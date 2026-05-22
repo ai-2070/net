@@ -174,21 +174,39 @@ pub trait FoldKind: Send + Sync + Sized + 'static {
     }
 }
 
-/// Placeholder audit-event payload for Phase 1.
-///
-/// `FoldKind::audit_event` returns one of these per applied
-/// transition the impl wants surfaced; the runtime collects them
-/// into the per-apply outcome so Phase 1B / Phase 6 can route
-/// them into the project's existing signed-audit chain without
-/// a Phase 1 redesign. The shape is intentionally open: a single
-/// `kind` string + a `key_repr` debug-shaped string lets folds
-/// emit audit info before the canonical schema is locked.
+/// Tag identifying which transition produced an [`AuditEvent`].
+/// The five canonical variants cover the apply / sweep / evict
+/// transitions the runtime emits; folds that want to surface
+/// additional events (e.g. a `ReservationFold` takeover from an
+/// expired holder) emit them via [`AuditKind::Custom`] without
+/// having to widen the enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditKind {
+    /// First-time install of a key.
+    Created,
+    /// Existing entry replaced under merge rules.
+    Replaced,
+    /// Incoming announcement rejected (stale generation, illegal
+    /// transition, etc.).
+    Rejected,
+    /// Entry removed via [`Fold::evict_node`] (SWIM / operator).
+    Evicted,
+    /// Entry removed because `expires_at` lapsed.
+    Expired,
+    /// Fold-specific transition outside the runtime's canonical
+    /// set. The `&'static str` is the fold's chosen tag (e.g.
+    /// `"reservation_takeover"`).
+    Custom(&'static str),
+}
+
+/// Audit-event payload emitted by [`FoldKind::audit_event`] for
+/// each transition the fold wants surfaced. The runtime collects
+/// them into the per-apply outcome and forwards to the installed
+/// [`FoldAuditSink`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditEvent {
-    /// Short kind tag: `"created"`, `"replaced"`, `"rejected"`,
-    /// `"evicted"`, `"expired"`. Folds may emit additional kinds
-    /// (e.g. `"reservation_takeover"`).
-    pub kind: &'static str,
+    /// Which transition produced this event. See [`AuditKind`].
+    pub kind: AuditKind,
     /// Debug-shaped key representation. The runtime can't
     /// `Debug`-format `K::Key` without an extra bound; impls
     /// that want richer audit detail materialize the string

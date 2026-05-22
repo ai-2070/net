@@ -1070,23 +1070,26 @@ impl FoldKind for AuditingCapFold {
     }
 
     fn audit_event(transition: super::EntryTransition<'_, Self>) -> Option<super::AuditEvent> {
+        use super::AuditKind;
         let (kind, key_repr, detail) = match transition {
             super::EntryTransition::Created { key, .. } => {
-                ("created", format!("{key:?}"), None)
+                (AuditKind::Created, format!("{key:?}"), None)
             }
             super::EntryTransition::Replaced { key, old, new } => (
-                "replaced",
+                AuditKind::Replaced,
                 format!("{key:?}"),
                 Some(format!("gen {} → {}", old.generation, new.generation)),
             ),
             super::EntryTransition::Rejected { key, .. } => {
-                ("rejected", format!("{key:?}"), None)
+                (AuditKind::Rejected, format!("{key:?}"), None)
             }
-            super::EntryTransition::Evicted { key, reason, .. } => {
-                ("evicted", format!("{key:?}"), Some(reason.to_string()))
-            }
+            super::EntryTransition::Evicted { key, reason, .. } => (
+                AuditKind::Evicted,
+                format!("{key:?}"),
+                Some(reason.to_string()),
+            ),
             super::EntryTransition::Expired { key, .. } => {
-                ("expired", format!("{key:?}"), None)
+                (AuditKind::Expired, format!("{key:?}"), None)
             }
         };
         Some(super::AuditEvent {
@@ -1135,13 +1138,13 @@ fn audit_sink_receives_create_replace_evict_and_expire_transitions() {
     fold.apply(sign_audit_ann(&kp, 0xA, 0x100, 1, 300, vec!["a"]))
         .expect("create");
     assert_eq!(sink.snapshot().len(), 1);
-    assert_eq!(sink.snapshot()[0].kind, "created");
+    assert_eq!(sink.snapshot()[0].kind, super::AuditKind::Created);
 
     // Replace
     fold.apply(sign_audit_ann(&kp, 0xA, 0x100, 2, 300, vec!["a2"]))
         .expect("replace");
     assert_eq!(sink.snapshot().len(), 2);
-    assert_eq!(sink.snapshot()[1].kind, "replaced");
+    assert_eq!(sink.snapshot()[1].kind, super::AuditKind::Replaced);
     assert_eq!(
         sink.snapshot()[1].detail.as_deref(),
         Some("gen 1 → 2")
@@ -1151,12 +1154,12 @@ fn audit_sink_receives_create_replace_evict_and_expire_transitions() {
     fold.apply(sign_audit_ann(&kp, 0xA, 0x100, 2, 300, vec!["bogus"]))
         .expect("reject");
     assert_eq!(sink.snapshot().len(), 3);
-    assert_eq!(sink.snapshot()[2].kind, "rejected");
+    assert_eq!(sink.snapshot()[2].kind, super::AuditKind::Rejected);
 
     // Evict
     fold.evict_node(0xA, "SWIM declared dead");
     assert_eq!(sink.snapshot().len(), 4);
-    assert_eq!(sink.snapshot()[3].kind, "evicted");
+    assert_eq!(sink.snapshot()[3].kind, super::AuditKind::Evicted);
     assert_eq!(sink.snapshot()[3].detail.as_deref(), Some("SWIM declared dead"));
 
     // Expire — insert a fresh entry with ttl=0 then sweep.
@@ -1166,7 +1169,10 @@ fn audit_sink_receives_create_replace_evict_and_expire_transitions() {
     let n = fold.sweep_expired_now();
     assert_eq!(n, 1);
     let trail = sink.snapshot();
-    assert_eq!(trail.last().expect("trail non-empty").kind, "expired");
+    assert_eq!(
+        trail.last().expect("trail non-empty").kind,
+        super::AuditKind::Expired
+    );
 }
 
 #[test]
@@ -1355,7 +1361,7 @@ fn ring_audit_sink_drops_oldest_when_capacity_exceeded() {
     let sink = RingFoldAuditSink::new(3);
     for i in 0..5 {
         sink.record(super::AuditEvent {
-            kind: "created",
+            kind: super::AuditKind::Created,
             key_repr: format!("{}", i),
             detail: None,
         });
@@ -1369,10 +1375,31 @@ fn ring_audit_sink_drops_oldest_when_capacity_exceeded() {
 }
 
 #[test]
+fn audit_kind_custom_variant_round_trips_through_sink() {
+    // Folds emit fold-specific transitions via AuditKind::Custom
+    // without widening the enum. Pin that the variant compares
+    // by string contents, not by reference identity.
+    let sink = RingFoldAuditSink::new(2);
+    sink.record(super::AuditEvent {
+        kind: super::AuditKind::Custom("reservation_takeover"),
+        key_repr: "0xCAFE".into(),
+        detail: Some("expired holder 0xDEAD".into()),
+    });
+    let snap = sink.snapshot();
+    assert_eq!(snap.len(), 1);
+    assert_eq!(
+        snap[0].kind,
+        super::AuditKind::Custom("reservation_takeover")
+    );
+    // Custom variants with different tags compare unequal.
+    assert_ne!(snap[0].kind, super::AuditKind::Custom("eviction"));
+}
+
+#[test]
 fn ring_audit_sink_with_zero_capacity_stores_nothing() {
     let sink = RingFoldAuditSink::new(0);
     sink.record(super::AuditEvent {
-        kind: "created",
+        kind: super::AuditKind::Created,
         key_repr: "x".into(),
         detail: None,
     });
@@ -1468,6 +1495,6 @@ fn ring_audit_sink_plugs_into_fold_and_captures_transitions() {
     // All 4 retained events are "created"; the oldest "created
     // for 0x10" was dropped.
     for e in &snap {
-        assert_eq!(e.kind, "created");
+        assert_eq!(e.kind, super::AuditKind::Created);
     }
 }
