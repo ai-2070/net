@@ -46,6 +46,7 @@ pub mod audit;
 pub mod dispatch;
 pub mod expiry;
 pub mod metrics;
+pub mod reservation;
 pub mod snapshot;
 pub mod state;
 pub mod wire;
@@ -61,6 +62,10 @@ pub use dispatch::{
 };
 pub use expiry::DEFAULT_SWEEP_INTERVAL;
 pub use metrics::FoldMetrics;
+pub use reservation::{
+    JobId, ReservationAnnouncement, ReservationFold, ReservationQuery, ReservationRow,
+    ReservationState, ResourceId,
+};
 pub use snapshot::{FoldSnapshot, FoldSnapshotEntry};
 pub use state::{
     ApplyOutcome, EntryTransition, FoldEntry, FoldError, FoldIndex, FoldState, MergeAction,
