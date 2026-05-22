@@ -100,6 +100,74 @@ use crate::event::{Batch, StoredEvent};
 /// Inbound event queues (same type as NetAdapter uses).
 type InboundQueues = Arc<DashMap<u16, SegQueue<StoredEvent>>>;
 
+/// One entry in the `origin_hash_to_node` reverse index.
+///
+/// `Single` is the common case — exactly one indexed `node_id`
+/// claims this wire `origin_hash` (the truncated projection of
+/// the publisher's `EntityId`). `Multiple` is the truncation-
+/// collision case; lookups return `None` so admission paths
+/// fail-closed to their publisher-unknown branch. The slot is
+/// derived from `peer_entity_ids` at TOFU pin time and lives
+/// alongside it on `MeshNode`.
+#[derive(Debug, Clone)]
+enum OriginHashSlot {
+    Single(u64),
+    Multiple(Vec<u64>),
+}
+
+impl OriginHashSlot {
+    /// Add `node_id`. Returns `true` on the first transition to
+    /// ambiguous state so callers can bump a collision counter
+    /// exactly once per new collision. Idempotent on re-add of
+    /// the same id.
+    fn insert(&mut self, node_id: u64) -> bool {
+        match self {
+            Self::Single(existing) => {
+                if *existing == node_id {
+                    false
+                } else {
+                    *self = Self::Multiple(vec![*existing, node_id]);
+                    true
+                }
+            }
+            Self::Multiple(ids) => {
+                if !ids.contains(&node_id) {
+                    ids.push(node_id);
+                }
+                false
+            }
+        }
+    }
+
+    /// Remove `node_id`. Returns `true` when the slot is now
+    /// empty (caller drops the map entry). Demotes Multiple to
+    /// Single when only one claimant survives.
+    fn remove(&mut self, node_id: u64) -> bool {
+        match self {
+            Self::Single(existing) => *existing == node_id,
+            Self::Multiple(ids) => {
+                ids.retain(|id| *id != node_id);
+                match ids.len() {
+                    0 => true,
+                    1 => {
+                        *self = Self::Single(ids[0]);
+                        false
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    /// Resolve to a single `node_id`, or `None` when ambiguous.
+    fn unique(&self) -> Option<u64> {
+        match self {
+            Self::Single(id) => Some(*id),
+            Self::Multiple(_) => None,
+        }
+    }
+}
+
 /// One slot in [`MeshNode::fold_generations`]: a monotonic
 /// counter plus the wall-clock micros at which it was last
 /// bumped. The background GC loop evicts slots whose
@@ -534,6 +602,12 @@ struct DispatchCtx {
     /// announcement dispatch after signature verification. Load-
     /// bearing for channel auth.
     peer_entity_ids: Arc<DashMap<u64, EntityId>>,
+    /// Reverse index: wire `origin_hash` → set of node_ids
+    /// claiming it. Populated alongside `peer_entity_ids` at
+    /// TOFU pin time. Used by the greedy-chain admission gate
+    /// to detect truncation collisions: a unique-claimant slot
+    /// resolves to a single node, an ambiguous slot fails-closed.
+    origin_hash_to_node: Arc<DashMap<u64, OriginHashSlot>>,
     /// Shared token cache, populated by subscriber-presented tokens
     /// plus caller-side pre-installs. `None` disables the
     /// `require_token` path — unset is equivalent to "no token is
@@ -1649,6 +1723,14 @@ pub struct MeshNode {
     /// without it, `require_token` channels can't match a token's
     /// `subject` to the subscribing peer.
     peer_entity_ids: Arc<DashMap<u64, EntityId>>,
+    /// Reverse index: publisher's wire-`origin_hash` projection
+    /// → set of node_ids claiming the slot. Populated alongside
+    /// `peer_entity_ids` at TOFU pin time. Consulted by the
+    /// greedy-chain admission gate to detect truncation
+    /// collisions: an unambiguous slot resolves to one node,
+    /// an ambiguous slot fails-closed for any caller that wants
+    /// "publisher of this hash."
+    origin_hash_to_node: Arc<DashMap<u64, OriginHashSlot>>,
     /// Shared token cache used by the channel-auth path. When
     /// `None`, `can_publish` / `can_subscribe` fall back to a
     /// fresh empty cache — which means `require_token` channels
@@ -1797,6 +1879,11 @@ impl MeshNode {
         // on session failure so a reconnect doesn't silently reuse
         // the old identity.
         let peer_entity_ids: Arc<DashMap<u64, EntityId>> = Arc::new(DashMap::new());
+        // Reverse index keyed on the publisher's wire `origin_hash`.
+        // Populated alongside `peer_entity_ids` at TOFU pin time;
+        // cleared by the failure-detector callback below.
+        let origin_hash_to_node: Arc<DashMap<u64, OriginHashSlot>> =
+            Arc::new(DashMap::new());
 
         // Capability index — hoisted out of the struct literal so
         // the failure-detector `on_failure` callback can hold a
@@ -1851,6 +1938,7 @@ impl MeshNode {
         let roster_failure = roster.clone();
         let peer_subnets_failure = peer_subnets.clone();
         let peer_entity_ids_failure = peer_entity_ids.clone();
+        let origin_hash_to_node_failure = origin_hash_to_node.clone();
         let capability_index_failure = capability_index.clone();
         let failure_detector = FailureDetector::with_config(FailureDetectorConfig {
             timeout: config.session_timeout,
@@ -1869,7 +1957,23 @@ impl MeshNode {
                 );
             }
             peer_subnets_failure.remove(&node_id);
-            peer_entity_ids_failure.remove(&node_id);
+            // Pull `entity_id` BEFORE removing it so we know which
+            // origin_hash slot to demote / drop. A node disappearing
+            // releases its claim on the wire hash.
+            let removed_entity_id = peer_entity_ids_failure
+                .remove(&node_id)
+                .map(|(_, eid)| eid);
+            if let Some(eid) = removed_entity_id {
+                let origin_hash = eid.origin_hash();
+                let mut drop_slot = false;
+                if let Some(mut slot) = origin_hash_to_node_failure.get_mut(&origin_hash)
+                {
+                    drop_slot = slot.remove(node_id);
+                }
+                if drop_slot {
+                    origin_hash_to_node_failure.remove(&origin_hash);
+                }
+            }
             // Drop the dead peer's cached capabilities + reflex.
             // Without this, a rendezvous coordinator could still
             // hand a PunchRequest initiator the failed peer's
@@ -1989,6 +2093,7 @@ impl MeshNode {
             local_subnet_policy,
             peer_subnets,
             peer_entity_ids,
+            origin_hash_to_node,
             token_cache: None,
             auth_guard: Arc::new(AuthGuard::new()),
             auth_failures: Arc::new(DashMap::new()),
@@ -2865,6 +2970,7 @@ impl MeshNode {
             local_subnet_policy: self.local_subnet_policy.clone(),
             peer_subnets: self.peer_subnets.clone(),
             peer_entity_ids: self.peer_entity_ids.clone(),
+            origin_hash_to_node: self.origin_hash_to_node.clone(),
             token_cache: self.token_cache.clone(),
             auth_guard: self.auth_guard.clone(),
             auth_failures: self.auth_failures.clone(),
@@ -5734,6 +5840,19 @@ impl MeshNode {
                 }
             } else {
                 ctx.peer_entity_ids.insert(from_node, ann.entity_id.clone());
+                // Mirror the entity-id pin into the origin_hash
+                // reverse index. Idempotent on re-add of the same
+                // node_id; a distinct node_id claiming the same
+                // wire hash promotes the slot to Multiple, which
+                // future get_node_by_origin_hash calls resolve
+                // to None.
+                let origin_hash = ann.entity_id.origin_hash();
+                ctx.origin_hash_to_node
+                    .entry(origin_hash)
+                    .and_modify(|slot| {
+                        slot.insert(from_node);
+                    })
+                    .or_insert_with(|| OriginHashSlot::Single(from_node));
             }
         }
 
@@ -8703,6 +8822,30 @@ impl MeshNode {
         &self.capability_fold
     }
 
+    /// Resolve a wire `origin_hash` to its publisher's `node_id`,
+    /// or `None` when the slot is empty or claimed by multiple
+    /// distinct nodes (truncation collision). Callers treat
+    /// `None` as "publisher unknown" — admission paths fail
+    /// closed.
+    pub fn get_node_by_origin_hash(&self, origin_hash: u64) -> Option<u64> {
+        self.origin_hash_to_node
+            .get(&origin_hash)
+            .and_then(|slot| slot.unique())
+    }
+
+    /// `true` when two or more distinct `node_id`s currently
+    /// claim the same wire `origin_hash`. Distinct from
+    /// "publisher not yet announced" (slot vacant) — used by
+    /// dispatch paths that need to fail-closed on adversarial
+    /// collision while keeping a benign empty-caps fallback for
+    /// the cap-propagation race.
+    pub fn is_origin_hash_ambiguous(&self, origin_hash: u64) -> bool {
+        self.origin_hash_to_node
+            .get(&origin_hash)
+            .map(|slot| slot.unique().is_none())
+            .unwrap_or(false)
+    }
+
     /// Push the currently-stored local announcement (if any) to
     /// `peer_addr`. Called from the end of `connect` / `accept` so
     /// late joiners don't have to wait for a re-announce. No-op
@@ -10519,6 +10662,57 @@ mod fold_publisher_helpers_tests {
             node.fold_generations.contains_key(&(kind, fresh_class)),
             "fresh slot survives"
         );
+    }
+
+    #[tokio::test]
+    async fn origin_hash_index_unique_then_ambiguous_then_drop() {
+        // Sub-step 3B-2b contract: MeshNode.origin_hash_to_node
+        // matches the legacy CapabilityIndex semantics — Single
+        // resolves to its node_id, Multiple resolves to None.
+        // Removal via slot.remove() demotes Multiple to Single
+        // and drops the slot when empty.
+        let node = build_node_for_test().await;
+        let hash = 0xCAFEBABE_u64;
+        let nid_a = 0xAAAA_u64;
+        let nid_b = 0xBBBB_u64;
+
+        // Empty slot — no claimant, both helpers report "absent."
+        assert_eq!(node.get_node_by_origin_hash(hash), None);
+        assert!(!node.is_origin_hash_ambiguous(hash));
+
+        // First claimant. resolved to its node_id, not ambiguous.
+        node.origin_hash_to_node
+            .insert(hash, OriginHashSlot::Single(nid_a));
+        assert_eq!(node.get_node_by_origin_hash(hash), Some(nid_a));
+        assert!(!node.is_origin_hash_ambiguous(hash));
+
+        // Second distinct claimant. Slot promotes to Multiple;
+        // lookups now fail-closed to None and ambiguous = true.
+        if let Some(mut slot) = node.origin_hash_to_node.get_mut(&hash) {
+            slot.insert(nid_b);
+        }
+        assert_eq!(node.get_node_by_origin_hash(hash), None);
+        assert!(node.is_origin_hash_ambiguous(hash));
+
+        // Remove nid_a → demotes back to Single(nid_b).
+        if let Some(mut slot) = node.origin_hash_to_node.get_mut(&hash) {
+            let now_empty = slot.remove(nid_a);
+            assert!(!now_empty);
+        }
+        assert_eq!(node.get_node_by_origin_hash(hash), Some(nid_b));
+        assert!(!node.is_origin_hash_ambiguous(hash));
+
+        // Remove nid_b → slot becomes empty; caller drops the
+        // map entry.
+        let mut drop_slot = false;
+        if let Some(mut slot) = node.origin_hash_to_node.get_mut(&hash) {
+            drop_slot = slot.remove(nid_b);
+        }
+        if drop_slot {
+            node.origin_hash_to_node.remove(&hash);
+        }
+        assert_eq!(node.get_node_by_origin_hash(hash), None);
+        assert!(!node.is_origin_hash_ambiguous(hash));
     }
 
     #[tokio::test]
