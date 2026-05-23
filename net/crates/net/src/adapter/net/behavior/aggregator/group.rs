@@ -74,17 +74,19 @@ impl AggregatorGroup {
                 "replica_count must be > 0".into(),
             ));
         }
-        let mut handles: Vec<LifecycleHandle> = Vec::with_capacity(replica_count as usize);
-        for index in 0..replica_count {
-            let daemon = factory(index);
-            let trait_obj: Arc<dyn LifecycleDaemon> = daemon;
-            // If start fails, the already-collected handles
-            // drop here — their Drop schedules `on_stop` on a
-            // detached task, so the group's partially-started
-            // replicas don't leak running loops.
-            let handle = LifecycleHandle::start(trait_obj).await?;
-            handles.push(handle);
-        }
+        // Build the per-replica daemons synchronously (factory is
+        // sync — preserving the existing ordering invariant the
+        // tests pin), then drive each `on_start` in parallel via
+        // `try_join_all`. If any start fails, every other in-flight
+        // start cancels and the partially-started replicas drop
+        // their LifecycleHandles cleanly via Drop.
+        let starts: Vec<_> = (0..replica_count)
+            .map(|index| {
+                let daemon: Arc<dyn LifecycleDaemon> = factory(index);
+                LifecycleHandle::start(daemon)
+            })
+            .collect();
+        let handles = futures::future::try_join_all(starts).await?;
         Ok(Self {
             handles,
             group_seed,
