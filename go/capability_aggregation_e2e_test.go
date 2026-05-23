@@ -18,6 +18,7 @@
 package net
 
 import (
+	"encoding/hex"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -35,9 +36,9 @@ func aggNextPort() string {
 // fixture so assertions stay in sync.
 func primedAggMesh(t *testing.T) *MeshNode {
 	t.Helper()
-	mesh, err := NewMeshNode(MeshNodeConfig{
+	mesh, err := NewMeshNode(MeshConfig{
 		BindAddr: aggNextPort(),
-		PSK:      psk32(0x42),
+		PskHex:   hex.EncodeToString(psk32(0x42)),
 	})
 	if err != nil {
 		t.Fatalf("NewMeshNode: %v", err)
