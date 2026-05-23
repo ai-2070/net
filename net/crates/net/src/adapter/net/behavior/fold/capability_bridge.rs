@@ -410,6 +410,49 @@ pub fn find_nodes_matching(fold: &Fold<CapabilityFold>, legacy: &LegacyFilter) -
     out
 }
 
+/// `true` if `node_id` has any fold entry that satisfies `legacy`.
+/// Single-target variant of [`find_nodes_matching`] — avoids the
+/// full composite query when callers (the placement layer's
+/// per-target scorer) only need a yes/no for one specific node.
+///
+/// Walks the publisher's class entries via the `by_node` reverse
+/// index (O(num classes the publisher owns), typically 0-3) and
+/// runs the same `tags_all` intersection + post-filter the bulk
+/// path applies. Returns `false` for unknown publishers, matching
+/// the bulk path's "missing publishers don't appear" contract.
+pub fn target_matches_filter(
+    fold: &Fold<CapabilityFold>,
+    node_id: NodeId,
+    legacy: &LegacyFilter,
+) -> bool {
+    fold.with_state(|state| {
+        let Some(keys) = state.by_node.get(&node_id) else {
+            return false;
+        };
+        for key in keys {
+            let Some(entry) = state.entries.get(key) else {
+                continue;
+            };
+            let membership = &entry.payload;
+            // Same tag-intersection rule the fold's secondary
+            // index applies (`tags_all` ⊆ membership.tags), then
+            // the range / vendor / model / tool post-filter.
+            let tags_ok = legacy
+                .require_tags
+                .iter()
+                .all(|t| membership.tags.iter().any(|m| m == t));
+            if !tags_ok {
+                continue;
+            }
+            if !membership_passes_post_filter(membership, legacy) {
+                continue;
+            }
+            return true;
+        }
+        false
+    })
+}
+
 /// Derive a [`CapabilityScope`] from a [`CapabilityMembership`]'s
 /// string-tag set. Reads the canonical string form the fold's
 /// payload carries — `"scope:global"`, `"scope:subnet-local"`,
@@ -682,6 +725,72 @@ mod tests {
 
         let nodes = find_nodes_matching(&fold, &legacy);
         assert_eq!(nodes, vec![0xAA]);
+    }
+
+    #[test]
+    fn target_matches_filter_agrees_with_find_nodes_matching() {
+        // Two publishers, mixed tag sets — both filter inputs must
+        // get the same yes/no verdict from the per-target check and
+        // the bulk find. Pins parity so the placement layer's O(1)
+        // fast path can't silently drift from the bulk query.
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(sign_member(&kp, 0xAA, 0x100, vec!["gpu", "cuda"], None))
+            .expect("apply AA");
+        fold.apply(sign_member(&kp, 0xBB, 0x100, vec!["cpu-only"], None))
+            .expect("apply BB");
+
+        let probe = |legacy: &LegacyFilter, candidates: &[NodeId]| {
+            let bulk: HashSet<NodeId> = find_nodes_matching(&fold, legacy).into_iter().collect();
+            for &n in candidates {
+                assert_eq!(
+                    bulk.contains(&n),
+                    target_matches_filter(&fold, n, legacy),
+                    "node 0x{:x} verdict mismatch for filter {:?}",
+                    n,
+                    legacy.require_tags
+                );
+            }
+        };
+
+        // Permissive filter: both publishers pass either path.
+        probe(&LegacyFilter::default(), &[0xAA, 0xBB, 0xCC]);
+
+        // `require_tags = ["gpu"]`: only AA passes.
+        let mut f = LegacyFilter::default();
+        f.require_tags.push("gpu".into());
+        probe(&f, &[0xAA, 0xBB, 0xCC]);
+
+        // Unknown publisher: per-target check returns false (matches
+        // bulk path's "missing publishers don't appear").
+        assert!(!target_matches_filter(&fold, 0xDEAD, &LegacyFilter::default()));
+    }
+
+    #[test]
+    fn target_matches_filter_applies_post_filter_predicates() {
+        // Min-memory predicate is in the post-filter slice; pin
+        // that the per-target check honors it, not just the
+        // indexable tag intersection.
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let hw = HardwareSummary {
+            gpu_vendor: None,
+            gpu_count: 0,
+            memory_gb: Some(32),
+            vram_gb: None,
+        };
+        fold.apply(sign_member(&kp, 0xAA, 0x100, vec!["gpu"], Some(hw)))
+            .expect("apply AA");
+
+        let mut tight = LegacyFilter::default();
+        tight.require_tags.push("gpu".into());
+        tight.min_memory_gb = Some(64);
+        assert!(!target_matches_filter(&fold, 0xAA, &tight));
+
+        let mut loose = LegacyFilter::default();
+        loose.require_tags.push("gpu".into());
+        loose.min_memory_gb = Some(16);
+        assert!(target_matches_filter(&fold, 0xAA, &loose));
     }
 
     #[test]

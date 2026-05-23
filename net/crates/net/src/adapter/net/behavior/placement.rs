@@ -180,8 +180,12 @@ impl<'a> LegacyPlacement<'a> {
 
 impl<'a> PlacementFilter for LegacyPlacement<'a> {
     fn placement_score(&self, target: &NodeId, _artifact: &Artifact<'_>) -> Option<f32> {
-        let candidates = capability_bridge::find_nodes_matching(self.fold, &self.filter);
-        if candidates.contains(target) {
+        // Per-target O(num classes target owns) check — calling
+        // `find_nodes_matching` here would run the full composite
+        // query and then linearly scan the result, making
+        // `placement_score` quadratic when the scheduler invokes
+        // it once per candidate target.
+        if capability_bridge::target_matches_filter(self.fold, *target, &self.filter) {
             Some(1.0)
         } else {
             None
