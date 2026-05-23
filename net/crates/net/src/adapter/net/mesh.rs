@@ -1674,6 +1674,14 @@ pub struct MeshNode {
     /// registry — those nodes accept every subscribe and skip the
     /// subnet-visibility gate entirely.
     subnet_gateway: Option<Arc<SubnetGateway>>,
+    /// Process-level registry of live aggregator groups,
+    /// installed lazily so callers that don't run aggregators
+    /// pay nothing. Operator CLI verbs
+    /// (`net aggregator spawn / ls / scale`) and the Deck
+    /// AGGREGATORS panel both read through this. See
+    /// [`Self::aggregator_registry`] and
+    /// [`Self::set_aggregator_registry`].
+    aggregator_registry: Option<Arc<super::behavior::aggregator::AggregatorRegistry>>,
     /// Per-peer entity-id map. Keys are `node_id`; values are the
     /// 32-byte ed25519 public key carried on the peer's most recent
     /// `CapabilityAnnouncement`. Load-bearing for channel auth —
@@ -2046,6 +2054,10 @@ impl MeshNode {
             // a node without an installed registry has no gateway
             // and skips the visibility gate entirely.
             subnet_gateway: None,
+            // Aggregator registry is installed lazily via
+            // `set_aggregator_registry`; nodes that never run an
+            // aggregator never allocate the HashMap.
+            aggregator_registry: None,
             peer_entity_ids,
             origin_hash_to_node,
             token_cache: None,
@@ -5310,6 +5322,31 @@ impl MeshNode {
     /// this to enumerate configured channels.
     pub fn channel_configs(&self) -> Option<&Arc<ChannelConfigRegistry>> {
         self.channel_configs.as_ref()
+    }
+
+    /// Install a shared `AggregatorRegistry` on the node. Once
+    /// installed, operator CLI verbs
+    /// (`net aggregator spawn / ls / scale`) and the Deck
+    /// AGGREGATORS panel can read + mutate live aggregator
+    /// groups through it. Call this BEFORE [`Self::start`].
+    pub fn set_aggregator_registry(
+        &mut self,
+        registry: Arc<super::behavior::aggregator::AggregatorRegistry>,
+    ) {
+        self.aggregator_registry = Some(registry);
+    }
+
+    /// Read-only handle to this node's installed
+    /// [`AggregatorRegistry`](super::behavior::aggregator::AggregatorRegistry),
+    /// or `None` when no registry has been installed via
+    /// [`Self::set_aggregator_registry`]. Nodes that don't run
+    /// aggregators leave this empty — callers should treat the
+    /// `None` case as "no aggregators registered" and skip
+    /// rendering / acting.
+    pub fn aggregator_registry(
+        &self,
+    ) -> Option<&Arc<super::behavior::aggregator::AggregatorRegistry>> {
+        self.aggregator_registry.as_ref()
     }
 
     /// Install a shared `TokenCache` used by the channel-auth path.
@@ -10902,6 +10939,24 @@ mod fold_publisher_helpers_tests {
         assert_eq!(gw.local_subnet(), SubnetId::GLOBAL);
         assert_eq!(gw.forwarded_count(), 0);
         assert_eq!(gw.dropped_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn aggregator_registry_is_none_until_installed() {
+        // Nodes that don't run aggregators leave the registry
+        // empty — CLI verbs short-circuit on this.
+        use crate::adapter::net::behavior::aggregator::AggregatorRegistry;
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x17u8; 32]);
+        let mut owned = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+        assert!(owned.aggregator_registry().is_none());
+        let registry = std::sync::Arc::new(AggregatorRegistry::new());
+        owned.set_aggregator_registry(registry.clone());
+        let installed = owned.aggregator_registry().expect("registry installed");
+        assert!(std::sync::Arc::ptr_eq(installed, &registry));
+        assert!(installed.is_empty());
     }
 
     #[tokio::test]

@@ -14,10 +14,12 @@ pub mod config;
 pub mod daemon;
 pub mod query_client;
 pub mod query_service;
+pub mod registry;
 pub mod summarizer;
 
 pub use config::AggregatorConfig;
 pub use daemon::{AggregatorDaemon, AggregatorError, AggregatorPublishError};
+pub use registry::{AggregatorGroupEntry, AggregatorRegistry, AggregatorRegistryError};
 pub use query_client::{
     FoldQueryClient, FoldQueryClientError, DEFAULT_QUERY_CACHE_TTL, DEFAULT_QUERY_DEADLINE,
 };

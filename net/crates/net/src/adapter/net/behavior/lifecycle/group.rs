@@ -313,6 +313,22 @@ impl<L: LifecycleDaemon> LifecycleGroup<L> {
             h.stop().await;
         }
     }
+
+    /// Surrender the group's parts to the caller. Used by
+    /// process-level registries (e.g.
+    /// `AggregatorRegistry::register`) that take ownership of
+    /// the handles for shutdown but still want concrete-typed
+    /// access to the replicas + placement records.
+    ///
+    /// Returns `(replicas, placements, handles, group_seed)` in
+    /// declaration order. After this call the group no longer
+    /// exists; lifecycle shutdown becomes the caller's
+    /// responsibility (via the returned `LifecycleHandle`s).
+    pub fn into_parts(
+        self,
+    ) -> (Vec<Arc<L>>, Vec<PlacementDecision>, Vec<LifecycleHandle>, [u8; 32]) {
+        (self.replicas, self.placements, self.handles, self.group_seed)
+    }
 }
 
 /// Shared spawn helper: invoke `factory(index)` for each
