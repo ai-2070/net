@@ -218,9 +218,110 @@ This shape gives reviewers a step-by-step walk without losing the atomicity of "
 
 ## Sign-off checklist before opening the PR
 
-- [ ] All 6-8 sub-step commits pass `cargo test --lib --features meshdb`.
-- [ ] All 6-8 sub-step commits pass `cargo clippy --lib --features meshdb -- -D warnings`.
-- [ ] The scheduler benchmark shows < 1.5× regression on per-placement latency.
-- [ ] `grep -rn 'CapabilityIndex' src/` returns no matches outside the about-to-be-deleted module after sub-step 4.
-- [ ] The capability-announcement integration test (sub-step 4) passes end-to-end.
-- [ ] The plan doc is updated to reflect any deviations from this checklist.
+- [x] All sub-step commits pass `cargo test --lib --features meshdb` (3979 lib tests green).
+- [x] `cargo clippy --lib --features meshdb -- -D warnings` clean on the merged tree.
+- [ ] Scheduler benchmark < 1.5× regression on per-placement latency — benches compile (`bench_capability_fold_*` in `benches/net.rs`, `bench_placement_score` in `benches/placement.rs`) but the empirical pre/post comparison hasn't been run.
+- [x] `grep CapabilityIndex src/` returns only doc-comment historical references; the struct + impls + supporting types are gone.
+- [x] The capability-announcement integration test passes end-to-end (covered by `capability_multihop`, `capability_broadcast`).
+- [x] Plan doc updated — see "Deviations from the original plan" below.
+
+---
+
+## Deviations from the original plan
+
+The cutover landed end-to-end, but five things differ from the plan as
+originally written. None block sign-off; they're recorded so reviewers
+can see the gap between intent and shipped code.
+
+### 1. `may_execute` was ported, not deferred
+
+The original plan didn't enumerate `CapabilityIndex::may_execute` (the
+v0.4 capability-auth gate) in the public-API table. It surfaced as a
+production caller in `mesh_rpc.rs` during sub-step 3 and had to be
+reimplemented on the fold path. The fix:
+
+- Added `allowed_nodes` / `allowed_subnets` / `allowed_groups` fields
+  to `CapabilityMembership` so the auth lists ride the same signed
+  envelope they did on the legacy `CapabilityAnnouncement`.
+- Added `capability_bridge::may_execute(fold, target, tag, caller)`
+  with the same union semantics (node OR subnet OR group OR
+  permissive-default) the legacy gate had.
+- `mesh_rpc.rs`'s two callsites (the per-RPC gate + the call_service
+  candidate retain) route through the bridge.
+
+### 2. `metadata: BTreeMap` carried through the fold envelope
+
+The plan flagged "the fold's `CapabilityMembership` doesn't carry the
+legacy `metadata` BTreeMap; callers that need metadata access keep the
+legacy `CapabilityIndex::get` path until the fold payload is extended"
+as a known gap. Testing surfaced that the
+`predicate_eval_fixture_matches_via_placement_filter_callback`
+cross-binding fixture exercises `metadata_exists` / `metadata_equals`
+predicates — without metadata propagation, half the fixture cases fail.
+
+Resolution: added `metadata: BTreeMap<String, String>` to
+`CapabilityMembership`. `translate_announcement` populates it from the
+legacy ann; `synthesize_capability_set` merges metadata maps across
+the publisher's per-class entries.
+
+### 3. `require_models` / `require_tools` filter encoding
+
+The plan's filter-translation table says "encode as `model:<name>` /
+`tool:<name>` tags before querying." That's wrong — the canonical wire
+form is the multi-tag bundle (`software.model.<i>.id=<name>` etc.),
+which a `model:<name>` `tags_all` predicate never matches. Surfaced as
+a Node binding test failure (`capabilities.test.ts > round-trips a
+complex POJO`).
+
+Resolution: `translate_filter` drops models / tools from `tags_all`;
+`membership_passes_post_filter` reuses `CapabilitySet::has_model` /
+`has_tool` against a synthesized set per candidate. Same union ("any
+must match") semantics the legacy `CapabilityFilter::matches` impl
+used.
+
+### 4. Wire `origin_hash` u32 truncation
+
+`CapabilityIndex::by_origin_hash` keyed entries on
+`(eid.origin_hash() as u32) as u64` to match the receiver-side
+`parsed.header.origin_hash.into()` projection. 3B-2b ported the
+reverse index to `MeshNode::origin_hash_to_node` without carrying the
+truncation, so post-deletion lookups silently missed and the greedy
+admission's `chain_caps` collapsed to empty. Restored in
+`b1a0be72`.
+
+The underlying limitation (DoS-by-collision-suppression in dataforts,
+~2³² work, no auth-bypass) is documented in
+`WIRE_ORIGIN_HASH_64BIT.md` as the wire-format-break follow-on.
+
+### 5. `axis_cardinality` lost; richer queries deferred to Phase 6c
+
+The plan's API-surface table marked `axis_cardinality` as "out of
+scope for cutover; migrate as a follow-up." The cutover deleted the
+method along with `CapabilityIndex`. The `CardinalityProvider` trait
+stays in `behavior/capability.rs` (`HugeCardinality` test mock
+satisfies the bound for `predicate.rs` planner tests). Real
+cardinality counts against fold state aren't restored — see
+**Phase 6c (Capacity Aggregation)** in
+`MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`, which lands the
+`Fold::aggregate` + `Fold::capacity_ranking` surface and replaces the
+legacy `axis_cardinality` semantics with `Aggregation::DistinctValues`
++ `Aggregation::Count` on the fold directly.
+
+This means the bridge stays a thin legacy-shape compatibility layer
+forever. Richer query work happens on the fold via 6c; the bridge
+doesn't grow `axis_cardinality` / `find_best` / etc. as follow-ups.
+
+### 6. Test surface shape
+
+The original plan said tests "either pass against the fold or have
+been deleted as redundant." The shipped shape uses three
+`test_*` helpers on `MeshNode`
+(`test_inject_capability_announcement`, `test_capability_fold_has`,
+`test_capability_fold_get`) so the existing tests substitute calls
+mechanically rather than each fixture re-deriving the
+fold-translation. The helpers are `#[doc(hidden)]` but `pub` so
+binding-side integration tests (Node / Python / Go FFI smoke tests)
+can use them too. Roughly 130 callsites across 14 integration test
+files + 8 internal lib-test modules migrated through these helpers.
+
+---
