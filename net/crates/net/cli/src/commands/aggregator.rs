@@ -312,18 +312,14 @@ async fn run_scale(
 }
 
 /// Hex-decode 32 bytes from a 64-char string. Used by
-/// `spawn --group-seed`.
+/// `spawn --group-seed`. Wraps `hex::decode` + a length check
+/// so the error path matches `psk_hex` / `group_seed`
+/// elsewhere.
 fn hex_decode_32(s: &str) -> Result<[u8; 32], String> {
-    if s.len() != 64 {
-        return Err(format!("expected 64 hex chars, got {}", s.len()));
-    }
-    let mut out = [0u8; 32];
-    for i in 0..32 {
-        let byte_str = &s[i * 2..i * 2 + 2];
-        out[i] = u8::from_str_radix(byte_str, 16)
-            .map_err(|e| format!("invalid hex at byte {i}: {e}"))?;
-    }
-    Ok(out)
+    hex::decode(s)
+        .map_err(|e| format!("invalid hex: {e}"))?
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("expected 32 bytes, got {}", v.len()))
 }
 
 #[derive(Serialize)]

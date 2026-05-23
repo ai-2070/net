@@ -573,29 +573,23 @@ pub async fn drain_registry(registry: &Arc<AggregatorRegistry>) {
     }
 }
 
-fn decode_psk(s: &str) -> Result<[u8; 32], DaemonError> {
+/// Decode a hex string into 32 bytes. Accepts an optional
+/// `0x` prefix. Used by both `psk_hex` and `group_seed`
+/// parsing — same shape, same error message.
+fn decode_hex_32(s: &str) -> Result<[u8; 32], String> {
     let trimmed = s.trim_start_matches("0x");
-    if trimmed.len() != 64 {
-        return Err(DaemonError::PskInvalid(format!(
-            "expected 64 hex chars, got {}",
-            trimmed.len()
-        )));
-    }
-    let bytes = hex::decode(trimmed).map_err(|e| DaemonError::PskInvalid(format!("{e}")))?;
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
+    let bytes = hex::decode(trimmed).map_err(|e| format!("{e}"))?;
+    bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("expected 32 bytes, got {}", v.len()))
+}
+
+fn decode_psk(s: &str) -> Result<[u8; 32], DaemonError> {
+    decode_hex_32(s).map_err(DaemonError::PskInvalid)
 }
 
 fn decode_seed(s: &str) -> Result<[u8; 32], String> {
-    let trimmed = s.trim_start_matches("0x");
-    if trimmed.len() != 64 {
-        return Err(format!("expected 64 hex chars, got {}", trimmed.len()));
-    }
-    let bytes = hex::decode(trimmed).map_err(|e| format!("{e}"))?;
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
+    decode_hex_32(s)
 }
 
 /// Derive a deterministic 32-byte seed from a group name. Uses
@@ -627,52 +621,21 @@ fn derive_seed_from_name(name: &str) -> [u8; 32] {
     out
 }
 
-/// Parse a dotted-notation subnet (e.g. `"3.7"`, `"1.2.3.4"`)
-/// into a `SubnetId`. Empty string → `SubnetId::GLOBAL`.
+/// Parse a subnet identifier via the substrate's
+/// `SubnetId::FromStr`. Accepts dotted notation (e.g.
+/// `"3.7"`, `"1.2.3.4"`) and the literal `"global"`.
 fn parse_subnet(raw: &str) -> Result<SubnetId, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(SubnetId::GLOBAL);
-    }
-    let levels: Vec<u8> = trimmed
-        .split('.')
-        .map(|s| s.parse::<u8>().map_err(|e| format!("level `{s}`: {e}")))
-        .collect::<Result<Vec<_>, _>>()?;
-    if levels.len() > SubnetId::MAX_DEPTH as usize {
-        return Err(format!(
-            "subnet has {} levels, max is {}",
-            levels.len(),
-            SubnetId::MAX_DEPTH
-        ));
-    }
-    Ok(SubnetId::new(&levels))
+    raw.trim().parse::<SubnetId>().map_err(|e| format!("{e:?}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_subnet_accepts_dotted_levels() {
-        let s = parse_subnet("3.7").expect("parse");
-        assert_eq!(s, SubnetId::new(&[3, 7]));
-    }
-
-    #[test]
-    fn parse_subnet_empty_input_returns_global() {
-        let s = parse_subnet("").expect("parse");
-        assert_eq!(s, SubnetId::GLOBAL);
-    }
-
-    #[test]
-    fn parse_subnet_rejects_non_numeric_levels() {
-        assert!(parse_subnet("3.beta").is_err());
-    }
-
-    #[test]
-    fn parse_subnet_rejects_too_deep() {
-        assert!(parse_subnet("1.2.3.4.5").is_err());
-    }
+    // `parse_subnet` is now a thin shim over `SubnetId::FromStr`
+    // (which has its own tests under
+    // `adapter::net::subnet::id::tests`). No daemon-local
+    // duplicates here.
 
     #[test]
     fn decode_psk_accepts_64_char_hex() {
