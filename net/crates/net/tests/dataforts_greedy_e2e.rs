@@ -194,7 +194,11 @@ async fn greedy_scope_filter_admits_when_publisher_advertises_matching_scope() {
     // Give B a moment to receive + index the announcement.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
-        if !node_b.test_capability_fold_get(node_a.node_id()).tags.is_empty() {
+        if !node_b
+            .test_capability_fold_get(node_a.node_id())
+            .tags
+            .is_empty()
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
