@@ -1,0 +1,29 @@
+net/crates/net/benches/placement.rs
+  s_d9dc521a887c3e::t_53d07cb1bad7a5 123-124
+  s_d9dc521a887c3e::t_c73a14a5d62332 145
+  s_d9dc521a887c3e::t_4240a515179a83 36,38-39,47-52,61,63
+  s_d9dc521a887c3e::t_c21f8334126b97 153
+  s_d9dc521a887c3e::t_85ede481c9e72c 177
+  s_d9dc521a887c3e::t_4d04275d3067b9 189,193
+  s_d9dc521a887c3e::t_3c581522f40fa4 81-84,87,91-98
+net/crates/net/benches/net.rs
+  s_d9dc521a887c3e::t_0264154bb208f8 24
+  s_d9dc521a887c3e::t_cf8edf82c78519 31,34
+  s_d9dc521a887c3e::t_ce9d2cc6bb3600 2146-2148,2158,2167,2169,2178-2180,2183-2184,2188,2194,2200,2206,2212,2221,2227,2233,2239,2245-2252,2255-2256,2260,2266,2269-2270,2281,2287-2289,2292,2297,2307,2320,2328-2330,2340,2349,2360,2374,2378,2388,2397,2418,2431,2436,2455-2456,2459,2465,2475,2485,2496,2498,2512-2517
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "4fc5cb8bc25f8e6d0993454d529e9e555a05ff2e",
+  "prompts": {},
+  "sessions": {
+    "s_d9dc521a887c3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1eafc9e-4dd5-40ff-8f76-e8a5b7800252",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
