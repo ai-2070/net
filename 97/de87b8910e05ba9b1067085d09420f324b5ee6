@@ -1,0 +1,28 @@
+go/aggregator.go
+  s_099fa7d871e34d::t_b29af301e40220 1-591
+.github/workflows/ci.yml
+  s_099fa7d871e34d::t_d8a1bbdc68ca69 415
+  s_099fa7d871e34d::t_42b3fbf00068c0 556
+  s_099fa7d871e34d::t_e6c0fad4c2a3eb 482
+  s_099fa7d871e34d::t_881e188efed2fd 760
+  s_099fa7d871e34d::t_8286d9662d0628 765-767
+  s_099fa7d871e34d::t_f2dd1aeafa528b 851,854
+go/aggregator_test.go
+  s_099fa7d871e34d::t_33523aaa1dc7b7 1-195
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "97de87b8910e05ba9b1067085d09420f324b5ee6",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
