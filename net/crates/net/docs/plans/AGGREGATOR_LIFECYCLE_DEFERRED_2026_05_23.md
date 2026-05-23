@@ -25,12 +25,12 @@ Tagged `[B | H | M | L]`:
 
 | ID    | Pri | Area                  | Title                                                                                 |
 |-------|-----|-----------------------|---------------------------------------------------------------------------------------|
-| AL-1  | H   | trait surface         | `LifecycleDaemon` sibling vs spec-promised `MeshDaemon` aggregator                    |
-| AL-2  | B   | placement             | `AggregatorGroup` has no cross-node placement                                         |
-| AL-3  | H   | failure recovery      | No auto-replacement or per-replica health on `AggregatorGroup`                        |
-| AL-4  | M   | observability         | `AggregatorGroup` skips `DaemonRegistry` registration                                 |
+| AL-1  | H   | trait surface         | `LifecycleDaemon` sibling vs `MeshDaemon` — ✅ direction B (sibling + generalized to `LifecycleGroup<L>`, `e672793a`) |
+| AL-2  | B   | placement             | `AggregatorGroup` had no cross-node placement — ✅ `spawn_with_placement` via `Scheduler`, `5acf1f34`                  |
+| AL-3  | H   | failure recovery      | No per-replica health or auto-replacement — ✅ `health()` + `replace` + `HealthMonitor`, `8787b2db` / `40a1b375`        |
+| AL-4  | M   | observability         | `AggregatorGroup` skipped registry — ✅ `AggregatorRegistry` on `MeshNode`, `e50728f0`                                  |
 | AL-5  | M   | shutdown determinism  | `on_stop` JoinHandle timeout is `interval + 100ms` — can drop mid-publish work        |
-| AL-6  | M   | operator CLI          | `net aggregator spawn / ls / scale` gated on AL-2..AL-4                               |
+| AL-6  | M   | operator CLI          | `net aggregator spawn / ls / scale` — ✅ `ls` live, `spawn`/`scale` parse-only pending daemon, `cb74cc14`                |
 | AL-7  | L   | dead-code warning     | `DispatchCtx.reservation_fold` field wired but unread — ✅ `cc4aac82`                  |
 | AL-8  | L   | summary rendering     | Reservation summarizer's `Reserved { ... }` Debug bucket name is verbose              |
 
@@ -140,6 +140,22 @@ The existing test (`reservation_fold_summarizer_buckets_by_state_label`) papers 
 
 ## Cross-references
 
-- Spec: `docs/plans/SCALING_SUBNET_SPEC.md` — design intent, the "deployed via ReplicaGroup" promise these items are gated on.
+- Spec: `docs/plans/SCALING_SUBNET_SPEC.md` — design intent, the "deployed via ReplicaGroup" promise these items were gated on.
 - Prior deferred review: `docs/misc/CODE_REVIEW_2026_05_23_MULTIFOLD_DEFERRED.md` — fold-framework cleanup landed earlier the same day.
-- Slice commits: `19faf1e3` (LifecycleDaemon + impl), `09492dc5` (AggregatorGroup).
+- Slice 4 commits (subnet-scaling branch): `19faf1e3` (LifecycleDaemon + impl), `09492dc5` (AggregatorGroup).
+- Direction B commits (aggregator-lifecycle branch):
+  - `e672793a` — step 1: hoist + generalize `LifecycleGroup<L>`.
+  - `5acf1f34` — step 2: `requirements()` + `spawn_with_placement`.
+  - `e50728f0` — step 3: `AggregatorRegistry` on `MeshNode`.
+  - `8787b2db` — step 4a: `ReplicaHealth` + `LifecycleGroup::replace`.
+  - `40a1b375` — step 4b: `HealthMonitor` auto-respawn driver.
+  - `cb74cc14` — step 5: `net aggregator ls / spawn / scale`.
+
+## Remaining gaps
+
+The architecture decisions are resolved; what's left is integration work:
+
+- **AL-5** still open — `on_stop` timeout can drop mid-publish. Bounded fix: split the publish loop so the shutdown check fires between summaries within a batch, not just between ticks.
+- **AL-6 daemon process** — `spawn` and `scale` are parse-only until an aggregator-daemon binary + registry-RPC surface lands. The substrate primitives (`AggregatorRegistry`, `LifecycleGroup::spawn_with_placement`, `HealthMonitor`) are all in place.
+- **AL-8** still open — reservation summarizer bucket-name cardinality. Pure summarizer concern, no substrate dependency.
+- **Registry ↔ HealthMonitor integration** — `AggregatorRegistry` stores `LifecycleHandle`s separately, not as `LifecycleGroup`s. Auto-respawn for registry-managed groups needs a small registry refactor (hold `LifecycleGroup<AggregatorDaemon>` directly). Noted in `monitor.rs` module doc.
