@@ -3,7 +3,7 @@
 //!
 //! Phase B slice 4 of `SCALING_SUBNET_SPEC.md`. Parallel to
 //! [`ReplicaGroup`](crate::adapter::net::compute::replica_group::ReplicaGroup)
-//! for sync [`MeshDaemon`](crate::adapter::net::compute::daemon::MeshDaemon)s,
+//! for sync [`MeshDaemon`](crate::adapter::net::compute::MeshDaemon)s,
 //! but built on the async [`LifecycleDaemon`] sibling trait so
 //! aggregator lifetimes (`mesh.publish().await`, tokio
 //! intervals) can run without contorting the sync MeshDaemon
@@ -26,7 +26,7 @@
 //!   currently install these into each `MeshNode` (single-mesh
 //!   deployments share one identity); the accessor exists so
 //!   future cross-node placement can read the same derivation
-//!   the [`ReplicaGroup`] uses.
+//!   the [`ReplicaGroup`](crate::adapter::net::compute::replica_group::ReplicaGroup) uses.
 //!
 //! # What this is NOT (yet)
 //!

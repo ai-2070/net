@@ -1,5 +1,5 @@
 //! `net aggregator (inspect|query)` — operator surface for
-//! [`AggregatorDaemon`] state.
+//! the substrate's `AggregatorDaemon` state.
 //!
 //! `inspect` reads the **local** aggregator's state via the
 //! `DeckClient::aggregator_*` accessors (populated when an
@@ -9,8 +9,8 @@
 //! same convention as `subnet show` / `gateway stats`.
 //!
 //! `query` issues a `fold.query` RPC against a **remote**
-//! aggregator and prints the response. Wraps
-//! [`FoldQueryClient`] with operator-friendly flag plumbing
+//! aggregator and prints the response. Wraps the substrate's
+//! `FoldQueryClient` with operator-friendly flag plumbing
 //! (target node id parsing, fold kind selection,
 //! summarize-now vs. latest, JSON output).
 //!
@@ -36,7 +36,7 @@ pub enum AggregatorCommand {
     /// Show the local aggregator's state (source subnet, fold
     /// kinds, generation, summary cadence, recent summaries).
     Inspect(InspectArgs),
-    /// [preview] Issue a `fold.query` RPC against a remote
+    /// \[preview\] Issue a `fold.query` RPC against a remote
     /// aggregator. Today this validates flags then errors —
     /// the substrate call path needs a MeshNode wired into the
     /// deck, which the read-only CLI doesn't carry yet.

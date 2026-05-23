@@ -46,7 +46,7 @@ impl SubnetId {
     pub const GLOBAL: Self = Self(0);
 
     /// Maximum hierarchy depth supported by the encoding — same
-    /// value as the module-level [`MAX_DEPTH`] constant, exposed
+    /// value as the module-level `MAX_DEPTH` constant, exposed
     /// as an associated const so operator tooling and the SDK can
     /// reach it through the type without an extra `use`.
     pub const MAX_DEPTH: u8 = MAX_DEPTH;
@@ -204,8 +204,9 @@ impl std::fmt::Display for SubnetId {
     }
 }
 
-/// Inverse of [`Display`]: parses `"global"` (case-insensitive) or
-/// a dotted decimal form like `"3.7.2"` (each level a `u8`).
+/// Inverse of [`std::fmt::Display`]: parses `"global"`
+/// (case-insensitive) or a dotted decimal form like `"3.7.2"`
+/// (each level a `u8`).
 impl std::str::FromStr for SubnetId {
     type Err = super::SubnetError;
 

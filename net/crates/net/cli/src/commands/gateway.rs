@@ -33,10 +33,10 @@ pub enum GatewayCommand {
     Stats(StatsArgs),
     /// Enumerate the gateway's export table.
     Exports(ExportsArgs),
-    /// [preview] Add an explicit export rule for a channel. Today
-    /// this validates flags then errors — the mutate path needs a
-    /// write-capable mesh handle that the read-only CLI doesn't
-    /// own.
+    /// \[preview\] Add an explicit export rule for a channel.
+    /// Today this validates flags then errors — the mutate path
+    /// needs a write-capable mesh handle that the read-only CLI
+    /// doesn't own.
     Export(ExportArgs),
 }
 

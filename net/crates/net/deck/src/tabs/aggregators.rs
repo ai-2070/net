@@ -1,4 +1,4 @@
-//! AGGREGATORS tab — projects the running [`AggregatorDaemon`]'s
+//! AGGREGATORS tab — projects the running `AggregatorDaemon`'s
 //! latest summaries as a header + per-summary table.
 //!
 //! Reads through `DeckClient::aggregator_*` accessors. When no

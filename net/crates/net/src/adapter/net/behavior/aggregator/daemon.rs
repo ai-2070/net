@@ -391,10 +391,10 @@ impl AggregatorDaemon {
     }
 
     /// Register every configured fold-kind's summary channel in
-    /// `mesh`'s [`ChannelConfigRegistry`] with the aggregator's
-    /// `summary_visibility`. Idempotent — `insert` replaces by
-    /// name so a re-call is a no-op. Returns the count of
-    /// channels registered.
+    /// `mesh`'s [`crate::adapter::net::ChannelConfigRegistry`]
+    /// with the aggregator's `summary_visibility`. Idempotent —
+    /// `insert` replaces by name so a re-call is a no-op. Returns
+    /// the count of channels registered.
     ///
     /// Operators that want visibility-enforced delivery (e.g.
     /// `Visibility::ParentVisible` so summaries reach the

@@ -4,8 +4,7 @@
 //!
 //! Design + rationale: `docs/plans/SCALING_SUBNET_SPEC.md`
 //! Phases B + C. The async lifecycle sibling trait
-//! ([`LifecycleDaemon`]) is documented in
-//! [`lifecycle`](self::lifecycle).
+//! ([`LifecycleDaemon`]) is documented in [`lifecycle`].
 
 pub mod config;
 pub mod daemon;

@@ -2,7 +2,7 @@
 //! mesh-aware daemons.
 //!
 //! Phase B slice 4 of `SCALING_SUBNET_SPEC.md`. Defined as a
-//! **sibling** to [`MeshDaemon`](crate::adapter::net::compute::daemon::MeshDaemon)
+//! **sibling** to [`MeshDaemon`](crate::adapter::net::compute::MeshDaemon)
 //! rather than an extension because the existing trait commits
 //! to a sync-only / WASM-compatible contract (see its module
 //! doc). The aggregator role is inherently async (tokio
@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 /// Async lifecycle trait for native mesh-aware daemons. See
 /// module doc for the trait's intent and the
-/// [`MeshDaemon`](crate::adapter::net::compute::daemon::MeshDaemon)
+/// [`MeshDaemon`](crate::adapter::net::compute::MeshDaemon)
 /// distinction.
 #[async_trait]
 pub trait LifecycleDaemon: Send + Sync + 'static {
