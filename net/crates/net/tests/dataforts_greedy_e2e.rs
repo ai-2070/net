@@ -754,11 +754,12 @@ async fn greedy_blob_pull_admits_when_publisher_scope_covers_local() {
 /// blob-ref event. Pins the cross-region-scope-enforcement
 /// scenario from the plan's T-3.
 ///
-/// Now deterministic post-PR-5g: the mesh's `chain_caps` lookup
-/// uses `CapabilityIndex::get_by_origin_hash` (keyed on the
-/// wire-truncated entity origin_hash) so the publisher's caps
-/// always resolve unambiguously — no contamination from cache
-/// holders' `causal:<hex>` advertisements.
+/// Deterministic post-`WIRE_ORIGIN_HASH_64BIT`: the mesh's
+/// `chain_caps` lookup uses `MeshNode::get_node_by_origin_hash`
+/// keyed on the full 64-bit `EntityId::origin_hash()` so the
+/// publisher's caps always resolve unambiguously — no
+/// contamination from cache holders' `causal:<hex>`
+/// advertisements, and no truncation-collision ambiguity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn greedy_blob_pull_vetoes_on_cross_scope_publisher() {
     let node_a = build_node().await;
