@@ -502,13 +502,6 @@ struct DispatchCtx {
     /// `SUBPROTOCOL_CAPABILITY_ANN` packets land here via the
     /// bridge's `translate_announcement`.
     capability_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
-    /// Reservation fold shared with `MeshNode`. Allocated at
-    /// construction even when the node never publishes a
-    /// reservation — the substrate-wide aggregator surface
-    /// (`AggregatorDaemon` / `Summarizer`) treats the fold as
-    /// always-present, so a `None` here would force every
-    /// caller to discriminate.
-    reservation_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::ReservationFold>>,
     /// Dedup cache for multi-hop capability announcements, keyed by
     /// `(origin_node_id, version)`. Written by the dispatch handler
     /// before indexing + forwarding so a `(origin, version)` tuple
@@ -2947,7 +2940,6 @@ impl MeshNode {
             traversal_config: self.traversal_config.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
             capability_fold: self.capability_fold.clone(),
-            reservation_fold: self.reservation_fold.clone(),
             seen_announcements: self.seen_announcements.clone(),
             require_signed_capabilities: self.config.require_signed_capabilities,
             local_subnet: self.local_subnet,
