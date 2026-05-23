@@ -1,0 +1,34 @@
+net/crates/net/bindings/python/src/placement.rs
+  s_d9dc521a887c3e::t_2c036d89d531d0 42,54-57,66-70,73,82-91
+net/crates/net/bindings/go/compute-ffi/src/lib.rs
+  s_d9dc521a887c3e::t_23c37bfddc623a 2807-2811,2826,2829-2839
+  s_d9dc521a887c3e::t_fdf46522462b7a 1963
+  s_d9dc521a887c3e::t_79ca28c180ef6b 2900
+  s_d9dc521a887c3e::t_4179a41f074758 2948,2951
+net/crates/net/bindings/node/src/placement.rs
+  s_d9dc521a887c3e::t_bb37ac0e7e9bf9 39
+  s_d9dc521a887c3e::t_876d7e55cc430f 123,127-133
+  s_d9dc521a887c3e::t_7812f84ee199ed 81-84,99,103
+net/crates/net/bindings/python/src/lib.rs
+  s_d9dc521a887c3e::t_04aaeb83ea5b79 1882,1884
+  s_d9dc521a887c3e::t_40620b86954093 1795
+net/crates/net/bindings/node/src/lib.rs
+  s_d9dc521a887c3e::t_aeb5cbcfb1fc86 2005,2013
+  s_d9dc521a887c3e::t_e0577338a172a1 2277
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "5b82485e769d528e6b81c78ef8b59fd179a3f59c",
+  "prompts": {},
+  "sessions": {
+    "s_d9dc521a887c3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1eafc9e-4dd5-40ff-8f76-e8a5b7800252",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
