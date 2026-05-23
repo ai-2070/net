@@ -38,6 +38,7 @@
 
 pub mod config;
 pub mod daemon;
+pub mod group;
 pub mod lifecycle;
 pub mod query_client;
 pub mod query_service;
@@ -45,6 +46,7 @@ pub mod summarizer;
 
 pub use config::AggregatorConfig;
 pub use daemon::{AggregatorDaemon, AggregatorError, AggregatorPublishError};
+pub use group::AggregatorGroup;
 pub use lifecycle::{LifecycleDaemon, LifecycleError, LifecycleHandle};
 pub use query_client::{
     FoldQueryClient, FoldQueryClientError, DEFAULT_QUERY_CACHE_TTL, DEFAULT_QUERY_DEADLINE,
