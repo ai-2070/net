@@ -11,6 +11,7 @@
 //! - Proximity graph integration (PINGWAVE++)
 //! - Safety envelope enforcement
 
+pub mod aggregator;
 pub mod api;
 pub mod bloom;
 pub mod bounded_ring;
