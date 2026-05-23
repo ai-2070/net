@@ -1,0 +1,42 @@
+net/crates/net/aggregator-daemon/src/lib.rs
+  s_099fa7d871e34d::t_7e95d533bbfeb0 53-54
+  s_099fa7d871e34d::t_d63dd5a43711dd 87,101-107,110-113,122,129,133-148
+  s_099fa7d871e34d::t_2717e408a13bbd 717-780
+  s_099fa7d871e34d::t_301660f4a7ed38 275-281,283,293,297-301
+  s_099fa7d871e34d::t_207d803231ca27 382-391,399-414,416,421-529
+net/crates/net/aggregator-daemon/tests/boot_and_query.rs
+  s_099fa7d871e34d::t_e8bb8f9039cdd2 185-295
+net/crates/net/src/adapter/net/behavior/aggregator/registry_service.rs
+  s_099fa7d871e34d::t_b55db3f56c919a 54-76
+  s_099fa7d871e34d::t_95f341b72f8442 412,431,444,447-646,648-654
+  s_099fa7d871e34d::t_c1ea256653c56c 221,230,238,242-279,284-308
+  s_099fa7d871e34d::t_a2b8a7812cf266 130-143
+  s_099fa7d871e34d::t_348a780453ded2 167,169,171
+  s_099fa7d871e34d::t_ee78cd55ff865f 90-93
+  s_099fa7d871e34d::t_d512840787a846 14,16-31
+  s_099fa7d871e34d::t_65fa023545fb97 313-319,327-341
+  s_099fa7d871e34d::t_ae05ac9a883735 84-89,94-95
+  s_099fa7d871e34d::t_21a26a829fdef2 280-283
+  s_099fa7d871e34d::t_2e4bf0af148a70 660-675,677,686-701
+  s_099fa7d871e34d::t_351e672b77bd2c 146-166,168,170,172,180-184,187,191-193,195-206
+net/crates/net/src/adapter/net/behavior/aggregator/mod.rs
+  s_099fa7d871e34d::t_5575ae4b7d9d1f 27-28
+net/crates/net/src/adapter/net/behavior/aggregator/registry_client.rs
+  s_099fa7d871e34d::t_8405b39f54ae8e 107-204,215
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "5560079b3857c7c3b4ea3feded71aab59d3104c9",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
