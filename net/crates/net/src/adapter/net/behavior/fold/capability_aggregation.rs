@@ -90,14 +90,70 @@ pub enum TagMatcher {
 }
 
 impl TagMatcher {
-    /// `true` if any tag in `tags` matches this matcher.
+    /// Build a [`CompiledMatcher`] that pre-resolves expensive
+    /// per-call work (regex compile, semver bound parse, axis-key
+    /// split). Used at the top of [`Fold::aggregate`] and
+    /// [`Fold::capacity_ranking`] so the per-entry walk amortizes
+    /// the parse cost over every tag instead of paying it on each
+    /// `matches_one` invocation.
+    fn compile(&self) -> CompiledMatcher<'_> {
+        match self {
+            Self::Exact { value } => CompiledMatcher::Exact { value },
+            Self::Prefix { value } => CompiledMatcher::Prefix { value },
+            Self::Axis { axis } => CompiledMatcher::Axis { axis: *axis },
+            Self::AxisKey { axis, key } => CompiledMatcher::AxisKey { axis: *axis, key },
+            Self::Regex { pattern } => CompiledMatcher::Regex {
+                re: regex::Regex::new(pattern).ok(),
+            },
+            Self::VersionRange { axis_key, min, max } => match split_axis_key(axis_key) {
+                Some((axis, key)) => CompiledMatcher::VersionRange {
+                    axis,
+                    key,
+                    min: min.as_deref().and_then(|s| semver::Version::parse(s).ok()),
+                    max: max.as_deref().and_then(|s| semver::Version::parse(s).ok()),
+                },
+                None => CompiledMatcher::MatchesNothing,
+            },
+        }
+    }
+}
+
+/// Precompiled view of a [`TagMatcher`]. Constructed once per
+/// aggregation call and reused across every entry; consolidates
+/// the regex compile + semver parse + axis-key split that the
+/// wire-shape matcher otherwise repeats on each tag.
+///
+/// Invalid inputs (bad regex pattern, malformed axis-key) collapse
+/// to [`CompiledMatcher::MatchesNothing`] / `Regex { re: None }`
+/// so the matcher fails closed — preserving the prior
+/// "invalid → matches nothing" contract pinned by
+/// `matcher_regex_with_invalid_pattern_matches_nothing`.
+enum CompiledMatcher<'a> {
+    Exact { value: &'a str },
+    Prefix { value: &'a str },
+    Axis { axis: TaxonomyAxis },
+    AxisKey { axis: TaxonomyAxis, key: &'a str },
+    Regex { re: Option<regex::Regex> },
+    VersionRange {
+        axis: TaxonomyAxis,
+        key: &'a str,
+        min: Option<semver::Version>,
+        max: Option<semver::Version>,
+    },
+    /// Fallthrough for matchers whose construction parameters are
+    /// malformed (e.g. `VersionRange` with an unrecognized axis
+    /// prefix). Matches no tag.
+    MatchesNothing,
+}
+
+impl CompiledMatcher<'_> {
     fn matches_any(&self, tags: &[String]) -> bool {
         tags.iter().any(|t| self.matches_one(t))
     }
 
     fn matches_one(&self, raw: &str) -> bool {
         match self {
-            Self::Exact { value } => raw == value,
+            Self::Exact { value } => raw == *value,
             Self::Prefix { value } => raw.starts_with(value),
             Self::Axis { axis } => {
                 Tag::parse(raw)
@@ -109,29 +165,32 @@ impl TagMatcher {
                 .ok()
                 .and_then(|t| t.axis_key())
                 .is_some_and(|k| k.axis == *axis && k.key == *key),
-            Self::Regex { pattern } => match regex::Regex::new(pattern) {
-                Ok(re) => re.is_match(raw),
-                Err(_) => false,
-            },
-            Self::VersionRange { axis_key, min, max } => {
-                let Some(value) = string_value_for_axis_key(raw, axis_key) else {
+            Self::Regex { re } => re.as_ref().is_some_and(|r| r.is_match(raw)),
+            Self::VersionRange {
+                axis,
+                key,
+                min,
+                max,
+            } => {
+                let Some(value) = axis_value_for(raw, *axis, key) else {
                     return false;
                 };
                 let Ok(parsed) = semver::Version::parse(&value) else {
                     return false;
                 };
-                if let Some(lo) = min.as_deref().and_then(|s| semver::Version::parse(s).ok()) {
-                    if parsed < lo {
+                if let Some(lo) = min.as_ref() {
+                    if parsed < *lo {
                         return false;
                     }
                 }
-                if let Some(hi) = max.as_deref().and_then(|s| semver::Version::parse(s).ok()) {
-                    if parsed > hi {
+                if let Some(hi) = max.as_ref() {
+                    if parsed > *hi {
                         return false;
                     }
                 }
                 true
             }
+            Self::MatchesNothing => false,
         }
     }
 }
@@ -289,11 +348,12 @@ impl Fold<CapabilityFold> {
         // separately because the aggregation type decides which to
         // count.
         let mut buckets: HashMap<String, BucketAccum> = HashMap::new();
+        let compiled = matcher.as_ref().map(TagMatcher::compile);
 
         self.with_state(|state| {
             for ((_class, publisher), entry) in state.entries.iter() {
                 let membership = &entry.payload;
-                if let Some(m) = &matcher {
+                if let Some(m) = &compiled {
                     if !m.matches_any(&membership.tags) {
                         continue;
                     }
@@ -379,6 +439,7 @@ impl Fold<CapabilityFold> {
         // because we need state-broken-down counts, which the base
         // `aggregate` path collapses.
         let mut buckets: HashMap<String, CapacityAccum> = HashMap::new();
+        let compiled_matcher = query.matcher.as_ref().map(TagMatcher::compile);
 
         self.with_state(|state| {
             for ((_class, publisher), entry) in state.entries.iter() {
@@ -390,7 +451,7 @@ impl Fold<CapabilityFold> {
                 }
 
                 // Matcher gate.
-                if let Some(m) = &query.matcher {
+                if let Some(m) = &compiled_matcher {
                     if !m.matches_any(&membership.tags) {
                         continue;
                     }
@@ -1501,6 +1562,36 @@ mod tests {
             Aggregation::Count,
         );
         assert!(rows.is_empty(), "unparseable values must be skipped");
+    }
+
+    #[test]
+    fn matcher_version_range_with_unknown_axis_prefix_matches_nothing() {
+        // Compiled matcher's `MatchesNothing` arm: an axis_key whose
+        // axis prefix doesn't resolve through `TaxonomyAxis::from_prefix`
+        // must reject every entry, not panic.
+        let fold = populated_fold();
+        let rows = fold.aggregate(
+            Some(TagMatcher::VersionRange {
+                axis_key: "garbage.runtime".into(),
+                min: None,
+                max: None,
+            }),
+            GroupBy::Publisher,
+            Aggregation::Count,
+        );
+        assert!(rows.is_empty());
+
+        // Also covers the "no dot in axis_key" path.
+        let rows = fold.aggregate(
+            Some(TagMatcher::VersionRange {
+                axis_key: "no-dot-anywhere".into(),
+                min: None,
+                max: None,
+            }),
+            GroupBy::Publisher,
+            Aggregation::Count,
+        );
+        assert!(rows.is_empty());
     }
 
     // ── 6c-C: Min/MaxNumericTag ────────────────────────────────
