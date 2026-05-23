@@ -201,6 +201,23 @@ impl AggregatorDaemon {
     pub fn query_handler(self: &Arc<Self>) -> FoldQueryHandler {
         FoldQueryHandler::new(self.clone())
     }
+
+    /// One-call installation: build the query handler, register
+    /// it on `mesh` under [`FOLD_QUERY_SERVICE`], and return the
+    /// resulting `ServeHandle`. Dropping the handle tears down
+    /// the registration.
+    ///
+    /// Operators that need to register under a non-default
+    /// service name (e.g. running multiple aggregators on one
+    /// node) call `mesh.serve_rpc(name, Arc::new(daemon.query_handler()))`
+    /// directly with their chosen name.
+    pub fn install_query_service(
+        self: &Arc<Self>,
+        mesh: &Arc<crate::adapter::net::MeshNode>,
+    ) -> Result<crate::adapter::net::mesh_rpc::ServeHandle, crate::adapter::net::mesh_rpc::ServeError>
+    {
+        mesh.serve_rpc(FOLD_QUERY_SERVICE, Arc::new(self.query_handler()))
+    }
 }
 
 #[cfg(test)]
