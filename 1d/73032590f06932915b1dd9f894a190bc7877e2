@@ -1,0 +1,19 @@
+.github/workflows/coverage.yml
+  s_1481a1b87a9b66::t_486b696dfa9238 27-30,32-35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "1d73032590f06932915b1dd9f894a190bc7877e2",
+  "prompts": {},
+  "sessions": {
+    "s_1481a1b87a9b66": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b6b7d116-fc00-4178-aba1-c133ae7ca379",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
