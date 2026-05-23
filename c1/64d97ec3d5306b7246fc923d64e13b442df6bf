@@ -1,0 +1,23 @@
+go/net.h
+  s_d9dc521a887c3e::t_3ae7ac472fa047 1517-1571
+net/crates/net/include/net.go.h
+  s_d9dc521a887c3e::t_08f4e517d3485e 1524-1558
+net/crates/net/examples/capability_aggregation.c
+  s_d9dc521a887c3e::t_7ffbfa464bbb83 1-133
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "c164d97ec3d5306b7246fc923d64e13b442df6bf",
+  "prompts": {},
+  "sessions": {
+    "s_d9dc521a887c3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1eafc9e-4dd5-40ff-8f76-e8a5b7800252",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
