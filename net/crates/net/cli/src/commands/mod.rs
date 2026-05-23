@@ -26,4 +26,5 @@ pub mod peer;
 pub mod port;
 pub mod rpc;
 pub mod snapshot;
+pub mod subnet;
 pub mod version;

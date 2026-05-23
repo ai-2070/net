@@ -133,6 +133,9 @@ enum Command {
     /// NetDB local KV adapters (Cortex-backed tasks + memories).
     #[command(subcommand)]
     Netdb(commands::netdb::NetdbCommand),
+    /// Hierarchical subnet inspection (`show|ls|tree`).
+    #[command(subcommand)]
+    Subnet(commands::subnet::SubnetCommand),
     /// Emit a shell-completion script (bash/zsh/fish/powershell).
     Completion(commands::completion::CompletionArgs),
     /// Emit the troff(1) man page on stdout.
@@ -212,6 +215,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
             commands::daemon::run_ls(args, output, config_path, profile).await
         }
         Command::Netdb(cmd) => commands::netdb::run(cmd, output, config_path, profile).await,
+        Command::Subnet(cmd) => commands::subnet::run(cmd, output, config_path, profile).await,
         Command::Completion(args) => commands::completion::run::<Cli>(args),
         Command::Man => commands::man::run::<Cli>(),
     }
