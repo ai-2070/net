@@ -214,10 +214,17 @@ impl AggregatorDaemon {
     /// recent entry for the same fold-kind are dropped — see
     /// [`Self::tick_and_publish`] for the rationale. Does NOT
     /// publish onto the wire.
-    pub fn tick_once(&self) {
+    ///
+    /// Returns the novel summaries just appended (empty when the
+    /// tick was a no-op). Callers that need the freshly-produced
+    /// batch — e.g. the `SummarizeNow` RPC path — avoid a full
+    /// re-scan of the latest-summaries buffer by reading the
+    /// return value directly.
+    pub fn tick_once(&self) -> Vec<SummaryAnnouncement> {
         let batch = self.produce_summaries();
         let novel = self.filter_novel(batch);
-        self.append_to_latest(novel);
+        self.append_to_latest(novel.clone());
+        novel
     }
 
     /// `tick_once` + publish each novel summary to its

@@ -151,20 +151,35 @@ pub(crate) fn answer(
             kind: request.kind,
         });
     }
-    match request.op {
-        FoldQueryOp::LatestSummary => {}
+    let summaries: Vec<SummaryAnnouncement> = match request.op {
+        FoldQueryOp::LatestSummary => aggregator
+            .latest_summaries()
+            .into_iter()
+            .filter(|s| s.fold_kind == request.kind)
+            .collect(),
         FoldQueryOp::SummarizeNow => {
             // Run one fresh tick synchronously so the response
             // reflects the moment-of-call fold state, not the
             // last background-loop tick.
-            aggregator.tick_once();
+            let fresh: Vec<SummaryAnnouncement> = aggregator
+                .tick_once()
+                .into_iter()
+                .filter(|s| s.fold_kind == request.kind)
+                .collect();
+            // If the tick was a no-op (buckets unchanged →
+            // change-detection guard), fall back to the latest
+            // buffer so the operator gets the most recent value.
+            if fresh.is_empty() {
+                aggregator
+                    .latest_summaries()
+                    .into_iter()
+                    .filter(|s| s.fold_kind == request.kind)
+                    .collect()
+            } else {
+                fresh
+            }
         }
-    }
-    let summaries = aggregator
-        .latest_summaries()
-        .into_iter()
-        .filter(|s| s.fold_kind == request.kind)
-        .collect();
+    };
     FoldQueryResponse::Summaries {
         kind: request.kind,
         summaries,
@@ -346,6 +361,40 @@ mod tests {
         };
         let _ = answer(&agg, &req);
         assert_eq!(agg.generation(), gen_before + 1);
+    }
+
+    #[tokio::test]
+    async fn summarize_now_falls_back_to_latest_when_tick_is_a_noop() {
+        // Pin the no-op path: a second SummarizeNow against an
+        // unchanged fold returns the cached latest entry rather
+        // than an empty Vec — the change-detection guard in
+        // tick_once produces no novel summary, and the RPC handler
+        // falls back to the latest buffer.
+        let agg = aggregator_with_idle_publisher().await;
+        let req = FoldQueryRequest {
+            kind: CapabilityFold::KIND_ID,
+            op: FoldQueryOp::SummarizeNow,
+        };
+        let first = answer(&agg, &req);
+        match first {
+            FoldQueryResponse::Summaries { ref summaries, .. } => {
+                assert_eq!(summaries.len(), 1, "first tick produces a novel summary");
+            }
+            other => panic!("expected Summaries, got {other:?}"),
+        }
+        // Second call — fold state unchanged → tick_once returns
+        // empty → handler falls back to latest_summaries.
+        let second = answer(&agg, &req);
+        match second {
+            FoldQueryResponse::Summaries { summaries, .. } => {
+                assert_eq!(
+                    summaries.len(),
+                    1,
+                    "no-op tick must still return the cached latest summary"
+                );
+            }
+            other => panic!("expected Summaries, got {other:?}"),
+        }
     }
 
     #[test]
