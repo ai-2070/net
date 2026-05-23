@@ -1947,10 +1947,11 @@ impl MeshNode {
             // releases its claim on the wire hash.
             let removed_entity_id = peer_entity_ids_failure.remove(&node_id).map(|(_, eid)| eid);
             if let Some(eid) = removed_entity_id {
-                // Same wire-truncated u32-as-u64 key the inbound
-                // announcement handler uses; see the comment above
-                // `ctx.origin_hash_to_node.entry(origin_hash)`.
-                let origin_hash = eid.origin_hash() as u32 as u64;
+                // Same key the inbound announcement handler uses —
+                // the full 64-bit `EntityId::origin_hash()` since the
+                // `WIRE_ORIGIN_HASH_64BIT` cutover (wire header
+                // now carries the full u64 too).
+                let origin_hash = eid.origin_hash();
                 let mut drop_slot = false;
                 if let Some(mut slot) = origin_hash_to_node_failure.get_mut(&origin_hash) {
                     drop_slot = slot.remove(node_id);
@@ -5827,14 +5828,11 @@ impl MeshNode {
                 // node_id; a distinct node_id claiming the same
                 // wire hash promotes the slot to Multiple, which
                 // future get_node_by_origin_hash calls resolve
-                // to None.
-                // Wire packet headers carry `origin_hash` as a u32
-                // (see `protocol::PacketHeader::origin_hash`); the
-                // channel-publish path stamps `entity_id.origin_hash() as u32`.
-                // Key the reverse index on the SAME truncated form so
-                // greedy-admission lookups against `parsed.header.origin_hash`
-                // hit the slot we just installed.
-                let origin_hash = ann.entity_id.origin_hash() as u32 as u64;
+                // to None. Post-`WIRE_ORIGIN_HASH_64BIT` the wire
+                // header carries the full `EntityId::origin_hash()`
+                // u64, so the reverse-index key matches the
+                // application-layer value verbatim.
+                let origin_hash = ann.entity_id.origin_hash();
                 ctx.origin_hash_to_node
                     .entry(origin_hash)
                     .and_modify(|slot| {

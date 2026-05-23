@@ -1,7 +1,7 @@
 //! Net wire protocol definitions.
 //!
 //! This module defines the packet format for the Net L0 Transport Protocol (Net).
-//! All packets use a fixed 64-byte cache-line aligned header for optimal memory access.
+//! All packets use a fixed 68-byte header (8-byte aligned for natural u64 reads).
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -11,8 +11,13 @@ pub const MAGIC: u16 = 0x4E45;
 /// Current protocol version
 pub const VERSION: u8 = 1;
 
-/// Header size in bytes (cache-line aligned)
-pub const HEADER_SIZE: usize = 64;
+/// Header size in bytes. Widened to 68 in the
+/// `WIRE_ORIGIN_HASH_64BIT` cutover when `origin_hash` grew from
+/// u32 to u64 — see `docs/plans/WIRE_ORIGIN_HASH_64BIT.md`. The
+/// struct is `align(8)` (natural u64 alignment); the prior
+/// 64-byte cache-line alignment was reclaimed when the size left
+/// the cache-line boundary.
+pub const HEADER_SIZE: usize = 68;
 
 /// Poly1305 authentication tag size
 pub const TAG_SIZE: usize = 16;
@@ -102,7 +107,7 @@ impl PacketFlags {
     }
 }
 
-/// Net packet header - 64 bytes, cache-line aligned.
+/// Net packet header - 68 bytes, 8-byte aligned.
 ///
 /// Wire format:
 /// ```text
@@ -125,17 +130,23 @@ impl PacketFlags {
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// |                       SEQUENCE (8 bytes)                      | 48
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |                       SUBNET_ID (4 bytes)                     | 52
+/// |                                                               |
+/// +                      ORIGIN_HASH (8 bytes)                    + 56
+/// |                                                               |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |                      ORIGIN_HASH (4 bytes)                    | 56
+/// |                       SUBNET_ID (4 bytes)                     | 60
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |       FRAGMENT_ID             |        FRAGMENT_OFFSET        | 60
+/// |       FRAGMENT_ID             |        FRAGMENT_OFFSET        | 64
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |       PAYLOAD_LEN             |        EVENT_COUNT            | 64
+/// |       PAYLOAD_LEN             |        EVENT_COUNT            | 68
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// ```
+///
+/// `ORIGIN_HASH` precedes `SUBNET_ID` so the u64 sits at offset
+/// 48 (naturally 8-aligned) — putting `SUBNET_ID` first would
+/// force a 4-byte padding gap and grow the struct to 72 bytes.
 #[derive(Debug, Clone, Copy)]
-#[repr(C, align(64))]
+#[repr(C, align(8))]
 pub struct NetHeader {
     // — routing fast-path (0-11) —
     /// Magic: "NE" (0x4E45)
@@ -169,29 +180,36 @@ pub struct NetHeader {
     /// Per-stream sequence number (monotonic)
     pub sequence: u64,
 
-    // — mesh topology (48-59) —
+    // — mesh topology (48-63) —
+    /// Full 64-bit blake2 hash of the origin node identity, matching
+    /// `EntityKeypair::origin_hash()`. Widened from u32 in the
+    /// `WIRE_ORIGIN_HASH_64BIT` cutover so the reverse index
+    /// (`mesh.rs::origin_hash_to_node`) maps `origin_hash → NodeId`
+    /// unambiguously even under adversarial collision-grinding.
+    /// Declared before `subnet_id` so the u64 sits at a naturally
+    /// 8-aligned offset.
+    pub origin_hash: u64,
     /// Subnet identifier for gateway routing
     pub subnet_id: u32,
-    /// Truncated blake2 hash of origin node identity. Stays u32
-    /// (per-packet routing fast-path); application-layer
-    /// callers downcast `kp.origin_hash() as u32` when stuffing
-    /// this field. Bumping per-packet header has a much larger
-    /// blast radius than the routing-collision benefit.
-    pub origin_hash: u32,
     /// Fragment group identifier
     pub fragment_id: u16,
     /// Byte offset within original packet
     pub fragment_offset: u16,
 
-    // — payload (60-63) —
+    // — payload (64-67) —
     /// Payload length (after encryption, before tag)
     pub payload_len: u16,
     /// Number of events in payload
     pub event_count: u16,
 }
 
-// Verify header size at compile time
-const _: () = assert!(std::mem::size_of::<NetHeader>() == HEADER_SIZE);
+// Verify the in-memory size hasn't regressed past 72 bytes — the
+// natural u64-aligned size with the current field set. `HEADER_SIZE`
+// is the WIRE size (68 bytes, what to_bytes / from_bytes serialize);
+// `align(8)` rounds the in-memory `size_of` up to a multiple of 8,
+// so the assertion targets 72 directly rather than tying it to
+// `HEADER_SIZE`.
+const _: () = assert!(std::mem::size_of::<NetHeader>() == 72);
 
 impl NetHeader {
     /// Create a new header with default values.
@@ -295,14 +313,12 @@ impl NetHeader {
         self
     }
 
-    /// Set origin node hash
+    /// Set origin node hash. Carries the full u64 from
+    /// `EntityKeypair::origin_hash()` — the per-packet wire field
+    /// matches the application-layer width post-`WIRE_ORIGIN_HASH_64BIT`.
     #[inline]
-    /// Set the origin hash. Takes u64 (matches
-    /// `EntityKeypair::origin_hash()`) and downcasts to the
-    /// per-packet wire u32 — the per-packet header stays at 64
-    /// bytes; routing-hash collisions there are benign.
     pub fn with_origin(mut self, origin_hash: u64) -> Self {
-        self.origin_hash = origin_hash as u32;
+        self.origin_hash = origin_hash;
         self
     }
 
@@ -323,9 +339,13 @@ impl NetHeader {
     ///
     /// This binds the encrypted payload to the immutable header fields, preventing
     /// an attacker from modifying any field without breaking AEAD verification.
+    ///
+    /// 56 bytes after the `WIRE_ORIGIN_HASH_64BIT` cutover (was 52
+    /// when `origin_hash` was u32). The trailing fragment / payload
+    /// slots all shifted 4 bytes later in lockstep.
     #[inline]
-    pub fn aad(&self) -> [u8; 52] {
-        let mut aad = [0u8; 52];
+    pub fn aad(&self) -> [u8; 56] {
+        let mut aad = [0u8; 56];
         // routing fast-path (hop_count excluded: mutable in transit)
         aad[0..2].copy_from_slice(&self.magic.to_le_bytes());
         aad[2] = self.version;
@@ -340,14 +360,16 @@ impl NetHeader {
         aad[12..20].copy_from_slice(&self.session_id.to_le_bytes());
         aad[20..28].copy_from_slice(&self.stream_id.to_le_bytes());
         aad[28..36].copy_from_slice(&self.sequence.to_le_bytes());
-        // mesh topology
-        aad[36..40].copy_from_slice(&self.subnet_id.to_le_bytes());
-        aad[40..44].copy_from_slice(&self.origin_hash.to_le_bytes());
-        aad[44..46].copy_from_slice(&self.fragment_id.to_le_bytes());
-        aad[46..48].copy_from_slice(&self.fragment_offset.to_le_bytes());
+        // mesh topology — origin_hash before subnet_id to mirror
+        // the in-memory layout (origin_hash sits at 8-aligned
+        // offset 48; subnet_id follows at 56).
+        aad[36..44].copy_from_slice(&self.origin_hash.to_le_bytes());
+        aad[44..48].copy_from_slice(&self.subnet_id.to_le_bytes());
+        aad[48..50].copy_from_slice(&self.fragment_id.to_le_bytes());
+        aad[50..52].copy_from_slice(&self.fragment_offset.to_le_bytes());
         // payload metadata
-        aad[48..50].copy_from_slice(&self.payload_len.to_le_bytes());
-        aad[50..52].copy_from_slice(&self.event_count.to_le_bytes());
+        aad[52..54].copy_from_slice(&self.payload_len.to_le_bytes());
+        aad[54..56].copy_from_slice(&self.event_count.to_le_bytes());
         aad
     }
 
@@ -373,9 +395,10 @@ impl NetHeader {
         cursor.put_u64_le(self.session_id);
         cursor.put_u64_le(self.stream_id);
         cursor.put_u64_le(self.sequence);
-        // mesh topology
+        // mesh topology — origin_hash before subnet_id to match
+        // the in-memory layout post-`WIRE_ORIGIN_HASH_64BIT`.
+        cursor.put_u64_le(self.origin_hash);
         cursor.put_u32_le(self.subnet_id);
-        cursor.put_u32_le(self.origin_hash);
         cursor.put_u16_le(self.fragment_id);
         cursor.put_u16_le(self.fragment_offset);
         // payload
@@ -415,8 +438,8 @@ impl NetHeader {
         let stream_id = cursor.get_u64_le();
         let sequence = cursor.get_u64_le();
 
+        let origin_hash = cursor.get_u64_le();
         let subnet_id = cursor.get_u32_le();
-        let origin_hash = cursor.get_u32_le();
         let fragment_id = cursor.get_u16_le();
         let fragment_offset = cursor.get_u16_le();
 
@@ -620,7 +643,12 @@ mod tests {
 
     #[test]
     fn test_header_size() {
-        assert_eq!(std::mem::size_of::<NetHeader>(), HEADER_SIZE);
+        // Wire size — what `to_bytes` serializes and `from_bytes`
+        // expects on the input slice.
+        assert_eq!(HEADER_SIZE, 68);
+        // In-memory size — `align(8)` rounds the natural 68-byte
+        // field layout up to a multiple of 8.
+        assert_eq!(std::mem::size_of::<NetHeader>(), 72);
     }
 
     #[test]
