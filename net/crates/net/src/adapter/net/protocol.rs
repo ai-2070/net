@@ -696,6 +696,74 @@ mod tests {
     }
 
     #[test]
+    fn origin_hash_preserves_high_bits_across_wire_roundtrip() {
+        // Regression for the `WIRE_ORIGIN_HASH_64BIT` cutover.
+        // The pre-cutover wire field was u32, so the high 32 bits
+        // of `EntityId::origin_hash()` were silently truncated on
+        // every packet. Pin that a hash with bits set above 2^32
+        // survives serialize → deserialize intact.
+        const HIGH_BITS_HASH: u64 = 0xCAFEBABE_DEADBEEF;
+        debug_assert!(
+            HIGH_BITS_HASH > u32::MAX as u64,
+            "test hash must exercise the high 32 bits"
+        );
+
+        let header = NetHeader::new(
+            0xAAAA_BBBB_CCCC_DDDD,
+            0,
+            1,
+            [0u8; NONCE_SIZE],
+            64,
+            1,
+            PacketFlags::NONE,
+        )
+        .with_origin(HIGH_BITS_HASH);
+        assert_eq!(header.origin_hash, HIGH_BITS_HASH);
+
+        let bytes = header.to_bytes();
+        let parsed = NetHeader::from_bytes(&bytes).expect("parse");
+        assert_eq!(parsed.origin_hash, HIGH_BITS_HASH);
+
+        // The AAD covers origin_hash (offsets 36..44 post-cutover); a
+        // single bit flipped anywhere in the 8-byte slice must change
+        // the AAD output — proves the field is fully authenticated,
+        // not just the low 32 bits.
+        let aad_full = header.aad();
+        let mut tampered = header;
+        tampered.origin_hash ^= 1u64 << 33; // bit only present in the high half
+        let aad_tampered = tampered.aad();
+        assert_ne!(
+            aad_full, aad_tampered,
+            "AAD must authenticate all 64 bits of origin_hash"
+        );
+    }
+
+    #[test]
+    fn header_validation_field_isolation() {
+        // Adversarial pair: two `origin_hash` values whose low 32
+        // bits collide (`u32::MAX & both = 0xDEADBEEF`) but whose
+        // full u64 values differ. Pre-cutover the wire would have
+        // collapsed both to the same routing key; post-cutover the
+        // distinct high bits survive and the receiver sees the
+        // correct full value.
+        const LOW_COMMON: u32 = 0xDEAD_BEEF;
+        let a: u64 = LOW_COMMON as u64;
+        let b: u64 = (0x4242_4242u64 << 32) | (LOW_COMMON as u64);
+        assert_eq!(a as u32, b as u32);
+        assert_ne!(a, b);
+
+        let mk = |h: u64| -> NetHeader {
+            NetHeader::new(1, 0, 1, [0u8; NONCE_SIZE], 0, 0, PacketFlags::NONE).with_origin(h)
+        };
+        let ha = NetHeader::from_bytes(&mk(a).to_bytes()).unwrap();
+        let hb = NetHeader::from_bytes(&mk(b).to_bytes()).unwrap();
+        assert_ne!(
+            ha.origin_hash, hb.origin_hash,
+            "low-32-bit collision must not collapse on the wire"
+        );
+    }
+
+    #[test]
     fn test_header_validation() {
         let header = NetHeader::new(0, 0, 0, [0u8; NONCE_SIZE], 1024, 0, PacketFlags::NONE);
         assert!(header.validate());
@@ -737,7 +805,9 @@ mod tests {
         .with_subnet(0x42);
 
         let aad = header.aad();
-        assert_eq!(aad.len(), 52);
+        // AAD widened from 52 → 56 in `WIRE_ORIGIN_HASH_64BIT` when
+        // origin_hash grew u32 → u64.
+        assert_eq!(aad.len(), 56);
 
         // Verify magic
         assert_eq!(u16::from_le_bytes([aad[0], aad[1]]), MAGIC);

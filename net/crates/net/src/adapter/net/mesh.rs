@@ -10647,6 +10647,80 @@ mod fold_publisher_helpers_tests {
 
 
     #[tokio::test]
+    async fn origin_hash_index_first_write_wins_on_adversarial_collision() {
+        // Post-`WIRE_ORIGIN_HASH_64BIT` policy: `origin_hash_to_node`
+        // uses first-write-wins. Two distinct node_ids claiming the
+        // same u64 origin_hash (~2^32 adversarial work to engineer)
+        // resolve to whichever was inserted first; the second
+        // claimant cannot displace the established slot.
+        //
+        // Pre-cutover the slot promoted to `Multiple` and lookups
+        // returned `None` for the ambiguous case — that branch is
+        // gone with the truncation it was designed to handle.
+        let node = build_node_for_test().await;
+        let hash = 0xCAFE_BABE_DEAD_BEEF_u64;
+        let first = 0xAAAA_u64;
+        let second = 0xBBBB_u64;
+
+        // Empty slot.
+        assert_eq!(node.get_node_by_origin_hash(hash), None);
+
+        // First claimant lands.
+        node.origin_hash_to_node.entry(hash).or_insert(first);
+        assert_eq!(node.get_node_by_origin_hash(hash), Some(first));
+
+        // Second adversarial claimant — `or_insert` is a no-op
+        // because the entry already exists.
+        node.origin_hash_to_node.entry(hash).or_insert(second);
+        assert_eq!(
+            node.get_node_by_origin_hash(hash),
+            Some(first),
+            "first-write-wins must not be displaced by an adversarial grind"
+        );
+
+        // Removal via `remove_if` only drops when the predicate
+        // matches the current claimant — mirrors what the
+        // failure-detector eviction does.
+        node.origin_hash_to_node
+            .remove_if(&hash, |_, claimant| *claimant == second);
+        assert_eq!(
+            node.get_node_by_origin_hash(hash),
+            Some(first),
+            "remove_if on non-claimant is a no-op"
+        );
+        node.origin_hash_to_node
+            .remove_if(&hash, |_, claimant| *claimant == first);
+        assert_eq!(
+            node.get_node_by_origin_hash(hash),
+            None,
+            "remove_if on the current claimant clears the slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn origin_hash_index_distinguishes_low32_collisions() {
+        // Regression for the original cutover motivation: pre-
+        // `WIRE_ORIGIN_HASH_64BIT` the slot keyed on the truncated
+        // u32 form, so two `EntityId`s whose low 32 bits collided
+        // but whose full u64 hashes differed would conflict on the
+        // wire. Post-cutover the index keys on the full u64, so the
+        // two publishers occupy distinct slots and both lookups
+        // succeed.
+        let node = build_node_for_test().await;
+        let low_common: u32 = 0xDEAD_BEEF;
+        let hash_a: u64 = low_common as u64;
+        let hash_b: u64 = (0x4242_4242_u64 << 32) | (low_common as u64);
+        assert_eq!(hash_a as u32, hash_b as u32);
+        assert_ne!(hash_a, hash_b);
+
+        node.origin_hash_to_node.insert(hash_a, 0xAAAA);
+        node.origin_hash_to_node.insert(hash_b, 0xBBBB);
+
+        assert_eq!(node.get_node_by_origin_hash(hash_a), Some(0xAAAA));
+        assert_eq!(node.get_node_by_origin_hash(hash_b), Some(0xBBBB));
+    }
+
+    #[tokio::test]
     async fn capability_fold_is_wired_at_construction() {
         // Sub-step 3B-1 contract: every freshly-built MeshNode
         // owns a CapabilityFold registered with the node's
