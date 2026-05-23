@@ -33,6 +33,12 @@ impl SubnetId {
     /// Global / no subnet.
     pub const GLOBAL: Self = Self(0);
 
+    /// Maximum hierarchy depth supported by the encoding — same
+    /// value as the module-level [`MAX_DEPTH`] constant, exposed
+    /// as an associated const so operator tooling and the SDK can
+    /// reach it through the type without an extra `use`.
+    pub const MAX_DEPTH: u8 = MAX_DEPTH;
+
     /// Create a subnet ID from hierarchy levels (up to 4).
     ///
     /// Levels are packed MSB-first: `&[3, 7]` becomes `0x03_07_00_00`.

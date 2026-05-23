@@ -136,6 +136,9 @@ enum Command {
     /// Hierarchical subnet inspection (`show|ls|tree`).
     #[command(subcommand)]
     Subnet(commands::subnet::SubnetCommand),
+    /// `SubnetGateway` stats + export-table operator surface.
+    #[command(subcommand)]
+    Gateway(commands::gateway::GatewayCommand),
     /// Emit a shell-completion script (bash/zsh/fish/powershell).
     Completion(commands::completion::CompletionArgs),
     /// Emit the troff(1) man page on stdout.
@@ -216,6 +219,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         }
         Command::Netdb(cmd) => commands::netdb::run(cmd, output, config_path, profile).await,
         Command::Subnet(cmd) => commands::subnet::run(cmd, output, config_path, profile).await,
+        Command::Gateway(cmd) => commands::gateway::run(cmd, output, config_path, profile).await,
         Command::Completion(args) => commands::completion::run::<Cli>(args),
         Command::Man => commands::man::run::<Cli>(),
     }

@@ -17,6 +17,7 @@ pub mod cap;
 pub mod completion;
 pub mod daemon;
 pub mod db;
+pub mod gateway;
 pub mod ice;
 pub mod identity;
 pub mod logs;
