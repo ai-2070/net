@@ -78,24 +78,40 @@ Direct wire / lookup-key surface:
   `MigrationRegistry::origin_hash`; no such field exists in the
   current tree.)
 
-Header-layout consequences:
+Header-layout consequences (decision: grow `HEADER_SIZE` to 68):
 
-- `protocol::HEADER_SIZE = 64` (`protocol.rs:15`) is cache-line
-  aligned, with a compile-time assertion `size_of::<NetHeader>() ==
-  64` at `protocol.rs:194`. `origin_hash` sits at byte offset 56
-  per the layout diagram (`protocol.rs:107-136`). Growing it by 4
-  bytes either:
-  - bumps `HEADER_SIZE` to 68 (alignment lost; `MAX_PAYLOAD_SIZE =
-    MAX_PACKET_SIZE - HEADER_SIZE - TAG_SIZE` at `protocol.rs:27`
-    shrinks by 4 bytes per packet), or
-  - reclaims 4 bytes elsewhere in the header. Concrete candidates:
-    `fragment_id` and `fragment_offset` are u16 pairs in the
-    current layout — one could be narrowed or a pair merged if the
-    fragmentation scheme tolerates it. Audit before picking.
+- `protocol::HEADER_SIZE = 64` (`protocol.rs:15`) bumps to 68.
+  `MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - HEADER_SIZE - TAG_SIZE`
+  at `protocol.rs:27` shrinks by 4 bytes per packet (~0.3% of a
+  1300-byte MTU). The compile-time assertion at `protocol.rs:194`
+  updates with the constant.
+- **`#[repr(C, align(64))]` on `NetHeader` (`protocol.rs:138`)
+  must change to `#[repr(C, align(8))]` or bare `#[repr(C)]`.**
+  Keeping `align(64)` while the struct grows to 68 bytes makes
+  Rust round `size_of::<NetHeader>()` up to the next multiple of
+  the alignment — i.e. 128 — and every packet pays the padded
+  bytes. The compile-time assertion catches it but the change is
+  easy to miss in review. Natural u64 alignment (`align(8)`) is
+  what every CPU built this decade reads at full speed; the
+  cache-line-alignment doc comments at `protocol.rs:4`, `:105`,
+  `:134`, `:302` update in lockstep.
+- Header layout diagram (`protocol.rs:107-136`) extends: the
+  `ORIGIN_HASH` row at offset 56 grows from 4 → 8 bytes; the
+  `FRAGMENT_ID | FRAGMENT_OFFSET` row shifts to offset 64; the
+  `PAYLOAD_LEN | EVENT_COUNT` row shifts to offset 68. Total grows
+  from 64 → 68.
+- Codebase grep confirmed no other load-bearing bare `64`
+  literals — every `HEADER_SIZE` consumer references the constant
+  symbolically. Socket buffer sizes (`64 * 1024 * 1024`), pool
+  slot counts (`packet_pool_size: 64`), batch capacity hints, and
+  Ed25519 signature arrays (`[u8; 64]`) are unrelated and stay
+  put. `align(64)` appears exactly once in the codebase (on
+  `NetHeader`).
 
-  The reclamation path preserves alignment and MTU math but costs
-  an audit of the rest of the header layout. Decide before
-  implementing — this is the gating call.
+The alternative — reclaiming 4 bytes from `fragment_id` /
+`fragment_offset` — is rejected: it preserves alignment and MTU
+math but constrains the fragmentation scheme for a 4-byte
+savings that doesn't matter at application latency. Grow.
 
 Reverse-index simplification (folds in with the wire change, no
 deprecation gate):
@@ -142,19 +158,31 @@ hard break. Operators upgrade their whole mesh in one step.
 
 The change set:
 
-1. Decide the header-layout question above (grow to 68 vs. reclaim
-   4 bytes). Update `HEADER_SIZE` and the `size_of` assertion
-   accordingly.
-2. Widen `NetHeader::origin_hash` to `u64`; flip `put_u32_le` /
-   `get_u32_le` to the u64 variants.
-3. Drop `as u32` in `NetHeader::with_origin`.
-4. Drop `as u32 as u64` at both `origin_hash_to_node` population
-   sites.
-5. Widen `RpcInboundEvent::origin_hash` to `u64`.
-6. Replace `OriginHashSlot` with `Option<NodeId>`; delete
-   `unique()`, `is_origin_hash_ambiguous`, and the `Multiple`-arm
-   branches in greedy/gravity/blob admission.
-7. Verify Go FFI round-trips a high-bits-set `origin_hash`.
+1. Bump `protocol::HEADER_SIZE` from 64 to 68 (`protocol.rs:15`).
+   The `size_of::<NetHeader>() == HEADER_SIZE` assertion at
+   `protocol.rs:194` and the matching runtime check at
+   `protocol.rs:623` pick up the new value automatically.
+2. Change `#[repr(C, align(64))]` on `NetHeader`
+   (`protocol.rs:138`) to `#[repr(C, align(8))]` so the struct
+   isn't padded to 128 bytes. Update the "cache-line aligned"
+   doc-comments at `protocol.rs:4`, `:105`, `:134`, `:302`.
+3. Widen `NetHeader::origin_hash` to `u64`; flip `put_u32_le` /
+   `get_u32_le` to the u64 variants in `to_bytes` /
+   `from_bytes` (`protocol.rs:378`, `:419`). Update the ASCII
+   header-layout diagram (`protocol.rs:107-136`) to reflect the
+   new 8-byte field and shifted trailer rows.
+4. Drop `as u32` in `NetHeader::with_origin` (`protocol.rs:305`).
+5. Drop `as u32 as u64` at both `origin_hash_to_node` population
+   sites (`mesh.rs:1953`, `:5837`).
+6. Widen `RpcInboundEvent::origin_hash` to `u64`
+   (`cortex/rpc.rs:950`).
+7. Replace `OriginHashSlot` (`mesh.rs:112`) with
+   `Option<NodeId>`; delete `unique()`,
+   `is_origin_hash_ambiguous` (`mesh.rs:8936`), and the
+   `Multiple`-arm branches in greedy/gravity/blob admission
+   (`mesh.rs:4540`). Delete the collision-insertion/demotion test
+   fixtures at `mesh.rs:10795-10809`.
+8. Verify Go FFI round-trips a high-bits-set `origin_hash`.
 
 ## Tests
 
@@ -185,9 +213,10 @@ The change set:
 
 ## Effort
 
-Implementation: small once the header-layout decision is made — one
-wire-format struct change, two cast cleanups, one `RpcInboundEvent`
-widen, `OriginHashSlot` collapse. Tests: small (4 pins). Go FFI
+Implementation: small. One wire-format struct change (header grows
+64 → 68, `align(64)` → `align(8)`, `origin_hash: u32 → u64`,
+diagram update), two cast cleanups, one `RpcInboundEvent` widen,
+`OriginHashSlot` collapse. Tests: small (4 pins). Go FFI
 verification: small.
 
 Total: 2–3 sessions of focused work.
