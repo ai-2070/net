@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/subnet/error.rs
+  s_1481a1b87a9b66::t_b16406ef527216 42-54
+net/crates/net/cli/src/commands/gateway.rs
+  s_1481a1b87a9b66::t_7c326c82efcf6f 177-179,181-182
+net/crates/net/src/adapter/net/subnet/id.rs
+  s_1481a1b87a9b66::t_4be60019d6203d 207-245
+  s_1481a1b87a9b66::t_4bc73200c86d49 387-424
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "bdf1cb1010afd7e6df7607c60e8bd3d33d2fddb7",
+  "prompts": {},
+  "sessions": {
+    "s_1481a1b87a9b66": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b6b7d116-fc00-4178-aba1-c133ae7ca379",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
