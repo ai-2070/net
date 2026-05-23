@@ -36,8 +36,10 @@ pub enum AggregatorCommand {
     /// Show the local aggregator's state (source subnet, fold
     /// kinds, generation, summary cadence, recent summaries).
     Inspect(InspectArgs),
-    /// Issue a `fold.query` RPC against a remote aggregator and
-    /// print the response.
+    /// [preview] Issue a `fold.query` RPC against a remote
+    /// aggregator. Today this validates flags then errors —
+    /// the substrate call path needs a MeshNode wired into the
+    /// deck, which the read-only CLI doesn't carry yet.
     Query(QueryArgs),
 }
 
