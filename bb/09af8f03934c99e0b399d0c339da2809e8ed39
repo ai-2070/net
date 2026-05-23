@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/behavior/fold/capability_aggregation.rs
+  s_099fa7d871e34d::t_e1ba2f12dd9f57 1567-1596
+  s_099fa7d871e34d::t_37c02322a7d8c9 442,454
+  s_099fa7d871e34d::t_ec0e12a26cbbe5 93-149,156,168-175,181-182,186-187,193
+  s_099fa7d871e34d::t_7ad5ecdbf4b02a 351,356
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "bb09af8f03934c99e0b399d0c339da2809e8ed39",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
