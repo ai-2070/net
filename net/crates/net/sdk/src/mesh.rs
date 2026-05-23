@@ -872,8 +872,8 @@ impl Mesh {
     /// // summed count column populated.
     /// let view = node.capability_capacity_ranking(
     ///     CapacityQuery {
-    ///         matcher: Some(TagMatcher::Prefix("hardware.gpu".into())),
-    ///         group_by: GroupBy::TagStem("hardware.gpu".into()),
+    ///         matcher: Some(TagMatcher::Prefix { value: "hardware.gpu".into() }),
+    ///         group_by: GroupBy::TagStem { prefix: "hardware.gpu".into() },
     ///         max_rtt_ms: None,
     ///         sum_axis_key: Some("hardware.gpu.count".into()),
     ///         limit: 5,
