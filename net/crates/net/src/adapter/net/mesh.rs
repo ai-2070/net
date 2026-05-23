@@ -534,11 +534,12 @@ struct DispatchCtx {
     /// announcement dispatch after signature verification. Load-
     /// bearing for channel auth.
     peer_entity_ids: Arc<DashMap<u64, EntityId>>,
-    /// Reverse index: wire `origin_hash` → set of node_ids
-    /// claiming it. Populated alongside `peer_entity_ids` at
-    /// TOFU pin time. Used by the greedy-chain admission gate
-    /// to detect truncation collisions: a unique-claimant slot
-    /// resolves to a single node, an ambiguous slot fails-closed.
+    /// Reverse index: wire `origin_hash` → publisher's `node_id`.
+    /// Populated alongside `peer_entity_ids` at TOFU pin time on
+    /// a first-write-wins basis — an established claimant can't
+    /// be displaced by a different node grinding a colliding u64.
+    /// Used by the greedy-chain admission gate to resolve the
+    /// publisher's caps without consulting the last-hop peer.
     origin_hash_to_node: Arc<DashMap<u64, u64>>,
     /// Shared token cache, populated by subscriber-presented tokens
     /// plus caller-side pre-installs. `None` disables the
@@ -1650,13 +1651,13 @@ pub struct MeshNode {
     /// without it, `require_token` channels can't match a token's
     /// `subject` to the subscribing peer.
     peer_entity_ids: Arc<DashMap<u64, EntityId>>,
-    /// Reverse index: publisher's wire-`origin_hash` projection
-    /// → set of node_ids claiming the slot. Populated alongside
-    /// `peer_entity_ids` at TOFU pin time. Consulted by the
-    /// greedy-chain admission gate to detect truncation
-    /// collisions: an unambiguous slot resolves to one node,
-    /// an ambiguous slot fails-closed for any caller that wants
-    /// "publisher of this hash."
+    /// Reverse index: publisher's wire `origin_hash` →
+    /// publisher's `node_id`. Populated alongside
+    /// `peer_entity_ids` at TOFU pin time on a first-write-wins
+    /// basis: an established slot is never displaced by a later
+    /// claimant, so an adversary grinding a colliding keypair
+    /// (~2^32 work for a full-u64 collision) cannot dislodge a
+    /// legitimate publisher.
     origin_hash_to_node: Arc<DashMap<u64, u64>>,
     /// Shared token cache used by the channel-auth path. When
     /// `None`, `can_publish` / `can_subscribe` fall back to a

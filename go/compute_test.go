@@ -323,11 +323,6 @@ func TestIdentityOriginHash_PreservesHighBitsAcrossFFI(t *testing.T) {
 		t.Fatalf("handle origin_hash = %#x, identity origin_hash = %#x; "+
 			"high bits diverged across the spawn FFI surface", got, highHash)
 	}
-	if got&highMask == 0 {
-		t.Fatalf("daemon handle reported zero high bits (%#x) for a "+
-			"high-bits identity (%#x); truncation on the daemon FFI surface",
-			got, highHash)
-	}
 }
 
 func TestDaemonSpawn_ReturnsHandleWithOriginHash(t *testing.T) {

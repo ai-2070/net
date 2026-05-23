@@ -11,13 +11,17 @@ pub const MAGIC: u16 = 0x4E45;
 /// Current protocol version
 pub const VERSION: u8 = 1;
 
-/// Header size in bytes. Widened to 68 in the
-/// `WIRE_ORIGIN_HASH_64BIT` cutover when `origin_hash` grew from
-/// u32 to u64 — see `docs/plans/WIRE_ORIGIN_HASH_64BIT.md`. The
-/// struct is `align(8)` (natural u64 alignment); the prior
-/// 64-byte cache-line alignment was reclaimed when the size left
-/// the cache-line boundary.
+/// Header size in bytes. The struct is `align(8)` for natural
+/// u64 reads; `size_of::<NetHeader>()` rounds up to 72 to honour
+/// that alignment, but only `HEADER_SIZE` bytes hit the wire.
 pub const HEADER_SIZE: usize = 68;
+
+/// Wire offset of the `payload_len` field. Exposed so the packet
+/// builder can patch the length in-place after AEAD encryption
+/// (which mutates `payload.len()`) without re-serialising the
+/// whole header. Keep in lockstep with the field's position in
+/// `NetHeader::to_bytes` / `from_bytes`.
+pub const PAYLOAD_LEN_OFFSET: usize = 64;
 
 /// Poly1305 authentication tag size
 pub const TAG_SIZE: usize = 16;
@@ -182,10 +186,10 @@ pub struct NetHeader {
 
     // — mesh topology (48-63) —
     /// Full 64-bit blake2 hash of the origin node identity, matching
-    /// `EntityKeypair::origin_hash()`. Widened from u32 in the
-    /// `WIRE_ORIGIN_HASH_64BIT` cutover so the reverse index
-    /// (`mesh.rs::origin_hash_to_node`) maps `origin_hash → NodeId`
-    /// unambiguously even under adversarial collision-grinding.
+    /// `EntityKeypair::origin_hash()`. The reverse index
+    /// (`mesh.rs::origin_hash_to_node`) maps this u64 to the
+    /// publisher's `NodeId` — unambiguously, even under adversarial
+    /// collision-grinding (~2^32 work per target).
     /// Declared before `subnet_id` so the u64 sits at a naturally
     /// 8-aligned offset.
     pub origin_hash: u64,
@@ -314,8 +318,8 @@ impl NetHeader {
     }
 
     /// Set origin node hash. Carries the full u64 from
-    /// `EntityKeypair::origin_hash()` — the per-packet wire field
-    /// matches the application-layer width post-`WIRE_ORIGIN_HASH_64BIT`.
+    /// `EntityKeypair::origin_hash()`; the per-packet wire field
+    /// matches the application-layer width.
     #[inline]
     pub fn with_origin(mut self, origin_hash: u64) -> Self {
         self.origin_hash = origin_hash;
@@ -339,10 +343,6 @@ impl NetHeader {
     ///
     /// This binds the encrypted payload to the immutable header fields, preventing
     /// an attacker from modifying any field without breaking AEAD verification.
-    ///
-    /// 56 bytes after the `WIRE_ORIGIN_HASH_64BIT` cutover (was 52
-    /// when `origin_hash` was u32). The trailing fragment / payload
-    /// slots all shifted 4 bytes later in lockstep.
     #[inline]
     pub fn aad(&self) -> [u8; 56] {
         let mut aad = [0u8; 56];
@@ -805,8 +805,6 @@ mod tests {
         .with_subnet(0x42);
 
         let aad = header.aad();
-        // AAD widened from 52 → 56 in `WIRE_ORIGIN_HASH_64BIT` when
-        // origin_hash grew u32 → u64.
         assert_eq!(aad.len(), 56);
 
         // Verify magic
