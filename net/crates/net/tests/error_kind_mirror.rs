@@ -111,8 +111,14 @@ fn every_registry_error_define_matches_rust_constant() {
             "NET_REGISTRY_ERR_SPAWN_NOT_SUPPORTED",
             NET_REGISTRY_ERR_SPAWN_NOT_SUPPORTED,
         ),
-        ("NET_REGISTRY_ERR_UNKNOWN_KIND", NET_REGISTRY_ERR_UNKNOWN_KIND),
-        ("NET_REGISTRY_ERR_INVALID_ARGS", NET_REGISTRY_ERR_INVALID_ARGS),
+        (
+            "NET_REGISTRY_ERR_UNKNOWN_KIND",
+            NET_REGISTRY_ERR_UNKNOWN_KIND,
+        ),
+        (
+            "NET_REGISTRY_ERR_INVALID_ARGS",
+            NET_REGISTRY_ERR_INVALID_ARGS,
+        ),
     ];
 
     // Header → Rust (catches "header has macro Rust doesn't").
@@ -158,7 +164,10 @@ fn every_registry_error_kind_has_stable_string_discriminant() {
         (NET_REGISTRY_ERR_TRANSPORT, "transport"),
         (NET_REGISTRY_ERR_CODEC, "codec"),
         (NET_REGISTRY_ERR_UNKNOWN_TEMPLATE, "unknown-template"),
-        (NET_REGISTRY_ERR_DUPLICATE_GROUP_NAME, "duplicate-group-name"),
+        (
+            NET_REGISTRY_ERR_DUPLICATE_GROUP_NAME,
+            "duplicate-group-name",
+        ),
         (NET_REGISTRY_ERR_SPAWN_REJECTED, "spawn-rejected"),
         (NET_REGISTRY_ERR_SPAWN_NOT_SUPPORTED, "spawn-not-supported"),
         (NET_REGISTRY_ERR_UNKNOWN_KIND, "unknown-kind"),

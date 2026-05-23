@@ -323,9 +323,7 @@ impl PyFoldQueryClient {
     /// Override the cache TTL in milliseconds. `0` disables the
     /// cache entirely. Warmed cache survives the adjustment.
     fn with_ttl(slf: PyRef<'_, Self>, millis: u64) -> PyRef<'_, Self> {
-        slf.inner
-            .write()
-            .set_ttl_mut(Duration::from_millis(millis));
+        slf.inner.write().set_ttl_mut(Duration::from_millis(millis));
         slf
     }
 

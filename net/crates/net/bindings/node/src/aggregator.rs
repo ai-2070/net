@@ -120,7 +120,9 @@ pub struct SummaryBucketJs {
     pub count: BigInt,
 }
 
-impl From<&::net::adapter::net::behavior::aggregator::SummaryAnnouncement> for SummaryAnnouncementJs {
+impl From<&::net::adapter::net::behavior::aggregator::SummaryAnnouncement>
+    for SummaryAnnouncementJs
+{
     fn from(s: &::net::adapter::net::behavior::aggregator::SummaryAnnouncement) -> Self {
         Self {
             fold_kind: u32::from(s.fold_kind),
