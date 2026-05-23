@@ -14,14 +14,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use parking_lot::RwLock;
 
 use super::query_service::{
     FoldQueryError, FoldQueryOp, FoldQueryRequest, FoldQueryResponse, FOLD_QUERY_SERVICE,
 };
 use super::summarizer::SummaryAnnouncement;
-use crate::adapter::net::mesh_rpc::{CallOptions, RpcError};
+use crate::adapter::net::mesh_rpc::{typed_call, RpcError, TypedCallError};
 use crate::adapter::net::MeshNode;
 
 /// Default cache TTL — the plan's locked value.
@@ -58,9 +57,12 @@ impl From<RpcError> for FoldQueryClientError {
     }
 }
 
-impl From<postcard::Error> for FoldQueryClientError {
-    fn from(e: postcard::Error) -> Self {
-        Self::Codec(e.to_string())
+impl From<TypedCallError> for FoldQueryClientError {
+    fn from(e: TypedCallError) -> Self {
+        match e {
+            TypedCallError::Transport(t) => Self::Transport(t),
+            TypedCallError::Codec(c) => Self::Codec(c),
+        }
     }
 }
 
@@ -233,16 +235,8 @@ impl FoldQueryClient {
         op: FoldQueryOp,
     ) -> Result<Vec<SummaryAnnouncement>, FoldQueryClientError> {
         let request = FoldQueryRequest { kind, op };
-        let body = postcard::to_allocvec(&request)?;
-        let opts = CallOptions {
-            deadline: Some(Instant::now() + self.deadline),
-            ..Default::default()
-        };
-        let reply = self
-            .mesh
-            .call(target_node_id, service, Bytes::from(body), opts)
-            .await?;
-        let response: FoldQueryResponse = postcard::from_bytes(&reply.body)?;
+        let response: FoldQueryResponse =
+            typed_call(&self.mesh, target_node_id, service, &request, self.deadline).await?;
         match response {
             FoldQueryResponse::Summaries { summaries, .. } => Ok(summaries),
             FoldQueryResponse::Error(e) => Err(FoldQueryClientError::Server(e)),

@@ -3062,6 +3062,67 @@ pub enum ServeError {
 }
 
 // ============================================================================
+// Typed-call helper.
+// ============================================================================
+
+/// Wire-shape failures from [`typed_call`]. Distinct variants
+/// for transport (no route, timeout, etc.) vs codec (serde /
+/// postcard) so service-specific client error enums can wrap
+/// each independently. Server-level (application) errors are
+/// decoded into `Resp` itself — the client matches on the
+/// resulting `Resp::Error(...)` variant.
+#[derive(Debug, thiserror::Error)]
+pub enum TypedCallError {
+    /// Transport-level failure surfaced by [`MeshNode::call`].
+    #[error("transport: {0}")]
+    Transport(#[from] RpcError),
+    /// Request serialization or response deserialization failed.
+    #[error("codec: {0}")]
+    Codec(String),
+}
+
+impl From<postcard::Error> for TypedCallError {
+    fn from(e: postcard::Error) -> Self {
+        Self::Codec(e.to_string())
+    }
+}
+
+/// Send a postcard-encoded request to a remote RPC service and
+/// decode the postcard-encoded reply. The shared shape every
+/// substrate-internal RPC client wants:
+///
+/// 1. `postcard::to_allocvec(request)` → wire body.
+/// 2. `MeshNode::call(target, service, body, opts{deadline})`.
+/// 3. `postcard::from_bytes::<Resp>(reply.body)`.
+///
+/// Caller wraps the returned `Resp` in its own typed-error
+/// surface (typically a `Server` variant that holds the
+/// service-specific error enum decoded from `Resp`). Returning
+/// `TypedCallError` here keeps the wrapper code to a one-line
+/// `From<TypedCallError>` impl per client.
+pub async fn typed_call<Req, Resp>(
+    mesh: &std::sync::Arc<crate::adapter::net::MeshNode>,
+    target_node_id: u64,
+    service: &str,
+    request: &Req,
+    deadline: std::time::Duration,
+) -> Result<Resp, TypedCallError>
+where
+    Req: serde::Serialize,
+    Resp: serde::de::DeserializeOwned,
+{
+    let body = postcard::to_allocvec(request)?;
+    let opts = CallOptions {
+        deadline: Some(std::time::Instant::now() + deadline),
+        ..Default::default()
+    };
+    let reply = mesh
+        .call(target_node_id, service, Bytes::from(body), opts)
+        .await?;
+    Ok(postcard::from_bytes(&reply.body)?)
+}
+
+// ============================================================================
 // Helpers.
 // ============================================================================
 

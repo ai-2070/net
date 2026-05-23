@@ -17,14 +17,12 @@
 //! for "give me a stable read" can call once and reuse the Vec.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use bytes::Bytes;
+use std::time::Duration;
 
 use super::registry_service::{
     RegistryGroupSummary, RegistryRequest, RegistryResponse, RegistryRpcError, REGISTRY_SERVICE,
 };
-use crate::adapter::net::mesh_rpc::{CallOptions, RpcError};
+use crate::adapter::net::mesh_rpc::{typed_call, RpcError, TypedCallError};
 use crate::adapter::net::MeshNode;
 
 /// Default RPC call deadline. Mirrors `FoldQueryClient`'s
@@ -56,9 +54,12 @@ impl From<RpcError> for RegistryClientError {
     }
 }
 
-impl From<postcard::Error> for RegistryClientError {
-    fn from(e: postcard::Error) -> Self {
-        Self::Codec(e.to_string())
+impl From<TypedCallError> for RegistryClientError {
+    fn from(e: TypedCallError) -> Self {
+        match e {
+            TypedCallError::Transport(t) => Self::Transport(t),
+            TypedCallError::Codec(c) => Self::Codec(c),
+        }
     }
 }
 
@@ -196,24 +197,21 @@ impl RegistryClient {
     }
 
     /// Shared marshalling helper. Encodes the request, fires the
-    /// RPC, decodes the response.
+    /// RPC, decodes the response. Wraps `mesh_rpc::typed_call`.
     async fn send(
         &self,
         target_node_id: u64,
         service: &str,
         request: RegistryRequest,
     ) -> Result<RegistryResponse, RegistryClientError> {
-        let body = postcard::to_allocvec(&request)?;
-        let opts = CallOptions {
-            deadline: Some(Instant::now() + self.deadline),
-            ..Default::default()
-        };
-        let reply = self
-            .mesh
-            .call(target_node_id, service, Bytes::from(body), opts)
-            .await?;
-        let response: RegistryResponse = postcard::from_bytes(&reply.body)?;
-        Ok(response)
+        Ok(typed_call::<RegistryRequest, RegistryResponse>(
+            &self.mesh,
+            target_node_id,
+            service,
+            &request,
+            self.deadline,
+        )
+        .await?)
     }
 }
 
