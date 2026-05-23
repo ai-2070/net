@@ -44,6 +44,19 @@ use tokio::task::JoinHandle;
 use super::daemon::LifecycleDaemon;
 use super::group::LifecycleGroup;
 
+/// Maximum number of ticks the backoff can skip between
+/// replace attempts. With a 1 s monitor interval that's
+/// ~256 s of cooldown after enough consecutive failures —
+/// long enough that a persistently broken replica stops
+/// churning the registry; short enough that recovery is
+/// observable within minutes of the underlying fix landing.
+const MAX_BACKOFF_SHIFT: u32 = 8;
+
+/// Number of `consecutive_failures` slots beyond which we
+/// stop growing the per-index Vec. Replica indices are u8,
+/// so 256 caps the worst case.
+const MAX_TRACKED_INDICES: usize = 256;
+
 /// Runtime counters surfaced to operator tooling. Atomic
 /// fields so reads from CLI / Deck panels are wait-free.
 #[derive(Debug, Default)]
@@ -59,6 +72,19 @@ pub struct HealthMonitorStats {
     /// index went out of bounds mid-respawn). Operators
     /// detecting persistent failures should consult this.
     pub replacements_failed: AtomicU64,
+    /// Number of poll ticks where the monitor skipped a known-
+    /// unhealthy replica because exponential backoff hadn't
+    /// elapsed yet. Counts every (tick × skipped-replica)
+    /// combination; operators reading the per-index backoff
+    /// state should consult `consecutive_failures`.
+    pub backoff_skips: AtomicU64,
+    /// Per-replica-index consecutive-failure counter. Bumped
+    /// each tick the replica is still unhealthy after a
+    /// replace attempt; reset to 0 when the replica reports
+    /// healthy. The `2^consecutive_failures` shift drives the
+    /// next-retry-tick computation (capped at
+    /// `MAX_BACKOFF_SHIFT`).
+    pub consecutive_failures: ParkingMutex<Vec<u32>>,
     /// `Instant` of the most recent poll tick, recorded after
     /// each pass. `None` until the first tick lands.
     pub last_tick_at: ParkingMutex<Option<std::time::Instant>>,
@@ -79,9 +105,21 @@ pub struct HealthMonitor<L: LifecycleDaemon> {
 }
 
 /// One health-poll + respawn pass against a live group.
-/// Returns true when at least one replacement was attempted
-/// (currently used only for tracing — the return is consumed
-/// to silence an unused warning).
+///
+/// Honors the per-index exponential backoff stored in
+/// `stats.consecutive_failures`. A replica that's been
+/// unhealthy for N consecutive ticks gets retried at
+/// `2^min(N, MAX_BACKOFF_SHIFT)` tick intervals — so a
+/// persistently broken replica stops churning the registry
+/// + the `LifecycleGroup::replace` lock at every tick.
+///
+/// Backoff state transitions:
+/// - Replica reports healthy → reset to 0.
+/// - Replica reports unhealthy + retry due → attempt replace,
+///   then bump counter (the replacement is judged on the next
+///   tick).
+/// - Replica reports unhealthy + retry not due → record a
+///   skip in `stats.backoff_skips` and continue.
 async fn run_poll_pass<L, F>(
     group: &mut LifecycleGroup<L>,
     factory: &mut F,
@@ -93,10 +131,46 @@ where
 {
     let snapshot = group.health().await;
     let mut any_work = false;
+    // Grow the per-index failure Vec to cover this group.
+    {
+        let mut failures = stats.consecutive_failures.lock();
+        if failures.len() < snapshot.len() {
+            failures.resize(snapshot.len().min(MAX_TRACKED_INDICES), 0);
+        }
+    }
+    let current_tick = stats.ticks.load(Ordering::Acquire);
     for (idx, h) in snapshot.iter().enumerate() {
         if h.healthy {
+            // Healthy → reset the failure counter; backoff
+            // disappears immediately so a recovered replica
+            // doesn't drag a stale skip-counter into the next
+            // failure cycle.
+            if idx < MAX_TRACKED_INDICES {
+                let mut failures = stats.consecutive_failures.lock();
+                if let Some(slot) = failures.get_mut(idx) {
+                    *slot = 0;
+                }
+            }
             continue;
         }
+        // Unhealthy. Decide whether the backoff lets us retry.
+        let failures_before = if idx < MAX_TRACKED_INDICES {
+            stats
+                .consecutive_failures
+                .lock()
+                .get(idx)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        if !should_retry_now(failures_before, current_tick) {
+            stats.backoff_skips.fetch_add(1, Ordering::AcqRel);
+            continue;
+        }
+        // Retry due — attempt the replace, then bump the
+        // counter regardless of replace-error vs replace-ok
+        // (the new daemon's health is judged next tick).
         let new_daemon = factory(u8::try_from(idx).unwrap_or(u8::MAX));
         stats.replacements_initiated.fetch_add(1, Ordering::AcqRel);
         any_work = true;
@@ -108,8 +182,30 @@ where
                 "HealthMonitor: replace failed; continuing"
             );
         }
+        if idx < MAX_TRACKED_INDICES {
+            let mut failures = stats.consecutive_failures.lock();
+            if let Some(slot) = failures.get_mut(idx) {
+                *slot = slot.saturating_add(1);
+            }
+        }
     }
     any_work
+}
+
+/// Should we attempt a replace this tick given `failures`
+/// prior failures + the `current_tick` counter?
+///
+/// - `failures == 0` → first sighting; always retry.
+/// - `failures >= 1` → retry every `2^min(failures, MAX_BACKOFF_SHIFT)`
+///   ticks. Concretely: `current_tick % step == 0` where
+///   `step = 2^min(failures, MAX_BACKOFF_SHIFT)`.
+fn should_retry_now(failures: u32, current_tick: u64) -> bool {
+    if failures == 0 {
+        return true;
+    }
+    let shift = failures.min(MAX_BACKOFF_SHIFT);
+    let step: u64 = 1u64 << shift;
+    current_tick % step == 0
 }
 
 impl<L: LifecycleDaemon> HealthMonitor<L> {
@@ -351,6 +447,131 @@ mod tests {
             0
         );
         assert!(monitor.stats().ticks.load(Ordering::Acquire) >= 1);
+
+        monitor.stop().await;
+        let g = Arc::try_unwrap(group)
+            .map_err(|_| "still referenced")
+            .expect("only ref")
+            .into_inner();
+        if let Some(lg) = g {
+            lg.stop().await;
+        }
+    }
+
+    #[test]
+    fn should_retry_now_first_failure_always_retries() {
+        // No prior failures → retry every tick.
+        for tick in 0..20u64 {
+            assert!(should_retry_now(0, tick), "tick {tick} with 0 failures");
+        }
+    }
+
+    #[test]
+    fn should_retry_now_backoff_grows_exponentially() {
+        // failures=1 → step=2, retries at every other tick.
+        let retries_with_1: Vec<u64> = (0..16).filter(|t| should_retry_now(1, *t)).collect();
+        assert_eq!(retries_with_1, vec![0, 2, 4, 6, 8, 10, 12, 14]);
+
+        // failures=2 → step=4.
+        let retries_with_2: Vec<u64> = (0..16).filter(|t| should_retry_now(2, *t)).collect();
+        assert_eq!(retries_with_2, vec![0, 4, 8, 12]);
+
+        // failures=3 → step=8.
+        let retries_with_3: Vec<u64> = (0..16).filter(|t| should_retry_now(3, *t)).collect();
+        assert_eq!(retries_with_3, vec![0, 8]);
+    }
+
+    #[test]
+    fn should_retry_now_caps_at_max_backoff_shift() {
+        // Very high failure counts cap at MAX_BACKOFF_SHIFT.
+        // 2^MAX_BACKOFF_SHIFT ticks between retries.
+        let max_step: u64 = 1u64 << MAX_BACKOFF_SHIFT;
+        // 100 failures should NOT increase step beyond max.
+        assert!(should_retry_now(100, max_step));
+        assert!(!should_retry_now(100, max_step + 1));
+        // Even u32::MAX failures cap at the same step.
+        assert!(should_retry_now(u32::MAX, max_step));
+    }
+
+    /// Daemon that's perpetually unhealthy + counts how many
+    /// `on_start` calls it sees. Lets the backoff test prove a
+    /// persistent failure doesn't spawn N replacements at every
+    /// monitor tick.
+    struct PerpetuallyUnhealthyDaemon {
+        starts: AtomicU64,
+        stops: AtomicU64,
+    }
+
+    #[async_trait]
+    impl LifecycleDaemon for PerpetuallyUnhealthyDaemon {
+        fn name(&self) -> &str {
+            "perpetually-unhealthy"
+        }
+        async fn on_start(self: Arc<Self>) -> Result<(), LifecycleError> {
+            self.starts.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+        async fn on_stop(&self) {
+            self.stops.fetch_add(1, Ordering::AcqRel);
+        }
+        async fn health(&self) -> ReplicaHealth {
+            ReplicaHealth::unhealthy("never-recovers")
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_backoff_throttles_replaces_after_consecutive_failures() {
+        // A daemon that's always unhealthy gets replaced each
+        // poll. With backoff, the replacement count grows
+        // logarithmically with elapsed time — not linearly with
+        // tick count. After enough consecutive failures the
+        // monitor should be skipping most ticks.
+        let group = LifecycleGroup::<PerpetuallyUnhealthyDaemon>::spawn(
+            1,
+            [0u8; 32],
+            |_idx| {
+                Arc::new(PerpetuallyUnhealthyDaemon {
+                    starts: AtomicU64::new(0),
+                    stops: AtomicU64::new(0),
+                })
+            },
+        )
+        .await
+        .expect("spawn");
+        let group = Arc::new(AsyncMutex::new(Some(group)));
+        let monitor = HealthMonitor::spawn(
+            group.clone(),
+            |_idx| {
+                Arc::new(PerpetuallyUnhealthyDaemon {
+                    starts: AtomicU64::new(0),
+                    stops: AtomicU64::new(0),
+                })
+            },
+            Duration::from_millis(15),
+        );
+
+        // Run for many monitor intervals — 300 ms / 15 ms = ~20
+        // ticks worth. Without backoff, that'd be ~20 replace
+        // attempts. With backoff (1, 2, 4, 8, 16-tick steps)
+        // we expect ~6 replaces (one per backoff doubling).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let initiated = monitor
+            .stats()
+            .replacements_initiated
+            .load(Ordering::Acquire);
+        let skips = monitor.stats().backoff_skips.load(Ordering::Acquire);
+        // Backoff should have skipped at least a few ticks by
+        // now. Exact counts are timing-sensitive in CI, so we
+        // assert directional invariants:
+        assert!(
+            initiated <= 12,
+            "without backoff this would be 20+; got {initiated}"
+        );
+        assert!(
+            skips >= 3,
+            "expected backoff to skip at least 3 ticks; got {skips}"
+        );
 
         monitor.stop().await;
         let g = Arc::try_unwrap(group)
