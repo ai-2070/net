@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::state::{FoldIndex, FoldState, NoIndex, NodeId};
+use super::state::{FoldIndex, FoldState, NodeId};
 use super::FoldKind;
 
 /// Coarse-grained node state for capability matching. The
@@ -439,11 +439,6 @@ fn composite_query(
     }
     matches
 }
-
-// Silence the dead-code lint on `NoIndex` — we re-export it
-// from `mod.rs` and the compiler is happy here.
-#[allow(dead_code)]
-type _NoIndexAlias = NoIndex;
 
 /// Return the union of every tag this publisher has advertised
 /// across its [`CapabilityMembership`] class entries. Walks the
