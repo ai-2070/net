@@ -36,7 +36,9 @@ typedef struct ArcMeshNode ArcMeshNode;
 
 // Imported FFI surface from `net-compute-ffi`. Both functions return
 // a heap-allocated UTF-8 string the caller frees with
-// `net_compute_free_cstring` (already declared in compute.go).
+// `net_compute_free_cstring`. cgo preambles are per-file, so the
+// free-fn declaration is repeated here even though other files in
+// the package also declare it.
 extern char* net_capability_aggregate(
     const ArcMeshNode* mesh_arc,
     const char* matcher_json,
