@@ -1887,9 +1887,8 @@ impl MeshNode {
                 // grinding the same hash would not displace it on
                 // insert, so it's not in the slot here).
                 let origin_hash = eid.origin_hash();
-                origin_hash_to_node_failure.remove_if(&origin_hash, |_, claimant| {
-                    *claimant == node_id
-                });
+                origin_hash_to_node_failure
+                    .remove_if(&origin_hash, |_, claimant| *claimant == node_id);
             }
             // Drop the dead peer's cached capabilities + reflex.
             // Without this, a rendezvous coordinator could still
@@ -5731,7 +5730,10 @@ impl MeshNode {
                 // value verbatim — accidental collisions are
                 // effectively impossible.
                 let origin_hash = ann.entity_id.origin_hash();
-                let _ = ctx.origin_hash_to_node.entry(origin_hash).or_insert(from_node);
+                let _ = ctx
+                    .origin_hash_to_node
+                    .entry(origin_hash)
+                    .or_insert(from_node);
             }
         }
 
@@ -10644,7 +10646,6 @@ mod fold_publisher_helpers_tests {
             "fresh slot survives"
         );
     }
-
 
     #[tokio::test]
     async fn origin_hash_index_first_write_wins_on_adversarial_collision() {
