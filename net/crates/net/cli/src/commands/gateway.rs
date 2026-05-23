@@ -24,6 +24,7 @@ use serde::Serialize;
 
 use crate::context::{resolve_profile, CliContext};
 use crate::error::{generic, invalid_args, CliError};
+use crate::parsers::parse_u16_flexible;
 use crate::prelude::{emit_value, OutputFormat};
 
 #[derive(Subcommand, Debug)]
@@ -150,30 +151,27 @@ async fn run_export(
     ))
 }
 
-/// Parse a channel arg as either a `0x` / decimal wire-hash
-/// literal, or as a name that the caller must look up against the
-/// deck's channel registry. The read-validation-only `export`
-/// command only confirms the input shape parses.
+/// Parse a channel arg as a `0x` / decimal wire-hash literal.
+/// Channel-name → wire-hash resolution requires a mesh-attached
+/// deck the read-only CLI doesn't carry; names are rejected with
+/// a message that points operators at the literal form.
 fn parse_channel_hash(raw: &str) -> Result<u16, CliError> {
     let s = raw.trim();
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        return u16::from_str_radix(hex, 16)
-            .map_err(|e| invalid_args(format!("channel hex `{raw}` not a u16: {e}")));
-    }
-    if s.chars().all(|c| c.is_ascii_digit()) {
-        return s
-            .parse::<u16>()
-            .map_err(|e| invalid_args(format!("channel decimal `{raw}` not a u16: {e}")));
-    }
-    // Treat as a channel name — accepted as long as it isn't empty.
     if s.is_empty() {
-        return Err(invalid_args("channel name cannot be empty"));
+        return Err(invalid_args("channel cannot be empty"));
     }
-    // We can't resolve a name → hash without a mesh-attached deck;
-    // return 0 as a sentinel for the write path (currently
-    // disabled), and let the operator know via the not-supported
-    // surface.
-    Ok(0)
+    let looks_like_literal =
+        s.starts_with("0x") || s.starts_with("0X") || s.chars().all(|c| c.is_ascii_digit());
+    if looks_like_literal {
+        return parse_u16_flexible(s)
+            .map_err(|e| invalid_args(format!("channel `{raw}`: {e}")));
+    }
+    Err(invalid_args(format!(
+        "channel `{raw}` looks like a name; name → wire-hash resolution needs \
+         a mesh-attached deck which the read-only CLI doesn't carry. Pass the \
+         wire hash directly (e.g. `0x1234` or `4660`) until the write-attach \
+         surface lands."
+    )))
 }
 
 /// Parse a subnet arg into a `SubnetId`. Accepts `global` or a
@@ -272,12 +270,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_channel_hash_accepts_hex_decimal_and_names() {
+    fn parse_channel_hash_accepts_hex_and_decimal_literals() {
         assert_eq!(parse_channel_hash("0x42").unwrap(), 0x42);
         assert_eq!(parse_channel_hash("0X42").unwrap(), 0x42);
         assert_eq!(parse_channel_hash("66").unwrap(), 66);
-        // Name → sentinel 0 (write path is disabled today).
-        assert_eq!(parse_channel_hash("internal/metrics").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_channel_hash_rejects_names_with_pointer_to_literal_form() {
+        let err = parse_channel_hash("internal/metrics").unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("looks like a name"),
+            "error must steer operator at the literal form, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_channel_hash_rejects_empty_and_overflow() {
         assert!(parse_channel_hash("").is_err());
+        assert!(parse_channel_hash("0x1FFFF").is_err());
+        assert!(parse_channel_hash("65536").is_err());
     }
 }
