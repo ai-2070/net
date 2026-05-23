@@ -1,0 +1,42 @@
+net/crates/net/src/adapter/net/behavior/fold/capability.rs
+  s_d9dc521a887c3e::t_2b3914e44d52be 9-11
+net/crates/net/src/adapter/net/behavior/meshdb/planner.rs
+  s_d9dc521a887c3e::t_4e8f6a32dc9d58 36
+net/crates/net/src/adapter/net/dataforts/blob/overflow.rs
+  s_d9dc521a887c3e::t_aa01449316473f 79-85
+net/crates/net/src/adapter/net/behavior/fold/audit.rs
+  s_d9dc521a887c3e::t_bea5179f25194e 5
+net/crates/net/src/adapter/net/behavior/fold/dispatch.rs
+  s_d9dc521a887c3e::t_194af271307542 197-201
+net/crates/net/src/adapter/net/behavior/fold/state.rs
+  s_d9dc521a887c3e::t_2fbdd999a7a4c2 26-30
+net/crates/net/src/adapter/net/behavior/fold/capability_bridge.rs
+  s_d9dc521a887c3e::t_f3c886e383964a 422-425
+  s_d9dc521a887c3e::t_95a46ffe622954 7-9,13-14,21-23,25
+net/crates/net/src/adapter/net/mesh.rs
+  s_d9dc521a887c3e::t_314410b8953094 7189-7191
+net/crates/net/src/adapter/net/behavior/fold/wire.rs
+  s_d9dc521a887c3e::t_ab8a0639205758 265-266
+  s_d9dc521a887c3e::t_efedd67e3d0539 291-292
+  s_d9dc521a887c3e::t_27a7da72140fa3 70
+net/crates/net/src/adapter/net/behavior/fold/expiry.rs
+  s_d9dc521a887c3e::t_c882b438c49998 8-13
+net/crates/net/src/adapter/net/behavior/fold/mod.rs
+  s_d9dc521a887c3e::t_a8d794417bd013 436-437
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "7c805bc9bac6ab11f59cf9982978c94a92a43c8e",
+  "prompts": {},
+  "sessions": {
+    "s_d9dc521a887c3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1eafc9e-4dd5-40ff-8f76-e8a5b7800252",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
