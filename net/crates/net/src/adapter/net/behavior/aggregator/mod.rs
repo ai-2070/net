@@ -37,9 +37,11 @@
 //! a MeshDaemon" for the full design.
 
 pub mod config;
+pub mod daemon;
 pub mod summarizer;
 
 pub use config::AggregatorConfig;
+pub use daemon::{AggregatorDaemon, AggregatorError};
 pub use summarizer::{
     CapabilityFoldSummarizer, ReservationFoldSummarizer, SummaryAnnouncement, Summarizer,
 };
