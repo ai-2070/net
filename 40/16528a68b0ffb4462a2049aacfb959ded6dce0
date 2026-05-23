@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/behavior/aggregator/daemon.rs
+  s_099fa7d871e34d::t_2b3f3cacf7e86b 207-212
+  s_099fa7d871e34d::t_18f3933f6cb1e3 533-546
+  s_099fa7d871e34d::t_e46365ae3b1688 969-980
+  s_099fa7d871e34d::t_c921f654ed4500 278-313
+  s_099fa7d871e34d::t_e400516f13ea01 1085-1113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "4016528a68b0ffb4462a2049aacfb959ded6dce0",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
