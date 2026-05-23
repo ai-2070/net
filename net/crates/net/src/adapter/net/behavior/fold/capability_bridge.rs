@@ -179,12 +179,12 @@ pub fn apply_legacy_announcement(fold: &Fold<CapabilityFold>, ann: CapabilityAnn
 }
 
 /// Synthesize a legacy [`CapabilitySet`](super::super::capability::CapabilitySet)
-/// for `node_id` from the fold's tag set. Carries tags only;
-/// the fold's [`CapabilityMembership`] doesn't model the legacy
-/// `metadata` BTreeMap, so consumers that read metadata from
-/// the returned set will see it empty. Callers that need
-/// metadata access should keep the legacy `CapabilityIndex::get`
-/// path until the fold payload is extended.
+/// for `node_id` from every fold entry the publisher owns
+/// (walked via the `by_node` reverse index). Tags are merged
+/// into the set's `HashSet<Tag>`; the metadata BTreeMaps from
+/// each entry's [`CapabilityMembership`] are merged into the
+/// set's `metadata` field, with later entries overwriting
+/// earlier ones on key collision.
 ///
 /// Returns an empty `CapabilitySet` when the publisher has no
 /// fold entries — matches the legacy `.unwrap_or_default()`
