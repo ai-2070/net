@@ -464,10 +464,9 @@ pub(crate) fn scope_from_membership_tags(tags: &[String]) -> CapabilityScope {
 /// Tag-based predicates work fully — reserved-prefix tags
 /// round-trip through `Tag::parse` inside
 /// [`synthesize_capability_set`]. Metadata-based predicates
-/// won't match anything because the fold's
-/// [`CapabilityMembership`] doesn't carry the legacy metadata
-/// BTreeMap; the synthesized CapabilitySet's `metadata` field
-/// is always empty.
+/// see the merged BTreeMap from every entry the publisher owns,
+/// per [`synthesize_capability_set`]'s last-write-wins merge
+/// on key collision.
 pub fn filter_by_predicate(
     fold: &Fold<CapabilityFold>,
     predicate: &super::super::predicate::Predicate,
