@@ -893,9 +893,10 @@ impl DeckClient {
     }
 
     /// Snapshot every aggregator group registered on the
-    /// installed `MeshNode`'s [`AggregatorRegistry`]. Returns
-    /// `None` when no mesh is wired in or no registry has been
-    /// installed via `MeshNode::set_aggregator_registry`.
+    /// installed `MeshNode`'s
+    /// [`AggregatorRegistry`](super::aggregator::registry::AggregatorRegistry).
+    /// Returns `None` when no mesh is wired in or no registry has
+    /// been installed via `MeshNode::set_aggregator_registry`.
     ///
     /// Used by `net aggregator ls` + the future
     /// Deck AGGREGATORS-list panel. Per-replica health is
@@ -918,12 +919,12 @@ impl DeckClient {
             let healths = entry.health().await;
             let mut rows = Vec::with_capacity(replicas.len());
             for (idx, replica) in replicas.iter().enumerate() {
-                let health = healths.get(idx).cloned().unwrap_or_else(|| {
+                let health = healths.get(idx).cloned().unwrap_or(
                     crate::adapter::net::behavior::lifecycle::ReplicaHealth {
                         healthy: true,
                         diagnostic: None,
-                    }
-                });
+                    },
+                );
                 let placement_node_id = placements.get(idx).map(|p| p.node_id);
                 rows.push(AggregatorReplicaRow {
                     generation: replica.generation(),

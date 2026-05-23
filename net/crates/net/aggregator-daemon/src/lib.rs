@@ -17,7 +17,8 @@
 //!
 //! # Config shape
 //!
-//! See [`Config`] / [`GroupConfig`] for the full schema. Minimum
+//! See the crate's internal `Config` / `GroupConfig` types
+//! (`src/lib.rs`) for the full schema. Minimum
 //! example:
 //!
 //! ```toml

@@ -188,6 +188,7 @@ jobs:
           --test nrpc_inbound_dispatcher
           --test queue_group_dispatch
           --test aggregator_fold_query
+          --test aggregator_registry_rpc
 
       # === NetDB ==========================================================
       - name: NetDB
@@ -788,6 +789,15 @@ jobs:
             # the test step uses, so what the binary ships gets
             # linted (not the `demo` feature, which is dev-only).
             features: ""
+          - name: aggregator-daemon
+            path: net/crates/net/aggregator-daemon
+            # `net-aggregator-daemon` is a lib + bin crate that
+            # hosts an AggregatorRegistry + the
+            # `aggregator.registry` RPC service. `--all-targets`
+            # covers the bin, lib, and the integration test crate
+            # under `tests/`. Default features — the crate's
+            # Cargo.toml pins its SDK feature set.
+            features: ""
     steps:
       - uses: actions/checkout@v6
 
@@ -1110,6 +1120,41 @@ jobs:
       - name: Run net-cli tests
         run: cargo test -p net-cli
 
+  aggregator-daemon-tests:
+    # `net-aggregator-daemon` is a lib + bin crate. The lib hosts
+    # the `boot` / `run` entry points + config parsing + template
+    # validation; the bin is a thin `Cli::parse + run` shim. Unit
+    # tests live in `src/lib.rs`'s `#[cfg(test)] mod tests`;
+    # integration tests live in `tests/boot_and_query.rs` and
+    # drive a real two-node mesh handshake against the daemon's
+    # registry-RPC surface. `cargo test -p net-aggregator-daemon`
+    # picks up every target automatically — new `tests/foo.rs`
+    # entries don't need a CI edit.
+    name: Aggregator daemon tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: net/crates/net
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-aggregator-daemon-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run net-aggregator-daemon tests
+        run: cargo test -p net-aggregator-daemon
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -1168,5 +1213,10 @@ jobs:
 
       - name: Build deck documentation
         run: cargo doc -p net-deck --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Build net-aggregator-daemon documentation
+        run: cargo doc -p net-aggregator-daemon --no-deps
         env:
           RUSTDOCFLAGS: -D warnings

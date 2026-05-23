@@ -351,7 +351,7 @@ mod tests {
             "factory should have been called at least once"
         );
         assert!(
-            factory_calls.lock().iter().any(|i| *i == 1),
+            factory_calls.lock().contains(&1),
             "factory must have been called for the unhealthy index 1"
         );
         assert!(

@@ -778,7 +778,7 @@ mod tests {
 
         agg.shutdown();
         // Loop exits within at most one interval after shutdown.
-        let _ = tokio::time::timeout(Duration::from_secs(2), handle)
+        tokio::time::timeout(Duration::from_secs(2), handle)
             .await
             .expect("loop exits within timeout")
             .expect("loop join clean");

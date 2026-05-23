@@ -287,12 +287,12 @@ pub async fn snapshot_group(entry: &Arc<super::AggregatorGroupEntry>) -> Registr
     let healths = entry.health().await;
     let mut rows = Vec::with_capacity(replicas.len());
     for (idx, replica) in replicas.iter().enumerate() {
-        let health = healths.get(idx).cloned().unwrap_or_else(|| {
+        let health = healths.get(idx).cloned().unwrap_or(
             crate::adapter::net::behavior::lifecycle::ReplicaHealth {
                 healthy: true,
                 diagnostic: None,
-            }
-        });
+            },
+        );
         let placement_node_id = placements.get(idx).map(|p| p.node_id);
         rows.push(RegistryReplicaSummary {
             generation: replica.generation(),

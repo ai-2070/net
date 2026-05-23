@@ -78,10 +78,10 @@ pub trait LifecycleDaemon: Send + Sync + 'static {
     fn name(&self) -> &str;
 
     /// Capability requirements for placement. Mirrors
-    /// [`MeshDaemon::requirements`](crate::adapter::net::compute::daemon::MeshDaemon::requirements)
+    /// [`MeshDaemon::requirements`](crate::adapter::net::compute::MeshDaemon::requirements)
     /// so the same scheduler primitives
-    /// ([`Scheduler::place`](crate::adapter::net::compute::scheduler::Scheduler::place),
-    /// [`GroupCoordinator::place_with_spread`](crate::adapter::net::compute::group_coord::GroupCoordinator::place_with_spread))
+    /// ([`Scheduler::place`](crate::adapter::net::compute::Scheduler::place),
+    /// [`GroupCoordinator::place_with_spread`](crate::adapter::net::compute::GroupCoordinator::place_with_spread))
     /// apply to lifecycle daemons without duplicating the
     /// filter type. Returns `CapabilityFilter::default()` to
     /// run anywhere.

@@ -149,7 +149,7 @@ impl<L: LifecycleDaemon> LifecycleGroup<L> {
     pub async fn spawn<F>(
         replica_count: u8,
         group_seed: [u8; 32],
-        mut factory: F,
+        factory: F,
     ) -> Result<Self, LifecycleGroupError>
     where
         F: FnMut(u8) -> Arc<L>,
@@ -159,7 +159,7 @@ impl<L: LifecycleDaemon> LifecycleGroup<L> {
                 "replica_count must be > 0".into(),
             ));
         }
-        let (replicas, handles) = start_replicas(replica_count, |idx| factory(idx)).await?;
+        let (replicas, handles) = start_replicas(replica_count, factory).await?;
         Ok(Self {
             handles,
             replicas,

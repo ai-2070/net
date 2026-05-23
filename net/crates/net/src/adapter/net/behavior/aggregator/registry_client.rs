@@ -87,8 +87,8 @@ impl RegistryClient {
 
     /// Enumerate every aggregator group registered on the target
     /// node. The reply ordering matches the server-side
-    /// [`AggregatorRegistry::entries`] ordering (sorted by
-    /// group name).
+    /// [`super::registry::AggregatorRegistry::entries`] ordering
+    /// (sorted by group name).
     pub async fn list(
         &self,
         target_node_id: u64,
