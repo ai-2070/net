@@ -31,7 +31,7 @@ Tagged `[B | H | M | L]`:
 | AL-4  | M   | observability         | `AggregatorGroup` skips `DaemonRegistry` registration                                 |
 | AL-5  | M   | shutdown determinism  | `on_stop` JoinHandle timeout is `interval + 100ms` — can drop mid-publish work        |
 | AL-6  | M   | operator CLI          | `net aggregator spawn / ls / scale` gated on AL-2..AL-4                               |
-| AL-7  | L   | dead-code warning     | `DispatchCtx.reservation_fold` field wired but unread (build warning)                 |
+| AL-7  | L   | dead-code warning     | `DispatchCtx.reservation_fold` field wired but unread — ✅ `cc4aac82`                  |
 | AL-8  | L   | summary rendering     | Reservation summarizer's `Reserved { ... }` Debug bucket name is verbose              |
 
 ---

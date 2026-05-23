@@ -1,28 +1,22 @@
-//! [`LifecycleDaemon`] — async lifecycle trait for native
-//! mesh-aware daemons.
+//! [`LifecycleDaemon`] — async lifecycle trait + RAII handle.
 //!
-//! Phase B slice 4 of `SCALING_SUBNET_SPEC.md`. Defined as a
-//! **sibling** to [`MeshDaemon`](crate::adapter::net::compute::MeshDaemon)
-//! rather than an extension because the existing trait commits
-//! to a sync-only / WASM-compatible contract (see its module
-//! doc). The aggregator role is inherently async (tokio
-//! interval, `mesh.publish().await`) and needs lifecycle
-//! callbacks the event-shaped trait doesn't carry.
+//! See the module-level doc on [`super`] for the rationale on
+//! why this lives separately from
+//! [`MeshDaemon`](crate::adapter::net::compute::MeshDaemon).
 //!
 //! # Trait shape
 //!
 //! - `on_start(self: Arc<Self>)` — spawn whatever background
-//!   work the daemon needs. Called exactly once per `(replica,
-//!   mesh)` pair before any other lifecycle method. Takes
-//!   `Arc<Self>` so implementations can hand the daemon to a
-//!   background tokio task without storing weak refs.
+//!   work the daemon needs. Called exactly once per daemon
+//!   before any other lifecycle method. Receives `Arc<Self>`
+//!   so implementations can move the daemon into a tokio task
+//!   without weak-ref gymnastics.
 //! - `on_stop(&self)` — signal the background work to stop.
-//!   Called exactly once after all references to the daemon are
-//!   about to drop. Idempotent in practice; the
-//!   [`LifecycleHandle`] only calls it once.
+//!   Called exactly once before the handle drops. Idempotent
+//!   in practice; [`LifecycleHandle`] only calls it once.
 //!
 //! The trait surface is intentionally minimal so future
-//! lifecycle hooks (`on_pause`, `on_drain`, etc.) can land
+//! lifecycle hooks (`on_pause`, `on_drain`, …) can land
 //! without breaking existing impls.
 
 use async_trait::async_trait;
@@ -126,10 +120,6 @@ impl LifecycleHandle {
 
 impl Drop for LifecycleHandle {
     fn drop(&mut self) {
-        // Fallback path: if the handle is dropped without
-        // calling `stop()`, schedule the async shutdown on a
-        // detached task. Operators reaching for deterministic
-        // teardown call `.stop().await` explicitly.
         if let Some(daemon) = self.daemon_for_drop.take() {
             match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
@@ -225,7 +215,6 @@ mod tests {
             let _handle = LifecycleHandle::start(daemon.clone()).await.expect("start");
             // Drop fires next.
         }
-        // The detached spawn lands; give it a moment to settle.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(daemon.stops.load(Ordering::Acquire), 1);
     }

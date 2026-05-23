@@ -36,7 +36,6 @@ use tokio::task::JoinHandle;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use super::lifecycle::{LifecycleDaemon, LifecycleError};
 use super::summarizer::{
     resolve_summarizer, CapabilityFoldHandle, FoldHandle, ReservationFoldHandle, Summarizer,
     SummarizerContext, SummaryAnnouncement,
@@ -45,6 +44,7 @@ use super::AggregatorConfig;
 use crate::adapter::net::behavior::fold::capability::CapabilityFold;
 use crate::adapter::net::behavior::fold::reservation::ReservationFold;
 use crate::adapter::net::behavior::fold::FoldKind;
+use crate::adapter::net::behavior::lifecycle::{LifecycleDaemon, LifecycleError};
 use crate::adapter::net::{
     AdapterError, ChannelConfig, ChannelId, ChannelName, MeshNode, PublishConfig,
 };
@@ -922,7 +922,7 @@ mod tests {
         // End-to-end pin: wrap an AggregatorDaemon in a
         // LifecycleHandle, let the loop tick a few times, then
         // `stop()` and verify the generation stops advancing.
-        use crate::adapter::net::behavior::aggregator::lifecycle::LifecycleHandle;
+        use crate::adapter::net::behavior::lifecycle::LifecycleHandle;
         let mesh = build_mesh().await;
         let kp = EntityKeypair::generate();
         let fold = mesh.capability_fold();
@@ -933,7 +933,7 @@ mod tests {
             .with_interval(Duration::from_millis(20));
         let agg: Arc<AggregatorDaemon> = Arc::new(AggregatorDaemon::new(cfg, mesh).expect("new"));
         let agg_trait: Arc<
-            dyn crate::adapter::net::behavior::aggregator::lifecycle::LifecycleDaemon,
+            dyn crate::adapter::net::behavior::lifecycle::LifecycleDaemon,
         > = agg.clone();
 
         let handle = LifecycleHandle::start(agg_trait).await.expect("start");
@@ -962,7 +962,7 @@ mod tests {
         // tick, so a fresh on_start after stop would never run if
         // the flag stayed set). Validate by direct LifecycleDaemon
         // trait calls.
-        use crate::adapter::net::behavior::aggregator::lifecycle::LifecycleDaemon;
+        use crate::adapter::net::behavior::lifecycle::LifecycleDaemon;
         let mesh = build_mesh().await;
         let cfg = AggregatorConfig::new(SubnetId::GLOBAL)
             .with_fold_kind(CapabilityFold::KIND_ID)

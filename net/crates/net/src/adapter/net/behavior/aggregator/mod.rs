@@ -4,20 +4,20 @@
 //!
 //! Design + rationale: `docs/plans/SCALING_SUBNET_SPEC.md`
 //! Phases B + C. The async lifecycle sibling trait
-//! ([`LifecycleDaemon`]) is documented in [`lifecycle`].
+//! ([`LifecycleDaemon`](crate::adapter::net::behavior::lifecycle::LifecycleDaemon))
+//! and its generic group primitive
+//! ([`LifecycleGroup`](crate::adapter::net::behavior::lifecycle::LifecycleGroup))
+//! live under `behavior::lifecycle` — `AggregatorDaemon` is the
+//! first consumer.
 
 pub mod config;
 pub mod daemon;
-pub mod group;
-pub mod lifecycle;
 pub mod query_client;
 pub mod query_service;
 pub mod summarizer;
 
 pub use config::AggregatorConfig;
 pub use daemon::{AggregatorDaemon, AggregatorError, AggregatorPublishError};
-pub use group::AggregatorGroup;
-pub use lifecycle::{LifecycleDaemon, LifecycleError, LifecycleHandle};
 pub use query_client::{
     FoldQueryClient, FoldQueryClientError, DEFAULT_QUERY_CACHE_TTL, DEFAULT_QUERY_DEADLINE,
 };
