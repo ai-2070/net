@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use net_sdk::deck::DeckClient;
+use net_sdk::deck::{AggregatorSnapshot, DeckClient};
 use ratatui::{
     layout::{Alignment, Constraint, Rect},
     text::{Line, Span},
@@ -21,11 +21,10 @@ use ratatui::{
 use crate::{theme, widgets};
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, deck: &Arc<DeckClient>) {
-    if !deck.aggregator_installed() {
-        render_empty(frame, area);
-        return;
+    match deck.aggregator_snapshot() {
+        None => render_empty(frame, area),
+        Some(snap) => render_table(frame, area, &snap),
     }
-    render_table(frame, area, deck);
 }
 
 fn render_empty(frame: &mut Frame<'_>, area: Rect) {
@@ -49,19 +48,16 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn render_table(frame: &mut Frame<'_>, area: Rect, deck: &Arc<DeckClient>) {
-    let source = deck
-        .aggregator_source_subnet()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "—".to_string());
-    let kinds: Vec<String> = deck
-        .aggregator_fold_kinds()
+fn render_table(frame: &mut Frame<'_>, area: Rect, snap: &AggregatorSnapshot) {
+    let source = snap.source_subnet.to_string();
+    let kinds: Vec<String> = snap
+        .fold_kinds
         .iter()
         .map(|k| format!("{k:#06x}"))
         .collect();
-    let generation = deck.aggregator_generation();
-    let interval = deck.aggregator_summary_interval();
-    let summaries = deck.aggregator_summaries();
+    let generation = snap.generation;
+    let interval = snap.summary_interval;
+    let summaries = &snap.summaries;
 
     let title = Line::from(vec![
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),

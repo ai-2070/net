@@ -333,6 +333,25 @@ pub struct GatewayStats {
     pub export_rules: u64,
 }
 
+/// One-shot snapshot returned by [`DeckClient::aggregator_snapshot`].
+/// Bundles every field a renderer needs in a single struct so
+/// callers don't pay for five per-field lock acquisitions per
+/// frame. `summaries` is an `Arc` so the snapshot itself is
+/// cheap to clone.
+#[derive(Clone, Debug)]
+pub struct AggregatorSnapshot {
+    /// Subnet the aggregator is summarizing.
+    pub source_subnet: SubnetId,
+    /// `FoldKind::KIND_ID`s the aggregator is configured for.
+    pub fold_kinds: Vec<u16>,
+    /// Aggregator's monotonic tick counter.
+    pub generation: u64,
+    /// Aggregator's tick cadence.
+    pub summary_interval: std::time::Duration,
+    /// Buffered summaries — `Arc::clone`-cheap.
+    pub summaries: Arc<Vec<SummaryAnnouncement>>,
+}
+
 /// Daemon counts within a [`StatusSummary`]. Lifecycle
 /// counts are disjoint partitions of the registered set;
 /// `crash_looping` / `backing_off` are orthogonal restart-
@@ -760,6 +779,27 @@ impl DeckClient {
             .as_ref()
             .map(|a| a.latest_summaries_arc())
             .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
+    /// One-call accessor that returns every aggregator field a
+    /// renderer needs in one struct. Replaces the per-field hops
+    /// (`aggregator_source_subnet` + `aggregator_fold_kinds` +
+    /// `aggregator_generation` + `aggregator_summary_interval` +
+    /// `aggregator_summaries`) — five lock acquisitions and two
+    /// Vec clones per frame collapse to one struct construction
+    /// and one Arc clone.
+    ///
+    /// Returns `None` when no aggregator is installed.
+    pub fn aggregator_snapshot(&self) -> Option<AggregatorSnapshot> {
+        let agg = self.aggregator.as_ref()?;
+        let config = agg.config();
+        Some(AggregatorSnapshot {
+            source_subnet: config.source_subnet,
+            fold_kinds: config.fold_kinds.clone(),
+            generation: agg.generation(),
+            summary_interval: config.summary_interval,
+            summaries: agg.latest_summaries_arc(),
+        })
     }
 
     /// Aggregator's monotonic tick counter, or `0` when none

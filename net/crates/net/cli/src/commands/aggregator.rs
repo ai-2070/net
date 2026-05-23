@@ -97,22 +97,25 @@ async fn run_inspect(
     let profile = resolve_profile(config_path, profile_name).await?;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let deck = ctx.deck();
-    let view = InspectView {
-        aggregator_installed: deck.aggregator_installed(),
-        source_subnet: deck.aggregator_source_subnet().map(|s| s.to_string()),
-        fold_kinds: deck
-            .aggregator_fold_kinds()
-            .iter()
-            .map(|k| format!("{k:#06x}"))
-            .collect(),
-        summary_interval_secs: deck.aggregator_summary_interval().as_secs_f64(),
-        generation: deck.aggregator_generation(),
-        summary_count: deck.aggregator_summaries().len() as u64,
-        summaries: deck
-            .aggregator_summaries()
-            .into_iter()
-            .map(SummaryRow::from)
-            .collect(),
+    let view = match deck.aggregator_snapshot() {
+        Some(snap) => InspectView {
+            aggregator_installed: true,
+            source_subnet: Some(snap.source_subnet.to_string()),
+            fold_kinds: snap.fold_kinds.iter().map(|k| format!("{k:#06x}")).collect(),
+            summary_interval_secs: snap.summary_interval.as_secs_f64(),
+            generation: snap.generation,
+            summary_count: snap.summaries.len() as u64,
+            summaries: snap.summaries.iter().cloned().map(SummaryRow::from).collect(),
+        },
+        None => InspectView {
+            aggregator_installed: false,
+            source_subnet: None,
+            fold_kinds: Vec::new(),
+            summary_interval_secs: 0.0,
+            generation: 0,
+            summary_count: 0,
+            summaries: Vec::new(),
+        },
     };
     emit_value(OutputFormat::resolve_oneshot(output), &view)
         .map_err(|e| generic(format!("write aggregator inspect: {e}")))?;
