@@ -1,0 +1,21 @@
+net/crates/net/docs/plans/AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md
+  s_099fa7d871e34d::t_431fd25a73e3f3 35
+  s_099fa7d871e34d::t_3a6563228ee880 32
+  s_099fa7d871e34d::t_ccbd4c3bfac4e8 153-154,156,158,160-162
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "854bd028091b2b6f01deb765b8f160e11d0eadf9",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
