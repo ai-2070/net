@@ -102,7 +102,7 @@ pub enum FoldQueryError {
         kind: u16,
     },
     /// Request payload failed to decode. Carries the postcard
-    /// error message as a `String` to keep the wire type free
+    /// error message as a `String` so the wire type stays free
     /// of cross-crate error dependencies.
     DecodeFailed(String),
 }
@@ -129,9 +129,8 @@ impl RpcHandler for FoldQueryHandler {
         let request: FoldQueryRequest = match postcard::from_bytes(&ctx.payload.body) {
             Ok(req) => req,
             Err(e) => {
-                let response = FoldQueryResponse::Error(FoldQueryError::DecodeFailed(format!(
-                    "{e:?}"
-                )));
+                let response =
+                    FoldQueryResponse::Error(FoldQueryError::DecodeFailed(e.to_string()));
                 return Ok(encode_response(&response));
             }
         };
@@ -173,13 +172,21 @@ pub(crate) fn answer(
 }
 
 fn encode_response(response: &FoldQueryResponse) -> RpcResponsePayload {
-    // Postcard can fail on serializer-level OOM / IO; not
-    // expected for these small payloads. Fall back to an empty
-    // body on encode failure rather than panicking — the client
-    // surfaces the empty decode as a decode error and retries.
-    let body = postcard::to_allocvec(response)
-        .map(Bytes::from)
-        .unwrap_or_else(|_| Bytes::new());
+    // Postcard can fail on serializer-level OOM / IO; not expected
+    // for these small payloads. Log a warning so an unexpected
+    // encode failure shows up in operator output, then fall back
+    // to an empty body — the client surfaces the empty decode as
+    // a decode error and retries.
+    let body = match postcard::to_allocvec(response) {
+        Ok(b) => Bytes::from(b),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "aggregator: fold.query response encode failed; replying with empty body",
+            );
+            Bytes::new()
+        }
+    };
     RpcResponsePayload {
         status: RpcStatus::Ok,
         headers: Vec::new(),

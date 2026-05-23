@@ -43,8 +43,6 @@ pub enum FoldQueryClientError {
     #[error("transport: {0}")]
     Transport(RpcError),
     /// Request serialization or response deserialization failed.
-    /// Postcard errors carry a `Debug`-rendered message so the
-    /// error stays cross-version stable.
     #[error("codec: {0}")]
     Codec(String),
     /// Aggregator handler rejected the request (e.g. unknown
@@ -62,7 +60,7 @@ impl From<RpcError> for FoldQueryClientError {
 
 impl From<postcard::Error> for FoldQueryClientError {
     fn from(e: postcard::Error) -> Self {
-        Self::Codec(format!("{e:?}"))
+        Self::Codec(e.to_string())
     }
 }
 

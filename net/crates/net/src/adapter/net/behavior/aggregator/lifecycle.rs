@@ -131,14 +131,26 @@ impl Drop for LifecycleHandle {
         // detached task. Operators reaching for deterministic
         // teardown call `.stop().await` explicitly.
         if let Some(daemon) = self.daemon_for_drop.take() {
-            // Best-effort; if no tokio runtime is current
-            // (synchronous test path), the shutdown is skipped
-            // and the daemon's internal task cleans itself up
-            // via its shutdown flag on drop of its own Arc.
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    daemon.on_stop().await;
-                });
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move {
+                        daemon.on_stop().await;
+                    });
+                }
+                Err(_) => {
+                    // No tokio runtime in scope (e.g. synchronous
+                    // test teardown). The daemon's internal task
+                    // is expected to clean itself up via its
+                    // shutdown flag once its own `Arc` is dropped
+                    // — but flag the skipped lifecycle hook so the
+                    // contract is visible at operator log level.
+                    tracing::warn!(
+                        daemon = daemon.name(),
+                        "LifecycleHandle dropped outside a tokio runtime; \
+                         skipping on_stop. Daemon must self-clean via its \
+                         shutdown flag.",
+                    );
+                }
             }
         }
     }

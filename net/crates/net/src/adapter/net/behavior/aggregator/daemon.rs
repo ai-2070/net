@@ -349,7 +349,7 @@ impl AggregatorDaemon {
             .mesh
             .channel_publisher(channel, PublishConfig::default());
         let bytes = postcard::to_allocvec(summary)
-            .map_err(|e| AggregatorPublishError::Encode(format!("{e:?}")))?;
+            .map_err(|e| AggregatorPublishError::Encode(e.to_string()))?;
         self.mesh
             .publish(&publisher, Bytes::from(bytes))
             .await
