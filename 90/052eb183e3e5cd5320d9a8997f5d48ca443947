@@ -1,0 +1,57 @@
+net/crates/net/src/adapter/net/behavior/meshdb/planner.rs
+  s_099fa7d871e34d::t_c8964fbf700010 1118-1119,1829-1830
+net/crates/net/src/adapter/net/compute/replica_group.rs
+  s_099fa7d871e34d::t_c8964fbf700010 743-744,980-981,1047-1048
+net/crates/net/tests/cross_lang_capability_fixtures.rs
+  s_099fa7d871e34d::t_c8964fbf700010 808-809,976-977
+net/crates/net/tests/integration_placement_filter_callback.rs
+  s_099fa7d871e34d::t_c8964fbf700010 51-52
+net/crates/net/benches/net.rs
+  s_099fa7d871e34d::t_c8964fbf700010 2167-2168,2189-2190,2262-2263,2300-2301,2364-2365,2383-2384,2437-2438,2472-2473,2483-2484,2494-2495,2506-2507
+net/crates/net/src/adapter/net/behavior/fold/capability_bridge.rs
+  s_099fa7d871e34d::t_c8964fbf700010 777-781
+  s_099fa7d871e34d::t_561bfbfa510f75 36-37
+  s_099fa7d871e34d::t_5df5974a3837d8 173-187,189
+net/crates/net/src/adapter/net/compute/scheduler.rs
+  s_099fa7d871e34d::t_c8964fbf700010 535-536
+net/crates/net/src/adapter/net/dataforts/blob/overflow.rs
+  s_099fa7d871e34d::t_c8964fbf700010 1142-1143
+net/crates/net/tests/migration_integration.rs
+  s_099fa7d871e34d::t_c8964fbf700010 339-340,994-995,1002-1003,1698-1699
+net/crates/net/src/adapter/net/behavior/fold/capability_aggregation.rs
+  s_099fa7d871e34d::t_c8964fbf700010 132-147,347-350,354-357,369-371,507-508
+net/crates/net/src/adapter/net/behavior/fold/mod.rs
+  s_099fa7d871e34d::t_c8964fbf700010 39-41
+net/crates/net/src/adapter/net/behavior/placement.rs
+  s_099fa7d871e34d::t_c8964fbf700010 1506-1507,2235-2236,2444-2445,2622-2623,3001-3002,3031-3032,3062-3063,3092-3093
+net/crates/net/src/adapter/net/compute/standby_group.rs
+  s_099fa7d871e34d::t_c8964fbf700010 1095-1096,1832-1833
+net/crates/net/src/adapter/net/mesh.rs
+  s_099fa7d871e34d::t_c8964fbf700010 8857-8859
+net/crates/net/src/adapter/net/compute/group_coord.rs
+  s_099fa7d871e34d::t_c8964fbf700010 397-398
+net/crates/net/tests/capability_broadcast.rs
+  s_099fa7d871e34d::t_c8964fbf700010 368-371
+net/crates/net/src/adapter/net/dataforts/blob/migration.rs
+  s_099fa7d871e34d::t_c8964fbf700010 819-820,1055-1056,1065-1066,1131-1132,1141-1142,1238-1239,1248-1249,1479-1480,1486-1487
+net/crates/net/src/adapter/net/compute/fork_group.rs
+  s_099fa7d871e34d::t_c8964fbf700010 873-874,1133-1134,1164-1165
+net/crates/net/benches/placement.rs
+  s_099fa7d871e34d::t_c8964fbf700010 61-62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "90052eb183e3e5cd5320d9a8997f5d48ca443947",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
