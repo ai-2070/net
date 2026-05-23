@@ -1,0 +1,29 @@
+net/crates/net/bindings/go/net/capability_aggregation.go
+  s_d9dc521a887c3e::t_eca7e3e1a12a65 1-335
+net/crates/net/bindings/go/compute-ffi/src/lib.rs
+  s_d9dc521a887c3e::t_f898e24fe9c2df 3027-3196
+net/crates/net/bindings/go/compute-ffi/Cargo.toml
+  s_d9dc521a887c3e::t_6d63c52c5567bc 63-67
+net/crates/net/bindings/go/net/capability_aggregation_test.go
+  s_d9dc521a887c3e::t_3b0d2376097fa1 1-214
+go/capability_aggregation.go
+  s_d9dc521a887c3e::t_a4ac397bd30503 1-336
+go/capability_aggregation_test.go
+  s_d9dc521a887c3e::t_cc60bc0555eb4f 1-222
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "330226483b84adabced93236aa538dbf12683e2d",
+  "prompts": {},
+  "sessions": {
+    "s_d9dc521a887c3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1eafc9e-4dd5-40ff-8f76-e8a5b7800252",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
