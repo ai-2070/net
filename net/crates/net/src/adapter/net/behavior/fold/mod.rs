@@ -20,6 +20,7 @@ use serde::Serialize;
 
 pub mod audit;
 pub mod capability;
+pub mod capability_aggregation;
 pub mod capability_bridge;
 pub mod dispatch;
 pub mod expiry;
@@ -38,6 +39,7 @@ pub use capability::{
     capability_tags_for, reflex_addr_for, CapabilityFilter, CapabilityFold, CapabilityIndexInner,
     CapabilityMatch, CapabilityMembership, CapabilityQuery, HardwareSummary, NodeState,
 };
+pub use capability_aggregation::{Aggregation, GroupBy, TagMatcher};
 pub use dispatch::{
     DispatchError, FoldChannelRouter, FoldDispatch, FoldDispatchAdapter, FoldRegistry,
     SUBPROTOCOL_FOLD,
