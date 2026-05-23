@@ -21,6 +21,8 @@
 
 pub mod daemon;
 pub mod group;
+pub mod monitor;
 
 pub use daemon::{LifecycleDaemon, LifecycleError, LifecycleHandle, ReplicaHealth};
 pub use group::{LifecycleGroup, LifecycleGroupError, ReplicaContext};
+pub use monitor::{HealthMonitor, HealthMonitorStats};
