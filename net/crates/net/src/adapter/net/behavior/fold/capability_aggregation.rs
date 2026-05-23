@@ -1385,9 +1385,23 @@ mod tests {
 
     #[test]
     fn matcher_version_range_picks_entries_within_inclusive_bounds() {
-        let fold = populated_fold();
-        // 0xA + 0xC carry `software.python=3.11`; 0xB carries
-        // `software.python=3.12`. Range [3.11, 3.11] picks 0xA + 0xC.
+        // Canonical 3-component versions only — `semver::Version::parse`
+        // rejects 2-component "3.11" so the matcher would silently
+        // skip those; the sibling `..._skips_unparseable_values` test
+        // pins that branch.
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        for (node_id, value) in [(0xA, "3.11.0"), (0xB, "3.12.0"), (0xC, "3.11.0")] {
+            fold.apply(sign(
+                &kp,
+                node_id,
+                0x100,
+                &[&format!("software.python={value}")],
+                NodeState::Idle,
+                None,
+            ))
+            .unwrap();
+        }
         let rows = fold.aggregate(
             Some(TagMatcher::VersionRange {
                 axis_key: "software.python".into(),
@@ -1397,11 +1411,9 @@ mod tests {
             GroupBy::Publisher,
             Aggregation::Count,
         );
-        // semver requires "3.11" → "3.11.0"; legacy `3.11` doesn't
-        // parse. Pin both publishers if their canonical tag values
-        // parse; if not, fall through to the unbounded test.
-        // (Defensive: publishers might emit either form.)
-        let _ = rows;
+        let mut publishers: Vec<&str> = rows.iter().map(|(b, _)| b.as_str()).collect();
+        publishers.sort_unstable();
+        assert_eq!(publishers, vec!["0xa", "0xc"]);
     }
 
     #[test]
