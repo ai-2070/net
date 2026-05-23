@@ -99,18 +99,21 @@ async fn run_ls(
     profile_name: &str,
 ) -> Result<(), CliError> {
     let profile = resolve_profile(config_path, profile_name).await?;
-    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
+    let local_node_id = args.node;
+    let ctx = CliContext::build(&profile, args.identity.as_deref(), local_node_id, false).await?;
     let deck = ctx.deck();
     // Group peers by their assigned subnet so operators see one
     // row per subnet rather than one per peer. Sorted by subnet
     // raw bits for stable output.
     let mut buckets: BTreeMap<u32, BTreeSet<u64>> = BTreeMap::new();
     if let Some(local) = deck.local_subnet() {
-        // The local node is always a member of its own subnet.
+        // The local node is always a member of its own subnet —
+        // and its id is whatever the operator passed via `--node`
+        // (the same id the substrate uses for `cfg.this_node`).
         buckets
             .entry(local.raw())
             .or_default()
-            .insert(profile_node_id(&deck));
+            .insert(local_node_id);
     }
     for (node_id, subnet) in deck.known_subnets() {
         buckets.entry(subnet.raw()).or_default().insert(node_id);
@@ -185,17 +188,6 @@ async fn run_tree(
 /// `SubnetId::new(&[3, 7, 2])`, `"global"` for `SubnetId::GLOBAL`).
 fn format_subnet(subnet: SubnetId) -> String {
     subnet.to_string()
-}
-
-/// Best-effort local-node id for `subnet ls`. The deck doesn't
-/// expose a `local_node_id()` accessor today, so fall back to a
-/// sentinel marker. Once `DeckClient::local_node_id` lands the
-/// caller wires the real value.
-fn profile_node_id(_deck: &std::sync::Arc<net_sdk::deck::DeckClient>) -> u64 {
-    // Local node membership shows up under id 0 until the deck
-    // surfaces a real accessor — operator can still see the
-    // grouping by subnet, just with a placeholder for "self."
-    0
 }
 
 #[derive(Serialize)]
