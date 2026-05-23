@@ -10,8 +10,8 @@ use crate::{app::Tab, theme};
 pub fn render(frame: &mut Frame<'_>, area: Rect, current: Tab) {
     // Brand on the left, tabs filling the rest. The "● LIVE"
     // chip the right side used to carry duplicated the status
-    // bar's live indicator — dropped so the tab strip can fit
-    // all 10 tabs without truncating on a 120-col terminal.
+    // bar's live indicator — dropped so the strip can fit
+    // every tab on a 120-col terminal.
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(7), Constraint::Min(0)])
@@ -21,10 +21,15 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, current: Tab) {
     frame.render_widget(Paragraph::new(brand), cols[0]);
 
     // Tab key glyphs: 1..=9 for the first 9 slots, then `0`
-    // for the 10th — mirrors the numeric jump key handler in
-    // app.rs.
+    // for the 10th (LOGS) — mirrors the numeric jump key
+    // handler in app.rs. Tabs beyond `PRIMARY_COUNT` (the
+    // SUBNETS / GATEWAYS / AGGREGATORS / AUDIT trailing
+    // group) render with no key prefix; they're reachable via
+    // letter shortcuts (`H`/`V`/`B`/`U`) only.
     let key_for = |i: usize| -> String {
-        if i == 9 {
+        if i >= Tab::PRIMARY_COUNT {
+            String::new()
+        } else if i == 9 {
             "[0] ".to_string()
         } else {
             format!("[{}] ", i + 1)

@@ -81,15 +81,19 @@ pub enum Tab {
 }
 
 impl Tab {
-    /// Tab order rendered by the tab strip. FAILURES + AUDIT
-    /// are hidden (their variants, state, render modules, and
-    /// key handlers stay in the codebase so re-enabling is a
-    /// one-line addition here). The strip carries 10 slots —
-    /// keys `1`..`9` plus `0` — with LOGS pinned to `0` so it
-    /// stays reachable from any tab without clobbering the
-    /// alphabetic shortcuts.
-    pub fn all() -> [Tab; 10] {
-        [
+    /// Tab order rendered by the tab strip. The first 10 slots
+    /// (`NetMap`..`Logs`) carry numeric shortcuts `1`..`9` plus
+    /// `0` — LOGS is pinned to `0` so the alphabetic shortcuts
+    /// stay free. The trailing four (`Subnets`, `Gateways`,
+    /// `Aggregators`, `Audit`) render to the right of LOGS in
+    /// the strip without numeric prefixes; they're reachable
+    /// via letter shortcuts (`H`/`V`/`B`/`U`) and via
+    /// `Tab`/`Shift+Tab` cycling. FAILURES stays hidden — its
+    /// variant + state + render module are still in the
+    /// codebase for one-line re-enablement here.
+    pub fn all() -> &'static [Tab] {
+        &[
+            // Primary — numeric shortcuts 1..9 + 0.
             Tab::NetMap,
             Tab::Nodes,
             Tab::Daemons,
@@ -100,8 +104,18 @@ impl Tab {
             Tab::Migrations,
             Tab::Replicas,
             Tab::Logs,
+            // Extended — letter shortcuts, no numeric prefix.
+            Tab::Subnets,
+            Tab::Gateways,
+            Tab::Aggregators,
+            Tab::Audit,
         ]
     }
+
+    /// Number of entries in [`Tab::all`] that carry numeric
+    /// keystroke prefixes (`[1]`..`[9]` + `[0]`). Tabs at or
+    /// beyond this index render label-only.
+    pub const PRIMARY_COUNT: usize = 10;
 
     pub fn label(self) -> &'static str {
         match self {
@@ -1643,6 +1657,9 @@ impl App {
             KeyCode::Char('H') => self.current = Tab::Subnets,
             KeyCode::Char('V') => self.current = Tab::Gateways,
             KeyCode::Char('B') => self.current = Tab::Aggregators,
+            // `U` for aUdit — `A` is taken by ICE flush-avoid-lists
+            // when on a node focus page (app.rs:1535).
+            KeyCode::Char('U') => self.current = Tab::Audit,
             // DAEMON tab navigation. Lowercase letters walk the
             // member axis (cursor inside the focused group);
             // uppercase letters + arrows walk the group axis.
