@@ -1,0 +1,36 @@
+net/crates/net/src/adapter/net/protocol.rs
+  s_099fa7d871e34d::t_82172451466cec 646-651
+  s_099fa7d871e34d::t_0e57ab0f79883f 316-318,321
+  s_099fa7d871e34d::t_8a0c4375e2e404 206-212
+  s_099fa7d871e34d::t_216dd450a2adb3 342-345,347-348,368-369,371-372
+  s_099fa7d871e34d::t_b0fcd32d81840f 441
+  s_099fa7d871e34d::t_8538aa1e59e1a2 363-367
+  s_099fa7d871e34d::t_5a92d0fdd920c9 134,137,144-147
+  s_099fa7d871e34d::t_662cefd9ddf264 189-190
+  s_099fa7d871e34d::t_67c94cc2ab05a2 110,133,135,139,141,149
+  s_099fa7d871e34d::t_1bf6fa93c936fd 4,14-20
+  s_099fa7d871e34d::t_40048826a7866a 398-399
+  s_099fa7d871e34d::t_182640845ecc91 183-188,191,199
+  s_099fa7d871e34d::t_f4cd6394e856e8 400
+net/crates/net/src/adapter/net/mesh.rs
+  s_099fa7d871e34d::t_55f5354a37c4f3 5831-5835
+  s_099fa7d871e34d::t_406b438fb86b93 1950-1954
+net/crates/net/src/adapter/net/cortex/rpc.rs
+  s_099fa7d871e34d::t_d3b748da788878 945-951,955-956
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "cdd11667553bce287c50c27cd918d867fd320cd7",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
