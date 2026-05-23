@@ -53,16 +53,15 @@ use super::{EnvelopeMeta, Fold, FoldKind, NodeId, NodeState, SignedAnnouncement}
 /// metadata needed to evaluate them; callers that need them
 /// keep the legacy index until the fold's payload is extended.
 pub fn translate_filter(legacy: &LegacyFilter) -> CapabilityFilter {
-    let mut tags_all: Vec<String> = legacy.require_tags.clone();
-    for model in &legacy.require_models {
-        tags_all.push(format!("model:{}", model));
-    }
-    for tool in &legacy.require_tools {
-        tags_all.push(format!("tool:{}", tool));
-    }
+    // Models and tools are NOT pushed into `tags_all` — the canonical
+    // wire form for those is a multi-tag bundle
+    // (`software.model.<i>.id=<name>`, `software.tool.<i>.tool_id=<name>`)
+    // that doesn't match a single `model:<name>` / `tool:<name>` tag.
+    // They're handled in `membership_passes_post_filter` via the
+    // legacy `CapabilitySet::has_model` / `has_tool` scan.
     CapabilityFilter {
         class: None,
-        tags_all,
+        tags_all: legacy.require_tags.clone(),
         tags_any: Vec::new(),
         state: None,
         region: None,
@@ -114,6 +113,32 @@ pub fn membership_passes_post_filter(
             .and_then(|h| h.gpu_vendor.as_deref())
             .unwrap_or("");
         if !gpu_vendor_matches(got, want_vendor) {
+            return false;
+        }
+    }
+    // Models + tools are encoded as multi-tag bundles
+    // (`software.model.<i>.id=<name>`, `software.tool.<i>.tool_id=<name>`)
+    // on the wire. Reuse the legacy `CapabilitySet::has_model` /
+    // `has_tool` scan against a synthesized set so the same
+    // canonical-tag predicate runs here as in the legacy matcher.
+    // `require_models` / `require_tools` are "any must match"
+    // (union semantics), per the legacy `CapabilityFilter::matches`
+    // impl.
+    if !legacy.require_models.is_empty() || !legacy.require_tools.is_empty() {
+        let mut caps = super::super::capability::CapabilitySet::new();
+        for s in &membership.tags {
+            if let Ok(tag) = super::super::tag::Tag::parse(s) {
+                caps.tags.insert(tag);
+            }
+        }
+        if !legacy.require_models.is_empty()
+            && !legacy.require_models.iter().any(|m| caps.has_model(m))
+        {
+            return false;
+        }
+        if !legacy.require_tools.is_empty()
+            && !legacy.require_tools.iter().any(|t| caps.has_tool(t))
+        {
             return false;
         }
     }
@@ -527,15 +552,59 @@ mod tests {
     }
 
     #[test]
-    fn translate_filter_encodes_models_and_tools_as_tags() {
-        let mut legacy = LegacyFilter::default();
-        legacy.require_tags.push("gpu".into());
-        legacy.require_models.push("llama3".into());
-        legacy.require_tools.push("ffmpeg".into());
+    fn translate_filter_passes_require_tags_through_and_defers_models_and_tools() {
+        let legacy = LegacyFilter {
+            require_tags: vec!["gpu".into()],
+            require_models: vec!["llama3".into()],
+            require_tools: vec!["ffmpeg".into()],
+            ..LegacyFilter::default()
+        };
         let fold_filter = translate_filter(&legacy);
-        assert!(fold_filter.tags_all.contains(&"gpu".to_string()));
-        assert!(fold_filter.tags_all.contains(&"model:llama3".to_string()));
-        assert!(fold_filter.tags_all.contains(&"tool:ffmpeg".to_string()));
+        // `require_tags` go directly through.
+        assert_eq!(fold_filter.tags_all, vec!["gpu".to_string()]);
+        // `require_models` / `require_tools` are NOT encoded as fold
+        // tags — the canonical wire form is multi-tag bundles
+        // (`software.model.<i>.id=...`) that `membership_passes_post_filter`
+        // matches via `CapabilitySet::has_model` / `has_tool`. A
+        // `model:<name>` / `tool:<name>` tag would never match an
+        // honest publisher.
+        assert!(!fold_filter.tags_all.contains(&"model:llama3".to_string()));
+        assert!(!fold_filter.tags_all.contains(&"tool:ffmpeg".to_string()));
+    }
+
+    #[test]
+    fn membership_passes_post_filter_matches_models_via_canonical_tag_bundle() {
+        let legacy = LegacyFilter {
+            require_models: vec!["llama3".into()],
+            ..LegacyFilter::default()
+        };
+        let pass = CapabilityMembership {
+            class_hash: 0x100,
+            tags: vec!["software.model.0.id=llama3".into()],
+            hardware: None,
+            state: NodeState::Idle,
+            region: None,
+            price_quote: None,
+            reflex_addr: None,
+            allowed_nodes: Vec::new(),
+            allowed_subnets: Vec::new(),
+            allowed_groups: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
+        };
+        assert!(membership_passes_post_filter(&pass, &legacy));
+
+        let fail = CapabilityMembership {
+            tags: vec!["software.model.0.id=mistral".into()],
+            ..pass.clone()
+        };
+        assert!(!membership_passes_post_filter(&fail, &legacy));
+
+        // No models advertised at all → reject.
+        let bare = CapabilityMembership {
+            tags: vec![],
+            ..pass
+        };
+        assert!(!membership_passes_post_filter(&bare, &legacy));
     }
 
     #[test]
