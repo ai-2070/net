@@ -72,34 +72,36 @@ psk_hex = "4242424242424242424242424242424242424242424242424242424242424242"
 
     assert!(got_line, "daemon never emitted the bootstrap line");
     let trimmed = line.trim_end();
-    // Field-level checks — substring assertions tolerate
-    // numeric / string-value differences across runs while
-    // pinning the field names + JSON shape.
+
+    // Parse — `from_str::<Value>` validates the JSON shape end
+    // to end (catches trailing commas, escape-mismatch bugs,
+    // field-order regressions that substring-asserts miss).
+    let parsed: serde_json::Value = serde_json::from_str(trimmed)
+        .unwrap_or_else(|e| panic!("bootstrap line is not valid JSON ({e}): {trimmed}"));
+    let obj = parsed
+        .as_object()
+        .unwrap_or_else(|| panic!("bootstrap line is not a JSON object: {trimmed}"));
+
     assert!(
-        trimmed.starts_with('{') && trimmed.ends_with('}'),
-        "expected single-line JSON object, got: {trimmed}"
+        obj.get("node_id").and_then(|v| v.as_u64()).is_some(),
+        "missing/wrong node_id field: {trimmed}",
     );
+    let bound_addr = obj
+        .get("bound_addr")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("missing bound_addr string field: {trimmed}"));
     assert!(
-        trimmed.contains("\"node_id\":"),
-        "missing node_id field: {trimmed}"
+        bound_addr.starts_with("127.0.0.1:"),
+        "bound_addr should reflect the loopback bind, got {bound_addr:?}",
     );
-    assert!(
-        trimmed.contains("\"bound_addr\":\"127.0.0.1:"),
-        "missing/wrong bound_addr field: {trimmed}"
-    );
-    assert!(
-        trimmed.contains("\"public_key_hex\":\""),
-        "missing public_key_hex field: {trimmed}"
-    );
-    // Public key must be exactly 64 hex chars between the
-    // quoted boundaries.
-    let pk_start = trimmed.find("\"public_key_hex\":\"").unwrap() + "\"public_key_hex\":\"".len();
-    let pk_end = trimmed[pk_start..].find('"').unwrap() + pk_start;
-    let pk = &trimmed[pk_start..pk_end];
+    let pk = obj
+        .get("public_key_hex")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("missing public_key_hex string field: {trimmed}"));
     assert_eq!(pk.len(), 64, "public_key_hex must be 64 chars, got {pk:?}");
     assert!(
         pk.chars()
             .all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_ascii_lowercase())),
-        "public_key_hex must be lowercase hex, got {pk:?}"
+        "public_key_hex must be lowercase hex, got {pk:?}",
     );
 }

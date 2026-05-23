@@ -1,21 +1,17 @@
 // Package net — aggregator-registry + fold-query RPC client
-// surface.
+// surface. Wraps the C ABI in libnet (`net::ffi::aggregator`).
 //
-// Wraps the C ABI exported by `net::ffi::aggregator` (compiled
-// into the main `libnet` cdylib alongside the netdb / cortex
-// FFI symbols). The full reference implementation with
-// docstrings + every documented edge case lives at
-// `net/crates/net/bindings/go/net/aggregator.go`; this file is
-// the consumer-side trim built against the same C symbols.
+// # Sync model
 //
-// # Build prerequisite
+// `WithDeadline` / `WithTTL` mutate the underlying Rust handle
+// in place; the returned wrapper shares state with the
+// original, so adjustments are observed by every alias. Ops
+// snapshot the client before issuing the RPC (no lock held
+// across the wire call).
 //
-//	cargo build --release --features net
-//	# libnet.{so,dylib} ends up in net/crates/net/target/release/
-//
-// `#cgo LDFLAGS` below points at that directory relative to
-// SRCDIR; the consumer go.mod sits next to it so the relative
-// path is stable.
+// `ctx.Deadline()` is NOT automatically applied — use
+// `WithDeadline` explicitly. The `ctx context.Context`
+// parameter on each op is reserved for future cancellation.
 
 package net
 
@@ -319,7 +315,6 @@ func (c *RegistryClient) List(ctx context.Context, targetNodeID uint64) ([]Regis
 	if c.handle == nil {
 		return nil, ErrAggregatorHandleClosed
 	}
-	c.honorContextDeadline(ctx)
 	var errKind C.int
 	jsonPtr := C.net_registry_client_list(c.handle, C.uint64_t(targetNodeID), &errKind)
 	if jsonPtr == nil {
@@ -409,22 +404,6 @@ func (c *RegistryClient) Unregister(
 	}
 }
 
-func (c *RegistryClient) honorContextDeadline(ctx context.Context) {
-	if ctx == nil {
-		return
-	}
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return
-		}
-		C.net_registry_client_set_deadline(
-			c.handle,
-			C.uint64_t(remaining/time.Millisecond),
-		)
-	}
-}
-
 func (c *RegistryClient) lastErrorDetail() string {
 	if c.handle == nil {
 		return ""
@@ -511,7 +490,6 @@ func (c *FoldQueryClient) QueryLatest(
 	if c.handle == nil {
 		return nil, ErrAggregatorHandleClosed
 	}
-	c.honorContextDeadline(ctx)
 	var errKind C.int
 	jsonPtr := C.net_fold_query_client_query_latest(
 		c.handle,
@@ -544,7 +522,6 @@ func (c *FoldQueryClient) QuerySummarizeNow(
 	if c.handle == nil {
 		return nil, ErrAggregatorHandleClosed
 	}
-	c.honorContextDeadline(ctx)
 	var errKind C.int
 	jsonPtr := C.net_fold_query_client_query_summarize_now(
 		c.handle,
@@ -581,22 +558,6 @@ func (c *FoldQueryClient) InvalidateTarget(targetNodeID uint64) {
 	defer c.mu.RUnlock()
 	if c.handle != nil {
 		C.net_fold_query_client_invalidate_target(c.handle, C.uint64_t(targetNodeID))
-	}
-}
-
-func (c *FoldQueryClient) honorContextDeadline(ctx context.Context) {
-	if ctx == nil {
-		return
-	}
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return
-		}
-		C.net_fold_query_client_set_deadline(
-			c.handle,
-			C.uint64_t(remaining/time.Millisecond),
-		)
 	}
 }
 

@@ -51,6 +51,11 @@ tracing = "0.1"
 
 # Hex codec for PSK + group_seed material.
 hex = "0.4"
+# `--print-bootstrap` emits a single JSON line for integration
+# test fixtures; serde_json gives us escaping + field ordering
+# for free (and stays correct if `bound_addr` ever supports
+# Unix-socket paths or anything else with special characters).
+serde_json = "1"
 
 # Stable, repo-pinned 32-byte hash for the auto-derived
 # group_seed when operators don't supply one explicitly.

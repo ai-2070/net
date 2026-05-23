@@ -39,10 +39,15 @@ async fn handshake(a: &Mesh, b: &Mesh, addr_b: std::net::SocketAddr) {
     let pub_b = *b.inner().public_key();
     let nid_b = b.inner().node_id();
     let nid_a = a.inner().node_id();
-    let (r1, r2) = tokio::join!(b.inner().accept(nid_a), async {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        a.inner().connect(addr_b, &pub_b, nid_b).await
-    });
+    // `accept` and `connect` both block on the same UDP socket
+    // exchange and synchronize their own state — `join!` lets
+    // whichever side is ready first wake the other. The
+    // previous `sleep(50ms)` race-papered over a real ordering
+    // bug fixed upstream; not needed anymore.
+    let (r1, r2) = tokio::join!(
+        b.inner().accept(nid_a),
+        a.inner().connect(addr_b, &pub_b, nid_b),
+    );
     r1.expect("accept");
     r2.expect("connect");
     a.inner().start();

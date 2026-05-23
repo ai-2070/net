@@ -1,32 +1,12 @@
-// Typed error classes + classifier for the `aggregator.registry` /
-// `fold.query` RPC clients (Stage 2 of `SDK_AGGREGATOR_SUBNET_PLAN.md`).
+// Typed error classes + classifier for the `aggregator.registry`
+// / `fold.query` RPC clients.
 //
-// The napi binding throws plain `Error` objects with the stable
-// `agg:` prefix (`agg:<kind>: <detail>`). `classifyAggregatorError`
-// inspects the kind segment and re-throws a typed
-// `RegistryClientError` / `FoldQueryClientError`. Catch with
-// `instanceof`:
-//
-//   import {
-//     RegistryClient,
-//     classifyAggregatorError,
-//     RegistryClientError,
-//   } from '@net-mesh/core/aggregator';
-//
-//   try {
-//     await client.spawn(target, 'reservation', 'res-1', 3);
-//   } catch (e) {
-//     const typed = classifyAggregatorError(e);
-//     if (typed instanceof RegistryClientError && typed.kind === 'unknown-template') {
-//       // ...
-//     }
-//     throw typed;
-//   }
-//
-// The prefix string is locked in lockstep with `ERR_AGG_PREFIX` in
-// `bindings/node/src/aggregator.rs`. The kind segment matches the
-// substrate's `RegistryClientError` / `FoldQueryClientError`
-// variants per `SDK_AGGREGATOR_SUBNET_PLAN.md` § "Stage 2".
+// The napi binding throws plain Error with the stable `agg:`
+// prefix (`agg:<kind>: <detail>`); `classifyAggregatorError`
+// re-throws as a typed `RegistryClientError` /
+// `FoldQueryClientError`. Prefix locked against
+// `ERR_AGG_PREFIX` in `bindings/node/src/aggregator.rs`;
+// `tests/error_kind_mirror.rs` is the cross-language pin.
 
 const ERR_AGG_PREFIX = 'agg:'
 

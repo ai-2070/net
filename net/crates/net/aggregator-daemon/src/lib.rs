@@ -246,16 +246,12 @@ pub async fn run(cli: Cli) -> Result<(), DaemonError> {
 /// 64 lowercase hex chars (no escaping). One line, terminated
 /// by `\n`, flushed.
 fn print_bootstrap_line(booted: &BootedDaemon) {
-    let pk_hex: String = booted
-        .public_key
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let node_id = booted.mesh.node_id();
-    println!(
-        "{{\"node_id\":{node_id},\"bound_addr\":\"{}\",\"public_key_hex\":\"{pk_hex}\"}}",
-        booted.bound_addr,
-    );
+    let line = serde_json::json!({
+        "node_id": booted.mesh.node_id(),
+        "bound_addr": booted.bound_addr.to_string(),
+        "public_key_hex": hex::encode(booted.public_key),
+    });
+    println!("{line}");
     // Force a flush so subprocess test fixtures see the line
     // before the daemon enters wait_for_shutdown (where stdout
     // is otherwise quiet for the program's lifetime).

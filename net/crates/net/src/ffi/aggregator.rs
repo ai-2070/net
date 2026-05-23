@@ -1,37 +1,13 @@
 //! C FFI bindings for the aggregator-registry RPC client +
-//! channel-visibility setter.
+//! fold-query client + channel-visibility setter
+//! (`SDK_AGGREGATOR_SUBNET_PLAN.md` stages 5 + 4-fold-query).
 //!
-//! Stage 5 of `docs/plans/SDK_AGGREGATOR_SUBNET_PLAN.md`. Surface
-//! targeted at the Go SDK (via the future `aggregator-ffi`
-//! cdylib) + any raw C consumer.
-//!
-//! # Surface
-//!
-//! - `net_registry_client_new` / `_free` / `_set_deadline` —
-//!   construct + tear down a
-//!   [`RegistryClient`](crate::adapter::net::behavior::aggregator::RegistryClient).
-//! - `net_registry_client_list` — enumerate groups; returns a
-//!   JSON array string.
-//! - `net_registry_client_spawn` — deploy a new group; returns
-//!   the spawned group's JSON.
-//! - `net_registry_client_unregister` — tear down a group;
-//!   returns `true`/`false`.
-//! - `net_registry_last_error_detail` — operator-facing detail
-//!   string for the last failed call on this handle.
-//! - `net_register_channel` — channel-config setter with the
-//!   `net_visibility_t` enum.
-//!
-//! Everything crosses the boundary the same way as
-//! `ffi::mesh`: opaque handles freed via dedicated `_free`,
-//! scalar ids as `u64`, JSON strings via `CString::into_raw`
-//! freed by the caller via `net_free_string`.
-//!
-//! # Safety
-//!
-//! Same caller-side contract as `ffi::mesh` and `ffi::cortex` —
-//! see those module preambles. `clippy::missing_safety_doc`
-//! and per-block `// SAFETY:` comments are suppressed at the
-//! module level for the same rationale.
+//! Boundary conventions mirror `ffi::mesh`: opaque handles
+//! freed via dedicated `_free`, scalar ids as `u64`, JSON
+//! strings via `CString::into_raw` freed by the caller via
+//! `net_free_string`. Caller safety contract is identical to
+//! `ffi::mesh` / `ffi::cortex`; `clippy::missing_safety_doc`
+//! suppressed at the module level for the same rationale.
 #![allow(clippy::missing_safety_doc)]
 #![expect(
     clippy::undocumented_unsafe_blocks,
@@ -42,11 +18,12 @@ use std::ffi::{c_char, c_int, CStr, CString};
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex as ParkingMutex;
+use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 
 use crate::adapter::net::behavior::aggregator::{
     FoldQueryClient, FoldQueryClientError, FoldQueryError, RegistryClient, RegistryClientError,
-    RegistryGroupSummary, RegistryRpcError, SummaryAnnouncement,
+    RegistryGroupSummary, RegistryRpcError, SummaryAnnouncement, DEFAULT_QUERY_DEADLINE,
+    DEFAULT_REGISTRY_DEADLINE,
 };
 use crate::adapter::net::{ChannelConfig, ChannelId, ChannelName, Visibility};
 
@@ -110,21 +87,41 @@ impl NetVisibility {
             _ => None,
         }
     }
+
+    /// Compile-time exhaustiveness check in the *opposite*
+    /// direction — every substrate [`Visibility`] variant must
+    /// have a wire-stable C ABI counterpart. If the substrate
+    /// gains a variant, this `match` stops compiling, forcing
+    /// the FFI maintainer to either add the discriminant + bump
+    /// the wire contract or explicitly accept the omission with
+    /// `_ => None`. Without this, [`from_raw`] would silently
+    /// reject the new variant and operator code referring to it
+    /// by literal value would see a NULL handle / ERR_INVALID
+    /// instead of a typed wire error.
+    #[allow(dead_code)] // existence is the check
+    fn to_raw(v: Visibility) -> NetVisibility {
+        match v {
+            Visibility::Global => NetVisibility::Global,
+            Visibility::ParentVisible => NetVisibility::ParentVisible,
+            Visibility::Exported => NetVisibility::Exported,
+            Visibility::SubnetLocal => NetVisibility::SubnetLocal,
+        }
+    }
 }
 
 // ─── Handle ───
 
-/// FFI handle for a [`RegistryClient`] + a slot for the last
-/// error's operator-facing detail string.
+/// FFI handle for a [`RegistryClient`].
+///
+/// The inner client is wrapped in a `RwLock` so concurrent ops
+/// (entry points are called from many threads in async runtimes)
+/// can share read access while a `set_deadline` writer
+/// serializes. `last_error_detail` lives behind a separate
+/// `parking_lot::Mutex`; the lifetime contract for pointers
+/// returned by [`net_registry_last_error_detail`] is "valid
+/// until the next op on this handle or until free".
 pub struct RegistryClientHandle {
-    client: RegistryClient,
-    /// Held alongside `client` so `set_deadline` can rebuild
-    /// the client (RegistryClient is `with_deadline(self) -> Self`).
-    mesh: Arc<crate::adapter::net::MeshNode>,
-    /// Diagnostic detail for the most recent op that returned
-    /// a non-OK status. `parking_lot::Mutex` because the FFI
-    /// surface is `Sync` (entry points are called from multiple
-    /// threads in async runtimes).
+    client: ParkingRwLock<RegistryClient>,
     last_error_detail: ParkingMutex<Option<CString>>,
 }
 
@@ -140,12 +137,9 @@ pub unsafe extern "C" fn net_registry_client_new(
     if mesh_handle.is_null() {
         return std::ptr::null_mut();
     }
-    let mesh_arc: Arc<crate::adapter::net::MeshNode> =
-        unsafe { super::mesh::mesh_node_arc(&*mesh_handle) };
-    let client = RegistryClient::new(mesh_arc.clone());
+    let mesh_arc = unsafe { super::mesh::mesh_node_arc(&*mesh_handle) };
     let boxed = Box::new(RegistryClientHandle {
-        client,
-        mesh: mesh_arc,
+        client: ParkingRwLock::new(RegistryClient::new(mesh_arc)),
         last_error_detail: ParkingMutex::new(None),
     });
     Box::into_raw(boxed)
@@ -161,8 +155,11 @@ pub unsafe extern "C" fn net_registry_client_free(handle: *mut RegistryClientHan
     drop(unsafe { Box::from_raw(handle) });
 }
 
-/// Override the per-call deadline in milliseconds.
-/// `millis == 0` resets to the substrate default.
+/// Override the per-call deadline in milliseconds. `millis == 0`
+/// resets to the substrate default. Safe to call concurrently
+/// with in-flight ops; the writer takes the inner lock briefly
+/// and any concurrent reader either observes the old or the new
+/// deadline (no torn read).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_registry_client_set_deadline(
     handle: *mut RegistryClientHandle,
@@ -171,13 +168,96 @@ pub unsafe extern "C" fn net_registry_client_set_deadline(
     if handle.is_null() {
         return;
     }
-    let h: &mut RegistryClientHandle = unsafe { &mut *handle };
-    let new_client = if millis == 0 {
-        RegistryClient::new(h.mesh.clone())
+    let h: &RegistryClientHandle = unsafe { &*handle };
+    let deadline = if millis == 0 {
+        DEFAULT_REGISTRY_DEADLINE
     } else {
-        RegistryClient::new(h.mesh.clone()).with_deadline(Duration::from_millis(millis))
+        Duration::from_millis(millis)
     };
-    h.client = new_client;
+    h.client.write().set_deadline_mut(deadline);
+}
+
+// ─── Op-handler internals ───
+//
+// Every public `net_registry_client_*` op shares the same six
+// steps: null-check, parse CStr args, snapshot the client under
+// the read lock, await the substrate call, classify+store-detail
+// on error, write the out param. The `dispatch_*` + `write_*`
+// helpers below capture each step once.
+
+/// Set `*out` if non-null and return the JSON pointer + status.
+/// Op handlers funnel every success / failure path through this
+/// so the null-check on `out_error_kind` is centralized.
+#[inline]
+unsafe fn write_kind(out: *mut c_int, kind: c_int) {
+    if !out.is_null() {
+        unsafe { *out = kind };
+    }
+}
+
+/// Read a NUL-terminated UTF-8 string argument and return an
+/// owned `String`, or set the out-param to `INVALID_ARGS` +
+/// return `None` if the pointer is null or the bytes aren't
+/// valid UTF-8.
+#[inline]
+unsafe fn cstr_arg(ptr: *const c_char, out: *mut c_int) -> Option<String> {
+    if ptr.is_null() {
+        unsafe { write_kind(out, NET_REGISTRY_ERR_INVALID_ARGS) };
+        return None;
+    }
+    match unsafe { CStr::from_ptr(ptr).to_str() } {
+        Ok(s) => Some(s.to_owned()),
+        Err(_) => {
+            unsafe { write_kind(out, NET_REGISTRY_ERR_INVALID_ARGS) };
+            None
+        }
+    }
+}
+
+/// Convert a JSON string into a heap-allocated `*mut c_char` the
+/// caller frees with `net_free_string`. Returns NULL + sets the
+/// out-param to `CODEC` if the string contains an embedded NUL.
+#[inline]
+unsafe fn json_to_raw(json: String, out: *mut c_int) -> *mut c_char {
+    match CString::new(json) {
+        Ok(s) => {
+            unsafe { write_kind(out, NET_REGISTRY_OK) };
+            s.into_raw()
+        }
+        Err(_) => {
+            unsafe { write_kind(out, NET_REGISTRY_ERR_CODEC) };
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Funnel for any registry op that returns a JSON string.
+/// Takes a closure that produces `Result<String, RegistryClientError>`
+/// (the JSON-encoding step is the caller's responsibility because
+/// the substrate type varies per op).
+unsafe fn registry_op_json<F>(
+    handle: *mut RegistryClientHandle,
+    out_error_kind: *mut c_int,
+    op: F,
+) -> *mut c_char
+where
+    F: FnOnce(RegistryClient) -> Result<String, RegistryClientError>,
+{
+    if handle.is_null() {
+        unsafe { write_kind(out_error_kind, NET_REGISTRY_ERR_INVALID_ARGS) };
+        return std::ptr::null_mut();
+    }
+    let h: &RegistryClientHandle = unsafe { &*handle };
+    let client = h.client.read().clone();
+    match op(client) {
+        Ok(json) => unsafe { json_to_raw(json, out_error_kind) },
+        Err(e) => {
+            let (kind, detail) = classify(&e);
+            store_error_detail(h, detail);
+            unsafe { write_kind(out_error_kind, kind) };
+            std::ptr::null_mut()
+        }
+    }
 }
 
 // ─── Operations ───
@@ -192,39 +272,17 @@ pub unsafe extern "C" fn net_registry_client_list(
     target_node_id: u64,
     out_error_kind: *mut c_int,
 ) -> *mut c_char {
-    if handle.is_null() || out_error_kind.is_null() {
-        if !out_error_kind.is_null() {
-            unsafe { *out_error_kind = NET_REGISTRY_ERR_INVALID_ARGS };
-        }
+    if out_error_kind.is_null() {
         return std::ptr::null_mut();
     }
-    let h: &RegistryClientHandle = unsafe { &*handle };
-    let result = block_on(h.client.list(target_node_id));
-    match result {
-        Ok(groups) => {
-            let json = groups_to_json(&groups);
-            unsafe { *out_error_kind = NET_REGISTRY_OK };
-            match CString::new(json) {
-                Ok(s) => s.into_raw(),
-                Err(_) => {
-                    unsafe { *out_error_kind = NET_REGISTRY_ERR_CODEC };
-                    std::ptr::null_mut()
-                }
-            }
-        }
-        Err(e) => {
-            let (kind, detail) = classify(&e);
-            store_error_detail(h, detail);
-            unsafe { *out_error_kind = kind };
-            std::ptr::null_mut()
-        }
+    unsafe {
+        registry_op_json(handle, out_error_kind, |client| {
+            block_on(client.list(target_node_id)).map(|groups| groups_to_json(&groups))
+        })
     }
 }
 
 /// Spawn a new group by referencing a daemon-side template.
-/// Returns a JSON-encoded `RegistryGroupSummaryJson` for the
-/// spawned group; caller frees via `net_free_string`.
-///
 /// `template_name` + `group_name` are NUL-terminated UTF-8.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_registry_client_spawn(
@@ -235,59 +293,17 @@ pub unsafe extern "C" fn net_registry_client_spawn(
     replica_count: u8,
     out_error_kind: *mut c_int,
 ) -> *mut c_char {
-    if handle.is_null() || template_name.is_null() || group_name.is_null() {
-        if !out_error_kind.is_null() {
-            unsafe { *out_error_kind = NET_REGISTRY_ERR_INVALID_ARGS };
-        }
+    let Some(template) = (unsafe { cstr_arg(template_name, out_error_kind) }) else {
         return std::ptr::null_mut();
-    }
-    let h: &RegistryClientHandle = unsafe { &*handle };
-    let template = match unsafe { CStr::from_ptr(template_name).to_str() } {
-        Ok(s) => s.to_owned(),
-        Err(_) => {
-            if !out_error_kind.is_null() {
-                unsafe { *out_error_kind = NET_REGISTRY_ERR_INVALID_ARGS };
-            }
-            return std::ptr::null_mut();
-        }
     };
-    let group = match unsafe { CStr::from_ptr(group_name).to_str() } {
-        Ok(s) => s.to_owned(),
-        Err(_) => {
-            if !out_error_kind.is_null() {
-                unsafe { *out_error_kind = NET_REGISTRY_ERR_INVALID_ARGS };
-            }
-            return std::ptr::null_mut();
-        }
+    let Some(group) = (unsafe { cstr_arg(group_name, out_error_kind) }) else {
+        return std::ptr::null_mut();
     };
-    let result = block_on(
-        h.client
-            .spawn(target_node_id, template, group, replica_count),
-    );
-    match result {
-        Ok(summary) => {
-            let json = group_to_json(&summary);
-            if !out_error_kind.is_null() {
-                unsafe { *out_error_kind = NET_REGISTRY_OK };
-            }
-            match CString::new(json) {
-                Ok(s) => s.into_raw(),
-                Err(_) => {
-                    if !out_error_kind.is_null() {
-                        unsafe { *out_error_kind = NET_REGISTRY_ERR_CODEC };
-                    }
-                    std::ptr::null_mut()
-                }
-            }
-        }
-        Err(e) => {
-            let (kind, detail) = classify(&e);
-            store_error_detail(h, detail);
-            if !out_error_kind.is_null() {
-                unsafe { *out_error_kind = kind };
-            }
-            std::ptr::null_mut()
-        }
+    unsafe {
+        registry_op_json(handle, out_error_kind, |client| {
+            block_on(client.spawn(target_node_id, template, group, replica_count))
+                .map(|summary| group_to_json(&summary))
+        })
     }
 }
 
@@ -302,27 +318,18 @@ pub unsafe extern "C" fn net_registry_client_unregister(
     group_name: *const c_char,
     out_error_kind: *mut c_int,
 ) -> c_int {
-    if handle.is_null() || group_name.is_null() {
-        if !out_error_kind.is_null() {
-            unsafe { *out_error_kind = NET_REGISTRY_ERR_INVALID_ARGS };
-        }
+    if handle.is_null() {
+        unsafe { write_kind(out_error_kind, NET_REGISTRY_ERR_INVALID_ARGS) };
         return -1;
     }
-    let h: &RegistryClientHandle = unsafe { &*handle };
-    let group = match unsafe { CStr::from_ptr(group_name).to_str() } {
-        Ok(s) => s.to_owned(),
-        Err(_) => {
-            if !out_error_kind.is_null() {
-                unsafe { *out_error_kind = NET_REGISTRY_ERR_INVALID_ARGS };
-            }
-            return -1;
-        }
+    let Some(group) = (unsafe { cstr_arg(group_name, out_error_kind) }) else {
+        return -1;
     };
-    match block_on(h.client.unregister(target_node_id, group)) {
+    let h: &RegistryClientHandle = unsafe { &*handle };
+    let client = h.client.read().clone();
+    match block_on(client.unregister(target_node_id, group)) {
         Ok(existed) => {
-            if !out_error_kind.is_null() {
-                unsafe { *out_error_kind = NET_REGISTRY_OK };
-            }
+            unsafe { write_kind(out_error_kind, NET_REGISTRY_OK) };
             if existed {
                 1
             } else {
@@ -332,9 +339,7 @@ pub unsafe extern "C" fn net_registry_client_unregister(
         Err(e) => {
             let (kind, detail) = classify(&e);
             store_error_detail(h, detail);
-            if !out_error_kind.is_null() {
-                unsafe { *out_error_kind = kind };
-            }
+            unsafe { write_kind(out_error_kind, kind) };
             -1
         }
     }
@@ -411,13 +416,13 @@ pub unsafe extern "C" fn net_register_channel(
 
 // ─── FoldQueryClient handle ───
 
-/// FFI handle for a [`FoldQueryClient`] + a slot for the last
-/// error's operator-facing detail string.
+/// FFI handle for a [`FoldQueryClient`]. Same sync model as
+/// [`RegistryClientHandle`]: the inner client lives behind a
+/// `RwLock` so `set_ttl` / `set_deadline` writers serialize with
+/// in-flight ops, and the cache (held by the inner client's
+/// `Arc<RwLock<HashMap<...>>>`) survives deadline / TTL changes.
 pub struct FoldQueryClientHandle {
-    client: FoldQueryClient,
-    /// Held alongside `client` so `set_ttl` / `set_deadline` can
-    /// rebuild the client (builders are `with_*(self) -> Self`).
-    mesh: Arc<crate::adapter::net::MeshNode>,
+    client: ParkingRwLock<FoldQueryClient>,
     last_error_detail: ParkingMutex<Option<CString>>,
 }
 
@@ -431,12 +436,9 @@ pub unsafe extern "C" fn net_fold_query_client_new(
     if mesh_handle.is_null() {
         return std::ptr::null_mut();
     }
-    let mesh_arc: Arc<crate::adapter::net::MeshNode> =
-        unsafe { super::mesh::mesh_node_arc(&*mesh_handle) };
-    let client = FoldQueryClient::new(mesh_arc.clone());
+    let mesh_arc = unsafe { super::mesh::mesh_node_arc(&*mesh_handle) };
     let boxed = Box::new(FoldQueryClientHandle {
-        client,
-        mesh: mesh_arc,
+        client: ParkingRwLock::new(FoldQueryClient::new(mesh_arc)),
         last_error_detail: ParkingMutex::new(None),
     });
     Box::into_raw(boxed)
@@ -452,7 +454,8 @@ pub unsafe extern "C" fn net_fold_query_client_free(handle: *mut FoldQueryClient
 }
 
 /// Override the cache TTL in milliseconds. `millis == 0` disables
-/// the cache entirely.
+/// the cache entirely. Mutates in place — the warmed cache
+/// survives the adjustment.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_fold_query_client_set_ttl(
     handle: *mut FoldQueryClientHandle,
@@ -461,12 +464,12 @@ pub unsafe extern "C" fn net_fold_query_client_set_ttl(
     if handle.is_null() {
         return;
     }
-    let h: &mut FoldQueryClientHandle = unsafe { &mut *handle };
-    h.client = FoldQueryClient::new(h.mesh.clone()).with_ttl(Duration::from_millis(millis));
+    let h: &FoldQueryClientHandle = unsafe { &*handle };
+    h.client.write().set_ttl_mut(Duration::from_millis(millis));
 }
 
 /// Override the per-call deadline in milliseconds. `millis == 0`
-/// resets to the substrate default.
+/// resets to the substrate default. Mutates in place.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_fold_query_client_set_deadline(
     handle: *mut FoldQueryClientHandle,
@@ -475,12 +478,13 @@ pub unsafe extern "C" fn net_fold_query_client_set_deadline(
     if handle.is_null() {
         return;
     }
-    let h: &mut FoldQueryClientHandle = unsafe { &mut *handle };
-    h.client = if millis == 0 {
-        FoldQueryClient::new(h.mesh.clone())
+    let h: &FoldQueryClientHandle = unsafe { &*handle };
+    let deadline = if millis == 0 {
+        DEFAULT_QUERY_DEADLINE
     } else {
-        FoldQueryClient::new(h.mesh.clone()).with_deadline(Duration::from_millis(millis))
+        Duration::from_millis(millis)
     };
+    h.client.write().set_deadline_mut(deadline);
 }
 
 /// Query the aggregator's latest cached summaries. Cache hit
@@ -495,19 +499,18 @@ pub unsafe extern "C" fn net_fold_query_client_query_latest(
     kind: u16,
     out_error_kind: *mut c_int,
 ) -> *mut c_char {
-    if handle.is_null() || out_error_kind.is_null() {
-        if !out_error_kind.is_null() {
-            unsafe { *out_error_kind = NET_REGISTRY_ERR_INVALID_ARGS };
-        }
+    if out_error_kind.is_null() {
         return std::ptr::null_mut();
     }
-    let h: &FoldQueryClientHandle = unsafe { &*handle };
-    let result = block_on(h.client.query_latest(target_node_id, kind));
-    finish_summaries(h, result, out_error_kind)
+    unsafe {
+        fold_query_op_json(handle, out_error_kind, |client| {
+            block_on(client.query_latest(target_node_id, kind))
+                .map(|summaries| summaries_to_json(&summaries))
+        })
+    }
 }
 
-/// Force a fresh `SummarizeNow` query — never cached. Returns
-/// the same JSON shape as `_query_latest`.
+/// Force a fresh `SummarizeNow` query — never cached.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_fold_query_client_query_summarize_now(
     handle: *mut FoldQueryClientHandle,
@@ -515,15 +518,15 @@ pub unsafe extern "C" fn net_fold_query_client_query_summarize_now(
     kind: u16,
     out_error_kind: *mut c_int,
 ) -> *mut c_char {
-    if handle.is_null() || out_error_kind.is_null() {
-        if !out_error_kind.is_null() {
-            unsafe { *out_error_kind = NET_REGISTRY_ERR_INVALID_ARGS };
-        }
+    if out_error_kind.is_null() {
         return std::ptr::null_mut();
     }
-    let h: &FoldQueryClientHandle = unsafe { &*handle };
-    let result = block_on(h.client.query_summarize_now(target_node_id, kind));
-    finish_summaries(h, result, out_error_kind)
+    unsafe {
+        fold_query_op_json(handle, out_error_kind, |client| {
+            block_on(client.query_summarize_now(target_node_id, kind))
+                .map(|summaries| summaries_to_json(&summaries))
+        })
+    }
 }
 
 /// Drop every cached entry.
@@ -535,7 +538,7 @@ pub unsafe extern "C" fn net_fold_query_client_invalidate_cache(
         return;
     }
     let h: &FoldQueryClientHandle = unsafe { &*handle };
-    h.client.invalidate_cache();
+    h.client.read().invalidate_cache();
 }
 
 /// Drop only cache entries matching `target_node_id`.
@@ -548,7 +551,7 @@ pub unsafe extern "C" fn net_fold_query_client_invalidate_target(
         return;
     }
     let h: &FoldQueryClientHandle = unsafe { &*handle };
-    h.client.invalidate_target(target_node_id);
+    h.client.read().invalidate_target(target_node_id);
 }
 
 /// Operator-facing detail string for the most recent non-OK
@@ -578,27 +581,28 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
     super::mesh::block_on(future)
 }
 
-fn finish_summaries(
-    h: &FoldQueryClientHandle,
-    result: Result<Vec<SummaryAnnouncement>, FoldQueryClientError>,
+/// Funnel for any fold-query op that returns a JSON string.
+/// Mirror of [`registry_op_json`].
+unsafe fn fold_query_op_json<F>(
+    handle: *mut FoldQueryClientHandle,
     out_error_kind: *mut c_int,
-) -> *mut c_char {
-    match result {
-        Ok(summaries) => {
-            let json = summaries_to_json(&summaries);
-            unsafe { *out_error_kind = NET_REGISTRY_OK };
-            match CString::new(json) {
-                Ok(s) => s.into_raw(),
-                Err(_) => {
-                    unsafe { *out_error_kind = NET_REGISTRY_ERR_CODEC };
-                    std::ptr::null_mut()
-                }
-            }
-        }
+    op: F,
+) -> *mut c_char
+where
+    F: FnOnce(FoldQueryClient) -> Result<String, FoldQueryClientError>,
+{
+    if handle.is_null() {
+        unsafe { write_kind(out_error_kind, NET_REGISTRY_ERR_INVALID_ARGS) };
+        return std::ptr::null_mut();
+    }
+    let h: &FoldQueryClientHandle = unsafe { &*handle };
+    let client = h.client.read().clone();
+    match op(client) {
+        Ok(json) => unsafe { json_to_raw(json, out_error_kind) },
         Err(e) => {
             let (kind, detail) = classify_fold_query(&e);
             store_fold_query_error_detail(h, detail);
-            unsafe { *out_error_kind = kind };
+            unsafe { write_kind(out_error_kind, kind) };
             std::ptr::null_mut()
         }
     }
@@ -608,15 +612,13 @@ fn classify_fold_query(err: &FoldQueryClientError) -> (i32, String) {
     match err {
         FoldQueryClientError::Transport(e) => (NET_REGISTRY_ERR_TRANSPORT, format!("{e}")),
         FoldQueryClientError::Codec(c) => (NET_REGISTRY_ERR_CODEC, c.clone()),
-        FoldQueryClientError::Server(srv) => match srv {
-            FoldQueryError::UnknownKind { kind } => (
-                NET_REGISTRY_ERR_UNKNOWN_KIND,
-                format!("unknown fold kind: 0x{kind:04x}"),
-            ),
-            FoldQueryError::DecodeFailed(s) => {
-                (NET_REGISTRY_ERR_CODEC, format!("server decode: {s}"))
-            }
-        },
+        FoldQueryClientError::Server(FoldQueryError::UnknownKind { kind }) => (
+            NET_REGISTRY_ERR_UNKNOWN_KIND,
+            format!("unknown fold kind: 0x{kind:04x}"),
+        ),
+        FoldQueryClientError::Server(FoldQueryError::DecodeFailed(s)) => {
+            (NET_REGISTRY_ERR_CODEC, format!("server decode: {s}"))
+        }
     }
 }
 
@@ -629,36 +631,49 @@ fn store_fold_query_error_detail(h: &FoldQueryClientHandle, detail: String) {
 }
 
 fn summaries_to_json(summaries: &[SummaryAnnouncement]) -> String {
-    let mut out = String::from("[");
-    for (i, s) in summaries.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push_str(&summary_to_json(s));
-    }
-    out.push(']');
-    out
+    let wire: Vec<SummaryWire<'_>> = summaries.iter().map(SummaryWire::from).collect();
+    // `to_string` only fails on serializer-side issues — none of
+    // our wire types have non-string map keys or Float NaN — so
+    // the unwrap is unreachable. Defensive `to_string`-on-error
+    // keeps the FFI surface infallible.
+    serde_json::to_string(&wire).unwrap_or_else(|_| "[]".to_string())
 }
 
+#[cfg(test)]
 fn summary_to_json(s: &SummaryAnnouncement) -> String {
-    let mut out = format!(
-        "{{\"fold_kind\":{},\"source_subnet\":{},\"generation\":{},\"buckets\":[",
-        s.fold_kind,
-        json_string(&format!("{}", s.source_subnet)),
-        s.generation,
-    );
-    for (i, (name, count)) in s.buckets.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
+    serde_json::to_string(&SummaryWire::from(s)).unwrap_or_else(|_| "{}".to_string())
+}
+
+#[derive(serde::Serialize)]
+struct SummaryWire<'a> {
+    fold_kind: u16,
+    source_subnet: String,
+    generation: u64,
+    buckets: Vec<BucketWire<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct BucketWire<'a> {
+    name: &'a str,
+    count: u64,
+}
+
+impl<'a> From<&'a SummaryAnnouncement> for SummaryWire<'a> {
+    fn from(s: &'a SummaryAnnouncement) -> Self {
+        Self {
+            fold_kind: s.fold_kind,
+            source_subnet: format!("{}", s.source_subnet),
+            generation: s.generation,
+            buckets: s
+                .buckets
+                .iter()
+                .map(|(n, c)| BucketWire {
+                    name: n.as_str(),
+                    count: *c,
+                })
+                .collect(),
         }
-        out.push_str(&format!(
-            "{{\"name\":{},\"count\":{}}}",
-            json_string(name),
-            count
-        ));
     }
-    out.push_str("]}");
-    out
 }
 
 /// Map a `RegistryClientError` to `(error_kind, detail_string)`.
@@ -666,27 +681,25 @@ fn classify(err: &RegistryClientError) -> (i32, String) {
     match err {
         RegistryClientError::Transport(e) => (NET_REGISTRY_ERR_TRANSPORT, format!("{e}")),
         RegistryClientError::Codec(c) => (NET_REGISTRY_ERR_CODEC, c.clone()),
-        RegistryClientError::Server(rpc) => match rpc {
-            RegistryRpcError::DecodeFailed(s) => {
-                (NET_REGISTRY_ERR_CODEC, format!("server decode: {s}"))
-            }
-            RegistryRpcError::UnknownTemplate(t) => (
-                NET_REGISTRY_ERR_UNKNOWN_TEMPLATE,
-                format!("unknown template: {t}"),
-            ),
-            RegistryRpcError::DuplicateGroupName(n) => (
-                NET_REGISTRY_ERR_DUPLICATE_GROUP_NAME,
-                format!("duplicate group name: {n}"),
-            ),
-            RegistryRpcError::SpawnRejected(d) => (
-                NET_REGISTRY_ERR_SPAWN_REJECTED,
-                format!("spawn rejected: {d}"),
-            ),
-            RegistryRpcError::SpawnNotSupported => (
-                NET_REGISTRY_ERR_SPAWN_NOT_SUPPORTED,
-                "daemon is read-only (no spawn handler installed)".to_string(),
-            ),
-        },
+        RegistryClientError::Server(RegistryRpcError::DecodeFailed(s)) => {
+            (NET_REGISTRY_ERR_CODEC, format!("server decode: {s}"))
+        }
+        RegistryClientError::Server(RegistryRpcError::UnknownTemplate(t)) => (
+            NET_REGISTRY_ERR_UNKNOWN_TEMPLATE,
+            format!("unknown template: {t}"),
+        ),
+        RegistryClientError::Server(RegistryRpcError::DuplicateGroupName(n)) => (
+            NET_REGISTRY_ERR_DUPLICATE_GROUP_NAME,
+            format!("duplicate group name: {n}"),
+        ),
+        RegistryClientError::Server(RegistryRpcError::SpawnRejected(d)) => (
+            NET_REGISTRY_ERR_SPAWN_REJECTED,
+            format!("spawn rejected: {d}"),
+        ),
+        RegistryClientError::Server(RegistryRpcError::SpawnNotSupported) => (
+            NET_REGISTRY_ERR_SPAWN_NOT_SUPPORTED,
+            "daemon is read-only (no spawn handler installed)".to_string(),
+        ),
     }
 }
 
@@ -698,74 +711,54 @@ fn store_error_detail(h: &RegistryClientHandle, detail: String) {
     *h.last_error_detail.lock() = Some(c);
 }
 
-/// Encode a `[RegistryGroupSummary]` as JSON without pulling
-/// in `serde_json` at this layer. The shape is documented in
-/// the SDK plan's cross-language wire-contract table — we hand-
-/// encode here to avoid adding a serde dep to the FFI's `net`
-/// feature surface (the substrate doesn't pull serde_json
-/// directly through `net`).
+/// Encode the wire-contract JSON for a slice of registry-group
+/// summaries via `serde_json`. The substrate type
+/// `RegistryGroupSummary` derives `Serialize` but its
+/// `group_seed: [u8; 32]` field serializes as an array of u8 —
+/// the wire contract calls for `group_seed_hex: "abab…"` (64
+/// lowercase hex chars). The proxy wire-types below handle the
+/// rename + hex encoding.
 fn groups_to_json(groups: &[RegistryGroupSummary]) -> String {
-    let mut out = String::from("[");
-    for (i, g) in groups.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push_str(&group_to_json(g));
-    }
-    out.push(']');
-    out
+    let wire: Vec<GroupWire<'_>> = groups.iter().map(GroupWire::from).collect();
+    serde_json::to_string(&wire).unwrap_or_else(|_| "[]".to_string())
 }
 
 fn group_to_json(g: &RegistryGroupSummary) -> String {
-    let seed_hex: String = g.group_seed.iter().map(|b| format!("{b:02x}")).collect();
-    let mut out = format!(
-        "{{\"name\":{},\"group_seed_hex\":\"{seed_hex}\",\"replicas\":[",
-        json_string(&g.name),
-    );
-    for (i, r) in g.replicas.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!(
-            "{{\"generation\":{},\"healthy\":{},\"diagnostic\":{},\"placement_node_id\":{}}}",
-            r.generation,
-            r.healthy,
-            r.diagnostic
-                .as_ref()
-                .map(|s| json_string(s))
-                .unwrap_or_else(|| "null".to_string()),
-            r.placement_node_id
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "null".to_string()),
-        ));
-    }
-    out.push_str("]}");
-    out
+    serde_json::to_string(&GroupWire::from(g)).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// JSON-quote a string. Escapes `\` and `"`; replaces ASCII
-/// control characters with `\uXXXX`. Sufficient for our
-/// operator-supplied group/template-name strings + diagnostics —
-/// none of which contain Unicode escapes that require full JSON
-/// escaping (our usage is ASCII-dominant).
-fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
+#[derive(serde::Serialize)]
+struct GroupWire<'a> {
+    name: &'a str,
+    group_seed_hex: String,
+    replicas: Vec<ReplicaWire<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct ReplicaWire<'a> {
+    generation: u64,
+    healthy: bool,
+    diagnostic: Option<&'a str>,
+    placement_node_id: Option<u64>,
+}
+
+impl<'a> From<&'a RegistryGroupSummary> for GroupWire<'a> {
+    fn from(g: &'a RegistryGroupSummary) -> Self {
+        Self {
+            name: g.name.as_str(),
+            group_seed_hex: hex::encode(g.group_seed),
+            replicas: g
+                .replicas
+                .iter()
+                .map(|r| ReplicaWire {
+                    generation: r.generation,
+                    healthy: r.healthy,
+                    diagnostic: r.diagnostic.as_deref(),
+                    placement_node_id: r.placement_node_id,
+                })
+                .collect(),
         }
     }
-    out.push('"');
-    out
 }
 
 #[cfg(test)]
@@ -785,16 +778,6 @@ mod tests {
         }
         assert!(NetVisibility::from_raw(99).is_none());
         assert!(NetVisibility::from_raw(-1).is_none());
-    }
-
-    #[test]
-    fn json_string_escapes_control_characters() {
-        assert_eq!(json_string("plain"), r#""plain""#);
-        assert_eq!(json_string("with \"quote\""), r#""with \"quote\"""#);
-        assert_eq!(json_string("back\\slash"), r#""back\\slash""#);
-        assert_eq!(json_string("new\nline"), r#""new\nline""#);
-        // ASCII bell (0x07) → .
-        assert_eq!(json_string("\u{0007}"), "\"\\u0007\"");
     }
 
     #[test]

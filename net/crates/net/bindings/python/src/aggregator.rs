@@ -1,30 +1,16 @@
-//! PyO3 bindings for the `aggregator.registry` + `fold.query` RPC
-//! clients. Stage 3 of `SDK_AGGREGATOR_SUBNET_PLAN.md`.
+//! PyO3 bindings for the `aggregator.registry` + `fold.query`
+//! RPC clients. Client surface only — daemon-author types stay
+//! Rust-only.
 //!
-//! Client surfaces only — daemon-author types
-//! (`AggregatorDaemon`, `LifecycleGroup`, `HealthMonitor`) stay
-//! Rust-only. Python operators wanting to host aggregators should
-//! run the `net-aggregator-daemon` binary alongside their app and
-//! RPC into it via the clients exposed here.
+//! Methods take a `Python<'_>` token and `py.detach(|| ...)`
+//! around the blocking `runtime.block_on` call so the GIL is
+//! released during the RPC (same pattern as `mesh_rpc.rs`;
+//! async Python wraps in `asyncio.to_thread`).
 //!
-//! # Thread / GIL model
-//!
-//! Methods that issue wire RPCs (`list`, `spawn`, `unregister`,
-//! `query_latest`, `query_summarize_now`) take a `Python<'_>` token
-//! and call `py.detach(|| runtime.block_on(async { ... }))` so the
-//! GIL is released while the RPC is in flight. This mirrors the
-//! pattern in [`mesh_rpc.rs`] (no `pyo3-asyncio` dependency); async
-//! Python callers wrap the sync call in `asyncio.to_thread`.
-//!
-//! # Error mapping
-//!
-//! All errors raise [`RegistryClientError`] / [`FoldQueryClientError`]
-//! (or one of their concrete subclasses) with a `.kind` attribute
-//! carrying the stable discriminator string and `.server_detail`
-//! carrying the long-form text. The discriminators match the
-//! `agg:<kind>` prefix the Node binding emits and the
-//! `RegistryClientError` / `FoldQueryClientError` variants in the
-//! Rust SDK.
+//! Errors raise `RegistryClientError` / `FoldQueryClientError`
+//! (or a typed subclass) with `.kind` + `.server_detail` set
+//! before raise. Discriminators are pinned by
+//! `tests/error_kind_mirror.rs`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,7 +22,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use tokio::runtime::Runtime;
 
-use net::adapter::net::MeshNode;
 use net_sdk::aggregator::{
     FoldQueryClient as SdkFoldQueryClient, FoldQueryClientError as SdkFoldQueryClientError,
     FoldQueryError, RegistryClient as SdkRegistryClient,
@@ -170,7 +155,7 @@ fn replica_to_dict<'py>(
 fn group_to_dict<'py>(py: Python<'py>, g: &RegistryGroupSummary) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("name", &g.name)?;
-    let seed_hex: String = g.group_seed.iter().map(|b| format!("{b:02x}")).collect();
+    let seed_hex = hex::encode(g.group_seed);
     d.set_item("group_seed_hex", seed_hex)?;
     let replicas = PyList::empty(py);
     for r in &g.replicas {
@@ -228,32 +213,26 @@ fn summaries_to_list<'py>(
 #[pyclass(name = "RegistryClient", module = "net._net")]
 pub struct PyRegistryClient {
     inner: Arc<RwLock<SdkRegistryClient>>,
-    mesh: Arc<MeshNode>,
     runtime: Arc<Runtime>,
 }
 
 #[pymethods]
 impl PyRegistryClient {
-    /// Construct against a live `NetMesh`. Raises `RuntimeError`
-    /// if the mesh has been shut down.
     #[new]
     fn new(mesh: &crate::mesh_bindings::NetMesh) -> PyResult<Self> {
         let mesh_arc = mesh.node_arc_clone()?;
-        let runtime = mesh.runtime_arc();
         Ok(Self {
-            inner: Arc::new(RwLock::new(SdkRegistryClient::new(mesh_arc.clone()))),
-            mesh: mesh_arc,
-            runtime,
+            inner: Arc::new(RwLock::new(SdkRegistryClient::new(mesh_arc))),
+            runtime: mesh.runtime_arc(),
         })
     }
 
     /// Override the per-call deadline in milliseconds. Mutates
-    /// `self` in place and returns it for `client.with_deadline(N)`
-    /// chaining (consistent with the substrate's builder).
+    /// `self` in place and returns it for chaining.
     fn with_deadline(slf: PyRef<'_, Self>, millis: u64) -> PyRef<'_, Self> {
-        let new_inner =
-            SdkRegistryClient::new(slf.mesh.clone()).with_deadline(Duration::from_millis(millis));
-        *slf.inner.write() = new_inner;
+        slf.inner
+            .write()
+            .set_deadline_mut(Duration::from_millis(millis));
         slf
     }
 
@@ -313,7 +292,7 @@ impl PyRegistryClient {
     }
 
     fn __repr__(&self) -> String {
-        format!("RegistryClient(mesh={:?})", Arc::as_ptr(&self.mesh),)
+        format!("RegistryClient(inner={:?})", Arc::as_ptr(&self.inner))
     }
 }
 
@@ -327,39 +306,34 @@ impl PyRegistryClient {
 #[pyclass(name = "FoldQueryClient", module = "net._net")]
 pub struct PyFoldQueryClient {
     inner: Arc<RwLock<SdkFoldQueryClient>>,
-    mesh: Arc<MeshNode>,
     runtime: Arc<Runtime>,
 }
 
 #[pymethods]
 impl PyFoldQueryClient {
-    /// Construct against a live `NetMesh`. Raises `RuntimeError`
-    /// if the mesh has been shut down.
     #[new]
     fn new(mesh: &crate::mesh_bindings::NetMesh) -> PyResult<Self> {
         let mesh_arc = mesh.node_arc_clone()?;
-        let runtime = mesh.runtime_arc();
         Ok(Self {
-            inner: Arc::new(RwLock::new(SdkFoldQueryClient::new(mesh_arc.clone()))),
-            mesh: mesh_arc,
-            runtime,
+            inner: Arc::new(RwLock::new(SdkFoldQueryClient::new(mesh_arc))),
+            runtime: mesh.runtime_arc(),
         })
     }
 
     /// Override the cache TTL in milliseconds. `0` disables the
-    /// cache entirely.
+    /// cache entirely. Warmed cache survives the adjustment.
     fn with_ttl(slf: PyRef<'_, Self>, millis: u64) -> PyRef<'_, Self> {
-        let new_inner =
-            SdkFoldQueryClient::new(slf.mesh.clone()).with_ttl(Duration::from_millis(millis));
-        *slf.inner.write() = new_inner;
+        slf.inner
+            .write()
+            .set_ttl_mut(Duration::from_millis(millis));
         slf
     }
 
     /// Override the per-call deadline in milliseconds.
     fn with_deadline(slf: PyRef<'_, Self>, millis: u64) -> PyRef<'_, Self> {
-        let new_inner =
-            SdkFoldQueryClient::new(slf.mesh.clone()).with_deadline(Duration::from_millis(millis));
-        *slf.inner.write() = new_inner;
+        slf.inner
+            .write()
+            .set_deadline_mut(Duration::from_millis(millis));
         slf
     }
 
@@ -417,6 +391,6 @@ impl PyFoldQueryClient {
     }
 
     fn __repr__(&self) -> String {
-        format!("FoldQueryClient(mesh={:?})", Arc::as_ptr(&self.mesh),)
+        format!("FoldQueryClient(inner={:?})", Arc::as_ptr(&self.inner))
     }
 }
