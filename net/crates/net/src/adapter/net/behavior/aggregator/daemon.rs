@@ -37,11 +37,12 @@ use tokio::task::JoinHandle;
 use bytes::Bytes;
 
 use super::summarizer::{
-    resolve_summarizer, CapabilityFoldHandle, FoldHandle, SummarizerContext, SummaryAnnouncement,
-    Summarizer,
+    resolve_summarizer, CapabilityFoldHandle, FoldHandle, ReservationFoldHandle,
+    SummarizerContext, SummaryAnnouncement, Summarizer,
 };
 use super::AggregatorConfig;
 use crate::adapter::net::behavior::fold::capability::CapabilityFold;
+use crate::adapter::net::behavior::fold::reservation::ReservationFold;
 use crate::adapter::net::behavior::fold::FoldKind;
 use crate::adapter::net::{
     AdapterError, ChannelConfig, ChannelId, ChannelName, MeshNode, PublishConfig,
@@ -256,11 +257,20 @@ impl AggregatorDaemon {
                     fold: &handle as &dyn FoldHandle,
                 };
                 summarizer.summarize(&ctx)
+            } else if *kind == ReservationFold::KIND_ID {
+                let fold = self.mesh.reservation_fold();
+                let handle = ReservationFoldHandle(fold);
+                let ctx = SummarizerContext {
+                    source_subnet: self.config.source_subnet,
+                    generation,
+                    fold: &handle as &dyn FoldHandle,
+                };
+                summarizer.summarize(&ctx)
             } else {
-                // ReservationFold / future fold kinds need
-                // `MeshNode` accessors that don't exist yet
-                // (`MeshNode::reservation_fold()` is a substrate
-                // gap). Skip cleanly until those land.
+                // Future fold kinds add an arm here. Custom
+                // summarizers registered against arbitrary kind
+                // ids reach the substrate via this branch when a
+                // future fold-handle accessor lands on MeshNode.
                 Vec::new()
             };
             batch.extend(summaries);
@@ -621,6 +631,93 @@ mod tests {
         let agg = AggregatorDaemon::new(cfg, mesh).expect("new");
         let count = agg.register_summary_channels().expect("register");
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn reservation_fold_summarizer_buckets_by_state_label() {
+        // Pin the second built-in summarizer end-to-end now that
+        // `MeshNode::reservation_fold()` exposes the fold handle.
+        // Publish two reservations in distinct states; the
+        // `ReservationFoldSummarizer` produces one bucket per
+        // observed state label.
+        use crate::adapter::net::behavior::fold::reservation::{
+            ReservationAnnouncement, ReservationFold, ReservationState,
+        };
+        use crate::adapter::net::behavior::fold::wire::SignedAnnouncement;
+
+        let mesh = build_mesh().await;
+        let kp = EntityKeypair::generate();
+        let res_fold = mesh.reservation_fold();
+        let fresh_deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64 + 60_000_000)
+            .unwrap_or(0);
+        res_fold
+            .apply(
+                SignedAnnouncement::sign(
+                    &kp,
+                    ReservationFold::KIND_ID,
+                    0,
+                    0xA,
+                    1,
+                    EnvelopeMeta::default(),
+                    ReservationAnnouncement {
+                        resource_id: 0xCAFE,
+                        state: ReservationState::Reserved {
+                            holder: 0xA,
+                            until_unix_us: fresh_deadline,
+                        },
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        res_fold
+            .apply(
+                SignedAnnouncement::sign(
+                    &kp,
+                    ReservationFold::KIND_ID,
+                    0,
+                    0xB,
+                    1,
+                    EnvelopeMeta::default(),
+                    ReservationAnnouncement {
+                        resource_id: 0xBEEF,
+                        state: ReservationState::Free,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let cfg = AggregatorConfig::new(SubnetId::new(&[3, 7]))
+            .with_fold_kind(ReservationFold::KIND_ID);
+        let agg = AggregatorDaemon::new(cfg, mesh).expect("new");
+        agg.tick_once();
+        let summaries = agg.latest_summaries();
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        assert_eq!(summary.fold_kind, ReservationFold::KIND_ID);
+        let bucket = |name: &str| -> u64 {
+            summary
+                .buckets
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, c)| *c)
+                .unwrap_or(0)
+        };
+        assert_eq!(bucket("free"), 1);
+        // `Reserved { holder, until_unix_us }` debug-renders with
+        // the named-fields shape; the summarizer's lowercase
+        // `format!("{:?}").to_lowercase()` produces a bucket name
+        // that starts with `reserved { ... }`. Assert by prefix.
+        let reserved_count: u64 = summary
+            .buckets
+            .iter()
+            .filter(|(n, _)| n.starts_with("reserved"))
+            .map(|(_, c)| *c)
+            .sum();
+        assert_eq!(reserved_count, 1);
     }
 
     #[tokio::test]

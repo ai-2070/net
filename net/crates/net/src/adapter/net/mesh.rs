@@ -502,6 +502,13 @@ struct DispatchCtx {
     /// `SUBPROTOCOL_CAPABILITY_ANN` packets land here via the
     /// bridge's `translate_announcement`.
     capability_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
+    /// Reservation fold shared with `MeshNode`. Allocated at
+    /// construction even when the node never publishes a
+    /// reservation — the substrate-wide aggregator surface
+    /// (`AggregatorDaemon` / `Summarizer`) treats the fold as
+    /// always-present, so a `None` here would force every
+    /// caller to discriminate.
+    reservation_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::ReservationFold>>,
     /// Dedup cache for multi-hop capability announcements, keyed by
     /// `(origin_node_id, version)`. Written by the dispatch handler
     /// before indexing + forwarding so a `(origin, version)` tuple
@@ -1515,6 +1522,14 @@ pub struct MeshNode {
     /// internal [`super::behavior::fold::FoldRegistry`] (installed
     /// as the [`Self::fold_router`] router by default).
     capability_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
+    /// Reservation fold, mirroring [`Self::capability_fold`]
+    /// at the per-resource granularity. Always allocated so the
+    /// aggregator's reservation summarizer + future
+    /// `MeshNode::reservation_fold()` callers don't have to
+    /// discriminate on presence. Inbound reservation
+    /// announcements flow through the same `SUBPROTOCOL_FOLD`
+    /// dispatch as capability announcements.
+    reservation_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::ReservationFold>>,
     /// Dedup cache for multi-hop capability announcements. Keyed by
     /// `(origin_node_id, version)` — the same discriminator
     /// `CapabilityIndex` uses to skip stale announcements. Entries
@@ -1851,8 +1866,12 @@ impl MeshNode {
         let capability_fold: Arc<
             super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>,
         > = Arc::new(super::behavior::fold::Fold::new());
+        let reservation_fold: Arc<
+            super::behavior::fold::Fold<super::behavior::fold::ReservationFold>,
+        > = Arc::new(super::behavior::fold::Fold::new());
         let fold_registry = Arc::new(super::behavior::fold::FoldRegistry::new());
         fold_registry.register(capability_fold.clone());
+        fold_registry.register(reservation_fold.clone());
         let fold_router: Arc<
             parking_lot::RwLock<Option<Arc<dyn super::behavior::fold::FoldChannelRouter>>>,
         > = Arc::new(parking_lot::RwLock::new(Some(
@@ -2013,6 +2032,7 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             traversal_stats: Arc::new(super::traversal::TraversalStats::new()),
             capability_fold,
+            reservation_fold,
             seen_announcements: Arc::new(DashMap::new()),
             last_announce_at: Arc::new(parking_lot::Mutex::new(None)),
             local_announcement: Arc::new(ArcSwapOption::empty()),
@@ -2927,6 +2947,7 @@ impl MeshNode {
             traversal_config: self.traversal_config.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
             capability_fold: self.capability_fold.clone(),
+            reservation_fold: self.reservation_fold.clone(),
             seen_announcements: self.seen_announcements.clone(),
             require_signed_capabilities: self.config.require_signed_capabilities,
             local_subnet: self.local_subnet,
@@ -8895,6 +8916,17 @@ impl MeshNode {
         &self,
     ) -> &Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>> {
         &self.capability_fold
+    }
+
+    /// Shared reference to the reservation fold. Always present
+    /// (allocated at construction even when the node never
+    /// publishes a reservation) so the aggregator surface +
+    /// future scheduler callers don't have to discriminate on
+    /// presence.
+    pub fn reservation_fold(
+        &self,
+    ) -> &Arc<super::behavior::fold::Fold<super::behavior::fold::ReservationFold>> {
+        &self.reservation_fold
     }
 
     /// Test-only helper — translate a legacy
