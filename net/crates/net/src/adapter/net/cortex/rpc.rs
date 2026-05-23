@@ -942,17 +942,18 @@ pub struct RpcInboundEvent {
     /// bucket-collide but the canonical hash uniquely identifies the
     /// registered dispatcher target.
     pub channel_hash: super::super::channel::ChannelHash,
-    /// Caller's `origin_hash` from the packet header (32-bit
-    /// routing projection of the AEAD-verified peer's full
-    /// `EntityKeypair::origin_hash()` — see `OriginStamp` doc).
-    /// The dispatcher should treat this as routing metadata, not
-    /// identity authentication.
-    pub origin_hash: u32,
+    /// Caller's `origin_hash` from the packet header — the full
+    /// 64-bit `EntityKeypair::origin_hash()` mirroring the wire
+    /// field's width post-`WIRE_ORIGIN_HASH_64BIT`. The dispatcher
+    /// should treat this as routing metadata, not identity
+    /// authentication (the AEAD-verified `session_node` field
+    /// below carries that).
+    pub origin_hash: u64,
     /// Wire-session peer's `NodeId` resolved at packet receive
     /// time from the AEAD-verified session_id. Distinct from
     /// `origin_hash`: this is the full 64-bit network identity
-    /// of the peer that delivered the packet, not a 32-bit
-    /// routing projection. Used by `RpcClientPending::deliver`
+    /// of the peer that delivered the packet. Used by
+    /// `RpcClientPending::deliver`
     /// to reject spoofed RESPONSE frames whose call_id happens
     /// to match an in-flight request but whose session peer
     /// isn't the recorded target.
