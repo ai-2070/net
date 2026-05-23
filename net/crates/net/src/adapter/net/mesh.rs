@@ -10922,7 +10922,8 @@ mod fold_publisher_helpers_tests {
         let node = build_node_for_test().await;
         assert!(node.known_subnets().is_empty());
 
-        node.peer_subnets.insert(0xC0FFEE, SubnetId::new(&[3, 7, 2]));
+        node.peer_subnets
+            .insert(0xC0FFEE, SubnetId::new(&[3, 7, 2]));
         node.peer_subnets.insert(0xAAAA, SubnetId::new(&[3, 7, 1]));
         node.peer_subnets.insert(0xB0B0, SubnetId::new(&[3, 8]));
 

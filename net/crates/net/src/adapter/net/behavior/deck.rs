@@ -857,7 +857,10 @@ impl DeckClient {
     /// Aggregator's monotonic tick counter, or `0` when none
     /// installed.
     pub fn aggregator_generation(&self) -> u64 {
-        self.aggregator.as_ref().map(|a| a.generation()).unwrap_or(0)
+        self.aggregator
+            .as_ref()
+            .map(|a| a.generation())
+            .unwrap_or(0)
     }
 
     /// Aggregator's source subnet — what the daemon is summarizing.

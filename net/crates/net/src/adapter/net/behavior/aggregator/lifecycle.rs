@@ -186,9 +186,7 @@ mod tests {
             starts: AtomicU8::new(0),
             stops: AtomicU8::new(0),
         });
-        let handle = LifecycleHandle::start(daemon.clone())
-            .await
-            .expect("start");
+        let handle = LifecycleHandle::start(daemon.clone()).await.expect("start");
         assert_eq!(daemon.starts.load(Ordering::Acquire), 1);
         assert_eq!(daemon.stops.load(Ordering::Acquire), 0);
         handle.stop().await;
@@ -224,9 +222,7 @@ mod tests {
             stops: AtomicU8::new(0),
         });
         {
-            let _handle = LifecycleHandle::start(daemon.clone())
-                .await
-                .expect("start");
+            let _handle = LifecycleHandle::start(daemon.clone()).await.expect("start");
             // Drop fires next.
         }
         // The detached spawn lands; give it a moment to settle.

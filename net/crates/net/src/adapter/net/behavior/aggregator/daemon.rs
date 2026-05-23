@@ -38,8 +38,8 @@ use bytes::Bytes;
 
 use super::lifecycle::{LifecycleDaemon, LifecycleError};
 use super::summarizer::{
-    resolve_summarizer, CapabilityFoldHandle, FoldHandle, ReservationFoldHandle,
-    SummarizerContext, SummaryAnnouncement, Summarizer,
+    resolve_summarizer, CapabilityFoldHandle, FoldHandle, ReservationFoldHandle, Summarizer,
+    SummarizerContext, SummaryAnnouncement,
 };
 use super::AggregatorConfig;
 use crate::adapter::net::behavior::fold::capability::CapabilityFold;
@@ -167,7 +167,9 @@ impl AggregatorDaemon {
             mesh,
             summarizers,
             generation: Arc::new(AtomicU64::new(0)),
-            latest: Arc::new(RwLock::new(Arc::new(Vec::with_capacity(LATEST_SUMMARIES_CAP)))),
+            latest: Arc::new(RwLock::new(Arc::new(Vec::with_capacity(
+                LATEST_SUMMARIES_CAP,
+            )))),
             shutdown: Arc::new(AtomicBool::new(false)),
             background: parking_lot::Mutex::new(None),
         })
@@ -384,9 +386,8 @@ impl AggregatorDaemon {
         fold_kind: u16,
     ) -> Result<ChannelName, AggregatorPublishError> {
         let name = format!("summary/{fold_kind:#06x}");
-        ChannelName::new(&name).map_err(|e| {
-            AggregatorPublishError::InvalidChannelName(format!("{name}: {e:?}"))
-        })
+        ChannelName::new(&name)
+            .map_err(|e| AggregatorPublishError::InvalidChannelName(format!("{name}: {e:?}")))
     }
 
     /// Register every configured fold-kind's summary channel in
@@ -416,7 +417,8 @@ impl AggregatorDaemon {
                     channel_name.as_str()
                 ))
             })?;
-            let cfg = ChannelConfig::new(channel_id).with_visibility(self.config.summary_visibility);
+            let cfg =
+                ChannelConfig::new(channel_id).with_visibility(self.config.summary_visibility);
             registry.insert(cfg);
             registered += 1;
         }
@@ -490,9 +492,7 @@ impl LifecycleDaemon for AggregatorDaemon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::net::behavior::fold::capability::{
-        CapabilityFold, CapabilityMembership,
-    };
+    use crate::adapter::net::behavior::fold::capability::{CapabilityFold, CapabilityMembership};
     use crate::adapter::net::behavior::fold::wire::SignedAnnouncement;
     use crate::adapter::net::behavior::fold::{EnvelopeMeta, NodeState};
     use crate::adapter::net::identity::EntityKeypair;
@@ -864,8 +864,8 @@ mod tests {
             )
             .unwrap();
 
-        let cfg = AggregatorConfig::new(SubnetId::new(&[3, 7]))
-            .with_fold_kind(ReservationFold::KIND_ID);
+        let cfg =
+            AggregatorConfig::new(SubnetId::new(&[3, 7])).with_fold_kind(ReservationFold::KIND_ID);
         let agg = AggregatorDaemon::new(cfg, mesh).expect("new");
         agg.tick_once();
         let summaries = agg.latest_summaries();

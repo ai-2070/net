@@ -163,8 +163,7 @@ fn parse_channel_hash(raw: &str) -> Result<u16, CliError> {
     let looks_like_literal =
         s.starts_with("0x") || s.starts_with("0X") || s.chars().all(|c| c.is_ascii_digit());
     if looks_like_literal {
-        return parse_u16_flexible(s)
-            .map_err(|e| invalid_args(format!("channel `{raw}`: {e}")));
+        return parse_u16_flexible(s).map_err(|e| invalid_args(format!("channel `{raw}`: {e}")));
     }
     Err(invalid_args(format!(
         "channel `{raw}` looks like a name; name → wire-hash resolution needs \
@@ -239,7 +238,10 @@ mod tests {
         assert_eq!(parse_subnet("3").unwrap(), SubnetId::new(&[3]));
         assert_eq!(parse_subnet("3.7").unwrap(), SubnetId::new(&[3, 7]));
         assert_eq!(parse_subnet("3.7.2").unwrap(), SubnetId::new(&[3, 7, 2]));
-        assert_eq!(parse_subnet("3.7.2.1").unwrap(), SubnetId::new(&[3, 7, 2, 1]));
+        assert_eq!(
+            parse_subnet("3.7.2.1").unwrap(),
+            SubnetId::new(&[3, 7, 2, 1])
+        );
     }
 
     #[test]

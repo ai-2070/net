@@ -112,10 +112,7 @@ impl std::fmt::Debug for AggregatorConfig {
             .field("summary_targets", &self.summary_targets)
             .field("fold_kinds", &self.fold_kinds)
             .field("summary_interval", &self.summary_interval)
-            .field(
-                "custom_summarizers_count",
-                &self.custom_summarizers.len(),
-            )
+            .field("custom_summarizers_count", &self.custom_summarizers.len())
             .finish()
     }
 }

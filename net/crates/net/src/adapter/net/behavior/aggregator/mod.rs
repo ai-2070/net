@@ -27,5 +27,5 @@ pub use query_service::{
     FOLD_QUERY_SERVICE,
 };
 pub use summarizer::{
-    CapabilityFoldSummarizer, ReservationFoldSummarizer, SummaryAnnouncement, Summarizer,
+    CapabilityFoldSummarizer, ReservationFoldSummarizer, Summarizer, SummaryAnnouncement,
 };

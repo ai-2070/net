@@ -166,7 +166,12 @@ impl FoldQueryClient {
             }
         }
         let summaries = self
-            .issue_call(target_node_id, &key.service, kind, FoldQueryOp::LatestSummary)
+            .issue_call(
+                target_node_id,
+                &key.service,
+                kind,
+                FoldQueryOp::LatestSummary,
+            )
             .await?;
         if !self.ttl.is_zero() {
             let mut cache = self.cache.write();
@@ -327,12 +332,7 @@ mod tests {
         }
         assert_eq!(client.cache.read().len(), 3);
         client.invalidate_target(0xBBBB);
-        let remaining: Vec<u64> = client
-            .cache
-            .read()
-            .keys()
-            .map(|k| k.target)
-            .collect();
+        let remaining: Vec<u64> = client.cache.read().keys().map(|k| k.target).collect();
         assert!(remaining.contains(&0xAAAA));
         assert!(remaining.contains(&0xCCCC));
         assert!(!remaining.contains(&0xBBBB));
@@ -401,10 +401,6 @@ mod tests {
         let mut cache = client.cache.write();
         cache.retain(|_, e| e.fetched_at.elapsed() < ttl);
         drop(cache);
-        assert_eq!(
-            client.cache.read().len(),
-            0,
-            "expired entry must be pruned"
-        );
+        assert_eq!(client.cache.read().len(), 0, "expired entry must be pruned");
     }
 }

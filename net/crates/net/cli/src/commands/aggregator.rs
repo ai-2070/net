@@ -101,11 +101,20 @@ async fn run_inspect(
         Some(snap) => InspectView {
             aggregator_installed: true,
             source_subnet: Some(snap.source_subnet.to_string()),
-            fold_kinds: snap.fold_kinds.iter().map(|k| format!("{k:#06x}")).collect(),
+            fold_kinds: snap
+                .fold_kinds
+                .iter()
+                .map(|k| format!("{k:#06x}"))
+                .collect(),
             summary_interval_secs: snap.summary_interval.as_secs_f64(),
             generation: snap.generation,
             summary_count: snap.summaries.len() as u64,
-            summaries: snap.summaries.iter().cloned().map(SummaryRow::from).collect(),
+            summaries: snap
+                .summaries
+                .iter()
+                .cloned()
+                .map(SummaryRow::from)
+                .collect(),
         },
         None => InspectView {
             aggregator_installed: false,
@@ -202,4 +211,3 @@ impl From<net_sdk::deck::SummaryAnnouncement> for SummaryRow {
         }
     }
 }
-

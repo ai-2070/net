@@ -91,7 +91,10 @@ fn render_table(
                 format!("{}", rollup.subnet.depth()),
                 theme::text(),
             )),
-            Cell::from(Span::styled(format!("{}", rollup.members.len()), theme::text())),
+            Cell::from(Span::styled(
+                format!("{}", rollup.members.len()),
+                theme::text(),
+            )),
             Cell::from(Span::styled(
                 if rollup.is_local { "yes" } else { "—" },
                 if rollup.is_local {

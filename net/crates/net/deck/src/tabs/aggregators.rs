@@ -112,7 +112,10 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, snap: &AggregatorSnapshot) {
                     format!("{:#06x}", summary.fold_kind),
                     theme::text(),
                 )),
-                Cell::from(Span::styled(summary.source_subnet.to_string(), theme::text())),
+                Cell::from(Span::styled(
+                    summary.source_subnet.to_string(),
+                    theme::text(),
+                )),
                 Cell::from(Span::styled(bucket_text, theme::text())),
             ]));
         }

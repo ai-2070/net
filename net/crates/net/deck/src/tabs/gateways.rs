@@ -96,10 +96,7 @@ fn render_table(
                 .collect::<Vec<_>>()
                 .join(", ");
             rows.push(Row::new(vec![
-                Cell::from(Span::styled(
-                    format!("{channel_hash:#06x}"),
-                    theme::text(),
-                )),
+                Cell::from(Span::styled(format!("{channel_hash:#06x}"), theme::text())),
                 Cell::from(Span::styled(target_text, theme::text())),
             ]));
         }

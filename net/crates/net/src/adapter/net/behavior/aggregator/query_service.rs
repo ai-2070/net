@@ -147,9 +147,7 @@ pub(crate) fn answer(
 ) -> FoldQueryResponse {
     let configured = aggregator.config().fold_kinds.contains(&request.kind);
     if !configured {
-        return FoldQueryResponse::Error(FoldQueryError::UnknownKind {
-            kind: request.kind,
-        });
+        return FoldQueryResponse::Error(FoldQueryError::UnknownKind { kind: request.kind });
     }
     let summaries: Vec<SummaryAnnouncement> = match request.op {
         FoldQueryOp::LatestSummary => aggregator

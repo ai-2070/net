@@ -132,7 +132,9 @@ impl SubnetGateway {
     /// `net gateway export <channel>` to render the current
     /// allow-list before an operator mutates it.
     pub fn exports_for_channel(&self, channel_hash: u16) -> Option<Vec<SubnetId>> {
-        self.export_table.get(&channel_hash).map(|e| e.value().clone())
+        self.export_table
+            .get(&channel_hash)
+            .map(|e| e.value().clone())
     }
 
     /// Record a forward decision that bypassed the gateway's
@@ -575,10 +577,7 @@ mod tests {
         let keys: Vec<u16> = snap.iter().map(|(k, _)| *k).collect();
         assert_eq!(keys, vec![0x10, 0x20, 0x42]);
         assert_eq!(snap[0].1, vec![SubnetId::new(&[5])]);
-        assert_eq!(
-            snap[2].1,
-            vec![SubnetId::new(&[2]), SubnetId::new(&[3])],
-        );
+        assert_eq!(snap[2].1, vec![SubnetId::new(&[2]), SubnetId::new(&[3])],);
 
         assert_eq!(
             gw.exports_for_channel(0x42),

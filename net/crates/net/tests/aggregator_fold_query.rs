@@ -23,13 +23,13 @@ use net::adapter::net::behavior::aggregator::{
     AggregatorConfig, AggregatorDaemon, FoldQueryClient, FoldQueryClientError, FoldQueryError,
     SummaryAnnouncement,
 };
+use net::adapter::net::behavior::fold::capability::{CapabilityFold, CapabilityMembership};
+use net::adapter::net::behavior::fold::wire::SignedAnnouncement;
+use net::adapter::net::behavior::fold::{EnvelopeMeta, FoldKind, NodeState};
 use net::adapter::net::{
     ChannelConfig, ChannelConfigRegistry, ChannelId, ChannelName, ChannelPublisher, OnFailure,
     PublishConfig, Reliability, Visibility,
 };
-use net::adapter::net::behavior::fold::capability::{CapabilityFold, CapabilityMembership};
-use net::adapter::net::behavior::fold::wire::SignedAnnouncement;
-use net::adapter::net::behavior::fold::{EnvelopeMeta, FoldKind, NodeState};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig, SubnetId};
 // `ChannelPublisher` / `OnFailure` / `Reliability` are also imported through
 // the `behavior::aggregator` umbrella above; the second `use` keeps the
@@ -300,10 +300,7 @@ async fn wire_publish_summary_reaches_subscriber_on_remote_node() {
         .publish(&publisher, bytes::Bytes::from(test_payload))
         .await
         .expect("publish");
-    assert_eq!(
-        report.attempted, 1,
-        "querier should be the only subscriber"
-    );
+    assert_eq!(report.attempted, 1, "querier should be the only subscriber");
     assert!(
         report.delivered >= 1,
         "subscriber on roster should receive payload (got delivered={})",
