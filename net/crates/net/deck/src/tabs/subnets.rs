@@ -8,11 +8,9 @@
 //! `deck/src/tabs/` table conventions (`Block::default` +
 //! `Row`/`Cell` + cursor-aware highlighting via theme helpers).
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use net_sdk::deck::DeckClient;
-use net_sdk::subnets::SubnetId;
+use net_sdk::deck::{DeckClient, SubnetRollup};
 use ratatui::{
     layout::{Alignment, Constraint, Rect},
     text::{Line, Span},
@@ -24,11 +22,11 @@ use crate::{theme, widgets};
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, deck: &Arc<DeckClient>) {
     let local = deck.local_subnet();
-    let known = deck.known_subnets();
-    if local.is_none() && known.is_empty() {
+    let rollups = deck.subnets_with_members(None);
+    if local.is_none() && rollups.is_empty() {
         render_empty(frame, area);
     } else {
-        render_table(frame, area, local, &known);
+        render_table(frame, area, local, &rollups);
     }
 }
 
@@ -55,15 +53,10 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
 fn render_table(
     frame: &mut Frame<'_>,
     area: Rect,
-    local: Option<SubnetId>,
-    known: &[(u64, SubnetId)],
+    local: Option<net_sdk::subnets::SubnetId>,
+    rollups: &[SubnetRollup],
 ) {
-    // Group peers by subnet for the member-count column.
-    let mut buckets: BTreeMap<u32, BTreeSet<u64>> = BTreeMap::new();
-    for (node, subnet) in known {
-        buckets.entry(subnet.raw()).or_default().insert(*node);
-    }
-    let total = buckets.len() + if local.is_some() { 1 } else { 0 };
+    let peer_total: usize = rollups.iter().map(|r| r.members.len()).sum();
     let local_str = local
         .map(|s| s.to_string())
         .unwrap_or_else(|| "—".to_string());
@@ -73,8 +66,8 @@ fn render_table(
         Span::styled(
             format!(
                 "    local: {local_str} · {buckets} known · {peers} peers",
-                buckets = buckets.len(),
-                peers = known.len()
+                buckets = rollups.len(),
+                peers = peer_total
             ),
             theme::chrome(),
         ),
@@ -93,28 +86,27 @@ fn render_table(
     ])
     .height(1);
 
-    let mut rows: Vec<Row> = Vec::with_capacity(total);
-    // Render every bucket, ascending by subnet raw bits.
-    let mut all_raw: BTreeSet<u32> = buckets.keys().copied().collect();
-    if let Some(s) = local {
-        all_raw.insert(s.raw());
-    }
-    for raw in all_raw {
-        let subnet = SubnetId::from_raw(raw);
-        let members = buckets.get(&raw).map(BTreeSet::len).unwrap_or(0);
-        let is_local = local == Some(subnet);
-        let subnet_style = if is_local {
+    let mut rows: Vec<Row> = Vec::with_capacity(rollups.len());
+    for rollup in rollups {
+        let subnet_style = if rollup.is_local {
             theme::green_hi()
         } else {
             theme::text()
         };
         rows.push(Row::new(vec![
-            Cell::from(Span::styled(subnet.to_string(), subnet_style)),
-            Cell::from(Span::styled(format!("{}", subnet.depth()), theme::text())),
-            Cell::from(Span::styled(format!("{members}"), theme::text())),
+            Cell::from(Span::styled(rollup.subnet.to_string(), subnet_style)),
             Cell::from(Span::styled(
-                if is_local { "yes" } else { "—" },
-                if is_local { theme::green() } else { theme::dim() },
+                format!("{}", rollup.subnet.depth()),
+                theme::text(),
+            )),
+            Cell::from(Span::styled(format!("{}", rollup.members.len()), theme::text())),
+            Cell::from(Span::styled(
+                if rollup.is_local { "yes" } else { "—" },
+                if rollup.is_local {
+                    theme::green()
+                } else {
+                    theme::dim()
+                },
             )),
         ]));
     }

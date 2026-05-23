@@ -333,6 +333,23 @@ pub struct GatewayStats {
     pub export_rules: u64,
 }
 
+/// One row in [`DeckClient::subnets_with_members`]'s rollup.
+/// Carries the subnet, the sorted member-`node_id` set, and a
+/// flag marking the local subnet so renderers don't need a
+/// second pass.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubnetRollup {
+    /// Subnet this row represents.
+    pub subnet: SubnetId,
+    /// Sorted set of `node_id`s known to belong to this subnet.
+    /// Empty when the local subnet has no peers (the local node
+    /// is only included if the caller supplied its node id).
+    pub members: Vec<u64>,
+    /// `true` when [`Self::subnet`] matches the local mesh
+    /// node's subnet.
+    pub is_local: bool,
+}
+
 /// One-shot snapshot returned by [`DeckClient::aggregator_snapshot`].
 /// Bundles every field a renderer needs in a single struct so
 /// callers don't pay for five per-field lock acquisitions per
@@ -674,6 +691,41 @@ impl DeckClient {
             .as_ref()
             .map(|m| m.known_subnets())
             .unwrap_or_default()
+    }
+
+    /// Group `known_subnets` into one row per subnet with sorted
+    /// member ids. Pass `Some(node_id)` to include the local node
+    /// under its own subnet's members (the CLI's `subnet ls`
+    /// surface does this); pass `None` to omit the local node
+    /// from members but still flag its row via
+    /// [`SubnetRollup::is_local`] (the deck SUBNETS tab does this).
+    ///
+    /// The local subnet always appears as a row, even when no
+    /// peers are known under it.
+    pub fn subnets_with_members(&self, local_node_id: Option<u64>) -> Vec<SubnetRollup> {
+        let local = self.local_subnet();
+        let mut buckets: std::collections::BTreeMap<u32, std::collections::BTreeSet<u64>> =
+            std::collections::BTreeMap::new();
+        for (node_id, subnet) in self.known_subnets() {
+            buckets.entry(subnet.raw()).or_default().insert(node_id);
+        }
+        if let Some(local_subnet) = local {
+            let entry = buckets.entry(local_subnet.raw()).or_default();
+            if let Some(id) = local_node_id {
+                entry.insert(id);
+            }
+        }
+        buckets
+            .into_iter()
+            .map(|(raw, members)| {
+                let subnet = SubnetId::from_raw(raw);
+                SubnetRollup {
+                    subnet,
+                    members: members.into_iter().collect(),
+                    is_local: local == Some(subnet),
+                }
+            })
+            .collect()
     }
 
     /// Aggregate gateway counters for `net gateway stats`.

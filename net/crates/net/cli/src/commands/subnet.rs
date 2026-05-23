@@ -11,7 +11,7 @@
 //!
 //! Shape pinned in `SCALING_SUBNET_SPEC.md` Phase A.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
@@ -102,29 +102,18 @@ async fn run_ls(
     let local_node_id = args.node;
     let ctx = CliContext::build(&profile, args.identity.as_deref(), local_node_id, false).await?;
     let deck = ctx.deck();
-    // Group peers by their assigned subnet so operators see one
-    // row per subnet rather than one per peer. Sorted by subnet
-    // raw bits for stable output.
-    let mut buckets: BTreeMap<u32, BTreeSet<u64>> = BTreeMap::new();
-    if let Some(local) = deck.local_subnet() {
-        // The local node is always a member of its own subnet —
-        // and its id is whatever the operator passed via `--node`
-        // (the same id the substrate uses for `cfg.this_node`).
-        buckets
-            .entry(local.raw())
-            .or_default()
-            .insert(local_node_id);
-    }
-    for (node_id, subnet) in deck.known_subnets() {
-        buckets.entry(subnet.raw()).or_default().insert(node_id);
-    }
-    let rows: Vec<SubnetRow> = buckets
+    // The deck handles the bucket-by-subnet grouping so the deck
+    // SUBNETS tab and this CLI surface stay in sync. Pass the
+    // local node id so the local subnet's row carries it as a
+    // member (the substrate's `cfg.this_node` uses the same value).
+    let rows: Vec<SubnetRow> = deck
+        .subnets_with_members(Some(local_node_id))
         .into_iter()
-        .map(|(raw, members)| SubnetRow {
-            subnet: format_subnet(SubnetId::from_raw(raw)),
-            depth: SubnetId::from_raw(raw).depth(),
-            member_count: members.len() as u64,
-            members: members.into_iter().collect(),
+        .map(|r| SubnetRow {
+            subnet: format_subnet(r.subnet),
+            depth: r.subnet.depth(),
+            member_count: r.members.len() as u64,
+            members: r.members,
         })
         .collect();
     emit_value(OutputFormat::resolve_oneshot(output), &rows)

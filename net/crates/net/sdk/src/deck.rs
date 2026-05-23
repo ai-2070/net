@@ -45,7 +45,7 @@ pub use net::adapter::net::behavior::deck::{
     DaemonCounts, DeckClient, DeckClientConfig, DeckError, FailureStream, GatewayStats,
     IceCommands, IceError, IceProposal, LogFilter, LogStream, OperatorIdentity, OperatorRegistry,
     OperatorSignature, PeerCounts, SimulatedIceProposal, SnapshotStream, StatusSummary,
-    StatusSummaryStream,
+    StatusSummaryStream, SubnetRollup,
 };
 // Pure ICE simulator — runs a `BlastRadius` against any
 // `MeshOsSnapshot` + `IceActionProposal` without touching the
