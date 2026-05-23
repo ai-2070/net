@@ -325,6 +325,44 @@ pub enum Aggregation {
     },
 }
 
+/// Precompiled view of an [`Aggregation`]. Like [`CompiledMatcher`],
+/// hoists the `axis_key` split + `TaxonomyAxis` lookup out of the
+/// per-entry walk so the parse cost amortizes to one call per
+/// aggregation instead of one per (entry, tag) pair.
+#[derive(Clone, Copy)]
+enum CompiledAgg<'a> {
+    Count,
+    DistinctPublishers,
+    DistinctValues { axis: TaxonomyAxis, key: &'a str },
+    /// Shared accumulator for `Sum/Min/Max NumericTag` — all three
+    /// project from the same per-bucket numeric_sum / numeric_min /
+    /// numeric_max fields, so the per-entry inner loop is identical.
+    Numeric { axis: TaxonomyAxis, key: &'a str },
+    /// Fallthrough for malformed `axis_key` inputs (unknown axis
+    /// prefix, missing dot). The per-entry loop does no per-tag
+    /// work; the projection later surfaces `0` for empty buckets.
+    Inert,
+}
+
+impl<'a> CompiledAgg<'a> {
+    fn compile(agg: &'a Aggregation) -> CompiledAgg<'a> {
+        match agg {
+            Aggregation::Count => CompiledAgg::Count,
+            Aggregation::DistinctPublishers => CompiledAgg::DistinctPublishers,
+            Aggregation::DistinctValues { axis, key } => CompiledAgg::DistinctValues {
+                axis: *axis,
+                key,
+            },
+            Aggregation::SumNumericTag { axis_key }
+            | Aggregation::MinNumericTag { axis_key }
+            | Aggregation::MaxNumericTag { axis_key } => match split_axis_key(axis_key) {
+                Some((axis, key)) => CompiledAgg::Numeric { axis, key },
+                None => CompiledAgg::Inert,
+            },
+        }
+    }
+}
+
 impl Fold<CapabilityFold> {
     /// Walk the fold once and produce a `Vec<(bucket, value)>` sorted
     /// lexicographically by bucket key.
@@ -349,6 +387,11 @@ impl Fold<CapabilityFold> {
         // count.
         let mut buckets: HashMap<String, BucketAccum> = HashMap::new();
         let compiled = matcher.as_ref().map(TagMatcher::compile);
+        // Pre-resolve the aggregation's `(axis, key)` once so the
+        // per-(entry, tag) loop doesn't re-split `axis_key` on
+        // every call. Malformed axis_key collapses to
+        // `CompiledAgg::Inert` so the loop becomes a no-op.
+        let compiled_agg = CompiledAgg::compile(&agg);
 
         self.with_state(|state| {
             for ((_class, publisher), entry) in state.entries.iter() {
@@ -366,19 +409,17 @@ impl Fold<CapabilityFold> {
                     let slot = buckets.entry(key).or_default();
                     slot.count = slot.count.saturating_add(1);
                     slot.publishers.insert(*publisher);
-                    match &agg {
-                        Aggregation::DistinctValues { axis, key: k } => {
+                    match compiled_agg {
+                        CompiledAgg::DistinctValues { axis, key: k } => {
                             for raw in &membership.tags {
-                                if let Some(v) = axis_value_for(raw, *axis, k) {
+                                if let Some(v) = axis_value_for(raw, axis, k) {
                                     slot.distinct_values.insert(v);
                                 }
                             }
                         }
-                        Aggregation::SumNumericTag { axis_key }
-                        | Aggregation::MinNumericTag { axis_key }
-                        | Aggregation::MaxNumericTag { axis_key } => {
+                        CompiledAgg::Numeric { axis, key: k } => {
                             for raw in &membership.tags {
-                                if let Some(n) = numeric_value_for(raw, axis_key) {
+                                if let Some(n) = numeric_value_for_split(raw, axis, k) {
                                     slot.numeric_sum = slot.numeric_sum.saturating_add(n);
                                     slot.numeric_min =
                                         Some(slot.numeric_min.map_or(n, |cur| cur.min(n)));
@@ -387,7 +428,9 @@ impl Fold<CapabilityFold> {
                                 }
                             }
                         }
-                        _ => {}
+                        CompiledAgg::Count
+                        | CompiledAgg::DistinctPublishers
+                        | CompiledAgg::Inert => {}
                     }
                 }
             }
@@ -440,6 +483,15 @@ impl Fold<CapabilityFold> {
         // `aggregate` path collapses.
         let mut buckets: HashMap<String, CapacityAccum> = HashMap::new();
         let compiled_matcher = query.matcher.as_ref().map(TagMatcher::compile);
+        // Pre-split `sum_axis_key` so the per-tag loop doesn't
+        // re-parse it. `None` either way disables the
+        // summed_capacity column; a malformed axis_key also
+        // disables it (fail-closed — matches `numeric_value_for`'s
+        // None-on-unknown-axis-prefix contract).
+        let sum_axis_split: Option<(TaxonomyAxis, &str)> = query
+            .sum_axis_key
+            .as_deref()
+            .and_then(split_axis_key);
 
         self.with_state(|state| {
             for ((_class, publisher), entry) in state.entries.iter() {
@@ -480,11 +532,11 @@ impl Fold<CapabilityFold> {
                 // landing in two `TagStem` buckets counts once toward
                 // each bucket's summed_capacity — same shape the
                 // state counts use.
-                let entry_capacity: Option<u64> = query.sum_axis_key.as_deref().map(|axk| {
+                let entry_capacity: Option<u64> = sum_axis_split.map(|(axis, key)| {
                     membership
                         .tags
                         .iter()
-                        .filter_map(|t| numeric_value_for(t, axk))
+                        .filter_map(|t| numeric_value_for_split(t, axis, key))
                         .fold(0u64, |acc, n| acc.saturating_add(n))
                 });
 
@@ -661,25 +713,16 @@ fn axis_value_for(raw: &str, want_axis: TaxonomyAxis, want_key: &str) -> Option<
     }
 }
 
-/// Parse the numeric value of an `AxisValue` tag whose canonical
-/// `<axis>.<key>` form matches `want_axis_key`. Returns `None` when
-/// the tag isn't an `AxisValue`, doesn't match, or its value
-/// doesn't parse as `u64`. Caller is expected to skip
-/// unparseable values silently (the plan §"Risk: sum_axis_key
-/// over-allocates" pins this contract).
-fn numeric_value_for(raw: &str, want_axis_key: &str) -> Option<u64> {
-    let value = string_value_for_axis_key(raw, want_axis_key)?;
-    value.parse::<u64>().ok()
-}
-
-/// Return the value portion of an `AxisValue` tag whose canonical
-/// `<axis>.<key>` form matches `want_axis_key`, as a raw `String`.
-/// Used by `TagMatcher::VersionRange` to grab the value before
-/// semver parsing. Returns `None` for non-matching tags or
-/// non-`AxisValue` variants.
-fn string_value_for_axis_key(raw: &str, want_axis_key: &str) -> Option<String> {
-    let (axis, key) = split_axis_key(want_axis_key)?;
-    axis_value_for(raw, axis, key)
+/// Parse the numeric `u64` value of an `AxisValue` tag whose
+/// `(axis, key)` matches the caller-supplied pre-split pair.
+/// Returns `None` for non-matching tags, non-`AxisValue` variants,
+/// or values that don't parse as `u64`.
+///
+/// Callers that have the `<axis>.<key>` form in dotted-string
+/// shape should first resolve through [`split_axis_key`] so the
+/// parse hoists outside any per-tag loop.
+fn numeric_value_for_split(raw: &str, axis: TaxonomyAxis, key: &str) -> Option<u64> {
+    axis_value_for(raw, axis, key)?.parse::<u64>().ok()
 }
 
 /// Split a canonical `"<axis>.<key>"` string into its
@@ -1382,6 +1425,16 @@ mod tests {
         assert_eq!(rows[0].available, 2);
     }
 
+    /// Test-only helper: dotted-axis-key wrapper around
+    /// `numeric_value_for_split`. Exists so test cases can keep
+    /// using the same wire-shape strings the FFI callers pass in,
+    /// even though the hot-loop production code now hoists the
+    /// `split_axis_key` step outside the per-tag loop.
+    fn numeric_value_for(raw: &str, want_axis_key: &str) -> Option<u64> {
+        let (axis, key) = split_axis_key(want_axis_key)?;
+        numeric_value_for_split(raw, axis, key)
+    }
+
     #[test]
     fn numeric_value_for_parses_axis_value_tag() {
         assert_eq!(
@@ -1398,6 +1451,18 @@ mod tests {
         );
         assert_eq!(
             numeric_value_for("software.python=3.11", "hardware.gpu.count"),
+            None
+        );
+    }
+
+    #[test]
+    fn numeric_value_for_rejects_malformed_axis_key() {
+        // Pre-split helper would now return None at `split_axis_key`;
+        // pin both failure modes here so future moves don't silently
+        // drop one branch.
+        assert_eq!(numeric_value_for("hardware.gpu.count=8", "no-dot"), None);
+        assert_eq!(
+            numeric_value_for("hardware.gpu.count=8", "unknown.count"),
             None
         );
     }
