@@ -2,6 +2,10 @@ name: CI
 
 on:
   push:
+    paths:
+      - 'net/**'
+      - 'go/**'
+      - '.github/workflows/ci.yml'
 
 env:
   CARGO_TERM_COLOR: always
