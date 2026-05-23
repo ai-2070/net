@@ -53,16 +53,16 @@ async fn runtime_with_peers(extra_peers: usize) -> DaemonRuntime {
     // has N+1 candidates (local + `extra_peers`). The core's
     // replica_group tests use the same pattern because
     // `place_with_spread` needs multiple distinct node IDs.
-    let index = mesh.inner().capability_index().clone();
     let filler_eid = EntityId::from_bytes([0u8; 32]);
     for i in 0..extra_peers {
         let node_id = 0x1000_0000_0000_0000u64 + (i as u64 + 1);
-        index.index(CapabilityAnnouncement::new(
-            node_id,
-            filler_eid.clone(),
-            1,
-            CapabilitySet::new(),
-        ));
+        mesh.inner()
+            .test_inject_capability_announcement(CapabilityAnnouncement::new(
+                node_id,
+                filler_eid.clone(),
+                1,
+                CapabilitySet::new(),
+            ));
     }
 
     let rt = DaemonRuntime::new(Arc::new(mesh));
