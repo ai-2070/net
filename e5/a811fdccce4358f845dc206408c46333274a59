@@ -1,0 +1,22 @@
+net/crates/net/cli/src/parsers.rs
+  s_1481a1b87a9b66::t_7e0d13f7b96c7f 23-34,61-75
+net/crates/net/cli/src/commands/aggregator.rs
+  s_1481a1b87a9b66::t_e228e4c74742c4 128-131
+  s_1481a1b87a9b66::t_fbf254440eb164 31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "e5a811fdccce4358f845dc206408c46333274a59",
+  "prompts": {},
+  "sessions": {
+    "s_1481a1b87a9b66": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b6b7d116-fc00-4178-aba1-c133ae7ca379",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
