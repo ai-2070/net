@@ -83,6 +83,14 @@ pub mod identity;
 #[cfg(feature = "net")]
 pub mod subnets;
 
+// Aggregator + lifecycle surfaces. Aggregator-daemon clients
+// (`RegistryClient`, `FoldQueryClient`) + the daemon-author
+// types (`AggregatorRegistry`, `LifecycleGroup`,
+// `HealthMonitor`). Riding `net` because every surface in this
+// module routes through `Mesh::call` / `Mesh::serve_rpc`.
+#[cfg(feature = "net")]
+pub mod aggregator;
+
 // Re-export the main handle.
 pub use crate::net::{Net, PollRequest, PollResponse, Receipt, Stats};
 

@@ -138,7 +138,6 @@ impl AggregatorGroupEntry {
         let healths = futures::future::join_all(
             replicas
                 .iter()
-                .cloned()
                 .map(|r| async move { r.health().await }),
         )
         .await;
