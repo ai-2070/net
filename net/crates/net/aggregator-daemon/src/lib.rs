@@ -297,10 +297,16 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
         "aggregator daemon booted",
     );
 
-    // Validate templates eagerly so operator typos surface at
-    // boot time rather than first Spawn RPC.
+    // Validate templates eagerly — including a dry
+    // `AggregatorDaemon::new` against the resolved config — so
+    // operator typos surface at boot time, not on the first
+    // Spawn RPC. This is what makes the
+    // `expect("aggregator config validated")` chains in the
+    // per-replica factory closures actually safe: anything
+    // `AggregatorDaemon::new` would reject we've already
+    // rejected at boot.
     for tpl in &config.templates {
-        validate_template(tpl)?;
+        validate_template(tpl, &mesh)?;
     }
 
     // Spawn every configured group in parallel — `spawn_group`
@@ -437,14 +443,21 @@ async fn spawn_group(
 
 /// Validate a `[[template]]` block at boot time so operator
 /// typos surface immediately, not on first Spawn RPC.
-fn validate_template(tpl: &TemplateConfig) -> Result<(), DaemonError> {
+///
+/// Field-level checks (subnet parse, interval floor, known
+/// fold_kinds) plus a dry `AggregatorDaemon::new` against the
+/// resolved config. The dry-new is what guarantees the
+/// `expect("aggregator config validated")` chains in the
+/// per-replica factory closures are safe: anything `new` would
+/// reject we've already rejected here.
+fn validate_template(tpl: &TemplateConfig, mesh: &Arc<MeshNode>) -> Result<(), DaemonError> {
     if tpl.summary_interval_ms < 10 {
         return Err(DaemonError::AggregatorConfig {
             name: tpl.name.clone(),
             error: "summary_interval_ms must be >= 10".into(),
         });
     }
-    parse_subnet(&tpl.source_subnet).map_err(|e| DaemonError::SubnetInvalid {
+    let source_subnet = parse_subnet(&tpl.source_subnet).map_err(|e| DaemonError::SubnetInvalid {
         raw: tpl.source_subnet.clone(),
         error: e,
     })?;
@@ -464,6 +477,21 @@ fn validate_template(tpl: &TemplateConfig) -> Result<(), DaemonError> {
             }
         }
     }
+    // Dry-build the AggregatorConfig + AggregatorDaemon::new to
+    // catch anything the field-wise checks miss. The throwaway
+    // daemon is dropped before returning; `new` doesn't mutate
+    // the mesh.
+    let mut agg_cfg = AggregatorConfig::new(source_subnet)
+        .with_interval(Duration::from_millis(tpl.summary_interval_ms));
+    for kind in &tpl.fold_kinds {
+        agg_cfg = agg_cfg.with_fold_kind(*kind);
+    }
+    drop(AggregatorDaemon::new(agg_cfg, mesh.clone()).map_err(|e| {
+        DaemonError::AggregatorConfig {
+            name: tpl.name.clone(),
+            error: format!("{e}"),
+        }
+    })?);
     Ok(())
 }
 
@@ -719,15 +747,26 @@ mod tests {
         assert_eq!(t.summary_interval_ms, 100);
     }
 
-    #[test]
-    fn validate_template_rejects_unknown_fold_kind() {
+    async fn test_mesh() -> Arc<MeshNode> {
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0u8; 32]);
+        Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        )
+    }
+
+    #[tokio::test]
+    async fn validate_template_rejects_unknown_fold_kind() {
         let tpl = TemplateConfig {
             name: "t".into(),
             source_subnet: "3.7".into(),
             fold_kinds: vec![0xDEAD],
             summary_interval_ms: 50,
         };
-        match validate_template(&tpl) {
+        let mesh = test_mesh().await;
+        match validate_template(&tpl, &mesh) {
             Err(DaemonError::AggregatorConfig { name, error }) => {
                 assert_eq!(name, "t");
                 assert!(error.contains("unknown fold_kind"), "msg was: {error}");
@@ -736,18 +775,40 @@ mod tests {
         }
     }
 
-    #[test]
-    fn validate_template_rejects_short_interval() {
+    #[tokio::test]
+    async fn validate_template_rejects_short_interval() {
         let tpl = TemplateConfig {
             name: "t".into(),
             source_subnet: "3.7".into(),
             fold_kinds: vec![1],
             summary_interval_ms: 5,
         };
-        match validate_template(&tpl) {
+        let mesh = test_mesh().await;
+        match validate_template(&tpl, &mesh) {
             Err(DaemonError::AggregatorConfig { name, error }) => {
                 assert_eq!(name, "t");
                 assert!(error.contains("interval"), "msg was: {error}");
+            }
+            other => panic!("expected AggregatorConfig, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_template_dry_new_catches_empty_fold_kinds() {
+        // No fold_kinds → `AggregatorDaemon::new` returns
+        // `NoFoldKinds`. The dry-new path is what catches this;
+        // the field-wise checks above don't.
+        let tpl = TemplateConfig {
+            name: "empty".into(),
+            source_subnet: "3.7".into(),
+            fold_kinds: vec![],
+            summary_interval_ms: 50,
+        };
+        let mesh = test_mesh().await;
+        match validate_template(&tpl, &mesh) {
+            Err(DaemonError::AggregatorConfig { name, error }) => {
+                assert_eq!(name, "empty");
+                assert!(error.contains("fold_kinds"), "msg was: {error}");
             }
             other => panic!("expected AggregatorConfig, got {other:?}"),
         }
