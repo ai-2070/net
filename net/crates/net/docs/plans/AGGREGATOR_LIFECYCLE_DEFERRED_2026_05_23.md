@@ -152,11 +152,12 @@ The existing test (`reservation_fold_summarizer_buckets_by_state_label`) papers 
   - `cb74cc14` — step 5: `net aggregator ls / spawn / scale`.
   - `4016528a` — AL-5 + AL-8 fixes.
   - `71ccaebf` — step 6: registry holds `LifecycleGroup` directly + `register_with_monitor`.
+  - `1bc409fd` — slice 7: `aggregator.registry` RPC service + `RegistryClient` (List op).
 
-## Remaining gap
+## Remaining gaps
 
-All eight original items (AL-1..AL-8) are resolved in the substrate. The only outstanding work is the **daemon process** for live `spawn` / `scale`:
+All eight original items (AL-1..AL-8) are resolved. Two follow-up surfaces remain — both at higher tiers than substrate-readiness:
 
-- `net aggregator spawn` and `net aggregator scale` parse + validate args today, then error with a "needs daemon process" message. The substrate primitives (`AggregatorRegistry`, `LifecycleGroup::spawn_with_placement`, `HealthMonitor`, `register_with_monitor`) are all in place — what remains is an `aggregator-daemon` binary that boots a `MeshNode`, installs the registry, and exposes a registry-RPC surface the CLI can call into.
+1. **`aggregator-daemon` binary** — boots a `MeshNode`, installs `AggregatorRegistry`, runs `install_registry_service`, hosts one or more groups from a config file. Today operators wire all of this manually in their own host binary; a turnkey daemon binary would close the loop for `net aggregator ls --node=X` against deployed meshes.
 
-That binary is its own slice; the deferred-items review intentionally stops at substrate readiness.
+2. **CLI remote-attach + Spawn/Scale RPCs** — `net aggregator ls / query` against `--node=X` is gated on `CliContext` having a `MeshNode` it can RPC through (pre-existing substrate gap, NET_CLI_PLAN.md Phase 5). Spawn / Scale RPC ops also need a wire shape for the daemon factory + config (template-by-name vs full marshalling). Both extend the substrate primitives already in place.
