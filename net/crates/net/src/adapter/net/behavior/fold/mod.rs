@@ -39,7 +39,9 @@ pub use capability::{
     capability_tags_for, reflex_addr_for, CapabilityFilter, CapabilityFold, CapabilityIndexInner,
     CapabilityMatch, CapabilityMembership, CapabilityQuery, HardwareSummary, NodeState,
 };
-pub use capability_aggregation::{Aggregation, GroupBy, TagMatcher};
+pub use capability_aggregation::{
+    Aggregation, CapacityQuery, CapacityRow, GroupBy, TagMatcher,
+};
 pub use dispatch::{
     DispatchError, FoldChannelRouter, FoldDispatch, FoldDispatchAdapter, FoldRegistry,
     SUBPROTOCOL_FOLD,
