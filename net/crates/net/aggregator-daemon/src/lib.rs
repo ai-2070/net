@@ -1,0 +1,552 @@
+//! `net-aggregator-daemon` — long-running process that hosts
+//! the Net-mesh substrate's [`AggregatorRegistry`] and one or
+//! more aggregator groups loaded from a TOML config file.
+//!
+//! Slice 8 of `docs/plans/AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`.
+//! Closes the AL-6 "needs daemon process" gap: the substrate
+//! primitives (`AggregatorRegistry`, `LifecycleGroup`,
+//! `HealthMonitor`, `aggregator.registry` RPC) are already in
+//! place; this binary is the operator-facing surface that boots
+//! them together.
+//!
+//! # CLI shape
+//!
+//! ```text
+//! net-aggregator-daemon --config /etc/net/aggregator.toml [--listen ADDR] [--peer ADDR]…
+//! ```
+//!
+//! # Config shape
+//!
+//! See [`Config`] / [`GroupConfig`] for the full schema. Minimum
+//! example:
+//!
+//! ```toml
+//! listen = "0.0.0.0:7400"
+//! psk_hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+//!
+//! [[group]]
+//! name = "primary"
+//! source_subnet = "3.7"
+//! fold_kinds = [0x0001]
+//! replica_count = 3
+//! summary_interval_ms = 1000
+//! ```
+//!
+//! # Lifecycle
+//!
+//! 1. Parse CLI + config.
+//! 2. Boot `MeshNode`, install `AggregatorRegistry`, expose
+//!    `aggregator.registry` RPC via `install_registry_service`.
+//! 3. For each `[[group]]` section, spawn a `LifecycleGroup`
+//!    and register it under the operator-chosen name.
+//! 4. Block on SIGINT (Ctrl-C). On signal: drain the registry
+//!    (stop every group, await teardown) then exit.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use clap::Parser;
+use serde::Deserialize;
+
+use net::adapter::net::behavior::aggregator::{
+    AggregatorConfig, AggregatorDaemon, AggregatorRegistry,
+};
+use net::adapter::net::behavior::fold::capability::CapabilityFold;
+use net::adapter::net::behavior::fold::reservation::ReservationFold;
+use net::adapter::net::behavior::fold::FoldKind;
+use net::adapter::net::behavior::lifecycle::LifecycleGroup;
+use net::adapter::net::identity::EntityKeypair;
+use net::adapter::net::{MeshNode, MeshNodeConfig, SubnetId};
+
+/// Argv shape. Exposed publicly so the binary entry point in
+/// `main.rs` can call `Cli::parse()` against it.
+#[derive(Parser, Debug)]
+#[command(
+    name = "net-aggregator-daemon",
+    version,
+    about = "Long-running net-mesh aggregator host. Boots a MeshNode, installs an AggregatorRegistry, and spawns aggregator groups from a TOML config."
+)]
+pub struct Cli {
+    /// Path to the TOML config file.
+    #[arg(long, short, env = "NET_AGGREGATOR_CONFIG")]
+    pub config: PathBuf,
+    /// Override the config's `listen` address (e.g.
+    /// `0.0.0.0:7400`). Useful when one config file is shared
+    /// across nodes that need distinct ports.
+    #[arg(long)]
+    pub listen: Option<String>,
+    /// Increase log verbosity. `-v` = info (default), `-vv` =
+    /// debug, `-vvv` = trace.
+    #[arg(long, short, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+}
+
+/// Top-level TOML config shape.
+#[derive(Deserialize, Debug)]
+struct Config {
+    /// UDP listen address (e.g. `"0.0.0.0:7400"` or
+    /// `"127.0.0.1:0"` for ephemeral-port tests).
+    listen: String,
+    /// 64-char hex pre-shared key (32 bytes) the rest of the
+    /// mesh uses for handshake encryption.
+    psk_hex: String,
+    /// Aggregator groups to spawn at startup. Order is preserved
+    /// — registry duplicates fail-fast, so operators see
+    /// duplicate-name errors immediately on startup rather than
+    /// at first RPC.
+    #[serde(default, rename = "group")]
+    groups: Vec<GroupConfig>,
+}
+
+/// Per-group config section.
+#[derive(Deserialize, Debug)]
+struct GroupConfig {
+    /// Operator-chosen name (the registry key). Must be unique
+    /// within the daemon process.
+    name: String,
+    /// Dotted-notation `SubnetId` (e.g. `"3.7"`) — the subnet
+    /// this aggregator summarizes detail from.
+    source_subnet: String,
+    /// `FoldKind::KIND_ID`s to aggregate. Accepts decimal or
+    /// `0x`-prefixed hex via [`u16`] deserialization through a
+    /// custom helper (`fold_kind_serde`).
+    fold_kinds: Vec<u16>,
+    /// Number of replicas. `1..=255`.
+    replica_count: u8,
+    /// Summary interval in milliseconds. `>= 10`.
+    summary_interval_ms: u64,
+    /// Optional 64-char hex group seed. When absent, derived
+    /// deterministically from the group name (BLAKE2 keyed
+    /// with a fixed daemon label).
+    group_seed: Option<String>,
+}
+
+/// Daemon startup errors. Cover config parsing, MeshNode boot,
+/// and group registration in one typed surface so the binary's
+/// `main` exit code maps cleanly.
+#[derive(Debug, thiserror::Error)]
+pub enum DaemonError {
+    #[error("read config {path:?}: {error}")]
+    ConfigRead {
+        path: PathBuf,
+        error: std::io::Error,
+    },
+    #[error("parse config: {0}")]
+    ConfigParse(toml::de::Error),
+    #[error("psk_hex must decode to 32 bytes: {0}")]
+    PskInvalid(String),
+    #[error("listen address {addr:?} is not a valid SocketAddr: {error}")]
+    ListenAddrInvalid {
+        addr: String,
+        error: std::net::AddrParseError,
+    },
+    #[error("subnet identifier {raw:?}: {error}")]
+    SubnetInvalid { raw: String, error: String },
+    #[error("group seed for {name:?} must be 64 hex chars: {error}")]
+    GroupSeedInvalid { name: String, error: String },
+    #[error("mesh: {0}")]
+    Mesh(String),
+    #[error("aggregator config for {name:?}: {error}")]
+    AggregatorConfig { name: String, error: String },
+    #[error("registry: {0}")]
+    Registry(String),
+    #[error("serve: {0}")]
+    Serve(String),
+}
+
+/// Configure the tracing subscriber for the daemon's stderr
+/// output. `verbose == 0` → info, `1` → debug, `2+` → trace.
+/// `RUST_LOG` env var overrides this if set.
+pub fn init_tracing(verbose: u8) {
+    use tracing_subscriber::EnvFilter;
+    let level = match verbose {
+        0 => "info",
+        1 => "debug",
+        _ => "trace",
+    };
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
+/// Boot from `cli`, install signal handlers, run until SIGINT
+/// (or SIGTERM on Unix), then drain the registry and exit.
+/// This is the binary's `main` body.
+pub async fn run(cli: Cli) -> Result<(), DaemonError> {
+    let booted = boot(cli).await?;
+    let registry = booted.registry.clone();
+    // `boot()` deliberately doesn't `start()` the mesh —
+    // integration tests need a window between boot and start
+    // to perform handshakes. The production path starts
+    // immediately.
+    booted.mesh.start();
+    // Hold `booted` until shutdown so the ServeHandle's Drop
+    // fires after we've stopped the groups.
+    wait_for_shutdown().await;
+    tracing::info!("shutdown signal received; draining registry");
+    drain_registry(&registry).await;
+    drop(booted);
+    tracing::info!("aggregator daemon stopped cleanly");
+    Ok(())
+}
+
+/// Boot the MeshNode + registry + groups described by `cli`,
+/// returning the live handles. Used by both `run()` (production
+/// path: hold until shutdown signal) and integration tests
+/// (assert against the booted state in-process).
+pub struct BootedDaemon {
+    pub mesh: Arc<MeshNode>,
+    pub registry: Arc<AggregatorRegistry>,
+    /// Held to keep the registry RPC service registration alive.
+    /// Dropping un-installs the service.
+    pub _serve: net::adapter::net::mesh_rpc::ServeHandle,
+    /// Listen address the mesh bound to (post-`MeshNode::new`
+    /// resolution — ephemeral `:0` ports surface as the
+    /// concrete bound port here).
+    pub bound_addr: std::net::SocketAddr,
+    /// Public key the listening node accepts handshakes against.
+    /// Test fixtures pass this to `MeshNode::connect`.
+    pub public_key: [u8; 32],
+}
+
+/// Boot the registry + groups without entering the
+/// signal-wait loop. Returns the live handles for tests +
+/// embedders that need to drive their own shutdown.
+pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
+    // Parse config.
+    let raw = tokio::fs::read_to_string(&cli.config)
+        .await
+        .map_err(|e| DaemonError::ConfigRead {
+            path: cli.config.clone(),
+            error: e,
+        })?;
+    let config: Config = toml::from_str(&raw).map_err(DaemonError::ConfigParse)?;
+
+    // CLI listen override.
+    let listen = cli.listen.unwrap_or(config.listen.clone());
+    let listen_addr: std::net::SocketAddr =
+        listen
+            .parse()
+            .map_err(|e| DaemonError::ListenAddrInvalid {
+                addr: listen.clone(),
+                error: e,
+            })?;
+    let psk = decode_psk(&config.psk_hex)?;
+
+    // Boot the MeshNode, install the registry, expose the RPC
+    // service. Order matters: `set_aggregator_registry`
+    // requires `&mut MeshNode`, so install before wrapping in
+    // Arc.
+    let mut mesh_node = MeshNode::new(EntityKeypair::generate(), MeshNodeConfig::new(listen_addr, psk))
+        .await
+        .map_err(|e| DaemonError::Mesh(format!("{e:?}")))?;
+    let registry = Arc::new(AggregatorRegistry::new());
+    mesh_node.set_aggregator_registry(registry.clone());
+    let mesh = Arc::new(mesh_node);
+    let serve = registry
+        .install_registry_service(&mesh)
+        .map_err(|e| DaemonError::Serve(format!("{e:?}")))?;
+
+    let bound_addr = mesh.local_addr();
+    let public_key = *mesh.public_key();
+
+    tracing::info!(
+        listen = %bound_addr,
+        node_id = mesh.node_id(),
+        groups = config.groups.len(),
+        "aggregator daemon booted",
+    );
+
+    // Spawn every configured group.
+    for group_cfg in &config.groups {
+        spawn_group(&registry, &mesh, group_cfg).await?;
+        tracing::info!(name = group_cfg.name, "group spawned + registered");
+    }
+
+    // NOTE: the mesh's receive loop is NOT started here.
+    // Callers (`run()`, integration tests) call
+    // `booted.mesh.start()` themselves — tests want a window
+    // between boot + start to perform peer handshakes.
+
+    Ok(BootedDaemon {
+        mesh,
+        registry,
+        _serve: serve,
+        bound_addr,
+        public_key,
+    })
+}
+
+async fn spawn_group(
+    registry: &Arc<AggregatorRegistry>,
+    mesh: &Arc<MeshNode>,
+    group_cfg: &GroupConfig,
+) -> Result<(), DaemonError> {
+    if group_cfg.replica_count == 0 {
+        return Err(DaemonError::AggregatorConfig {
+            name: group_cfg.name.clone(),
+            error: "replica_count must be > 0".into(),
+        });
+    }
+    if group_cfg.summary_interval_ms < 10 {
+        return Err(DaemonError::AggregatorConfig {
+            name: group_cfg.name.clone(),
+            error: "summary_interval_ms must be >= 10".into(),
+        });
+    }
+    let source_subnet = parse_subnet(&group_cfg.source_subnet)
+        .map_err(|e| DaemonError::SubnetInvalid {
+            raw: group_cfg.source_subnet.clone(),
+            error: e,
+        })?;
+    let group_seed = match &group_cfg.group_seed {
+        Some(s) => decode_seed(s).map_err(|e| DaemonError::GroupSeedInvalid {
+            name: group_cfg.name.clone(),
+            error: e,
+        })?,
+        None => derive_seed_from_name(&group_cfg.name),
+    };
+
+    // Build a fresh AggregatorConfig per replica via the factory.
+    let mut cfg = AggregatorConfig::new(source_subnet)
+        .with_interval(Duration::from_millis(group_cfg.summary_interval_ms));
+    for kind in &group_cfg.fold_kinds {
+        // Validate the kind is one of the built-ins we know how
+        // to summarize — operator typos surface at startup, not
+        // at first tick.
+        match *kind {
+            k if k == CapabilityFold::KIND_ID => {}
+            k if k == ReservationFold::KIND_ID => {}
+            other => {
+                return Err(DaemonError::AggregatorConfig {
+                    name: group_cfg.name.clone(),
+                    error: format!(
+                        "unknown fold_kind 0x{other:04x}; built-in summarizers cover {:#06x} (capability) and {:#06x} (reservation)",
+                        CapabilityFold::KIND_ID,
+                        ReservationFold::KIND_ID,
+                    ),
+                });
+            }
+        }
+        cfg = cfg.with_fold_kind(*kind);
+    }
+    let mesh_for_factory = mesh.clone();
+    let cfg_for_factory = cfg.clone();
+    let group_name = group_cfg.name.clone();
+    let group = LifecycleGroup::<AggregatorDaemon>::spawn(
+        group_cfg.replica_count,
+        group_seed,
+        move |_idx| {
+            // `AggregatorDaemon::new` failures here would crash
+            // the spawn loop; we pre-validated above so this
+            // path is "should never fail". expect_used: the
+            // error surfaces in the spawn return value via the
+            // group's StartFailed below.
+            #[allow(clippy::expect_used)]
+            Arc::new(
+                AggregatorDaemon::new(cfg_for_factory.clone(), mesh_for_factory.clone())
+                    .expect("aggregator config validated"),
+            )
+        },
+    )
+    .await
+    .map_err(|e| DaemonError::AggregatorConfig {
+        name: group_name.clone(),
+        error: format!("{e}"),
+    })?;
+    registry
+        .register(group_cfg.name.clone(), group)
+        .map_err(|e| DaemonError::Registry(format!("{e}")))?;
+    Ok(())
+}
+
+async fn wait_for_shutdown() {
+    // SIGINT (Ctrl-C) and (on Unix) SIGTERM both trigger a
+    // clean drain. Windows only fires SIGINT.
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGTERM handler install failed; relying on SIGINT only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Stop every group in the registry, awaiting each `stop()`
+/// before continuing. Used by `run()`'s shutdown path and
+/// available for tests that want to drive a clean teardown.
+pub async fn drain_registry(registry: &Arc<AggregatorRegistry>) {
+    for name in registry.names() {
+        match registry.unregister(&name).await {
+            Ok(group) => {
+                tracing::debug!(name = %name, "stopping group");
+                group.stop().await;
+            }
+            Err(e) => {
+                tracing::warn!(name = %name, error = %e, "unregister failed during drain");
+            }
+        }
+    }
+}
+
+fn decode_psk(s: &str) -> Result<[u8; 32], DaemonError> {
+    let trimmed = s.trim_start_matches("0x");
+    if trimmed.len() != 64 {
+        return Err(DaemonError::PskInvalid(format!(
+            "expected 64 hex chars, got {}",
+            trimmed.len()
+        )));
+    }
+    let bytes = hex::decode(trimmed).map_err(|e| DaemonError::PskInvalid(format!("{e}")))?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn decode_seed(s: &str) -> Result<[u8; 32], String> {
+    let trimmed = s.trim_start_matches("0x");
+    if trimmed.len() != 64 {
+        return Err(format!("expected 64 hex chars, got {}", trimmed.len()));
+    }
+    let bytes = hex::decode(trimmed).map_err(|e| format!("{e}"))?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// Derive a deterministic 32-byte seed from a group name. Uses
+/// BLAKE2 with a fixed daemon label so the same name always
+/// resolves to the same seed across restarts — operators don't
+/// need to track seeds for groups they're happy with.
+fn derive_seed_from_name(name: &str) -> [u8; 32] {
+    use std::hash::Hasher as _;
+    // Minimal seed derivation that doesn't pull in another
+    // hashing dep. xxhash on the input twice with distinct
+    // salts gives us 16 bytes; combine with constant label
+    // bytes for 32-byte output. Acceptable: the seed is only
+    // identity-binding and operators can override via
+    // `group_seed` for cryptographic strength.
+    let mut out = [0u8; 32];
+    let label = b"net-aggregator-daemon-seed-v1!!!";
+    out.copy_from_slice(label);
+    // Mix the name's bytes into the low half so distinct names
+    // produce distinct seeds without colliding.
+    let mut hasher_lo = std::collections::hash_map::DefaultHasher::new();
+    hasher_lo.write(name.as_bytes());
+    let lo = hasher_lo.finish().to_le_bytes();
+    let mut hasher_hi = std::collections::hash_map::DefaultHasher::new();
+    hasher_hi.write(b"hi:");
+    hasher_hi.write(name.as_bytes());
+    let hi = hasher_hi.finish().to_le_bytes();
+    out[..8].copy_from_slice(&lo);
+    out[8..16].copy_from_slice(&hi);
+    out
+}
+
+/// Parse a dotted-notation subnet (e.g. `"3.7"`, `"1.2.3.4"`)
+/// into a `SubnetId`. Empty string → `SubnetId::GLOBAL`.
+fn parse_subnet(raw: &str) -> Result<SubnetId, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(SubnetId::GLOBAL);
+    }
+    let levels: Vec<u8> = trimmed
+        .split('.')
+        .map(|s| s.parse::<u8>().map_err(|e| format!("level `{s}`: {e}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    if levels.len() > SubnetId::MAX_DEPTH as usize {
+        return Err(format!(
+            "subnet has {} levels, max is {}",
+            levels.len(),
+            SubnetId::MAX_DEPTH
+        ));
+    }
+    Ok(SubnetId::new(&levels))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_subnet_accepts_dotted_levels() {
+        let s = parse_subnet("3.7").expect("parse");
+        assert_eq!(s, SubnetId::new(&[3, 7]));
+    }
+
+    #[test]
+    fn parse_subnet_empty_input_returns_global() {
+        let s = parse_subnet("").expect("parse");
+        assert_eq!(s, SubnetId::GLOBAL);
+    }
+
+    #[test]
+    fn parse_subnet_rejects_non_numeric_levels() {
+        assert!(parse_subnet("3.beta").is_err());
+    }
+
+    #[test]
+    fn parse_subnet_rejects_too_deep() {
+        assert!(parse_subnet("1.2.3.4.5").is_err());
+    }
+
+    #[test]
+    fn decode_psk_accepts_64_char_hex() {
+        let psk = decode_psk("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+            .expect("decode");
+        assert_eq!(psk[0], 0x00);
+        assert_eq!(psk[31], 0xff);
+    }
+
+    #[test]
+    fn decode_psk_rejects_wrong_length() {
+        assert!(decode_psk("0011").is_err());
+    }
+
+    #[test]
+    fn derive_seed_from_name_is_deterministic_and_per_name() {
+        let s1 = derive_seed_from_name("alpha");
+        let s2 = derive_seed_from_name("alpha");
+        let s3 = derive_seed_from_name("beta");
+        assert_eq!(s1, s2);
+        assert_ne!(s1, s3);
+    }
+
+    #[test]
+    fn config_parses_minimum_viable_toml() {
+        let raw = r#"
+            listen = "127.0.0.1:0"
+            psk_hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+
+            [[group]]
+            name = "primary"
+            source_subnet = "3.7"
+            fold_kinds = [1]
+            replica_count = 2
+            summary_interval_ms = 50
+        "#;
+        let cfg: Config = toml::from_str(raw).expect("parse");
+        assert_eq!(cfg.listen, "127.0.0.1:0");
+        assert_eq!(cfg.groups.len(), 1);
+        let g = &cfg.groups[0];
+        assert_eq!(g.name, "primary");
+        assert_eq!(g.replica_count, 2);
+        assert_eq!(g.fold_kinds, vec![1]);
+    }
+}

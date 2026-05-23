@@ -4,6 +4,7 @@ members = [
     "sdk",
     "deck",
     "cli",
+    "aggregator-daemon",
     "bindings/node",
     "bindings/python",
     "bindings/go/compute-ffi",

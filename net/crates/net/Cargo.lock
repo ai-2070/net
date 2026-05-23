@@ -2270,6 +2270,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-aggregator-daemon"
+version = "0.21.0"
+dependencies = [
+ "assert_cmd",
+ "clap",
+ "futures",
+ "hex",
+ "net-mesh",
+ "net-mesh-sdk",
+ "predicates",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "net-cli"
 version = "0.21.0"
 dependencies = [
