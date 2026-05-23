@@ -205,7 +205,7 @@ fn should_retry_now(failures: u32, current_tick: u64) -> bool {
     }
     let shift = failures.min(MAX_BACKOFF_SHIFT);
     let step: u64 = 1u64 << shift;
-    current_tick % step == 0
+    current_tick.is_multiple_of(step)
 }
 
 impl<L: LifecycleDaemon> HealthMonitor<L> {
