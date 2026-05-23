@@ -50,7 +50,8 @@ use clap::Parser;
 use serde::Deserialize;
 
 use net::adapter::net::behavior::aggregator::{
-    AggregatorConfig, AggregatorDaemon, AggregatorRegistry,
+    snapshot_group, AggregatorConfig, AggregatorDaemon, AggregatorRegistry,
+    RegistryRpcError, SpawnFn,
 };
 use net::adapter::net::behavior::fold::capability::CapabilityFold;
 use net::adapter::net::behavior::fold::reservation::ReservationFold;
@@ -83,7 +84,7 @@ pub struct Cli {
 }
 
 /// Top-level TOML config shape.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 struct Config {
     /// UDP listen address (e.g. `"0.0.0.0:7400"` or
     /// `"127.0.0.1:0"` for ephemeral-port tests).
@@ -97,10 +98,19 @@ struct Config {
     /// at first RPC.
     #[serde(default, rename = "group")]
     groups: Vec<GroupConfig>,
+    /// Aggregator templates — referenced by name via the
+    /// `aggregator.registry` `Spawn` RPC. Operators preregister
+    /// the legal shapes here; remote callers can only deploy
+    /// groups matching a configured template, keeping the trust
+    /// boundary at the operator's config file.
+    #[serde(default, rename = "template")]
+    templates: Vec<TemplateConfig>,
 }
 
-/// Per-group config section.
-#[derive(Deserialize, Debug)]
+/// Per-group config section spawned at startup. Carries the
+/// operator-chosen group name + the aggregator's per-replica
+/// config.
+#[derive(Deserialize, Debug, Clone)]
 struct GroupConfig {
     /// Operator-chosen name (the registry key). Must be unique
     /// within the daemon process.
@@ -109,17 +119,33 @@ struct GroupConfig {
     /// this aggregator summarizes detail from.
     source_subnet: String,
     /// `FoldKind::KIND_ID`s to aggregate. Accepts decimal or
-    /// `0x`-prefixed hex via [`u16`] deserialization through a
-    /// custom helper (`fold_kind_serde`).
+    /// `0x`-prefixed hex via [`u16`] deserialization.
     fold_kinds: Vec<u16>,
     /// Number of replicas. `1..=255`.
     replica_count: u8,
     /// Summary interval in milliseconds. `>= 10`.
     summary_interval_ms: u64,
     /// Optional 64-char hex group seed. When absent, derived
-    /// deterministically from the group name (BLAKE2 keyed
-    /// with a fixed daemon label).
+    /// deterministically from the group name.
     group_seed: Option<String>,
+}
+
+/// Per-template config section. Lookup key for `Spawn` RPC.
+/// Same per-replica shape as `[[group]]` but the operator
+/// supplies `group_name` + `replica_count` at spawn time
+/// rather than in the file.
+#[derive(Deserialize, Debug, Clone)]
+struct TemplateConfig {
+    /// Template name — the `Spawn` RPC's `template_name`
+    /// resolves against this. Must be unique within the daemon's
+    /// template registry.
+    name: String,
+    /// Dotted-notation `SubnetId` for the spawned group.
+    source_subnet: String,
+    /// `FoldKind::KIND_ID`s the template aggregates.
+    fold_kinds: Vec<u16>,
+    /// Summary interval in milliseconds. `>= 10`.
+    summary_interval_ms: u64,
 }
 
 /// Daemon startup errors. Cover config parsing, MeshNode boot,
@@ -246,8 +272,15 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
     let registry = Arc::new(AggregatorRegistry::new());
     mesh_node.set_aggregator_registry(registry.clone());
     let mesh = Arc::new(mesh_node);
+
+    // Build the SpawnFn from the operator's template registry,
+    // then install the registry service with dynamic spawn
+    // support. Templates and the mesh handle are captured by
+    // the closure for the SpawnFn's lifetime (= the daemon's
+    // lifetime).
+    let spawner = make_spawner(config.templates.clone(), registry.clone(), mesh.clone());
     let serve = registry
-        .install_registry_service(&mesh)
+        .install_registry_service_with_spawner(&mesh, spawner)
         .map_err(|e| DaemonError::Serve(format!("{e:?}")))?;
 
     let bound_addr = mesh.local_addr();
@@ -257,8 +290,15 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
         listen = %bound_addr,
         node_id = mesh.node_id(),
         groups = config.groups.len(),
+        templates = config.templates.len(),
         "aggregator daemon booted",
     );
+
+    // Validate templates eagerly so operator typos surface at
+    // boot time rather than first Spawn RPC.
+    for tpl in &config.templates {
+        validate_template(tpl)?;
+    }
 
     // Spawn every configured group.
     for group_cfg in &config.groups {
@@ -339,17 +379,16 @@ async fn spawn_group(
     let group = LifecycleGroup::<AggregatorDaemon>::spawn(
         group_cfg.replica_count,
         group_seed,
-        move |_idx| {
-            // `AggregatorDaemon::new` failures here would crash
-            // the spawn loop; we pre-validated above so this
-            // path is "should never fail". expect_used: the
-            // error surfaces in the spawn return value via the
-            // group's StartFailed below.
-            #[allow(clippy::expect_used)]
-            Arc::new(
-                AggregatorDaemon::new(cfg_for_factory.clone(), mesh_for_factory.clone())
-                    .expect("aggregator config validated"),
-            )
+        {
+            let cfg = cfg_for_factory.clone();
+            let mesh = mesh_for_factory.clone();
+            move |_idx| {
+                #[allow(clippy::expect_used)]
+                Arc::new(
+                    AggregatorDaemon::new(cfg.clone(), mesh.clone())
+                        .expect("aggregator config validated"),
+                )
+            }
         },
     )
     .await
@@ -357,10 +396,137 @@ async fn spawn_group(
         name: group_name.clone(),
         error: format!("{e}"),
     })?;
+    // Register with the auto-respawn monitor. The factory is
+    // re-invoked when a replica goes unhealthy — same shape as
+    // the initial spawn factory, plus the registry holds the
+    // closure for the monitor's lifetime.
+    let monitor_factory = {
+        let cfg = cfg.clone();
+        let mesh = mesh.clone();
+        move |_idx: u8| -> Arc<AggregatorDaemon> {
+            #[allow(clippy::expect_used)]
+            Arc::new(
+                AggregatorDaemon::new(cfg.clone(), mesh.clone())
+                    .expect("aggregator config validated"),
+            )
+        }
+    };
+    let monitor_interval = Duration::from_millis(group_cfg.summary_interval_ms.saturating_mul(4));
     registry
-        .register(group_cfg.name.clone(), group)
+        .register_with_monitor(group_cfg.name.clone(), group, monitor_factory, monitor_interval)
         .map_err(|e| DaemonError::Registry(format!("{e}")))?;
     Ok(())
+}
+
+/// Validate a `[[template]]` block at boot time so operator
+/// typos surface immediately, not on first Spawn RPC.
+fn validate_template(tpl: &TemplateConfig) -> Result<(), DaemonError> {
+    if tpl.summary_interval_ms < 10 {
+        return Err(DaemonError::AggregatorConfig {
+            name: tpl.name.clone(),
+            error: "summary_interval_ms must be >= 10".into(),
+        });
+    }
+    parse_subnet(&tpl.source_subnet).map_err(|e| DaemonError::SubnetInvalid {
+        raw: tpl.source_subnet.clone(),
+        error: e,
+    })?;
+    for kind in &tpl.fold_kinds {
+        match *kind {
+            k if k == CapabilityFold::KIND_ID => {}
+            k if k == ReservationFold::KIND_ID => {}
+            other => {
+                return Err(DaemonError::AggregatorConfig {
+                    name: tpl.name.clone(),
+                    error: format!(
+                        "unknown fold_kind 0x{other:04x}; built-in summarizers cover {:#06x} (capability) and {:#06x} (reservation)",
+                        CapabilityFold::KIND_ID,
+                        ReservationFold::KIND_ID,
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build a [`SpawnFn`] backed by `templates`. The closure
+/// captures `registry` + `mesh` so it can resolve names, build
+/// daemons, and register the spawned group all in one place.
+fn make_spawner(
+    templates: Vec<TemplateConfig>,
+    registry: Arc<AggregatorRegistry>,
+    mesh: Arc<MeshNode>,
+) -> SpawnFn {
+    use std::collections::HashMap;
+    // Index by template name for O(1) lookup. Cloning is fine
+    // — templates are small and the operator's config is
+    // immutable for the daemon's lifetime.
+    let by_name: HashMap<String, TemplateConfig> = templates
+        .into_iter()
+        .map(|t| (t.name.clone(), t))
+        .collect();
+    let by_name = Arc::new(by_name);
+    Box::new(move |req| {
+        let registry = registry.clone();
+        let mesh = mesh.clone();
+        let by_name = by_name.clone();
+        Box::pin(async move {
+            let template = by_name
+                .get(&req.template_name)
+                .cloned()
+                .ok_or_else(|| RegistryRpcError::UnknownTemplate(req.template_name.clone()))?;
+            if req.replica_count == 0 {
+                return Err(RegistryRpcError::SpawnRejected(
+                    "replica_count must be > 0".into(),
+                ));
+            }
+            // Build the AggregatorConfig from the template.
+            let source_subnet = parse_subnet(&template.source_subnet)
+                .map_err(|e| RegistryRpcError::SpawnRejected(format!("source_subnet: {e}")))?;
+            let mut agg_cfg = AggregatorConfig::new(source_subnet)
+                .with_interval(Duration::from_millis(template.summary_interval_ms));
+            for kind in &template.fold_kinds {
+                agg_cfg = agg_cfg.with_fold_kind(*kind);
+            }
+            let group_seed = derive_seed_from_name(&req.group_name);
+            let group = LifecycleGroup::<AggregatorDaemon>::spawn(req.replica_count, group_seed, {
+                let cfg = agg_cfg.clone();
+                let mesh = mesh.clone();
+                move |_idx| {
+                    #[allow(clippy::expect_used)]
+                    Arc::new(
+                        AggregatorDaemon::new(cfg.clone(), mesh.clone())
+                            .expect("aggregator config validated"),
+                    )
+                }
+            })
+            .await
+            .map_err(|e| RegistryRpcError::SpawnRejected(format!("{e}")))?;
+            let monitor_factory = {
+                let cfg = agg_cfg.clone();
+                let mesh = mesh.clone();
+                move |_idx: u8| -> Arc<AggregatorDaemon> {
+                    #[allow(clippy::expect_used)]
+                    Arc::new(
+                        AggregatorDaemon::new(cfg.clone(), mesh.clone())
+                            .expect("aggregator config validated"),
+                    )
+                }
+            };
+            let monitor_interval =
+                Duration::from_millis(template.summary_interval_ms.saturating_mul(4));
+            let entry = registry
+                .register_with_monitor(
+                    req.group_name.clone(),
+                    group,
+                    monitor_factory,
+                    monitor_interval,
+                )
+                .map_err(|e| RegistryRpcError::SpawnRejected(format!("{e}")))?;
+            Ok(snapshot_group(&entry).await)
+        })
+    })
 }
 
 async fn wait_for_shutdown() {
@@ -548,5 +714,69 @@ mod tests {
         assert_eq!(g.name, "primary");
         assert_eq!(g.replica_count, 2);
         assert_eq!(g.fold_kinds, vec![1]);
+        assert!(cfg.templates.is_empty());
+    }
+
+    #[test]
+    fn config_parses_templates_alongside_groups() {
+        let raw = r#"
+            listen = "127.0.0.1:0"
+            psk_hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+
+            [[group]]
+            name = "primary"
+            source_subnet = "3.7"
+            fold_kinds = [1]
+            replica_count = 2
+            summary_interval_ms = 50
+
+            [[template]]
+            name = "scale-out"
+            source_subnet = "3.8"
+            fold_kinds = [1]
+            summary_interval_ms = 100
+        "#;
+        let cfg: Config = toml::from_str(raw).expect("parse");
+        assert_eq!(cfg.groups.len(), 1);
+        assert_eq!(cfg.templates.len(), 1);
+        let t = &cfg.templates[0];
+        assert_eq!(t.name, "scale-out");
+        assert_eq!(t.source_subnet, "3.8");
+        assert_eq!(t.fold_kinds, vec![1]);
+        assert_eq!(t.summary_interval_ms, 100);
+    }
+
+    #[test]
+    fn validate_template_rejects_unknown_fold_kind() {
+        let tpl = TemplateConfig {
+            name: "t".into(),
+            source_subnet: "3.7".into(),
+            fold_kinds: vec![0xDEAD],
+            summary_interval_ms: 50,
+        };
+        match validate_template(&tpl) {
+            Err(DaemonError::AggregatorConfig { name, error }) => {
+                assert_eq!(name, "t");
+                assert!(error.contains("unknown fold_kind"), "msg was: {error}");
+            }
+            other => panic!("expected AggregatorConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_template_rejects_short_interval() {
+        let tpl = TemplateConfig {
+            name: "t".into(),
+            source_subnet: "3.7".into(),
+            fold_kinds: vec![1],
+            summary_interval_ms: 5,
+        };
+        match validate_template(&tpl) {
+            Err(DaemonError::AggregatorConfig { name, error }) => {
+                assert_eq!(name, "t");
+                assert!(error.contains("interval"), "msg was: {error}");
+            }
+            other => panic!("expected AggregatorConfig, got {other:?}"),
+        }
     }
 }

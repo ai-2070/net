@@ -104,7 +104,104 @@ impl RegistryClient {
         target_node_id: u64,
         service: &str,
     ) -> Result<Vec<RegistryGroupSummary>, RegistryClientError> {
-        let request = RegistryRequest::List;
+        let response = self
+            .send(target_node_id, service, RegistryRequest::List)
+            .await?;
+        match response {
+            RegistryResponse::Groups(groups) => Ok(groups),
+            RegistryResponse::Error(e) => Err(RegistryClientError::Server(e)),
+            other => Err(RegistryClientError::Codec(format!(
+                "unexpected response for List: {other:?}"
+            ))),
+        }
+    }
+
+    /// Deploy a new aggregator group by referencing a daemon-
+    /// side template by name. The daemon resolves `template_name`
+    /// against its config-time `[[template]]` registry, builds
+    /// the group with the operator-chosen `group_name`, and
+    /// returns its initial snapshot.
+    pub async fn spawn(
+        &self,
+        target_node_id: u64,
+        template_name: impl Into<String>,
+        group_name: impl Into<String>,
+        replica_count: u8,
+    ) -> Result<RegistryGroupSummary, RegistryClientError> {
+        self.spawn_with_service(
+            target_node_id,
+            REGISTRY_SERVICE,
+            template_name,
+            group_name,
+            replica_count,
+        )
+        .await
+    }
+
+    /// `Spawn` against a non-default service name.
+    pub async fn spawn_with_service(
+        &self,
+        target_node_id: u64,
+        service: &str,
+        template_name: impl Into<String>,
+        group_name: impl Into<String>,
+        replica_count: u8,
+    ) -> Result<RegistryGroupSummary, RegistryClientError> {
+        let request = RegistryRequest::Spawn {
+            template_name: template_name.into(),
+            group_name: group_name.into(),
+            replica_count,
+        };
+        let response = self.send(target_node_id, service, request).await?;
+        match response {
+            RegistryResponse::Spawned(summary) => Ok(summary),
+            RegistryResponse::Error(e) => Err(RegistryClientError::Server(e)),
+            other => Err(RegistryClientError::Codec(format!(
+                "unexpected response for Spawn: {other:?}"
+            ))),
+        }
+    }
+
+    /// Tear down a registered group by name. Returns `true`
+    /// when the group existed and was stopped, `false` when no
+    /// such group was registered on the target node.
+    pub async fn unregister(
+        &self,
+        target_node_id: u64,
+        group_name: impl Into<String>,
+    ) -> Result<bool, RegistryClientError> {
+        self.unregister_with_service(target_node_id, REGISTRY_SERVICE, group_name)
+            .await
+    }
+
+    /// `Unregister` against a non-default service name.
+    pub async fn unregister_with_service(
+        &self,
+        target_node_id: u64,
+        service: &str,
+        group_name: impl Into<String>,
+    ) -> Result<bool, RegistryClientError> {
+        let request = RegistryRequest::Unregister {
+            group_name: group_name.into(),
+        };
+        let response = self.send(target_node_id, service, request).await?;
+        match response {
+            RegistryResponse::Unregistered { existed } => Ok(existed),
+            RegistryResponse::Error(e) => Err(RegistryClientError::Server(e)),
+            other => Err(RegistryClientError::Codec(format!(
+                "unexpected response for Unregister: {other:?}"
+            ))),
+        }
+    }
+
+    /// Shared marshalling helper. Encodes the request, fires the
+    /// RPC, decodes the response.
+    async fn send(
+        &self,
+        target_node_id: u64,
+        service: &str,
+        request: RegistryRequest,
+    ) -> Result<RegistryResponse, RegistryClientError> {
         let body = postcard::to_allocvec(&request)?;
         let opts = CallOptions {
             deadline: Some(Instant::now() + self.deadline),
@@ -115,10 +212,7 @@ impl RegistryClient {
             .call(target_node_id, service, Bytes::from(body), opts)
             .await?;
         let response: RegistryResponse = postcard::from_bytes(&reply.body)?;
-        match response {
-            RegistryResponse::Groups(groups) => Ok(groups),
-            RegistryResponse::Error(e) => Err(RegistryClientError::Server(e)),
-        }
+        Ok(response)
     }
 }
 

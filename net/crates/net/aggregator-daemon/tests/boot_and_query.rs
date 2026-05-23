@@ -182,6 +182,117 @@ async fn daemon_rejects_unknown_fold_kind_at_boot() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spawn_and_unregister_rpc_round_trip_against_running_daemon() {
+    // Pin the full operator loop: configure a template, boot
+    // the daemon (no static groups), spawn a new group via the
+    // RPC, list to confirm it's there, then unregister it.
+    let toml = format!(
+        r#"
+            listen = "127.0.0.1:0"
+            psk_hex = "{PSK_HEX}"
+
+            [[template]]
+            name = "primary"
+            source_subnet = "3.7"
+            fold_kinds = [1]
+            summary_interval_ms = 50
+        "#
+    );
+    let cfg_file = write_temp_config(&toml).await;
+    let cli = Cli {
+        config: cfg_file.path().to_path_buf(),
+        listen: None,
+        verbose: 0,
+    };
+    let booted = boot(cli).await.expect("daemon boot");
+    assert_eq!(booted.registry.len(), 0);
+
+    // Handshake.
+    let client_node = build_client_node().await;
+    let daemon_node_id = booted.mesh.node_id();
+    let client_node_id = client_node.node_id();
+    let daemon_clone = booted.mesh.clone();
+    let accept = tokio::spawn(async move { daemon_clone.accept(client_node_id).await });
+    client_node
+        .connect(booted.bound_addr, &booted.public_key, daemon_node_id)
+        .await
+        .expect("connect");
+    accept.await.expect("join").expect("accept");
+    booted.mesh.start();
+    client_node.start();
+
+    let client = RegistryClient::new(client_node).with_deadline(Duration::from_secs(2));
+
+    // Spawn against the configured template.
+    let summary = client
+        .spawn(daemon_node_id, "primary", "dynamic", 2)
+        .await
+        .expect("spawn");
+    assert_eq!(summary.name, "dynamic");
+    assert_eq!(summary.replicas.len(), 2);
+
+    // List shows the new group.
+    let groups = client.list(daemon_node_id).await.expect("list");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].name, "dynamic");
+
+    // Unregister returns existed=true.
+    let existed = client
+        .unregister(daemon_node_id, "dynamic")
+        .await
+        .expect("unregister");
+    assert!(existed);
+    // List is empty again.
+    let groups = client.list(daemon_node_id).await.expect("list-after");
+    assert!(groups.is_empty());
+    // Second unregister returns existed=false.
+    let existed = client
+        .unregister(daemon_node_id, "dynamic")
+        .await
+        .expect("unregister-2");
+    assert!(!existed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spawn_unknown_template_returns_typed_server_error() {
+    let toml = format!(
+        r#"
+            listen = "127.0.0.1:0"
+            psk_hex = "{PSK_HEX}"
+        "#
+    );
+    let cfg_file = write_temp_config(&toml).await;
+    let cli = Cli {
+        config: cfg_file.path().to_path_buf(),
+        listen: None,
+        verbose: 0,
+    };
+    let booted = boot(cli).await.expect("daemon boot");
+
+    let client_node = build_client_node().await;
+    let daemon_node_id = booted.mesh.node_id();
+    let client_node_id = client_node.node_id();
+    let daemon_clone = booted.mesh.clone();
+    let accept = tokio::spawn(async move { daemon_clone.accept(client_node_id).await });
+    client_node
+        .connect(booted.bound_addr, &booted.public_key, daemon_node_id)
+        .await
+        .expect("connect");
+    accept.await.expect("join").expect("accept");
+    booted.mesh.start();
+    client_node.start();
+
+    let client = RegistryClient::new(client_node).with_deadline(Duration::from_secs(2));
+    use net::adapter::net::behavior::aggregator::{RegistryClientError, RegistryRpcError};
+    match client.spawn(daemon_node_id, "nope", "any", 1).await {
+        Err(RegistryClientError::Server(RegistryRpcError::UnknownTemplate(t))) => {
+            assert_eq!(t, "nope");
+        }
+        other => panic!("expected UnknownTemplate, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_rejects_duplicate_group_names_at_boot() {
     let toml = format!(
         r#"
