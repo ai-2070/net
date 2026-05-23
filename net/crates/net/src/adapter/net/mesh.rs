@@ -5328,11 +5328,22 @@ impl MeshNode {
     /// installed, operator CLI verbs
     /// (`net aggregator spawn / ls / scale`) and the Deck
     /// AGGREGATORS panel can read + mutate live aggregator
-    /// groups through it. Call this BEFORE [`Self::start`].
+    /// groups through it. Call this BEFORE [`Self::start`] —
+    /// installing after the receive loop is live races against
+    /// channel-publish initialization. The `debug_assert!` makes
+    /// the constraint observable in tests; release builds carry
+    /// the doc-comment contract only.
     pub fn set_aggregator_registry(
         &mut self,
         registry: Arc<super::behavior::aggregator::AggregatorRegistry>,
     ) {
+        debug_assert!(
+            !self
+                .started
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "set_aggregator_registry must be called before MeshNode::start; \
+             installing after the receive loop is live races channel-publish init",
+        );
         self.aggregator_registry = Some(registry);
     }
 

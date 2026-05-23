@@ -303,10 +303,23 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
         validate_template(tpl)?;
     }
 
-    // Spawn every configured group.
-    for group_cfg in &config.groups {
-        spawn_group(&registry, &mesh, group_cfg).await?;
-        tracing::info!(name = group_cfg.name, "group spawned + registered");
+    // Spawn every configured group in parallel — `spawn_group`
+    // already parallelizes its replicas via `join_all` (see
+    // `LifecycleGroup::spawn`), but groups themselves were
+    // sequential. Boot of N groups of M replicas now takes
+    // ~max(per-replica start latency) instead of N × max.
+    let spawn_futures = config.groups.iter().map(|group_cfg| {
+        let registry = registry.clone();
+        let mesh = mesh.clone();
+        async move {
+            let res = spawn_group(&registry, &mesh, group_cfg).await;
+            (group_cfg.name.clone(), res)
+        }
+    });
+    let results = futures::future::join_all(spawn_futures).await;
+    for (name, res) in results {
+        res?;
+        tracing::info!(name, "group spawned + registered");
     }
 
     // NOTE: the mesh's receive loop is NOT started here.
