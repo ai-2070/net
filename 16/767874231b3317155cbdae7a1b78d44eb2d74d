@@ -1,0 +1,37 @@
+net/crates/net/bindings/python/python/net/_net.pyi
+  s_099fa7d871e34d::t_6bf2c51c8d9f24 1780-1841
+  s_099fa7d871e34d::t_31859eb783a7da 247
+net/crates/net/bindings/python/python/net/__init__.py
+  s_099fa7d871e34d::t_ec68e1972033e7 570-603
+net/crates/net/bindings/python/src/lib.rs
+  s_099fa7d871e34d::t_d35a8e8f7a07db 2461-2493
+  s_099fa7d871e34d::t_5ded53a4203d7b 5-6
+  s_099fa7d871e34d::t_91b14f72294f68 2245
+  s_099fa7d871e34d::t_2666a4e6f74b25 2267
+net/crates/net/bindings/python/src/aggregator.rs
+  s_099fa7d871e34d::t_d4e3faee2a792f 138,140-142
+  s_099fa7d871e34d::t_c21f598e13cbd6 1-40,45-112,114,118-137,139,143-440
+  s_099fa7d871e34d::t_2f81a03b017492 113,115-117
+  s_099fa7d871e34d::t_47f3c01c94ddd2 41-44
+net/crates/net/bindings/python/Cargo.toml
+  s_099fa7d871e34d::t_c2025c6e1729ff 105-109
+  s_099fa7d871e34d::t_e857d550586a8e 43
+net/crates/net/bindings/python/tests/test_aggregator_error_kinds.py
+  s_099fa7d871e34d::t_f48bc3f657c87a 1-98
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "16767874231b3317155cbdae7a1b78d44eb2d74d",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
