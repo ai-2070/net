@@ -2161,6 +2161,41 @@ impl MeshNode {
         self.peer_subnets.get(&node_id).map(|e| *e.value())
     }
 
+    /// This node's own `SubnetId` — the value supplied via
+    /// `MeshNodeConfig::subnet` (or `SubnetId::GLOBAL` when none was
+    /// configured). Stable for the node's lifetime; the substrate
+    /// doesn't reassign the local subnet at runtime.
+    pub fn local_subnet(&self) -> SubnetId {
+        self.local_subnet
+    }
+
+    /// Read-only handle to the `SubnetPolicy` that derived this
+    /// node's `local_subnet`, when one was supplied. `None` when
+    /// the local subnet came from `MeshNodeConfig::subnet`
+    /// directly without going through a policy. Operator tools
+    /// surface this to explain "why is this node in subnet X."
+    pub fn local_subnet_policy(&self) -> Option<&Arc<SubnetPolicy>> {
+        self.local_subnet_policy.as_ref()
+    }
+
+    /// Snapshot of every `(node_id, subnet_id)` pair the local
+    /// node has cached from signature-verified capability
+    /// announcements. Sorted by `node_id` for stable output. Used
+    /// by operator tooling (`net subnet ls` / `subnet tree`) to
+    /// enumerate the mesh's subnet topology from a single
+    /// vantage point — anything not yet announced (or announced
+    /// unsigned) is invisible here, matching `peer_subnet`'s
+    /// "signed-only" contract.
+    pub fn known_subnets(&self) -> Vec<(u64, SubnetId)> {
+        let mut out: Vec<(u64, SubnetId)> = self
+            .peer_subnets
+            .iter()
+            .map(|e| (*e.key(), *e.value()))
+            .collect();
+        out.sort_by_key(|(node_id, _)| *node_id);
+        out
+    }
+
     /// Get the local bind address.
     pub fn local_addr(&self) -> SocketAddr {
         self.socket.local_addr()
@@ -10720,6 +10755,39 @@ mod fold_publisher_helpers_tests {
 
         assert_eq!(node.get_node_by_origin_hash(hash_a), Some(0xAAAA));
         assert_eq!(node.get_node_by_origin_hash(hash_b), Some(0xBBBB));
+    }
+
+    #[tokio::test]
+    async fn local_subnet_defaults_to_global_without_config_override() {
+        // `build_node_for_test` constructs `MeshNodeConfig::new(...)`
+        // without `.with_subnet(...)`, so the local subnet must
+        // come out as `SubnetId::GLOBAL`. Pins the
+        // GLOBAL-as-default contract operator tooling relies on.
+        let node = build_node_for_test().await;
+        assert_eq!(node.local_subnet(), SubnetId::GLOBAL);
+        assert!(node.local_subnet_policy().is_none());
+    }
+
+    #[tokio::test]
+    async fn known_subnets_sorted_by_node_id() {
+        // Pin the deterministic-order contract `subnet ls` /
+        // `subnet tree` operator tools depend on. Build a node,
+        // populate `peer_subnets` directly with three out-of-order
+        // entries, and assert `known_subnets()` returns them
+        // sorted ascending by node_id.
+        let node = build_node_for_test().await;
+        assert!(node.known_subnets().is_empty());
+
+        node.peer_subnets.insert(0xC0FFEE, SubnetId::new(&[3, 7, 2]));
+        node.peer_subnets.insert(0xAAAA, SubnetId::new(&[3, 7, 1]));
+        node.peer_subnets.insert(0xB0B0, SubnetId::new(&[3, 8]));
+
+        let snapshot = node.known_subnets();
+        let ids: Vec<u64> = snapshot.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![0xAAAA, 0xB0B0, 0xC0FFEE]);
+        assert_eq!(snapshot[0].1, SubnetId::new(&[3, 7, 1]));
+        assert_eq!(snapshot[1].1, SubnetId::new(&[3, 8]));
+        assert_eq!(snapshot[2].1, SubnetId::new(&[3, 7, 2]));
     }
 
     #[tokio::test]
