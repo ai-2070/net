@@ -1,0 +1,22 @@
+net/crates/net/tests/aggregator_fold_query.rs
+  s_099fa7d871e34d::t_8db1bdd8c812f0 24-28
+  s_099fa7d871e34d::t_767efce2388953 214-222,224,227,248-313
+  s_099fa7d871e34d::t_ff93a26fa2da9d 34-38
+  s_099fa7d871e34d::t_8b0daded86bf22 223,225-226,228-247
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "b44b4a9a9270ba8fe92fc051414aa50cbd7b21d2",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
