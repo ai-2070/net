@@ -204,6 +204,45 @@ impl std::fmt::Display for SubnetId {
     }
 }
 
+/// Inverse of [`Display`]: parses `"global"` (case-insensitive) or
+/// a dotted decimal form like `"3.7.2"` (each level a `u8`).
+impl std::str::FromStr for SubnetId {
+    type Err = super::SubnetError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        if trimmed.eq_ignore_ascii_case("global") {
+            return Ok(Self::GLOBAL);
+        }
+        if trimmed.is_empty() {
+            return Err(super::SubnetError::ParseFailed {
+                input: s.to_string(),
+                reason: "empty".into(),
+            });
+        }
+        let parts: Vec<&str> = trimmed.split('.').collect();
+        if parts.len() > MAX_DEPTH as usize {
+            return Err(super::SubnetError::TooManyLevels {
+                got: parts.len(),
+                max: MAX_DEPTH,
+            });
+        }
+        let mut levels: Vec<u8> = Vec::with_capacity(parts.len());
+        for p in parts {
+            match p.parse::<u8>() {
+                Ok(level) => levels.push(level),
+                Err(e) => {
+                    return Err(super::SubnetError::ParseFailed {
+                        input: s.to_string(),
+                        reason: format!("level `{p}` not a u8: {e}"),
+                    })
+                }
+            }
+        }
+        Self::try_new(&levels)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +383,43 @@ mod tests {
     fn try_new_accepts_empty() {
         let id = SubnetId::try_new(&[]).expect("0 levels (GLOBAL) must be accepted");
         assert_eq!(id, SubnetId::GLOBAL);
+    }
+
+    #[test]
+    fn from_str_round_trips_global_and_dotted_levels() {
+        use std::str::FromStr;
+        assert_eq!(SubnetId::from_str("global").unwrap(), SubnetId::GLOBAL);
+        assert_eq!(SubnetId::from_str("GLOBAL").unwrap(), SubnetId::GLOBAL);
+        assert_eq!(SubnetId::from_str("3").unwrap(), SubnetId::new(&[3]));
+        assert_eq!(SubnetId::from_str("3.7").unwrap(), SubnetId::new(&[3, 7]));
+        assert_eq!(
+            SubnetId::from_str("1.2.3.4").unwrap(),
+            SubnetId::new(&[1, 2, 3, 4])
+        );
+        // Display ↔ FromStr round-trip.
+        let id = SubnetId::new(&[3, 7, 2]);
+        assert_eq!(SubnetId::from_str(&id.to_string()).unwrap(), id);
+    }
+
+    #[test]
+    fn from_str_rejects_garbage() {
+        use super::super::error::SubnetError;
+        use std::str::FromStr;
+        assert!(matches!(
+            SubnetId::from_str("").unwrap_err(),
+            SubnetError::ParseFailed { .. }
+        ));
+        assert!(matches!(
+            SubnetId::from_str("256").unwrap_err(),
+            SubnetError::ParseFailed { .. }
+        ));
+        assert!(matches!(
+            SubnetId::from_str("1.2.3.4.5").unwrap_err(),
+            SubnetError::TooManyLevels { got: 5, max: 4 }
+        ));
+        assert!(matches!(
+            SubnetId::from_str("not-a-number").unwrap_err(),
+            SubnetError::ParseFailed { .. }
+        ));
     }
 }

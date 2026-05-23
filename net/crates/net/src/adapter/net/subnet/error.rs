@@ -39,4 +39,17 @@ pub enum SubnetError {
         /// Hard cap from `super::id::MAX_DEPTH`.
         max: u8,
     },
+
+    /// String form did not parse as a [`super::SubnetId`].
+    ///
+    /// Returned by `SubnetId::from_str`. Carries the original
+    /// input and a short reason so the operator sees what
+    /// rejected the value.
+    #[error("SubnetId could not parse `{input}`: {reason}")]
+    ParseFailed {
+        /// The string the caller supplied.
+        input: String,
+        /// Short human-readable reason for the rejection.
+        reason: String,
+    },
 }

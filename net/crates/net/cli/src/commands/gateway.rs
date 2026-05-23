@@ -174,31 +174,12 @@ fn parse_channel_hash(raw: &str) -> Result<u16, CliError> {
     )))
 }
 
-/// Parse a subnet arg into a `SubnetId`. Accepts `global` or a
-/// dotted form like `3.7.2`. Levels are u8; each must parse.
+/// Parse a subnet arg into a `SubnetId` via its `FromStr` impl.
+/// Wraps the typed `SubnetError` as a `CliError` so the operator
+/// sees a clear message.
 fn parse_subnet(raw: &str) -> Result<SubnetId, CliError> {
-    let s = raw.trim().to_ascii_lowercase();
-    if s == "global" {
-        return Ok(SubnetId::GLOBAL);
-    }
-    let parts: Vec<&str> = s.split('.').collect();
-    if parts.is_empty() || parts.len() > SubnetId::MAX_DEPTH as usize {
-        return Err(invalid_args(format!(
-            "subnet `{raw}` must be 1..={max} dotted u8 levels (got {n}); \
-             use `global` for SubnetId::GLOBAL",
-            max = SubnetId::MAX_DEPTH,
-            n = parts.len()
-        )));
-    }
-    let mut levels: Vec<u8> = Vec::with_capacity(parts.len());
-    for p in parts {
-        levels.push(
-            p.parse::<u8>()
-                .map_err(|e| invalid_args(format!("subnet level `{p}` in `{raw}` not a u8: {e}")))?,
-        );
-    }
-    SubnetId::try_new(&levels)
-        .map_err(|e| invalid_args(format!("subnet `{raw}` rejected: {e:?}")))
+    use std::str::FromStr;
+    SubnetId::from_str(raw).map_err(|e| invalid_args(format!("subnet `{raw}`: {e}")))
 }
 
 #[derive(Serialize)]
