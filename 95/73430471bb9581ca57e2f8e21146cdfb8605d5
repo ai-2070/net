@@ -1,0 +1,21 @@
+net/crates/net/aggregator-daemon/Cargo.toml
+  s_099fa7d871e34d::t_cdb72c96c81511 55-62
+net/crates/net/aggregator-daemon/src/lib.rs
+  s_099fa7d871e34d::t_7a6b64e8e65ee0 595-606,608-616
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "9573430471bb9581ca57e2f8e21146cdfb8605d5",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
