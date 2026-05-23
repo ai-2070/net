@@ -342,82 +342,145 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
     })
 }
 
-async fn spawn_group(
+/// Internal: resolved + validated per-replica spec. The two
+/// caller paths — static `[[group]]` spawn at boot and the
+/// `Spawn` RPC's template-based dynamic deployment — funnel
+/// through this shape so [`spawn_and_register`] runs the same
+/// LifecycleGroup::spawn + register_with_monitor flow for
+/// both.
+#[derive(Debug, Clone)]
+struct AggregatorSpec {
+    name: String,
+    source_subnet: SubnetId,
+    fold_kinds: Vec<u16>,
+    replica_count: u8,
+    summary_interval_ms: u64,
+    group_seed: [u8; 32],
+}
+
+impl AggregatorSpec {
+    /// Resolve a static `[[group]]` config into a spec, doing
+    /// the field-wise validation (subnet parse, replica_count,
+    /// interval floor, fold_kinds).
+    fn from_group(group_cfg: &GroupConfig) -> Result<Self, DaemonError> {
+        if group_cfg.replica_count == 0 {
+            return Err(DaemonError::AggregatorConfig {
+                name: group_cfg.name.clone(),
+                error: "replica_count must be > 0".into(),
+            });
+        }
+        if group_cfg.summary_interval_ms < 10 {
+            return Err(DaemonError::AggregatorConfig {
+                name: group_cfg.name.clone(),
+                error: "summary_interval_ms must be >= 10".into(),
+            });
+        }
+        let source_subnet =
+            parse_subnet(&group_cfg.source_subnet).map_err(|e| DaemonError::SubnetInvalid {
+                raw: group_cfg.source_subnet.clone(),
+                error: e,
+            })?;
+        for kind in &group_cfg.fold_kinds {
+            check_known_fold_kind(*kind, &group_cfg.name)?;
+        }
+        let group_seed = match &group_cfg.group_seed {
+            Some(s) => decode_seed(s).map_err(|e| DaemonError::GroupSeedInvalid {
+                name: group_cfg.name.clone(),
+                error: e,
+            })?,
+            None => derive_seed_from_name(&group_cfg.name),
+        };
+        Ok(Self {
+            name: group_cfg.name.clone(),
+            source_subnet,
+            fold_kinds: group_cfg.fold_kinds.clone(),
+            replica_count: group_cfg.replica_count,
+            summary_interval_ms: group_cfg.summary_interval_ms,
+            group_seed,
+        })
+    }
+
+    /// Build a spec from a `Spawn` RPC request + the matching
+    /// template. Returns RegistryRpcError shapes since the
+    /// caller is the spawner closure surfaced over the wire.
+    fn from_template(
+        template: &TemplateConfig,
+        group_name: String,
+        replica_count: u8,
+    ) -> Result<Self, RegistryRpcError> {
+        if replica_count == 0 {
+            return Err(RegistryRpcError::SpawnRejected(
+                "replica_count must be > 0".into(),
+            ));
+        }
+        let source_subnet = parse_subnet(&template.source_subnet)
+            .map_err(|e| RegistryRpcError::SpawnRejected(format!("source_subnet: {e}")))?;
+        Ok(Self {
+            group_seed: derive_seed_from_name(&group_name),
+            name: group_name,
+            source_subnet,
+            fold_kinds: template.fold_kinds.clone(),
+            replica_count,
+            summary_interval_ms: template.summary_interval_ms,
+        })
+    }
+
+    /// Build the `AggregatorConfig` used per-replica.
+    fn aggregator_config(&self) -> AggregatorConfig {
+        let mut cfg = AggregatorConfig::new(self.source_subnet)
+            .with_interval(Duration::from_millis(self.summary_interval_ms));
+        for kind in &self.fold_kinds {
+            cfg = cfg.with_fold_kind(*kind);
+        }
+        cfg
+    }
+}
+
+/// Single fold-kind check used by both `validate_template` and
+/// `AggregatorSpec::from_group`. Returns a typed
+/// `DaemonError::AggregatorConfig` so the error path is
+/// identical at the source.
+fn check_known_fold_kind(kind: u16, name: &str) -> Result<(), DaemonError> {
+    match kind {
+        k if k == CapabilityFold::KIND_ID => Ok(()),
+        k if k == ReservationFold::KIND_ID => Ok(()),
+        other => Err(DaemonError::AggregatorConfig {
+            name: name.to_string(),
+            error: format!(
+                "unknown fold_kind 0x{other:04x}; built-in summarizers cover {:#06x} (capability) and {:#06x} (reservation)",
+                CapabilityFold::KIND_ID,
+                ReservationFold::KIND_ID,
+            ),
+        }),
+    }
+}
+
+/// Shared lifecycle-spawn + register-with-monitor path used by
+/// both the static `[[group]]` boot loop and the Spawn RPC's
+/// dynamic deployment. The monitor factory closure rebuilds an
+/// `AggregatorDaemon` from the same config the initial spawn
+/// used — auto-respawn on unhealthy preserves identity (same
+/// `group_seed`) but the daemon instance itself is fresh.
+async fn spawn_and_register(
+    spec: &AggregatorSpec,
     registry: &Arc<AggregatorRegistry>,
     mesh: &Arc<MeshNode>,
-    group_cfg: &GroupConfig,
-) -> Result<(), DaemonError> {
-    if group_cfg.replica_count == 0 {
-        return Err(DaemonError::AggregatorConfig {
-            name: group_cfg.name.clone(),
-            error: "replica_count must be > 0".into(),
-        });
-    }
-    if group_cfg.summary_interval_ms < 10 {
-        return Err(DaemonError::AggregatorConfig {
-            name: group_cfg.name.clone(),
-            error: "summary_interval_ms must be >= 10".into(),
-        });
-    }
-    let source_subnet =
-        parse_subnet(&group_cfg.source_subnet).map_err(|e| DaemonError::SubnetInvalid {
-            raw: group_cfg.source_subnet.clone(),
-            error: e,
-        })?;
-    let group_seed = match &group_cfg.group_seed {
-        Some(s) => decode_seed(s).map_err(|e| DaemonError::GroupSeedInvalid {
-            name: group_cfg.name.clone(),
-            error: e,
-        })?,
-        None => derive_seed_from_name(&group_cfg.name),
-    };
-
-    // Build a fresh AggregatorConfig per replica via the factory.
-    let mut cfg = AggregatorConfig::new(source_subnet)
-        .with_interval(Duration::from_millis(group_cfg.summary_interval_ms));
-    for kind in &group_cfg.fold_kinds {
-        // Validate the kind is one of the built-ins we know how
-        // to summarize — operator typos surface at startup, not
-        // at first tick.
-        match *kind {
-            k if k == CapabilityFold::KIND_ID => {}
-            k if k == ReservationFold::KIND_ID => {}
-            other => {
-                return Err(DaemonError::AggregatorConfig {
-                    name: group_cfg.name.clone(),
-                    error: format!(
-                        "unknown fold_kind 0x{other:04x}; built-in summarizers cover {:#06x} (capability) and {:#06x} (reservation)",
-                        CapabilityFold::KIND_ID,
-                        ReservationFold::KIND_ID,
-                    ),
-                });
-            }
-        }
-        cfg = cfg.with_fold_kind(*kind);
-    }
-    let mesh_for_factory = mesh.clone();
-    let cfg_for_factory = cfg.clone();
-    let group_name = group_cfg.name.clone();
-    let group = LifecycleGroup::<AggregatorDaemon>::spawn(group_cfg.replica_count, group_seed, {
-        let cfg = cfg_for_factory.clone();
-        let mesh = mesh_for_factory.clone();
+) -> Result<Arc<net::adapter::net::behavior::aggregator::AggregatorGroupEntry>, SpawnAndRegisterError>
+{
+    let cfg = spec.aggregator_config();
+    let group = LifecycleGroup::<AggregatorDaemon>::spawn(spec.replica_count, spec.group_seed, {
+        let cfg = cfg.clone();
+        let mesh = mesh.clone();
         move |_idx| {
             #[allow(clippy::expect_used)]
             Arc::new(
                 AggregatorDaemon::new(cfg.clone(), mesh.clone())
-                    .expect("aggregator config validated"),
+                    .expect("aggregator config validated by AggregatorSpec resolution"),
             )
         }
     })
     .await
-    .map_err(|e| DaemonError::AggregatorConfig {
-        name: group_name.clone(),
-        error: format!("{e}"),
-    })?;
-    // Register with the auto-respawn monitor. The factory is
-    // re-invoked when a replica goes unhealthy — same shape as
-    // the initial spawn factory, plus the registry holds the
-    // closure for the monitor's lifetime.
+    .map_err(|e| SpawnAndRegisterError::SpawnFailed(format!("{e}")))?;
     let monitor_factory = {
         let cfg = cfg.clone();
         let mesh = mesh.clone();
@@ -425,19 +488,40 @@ async fn spawn_group(
             #[allow(clippy::expect_used)]
             Arc::new(
                 AggregatorDaemon::new(cfg.clone(), mesh.clone())
-                    .expect("aggregator config validated"),
+                    .expect("aggregator config validated by AggregatorSpec resolution"),
             )
         }
     };
-    let monitor_interval = Duration::from_millis(group_cfg.summary_interval_ms.saturating_mul(4));
+    let monitor_interval = Duration::from_millis(spec.summary_interval_ms.saturating_mul(4));
     registry
-        .register_with_monitor(
-            group_cfg.name.clone(),
-            group,
-            monitor_factory,
-            monitor_interval,
-        )
-        .map_err(|e| DaemonError::Registry(format!("{e}")))?;
+        .register_with_monitor(spec.name.clone(), group, monitor_factory, monitor_interval)
+        .map_err(|e| SpawnAndRegisterError::RegisterFailed(format!("{e}")))
+}
+
+/// Internal error from [`spawn_and_register`]. Each variant
+/// maps trivially to either `DaemonError` (static path) or
+/// `RegistryRpcError` (RPC path) at the caller.
+#[derive(Debug)]
+enum SpawnAndRegisterError {
+    SpawnFailed(String),
+    RegisterFailed(String),
+}
+
+async fn spawn_group(
+    registry: &Arc<AggregatorRegistry>,
+    mesh: &Arc<MeshNode>,
+    group_cfg: &GroupConfig,
+) -> Result<(), DaemonError> {
+    let spec = AggregatorSpec::from_group(group_cfg)?;
+    spawn_and_register(&spec, registry, mesh)
+        .await
+        .map_err(|e| match e {
+            SpawnAndRegisterError::SpawnFailed(s) => DaemonError::AggregatorConfig {
+                name: spec.name.clone(),
+                error: s,
+            },
+            SpawnAndRegisterError::RegisterFailed(s) => DaemonError::Registry(s),
+        })?;
     Ok(())
 }
 
@@ -462,20 +546,7 @@ fn validate_template(tpl: &TemplateConfig, mesh: &Arc<MeshNode>) -> Result<(), D
         error: e,
     })?;
     for kind in &tpl.fold_kinds {
-        match *kind {
-            k if k == CapabilityFold::KIND_ID => {}
-            k if k == ReservationFold::KIND_ID => {}
-            other => {
-                return Err(DaemonError::AggregatorConfig {
-                    name: tpl.name.clone(),
-                    error: format!(
-                        "unknown fold_kind 0x{other:04x}; built-in summarizers cover {:#06x} (capability) and {:#06x} (reservation)",
-                        CapabilityFold::KIND_ID,
-                        ReservationFold::KIND_ID,
-                    ),
-                });
-            }
-        }
+        check_known_fold_kind(*kind, &tpl.name)?;
     }
     // Dry-build the AggregatorConfig + AggregatorDaemon::new to
     // catch anything the field-wise checks miss. The throwaway
@@ -519,54 +590,17 @@ fn make_spawner(
                 .get(&req.template_name)
                 .cloned()
                 .ok_or_else(|| RegistryRpcError::UnknownTemplate(req.template_name.clone()))?;
-            if req.replica_count == 0 {
-                return Err(RegistryRpcError::SpawnRejected(
-                    "replica_count must be > 0".into(),
-                ));
-            }
-            // Build the AggregatorConfig from the template.
-            let source_subnet = parse_subnet(&template.source_subnet)
-                .map_err(|e| RegistryRpcError::SpawnRejected(format!("source_subnet: {e}")))?;
-            let mut agg_cfg = AggregatorConfig::new(source_subnet)
-                .with_interval(Duration::from_millis(template.summary_interval_ms));
-            for kind in &template.fold_kinds {
-                agg_cfg = agg_cfg.with_fold_kind(*kind);
-            }
-            let group_seed = derive_seed_from_name(&req.group_name);
-            let group = LifecycleGroup::<AggregatorDaemon>::spawn(req.replica_count, group_seed, {
-                let cfg = agg_cfg.clone();
-                let mesh = mesh.clone();
-                move |_idx| {
-                    #[allow(clippy::expect_used)]
-                    Arc::new(
-                        AggregatorDaemon::new(cfg.clone(), mesh.clone())
-                            .expect("aggregator config validated"),
-                    )
-                }
-            })
-            .await
-            .map_err(|e| RegistryRpcError::SpawnRejected(format!("{e}")))?;
-            let monitor_factory = {
-                let cfg = agg_cfg.clone();
-                let mesh = mesh.clone();
-                move |_idx: u8| -> Arc<AggregatorDaemon> {
-                    #[allow(clippy::expect_used)]
-                    Arc::new(
-                        AggregatorDaemon::new(cfg.clone(), mesh.clone())
-                            .expect("aggregator config validated"),
-                    )
-                }
-            };
-            let monitor_interval =
-                Duration::from_millis(template.summary_interval_ms.saturating_mul(4));
-            let entry = registry
-                .register_with_monitor(
-                    req.group_name.clone(),
-                    group,
-                    monitor_factory,
-                    monitor_interval,
-                )
-                .map_err(|e| RegistryRpcError::SpawnRejected(format!("{e}")))?;
+            let spec = AggregatorSpec::from_template(
+                &template,
+                req.group_name.clone(),
+                req.replica_count,
+            )?;
+            let entry = spawn_and_register(&spec, &registry, &mesh)
+                .await
+                .map_err(|e| match e {
+                    SpawnAndRegisterError::SpawnFailed(s)
+                    | SpawnAndRegisterError::RegisterFailed(s) => RegistryRpcError::SpawnRejected(s),
+                })?;
             Ok(snapshot_group(&entry).await)
         })
     })
