@@ -47,6 +47,18 @@ import {
   type CapabilitySet,
   type ScopeFilter,
 } from './capabilities';
+import {
+  aggregationToJson,
+  capacityQueryToJson,
+  groupByToJson,
+  tagMatcherToJson,
+  type Aggregation,
+  type AggregateRow,
+  type CapacityQuery,
+  type CapacityRow,
+  type GroupBy,
+  type TagMatcher,
+} from './capability-aggregation';
 import type { SubnetId, SubnetPolicy } from './subnets';
 import type { Token } from './identity';
 
@@ -562,6 +574,85 @@ export class MeshNode {
     return this.native.findNodesScoped(
       capabilityFilterToNapi(filter),
       scopeFilterToNapi(scope),
+    );
+  }
+
+  /**
+   * Bucketed aggregation over the local capability fold —
+   * `Fold::aggregate(matcher, groupBy, agg)`. Composes a matcher,
+   * a bucket-derivation, and a per-bucket reduction into a
+   * lex-sorted `[bucket, value][]`. Phase 6c-A of
+   * `MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`.
+   *
+   * `matcher === undefined` walks every entry.
+   *
+   * @example
+   * ```typescript
+   * // Top GPU types by count.
+   * const rows = node.capabilityAggregate(
+   *   { kind: 'prefix', value: 'hardware.gpu' },
+   *   { kind: 'tagStem', prefix: 'hardware.gpu' },
+   *   { kind: 'count' },
+   * );
+   * for (const r of rows) console.log(r.bucket, r.value);
+   * ```
+   */
+  capabilityAggregate(
+    matcher: TagMatcher | undefined,
+    groupBy: GroupBy,
+    aggregation: Aggregation,
+  ): AggregateRow[] {
+    const matcherJson = matcher ? tagMatcherToJson(matcher) : null;
+    const groupByJson = groupByToJson(groupBy);
+    const aggregationJson = aggregationToJson(aggregation);
+    return this.native.capabilityAggregate(
+      matcherJson,
+      groupByJson,
+      aggregationJson,
+    );
+  }
+
+  /**
+   * Capacity-ranked materialized view —
+   * `Fold::capacity_ranking(query, rttLookup)`. Per-bucket state
+   * breakdown + latency gate + optional summed numeric capacity,
+   * sorted by `available` desc (ties broken on bucket asc) and
+   * truncated to `query.limit`. Phase 6c-B.
+   *
+   * `rttEntries` is the materialized RTT map. `undefined`/empty
+   * disables the RTT filter regardless of `query.maxRttMs`. Per
+   * the plan, a `ThreadsafeFunction` closure variant is a follow-
+   * up; the map shape matches the Go / C wrappers and lines up
+   * with what operators typically have cached from the proximity
+   * graph.
+   *
+   * @example
+   * ```typescript
+   * // Top 5 GPU types available within 50 ms latency.
+   * const rttMap = [
+   *   { nodeId: 0x1234n, rttMs: 25 },
+   *   { nodeId: 0x5678n, rttMs: 75 },
+   * ];
+   * const rows = node.capabilityCapacityRanking(
+   *   {
+   *     matcher: { kind: 'prefix', value: 'hardware.gpu' },
+   *     groupBy: { kind: 'tagStem', prefix: 'hardware.gpu' },
+   *     maxRttMs: 50,
+   *     sumAxisKey: 'hardware.gpu.count',
+   *     limit: 5,
+   *   },
+   *   rttMap,
+   * );
+   * ```
+   */
+  capabilityCapacityRanking(
+    query: CapacityQuery,
+    rttEntries?: Array<{ nodeId: bigint; rttMs: number }>,
+  ): CapacityRow[] {
+    const queryJson = capacityQueryToJson(query);
+    return this.native.capabilityCapacityRanking(
+      queryJson,
+      rttEntries ?? null,
     );
   }
 

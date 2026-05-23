@@ -33,14 +33,23 @@ use crate::adapter::net::behavior::tag::{Tag, TaxonomyAxis};
 pub enum TagMatcher {
     /// Exact tag string match — e.g. `"software.python=3.11"` matches
     /// only entries carrying that exact canonical tag.
-    Exact(String),
+    Exact {
+        /// The literal tag string to match against.
+        value: String,
+    },
     /// Tag-string prefix — e.g. `"hardware.gpu"` matches
     /// `"hardware.gpu"` and `"hardware.gpu.vram_gb=80"` and any other
     /// tag starting with the prefix.
-    Prefix(String),
+    Prefix {
+        /// The tag prefix to match against.
+        value: String,
+    },
     /// Tag is anywhere in the given taxonomy axis. Matches every
     /// axis-prefixed tag (presence + value) in that axis.
-    Axis(TaxonomyAxis),
+    Axis {
+        /// Taxonomy axis the tag must live in.
+        axis: TaxonomyAxis,
+    },
     /// Tag has a specific (axis, key) regardless of value.
     /// `AxisKey { axis: Hardware, key: "gpu.count" }` matches
     /// `"hardware.gpu.count=8"` and `"hardware.gpu.count=16"` but not
@@ -57,7 +66,10 @@ pub enum TagMatcher {
     /// safer than silently treating bad patterns as wildcards).
     /// Compiled per `matches_one` call; callers expecting heavy
     /// reuse should pre-filter via a coarser matcher first.
-    Regex(String),
+    Regex {
+        /// Regular-expression pattern to match against the tag.
+        pattern: String,
+    },
     /// Semver range against a specific axis-key value. Picks
     /// `AxisValue` tags whose `(axis, key)` matches `axis_key`
     /// (canonical dotted form, e.g. `"software.python"`) and whose
@@ -85,17 +97,17 @@ impl TagMatcher {
 
     fn matches_one(&self, raw: &str) -> bool {
         match self {
-            Self::Exact(s) => raw == s,
-            Self::Prefix(s) => raw.starts_with(s),
-            Self::Axis(want) => Tag::parse(raw)
+            Self::Exact { value } => raw == value,
+            Self::Prefix { value } => raw.starts_with(value),
+            Self::Axis { axis } => Tag::parse(raw)
                 .ok()
                 .and_then(|t| t.axis_key().map(|k| k.axis))
-                == Some(*want),
+                == Some(*axis),
             Self::AxisKey { axis, key } => Tag::parse(raw)
                 .ok()
                 .and_then(|t| t.axis_key())
                 .is_some_and(|k| k.axis == *axis && k.key == *key),
-            Self::Regex(pattern) => match regex::Regex::new(pattern) {
+            Self::Regex { pattern } => match regex::Regex::new(pattern) {
                 Ok(re) => re.is_match(raw),
                 Err(_) => false,
             },
@@ -141,12 +153,16 @@ pub enum GroupBy {
     Publisher,
     /// Bucket by tag stem. For each tag matching `<prefix>` or
     /// `<prefix>.<rest>`, the bucket key is the next dotted segment
-    /// after the prefix. `TagStem("hardware.gpu")` over a tag set
-    /// containing `"hardware.gpu.h100"` and `"hardware.gpu.a100"`
-    /// produces buckets `"h100"` and `"a100"`. Bare `"hardware.gpu"`
-    /// itself produces the bucket `"(present)"` so presence-only tags
-    /// don't disappear.
-    TagStem(String),
+    /// after the prefix. `TagStem { prefix: "hardware.gpu" }` over a
+    /// tag set containing `"hardware.gpu.h100"` and
+    /// `"hardware.gpu.a100"` produces buckets `"h100"` and `"a100"`.
+    /// Bare `"hardware.gpu"` itself produces the bucket `"(present)"`
+    /// so presence-only tags don't disappear.
+    TagStem {
+        /// Prefix that an entry's tag must start with for the stem
+        /// extraction to apply.
+        prefix: String,
+    },
     /// Bucket by the value of a specific axis-key. For each
     /// `AxisValue { axis, key, value }` tag on the entry matching the
     /// requested `(axis, key)`, the bucket key is the captured value.
@@ -178,7 +194,7 @@ impl GroupBy {
                     .unwrap_or_else(|| "(none)".to_string()),
             ],
             Self::Publisher => vec![format!("0x{:x}", publisher)],
-            Self::TagStem(prefix) => {
+            Self::TagStem { prefix } => {
                 let mut buckets: Vec<String> = membership
                     .tags
                     .iter()
@@ -225,23 +241,33 @@ pub enum Aggregation {
         key: String,
     },
     /// Sum the numeric value of `<axis_key>=<n>` tags across the
-    /// bucket. The argument is the canonical dotted axis-key
-    /// (e.g. `"hardware.gpu.count"`); only `AxisValue` tags whose
-    /// `(axis, key)` matches are considered. Values that don't parse
-    /// as `u64` are skipped silently. Saturating addition — overflow
-    /// caps at `u64::MAX` rather than panicking.
-    SumNumericTag(String),
+    /// bucket. The `axis_key` field is the canonical dotted
+    /// axis-key (e.g. `"hardware.gpu.count"`); only `AxisValue`
+    /// tags whose `(axis, key)` matches are considered. Values
+    /// that don't parse as `u64` are skipped silently. Saturating
+    /// addition — overflow caps at `u64::MAX` rather than
+    /// panicking.
+    SumNumericTag {
+        /// Canonical `<axis>.<key>` of the numeric-value tag to sum.
+        axis_key: String,
+    },
     /// Minimum observed numeric value of an `<axis_key>=<n>` tag
     /// across the bucket. Returns `0` when no parseable values are
     /// observed in the bucket (an operator who needs to distinguish
     /// "no values observed" from "min is 0" should use
     /// `capacity_ranking` with `sum_axis_key`, which surfaces
     /// `Option<u64>`).
-    MinNumericTag(String),
+    MinNumericTag {
+        /// Canonical `<axis>.<key>` of the numeric-value tag to min.
+        axis_key: String,
+    },
     /// Maximum observed numeric value of an `<axis_key>=<n>` tag
     /// across the bucket. Returns `0` when no parseable values are
     /// observed (same caveat as `MinNumericTag`).
-    MaxNumericTag(String),
+    MaxNumericTag {
+        /// Canonical `<axis>.<key>` of the numeric-value tag to max.
+        axis_key: String,
+    },
 }
 
 impl Fold<CapabilityFold> {
@@ -292,9 +318,9 @@ impl Fold<CapabilityFold> {
                                 }
                             }
                         }
-                        Aggregation::SumNumericTag(axis_key)
-                        | Aggregation::MinNumericTag(axis_key)
-                        | Aggregation::MaxNumericTag(axis_key) => {
+                        Aggregation::SumNumericTag { axis_key }
+                        | Aggregation::MinNumericTag { axis_key }
+                        | Aggregation::MaxNumericTag { axis_key } => {
                             for raw in &membership.tags {
                                 if let Some(n) = numeric_value_for(raw, axis_key) {
                                     slot.numeric_sum = slot.numeric_sum.saturating_add(n);
@@ -323,9 +349,9 @@ impl Fold<CapabilityFold> {
                     Aggregation::Count => slot.count,
                     Aggregation::DistinctPublishers => slot.publishers.len() as u64,
                     Aggregation::DistinctValues { .. } => slot.distinct_values.len() as u64,
-                    Aggregation::SumNumericTag(_) => slot.numeric_sum,
-                    Aggregation::MinNumericTag(_) => slot.numeric_min.unwrap_or(0),
-                    Aggregation::MaxNumericTag(_) => slot.numeric_max.unwrap_or(0),
+                    Aggregation::SumNumericTag { .. } => slot.numeric_sum,
+                    Aggregation::MinNumericTag { .. } => slot.numeric_min.unwrap_or(0),
+                    Aggregation::MaxNumericTag { .. } => slot.numeric_max.unwrap_or(0),
                 };
                 (bucket, v)
             })
@@ -730,7 +756,7 @@ mod tests {
     fn matcher_exact_picks_only_exact_tag() {
         let fold = populated_fold();
         let rows = fold.aggregate(
-            Some(TagMatcher::Exact("software.python=3.11".into())),
+            Some(TagMatcher::Exact { value: "software.python=3.11".into() }),
             GroupBy::Publisher,
             Aggregation::Count,
         );
@@ -744,7 +770,7 @@ mod tests {
         // Every entry has at least one `hardware.gpu*` tag → all three
         // publishers match.
         let rows = fold.aggregate(
-            Some(TagMatcher::Prefix("hardware.gpu".into())),
+            Some(TagMatcher::Prefix { value: "hardware.gpu".into() }),
             GroupBy::Publisher,
             Aggregation::Count,
         );
@@ -755,7 +781,7 @@ mod tests {
     fn matcher_axis_picks_every_entry_in_that_axis() {
         let fold = populated_fold();
         let rows = fold.aggregate(
-            Some(TagMatcher::Axis(TaxonomyAxis::Hardware)),
+            Some(TagMatcher::Axis { axis: TaxonomyAxis::Hardware }),
             GroupBy::Publisher,
             Aggregation::Count,
         );
@@ -876,7 +902,7 @@ mod tests {
         // plus the bare `hardware.gpu` becomes "(present)" for each.
         let rows = fold.aggregate(
             None,
-            GroupBy::TagStem("hardware.gpu".into()),
+            GroupBy::TagStem { prefix: "hardware.gpu".into() },
             Aggregation::Count,
         );
         let map: HashMap<String, u64> = rows.into_iter().collect();
@@ -965,7 +991,7 @@ mod tests {
         // Only h100 publishers, bucketed by region. 0xA + 0xB are both
         // h100 / us-east; 0xC is a100 / us-west and is filtered out.
         let rows = fold.aggregate(
-            Some(TagMatcher::Exact("hardware.gpu.h100".into())),
+            Some(TagMatcher::Exact { value: "hardware.gpu.h100".into() }),
             GroupBy::Region,
             Aggregation::Count,
         );
@@ -983,7 +1009,7 @@ mod tests {
     fn matcher_that_excludes_everything_returns_empty() {
         let fold = populated_fold();
         let rows = fold.aggregate(
-            Some(TagMatcher::Exact("nope".into())),
+            Some(TagMatcher::Exact { value: "nope".into() }),
             GroupBy::Region,
             Aggregation::Count,
         );
@@ -1031,7 +1057,7 @@ mod tests {
         let rows = fold.aggregate(
             None,
             GroupBy::Region,
-            Aggregation::SumNumericTag("hardware.gpu.count".into()),
+            Aggregation::SumNumericTag { axis_key: "hardware.gpu.count".into() },
         );
         assert_eq!(
             rows,
@@ -1077,7 +1103,7 @@ mod tests {
         let rows = fold.aggregate(
             None,
             GroupBy::Region,
-            Aggregation::SumNumericTag("hardware.gpu.count".into()),
+            Aggregation::SumNumericTag { axis_key: "hardware.gpu.count".into() },
         );
         assert_eq!(rows, vec![("r1".to_string(), 8)]);
     }
@@ -1296,7 +1322,7 @@ mod tests {
         // Only h100 publishers (0xA idle + 0xB busy).
         let rows = fold.capacity_ranking(
             CapacityQuery {
-                matcher: Some(TagMatcher::Exact("hardware.gpu.h100".into())),
+                matcher: Some(TagMatcher::Exact { value: "hardware.gpu.h100".into() }),
                 group_by: GroupBy::Region,
                 ..CapacityQuery::default()
             },
@@ -1337,7 +1363,7 @@ mod tests {
         let rows = fold.aggregate(
             // h100 OR a100 (literal dots — these are tag stems, not
             // regex metachars in the user's mental model).
-            Some(TagMatcher::Regex(r"^hardware\.gpu\.(h100|a100)$".into())),
+            Some(TagMatcher::Regex { pattern: r"^hardware\.gpu\.(h100|a100)$".into() }),
             GroupBy::Publisher,
             Aggregation::Count,
         );
@@ -1351,7 +1377,7 @@ mod tests {
         let fold = populated_fold();
         // Unclosed character class — invalid pattern.
         let rows = fold.aggregate(
-            Some(TagMatcher::Regex(r"[unclosed".into())),
+            Some(TagMatcher::Regex { pattern: r"[unclosed".into() }),
             GroupBy::Publisher,
             Aggregation::Count,
         );
@@ -1485,7 +1511,7 @@ mod tests {
         let mins = fold.aggregate(
             None,
             GroupBy::Region,
-            Aggregation::MinNumericTag("hardware.gpu.count".into()),
+            Aggregation::MinNumericTag { axis_key: "hardware.gpu.count".into() },
         );
         assert_eq!(
             mins,
@@ -1494,12 +1520,116 @@ mod tests {
         let maxes = fold.aggregate(
             None,
             GroupBy::Region,
-            Aggregation::MaxNumericTag("hardware.gpu.count".into()),
+            Aggregation::MaxNumericTag { axis_key: "hardware.gpu.count".into() },
         );
         assert_eq!(
             maxes,
             vec![("us-east".to_string(), 8), ("us-west".to_string(), 2)]
         );
+    }
+
+    /// Pin the wire-format JSON shape for cross-binding parity.
+    /// Bindings (TS, Python, Go, C) encode + decode this exact
+    /// shape, so an update to either the field names or the
+    /// `kind` discriminants needs to land in lockstep across
+    /// every binding. The test serializes one example of every
+    /// variant and asserts the byte form is what the bindings
+    /// expect.
+    #[test]
+    fn serde_shapes_match_cross_binding_wire_format() {
+        assert_eq!(
+            serde_json::to_string(&TagMatcher::Exact {
+                value: "software.python=3.11".into()
+            })
+            .unwrap(),
+            r#"{"kind":"exact","value":"software.python=3.11"}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&TagMatcher::Prefix {
+                value: "hardware.gpu".into()
+            })
+            .unwrap(),
+            r#"{"kind":"prefix","value":"hardware.gpu"}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&TagMatcher::Axis {
+                axis: TaxonomyAxis::Hardware
+            })
+            .unwrap(),
+            r#"{"kind":"axis","axis":"hardware"}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&TagMatcher::AxisKey {
+                axis: TaxonomyAxis::Hardware,
+                key: "gpu.count".into()
+            })
+            .unwrap(),
+            r#"{"kind":"axis_key","axis":"hardware","key":"gpu.count"}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&TagMatcher::Regex {
+                pattern: "^a$".into()
+            })
+            .unwrap(),
+            r#"{"kind":"regex","pattern":"^a$"}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&TagMatcher::VersionRange {
+                axis_key: "software.python".into(),
+                min: Some("3.10.0".into()),
+                max: None
+            })
+            .unwrap(),
+            r#"{"kind":"version_range","axis_key":"software.python","min":"3.10.0","max":null}"#,
+        );
+
+        assert_eq!(
+            serde_json::to_string(&GroupBy::Class).unwrap(),
+            r#"{"kind":"class"}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&GroupBy::TagStem {
+                prefix: "hardware.gpu".into()
+            })
+            .unwrap(),
+            r#"{"kind":"tag_stem","prefix":"hardware.gpu"}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&GroupBy::TagValue {
+                axis: TaxonomyAxis::Software,
+                key: "python".into()
+            })
+            .unwrap(),
+            r#"{"kind":"tag_value","axis":"software","key":"python"}"#,
+        );
+
+        assert_eq!(
+            serde_json::to_string(&Aggregation::Count).unwrap(),
+            r#"{"kind":"count"}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&Aggregation::SumNumericTag {
+                axis_key: "hardware.gpu.count".into()
+            })
+            .unwrap(),
+            r#"{"kind":"sum_numeric_tag","axis_key":"hardware.gpu.count"}"#,
+        );
+
+        // Round-trip the full query.
+        let q = CapacityQuery {
+            matcher: Some(TagMatcher::Prefix {
+                value: "hardware.gpu".into(),
+            }),
+            group_by: GroupBy::TagStem {
+                prefix: "hardware.gpu".into(),
+            },
+            max_rtt_ms: Some(50),
+            sum_axis_key: Some("hardware.gpu.count".into()),
+            limit: 5,
+        };
+        let s = serde_json::to_string(&q).unwrap();
+        let back: CapacityQuery = serde_json::from_str(&s).unwrap();
+        assert_eq!(q, back);
     }
 
     #[test]
@@ -1519,7 +1649,7 @@ mod tests {
         let rows = fold.aggregate(
             None,
             GroupBy::Region,
-            Aggregation::MinNumericTag("hardware.gpu.count".into()),
+            Aggregation::MinNumericTag { axis_key: "hardware.gpu.count".into() },
         );
         assert_eq!(
             rows,

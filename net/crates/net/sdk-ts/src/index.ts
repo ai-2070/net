@@ -205,6 +205,19 @@ export {
 export { subnetId, GLOBAL_SUBNET } from './subnets';
 export type { SubnetId, SubnetRule, SubnetPolicy } from './subnets';
 
+// Capability aggregation surface — Phase 6c of
+// `MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`. Bucketed aggregation +
+// capacity-ranked materialized view over the local capability fold.
+export type {
+  Aggregation,
+  AggregateRow,
+  CapacityQuery,
+  CapacityRow,
+  GroupBy,
+  TagMatcher,
+  TaxonomyAxis,
+} from './capability-aggregation';
+
 // Compute (daemons + migration — Stage 3 + 4).
 export {
   DaemonRuntime,

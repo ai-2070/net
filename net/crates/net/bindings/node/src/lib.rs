@@ -8,6 +8,7 @@
 // separately would only enable combinations that aren't meaningful.
 #[cfg(feature = "dataforts")]
 mod blob;
+mod capability_aggregation;
 #[cfg(feature = "net")]
 mod capabilities;
 #[cfg(any(
@@ -1885,6 +1886,58 @@ mod mesh_bindings {
                 node.find_nodes_by_filter_scoped(&core, f)
             });
             Ok(ids.into_iter().map(BigInt::from).collect())
+        }
+
+        /// Bucketed aggregation over the local capability fold —
+        /// `Fold::aggregate(matcher, groupBy, agg)`. Arguments are
+        /// JSON-encoded tagged unions; the TS SDK ships ergonomic
+        /// constructors. Returns
+        /// `[{ bucket: string, value: bigint }]` sorted lex by bucket.
+        ///
+        /// `matcherJson = null` walks every entry. Phase 6c-A of
+        /// `MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`.
+        #[napi]
+        pub fn capability_aggregate(
+            &self,
+            matcher_json: Option<String>,
+            group_by_json: String,
+            aggregation_json: String,
+        ) -> Result<Vec<crate::capability_aggregation::AggregateRowJs>> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            crate::capability_aggregation::aggregate(
+                node.capability_fold(),
+                matcher_json,
+                group_by_json,
+                aggregation_json,
+            )
+        }
+
+        /// Capacity-ranked materialized view over the local
+        /// capability fold — `Fold::capacity_ranking(query,
+        /// rttLookup)`. `queryJson` is a JSON-encoded
+        /// `CapacityQuery`; `rttEntries` is the materialized RTT map
+        /// (`null`/empty disables the RTT filter regardless of
+        /// `query.maxRttMs`). Faulty entries are always excluded;
+        /// rows return sorted by `available` desc, ties broken by
+        /// bucket asc, truncated to `query.limit`.
+        ///
+        /// Phase 6c-B of `MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`.
+        /// The plan flags a `ThreadsafeFunction` closure variant as
+        /// the natural shape for TS; that ships as a follow-up.
+        #[napi]
+        pub fn capability_capacity_ranking(
+            &self,
+            query_json: String,
+            rtt_entries: Option<Vec<crate::capability_aggregation::RttEntryJs>>,
+        ) -> Result<Vec<crate::capability_aggregation::CapacityRowJs>> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            crate::capability_aggregation::capacity_ranking(
+                node.capability_fold(),
+                query_json,
+                rtt_entries,
+            )
         }
 
         /// Shutdown the mesh node.
