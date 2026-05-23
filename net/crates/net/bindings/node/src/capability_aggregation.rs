@@ -30,10 +30,10 @@ use std::collections::HashMap;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
+use net::adapter::net::behavior::fold::CapabilityFold;
 use net::adapter::net::behavior::fold::{
     Aggregation, CapacityQuery, CapacityRow, Fold, GroupBy, TagMatcher,
 };
-use net::adapter::net::behavior::fold::CapabilityFold;
 
 /// One row of an `aggregate` result. Mirrors the
 /// `Vec<(String, u64)>` shape the Rust core returns but JS-friendly
@@ -142,9 +142,8 @@ pub(crate) fn capacity_ranking(
         })
         .unwrap_or_default();
 
-    let rows: Vec<CapacityRow> = fold.capacity_ranking(query, |node_id| {
-        rtt_map.get(&node_id).copied()
-    });
+    let rows: Vec<CapacityRow> =
+        fold.capacity_ranking(query, |node_id| rtt_map.get(&node_id).copied());
     Ok(rows
         .into_iter()
         .map(|r| CapacityRowJs {

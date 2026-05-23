@@ -99,10 +99,12 @@ impl TagMatcher {
         match self {
             Self::Exact { value } => raw == value,
             Self::Prefix { value } => raw.starts_with(value),
-            Self::Axis { axis } => Tag::parse(raw)
-                .ok()
-                .and_then(|t| t.axis_key().map(|k| k.axis))
-                == Some(*axis),
+            Self::Axis { axis } => {
+                Tag::parse(raw)
+                    .ok()
+                    .and_then(|t| t.axis_key().map(|k| k.axis))
+                    == Some(*axis)
+            }
             Self::AxisKey { axis, key } => Tag::parse(raw)
                 .ok()
                 .and_then(|t| t.axis_key())
@@ -179,20 +181,14 @@ impl GroupBy {
     /// Compute the bucket keys this entry contributes to. Returns a
     /// `Vec` since `TagStem` / `TagValue` may produce multiple
     /// buckets per entry.
-    fn bucket_keys(
-        &self,
-        membership: &CapabilityMembership,
-        publisher: NodeId,
-    ) -> Vec<String> {
+    fn bucket_keys(&self, membership: &CapabilityMembership, publisher: NodeId) -> Vec<String> {
         match self {
             Self::Class => vec![format!("0x{:x}", membership.class_hash)],
             Self::State => vec![state_label(membership.state).to_string()],
-            Self::Region => vec![
-                membership
-                    .region
-                    .clone()
-                    .unwrap_or_else(|| "(none)".to_string()),
-            ],
+            Self::Region => vec![membership
+                .region
+                .clone()
+                .unwrap_or_else(|| "(none)".to_string())],
             Self::Publisher => vec![format!("0x{:x}", publisher)],
             Self::TagStem { prefix } => {
                 let mut buckets: Vec<String> = membership
@@ -324,12 +320,10 @@ impl Fold<CapabilityFold> {
                             for raw in &membership.tags {
                                 if let Some(n) = numeric_value_for(raw, axis_key) {
                                     slot.numeric_sum = slot.numeric_sum.saturating_add(n);
-                                    slot.numeric_min = Some(
-                                        slot.numeric_min.map_or(n, |cur| cur.min(n)),
-                                    );
-                                    slot.numeric_max = Some(
-                                        slot.numeric_max.map_or(n, |cur| cur.max(n)),
-                                    );
+                                    slot.numeric_min =
+                                        Some(slot.numeric_min.map_or(n, |cur| cur.min(n)));
+                                    slot.numeric_max =
+                                        Some(slot.numeric_max.map_or(n, |cur| cur.max(n)));
                                     slot.numeric_present = true;
                                 }
                             }
@@ -439,17 +433,12 @@ impl Fold<CapabilityFold> {
                     match membership.state {
                         NodeState::Idle => slot.idle = slot.idle.saturating_add(1),
                         NodeState::Busy => slot.busy = slot.busy.saturating_add(1),
-                        NodeState::Reserved => {
-                            slot.reserved = slot.reserved.saturating_add(1)
-                        }
+                        NodeState::Reserved => slot.reserved = slot.reserved.saturating_add(1),
                         NodeState::Faulty => unreachable!("filtered above"),
                     }
                     if let Some(c) = entry_capacity {
-                        slot.summed_capacity = Some(
-                            slot.summed_capacity
-                                .unwrap_or(0)
-                                .saturating_add(c),
-                        );
+                        slot.summed_capacity =
+                            Some(slot.summed_capacity.unwrap_or(0).saturating_add(c));
                     }
                 }
             }
@@ -756,7 +745,9 @@ mod tests {
     fn matcher_exact_picks_only_exact_tag() {
         let fold = populated_fold();
         let rows = fold.aggregate(
-            Some(TagMatcher::Exact { value: "software.python=3.11".into() }),
+            Some(TagMatcher::Exact {
+                value: "software.python=3.11".into(),
+            }),
             GroupBy::Publisher,
             Aggregation::Count,
         );
@@ -770,7 +761,9 @@ mod tests {
         // Every entry has at least one `hardware.gpu*` tag → all three
         // publishers match.
         let rows = fold.aggregate(
-            Some(TagMatcher::Prefix { value: "hardware.gpu".into() }),
+            Some(TagMatcher::Prefix {
+                value: "hardware.gpu".into(),
+            }),
             GroupBy::Publisher,
             Aggregation::Count,
         );
@@ -781,7 +774,9 @@ mod tests {
     fn matcher_axis_picks_every_entry_in_that_axis() {
         let fold = populated_fold();
         let rows = fold.aggregate(
-            Some(TagMatcher::Axis { axis: TaxonomyAxis::Hardware }),
+            Some(TagMatcher::Axis {
+                axis: TaxonomyAxis::Hardware,
+            }),
             GroupBy::Publisher,
             Aggregation::Count,
         );
@@ -850,10 +845,7 @@ mod tests {
     fn group_by_state_buckets_idle_busy_reserved_faulty() {
         let fold = populated_fold();
         let rows = fold.aggregate(None, GroupBy::State, Aggregation::Count);
-        assert_eq!(
-            rows,
-            vec![("busy".to_string(), 1), ("idle".to_string(), 2)]
-        );
+        assert_eq!(rows, vec![("busy".to_string(), 1), ("idle".to_string(), 2)]);
     }
 
     #[test]
@@ -902,7 +894,9 @@ mod tests {
         // plus the bare `hardware.gpu` becomes "(present)" for each.
         let rows = fold.aggregate(
             None,
-            GroupBy::TagStem { prefix: "hardware.gpu".into() },
+            GroupBy::TagStem {
+                prefix: "hardware.gpu".into(),
+            },
             Aggregation::Count,
         );
         let map: HashMap<String, u64> = rows.into_iter().collect();
@@ -923,10 +917,7 @@ mod tests {
             },
             Aggregation::Count,
         );
-        assert_eq!(
-            rows,
-            vec![("3.11".to_string(), 2), ("3.12".to_string(), 1)]
-        );
+        assert_eq!(rows, vec![("3.11".to_string(), 2), ("3.12".to_string(), 1)]);
     }
 
     // ── Aggregation variants ───────────────────────────────────
@@ -958,8 +949,7 @@ mod tests {
         let by_count = fold.aggregate(None, GroupBy::Region, Aggregation::Count);
         assert_eq!(by_count, vec![("us-east".to_string(), 3)]);
 
-        let by_publishers =
-            fold.aggregate(None, GroupBy::Region, Aggregation::DistinctPublishers);
+        let by_publishers = fold.aggregate(None, GroupBy::Region, Aggregation::DistinctPublishers);
         assert_eq!(by_publishers, vec![("us-east".to_string(), 2)]);
     }
 
@@ -991,7 +981,9 @@ mod tests {
         // Only h100 publishers, bucketed by region. 0xA + 0xB are both
         // h100 / us-east; 0xC is a100 / us-west and is filtered out.
         let rows = fold.aggregate(
-            Some(TagMatcher::Exact { value: "hardware.gpu.h100".into() }),
+            Some(TagMatcher::Exact {
+                value: "hardware.gpu.h100".into(),
+            }),
             GroupBy::Region,
             Aggregation::Count,
         );
@@ -1009,7 +1001,9 @@ mod tests {
     fn matcher_that_excludes_everything_returns_empty() {
         let fold = populated_fold();
         let rows = fold.aggregate(
-            Some(TagMatcher::Exact { value: "nope".into() }),
+            Some(TagMatcher::Exact {
+                value: "nope".into(),
+            }),
             GroupBy::Region,
             Aggregation::Count,
         );
@@ -1057,7 +1051,9 @@ mod tests {
         let rows = fold.aggregate(
             None,
             GroupBy::Region,
-            Aggregation::SumNumericTag { axis_key: "hardware.gpu.count".into() },
+            Aggregation::SumNumericTag {
+                axis_key: "hardware.gpu.count".into(),
+            },
         );
         assert_eq!(
             rows,
@@ -1103,7 +1099,9 @@ mod tests {
         let rows = fold.aggregate(
             None,
             GroupBy::Region,
-            Aggregation::SumNumericTag { axis_key: "hardware.gpu.count".into() },
+            Aggregation::SumNumericTag {
+                axis_key: "hardware.gpu.count".into(),
+            },
         );
         assert_eq!(rows, vec![("r1".to_string(), 8)]);
     }
@@ -1266,15 +1264,8 @@ mod tests {
             fold.apply(sign(&kp, nid, 0x100, &[], NodeState::Idle, Some("us-east")))
                 .unwrap();
         }
-        fold.apply(sign(
-            &kp,
-            10,
-            0x100,
-            &[],
-            NodeState::Idle,
-            Some("us-west"),
-        ))
-        .unwrap();
+        fold.apply(sign(&kp, 10, 0x100, &[], NodeState::Idle, Some("us-west")))
+            .unwrap();
         for nid in [100u64, 101, 102] {
             fold.apply(sign(&kp, nid, 0x100, &[], NodeState::Idle, Some("eu-west")))
                 .unwrap();
@@ -1322,7 +1313,9 @@ mod tests {
         // Only h100 publishers (0xA idle + 0xB busy).
         let rows = fold.capacity_ranking(
             CapacityQuery {
-                matcher: Some(TagMatcher::Exact { value: "hardware.gpu.h100".into() }),
+                matcher: Some(TagMatcher::Exact {
+                    value: "hardware.gpu.h100".into(),
+                }),
                 group_by: GroupBy::Region,
                 ..CapacityQuery::default()
             },
@@ -1363,7 +1356,9 @@ mod tests {
         let rows = fold.aggregate(
             // h100 OR a100 (literal dots — these are tag stems, not
             // regex metachars in the user's mental model).
-            Some(TagMatcher::Regex { pattern: r"^hardware\.gpu\.(h100|a100)$".into() }),
+            Some(TagMatcher::Regex {
+                pattern: r"^hardware\.gpu\.(h100|a100)$".into(),
+            }),
             GroupBy::Publisher,
             Aggregation::Count,
         );
@@ -1377,7 +1372,9 @@ mod tests {
         let fold = populated_fold();
         // Unclosed character class — invalid pattern.
         let rows = fold.aggregate(
-            Some(TagMatcher::Regex { pattern: r"[unclosed".into() }),
+            Some(TagMatcher::Regex {
+                pattern: r"[unclosed".into(),
+            }),
             GroupBy::Publisher,
             Aggregation::Count,
         );
@@ -1511,7 +1508,9 @@ mod tests {
         let mins = fold.aggregate(
             None,
             GroupBy::Region,
-            Aggregation::MinNumericTag { axis_key: "hardware.gpu.count".into() },
+            Aggregation::MinNumericTag {
+                axis_key: "hardware.gpu.count".into(),
+            },
         );
         assert_eq!(
             mins,
@@ -1520,7 +1519,9 @@ mod tests {
         let maxes = fold.aggregate(
             None,
             GroupBy::Region,
-            Aggregation::MaxNumericTag { axis_key: "hardware.gpu.count".into() },
+            Aggregation::MaxNumericTag {
+                axis_key: "hardware.gpu.count".into(),
+            },
         );
         assert_eq!(
             maxes,
@@ -1649,7 +1650,9 @@ mod tests {
         let rows = fold.aggregate(
             None,
             GroupBy::Region,
-            Aggregation::MinNumericTag { axis_key: "hardware.gpu.count".into() },
+            Aggregation::MinNumericTag {
+                axis_key: "hardware.gpu.count".into(),
+            },
         );
         assert_eq!(
             rows,

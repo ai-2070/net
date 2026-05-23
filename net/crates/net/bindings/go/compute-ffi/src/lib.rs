@@ -3097,9 +3097,7 @@ pub extern "C" fn net_capability_aggregate(
     // Project to the row shape Go expects.
     let rows_out: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(bucket, value)| {
-            serde_json::json!({"bucket": bucket, "value": value})
-        })
+        .map(|(bucket, value)| serde_json::json!({"bucket": bucket, "value": value}))
         .collect();
     let s = match serde_json::to_string(&rows_out) {
         Ok(s) => s,

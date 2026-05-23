@@ -829,7 +829,9 @@ impl Mesh {
         group_by: crate::capabilities::GroupBy,
         agg: crate::capabilities::Aggregation,
     ) -> Vec<(String, u64)> {
-        self.node.capability_fold().aggregate(matcher, group_by, agg)
+        self.node
+            .capability_fold()
+            .aggregate(matcher, group_by, agg)
     }
 
     /// Capacity-ranked materialized view. Wraps

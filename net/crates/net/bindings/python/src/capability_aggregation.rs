@@ -38,18 +38,17 @@ pub(crate) fn aggregate(
     group_by_json: &str,
     aggregation_json: &str,
 ) -> PyResult<Py<PyAny>> {
-    let matcher: Option<TagMatcher> = match matcher_json {
-        Some(s) => Some(serde_json::from_str(s).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("matcher JSON: {e}"))
-        })?),
-        None => None,
-    };
-    let group_by: GroupBy = serde_json::from_str(group_by_json).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("group_by JSON: {e}"))
-    })?;
-    let agg: Aggregation = serde_json::from_str(aggregation_json).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("aggregation JSON: {e}"))
-    })?;
+    let matcher: Option<TagMatcher> =
+        match matcher_json {
+            Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("matcher JSON: {e}"))
+            })?),
+            None => None,
+        };
+    let group_by: GroupBy = serde_json::from_str(group_by_json)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("group_by JSON: {e}")))?;
+    let agg: Aggregation = serde_json::from_str(aggregation_json)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("aggregation JSON: {e}")))?;
 
     let rows = fold.aggregate(matcher, group_by, agg);
 
@@ -74,9 +73,8 @@ pub(crate) fn capacity_ranking(
     query_json: &str,
     rtt_map: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
-    let query: CapacityQuery = serde_json::from_str(query_json).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("CapacityQuery JSON: {e}"))
-    })?;
+    let query: CapacityQuery = serde_json::from_str(query_json)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("CapacityQuery JSON: {e}")))?;
 
     let rtt_lookup: HashMap<u64, u32> = match rtt_map {
         Some(d) => {

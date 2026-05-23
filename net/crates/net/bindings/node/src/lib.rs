@@ -8,9 +8,9 @@
 // separately would only enable combinations that aren't meaningful.
 #[cfg(feature = "dataforts")]
 mod blob;
-mod capability_aggregation;
 #[cfg(feature = "net")]
 mod capabilities;
+mod capability_aggregation;
 #[cfg(any(
     feature = "meshdb",
     feature = "cortex",
