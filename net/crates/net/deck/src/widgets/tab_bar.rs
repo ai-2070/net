@@ -20,26 +20,36 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, current: Tab) {
     let brand = Line::from(vec![Span::styled("DECK  ", theme::green_hi())]);
     frame.render_widget(Paragraph::new(brand), cols[0]);
 
-    // Tab key glyphs: 1..=9 for the first 9 slots, then `0`
-    // for the 10th (LOGS) — mirrors the numeric jump key
-    // handler in app.rs. Tabs beyond `PRIMARY_COUNT` (the
-    // SUBNETS / GATEWAYS / AGGREGATORS / AUDIT trailing
-    // group) render with no key prefix; they're reachable via
-    // letter shortcuts (`H`/`V`/`B`/`U`) only.
-    let key_for = |i: usize| -> String {
-        if i >= Tab::PRIMARY_COUNT {
-            String::new()
-        } else if i == 9 {
-            "[0] ".to_string()
-        } else {
-            format!("[{}] ", i + 1)
+    // Tab key glyphs: numeric prefixes `[1]`..`[9]` plus `[0]`
+    // (LOGS) for the primary slots — mirrors the numeric jump
+    // handler in app.rs. The trailing SUBNETS / GATEWAYS /
+    // AGGREGATORS / AUDIT group renders with its letter
+    // shortcut (`[H]`/`[V]`/`[B]`/`[U]`) so the operator can
+    // see the keystroke alongside the label.
+    let key_for = |i: usize, tab: Tab| -> String {
+        if i < Tab::PRIMARY_COUNT {
+            return if i == 9 {
+                "[0] ".to_string()
+            } else {
+                format!("[{}] ", i + 1)
+            };
         }
+        let letter = match tab {
+            Tab::Subnets => 'H',
+            Tab::Gateways => 'V',
+            Tab::Aggregators => 'B',
+            Tab::Audit => 'U',
+            // Any future trailing tab without a letter falls
+            // through to label-only.
+            _ => return String::new(),
+        };
+        format!("[{letter}] ")
     };
 
     let tabs: Vec<(String, &'static str)> = Tab::all()
         .iter()
         .enumerate()
-        .map(|(i, t)| (key_for(i), t.label()))
+        .map(|(i, t)| (key_for(i, *t), t.label()))
         .collect();
     // ASCII so byte length == cell width. Entry width is
     // `[N] LABEL ` — key + label + trailing space.
