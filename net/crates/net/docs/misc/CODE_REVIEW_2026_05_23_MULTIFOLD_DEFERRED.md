@@ -1,10 +1,10 @@
 # Code review — `multifolds` branch — deferred items (2026-05-23)
 
 Branch base: `master`.
-Branch tip after the cleanup pass: `d2a19e12` ("refactor(capability_aggregation): drop dead numeric_present field").
+Initial branch tip after the cleanup pass: `d2a19e12` ("refactor(capability_aggregation): drop dead numeric_present field").
 Scope of the pass: changes since `6ea31ba5` (~88 files, +9,876 / −7,889). Multifold phase 3b CapabilityIndex deletion + phase 6c capability-aggregation surface in Rust/TS/Python/Go/C.
 
-Three review agents (reuse / quality / efficiency) were dispatched in parallel. Eight fixes landed in commits `b18e3840`..`d2a19e12`. The items below were surfaced but deliberately deferred — each needs either a product decision or is a wider change that doesn't belong bundled with the cleanup pass.
+Three review agents (reuse / quality / efficiency) were dispatched in parallel. Eight fixes landed in commits `b18e3840`..`d2a19e12`. The ten items below were initially deferred, then resolved in a follow-up pass — see commits `90f37d0f`..`a02ec3f9` for the per-item changes.
 
 Tagged `[B | H | M | L]`:
 
@@ -19,16 +19,16 @@ Tagged `[B | H | M | L]`:
 
 | ID    | Pri | Area                | Title                                                                            | Status |
 |-------|-----|---------------------|----------------------------------------------------------------------------------|--------|
-| MD-1  | H   | bridge              | `apply_legacy_announcement` silently drops `fold.apply` errors at ~30 callsites  | ⏳ |
-| MD-2  | M   | sdk-go              | Two near-identical Go aggregation surfaces (336 LOC each)                        | ⏳ |
-| MD-3  | M   | mesh hot path       | `find_best_node*` re-synthesizes caps twice per `max_by` comparison              | ⏳ |
-| MD-4  | M   | placement           | `LegacyPlacement::placement_score` is quadratic in candidate count               | ⏳ |
-| MD-5  | M   | planner             | `planner.rs::collect_coverage` takes N+1 `with_state` locks                      | ⏳ |
-| MD-6  | L   | scope helper        | `scope_from_membership_tags` duplicates dead `scope_from_tags`                   | ⏳ |
-| MD-7  | L   | aggregation         | `axis_value_for` and `string_value_for_axis_key` near-duplicates                 | ⏳ |
-| MD-8  | L   | aggregation         | `TagMatcher::Regex` recompiles regex per `matches_one` call                      | ⏳ |
-| MD-9  | L   | aggregation hot loop | Per-bucket aggregation match dispatched once per entry per bucket               | ⏳ |
-| MD-10 | L   | mod re-export       | `CapabilityIndexInner` exposed `pub` but only used inside `fold/`                | ⏳ |
+| MD-1  | H   | bridge              | `apply_legacy_announcement` silently drops `fold.apply` errors at ~30 callsites  | ✅ `90052eb1` (returns `Result<ApplyOutcome, FoldError>`; all callsites use `.expect`) |
+| MD-2  | M   | sdk-go              | Two near-identical Go aggregation surfaces (336 LOC each)                        | ✅ `a02ec3f9` (dropped vendor-template duplicate; `/go/` is canonical) |
+| MD-3  | M   | mesh hot path       | `find_best_node*` re-synthesizes caps twice per `max_by` comparison              | ✅ `64bd32c3` (memoize via `best_by_score` helper) |
+| MD-4  | M   | placement           | `LegacyPlacement::placement_score` is quadratic in candidate count               | ✅ `b84698f0` (per-target `target_matches_filter`) |
+| MD-5  | M   | planner             | `planner.rs::collect_coverage` takes N+1 `with_state` locks                      | ✅ `461711ac` (batched `capability_tags_for_all`) |
+| MD-6  | L   | scope helper        | `scope_from_membership_tags` duplicates dead `scope_from_tags`                   | ✅ `18efa4e1` (deleted dead helper + its tests; redirected doc refs) |
+| MD-7  | L   | aggregation         | `axis_value_for` and `string_value_for_axis_key` near-duplicates                 | ✅ `6ea489a8` (delegate via shared `split_axis_key`) |
+| MD-8  | L   | aggregation         | `TagMatcher::Regex` recompiles regex per `matches_one` call                      | ✅ `bb09af8f` (precompile via `CompiledMatcher`) |
+| MD-9  | L   | aggregation hot loop | Per-bucket aggregation match dispatched once per entry per bucket               | ✅ `fb84cd08` (hoist axis-key split via `CompiledAgg`) |
+| MD-10 | L   | mod re-export       | `CapabilityIndexInner` exposed `pub` but only used inside `fold/`                | ✅ `90f37d0f` (dropped from `mod.rs` re-exports) |
 
 ---
 
