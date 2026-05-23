@@ -11,18 +11,17 @@
 //!
 //! # Trait shape
 //!
-//! - `on_start(&self)` — spawn whatever background work the
-//!   daemon needs. Called exactly once per `(replica, mesh)`
-//!   pair before any other lifecycle method.
+//! - `on_start(self: Arc<Self>)` — spawn whatever background
+//!   work the daemon needs. Called exactly once per `(replica,
+//!   mesh)` pair before any other lifecycle method. Takes
+//!   `Arc<Self>` so implementations can hand the daemon to a
+//!   background tokio task without storing weak refs.
 //! - `on_stop(&self)` — signal the background work to stop.
 //!   Called exactly once after all references to the daemon are
 //!   about to drop. Idempotent in practice; the
 //!   [`LifecycleHandle`] only calls it once.
 //!
-//! Implementations may park work on a tokio task internally —
-//! [`AggregatorDaemon`](super::AggregatorDaemon) does exactly
-//! that via its [`spawn`](super::AggregatorDaemon::spawn)
-//! method. The trait surface is intentionally minimal so future
+//! The trait surface is intentionally minimal so future
 //! lifecycle hooks (`on_pause`, `on_drain`, etc.) can land
 //! without breaking existing impls.
 
@@ -44,9 +43,11 @@ pub trait LifecycleDaemon: Send + Sync + 'static {
     /// Called once when a [`LifecycleHandle`] wrapping `self`
     /// is created. Implementations spawn whatever long-running
     /// background work they need (a tokio interval loop, a
-    /// subscription handler, etc.). Errors abort the lifecycle
+    /// subscription handler, etc.). Receives `Arc<Self>` so
+    /// implementations can move the daemon into a spawned task
+    /// without weak-ref gymnastics. Errors abort the lifecycle
     /// — the handle isn't created.
-    async fn on_start(&self) -> Result<(), LifecycleError>;
+    async fn on_start(self: Arc<Self>) -> Result<(), LifecycleError>;
 
     /// Called once when a [`LifecycleHandle`] wrapping `self`
     /// is dropped. Implementations signal their background work
@@ -98,7 +99,7 @@ impl LifecycleHandle {
     /// against the async runtime. Errors abort — the handle is
     /// never created if start fails.
     pub async fn start(daemon: Arc<dyn LifecycleDaemon>) -> Result<Self, LifecycleError> {
-        daemon.on_start().await?;
+        Arc::clone(&daemon).on_start().await?;
         Ok(Self {
             daemon: daemon.clone(),
             daemon_for_drop: Some(daemon),
@@ -158,7 +159,7 @@ mod tests {
         fn name(&self) -> &str {
             "counting"
         }
-        async fn on_start(&self) -> Result<(), LifecycleError> {
+        async fn on_start(self: Arc<Self>) -> Result<(), LifecycleError> {
             self.starts.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
@@ -189,7 +190,7 @@ mod tests {
         fn name(&self) -> &str {
             "failing"
         }
-        async fn on_start(&self) -> Result<(), LifecycleError> {
+        async fn on_start(self: Arc<Self>) -> Result<(), LifecycleError> {
             Err(LifecycleError::StartFailed("intentional".into()))
         }
         async fn on_stop(&self) {}

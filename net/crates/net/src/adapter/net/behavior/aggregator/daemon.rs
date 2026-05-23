@@ -401,57 +401,9 @@ impl LifecycleDaemon for AggregatorDaemon {
         "aggregator"
     }
 
-    async fn on_start(&self) -> Result<(), LifecycleError> {
-        // Bridge the lifecycle hook to the existing
-        // `Arc<Self>::spawn` path: re-acquire the Arc via the
-        // shared `Arc<MeshNode>` clone trick? No — we need an
-        // `Arc<AggregatorDaemon>` to spawn. The lifecycle
-        // callers wrap the daemon in `Arc<dyn LifecycleDaemon>`
-        // and call `on_start` through it; the concrete Arc isn't
-        // recoverable here without `Arc::clone` on the trait
-        // object.
-        //
-        // Workaround: spawn a self-contained loop that holds
-        // weak refs to the daemon's state. Same shape as the
-        // existing `spawn` but reachable from `&self`.
-        let interval = self.config.summary_interval;
-        let shutdown = self.shutdown.clone();
-        let generation = self.generation.clone();
-        let latest = self.latest.clone();
-        let summarizers = self.summarizers.clone();
-        let fold_kinds = self.config.fold_kinds.clone();
-        let source_subnet = self.config.source_subnet;
-        let mesh = self.mesh.clone();
-        let summary_visibility = self.config.summary_visibility;
-        let handle = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.tick().await;
-            loop {
-                if shutdown.load(Ordering::Acquire) {
-                    return;
-                }
-                ticker.tick().await;
-                let result = run_one_tick(
-                    &mesh,
-                    &fold_kinds,
-                    &summarizers,
-                    &generation,
-                    &latest,
-                    source_subnet,
-                    summary_visibility,
-                )
-                .await;
-                if let Err(e) = result {
-                    tracing::warn!(
-                        error = %e,
-                        source_subnet = %source_subnet,
-                        "aggregator: lifecycle tick_and_publish failed; loop continues",
-                    );
-                }
-            }
-        });
-        let mut slot = self.background.lock();
-        *slot = Some(handle);
+    async fn on_start(self: Arc<Self>) -> Result<(), LifecycleError> {
+        let handle = self.clone().spawn();
+        *self.background.lock() = Some(handle);
         Ok(())
     }
 
@@ -466,72 +418,6 @@ impl LifecycleDaemon for AggregatorDaemon {
             let _ = tokio::time::timeout(deadline, h).await;
         }
     }
-}
-
-/// Pure helper used by the `LifecycleDaemon::on_start` loop —
-/// mirrors [`AggregatorDaemon::tick_and_publish`] but operates
-/// against borrowed handles so the spawned task doesn't need an
-/// `Arc<AggregatorDaemon>`. Kept private to the daemon module.
-#[allow(clippy::too_many_arguments)]
-async fn run_one_tick(
-    mesh: &Arc<MeshNode>,
-    fold_kinds: &[u16],
-    summarizers: &HashMap<u16, Arc<dyn Summarizer>>,
-    generation: &Arc<AtomicU64>,
-    latest: &Arc<RwLock<Vec<SummaryAnnouncement>>>,
-    source_subnet: crate::adapter::net::subnet::SubnetId,
-    _summary_visibility: crate::adapter::net::Visibility,
-) -> Result<usize, AggregatorPublishError> {
-    let gen = generation.fetch_add(1, Ordering::AcqRel) + 1;
-    let mut batch: Vec<SummaryAnnouncement> = Vec::new();
-    for kind in fold_kinds {
-        let Some(summarizer) = summarizers.get(kind) else {
-            continue;
-        };
-        let summaries = if *kind == CapabilityFold::KIND_ID {
-            let fold = mesh.capability_fold();
-            let handle = CapabilityFoldHandle(fold);
-            let ctx = SummarizerContext {
-                source_subnet,
-                generation: gen,
-                fold: &handle as &dyn FoldHandle,
-            };
-            summarizer.summarize(&ctx)
-        } else if *kind == ReservationFold::KIND_ID {
-            let fold = mesh.reservation_fold();
-            let handle = ReservationFoldHandle(fold);
-            let ctx = SummarizerContext {
-                source_subnet,
-                generation: gen,
-                fold: &handle as &dyn FoldHandle,
-            };
-            summarizer.summarize(&ctx)
-        } else {
-            Vec::new()
-        };
-        batch.extend(summaries);
-    }
-    let mut published = 0;
-    for summary in &batch {
-        let name = format!("summary/{:#06x}", summary.fold_kind);
-        let channel = ChannelName::new(&name)
-            .map_err(|e| AggregatorPublishError::InvalidChannelName(format!("{name}: {e:?}")))?;
-        let publisher = mesh.channel_publisher(channel, PublishConfig::default());
-        let bytes = postcard::to_allocvec(summary)
-            .map_err(|e| AggregatorPublishError::Encode(format!("{e:?}")))?;
-        mesh.publish(&publisher, Bytes::from(bytes))
-            .await
-            .map_err(AggregatorPublishError::Publish)?;
-        published += 1;
-    }
-    let mut latest_guard = latest.write();
-    for s in batch {
-        if latest_guard.len() >= LATEST_SUMMARIES_CAP {
-            latest_guard.remove(0);
-        }
-        latest_guard.push(s);
-    }
-    Ok(published)
 }
 
 #[cfg(test)]
@@ -939,11 +825,13 @@ mod tests {
         let cfg = AggregatorConfig::new(SubnetId::GLOBAL)
             .with_fold_kind(CapabilityFold::KIND_ID)
             .with_interval(Duration::from_millis(15));
-        let agg = AggregatorDaemon::new(cfg, mesh).expect("new");
-        assert_eq!(LifecycleDaemon::name(&agg), "aggregator");
-        LifecycleDaemon::on_start(&agg).await.expect("on_start");
+        let agg = Arc::new(AggregatorDaemon::new(cfg, mesh).expect("new"));
+        assert_eq!(LifecycleDaemon::name(&*agg), "aggregator");
+        LifecycleDaemon::on_start(agg.clone())
+            .await
+            .expect("on_start");
         tokio::time::sleep(Duration::from_millis(40)).await;
-        LifecycleDaemon::on_stop(&agg).await;
+        LifecycleDaemon::on_stop(&*agg).await;
         let gen_after_first = agg.generation();
         assert!(gen_after_first >= 1);
     }
