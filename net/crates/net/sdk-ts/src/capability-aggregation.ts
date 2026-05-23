@@ -21,8 +21,9 @@
  * with idiomatic discriminated unions.
  */
 
-/** Taxonomy axis — matches the Rust core's `TaxonomyAxis` enum. */
-export type TaxonomyAxis = 'hardware' | 'software' | 'devices' | 'dataforts';
+import type { TaxonomyAxis } from './capability-enhancements';
+
+export type { TaxonomyAxis };
 
 /**
  * Pre-grouping filter. An entry is included if any of its tags
