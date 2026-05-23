@@ -194,7 +194,9 @@ impl PacketBuilder {
         header_bytes[12..16].copy_from_slice(&session_prefix_from_id(self.session_id));
         header_bytes[16..24].copy_from_slice(&counter.to_le_bytes());
 
-        // Patch payload_len to exclude the 16-byte auth tag (bytes 60..62).
+        // Patch payload_len to exclude the 16-byte auth tag (bytes 64..66
+        // post-`WIRE_ORIGIN_HASH_64BIT`; was 60..62 when the header was
+        // 64 bytes and origin_hash was u32).
         // The `as u16` cast is safe under current MAX_PAYLOAD_SIZE
         // (8112 << u16::MAX), but a future config that raised the cap
         // past `u16::MAX + 16` would silently truncate the wire
@@ -208,7 +210,7 @@ impl PacketBuilder {
             self.payload.len() - 16,
         );
         let payload_len = (self.payload.len() - 16) as u16;
-        header_bytes[60..62].copy_from_slice(&payload_len.to_le_bytes());
+        header_bytes[64..66].copy_from_slice(&payload_len.to_le_bytes());
 
         // Assemble packet: header + encrypted_payload + tag
         self.packet.extend_from_slice(&header_bytes);
@@ -284,7 +286,7 @@ impl PacketBuilder {
             self.payload.len() - 16,
         );
         let payload_len = (self.payload.len() - 16) as u16;
-        header_bytes[60..62].copy_from_slice(&payload_len.to_le_bytes());
+        header_bytes[64..66].copy_from_slice(&payload_len.to_le_bytes());
 
         self.packet.extend_from_slice(&header_bytes);
         self.packet.extend_from_slice(&self.payload);
@@ -343,7 +345,7 @@ impl PacketBuilder {
         // payload_len is 0 (the tag rides outside the declared
         // payload length, like every other AEAD-tagged packet).
         let payload_len = 0u16;
-        header_bytes[60..62].copy_from_slice(&payload_len.to_le_bytes());
+        header_bytes[64..66].copy_from_slice(&payload_len.to_le_bytes());
 
         self.packet.extend_from_slice(&header_bytes);
         self.packet.extend_from_slice(&self.payload); // just the 16-byte tag
