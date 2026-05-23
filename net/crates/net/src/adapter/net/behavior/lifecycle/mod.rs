@@ -22,5 +22,5 @@
 pub mod daemon;
 pub mod group;
 
-pub use daemon::{LifecycleDaemon, LifecycleError, LifecycleHandle};
-pub use group::{LifecycleGroup, LifecycleGroupError};
+pub use daemon::{LifecycleDaemon, LifecycleError, LifecycleHandle, ReplicaHealth};
+pub use group::{LifecycleGroup, LifecycleGroupError, ReplicaContext};

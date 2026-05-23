@@ -24,6 +24,47 @@ use std::sync::Arc;
 
 use crate::adapter::net::behavior::capability::CapabilityFilter;
 
+/// Per-replica health snapshot reported by
+/// [`LifecycleDaemon::health`]. Distinct from the substrate's
+/// `DaemonHealth` so lifecycle daemons can carry typed
+/// diagnostic strings without dragging in cross-module
+/// dependencies. The
+/// [`LifecycleGroup::health`](super::group::LifecycleGroup::health)
+/// accessor returns one of these per replica in declaration
+/// order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaHealth {
+    /// True when the daemon's last heartbeat was within its
+    /// liveness window. Implementations that don't carry a
+    /// liveness notion can leave this `true` permanently —
+    /// the default [`LifecycleDaemon::health`] does exactly
+    /// that.
+    pub healthy: bool,
+    /// Daemon-specific diagnostic when `healthy == false`.
+    /// Operator surfaces render this verbatim.
+    pub diagnostic: Option<String>,
+}
+
+impl ReplicaHealth {
+    /// Healthy snapshot with no diagnostic. The default
+    /// [`LifecycleDaemon::health`] impl returns this.
+    pub fn healthy() -> Self {
+        Self {
+            healthy: true,
+            diagnostic: None,
+        }
+    }
+
+    /// Unhealthy snapshot carrying a diagnostic for operator
+    /// rendering.
+    pub fn unhealthy(reason: impl Into<String>) -> Self {
+        Self {
+            healthy: false,
+            diagnostic: Some(reason.into()),
+        }
+    }
+}
+
 /// Async lifecycle trait for native mesh-aware daemons. See
 /// module doc for the trait's intent and the
 /// [`MeshDaemon`](crate::adapter::net::compute::MeshDaemon)
@@ -71,6 +112,19 @@ pub trait LifecycleDaemon: Send + Sync + 'static {
     /// implementations that need to wait for full teardown should
     /// hold a `JoinHandle` internally and await it here.
     async fn on_stop(&self);
+
+    /// Liveness check polled by
+    /// [`LifecycleGroup::health`](super::group::LifecycleGroup::health)
+    /// and the auto-respawn monitor. Default: report healthy
+    /// — daemons that have a heartbeat / tick / generation
+    /// notion override to surface stuck loops to operators.
+    ///
+    /// `async` because some daemons may need to await an
+    /// internal RwLock or query the runtime; most impls are
+    /// fast and non-blocking.
+    async fn health(&self) -> ReplicaHealth {
+        ReplicaHealth::healthy()
+    }
 }
 
 /// Lifecycle-trait error shape. Distinct from substrate-wide

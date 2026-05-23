@@ -41,7 +41,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use super::daemon::{LifecycleDaemon, LifecycleError, LifecycleHandle};
+use super::daemon::{LifecycleDaemon, LifecycleError, LifecycleHandle, ReplicaHealth};
 use crate::adapter::net::behavior::capability::CapabilityFilter;
 use crate::adapter::net::compute::group_coord::GroupCoordinator;
 use crate::adapter::net::compute::replica_group::derive_replica_keypair;
@@ -296,6 +296,70 @@ impl<L: LifecycleDaemon> LifecycleGroup<L> {
     /// [`Self::spawn`].
     pub fn placements(&self) -> &[PlacementDecision] {
         &self.placements
+    }
+
+    /// Per-replica health snapshot in declaration order.
+    /// Polls each replica's
+    /// [`LifecycleDaemon::health`] in parallel via
+    /// `join_all` — the typical impl is cheap (atomic load or
+    /// short-RwLock read), so the parallelism is mostly future-
+    /// proofing for impls that need to await a lock.
+    pub async fn health(&self) -> Vec<ReplicaHealth> {
+        let futures = self.replicas.iter().map(|r| {
+            let r = r.clone();
+            async move { r.health().await }
+        });
+        futures::future::join_all(futures).await
+    }
+
+    /// Replace the daemon at `index` with `new_daemon`. The old
+    /// handle is stopped + awaited before the new one is
+    /// installed, so the slot is briefly empty during the
+    /// transition. Returns the stopped handle's underlying
+    /// daemon Arc — callers wanting to inspect the old state
+    /// (e.g. for forensics on what caused the unhealthy flip)
+    /// can hold onto it.
+    ///
+    /// Errors:
+    /// - `InvalidConfig` if `index >= replica_count`.
+    /// - `StartFailed { index, error }` if the new handle's
+    ///   `on_start` fails. The slot is left empty in this case
+    ///   — caller must retry or shrink the group.
+    pub async fn replace(
+        &mut self,
+        index: usize,
+        new_daemon: Arc<L>,
+    ) -> Result<Arc<L>, LifecycleGroupError> {
+        if index >= self.replicas.len() {
+            return Err(LifecycleGroupError::InvalidConfig(format!(
+                "replace index {index} out of bounds for {} replicas",
+                self.replicas.len()
+            )));
+        }
+        // Drain the old handle out of the Vec and stop it. Use
+        // `Vec::remove` shift-cost is bounded by `replica_count`
+        // which is u8-bounded; cheap.
+        let old_handle = self.handles.remove(index);
+        old_handle.stop().await;
+        let old_replica = std::mem::replace(&mut self.replicas[index], new_daemon.clone());
+
+        // Start the replacement.
+        let trait_obj: Arc<dyn LifecycleDaemon> = new_daemon;
+        let new_handle = match LifecycleHandle::start(trait_obj).await {
+            Ok(h) => h,
+            Err(error) => {
+                // Slot is now empty for handles but replicas Vec
+                // still has the new Arc. Leave it that way and
+                // surface the error — `health()` will report
+                // unhealthy for the missing-handle index.
+                return Err(LifecycleGroupError::StartFailed {
+                    index: u8::try_from(index).unwrap_or(u8::MAX),
+                    error,
+                });
+            }
+        };
+        self.handles.insert(index, new_handle);
+        Ok(old_replica)
     }
 
     /// Borrow the underlying lifecycle handles. Operator
@@ -569,6 +633,137 @@ mod tests {
             Err(other) => panic!("expected PlacementFailed, got {other:?}"),
             Ok(_) => panic!("expected PlacementFailed, got Ok"),
         }
+    }
+
+    /// Daemon variant that reports unhealthy when `force_unhealthy`
+    /// is set — lets tests pin LifecycleGroup::health snapshot
+    /// + replace() behavior without dragging in AggregatorDaemon.
+    struct HealthControlDaemon {
+        force_unhealthy: AtomicBool,
+        starts: AtomicU64,
+        stops: AtomicU64,
+    }
+
+    impl HealthControlDaemon {
+        fn new() -> Self {
+            Self {
+                force_unhealthy: AtomicBool::new(false),
+                starts: AtomicU64::new(0),
+                stops: AtomicU64::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LifecycleDaemon for HealthControlDaemon {
+        fn name(&self) -> &str {
+            "health-control"
+        }
+        async fn on_start(self: Arc<Self>) -> Result<(), LifecycleError> {
+            self.starts.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+        async fn on_stop(&self) {
+            self.stops.fetch_add(1, Ordering::AcqRel);
+        }
+        async fn health(&self) -> ReplicaHealth {
+            if self.force_unhealthy.load(Ordering::Acquire) {
+                ReplicaHealth::unhealthy("test-forced")
+            } else {
+                ReplicaHealth::healthy()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn health_returns_per_replica_snapshot_in_declaration_order() {
+        let daemons: Arc<parking_lot::Mutex<Vec<Arc<HealthControlDaemon>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let daemons_clone = daemons.clone();
+        let group = LifecycleGroup::<HealthControlDaemon>::spawn(3, [0u8; 32], move |_idx| {
+            let d = Arc::new(HealthControlDaemon::new());
+            daemons_clone.lock().push(d.clone());
+            d
+        })
+        .await
+        .expect("spawn");
+
+        // All three healthy initially.
+        let snapshot = group.health().await;
+        assert_eq!(snapshot.len(), 3);
+        for h in &snapshot {
+            assert!(h.healthy);
+            assert!(h.diagnostic.is_none());
+        }
+
+        // Flip replica 1 to unhealthy.
+        daemons.lock()[1]
+            .force_unhealthy
+            .store(true, Ordering::Release);
+        let snapshot = group.health().await;
+        assert!(snapshot[0].healthy);
+        assert!(!snapshot[1].healthy);
+        assert_eq!(snapshot[1].diagnostic.as_deref(), Some("test-forced"));
+        assert!(snapshot[2].healthy);
+
+        group.stop().await;
+    }
+
+    #[tokio::test]
+    async fn replace_stops_old_handle_and_installs_new_daemon() {
+        let daemons: Arc<parking_lot::Mutex<Vec<Arc<HealthControlDaemon>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let daemons_clone = daemons.clone();
+        let mut group =
+            LifecycleGroup::<HealthControlDaemon>::spawn(2, [0u8; 32], move |_idx| {
+                let d = Arc::new(HealthControlDaemon::new());
+                daemons_clone.lock().push(d.clone());
+                d
+            })
+            .await
+            .expect("spawn");
+
+        let original_idx_1 = daemons.lock()[1].clone();
+        assert_eq!(original_idx_1.stops.load(Ordering::Acquire), 0);
+
+        // Build a replacement.
+        let replacement = Arc::new(HealthControlDaemon::new());
+        let returned = group
+            .replace(1, replacement.clone())
+            .await
+            .expect("replace");
+        // The returned Arc is the original replica.
+        assert!(Arc::ptr_eq(&returned, &original_idx_1));
+        // The old daemon was stopped.
+        assert_eq!(original_idx_1.stops.load(Ordering::Acquire), 1);
+        // The replacement was started.
+        assert_eq!(replacement.starts.load(Ordering::Acquire), 1);
+        // The group's typed accessor reflects the swap.
+        let now_at_1 = group.replica(1).expect("replica 1");
+        assert!(Arc::ptr_eq(&now_at_1, &replacement));
+
+        group.stop().await;
+        // The replacement's on_stop fires on group.stop.
+        assert_eq!(replacement.stops.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn replace_rejects_out_of_bounds_index() {
+        let mut group =
+            LifecycleGroup::<HealthControlDaemon>::spawn(2, [0u8; 32], |_idx| {
+                Arc::new(HealthControlDaemon::new())
+            })
+            .await
+            .expect("spawn");
+        let replacement = Arc::new(HealthControlDaemon::new());
+        match group.replace(5, replacement).await {
+            Err(LifecycleGroupError::InvalidConfig(msg)) => {
+                assert!(msg.contains("out of bounds"), "msg was: {msg}");
+            }
+            Err(other) => panic!("expected InvalidConfig, got {other:?}"),
+            Ok(_) => panic!("expected InvalidConfig, got Ok"),
+        }
+        group.stop().await;
     }
 
     #[tokio::test]

@@ -44,7 +44,7 @@ use super::AggregatorConfig;
 use crate::adapter::net::behavior::fold::capability::CapabilityFold;
 use crate::adapter::net::behavior::fold::reservation::ReservationFold;
 use crate::adapter::net::behavior::fold::FoldKind;
-use crate::adapter::net::behavior::lifecycle::{LifecycleDaemon, LifecycleError};
+use crate::adapter::net::behavior::lifecycle::{LifecycleDaemon, LifecycleError, ReplicaHealth};
 use crate::adapter::net::{
     AdapterError, ChannelConfig, ChannelId, ChannelName, MeshNode, PublishConfig,
 };
@@ -147,6 +147,12 @@ pub struct AggregatorDaemon {
     /// `on_stop` can take ownership and await it without racing
     /// the spawn path.
     background: parking_lot::Mutex<Option<JoinHandle<()>>>,
+    /// `Instant` of the most recent successful tick (set after
+    /// `run_one_tick` returns Ok). `LifecycleDaemon::health`
+    /// reads this: if more than `3 × summary_interval` has
+    /// elapsed since the last tick, the daemon reports
+    /// unhealthy. `None` until the loop has run at least once.
+    last_tick_at: Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
 }
 
 impl AggregatorDaemon {
@@ -172,6 +178,7 @@ impl AggregatorDaemon {
             )))),
             shutdown: Arc::new(AtomicBool::new(false)),
             background: parking_lot::Mutex::new(None),
+            last_tick_at: Arc::new(parking_lot::Mutex::new(None)),
         })
     }
 
@@ -229,6 +236,7 @@ impl AggregatorDaemon {
         let batch = self.produce_summaries();
         let novel = self.filter_novel(batch);
         self.append_to_latest(novel.clone());
+        *self.last_tick_at.lock() = Some(std::time::Instant::now());
         novel
     }
 
@@ -258,6 +266,7 @@ impl AggregatorDaemon {
             kept.push(summary);
         }
         self.append_to_latest(kept);
+        *self.last_tick_at.lock() = Some(std::time::Instant::now());
         Ok(published)
     }
 
@@ -485,6 +494,32 @@ impl LifecycleDaemon for AggregatorDaemon {
             // shutdown check fires before we abort.
             let deadline = self.config.summary_interval + std::time::Duration::from_millis(100);
             let _ = tokio::time::timeout(deadline, h).await;
+        }
+    }
+
+    async fn health(&self) -> ReplicaHealth {
+        // The aggregator's liveness signal is "last
+        // successful tick was within 3 × summary_interval".
+        // Before the loop has ticked at least once, treat the
+        // daemon as healthy — `on_start` may have only just
+        // returned and the first interval may not have
+        // elapsed yet. Once a tick has landed, an expired
+        // window means the loop is stuck (publish path
+        // wedged, runtime starved, etc.).
+        let last = *self.last_tick_at.lock();
+        let Some(last) = last else {
+            return ReplicaHealth::healthy();
+        };
+        let interval = self.config.summary_interval;
+        let max_quiet = interval.saturating_mul(3);
+        let elapsed = last.elapsed();
+        if elapsed > max_quiet {
+            ReplicaHealth::unhealthy(format!(
+                "no tick in {:?} (max allowed: {max_quiet:?})",
+                elapsed
+            ))
+        } else {
+            ReplicaHealth::healthy()
         }
     }
 }
@@ -976,5 +1011,43 @@ mod tests {
         LifecycleDaemon::on_stop(&*agg).await;
         let gen_after_first = agg.generation();
         assert!(gen_after_first >= 1);
+    }
+
+    #[tokio::test]
+    async fn health_reports_healthy_before_first_tick_and_after_a_recent_tick() {
+        use crate::adapter::net::behavior::lifecycle::LifecycleDaemon;
+        let mesh = build_mesh().await;
+        let cfg = AggregatorConfig::new(SubnetId::GLOBAL)
+            .with_fold_kind(CapabilityFold::KIND_ID)
+            .with_interval(Duration::from_millis(50));
+        let agg = AggregatorDaemon::new(cfg, mesh).expect("new");
+        // Before any tick has landed, health is "healthy" so a
+        // freshly-started daemon isn't reported as unhealthy
+        // during its first interval.
+        assert!(LifecycleDaemon::health(&agg).await.healthy);
+        // After a fresh tick, still healthy.
+        agg.tick_once();
+        assert!(LifecycleDaemon::health(&agg).await.healthy);
+    }
+
+    #[tokio::test]
+    async fn health_flips_unhealthy_after_3x_interval_without_a_tick() {
+        // Short interval so the test runs in <500ms.
+        use crate::adapter::net::behavior::lifecycle::LifecycleDaemon;
+        let mesh = build_mesh().await;
+        let cfg = AggregatorConfig::new(SubnetId::GLOBAL)
+            .with_fold_kind(CapabilityFold::KIND_ID)
+            .with_interval(Duration::from_millis(40));
+        let agg = AggregatorDaemon::new(cfg, mesh).expect("new");
+        // Tick once, then wait long enough for the 3 × interval
+        // (120ms) window to expire.
+        agg.tick_once();
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        let h = LifecycleDaemon::health(&agg).await;
+        assert!(!h.healthy, "expected unhealthy after 3 × interval, got {h:?}");
+        assert!(
+            h.diagnostic.as_deref().unwrap_or("").contains("no tick"),
+            "diagnostic should mention the missed tick: {h:?}"
+        );
     }
 }
