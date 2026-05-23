@@ -22,6 +22,8 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
+use crate::adapter::net::behavior::capability::CapabilityFilter;
+
 /// Async lifecycle trait for native mesh-aware daemons. See
 /// module doc for the trait's intent and the
 /// [`MeshDaemon`](crate::adapter::net::compute::MeshDaemon)
@@ -33,6 +35,26 @@ pub trait LifecycleDaemon: Send + Sync + 'static {
     /// header). Stable across the daemon's lifetime; no
     /// per-replica differentiation.
     fn name(&self) -> &str;
+
+    /// Capability requirements for placement. Mirrors
+    /// [`MeshDaemon::requirements`](crate::adapter::net::compute::daemon::MeshDaemon::requirements)
+    /// so the same scheduler primitives
+    /// ([`Scheduler::place`](crate::adapter::net::compute::scheduler::Scheduler::place),
+    /// [`GroupCoordinator::place_with_spread`](crate::adapter::net::compute::group_coord::GroupCoordinator::place_with_spread))
+    /// apply to lifecycle daemons without duplicating the
+    /// filter type. Returns `CapabilityFilter::default()` to
+    /// run anywhere.
+    ///
+    /// Used by
+    /// [`LifecycleGroup::spawn_with_placement`](super::group::LifecycleGroup::spawn_with_placement)
+    /// — invoked once before placement to read the requirements
+    /// applied to every replica. Daemons whose requirements are
+    /// uniform across replicas (the common case) can leave the
+    /// default empty filter and pass requirements directly to
+    /// `spawn_with_placement`.
+    fn requirements(&self) -> CapabilityFilter {
+        CapabilityFilter::default()
+    }
 
     /// Called once when a [`LifecycleHandle`] wrapping `self`
     /// is created. Implementations spawn whatever long-running

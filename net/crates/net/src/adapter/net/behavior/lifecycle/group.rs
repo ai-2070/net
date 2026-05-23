@@ -38,16 +38,22 @@
 //!   future cross-node placement can read the same derivation
 //!   `ReplicaGroup` uses.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::daemon::{LifecycleDaemon, LifecycleError, LifecycleHandle};
+use crate::adapter::net::behavior::capability::CapabilityFilter;
+use crate::adapter::net::compute::group_coord::GroupCoordinator;
 use crate::adapter::net::compute::replica_group::derive_replica_keypair;
+use crate::adapter::net::compute::{PlacementDecision, Scheduler};
 use crate::adapter::net::identity::EntityKeypair;
 
 /// Group-spawn failure shape. Distinguishes config-time errors
 /// (rejected on the caller side before any on_start fires) from
 /// per-replica `on_start` failures (carry the failing index for
-/// operator diagnosis).
+/// operator diagnosis) and from placement failures (no candidate
+/// node satisfied the daemon's capability requirements + spread
+/// constraint).
 #[derive(Debug)]
 pub enum LifecycleGroupError {
     /// `replica_count == 0` or other up-front validation
@@ -63,6 +69,15 @@ pub enum LifecycleGroupError {
         /// The underlying lifecycle error.
         error: LifecycleError,
     },
+    /// `Scheduler::place_with_spread` could not find a candidate
+    /// node satisfying the daemon's `CapabilityFilter` outside
+    /// the already-used set (spread invariant).
+    PlacementFailed {
+        /// Index of the replica that could not be placed.
+        index: u8,
+        /// Operator-facing diagnostic string.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for LifecycleGroupError {
@@ -72,11 +87,32 @@ impl std::fmt::Display for LifecycleGroupError {
             Self::StartFailed { index, error } => {
                 write!(f, "replica {index} failed to start: {error}")
             }
+            Self::PlacementFailed { index, reason } => {
+                write!(f, "replica {index} placement failed: {reason}")
+            }
         }
     }
 }
 
 impl std::error::Error for LifecycleGroupError {}
+
+/// Per-replica context the factory receives during
+/// [`LifecycleGroup::spawn_with_placement`]. Carries the
+/// replica index + the scheduler's placement decision so
+/// factories that need to bind a daemon to a specific node can.
+/// Factories that don't care about placement can ignore the
+/// `placement` field (or use the simpler
+/// [`LifecycleGroup::spawn`] which doesn't run placement at
+/// all).
+#[derive(Debug, Clone)]
+pub struct ReplicaContext {
+    /// Replica index in `0..replica_count`.
+    pub index: u8,
+    /// Placement decision from the scheduler. `None` only on
+    /// the placement-free [`LifecycleGroup::spawn`] path —
+    /// always `Some` under `spawn_with_placement`.
+    pub placement: Option<PlacementDecision>,
+}
 
 /// N interchangeable replicas of a single `LifecycleDaemon` type
 /// with a shared `group_seed` for deterministic identity
@@ -91,6 +127,11 @@ pub struct LifecycleGroup<L: LifecycleDaemon> {
     /// daemon state without going through the type-erased
     /// `LifecycleHandle::daemon()`.
     replicas: Vec<Arc<L>>,
+    /// Per-replica placement decisions in declaration order.
+    /// Populated by `spawn_with_placement`; left empty by the
+    /// placement-free `spawn`. The accessor [`Self::placement`]
+    /// returns `Some` only when this Vec is non-empty.
+    placements: Vec<PlacementDecision>,
     group_seed: [u8; 32],
 }
 
@@ -118,42 +159,95 @@ impl<L: LifecycleDaemon> LifecycleGroup<L> {
                 "replica_count must be > 0".into(),
             ));
         }
-        // Materialize concrete + dyn Arcs in lockstep so the
-        // group retains typed access while LifecycleHandle takes
-        // the erased trait object.
-        let mut replicas: Vec<Arc<L>> = Vec::with_capacity(replica_count as usize);
-        let mut starts = Vec::with_capacity(replica_count as usize);
-        for index in 0..replica_count {
-            let daemon = factory(index);
-            replicas.push(daemon.clone());
-            let trait_obj: Arc<dyn LifecycleDaemon> = daemon;
-            starts.push((index, LifecycleHandle::start(trait_obj)));
-        }
-        // Drive starts concurrently. Map each to (index,
-        // Result) so a failure carries the offending index for
-        // diagnosis.
-        let started: Vec<_> = futures::future::join_all(
-            starts.into_iter().map(|(i, fut)| async move { (i, fut.await) }),
-        )
-        .await;
-        let mut handles = Vec::with_capacity(replica_count as usize);
-        for (index, result) in started {
-            match result {
-                Ok(h) => handles.push(h),
-                Err(error) => {
-                    // Drop the handles collected so far + the
-                    // concrete replica Arcs. Each handle's Drop
-                    // schedules an `on_stop` cleanup; the
-                    // detached task handles teardown.
-                    drop(handles);
-                    drop(replicas);
-                    return Err(LifecycleGroupError::StartFailed { index, error });
-                }
-            }
-        }
+        let (replicas, handles) =
+            start_replicas(replica_count, |idx| factory(idx)).await?;
         Ok(Self {
             handles,
             replicas,
+            placements: Vec::new(),
+            group_seed,
+        })
+    }
+
+    /// Spawn `replica_count` replicas with cross-node placement
+    /// via [`Scheduler::place`] /
+    /// [`GroupCoordinator::place_with_spread`].
+    ///
+    /// Differences from [`Self::spawn`]:
+    /// - Caller supplies a `Scheduler` + a `CapabilityFilter`
+    ///   the scheduler uses to find candidate nodes for each
+    ///   replica.
+    /// - Replicas are spread across distinct nodes (spread
+    ///   invariant) — failing if fewer than `replica_count`
+    ///   candidates match the filter.
+    /// - The factory receives a [`ReplicaContext`] carrying the
+    ///   placement decision so daemons that bind to a specific
+    ///   node can read it.
+    ///
+    /// Daemon construction happens **after** placement so a
+    /// factory can use `ctx.placement.node_id` to configure the
+    /// daemon for its target node. The placement decision is
+    /// recorded on the group for inspection.
+    ///
+    /// # Note on single-process semantics
+    ///
+    /// In a single-process deployment the scheduler may pick
+    /// the local node for every replica — `place_with_spread`
+    /// errors with `PlacementFailed` when fewer candidate nodes
+    /// than replicas match the filter. The group does not
+    /// actually move daemons across nodes; that is the
+    /// substrate's remote-spawn responsibility, not the group
+    /// helper's. Recording the placement decisions here lets a
+    /// future cross-node integration consume them without
+    /// re-deriving them.
+    pub async fn spawn_with_placement<F>(
+        replica_count: u8,
+        group_seed: [u8; 32],
+        requirements: CapabilityFilter,
+        scheduler: &Scheduler,
+        mut factory: F,
+    ) -> Result<Self, LifecycleGroupError>
+    where
+        F: FnMut(ReplicaContext) -> Arc<L>,
+    {
+        if replica_count == 0 {
+            return Err(LifecycleGroupError::InvalidConfig(
+                "replica_count must be > 0".into(),
+            ));
+        }
+        // Walk placements first so factory invocations see a
+        // populated `ReplicaContext`. Spread invariant: each
+        // placement excludes prior ones.
+        let mut placements: Vec<PlacementDecision> =
+            Vec::with_capacity(replica_count as usize);
+        let mut used_nodes: HashSet<u64> = HashSet::new();
+        for index in 0..replica_count {
+            match GroupCoordinator::place_with_spread(scheduler, &requirements, &used_nodes) {
+                Ok(decision) => {
+                    used_nodes.insert(decision.node_id);
+                    placements.push(decision);
+                }
+                Err(e) => {
+                    return Err(LifecycleGroupError::PlacementFailed {
+                        index,
+                        reason: format!("{e}"),
+                    });
+                }
+            }
+        }
+        let placements_for_factory = placements.clone();
+        let (replicas, handles) = start_replicas(replica_count, move |index| {
+            let ctx = ReplicaContext {
+                index,
+                placement: Some(placements_for_factory[index as usize].clone()),
+            };
+            factory(ctx)
+        })
+        .await?;
+        Ok(Self {
+            handles,
+            replicas,
+            placements,
             group_seed,
         })
     }
@@ -190,6 +284,20 @@ impl<L: LifecycleDaemon> LifecycleGroup<L> {
         self.replicas.clone()
     }
 
+    /// Placement decision recorded for `index`, or `None` when
+    /// the group was created via the placement-free
+    /// [`Self::spawn`].
+    pub fn placement(&self, index: usize) -> Option<&PlacementDecision> {
+        self.placements.get(index)
+    }
+
+    /// All recorded placement decisions in declaration order.
+    /// Empty when the group was created via the placement-free
+    /// [`Self::spawn`].
+    pub fn placements(&self) -> &[PlacementDecision] {
+        &self.placements
+    }
+
     /// Borrow the underlying lifecycle handles. Operator
     /// tooling that wants type-erased access (e.g. iterating
     /// `daemon().name()` across heterogeneous groups in a
@@ -205,6 +313,46 @@ impl<L: LifecycleDaemon> LifecycleGroup<L> {
             h.stop().await;
         }
     }
+}
+
+/// Shared spawn helper: invoke `factory(index)` for each
+/// replica, wrap each in a `LifecycleHandle` concurrently via
+/// `join_all`, and return the parallel `(replicas, handles)`
+/// Vecs in declaration order. Partial failure drops the
+/// already-collected Arcs cleanly — each handle's RAII Drop
+/// schedules `on_stop`.
+async fn start_replicas<L, F>(
+    replica_count: u8,
+    mut factory: F,
+) -> Result<(Vec<Arc<L>>, Vec<LifecycleHandle>), LifecycleGroupError>
+where
+    L: LifecycleDaemon,
+    F: FnMut(u8) -> Arc<L>,
+{
+    let mut replicas: Vec<Arc<L>> = Vec::with_capacity(replica_count as usize);
+    let mut starts = Vec::with_capacity(replica_count as usize);
+    for index in 0..replica_count {
+        let daemon = factory(index);
+        replicas.push(daemon.clone());
+        let trait_obj: Arc<dyn LifecycleDaemon> = daemon;
+        starts.push((index, LifecycleHandle::start(trait_obj)));
+    }
+    let started: Vec<_> = futures::future::join_all(
+        starts.into_iter().map(|(i, fut)| async move { (i, fut.await) }),
+    )
+    .await;
+    let mut handles = Vec::with_capacity(replica_count as usize);
+    for (index, result) in started {
+        match result {
+            Ok(h) => handles.push(h),
+            Err(error) => {
+                drop(handles);
+                drop(replicas);
+                return Err(LifecycleGroupError::StartFailed { index, error });
+            }
+        }
+    }
+    Ok((replicas, handles))
 }
 
 #[cfg(test)]
@@ -323,6 +471,101 @@ mod tests {
             group.replica_keypair(1).entity_id()
         );
         assert_eq!(group.group_seed(), &seed);
+        group.stop().await;
+    }
+
+    fn make_scheduler(node_ids: &[u64]) -> Scheduler {
+        use crate::adapter::net::behavior::capability::{
+            CapabilityAnnouncement, CapabilitySet,
+        };
+        use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
+        let fold: Arc<Fold<CapabilityFold>> =
+            Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
+        let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
+        for &id in node_ids {
+            capability_bridge::apply_legacy_announcement(
+                &fold,
+                CapabilityAnnouncement::new(id, eid.clone(), 1, CapabilitySet::new()),
+            )
+            .expect("apply legacy announcement in fixture");
+        }
+        let local = node_ids.first().copied().unwrap_or(0xFFFF);
+        Scheduler::new(fold, local, CapabilitySet::new())
+    }
+
+    #[tokio::test]
+    async fn spawn_with_placement_records_distinct_node_per_replica() {
+        let scheduler = make_scheduler(&[0x1111, 0x2222, 0x3333]);
+        let seen_placements = Arc::new(parking_lot::Mutex::new(Vec::<u64>::new()));
+        let seen_placements_clone = seen_placements.clone();
+
+        let group = LifecycleGroup::<CountingDaemon>::spawn_with_placement(
+            3,
+            [0u8; 32],
+            CapabilityFilter::default(),
+            &scheduler,
+            move |ctx| {
+                // Factory observes the placement decision for
+                // its index — record it for assertion.
+                let node_id = ctx
+                    .placement
+                    .as_ref()
+                    .expect("placement set under spawn_with_placement")
+                    .node_id;
+                seen_placements_clone.lock().push(node_id);
+                Arc::new(CountingDaemon::new())
+            },
+        )
+        .await
+        .expect("spawn_with_placement");
+
+        // Spread invariant: three replicas → three distinct nodes.
+        let recorded: Vec<u64> = group.placements().iter().map(|p| p.node_id).collect();
+        assert_eq!(recorded.len(), 3);
+        let unique: std::collections::HashSet<u64> = recorded.iter().copied().collect();
+        assert_eq!(unique.len(), 3, "placements must be on distinct nodes");
+        assert_eq!(*seen_placements.lock(), recorded);
+        for i in 0..3 {
+            assert!(group.placement(i).is_some());
+        }
+        assert!(group.placement(3).is_none());
+
+        group.stop().await;
+    }
+
+    #[tokio::test]
+    async fn spawn_with_placement_fails_when_fewer_nodes_than_replicas() {
+        // Two candidate nodes, three replicas requested — spread
+        // invariant rejects the third.
+        let scheduler = make_scheduler(&[0xAA, 0xBB]);
+        let result = LifecycleGroup::<CountingDaemon>::spawn_with_placement(
+            3,
+            [0u8; 32],
+            CapabilityFilter::default(),
+            &scheduler,
+            |_ctx| Arc::new(CountingDaemon::new()),
+        )
+        .await;
+        match result {
+            Err(LifecycleGroupError::PlacementFailed { index, .. }) => {
+                assert_eq!(index, 2);
+            }
+            Err(other) => panic!("expected PlacementFailed, got {other:?}"),
+            Ok(_) => panic!("expected PlacementFailed, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_path_leaves_placements_empty() {
+        // Placement-free path returns no recorded placements;
+        // `placement(0)` is None.
+        let group = LifecycleGroup::<CountingDaemon>::spawn(2, [0u8; 32], |_idx| {
+            Arc::new(CountingDaemon::new())
+        })
+        .await
+        .expect("spawn");
+        assert!(group.placements().is_empty());
+        assert!(group.placement(0).is_none());
         group.stop().await;
     }
 
