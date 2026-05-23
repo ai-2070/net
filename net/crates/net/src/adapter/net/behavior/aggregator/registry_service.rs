@@ -175,38 +175,58 @@ pub struct SpawnRequest {
     pub replica_count: u8,
 }
 
-/// `RpcHandler` implementation backed by a shared
-/// [`AggregatorRegistry`]. Construct via
-/// [`RegistryHandler::new`] and pass to
-/// [`crate::adapter::net::MeshNode::serve_rpc`] under
-/// [`REGISTRY_SERVICE`].
-///
-/// `Spawn` requests are dispatched to an optional [`SpawnFn`]
-/// installed via [`RegistryHandler::with_spawner`]. Handlers
-/// without a spawner reject `Spawn` requests with
-/// [`RegistryRpcError::SpawnNotSupported`].
+/// Read-only `RpcHandler` for [`REGISTRY_SERVICE`]. Answers
+/// `List` and `Unregister`; replies to `Spawn` with
+/// [`RegistryRpcError::SpawnNotSupported`]. Sibling to
+/// [`RegistryHandler`] which is the spawn-capable variant —
+/// type-level rather than runtime distinction so daemons that
+/// shouldn't accept dynamic deployment can prove it at the
+/// constructor.
+pub struct RegistryReadHandler {
+    registry: Arc<AggregatorRegistry>,
+}
+
+impl RegistryReadHandler {
+    /// Wrap a shared registry as a read-only handler.
+    pub fn new(registry: Arc<AggregatorRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+#[async_trait]
+impl RpcHandler for RegistryReadHandler {
+    async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+        let request: RegistryRequest = match postcard::from_bytes(&ctx.payload.body) {
+            Ok(req) => req,
+            Err(e) => {
+                let response =
+                    RegistryResponse::Error(RegistryRpcError::DecodeFailed(e.to_string()));
+                return Ok(encode_response(&response));
+            }
+        };
+        let response = answer(&self.registry, None, &request).await;
+        Ok(encode_response(&response))
+    }
+}
+
+/// Full `RpcHandler` for [`REGISTRY_SERVICE`]. Answers `List`
+/// / `Spawn` / `Unregister`. The [`SpawnFn`] is **required**
+/// at construction — daemons without a spawn callback use
+/// [`RegistryReadHandler`] instead. This split makes the
+/// "read-only daemon" vs "spawn-capable daemon" choice a
+/// compile-time decision rather than a runtime branch.
 pub struct RegistryHandler {
     registry: Arc<AggregatorRegistry>,
-    spawner: Option<Arc<SpawnFn>>,
+    spawner: Arc<SpawnFn>,
 }
 
 impl RegistryHandler {
-    /// Wrap a shared registry as a read-only RPC handler.
-    /// `List` and `Unregister` work; `Spawn` is rejected with
-    /// [`RegistryRpcError::SpawnNotSupported`].
-    pub fn new(registry: Arc<AggregatorRegistry>) -> Self {
+    /// Construct a full handler with the given spawn callback.
+    pub fn new(registry: Arc<AggregatorRegistry>, spawner: SpawnFn) -> Self {
         Self {
             registry,
-            spawner: None,
+            spawner: Arc::new(spawner),
         }
-    }
-
-    /// Install a spawn callback so the handler accepts
-    /// `Spawn` requests. Typically the daemon's template
-    /// resolver — see `aggregator-daemon`'s `make_spawner`.
-    pub fn with_spawner(mut self, spawner: SpawnFn) -> Self {
-        self.spawner = Some(Arc::new(spawner));
-        self
     }
 }
 
@@ -221,7 +241,7 @@ impl RpcHandler for RegistryHandler {
                 return Ok(encode_response(&response));
             }
         };
-        let response = answer(&self.registry, self.spawner.as_deref(), &request).await;
+        let response = answer(&self.registry, Some(&self.spawner), &request).await;
         Ok(encode_response(&response))
     }
 }
@@ -317,10 +337,10 @@ fn build_rows(snap: &super::EntrySnapshot) -> Vec<RegistryReplicaSummary> {
 }
 
 impl AggregatorRegistry {
-    /// Wrap `self` in a read-only [`RegistryHandler`] and
+    /// Wrap `self` in a [`RegistryReadHandler`] (read-only) and
     /// register it against `mesh` under [`REGISTRY_SERVICE`].
     /// Returns the `ServeHandle` — drop it to tear down the
-    /// registration. `Spawn` requests reject with
+    /// registration. `Spawn` requests reply with
     /// [`RegistryRpcError::SpawnNotSupported`]; use
     /// [`Self::install_registry_service_with_spawner`] to
     /// accept dynamic deployment.
@@ -331,14 +351,14 @@ impl AggregatorRegistry {
     {
         mesh.serve_rpc(
             REGISTRY_SERVICE,
-            Arc::new(RegistryHandler::new(self.clone())),
+            Arc::new(RegistryReadHandler::new(self.clone())),
         )
     }
 
-    /// Same as [`Self::install_registry_service`] but with a
-    /// dynamic-spawn callback. The daemon's template-resolution
-    /// layer plugs in here so `Spawn` RPCs can deploy new
-    /// groups.
+    /// Wrap `self` in a [`RegistryHandler`] (Spawn-capable) and
+    /// register it under [`REGISTRY_SERVICE`]. The daemon's
+    /// template-resolution layer supplies the [`SpawnFn`] —
+    /// see `aggregator-daemon`'s `make_spawner`.
     pub fn install_registry_service_with_spawner(
         self: &Arc<Self>,
         mesh: &Arc<crate::adapter::net::MeshNode>,
@@ -347,7 +367,7 @@ impl AggregatorRegistry {
     {
         mesh.serve_rpc(
             REGISTRY_SERVICE,
-            Arc::new(RegistryHandler::new(self.clone()).with_spawner(spawner)),
+            Arc::new(RegistryHandler::new(self.clone(), spawner)),
         )
     }
 }
