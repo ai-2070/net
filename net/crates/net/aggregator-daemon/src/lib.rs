@@ -78,6 +78,15 @@ pub struct Cli {
     /// across nodes that need distinct ports.
     #[arg(long)]
     pub listen: Option<String>,
+    /// Print a single JSON line to stdout with the bound
+    /// `(node_id, bound_addr, public_key_hex)` triple *before*
+    /// entering the signal-wait loop. Binding integration
+    /// tests (Node / Python / Go) parse this line to drive
+    /// their handshake against the daemon without grepping
+    /// tracing output. Has no effect on the daemon's behavior
+    /// otherwise.
+    #[arg(long, default_value_t = false)]
+    pub print_bootstrap: bool,
     /// Increase log verbosity. `-v` = info (default), `-vv` =
     /// debug, `-vvv` = trace.
     #[arg(long, short, action = clap::ArgAction::Count)]
@@ -203,6 +212,7 @@ pub fn init_tracing(verbose: u8) {
 /// (or SIGTERM on Unix), then drain the registry and exit.
 /// This is the binary's `main` body.
 pub async fn run(cli: Cli) -> Result<(), DaemonError> {
+    let print_bootstrap = cli.print_bootstrap;
     let booted = boot(cli).await?;
     let registry = booted.registry.clone();
     // `boot()` deliberately doesn't `start()` the mesh —
@@ -210,6 +220,9 @@ pub async fn run(cli: Cli) -> Result<(), DaemonError> {
     // to perform handshakes. The production path starts
     // immediately.
     booted.mesh.start();
+    if print_bootstrap {
+        print_bootstrap_line(&booted);
+    }
     // Hold `booted` until shutdown so the ServeHandle's Drop
     // fires after we've stopped the groups.
     wait_for_shutdown().await;
@@ -218,6 +231,36 @@ pub async fn run(cli: Cli) -> Result<(), DaemonError> {
     drop(booted);
     tracing::info!("aggregator daemon stopped cleanly");
     Ok(())
+}
+
+/// Print a single-line JSON object describing the daemon's
+/// bootstrap state to stdout. Format is locked across SDK
+/// bindings — see `SDK_AGGREGATOR_SUBNET_PLAN.md` Stage 6:
+///
+/// ```text
+/// {"node_id":12345,"bound_addr":"127.0.0.1:54321","public_key_hex":"<64 hex>"}
+/// ```
+///
+/// `node_id` is a JSON number; `bound_addr` is a JSON string
+/// (always IP:port — no special escaping); `public_key_hex` is
+/// 64 lowercase hex chars (no escaping). One line, terminated
+/// by `\n`, flushed.
+fn print_bootstrap_line(booted: &BootedDaemon) {
+    let pk_hex: String = booted
+        .public_key
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let node_id = booted.mesh.node_id();
+    println!(
+        "{{\"node_id\":{node_id},\"bound_addr\":\"{}\",\"public_key_hex\":\"{pk_hex}\"}}",
+        booted.bound_addr,
+    );
+    // Force a flush so subprocess test fixtures see the line
+    // before the daemon enters wait_for_shutdown (where stdout
+    // is otherwise quiet for the program's lifetime).
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
 }
 
 /// Boot the MeshNode + registry + groups described by `cli`,

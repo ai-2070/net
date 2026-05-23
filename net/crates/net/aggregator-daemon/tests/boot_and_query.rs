@@ -97,6 +97,7 @@ async fn daemon_boots_two_groups_and_serves_registry_rpc() {
         config: cfg_file.path().to_path_buf(),
         listen: None,
         verbose: 0,
+        print_bootstrap: false,
     };
     let booted = boot(cli).await.expect("daemon boot");
     assert_eq!(booted.registry.len(), 2);
@@ -170,6 +171,7 @@ async fn daemon_rejects_unknown_fold_kind_at_boot() {
         config: cfg_file.path().to_path_buf(),
         listen: None,
         verbose: 0,
+        print_bootstrap: false,
     };
     match boot(cli).await {
         Err(net_aggregator_daemon::DaemonError::AggregatorConfig { name, error }) => {
@@ -203,6 +205,7 @@ async fn spawn_and_unregister_rpc_round_trip_against_running_daemon() {
         config: cfg_file.path().to_path_buf(),
         listen: None,
         verbose: 0,
+        print_bootstrap: false,
     };
     let booted = boot(cli).await.expect("daemon boot");
     assert_eq!(booted.registry.len(), 0);
@@ -266,6 +269,7 @@ async fn spawn_unknown_template_returns_typed_server_error() {
         config: cfg_file.path().to_path_buf(),
         listen: None,
         verbose: 0,
+        print_bootstrap: false,
     };
     let booted = boot(cli).await.expect("daemon boot");
 
@@ -319,6 +323,7 @@ async fn daemon_rejects_duplicate_group_names_at_boot() {
         config: cfg_file.path().to_path_buf(),
         listen: None,
         verbose: 0,
+        print_bootstrap: false,
     };
     match boot(cli).await {
         Err(net_aggregator_daemon::DaemonError::Registry(msg)) => {

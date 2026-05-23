@@ -152,15 +152,22 @@ pub fn install_fold_query_service(
 /// auto-register pattern — register the `<service>.requests`
 /// channel exactly + the `<service>.replies.` prefix entry
 /// permissively. Idempotent.
+///
+/// Routes the prefix insertion through `MeshNode::channel_configs()`
+/// (publicly accessible whenever `net` is on) rather than the
+/// SDK's `pub(crate)` accessor (which the SDK gates on
+/// `cortex`).
 fn auto_register_rpc_channels(mesh: &Mesh, service: &str) {
     if let Ok(req_channel) = ChannelName::new(&format!("{service}.requests")) {
         mesh.register_channel(ChannelConfig::new(ChannelId::new(req_channel)));
     }
-    if let Ok(sentinel_name) = ChannelName::new(&format!("{service}.replies.prefix")) {
-        mesh.channel_configs_arc().insert_prefix(
-            format!("{service}.replies."),
-            ChannelConfig::new(ChannelId::new(sentinel_name)),
-        );
+    if let Some(configs) = mesh.inner().channel_configs() {
+        if let Ok(sentinel_name) = ChannelName::new(&format!("{service}.replies.prefix")) {
+            configs.insert_prefix(
+                format!("{service}.replies."),
+                ChannelConfig::new(ChannelId::new(sentinel_name)),
+            );
+        }
     }
 }
 
