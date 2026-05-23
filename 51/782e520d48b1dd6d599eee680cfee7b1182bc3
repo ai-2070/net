@@ -1,0 +1,29 @@
+net/crates/net/tests/capability_aggregation_e2e.rs
+  s_d9dc521a887c3e::t_96a81a2d678726 1-230
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_23_MULTIFOLD_DEFERRED.md
+  s_099fa7d871e34d::t_359a91143ba8dd 4,7,22-31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "51782e520d48b1dd6d599eee680cfee7b1182bc3",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_d9dc521a887c3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1eafc9e-4dd5-40ff-8f76-e8a5b7800252",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
