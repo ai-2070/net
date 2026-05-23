@@ -1947,7 +1947,10 @@ impl MeshNode {
             // releases its claim on the wire hash.
             let removed_entity_id = peer_entity_ids_failure.remove(&node_id).map(|(_, eid)| eid);
             if let Some(eid) = removed_entity_id {
-                let origin_hash = eid.origin_hash();
+                // Same wire-truncated u32-as-u64 key the inbound
+                // announcement handler uses; see the comment above
+                // `ctx.origin_hash_to_node.entry(origin_hash)`.
+                let origin_hash = eid.origin_hash() as u32 as u64;
                 let mut drop_slot = false;
                 if let Some(mut slot) = origin_hash_to_node_failure.get_mut(&origin_hash) {
                     drop_slot = slot.remove(node_id);
@@ -4542,16 +4545,15 @@ impl MeshNode {
             if ambiguous {
                 None
             } else {
-                let tags = match publisher_node {
+                let caps = match publisher_node {
                     Some(nid) => {
-                        super::behavior::fold::capability_tags_for(&ctx.capability_fold, nid)
+                        super::behavior::fold::capability_bridge::synthesize_capability_set(
+                            &ctx.capability_fold,
+                            nid,
+                        )
                     }
-                    None => Vec::new(),
+                    None => crate::adapter::net::behavior::capability::CapabilitySet::new(),
                 };
-                let mut caps = crate::adapter::net::behavior::capability::CapabilitySet::new();
-                for tag in tags {
-                    caps = caps.add_tag(tag);
-                }
                 Some(std::sync::Arc::new(caps))
             }
         } else {
@@ -5826,7 +5828,13 @@ impl MeshNode {
                 // wire hash promotes the slot to Multiple, which
                 // future get_node_by_origin_hash calls resolve
                 // to None.
-                let origin_hash = ann.entity_id.origin_hash();
+                // Wire packet headers carry `origin_hash` as a u32
+                // (see `protocol::PacketHeader::origin_hash`); the
+                // channel-publish path stamps `entity_id.origin_hash() as u32`.
+                // Key the reverse index on the SAME truncated form so
+                // greedy-admission lookups against `parsed.header.origin_hash`
+                // hit the slot we just installed.
+                let origin_hash = ann.entity_id.origin_hash() as u32 as u64;
                 ctx.origin_hash_to_node
                     .entry(origin_hash)
                     .and_modify(|slot| {
