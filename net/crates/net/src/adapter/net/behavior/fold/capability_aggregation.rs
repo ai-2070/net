@@ -617,15 +617,17 @@ fn numeric_value_for(raw: &str, want_axis_key: &str) -> Option<u64> {
 /// semver parsing. Returns `None` for non-matching tags or
 /// non-`AxisValue` variants.
 fn string_value_for_axis_key(raw: &str, want_axis_key: &str) -> Option<String> {
+    let (axis, key) = split_axis_key(want_axis_key)?;
+    axis_value_for(raw, axis, key)
+}
+
+/// Split a canonical `"<axis>.<key>"` string into its
+/// `(TaxonomyAxis, key)` pair. Returns `None` for malformed inputs
+/// (missing dot or unknown axis prefix).
+fn split_axis_key(want_axis_key: &str) -> Option<(TaxonomyAxis, &str)> {
     let (want_axis_str, want_key) = want_axis_key.split_once('.')?;
     let want_axis = TaxonomyAxis::from_prefix(want_axis_str)?;
-    let tag = Tag::parse(raw).ok()?;
-    match tag {
-        Tag::AxisValue {
-            axis, key, value, ..
-        } if axis == want_axis && key == want_key => Some(value),
-        _ => None,
-    }
+    Some((want_axis, want_key))
 }
 
 // ============================================================================
