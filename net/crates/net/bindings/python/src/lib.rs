@@ -1791,9 +1791,8 @@ mod mesh_bindings {
             use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
             use net::adapter::net::identity::EntityId;
             let node = self.get_node()?;
-            let index = node.capability_index().clone();
             let eid = EntityId::from_bytes([0u8; 32]);
-            index.index(CapabilityAnnouncement::new(
+            node.test_inject_capability_announcement(CapabilityAnnouncement::new(
                 node_id,
                 eid,
                 1,
@@ -1880,9 +1879,9 @@ mod mesh_bindings {
             }
 
             let node = self.get_node()?;
-            let capability_index = node.capability_index().clone();
+            let capability_fold = node.capability_fold().clone();
             let wrapper =
-                super::placement::PyPlacementFilter::new(id.clone(), predicate, capability_index);
+                super::placement::PyPlacementFilter::new(id.clone(), predicate, capability_fold);
             let arc: std::sync::Arc<dyn PlacementFilter> = std::sync::Arc::new(wrapper);
             // SDK Phase 7 polish: `"python"` binding label drives the
             // `dataforts_placement_callback_invocations_total{binding="python"}`

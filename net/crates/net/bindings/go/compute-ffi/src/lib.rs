@@ -1959,9 +1959,8 @@ pub extern "C" fn net_compute_test_inject_synthetic_peer(
         return;
     }
     let arc = unsafe { &*mesh_arc };
-    let index = arc.capability_index().clone();
     let eid = EntityId::from_bytes([0u8; 32]);
-    index.index(CapabilityAnnouncement::new(
+    arc.test_inject_capability_announcement(CapabilityAnnouncement::new(
         node_id,
         eid,
         1,
@@ -2805,7 +2804,11 @@ pub extern "C" fn net_compute_set_placement_filter_dispatcher(
 /// `global_placement_filter_registry` as `Arc<dyn PlacementFilter>`.
 struct CgoPlacementFilter {
     id: String,
-    capability_index: Arc<::net::adapter::net::behavior::capability::CapabilityIndex>,
+    capability_fold: Arc<
+        ::net::adapter::net::behavior::fold::Fold<
+            ::net::adapter::net::behavior::fold::CapabilityFold,
+        >,
+    >,
 }
 
 impl ::net::adapter::net::behavior::placement::PlacementFilter for CgoPlacementFilter {
@@ -2820,10 +2823,20 @@ impl ::net::adapter::net::behavior::placement::PlacementFilter for CgoPlacementF
         let dispatcher = *PLACEMENT_FILTER_DISPATCHER.get()?;
 
         // Look up candidate caps. Same semantics as Node / Python:
-        // a candidate not in the index is invisible to the Go
+        // a candidate not in the fold is invisible to the Go
         // predicate (which expects tags + metadata); veto rather
         // than feed an empty candidate.
-        let caps = self.capability_index.get(*target)?;
+        if !self
+            .capability_fold
+            .with_state(|state| state.by_node.contains_key(target))
+        {
+            return None;
+        }
+        let caps =
+            ::net::adapter::net::behavior::fold::capability_bridge::synthesize_capability_set(
+                &self.capability_fold,
+                *target,
+            );
 
         // Build the candidate JSON. `Tag::Display` produces the
         // on-wire string form; `metadata` is BTreeMap<String,String>
@@ -2884,7 +2897,7 @@ impl ::net::adapter::net::behavior::placement::PlacementFilter for CgoPlacementF
 /// `Arc<dyn PlacementFilter>`.
 ///
 /// `mesh_arc` is a non-consuming pointer — the registry holds an
-/// `Arc<CapabilityIndex>` clone, not the mesh handle. Caller's
+/// `Arc<Fold<CapabilityFold>>` clone, not the mesh handle. Caller's
 /// existing `_free` for the mesh handle stays correct.
 ///
 /// Returns:
@@ -2932,10 +2945,10 @@ pub extern "C" fn net_compute_register_placement_filter(
     };
 
     let arc = unsafe { &*mesh_arc };
-    let capability_index = arc.capability_index().clone();
+    let capability_fold = arc.capability_fold().clone();
     let wrapper = CgoPlacementFilter {
         id: id.clone(),
-        capability_index,
+        capability_fold,
     };
     let arc_filter: Arc<dyn PlacementFilter> = Arc::new(wrapper);
 

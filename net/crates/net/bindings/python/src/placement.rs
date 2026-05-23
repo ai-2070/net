@@ -39,7 +39,7 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
-use net::adapter::net::behavior::capability::CapabilityIndex;
+use net::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
 use net::adapter::net::behavior::placement::{
     Artifact, NodeId as PlacementNodeId, PlacementFilter,
 };
@@ -51,9 +51,10 @@ pub struct PyPlacementFilter {
     /// Python callable to invoke per candidate. `Py<PyAny>` is
     /// `Send + Sync`; the GIL is acquired around every invocation.
     predicate: Py<PyAny>,
-    /// Local capability index — looked up to materialize the
-    /// candidate's tags/metadata for the Python dict.
-    capability_index: Arc<CapabilityIndex>,
+    /// Local capability fold — synthesized into a `CapabilitySet`
+    /// at scoring time to materialize the candidate's tags/metadata
+    /// for the Python dict.
+    capability_fold: Arc<Fold<CapabilityFold>>,
     /// SDK-supplied id, retained for diagnostics in logged
     /// exception / type-error messages.
     id: String,
@@ -62,10 +63,14 @@ pub struct PyPlacementFilter {
 impl PyPlacementFilter {
     /// Construct a wrapper. `predicate` is a Python callable; the
     /// GIL is acquired internally around every invocation.
-    pub fn new(id: String, predicate: Py<PyAny>, capability_index: Arc<CapabilityIndex>) -> Self {
+    pub fn new(
+        id: String,
+        predicate: Py<PyAny>,
+        capability_fold: Arc<Fold<CapabilityFold>>,
+    ) -> Self {
         Self {
             predicate,
-            capability_index,
+            capability_fold,
             id,
         }
     }
@@ -74,10 +79,16 @@ impl PyPlacementFilter {
 impl PlacementFilter for PyPlacementFilter {
     fn placement_score(&self, target: &PlacementNodeId, _artifact: &Artifact<'_>) -> Option<f32> {
         // Look up the candidate's caps. Same semantics as the
-        // Node TSFN bridge: missing-from-index → vetoed (no
-        // Python visibility into a never-indexed node, so we
-        // can't materialize a meaningful candidate dict).
-        let caps = self.capability_index.get(*target)?;
+        // Node TSFN bridge: missing-from-fold → vetoed (no Python
+        // visibility into a never-indexed node, so we can't
+        // materialize a meaningful candidate dict).
+        if !self
+            .capability_fold
+            .with_state(|state| state.by_node.contains_key(target))
+        {
+            return None;
+        }
+        let caps = capability_bridge::synthesize_capability_set(&self.capability_fold, *target);
 
         Python::attach(|py| -> Option<f32> {
             // Build the candidate dict matching the SDK's

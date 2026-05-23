@@ -2002,7 +2002,7 @@ mod mesh_bindings {
             let node = guard
                 .as_ref()
                 .ok_or_else(|| Error::from_reason("MeshNode has been shut down"))?;
-            let capability_index = node.capability_index().clone();
+            let capability_fold = node.capability_fold().clone();
 
             // Build the TSFN inside the Node main thread; the
             // resulting handle is `Send + Sync + Clone` and can
@@ -2010,7 +2010,7 @@ mod mesh_bindings {
             let tsfn: crate::placement::PlacementFilterTsfn =
                 predicate.build_threadsafe_function().build()?;
             let wrapper =
-                crate::placement::TsfnPlacementFilter::new(id.clone(), tsfn, capability_index);
+                crate::placement::TsfnPlacementFilter::new(id.clone(), tsfn, capability_fold);
             let arc: std::sync::Arc<dyn PlacementFilter> = std::sync::Arc::new(wrapper);
 
             // SDK Phase 7 polish: `"node"` binding label drives the
@@ -2273,9 +2273,8 @@ mod mesh_bindings {
             })?;
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let index = node.capability_index().clone();
             let eid = EntityId::from_bytes([0u8; 32]);
-            index.index(CapabilityAnnouncement::new(
+            node.test_inject_capability_announcement(CapabilityAnnouncement::new(
                 nid,
                 eid,
                 1,
