@@ -60,8 +60,11 @@ parking_lot = "0.12"
 # matching `free`.
 libc = "0.2"
 # JSON marshaling for the `PlacementFilter` candidate payload (Phase 7
-# slice 4). Bounded per-call cost; same json crate the rest of the
-# tree uses for cap diff / predicate IR.
+# slice 4) + the Phase 6c capability-aggregation FFI surface
+# (`net_capability_aggregate` / `net_capability_capacity_ranking`).
+# Bounded per-call cost; same json crate the rest of the tree uses
+# for cap diff / predicate IR.
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # `[profile.release]` intentionally omitted — cargo ignores non-root
