@@ -43,7 +43,7 @@ pub mod query_service;
 pub mod summarizer;
 
 pub use config::AggregatorConfig;
-pub use daemon::{AggregatorDaemon, AggregatorError};
+pub use daemon::{AggregatorDaemon, AggregatorError, AggregatorPublishError};
 pub use query_client::{
     FoldQueryClient, FoldQueryClientError, DEFAULT_QUERY_CACHE_TTL, DEFAULT_QUERY_DEADLINE,
 };

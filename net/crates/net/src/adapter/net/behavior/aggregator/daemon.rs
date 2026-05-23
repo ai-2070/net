@@ -34,6 +34,8 @@ use std::time::Duration;
 use parking_lot::RwLock;
 use tokio::task::JoinHandle;
 
+use bytes::Bytes;
+
 use super::summarizer::{
     resolve_summarizer, CapabilityFoldHandle, FoldHandle, SummarizerContext, SummaryAnnouncement,
     Summarizer,
@@ -41,7 +43,9 @@ use super::summarizer::{
 use super::AggregatorConfig;
 use crate::adapter::net::behavior::fold::capability::CapabilityFold;
 use crate::adapter::net::behavior::fold::FoldKind;
-use crate::adapter::net::MeshNode;
+use crate::adapter::net::{
+    AdapterError, ChannelConfig, ChannelId, ChannelName, MeshNode, PublishConfig,
+};
 
 /// Configuration-validation error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +53,10 @@ pub enum AggregatorError {
     /// A `fold_kind` listed in [`AggregatorConfig::fold_kinds`]
     /// has no built-in summarizer and no custom override in
     /// [`AggregatorConfig::custom_summarizers`].
-    UnregisteredFoldKind { kind: u16 },
+    UnregisteredFoldKind {
+        /// Kind id that failed to resolve.
+        kind: u16,
+    },
     /// `fold_kinds` is empty — the daemon would do nothing.
     NoFoldKinds,
 }
@@ -68,6 +75,39 @@ impl std::fmt::Display for AggregatorError {
 }
 
 impl std::error::Error for AggregatorError {}
+
+/// Publish-path failures from
+/// [`AggregatorDaemon::tick_and_publish`]. Distinct from
+/// `AggregatorError` so callers can distinguish
+/// construction-time validation from runtime publish errors.
+#[derive(Debug)]
+pub enum AggregatorPublishError {
+    /// `postcard::to_allocvec` failed to encode a summary.
+    /// Doesn't carry the codec error directly so the wire type
+    /// stays free of cross-crate dependencies.
+    Encode(String),
+    /// `MeshNode::publish` failed for the per-kind summary
+    /// channel.
+    Publish(AdapterError),
+    /// A computed summary channel name failed validation.
+    /// Should be unreachable in practice — the formatter only
+    /// produces lowercase / digit / slash characters — but kept
+    /// as a typed variant so a future channel-name spec change
+    /// surfaces cleanly.
+    InvalidChannelName(String),
+}
+
+impl std::fmt::Display for AggregatorPublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Encode(msg) => write!(f, "encode failed: {msg}"),
+            Self::Publish(e) => write!(f, "publish failed: {e}"),
+            Self::InvalidChannelName(msg) => write!(f, "invalid channel name: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for AggregatorPublishError {}
 
 /// Cap on the number of latest summaries retained per
 /// [`AggregatorDaemon`]. Operator tooling pulls the latest batch
@@ -124,6 +164,12 @@ impl AggregatorDaemon {
     /// Spawn the background summarize loop and return its
     /// `JoinHandle`. The handle resolves when the loop exits
     /// (typically after [`Self::shutdown`] is called).
+    ///
+    /// The loop calls [`Self::tick_and_publish`] on each tick so
+    /// summaries fan out to subscribers in addition to landing in
+    /// the in-memory buffer. Publish errors are logged at `warn`
+    /// and the loop continues — a transiently-wedged peer
+    /// shouldn't stop subsequent ticks from publishing.
     pub fn spawn(self: Arc<Self>) -> JoinHandle<()> {
         let interval = self.config.summary_interval;
         tokio::spawn(async move {
@@ -137,16 +183,58 @@ impl AggregatorDaemon {
                     return;
                 }
                 ticker.tick().await;
-                self.tick_once();
+                if let Err(e) = self.tick_and_publish().await {
+                    tracing::warn!(
+                        error = %e,
+                        source_subnet = %self.config.source_subnet,
+                        "aggregator: tick_and_publish failed; loop continues",
+                    );
+                }
             }
         })
     }
 
     /// Run one summarize tick synchronously. Public for tests
-    /// (the background loop calls this once per
-    /// `summary_interval`); production code spawns and lets the
-    /// loop drive it.
+    /// (the background loop calls [`Self::tick_and_publish`]
+    /// once per `summary_interval`); production code spawns and
+    /// lets the loop drive it.
+    ///
+    /// Bumps `generation`, runs each configured summarizer,
+    /// appends to the latest-summaries buffer. Does NOT publish
+    /// summaries onto the wire — use
+    /// [`Self::tick_and_publish`] for that.
     pub fn tick_once(&self) {
+        let batch = self.produce_summaries();
+        self.append_to_latest(batch);
+    }
+
+    /// `tick_once` + publish each emitted summary to its
+    /// per-fold-kind summary channel via
+    /// [`MeshNode::publish`](crate::adapter::net::MeshNode::publish).
+    /// Used by the background loop; tests can call it explicitly.
+    ///
+    /// Returns the number of summaries successfully published.
+    /// Publish-failure short-circuits — the first failed publish
+    /// aborts the batch; remaining summaries land in the latest
+    /// buffer regardless, so the daemon's local view stays
+    /// consistent.
+    pub async fn tick_and_publish(&self) -> Result<usize, AggregatorPublishError> {
+        let batch = self.produce_summaries();
+        let mut published = 0;
+        for summary in &batch {
+            self.publish_summary(summary).await?;
+            published += 1;
+        }
+        self.append_to_latest(batch);
+        Ok(published)
+    }
+
+    /// Compute one tick's worth of summaries. Pure side-effect-
+    /// per-call (bumps the generation counter), but doesn't
+    /// mutate the latest-summaries buffer. Split out so
+    /// [`Self::tick_once`] and [`Self::tick_and_publish`] share
+    /// the per-fold-kind dispatch.
+    fn produce_summaries(&self) -> Vec<SummaryAnnouncement> {
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let mut batch: Vec<SummaryAnnouncement> = Vec::new();
         for kind in &self.config.fold_kinds {
@@ -177,15 +265,89 @@ impl AggregatorDaemon {
             };
             batch.extend(summaries);
         }
+        batch
+    }
+
+    /// Append a batch to the latest-summaries buffer, evicting
+    /// the oldest entries when the cap is hit.
+    fn append_to_latest(&self, batch: Vec<SummaryAnnouncement>) {
         let mut latest = self.latest.write();
-        // Append-and-cap: keep up to the cap's worth of the most
-        // recent batches' worth of summaries.
         for s in batch {
             if latest.len() >= LATEST_SUMMARIES_CAP {
                 latest.remove(0);
             }
             latest.push(s);
         }
+    }
+
+    /// Publish one summary onto its per-fold-kind summary
+    /// channel. Encoding is postcard, matching the
+    /// [`super::query_service`] wire format so receivers can
+    /// decode the same shape from either the RPC reply or the
+    /// channel fan-out.
+    async fn publish_summary(
+        &self,
+        summary: &SummaryAnnouncement,
+    ) -> Result<(), AggregatorPublishError> {
+        let channel = self.summary_channel_name(summary.fold_kind)?;
+        let publisher = self
+            .mesh
+            .channel_publisher(channel, PublishConfig::default());
+        let bytes = postcard::to_allocvec(summary)
+            .map_err(|e| AggregatorPublishError::Encode(format!("{e:?}")))?;
+        self.mesh
+            .publish(&publisher, Bytes::from(bytes))
+            .await
+            .map_err(AggregatorPublishError::Publish)?;
+        Ok(())
+    }
+
+    /// Canonical summary channel name for `fold_kind`. One
+    /// summary channel per fold-kind per host; source-subnet
+    /// discrimination is carried on the payload's
+    /// `source_subnet` field. Format: `"summary/<hex_kind>"`.
+    pub fn summary_channel_name(
+        &self,
+        fold_kind: u16,
+    ) -> Result<ChannelName, AggregatorPublishError> {
+        let name = format!("summary/{fold_kind:#06x}");
+        ChannelName::new(&name).map_err(|e| {
+            AggregatorPublishError::InvalidChannelName(format!("{name}: {e:?}"))
+        })
+    }
+
+    /// Register every configured fold-kind's summary channel in
+    /// `mesh`'s [`ChannelConfigRegistry`] with the aggregator's
+    /// `summary_visibility`. Idempotent — `insert` replaces by
+    /// name so a re-call is a no-op. Returns the count of
+    /// channels registered.
+    ///
+    /// Operators that want visibility-enforced delivery (e.g.
+    /// `Visibility::ParentVisible` so summaries reach the
+    /// parent subnet but not siblings) call this once after
+    /// `install_query_service`. Without it, summaries publish on
+    /// the wire but the gateway sees no visibility config and
+    /// falls back to its default behavior.
+    pub fn register_summary_channels(&self) -> Result<usize, AggregatorPublishError> {
+        let Some(registry) = self.mesh.channel_configs() else {
+            // No registry installed — nothing to register. Not
+            // an error; the gateway falls back to defaults.
+            return Ok(0);
+        };
+        let mut registered = 0;
+        for kind in &self.config.fold_kinds {
+            let channel_name = self.summary_channel_name(*kind)?;
+            let channel_id = ChannelId::parse(channel_name.as_str()).map_err(|e| {
+                AggregatorPublishError::InvalidChannelName(format!(
+                    "{}: {e:?}",
+                    channel_name.as_str()
+                ))
+            })?;
+            let cfg = ChannelConfig::new(channel_id).with_visibility(self.config.summary_visibility);
+            registry.insert(cfg);
+            registered += 1;
+        }
+        Ok(registered)
     }
 
     /// Snapshot of the latest summaries the loop has produced.
@@ -385,5 +547,102 @@ mod tests {
             agg.tick_once();
         }
         assert_eq!(agg.latest_summaries().len(), LATEST_SUMMARIES_CAP);
+    }
+
+    #[tokio::test]
+    async fn summary_channel_name_renders_kind_as_hex_under_summary_prefix() {
+        let mesh = build_mesh().await;
+        let cfg = AggregatorConfig::new(SubnetId::GLOBAL).with_fold_kind(CapabilityFold::KIND_ID);
+        let agg = AggregatorDaemon::new(cfg, mesh).expect("new");
+        let name = agg
+            .summary_channel_name(CapabilityFold::KIND_ID)
+            .expect("channel name");
+        assert_eq!(name.as_str(), "summary/0x0001");
+        let name = agg.summary_channel_name(0x0042).expect("channel name");
+        assert_eq!(name.as_str(), "summary/0x0042");
+    }
+
+    #[tokio::test]
+    async fn register_summary_channels_inserts_with_configured_visibility() {
+        use crate::adapter::net::{ChannelConfigRegistry, Visibility};
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x17u8; 32]);
+        let mut mesh = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+        let registry = std::sync::Arc::new(ChannelConfigRegistry::new());
+        mesh.set_channel_configs(registry);
+        let mesh = std::sync::Arc::new(mesh);
+
+        let agg_cfg = AggregatorConfig::new(SubnetId::new(&[3, 7]))
+            .with_fold_kind(CapabilityFold::KIND_ID)
+            .with_visibility(Visibility::ParentVisible);
+        let agg = AggregatorDaemon::new(agg_cfg, mesh.clone()).expect("new");
+
+        let count = agg.register_summary_channels().expect("register");
+        assert_eq!(count, 1);
+        let registered = mesh
+            .channel_configs()
+            .expect("registry")
+            .get_by_name("summary/0x0001")
+            .expect("channel registered");
+        assert_eq!(registered.visibility, Visibility::ParentVisible);
+    }
+
+    #[tokio::test]
+    async fn register_summary_channels_idempotent_on_re_call() {
+        use crate::adapter::net::{ChannelConfigRegistry, Visibility};
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x17u8; 32]);
+        let mut mesh = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+        mesh.set_channel_configs(std::sync::Arc::new(ChannelConfigRegistry::new()));
+        let mesh = std::sync::Arc::new(mesh);
+
+        let agg_cfg = AggregatorConfig::new(SubnetId::GLOBAL)
+            .with_fold_kind(CapabilityFold::KIND_ID)
+            .with_visibility(Visibility::Global);
+        let agg = AggregatorDaemon::new(agg_cfg, mesh.clone()).expect("new");
+
+        let first = agg.register_summary_channels().expect("first");
+        let second = agg.register_summary_channels().expect("second");
+        assert_eq!(first, second);
+        // Registry should still have the single entry — no
+        // duplicates accumulated.
+        assert_eq!(mesh.channel_configs().expect("registry").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn register_summary_channels_noop_without_registry() {
+        // Mesh with no installed registry → register returns 0.
+        let mesh = build_mesh().await;
+        let cfg = AggregatorConfig::new(SubnetId::GLOBAL).with_fold_kind(CapabilityFold::KIND_ID);
+        let agg = AggregatorDaemon::new(cfg, mesh).expect("new");
+        let count = agg.register_summary_channels().expect("register");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn tick_and_publish_advances_generation_and_appends_to_latest() {
+        // Single-node test: publish has no subscribers (the
+        // mesh has no peers), so the publish path succeeds with
+        // zero recipients. The summary still lands in the
+        // latest-summaries buffer and generation advances.
+        let mesh = build_mesh().await;
+        let kp = EntityKeypair::generate();
+        let fold = mesh.capability_fold();
+        fold.apply(sign_cap(&kp, 0xA, 1, NodeState::Idle)).unwrap();
+
+        let cfg = AggregatorConfig::new(SubnetId::new(&[3]))
+            .with_fold_kind(CapabilityFold::KIND_ID)
+            .with_interval(Duration::from_secs(60));
+        let agg = AggregatorDaemon::new(cfg, mesh).expect("new");
+
+        let before = agg.generation();
+        let published = agg.tick_and_publish().await.expect("tick_and_publish");
+        assert_eq!(published, 1, "one capability-fold summary should publish");
+        assert_eq!(agg.generation(), before + 1);
+        assert_eq!(agg.latest_summaries().len(), 1);
     }
 }
