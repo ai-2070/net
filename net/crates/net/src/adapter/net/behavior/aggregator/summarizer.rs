@@ -157,26 +157,38 @@ impl Summarizer for ReservationFoldSummarizer {
     }
 
     fn summarize(&self, ctx: &SummarizerContext<'_>) -> Vec<SummaryAnnouncement> {
+        use crate::adapter::net::behavior::fold::reservation::ReservationState;
         let Some(fold) = ctx.fold.reservation_fold() else {
             return Vec::new();
         };
-        // Reservation fold's `ReservationState` is a small enum;
-        // group by `state_label` so the summarizer doesn't bind
-        // tightly to its specific variants.
-        let buckets = fold.with_state(|state| {
-            let mut by_label: std::collections::BTreeMap<String, u64> =
-                std::collections::BTreeMap::new();
+        // Match each variant to a fixed `&'static str` label. The
+        // previous shape used `format!("{:?}").to_lowercase()`
+        // per entry, allocating once per reservation per tick;
+        // this version allocates three short Strings per tick
+        // total (one per bucket-name slot in the wire payload).
+        let (free, reserved, active) = fold.with_state(|state| {
+            let mut free = 0u64;
+            let mut reserved = 0u64;
+            let mut active = 0u64;
             for entry in state.entries.values() {
-                let label = format!("{:?}", entry.payload.state).to_lowercase();
-                *by_label.entry(label).or_default() += 1;
+                match entry.payload.state {
+                    ReservationState::Free => free += 1,
+                    ReservationState::Reserved { .. } => reserved += 1,
+                    ReservationState::Active { .. } => active += 1,
+                }
             }
-            by_label.into_iter().collect::<Vec<_>>()
+            (free, reserved, active)
         });
         vec![SummaryAnnouncement {
             source_subnet: ctx.source_subnet,
             fold_kind: ReservationFold::KIND_ID,
             generation: ctx.generation,
-            buckets,
+            // Lex-sorted on bucket name for stable wire bytes.
+            buckets: vec![
+                ("active".to_string(), active),
+                ("free".to_string(), free),
+                ("reserved".to_string(), reserved),
+            ],
         }]
     }
 }
