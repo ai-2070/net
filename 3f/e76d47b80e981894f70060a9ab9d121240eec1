@@ -1,0 +1,34 @@
+net/crates/net/bindings/node/test/aggregator.test.ts
+  s_099fa7d871e34d::t_495a3c61f0fe72 1-153
+net/crates/net/bindings/node/src/aggregator.rs
+  s_099fa7d871e34d::t_8739b929a27b81 1-381
+net/crates/net/bindings/node/package.json
+  s_099fa7d871e34d::t_82066450806e3b 63-66
+  s_099fa7d871e34d::t_aa6d8c071c76e6 23-26
+net/crates/net/bindings/node/src/lib.rs
+  s_099fa7d871e34d::t_2e944f1065065b 18-19
+  s_099fa7d871e34d::t_f37ab1cb0f031e 54-55
+  s_099fa7d871e34d::t_cfcfc2d5280585 1992
+net/crates/net/bindings/node/Cargo.toml
+  s_099fa7d871e34d::t_541175e299b4e2 117-121
+net/crates/net/bindings/node/aggregator.ts
+  s_099fa7d871e34d::t_3d0e239a66481d 1-222
+net/crates/net/bindings/node/tsconfig.build.json
+  s_099fa7d871e34d::t_a3bfdeccf95749 27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "3fe76d47b80e981894f70060a9ab9d121240eec1",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
