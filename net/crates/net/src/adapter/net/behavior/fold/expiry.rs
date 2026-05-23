@@ -5,11 +5,12 @@
 //! [`Fold::new`](super::Fold::new) walks the state on a
 //! configurable cadence and evicts entries past that instant.
 //!
-//! [`sweep_expired`] is a plain synchronous walk-and-remove so
-//! tests can drive expiry deterministically without spinning a
-//! tokio runtime; the background task is a thin loop on top of
-//! it. The task holds a [`Weak`] reference to the fold's inner
-//! state so it exits naturally when the last [`Fold<K>`] drops.
+//! The internal `sweep_expired` helper is a plain synchronous
+//! walk-and-remove so tests can drive expiry deterministically
+//! without spinning a tokio runtime; the background task is a
+//! thin loop on top of it. The task holds a [`Weak`] reference
+//! to the fold's inner state so it exits naturally when the last
+//! [`Fold<K>`](super::Fold) drops.
 //!
 //! [`DEFAULT_SWEEP_INTERVAL`] (500 ms) is a compromise between
 //! "TTL boundary observable within a human-perceivable window"

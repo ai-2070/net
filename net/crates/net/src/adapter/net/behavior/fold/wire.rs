@@ -67,7 +67,7 @@ pub fn placeholder_signature() -> Vec<u8> {
 
 /// One signed announcement on a fold channel. The `P` parameter
 /// is the per-fold payload type
-/// ([`super::FoldKind::Payload`](super::FoldKind::Payload)).
+/// ([`super::FoldKind::Payload`]).
 ///
 /// Postcard-encoded with field-ordered structs; the signature is
 /// Ed25519 over the canonical encoding of every other field.
@@ -262,7 +262,8 @@ pub(super) fn signing_bytes<P: Serialize>(
 impl<P: Serialize + DeserializeOwned> SignedAnnouncement<P> {
     /// Construct + sign an announcement with the supplied
     /// keypair. The signature commits to every other field via
-    /// [`signing_bytes`].
+    /// the canonical `signing_bytes` byte layout (private to
+    /// this module).
     pub fn sign(
         keypair: &crate::adapter::net::identity::EntityKeypair,
         kind: u16,
@@ -287,7 +288,8 @@ impl<P: Serialize + DeserializeOwned> SignedAnnouncement<P> {
         })
     }
 
-    /// Verify the signature against a publisher's [`EntityId`].
+    /// Verify the signature against a publisher's
+    /// [`EntityId`](crate::adapter::net::identity::EntityId).
     ///
     /// Rejects:
     /// - Wrong-length signatures

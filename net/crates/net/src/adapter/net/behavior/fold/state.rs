@@ -23,11 +23,11 @@ use super::FoldKind;
 /// Publisher's routing-layer identity, matching
 /// [`behavior::placement::NodeId`](super::super::placement::NodeId).
 /// The fold layer indexes by this `u64` rather than the 32-byte
-/// cryptographic [`behavior::metadata::NodeId`] because every
-/// query surface (capability, routing, reservation) addresses
-/// nodes by their routing id, and the wire envelope already
-/// commits a separate [`SignedAnnouncement::signature`] to the
-/// publisher's cryptographic identity.
+/// cryptographic node identity because every query surface
+/// (capability, routing, reservation) addresses nodes by their
+/// routing id, and the wire envelope already commits a separate
+/// [`SignedAnnouncement::signature`] to the publisher's
+/// cryptographic identity.
 pub type NodeId = u64;
 
 /// One entry in a fold: the payload most recently accepted for

@@ -433,8 +433,8 @@ impl<K: FoldKind> Fold<K> {
     ///
     /// Re-anchors `received_at` / `expires_at` against the
     /// current `Instant::now()` so freshness semantics survive
-    /// the dump → restore boundary (see
-    /// [`FoldSnapshot::rehydrate_entry`]).
+    /// the dump → restore boundary (handled by an internal
+    /// `FoldSnapshot::rehydrate_entry` helper).
     pub fn restore(&self, snap: FoldSnapshot<K>, force: bool) -> Result<(), FoldError> {
         // Snapshot kind ↔ fold kind is a configuration invariant:
         // the dispatch layer routes by kind, so a foreign-kind

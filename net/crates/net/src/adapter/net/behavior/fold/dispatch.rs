@@ -194,10 +194,11 @@ impl FoldRegistry {
     /// Dispatch an inbound wire envelope to the right fold.
     ///
     /// The dispatch is two-step:
-    /// 1. [`peek_kind`] reads the leading `kind: u16` varint to
-    ///    pick the right adapter. This is unavoidable: the per-
-    ///    fold adapter is typed on `K::Payload`, so we can't run
-    ///    the full envelope decode until we know `K`.
+    /// 1. A private `peek_kind` helper reads the leading
+    ///    `kind: u16` varint to pick the right adapter. This is
+    ///    unavoidable: the per-fold adapter is typed on
+    ///    `K::Payload`, so we can't run the full envelope decode
+    ///    until we know `K`.
     /// 2. The matched adapter runs the full
     ///    [`SignedAnnouncement::decode_and_verify`] (which also
     ///    re-reads the `kind` field as part of the struct

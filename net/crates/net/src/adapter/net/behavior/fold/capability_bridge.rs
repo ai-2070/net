@@ -4,27 +4,25 @@
 //! Centralizes filter-shape translation, post-query predicate
 //! filtering (range predicates the fold's secondary index
 //! doesn't index natively), and scope-filter composition for
-//! callers migrating from
-//! [`behavior::capability::CapabilityIndex`](super::super::capability::CapabilityIndex)
-//! to [`Fold<CapabilityFold>`](super::Fold).
+//! callers using [`Fold<CapabilityFold>`](super::Fold) as the
+//! source of truth (the legacy `CapabilityIndex` was deleted in
+//! Multifold Phase 3B; see `docs/plans/MULTIFOLD_PHASE_3B_CUTOVER.md`).
 //!
 //! ## What's here
 //!
-//! - [`translate_filter`] — legacy
-//!   [`behavior::capability::CapabilityFilter`](super::super::capability::CapabilityFilter)
-//!   → [`super::CapabilityFilter`]. Handles the indexable axes
+//! - [`translate_filter`] — legacy `CapabilityFilter` →
+//!   [`super::CapabilityFilter`]. Handles the indexable axes
 //!   (tags, models, tools).
 //! - [`membership_passes_post_filter`] — for the predicates the
 //!   fold's secondary index doesn't surface (memory_gb,
 //!   vram_gb, GPU presence, GPU vendor).
 //! - [`find_nodes_matching`] — combine the two: query the fold,
 //!   post-filter the returned memberships, dedupe by node_id.
-//! - [`scope_from_membership_tags`] — derive a
-//!   [`CapabilityScope`](super::super::capability::CapabilityScope)
-//!   from the string-tag form the fold's payload carries.
+//! - `scope_from_membership_tags` (private) — derive a
+//!   `CapabilityScope` from the string-tag form the fold's
+//!   payload carries.
 //! - [`find_nodes_matching_scoped`] — the fold-flavored
-//!   replacement for
-//!   [`CapabilityIndex::find_nodes_scoped`](super::super::capability::CapabilityIndex::find_nodes_scoped).
+//!   replacement for the legacy `find_nodes_scoped`.
 
 use std::collections::HashSet;
 
@@ -421,10 +419,10 @@ pub(crate) fn scope_from_membership_tags(tags: &[String]) -> CapabilityScope {
 
 /// Run a [`Predicate`](super::super::predicate::Predicate)
 /// against every publisher in the fold and return the matching
-/// `(node_id, synthesized_caps)` pairs. Mirrors the legacy
-/// `CapabilityQuery::filter` impl on `CapabilityIndex` but
-/// walks the fold's by_node reverse index and builds the
-/// `EvalContext` from a synthesized [`CapabilitySet`].
+/// `(node_id, synthesized_caps)` pairs. Walks the fold's
+/// `by_node` reverse index and builds the `EvalContext` from a
+/// synthesized
+/// [`CapabilitySet`](super::super::capability::CapabilitySet).
 ///
 /// Tag-based predicates work fully — reserved-prefix tags
 /// round-trip through `Tag::parse` inside

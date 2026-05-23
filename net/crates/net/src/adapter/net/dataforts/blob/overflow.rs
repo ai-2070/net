@@ -76,13 +76,13 @@ pub struct OverflowPush {
     /// Wire size of the chunk in bytes. Drives the receive-
     /// side disk-gate.
     pub size_bytes: u64,
-    /// Sender's canonical `node_id`. The receiver looks the
-    /// sender's [`CapabilitySet`] up in its local
-    /// [`CapabilityIndex`] keyed on this id; the admission
-    /// check reads `overflow_enabled` + scope tags from the
-    /// looked-up snapshot, not from the request body. Defends
-    /// against a sender forging its caps via the request — the
-    /// only authority is the verified capability index.
+    /// Sender's canonical `node_id`. The receiver synthesizes
+    /// the sender's `CapabilitySet` from its local capability
+    /// fold keyed on this id; the admission check reads
+    /// `overflow_enabled` + scope tags from the synthesized
+    /// snapshot, not from the request body. Defends against a
+    /// sender forging its caps via the request — the only
+    /// authority is the verified fold state.
     pub sender_node_id: u64,
 }
 

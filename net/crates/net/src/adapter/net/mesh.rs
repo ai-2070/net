@@ -7186,8 +7186,9 @@ impl MeshNode {
         Ok(())
     }
 
-    /// Encode a [`SignedAnnouncement<P>`] and send it to one peer
-    /// as a [`super::behavior::fold::SUBPROTOCOL_FOLD`] frame.
+    /// Encode a [`super::behavior::fold::SignedAnnouncement`] and
+    /// send it to one peer as a
+    /// [`super::behavior::fold::SUBPROTOCOL_FOLD`] frame.
     /// The receiver's `dispatch_packet` arm decodes + verifies +
     /// routes to the right typed [`super::behavior::fold::Fold<K>`]
     /// via the installed

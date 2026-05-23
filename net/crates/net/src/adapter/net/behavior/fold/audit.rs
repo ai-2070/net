@@ -2,7 +2,7 @@
 //!
 //! [`FoldKind::audit_event`](super::FoldKind::audit_event) is
 //! called on every applied transition; the returned
-//! [`AuditEvent`](super::AuditEvent) is forwarded to the
+//! [`AuditEvent`] is forwarded to the
 //! installed [`FoldAuditSink`]. Default install is `None`, in
 //! which case audit emission is effectively a no-op; sinks can
 //! be installed at any time via

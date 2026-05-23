@@ -33,7 +33,7 @@
 //! RTT graph (or `0` if unknown), and a bandwidth heuristic of
 //! `64 KiB` per node (chain reads are typically small). Phase
 //! B replaces the bandwidth heuristic with cardinality
-//! estimates pulled via [`CapabilityQuery::aggregate`].
+//! estimates pulled via the capability-query aggregate path.
 
 use std::time::Duration;
 

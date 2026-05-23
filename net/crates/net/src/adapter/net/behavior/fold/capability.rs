@@ -6,10 +6,9 @@
 //! hardware summary, current state, optional region + price
 //! quote.
 //!
-//! The legacy [`CapabilityIndex`](super::super::capability::CapabilityIndex)
-//! is still in service; cutting its ~20 call sites over to this
-//! fold is tracked separately
-//! (see `docs/plans/MULTIFOLD_PHASE_3B_CUTOVER.md`).
+//! Replaces the deleted `behavior::capability::CapabilityIndex` —
+//! see `docs/plans/MULTIFOLD_PHASE_3B_CUTOVER.md` for the
+//! end-to-end cutover that landed.
 //!
 //! Tags ship as canonical `String`s — the same form the legacy
 //! [`Tag`](super::super::tag::Tag) enum would emit when
