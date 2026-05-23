@@ -246,12 +246,4 @@ mod tests {
         assert!(parse_u16("65536", "x").is_err()); // overflow u16
         assert!(parse_u16("0x1FFFF", "x").is_err()); // hex overflow u16
     }
-
-    #[test]
-    fn _summary_interval_seconds_round_trips_zero() {
-        // Operator-readable JSON: `summary_interval_secs: 0.0`
-        // when no aggregator is installed (the duration default
-        // is Duration::ZERO).
-        let _ = Duration::ZERO.as_secs_f64();
-    }
 }
