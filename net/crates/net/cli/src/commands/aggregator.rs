@@ -1,5 +1,6 @@
-//! `net aggregator (inspect|query)` — operator surface for
-//! the substrate's `AggregatorDaemon` state.
+//! `net aggregator (inspect|query|ls|spawn|scale)` — operator
+//! surface for the substrate's `AggregatorDaemon` state and the
+//! `AggregatorRegistry` that holds live groups.
 //!
 //! `inspect` reads the **local** aggregator's state via the
 //! `DeckClient::aggregator_*` accessors (populated when an
@@ -14,12 +15,21 @@
 //! (target node id parsing, fold kind selection,
 //! summarize-now vs. latest, JSON output).
 //!
-//! Spawn / ls / scale are deferred — those need a daemon binary
-//! to host the long-running aggregator + `ReplicaGroup`
-//! integration. The one-shot CLI shape only fits inspect and
-//! query today.
+//! `ls` enumerates every group registered on the local node's
+//! `AggregatorRegistry` with per-replica health + generation.
+//! Reads through `DeckClient::aggregator_registry_snapshot` —
+//! when the CLI runs against a process that doesn't host a
+//! registry, output is empty (same convention as `inspect`).
 //!
-//! Phase C of `SCALING_SUBNET_SPEC.md`.
+//! `spawn` and `scale` parse + validate args today but return a
+//! typed "needs daemon process" error: the one-shot CLI can't
+//! host the long-running aggregator loop. The error includes
+//! the parsed arguments so operators see what would be passed.
+//! These verbs flip to live once an aggregator-daemon binary +
+//! registry-RPC surface land.
+//!
+//! Phase C of `SCALING_SUBNET_SPEC.md`. Direction B / step 5 of
+//! `AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`.
 
 use std::path::PathBuf;
 
@@ -41,10 +51,73 @@ pub enum AggregatorCommand {
     /// the substrate call path needs a MeshNode wired into the
     /// deck, which the read-only CLI doesn't carry yet.
     Query(QueryArgs),
+    /// List aggregator groups registered on the local node's
+    /// `AggregatorRegistry`. Output includes per-replica health
+    /// + generation. Empty when no registry is installed.
+    Ls(LsArgs),
+    /// \[preview\] Spawn a new aggregator group. Validates args
+    /// then errors — needs a daemon process to host the live
+    /// group + registry.
+    Spawn(SpawnArgs),
+    /// \[preview\] Resize an existing group. Validates args
+    /// then errors — needs registry-RPC plumbing.
+    Scale(ScaleArgs),
 }
 
 #[derive(Args, Debug)]
 pub struct InspectArgs {
+    #[arg(long)]
+    pub identity: Option<PathBuf>,
+
+    #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
+    pub node: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct LsArgs {
+    #[arg(long)]
+    pub identity: Option<PathBuf>,
+
+    #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
+    pub node: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct SpawnArgs {
+    /// Operator-chosen group name. Must be unique within the
+    /// target node's registry.
+    #[arg(long)]
+    pub name: String,
+    /// Number of replicas to spawn. `1..=255`.
+    #[arg(long)]
+    pub replica_count: u8,
+    /// `SubnetId` the aggregator summarizes — accepts dotted
+    /// notation (e.g. `3.7`) or decimal.
+    #[arg(long)]
+    pub source_subnet: String,
+    /// 32-byte group seed as hex (64 chars). Optional — when
+    /// omitted, the CLI would derive one from `name`. (Today
+    /// `spawn` errors before reaching the derivation, so the
+    /// flag is parse-only.)
+    #[arg(long)]
+    pub group_seed: Option<String>,
+
+    #[arg(long)]
+    pub identity: Option<PathBuf>,
+
+    #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
+    pub node: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct ScaleArgs {
+    /// Group name to resize.
+    #[arg(long)]
+    pub name: String,
+    /// Target replica count. `1..=255`.
+    #[arg(long)]
+    pub replica_count: u8,
+
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
@@ -85,6 +158,9 @@ pub async fn run(
             run_inspect(args, output, config_path, profile_name).await
         }
         AggregatorCommand::Query(args) => run_query(args, output, config_path, profile_name).await,
+        AggregatorCommand::Ls(args) => run_ls(args, output, config_path, profile_name).await,
+        AggregatorCommand::Spawn(args) => run_spawn(args, output, config_path, profile_name).await,
+        AggregatorCommand::Scale(args) => run_scale(args, output, config_path, profile_name).await,
     }
 }
 
@@ -156,6 +232,160 @@ async fn run_query(
          doesn't construct one in-process yet; when the in-process MeshNode \
          bootstrap lands (or remote-attach), this command flips to live.",
     ))
+}
+
+async fn run_ls(
+    args: LsArgs,
+    output: Option<OutputFormat>,
+    config_path: Option<&std::path::Path>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    let profile = resolve_profile(config_path, profile_name).await?;
+    let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
+    let deck = ctx.deck();
+    let snapshot = deck.aggregator_registry_snapshot().await;
+    let view = match snapshot {
+        Some(s) => LsView {
+            registry_installed: true,
+            group_count: s.groups.len() as u64,
+            groups: s.groups.iter().map(LsGroupRow::from).collect(),
+        },
+        None => LsView {
+            registry_installed: false,
+            group_count: 0,
+            groups: Vec::new(),
+        },
+    };
+    emit_value(OutputFormat::resolve_oneshot(output), &view)
+        .map_err(|e| generic(format!("write aggregator ls: {e}")))?;
+    Ok(())
+}
+
+async fn run_spawn(
+    args: SpawnArgs,
+    _output: Option<OutputFormat>,
+    _config_path: Option<&std::path::Path>,
+    _profile_name: &str,
+) -> Result<(), CliError> {
+    // Validate inputs up-front so the operator sees concrete
+    // parse errors rather than a generic "not supported."
+    if args.replica_count == 0 {
+        return Err(invalid_args("replica_count must be > 0"));
+    }
+    // SubnetId parse — accepts "global" or dotted u8 levels.
+    use std::str::FromStr;
+    net_sdk::subnets::SubnetId::from_str(&args.source_subnet)
+        .map_err(|e| invalid_args(format!("source_subnet `{}`: {e}", args.source_subnet)))?;
+    // group_seed parse if provided.
+    if let Some(ref seed) = args.group_seed {
+        let trimmed = seed.trim_start_matches("0x");
+        let bytes = hex_decode_32(trimmed)
+            .map_err(|e| invalid_args(format!("group_seed `{seed}`: {e}")))?;
+        let _: [u8; 32] = bytes;
+    }
+    Err(invalid_args(format!(
+        "net aggregator spawn is parse-only today: args validated (name={}, \
+         replica_count={}, source_subnet={}) but the substrate call path \
+         needs a daemon process hosting an AggregatorRegistry + a registry-RPC \
+         surface so the CLI can invoke `register` remotely. Tracked in \
+         AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md.",
+        args.name, args.replica_count, args.source_subnet,
+    )))
+}
+
+async fn run_scale(
+    args: ScaleArgs,
+    _output: Option<OutputFormat>,
+    _config_path: Option<&std::path::Path>,
+    _profile_name: &str,
+) -> Result<(), CliError> {
+    if args.replica_count == 0 {
+        return Err(invalid_args("replica_count must be > 0"));
+    }
+    Err(invalid_args(format!(
+        "net aggregator scale is parse-only today: args validated (name={}, \
+         replica_count={}) but the substrate path needs the same daemon + \
+         registry-RPC plumbing as spawn. Tracked in \
+         AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md.",
+        args.name, args.replica_count,
+    )))
+}
+
+/// Hex-decode 32 bytes from a 64-char string. Used by
+/// `spawn --group-seed`. Wraps `hex::decode` + a length check
+/// so the error path matches `psk_hex` / `group_seed`
+/// elsewhere.
+fn hex_decode_32(s: &str) -> Result<[u8; 32], String> {
+    hex::decode(s)
+        .map_err(|e| format!("invalid hex: {e}"))?
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("expected 32 bytes, got {}", v.len()))
+}
+
+#[derive(Serialize)]
+struct LsView {
+    /// `true` when the deck has an `AggregatorRegistry` wired
+    /// in. Most operator CLI invocations see `false` today —
+    /// aggregator daemons run in separate processes, not the CLI.
+    registry_installed: bool,
+    /// Convenience — `groups.len()` rendered as its own field.
+    group_count: u64,
+    groups: Vec<LsGroupRow>,
+}
+
+#[derive(Serialize)]
+struct LsGroupRow {
+    name: String,
+    /// 64-char hex rendering of `group_seed`.
+    group_seed: String,
+    /// Per-replica rows in declaration order.
+    replicas: Vec<LsReplicaRow>,
+    /// Summary counter — how many replicas are healthy now.
+    healthy_count: u64,
+    /// Summary counter — total replicas in the group.
+    replica_count: u64,
+}
+
+impl From<&net_sdk::deck::AggregatorRegistryGroupSnapshot> for LsGroupRow {
+    fn from(g: &net_sdk::deck::AggregatorRegistryGroupSnapshot) -> Self {
+        let replicas: Vec<LsReplicaRow> = g.replicas.iter().map(LsReplicaRow::from).collect();
+        let healthy_count = replicas.iter().filter(|r| r.healthy).count() as u64;
+        Self {
+            name: g.name.clone(),
+            group_seed: g
+                .group_seed
+                .iter()
+                .fold(String::with_capacity(64), |mut acc, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(&mut acc, "{b:02x}");
+                    acc
+                }),
+            replica_count: g.replicas.len() as u64,
+            healthy_count,
+            replicas,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct LsReplicaRow {
+    generation: u64,
+    healthy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    placement_node_id: Option<u64>,
+}
+
+impl From<&net_sdk::deck::AggregatorReplicaRow> for LsReplicaRow {
+    fn from(r: &net_sdk::deck::AggregatorReplicaRow) -> Self {
+        Self {
+            generation: r.generation,
+            healthy: r.healthy,
+            diagnostic: r.diagnostic.clone(),
+            placement_node_id: r.placement_node_id,
+        }
+    }
 }
 
 #[derive(Serialize)]

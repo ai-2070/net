@@ -1,32 +1,69 @@
-//! [`LifecycleDaemon`] — async lifecycle trait for native
-//! mesh-aware daemons.
+//! [`LifecycleDaemon`] — async lifecycle trait + RAII handle.
 //!
-//! Phase B slice 4 of `SCALING_SUBNET_SPEC.md`. Defined as a
-//! **sibling** to [`MeshDaemon`](crate::adapter::net::compute::MeshDaemon)
-//! rather than an extension because the existing trait commits
-//! to a sync-only / WASM-compatible contract (see its module
-//! doc). The aggregator role is inherently async (tokio
-//! interval, `mesh.publish().await`) and needs lifecycle
-//! callbacks the event-shaped trait doesn't carry.
+//! See the module-level doc on [`super`] for the rationale on
+//! why this lives separately from
+//! [`MeshDaemon`](crate::adapter::net::compute::MeshDaemon).
 //!
 //! # Trait shape
 //!
 //! - `on_start(self: Arc<Self>)` — spawn whatever background
-//!   work the daemon needs. Called exactly once per `(replica,
-//!   mesh)` pair before any other lifecycle method. Takes
-//!   `Arc<Self>` so implementations can hand the daemon to a
-//!   background tokio task without storing weak refs.
+//!   work the daemon needs. Called exactly once per daemon
+//!   before any other lifecycle method. Receives `Arc<Self>`
+//!   so implementations can move the daemon into a tokio task
+//!   without weak-ref gymnastics.
 //! - `on_stop(&self)` — signal the background work to stop.
-//!   Called exactly once after all references to the daemon are
-//!   about to drop. Idempotent in practice; the
-//!   [`LifecycleHandle`] only calls it once.
+//!   Called exactly once before the handle drops. Idempotent
+//!   in practice; [`LifecycleHandle`] only calls it once.
 //!
 //! The trait surface is intentionally minimal so future
-//! lifecycle hooks (`on_pause`, `on_drain`, etc.) can land
+//! lifecycle hooks (`on_pause`, `on_drain`, …) can land
 //! without breaking existing impls.
 
 use async_trait::async_trait;
 use std::sync::Arc;
+
+use crate::adapter::net::behavior::capability::CapabilityFilter;
+
+/// Per-replica health snapshot reported by
+/// [`LifecycleDaemon::health`]. Distinct from the substrate's
+/// `DaemonHealth` so lifecycle daemons can carry typed
+/// diagnostic strings without dragging in cross-module
+/// dependencies. The
+/// [`LifecycleGroup::health`](super::group::LifecycleGroup::health)
+/// accessor returns one of these per replica in declaration
+/// order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaHealth {
+    /// True when the daemon's last heartbeat was within its
+    /// liveness window. Implementations that don't carry a
+    /// liveness notion can leave this `true` permanently —
+    /// the default [`LifecycleDaemon::health`] does exactly
+    /// that.
+    pub healthy: bool,
+    /// Daemon-specific diagnostic when `healthy == false`.
+    /// Operator surfaces render this verbatim.
+    pub diagnostic: Option<String>,
+}
+
+impl ReplicaHealth {
+    /// Healthy snapshot with no diagnostic. The default
+    /// [`LifecycleDaemon::health`] impl returns this.
+    pub fn healthy() -> Self {
+        Self {
+            healthy: true,
+            diagnostic: None,
+        }
+    }
+
+    /// Unhealthy snapshot carrying a diagnostic for operator
+    /// rendering.
+    pub fn unhealthy(reason: impl Into<String>) -> Self {
+        Self {
+            healthy: false,
+            diagnostic: Some(reason.into()),
+        }
+    }
+}
 
 /// Async lifecycle trait for native mesh-aware daemons. See
 /// module doc for the trait's intent and the
@@ -39,6 +76,26 @@ pub trait LifecycleDaemon: Send + Sync + 'static {
     /// header). Stable across the daemon's lifetime; no
     /// per-replica differentiation.
     fn name(&self) -> &str;
+
+    /// Capability requirements for placement. Mirrors
+    /// [`MeshDaemon::requirements`](crate::adapter::net::compute::MeshDaemon::requirements)
+    /// so the same scheduler primitives
+    /// ([`Scheduler::place`](crate::adapter::net::compute::Scheduler::place),
+    /// [`GroupCoordinator::place_with_spread`](crate::adapter::net::compute::GroupCoordinator::place_with_spread))
+    /// apply to lifecycle daemons without duplicating the
+    /// filter type. Returns `CapabilityFilter::default()` to
+    /// run anywhere.
+    ///
+    /// Used by
+    /// [`LifecycleGroup::spawn_with_placement`](super::group::LifecycleGroup::spawn_with_placement)
+    /// — invoked once before placement to read the requirements
+    /// applied to every replica. Daemons whose requirements are
+    /// uniform across replicas (the common case) can leave the
+    /// default empty filter and pass requirements directly to
+    /// `spawn_with_placement`.
+    fn requirements(&self) -> CapabilityFilter {
+        CapabilityFilter::default()
+    }
 
     /// Called once when a [`LifecycleHandle`] wrapping `self`
     /// is created. Implementations spawn whatever long-running
@@ -55,6 +112,19 @@ pub trait LifecycleDaemon: Send + Sync + 'static {
     /// implementations that need to wait for full teardown should
     /// hold a `JoinHandle` internally and await it here.
     async fn on_stop(&self);
+
+    /// Liveness check polled by
+    /// [`LifecycleGroup::health`](super::group::LifecycleGroup::health)
+    /// and the auto-respawn monitor. Default: report healthy
+    /// — daemons that have a heartbeat / tick / generation
+    /// notion override to surface stuck loops to operators.
+    ///
+    /// `async` because some daemons may need to await an
+    /// internal RwLock or query the runtime; most impls are
+    /// fast and non-blocking.
+    async fn health(&self) -> ReplicaHealth {
+        ReplicaHealth::healthy()
+    }
 }
 
 /// Lifecycle-trait error shape. Distinct from substrate-wide
@@ -126,10 +196,6 @@ impl LifecycleHandle {
 
 impl Drop for LifecycleHandle {
     fn drop(&mut self) {
-        // Fallback path: if the handle is dropped without
-        // calling `stop()`, schedule the async shutdown on a
-        // detached task. Operators reaching for deterministic
-        // teardown call `.stop().await` explicitly.
         if let Some(daemon) = self.daemon_for_drop.take() {
             match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
@@ -225,7 +291,6 @@ mod tests {
             let _handle = LifecycleHandle::start(daemon.clone()).await.expect("start");
             // Drop fires next.
         }
-        // The detached spawn lands; give it a moment to settle.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(daemon.stops.load(Ordering::Acquire), 1);
     }

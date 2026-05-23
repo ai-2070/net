@@ -41,11 +41,12 @@
 // `net_sdk::deck::*` path.
 pub use net::adapter::net::behavior::aggregator::SummaryAnnouncement;
 pub use net::adapter::net::behavior::deck::{
-    AdminCommands, AdminError, AggregatorSnapshot, AuditQuery, AuditStream, ChainCommit,
-    DaemonCounts, DeckClient, DeckClientConfig, DeckError, FailureStream, GatewayStats,
-    IceCommands, IceError, IceProposal, LogFilter, LogStream, OperatorIdentity, OperatorRegistry,
-    OperatorSignature, PeerCounts, SimulatedIceProposal, SnapshotStream, StatusSummary,
-    StatusSummaryStream, SubnetRollup,
+    AdminCommands, AdminError, AggregatorRegistryGroupSnapshot, AggregatorRegistrySnapshot,
+    AggregatorReplicaRow, AggregatorSnapshot, AuditQuery, AuditStream, ChainCommit, DaemonCounts,
+    DeckClient, DeckClientConfig, DeckError, FailureStream, GatewayStats, IceCommands, IceError,
+    IceProposal, LogFilter, LogStream, OperatorIdentity, OperatorRegistry, OperatorSignature,
+    PeerCounts, SimulatedIceProposal, SnapshotStream, StatusSummary, StatusSummaryStream,
+    SubnetRollup,
 };
 // Pure ICE simulator — runs a `BlastRadius` against any
 // `MeshOsSnapshot` + `IceActionProposal` without touching the

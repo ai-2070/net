@@ -25,14 +25,14 @@ Tagged `[B | H | M | L]`:
 
 | ID    | Pri | Area                  | Title                                                                                 |
 |-------|-----|-----------------------|---------------------------------------------------------------------------------------|
-| AL-1  | H   | trait surface         | `LifecycleDaemon` sibling vs spec-promised `MeshDaemon` aggregator                    |
-| AL-2  | B   | placement             | `AggregatorGroup` has no cross-node placement                                         |
-| AL-3  | H   | failure recovery      | No auto-replacement or per-replica health on `AggregatorGroup`                        |
-| AL-4  | M   | observability         | `AggregatorGroup` skips `DaemonRegistry` registration                                 |
-| AL-5  | M   | shutdown determinism  | `on_stop` JoinHandle timeout is `interval + 100ms` — can drop mid-publish work        |
-| AL-6  | M   | operator CLI          | `net aggregator spawn / ls / scale` gated on AL-2..AL-4                               |
-| AL-7  | L   | dead-code warning     | `DispatchCtx.reservation_fold` field wired but unread (build warning)                 |
-| AL-8  | L   | summary rendering     | Reservation summarizer's `Reserved { ... }` Debug bucket name is verbose              |
+| AL-1  | H   | trait surface         | `LifecycleDaemon` sibling vs `MeshDaemon` — ✅ direction B (sibling + generalized to `LifecycleGroup<L>`, `e672793a`) |
+| AL-2  | B   | placement             | `AggregatorGroup` had no cross-node placement — ✅ `spawn_with_placement` via `Scheduler`, `5acf1f34`                  |
+| AL-3  | H   | failure recovery      | No per-replica health or auto-replacement — ✅ `health()` + `replace` + `HealthMonitor`, `8787b2db` / `40a1b375`        |
+| AL-4  | M   | observability         | `AggregatorGroup` skipped registry — ✅ `AggregatorRegistry` on `MeshNode`, `e50728f0`                                  |
+| AL-5  | M   | shutdown determinism  | `on_stop` could drop mid-publish work — ✅ shutdown-aware tick loop + bumped backstop, `4016528a` |
+| AL-6  | M   | operator CLI          | `net aggregator spawn / ls / scale` — ✅ `ls` live, `spawn`/`scale` parse-only pending daemon, `cb74cc14`                |
+| AL-7  | L   | dead-code warning     | `DispatchCtx.reservation_fold` field wired but unread — ✅ `cc4aac82`                  |
+| AL-8  | L   | summary rendering     | Reservation summarizer's `Reserved { ... }` Debug bucket — ✅ fixed-label match arms + tighter test, `4016528a` |
 
 ---
 
@@ -140,6 +140,25 @@ The existing test (`reservation_fold_summarizer_buckets_by_state_label`) papers 
 
 ## Cross-references
 
-- Spec: `docs/plans/SCALING_SUBNET_SPEC.md` — design intent, the "deployed via ReplicaGroup" promise these items are gated on.
+- Spec: `docs/plans/SCALING_SUBNET_SPEC.md` — design intent, the "deployed via ReplicaGroup" promise these items were gated on.
 - Prior deferred review: `docs/misc/CODE_REVIEW_2026_05_23_MULTIFOLD_DEFERRED.md` — fold-framework cleanup landed earlier the same day.
-- Slice commits: `19faf1e3` (LifecycleDaemon + impl), `09492dc5` (AggregatorGroup).
+- Slice 4 commits (subnet-scaling branch): `19faf1e3` (LifecycleDaemon + impl), `09492dc5` (AggregatorGroup).
+- Direction B commits (aggregator-lifecycle branch):
+  - `e672793a` — step 1: hoist + generalize `LifecycleGroup<L>`.
+  - `5acf1f34` — step 2: `requirements()` + `spawn_with_placement`.
+  - `e50728f0` — step 3: `AggregatorRegistry` on `MeshNode`.
+  - `8787b2db` — step 4a: `ReplicaHealth` + `LifecycleGroup::replace`.
+  - `40a1b375` — step 4b: `HealthMonitor` auto-respawn driver.
+  - `cb74cc14` — step 5: `net aggregator ls / spawn / scale`.
+  - `4016528a` — AL-5 + AL-8 fixes.
+  - `71ccaebf` — step 6: registry holds `LifecycleGroup` directly + `register_with_monitor`.
+  - `1bc409fd` — slice 7: `aggregator.registry` RPC service + `RegistryClient` (List op).
+  - `a4024e37` — slice 8: `net-aggregator-daemon` binary + library.
+  - `5560079b` — slice 9: `Spawn`/`Unregister` RPC ops + daemon templates + auto-respawn-by-default.
+
+## Remaining gap
+
+All eight original items (AL-1..AL-8) are resolved. A turnkey daemon binary ships with template-based dynamic spawn, auto-respawn-by-default, and full `List`/`Spawn`/`Unregister` RPC surface. The one substrate-adjacent surface still pending:
+
+- **CLI remote-attach** — `net aggregator ls / query / spawn / scale` against `--node=X` is gated on `CliContext` having a `MeshNode` it can RPC through (pre-existing substrate gap, NET_CLI_PLAN.md Phase 5). The wire surface and `RegistryClient` are ready; the gap is the CLI's MeshNode bootstrap.
+- **Scale RPC** — `LifecycleGroup` doesn't yet expose `add_replica` / `remove_last`. Scale is implementable today via Unregister + Spawn-with-different-count; a dedicated `Scale` op (in-place grow/shrink) is a small follow-up that doesn't move the trust or substrate boundaries.

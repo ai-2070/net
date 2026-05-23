@@ -24,6 +24,7 @@ pub mod deck;
 pub mod diff;
 pub mod fold;
 pub mod group;
+pub mod lifecycle;
 pub mod loadbalance;
 #[cfg(feature = "meshdb")]
 pub mod meshdb;

@@ -369,6 +369,44 @@ pub struct AggregatorSnapshot {
     pub summaries: Arc<Vec<SummaryAnnouncement>>,
 }
 
+/// Per-replica row in an [`AggregatorRegistryGroupSnapshot`].
+/// One per replica in declaration order.
+#[derive(Clone, Debug)]
+pub struct AggregatorReplicaRow {
+    /// Replica's monotonic tick counter.
+    pub generation: u64,
+    /// `true` when the replica's last tick was within
+    /// `3 × summary_interval`.
+    pub healthy: bool,
+    /// Operator-facing diagnostic when `healthy == false`.
+    pub diagnostic: Option<String>,
+    /// Placement decision recorded at spawn time (only present
+    /// when the group was spawned via
+    /// `LifecycleGroup::spawn_with_placement`).
+    pub placement_node_id: Option<u64>,
+}
+
+/// Snapshot of one registered aggregator group. Built by
+/// [`DeckClient::aggregator_registry_snapshot`] and consumed by
+/// `net aggregator ls` + the future Deck panel.
+#[derive(Clone, Debug)]
+pub struct AggregatorRegistryGroupSnapshot {
+    /// Operator-chosen group name.
+    pub name: String,
+    /// 32-byte group seed for deterministic identity.
+    pub group_seed: [u8; 32],
+    /// Per-replica rows in declaration order.
+    pub replicas: Vec<AggregatorReplicaRow>,
+}
+
+/// Snapshot of every aggregator group registered on the node.
+#[derive(Clone, Debug, Default)]
+pub struct AggregatorRegistrySnapshot {
+    /// Groups in lexicographic order by name (matches the
+    /// registry's `entries()` ordering).
+    pub groups: Vec<AggregatorRegistryGroupSnapshot>,
+}
+
 /// Daemon counts within a [`StatusSummary`]. Lifecycle
 /// counts are disjoint partitions of the registered set;
 /// `crash_looping` / `backing_off` are orthogonal restart-
@@ -852,6 +890,59 @@ impl DeckClient {
             summary_interval: config.summary_interval,
             summaries: agg.latest_summaries_arc(),
         })
+    }
+
+    /// Snapshot every aggregator group registered on the
+    /// installed `MeshNode`'s
+    /// [`AggregatorRegistry`](super::aggregator::registry::AggregatorRegistry).
+    /// Returns `None` when no mesh is wired in or no registry has
+    /// been installed via `MeshNode::set_aggregator_registry`.
+    ///
+    /// Used by `net aggregator ls` + the future
+    /// Deck AGGREGATORS-list panel. Per-replica health is
+    /// surfaced inline so CLI / TUI render one shot of data
+    /// without follow-up calls.
+    pub async fn aggregator_registry_snapshot(&self) -> Option<AggregatorRegistrySnapshot> {
+        let mesh = self.mesh.as_ref()?;
+        let registry = mesh.aggregator_registry()?;
+        let entries = registry.entries();
+        let mut groups = Vec::with_capacity(entries.len());
+        for entry in entries {
+            // One lock + outside-the-guard health-join per group,
+            // via the entry's snapshot helper. Previously this
+            // path took three sequential lock acquisitions
+            // (`replicas` / `placements` / `health`) per group +
+            // a slow `health()` blocked concurrent
+            // `register`/`unregister` writers. See
+            // `AggregatorGroupEntry::snapshot` for the rationale.
+            let snap = entry.snapshot().await;
+            let rows = snap
+                .replicas
+                .iter()
+                .enumerate()
+                .map(|(idx, replica)| {
+                    let health = snap.healths.get(idx).cloned().unwrap_or(
+                        crate::adapter::net::behavior::lifecycle::ReplicaHealth {
+                            healthy: true,
+                            diagnostic: None,
+                        },
+                    );
+                    let placement_node_id = snap.placements.get(idx).map(|p| p.node_id);
+                    AggregatorReplicaRow {
+                        generation: replica.generation(),
+                        healthy: health.healthy,
+                        diagnostic: health.diagnostic,
+                        placement_node_id,
+                    }
+                })
+                .collect();
+            groups.push(AggregatorRegistryGroupSnapshot {
+                name: entry.name.clone(),
+                group_seed: entry.group_seed,
+                replicas: rows,
+            });
+        }
+        Some(AggregatorRegistrySnapshot { groups })
     }
 
     /// Aggregator's monotonic tick counter, or `0` when none

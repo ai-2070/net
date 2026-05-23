@@ -1,0 +1,73 @@
+[package]
+name = "net-aggregator-daemon"
+version = "0.21.0"
+edition = "2021"
+description = "Long-running daemon that hosts net-mesh AggregatorRegistry + aggregator groups"
+license = "Apache-2.0"
+repository = "https://github.com/ai-2070/net"
+publish = true
+
+[lib]
+name = "net_aggregator_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "net-aggregator-daemon"
+path = "src/main.rs"
+
+[dependencies]
+# Substrate primitives — aggregator + lifecycle + registry +
+# RPC service all live behind the SDK's `net` feature surface.
+net-sdk = { package = "net-mesh-sdk", version = "0.21.0", path = "../sdk", default-features = false, features = [
+    "net",
+    "nat-traversal",
+] }
+# Direct dep on the underlying crate so the binary can reach
+# the typed surfaces the SDK doesn't re-export (AggregatorConfig,
+# LifecycleGroup, etc).
+net = { package = "net-mesh", version = "0.21.0", path = ".." }
+
+# Argv parsing.
+clap = { version = "4", features = ["derive", "env"] }
+
+# Multi-thread tokio for the SDK; macros for `#[tokio::main]`;
+# `signal` for the ctrl-c-driven graceful-shutdown path.
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "signal",
+    "fs",
+] }
+
+# Config-file parsing.
+serde = { version = "1", features = ["derive"] }
+toml = "1.0"
+
+# Tracing — same shape as `net-cli`, formatted to stderr.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing = "0.1"
+
+# Hex codec for PSK + group_seed material.
+hex = "0.4"
+
+# Stable, repo-pinned 32-byte hash for the auto-derived
+# group_seed when operators don't supply one explicitly.
+# `DefaultHasher` would be unstable across Rust releases —
+# operators upgrading the daemon would silently get different
+# replica identities. Blake3 is what other identity-derivation
+# paths in the substrate already use.
+blake3 = "1"
+
+# Typed errors at the config + startup boundary.
+thiserror = "2"
+
+# `Arc<MeshNode>` + every group lifecycle method is async.
+futures = "0.3"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

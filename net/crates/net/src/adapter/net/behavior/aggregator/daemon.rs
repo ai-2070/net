@@ -36,7 +36,6 @@ use tokio::task::JoinHandle;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use super::lifecycle::{LifecycleDaemon, LifecycleError};
 use super::summarizer::{
     resolve_summarizer, CapabilityFoldHandle, FoldHandle, ReservationFoldHandle, Summarizer,
     SummarizerContext, SummaryAnnouncement,
@@ -45,6 +44,7 @@ use super::AggregatorConfig;
 use crate::adapter::net::behavior::fold::capability::CapabilityFold;
 use crate::adapter::net::behavior::fold::reservation::ReservationFold;
 use crate::adapter::net::behavior::fold::FoldKind;
+use crate::adapter::net::behavior::lifecycle::{LifecycleDaemon, LifecycleError, ReplicaHealth};
 use crate::adapter::net::{
     AdapterError, ChannelConfig, ChannelId, ChannelName, MeshNode, PublishConfig,
 };
@@ -147,6 +147,15 @@ pub struct AggregatorDaemon {
     /// `on_stop` can take ownership and await it without racing
     /// the spawn path.
     background: parking_lot::Mutex<Option<JoinHandle<()>>>,
+    /// Wallclock at construction. `LifecycleDaemon::health`
+    /// derives liveness from
+    /// `(start_instant.elapsed() / summary_interval) - generation`:
+    /// if the daemon is more than 3 ticks behind the schedule
+    /// the operator's interval implies, it reports unhealthy.
+    /// Single immutable read — no lock, no atomics. Replaces an
+    /// earlier `Mutex<Option<Instant>>` that took 3 write-locks
+    /// per tick to compute the same answer.
+    start_instant: std::time::Instant,
 }
 
 impl AggregatorDaemon {
@@ -172,6 +181,7 @@ impl AggregatorDaemon {
             )))),
             shutdown: Arc::new(AtomicBool::new(false)),
             background: parking_lot::Mutex::new(None),
+            start_instant: std::time::Instant::now(),
         })
     }
 
@@ -197,7 +207,12 @@ impl AggregatorDaemon {
                     return;
                 }
                 ticker.tick().await;
-                if let Err(e) = self.tick_and_publish().await {
+                // Use the shutdown-aware publish path so the
+                // batch can bail between summaries — without
+                // this, `on_stop` would fall back on its
+                // JoinHandle timeout and abort a mid-batch
+                // publish task.
+                if let Err(e) = self.tick_and_publish_with_shutdown(&self.shutdown).await {
                     tracing::warn!(
                         error = %e,
                         source_subnet = %self.config.source_subnet,
@@ -253,6 +268,41 @@ impl AggregatorDaemon {
         let mut published = 0;
         let mut kept: Vec<SummaryAnnouncement> = Vec::with_capacity(novel.len());
         for summary in novel {
+            self.publish_summary(&summary).await?;
+            published += 1;
+            kept.push(summary);
+        }
+        self.append_to_latest(kept);
+        Ok(published)
+    }
+
+    /// Shutdown-aware variant of [`Self::tick_and_publish`].
+    /// Identical semantics except that the inner per-summary
+    /// publish loop checks `shutdown.load(Acquire)` between
+    /// summaries and bails early if it's set — preventing the
+    /// background task from getting stuck mid-batch when
+    /// `on_stop` flips the flag. Summaries successfully
+    /// published before the bail-out still land in the latest
+    /// buffer.
+    ///
+    /// Used by the background loop in [`Self::spawn`]; tests
+    /// can call it explicitly to exercise the mid-batch
+    /// shutdown path.
+    pub async fn tick_and_publish_with_shutdown(
+        &self,
+        shutdown: &AtomicBool,
+    ) -> Result<usize, AggregatorPublishError> {
+        let batch = self.produce_summaries();
+        let novel = self.filter_novel(batch);
+        let mut published = 0;
+        let mut kept: Vec<SummaryAnnouncement> = Vec::with_capacity(novel.len());
+        for summary in novel {
+            if shutdown.load(Ordering::Acquire) {
+                // Stop mid-batch; the summaries published so far
+                // still land in the latest buffer below so the
+                // local view stays consistent.
+                break;
+            }
             self.publish_summary(&summary).await?;
             published += 1;
             kept.push(summary);
@@ -480,11 +530,53 @@ impl LifecycleDaemon for AggregatorDaemon {
         self.shutdown.store(true, Ordering::Release);
         let handle = self.background.lock().take();
         if let Some(h) = handle {
-            // Wait up to one interval + a small buffer so the
-            // loop's `ticker.tick().await` returns and the
-            // shutdown check fires before we abort.
-            let deadline = self.config.summary_interval + std::time::Duration::from_millis(100);
-            let _ = tokio::time::timeout(deadline, h).await;
+            // The loop's `tick_and_publish_with_shutdown` checks
+            // the shutdown flag between summaries, so a
+            // mid-batch publish completes its current
+            // `mesh.publish().await` and then breaks — no
+            // task-abort needed under normal conditions. The
+            // timeout exists only as a backstop for a single
+            // `mesh.publish` that hangs longer than the window.
+            // Give it a generous window: one interval + 1s
+            // (or the interval itself, whichever is larger).
+            let backstop = self
+                .config
+                .summary_interval
+                .saturating_add(std::time::Duration::from_secs(1));
+            let _ = tokio::time::timeout(backstop, h).await;
+        }
+    }
+
+    async fn health(&self) -> ReplicaHealth {
+        // Derive liveness from `start_instant + generation`:
+        //   expected = elapsed / interval
+        //   behind   = expected.saturating_sub(generation)
+        // Healthy unless `behind > MAX_BEHIND_TICKS`. Equivalent
+        // to the old "no successful tick in 3 × interval"
+        // formulation but with no per-tick lock — just an
+        // atomic load on generation + an Instant::elapsed.
+        const MAX_BEHIND_TICKS: u128 = 3;
+        let interval_ns = self.config.summary_interval.as_nanos();
+        if interval_ns == 0 {
+            // Degenerate config — can't reason about ticks per
+            // unit time. Surface as healthy; the validation at
+            // construction normally rejects this.
+            return ReplicaHealth::healthy();
+        }
+        let elapsed_ns = self.start_instant.elapsed().as_nanos();
+        let expected = elapsed_ns / interval_ns;
+        let generation = u128::from(self.generation.load(Ordering::Acquire));
+        let behind = expected.saturating_sub(generation);
+        // `>=` rather than `>` so 3 missed ticks (the
+        // "3 × interval quiet" boundary the original
+        // last-tick-elapsed check enforced) flips to unhealthy.
+        if behind >= MAX_BEHIND_TICKS {
+            ReplicaHealth::unhealthy(format!(
+                "generation {} is {} ticks behind expected {} (interval {:?})",
+                generation, behind, expected, self.config.summary_interval,
+            ))
+        } else {
+            ReplicaHealth::healthy()
         }
     }
 }
@@ -693,7 +785,7 @@ mod tests {
 
         agg.shutdown();
         // Loop exits within at most one interval after shutdown.
-        let _ = tokio::time::timeout(Duration::from_secs(2), handle)
+        tokio::time::timeout(Duration::from_secs(2), handle)
             .await
             .expect("loop exits within timeout")
             .expect("loop join clean");
@@ -881,17 +973,18 @@ mod tests {
                 .unwrap_or(0)
         };
         assert_eq!(bucket("free"), 1);
-        // `Reserved { holder, until_unix_us }` debug-renders with
-        // the named-fields shape; the summarizer's lowercase
-        // `format!("{:?}").to_lowercase()` produces a bucket name
-        // that starts with `reserved { ... }`. Assert by prefix.
-        let reserved_count: u64 = summary
-            .buckets
-            .iter()
-            .filter(|(n, _)| n.starts_with("reserved"))
-            .map(|(_, c)| *c)
-            .sum();
-        assert_eq!(reserved_count, 1);
+        // The summarizer matches each `ReservationState` variant
+        // to a fixed `&'static str` label — no Debug-derived
+        // bucket-name cardinality. So `reserved` (without any
+        // `{ ... }` suffix) is the exact bucket key.
+        assert_eq!(bucket("reserved"), 1);
+        assert_eq!(bucket("active"), 0);
+        // No spurious bucket names from Debug renderings.
+        let expected: std::collections::HashSet<&str> =
+            ["active", "free", "reserved"].into_iter().collect();
+        let actual: std::collections::HashSet<&str> =
+            summary.buckets.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
@@ -922,7 +1015,7 @@ mod tests {
         // End-to-end pin: wrap an AggregatorDaemon in a
         // LifecycleHandle, let the loop tick a few times, then
         // `stop()` and verify the generation stops advancing.
-        use crate::adapter::net::behavior::aggregator::lifecycle::LifecycleHandle;
+        use crate::adapter::net::behavior::lifecycle::LifecycleHandle;
         let mesh = build_mesh().await;
         let kp = EntityKeypair::generate();
         let fold = mesh.capability_fold();
@@ -932,9 +1025,8 @@ mod tests {
             .with_fold_kind(CapabilityFold::KIND_ID)
             .with_interval(Duration::from_millis(20));
         let agg: Arc<AggregatorDaemon> = Arc::new(AggregatorDaemon::new(cfg, mesh).expect("new"));
-        let agg_trait: Arc<
-            dyn crate::adapter::net::behavior::aggregator::lifecycle::LifecycleDaemon,
-        > = agg.clone();
+        let agg_trait: Arc<dyn crate::adapter::net::behavior::lifecycle::LifecycleDaemon> =
+            agg.clone();
 
         let handle = LifecycleHandle::start(agg_trait).await.expect("start");
         tokio::time::sleep(Duration::from_millis(85)).await;
@@ -962,7 +1054,7 @@ mod tests {
         // tick, so a fresh on_start after stop would never run if
         // the flag stayed set). Validate by direct LifecycleDaemon
         // trait calls.
-        use crate::adapter::net::behavior::aggregator::lifecycle::LifecycleDaemon;
+        use crate::adapter::net::behavior::lifecycle::LifecycleDaemon;
         let mesh = build_mesh().await;
         let cfg = AggregatorConfig::new(SubnetId::GLOBAL)
             .with_fold_kind(CapabilityFold::KIND_ID)
@@ -976,5 +1068,76 @@ mod tests {
         LifecycleDaemon::on_stop(&*agg).await;
         let gen_after_first = agg.generation();
         assert!(gen_after_first >= 1);
+    }
+
+    #[tokio::test]
+    async fn health_reports_healthy_before_first_tick_and_after_a_recent_tick() {
+        use crate::adapter::net::behavior::lifecycle::LifecycleDaemon;
+        let mesh = build_mesh().await;
+        let cfg = AggregatorConfig::new(SubnetId::GLOBAL)
+            .with_fold_kind(CapabilityFold::KIND_ID)
+            .with_interval(Duration::from_millis(50));
+        let agg = AggregatorDaemon::new(cfg, mesh).expect("new");
+        // Before any tick has landed, health is "healthy" so a
+        // freshly-started daemon isn't reported as unhealthy
+        // during its first interval.
+        assert!(LifecycleDaemon::health(&agg).await.healthy);
+        // After a fresh tick, still healthy.
+        agg.tick_once();
+        assert!(LifecycleDaemon::health(&agg).await.healthy);
+    }
+
+    #[tokio::test]
+    async fn tick_and_publish_with_shutdown_bails_before_publishing_when_flag_is_set() {
+        // Pre-set shutdown, then call the shutdown-aware variant.
+        // The for-loop's first iteration sees the flag and
+        // breaks — published count is 0, no summaries land in
+        // the latest buffer (since none were kept).
+        let mesh = build_mesh().await;
+        let kp = EntityKeypair::generate();
+        let fold = mesh.capability_fold();
+        fold.apply(sign_cap(&kp, 0xA, 1, NodeState::Idle)).unwrap();
+
+        let cfg = AggregatorConfig::new(SubnetId::GLOBAL)
+            .with_fold_kind(CapabilityFold::KIND_ID)
+            .with_interval(Duration::from_secs(60));
+        let agg = AggregatorDaemon::new(cfg, mesh).expect("new");
+
+        let shutdown = std::sync::atomic::AtomicBool::new(true);
+        let published = agg
+            .tick_and_publish_with_shutdown(&shutdown)
+            .await
+            .expect("ok");
+        // Shutdown was set before the first summary published,
+        // so nothing fanned out.
+        assert_eq!(published, 0);
+        // Generation still advanced (produce_summaries ran).
+        assert_eq!(agg.generation(), 1);
+        // Latest buffer untouched — no kept summaries.
+        assert!(agg.latest_summaries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn health_flips_unhealthy_after_3x_interval_without_a_tick() {
+        // Short interval so the test runs in <500ms.
+        use crate::adapter::net::behavior::lifecycle::LifecycleDaemon;
+        let mesh = build_mesh().await;
+        let cfg = AggregatorConfig::new(SubnetId::GLOBAL)
+            .with_fold_kind(CapabilityFold::KIND_ID)
+            .with_interval(Duration::from_millis(40));
+        let agg = AggregatorDaemon::new(cfg, mesh).expect("new");
+        // Tick once, then wait long enough for the 3 × interval
+        // (120ms) window to expire.
+        agg.tick_once();
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        let h = LifecycleDaemon::health(&agg).await;
+        assert!(
+            !h.healthy,
+            "expected unhealthy after 3 × interval, got {h:?}"
+        );
+        assert!(
+            h.diagnostic.as_deref().unwrap_or("").contains("ticks behind"),
+            "diagnostic should mention the missed ticks: {h:?}"
+        );
     }
 }
