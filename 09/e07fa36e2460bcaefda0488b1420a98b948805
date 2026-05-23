@@ -1,0 +1,25 @@
+net/crates/net/tests/three_node_integration.rs
+  s_099fa7d871e34d::t_e2d0c5a2e96927 1582
+  s_099fa7d871e34d::t_1ee9d18d08379e 1540,1559,1579,1609,1635
+net/crates/net/src/adapter/net/subnet/gateway.rs
+  s_099fa7d871e34d::t_b201be11915e57 560-626
+  s_099fa7d871e34d::t_0117b1da1408c2 7-8
+  s_099fa7d871e34d::t_0a0e4cbcc7f6f9 58-63,67-72,79-83,86,94-99,103-110,116-153
+  s_099fa7d871e34d::t_3e8c29c4454f96 306,322,338,367,398,415,439,465,502,530
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "09e07fa36e2460bcaefda0488b1420a98b948805",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
