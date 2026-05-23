@@ -86,6 +86,9 @@ use super::meshos::{
     MeshOsSnapshotReader, NodeId,
 };
 use crate::adapter::net::identity::EntityKeypair;
+use crate::adapter::net::subnet::SubnetId;
+use crate::adapter::net::MeshNode;
+use crate::adapter::net::{ChannelHash, Visibility};
 
 /// Operator identity. Phase 1 holds the operator key as an
 /// [`EntityKeypair`] (the same ed25519 type daemons use) plus a
@@ -303,6 +306,32 @@ pub struct PeerCounts {
     pub unknown: usize,
 }
 
+/// Aggregate `SubnetGateway` counters surfaced by
+/// [`DeckClient::gateway_stats`]. Plain value type so operator
+/// tooling can render / serialize / diff snapshots without
+/// reaching into the substrate's atomic counters.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GatewayStats {
+    /// The mesh node's local subnet — same as
+    /// [`DeckClient::local_subnet`], echoed here so a
+    /// `gateway stats` rendering doesn't need a second
+    /// accessor call.
+    pub local_subnet: SubnetId,
+    /// Total cross-subnet visibility decisions that resolved to
+    /// "forward" (publish-fanout admitted; subscribe-gate
+    /// admitted). Monotonic-increasing for the lifetime of the
+    /// gateway.
+    pub forwarded: u64,
+    /// Total decisions that resolved to "drop." Monotonic.
+    pub dropped: u64,
+    /// Snapshot of every peer subnet the gateway is bridging to,
+    /// sorted by raw bits. Sourced from `SubnetGateway::peer_subnets`.
+    pub peer_subnets: Vec<SubnetId>,
+    /// Number of explicit `(channel, target-subnets)` rules in
+    /// the export table — what `gateway exports` enumerates.
+    pub export_rules: u64,
+}
+
 /// Daemon counts within a [`StatusSummary`]. Lifecycle
 /// counts are disjoint partitions of the registered set;
 /// `crash_looping` / `backing_off` are orthogonal restart-
@@ -398,6 +427,14 @@ pub struct DeckClient {
     /// in-process tests but unsafe for any deployment that
     /// hasn't yet wired up the substrate verifier.
     operator_registry: Option<Arc<OperatorRegistry>>,
+    /// Optional reference to the running `MeshNode`. Wired in via
+    /// [`Self::with_mesh`] when the operator surface needs to
+    /// read subnet / gateway / channel state that doesn't live
+    /// in the [`MeshOsSnapshot`]. `None` when the deck is running
+    /// against a degenerate / mesh-less runtime (test harnesses,
+    /// pre-attach CLI invocations); the subnet/gateway accessors
+    /// gracefully report "no mesh installed" in that case.
+    mesh: Option<Arc<MeshNode>>,
 }
 
 impl DeckClient {
@@ -418,7 +455,20 @@ impl DeckClient {
             config,
             commit_seq: Arc::new(AtomicU64::new(0)),
             operator_registry: None,
+            mesh: None,
         }
+    }
+
+    /// Install a live `MeshNode` reference so the subnet and
+    /// gateway accessors ([`Self::local_subnet`],
+    /// [`Self::known_subnets`], [`Self::gateway_stats`],
+    /// [`Self::gateway_exports`], [`Self::channel_visibility`])
+    /// can read substrate state that doesn't flow through the
+    /// [`MeshOsSnapshot`] stream. Without this the accessors
+    /// gracefully report "no mesh installed."
+    pub fn with_mesh(mut self, mesh: Arc<MeshNode>) -> Self {
+        self.mesh = Some(mesh);
+        self
     }
 
     /// Convenience constructor that pulls the handle + snapshot
@@ -569,6 +619,103 @@ impl DeckClient {
     /// clone of just the peers map.
     pub fn peers(&self) -> std::collections::BTreeMap<NodeId, super::meshos::PeerSnapshot> {
         self.snapshot_reader.load().peers.clone()
+    }
+
+    /// This deck's local mesh node's `SubnetId`, or `None` when
+    /// no `MeshNode` has been wired in via [`Self::with_mesh`].
+    /// Powers `net subnet show`.
+    pub fn local_subnet(&self) -> Option<SubnetId> {
+        self.mesh.as_ref().map(|m| m.local_subnet())
+    }
+
+    /// Snapshot of every `(node_id, subnet_id)` pair the local
+    /// mesh has cached from signature-verified capability
+    /// announcements, sorted by `node_id`. Empty when no
+    /// `MeshNode` is wired in. Powers `net subnet ls` and
+    /// `net subnet tree`.
+    pub fn known_subnets(&self) -> Vec<(u64, SubnetId)> {
+        self.mesh
+            .as_ref()
+            .map(|m| m.known_subnets())
+            .unwrap_or_default()
+    }
+
+    /// Aggregate gateway counters for `net gateway stats`.
+    /// Returns `None` when the mesh has no installed
+    /// `ChannelConfigRegistry` — in that case the gateway isn't
+    /// built and there's nothing to report.
+    pub fn gateway_stats(&self) -> Option<GatewayStats> {
+        let gw = self.mesh.as_ref().and_then(|m| m.gateway())?;
+        Some(GatewayStats {
+            local_subnet: gw.local_subnet(),
+            forwarded: gw.forwarded_count(),
+            dropped: gw.dropped_count(),
+            peer_subnets: gw.peer_subnets(),
+            export_rules: gw.exports().len() as u64,
+        })
+    }
+
+    /// Snapshot of the gateway's export table as
+    /// `(channel_hash, target_subnets)` pairs, sorted by
+    /// `channel_hash`. Empty when no gateway is installed.
+    pub fn gateway_exports(&self) -> Vec<(u16, Vec<SubnetId>)> {
+        self.mesh
+            .as_ref()
+            .and_then(|m| m.gateway())
+            .map(|gw| gw.exports())
+            .unwrap_or_default()
+    }
+
+    /// Resolve a channel name to its [`Visibility`] config, or
+    /// `None` when no `ChannelConfigRegistry` has been installed
+    /// or the name isn't registered. Falls back through the
+    /// registry's prefix table via `get_by_name`. Powers
+    /// `net channel visibility <name>`.
+    pub fn channel_visibility(&self, channel_name: &str) -> Option<Visibility> {
+        let mesh = self.mesh.as_ref()?;
+        let registry = mesh.channel_configs()?;
+        let cfg = registry.get_by_name(channel_name)?;
+        Some(cfg.visibility)
+    }
+
+    /// Snapshot every registered channel as `(name, visibility)`
+    /// pairs for `net channel ls`, sorted by name. Empty when no
+    /// `ChannelConfigRegistry` has been installed.
+    pub fn channels(&self) -> Vec<(String, Visibility)> {
+        let Some(mesh) = self.mesh.as_ref() else {
+            return Vec::new();
+        };
+        let Some(registry) = mesh.channel_configs() else {
+            return Vec::new();
+        };
+        registry
+            .snapshot()
+            .into_iter()
+            .map(|(name, cfg)| (name, cfg.visibility))
+            .collect()
+    }
+
+    /// Lookup a channel's wire-`u16` hash for use with
+    /// `gateway_exports`. `None` when no registry is installed
+    /// or the channel isn't registered. Convenience for
+    /// `net gateway export <channel> ...` to translate the
+    /// human-readable channel name into the wire key the
+    /// gateway's export table is keyed on.
+    pub fn channel_wire_hash(&self, channel_name: &str) -> Option<u16> {
+        let mesh = self.mesh.as_ref()?;
+        let registry = mesh.channel_configs()?;
+        let cfg = registry.get_by_name(channel_name)?;
+        Some(cfg.channel_id.wire_hash())
+    }
+
+    /// Lookup a channel's canonical `ChannelHash` (u64). Same
+    /// shape as [`Self::channel_wire_hash`] but returns the full
+    /// 64-bit hash callers use for fold + ACL lookups.
+    pub fn channel_canonical_hash(&self, channel_name: &str) -> Option<ChannelHash> {
+        let mesh = self.mesh.as_ref()?;
+        let registry = mesh.channel_configs()?;
+        let cfg = registry.get_by_name(channel_name)?;
+        Some(cfg.channel_id.hash())
     }
 
     /// Borrow the latest daemon summary keyed by daemon id.
@@ -1835,6 +1982,90 @@ mod tests {
         let origin = kp.origin_hash();
         let identity = OperatorIdentity::from_keypair(kp);
         assert_eq!(identity.operator_id(), origin);
+    }
+
+    #[tokio::test]
+    async fn deck_subnet_and_gateway_accessors_default_to_empty_without_mesh() {
+        // Pin the "no mesh installed" contract — the new
+        // subnet/gateway/channel accessors must surface
+        // sensible empties rather than panicking. CliContext
+        // currently wires DeckClient without a MeshNode; this
+        // is the path operator tooling sees today.
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+        assert_eq!(deck.local_subnet(), None);
+        assert!(deck.known_subnets().is_empty());
+        assert!(deck.gateway_stats().is_none());
+        assert!(deck.gateway_exports().is_empty());
+        assert_eq!(deck.channel_visibility("any/name"), None);
+        assert!(deck.channels().is_empty());
+        assert_eq!(deck.channel_wire_hash("any/name"), None);
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deck_with_mesh_surfaces_local_subnet_and_gateway_stats() {
+        // Pin the "mesh installed" contract — `with_mesh` wires
+        // the MeshNode reference through; the accessors then
+        // return the substrate-level values. Uses
+        // `set_channel_configs` to install a registry so the
+        // gateway is built and `gateway_stats()` returns Some.
+        use crate::adapter::net::{
+            ChannelConfig, ChannelConfigRegistry, ChannelId, MeshNodeConfig, SubnetId, Visibility,
+        };
+        use std::net::SocketAddr;
+
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut mesh_cfg = MeshNodeConfig::new(addr, [0x17u8; 32]);
+        mesh_cfg = mesh_cfg.with_subnet(SubnetId::new(&[3, 7]));
+        let mut mesh = crate::adapter::net::MeshNode::new(EntityKeypair::generate(), mesh_cfg)
+            .await
+            .expect("MeshNode::new");
+        let registry = Arc::new(ChannelConfigRegistry::new());
+        let metrics_id = ChannelId::parse("internal/metrics").expect("channel id");
+        registry.insert(
+            ChannelConfig::new(metrics_id.clone()).with_visibility(Visibility::SubnetLocal),
+        );
+        mesh.set_channel_configs(registry);
+        let mesh = Arc::new(mesh);
+
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
+            .with_mesh(mesh.clone());
+
+        assert_eq!(deck.local_subnet(), Some(SubnetId::new(&[3, 7])));
+        let stats = deck.gateway_stats().expect("gateway installed");
+        assert_eq!(stats.local_subnet, SubnetId::new(&[3, 7]));
+        assert_eq!(stats.forwarded, 0);
+        assert_eq!(stats.dropped, 0);
+        assert_eq!(stats.export_rules, 0);
+        assert!(stats.peer_subnets.is_empty());
+
+        // Channel-visibility lookup round-trips the configured
+        // visibility for the one channel we registered.
+        assert_eq!(
+            deck.channel_visibility("internal/metrics"),
+            Some(Visibility::SubnetLocal),
+        );
+        // The list surface mirrors the same channel.
+        let channels = deck.channels();
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].0, "internal/metrics");
+        assert_eq!(channels[0].1, Visibility::SubnetLocal);
+        // Wire-hash + canonical lookups resolve.
+        assert_eq!(
+            deck.channel_wire_hash("internal/metrics"),
+            Some(metrics_id.wire_hash()),
+        );
+        assert_eq!(
+            deck.channel_canonical_hash("internal/metrics"),
+            Some(metrics_id.hash()),
+        );
+
+        let _ = runtime.shutdown().await;
     }
 
     #[tokio::test]

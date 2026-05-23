@@ -41,8 +41,8 @@
 // `net_sdk::deck::*` path.
 pub use net::adapter::net::behavior::deck::{
     AdminCommands, AdminError, AuditQuery, AuditStream, ChainCommit, DaemonCounts, DeckClient,
-    DeckClientConfig, DeckError, FailureStream, IceCommands, IceError, IceProposal, LogFilter,
-    LogStream, OperatorIdentity, OperatorRegistry, OperatorSignature, PeerCounts,
+    DeckClientConfig, DeckError, FailureStream, GatewayStats, IceCommands, IceError, IceProposal,
+    LogFilter, LogStream, OperatorIdentity, OperatorRegistry, OperatorSignature, PeerCounts,
     SimulatedIceProposal, SnapshotStream, StatusSummary, StatusSummaryStream,
 };
 // Pure ICE simulator — runs a `BlastRadius` against any

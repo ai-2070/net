@@ -5290,6 +5290,15 @@ impl MeshNode {
         self.subnet_gateway.as_ref()
     }
 
+    /// Read-only handle to this node's installed
+    /// `ChannelConfigRegistry`, or `None` when no registry has
+    /// been installed via [`Self::set_channel_configs`].
+    /// Operator tooling (`net channel ls|visibility`) reads
+    /// this to enumerate configured channels.
+    pub fn channel_configs(&self) -> Option<&Arc<ChannelConfigRegistry>> {
+        self.channel_configs.as_ref()
+    }
+
     /// Install a shared `TokenCache` used by the channel-auth path.
     /// When set, `authorize_subscribe` and `publish_many` consult
     /// it via `ChannelConfig::can_subscribe` / `can_publish`.
