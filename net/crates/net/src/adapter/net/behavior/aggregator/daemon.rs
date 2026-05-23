@@ -26,7 +26,7 @@
 //! - [`AggregatorDaemon::generation`] — monotonic tick counter,
 //!   stamped onto every emitted `SummaryAnnouncement`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -133,8 +133,9 @@ pub struct AggregatorDaemon {
     generation: Arc<AtomicU64>,
     /// Latest batch of summaries the loop produced. Capped at
     /// `LATEST_SUMMARIES_CAP` entries — operator tooling reads
-    /// through [`Self::latest_summaries`].
-    latest: Arc<RwLock<Vec<SummaryAnnouncement>>>,
+    /// through [`Self::latest_summaries`]. `VecDeque` so the cap
+    /// eviction (`pop_front`) is O(1).
+    latest: Arc<RwLock<VecDeque<SummaryAnnouncement>>>,
     /// Cooperative-shutdown flag. The background loop polls this
     /// between ticks; [`Self::shutdown`] sets it.
     shutdown: Arc<AtomicBool>,
@@ -163,7 +164,7 @@ impl AggregatorDaemon {
             mesh,
             summarizers,
             generation: Arc::new(AtomicU64::new(0)),
-            latest: Arc::new(RwLock::new(Vec::new())),
+            latest: Arc::new(RwLock::new(VecDeque::with_capacity(LATEST_SUMMARIES_CAP))),
             shutdown: Arc::new(AtomicBool::new(false)),
             background: parking_lot::Mutex::new(None),
         })
@@ -324,14 +325,14 @@ impl AggregatorDaemon {
     }
 
     /// Append a batch to the latest-summaries buffer, evicting
-    /// the oldest entries when the cap is hit.
+    /// the oldest entries (FIFO) when the cap is hit.
     fn append_to_latest(&self, batch: Vec<SummaryAnnouncement>) {
         let mut latest = self.latest.write();
         for s in batch {
             if latest.len() >= LATEST_SUMMARIES_CAP {
-                latest.remove(0);
+                latest.pop_front();
             }
-            latest.push(s);
+            latest.push_back(s);
         }
     }
 
@@ -409,7 +410,7 @@ impl AggregatorDaemon {
     /// Caller gets a `Vec` clone — modifying it doesn't affect
     /// the daemon's internal buffer.
     pub fn latest_summaries(&self) -> Vec<SummaryAnnouncement> {
-        self.latest.read().clone()
+        self.latest.read().iter().cloned().collect()
     }
 
     /// Current generation counter. Reflects the number of
