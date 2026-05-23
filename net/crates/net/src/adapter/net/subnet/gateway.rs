@@ -92,20 +92,20 @@ impl SubnetGateway {
     }
 
     /// Add a peer subnet this gateway bridges to. Idempotent —
-    /// re-registering the same subnet is a no-op.
+    /// re-registering the same subnet is a no-op. The Vec is
+    /// kept sorted by raw bits on insert so [`Self::peer_subnets`]
+    /// can return a plain clone without re-sorting.
     pub fn add_peer(&self, subnet: SubnetId) {
         let mut peers = self.peer_subnets.write();
-        if !peers.contains(&subnet) {
-            peers.push(subnet);
+        if let Err(pos) = peers.binary_search_by_key(&subnet.raw(), |s| s.raw()) {
+            peers.insert(pos, subnet);
         }
     }
 
     /// Snapshot of every peer subnet currently bridged to,
     /// sorted by raw bits for stable operator-tool output.
     pub fn peer_subnets(&self) -> Vec<SubnetId> {
-        let mut out = self.peer_subnets.read().clone();
-        out.sort_by_key(|s| s.raw());
-        out
+        self.peer_subnets.read().clone()
     }
 
     /// Export a channel to specific subnets.
