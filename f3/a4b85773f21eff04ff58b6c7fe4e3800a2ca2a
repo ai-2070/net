@@ -1,0 +1,32 @@
+net/crates/net/sdk-py/src/net_sdk/capability_aggregation.py
+  s_d9dc521a887c3e::t_9623c41b7992f3 1-23,25-395
+  s_d9dc521a887c3e::t_02a931b3104c0e 24
+net/crates/net/bindings/python/src/capability_aggregation.rs
+  s_d9dc521a887c3e::t_c74eddea791701 40,76
+  s_d9dc521a887c3e::t_2759f72f400c7f 1-39,41-75,77-109
+net/crates/net/bindings/python/src/lib.rs
+  s_d9dc521a887c3e::t_ebaebeaed4c416 1836-1850,1852-1877,1879-1887
+  s_d9dc521a887c3e::t_f1fe1e565cd254 7
+  s_d9dc521a887c3e::t_15fe979e6a7214 1851,1878
+net/crates/net/sdk-py/tests/test_capability_aggregation.py
+  s_d9dc521a887c3e::t_22737bb66bce3a 1-186
+net/crates/net/sdk-py/src/net_sdk/__init__.py
+  s_d9dc521a887c3e::t_c14e4aee56852b 88-99
+  s_d9dc521a887c3e::t_8a0dc3d15b5217 123-132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "f3a4b85773f21eff04ff58b6c7fe4e3800a2ca2a",
+  "prompts": {},
+  "sessions": {
+    "s_d9dc521a887c3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1eafc9e-4dd5-40ff-8f76-e8a5b7800252",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
