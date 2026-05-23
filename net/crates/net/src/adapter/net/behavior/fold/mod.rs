@@ -36,8 +36,8 @@ mod tests;
 
 pub use audit::{FoldAuditSink, NoopSink, RingFoldAuditSink, VecFoldAuditSink};
 pub use capability::{
-    capability_tags_for, reflex_addr_for, CapabilityFilter, CapabilityFold, CapabilityIndexInner,
-    CapabilityMatch, CapabilityMembership, CapabilityQuery, HardwareSummary, NodeState,
+    capability_tags_for, reflex_addr_for, CapabilityFilter, CapabilityFold, CapabilityMatch,
+    CapabilityMembership, CapabilityQuery, HardwareSummary, NodeState,
 };
 pub use capability_aggregation::{Aggregation, CapacityQuery, CapacityRow, GroupBy, TagMatcher};
 pub use dispatch::{
