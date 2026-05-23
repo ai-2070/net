@@ -40,6 +40,7 @@ default = [
     "dataforts",
     "meshdb",
     "redis",
+    "aggregator",
 ]
 # Pulls in `net-sdk` at its `redis` sub-feature for the
 # `RedisStreamDedup` consumer helper. The dedup helper is a thin
@@ -101,6 +102,11 @@ meshos = ["compute", "cortex", "net/meshos", "net-sdk/meshos"]
 # records the operator id but doesn't yet route through channel-
 # auth); the binding surface is final.
 deck = ["meshos", "net/meshos", "net-sdk/deck"]
+# Aggregator-registry RPC client + fold.query client surfaces
+# (`SDK_AGGREGATOR_SUBNET_PLAN.md` Stage 3). Builds on `net` + pulls in
+# the SDK's `aggregator` re-export module so the binding gets
+# RegistryClient / FoldQueryClient + the typed error hierarchy.
+aggregator = ["net", "dep:net-sdk", "net-sdk/net"]
 
 [dependencies]
 net = { package = "net-mesh", version = "0.21.0", path = "../..", default-features = false }
