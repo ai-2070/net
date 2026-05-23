@@ -324,7 +324,6 @@ impl Fold<CapabilityFold> {
                                         Some(slot.numeric_min.map_or(n, |cur| cur.min(n)));
                                     slot.numeric_max =
                                         Some(slot.numeric_max.map_or(n, |cur| cur.max(n)));
-                                    slot.numeric_present = true;
                                 }
                             }
                         }
@@ -531,9 +530,7 @@ struct BucketAccum {
     /// `Aggregation::DistinctValues`.
     distinct_values: HashSet<String>,
     /// Running saturating sum for `Aggregation::SumNumericTag`.
-    /// Stays 0 when no numeric values are observed; the
-    /// `numeric_present` flag distinguishes "summed to 0" from
-    /// "no numeric tag found" if a caller ever needs that.
+    /// Stays 0 when no numeric values are observed.
     numeric_sum: u64,
     /// Running minimum for `Aggregation::MinNumericTag`. `None`
     /// until the first parseable value lands; the projection
@@ -543,12 +540,6 @@ struct BucketAccum {
     /// Running maximum for `Aggregation::MaxNumericTag`. Same
     /// shape as `numeric_min`.
     numeric_max: Option<u64>,
-    /// `true` once at least one parseable numeric tag has been
-    /// folded into `numeric_sum`. Not currently surfaced (the
-    /// aggregate API projects to `u64`) but kept so a follow-up
-    /// can expose `Option<u64>` semantics without a second walk.
-    #[allow(dead_code)]
-    numeric_present: bool,
 }
 
 #[derive(Default)]
