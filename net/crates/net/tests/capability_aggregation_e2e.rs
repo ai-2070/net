@@ -18,9 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
-use net::adapter::net::behavior::fold::{
-    Aggregation, CapacityQuery, GroupBy, TagMatcher,
-};
+use net::adapter::net::behavior::fold::{Aggregation, CapacityQuery, GroupBy, TagMatcher};
 use net::adapter::net::identity::EntityId;
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
@@ -58,12 +56,7 @@ fn prime_fixture(node: &MeshNode) {
         .add_tag("hardware.gpu.count=8")
         .add_tag("software.python=3.11");
     caps_a = caps_a.with_metadata("region", "us-east");
-    let mut ann_a = CapabilityAnnouncement::new(
-        0xA,
-        EntityId::from_bytes([0xAA; 32]),
-        1,
-        caps_a,
-    );
+    let mut ann_a = CapabilityAnnouncement::new(0xA, EntityId::from_bytes([0xAA; 32]), 1, caps_a);
     ann_a.region = Some("us-east".to_string());
     node.test_inject_capability_announcement(ann_a);
 
@@ -74,12 +67,7 @@ fn prime_fixture(node: &MeshNode) {
         .add_tag("hardware.gpu.count=4")
         .add_tag("software.python=3.12");
     caps_b = caps_b.with_metadata("region", "us-east");
-    let mut ann_b = CapabilityAnnouncement::new(
-        0xB,
-        EntityId::from_bytes([0xBB; 32]),
-        1,
-        caps_b,
-    );
+    let mut ann_b = CapabilityAnnouncement::new(0xB, EntityId::from_bytes([0xBB; 32]), 1, caps_b);
     ann_b.region = Some("us-east".to_string());
     node.test_inject_capability_announcement(ann_b);
 
@@ -90,12 +78,7 @@ fn prime_fixture(node: &MeshNode) {
         .add_tag("hardware.gpu.count=2")
         .add_tag("software.python=3.11");
     caps_c = caps_c.with_metadata("region", "us-west");
-    let mut ann_c = CapabilityAnnouncement::new(
-        0xC,
-        EntityId::from_bytes([0xCC; 32]),
-        1,
-        caps_c,
-    );
+    let mut ann_c = CapabilityAnnouncement::new(0xC, EntityId::from_bytes([0xCC; 32]), 1, caps_c);
     ann_c.region = Some("us-west".to_string());
     node.test_inject_capability_announcement(ann_c);
 }
@@ -104,11 +87,9 @@ fn prime_fixture(node: &MeshNode) {
 async fn aggregate_by_region_counts_publishers() {
     let node = build_node().await;
     prime_fixture(&node);
-    let rows = node.capability_fold().aggregate(
-        None,
-        GroupBy::Region,
-        Aggregation::Count,
-    );
+    let rows = node
+        .capability_fold()
+        .aggregate(None, GroupBy::Region, Aggregation::Count);
     assert_eq!(
         rows,
         vec![("us-east".to_string(), 2), ("us-west".to_string(), 1)],

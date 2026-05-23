@@ -139,8 +139,8 @@ impl<K: FoldKind> FoldSnapshot<K> {
             return None;
         }
         let remaining_ttl = expires_offset - elapsed_since_dump;
-        let aged_received_offset = Duration::from_nanos(snap_entry.received_offset_ns)
-            .saturating_add(elapsed_since_dump);
+        let aged_received_offset =
+            Duration::from_nanos(snap_entry.received_offset_ns).saturating_add(elapsed_since_dump);
         let received_at = anchor.checked_sub(aged_received_offset).unwrap_or(anchor);
         let expires_at = anchor.checked_add(remaining_ttl).unwrap_or(anchor);
         Some(FoldEntry {
