@@ -8815,24 +8815,11 @@ impl MeshNode {
         &self,
         req: &super::behavior::capability::CapabilityRequirement,
     ) -> Option<u64> {
-        let mut candidates = super::behavior::fold::capability_bridge::find_nodes_matching(
+        let candidates = super::behavior::fold::capability_bridge::find_nodes_matching(
             &self.capability_fold,
             &req.filter,
         );
-        candidates.sort_unstable();
-        candidates.into_iter().max_by(|a, b| {
-            let caps_a = super::behavior::fold::capability_bridge::synthesize_capability_set(
-                &self.capability_fold,
-                *a,
-            );
-            let caps_b = super::behavior::fold::capability_bridge::synthesize_capability_set(
-                &self.capability_fold,
-                *b,
-            );
-            req.score(&caps_a)
-                .partial_cmp(&req.score(&caps_b))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        Self::best_by_score(&self.capability_fold, candidates, req)
     }
 
     /// Scoped variant of [`Self::find_best_node`]. See
@@ -8851,21 +8838,40 @@ impl MeshNode {
         scope: &ScopeFilter<'_>,
     ) -> Option<u64> {
         let candidates = self.find_nodes_by_filter_scoped(&req.filter, scope);
-        let mut sorted = candidates;
-        sorted.sort_unstable();
-        sorted.into_iter().max_by(|a, b| {
-            let caps_a = super::behavior::fold::capability_bridge::synthesize_capability_set(
-                &self.capability_fold,
-                *a,
-            );
-            let caps_b = super::behavior::fold::capability_bridge::synthesize_capability_set(
-                &self.capability_fold,
-                *b,
-            );
-            req.score(&caps_a)
-                .partial_cmp(&req.score(&caps_b))
+        Self::best_by_score(&self.capability_fold, candidates, req)
+    }
+
+    /// Pick the highest-scoring candidate against `req`. Synthesizes
+    /// each candidate's [`CapabilitySet`] from the fold exactly once
+    /// (sort by score key, lex-tiebreak on `node_id` for stable
+    /// output), instead of re-synthesizing twice per
+    /// `max_by` comparison.
+    fn best_by_score(
+        fold: &Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
+        candidates: Vec<u64>,
+        req: &super::behavior::capability::CapabilityRequirement,
+    ) -> Option<u64> {
+        let mut scored: Vec<(u64, f32)> = candidates
+            .into_iter()
+            .map(|node_id| {
+                let caps =
+                    super::behavior::fold::capability_bridge::synthesize_capability_set(
+                        fold, node_id,
+                    );
+                (node_id, req.score(&caps))
+            })
+            .collect();
+        // Sort by descending score, lex-asc node_id tiebreak —
+        // matches `find_nodes_matching`'s sort ordering when scores
+        // tie (which they always do today, per the docstring's
+        // "scoring degrades to lex-sorted" caveat) so the result
+        // is byte-stable across runs.
+        scored.sort_by(|(na, sa), (nb, sb)| {
+            sb.partial_cmp(sa)
                 .unwrap_or(std::cmp::Ordering::Equal)
-        })
+                .then_with(|| na.cmp(nb))
+        });
+        scored.into_iter().next().map(|(node_id, _)| node_id)
     }
 
     /// Shared reference to the capability fold — the canonical
