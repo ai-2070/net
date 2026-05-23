@@ -194,6 +194,23 @@ pub use net::adapter::net::behavior::capability::{CapabilitySetDiff, MetadataCha
 pub use net::adapter::net::behavior::capability::CardinalityProvider;
 
 // =============================================================================
+// Aggregation surface — Phase 6c of `MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`.
+//
+// `Mesh::capability_aggregate(matcher, group_by, agg)` answers
+// "what's available, bucketed how, counted how" against the local
+// `CapabilityFold`. `Mesh::capability_capacity_ranking(query, rtt)`
+// wraps that primitive with state breakdown + latency filtering +
+// optional summed numeric capacity + sort + limit — the
+// "top-N <thing> by available capacity within X ms latency"
+// materialized view. See [`Mesh::capability_capacity_ranking`] for
+// the example.
+// =============================================================================
+
+pub use net::adapter::net::behavior::fold::{
+    Aggregation, CapacityQuery, CapacityRow, GroupBy, TagMatcher,
+};
+
+// =============================================================================
 // Placement filter — Phase F slice 1 of `CAPABILITY_SYSTEM_PLAN.md`.
 //
 // `PlacementFilter::placement_score(target, artifact) -> Option<f32>`
