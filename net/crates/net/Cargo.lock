@@ -2274,6 +2274,7 @@ name = "net-aggregator-daemon"
 version = "0.21.0"
 dependencies = [
  "assert_cmd",
+ "blake3",
  "clap",
  "futures",
  "hex",

@@ -592,33 +592,28 @@ fn decode_seed(s: &str) -> Result<[u8; 32], String> {
     decode_hex_32(s)
 }
 
-/// Derive a deterministic 32-byte seed from a group name. Uses
-/// BLAKE2 with a fixed daemon label so the same name always
-/// resolves to the same seed across restarts — operators don't
-/// need to track seeds for groups they're happy with.
+/// Derive a deterministic 32-byte seed from a group name via
+/// `blake3(label || name)`. The label is repo-pinned so the
+/// derivation is stable across:
+///
+/// - Rust releases — `DefaultHasher` (the prior implementation)
+///   is explicitly not stable across releases; an operator
+///   upgrading the daemon binary would silently get different
+///   derived seeds → different replica identities → fold-state
+///   churn on upgrade. The bug-class this prevents.
+/// - Daemon binary patch releases — the label string never
+///   changes; bumping it constitutes a deliberate identity
+///   migration that operators must opt into.
 fn derive_seed_from_name(name: &str) -> [u8; 32] {
-    use std::hash::Hasher as _;
-    // Minimal seed derivation that doesn't pull in another
-    // hashing dep. xxhash on the input twice with distinct
-    // salts gives us 16 bytes; combine with constant label
-    // bytes for 32-byte output. Acceptable: the seed is only
-    // identity-binding and operators can override via
-    // `group_seed` for cryptographic strength.
-    let mut out = [0u8; 32];
-    let label = b"net-aggregator-daemon-seed-v1!!!";
-    out.copy_from_slice(label);
-    // Mix the name's bytes into the low half so distinct names
-    // produce distinct seeds without colliding.
-    let mut hasher_lo = std::collections::hash_map::DefaultHasher::new();
-    hasher_lo.write(name.as_bytes());
-    let lo = hasher_lo.finish().to_le_bytes();
-    let mut hasher_hi = std::collections::hash_map::DefaultHasher::new();
-    hasher_hi.write(b"hi:");
-    hasher_hi.write(name.as_bytes());
-    let hi = hasher_hi.finish().to_le_bytes();
-    out[..8].copy_from_slice(&lo);
-    out[8..16].copy_from_slice(&hi);
-    out
+    const LABEL: &[u8] = b"net-aggregator-daemon-seed-v1";
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(LABEL);
+    // Domain-separate the label from the name to defeat
+    // length-extension corner cases (LABEL || name vs
+    // LABEL + suffix || name_without_suffix).
+    hasher.update(&[0u8]);
+    hasher.update(name.as_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 /// Parse a subnet identifier via the substrate's

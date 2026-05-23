@@ -52,6 +52,14 @@ tracing = "0.1"
 # Hex codec for PSK + group_seed material.
 hex = "0.4"
 
+# Stable, repo-pinned 32-byte hash for the auto-derived
+# group_seed when operators don't supply one explicitly.
+# `DefaultHasher` would be unstable across Rust releases —
+# operators upgrading the daemon would silently get different
+# replica identities. Blake3 is what other identity-derivation
+# paths in the substrate already use.
+blake3 = "1"
+
 # Typed errors at the config + startup boundary.
 thiserror = "2"
 
