@@ -204,7 +204,12 @@ impl AggregatorDaemon {
                     return;
                 }
                 ticker.tick().await;
-                if let Err(e) = self.tick_and_publish().await {
+                // Use the shutdown-aware publish path so the
+                // batch can bail between summaries — without
+                // this, `on_stop` would fall back on its
+                // JoinHandle timeout and abort a mid-batch
+                // publish task.
+                if let Err(e) = self.tick_and_publish_with_shutdown(&self.shutdown).await {
                     tracing::warn!(
                         error = %e,
                         source_subnet = %self.config.source_subnet,
@@ -261,6 +266,42 @@ impl AggregatorDaemon {
         let mut published = 0;
         let mut kept: Vec<SummaryAnnouncement> = Vec::with_capacity(novel.len());
         for summary in novel {
+            self.publish_summary(&summary).await?;
+            published += 1;
+            kept.push(summary);
+        }
+        self.append_to_latest(kept);
+        *self.last_tick_at.lock() = Some(std::time::Instant::now());
+        Ok(published)
+    }
+
+    /// Shutdown-aware variant of [`Self::tick_and_publish`].
+    /// Identical semantics except that the inner per-summary
+    /// publish loop checks `shutdown.load(Acquire)` between
+    /// summaries and bails early if it's set — preventing the
+    /// background task from getting stuck mid-batch when
+    /// `on_stop` flips the flag. Summaries successfully
+    /// published before the bail-out still land in the latest
+    /// buffer.
+    ///
+    /// Used by the background loop in [`Self::spawn`]; tests
+    /// can call it explicitly to exercise the mid-batch
+    /// shutdown path.
+    pub async fn tick_and_publish_with_shutdown(
+        &self,
+        shutdown: &AtomicBool,
+    ) -> Result<usize, AggregatorPublishError> {
+        let batch = self.produce_summaries();
+        let novel = self.filter_novel(batch);
+        let mut published = 0;
+        let mut kept: Vec<SummaryAnnouncement> = Vec::with_capacity(novel.len());
+        for summary in novel {
+            if shutdown.load(Ordering::Acquire) {
+                // Stop mid-batch; the summaries published so far
+                // still land in the latest buffer below so the
+                // local view stays consistent.
+                break;
+            }
             self.publish_summary(&summary).await?;
             published += 1;
             kept.push(summary);
@@ -489,11 +530,20 @@ impl LifecycleDaemon for AggregatorDaemon {
         self.shutdown.store(true, Ordering::Release);
         let handle = self.background.lock().take();
         if let Some(h) = handle {
-            // Wait up to one interval + a small buffer so the
-            // loop's `ticker.tick().await` returns and the
-            // shutdown check fires before we abort.
-            let deadline = self.config.summary_interval + std::time::Duration::from_millis(100);
-            let _ = tokio::time::timeout(deadline, h).await;
+            // The loop's `tick_and_publish_with_shutdown` checks
+            // the shutdown flag between summaries, so a
+            // mid-batch publish completes its current
+            // `mesh.publish().await` and then breaks — no
+            // task-abort needed under normal conditions. The
+            // timeout exists only as a backstop for a single
+            // `mesh.publish` that hangs longer than the window.
+            // Give it a generous window: one interval + 1s
+            // (or the interval itself, whichever is larger).
+            let backstop = self
+                .config
+                .summary_interval
+                .saturating_add(std::time::Duration::from_secs(1));
+            let _ = tokio::time::timeout(backstop, h).await;
         }
     }
 
@@ -916,17 +966,18 @@ mod tests {
                 .unwrap_or(0)
         };
         assert_eq!(bucket("free"), 1);
-        // `Reserved { holder, until_unix_us }` debug-renders with
-        // the named-fields shape; the summarizer's lowercase
-        // `format!("{:?}").to_lowercase()` produces a bucket name
-        // that starts with `reserved { ... }`. Assert by prefix.
-        let reserved_count: u64 = summary
-            .buckets
-            .iter()
-            .filter(|(n, _)| n.starts_with("reserved"))
-            .map(|(_, c)| *c)
-            .sum();
-        assert_eq!(reserved_count, 1);
+        // The summarizer matches each `ReservationState` variant
+        // to a fixed `&'static str` label — no Debug-derived
+        // bucket-name cardinality. So `reserved` (without any
+        // `{ ... }` suffix) is the exact bucket key.
+        assert_eq!(bucket("reserved"), 1);
+        assert_eq!(bucket("active"), 0);
+        // No spurious bucket names from Debug renderings.
+        let expected: std::collections::HashSet<&str> =
+            ["active", "free", "reserved"].into_iter().collect();
+        let actual: std::collections::HashSet<&str> =
+            summary.buckets.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
@@ -1028,6 +1079,36 @@ mod tests {
         // After a fresh tick, still healthy.
         agg.tick_once();
         assert!(LifecycleDaemon::health(&agg).await.healthy);
+    }
+
+    #[tokio::test]
+    async fn tick_and_publish_with_shutdown_bails_before_publishing_when_flag_is_set() {
+        // Pre-set shutdown, then call the shutdown-aware variant.
+        // The for-loop's first iteration sees the flag and
+        // breaks — published count is 0, no summaries land in
+        // the latest buffer (since none were kept).
+        let mesh = build_mesh().await;
+        let kp = EntityKeypair::generate();
+        let fold = mesh.capability_fold();
+        fold.apply(sign_cap(&kp, 0xA, 1, NodeState::Idle)).unwrap();
+
+        let cfg = AggregatorConfig::new(SubnetId::GLOBAL)
+            .with_fold_kind(CapabilityFold::KIND_ID)
+            .with_interval(Duration::from_secs(60));
+        let agg = AggregatorDaemon::new(cfg, mesh).expect("new");
+
+        let shutdown = std::sync::atomic::AtomicBool::new(true);
+        let published = agg
+            .tick_and_publish_with_shutdown(&shutdown)
+            .await
+            .expect("ok");
+        // Shutdown was set before the first summary published,
+        // so nothing fanned out.
+        assert_eq!(published, 0);
+        // Generation still advanced (produce_summaries ran).
+        assert_eq!(agg.generation(), 1);
+        // Latest buffer untouched — no kept summaries.
+        assert!(agg.latest_summaries().is_empty());
     }
 
     #[tokio::test]
