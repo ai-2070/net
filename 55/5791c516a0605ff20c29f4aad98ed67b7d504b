@@ -1,0 +1,21 @@
+net/crates/net/docs/plans/WIRE_ORIGIN_HASH_64BIT.md
+  s_099fa7d871e34d::t_e0f50e0cd387dc 81-114
+  s_099fa7d871e34d::t_74d66f5ed381fd 216-219
+  s_099fa7d871e34d::t_329e5a66c507f5 161-185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "555791c516a0605ff20c29f4aad98ed67b7d504b",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
