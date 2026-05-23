@@ -11,6 +11,7 @@
 //! commits.
 
 pub mod admin;
+pub mod aggregator;
 pub mod audit;
 pub mod blob;
 pub mod cap;
