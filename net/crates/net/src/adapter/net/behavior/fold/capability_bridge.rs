@@ -395,7 +395,12 @@ pub fn find_nodes_matching(fold: &Fold<CapabilityFold>, legacy: &LegacyFilter) -
             node_set.insert(node_id);
         }
     }
-    node_set.into_iter().collect()
+    // Sort so callers (e.g. the scheduler's `FirstMatch` placement)
+    // see a deterministic order across processes; HashSet iteration
+    // is randomized.
+    let mut out: Vec<NodeId> = node_set.into_iter().collect();
+    out.sort_unstable();
+    out
 }
 
 /// Derive a [`CapabilityScope`] from a [`CapabilityMembership`]'s
@@ -504,7 +509,9 @@ pub fn find_nodes_matching_scoped(
         }
         node_set.insert(node_id);
     }
-    node_set.into_iter().collect()
+    let mut out: Vec<NodeId> = node_set.into_iter().collect();
+    out.sort_unstable();
+    out
 }
 
 #[cfg(test)]
