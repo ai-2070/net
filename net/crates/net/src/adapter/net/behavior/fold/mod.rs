@@ -435,9 +435,13 @@ impl<K: FoldKind> Fold<K> {
     /// restore is for cold-start / forced-reset only.
     ///
     /// Re-anchors `received_at` / `expires_at` against the
-    /// current `Instant::now()` so freshness semantics survive
-    /// the dump → restore boundary (handled by an internal
-    /// `FoldSnapshot::rehydrate_entry` helper).
+    /// current `Instant::now()` and consumes the wall-clock
+    /// interval since `snap.taken_at_unix_us` out of each entry's
+    /// remaining TTL — so a long downtime between dump and restore
+    /// can't extend an entry's lifetime past its original
+    /// deadline. Entries whose TTL has fully elapsed during the
+    /// pause are skipped at restore time (the sweeper would
+    /// evict them on its next tick anyway).
     pub fn restore(&self, snap: FoldSnapshot<K>, force: bool) -> Result<(), FoldError> {
         // Snapshot kind ↔ fold kind is a configuration invariant:
         // the dispatch layer routes by kind, so a foreign-kind
@@ -463,8 +467,25 @@ impl<K: FoldKind> Fold<K> {
         index.clear();
 
         let anchor = Instant::now();
+        // Wall-clock interval since the snapshot was taken. Clock
+        // skew (now < taken_at) saturates to zero — a clock that
+        // jumped backwards means we behave as if the snapshot is
+        // freshly-dumped, which is the most permissive reading
+        // available without a monotonic source spanning processes.
+        let now_unix_us = crate::adapter::net::current_timestamp_micros();
+        let elapsed_since_dump =
+            Duration::from_micros(now_unix_us.saturating_sub(snap.taken_at_unix_us));
+
         for snap_entry in &snap.entries {
-            let entry = FoldSnapshot::<K>::rehydrate_entry(snap_entry, anchor);
+            let Some(entry) =
+                FoldSnapshot::<K>::rehydrate_entry(snap_entry, anchor, elapsed_since_dump)
+            else {
+                // Entry's remaining TTL was consumed by downtime
+                // between dump and restore. Drop, same shape as
+                // `from_state` dropping already-expired entries at
+                // dump time.
+                continue;
+            };
             let key = snap_entry.key.clone();
             index.on_insert(&key, &entry.payload);
             state

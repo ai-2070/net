@@ -294,6 +294,111 @@ fn snapshot_round_trips_via_restore() {
 }
 
 #[test]
+fn restore_drops_entries_whose_ttl_lapsed_during_downtime() {
+    // Regression: rehydrate_entry used to add expires_offset_ns to
+    // Instant::now() without consuming wall-clock elapsed since the
+    // dump, so any pause between dump and restore extended an
+    // entry's lifetime by exactly that pause. The fix aged each
+    // entry by `now_unix_us - taken_at_unix_us`; entries whose
+    // remaining TTL is non-positive are dropped at restore time
+    // instead of being installed with a past expires_at.
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(Duration::ZERO);
+    fold.apply(cap_announcement(0x42, 0x1000, 1, vec!["gpu"]))
+        .expect("apply");
+    let mut snap = fold.snapshot();
+    assert_eq!(snap.entries.len(), 1);
+    // Each snap entry carries an expires_offset relative to
+    // `taken_at_unix_us`. Pin `taken_at_unix_us` to a value far
+    // enough in the past that the elapsed-since-dump exceeds every
+    // entry's expires_offset.
+    let max_expires_ns: u64 = snap
+        .entries
+        .iter()
+        .map(|e| e.expires_offset_ns)
+        .max()
+        .unwrap();
+    let max_expires_us = max_expires_ns / 1000 + 1;
+    let now_us = crate::adapter::net::current_timestamp_micros();
+    snap.taken_at_unix_us = now_us.saturating_sub(max_expires_us + 1_000_000);
+
+    let restored: Fold<CapFold> = Fold::with_sweep_interval(Duration::ZERO);
+    restored.restore(snap, false).expect("restore");
+    assert_eq!(
+        restored.metrics().entries(),
+        0,
+        "entries past their TTL by the restore moment must be dropped"
+    );
+    restored.with_state(|state| {
+        assert!(state.entries.is_empty());
+        assert!(state.by_node.is_empty());
+    });
+}
+
+#[test]
+fn restore_consumes_elapsed_downtime_out_of_remaining_ttl() {
+    // Companion to the regression test above: a partial pause
+    // (elapsed_since_dump < expires_offset_ns) must yield a
+    // restored expires_at that's CLOSER to now than a naive
+    // `Instant::now() + expires_offset_ns` would produce — the
+    // entry's remaining TTL is `expires_offset - elapsed`, not
+    // `expires_offset`.
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(Duration::ZERO);
+    fold.apply(cap_announcement(0x42, 0x1000, 1, vec!["gpu"]))
+        .expect("apply");
+    let mut snap = fold.snapshot();
+    assert_eq!(snap.entries.len(), 1);
+
+    // CapFold::DEFAULT_TTL is 60s. The original snap's expires_offset
+    // anchors at ~60s; simulate a 30s pause between dump and
+    // restore so the restored entry should have ~30s remaining.
+    snap.taken_at_unix_us = snap.taken_at_unix_us.saturating_sub(30_000_000);
+
+    let restored: Fold<CapFold> = Fold::with_sweep_interval(Duration::ZERO);
+    let before_restore = std::time::Instant::now();
+    restored.restore(snap, false).expect("restore");
+    let after_restore = std::time::Instant::now();
+
+    assert_eq!(restored.metrics().entries(), 1);
+    restored.with_state(|state| {
+        let entry = state.entries.values().next().expect("entry present");
+        let remaining_lower = entry.expires_at.saturating_duration_since(after_restore);
+        let remaining_upper = entry.expires_at.saturating_duration_since(before_restore);
+        // Buggy code would yield ~60s remaining (the original TTL
+        // re-anchored at restore-time `now`); the fixed code yields
+        // ~30s after consuming the 30s of simulated downtime.
+        assert!(
+            remaining_upper <= Duration::from_secs(35),
+            "restored TTL must consume elapsed downtime (got remaining {:?})",
+            remaining_upper,
+        );
+        assert!(
+            remaining_lower >= Duration::from_secs(25),
+            "restored TTL should still carry ~30s (got remaining {:?})",
+            remaining_lower,
+        );
+    });
+}
+
+#[test]
+fn restore_clock_skew_backwards_treats_as_fresh_snapshot() {
+    // A new process whose clock jumped backwards (now < taken_at)
+    // saturates elapsed_since_dump to zero — same behavior as a
+    // freshly-dumped snapshot. Locks in the "most permissive read
+    // available without a monotonic source spanning processes"
+    // contract the restore docstring pins.
+    let fold: Fold<CapFold> = Fold::with_sweep_interval(Duration::ZERO);
+    fold.apply(cap_announcement(0x42, 0x1000, 1, vec!["gpu"]))
+        .expect("apply");
+    let mut snap = fold.snapshot();
+    assert_eq!(snap.entries.len(), 1);
+    snap.taken_at_unix_us = u64::MAX;
+
+    let restored: Fold<CapFold> = Fold::with_sweep_interval(Duration::ZERO);
+    restored.restore(snap, false).expect("restore");
+    assert_eq!(restored.metrics().entries(), 1);
+}
+
+#[test]
 fn restore_over_live_state_without_force_is_refused() {
     let fold: Fold<CapFold> = Fold::new();
     fold.apply(cap_announcement(0x42, 0x1000, 1, vec!["gpu"]))

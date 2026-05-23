@@ -115,28 +115,40 @@ impl<K: FoldKind> FoldSnapshot<K> {
     }
 
     /// Materialize a [`FoldEntry`] from a snapshot entry, anchored
-    /// to a freshly-captured `Instant::now()` so the restored
-    /// `received_at` / `expires_at` carry the same durations the
-    /// snapshot encoded — relative to the *new* process's clock.
+    /// to a freshly-captured `Instant::now()` and aged by
+    /// `elapsed_since_dump` — the wall-clock interval between the
+    /// snapshot's `taken_at_unix_us` and "now". The restored
+    /// `expires_at` consumes the elapsed downtime out of the
+    /// remaining TTL so a dump → long-pause → restore can't extend
+    /// an entry's lifetime past its original deadline; the
+    /// restored `received_at` ages by the same interval so age-
+    /// dependent freshness checks see a realistic timestamp.
     ///
-    /// Used by [`super::Fold::restore`] to walk
-    /// [`FoldSnapshot::entries`] and rebuild the in-memory state.
+    /// Returns `None` when the entry would already be expired —
+    /// `elapsed_since_dump >= expires_offset_ns`. Callers
+    /// ([`super::Fold::restore`]) skip such entries rather than
+    /// installing them with `expires_at <= now` and waiting for
+    /// the sweeper to clean them up.
     pub(super) fn rehydrate_entry(
         snap_entry: &FoldSnapshotEntry<K>,
         anchor: Instant,
-    ) -> FoldEntry<K> {
-        let received_at = anchor
-            .checked_sub(Duration::from_nanos(snap_entry.received_offset_ns))
-            .unwrap_or(anchor);
-        let expires_at = anchor
-            .checked_add(Duration::from_nanos(snap_entry.expires_offset_ns))
-            .unwrap_or(anchor);
-        FoldEntry {
+        elapsed_since_dump: Duration,
+    ) -> Option<FoldEntry<K>> {
+        let expires_offset = Duration::from_nanos(snap_entry.expires_offset_ns);
+        if elapsed_since_dump >= expires_offset {
+            return None;
+        }
+        let remaining_ttl = expires_offset - elapsed_since_dump;
+        let aged_received_offset = Duration::from_nanos(snap_entry.received_offset_ns)
+            .saturating_add(elapsed_since_dump);
+        let received_at = anchor.checked_sub(aged_received_offset).unwrap_or(anchor);
+        let expires_at = anchor.checked_add(remaining_ttl).unwrap_or(anchor);
+        Some(FoldEntry {
             payload: snap_entry.payload.clone(),
             node_id: snap_entry.node_id,
             generation: snap_entry.generation,
             received_at,
             expires_at,
-        }
+        })
     }
 }
