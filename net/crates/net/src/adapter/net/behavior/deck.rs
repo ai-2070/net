@@ -752,6 +752,16 @@ impl DeckClient {
             .unwrap_or_default()
     }
 
+    /// Cheap shared-snapshot variant of [`Self::aggregator_summaries`]
+    /// — clones only the outer `Arc`. Hot-path callers (TUI render
+    /// loops) should prefer this.
+    pub fn aggregator_summaries_arc(&self) -> Arc<Vec<SummaryAnnouncement>> {
+        self.aggregator
+            .as_ref()
+            .map(|a| a.latest_summaries_arc())
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
     /// Aggregator's monotonic tick counter, or `0` when none
     /// installed.
     pub fn aggregator_generation(&self) -> u64 {

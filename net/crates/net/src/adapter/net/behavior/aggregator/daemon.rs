@@ -26,7 +26,7 @@
 //! - [`AggregatorDaemon::generation`] — monotonic tick counter,
 //!   stamped onto every emitted `SummaryAnnouncement`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -132,10 +132,13 @@ pub struct AggregatorDaemon {
     /// [`SummaryAnnouncement`].
     generation: Arc<AtomicU64>,
     /// Latest batch of summaries the loop produced. Capped at
-    /// `LATEST_SUMMARIES_CAP` entries — operator tooling reads
-    /// through [`Self::latest_summaries`]. `VecDeque` so the cap
-    /// eviction (`pop_front`) is O(1).
-    latest: Arc<RwLock<VecDeque<SummaryAnnouncement>>>,
+    /// `LATEST_SUMMARIES_CAP` entries.
+    ///
+    /// Held as `Arc<Vec<...>>` so reads (`latest_summaries_arc`)
+    /// are an O(1) Arc clone instead of a deep Vec clone. Writes
+    /// rebuild the inner Vec then swap the Arc — copy cost is
+    /// bounded by the cap so the rebuild is cheap.
+    latest: Arc<RwLock<Arc<Vec<SummaryAnnouncement>>>>,
     /// Cooperative-shutdown flag. The background loop polls this
     /// between ticks; [`Self::shutdown`] sets it.
     shutdown: Arc<AtomicBool>,
@@ -164,7 +167,7 @@ impl AggregatorDaemon {
             mesh,
             summarizers,
             generation: Arc::new(AtomicU64::new(0)),
-            latest: Arc::new(RwLock::new(VecDeque::with_capacity(LATEST_SUMMARIES_CAP))),
+            latest: Arc::new(RwLock::new(Arc::new(Vec::with_capacity(LATEST_SUMMARIES_CAP)))),
             shutdown: Arc::new(AtomicBool::new(false)),
             background: parking_lot::Mutex::new(None),
         })
@@ -264,7 +267,7 @@ impl AggregatorDaemon {
         if batch.is_empty() {
             return batch;
         }
-        let latest = self.latest.read();
+        let latest = self.latest_summaries_arc();
         batch
             .into_iter()
             .filter(|summary| {
@@ -332,15 +335,22 @@ impl AggregatorDaemon {
     }
 
     /// Append a batch to the latest-summaries buffer, evicting
-    /// the oldest entries (FIFO) when the cap is hit.
+    /// the oldest entries (FIFO) when the cap is hit. Rebuilds
+    /// the inner `Arc<Vec>` so concurrent readers holding the
+    /// prior Arc continue seeing a consistent snapshot.
     fn append_to_latest(&self, batch: Vec<SummaryAnnouncement>) {
-        let mut latest = self.latest.write();
-        for s in batch {
-            if latest.len() >= LATEST_SUMMARIES_CAP {
-                latest.pop_front();
-            }
-            latest.push_back(s);
+        if batch.is_empty() {
+            return;
         }
+        let mut slot = self.latest.write();
+        let mut new_vec: Vec<SummaryAnnouncement> = (**slot).clone();
+        for s in batch {
+            if new_vec.len() >= LATEST_SUMMARIES_CAP {
+                new_vec.remove(0);
+            }
+            new_vec.push(s);
+        }
+        *slot = Arc::new(new_vec);
     }
 
     /// Publish one summary onto its per-fold-kind summary
@@ -416,8 +426,19 @@ impl AggregatorDaemon {
     /// Snapshot of the latest summaries the loop has produced.
     /// Caller gets a `Vec` clone — modifying it doesn't affect
     /// the daemon's internal buffer.
+    ///
+    /// Hot-path callers (TUI render loops, RPC handlers) should
+    /// prefer [`Self::latest_summaries_arc`] which avoids the
+    /// deep clone.
     pub fn latest_summaries(&self) -> Vec<SummaryAnnouncement> {
-        self.latest.read().iter().cloned().collect()
+        (**self.latest.read()).clone()
+    }
+
+    /// Cheap snapshot accessor: clones only the outer `Arc`. Use
+    /// for hot-path readers (TUI render, fold-query RPC) that
+    /// only need read-only access.
+    pub fn latest_summaries_arc(&self) -> Arc<Vec<SummaryAnnouncement>> {
+        Arc::clone(&*self.latest.read())
     }
 
     /// Current generation counter. Reflects the number of
