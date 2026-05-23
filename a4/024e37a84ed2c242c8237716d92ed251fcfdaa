@@ -1,0 +1,39 @@
+net/crates/net/aggregator-daemon/tests/boot_and_query.rs
+  s_099fa7d871e34d::t_884b8102244d16 108-110,123-124
+  s_099fa7d871e34d::t_45f1229ea4d4b4 1-107,111-122,125-219
+net/crates/net/Cargo.toml
+  s_099fa7d871e34d::t_3320f7bc158234 7
+net/crates/net/aggregator-daemon/Cargo.toml
+  s_099fa7d871e34d::t_33516528cb056e 1-9,14-65
+  s_099fa7d871e34d::t_9564c18f4d61e5 10-13
+net/crates/net/aggregator-daemon/src/main.rs
+  s_099fa7d871e34d::t_efa73003392daf 5-9,12,14-20
+  s_099fa7d871e34d::t_91b3925f6e94d5 1-4,10-11,13
+net/crates/net/aggregator-daemon/src/lib.rs
+  s_099fa7d871e34d::t_e042b512ddba2b 269-272
+  s_099fa7d871e34d::t_2ebf9158c2d499 1-61,64-69,71-72,74-77,79-81,83-128,130-157,162-174,179-180,186-199,201-214,219-268,273-390,395-552
+  s_099fa7d871e34d::t_c7cbd973461477 391-394
+  s_099fa7d871e34d::t_5dc23fb1b831fe 158-161
+  s_099fa7d871e34d::t_8eedd64ae77991 181-185
+  s_099fa7d871e34d::t_19d9afda98ac57 62-63,70,73,78,82
+  s_099fa7d871e34d::t_399f33e573d4d3 200
+  s_099fa7d871e34d::t_12a126da9a09f9 175-178
+  s_099fa7d871e34d::t_c1501881f053dd 129
+  s_099fa7d871e34d::t_725b1c006e8103 215-218
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "a4024e37a84ed2c242c8237716d92ed251fcfdaa",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
