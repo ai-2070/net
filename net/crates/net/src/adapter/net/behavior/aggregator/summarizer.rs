@@ -23,7 +23,7 @@ use crate::adapter::net::subnet::SubnetId;
 /// for class-bucketed counts. Receivers diff successive
 /// announcements via `(source_subnet, fold_kind, bucket)` to
 /// detect deltas.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SummaryAnnouncement {
     /// Subnet this summary describes. Filled in by the aggregator
     /// daemon from its [`super::AggregatorConfig::source_subnet`].

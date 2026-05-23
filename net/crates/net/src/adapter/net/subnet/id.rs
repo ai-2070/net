@@ -26,7 +26,19 @@ pub const MAX_DEPTH: u8 = 4;
 /// over `SubnetId`s — e.g. `correlation.rs::analyze_subnet_correlation`
 /// needs ties at the same depth to resolve consistently across runs
 /// rather than depending on `HashMap` iteration order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Default,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct SubnetId(u32);
 
 impl SubnetId {
