@@ -102,6 +102,27 @@ import (
 )
 
 // =====================================================================
+// Error kind discriminants — Go-typed mirrors of the C `#define`s.
+//
+// Re-stating them at the Go level lets `_test.go` files reach them
+// without their own cgo prelude (cgo directives are disallowed
+// inside `_test.go`). Values locked across SDK releases per the
+// public C ABI; an SDK bump would have to update both sides in
+// lockstep. The on-the-wire type matches `c_int` on every supported
+// platform — int32 is the safe Go representation.
+const (
+	netRegistryOk                    int32 = 0
+	netRegistryErrTransport          int32 = 1
+	netRegistryErrCodec              int32 = 2
+	netRegistryErrUnknownTemplate    int32 = 3
+	netRegistryErrDuplicateGroupName int32 = 4
+	netRegistryErrSpawnRejected      int32 = 5
+	netRegistryErrSpawnNotSupported  int32 = 6
+	netRegistryErrUnknownKind        int32 = 7
+	netRegistryErrInvalidArgs        int32 = 99
+)
+
+// =====================================================================
 // Error types
 // =====================================================================
 
@@ -160,42 +181,42 @@ func (e *FoldQueryClientError) Error() string {
 // after Close() has freed the underlying handle.
 var ErrAggregatorHandleClosed = errors.New("net: aggregator client handle is closed")
 
-func registryErrFromKind(kind C.int, detail string) *RegistryClientError {
+func registryErrFromKind(kind int32, detail string) *RegistryClientError {
 	var k RegistryErrorKind
 	switch kind {
-	case C.NET_REGISTRY_ERR_TRANSPORT:
+	case netRegistryErrTransport:
 		k = RegistryErrKindTransport
-	case C.NET_REGISTRY_ERR_CODEC:
+	case netRegistryErrCodec:
 		k = RegistryErrKindCodec
-	case C.NET_REGISTRY_ERR_UNKNOWN_TEMPLATE:
+	case netRegistryErrUnknownTemplate:
 		k = RegistryErrKindUnknownTemplate
-	case C.NET_REGISTRY_ERR_DUPLICATE_GROUP_NAME:
+	case netRegistryErrDuplicateGroupName:
 		k = RegistryErrKindDuplicateGroupName
-	case C.NET_REGISTRY_ERR_SPAWN_REJECTED:
+	case netRegistryErrSpawnRejected:
 		k = RegistryErrKindSpawnRejected
-	case C.NET_REGISTRY_ERR_SPAWN_NOT_SUPPORTED:
+	case netRegistryErrSpawnNotSupported:
 		k = RegistryErrKindSpawnNotSupported
-	case C.NET_REGISTRY_ERR_INVALID_ARGS:
+	case netRegistryErrInvalidArgs:
 		k = RegistryErrKindInvalidArgs
 	default:
-		k = RegistryErrorKind(fmt.Sprintf("unknown-%d", int(kind)))
+		k = RegistryErrorKind(fmt.Sprintf("unknown-%d", kind))
 	}
 	return &RegistryClientError{Kind: k, Detail: detail}
 }
 
-func foldQueryErrFromKind(kind C.int, detail string) *FoldQueryClientError {
+func foldQueryErrFromKind(kind int32, detail string) *FoldQueryClientError {
 	var k FoldQueryErrorKind
 	switch kind {
-	case C.NET_REGISTRY_ERR_TRANSPORT:
+	case netRegistryErrTransport:
 		k = FoldQueryErrKindTransport
-	case C.NET_REGISTRY_ERR_CODEC:
+	case netRegistryErrCodec:
 		k = FoldQueryErrKindCodec
-	case C.NET_REGISTRY_ERR_UNKNOWN_KIND:
+	case netRegistryErrUnknownKind:
 		k = FoldQueryErrKindUnknownKind
-	case C.NET_REGISTRY_ERR_INVALID_ARGS:
+	case netRegistryErrInvalidArgs:
 		k = FoldQueryErrKindInvalidArgs
 	default:
-		k = FoldQueryErrorKind(fmt.Sprintf("unknown-%d", int(kind)))
+		k = FoldQueryErrorKind(fmt.Sprintf("unknown-%d", kind))
 	}
 	return &FoldQueryClientError{Kind: k, Detail: detail}
 }
@@ -302,7 +323,7 @@ func (c *RegistryClient) List(ctx context.Context, targetNodeID uint64) ([]Regis
 	var errKind C.int
 	jsonPtr := C.net_registry_client_list(c.handle, C.uint64_t(targetNodeID), &errKind)
 	if jsonPtr == nil {
-		return nil, registryErrFromKind(errKind, c.lastErrorDetail())
+		return nil, registryErrFromKind(int32(errKind), c.lastErrorDetail())
 	}
 	defer C.net_free_string(jsonPtr)
 	var out []RegistryGroupSummary
@@ -342,7 +363,7 @@ func (c *RegistryClient) Spawn(
 		&errKind,
 	)
 	if jsonPtr == nil {
-		return RegistryGroupSummary{}, registryErrFromKind(errKind, c.lastErrorDetail())
+		return RegistryGroupSummary{}, registryErrFromKind(int32(errKind), c.lastErrorDetail())
 	}
 	defer C.net_free_string(jsonPtr)
 	var out RegistryGroupSummary
@@ -384,7 +405,7 @@ func (c *RegistryClient) Unregister(
 	case 0:
 		return false, nil
 	default:
-		return false, registryErrFromKind(errKind, c.lastErrorDetail())
+		return false, registryErrFromKind(int32(errKind), c.lastErrorDetail())
 	}
 }
 
@@ -499,7 +520,7 @@ func (c *FoldQueryClient) QueryLatest(
 		&errKind,
 	)
 	if jsonPtr == nil {
-		return nil, foldQueryErrFromKind(errKind, c.lastErrorDetail())
+		return nil, foldQueryErrFromKind(int32(errKind), c.lastErrorDetail())
 	}
 	defer C.net_free_string(jsonPtr)
 	var out []SummaryAnnouncement
@@ -532,7 +553,7 @@ func (c *FoldQueryClient) QuerySummarizeNow(
 		&errKind,
 	)
 	if jsonPtr == nil {
-		return nil, foldQueryErrFromKind(errKind, c.lastErrorDetail())
+		return nil, foldQueryErrFromKind(int32(errKind), c.lastErrorDetail())
 	}
 	defer C.net_free_string(jsonPtr)
 	var out []SummaryAnnouncement

@@ -9,6 +9,13 @@
 
 package net
 
+// cgo directives are disallowed inside `_test.go` files, so this
+// test exercises `registryErrFromKind` / `foldQueryErrFromKind`
+// through their Go-typed `int32` signatures + the `netRegistry*`
+// constants declared in `aggregator.go`. The constants mirror the
+// C `#define`s value-for-value and are themselves part of the
+// public ABI contract — any drift fails both sides in lockstep.
+
 import (
 	"context"
 	"errors"
@@ -63,40 +70,40 @@ func TestFoldQueryClientErrorRendering(t *testing.T) {
 
 func TestRegistryErrFromKindMapping(t *testing.T) {
 	for _, tt := range []struct {
-		raw  C.int
+		raw  int32
 		want RegistryErrorKind
 	}{
-		{C.NET_REGISTRY_ERR_TRANSPORT, RegistryErrKindTransport},
-		{C.NET_REGISTRY_ERR_CODEC, RegistryErrKindCodec},
-		{C.NET_REGISTRY_ERR_UNKNOWN_TEMPLATE, RegistryErrKindUnknownTemplate},
-		{C.NET_REGISTRY_ERR_DUPLICATE_GROUP_NAME, RegistryErrKindDuplicateGroupName},
-		{C.NET_REGISTRY_ERR_SPAWN_REJECTED, RegistryErrKindSpawnRejected},
-		{C.NET_REGISTRY_ERR_SPAWN_NOT_SUPPORTED, RegistryErrKindSpawnNotSupported},
-		{C.NET_REGISTRY_ERR_INVALID_ARGS, RegistryErrKindInvalidArgs},
+		{netRegistryErrTransport, RegistryErrKindTransport},
+		{netRegistryErrCodec, RegistryErrKindCodec},
+		{netRegistryErrUnknownTemplate, RegistryErrKindUnknownTemplate},
+		{netRegistryErrDuplicateGroupName, RegistryErrKindDuplicateGroupName},
+		{netRegistryErrSpawnRejected, RegistryErrKindSpawnRejected},
+		{netRegistryErrSpawnNotSupported, RegistryErrKindSpawnNotSupported},
+		{netRegistryErrInvalidArgs, RegistryErrKindInvalidArgs},
 	} {
 		got := registryErrFromKind(tt.raw, "detail")
 		if got.Kind != tt.want {
-			t.Errorf("raw=%d: kind = %q, want %q", int(tt.raw), got.Kind, tt.want)
+			t.Errorf("raw=%d: kind = %q, want %q", tt.raw, got.Kind, tt.want)
 		}
 		if got.Detail != "detail" {
-			t.Errorf("raw=%d: detail = %q, want %q", int(tt.raw), got.Detail, "detail")
+			t.Errorf("raw=%d: detail = %q, want %q", tt.raw, got.Detail, "detail")
 		}
 	}
 }
 
 func TestFoldQueryErrFromKindMapping(t *testing.T) {
 	for _, tt := range []struct {
-		raw  C.int
+		raw  int32
 		want FoldQueryErrorKind
 	}{
-		{C.NET_REGISTRY_ERR_TRANSPORT, FoldQueryErrKindTransport},
-		{C.NET_REGISTRY_ERR_CODEC, FoldQueryErrKindCodec},
-		{C.NET_REGISTRY_ERR_UNKNOWN_KIND, FoldQueryErrKindUnknownKind},
-		{C.NET_REGISTRY_ERR_INVALID_ARGS, FoldQueryErrKindInvalidArgs},
+		{netRegistryErrTransport, FoldQueryErrKindTransport},
+		{netRegistryErrCodec, FoldQueryErrKindCodec},
+		{netRegistryErrUnknownKind, FoldQueryErrKindUnknownKind},
+		{netRegistryErrInvalidArgs, FoldQueryErrKindInvalidArgs},
 	} {
 		got := foldQueryErrFromKind(tt.raw, "detail")
 		if got.Kind != tt.want {
-			t.Errorf("raw=%d: kind = %q, want %q", int(tt.raw), got.Kind, tt.want)
+			t.Errorf("raw=%d: kind = %q, want %q", tt.raw, got.Kind, tt.want)
 		}
 	}
 }
@@ -105,12 +112,12 @@ func TestUnknownErrKindFallsThrough(t *testing.T) {
 	// A future C ABI release might add a new discriminant; the
 	// Go binding must surface it as `unknown-N` rather than
 	// silently mapping it to an existing variant.
-	got := registryErrFromKind(C.int(123), "future")
+	got := registryErrFromKind(int32(123), "future")
 	if !strings.HasPrefix(string(got.Kind), "unknown-") {
 		t.Errorf("expected unknown-N fallback, got %q", got.Kind)
 	}
 
-	gotFold := foldQueryErrFromKind(C.int(123), "future")
+	gotFold := foldQueryErrFromKind(int32(123), "future")
 	if !strings.HasPrefix(string(gotFold.Kind), "unknown-") {
 		t.Errorf("expected unknown-N fallback, got %q", gotFold.Kind)
 	}
