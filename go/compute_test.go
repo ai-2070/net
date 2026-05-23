@@ -260,6 +260,76 @@ func readU32LE(b []byte) uint32 {
 	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
 }
 
+// Regression for the `WIRE_ORIGIN_HASH_64BIT` cutover: the C ABI
+// surface (`net_identity_origin_hash` / `net_compute_daemon_handle_origin_hash`)
+// returns the full 64-bit hash, not a truncated u32 zero-extended
+// to u64. If the Go side were seeing a truncated value, every
+// generated identity would have `origin_hash & 0xFFFFFFFF_00000000 == 0`.
+//
+// Strategy: generate enough random identities that at least one
+// would, statistically, have bits set above 2^32 if the FFI surface
+// wasn't truncating. The bound is `1 - (1/2)^N`; N=32 brings the
+// false-negative probability to ~2.3e-10 — effectively impossible
+// to flake. If every identity reports a zero high half, that's
+// near-certain proof that truncation is happening at the FFI
+// boundary.
+func TestIdentityOriginHash_PreservesHighBitsAcrossFFI(t *testing.T) {
+	const samples = 32
+	const highMask uint64 = 0xFFFF_FFFF_0000_0000
+
+	var withHighBits *Identity
+	var highHash uint64
+	for i := 0; i < samples; i++ {
+		id := newTestIdentity(t)
+		h := id.OriginHash()
+		if h&highMask != 0 {
+			withHighBits = id
+			highHash = h
+			break
+		}
+		id.Close()
+	}
+	if withHighBits == nil {
+		t.Fatalf("none of %d random identities had bits set above 2^32; "+
+			"FFI is almost certainly truncating origin_hash to u32 "+
+			"(this branch is statistically impossible without truncation)", samples)
+	}
+	defer withHighBits.Close()
+
+	// Cross-FFI surface check: spawning a daemon against this
+	// identity must return a handle whose OriginHash() matches the
+	// identity's full u64 value. If the daemon-side FFI truncated,
+	// the handle.OriginHash() and id.OriginHash() would differ in
+	// the high bits.
+	m := newLocalMesh(t)
+	defer m.Shutdown()
+	rt, err := NewDaemonRuntime(m)
+	if err != nil {
+		t.Fatalf("NewDaemonRuntime: %v", err)
+	}
+	defer rt.Close()
+	if err := rt.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	h, err := rt.Spawn("echo", withHighBits, echoDaemon{}, nil)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer h.Close()
+
+	got := h.OriginHash()
+	if got != highHash {
+		t.Fatalf("handle origin_hash = %#x, identity origin_hash = %#x; "+
+			"high bits diverged across the spawn FFI surface", got, highHash)
+	}
+	if got&highMask == 0 {
+		t.Fatalf("daemon handle reported zero high bits (%#x) for a "+
+			"high-bits identity (%#x); truncation on the daemon FFI surface",
+			got, highHash)
+	}
+}
+
 func TestDaemonSpawn_ReturnsHandleWithOriginHash(t *testing.T) {
 	m := newLocalMesh(t)
 	defer m.Shutdown()
