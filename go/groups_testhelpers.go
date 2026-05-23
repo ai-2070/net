@@ -26,16 +26,27 @@ package net
 
 /*
 #include "net.h"
+#include <stdlib.h>
 
-// The prototype is deliberately NOT in net.h since that header
+// The prototypes are deliberately NOT in net.h since that header
 // is consumed by production callers. Declared inline here so
-// only this test-only TU references the (feature-gated) symbol.
+// only this test-only TU references the (feature-gated) symbols.
 extern void net_compute_test_inject_synthetic_peer(
     net_compute_mesh_arc_t* mesh_arc,
     uint64_t node_id
 );
+extern void net_compute_test_inject_synthetic_peer_with_tags(
+    net_compute_mesh_arc_t* mesh_arc,
+    uint64_t node_id,
+    const char* tags_json
+);
 */
 import "C"
+
+import (
+	"encoding/json"
+	"unsafe"
+)
 
 // TestInjectSyntheticPeer is test-only — DO NOT use in
 // production. Stages a synthetic peer entry in the given
@@ -64,4 +75,42 @@ func TestInjectSyntheticPeer(mesh *MeshNode, nodeID uint64) {
 	}
 	defer C.net_mesh_arc_free(arc)
 	C.net_compute_test_inject_synthetic_peer(arc, C.uint64_t(nodeID))
+}
+
+// TestInjectSyntheticPeerWithTags is the richer variant for the
+// Phase 6c aggregation smoke tests — stages a synthetic peer with
+// the supplied canonical tag strings (including reserved-prefix
+// tags like `scope:region:us-east`). Same lifecycle / lock
+// discipline as TestInjectSyntheticPeer.
+func TestInjectSyntheticPeerWithTags(mesh *MeshNode, nodeID uint64, tags []string) {
+	if mesh == nil {
+		return
+	}
+	mesh.mu.RLock()
+	h := mesh.handle
+	if h == nil {
+		mesh.mu.RUnlock()
+		return
+	}
+	arc := C.net_mesh_arc_clone(h)
+	mesh.mu.RUnlock()
+	if arc == nil {
+		return
+	}
+	defer C.net_mesh_arc_free(arc)
+	if len(tags) == 0 {
+		C.net_compute_test_inject_synthetic_peer_with_tags(
+			arc, C.uint64_t(nodeID), nil,
+		)
+		return
+	}
+	b, err := json.Marshal(tags)
+	if err != nil {
+		return
+	}
+	cs := C.CString(string(b))
+	defer C.free(unsafe.Pointer(cs))
+	C.net_compute_test_inject_synthetic_peer_with_tags(
+		arc, C.uint64_t(nodeID), cs,
+	)
 }

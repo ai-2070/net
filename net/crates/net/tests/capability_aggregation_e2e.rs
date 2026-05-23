@@ -19,8 +19,23 @@ use std::time::Duration;
 
 use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
 use net::adapter::net::behavior::fold::{Aggregation, CapacityQuery, GroupBy, TagMatcher};
+use net::adapter::net::behavior::tag::Tag;
 use net::adapter::net::identity::EntityId;
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
+
+/// Build a `scope:region:<name>` reserved tag — the fold's
+/// `translate_announcement` parses this prefix to populate
+/// `CapabilityMembership::region` (which `GroupBy::Region` reads).
+/// Reserved prefixes can't go through `CapabilitySet::add_tag`
+/// (it routes through `Tag::parse_user`, which rejects reserved
+/// prefixes by design), so we insert the typed `Tag::Reserved`
+/// directly.
+fn region_tag(name: &str) -> Tag {
+    Tag::Reserved {
+        prefix: "scope:".to_string(),
+        body: format!("region:{name}"),
+    }
+}
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
@@ -55,10 +70,13 @@ fn prime_fixture(node: &MeshNode) {
         .add_tag("hardware.gpu.h100")
         .add_tag("hardware.gpu.count=8")
         .add_tag("software.python=3.11");
-    caps_a = caps_a.with_metadata("region", "us-east");
-    let mut ann_a = CapabilityAnnouncement::new(0xA, EntityId::from_bytes([0xAA; 32]), 1, caps_a);
-    ann_a.region = Some("us-east".to_string());
-    node.test_inject_capability_announcement(ann_a);
+    caps_a.tags.insert(region_tag("us-east"));
+    node.test_inject_capability_announcement(CapabilityAnnouncement::new(
+        0xA,
+        EntityId::from_bytes([0xAA; 32]),
+        1,
+        caps_a,
+    ));
 
     // Publisher 0xB: h100 / us-east / 4 GPUs.
     let mut caps_b = CapabilitySet::new()
@@ -66,10 +84,13 @@ fn prime_fixture(node: &MeshNode) {
         .add_tag("hardware.gpu.h100")
         .add_tag("hardware.gpu.count=4")
         .add_tag("software.python=3.12");
-    caps_b = caps_b.with_metadata("region", "us-east");
-    let mut ann_b = CapabilityAnnouncement::new(0xB, EntityId::from_bytes([0xBB; 32]), 1, caps_b);
-    ann_b.region = Some("us-east".to_string());
-    node.test_inject_capability_announcement(ann_b);
+    caps_b.tags.insert(region_tag("us-east"));
+    node.test_inject_capability_announcement(CapabilityAnnouncement::new(
+        0xB,
+        EntityId::from_bytes([0xBB; 32]),
+        1,
+        caps_b,
+    ));
 
     // Publisher 0xC: a100 / us-west / 2 GPUs.
     let mut caps_c = CapabilitySet::new()
@@ -77,10 +98,13 @@ fn prime_fixture(node: &MeshNode) {
         .add_tag("hardware.gpu.a100")
         .add_tag("hardware.gpu.count=2")
         .add_tag("software.python=3.11");
-    caps_c = caps_c.with_metadata("region", "us-west");
-    let mut ann_c = CapabilityAnnouncement::new(0xC, EntityId::from_bytes([0xCC; 32]), 1, caps_c);
-    ann_c.region = Some("us-west".to_string());
-    node.test_inject_capability_announcement(ann_c);
+    caps_c.tags.insert(region_tag("us-west"));
+    node.test_inject_capability_announcement(CapabilityAnnouncement::new(
+        0xC,
+        EntityId::from_bytes([0xCC; 32]),
+        1,
+        caps_c,
+    ));
 }
 
 #[tokio::test]

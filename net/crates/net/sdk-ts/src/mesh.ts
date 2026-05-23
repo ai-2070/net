@@ -276,6 +276,29 @@ export class MeshNode {
     native.testInjectSyntheticPeer(nodeId);
   }
 
+  /**
+   * Test-only — same shape as {@link _testInjectSyntheticPeer} but
+   * stages the synthetic peer with the supplied canonical tag
+   * strings. Used by the Phase 6c aggregation smoke tests to set
+   * up multi-bucket fixtures without spinning up multiple meshes.
+   *
+   * @internal
+   */
+  _testInjectSyntheticPeerWithTags(nodeId: bigint, tags: string[]): void {
+    const native = this.native as unknown as {
+      testInjectSyntheticPeerWithTags?: (
+        nodeId: bigint,
+        tags: string[],
+      ) => void;
+    };
+    if (typeof native.testInjectSyntheticPeerWithTags !== 'function') {
+      throw new Error(
+        'testInjectSyntheticPeerWithTags: NAPI build missing `test-helpers` feature',
+      );
+    }
+    native.testInjectSyntheticPeerWithTags(nodeId, tags);
+  }
+
   /** Create and configure a new mesh node. */
   static async create(config: MeshNodeConfig): Promise<MeshNode> {
     const native = await NapiNetMesh.create({

@@ -2335,6 +2335,46 @@ mod mesh_bindings {
             ));
             Ok(())
         }
+
+        /// Test-only — same shape as
+        /// [`Self::test_inject_synthetic_peer`] but takes an array of
+        /// canonical tag strings to install on the synthetic peer.
+        /// Used by the Phase 6c capability-aggregation smoke tests
+        /// to stage multi-bucket fixtures without spinning up
+        /// multiple meshes.
+        #[napi]
+        pub fn test_inject_synthetic_peer_with_tags(
+            &self,
+            node_id: BigInt,
+            tags: Vec<String>,
+        ) -> Result<()> {
+            use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
+            use net::adapter::net::behavior::Tag;
+            use net::adapter::net::identity::EntityId;
+            let nid = crate::common::bigint_u64(node_id).map_err(|e| {
+                Error::from_reason(format!("test_inject_synthetic_peer_with_tags: {}", e.reason))
+            })?;
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let mut caps = CapabilitySet::new();
+            // Insert directly via the permissive `Tag::parse` so
+            // reserved-prefix tags (`scope:region:us-east`, etc.)
+            // make it into the synthesized cap set; `add_tag` rejects
+            // reserved prefixes by design.
+            for s in tags {
+                if let Ok(t) = Tag::parse(&s) {
+                    caps.tags.insert(t);
+                }
+            }
+            let eid = EntityId::from_bytes([0u8; 32]);
+            node.test_inject_capability_announcement(CapabilityAnnouncement::new(
+                nid,
+                eid,
+                1,
+                caps,
+            ));
+            Ok(())
+        }
     }
 }
 

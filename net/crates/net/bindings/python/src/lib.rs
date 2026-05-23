@@ -1802,6 +1802,41 @@ mod mesh_bindings {
             Ok(())
         }
 
+        /// Test-only — same shape as `_test_inject_synthetic_peer`
+        /// but takes a list of canonical tag strings to install on
+        /// the synthetic peer. Used by the Phase 6c
+        /// capability-aggregation smoke tests so the fixture can
+        /// stage multi-bucket data without spinning up multiple
+        /// meshes.
+        #[cfg(feature = "groups")]
+        fn _test_inject_synthetic_peer_with_tags(
+            &self,
+            node_id: u64,
+            tags: Vec<String>,
+        ) -> PyResult<()> {
+            use net::adapter::net::behavior::capability::{
+                CapabilityAnnouncement, CapabilitySet,
+            };
+            use net::adapter::net::behavior::Tag;
+            use net::adapter::net::identity::EntityId;
+            let node = self.get_node()?;
+            let mut caps = CapabilitySet::new();
+            // Insert via the permissive `Tag::parse` so reserved-
+            // prefix tags (`scope:region:us-east`, etc.) make it
+            // into the synthesized cap set; `add_tag` rejects
+            // reserved prefixes by design.
+            for s in tags {
+                if let Ok(t) = Tag::parse(&s) {
+                    caps.tags.insert(t);
+                }
+            }
+            let eid = EntityId::from_bytes([0u8; 32]);
+            node.test_inject_capability_announcement(CapabilityAnnouncement::new(
+                node_id, eid, 1, caps,
+            ));
+            Ok(())
+        }
+
         /// Query the local capability index. Returns node ids
         /// (including our own when we self-match) whose latest
         /// announcement matches `filter`.

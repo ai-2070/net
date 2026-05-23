@@ -1968,6 +1968,59 @@ pub extern "C" fn net_compute_test_inject_synthetic_peer(
     ));
 }
 
+/// Test-only — same shape as
+/// [`net_compute_test_inject_synthetic_peer`] but takes a
+/// JSON-encoded `[string, ...]` list of canonical tag strings to
+/// install on the synthetic peer. Used by the Phase 6c
+/// capability-aggregation smoke tests to stage multi-bucket
+/// fixtures without spinning up multiple meshes.
+///
+/// `tags_json` may be NULL — equivalent to an empty list.
+///
+/// # Safety
+///
+/// `mesh_arc` must be a pointer returned by `net_mesh_arc_clone`.
+/// `tags_json`, if non-NULL, must point at a NUL-terminated UTF-8
+/// string valid for the duration of the call.
+#[cfg(feature = "test-helpers")]
+#[no_mangle]
+pub extern "C" fn net_compute_test_inject_synthetic_peer_with_tags(
+    mesh_arc: *mut std::sync::Arc<MeshNode>,
+    node_id: u64,
+    tags_json: *const c_char,
+) {
+    use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
+    use net::adapter::net::behavior::Tag;
+    use net::adapter::net::identity::EntityId;
+    use std::ffi::CStr;
+    if mesh_arc.is_null() {
+        return;
+    }
+    let arc = unsafe { &*mesh_arc };
+    let tags: Vec<String> = if tags_json.is_null() {
+        Vec::new()
+    } else {
+        let s = match unsafe { CStr::from_ptr(tags_json) }.to_str() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        match serde_json::from_str(s) {
+            Ok(v) => v,
+            Err(_) => return,
+        }
+    };
+    let mut caps = CapabilitySet::new();
+    for s in tags {
+        if let Ok(t) = Tag::parse(&s) {
+            caps.tags.insert(t);
+        }
+    }
+    let eid = EntityId::from_bytes([0u8; 32]);
+    arc.test_inject_capability_announcement(CapabilityAnnouncement::new(
+        node_id, eid, 1, caps,
+    ));
+}
+
 // =========================================================================
 // Groups — Stage 4 of SDK_GROUPS_SURFACE_PLAN.md
 // =========================================================================
