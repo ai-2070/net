@@ -29,10 +29,10 @@ Tagged `[B | H | M | L]`:
 | AL-2  | B   | placement             | `AggregatorGroup` had no cross-node placement — ✅ `spawn_with_placement` via `Scheduler`, `5acf1f34`                  |
 | AL-3  | H   | failure recovery      | No per-replica health or auto-replacement — ✅ `health()` + `replace` + `HealthMonitor`, `8787b2db` / `40a1b375`        |
 | AL-4  | M   | observability         | `AggregatorGroup` skipped registry — ✅ `AggregatorRegistry` on `MeshNode`, `e50728f0`                                  |
-| AL-5  | M   | shutdown determinism  | `on_stop` JoinHandle timeout is `interval + 100ms` — can drop mid-publish work        |
+| AL-5  | M   | shutdown determinism  | `on_stop` could drop mid-publish work — ✅ shutdown-aware tick loop + bumped backstop, `4016528a` |
 | AL-6  | M   | operator CLI          | `net aggregator spawn / ls / scale` — ✅ `ls` live, `spawn`/`scale` parse-only pending daemon, `cb74cc14`                |
 | AL-7  | L   | dead-code warning     | `DispatchCtx.reservation_fold` field wired but unread — ✅ `cc4aac82`                  |
-| AL-8  | L   | summary rendering     | Reservation summarizer's `Reserved { ... }` Debug bucket name is verbose              |
+| AL-8  | L   | summary rendering     | Reservation summarizer's `Reserved { ... }` Debug bucket — ✅ fixed-label match arms + tighter test, `4016528a` |
 
 ---
 
@@ -150,12 +150,13 @@ The existing test (`reservation_fold_summarizer_buckets_by_state_label`) papers 
   - `8787b2db` — step 4a: `ReplicaHealth` + `LifecycleGroup::replace`.
   - `40a1b375` — step 4b: `HealthMonitor` auto-respawn driver.
   - `cb74cc14` — step 5: `net aggregator ls / spawn / scale`.
+  - `4016528a` — AL-5 + AL-8 fixes.
+  - `71ccaebf` — step 6: registry holds `LifecycleGroup` directly + `register_with_monitor`.
 
-## Remaining gaps
+## Remaining gap
 
-The architecture decisions are resolved; what's left is integration work:
+All eight original items (AL-1..AL-8) are resolved in the substrate. The only outstanding work is the **daemon process** for live `spawn` / `scale`:
 
-- **AL-5** still open — `on_stop` timeout can drop mid-publish. Bounded fix: split the publish loop so the shutdown check fires between summaries within a batch, not just between ticks.
-- **AL-6 daemon process** — `spawn` and `scale` are parse-only until an aggregator-daemon binary + registry-RPC surface lands. The substrate primitives (`AggregatorRegistry`, `LifecycleGroup::spawn_with_placement`, `HealthMonitor`) are all in place.
-- **AL-8** still open — reservation summarizer bucket-name cardinality. Pure summarizer concern, no substrate dependency.
-- **Registry ↔ HealthMonitor integration** — `AggregatorRegistry` stores `LifecycleHandle`s separately, not as `LifecycleGroup`s. Auto-respawn for registry-managed groups needs a small registry refactor (hold `LifecycleGroup<AggregatorDaemon>` directly). Noted in `monitor.rs` module doc.
+- `net aggregator spawn` and `net aggregator scale` parse + validate args today, then error with a "needs daemon process" message. The substrate primitives (`AggregatorRegistry`, `LifecycleGroup::spawn_with_placement`, `HealthMonitor`, `register_with_monitor`) are all in place — what remains is an `aggregator-daemon` binary that boots a `MeshNode`, installs the registry, and exposes a registry-RPC surface the CLI can call into.
+
+That binary is its own slice; the deferred-items review intentionally stops at substrate readiness.
