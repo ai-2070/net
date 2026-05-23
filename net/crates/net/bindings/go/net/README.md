@@ -18,6 +18,8 @@ Reference-implementation Go wrapper over the C ABI exported by the `net` crate's
 
 The wrapper covers the operator-facing surface that landed alongside the Phase I Go binding work (RedEX + replication, Tasks / Memories adapters, NetDB, MeshDB query layer, MeshOS daemon SDK, Deck, capability / placement schema, mesh nRPC, resilience helpers). The exact symbol set is defined by the Cargo features the underlying cdylib was built with.
 
+The Phase 6c capability-aggregation surface (`Fold::aggregate` / `Fold::capacity_ranking`) lives only in the in-repo Go module at [`/go/capability_aggregation.go`](../../../../../go/capability_aggregation.go). The receiver-method shape there (`(*MeshNode).CapabilityAggregate`) requires a `MeshNode` type the schema-template package here doesn't define, so vendors who need aggregation copy from `/go/` directly. The C ABI it speaks to (`net_capability_aggregate` / `net_capability_capacity_ranking`) is exported by `bindings/go/compute-ffi`.
+
 ## Cargo features
 
 The five feature flags that gate the storage / query / OS surfaces in `libnet`. A cdylib built without a feature silently omits its `extern "C"` entry points — the Go wrapper's corresponding methods then fail at runtime with the linker's missing-symbol error (or, for `dlopen`-based loaders, with a clean error from the FFI shim).
