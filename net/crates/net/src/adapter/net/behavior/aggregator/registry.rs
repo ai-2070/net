@@ -266,7 +266,7 @@ impl AggregatorRegistry {
         // not the `Option`-wrapped version. Wrap the access
         // layer so the monitor's locks see whatever the entry
         // currently holds.
-        let monitor = Arc::new(HealthMonitor::spawn_with_option(
+        let monitor = Arc::new(HealthMonitor::spawn(
             group_arc.clone(),
             factory,
             monitor_interval,

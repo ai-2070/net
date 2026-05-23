@@ -78,16 +78,6 @@ pub struct HealthMonitor<L: LifecycleDaemon> {
     _marker: std::marker::PhantomData<L>,
 }
 
-/// Internal: the monitor accepts either a plain
-/// `Arc<AsyncMutex<LifecycleGroup<L>>>` (callers that own the
-/// group exclusively) or an Option-wrapped variant (registry
-/// path where unregister `take`s the group out). The variants
-/// share the `run_poll_pass` body.
-enum MonitorGroupRef<L: LifecycleDaemon> {
-    Plain(Arc<AsyncMutex<LifecycleGroup<L>>>),
-    Optional(Arc<AsyncMutex<Option<LifecycleGroup<L>>>>),
-}
-
 /// One health-poll + respawn pass against a live group.
 /// Returns true when at least one replacement was attempted
 /// (currently used only for tracing — the return is consumed
@@ -123,70 +113,18 @@ where
 }
 
 impl<L: LifecycleDaemon> HealthMonitor<L> {
-    /// Spawn a background task that polls `group.health()` every
-    /// `interval` and calls `group.replace(index, factory(index))`
-    /// for each replica reporting unhealthy. The factory is
-    /// invoked with the failing replica's index so it can build
-    /// an identical replacement (same config + deterministic
-    /// identity via `LifecycleGroup::replica_keypair`).
+    /// Spawn a background task that polls `group.health()`
+    /// every `interval` and calls
+    /// `group.replace(index, factory(index))` for each replica
+    /// reporting unhealthy.
     ///
-    /// Convenience wrapper around [`Self::spawn_with_option`]
-    /// for callers that don't need the `take`-on-unregister
-    /// pattern (e.g. tests that own their group directly).
+    /// The group is an `Arc<AsyncMutex<Option<LifecycleGroup<L>>>>`
+    /// so the registry's `unregister` path can `take` the group
+    /// out without disturbing the monitor — the monitor's poll
+    /// becomes a no-op once the `Option` is `None`. Pure-RAII
+    /// callers wrap their group with `Some(...)` at construction.
     pub fn spawn<F>(
-        group: Arc<AsyncMutex<LifecycleGroup<L>>>,
-        factory: F,
-        interval: Duration,
-    ) -> Self
-    where
-        F: FnMut(u8) -> Arc<L> + Send + 'static,
-    {
-        // Wrap the non-option group in an Option-wrapped mutex
-        // by transferring the LifecycleGroup. We can't move out
-        // of the existing Arc<AsyncMutex<LifecycleGroup>>, so
-        // the easiest path is: produce a separate
-        // Arc<AsyncMutex<Option<...>>> that the monitor sees,
-        // and arrange for the original arc to share the same
-        // underlying group via a relay future. The simpler
-        // alternative: just spawn directly against an
-        // owned-by-the-monitor mutex by cloning at the API
-        // boundary. Tests that hold the original `group`
-        // continue to work because they also `lock().await`
-        // against the same `Arc<AsyncMutex<LifecycleGroup>>`.
-        //
-        // Concretely: spawn returns a monitor whose internal
-        // task uses the **same** mutex. We can't change the
-        // inner type without taking ownership of the group.
-        // So `spawn` keeps its original behavior — operates
-        // directly against `Arc<AsyncMutex<LifecycleGroup<L>>>`.
-        Self::spawn_inner_loop(MonitorGroupRef::Plain(group), factory, interval)
-    }
-
-    /// Spawn a monitor against an `Option`-wrapped group. When
-    /// the option is `None` (e.g. after a registry
-    /// `unregister` consumed the group), the monitor's poll
-    /// pass becomes a no-op — the loop continues ticking but
-    /// performs no health checks or replacements until the
-    /// option is repopulated (which the current registry
-    /// doesn't do) or `stop()` is called.
-    ///
-    /// This is the variant `AggregatorRegistry::register_with_monitor`
-    /// uses so unregister can take the group out without
-    /// disturbing the monitor's existence; the monitor's
-    /// `stop()` is awaited as part of unregister.
-    pub fn spawn_with_option<F>(
         group: Arc<AsyncMutex<Option<LifecycleGroup<L>>>>,
-        factory: F,
-        interval: Duration,
-    ) -> Self
-    where
-        F: FnMut(u8) -> Arc<L> + Send + 'static,
-    {
-        Self::spawn_inner_loop(MonitorGroupRef::Optional(group), factory, interval)
-    }
-
-    fn spawn_inner_loop<F>(
-        group_ref: MonitorGroupRef<L>,
         mut factory: F,
         interval: Duration,
     ) -> Self
@@ -212,26 +150,15 @@ impl<L: LifecycleDaemon> HealthMonitor<L> {
                 if shutdown_for_task.load(Ordering::Acquire) {
                     return;
                 }
-
                 // Hold the lock for the entire health-poll +
-                // respawn pass. Snapshot health first, then
-                // replace any unhealthy slots. The `Option`
-                // variant short-circuits if the group's been
-                // taken (registry unregister path).
-                let did_work = match &group_ref {
-                    MonitorGroupRef::Plain(g) => {
-                        let mut guard = g.lock().await;
-                        run_poll_pass(&mut *guard, &mut factory, &stats_for_task).await
+                // respawn pass. The `Option` short-circuits if
+                // the group's been taken via unregister.
+                {
+                    let mut guard = group.lock().await;
+                    if let Some(lg) = guard.as_mut() {
+                        let _ = run_poll_pass(lg, &mut factory, &stats_for_task).await;
                     }
-                    MonitorGroupRef::Optional(g) => {
-                        let mut guard = g.lock().await;
-                        match guard.as_mut() {
-                            Some(lg) => run_poll_pass(lg, &mut factory, &stats_for_task).await,
-                            None => false,
-                        }
-                    }
-                };
-                let _ = did_work;
+                }
                 stats_for_task.ticks.fetch_add(1, Ordering::AcqRel);
                 *stats_for_task.last_tick_at.lock() = Some(std::time::Instant::now());
             }
@@ -324,7 +251,7 @@ mod tests {
         .expect("spawn group");
         let original_at_1 = original_replicas.lock()[1].clone();
 
-        let group = Arc::new(AsyncMutex::new(group));
+        let group = Arc::new(AsyncMutex::new(Some(group)));
         let factory_calls: Arc<parking_lot::Mutex<Vec<u8>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
         let factory_calls_clone = factory_calls.clone();
@@ -363,7 +290,8 @@ mod tests {
         // different Arc than the original.
         {
             let g = group.lock().await;
-            let now_at_1 = g.replica(1).expect("replica 1");
+            let lg = g.as_ref().expect("group not taken");
+            let now_at_1 = lg.replica(1).expect("replica 1");
             assert!(
                 !Arc::ptr_eq(&now_at_1, &original_at_1),
                 "replica 1 should be the replacement, not the original"
@@ -386,7 +314,9 @@ mod tests {
             .map_err(|_| "still referenced")
             .expect("only ref")
             .into_inner();
-        g.stop().await;
+        if let Some(lg) = g {
+            lg.stop().await;
+        }
     }
 
     #[tokio::test]
@@ -398,7 +328,7 @@ mod tests {
         })
         .await
         .expect("spawn");
-        let group = Arc::new(AsyncMutex::new(group));
+        let group = Arc::new(AsyncMutex::new(Some(group)));
         let factory_calls: Arc<parking_lot::Mutex<u32>> = Arc::new(parking_lot::Mutex::new(0));
         let factory_calls_clone = factory_calls.clone();
         let monitor = HealthMonitor::spawn(
@@ -427,6 +357,8 @@ mod tests {
             .map_err(|_| "still referenced")
             .expect("only ref")
             .into_inner();
-        g.stop().await;
+        if let Some(lg) = g {
+            lg.stop().await;
+        }
     }
 }
