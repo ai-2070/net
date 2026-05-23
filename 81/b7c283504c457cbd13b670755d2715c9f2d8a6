@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/behavior/aggregator/query_service.rs
+  s_099fa7d871e34d::t_b672ca93e05110 204-220
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "81b7c283504c457cbd13b670755d2715c9f2d8a6",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
