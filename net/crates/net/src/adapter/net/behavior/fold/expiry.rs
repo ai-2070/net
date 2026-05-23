@@ -78,7 +78,8 @@ pub(super) fn sweep_expired<K: FoldKind>(
             state
                 .entries
                 .iter()
-                .filter_map(|(k, e)| (e.expires_at <= now).then(|| k.clone()))
+                .filter(|(_, e)| e.expires_at <= now)
+                .map(|(k, _)| k.clone())
                 .take(SWEEP_CHUNK_SIZE)
                 .collect()
         };

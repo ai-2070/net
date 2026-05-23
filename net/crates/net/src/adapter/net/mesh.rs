@@ -7687,12 +7687,7 @@ impl MeshNode {
         if !body.starts_with(hex) {
             return false;
         }
-        match body.as_bytes().get(hex.len()) {
-            None => true,
-            Some(b':') => true,
-            Some(b'[') => true,
-            _ => false,
-        }
+        matches!(body.as_bytes().get(hex.len()), None | Some(b':') | Some(b'['))
     }
 
     /// Strip every `causal:<hex>*` tag for `origin_hash` from

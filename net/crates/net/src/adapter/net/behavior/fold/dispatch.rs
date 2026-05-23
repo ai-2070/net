@@ -6,9 +6,9 @@
 //! [`Fold<K>`] is wrapped in a [`FoldDispatchAdapter<K>`] that
 //! implements the non-generic [`FoldDispatch`] trait by decoding
 //! + verifying the envelope, cross-checking the decoded `kind`
-//! against the adapter's [`FoldKind::KIND_ID`] (catches
-//! misregistered folds and crossed-channel publishes), and
-//! calling [`Fold::apply`] on the verified envelope.
+//!   against the adapter's [`FoldKind::KIND_ID`] (catches
+//!   misregistered folds and crossed-channel publishes), and
+//!   calling [`Fold::apply`] on the verified envelope.
 //!
 //! The registry holds an `Arc<dyn FoldDispatch>` per registered
 //! `kind`. The dispatch hot path takes one `RwLock<HashMap>` read
