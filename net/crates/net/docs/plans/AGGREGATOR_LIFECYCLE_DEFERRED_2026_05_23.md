@@ -153,11 +153,10 @@ The existing test (`reservation_fold_summarizer_buckets_by_state_label`) papers 
   - `4016528a` — AL-5 + AL-8 fixes.
   - `71ccaebf` — step 6: registry holds `LifecycleGroup` directly + `register_with_monitor`.
   - `1bc409fd` — slice 7: `aggregator.registry` RPC service + `RegistryClient` (List op).
+  - `a4024e37` — slice 8: `net-aggregator-daemon` binary + library.
 
-## Remaining gaps
+## Remaining gap
 
-All eight original items (AL-1..AL-8) are resolved. Two follow-up surfaces remain — both at higher tiers than substrate-readiness:
+All eight original items (AL-1..AL-8) are resolved and a turnkey daemon binary is shipped. One follow-up surface remains:
 
-1. **`aggregator-daemon` binary** — boots a `MeshNode`, installs `AggregatorRegistry`, runs `install_registry_service`, hosts one or more groups from a config file. Today operators wire all of this manually in their own host binary; a turnkey daemon binary would close the loop for `net aggregator ls --node=X` against deployed meshes.
-
-2. **CLI remote-attach + Spawn/Scale RPCs** — `net aggregator ls / query` against `--node=X` is gated on `CliContext` having a `MeshNode` it can RPC through (pre-existing substrate gap, NET_CLI_PLAN.md Phase 5). Spawn / Scale RPC ops also need a wire shape for the daemon factory + config (template-by-name vs full marshalling). Both extend the substrate primitives already in place.
+- **CLI remote-attach + Spawn/Scale RPCs** — `net aggregator ls / query` against `--node=X` is gated on `CliContext` having a `MeshNode` it can RPC through (pre-existing substrate gap, NET_CLI_PLAN.md Phase 5). Once that lands, the existing `RegistryClient` plugs in. Spawn / Scale RPC ops additionally need a wire shape for the daemon factory + config (template-by-name vs full marshalling). Both extend the substrate primitives already in place; neither blocks the substrate from being operationally usable today via the `aggregator-daemon` binary + direct `RegistryClient` from any `MeshNode`-bearing process.
