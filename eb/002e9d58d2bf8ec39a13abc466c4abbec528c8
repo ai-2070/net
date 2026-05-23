@@ -1,0 +1,33 @@
+net/crates/net/bindings/python/Cargo.toml
+  s_099fa7d871e34d::t_756899910180fb 109
+net/crates/net/sdk/src/lib.rs
+  s_099fa7d871e34d::t_2d4cecaa99a024 89-94
+net/crates/net/sdk/tests/aggregator_registry_client_round_trip.rs
+  s_099fa7d871e34d::t_749fed9552f0df 10
+.github/workflows/ci.yml
+  s_099fa7d871e34d::t_b3f53ce6797e79 355
+net/crates/net/sdk/Cargo.toml
+  s_099fa7d871e34d::t_fd1ab691acdba0 144-152
+  s_099fa7d871e34d::t_fd0ade3dbc584b 183
+  s_099fa7d871e34d::t_18606fa41e7199 168
+  s_099fa7d871e34d::t_d23dc4670493c3 70
+net/crates/net/bindings/node/Cargo.toml
+  s_099fa7d871e34d::t_7b1f40b8361a59 43
+  s_099fa7d871e34d::t_c41faa3f12aeb9 122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "eb002e9d58d2bf8ec39a13abc466c4abbec528c8",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
