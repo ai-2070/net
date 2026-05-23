@@ -1,6 +1,6 @@
 //! `net aggregator (inspect|query|ls|spawn|scale)` — operator
 //! surface for the substrate's `AggregatorDaemon` state and the
-//! [`AggregatorRegistry`] that holds live groups.
+//! `AggregatorRegistry` that holds live groups.
 //!
 //! `inspect` reads the **local** aggregator's state via the
 //! `DeckClient::aggregator_*` accessors (populated when an
@@ -16,7 +16,7 @@
 //! summarize-now vs. latest, JSON output).
 //!
 //! `ls` enumerates every group registered on the local node's
-//! [`AggregatorRegistry`] with per-replica health + generation.
+//! `AggregatorRegistry` with per-replica health + generation.
 //! Reads through `DeckClient::aggregator_registry_snapshot` —
 //! when the CLI runs against a process that doesn't host a
 //! registry, output is empty (same convention as `inspect`).
@@ -272,8 +272,9 @@ async fn run_spawn(
     if args.replica_count == 0 {
         return Err(invalid_args("replica_count must be > 0"));
     }
-    // SubnetId parse — accept dotted (3.7) or decimal.
-    let _ = parse_subnet(&args.source_subnet)
+    // SubnetId parse — accepts "global" or dotted u8 levels.
+    use std::str::FromStr;
+    net_sdk::subnets::SubnetId::from_str(&args.source_subnet)
         .map_err(|e| invalid_args(format!("source_subnet `{}`: {e}", args.source_subnet)))?;
     // group_seed parse if provided.
     if let Some(ref seed) = args.group_seed {
@@ -308,19 +309,6 @@ async fn run_scale(
          AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md.",
         args.name, args.replica_count,
     )))
-}
-
-/// Parse a subnet identifier from either dotted notation (e.g.
-/// `3.7`, `1.2.3.4`) or decimal. Accepts the full 4-level
-/// `SubnetId` shape supported by the substrate.
-fn parse_subnet(raw: &str) -> Result<(), String> {
-    // Accept anything non-empty; full SubnetId parse lives in
-    // net_sdk and the CLI doesn't expose it yet. When the
-    // spawn path goes live, swap this for the real call.
-    if raw.trim().is_empty() {
-        return Err("subnet identifier must be non-empty".into());
-    }
-    Ok(())
 }
 
 /// Hex-decode 32 bytes from a 64-char string. Used by
