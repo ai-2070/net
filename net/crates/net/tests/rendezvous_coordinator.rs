@@ -302,17 +302,7 @@ async fn request_punch_unknown_relay_fails_fast() {
 /// eviction (this test), not a torn dispatch state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_punch_times_out_when_targets_reflex_was_evicted_by_ttl_gc() {
-    // Build R with a short GC interval so it sweeps frequently.
-    // Default 60 s would keep B's entry indexed past any
-    // practical test deadline.
-    let r = {
-        let cfg = test_config().with_capability_gc_interval(Duration::from_millis(100));
-        Arc::new(
-            MeshNode::new(EntityKeypair::generate(), cfg)
-                .await
-                .expect("R build"),
-        )
-    };
+    let r = build_node().await;
     let a = build_node().await;
     let b = build_node().await;
     let x = build_node().await;
@@ -333,7 +323,8 @@ async fn request_punch_times_out_when_targets_reflex_was_evicted_by_ttl_gc() {
         .expect("A announce");
 
     // B classifies + announces with a TINY TTL (1 second). After
-    // R indexes, its GC will evict within the sweep cadence.
+    // R indexes, the capability fold's background sweeper evicts
+    // B's entry once its `expires_at` lapses.
     b.reclassify_nat().await;
     b.announce_capabilities_with(CapabilitySet::new(), Duration::from_secs(1), true)
         .await
@@ -353,12 +344,19 @@ async fn request_punch_times_out_when_targets_reflex_was_evicted_by_ttl_gc() {
         "R must index B's announcement before its TTL expires"
     );
 
-    // Now wait for the TTL (1 s) + a GC cycle (100 ms) + margin
-    // so R has definitely evicted B.
-    tokio::time::sleep(Duration::from_millis(1_400)).await;
+    // Wait for the fold sweep to evict B's entry. TTL is 1 s; the
+    // fold's background sweeper runs every 500 ms, so the eviction
+    // lands somewhere in `[ttl, ttl + sweep_interval)`. Poll with
+    // a generous ceiling so a slow CI runner doesn't flake on the
+    // upper end.
+    let r_for_evict = r.clone();
+    let evicted = wait_for(Duration::from_secs(3), || {
+        r_for_evict.peer_reflex_addr(b_id).is_none()
+    })
+    .await;
     assert!(
-        r.peer_reflex_addr(b_id).is_none(),
-        "R's capability-GC should have evicted B by now; got {:?}",
+        evicted,
+        "R's capability fold should have evicted B by now; got {:?}",
         r.peer_reflex_addr(b_id),
     );
 
