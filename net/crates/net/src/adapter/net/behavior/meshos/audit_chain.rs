@@ -68,17 +68,14 @@ impl AdminAuditChainAppender for NoOpAdminAuditChainAppender {
 /// Past the cap, oldest records drop FIFO.
 pub const DEFAULT_AUDIT_BUFFERING_APPENDER_CAPACITY: usize = 4096;
 
-/// Buffering appender — collects records in an internal
-/// `VecDeque` so tests can `assert_eq!` against the captured
-/// stream. Bounded by [`Self::with_capacity`] (default
-/// [`DEFAULT_AUDIT_BUFFERING_APPENDER_CAPACITY`]); past the
-/// cap oldest records drop FIFO and `dropped_count`
+/// Buffering appender — collects records in an internal bounded
+/// ring so tests can `assert_eq!` against the captured stream.
+/// Default capacity is [`DEFAULT_AUDIT_BUFFERING_APPENDER_CAPACITY`];
+/// past the cap, oldest records drop FIFO and `dropped_count`
 /// increments.
 #[derive(Debug)]
 pub struct BufferingAdminAuditChainAppender {
-    records: parking_lot::Mutex<std::collections::VecDeque<AdminAuditRecord>>,
-    capacity: usize,
-    dropped: std::sync::atomic::AtomicU64,
+    records: super::super::bounded_ring::BoundedRing<AdminAuditRecord>,
 }
 
 impl Default for BufferingAdminAuditChainAppender {
@@ -88,39 +85,30 @@ impl Default for BufferingAdminAuditChainAppender {
 }
 
 impl BufferingAdminAuditChainAppender {
-    /// Build with the given capacity. `capacity = 0` is
-    /// clamped to `1` — a zero-cap buffer can't hold the
-    /// record currently being appended.
+    /// Build with the given capacity. `capacity = 0` is clamped
+    /// to `1` — a zero-cap buffer can't hold the record
+    /// currently being appended.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            records: parking_lot::Mutex::new(std::collections::VecDeque::new()),
-            capacity: capacity.max(1),
-            dropped: std::sync::atomic::AtomicU64::new(0),
+            records: super::super::bounded_ring::BoundedRing::new(capacity.max(1)),
         }
     }
 
-    /// Snapshot the captured records. Cheap — one mutex lock
-    /// + a vec clone.
+    /// Snapshot the captured records (oldest → newest).
     pub fn captured(&self) -> Vec<AdminAuditRecord> {
-        self.records.lock().iter().cloned().collect()
+        self.records.snapshot()
     }
 
     /// Number of records dropped because the buffer was at
-    /// capacity. Strictly increasing.
+    /// capacity. Strictly non-decreasing.
     pub fn dropped_count(&self) -> u64 {
-        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+        self.records.dropped()
     }
 }
 
 impl AdminAuditChainAppender for BufferingAdminAuditChainAppender {
     fn append(&self, record: &AdminAuditRecord) -> Result<(), AdminAuditAppendError> {
-        let mut buf = self.records.lock();
-        if buf.len() >= self.capacity {
-            buf.pop_front();
-            self.dropped
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        buf.push_back(record.clone());
+        self.records.push(record.clone());
         Ok(())
     }
 }

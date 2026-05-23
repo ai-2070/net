@@ -1514,6 +1514,61 @@ int net_mesh_blob_adapter_set_overflow_enabled(
 int net_mesh_blob_adapter_set_overflow_config(
     const net_mesh_blob_adapter_t* handle, const char* config_json);
 
+/* ============================================================
+ * Capability aggregation — Phase 6c of
+ * `MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`.
+ *
+ * Two operations against the local `CapabilityFold`:
+ *   - `net_capability_aggregate` — bucket-and-count primitive.
+ *   - `net_capability_capacity_ranking` — state-broken-down
+ *     materialized view with latency gate, optional summed
+ *     capacity, sort, truncate.
+ *
+ * Wire shape: every aggregation type (TagMatcher / GroupBy /
+ * Aggregation / CapacityQuery / row outputs) crosses the C ABI
+ * as serde-JSON-encoded UTF-8 strings. The Rust core derives
+ * Serialize/Deserialize with the cross-binding-pinned wire
+ * format (`serde_shapes_match_cross_binding_wire_format` test
+ * in `capability_aggregation.rs`); each binding emits the same
+ * JSON shape so they all interoperate against this single ABI.
+ *
+ * Memory: returned `char*` strings are heap-allocated by Rust;
+ * caller frees with `net_compute_free_cstring`. Returning NULL
+ * indicates fail-closed: any input JSON parse error or NULL
+ * mesh_arc surfaces as NULL.
+ * ============================================================ */
+
+/* Returns a JSON `[{"bucket": <str>, "value": <u64>}, ...]`
+ * sorted lex by bucket. `matcher_json` may be NULL (walks every
+ * entry). Caller frees the returned string with
+ * `net_compute_free_cstring`. */
+char* net_capability_aggregate(
+    const net_compute_mesh_arc_t* mesh_arc,
+    const char* matcher_json,
+    const char* group_by_json,
+    const char* aggregation_json);
+
+/* Returns a JSON list of capacity rows sorted by `available`
+ * descending (ties broken on bucket ascending), truncated to
+ * `query.limit`. Each row carries
+ * `{"bucket": <str>, "idle": <u64>, "busy": <u64>,
+ *   "reserved": <u64>, "available": <u64>,
+ *   "summed_capacity": <u64?> }`.
+ *
+ * `rtt_map_json` is the materialized RTT map, encoded as a JSON
+ * `[{"node_id": <u64>, "rtt_ms": <u32>}, ...]` array. May be
+ * NULL or `"[]"`; either disables the RTT filter regardless of
+ * `query.max_rtt_ms`. The plan-noted callback variant for
+ * pure-Rust / TS / Python is intentionally not exposed at this
+ * C boundary — every C-ABI consumer materializes the map.
+ *
+ * Caller frees the returned string with
+ * `net_compute_free_cstring`. */
+char* net_capability_capacity_ranking(
+    const net_compute_mesh_arc_t* mesh_arc,
+    const char* query_json,
+    const char* rtt_map_json);
+
 #ifdef __cplusplus
 }
 #endif

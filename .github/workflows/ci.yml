@@ -654,6 +654,20 @@ jobs:
           RUN_INTEGRATION_TESTS: "1"
         run: go test -v ./...
 
+      # Run again with `-tags test_helpers` so the test-only files
+      # (`groups_testhelpers.go`, `groups_test.go`,
+      # `capability_aggregation_e2e_test.go`) compile and execute.
+      # These reference FFI symbols gated behind the `test-helpers`
+      # cargo feature on `net-compute-ffi` (already enabled in the
+      # build step above) — without the Go build tag they're
+      # excluded from the package compile and silently skipped.
+      - name: Run Go tests (test_helpers)
+        working-directory: go
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
+          RUN_INTEGRATION_TESTS: "1"
+        run: go test -v -tags test_helpers ./...
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

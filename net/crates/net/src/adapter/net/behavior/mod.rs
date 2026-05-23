@@ -13,6 +13,7 @@
 
 pub mod api;
 pub mod bloom;
+pub mod bounded_ring;
 pub mod broadcast;
 pub mod capability;
 pub mod context;
@@ -20,6 +21,7 @@ pub mod dataforts_capabilities;
 #[cfg(feature = "meshos")]
 pub mod deck;
 pub mod diff;
+pub mod fold;
 pub mod group;
 pub mod loadbalance;
 #[cfg(feature = "meshdb")]
@@ -49,11 +51,10 @@ pub use query::{
 pub use broadcast::SUBPROTOCOL_CAPABILITY_ANN;
 
 pub use capability::{
-    AcceleratorInfo, AcceleratorType, CapabilityAnnouncement, CapabilityFilter, CapabilityIndex,
-    CapabilityIndexStats, CapabilityRequirement, CapabilitySet, CapabilitySetDiff, CapabilityViews,
-    CardinalityCache, CardinalityProvider, GpuInfo, GpuVendor, HardwareCapabilities, IndexedNode,
-    MetadataChange, Modality, ModelCapability, ResourceLimits, Signature64, SoftwareCapabilities,
-    ToolCapability,
+    AcceleratorInfo, AcceleratorType, CapabilityAnnouncement, CapabilityFilter,
+    CapabilityRequirement, CapabilitySet, CapabilitySetDiff, CapabilityViews, CardinalityProvider,
+    GpuInfo, GpuVendor, HardwareCapabilities, MetadataChange, Modality, ModelCapability,
+    ResourceLimits, Signature64, SoftwareCapabilities, ToolCapability,
 };
 
 pub use dataforts_capabilities::{

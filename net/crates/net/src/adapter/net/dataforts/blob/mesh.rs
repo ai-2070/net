@@ -704,7 +704,7 @@ impl MeshBlobAdapter {
         let config = self.overflow_config();
         let controller = super::overflow::BlobOverflowController::new(
             ctx.local_caps,
-            ctx.capability_index,
+            ctx.capability_fold,
             ctx.heat_registry,
             &self.refcount,
             &config,

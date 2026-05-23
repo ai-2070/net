@@ -1959,14 +1959,64 @@ pub extern "C" fn net_compute_test_inject_synthetic_peer(
         return;
     }
     let arc = unsafe { &*mesh_arc };
-    let index = arc.capability_index().clone();
     let eid = EntityId::from_bytes([0u8; 32]);
-    index.index(CapabilityAnnouncement::new(
+    arc.test_inject_capability_announcement(CapabilityAnnouncement::new(
         node_id,
         eid,
         1,
         CapabilitySet::new(),
     ));
+}
+
+/// Test-only — same shape as
+/// [`net_compute_test_inject_synthetic_peer`] but takes a
+/// JSON-encoded `[string, ...]` list of canonical tag strings to
+/// install on the synthetic peer. Used by the Phase 6c
+/// capability-aggregation smoke tests to stage multi-bucket
+/// fixtures without spinning up multiple meshes.
+///
+/// `tags_json` may be NULL — equivalent to an empty list.
+///
+/// # Safety
+///
+/// `mesh_arc` must be a pointer returned by `net_mesh_arc_clone`.
+/// `tags_json`, if non-NULL, must point at a NUL-terminated UTF-8
+/// string valid for the duration of the call.
+#[cfg(feature = "test-helpers")]
+#[no_mangle]
+pub extern "C" fn net_compute_test_inject_synthetic_peer_with_tags(
+    mesh_arc: *mut std::sync::Arc<MeshNode>,
+    node_id: u64,
+    tags_json: *const c_char,
+) {
+    use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
+    use net::adapter::net::behavior::Tag;
+    use net::adapter::net::identity::EntityId;
+    use std::ffi::CStr;
+    if mesh_arc.is_null() {
+        return;
+    }
+    let arc = unsafe { &*mesh_arc };
+    let tags: Vec<String> = if tags_json.is_null() {
+        Vec::new()
+    } else {
+        let s = match unsafe { CStr::from_ptr(tags_json) }.to_str() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        match serde_json::from_str(s) {
+            Ok(v) => v,
+            Err(_) => return,
+        }
+    };
+    let mut caps = CapabilitySet::new();
+    for s in tags {
+        if let Ok(t) = Tag::parse(&s) {
+            caps.tags.insert(t);
+        }
+    }
+    let eid = EntityId::from_bytes([0u8; 32]);
+    arc.test_inject_capability_announcement(CapabilityAnnouncement::new(node_id, eid, 1, caps));
 }
 
 // =========================================================================
@@ -2805,7 +2855,11 @@ pub extern "C" fn net_compute_set_placement_filter_dispatcher(
 /// `global_placement_filter_registry` as `Arc<dyn PlacementFilter>`.
 struct CgoPlacementFilter {
     id: String,
-    capability_index: Arc<::net::adapter::net::behavior::capability::CapabilityIndex>,
+    capability_fold: Arc<
+        ::net::adapter::net::behavior::fold::Fold<
+            ::net::adapter::net::behavior::fold::CapabilityFold,
+        >,
+    >,
 }
 
 impl ::net::adapter::net::behavior::placement::PlacementFilter for CgoPlacementFilter {
@@ -2820,10 +2874,20 @@ impl ::net::adapter::net::behavior::placement::PlacementFilter for CgoPlacementF
         let dispatcher = *PLACEMENT_FILTER_DISPATCHER.get()?;
 
         // Look up candidate caps. Same semantics as Node / Python:
-        // a candidate not in the index is invisible to the Go
+        // a candidate not in the fold is invisible to the Go
         // predicate (which expects tags + metadata); veto rather
         // than feed an empty candidate.
-        let caps = self.capability_index.get(*target)?;
+        if !self
+            .capability_fold
+            .with_state(|state| state.by_node.contains_key(target))
+        {
+            return None;
+        }
+        let caps =
+            ::net::adapter::net::behavior::fold::capability_bridge::synthesize_capability_set(
+                &self.capability_fold,
+                *target,
+            );
 
         // Build the candidate JSON. `Tag::Display` produces the
         // on-wire string form; `metadata` is BTreeMap<String,String>
@@ -2884,7 +2948,7 @@ impl ::net::adapter::net::behavior::placement::PlacementFilter for CgoPlacementF
 /// `Arc<dyn PlacementFilter>`.
 ///
 /// `mesh_arc` is a non-consuming pointer — the registry holds an
-/// `Arc<CapabilityIndex>` clone, not the mesh handle. Caller's
+/// `Arc<Fold<CapabilityFold>>` clone, not the mesh handle. Caller's
 /// existing `_free` for the mesh handle stays correct.
 ///
 /// Returns:
@@ -2932,10 +2996,10 @@ pub extern "C" fn net_compute_register_placement_filter(
     };
 
     let arc = unsafe { &*mesh_arc };
-    let capability_index = arc.capability_index().clone();
+    let capability_fold = arc.capability_fold().clone();
     let wrapper = CgoPlacementFilter {
         id: id.clone(),
-        capability_index,
+        capability_fold,
     };
     let arc_filter: Arc<dyn PlacementFilter> = Arc::new(wrapper);
 
@@ -3007,6 +3071,175 @@ pub extern "C" fn net_compute_has_placement_filter(id_ptr: *const c_char, id_len
         1
     } else {
         0
+    }
+}
+
+// =========================================================================
+// Capability aggregation — Phase 6c
+// (`MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`).
+//
+// JSON-in / JSON-out shape across the C ABI. The Rust core already
+// derives serde Serialize/Deserialize on every aggregation type with
+// the cross-binding-pinned wire format, so the FFI just hands the
+// bytes through. Go callers marshal Go types to JSON, call into
+// Rust, and unmarshal the result.
+// =========================================================================
+
+/// Run `Fold::aggregate` against the publisher's capability fold and
+/// return a JSON-encoded `[{"bucket": <str>, "value": <u64>}, ...]`
+/// list (heap-allocated; caller frees with
+/// [`net_compute_free_cstring`]).
+///
+/// `matcher_json` may be NULL — disables the pre-filter and walks
+/// every entry. `group_by_json` and `aggregation_json` are required.
+/// Returns NULL when `mesh_arc` is NULL or any non-NULL JSON arg
+/// fails to parse.
+///
+/// # Safety
+///
+/// `mesh_arc` must be a pointer returned by `net_mesh_arc_clone`
+/// (it is NOT consumed). JSON pointers, if non-NULL, must point at
+/// NUL-terminated UTF-8 strings valid for the duration of the call.
+#[no_mangle]
+pub extern "C" fn net_capability_aggregate(
+    mesh_arc: *const std::sync::Arc<MeshNode>,
+    matcher_json: *const c_char,
+    group_by_json: *const c_char,
+    aggregation_json: *const c_char,
+) -> *mut c_char {
+    use net::adapter::net::behavior::fold::{Aggregation, GroupBy, TagMatcher};
+    use std::ffi::CStr;
+
+    if mesh_arc.is_null() || group_by_json.is_null() || aggregation_json.is_null() {
+        return std::ptr::null_mut();
+    }
+    let arc = unsafe { &*mesh_arc };
+
+    let matcher: Option<TagMatcher> = if matcher_json.is_null() {
+        None
+    } else {
+        let s = match unsafe { CStr::from_ptr(matcher_json) }.to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        match serde_json::from_str(s) {
+            Ok(m) => Some(m),
+            Err(_) => return std::ptr::null_mut(),
+        }
+    };
+    let group_by_str = match unsafe { CStr::from_ptr(group_by_json) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let group_by: GroupBy = match serde_json::from_str(group_by_str) {
+        Ok(g) => g,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let agg_str = match unsafe { CStr::from_ptr(aggregation_json) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let agg: Aggregation = match serde_json::from_str(agg_str) {
+        Ok(a) => a,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let rows = arc.capability_fold().aggregate(matcher, group_by, agg);
+    // Project to the row shape Go expects.
+    let rows_out: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(bucket, value)| serde_json::json!({"bucket": bucket, "value": value}))
+        .collect();
+    let s = match serde_json::to_string(&rows_out) {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match CString::new(s) {
+        Ok(c) => c.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Run `Fold::capacity_ranking` against the publisher's capability
+/// fold and return a JSON-encoded list of capacity rows. Free with
+/// [`net_compute_free_cstring`].
+///
+/// `query_json` is a JSON-encoded `CapacityQuery`. `rtt_map_json`
+/// is the materialized RTT map, JSON-encoded as
+/// `[{"node_id": <u64>, "rtt_ms": <u32>}, ...]`. `rtt_map_json` may
+/// be NULL or `"[]"`; either disables the RTT filter regardless of
+/// `query.max_rtt_ms`.
+///
+/// # Safety
+///
+/// Same as `net_capability_aggregate`.
+#[no_mangle]
+pub extern "C" fn net_capability_capacity_ranking(
+    mesh_arc: *const std::sync::Arc<MeshNode>,
+    query_json: *const c_char,
+    rtt_map_json: *const c_char,
+) -> *mut c_char {
+    use net::adapter::net::behavior::fold::CapacityQuery;
+    use std::collections::HashMap;
+    use std::ffi::CStr;
+
+    #[derive(serde::Deserialize)]
+    struct RttEntry {
+        node_id: u64,
+        rtt_ms: u32,
+    }
+
+    if mesh_arc.is_null() || query_json.is_null() {
+        return std::ptr::null_mut();
+    }
+    let arc = unsafe { &*mesh_arc };
+
+    let query_str = match unsafe { CStr::from_ptr(query_json) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let query: CapacityQuery = match serde_json::from_str(query_str) {
+        Ok(q) => q,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let rtt_map: HashMap<u64, u32> = if rtt_map_json.is_null() {
+        HashMap::new()
+    } else {
+        let s = match unsafe { CStr::from_ptr(rtt_map_json) }.to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let entries: Vec<RttEntry> = match serde_json::from_str(s) {
+            Ok(v) => v,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        entries.into_iter().map(|e| (e.node_id, e.rtt_ms)).collect()
+    };
+
+    let rows = arc
+        .capability_fold()
+        .capacity_ranking(query, |node_id| rtt_map.get(&node_id).copied());
+    let rows_out: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "bucket": r.bucket,
+                "idle": r.idle,
+                "busy": r.busy,
+                "reserved": r.reserved,
+                "available": r.available,
+                "summed_capacity": r.summed_capacity,
+            })
+        })
+        .collect();
+    let s = match serde_json::to_string(&rows_out) {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match CString::new(s) {
+        Ok(c) => c.into_raw(),
+        Err(_) => std::ptr::null_mut(),
     }
 }
 

@@ -208,7 +208,7 @@ async fn auth_guard_populated_for_token_gated_subscribe() {
         .await
         .expect("B announce");
     assert!(
-        wait_until(|| a.mesh.capability_index().get(b.mesh.node_id()).is_some()).await,
+        wait_until(|| a.mesh.test_capability_fold_has(b.mesh.node_id())).await,
         "A never indexed B's capability announcement",
     );
 
@@ -366,7 +366,7 @@ async fn expired_token_evicts_subscriber_within_one_sweep() {
         .await
         .expect("B announce");
     assert!(
-        wait_until(|| a.mesh.capability_index().get(b.mesh.node_id()).is_some()).await,
+        wait_until(|| a.mesh.test_capability_fold_has(b.mesh.node_id())).await,
         "A never indexed B's caps",
     );
 
@@ -464,7 +464,7 @@ async fn publish_skips_expired_subscriber_when_sweep_is_disabled() {
         .await
         .expect("B announce");
     assert!(
-        wait_until(|| a.mesh.capability_index().get(b.mesh.node_id()).is_some()).await,
+        wait_until(|| a.mesh.test_capability_fold_has(b.mesh.node_id())).await,
         "A never indexed B's caps",
     );
 
@@ -603,7 +603,7 @@ async fn auth_failure_rate_limit_kicks_in() {
         .await
         .expect("B announce");
     assert!(
-        wait_until(|| a.mesh.capability_index().get(b.mesh.node_id()).is_some()).await,
+        wait_until(|| a.mesh.test_capability_fold_has(b.mesh.node_id())).await,
         "A never indexed B's caps",
     );
 

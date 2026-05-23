@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use net::adapter::net::behavior::capability::{
-    CapabilityAnnouncement, CapabilityFilter, CapabilityIndex, CapabilitySet,
+    CapabilityAnnouncement, CapabilityFilter, CapabilitySet,
 };
+use net::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
 use net::adapter::net::behavior::loadbalance::{RequestContext, Strategy};
 use net::adapter::net::compute::migration_target::RestoreContext;
 use net::adapter::net::compute::{
@@ -328,18 +329,18 @@ fn test_start_migration_auto() {
 
     let orch = MigrationOrchestrator::new(reg.clone(), 0x1111);
 
-    // Create an index with a migration-capable target
-    let index = Arc::new(CapabilityIndex::new());
+    // Stage a migration-capable target in the fold.
+    let fold: Arc<Fold<CapabilityFold>> =
+        Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
     let target_caps = CapabilitySet::new().add_tag("subprotocol:0x0500");
-    index.index(CapabilityAnnouncement::new(
-        0x2222,
-        test_entity_id(),
-        1,
-        target_caps,
-    ));
+    capability_bridge::apply_legacy_announcement(
+        &fold,
+        CapabilityAnnouncement::new(0x2222, test_entity_id(), 1, target_caps),
+    )
+    .expect("apply legacy announcement in fixture");
 
     let local_caps = CapabilitySet::new();
-    let scheduler = Scheduler::new(index, 0x1111, local_caps);
+    let scheduler = Scheduler::new(fold, 0x1111, local_caps);
 
     let (target_node, msgs) = orch
         .start_migration_auto(origin, 0x1111, &scheduler, &CapabilityFilter::default())
@@ -363,9 +364,10 @@ fn test_start_migration_auto_no_targets() {
 
     let orch = MigrationOrchestrator::new(reg.clone(), 0x1111);
 
-    // Empty index — no migration-capable nodes
-    let index = Arc::new(CapabilityIndex::new());
-    let scheduler = Scheduler::new(index, 0x1111, CapabilitySet::new());
+    // Empty fold — no migration-capable nodes
+    let fold: Arc<Fold<CapabilityFold>> =
+        Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
+    let scheduler = Scheduler::new(fold, 0x1111, CapabilitySet::new());
 
     let err = orch
         .start_migration_auto(origin, 0x1111, &scheduler, &CapabilityFilter::default())
@@ -983,26 +985,25 @@ fn test_enriched_capabilities_discoverable_by_scheduler() {
     let node_a_caps = subproto_reg.enrich_capabilities(CapabilitySet::new());
     assert!(node_a_caps.has_tag("subprotocol:0x0500"));
 
-    // Index node A's capabilities
-    let index = Arc::new(CapabilityIndex::new());
-    index.index(CapabilityAnnouncement::new(
-        0xAAAA,
-        test_entity_id(),
-        1,
-        node_a_caps,
-    ));
+    // Stage node A's capabilities into the fold.
+    let fold: Arc<Fold<CapabilityFold>> =
+        Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
+    capability_bridge::apply_legacy_announcement(
+        &fold,
+        CapabilityAnnouncement::new(0xAAAA, test_entity_id(), 1, node_a_caps),
+    )
+    .expect("apply legacy announcement in fixture");
 
     // Node B: no migration support
     let node_b_caps = CapabilitySet::new();
-    index.index(CapabilityAnnouncement::new(
-        0xBBBB,
-        test_entity_id(),
-        1,
-        node_b_caps,
-    ));
+    capability_bridge::apply_legacy_announcement(
+        &fold,
+        CapabilityAnnouncement::new(0xBBBB, test_entity_id(), 1, node_b_caps),
+    )
+    .expect("apply legacy announcement in fixture");
 
     // Scheduler on node C should find A but not B
-    let scheduler = Scheduler::new(index, 0xCCCC, CapabilitySet::new());
+    let scheduler = Scheduler::new(fold, 0xCCCC, CapabilitySet::new());
     let targets = scheduler.find_migration_targets(&CapabilityFilter::default(), 0xCCCC);
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0], 0xAAAA);
@@ -1688,26 +1689,16 @@ fn test_regression_chunk_count_boundary() {
 // ── Group integration tests ──────────────────────────────────────────────────
 
 fn make_scheduler_for_groups() -> Scheduler {
-    let index = Arc::new(CapabilityIndex::new());
-    index.index(CapabilityAnnouncement::new(
-        0x1111,
-        test_entity_id(),
-        1,
-        CapabilitySet::new(),
-    ));
-    index.index(CapabilityAnnouncement::new(
-        0x2222,
-        test_entity_id(),
-        1,
-        CapabilitySet::new(),
-    ));
-    index.index(CapabilityAnnouncement::new(
-        0x3333,
-        test_entity_id(),
-        1,
-        CapabilitySet::new(),
-    ));
-    Scheduler::new(index, 0x1111, CapabilitySet::new())
+    let fold: Arc<Fold<CapabilityFold>> =
+        Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
+    for node_id in [0x1111u64, 0x2222, 0x3333] {
+        capability_bridge::apply_legacy_announcement(
+            &fold,
+            CapabilityAnnouncement::new(node_id, test_entity_id(), 1, CapabilitySet::new()),
+        )
+        .expect("apply legacy announcement in fixture");
+    }
+    Scheduler::new(fold, 0x1111, CapabilitySet::new())
 }
 
 /// Integration test 1: ReplicaGroup refactor — route_event returns an

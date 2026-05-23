@@ -311,13 +311,13 @@ impl DaemonRuntime {
             registry.clone(),
             factory_registry.clone(),
         ));
-        // Scheduler shares the mesh's `CapabilityIndex`, so
+        // Scheduler shares the mesh's `CapabilityFold`, so
         // announcements the mesh publishes become visible to
         // placement queries immediately. `CapabilitySet::default()`
         // for `local_caps` is a known gap — see the `scheduler`
         // field's docstring on [`Inner`].
         let scheduler = Arc::new(Scheduler::new(
-            mesh.inner().capability_index().clone(),
+            mesh.inner().capability_fold().clone(),
             local_node_id,
             CapabilitySet::default(),
         ));

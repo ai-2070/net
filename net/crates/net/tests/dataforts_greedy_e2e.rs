@@ -194,12 +194,10 @@ async fn greedy_scope_filter_admits_when_publisher_advertises_matching_scope() {
     // Give B a moment to receive + index the announcement.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
-        if node_b
-            .capability_index()
-            .get(node_a.node_id())
-            .map(|c| c.tags.len())
-            .unwrap_or(0)
-            > 0
+        if !node_b
+            .test_capability_fold_get(node_a.node_id())
+            .tags
+            .is_empty()
         {
             break;
         }
@@ -659,11 +657,7 @@ async fn wait_for_peer_caps(
     deadline: tokio::time::Instant,
 ) {
     while tokio::time::Instant::now() < deadline {
-        let landed = observer
-            .capability_index()
-            .get(peer)
-            .map(|c| c.tags.len())
-            .unwrap_or(0);
+        let landed = observer.test_capability_fold_get(peer).tags.len();
         if landed >= min_tags {
             return;
         }

@@ -10,6 +10,7 @@
 mod blob;
 #[cfg(feature = "net")]
 mod capabilities;
+mod capability_aggregation;
 #[cfg(any(
     feature = "meshdb",
     feature = "cortex",
@@ -1887,6 +1888,58 @@ mod mesh_bindings {
             Ok(ids.into_iter().map(BigInt::from).collect())
         }
 
+        /// Bucketed aggregation over the local capability fold —
+        /// `Fold::aggregate(matcher, groupBy, agg)`. Arguments are
+        /// JSON-encoded tagged unions; the TS SDK ships ergonomic
+        /// constructors. Returns
+        /// `[{ bucket: string, value: bigint }]` sorted lex by bucket.
+        ///
+        /// `matcherJson = null` walks every entry. Phase 6c-A of
+        /// `MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`.
+        #[napi]
+        pub fn capability_aggregate(
+            &self,
+            matcher_json: Option<String>,
+            group_by_json: String,
+            aggregation_json: String,
+        ) -> Result<Vec<crate::capability_aggregation::AggregateRowJs>> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            crate::capability_aggregation::aggregate(
+                node.capability_fold(),
+                matcher_json,
+                group_by_json,
+                aggregation_json,
+            )
+        }
+
+        /// Capacity-ranked materialized view over the local
+        /// capability fold — `Fold::capacity_ranking(query,
+        /// rttLookup)`. `queryJson` is a JSON-encoded
+        /// `CapacityQuery`; `rttEntries` is the materialized RTT map
+        /// (`null`/empty disables the RTT filter regardless of
+        /// `query.maxRttMs`). Faulty entries are always excluded;
+        /// rows return sorted by `available` desc, ties broken by
+        /// bucket asc, truncated to `query.limit`.
+        ///
+        /// Phase 6c-B of `MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`.
+        /// The plan flags a `ThreadsafeFunction` closure variant as
+        /// the natural shape for TS; that ships as a follow-up.
+        #[napi]
+        pub fn capability_capacity_ranking(
+            &self,
+            query_json: String,
+            rtt_entries: Option<Vec<crate::capability_aggregation::RttEntryJs>>,
+        ) -> Result<Vec<crate::capability_aggregation::CapacityRowJs>> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            crate::capability_aggregation::capacity_ranking(
+                node.capability_fold(),
+                query_json,
+                rtt_entries,
+            )
+        }
+
         /// Shutdown the mesh node.
         #[napi]
         pub async fn shutdown(&self) -> Result<()> {
@@ -2002,7 +2055,7 @@ mod mesh_bindings {
             let node = guard
                 .as_ref()
                 .ok_or_else(|| Error::from_reason("MeshNode has been shut down"))?;
-            let capability_index = node.capability_index().clone();
+            let capability_fold = node.capability_fold().clone();
 
             // Build the TSFN inside the Node main thread; the
             // resulting handle is `Send + Sync + Clone` and can
@@ -2010,7 +2063,7 @@ mod mesh_bindings {
             let tsfn: crate::placement::PlacementFilterTsfn =
                 predicate.build_threadsafe_function().build()?;
             let wrapper =
-                crate::placement::TsfnPlacementFilter::new(id.clone(), tsfn, capability_index);
+                crate::placement::TsfnPlacementFilter::new(id.clone(), tsfn, capability_fold);
             let arc: std::sync::Arc<dyn PlacementFilter> = std::sync::Arc::new(wrapper);
 
             // SDK Phase 7 polish: `"node"` binding label drives the
@@ -2273,13 +2326,52 @@ mod mesh_bindings {
             })?;
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let index = node.capability_index().clone();
             let eid = EntityId::from_bytes([0u8; 32]);
-            index.index(CapabilityAnnouncement::new(
+            node.test_inject_capability_announcement(CapabilityAnnouncement::new(
                 nid,
                 eid,
                 1,
                 CapabilitySet::new(),
+            ));
+            Ok(())
+        }
+
+        /// Test-only — same shape as
+        /// [`Self::test_inject_synthetic_peer`] but takes an array of
+        /// canonical tag strings to install on the synthetic peer.
+        /// Used by the Phase 6c capability-aggregation smoke tests
+        /// to stage multi-bucket fixtures without spinning up
+        /// multiple meshes.
+        #[napi]
+        pub fn test_inject_synthetic_peer_with_tags(
+            &self,
+            node_id: BigInt,
+            tags: Vec<String>,
+        ) -> Result<()> {
+            use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
+            use net::adapter::net::behavior::Tag;
+            use net::adapter::net::identity::EntityId;
+            let nid = crate::common::bigint_u64(node_id).map_err(|e| {
+                Error::from_reason(format!(
+                    "test_inject_synthetic_peer_with_tags: {}",
+                    e.reason
+                ))
+            })?;
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let mut caps = CapabilitySet::new();
+            // Insert directly via the permissive `Tag::parse` so
+            // reserved-prefix tags (`scope:region:us-east`, etc.)
+            // make it into the synthesized cap set; `add_tag` rejects
+            // reserved prefixes by design.
+            for s in tags {
+                if let Ok(t) = Tag::parse(&s) {
+                    caps.tags.insert(t);
+                }
+            }
+            let eid = EntityId::from_bytes([0u8; 32]);
+            node.test_inject_capability_announcement(CapabilityAnnouncement::new(
+                nid, eid, 1, caps,
             ));
             Ok(())
         }

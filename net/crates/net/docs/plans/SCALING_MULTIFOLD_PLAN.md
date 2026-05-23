@@ -2,7 +2,7 @@
 
 A unified state-aggregation framework over signed announcements. One mechanism, multiple typed instantiations (capability, routing, reservation, plus future folds). Replaces three would-be-separate implementations with one generic runtime and three trait impls.
 
-This plan is scoped to land in the existing Net substrate. It composes with the channel/pub-sub layer, the identity layer, the existing hierarchical subnet system (`subnet::{SubnetId, SubnetGateway, SubnetPolicy}`), and the audit framework that already exist. It does NOT replace the existing `CapabilityIndex` immediately — the migration is staged so both coexist during transition.
+This plan is scoped to land in the existing Net substrate. It composes with the channel/pub-sub layer, the identity layer, the existing hierarchical subnet system (`subnet::{SubnetId, SubnetGateway, SubnetPolicy}`), and the audit framework that already exist. The fold framework replaces the existing `CapabilityIndex` and the pingwave-driven `RoutingTable` outright — no bridges, no dual-source-of-truth, no transition period. Callers cut over in the same PR that adds the new fold; the legacy impls are deleted in that PR too.
 
 ---
 
@@ -22,8 +22,6 @@ This plan is scoped to land in the existing Net substrate. It composes with the 
 5. **Operator surface.** CLI commands and Deck panels for all folds uniformly.
 
 6. **Audit + snapshot integration.** Folds emit audit events; snapshots can serialize fold state for restart.
-
-7. **Migration path.** Existing `CapabilityIndex` continues to work; new code uses the fold framework; cutover when comfortable.
 
 ---
 
@@ -327,7 +325,7 @@ This means **the fold framework gets multi-tier subnet scoping for free**. No ne
 
 ### CapabilityFold
 
-**Purpose:** Each (capability class, node) is one entry. Subscribers learn which nodes are in which classes. Replaces the broadcast model of the existing `CapabilityIndex`.
+**Purpose:** Each (capability class, node) is one entry. Subscribers learn which nodes are in which classes. Replaces `CapabilityIndex` outright — the PR that lands this fold deletes the legacy index and rewires every caller (`MeshNode::capability_index`, `Scheduler::place_*`, `ReplicaGroup` / `ForkGroup` / `StandbyGroup` placement paths, the FFI surface, the Deck capability panel) to `Fold<CapabilityFold>`.
 
 ```rust
 pub struct CapabilityFold;
@@ -387,8 +385,6 @@ pub struct CapabilityIndexInner {
 }
 ```
 
-**Migration from existing `CapabilityIndex`:** existing capability code keeps working. New code uses `Fold<CapabilityFold>`. Both can coexist via a feature-gated bridge during transition. Once new code is validated, old code can be removed.
-
 ### RoutingFold
 
 **Purpose:** Each destination has an entry; multiple announcements per destination from different routers; the merge logic picks the best route by metric.
@@ -440,7 +436,7 @@ pub struct RouteAnnouncement {
 }
 ```
 
-**Bridges with existing `RoutingTable`:** existing pingwave-based routing continues working; `RoutingFold` can ingest the same pingwave data through an adapter that translates pingwave broadcasts into `SignedAnnouncement<RouteAnnouncement>`. Or `RoutingFold` is used directly by new code paths and the old routing table is queried as a fallback.
+The PR landing this fold deletes the legacy pingwave-driven `RoutingTable` and rewires every caller (`Router::lookup`, `MeshNode::dispatch_packet`, the route-staleness sweeper) to `Fold<RoutingFold>`. Pingwave packets are repurposed as `SignedAnnouncement<RouteAnnouncement>` publishes on the `fold:route:` channel — same wire RTT measurement, new envelope.
 
 ### ReservationFold
 
@@ -662,33 +658,34 @@ These are achievable on commodity hardware with the audit's per-call optimizatio
 - `crates/net/src/adapter/net/behavior/fold/dispatch.rs` — registry + dispatch
 - Integration into the existing channel handler
 
-### Phase 3: CapabilityFold (1-2 weeks)
+### Phase 3: CapabilityFold + CapabilityIndex deletion (1-2 weeks)
 
-**Deliverable:** `CapabilityFold` impl. Migration bridge from existing `CapabilityIndex` (announcements published to both during transition).
+**Deliverable:** `CapabilityFold` impl. In the SAME PR: every caller of the legacy `CapabilityIndex` is rewired to `Fold<CapabilityFold>` and the legacy module is deleted. No bridge, no dual-publish, no feature gate.
 
 **Tests:**
-- Existing capability test suite passes against `Fold<CapabilityFold>` (via bridge)
-- New tests: subscription model, class membership, tag-based queries
-- Performance: matches or exceeds existing `CapabilityIndex` benchmarks
+- Carry the existing capability-suite assertions forward against `Fold<CapabilityFold>` (rewritten to the new API; semantic intent preserved).
+- New tests: subscription model, class membership, tag-based queries.
+- Performance: matches or exceeds the pre-deletion `CapabilityIndex` benchmarks. Regression catches if the new fold is slower than the legacy at deletion time.
 
 **Files:**
 - `crates/net/src/adapter/net/behavior/fold/capability.rs` — impl
-- `crates/net/src/adapter/net/behavior/fold/capability_bridge.rs` — migration adapter
 - `crates/net/src/adapter/net/behavior/fold/capability_tests.rs`
+- `crates/net/src/adapter/net/behavior/capability.rs` — DELETED
+- All callers updated in the same PR.
 
-### Phase 4: RoutingFold (1 week)
+### Phase 4: RoutingFold + RoutingTable deletion (1 week)
 
-**Deliverable:** `RoutingFold` impl. Bridge from existing pingwave-driven routing.
+**Deliverable:** `RoutingFold` impl. In the SAME PR: pingwave-driven `RoutingTable` deleted, callers rewired, pingwave packets are repurposed as `SignedAnnouncement<RouteAnnouncement>` publishes.
 
 **Tests:**
-- Route table behavior matches existing `RoutingTable`
-- Metric-based route selection
-- TTL-based eviction matches pingwave timeout semantics
+- Route-selection semantics: metric-based winner, TTL-based eviction.
+- Pingwave round-trip: a publish on `fold:route:` from one node reaches another node's fold within the existing pingwave latency budget.
 
 **Files:**
 - `crates/net/src/adapter/net/behavior/fold/routing.rs`
-- `crates/net/src/adapter/net/behavior/fold/routing_bridge.rs`
 - `crates/net/src/adapter/net/behavior/fold/routing_tests.rs`
+- The legacy `RoutingTable` module — DELETED.
+- All callers updated in the same PR.
 
 ### Phase 5: ReservationFold (1-2 weeks)
 
@@ -712,20 +709,11 @@ These are achievable on commodity hardware with the audit's per-call optimizatio
 - `crates/net/cli/src/commands/fold.rs`
 - Deck UI updates (in whatever path the Deck lives)
 
-### Phase 7: Migration + cutover (1-2 weeks)
-
-**Deliverable:** Existing `CapabilityIndex` users migrated to `Fold<CapabilityFold>`. Existing routing users have option to use `Fold<RoutingFold>`. ReservationFold lights up new product features (compute marketplace, GPU reservation in scheduler).
-
-**Tests:**
-- End-to-end: full stack using fold framework
-- Performance regression tests vs baseline
-- Production replay of historical traffic against new framework
-
 ---
 
 ## Total timeline
 
-7-10 weeks for full implementation, including migration. The runtime + dispatch + capability fold (the core, 3-4 weeks) is the critical path; routing/reservation can follow at the team's pace.
+6-9 weeks for full implementation. Each phase's PR is atomic: lands the new fold AND rewires callers AND deletes the legacy module in one diff. No transition period, no feature gates, no dual-publish.
 
 For pre-investor purposes, Phases 1-3 (4-5 weeks) are sufficient to demonstrate the framework in action. The remaining phases are normal followup.
 
@@ -735,15 +723,15 @@ For pre-investor purposes, Phases 1-3 (4-5 weeks) are sufficient to demonstrate 
 
 **Risk: Generic dispatch adds overhead vs purpose-built code.**
 
-Mitigation: benchmark each fold against its baseline (CapabilityIndex, RoutingTable). Generic dispatch has known cost (vtable lookup, dynamic typing); the benchmark numbers should show this is small relative to signature verification + state mutation, which dominate. If generic dispatch becomes the bottleneck, specific folds can implement hot paths directly without going through the trait.
+Mitigation: benchmark each fold against the pre-deletion baseline of the module it replaces (CapabilityIndex, RoutingTable). Generic dispatch has known cost (vtable lookup, dynamic typing); the benchmark numbers should show this is small relative to signature verification + state mutation, which dominate. The same-PR cutover means the comparison is one diff away from being verifiable — no long-lived bridge to obscure the regression. If generic dispatch becomes the bottleneck, specific folds can implement hot paths directly without going through the trait.
 
-**Risk: Migration creates dual-source-of-truth bugs.**
+**Risk: Same-PR cutover lands a regression that's hard to revert.**
 
-Mitigation: bridge layer publishes to both old and new during transition. A reconciliation tool compares state between old and new periodically; alerts on divergence. Cutover only after a sustained period of zero divergence. Old code removed in a final cleanup PR.
+Mitigation: each phase PR is atomic but standalone — Phases 3/4/5 are sequenced so the dependency graph is one-way. Pre-merge: full benchmark + integration suite against the new fold; a regression vs the pre-deletion baseline blocks the merge. Post-merge: standard git revert works because there's no schema migration to undo (the wire format is the fold envelope; the deletion is purely an internal callers-and-modules rewrite). Operators rolling back a deployment is one redeploy of the prior binary; the on-disk state has no fold/legacy ambiguity because there's no transition window.
 
 **Risk: Wire format choice locks in poor decisions.**
 
-Mitigation: postcard encoding with versioned envelopes. Adding fields is backward-compatible if defaulted. Breaking changes bump version; old and new can coexist during multi-version transitions.
+Mitigation: postcard encoding with versioned envelopes. The `kind` u16 carries the format version implicitly (a v2 fold gets a new `KIND_ID`). Breaking changes ship as a new fold kind; the old kind is deleted in a follow-up cleanup PR once all publishers have rolled forward.
 
 **Risk: Subscription lag at high update rates causes fold staleness.**
 

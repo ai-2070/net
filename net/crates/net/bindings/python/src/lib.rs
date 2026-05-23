@@ -4,6 +4,7 @@
 
 #[cfg(feature = "dataforts")]
 mod blob;
+mod capability_aggregation;
 #[cfg(feature = "cortex")]
 mod cortex;
 // Identity / capabilities / subnets ride the `net` feature as a
@@ -1791,13 +1792,45 @@ mod mesh_bindings {
             use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
             use net::adapter::net::identity::EntityId;
             let node = self.get_node()?;
-            let index = node.capability_index().clone();
             let eid = EntityId::from_bytes([0u8; 32]);
-            index.index(CapabilityAnnouncement::new(
+            node.test_inject_capability_announcement(CapabilityAnnouncement::new(
                 node_id,
                 eid,
                 1,
                 CapabilitySet::new(),
+            ));
+            Ok(())
+        }
+
+        /// Test-only — same shape as `_test_inject_synthetic_peer`
+        /// but takes a list of canonical tag strings to install on
+        /// the synthetic peer. Used by the Phase 6c
+        /// capability-aggregation smoke tests so the fixture can
+        /// stage multi-bucket data without spinning up multiple
+        /// meshes.
+        #[cfg(feature = "groups")]
+        fn _test_inject_synthetic_peer_with_tags(
+            &self,
+            node_id: u64,
+            tags: Vec<String>,
+        ) -> PyResult<()> {
+            use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
+            use net::adapter::net::behavior::Tag;
+            use net::adapter::net::identity::EntityId;
+            let node = self.get_node()?;
+            let mut caps = CapabilitySet::new();
+            // Insert via the permissive `Tag::parse` so reserved-
+            // prefix tags (`scope:region:us-east`, etc.) make it
+            // into the synthesized cap set; `add_tag` rejects
+            // reserved prefixes by design.
+            for s in tags {
+                if let Ok(t) = Tag::parse(&s) {
+                    caps.tags.insert(t);
+                }
+            }
+            let eid = EntityId::from_bytes([0u8; 32]);
+            node.test_inject_capability_announcement(CapabilityAnnouncement::new(
+                node_id, eid, 1, caps,
             ));
             Ok(())
         }
@@ -1831,6 +1864,58 @@ mod mesh_bindings {
             Ok(super::capabilities::with_scope_filter(&owned, |sf| {
                 node.find_nodes_by_filter_scoped(&core, sf)
             }))
+        }
+
+        /// Bucketed aggregation over the local capability fold —
+        /// `Fold::aggregate(matcher, group_by, agg)`. Arguments are
+        /// JSON-encoded tagged unions; the sdk-py wrappers ship
+        /// dataclasses that emit the right shape. Returns
+        /// `list[dict]` sorted lex by bucket key. Phase 6c-A of
+        /// `MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`.
+        ///
+        /// `matcher_json = None` walks every entry.
+        #[pyo3(signature = (matcher_json, group_by_json, aggregation_json))]
+        fn capability_aggregate(
+            &self,
+            py: Python<'_>,
+            matcher_json: Option<&str>,
+            group_by_json: &str,
+            aggregation_json: &str,
+        ) -> PyResult<Py<PyAny>> {
+            let node = self.get_node()?;
+            super::capability_aggregation::aggregate(
+                py,
+                node.capability_fold(),
+                matcher_json,
+                group_by_json,
+                aggregation_json,
+            )
+        }
+
+        /// Capacity-ranked materialized view over the local
+        /// capability fold — `Fold::capacity_ranking(query,
+        /// rtt_lookup)`. `query_json` is a JSON-encoded
+        /// `CapacityQuery`; `rtt_map` is a Python `dict[int, int]`
+        /// mapping `node_id -> rtt_ms` (`None` / empty disables the
+        /// RTT filter regardless of `query.max_rtt_ms`).
+        ///
+        /// Faulty entries are always excluded; rows return sorted by
+        /// `available` desc, ties broken on bucket asc, truncated to
+        /// `query.limit`. Phase 6c-B.
+        #[pyo3(signature = (query_json, rtt_map = None))]
+        fn capability_capacity_ranking(
+            &self,
+            py: Python<'_>,
+            query_json: &str,
+            rtt_map: Option<&Bound<'_, PyDict>>,
+        ) -> PyResult<Py<PyAny>> {
+            let node = self.get_node()?;
+            super::capability_aggregation::capacity_ranking(
+                py,
+                node.capability_fold(),
+                query_json,
+                rtt_map,
+            )
         }
 
         // ── SDK Phase 7 slice 3 — custom PlacementFilter callbacks ──
@@ -1880,9 +1965,9 @@ mod mesh_bindings {
             }
 
             let node = self.get_node()?;
-            let capability_index = node.capability_index().clone();
+            let capability_fold = node.capability_fold().clone();
             let wrapper =
-                super::placement::PyPlacementFilter::new(id.clone(), predicate, capability_index);
+                super::placement::PyPlacementFilter::new(id.clone(), predicate, capability_fold);
             let arc: std::sync::Arc<dyn PlacementFilter> = std::sync::Arc::new(wrapper);
             // SDK Phase 7 polish: `"python"` binding label drives the
             // `dataforts_placement_callback_invocations_total{binding="python"}`

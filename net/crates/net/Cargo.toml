@@ -94,7 +94,10 @@ net = [
     "dep:ed25519-dalek",
     "dep:x25519-dalek",
 ]
-regex = ["dep:regex"]
+# `regex` is now an unconditional dep (see `dependencies.regex`).
+# The feature is preserved as an empty alias so external callers that
+# referenced `features = ["regex"]` keep compiling.
+regex = []
 ffi = []
 redex = ["net", "dep:tokio-stream", "dep:postcard"]
 redex-disk = ["redex"]
@@ -246,7 +249,17 @@ ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"], optional =
 # construction mirrors libsodium's `crypto_box_seal` but uses the
 # XChaCha AEAD already in-tree rather than pulling in XSalsa20.
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"], optional = true }
-regex = { version = "1", optional = true }
+# Regex for `TagMatcher::Regex` (Phase 6c-C) + the safety predicate
+# match path in `behavior::safety`. Pulled in unconditionally so the
+# aggregation surface ships uniformly across binaries; the existing
+# `regex` Cargo feature is preserved as an empty alias for callers
+# that referenced it.
+regex = "1"
+
+# Semver-range matching for `TagMatcher::VersionRange` (Phase 6c-C).
+# Small (~50KB), no transitive load — pulled in unconditionally so
+# the aggregation surface ships uniformly across binaries.
+semver = "1"
 
 # UPnP-IGD client (optional). Behind `port-mapping` — used by
 # `adapter/net/traversal/portmap/upnp.rs`. NAT-PMP's wire format

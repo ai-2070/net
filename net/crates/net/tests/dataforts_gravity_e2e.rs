@@ -182,15 +182,14 @@ async fn read_hot_chain_emits_heat_tag_into_local_caps() {
             let _ = redex_b.greedy_cache_for(&name);
         }
         runtime.gravity_tick().await;
-        if let Some(b_caps_self) = node_b.capability_index().get(node_b.node_id()) {
-            if b_caps_self
-                .tags
-                .iter()
-                .any(|t| matches!(t, Tag::Reserved { prefix, .. } if prefix == "heat:"))
-            {
-                observed_heat = true;
-                break;
-            }
+        let b_caps_self = node_b.test_capability_fold_get(node_b.node_id());
+        if b_caps_self
+            .tags
+            .iter()
+            .any(|t| matches!(t, Tag::Reserved { prefix, .. } if prefix == "heat:"))
+        {
+            observed_heat = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -256,16 +255,15 @@ async fn greedy_without_gravity_emits_no_heat_tags() {
     // Wait through several heartbeat windows; assert no heat tag
     // ever appears on B's self-caps.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    if let Some(b_caps_self) = node_b.capability_index().get(node_b.node_id()) {
-        let has_heat = b_caps_self
-            .tags
-            .iter()
-            .any(|t| matches!(t, Tag::Reserved { prefix, .. } if prefix == "heat:"));
-        assert!(
-            !has_heat,
-            "gravity-disabled greedy must not emit any heat: tag"
-        );
-    }
+    let b_caps_self = node_b.test_capability_fold_get(node_b.node_id());
+    let has_heat = b_caps_self
+        .tags
+        .iter()
+        .any(|t| matches!(t, Tag::Reserved { prefix, .. } if prefix == "heat:"));
+    assert!(
+        !has_heat,
+        "gravity-disabled greedy must not emit any heat: tag"
+    );
 
     redex_b.disable_greedy_dataforts();
 }

@@ -226,9 +226,7 @@ pub const DEFAULT_BUFFERING_APPENDER_CAPACITY: usize = 4096;
 /// increments.
 #[derive(Debug)]
 pub struct BufferingActionChainAppender {
-    records: parking_lot::Mutex<std::collections::VecDeque<ActionChainRecord>>,
-    capacity: usize,
-    dropped: std::sync::atomic::AtomicU64,
+    records: super::super::bounded_ring::BoundedRing<ActionChainRecord>,
 }
 
 impl Default for BufferingActionChainAppender {
@@ -244,52 +242,41 @@ impl BufferingActionChainAppender {
     }
 
     /// Construct an empty buffer capped at `capacity` records.
-    /// A `capacity` of `0` is clamped to `1` to match the sibling
-    /// `BufferingAdminAuditChainAppender::with_capacity` behaviour:
-    /// otherwise every `append` would increment `dropped_count`
-    /// against an empty deque, making the metric meaningless.
+    /// `capacity = 0` is clamped to `1` so the dropped-count
+    /// metric stays meaningful (a zero-cap buffer would
+    /// increment dropped on every append against an empty
+    /// deque).
     pub fn with_capacity(capacity: usize) -> Self {
-        let capacity = capacity.max(1);
         Self {
-            records: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(
-                capacity.min(64),
-            )),
-            capacity,
-            dropped: std::sync::atomic::AtomicU64::new(0),
+            records: super::super::bounded_ring::BoundedRing::new(capacity.max(1)),
         }
     }
 
     /// Snapshot the buffered records (oldest first).
     pub fn records(&self) -> Vec<ActionChainRecord> {
-        self.records.lock().iter().cloned().collect()
+        self.records.snapshot()
     }
 
     /// Count of buffered records.
     pub fn len(&self) -> usize {
-        self.records.lock().len()
+        self.records.len()
     }
 
     /// `true` if no records have been appended.
     pub fn is_empty(&self) -> bool {
-        self.records.lock().is_empty()
+        self.records.is_empty()
     }
 
     /// Count of records the buffer dropped because it was at
     /// `capacity`. Increments on every FIFO eviction.
     pub fn dropped_count(&self) -> u64 {
-        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+        self.records.dropped()
     }
 }
 
 impl ActionChainAppender for BufferingActionChainAppender {
     fn append(&self, record: ActionChainRecord) -> Result<(), AppendError> {
-        let mut guard = self.records.lock();
-        if guard.len() >= self.capacity {
-            guard.pop_front();
-            self.dropped
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        guard.push_back(record);
+        self.records.push(record);
         Ok(())
     }
 }

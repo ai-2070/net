@@ -840,7 +840,7 @@ impl std::fmt::Debug for ForkGroup {
 mod tests {
     use super::*;
     use crate::adapter::net::behavior::capability::{
-        CapabilityAnnouncement, CapabilityFilter, CapabilityIndex, CapabilitySet,
+        CapabilityAnnouncement, CapabilityFilter, CapabilitySet,
     };
     use crate::adapter::net::compute::DaemonError;
     use crate::adapter::net::state::causal::CausalEvent;
@@ -862,39 +862,18 @@ mod tests {
     }
 
     fn make_scheduler() -> Scheduler {
-        let index = Arc::new(CapabilityIndex::new());
+        use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
+        let fold: Arc<Fold<CapabilityFold>> =
+            Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
-        index.index(CapabilityAnnouncement::new(
-            0x1111,
-            eid.clone(),
-            1,
-            CapabilitySet::new(),
-        ));
-        index.index(CapabilityAnnouncement::new(
-            0x2222,
-            eid.clone(),
-            1,
-            CapabilitySet::new(),
-        ));
-        index.index(CapabilityAnnouncement::new(
-            0x3333,
-            eid.clone(),
-            1,
-            CapabilitySet::new(),
-        ));
-        index.index(CapabilityAnnouncement::new(
-            0x4444,
-            eid.clone(),
-            1,
-            CapabilitySet::new(),
-        ));
-        index.index(CapabilityAnnouncement::new(
-            0x5555,
-            eid,
-            1,
-            CapabilitySet::new(),
-        ));
-        Scheduler::new(index, 0x1111, CapabilitySet::new())
+        for node_id in [0x1111u64, 0x2222, 0x3333, 0x4444, 0x5555] {
+            capability_bridge::apply_legacy_announcement(
+                &fold,
+                CapabilityAnnouncement::new(node_id, eid.clone(), 1, CapabilitySet::new()),
+            )
+            .expect("apply legacy announcement in fixture");
+        }
+        Scheduler::new(fold, 0x1111, CapabilitySet::new())
     }
 
     fn test_config(n: u8) -> ForkGroupConfig {
@@ -1140,14 +1119,20 @@ mod tests {
         // Regression: place_with_spread used to silently fall back to an
         // excluded node when all candidates were in the exclusion set,
         // defeating the spread constraint.
-        let index = Arc::new(CapabilityIndex::new());
-        index.index(CapabilityAnnouncement::new(
-            0x1111,
-            crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]),
-            1,
-            CapabilitySet::new(),
-        ));
-        let sched = Scheduler::new(index, 0x1111, CapabilitySet::new());
+        use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
+        let fold: Arc<Fold<CapabilityFold>> =
+            Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
+        capability_bridge::apply_legacy_announcement(
+            &fold,
+            CapabilityAnnouncement::new(
+                0x1111,
+                crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]),
+                1,
+                CapabilitySet::new(),
+            ),
+        )
+        .expect("apply legacy announcement in fixture");
+        let sched = Scheduler::new(fold, 0x1111, CapabilitySet::new());
 
         let mut exclude = HashSet::new();
         exclude.insert(0x1111); // exclude the only node
@@ -1167,20 +1152,20 @@ mod tests {
 
     use crate::adapter::net::behavior::placement::{NodeId as PlacementNodeId, ResourceAxis};
 
-    fn make_scheduler_and_index(node_ids: &[u64]) -> (Scheduler, Arc<CapabilityIndex>) {
-        let index = Arc::new(CapabilityIndex::new());
+    fn make_scheduler_and_index(node_ids: &[u64]) -> Scheduler {
+        use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
+        let fold: Arc<Fold<CapabilityFold>> =
+            Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
         for &id in node_ids {
-            index.index(CapabilityAnnouncement::new(
-                id,
-                eid.clone(),
-                1,
-                CapabilitySet::new(),
-            ));
+            capability_bridge::apply_legacy_announcement(
+                &fold,
+                CapabilityAnnouncement::new(id, eid.clone(), 1, CapabilitySet::new()),
+            )
+            .expect("apply legacy announcement in fixture");
         }
         let local = node_ids.first().copied().unwrap_or(0xFFFF);
-        let scheduler = Scheduler::new(index.clone(), local, CapabilitySet::new());
-        (scheduler, index)
+        Scheduler::new(fold, local, CapabilitySet::new())
     }
 
     /// Permissive placement filter — every candidate scores 1.0.
@@ -1196,10 +1181,9 @@ mod tests {
     #[test]
     fn fork_with_placement_spreads_across_nodes() {
         let reg = DaemonRegistry::new();
-        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
+        let sched = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1232,10 +1216,9 @@ mod tests {
     #[test]
     fn fork_with_placement_routes_first_fork_to_highest_scorer() {
         let reg = DaemonRegistry::new();
-        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
+        let sched = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1266,10 +1249,9 @@ mod tests {
     #[test]
     fn fork_with_placement_returns_placement_failed_when_all_vetoed() {
         let reg = DaemonRegistry::new();
-        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222]);
+        let sched = make_scheduler_and_index(&[0x1111, 0x2222]);
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1301,10 +1283,9 @@ mod tests {
     #[test]
     fn scale_to_with_placement_spreads_new_forks() {
         let reg = DaemonRegistry::new();
-        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
+        let sched = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1339,10 +1320,9 @@ mod tests {
     #[test]
     fn scale_to_with_placement_scale_down_does_not_invoke_filter() {
         let reg = DaemonRegistry::new();
-        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
+        let sched = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333]);
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1380,10 +1360,9 @@ mod tests {
     #[test]
     fn on_node_failure_with_placement_replaces_fork_on_spare_node() {
         let reg = DaemonRegistry::new();
-        let (sched, index) = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
+        let sched = make_scheduler_and_index(&[0x1111, 0x2222, 0x3333, 0x4444]);
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -1431,10 +1410,9 @@ mod tests {
     #[test]
     fn on_node_failure_with_placement_preserves_slot_when_placement_fails() {
         let reg = DaemonRegistry::new();
-        let (sched, index) = make_scheduler_and_index(&[0x9999]);
+        let sched = make_scheduler_and_index(&[0x9999]);
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 

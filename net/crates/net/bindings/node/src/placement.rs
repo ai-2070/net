@@ -36,7 +36,7 @@ use std::time::Duration;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use net::adapter::net::behavior::capability::CapabilityIndex;
+use net::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
 use net::adapter::net::behavior::placement::{
     Artifact, NodeId as PlacementNodeId, PlacementFilter,
 };
@@ -78,9 +78,10 @@ pub type PlacementFilterTsfn = napi::threadsafe_function::ThreadsafeFunction<
 pub struct TsfnPlacementFilter {
     /// JS predicate to invoke per candidate.
     tsfn: PlacementFilterTsfn,
-    /// Local capability index — looked up to materialize the
-    /// candidate's tags/metadata for the JS object.
-    capability_index: Arc<CapabilityIndex>,
+    /// Local capability fold — synthesized into a `CapabilitySet`
+    /// at scoring time to materialize the candidate's tags/metadata
+    /// for the JS object.
+    capability_fold: Arc<Fold<CapabilityFold>>,
     /// Bounded wait per scoring call.
     callback_timeout: Duration,
     /// SDK-supplied id, retained for diagnostics in logged
@@ -95,11 +96,11 @@ impl TsfnPlacementFilter {
     pub fn new(
         id: String,
         tsfn: PlacementFilterTsfn,
-        capability_index: Arc<CapabilityIndex>,
+        capability_fold: Arc<Fold<CapabilityFold>>,
     ) -> Self {
         Self {
             tsfn,
-            capability_index,
+            capability_fold,
             callback_timeout: DEFAULT_PLACEMENT_FILTER_TIMEOUT,
             id,
         }
@@ -119,11 +120,17 @@ impl TsfnPlacementFilter {
 impl PlacementFilter for TsfnPlacementFilter {
     fn placement_score(&self, target: &PlacementNodeId, _artifact: &Artifact<'_>) -> Option<f32> {
         // Look up the candidate's caps. A candidate not in the
-        // index is invisible to the JS predicate (which expects
+        // fold is invisible to the JS predicate (which expects
         // tags + metadata); treat as veto rather than feeding an
         // empty candidate that the JS layer can't distinguish from
         // a real never-tagged node.
-        let caps = self.capability_index.get(*target)?;
+        if !self
+            .capability_fold
+            .with_state(|state| state.by_node.contains_key(target))
+        {
+            return None;
+        }
+        let caps = capability_bridge::synthesize_capability_set(&self.capability_fold, *target);
 
         // Materialize the candidate's tags as strings — the
         // substrate's `Tag` type renders to its on-wire string

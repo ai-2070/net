@@ -299,7 +299,7 @@ async fn receiver_survives_unknown_subprotocol_id() {
         .expect("real announce after junk barrage");
     let mut propagated = false;
     for _ in 0..40 {
-        if b.capability_index().get(a_id).is_some() {
+        if b.test_capability_fold_has(a_id) {
             propagated = true;
             break;
         }
@@ -349,7 +349,7 @@ async fn receiver_drops_malformed_capability_announcement_without_panic() {
     // with a bogus entry.
     let a_id = a.node_id();
     assert!(
-        b.capability_index().get(a_id).is_none(),
+        !b.test_capability_fold_has(a_id),
         "malformed announcement must not populate B's capability index",
     );
 
@@ -360,7 +360,7 @@ async fn receiver_drops_malformed_capability_announcement_without_panic() {
         .expect("A real announce");
     let mut propagated = false;
     for _ in 0..40 {
-        if b.capability_index().get(a_id).is_some() {
+        if b.test_capability_fold_has(a_id) {
             propagated = true;
             break;
         }

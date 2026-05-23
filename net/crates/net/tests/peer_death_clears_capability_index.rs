@@ -159,7 +159,7 @@ async fn capability_index_is_cleared_when_failure_detector_marks_peer_failed() {
     // Snapshot: B is in R's index, PunchRequests would find a
     // reflex. This is the pre-failure state.
     assert!(
-        r.capability_index().get(b_id).is_some(),
+        r.test_capability_fold_has(b_id),
         "precondition: B must be indexed on R before failure",
     );
 
@@ -185,7 +185,7 @@ async fn capability_index_is_cleared_when_failure_detector_marks_peer_failed() {
     let r_for_poll = r.clone();
     let b_id_copy = b_id;
     let evicted = wait_for(Duration::from_secs(2), || {
-        r_for_poll.capability_index().get(b_id_copy).is_none()
+        !r_for_poll.test_capability_fold_has(b_id_copy)
     })
     .await;
     assert!(
@@ -193,8 +193,8 @@ async fn capability_index_is_cleared_when_failure_detector_marks_peer_failed() {
         "R's capability index must evict B after the failure \
          detector fires — three-way-agreement invariant. Without \
          this fix the rendezvous coordinator would still return \
-         B's stale reflex to a PunchRequest initiator. R.get(B)={:?}",
-        r.capability_index().get(b_id).is_some(),
+         B's stale reflex to a PunchRequest initiator. R.has(B)={:?}",
+        r.test_capability_fold_has(b_id),
     );
 
     // Stronger assertion: the behavioral consequence. A fires a

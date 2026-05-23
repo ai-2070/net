@@ -162,10 +162,8 @@ async fn subnet_local_partitions_a_b_from_c() {
     // handler).
     let b_id = b.node_id();
     let c_id = c.node_id();
-    let learned = wait_until(|| {
-        a.capability_index().get(b_id).is_some() && a.capability_index().get(c_id).is_some()
-    })
-    .await;
+    let learned =
+        wait_until(|| a.test_capability_fold_has(b_id) && a.test_capability_fold_has(c_id)).await;
     assert!(
         learned,
         "A never indexed both B's and C's capability announcements"
@@ -253,10 +251,9 @@ async fn parent_visible_admits_descendant_rejects_sibling() {
 
     let desc_id = descendant.node_id();
     let sib_id = sibling.node_id();
-    let learned = wait_until(|| {
-        a.capability_index().get(desc_id).is_some() && a.capability_index().get(sib_id).is_some()
-    })
-    .await;
+    let learned =
+        wait_until(|| a.test_capability_fold_has(desc_id) && a.test_capability_fold_has(sib_id))
+            .await;
     assert!(learned, "A did not learn both peers' announcements");
 
     let channel_name = ChannelName::new("lab/parent").expect("channel name");

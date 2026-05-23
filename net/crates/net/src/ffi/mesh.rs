@@ -3234,10 +3234,10 @@ fn scope_filter_from_json(f: ScopeFilterJson) -> ScopeFilterOwned {
             _ => ScopeFilterOwned::Any,
         },
         "tenants" => match f.tenants {
-            // Drop empty tenant ids — `scope_from_tags` rejects
-            // empty announcements, so a query containing `[""]`
-            // would never match a real tenant and would only pin
-            // to Global candidates. Fall back to Any when cleaned
+            // Drop empty tenant ids — `scope_from_membership_tags`
+            // rejects empty announcements, so a query containing
+            // `[""]` would never match a real tenant and would only
+            // pin to Global candidates. Fall back to Any when cleaned
             // list is empty.
             Some(ts) => {
                 let cleaned: Vec<String> = ts.into_iter().filter(|t| !t.is_empty()).collect();

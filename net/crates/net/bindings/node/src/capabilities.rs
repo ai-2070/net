@@ -516,8 +516,8 @@ pub fn with_scope_filter<R>(
 
 /// Convert a JS scope filter POJO to the owned form. Empty strings
 /// or empty lists collapse to [`ScopeFilterOwned::Any`] —
-/// `scope:tenant:` (no id) is rejected by [`scope_from_tags`] in
-/// the core, so passing it as a query would never match anything;
+/// `scope:tenant:` (no id) is rejected by `scope_from_membership_tags`
+/// in the core, so passing it as a query would never match anything;
 /// `Any` is the more honest result.
 pub fn scope_filter_from_js(f: ScopeFilterJs) -> ScopeFilterOwned {
     match f.kind.as_str() {
@@ -530,11 +530,11 @@ pub fn scope_filter_from_js(f: ScopeFilterJs) -> ScopeFilterOwned {
         },
         "tenants" => match f.tenants {
             Some(ts) => {
-                // Drop empty tenant ids — `scope_from_tags` rejects
-                // empty announcements, so passing `[""]` through as a
-                // query would never match real tenants and would only
-                // pin to Global candidates (since `Tenants(["",])` is
-                // a valid filter that matches no tenant tag).
+                // Drop empty tenant ids — `scope_from_membership_tags`
+                // rejects empty announcements, so passing `[""]` through
+                // as a query would never match real tenants and would
+                // only pin to Global candidates (since `Tenants(["",])`
+                // is a valid filter that matches no tenant tag).
                 let cleaned: Vec<String> = ts.into_iter().filter(|t| !t.is_empty()).collect();
                 if cleaned.is_empty() {
                     ScopeFilterOwned::Any

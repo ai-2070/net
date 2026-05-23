@@ -21,16 +21,18 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use net::adapter::net::identity::EntityId;
 use net::adapter::net::{
     // Phase 4A-4G: Behavior Plane - Capabilities, Diffs, Metadata, APIs, Rules, Context & LoadBalancing
     behavior::{
+        fold::{capability_bridge, CapabilityFold, Fold},
         Action, AlertSeverity, ApiAnnouncement, ApiEndpoint, ApiMethod, ApiParameter, ApiQuery,
         ApiRegistry, ApiSchema, ApiVersion, Baggage, CapabilityAnnouncement, CapabilityFilter,
-        CapabilityIndex, CapabilityRequirement, CapabilitySet, CompareOp, Condition, ConditionExpr,
-        Context, ContextStore, Endpoint, GpuInfo, GpuVendor, HardwareCapabilities, HealthStatus,
+        CapabilityRequirement, CapabilitySet, CompareOp, Condition, ConditionExpr, Context,
+        ContextStore, Endpoint, GpuInfo, GpuVendor, HardwareCapabilities, HealthStatus,
         LbRequestContext, LoadBalancer, LoadBalancerConfig, LoadMetrics, LocationInfo, LogLevel,
         MetadataQuery, MetadataStore, Modality, ModelCapability, NatType, NetworkTier,
         NodeMetadata, NodeStatus, Priority, PropagationContext, Region, ResourceLimits, Rule,
@@ -2141,9 +2143,9 @@ fn bench_capability_filter(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark: CapabilityIndex indexing throughput
-fn bench_capability_index_insert(c: &mut Criterion) {
-    let mut group = c.benchmark_group("capability_index_insert");
+/// Benchmark: CapabilityFold indexing throughput
+fn bench_capability_fold_insert(c: &mut Criterion) {
+    let mut group = c.benchmark_group("capability_fold_insert");
 
     for node_count in [100, 1000, 10000].iter() {
         group.throughput(Throughput::Elements(*node_count as u64));
@@ -2153,7 +2155,7 @@ fn bench_capability_index_insert(c: &mut Criterion) {
             node_count,
             |b, &count| {
                 b.iter(|| {
-                    let index = CapabilityIndex::new();
+                    let fold = Fold::<CapabilityFold>::with_sweep_interval(Duration::ZERO);
                     for i in 0..count {
                         let caps = sample_capability_set(i as u64);
                         let ann = CapabilityAnnouncement::new(
@@ -2162,9 +2164,10 @@ fn bench_capability_index_insert(c: &mut Criterion) {
                             1,
                             caps,
                         );
-                        index.index(ann);
+                        capability_bridge::apply_legacy_announcement(&fold, ann)
+                            .expect("apply legacy announcement in fixture");
                     }
-                    index
+                    fold
                 });
             },
         );
@@ -2173,41 +2176,42 @@ fn bench_capability_index_insert(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark: CapabilityIndex query performance
-fn bench_capability_index_query(c: &mut Criterion) {
-    let mut group = c.benchmark_group("capability_index_query");
+/// Benchmark: CapabilityFold query performance
+fn bench_capability_fold_query(c: &mut Criterion) {
+    let mut group = c.benchmark_group("capability_fold_query");
     group.throughput(Throughput::Elements(1));
 
-    // Pre-populate index with 10k nodes
-    let index = CapabilityIndex::new();
+    // Pre-populate fold with 10k nodes
+    let fold = Fold::<CapabilityFold>::with_sweep_interval(Duration::ZERO);
     for i in 0..10000 {
         let caps = sample_capability_set(i);
         let ann = CapabilityAnnouncement::new(i, EntityId::from_bytes([0u8; 32]), 1, caps);
-        index.index(ann);
+        capability_bridge::apply_legacy_announcement(&fold, ann)
+            .expect("apply legacy announcement in fixture");
     }
 
     // Single tag query (uses inverted index)
     let tag_filter = CapabilityFilter::new().require_tag("inference");
     group.bench_function("query_single_tag", |b| {
-        b.iter(|| index.query(&tag_filter));
+        b.iter(|| capability_bridge::find_nodes_matching(&fold, &tag_filter));
     });
 
     // GPU query (uses inverted index)
     let gpu_filter = CapabilityFilter::new().require_gpu();
     group.bench_function("query_require_gpu", |b| {
-        b.iter(|| index.query(&gpu_filter));
+        b.iter(|| capability_bridge::find_nodes_matching(&fold, &gpu_filter));
     });
 
     // GPU vendor query (uses inverted index)
     let vendor_filter = CapabilityFilter::new().with_gpu_vendor(GpuVendor::Nvidia);
     group.bench_function("query_gpu_vendor", |b| {
-        b.iter(|| index.query(&vendor_filter));
+        b.iter(|| capability_bridge::find_nodes_matching(&fold, &vendor_filter));
     });
 
     // Memory filter (requires full scan of candidates)
     let memory_filter = CapabilityFilter::new().with_min_memory(80);
     group.bench_function("query_min_memory", |b| {
-        b.iter(|| index.query(&memory_filter));
+        b.iter(|| capability_bridge::find_nodes_matching(&fold, &memory_filter));
     });
 
     // Complex query (multiple inverted indexes + full check)
@@ -2216,50 +2220,57 @@ fn bench_capability_index_query(c: &mut Criterion) {
         .require_gpu()
         .with_min_memory(64);
     group.bench_function("query_complex", |b| {
-        b.iter(|| index.query(&complex_filter));
+        b.iter(|| capability_bridge::find_nodes_matching(&fold, &complex_filter));
     });
 
     // Model query
     let model_filter = CapabilityFilter::new().require_model("llama-3.1-7b");
     group.bench_function("query_model", |b| {
-        b.iter(|| index.query(&model_filter));
+        b.iter(|| capability_bridge::find_nodes_matching(&fold, &model_filter));
     });
 
     // Tool query
     let tool_filter = CapabilityFilter::new().require_tool("python_repl");
     group.bench_function("query_tool", |b| {
-        b.iter(|| index.query(&tool_filter));
+        b.iter(|| capability_bridge::find_nodes_matching(&fold, &tool_filter));
     });
 
     // No results query
     let empty_filter = CapabilityFilter::new().require_tag("nonexistent");
     group.bench_function("query_no_results", |b| {
-        b.iter(|| index.query(&empty_filter));
+        b.iter(|| capability_bridge::find_nodes_matching(&fold, &empty_filter));
     });
 
     group.finish();
 }
 
-/// Benchmark: CapabilityIndex find_best with scoring
-fn bench_capability_index_find_best(c: &mut Criterion) {
-    let mut group = c.benchmark_group("capability_index_find_best");
+/// Benchmark: CapabilityFold candidate-set lookup
+///
+/// The legacy `CapabilityIndex::find_best` scoring path has no
+/// fold-side equivalent yet; this bench treats the requirement
+/// as a candidate-set query via `find_nodes_matching(req.filter)`
+/// and exercises throughput only — scoring is NOT measured here.
+fn bench_capability_fold_find_best(c: &mut Criterion) {
+    let mut group = c.benchmark_group("capability_fold_find_best");
     group.throughput(Throughput::Elements(1));
 
-    // Pre-populate index
-    let index = CapabilityIndex::new();
+    // Pre-populate fold
+    let fold = Fold::<CapabilityFold>::with_sweep_interval(Duration::ZERO);
     for i in 0..10000 {
         let caps = sample_capability_set(i);
         let ann = CapabilityAnnouncement::new(i, EntityId::from_bytes([0u8; 32]), 1, caps);
-        index.index(ann);
+        capability_bridge::apply_legacy_announcement(&fold, ann)
+            .expect("apply legacy announcement in fixture");
     }
 
     // Simple requirement
     let simple_req = CapabilityRequirement::from_filter(CapabilityFilter::new().require_gpu());
     group.bench_function("find_best_simple", |b| {
-        b.iter(|| index.find_best(&simple_req));
+        b.iter(|| capability_bridge::find_nodes_matching(&fold, &simple_req.filter));
     });
 
-    // Requirement with preferences
+    // Requirement with preferences (preferences are not exercised
+    // on the fold path; the bridge does candidate-set queries only).
     let pref_req = CapabilityRequirement::from_filter(
         CapabilityFilter::new()
             .require_gpu()
@@ -2270,23 +2281,24 @@ fn bench_capability_index_find_best(c: &mut Criterion) {
     .prefer_speed(0.3);
 
     group.bench_function("find_best_with_prefs", |b| {
-        b.iter(|| index.find_best(&pref_req));
+        b.iter(|| capability_bridge::find_nodes_matching(&fold, &pref_req.filter));
     });
 
     group.finish();
 }
 
-/// Benchmark: CapabilityIndex scaling
-fn bench_capability_index_scaling(c: &mut Criterion) {
-    let mut group = c.benchmark_group("capability_index_scaling");
+/// Benchmark: CapabilityFold scaling
+fn bench_capability_fold_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("capability_fold_scaling");
 
     for node_count in [1000, 5000, 10000, 50000].iter() {
-        let index = CapabilityIndex::new();
+        let fold = Fold::<CapabilityFold>::with_sweep_interval(Duration::ZERO);
         for i in 0..*node_count {
             let caps = sample_capability_set(i as u64);
             let ann =
                 CapabilityAnnouncement::new(i as u64, EntityId::from_bytes([0u8; 32]), 1, caps);
-            index.index(ann);
+            capability_bridge::apply_legacy_announcement(&fold, ann)
+                .expect("apply legacy announcement in fixture");
         }
 
         let tag_filter = CapabilityFilter::new().require_tag("inference");
@@ -2296,7 +2308,7 @@ fn bench_capability_index_scaling(c: &mut Criterion) {
             BenchmarkId::new("query_tag", node_count),
             node_count,
             |b, _| {
-                b.iter(|| index.query(&tag_filter));
+                b.iter(|| capability_bridge::find_nodes_matching(&fold, &tag_filter));
             },
         );
 
@@ -2309,7 +2321,7 @@ fn bench_capability_index_scaling(c: &mut Criterion) {
             BenchmarkId::new("query_complex", node_count),
             node_count,
             |b, _| {
-                b.iter(|| index.query(&complex_filter));
+                b.iter(|| capability_bridge::find_nodes_matching(&fold, &complex_filter));
             },
         );
     }
@@ -2317,9 +2329,9 @@ fn bench_capability_index_scaling(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark: CapabilityIndex concurrent access
-fn bench_capability_index_concurrent(c: &mut Criterion) {
-    let mut group = c.benchmark_group("capability_index_concurrent");
+/// Benchmark: CapabilityFold concurrent access
+fn bench_capability_fold_concurrent(c: &mut Criterion) {
+    let mut group = c.benchmark_group("capability_fold_concurrent");
     group.sample_size(20);
 
     let ops_per_thread = 500;
@@ -2329,7 +2341,7 @@ fn bench_capability_index_concurrent(c: &mut Criterion) {
         group.throughput(Throughput::Elements(total_ops as u64));
 
         // Concurrent indexing
-        let index = Arc::new(CapabilityIndex::new());
+        let fold = Arc::new(Fold::<CapabilityFold>::with_sweep_interval(Duration::ZERO));
 
         group.bench_with_input(
             BenchmarkId::new("concurrent_index", thread_count),
@@ -2338,7 +2350,7 @@ fn bench_capability_index_concurrent(c: &mut Criterion) {
                 b.iter(|| {
                     let handles: Vec<_> = (0..thread_count)
                         .map(|thread_id| {
-                            let idx = Arc::clone(&index);
+                            let f = Arc::clone(&fold);
                             thread::spawn(move || {
                                 for i in 0..ops_per_thread {
                                     let node_id = (thread_id as u64 * 100000) + i as u64;
@@ -2349,7 +2361,8 @@ fn bench_capability_index_concurrent(c: &mut Criterion) {
                                         1,
                                         caps,
                                     );
-                                    idx.index(ann);
+                                    capability_bridge::apply_legacy_announcement(&f, ann)
+                                        .expect("apply legacy announcement in fixture");
                                 }
                             })
                         })
@@ -2363,11 +2376,12 @@ fn bench_capability_index_concurrent(c: &mut Criterion) {
         );
 
         // Concurrent querying (pre-populate first)
-        let query_index = Arc::new(CapabilityIndex::new());
+        let query_fold = Arc::new(Fold::<CapabilityFold>::with_sweep_interval(Duration::ZERO));
         for i in 0..10000 {
             let caps = sample_capability_set(i);
             let ann = CapabilityAnnouncement::new(i, EntityId::from_bytes([0u8; 32]), 1, caps);
-            query_index.index(ann);
+            capability_bridge::apply_legacy_announcement(&query_fold, ann)
+                .expect("apply legacy announcement in fixture");
         }
 
         group.bench_with_input(
@@ -2377,7 +2391,7 @@ fn bench_capability_index_concurrent(c: &mut Criterion) {
                 b.iter(|| {
                     let handles: Vec<_> = (0..thread_count)
                         .map(|thread_id| {
-                            let idx = Arc::clone(&query_index);
+                            let f = Arc::clone(&query_fold);
                             thread::spawn(move || {
                                 for i in 0..ops_per_thread {
                                     let filter = match (thread_id + i) % 4 {
@@ -2386,7 +2400,7 @@ fn bench_capability_index_concurrent(c: &mut Criterion) {
                                         2 => CapabilityFilter::new().require_tool("python_repl"),
                                         _ => CapabilityFilter::new().with_min_memory(70),
                                     };
-                                    let _ = idx.query(&filter);
+                                    let _ = capability_bridge::find_nodes_matching(&f, &filter);
                                 }
                             })
                         })
@@ -2407,7 +2421,7 @@ fn bench_capability_index_concurrent(c: &mut Criterion) {
                 b.iter(|| {
                     let handles: Vec<_> = (0..thread_count)
                         .map(|thread_id| {
-                            let idx = Arc::clone(&query_index);
+                            let f = Arc::clone(&query_fold);
                             thread::spawn(move || {
                                 for i in 0..ops_per_thread {
                                     if i % 10 == 0 {
@@ -2420,12 +2434,13 @@ fn bench_capability_index_concurrent(c: &mut Criterion) {
                                             1,
                                             caps,
                                         );
-                                        idx.index(ann);
+                                        capability_bridge::apply_legacy_announcement(&f, ann)
+                                            .expect("apply legacy announcement in fixture");
                                     } else {
                                         // 90% reads
                                         let filter =
                                             CapabilityFilter::new().require_tag("inference");
-                                        let _ = idx.query(&filter);
+                                        let _ = capability_bridge::find_nodes_matching(&f, &filter);
                                     }
                                 }
                             })
@@ -2444,17 +2459,18 @@ fn bench_capability_index_concurrent(c: &mut Criterion) {
 }
 
 /// Benchmark: Version handling and updates
-fn bench_capability_index_updates(c: &mut Criterion) {
-    let mut group = c.benchmark_group("capability_index_updates");
+fn bench_capability_fold_updates(c: &mut Criterion) {
+    let mut group = c.benchmark_group("capability_fold_updates");
     group.throughput(Throughput::Elements(1));
 
-    let index = CapabilityIndex::new();
+    let fold = Fold::<CapabilityFold>::with_sweep_interval(Duration::ZERO);
 
     // Pre-populate
     for i in 0..1000 {
         let caps = sample_capability_set(i);
         let ann = CapabilityAnnouncement::new(i, EntityId::from_bytes([0u8; 32]), 1, caps);
-        index.index(ann);
+        capability_bridge::apply_legacy_announcement(&fold, ann)
+            .expect("apply legacy announcement in fixture");
     }
 
     // Update existing node (higher version)
@@ -2464,7 +2480,8 @@ fn bench_capability_index_updates(c: &mut Criterion) {
             let caps = sample_capability_set(500);
             let ann =
                 CapabilityAnnouncement::new(500, EntityId::from_bytes([0u8; 32]), version, caps);
-            index.index(ann);
+            capability_bridge::apply_legacy_announcement(&fold, ann)
+                .expect("apply legacy announcement in fixture");
             version += 1;
         });
     });
@@ -2474,7 +2491,8 @@ fn bench_capability_index_updates(c: &mut Criterion) {
         b.iter(|| {
             let caps = sample_capability_set(500);
             let ann = CapabilityAnnouncement::new(500, EntityId::from_bytes([0u8; 32]), 1, caps);
-            index.index(ann);
+            capability_bridge::apply_legacy_announcement(&fold, ann)
+                .expect("apply legacy announcement in fixture");
         });
     });
 
@@ -2485,9 +2503,10 @@ fn bench_capability_index_updates(c: &mut Criterion) {
             // Add
             let caps = sample_capability_set(id);
             let ann = CapabilityAnnouncement::new(id, EntityId::from_bytes([0u8; 32]), 1, caps);
-            index.index(ann);
+            capability_bridge::apply_legacy_announcement(&fold, ann)
+                .expect("apply legacy announcement in fixture");
             // Remove
-            index.remove(id);
+            fold.evict_node(id, "bench");
             id += 1;
         });
     });
@@ -2501,12 +2520,12 @@ criterion_group!(
     bench_capability_set,
     bench_capability_announcement,
     bench_capability_filter,
-    bench_capability_index_insert,
-    bench_capability_index_query,
-    bench_capability_index_find_best,
-    bench_capability_index_scaling,
-    bench_capability_index_concurrent,
-    bench_capability_index_updates,
+    bench_capability_fold_insert,
+    bench_capability_fold_query,
+    bench_capability_fold_find_best,
+    bench_capability_fold_scaling,
+    bench_capability_fold_concurrent,
+    bench_capability_fold_updates,
 );
 
 // =============================================================================

@@ -381,27 +381,25 @@ impl std::fmt::Debug for GroupCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::net::behavior::capability::{
-        CapabilityAnnouncement, CapabilityIndex, CapabilitySet,
-    };
+    use crate::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
     use crate::adapter::net::behavior::placement::{NodeId as PlacementNodeId, ResourceAxis};
     use std::sync::Arc;
 
-    fn make_scheduler(node_ids: &[u64]) -> (Scheduler, Arc<CapabilityIndex>) {
-        let index = Arc::new(CapabilityIndex::new());
+    fn make_scheduler(node_ids: &[u64]) -> Scheduler {
+        use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
+        let fold: Arc<Fold<CapabilityFold>> =
+            Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
         for &id in node_ids {
-            index.index(CapabilityAnnouncement::new(
-                id,
-                eid.clone(),
-                1,
-                CapabilitySet::new(),
-            ));
+            capability_bridge::apply_legacy_announcement(
+                &fold,
+                CapabilityAnnouncement::new(id, eid.clone(), 1, CapabilitySet::new()),
+            )
+            .expect("apply legacy announcement in fixture");
         }
         // Local node id = first in list (or 0xFFFF if list is empty).
         let local = node_ids.first().copied().unwrap_or(0xFFFF);
-        let scheduler = Scheduler::new(index.clone(), local, CapabilitySet::new());
-        (scheduler, index)
+        Scheduler::new(fold, local, CapabilitySet::new())
     }
 
     /// Synthetic placement filter — a fixed score for every candidate
@@ -445,7 +443,7 @@ mod tests {
     /// observability contract that distinguishes v2 from v1.
     #[test]
     fn place_member_stamps_best_score_reason() {
-        let (sched, index) = make_scheduler(&[0x1111, 0x2222, 0x3333]);
+        let sched = make_scheduler(&[0x1111, 0x2222, 0x3333]);
         let req = empty_caps();
         let opt = empty_caps();
         let artifact = daemon_artifact(&req, &opt);
@@ -455,7 +453,6 @@ mod tests {
         };
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
         let exclude = HashSet::new();
@@ -481,7 +478,7 @@ mod tests {
     /// the best.
     #[test]
     fn place_member_excludes_already_placed_nodes() {
-        let (sched, index) = make_scheduler(&[0x1111, 0x2222, 0x3333]);
+        let sched = make_scheduler(&[0x1111, 0x2222, 0x3333]);
         let req = empty_caps();
         let opt = empty_caps();
         let artifact = daemon_artifact(&req, &opt);
@@ -491,7 +488,6 @@ mod tests {
         };
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
 
@@ -518,7 +514,7 @@ mod tests {
     /// excluded" branch.
     #[test]
     fn place_member_returns_placement_failed_when_all_vetoed_or_excluded() {
-        let (sched, index) = make_scheduler(&[0x1111, 0x2222, 0x3333]);
+        let sched = make_scheduler(&[0x1111, 0x2222, 0x3333]);
         let req = empty_caps();
         let opt = empty_caps();
         let artifact = daemon_artifact(&req, &opt);
@@ -529,7 +525,6 @@ mod tests {
         };
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
         let mut exclude = HashSet::new();
@@ -564,7 +559,7 @@ mod tests {
     /// in index order, which can deviate from the score-best pick.
     #[test]
     fn place_member_picks_highest_scoring_over_lex_order() {
-        let (sched, index) = make_scheduler(&[0x1111, 0x2222, 0x3333]);
+        let sched = make_scheduler(&[0x1111, 0x2222, 0x3333]);
         let req = empty_caps();
         let opt = empty_caps();
         let artifact = daemon_artifact(&req, &opt);
@@ -584,7 +579,6 @@ mod tests {
 
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
         let exclude = HashSet::new();
@@ -609,7 +603,7 @@ mod tests {
     /// Empty candidate pool (no nodes in index) → `PlacementFailed`.
     #[test]
     fn place_member_returns_placement_failed_for_empty_index() {
-        let (sched, index) = make_scheduler(&[]);
+        let sched = make_scheduler(&[]);
         let req = empty_caps();
         let opt = empty_caps();
         let artifact = daemon_artifact(&req, &opt);
@@ -619,7 +613,6 @@ mod tests {
         };
         let tb = TieBreakContext {
             rtt_lookup: None,
-            index: &index,
             resource_axis: ResourceAxis::Compute,
         };
         let exclude = HashSet::new();
@@ -642,7 +635,7 @@ mod tests {
     /// changed yet" guarantee for slice 4.
     #[test]
     fn place_with_spread_unchanged_after_place_member_added() {
-        let (sched, _index) = make_scheduler(&[0x1111, 0x2222, 0x3333]);
+        let sched = make_scheduler(&[0x1111, 0x2222, 0x3333]);
         let exclude = HashSet::new();
         let decision =
             GroupCoordinator::place_with_spread(&sched, &CapabilityFilter::default(), &exclude)

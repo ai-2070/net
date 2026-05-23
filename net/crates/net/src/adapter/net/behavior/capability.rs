@@ -3,22 +3,19 @@
 //! This module provides:
 //! - `CapabilitySet` - Structured capability representation
 //! - `CapabilityAnnouncement` - Versioned capability broadcast
-//! - `CapabilityIndex` - High-performance capability indexing with inverted indexes
 //! - `CapabilityFilter` - Query capabilities by various criteria
+//! - `CardinalityProvider` - Trait used by the predicate planner
 //!
-//! # Performance Targets
-//! - Index throughput: 100k+ announcements/s
-//! - Query latency (single tag): < 100µs
-//! - Query latency (complex filter): < 1ms
-//! - Memory per 10k nodes: < 50MB
+//! The legacy `CapabilityIndex` in-memory store was removed in
+//! Phase 3B of the multifold migration. Membership + cardinality
+//! data now live on the `CapabilityFold` (see
+//! `behavior/fold/capability`); downstream callers go through
+//! `MeshNode`'s fold helpers or `capability_bridge`.
 
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashSet};
 use std::hash::Hash;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use crate::adapter::net::behavior::tag::Tag;
 
@@ -637,7 +634,7 @@ pub const TAG_SCOPE_GLOBAL: &str = "scope:global";
 /// Resolved scope of a capability announcement, derived from the
 /// reserved `scope:*` tags inside the announcer's [`CapabilitySet`].
 /// Pure derivation — never stored, recomputed on each query via
-/// [`scope_from_tags`].
+/// `behavior::fold::capability_bridge::scope_from_membership_tags`.
 ///
 /// Precedence: `SubnetLocal` > tenants/regions > `Global`. A node
 /// that tags itself with both `scope:subnet-local` and
@@ -672,54 +669,6 @@ pub(crate) enum CapabilityScope {
     },
 }
 
-/// Resolve a `CapabilitySet::tags` set into the announcer's
-/// effective [`CapabilityScope`]. Empty tenant / region values
-/// (`scope:tenant:` with no id) are silently dropped — defensive,
-/// since reading them as the empty string would let a peer match
-/// any tenant query that also had an empty id.
-///
-/// Phase A.5.N.2: signature now takes `&HashSet<Tag>`. Inspects
-/// `Tag::Reserved` variants where prefix is `scope:`. The body
-/// of those reserved tags is the post-`scope:` substring, e.g.
-/// `tenant:foo` / `region:eu-west` / `subnet-local`.
-pub(crate) fn scope_from_tags(tags: &HashSet<Tag>) -> CapabilityScope {
-    let mut tenants = Vec::new();
-    let mut regions = Vec::new();
-    let mut subnet_local = false;
-
-    for tag in tags {
-        let Tag::Reserved { prefix, body } = tag else {
-            continue;
-        };
-        if prefix.as_str() != "scope:" {
-            continue;
-        }
-        if body == "subnet-local" {
-            subnet_local = true;
-        } else if let Some(id) = body.strip_prefix("tenant:") {
-            if !id.is_empty() {
-                tenants.push(id.to_string());
-            }
-        } else if let Some(name) = body.strip_prefix("region:") {
-            if !name.is_empty() {
-                regions.push(name.to_string());
-            }
-        }
-        // `scope:global` is the default; presence is a no-op.
-    }
-
-    if subnet_local {
-        CapabilityScope::SubnetLocal
-    } else {
-        match (tenants.is_empty(), regions.is_empty()) {
-            (true, true) => CapabilityScope::Global,
-            (false, true) => CapabilityScope::Tenants(tenants),
-            (true, false) => CapabilityScope::Regions(regions),
-            (false, false) => CapabilityScope::TenantsAndRegions { tenants, regions },
-        }
-    }
-}
-
 /// Parse `subnet:<hex32>` and `group:<hex64>` tags out of an
 /// announcement's tag set. Used at index time so the
 /// capability-auth `may_execute` gate can look up a peer's
@@ -735,6 +684,12 @@ pub(crate) fn scope_from_tags(tags: &HashSet<Tag>) -> CapabilityScope {
 /// subnet tag works as expected. All distinct `group:` tags
 /// accumulate (deterministically sorted by byte value so receivers
 /// agree on iteration order); duplicates (Eq) are removed.
+///
+/// Kept (with `#[allow(dead_code)]`) for downstream consumers
+/// (capability_bridge translates the same shape onto the fold).
+/// The legacy `CapabilityIndex` caller was removed in Phase 3B
+/// of the multifold migration.
+#[allow(dead_code)]
 pub(crate) fn parse_membership_tags(
     tags: &HashSet<Tag>,
 ) -> (Option<super::subnet::SubnetId>, Vec<super::group::GroupId>) {
@@ -770,8 +725,10 @@ pub(crate) fn parse_membership_tags(
 }
 
 /// Caller's intent for narrowing peer discovery by reserved scope
-/// tags, paired with [`CapabilityIndex::find_nodes_scoped`] /
-/// [`CapabilityIndex::find_best_node_scoped`].
+/// tags. The legacy `CapabilityIndex::find_nodes_scoped` /
+/// `find_best_node_scoped` callers were rewired to the
+/// `CapabilityFold` in Phase 3B; this filter still parameterizes
+/// the scope-axis decision on the fold side.
 ///
 /// `Any` reproduces v1 behavior for non-`SubnetLocal` peers but
 /// excludes peers that explicitly tagged themselves
@@ -2089,7 +2046,7 @@ impl CapabilityAnnouncement {
     /// Default `ttl_secs` value assigned by [`Self::new`]. Five
     /// minutes — long enough that a missed re-announcement on one
     /// node doesn't immediately evict it from every peer's
-    /// [`CapabilityIndex`], short enough that stale state clears on
+    /// capability fold, short enough that stale state clears on
     /// realistic operational timescales. Exposed as a constant so
     /// multi-hop dedup retention can be scaled off it.
     pub const DEFAULT_TTL_SECS: u32 = 300;
@@ -2560,1254 +2517,18 @@ impl CapabilityRequirement {
 }
 
 // ============================================================================
-// Capability Index
+// CardinalityProvider trait — used by the predicate planner for
+// per-key selectivity estimates. The legacy CapabilityIndex impl
+// was removed in Phase 3B of the multifold migration; downstream
+// users now bring their own provider (the fold side ships one
+// through `capability::CapabilityFold`).
 // ============================================================================
 
-/// Indexed node entry
-#[derive(Debug, Clone)]
-pub struct IndexedNode {
-    /// Node ID
-    pub node_id: u64,
-    /// Capability set
-    pub capabilities: CapabilitySet,
-    /// Version
-    pub version: u64,
-    /// When indexed
-    pub indexed_at: Instant,
-    /// TTL
-    pub ttl: Duration,
-    /// Peer's public-facing `SocketAddr` as advertised on the
-    /// announcement (stage 2 of `NAT_TRAVERSAL_PLAN.md`). `None`
-    /// when the sender was compiled without `nat-traversal` or
-    /// hasn't finished its classification sweep yet. Consumed by
-    /// the rendezvous coordinator (stage 3) — R looks up the
-    /// punch target's `reflex_addr` from the index instead of
-    /// probing it directly.
-    pub reflex_addr: Option<std::net::SocketAddr>,
-    /// Wire-form origin_hash for this node's entity: the low
-    /// 32 bits of `EntityId::origin_hash()`, zero-extended back
-    /// to `u64` so it matches the receiver-side
-    /// `NetHeader::origin_hash.into()` projection inside the
-    /// mesh dispatch path. Cached at index time so
-    /// [`CapabilityIndex::remove`] can clean up the
-    /// `by_origin_hash` side index without re-deriving the
-    /// projection (which would require either an `EntityId` clone
-    /// on every entry or a re-keying scan).
-    pub origin_hash: u64,
-    /// v0.4 capability-auth allow-list — explicit `NodeId`s that
-    /// may invoke any capability listed on this announcement.
-    /// Empty = permissive default. Carried verbatim from
-    /// [`CapabilityAnnouncement::allowed_nodes`].
-    pub allowed_nodes: Vec<u64>,
-    /// v0.4 capability-auth allow-list — subnet ids whose members
-    /// may invoke. Empty = permissive default. Carried from
-    /// [`CapabilityAnnouncement::allowed_subnets`].
-    pub allowed_subnets: Vec<super::subnet::SubnetId>,
-    /// v0.4 capability-auth allow-list — group ids whose
-    /// claimants may invoke. Empty = permissive default. Carried
-    /// from [`CapabilityAnnouncement::allowed_groups`].
-    pub allowed_groups: Vec<super::group::GroupId>,
-    /// Self-declared subnet membership parsed from a `subnet:<hex32>`
-    /// tag on the announcement. Resolves to `Some(s)` only when the
-    /// announcement carries exactly one distinct subnet tag; zero
-    /// or two-or-more distinct subnet tags collapse to `None`
-    /// (out-of-model malformed input → no membership). The
-    /// collapse keeps the gate's subnet-axis verdict deterministic
-    /// across receivers — a previous "first valid wins" strategy
-    /// was hash-order-dependent against `HashSet<Tag>` iteration.
-    pub subnet: Option<super::subnet::SubnetId>,
-    /// Self-declared group memberships parsed from every
-    /// `group:<hex64>` tag on the announcement. Sorted by byte
-    /// value so iteration order is stable across receivers
-    /// regardless of local hash randomization; duplicates removed.
-    pub groups: Vec<super::group::GroupId>,
-}
-
-/// One entry in the `by_origin_hash` side index.
-///
-/// `Single` is the common case — exactly one indexed `node_id`
-/// claims this wire hash. `Multiple` is the truncation-collision
-/// case; lookups return `None` so admission falls back to its
-/// publisher-unknown path. The `Vec` is sized for two-element
-/// adversarial cases — a real cluster sees zero or one entry per
-/// slot, and the allocation is amortized against the collision
-/// counter bump that already accompanies the transition.
-#[derive(Debug, Clone)]
-enum OriginHashSlot {
-    Single(u64),
-    Multiple(Vec<u64>),
-}
-
-impl OriginHashSlot {
-    /// Add `node_id`. Returns `true` on the *first* transition to
-    /// ambiguous state (Single → Multiple with a distinct id), so
-    /// callers can bump the collision counter exactly once per
-    /// new collision. Idempotent on re-add of the same id.
-    fn insert(&mut self, node_id: u64) -> bool {
-        match self {
-            Self::Single(existing) => {
-                if *existing == node_id {
-                    false
-                } else {
-                    *self = Self::Multiple(vec![*existing, node_id]);
-                    true
-                }
-            }
-            Self::Multiple(ids) => {
-                if !ids.contains(&node_id) {
-                    ids.push(node_id);
-                }
-                false
-            }
-        }
-    }
-
-    /// Remove `node_id`. Returns `true` when the slot is now
-    /// empty (caller drops the map entry). Demotes Multiple to
-    /// Single when only one claimant survives.
-    fn remove(&mut self, node_id: u64) -> bool {
-        match self {
-            Self::Single(existing) => *existing == node_id,
-            Self::Multiple(ids) => {
-                ids.retain(|id| *id != node_id);
-                match ids.len() {
-                    0 => true,
-                    1 => {
-                        *self = Self::Single(ids[0]);
-                        false
-                    }
-                    _ => false,
-                }
-            }
-        }
-    }
-
-    /// Resolve to a single `node_id`, or `None` when the slot is
-    /// ambiguous. Callers treat `None` as fail-closed for any
-    /// admission decision that consults publisher caps.
-    fn unique(&self) -> Option<u64> {
-        match self {
-            Self::Single(id) => Some(*id),
-            Self::Multiple(_) => None,
-        }
-    }
-}
-
-/// High-performance capability index with inverted indexes
-pub struct CapabilityIndex {
-    /// Node ID -> indexed node
-    nodes: DashMap<u64, IndexedNode>,
-    /// Inverted index: tag -> set of node IDs
-    by_tag: DashMap<String, HashSet<u64>>,
-    /// Inverted index: model ID -> set of node IDs
-    by_model: DashMap<String, HashSet<u64>>,
-    /// Inverted index: tool ID -> set of node IDs
-    by_tool: DashMap<String, HashSet<u64>>,
-    /// Inverted index: GPU vendor -> set of node IDs
-    by_gpu_vendor: DashMap<GpuVendor, HashSet<u64>>,
-    /// Inverted index: has GPU -> set of node IDs
-    gpu_nodes: DashMap<bool, HashSet<u64>>,
-    /// Inverted index: metadata key -> { value -> set of node IDs }.
-    ///
-    /// Phase 5.B follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md`.
-    /// Mirrors `by_tag` for the metadata side; lets the cardinality-
-    /// aware planner refine `MetadataEquals` / `MetadataExists` /
-    /// related leaf clauses with distinct-value counts (otherwise
-    /// they'd fall back to plain `static_cost`).
-    by_metadata: DashMap<String, DashMap<String, HashSet<u64>>>,
-    /// Inverted index: axis tag key -> { value -> set of node IDs }.
-    ///
-    /// Phase 4 follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md`.
-    /// Lets [`Self::axis_cardinality`] return O(1) instead of
-    /// O(N) over the full `by_tag` table — the planner reads it
-    /// once per leaf-clause-per-candidate, so the linear scan
-    /// would dominate hot-path evaluation. Presence-only axis
-    /// tags (`hardware.gpu` with no value) use the sentinel
-    /// empty string `""` as the inner key.
-    by_axis_key: DashMap<crate::adapter::net::behavior::tag::TagKey, DashMap<String, HashSet<u64>>>,
-    /// Side index: `wire origin_hash -> set of node_ids`.
-    ///
-    /// Wire packets carry the publisher's `origin_hash` as a u32
-    /// — the low 32 bits of `EntityId::origin_hash()` (BLAKE2s
-    /// projection under `net-origin-v1`) after `with_origin`'s
-    /// `as u32` truncation in
-    /// [`NetHeader`](crate::adapter::net::protocol::NetHeader).
-    /// Every other index keys on `node_id` (a separate projection
-    /// under `net-node-v1`). Without this side index, code paths
-    /// that have a wire origin_hash in hand (e.g. the inbound
-    /// packet header) need to walk every entry looking for a
-    /// matching tag or fall back to last-hop-peer heuristics —
-    /// both fragile under multi-hop relay. Direct lookup via
-    /// [`Self::get_by_origin_hash`] is O(1).
-    ///
-    /// Key shape is `u64` (zero-extended from the wire `u32`) to
-    /// match the receiver-side `parsed.header.origin_hash.into()`
-    /// projection inside `process_local_packet`.
-    ///
-    /// ## Collision behavior — fail-closed on ambiguity
-    ///
-    /// Two distinct entities can collide on the wire u32 (birthday
-    /// paradox at ~2¹⁶ entities). The slot tracks every `node_id`
-    /// claiming a given wire hash. [`Self::get_by_origin_hash`]
-    /// returns `Some(caps)` only when exactly one `node_id` is
-    /// mapped — when two or more claim the same slot the lookup
-    /// returns `None`, the caller falls back to its
-    /// publisher-unknown path, and scope/intent/colocation
-    /// admission fails closed. A deliberately-colliding peer can
-    /// therefore *suppress* a victim's caps from the admission
-    /// surface, but **cannot impersonate them** to widen scope.
-    /// The authorization surface is unaffected either way (ACLs
-    /// key on `ChannelHash` / `node_id`, not wire `origin_hash`).
-    ///
-    /// `collision_count` below increments on every fresh
-    /// transition from one claimant to two (i.e. the first time a
-    /// slot becomes ambiguous); operators dashboard it to detect
-    /// truncation-collision attacks. A full fix to disambiguate
-    /// requires widening the wire `origin_hash` to `u64`
-    /// (wire-format break), out of scope for v0.2.
-    by_origin_hash: DashMap<u64, OriginHashSlot>,
-    /// Version tracking
-    versions: DashMap<u64, u64>,
-    /// Stats
-    index_count: AtomicU64,
-    query_count: AtomicU64,
-    /// Cumulative count of wire-origin_hash collisions detected
-    /// at `index()` time — bumped when the `by_origin_hash` slot
-    /// for a wire hash is overwritten by a different `node_id`.
-    /// See the docstring on `by_origin_hash` for the DoS surface
-    /// this counter surfaces. Read via [`Self::collision_count`].
-    origin_hash_collisions: AtomicU64,
-    /// Monotonic mutation version. Incremented on every
-    /// [`Self::index`], [`Self::remove`], and [`Self::gc`] call
-    /// — i.e. anything that can change observable capability
-    /// state. Read via [`Self::version`]; used by the MeshDB
-    /// result cache to pull-invalidate stale entries (per the
-    /// MeshDB plan's locked decision #4). Per design we bump
-    /// aggressively: if a workload sees too many invalidations
-    /// the fix is `bypass_cache` or `CachePolicy::Permanent` on
-    /// the affected queries, not softening this bump.
-    mutation_version: AtomicU64,
-}
-
-impl CapabilityIndex {
-    /// Create new capability index
-    pub fn new() -> Self {
-        Self {
-            nodes: DashMap::new(),
-            by_tag: DashMap::new(),
-            by_model: DashMap::new(),
-            by_tool: DashMap::new(),
-            by_gpu_vendor: DashMap::new(),
-            gpu_nodes: DashMap::new(),
-            by_metadata: DashMap::new(),
-            by_axis_key: DashMap::new(),
-            by_origin_hash: DashMap::new(),
-            versions: DashMap::new(),
-            index_count: AtomicU64::new(0),
-            query_count: AtomicU64::new(0),
-            origin_hash_collisions: AtomicU64::new(0),
-            mutation_version: AtomicU64::new(0),
-        }
-    }
-
-    /// Monotonic mutation version. Bumps on every `index` /
-    /// `remove` / `gc` call. The MeshDB result cache snapshots
-    /// this at plan time and compares on lookup; any divergence
-    /// is treated as a cache miss (pull-based invalidation).
-    pub fn version(&self) -> u64 {
-        self.mutation_version.load(Ordering::Acquire)
-    }
-
-    /// Index a capability announcement.
-    ///
-    /// Rejects `is_expired()` up-front, and when computing the
-    /// entry's TTL, takes the lesser of "now + ttl_secs" and
-    /// "origin_timestamp + ttl_secs" so a clock-skew or replay
-    /// scenario doesn't extend the announcement's effective
-    /// lifetime past what the origin signed.
-    ///
-    /// Without these checks, the index would happily accept an
-    /// old (still cryptographically valid) announcement and store
-    /// `ttl: Duration::from_secs(ann.ttl_secs)` from
-    /// `Instant::now()`, making the index entry alive for
-    /// `ttl_secs` seconds *from local indexing time*. An attacker
-    /// could replay a saved announcement to a fresh node and get
-    /// the stale capabilities reinstated with a fresh local
-    /// lease — useful for re-introducing a model/tag/scope an
-    /// operator deliberately removed, or an old `reflex_addr` to
-    /// misdirect NAT traversal.
-    pub fn index(&self, ann: CapabilityAnnouncement) {
-        // Reject already-expired announcements, but exempt the
-        // legitimate `ttl_secs == 0` "announce-and-forget"
-        // diagnostic case — those are intentionally short-lived
-        // and the next `gc()` sweep evicts them (see
-        // `gc_evicts_entries_with_ttl_zero`).
-        if ann.ttl_secs > 0 && ann.is_expired() {
-            return;
-        }
-
-        let node_id = ann.node_id;
-
-        // Hold the versions entry across the whole update. This serializes
-        // concurrent indexers for the same node_id and prevents a TOCTOU
-        // where thread A's stale version v10 could overwrite thread B's
-        // already-committed v11 between the version check and nodes.insert.
-        // Lock ordering: versions before nodes (see `remove`).
-        use dashmap::mapref::entry::Entry;
-        let _version_guard = match self.versions.entry(node_id) {
-            Entry::Occupied(mut e) => {
-                if ann.version <= *e.get() {
-                    return;
-                }
-                *e.get_mut() = ann.version;
-                e.into_ref()
-            }
-            Entry::Vacant(e) => e.insert(ann.version),
-        };
-
-        // Remove old entries from inverted indexes
-        if let Some(old) = self.nodes.get(&node_id) {
-            self.remove_from_indexes(node_id, &old.capabilities);
-        }
-
-        // Add to inverted indexes
-        self.add_to_indexes(node_id, &ann.capabilities);
-
-        // Cap the local TTL by the origin's remaining lifetime.
-        // `origin_remaining_ns = ann.timestamp_ns +
-        // ttl_secs*1e9 - now_ns`. If positive, that's the
-        // remaining lifetime according to the origin. The local
-        // TTL is `min(local_ttl, origin_remaining)` so a replayed
-        // announcement near its origin-side expiry doesn't get a
-        // freshly-extended local lease.
-        let local_ttl = Duration::from_secs(ann.ttl_secs as u64);
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
-            .unwrap_or(0);
-        let origin_expiry_ns = ann
-            .timestamp_ns
-            .saturating_add((ann.ttl_secs as u64).saturating_mul(1_000_000_000));
-        let origin_remaining_ns = origin_expiry_ns.saturating_sub(now_ns);
-        let origin_remaining = Duration::from_nanos(origin_remaining_ns);
-        let effective_ttl = local_ttl.min(origin_remaining);
-
-        // Store node. The wire form of `origin_hash` is the low
-        // 32 bits of the entity projection (see `with_origin`'s
-        // truncation in NetHeader); reproduce that here so the
-        // side index keys match what receivers compute.
-        let origin_hash = (ann.entity_id.origin_hash() as u32) as u64;
-        // Parse subnet/group membership from the announcement's
-        // own tags so the capability-auth gate (`may_execute`) can
-        // resolve caller membership without re-walking the tag set
-        // on every check. Subnet membership is single-valued by
-        // design: exactly one distinct `subnet:<hex32>` tag →
-        // `Some(s)`; zero or multiple distinct tags collapse to
-        // `None` (treating multiples as out-of-model malformed
-        // input keeps the gate's verdict deterministic across
-        // receivers — `HashSet<Tag>` iteration order is unspecified
-        // so "first valid wins" would be hash-order-dependent).
-        // All distinct `group:<hex64>` tags accumulate, sorted by
-        // byte value, deduplicated by Eq.
-        let (parsed_subnet, parsed_groups) = parse_membership_tags(&ann.capabilities.tags);
-        let indexed = IndexedNode {
-            node_id,
-            capabilities: ann.capabilities,
-            version: ann.version,
-            indexed_at: Instant::now(),
-            ttl: effective_ttl,
-            reflex_addr: ann.reflex_addr,
-            origin_hash,
-            allowed_nodes: ann.allowed_nodes,
-            allowed_subnets: ann.allowed_subnets,
-            allowed_groups: ann.allowed_groups,
-            subnet: parsed_subnet,
-            groups: parsed_groups,
-        };
-        self.nodes.insert(node_id, indexed);
-        // Track collisions on the side index. A fresh Single
-        // slot is the common case; the Occupied branch merges the
-        // new node_id into the existing slot, bumping the
-        // collision counter on the first transition from one
-        // claimant to two distinct ones. See the collision-
-        // behavior docstring on `by_origin_hash`.
-        match self.by_origin_hash.entry(origin_hash) {
-            dashmap::mapref::entry::Entry::Vacant(slot) => {
-                slot.insert(OriginHashSlot::Single(node_id));
-            }
-            dashmap::mapref::entry::Entry::Occupied(mut slot) => {
-                if slot.get_mut().insert(node_id) {
-                    self.origin_hash_collisions.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-
-        self.index_count.fetch_add(1, Ordering::Relaxed);
-        self.mutation_version.fetch_add(1, Ordering::AcqRel);
-    }
-
-    /// Remove node from index
-    pub fn remove(&self, node_id: u64) {
-        use dashmap::mapref::entry::Entry;
-        // Hold the versions shard lock across the whole cleanup so a
-        // concurrent `index(ann)` for this node_id serializes against us.
-        // Without this, the sequence (versions.remove → index inserts
-        // fresh version+node → nodes.remove clobbers the new entry) is
-        // observable as a lost update. Lock ordering: versions before
-        // nodes, matching `index`.
-        let version_entry = self.versions.entry(node_id);
-        if let Some((_, node)) = self.nodes.remove(&node_id) {
-            self.remove_from_indexes(node_id, &node.capabilities);
-            // Tear down this node's claim on the origin_hash slot.
-            // Other colliding claimants stay; the slot is dropped
-            // only when no node_id remains.
-            if let dashmap::mapref::entry::Entry::Occupied(mut slot) =
-                self.by_origin_hash.entry(node.origin_hash)
-            {
-                if slot.get_mut().remove(node_id) {
-                    slot.remove();
-                }
-            }
-        }
-        if let Entry::Occupied(e) = version_entry {
-            e.remove();
-        }
-        self.mutation_version.fetch_add(1, Ordering::AcqRel);
-    }
-
-    /// Add node to inverted indexes.
-    ///
-    /// On the steady-state re-announcement path (peer re-broadcasts
-    /// the same `CapabilitySet` periodically), the inverted-index
-    /// entries for its tags / models / tools already exist. We do a
-    /// borrowing `get_mut` first and only fall through to the
-    /// owned-key `entry()` insert on a true cache miss — this skips
-    /// the per-tag `String` clone for every existing key. The
-    /// fallback is still atomic via DashMap's `entry().or_default()`,
-    /// so concurrent first-time inserts of the same key are safe
-    /// (the loser pays a redundant clone, which is the original
-    /// cost; correctness is unchanged).
-    fn add_to_indexes(&self, node_id: u64, caps: &CapabilitySet) {
-        // Phase A.5.5: read through views() once. `caps.tags` stays
-        // direct because tags are not part of the typed-struct
-        // projection (they're carried through `CapabilitySet::tags`
-        // independently and survive Phase A.5.N).
-        let views = caps.views();
-
-        // Tags. `by_tag` is keyed by `String` (the wire-form
-        // rendering) so query() can look up tags by their string
-        // representation regardless of which Tag variant they
-        // round-trip through. Phase A.5.N.2: render Tag → wire string.
-        //
-        // Phase 4 follow-on: also populate `by_axis_key` for axis-
-        // shaped tags so axis_cardinality is O(1).
-        for tag in &caps.tags {
-            let key = tag.to_string();
-            if let Some(mut set) = self.by_tag.get_mut(&key) {
-                set.insert(node_id);
-            } else {
-                self.by_tag.entry(key).or_default().insert(node_id);
-            }
-
-            // Mirror axis-shaped tags into `by_axis_key`.
-            // AxisPresent: value sentinel `""`. AxisValue: the
-            // actual value. Reserved / Legacy variants don't
-            // surface here (no axis_key).
-            use crate::adapter::net::behavior::tag::Tag as TagEnum;
-            let (axis_key, value) = match tag {
-                TagEnum::AxisPresent { axis, key } => (
-                    crate::adapter::net::behavior::tag::TagKey::new(*axis, key.clone()),
-                    String::new(),
-                ),
-                TagEnum::AxisValue {
-                    axis, key, value, ..
-                } => (
-                    crate::adapter::net::behavior::tag::TagKey::new(*axis, key.clone()),
-                    value.clone(),
-                ),
-                _ => continue,
-            };
-            let inner = self.by_axis_key.entry(axis_key).or_default();
-            inner.entry(value).or_default().insert(node_id);
-        }
-
-        // Models
-        for model in views.models() {
-            if let Some(mut set) = self.by_model.get_mut(&model.model_id) {
-                set.insert(node_id);
-            } else {
-                self.by_model
-                    .entry(model.model_id.clone())
-                    .or_default()
-                    .insert(node_id);
-            }
-        }
-
-        // Tools
-        for tool in views.tools() {
-            if let Some(mut set) = self.by_tool.get_mut(&tool.tool_id) {
-                set.insert(node_id);
-            } else {
-                self.by_tool
-                    .entry(tool.tool_id.clone())
-                    .or_default()
-                    .insert(node_id);
-            }
-        }
-
-        // GPU. Key is `bool`, no allocation either way.
-        let has_gpu = views.hardware().has_gpu();
-        self.gpu_nodes.entry(has_gpu).or_default().insert(node_id);
-
-        if let Some(vendor) = views.hardware().gpu_vendor() {
-            // Vendor key is `Copy` (small enum), so the entry-only
-            // form is already allocation-free.
-            self.by_gpu_vendor
-                .entry(vendor)
-                .or_default()
-                .insert(node_id);
-        }
-
-        // Metadata: track per-key distinct values so the cardinality-
-        // aware planner can score MetadataEquals / MetadataExists
-        // leaves. Mirrors `by_tag` for the metadata side.
-        for (k, v) in &caps.metadata {
-            // Outer entry: key. Inner entry: value → node IDs.
-            let inner = self.by_metadata.entry(k.clone()).or_default();
-            inner.entry(v.clone()).or_default().insert(node_id);
-        }
-    }
-
-    /// Remove node from inverted indexes.
-    ///
-    /// After each `HashSet::remove`, the outer-map entry is dropped
-    /// if the inner set is now empty. Without that drop, ephemeral
-    /// tag / model-id / tool-id / vendor keys accumulated as empty
-    /// `HashSet` shells in the outer `DashMap`s — a slow unbounded
-    /// leak over long-running deployments with high peer churn.
-    fn remove_from_indexes(&self, node_id: u64, caps: &CapabilitySet) {
-        // Phase A.5.5: read through views() once — mirrors
-        // `add_to_indexes` so add/remove see the same projection.
-        let views = caps.views();
-
-        // Tags
-        for tag in &caps.tags {
-            let key = tag.to_string();
-            if let Some(mut set) = self.by_tag.get_mut(&key) {
-                set.remove(&node_id);
-            }
-            self.by_tag.remove_if(&key, |_, set| set.is_empty());
-
-            // Mirror prune in by_axis_key for axis-shaped tags.
-            use crate::adapter::net::behavior::tag::Tag as TagEnum;
-            let (axis_key, value) = match tag {
-                TagEnum::AxisPresent { axis, key } => (
-                    crate::adapter::net::behavior::tag::TagKey::new(*axis, key.clone()),
-                    String::new(),
-                ),
-                TagEnum::AxisValue {
-                    axis, key, value, ..
-                } => (
-                    crate::adapter::net::behavior::tag::TagKey::new(*axis, key.clone()),
-                    value.clone(),
-                ),
-                _ => continue,
-            };
-            let mut inner_now_empty = false;
-            if let Some(inner) = self.by_axis_key.get(&axis_key) {
-                if let Some(mut set) = inner.get_mut(&value) {
-                    set.remove(&node_id);
-                }
-                inner.remove_if(&value, |_, set| set.is_empty());
-                inner_now_empty = inner.is_empty();
-            }
-            if inner_now_empty {
-                self.by_axis_key
-                    .remove_if(&axis_key, |_, inner| inner.is_empty());
-            }
-        }
-
-        // Models
-        for model in views.models() {
-            if let Some(mut set) = self.by_model.get_mut(&model.model_id) {
-                set.remove(&node_id);
-            }
-            self.by_model
-                .remove_if(&model.model_id, |_, set| set.is_empty());
-        }
-
-        // Tools
-        for tool in views.tools() {
-            if let Some(mut set) = self.by_tool.get_mut(&tool.tool_id) {
-                set.remove(&node_id);
-            }
-            self.by_tool
-                .remove_if(&tool.tool_id, |_, set| set.is_empty());
-        }
-
-        // GPU (two-value bucket; entries are intentionally permanent
-        // because lookups for both `true` and `false` are expected).
-        let has_gpu = views.hardware().has_gpu();
-        if let Some(mut set) = self.gpu_nodes.get_mut(&has_gpu) {
-            set.remove(&node_id);
-        }
-
-        if let Some(vendor) = views.hardware().gpu_vendor() {
-            if let Some(mut set) = self.by_gpu_vendor.get_mut(&vendor) {
-                set.remove(&node_id);
-            }
-            self.by_gpu_vendor
-                .remove_if(&vendor, |_, set| set.is_empty());
-        }
-
-        // Metadata: drop this node's contribution from each
-        // (key, value) entry; prune empty inner / outer entries
-        // so the by_metadata index doesn't accumulate empty
-        // shells across high-churn deployments.
-        for (k, v) in &caps.metadata {
-            let mut inner_now_empty = false;
-            if let Some(inner) = self.by_metadata.get(k) {
-                if let Some(mut set) = inner.get_mut(v) {
-                    set.remove(&node_id);
-                }
-                inner.remove_if(v, |_, set| set.is_empty());
-                inner_now_empty = inner.is_empty();
-            }
-            if inner_now_empty {
-                self.by_metadata.remove_if(k, |_, inner| inner.is_empty());
-            }
-        }
-    }
-
-    /// Walk the inverted indexes to build the candidate set narrowed
-    /// by `filter`'s indexed predicates (GPU, vendor, tags, models,
-    /// tools). Returns:
-    ///
-    /// - `Some(set)` when at least one indexed predicate applied. The
-    ///   set may be empty, in which case downstream filtering trivially
-    ///   yields no results.
-    /// - `None` when the filter has zero indexed predicates — callers
-    ///   fall back to "all nodes" before applying any non-indexed
-    ///   predicates.
-    fn build_candidate_set(&self, filter: &CapabilityFilter) -> Option<Vec<u64>> {
-        // Per perf #110: switched return + working set from
-        // `HashSet<u64>` to `Vec<u64>` so subsequent intersections
-        // can run as in-place `Vec::retain(|n| index.contains(n))`
-        // instead of `c.intersection(&set).copied().collect()`
-        // (which allocates a fresh HashSet per filter clause).
-        // The first matched filter materializes via
-        // `.iter().copied().collect()` (one Vec alloc). Each
-        // subsequent indexed clause is a borrow + retain — no
-        // new container allocated. The inverted-index entries are
-        // already deduplicated (they're `HashSet<u64>` internally)
-        // so the initial materialization is unique; `retain`
-        // preserves that invariant.
-        let mut candidates: Option<Vec<u64>> = None;
-
-        // GPU filter (most selective often)
-        if filter.require_gpu {
-            match self.gpu_nodes.get(&true) {
-                Some(gpu_nodes) => candidates = Some(gpu_nodes.iter().copied().collect()),
-                None => return Some(Vec::new()),
-            }
-        }
-
-        // GPU vendor filter
-        if let Some(vendor) = filter.gpu_vendor {
-            match self.by_gpu_vendor.get(&vendor) {
-                Some(vendor_nodes) => match &mut candidates {
-                    Some(c) => c.retain(|n| vendor_nodes.contains(n)),
-                    None => candidates = Some(vendor_nodes.iter().copied().collect()),
-                },
-                None => return Some(Vec::new()),
-            }
-        }
-
-        // Tag filter (all required)
-        for tag in &filter.require_tags {
-            match self.by_tag.get(tag) {
-                Some(tag_nodes) => match &mut candidates {
-                    Some(c) => c.retain(|n| tag_nodes.contains(n)),
-                    None => candidates = Some(tag_nodes.iter().copied().collect()),
-                },
-                None => return Some(Vec::new()),
-            }
-        }
-
-        // Model filter (any required). The union across multiple
-        // model names still wants set semantics for deduplication
-        // — keep the temporary `HashSet` for that union, then
-        // intersect it with `candidates` via the same retain
-        // pattern (or seed `candidates` from it on first match).
-        if !filter.require_models.is_empty() {
-            let mut model_candidates: HashSet<u64> = HashSet::new();
-            for model in &filter.require_models {
-                if let Some(model_nodes) = self.by_model.get(model) {
-                    model_candidates.extend(model_nodes.iter());
-                }
-            }
-            if model_candidates.is_empty() {
-                return Some(Vec::new());
-            }
-            match &mut candidates {
-                Some(c) => c.retain(|n| model_candidates.contains(n)),
-                None => candidates = Some(model_candidates.into_iter().collect()),
-            }
-        }
-
-        // Tool filter (any required)
-        if !filter.require_tools.is_empty() {
-            let mut tool_candidates: HashSet<u64> = HashSet::new();
-            for tool in &filter.require_tools {
-                if let Some(tool_nodes) = self.by_tool.get(tool) {
-                    tool_candidates.extend(tool_nodes.iter());
-                }
-            }
-            if tool_candidates.is_empty() {
-                return Some(Vec::new());
-            }
-            match &mut candidates {
-                Some(c) => c.retain(|n| tool_candidates.contains(n)),
-                None => candidates = Some(tool_candidates.into_iter().collect()),
-            }
-        }
-
-        candidates
-    }
-
-    /// Find indexed nodes whose capabilities match `predicate`.
-    ///
-    /// Linear scan over the indexed-node table; each node's
-    /// capabilities are evaluated against `predicate` via the
-    /// cardinality-aware planner ([`super::predicate::Predicate::evaluate_with_index`]).
-    /// `Self` provides the cardinality data — the same index that
-    /// holds the candidates also informs the planner's clause
-    /// ordering, so high-cardinality discriminating clauses run
-    /// first.
-    ///
-    /// Phase 5.B follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md`.
-    /// Bridges the substrate's `CapabilityIndex` with the
-    /// `Predicate` AST so applications can do predicate-based
-    /// discovery without building a `CapabilityFilter`.
-    ///
-    /// Cost: O(N) where N is the number of indexed nodes. Each
-    /// per-node check materializes the node's tags as a Vec for
-    /// the slice-based `EvalContext` — for hot loops over many
-    /// predicates against the same index, callers may prefer to
-    /// pre-extract a `Vec<(u64, Vec<Tag>, BTreeMap)>` once and
-    /// reuse it.
-    ///
-    /// Returns matching node IDs in unspecified order. Callers
-    /// that need a deterministic order should sort.
-    pub fn find_nodes_matching(
-        &self,
-        predicate: &crate::adapter::net::behavior::Predicate,
-    ) -> Vec<u64> {
-        let mut matched = Vec::new();
-        for entry in self.nodes.iter() {
-            let node_id = *entry.key();
-            let caps = &entry.value().capabilities;
-            // Materialize tags for the slice-based EvalContext.
-            let tags: Vec<Tag> = caps.tags.iter().cloned().collect();
-            let ctx = crate::adapter::net::behavior::EvalContext::new(&tags, &caps.metadata);
-            if predicate.evaluate_with_index(&ctx, self) {
-                matched.push(node_id);
-            }
-        }
-        matched
-    }
-
-    /// Distinct-value cardinality for a metadata key.
-    ///
-    /// Returns the count of distinct values seen for `key` across
-    /// all currently-indexed nodes. The cardinality-aware planner
-    /// uses this as a selectivity proxy for `MetadataEquals` /
-    /// `MetadataExists` / similar leaves, parallel to
-    /// [`Self::axis_cardinality`] for axis tags.
-    ///
-    /// Cost: O(1) — looks up the inner DashMap size; no scan.
-    /// `by_metadata` maintains distinct-value tracking incrementally
-    /// during `add_to_indexes` / `remove_from_indexes`.
-    ///
-    /// Returns 0 when the key is absent from the index. The
-    /// planner falls back to `static_cost` in that case.
-    pub fn metadata_value_cardinality(&self, key: &str) -> usize {
-        self.by_metadata
-            .get(key)
-            .map(|inner| inner.len())
-            .unwrap_or(0)
-    }
-
-    /// Distinct-value cardinality for an axis tag key.
-    ///
-    /// Returns the number of distinct values seen for the given
-    /// `(axis, key)` across all currently-indexed nodes. Used by
-    /// the predicate query planner (Phase 4 of
-    /// `CAPABILITY_ENHANCEMENTS_PLAN.md`) as a selectivity proxy:
-    /// a key with high cardinality has many possible values, so a
-    /// predicate matching one of them is likely to filter most
-    /// candidates — run such clauses first in `And`.
-    ///
-    /// Cost: O(1) — looks up the inner DashMap size in the
-    /// dedicated `by_axis_key` index, maintained incrementally
-    /// during `add_to_indexes` / `remove_from_indexes`. Phase 4
-    /// follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md` replaced an
-    /// earlier O(N) scan over `by_tag` because the planner reads
-    /// this once per leaf-clause-per-candidate; the linear scan
-    /// dominated hot-path evaluation.
-    ///
-    /// Returns:
-    ///
-    /// - For value-bearing keys (`hardware.cpu_cores=...`,
-    ///   `hardware.gpu.vendor=...`): the count of distinct
-    ///   value strings seen. Presence-form (no value) entries
-    ///   under the same key, if any, count as one of those
-    ///   distinct values via the empty-string sentinel.
-    /// - For presence-only keys (`hardware.gpu`): `1` if any node
-    ///   has the marker, `0` otherwise.
-    /// - For unrecognized keys: `0`.
-    ///
-    /// Reserved-prefix tags (`scope:*`, `causal:*`, etc.) and
-    /// legacy untyped tags don't fit the axis taxonomy; this
-    /// primitive doesn't surface them.
-    pub fn axis_cardinality(&self, key: &crate::adapter::net::behavior::tag::TagKey) -> usize {
-        self.by_axis_key
-            .get(key)
-            .map(|inner| inner.len())
-            .unwrap_or(0)
-    }
-
-    /// Query nodes by filter
-    pub fn query(&self, filter: &CapabilityFilter) -> Vec<u64> {
-        self.query_count.fetch_add(1, Ordering::Relaxed);
-
-        let candidates = self
-            .build_candidate_set(filter)
-            .unwrap_or_else(|| self.nodes.iter().map(|r| *r.key()).collect());
-
-        // Re-check `filter.matches()` against each candidate's current
-        // `nodes` entry, even when the filter only constrains indexed
-        // dimensions. The inverted indexes update non-atomically with
-        // `nodes` (`remove_from_indexes` → `add_to_indexes` →
-        // `nodes.insert`), so during a re-announcement that swaps a
-        // capability set the inverted index can list a node under a
-        // tag/model/tool that the node's current `nodes` entry does
-        // not actually advertise. Skipping the re-check on a "fast
-        // path" lets that stale index leak into the result. The
-        // matches() call here re-verifies under the current
-        // capabilities and closes the window.
-        candidates
-            .into_iter()
-            .filter(|&node_id| {
-                self.nodes
-                    .get(&node_id)
-                    .map(|n| filter.matches(&n.capabilities))
-                    .unwrap_or(false)
-            })
-            .collect()
-    }
-
-    /// Find best matching node using requirements.
-    ///
-    /// Iterates the index-narrowed candidate set once, folding the
-    /// non-indexed-predicate check (when needed) and the score
-    /// computation into a single `nodes.get()` per candidate.
-    /// Previously this called [`Self::query`] and then re-fetched
-    /// each candidate again to score it — a double DashMap lookup
-    /// per candidate that has now collapsed to one.
-    pub fn find_best(&self, req: &CapabilityRequirement) -> Option<u64> {
-        self.query_count.fetch_add(1, Ordering::Relaxed);
-
-        let candidates = self
-            .build_candidate_set(&req.filter)
-            .unwrap_or_else(|| self.nodes.iter().map(|r| *r.key()).collect());
-
-        candidates
-            .into_iter()
-            .filter_map(|node_id| {
-                let node = self.nodes.get(&node_id)?;
-                // Always re-check the filter under the current
-                // capabilities — the inverted indexes update
-                // non-atomically with `nodes`, so a stale index can
-                // otherwise advance a candidate that no longer
-                // matches the filter into the scoring step. See
-                // `query()` for the same fix.
-                if !req.filter.matches(&node.capabilities) {
-                    return None;
-                }
-                Some((node_id, req.score(&node.capabilities)))
-            })
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(node_id, _)| node_id)
-    }
-
-    /// Like [`Self::query`], but additionally filters candidates
-    /// through a [`ScopeFilter`] derived from each node's
-    /// `scope:*` reserved tags. See `docs/SCOPED_CAPABILITIES_PLAN.md`
-    /// for the resolution rules.
-    ///
-    /// `same_subnet_lookup` is invoked at most once per candidate
-    /// — only when the filter is [`ScopeFilter::SameSubnet`] or
-    /// the candidate resolves to `SubnetLocal` (which always
-    /// requires same-subnet membership). The
-    /// closure should return `true` when the candidate's subnet
-    /// equals the caller's; for the warm-up case where one
-    /// side's subnet is unknown, callers default to permissive
-    /// (`true`), matching the channel-path warm-up behavior.
-    ///
-    /// The closure is supplied by the caller because
-    /// [`CapabilityIndex`] does not own subnet state — that
-    /// lives on `MeshNode::peer_subnets`.
-    pub fn find_nodes_scoped(
-        &self,
-        filter: &CapabilityFilter,
-        scope_filter: &ScopeFilter<'_>,
-        mut same_subnet_lookup: impl FnMut(u64) -> bool,
-    ) -> Vec<u64> {
-        // Per discovery-routing perf #112 — pre-fix this method did
-        // two passes: `self.query(filter)` walked the index and
-        // re-validated each candidate via a `self.nodes.get(node_id)`
-        // shard-lock acquisition, then the result `Vec<u64>` was
-        // re-walked here with a SECOND `self.get(node_id)` per node
-        // (which itself clones the `CapabilitySet`). For a 1000-node
-        // query that's 2000 DashMap probes + 1000 `CapabilitySet`
-        // clones — the second pass exists only to read `caps.tags`,
-        // which the first pass already held under its shard guard.
-        //
-        // Fold scope resolution into one pass over the candidate set:
-        // resolve the `CapabilitySet` once (under the same shard
-        // guard that re-validates `filter.matches`) and read
-        // `caps.tags` directly from the borrowed entry instead of
-        // re-fetching. Saves N DashMap lookups + N `CapabilitySet`
-        // clones per scoped query (`CapabilitySet` contains `String`,
-        // `HashSet`, `Vec` fields — the clone is non-trivial on
-        // realistic announcements).
-        self.query_count.fetch_add(1, Ordering::Relaxed);
-
-        let candidates = self
-            .build_candidate_set(filter)
-            .unwrap_or_else(|| self.nodes.iter().map(|r| *r.key()).collect());
-
-        candidates
-            .into_iter()
-            .filter_map(|node_id| {
-                // Single shard-lock acquisition per candidate. The
-                // `filter.matches` re-check closes the stale-index
-                // window described on `query()`; the scope resolution
-                // reads from the same borrowed `node.capabilities`
-                // so the second lookup vanishes.
-                let node = self.nodes.get(&node_id)?;
-                if !filter.matches(&node.capabilities) {
-                    return None;
-                }
-                let scope = scope_from_tags(&node.capabilities.tags);
-                let needs_subnet = matches!(scope_filter, ScopeFilter::SameSubnet)
-                    || matches!(scope, CapabilityScope::SubnetLocal);
-                let same_subnet = if needs_subnet {
-                    same_subnet_lookup(node_id)
-                } else {
-                    false
-                };
-                if !matches_scope(&scope, scope_filter, same_subnet) {
-                    return None;
-                }
-                Some(node_id)
-            })
-            .collect()
-    }
-
-    /// Scoped variant of [`Self::find_best`]. Same scope-resolution
-    /// semantics as [`Self::find_nodes_scoped`]; selection picks the
-    /// highest-scoring candidate within the scoped set.
-    pub fn find_best_node_scoped(
-        &self,
-        req: &CapabilityRequirement,
-        scope_filter: &ScopeFilter<'_>,
-        mut same_subnet_lookup: impl FnMut(u64) -> bool,
-    ) -> Option<u64> {
-        self.query_count.fetch_add(1, Ordering::Relaxed);
-
-        let candidates = self
-            .build_candidate_set(&req.filter)
-            .unwrap_or_else(|| self.nodes.iter().map(|r| *r.key()).collect());
-
-        candidates
-            .into_iter()
-            .filter_map(|node_id| {
-                let node = self.nodes.get(&node_id)?;
-                if !req.filter.matches(&node.capabilities) {
-                    return None;
-                }
-                let scope = scope_from_tags(&node.capabilities.tags);
-                let needs_subnet = matches!(scope_filter, ScopeFilter::SameSubnet)
-                    || matches!(scope, CapabilityScope::SubnetLocal);
-                let same_subnet = if needs_subnet {
-                    same_subnet_lookup(node_id)
-                } else {
-                    false
-                };
-                if !matches_scope(&scope, scope_filter, same_subnet) {
-                    return None;
-                }
-                Some((node_id, req.score(&node.capabilities)))
-            })
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(node_id, _)| node_id)
-    }
-
-    /// Get node capabilities
-    pub fn get(&self, node_id: u64) -> Option<CapabilitySet> {
-        self.nodes.get(&node_id).map(|n| n.capabilities.clone())
-    }
-
-    /// Look up a node's `CapabilitySet` by `EntityId::origin_hash()`
-    /// rather than `node_id`. Wire packets carry the publisher's
-    /// `origin_hash` (a BLAKE2s projection of the entity key under
-    /// the `net-origin-v1` domain); the index keys on `node_id`
-    /// (a separate projection under `net-node-v1`). This accessor
-    /// bridges the two via the `by_origin_hash` side index so a
-    /// packet-side caller doesn't need to walk every entry.
-    ///
-    /// Returns `None` when either:
-    ///
-    /// 1. No announcement carrying that origin_hash has reached
-    ///    this node yet.
-    /// 2. Two or more distinct `node_id`s have claimed the same
-    ///    wire `origin_hash` (a truncation collision — see the
-    ///    collision-behavior docstring on `by_origin_hash`).
-    ///
-    /// Both cases are fail-closed for scope / intent / colocation
-    /// admission: the caller cannot tell them apart and treats a
-    /// missing result as "publisher unknown."
-    pub fn get_by_origin_hash(&self, origin_hash: u64) -> Option<CapabilitySet> {
-        let node_id = {
-            let slot = self.by_origin_hash.get(&origin_hash)?;
-            slot.unique()?
-        };
-        self.get(node_id)
-    }
-
-    /// Cumulative count of wire-`origin_hash` collisions detected
-    /// at `index()` time. Bumped every time a slot transitions
-    /// from one claimant to two distinct `node_id`s — i.e. the
-    /// first time the slot becomes ambiguous. Re-asserting a
-    /// node_id that already shares the slot is idempotent and
-    /// does not bump.
-    ///
-    /// Operators monitor this counter to detect deliberate
-    /// truncation-collision attacks against the scope-axis
-    /// admission gate — see the collision-behavior docstring on
-    /// `by_origin_hash` above. A non-zero count on a production
-    /// cluster is a signal worth investigating; the collision
-    /// itself doesn't bypass authorization or impersonate the
-    /// victim's caps, but the *victim's* caps are suppressed from
-    /// `get_by_origin_hash` for the duration of the collision.
-    pub fn collision_count(&self) -> u64 {
-        self.origin_hash_collisions.load(Ordering::Relaxed)
-    }
-
-    /// `true` when two or more distinct `node_id`s currently
-    /// claim the same wire `origin_hash`. Distinct from
-    /// "publisher not yet announced" (slot vacant) — the dispatch
-    /// path uses this to fail-closed on adversarial collision
-    /// while keeping the empty-caps fallback for the benign
-    /// cap-propagation race where the publisher's announcement
-    /// just hasn't arrived yet.
-    pub fn is_origin_hash_ambiguous(&self, origin_hash: u64) -> bool {
-        self.by_origin_hash
-            .get(&origin_hash)
-            .map(|slot| slot.unique().is_none())
-            .unwrap_or(false)
-    }
-
-    /// Run `f` against the node's `CapabilitySet` without cloning.
-    ///
-    /// Holds the `DashMap` shard's read lock for the duration of
-    /// the closure — `f` MUST NOT acquire any other index locks
-    /// (e.g. via `find_nodes` / `query`), or it'll deadlock
-    /// against a concurrent insert. Use [`Self::get`] when the
-    /// result needs to outlive the scoring call.
-    ///
-    /// Hot-path use: `StandardPlacement::placement_score` calls
-    /// this once per scoring decision, dispatching the in-tree
-    /// axes against the borrowed caps. Saves the `CapabilitySet`
-    /// clone per scoring call (a HashSet + BTreeMap allocation
-    /// pair), which dominates the per-candidate cost in benches.
-    pub fn with_caps<R>(&self, node_id: u64, f: impl FnOnce(&CapabilitySet) -> R) -> Option<R> {
-        self.nodes.get(&node_id).map(|n| f(&n.capabilities))
-    }
-
-    /// Get the peer's last-advertised reflex address from the
-    /// index. Returns `None` when the peer hasn't indexed, or
-    /// indexed a version with no `reflex_addr` attached. Consumed
-    /// by the rendezvous coordinator (stage 3) — R looks up the
-    /// punch target's public `SocketAddr` here.
-    pub fn reflex_addr(&self, node_id: u64) -> Option<std::net::SocketAddr> {
-        self.nodes.get(&node_id).and_then(|n| n.reflex_addr)
-    }
-
-    /// Caller's self-declared subnet membership, parsed from a
-    /// `subnet:<hex32>` tag on the caller's own announcement.
-    /// Returns `None` when the caller has no announcement yet or
-    /// emitted no `subnet:` tag. v0.4 capability-auth uses this
-    /// inside [`Self::may_execute`].
-    pub fn subnet_of(&self, node_id: u64) -> Option<super::subnet::SubnetId> {
-        self.nodes.get(&node_id).and_then(|n| n.subnet)
-    }
-
-    /// Caller's self-declared group memberships, parsed from
-    /// every `group:<hex64>` tag on the caller's own
-    /// announcement. Returns an empty Vec when the caller has no
-    /// announcement yet or emitted no `group:` tags. Order
-    /// matches the announcement's tag-set iteration order
-    /// (deterministic for a given index entry but not stable
-    /// across rebuilds).
-    pub fn groups_of(&self, node_id: u64) -> Vec<super::group::GroupId> {
-        self.nodes
-            .get(&node_id)
-            .map(|n| n.groups.clone())
-            .unwrap_or_default()
-    }
-
-    /// v0.4 capability-auth execute-gate. Returns `true` when
-    /// `caller_node` is allowed to invoke `capability_tag` on
-    /// `target_node`.
-    ///
-    /// See `docs/plans/CAPABILITY_AUTH_PLAN.md` §3 for the model.
-    /// The gate is permissive by default — an announcement with
-    /// all three allow-lists empty admits any caller. Once any
-    /// list is non-empty, the union of all three is enforced
-    /// (node OR subnet OR group); the scan short-circuits on the
-    /// first match.
-    ///
-    /// Returns `false` when:
-    /// - the target has no indexed announcement (you can't
-    ///   address what you can't see);
-    /// - the target's announcement doesn't list the requested
-    ///   `capability_tag`;
-    /// - the target restricts and the caller matches no axis.
-    ///
-    /// The caller's identity is taken from the wire binding only —
-    /// the gate does NOT consult the caller's own announcement
-    /// for capability claims. It does consult it for subnet /
-    /// group membership lookup, because that's the only place
-    /// self-declared membership lives.
-    pub fn may_execute(&self, target_node: u64, capability_tag: &str, caller_node: u64) -> bool {
-        let Some(target) = self.nodes.get(&target_node) else {
-            return false;
-        };
-        if !target.capabilities.has_tag(capability_tag) {
-            return false;
-        }
-        if target.allowed_nodes.is_empty()
-            && target.allowed_subnets.is_empty()
-            && target.allowed_groups.is_empty()
-        {
-            return true;
-        }
-        if target.allowed_nodes.contains(&caller_node) {
-            return true;
-        }
-        if !target.allowed_subnets.is_empty() {
-            if let Some(caller_subnet) = self.nodes.get(&caller_node).and_then(|n| n.subnet) {
-                if target.allowed_subnets.contains(&caller_subnet) {
-                    return true;
-                }
-            }
-        }
-        if !target.allowed_groups.is_empty() {
-            if let Some(caller_entry) = self.nodes.get(&caller_node) {
-                for group in &caller_entry.groups {
-                    if target.allowed_groups.contains(group) {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
-    }
-
-    /// Get all node IDs
-    pub fn all_nodes(&self) -> Vec<u64> {
-        self.nodes.iter().map(|r| *r.key()).collect()
-    }
-
-    /// Get node count
-    pub fn len(&self) -> usize {
-        self.nodes.len()
-    }
-
-    /// Check if empty
-    pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
-    }
-
-    /// Garbage collect expired entries
-    pub fn gc(&self) -> usize {
-        let now = Instant::now();
-        let mut removed = 0;
-
-        let expired: Vec<u64> = self
-            .nodes
-            .iter()
-            .filter(|r| now.duration_since(r.indexed_at) >= r.ttl)
-            .map(|r| *r.key())
-            .collect();
-
-        for node_id in expired {
-            self.remove(node_id);
-            removed += 1;
-        }
-
-        removed
-    }
-
-    /// Get statistics
-    pub fn stats(&self) -> CapabilityIndexStats {
-        CapabilityIndexStats {
-            node_count: self.nodes.len(),
-            tag_count: self.by_tag.len(),
-            model_count: self.by_model.len(),
-            tool_count: self.by_tool.len(),
-            total_indexed: self.index_count.load(Ordering::Relaxed),
-            total_queries: self.query_count.load(Ordering::Relaxed),
-        }
-    }
-}
-
-impl Default for CapabilityIndex {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// =============================================================================
-// CardinalityProvider trait + CardinalityCache — Phase 4 follow-on of
-// CAPABILITY_ENHANCEMENTS_PLAN.md "Cached cardinality estimates".
-//
-// `axis_cardinality` and `metadata_value_cardinality` on
-// `CapabilityIndex` are O(1) but each call hits DashMap — a sharded
-// lookup with atomic ops + per-shard locks. For the predicate
-// planner reading the same key many times in a hot evaluation
-// loop (one read per leaf-clause-per-candidate), the contention
-// cost compounds. `CardinalityCache` snapshots cardinality numbers
-// on first read and serves subsequent reads from a plain `HashMap`,
-// dropping the DashMap traffic.
-//
-// The cache is bound to a TTL — after `ttl` elapses, the next
-// access recomputes from the underlying index. Heartbeat-aligned
-// TTLs are the canonical use case (per-heartbeat planner snapshot).
-// =============================================================================
-
 /// Source of per-key cardinality data for the predicate query
-/// planner. Implemented by [`CapabilityIndex`] (direct, O(1) DashMap
-/// lookups) and [`CardinalityCache`] (TTL-cached, O(1) HashMap
-/// lookups after warmup).
-///
-/// The planner ([`crate::adapter::net::behavior::predicate::Predicate::evaluate_with_index`])
-/// is generic over this trait so callers pick whichever shape
-/// matches their workload — direct for single-shot evaluation,
-/// cache for hot-loop or long-lived service handlers.
+/// planner. Implementors return distinct-value counts for axis
+/// tag keys and metadata keys; the planner uses these to order
+/// And-clauses (rare-true first) and Or-clauses (often-true
+/// first) for early-out savings.
 pub trait CardinalityProvider {
     /// Distinct-value count for the given axis tag key. Returns 0
     /// when the key is absent — planner treats this as "no data,
@@ -3818,150 +2539,6 @@ pub trait CardinalityProvider {
     fn metadata_value_cardinality(&self, key: &str) -> usize;
 }
 
-impl CardinalityProvider for CapabilityIndex {
-    fn axis_cardinality(&self, key: &crate::adapter::net::behavior::tag::TagKey) -> usize {
-        // Inherent method (resolved via Rust's preference for
-        // inherent over trait when the receiver is concrete).
-        Self::axis_cardinality(self, key)
-    }
-
-    fn metadata_value_cardinality(&self, key: &str) -> usize {
-        Self::metadata_value_cardinality(self, key)
-    }
-}
-
-/// Per-call TTL cache around a [`CapabilityIndex`] for cardinality
-/// lookups.
-///
-/// Phase 4 follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md`. Drops
-/// DashMap shard contention on hot loops over many predicates
-/// against the same index by snapshotting cardinality numbers
-/// into a plain `HashMap` on first access. Subsequent reads of
-/// the same key skip the DashMap entirely.
-///
-/// The cache invalidates after `ttl` elapses — the next lookup
-/// past the deadline triggers a refresh (clear + reset deadline);
-/// fresh lookups go to the index again. Heartbeat-aligned TTLs
-/// are the canonical use case: a service handler builds a cache
-/// at the start of each heartbeat-bounded request batch, evaluates
-/// many predicates against it, then lets it drop.
-///
-/// Concurrent access is safe — internal `parking_lot::Mutex`
-/// guards the HashMap. Two threads racing on the same uncached
-/// key may both compute via the index (the work is idempotent),
-/// but neither will read stale data.
-///
-/// ```ignore
-/// let cache = CardinalityCache::new(&index, Duration::from_secs(5));
-/// for candidate in candidates {
-///     let ctx = build_eval_context(candidate);
-///     if predicate.evaluate_with_index(&ctx, &cache) { /* ... */ }
-/// }
-/// ```
-pub struct CardinalityCache<'a> {
-    index: &'a CapabilityIndex,
-    ttl: Duration,
-    state: parking_lot::Mutex<CardinalityCacheState>,
-}
-
-/// Inner state guarded by the cache's mutex.
-struct CardinalityCacheState {
-    deadline: Instant,
-    axis: std::collections::HashMap<crate::adapter::net::behavior::tag::TagKey, usize>,
-    metadata: std::collections::HashMap<String, usize>,
-}
-
-impl<'a> CardinalityCache<'a> {
-    /// Build a cache bound to `index` with `ttl` lifetime. The
-    /// cache's deadline starts at `Instant::now() + ttl`.
-    pub fn new(index: &'a CapabilityIndex, ttl: Duration) -> Self {
-        Self {
-            index,
-            ttl,
-            state: parking_lot::Mutex::new(CardinalityCacheState {
-                deadline: Instant::now() + ttl,
-                axis: std::collections::HashMap::new(),
-                metadata: std::collections::HashMap::new(),
-            }),
-        }
-    }
-
-    /// True if the cache's TTL has elapsed.
-    pub fn is_expired(&self) -> bool {
-        Instant::now() >= self.state.lock().deadline
-    }
-
-    /// Force-refresh the cache: clear all entries and reset the
-    /// deadline to `now + ttl`. Called automatically when an
-    /// access notices the cache is expired; callers can invoke
-    /// directly to align with their own heartbeat.
-    pub fn refresh(&self) {
-        let mut guard = self.state.lock();
-        guard.deadline = Instant::now() + self.ttl;
-        guard.axis.clear();
-        guard.metadata.clear();
-    }
-}
-
-impl CardinalityProvider for CardinalityCache<'_> {
-    fn axis_cardinality(&self, key: &crate::adapter::net::behavior::tag::TagKey) -> usize {
-        // Acquire the lock once per call; check deadline and
-        // cache under the same critical section to avoid TOCTOU.
-        {
-            let mut guard = self.state.lock();
-            if Instant::now() >= guard.deadline {
-                guard.deadline = Instant::now() + self.ttl;
-                guard.axis.clear();
-                guard.metadata.clear();
-            }
-            if let Some(&v) = guard.axis.get(key) {
-                return v;
-            }
-        }
-        // Cache miss: compute via the underlying index without
-        // holding the cache lock (axis_cardinality acquires the
-        // index's own DashMap shard lock; cross-locking would
-        // serialize unnecessarily).
-        let v = self.index.axis_cardinality(key);
-        self.state.lock().axis.insert(key.clone(), v);
-        v
-    }
-
-    fn metadata_value_cardinality(&self, key: &str) -> usize {
-        {
-            let mut guard = self.state.lock();
-            if Instant::now() >= guard.deadline {
-                guard.deadline = Instant::now() + self.ttl;
-                guard.axis.clear();
-                guard.metadata.clear();
-            }
-            if let Some(&v) = guard.metadata.get(key) {
-                return v;
-            }
-        }
-        let v = self.index.metadata_value_cardinality(key);
-        self.state.lock().metadata.insert(key.to_string(), v);
-        v
-    }
-}
-
-/// Capability index statistics
-#[derive(Debug, Clone, Default)]
-pub struct CapabilityIndexStats {
-    /// Number of indexed nodes
-    pub node_count: usize,
-    /// Number of unique tags
-    pub tag_count: usize,
-    /// Number of unique models
-    pub model_count: usize,
-    /// Number of unique tools
-    pub tool_count: usize,
-    /// Total announcements indexed
-    pub total_indexed: u64,
-    /// Total queries processed
-    pub total_queries: u64,
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -3969,7 +2546,6 @@ pub struct CapabilityIndexStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     /// Fixed-bytes `EntityId` for unit-test fixtures. Valid as a
     /// *value* (it's just 32 bytes) but not a valid ed25519 public
     /// key — callers that also exercise signature verification
@@ -3977,7 +2553,6 @@ mod tests {
     fn test_entity() -> super::super::super::identity::EntityId {
         super::super::super::identity::EntityId::from_bytes([0u8; 32])
     }
-
     /// `strip_reserved_metadata` drops every exact-match reserved
     /// key and every key under a reserved prefix, leaves all other
     /// keys intact. The substrate calls this on every inbound peer
@@ -4034,7 +2609,6 @@ mod tests {
             Some("fine"),
         );
     }
-
     /// The signature transcript covers `capabilities.metadata`, so
     /// `strip_reserved_metadata` invalidates the signature. The
     /// inbound dispatch path must therefore re-broadcast the
@@ -4075,7 +2649,6 @@ mod tests {
              to strip the local copy AFTER any re-broadcast"
         );
     }
-
     fn sample_capability_set() -> CapabilitySet {
         let gpu = GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24)
             .with_compute_units(128)
@@ -4117,56 +2690,6 @@ mod tests {
             .add_tag("gpu")
             .with_limits(ResourceLimits::new().with_max_concurrent(10))
     }
-
-    #[test]
-    fn version_bumps_on_index_remove_and_gc() {
-        // Phase F locked decision: every mutation bumps the
-        // mutation_version monotonically. The MeshDB cache
-        // pull-invalidates on any divergence.
-        let index = CapabilityIndex::new();
-        assert_eq!(index.version(), 0);
-
-        let entity = super::super::super::identity::EntityId::from_bytes([7u8; 32]);
-        index.index(CapabilityAnnouncement::new(
-            1u64,
-            entity,
-            1,
-            sample_capability_set(),
-        ));
-        let after_first_index = index.version();
-        assert!(after_first_index >= 1);
-
-        index.index(CapabilityAnnouncement::new(
-            2u64,
-            super::super::super::identity::EntityId::from_bytes([8u8; 32]),
-            1,
-            sample_capability_set(),
-        ));
-        let after_second_index = index.version();
-        assert!(after_second_index > after_first_index);
-
-        index.remove(1u64);
-        let after_remove = index.version();
-        assert!(after_remove > after_second_index);
-
-        // gc delegates to remove; if the entries are still
-        // alive (we haven't aged them out) nothing happens.
-        // So set a TTL-zero announcement and gc to confirm
-        // the bump path covers gc-induced removes too.
-        let mut ann = CapabilityAnnouncement::new(
-            3u64,
-            super::super::super::identity::EntityId::from_bytes([9u8; 32]),
-            1,
-            sample_capability_set(),
-        );
-        ann.ttl_secs = 0;
-        index.index(ann);
-        let after_zero_ttl_index = index.version();
-        assert!(after_zero_ttl_index > after_remove);
-        index.gc();
-        assert!(index.version() > after_zero_ttl_index);
-    }
-
     #[test]
     fn test_capability_set_creation() {
         let caps = sample_capability_set();
@@ -4176,7 +2699,6 @@ mod tests {
         assert!(caps.has_tool("python_repl"));
         assert_eq!(caps.views().hardware().memory_gb, 64);
     }
-
     #[test]
     fn test_capability_set_serialization() {
         let caps = sample_capability_set();
@@ -4190,7 +2712,6 @@ mod tests {
         assert_eq!(caps.tags, parsed.tags);
         assert_eq!(caps.views().models().len(), parsed.views().models().len());
     }
-
     /// CR-16: `with_metadata` silently drops writes whose key
     /// starts with a reserved prefix (`tool::`). Same shape as
     /// `add_tag`'s rejection of reserved tag prefixes via
@@ -4223,7 +2744,6 @@ mod tests {
             Some("ml-training")
         );
     }
-
     #[test]
     fn has_tag_matches_across_separator_forms() {
         // Regression for CR-1: `Tag::AxisValue` derives `PartialEq`
@@ -4259,7 +2779,6 @@ mod tests {
         // Stored equals, queried equals — must hit.
         assert!(caps.has_tag("hardware.gpu.vram_gb=80"));
     }
-
     #[test]
     fn test_capability_filter_matches() {
         let caps = sample_capability_set();
@@ -4295,118 +2814,6 @@ mod tests {
         let filter = CapabilityFilter::new().require_model("gpt-4");
         assert!(!filter.matches(&caps));
     }
-
-    /// Pin perf #110: the Vec+retain refactor of
-    /// `build_candidate_set` must produce the SAME node-set as
-    /// the legacy HashSet-clone form across the four index
-    /// dimensions (gpu / vendor / tag / model / tool). Cover the
-    /// permutations that exercise the intersection paths:
-    /// - gpu × tag (boolean + iterated index)
-    /// - tag × tag (two sequential `retain` calls)
-    /// - tag × model (retain followed by union-then-retain)
-    /// - early-empty short circuit (returns Some(empty Vec))
-    ///
-    /// A regression that drops `retain` and reverts to a
-    /// non-deduplicating intersection (or doesn't honor the
-    /// "all-required" tag semantics) would surface here.
-    #[test]
-    fn build_candidate_set_intersection_semantics_preserved_after_vec_refactor() {
-        use std::collections::HashSet;
-        let index = CapabilityIndex::new();
-        // 12 nodes; 4-way tag pattern: A=evens, B=multiples-of-3,
-        // C=multiples-of-4. Models: m1 on first 6, m2 on last 6.
-        for i in 0u64..12 {
-            let mut caps = CapabilitySet::default();
-            if i % 2 == 0 {
-                caps = caps.add_tag("A");
-            }
-            if i % 3 == 0 {
-                caps = caps.add_tag("B");
-            }
-            if i % 4 == 0 {
-                caps = caps.add_tag("C");
-            }
-            if i < 6 {
-                caps = caps.add_model(ModelCapability::new("m1", "test"));
-            } else {
-                caps = caps.add_model(ModelCapability::new("m2", "test"));
-            }
-            index.index(CapabilityAnnouncement::new(i, test_entity(), 1, caps));
-        }
-
-        // Tag intersection A ∩ B = multiples of 6 = {0, 6}.
-        let f = CapabilityFilter::new().require_tag("A").require_tag("B");
-        let got: HashSet<u64> = index.query(&f).into_iter().collect();
-        assert_eq!(got, HashSet::from([0, 6]), "A ∩ B");
-
-        // Tag intersection A ∩ C = multiples of 4 = {0, 4, 8}.
-        let f = CapabilityFilter::new().require_tag("A").require_tag("C");
-        let got: HashSet<u64> = index.query(&f).into_iter().collect();
-        assert_eq!(got, HashSet::from([0, 4, 8]), "A ∩ C");
-
-        // Tag A ∩ model m1 = {0, 2, 4}.
-        let f = CapabilityFilter::new().require_tag("A").require_model("m1");
-        let got: HashSet<u64> = index.query(&f).into_iter().collect();
-        assert_eq!(got, HashSet::from([0, 2, 4]), "A ∩ m1");
-
-        // Early-empty: tag X (no nodes) → empty result, NOT None.
-        let f = CapabilityFilter::new().require_tag("X");
-        assert!(
-            index.query(&f).is_empty(),
-            "no-matches tag must short-circuit to empty"
-        );
-
-        // No deduplication regression: 100 queries' results must
-        // contain each id at most once.
-        let f = CapabilityFilter::new().require_tag("A");
-        let got = index.query(&f);
-        let unique: HashSet<u64> = got.iter().copied().collect();
-        assert_eq!(
-            got.len(),
-            unique.len(),
-            "Vec+retain path must preserve uniqueness from the seed set"
-        );
-    }
-
-    #[test]
-    fn test_capability_index() {
-        let index = CapabilityIndex::new();
-
-        // Index some nodes
-        for i in 0..100 {
-            let mut caps = sample_capability_set();
-            if i % 2 == 0 {
-                caps = caps.add_tag("even");
-            }
-            if i % 3 == 0 {
-                caps = caps.add_tag("divisible_by_3");
-            }
-
-            let ann = CapabilityAnnouncement::new(i, test_entity(), 1, caps);
-            index.index(ann);
-        }
-
-        assert_eq!(index.len(), 100);
-
-        // Query by tag
-        let filter = CapabilityFilter::new().require_tag("even");
-        let results = index.query(&filter);
-        assert_eq!(results.len(), 50);
-
-        // Query by multiple tags
-        let filter = CapabilityFilter::new()
-            .require_tag("even")
-            .require_tag("divisible_by_3");
-        let results = index.query(&filter);
-        // Nodes divisible by 6: 0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60, 66, 72, 78, 84, 90, 96
-        assert_eq!(results.len(), 17);
-
-        // Query by GPU
-        let filter = CapabilityFilter::new().require_gpu();
-        let results = index.query(&filter);
-        assert_eq!(results.len(), 100);
-    }
-
     #[test]
     fn test_capability_requirement_scoring() {
         let caps = sample_capability_set();
@@ -4419,656 +2826,6 @@ mod tests {
         let score = req.score(&caps);
         assert!(score > 1.0); // Base score + preferences
     }
-
-    // ========================================================================
-    // CapabilityIndex::axis_cardinality — Phase 4 follow-on of
-    // CAPABILITY_ENHANCEMENTS_PLAN.md.
-    // ========================================================================
-
-    fn index_with_node(index: &CapabilityIndex, node_id: u64, caps: CapabilitySet) {
-        let ann = CapabilityAnnouncement::new(node_id, test_entity(), 1, caps);
-        index.index(ann);
-    }
-
-    #[test]
-    fn axis_cardinality_counts_distinct_value_tags() {
-        // 3 nodes with different memory_gb values. Cardinality
-        // for `hardware.memory_gb` should be 3.
-        let index = CapabilityIndex::new();
-        for (i, gb) in [16u32, 32, 64].iter().enumerate() {
-            let caps =
-                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(*gb));
-            index_with_node(&index, i as u64, caps);
-        }
-        let key = crate::adapter::net::behavior::tag::TagKey::new(
-            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "memory_gb",
-        );
-        assert_eq!(index.axis_cardinality(&key), 3);
-    }
-
-    #[test]
-    fn axis_cardinality_dedupes_repeated_values() {
-        // 5 nodes, only 2 distinct gpu vendors. Cardinality = 2.
-        let index = CapabilityIndex::new();
-        let vendors = [
-            GpuVendor::Nvidia,
-            GpuVendor::Nvidia,
-            GpuVendor::Amd,
-            GpuVendor::Nvidia,
-            GpuVendor::Amd,
-        ];
-        for (i, v) in vendors.iter().enumerate() {
-            let caps = CapabilitySet::new()
-                .with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(*v, "x", 1)));
-            index_with_node(&index, i as u64, caps);
-        }
-        let key = crate::adapter::net::behavior::tag::TagKey::new(
-            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "gpu.vendor",
-        );
-        assert_eq!(index.axis_cardinality(&key), 2);
-    }
-
-    #[test]
-    fn axis_cardinality_returns_one_for_presence_keys_with_any_match() {
-        // Presence-only key (`hardware.gpu` marker, no `=value`).
-        // Any node with the marker → cardinality 1.
-        let index = CapabilityIndex::new();
-        let caps = CapabilitySet::new().with_hardware(
-            HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 80)),
-        );
-        index_with_node(&index, 1, caps);
-        let key = crate::adapter::net::behavior::tag::TagKey::new(
-            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "gpu",
-        );
-        assert_eq!(index.axis_cardinality(&key), 1);
-    }
-
-    #[test]
-    fn axis_cardinality_returns_zero_for_unknown_keys() {
-        let index = CapabilityIndex::new();
-        let caps = CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(64));
-        index_with_node(&index, 1, caps);
-
-        let unknown_key = crate::adapter::net::behavior::tag::TagKey::new(
-            crate::adapter::net::behavior::tag::TaxonomyAxis::Devices,
-            "qpu",
-        );
-        assert_eq!(index.axis_cardinality(&unknown_key), 0);
-    }
-
-    #[test]
-    fn axis_cardinality_returns_zero_on_empty_index() {
-        let index = CapabilityIndex::new();
-        let key = crate::adapter::net::behavior::tag::TagKey::new(
-            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "memory_gb",
-        );
-        assert_eq!(index.axis_cardinality(&key), 0);
-    }
-
-    #[test]
-    fn axis_cardinality_excludes_presence_when_value_form_present() {
-        // Edge case: if the key has BOTH presence-form
-        // (`hardware.gpu`) and value-form sub-keys
-        // (`hardware.gpu.vendor=...`), `axis_cardinality(gpu)`
-        // returns 1 (the presence count) — the gpu.vendor sub-key
-        // has its own cardinality measurement under a different
-        // TagKey.
-        let index = CapabilityIndex::new();
-        let caps = CapabilitySet::new().with_hardware(
-            HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "h100", 80)),
-        );
-        index_with_node(&index, 1, caps);
-
-        let gpu_presence = crate::adapter::net::behavior::tag::TagKey::new(
-            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "gpu",
-        );
-        assert_eq!(index.axis_cardinality(&gpu_presence), 1);
-
-        let gpu_vendor = crate::adapter::net::behavior::tag::TagKey::new(
-            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "gpu.vendor",
-        );
-        assert_eq!(index.axis_cardinality(&gpu_vendor), 1);
-    }
-
-    #[test]
-    fn axis_cardinality_handles_high_cardinality_keys() {
-        // 100 nodes with distinct memory values → cardinality 100.
-        // Pin: the O(1) by_axis_key lookup handles modest sizes
-        // correctly (was an O(N) scan in the previous implementation).
-        let index = CapabilityIndex::new();
-        for i in 0..100u32 {
-            let caps =
-                CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(1 + i));
-            index_with_node(&index, i as u64, caps);
-        }
-        let key = crate::adapter::net::behavior::tag::TagKey::new(
-            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "memory_gb",
-        );
-        assert_eq!(index.axis_cardinality(&key), 100);
-    }
-
-    #[test]
-    fn axis_cardinality_decrements_on_node_removal() {
-        // Pin: removing a node updates `by_axis_key` — its values
-        // are pruned if no other node carries them. Mirrors the
-        // metadata_value_cardinality lifecycle test.
-        let index = CapabilityIndex::new();
-        // Node 1: memory_gb=1
-        index_with_node(
-            &index,
-            1,
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(1)),
-        );
-        // Node 2: memory_gb=2
-        index_with_node(
-            &index,
-            2,
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(2)),
-        );
-        let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
-            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "memory_gb",
-        );
-        assert_eq!(index.axis_cardinality(&memory_key), 2);
-
-        // Remove node 1; only memory_gb=2 left → cardinality 1.
-        index.remove(1);
-        assert_eq!(index.axis_cardinality(&memory_key), 1);
-
-        // Remove node 2; both memory values pruned → cardinality 0.
-        index.remove(2);
-        assert_eq!(index.axis_cardinality(&memory_key), 0);
-    }
-
-    // ========================================================================
-    // CapabilityIndex::find_nodes_matching — Phase 5.B follow-on of
-    // CAPABILITY_ENHANCEMENTS_PLAN.md.
-    // ========================================================================
-
-    #[test]
-    fn find_nodes_matching_simple_predicate() {
-        // 4 nodes: 2 with GPUs, 2 without. Predicate selects GPU nodes.
-        let index = CapabilityIndex::new();
-        index_with_node(
-            &index,
-            1,
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(
-                GpuVendor::Nvidia,
-                "h100",
-                1,
-            ))),
-        );
-        index_with_node(
-            &index,
-            2,
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(64)),
-        );
-        index_with_node(
-            &index,
-            3,
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(
-                GpuVendor::Amd,
-                "x",
-                1,
-            ))),
-        );
-        index_with_node(
-            &index,
-            4,
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_cpu(8, 16)),
-        );
-
-        let pred = crate::adapter::net::behavior::Predicate::Exists {
-            key: crate::adapter::net::behavior::tag::TagKey::new(
-                crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-                "gpu",
-            ),
-        };
-        let mut matched = index.find_nodes_matching(&pred);
-        matched.sort();
-        assert_eq!(matched, vec![1, 3]);
-    }
-
-    #[test]
-    fn find_nodes_matching_composite_predicate() {
-        // 4 nodes; the predicate selects nodes with GPU AND
-        // intent=ml-training metadata. Pin the And + metadata
-        // composition path.
-        let index = CapabilityIndex::new();
-        // GPU + ml-training → match
-        index_with_node(
-            &index,
-            10,
-            CapabilitySet::new()
-                .with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(
-                    GpuVendor::Nvidia,
-                    "h100",
-                    80,
-                )))
-                .with_metadata("intent", "ml-training"),
-        );
-        // GPU but wrong intent → miss
-        index_with_node(
-            &index,
-            11,
-            CapabilitySet::new()
-                .with_hardware(HardwareCapabilities::new().with_gpu(GpuInfo::new(
-                    GpuVendor::Amd,
-                    "x",
-                    1,
-                )))
-                .with_metadata("intent", "embedding-cache"),
-        );
-        // ml-training but no GPU → miss
-        index_with_node(
-            &index,
-            12,
-            CapabilitySet::new()
-                .with_hardware(HardwareCapabilities::new().with_memory(64))
-                .with_metadata("intent", "ml-training"),
-        );
-        // Neither → miss
-        index_with_node(
-            &index,
-            13,
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_cpu(4, 8)),
-        );
-
-        let pred = crate::adapter::net::behavior::Predicate::And(vec![
-            crate::adapter::net::behavior::Predicate::Exists {
-                key: crate::adapter::net::behavior::tag::TagKey::new(
-                    crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-                    "gpu",
-                ),
-            },
-            crate::adapter::net::behavior::Predicate::MetadataEquals {
-                key: "intent".into(),
-                value: "ml-training".into(),
-            },
-        ]);
-        let matched = index.find_nodes_matching(&pred);
-        assert_eq!(matched, vec![10]);
-    }
-
-    #[test]
-    fn find_nodes_matching_no_match_returns_empty() {
-        let index = CapabilityIndex::new();
-        index_with_node(
-            &index,
-            1,
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(1)),
-        );
-        let pred = crate::adapter::net::behavior::Predicate::Exists {
-            key: crate::adapter::net::behavior::tag::TagKey::new(
-                crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-                "gpu",
-            ),
-        };
-        let matched = index.find_nodes_matching(&pred);
-        assert!(matched.is_empty());
-    }
-
-    #[test]
-    fn find_nodes_matching_empty_index_returns_empty() {
-        let index = CapabilityIndex::new();
-        let pred = crate::adapter::net::behavior::Predicate::Exists {
-            key: crate::adapter::net::behavior::tag::TagKey::new(
-                crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-                "gpu",
-            ),
-        };
-        let matched = index.find_nodes_matching(&pred);
-        assert!(matched.is_empty());
-    }
-
-    // ========================================================================
-    // CapabilityIndex::metadata_value_cardinality — Phase 5.B follow-on of
-    // CAPABILITY_ENHANCEMENTS_PLAN.md.
-    // ========================================================================
-
-    #[test]
-    fn metadata_value_cardinality_counts_distinct_values() {
-        let index = CapabilityIndex::new();
-        // 5 nodes with 3 distinct intent values.
-        let intents = [
-            "ml-training",
-            "ml-training",
-            "embedding-cache",
-            "ml-training",
-            "scratchpad",
-        ];
-        for (i, v) in intents.iter().enumerate() {
-            let caps = CapabilitySet::new().with_metadata("intent", *v);
-            index_with_node(&index, i as u64, caps);
-        }
-        assert_eq!(index.metadata_value_cardinality("intent"), 3);
-    }
-
-    #[test]
-    fn metadata_value_cardinality_returns_zero_for_unknown_key() {
-        let index = CapabilityIndex::new();
-        let caps = CapabilitySet::new().with_metadata("intent", "ml-training");
-        index_with_node(&index, 1, caps);
-        assert_eq!(index.metadata_value_cardinality("nonexistent"), 0);
-    }
-
-    #[test]
-    fn metadata_value_cardinality_empty_index() {
-        let index = CapabilityIndex::new();
-        assert_eq!(index.metadata_value_cardinality("intent"), 0);
-    }
-
-    #[test]
-    fn metadata_value_cardinality_dedupes_repeated_values() {
-        let index = CapabilityIndex::new();
-        // 10 nodes all with the same intent → cardinality = 1.
-        for i in 0..10u64 {
-            let caps = CapabilitySet::new().with_metadata("intent", "ml-training");
-            index_with_node(&index, i, caps);
-        }
-        assert_eq!(index.metadata_value_cardinality("intent"), 1);
-    }
-
-    #[test]
-    fn metadata_value_cardinality_decrements_on_node_removal() {
-        // Pin: removing a node updates the metadata index — its
-        // values are pruned if no other node carries them.
-        let index = CapabilityIndex::new();
-        // Node 1: intent=A, owner=alice
-        index_with_node(
-            &index,
-            1,
-            CapabilitySet::new()
-                .with_metadata("intent", "A")
-                .with_metadata("owner", "alice"),
-        );
-        // Node 2: intent=B, owner=alice (same owner, different intent)
-        index_with_node(
-            &index,
-            2,
-            CapabilitySet::new()
-                .with_metadata("intent", "B")
-                .with_metadata("owner", "alice"),
-        );
-        assert_eq!(index.metadata_value_cardinality("intent"), 2);
-        assert_eq!(index.metadata_value_cardinality("owner"), 1);
-
-        // Remove node 1; intent A's only node is gone, so
-        // intent's cardinality drops to 1. Owner alice still has
-        // node 2, so owner's cardinality stays 1.
-        index.remove(1);
-        assert_eq!(index.metadata_value_cardinality("intent"), 1);
-        assert_eq!(index.metadata_value_cardinality("owner"), 1);
-
-        // Remove node 2; both intent and owner are now empty.
-        index.remove(2);
-        assert_eq!(index.metadata_value_cardinality("intent"), 0);
-        assert_eq!(index.metadata_value_cardinality("owner"), 0);
-    }
-
-    // ========================================================================
-    // CardinalityCache — Phase 4 follow-on of CAPABILITY_ENHANCEMENTS_PLAN.md
-    // "Cached cardinality estimates".
-    // ========================================================================
-
-    fn small_index_with_metadata() -> CapabilityIndex {
-        let index = CapabilityIndex::new();
-        for i in 0..5u64 {
-            let caps = CapabilitySet::new()
-                .with_hardware(HardwareCapabilities::new().with_memory(1 + i as u32))
-                .with_metadata("intent", "ml-training");
-            index_with_node(&index, i, caps);
-        }
-        index
-    }
-
-    #[test]
-    fn cardinality_cache_returns_same_values_as_index() {
-        // Pin: the cache is a transparent passthrough on first
-        // access — every key returns the same value as direct
-        // index lookup.
-        let index = small_index_with_metadata();
-        let cache = CardinalityCache::new(&index, std::time::Duration::from_secs(60));
-
-        let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
-            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "memory_gb",
-        );
-        assert_eq!(
-            cache.axis_cardinality(&memory_key),
-            index.axis_cardinality(&memory_key),
-        );
-        assert_eq!(
-            cache.metadata_value_cardinality("intent"),
-            index.metadata_value_cardinality("intent"),
-        );
-    }
-
-    #[test]
-    fn cardinality_cache_serves_repeat_reads_from_cache() {
-        // Pin: a second read of the same key returns the cached
-        // value even if the underlying index changes — the cache
-        // hides updates until the TTL elapses or refresh() is
-        // called explicitly.
-        let index = small_index_with_metadata();
-        let cache = CardinalityCache::new(&index, std::time::Duration::from_secs(60));
-
-        let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
-            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "memory_gb",
-        );
-        let first = cache.axis_cardinality(&memory_key);
-
-        // Mutate the underlying index. The cache shouldn't see this
-        // until refresh / TTL elapse.
-        index_with_node(
-            &index,
-            999,
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(100)),
-        );
-
-        let second = cache.axis_cardinality(&memory_key);
-        assert_eq!(
-            second, first,
-            "cached value should not reflect post-cache mutation"
-        );
-    }
-
-    #[test]
-    fn cardinality_cache_refresh_picks_up_new_data() {
-        // Pin: refresh() invalidates the cache; the next access
-        // reads fresh data from the index.
-        let index = small_index_with_metadata();
-        let cache = CardinalityCache::new(&index, std::time::Duration::from_secs(60));
-
-        let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
-            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "memory_gb",
-        );
-        let first = cache.axis_cardinality(&memory_key);
-
-        // Mutate index, then explicitly refresh.
-        index_with_node(
-            &index,
-            999,
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(100)),
-        );
-        cache.refresh();
-
-        let after_refresh = cache.axis_cardinality(&memory_key);
-        assert_eq!(
-            after_refresh,
-            first + 1,
-            "post-refresh read should see the new node"
-        );
-    }
-
-    #[test]
-    fn cardinality_cache_auto_refresh_on_ttl_expiry() {
-        // Pin: the cache auto-refreshes when its TTL elapses.
-        let index = small_index_with_metadata();
-        // 1 ms TTL — guarantees expiry between two ordinary reads.
-        let cache = CardinalityCache::new(&index, std::time::Duration::from_millis(1));
-
-        let memory_key = crate::adapter::net::behavior::tag::TagKey::new(
-            crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-            "memory_gb",
-        );
-        let first = cache.axis_cardinality(&memory_key);
-
-        // Mutate index, then sleep past the TTL.
-        index_with_node(
-            &index,
-            999,
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_memory(100)),
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-
-        let after_expiry = cache.axis_cardinality(&memory_key);
-        assert_eq!(
-            after_expiry,
-            first + 1,
-            "post-TTL-expiry read should see the new node",
-        );
-    }
-
-    #[test]
-    fn cardinality_cache_is_expired_reflects_deadline() {
-        let index = CapabilityIndex::new();
-        let cache = CardinalityCache::new(&index, std::time::Duration::from_millis(1));
-        // Fresh cache: not expired.
-        assert!(!cache.is_expired());
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        assert!(cache.is_expired());
-    }
-
-    #[test]
-    fn cardinality_cache_works_as_planner_provider() {
-        // Pin: the planner accepts &CardinalityCache transparently
-        // (drop-in replacement for &CapabilityIndex).
-        use crate::adapter::net::behavior::Predicate;
-        let index = small_index_with_metadata();
-        let cache = CardinalityCache::new(&index, std::time::Duration::from_secs(60));
-
-        let pred = Predicate::And(vec![
-            Predicate::Exists {
-                key: crate::adapter::net::behavior::tag::TagKey::new(
-                    crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-                    "memory_gb",
-                ),
-            },
-            Predicate::MetadataEquals {
-                key: "intent".into(),
-                value: "ml-training".into(),
-            },
-        ]);
-
-        // Use the cache as the planner provider; pin equivalence
-        // with the direct-index path.
-        let candidate_caps = CapabilitySet::new()
-            .with_hardware(HardwareCapabilities::new().with_memory(2))
-            .with_metadata("intent", "ml-training");
-        let tags: Vec<crate::adapter::net::behavior::Tag> =
-            candidate_caps.tags.iter().cloned().collect();
-        let ctx = crate::adapter::net::behavior::EvalContext::new(&tags, &candidate_caps.metadata);
-        assert_eq!(
-            pred.evaluate_with_index(&ctx, &cache),
-            pred.evaluate_with_index(&ctx, &index),
-        );
-    }
-
-    #[test]
-    fn find_nodes_matching_uses_cardinality_aware_planner() {
-        // Build an index where one node matches a high-cardinality
-        // discriminator AND a low-cardinality clause; a different
-        // node matches only the low-cardinality clause. The
-        // cardinality-aware planner runs the high-cardinality
-        // (more selective) clause first → fewer evaluations of the
-        // low-cardinality clause. Result is the same; this test
-        // pins the *result*, not the ordering (which is internal).
-        let index = CapabilityIndex::new();
-        // Many distinct memory values → high cardinality of memory_gb
-        for i in 0..20u64 {
-            let mut caps = CapabilitySet::new().with_hardware(
-                HardwareCapabilities::new()
-                    .with_memory(1 + i as u32)
-                    .with_gpu(GpuInfo::new(
-                        if i % 2 == 0 {
-                            GpuVendor::Nvidia
-                        } else {
-                            GpuVendor::Amd
-                        },
-                        "x",
-                        1,
-                    )),
-            );
-            if i == 5 {
-                caps = caps.with_metadata("intent", "ml-training");
-            }
-            index_with_node(&index, i, caps);
-        }
-
-        // Predicate: intent=ml-training (low-card metadata) AND memory=6 (high-card axis)
-        let pred = crate::adapter::net::behavior::Predicate::And(vec![
-            crate::adapter::net::behavior::Predicate::MetadataEquals {
-                key: "intent".into(),
-                value: "ml-training".into(),
-            },
-            crate::adapter::net::behavior::Predicate::Equals {
-                key: crate::adapter::net::behavior::tag::TagKey::new(
-                    crate::adapter::net::behavior::tag::TaxonomyAxis::Hardware,
-                    "memory_gb",
-                ),
-                value: "6".into(),
-            },
-        ]);
-        // Only node 5 matches both clauses.
-        let matched = index.find_nodes_matching(&pred);
-        assert_eq!(matched, vec![5]);
-    }
-
-    #[test]
-    fn test_capability_index_version_handling() {
-        let index = CapabilityIndex::new();
-
-        // Index version 1
-        let caps_v1 = CapabilitySet::new().add_tag("v1");
-        let ann_v1 = CapabilityAnnouncement::new(1, test_entity(), 1, caps_v1);
-        index.index(ann_v1);
-
-        // Query should find v1 tag
-        let filter = CapabilityFilter::new().require_tag("v1");
-        assert_eq!(index.query(&filter).len(), 1);
-
-        // Index version 2 (should replace v1)
-        let caps_v2 = CapabilitySet::new().add_tag("v2");
-        let ann_v2 = CapabilityAnnouncement::new(1, test_entity(), 2, caps_v2);
-        index.index(ann_v2);
-
-        // v1 tag should be gone, v2 should be present
-        let filter = CapabilityFilter::new().require_tag("v1");
-        assert_eq!(index.query(&filter).len(), 0);
-
-        let filter = CapabilityFilter::new().require_tag("v2");
-        assert_eq!(index.query(&filter).len(), 1);
-
-        // Older version should be ignored
-        let caps_old = CapabilitySet::new().add_tag("old");
-        let ann_old = CapabilityAnnouncement::new(1, test_entity(), 1, caps_old);
-        index.index(ann_old);
-
-        // v2 should still be present
-        let filter = CapabilityFilter::new().require_tag("v2");
-        assert_eq!(index.query(&filter).len(), 1);
-    }
-
     #[test]
     fn test_capability_announcement_expiry() {
         let caps = sample_capability_set();
@@ -5084,201 +2841,6 @@ mod tests {
         // Should be expired now
         assert!(ann.is_expired());
     }
-
-    // ========================================================================
-    // CapabilityIndex::gc() boundary + race coverage (TEST_COVERAGE_PLAN §P1-2)
-    // ========================================================================
-
-    /// A zero-TTL announcement is evicted on the very next `gc()`
-    /// sweep. Zero-TTL is a legitimate operator choice for
-    /// "announce-and-forget" diagnostics; the index must respect
-    /// it rather than silently promoting zero to some default.
-    #[test]
-    fn gc_evicts_entries_with_ttl_zero() {
-        let index = CapabilityIndex::new();
-        let mut ann = CapabilityAnnouncement::new(1, test_entity(), 1, sample_capability_set());
-        ann.ttl_secs = 0;
-        index.index(ann);
-
-        assert_eq!(index.stats().node_count, 1, "entry should be indexed");
-        // No sleep needed — with ttl=0, `now.duration_since(indexed_at)`
-        // is already >= ttl on the first gc call.
-        let removed = index.gc();
-        assert_eq!(removed, 1, "zero-TTL entry must be evicted on first gc");
-        assert_eq!(index.stats().node_count, 0);
-        assert!(
-            index.get(1).is_none(),
-            "evicted entry must not be queryable"
-        );
-    }
-
-    /// A u32::MAX-TTL announcement (~136 years in seconds) must
-    /// NOT be evicted on the first gc sweep. Pins that the
-    /// `Duration::from_secs(ttl_secs as u64)` conversion doesn't
-    /// wrap or overflow — a regression here would produce a
-    /// zero-valued `Duration` and evict long-lived entries
-    /// immediately.
-    #[test]
-    fn gc_retains_entries_with_max_ttl_no_wraparound() {
-        let index = CapabilityIndex::new();
-        let mut ann = CapabilityAnnouncement::new(7, test_entity(), 1, sample_capability_set());
-        ann.ttl_secs = u32::MAX;
-        index.index(ann);
-
-        assert_eq!(index.stats().node_count, 1);
-        let removed = index.gc();
-        assert_eq!(
-            removed, 0,
-            "u32::MAX-TTL entry must not be evicted — regression \
-             would indicate the `ttl_secs as u64` widening wrapped \
-             to zero and produced a zero-`Duration` ttl",
-        );
-        assert!(index.get(7).is_some(), "entry still queryable");
-    }
-
-    /// Concurrent `index()` on one thread + `gc()` on another —
-    /// the two dashmap operations must not corrupt the index or
-    /// panic. With a long TTL every indexed entry is gc-safe
-    /// (not expired), so gc should never remove anything; we
-    /// assert that invariant after the race completes. Guards
-    /// the `versions` + `nodes` lock-ordering contract
-    /// documented on `remove` (versions before nodes).
-    #[test]
-    fn gc_and_index_concurrent_race_is_panic_free_and_does_not_evict_live_entries() {
-        use std::sync::{Arc, Barrier};
-        use std::thread;
-
-        let index = Arc::new(CapabilityIndex::new());
-        let iters = 500u64;
-        // Start barrier: both threads must be at their first loop
-        // iteration before either runs. Without it the GC thread
-        // could race ahead and finish all 500 gc() sweeps before
-        // the indexer's thread even started — a silent green pass
-        // that wouldn't have exercised the versions↔nodes
-        // lock-ordering at all (cubic-flagged P2).
-        let start = Arc::new(Barrier::new(2));
-
-        // Indexer thread: reindex node_id 42 with a bumped
-        // version each iteration. TTL default (300s), so no
-        // entry is ever actually expired.
-        let indexer = {
-            let index = index.clone();
-            let start = start.clone();
-            thread::spawn(move || {
-                start.wait();
-                for v in 1..=iters {
-                    let ann =
-                        CapabilityAnnouncement::new(42, test_entity(), v, sample_capability_set());
-                    index.index(ann);
-                }
-            })
-        };
-
-        // GC thread: run `gc()` repeatedly while the indexer
-        // is active. Count removals — since all entries have a
-        // 300-second TTL and the test takes milliseconds,
-        // `gc` must return 0 every time.
-        let gc_runner = {
-            let index = index.clone();
-            let start = start.clone();
-            thread::spawn(move || {
-                start.wait();
-                let mut total_removed = 0usize;
-                for _ in 0..iters {
-                    total_removed += index.gc();
-                }
-                total_removed
-            })
-        };
-
-        indexer.join().expect("indexer panicked");
-        let gc_removed = gc_runner.join().expect("gc thread panicked");
-
-        assert_eq!(
-            gc_removed, 0,
-            "gc must not evict any entry during the race — every \
-             indexed version has a 300-second TTL and the test \
-             completes in milliseconds. A nonzero removal count \
-             indicates a lock-ordering bug that lets gc see an \
-             indexed-then-still-present entry as expired.",
-        );
-
-        // Final state: node 42 is present, at some version
-        // between 1 and `iters`. No data structure corruption.
-        let final_entry = index.get(42);
-        assert!(
-            final_entry.is_some(),
-            "node 42 must be indexed after the race"
-        );
-    }
-
-    // ========================================================================
-    // Custom TTL coverage (TEST_COVERAGE_PLAN §P3-16)
-    //
-    // Table-driven cases that exercise TTLs the default-300s unit
-    // tests never touch: 0s, 1s, 1h, 1yr, u32::MAX. Two flavors —
-    // one drives the index's `gc()` on freshly-indexed entries, the
-    // other drives `CapabilityAnnouncement::is_expired()` directly
-    // so the "age >= ttl" boundary can be pinned against an exact
-    // past timestamp (Instant::now() is not manipulable at test
-    // time, but `timestamp_ns` is).
-    // ========================================================================
-
-    /// `gc()` on a freshly-indexed entry evicts only when the TTL
-    /// is zero. Everything from 1s up is a "not yet expired" case
-    /// because less than a second has elapsed between `index()` and
-    /// `gc()`. Pins the sign of the comparison in `gc` — a flipped
-    /// inequality would evict an entry with a year-long TTL after
-    /// one microsecond of wall-clock age.
-    #[test]
-    fn gc_respects_ttl_bounds_on_freshly_indexed_entries() {
-        // (node_id, ttl_secs, expected_evicted_on_immediate_gc)
-        //
-        // NB: the smallest non-zero TTL is 10 s, not 1 s — a
-        // 1 s bound is timing-sensitive (a paused scheduler or
-        // CI VM stall between `index()` and `gc()` could push
-        // wall-clock age past the boundary and flip the
-        // assertion). 10 s leaves comfortable slack for CI
-        // under load while still covering the "short, non-zero
-        // TTL" class.
-        let cases: &[(u64, u32, bool)] = &[
-            (100, 0, true),
-            (101, 10, false),         // 10 s — short but non-flaky
-            (102, 3_600, false),      // 1 hour
-            (103, 31_536_000, false), // 1 year
-            (104, u32::MAX, false),   // ~136 years
-        ];
-
-        for &(node_id, ttl_secs, should_evict) in cases {
-            let index = CapabilityIndex::new();
-            let mut ann =
-                CapabilityAnnouncement::new(node_id, test_entity(), 1, sample_capability_set());
-            ann.ttl_secs = ttl_secs;
-            index.index(ann);
-
-            let removed = index.gc();
-            if should_evict {
-                assert_eq!(
-                    removed, 1,
-                    "TTL={ttl_secs}s: entry must be evicted on immediate gc",
-                );
-                assert!(
-                    index.get(node_id).is_none(),
-                    "TTL={ttl_secs}s: evicted entry must not be queryable",
-                );
-            } else {
-                assert_eq!(
-                    removed, 0,
-                    "TTL={ttl_secs}s: fresh entry must not be evicted on immediate gc",
-                );
-                assert!(
-                    index.get(node_id).is_some(),
-                    "TTL={ttl_secs}s: live entry must remain queryable",
-                );
-            }
-        }
-    }
-
     /// `CapabilityAnnouncement::is_expired()` uses `SystemTime`, so
     /// we can backdate `timestamp_ns` and exercise the ttl boundary
     /// directly. Covers the inclusive-expiry contract at every TTL
@@ -5325,145 +2887,6 @@ mod tests {
             );
         }
     }
-
-    /// `with_ttl()` applied after construction must actually change
-    /// the announcement's effective lifetime — pins that the
-    /// builder-style setter doesn't silently ignore the new value
-    /// or leak the `DEFAULT_TTL_SECS` default through.
-    #[test]
-    fn with_ttl_mutation_round_trips_through_is_expired_and_gc() {
-        let ann =
-            CapabilityAnnouncement::new(9, test_entity(), 1, sample_capability_set()).with_ttl(0);
-        assert_eq!(ann.ttl_secs, 0, "with_ttl must write through");
-
-        let index = CapabilityIndex::new();
-        index.index(ann);
-        // Immediate gc should evict because `with_ttl(0)` applied.
-        assert_eq!(
-            index.gc(),
-            1,
-            "with_ttl(0) must propagate into the indexed entry's TTL \
-             so gc treats it the same as a fresh ttl_secs=0 announcement",
-        );
-
-        // Long TTL path: with_ttl(u32::MAX) keeps the entry
-        // indefinitely on a fresh gc.
-        let ann2 = CapabilityAnnouncement::new(10, test_entity(), 1, sample_capability_set())
-            .with_ttl(u32::MAX);
-        assert_eq!(ann2.ttl_secs, u32::MAX);
-        let index = CapabilityIndex::new();
-        index.index(ann2);
-        assert_eq!(index.gc(), 0, "u32::MAX TTL must survive gc");
-        assert!(index.get(10).is_some());
-    }
-
-    // ========================================================================
-    // replayed/expired announcements must not be admitted
-    // ========================================================================
-
-    /// An already-expired announcement (origin timestamp older than
-    /// `ttl_secs`) must be rejected by `index()` rather than stored
-    /// with a freshly-extended local lease. Pre-fix, `index()` had
-    /// no `is_expired()` check, so a captured-and-replayed
-    /// announcement reinstated stale capabilities indefinitely on
-    /// any node that received it.
-    #[test]
-    fn index_rejects_already_expired_announcement() {
-        let index = CapabilityIndex::new();
-        let mut ann = CapabilityAnnouncement::new(1, test_entity(), 1, sample_capability_set());
-        // Origin signed this 1 hour ago with a 60s TTL — long expired.
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        ann.timestamp_ns = now_ns.saturating_sub(3600 * 1_000_000_000);
-        ann.ttl_secs = 60;
-        assert!(ann.is_expired(), "test setup: ann must be expired");
-
-        index.index(ann);
-
-        assert_eq!(
-            index.stats().node_count,
-            0,
-            "expired announcement must not be indexed",
-        );
-        assert!(index.get(1).is_none());
-    }
-
-    /// A near-expiry replay (still cryptographically valid by
-    /// `is_expired()`'s inclusive bound, but most of its lifetime
-    /// already burned) must have its local TTL clamped by the
-    /// origin's remaining lifetime — not reset to a fresh
-    /// `ttl_secs` from `Instant::now()`. This pins the
-    /// `effective_ttl = local_ttl.min(origin_remaining)` clamp:
-    /// pre-fix, an attacker could capture an announcement at
-    /// age=ttl-1s and replay it to gain ~ttl seconds of fresh
-    /// lease per replay.
-    #[test]
-    fn index_clamps_local_ttl_to_origin_remaining_lifetime() {
-        let index = CapabilityIndex::new();
-        let mut ann = CapabilityAnnouncement::new(2, test_entity(), 1, sample_capability_set());
-        // Origin signed 200s ago with 300s TTL — 100s remaining.
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        ann.timestamp_ns = now_ns.saturating_sub(200 * 1_000_000_000);
-        ann.ttl_secs = 300;
-        assert!(!ann.is_expired(), "test setup: ann must still be live");
-
-        index.index(ann);
-
-        // Access the IndexedNode via private `nodes` field — `get()`
-        // returns only the CapabilitySet, but the clamp lives
-        // on `IndexedNode::ttl`.
-        let stored_ttl = index
-            .nodes
-            .get(&2)
-            .map(|n| n.ttl)
-            .expect("near-expiry ann must still be admitted");
-        // The local TTL should be clamped to ~100s (origin_remaining),
-        // not the full 300s. Allow generous slack for clock skew /
-        // scheduling between `timestamp_ns` capture and `index()`.
-        assert!(
-            stored_ttl <= Duration::from_secs(105),
-            "effective_ttl must be clamped to origin_remaining (~100s), \
-             got {:?} — pre-fix bug would leave ttl=300s",
-            stored_ttl,
-        );
-        assert!(
-            stored_ttl >= Duration::from_secs(90),
-            "effective_ttl must not over-clamp; expected ~100s, got {:?}",
-            stored_ttl,
-        );
-    }
-
-    /// Zero-TTL announcements remain admitted (and immediately
-    /// gc-eligible). The `ttl_secs > 0 && is_expired()` guard in
-    /// `index()` exempts them so the documented "announce-and-
-    /// forget" diagnostic flow keeps working — guarded by
-    /// `gc_evicts_entries_with_ttl_zero` already, but pinned here
-    /// alongside the replay-rejection cluster so a future tightening of
-    /// the rejection rule can't silently break zero-TTL.
-    #[test]
-    fn index_admits_zero_ttl_announcement_even_though_is_expired_returns_true() {
-        let index = CapabilityIndex::new();
-        let mut ann = CapabilityAnnouncement::new(3, test_entity(), 1, sample_capability_set());
-        ann.ttl_secs = 0;
-        assert!(
-            ann.is_expired(),
-            "is_expired() returns true for ttl_secs=0 by inclusive-bound rule",
-        );
-
-        index.index(ann);
-
-        assert_eq!(
-            index.stats().node_count,
-            1,
-            "zero-TTL exemption must keep announce-and-forget working",
-        );
-    }
-
     // ========================================================================
     // Multi-hop wire format (M-1)
     // ========================================================================
@@ -5473,7 +2896,6 @@ mod tests {
         let ann = CapabilityAnnouncement::new(1, test_entity(), 1, sample_capability_set());
         assert_eq!(ann.hop_count, 0);
     }
-
     #[test]
     fn hop_count_roundtrips_through_serde() {
         let mut ann = CapabilityAnnouncement::new(1, test_entity(), 1, sample_capability_set());
@@ -5482,7 +2904,6 @@ mod tests {
         let restored = CapabilityAnnouncement::from_bytes(&bytes).expect("parse");
         assert_eq!(restored.hop_count, 7);
     }
-
     #[test]
     fn old_format_without_hop_count_parses_as_zero() {
         // Hand-crafted JSON missing the `hop_count` field — the
@@ -5499,7 +2920,6 @@ mod tests {
         let parsed = CapabilityAnnouncement::from_bytes(&bytes).expect("parse old format");
         assert_eq!(parsed.hop_count, 0);
     }
-
     #[test]
     fn signature_verifies_across_hop_count_bumps() {
         use super::super::super::identity::EntityKeypair;
@@ -5521,7 +2941,6 @@ mod tests {
             );
         }
     }
-
     #[test]
     fn signature_rejects_tampered_payload_even_at_hop_zero() {
         use super::super::super::identity::EntityKeypair;
@@ -5533,7 +2952,6 @@ mod tests {
         ann.node_id ^= 0x01;
         assert!(ann.verify().is_err());
     }
-
     #[test]
     fn max_capability_hops_matches_pingwave_contract() {
         // MAX_CAPABILITY_HOPS is documented to mirror the pingwave
@@ -5541,7 +2959,6 @@ mod tests {
         // test flags the divergence at compile time.
         assert_eq!(MAX_CAPABILITY_HOPS, 16);
     }
-
     // ─────────────────────────────────────────────────────────────────
     // v0.4 capability-auth: allow-list wire-format + signing tests
     // ─────────────────────────────────────────────────────────────────
@@ -5577,7 +2994,6 @@ mod tests {
             s
         );
     }
-
     /// Round-trip an announcement with each allow-list populated
     /// — the decoder must reconstruct the exact field values.
     #[test]
@@ -5600,7 +3016,6 @@ mod tests {
         assert_eq!(decoded.allowed_subnets, ann.allowed_subnets);
         assert_eq!(decoded.allowed_groups, ann.allowed_groups);
     }
-
     /// The canonical signed payload of an unrestricted
     /// announcement must NOT carry the three allow-list keys at
     /// all — that's what keeps the v0.4 signed byte-pattern
@@ -5632,7 +3047,6 @@ mod tests {
             "pre-v0.4 wire shape must not carry allowed_groups when empty"
         );
     }
-
     /// A signed announcement carrying non-empty allow-lists
     /// verifies after wire round-trip. Pins that the signature
     /// covers the new fields end-to-end.
@@ -5653,7 +3067,6 @@ mod tests {
             "signature must cover the new allow-list fields end-to-end"
         );
     }
-
     /// Tampering with any allow-list after signing must fail
     /// verification — proves the signature covers each new field.
     #[test]
@@ -5689,7 +3102,6 @@ mod tests {
             );
         }
     }
-
     #[test]
     fn allow_list_cap_documented() {
         // Sanity: keep the doc-string + the constant in sync. If
@@ -5697,7 +3109,6 @@ mod tests {
         // budgeting — explicit pin makes the change visible.
         assert_eq!(MAX_ALLOW_LIST_LEN, 64);
     }
-
     /// M1 regression — pre-fix, `from_bytes` accepted any allow-list
     /// length the wire delivered; a malicious or buggy peer could
     /// ship a million-entry `allowed_nodes` and the receiver would
@@ -5736,7 +3147,6 @@ mod tests {
             );
         }
     }
-
     /// Boundary check — exactly `MAX_ALLOW_LIST_LEN` entries
     /// must STILL deserialize (the cap is inclusive).
     #[test]
@@ -5753,338 +3163,6 @@ mod tests {
             CapabilityAnnouncement::from_bytes(&bytes).expect("exactly-at-cap must deserialize");
         assert_eq!(decoded.allowed_nodes.len(), MAX_ALLOW_LIST_LEN);
     }
-
-    // ─────────────────────────────────────────────────────────────────
-    // v0.4 capability-auth: may_execute gate semantics
-    // (CAPABILITY_AUTH_PLAN.md §3 / §7 conformance scenarios)
-    // ─────────────────────────────────────────────────────────────────
-
-    /// Build an announcement carrying a single capability tag,
-    /// optional `subnet:` / `group:` membership tags, and the three
-    /// allow-lists. Helper used across the gate tests.
-    #[allow(clippy::too_many_arguments)]
-    fn auth_ann(
-        node_id: u64,
-        version: u64,
-        capability_tag: &str,
-        membership_subnet: Option<super::super::subnet::SubnetId>,
-        membership_groups: &[super::super::group::GroupId],
-        allowed_nodes: Vec<u64>,
-        allowed_subnets: Vec<super::super::subnet::SubnetId>,
-        allowed_groups: Vec<super::super::group::GroupId>,
-    ) -> CapabilityAnnouncement {
-        let mut caps = CapabilitySet::new().add_tag(capability_tag);
-        if let Some(s) = membership_subnet {
-            caps = caps.add_tag(s.to_tag());
-        }
-        for g in membership_groups {
-            caps = caps.add_tag(g.to_tag());
-        }
-        let entity = super::super::super::identity::EntityId::from_bytes([node_id as u8; 32]);
-        let mut ann = CapabilityAnnouncement::new(node_id, entity, version, caps);
-        ann.allowed_nodes = allowed_nodes;
-        ann.allowed_subnets = allowed_subnets;
-        ann.allowed_groups = allowed_groups;
-        ann
-    }
-
-    #[test]
-    fn may_execute_permissive_default_when_all_lists_empty() {
-        let index = CapabilityIndex::new();
-        index.index(auth_ann(
-            1,
-            1,
-            "nrpc:echo",
-            None,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-        ));
-        // Caller has no announcement; permissive default still
-        // admits — the gate trusts the wire-level binding for
-        // the caller's identity, not its announcement.
-        assert!(index.may_execute(1, "nrpc:echo", 2));
-    }
-
-    #[test]
-    fn may_execute_denies_when_target_unknown() {
-        let index = CapabilityIndex::new();
-        assert!(!index.may_execute(99, "nrpc:echo", 2));
-    }
-
-    #[test]
-    fn may_execute_denies_when_target_lacks_tag() {
-        let index = CapabilityIndex::new();
-        index.index(auth_ann(
-            1,
-            1,
-            "nrpc:echo",
-            None,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-        ));
-        assert!(!index.may_execute(1, "nrpc:other", 2));
-    }
-
-    #[test]
-    fn may_execute_allow_by_node_admits_listed_caller_only() {
-        let index = CapabilityIndex::new();
-        index.index(auth_ann(
-            1,
-            1,
-            "nrpc:echo",
-            None,
-            &[],
-            vec![2],
-            vec![],
-            vec![],
-        ));
-        assert!(index.may_execute(1, "nrpc:echo", 2));
-        assert!(!index.may_execute(1, "nrpc:echo", 3));
-    }
-
-    #[test]
-    fn may_execute_allow_by_subnet_uses_caller_announcement_tag() {
-        let index = CapabilityIndex::new();
-        let subnet = super::super::subnet::SubnetId([0x42; 16]);
-        // Target restricts to a subnet.
-        index.index(auth_ann(
-            1,
-            1,
-            "nrpc:echo",
-            None,
-            &[],
-            vec![],
-            vec![subnet],
-            vec![],
-        ));
-        // Caller declares membership via its own announcement.
-        index.index(auth_ann(
-            2,
-            1,
-            "nrpc:other-caller-tag",
-            Some(subnet),
-            &[],
-            vec![],
-            vec![],
-            vec![],
-        ));
-        // Outsider declares no subnet.
-        index.index(auth_ann(
-            3,
-            1,
-            "nrpc:other-caller-tag",
-            None,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-        ));
-        assert!(index.may_execute(1, "nrpc:echo", 2));
-        assert!(!index.may_execute(1, "nrpc:echo", 3));
-    }
-
-    #[test]
-    fn may_execute_allow_by_group_admits_any_member() {
-        let index = CapabilityIndex::new();
-        let group = super::super::group::GroupId([0x77; 32]);
-        index.index(auth_ann(
-            1,
-            1,
-            "nrpc:echo",
-            None,
-            &[],
-            vec![],
-            vec![],
-            vec![group],
-        ));
-        index.index(auth_ann(
-            2,
-            1,
-            "nrpc:caller-x",
-            None,
-            &[group],
-            vec![],
-            vec![],
-            vec![],
-        ));
-        index.index(auth_ann(
-            3,
-            1,
-            "nrpc:caller-y",
-            None,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-        ));
-        assert!(index.may_execute(1, "nrpc:echo", 2));
-        assert!(!index.may_execute(1, "nrpc:echo", 3));
-    }
-
-    #[test]
-    fn may_execute_union_semantics_short_circuit() {
-        // All three lists non-empty; caller matches only the
-        // node list. Pin that we return true on the first axis
-        // match (we don't require all axes to agree).
-        let index = CapabilityIndex::new();
-        let unmatched_subnet = super::super::subnet::SubnetId([0xAA; 16]);
-        let unmatched_group = super::super::group::GroupId([0xBB; 32]);
-        index.index(auth_ann(
-            1,
-            1,
-            "nrpc:echo",
-            None,
-            &[],
-            vec![2],
-            vec![unmatched_subnet],
-            vec![unmatched_group],
-        ));
-        // Caller declares neither the allowed subnet nor the
-        // allowed group, but is in `allowed_nodes`.
-        index.index(auth_ann(
-            2,
-            1,
-            "nrpc:caller",
-            None,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-        ));
-        assert!(index.may_execute(1, "nrpc:echo", 2));
-    }
-
-    #[test]
-    fn may_execute_revocation_via_new_announcement_supersedes() {
-        // v1 is permissive; B can execute. v2 tightens to
-        // [only target] and B is locked out — revocation is
-        // just a new announcement with a stricter allow-list.
-        let index = CapabilityIndex::new();
-        index.index(auth_ann(
-            1,
-            1,
-            "nrpc:echo",
-            None,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-        ));
-        assert!(index.may_execute(1, "nrpc:echo", 2));
-        index.index(auth_ann(
-            1,
-            2,
-            "nrpc:echo",
-            None,
-            &[],
-            vec![1],
-            vec![],
-            vec![],
-        ));
-        assert!(!index.may_execute(1, "nrpc:echo", 2));
-    }
-
-    #[test]
-    fn may_execute_caller_with_no_announcement_can_still_match_node_list() {
-        // Caller's identity is the wire `node_id`; no caller
-        // announcement is required for the node-list axis (only
-        // for subnet/group lookup, where membership self-
-        // declaration lives).
-        let index = CapabilityIndex::new();
-        index.index(auth_ann(
-            1,
-            1,
-            "nrpc:echo",
-            None,
-            &[],
-            vec![999],
-            vec![],
-            vec![],
-        ));
-        assert!(index.may_execute(1, "nrpc:echo", 999));
-    }
-
-    #[test]
-    fn subnet_of_and_groups_of_parse_self_declared_tags() {
-        let index = CapabilityIndex::new();
-        let subnet = super::super::subnet::SubnetId([0x11; 16]);
-        let g1 = super::super::group::GroupId([0x22; 32]);
-        let g2 = super::super::group::GroupId([0x33; 32]);
-        index.index(auth_ann(
-            7,
-            1,
-            "nrpc:echo",
-            Some(subnet),
-            &[g1, g2],
-            vec![],
-            vec![],
-            vec![],
-        ));
-        assert_eq!(index.subnet_of(7), Some(subnet));
-        // Group order is now deterministic (sorted by byte value),
-        // so callers don't need to re-sort to compare against an
-        // expected sequence.
-        assert_eq!(index.groups_of(7), vec![g1, g2]);
-        // Unknown node returns None / empty — never a panic.
-        assert_eq!(index.subnet_of(999), None);
-        assert!(index.groups_of(999).is_empty());
-    }
-
-    /// H4 regression — multiple `subnet:<hex>` tags on one
-    /// announcement used to pick a hash-order-dependent winner,
-    /// making the gate's subnet verdict non-deterministic across
-    /// receivers. The model treats subnet membership as
-    /// single-valued; multiple distinct subnet tags now collapse
-    /// to `None` (out-of-model malformed input → no membership)
-    /// rather than admitting one arbitrarily.
-    #[test]
-    fn subnet_of_returns_none_when_announcement_carries_multiple_subnet_tags() {
-        let index = CapabilityIndex::new();
-        let s1 = super::super::subnet::SubnetId([0x11; 16]);
-        let s2 = super::super::subnet::SubnetId([0x22; 16]);
-        // Hand-build a CapabilitySet with two distinct subnet
-        // tags. `auth_ann` only takes one Option<SubnetId>, so
-        // bypass it.
-        let caps = CapabilitySet::new()
-            .add_tag(s1.to_tag())
-            .add_tag(s2.to_tag())
-            .add_tag("nrpc:echo");
-        let entity = super::super::super::identity::EntityId::from_bytes([0xCD; 32]);
-        let ann = CapabilityAnnouncement::new(5, entity, 1, caps);
-        index.index(ann);
-        assert_eq!(
-            index.subnet_of(5),
-            None,
-            "two distinct subnet tags must collapse to no membership",
-        );
-    }
-
-    /// Duplicate `subnet:<hex>` tags pointing at the SAME subnet
-    /// are not malformed (set semantics dedup them at the wire
-    /// level) — confirm the parser still returns the single value
-    /// when only one distinct subnet survives.
-    #[test]
-    fn subnet_of_picks_single_distinct_value_even_when_set_has_one_entry() {
-        let index = CapabilityIndex::new();
-        let s1 = super::super::subnet::SubnetId([0x33; 16]);
-        // `add_tag` parses and inserts into a HashSet<Tag> — two
-        // identical tag strings collapse to one entry. This pins
-        // that the dedup happens at the tag-set layer, not at
-        // the parser.
-        let caps = CapabilitySet::new()
-            .add_tag(s1.to_tag())
-            .add_tag(s1.to_tag())
-            .add_tag("nrpc:echo");
-        let entity = super::super::super::identity::EntityId::from_bytes([0xCE; 32]);
-        let ann = CapabilityAnnouncement::new(6, entity, 1, caps);
-        index.index(ann);
-        assert_eq!(index.subnet_of(6), Some(s1));
-    }
-
     /// Regression for a cubic-flagged P1: adding `hop_count` to the
     /// signed canonical serialization broke rolling-upgrade
     /// compatibility — pre-M-1 announcements were signed over bytes
@@ -6118,37 +3196,6 @@ mod tests {
         let restored = CapabilityAnnouncement::from_bytes(&bytes).expect("parse");
         assert_eq!(restored.reflex_addr, Some(reflex));
     }
-
-    #[test]
-    fn index_stores_and_returns_reflex_addr() {
-        // Stage 3 (rendezvous): the coordinator looks up the
-        // punch target's reflex address in its capability index.
-        // Regression-guard the storage path — without it, the
-        // coordinator would never find any reflex, effectively
-        // disabling the rendezvous optimization.
-        let reflex: std::net::SocketAddr = "198.51.100.9:40000".parse().unwrap();
-        let ann = CapabilityAnnouncement::new(42, test_entity(), 1, sample_capability_set())
-            .with_reflex_addr(Some(reflex));
-        let index = CapabilityIndex::new();
-        index.index(ann);
-        assert_eq!(index.reflex_addr(42), Some(reflex));
-        // Unknown node returns None — not a panic, not a default.
-        assert_eq!(index.reflex_addr(999), None);
-    }
-
-    #[test]
-    fn index_reflex_addr_none_when_unset_on_announcement() {
-        // A node compiled without nat-traversal (or that hasn't
-        // classified yet) announces with `reflex_addr = None`.
-        // The index round-trip must preserve that, not invent a
-        // bogus default that the coordinator would then try to
-        // punch to.
-        let ann = CapabilityAnnouncement::new(77, test_entity(), 1, sample_capability_set());
-        let index = CapabilityIndex::new();
-        index.index(ann);
-        assert_eq!(index.reflex_addr(77), None);
-    }
-
     #[test]
     fn reflex_addr_none_is_omitted_from_wire_bytes() {
         // The `skip_serializing_if = "Option::is_none"` on
@@ -6166,7 +3213,6 @@ mod tests {
             "reflex_addr key must be omitted when the field is None; got: {text}",
         );
     }
-
     // `signed_payload_stays_compatible_with_pre_hop_count_format`
     // intentionally removed in Phase A.5.N.3. That test pinned the
     // pre-hop_count byte-identical serialization so signatures
@@ -6204,273 +3250,11 @@ mod tests {
             bumped_str,
         );
     }
-
-    /// `query()` re-checks `filter.matches()` per candidate against
-    /// the live `nodes` entry, so a filter with an always-true
-    /// non-indexed predicate (e.g., `min_memory_gb = 0`) must produce
-    /// the same result as the equivalent indexed-only filter. This
-    /// pins the equivalence under semantically-redundant predicate
-    /// expansions and would catch a future regression that special-
-    /// cased the index-only path again without re-running matches().
-    #[test]
-    fn query_indexed_only_matches_with_redundant_non_indexed_predicate() {
-        let index = CapabilityIndex::new();
-
-        for i in 0..30u64 {
-            let mut caps = sample_capability_set();
-            // sample_capability_set already has tag "inference" + "gpu"; vary
-            // additional tags so filters discriminate.
-            if i % 2 == 0 {
-                caps = caps.add_tag("even");
-            }
-            if i % 3 == 0 {
-                caps = caps.add_tag("triple");
-            }
-            let ann = CapabilityAnnouncement::new(i, test_entity(), 1, caps);
-            index.index(ann);
-        }
-
-        let indexed_only = CapabilityFilter::new()
-            .require_tag("even")
-            .require_tag("inference");
-        // Same predicates plus an always-true non-indexed predicate.
-        // `memory_gb` is unsigned so `>= 0` is trivially true.
-        let mut with_non_indexed = indexed_only.clone();
-        with_non_indexed.min_memory_gb = Some(0);
-
-        let mut a: Vec<u64> = index.query(&indexed_only);
-        let mut b: Vec<u64> = index.query(&with_non_indexed);
-        a.sort();
-        b.sort();
-        assert_eq!(
-            a, b,
-            "adding an always-true predicate must not change the result set"
-        );
-        assert!(!a.is_empty(), "sample data must produce non-empty results");
-    }
-
-    /// After the `find_best()` refactor that folds the index lookup
-    /// and the score lookup into a single pass, the chosen node must
-    /// still match what `query()` returns intersected with the
-    /// highest-scoring candidate. Pins the contract: any future
-    /// re-derivation of the candidate set must keep `find_best`'s
-    /// answer inside `query`'s result set.
-    #[test]
-    fn find_best_returns_a_member_of_query_results() {
-        let index = CapabilityIndex::new();
-
-        for i in 0..20u64 {
-            let mut caps = sample_capability_set();
-            // Discriminator tag.
-            if i % 4 == 0 {
-                caps = caps.add_tag("preferred");
-            }
-            // Vary memory so `prefer_memory` produces a real ordering.
-            // Phase A.5.N.3: read-modify-write through views()/setter
-            // since the typed `hardware` field is gone.
-            let mut hw = caps.views().hardware().clone();
-            hw.memory_gb = i as u32 + 1;
-            caps.set_hardware(hw);
-            let ann = CapabilityAnnouncement::new(i, test_entity(), 1, caps);
-            index.index(ann);
-        }
-
-        let filter = CapabilityFilter::new().require_tag("preferred");
-        let req = CapabilityRequirement::from_filter(filter.clone()).prefer_memory(1.0);
-
-        let candidates = index.query(&filter);
-        let chosen = index
-            .find_best(&req)
-            .expect("non-empty candidate set must yield a winner");
-
-        assert!(
-            candidates.contains(&chosen),
-            "find_best returned {} which is not in query() candidates {:?}",
-            chosen,
-            candidates,
-        );
-
-        // With `prefer_memory(1.0)` and our memory_gb assignment, the
-        // largest-memory candidate must win — pins the score path.
-        let expected_winner = candidates
-            .iter()
-            .max_by_key(|&&id| {
-                index
-                    .nodes
-                    .get(&id)
-                    .map(|n| n.capabilities.views().hardware().memory_gb)
-                    .unwrap_or(0)
-            })
-            .copied()
-            .expect("non-empty candidates");
-        assert_eq!(
-            chosen, expected_winner,
-            "find_best must pick the highest-memory candidate under prefer_memory(1.0)"
-        );
-    }
-
-    #[test]
-    fn test_regression_query_rejects_stale_inverted_index_entry() {
-        // Regression: `query()` had a fast path that, when the filter
-        // only constrained indexed dimensions, returned every candidate
-        // produced by the inverted indexes after only a `contains_key`
-        // presence check on `nodes`. The inverted indexes update
-        // non-atomically with `nodes` (`remove_from_indexes(old)` →
-        // `add_to_indexes(new)` → `nodes.insert(new)`), so during a
-        // capability re-announcement that swaps a tag the inverted
-        // index could already advertise the node under the new tag
-        // while `nodes` still held the old `CapabilitySet`. The fast
-        // path then leaked the node into a query that did not actually
-        // match its current capabilities.
-        //
-        // The fix removes the fast path and always re-runs
-        // `filter.matches()` against the current capabilities. This
-        // test deterministically reproduces the inconsistent state by
-        // directly manipulating the private indexes — no thread race
-        // needed.
-        let index = CapabilityIndex::new();
-
-        // Step 1: index the node honestly via the public API with
-        // tags = ["alpha"].
-        let caps_alpha = CapabilitySet::new().add_tag("alpha");
-        let ann = CapabilityAnnouncement::new(1, test_entity(), 1, caps_alpha);
-        index.index(ann);
-
-        // Sanity: alpha matches, beta does not.
-        let filter_alpha = CapabilityFilter::new().require_tag("alpha");
-        let filter_beta = CapabilityFilter::new().require_tag("beta");
-        assert_eq!(index.query(&filter_alpha), vec![1]);
-        assert!(index.query(&filter_beta).is_empty());
-
-        // Step 2: simulate the mid-reindex race window. Move node 1
-        // from `by_tag["alpha"]` to `by_tag["beta"]` WITHOUT updating
-        // `nodes`. This is exactly the state the inverted-index update
-        // produces between `add_to_indexes(new)` and
-        // `nodes.insert(new)` when "alpha"→"beta" tags swap.
-        //
-        // Faithful to production: `remove_from_indexes` drops the
-        // outer-map entry once its inner set is empty (the `remove_if`
-        // call that prevents an unbounded leak of empty `HashSet`
-        // shells). Without that drop here, the simulation would leave
-        // `by_tag["alpha"]` as an empty entry — observable to
-        // `build_candidate_set` as `Some(empty)` instead of the real
-        // `None`, which paper-thinly changes the candidate-set
-        // construction shape compared to what production emits.
-        index
-            .by_tag
-            .get_mut("alpha")
-            .expect("alpha tag entry was indexed")
-            .remove(&1);
-        index.by_tag.remove_if("alpha", |_, set| set.is_empty());
-        index
-            .by_tag
-            .entry("beta".to_string())
-            .or_default()
-            .insert(1);
-
-        // Step 3: with the fix, query(beta) does NOT return node 1
-        // because nodes[1] still has tags=["alpha"] which does not
-        // match beta. The buggy fast path would return it via
-        // contains_key alone.
-        assert!(
-            index.query(&filter_beta).is_empty(),
-            "query(beta) leaked a node whose nodes[] entry does not advertise beta"
-        );
-
-        // Step 4: same invariant for find_best — its previous
-        // implementation gated `filter.matches()` on
-        // `needs_full_check()` and skipped the re-check on
-        // index-only filters, surfacing the same leak as a chosen
-        // node that did not actually match.
-        let req = CapabilityRequirement::from_filter(filter_beta.clone());
-        assert!(
-            index.find_best(&req).is_none(),
-            "find_best(beta) leaked a non-matching node from the stale inverted index"
-        );
-    }
-
     // ========================================================================
-    // Scope helpers (`scope_from_tags` + `matches_scope`)
+    // Scope helpers (`matches_scope`) — scope tag resolution itself
+    // is tested in `behavior::fold::capability_bridge::tests` under
+    // `scope_from_membership_tags`.
     // ========================================================================
-
-    /// Phase A.5.N.2: scope tests now exercise `&HashSet<Tag>`.
-    /// Helper parses each input string through the permissive
-    /// `Tag::parse` so reserved-prefix tags (`scope:tenant:foo`)
-    /// land as `Tag::Reserved`, mirroring real wire-form decoding.
-    fn tags_from(strs: &[&str]) -> HashSet<Tag> {
-        strs.iter().filter_map(|s| Tag::parse(s).ok()).collect()
-    }
-
-    #[test]
-    fn scope_from_tags_no_scope_tag_is_global() {
-        assert!(matches!(
-            scope_from_tags(&tags_from(&[])),
-            CapabilityScope::Global
-        ));
-        assert!(matches!(
-            scope_from_tags(&tags_from(&["gpu", "model:llama3"])),
-            CapabilityScope::Global
-        ));
-        // Explicit `scope:global` resolves the same as no tag.
-        assert!(matches!(
-            scope_from_tags(&tags_from(&[TAG_SCOPE_GLOBAL])),
-            CapabilityScope::Global
-        ));
-    }
-
-    #[test]
-    fn scope_from_tags_subnet_local_wins() {
-        // Even with tenants and regions present, `subnet-local` is
-        // the strictest form and dominates.
-        let tags = tags_from(&[
-            TAG_SCOPE_SUBNET_LOCAL,
-            &format!("{TAG_SCOPE_TENANT_PREFIX}foo"),
-            &format!("{TAG_SCOPE_REGION_PREFIX}eu-west"),
-        ]);
-        assert_eq!(scope_from_tags(&tags), CapabilityScope::SubnetLocal);
-    }
-
-    #[test]
-    fn scope_from_tags_multiple_tenants() {
-        let tags = tags_from(&[
-            &format!("{TAG_SCOPE_TENANT_PREFIX}a"),
-            &format!("{TAG_SCOPE_TENANT_PREFIX}b"),
-            "gpu",
-        ]);
-        match scope_from_tags(&tags) {
-            CapabilityScope::Tenants(mut ts) => {
-                // HashSet iteration is unordered; sort for stable comparison.
-                ts.sort();
-                assert_eq!(ts, vec!["a".to_string(), "b".to_string()]);
-            }
-            other => panic!("expected Tenants, got {other:?}"),
-        }
-
-        // Empty tenant id is silently dropped.
-        let tags = tags_from(&[
-            TAG_SCOPE_TENANT_PREFIX,
-            &format!("{TAG_SCOPE_TENANT_PREFIX}real"),
-        ]);
-        match scope_from_tags(&tags) {
-            CapabilityScope::Tenants(ts) => assert_eq!(ts, vec!["real".to_string()]),
-            other => panic!("expected Tenants, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn scope_from_tags_tenants_and_regions() {
-        let tags = tags_from(&[
-            &format!("{TAG_SCOPE_TENANT_PREFIX}oem-123"),
-            &format!("{TAG_SCOPE_REGION_PREFIX}eu-west"),
-        ]);
-        match scope_from_tags(&tags) {
-            CapabilityScope::TenantsAndRegions { tenants, regions } => {
-                assert_eq!(tenants, vec!["oem-123".to_string()]);
-                assert_eq!(regions, vec!["eu-west".to_string()]);
-            }
-            other => panic!("expected TenantsAndRegions, got {other:?}"),
-        }
-    }
 
     #[test]
     fn matches_scope_global_visible_to_tenant_filter() {
@@ -6500,7 +3284,6 @@ mod tests {
             false
         ));
     }
-
     #[test]
     fn matches_scope_subnet_local_excluded_from_any() {
         // SubnetLocal is opt-out from cross-subnet discovery: it
@@ -6532,7 +3315,6 @@ mod tests {
             false
         ));
     }
-
     // ========================================================================
     // CapabilitySet builders for reserved scope tags
     // ========================================================================
@@ -6545,15 +3327,16 @@ mod tests {
         assert!(caps.has_tag("gpu"));
         assert!(caps.has_tag("scope:tenant:oem-123"));
 
-        // The tag list resolves through `scope_from_tags` to the
-        // expected variant — proves the builder writes the form
-        // the resolver matches on.
+        // The builder writes the wire string the bridge's
+        // `scope_from_membership_tags` matches on.
+        let wire_tags: Vec<String> = caps.tags.iter().map(|t| t.to_string()).collect();
+        let resolved =
+            super::super::fold::capability_bridge::scope_from_membership_tags(&wire_tags);
         assert_eq!(
-            scope_from_tags(&caps.tags),
+            resolved,
             CapabilityScope::Tenants(vec!["oem-123".to_string()]),
         );
     }
-
     #[test]
     fn with_tenant_scope_is_idempotent_and_drops_empty() {
         let caps = CapabilitySet::new()
@@ -6576,14 +3359,18 @@ mod tests {
         );
         assert_eq!(tenant_tags[0], "scope:tenant:oem-123");
     }
-
     #[test]
     fn with_region_and_subnet_local_scope_compose_with_resolver() {
+        use super::super::fold::capability_bridge::scope_from_membership_tags;
+        let to_wire = |caps: &CapabilitySet| -> Vec<String> {
+            caps.tags.iter().map(|t| t.to_string()).collect()
+        };
+
         // Region builder produces a Regions scope.
         let caps_region = CapabilitySet::new().with_region_scope("eu-west");
         assert!(caps_region.has_tag("scope:region:eu-west"));
         assert_eq!(
-            scope_from_tags(&caps_region.tags),
+            scope_from_membership_tags(&to_wire(&caps_region)),
             CapabilityScope::Regions(vec!["eu-west".to_string()]),
         );
 
@@ -6608,11 +3395,10 @@ mod tests {
             .collect();
         assert_eq!(local_tags.len(), 1);
         assert_eq!(
-            scope_from_tags(&caps_local.tags),
+            scope_from_membership_tags(&to_wire(&caps_local)),
             CapabilityScope::SubnetLocal
         );
     }
-
     // ========================================================================
     // Chain composition helpers — Phase 3 of CAPABILITY_ENHANCEMENTS_PLAN.md.
     // ========================================================================
@@ -6623,13 +3409,11 @@ mod tests {
             body: body.to_string(),
         }
     }
-
     #[test]
     fn require_chain_emits_causal_reserved_tag() {
         let caps = CapabilitySet::new().require_chain("abc123");
         assert!(caps.tags.contains(&reserved_tag("causal:", "abc123")));
     }
-
     #[test]
     fn require_chain_is_idempotent() {
         let caps = CapabilitySet::new()
@@ -6642,19 +3426,16 @@ mod tests {
             .count();
         assert_eq!(causal_count, 1);
     }
-
     #[test]
     fn require_chain_drops_empty_hash() {
         let caps = CapabilitySet::new().require_chain("");
         assert!(caps.tags.is_empty());
     }
-
     #[test]
     fn require_chain_tip_emits_with_seq_separator() {
         let caps = CapabilitySet::new().require_chain_tip("abc", 100);
         assert!(caps.tags.contains(&reserved_tag("causal:", "abc:100")));
     }
-
     #[test]
     fn require_chain_range_emits_bracket_form() {
         let caps = CapabilitySet::new().require_chain_range("abc", 100, 200);
@@ -6662,7 +3443,6 @@ mod tests {
             .tags
             .contains(&reserved_tag("causal:", "abc[100..200]")));
     }
-
     #[test]
     fn require_chain_range_drops_inverted_or_equal_range() {
         // Equal range: silently dropped (zero-length range is meaningless).
@@ -6672,7 +3452,6 @@ mod tests {
         let caps = CapabilitySet::new().require_chain_range("abc", 200, 100);
         assert!(caps.tags.is_empty());
     }
-
     #[test]
     fn require_any_chain_emits_one_tag_per_hash() {
         let caps = CapabilitySet::new().require_any_chain(["abc", "def", "ghi"]);
@@ -6681,25 +3460,21 @@ mod tests {
         assert!(caps.tags.contains(&reserved_tag("causal:", "ghi")));
         assert_eq!(caps.tags.len(), 3);
     }
-
     #[test]
     fn require_any_chain_skips_empty_hashes() {
         let caps = CapabilitySet::new().require_any_chain(["abc", "", "def"]);
         assert_eq!(caps.tags.len(), 2);
     }
-
     #[test]
     fn from_fork_emits_fork_of_reserved_tag() {
         let caps = CapabilitySet::new().from_fork("parent_hash");
         assert!(caps.tags.contains(&reserved_tag("fork-of:", "parent_hash")));
     }
-
     #[test]
     fn heat_level_emits_chain_hash_equals_rate_with_two_decimals() {
         let caps = CapabilitySet::new().heat_level("abc", 0.85);
         assert!(caps.tags.contains(&reserved_tag("heat:", "abc=0.85")));
     }
-
     #[test]
     fn heat_level_clamps_out_of_range_rate() {
         // Above 1.0 clamps to 1.00.
@@ -6709,7 +3484,6 @@ mod tests {
         let caps = CapabilitySet::new().heat_level("abc", -0.3);
         assert!(caps.tags.contains(&reserved_tag("heat:", "abc=0.00")));
     }
-
     #[test]
     fn heat_level_drops_non_finite_rate() {
         let caps = CapabilitySet::new().heat_level("abc", f64::NAN);
@@ -6717,7 +3491,6 @@ mod tests {
         let caps = CapabilitySet::new().heat_level("abc", f64::INFINITY);
         assert!(caps.tags.is_empty());
     }
-
     #[test]
     fn chain_helpers_compose_naturally_in_a_builder_chain() {
         // Pinned: helpers chain ergonomically without intermediate
@@ -6738,64 +3511,6 @@ mod tests {
             .count();
         assert_eq!(reserved_count, 7, "tags: {:?}", caps.tags);
     }
-
-    /// Repro for the failing Go `TestHardwareAndGpuFilter_Matches`:
-    /// announce a node with NVIDIA GPU + memory, then query for
-    /// `RequireGPU + GPUVendor=Nvidia + MinVRAMGB + MinMemoryGB`.
-    /// Self-match must succeed.
-    #[test]
-    fn hardware_and_gpu_filter_self_matches() {
-        let gpu = GpuInfo::new(GpuVendor::Nvidia, "h100", 80);
-        let hw = HardwareCapabilities::new()
-            .with_cpu(16, 16)
-            .with_memory(64)
-            .with_gpu(gpu);
-        let caps = CapabilitySet::new().with_hardware(hw).add_tag("gpu");
-
-        let index = CapabilityIndex::new();
-        let ann = CapabilityAnnouncement::new(42u64, test_entity(), 1, caps);
-        index.index(ann);
-
-        let filter = CapabilityFilter::new()
-            .require_gpu()
-            .with_gpu_vendor(GpuVendor::Nvidia)
-            .with_min_vram(40)
-            .with_min_memory(32);
-        let hits = index.query(&filter);
-        assert!(hits.contains(&42u64), "self-match expected, got {:?}", hits);
-    }
-
-    /// Repro that exercises announcement signing + clone, mirroring
-    /// what `MeshNode::announce_capabilities` does before calling
-    /// `CapabilityIndex::index`. Catches any mutation of the GPU
-    /// vendor field across that path.
-    #[test]
-    fn hardware_and_gpu_filter_self_matches_after_sign_and_clone() {
-        use super::super::super::identity::EntityKeypair;
-        let keypair = EntityKeypair::generate();
-
-        let gpu = GpuInfo::new(GpuVendor::Nvidia, "h100", 80);
-        let hw = HardwareCapabilities::new()
-            .with_cpu(16, 16)
-            .with_memory(64)
-            .with_gpu(gpu);
-        let caps = CapabilitySet::new().with_hardware(hw).add_tag("gpu");
-
-        let mut ann = CapabilityAnnouncement::new(42u64, keypair.entity_id().clone(), 1, caps);
-        ann.sign(&keypair);
-
-        let index = CapabilityIndex::new();
-        index.index(ann.clone());
-
-        let filter = CapabilityFilter::new()
-            .require_gpu()
-            .with_gpu_vendor(GpuVendor::Nvidia)
-            .with_min_vram(40)
-            .with_min_memory(32);
-        let hits = index.query(&filter);
-        assert!(hits.contains(&42u64), "self-match expected, got {:?}", hits);
-    }
-
     // ========================================================================
     // View projections — `From<&CapabilitySet>` + `CapabilitySet::views`.
     // Phase A.4: pin the contract so Phase A.5's wire-format migration
@@ -6813,7 +3528,6 @@ mod tests {
         let hw_via_from: HardwareCapabilities = (&caps).into();
         assert_eq!(hw_via_from, hw_input);
     }
-
     #[test]
     fn projection_software_and_resource_limits_round_trip() {
         // Round-trip via builder → views for software and limits.
@@ -6829,7 +3543,6 @@ mod tests {
         let limits: ResourceLimits = (&caps).into();
         assert_eq!(limits, limits_input);
     }
-
     #[test]
     fn views_struct_returns_all_five_projections() {
         // Pin: `views()` returns the five typed projections together,
@@ -6844,7 +3557,6 @@ mod tests {
         assert!(!views.models().is_empty());
         assert!(!views.tools().is_empty());
     }
-
     #[test]
     fn lazy_view_handle_caches_per_projection() {
         // Phase 1 of `CAPABILITY_ENHANCEMENTS_PLAN.md`: each
@@ -6863,7 +3575,6 @@ mod tests {
             "models projection must be cached",
         );
     }
-
     // ========================================================================
     // Phase A.5.1: typed-tag access methods + wire-format snapshots.
     // ========================================================================
@@ -6897,7 +3608,6 @@ mod tests {
             assert_eq!(a.version, b.version);
         }
     }
-
     #[test]
     fn typed_tags_default_capability_set_is_empty() {
         // Pinned: a default CapabilitySet's typed-tag set is empty.
@@ -6906,7 +3616,6 @@ mod tests {
         let caps = CapabilitySet::default();
         assert!(caps.typed_tags().is_empty());
     }
-
     // ========================================================================
     // CapabilitySet::diff tests (Phase 1 of CAPABILITY_ENHANCEMENTS_PLAN.md).
     // ========================================================================
@@ -6921,7 +3630,6 @@ mod tests {
         assert!(diff.removed_tags.is_empty());
         assert!(diff.changed_metadata.is_empty());
     }
-
     #[test]
     fn diff_against_empty_reports_full_added() {
         let prev = CapabilitySet::default();
@@ -6941,7 +3649,6 @@ mod tests {
                 if key == "intent" && value == "ml-training"
         ));
     }
-
     #[test]
     fn diff_added_and_removed_tags_are_separated() {
         // Distinct sets: prev has {a, b}, curr has {b, c}.
@@ -6954,7 +3661,6 @@ mod tests {
         assert_eq!(added, vec!["c".to_string()]);
         assert_eq!(removed, vec!["a".to_string()]);
     }
-
     #[test]
     fn diff_ignores_separator_form_on_axis_value_tags() {
         // Regression for CR-3: `Tag::AxisValue` PartialEq distinguishes
@@ -6989,7 +3695,6 @@ mod tests {
             diff.removed_tags
         );
     }
-
     #[test]
     fn diff_metadata_updated_for_value_change() {
         let prev = CapabilitySet::new().with_metadata("intent", "ml-training");
@@ -7011,7 +3716,6 @@ mod tests {
             other => panic!("expected Updated, got {other:?}"),
         }
     }
-
     #[test]
     fn diff_metadata_key_rename_is_remove_plus_add_not_update() {
         // Pinned: a key rename surfaces as Removed + Added, NOT
@@ -7037,7 +3741,6 @@ mod tests {
             "expected Added(new-key) + Removed(old-key); got {kinds:?}"
         );
     }
-
     #[test]
     fn diff_changed_metadata_preserves_btreemap_ordering() {
         // BTreeMap iteration order is stable + sorted. The diff
@@ -7060,7 +3763,6 @@ mod tests {
             .collect();
         assert_eq!(keys, vec!["alpha", "middle", "zebra"]);
     }
-
     #[test]
     fn diff_round_trips_via_apply_diff_on_canonical_diff_engine() {
         // Property-style: applying the structural DiffEngine ops
@@ -7095,7 +3797,6 @@ mod tests {
         assert!(!cset_diff.is_empty());
         assert_eq!(cset_diff.changed_metadata.len(), 2);
     }
-
     #[test]
     fn wire_format_serialization_snapshot() {
         // Pin the post-Phase-A.5.N.3 wire format. CapabilitySet
@@ -7139,7 +3840,6 @@ mod tests {
         assert!(!json.contains("\"tools\":"), "stale tools key: {json}");
         assert!(!json.contains("\"limits\":"), "stale limits key: {json}");
     }
-
     #[test]
     fn wire_format_round_trips_through_json() {
         // Pinned: a CapabilitySet round-trips through `to_bytes` →
@@ -7153,7 +3853,6 @@ mod tests {
         let caps2 = CapabilitySet::from_bytes(&bytes).expect("round-trip parses");
         assert_eq!(caps, caps2);
     }
-
     #[test]
     fn typed_tags_includes_legacy_string_tags() {
         // Pinned: legacy `Vec<String>` tags appear in the typed-
@@ -7174,478 +3873,5 @@ mod tests {
             .iter()
             .any(|t| matches!(t, TagT::Reserved { prefix, body }
                 if prefix == "scope:" && body == "tenant:acme")));
-    }
-
-    // ========================================================================
-    // origin_hash side index (PR-5g)
-    // ========================================================================
-
-    /// `get_by_origin_hash` returns the indexed `CapabilitySet`
-    /// when an announcement with a matching wire-form origin_hash
-    /// has been indexed. Key shape is the low 32 bits of
-    /// `EntityId::origin_hash()` (zero-extended back to u64) so
-    /// it matches the receiver-side `NetHeader::origin_hash.into()`
-    /// projection.
-    #[test]
-    fn get_by_origin_hash_returns_indexed_caps() {
-        // Use a non-zero entity so origin_hash is non-trivial —
-        // [0; 32] derives a fixed value, but a different key
-        // exercises the index more honestly.
-        let entity = super::super::super::identity::EntityId::from_bytes([7u8; 32]);
-        let wire_origin = (entity.origin_hash() as u32) as u64;
-        let index = CapabilityIndex::new();
-        let caps = CapabilitySet::new().add_tag("test-marker");
-        index.index(CapabilityAnnouncement::new(42, entity.clone(), 1, caps));
-
-        let resolved = index
-            .get_by_origin_hash(wire_origin)
-            .expect("side index must surface the indexed caps");
-        assert!(resolved
-            .tags
-            .iter()
-            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "test-marker")));
-    }
-
-    /// Unknown origin_hash returns `None` — fail-closed for the
-    /// caller (mesh dispatch path defaults to empty caps and
-    /// scope-axis admission rejects).
-    #[test]
-    fn get_by_origin_hash_returns_none_for_unknown_origin() {
-        let index = CapabilityIndex::new();
-        let entity = super::super::super::identity::EntityId::from_bytes([1u8; 32]);
-        index.index(CapabilityAnnouncement::new(
-            1,
-            entity,
-            1,
-            CapabilitySet::new(),
-        ));
-        // A different origin_hash that wasn't announced.
-        assert!(index.get_by_origin_hash(0xDEAD_BEEF_u64).is_none());
-    }
-
-    /// `remove` tears down the side-index mapping so a stale
-    /// lookup doesn't surface caps from an evicted node.
-    #[test]
-    fn remove_clears_origin_hash_side_index() {
-        let entity = super::super::super::identity::EntityId::from_bytes([2u8; 32]);
-        let wire_origin = (entity.origin_hash() as u32) as u64;
-        let index = CapabilityIndex::new();
-        index.index(CapabilityAnnouncement::new(
-            99,
-            entity.clone(),
-            1,
-            CapabilitySet::new().add_tag("before"),
-        ));
-        assert!(index.get_by_origin_hash(wire_origin).is_some());
-
-        index.remove(99);
-        assert!(
-            index.get_by_origin_hash(wire_origin).is_none(),
-            "side index must clean up on remove"
-        );
-    }
-
-    /// Re-indexing the same `node_id` with a newer version replaces
-    /// the side index entry; the wire origin_hash continues to
-    /// resolve to the same node_id (entity is the same), and the
-    /// surfaced caps reflect the latest announcement.
-    #[test]
-    fn reindex_replaces_caps_under_same_origin_hash() {
-        let entity = super::super::super::identity::EntityId::from_bytes([3u8; 32]);
-        let wire_origin = (entity.origin_hash() as u32) as u64;
-        let index = CapabilityIndex::new();
-        index.index(CapabilityAnnouncement::new(
-            123,
-            entity.clone(),
-            1,
-            CapabilitySet::new().add_tag("v1-marker"),
-        ));
-        index.index(CapabilityAnnouncement::new(
-            123,
-            entity,
-            2,
-            CapabilitySet::new().add_tag("v2-marker"),
-        ));
-
-        let resolved = index
-            .get_by_origin_hash(wire_origin)
-            .expect("side index must point at the freshly-indexed node");
-        assert!(resolved
-            .tags
-            .iter()
-            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "v2-marker")));
-        // The old version's caps shouldn't surface.
-        assert!(!resolved
-            .tags
-            .iter()
-            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "v1-marker")));
-    }
-
-    /// Brute-force two distinct `EntityId`s whose wire-form
-    /// `origin_hash` (low 32 bits of the BLAKE2s projection)
-    /// collides. Birthday paradox in a 32-bit space: ~50 %
-    /// collision probability at ~2¹⁶ = 65 k samples; in practice
-    /// a 128 k sample sweep finds one in milliseconds.
-    ///
-    /// Returns `(entity_a, entity_b, wire_origin_hash)`. Both
-    /// entities have node_ids that match their `EntityId::node_id()`
-    /// derivation — both pass `node_id == entity_id.node_id()`
-    /// inside `handle_capability_announcement` — so the colliding
-    /// wire origin_hash is a real semantic concern, not a
-    /// constructible-only edge case.
-    fn find_colliding_entities() -> (
-        super::super::super::identity::EntityId,
-        super::super::super::identity::EntityId,
-        u64,
-    ) {
-        use super::super::super::identity::EntityId;
-        use std::collections::HashMap;
-        // `EntityId::origin_hash()` runs its own BLAKE2s over the
-        // 32-byte pubkey under domain `net-origin-v1`. We just
-        // need varied 32-byte inputs to sample the u32 wire-hash
-        // space — `seed.to_le_bytes()` in the first 8 bytes
-        // (zero padding elsewhere) gives us 2^64 distinct inputs
-        // without pulling in BLAKE3 or any other hash dep. Each
-        // seed → unique EntityId → effectively-random u32 wire
-        // origin_hash (per the BLAKE2s distribution).
-        let mut seen: HashMap<u32, EntityId> = HashMap::new();
-        for seed in 0u64..1 << 20 {
-            let mut bytes = [0u8; 32];
-            bytes[..8].copy_from_slice(&seed.to_le_bytes());
-            let entity = EntityId::from_bytes(bytes);
-            let wire = entity.origin_hash() as u32;
-            if let Some(prev) = seen.get(&wire) {
-                if prev.as_bytes() != entity.as_bytes() {
-                    return (prev.clone(), entity, wire as u64);
-                }
-            }
-            seen.insert(wire, entity);
-        }
-        panic!("no wire-origin_hash collision found in 2^20 trials — birthday paradox math says this should be effectively impossible; check the derivation");
-    }
-
-    /// **Fail-closed on wire-origin_hash collision.** Two distinct
-    /// entities whose `EntityId::origin_hash()` truncates to the
-    /// same `u32` share a `by_origin_hash` slot. Under the
-    /// `OriginHashSlot::Multiple` shape, `get_by_origin_hash`
-    /// returns `None` for the duration of the collision so
-    /// admission cannot use either entity's caps. Both entities
-    /// remain individually reachable via `get(node_id_*)`.
-    ///
-    /// This shape suppresses the *victim's* caps from the
-    /// admission surface but cannot impersonate them: a colliding
-    /// peer can deny scope-axis admit decisions for legitimate
-    /// publishers, but cannot widen them. The mesh's
-    /// authorization paths (`ChannelHash` / `node_id`) are
-    /// untouched.
-    #[test]
-    fn get_by_origin_hash_returns_none_on_truncation_collision() {
-        let (entity_a, entity_b, wire) = find_colliding_entities();
-        let node_a: u64 = 0xAAAA_AAAA_AAAA_AAAA;
-        let node_b: u64 = 0xBBBB_BBBB_BBBB_BBBB;
-
-        let index = CapabilityIndex::new();
-        // Index A first; the slot is Single(A) and lookup resolves.
-        index.index(CapabilityAnnouncement::new(
-            node_a,
-            entity_a.clone(),
-            1,
-            CapabilitySet::new().add_tag("from-A"),
-        ));
-        let resolved_a = index
-            .get_by_origin_hash(wire)
-            .expect("A must surface via wire origin_hash before B is indexed");
-        assert!(resolved_a
-            .tags
-            .iter()
-            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "from-A")));
-
-        // Index B with the colliding wire origin_hash.
-        index.index(CapabilityAnnouncement::new(
-            node_b,
-            entity_b.clone(),
-            1,
-            CapabilitySet::new().add_tag("from-B"),
-        ));
-
-        // Lookup is now ambiguous → None. Neither A nor B's caps
-        // surface via the side index.
-        assert!(
-            index.get_by_origin_hash(wire).is_none(),
-            "ambiguous slot must fail-closed via None — the caller treats this as publisher-unknown for admission"
-        );
-
-        // Both entities are still independently indexed under
-        // their distinct node_ids — the collision only affects
-        // the origin_hash → node_id projection.
-        let direct_a = index
-            .get(node_a)
-            .expect("A's caps must still be reachable via node_id");
-        assert!(direct_a
-            .tags
-            .iter()
-            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "from-A")));
-        let direct_b = index
-            .get(node_b)
-            .expect("B's caps must still be reachable via node_id");
-        assert!(direct_b
-            .tags
-            .iter()
-            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "from-B")));
-    }
-
-    /// Removing one of two colliders demotes the slot back to
-    /// `Single` and the surviving entity resolves again. The
-    /// resolved caps must be the survivor's — never stale state
-    /// from the departed claimant.
-    #[test]
-    fn remove_under_collision_demotes_slot_to_survivor() {
-        let (entity_a, entity_b, wire) = find_colliding_entities();
-        let node_a: u64 = 0x1111_1111_1111_1111;
-        let node_b: u64 = 0x2222_2222_2222_2222;
-        let index = CapabilityIndex::new();
-        index.index(CapabilityAnnouncement::new(
-            node_a,
-            entity_a,
-            1,
-            CapabilitySet::new().add_tag("a-caps"),
-        ));
-        index.index(CapabilityAnnouncement::new(
-            node_b,
-            entity_b,
-            1,
-            CapabilitySet::new().add_tag("b-caps"),
-        ));
-        // While both are indexed the slot is ambiguous.
-        assert!(
-            index.get_by_origin_hash(wire).is_none(),
-            "both colliders indexed → ambiguous"
-        );
-
-        // Remove A — slot demotes to Single(B), lookup resolves to B.
-        index.remove(node_a);
-        let after = index
-            .get_by_origin_hash(wire)
-            .expect("survivor (B) must resolve after collider A is removed");
-        assert!(after
-            .tags
-            .iter()
-            .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "b-caps")));
-        // Sanity: A's stale caps must NOT surface.
-        assert!(
-            !after
-                .tags
-                .iter()
-                .any(|t| matches!(t, super::super::tag::Tag::Legacy(s) if s == "a-caps")),
-            "stale collider caps must not leak after remove"
-        );
-
-        // Remove B too — slot disappears entirely.
-        index.remove(node_b);
-        assert!(
-            index.get_by_origin_hash(wire).is_none(),
-            "slot drops when no claimants remain"
-        );
-    }
-
-    /// Indexing two distinct entities at the same wire
-    /// `origin_hash` bumps `collision_count` exactly once. The
-    /// counter measures *new* ambiguity events; re-asserting a
-    /// node_id that already claims the slot is idempotent.
-    #[test]
-    fn collision_count_bumps_once_per_new_ambiguity_event() {
-        let (entity_a, entity_b, _wire) = find_colliding_entities();
-        let index = CapabilityIndex::new();
-        assert_eq!(index.collision_count(), 0, "counter starts at zero");
-        index.index(CapabilityAnnouncement::new(
-            0xAAAA,
-            entity_a,
-            1,
-            CapabilitySet::new().add_tag("a-caps"),
-        ));
-        assert_eq!(
-            index.collision_count(),
-            0,
-            "first indexing of a fresh wire-hash slot is not a collision"
-        );
-        index.index(CapabilityAnnouncement::new(
-            0xBBBB,
-            entity_b,
-            1,
-            CapabilitySet::new().add_tag("b-caps"),
-        ));
-        assert_eq!(
-            index.collision_count(),
-            1,
-            "Single → Multiple transition with a distinct node_id bumps once"
-        );
-
-        // Re-asserting the SAME node_id (A) does not introduce
-        // new ambiguity; the slot already holds {A, B}. Counter
-        // stays at 1.
-        let (entity_a2, _, _) = find_colliding_entities();
-        index.index(CapabilityAnnouncement::new(
-            0xAAAA,
-            entity_a2,
-            2,
-            CapabilitySet::new().add_tag("a-caps-v2"),
-        ));
-        assert_eq!(
-            index.collision_count(),
-            1,
-            "re-asserting an existing claimant must not bump the counter"
-        );
-    }
-
-    /// Pinning the security boundary: the dispatch-side admission
-    /// surface uses `get_by_origin_hash` to resolve the publisher
-    /// of an inbound event. When the wire origin_hash is
-    /// ambiguous, the lookup must return None so the caller skips
-    /// the admission gate entirely — admitting via either
-    /// claimant's caps (or via the default `Mesh` scope of an
-    /// empty `CapabilitySet`) would be a privilege-escalation
-    /// surface for a colliding attacker.
-    #[test]
-    fn admission_lookup_is_fail_closed_under_collision() {
-        let (entity_a, entity_b, wire) = find_colliding_entities();
-        let node_a: u64 = 0xA0A0_A0A0_A0A0_A0A0;
-        let node_b: u64 = 0xB0B0_B0B0_B0B0_B0B0;
-        let index = CapabilityIndex::new();
-
-        // A claims a narrow scope (Zone). B claims a wide scope
-        // (Mesh). Under the prior last-writer-wins semantics, B
-        // overwrites A's slot and a victim's narrow-scope claim
-        // is laundered into a Mesh claim — admission would admit
-        // mesh-wide pulls under A's wire hash.
-        index.index(CapabilityAnnouncement::new(
-            node_a,
-            entity_a,
-            1,
-            CapabilitySet::new()
-                .add_tag("a-publisher")
-                .add_tag("dataforts.greedy.scope=zone"),
-        ));
-        index.index(CapabilityAnnouncement::new(
-            node_b,
-            entity_b,
-            1,
-            CapabilitySet::new()
-                .add_tag("b-publisher")
-                .add_tag("dataforts.greedy.scope=mesh"),
-        ));
-
-        // The fail-closed contract: lookup returns None. Caller
-        // (mesh dispatch) treats this as publisher-unknown and
-        // skips the greedy admission entirely.
-        assert!(
-            index.get_by_origin_hash(wire).is_none(),
-            "ambiguous publisher caps must NOT resolve through the admission lookup"
-        );
-        assert_eq!(
-            index.collision_count(),
-            1,
-            "collision counter records the ambiguity event for operator observability"
-        );
-    }
-
-    /// Pin discovery-routing perf #112: `find_nodes_scoped` must
-    /// produce the SAME node-set as the legacy two-pass form
-    /// (`self.query(filter)` followed by per-result
-    /// `self.get(node_id)` + scope check). A regression that drops
-    /// the inline `filter.matches` re-check or skips the scope
-    /// resolution would surface here by returning a different set.
-    /// Covers `Any` / `GlobalOnly` / `SameSubnet` so all three
-    /// branches of `matches_scope` get exercised in one go.
-    #[test]
-    fn find_nodes_scoped_single_pass_matches_legacy_two_pass() {
-        let index = CapabilityIndex::new();
-        // 5 nodes:
-        // - 0: global (no scope tag), tag=worker
-        // - 1: global, tag=worker
-        // - 2: subnet-local, tag=worker
-        // - 3: global, NO worker tag (filtered out by filter)
-        // - 4: subnet-local, tag=worker
-        for (i, (scope_tag, has_worker)) in [
-            (None, true),
-            (None, true),
-            (Some("scope:subnet-local"), true),
-            (None, false),
-            (Some("scope:subnet-local"), true),
-        ]
-        .iter()
-        .enumerate()
-        {
-            let mut caps = CapabilitySet::default();
-            if *has_worker {
-                caps = caps.add_tag("worker");
-            }
-            if let Some(tag) = scope_tag {
-                caps = caps.add_tag(*tag);
-            }
-            index_with_node(&index, i as u64, caps);
-        }
-
-        let filter = CapabilityFilter::new().require_tag("worker");
-
-        // Reference shape: the legacy two-pass implementation that
-        // perf #112 collapsed. Build the same node-set inline so
-        // the assertion below catches any semantic drift in the
-        // refactored single-pass code.
-        let two_pass_reference =
-            |scope_filter: &ScopeFilter<'_>, same_subnet: bool| -> std::collections::HashSet<u64> {
-                index
-                    .query(&filter)
-                    .into_iter()
-                    .filter(|&node_id| {
-                        let Some(caps) = index.get(node_id) else {
-                            return false;
-                        };
-                        let scope = scope_from_tags(&caps.tags);
-                        let needs_subnet = matches!(scope_filter, ScopeFilter::SameSubnet)
-                            || matches!(scope, CapabilityScope::SubnetLocal);
-                        let ss = if needs_subnet { same_subnet } else { false };
-                        matches_scope(&scope, scope_filter, ss)
-                    })
-                    .collect()
-            };
-
-        let to_set = |v: Vec<u64>| v.into_iter().collect::<std::collections::HashSet<u64>>();
-
-        // ScopeFilter::Any with same-subnet=true: every worker
-        // (subnet-local + global), excluding the no-worker node 3.
-        let any_ss_true = to_set(index.find_nodes_scoped(&filter, &ScopeFilter::Any, |_| true));
-        assert_eq!(
-            any_ss_true,
-            two_pass_reference(&ScopeFilter::Any, true),
-            "ScopeFilter::Any (same-subnet=true) must match the two-pass reference"
-        );
-
-        // ScopeFilter::Any with same-subnet=false: SubnetLocal
-        // peers drop out (they require same-subnet), globals stay.
-        let any_ss_false = to_set(index.find_nodes_scoped(&filter, &ScopeFilter::Any, |_| false));
-        assert_eq!(
-            any_ss_false,
-            two_pass_reference(&ScopeFilter::Any, false),
-            "ScopeFilter::Any (same-subnet=false) must match the two-pass reference"
-        );
-
-        // ScopeFilter::GlobalOnly: only nodes with no scope tag.
-        let global_only =
-            to_set(index.find_nodes_scoped(&filter, &ScopeFilter::GlobalOnly, |_| true));
-        assert_eq!(
-            global_only,
-            two_pass_reference(&ScopeFilter::GlobalOnly, true),
-            "ScopeFilter::GlobalOnly must match the two-pass reference"
-        );
-
-        // ScopeFilter::SameSubnet, same-subnet=true: all workers
-        // (the same_subnet predicate admits everything).
-        let same_subnet =
-            to_set(index.find_nodes_scoped(&filter, &ScopeFilter::SameSubnet, |_| true));
-        assert_eq!(
-            same_subnet,
-            two_pass_reference(&ScopeFilter::SameSubnet, true),
-            "ScopeFilter::SameSubnet (predicate=true) must match the two-pass reference"
-        );
     }
 }

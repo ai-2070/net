@@ -427,7 +427,7 @@ async fn wire_replay_is_dropped_at_dedup_cache() {
         "B should index A's first announce",
     );
 
-    let baseline = b.capability_index().stats().total_indexed;
+    let baseline = b.capability_fold().stats().entries as u64;
 
     // Grab A's own announcement wire bytes.
     let ann = a
@@ -447,7 +447,7 @@ async fn wire_replay_is_dropped_at_dedup_cache() {
     }
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let after = b.capability_index().stats().total_indexed;
+    let after = b.capability_fold().stats().entries as u64;
     assert_eq!(
         after, baseline,
         "total_indexed must not bump on wire-replay — dedup cache \
@@ -528,7 +528,7 @@ async fn version_collision_from_same_origin_is_dropped_at_dedup_cache() {
         "B should index announcement #1 (tag=first, v=42)",
     );
 
-    let indexed_after_first = b.capability_index().stats().total_indexed;
+    let indexed_after_first = b.capability_fold().stats().entries as u64;
 
     // Send #2 — same version, different tag. Dedup must drop it
     // at the `(a_id, 42)` cache check.
@@ -537,7 +537,7 @@ async fn version_collision_from_same_origin_is_dropped_at_dedup_cache() {
         .expect("send #2");
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let indexed_after_second = b.capability_index().stats().total_indexed;
+    let indexed_after_second = b.capability_fold().stats().entries as u64;
     assert_eq!(
         indexed_after_second, indexed_after_first,
         "second same-version announcement must NOT increment total_indexed",

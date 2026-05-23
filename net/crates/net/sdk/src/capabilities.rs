@@ -128,10 +128,10 @@
 // =============================================================================
 
 pub use net::adapter::net::behavior::capability::{
-    AcceleratorInfo, AcceleratorType, CapabilityAnnouncement, CapabilityFilter, CapabilityIndex,
-    CapabilityIndexStats, CapabilityRequirement, CapabilitySet, GpuInfo, GpuVendor,
-    HardwareCapabilities, IndexedNode, Modality, ModelCapability, ResourceLimits, ScopeFilter,
-    Signature64, SoftwareCapabilities, ToolCapability, MAX_ALLOW_LIST_LEN,
+    AcceleratorInfo, AcceleratorType, CapabilityAnnouncement, CapabilityFilter,
+    CapabilityRequirement, CapabilitySet, GpuInfo, GpuVendor, HardwareCapabilities, Modality,
+    ModelCapability, ResourceLimits, ScopeFilter, Signature64, SoftwareCapabilities,
+    ToolCapability, MAX_ALLOW_LIST_LEN,
 };
 
 // v0.4 capability-auth identity types. Aliased on re-export to
@@ -185,14 +185,30 @@ pub use net::adapter::net::behavior::capability::{CapabilitySetDiff, MetadataCha
 // =============================================================================
 // Cardinality — Phase 4 follow-on of `CAPABILITY_ENHANCEMENTS_PLAN.md`.
 //
-// `CapabilityIndex` exposes O(1) cardinality lookups via the
-// `CardinalityProvider` trait. `CardinalityCache<'a>` snapshots
-// the lookups with a TTL to drop DashMap shard contention on
-// hot loops; passes through the same trait so the planner uses
-// either as a drop-in.
+// The `CardinalityProvider` trait surfaces O(1) per-key distinct-value
+// counts to the predicate planner. Implementors plug into
+// `Predicate::evaluate_with_index`; an empty implementation falls
+// back to static-cost evaluation.
 // =============================================================================
 
-pub use net::adapter::net::behavior::capability::{CardinalityCache, CardinalityProvider};
+pub use net::adapter::net::behavior::capability::CardinalityProvider;
+
+// =============================================================================
+// Aggregation surface — Phase 6c of `MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`.
+//
+// `Mesh::capability_aggregate(matcher, group_by, agg)` answers
+// "what's available, bucketed how, counted how" against the local
+// `CapabilityFold`. `Mesh::capability_capacity_ranking(query, rtt)`
+// wraps that primitive with state breakdown + latency filtering +
+// optional summed numeric capacity + sort + limit — the
+// "top-N <thing> by available capacity within X ms latency"
+// materialized view. See [`Mesh::capability_capacity_ranking`] for
+// the example.
+// =============================================================================
+
+pub use net::adapter::net::behavior::fold::{
+    Aggregation, CapacityQuery, CapacityRow, GroupBy, TagMatcher,
+};
 
 // =============================================================================
 // Placement filter — Phase F slice 1 of `CAPABILITY_SYSTEM_PLAN.md`.

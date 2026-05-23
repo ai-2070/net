@@ -31,7 +31,7 @@ use super::admission::OverflowReject;
 use super::error::BlobError;
 use super::mesh::OverflowConfig;
 use super::refcount::BlobRefcountTable;
-use crate::adapter::net::behavior::capability::CapabilityIndex;
+use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
 use crate::adapter::net::behavior::{
     is_blob_storage_unhealthy, BlobCapability, CapabilitySet, GravityCapability, TopologyScope,
 };
@@ -76,13 +76,13 @@ pub struct OverflowPush {
     /// Wire size of the chunk in bytes. Drives the receive-
     /// side disk-gate.
     pub size_bytes: u64,
-    /// Sender's canonical `node_id`. The receiver looks the
-    /// sender's [`CapabilitySet`] up in its local
-    /// [`CapabilityIndex`] keyed on this id; the admission
-    /// check reads `overflow_enabled` + scope tags from the
-    /// looked-up snapshot, not from the request body. Defends
-    /// against a sender forging its caps via the request — the
-    /// only authority is the verified capability index.
+    /// Sender's canonical `node_id`. The receiver synthesizes
+    /// the sender's `CapabilitySet` from its local capability
+    /// fold keyed on this id; the admission check reads
+    /// `overflow_enabled` + scope tags from the synthesized
+    /// snapshot, not from the request body. Defends against a
+    /// sender forging its caps via the request — the only
+    /// authority is the verified fold state.
     pub sender_node_id: u64,
 }
 
@@ -335,7 +335,7 @@ impl OverflowPushHandler {
     /// tests can drive the admission path without
     /// constructing an [`crate::adapter::net::cortex::RpcContext`].
     ///
-    /// Reads live `user_caps_snapshot` + capability-index
+    /// Reads live `user_caps_snapshot` + capability-fold
     /// state on each call, so an operator toggling
     /// `overflow_enabled` on the local node is observed by
     /// the next inbound push.
@@ -344,15 +344,15 @@ impl OverflowPushHandler {
         use super::admission::{should_accept_overflow_from, OverflowVerdict};
         use super::blob_ref::BlobRef;
 
-        // Look up sender caps from the capability index.
+        // Synthesize sender caps from the capability fold.
         // Absent → use the empty default (which has
         // `overflow_enabled = false`); the admission gate
         // will then return `SenderNotOverflowing`.
-        let sender_caps = self
-            .mesh
-            .capability_index_arc()
-            .get(request.sender_node_id)
-            .unwrap_or_default();
+        let sender_caps =
+            super::super::super::behavior::fold::capability_bridge::synthesize_capability_set(
+                self.mesh.capability_fold(),
+                request.sender_node_id,
+            );
 
         // Snapshot local caps fresh per request so a
         // concurrent `set_overflow_enabled(false)` is
@@ -551,10 +551,10 @@ pub struct BlobOverflowController<'a> {
     /// RPC and come back `Rejected(SenderNotOverflowing)`
     /// while the announce propagates).
     pub local_caps: &'a CapabilitySet,
-    /// Index of peer capability sets. The controller walks
-    /// every overflow-enabled peer to score target
-    /// selection.
-    pub capability_index: &'a CapabilityIndex,
+    /// Fold of peer capability sets. The controller walks
+    /// every overflow-enabled peer to score target selection.
+    /// Migrated off the legacy CapabilityIndex per Phase 3b.
+    pub capability_fold: &'a Fold<CapabilityFold>,
     /// Per-chunk heat registry. The controller walks every
     /// tracked hash, decays each rate to `now`, and ranks
     /// candidates coldest-first.
@@ -580,14 +580,14 @@ impl<'a> BlobOverflowController<'a> {
     /// literal for clarity.
     pub fn new(
         local_caps: &'a CapabilitySet,
-        capability_index: &'a CapabilityIndex,
+        capability_fold: &'a Fold<CapabilityFold>,
         heat_registry: &'a Arc<parking_lot::Mutex<BlobHeatRegistry>>,
         refcount: &'a BlobRefcountTable,
         config: &'a OverflowConfig,
     ) -> Self {
         Self {
             local_caps,
-            capability_index,
+            capability_fold,
             heat_registry,
             refcount,
             config,
@@ -752,10 +752,18 @@ impl<'a> BlobOverflowController<'a> {
     ) -> Option<(u64, CapabilitySet)> {
         let required_gb = size_bytes.div_ceil(1 << 30);
         let mut best: Option<(u64, u64, CapabilitySet)> = None; // (disk_free_gb, node_id, caps)
-        for node_id in self.capability_index.all_nodes() {
-            let Some(caps) = self.capability_index.get(node_id) else {
-                continue;
-            };
+        let publishers: Vec<u64> = self
+            .capability_fold
+            .with_state(|state| state.by_node.keys().copied().collect());
+        for node_id in publishers {
+            // Synthesize a CapabilitySet from the fold's tag set
+            // for `node_id`. The downstream BlobCapability /
+            // GravityCapability projections read tags via
+            // `Tag::AxisPresent` / `Tag::AxisValue` patterns that
+            // round-trip through CapabilitySet::add_tag, so
+            // tag-based reads (storage / overflow / scope /
+            // disk_total_gb / disk_free_gb) work identically.
+            let caps = capability_bridge::synthesize_capability_set(self.capability_fold, node_id);
             let peer_blob = BlobCapability::from_capability_set(&caps);
             if !peer_blob.storage || !peer_blob.overflow_enabled {
                 continue;
@@ -802,10 +810,11 @@ impl<'a> BlobOverflowController<'a> {
 /// the context to a single tick's await; operators
 /// reconstruct the context each tick from the live state.
 pub struct OverflowTickContext<'a> {
-    /// The mesh's capability index — read for target peer
+    /// The mesh's capability fold — read for target peer
     /// selection (overflow tag + scope + disk_free + health
-    /// gate).
-    pub capability_index: &'a CapabilityIndex,
+    /// gate). Migrated off the legacy CapabilityIndex per
+    /// Phase 3b.
+    pub capability_fold: &'a Fold<CapabilityFold>,
     /// Per-chunk heat registry. The controller walks every
     /// tracked hash, decays each rate to `now`, and ranks
     /// candidates coldest-first.
@@ -1123,16 +1132,17 @@ mod tests {
         rc
     }
 
-    fn cap_index_with(peers: &[(u64, [u8; 32], CapabilitySet)]) -> CapabilityIndex {
-        let index = CapabilityIndex::new();
+    fn cap_index_with(peers: &[(u64, [u8; 32], CapabilitySet)]) -> Fold<CapabilityFold> {
+        let fold = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
         for (idx, (node_id, entity_bytes, caps)) in peers.iter().enumerate() {
             let entity = EntityId::from_bytes(*entity_bytes);
-            // CapabilityAnnouncement::new(node_id, entity, version, caps)
-            let announce =
-                CapabilityAnnouncement::new(*node_id, entity, 1 + idx as u64, caps.clone());
-            index.index(announce);
+            capability_bridge::apply_legacy_announcement(
+                &fold,
+                CapabilityAnnouncement::new(*node_id, entity, 1 + idx as u64, caps.clone()),
+            )
+            .expect("apply legacy announcement in fixture");
         }
-        index
+        fold
     }
 
     // ========================================================================
@@ -1192,14 +1202,14 @@ mod tests {
         let heat = heat_registry_with(now, &[(a, 0.0), (b, 1.0), (c, 5.0)]);
         let refcount = refcount_with_zero(&[a, b, c], 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let index = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
             max_pushes_per_tick: 16,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
 
         let cands = controller.candidates(now, |_| Some(1024));
         assert_eq!(cands.len(), 3);
@@ -1219,14 +1229,14 @@ mod tests {
         refcount.pin(a, 1_000_000);
         refcount.store_observed(b, 0, 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let index = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
             max_pushes_per_tick: 16,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
 
         let cands = controller.candidates(now, |_| Some(1024));
         // Pinned `a` skipped; only unpinned `b` surfaces.
@@ -1242,14 +1252,14 @@ mod tests {
         let refcount = BlobRefcountTable::new();
         refcount.incr(a, 1_000_000); // refcount = 1, not droppable
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let index = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
             max_pushes_per_tick: 16,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         assert!(controller.candidates(now, |_| Some(1024)).is_empty());
     }
 
@@ -1264,14 +1274,14 @@ mod tests {
         let refcount = refcount_with_zero(&[a], 1_000_000);
         let peer_low = (99u64, [0x11; 32], overflow_peer_caps(40));
         let peer_high = (88u64, [0x22; 32], overflow_peer_caps(80));
-        let index = cap_index_with(&[peer_low, peer_high]);
+        let fold = cap_index_with(&[peer_low, peer_high]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
             max_pushes_per_tick: 16,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
 
         let cands = controller.candidates(now, |_| Some(1024));
         assert_eq!(cands.len(), 1);
@@ -1294,14 +1304,14 @@ mod tests {
             .add_tag("dataforts.gravity.scope=mesh")
             .add_tag("dataforts.gravity.proximity=128");
         let peer = (99u64, [0x11; 32], no_overflow_peer_caps);
-        let index = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
             max_pushes_per_tick: 16,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         assert!(controller.candidates(now, |_| Some(1024)).is_empty());
     }
 
@@ -1314,14 +1324,14 @@ mod tests {
         let heat = heat_registry_with(now, &[(a, 0.0)]);
         let refcount = refcount_with_zero(&[a], 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(1));
-        let index = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
             max_pushes_per_tick: 16,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let four_gib: u64 = 4 * (1 << 30);
         assert!(controller.candidates(now, |_| Some(four_gib)).is_empty());
     }
@@ -1334,14 +1344,14 @@ mod tests {
         let heat = heat_registry_with(now, &entries);
         let refcount = refcount_with_zero(&hashes, 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let index = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
             max_pushes_per_tick: 2,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let cands = controller.candidates(now, |_| Some(1024));
         assert_eq!(
             cands.len(),
@@ -1361,13 +1371,13 @@ mod tests {
         let heat = heat_registry_with(now, &[(a, 0.0)]);
         let refcount = refcount_with_zero(&[a], 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let index = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let active = AtomicBool::new(false);
         let sink = OverflowPushRecorder::new();
 
@@ -1396,13 +1406,13 @@ mod tests {
         let heat = heat_registry_with(now, &[(a, 0.0)]);
         let refcount = refcount_with_zero(&[a], 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let index = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let active = AtomicBool::new(false);
         let sink = OverflowPushRecorder::new();
 
@@ -1435,13 +1445,13 @@ mod tests {
         let heat = heat_registry_with(now, &[(a, 0.0)]);
         let refcount = refcount_with_zero(&[a], 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let index = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: false, // master switch off
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let active = AtomicBool::new(false);
         let sink = OverflowPushRecorder::new();
 
@@ -1473,13 +1483,13 @@ mod tests {
         let heat = heat_registry_with(now, &[(a, 0.0)]);
         let refcount = refcount_with_zero(&[a], 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let index = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let active = AtomicBool::new(false);
         let sink = OverflowPushRecorder::new();
         sink.fail_count.store(1, Ordering::Relaxed);
@@ -1515,13 +1525,13 @@ mod tests {
             .add_tag("dataforts.gravity.enabled")
             .add_tag("dataforts.gravity.scope=mesh");
         let peer = (99u64, [0x11; 32], no_overflow_peer_caps);
-        let index = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let active = AtomicBool::new(false);
         let sink = OverflowPushRecorder::new();
 
@@ -1558,7 +1568,7 @@ mod tests {
         let heat = heat_registry_with(now, &[(a, 0.0)]);
         let refcount = refcount_with_zero(&[a], 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let index = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         // Local caps WITHOUT `dataforts.blob.overflow` tag.
         let local = CapabilitySet::new()
             .add_tag("dataforts.blob.storage")
@@ -1569,7 +1579,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let active = AtomicBool::new(false);
         let sink = OverflowPushRecorder::new();
 
@@ -1610,14 +1620,14 @@ mod tests {
         let heat = heat_registry_with(now, &entries);
         let refcount = refcount_with_zero(&hashes, 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(80));
-        let index = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
             max_pushes_per_tick: 2,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let active = AtomicBool::new(false);
         let sink = OverflowPushRecorder::new();
 
@@ -1664,14 +1674,14 @@ mod tests {
         );
         let refcount = refcount_with_zero(&[small1, big1, small2, big2], 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(80));
-        let index = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
             max_pushes_per_tick: 3,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let active = AtomicBool::new(false);
         let sink = OverflowPushRecorder::new();
 
@@ -1711,13 +1721,13 @@ mod tests {
         let heat = heat_registry_with(now, &[(a, 0.0)]);
         let refcount = refcount_with_zero(&[a], 1_000_000);
         let peer = (99u64, [0x11; 32], overflow_peer_caps(50));
-        let index = cap_index_with(&[peer]);
+        let fold = cap_index_with(&[peer]);
         let local = overflow_enabled_local_caps();
         let cfg = OverflowConfig {
             enabled: true,
             ..Default::default()
         };
-        let controller = BlobOverflowController::new(&local, &index, &heat, &refcount, &cfg);
+        let controller = BlobOverflowController::new(&local, &fold, &heat, &refcount, &cfg);
         let active = AtomicBool::new(false);
         let sink = OverflowPushRecorder::new();
 

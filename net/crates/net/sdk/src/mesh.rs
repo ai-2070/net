@@ -814,6 +814,92 @@ impl Mesh {
         self.node.find_best_node_scoped(req, scope)
     }
 
+    /// Bucketed aggregation over the local capability fold. Composes
+    /// [`TagMatcher`](crate::capabilities::TagMatcher) ×
+    /// [`GroupBy`](crate::capabilities::GroupBy) ×
+    /// [`Aggregation`](crate::capabilities::Aggregation) into a
+    /// `Vec<(bucket, value)>` sorted lex by bucket key. Phase 6c-A
+    /// of `MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`.
+    ///
+    /// `matcher = None` walks every entry. Returns an empty vec when
+    /// no entries match.
+    pub fn capability_aggregate(
+        &self,
+        matcher: Option<crate::capabilities::TagMatcher>,
+        group_by: crate::capabilities::GroupBy,
+        agg: crate::capabilities::Aggregation,
+    ) -> Vec<(String, u64)> {
+        self.node
+            .capability_fold()
+            .aggregate(matcher, group_by, agg)
+    }
+
+    /// Capacity-ranked materialized view. Wraps
+    /// [`Self::capability_aggregate`] with per-bucket state
+    /// breakdown (`idle` / `busy` / `reserved`), an RTT gate, and
+    /// optional summed numeric capacity. Phase 6c-B of
+    /// `MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`.
+    ///
+    /// `rtt_lookup` maps a publisher's `node_id` to current RTT in
+    /// milliseconds. When `query.max_rtt_ms` is `None`, the closure
+    /// is never invoked; when set, publishers whose lookup returns
+    /// `None` are dropped (fail-closed — never-pinged nodes don't
+    /// ride a "fastest available" filter as zero).
+    ///
+    /// Faulty entries are always excluded. Rows return sorted by
+    /// `available` descending; ties broken by bucket key ascending.
+    /// Truncated to `query.limit` (0 = no truncation).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # async fn doc() -> net_sdk::error::Result<()> {
+    /// use net_sdk::capabilities::{
+    ///     CapabilitySet, CapacityQuery, GroupBy, TagMatcher,
+    /// };
+    /// use net_sdk::mesh::MeshBuilder;
+    ///
+    /// let node = MeshBuilder::new("127.0.0.1:0", &[0x42u8; 32])?
+    ///     .build()
+    ///     .await?;
+    /// node.announce_capabilities(
+    ///     CapabilitySet::new()
+    ///         .add_tag("hardware.gpu")
+    ///         .add_tag("hardware.gpu.h100")
+    ///         .add_tag("hardware.gpu.count=8"),
+    /// )
+    /// .await?;
+    ///
+    /// // Top GPU types by available capacity, no RTT filter,
+    /// // summed count column populated.
+    /// let view = node.capability_capacity_ranking(
+    ///     CapacityQuery {
+    ///         matcher: Some(TagMatcher::Prefix { value: "hardware.gpu".into() }),
+    ///         group_by: GroupBy::TagStem { prefix: "hardware.gpu".into() },
+    ///         max_rtt_ms: None,
+    ///         sum_axis_key: Some("hardware.gpu.count".into()),
+    ///         limit: 5,
+    ///     },
+    ///     |_node_id| None,
+    /// );
+    /// // Self-match: one bucket per stem this node carries.
+    /// assert!(view.iter().any(|row| row.bucket == "h100"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn capability_capacity_ranking<R>(
+        &self,
+        query: crate::capabilities::CapacityQuery,
+        rtt_lookup: R,
+    ) -> Vec<crate::capabilities::CapacityRow>
+    where
+        R: Fn(u64) -> Option<u32>,
+    {
+        self.node
+            .capability_fold()
+            .capacity_ranking(query, rtt_lookup)
+    }
+
     // ---- Lifecycle ----
 
     /// Set a migration handler (for Mikoshi daemon migration).

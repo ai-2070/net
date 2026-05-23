@@ -33,10 +33,10 @@ use std::sync::Arc;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
 
+use net::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
 use net::adapter::net::behavior::{
-    global_placement_filter_registry, Artifact, CapabilityAnnouncement, CapabilityIndex,
-    CapabilitySet, EvalContext, PlacementFilter, PlacementNodeId, Predicate, StandardPlacement,
-    Tag, TagKey, TaxonomyAxis,
+    global_placement_filter_registry, Artifact, CapabilityAnnouncement, CapabilitySet, EvalContext,
+    PlacementFilter, PlacementNodeId, Predicate, StandardPlacement, Tag, TagKey, TaxonomyAxis,
 };
 use net::adapter::net::identity::EntityId;
 
@@ -44,12 +44,12 @@ use net::adapter::net::identity::EntityId;
 // Setup helpers
 // ============================================================================
 
-/// Build a `CapabilityIndex` populated with `count` candidate nodes.
-/// Each node has a small, realistic cap set: a region scope tag, a
-/// hardware GPU tag, and a 2-key metadata blob. Mirrors the kind of
-/// index a placement decision would actually run against.
-fn make_index(count: usize) -> Arc<CapabilityIndex> {
-    let index = CapabilityIndex::new();
+/// Build a `Fold<CapabilityFold>` populated with `count` candidate
+/// nodes. Each node has a small, realistic cap set: a region scope
+/// tag, a hardware GPU tag, and a 2-key metadata blob. Mirrors the
+/// kind of fold a placement decision would actually run against.
+fn make_fold(count: usize) -> Arc<Fold<CapabilityFold>> {
+    let fold = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
     let eid = EntityId::from_bytes([0u8; 32]);
     for i in 0..count {
         let caps = CapabilitySet::default()
@@ -58,9 +58,10 @@ fn make_index(count: usize) -> Arc<CapabilityIndex> {
             .with_metadata("intent", "ml-training")
             .with_metadata("region", if i % 2 == 0 { "us-east" } else { "us-west" });
         let ad = CapabilityAnnouncement::new(0x1000 + i as u64, eid.clone(), 1, caps);
-        index.index(ad);
+        capability_bridge::apply_legacy_announcement(&fold, ad)
+            .expect("apply legacy announcement in fixture");
     }
-    Arc::new(index)
+    Arc::new(fold)
 }
 
 /// `Arc<dyn PlacementFilter>` factory that scores every candidate
@@ -78,31 +79,24 @@ impl PlacementFilter for AlwaysOneFilter {
 /// (`exists hardware.gpu AND equals region us-east`); pins the
 /// realistic per-candidate cost.
 ///
-/// Uses `CapabilityIndex::with_caps` to avoid the per-call
-/// `CapabilitySet` clone that the legacy `get()` path performs;
-/// the closure runs while the DashMap shard's read lock is held,
-/// which is fine because `Predicate::evaluate_unplanned` only
-/// reads `EvalContext` and doesn't touch the index.
+/// Synthesizes a `CapabilitySet` from the fold's tag set per
+/// scoring call (the bridge's standard pattern). Allocates the
+/// synthesized set + a `Vec<Tag>` projection; bounded by the
+/// candidate's tag cardinality.
 struct PredicateFilter {
     pred: Predicate,
-    index: Arc<CapabilityIndex>,
+    fold: Arc<Fold<CapabilityFold>>,
 }
 impl PlacementFilter for PredicateFilter {
     fn placement_score(&self, target: &PlacementNodeId, _: &Artifact<'_>) -> Option<f32> {
-        self.index
-            .with_caps(*target, |caps| {
-                // EvalContext::new takes `&[Tag]`. HashSet → Vec
-                // collection is the only allocation per call;
-                // bounded by the candidate's tag cardinality.
-                let tags: Vec<Tag> = caps.tags.iter().cloned().collect();
-                let ctx = EvalContext::new(&tags, &caps.metadata);
-                if self.pred.evaluate_unplanned(&ctx) {
-                    Some(1.0)
-                } else {
-                    None
-                }
-            })
-            .flatten()
+        let caps = capability_bridge::synthesize_capability_set(&self.fold, *target);
+        let tags: Vec<Tag> = caps.tags.iter().cloned().collect();
+        let ctx = EvalContext::new(&tags, &caps.metadata);
+        if self.pred.evaluate_unplanned(&ctx) {
+            Some(1.0)
+        } else {
+            None
+        }
     }
 }
 
@@ -127,8 +121,8 @@ fn bench_placement_score(c: &mut Criterion) {
     // Plan budget: ≤ 5 μs across 100 candidates with config-driven
     // (in-tree-axes-only) placement.
     {
-        let index = make_index(100);
-        let placement = StandardPlacement::new(&index);
+        let fold = make_fold(100);
+        let placement = StandardPlacement::new(&fold);
 
         group.bench_function(BenchmarkId::new("baseline_no_custom_filter", 100), |b| {
             b.iter(|| {
@@ -149,7 +143,7 @@ fn bench_placement_score(c: &mut Criterion) {
     // The delta vs baseline is the substrate-side custom-filter
     // tax in isolation from any FFI cost.
     {
-        let index = make_index(100);
+        let fold = make_fold(100);
         let id = "bench-pf-noop";
         let registry = global_placement_filter_registry();
         // Defensive cleanup if a prior run aborted.
@@ -157,7 +151,7 @@ fn bench_placement_score(c: &mut Criterion) {
         let arc: Arc<dyn PlacementFilter> = Arc::new(AlwaysOneFilter);
         registry.register(id.to_string(), arc, "bench");
 
-        let placement = StandardPlacement::new(&index).with_custom_filter_id(id);
+        let placement = StandardPlacement::new(&fold).with_custom_filter_id(id);
 
         group.bench_function(
             BenchmarkId::new("with_custom_filter_rust_callback", 100),
@@ -181,7 +175,7 @@ fn bench_placement_score(c: &mut Criterion) {
     // AND metadata.region == "us-east"`. Half the candidates pass
     // (us-east), half fail (us-west).
     {
-        let index = make_index(100);
+        let fold = make_fold(100);
         let pred = {
             let gpu_key = TagKey::new(TaxonomyAxis::Hardware, "gpu");
             let exists_gpu = Predicate::exists(gpu_key);
@@ -193,11 +187,11 @@ fn bench_placement_score(c: &mut Criterion) {
         let _ = registry.unregister(id);
         let arc: Arc<dyn PlacementFilter> = Arc::new(PredicateFilter {
             pred,
-            index: index.clone(),
+            fold: fold.clone(),
         });
         registry.register(id.to_string(), arc, "bench");
 
-        let placement = StandardPlacement::new(&index).with_custom_filter_id(id);
+        let placement = StandardPlacement::new(&fold).with_custom_filter_id(id);
 
         group.bench_function(BenchmarkId::new("with_custom_filter_predicate", 100), |b| {
             b.iter(|| {

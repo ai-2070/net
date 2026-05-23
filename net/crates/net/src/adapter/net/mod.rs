@@ -210,6 +210,19 @@ pub(crate) fn current_timestamp() -> u64 {
     u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// Current timestamp in microseconds since the Unix epoch.
+/// Saturates at `0` on pre-epoch clocks (the wire envelopes that
+/// consume this — fold announcements, snapshots — treat micros
+/// purely as diagnostics, never as ordering, so a saturated
+/// reading is benign).
+#[inline]
+pub(crate) fn current_timestamp_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
 /// Fast xxh3-based routing utilities for Net streams.
 ///
 /// Uses xxh3 (~50GB/s) for deterministic, high-performance stream routing.

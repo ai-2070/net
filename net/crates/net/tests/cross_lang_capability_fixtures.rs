@@ -16,11 +16,12 @@
 
 use std::collections::BTreeMap;
 
+use net::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
 use net::adapter::net::behavior::{
     global_placement_filter_registry, validate_capabilities, Artifact, CapabilityAnnouncement,
-    CapabilityIndex, CapabilitySet, ClauseTrace, EvalContext, MetadataChange, PlacementFilter,
-    PlacementNodeId, Predicate, PredicateDebugReport, PredicateWire, SchemaError, ScopeLabel,
-    StandardPlacement, Tag, ValidationWarning, ValueType, RPC_WHERE_HEADER,
+    CapabilitySet, ClauseTrace, EvalContext, MetadataChange, PlacementFilter, PlacementNodeId,
+    Predicate, PredicateDebugReport, PredicateWire, SchemaError, ScopeLabel, StandardPlacement,
+    Tag, ValidationWarning, ValueType, RPC_WHERE_HEADER,
 };
 use net::adapter::net::identity::EntityId;
 use serde_json::Value;
@@ -717,7 +718,7 @@ fn predicate_debug_report_fixture_matches_substrate() {
 // `PlacementFilter` and route it through the full Phase 7 path:
 //
 //   global_placement_filter_registry().register(id, wrapper, "test")
-//   StandardPlacement::new(&index).with_custom_filter_id(id)
+//   StandardPlacement::new(&fold).with_custom_filter_id(id)
 //   placement.placement_score(target, artifact)
 //
 // `predicate_eval.json` is the same fixture every binding's predicate
@@ -734,33 +735,28 @@ fn predicate_debug_report_fixture_matches_substrate() {
 // behavior, in every binding.
 // =============================================================================
 
-/// Wraps a `Predicate` + `Arc<CapabilityIndex>` as a `PlacementFilter`.
-/// Fixture-driven test impl — production bindings (Node TSFN, Python
-/// PyAny, Go cgo) all reach the same place via different mechanics.
+/// Wraps a `Predicate` + `Arc<Fold<CapabilityFold>>` as a
+/// `PlacementFilter`. Fixture-driven test impl — production bindings
+/// (Node TSFN, Python PyAny, Go cgo) all reach the same place via
+/// different mechanics.
 struct PredicatePlacementFilter {
     pred: Predicate,
-    index: Arc<CapabilityIndex>,
+    fold: Arc<Fold<CapabilityFold>>,
 }
 
 impl PlacementFilter for PredicatePlacementFilter {
     fn placement_score(&self, target: &PlacementNodeId, _artifact: &Artifact<'_>) -> Option<f32> {
-        // Use the non-cloning `with_caps` path. Holds the DashMap
-        // shard's read lock for the closure's duration; safe here
-        // because `Predicate::evaluate_unplanned` only reads
-        // `EvalContext` and doesn't re-enter the index.
-        self.index
-            .with_caps(*target, |caps| {
-                // `EvalContext::new` takes `&[Tag]`; `caps.tags` is a
-                // `HashSet<Tag>`, so collect into a Vec.
-                let tags: Vec<Tag> = caps.tags.iter().cloned().collect();
-                let ctx = EvalContext::new(&tags, &caps.metadata);
-                if self.pred.evaluate_unplanned(&ctx) {
-                    Some(1.0)
-                } else {
-                    None
-                }
-            })
-            .flatten()
+        // Synthesize the candidate's CapabilitySet from the fold's
+        // tag set (metadata isn't carried through the fold payload —
+        // see `synthesize_capability_set` doc).
+        let caps = capability_bridge::synthesize_capability_set(&self.fold, *target);
+        let tags: Vec<Tag> = caps.tags.iter().cloned().collect();
+        let ctx = EvalContext::new(&tags, &caps.metadata);
+        if self.pred.evaluate_unplanned(&ctx) {
+            Some(1.0)
+        } else {
+            None
+        }
     }
 }
 
@@ -800,16 +796,17 @@ fn predicate_eval_fixture_matches_via_placement_filter_callback() {
             .as_bool()
             .unwrap_or_else(|| panic!("case[{i}] {name}: `expected` not a bool"));
 
-        // Index a single candidate node carrying the case's caps.
+        // Stage a single candidate node carrying the case's caps.
         let target_node: PlacementNodeId = 0x1234_5678_DEAD_BEEF;
-        let index = Arc::new(CapabilityIndex::new());
+        let fold: Arc<Fold<CapabilityFold>> = Arc::new(
+            Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO),
+        );
         let eid = EntityId::from_bytes([0u8; 32]);
-        index.index(CapabilityAnnouncement::new(
-            target_node,
-            eid,
-            1,
-            caps.clone(),
-        ));
+        capability_bridge::apply_legacy_announcement(
+            &fold,
+            CapabilityAnnouncement::new(target_node, eid, 1, caps.clone()),
+        )
+        .expect("apply legacy announcement in fixture");
 
         // Register the predicate-backed filter under a fixture-scoped
         // id; binding label `"test"` so concurrent fixture runs don't
@@ -820,7 +817,7 @@ fn predicate_eval_fixture_matches_via_placement_filter_callback() {
         let _ = registry.unregister(&id);
         let wrapper: Arc<dyn PlacementFilter> = Arc::new(PredicatePlacementFilter {
             pred,
-            index: index.clone(),
+            fold: fold.clone(),
         });
         assert!(
             registry.register(id.clone(), wrapper, "test"),
@@ -829,7 +826,7 @@ fn predicate_eval_fixture_matches_via_placement_filter_callback() {
 
         // Configure StandardPlacement to consume the registered filter
         // via the full Phase 7 path.
-        let placement = StandardPlacement::new(&index).with_custom_filter_id(&id);
+        let placement = StandardPlacement::new(&fold).with_custom_filter_id(&id);
 
         // Empty Daemon artifact — the predicate evaluates against the
         // candidate's caps, not the artifact's required/optional sets.
@@ -969,15 +966,21 @@ fn placement_score_fixture_matches_substrate() {
         );
         let cand_caps = caps_from_fixture_obj(cand, &format!("case[{i}] {name} candidate"));
 
-        let index = Arc::new(CapabilityIndex::new());
+        let fold: Arc<Fold<CapabilityFold>> = Arc::new(
+            Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO),
+        );
         let eid = EntityId::from_bytes([0u8; 32]);
-        index.index(CapabilityAnnouncement::new(node_id, eid, 1, cand_caps));
+        capability_bridge::apply_legacy_announcement(
+            &fold,
+            CapabilityAnnouncement::new(node_id, eid, 1, cand_caps),
+        )
+        .expect("apply legacy announcement in fixture");
 
         // Build the StandardPlacement from the case's config
         // subset. Only the fields that exist in the case JSON
         // are applied; missing fields stay at the default (axis
         // disabled / identity).
-        let mut placement = StandardPlacement::new(&index);
+        let mut placement = StandardPlacement::new(&fold);
         let cfg = &case["config"];
         if let Some(scope_filter) = cfg.get("scope_filter").and_then(|s| s.as_array()) {
             let labels: Vec<ScopeLabel> = scope_filter
