@@ -356,6 +356,127 @@ int net_redis_dedup_is_empty(net_redis_dedup_t* handle);
  */
 void net_redis_dedup_clear(net_redis_dedup_t* handle);
 
+/* ========================================================================= */
+/* Aggregator: registry RPC client + channel visibility setter.              */
+/* ========================================================================= */
+/*
+ * Stage 5 of SDK_AGGREGATOR_SUBNET_PLAN.md. Client surface for
+ * the daemon's `aggregator.registry` RPC service. All ops are
+ * blocking against the shared mesh-FFI tokio runtime — call
+ * from a non-tokio thread (CGo / cgo-fronted Go is fine).
+ */
+
+/* Opaque handle for a RegistryClient. */
+typedef struct net_registry_client_handle_t net_registry_client_handle_t;
+
+/* Error-kind discriminants. Stable across SDK releases. */
+#define NET_REGISTRY_OK                       0
+#define NET_REGISTRY_ERR_TRANSPORT            1
+#define NET_REGISTRY_ERR_CODEC                2
+#define NET_REGISTRY_ERR_UNKNOWN_TEMPLATE     3
+#define NET_REGISTRY_ERR_DUPLICATE_GROUP_NAME 4
+#define NET_REGISTRY_ERR_SPAWN_REJECTED       5
+#define NET_REGISTRY_ERR_SPAWN_NOT_SUPPORTED  6
+#define NET_REGISTRY_ERR_INVALID_ARGS         99
+
+/* Visibility discriminants, mirroring the substrate's `Visibility` enum.
+ * Operator code referring to these by literal value (not just name)
+ * stays correct across SDK releases. */
+typedef enum {
+    NET_VISIBILITY_GLOBAL         = 0,
+    NET_VISIBILITY_PARENT_VISIBLE = 1,
+    NET_VISIBILITY_EXPORTED       = 2,
+    NET_VISIBILITY_SUBNET_LOCAL   = 3,
+} net_visibility_t;
+
+/*
+ * Build a RegistryClient from an existing net_mesh handle.
+ * Returns NULL on null input.
+ * Free with `net_registry_client_free`.
+ */
+net_registry_client_handle_t* net_registry_client_new(void* mesh_handle);
+
+/* Free a RegistryClient. Idempotent on NULL. */
+void net_registry_client_free(net_registry_client_handle_t* handle);
+
+/*
+ * Override the per-call deadline in milliseconds. `millis == 0`
+ * resets to the substrate default.
+ */
+void net_registry_client_set_deadline(
+    net_registry_client_handle_t* handle,
+    uint64_t millis);
+
+/*
+ * Enumerate groups registered on `target_node_id`. Returns a
+ * JSON-encoded `[RegistryGroupSummaryJson]` string — caller
+ * frees via `net_free_string`. On error, writes the error
+ * discriminant to `*out_error_kind` and returns NULL. The
+ * `out_error_kind` pointer is required (non-NULL).
+ *
+ * JSON shape:
+ *   [{"name": "...", "group_seed_hex": "...", "replicas": [
+ *      {"generation": N, "healthy": true|false,
+ *       "diagnostic": "..."|null, "placement_node_id": N|null}
+ *   ]}, ...]
+ */
+char* net_registry_client_list(
+    net_registry_client_handle_t* handle,
+    uint64_t target_node_id,
+    int* out_error_kind);
+
+/*
+ * Spawn a new group by referencing a daemon-side template by
+ * name. Returns a JSON-encoded `RegistryGroupSummaryJson` for
+ * the spawned group; caller frees via `net_free_string`.
+ *
+ * `template_name` and `group_name` are NUL-terminated UTF-8
+ * strings owned by the caller for the duration of the call.
+ */
+char* net_registry_client_spawn(
+    net_registry_client_handle_t* handle,
+    uint64_t target_node_id,
+    const char* template_name,
+    const char* group_name,
+    uint8_t replica_count,
+    int* out_error_kind);
+
+/*
+ * Tear down a registered group. Returns:
+ *   1 — group existed and was stopped
+ *   0 — no such group was registered
+ *  -1 — transport / codec / invalid-args failure (consult
+ *       `out_error_kind`)
+ */
+int net_registry_client_unregister(
+    net_registry_client_handle_t* handle,
+    uint64_t target_node_id,
+    const char* group_name,
+    int* out_error_kind);
+
+/*
+ * Operator-facing detail string for the most recent non-OK op.
+ * Returns a NUL-terminated C string owned by the handle —
+ * valid until the next op on the handle (which may overwrite)
+ * or until the handle is freed. Returns NULL when no error has
+ * been recorded.
+ */
+const char* net_registry_last_error_detail(net_registry_client_handle_t* handle);
+
+/*
+ * Register a channel with a specific visibility tier. Mirrors
+ * `Mesh::register_channel` at the C boundary. Returns
+ * `NET_REGISTRY_OK` on success or a typed error code. The
+ * mesh must have a ChannelConfigRegistry installed — true for
+ * any net_mesh built via `net_mesh_new`.
+ *
+ * `name` is a NUL-terminated UTF-8 channel name.
+ */
+int net_register_channel(
+    void* mesh_handle,
+    const char* name,
+    int visibility);
+
 #ifdef __cplusplus
 }
 #endif
