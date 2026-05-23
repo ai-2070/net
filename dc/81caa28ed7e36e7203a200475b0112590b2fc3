@@ -1,0 +1,26 @@
+net/crates/net/src/adapter/net/behavior/aggregator/lifecycle.rs
+  s_1481a1b87a9b66::t_65deab07ded793 46-48,50
+  s_1481a1b87a9b66::t_54533711b6cee2 102
+  s_1481a1b87a9b66::t_3395300542dac0 193
+  s_1481a1b87a9b66::t_c11a2ee0bc4473 14-18,24
+  s_1481a1b87a9b66::t_10e3a731475b99 162
+net/crates/net/src/adapter/net/behavior/aggregator/daemon.rs
+  s_1481a1b87a9b66::t_e698594c07bac3 828-832,834
+  s_1481a1b87a9b66::t_ad5b44fbf8f567 404-406
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "dc81caa28ed7e36e7203a200475b0112590b2fc3",
+  "prompts": {},
+  "sessions": {
+    "s_1481a1b87a9b66": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b6b7d116-fc00-4178-aba1-c133ae7ca379",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
