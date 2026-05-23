@@ -377,6 +377,7 @@ typedef struct net_registry_client_handle_t net_registry_client_handle_t;
 #define NET_REGISTRY_ERR_DUPLICATE_GROUP_NAME 4
 #define NET_REGISTRY_ERR_SPAWN_REJECTED       5
 #define NET_REGISTRY_ERR_SPAWN_NOT_SUPPORTED  6
+#define NET_REGISTRY_ERR_UNKNOWN_KIND         7
 #define NET_REGISTRY_ERR_INVALID_ARGS         99
 
 /* Visibility discriminants, mirroring the substrate's `Visibility` enum.
@@ -476,6 +477,82 @@ int net_register_channel(
     void* mesh_handle,
     const char* name,
     int visibility);
+
+/* ─── FoldQueryClient ────────────────────────────────────────────────────── */
+
+/* Opaque handle for a FoldQueryClient. */
+typedef struct net_fold_query_client_handle_t net_fold_query_client_handle_t;
+
+/*
+ * Build a FoldQueryClient from an existing net_mesh handle.
+ * Returns NULL on null input. Free with
+ * `net_fold_query_client_free`.
+ */
+net_fold_query_client_handle_t* net_fold_query_client_new(void* mesh_handle);
+
+/* Free a FoldQueryClient. Idempotent on NULL. */
+void net_fold_query_client_free(net_fold_query_client_handle_t* handle);
+
+/*
+ * Override the cache TTL in milliseconds. `millis == 0` disables
+ * the cache entirely.
+ */
+void net_fold_query_client_set_ttl(
+    net_fold_query_client_handle_t* handle,
+    uint64_t millis);
+
+/*
+ * Override the per-call deadline in milliseconds.
+ * `millis == 0` resets to the substrate default.
+ */
+void net_fold_query_client_set_deadline(
+    net_fold_query_client_handle_t* handle,
+    uint64_t millis);
+
+/*
+ * Query the aggregator's latest cached summaries. Cache hit
+ * returns immediately; miss issues a wire RPC, caches the
+ * response, and returns. Returns a JSON-encoded
+ * `[SummaryAnnouncementJson]` string — caller frees via
+ * `net_free_string`. On error, writes the error discriminant
+ * to `*out_error_kind` and returns NULL.
+ *
+ * JSON shape:
+ *   [{"fold_kind": N, "source_subnet": "...", "generation": N,
+ *     "buckets": [{"name": "...", "count": N}, ...]}, ...]
+ */
+char* net_fold_query_client_query_latest(
+    net_fold_query_client_handle_t* handle,
+    uint64_t target_node_id,
+    uint16_t kind,
+    int* out_error_kind);
+
+/*
+ * Force a fresh `SummarizeNow` query — never cached. Same JSON
+ * shape as `_query_latest`.
+ */
+char* net_fold_query_client_query_summarize_now(
+    net_fold_query_client_handle_t* handle,
+    uint64_t target_node_id,
+    uint16_t kind,
+    int* out_error_kind);
+
+/* Drop every cached entry. */
+void net_fold_query_client_invalidate_cache(
+    net_fold_query_client_handle_t* handle);
+
+/* Drop only cache entries matching `target_node_id`. */
+void net_fold_query_client_invalidate_target(
+    net_fold_query_client_handle_t* handle,
+    uint64_t target_node_id);
+
+/*
+ * Operator-facing detail string for the most recent non-OK
+ * fold-query op on this handle. Same valid-until contract as
+ * `net_registry_last_error_detail`.
+ */
+const char* net_fold_query_last_error_detail(
+    net_fold_query_client_handle_t* handle);
 
 #ifdef __cplusplus
 }
