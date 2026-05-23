@@ -540,9 +540,11 @@ mod tests {
 
     #[test]
     fn membership_passes_post_filter_enforces_min_memory_and_gpu() {
-        let mut legacy = LegacyFilter::default();
-        legacy.min_memory_gb = Some(64);
-        legacy.require_gpu = true;
+        let legacy = LegacyFilter {
+            min_memory_gb: Some(64),
+            require_gpu: true,
+            ..LegacyFilter::default()
+        };
 
         let ok = CapabilityMembership {
             class_hash: 0x100,
