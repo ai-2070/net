@@ -24,7 +24,7 @@
     "types": ["node"],
   },
   // Source files only; tests stay under the base config.
-  "include": ["errors.ts", "mesh_rpc.ts", "meshdb.ts"],
+  "include": ["errors.ts", "mesh_rpc.ts", "meshdb.ts", "aggregator.ts"],
   "exclude": [
     "node_modules",
     "dist",

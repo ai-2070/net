@@ -20,6 +20,10 @@
     "./meshdb": {
       "types": "./meshdb.d.ts",
       "default": "./meshdb.js"
+    },
+    "./aggregator": {
+      "types": "./aggregator.d.ts",
+      "default": "./aggregator.js"
     }
   },
   "napi": {
@@ -56,6 +60,10 @@
     "errors.d.ts",
     "mesh_rpc.js",
     "mesh_rpc.d.ts",
+    "meshdb.js",
+    "meshdb.d.ts",
+    "aggregator.js",
+    "aggregator.d.ts",
     "*.node"
   ],
   "devDependencies": {
@@ -66,9 +74,9 @@
   },
   "scripts": {
     "artifacts": "napi artifacts",
-    "build": "napi build --platform --release --features redis,net,cortex,compute,groups,meshos,deck,meshdb",
-    "build:debug": "napi build --platform --features redis,net,cortex,compute,groups,meshos,deck,meshdb",
-    "build:test": "napi build --platform --features redis,net,cortex,compute,groups,meshos,deck,meshdb,test-helpers",
+    "build": "napi build --platform --release --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator",
+    "build:debug": "napi build --platform --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator",
+    "build:test": "napi build --platform --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator,test-helpers",
     "build:ts": "tsc -p tsconfig.build.json",
     "prepublishOnly": "npm run build:ts && napi prepublish -t npm",
     "test": "vitest run",
