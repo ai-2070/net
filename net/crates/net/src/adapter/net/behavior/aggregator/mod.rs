@@ -15,11 +15,18 @@ pub mod daemon;
 pub mod query_client;
 pub mod query_service;
 pub mod registry;
+pub mod registry_client;
+pub mod registry_service;
 pub mod summarizer;
 
 pub use config::AggregatorConfig;
 pub use daemon::{AggregatorDaemon, AggregatorError, AggregatorPublishError};
 pub use registry::{AggregatorGroupEntry, AggregatorRegistry, AggregatorRegistryError};
+pub use registry_client::{RegistryClient, RegistryClientError, DEFAULT_REGISTRY_DEADLINE};
+pub use registry_service::{
+    RegistryGroupSummary, RegistryHandler, RegistryReplicaSummary, RegistryRequest,
+    RegistryResponse, RegistryRpcError, REGISTRY_SERVICE,
+};
 pub use query_client::{
     FoldQueryClient, FoldQueryClientError, DEFAULT_QUERY_CACHE_TTL, DEFAULT_QUERY_DEADLINE,
 };
