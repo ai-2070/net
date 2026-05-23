@@ -446,21 +446,48 @@ fn composite_query(
 /// per class), typically tiny. Used by the dataforts greedy
 /// admission path to feed the scope gate after origin_hash →
 /// node_id resolution.
+///
+/// Callers iterating over every publisher should use
+/// [`capability_tags_for_all`] instead — single-shot batched
+/// variant that avoids the `1 + N` `with_state` lock pattern.
 pub fn capability_tags_for(fold: &super::Fold<CapabilityFold>, node_id: NodeId) -> Vec<String> {
+    fold.with_state(|state| tags_union_for(state, node_id))
+}
+
+/// Return `(node_id, tags)` pairs for every publisher in the fold
+/// under one `with_state` lock. Equivalent to
+/// `state.by_node.keys().map(|n| (n, capability_tags_for(fold, n)))`
+/// but acquires the lock once instead of `1 + N` times — the
+/// planner's coverage walk and similar full-fold sweeps want this
+/// shape.
+pub fn capability_tags_for_all(
+    fold: &super::Fold<CapabilityFold>,
+) -> std::collections::HashMap<NodeId, Vec<String>> {
     fold.with_state(|state| {
-        let Some(keys) = state.by_node.get(&node_id) else {
-            return Vec::new();
-        };
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for key in keys {
-            if let Some(entry) = state.entries.get(key) {
-                for tag in &entry.payload.tags {
-                    seen.insert(tag.clone());
-                }
+        let mut out: std::collections::HashMap<NodeId, Vec<String>> =
+            std::collections::HashMap::with_capacity(state.by_node.len());
+        for node_id in state.by_node.keys() {
+            out.insert(*node_id, tags_union_for(state, *node_id));
+        }
+        out
+    })
+}
+
+/// Shared implementation: union the publisher's tag set across
+/// every class entry it owns. Callers hold the state read lock.
+fn tags_union_for(state: &FoldState<CapabilityFold>, node_id: NodeId) -> Vec<String> {
+    let Some(keys) = state.by_node.get(&node_id) else {
+        return Vec::new();
+    };
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for key in keys {
+        if let Some(entry) = state.entries.get(key) {
+            for tag in &entry.payload.tags {
+                seen.insert(tag.clone());
             }
         }
-        seen.into_iter().collect()
-    })
+    }
+    seen.into_iter().collect()
 }
 
 /// Return `node_id`'s last-advertised reflex `SocketAddr`, or
@@ -1022,6 +1049,85 @@ mod tests {
         fold.apply(sign_cap(&kp, 0xAA, 1, 0x100, vec![], NodeState::Idle, None))
             .expect("class 0x100");
         assert_eq!(super::reflex_addr_for(&fold, 0xAA), None);
+    }
+
+    #[test]
+    fn capability_tags_for_all_matches_per_node_walk() {
+        // Pin that the batched helper returns the same per-publisher
+        // tag set as the single-node helper, but in one lock
+        // acquisition. The shape callers depend on: every
+        // `by_node` publisher gets an entry; tag sets are unioned
+        // across the publisher's class entries.
+        let fold = new_fold();
+        let kp_a = EntityKeypair::generate();
+        let kp_b = EntityKeypair::generate();
+        fold.apply(sign_cap(
+            &kp_a,
+            0xA,
+            1,
+            0x100,
+            vec!["gpu", "vendor.nvidia"],
+            NodeState::Idle,
+            None,
+        ))
+        .expect("a-100");
+        // Same publisher, different class — tags should union.
+        fold.apply(sign_cap(
+            &kp_a,
+            0xA,
+            1,
+            0x200,
+            vec!["gpu", "model:llama"],
+            NodeState::Idle,
+            None,
+        ))
+        .expect("a-200");
+        fold.apply(sign_cap(
+            &kp_b,
+            0xB,
+            1,
+            0x100,
+            vec!["cpu-only"],
+            NodeState::Idle,
+            None,
+        ))
+        .expect("b-100");
+
+        let batched = super::capability_tags_for_all(&fold);
+        assert_eq!(batched.len(), 2);
+
+        let mut tags_a = batched.get(&0xA).cloned().unwrap_or_default();
+        tags_a.sort();
+        assert_eq!(
+            tags_a,
+            vec![
+                "gpu".to_string(),
+                "model:llama".to_string(),
+                "vendor.nvidia".to_string()
+            ],
+            "publisher A unions tags across both class entries"
+        );
+
+        let mut tags_b = batched.get(&0xB).cloned().unwrap_or_default();
+        tags_b.sort();
+        assert_eq!(tags_b, vec!["cpu-only".to_string()]);
+
+        // Each entry should equal the single-node helper's result
+        // for that publisher.
+        for (node_id, batched_tags) in &batched {
+            let mut single = super::capability_tags_for(&fold, *node_id);
+            single.sort();
+            let mut batched_sorted = batched_tags.clone();
+            batched_sorted.sort();
+            assert_eq!(single, batched_sorted, "mismatch for node 0x{:x}", node_id);
+        }
+    }
+
+    #[test]
+    fn capability_tags_for_all_returns_empty_for_empty_fold() {
+        let fold = new_fold();
+        let batched = super::capability_tags_for_all(&fold);
+        assert!(batched.is_empty());
     }
 
     #[test]

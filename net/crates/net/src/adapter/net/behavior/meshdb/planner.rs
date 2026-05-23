@@ -1111,10 +1111,14 @@ where
     fn collect_coverage(&self, origin_hash: u64) -> Vec<HolderCoverage> {
         let hex = chain_hex(origin_hash);
         let mut out: Vec<HolderCoverage> = Vec::new();
-        let publishers: Vec<u64> = self
-            .capability_fold
-            .with_state(|state| state.by_node.keys().copied().collect());
-        for node_id in publishers {
+        // Single batched walk under one `with_state` lock — the
+        // legacy CapabilityIndex shape returned `(node, tags)`
+        // pairs in one shot, so callers stay on a `1` lock budget
+        // instead of `1 + N` (publishers).
+        let per_node_tags = crate::adapter::net::behavior::fold::capability_tags_for_all(
+            self.capability_fold,
+        );
+        for (node_id, tags) in per_node_tags {
             // Each node may advertise multiple `causal:`
             // variants for the same chain (presence + tip +
             // range during transitions). Pick the most
@@ -1124,10 +1128,6 @@ where
             // the same node resolve deterministically — the
             // cache key per locked decision #4 needs byte-
             // stable plans.
-            let tags = crate::adapter::net::behavior::fold::capability_tags_for(
-                self.capability_fold,
-                node_id,
-            );
             let claim = tags
                 .iter()
                 .filter_map(|t| parse_causal_claim_str(t, &hex))
