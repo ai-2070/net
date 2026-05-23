@@ -63,6 +63,16 @@ pub enum Tab {
     Replicas,
     Migrations,
     Failures,
+    /// Hidden tab — reaches the hierarchical subnet view through
+    /// `DeckClient::known_subnets` etc. Out of the visible
+    /// rotation so the `1..0` strip stays at 10 slots; operators
+    /// open via the `H` ("Hierarchy") key.
+    Subnets,
+    /// Hidden tab — reaches `SubnetGateway` stats and the export
+    /// table. Open via `V` ("Visibility gate"). `G` is reserved
+    /// for vim-style cursor-to-bottom; `S` clashes with Groups
+    /// navigation.
+    Gateways,
 }
 
 impl Tab {
@@ -102,6 +112,8 @@ impl Tab {
             Tab::Migrations => "MIGRATIONS",
             Tab::Failures => "FAILURES",
             Tab::Blobs => "BLOBS",
+            Tab::Subnets => "SUBNETS",
+            Tab::Gateways => "GATEWAYS",
         }
     }
 
@@ -1613,6 +1625,17 @@ impl App {
             KeyCode::Char('8') => self.current = Tab::Migrations,
             KeyCode::Char('9') => self.current = Tab::Replicas,
             KeyCode::Char('0') => self.current = Tab::Logs,
+            // Hidden tabs reachable via uppercase letters so the
+            // visible `1..0` strip stays at 10 slots. SUBNETS +
+            // GATEWAYS surface the subnet hierarchy + gateway
+            // counters per `SCALING_SUBNET_SPEC.md` Phase A.
+            // `S` collides with Groups navigation; `G` with
+            // vim-style cursor-to-bottom — both rejected. `H` for
+            // "Hierarchy" (Subnets) and `V` for the visibility
+            // gate (Gateways) are genuinely unused across the
+            // keymap.
+            KeyCode::Char('H') => self.current = Tab::Subnets,
+            KeyCode::Char('V') => self.current = Tab::Gateways,
             // DAEMON tab navigation. Lowercase letters walk the
             // member axis (cursor inside the focused group);
             // uppercase letters + arrows walk the group axis.
@@ -3017,6 +3040,8 @@ impl App {
                     self.blobs_search_editing,
                 );
             }
+            Tab::Subnets => tabs::subnets::render(frame, chunks[3], &self.deck),
+            Tab::Gateways => tabs::gateways::render(frame, chunks[3], &self.deck),
         }
         widgets::footer::render(
             frame,

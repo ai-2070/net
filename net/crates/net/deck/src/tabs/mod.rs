@@ -4,6 +4,7 @@ pub mod daemon_page;
 pub mod daemons;
 pub mod dataforts;
 pub mod failures;
+pub mod gateways;
 pub mod groups;
 pub mod logs;
 pub mod migrations;
@@ -12,6 +13,7 @@ pub mod node_page;
 pub mod nodes;
 pub mod nrpc;
 pub mod replicas;
+pub mod subnets;
 
 /// Window an indexable list of `total` items into `body_h` rows
 /// while keeping `cursor` visible. Reserves a row for each of
