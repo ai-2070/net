@@ -8,7 +8,8 @@
 //! # Surface
 //!
 //! - `net_registry_client_new` / `_free` / `_set_deadline` —
-//!   construct + tear down a [`RegistryClient`].
+//!   construct + tear down a
+//!   [`RegistryClient`](crate::adapter::net::behavior::aggregator::RegistryClient).
 //! - `net_registry_client_list` — enumerate groups; returns a
 //!   JSON array string.
 //! - `net_registry_client_spawn` — deploy a new group; returns
