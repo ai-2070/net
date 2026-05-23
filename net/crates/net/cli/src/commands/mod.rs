@@ -14,6 +14,7 @@ pub mod admin;
 pub mod audit;
 pub mod blob;
 pub mod cap;
+pub mod channel;
 pub mod completion;
 pub mod daemon;
 pub mod db;
