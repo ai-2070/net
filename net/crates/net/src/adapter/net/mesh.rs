@@ -85,7 +85,7 @@ use super::route::{RoutingHeader, ROUTING_HEADER_SIZE, ROUTING_MAGIC};
 use super::router::{NetRouter, RouterConfig};
 use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
-use super::subnet::{SubnetId, SubnetPolicy};
+use super::subnet::{DropReason, SubnetGateway, SubnetId, SubnetPolicy};
 use super::subprotocol::stream_window::{StreamWindow, SUBPROTOCOL_STREAM_WINDOW};
 use super::subprotocol::MigrationSubprotocolHandler;
 use super::transport::{NetSocket, PacketReceiver, ParsedPacket, SocketBufferConfig};
@@ -530,6 +530,11 @@ struct DispatchCtx {
     /// Per-peer subnet map, written by the capability-announcement
     /// dispatch and read by the subscribe gate + publish fan-out.
     peer_subnets: Arc<DashMap<u64, SubnetId>>,
+    /// See the matching field doc on `MeshNode`. Cloned in at
+    /// dispatch-start time; the inline `subnet_visible` call site
+    /// in `authorize_subscribe` records forward/drop decisions
+    /// through this gateway when present.
+    subnet_gateway: Option<Arc<SubnetGateway>>,
     /// Per-peer entity-id map, written by the capability-
     /// announcement dispatch after signature verification. Load-
     /// bearing for channel auth.
@@ -1510,6 +1515,14 @@ pub struct MeshNode {
     /// internal [`super::behavior::fold::FoldRegistry`] (installed
     /// as the [`Self::fold_router`] router by default).
     capability_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
+    /// Reservation fold, mirroring [`Self::capability_fold`]
+    /// at the per-resource granularity. Always allocated so the
+    /// aggregator's reservation summarizer + future
+    /// `MeshNode::reservation_fold()` callers don't have to
+    /// discriminate on presence. Inbound reservation
+    /// announcements flow through the same `SUBPROTOCOL_FOLD`
+    /// dispatch as capability announcements.
+    reservation_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::ReservationFold>>,
     /// Dedup cache for multi-hop capability announcements. Keyed by
     /// `(origin_node_id, version)` — the same discriminator
     /// `CapabilityIndex` uses to skip stale announcements. Entries
@@ -1645,6 +1658,22 @@ pub struct MeshNode {
     /// `local_subnet_policy`. Unknown peers default to
     /// [`SubnetId::GLOBAL`] at read time.
     peer_subnets: Arc<DashMap<u64, SubnetId>>,
+    /// Optional `SubnetGateway` instance for this node — installed
+    /// alongside `channel_configs` in [`Self::set_channel_configs`]
+    /// when the operator supplies a registry. Shares the registry
+    /// `Arc` with the substrate's channel-auth path, so the gateway
+    /// sees the same visibility config the publish + subscribe
+    /// hot paths consult.
+    ///
+    /// Powers the `net gateway stats|export|exports` operator
+    /// surface. Counter increments (`record_forward` /
+    /// `record_drop`) fire from the inline `subnet_visible`
+    /// call sites when the gateway is present.
+    ///
+    /// `None` for nodes that haven't installed a channel-config
+    /// registry — those nodes accept every subscribe and skip the
+    /// subnet-visibility gate entirely.
+    subnet_gateway: Option<Arc<SubnetGateway>>,
     /// Per-peer entity-id map. Keys are `node_id`; values are the
     /// 32-byte ed25519 public key carried on the peer's most recent
     /// `CapabilityAnnouncement`. Load-bearing for channel auth —
@@ -1830,8 +1859,12 @@ impl MeshNode {
         let capability_fold: Arc<
             super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>,
         > = Arc::new(super::behavior::fold::Fold::new());
+        let reservation_fold: Arc<
+            super::behavior::fold::Fold<super::behavior::fold::ReservationFold>,
+        > = Arc::new(super::behavior::fold::Fold::new());
         let fold_registry = Arc::new(super::behavior::fold::FoldRegistry::new());
         fold_registry.register(capability_fold.clone());
+        fold_registry.register(reservation_fold.clone());
         let fold_router: Arc<
             parking_lot::RwLock<Option<Arc<dyn super::behavior::fold::FoldChannelRouter>>>,
         > = Arc::new(parking_lot::RwLock::new(Some(
@@ -1992,6 +2025,7 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             traversal_stats: Arc::new(super::traversal::TraversalStats::new()),
             capability_fold,
+            reservation_fold,
             seen_announcements: Arc::new(DashMap::new()),
             last_announce_at: Arc::new(parking_lot::Mutex::new(None)),
             local_announcement: Arc::new(ArcSwapOption::empty()),
@@ -2008,6 +2042,10 @@ impl MeshNode {
             local_subnet,
             local_subnet_policy,
             peer_subnets,
+            // Gateway is installed lazily by `set_channel_configs`;
+            // a node without an installed registry has no gateway
+            // and skips the visibility gate entirely.
+            subnet_gateway: None,
             peer_entity_ids,
             origin_hash_to_node,
             token_cache: None,
@@ -2159,6 +2197,41 @@ impl MeshNode {
     /// on the publish / subscribe fan-out path.
     pub fn peer_subnet(&self, node_id: u64) -> Option<SubnetId> {
         self.peer_subnets.get(&node_id).map(|e| *e.value())
+    }
+
+    /// This node's own `SubnetId` — the value supplied via
+    /// `MeshNodeConfig::subnet` (or `SubnetId::GLOBAL` when none was
+    /// configured). Stable for the node's lifetime; the substrate
+    /// doesn't reassign the local subnet at runtime.
+    pub fn local_subnet(&self) -> SubnetId {
+        self.local_subnet
+    }
+
+    /// Read-only handle to the `SubnetPolicy` that derived this
+    /// node's `local_subnet`, when one was supplied. `None` when
+    /// the local subnet came from `MeshNodeConfig::subnet`
+    /// directly without going through a policy. Operator tools
+    /// surface this to explain "why is this node in subnet X."
+    pub fn local_subnet_policy(&self) -> Option<&Arc<SubnetPolicy>> {
+        self.local_subnet_policy.as_ref()
+    }
+
+    /// Snapshot of every `(node_id, subnet_id)` pair the local
+    /// node has cached from signature-verified capability
+    /// announcements. Sorted by `node_id` for stable output. Used
+    /// by operator tooling (`net subnet ls` / `subnet tree`) to
+    /// enumerate the mesh's subnet topology from a single
+    /// vantage point — anything not yet announced (or announced
+    /// unsigned) is invisible here, matching `peer_subnet`'s
+    /// "signed-only" contract.
+    pub fn known_subnets(&self) -> Vec<(u64, SubnetId)> {
+        let mut out: Vec<(u64, SubnetId)> = self
+            .peer_subnets
+            .iter()
+            .map(|e| (*e.key(), *e.value()))
+            .collect();
+        out.sort_by_key(|(node_id, _)| *node_id);
+        out
     }
 
     /// Get the local bind address.
@@ -2872,6 +2945,7 @@ impl MeshNode {
             local_subnet: self.local_subnet,
             local_subnet_policy: self.local_subnet_policy.clone(),
             peer_subnets: self.peer_subnets.clone(),
+            subnet_gateway: self.subnet_gateway.clone(),
             peer_entity_ids: self.peer_entity_ids.clone(),
             origin_hash_to_node: self.origin_hash_to_node.clone(),
             token_cache: self.token_cache.clone(),
@@ -5201,13 +5275,41 @@ impl MeshNode {
 
     /// Install a `ChannelConfigRegistry` whose `can_subscribe` /
     /// `can_publish` rules are consulted for incoming Subscribe
-    /// messages.
+    /// messages. Also constructs a [`SubnetGateway`] over the
+    /// same registry + this node's `local_subnet`; the gateway
+    /// is read by `MeshNode::gateway()` and powers the
+    /// `net gateway` operator surface.
     ///
-    /// When unset (the default), all subscribes are accepted. Full
-    /// capability/token-based authorization additionally requires a
-    /// `TokenCache` — see [`Self::set_token_cache`].
+    /// When unset (the default), all subscribes are accepted, the
+    /// subnet-visibility gate is skipped, and `gateway()` returns
+    /// `None`. Full capability/token-based authorization additionally
+    /// requires a `TokenCache` — see [`Self::set_token_cache`].
+    ///
+    /// Call this BEFORE [`Self::start`] — the dispatch context is
+    /// captured at start time, so a registry installed after start
+    /// won't be visible to the receive loop.
     pub fn set_channel_configs(&mut self, configs: Arc<ChannelConfigRegistry>) {
+        let gateway = Arc::new(SubnetGateway::new(self.local_subnet, configs.clone()));
         self.channel_configs = Some(configs);
+        self.subnet_gateway = Some(gateway);
+    }
+
+    /// Read-only handle to this node's [`SubnetGateway`], or
+    /// `None` when no `ChannelConfigRegistry` has been installed
+    /// (see [`Self::set_channel_configs`]). Operator tooling
+    /// (`net gateway stats|exports`) consults this to read the
+    /// forwarded/dropped counters and export table.
+    pub fn gateway(&self) -> Option<&Arc<SubnetGateway>> {
+        self.subnet_gateway.as_ref()
+    }
+
+    /// Read-only handle to this node's installed
+    /// `ChannelConfigRegistry`, or `None` when no registry has
+    /// been installed via [`Self::set_channel_configs`].
+    /// Operator tooling (`net channel ls|visibility`) reads
+    /// this to enumerate configured channels.
+    pub fn channel_configs(&self) -> Option<&Arc<ChannelConfigRegistry>> {
+        self.channel_configs.as_ref()
     }
 
     /// Install a shared `TokenCache` used by the channel-auth path.
@@ -6396,7 +6498,15 @@ impl MeshNode {
             .get(&from_node)
             .map(|e| *e.value())
             .unwrap_or(SubnetId::GLOBAL);
-        if !Self::subnet_visible(ctx.local_subnet, peer_subnet, cfg.visibility) {
+        let visible = Self::subnet_visible(ctx.local_subnet, peer_subnet, cfg.visibility);
+        if let Some(gw) = ctx.subnet_gateway.as_ref() {
+            if visible {
+                gw.record_forward();
+            } else {
+                gw.record_drop(Self::visibility_drop_reason(cfg.visibility));
+            }
+        }
+        if !visible {
             return (false, Some(AckReason::Unauthorized));
         }
 
@@ -6556,6 +6666,21 @@ impl MeshNode {
     /// `Exported` is conservative — returns `false` unless a
     /// per-channel export table is consulted elsewhere. Wiring that
     /// is a documented follow-up.
+    /// Translate a [`Visibility`] verdict into the matching
+    /// [`DropReason`] for gateway counter telemetry. Mirrors the
+    /// matrix in [`Self::subnet_visible`] — `Global` never
+    /// triggers a drop (caller short-circuits with
+    /// `record_forward` instead), so this returns the dominant
+    /// reason for the non-Global variants.
+    fn visibility_drop_reason(visibility: Visibility) -> DropReason {
+        match visibility {
+            Visibility::Global => DropReason::SubnetLocal, // unreachable in practice
+            Visibility::SubnetLocal => DropReason::SubnetLocal,
+            Visibility::ParentVisible => DropReason::NotAncestor,
+            Visibility::Exported => DropReason::NotExported,
+        }
+    }
+
     fn subnet_visible(source: SubnetId, dest: SubnetId, visibility: Visibility) -> bool {
         match visibility {
             Visibility::Global => true,
@@ -6789,7 +6914,15 @@ impl MeshNode {
                 .get(peer_id)
                 .map(|e| *e.value())
                 .unwrap_or(SubnetId::GLOBAL);
-            if !Self::subnet_visible(self.local_subnet, peer_subnet, visibility) {
+            let visible = Self::subnet_visible(self.local_subnet, peer_subnet, visibility);
+            if let Some(gw) = self.subnet_gateway.as_ref() {
+                if visible {
+                    gw.record_forward();
+                } else {
+                    gw.record_drop(Self::visibility_drop_reason(visibility));
+                }
+            }
+            if !visible {
                 return false;
             }
             // (2) Auth guard (bloom + verified cache).
@@ -8777,6 +8910,17 @@ impl MeshNode {
         &self.capability_fold
     }
 
+    /// Shared reference to the reservation fold. Always present
+    /// (allocated at construction even when the node never
+    /// publishes a reservation) so the aggregator surface +
+    /// future scheduler callers don't have to discriminate on
+    /// presence.
+    pub fn reservation_fold(
+        &self,
+    ) -> &Arc<super::behavior::fold::Fold<super::behavior::fold::ReservationFold>> {
+        &self.reservation_fold
+    }
+
     /// Test-only helper — translate a legacy
     /// [`CapabilityAnnouncement`] into the fold-shaped envelope
     /// and apply it. Mirrors the inbound dispatch path's
@@ -10720,6 +10864,67 @@ mod fold_publisher_helpers_tests {
 
         assert_eq!(node.get_node_by_origin_hash(hash_a), Some(0xAAAA));
         assert_eq!(node.get_node_by_origin_hash(hash_b), Some(0xBBBB));
+    }
+
+    #[tokio::test]
+    async fn local_subnet_defaults_to_global_without_config_override() {
+        // `build_node_for_test` constructs `MeshNodeConfig::new(...)`
+        // without `.with_subnet(...)`, so the local subnet must
+        // come out as `SubnetId::GLOBAL`. Pins the
+        // GLOBAL-as-default contract operator tooling relies on.
+        let node = build_node_for_test().await;
+        assert_eq!(node.local_subnet(), SubnetId::GLOBAL);
+        assert!(node.local_subnet_policy().is_none());
+    }
+
+    #[tokio::test]
+    async fn gateway_handle_is_none_until_channel_configs_installed() {
+        // `set_channel_configs` builds the gateway lazily; nodes
+        // without a registry have no gateway and `gateway()`
+        // returns `None`. Operator tooling discriminates on this
+        // to print "no gateway configured" vs. real stats.
+        let node = build_node_for_test().await;
+        assert!(node.gateway().is_none());
+        // The node we get from `build_node_for_test` is wrapped
+        // in an `Arc`, so installing configs requires mutable
+        // access via Arc::try_unwrap or unsafe. Cover the
+        // None-then-Some transition via a fresh node we own.
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x17u8; 32]);
+        let mut owned = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+        assert!(owned.gateway().is_none());
+        owned.set_channel_configs(std::sync::Arc::new(
+            crate::adapter::net::ChannelConfigRegistry::new(),
+        ));
+        let gw = owned.gateway().expect("gateway installed");
+        assert_eq!(gw.local_subnet(), SubnetId::GLOBAL);
+        assert_eq!(gw.forwarded_count(), 0);
+        assert_eq!(gw.dropped_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn known_subnets_sorted_by_node_id() {
+        // Pin the deterministic-order contract `subnet ls` /
+        // `subnet tree` operator tools depend on. Build a node,
+        // populate `peer_subnets` directly with three out-of-order
+        // entries, and assert `known_subnets()` returns them
+        // sorted ascending by node_id.
+        let node = build_node_for_test().await;
+        assert!(node.known_subnets().is_empty());
+
+        node.peer_subnets
+            .insert(0xC0FFEE, SubnetId::new(&[3, 7, 2]));
+        node.peer_subnets.insert(0xAAAA, SubnetId::new(&[3, 7, 1]));
+        node.peer_subnets.insert(0xB0B0, SubnetId::new(&[3, 8]));
+
+        let snapshot = node.known_subnets();
+        let ids: Vec<u64> = snapshot.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![0xAAAA, 0xB0B0, 0xC0FFEE]);
+        assert_eq!(snapshot[0].1, SubnetId::new(&[3, 7, 1]));
+        assert_eq!(snapshot[1].1, SubnetId::new(&[3, 8]));
+        assert_eq!(snapshot[2].1, SubnetId::new(&[3, 7, 2]));
     }
 
     #[tokio::test]

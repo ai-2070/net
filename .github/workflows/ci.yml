@@ -2,6 +2,10 @@ name: CI
 
 on:
   push:
+    paths:
+      - 'net/**'
+      - 'go/**'
+      - '.github/workflows/ci.yml'
 
 env:
   CARGO_TERM_COLOR: always
@@ -183,6 +187,7 @@ jobs:
           --test integration_nrpc_cross_lang_streaming
           --test nrpc_inbound_dispatcher
           --test queue_group_dispatch
+          --test aggregator_fold_query
 
       # === NetDB ==========================================================
       - name: NetDB

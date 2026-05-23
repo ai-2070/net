@@ -11,12 +11,15 @@
 //! commits.
 
 pub mod admin;
+pub mod aggregator;
 pub mod audit;
 pub mod blob;
 pub mod cap;
+pub mod channel;
 pub mod completion;
 pub mod daemon;
 pub mod db;
+pub mod gateway;
 pub mod ice;
 pub mod identity;
 pub mod logs;
@@ -26,4 +29,5 @@ pub mod peer;
 pub mod port;
 pub mod rpc;
 pub mod snapshot;
+pub mod subnet;
 pub mod version;

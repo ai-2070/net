@@ -365,6 +365,39 @@ impl ChannelConfigRegistry {
         self.configs.is_empty()
     }
 
+    /// Snapshot every registered channel as `(name, config)` pairs,
+    /// sorted by name for stable operator-tool output. Walks the
+    /// exact-match table only — prefix entries are excluded
+    /// because their `channel_id.name()` is a sentinel rather
+    /// than a routable channel.
+    ///
+    /// O(N) clone — N is the registry size (typically tens to a
+    /// few hundred). Suitable for `net channel ls` / Deck-panel
+    /// renders, not for hot-path use.
+    pub fn snapshot(&self) -> Vec<(String, ChannelConfig)> {
+        let mut out: Vec<(String, ChannelConfig)> = self
+            .configs
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Same as [`Self::snapshot`] but for prefix entries — emits
+    /// `(prefix, config)` pairs for every prefix registered via
+    /// [`Self::insert_prefix`]. Sorted by prefix for stable
+    /// output.
+    pub fn snapshot_prefixes(&self) -> Vec<(String, ChannelConfig)> {
+        let mut out: Vec<(String, ChannelConfig)> = self
+            .prefix_configs
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Get the priority for a channel (0 if not configured).
     #[inline]
     pub fn priority(&self, channel_hash: ChannelHash) -> u8 {
@@ -514,6 +547,42 @@ mod tests {
         let id = ChannelId::parse("test").unwrap();
         let config = ChannelConfig::new(id);
         assert_eq!(config.visibility, Visibility::Global);
+    }
+
+    #[test]
+    fn snapshot_returns_sorted_exact_matches_excludes_prefixes() {
+        // Pin the operator-tool surface: `snapshot` yields every
+        // exact-match channel in lex order, and `snapshot_prefixes`
+        // is a sibling for the prefix table — exact-matches and
+        // prefixes don't mix.
+        let reg = ChannelConfigRegistry::new();
+        let zeta = ChannelConfig::new(ChannelId::parse("zeta/c").unwrap())
+            .with_visibility(Visibility::SubnetLocal);
+        let alpha = ChannelConfig::new(ChannelId::parse("alpha/a").unwrap())
+            .with_visibility(Visibility::Global);
+        let middle = ChannelConfig::new(ChannelId::parse("middle/b").unwrap());
+        reg.insert(zeta);
+        reg.insert(alpha);
+        reg.insert(middle);
+        reg.insert_prefix(
+            "rpc.replies.",
+            ChannelConfig::new(ChannelId::parse("rpc.replies.").unwrap()),
+        );
+
+        let snap = reg.snapshot();
+        let names: Vec<&str> = snap.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["alpha/a", "middle/b", "zeta/c"]);
+        // Prefix entries excluded from `snapshot`.
+        assert!(!names.contains(&"rpc.replies."));
+        // Per-entry visibility round-trips.
+        let alpha_cfg = snap.iter().find(|(n, _)| n == "alpha/a").unwrap();
+        assert_eq!(alpha_cfg.1.visibility, Visibility::Global);
+        let zeta_cfg = snap.iter().find(|(n, _)| n == "zeta/c").unwrap();
+        assert_eq!(zeta_cfg.1.visibility, Visibility::SubnetLocal);
+
+        let prefixes = reg.snapshot_prefixes();
+        let prefix_names: Vec<&str> = prefixes.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(prefix_names, vec!["rpc.replies."]);
     }
 
     #[test]

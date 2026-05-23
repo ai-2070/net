@@ -1537,7 +1537,7 @@ async fn test_subnet_gateway_blocks_local_traffic() {
     let subnet_ab = SubnetId::new(&[3, 1]);
     let subnet_c = SubnetId::new(&[3, 2]);
 
-    let registry = ChannelConfigRegistry::new();
+    let registry = std::sync::Arc::new(ChannelConfigRegistry::new());
     let local_hash = register_channel(&registry, "internal/metrics", Visibility::SubnetLocal);
 
     let gateway = SubnetGateway::new(subnet_ab, registry);
@@ -1556,7 +1556,7 @@ async fn test_subnet_gateway_forwards_global_traffic() {
     let subnet_ab = SubnetId::new(&[3, 1]);
     let subnet_c = SubnetId::new(&[3, 2]);
 
-    let registry = ChannelConfigRegistry::new();
+    let registry = std::sync::Arc::new(ChannelConfigRegistry::new());
     let global_hash = register_channel(&registry, "events/global", Visibility::Global);
 
     let gateway = SubnetGateway::new(subnet_ab, registry);
@@ -1576,10 +1576,10 @@ async fn test_subnet_gateway_exported_selective() {
     let subnet_c = SubnetId::new(&[3, 2]);
     let subnet_d = SubnetId::new(&[3, 3]);
 
-    let registry = ChannelConfigRegistry::new();
+    let registry = std::sync::Arc::new(ChannelConfigRegistry::new());
     let export_hash = register_channel(&registry, "data/shared", Visibility::Exported);
 
-    let mut gateway = SubnetGateway::new(subnet_ab, registry);
+    let gateway = SubnetGateway::new(subnet_ab, registry);
     gateway.add_peer(subnet_c);
     gateway.add_peer(subnet_d);
     gateway.export_channel(export_hash, vec![subnet_c]);
@@ -1606,7 +1606,7 @@ async fn test_subnet_gateway_parent_visible() {
     let parent = SubnetId::new(&[3, 1]);
     let sibling = SubnetId::new(&[3, 2]);
 
-    let registry = ChannelConfigRegistry::new();
+    let registry = std::sync::Arc::new(ChannelConfigRegistry::new());
     let hash = register_channel(&registry, "status/reports", Visibility::ParentVisible);
 
     let gateway = SubnetGateway::new(child, registry);
@@ -1632,7 +1632,7 @@ async fn test_subnet_gateway_stats() {
     let subnet_a = SubnetId::new(&[1]);
     let subnet_b = SubnetId::new(&[2]);
 
-    let registry = ChannelConfigRegistry::new();
+    let registry = std::sync::Arc::new(ChannelConfigRegistry::new());
     let local_hash = register_channel(&registry, "chan/local", Visibility::SubnetLocal);
     let global_hash = register_channel(&registry, "chan/global", Visibility::Global);
 

@@ -1,0 +1,232 @@
+//! [`LifecycleDaemon`] — async lifecycle trait for native
+//! mesh-aware daemons.
+//!
+//! Phase B slice 4 of `SCALING_SUBNET_SPEC.md`. Defined as a
+//! **sibling** to [`MeshDaemon`](crate::adapter::net::compute::MeshDaemon)
+//! rather than an extension because the existing trait commits
+//! to a sync-only / WASM-compatible contract (see its module
+//! doc). The aggregator role is inherently async (tokio
+//! interval, `mesh.publish().await`) and needs lifecycle
+//! callbacks the event-shaped trait doesn't carry.
+//!
+//! # Trait shape
+//!
+//! - `on_start(self: Arc<Self>)` — spawn whatever background
+//!   work the daemon needs. Called exactly once per `(replica,
+//!   mesh)` pair before any other lifecycle method. Takes
+//!   `Arc<Self>` so implementations can hand the daemon to a
+//!   background tokio task without storing weak refs.
+//! - `on_stop(&self)` — signal the background work to stop.
+//!   Called exactly once after all references to the daemon are
+//!   about to drop. Idempotent in practice; the
+//!   [`LifecycleHandle`] only calls it once.
+//!
+//! The trait surface is intentionally minimal so future
+//! lifecycle hooks (`on_pause`, `on_drain`, etc.) can land
+//! without breaking existing impls.
+
+use async_trait::async_trait;
+use std::sync::Arc;
+
+/// Async lifecycle trait for native mesh-aware daemons. See
+/// module doc for the trait's intent and the
+/// [`MeshDaemon`](crate::adapter::net::compute::MeshDaemon)
+/// distinction.
+#[async_trait]
+pub trait LifecycleDaemon: Send + Sync + 'static {
+    /// Human-readable name — used in tracing spans + operator
+    /// surfaces (`net aggregator inspect`, the Deck panel
+    /// header). Stable across the daemon's lifetime; no
+    /// per-replica differentiation.
+    fn name(&self) -> &str;
+
+    /// Called once when a [`LifecycleHandle`] wrapping `self`
+    /// is created. Implementations spawn whatever long-running
+    /// background work they need (a tokio interval loop, a
+    /// subscription handler, etc.). Receives `Arc<Self>` so
+    /// implementations can move the daemon into a spawned task
+    /// without weak-ref gymnastics. Errors abort the lifecycle
+    /// — the handle isn't created.
+    async fn on_start(self: Arc<Self>) -> Result<(), LifecycleError>;
+
+    /// Called once when a [`LifecycleHandle`] wrapping `self`
+    /// is dropped. Implementations signal their background work
+    /// to stop. Awaited by the handle's drop / shutdown path;
+    /// implementations that need to wait for full teardown should
+    /// hold a `JoinHandle` internally and await it here.
+    async fn on_stop(&self);
+}
+
+/// Lifecycle-trait error shape. Distinct from substrate-wide
+/// `AdapterError` so trait implementors can carry typed
+/// failures without pulling in cross-module dependencies.
+#[derive(Debug)]
+pub enum LifecycleError {
+    /// `on_start` failed for a daemon-specific reason. Carries
+    /// a free-form diagnostic string the lifecycle harness
+    /// surfaces to the operator.
+    StartFailed(String),
+}
+
+impl std::fmt::Display for LifecycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StartFailed(msg) => write!(f, "start failed: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for LifecycleError {}
+
+/// RAII handle that runs a [`LifecycleDaemon`]'s lifecycle.
+/// Construction calls `on_start`; drop schedules `on_stop` on a
+/// detached task so the synchronous Drop impl can fire-and-forget
+/// the async shutdown.
+///
+/// For deterministic shutdown ordering (`net aggregator shutdown`
+/// waiting on the loop to fully drain before returning), use
+/// [`LifecycleHandle::stop`] instead of dropping.
+pub struct LifecycleHandle {
+    daemon: Arc<dyn LifecycleDaemon>,
+    /// `Some` until `stop()` consumes the handle or Drop runs.
+    /// Lets `stop()` move ownership without conflicting with
+    /// Drop's fallback.
+    daemon_for_drop: Option<Arc<dyn LifecycleDaemon>>,
+}
+
+impl LifecycleHandle {
+    /// Construct a handle and run `on_start` synchronously
+    /// against the async runtime. Errors abort — the handle is
+    /// never created if start fails.
+    pub async fn start(daemon: Arc<dyn LifecycleDaemon>) -> Result<Self, LifecycleError> {
+        Arc::clone(&daemon).on_start().await?;
+        Ok(Self {
+            daemon: daemon.clone(),
+            daemon_for_drop: Some(daemon),
+        })
+    }
+
+    /// Borrow the underlying daemon for introspection. Operator
+    /// tooling that wants type-erased access reads through this
+    /// — the lifecycle handle alone doesn't expose concrete
+    /// daemon state.
+    pub fn daemon(&self) -> &Arc<dyn LifecycleDaemon> {
+        &self.daemon
+    }
+
+    /// Shut the daemon down and await the teardown. Consumes
+    /// the handle so a subsequent Drop doesn't double-stop.
+    pub async fn stop(mut self) {
+        let daemon = self.daemon_for_drop.take();
+        if let Some(d) = daemon {
+            d.on_stop().await;
+        }
+    }
+}
+
+impl Drop for LifecycleHandle {
+    fn drop(&mut self) {
+        // Fallback path: if the handle is dropped without
+        // calling `stop()`, schedule the async shutdown on a
+        // detached task. Operators reaching for deterministic
+        // teardown call `.stop().await` explicitly.
+        if let Some(daemon) = self.daemon_for_drop.take() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move {
+                        daemon.on_stop().await;
+                    });
+                }
+                Err(_) => {
+                    // No tokio runtime in scope (e.g. synchronous
+                    // test teardown). The daemon's internal task
+                    // is expected to clean itself up via its
+                    // shutdown flag once its own `Arc` is dropped
+                    // — but flag the skipped lifecycle hook so the
+                    // contract is visible at operator log level.
+                    tracing::warn!(
+                        daemon = daemon.name(),
+                        "LifecycleHandle dropped outside a tokio runtime; \
+                         skipping on_stop. Daemon must self-clean via its \
+                         shutdown flag.",
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    struct CountingDaemon {
+        starts: AtomicU8,
+        stops: AtomicU8,
+    }
+
+    #[async_trait]
+    impl LifecycleDaemon for CountingDaemon {
+        fn name(&self) -> &str {
+            "counting"
+        }
+        async fn on_start(self: Arc<Self>) -> Result<(), LifecycleError> {
+            self.starts.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+        async fn on_stop(&self) {
+            self.stops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[tokio::test]
+    async fn start_fires_on_start_exactly_once() {
+        let daemon = Arc::new(CountingDaemon {
+            starts: AtomicU8::new(0),
+            stops: AtomicU8::new(0),
+        });
+        let handle = LifecycleHandle::start(daemon.clone()).await.expect("start");
+        assert_eq!(daemon.starts.load(Ordering::Acquire), 1);
+        assert_eq!(daemon.stops.load(Ordering::Acquire), 0);
+        handle.stop().await;
+        assert_eq!(daemon.stops.load(Ordering::Acquire), 1);
+    }
+
+    struct FailingStart;
+
+    #[async_trait]
+    impl LifecycleDaemon for FailingStart {
+        fn name(&self) -> &str {
+            "failing"
+        }
+        async fn on_start(self: Arc<Self>) -> Result<(), LifecycleError> {
+            Err(LifecycleError::StartFailed("intentional".into()))
+        }
+        async fn on_stop(&self) {}
+    }
+
+    #[tokio::test]
+    async fn start_failure_aborts_handle_creation() {
+        let result = LifecycleHandle::start(Arc::new(FailingStart)).await;
+        match result {
+            Err(LifecycleError::StartFailed(msg)) => assert_eq!(msg, "intentional"),
+            Ok(_) => panic!("expected StartFailed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn drop_schedules_on_stop_under_tokio_runtime() {
+        let daemon = Arc::new(CountingDaemon {
+            starts: AtomicU8::new(0),
+            stops: AtomicU8::new(0),
+        });
+        {
+            let _handle = LifecycleHandle::start(daemon.clone()).await.expect("start");
+            // Drop fires next.
+        }
+        // The detached spawn lands; give it a moment to settle.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(daemon.stops.load(Ordering::Acquire), 1);
+    }
+}

@@ -4,6 +4,8 @@
 //! visibility policy. It reads header fields (no decryption) to make
 //! forward/drop decisions. Encrypted payloads pass through untouched.
 
+use std::sync::Arc;
+
 use dashmap::DashMap;
 
 use super::id::SubnetId;
@@ -53,24 +55,35 @@ pub enum ForwardDecision {
 pub struct SubnetGateway {
     /// This gateway's subnet.
     local_subnet: SubnetId,
-    /// Known peer subnets this gateway bridges to.
-    peer_subnets: Vec<SubnetId>,
+    /// Known peer subnets this gateway bridges to. Stored in a
+    /// `parking_lot::RwLock` so `add_peer` can mutate it through
+    /// an `&self` handle the same way `export_channel` already
+    /// mutates the export table — lets `MeshNode` keep its
+    /// gateway behind an `Arc` without an outer `Mutex`.
+    peer_subnets: parking_lot::RwLock<Vec<SubnetId>>,
     /// Export table: channel_hash -> allowed destination subnets.
     /// Only consulted for `Visibility::Exported` channels.
     export_table: DashMap<u16, Vec<SubnetId>>,
-    /// Channel config registry for looking up visibility.
-    channel_configs: ChannelConfigRegistry,
+    /// Channel config registry for looking up visibility. Shared
+    /// `Arc` so the gateway sees the same registry the host
+    /// `MeshNode` mutates through `set_channel_configs` /
+    /// `insert` — without this, the gateway's view would drift
+    /// from the substrate's actual config.
+    channel_configs: Arc<ChannelConfigRegistry>,
     /// Gateway stats.
     forwarded: std::sync::atomic::AtomicU64,
     dropped: std::sync::atomic::AtomicU64,
 }
 
 impl SubnetGateway {
-    /// Create a new gateway for a subnet.
-    pub fn new(local_subnet: SubnetId, channel_configs: ChannelConfigRegistry) -> Self {
+    /// Create a new gateway for a subnet, sharing the supplied
+    /// `ChannelConfigRegistry` with the host. The registry is held
+    /// behind an `Arc` so subsequent inserts on the substrate side
+    /// flow through to gateway visibility lookups.
+    pub fn new(local_subnet: SubnetId, channel_configs: Arc<ChannelConfigRegistry>) -> Self {
         Self {
             local_subnet,
-            peer_subnets: Vec::new(),
+            peer_subnets: parking_lot::RwLock::new(Vec::new()),
             export_table: DashMap::new(),
             channel_configs,
             forwarded: std::sync::atomic::AtomicU64::new(0),
@@ -78,16 +91,68 @@ impl SubnetGateway {
         }
     }
 
-    /// Add a peer subnet this gateway bridges to.
-    pub fn add_peer(&mut self, subnet: SubnetId) {
-        if !self.peer_subnets.contains(&subnet) {
-            self.peer_subnets.push(subnet);
+    /// Add a peer subnet this gateway bridges to. Idempotent —
+    /// re-registering the same subnet is a no-op. The Vec is
+    /// kept sorted by raw bits on insert so [`Self::peer_subnets`]
+    /// can return a plain clone without re-sorting.
+    pub fn add_peer(&self, subnet: SubnetId) {
+        let mut peers = self.peer_subnets.write();
+        if let Err(pos) = peers.binary_search_by_key(&subnet.raw(), |s| s.raw()) {
+            peers.insert(pos, subnet);
         }
+    }
+
+    /// Snapshot of every peer subnet currently bridged to,
+    /// sorted by raw bits for stable operator-tool output.
+    pub fn peer_subnets(&self) -> Vec<SubnetId> {
+        self.peer_subnets.read().clone()
     }
 
     /// Export a channel to specific subnets.
     pub fn export_channel(&self, channel_hash: u16, targets: Vec<SubnetId>) {
         self.export_table.insert(channel_hash, targets);
+    }
+
+    /// Snapshot of the export table as `(channel_hash, targets)`
+    /// pairs, sorted by `channel_hash` for stable output. Used by
+    /// operator tooling (`net gateway exports`) to render the
+    /// current set of explicit cross-subnet allow-rules.
+    pub fn exports(&self) -> Vec<(u16, Vec<SubnetId>)> {
+        let mut out: Vec<(u16, Vec<SubnetId>)> = self
+            .export_table
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
+        out.sort_by_key(|(hash, _)| *hash);
+        out
+    }
+
+    /// Look up the export targets for a single `channel_hash`, or
+    /// `None` if the channel is not in the export table. Used by
+    /// `net gateway export <channel>` to render the current
+    /// allow-list before an operator mutates it.
+    pub fn exports_for_channel(&self, channel_hash: u16) -> Option<Vec<SubnetId>> {
+        self.export_table
+            .get(&channel_hash)
+            .map(|e| e.value().clone())
+    }
+
+    /// Record a forward decision that bypassed the gateway's
+    /// own `should_forward` entrypoint (e.g. an inline
+    /// publish-fanout visibility check on `MeshNode`). Lets
+    /// gateway counters reflect every visibility decision the
+    /// host node makes, not just the ones routed through
+    /// `should_forward`.
+    pub fn record_forward(&self) {
+        self.forwarded
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Companion to [`Self::record_forward`] — drops a packet
+    /// the host visibility check rejected.
+    pub fn record_drop(&self, _reason: DropReason) {
+        self.dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get this gateway's local subnet.
@@ -240,7 +305,7 @@ mod tests {
 
     #[test]
     fn test_global_always_forwards() {
-        let reg = ChannelConfigRegistry::new();
+        let reg = Arc::new(ChannelConfigRegistry::new());
         let ch = make_channel("test/global", Visibility::Global, &reg);
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
@@ -256,7 +321,7 @@ mod tests {
 
     #[test]
     fn test_subnet_local_always_drops() {
-        let reg = ChannelConfigRegistry::new();
+        let reg = Arc::new(ChannelConfigRegistry::new());
         let ch = make_channel("test/local", Visibility::SubnetLocal, &reg);
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
@@ -272,7 +337,7 @@ mod tests {
 
     #[test]
     fn test_parent_visible_allows_ancestor() {
-        let reg = ChannelConfigRegistry::new();
+        let reg = Arc::new(ChannelConfigRegistry::new());
         let ch = make_channel("test/parent-vis", Visibility::ParentVisible, &reg);
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
@@ -301,7 +366,7 @@ mod tests {
     /// `source.is_ancestor_of(dest)` (incorrect downward leak).
     #[test]
     fn parent_visible_drops_parent_to_descendant() {
-        let reg = ChannelConfigRegistry::new();
+        let reg = Arc::new(ChannelConfigRegistry::new());
         let ch = make_channel("test/parent-down", Visibility::ParentVisible, &reg);
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
@@ -332,7 +397,7 @@ mod tests {
 
     #[test]
     fn test_exported_channel() {
-        let reg = ChannelConfigRegistry::new();
+        let reg = Arc::new(ChannelConfigRegistry::new());
         let ch = make_channel("test/exported", Visibility::Exported, &reg);
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
@@ -349,7 +414,7 @@ mod tests {
 
     #[test]
     fn test_ttl_expired() {
-        let reg = ChannelConfigRegistry::new();
+        let reg = Arc::new(ChannelConfigRegistry::new());
         let ch = make_channel("test/ttl", Visibility::Global, &reg);
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
@@ -373,7 +438,7 @@ mod tests {
     /// Post-fix, `hop_ttl == 0` is treated as expired.
     #[test]
     fn ttl_zero_is_treated_as_expired() {
-        let reg = ChannelConfigRegistry::new();
+        let reg = Arc::new(ChannelConfigRegistry::new());
         let ch = make_channel("test/ttl-zero", Visibility::Global, &reg);
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
@@ -399,7 +464,7 @@ mod tests {
         // so the gateway drops them (SubnetLocal semantics). Previously this
         // defaulted to Global, silently forwarding traffic for any hash the
         // local node hadn't seen.
-        let reg = ChannelConfigRegistry::new();
+        let reg = Arc::new(ChannelConfigRegistry::new());
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
         let decision = gw.should_forward(
@@ -436,7 +501,7 @@ mod tests {
             seen.insert(wire, name);
         };
 
-        let reg = ChannelConfigRegistry::new();
+        let reg = Arc::new(ChannelConfigRegistry::new());
         let id1 = ChannelId::parse(&name1).unwrap();
         let id2 = ChannelId::parse(&name2).unwrap();
         let colliding_wire = id1.wire_hash();
@@ -464,7 +529,7 @@ mod tests {
 
     #[test]
     fn test_stats() {
-        let reg = ChannelConfigRegistry::new();
+        let reg = Arc::new(ChannelConfigRegistry::new());
         let ch_global = make_channel("test/stats-global", Visibility::Global, &reg);
         let ch_local = make_channel("test/stats-local", Visibility::SubnetLocal, &reg);
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
@@ -490,6 +555,70 @@ mod tests {
             TEST_TTL,
             0,
         );
+
+        assert_eq!(gw.forwarded_count(), 2);
+        assert_eq!(gw.dropped_count(), 1);
+    }
+
+    #[test]
+    fn exports_snapshot_round_trips_export_table() {
+        // Pin the new operator-tool accessor: every `export_channel`
+        // insert shows up in `exports()` keyed by channel_hash and
+        // sorted ascending. `exports_for_channel` is a per-channel
+        // point lookup.
+        let reg = Arc::new(ChannelConfigRegistry::new());
+        let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
+
+        gw.export_channel(0x42, vec![SubnetId::new(&[2]), SubnetId::new(&[3])]);
+        gw.export_channel(0x10, vec![SubnetId::new(&[5])]);
+        gw.export_channel(0x20, vec![]);
+
+        let snap = gw.exports();
+        let keys: Vec<u16> = snap.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec![0x10, 0x20, 0x42]);
+        assert_eq!(snap[0].1, vec![SubnetId::new(&[5])]);
+        assert_eq!(snap[2].1, vec![SubnetId::new(&[2]), SubnetId::new(&[3])],);
+
+        assert_eq!(
+            gw.exports_for_channel(0x42),
+            Some(vec![SubnetId::new(&[2]), SubnetId::new(&[3])]),
+        );
+        assert_eq!(gw.exports_for_channel(0xDEAD), None);
+    }
+
+    #[test]
+    fn peer_subnets_snapshot_is_idempotent_and_sorted() {
+        // Pin `add_peer` (now `&self`) + `peer_subnets()` snapshot.
+        // Re-adding the same subnet is a no-op; output is sorted by
+        // raw bits for stable operator output.
+        let reg = Arc::new(ChannelConfigRegistry::new());
+        let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
+
+        gw.add_peer(SubnetId::new(&[3, 7]));
+        gw.add_peer(SubnetId::new(&[2]));
+        gw.add_peer(SubnetId::new(&[3, 7])); // duplicate
+        gw.add_peer(SubnetId::new(&[3]));
+
+        let peers = gw.peer_subnets();
+        assert_eq!(peers.len(), 3, "duplicate add must be a no-op");
+        // Sorted by raw bits: SubnetId::new(&[2]).raw() < SubnetId::new(&[3]).raw() < SubnetId::new(&[3,7]).raw()
+        assert_eq!(peers[0], SubnetId::new(&[2]));
+        assert_eq!(peers[1], SubnetId::new(&[3]));
+        assert_eq!(peers[2], SubnetId::new(&[3, 7]));
+    }
+
+    #[test]
+    fn record_forward_and_record_drop_tick_independent_counters() {
+        // `record_forward` / `record_drop` are the entry points for
+        // host visibility checks that bypass `should_forward` (e.g.
+        // MeshNode's inline publish-fanout). Pin that they each bump
+        // their dedicated counter and don't cross-contaminate.
+        let reg = Arc::new(ChannelConfigRegistry::new());
+        let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
+
+        gw.record_forward();
+        gw.record_forward();
+        gw.record_drop(DropReason::SubnetLocal);
 
         assert_eq!(gw.forwarded_count(), 2);
         assert_eq!(gw.dropped_count(), 1);

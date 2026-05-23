@@ -39,11 +39,13 @@
 
 // Re-export the substrate-side Deck types under a clean
 // `net_sdk::deck::*` path.
+pub use net::adapter::net::behavior::aggregator::SummaryAnnouncement;
 pub use net::adapter::net::behavior::deck::{
-    AdminCommands, AdminError, AuditQuery, AuditStream, ChainCommit, DaemonCounts, DeckClient,
-    DeckClientConfig, DeckError, FailureStream, IceCommands, IceError, IceProposal, LogFilter,
-    LogStream, OperatorIdentity, OperatorRegistry, OperatorSignature, PeerCounts,
-    SimulatedIceProposal, SnapshotStream, StatusSummary, StatusSummaryStream,
+    AdminCommands, AdminError, AggregatorSnapshot, AuditQuery, AuditStream, ChainCommit,
+    DaemonCounts, DeckClient, DeckClientConfig, DeckError, FailureStream, GatewayStats,
+    IceCommands, IceError, IceProposal, LogFilter, LogStream, OperatorIdentity, OperatorRegistry,
+    OperatorSignature, PeerCounts, SimulatedIceProposal, SnapshotStream, StatusSummary,
+    StatusSummaryStream, SubnetRollup,
 };
 // Pure ICE simulator — runs a `BlastRadius` against any
 // `MeshOsSnapshot` + `IceActionProposal` without touching the
