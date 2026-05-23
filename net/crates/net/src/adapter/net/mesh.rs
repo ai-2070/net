@@ -4464,7 +4464,7 @@ impl MeshNode {
             if let (Some(observer), Some(caps)) = (&greedy, &chain_caps) {
                 observer.observe_event(
                     parsed.header.channel_hash,
-                    parsed.header.origin_hash.into(),
+                    parsed.header.origin_hash,
                     caps.clone(),
                     event_data.clone(),
                 );
