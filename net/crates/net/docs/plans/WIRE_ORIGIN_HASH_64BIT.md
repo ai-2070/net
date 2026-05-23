@@ -82,11 +82,16 @@ Header-layout consequences:
 
 - `protocol::HEADER_SIZE = 64` (`protocol.rs:15`) is cache-line
   aligned, with a compile-time assertion `size_of::<NetHeader>() ==
-  64` at `protocol.rs:194`. Growing `origin_hash` by 4 bytes either:
+  64` at `protocol.rs:194`. `origin_hash` sits at byte offset 56
+  per the layout diagram (`protocol.rs:107-136`). Growing it by 4
+  bytes either:
   - bumps `HEADER_SIZE` to 68 (alignment lost; `MAX_PAYLOAD_SIZE =
     MAX_PACKET_SIZE - HEADER_SIZE - TAG_SIZE` at `protocol.rs:27`
     shrinks by 4 bytes per packet), or
-  - reclaims 4 bytes elsewhere in the header.
+  - reclaims 4 bytes elsewhere in the header. Concrete candidates:
+    `fragment_id` and `fragment_offset` are u16 pairs in the
+    current layout — one could be narrowed or a pair merged if the
+    fragmentation scheme tolerates it. Audit before picking.
 
   The reclamation path preserves alignment and MTU math but costs
   an audit of the rest of the header layout. Decide before
@@ -103,7 +108,8 @@ deprecation gate):
   ambiguous-slot case (`mesh.rs:4540`) collapse to the direct
   lookup. There is no separate `origin_hash_collisions` counter —
   the `Multiple` variant *was* the tracking mechanism, and it goes
-  away with the variant.
+  away with the variant. The collision-insertion/demotion test
+  fixtures at `mesh.rs:10795-10809` go away with it.
 
   Adversarial 2³² collisions remain theoretically possible but
   require ~hours of dedicated compute per target, and the only
@@ -159,10 +165,11 @@ The change set:
   two `EntityId`s whose low 32 bits collide but whose full u64
   values differ; assert `get_node_by_origin_hash` returns each
   publisher's `node_id` distinctly.
-- A dataforts integration test that runs the greedy admission
-  scope-filter pin against a configured-collision pair (or a
-  synthetic one in test mode) and asserts both publishers' events
-  cache independently.
+- The existing greedy e2e test at
+  `tests/dataforts_greedy_e2e.rs:759` already references the
+  truncation-collision scenario; update it (or its surrounding
+  pin) to assert that both publishers' events cache independently
+  under the widened hash, rather than adding a fresh pin.
 - A Go-FFI round-trip test asserting a `uint64_t origin_hash` with
   bits set above 2³² survives publish → receive.
 
