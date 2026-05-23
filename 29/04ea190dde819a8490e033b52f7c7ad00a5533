@@ -1,0 +1,38 @@
+net/crates/net/bindings/go/compute-ffi/src/lib.rs
+  s_d9dc521a887c3e::t_6020825a3097d0 1971-2023
+net/crates/net/bindings/python/src/lib.rs
+  s_d9dc521a887c3e::t_89970aace657fb 1805-1839
+go/capability_aggregation_e2e_test.go
+  s_d9dc521a887c3e::t_dbd57f22479469 1-232
+net/crates/net/sdk-ts/test/capability_aggregation_e2e.test.ts
+  s_d9dc521a887c3e::t_fe1ffcbba87df1 1-147
+net/crates/net/bindings/node/src/lib.rs
+  s_d9dc521a887c3e::t_f59bc5c33e764f 2338-2377
+net/crates/net/tests/capability_aggregation_e2e.rs
+  s_d9dc521a887c3e::t_b41c9aee2178de 73-79,87-93,101-107
+  s_d9dc521a887c3e::t_46a6779f0a2fd2 22,26-38
+go/groups_testhelpers.go
+  s_d9dc521a887c3e::t_2f680366250fc7 29,31,33,38-42,46-50,79-115
+net/crates/net/sdk-ts/src/mesh.ts
+  s_d9dc521a887c3e::t_2ab1a09d84715f 279-301
+net/crates/net/bindings/python/tests/test_capability_aggregation_e2e.py
+  s_d9dc521a887c3e::t_d0f749cd7cc3c1 1-187
+.github/workflows/ci.yml
+  s_d9dc521a887c3e::t_db5f26fb22fd8b 658-671
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "2904ea190dde819a8490e033b52f7c7ad00a5533",
+  "prompts": {},
+  "sessions": {
+    "s_d9dc521a887c3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1eafc9e-4dd5-40ff-8f76-e8a5b7800252",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
