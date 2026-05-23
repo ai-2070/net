@@ -85,6 +85,7 @@ use super::meshos::{
     IceActionProposal, MeshOsEvent, MeshOsHandle, MeshOsHandleError, MeshOsRuntime, MeshOsSnapshot,
     MeshOsSnapshotReader, NodeId,
 };
+use crate::adapter::net::behavior::aggregator::{AggregatorDaemon, SummaryAnnouncement};
 use crate::adapter::net::identity::EntityKeypair;
 use crate::adapter::net::subnet::SubnetId;
 use crate::adapter::net::MeshNode;
@@ -435,6 +436,14 @@ pub struct DeckClient {
     /// pre-attach CLI invocations); the subnet/gateway accessors
     /// gracefully report "no mesh installed" in that case.
     mesh: Option<Arc<MeshNode>>,
+    /// Optional reference to a running [`AggregatorDaemon`].
+    /// Wired in via [`Self::with_aggregator`] when an aggregator
+    /// is running in-process alongside the deck. Powers the
+    /// `AGGREGATORS` Deck panel + the
+    /// `DeckClient::aggregator_*` accessors. `None` for decks
+    /// that don't host an aggregator (most operator binaries —
+    /// they're queriers, not hosts).
+    aggregator: Option<Arc<AggregatorDaemon>>,
 }
 
 impl DeckClient {
@@ -456,6 +465,7 @@ impl DeckClient {
             commit_seq: Arc::new(AtomicU64::new(0)),
             operator_registry: None,
             mesh: None,
+            aggregator: None,
         }
     }
 
@@ -468,6 +478,13 @@ impl DeckClient {
     /// gracefully report "no mesh installed."
     pub fn with_mesh(mut self, mesh: Arc<MeshNode>) -> Self {
         self.mesh = Some(mesh);
+        self
+    }
+
+    /// Install a live [`AggregatorDaemon`] reference. Powers the
+    /// `aggregator_*` accessors + the Deck `AGGREGATORS` panel.
+    pub fn with_aggregator(mut self, aggregator: Arc<AggregatorDaemon>) -> Self {
+        self.aggregator = Some(aggregator);
         self
     }
 
@@ -716,6 +733,52 @@ impl DeckClient {
         let registry = mesh.channel_configs()?;
         let cfg = registry.get_by_name(channel_name)?;
         Some(cfg.channel_id.hash())
+    }
+
+    /// `true` when a live [`AggregatorDaemon`] is installed via
+    /// [`Self::with_aggregator`]. Lets the AGGREGATORS Deck panel
+    /// discriminate between "no aggregator wired" and "aggregator
+    /// wired but has nothing to report yet."
+    pub fn aggregator_installed(&self) -> bool {
+        self.aggregator.is_some()
+    }
+
+    /// Snapshot the running aggregator's latest summaries.
+    /// Empty vec when no aggregator is installed.
+    pub fn aggregator_summaries(&self) -> Vec<SummaryAnnouncement> {
+        self.aggregator
+            .as_ref()
+            .map(|a| a.latest_summaries())
+            .unwrap_or_default()
+    }
+
+    /// Aggregator's monotonic tick counter, or `0` when none
+    /// installed.
+    pub fn aggregator_generation(&self) -> u64 {
+        self.aggregator.as_ref().map(|a| a.generation()).unwrap_or(0)
+    }
+
+    /// Aggregator's source subnet — what the daemon is summarizing.
+    /// `None` when no aggregator is installed.
+    pub fn aggregator_source_subnet(&self) -> Option<SubnetId> {
+        self.aggregator.as_ref().map(|a| a.config().source_subnet)
+    }
+
+    /// List of fold-kind ids the aggregator is configured to
+    /// summarize. Empty when no aggregator is installed.
+    pub fn aggregator_fold_kinds(&self) -> Vec<u16> {
+        self.aggregator
+            .as_ref()
+            .map(|a| a.config().fold_kinds.clone())
+            .unwrap_or_default()
+    }
+
+    /// Aggregator's summary cadence, or zero when none installed.
+    pub fn aggregator_summary_interval(&self) -> std::time::Duration {
+        self.aggregator
+            .as_ref()
+            .map(|a| a.config().summary_interval)
+            .unwrap_or_default()
     }
 
     /// Borrow the latest daemon summary keyed by daemon id.

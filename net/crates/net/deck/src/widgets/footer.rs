@@ -198,9 +198,9 @@ fn tab_chips(current: Tab) -> Line<'static> {
                 chip_desc(" export   "),
             ]);
         }
-        Tab::Subnets | Tab::Gateways => {
+        Tab::Subnets | Tab::Gateways | Tab::Aggregators => {
             // Read-only inspection tabs; no lowercase shortcuts.
-            // Reached via the uppercase `S` / `G` hidden tabs.
+            // Reached via the uppercase `H` / `V` / `B` hidden tabs.
         }
     }
     spans.extend([

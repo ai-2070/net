@@ -73,6 +73,11 @@ pub enum Tab {
     /// for vim-style cursor-to-bottom; `S` clashes with Groups
     /// navigation.
     Gateways,
+    /// Hidden tab — reaches the in-process `AggregatorDaemon`'s
+    /// latest summaries via the `DeckClient::aggregator_*`
+    /// accessors. Open via `B` ("Bridge" — aggregators bridge
+    /// subnet tiers).
+    Aggregators,
 }
 
 impl Tab {
@@ -114,6 +119,7 @@ impl Tab {
             Tab::Blobs => "BLOBS",
             Tab::Subnets => "SUBNETS",
             Tab::Gateways => "GATEWAYS",
+            Tab::Aggregators => "AGGREGATORS",
         }
     }
 
@@ -1636,6 +1642,7 @@ impl App {
             // keymap.
             KeyCode::Char('H') => self.current = Tab::Subnets,
             KeyCode::Char('V') => self.current = Tab::Gateways,
+            KeyCode::Char('B') => self.current = Tab::Aggregators,
             // DAEMON tab navigation. Lowercase letters walk the
             // member axis (cursor inside the focused group);
             // uppercase letters + arrows walk the group axis.
@@ -3042,6 +3049,7 @@ impl App {
             }
             Tab::Subnets => tabs::subnets::render(frame, chunks[3], &self.deck),
             Tab::Gateways => tabs::gateways::render(frame, chunks[3], &self.deck),
+            Tab::Aggregators => tabs::aggregators::render(frame, chunks[3], &self.deck),
         }
         widgets::footer::render(
             frame,
