@@ -1092,7 +1092,8 @@ mod tests {
             capability_bridge::apply_legacy_announcement(
                 &fold,
                 CapabilityAnnouncement::new(node_id, eid.clone(), 1, CapabilitySet::new()),
-            );
+            )
+            .expect("apply legacy announcement in fixture");
         }
         Scheduler::new(fold, 0xFFFF, CapabilitySet::new())
     }
@@ -1828,7 +1829,8 @@ mod tests {
             capability_bridge::apply_legacy_announcement(
                 &fold,
                 CapabilityAnnouncement::new(id, eid.clone(), 1, CapabilitySet::new()),
-            );
+            )
+            .expect("apply legacy announcement in fixture");
         }
         // Use a local_node_id NOT in the index so placement spreads
         // across indexed nodes instead of always picking local.

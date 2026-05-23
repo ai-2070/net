@@ -870,7 +870,8 @@ mod tests {
             capability_bridge::apply_legacy_announcement(
                 &fold,
                 CapabilityAnnouncement::new(node_id, eid.clone(), 1, CapabilitySet::new()),
-            );
+            )
+            .expect("apply legacy announcement in fixture");
         }
         Scheduler::new(fold, 0x1111, CapabilitySet::new())
     }
@@ -1129,7 +1130,8 @@ mod tests {
                 1,
                 CapabilitySet::new(),
             ),
-        );
+        )
+        .expect("apply legacy announcement in fixture");
         let sched = Scheduler::new(fold, 0x1111, CapabilitySet::new());
 
         let mut exclude = HashSet::new();
@@ -1159,7 +1161,8 @@ mod tests {
             capability_bridge::apply_legacy_announcement(
                 &fold,
                 CapabilityAnnouncement::new(id, eid.clone(), 1, CapabilitySet::new()),
-            );
+            )
+            .expect("apply legacy announcement in fixture");
         }
         let local = node_ids.first().copied().unwrap_or(0xFFFF);
         Scheduler::new(fold, local, CapabilitySet::new())

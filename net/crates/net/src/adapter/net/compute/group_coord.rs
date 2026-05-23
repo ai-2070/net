@@ -394,7 +394,8 @@ mod tests {
             capability_bridge::apply_legacy_announcement(
                 &fold,
                 CapabilityAnnouncement::new(id, eid.clone(), 1, CapabilitySet::new()),
-            );
+            )
+            .expect("apply legacy announcement in fixture");
         }
         // Local node id = first in list (or 0xFFFF if list is empty).
         let local = node_ids.first().copied().unwrap_or(0xFFFF);

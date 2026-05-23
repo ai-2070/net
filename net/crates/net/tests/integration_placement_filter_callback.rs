@@ -48,7 +48,8 @@ fn caps_with_tag(tag: &str) -> CapabilitySet {
 fn install_peer(fold: &Fold<CapabilityFold>, node_id: NodeId, caps: CapabilitySet) {
     let kp = EntityKeypair::generate();
     let ann = CapabilityAnnouncement::new(node_id, kp.entity_id().clone(), 1, caps);
-    capability_bridge::apply_legacy_announcement(fold, ann);
+    capability_bridge::apply_legacy_announcement(fold, ann)
+        .expect("apply legacy announcement in fixture");
 }
 
 /// 4-peer fixture: GPU, TPU, CPU, untagged. The custom filter we

@@ -129,11 +129,22 @@ impl TagMatcher {
 /// "invalid → matches nothing" contract pinned by
 /// `matcher_regex_with_invalid_pattern_matches_nothing`.
 enum CompiledMatcher<'a> {
-    Exact { value: &'a str },
-    Prefix { value: &'a str },
-    Axis { axis: TaxonomyAxis },
-    AxisKey { axis: TaxonomyAxis, key: &'a str },
-    Regex { re: Option<regex::Regex> },
+    Exact {
+        value: &'a str,
+    },
+    Prefix {
+        value: &'a str,
+    },
+    Axis {
+        axis: TaxonomyAxis,
+    },
+    AxisKey {
+        axis: TaxonomyAxis,
+        key: &'a str,
+    },
+    Regex {
+        re: Option<regex::Regex>,
+    },
     VersionRange {
         axis: TaxonomyAxis,
         key: &'a str,
@@ -333,11 +344,17 @@ pub enum Aggregation {
 enum CompiledAgg<'a> {
     Count,
     DistinctPublishers,
-    DistinctValues { axis: TaxonomyAxis, key: &'a str },
+    DistinctValues {
+        axis: TaxonomyAxis,
+        key: &'a str,
+    },
     /// Shared accumulator for `Sum/Min/Max NumericTag` — all three
     /// project from the same per-bucket numeric_sum / numeric_min /
     /// numeric_max fields, so the per-entry inner loop is identical.
-    Numeric { axis: TaxonomyAxis, key: &'a str },
+    Numeric {
+        axis: TaxonomyAxis,
+        key: &'a str,
+    },
     /// Fallthrough for malformed `axis_key` inputs (unknown axis
     /// prefix, missing dot). The per-entry loop does no per-tag
     /// work; the projection later surfaces `0` for empty buckets.
@@ -349,10 +366,9 @@ impl<'a> CompiledAgg<'a> {
         match agg {
             Aggregation::Count => CompiledAgg::Count,
             Aggregation::DistinctPublishers => CompiledAgg::DistinctPublishers,
-            Aggregation::DistinctValues { axis, key } => CompiledAgg::DistinctValues {
-                axis: *axis,
-                key,
-            },
+            Aggregation::DistinctValues { axis, key } => {
+                CompiledAgg::DistinctValues { axis: *axis, key }
+            }
             Aggregation::SumNumericTag { axis_key }
             | Aggregation::MinNumericTag { axis_key }
             | Aggregation::MaxNumericTag { axis_key } => match split_axis_key(axis_key) {
@@ -488,10 +504,8 @@ impl Fold<CapabilityFold> {
         // summed_capacity column; a malformed axis_key also
         // disables it (fail-closed — matches `numeric_value_for`'s
         // None-on-unknown-axis-prefix contract).
-        let sum_axis_split: Option<(TaxonomyAxis, &str)> = query
-            .sum_axis_key
-            .as_deref()
-            .and_then(split_axis_key);
+        let sum_axis_split: Option<(TaxonomyAxis, &str)> =
+            query.sum_axis_key.as_deref().and_then(split_axis_key);
 
         self.with_state(|state| {
             for ((_class, publisher), entry) in state.entries.iter() {

@@ -1115,9 +1115,8 @@ where
         // legacy CapabilityIndex shape returned `(node, tags)`
         // pairs in one shot, so callers stay on a `1` lock budget
         // instead of `1 + N` (publishers).
-        let per_node_tags = crate::adapter::net::behavior::fold::capability_tags_for_all(
-            self.capability_fold,
-        );
+        let per_node_tags =
+            crate::adapter::net::behavior::fold::capability_tags_for_all(self.capability_fold);
         for (node_id, tags) in per_node_tags {
             // Each node may advertise multiple `causal:`
             // variants for the same chain (presence + tip +
@@ -1827,7 +1826,8 @@ mod tests {
                     1,
                     caps,
                 ),
-            );
+            )
+            .expect("apply legacy announcement in fixture");
         }
         fold
     }

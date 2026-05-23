@@ -1503,7 +1503,8 @@ mod tests {
             capability_bridge::apply_legacy_announcement(
                 &fold,
                 CapabilityAnnouncement::new(*node_id, eid.clone(), 1, caps.clone()),
-            );
+            )
+            .expect("apply legacy announcement in fixture");
         }
         fold
     }
@@ -2231,7 +2232,8 @@ mod tests {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::apply_legacy_announcement(&f, ad);
+            capability_bridge::apply_legacy_announcement(&f, ad)
+                .expect("apply legacy announcement in fixture");
             f
         };
         let placement = StandardPlacement::new(&fold)
@@ -2439,7 +2441,8 @@ mod tests {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::apply_legacy_announcement(&f, ad);
+            capability_bridge::apply_legacy_announcement(&f, ad)
+                .expect("apply legacy announcement in fixture");
             f
         };
         let lookup = |_id: NodeId| -> Option<u64> { Some(200_000) }; // 200 ms
@@ -2616,7 +2619,8 @@ mod tests {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::apply_legacy_announcement(&f, ad);
+            capability_bridge::apply_legacy_announcement(&f, ad)
+                .expect("apply legacy announcement in fixture");
             f
         };
         let placement =
@@ -2994,7 +2998,8 @@ mod tests {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::apply_legacy_announcement(&f, ad);
+            capability_bridge::apply_legacy_announcement(&f, ad)
+                .expect("apply legacy announcement in fixture");
             f
         };
         let stats = |_id: NodeId| -> Option<f32> { Some(0.50) };
@@ -3023,7 +3028,8 @@ mod tests {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::apply_legacy_announcement(&f, ad);
+            capability_bridge::apply_legacy_announcement(&f, ad)
+                .expect("apply legacy announcement in fixture");
             f
         };
         let placement = StandardPlacement::new(&fold).with_resource_axis(ResourceAxis::Compute);
@@ -3053,7 +3059,8 @@ mod tests {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::apply_legacy_announcement(&f, ad);
+            capability_bridge::apply_legacy_announcement(&f, ad)
+                .expect("apply legacy announcement in fixture");
             f
         };
         let placement =
@@ -3082,7 +3089,8 @@ mod tests {
             let f = Fold::<CapabilityFold>::with_sweep_interval(std::time::Duration::ZERO);
             let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
             let ad = CapabilityAnnouncement::new(0x1111, eid.clone(), 1, target_caps.clone());
-            capability_bridge::apply_legacy_announcement(&f, ad);
+            capability_bridge::apply_legacy_announcement(&f, ad)
+                .expect("apply legacy announcement in fixture");
             f
         };
         let placement =

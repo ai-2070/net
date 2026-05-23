@@ -365,8 +365,10 @@ async fn stale_versions_are_ignored_by_index() {
     let v1 = CapabilityAnnouncement::new(/* node_id */ 0xAA, eid.clone(), 1, caps_v1);
     let v2 = CapabilityAnnouncement::new(0xAA, eid, 2, caps_v2);
 
-    capability_bridge::apply_legacy_announcement(&fold, v2);
-    capability_bridge::apply_legacy_announcement(&fold, v1); // older — must be a no-op
+    capability_bridge::apply_legacy_announcement(&fold, v2)
+        .expect("apply legacy announcement in fixture");
+    capability_bridge::apply_legacy_announcement(&fold, v1)
+        .expect("apply legacy announcement in fixture"); // older — must be a no-op
 
     let v2_filter = CapabilityFilter::new().require_tag("v2");
     assert_eq!(

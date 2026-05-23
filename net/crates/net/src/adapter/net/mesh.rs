@@ -8854,10 +8854,9 @@ impl MeshNode {
         let mut scored: Vec<(u64, f32)> = candidates
             .into_iter()
             .map(|node_id| {
-                let caps =
-                    super::behavior::fold::capability_bridge::synthesize_capability_set(
-                        fold, node_id,
-                    );
+                let caps = super::behavior::fold::capability_bridge::synthesize_capability_set(
+                    fold, node_id,
+                );
                 (node_id, req.score(&caps))
             })
             .collect();

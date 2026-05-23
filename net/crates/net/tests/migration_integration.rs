@@ -336,7 +336,8 @@ fn test_start_migration_auto() {
     capability_bridge::apply_legacy_announcement(
         &fold,
         CapabilityAnnouncement::new(0x2222, test_entity_id(), 1, target_caps),
-    );
+    )
+    .expect("apply legacy announcement in fixture");
 
     let local_caps = CapabilitySet::new();
     let scheduler = Scheduler::new(fold, 0x1111, local_caps);
@@ -990,14 +991,16 @@ fn test_enriched_capabilities_discoverable_by_scheduler() {
     capability_bridge::apply_legacy_announcement(
         &fold,
         CapabilityAnnouncement::new(0xAAAA, test_entity_id(), 1, node_a_caps),
-    );
+    )
+    .expect("apply legacy announcement in fixture");
 
     // Node B: no migration support
     let node_b_caps = CapabilitySet::new();
     capability_bridge::apply_legacy_announcement(
         &fold,
         CapabilityAnnouncement::new(0xBBBB, test_entity_id(), 1, node_b_caps),
-    );
+    )
+    .expect("apply legacy announcement in fixture");
 
     // Scheduler on node C should find A but not B
     let scheduler = Scheduler::new(fold, 0xCCCC, CapabilitySet::new());
@@ -1692,7 +1695,8 @@ fn make_scheduler_for_groups() -> Scheduler {
         capability_bridge::apply_legacy_announcement(
             &fold,
             CapabilityAnnouncement::new(node_id, test_entity_id(), 1, CapabilitySet::new()),
-        );
+        )
+        .expect("apply legacy announcement in fixture");
     }
     Scheduler::new(fold, 0x1111, CapabilitySet::new())
 }

@@ -33,7 +33,8 @@ use super::super::capability::{
 use super::capability::{
     CapabilityFilter, CapabilityFold, CapabilityMembership, CapabilityQuery, HardwareSummary,
 };
-use super::{EnvelopeMeta, Fold, FoldKind, NodeId, NodeState, SignedAnnouncement};
+use super::state::FoldError;
+use super::{ApplyOutcome, EnvelopeMeta, Fold, FoldKind, NodeId, NodeState, SignedAnnouncement};
 
 /// Translate the legacy
 /// [`behavior::capability::CapabilityFilter`](super::super::capability::CapabilityFilter)
@@ -169,13 +170,23 @@ fn gpu_vendor_canonical(vendor: GpuVendor) -> &'static str {
 }
 
 /// Apply a legacy [`CapabilityAnnouncement`] to the fold via
-/// [`translate_announcement`]. Intended primarily for test
-/// fixtures that need to prime a `Fold<CapabilityFold>` with
-/// the same legacy-shape announcement the production dispatch
-/// path would produce.
-pub fn apply_legacy_announcement(fold: &Fold<CapabilityFold>, ann: CapabilityAnnouncement) {
+/// [`translate_announcement`]. Test fixtures use this to prime
+/// a `Fold<CapabilityFold>` with the same legacy-shape
+/// announcement the production dispatch path would produce.
+///
+/// Returns the [`ApplyOutcome`] from the underlying `fold.apply`
+/// call so callers can distinguish `Inserted` / `Replaced` from
+/// `IgnoredOlder` / `IgnoredEqual`, and so a failing apply (invalid
+/// generation, signature mismatch — anything `FoldError` grows into)
+/// surfaces instead of being silently dropped. Test fixtures
+/// typically `.expect("apply")`; production callers that
+/// intentionally want a best-effort apply can `let _ = ` the result.
+pub fn apply_legacy_announcement(
+    fold: &Fold<CapabilityFold>,
+    ann: CapabilityAnnouncement,
+) -> Result<ApplyOutcome, FoldError> {
     let fold_ann = translate_announcement(&ann);
-    let _ = fold.apply(fold_ann);
+    fold.apply(fold_ann)
 }
 
 /// Synthesize a legacy [`CapabilitySet`](super::super::capability::CapabilitySet)
@@ -763,7 +774,11 @@ mod tests {
 
         // Unknown publisher: per-target check returns false (matches
         // bulk path's "missing publishers don't appear").
-        assert!(!target_matches_filter(&fold, 0xDEAD, &LegacyFilter::default()));
+        assert!(!target_matches_filter(
+            &fold,
+            0xDEAD,
+            &LegacyFilter::default()
+        ));
     }
 
     #[test]

@@ -805,7 +805,8 @@ fn predicate_eval_fixture_matches_via_placement_filter_callback() {
         capability_bridge::apply_legacy_announcement(
             &fold,
             CapabilityAnnouncement::new(target_node, eid, 1, caps.clone()),
-        );
+        )
+        .expect("apply legacy announcement in fixture");
 
         // Register the predicate-backed filter under a fixture-scoped
         // id; binding label `"test"` so concurrent fixture runs don't
@@ -972,7 +973,8 @@ fn placement_score_fixture_matches_substrate() {
         capability_bridge::apply_legacy_announcement(
             &fold,
             CapabilityAnnouncement::new(node_id, eid, 1, cand_caps),
-        );
+        )
+        .expect("apply legacy announcement in fixture");
 
         // Build the StandardPlacement from the case's config
         // subset. Only the fields that exist in the case JSON
