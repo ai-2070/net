@@ -1,0 +1,21 @@
+net/crates/net/sdk-ts/src/capability-aggregation.ts
+  s_d9dc521a887c3e::t_88f63213019bf0 24-26
+net/crates/net/sdk-ts/src/index.ts
+  s_d9dc521a887c3e::t_60b0c425ea837a 211-212
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "16cb5f750a8813050c592e99068a1e01c77d48a8",
+  "prompts": {},
+  "sessions": {
+    "s_d9dc521a887c3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f1eafc9e-4dd5-40ff-8f76-e8a5b7800252",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
