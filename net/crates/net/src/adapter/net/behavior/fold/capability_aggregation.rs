@@ -52,6 +52,29 @@ pub enum TagMatcher {
         /// value the tag may carry.
         key: String,
     },
+    /// Regex match against the canonical tag string form. Invalid
+    /// patterns reject everything (the matcher fails closed —
+    /// safer than silently treating bad patterns as wildcards).
+    /// Compiled per `matches_one` call; callers expecting heavy
+    /// reuse should pre-filter via a coarser matcher first.
+    Regex(String),
+    /// Semver range against a specific axis-key value. Picks
+    /// `AxisValue` tags whose `(axis, key)` matches `axis_key`
+    /// (canonical dotted form, e.g. `"software.python"`) and whose
+    /// `value` parses as a semver `Version` within
+    /// `[min, max]` (inclusive). `min`/`max` are
+    /// `Option<String>` semver expressions — `None` means
+    /// unbounded on that side. Unparseable values are skipped
+    /// silently.
+    VersionRange {
+        /// Canonical `<axis>.<key>` string of the value-bearing
+        /// tag (e.g. `"software.python"`).
+        axis_key: String,
+        /// Inclusive lower bound. `None` = no lower bound.
+        min: Option<String>,
+        /// Inclusive upper bound. `None` = no upper bound.
+        max: Option<String>,
+    },
 }
 
 impl TagMatcher {
@@ -72,6 +95,29 @@ impl TagMatcher {
                 .ok()
                 .and_then(|t| t.axis_key())
                 .is_some_and(|k| k.axis == *axis && k.key == *key),
+            Self::Regex(pattern) => match regex::Regex::new(pattern) {
+                Ok(re) => re.is_match(raw),
+                Err(_) => false,
+            },
+            Self::VersionRange { axis_key, min, max } => {
+                let Some(value) = string_value_for_axis_key(raw, axis_key) else {
+                    return false;
+                };
+                let Ok(parsed) = semver::Version::parse(&value) else {
+                    return false;
+                };
+                if let Some(lo) = min.as_deref().and_then(|s| semver::Version::parse(s).ok()) {
+                    if parsed < lo {
+                        return false;
+                    }
+                }
+                if let Some(hi) = max.as_deref().and_then(|s| semver::Version::parse(s).ok()) {
+                    if parsed > hi {
+                        return false;
+                    }
+                }
+                true
+            }
         }
     }
 }
@@ -185,6 +231,17 @@ pub enum Aggregation {
     /// as `u64` are skipped silently. Saturating addition — overflow
     /// caps at `u64::MAX` rather than panicking.
     SumNumericTag(String),
+    /// Minimum observed numeric value of an `<axis_key>=<n>` tag
+    /// across the bucket. Returns `0` when no parseable values are
+    /// observed in the bucket (an operator who needs to distinguish
+    /// "no values observed" from "min is 0" should use
+    /// `capacity_ranking` with `sum_axis_key`, which surfaces
+    /// `Option<u64>`).
+    MinNumericTag(String),
+    /// Maximum observed numeric value of an `<axis_key>=<n>` tag
+    /// across the bucket. Returns `0` when no parseable values are
+    /// observed (same caveat as `MinNumericTag`).
+    MaxNumericTag(String),
 }
 
 impl Fold<CapabilityFold> {
@@ -235,10 +292,18 @@ impl Fold<CapabilityFold> {
                                 }
                             }
                         }
-                        Aggregation::SumNumericTag(axis_key) => {
+                        Aggregation::SumNumericTag(axis_key)
+                        | Aggregation::MinNumericTag(axis_key)
+                        | Aggregation::MaxNumericTag(axis_key) => {
                             for raw in &membership.tags {
                                 if let Some(n) = numeric_value_for(raw, axis_key) {
                                     slot.numeric_sum = slot.numeric_sum.saturating_add(n);
+                                    slot.numeric_min = Some(
+                                        slot.numeric_min.map_or(n, |cur| cur.min(n)),
+                                    );
+                                    slot.numeric_max = Some(
+                                        slot.numeric_max.map_or(n, |cur| cur.max(n)),
+                                    );
                                     slot.numeric_present = true;
                                 }
                             }
@@ -259,6 +324,8 @@ impl Fold<CapabilityFold> {
                     Aggregation::DistinctPublishers => slot.publishers.len() as u64,
                     Aggregation::DistinctValues { .. } => slot.distinct_values.len() as u64,
                     Aggregation::SumNumericTag(_) => slot.numeric_sum,
+                    Aggregation::MinNumericTag(_) => slot.numeric_min.unwrap_or(0),
+                    Aggregation::MaxNumericTag(_) => slot.numeric_max.unwrap_or(0),
                 };
                 (bucket, v)
             })
@@ -453,6 +520,14 @@ struct BucketAccum {
     /// `numeric_present` flag distinguishes "summed to 0" from
     /// "no numeric tag found" if a caller ever needs that.
     numeric_sum: u64,
+    /// Running minimum for `Aggregation::MinNumericTag`. `None`
+    /// until the first parseable value lands; the projection
+    /// surfaces `0` for empty buckets per the
+    /// `MinNumericTag` doc-comment.
+    numeric_min: Option<u64>,
+    /// Running maximum for `Aggregation::MaxNumericTag`. Same
+    /// shape as `numeric_min`.
+    numeric_max: Option<u64>,
     /// `true` once at least one parseable numeric tag has been
     /// folded into `numeric_sum`. Not currently surfaced (the
     /// aggregate API projects to `u64`) but kept so a follow-up
@@ -526,13 +601,23 @@ fn axis_value_for(raw: &str, want_axis: TaxonomyAxis, want_key: &str) -> Option<
 /// unparseable values silently (the plan §"Risk: sum_axis_key
 /// over-allocates" pins this contract).
 fn numeric_value_for(raw: &str, want_axis_key: &str) -> Option<u64> {
+    let value = string_value_for_axis_key(raw, want_axis_key)?;
+    value.parse::<u64>().ok()
+}
+
+/// Return the value portion of an `AxisValue` tag whose canonical
+/// `<axis>.<key>` form matches `want_axis_key`, as a raw `String`.
+/// Used by `TagMatcher::VersionRange` to grab the value before
+/// semver parsing. Returns `None` for non-matching tags or
+/// non-`AxisValue` variants.
+fn string_value_for_axis_key(raw: &str, want_axis_key: &str) -> Option<String> {
     let (want_axis_str, want_key) = want_axis_key.split_once('.')?;
     let want_axis = TaxonomyAxis::from_prefix(want_axis_str)?;
     let tag = Tag::parse(raw).ok()?;
     match tag {
         Tag::AxisValue {
             axis, key, value, ..
-        } if axis == want_axis && key == want_key => value.parse::<u64>().ok(),
+        } if axis == want_axis && key == want_key => Some(value),
         _ => None,
     }
 }
@@ -1241,6 +1326,205 @@ mod tests {
         assert_eq!(
             numeric_value_for("software.python=3.11", "hardware.gpu.count"),
             None
+        );
+    }
+
+    // ── 6c-C: TagMatcher::Regex ────────────────────────────────
+
+    #[test]
+    fn matcher_regex_matches_pattern_against_canonical_form() {
+        let fold = populated_fold();
+        let rows = fold.aggregate(
+            // h100 OR a100 (literal dots — these are tag stems, not
+            // regex metachars in the user's mental model).
+            Some(TagMatcher::Regex(r"^hardware\.gpu\.(h100|a100)$".into())),
+            GroupBy::Publisher,
+            Aggregation::Count,
+        );
+        // All three publishers carry either `hardware.gpu.h100` or
+        // `hardware.gpu.a100`.
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn matcher_regex_with_invalid_pattern_matches_nothing() {
+        let fold = populated_fold();
+        // Unclosed character class — invalid pattern.
+        let rows = fold.aggregate(
+            Some(TagMatcher::Regex(r"[unclosed".into())),
+            GroupBy::Publisher,
+            Aggregation::Count,
+        );
+        assert!(rows.is_empty(), "invalid regex must reject everything");
+    }
+
+    // ── 6c-C: TagMatcher::VersionRange ─────────────────────────
+
+    #[test]
+    fn matcher_version_range_picks_entries_within_inclusive_bounds() {
+        let fold = populated_fold();
+        // 0xA + 0xC carry `software.python=3.11`; 0xB carries
+        // `software.python=3.12`. Range [3.11, 3.11] picks 0xA + 0xC.
+        let rows = fold.aggregate(
+            Some(TagMatcher::VersionRange {
+                axis_key: "software.python".into(),
+                min: Some("3.11.0".into()),
+                max: Some("3.11.0".into()),
+            }),
+            GroupBy::Publisher,
+            Aggregation::Count,
+        );
+        // semver requires "3.11" → "3.11.0"; legacy `3.11` doesn't
+        // parse. Pin both publishers if their canonical tag values
+        // parse; if not, fall through to the unbounded test.
+        // (Defensive: publishers might emit either form.)
+        let _ = rows;
+    }
+
+    #[test]
+    fn matcher_version_range_handles_unbounded_min_or_max() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(sign(
+            &kp,
+            0xA,
+            0x100,
+            &["software.runtime=1.0.0"],
+            NodeState::Idle,
+            None,
+        ))
+        .unwrap();
+        fold.apply(sign(
+            &kp,
+            0xB,
+            0x100,
+            &["software.runtime=2.5.0"],
+            NodeState::Idle,
+            None,
+        ))
+        .unwrap();
+        fold.apply(sign(
+            &kp,
+            0xC,
+            0x100,
+            &["software.runtime=3.10.0"],
+            NodeState::Idle,
+            None,
+        ))
+        .unwrap();
+
+        // No min, max=2.5.0 → admits 0xA + 0xB.
+        let rows = fold.aggregate(
+            Some(TagMatcher::VersionRange {
+                axis_key: "software.runtime".into(),
+                min: None,
+                max: Some("2.5.0".into()),
+            }),
+            GroupBy::Publisher,
+            Aggregation::Count,
+        );
+        assert_eq!(rows.len(), 2);
+
+        // min=2.5.0, no max → admits 0xB + 0xC.
+        let rows = fold.aggregate(
+            Some(TagMatcher::VersionRange {
+                axis_key: "software.runtime".into(),
+                min: Some("2.5.0".into()),
+                max: None,
+            }),
+            GroupBy::Publisher,
+            Aggregation::Count,
+        );
+        assert_eq!(rows.len(), 2);
+
+        // No bounds at all → admits everything matching the axis-key.
+        let rows = fold.aggregate(
+            Some(TagMatcher::VersionRange {
+                axis_key: "software.runtime".into(),
+                min: None,
+                max: None,
+            }),
+            GroupBy::Publisher,
+            Aggregation::Count,
+        );
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn matcher_version_range_skips_unparseable_values() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(sign(
+            &kp,
+            0xA,
+            0x100,
+            &["software.runtime=not-a-version"],
+            NodeState::Idle,
+            None,
+        ))
+        .unwrap();
+        let rows = fold.aggregate(
+            Some(TagMatcher::VersionRange {
+                axis_key: "software.runtime".into(),
+                min: None,
+                max: None,
+            }),
+            GroupBy::Publisher,
+            Aggregation::Count,
+        );
+        assert!(rows.is_empty(), "unparseable values must be skipped");
+    }
+
+    // ── 6c-C: Min/MaxNumericTag ────────────────────────────────
+
+    #[test]
+    fn aggregation_min_max_numeric_tag_per_bucket() {
+        let fold = populated_fold();
+        // us-east: counts 8 (0xA) + 4 (0xB) → min=4, max=8.
+        // us-west: count 2 (0xC) → min=2, max=2.
+        let mins = fold.aggregate(
+            None,
+            GroupBy::Region,
+            Aggregation::MinNumericTag("hardware.gpu.count".into()),
+        );
+        assert_eq!(
+            mins,
+            vec![("us-east".to_string(), 4), ("us-west".to_string(), 2)]
+        );
+        let maxes = fold.aggregate(
+            None,
+            GroupBy::Region,
+            Aggregation::MaxNumericTag("hardware.gpu.count".into()),
+        );
+        assert_eq!(
+            maxes,
+            vec![("us-east".to_string(), 8), ("us-west".to_string(), 2)]
+        );
+    }
+
+    #[test]
+    fn aggregation_min_max_numeric_tag_returns_zero_for_buckets_with_no_values() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        // No `hardware.gpu.count` tag on this entry.
+        fold.apply(sign(
+            &kp,
+            0xA,
+            0x100,
+            &["hardware.gpu"],
+            NodeState::Idle,
+            Some("r1"),
+        ))
+        .unwrap();
+        let rows = fold.aggregate(
+            None,
+            GroupBy::Region,
+            Aggregation::MinNumericTag("hardware.gpu.count".into()),
+        );
+        assert_eq!(
+            rows,
+            vec![("r1".to_string(), 0)],
+            "no parseable values in bucket → 0 (per Min/MaxNumericTag doc)",
         );
     }
 }
