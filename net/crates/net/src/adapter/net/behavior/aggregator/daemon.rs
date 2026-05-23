@@ -147,12 +147,15 @@ pub struct AggregatorDaemon {
     /// `on_stop` can take ownership and await it without racing
     /// the spawn path.
     background: parking_lot::Mutex<Option<JoinHandle<()>>>,
-    /// `Instant` of the most recent successful tick (set after
-    /// `run_one_tick` returns Ok). `LifecycleDaemon::health`
-    /// reads this: if more than `3 × summary_interval` has
-    /// elapsed since the last tick, the daemon reports
-    /// unhealthy. `None` until the loop has run at least once.
-    last_tick_at: Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
+    /// Wallclock at construction. `LifecycleDaemon::health`
+    /// derives liveness from
+    /// `(start_instant.elapsed() / summary_interval) - generation`:
+    /// if the daemon is more than 3 ticks behind the schedule
+    /// the operator's interval implies, it reports unhealthy.
+    /// Single immutable read — no lock, no atomics. Replaces an
+    /// earlier `Mutex<Option<Instant>>` that took 3 write-locks
+    /// per tick to compute the same answer.
+    start_instant: std::time::Instant,
 }
 
 impl AggregatorDaemon {
@@ -178,7 +181,7 @@ impl AggregatorDaemon {
             )))),
             shutdown: Arc::new(AtomicBool::new(false)),
             background: parking_lot::Mutex::new(None),
-            last_tick_at: Arc::new(parking_lot::Mutex::new(None)),
+            start_instant: std::time::Instant::now(),
         })
     }
 
@@ -241,7 +244,6 @@ impl AggregatorDaemon {
         let batch = self.produce_summaries();
         let novel = self.filter_novel(batch);
         self.append_to_latest(novel.clone());
-        *self.last_tick_at.lock() = Some(std::time::Instant::now());
         novel
     }
 
@@ -271,7 +273,6 @@ impl AggregatorDaemon {
             kept.push(summary);
         }
         self.append_to_latest(kept);
-        *self.last_tick_at.lock() = Some(std::time::Instant::now());
         Ok(published)
     }
 
@@ -307,7 +308,6 @@ impl AggregatorDaemon {
             kept.push(summary);
         }
         self.append_to_latest(kept);
-        *self.last_tick_at.lock() = Some(std::time::Instant::now());
         Ok(published)
     }
 
@@ -548,25 +548,32 @@ impl LifecycleDaemon for AggregatorDaemon {
     }
 
     async fn health(&self) -> ReplicaHealth {
-        // The aggregator's liveness signal is "last
-        // successful tick was within 3 × summary_interval".
-        // Before the loop has ticked at least once, treat the
-        // daemon as healthy — `on_start` may have only just
-        // returned and the first interval may not have
-        // elapsed yet. Once a tick has landed, an expired
-        // window means the loop is stuck (publish path
-        // wedged, runtime starved, etc.).
-        let last = *self.last_tick_at.lock();
-        let Some(last) = last else {
+        // Derive liveness from `start_instant + generation`:
+        //   expected = elapsed / interval
+        //   behind   = expected.saturating_sub(generation)
+        // Healthy unless `behind > MAX_BEHIND_TICKS`. Equivalent
+        // to the old "no successful tick in 3 × interval"
+        // formulation but with no per-tick lock — just an
+        // atomic load on generation + an Instant::elapsed.
+        const MAX_BEHIND_TICKS: u128 = 3;
+        let interval_ns = self.config.summary_interval.as_nanos();
+        if interval_ns == 0 {
+            // Degenerate config — can't reason about ticks per
+            // unit time. Surface as healthy; the validation at
+            // construction normally rejects this.
             return ReplicaHealth::healthy();
-        };
-        let interval = self.config.summary_interval;
-        let max_quiet = interval.saturating_mul(3);
-        let elapsed = last.elapsed();
-        if elapsed > max_quiet {
+        }
+        let elapsed_ns = self.start_instant.elapsed().as_nanos();
+        let expected = elapsed_ns / interval_ns;
+        let generation = u128::from(self.generation.load(Ordering::Acquire));
+        let behind = expected.saturating_sub(generation);
+        // `>=` rather than `>` so 3 missed ticks (the
+        // "3 × interval quiet" boundary the original
+        // last-tick-elapsed check enforced) flips to unhealthy.
+        if behind >= MAX_BEHIND_TICKS {
             ReplicaHealth::unhealthy(format!(
-                "no tick in {:?} (max allowed: {max_quiet:?})",
-                elapsed
+                "generation {} is {} ticks behind expected {} (interval {:?})",
+                generation, behind, expected, self.config.summary_interval,
             ))
         } else {
             ReplicaHealth::healthy()
@@ -1129,8 +1136,8 @@ mod tests {
             "expected unhealthy after 3 × interval, got {h:?}"
         );
         assert!(
-            h.diagnostic.as_deref().unwrap_or("").contains("no tick"),
-            "diagnostic should mention the missed tick: {h:?}"
+            h.diagnostic.as_deref().unwrap_or("").contains("ticks behind"),
+            "diagnostic should mention the missed ticks: {h:?}"
         );
     }
 }
