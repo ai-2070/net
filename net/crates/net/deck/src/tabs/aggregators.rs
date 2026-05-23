@@ -13,7 +13,7 @@ use std::sync::Arc;
 use net_sdk::deck::{AggregatorSnapshot, DeckClient};
 use ratatui::{
     layout::{Alignment, Constraint, Rect},
-    text::{Line, Span},
+    text::Span,
     widgets::{Block, Borders, Cell, Row, Table},
     Frame,
 };
@@ -31,11 +31,7 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
-        .title(Line::from(vec![
-            Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
-            Span::styled("AGGREGATORS", theme::green_hi()),
-            Span::styled("    no aggregator wired", theme::chrome()),
-        ]));
+        .title(widgets::section_title("AGGREGATORS", "no aggregator wired"));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     widgets::empty::render(
@@ -59,18 +55,14 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, snap: &AggregatorSnapshot) {
     let interval = snap.summary_interval;
     let summaries = &snap.summaries;
 
-    let title = Line::from(vec![
-        Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
-        Span::styled("AGGREGATORS", theme::green_hi()),
-        Span::styled(
-            format!(
-                "    source: {source} · folds: [{kinds}] · gen: {generation} · every {interval:?} · {count} summaries buffered",
-                kinds = kinds.join(", "),
-                count = summaries.len(),
-            ),
-            theme::chrome(),
+    let title = widgets::section_title(
+        "AGGREGATORS",
+        &format!(
+            "source: {source} · folds: [{kinds}] · gen: {generation} · every {interval:?} · {count} summaries buffered",
+            kinds = kinds.join(", "),
+            count = summaries.len(),
         ),
-    ]);
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())

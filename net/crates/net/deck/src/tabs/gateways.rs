@@ -14,7 +14,7 @@ use std::sync::Arc;
 use net_sdk::deck::{DeckClient, GatewayStats};
 use ratatui::{
     layout::{Alignment, Constraint, Rect},
-    text::{Line, Span},
+    text::Span,
     widgets::{Block, Borders, Cell, Row, Table},
     Frame,
 };
@@ -35,11 +35,7 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
-        .title(Line::from(vec![
-            Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
-            Span::styled("GATEWAYS", theme::green_hi()),
-            Span::styled("    no gateway installed", theme::chrome()),
-        ]));
+        .title(widgets::section_title("GATEWAYS", "no gateway installed"));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     widgets::empty::render(
@@ -57,21 +53,17 @@ fn render_table(
     stats: &GatewayStats,
     exports: &[(u16, Vec<net_sdk::subnets::SubnetId>)],
 ) {
-    let title = Line::from(vec![
-        Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
-        Span::styled("GATEWAYS", theme::green_hi()),
-        Span::styled(
-            format!(
-                "    local: {local} · forwarded: {fwd} · dropped: {drp} · {peers} peer-subnets · {exp} export rules",
-                local = stats.local_subnet,
-                fwd = stats.forwarded,
-                drp = stats.dropped,
-                peers = stats.peer_subnets.len(),
-                exp = stats.export_rules
-            ),
-            theme::chrome(),
+    let title = widgets::section_title(
+        "GATEWAYS",
+        &format!(
+            "local: {local} · forwarded: {fwd} · dropped: {drp} · {peers} peer-subnets · {exp} export rules",
+            local = stats.local_subnet,
+            fwd = stats.forwarded,
+            drp = stats.dropped,
+            peers = stats.peer_subnets.len(),
+            exp = stats.export_rules
         ),
-    ]);
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())

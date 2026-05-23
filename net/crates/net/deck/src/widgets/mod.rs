@@ -14,6 +14,9 @@ pub mod status_bar;
 pub mod tab_bar;
 
 use ratatui::layout::Rect;
+use ratatui::text::{Line, Span};
+
+use crate::theme;
 
 /// Centered sub-rect of `area` with the given width / height,
 /// clamped to fit so the modal never tries to render outside
@@ -30,4 +33,15 @@ pub fn center(area: Rect, width: u16, height: u16) -> Rect {
         width: w,
         height: h,
     }
+}
+
+/// Standard panel title: `▸ NAME    <status text>`. Used by
+/// every Block panel so the prefix glyph + bright name +
+/// dim status segment stay consistent across tabs.
+pub fn section_title(name: &str, status: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
+        Span::styled(name.to_string(), theme::green_hi()),
+        Span::styled(format!("    {status}"), theme::chrome()),
+    ])
 }

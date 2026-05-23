@@ -13,7 +13,7 @@ use std::sync::Arc;
 use net_sdk::deck::{DeckClient, SubnetRollup};
 use ratatui::{
     layout::{Alignment, Constraint, Rect},
-    text::{Line, Span},
+    text::Span,
     widgets::{Block, Borders, Cell, Row, Table},
     Frame,
 };
@@ -34,11 +34,7 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
-        .title(Line::from(vec![
-            Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
-            Span::styled("SUBNETS", theme::green_hi()),
-            Span::styled("    no mesh attached", theme::chrome()),
-        ]));
+        .title(widgets::section_title("SUBNETS", "no mesh attached"));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     widgets::empty::render(
@@ -60,18 +56,14 @@ fn render_table(
     let local_str = local
         .map(|s| s.to_string())
         .unwrap_or_else(|| "—".to_string());
-    let title = Line::from(vec![
-        Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
-        Span::styled("SUBNETS", theme::green_hi()),
-        Span::styled(
-            format!(
-                "    local: {local_str} · {buckets} known · {peers} peers",
-                buckets = rollups.len(),
-                peers = peer_total
-            ),
-            theme::chrome(),
+    let title = widgets::section_title(
+        "SUBNETS",
+        &format!(
+            "local: {local_str} · {buckets} known · {peers} peers",
+            buckets = rollups.len(),
+            peers = peer_total
         ),
-    ]);
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
