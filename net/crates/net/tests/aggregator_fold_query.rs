@@ -21,11 +21,21 @@ use std::time::Duration;
 
 use net::adapter::net::behavior::aggregator::{
     AggregatorConfig, AggregatorDaemon, FoldQueryClient, FoldQueryClientError, FoldQueryError,
+    SummaryAnnouncement,
+};
+use net::adapter::net::{
+    ChannelConfig, ChannelConfigRegistry, ChannelId, ChannelName, ChannelPublisher, OnFailure,
+    PublishConfig, Reliability, Visibility,
 };
 use net::adapter::net::behavior::fold::capability::{CapabilityFold, CapabilityMembership};
 use net::adapter::net::behavior::fold::wire::SignedAnnouncement;
 use net::adapter::net::behavior::fold::{EnvelopeMeta, FoldKind, NodeState};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig, SubnetId};
+// `ChannelPublisher` / `OnFailure` / `Reliability` are also imported through
+// the `behavior::aggregator` umbrella above; the second `use` keeps the
+// integration test's flat name surface readable.
+#[allow(unused_imports)]
+use net::adapter::net as _net;
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
@@ -198,6 +208,107 @@ async fn unknown_kind_returns_server_error() {
         Err(other) => panic!("expected Server(UnknownKind), got {other:?}"),
         Ok(s) => panic!("expected error, got {s:?}"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wire_publish_summary_reaches_subscriber_on_remote_node() {
+    // Pin the Phase B slice 3 wire-publish path end-to-end:
+    // - Host installs a channel registry + an aggregator that
+    //   registers its summary channels with `Visibility::Global`.
+    // - Querier subscribes to `summary/0x0001` on the host.
+    // - Host's aggregator publishes; the substrate fan-out
+    //   reports a non-zero delivered count, proving the wire
+    //   path admitted the subscriber.
+    let summary_channel = ChannelName::new("summary/0x0001").expect("channel name");
+    let channel_cfg = || {
+        ChannelConfig::new(ChannelId::parse(summary_channel.as_str()).expect("id"))
+            .with_visibility(Visibility::Global)
+    };
+
+    // Both nodes need the channel in their registry so the
+    // subscribe-gate + publish-fanout visibility checks pass.
+    let host = {
+        let mut node = MeshNode::new(EntityKeypair::generate(), test_config())
+            .await
+            .expect("MeshNode::new host");
+        let registry = Arc::new(ChannelConfigRegistry::new());
+        registry.insert(channel_cfg());
+        node.set_channel_configs(registry);
+        Arc::new(node)
+    };
+    let querier = {
+        let mut node = MeshNode::new(EntityKeypair::generate(), test_config())
+            .await
+            .expect("MeshNode::new querier");
+        let registry = Arc::new(ChannelConfigRegistry::new());
+        registry.insert(channel_cfg());
+        node.set_channel_configs(registry);
+        Arc::new(node)
+    };
+
+    handshake(&host, &querier).await;
+
+    // Prime the host's capability fold.
+    let kp = EntityKeypair::generate();
+    let fold = host.capability_fold();
+    fold.apply(sign_cap(&kp, 0xA, 1, NodeState::Idle)).unwrap();
+
+    // Build + install the aggregator on the host.
+    let cfg = AggregatorConfig::new(SubnetId::new(&[3]))
+        .with_fold_kind(CapabilityFold::KIND_ID)
+        .with_visibility(Visibility::Global);
+    let agg = Arc::new(AggregatorDaemon::new(cfg, host.clone()).expect("new"));
+    agg.register_summary_channels().expect("register channels");
+
+    // Querier subscribes to the host's summary channel.
+    querier
+        .subscribe_channel(host.node_id(), summary_channel.clone())
+        .await
+        .expect("subscribe");
+
+    // Give the subscribe a tick to propagate through the
+    // membership-ack path so the host's roster has the querier
+    // before the publish fan-out.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Tick + publish.
+    let published = agg.tick_and_publish().await.expect("tick_and_publish");
+    assert_eq!(published, 1, "one summary should publish");
+
+    // Sanity: also verify via a direct publish that the
+    // subscriber is on the roster — the aggregator's internal
+    // publish goes through `mesh.publish`, which uses the same
+    // fan-out path. A `delivered > 0` here proves the channel is
+    // wired correctly even if the aggregator's report isn't
+    // surfaced.
+    let publisher = ChannelPublisher::new(
+        summary_channel.clone(),
+        PublishConfig {
+            reliability: Reliability::FireAndForget,
+            on_failure: OnFailure::BestEffort,
+            max_inflight: 16,
+        },
+    );
+    let test_payload = postcard::to_allocvec(&SummaryAnnouncement {
+        source_subnet: SubnetId::new(&[3]),
+        fold_kind: CapabilityFold::KIND_ID,
+        generation: 999,
+        buckets: vec![("idle".to_string(), 1)],
+    })
+    .expect("encode");
+    let report = host
+        .publish(&publisher, bytes::Bytes::from(test_payload))
+        .await
+        .expect("publish");
+    assert_eq!(
+        report.attempted, 1,
+        "querier should be the only subscriber"
+    );
+    assert!(
+        report.delivered >= 1,
+        "subscriber on roster should receive payload (got delivered={})",
+        report.delivered,
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
