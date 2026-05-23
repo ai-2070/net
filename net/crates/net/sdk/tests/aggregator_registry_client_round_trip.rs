@@ -69,10 +69,8 @@ fn primary_template_spawner(
             let cfg = AggregatorConfig::new(SubnetId::GLOBAL)
                 .with_fold_kind(CapabilityFold::KIND_ID)
                 .with_interval(Duration::from_millis(80));
-            let group = LifecycleGroup::<AggregatorDaemon>::spawn(
-                req.replica_count,
-                [0xCDu8; 32],
-                {
+            let group =
+                LifecycleGroup::<AggregatorDaemon>::spawn(req.replica_count, [0xCDu8; 32], {
                     let cfg = cfg.clone();
                     let mesh = mesh.clone();
                     move |_idx| {
@@ -81,10 +79,9 @@ fn primary_template_spawner(
                                 .expect("aggregator config validated"),
                         )
                     }
-                },
-            )
-            .await
-            .map_err(|e| RegistryRpcError::SpawnRejected(format!("{e}")))?;
+                })
+                .await
+                .map_err(|e| RegistryRpcError::SpawnRejected(format!("{e}")))?;
             let entry = registry
                 .register(req.group_name.clone(), group)
                 .map_err(|e| RegistryRpcError::SpawnRejected(format!("{e}")))?;
@@ -114,8 +111,8 @@ async fn bound_registry_client_drives_list_spawn_unregister_against_remote_host(
     // SDK wrapper: BoundRegistryClient binds A's mesh + B's
     // node_id at construction.
     let target = b.inner().node_id();
-    let client = BoundRegistryClient::new(a.node_arc(), target)
-        .with_deadline(Duration::from_secs(2));
+    let client =
+        BoundRegistryClient::new(a.node_arc(), target).with_deadline(Duration::from_secs(2));
     assert_eq!(client.target_node_id(), target);
 
     // Initial list: empty.
@@ -164,8 +161,8 @@ async fn bound_client_unknown_template_surfaces_typed_server_error() {
     handshake(&a, &b, addr_b).await;
 
     let target = b.inner().node_id();
-    let client = BoundRegistryClient::new(a.node_arc(), target)
-        .with_deadline(Duration::from_secs(2));
+    let client =
+        BoundRegistryClient::new(a.node_arc(), target).with_deadline(Duration::from_secs(2));
 
     match client.spawn("does-not-exist", "any", 1).await {
         Err(RegistryClientError::Server(RegistryRpcError::UnknownTemplate(t))) => {

@@ -5338,9 +5338,7 @@ impl MeshNode {
         registry: Arc<super::behavior::aggregator::AggregatorRegistry>,
     ) {
         debug_assert!(
-            !self
-                .started
-                .load(std::sync::atomic::Ordering::SeqCst),
+            !self.started.load(std::sync::atomic::Ordering::SeqCst),
             "set_aggregator_registry must be called before MeshNode::start; \
              installing after the receive loop is live races channel-publish init",
         );

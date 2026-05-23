@@ -69,19 +69,19 @@
 
 // ─── Client surfaces (every binding can re-export these) ───
 pub use net::adapter::net::behavior::aggregator::{
-    DEFAULT_QUERY_CACHE_TTL, DEFAULT_QUERY_DEADLINE, DEFAULT_REGISTRY_DEADLINE, FOLD_QUERY_SERVICE,
     FoldQueryClient, FoldQueryClientError, FoldQueryError, FoldQueryOp, FoldQueryRequest,
-    FoldQueryResponse, REGISTRY_SERVICE, RegistryClient, RegistryClientError, RegistryGroupSummary,
+    FoldQueryResponse, RegistryClient, RegistryClientError, RegistryGroupSummary,
     RegistryReplicaSummary, RegistryRequest, RegistryResponse, RegistryRpcError, SpawnFn,
-    SpawnRequest,
+    SpawnRequest, DEFAULT_QUERY_CACHE_TTL, DEFAULT_QUERY_DEADLINE, DEFAULT_REGISTRY_DEADLINE,
+    FOLD_QUERY_SERVICE, REGISTRY_SERVICE,
 };
 
 // ─── Daemon-author surfaces (Rust-only re-exports) ───
 pub use net::adapter::net::behavior::aggregator::{
-    AggregatorConfig, AggregatorDaemon, AggregatorError, AggregatorGroupEntry,
+    snapshot_group, AggregatorConfig, AggregatorDaemon, AggregatorError, AggregatorGroupEntry,
     AggregatorPublishError, AggregatorRegistry, AggregatorRegistryError, CapabilityFoldSummarizer,
-    EntrySnapshot, RegistryHandler, RegistryReadHandler, ReservationFoldSummarizer,
-    SummaryAnnouncement, Summarizer, snapshot_group,
+    EntrySnapshot, RegistryHandler, RegistryReadHandler, ReservationFoldSummarizer, Summarizer,
+    SummaryAnnouncement,
 };
 
 // ─── Lifecycle primitives ───
@@ -239,7 +239,12 @@ impl BoundRegistryClient {
         replica_count: u8,
     ) -> Result<RegistryGroupSummary, RegistryClientError> {
         self.inner
-            .spawn(self.target_node_id, template_name, group_name, replica_count)
+            .spawn(
+                self.target_node_id,
+                template_name,
+                group_name,
+                replica_count,
+            )
             .await
     }
 
@@ -248,9 +253,7 @@ impl BoundRegistryClient {
         &self,
         group_name: impl Into<String>,
     ) -> Result<bool, RegistryClientError> {
-        self.inner
-            .unregister(self.target_node_id, group_name)
-            .await
+        self.inner.unregister(self.target_node_id, group_name).await
     }
 }
 

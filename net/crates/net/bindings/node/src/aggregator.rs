@@ -149,7 +149,9 @@ pub struct SummaryBucketJs {
     pub count: BigInt,
 }
 
-impl From<&::net::adapter::net::behavior::aggregator::SummaryAnnouncement> for SummaryAnnouncementJs {
+impl From<&::net::adapter::net::behavior::aggregator::SummaryAnnouncement>
+    for SummaryAnnouncementJs
+{
     fn from(s: &::net::adapter::net::behavior::aggregator::SummaryAnnouncement) -> Self {
         Self {
             fold_kind: s.fold_kind as u32,
@@ -210,11 +212,7 @@ impl RegistryClient {
     #[napi]
     pub async fn list(&self, target_node_id: BigInt) -> Result<Vec<RegistryGroupSummaryJs>> {
         let target = bigint_u64("targetNodeId", target_node_id)?;
-        let groups = self
-            .inner
-            .list(target)
-            .await
-            .map_err(registry_err)?;
+        let groups = self.inner.list(target).await.map_err(registry_err)?;
         Ok(groups.iter().map(Into::into).collect())
     }
 
@@ -244,11 +242,7 @@ impl RegistryClient {
 
     /// Tear down a registered group by name.
     #[napi]
-    pub async fn unregister(
-        &self,
-        target_node_id: BigInt,
-        group_name: String,
-    ) -> Result<bool> {
+    pub async fn unregister(&self, target_node_id: BigInt, group_name: String) -> Result<bool> {
         let target = bigint_u64("targetNodeId", target_node_id)?;
         self.inner
             .unregister(target, group_name)
@@ -309,12 +303,8 @@ impl FoldQueryClient {
         kind: u32,
     ) -> Result<Vec<SummaryAnnouncementJs>> {
         let target = bigint_u64("targetNodeId", target_node_id)?;
-        let kind_u16 = u16::try_from(kind).map_err(|_| {
-            agg_err(
-                "invalid-args",
-                format!("kind must fit in u16, got {kind}"),
-            )
-        })?;
+        let kind_u16 = u16::try_from(kind)
+            .map_err(|_| agg_err("invalid-args", format!("kind must fit in u16, got {kind}")))?;
         let summaries = self
             .inner
             .query_latest(target, kind_u16)
@@ -331,12 +321,8 @@ impl FoldQueryClient {
         kind: u32,
     ) -> Result<Vec<SummaryAnnouncementJs>> {
         let target = bigint_u64("targetNodeId", target_node_id)?;
-        let kind_u16 = u16::try_from(kind).map_err(|_| {
-            agg_err(
-                "invalid-args",
-                format!("kind must fit in u16, got {kind}"),
-            )
-        })?;
+        let kind_u16 = u16::try_from(kind)
+            .map_err(|_| agg_err("invalid-args", format!("kind must fit in u16, got {kind}")))?;
         let summaries = self
             .inner
             .query_summarize_now(target, kind_u16)

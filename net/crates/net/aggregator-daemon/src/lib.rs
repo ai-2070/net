@@ -584,10 +584,11 @@ fn validate_template(tpl: &TemplateConfig, mesh: &Arc<MeshNode>) -> Result<(), D
             error: "summary_interval_ms must be >= 10".into(),
         });
     }
-    let source_subnet = parse_subnet(&tpl.source_subnet).map_err(|e| DaemonError::SubnetInvalid {
-        raw: tpl.source_subnet.clone(),
-        error: e,
-    })?;
+    let source_subnet =
+        parse_subnet(&tpl.source_subnet).map_err(|e| DaemonError::SubnetInvalid {
+            raw: tpl.source_subnet.clone(),
+            error: e,
+        })?;
     for kind in &tpl.fold_kinds {
         check_known_fold_kind(*kind, &tpl.name)?;
     }
@@ -642,7 +643,9 @@ fn make_spawner(
                 .await
                 .map_err(|e| match e {
                     SpawnAndRegisterError::SpawnFailed(s)
-                    | SpawnAndRegisterError::RegisterFailed(s) => RegistryRpcError::SpawnRejected(s),
+                    | SpawnAndRegisterError::RegisterFailed(s) => {
+                        RegistryRpcError::SpawnRejected(s)
+                    }
                 })?;
             Ok(snapshot_group(&entry).await)
         })

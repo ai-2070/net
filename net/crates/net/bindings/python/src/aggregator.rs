@@ -38,11 +38,10 @@ use tokio::runtime::Runtime;
 
 use net::adapter::net::MeshNode;
 use net_sdk::aggregator::{
-    FoldQueryClient as SdkFoldQueryClient,
-    FoldQueryClientError as SdkFoldQueryClientError, FoldQueryError,
-    RegistryClient as SdkRegistryClient,
-    RegistryClientError as SdkRegistryClientError, RegistryGroupSummary,
-    RegistryReplicaSummary, RegistryRpcError, SummaryAnnouncement,
+    FoldQueryClient as SdkFoldQueryClient, FoldQueryClientError as SdkFoldQueryClientError,
+    FoldQueryError, RegistryClient as SdkRegistryClient,
+    RegistryClientError as SdkRegistryClientError, RegistryGroupSummary, RegistryReplicaSummary,
+    RegistryRpcError, SummaryAnnouncement,
 };
 
 // =========================================================================
@@ -168,10 +167,7 @@ fn replica_to_dict<'py>(
     Ok(d)
 }
 
-fn group_to_dict<'py>(
-    py: Python<'py>,
-    g: &RegistryGroupSummary,
-) -> PyResult<Bound<'py, PyDict>> {
+fn group_to_dict<'py>(py: Python<'py>, g: &RegistryGroupSummary) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("name", &g.name)?;
     let seed_hex: String = g.group_seed.iter().map(|b| format!("{b:02x}")).collect();
@@ -195,10 +191,7 @@ fn groups_to_list<'py>(
     Ok(out)
 }
 
-fn summary_to_dict<'py>(
-    py: Python<'py>,
-    s: &SummaryAnnouncement,
-) -> PyResult<Bound<'py, PyDict>> {
+fn summary_to_dict<'py>(py: Python<'py>, s: &SummaryAnnouncement) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("fold_kind", u32::from(s.fold_kind))?;
     d.set_item("source_subnet", format!("{}", s.source_subnet))?;
@@ -258,23 +251,18 @@ impl PyRegistryClient {
     /// `self` in place and returns it for `client.with_deadline(N)`
     /// chaining (consistent with the substrate's builder).
     fn with_deadline(slf: PyRef<'_, Self>, millis: u64) -> PyRef<'_, Self> {
-        let new_inner = SdkRegistryClient::new(slf.mesh.clone())
-            .with_deadline(Duration::from_millis(millis));
+        let new_inner =
+            SdkRegistryClient::new(slf.mesh.clone()).with_deadline(Duration::from_millis(millis));
         *slf.inner.write() = new_inner;
         slf
     }
 
     /// Enumerate groups on `target_node_id`.
-    fn list<'py>(
-        &self,
-        py: Python<'py>,
-        target_node_id: u64,
-    ) -> PyResult<Bound<'py, PyList>> {
+    fn list<'py>(&self, py: Python<'py>, target_node_id: u64) -> PyResult<Bound<'py, PyList>> {
         let inner_snapshot = self.inner.read().clone();
         let runtime = self.runtime.clone();
-        let result = py.detach(|| {
-            runtime.block_on(async move { inner_snapshot.list(target_node_id).await })
-        });
+        let result = py
+            .detach(|| runtime.block_on(async move { inner_snapshot.list(target_node_id).await }));
         match result {
             Ok(groups) => groups_to_list(py, &groups),
             Err(e) => Err(registry_err(py, e)),
@@ -317,18 +305,15 @@ impl PyRegistryClient {
         let inner_snapshot = self.inner.read().clone();
         let runtime = self.runtime.clone();
         let result = py.detach(|| {
-            runtime.block_on(async move {
-                inner_snapshot.unregister(target_node_id, group_name).await
-            })
+            runtime.block_on(
+                async move { inner_snapshot.unregister(target_node_id, group_name).await },
+            )
         });
         result.map_err(|e| registry_err(py, e))
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "RegistryClient(mesh={:?})",
-            Arc::as_ptr(&self.mesh),
-        )
+        format!("RegistryClient(mesh={:?})", Arc::as_ptr(&self.mesh),)
     }
 }
 
@@ -372,8 +357,8 @@ impl PyFoldQueryClient {
 
     /// Override the per-call deadline in milliseconds.
     fn with_deadline(slf: PyRef<'_, Self>, millis: u64) -> PyRef<'_, Self> {
-        let new_inner = SdkFoldQueryClient::new(slf.mesh.clone())
-            .with_deadline(Duration::from_millis(millis));
+        let new_inner =
+            SdkFoldQueryClient::new(slf.mesh.clone()).with_deadline(Duration::from_millis(millis));
         *slf.inner.write() = new_inner;
         slf
     }
@@ -432,9 +417,6 @@ impl PyFoldQueryClient {
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "FoldQueryClient(mesh={:?})",
-            Arc::as_ptr(&self.mesh),
-        )
+        format!("FoldQueryClient(mesh={:?})", Arc::as_ptr(&self.mesh),)
     }
 }

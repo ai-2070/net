@@ -98,7 +98,8 @@ psk_hex = "4242424242424242424242424242424242424242424242424242424242424242"
     let pk = &trimmed[pk_start..pk_end];
     assert_eq!(pk.len(), 64, "public_key_hex must be 64 chars, got {pk:?}");
     assert!(
-        pk.chars().all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_ascii_lowercase())),
+        pk.chars()
+            .all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_ascii_lowercase())),
         "public_key_hex must be lowercase hex, got {pk:?}"
     );
 }

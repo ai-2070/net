@@ -43,6 +43,8 @@ mod meshdb;
 mod meshos;
 // Deck SDK — operator-side bindings (Phase 5 slice 1). Builds on
 // `meshos` for the supervisor runtime accessors.
+#[cfg(feature = "aggregator")]
+mod aggregator;
 #[cfg(feature = "deck")]
 mod deck;
 #[cfg(feature = "net")]
@@ -51,8 +53,6 @@ mod placement;
 mod redis_dedup;
 #[cfg(feature = "net")]
 mod subnets;
-#[cfg(feature = "aggregator")]
-mod aggregator;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;

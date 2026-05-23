@@ -669,9 +669,10 @@ fn classify(err: &RegistryClientError) -> (i32, String) {
             RegistryRpcError::DecodeFailed(s) => {
                 (NET_REGISTRY_ERR_CODEC, format!("server decode: {s}"))
             }
-            RegistryRpcError::UnknownTemplate(t) => {
-                (NET_REGISTRY_ERR_UNKNOWN_TEMPLATE, format!("unknown template: {t}"))
-            }
+            RegistryRpcError::UnknownTemplate(t) => (
+                NET_REGISTRY_ERR_UNKNOWN_TEMPLATE,
+                format!("unknown template: {t}"),
+            ),
             RegistryRpcError::DuplicateGroupName(n) => (
                 NET_REGISTRY_ERR_DUPLICATE_GROUP_NAME,
                 format!("duplicate group name: {n}"),
@@ -835,10 +836,7 @@ mod tests {
             fold_kind: 0x42,
             source_subnet: crate::adapter::net::subnet::SubnetId::GLOBAL,
             generation: 7,
-            buckets: vec![
-                ("alpha".into(), 1),
-                ("beta".into(), 2),
-            ],
+            buckets: vec![("alpha".into(), 1), ("beta".into(), 2)],
         };
         let json = summary_to_json(&s);
         assert!(json.contains("\"fold_kind\":66"));
@@ -859,13 +857,15 @@ mod tests {
             target: 0,
             reason: String::new(),
         });
-        assert_eq!(classify_fold_query(&transport).0, NET_REGISTRY_ERR_TRANSPORT);
+        assert_eq!(
+            classify_fold_query(&transport).0,
+            NET_REGISTRY_ERR_TRANSPORT
+        );
 
         let codec = FoldQueryClientError::Codec("bad".into());
         assert_eq!(classify_fold_query(&codec).0, NET_REGISTRY_ERR_CODEC);
 
-        let unknown_kind =
-            FoldQueryClientError::Server(FoldQueryError::UnknownKind { kind: 0x42 });
+        let unknown_kind = FoldQueryClientError::Server(FoldQueryError::UnknownKind { kind: 0x42 });
         let (kind_code, detail) = classify_fold_query(&unknown_kind);
         assert_eq!(kind_code, NET_REGISTRY_ERR_UNKNOWN_KIND);
         assert!(detail.contains("0x0042"));

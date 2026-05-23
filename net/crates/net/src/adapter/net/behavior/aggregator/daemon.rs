@@ -1136,7 +1136,10 @@ mod tests {
             "expected unhealthy after 3 × interval, got {h:?}"
         );
         assert!(
-            h.diagnostic.as_deref().unwrap_or("").contains("ticks behind"),
+            h.diagnostic
+                .as_deref()
+                .unwrap_or("")
+                .contains("ticks behind"),
             "diagnostic should mention the missed ticks: {h:?}"
         );
     }
