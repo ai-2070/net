@@ -86,7 +86,6 @@ use super::meshos::{
     MeshOsSnapshotReader, NodeId,
 };
 use crate::adapter::net::behavior::aggregator::{AggregatorDaemon, SummaryAnnouncement};
-use crate::adapter::net::behavior::lifecycle::LifecycleDaemon;
 use crate::adapter::net::identity::EntityKeypair;
 use crate::adapter::net::subnet::SubnetId;
 use crate::adapter::net::MeshNode;
@@ -910,10 +909,25 @@ impl DeckClient {
         let entries = registry.entries();
         let mut groups = Vec::with_capacity(entries.len());
         for entry in entries {
-            let mut rows = Vec::with_capacity(entry.replicas.len());
-            for (idx, replica) in entry.replicas.iter().enumerate() {
-                let health = replica.health().await;
-                let placement_node_id = entry.placements.get(idx).map(|p| p.node_id);
+            // Async accessors on the entry — one lock per call,
+            // released between calls. The snapshot is taken
+            // best-effort: a concurrent unregister between calls
+            // would yield mismatched-length Vecs. Operators see
+            // the empty-group case naturally (replicas Vec is
+            // empty).
+            let replicas = entry.replicas().await;
+            let placements = entry.placements().await;
+            let healths = entry.health().await;
+            let mut rows = Vec::with_capacity(replicas.len());
+            for (idx, replica) in replicas.iter().enumerate() {
+                let health = healths
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| crate::adapter::net::behavior::lifecycle::ReplicaHealth {
+                        healthy: true,
+                        diagnostic: None,
+                    });
+                let placement_node_id = placements.get(idx).map(|p| p.node_id);
                 rows.push(AggregatorReplicaRow {
                     generation: replica.generation(),
                     healthy: health.healthy,

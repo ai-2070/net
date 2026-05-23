@@ -78,6 +78,50 @@ pub struct HealthMonitor<L: LifecycleDaemon> {
     _marker: std::marker::PhantomData<L>,
 }
 
+/// Internal: the monitor accepts either a plain
+/// `Arc<AsyncMutex<LifecycleGroup<L>>>` (callers that own the
+/// group exclusively) or an Option-wrapped variant (registry
+/// path where unregister `take`s the group out). The variants
+/// share the `run_poll_pass` body.
+enum MonitorGroupRef<L: LifecycleDaemon> {
+    Plain(Arc<AsyncMutex<LifecycleGroup<L>>>),
+    Optional(Arc<AsyncMutex<Option<LifecycleGroup<L>>>>),
+}
+
+/// One health-poll + respawn pass against a live group.
+/// Returns true when at least one replacement was attempted
+/// (currently used only for tracing — the return is consumed
+/// to silence an unused warning).
+async fn run_poll_pass<L, F>(
+    group: &mut LifecycleGroup<L>,
+    factory: &mut F,
+    stats: &Arc<HealthMonitorStats>,
+) -> bool
+where
+    L: LifecycleDaemon,
+    F: FnMut(u8) -> Arc<L> + Send + 'static,
+{
+    let snapshot = group.health().await;
+    let mut any_work = false;
+    for (idx, h) in snapshot.iter().enumerate() {
+        if h.healthy {
+            continue;
+        }
+        let new_daemon = factory(u8::try_from(idx).unwrap_or(u8::MAX));
+        stats.replacements_initiated.fetch_add(1, Ordering::AcqRel);
+        any_work = true;
+        if let Err(e) = group.replace(idx, new_daemon).await {
+            stats.replacements_failed.fetch_add(1, Ordering::AcqRel);
+            tracing::warn!(
+                error = %e,
+                replica_index = idx,
+                "HealthMonitor: replace failed; continuing"
+            );
+        }
+    }
+    any_work
+}
+
 impl<L: LifecycleDaemon> HealthMonitor<L> {
     /// Spawn a background task that polls `group.health()` every
     /// `interval` and calls `group.replace(index, factory(index))`
@@ -86,13 +130,64 @@ impl<L: LifecycleDaemon> HealthMonitor<L> {
     /// an identical replacement (same config + deterministic
     /// identity via `LifecycleGroup::replica_keypair`).
     ///
-    /// The monitor task holds the `tokio::sync::Mutex` across
-    /// each `replace` call — concurrent `group.lock().await`
-    /// from other callers will serialize, but those calls are
-    /// typically short (metadata reads).
+    /// Convenience wrapper around [`Self::spawn_with_option`]
+    /// for callers that don't need the `take`-on-unregister
+    /// pattern (e.g. tests that own their group directly).
     pub fn spawn<F>(
         group: Arc<AsyncMutex<LifecycleGroup<L>>>,
         factory: F,
+        interval: Duration,
+    ) -> Self
+    where
+        F: FnMut(u8) -> Arc<L> + Send + 'static,
+    {
+        // Wrap the non-option group in an Option-wrapped mutex
+        // by transferring the LifecycleGroup. We can't move out
+        // of the existing Arc<AsyncMutex<LifecycleGroup>>, so
+        // the easiest path is: produce a separate
+        // Arc<AsyncMutex<Option<...>>> that the monitor sees,
+        // and arrange for the original arc to share the same
+        // underlying group via a relay future. The simpler
+        // alternative: just spawn directly against an
+        // owned-by-the-monitor mutex by cloning at the API
+        // boundary. Tests that hold the original `group`
+        // continue to work because they also `lock().await`
+        // against the same `Arc<AsyncMutex<LifecycleGroup>>`.
+        //
+        // Concretely: spawn returns a monitor whose internal
+        // task uses the **same** mutex. We can't change the
+        // inner type without taking ownership of the group.
+        // So `spawn` keeps its original behavior — operates
+        // directly against `Arc<AsyncMutex<LifecycleGroup<L>>>`.
+        Self::spawn_inner_loop(MonitorGroupRef::Plain(group), factory, interval)
+    }
+
+    /// Spawn a monitor against an `Option`-wrapped group. When
+    /// the option is `None` (e.g. after a registry
+    /// `unregister` consumed the group), the monitor's poll
+    /// pass becomes a no-op — the loop continues ticking but
+    /// performs no health checks or replacements until the
+    /// option is repopulated (which the current registry
+    /// doesn't do) or `stop()` is called.
+    ///
+    /// This is the variant `AggregatorRegistry::register_with_monitor`
+    /// uses so unregister can take the group out without
+    /// disturbing the monitor's existence; the monitor's
+    /// `stop()` is awaited as part of unregister.
+    pub fn spawn_with_option<F>(
+        group: Arc<AsyncMutex<Option<LifecycleGroup<L>>>>,
+        factory: F,
+        interval: Duration,
+    ) -> Self
+    where
+        F: FnMut(u8) -> Arc<L> + Send + 'static,
+    {
+        Self::spawn_inner_loop(MonitorGroupRef::Optional(group), factory, interval)
+    }
+
+    fn spawn_inner_loop<F>(
+        group_ref: MonitorGroupRef<L>,
+        mut factory: F,
         interval: Duration,
     ) -> Self
     where
@@ -102,7 +197,6 @@ impl<L: LifecycleDaemon> HealthMonitor<L> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let stats_for_task = stats.clone();
         let shutdown_for_task = shutdown.clone();
-        let mut factory = factory;
 
         let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
@@ -121,29 +215,25 @@ impl<L: LifecycleDaemon> HealthMonitor<L> {
 
                 // Hold the lock for the entire health-poll +
                 // respawn pass. Snapshot health first, then
-                // replace any unhealthy slots.
-                let mut g = group.lock().await;
-                let snapshot = g.health().await;
-                for (idx, h) in snapshot.iter().enumerate() {
-                    if h.healthy {
-                        continue;
+                // replace any unhealthy slots. The `Option`
+                // variant short-circuits if the group's been
+                // taken (registry unregister path).
+                let did_work = match &group_ref {
+                    MonitorGroupRef::Plain(g) => {
+                        let mut guard = g.lock().await;
+                        run_poll_pass(&mut *guard, &mut factory, &stats_for_task).await
                     }
-                    let new_daemon = factory(u8::try_from(idx).unwrap_or(u8::MAX));
-                    stats_for_task
-                        .replacements_initiated
-                        .fetch_add(1, Ordering::AcqRel);
-                    if let Err(e) = g.replace(idx, new_daemon).await {
-                        stats_for_task
-                            .replacements_failed
-                            .fetch_add(1, Ordering::AcqRel);
-                        tracing::warn!(
-                            error = %e,
-                            replica_index = idx,
-                            "HealthMonitor: replace failed; continuing"
-                        );
+                    MonitorGroupRef::Optional(g) => {
+                        let mut guard = g.lock().await;
+                        match guard.as_mut() {
+                            Some(lg) => {
+                                run_poll_pass(lg, &mut factory, &stats_for_task).await
+                            }
+                            None => false,
+                        }
                     }
-                }
-                drop(g);
+                };
+                let _ = did_work;
                 stats_for_task.ticks.fetch_add(1, Ordering::AcqRel);
                 *stats_for_task.last_tick_at.lock() = Some(std::time::Instant::now());
             }

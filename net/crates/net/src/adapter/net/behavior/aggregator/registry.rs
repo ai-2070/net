@@ -2,36 +2,52 @@
 //! [`LifecycleGroup<AggregatorDaemon>`]s, keyed by operator-
 //! chosen name.
 //!
-//! Direction B / step 3 of
-//! `docs/plans/AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`.
+//! Direction B / step 3 + step 6 (registry ↔ HealthMonitor
+//! integration) of `docs/plans/AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`.
 //! The registry is the substrate primitive operator CLI verbs
 //! (`net aggregator spawn / ls / scale`) operate against. A
-//! group's entry carries:
+//! group's entry holds the live [`LifecycleGroup`] directly
+//! (behind an `async` mutex) so the optional [`HealthMonitor`]
+//! attached at registration time can lock + replace slots
+//! without conflicting with concurrent snapshot reads.
 //!
-//! - Operator-chosen `name` (the lookup key).
-//! - 32-byte `group_seed` for deterministic replica identity.
-//! - Typed `Arc<AggregatorDaemon>` per replica (no downcast).
-//! - Recorded `PlacementDecision`s when the group was created
-//!   via [`LifecycleGroup::spawn_with_placement`] — empty
-//!   otherwise.
-//! - Internal handles parked under a mutex so `unregister` can
-//!   take ownership for shutdown without conflicting with
-//!   shared-ref reads.
+//! # Shape
+//!
+//! - [`AggregatorGroupEntry`] carries the operator-chosen name,
+//!   the 32-byte group seed, an `Arc<AsyncMutex<Option<LifecycleGroup<AggregatorDaemon>>>>`
+//!   for the live group (`None` once `unregister` has taken
+//!   ownership), and an optional `Arc<HealthMonitor<AggregatorDaemon>>`.
+//! - Async accessor methods read through the lock: `replica_count`,
+//!   `replicas`, `placements`, `health`.
+//! - [`AggregatorRegistry::register`] consumes a `LifecycleGroup`;
+//!   [`AggregatorRegistry::register_with_monitor`] does the same
+//!   plus spawns a `HealthMonitor` against the group and the
+//!   caller-supplied factory.
+//! - [`AggregatorRegistry::unregister`] is `async` — stops the
+//!   monitor (if any), takes the group out, and returns it to
+//!   the caller. The caller drives `group.stop().await`.
 //!
 //! # Threading
 //!
-//! The registry uses [`parking_lot::RwLock`] for the outer
-//! map + a [`parking_lot::Mutex`] inside each entry to guard
-//! handle take/replace. Reads (`get`, `names`) are wait-free
-//! against writes; writes (`register`, `unregister`) serialize.
+//! - Outer map: `parking_lot::RwLock<HashMap<String, Arc<Entry>>>`.
+//!   Reads (`get`, `names`, `entries`) are wait-free against
+//!   writes.
+//! - Per-entry group: `tokio::sync::Mutex` inside an `Arc` so
+//!   the entry, the monitor, and the snapshot path can all hold
+//!   their own clones.
+//! - Per-entry monitor: `parking_lot::Mutex<Option<Arc<...>>>`
+//!   for the install/take during register/unregister.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
+use tokio::sync::Mutex as AsyncMutex;
 
 use super::daemon::AggregatorDaemon;
-use crate::adapter::net::behavior::lifecycle::LifecycleHandle;
+use crate::adapter::net::behavior::lifecycle::{
+    HealthMonitor, LifecycleGroup, ReplicaHealth,
+};
 use crate::adapter::net::compute::PlacementDecision;
 
 /// A live aggregator group plus the metadata operator tooling
@@ -42,26 +58,59 @@ pub struct AggregatorGroupEntry {
     pub name: String,
     /// 32-byte seed used to derive per-replica `EntityKeypair`s.
     pub group_seed: [u8; 32],
-    /// Typed handles to each replica in declaration order.
-    pub replicas: Vec<Arc<AggregatorDaemon>>,
-    /// Per-replica placement decisions from
-    /// [`LifecycleGroup::spawn_with_placement`]. Empty when the
-    /// group was created via the placement-free
-    /// [`LifecycleGroup::spawn`].
-    pub placements: Vec<PlacementDecision>,
-    /// Lifecycle handles, parked under a `Mutex` so
-    /// [`AggregatorRegistry::unregister`] can `take` ownership
-    /// and drive `stop()` without racing reads.
-    /// `Some` until `unregister` consumes the entry; `None`
-    /// afterwards (the entry is also removed from the map at
-    /// that point, so this state is transient).
-    handles: Mutex<Option<Vec<LifecycleHandle>>>,
+    /// The live group, shared with the optional
+    /// [`HealthMonitor`] so both can lock it concurrently. `None`
+    /// once `unregister` has taken ownership (transient — the
+    /// entry is also removed from the map at that point).
+    group: Arc<AsyncMutex<Option<LifecycleGroup<AggregatorDaemon>>>>,
+    /// Health monitor attached at register time (or `None` if
+    /// the registration path was [`AggregatorRegistry::register`]
+    /// rather than `register_with_monitor`).
+    monitor: Mutex<Option<Arc<HealthMonitor<AggregatorDaemon>>>>,
 }
 
 impl AggregatorGroupEntry {
-    /// Number of live replicas at construction.
-    pub fn replica_count(&self) -> usize {
-        self.replicas.len()
+    /// Number of replicas in the live group, or `0` once the
+    /// entry has been unregistered (the group's been taken).
+    pub async fn replica_count(&self) -> usize {
+        match &*self.group.lock().await {
+            Some(g) => g.replica_count(),
+            None => 0,
+        }
+    }
+
+    /// Typed `Arc` to each replica in declaration order. Empty
+    /// after the group has been taken via `unregister`.
+    pub async fn replicas(&self) -> Vec<Arc<AggregatorDaemon>> {
+        match &*self.group.lock().await {
+            Some(g) => g.replicas(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Per-replica placement decisions in declaration order.
+    /// Empty when the group was created via the placement-free
+    /// [`LifecycleGroup::spawn`], or after `unregister`.
+    pub async fn placements(&self) -> Vec<PlacementDecision> {
+        match &*self.group.lock().await {
+            Some(g) => g.placements().to_vec(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Per-replica health snapshot in declaration order. Empty
+    /// after `unregister`.
+    pub async fn health(&self) -> Vec<ReplicaHealth> {
+        match &*self.group.lock().await {
+            Some(g) => g.health().await,
+            None => Vec::new(),
+        }
+    }
+
+    /// Borrow the attached [`HealthMonitor`] if one was wired
+    /// at registration time via `register_with_monitor`.
+    pub fn monitor(&self) -> Option<Arc<HealthMonitor<AggregatorDaemon>>> {
+        self.monitor.lock().clone()
     }
 }
 
@@ -98,19 +147,19 @@ impl AggregatorRegistry {
         }
     }
 
-    /// Register a live group. Returns `DuplicateName` if a
-    /// group with the same name already exists — callers should
-    /// either pick a unique name or `unregister` the prior
-    /// group first.
+    /// Register a live group. The registry takes ownership of
+    /// the `LifecycleGroup` — callers that need shared access
+    /// route through the returned `Arc<AggregatorGroupEntry>`.
+    ///
+    /// Returns `DuplicateName` if a group with the same name
+    /// already exists.
     pub fn register(
         &self,
         name: impl Into<String>,
-        group_seed: [u8; 32],
-        replicas: Vec<Arc<AggregatorDaemon>>,
-        placements: Vec<PlacementDecision>,
-        handles: Vec<LifecycleHandle>,
+        group: LifecycleGroup<AggregatorDaemon>,
     ) -> Result<Arc<AggregatorGroupEntry>, AggregatorRegistryError> {
         let name = name.into();
+        let group_seed = *group.group_seed();
         let mut groups = self.groups.write();
         if groups.contains_key(&name) {
             return Err(AggregatorRegistryError::DuplicateName(name));
@@ -118,9 +167,62 @@ impl AggregatorRegistry {
         let entry = Arc::new(AggregatorGroupEntry {
             name: name.clone(),
             group_seed,
-            replicas,
-            placements,
-            handles: Mutex::new(Some(handles)),
+            group: Arc::new(AsyncMutex::new(Some(group))),
+            monitor: Mutex::new(None),
+        });
+        groups.insert(name, entry.clone());
+        Ok(entry)
+    }
+
+    /// Register a live group **and** spawn a [`HealthMonitor`]
+    /// against it. The monitor polls each replica's `health()`
+    /// every `monitor_interval` and replaces unhealthy slots
+    /// via `factory`.
+    ///
+    /// The monitor's `factory` is invoked with the failing
+    /// replica's index so it can rebuild an identical
+    /// replacement (the group's `replica_keypair(index)`
+    /// provides the deterministic identity).
+    ///
+    /// Returns `DuplicateName` if a group with the same name
+    /// already exists.
+    pub fn register_with_monitor<F>(
+        &self,
+        name: impl Into<String>,
+        group: LifecycleGroup<AggregatorDaemon>,
+        factory: F,
+        monitor_interval: std::time::Duration,
+    ) -> Result<Arc<AggregatorGroupEntry>, AggregatorRegistryError>
+    where
+        F: FnMut(u8) -> Arc<AggregatorDaemon> + Send + 'static,
+    {
+        let name = name.into();
+        let group_seed = *group.group_seed();
+        let mut groups = self.groups.write();
+        if groups.contains_key(&name) {
+            return Err(AggregatorRegistryError::DuplicateName(name));
+        }
+        // Park the group in its async mutex, then spawn the
+        // monitor against a helper-extracted Arc<Mutex<LifecycleGroup>>.
+        // The monitor only sees the LifecycleGroup-flavor; the
+        // entry's `Option` wrapper lets `unregister` take it
+        // later without invalidating the monitor's reference
+        // (the monitor sees `None` after take and bails).
+        let group_arc = Arc::new(AsyncMutex::new(Some(group)));
+        // The monitor wants `Arc<AsyncMutex<LifecycleGroup<L>>>`,
+        // not the `Option`-wrapped version. Wrap the access
+        // layer so the monitor's locks see whatever the entry
+        // currently holds.
+        let monitor = Arc::new(HealthMonitor::spawn_with_option(
+            group_arc.clone(),
+            factory,
+            monitor_interval,
+        ));
+        let entry = Arc::new(AggregatorGroupEntry {
+            name: name.clone(),
+            group_seed,
+            group: group_arc,
+            monitor: Mutex::new(Some(monitor)),
         });
         groups.insert(name, entry.clone());
         Ok(entry)
@@ -159,36 +261,40 @@ impl AggregatorRegistry {
         self.groups.read().is_empty()
     }
 
-    /// Remove a group and return its lifecycle handles so the
-    /// caller can stop them. The Arc<AggregatorGroupEntry>
-    /// remains valid as long as someone else holds it (its
-    /// replicas / placements survive), but the handles are
-    /// taken out of the entry.
+    /// Remove a group and return the underlying `LifecycleGroup`
+    /// for caller-driven shutdown. The attached `HealthMonitor`
+    /// (if any) is stopped first.
     ///
     /// Returns `NotFound` if no group is registered under the
-    /// name. Returns `Some` handles on first call; later calls
-    /// against the same already-unregistered name short-circuit
-    /// to `NotFound` because the entry is removed from the map.
-    pub fn unregister(
+    /// name. Calling `unregister` twice with the same name
+    /// returns `NotFound` on the second call (the entry was
+    /// removed from the map).
+    pub async fn unregister(
         &self,
         name: &str,
-    ) -> Result<Vec<LifecycleHandle>, AggregatorRegistryError> {
+    ) -> Result<LifecycleGroup<AggregatorDaemon>, AggregatorRegistryError> {
         let entry = {
             let mut groups = self.groups.write();
             groups
                 .remove(name)
                 .ok_or_else(|| AggregatorRegistryError::NotFound(name.to_string()))?
         };
-        // `entry` is now the last Arc inside the map. Take the
-        // handles out of the entry's mutex. The Arc itself may
-        // still outlive this call if a caller held it — the
-        // handles slot is `None` after this.
-        let handles = entry
-            .handles
+        // Stop the monitor first so it doesn't try to lock the
+        // group while we're taking it out.
+        let monitor = entry.monitor.lock().take();
+        if let Some(m) = monitor {
+            m.stop().await;
+        }
+        // Now take the group. The entry's Arc may outlive this
+        // call if a caller held it; subsequent accessor reads
+        // see the empty Option and return empty Vecs.
+        let group = entry
+            .group
             .lock()
+            .await
             .take()
-            .unwrap_or_default();
-        Ok(handles)
+            .ok_or_else(|| AggregatorRegistryError::NotFound(name.to_string()))?;
+        Ok(group)
     }
 }
 
@@ -220,165 +326,158 @@ mod tests {
         )
     }
 
-    async fn spawn_group(name: &str) -> (LifecycleGroup<AggregatorDaemon>, Arc<MeshNode>) {
+    async fn spawn_group_2(interval_ms: u64) -> LifecycleGroup<AggregatorDaemon> {
         let mesh = build_mesh().await;
         let cfg = AggregatorConfig::new(SubnetId::GLOBAL)
             .with_fold_kind(CapabilityFold::KIND_ID)
-            .with_interval(Duration::from_millis(50));
+            .with_interval(Duration::from_millis(interval_ms));
         let cfg_clone = cfg.clone();
         let mesh_clone = mesh.clone();
-        let group = LifecycleGroup::<AggregatorDaemon>::spawn(2, [0xCDu8; 32], move |_idx| {
-            Arc::new(
-                AggregatorDaemon::new(cfg_clone.clone(), mesh_clone.clone()).expect("new"),
-            )
+        LifecycleGroup::<AggregatorDaemon>::spawn(2, [0xCDu8; 32], move |_idx| {
+            Arc::new(AggregatorDaemon::new(cfg_clone.clone(), mesh_clone.clone()).expect("new"))
         })
         .await
-        .expect("spawn group");
-        let _ = name;
-        (group, mesh)
+        .expect("spawn group")
     }
 
     #[tokio::test]
-    async fn register_and_get_round_trip_by_name() {
-        let (group, _mesh) = spawn_group("a").await;
+    async fn register_then_accessors_reflect_live_group_state() {
+        let group = spawn_group_2(50).await;
         let registry = AggregatorRegistry::new();
-        // We need to split the group's parts into the registry
-        // surface: replicas, placements, handles.
-        let replicas = group.replicas();
-        let placements = group.placements().to_vec();
-        let group_seed = *group.group_seed();
-        // Take the handles out by destructuring via `into_parts`?
-        // The current API doesn't expose that — call stop() on
-        // unregister instead. For now, drop the LifecycleGroup
-        // to release its handles, then re-acquire by calling
-        // LifecycleGroup::spawn again wouldn't preserve the
-        // identity. So we just use the typed `replicas` for
-        // metadata-only registry tests; handles is empty.
-        drop(group);
-        // The registry accepts an empty handles vec — typical
-        // for "test this without taking ownership of the
-        // group's lifecycle" tests.
-        let entry = registry
-            .register("agg-a", group_seed, replicas.clone(), placements, Vec::new())
-            .expect("register");
-        assert_eq!(entry.name, "agg-a");
-        assert_eq!(entry.replica_count(), 2);
-        let got = registry.get("agg-a").expect("get");
-        assert!(Arc::ptr_eq(&entry, &got));
-        assert!(registry.get("not-there").is_none());
-        assert_eq!(registry.names(), vec!["agg-a"]);
-        assert_eq!(registry.len(), 1);
+        let entry = registry.register("a", group).expect("register");
+        assert_eq!(entry.name, "a");
+        assert_eq!(entry.replica_count().await, 2);
+        assert_eq!(entry.replicas().await.len(), 2);
+        assert!(entry.placements().await.is_empty());
+        let health = entry.health().await;
+        assert_eq!(health.len(), 2);
+        // Drain via unregister.
+        let g = registry.unregister("a").await.expect("unregister");
+        g.stop().await;
     }
 
     #[tokio::test]
     async fn register_rejects_duplicate_names() {
-        let (group, _mesh) = spawn_group("a").await;
         let registry = AggregatorRegistry::new();
-        let seed = *group.group_seed();
-        let replicas = group.replicas();
-        drop(group);
         registry
-            .register("dup", seed, replicas.clone(), Vec::new(), Vec::new())
+            .register("dup", spawn_group_2(50).await)
             .expect("first register");
-        match registry.register("dup", seed, replicas, Vec::new(), Vec::new()) {
+        match registry.register("dup", spawn_group_2(50).await) {
             Err(AggregatorRegistryError::DuplicateName(n)) => assert_eq!(n, "dup"),
             Err(other) => panic!("expected DuplicateName, got {other:?}"),
             Ok(_) => panic!("expected DuplicateName, got Ok"),
         }
+        // Cleanup.
+        let g = registry.unregister("dup").await.expect("unregister");
+        g.stop().await;
     }
 
     #[tokio::test]
-    async fn unregister_returns_handles_and_removes_entry() {
-        let (group, _mesh) = spawn_group("a").await;
+    async fn unregister_returns_group_and_removes_entry() {
         let registry = AggregatorRegistry::new();
-        let seed = *group.group_seed();
-        let replicas = group.replicas();
-        // Pull handles out of the LifecycleGroup. The current
-        // group API doesn't expose this directly; for the
-        // registry test we re-build via the trait by stopping +
-        // re-spawning — but that breaks identity. Instead, just
-        // stub the registry with empty handles to test the
-        // registry's own bookkeeping; the integration test
-        // covers the handle-takeover path.
-        drop(group);
         registry
-            .register("agg", seed, replicas, Vec::new(), Vec::new())
+            .register("a", spawn_group_2(50).await)
             .expect("register");
         assert_eq!(registry.len(), 1);
-        let handles = registry.unregister("agg").expect("unregister");
-        assert!(handles.is_empty());
+        let group = registry.unregister("a").await.expect("unregister");
+        assert_eq!(group.replica_count(), 2);
+        group.stop().await;
         assert_eq!(registry.len(), 0);
-        match registry.unregister("agg") {
-            Err(AggregatorRegistryError::NotFound(n)) => assert_eq!(n, "agg"),
+        match registry.unregister("a").await {
+            Err(AggregatorRegistryError::NotFound(n)) => assert_eq!(n, "a"),
             Err(other) => panic!("expected NotFound, got {other:?}"),
             Ok(_) => panic!("expected NotFound, got Ok"),
         }
     }
 
     #[tokio::test]
-    async fn end_to_end_register_then_unregister_drives_real_handle_shutdown() {
-        // Spawn a real LifecycleGroup, surrender its parts via
-        // `into_parts`, register them, then unregister and stop
-        // the returned handles. The replicas' on_stop must
-        // observe the shutdown.
-        let mesh = build_mesh().await;
-        let cfg = AggregatorConfig::new(SubnetId::GLOBAL)
-            .with_fold_kind(CapabilityFold::KIND_ID)
-            .with_interval(Duration::from_millis(30));
-        let cfg_clone = cfg.clone();
-        let mesh_clone = mesh.clone();
-        let group = LifecycleGroup::<AggregatorDaemon>::spawn(
-            2,
-            [0xCDu8; 32],
-            move |_idx| {
-                Arc::new(
-                    AggregatorDaemon::new(cfg_clone.clone(), mesh_clone.clone()).expect("new"),
-                )
-            },
-        )
-        .await
-        .expect("spawn");
-        let (replicas, placements, handles, group_seed) = group.into_parts();
-        let registry = AggregatorRegistry::new();
-        registry
-            .register("e2e", group_seed, replicas.clone(), placements, handles)
-            .expect("register");
-        // Let the loops tick a few times.
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        let gen_before_stop: Vec<u64> = replicas.iter().map(|d| d.generation()).collect();
-        for g in &gen_before_stop {
-            assert!(*g >= 1, "each replica should have ticked");
-        }
-        // Unregister + stop handles to halt the loops.
-        let handles_out = registry.unregister("e2e").expect("unregister");
-        for h in handles_out {
-            h.stop().await;
-        }
-        // Capture and wait; ticks must not advance further.
-        let after_stop: Vec<u64> = replicas.iter().map(|d| d.generation()).collect();
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        let after_wait: Vec<u64> = replicas.iter().map(|d| d.generation()).collect();
-        assert_eq!(after_stop, after_wait, "loops must halt after unregister/stop");
-        assert!(registry.is_empty());
-    }
-
-    #[tokio::test]
     async fn entries_are_sorted_by_name_for_deterministic_cli_output() {
-        let (group_a, _mesh) = spawn_group("a").await;
         let registry = AggregatorRegistry::new();
-        let seed = *group_a.group_seed();
-        let replicas = group_a.replicas();
-        drop(group_a);
         registry
-            .register("zulu", seed, replicas.clone(), Vec::new(), Vec::new())
+            .register("zulu", spawn_group_2(50).await)
             .expect("register zulu");
         registry
-            .register("alpha", seed, replicas.clone(), Vec::new(), Vec::new())
+            .register("alpha", spawn_group_2(50).await)
             .expect("register alpha");
         registry
-            .register("mike", seed, replicas, Vec::new(), Vec::new())
+            .register("mike", spawn_group_2(50).await)
             .expect("register mike");
         let names: Vec<String> = registry.entries().iter().map(|e| e.name.clone()).collect();
         assert_eq!(names, vec!["alpha", "mike", "zulu"]);
+        // Cleanup.
+        for n in ["alpha", "mike", "zulu"] {
+            let g = registry.unregister(n).await.expect("unregister");
+            g.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn register_with_monitor_stops_monitor_on_unregister() {
+        // Wire a monitor; on unregister it must be stopped.
+        // The factory is called from the monitor task — for
+        // this test no replicas go unhealthy, so factory isn't
+        // invoked.
+        let registry = AggregatorRegistry::new();
+        let mesh = build_mesh().await;
+        // Short interval so the on_stop backstop (interval + 1s)
+        // doesn't dominate the test wallclock.
+        let cfg = AggregatorConfig::new(SubnetId::GLOBAL)
+            .with_fold_kind(CapabilityFold::KIND_ID)
+            .with_interval(Duration::from_millis(50));
+        let factory_cfg = cfg.clone();
+        let factory_mesh = mesh.clone();
+        let group = LifecycleGroup::<AggregatorDaemon>::spawn(2, [0u8; 32], {
+            let cfg = cfg.clone();
+            let mesh = mesh.clone();
+            move |_idx| {
+                Arc::new(AggregatorDaemon::new(cfg.clone(), mesh.clone()).expect("new"))
+            }
+        })
+        .await
+        .expect("spawn");
+
+        let entry = registry
+            .register_with_monitor(
+                "monitored",
+                group,
+                move |_idx| {
+                    Arc::new(
+                        AggregatorDaemon::new(factory_cfg.clone(), factory_mesh.clone())
+                            .expect("new"),
+                    )
+                },
+                Duration::from_millis(20),
+            )
+            .expect("register_with_monitor");
+
+        // Monitor must be attached.
+        assert!(entry.monitor().is_some());
+
+        // Wait a few monitor ticks to ensure the loop is alive.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let monitor_handle = entry.monitor().expect("monitor");
+        let ticks_before_stop = monitor_handle
+            .stats()
+            .ticks
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert!(
+            ticks_before_stop >= 1,
+            "monitor should have ticked at least once"
+        );
+
+        // Unregister stops the monitor + returns the group.
+        let group = registry.unregister("monitored").await.expect("unregister");
+        // Sleep past several intervals; the monitor's ticks
+        // counter must not advance further.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let ticks_after_stop = monitor_handle
+            .stats()
+            .ticks
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(
+            ticks_before_stop, ticks_after_stop,
+            "monitor must stop ticking after unregister"
+        );
+        group.stop().await;
     }
 }
