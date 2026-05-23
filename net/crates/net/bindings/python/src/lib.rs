@@ -4,6 +4,7 @@
 
 #[cfg(feature = "dataforts")]
 mod blob;
+mod capability_aggregation;
 #[cfg(feature = "cortex")]
 mod cortex;
 // Identity / capabilities / subnets ride the `net` feature as a
@@ -1830,6 +1831,58 @@ mod mesh_bindings {
             Ok(super::capabilities::with_scope_filter(&owned, |sf| {
                 node.find_nodes_by_filter_scoped(&core, sf)
             }))
+        }
+
+        /// Bucketed aggregation over the local capability fold —
+        /// `Fold::aggregate(matcher, group_by, agg)`. Arguments are
+        /// JSON-encoded tagged unions; the sdk-py wrappers ship
+        /// dataclasses that emit the right shape. Returns
+        /// `list[dict]` sorted lex by bucket key. Phase 6c-A of
+        /// `MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`.
+        ///
+        /// `matcher_json = None` walks every entry.
+        #[pyo3(signature = (matcher_json, group_by_json, aggregation_json))]
+        fn capability_aggregate(
+            &self,
+            py: Python<'_>,
+            matcher_json: Option<&str>,
+            group_by_json: &str,
+            aggregation_json: &str,
+        ) -> PyResult<Py<PyAny>> {
+            let node = self.get_node()?;
+            super::capability_aggregation::aggregate(
+                py,
+                node.capability_fold(),
+                matcher_json,
+                group_by_json,
+                aggregation_json,
+            )
+        }
+
+        /// Capacity-ranked materialized view over the local
+        /// capability fold — `Fold::capacity_ranking(query,
+        /// rtt_lookup)`. `query_json` is a JSON-encoded
+        /// `CapacityQuery`; `rtt_map` is a Python `dict[int, int]`
+        /// mapping `node_id -> rtt_ms` (`None` / empty disables the
+        /// RTT filter regardless of `query.max_rtt_ms`).
+        ///
+        /// Faulty entries are always excluded; rows return sorted by
+        /// `available` desc, ties broken on bucket asc, truncated to
+        /// `query.limit`. Phase 6c-B.
+        #[pyo3(signature = (query_json, rtt_map = None))]
+        fn capability_capacity_ranking(
+            &self,
+            py: Python<'_>,
+            query_json: &str,
+            rtt_map: Option<&Bound<'_, PyDict>>,
+        ) -> PyResult<Py<PyAny>> {
+            let node = self.get_node()?;
+            super::capability_aggregation::capacity_ranking(
+                py,
+                node.capability_fold(),
+                query_json,
+                rtt_map,
+            )
         }
 
         // ── SDK Phase 7 slice 3 — custom PlacementFilter callbacks ──

@@ -85,6 +85,18 @@ from net_sdk.capability_schema import (
     WarningUnknownKey,
     validate_capabilities,
 )
+from net_sdk.capability_aggregation import (
+    Aggregation,
+    AggregationCls,
+    AggregateRow,
+    CapacityQuery,
+    CapacityRow,
+    GroupBy,
+    GroupByCls,
+    TagMatcher,
+    TagMatcherCls,
+    TaxonomyAxis,
+)
 from net_sdk.channel import TypedChannel
 from net_sdk.mesh import (
     BackpressureError,
@@ -108,6 +120,16 @@ __all__ = [
     "Reliability",
     "BackpressureError",
     "NotConnectedError",
+    # Capability-aggregation surface (Phase 6c).
+    "Aggregation",
+    "AggregationCls",
+    "AggregateRow",
+    "CapacityQuery",
+    "CapacityRow",
+    "GroupBy",
+    "GroupByCls",
+    "TagMatcher",
+    "TagMatcherCls",
     # Capability-System Enhancements.
     "TaxonomyAxis",
     "TAXONOMY_AXES",
