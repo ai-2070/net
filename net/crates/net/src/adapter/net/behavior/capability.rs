@@ -634,7 +634,7 @@ pub const TAG_SCOPE_GLOBAL: &str = "scope:global";
 /// Resolved scope of a capability announcement, derived from the
 /// reserved `scope:*` tags inside the announcer's [`CapabilitySet`].
 /// Pure derivation — never stored, recomputed on each query via
-/// [`scope_from_tags`].
+/// `behavior::fold::capability_bridge::scope_from_membership_tags`.
 ///
 /// Precedence: `SubnetLocal` > tenants/regions > `Global`. A node
 /// that tags itself with both `scope:subnet-local` and
@@ -667,60 +667,6 @@ pub(crate) enum CapabilityScope {
         /// Region names declared via `scope:region:*` tags.
         regions: Vec<String>,
     },
-}
-
-/// Resolve a `CapabilitySet::tags` set into the announcer's
-/// effective [`CapabilityScope`]. Empty tenant / region values
-/// (`scope:tenant:` with no id) are silently dropped — defensive,
-/// since reading them as the empty string would let a peer match
-/// any tenant query that also had an empty id.
-///
-/// Phase A.5.N.2: signature now takes `&HashSet<Tag>`. Inspects
-/// `Tag::Reserved` variants where prefix is `scope:`. The body
-/// of those reserved tags is the post-`scope:` substring, e.g.
-/// `tenant:foo` / `region:eu-west` / `subnet-local`.
-///
-/// Kept (with `#[allow(dead_code)]`) for downstream consumers
-/// (capability_bridge, FFI surface) — the legacy
-/// `CapabilityIndex::find_nodes_scoped` callers were removed in
-/// Phase 3B of the multifold migration.
-#[allow(dead_code)]
-pub(crate) fn scope_from_tags(tags: &HashSet<Tag>) -> CapabilityScope {
-    let mut tenants = Vec::new();
-    let mut regions = Vec::new();
-    let mut subnet_local = false;
-
-    for tag in tags {
-        let Tag::Reserved { prefix, body } = tag else {
-            continue;
-        };
-        if prefix.as_str() != "scope:" {
-            continue;
-        }
-        if body == "subnet-local" {
-            subnet_local = true;
-        } else if let Some(id) = body.strip_prefix("tenant:") {
-            if !id.is_empty() {
-                tenants.push(id.to_string());
-            }
-        } else if let Some(name) = body.strip_prefix("region:") {
-            if !name.is_empty() {
-                regions.push(name.to_string());
-            }
-        }
-        // `scope:global` is the default; presence is a no-op.
-    }
-
-    if subnet_local {
-        CapabilityScope::SubnetLocal
-    } else {
-        match (tenants.is_empty(), regions.is_empty()) {
-            (true, true) => CapabilityScope::Global,
-            (false, true) => CapabilityScope::Tenants(tenants),
-            (true, false) => CapabilityScope::Regions(regions),
-            (false, false) => CapabilityScope::TenantsAndRegions { tenants, regions },
-        }
-    }
 }
 
 /// Parse `subnet:<hex32>` and `group:<hex64>` tags out of an
@@ -3305,83 +3251,11 @@ mod tests {
         );
     }
     // ========================================================================
-    // Scope helpers (`scope_from_tags` + `matches_scope`)
+    // Scope helpers (`matches_scope`) — scope tag resolution itself
+    // is tested in `behavior::fold::capability_bridge::tests` under
+    // `scope_from_membership_tags`.
     // ========================================================================
 
-    /// Phase A.5.N.2: scope tests now exercise `&HashSet<Tag>`.
-    /// Helper parses each input string through the permissive
-    /// `Tag::parse` so reserved-prefix tags (`scope:tenant:foo`)
-    /// land as `Tag::Reserved`, mirroring real wire-form decoding.
-    fn tags_from(strs: &[&str]) -> HashSet<Tag> {
-        strs.iter().filter_map(|s| Tag::parse(s).ok()).collect()
-    }
-    #[test]
-    fn scope_from_tags_no_scope_tag_is_global() {
-        assert!(matches!(
-            scope_from_tags(&tags_from(&[])),
-            CapabilityScope::Global
-        ));
-        assert!(matches!(
-            scope_from_tags(&tags_from(&["gpu", "model:llama3"])),
-            CapabilityScope::Global
-        ));
-        // Explicit `scope:global` resolves the same as no tag.
-        assert!(matches!(
-            scope_from_tags(&tags_from(&[TAG_SCOPE_GLOBAL])),
-            CapabilityScope::Global
-        ));
-    }
-    #[test]
-    fn scope_from_tags_subnet_local_wins() {
-        // Even with tenants and regions present, `subnet-local` is
-        // the strictest form and dominates.
-        let tags = tags_from(&[
-            TAG_SCOPE_SUBNET_LOCAL,
-            &format!("{TAG_SCOPE_TENANT_PREFIX}foo"),
-            &format!("{TAG_SCOPE_REGION_PREFIX}eu-west"),
-        ]);
-        assert_eq!(scope_from_tags(&tags), CapabilityScope::SubnetLocal);
-    }
-    #[test]
-    fn scope_from_tags_multiple_tenants() {
-        let tags = tags_from(&[
-            &format!("{TAG_SCOPE_TENANT_PREFIX}a"),
-            &format!("{TAG_SCOPE_TENANT_PREFIX}b"),
-            "gpu",
-        ]);
-        match scope_from_tags(&tags) {
-            CapabilityScope::Tenants(mut ts) => {
-                // HashSet iteration is unordered; sort for stable comparison.
-                ts.sort();
-                assert_eq!(ts, vec!["a".to_string(), "b".to_string()]);
-            }
-            other => panic!("expected Tenants, got {other:?}"),
-        }
-
-        // Empty tenant id is silently dropped.
-        let tags = tags_from(&[
-            TAG_SCOPE_TENANT_PREFIX,
-            &format!("{TAG_SCOPE_TENANT_PREFIX}real"),
-        ]);
-        match scope_from_tags(&tags) {
-            CapabilityScope::Tenants(ts) => assert_eq!(ts, vec!["real".to_string()]),
-            other => panic!("expected Tenants, got {other:?}"),
-        }
-    }
-    #[test]
-    fn scope_from_tags_tenants_and_regions() {
-        let tags = tags_from(&[
-            &format!("{TAG_SCOPE_TENANT_PREFIX}oem-123"),
-            &format!("{TAG_SCOPE_REGION_PREFIX}eu-west"),
-        ]);
-        match scope_from_tags(&tags) {
-            CapabilityScope::TenantsAndRegions { tenants, regions } => {
-                assert_eq!(tenants, vec!["oem-123".to_string()]);
-                assert_eq!(regions, vec!["eu-west".to_string()]);
-            }
-            other => panic!("expected TenantsAndRegions, got {other:?}"),
-        }
-    }
     #[test]
     fn matches_scope_global_visible_to_tenant_filter() {
         // A peer that doesn't tag itself stays discoverable under
@@ -3453,11 +3327,13 @@ mod tests {
         assert!(caps.has_tag("gpu"));
         assert!(caps.has_tag("scope:tenant:oem-123"));
 
-        // The tag list resolves through `scope_from_tags` to the
-        // expected variant — proves the builder writes the form
-        // the resolver matches on.
+        // The builder writes the wire string the bridge's
+        // `scope_from_membership_tags` matches on.
+        let wire_tags: Vec<String> = caps.tags.iter().map(|t| t.to_string()).collect();
+        let resolved =
+            super::super::fold::capability_bridge::scope_from_membership_tags(&wire_tags);
         assert_eq!(
-            scope_from_tags(&caps.tags),
+            resolved,
             CapabilityScope::Tenants(vec!["oem-123".to_string()]),
         );
     }
@@ -3485,11 +3361,16 @@ mod tests {
     }
     #[test]
     fn with_region_and_subnet_local_scope_compose_with_resolver() {
+        use super::super::fold::capability_bridge::scope_from_membership_tags;
+        let to_wire = |caps: &CapabilitySet| -> Vec<String> {
+            caps.tags.iter().map(|t| t.to_string()).collect()
+        };
+
         // Region builder produces a Regions scope.
         let caps_region = CapabilitySet::new().with_region_scope("eu-west");
         assert!(caps_region.has_tag("scope:region:eu-west"));
         assert_eq!(
-            scope_from_tags(&caps_region.tags),
+            scope_from_membership_tags(&to_wire(&caps_region)),
             CapabilityScope::Regions(vec!["eu-west".to_string()]),
         );
 
@@ -3514,7 +3395,7 @@ mod tests {
             .collect();
         assert_eq!(local_tags.len(), 1);
         assert_eq!(
-            scope_from_tags(&caps_local.tags),
+            scope_from_membership_tags(&to_wire(&caps_local)),
             CapabilityScope::SubnetLocal
         );
     }

@@ -411,9 +411,8 @@ pub fn find_nodes_matching(fold: &Fold<CapabilityFold>, legacy: &LegacyFilter) -
 }
 
 /// Derive a [`CapabilityScope`] from a [`CapabilityMembership`]'s
-/// string-tag set. Mirrors the legacy `scope_from_tags` but
-/// reads the canonical string form the fold's payload carries —
-/// `"scope:global"`, `"scope:subnet-local"`,
+/// string-tag set. Reads the canonical string form the fold's
+/// payload carries — `"scope:global"`, `"scope:subnet-local"`,
 /// `"scope:tenant:<id>"`, `"scope:region:<name>"`.
 ///
 /// `pub(crate)` because [`CapabilityScope`] is itself
