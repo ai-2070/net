@@ -1,7 +1,7 @@
-# Widen `PacketHeader::origin_hash` to u64
+# Widen `NetHeader::origin_hash` to u64
 
 Follow-up to the Multifold Phase 3B cutover. The cutover preserved the
-legacy wire shape — `protocol::PacketHeader::origin_hash` is `u32`, a
+legacy wire shape — `protocol::NetHeader::origin_hash` is `u32`, a
 truncation of the publisher's full `EntityId::origin_hash() -> u64`. The
 publisher path stamps `kp.origin_hash() as u32`; the receiver side
 zero-extends back via `parsed.header.origin_hash.into()`; the reverse
@@ -50,70 +50,121 @@ The accidental case is the birthday bound: ~65k distinct entities
 puts the expected collision probability into the percent range. Above
 ~250k entities accidental collisions become routine.
 
-## Why this is one wire-format break
+## The breakage matrix
 
-The full breakage matrix:
+Direct wire / lookup-key surface:
 
-- `protocol::PacketHeader::origin_hash: u32` → `u64`. Increases the
-  header size by 4 bytes per packet. Routing fast-path reads the
-  field once per packet to dispatch into the channel handler.
-- `protocol::PacketHeader::with_origin(...)` — no signature change,
-  drop the `as u32` cast.
+- `protocol::NetHeader::origin_hash: u32` → `u64`
+  (`protocol.rs:180`). Wire encode at `protocol.rs:378`
+  (`put_u32_le` → `put_u64_le`); decode at `protocol.rs:419`.
+- `protocol::NetHeader::with_origin(...)` — no signature change,
+  drop the `as u32` cast (`protocol.rs:305`).
+- Publisher build sites: `pool.rs:172` (`PacketBuilder::build_user`)
+  and `pool.rs:261` (`PacketBuilderLarge::build_user`) already pass
+  u64 through; no change once `with_origin` stops truncating.
 - Receiver-side `parsed.header.origin_hash.into()` becomes a no-op
-  (already u64); the call sites compile unchanged.
+  (already u64); the call sites at `mesh.rs:4519` compile unchanged.
 - `mesh.rs::origin_hash_to_node` key — drop the `as u32 as u64`
-  truncation in the populator + failure-detector eviction. Stored
-  values become the full u64 directly.
+  truncation in the populator (`mesh.rs:5837`) and failure-detector
+  eviction (`mesh.rs:1953`). Stored values become the full u64
+  directly.
+- `cortex::rpc::RpcInboundEvent::origin_hash: u32`
+  (`cortex/rpc.rs:950`) mirrors the wire field — widen in lockstep
+  or truncation re-enters one layer up.
 - `EntityId::origin_hash()` — already returns `u64`; no change.
-- `EventMeta::origin_hash`, `CausalLink::origin_hash`,
-  `MigrationRegistry::origin_hash` — all u64 already (app-layer side
-  per the existing `EntityId::origin_hash` doc-comment); no change.
+- `EventMeta::origin_hash` (`cortex/meta.rs:47`),
+  `CausalLink::origin_hash` (`state/causal.rs:47`) — already u64;
+  no change. (The previous draft also listed
+  `MigrationRegistry::origin_hash`; no such field exists in the
+  current tree.)
 
-The wire-format incompatibility is unilateral and per-packet: a
-mixed deployment cannot interoperate at the packet layer. Coordination
-with operators is mandatory.
+Header-layout consequences:
 
-## Migration shape
+- `protocol::HEADER_SIZE = 64` (`protocol.rs:15`) is cache-line
+  aligned, with a compile-time assertion `size_of::<NetHeader>() ==
+  64` at `protocol.rs:194`. Growing `origin_hash` by 4 bytes either:
+  - bumps `HEADER_SIZE` to 68 (alignment lost; `MAX_PAYLOAD_SIZE =
+    MAX_PACKET_SIZE - HEADER_SIZE - TAG_SIZE` at `protocol.rs:27`
+    shrinks by 4 bytes per packet), or
+  - reclaims 4 bytes elsewhere in the header.
 
-**Step 1 — version-gated header.** Add a `header_version` byte to
-`PacketHeader` (likely already present per the v0.4 wire format).
-Bump the version. Receivers reading v(N) parse u32; receivers reading
-v(N+1) parse u64. Senders emit the version they're configured for.
+  The reclamation path preserves alignment and MTU math but costs
+  an audit of the rest of the header layout. Decide before
+  implementing — this is the gating call.
 
-**Step 2 — bilateral upgrade.** Operators flip nodes to emit v(N+1)
-once every node in their mesh accepts both. A flag day per cluster.
+Reverse-index simplification (folds in with the wire change, no
+deprecation gate):
 
-**Step 3 — drop v(N) parser.** After a deprecation window (~one
-release cycle), receivers stop accepting v(N) packets. Senders emit
-v(N+1) unconditionally. The `as u32 as u64` truncation in
-`origin_hash_to_node` population is removed.
+- `OriginHashSlot` (`mesh.rs:112`) collapses to `Option<NodeId>`.
+  With u64 keys, accidental collisions are 2⁻³² — effectively
+  impossible. The `Multiple` variant and its `unique()` /
+  `is_origin_hash_ambiguous` (`mesh.rs:8936`) plumbing get
+  deleted; greedy/gravity/blob admission paths that branch on the
+  ambiguous-slot case (`mesh.rs:4540`) collapse to the direct
+  lookup. There is no separate `origin_hash_collisions` counter —
+  the `Multiple` variant *was* the tracking mechanism, and it goes
+  away with the variant.
 
-**Step 4 — drop the OriginHashSlot::Multiple variant.** With u64
-keys, accidental collisions are 2⁻³² — effectively impossible. The
-slot's collision-tracking machinery (`origin_hash_collisions`
-counter, multi-claimant Vec) can be deleted; lookups become
-`Option<NodeId>` directly. The fail-closed semantics on `Multiple`
-are no longer needed because no honest cluster will see one.
+  Adversarial 2³² collisions remain theoretically possible but
+  require ~hours of dedicated compute per target, and the only
+  effect is the same suppression DoS — auth is still unaffected.
+  Deployments that consider 2³² inadequate can move to BLAKE2s-128
+  truncation as a follow-on.
 
-Adversarial 2³² collisions remain theoretically possible but
-require ~hours of dedicated compute per target, and the only effect
-is the same suppression DoS — auth is still unaffected. Most
-deployments will consider 2³² adequate; deployments that don't can
-go to BLAKE2s-128 truncation as a v(N+2) follow-on.
+Cross-language sanity check:
+
+- The Go FFI bindings (`bindings/go/net/{memories,meshos,netdb,
+  tasks}.go`) already declare `origin_hash` as `uint64_t`. Either
+  there is an undocumented adapter zero-extending on ingress, or
+  the Go path has been quietly seeing truncated values. Verify
+  end-to-end before merge — the wire fix may transparently fix Go,
+  or may expose a missing layer.
+- No TS/Py SDK mirrors the packet-header layout (only app-layer
+  types, all already u64).
+
+Persistence:
+
+- RedEX append-only logs persist `EventMeta` / `CausalLink`, not
+  `NetHeader`. Both already use `put_u64_le` for `origin_hash`. No
+  on-disk migration needed.
+
+## Cutover
+
+Single PR, no version gate, no mixed-deployment support. Old nodes
+and new nodes cannot interoperate at the packet layer; this is a
+hard break. Operators upgrade their whole mesh in one step.
+
+The change set:
+
+1. Decide the header-layout question above (grow to 68 vs. reclaim
+   4 bytes). Update `HEADER_SIZE` and the `size_of` assertion
+   accordingly.
+2. Widen `NetHeader::origin_hash` to `u64`; flip `put_u32_le` /
+   `get_u32_le` to the u64 variants.
+3. Drop `as u32` in `NetHeader::with_origin`.
+4. Drop `as u32 as u64` at both `origin_hash_to_node` population
+   sites.
+5. Widen `RpcInboundEvent::origin_hash` to `u64`.
+6. Replace `OriginHashSlot` with `Option<NodeId>`; delete
+   `unique()`, `is_origin_hash_ambiguous`, and the `Multiple`-arm
+   branches in greedy/gravity/blob admission.
+7. Verify Go FFI round-trips a high-bits-set `origin_hash`.
 
 ## Tests
 
 - A pin in `tests/wire_origin_hash_64bit.rs` constructing a
-  `PacketHeader` with `origin_hash = u32::MAX as u64 + 1` and
+  `NetHeader` with `origin_hash = u32::MAX as u64 + 1` and
   asserting the high bits survive the wire round-trip.
 - A regression test for `origin_hash_to_node`: install entries for
   two `EntityId`s whose low 32 bits collide but whose full u64
   values differ; assert `get_node_by_origin_hash` returns each
-  publisher's `node_id` distinctly (no `Multiple` slot).
+  publisher's `node_id` distinctly.
 - A dataforts integration test that runs the greedy admission
   scope-filter pin against a configured-collision pair (or a
   synthetic one in test mode) and asserts both publishers' events
   cache independently.
+- A Go-FFI round-trip test asserting a `uint64_t origin_hash` with
+  bits set above 2³² survives publish → receive.
 
 ## Not in scope
 
@@ -127,8 +178,9 @@ go to BLAKE2s-128 truncation as a v(N+2) follow-on.
 
 ## Effort
 
-Implementation: small (one wire-format struct change, one cast
-cleanup in two files, one deprecation window). Operator coordination
-+ deprecation: medium. Tests: small (3–4 pins).
+Implementation: small once the header-layout decision is made — one
+wire-format struct change, two cast cleanups, one `RpcInboundEvent`
+widen, `OriginHashSlot` collapse. Tests: small (4 pins). Go FFI
+verification: small.
 
-Total: 1–2 sessions of focused work + the deprecation window.
+Total: 2–3 sessions of focused work.
