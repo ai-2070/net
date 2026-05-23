@@ -207,34 +207,72 @@ impl AggregatorDaemon {
     /// once per `summary_interval`); production code spawns and
     /// lets the loop drive it.
     ///
-    /// Bumps `generation`, runs each configured summarizer,
-    /// appends to the latest-summaries buffer. Does NOT publish
-    /// summaries onto the wire — use
-    /// [`Self::tick_and_publish`] for that.
+    /// Bumps `generation`, runs each configured summarizer, then
+    /// appends novel summaries to the latest-summaries buffer.
+    /// Summaries whose `(source_subnet, buckets)` match the most
+    /// recent entry for the same fold-kind are dropped — see
+    /// [`Self::tick_and_publish`] for the rationale. Does NOT
+    /// publish onto the wire.
     pub fn tick_once(&self) {
         let batch = self.produce_summaries();
-        self.append_to_latest(batch);
+        let novel = self.filter_novel(batch);
+        self.append_to_latest(novel);
     }
 
-    /// `tick_once` + publish each emitted summary to its
+    /// `tick_once` + publish each novel summary to its
     /// per-fold-kind summary channel via
     /// [`MeshNode::publish`](crate::adapter::net::MeshNode::publish).
     /// Used by the background loop; tests can call it explicitly.
     ///
+    /// A summary is "novel" when its `(source_subnet, buckets)`
+    /// differs from the most recent entry already in the
+    /// latest-summaries buffer for the same `fold_kind`. Folds
+    /// that change rarely (capability, reservation) otherwise
+    /// republish byte-identical summaries every tick.
+    ///
     /// Returns the number of summaries successfully published.
     /// Publish-failure short-circuits — the first failed publish
-    /// aborts the batch; remaining summaries land in the latest
-    /// buffer regardless, so the daemon's local view stays
-    /// consistent.
+    /// aborts the batch; preceding summaries still land in the
+    /// latest buffer so the daemon's local view stays consistent.
     pub async fn tick_and_publish(&self) -> Result<usize, AggregatorPublishError> {
         let batch = self.produce_summaries();
+        let novel = self.filter_novel(batch);
         let mut published = 0;
-        for summary in &batch {
-            self.publish_summary(summary).await?;
+        let mut kept: Vec<SummaryAnnouncement> = Vec::with_capacity(novel.len());
+        for summary in novel {
+            self.publish_summary(&summary).await?;
             published += 1;
+            kept.push(summary);
         }
-        self.append_to_latest(batch);
+        self.append_to_latest(kept);
         Ok(published)
+    }
+
+    /// Drop summaries whose `(source_subnet, buckets)` matches
+    /// the most recent prior entry in the latest buffer for the
+    /// same fold-kind. Generation is intentionally not part of
+    /// the equality — generation always advances tick-to-tick.
+    fn filter_novel(&self, batch: Vec<SummaryAnnouncement>) -> Vec<SummaryAnnouncement> {
+        if batch.is_empty() {
+            return batch;
+        }
+        let latest = self.latest.read();
+        batch
+            .into_iter()
+            .filter(|summary| {
+                let prev = latest
+                    .iter()
+                    .rev()
+                    .find(|s| s.fold_kind == summary.fold_kind);
+                match prev {
+                    None => true,
+                    Some(prev) => {
+                        prev.source_subnet != summary.source_subnet
+                            || prev.buckets != summary.buckets
+                    }
+                }
+            })
+            .collect()
     }
 
     /// Compute one tick's worth of summaries. Pure side-effect-
@@ -540,11 +578,71 @@ mod tests {
         assert_eq!(idle, 2);
         assert_eq!(busy, 1);
 
-        // Second tick bumps generation again, retains the prior
-        // summary in the latest-window.
+        // Second tick with mutated fold state produces a novel
+        // summary; generation advances and the new summary lands
+        // alongside the first.
+        agg.mesh
+            .capability_fold()
+            .apply(sign_cap(&kp, 0xD, 4, NodeState::Idle))
+            .unwrap();
         agg.tick_once();
         assert_eq!(agg.generation(), 2);
         assert_eq!(agg.latest_summaries().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tick_skips_summary_when_buckets_are_unchanged() {
+        // Pin the change-detection guard: a no-op tick (fold
+        // state unchanged) advances `generation` but does NOT
+        // append a duplicate summary to the latest buffer.
+        let mesh = build_mesh().await;
+        let kp = EntityKeypair::generate();
+        let fold = mesh.capability_fold();
+        fold.apply(sign_cap(&kp, 0xA, 1, NodeState::Idle)).unwrap();
+
+        let cfg = AggregatorConfig::new(SubnetId::new(&[3]))
+            .with_fold_kind(CapabilityFold::KIND_ID)
+            .with_interval(Duration::from_secs(60));
+        let agg = AggregatorDaemon::new(cfg, mesh.clone()).expect("new");
+
+        agg.tick_once();
+        assert_eq!(agg.latest_summaries().len(), 1);
+        let first_gen = agg.generation();
+        agg.tick_once();
+        assert!(agg.generation() > first_gen, "generation must advance");
+        assert_eq!(
+            agg.latest_summaries().len(),
+            1,
+            "unchanged fold state must not append a duplicate summary"
+        );
+
+        // Once fold state changes, the next tick lands a novel
+        // summary.
+        fold.apply(sign_cap(&kp, 0xB, 2, NodeState::Busy)).unwrap();
+        agg.tick_once();
+        assert_eq!(agg.latest_summaries().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tick_and_publish_skips_publish_when_buckets_are_unchanged() {
+        // Companion to `tick_skips_summary_when_buckets_are_unchanged`
+        // — the wire-publish path also short-circuits unchanged
+        // summaries, returning a published count of zero.
+        let mesh = build_mesh().await;
+        let kp = EntityKeypair::generate();
+        let fold = mesh.capability_fold();
+        fold.apply(sign_cap(&kp, 0xA, 1, NodeState::Idle)).unwrap();
+
+        let cfg = AggregatorConfig::new(SubnetId::new(&[3]))
+            .with_fold_kind(CapabilityFold::KIND_ID)
+            .with_interval(Duration::from_secs(60));
+        let agg = AggregatorDaemon::new(cfg, mesh).expect("new");
+
+        let first = agg.tick_and_publish().await.expect("first");
+        assert_eq!(first, 1, "first tick publishes");
+        let second = agg.tick_and_publish().await.expect("second");
+        assert_eq!(second, 0, "unchanged buckets skip publish");
+        assert_eq!(agg.latest_summaries().len(), 1);
     }
 
     #[tokio::test]
@@ -581,11 +679,26 @@ mod tests {
     #[tokio::test]
     async fn latest_summaries_capped_at_buffer_size() {
         let mesh = build_mesh().await;
+        let kp = EntityKeypair::generate();
         let cfg = AggregatorConfig::new(SubnetId::GLOBAL)
             .with_fold_kind(CapabilityFold::KIND_ID)
             .with_interval(Duration::from_millis(10));
-        let agg = AggregatorDaemon::new(cfg, mesh).expect("new");
-        for _ in 0..(LATEST_SUMMARIES_CAP + 5) {
+        let agg = AggregatorDaemon::new(cfg, mesh.clone()).expect("new");
+        // Mutate fold state between ticks so each summary is
+        // novel (change-detection would otherwise drop dupes).
+        for i in 0..(LATEST_SUMMARIES_CAP as u64 + 5) {
+            mesh.capability_fold()
+                .apply(sign_cap(
+                    &kp,
+                    0xA00 + i,
+                    i + 1,
+                    if i % 2 == 0 {
+                        NodeState::Idle
+                    } else {
+                        NodeState::Busy
+                    },
+                ))
+                .unwrap();
             agg.tick_once();
         }
         assert_eq!(agg.latest_summaries().len(), LATEST_SUMMARIES_CAP);
