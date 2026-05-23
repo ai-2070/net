@@ -148,7 +148,12 @@ pub fn membership_passes_post_filter(
 fn gpu_vendor_matches(canonical: &str, want: GpuVendor) -> bool {
     matches!(
         (canonical, want),
-        ("nvidia", GpuVendor::Nvidia) | ("amd", GpuVendor::Amd) | ("intel", GpuVendor::Intel)
+        ("nvidia", GpuVendor::Nvidia)
+            | ("amd", GpuVendor::Amd)
+            | ("intel", GpuVendor::Intel)
+            | ("apple", GpuVendor::Apple)
+            | ("qualcomm", GpuVendor::Qualcomm)
+            | ("unknown", GpuVendor::Unknown)
     )
 }
 
@@ -157,7 +162,9 @@ fn gpu_vendor_canonical(vendor: GpuVendor) -> &'static str {
         GpuVendor::Nvidia => "nvidia",
         GpuVendor::Amd => "amd",
         GpuVendor::Intel => "intel",
-        _ => "other",
+        GpuVendor::Apple => "apple",
+        GpuVendor::Qualcomm => "qualcomm",
+        GpuVendor::Unknown => "unknown",
     }
 }
 
