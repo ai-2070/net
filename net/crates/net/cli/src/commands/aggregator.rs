@@ -22,13 +22,13 @@
 //! Phase C of `SCALING_SUBNET_SPEC.md`.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::context::{resolve_profile, CliContext};
 use crate::error::{generic, invalid_args, CliError};
+use crate::parsers::{parse_u16_flexible, parse_u64_flexible};
 use crate::prelude::{emit_value, OutputFormat};
 
 #[derive(Subcommand, Debug)]
@@ -125,8 +125,10 @@ async fn run_query(
 ) -> Result<(), CliError> {
     // Validate inputs up-front so the operator sees concrete
     // parse errors rather than a generic "not supported."
-    let _target = parse_u64(&args.target, "target")?;
-    let _kind = parse_u16(&args.kind, "kind")?;
+    let _target = parse_u64_flexible(&args.target)
+        .map_err(|e| invalid_args(format!("target `{}`: {e}", args.target)))?;
+    let _kind = parse_u16_flexible(&args.kind)
+        .map_err(|e| invalid_args(format!("kind `{}`: {e}", args.kind)))?;
     // The query path needs a `MeshNode` wired into the
     // DeckClient (so the substrate can route the RPC). The
     // CliContext's deck doesn't carry one today — same gap
@@ -140,30 +142,6 @@ async fn run_query(
          doesn't construct one in-process yet; when the in-process MeshNode \
          bootstrap lands (or remote-attach), this command flips to live.",
     ))
-}
-
-/// Parse a `u64` from a CLI string that accepts either decimal
-/// or `0x` / `0X`-prefixed hex.
-fn parse_u64(raw: &str, field: &str) -> Result<u64, CliError> {
-    let s = raw.trim();
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        return u64::from_str_radix(hex, 16)
-            .map_err(|e| invalid_args(format!("{field} hex `{raw}` not a u64: {e}")));
-    }
-    s.parse::<u64>()
-        .map_err(|e| invalid_args(format!("{field} decimal `{raw}` not a u64: {e}")))
-}
-
-/// Parse a `u16` from a CLI string that accepts either decimal
-/// or `0x` / `0X`-prefixed hex.
-fn parse_u16(raw: &str, field: &str) -> Result<u16, CliError> {
-    let s = raw.trim();
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        return u16::from_str_radix(hex, 16)
-            .map_err(|e| invalid_args(format!("{field} hex `{raw}` not a u16: {e}")));
-    }
-    s.parse::<u16>()
-        .map_err(|e| invalid_args(format!("{field} decimal `{raw}` not a u16: {e}")))
 }
 
 #[derive(Serialize)]
@@ -220,30 +198,3 @@ impl From<net_sdk::deck::SummaryAnnouncement> for SummaryRow {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_u64_accepts_decimal_and_hex() {
-        assert_eq!(parse_u64("0", "x").unwrap(), 0);
-        assert_eq!(parse_u64("42", "x").unwrap(), 42);
-        assert_eq!(parse_u64("0xDEAD", "x").unwrap(), 0xDEAD);
-        assert_eq!(parse_u64("0XBEEF", "x").unwrap(), 0xBEEF);
-        assert_eq!(
-            parse_u64("0xCAFEBABE_DEADBEEF".replace('_', "").as_str(), "x").unwrap(),
-            0xCAFE_BABE_DEAD_BEEF
-        );
-        assert!(parse_u64("not-a-number", "x").is_err());
-        assert!(parse_u64("0xZZ", "x").is_err());
-    }
-
-    #[test]
-    fn parse_u16_accepts_decimal_and_hex_and_rejects_overflow() {
-        assert_eq!(parse_u16("0", "x").unwrap(), 0);
-        assert_eq!(parse_u16("42", "x").unwrap(), 42);
-        assert_eq!(parse_u16("0x0001", "x").unwrap(), 1);
-        assert!(parse_u16("65536", "x").is_err()); // overflow u16
-        assert!(parse_u16("0x1FFFF", "x").is_err()); // hex overflow u16
-    }
-}

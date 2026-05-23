@@ -20,6 +20,18 @@ pub(crate) fn parse_u64_flexible(s: &str) -> Result<u64, String> {
     }
 }
 
+/// `u16` variant of [`parse_u64_flexible`]. Used for fold-kind
+/// ids and wire-hash literals on subcommand args.
+pub(crate) fn parse_u16_flexible(s: &str) -> Result<u16, String> {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u16::from_str_radix(rest, 16).map_err(|e| format!("invalid hex: {e}"))
+    } else {
+        s.parse::<u16>()
+            .map_err(|e| format!("invalid integer: {e}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,5 +57,21 @@ mod tests {
         assert!(parse_u64_flexible("").is_err());
         assert!(parse_u64_flexible("0xzz").is_err());
         assert!(parse_u64_flexible("abc").is_err());
+    }
+
+    #[test]
+    fn u16_decimal_and_hex_round_trip() {
+        assert_eq!(parse_u16_flexible("0").unwrap(), 0);
+        assert_eq!(parse_u16_flexible("42").unwrap(), 42);
+        assert_eq!(parse_u16_flexible("0x0001").unwrap(), 1);
+        assert_eq!(parse_u16_flexible("0XBEEF").unwrap(), 0xBEEF);
+    }
+
+    #[test]
+    fn u16_rejects_overflow_and_garbage() {
+        assert!(parse_u16_flexible("65536").is_err());
+        assert!(parse_u16_flexible("0x1FFFF").is_err());
+        assert!(parse_u16_flexible("").is_err());
+        assert!(parse_u16_flexible("not-a-number").is_err());
     }
 }
