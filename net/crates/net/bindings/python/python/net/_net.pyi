@@ -244,7 +244,7 @@ class Net:
 # CortEX adapter (requires the `cortex` feature at build time)
 # =========================================================================
 
-from typing import Any, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 class Redex:
     """Local RedEX manager. One handle per node; shared by all adapters.
@@ -1777,3 +1777,65 @@ class AdminVerifier:
 
 class RedisStreamDedup:
     """LRU-bounded dedup helper for Redis Streams consumers."""
+
+# ---- Aggregator-registry RPC clients (`aggregator.rs`) ----------------------
+
+class RegistryClientError(Exception):
+    """Aggregator registry RPC failure.
+
+    ``kind`` is one of ``"transport"`` | ``"codec"`` |
+    ``"unknown-template"`` | ``"duplicate-group-name"`` |
+    ``"spawn-rejected"`` | ``"spawn-not-supported"``.
+    ``server_detail`` carries the long-form text.
+    """
+    kind: str
+    server_detail: str | None
+
+class UnknownTemplate(RegistryClientError): ...
+class DuplicateGroupName(RegistryClientError): ...
+class SpawnRejected(RegistryClientError): ...
+class SpawnNotSupported(RegistryClientError): ...
+
+class FoldQueryClientError(Exception):
+    """Fold-query RPC failure.
+
+    ``kind`` is one of ``"transport"`` | ``"codec"`` |
+    ``"unknown-kind"``. ``server_detail`` carries the long-form
+    text.
+    """
+    kind: str
+    server_detail: str | None
+
+class UnknownFoldKind(FoldQueryClientError): ...
+
+class RegistryClient:
+    """Client for the ``aggregator.registry`` RPC service."""
+
+    def __init__(self, mesh: NetMesh) -> None: ...
+    def with_deadline(self, millis: int) -> RegistryClient: ...
+    def list(self, target_node_id: int) -> List[Dict[str, Any]]: ...
+    def spawn(
+        self,
+        target_node_id: int,
+        template_name: str,
+        group_name: str,
+        replica_count: int,
+    ) -> Dict[str, Any]: ...
+    def unregister(self, target_node_id: int, group_name: str) -> bool: ...
+    def __repr__(self) -> str: ...
+
+class FoldQueryClient:
+    """Client for the ``fold.query`` RPC service with a TTL cache."""
+
+    def __init__(self, mesh: NetMesh) -> None: ...
+    def with_ttl(self, millis: int) -> FoldQueryClient: ...
+    def with_deadline(self, millis: int) -> FoldQueryClient: ...
+    def query_latest(
+        self, target_node_id: int, kind: int
+    ) -> List[Dict[str, Any]]: ...
+    def query_summarize_now(
+        self, target_node_id: int, kind: int
+    ) -> List[Dict[str, Any]]: ...
+    def invalidate_cache(self) -> None: ...
+    def invalidate_target(self, target_node_id: int) -> None: ...
+    def __repr__(self) -> str: ...

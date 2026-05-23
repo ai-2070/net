@@ -567,4 +567,38 @@ else:
     )
 
 
+# Aggregator-registry RPC client surface (`SDK_AGGREGATOR_SUBNET_PLAN.md`
+# Stage 3). Present iff the native module was built with the
+# `aggregator` feature (default in the maturin-shipped wheel).
+try:
+    from ._net import (
+        DuplicateGroupName,
+        FoldQueryClient,
+        FoldQueryClientError,
+        RegistryClient,
+        RegistryClientError,
+        SpawnNotSupported,
+        SpawnRejected,
+        UnknownFoldKind,
+        UnknownTemplate,
+    )
+except ImportError:
+    # `aggregator` feature not compiled in; symbols stay undefined.
+    pass
+else:
+    __all__.extend(
+        [
+            "DuplicateGroupName",
+            "FoldQueryClient",
+            "FoldQueryClientError",
+            "RegistryClient",
+            "RegistryClientError",
+            "SpawnNotSupported",
+            "SpawnRejected",
+            "UnknownFoldKind",
+            "UnknownTemplate",
+        ]
+    )
+
+
 __version__ = "0.21.0"

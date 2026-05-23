@@ -235,7 +235,12 @@ fn runtime() -> &'static Arc<Runtime> {
 /// an embedding Rust runtime) hit the fast path; embedded-Rust
 /// callers who violate the contract get a clean abort with a
 /// diagnosable message instead of UB.
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
+/// Crate-internal: `tokio::Runtime::block_on` against the
+/// shared mesh-FFI runtime. Aborts on runtime-in-runtime so a
+/// stray sync-from-async call doesn't panic across the FFI
+/// boundary. Re-used by `ffi::aggregator` and any future FFI
+/// module that needs the same runtime semantics.
+pub(super) fn block_on<F: std::future::Future>(future: F) -> F::Output {
     if tokio::runtime::Handle::try_current().is_ok() {
         eprintln!(
             "FATAL: mesh FFI called from inside a tokio runtime context; \
@@ -617,6 +622,15 @@ pub unsafe extern "C" fn net_mesh_free(handle: *mut MeshNodeHandle) {
              leaking inner to avoid use-after-free"
         );
     }
+}
+
+/// Crate-internal accessor: return an `Arc<MeshNode>` clone
+/// from a borrowed handle without crossing the FFI boundary.
+/// Used by sibling FFI modules (`ffi::aggregator`) that need
+/// the inner Arc without round-tripping through the extern
+/// `net_mesh_arc_clone` + `net_mesh_arc_free` pair.
+pub(super) fn mesh_node_arc(h: &MeshNodeHandle) -> Arc<MeshNode> {
+    Arc::clone(&h.inner)
 }
 
 /// Clone the `Arc<MeshNode>` backing this handle and return a

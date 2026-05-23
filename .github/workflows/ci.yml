@@ -352,7 +352,7 @@ jobs:
       #     duplex typed SDK surface (5 tests). Gated on
       #     `feature = "net" + "cortex"`, both present here.
       - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed)
-        run: cargo test --features "net cortex testing compute nat-traversal port-mapping"
+        run: cargo test --features "net cortex testing compute nat-traversal port-mapping aggregator"
 
       # SDK doctests — `///` examples in `sdk/src/`. Same feature set
       # as the test run so doc examples gated on those features
@@ -412,7 +412,7 @@ jobs:
       # surface from source.
       - name: Build native module
         working-directory: net/crates/net/bindings/node
-        run: npx napi build --platform --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,test-helpers
+        run: npx napi build --platform --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,test-helpers
 
       # Compile the sibling .ts shims (meshdb.ts, mesh_rpc.ts, errors.ts)
       # into .js so `require('../meshdb')` in the test suite resolves.
@@ -479,7 +479,7 @@ jobs:
         working-directory: net/crates/net/bindings/node
         run: |
           npm i --ignore-scripts
-          npx napi build --platform --no-default-features --features redis,net,cortex,compute,groups,meshos,deck,meshdb,test-helpers
+          npx napi build --platform --no-default-features --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator,test-helpers
 
       - name: Install npm dependencies
         run: npm i
@@ -553,7 +553,7 @@ jobs:
       # test's MeshDB class coverage. Default `redis` is omitted
       # because the suite doesn't exercise the Redis adapter.
       - name: Build and install bindings
-        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck
+        run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator
 
       - name: Run tests
         run: pytest -v
@@ -757,13 +757,14 @@ jobs:
             # plus `test-helpers` so the test-only FFI symbols are
             # included in the lint set, plus `meshos,deck,meshdb` so
             # the MeshOS / Deck / MeshDB NAPI surfaces compile).
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,test-helpers
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,test-helpers
           - name: python
             path: net/crates/net/bindings/python
             # Mirrors the `python-tests` `maturin develop` invocation
             # (plus `meshos,deck` so the corresponding pyo3 surfaces
-            # are linted).
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck
+            # are linted, plus `aggregator` so the aggregator pyo3
+            # surface is linted in lockstep with the test job).
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator
           - name: go-compute-ffi
             path: net/crates/net/bindings/go/compute-ffi
             # Default features only — the cdylib production build
@@ -847,10 +848,10 @@ jobs:
         crate:
           - name: node
             path: net/crates/net/bindings/node
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,test-helpers
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,test-helpers
           - name: python
             path: net/crates/net/bindings/python
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator
           - name: go-compute-ffi
             path: net/crates/net/bindings/go/compute-ffi
             features: ""

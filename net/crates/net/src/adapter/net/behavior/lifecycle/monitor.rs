@@ -526,16 +526,12 @@ mod tests {
         // logarithmically with elapsed time — not linearly with
         // tick count. After enough consecutive failures the
         // monitor should be skipping most ticks.
-        let group = LifecycleGroup::<PerpetuallyUnhealthyDaemon>::spawn(
-            1,
-            [0u8; 32],
-            |_idx| {
-                Arc::new(PerpetuallyUnhealthyDaemon {
-                    starts: AtomicU64::new(0),
-                    stops: AtomicU64::new(0),
-                })
-            },
-        )
+        let group = LifecycleGroup::<PerpetuallyUnhealthyDaemon>::spawn(1, [0u8; 32], |_idx| {
+            Arc::new(PerpetuallyUnhealthyDaemon {
+                starts: AtomicU64::new(0),
+                stops: AtomicU64::new(0),
+            })
+        })
         .await
         .expect("spawn");
         let group = Arc::new(AsyncMutex::new(Some(group)));

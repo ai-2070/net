@@ -207,6 +207,14 @@ pub mod blob_stubs;
 #[allow(missing_docs)]
 pub mod mesh;
 
+/// C FFI for the `aggregator.registry` RPC client + channel
+/// visibility setter. Stage 5 of `SDK_AGGREGATOR_SUBNET_PLAN.md`.
+/// Rides the `net` feature alongside `ffi::mesh` because every
+/// op needs a `MeshNodeHandle`.
+#[cfg(feature = "net")]
+#[allow(missing_docs)]
+pub mod aggregator;
+
 /// C FFI for stateless predicate evaluation (Phase 9c of
 /// `CAPABILITY_SYSTEM_SDK_PLAN.md`). Pure helpers — no handles,
 /// no state. Mirrors the SDK-layer `evaluatePredicate` /

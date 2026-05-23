@@ -119,6 +119,22 @@ impl FoldQueryClient {
         self
     }
 
+    /// Override the cache TTL in place. Used by the FFI wrapper
+    /// so adjusting TTL doesn't drop the warmed cache (a fresh
+    /// `with_ttl(self)` would clone all `Arc`s except the cache
+    /// is held by `&mut self` — the in-place mutation preserves
+    /// the inner `Arc<RwLock<HashMap<...>>>`).
+    pub fn set_ttl_mut(&mut self, ttl: Duration) {
+        self.ttl = ttl;
+    }
+
+    /// Override the per-call deadline in place. Same rationale as
+    /// [`Self::set_ttl_mut`] — preserves the cache state across
+    /// FFI-side deadline adjustments.
+    pub fn set_deadline_mut(&mut self, deadline: Duration) {
+        self.deadline = deadline;
+    }
+
     /// Query the aggregator for its latest cached summaries.
     /// Cache hit → return immediately; miss → issue RPC, cache
     /// the result, return.

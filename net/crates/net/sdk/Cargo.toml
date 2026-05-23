@@ -67,6 +67,7 @@ default = [
     "meshos",
     "dataforts",
     "meshdb",
+    "aggregator",
 ]
 # External transports (opt-in, network I/O).
 redis = ["net/redis"]
@@ -140,6 +141,15 @@ dataforts = ["net/dataforts"]
 # own `meshdb` feature (Phase A of `MESHDB_PLAN.md`); this
 # flag composes against it.
 meshdb = ["net/meshdb"]
+# Aggregator-registry RPC clients (`RegistryClient`,
+# `FoldQueryClient`) + the daemon-author surface
+# (`AggregatorRegistry`, `LifecycleGroup`, `HealthMonitor`).
+# Riding `net` because every operation routes through
+# `Mesh::call` / `Mesh::serve_rpc`. Named explicitly so a
+# `--no-default-features` consumer can opt in by name — and so
+# the per-binding `aggregator` Cargo features have a 1:1 SDK
+# counterpart to forward (`net-sdk/aggregator`).
+aggregator = ["net"]
 # Testing — in-process multi-node `ClusterHarness` + bridge probes
 # (Mesh → MeshOsRuntime). Powers the deck demo and any integration
 # test that wants real UDP loopback + a real MeshOS snapshot fold
@@ -155,7 +165,7 @@ testing = ["meshos", "groups"]
 # Everything that runs locally (mesh + storage/state + security +
 # compute + groups, no external transports). The default shape for
 # a single-node or LAN-only deployment.
-local = ["net", "cortex", "compute", "groups"]
+local = ["net", "cortex", "compute", "groups", "aggregator"]
 # Named alias for the SDK's heavy default — useful when a consumer
 # has set `default-features = false` to pull a leaner build and
 # later wants to opt back into "the full distributed-agent stack
@@ -170,6 +180,7 @@ agent = [
     "meshos",
     "dataforts",
     "meshdb",
+    "aggregator",
 ]
 # Everything — local stack plus NAT traversal plus external
 # transports plus the operator-facing surfaces. `dataforts` and

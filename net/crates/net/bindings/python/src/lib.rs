@@ -2,6 +2,8 @@
 //!
 //! Provides high-performance event ingestion and consumption for Python.
 
+#[cfg(feature = "aggregator")]
+mod aggregator;
 #[cfg(feature = "dataforts")]
 mod blob;
 mod capability_aggregation;
@@ -2240,7 +2242,7 @@ mod mesh_bindings {
         /// by sibling-feature modules (`compute`, `mesh_rpc`) to
         /// share the live mesh node without opening a second
         /// socket.
-        #[cfg(any(feature = "compute", feature = "cortex"))]
+        #[cfg(any(feature = "compute", feature = "cortex", feature = "aggregator"))]
         pub(crate) fn node_arc_clone(&self) -> PyResult<Arc<MeshNode>> {
             self.node
                 .as_ref()
@@ -2262,7 +2264,7 @@ mod mesh_bindings {
         /// Shared tokio runtime. `DaemonRuntime` and `MeshRpc`
         /// both use this for async method bridging so we don't
         /// spin up a second runtime per mesh.
-        #[cfg(any(feature = "compute", feature = "cortex"))]
+        #[cfg(any(feature = "compute", feature = "cortex", feature = "aggregator"))]
         pub(crate) fn runtime_arc(&self) -> Arc<Runtime> {
             self.runtime.clone()
         }
@@ -2454,6 +2456,39 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add(
             "MeshOsSdkError",
             m.py().get_type::<meshos::MeshOsSdkError>(),
+        )?;
+    }
+    #[cfg(feature = "aggregator")]
+    {
+        m.add_class::<aggregator::PyRegistryClient>()?;
+        m.add_class::<aggregator::PyFoldQueryClient>()?;
+        m.add(
+            "RegistryClientError",
+            m.py().get_type::<aggregator::RegistryClientError>(),
+        )?;
+        m.add(
+            "UnknownTemplate",
+            m.py().get_type::<aggregator::UnknownTemplate>(),
+        )?;
+        m.add(
+            "DuplicateGroupName",
+            m.py().get_type::<aggregator::DuplicateGroupName>(),
+        )?;
+        m.add(
+            "SpawnRejected",
+            m.py().get_type::<aggregator::SpawnRejected>(),
+        )?;
+        m.add(
+            "SpawnNotSupported",
+            m.py().get_type::<aggregator::SpawnNotSupported>(),
+        )?;
+        m.add(
+            "FoldQueryClientError",
+            m.py().get_type::<aggregator::FoldQueryClientError>(),
+        )?;
+        m.add(
+            "UnknownFoldKind",
+            m.py().get_type::<aggregator::UnknownFoldKind>(),
         )?;
     }
     #[cfg(feature = "deck")]

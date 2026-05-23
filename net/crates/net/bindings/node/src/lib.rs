@@ -15,7 +15,8 @@ mod capability_aggregation;
     feature = "meshdb",
     feature = "cortex",
     feature = "compute",
-    feature = "groups"
+    feature = "groups",
+    feature = "aggregator",
 ))]
 mod common;
 #[cfg(feature = "compute")]
@@ -42,6 +43,8 @@ mod meshdb;
 mod meshos;
 // Deck SDK — operator-side bindings (Phase 5 slice 1). Builds on
 // `meshos` for the supervisor runtime accessors.
+#[cfg(feature = "aggregator")]
+mod aggregator;
 #[cfg(feature = "deck")]
 mod deck;
 #[cfg(feature = "net")]
@@ -1986,7 +1989,7 @@ mod mesh_bindings {
         /// so the previous "load_node + as_ref + expect" pattern
         /// could panic on a real shutdown race. Surface as a
         /// typed error instead.
-        #[cfg(any(feature = "compute", feature = "cortex"))]
+        #[cfg(any(feature = "compute", feature = "cortex", feature = "aggregator"))]
         pub(crate) fn node_arc_clone(&self) -> Result<Arc<MeshNode>> {
             let guard = self.node.load();
             match guard.as_ref() {

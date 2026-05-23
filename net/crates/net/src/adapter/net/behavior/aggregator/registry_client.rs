@@ -80,10 +80,20 @@ impl RegistryClient {
         }
     }
 
-    /// Override the per-call deadline.
+    /// Override the per-call deadline (consumes self — fluent
+    /// builder shape).
     pub fn with_deadline(mut self, deadline: Duration) -> Self {
         self.deadline = deadline;
         self
+    }
+
+    /// Override the per-call deadline in place. Used by the FFI
+    /// wrapper, which holds the client behind a `RwLock` so an
+    /// in-flight RPC reader and a `set_deadline` writer serialize
+    /// instead of fragmenting handles via clone. Keeps any
+    /// future state (e.g. dispatch token caches) intact.
+    pub fn set_deadline_mut(&mut self, deadline: Duration) {
+        self.deadline = deadline;
     }
 
     /// Enumerate every aggregator group registered on the target

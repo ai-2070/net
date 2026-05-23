@@ -40,6 +40,7 @@ default = [
     "dataforts",
     "meshdb",
     "redis",
+    "aggregator",
 ]
 # Pulls in `net-sdk` at its `redis` sub-feature for the
 # `RedisStreamDedup` consumer helper. The dedup helper is a thin
@@ -114,6 +115,11 @@ deck = ["meshos", "net-sdk/deck"]
 # `--features groups,test-helpers`; release / consumer builds stop
 # at `--features groups`.
 test-helpers = ["groups"]
+# Aggregator-registry RPC client surface (`SDK_AGGREGATOR_SUBNET_PLAN.md`
+# Stage 2). Builds on `net` + pulls in the SDK's `aggregator`
+# re-export module so the NAPI binding gets BoundRegistryClient
+# + install_aggregator_registry_service helpers for free.
+aggregator = ["net", "dep:net-sdk", "net-sdk/aggregator"]
 # MeshDB query layer — federated AST + planner + executor + result
 # cache. Standalone of `net`: the Node SDK's first MeshDB slice
 # ships a local executor over an in-memory ChainReader, so it

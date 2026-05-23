@@ -135,13 +135,9 @@ impl AggregatorGroupEntry {
         };
         // Lock is dropped here. Run per-replica health checks
         // concurrently, with no other guard held.
-        let healths = futures::future::join_all(
-            replicas
-                .iter()
-                .cloned()
-                .map(|r| async move { r.health().await }),
-        )
-        .await;
+        let healths =
+            futures::future::join_all(replicas.iter().map(|r| async move { r.health().await }))
+                .await;
         EntrySnapshot {
             replicas,
             placements,
