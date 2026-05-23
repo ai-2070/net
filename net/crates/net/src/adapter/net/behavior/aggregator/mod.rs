@@ -21,18 +21,18 @@ pub mod summarizer;
 
 pub use config::AggregatorConfig;
 pub use daemon::{AggregatorDaemon, AggregatorError, AggregatorPublishError};
-pub use registry::{AggregatorGroupEntry, AggregatorRegistry, AggregatorRegistryError};
-pub use registry_client::{RegistryClient, RegistryClientError, DEFAULT_REGISTRY_DEADLINE};
-pub use registry_service::{
-    snapshot_group, RegistryGroupSummary, RegistryHandler, RegistryReplicaSummary,
-    RegistryRequest, RegistryResponse, RegistryRpcError, SpawnFn, SpawnRequest, REGISTRY_SERVICE,
-};
 pub use query_client::{
     FoldQueryClient, FoldQueryClientError, DEFAULT_QUERY_CACHE_TTL, DEFAULT_QUERY_DEADLINE,
 };
 pub use query_service::{
     FoldQueryError, FoldQueryHandler, FoldQueryOp, FoldQueryRequest, FoldQueryResponse,
     FOLD_QUERY_SERVICE,
+};
+pub use registry::{AggregatorGroupEntry, AggregatorRegistry, AggregatorRegistryError};
+pub use registry_client::{RegistryClient, RegistryClientError, DEFAULT_REGISTRY_DEADLINE};
+pub use registry_service::{
+    snapshot_group, RegistryGroupSummary, RegistryHandler, RegistryReplicaSummary, RegistryRequest,
+    RegistryResponse, RegistryRpcError, SpawnFn, SpawnRequest, REGISTRY_SERVICE,
 };
 pub use summarizer::{
     CapabilityFoldSummarizer, ReservationFoldSummarizer, Summarizer, SummaryAnnouncement,

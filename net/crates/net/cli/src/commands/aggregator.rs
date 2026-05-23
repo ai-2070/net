@@ -368,11 +368,14 @@ impl From<&net_sdk::deck::AggregatorRegistryGroupSnapshot> for LsGroupRow {
         let healthy_count = replicas.iter().filter(|r| r.healthy).count() as u64;
         Self {
             name: g.name.clone(),
-            group_seed: g.group_seed.iter().fold(String::with_capacity(64), |mut acc, b| {
-                use std::fmt::Write as _;
-                let _ = write!(&mut acc, "{b:02x}");
-                acc
-            }),
+            group_seed: g
+                .group_seed
+                .iter()
+                .fold(String::with_capacity(64), |mut acc, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(&mut acc, "{b:02x}");
+                    acc
+                }),
             replica_count: g.replicas.len() as u64,
             healthy_count,
             replicas,

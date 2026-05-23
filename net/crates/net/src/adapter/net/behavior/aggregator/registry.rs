@@ -45,9 +45,7 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::daemon::AggregatorDaemon;
-use crate::adapter::net::behavior::lifecycle::{
-    HealthMonitor, LifecycleGroup, ReplicaHealth,
-};
+use crate::adapter::net::behavior::lifecycle::{HealthMonitor, LifecycleGroup, ReplicaHealth};
 use crate::adapter::net::compute::PlacementDecision;
 
 /// A live aggregator group plus the metadata operator tooling
@@ -429,9 +427,7 @@ mod tests {
         let group = LifecycleGroup::<AggregatorDaemon>::spawn(2, [0u8; 32], {
             let cfg = cfg.clone();
             let mesh = mesh.clone();
-            move |_idx| {
-                Arc::new(AggregatorDaemon::new(cfg.clone(), mesh.clone()).expect("new"))
-            }
+            move |_idx| Arc::new(AggregatorDaemon::new(cfg.clone(), mesh.clone()).expect("new"))
         })
         .await
         .expect("spawn");

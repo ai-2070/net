@@ -153,7 +153,10 @@ pub enum RegistryRpcError {
 /// closure's concrete type. `'static` so the handler can move
 /// the callback into the spawned `RpcHandler::call` future.
 pub type SpawnFn = Box<
-    dyn Fn(SpawnRequest) -> futures::future::BoxFuture<'static, Result<RegistryGroupSummary, RegistryRpcError>>
+    dyn Fn(
+            SpawnRequest,
+        )
+            -> futures::future::BoxFuture<'static, Result<RegistryGroupSummary, RegistryRpcError>>
         + Send
         + Sync
         + 'static,
@@ -264,15 +267,13 @@ pub(crate) async fn answer(
                 Err(e) => RegistryResponse::Error(e),
             }
         }
-        RegistryRequest::Unregister { group_name } => {
-            match registry.unregister(group_name).await {
-                Ok(group) => {
-                    group.stop().await;
-                    RegistryResponse::Unregistered { existed: true }
-                }
-                Err(_) => RegistryResponse::Unregistered { existed: false },
+        RegistryRequest::Unregister { group_name } => match registry.unregister(group_name).await {
+            Ok(group) => {
+                group.stop().await;
+                RegistryResponse::Unregistered { existed: true }
             }
-        }
+            Err(_) => RegistryResponse::Unregistered { existed: false },
+        },
     }
 }
 
@@ -280,9 +281,7 @@ pub(crate) async fn answer(
 /// registry entry. Used by the `answer` path internally and
 /// by daemon-side `SpawnFn` implementations to build the
 /// `RegistryResponse::Spawned` payload after registration.
-pub async fn snapshot_group(
-    entry: &Arc<super::AggregatorGroupEntry>,
-) -> RegistryGroupSummary {
+pub async fn snapshot_group(entry: &Arc<super::AggregatorGroupEntry>) -> RegistryGroupSummary {
     let replicas = entry.replicas().await;
     let placements = entry.placements().await;
     let healths = entry.health().await;
@@ -322,7 +321,10 @@ impl AggregatorRegistry {
         mesh: &Arc<crate::adapter::net::MeshNode>,
     ) -> Result<crate::adapter::net::mesh_rpc::ServeHandle, crate::adapter::net::mesh_rpc::ServeError>
     {
-        mesh.serve_rpc(REGISTRY_SERVICE, Arc::new(RegistryHandler::new(self.clone())))
+        mesh.serve_rpc(
+            REGISTRY_SERVICE,
+            Arc::new(RegistryHandler::new(self.clone())),
+        )
     }
 
     /// Same as [`Self::install_registry_service`] but with a
@@ -534,7 +536,9 @@ mod tests {
                 let cfg = crate::adapter::net::behavior::aggregator::AggregatorConfig::new(
                     crate::adapter::net::SubnetId::GLOBAL,
                 )
-                .with_fold_kind(crate::adapter::net::behavior::fold::capability::CapabilityFold::KIND_ID)
+                .with_fold_kind(
+                    crate::adapter::net::behavior::fold::capability::CapabilityFold::KIND_ID,
+                )
                 .with_interval(std::time::Duration::from_millis(50));
                 let cfg_clone = cfg.clone();
                 let mesh_clone = mesh.clone();
@@ -592,9 +596,7 @@ mod tests {
     async fn spawn_with_unknown_template_surfaces_typed_error() {
         let registry: Arc<AggregatorRegistry> = Arc::new(AggregatorRegistry::new());
         let spawner: SpawnFn = Box::new(|req: SpawnRequest| {
-            Box::pin(async move {
-                Err(RegistryRpcError::UnknownTemplate(req.template_name))
-            })
+            Box::pin(async move { Err(RegistryRpcError::UnknownTemplate(req.template_name)) })
         });
         let response = answer(
             &registry,

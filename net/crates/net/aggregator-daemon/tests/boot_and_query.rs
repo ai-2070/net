@@ -116,10 +116,7 @@ async fn daemon_boots_two_groups_and_serves_registry_rpc() {
         .connect(booted.bound_addr, &booted.public_key, daemon_node_id)
         .await
         .expect("connect to daemon");
-    accept
-        .await
-        .expect("accept join")
-        .expect("daemon accept");
+    accept.await.expect("accept join").expect("daemon accept");
     // Start both receive loops now that the handshake landed.
     booted.mesh.start();
     client_node.start();
@@ -128,7 +125,10 @@ async fn daemon_boots_two_groups_and_serves_registry_rpc() {
     let client = RegistryClient::new(client_node).with_deadline(Duration::from_secs(2));
     let groups = client.list(daemon_node_id).await.expect("list");
     let resolved_names: Vec<String> = groups.iter().map(|g| g.name.clone()).collect();
-    assert_eq!(resolved_names, vec!["alpha".to_string(), "beta".to_string()]);
+    assert_eq!(
+        resolved_names,
+        vec!["alpha".to_string(), "beta".to_string()]
+    );
     let alpha = groups.iter().find(|g| g.name == "alpha").expect("alpha");
     assert_eq!(alpha.replicas.len(), 2);
     let beta = groups.iter().find(|g| g.name == "beta").expect("beta");

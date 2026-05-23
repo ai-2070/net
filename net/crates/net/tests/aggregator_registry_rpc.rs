@@ -25,9 +25,7 @@ use net::adapter::net::behavior::aggregator::{
 use net::adapter::net::behavior::fold::capability::CapabilityFold;
 use net::adapter::net::behavior::fold::FoldKind;
 use net::adapter::net::behavior::lifecycle::LifecycleGroup;
-use net::adapter::net::{
-    EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig, SubnetId,
-};
+use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig, SubnetId};
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
@@ -76,8 +74,13 @@ async fn handshake(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
 /// with two registered groups + the registry service installed;
 /// `querier` connects to it. Returns
 /// `(host, querier, registry, _serve_handle, group_names)`.
-async fn build_registry_pair(
-) -> (Arc<MeshNode>, Arc<MeshNode>, Arc<AggregatorRegistry>, net::adapter::net::mesh_rpc::ServeHandle, Vec<&'static str>) {
+async fn build_registry_pair() -> (
+    Arc<MeshNode>,
+    Arc<MeshNode>,
+    Arc<AggregatorRegistry>,
+    net::adapter::net::mesh_rpc::ServeHandle,
+    Vec<&'static str>,
+) {
     let host = build_node().await;
     let querier = build_node().await;
     handshake(&host, &querier).await;

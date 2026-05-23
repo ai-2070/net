@@ -159,8 +159,7 @@ impl<L: LifecycleDaemon> LifecycleGroup<L> {
                 "replica_count must be > 0".into(),
             ));
         }
-        let (replicas, handles) =
-            start_replicas(replica_count, |idx| factory(idx)).await?;
+        let (replicas, handles) = start_replicas(replica_count, |idx| factory(idx)).await?;
         Ok(Self {
             handles,
             replicas,
@@ -218,8 +217,7 @@ impl<L: LifecycleDaemon> LifecycleGroup<L> {
         // Walk placements first so factory invocations see a
         // populated `ReplicaContext`. Spread invariant: each
         // placement excludes prior ones.
-        let mut placements: Vec<PlacementDecision> =
-            Vec::with_capacity(replica_count as usize);
+        let mut placements: Vec<PlacementDecision> = Vec::with_capacity(replica_count as usize);
         let mut used_nodes: HashSet<u64> = HashSet::new();
         for index in 0..replica_count {
             match GroupCoordinator::place_with_spread(scheduler, &requirements, &used_nodes) {
@@ -390,8 +388,18 @@ impl<L: LifecycleDaemon> LifecycleGroup<L> {
     /// responsibility (via the returned `LifecycleHandle`s).
     pub fn into_parts(
         self,
-    ) -> (Vec<Arc<L>>, Vec<PlacementDecision>, Vec<LifecycleHandle>, [u8; 32]) {
-        (self.replicas, self.placements, self.handles, self.group_seed)
+    ) -> (
+        Vec<Arc<L>>,
+        Vec<PlacementDecision>,
+        Vec<LifecycleHandle>,
+        [u8; 32],
+    ) {
+        (
+            self.replicas,
+            self.placements,
+            self.handles,
+            self.group_seed,
+        )
     }
 }
 
@@ -418,7 +426,9 @@ where
         starts.push((index, LifecycleHandle::start(trait_obj)));
     }
     let started: Vec<_> = futures::future::join_all(
-        starts.into_iter().map(|(i, fut)| async move { (i, fut.await) }),
+        starts
+            .into_iter()
+            .map(|(i, fut)| async move { (i, fut.await) }),
     )
     .await;
     let mut handles = Vec::with_capacity(replica_count as usize);
@@ -531,11 +541,14 @@ mod tests {
     #[tokio::test]
     async fn replica_keypair_is_deterministic_for_a_given_index() {
         let seed = [0x42u8; 32];
-        let group = LifecycleGroup::<CountingDaemon>::spawn(2, seed, |_idx| {
-            Arc::new(CountingDaemon::new())
-        })
-        .await
-        .expect("group spawn");
+        let group =
+            LifecycleGroup::<CountingDaemon>::spawn(
+                2,
+                seed,
+                |_idx| Arc::new(CountingDaemon::new()),
+            )
+            .await
+            .expect("group spawn");
         let expected_kp_0 = derive_replica_keypair(&seed, 0);
         let expected_kp_1 = derive_replica_keypair(&seed, 1);
         assert_eq!(
@@ -555,9 +568,7 @@ mod tests {
     }
 
     fn make_scheduler(node_ids: &[u64]) -> Scheduler {
-        use crate::adapter::net::behavior::capability::{
-            CapabilityAnnouncement, CapabilitySet,
-        };
+        use crate::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
         use crate::adapter::net::behavior::fold::{capability_bridge, CapabilityFold, Fold};
         let fold: Arc<Fold<CapabilityFold>> =
             Arc::new(Fold::with_sweep_interval(std::time::Duration::ZERO));
@@ -714,14 +725,13 @@ mod tests {
         let daemons: Arc<parking_lot::Mutex<Vec<Arc<HealthControlDaemon>>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
         let daemons_clone = daemons.clone();
-        let mut group =
-            LifecycleGroup::<HealthControlDaemon>::spawn(2, [0u8; 32], move |_idx| {
-                let d = Arc::new(HealthControlDaemon::new());
-                daemons_clone.lock().push(d.clone());
-                d
-            })
-            .await
-            .expect("spawn");
+        let mut group = LifecycleGroup::<HealthControlDaemon>::spawn(2, [0u8; 32], move |_idx| {
+            let d = Arc::new(HealthControlDaemon::new());
+            daemons_clone.lock().push(d.clone());
+            d
+        })
+        .await
+        .expect("spawn");
 
         let original_idx_1 = daemons.lock()[1].clone();
         assert_eq!(original_idx_1.stops.load(Ordering::Acquire), 0);
@@ -749,12 +759,11 @@ mod tests {
 
     #[tokio::test]
     async fn replace_rejects_out_of_bounds_index() {
-        let mut group =
-            LifecycleGroup::<HealthControlDaemon>::spawn(2, [0u8; 32], |_idx| {
-                Arc::new(HealthControlDaemon::new())
-            })
-            .await
-            .expect("spawn");
+        let mut group = LifecycleGroup::<HealthControlDaemon>::spawn(2, [0u8; 32], |_idx| {
+            Arc::new(HealthControlDaemon::new())
+        })
+        .await
+        .expect("spawn");
         let replacement = Arc::new(HealthControlDaemon::new());
         match group.replace(5, replacement).await {
             Err(LifecycleGroupError::InvalidConfig(msg)) => {

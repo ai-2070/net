@@ -50,8 +50,8 @@ use clap::Parser;
 use serde::Deserialize;
 
 use net::adapter::net::behavior::aggregator::{
-    snapshot_group, AggregatorConfig, AggregatorDaemon, AggregatorRegistry,
-    RegistryRpcError, SpawnFn,
+    snapshot_group, AggregatorConfig, AggregatorDaemon, AggregatorRegistry, RegistryRpcError,
+    SpawnFn,
 };
 use net::adapter::net::behavior::fold::capability::CapabilityFold;
 use net::adapter::net::behavior::fold::reservation::ReservationFold;
@@ -243,32 +243,34 @@ pub struct BootedDaemon {
 /// embedders that need to drive their own shutdown.
 pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
     // Parse config.
-    let raw = tokio::fs::read_to_string(&cli.config)
-        .await
-        .map_err(|e| DaemonError::ConfigRead {
-            path: cli.config.clone(),
-            error: e,
-        })?;
+    let raw =
+        tokio::fs::read_to_string(&cli.config)
+            .await
+            .map_err(|e| DaemonError::ConfigRead {
+                path: cli.config.clone(),
+                error: e,
+            })?;
     let config: Config = toml::from_str(&raw).map_err(DaemonError::ConfigParse)?;
 
     // CLI listen override.
     let listen = cli.listen.unwrap_or(config.listen.clone());
     let listen_addr: std::net::SocketAddr =
-        listen
-            .parse()
-            .map_err(|e| DaemonError::ListenAddrInvalid {
-                addr: listen.clone(),
-                error: e,
-            })?;
+        listen.parse().map_err(|e| DaemonError::ListenAddrInvalid {
+            addr: listen.clone(),
+            error: e,
+        })?;
     let psk = decode_psk(&config.psk_hex)?;
 
     // Boot the MeshNode, install the registry, expose the RPC
     // service. Order matters: `set_aggregator_registry`
     // requires `&mut MeshNode`, so install before wrapping in
     // Arc.
-    let mut mesh_node = MeshNode::new(EntityKeypair::generate(), MeshNodeConfig::new(listen_addr, psk))
-        .await
-        .map_err(|e| DaemonError::Mesh(format!("{e:?}")))?;
+    let mut mesh_node = MeshNode::new(
+        EntityKeypair::generate(),
+        MeshNodeConfig::new(listen_addr, psk),
+    )
+    .await
+    .map_err(|e| DaemonError::Mesh(format!("{e:?}")))?;
     let registry = Arc::new(AggregatorRegistry::new());
     mesh_node.set_aggregator_registry(registry.clone());
     let mesh = Arc::new(mesh_node);
@@ -337,8 +339,8 @@ async fn spawn_group(
             error: "summary_interval_ms must be >= 10".into(),
         });
     }
-    let source_subnet = parse_subnet(&group_cfg.source_subnet)
-        .map_err(|e| DaemonError::SubnetInvalid {
+    let source_subnet =
+        parse_subnet(&group_cfg.source_subnet).map_err(|e| DaemonError::SubnetInvalid {
             raw: group_cfg.source_subnet.clone(),
             error: e,
         })?;
@@ -376,21 +378,17 @@ async fn spawn_group(
     let mesh_for_factory = mesh.clone();
     let cfg_for_factory = cfg.clone();
     let group_name = group_cfg.name.clone();
-    let group = LifecycleGroup::<AggregatorDaemon>::spawn(
-        group_cfg.replica_count,
-        group_seed,
-        {
-            let cfg = cfg_for_factory.clone();
-            let mesh = mesh_for_factory.clone();
-            move |_idx| {
-                #[allow(clippy::expect_used)]
-                Arc::new(
-                    AggregatorDaemon::new(cfg.clone(), mesh.clone())
-                        .expect("aggregator config validated"),
-                )
-            }
-        },
-    )
+    let group = LifecycleGroup::<AggregatorDaemon>::spawn(group_cfg.replica_count, group_seed, {
+        let cfg = cfg_for_factory.clone();
+        let mesh = mesh_for_factory.clone();
+        move |_idx| {
+            #[allow(clippy::expect_used)]
+            Arc::new(
+                AggregatorDaemon::new(cfg.clone(), mesh.clone())
+                    .expect("aggregator config validated"),
+            )
+        }
+    })
     .await
     .map_err(|e| DaemonError::AggregatorConfig {
         name: group_name.clone(),
@@ -413,7 +411,12 @@ async fn spawn_group(
     };
     let monitor_interval = Duration::from_millis(group_cfg.summary_interval_ms.saturating_mul(4));
     registry
-        .register_with_monitor(group_cfg.name.clone(), group, monitor_factory, monitor_interval)
+        .register_with_monitor(
+            group_cfg.name.clone(),
+            group,
+            monitor_factory,
+            monitor_interval,
+        )
         .map_err(|e| DaemonError::Registry(format!("{e}")))?;
     Ok(())
 }
@@ -462,10 +465,8 @@ fn make_spawner(
     // Index by template name for O(1) lookup. Cloning is fine
     // — templates are small and the operator's config is
     // immutable for the daemon's lifetime.
-    let by_name: HashMap<String, TemplateConfig> = templates
-        .into_iter()
-        .map(|t| (t.name.clone(), t))
-        .collect();
+    let by_name: HashMap<String, TemplateConfig> =
+        templates.into_iter().map(|t| (t.name.clone(), t)).collect();
     let by_name = Arc::new(by_name);
     Box::new(move |req| {
         let registry = registry.clone();

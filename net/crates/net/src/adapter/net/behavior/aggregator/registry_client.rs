@@ -93,7 +93,8 @@ impl RegistryClient {
         &self,
         target_node_id: u64,
     ) -> Result<Vec<RegistryGroupSummary>, RegistryClientError> {
-        self.list_with_service(target_node_id, REGISTRY_SERVICE).await
+        self.list_with_service(target_node_id, REGISTRY_SERVICE)
+            .await
     }
 
     /// Same as [`Self::list`] but with a caller-supplied service

@@ -1018,9 +1018,8 @@ mod tests {
             .with_fold_kind(CapabilityFold::KIND_ID)
             .with_interval(Duration::from_millis(20));
         let agg: Arc<AggregatorDaemon> = Arc::new(AggregatorDaemon::new(cfg, mesh).expect("new"));
-        let agg_trait: Arc<
-            dyn crate::adapter::net::behavior::lifecycle::LifecycleDaemon,
-        > = agg.clone();
+        let agg_trait: Arc<dyn crate::adapter::net::behavior::lifecycle::LifecycleDaemon> =
+            agg.clone();
 
         let handle = LifecycleHandle::start(agg_trait).await.expect("start");
         tokio::time::sleep(Duration::from_millis(85)).await;
@@ -1125,7 +1124,10 @@ mod tests {
         agg.tick_once();
         tokio::time::sleep(Duration::from_millis(180)).await;
         let h = LifecycleDaemon::health(&agg).await;
-        assert!(!h.healthy, "expected unhealthy after 3 × interval, got {h:?}");
+        assert!(
+            !h.healthy,
+            "expected unhealthy after 3 × interval, got {h:?}"
+        );
         assert!(
             h.diagnostic.as_deref().unwrap_or("").contains("no tick"),
             "diagnostic should mention the missed tick: {h:?}"

@@ -901,9 +901,7 @@ impl DeckClient {
     /// Deck AGGREGATORS-list panel. Per-replica health is
     /// surfaced inline so CLI / TUI render one shot of data
     /// without follow-up calls.
-    pub async fn aggregator_registry_snapshot(
-        &self,
-    ) -> Option<AggregatorRegistrySnapshot> {
+    pub async fn aggregator_registry_snapshot(&self) -> Option<AggregatorRegistrySnapshot> {
         let mesh = self.mesh.as_ref()?;
         let registry = mesh.aggregator_registry()?;
         let entries = registry.entries();
@@ -920,13 +918,12 @@ impl DeckClient {
             let healths = entry.health().await;
             let mut rows = Vec::with_capacity(replicas.len());
             for (idx, replica) in replicas.iter().enumerate() {
-                let health = healths
-                    .get(idx)
-                    .cloned()
-                    .unwrap_or_else(|| crate::adapter::net::behavior::lifecycle::ReplicaHealth {
+                let health = healths.get(idx).cloned().unwrap_or_else(|| {
+                    crate::adapter::net::behavior::lifecycle::ReplicaHealth {
                         healthy: true,
                         diagnostic: None,
-                    });
+                    }
+                });
                 let placement_node_id = placements.get(idx).map(|p| p.node_id);
                 rows.push(AggregatorReplicaRow {
                     generation: replica.generation(),

@@ -226,9 +226,7 @@ impl<L: LifecycleDaemon> HealthMonitor<L> {
                     MonitorGroupRef::Optional(g) => {
                         let mut guard = g.lock().await;
                         match guard.as_mut() {
-                            Some(lg) => {
-                                run_poll_pass(lg, &mut factory, &stats_for_task).await
-                            }
+                            Some(lg) => run_poll_pass(lg, &mut factory, &stats_for_task).await,
                             None => false,
                         }
                     }
@@ -373,7 +371,13 @@ mod tests {
         }
 
         // Stats are populated.
-        assert!(monitor.stats().replacements_initiated.load(Ordering::Acquire) >= 1);
+        assert!(
+            monitor
+                .stats()
+                .replacements_initiated
+                .load(Ordering::Acquire)
+                >= 1
+        );
         assert!(monitor.stats().ticks.load(Ordering::Acquire) >= 1);
 
         monitor.stop().await;
@@ -389,15 +393,13 @@ mod tests {
     async fn monitor_skips_replace_when_all_healthy() {
         // Healthy 2-replica group; monitor should never call
         // the factory.
-        let group =
-            LifecycleGroup::<ToggleHealthDaemon>::spawn(2, [0u8; 32], |_idx| {
-                Arc::new(ToggleHealthDaemon::new(false))
-            })
-            .await
-            .expect("spawn");
+        let group = LifecycleGroup::<ToggleHealthDaemon>::spawn(2, [0u8; 32], |_idx| {
+            Arc::new(ToggleHealthDaemon::new(false))
+        })
+        .await
+        .expect("spawn");
         let group = Arc::new(AsyncMutex::new(group));
-        let factory_calls: Arc<parking_lot::Mutex<u32>> =
-            Arc::new(parking_lot::Mutex::new(0));
+        let factory_calls: Arc<parking_lot::Mutex<u32>> = Arc::new(parking_lot::Mutex::new(0));
         let factory_calls_clone = factory_calls.clone();
         let monitor = HealthMonitor::spawn(
             group.clone(),
@@ -412,7 +414,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(*factory_calls.lock(), 0, "factory must not be called");
         assert_eq!(
-            monitor.stats().replacements_initiated.load(Ordering::Acquire),
+            monitor
+                .stats()
+                .replacements_initiated
+                .load(Ordering::Acquire),
             0
         );
         assert!(monitor.stats().ticks.load(Ordering::Acquire) >= 1);
