@@ -7,7 +7,7 @@
 //! This is the SDK-side smoke test — the substrate-level
 //! round-trip is in `crates/net/tests/aggregator_registry_rpc.rs`.
 
-#![cfg(feature = "net")]
+#![cfg(feature = "aggregator")]
 
 use std::sync::Arc;
 use std::time::Duration;

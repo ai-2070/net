@@ -352,7 +352,7 @@ jobs:
       #     duplex typed SDK surface (5 tests). Gated on
       #     `feature = "net" + "cortex"`, both present here.
       - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed)
-        run: cargo test --features "net cortex testing compute nat-traversal port-mapping"
+        run: cargo test --features "net cortex testing compute nat-traversal port-mapping aggregator"
 
       # SDK doctests — `///` examples in `sdk/src/`. Same feature set
       # as the test run so doc examples gated on those features

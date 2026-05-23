@@ -86,9 +86,12 @@ pub mod subnets;
 // Aggregator + lifecycle surfaces. Aggregator-daemon clients
 // (`RegistryClient`, `FoldQueryClient`) + the daemon-author
 // types (`AggregatorRegistry`, `LifecycleGroup`,
-// `HealthMonitor`). Riding `net` because every surface in this
-// module routes through `Mesh::call` / `Mesh::serve_rpc`.
-#[cfg(feature = "net")]
+// `HealthMonitor`). The `aggregator` feature is on by default and
+// transitively activates `net` (every surface in this module
+// routes through `Mesh::call` / `Mesh::serve_rpc`); the explicit
+// flag mirrors the per-binding `aggregator` Cargo feature so a
+// `--no-default-features` consumer can opt in by name.
+#[cfg(feature = "aggregator")]
 pub mod aggregator;
 
 // Re-export the main handle.
