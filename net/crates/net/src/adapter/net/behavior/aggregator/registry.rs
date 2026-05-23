@@ -45,7 +45,9 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::daemon::AggregatorDaemon;
-use crate::adapter::net::behavior::lifecycle::{HealthMonitor, LifecycleGroup, ReplicaHealth};
+use crate::adapter::net::behavior::lifecycle::{
+    HealthMonitor, LifecycleDaemon, LifecycleGroup, ReplicaHealth,
+};
 use crate::adapter::net::compute::PlacementDecision;
 
 /// A live aggregator group plus the metadata operator tooling
@@ -110,6 +112,59 @@ impl AggregatorGroupEntry {
     pub fn monitor(&self) -> Option<Arc<HealthMonitor<AggregatorDaemon>>> {
         self.monitor.lock().clone()
     }
+
+    /// Single lock-once snapshot of the entry's full per-replica
+    /// state. Used by [`super::snapshot_group`] (the RPC
+    /// `List` path) and `DeckClient::aggregator_registry_snapshot`
+    /// — both previously took **three sequential** lock
+    /// acquisitions (`replicas` / `placements` / `health`) per
+    /// group per snapshot. This collapses to one lock + an
+    /// outside-the-guard `join_all` for the per-replica
+    /// `health()` futures, so a slow daemon's `health()` no
+    /// longer blocks concurrent `register`/`unregister` writers.
+    ///
+    /// Returns an empty snapshot when the group has been taken
+    /// via `unregister`.
+    pub async fn snapshot(&self) -> EntrySnapshot {
+        let (replicas, placements) = {
+            let guard = self.group.lock().await;
+            match guard.as_ref() {
+                Some(g) => (g.replicas(), g.placements().to_vec()),
+                None => return EntrySnapshot::default(),
+            }
+        };
+        // Lock is dropped here. Run per-replica health checks
+        // concurrently, with no other guard held.
+        let healths = futures::future::join_all(
+            replicas
+                .iter()
+                .cloned()
+                .map(|r| async move { r.health().await }),
+        )
+        .await;
+        EntrySnapshot {
+            replicas,
+            placements,
+            healths,
+        }
+    }
+}
+
+/// Lock-once snapshot of an [`AggregatorGroupEntry`]'s
+/// per-replica state. Built by
+/// [`AggregatorGroupEntry::snapshot`]; consumed by the RPC
+/// handler + the deck snapshot accessor.
+#[derive(Default)]
+pub struct EntrySnapshot {
+    /// Typed handles to each replica in declaration order.
+    pub replicas: Vec<Arc<AggregatorDaemon>>,
+    /// Per-replica placement decisions in declaration order.
+    /// Empty when the group was created via the placement-free
+    /// [`LifecycleGroup::spawn`].
+    pub placements: Vec<PlacementDecision>,
+    /// Per-replica health snapshot in declaration order.
+    /// Indexed parallel to `replicas`.
+    pub healths: Vec<ReplicaHealth>,
 }
 
 /// Process-level registry of live aggregator groups.

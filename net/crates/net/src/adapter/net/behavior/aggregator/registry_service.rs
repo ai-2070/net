@@ -282,30 +282,38 @@ pub(crate) async fn answer(
 /// by daemon-side `SpawnFn` implementations to build the
 /// `RegistryResponse::Spawned` payload after registration.
 pub async fn snapshot_group(entry: &Arc<super::AggregatorGroupEntry>) -> RegistryGroupSummary {
-    let replicas = entry.replicas().await;
-    let placements = entry.placements().await;
-    let healths = entry.health().await;
-    let mut rows = Vec::with_capacity(replicas.len());
-    for (idx, replica) in replicas.iter().enumerate() {
-        let health = healths.get(idx).cloned().unwrap_or(
-            crate::adapter::net::behavior::lifecycle::ReplicaHealth {
-                healthy: true,
-                diagnostic: None,
-            },
-        );
-        let placement_node_id = placements.get(idx).map(|p| p.node_id);
-        rows.push(RegistryReplicaSummary {
-            generation: replica.generation(),
-            healthy: health.healthy,
-            diagnostic: health.diagnostic,
-            placement_node_id,
-        });
-    }
+    let snap = entry.snapshot().await;
+    let rows = build_rows(&snap);
     RegistryGroupSummary {
         name: entry.name.clone(),
         group_seed: entry.group_seed,
         replicas: rows,
     }
+}
+
+/// Map an [`EntrySnapshot`](super::EntrySnapshot) to the wire's
+/// per-replica row Vec. Pulled out so `snapshot_group` and the
+/// deck-side accessor produce byte-identical replica metadata.
+fn build_rows(snap: &super::EntrySnapshot) -> Vec<RegistryReplicaSummary> {
+    snap.replicas
+        .iter()
+        .enumerate()
+        .map(|(idx, replica)| {
+            let health = snap.healths.get(idx).cloned().unwrap_or(
+                crate::adapter::net::behavior::lifecycle::ReplicaHealth {
+                    healthy: true,
+                    diagnostic: None,
+                },
+            );
+            let placement_node_id = snap.placements.get(idx).map(|p| p.node_id);
+            RegistryReplicaSummary {
+                generation: replica.generation(),
+                healthy: health.healthy,
+                diagnostic: health.diagnostic,
+                placement_node_id,
+            }
+        })
+        .collect()
 }
 
 impl AggregatorRegistry {

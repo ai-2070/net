@@ -908,31 +908,34 @@ impl DeckClient {
         let entries = registry.entries();
         let mut groups = Vec::with_capacity(entries.len());
         for entry in entries {
-            // Async accessors on the entry — one lock per call,
-            // released between calls. The snapshot is taken
-            // best-effort: a concurrent unregister between calls
-            // would yield mismatched-length Vecs. Operators see
-            // the empty-group case naturally (replicas Vec is
-            // empty).
-            let replicas = entry.replicas().await;
-            let placements = entry.placements().await;
-            let healths = entry.health().await;
-            let mut rows = Vec::with_capacity(replicas.len());
-            for (idx, replica) in replicas.iter().enumerate() {
-                let health = healths.get(idx).cloned().unwrap_or(
-                    crate::adapter::net::behavior::lifecycle::ReplicaHealth {
-                        healthy: true,
-                        diagnostic: None,
-                    },
-                );
-                let placement_node_id = placements.get(idx).map(|p| p.node_id);
-                rows.push(AggregatorReplicaRow {
-                    generation: replica.generation(),
-                    healthy: health.healthy,
-                    diagnostic: health.diagnostic,
-                    placement_node_id,
-                });
-            }
+            // One lock + outside-the-guard health-join per group,
+            // via the entry's snapshot helper. Previously this
+            // path took three sequential lock acquisitions
+            // (`replicas` / `placements` / `health`) per group +
+            // a slow `health()` blocked concurrent
+            // `register`/`unregister` writers. See
+            // `AggregatorGroupEntry::snapshot` for the rationale.
+            let snap = entry.snapshot().await;
+            let rows = snap
+                .replicas
+                .iter()
+                .enumerate()
+                .map(|(idx, replica)| {
+                    let health = snap.healths.get(idx).cloned().unwrap_or(
+                        crate::adapter::net::behavior::lifecycle::ReplicaHealth {
+                            healthy: true,
+                            diagnostic: None,
+                        },
+                    );
+                    let placement_node_id = snap.placements.get(idx).map(|p| p.node_id);
+                    AggregatorReplicaRow {
+                        generation: replica.generation(),
+                        healthy: health.healthy,
+                        diagnostic: health.diagnostic,
+                        placement_node_id,
+                    }
+                })
+                .collect();
             groups.push(AggregatorRegistryGroupSnapshot {
                 name: entry.name.clone(),
                 group_seed: entry.group_seed,
