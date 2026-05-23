@@ -1,0 +1,22 @@
+net/crates/net/deck/src/app.rs
+  s_099fa7d871e34d::t_140e79b0831e4b 1660-1662
+  s_099fa7d871e34d::t_ecfc87d136b6f8 84-96,107-111,115-118
+net/crates/net/deck/src/widgets/tab_bar.rs
+  s_099fa7d871e34d::t_c93282e32f47d2 13-14,24-28,30-32
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "69a5ff205eef18a0107a3f23712d9871ce48deee",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
