@@ -2352,7 +2352,10 @@ mod mesh_bindings {
             use net::adapter::net::behavior::Tag;
             use net::adapter::net::identity::EntityId;
             let nid = crate::common::bigint_u64(node_id).map_err(|e| {
-                Error::from_reason(format!("test_inject_synthetic_peer_with_tags: {}", e.reason))
+                Error::from_reason(format!(
+                    "test_inject_synthetic_peer_with_tags: {}",
+                    e.reason
+                ))
             })?;
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
@@ -2368,10 +2371,7 @@ mod mesh_bindings {
             }
             let eid = EntityId::from_bytes([0u8; 32]);
             node.test_inject_capability_announcement(CapabilityAnnouncement::new(
-                nid,
-                eid,
-                1,
-                caps,
+                nid, eid, 1, caps,
             ));
             Ok(())
         }

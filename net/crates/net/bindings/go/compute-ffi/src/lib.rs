@@ -2016,9 +2016,7 @@ pub extern "C" fn net_compute_test_inject_synthetic_peer_with_tags(
         }
     }
     let eid = EntityId::from_bytes([0u8; 32]);
-    arc.test_inject_capability_announcement(CapabilityAnnouncement::new(
-        node_id, eid, 1, caps,
-    ));
+    arc.test_inject_capability_announcement(CapabilityAnnouncement::new(node_id, eid, 1, caps));
 }
 
 // =========================================================================

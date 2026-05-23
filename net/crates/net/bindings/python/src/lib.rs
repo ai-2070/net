@@ -1814,9 +1814,7 @@ mod mesh_bindings {
             node_id: u64,
             tags: Vec<String>,
         ) -> PyResult<()> {
-            use net::adapter::net::behavior::capability::{
-                CapabilityAnnouncement, CapabilitySet,
-            };
+            use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
             use net::adapter::net::behavior::Tag;
             use net::adapter::net::identity::EntityId;
             let node = self.get_node()?;
