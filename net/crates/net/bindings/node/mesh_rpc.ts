@@ -614,24 +614,33 @@ export class TypedMeshRpc {
    * `send(value)`, then `finish()` to drain the terminal
    * response.
    *
-   * Cancellation: pass `opts.signal` for surface parity with
-   * unary `call`; the wrapper does NOT wire the signal into the
-   * streaming raw layer (locked decision #2 — `.close()`-only
-   * for v1). Invoke `typedCall.close()` to abort an in-flight
-   * stream. Unifying signal/token/context across streaming
-   * shapes is a deliberate post-v1 follow-up.
+   * Cancellation (v3 / C-A1): `opts.signal` is wired end-to-end
+   * via the same `wireAbortSignal` helper unary calls use.
+   * `signal.aborted` triggers the substrate's
+   * `MeshNode::cancel(token)`, which drops the pending
+   * client-stream entry — the next `send()` / `finish()` observes
+   * a stream-closed error within bounded time, and the call's
+   * Drop emits CANCEL on the wire. Invoking `typedCall.close()`
+   * explicitly is still supported as the imperative cancel
+   * surface.
    */
   async callClientStream<Req = unknown, Resp = unknown>(
     targetNodeId: bigint,
     service: string,
     opts?: CallOptions,
   ): Promise<TypedClientStreamCall<Req, Resp>> {
-    const rawCall = await this._raw.callClientStream(
-      targetNodeId,
-      service,
-      stripSignal(opts),
-    )
-    return new TypedClientStreamCall<Req, Resp>(rawCall)
+    const { rawOpts, detach } = wireAbortSignal(this._raw, opts)
+    try {
+      const rawCall = await this._raw.callClientStream(
+        targetNodeId,
+        service,
+        rawOpts,
+      )
+      return new TypedClientStreamCall<Req, Resp>(rawCall, detach)
+    } catch (err) {
+      detach()
+      throw err
+    }
   }
 
   /**
@@ -669,22 +678,30 @@ export class TypedMeshRpc {
    * via `next` (or `for await`), or `intoSplit` to separate the
    * halves for the encoder-task / decoder-task pattern.
    *
-   * Cancellation: same `.close()`-only contract as
-   * `callClientStream` (locked decision #2). `opts.signal` is
-   * stripped before reaching the raw layer; invoke
-   * `typedCall.close()` to abort an in-flight duplex.
+   * Cancellation (v3 / C-A1): `opts.signal` is wired through to
+   * the substrate's cancel-token primitive — same pattern as
+   * `callClientStream`. Aborting the signal drops both halves
+   * cleanly; the receive side observes EOF on its next pull and
+   * Drop emits CANCEL on the wire. `typedCall.close()` is still
+   * supported as the imperative cancel surface.
    */
   async callDuplex<Req = unknown, Resp = unknown>(
     targetNodeId: bigint,
     service: string,
     opts?: CallOptions,
   ): Promise<TypedDuplexCall<Req, Resp>> {
-    const rawCall = await this._raw.callDuplex(
-      targetNodeId,
-      service,
-      stripSignal(opts),
-    )
-    return new TypedDuplexCall<Req, Resp>(rawCall)
+    const { rawOpts, detach } = wireAbortSignal(this._raw, opts)
+    try {
+      const rawCall = await this._raw.callDuplex(
+        targetNodeId,
+        service,
+        rawOpts,
+      )
+      return new TypedDuplexCall<Req, Resp>(rawCall, detach)
+    } catch (err) {
+      detach()
+      throw err
+    }
   }
 
   /**
@@ -913,9 +930,20 @@ export class TypedRpcStream<Resp = unknown> implements AsyncIterable<Resp> {
  */
 export class TypedClientStreamCall<Req = unknown, Resp = unknown> {
   private readonly _raw: RawClientStreamCall
+  private readonly _detachSignal: () => void
 
-  constructor(rawCall: RawClientStreamCall) {
+  /**
+   * `detachSignal` is the cleanup function returned by
+   * `wireAbortSignal`. Run on `close()` (or on call resolution
+   * via `finish()`) so the AbortSignal listener doesn't outlive
+   * the call.
+   */
+  constructor(
+    rawCall: RawClientStreamCall,
+    detachSignal: () => void = () => {},
+  ) {
     this._raw = rawCall
+    this._detachSignal = detachSignal
   }
 
   /** Underlying raw call for users who want the Buffer-level surface. */
@@ -940,8 +968,12 @@ export class TypedClientStreamCall<Req = unknown, Resp = unknown> {
    * surfaces as `nrpc:codec_decode:`.
    */
   async finish(): Promise<Resp> {
-    const buf = await this._raw.finish()
-    return jsonDecode(buf) as Resp
+    try {
+      const buf = await this._raw.finish()
+      return jsonDecode(buf) as Resp
+    } finally {
+      this._detachSignal()
+    }
   }
 
   /** Server-assigned `call_id`. */
@@ -957,10 +989,14 @@ export class TypedClientStreamCall<Req = unknown, Resp = unknown> {
   /**
    * Close without finishing. Fires CANCEL on the wire if the
    * initial REQUEST has flown. Idempotent. A concurrent in-flight
-   * `send()` awaiting flow-control credit observes `stream_closed`
-   * (locked decision #2 — this is the v1 cancellation primitive).
+   * `send()` awaiting flow-control credit observes `stream_closed`.
+   *
+   * Detaches the `AbortSignal` listener (if one was wired by
+   * `TypedMeshRpc.callClientStream(opts.signal)`) so the
+   * signal can be reused for a subsequent call.
    */
   async close(): Promise<void> {
+    this._detachSignal()
     try {
       await this._raw.close()
     } catch {
@@ -1095,10 +1131,21 @@ export class TypedDuplexCall<Req = unknown, Resp = unknown>
 {
   private readonly _raw: RawDuplexCall
   private _done: boolean
+  private readonly _detachSignal: () => void
 
-  constructor(rawCall: RawDuplexCall) {
+  /**
+   * `detachSignal` is the cleanup function returned by
+   * `wireAbortSignal`. Run on `close()` (or transferred to one
+   * of the split halves on `intoSplit`) so the AbortSignal
+   * listener doesn't outlive the call.
+   */
+  constructor(
+    rawCall: RawDuplexCall,
+    detachSignal: () => void = () => {},
+  ) {
     this._raw = rawCall
     this._done = false
+    this._detachSignal = detachSignal
   }
 
   /** Underlying raw call for users who want the Buffer-level surface. */
@@ -1163,6 +1210,14 @@ export class TypedDuplexCall<Req = unknown, Resp = unknown>
    * `send` / `finishSending` / `next` throw `stream_closed`.
    * CANCEL fires only when BOTH split halves drop without
    * observing the response stream's terminal frame.
+   *
+   * The AbortSignal listener (if one was wired) transfers to the
+   * sink half — the sink is the half that issues the upload,
+   * which is typically dropped first. Wherever the listener
+   * ends up, it stays attached until that half's `close()` runs;
+   * the stream half can still observe cancel-mid-flight via the
+   * substrate's cancel-token primitive even if the sink half's
+   * listener has already detached.
    */
   async intoSplit(): Promise<
     [TypedDuplexSink<Req>, TypedDuplexStream<Resp>]
@@ -1170,7 +1225,7 @@ export class TypedDuplexCall<Req = unknown, Resp = unknown>
     const [rawSink, rawStream] = await this._raw.intoSplit()
     this._done = true
     return [
-      new TypedDuplexSink<Req>(rawSink),
+      new TypedDuplexSink<Req>(rawSink, this._detachSignal),
       new TypedDuplexStream<Resp>(rawStream),
     ]
   }
@@ -1193,9 +1248,14 @@ export class TypedDuplexCall<Req = unknown, Resp = unknown>
    * Close without observing the response terminator. Fires
    * CANCEL on the wire. Idempotent. Concurrent in-flight
    * `send()` awaiting credit observes `stream_closed`.
+   *
+   * Detaches the `AbortSignal` listener (if one was wired by
+   * `TypedMeshRpc.callDuplex(opts.signal)`) so the signal can
+   * be reused for a subsequent call.
    */
   async close(): Promise<void> {
     this._done = true
+    this._detachSignal()
     try {
       await this._raw.close()
     } catch {
@@ -1207,9 +1267,14 @@ export class TypedDuplexCall<Req = unknown, Resp = unknown>
 /** Send-half of a typed duplex call after `intoSplit`. */
 export class TypedDuplexSink<Req = unknown> {
   private readonly _raw: RawDuplexSink
+  private readonly _detachSignal: () => void
 
-  constructor(rawSink: RawDuplexSink) {
+  constructor(
+    rawSink: RawDuplexSink,
+    detachSignal: () => void = () => {},
+  ) {
     this._raw = rawSink
+    this._detachSignal = detachSignal
   }
 
   /** Underlying raw sink for Buffer-level access. */
@@ -1241,8 +1306,12 @@ export class TypedDuplexSink<Req = unknown> {
   /**
    * Close without emitting REQUEST_END. Idempotent. Concurrent
    * in-flight `send()` awaiting credit observes `stream_closed`.
+   *
+   * Detaches the AbortSignal listener (if one was transferred from
+   * the parent `TypedDuplexCall` via `intoSplit`).
    */
   async close(): Promise<void> {
+    this._detachSignal()
     try {
       await this._raw.close()
     } catch {
@@ -1862,22 +1931,6 @@ interface WiredAbortSignal {
  * unchanged so the non-cancellable fast path stays free of
  * tokio-spawn / registry overhead.
  */
-/**
- * Strip `signal` from `opts` before passing to a raw streaming
- * entry point. The raw napi side does not honor `signal` for
- * streaming calls (locked decision #2 — v1 streaming
- * cancellation is `.close()`-only). Leaving `signal` in the
- * forwarded opts would be silently ignored by the napi layer;
- * stripping it here surfaces the omission at the wrapper
- * boundary so an inattentive caller doesn't think they wired
- * cancellation when they hadn't.
- */
-function stripSignal(opts: CallOptions | undefined): CallOptions | undefined {
-  if (!opts || opts.signal === undefined) return opts
-  const { signal: _unused, ...rest } = opts
-  return rest
-}
-
 function wireAbortSignal(
   raw: RawMeshRpc,
   opts: CallOptions | undefined,
