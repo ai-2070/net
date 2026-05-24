@@ -3871,4 +3871,49 @@ mod tests {
         assert_eq!(collected[0].0, "x-empty");
         assert!(collected[0].1.is_empty());
     }
+
+    /// `GoRpcObserver::on_call` drops events when the bounded
+    /// channel fills, incrementing `OBSERVER_DROPPED_TOTAL` by one
+    /// per drop. Mirror of the napi + pyo3 drop-counter tests —
+    /// invariant lives at the substrate dispatch boundary in all
+    /// three bindings. Pinned because the v3 locked decision #1
+    /// hinges on this counter — overflow MUST surface via
+    /// `net_rpc_observer_dropped_total` so a slow Go consumer is
+    /// observable from production telemetry.
+    #[test]
+    fn observer_drops_overflow_events_and_counts_them() {
+        use ::net::adapter::net::cortex::{
+            RpcCallEvent as InnerEvt, RpcCallStatus as InnerStatus,
+            RpcDirection as InnerDir, RpcObserver,
+        };
+        let baseline = OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed);
+        let (sender, _recv) =
+            tokio::sync::mpsc::channel::<InnerEvt>(OBSERVER_BUFFER_CAPACITY);
+        let obs = GoRpcObserver { sender };
+        let make_event = || InnerEvt {
+            caller: 1,
+            callee: 2,
+            method: "test.svc.echo".into(),
+            latency_ms: 0,
+            status: InnerStatus::Ok,
+            request_bytes: 0,
+            response_bytes: 0,
+            direction: InnerDir::Outbound,
+            ts_unix_ms: 0,
+        };
+        const FIRED: u64 = 2000;
+        for _ in 0..FIRED {
+            obs.on_call(make_event());
+        }
+        let dropped = OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed) - baseline;
+        let expected = FIRED - OBSERVER_BUFFER_CAPACITY as u64;
+        assert!(
+            dropped >= expected,
+            "expected ≥ {expected} drops, got {dropped}",
+        );
+        // FFI sanity: the dedicated counter symbol surfaces the
+        // same value the snapshot's JSON field does.
+        let via_ffi = net_rpc_observer_dropped_total();
+        assert!(via_ffi >= dropped + baseline);
+    }
 }

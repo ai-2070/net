@@ -2199,4 +2199,46 @@ mod tests {
             );
         }
     }
+
+    /// `PyRpcObserver::on_call` drops events when the bounded
+    /// channel fills, incrementing the process-global drop counter
+    /// by one per drop. Mirror of the napi binding's
+    /// `observer_drops_overflow_events_and_counts_them` — same
+    /// invariant lives at the substrate dispatch boundary in all
+    /// three bindings.
+    #[test]
+    fn pyo3_observer_drops_overflow_events_and_counts_them() {
+        use super::{PyRpcObserver, OBSERVER_BUFFER_CAPACITY, OBSERVER_DROPPED_TOTAL};
+        use ::net::adapter::net::cortex::{
+            RpcCallEvent as InnerRpcCallEvent, RpcCallStatus as InnerRpcCallStatus,
+            RpcDirection as InnerRpcDirection, RpcObserver,
+        };
+        use std::sync::atomic::Ordering;
+
+        let baseline = OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed);
+        let (sender, _recv) =
+            tokio::sync::mpsc::channel::<InnerRpcCallEvent>(OBSERVER_BUFFER_CAPACITY);
+        let obs = PyRpcObserver { sender };
+        let make_event = || InnerRpcCallEvent {
+            caller: 1,
+            callee: 2,
+            method: "test.svc.echo".into(),
+            latency_ms: 0,
+            status: InnerRpcCallStatus::Ok,
+            request_bytes: 0,
+            response_bytes: 0,
+            direction: InnerRpcDirection::Outbound,
+            ts_unix_ms: 0,
+        };
+        const FIRED: u64 = 2000;
+        for _ in 0..FIRED {
+            obs.on_call(make_event());
+        }
+        let dropped = OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed) - baseline;
+        let expected = FIRED - OBSERVER_BUFFER_CAPACITY as u64;
+        assert!(
+            dropped >= expected,
+            "expected ≥ {expected} drops, got {dropped}",
+        );
+    }
 }

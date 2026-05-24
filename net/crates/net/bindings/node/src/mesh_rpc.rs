@@ -2003,6 +2003,7 @@ mod tests {
                 InnerRpcError::CapabilityDenied { target, capability } => format!(
                     "{ERR_NRPC_PREFIX}capability_denied: target=0x{target:x} capability={capability}"
                 ),
+                InnerRpcError::Cancelled => format!("{ERR_NRPC_PREFIX}cancelled: call cancelled"),
             }
         };
 
@@ -2178,5 +2179,53 @@ mod tests {
                 "codec/diagnostic string MUST NOT match app-error format: {s:?}",
             );
         }
+    }
+
+    /// `NodeRpcObserver::on_call` drops events when the bounded
+    /// channel fills, incrementing the process-global drop counter
+    /// by one per drop. Pinned because the v3 locked decision #1
+    /// hinges on this — overflow MUST surface via the snapshot's
+    /// `observer_dropped_total` field so a slow JS consumer is
+    /// observable from production telemetry rather than a
+    /// silently-on-fire dispatch path.
+    ///
+    /// The test bypasses the TSFN-bearing `install()` by constructing
+    /// the observer struct directly with a sender whose receiver is
+    /// held but never drained — the channel fills up, every event
+    /// past 1024 hits the overflow branch. We hold `_recv` ourselves
+    /// so the channel doesn't close (which would also trip the
+    /// `is_err()` arm but for the wrong reason).
+    #[test]
+    fn observer_drops_overflow_events_and_counts_them() {
+        use std::sync::atomic::Ordering;
+
+        let baseline = OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed);
+        let (sender, _recv) =
+            tokio::sync::mpsc::channel::<RpcCallEventJs>(OBSERVER_BUFFER_CAPACITY);
+        let obs = NodeRpcObserver { sender };
+        let make_event = || InnerRpcCallEvent {
+            caller: 1,
+            callee: 2,
+            method: "test.svc.echo".into(),
+            latency_ms: 0,
+            status: InnerRpcCallStatus::Ok,
+            request_bytes: 0,
+            response_bytes: 0,
+            direction: InnerRpcDirection::Outbound,
+            ts_unix_ms: 0,
+        };
+        const FIRED: u64 = 2000;
+        for _ in 0..FIRED {
+            obs.on_call(make_event());
+        }
+        let dropped = OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed) - baseline;
+        let expected = FIRED - OBSERVER_BUFFER_CAPACITY as u64;
+        // Allow slack — the counter is process-global so concurrent
+        // tests could nudge it; but the per-fire delta from THIS
+        // test must be at least the overflow count.
+        assert!(
+            dropped >= expected,
+            "expected ≥ {expected} drops, got {dropped}",
+        );
     }
 }
