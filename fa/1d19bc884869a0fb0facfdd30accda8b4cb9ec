@@ -1,0 +1,19 @@
+net/crates/net/tests/integration_mesh_cancel.rs
+  s_099fa7d871e34d::t_aae8a9be3458c2 1-447
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "fa1d19bc884869a0fb0facfdd30accda8b4cb9ec",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
