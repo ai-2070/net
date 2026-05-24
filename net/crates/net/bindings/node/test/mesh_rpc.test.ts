@@ -50,10 +50,18 @@ import {
   TypedMeshRpc,
   TypedClientStreamCall,
   TypedRequestStream,
+  TypedDuplexCall,
+  TypedDuplexSink,
+  TypedDuplexStream,
+  TypedResponseSink,
   type CallOptions,
   type RawMeshRpc,
   type RawClientStreamCall,
   type RawRequestStream,
+  type RawDuplexCall,
+  type RawDuplexSink,
+  type RawDuplexStream,
+  type RawResponseSink,
   type ServeHandle,
 } from '../mesh_rpc'
 
@@ -437,6 +445,12 @@ class StubRawMeshRpc implements RawMeshRpc {
   serveClientStream(): ServeHandle {
     throw new Error('serveClientStream not implemented in stub')
   }
+  async callDuplex(): Promise<never> {
+    throw new Error('callDuplex not implemented in stub')
+  }
+  serveDuplex(): ServeHandle {
+    throw new Error('serveDuplex not implemented in stub')
+  }
   serve(): ServeHandle {
     throw new Error('not implemented in stub')
   }
@@ -599,6 +613,12 @@ describe('AbortSignal wiring on the typed wrapper', () => {
     }
     serveClientStream(): ServeHandle {
       throw new Error('serveClientStream not implemented')
+    }
+    async callDuplex(): Promise<never> {
+      throw new Error('callDuplex not implemented')
+    }
+    serveDuplex(): ServeHandle {
+      throw new Error('serveDuplex not implemented')
     }
     serve(): ServeHandle {
       throw new Error('not implemented')
@@ -912,6 +932,10 @@ describe('TypedMeshRpc.serveClientStream', () => {
         installed = handler
         return { close: () => {}, isClosed: () => false }
       },
+      callDuplex: () => Promise.reject(new Error('not used')),
+      serveDuplex: () => {
+        throw new Error('not used')
+      },
       findServiceNodes: () => [],
       reserveCancelToken: () => 0n,
       cancelCall: () => {},
@@ -936,5 +960,274 @@ describe('TypedMeshRpc.serveClientStream', () => {
     ])
     const respBuf = await installed!(raw)
     expect(respBuf.toString('utf-8')).toBe('{"sum":42}')
+  })
+})
+
+// ============================================================================
+// TypedDuplexCall / TypedDuplexSink / TypedDuplexStream /
+// TypedResponseSink (S2-B2) — stub-level round-trip + split-halves
+// coverage. Live napi tests against a real MeshRpc belong in S2-X.
+// ============================================================================
+
+class StubResponseSink implements RawResponseSink {
+  public sent: Buffer[] = []
+  public closed = false
+  send(body: Buffer): boolean {
+    if (this.closed) return false
+    this.sent.push(Buffer.from(body))
+    return true
+  }
+}
+
+class StubDuplexSink implements RawDuplexSink {
+  public sent: Buffer[] = []
+  public finished = false
+  public closed = false
+  async send(body: Buffer): Promise<void> {
+    this.sent.push(Buffer.from(body))
+  }
+  async finish(): Promise<void> {
+    this.finished = true
+  }
+  async callId(): Promise<bigint> {
+    return 11n
+  }
+  async flowControlled(): Promise<boolean> {
+    return false
+  }
+  async close(): Promise<void> {
+    this.closed = true
+  }
+}
+
+class StubDuplexStream implements RawDuplexStream {
+  private chunks: (Buffer | null)[]
+  private idx = 0
+  public closed = false
+  constructor(chunks: (Buffer | null)[]) {
+    const lastIsNull =
+      chunks.length > 0 && chunks[chunks.length - 1] === null
+    this.chunks = lastIsNull ? chunks : [...chunks, null]
+  }
+  async next(): Promise<Buffer | null> {
+    if (this.idx >= this.chunks.length) return null
+    return this.chunks[this.idx++]
+  }
+  async callId(): Promise<bigint> {
+    return 12n
+  }
+  async close(): Promise<void> {
+    this.closed = true
+  }
+}
+
+class StubDuplexCall implements RawDuplexCall {
+  public sent: Buffer[] = []
+  public finishedSending = false
+  public closed = false
+  public sink: StubDuplexSink | null = null
+  public stream: StubDuplexStream
+  constructor(stream: StubDuplexStream) {
+    this.stream = stream
+  }
+  async send(body: Buffer): Promise<void> {
+    this.sent.push(Buffer.from(body))
+  }
+  async finishSending(): Promise<void> {
+    this.finishedSending = true
+  }
+  async next(): Promise<Buffer | null> {
+    return this.stream.next()
+  }
+  async intoSplit(): Promise<[RawDuplexSink, RawDuplexStream]> {
+    const sink = new StubDuplexSink()
+    this.sink = sink
+    return [sink, this.stream]
+  }
+  async callId(): Promise<bigint> {
+    return 13n
+  }
+  async flowControlled(): Promise<boolean> {
+    return false
+  }
+  async close(): Promise<void> {
+    this.closed = true
+  }
+}
+
+describe('TypedDuplexCall', () => {
+  it('round-trips: typed sends + typed responses', async () => {
+    const stream = new StubDuplexStream([
+      Buffer.from('{"r":"a"}'),
+      Buffer.from('{"r":"b"}'),
+    ])
+    const raw = new StubDuplexCall(stream)
+    const call = new TypedDuplexCall<{ q: number }, { r: string }>(raw)
+    await call.send({ q: 1 })
+    await call.send({ q: 2 })
+    await call.finishSending()
+    const collected: string[] = []
+    for await (const v of call) collected.push(v.r)
+    expect(collected).toEqual(['a', 'b'])
+    expect(raw.sent.map((b) => b.toString('utf-8'))).toEqual([
+      '{"q":1}',
+      '{"q":2}',
+    ])
+    expect(raw.finishedSending).toBe(true)
+  })
+
+  it('decode failure on next closes the underlying call', async () => {
+    const stream = new StubDuplexStream([Buffer.from('{not json')])
+    const raw = new StubDuplexCall(stream)
+    const call = new TypedDuplexCall(raw)
+    let caught: Error | null = null
+    try {
+      await call.next()
+    } catch (e) {
+      caught = e as Error
+    }
+    expect(caught).not.toBeNull()
+    const typed = classifyError(caught) as RpcCodecError
+    expect(typed).toBeInstanceOf(RpcCodecError)
+    expect(typed.direction).toBe('decode')
+    expect(raw.closed).toBe(true)
+    // Subsequent next() returns null instead of re-throwing.
+    expect(await call.next()).toBeNull()
+  })
+
+  it('intoSplit yields typed sink + stream halves', async () => {
+    const stream = new StubDuplexStream([
+      Buffer.from('{"r":"x"}'),
+      Buffer.from('{"r":"y"}'),
+    ])
+    const raw = new StubDuplexCall(stream)
+    const call = new TypedDuplexCall<{ q: number }, { r: string }>(raw)
+    const [sink, recvStream] = await call.intoSplit()
+    expect(sink).toBeInstanceOf(TypedDuplexSink)
+    expect(recvStream).toBeInstanceOf(TypedDuplexStream)
+    await sink.send({ q: 7 })
+    await sink.finish()
+    expect(raw.sink).not.toBeNull()
+    expect(raw.sink!.sent.length).toBe(1)
+    expect(raw.sink!.sent[0].toString('utf-8')).toBe('{"q":7}')
+    expect(raw.sink!.finished).toBe(true)
+    const collected: string[] = []
+    for await (const v of recvStream) collected.push(v.r)
+    expect(collected).toEqual(['x', 'y'])
+    // After intoSplit the original call is consumed; subsequent
+    // next() returns null and won't double-drain the stream.
+    expect(await call.next()).toBeNull()
+  })
+
+  it('close() is idempotent and swallows underlying errors', async () => {
+    const raw = new StubDuplexCall(new StubDuplexStream([]))
+    raw.close = async (): Promise<void> => {
+      throw new Error('nrpc:stream_closed: already closed')
+    }
+    const call = new TypedDuplexCall(raw)
+    await call.close()
+    await call.close()
+  })
+})
+
+describe('TypedResponseSink', () => {
+  it('JSON-encodes each send and returns true on enqueue', () => {
+    const raw = new StubResponseSink()
+    const sink = new TypedResponseSink<{ r: number }>(raw)
+    expect(sink.send({ r: 1 })).toBe(true)
+    expect(sink.send({ r: 2 })).toBe(true)
+    expect(raw.sent.map((b) => b.toString('utf-8'))).toEqual([
+      '{"r":1}',
+      '{"r":2}',
+    ])
+  })
+
+  it('returns false when the underlying raw sink is closed', () => {
+    const raw = new StubResponseSink()
+    raw.closed = true
+    const sink = new TypedResponseSink<{ r: number }>(raw)
+    expect(sink.send({ r: 1 })).toBe(false)
+    expect(raw.sent.length).toBe(0)
+  })
+
+  it('encode failure throws nrpc:codec_encode and does NOT enqueue', () => {
+    const raw = new StubResponseSink()
+    const sink = new TypedResponseSink<bigint>(raw)
+    let caught: Error | null = null
+    try {
+      sink.send(1n)
+    } catch (e) {
+      caught = e as Error
+    }
+    expect(caught).not.toBeNull()
+    expect(caught!.message.startsWith('nrpc:codec_encode:')).toBe(true)
+    expect(raw.sent.length).toBe(0)
+  })
+})
+
+describe('TypedMeshRpc.serveDuplex', () => {
+  it('destructures [stream, sink] and presents (stream, sink) to the handler', async () => {
+    let installed:
+      | ((
+          args: [RawRequestStream, RawResponseSink],
+        ) => Promise<Buffer>)
+      | undefined
+    const stub: RawMeshRpc = {
+      serve: () => {
+        throw new Error('not used')
+      },
+      call: () => Promise.reject(new Error('not used')),
+      callService: () => Promise.reject(new Error('not used')),
+      callStreaming: () => Promise.reject(new Error('not used')),
+      callClientStream: () => Promise.reject(new Error('not used')),
+      serveClientStream: () => {
+        throw new Error('not used')
+      },
+      callDuplex: () => Promise.reject(new Error('not used')),
+      serveDuplex: (
+        _service: string,
+        handler: (
+          args: [RawRequestStream, RawResponseSink],
+        ) => Promise<Buffer>,
+      ): ServeHandle => {
+        installed = handler
+        return { close: () => {}, isClosed: () => false }
+      },
+      findServiceNodes: () => [],
+      reserveCancelToken: () => 0n,
+      cancelCall: () => {},
+    }
+    const rpc = new TypedMeshRpc(stub)
+    let observed: { reqs: number[]; sent: string[] } | null = null
+    rpc.serveDuplex<{ q: number }, { r: string }>(
+      'echo',
+      async (stream, sink) => {
+        const reqs: number[] = []
+        const sent: string[] = []
+        for await (const req of stream) {
+          reqs.push(req.q)
+          const replied = sink.send({ r: `echo:${req.q}` })
+          if (replied) sent.push(`echo:${req.q}`)
+        }
+        observed = { reqs, sent }
+      },
+    )
+    expect(installed).toBeDefined()
+    const rawStream = new StubRequestStream([
+      Buffer.from('{"q":1}'),
+      Buffer.from('{"q":2}'),
+      Buffer.from('{"q":3}'),
+    ])
+    const rawSink = new StubResponseSink()
+    const termBuf = await installed!([rawStream, rawSink])
+    expect(observed).toEqual({ reqs: [1, 2, 3], sent: ['echo:1', 'echo:2', 'echo:3'] })
+    // Substrate discards the terminal Buffer for duplex; the
+    // wrapper returns an empty Buffer so the JS contract holds.
+    expect(termBuf.length).toBe(0)
+    expect(rawSink.sent.map((b) => b.toString('utf-8'))).toEqual([
+      '{"r":"echo:1"}',
+      '{"r":"echo:2"}',
+      '{"r":"echo:3"}',
+    ])
   })
 })

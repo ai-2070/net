@@ -160,6 +160,28 @@ export interface RawMeshRpc {
     service: string,
     handler: (stream: RawRequestStream) => Promise<Buffer>,
   ): ServeHandle
+  /**
+   * Open a duplex call. Both `requestWindowInitial` (upload flow
+   * control) and `streamWindowInitial` (download flow control)
+   * on `CallOptions` are independently opt-in.
+   */
+  callDuplex(
+    targetNodeId: bigint,
+    service: string,
+    opts?: CallOptions,
+  ): Promise<RawDuplexCall>
+  /**
+   * Register a duplex handler. The napi side passes a 2-tuple
+   * `[stream, sink]` to the handler (per the
+   * `DuplexHandlerArgs::ToNapiValue` impl in the napi binding).
+   * Handler returns a terminal Buffer that the substrate discards;
+   * intermediate chunks come from `sink.send`. Throw
+   * `appError(code, body)` to surface a typed Application status.
+   */
+  serveDuplex(
+    service: string,
+    handler: (args: [RawRequestStream, RawResponseSink]) => Promise<Buffer>,
+  ): ServeHandle
   findServiceNodes(service: string): bigint[]
   /** Mint a fresh cancel token (`bigint`). */
   reserveCancelToken(): bigint
@@ -195,6 +217,45 @@ export interface RawRequestStream {
   readonly callId: bigint
   readonly deadlineNs: bigint
   readonly headers: [string, Buffer][]
+}
+
+/**
+ * Raw napi `DuplexCall` — combined send + receive surface. Use
+ * `intoSplit` to separate into independent sink + stream halves.
+ */
+export interface RawDuplexCall {
+  send(body: Buffer): Promise<void>
+  finishSending(): Promise<void>
+  next(): Promise<Buffer | null>
+  intoSplit(): Promise<[RawDuplexSink, RawDuplexStream]>
+  callId(): Promise<bigint>
+  flowControlled(): Promise<boolean>
+  close(): Promise<void>
+}
+
+/** Send-half of a `RawDuplexCall` after `intoSplit`. */
+export interface RawDuplexSink {
+  send(body: Buffer): Promise<void>
+  finish(): Promise<void>
+  callId(): Promise<bigint>
+  flowControlled(): Promise<boolean>
+  close(): Promise<void>
+}
+
+/** Receive-half of a `RawDuplexCall` after `intoSplit`. */
+export interface RawDuplexStream {
+  next(): Promise<Buffer | null>
+  callId(): Promise<bigint>
+  close(): Promise<void>
+}
+
+/**
+ * Raw napi `JsResponseSink` — outbound side surfaced to duplex
+ * server handlers. Non-async (try_send under the hood; drops on
+ * mpsc overflow). Returns `false` if the sink has been closed.
+ */
+export interface RawResponseSink {
+  send(body: Buffer): boolean
 }
 
 /** Raw napi `RpcStream` — minimal shape consumed by `TypedRpcStream`. */
@@ -466,6 +527,66 @@ export class TypedMeshRpc {
         const typedStream = new TypedRequestStream<Req>(rawStream)
         const resp = await handler(typedStream)
         return jsonEncode(resp)
+      },
+    )
+  }
+
+  // ---- duplex (S2-B2) ----------------------------------------------------
+
+  /**
+   * Open a typed duplex call. Returns a `TypedDuplexCall<Req,
+   * Resp>` — push typed requests via `send`, pull typed responses
+   * via `next` (or `for await`), or `intoSplit` to separate the
+   * halves for the encoder-task / decoder-task pattern.
+   *
+   * Cancellation: same `.close()`-only contract as
+   * `callClientStream` (locked decision #2). `opts.signal` is
+   * stripped before reaching the raw layer; invoke
+   * `typedCall.close()` to abort an in-flight duplex.
+   */
+  async callDuplex<Req = unknown, Resp = unknown>(
+    targetNodeId: bigint,
+    service: string,
+    opts?: CallOptions,
+  ): Promise<TypedDuplexCall<Req, Resp>> {
+    const rawCall = await this._raw.callDuplex(
+      targetNodeId,
+      service,
+      stripSignal(opts),
+    )
+    return new TypedDuplexCall<Req, Resp>(rawCall)
+  }
+
+  /**
+   * Register a typed duplex handler. The user signature is
+   * `(stream: TypedRequestStream<Req>, sink: TypedResponseSink<Resp>) => Promise<void>`
+   * — the wrapper destructures the napi-side `[stream, sink]`
+   * tuple internally so the user handler never sees the array
+   * form. Handler return is `void`; the substrate emits the
+   * terminal frame automatically. To surface a typed Application
+   * status, throw `appError(code, body)` from the handler.
+   */
+  serveDuplex<Req = unknown, Resp = unknown>(
+    service: string,
+    handler: (
+      stream: TypedRequestStream<Req>,
+      sink: TypedResponseSink<Resp>,
+    ) => Promise<void>,
+  ): ServeHandle {
+    return this._raw.serveDuplex(
+      service,
+      async ([rawStream, rawSink]: [
+        RawRequestStream,
+        RawResponseSink,
+      ]): Promise<Buffer> => {
+        const typedStream = new TypedRequestStream<Req>(rawStream)
+        const typedSink = new TypedResponseSink<Resp>(rawSink)
+        await handler(typedStream, typedSink)
+        // The napi side discards the terminal Buffer for duplex
+        // handlers (only the Ok/Err outcome matters — see
+        // NodeDuplexRpcHandler at bindings/node/src/mesh_rpc.rs).
+        // Return an empty Buffer so the JS signature is satisfied.
+        return DUPLEX_TERMINAL_SENTINEL
       },
     )
   }
@@ -757,6 +878,305 @@ export class TypedRequestStream<Req = unknown>
       if (value === null) return
       yield value
     }
+  }
+}
+
+// ============================================================================
+// TypedDuplexCall + TypedDuplexSink + TypedDuplexStream +
+// TypedResponseSink (S2-B2).
+//
+// Duplex: caller pushes Reqs and pulls Resps concurrently on a
+// single call. `intoSplit` separates the halves for the encoder-
+// task / decoder-task pattern where each half lives in its own
+// async task.
+//
+// Cancellation contract (locked decision #2): v1 `.close()`-only,
+// same as client-streaming.
+// ============================================================================
+
+/**
+ * Constant sentinel returned by the duplex serve-handler shim.
+ * The napi `NodeDuplexRpcHandler` discards the terminal Buffer
+ * (only the Ok/Err outcome matters for duplex), so a stable
+ * empty Buffer is enough.
+ */
+const DUPLEX_TERMINAL_SENTINEL = Buffer.alloc(0)
+
+/**
+ * Typed duplex call handle. Push typed requests via `send`,
+ * pull typed responses via `next` or `for await`, or call
+ * `intoSplit` to peel off independent sink + stream halves.
+ *
+ * After `intoSplit` returns, this call is "consumed" — calling
+ * `send` / `finishSending` / `next` / `close` on it throws.
+ */
+export class TypedDuplexCall<Req = unknown, Resp = unknown>
+  implements AsyncIterable<Resp>
+{
+  private readonly _raw: RawDuplexCall
+  private _done: boolean
+
+  constructor(rawCall: RawDuplexCall) {
+    this._raw = rawCall
+    this._done = false
+  }
+
+  /** Underlying raw call for users who want the Buffer-level surface. */
+  get raw(): RawDuplexCall {
+    return this._raw
+  }
+
+  /** Encode + push one request chunk. */
+  async send(value: Req): Promise<void> {
+    const buf = jsonEncode(value)
+    await this._raw.send(buf)
+  }
+
+  /** Close the upload direction (emit REQUEST_END). */
+  async finishSending(): Promise<void> {
+    await this._raw.finishSending()
+  }
+
+  /**
+   * Pull the next decoded response. Returns `null` on clean EOF.
+   * Decode failure throws `nrpc:codec_decode:` and closes the
+   * underlying duplex call — subsequent `next()` returns `null`.
+   */
+  async next(): Promise<Resp | null> {
+    if (this._done) return null
+    let buf: Buffer | null
+    try {
+      buf = await this._raw.next()
+    } catch (e) {
+      this._done = true
+      throw e
+    }
+    if (buf === null || buf === undefined) {
+      this._done = true
+      return null
+    }
+    try {
+      return jsonDecode(buf) as Resp
+    } catch (e) {
+      this._done = true
+      try {
+        await this._raw.close()
+      } catch {
+        /* swallow — best-effort */
+      }
+      throw e
+    }
+  }
+
+  /** Async iterator support over the response stream. */
+  async *[Symbol.asyncIterator](): AsyncIterator<Resp> {
+    while (true) {
+      const value = await this.next()
+      if (value === null) return
+      yield value
+    }
+  }
+
+  /**
+   * Split the duplex into independent typed sink + stream halves.
+   * After return, this `TypedDuplexCall` is consumed — subsequent
+   * `send` / `finishSending` / `next` throw `stream_closed`.
+   * CANCEL fires only when BOTH split halves drop without
+   * observing the response stream's terminal frame.
+   */
+  async intoSplit(): Promise<
+    [TypedDuplexSink<Req>, TypedDuplexStream<Resp>]
+  > {
+    const [rawSink, rawStream] = await this._raw.intoSplit()
+    this._done = true
+    return [
+      new TypedDuplexSink<Req>(rawSink),
+      new TypedDuplexStream<Resp>(rawStream),
+    ]
+  }
+
+  /** Server-assigned `call_id`. */
+  async callId(): Promise<bigint> {
+    return await this._raw.callId()
+  }
+
+  /**
+   * `true` if the call was opened with non-`None`
+   * `requestWindowInitial`. Reports the UPLOAD-direction
+   * flow-control state.
+   */
+  async flowControlled(): Promise<boolean> {
+    return await this._raw.flowControlled()
+  }
+
+  /**
+   * Close without observing the response terminator. Fires
+   * CANCEL on the wire. Idempotent. Concurrent in-flight
+   * `send()` awaiting credit observes `stream_closed`.
+   */
+  async close(): Promise<void> {
+    this._done = true
+    try {
+      await this._raw.close()
+    } catch {
+      /* swallow — best-effort */
+    }
+  }
+}
+
+/** Send-half of a typed duplex call after `intoSplit`. */
+export class TypedDuplexSink<Req = unknown> {
+  private readonly _raw: RawDuplexSink
+
+  constructor(rawSink: RawDuplexSink) {
+    this._raw = rawSink
+  }
+
+  /** Underlying raw sink for Buffer-level access. */
+  get raw(): RawDuplexSink {
+    return this._raw
+  }
+
+  /** Encode + push one request chunk. */
+  async send(value: Req): Promise<void> {
+    const buf = jsonEncode(value)
+    await this._raw.send(buf)
+  }
+
+  /** Close the upload direction (emit REQUEST_END). */
+  async finish(): Promise<void> {
+    await this._raw.finish()
+  }
+
+  /** Server-assigned `call_id`. */
+  async callId(): Promise<bigint> {
+    return await this._raw.callId()
+  }
+
+  /** `true` if the call was opened with `requestWindowInitial`. */
+  async flowControlled(): Promise<boolean> {
+    return await this._raw.flowControlled()
+  }
+
+  /**
+   * Close without emitting REQUEST_END. Idempotent. Concurrent
+   * in-flight `send()` awaiting credit observes `stream_closed`.
+   */
+  async close(): Promise<void> {
+    try {
+      await this._raw.close()
+    } catch {
+      /* swallow — best-effort */
+    }
+  }
+}
+
+/** Receive-half of a typed duplex call after `intoSplit`. */
+export class TypedDuplexStream<Resp = unknown>
+  implements AsyncIterable<Resp>
+{
+  private readonly _raw: RawDuplexStream
+  private _done: boolean
+
+  constructor(rawStream: RawDuplexStream) {
+    this._raw = rawStream
+    this._done = false
+  }
+
+  /** Underlying raw stream for Buffer-level access. */
+  get raw(): RawDuplexStream {
+    return this._raw
+  }
+
+  /**
+   * Pull the next decoded response. Returns `null` on clean EOF.
+   * Decode failure throws `nrpc:codec_decode:` and closes the
+   * underlying stream.
+   */
+  async next(): Promise<Resp | null> {
+    if (this._done) return null
+    let buf: Buffer | null
+    try {
+      buf = await this._raw.next()
+    } catch (e) {
+      this._done = true
+      throw e
+    }
+    if (buf === null || buf === undefined) {
+      this._done = true
+      return null
+    }
+    try {
+      return jsonDecode(buf) as Resp
+    } catch (e) {
+      this._done = true
+      try {
+        await this._raw.close()
+      } catch {
+        /* swallow — best-effort */
+      }
+      throw e
+    }
+  }
+
+  /** Async iterator support over the response stream. */
+  async *[Symbol.asyncIterator](): AsyncIterator<Resp> {
+    while (true) {
+      const value = await this.next()
+      if (value === null) return
+      yield value
+    }
+  }
+
+  /** Server-assigned `call_id`. */
+  async callId(): Promise<bigint> {
+    return await this._raw.callId()
+  }
+
+  /** Close the stream. Idempotent. */
+  async close(): Promise<void> {
+    this._done = true
+    try {
+      await this._raw.close()
+    } catch {
+      /* swallow — best-effort */
+    }
+  }
+}
+
+/**
+ * Typed outbound response sink for duplex server handlers.
+ * Non-async — mirrors `RawResponseSink.send`. Returns `true`
+ * when the chunk was enqueued; `false` if the underlying sink
+ * is closed. Encode failure throws `nrpc:codec_encode:` and the
+ * chunk is NOT sent.
+ *
+ * Flow control: the underlying sink `try_send`s into a bounded
+ * 1024-chunk mpsc; bursts past the credit window are dropped
+ * (counted by `streaming_chunks_dropped_total`). Pace your
+ * `send` calls via REQUEST_GRANT cadence for lossless flow
+ * control.
+ */
+export class TypedResponseSink<Resp = unknown> {
+  private readonly _raw: RawResponseSink
+
+  constructor(rawSink: RawResponseSink) {
+    this._raw = rawSink
+  }
+
+  /** Underlying raw sink for Buffer-level access. */
+  get raw(): RawResponseSink {
+    return this._raw
+  }
+
+  /**
+   * Encode + emit one response chunk. Returns `true` on
+   * successful enqueue; `false` if the sink has been closed.
+   * Throws `nrpc:codec_encode:` on encoding failure.
+   */
+  send(value: Resp): boolean {
+    const buf = jsonEncode(value)
+    return this._raw.send(buf)
   }
 }
 
