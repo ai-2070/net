@@ -32,6 +32,18 @@ pub(crate) fn parse_u16_flexible(s: &str) -> Result<u16, String> {
     }
 }
 
+/// Decode a 32-byte literal from hex. Accepts an optional `0x`
+/// prefix; rejects any other length. Shared between
+/// `--psk-hex` / `--node-pubkey` / `--group-seed` so the error
+/// shape matches operator-facing copy across commands.
+pub(crate) fn hex_decode_32(s: &str) -> Result<[u8; 32], String> {
+    let trimmed = s.trim().trim_start_matches("0x").trim_start_matches("0X");
+    let bytes = hex::decode(trimmed).map_err(|e| format!("invalid hex: {e}"))?;
+    bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("expected 32 bytes, got {}", v.len()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

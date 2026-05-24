@@ -136,6 +136,16 @@ pub use ::net::adapter::net::{
 #[cfg(feature = "net")]
 pub use crate::mesh::{Mesh, MeshBuilder, SubscribeOptions};
 
+// Raw substrate handle. The SDK's `Mesh` is the ergonomic
+// front-door, but typed RPC clients (`RegistryClient`,
+// `FoldQueryClient`) and FFI bindings want the underlying
+// `Arc<MeshNode>` directly — `Mesh::node_arc()` hands one out.
+// Re-exporting here lets downstream consumers (the CLI's
+// remote-attach context, in particular) name the type without
+// reaching into `::net::adapter::net` themselves.
+#[cfg(feature = "net")]
+pub use ::net::adapter::net::MeshNode;
+
 // Compute surface — `MeshDaemon` trait + runtime. Gated by the
 // `compute` feature (which depends on `net`).
 #[cfg(feature = "compute")]

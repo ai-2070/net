@@ -22,6 +22,7 @@ net-sdk = { package = "net-mesh-sdk", version = "0.21.0", path = "../sdk", defau
     "deck",
     "dataforts",
     "meshdb",
+    "aggregator",
 ] }
 
 # Clap derives the argv parser from typed structs; `env` enables
@@ -105,3 +106,8 @@ tokio = { version = "1", features = [
     "time",
     "test-util",
 ] }
+
+# Boot the aggregator-daemon in-process for the remote-attach
+# integration test (`tests/aggregator_remote.rs`). The CLI
+# subprocess handshakes against this booted daemon's MeshNode.
+net-aggregator-daemon = { version = "0.21.0", path = "../aggregator-daemon" }

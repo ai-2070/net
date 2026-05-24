@@ -36,31 +36,65 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
-use crate::context::{resolve_profile, CliContext};
-use crate::error::{generic, invalid_args, CliError};
+use crate::context::{resolve_profile, resolve_remote_attach, CliContext, RemoteAttach};
+use crate::error::{generic, invalid_args, sdk, CliError};
 use crate::parsers::{parse_u16_flexible, parse_u64_flexible};
 use crate::prelude::{emit_value, OutputFormat};
+
+/// Flags every aggregator verb accepts for remote-attach. Each
+/// is also resolvable from the profile (`node_addr` / `node_pubkey`
+/// / `node_id` / `psk_hex`) — the CLI flag wins when both are
+/// set. Resolution is centralised in
+/// [`crate::context::resolve_remote_attach`]; when every field is
+/// `None` and the profile has no defaults, the subcommand runs
+/// in-process.
+#[derive(Args, Debug, Default)]
+pub struct RemoteAttachArgs {
+    /// Remote daemon `IP:port`. Operators copy this from the
+    /// daemon's `--print-bootstrap` output.
+    #[arg(long)]
+    pub node_addr: Option<String>,
+    /// Remote daemon's Noise public key (64 hex chars, optional
+    /// `0x` prefix).
+    #[arg(long)]
+    pub node_pubkey: Option<String>,
+    /// Remote daemon's `node_id` (decimal or `0x`-prefixed hex).
+    #[arg(long = "node-id")]
+    pub remote_node_id: Option<String>,
+    /// 32-byte pre-shared key as hex. Required when handshaking
+    /// with a remote daemon; profile-level `psk_hex` covers the
+    /// common case.
+    #[arg(long)]
+    pub psk_hex: Option<String>,
+}
 
 #[derive(Subcommand, Debug)]
 pub enum AggregatorCommand {
     /// Show the local aggregator's state (source subnet, fold
     /// kinds, generation, summary cadence, recent summaries).
     Inspect(InspectArgs),
-    /// \[preview\] Issue a `fold.query` RPC against a remote
-    /// aggregator. Today this validates flags then errors —
-    /// the substrate call path needs a MeshNode wired into the
-    /// deck, which the read-only CLI doesn't carry yet.
+    /// Issue a `fold.query` RPC against a remote aggregator.
+    /// Requires `--node-addr` + `--node-pubkey` + `--node-id` +
+    /// `--psk-hex` (or the matching profile fields). Output is
+    /// the buffered `SummaryAnnouncement` list from the target
+    /// aggregator; pass `--fresh` to force a `SummarizeNow` tick
+    /// instead of the latest cached buffer.
     Query(QueryArgs),
     /// List aggregator groups registered on the local node's
     /// `AggregatorRegistry`. Output includes per-replica health
     /// + generation. Empty when no registry is installed.
     Ls(LsArgs),
-    /// \[preview\] Spawn a new aggregator group. Validates args
-    /// then errors — needs a daemon process to host the live
-    /// group + registry.
+    /// Spawn a new aggregator group on a remote daemon by
+    /// referencing one of its operator-configured `[[template]]`
+    /// blocks. The daemon resolves the template, builds the
+    /// group with the operator-chosen `--name`, and returns its
+    /// initial snapshot. Requires the same remote-attach flags
+    /// as `query`.
     Spawn(SpawnArgs),
-    /// \[preview\] Resize an existing group. Validates args
-    /// then errors — needs registry-RPC plumbing.
+    /// Resize an existing aggregator group on a remote daemon
+    /// to the supplied `--replica-count`. Today implemented as
+    /// Unregister + Spawn (interim — `B-5` flips to the
+    /// dedicated `Scale` RPC once the substrate helper lands).
     Scale(ScaleArgs),
 }
 
@@ -80,6 +114,16 @@ pub struct LsArgs {
 
     #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
     pub node: u64,
+
+    /// When set (or implicit via `--node-addr`), route `ls`
+    /// through the registry RPC against the remote daemon
+    /// rather than reading the local registry snapshot. Wired
+    /// in A-5.
+    #[arg(long, default_value_t = false)]
+    pub remote: bool,
+
+    #[command(flatten)]
+    pub attach: RemoteAttachArgs,
 }
 
 #[derive(Args, Debug)]
@@ -88,25 +132,24 @@ pub struct SpawnArgs {
     /// target node's registry.
     #[arg(long)]
     pub name: String,
+    /// Daemon-side template (a `[[template]]` block in the
+    /// daemon's config) to instantiate. The template owns
+    /// `source_subnet` + `fold_kinds` + cadence; the operator
+    /// only picks how many replicas and what to call the group.
+    #[arg(long)]
+    pub template: String,
     /// Number of replicas to spawn. `1..=255`.
     #[arg(long)]
     pub replica_count: u8,
-    /// `SubnetId` the aggregator summarizes — accepts dotted
-    /// notation (e.g. `3.7`) or decimal.
-    #[arg(long)]
-    pub source_subnet: String,
-    /// 32-byte group seed as hex (64 chars). Optional — when
-    /// omitted, the CLI would derive one from `name`. (Today
-    /// `spawn` errors before reaching the derivation, so the
-    /// flag is parse-only.)
-    #[arg(long)]
-    pub group_seed: Option<String>,
 
     #[arg(long)]
     pub identity: Option<PathBuf>,
 
     #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
     pub node: u64,
+
+    #[command(flatten)]
+    pub attach: RemoteAttachArgs,
 }
 
 #[derive(Args, Debug)]
@@ -114,6 +157,12 @@ pub struct ScaleArgs {
     /// Group name to resize.
     #[arg(long)]
     pub name: String,
+    /// Daemon-side template the group was spawned from. The
+    /// interim path needs this to re-spawn after unregistering;
+    /// B-5 drops the requirement when the dedicated `Scale` RPC
+    /// lands and the daemon can look the spec up by group name.
+    #[arg(long)]
+    pub template: String,
     /// Target replica count. `1..=255`.
     #[arg(long)]
     pub replica_count: u8,
@@ -123,6 +172,9 @@ pub struct ScaleArgs {
 
     #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
     pub node: u64,
+
+    #[command(flatten)]
+    pub attach: RemoteAttachArgs,
 }
 
 #[derive(Args, Debug)]
@@ -145,6 +197,9 @@ pub struct QueryArgs {
 
     #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
     pub node: u64,
+
+    #[command(flatten)]
+    pub attach: RemoteAttachArgs,
 }
 
 pub async fn run(
@@ -209,29 +264,78 @@ async fn run_inspect(
 
 async fn run_query(
     args: QueryArgs,
-    _output: Option<OutputFormat>,
-    _config_path: Option<&std::path::Path>,
-    _profile_name: &str,
+    output: Option<OutputFormat>,
+    config_path: Option<&std::path::Path>,
+    profile_name: &str,
 ) -> Result<(), CliError> {
-    // Validate inputs up-front so the operator sees concrete
-    // parse errors rather than a generic "not supported."
-    let _target = parse_u64_flexible(&args.target)
+    let target = parse_u64_flexible(&args.target)
         .map_err(|e| invalid_args(format!("target `{}`: {e}", args.target)))?;
-    let _kind = parse_u16_flexible(&args.kind)
+    let kind = parse_u16_flexible(&args.kind)
         .map_err(|e| invalid_args(format!("kind `{}`: {e}", args.kind)))?;
-    // The query path needs a `MeshNode` wired into the
-    // DeckClient (so the substrate can route the RPC). The
-    // CliContext's deck doesn't carry one today — same gap
-    // documented on every other write-or-call surface. Return
-    // a typed error rather than crash the FoldQueryClient on
-    // an empty handle.
-    Err(invalid_args(
-        "net aggregator query is read-validation-only today: the target / \
-         kind / --fresh flags parse correctly but the substrate call path \
-         needs a MeshNode wired into the deck's DeckClient. CliContext::build \
-         doesn't construct one in-process yet; when the in-process MeshNode \
-         bootstrap lands (or remote-attach), this command flips to live.",
-    ))
+
+    let profile = resolve_profile(config_path, profile_name).await?;
+    let remote = require_remote_attach(&profile, &args.attach, "query")?;
+    let ctx = CliContext::build_with_remote(
+        &profile,
+        args.identity.as_deref(),
+        args.node,
+        false,
+        remote,
+    )
+    .await?;
+    let mesh = ctx.mesh_node().ok_or_else(|| {
+        sdk("internal: remote-attach context returned no mesh_node — should be unreachable")
+    })?;
+
+    use net_sdk::aggregator::FoldQueryClient;
+    let client = FoldQueryClient::new(mesh);
+    let summaries = if args.fresh {
+        client
+            .query_summarize_now(target, kind)
+            .await
+            .map_err(|e| sdk(format!("fold.query (summarize-now) failed: {e}")))?
+    } else {
+        client
+            .query_latest(target, kind)
+            .await
+            .map_err(|e| sdk(format!("fold.query (latest) failed: {e}")))?
+    };
+
+    let view = QueryView {
+        target_node_id: target,
+        fold_kind: format!("{kind:#06x}"),
+        fresh: args.fresh,
+        summary_count: summaries.len() as u64,
+        summaries: summaries.into_iter().map(SummaryRow::from).collect(),
+    };
+    emit_value(OutputFormat::resolve_oneshot(output), &view)
+        .map_err(|e| generic(format!("write aggregator query: {e}")))?;
+    Ok(())
+}
+
+/// Resolve remote-attach for a verb that requires one. The
+/// `verb` arg goes into the error message so the operator sees
+/// which subcommand needed the missing flag.
+fn require_remote_attach(
+    profile: &crate::config::Profile,
+    args: &RemoteAttachArgs,
+    verb: &str,
+) -> Result<RemoteAttach, CliError> {
+    let resolved = resolve_remote_attach(
+        profile,
+        args.node_addr.as_deref(),
+        args.node_pubkey.as_deref(),
+        args.remote_node_id.as_deref(),
+        args.psk_hex.as_deref(),
+    )?;
+    resolved.ok_or_else(|| {
+        invalid_args(format!(
+            "net aggregator {verb} needs a remote daemon target: pass \
+             --node-addr <IP:PORT> --node-pubkey <HEX> --node-id <N> \
+             --psk-hex <HEX> (each can be defaulted in the profile as \
+             `node_addr` / `node_pubkey` / `node_id` / `psk_hex`)."
+        ))
+    })
 }
 
 async fn run_ls(
@@ -241,6 +345,13 @@ async fn run_ls(
     profile_name: &str,
 ) -> Result<(), CliError> {
     let profile = resolve_profile(config_path, profile_name).await?;
+    // --remote flips the path; --node-addr implies --remote so
+    // an operator who supplied attach flags doesn't accidentally
+    // read the local registry.
+    let want_remote = args.remote || args.attach.node_addr.is_some();
+    if want_remote {
+        return run_ls_remote(args, output, &profile).await;
+    }
     let ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
     let deck = ctx.deck();
     let snapshot = deck.aggregator_registry_snapshot().await;
@@ -261,65 +372,154 @@ async fn run_ls(
     Ok(())
 }
 
+async fn run_ls_remote(
+    args: LsArgs,
+    output: Option<OutputFormat>,
+    profile: &crate::config::Profile,
+) -> Result<(), CliError> {
+    let remote = require_remote_attach(profile, &args.attach, "ls --remote")?;
+    let target_node_id = remote.node_id;
+    let ctx = CliContext::build_with_remote(
+        profile,
+        args.identity.as_deref(),
+        args.node,
+        false,
+        remote,
+    )
+    .await?;
+    let mesh = ctx.mesh_node().ok_or_else(|| {
+        sdk("internal: remote-attach context returned no mesh_node — should be unreachable")
+    })?;
+
+    use net_sdk::aggregator::RegistryClient;
+    let client = RegistryClient::new(mesh);
+    let groups = client
+        .list(target_node_id)
+        .await
+        .map_err(|e| sdk(format!("aggregator.registry list failed: {e}")))?;
+
+    let view = RemoteLsView {
+        target_node_id,
+        group_count: groups.len() as u64,
+        groups: groups.iter().map(RemoteLsGroupRow::from).collect(),
+    };
+    emit_value(OutputFormat::resolve_oneshot(output), &view)
+        .map_err(|e| generic(format!("write aggregator ls --remote: {e}")))?;
+    Ok(())
+}
+
 async fn run_spawn(
     args: SpawnArgs,
-    _output: Option<OutputFormat>,
-    _config_path: Option<&std::path::Path>,
-    _profile_name: &str,
+    output: Option<OutputFormat>,
+    config_path: Option<&std::path::Path>,
+    profile_name: &str,
 ) -> Result<(), CliError> {
-    // Validate inputs up-front so the operator sees concrete
-    // parse errors rather than a generic "not supported."
     if args.replica_count == 0 {
         return Err(invalid_args("replica_count must be > 0"));
     }
-    // SubnetId parse — accepts "global" or dotted u8 levels.
-    use std::str::FromStr;
-    net_sdk::subnets::SubnetId::from_str(&args.source_subnet)
-        .map_err(|e| invalid_args(format!("source_subnet `{}`: {e}", args.source_subnet)))?;
-    // group_seed parse if provided.
-    if let Some(ref seed) = args.group_seed {
-        let trimmed = seed.trim_start_matches("0x");
-        let bytes = hex_decode_32(trimmed)
-            .map_err(|e| invalid_args(format!("group_seed `{seed}`: {e}")))?;
-        let _: [u8; 32] = bytes;
+    if args.template.trim().is_empty() {
+        return Err(invalid_args("--template must not be empty"));
     }
-    Err(invalid_args(format!(
-        "net aggregator spawn is parse-only today: args validated (name={}, \
-         replica_count={}, source_subnet={}) but the substrate call path \
-         needs a daemon process hosting an AggregatorRegistry + a registry-RPC \
-         surface so the CLI can invoke `register` remotely. Tracked in \
-         AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md.",
-        args.name, args.replica_count, args.source_subnet,
-    )))
+    if args.name.trim().is_empty() {
+        return Err(invalid_args("--name must not be empty"));
+    }
+
+    let profile = resolve_profile(config_path, profile_name).await?;
+    let remote = require_remote_attach(&profile, &args.attach, "spawn")?;
+    let target_node_id = remote.node_id;
+    let ctx = CliContext::build_with_remote(
+        &profile,
+        args.identity.as_deref(),
+        args.node,
+        false,
+        remote,
+    )
+    .await?;
+    let mesh = ctx.mesh_node().ok_or_else(|| {
+        sdk("internal: remote-attach context returned no mesh_node — should be unreachable")
+    })?;
+
+    use net_sdk::aggregator::RegistryClient;
+    let client = RegistryClient::new(mesh);
+    let summary = client
+        .spawn(target_node_id, args.template, args.name, args.replica_count)
+        .await
+        .map_err(|e| sdk(format!("aggregator.registry spawn failed: {e}")))?;
+
+    let view = SpawnView::from(&summary);
+    emit_value(OutputFormat::resolve_oneshot(output), &view)
+        .map_err(|e| generic(format!("write aggregator spawn: {e}")))?;
+    Ok(())
 }
 
 async fn run_scale(
     args: ScaleArgs,
-    _output: Option<OutputFormat>,
-    _config_path: Option<&std::path::Path>,
-    _profile_name: &str,
+    output: Option<OutputFormat>,
+    config_path: Option<&std::path::Path>,
+    profile_name: &str,
 ) -> Result<(), CliError> {
     if args.replica_count == 0 {
         return Err(invalid_args("replica_count must be > 0"));
     }
-    Err(invalid_args(format!(
-        "net aggregator scale is parse-only today: args validated (name={}, \
-         replica_count={}) but the substrate path needs the same daemon + \
-         registry-RPC plumbing as spawn. Tracked in \
-         AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md.",
-        args.name, args.replica_count,
-    )))
-}
+    if args.template.trim().is_empty() {
+        return Err(invalid_args("--template must not be empty"));
+    }
+    if args.name.trim().is_empty() {
+        return Err(invalid_args("--name must not be empty"));
+    }
 
-/// Hex-decode 32 bytes from a 64-char string. Used by
-/// `spawn --group-seed`. Wraps `hex::decode` + a length check
-/// so the error path matches `psk_hex` / `group_seed`
-/// elsewhere.
-fn hex_decode_32(s: &str) -> Result<[u8; 32], String> {
-    hex::decode(s)
-        .map_err(|e| format!("invalid hex: {e}"))?
-        .try_into()
-        .map_err(|v: Vec<u8>| format!("expected 32 bytes, got {}", v.len()))
+    let profile = resolve_profile(config_path, profile_name).await?;
+    let remote = require_remote_attach(&profile, &args.attach, "scale")?;
+    let target_node_id = remote.node_id;
+    let ctx = CliContext::build_with_remote(
+        &profile,
+        args.identity.as_deref(),
+        args.node,
+        false,
+        remote,
+    )
+    .await?;
+    let mesh = ctx.mesh_node().ok_or_else(|| {
+        sdk("internal: remote-attach context returned no mesh_node — should be unreachable")
+    })?;
+
+    // Interim path: Unregister + Spawn. The dedicated `Scale`
+    // RPC in B-5 collapses these into one atomic call and
+    // preserves identity for replicas that survive the resize.
+    use net_sdk::aggregator::RegistryClient;
+    let client = RegistryClient::new(mesh);
+    let existed = client
+        .unregister(target_node_id, args.name.clone())
+        .await
+        .map_err(|e| sdk(format!("aggregator.registry unregister failed: {e}")))?;
+    if !existed {
+        return Err(sdk(format!(
+            "aggregator group `{}` is not registered on target node {}",
+            args.name, target_node_id
+        )));
+    }
+    let summary = client
+        .spawn(
+            target_node_id,
+            args.template.clone(),
+            args.name.clone(),
+            args.replica_count,
+        )
+        .await
+        .map_err(|e| {
+            sdk(format!(
+                "aggregator.registry spawn after unregister failed: {e} — \
+                 NOTE: the group was unregistered before the failure; \
+                 re-run `net aggregator spawn --name {} --template {} \
+                 --replica-count {}` to restore",
+                args.name, args.template, args.replica_count
+            ))
+        })?;
+
+    let view = SpawnView::from(&summary);
+    emit_value(OutputFormat::resolve_oneshot(output), &view)
+        .map_err(|e| generic(format!("write aggregator scale: {e}")))?;
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -386,6 +586,108 @@ impl From<&net_sdk::deck::AggregatorReplicaRow> for LsReplicaRow {
             placement_node_id: r.placement_node_id,
         }
     }
+}
+
+#[derive(Serialize)]
+struct RemoteLsView {
+    /// Echo of the remote target.
+    target_node_id: u64,
+    group_count: u64,
+    groups: Vec<RemoteLsGroupRow>,
+}
+
+#[derive(Serialize)]
+struct RemoteLsGroupRow {
+    name: String,
+    group_seed: String,
+    healthy_count: u64,
+    replica_count: u64,
+    /// Per-replica rows. Source-subnet + fold-kinds aren't on
+    /// the wire today; B-2 extends `RegistryGroupSummary` and
+    /// this row picks them up automatically once that lands.
+    replicas: Vec<RemoteReplicaRow>,
+}
+
+impl From<&net_sdk::aggregator::RegistryGroupSummary> for RemoteLsGroupRow {
+    fn from(g: &net_sdk::aggregator::RegistryGroupSummary) -> Self {
+        let replicas: Vec<RemoteReplicaRow> = g.replicas.iter().map(RemoteReplicaRow::from).collect();
+        let healthy_count = replicas.iter().filter(|r| r.healthy).count() as u64;
+        Self {
+            name: g.name.clone(),
+            group_seed: hex::encode(g.group_seed),
+            healthy_count,
+            replica_count: replicas.len() as u64,
+            replicas,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SpawnView {
+    /// Echo of the group the daemon registered.
+    name: String,
+    /// 64-char hex rendering of the daemon-side-derived group
+    /// seed (today: `blake3(name)` — the daemon owns the
+    /// derivation, the operator just sees the resulting bytes).
+    group_seed: String,
+    replica_count: u64,
+    /// Per-replica rows — same shape as `ls`'s output so
+    /// consumers can reuse parsers.
+    replicas: Vec<RemoteReplicaRow>,
+}
+
+impl From<&net_sdk::aggregator::RegistryGroupSummary> for SpawnView {
+    fn from(g: &net_sdk::aggregator::RegistryGroupSummary) -> Self {
+        Self {
+            name: g.name.clone(),
+            group_seed: hex::encode(g.group_seed),
+            replica_count: g.replicas.len() as u64,
+            replicas: g.replicas.iter().map(RemoteReplicaRow::from).collect(),
+        }
+    }
+}
+
+/// Wire-shape replica row. Distinct from [`LsReplicaRow`] because
+/// the local snapshot ([`net_sdk::deck::AggregatorReplicaRow`])
+/// and the wire reply
+/// ([`net_sdk::aggregator::RegistryReplicaSummary`]) have
+/// different field sets; this row mirrors the wire reply.
+#[derive(Serialize)]
+struct RemoteReplicaRow {
+    generation: u64,
+    healthy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    placement_node_id: Option<u64>,
+}
+
+impl From<&net_sdk::aggregator::RegistryReplicaSummary> for RemoteReplicaRow {
+    fn from(r: &net_sdk::aggregator::RegistryReplicaSummary) -> Self {
+        Self {
+            generation: r.generation,
+            healthy: r.healthy,
+            diagnostic: r.diagnostic.clone(),
+            placement_node_id: r.placement_node_id,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct QueryView {
+    /// Echo of the resolved target node so the operator can
+    /// diff their flag input against what the RPC actually hit.
+    target_node_id: u64,
+    /// `FoldKind::KIND_ID` formatted as `0x____`.
+    fold_kind: String,
+    /// `true` when the call used `SummarizeNow` (cache-bypass).
+    fresh: bool,
+    /// Convenience — `summaries.len()` rendered as its own field.
+    summary_count: u64,
+    /// Aggregator's buffered summaries (latest cadence) — same
+    /// row shape as `inspect`'s output so consumers can reuse
+    /// downstream parsers.
+    summaries: Vec<SummaryRow>,
 }
 
 #[derive(Serialize)]

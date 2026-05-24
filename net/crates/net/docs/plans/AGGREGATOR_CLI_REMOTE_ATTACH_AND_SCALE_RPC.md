@@ -407,6 +407,20 @@ Mirrors the existing `list_round_trips_two_registered_groups_across_handshake` s
 
 ---
 
+## Discovered substrate gap — direct-handshake responder
+
+Surfaced during A-6 integration testing: the substrate's dispatch loop drops direct handshake msg1 packets from peers it hasn't pre-`accept()`ed (`mesh.rs:2409-2417` + `mesh.rs:3247-3250`). Only the initiator-side has a post-start registry (`pending_direct_initiators`); the responder side is "explicitly deferred." Every CLI subprocess invocation generates a fresh ephemeral identity, so the daemon can't pre-`accept` it — meaning **production CLI remote-attach as designed in A-1..A-5 is blocked on this substrate fix**.
+
+Tracked as task #102 (`Substrate: pending_direct_responders for post-start handshake`). The fix needs to:
+- Add a responder-side registry symmetric to `pending_direct_initiators`.
+- Modify `dispatch_packet`'s `is_direct + is_handshake` arm to spawn an on-the-fly responder when no pending initiator matches and no peer is yet registered for `source`.
+- Run the Noise responder state machine inside the dispatch loop's spawn task, complete the handshake, register the new peer.
+
+Until #102 lands:
+- A-1..A-5 wire surface ships but is "shaped only" — the CLI can build typed clients and call them, but the daemon-side dispatch drops msg1.
+- A-6's two negative-path subprocess tests (flag validation; exit before handshake) run and pass.
+- A-6's four positive-path subprocess tests (`ls --remote` / `spawn` / `scale` / `query` end-to-end) are `#[ignore]`'d with the task #102 pointer.
+
 ## Risks for the user to weigh in on
 
 1. **`--source-subnet` removal from `net aggregator spawn`.** A-3 makes `--template` required and removes `--source-subnet`. The flag exists today as parse-only (no live use), so no consumer scripts break — but the help-text contract under NET_CLI_PLAN.md's "subcommand layout is a contract" lock (Locked decision 1, NET_CLI_PLAN.md:31-34) treats parse-only verbs the same as live ones. If the user wants to preserve `--source-subnet` for some future template-free path, flag this before A-3 lands.
