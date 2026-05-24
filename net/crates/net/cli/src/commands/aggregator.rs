@@ -283,9 +283,7 @@ async fn run_query(
         remote,
     )
     .await?;
-    let mesh = ctx.mesh_node().ok_or_else(|| {
-        sdk("internal: remote-attach context returned no mesh_node — should be unreachable")
-    })?;
+    let mesh = ctx.require_mesh_node()?;
 
     use net_sdk::aggregator::FoldQueryClient;
     let client = FoldQueryClient::new(mesh);
@@ -387,9 +385,7 @@ async fn run_ls_remote(
         remote,
     )
     .await?;
-    let mesh = ctx.mesh_node().ok_or_else(|| {
-        sdk("internal: remote-attach context returned no mesh_node — should be unreachable")
-    })?;
+    let mesh = ctx.require_mesh_node()?;
 
     use net_sdk::aggregator::RegistryClient;
     let client = RegistryClient::new(mesh);
@@ -435,9 +431,7 @@ async fn run_spawn(
         remote,
     )
     .await?;
-    let mesh = ctx.mesh_node().ok_or_else(|| {
-        sdk("internal: remote-attach context returned no mesh_node — should be unreachable")
-    })?;
+    let mesh = ctx.require_mesh_node()?;
 
     use net_sdk::aggregator::RegistryClient;
     let client = RegistryClient::new(mesh);
@@ -479,9 +473,7 @@ async fn run_scale(
         remote,
     )
     .await?;
-    let mesh = ctx.mesh_node().ok_or_else(|| {
-        sdk("internal: remote-attach context returned no mesh_node — should be unreachable")
-    })?;
+    let mesh = ctx.require_mesh_node()?;
 
     // Dedicated Scale RPC: grow/shrink in place. Surviving
     // replicas keep their identity + generation across the

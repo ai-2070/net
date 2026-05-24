@@ -78,6 +78,22 @@ impl CliContext {
         self.mesh_node.clone()
     }
 
+    /// Same as [`Self::mesh_node`] but panics-as-typed-error when
+    /// the context was built via [`Self::build`] instead of
+    /// [`Self::build_with_remote`]. Subcommands that always
+    /// remote-attach (`net aggregator query`/`spawn`/`scale`/
+    /// `ls --remote`) call this rather than re-implementing the
+    /// "should be unreachable" sdk-error per call site.
+    #[allow(dead_code)]
+    pub fn require_mesh_node(&self) -> Result<Arc<net_sdk::MeshNode>, CliError> {
+        self.mesh_node.clone().ok_or_else(|| {
+            crate::error::sdk(
+                "internal: remote-attach context returned no mesh_node — \
+                 build_with_remote always populates it, this should be unreachable",
+            )
+        })
+    }
+
     /// Build a fresh context. Resolves the operator identity
     /// from (in priority order): `identity_override`,
     /// `profile.identity`, an ephemeral random keypair (with a
