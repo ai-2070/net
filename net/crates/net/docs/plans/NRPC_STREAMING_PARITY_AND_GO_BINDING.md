@@ -28,24 +28,26 @@ Tagged `[A | B | C | D]`:
 
 ## Status
 
-| ID    | Pri | Area                | Title                                                                                          |
-|-------|-----|---------------------|------------------------------------------------------------------------------------------------|
-| S2-A1 | H   | napi binding        | Expose `MeshRpc.setObserver(handler)` + `MeshRpc.metricsSnapshot()` on raw napi class          |
-| S2-A2 | H   | pyo3 binding        | Expose `MeshRpc.set_observer(callable)` + `MeshRpc.metrics_snapshot()` on raw pyo3 class       |
-| S2-B1 | H   | Node TS wrapper     | `TypedMeshRpc.serveClientStream` + `callClientStream` + `TypedClientStreamCall`                |
-| S2-B2 | H   | Node TS wrapper     | `TypedMeshRpc.serveDuplex` + `callDuplex` + `TypedDuplexCall` / `TypedDuplexSink` / `TypedDuplexStream` |
-| S2-B3 | M   | Node TS wrapper     | `TypedMeshRpc.setObserver` + `TypedMeshRpc.metricsSnapshot` + `RpcCallEvent` JS type           |
-| S2-C1 | H   | Python wrapper      | `TypedMeshRpc.serve_client_stream` + `call_client_stream` + `TypedClientStreamCall`            |
-| S2-C2 | H   | Python wrapper      | `TypedMeshRpc.serve_duplex` + `call_duplex` + `TypedDuplexCall` / `TypedDuplexSink` / `TypedDuplexStream` |
-| S2-C3 | M   | Python wrapper      | `TypedMeshRpc.set_observer` + `TypedMeshRpc.metrics_snapshot` + `RpcCallEvent` dataclass       |
-| S2-X  | M   | cross-binding tests | Cross-language streaming round-trip test under `tests/cross_lang_nrpc/`                        |
-| S1-A1 | M   | C ABI               | `net_rpc_set_observer` + `net_rpc_metrics_snapshot` FFI symbols in `rpc-ffi/src/lib.rs`        |
-| S1-D1 | H   | Go wrapper          | `TypedMeshRpc` Go struct + `Call` / `CallService` / `Serve` (unary)                            |
-| S1-D2 | H   | Go wrapper          | `TypedMeshRpc.CallStreaming` + `TypedRpcStream`                                                |
-| S1-D3 | H   | Go wrapper          | `TypedMeshRpc.ServeClientStream` + `CallClientStream` + `TypedClientStreamCall`                |
-| S1-D4 | H   | Go wrapper          | `TypedMeshRpc.ServeDuplex` + `CallDuplex` + `TypedDuplexCall` / `TypedDuplexSink` / `TypedDuplexStream` |
-| S1-D5 | M   | Go wrapper          | `TypedMeshRpc.SetObserver` + `MetricsSnapshot` + observer trampoline                           |
-| S1-D6 | M   | Go tests            | `bindings/go/net/mesh_rpc_typed_test.go` — JSON round-trip + streaming round-trip + observer fire |
+**Plan delivered (2026-05-24).** All 16 slices merged across 10 commits on `nrpc-sdks`. Per-slice landing commits documented in the `Done` column below; deferred follow-ups (live multi-binding harness, bounded-mpsc + drop-counter observer queue, unified streaming cancel propagation, server-side `direction=='inbound'` events) are pinned in the [Deferred follow-ups](#deferred-follow-ups-post-v1) section.
+
+| ID    | Pri | Area                | Title                                                                                          | Done |
+|-------|-----|---------------------|------------------------------------------------------------------------------------------------|------|
+| S2-A1 | H   | napi binding        | Expose `MeshRpc.setObserver(handler)` + `MeshRpc.metricsSnapshot()` on raw napi class          | ✅ `98a2a25e` |
+| S2-A2 | H   | pyo3 binding        | Expose `MeshRpc.set_observer(callable)` + `MeshRpc.metrics_snapshot()` on raw pyo3 class       | ✅ `98a2a25e` |
+| S2-B1 | H   | Node TS wrapper     | `TypedMeshRpc.serveClientStream` + `callClientStream` + `TypedClientStreamCall`                | ✅ `2c5456ce` |
+| S2-B2 | H   | Node TS wrapper     | `TypedMeshRpc.serveDuplex` + `callDuplex` + `TypedDuplexCall` / `TypedDuplexSink` / `TypedDuplexStream` | ✅ `e55bd791` |
+| S2-B3 | M   | Node TS wrapper     | `TypedMeshRpc.setObserver` + `TypedMeshRpc.metricsSnapshot` + `RpcCallEvent` JS type           | ✅ `07b5fca6` |
+| S2-C1 | H   | Python wrapper      | `TypedMeshRpc.serve_client_stream` + `call_client_stream` + `TypedClientStreamCall`            | ✅ `a85a2199` |
+| S2-C2 | H   | Python wrapper      | `TypedMeshRpc.serve_duplex` + `call_duplex` + `TypedDuplexCall` / `TypedDuplexSink` / `TypedDuplexStream` | ✅ `2bcc7530` |
+| S2-C3 | M   | Python wrapper      | `TypedMeshRpc.set_observer` + `TypedMeshRpc.metrics_snapshot` + `RpcCallEvent` dataclass       | ✅ `6cdb30db` |
+| S2-X  | M   | cross-binding tests | Cross-language streaming round-trip test under `tests/cross_lang_nrpc/`                        | ✅ `d1edd3f0` |
+| S1-A1 | M   | C ABI               | `net_rpc_set_observer` + `net_rpc_metrics_snapshot` FFI symbols in `rpc-ffi/src/lib.rs`        | ✅ `98a2a25e` |
+| S1-D1 | H   | Go wrapper          | `TypedMeshRpc` Go struct + `Call` / `CallService` / `Serve` (unary)                            | ✅ `39b73f6b` |
+| S1-D2 | H   | Go wrapper          | `TypedMeshRpc.CallStreaming` + `TypedRpcStream`                                                | ✅ `39b73f6b` |
+| S1-D3 | H   | Go wrapper          | `TypedMeshRpc.ServeClientStream` + `CallClientStream` + `TypedClientStreamCall`                | ✅ `39b73f6b` |
+| S1-D4 | H   | Go wrapper          | `TypedMeshRpc.ServeDuplex` + `CallDuplex` + `TypedDuplexCall` / `TypedDuplexSink` / `TypedDuplexStream` | ✅ `39b73f6b` |
+| S1-D5 | M   | Go wrapper          | `TypedMeshRpc.SetObserver` + `MetricsSnapshot` + observer trampoline                           | ✅ `39b73f6b` |
+| S1-D6 | M   | Go tests            | `bindings/go/net/mesh_rpc_typed_test.go` — JSON round-trip + streaming round-trip + observer fire | ✅ `39e99d15` |
 
 ---
 
@@ -490,8 +492,11 @@ Lands AFTER Slice 2 so the Go binding can mirror Node + Python's typed shape exa
 
 ## Deferred follow-ups (post-v1)
 
-Three follow-up items deliberately deferred from v1; cross-referenced by the locked decisions at the top of the doc.
+Follow-up items deliberately deferred from v1; cross-referenced by the locked decisions at the top of the doc.
 
 1. **Bounded-mpsc observer dispatch.** Each binding currently fires the user observer synchronously on the substrate dispatch path; the v1 contract documents "callbacks must be cheap." A follow-up adds a bounded-mpsc + drop-on-overflow trampoline per binding, with the drop count surfaced through `metricsSnapshot` so operators can see when their observer is too slow. Lands when a production user surfaces an observer that has to do real work (logging to disk, exporting to Prometheus, etc.).
 2. **Unified streaming cancellation.** v1 ships `close()`-only cancellation across all three bindings. A follow-up extends the raw bindings so `AbortSignal` (Node), cancel-token (pyo3), and `context.Context` (Go) propagate uniformly through `callClientStream` / `callDuplex` to a single substrate-level cancel primitive. Likely involves a small change at `bindings/node/src/mesh_rpc.rs:1572-1621` (thread `cancel_token` through `call_client_stream` + `call_duplex`) and equivalent extensions on the pyo3 / Go raw layers.
 3. **`Range` iterator for Go streams.** Once the Go workspace targets Go 1.23+, add range-over-func support on `*TypedRpcStream[Resp]` and `*TypedDuplexStream[Resp]` so `for resp := range stream.Range()` works idiomatically. Until then, the explicit `Recv()` loop is the only shape.
+4. **Server-side `direction=='inbound'` observer events.** v1 emits only outbound events (caller-side completion). The substrate's `RpcDirection::Inbound` variant is declared but no firing site exists in `mesh_rpc.rs` — the dispatch path's mpsc-driven handler invocation needs additional plumbing to record the dispatch-to-respond span cleanly. Fixture's `observer_invariants.direction_discriminator` already documents `emitted_in_v1: false` for inbound; the follow-up flips that flag once the substrate fires it.
+5. **Live multi-process cross-language harness.** S2-X ships the cross-binding *contract* (fixture invariants + Rust reference assertions). A follow-up adds a multi-process orchestrator that spawns Node + Python + Go peers, has them serve and call each other's typed handlers, and asserts the wire-level round-trip end-to-end. Requires CI infrastructure to build all three binding artifacts (`.node` + `.so` + `cdylib`) before launching; the per-binding unit tests already cover the typed-wrapper logic in isolation, so this follow-up's value is catching wire-level drift that the fixture's structural assertions can't.
+6. **ABI 0x0003 cascade to downstream Go consumers.** `bindings/go/net/mesh_rpc.go::ExpectedABIVersion` now pins `0x0003` to match the substrate. Downstream Go binding consumers compiled against the pre-S1-A1 `0x0001` will panic at process init (per `mesh_rpc.go:618-625`); release notes for the next downstream Go binding bump must call out the override path (`NET_RPC_SKIP_ABI_CHECK=1`) for in-development consumers.
