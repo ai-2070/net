@@ -157,6 +157,39 @@ pub struct RegistryReplicaSummary {
 }
 
 /// Handler-level error variants.
+///
+/// # Error shape rationale
+///
+/// Three families of variants:
+///
+/// 1. **Rejection with diagnostic**: `*Rejected(String)` — the
+///    daemon would have accepted the op shape but the runtime
+///    state refused it (config validation, replica spawn
+///    failure, template-spec mismatch). The string is operator-
+///    facing copy.
+/// 2. **Op unsupported**: `*NotSupported` (no payload) — the
+///    daemon's handler doesn't accept this op at all, typically
+///    because the operator didn't install the corresponding
+///    factory closure (`SpawnFn` / `ScaleFn`). A read-only
+///    daemon surfaces these instead of silently failing.
+/// 3. **Resource lookup miss**: `UnknownTemplate(String)` /
+///    `UnknownGroup(String)` — typed misses for "no such X by
+///    that name". One-string payload (the name the operator
+///    supplied) so the CLI can echo it back without re-decoding
+///    the request.
+///
+/// # Note on `Unregister` asymmetry
+///
+/// `Unregister` deliberately returns
+/// [`RegistryResponse::Unregistered { existed: false }`] for
+/// "no such group" rather than a typed `UnknownGroup` error.
+/// Reason: unregister-against-missing is the natural shape of
+/// "make sure this group is gone, idempotently" — operators
+/// scripting cleanup loops should not have to treat the
+/// missing-group case as an error to swallow. `Scale` and
+/// future write ops that *require* the group to exist do use
+/// `UnknownGroup` because they have nothing meaningful to do
+/// against a missing target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RegistryRpcError {
     /// Request payload failed to decode. Carries the postcard
