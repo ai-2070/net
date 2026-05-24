@@ -50,15 +50,13 @@ pub struct CliContext {
     _sdk: MeshOsDaemonSdk,
     deck: Arc<DeckClient>,
     identity: OperatorIdentity,
-    /// Connected `MeshNode` when the context was built via
+    /// Connected `Mesh` when the context was built via
     /// [`CliContext::build_with_remote`]. `None` for in-process
-    /// (read-local) subcommands. A-2 onward wires call sites.
-    #[allow(dead_code)]
-    mesh_node: Option<Arc<net_sdk::MeshNode>>,
-    /// Held so the underlying UDP socket + receive loop keep
-    /// running for the lifetime of the context. Dropped at end-
-    /// of-command alongside `_sdk`.
-    _mesh: Option<net_sdk::Mesh>,
+    /// (read-local) subcommands. Holds the underlying UDP socket
+    /// + receive loop alive for the lifetime of the context;
+    /// `Mesh::node_arc()` hands out the `Arc<MeshNode>` typed
+    /// clients (`RegistryClient` / `FoldQueryClient`) consume.
+    mesh: Option<net_sdk::Mesh>,
 }
 
 impl CliContext {
@@ -72,13 +70,17 @@ impl CliContext {
 
     /// Connected `MeshNode` for typed RPC clients. `None` when
     /// the context was built without a remote-attach target.
-    /// A-2 onward consumes this from the aggregator subcommands.
+    /// Connected `Arc<MeshNode>` for typed RPC clients. Derived
+    /// from the held `Mesh` so there's a single source of truth
+    /// for the connection lifetime. `None` when the context was
+    /// built without a remote-attach target. A-2 onward consumes
+    /// this from the aggregator subcommands.
     #[allow(dead_code)]
     pub fn mesh_node(&self) -> Option<Arc<net_sdk::MeshNode>> {
-        self.mesh_node.clone()
+        self.mesh.as_ref().map(|m| m.node_arc())
     }
 
-    /// Same as [`Self::mesh_node`] but panics-as-typed-error when
+    /// Same as [`Self::mesh_node`] but returns a typed error when
     /// the context was built via [`Self::build`] instead of
     /// [`Self::build_with_remote`]. Subcommands that always
     /// remote-attach (`net aggregator query`/`spawn`/`scale`/
@@ -86,9 +88,9 @@ impl CliContext {
     /// "should be unreachable" sdk-error per call site.
     #[allow(dead_code)]
     pub fn require_mesh_node(&self) -> Result<Arc<net_sdk::MeshNode>, CliError> {
-        self.mesh_node.clone().ok_or_else(|| {
+        self.mesh_node().ok_or_else(|| {
             crate::error::sdk(
-                "internal: remote-attach context returned no mesh_node — \
+                "internal: remote-attach context returned no mesh — \
                  build_with_remote always populates it, this should be unreachable",
             )
         })
@@ -191,22 +193,19 @@ impl CliContext {
 
         // Remote-attach branch: stand up a local ephemeral mesh
         // on 127.0.0.1:0, handshake with the target, start the
-        // receive loop, hand back the Arc<MeshNode>.
-        let (mesh_node, _mesh) = match remote {
-            Some(remote) => {
-                let mesh = build_remote_mesh(remote).await?;
-                let node = mesh.node_arc();
-                (Some(node), Some(mesh))
-            }
-            None => (None, None),
+        // receive loop. The Mesh owns the socket + dispatch loop;
+        // `mesh_node()` hands out the `Arc<MeshNode>` view typed
+        // clients consume.
+        let mesh = match remote {
+            Some(remote) => Some(build_remote_mesh(remote).await?),
+            None => None,
         };
 
         Ok(Self {
             _sdk: sdk,
             deck,
             identity,
-            mesh_node,
-            _mesh,
+            mesh,
         })
     }
 }
