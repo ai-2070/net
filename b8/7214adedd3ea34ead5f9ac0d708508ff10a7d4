@@ -1,0 +1,70 @@
+net/crates/net/cli/src/commands/aggregator.rs
+  s_099fa7d871e34d::t_345a8b99071c1d 348-354,375-407
+  s_099fa7d871e34d::t_554e431b270b9d 44-69
+  s_099fa7d871e34d::t_3e6dcf4d1aa8ae 87-92,94-97
+  s_099fa7d871e34d::t_78494e8c823ac2 175-177
+  s_099fa7d871e34d::t_3b9b96d740efe4 117-126
+  s_099fa7d871e34d::t_7e291e6b80f646 413-415,420-421,423-452
+  s_099fa7d871e34d::t_2db5c80bc175e8 592-625
+  s_099fa7d871e34d::t_f79af4783289fb 39-40
+  s_099fa7d871e34d::t_9b33e6c27ad2eb 160-165
+  s_099fa7d871e34d::t_722bfc1d27d0f4 200-202
+  s_099fa7d871e34d::t_80c6232f17c087 135-140
+  s_099fa7d871e34d::t_7f634830c30aba 626-676
+  s_099fa7d871e34d::t_514d1556f4102b 677-692
+  s_099fa7d871e34d::t_6624b47a3248e6 76-81
+  s_099fa7d871e34d::t_3e0c7cf6bda0de 267-269,271,273,275-338
+  s_099fa7d871e34d::t_4ecf8d1526de36 457-459,464-517,519-522
+  s_099fa7d871e34d::t_c93cedd0183ff2 150-152
+net/crates/net/docs/plans/AGGREGATOR_CLI_REMOTE_ATTACH_AND_SCALE_RPC.md
+  s_099fa7d871e34d::t_508a429c2d972b 410-423
+net/crates/net/cli/Cargo.toml
+  s_099fa7d871e34d::t_1993f2b151922c 25
+  s_099fa7d871e34d::t_7def139a42073c 109-113
+net/crates/net/sdk/src/lib.rs
+  s_099fa7d871e34d::t_b969ba10935e86 139-148
+net/crates/net/cli/src/error.rs
+  s_099fa7d871e34d::t_910fb496412ffd 129-132
+net/crates/net/cli/src/parsers.rs
+  s_099fa7d871e34d::t_72b20d61c4b2a4 35-46
+net/crates/net/cli/src/context.rs
+  s_099fa7d871e34d::t_e5c593beeddb65 75-76
+  s_099fa7d871e34d::t_902ebd48b13b6a 385-391
+  s_099fa7d871e34d::t_04d3528f0ce75c 57
+  s_099fa7d871e34d::t_95067837bdeae7 11,13-21,23,32-46,53-54,58-61,73-74,78
+  s_099fa7d871e34d::t_d81c9a134899dc 77
+  s_099fa7d871e34d::t_cefb97a826adc6 55-56
+  s_099fa7d871e34d::t_094727ca43ed83 103-105
+  s_099fa7d871e34d::t_ab86faa6b20178 96-102,106-128,176-187,192-193,198-225,229-286
+  s_099fa7d871e34d::t_ee655e03058e69 344-384,392-439
+  s_099fa7d871e34d::t_28ff711849ede9 226-228
+net/crates/net/cli/tests/aggregator_remote.rs
+  s_099fa7d871e34d::t_469ecda47c8fbd 263
+  s_099fa7d871e34d::t_67324855d081ac 1-9,21,26-62,64-71,73-125,127-152,155-167,169-199,202-215,217-262,264-296,299-312,314-344,346-365
+  s_099fa7d871e34d::t_ad26696818f1a1 63
+  s_099fa7d871e34d::t_38ed112a441f64 72
+  s_099fa7d871e34d::t_b0b8d3e15881fd 153-154,200-201,297-298
+  s_099fa7d871e34d::t_778ff799e83469 126
+  s_099fa7d871e34d::t_4af12e7bf58610 168
+  s_099fa7d871e34d::t_1e05bc6a658845 216
+  s_099fa7d871e34d::t_9037acae1ba9e8 10-20,22-25
+  s_099fa7d871e34d::t_cdef86f9cd5372 313,345
+net/crates/net/cli/src/config.rs
+  s_099fa7d871e34d::t_b9ae652d584439 60-83
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "b87214adedd3ea34ead5f9ac0d708508ff10a7d4",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
