@@ -1621,47 +1621,89 @@ pub struct PyRpcMetricsSnapshot {
     /// One entry per service that has been called at least once
     /// since the mesh was created. Sorted by service name.
     pub services: Vec<Py<PyServiceMetrics>>,
+    /// Cumulative count of observer events dropped because the
+    /// observer's bounded buffer was full (v3 / O-A2). Climbing
+    /// values indicate the installed Python callback can't keep
+    /// up with the dispatch rate; push events into a
+    /// :class:`queue.Queue` and drain off a dedicated thread.
+    pub observer_dropped_total: u64,
 }
 
 // ----------------------------------------------------------------------
-// Observer trampoline.
+// Observer trampoline — bounded mpsc + dedicated worker (v3 / O-A2).
 //
-// The substrate calls `RpcObserver::on_call` synchronously from
-// the dispatch task. We bridge that to a Python callable by
-// dispatching the call onto the tokio runtime's blocking pool —
-// the dispatch thread enqueues + returns immediately, never
-// blocking on GIL acquisition. The blocking pool is bounded; if
-// it fills up, `Handle::spawn_blocking` will block briefly
-// queueing the closure, which is the documented "callbacks must
-// be cheap" backpressure path. Errors raised by the Python
-// callback are silently swallowed — observers can't influence
-// the in-flight call.
+// v1 (S2-A2) spawned a fresh blocking-pool task per event via
+// `runtime.spawn_blocking`. Under sustained load this drained the
+// tokio blocking pool faster than user callbacks acquire-and-
+// release the GIL; past the pool's cap, spawn_blocking queues
+// internally with no observability.
+//
+// v3 inserts a bounded mpsc + single worker so:
+//   - The substrate dispatch thread pays only an atomic counter
+//     on overflow (vs the channel-send-or-block on every event).
+//   - Drops surface via `metrics_snapshot.observer_dropped_total`.
+//   - Serialized GIL acquisition (one worker → one acquire-release
+//     cycle per drained event) matches Python's natural threading
+//     model better than 100 concurrent blocking-pool tasks all
+//     fighting for the GIL.
+//
+// Locked decision #1 (NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION.md):
+// callbacks should still be cheap, but the substrate dispatch
+// path is defended.
 // ----------------------------------------------------------------------
 
+/// Bound on the observer event buffer. Matches the napi binding's
+/// `OBSERVER_BUFFER_CAPACITY` (1024) for consistency across
+/// bindings.
+const OBSERVER_BUFFER_CAPACITY: usize = 1024;
+
+/// Process-global count of observer events dropped because the
+/// bounded buffer was full. Surfaced via
+/// `metrics_snapshot.observer_dropped_total`.
+static OBSERVER_DROPPED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 struct PyRpcObserver {
-    callable: Py<PyAny>,
-    runtime: Arc<Runtime>,
+    sender: tokio::sync::mpsc::Sender<InnerRpcCallEvent>,
+}
+
+impl PyRpcObserver {
+    /// Install a new observer: build the bounded channel, spawn
+    /// the drain worker that acquires the GIL once per drained
+    /// event and invokes the Python callable.
+    fn install(callable: Py<PyAny>, runtime: Arc<Runtime>) -> Self {
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<InnerRpcCallEvent>(OBSERVER_BUFFER_CAPACITY);
+        runtime.spawn(async move {
+            while let Some(evt) = receiver.recv().await {
+                // GIL acquisition off the substrate dispatch
+                // thread, serialized across events by the
+                // single-worker design.
+                Python::attach(|py| {
+                    let py_evt = match Py::new(py, PyRpcCallEvent::from(&evt)) {
+                        Ok(o) => o,
+                        Err(_) => return,
+                    };
+                    // Ignore exceptions — observers can't
+                    // influence the in-flight call.
+                    let _ = callable.call1(py, (py_evt,));
+                });
+            }
+            // Sender dropped → channel closed → worker exits.
+        });
+        Self { sender }
+    }
 }
 
 impl RpcObserver for PyRpcObserver {
     fn on_call(&self, evt: InnerRpcCallEvent) {
-        let callable = Python::attach(|py| self.callable.clone_ref(py));
-        // Spawn a blocking task on the runtime so GIL acquisition
-        // never blocks the substrate dispatch thread. The returned
-        // JoinHandle is dropped — blocking tasks run to completion
-        // regardless (drop doesn't cancel).
-        self.runtime.spawn_blocking(move || {
-            Python::attach(|py| {
-                let py_evt = Py::new(py, PyRpcCallEvent::from(&evt));
-                let py_evt = match py_evt {
-                    Ok(o) => o,
-                    Err(_) => return,
-                };
-                // Ignore the result + any raised exception. A
-                // misbehaving observer must not crash the substrate.
-                let _ = callable.call1(py, (py_evt,));
-            });
-        });
+        // try_send is non-blocking; full or closed → drop +
+        // counter increment. The substrate dispatch path pays
+        // only this atomic-counter increment on overflow.
+        if self.sender.try_send(evt).is_err() {
+            OBSERVER_DROPPED_TOTAL
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -2002,10 +2044,8 @@ impl PyMeshRpc {
                         "observer must be a callable or None",
                     ));
                 }
-                let obs: Arc<dyn RpcObserver> = Arc::new(PyRpcObserver {
-                    callable,
-                    runtime: self.runtime.clone(),
-                });
+                let obs: Arc<dyn RpcObserver> =
+                    Arc::new(PyRpcObserver::install(callable, self.runtime.clone()));
                 self.node.set_rpc_observer(Some(obs));
             }
             None => {
@@ -2026,10 +2066,13 @@ impl PyMeshRpc {
             .iter()
             .map(|m| Py::new(py, PyServiceMetrics::from(m)))
             .collect();
+        let observer_dropped_total =
+            OBSERVER_DROPPED_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
         Py::new(
             py,
             PyRpcMetricsSnapshot {
                 services: services?,
+                observer_dropped_total,
             },
         )
     }

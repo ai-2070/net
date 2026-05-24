@@ -231,6 +231,13 @@ class RpcMetricsSnapshot:
     """Snapshot of the per-service nRPC metrics registry."""
 
     services: list  # list[ServiceMetrics]
+    #: Cumulative count of observer events dropped because the
+    #: observer's bounded buffer was full at the time the
+    #: substrate dispatch path fired (v3 / O-A2). A non-zero,
+    #: climbing value indicates the installed observer callback
+    #: can't keep up with the dispatch rate — push events into a
+    #: :class:`queue.Queue` and drain off a dedicated thread.
+    observer_dropped_total: int = 0
 
 
 def _raw_event_to_typed(raw: Any) -> RpcCallEvent:
@@ -292,9 +299,15 @@ def _raw_service_metrics_to_typed(raw: Any) -> ServiceMetrics:
 
 
 def _raw_metrics_snapshot_to_typed(raw: Any) -> RpcMetricsSnapshot:
-    """Convert a pyo3 ``RpcMetricsSnapshot`` POD into the dataclass."""
+    """Convert a pyo3 ``RpcMetricsSnapshot`` POD into the dataclass.
+
+    The ``observer_dropped_total`` field on the pyo3 POD is new
+    in v3 (O-A2). Older bindings without the field default to 0
+    via the dataclass's default value.
+    """
     return RpcMetricsSnapshot(
         services=[_raw_service_metrics_to_typed(s) for s in raw.services],
+        observer_dropped_total=int(getattr(raw, "observer_dropped_total", 0)),
     )
 
 
