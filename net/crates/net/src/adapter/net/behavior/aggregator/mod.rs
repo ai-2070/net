@@ -34,8 +34,8 @@ pub use registry::{
 pub use registry_client::{RegistryClient, RegistryClientError, DEFAULT_REGISTRY_DEADLINE};
 pub use registry_service::{
     snapshot_group, RegistryGroupSummary, RegistryHandler, RegistryReadHandler,
-    RegistryReplicaSummary, RegistryRequest, RegistryResponse, RegistryRpcError, SpawnFn,
-    SpawnRequest, REGISTRY_SERVICE,
+    RegistryReplicaSummary, RegistryRequest, RegistryResponse, RegistryRpcError, ScaleFn,
+    ScaleRequest, SpawnFn, SpawnRequest, REGISTRY_SERVICE,
 };
 pub use summarizer::{
     CapabilityFoldSummarizer, ReservationFoldSummarizer, Summarizer, SummaryAnnouncement,

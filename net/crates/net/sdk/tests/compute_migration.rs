@@ -1454,3 +1454,39 @@ fn make_event(origin_hash: u64, seq: u64, payload: &'static [u8]) -> CausalEvent
         received_at: 0,
     }
 }
+
+// ---- Regression pins ---------------------------------------------------
+
+/// Pins the technique used by `DaemonRuntime::build_migration_handler`:
+/// capture `Handle::current()` once inside a tokio runtime, then use
+/// `handle.spawn(...)` from a non-runtime thread.
+///
+/// The substrate's migration handler invokes the SDK-supplied
+/// `PostRestoreCallback` / `PreCleanupCallback` synchronously and
+/// expects the hook to `spawn` the actual work. When the dispatch path
+/// is driven from a non-tokio thread (FFI trampoline, Go cgo,
+/// synchronous `block_on` callers), bare `tokio::spawn` panics with
+/// "there is no reactor running". The fix captures the runtime handle
+/// at handler-construction time; this test catches a regression that
+/// swaps it back to `tokio::spawn`.
+///
+/// Tracked in `TestMigration_EndToEndCounterSurvivesAToB` end-to-end on
+/// the Go side — this Rust-side pin gives a focused signal so the next
+/// `build_migration_handler` refactor catches the regression without
+/// waiting for the cgo suite.
+#[tokio::test]
+async fn captured_handle_spawns_from_non_runtime_thread() {
+    let handle = tokio::runtime::Handle::current();
+    let (tx, rx) = tokio::sync::oneshot::channel::<u8>();
+    let join = std::thread::spawn(move || {
+        // No tokio runtime is registered on this OS thread; a bare
+        // `tokio::spawn(...)` here would panic. The captured `Handle`
+        // routes the spawn onto the runtime that owned `Handle::current()`
+        // at capture time.
+        handle.spawn(async move {
+            let _ = tx.send(42);
+        });
+    });
+    join.join().expect("os thread joined");
+    assert_eq!(rx.await.expect("oneshot recv"), 42);
+}

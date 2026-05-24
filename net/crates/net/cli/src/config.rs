@@ -57,6 +57,30 @@ pub struct Profile {
     /// this is only a UI hint for the confirm gate.
     #[serde(default)]
     pub ice_signature_threshold: Option<usize>,
+
+    /// Pre-shared key for handshaking with a remote daemon, as
+    /// 64 hex chars (`0x`-prefix optional). Required by every
+    /// subcommand that uses `--node-addr`. Profile-level so an
+    /// operator who always talks to the same daemon can omit
+    /// `--psk-hex` from the call site.
+    #[serde(default)]
+    pub psk_hex: Option<String>,
+
+    /// Default remote daemon `IP:port`. Subcommand `--node-addr`
+    /// overrides; omitted when only in-process supervisor work
+    /// happens against this profile.
+    #[serde(default)]
+    pub node_addr: Option<String>,
+
+    /// Default remote daemon's Noise public key (64 hex chars).
+    /// Subcommand `--node-pubkey` overrides.
+    #[serde(default)]
+    pub node_pubkey: Option<String>,
+
+    /// Default remote daemon's `node_id` (decimal or `0x`-prefixed
+    /// hex). Subcommand `--node-id` overrides.
+    #[serde(default)]
+    pub node_id: Option<String>,
 }
 
 impl ConfigFile {

@@ -22,13 +22,19 @@
 //! keeps the trust boundary at the daemon's operator-controlled
 //! config file.
 //!
-//! # Scale (deferred)
+//! # Scale
 //!
-//! Scale is implementable today as Unregister + Spawn with a
-//! different `replica_count`. A dedicated Scale op (grow/shrink
-//! the live `LifecycleGroup` without tearing it down) needs
-//! `LifecycleGroup::add_replica` / `remove_last`, which we
-//! haven't shipped yet — tracked as a follow-up.
+//! `Scale { group_name, template_name, target_replica_count }`
+//! grows / shrinks an existing group in place via
+//! [`crate::adapter::net::behavior::lifecycle::LifecycleGroup::add_replica`]
+//! / [`crate::adapter::net::behavior::lifecycle::LifecycleGroup::remove_last`].
+//! Surviving replicas keep their identity + generation across
+//! the resize. The `template_name` is re-supplied per call
+//! (rather than cached per group) so the daemon can re-derive
+//! the spec without growing `AggregatorGroupEntry`'s state.
+//! The handler verifies the template matches the current
+//! group's `source_subnet` + `fold_kinds` and rejects with
+//! `ScaleRejected("template mismatch")` if not.
 
 use std::sync::Arc;
 
@@ -40,6 +46,7 @@ use super::registry::AggregatorRegistry;
 use crate::adapter::net::cortex::rpc::{
     RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
 };
+use crate::adapter::net::subnet::SubnetId;
 
 /// Canonical service name. Clients construct request channels
 /// implicitly via the substrate's `call_typed` plumbing.
@@ -74,6 +81,25 @@ pub enum RegistryRequest {
         /// Name of the group to remove.
         group_name: String,
     },
+    /// Resize an existing group in place via
+    /// [`crate::adapter::net::behavior::lifecycle::LifecycleGroup::add_replica`]
+    /// / [`crate::adapter::net::behavior::lifecycle::LifecycleGroup::remove_last`].
+    /// Surviving replicas keep their identity + generation; only
+    /// the delta replicas are spawned (grow) or stopped (shrink).
+    /// The handler re-resolves `template_name` against the
+    /// daemon's config and refuses the call if the resolved spec
+    /// doesn't match the group's current `source_subnet` +
+    /// `fold_kinds`.
+    Scale {
+        /// Name of the existing group to resize.
+        group_name: String,
+        /// Template the group was spawned from. Re-supplied per
+        /// call so the daemon can re-derive the spec without
+        /// caching it per group.
+        template_name: String,
+        /// Target replica count after the resize. `1..=255`.
+        target_replica_count: u8,
+    },
 }
 
 /// Wire-shaped response.
@@ -91,6 +117,9 @@ pub enum RegistryResponse {
         /// True iff a group by that name was present.
         existed: bool,
     },
+    /// Successful `Scale` reply — carries the resized group's
+    /// snapshot so the client doesn't need a follow-up `List`.
+    Scaled(RegistryGroupSummary),
     /// Handler-level error (decode failure, op-specific errors,
     /// template/factory rejections).
     Error(RegistryRpcError),
@@ -103,6 +132,13 @@ pub struct RegistryGroupSummary {
     pub name: String,
     /// 32-byte group seed.
     pub group_seed: [u8; 32],
+    /// Subnet the aggregator summarizes. Sourced from the live
+    /// replica's config; identical across replicas in a group.
+    pub source_subnet: SubnetId,
+    /// Fold kinds the aggregator publishes summaries for.
+    /// Sourced from the live replica's config; identical across
+    /// replicas.
+    pub fold_kinds: Vec<u16>,
     /// Per-replica rows in declaration order.
     pub replicas: Vec<RegistryReplicaSummary>,
 }
@@ -122,6 +158,39 @@ pub struct RegistryReplicaSummary {
 }
 
 /// Handler-level error variants.
+///
+/// # Error shape rationale
+///
+/// Three families of variants:
+///
+/// 1. **Rejection with diagnostic**: `*Rejected(String)` — the
+///    daemon would have accepted the op shape but the runtime
+///    state refused it (config validation, replica spawn
+///    failure, template-spec mismatch). The string is operator-
+///    facing copy.
+/// 2. **Op unsupported**: `*NotSupported` (no payload) — the
+///    daemon's handler doesn't accept this op at all, typically
+///    because the operator didn't install the corresponding
+///    factory closure (`SpawnFn` / `ScaleFn`). A read-only
+///    daemon surfaces these instead of silently failing.
+/// 3. **Resource lookup miss**: `UnknownTemplate(String)` /
+///    `UnknownGroup(String)` — typed misses for "no such X by
+///    that name". One-string payload (the name the operator
+///    supplied) so the CLI can echo it back without re-decoding
+///    the request.
+///
+/// # Note on `Unregister` asymmetry
+///
+/// `Unregister` deliberately returns
+/// [`RegistryResponse::Unregistered { existed: false }`] for
+/// "no such group" rather than a typed `UnknownGroup` error.
+/// Reason: unregister-against-missing is the natural shape of
+/// "make sure this group is gone, idempotently" — operators
+/// scripting cleanup loops should not have to treat the
+/// missing-group case as an error to swallow. `Scale` and
+/// future write ops that *require* the group to exist do use
+/// `UnknownGroup` because they have nothing meaningful to do
+/// against a missing target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RegistryRpcError {
     /// Request payload failed to decode. Carries the postcard
@@ -141,6 +210,18 @@ pub enum RegistryRpcError {
     /// installed via `RegistryHandler::with_spawner`). Read-only
     /// daemons surface this rather than silently failing.
     SpawnNotSupported,
+    /// `Scale` rejected: no group by `group_name` is registered
+    /// on this daemon.
+    UnknownGroup(String),
+    /// `Scale` rejected for a daemon-defined reason — template
+    /// mismatch, replica spawn failure during grow, replica
+    /// stop failure during shrink, target count zero, etc.
+    /// Carries an operator-facing diagnostic.
+    ScaleRejected(String),
+    /// The daemon refuses dynamic `Scale` (no scale factory
+    /// installed). Mirror of [`Self::SpawnNotSupported`] for the
+    /// scale path.
+    ScaleNotSupported,
 }
 
 /// Async callback the [`RegistryHandler`] invokes when a
@@ -175,6 +256,40 @@ pub struct SpawnRequest {
     pub replica_count: u8,
 }
 
+/// Async callback the [`RegistryHandler`] invokes when a
+/// `Scale` request arrives. The daemon's template-resolution
+/// layer plugs in here: given `(group_name, template_name,
+/// target_replica_count)`, walk the existing group in place via
+/// [`crate::adapter::net::behavior::lifecycle::LifecycleGroup::add_replica`]
+/// / [`crate::adapter::net::behavior::lifecycle::LifecycleGroup::remove_last`]
+/// and return the post-resize snapshot. Returning a typed
+/// [`RegistryRpcError`] surfaces template mismatch /
+/// unknown-group / replica spawn failure to the wire.
+pub type ScaleFn = Box<
+    dyn Fn(
+            ScaleRequest,
+        )
+            -> futures::future::BoxFuture<'static, Result<RegistryGroupSummary, RegistryRpcError>>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// Argument bundle passed to a [`ScaleFn`]. Same shape as
+/// [`SpawnRequest`] but distinct so future scale-specific
+/// fields (e.g. concurrent-add throttle) don't pollute spawn.
+#[derive(Debug, Clone)]
+pub struct ScaleRequest {
+    /// Name of the existing group to resize.
+    pub group_name: String,
+    /// Template the group was spawned from. The daemon
+    /// re-resolves this to validate the resize target matches
+    /// the existing group's spec.
+    pub template_name: String,
+    /// Target replica count after the resize. `1..=255`.
+    pub target_replica_count: u8,
+}
+
 /// Read-only `RpcHandler` for [`REGISTRY_SERVICE`]. Answers
 /// `List` and `Unregister`; replies to `Spawn` with
 /// [`RegistryRpcError::SpawnNotSupported`]. Sibling to
@@ -204,29 +319,47 @@ impl RpcHandler for RegistryReadHandler {
                 return Ok(encode_response(&response));
             }
         };
-        let response = answer(&self.registry, None, &request).await;
+        let response = answer(&self.registry, None, None, &request).await;
         Ok(encode_response(&response))
     }
 }
 
 /// Full `RpcHandler` for [`REGISTRY_SERVICE`]. Answers `List`
-/// / `Spawn` / `Unregister`. The [`SpawnFn`] is **required**
-/// at construction — daemons without a spawn callback use
-/// [`RegistryReadHandler`] instead. This split makes the
-/// "read-only daemon" vs "spawn-capable daemon" choice a
-/// compile-time decision rather than a runtime branch.
+/// / `Spawn` / `Unregister` / `Scale`. The [`SpawnFn`] is
+/// **required** at construction — daemons without a spawn
+/// callback use [`RegistryReadHandler`] instead. This split
+/// makes the "read-only daemon" vs "spawn-capable daemon"
+/// choice a compile-time decision rather than a runtime branch.
+///
+/// The [`ScaleFn`] is optional ([`Self::with_scaler`]): when
+/// absent, `Scale` requests reply with
+/// [`RegistryRpcError::ScaleNotSupported`].
 pub struct RegistryHandler {
     registry: Arc<AggregatorRegistry>,
     spawner: Arc<SpawnFn>,
+    scaler: Option<Arc<ScaleFn>>,
 }
 
 impl RegistryHandler {
     /// Construct a full handler with the given spawn callback.
+    /// No scaler is installed; calls to `Scale` reply with
+    /// [`RegistryRpcError::ScaleNotSupported`] unless the
+    /// caller layers one in via [`Self::with_scaler`].
     pub fn new(registry: Arc<AggregatorRegistry>, spawner: SpawnFn) -> Self {
         Self {
             registry,
             spawner: Arc::new(spawner),
+            scaler: None,
         }
+    }
+
+    /// Attach a [`ScaleFn`] so the handler answers `Scale`
+    /// requests by invoking the daemon's resize logic. The
+    /// daemon side typically pairs `make_spawner` with a
+    /// `make_scaler` that shares the same template registry.
+    pub fn with_scaler(mut self, scaler: ScaleFn) -> Self {
+        self.scaler = Some(Arc::new(scaler));
+        self
     }
 }
 
@@ -241,7 +374,13 @@ impl RpcHandler for RegistryHandler {
                 return Ok(encode_response(&response));
             }
         };
-        let response = answer(&self.registry, Some(&self.spawner), &request).await;
+        let response = answer(
+            &self.registry,
+            Some(&self.spawner),
+            self.scaler.as_deref(),
+            &request,
+        )
+        .await;
         Ok(encode_response(&response))
     }
 }
@@ -251,6 +390,7 @@ impl RpcHandler for RegistryHandler {
 pub(crate) async fn answer(
     registry: &Arc<AggregatorRegistry>,
     spawner: Option<&SpawnFn>,
+    scaler: Option<&ScaleFn>,
     request: &RegistryRequest,
 ) -> RegistryResponse {
     match request {
@@ -294,19 +434,74 @@ pub(crate) async fn answer(
             }
             Err(_) => RegistryResponse::Unregistered { existed: false },
         },
+        RegistryRequest::Scale {
+            group_name,
+            template_name,
+            target_replica_count,
+        } => {
+            let Some(scaler) = scaler else {
+                return RegistryResponse::Error(RegistryRpcError::ScaleNotSupported);
+            };
+            // Fail-fast on the missing group before invoking
+            // the scaler. UnknownGroup is the explicit error
+            // (vs. Unregister which returns existed=false) — Scale
+            // is a write op against a presumed-extant group, so
+            // a typed error is more appropriate than silent
+            // not-modified.
+            if registry.get(group_name).is_none() {
+                return RegistryResponse::Error(RegistryRpcError::UnknownGroup(group_name.clone()));
+            }
+            // Front-line validation: target replica count must
+            // be positive. The scaler is also expected to
+            // refuse zero (LifecycleGroup::remove_last refuses
+            // below 1) but surfacing here keeps the error shape
+            // operator-friendly.
+            if *target_replica_count == 0 {
+                return RegistryResponse::Error(RegistryRpcError::ScaleRejected(
+                    "target_replica_count must be > 0".into(),
+                ));
+            }
+            let req = ScaleRequest {
+                group_name: group_name.clone(),
+                template_name: template_name.clone(),
+                target_replica_count: *target_replica_count,
+            };
+            match (scaler)(req).await {
+                Ok(summary) => RegistryResponse::Scaled(summary),
+                Err(e) => RegistryResponse::Error(e),
+            }
+        }
     }
 }
 
 /// Build a wire-shaped per-group snapshot from a live
 /// registry entry. Used by the `answer` path internally and
-/// by daemon-side `SpawnFn` implementations to build the
-/// `RegistryResponse::Spawned` payload after registration.
+/// by daemon-side `SpawnFn` / `ScaleFn` implementations to
+/// build the `RegistryResponse::Spawned` / `Scaled` payload
+/// after registration / resize.
+///
+/// `source_subnet` and `fold_kinds` are sourced from the first
+/// replica's `AggregatorConfig` — every replica in a group
+/// shares the same spec, so reading from `replica(0)` is
+/// representative. Falls back to `SubnetId::GLOBAL` + empty
+/// `fold_kinds` when the group has been unregistered (race
+/// against a concurrent `unregister`); operator tooling sees
+/// the post-unregister snapshot as an empty group anyway.
 pub async fn snapshot_group(entry: &Arc<super::AggregatorGroupEntry>) -> RegistryGroupSummary {
     let snap = entry.snapshot().await;
     let rows = build_rows(&snap);
+    let (source_subnet, fold_kinds) = match snap.replicas.first() {
+        Some(replica) => {
+            let cfg = replica.config();
+            (cfg.source_subnet, cfg.fold_kinds.clone())
+        }
+        None => (SubnetId::GLOBAL, Vec::new()),
+    };
     RegistryGroupSummary {
         name: entry.name.clone(),
         group_seed: entry.group_seed,
+        source_subnet,
+        fold_kinds,
         replicas: rows,
     }
 }
@@ -358,7 +553,10 @@ impl AggregatorRegistry {
     /// Wrap `self` in a [`RegistryHandler`] (Spawn-capable) and
     /// register it under [`REGISTRY_SERVICE`]. The daemon's
     /// template-resolution layer supplies the [`SpawnFn`] —
-    /// see `aggregator-daemon`'s `make_spawner`.
+    /// see `aggregator-daemon`'s `make_spawner`. `Scale`
+    /// requests reply with [`RegistryRpcError::ScaleNotSupported`];
+    /// use [`Self::install_registry_service_with_handlers`] to
+    /// also accept dynamic resize.
     pub fn install_registry_service_with_spawner(
         self: &Arc<Self>,
         mesh: &Arc<crate::adapter::net::MeshNode>,
@@ -368,6 +566,23 @@ impl AggregatorRegistry {
         mesh.serve_rpc(
             REGISTRY_SERVICE,
             Arc::new(RegistryHandler::new(self.clone(), spawner)),
+        )
+    }
+
+    /// Wrap `self` in a [`RegistryHandler`] with both `Spawn`
+    /// and `Scale` callbacks installed. Daemons that pair
+    /// `make_spawner` with a `make_scaler` (sharing one template
+    /// registry) call this rather than the spawner-only variant.
+    pub fn install_registry_service_with_handlers(
+        self: &Arc<Self>,
+        mesh: &Arc<crate::adapter::net::MeshNode>,
+        spawner: SpawnFn,
+        scaler: ScaleFn,
+    ) -> Result<crate::adapter::net::mesh_rpc::ServeHandle, crate::adapter::net::mesh_rpc::ServeError>
+    {
+        mesh.serve_rpc(
+            REGISTRY_SERVICE,
+            Arc::new(RegistryHandler::new(self.clone(), spawner).with_scaler(scaler)),
         )
     }
 }
@@ -439,7 +654,7 @@ mod tests {
             .register("beta", spawn_group("beta", 50).await)
             .expect("register beta");
 
-        let response = answer(&registry, None, &RegistryRequest::List).await;
+        let response = answer(&registry, None, None, &RegistryRequest::List).await;
         match response {
             RegistryResponse::Groups(groups) => {
                 assert_eq!(groups.len(), 2);
@@ -471,7 +686,7 @@ mod tests {
     #[tokio::test]
     async fn list_against_empty_registry_returns_empty_groups() {
         let registry = Arc::new(AggregatorRegistry::new());
-        let response = answer(&registry, None, &RegistryRequest::List).await;
+        let response = answer(&registry, None, None, &RegistryRequest::List).await;
         match response {
             RegistryResponse::Groups(groups) => assert!(groups.is_empty()),
             other => panic!("expected empty Groups, got {other:?}"),
@@ -486,6 +701,7 @@ mod tests {
             .expect("register");
         let response = answer(
             &registry,
+            None,
             None,
             &RegistryRequest::Unregister {
                 group_name: "agg".into(),
@@ -505,6 +721,7 @@ mod tests {
         let response = answer(
             &registry,
             None,
+            None,
             &RegistryRequest::Unregister {
                 group_name: "missing".into(),
             },
@@ -521,6 +738,7 @@ mod tests {
         let registry = Arc::new(AggregatorRegistry::new());
         let response = answer(
             &registry,
+            None,
             None,
             &RegistryRequest::Spawn {
                 template_name: "primary".into(),
@@ -593,6 +811,7 @@ mod tests {
         let response = answer(
             &registry,
             Some(&spawner),
+            None,
             &RegistryRequest::Spawn {
                 template_name: "primary".into(),
                 group_name: "dynamic".into(),
@@ -613,6 +832,7 @@ mod tests {
         let _ = answer(
             &registry,
             None,
+            None,
             &RegistryRequest::Unregister {
                 group_name: "dynamic".into(),
             },
@@ -629,6 +849,7 @@ mod tests {
         let response = answer(
             &registry,
             Some(&spawner),
+            None,
             &RegistryRequest::Spawn {
                 template_name: "nope".into(),
                 group_name: "x".into(),
@@ -662,6 +883,7 @@ mod tests {
         let response = answer(
             &registry,
             Some(&spawner),
+            None,
             &RegistryRequest::Spawn {
                 template_name: "anything".into(),
                 group_name: "existing".into(),
@@ -698,6 +920,11 @@ mod tests {
             RegistryRequest::Unregister {
                 group_name: "old".into(),
             },
+            RegistryRequest::Scale {
+                group_name: "grow".into(),
+                template_name: "primary".into(),
+                target_replica_count: 5,
+            },
         ] {
             let bytes = postcard::to_allocvec(&req).expect("encode req");
             let decoded: RegistryRequest = postcard::from_bytes(&bytes).expect("decode req");
@@ -707,6 +934,8 @@ mod tests {
         let group_summary = RegistryGroupSummary {
             name: "test".into(),
             group_seed: [0xCDu8; 32],
+            source_subnet: SubnetId::GLOBAL,
+            fold_kinds: vec![0x0001],
             replicas: vec![RegistryReplicaSummary {
                 generation: 42,
                 healthy: false,
@@ -716,14 +945,18 @@ mod tests {
         };
         for resp in [
             RegistryResponse::Groups(vec![group_summary.clone()]),
-            RegistryResponse::Spawned(group_summary),
+            RegistryResponse::Spawned(group_summary.clone()),
             RegistryResponse::Unregistered { existed: true },
             RegistryResponse::Unregistered { existed: false },
+            RegistryResponse::Scaled(group_summary),
             RegistryResponse::Error(RegistryRpcError::DecodeFailed("bad bytes".into())),
             RegistryResponse::Error(RegistryRpcError::UnknownTemplate("missing".into())),
             RegistryResponse::Error(RegistryRpcError::DuplicateGroupName("dup".into())),
             RegistryResponse::Error(RegistryRpcError::SpawnRejected("oops".into())),
             RegistryResponse::Error(RegistryRpcError::SpawnNotSupported),
+            RegistryResponse::Error(RegistryRpcError::UnknownGroup("ghost".into())),
+            RegistryResponse::Error(RegistryRpcError::ScaleRejected("template mismatch".into())),
+            RegistryResponse::Error(RegistryRpcError::ScaleNotSupported),
         ] {
             let bytes = postcard::to_allocvec(&resp).expect("encode resp");
             let decoded: RegistryResponse = postcard::from_bytes(&bytes).expect("decode resp");

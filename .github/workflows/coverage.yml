@@ -24,7 +24,15 @@ name: Coverage
 on:
   push:
     branches: [master]
+    paths:
+      - 'net/**'
+      - 'go/**'
+      - '.github/workflows/coverage.yml'
   pull_request:
+    paths:
+      - 'net/**'
+      - 'go/**'
+      - '.github/workflows/coverage.yml'
 
 env:
   CARGO_TERM_COLOR: always

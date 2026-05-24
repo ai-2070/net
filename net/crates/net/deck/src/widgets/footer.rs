@@ -18,6 +18,7 @@ pub enum FocusKind {
     None,
     Node,
     Daemon,
+    Subnet,
 }
 
 pub fn render(
@@ -37,6 +38,7 @@ pub fn render(
     let line = match focus {
         FocusKind::Node => node_focus_chips(),
         FocusKind::Daemon => daemon_focus_chips(),
+        FocusKind::Subnet => subnet_focus_chips(),
         FocusKind::None => tab_chips(current),
     };
     frame.render_widget(Paragraph::new(line), area);
@@ -66,6 +68,22 @@ fn node_focus_chips() -> Line<'static> {
         chip_desc(" back   "),
         chip_key("q"),
         chip_desc(" quit"),
+    ]);
+    Line::from(spans)
+}
+
+/// Chips for the SUBNET focus page. j/k walks the member
+/// table; Enter drills into the NODE focus page for the
+/// cursored member.
+fn subnet_focus_chips() -> Line<'static> {
+    let mut spans = base_nav();
+    spans.extend([
+        chip_key("Enter"),
+        chip_desc(" node detail   "),
+        chip_key("Esc"),
+        chip_desc(" back   "),
+        chip_key("?"),
+        chip_desc(" help"),
     ]);
     Line::from(spans)
 }
@@ -198,9 +216,12 @@ fn tab_chips(current: Tab) -> Line<'static> {
                 chip_desc(" export   "),
             ]);
         }
-        Tab::Subnets | Tab::Gateways | Tab::Aggregators => {
-            // Read-only inspection tabs; no lowercase shortcuts.
-            // Reached via the uppercase `H` / `V` / `B` hidden tabs.
+        Tab::Subnets => {
+            spans.extend([chip_key("Enter"), chip_desc(" detail   ")]);
+        }
+        Tab::Gateways | Tab::Aggregators => {
+            // Read-only today. Gateways could grow channel
+            // drill-down; aggregators a summary detail card.
         }
     }
     spans.extend([

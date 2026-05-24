@@ -343,7 +343,6 @@ func (c *RegistryClient) Spawn(
 	if c.handle == nil {
 		return RegistryGroupSummary{}, ErrAggregatorHandleClosed
 	}
-	c.honorContextDeadline(ctx)
 	cTemplate := C.CString(templateName)
 	defer C.free(unsafe.Pointer(cTemplate))
 	cGroup := C.CString(groupName)
@@ -384,7 +383,6 @@ func (c *RegistryClient) Unregister(
 	if c.handle == nil {
 		return false, ErrAggregatorHandleClosed
 	}
-	c.honorContextDeadline(ctx)
 	cGroup := C.CString(groupName)
 	defer C.free(unsafe.Pointer(cGroup))
 	var errKind C.int

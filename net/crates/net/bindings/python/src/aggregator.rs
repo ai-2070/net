@@ -106,6 +106,12 @@ fn registry_err(py: Python<'_>, e: SdkRegistryClientError) -> PyErr {
             RegistryRpcError::SpawnNotSupported => {
                 ("spawn-not-supported", "daemon is read-only".to_string())
             }
+            RegistryRpcError::UnknownGroup(g) => ("unknown-group", g.clone()),
+            RegistryRpcError::ScaleRejected(d) => ("scale-rejected", d.clone()),
+            RegistryRpcError::ScaleNotSupported => (
+                "scale-not-supported",
+                "daemon doesn't accept dynamic scale".to_string(),
+            ),
         },
     };
     let message = format!("agg:{kind}: {detail}");

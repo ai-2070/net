@@ -33,6 +33,8 @@ const NET_ERR_BUFFER_TOO_SMALL: i32 = -7;
 
 #[test]
 fn net_poll_rejects_buffers_below_minimum_without_polling() {
+    // SAFETY: net_init accepts a null config pointer to mean
+    // "default configuration"; documented in the FFI surface.
     let handle = unsafe { net_init(ptr::null()) };
     assert!(!handle.is_null(), "net_init failed");
 
@@ -41,6 +43,9 @@ fn net_poll_rejects_buffers_below_minimum_without_polling() {
     // and dropped the response on this path; post-fix the rejection
     // happens before any cursor work.
     let mut buf = vec![0u8; 100];
+    // SAFETY: `handle` is the live handle returned by net_init
+    // above; `buf` is a locally-owned Vec whose pointer + length
+    // describe valid writable memory for the call's duration.
     let code = unsafe {
         net_poll(
             handle,
@@ -57,6 +62,8 @@ fn net_poll_rejects_buffers_below_minimum_without_polling() {
 
     // Even tinier buffer — same rejection.
     let mut tiny = vec![0u8; 10];
+    // SAFETY: same invariants as above — live handle, locally-
+    // owned writable Vec.
     let code = unsafe {
         net_poll(
             handle,
@@ -71,6 +78,8 @@ fn net_poll_rejects_buffers_below_minimum_without_polling() {
         code,
     );
 
+    // SAFETY: net_shutdown consumes the handle returned by
+    // net_init; the handle is still live at this point.
     let _ = unsafe { net_shutdown(handle) };
 }
 
@@ -83,6 +92,7 @@ fn net_poll_rejects_buffers_below_minimum_without_polling() {
 /// after free, so subsequent calls are no-ops.
 #[test]
 fn net_free_poll_result_is_idempotent() {
+    // SAFETY: null config pointer = "use defaults".
     let handle = unsafe { net_init(ptr::null()) };
     assert!(!handle.is_null(), "net_init failed");
 
@@ -96,11 +106,17 @@ fn net_free_poll_result_is_idempotent() {
     // First poll — populates the result. Default config + noop
     // adapter returns no events, so `events` and `next_id` may
     // both be null. The idempotency check still holds.
+    //
+    // SAFETY: live handle from net_init; `&mut result` is a
+    // valid pointer to a locally-owned NetPollResult.
     let code = unsafe { net_poll_ex(handle, 16, ptr::null::<c_char>(), &mut result as *mut _) };
     assert_eq!(code, 0, "net_poll_ex returned {} (expected 0)", code);
 
     // First free — releases whatever was allocated and nulls
     // the fields.
+    // SAFETY: `result` holds pointers populated (or left null)
+    // by net_poll_ex above; net_free_poll_result is documented
+    // to free those + null the fields.
     unsafe { net_free_poll_result(&mut result as *mut _) };
     assert!(result.events.is_null(), "events not nulled after free");
     assert_eq!(result.count, 0);
@@ -109,25 +125,36 @@ fn net_free_poll_result_is_idempotent() {
 
     // Second free — must be a no-op. Pre-fix this would
     // double-free the boxed slice and CString.
+    // SAFETY: idempotency is the contract under test — the
+    // function nulls the fields after the first free, so the
+    // second call sees nulls and is a no-op.
     unsafe { net_free_poll_result(&mut result as *mut _) };
 
     // And a third, just to be sure.
+    // SAFETY: same idempotency contract.
     unsafe { net_free_poll_result(&mut result as *mut _) };
 
     // Null pointer is also handled.
+    // SAFETY: net_free_poll_result is documented to accept a
+    // null result pointer as a no-op.
     unsafe { net_free_poll_result(ptr::null_mut::<NetPollResult>()) };
 
+    // SAFETY: live handle from net_init.
     let _ = unsafe { net_shutdown(handle) };
 }
 
 #[test]
 fn net_poll_accepts_buffers_at_or_above_minimum() {
+    // SAFETY: null config pointer = "use defaults".
     let handle = unsafe { net_init(ptr::null()) };
     assert!(!handle.is_null(), "net_init failed");
 
     // 4 KB comfortably exceeds the minimum, and the noop adapter
     // returns an empty event list so the response easily fits.
     let mut buf = vec![0u8; 4096];
+    // SAFETY: live handle from net_init; `c"..."` literal is a
+    // null-terminated 'static C-string; `buf` is a locally-owned
+    // writable Vec.
     let code = unsafe {
         net_poll(
             handle,
@@ -152,5 +179,6 @@ fn net_poll_accepts_buffers_at_or_above_minimum() {
         s,
     );
 
+    // SAFETY: live handle from net_init.
     let _ = unsafe { net_shutdown(handle) };
 }

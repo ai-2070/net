@@ -186,6 +186,53 @@ impl RegistryClient {
             .await
     }
 
+    /// Resize an existing group in place against the target
+    /// daemon. The daemon re-resolves `template_name` to
+    /// validate the resize target matches the group's current
+    /// `source_subnet` + `fold_kinds`; surviving replicas keep
+    /// their identity + generation. Returns the post-resize
+    /// snapshot.
+    pub async fn scale(
+        &self,
+        target_node_id: u64,
+        group_name: impl Into<String>,
+        template_name: impl Into<String>,
+        target_replica_count: u8,
+    ) -> Result<RegistryGroupSummary, RegistryClientError> {
+        self.scale_with_service(
+            target_node_id,
+            REGISTRY_SERVICE,
+            group_name,
+            template_name,
+            target_replica_count,
+        )
+        .await
+    }
+
+    /// `Scale` against a non-default service name.
+    pub async fn scale_with_service(
+        &self,
+        target_node_id: u64,
+        service: &str,
+        group_name: impl Into<String>,
+        template_name: impl Into<String>,
+        target_replica_count: u8,
+    ) -> Result<RegistryGroupSummary, RegistryClientError> {
+        let request = RegistryRequest::Scale {
+            group_name: group_name.into(),
+            template_name: template_name.into(),
+            target_replica_count,
+        };
+        let response = self.send(target_node_id, service, request).await?;
+        match response {
+            RegistryResponse::Scaled(summary) => Ok(summary),
+            RegistryResponse::Error(e) => Err(RegistryClientError::Server(e)),
+            other => Err(RegistryClientError::Codec(format!(
+                "unexpected response for Scale: {other:?}"
+            ))),
+        }
+    }
+
     /// `Unregister` against a non-default service name.
     pub async fn unregister_with_service(
         &self,

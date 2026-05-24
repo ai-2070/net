@@ -315,14 +315,14 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
     mesh_node.set_aggregator_registry(registry.clone());
     let mesh = Arc::new(mesh_node);
 
-    // Build the SpawnFn from the operator's template registry,
-    // then install the registry service with dynamic spawn
-    // support. Templates and the mesh handle are captured by
-    // the closure for the SpawnFn's lifetime (= the daemon's
-    // lifetime).
+    // Build the SpawnFn + ScaleFn from the operator's template
+    // registry, then install the registry service with both
+    // handlers. Templates and the mesh handle are captured by
+    // each closure for the daemon's lifetime.
     let spawner = make_spawner(config.templates.clone(), registry.clone(), mesh.clone());
+    let scaler = make_scaler(config.templates.clone(), registry.clone(), mesh.clone());
     let serve = registry
-        .install_registry_service_with_spawner(&mesh, spawner)
+        .install_registry_service_with_handlers(&mesh, spawner, scaler)
         .map_err(|e| DaemonError::Serve(format!("{e:?}")))?;
 
     let bound_addr = mesh.local_addr();
@@ -609,27 +609,43 @@ fn validate_template(tpl: &TemplateConfig, mesh: &Arc<MeshNode>) -> Result<(), D
 /// Build a [`SpawnFn`] backed by `templates`. The closure
 /// captures `registry` + `mesh` so it can resolve names, build
 /// daemons, and register the spawned group all in one place.
+/// Build an Arc-shared `HashMap<name, TemplateConfig>` for
+/// O(1) lookup at Spawn / Scale dispatch time. Cloning the
+/// inputs is fine — templates are small and the operator's
+/// config is immutable for the daemon's lifetime. Used by
+/// both [`make_spawner`] and [`make_scaler`].
+fn build_template_index(
+    templates: Vec<TemplateConfig>,
+) -> Arc<std::collections::HashMap<String, TemplateConfig>> {
+    Arc::new(templates.into_iter().map(|t| (t.name.clone(), t)).collect())
+}
+
+/// O(1) lookup against the template index with the typed
+/// `UnknownTemplate(name)` error on miss. Both Spawn and Scale
+/// dispatch through this so the operator-facing diagnostic stays
+/// consistent across the two ops.
+fn resolve_template(
+    by_name: &std::collections::HashMap<String, TemplateConfig>,
+    name: &str,
+) -> Result<TemplateConfig, RegistryRpcError> {
+    by_name
+        .get(name)
+        .cloned()
+        .ok_or_else(|| RegistryRpcError::UnknownTemplate(name.to_string()))
+}
+
 fn make_spawner(
     templates: Vec<TemplateConfig>,
     registry: Arc<AggregatorRegistry>,
     mesh: Arc<MeshNode>,
 ) -> SpawnFn {
-    use std::collections::HashMap;
-    // Index by template name for O(1) lookup. Cloning is fine
-    // — templates are small and the operator's config is
-    // immutable for the daemon's lifetime.
-    let by_name: HashMap<String, TemplateConfig> =
-        templates.into_iter().map(|t| (t.name.clone(), t)).collect();
-    let by_name = Arc::new(by_name);
+    let by_name = build_template_index(templates);
     Box::new(move |req| {
         let registry = registry.clone();
         let mesh = mesh.clone();
         let by_name = by_name.clone();
         Box::pin(async move {
-            let template = by_name
-                .get(&req.template_name)
-                .cloned()
-                .ok_or_else(|| RegistryRpcError::UnknownTemplate(req.template_name.clone()))?;
+            let template = resolve_template(&by_name, &req.template_name)?;
             let spec = AggregatorSpec::from_template(
                 &template,
                 req.group_name.clone(),
@@ -642,6 +658,104 @@ fn make_spawner(
                     | SpawnAndRegisterError::RegisterFailed(s) => {
                         RegistryRpcError::SpawnRejected(s)
                     }
+                })?;
+            Ok(snapshot_group(&entry).await)
+        })
+    })
+}
+
+/// Build a [`ScaleFn`] that resolves the supplied template,
+/// verifies it matches the existing group's `source_subnet` +
+/// `fold_kinds`, and invokes [`AggregatorRegistry::scale_group`]
+/// with a factory that constructs fresh `AggregatorDaemon`s
+/// from the same spec. The factory closure mirrors the one in
+/// [`spawn_and_register`] so grow-added replicas use the exact
+/// per-replica config the original spawn used — preserving
+/// identity continuity (group_seed-derived) for the lifetime
+/// of the group.
+fn make_scaler(
+    templates: Vec<TemplateConfig>,
+    registry: Arc<AggregatorRegistry>,
+    mesh: Arc<MeshNode>,
+) -> net::adapter::net::behavior::aggregator::ScaleFn {
+    let by_name = build_template_index(templates);
+    Box::new(move |req| {
+        let registry = registry.clone();
+        let mesh = mesh.clone();
+        let by_name = by_name.clone();
+        Box::pin(async move {
+            let template = resolve_template(&by_name, &req.template_name)?;
+            // Build the spec from the template + supplied group
+            // name. `replica_count` here is the *target* — used
+            // only to materialize the spec for factory closure
+            // construction; the actual grow/shrink delta lives
+            // in scale_group.
+            let spec = AggregatorSpec::from_template(
+                &template,
+                req.group_name.clone(),
+                req.target_replica_count,
+            )
+            .map_err(|e| match e {
+                RegistryRpcError::SpawnRejected(d) => RegistryRpcError::ScaleRejected(d),
+                other => other,
+            })?;
+            let existing_entry = registry
+                .get(&req.group_name)
+                .ok_or_else(|| RegistryRpcError::UnknownGroup(req.group_name.clone()))?;
+            // Fast path: target == current. The replica_count
+            // accessor reads through a brief lock without
+            // allocating a per-replica snapshot or polling each
+            // replica's health() — skip the (potentially
+            // expensive) validation + scale_group invocation and
+            // return the current snapshot directly.
+            if req.target_replica_count as usize == existing_entry.replica_count().await {
+                return Ok(snapshot_group(&existing_entry).await);
+            }
+            // Validate the resolved spec against the existing
+            // group's live config. Read from the first replica's
+            // AggregatorConfig — every replica shares the same
+            // spec, so any one is representative.
+            {
+                let snap = existing_entry.snapshot().await;
+                if let Some(replica) = snap.replicas.first() {
+                    let cfg = replica.config();
+                    if cfg.source_subnet != spec.source_subnet {
+                        return Err(RegistryRpcError::ScaleRejected(format!(
+                            "template `{}` source_subnet {} does not match \
+                             existing group's source_subnet {}",
+                            req.template_name, spec.source_subnet, cfg.source_subnet
+                        )));
+                    }
+                    if cfg.fold_kinds != spec.fold_kinds {
+                        return Err(RegistryRpcError::ScaleRejected(format!(
+                            "template `{}` fold_kinds differ from existing \
+                             group's fold_kinds",
+                            req.template_name
+                        )));
+                    }
+                }
+            }
+            let aggregator_cfg = spec.aggregator_config();
+            let factory_mesh = mesh.clone();
+            let factory_cfg = aggregator_cfg.clone();
+            let factory = move |_idx: u8| -> Arc<AggregatorDaemon> {
+                #[allow(clippy::expect_used)]
+                Arc::new(
+                    AggregatorDaemon::new(factory_cfg.clone(), factory_mesh.clone())
+                        .expect("aggregator config validated by AggregatorSpec resolution"),
+                )
+            };
+            let entry = registry
+                .scale_group(&req.group_name, req.target_replica_count, factory)
+                .await
+                .map_err(|e| match e {
+                    net::adapter::net::behavior::aggregator::AggregatorRegistryError::NotFound(g) => {
+                        RegistryRpcError::UnknownGroup(g)
+                    }
+                    net::adapter::net::behavior::aggregator::AggregatorRegistryError::ScaleFailed(d) => {
+                        RegistryRpcError::ScaleRejected(d)
+                    }
+                    other => RegistryRpcError::ScaleRejected(format!("{other}")),
                 })?;
             Ok(snapshot_group(&entry).await)
         })

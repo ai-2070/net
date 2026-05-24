@@ -53,6 +53,15 @@ pub const NET_REGISTRY_ERR_DUPLICATE_GROUP_NAME: i32 = 4;
 pub const NET_REGISTRY_ERR_SPAWN_REJECTED: i32 = 5;
 /// Server doesn't accept dynamic spawn (read-only daemon).
 pub const NET_REGISTRY_ERR_SPAWN_NOT_SUPPORTED: i32 = 6;
+/// Server handler rejected `Scale`: no group by that name is
+/// registered on the target.
+pub const NET_REGISTRY_ERR_UNKNOWN_GROUP: i32 = 8;
+/// Server handler rejected `Scale` for a daemon-defined reason
+/// (template mismatch, replica spawn/stop failure, etc.).
+pub const NET_REGISTRY_ERR_SCALE_REJECTED: i32 = 9;
+/// Server doesn't accept dynamic scale (no scale handler
+/// installed).
+pub const NET_REGISTRY_ERR_SCALE_NOT_SUPPORTED: i32 = 10;
 /// Caller-side error: a string argument wasn't valid UTF-8 or
 /// a pointer was null where one was required.
 pub const NET_REGISTRY_ERR_INVALID_ARGS: i32 = 99;
@@ -700,6 +709,18 @@ fn classify(err: &RegistryClientError) -> (i32, String) {
             NET_REGISTRY_ERR_SPAWN_NOT_SUPPORTED,
             "daemon is read-only (no spawn handler installed)".to_string(),
         ),
+        RegistryClientError::Server(RegistryRpcError::UnknownGroup(g)) => (
+            NET_REGISTRY_ERR_UNKNOWN_GROUP,
+            format!("unknown group: {g}"),
+        ),
+        RegistryClientError::Server(RegistryRpcError::ScaleRejected(d)) => (
+            NET_REGISTRY_ERR_SCALE_REJECTED,
+            format!("scale rejected: {d}"),
+        ),
+        RegistryClientError::Server(RegistryRpcError::ScaleNotSupported) => (
+            NET_REGISTRY_ERR_SCALE_NOT_SUPPORTED,
+            "daemon doesn't accept dynamic scale (no scaler installed)".to_string(),
+        ),
     }
 }
 
@@ -785,6 +806,8 @@ mod tests {
         let g = RegistryGroupSummary {
             name: "alpha".into(),
             group_seed: [0xABu8; 32],
+            source_subnet: crate::adapter::net::subnet::SubnetId::GLOBAL,
+            fold_kinds: vec![0x0001],
             replicas: vec![
                 crate::adapter::net::behavior::aggregator::RegistryReplicaSummary {
                     generation: 42,

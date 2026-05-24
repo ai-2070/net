@@ -126,6 +126,11 @@ pub fn timeout(msg: impl Into<String>) -> CliError {
 }
 
 #[allow(dead_code)]
+pub fn connection_failure(msg: impl Into<String>) -> CliError {
+    CliError::new(ExitCodeKind::ConnectionFailure, msg)
+}
+
+#[allow(dead_code)]
 pub fn confirmation_refused() -> CliError {
     CliError::new(
         ExitCodeKind::ConfirmationRefused,

@@ -14,6 +14,7 @@ pub mod node_page;
 pub mod nodes;
 pub mod nrpc;
 pub mod replicas;
+pub mod subnet_page;
 pub mod subnets;
 
 /// Window an indexable list of `total` items into `body_h` rows
@@ -24,6 +25,13 @@ pub mod subnets;
 ///
 /// Returns `(start, end, hidden_above, hidden_below)` — the
 /// visible slice is `start..end`.
+///
+/// # See also
+///
+/// `widgets::tab_bar::scroll_window_horizontal` — the
+/// variable-width, horizontal-strip sibling used by the tab
+/// bar. Same 2-pass reservation shape with different chip
+/// sizes; changes here usually deserve a look there.
 pub fn scroll_window(total: usize, body_h: usize, cursor: usize) -> (usize, usize, usize, usize) {
     if total == 0 || body_h == 0 {
         return (0, 0, 0, 0);

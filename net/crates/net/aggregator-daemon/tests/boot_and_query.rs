@@ -257,6 +257,189 @@ async fn spawn_and_unregister_rpc_round_trip_against_running_daemon() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scale_grows_existing_group_via_wire() {
+    let toml = format!(
+        r#"
+            listen = "127.0.0.1:0"
+            psk_hex = "{PSK_HEX}"
+
+            [[template]]
+            name = "primary"
+            source_subnet = "3.7"
+            fold_kinds = [1]
+            summary_interval_ms = 50
+        "#
+    );
+    let cfg_file = write_temp_config(&toml).await;
+    let cli = Cli {
+        config: cfg_file.path().to_path_buf(),
+        listen: None,
+        verbose: 0,
+        print_bootstrap: false,
+    };
+    let booted = boot(cli).await.expect("daemon boot");
+
+    let client_node = build_client_node().await;
+    let daemon_node_id = booted.mesh.node_id();
+    let client_node_id = client_node.node_id();
+    let daemon_clone = booted.mesh.clone();
+    let accept = tokio::spawn(async move { daemon_clone.accept(client_node_id).await });
+    client_node
+        .connect(booted.bound_addr, &booted.public_key, daemon_node_id)
+        .await
+        .expect("connect");
+    accept.await.expect("join").expect("accept");
+    booted.mesh.start();
+    client_node.start();
+
+    let client = RegistryClient::new(client_node).with_deadline(Duration::from_secs(2));
+
+    // Spawn at 2 replicas.
+    let initial = client
+        .spawn(daemon_node_id, "primary", "swarm", 2)
+        .await
+        .expect("spawn");
+    assert_eq!(initial.replicas.len(), 2);
+    let original_generations: Vec<u64> = initial.replicas.iter().map(|r| r.generation).collect();
+
+    // Scale to 4. Generations on the held replicas (indices 0,1)
+    // should be >= what they were after spawn (they keep ticking)
+    // — not back to zero, which would indicate a restart.
+    let scaled = client
+        .scale(daemon_node_id, "swarm", "primary", 4)
+        .await
+        .expect("scale");
+    assert_eq!(scaled.replicas.len(), 4);
+    for (i, gen0) in original_generations.iter().enumerate() {
+        assert!(
+            scaled.replicas[i].generation >= *gen0,
+            "replica {i}: gen regressed (was >= {gen0}, now {})",
+            scaled.replicas[i].generation
+        );
+    }
+
+    // Scale back down to 1.
+    let shrunk = client
+        .scale(daemon_node_id, "swarm", "primary", 1)
+        .await
+        .expect("scale-down");
+    assert_eq!(shrunk.replicas.len(), 1);
+
+    drain_registry(&booted.registry).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scale_unknown_group_returns_typed_server_error() {
+    let toml = format!(
+        r#"
+            listen = "127.0.0.1:0"
+            psk_hex = "{PSK_HEX}"
+
+            [[template]]
+            name = "primary"
+            source_subnet = "3.7"
+            fold_kinds = [1]
+            summary_interval_ms = 50
+        "#
+    );
+    let cfg_file = write_temp_config(&toml).await;
+    let cli = Cli {
+        config: cfg_file.path().to_path_buf(),
+        listen: None,
+        verbose: 0,
+        print_bootstrap: false,
+    };
+    let booted = boot(cli).await.expect("daemon boot");
+
+    let client_node = build_client_node().await;
+    let daemon_node_id = booted.mesh.node_id();
+    let client_node_id = client_node.node_id();
+    let daemon_clone = booted.mesh.clone();
+    let accept = tokio::spawn(async move { daemon_clone.accept(client_node_id).await });
+    client_node
+        .connect(booted.bound_addr, &booted.public_key, daemon_node_id)
+        .await
+        .expect("connect");
+    accept.await.expect("join").expect("accept");
+    booted.mesh.start();
+    client_node.start();
+
+    let client = RegistryClient::new(client_node).with_deadline(Duration::from_secs(2));
+    use net::adapter::net::behavior::aggregator::{RegistryClientError, RegistryRpcError};
+    match client.scale(daemon_node_id, "ghost", "primary", 2).await {
+        Err(RegistryClientError::Server(RegistryRpcError::UnknownGroup(g))) => {
+            assert_eq!(g, "ghost");
+        }
+        other => panic!("expected UnknownGroup, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scale_template_mismatch_returns_typed_server_error() {
+    // Two templates with different source_subnets. Spawn the
+    // group via one, then attempt to scale using the other —
+    // the daemon detects the spec mismatch and refuses.
+    let toml = format!(
+        r#"
+            listen = "127.0.0.1:0"
+            psk_hex = "{PSK_HEX}"
+
+            [[template]]
+            name = "primary"
+            source_subnet = "3.7"
+            fold_kinds = [1]
+            summary_interval_ms = 50
+
+            [[template]]
+            name = "secondary"
+            source_subnet = "3.8"
+            fold_kinds = [1]
+            summary_interval_ms = 50
+        "#
+    );
+    let cfg_file = write_temp_config(&toml).await;
+    let cli = Cli {
+        config: cfg_file.path().to_path_buf(),
+        listen: None,
+        verbose: 0,
+        print_bootstrap: false,
+    };
+    let booted = boot(cli).await.expect("daemon boot");
+
+    let client_node = build_client_node().await;
+    let daemon_node_id = booted.mesh.node_id();
+    let client_node_id = client_node.node_id();
+    let daemon_clone = booted.mesh.clone();
+    let accept = tokio::spawn(async move { daemon_clone.accept(client_node_id).await });
+    client_node
+        .connect(booted.bound_addr, &booted.public_key, daemon_node_id)
+        .await
+        .expect("connect");
+    accept.await.expect("join").expect("accept");
+    booted.mesh.start();
+    client_node.start();
+
+    let client = RegistryClient::new(client_node).with_deadline(Duration::from_secs(2));
+    client
+        .spawn(daemon_node_id, "primary", "swarm", 1)
+        .await
+        .expect("spawn");
+
+    use net::adapter::net::behavior::aggregator::{RegistryClientError, RegistryRpcError};
+    match client.scale(daemon_node_id, "swarm", "secondary", 3).await {
+        Err(RegistryClientError::Server(RegistryRpcError::ScaleRejected(msg))) => {
+            assert!(
+                msg.contains("source_subnet") || msg.contains("does not match"),
+                "diagnostic was: {msg}"
+            );
+        }
+        other => panic!("expected ScaleRejected(template mismatch), got {other:?}"),
+    }
+
+    drain_registry(&booted.registry).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn spawn_unknown_template_returns_typed_server_error() {
     let toml = format!(
         r#"

@@ -527,14 +527,29 @@ impl DaemonRuntime {
         // never crosses this boundary as raw bytes — see
         // `MeshNode::migration_identity_context`.
         let ctx = self.inner.mesh.inner().migration_identity_context();
+        // Capture the active tokio Handle so the substrate callbacks
+        // can spawn even when fired from a thread that doesn't have a
+        // current runtime (e.g. an FFI trampoline driving the
+        // migration handler synchronously from a Go test). The
+        // substrate explicitly calls these hooks synchronously and
+        // expects them to `tokio::spawn` the actual work — without an
+        // explicit Handle, `tokio::spawn` panics with "no reactor
+        // running" on non-runtime threads.
+        //
+        // Safe to call `Handle::current()` here: `build_migration_handler`
+        // is only invoked from `pub async fn start`, which always
+        // runs inside a tokio runtime.
+        let rt = tokio::runtime::Handle::current();
         let inner_for_rebind = self.inner.clone();
+        let rt_for_rebind = rt.clone();
         let post_restore: PostRestoreCallback = Arc::new(move |origin_hash: u64| {
             let inner = inner_for_rebind.clone();
-            tokio::spawn(async move {
+            rt_for_rebind.spawn(async move {
                 replay_subscriptions(inner, origin_hash).await;
             });
         });
         let inner_for_teardown = self.inner.clone();
+        let rt_for_teardown = rt.clone();
         let pre_cleanup: PreCleanupCallback = Arc::new(move |origin_hash: u64| {
             // Snapshot the ledger BEFORE cleanup drops the host —
             // after that, the ledger is gone. Spawn async
@@ -548,7 +563,7 @@ impl DaemonRuntime {
                 return;
             }
             let inner = inner_for_teardown.clone();
-            tokio::spawn(async move {
+            rt_for_teardown.spawn(async move {
                 teardown_subscriptions(inner, bindings).await;
             });
         });

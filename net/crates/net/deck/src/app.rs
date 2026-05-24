@@ -81,15 +81,19 @@ pub enum Tab {
 }
 
 impl Tab {
-    /// Tab order rendered by the tab strip. FAILURES + AUDIT
-    /// are hidden (their variants, state, render modules, and
-    /// key handlers stay in the codebase so re-enabling is a
-    /// one-line addition here). The strip carries 10 slots —
-    /// keys `1`..`9` plus `0` — with LOGS pinned to `0` so it
-    /// stays reachable from any tab without clobbering the
-    /// alphabetic shortcuts.
-    pub fn all() -> [Tab; 10] {
-        [
+    /// Tab order rendered by the tab strip. The first 10 slots
+    /// (`NetMap`..`Logs`) carry numeric shortcuts `1`..`9` plus
+    /// `0` — LOGS is pinned to `0` so the alphabetic shortcuts
+    /// stay free. The trailing four (`Subnets`, `Gateways`,
+    /// `Aggregators`, `Audit`) render to the right of LOGS in
+    /// the strip without numeric prefixes; they're reachable
+    /// via letter shortcuts (`H`/`V`/`B`/`U`) and via
+    /// `Tab`/`Shift+Tab` cycling. FAILURES stays hidden — its
+    /// variant + state + render module are still in the
+    /// codebase for one-line re-enablement here.
+    pub fn all() -> &'static [Tab] {
+        &[
+            // Primary — numeric shortcuts 1..9 + 0.
             Tab::NetMap,
             Tab::Nodes,
             Tab::Daemons,
@@ -100,8 +104,18 @@ impl Tab {
             Tab::Migrations,
             Tab::Replicas,
             Tab::Logs,
+            // Extended — letter shortcuts, no numeric prefix.
+            Tab::Subnets,
+            Tab::Gateways,
+            Tab::Aggregators,
+            Tab::Audit,
         ]
     }
+
+    /// Number of entries in [`Tab::all`] that carry numeric
+    /// keystroke prefixes (`[1]`..`[9]` + `[0]`). Tabs at or
+    /// beyond this index render label-only.
+    pub const PRIMARY_COUNT: usize = 10;
 
     pub fn label(self) -> &'static str {
         match self {
@@ -120,6 +134,33 @@ impl Tab {
             Tab::Subnets => "SUBNETS",
             Tab::Gateways => "GATEWAYS",
             Tab::Aggregators => "AGGREGATORS",
+        }
+    }
+
+    /// Letter-shortcut chip for tabs past the digit-shortcut
+    /// range (`Tab::PRIMARY_COUNT..`). The tab strip's `[N]`
+    /// prefix uses digits 1..9 + 0 for the first 10 tabs;
+    /// later tabs get a single uppercase letter chosen to
+    /// avoid keymap collisions documented at the keystroke
+    /// site:
+    ///   - `H` (subnets / Hierarchy) — `S` collides with
+    ///     Groups, `G` with vim-style bottom.
+    ///   - `V` (gateways / Visibility gate) — `G` taken.
+    ///   - `B` (aggregators).
+    ///   - `U` (aUdit) — `A` taken by ICE flush-avoid-lists
+    ///     on a node focus page.
+    ///
+    /// Returning `None` for primary tabs (which use digit
+    /// shortcuts) plus any future tab without an assigned
+    /// letter — the tab strip renderer falls back to a
+    /// label-only entry in that case.
+    pub fn letter_shortcut(self) -> Option<char> {
+        match self {
+            Tab::Subnets => Some('H'),
+            Tab::Gateways => Some('V'),
+            Tab::Aggregators => Some('B'),
+            Tab::Audit => Some('U'),
+            _ => None,
         }
     }
 
@@ -159,6 +200,15 @@ pub struct App {
     /// collections are empty to decide between live and
     /// fixture rendering paths.
     pub snapshot: Arc<MeshOsSnapshot>,
+    /// Memoized SUBNETS-tab derivation against the current
+    /// snapshot. `subnet_rollups_with_local` and
+    /// `aggregator_source_subnets` get called every frame on
+    /// the SUBNETS tab (8 fps); walking the snapshot peers +
+    /// allocating fresh `HashSet`/`Vec` per frame is wasted
+    /// work. Cleared by `refresh_snapshot` whenever the
+    /// snapshot Arc swaps — until then, repeated render-path
+    /// calls reuse the cached derivation.
+    subnet_view_cache: std::cell::RefCell<SubnetViewCache>,
     /// Phase-4 streaming tail for LOGS. Fed by a background
     /// `subscribe_logs` task; the LOGS render path reads from
     /// this buffer instead of `snapshot.log_ring`, so the
@@ -190,7 +240,17 @@ pub struct App {
     pub blobs_tail: crate::streams::BlobsTail,
     /// Cursor on the BLOBS tab — index into the visible
     /// (filtered) projection of `blobs_tail.snapshot()`.
+    /// Persists across tab switches so the operator's
+    /// selection survives a quick pivot away (same for every
+    /// `*_cursor` field below).
     pub blobs_cursor: usize,
+    /// Cursor on the GATEWAYS tab — resolved export-rule rows.
+    pub gateways_cursor: usize,
+    /// Cursor on the SUBNETS tab — `subnets_with_members` rows.
+    pub subnets_cursor: usize,
+    /// Cursor on the AGGREGATORS tab — buffered
+    /// `SummaryAnnouncement`s (newest-first).
+    pub aggregators_cursor: usize,
     /// BLOBS substring search. Matches hash prefix; empty =
     /// no filter.
     pub blobs_search: String,
@@ -296,6 +356,11 @@ pub struct App {
     /// NET.MAP, DATAFORTS, or a Daemon-page placement row;
     /// cleared by `[Esc]`.
     pub node_focus: Option<crate::tabs::node_page::NodeFocusEntry>,
+    /// SUBNET focus page state — `Some` after the operator
+    /// pressed `Enter` on a cursored SUBNETS row. The focus
+    /// page renders instead of the SUBNETS list until the
+    /// operator hits `Esc`.
+    pub subnet_focus: Option<crate::tabs::subnet_page::SubnetFocusEntry>,
     /// Focused daemon — same shape as `node_focus` but for the
     /// Daemon page. Mutually exclusive with `node_focus`; each
     /// `focus_*` helper clears the other before setting.
@@ -517,6 +582,26 @@ fn synthetic_greedy_view(node_id: u64, label: Option<&'static str>) -> tabs::dat
     }
 }
 
+/// Memoized SUBNETS-tab derivations against the most-recent
+/// snapshot. Single-threaded UI code, so `RefCell` interior
+/// mutation is fine. Both fields are `None` after a snapshot
+/// swap; populated on first access; reused per frame.
+#[derive(Default)]
+struct SubnetViewCache {
+    rollups: Option<(
+        Option<net_sdk::subnets::SubnetId>,
+        Vec<net_sdk::deck::SubnetRollup>,
+    )>,
+    agg_subnets: Option<std::collections::HashSet<net_sdk::subnets::SubnetId>>,
+}
+
+impl SubnetViewCache {
+    fn invalidate(&mut self) {
+        self.rollups = None;
+        self.agg_subnets = None;
+    }
+}
+
 impl App {
     pub fn new(
         deck: Arc<DeckClient>,
@@ -544,6 +629,9 @@ impl App {
             nrpc_tail,
             blobs_tail,
             blobs_cursor: 0,
+            gateways_cursor: 0,
+            subnets_cursor: 0,
+            aggregators_cursor: 0,
             blobs_search: String::new(),
             blobs_search_editing: false,
             bookmarks,
@@ -554,6 +642,7 @@ impl App {
             tick: 0,
             deck,
             snapshot,
+            subnet_view_cache: std::cell::RefCell::new(SubnetViewCache::default()),
             groups_cursor: DaemonCursor::default(),
             daemons_cursor: 0,
             netmap_cursor: 0,
@@ -575,6 +664,7 @@ impl App {
             modal: None,
             node_focus: None,
             daemon_focus: None,
+            subnet_focus: None,
             logs_back: None,
             toast: None,
             toast_tx,
@@ -619,6 +709,9 @@ impl App {
 
     fn refresh_snapshot(&mut self) {
         self.snapshot = Arc::new(self.deck.status());
+        // Snapshot just swapped — every memoized derivation
+        // against it is now stale.
+        self.subnet_view_cache.borrow_mut().invalidate();
     }
 
     /// Drain any toasts queued by detached dispatch tasks; the
@@ -859,6 +952,47 @@ impl App {
         if let Some(f) = self.node_focus.as_mut() {
             f.placement_cursor = next;
         }
+    }
+
+    /// Step the SUBNET focus page's member cursor, clamped to
+    /// the visible (in-snapshot) member count.
+    fn step_subnet_member_cursor(&mut self, delta: i32) {
+        let Some(focus) = self.subnet_focus.as_ref() else {
+            return;
+        };
+        let n = crate::tabs::subnet_page::visible_member_count(
+            focus,
+            &self.snapshot,
+            Some(self.this_node),
+        );
+        if n == 0 {
+            return;
+        }
+        let cur = focus.member_cursor as i64 + delta as i64;
+        let last = n.saturating_sub(1) as i64;
+        let next = cur.clamp(0, last) as usize;
+        if let Some(f) = self.subnet_focus.as_mut() {
+            f.member_cursor = next;
+        }
+    }
+
+    /// Open the NODE focus page for the cursored member of the
+    /// drilled subnet. Drops `subnet_focus` so the render
+    /// dispatcher promotes the node page in its place — same
+    /// shape as `open_cursored_node_placement`.
+    fn open_cursored_subnet_member(&mut self) {
+        let Some(focus) = self.subnet_focus.as_ref() else {
+            return;
+        };
+        let Some(id) = crate::tabs::subnet_page::cursored_member_id(
+            focus,
+            &self.snapshot,
+            Some(self.this_node),
+        ) else {
+            return;
+        };
+        self.subnet_focus = None;
+        self.focus_host(id, None);
     }
 
     /// Open the cursored placement daemon's Daemon page from the
@@ -1251,6 +1385,91 @@ impl App {
     /// The modal owns its copy of the entry so a subsequent
     /// inventory refresh (~500 ms tick) under the cursor
     /// doesn't shift the body the operator is reading.
+    /// Snapshot the cursored SUBNETS row into `subnet_focus`.
+    /// Mirrors the demo-fixture fallback so the focus page
+    /// works even when no real mesh is wired (e.g. `--features
+    /// demo`).
+    fn open_subnet_focus(&mut self) {
+        let rollups = self.subnet_rollups();
+        if rollups.is_empty() {
+            return;
+        }
+        let idx = self.subnets_cursor.min(rollups.len() - 1);
+        let row = &rollups[idx];
+        self.subnet_focus = Some(crate::tabs::subnet_page::SubnetFocusEntry {
+            subnet: row.subnet,
+            members: row.members.clone(),
+            is_local: row.is_local,
+            member_cursor: 0,
+        });
+    }
+
+    /// Subnets known to host an aggregator source. Powers the
+    /// SUBNETS `AGG` column. Today the only sync source is
+    /// `aggregator_snapshot()` (one entry — the deck's local
+    /// aggregator if installed); a future slice can layer in a
+    /// periodically-refreshed `aggregator_registry_snapshot`
+    /// cache for cluster-wide coverage.
+    fn aggregator_source_subnets(&self) -> std::collections::HashSet<net_sdk::subnets::SubnetId> {
+        if let Some(cached) = self.subnet_view_cache.borrow().agg_subnets.as_ref() {
+            return cached.clone();
+        }
+        let mut out = std::collections::HashSet::new();
+        if let Some(snap) = self.deck.aggregator_snapshot() {
+            out.insert(snap.source_subnet);
+        }
+        #[cfg(feature = "demo")]
+        if out.is_empty() {
+            // Fixture aggregator lives on `1.2`; surface it so
+            // the demo SUBNETS panel lights up at least one row.
+            out.insert(crate::demo::fixtures::aggregator().source_subnet);
+        }
+        self.subnet_view_cache.borrow_mut().agg_subnets = Some(out.clone());
+        out
+    }
+
+    /// Pull the subnet rollup list the SUBNETS panel renders.
+    /// Mirrors the demo-fixture fallback so cursor + Enter
+    /// work even when no real mesh is wired.
+    fn subnet_rollups(&self) -> Vec<net_sdk::deck::SubnetRollup> {
+        self.subnet_rollups_with_local().1
+    }
+
+    /// Same as `subnet_rollups` but also returns the resolved
+    /// `local` subnet pointer the table uses. Under
+    /// `--features demo` the fixture pulls real peer IDs from
+    /// `self.snapshot.peers` so members tagged into each fixture
+    /// subnet actually resolve when the operator drills in.
+    fn subnet_rollups_with_local(
+        &self,
+    ) -> (
+        Option<net_sdk::subnets::SubnetId>,
+        Vec<net_sdk::deck::SubnetRollup>,
+    ) {
+        if let Some(cached) = self.subnet_view_cache.borrow().rollups.as_ref() {
+            return cached.clone();
+        }
+        let local = self.deck.local_subnet();
+        let rollups = self.deck.subnets_with_members(None);
+        let value = {
+            #[cfg(feature = "demo")]
+            {
+                if rollups.is_empty() && local.is_none() {
+                    let peer_ids: Vec<u64> = self.snapshot.peers.keys().copied().collect();
+                    crate::demo::fixtures::subnets(self.this_node, &peer_ids)
+                } else {
+                    (local, rollups)
+                }
+            }
+            #[cfg(not(feature = "demo"))]
+            {
+                (local, rollups)
+            }
+        };
+        self.subnet_view_cache.borrow_mut().rollups = Some(value.clone());
+        value
+    }
+
     fn open_blob_detail(&mut self) {
         let entries = self.blobs_tail.snapshot();
         if entries.is_empty() {
@@ -1572,6 +1791,55 @@ impl App {
                 return;
             }
         }
+        // Subnet focus page absorber. Mirrors the node-focus
+        // shape: Esc / tab-switch drop the focus; j/k/g/G walk
+        // the members table; Enter drills into the NODE focus
+        // page for the cursored member.
+        if self.subnet_focus.is_some() {
+            if matches!(code, KeyCode::Esc) {
+                self.subnet_focus = None;
+                return;
+            }
+            if is_tab_switch {
+                self.subnet_focus = None;
+                // fall through to the normal handler
+            } else if matches!(code, KeyCode::Down | KeyCode::Char('j' | 's')) {
+                self.step_subnet_member_cursor(1);
+                return;
+            } else if matches!(code, KeyCode::Up | KeyCode::Char('k' | 'w')) {
+                self.step_subnet_member_cursor(-1);
+                return;
+            } else if matches!(code, KeyCode::Char('g')) {
+                if let Some(f) = self.subnet_focus.as_mut() {
+                    f.member_cursor = 0;
+                }
+                return;
+            } else if matches!(code, KeyCode::Char('G')) {
+                let n = self
+                    .subnet_focus
+                    .as_ref()
+                    .map(|f| {
+                        crate::tabs::subnet_page::visible_member_count(
+                            f,
+                            &self.snapshot,
+                            Some(self.this_node),
+                        )
+                    })
+                    .unwrap_or(0);
+                if let Some(f) = self.subnet_focus.as_mut() {
+                    f.member_cursor = n.saturating_sub(1);
+                }
+                return;
+            } else if matches!(code, KeyCode::Enter) {
+                self.open_cursored_subnet_member();
+                return;
+            } else if matches!(code, KeyCode::Char('?')) {
+                self.modal = Some(Modal::Help);
+                return;
+            } else {
+                return;
+            }
+        }
         // Search prompts are the second-tier absorber: while a
         // tab's `_editing` flag is set, keystrokes go into that
         // tab's query buffer rather than the normal bindings.
@@ -1643,6 +1911,9 @@ impl App {
             KeyCode::Char('H') => self.current = Tab::Subnets,
             KeyCode::Char('V') => self.current = Tab::Gateways,
             KeyCode::Char('B') => self.current = Tab::Aggregators,
+            // `U` for aUdit — `A` is taken by ICE flush-avoid-lists
+            // when on a node focus page (app.rs:1535).
+            KeyCode::Char('U') => self.current = Tab::Audit,
             // DAEMON tab navigation. Lowercase letters walk the
             // member axis (cursor inside the focused group);
             // uppercase letters + arrows walk the group axis.
@@ -1756,6 +2027,27 @@ impl App {
             KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::Blobs => {
                 self.blobs_cursor = self.blobs_cursor.saturating_sub(1);
             }
+            KeyCode::Char('j' | 's') | KeyCode::Down if self.current == Tab::Gateways => {
+                self.gateways_cursor = self.gateways_cursor.saturating_add(1);
+                self.clamp_gateways_cursor();
+            }
+            KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::Gateways => {
+                self.gateways_cursor = self.gateways_cursor.saturating_sub(1);
+            }
+            KeyCode::Char('j' | 's') | KeyCode::Down if self.current == Tab::Subnets => {
+                self.subnets_cursor = self.subnets_cursor.saturating_add(1);
+                self.clamp_subnets_cursor();
+            }
+            KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::Subnets => {
+                self.subnets_cursor = self.subnets_cursor.saturating_sub(1);
+            }
+            KeyCode::Char('j' | 's') | KeyCode::Down if self.current == Tab::Aggregators => {
+                self.aggregators_cursor = self.aggregators_cursor.saturating_add(1);
+                self.clamp_aggregators_cursor();
+            }
+            KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::Aggregators => {
+                self.aggregators_cursor = self.aggregators_cursor.saturating_sub(1);
+            }
             // Vim-style top/bottom on every cursor-driven tab.
             // `g` jumps to the first row / group / member; `G`
             // jumps to the last. No-op on tabs without a list.
@@ -1833,6 +2125,13 @@ impl App {
             // entry. Snapshots the entry so a subsequent
             // inventory refresh doesn't shift the body.
             KeyCode::Enter if self.current == Tab::Blobs => self.open_blob_detail(),
+            // SUBNETS: Enter opens the SUBNET focus page for the
+            // cursored row — header (id/depth/parent/members/local)
+            // + member list with peer health rolled up from the
+            // current snapshot. Esc returns to the SUBNETS table.
+            KeyCode::Enter if self.current == Tab::Subnets => {
+                self.open_subnet_focus();
+            }
             // Open the dedicated node detail page for the
             // cursored peer on NODES (`nodes_cursor`) or NET.MAP
             // (`netmap_cursor`). Both tabs share the
@@ -2154,6 +2453,74 @@ impl App {
         }
     }
 
+    /// Count gateway export rows the panel will render. Reads
+    /// `DeckClient::gateway_exports()` for the live path; under
+    /// `--features demo` the count comes from the fixture so
+    /// `gateways_cursor` clamps correctly even when no real
+    /// gateway is wired.
+    fn gateway_row_count(&self) -> usize {
+        let n = self.deck.gateway_exports().len();
+        #[cfg(feature = "demo")]
+        {
+            if n == 0 && self.deck.gateway_stats().is_none() {
+                return crate::demo::fixtures::gateways().1.len();
+            }
+        }
+        n
+    }
+
+    fn clamp_gateways_cursor(&mut self) {
+        let n = self.gateway_row_count();
+        if n == 0 {
+            self.gateways_cursor = 0;
+        } else if self.gateways_cursor >= n {
+            self.gateways_cursor = n - 1;
+        }
+    }
+
+    /// Count subnet rollup rows the panel will render. Same
+    /// demo-fixture fallback shape as `gateway_row_count`.
+    fn subnet_row_count(&self) -> usize {
+        self.subnet_rollups_with_local().1.len()
+    }
+
+    fn clamp_subnets_cursor(&mut self) {
+        let n = self.subnet_row_count();
+        if n == 0 {
+            self.subnets_cursor = 0;
+        } else if self.subnets_cursor >= n {
+            self.subnets_cursor = n - 1;
+        }
+    }
+
+    /// Count buffered summaries the AGGREGATORS panel will
+    /// render. Falls back to the fixture when the deck has no
+    /// AggregatorDaemon wired.
+    fn aggregator_row_count(&self) -> usize {
+        match self.deck.aggregator_snapshot() {
+            Some(snap) => snap.summaries.len(),
+            None => {
+                #[cfg(feature = "demo")]
+                {
+                    crate::demo::fixtures::aggregator().summaries.len()
+                }
+                #[cfg(not(feature = "demo"))]
+                {
+                    0
+                }
+            }
+        }
+    }
+
+    fn clamp_aggregators_cursor(&mut self) {
+        let n = self.aggregator_row_count();
+        if n == 0 {
+            self.aggregators_cursor = 0;
+        } else if self.aggregators_cursor >= n {
+            self.aggregators_cursor = n - 1;
+        }
+    }
+
     /// Absorb a single keypress into the active tab's search
     /// buffer. `Enter` commits (filter stays active), `Esc`
     /// cancels and clears, `Backspace` pops, any printable char
@@ -2195,6 +2562,9 @@ impl App {
             Tab::Migrations => self.migration_cursor = 0,
             Tab::Failures => self.failures_cursor = 0,
             Tab::Blobs => self.blobs_cursor = 0,
+            Tab::Gateways => self.gateways_cursor = 0,
+            Tab::Subnets => self.subnets_cursor = 0,
+            Tab::Aggregators => self.aggregators_cursor = 0,
             Tab::Groups => self.groups_cursor = DaemonCursor::default(),
             _ => {}
         }
@@ -2243,6 +2613,18 @@ impl App {
             Tab::Blobs => {
                 let n = self.visible_blobs_count();
                 self.blobs_cursor = n.saturating_sub(1);
+            }
+            Tab::Gateways => {
+                let n = self.gateway_row_count();
+                self.gateways_cursor = n.saturating_sub(1);
+            }
+            Tab::Subnets => {
+                let n = self.subnet_row_count();
+                self.subnets_cursor = n.saturating_sub(1);
+            }
+            Tab::Aggregators => {
+                let n = self.aggregator_row_count();
+                self.aggregators_cursor = n.saturating_sub(1);
             }
             Tab::Groups => {
                 let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
@@ -2906,6 +3288,26 @@ impl App {
             self.render_modal_overlay(frame, area);
             return;
         }
+        // SUBNET focus page — same pre-emption shape as the
+        // node / daemon focus pages.
+        if let Some(focus) = self.subnet_focus.as_ref() {
+            let local_peer = self.local_peer_snapshot();
+            let local_row = tabs::subnet_page::LocalMemberRow {
+                id: self.this_node,
+                peer: &local_peer,
+                local_maintenance: &self.snapshot.local_maintenance,
+            };
+            tabs::subnet_page::render(frame, chunks[3], focus, &self.snapshot, Some(local_row));
+            widgets::footer::render(
+                frame,
+                chunks[4],
+                self.current,
+                widgets::footer::FocusKind::Subnet,
+                self.toast.as_ref().map(|(s, _)| s.as_str()),
+            );
+            self.render_modal_overlay(frame, area);
+            return;
+        }
         match self.current {
             Tab::NetMap => {
                 let logs = self.logs_tail.snapshot();
@@ -3047,9 +3449,25 @@ impl App {
                     self.blobs_search_editing,
                 );
             }
-            Tab::Subnets => tabs::subnets::render(frame, chunks[3], &self.deck),
-            Tab::Gateways => tabs::gateways::render(frame, chunks[3], &self.deck),
-            Tab::Aggregators => tabs::aggregators::render(frame, chunks[3], &self.deck),
+            Tab::Subnets => {
+                let agg_subnets = self.aggregator_source_subnets();
+                let (local, rollups) = self.subnet_rollups_with_local();
+                tabs::subnets::render(
+                    frame,
+                    chunks[3],
+                    local,
+                    &rollups,
+                    &self.snapshot,
+                    &agg_subnets,
+                    self.subnets_cursor,
+                )
+            }
+            Tab::Gateways => {
+                tabs::gateways::render(frame, chunks[3], &self.deck, self.gateways_cursor)
+            }
+            Tab::Aggregators => {
+                tabs::aggregators::render(frame, chunks[3], &self.deck, self.aggregators_cursor)
+            }
         }
         widgets::footer::render(
             frame,

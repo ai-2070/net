@@ -425,6 +425,45 @@ impl Mesh {
         Ok(addr)
     }
 
+    /// Connect to a peer when the responder is already
+    /// `start()`ed and hasn't pre-`accept()`'d this initiator's
+    /// `node_id` — the standard "remote-attach against a running
+    /// daemon" case. Mirror of [`Self::connect`] for that
+    /// scenario; the local side must also have `start()` called
+    /// before this method (the dispatch loop is what completes
+    /// the handshake).
+    ///
+    /// `relay_addr` is the wire address to send msg1 to. The
+    /// degenerate single-hop case (relay == final destination)
+    /// is the CLI remote-attach pattern; the multi-hop case
+    /// (relay forwards to dest) is the same call signature.
+    /// Either way the destination's running dispatch loop
+    /// receives msg1 via the routed-handshake protocol and
+    /// replies with msg2.
+    ///
+    /// # Why a separate method from `connect`?
+    ///
+    /// `connect` uses the direct-handshake protocol, where the
+    /// responder must pre-register the initiator's `node_id`
+    /// via `accept()` before its `start()`. `connect_via` uses
+    /// the routed-handshake protocol — the initiator's full
+    /// `node_id` rides inside the Noise msg1 payload, so the
+    /// responder learns it on demand. No pre-`accept` needed.
+    pub async fn connect_via(
+        &self,
+        relay_addr: &str,
+        peer_pubkey: &[u8; 32],
+        peer_node_id: u64,
+    ) -> Result<()> {
+        let addr: SocketAddr = relay_addr
+            .parse()
+            .map_err(|e| SdkError::Config(format!("invalid relay address: {}", e)))?;
+        self.node
+            .connect_via(addr, peer_pubkey, peer_node_id)
+            .await?;
+        Ok(())
+    }
+
     /// Start the receive loop, heartbeat sender, and router.
     ///
     /// Call this after connecting to peers. Events won't be received

@@ -2303,6 +2303,7 @@ dependencies = [
  "dirs",
  "futures",
  "hex",
+ "net-aggregator-daemon",
  "net-mesh-sdk",
  "predicates",
  "serde",

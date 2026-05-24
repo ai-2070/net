@@ -175,6 +175,10 @@ pub enum AggregatorRegistryError {
     DuplicateName(String),
     /// No group registered under this name.
     NotFound(String),
+    /// `scale_group` rejected for a registry-level reason —
+    /// invalid target count, lifecycle helper refused, etc.
+    /// Carries an operator-facing diagnostic.
+    ScaleFailed(String),
 }
 
 impl std::fmt::Display for AggregatorRegistryError {
@@ -182,6 +186,7 @@ impl std::fmt::Display for AggregatorRegistryError {
         match self {
             Self::DuplicateName(n) => write!(f, "aggregator group already registered: {n}"),
             Self::NotFound(n) => write!(f, "aggregator group not found: {n}"),
+            Self::ScaleFailed(d) => write!(f, "aggregator group scale failed: {d}"),
         }
     }
 }
@@ -308,6 +313,83 @@ impl AggregatorRegistry {
     /// True when no groups are registered.
     pub fn is_empty(&self) -> bool {
         self.groups.read().is_empty()
+    }
+
+    /// Resize an existing group in place to `target_replica_count`
+    /// replicas. Calls [`LifecycleGroup::add_replica`] (grow) or
+    /// [`LifecycleGroup::remove_last`] (shrink) the appropriate
+    /// number of times against the registered group's lock,
+    /// preserving the identity + generation of the replicas that
+    /// survive the resize.
+    ///
+    /// `factory` is invoked once per added replica (delta times
+    /// for grow, zero times for shrink) with the new replica's
+    /// index. The daemon supplies a factory that re-resolves the
+    /// template + derives the appropriate keypair via
+    /// `derive_replica_keypair(group_seed, index)`.
+    ///
+    /// Returns:
+    /// - `NotFound` when no group is registered under `name`.
+    /// - `ScaleFailed` when target_replica_count == 0, or when
+    ///   the lifecycle helpers refuse (e.g., add_replica fails
+    ///   on_start, remove_last hit the floor mid-shrink).
+    /// - `Ok(entry)` on success. The entry is the same one that
+    ///   would have come from `get(name)` — held across the
+    ///   resize so callers can snapshot immediately after.
+    pub async fn scale_group<F>(
+        &self,
+        name: &str,
+        target_replica_count: u8,
+        mut factory: F,
+    ) -> Result<Arc<AggregatorGroupEntry>, AggregatorRegistryError>
+    where
+        F: FnMut(u8) -> Arc<AggregatorDaemon> + Send,
+    {
+        if target_replica_count == 0 {
+            return Err(AggregatorRegistryError::ScaleFailed(
+                "target_replica_count must be > 0".into(),
+            ));
+        }
+        let entry = self
+            .get(name)
+            .ok_or_else(|| AggregatorRegistryError::NotFound(name.to_string()))?;
+        let mut group_guard = entry.group.lock().await;
+        let group = group_guard
+            .as_mut()
+            .ok_or_else(|| AggregatorRegistryError::NotFound(name.to_string()))?;
+        let current = group.replica_count();
+        let target = target_replica_count as usize;
+        if target > current {
+            // Grow via the bulk path so on_start handlers run
+            // concurrently. Sequential per-replica `add_replica`
+            // calls would hold the entry mutex through N on_start
+            // awaits and block List / health / HealthMonitor for
+            // a 1→N grow — by funnelling through
+            // `LifecycleGroup::add_replicas`, the parallel
+            // on_start pattern from `start_replicas` is reused.
+            let delta = (target - current) as u8;
+            group
+                .add_replicas(delta, &mut factory)
+                .await
+                .map_err(|e| AggregatorRegistryError::ScaleFailed(format!("add_replicas: {e}")))?;
+        } else if target < current {
+            // Shrink: remove_last is genuinely sequential — each
+            // pop awaits the previous handle's stop() so the
+            // parallel-Vec invariant in LifecycleGroup holds.
+            // Refuses to drop below 1 — guarded above by the
+            // `target == 0` check, so the LifecycleGroupError
+            // shouldn't fire, but we surface it cleanly if the
+            // invariant breaks.
+            for _ in 0..(current - target) {
+                group.remove_last().await.map_err(|e| {
+                    AggregatorRegistryError::ScaleFailed(format!("remove_last: {e}"))
+                })?;
+            }
+        }
+        // No-op when target == current — operator gets the
+        // existing snapshot back.
+        drop(group_guard);
+        Ok(entry)
     }
 
     /// Remove a group and return the underlying `LifecycleGroup`
