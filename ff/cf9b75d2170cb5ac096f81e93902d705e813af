@@ -1,0 +1,21 @@
+net/crates/net/deck/src/tabs/subnet_page.rs
+  s_099fa7d871e34d::t_41d3de7d3307d1 73-85,89
+  s_099fa7d871e34d::t_4073c1fdc88238 18
+  s_099fa7d871e34d::t_abfeb9700a4d40 58-60
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "ffcf9b75d2170cb5ac096f81e93902d705e813af",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
