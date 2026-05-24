@@ -955,11 +955,7 @@ fn metrics_snapshot_invariants_fixture_is_well_formed() {
     // The substrate's ServiceMetrics has 19 documented fields
     // (1 identity + 9 caller-side + 9 server-side). Pin so a
     // substrate-side field add/remove surfaces here.
-    assert_eq!(
-        fields.len(),
-        19,
-        "ServiceMetrics has 19 documented fields",
-    );
+    assert_eq!(fields.len(), 19, "ServiceMetrics has 19 documented fields",);
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for f in fields {
         let name = f

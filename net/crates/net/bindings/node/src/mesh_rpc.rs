@@ -551,7 +551,12 @@ impl From<&InnerServiceMetrics> for ServiceMetricsJs {
             in_flight: m.in_flight,
             latency_sum_ns: BigInt::from(m.latency_sum_ns),
             latency_count: BigInt::from(m.latency_count),
-            latency_buckets: m.latency_buckets.iter().copied().map(BigInt::from).collect(),
+            latency_buckets: m
+                .latency_buckets
+                .iter()
+                .copied()
+                .map(BigInt::from)
+                .collect(),
             handler_invocations_total: BigInt::from(m.handler_invocations_total),
             handler_panics_total: BigInt::from(m.handler_panics_total),
             handler_in_flight: m.handler_in_flight,
@@ -1909,10 +1914,7 @@ impl MeshRpc {
     /// v1 emits only `direction === "outbound"` events; the
     /// substrate's server-side hook is a planned follow-up.
     #[napi]
-    pub fn set_observer(
-        &self,
-        observer: Option<Function<'_, RpcCallEventJs, ()>>,
-    ) -> Result<()> {
+    pub fn set_observer(&self, observer: Option<Function<'_, RpcCallEventJs, ()>>) -> Result<()> {
         match observer {
             Some(f) => {
                 let tsfn: RpcObserverTsfn = f.build_threadsafe_function().build()?;
