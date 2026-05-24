@@ -1,0 +1,27 @@
+net/crates/net/deck/src/tabs/subnets.rs
+  s_099fa7d871e34d::t_d9e6b3e3b11962 13,27-28,40
+net/crates/net/deck/src/widgets/footer.rs
+  s_099fa7d871e34d::t_b0701e4348d9c6 86
+net/crates/net/deck/src/app.rs
+  s_099fa7d871e34d::t_8ebed5efddd036 1370-1381,1384-1386,1388
+  s_099fa7d871e34d::t_991d3b79726575 2402
+  s_099fa7d871e34d::t_f1a2b5005e9212 3378,3382-3383
+net/crates/net/deck/src/demo/fixtures.rs
+  s_099fa7d871e34d::t_1b79ca7f55be3f 44-66,68-78,82,87,92,97-100,105,110-113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "6f2b2e649e527cb24d15b571b28da1895ebec6af",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
