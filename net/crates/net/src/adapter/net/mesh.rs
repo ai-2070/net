@@ -9353,12 +9353,19 @@ impl MeshNode {
     ///
     /// `start()` must have been called before `connect_via` — the
     /// receive loop has to be running to deliver msg2 back to us.
-    pub async fn connect_via(
+    /// One attempt of the routed-handshake protocol: register a
+    /// pending-initiator slot, send msg1, await msg2. On any
+    /// error path the pending slot is cleared so a retry from
+    /// the caller (or a fresh `connect_via` invocation) sees a
+    /// clean entry. Returns the negotiated [`SessionKeys`] on
+    /// success — the caller installs the peer (NetSession +
+    /// router + peers + addr_to_node).
+    async fn try_connect_via_once(
         &self,
         relay_addr: SocketAddr,
         dest_pubkey: &[u8; 32],
         dest_node_id: u64,
-    ) -> Result<u64, AdapterError> {
+    ) -> Result<SessionKeys, AdapterError> {
         // Build msg1. Prologue uses *routing-identity* (32-bit) versions
         // of (self, dest) — that's what a malicious relay could see and
         // rewrite in the routing header, so binding those bits into the
@@ -9424,6 +9431,59 @@ impl MeshNode {
             Err(_) => {
                 self.pending_handshakes.remove(&pending_key);
                 return Err(AdapterError::Connection("handshake timeout".into()));
+            }
+        };
+        Ok(keys)
+    }
+
+    /// Connect to `dest_node_id` via a routed handshake through
+    /// `relay_addr`. Unlike [`Self::connect`] (which requires the
+    /// responder to pre-`accept()` this initiator's node_id before
+    /// `start()`), this path embeds the initiator's full node_id
+    /// inside the Noise msg1 payload and routes the packet through
+    /// the dispatch loop's `handle_routed_handshake` Case 2 — so a
+    /// daemon that's already `start()`ed accepts msg1 from a brand-
+    /// new initiator without prior coordination.
+    ///
+    /// When `relay_addr == final destination` (the CLI remote-attach
+    /// case), the routed path is degenerate one-hop. The post-
+    /// handshake peer install populates `addr_to_node[relay_addr]`
+    /// via `entry().or_insert(...)` so address-keyed sends resolve
+    /// the peer; in a true multi-hop scenario the relay's prior
+    /// mapping stays intact.
+    ///
+    /// Retries up to [`MeshNodeConfig::handshake_retries`] (default
+    /// 3) — a single UDP drop on msg1 or msg2 should not surface
+    /// as a typed error.
+    pub async fn connect_via(
+        &self,
+        relay_addr: SocketAddr,
+        dest_pubkey: &[u8; 32],
+        dest_node_id: u64,
+    ) -> Result<u64, AdapterError> {
+        // Retry the msg1-send + msg2-await `handshake_retries` times
+        // (mirrors `handshake_initiator` for the direct path). Routed
+        // handshakes ride a UDP relay path that can drop msg1 or msg2
+        // independently; a single packet loss should not surface as a
+        // typed error to the operator. Per-attempt cleanup happens
+        // inside `try_connect_via_once`, so each retry starts fresh.
+        let mut attempt = 0;
+        let keys = loop {
+            attempt += 1;
+            match self
+                .try_connect_via_once(relay_addr, dest_pubkey, dest_node_id)
+                .await
+            {
+                Ok(keys) => break keys,
+                Err(e) if attempt < self.config.handshake_retries => {
+                    tracing::warn!(
+                        attempt,
+                        error = %e,
+                        "mesh routed handshake failed, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                }
+                Err(e) => return Err(e),
             }
         };
 
