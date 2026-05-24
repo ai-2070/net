@@ -158,15 +158,26 @@ fn render_members(
     // matches `this_node`. Members missing from the snapshot
     // are dropped — they render no NODE row, but the header's
     // health rollup still counts them as `—`.
-    let mut nodes_iter: Vec<(u64, &PeerSnapshot)> = Vec::with_capacity(focus.members.len());
+    //
+    // The walk is per-frame and unavoidable here — the row
+    // shape borrows `&PeerSnapshot` from the snapshot, which
+    // ties the resulting Vec to the snapshot's lifetime.
+    // Hoisting the Vec onto `SubnetFocusEntry` would require
+    // either Arc-cloning the PeerSnapshots (per-frame clone
+    // cost) or threading a snapshot-Arc-keyed cache through
+    // the render call — not worth the lifetime gymnastics for
+    // a one-tab path.
     let local_id = local.as_ref().map(|r| r.id);
+    let mut nodes_iter: Vec<(u64, &PeerSnapshot)> = Vec::with_capacity(focus.members.len());
     for id in &focus.members {
-        if Some(*id) == local_id {
-            if let Some(r) = local.as_ref() {
-                nodes_iter.push((*id, r.peer));
+        if is_visible_member(*id, local_id, snapshot) {
+            if Some(*id) == local_id {
+                if let Some(r) = local.as_ref() {
+                    nodes_iter.push((*id, r.peer));
+                }
+            } else if let Some(p) = snapshot.peers.get(id) {
+                nodes_iter.push((*id, p));
             }
-        } else if let Some(p) = snapshot.peers.get(id) {
-            nodes_iter.push((*id, p));
         }
     }
     if nodes_iter.is_empty() {
@@ -218,6 +229,18 @@ fn render_members(
     );
 }
 
+/// Visibility predicate shared by `render_members` (per-frame),
+/// `cursored_member_id` (per Enter), and `visible_member_count`
+/// (per snapshot tick). Single source of truth for "is this
+/// member resolvable against the current snapshot" — drift
+/// between the render path and the cursor-resolve path would
+/// surface as an off-by-one when the operator presses Enter on
+/// what they see as row N but the cursor lookup walks a
+/// different subset.
+fn is_visible_member(id: u64, local_id: Option<u64>, snapshot: &MeshOsSnapshot) -> bool {
+    Some(id) == local_id || snapshot.peers.contains_key(&id)
+}
+
 /// Resolve the cursored member's `node_id` from a focus entry
 /// against the same snapshot the render path sees. Returns
 /// `None` when the cursor lands on a member that isn't in the
@@ -227,12 +250,16 @@ pub fn cursored_member_id(
     snapshot: &MeshOsSnapshot,
     local_id: Option<u64>,
 ) -> Option<u64> {
-    let mut visible: Vec<u64> = Vec::with_capacity(focus.members.len());
-    for id in &focus.members {
-        if Some(*id) == local_id || snapshot.peers.contains_key(id) {
-            visible.push(*id);
-        }
-    }
+    // Only called on `Enter` — once per key event — so the
+    // allocate-and-index pattern is fine. Hoisting the Vec
+    // would couple this call's lifetime to `render_members`'s
+    // per-frame state, which it isn't.
+    let visible: Vec<u64> = focus
+        .members
+        .iter()
+        .copied()
+        .filter(|id| is_visible_member(*id, local_id, snapshot))
+        .collect();
     let idx = focus.member_cursor.min(visible.len().saturating_sub(1));
     visible.get(idx).copied()
 }
@@ -249,6 +276,6 @@ pub fn visible_member_count(
     focus
         .members
         .iter()
-        .filter(|id| Some(**id) == local_id || snapshot.peers.contains_key(id))
+        .filter(|id| is_visible_member(**id, local_id, snapshot))
         .count()
 }
