@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/behavior/lifecycle/group.rs
+  s_099fa7d871e34d::t_5ce7d7560506f0 367-368
+net/crates/net/src/adapter/net/behavior/aggregator/registry_service.rs
+  s_099fa7d871e34d::t_464360ce2f856c 263-265
+  s_099fa7d871e34d::t_62b44fbf179a8a 29-37
+  s_099fa7d871e34d::t_cea2744ef15036 85-92
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "b74aa7f4a96f286ea87694ed60540fe48fd31cf0",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
