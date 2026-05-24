@@ -3466,10 +3466,12 @@ mod tests {
     #[test]
     fn abi_version_matches_constant() {
         assert_eq!(net_rpc_abi_version(), NET_RPC_ABI_VERSION);
-        // Phase S1-A1 bumps to 0x0003 — adds observer +
-        // metrics-snapshot surface. Pin so a regression to 0x0002
-        // (or accidental further bumps) surfaces in tests.
-        assert_eq!(NET_RPC_ABI_VERSION, 0x0003);
+        // Phase C-A3 bumps to 0x0004 — the two cancel symbols gain
+        // a leading MeshRpcHandle* argument so cancellation routes
+        // through the substrate's per-mesh CancelRegistry. Pin so
+        // an accidental regression (or further bump without all
+        // callers updating) surfaces in tests.
+        assert_eq!(NET_RPC_ABI_VERSION, 0x0004);
     }
 
     /// `net_rpc_client_stream_send` on a NULL handle returns
