@@ -5,7 +5,7 @@ Predecessor: `docs/plans/AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md` — every 
 Scope: close the two surfaces called out in that doc's "Remaining gap" section (`AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md:163-164`):
 
 1. **CLI remote-attach** — `net aggregator query / spawn / scale` are parse-only today (`net/crates/net/cli/src/commands/aggregator.rs:210-235`, `:264-294`, `:296-312`). The wire surface (`RegistryClient`, `FoldQueryClient`) is shipped and proven by `tests/aggregator_registry_rpc.rs` + `tests/aggregator_fold_query.rs` + `aggregator-daemon/tests/boot_and_query.rs`. The gap is `CliContext` — it owns an in-process `MeshOsDaemonSdk` + `DeckClient` but **no `MeshNode`** the typed clients can route through (`cli/src/context.rs:29-110`). NET_CLI_PLAN.md Phase 5 (line 542-544) tracked this generically as a Deck-RPC remote-attach gap; we close the aggregator slice of it now, leaving the broader Deck-RPC surface for that plan.
-2. **Dedicated Scale RPC** — `Scale` is implementable today as `Unregister` + `Spawn(replica_count=N)` (`registry_service.rs:25-31`). The substrate doesn't yet have `LifecycleGroup::add_replica` / `remove_last`, so any in-place grow/shrink tears down + re-derives identity. We add the helpers, a `RegistryRequest::Scale` variant, server-side dispatch, client method, CLI flip, and back-compat handling for older servers.
+2. **Dedicated Scale RPC** — `Scale` is implementable today as `Unregister` + `Spawn(replica_count=N)` (`registry_service.rs:25-31`). The substrate doesn't yet have `LifecycleGroup::add_replica` / `remove_last`, so any in-place grow/shrink tears down + re-derives identity. We add the helpers, a `RegistryRequest::Scale` variant, server-side dispatch, client method, and the CLI flip.
 
 Two independent gaps. **Recommended order: ship Gap 1 first** — it unblocks the CLI's three "preview" verbs which operators are already reading the help text for, and the Scale work is small and additive on top of a live CLI. Gap 2 can ship in parallel from the substrate side but its visible payoff is `net aggregator scale` flipping from "Unregister + Spawn churn" to "in-place add/remove," which only matters once the CLI verb is live.
 
@@ -13,7 +13,7 @@ Tagged `[A | B | C]`:
 
 - A — CLI remote-attach (Gap 1)
 - B — Dedicated Scale RPC (Gap 2)
-- C — Closeout (smoke / docs / migration)
+- C — Closeout (smoke / docs / tidy)
 
 ---
 
@@ -32,8 +32,7 @@ Tagged `[A | B | C]`:
 | B-3   | H   | server                | `RegistryHandler` dispatch + `AggregatorRegistry::scale_group` action                        |
 | B-4   | H   | client                | `RegistryClient::scale(target, group_name, count)` + `BoundRegistryClient::scale`           |
 | B-5   | H   | CLI flip              | `net aggregator scale` flips from interim Unregister+Spawn to dedicated `Scale` RPC          |
-| B-6   | M   | back-compat           | older daemons reject `Scale` cleanly; CLI surfaces a typed fallback hint                    |
-| B-7   | M   | tests                 | round-trip Scale integration test (`tests/aggregator_registry_rpc.rs` extension)            |
+| B-6   | M   | tests                 | round-trip Scale integration test (`tests/aggregator_registry_rpc.rs` extension)            |
 | C-1   | L   | docs                  | NET_CLI_PLAN.md + AGGREGATOR_LIFECYCLE_DEFERRED note: aggregator slice of Phase 5 closed     |
 | C-2   | L   | tidy                  | drop "[preview]" markers + parse-only error copy from `cli/src/commands/aggregator.rs`       |
 
@@ -138,14 +137,14 @@ Today `run_ls` reads from the local `DeckClient::aggregator_registry_snapshot()`
 **The wire shape's missing fields** (`RegistryGroupSummary` lacks `source_subnet` + `fold_kinds`) is a real gap for `ls --remote`. Three options:
 
 1. **Show "(template metadata unavailable)" placeholder.** Cheap; loses information operators want.
-2. **Extend `RegistryGroupSummary`** with `source_subnet: SubnetId` + `fold_kinds: Vec<u16>`. Wire-protocol bump. Postcard variant addition (unnamed fields → named fields adds bytes but is wire-compatible because postcard is a struct of fixed-order fields; **but adding fields IS a breaking change for postcard since the decoder consumes bytes positionally**). Confirmed: must bump.
+2. **Extend `RegistryGroupSummary`** with `source_subnet: SubnetId` + `fold_kinds: Vec<u16>`. Append to the struct; no back-compat constraint.
 3. **Add `RegistryRequest::Describe { group_name }`** returning the full spec. Adds a wire op.
 
-**Recommend option 2.** The daemon already owns the spec (`AggregatorSpec` in `aggregator-daemon/src/lib.rs:390-465`); piping `source_subnet` + `fold_kinds` into `snapshot_group` (`registry_service.rs:304-312`) is local refactor. Migration: when an older client decodes a newer `RegistryGroupSummary`, postcard's behaviour is **to fail** — postcard isn't forward-compatible by default. Mitigation: ship the daemon and the client at the same release; no skew between operator workstation CLI and daemon binaries is the standard ops practice. Document this in the migration note (C-1).
+**Recommend option 2.** The daemon already owns the spec (`AggregatorSpec` in `aggregator-daemon/src/lib.rs:390-465`); piping `source_subnet` + `fold_kinds` into `snapshot_group` (`registry_service.rs:304-312`) is a local refactor.
 
-Defer this wire bump to **B-2's scope** — combine it with the `Scale` variant addition so we burn one wire version, not two.
+Defer this wire change to **B-2's scope** — combine it with the `Scale` variant addition so the wire surface lands in one step.
 
-**A-5 in the meantime** can ship without the wire bump by using option 1 (placeholder) — operator who needs the full spec runs `query` against a replica's metadata. Land this slice without blocking on B-2; flip the placeholder to live data once B-2 is in.
+**A-5 in the meantime** can ship without the wire fields by using option 1 (placeholder) — operator who needs the full spec runs `query` against a replica's metadata. Land this slice without blocking on B-2; flip the placeholder to live data once B-2 is in.
 
 **Files touched (A-5).**
 - `cli/src/commands/aggregator.rs::LsArgs` — gate `--remote` (off by default; on when `--node-addr` is present).
@@ -203,9 +202,9 @@ Today `LifecycleGroup` (`adapter/net/behavior/lifecycle/group.rs:123-404`) has n
 - `group.rs::add_replica_at_u8_max_returns_error` — synthetic / mocked u8::MAX check. Doc test only; not worth the runtime cost.
 - `group.rs::add_replica_under_placement_path` — `spawn_with_placement` with 2 replicas, `add_replica` extends the group but **doesn't** record a placement decision (the new replica runs on the local node; the placement-spread invariant only applies at `spawn_with_placement` time). Document this in the method's docstring as a known limitation; placement-aware scale is out-of-scope for this slice.
 
-### B-2 — Wire-protocol bump: `RegistryRequest::Scale` + reply variant
+### B-2 — Wire-protocol additions: `RegistryRequest::Scale` + reply variant
 
-The wire enum is **versioned by postcard's positional decoding**, not by an explicit version field. Adding a new variant to the `RegistryRequest` enum at the **end** is backward-compatible for serialization (older servers reject unknown variants with a decode error → `RegistryResponse::Error(DecodeFailed)`). Postcard discriminants are written as varint indices; appending a new variant is the canonical extension path.
+No backwards-compatibility constraint — operators ship CLI + daemon together. Just append the variants.
 
 **Variant addition (`registry_service.rs:49-77`).**
 
@@ -234,17 +233,14 @@ pub enum RegistryResponse {
 - `RegistryRpcError::ScaleRejected(String)` — generic shape failure (replica count out of range, factory failed during add).
 - `RegistryRpcError::UnknownGroup(String)` — scale-against-missing. Existing variants don't cover this; `Unregister` returns `Unregistered { existed: false }` instead of an error, but Scale is a write op against a presumed-extant group, so an error is more appropriate.
 
-**Combined wire-bump scope.** Per A-5, also add `source_subnet: SubnetId` + `fold_kinds: Vec<u16>` to `RegistryGroupSummary` (`registry_service.rs:100-108`). One wire bump, two payoffs.
+**Combined scope.** Per A-5, also add `source_subnet: SubnetId` + `fold_kinds: Vec<u16>` to `RegistryGroupSummary` (`registry_service.rs:100-108`). One wire change, two payoffs.
 
 **Files touched (B-2).**
 - `crates/net/src/adapter/net/behavior/aggregator/registry_service.rs` — three variant additions + the `RegistryGroupSummary` field additions.
 - `crates/net/src/adapter/net/behavior/aggregator/registry.rs` — `AggregatorGroupEntry` already carries enough state to fill the new summary fields, but they aren't currently piped through. Find where the entry is constructed (`registry.rs:205-224, 238-278`) and ensure `source_subnet` + `fold_kinds` land on the entry at register time. The aggregator daemon's `AggregatorSpec` (`aggregator-daemon/src/lib.rs:390-476`) has both; piping requires either adding fields to `AggregatorGroupEntry` or sourcing them from the first replica's `AggregatorDaemon::config().source_subnet` / `fold_kinds` accessor (which already exists per `commands/aggregator.rs:179-184`).
 
-**Migration note (back-compat).** Newer clients sending `Scale` to older daemons will get a `RegistryResponse::Error(RegistryRpcError::DecodeFailed("…"))` because the older daemon's postcard decoder can't deserialize the unknown variant. **The client must surface this as a typed error** so the CLI can suggest the Unregister+Spawn fallback. See B-6.
-
 **Test plan (B-2).**
 - Extend `registry_service.rs::tests::registry_request_response_round_trip_through_postcard` (`:687-732`) to cover every new variant.
-- New test: `older_server_rejects_scale_with_decode_failed` — encode a `RegistryRequest::Scale` with the new schema, decode against a fixture of the **old** enum shape (synthesized via a stripped clone of the type), assert postcard returns a decode error and the server-side `answer` (`:251-298`) produces `RegistryResponse::Error(RegistryRpcError::DecodeFailed(_))`.
 
 ### B-3 — Server dispatch + `AggregatorRegistry::scale_group`
 
@@ -336,7 +332,7 @@ pub async fn scale_with_service(
 
 **Test plan (B-4).**
 - `registry_client.rs::tests` only currently asserts deadline plumbing (`:228-258`); add a unit test that round-trips a `Scale` request via `postcard::to_allocvec` + `postcard::from_bytes` — same shape as the existing round-trip test.
-- Full wire round-trip lives in B-7.
+- Full wire round-trip lives in B-6.
 
 ### B-5 — `net aggregator scale` flips to dedicated op
 
@@ -357,23 +353,7 @@ The CLI's external shape is unchanged from A-4 (`--name`, `--template`, `--repli
 **Test plan (B-5).**
 - Extend `cli/tests/aggregator_remote.rs::scale_grows_then_shrinks` with assertions on `EntrySnapshot.replicas[0].generation()` — confirm the original replica's generation persists across the resize (proving no identity churn). The substrate already exposes generation via `RegistryReplicaSummary.generation` (`registry_service.rs:113-114`).
 
-### B-6 — Back-compat: older daemons reject `Scale` cleanly
-
-When a newer CLI talks to an older daemon:
-- Postcard decode of the unknown `Scale` variant on the server side fails → server replies `RegistryResponse::Error(RegistryRpcError::DecodeFailed("<postcard error>"))`.
-- `RegistryClient::scale` already maps `RegistryResponse::Error(_)` → `RegistryClientError::Server(_)` (`registry_client.rs:124-127`).
-- The CLI catches this in `run_scale` and surfaces a typed hint: "the target daemon doesn't support the Scale op; upgrade the daemon or run `net aggregator unregister` + `net aggregator spawn` manually." Exit code 3 (SDK error per NET_CLI_PLAN.md) with a `daemon_too_old` JSON `kind` discriminator.
-
-**Detection precision.** A `DecodeFailed` from the daemon could also surface for genuine encoding bugs in the new client. The error message includes postcard's diagnostic; the CLI's hint is best-effort. Acceptable — the operator's next step (upgrade daemon or run the fallback) is the same in both cases.
-
-**Files touched (B-6).**
-- `crates/net/cli/src/commands/aggregator.rs::run_scale` — add the typed-error branch.
-- `crates/net/cli/src/error.rs` — new helper `daemon_too_old(hint: &str)` mapping to the JSON shape.
-
-**Test plan (B-6).**
-- Synthetic: hand-craft a `RegistryResponse::Error(RegistryRpcError::DecodeFailed("..."))` reply via a mock RPC handler installed on a host MeshNode; invoke `net aggregator scale` against it; assert exit code 3 + the `daemon_too_old` kind on stderr.
-
-### B-7 — Round-trip Scale integration test
+### B-6 — Round-trip Scale integration test
 
 Extend `tests/aggregator_registry_rpc.rs` (`:113-160` is the current pattern). Add:
 
@@ -383,7 +363,7 @@ Extend `tests/aggregator_registry_rpc.rs` (`:113-160` is the current pattern). A
 
 Mirrors the existing `list_round_trips_two_registered_groups_across_handshake` shape (`:113-141`).
 
-**Files touched (B-7).**
+**Files touched (B-6).**
 - `crates/net/tests/aggregator_registry_rpc.rs` — three new `#[tokio::test]` functions.
 
 ---
@@ -418,19 +398,17 @@ Mirrors the existing `list_round_trips_two_registered_groups_across_handshake` s
 9. **B-3** (server) — full Scale dispatch.
 10. **B-4** (client) — `RegistryClient::scale` + bound wrapper.
 11. **B-5** (CLI flip) — `net aggregator scale` now uses Scale instead of Unregister+Spawn. CLI shape unchanged from A-4.
-12. **B-6** (back-compat) — typed `daemon_too_old` hint.
-13. **B-7** (round-trip test).
-14. **C-1 + C-2** — docs + tidy.
+12. **B-6** (round-trip test).
+13. **C-1 + C-2** — docs + tidy.
 
 **Parallelism.** Gap 1 and Gap 2 can ship side-by-side (B-* work is substrate + wire; A-* is CLI). The only sequencing constraint is **A-4 must land before B-5** (B-5 collapses A-4's logic); **A-5 lands at placeholder fidelity before B-2 ships full fields**.
 
-**Estimated slice count.** 13 mergeable slices + 2 doc/tidy. Each slice is 1–3 days of work; the substrate + wire slices (B-1, B-2, B-3) are the slowest (~2 days each including tests). Total: ~3 weeks of focused work.
+**Estimated slice count.** 12 mergeable slices + 2 doc/tidy. Each slice is 1–3 days of work; the substrate + wire slices (B-1, B-2, B-3) are the slowest (~2 days each including tests). Total: ~3 weeks of focused work.
 
 ---
 
 ## Risks for the user to weigh in on
 
 1. **`--source-subnet` removal from `net aggregator spawn`.** A-3 makes `--template` required and removes `--source-subnet`. The flag exists today as parse-only (no live use), so no consumer scripts break — but the help-text contract under NET_CLI_PLAN.md's "subcommand layout is a contract" lock (Locked decision 1, NET_CLI_PLAN.md:31-34) treats parse-only verbs the same as live ones. If the user wants to preserve `--source-subnet` for some future template-free path, flag this before A-3 lands.
-2. **Wire-version migration policy.** B-2 burns one wire version (Scale variant + RegistryGroupSummary fields). Postcard rejects unknown variants on the server side, so client-newer-than-daemon is detectable but client-older-than-daemon is not — older clients reading a newer `Groups` reply hit a decode error and can't degrade gracefully. The current shipping practice (no SDK-skew across operator workstations and daemon binaries) is the implicit assumption; if the user expects mixed-version deployments, B-2 needs an explicit version field on the wire enum, which is a larger lift.
-3. **PSK transport.** A-1 requires the operator to supply the daemon's PSK to the CLI (via `--psk-hex` flag or config `psk_hex`). This is the same trust model the round-trip tests use, but it puts a 32-byte symmetric key into operator-facing CLI config. If the user wants a different trust model (e.g. operator-identity-based auth instead of mesh-PSK), the bootstrap shape needs revisiting — likely a Deck-RPC frame (NET_CLI_PLAN.md Phase 5 proper) rather than a raw MeshNode attach.
-4. **Placement under scale-up.** B-1's `add_replica` doesn't engage the scheduler. Adding the 3rd replica to a group originally spawned via `spawn_with_placement` lands locally rather than on a third failure domain. Acceptable in the single-process / single-host daemon deployment we ship today; not acceptable for the multi-host deployment SCALING_SUBNET_SPEC.md sketches. If multi-host deployment is on the near roadmap, B-1 needs a `add_replica_with_placement` sibling — flag this if relevant.
+2. **PSK transport.** A-1 requires the operator to supply the daemon's PSK to the CLI (via `--psk-hex` flag or config `psk_hex`). This is the same trust model the round-trip tests use, but it puts a 32-byte symmetric key into operator-facing CLI config. If the user wants a different trust model (e.g. operator-identity-based auth instead of mesh-PSK), the bootstrap shape needs revisiting — likely a Deck-RPC frame (NET_CLI_PLAN.md Phase 5 proper) rather than a raw MeshNode attach.
+3. **Placement under scale-up.** B-1's `add_replica` doesn't engage the scheduler. Adding the 3rd replica to a group originally spawned via `spawn_with_placement` lands locally rather than on a third failure domain. Acceptable in the single-process / single-host daemon deployment we ship today; not acceptable for the multi-host deployment SCALING_SUBNET_SPEC.md sketches. If multi-host deployment is on the near roadmap, B-1 needs a `add_replica_with_placement` sibling — flag this if relevant.
