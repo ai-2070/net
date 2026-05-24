@@ -110,4 +110,4 @@ tokio = { version = "1", features = [
 # Boot the aggregator-daemon in-process for the remote-attach
 # integration test (`tests/aggregator_remote.rs`). The CLI
 # subprocess handshakes against this booted daemon's MeshNode.
-net-aggregator-daemon = { version = "0.21.0", path = "../aggregator-daemon" }
+net-aggregator-daemon = { version = "0.22.0", path = "../aggregator-daemon" }
