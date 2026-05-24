@@ -609,27 +609,48 @@ fn validate_template(tpl: &TemplateConfig, mesh: &Arc<MeshNode>) -> Result<(), D
 /// Build a [`SpawnFn`] backed by `templates`. The closure
 /// captures `registry` + `mesh` so it can resolve names, build
 /// daemons, and register the spawned group all in one place.
+/// Build an Arc-shared `HashMap<name, TemplateConfig>` for
+/// O(1) lookup at Spawn / Scale dispatch time. Cloning the
+/// inputs is fine — templates are small and the operator's
+/// config is immutable for the daemon's lifetime. Used by
+/// both [`make_spawner`] and [`make_scaler`].
+fn build_template_index(
+    templates: Vec<TemplateConfig>,
+) -> Arc<std::collections::HashMap<String, TemplateConfig>> {
+    Arc::new(
+        templates
+            .into_iter()
+            .map(|t| (t.name.clone(), t))
+            .collect(),
+    )
+}
+
+/// O(1) lookup against the template index with the typed
+/// `UnknownTemplate(name)` error on miss. Both Spawn and Scale
+/// dispatch through this so the operator-facing diagnostic stays
+/// consistent across the two ops.
+fn resolve_template(
+    by_name: &std::collections::HashMap<String, TemplateConfig>,
+    name: &str,
+) -> Result<TemplateConfig, RegistryRpcError> {
+    by_name
+        .get(name)
+        .cloned()
+        .ok_or_else(|| RegistryRpcError::UnknownTemplate(name.to_string()))
+}
+
 fn make_spawner(
     templates: Vec<TemplateConfig>,
     registry: Arc<AggregatorRegistry>,
     mesh: Arc<MeshNode>,
 ) -> SpawnFn {
-    use std::collections::HashMap;
-    // Index by template name for O(1) lookup. Cloning is fine
-    // — templates are small and the operator's config is
-    // immutable for the daemon's lifetime.
-    let by_name: HashMap<String, TemplateConfig> =
-        templates.into_iter().map(|t| (t.name.clone(), t)).collect();
-    let by_name = Arc::new(by_name);
+    let by_name = build_template_index(templates);
     Box::new(move |req| {
         let registry = registry.clone();
         let mesh = mesh.clone();
         let by_name = by_name.clone();
         Box::pin(async move {
-            let template = by_name
-                .get(&req.template_name)
-                .cloned()
-                .ok_or_else(|| RegistryRpcError::UnknownTemplate(req.template_name.clone()))?;
+            let template = resolve_template(&by_name, &req.template_name)?;
             let spec = AggregatorSpec::from_template(
                 &template,
                 req.group_name.clone(),
@@ -662,19 +683,13 @@ fn make_scaler(
     registry: Arc<AggregatorRegistry>,
     mesh: Arc<MeshNode>,
 ) -> net::adapter::net::behavior::aggregator::ScaleFn {
-    use std::collections::HashMap;
-    let by_name: HashMap<String, TemplateConfig> =
-        templates.into_iter().map(|t| (t.name.clone(), t)).collect();
-    let by_name = Arc::new(by_name);
+    let by_name = build_template_index(templates);
     Box::new(move |req| {
         let registry = registry.clone();
         let mesh = mesh.clone();
         let by_name = by_name.clone();
         Box::pin(async move {
-            let template = by_name
-                .get(&req.template_name)
-                .cloned()
-                .ok_or_else(|| RegistryRpcError::UnknownTemplate(req.template_name.clone()))?;
+            let template = resolve_template(&by_name, &req.template_name)?;
             // Build the spec from the template + supplied group
             // name. `replica_count` here is the *target* — used
             // only to materialize the spec for factory closure
