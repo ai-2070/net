@@ -2371,7 +2371,12 @@ impl MeshNode {
         // Shared peer install (NetSession + router + peers +
         // peer_addrs + addr_to_node). Direct-mode overwrites
         // addr_to_node — `peer_addr` IS the peer's wire address.
-        self.install_peer(peer_node_id, peer_addr, keys, AddrInstallMode::DirectOverwrite);
+        self.install_peer(
+            peer_node_id,
+            peer_addr,
+            keys,
+            AddrInstallMode::DirectOverwrite,
+        );
 
         // Direct-handshake-only post-install wiring. Routed
         // handshakes (`connect_via`) intentionally skip these:
@@ -9532,7 +9537,12 @@ impl MeshNode {
         // failure_detector / announcement push — see
         // `connect`'s wiring for the direct-handshake-only
         // bookkeeping.
-        self.install_peer(dest_node_id, relay_addr, keys, AddrInstallMode::RoutedPreserve);
+        self.install_peer(
+            dest_node_id,
+            relay_addr,
+            keys,
+            AddrInstallMode::RoutedPreserve,
+        );
 
         Ok(dest_node_id)
     }

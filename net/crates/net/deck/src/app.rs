@@ -588,7 +588,10 @@ fn synthetic_greedy_view(node_id: u64, label: Option<&'static str>) -> tabs::dat
 /// swap; populated on first access; reused per frame.
 #[derive(Default)]
 struct SubnetViewCache {
-    rollups: Option<(Option<net_sdk::subnets::SubnetId>, Vec<net_sdk::deck::SubnetRollup>)>,
+    rollups: Option<(
+        Option<net_sdk::subnets::SubnetId>,
+        Vec<net_sdk::deck::SubnetRollup>,
+    )>,
     agg_subnets: Option<std::collections::HashSet<net_sdk::subnets::SubnetId>>,
 }
 

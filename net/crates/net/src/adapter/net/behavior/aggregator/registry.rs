@@ -368,9 +368,10 @@ impl AggregatorRegistry {
             // `LifecycleGroup::add_replicas`, the parallel
             // on_start pattern from `start_replicas` is reused.
             let delta = (target - current) as u8;
-            group.add_replicas(delta, &mut factory).await.map_err(|e| {
-                AggregatorRegistryError::ScaleFailed(format!("add_replicas: {e}"))
-            })?;
+            group
+                .add_replicas(delta, &mut factory)
+                .await
+                .map_err(|e| AggregatorRegistryError::ScaleFailed(format!("add_replicas: {e}")))?;
         } else if target < current {
             // Shrink: remove_last is genuinely sequential — each
             // pop awaits the previous handle's stop() so the

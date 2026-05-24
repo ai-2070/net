@@ -458,7 +458,9 @@ impl Mesh {
         let addr: SocketAddr = relay_addr
             .parse()
             .map_err(|e| SdkError::Config(format!("invalid relay address: {}", e)))?;
-        self.node.connect_via(addr, peer_pubkey, peer_node_id).await?;
+        self.node
+            .connect_via(addr, peer_pubkey, peer_node_id)
+            .await?;
         Ok(())
     }
 

@@ -275,14 +275,9 @@ async fn run_query(
 
     let profile = resolve_profile(config_path, profile_name).await?;
     let remote = require_remote_attach(&profile, &args.attach, "query")?;
-    let ctx = CliContext::build_with_remote(
-        &profile,
-        args.identity.as_deref(),
-        args.node,
-        false,
-        remote,
-    )
-    .await?;
+    let ctx =
+        CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)
+            .await?;
     let mesh = ctx.require_mesh_node()?;
 
     use net_sdk::aggregator::FoldQueryClient;
@@ -377,14 +372,9 @@ async fn run_ls_remote(
 ) -> Result<(), CliError> {
     let remote = require_remote_attach(profile, &args.attach, "ls --remote")?;
     let target_node_id = remote.node_id;
-    let ctx = CliContext::build_with_remote(
-        profile,
-        args.identity.as_deref(),
-        args.node,
-        false,
-        remote,
-    )
-    .await?;
+    let ctx =
+        CliContext::build_with_remote(profile, args.identity.as_deref(), args.node, false, remote)
+            .await?;
     let mesh = ctx.require_mesh_node()?;
 
     use net_sdk::aggregator::RegistryClient;
@@ -423,14 +413,9 @@ async fn run_spawn(
     let profile = resolve_profile(config_path, profile_name).await?;
     let remote = require_remote_attach(&profile, &args.attach, "spawn")?;
     let target_node_id = remote.node_id;
-    let ctx = CliContext::build_with_remote(
-        &profile,
-        args.identity.as_deref(),
-        args.node,
-        false,
-        remote,
-    )
-    .await?;
+    let ctx =
+        CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)
+            .await?;
     let mesh = ctx.require_mesh_node()?;
 
     use net_sdk::aggregator::RegistryClient;
@@ -465,14 +450,9 @@ async fn run_scale(
     let profile = resolve_profile(config_path, profile_name).await?;
     let remote = require_remote_attach(&profile, &args.attach, "scale")?;
     let target_node_id = remote.node_id;
-    let ctx = CliContext::build_with_remote(
-        &profile,
-        args.identity.as_deref(),
-        args.node,
-        false,
-        remote,
-    )
-    .await?;
+    let ctx =
+        CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)
+            .await?;
     let mesh = ctx.require_mesh_node()?;
 
     // Dedicated Scale RPC: grow/shrink in place. Surviving
@@ -588,7 +568,8 @@ struct RemoteLsGroupRow {
 
 impl From<&net_sdk::aggregator::RegistryGroupSummary> for RemoteLsGroupRow {
     fn from(g: &net_sdk::aggregator::RegistryGroupSummary) -> Self {
-        let replicas: Vec<RemoteReplicaRow> = g.replicas.iter().map(RemoteReplicaRow::from).collect();
+        let replicas: Vec<RemoteReplicaRow> =
+            g.replicas.iter().map(RemoteReplicaRow::from).collect();
         let healthy_count = replicas.iter().filter(|r| r.healthy).count() as u64;
         Self {
             name: g.name.clone(),

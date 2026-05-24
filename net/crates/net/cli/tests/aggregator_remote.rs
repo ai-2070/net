@@ -152,8 +152,8 @@ async fn ls_remote_lists_configured_groups() {
 
     let (code, stdout, stderr) = run_cli(&booted, &home, "ls", &["--remote"]).await;
     assert_eq!(code, 0, "ls --remote failed: stderr={stderr}");
-    let parsed: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("non-JSON stdout ({e}): {stdout}"));
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("non-JSON stdout ({e}): {stdout}"));
     assert_eq!(parsed["group_count"], 2, "stdout={stdout}");
     let names: Vec<&str> = parsed["groups"]
         .as_array()
@@ -198,8 +198,8 @@ async fn spawn_against_template_adds_a_group() {
     )
     .await;
     assert_eq!(code, 0, "spawn failed: stderr={stderr}");
-    let parsed: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("non-JSON stdout ({e}): {stdout}"));
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("non-JSON stdout ({e}): {stdout}"));
     assert_eq!(parsed["name"], "dynamic");
     assert_eq!(parsed["replica_count"], 2);
 
@@ -298,8 +298,8 @@ async fn query_returns_summary_for_configured_group() {
     )
     .await;
     assert_eq!(code, 0, "query failed: stderr={stderr}");
-    let parsed: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("non-JSON stdout ({e}): {stdout}"));
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("non-JSON stdout ({e}): {stdout}"));
     assert_eq!(parsed["fresh"], true);
     assert_eq!(parsed["fold_kind"], "0x0001");
 

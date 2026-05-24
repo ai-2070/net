@@ -398,12 +398,12 @@ impl<L: LifecycleDaemon> LifecycleGroup<L> {
         let new_idx = self.replicas.len() as u8;
         let daemon = factory(new_idx);
         let trait_obj: Arc<dyn LifecycleDaemon> = daemon.clone();
-        let handle = LifecycleHandle::start(trait_obj)
-            .await
-            .map_err(|error| LifecycleGroupError::StartFailed {
+        let handle = LifecycleHandle::start(trait_obj).await.map_err(|error| {
+            LifecycleGroupError::StartFailed {
                 index: new_idx,
                 error,
-            })?;
+            }
+        })?;
         self.replicas.push(daemon);
         self.handles.push(handle);
         Ok(new_idx)
@@ -1016,8 +1016,16 @@ mod tests {
         // Critical: existing replicas did NOT restart — their
         // start counters stay at 1 (no respawn).
         for d in daemons.lock().iter() {
-            assert_eq!(d.starts.load(Ordering::Acquire), 1, "existing replica restarted");
-            assert_eq!(d.stops.load(Ordering::Acquire), 0, "existing replica stopped");
+            assert_eq!(
+                d.starts.load(Ordering::Acquire),
+                1,
+                "existing replica restarted"
+            );
+            assert_eq!(
+                d.stops.load(Ordering::Acquire),
+                0,
+                "existing replica stopped"
+            );
         }
 
         group.stop().await;

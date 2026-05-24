@@ -266,33 +266,23 @@ pub fn resolve_remote_attach(
     let node_id_str = node_id.or(profile.node_id.as_deref());
     let psk_str = psk_hex.or(profile.psk_hex.as_deref());
 
-    let any_set = addr_str.is_some()
-        || pubkey_str.is_some()
-        || node_id_str.is_some()
-        || psk_str.is_some();
+    let any_set =
+        addr_str.is_some() || pubkey_str.is_some() || node_id_str.is_some() || psk_str.is_some();
     if !any_set {
         return Ok(None);
     }
 
     let addr_str = addr_str.ok_or_else(|| {
-        invalid_args(
-            "remote-attach requires --node-addr (or `node_addr` in the profile)",
-        )
+        invalid_args("remote-attach requires --node-addr (or `node_addr` in the profile)")
     })?;
     let pubkey_str = pubkey_str.ok_or_else(|| {
-        invalid_args(
-            "remote-attach requires --node-pubkey (or `node_pubkey` in the profile)",
-        )
+        invalid_args("remote-attach requires --node-pubkey (or `node_pubkey` in the profile)")
     })?;
     let node_id_str = node_id_str.ok_or_else(|| {
-        invalid_args(
-            "remote-attach requires --node-id (or `node_id` in the profile)",
-        )
+        invalid_args("remote-attach requires --node-id (or `node_id` in the profile)")
     })?;
     let psk_str = psk_str.ok_or_else(|| {
-        invalid_args(
-            "remote-attach requires --psk-hex (or `psk_hex` in the profile)",
-        )
+        invalid_args("remote-attach requires --psk-hex (or `psk_hex` in the profile)")
     })?;
 
     let addr: SocketAddr = addr_str.parse().map_err(|e| {
@@ -300,8 +290,8 @@ pub fn resolve_remote_attach(
             "--node-addr `{addr_str}` is not a valid IP:port: {e}"
         ))
     })?;
-    let public_key = hex_decode_32(pubkey_str)
-        .map_err(|e| invalid_args(format!("--node-pubkey: {e}")))?;
+    let public_key =
+        hex_decode_32(pubkey_str).map_err(|e| invalid_args(format!("--node-pubkey: {e}")))?;
     let node_id =
         parse_u64_flexible(node_id_str).map_err(|e| invalid_args(format!("--node-id: {e}")))?;
     let psk = hex_decode_32(psk_str).map_err(|e| invalid_args(format!("--psk-hex: {e}")))?;

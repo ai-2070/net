@@ -448,9 +448,7 @@ pub(crate) async fn answer(
             // a typed error is more appropriate than silent
             // not-modified.
             if registry.get(group_name).is_none() {
-                return RegistryResponse::Error(RegistryRpcError::UnknownGroup(
-                    group_name.clone(),
-                ));
+                return RegistryResponse::Error(RegistryRpcError::UnknownGroup(group_name.clone()));
             }
             // Front-line validation: target replica count must
             // be positive. The scaler is also expected to

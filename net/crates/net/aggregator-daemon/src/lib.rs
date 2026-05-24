@@ -617,12 +617,7 @@ fn validate_template(tpl: &TemplateConfig, mesh: &Arc<MeshNode>) -> Result<(), D
 fn build_template_index(
     templates: Vec<TemplateConfig>,
 ) -> Arc<std::collections::HashMap<String, TemplateConfig>> {
-    Arc::new(
-        templates
-            .into_iter()
-            .map(|t| (t.name.clone(), t))
-            .collect(),
-    )
+    Arc::new(templates.into_iter().map(|t| (t.name.clone(), t)).collect())
 }
 
 /// O(1) lookup against the template index with the typed
