@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/NRPC_STREAMING_PARITY_AND_GO_BINDING.md
+  s_099fa7d871e34d::t_e591ac0d3ac0ba 1-497
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "830811c06f94989e3c7be5c8ce23669a5b464b6a",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
