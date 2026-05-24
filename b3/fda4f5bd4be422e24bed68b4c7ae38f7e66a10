@@ -1,0 +1,26 @@
+net/crates/net/docs/plans/NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION.md
+  s_099fa7d871e34d::t_f41d1d8e4688b3 60,62-66,68
+  s_099fa7d871e34d::t_d2a09f62344285 310
+  s_099fa7d871e34d::t_67edc65727fd0d 277
+  s_099fa7d871e34d::t_27832680bade59 14-15
+  s_099fa7d871e34d::t_3627db401d5737 23,25
+  s_099fa7d871e34d::t_8e85826303a548 38-39,43-45,49,54
+  s_099fa7d871e34d::t_b730e57bf2d596 135,137,139,142-193,196-198,200-238,240,242,245-248,251-252,254,256,259-260,264,268
+  s_099fa7d871e34d::t_a624cfa4d4fff5 20-21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "b3fda4f5bd4be422e24bed68b4c7ae38f7e66a10",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
