@@ -52,19 +52,19 @@ use crate::prelude::{emit_value, OutputFormat};
 pub struct RemoteAttachArgs {
     /// Remote daemon `IP:port`. Operators copy this from the
     /// daemon's `--print-bootstrap` output.
-    #[arg(long)]
+    #[arg(long, value_parser = crate::parsers::parse_socket_addr_string)]
     pub node_addr: Option<String>,
     /// Remote daemon's Noise public key (64 hex chars, optional
     /// `0x` prefix).
-    #[arg(long)]
+    #[arg(long, value_parser = crate::parsers::parse_hex32_string)]
     pub node_pubkey: Option<String>,
     /// Remote daemon's `node_id` (decimal or `0x`-prefixed hex).
-    #[arg(long = "node-id")]
+    #[arg(long = "node-id", value_parser = crate::parsers::parse_u64_flexible_string)]
     pub remote_node_id: Option<String>,
     /// 32-byte pre-shared key as hex. Required when handshaking
     /// with a remote daemon; profile-level `psk_hex` covers the
     /// common case.
-    #[arg(long)]
+    #[arg(long, value_parser = crate::parsers::parse_hex32_string)]
     pub psk_hex: Option<String>,
 }
 

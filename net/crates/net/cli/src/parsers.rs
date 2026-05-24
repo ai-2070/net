@@ -44,6 +44,36 @@ pub(crate) fn hex_decode_32(s: &str) -> Result<[u8; 32], String> {
         .map_err(|v: Vec<u8>| format!("expected 32 bytes, got {}", v.len()))
 }
 
+/// Clap value-parser wrappers that validate at argv-parse time
+/// while preserving the operator's original `String` value for
+/// downstream consumers (the same string flows through profile
+/// fallbacks via TOML, so keeping the held type as `String`
+/// lets one resolve path handle both sources). Each parser
+/// short-circuits with a clear diagnostic when the input is
+/// malformed — clap renders the message at the offending flag.
+
+/// Parse an `IP:port` literal at argv time. Returns the string
+/// unchanged on success.
+pub(crate) fn parse_socket_addr_string(s: &str) -> Result<String, String> {
+    s.parse::<std::net::SocketAddr>()
+        .map_err(|e| format!("invalid IP:port `{s}`: {e}"))?;
+    Ok(s.to_string())
+}
+
+/// Validate a 32-byte hex literal at argv time. Returns the
+/// string unchanged on success.
+pub(crate) fn parse_hex32_string(s: &str) -> Result<String, String> {
+    let _ = hex_decode_32(s)?;
+    Ok(s.to_string())
+}
+
+/// Validate a `u64` decimal or `0x`-hex literal at argv time.
+/// Returns the string unchanged on success.
+pub(crate) fn parse_u64_flexible_string(s: &str) -> Result<String, String> {
+    let _ = parse_u64_flexible(s)?;
+    Ok(s.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
