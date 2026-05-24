@@ -358,6 +358,230 @@ class TypedRequestStream:
 
 
 # ---------------------------------------------------------------------------
+# TypedDuplexCall + TypedDuplexSink + TypedDuplexStream +
+# TypedResponseSink (S2-C2).
+#
+# Duplex: caller pushes Reqs and pulls Resps concurrently on a
+# single call. ``into_split`` separates the halves for the
+# encoder-thread / decoder-thread pattern.
+#
+# Cancellation contract (locked decision #2): v1 ``close()``-only,
+# same as client-streaming.
+# ---------------------------------------------------------------------------
+
+
+class TypedDuplexCall:
+    """Typed duplex call handle. Push typed requests via
+    :meth:`send`, pull typed responses via :meth:`__next__` /
+    iteration, or call :meth:`into_split` to peel off independent
+    sink + stream halves.
+
+    After :meth:`into_split` returns, the call is consumed —
+    subsequent :meth:`send` / :meth:`finish_sending` /
+    :meth:`__next__` raise.
+    """
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+        self._done = False
+
+    @property
+    def raw(self) -> Any:
+        """Underlying raw ``DuplexCall``."""
+        return self._raw
+
+    def send(self, value: Any) -> None:
+        """Encode + push one request chunk."""
+        self._raw.send(_json_encode(value))
+
+    def finish_sending(self) -> None:
+        """Close the upload direction (emit REQUEST_END)."""
+        self._raw.finish_sending()
+
+    def __iter__(self) -> Iterator[Any]:
+        return self
+
+    def __next__(self) -> Any:
+        """Pull the next decoded response. Raises
+        ``StopIteration`` on clean EOF. Decode failure raises
+        :class:`RpcCodecError` after closing the underlying
+        duplex call.
+        """
+        if self._done:
+            raise StopIteration
+        try:
+            chunk = next(self._raw)
+        except StopIteration:
+            self._done = True
+            raise
+        try:
+            return _json_decode(chunk)
+        except RpcCodecError:
+            self._done = True
+            try:
+                self._raw.close()
+            except Exception:
+                pass
+            raise
+
+    def into_split(self) -> tuple:
+        """Split the duplex into independent typed sink + stream
+        halves. After return, this call is consumed — subsequent
+        :meth:`send` / :meth:`__next__` raise. CANCEL fires only
+        when BOTH split halves drop without observing the
+        response stream's terminal frame.
+
+        Returns ``(TypedDuplexSink, TypedDuplexStream)``.
+        """
+        raw_sink, raw_stream = self._raw.into_split()
+        self._done = True
+        return TypedDuplexSink(raw_sink), TypedDuplexStream(raw_stream)
+
+    def call_id(self) -> int:
+        """Server-assigned ``call_id``."""
+        return int(self._raw.call_id())
+
+    def flow_controlled(self) -> bool:
+        """``True`` if the call was opened with non-``None``
+        ``request_window_initial``. Reports the upload-direction
+        flow-control state.
+        """
+        return bool(self._raw.flow_controlled())
+
+    def close(self) -> None:
+        """Close without observing the response terminator. Fires
+        CANCEL on the wire. Idempotent.
+        """
+        self._done = True
+        try:
+            self._raw.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "TypedDuplexCall":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        self.close()
+        return False
+
+
+class TypedDuplexSink:
+    """Send-half of a typed duplex call after
+    :meth:`TypedDuplexCall.into_split`.
+    """
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+
+    @property
+    def raw(self) -> Any:
+        """Underlying raw ``DuplexSink``."""
+        return self._raw
+
+    def send(self, value: Any) -> None:
+        """Encode + push one request chunk."""
+        self._raw.send(_json_encode(value))
+
+    def finish(self) -> None:
+        """Close the upload direction (emit REQUEST_END)."""
+        self._raw.finish()
+
+    def call_id(self) -> int:
+        return int(self._raw.call_id())
+
+    def flow_controlled(self) -> bool:
+        return bool(self._raw.flow_controlled())
+
+    def close(self) -> None:
+        """Close without emitting REQUEST_END. Idempotent."""
+        try:
+            self._raw.close()
+        except Exception:
+            pass
+
+
+class TypedDuplexStream:
+    """Receive-half of a typed duplex call after
+    :meth:`TypedDuplexCall.into_split`. Iterates over decoded
+    responses; decode failure raises :class:`RpcCodecError` and
+    closes the underlying stream.
+    """
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+        self._done = False
+
+    @property
+    def raw(self) -> Any:
+        """Underlying raw ``DuplexStream``."""
+        return self._raw
+
+    def __iter__(self) -> Iterator[Any]:
+        return self
+
+    def __next__(self) -> Any:
+        if self._done:
+            raise StopIteration
+        try:
+            chunk = next(self._raw)
+        except StopIteration:
+            self._done = True
+            raise
+        try:
+            return _json_decode(chunk)
+        except RpcCodecError:
+            self._done = True
+            try:
+                self._raw.close()
+            except Exception:
+                pass
+            raise
+
+    def call_id(self) -> int:
+        return int(self._raw.call_id())
+
+    def close(self) -> None:
+        """Close the stream. Idempotent."""
+        self._done = True
+        try:
+            self._raw.close()
+        except Exception:
+            pass
+
+
+class TypedResponseSink:
+    """Typed outbound response sink for duplex server handlers.
+
+    Non-async (mirrors the raw ``ResponseSinkSend.send``). Returns
+    ``True`` when the chunk was enqueued; ``False`` if the
+    underlying sink is closed. Encode failure raises
+    :class:`RpcCodecError` and the chunk is NOT sent.
+
+    Flow control: the underlying sink ``try_send``\\ s into a
+    bounded 1024-chunk mpsc. Bursts past the credit window are
+    dropped (counted by ``streaming_chunks_dropped_total``). Pace
+    your :meth:`send` calls to the protocol's REQUEST_GRANT
+    cadence for lossless flow control.
+    """
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+
+    @property
+    def raw(self) -> Any:
+        """Underlying raw ``ResponseSinkSend``."""
+        return self._raw
+
+    def send(self, value: Any) -> bool:
+        """Encode + emit one response chunk. Returns ``True`` on
+        successful enqueue; ``False`` if the sink has been closed.
+        Raises :class:`RpcCodecError` on encode failure.
+        """
+        return bool(self._raw.send(_json_encode(value)))
+
+
+# ---------------------------------------------------------------------------
 # TypedMeshRpc — public typed wrapper.
 # ---------------------------------------------------------------------------
 
@@ -527,6 +751,50 @@ class TypedMeshRpc:
             return _json_encode(resp)
 
         return self._raw.serve_client_stream(service, _wrapped)
+
+    # ---- duplex (S2-C2) -----------------------------------------------------
+
+    def call_duplex(
+        self,
+        target_node_id: int,
+        service: str,
+        opts: Optional[dict] = None,
+    ) -> "TypedDuplexCall":
+        """Open a typed duplex call. Returns a
+        :class:`TypedDuplexCall` — push typed requests via
+        :meth:`TypedDuplexCall.send`, pull typed responses via
+        iteration, or :meth:`TypedDuplexCall.into_split` to
+        separate the halves.
+
+        Cancellation contract (locked decision #2): v1 supports
+        ``close()`` only. ``opts['cancel']`` is **not** wired into
+        the raw streaming layer; invoke ``typed_call.close()`` to
+        abort an in-flight duplex.
+        """
+        raw_call = self._raw.call_duplex(target_node_id, service, opts)
+        return TypedDuplexCall(raw_call)
+
+    def serve_duplex(
+        self,
+        service: str,
+        handler: Callable[["TypedRequestStream", "TypedResponseSink"], None],
+    ) -> ServeHandle:
+        """Register a typed duplex handler. ``handler`` signature
+        is ``(stream: TypedRequestStream, sink: TypedResponseSink) -> None``:
+        drain inbound chunks from ``stream``, emit response chunks
+        via ``sink.send(value)``. Handler return is ``None``; the
+        substrate emits the terminal frame automatically.
+
+        Raise ``RpcAppError(code, body)`` to surface a typed
+        Application status.
+        """
+
+        def _wrapped(raw_stream: Any, raw_sink: Any) -> None:
+            typed_stream = TypedRequestStream(raw_stream)
+            typed_sink = TypedResponseSink(raw_sink)
+            handler(typed_stream, typed_sink)
+
+        return self._raw.serve_duplex(service, _wrapped)
 
     # ---- resilience ---------------------------------------------------------
 

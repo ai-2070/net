@@ -48,8 +48,12 @@ from net.mesh_rpc import (
     RpcTimeoutError,
     RpcTransportError,
     TypedClientStreamCall,
+    TypedDuplexCall,
+    TypedDuplexSink,
+    TypedDuplexStream,
     TypedMeshRpc,
     TypedRequestStream,
+    TypedResponseSink,
     classify_error,
     default_breaker_failure,
     default_retryable,
@@ -831,3 +835,222 @@ def test_typed_call_client_stream_wraps_raw_call() -> None:
     call.send({"k": "v"})
     assert stub.returned_call is not None
     assert stub.returned_call.sent[0].decode("utf-8") == '{"k":"v"}'
+
+
+# =========================================================================
+# TypedDuplexCall / TypedDuplexSink / TypedDuplexStream /
+# TypedResponseSink (S2-C2) — stub-level round-trip + split-halves
+# coverage. Live tests against a real MeshRpc belong in S2-X.
+# =========================================================================
+
+
+class _StubRawResponseSink:
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+        self.closed = False
+
+    def send(self, body: bytes) -> bool:
+        if self.closed:
+            return False
+        self.sent.append(bytes(body))
+        return True
+
+
+class _StubRawDuplexSink:
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+        self.finished = False
+        self.closed = False
+
+    def send(self, body: bytes) -> None:
+        self.sent.append(bytes(body))
+
+    def finish(self) -> None:
+        self.finished = True
+
+    def call_id(self) -> int:
+        return 11
+
+    def flow_controlled(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _StubRawDuplexStream:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = list(chunks)
+        self._idx = 0
+        self.closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> bytes:
+        if self._idx >= len(self._chunks):
+            raise StopIteration
+        chunk = self._chunks[self._idx]
+        self._idx += 1
+        return chunk
+
+    def call_id(self) -> int:
+        return 12
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _StubRawDuplexCall:
+    def __init__(self, stream: _StubRawDuplexStream) -> None:
+        self.sent: list[bytes] = []
+        self.finished_sending = False
+        self.closed = False
+        self.sink: _StubRawDuplexSink | None = None
+        self.stream = stream
+
+    def send(self, body: bytes) -> None:
+        self.sent.append(bytes(body))
+
+    def finish_sending(self) -> None:
+        self.finished_sending = True
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> bytes:
+        return next(self.stream)
+
+    def into_split(self):
+        sink = _StubRawDuplexSink()
+        self.sink = sink
+        return sink, self.stream
+
+    def call_id(self) -> int:
+        return 13
+
+    def flow_controlled(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_typed_duplex_round_trip() -> None:
+    """Round-trip: typed sends + typed responses interleaved."""
+    stream = _StubRawDuplexStream([b'{"r":"a"}', b'{"r":"b"}'])
+    raw = _StubRawDuplexCall(stream)
+    call = TypedDuplexCall(raw)
+    call.send({"q": 1})
+    call.send({"q": 2})
+    call.finish_sending()
+    collected = [item["r"] for item in call]
+    assert collected == ["a", "b"]
+    assert [b.decode("utf-8") for b in raw.sent] == ['{"q":1}', '{"q":2}']
+    assert raw.finished_sending is True
+
+
+def test_typed_duplex_decode_failure_closes_call() -> None:
+    stream = _StubRawDuplexStream([b'{not json'])
+    raw = _StubRawDuplexCall(stream)
+    call = TypedDuplexCall(raw)
+    with pytest.raises(RpcCodecError):
+        next(call)
+    assert raw.closed is True
+    # Subsequent next() returns StopIteration (no re-throw).
+    with pytest.raises(StopIteration):
+        next(call)
+
+
+def test_typed_duplex_into_split_yields_typed_halves() -> None:
+    stream = _StubRawDuplexStream([b'{"r":"x"}', b'{"r":"y"}'])
+    raw = _StubRawDuplexCall(stream)
+    call = TypedDuplexCall(raw)
+    sink, recv = call.into_split()
+    assert isinstance(sink, TypedDuplexSink)
+    assert isinstance(recv, TypedDuplexStream)
+    sink.send({"q": 7})
+    sink.finish()
+    assert raw.sink is not None
+    assert raw.sink.sent[0].decode("utf-8") == '{"q":7}'
+    assert raw.sink.finished is True
+    collected = [item["r"] for item in recv]
+    assert collected == ["x", "y"]
+    # The original call is consumed after into_split.
+    with pytest.raises(StopIteration):
+        next(call)
+
+
+def test_typed_duplex_close_idempotent_swallows_errors() -> None:
+    class _RaisingClose(_StubRawDuplexCall):
+        def close(self) -> None:
+            raise RuntimeError("boom")
+
+    call = TypedDuplexCall(_RaisingClose(_StubRawDuplexStream([])))
+    call.close()  # must not raise
+    call.close()  # idempotent
+
+
+def test_typed_response_sink_round_trip() -> None:
+    raw = _StubRawResponseSink()
+    sink = TypedResponseSink(raw)
+    assert sink.send({"r": 1}) is True
+    assert sink.send({"r": 2}) is True
+    assert [b.decode("utf-8") for b in raw.sent] == ['{"r":1}', '{"r":2}']
+
+
+def test_typed_response_sink_returns_false_when_closed() -> None:
+    raw = _StubRawResponseSink()
+    raw.closed = True
+    sink = TypedResponseSink(raw)
+    assert sink.send({"r": 1}) is False
+    assert raw.sent == []
+
+
+def test_typed_response_sink_encode_failure_does_not_enqueue() -> None:
+    raw = _StubRawResponseSink()
+    sink = TypedResponseSink(raw)
+
+    class NotJsonable:
+        pass
+
+    with pytest.raises(RpcCodecError):
+        sink.send(NotJsonable())
+    assert raw.sent == []
+
+
+class _CapturingDuplexRpc:
+    def __init__(self) -> None:
+        self.inner_handler = None
+
+    def serve_duplex(self, service: str, handler) -> object:  # noqa: ARG002
+        self.inner_handler = handler
+        return object()
+
+
+def test_typed_serve_duplex_destructures_stream_and_sink() -> None:
+    stub = _CapturingDuplexRpc()
+    rpc = TypedMeshRpc(stub)
+
+    observed: dict = {}
+
+    def handler(stream: TypedRequestStream, sink: TypedResponseSink) -> None:
+        reqs = []
+        for req in stream:
+            reqs.append(req["q"])
+            sink.send({"r": f"echo:{req['q']}"})
+        observed["reqs"] = reqs
+
+    rpc.serve_duplex("echo", handler)
+    assert stub.inner_handler is not None
+
+    raw_stream = _StubRawRequestStream([b'{"q":1}', b'{"q":2}', b'{"q":3}'])
+    raw_sink = _StubRawResponseSink()
+    result = stub.inner_handler(raw_stream, raw_sink)
+    assert result is None
+    assert observed["reqs"] == [1, 2, 3]
+    assert [b.decode("utf-8") for b in raw_sink.sent] == [
+        '{"r":"echo:1"}',
+        '{"r":"echo:2"}',
+        '{"r":"echo:3"}',
+    ]
