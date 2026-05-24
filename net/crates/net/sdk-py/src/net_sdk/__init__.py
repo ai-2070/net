@@ -61,6 +61,18 @@ from net_sdk.capability import (
     where_header,
     with_metadata,
 )
+from net_sdk.capability_aggregation import (
+    AggregateRow,
+    Aggregation,
+    AggregationCls,
+    CapacityQuery,
+    CapacityRow,
+    GroupBy,
+    GroupByCls,
+    TagMatcher,
+    TagMatcherCls,
+    TaxonomyAxis,
+)
 from net_sdk.capability_schema import (
     AXIS_SCHEMA,
     METADATA_RESERVED_KEYS,
@@ -84,18 +96,6 @@ from net_sdk.capability_schema import (
     WarningMetadataOversize,
     WarningUnknownKey,
     validate_capabilities,
-)
-from net_sdk.capability_aggregation import (
-    Aggregation,
-    AggregationCls,
-    AggregateRow,
-    CapacityQuery,
-    CapacityRow,
-    GroupBy,
-    GroupByCls,
-    TagMatcher,
-    TagMatcherCls,
-    TaxonomyAxis,
 )
 from net_sdk.channel import TypedChannel
 from net_sdk.mesh import (
@@ -205,4 +205,4 @@ __all__ = [
     "validate_capabilities",
 ]
 
-__version__ = "0.21.0"
+__version__ = "0.22.0"

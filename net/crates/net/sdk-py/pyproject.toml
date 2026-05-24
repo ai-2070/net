@@ -7,11 +7,11 @@ build-backend = "setuptools.build_meta"
 # `net_sdk` (the package directory under `src/` is unchanged) so
 # user code keeps `import net_sdk` working.
 name = "net-mesh-sdk"
-version = "0.21.0"
+version = "0.22.0"
 description = "Ergonomic Python SDK for the Net mesh network"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
-dependencies = ["net-mesh>=0.21.0"]
+dependencies = ["net-mesh>=0.22.0"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
