@@ -52,7 +52,23 @@ use std::time::Duration;
 
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
-const N_NODES: usize = 32;
+/// Concurrency target. The fast-build CI runs 32 in ~hundreds of
+/// ms; under `cargo-llvm-cov`'s `-C instrument-coverage` build
+/// every per-node tokio task + UDP socket setup is heavily slowed,
+/// and the GitHub runner's file-descriptor / IO budget can't
+/// sustain 32 simultaneous `MeshNode::new` calls — bind failures
+/// surface as test panics. The TOCTOU-race regression this test
+/// guards against doesn't need 32 nodes to be visible; 4
+/// concurrent binds already exercise the shared-port window the
+/// old `find_ports` helper used to introduce. Scale down when
+/// `CARGO_LLVM_COV` indicates we're inside the coverage workflow.
+fn n_nodes() -> usize {
+    if std::env::var_os("CARGO_LLVM_COV").is_some() {
+        4
+    } else {
+        32
+    }
+}
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
 
@@ -71,7 +87,7 @@ fn test_config() -> MeshNodeConfig {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parallel_mesh_nodes_bind_to_distinct_ports() {
-    // Spawn N_NODES concurrent construction tasks. Each binds to
+    // Spawn `n` concurrent construction tasks. Each binds to
     // `:0` independently; the OS allocates a distinct port per
     // socket.
     //
@@ -81,11 +97,12 @@ async fn parallel_mesh_nodes_bind_to_distinct_ports() {
     // be free to hand that same port back to a later task. That
     // is exactly the TOCTOU window this test claims to guard
     // against, so reproducing it inside the test gave a duplicate-
-    // port flake (e.g. port 52605 reported twice across 32 nodes).
+    // port flake (e.g. port 52605 reported twice across N nodes).
     // Holding every node alive in `nodes` until after the
-    // distinct-port assertion forces the kernel to keep all 32
+    // distinct-port assertion forces the kernel to keep all
     // ports allocated simultaneously.
-    let handles: Vec<_> = (0..N_NODES)
+    let n = n_nodes();
+    let handles: Vec<_> = (0..n)
         .map(|_| {
             tokio::spawn(async move {
                 let keypair = EntityKeypair::generate();
@@ -94,7 +111,7 @@ async fn parallel_mesh_nodes_bind_to_distinct_ports() {
         })
         .collect();
 
-    let mut nodes: Vec<MeshNode> = Vec::with_capacity(N_NODES);
+    let mut nodes: Vec<MeshNode> = Vec::with_capacity(n);
     for (i, h) in handles.into_iter().enumerate() {
         let node = h
             .await
@@ -106,15 +123,15 @@ async fn parallel_mesh_nodes_bind_to_distinct_ports() {
     let ports: Vec<u16> = nodes.iter().map(|n| n.local_addr().port()).collect();
 
     // Distinct-port property. A HashSet of the collected ports
-    // must have exactly N_NODES entries — any collision means the
-    // OS handed us the same port twice while all 32 sockets are
+    // must have exactly `n` entries — any collision means the
+    // OS handed us the same port twice while all sockets are
     // simultaneously bound, which shouldn't happen on any platform
     // we support.
     let distinct: HashSet<u16> = ports.iter().copied().collect();
     assert_eq!(
         distinct.len(),
-        N_NODES,
-        "expected {N_NODES} distinct ports; got {} ({:?})",
+        n,
+        "expected {n} distinct ports; got {} ({:?})",
         distinct.len(),
         ports,
     );
