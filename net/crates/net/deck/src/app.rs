@@ -173,6 +173,15 @@ pub struct App {
     /// collections are empty to decide between live and
     /// fixture rendering paths.
     pub snapshot: Arc<MeshOsSnapshot>,
+    /// Memoized SUBNETS-tab derivation against the current
+    /// snapshot. `subnet_rollups_with_local` and
+    /// `aggregator_source_subnets` get called every frame on
+    /// the SUBNETS tab (8 fps); walking the snapshot peers +
+    /// allocating fresh `HashSet`/`Vec` per frame is wasted
+    /// work. Cleared by `refresh_snapshot` whenever the
+    /// snapshot Arc swaps — until then, repeated render-path
+    /// calls reuse the cached derivation.
+    subnet_view_cache: std::cell::RefCell<SubnetViewCache>,
     /// Phase-4 streaming tail for LOGS. Fed by a background
     /// `subscribe_logs` task; the LOGS render path reads from
     /// this buffer instead of `snapshot.log_ring`, so the
@@ -545,6 +554,23 @@ fn synthetic_greedy_view(node_id: u64, label: Option<&'static str>) -> tabs::dat
     }
 }
 
+/// Memoized SUBNETS-tab derivations against the most-recent
+/// snapshot. Single-threaded UI code, so `RefCell` interior
+/// mutation is fine. Both fields are `None` after a snapshot
+/// swap; populated on first access; reused per frame.
+#[derive(Default)]
+struct SubnetViewCache {
+    rollups: Option<(Option<net_sdk::subnets::SubnetId>, Vec<net_sdk::deck::SubnetRollup>)>,
+    agg_subnets: Option<std::collections::HashSet<net_sdk::subnets::SubnetId>>,
+}
+
+impl SubnetViewCache {
+    fn invalidate(&mut self) {
+        self.rollups = None;
+        self.agg_subnets = None;
+    }
+}
+
 impl App {
     pub fn new(
         deck: Arc<DeckClient>,
@@ -585,6 +611,7 @@ impl App {
             tick: 0,
             deck,
             snapshot,
+            subnet_view_cache: std::cell::RefCell::new(SubnetViewCache::default()),
             groups_cursor: DaemonCursor::default(),
             daemons_cursor: 0,
             netmap_cursor: 0,
@@ -651,6 +678,9 @@ impl App {
 
     fn refresh_snapshot(&mut self) {
         self.snapshot = Arc::new(self.deck.status());
+        // Snapshot just swapped — every memoized derivation
+        // against it is now stale.
+        self.subnet_view_cache.borrow_mut().invalidate();
     }
 
     /// Drain any toasts queued by detached dispatch tasks; the
@@ -1350,6 +1380,9 @@ impl App {
     /// periodically-refreshed `aggregator_registry_snapshot`
     /// cache for cluster-wide coverage.
     fn aggregator_source_subnets(&self) -> std::collections::HashSet<net_sdk::subnets::SubnetId> {
+        if let Some(cached) = self.subnet_view_cache.borrow().agg_subnets.as_ref() {
+            return cached.clone();
+        }
         let mut out = std::collections::HashSet::new();
         if let Some(snap) = self.deck.aggregator_snapshot() {
             out.insert(snap.source_subnet);
@@ -1360,6 +1393,7 @@ impl App {
             // the demo SUBNETS panel lights up at least one row.
             out.insert(crate::demo::fixtures::aggregator().source_subnet);
         }
+        self.subnet_view_cache.borrow_mut().agg_subnets = Some(out.clone());
         out
     }
 
@@ -1381,14 +1415,28 @@ impl App {
         Option<net_sdk::subnets::SubnetId>,
         Vec<net_sdk::deck::SubnetRollup>,
     ) {
+        if let Some(cached) = self.subnet_view_cache.borrow().rollups.as_ref() {
+            return cached.clone();
+        }
         let local = self.deck.local_subnet();
         let rollups = self.deck.subnets_with_members(None);
-        #[cfg(feature = "demo")]
-        if rollups.is_empty() && local.is_none() {
-            let peer_ids: Vec<u64> = self.snapshot.peers.keys().copied().collect();
-            return crate::demo::fixtures::subnets(self.this_node, &peer_ids);
-        }
-        (local, rollups)
+        let value = {
+            #[cfg(feature = "demo")]
+            {
+                if rollups.is_empty() && local.is_none() {
+                    let peer_ids: Vec<u64> = self.snapshot.peers.keys().copied().collect();
+                    crate::demo::fixtures::subnets(self.this_node, &peer_ids)
+                } else {
+                    (local, rollups)
+                }
+            }
+            #[cfg(not(feature = "demo"))]
+            {
+                (local, rollups)
+            }
+        };
+        self.subnet_view_cache.borrow_mut().rollups = Some(value.clone());
+        value
     }
 
     fn open_blob_detail(&mut self) {
