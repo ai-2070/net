@@ -33,23 +33,23 @@ Tagged `[S | A | B | C | D | T]`:
 
 ## Status
 
-| ID    | Pri | Area                | Title                                                                                          |
-|-------|-----|---------------------|------------------------------------------------------------------------------------------------|
-| C-S1  | H   | SDK substrate       | Add `cancel_token: Option<u64>` to `CallOptions` + `Mesh::reserve_cancel_token` / `Mesh::cancel(token)` + per-mesh registry; thread through `call` / `call_service` / `call_streaming` / `call_client_stream` / `call_duplex` |
-| C-S2  | H   | SDK substrate       | SDK-level integration tests: per-call-shape cancel-mid-flight emits CANCEL on the wire; cancel-on-zero-token is a no-op; reservation+cancel race is safe |
-| O-A1  | H   | napi binding        | Replace sync `NodeRpcObserver` with bounded-mpsc + drop counter; surface `observerDroppedTotal` in `metricsSnapshot` |
-| O-A2  | H   | pyo3 binding        | Replace per-event `spawn_blocking` with bounded-mpsc + worker task + drop counter; surface in `metrics_snapshot` |
-| O-A3  | H   | C ABI / Go FFI      | Replace direct dispatcher invocation with Rust-side bounded-mpsc + worker; surface drop counter in JSON of `net_rpc_metrics_snapshot` |
-| C-A1  | H   | napi binding        | Migrate `lock_cancel_registry` to thin pass-through over `Mesh::cancel`; populate `opts.cancel_token` for streaming entries (delete the local AbortHandle registry) |
-| C-A2  | H   | pyo3 binding        | Migrate `Cancellable` watcher to thin pass-through over `Mesh::cancel`; populate `opts.cancel_token` for streaming entries |
-| C-A3  | H   | Go FFI              | Migrate rpc-ffi `cancel_registry` to thin pass-through over `Mesh::cancel`; add `net_rpc_call_client_stream_cancellable` + `net_rpc_call_duplex_cancellable` symbols populating `opts.cancel_token` |
-| C-B1  | M   | Node TS wrapper     | `TypedMeshRpc.callClientStream` / `callDuplex` wire `AbortSignal` end-to-end (drop `stripSignal` for streaming) |
-| C-C1  | M   | Python wrapper      | `TypedMeshRpc.call_client_stream` / `call_duplex` extract `opts['cancel']` and propagate                       |
-| C-D1  | M   | Go wrapper          | `TypedCallClientStream` / `TypedCallDuplex` propagate `ctx` through the cancellable FFI variant                |
-| O-T1  | M   | fixture + tests     | Update `golden_vectors_streaming.json::observer_invariants.firing_contract` for mpsc shape; add `observerDroppedTotal` to `metrics_snapshot_invariants`; document the SDK-level cancel-token contract in a new `cancellation_invariants` section |
-| O-T2  | M   | tests               | Rust-side reference: drop counter increments under sustained load when the observer is intentionally slow |
-| C-T1  | M   | tests               | Rust-side reference: cancel mid-stream observed by server as `RpcStatus::Cancelled` for client-stream + duplex |
-| C-T2  | L   | per-binding tests   | Stub-level test in each binding: signal-aborted / cancellable-cancelled / ctx-cancelled streaming call propagates to `close()` on the inner call |
+| ID    | Pri | Area                | Title                                                                                          | Status                  |
+|-------|-----|---------------------|------------------------------------------------------------------------------------------------|-------------------------|
+| C-S1  | H   | SDK substrate       | Add `cancel_token: Option<u64>` to `CallOptions` + `Mesh::reserve_cancel_token` / `Mesh::cancel(token)` + per-mesh registry; thread through `call` / `call_service` / `call_streaming` / `call_client_stream` / `call_duplex` | ✅ `68470697` + `9cdb36c0` |
+| C-S2  | H   | SDK substrate       | SDK-level integration tests: per-call-shape cancel-mid-flight emits CANCEL on the wire; cancel-on-zero-token is a no-op; reservation+cancel race is safe | ✅ `fa1d19bc`           |
+| O-A1  | H   | napi binding        | Replace sync `NodeRpcObserver` with bounded-mpsc + drop counter; surface `observerDroppedTotal` in `metricsSnapshot` | ✅ `1217c8e9`           |
+| O-A2  | H   | pyo3 binding        | Replace per-event `spawn_blocking` with bounded-mpsc + worker task + drop counter; surface in `metrics_snapshot` | ✅ `ce43d3d0`           |
+| O-A3  | H   | C ABI / Go FFI      | Replace direct dispatcher invocation with Rust-side bounded-mpsc + worker; surface drop counter in JSON of `net_rpc_metrics_snapshot` | ✅ `0898053c`           |
+| C-A1  | H   | napi binding        | Migrate `lock_cancel_registry` to thin pass-through over `Mesh::cancel`; populate `opts.cancel_token` for streaming entries (delete the local AbortHandle registry) | ✅ `47576ff2`           |
+| C-A2  | H   | pyo3 binding        | Migrate `Cancellable` watcher to thin pass-through over `Mesh::cancel`; populate `opts.cancel_token` for streaming entries | ✅ `7dd395d0`           |
+| C-A3  | H   | Go FFI              | Migrate rpc-ffi `cancel_registry` to thin pass-through over `Mesh::cancel`; add `net_rpc_call_client_stream_cancellable` + `net_rpc_call_duplex_cancellable` symbols populating `opts.cancel_token` | ✅ `a8ca0910`           |
+| C-B1  | M   | Node TS wrapper     | `TypedMeshRpc.callClientStream` / `callDuplex` wire `AbortSignal` end-to-end (drop `stripSignal` for streaming) | ✅ `47576ff2`           |
+| C-C1  | M   | Python wrapper      | `TypedMeshRpc.call_client_stream` / `call_duplex` extract `opts['cancel']` and propagate                       | ✅ `df18c183`           |
+| C-D1  | M   | Go wrapper          | `TypedCallClientStream` / `TypedCallDuplex` propagate `ctx` through the cancellable FFI variant                | ✅ `df18c183`           |
+| O-T1  | M   | fixture + tests     | Update `golden_vectors_streaming.json::observer_invariants.firing_contract` for mpsc shape; add `observerDroppedTotal` to `metrics_snapshot_invariants`; document the SDK-level cancel-token contract in a new `cancellation_invariants` section | ✅ `d20c422a`           |
+| O-T2  | M   | tests               | Rust-side reference: drop counter increments under sustained load when the observer is intentionally slow | ✅ `8048d02c`           |
+| C-T1  | M   | tests               | Rust-side reference: cancel mid-stream observed by server as `RpcStatus::Cancelled` for client-stream + duplex | ✅ covered by C-S2 `fa1d19bc` (integration_mesh_cancel.rs exercises mid-flight cancel for all four shapes) |
+| C-T2  | L   | per-binding tests   | Stub-level test in each binding: signal-aborted / cancellable-cancelled / ctx-cancelled streaming call propagates to `close()` on the inner call | ⏳ deferred — substrate-level cancel is already pinned end-to-end; per-binding regression tests are useful but lower priority and can land per-binding as users add coverage |
 
 ABI version: this plan bumps `NET_RPC_ABI_VERSION` from `0x0003` → `0x0004` because of the new cancellable FFI symbols. Additive; 0x0003 consumers keep working. The new `CallOptions::cancel_token` field is also additive on the SDK side (existing `..Default::default()` callers continue to compile).
 
