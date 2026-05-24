@@ -1,0 +1,19 @@
+net/crates/net/docs/releases/RELEASE_v0.22_ALL_ALONG_THE_WATCHTOWER.md
+  s_cd1ebec706d521::t_db8c6269818eac 1-5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "453274f7beecf33806fba0251c2769c1c977f59b",
+  "prompts": {},
+  "sessions": {
+    "s_cd1ebec706d521": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a00e6c6b-265f-49a7-8bdb-ff094cb0b97e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
