@@ -110,4 +110,11 @@ tokio = { version = "1", features = [
 # Boot the aggregator-daemon in-process for the remote-attach
 # integration test (`tests/aggregator_remote.rs`). The CLI
 # subprocess handshakes against this booted daemon's MeshNode.
-net-aggregator-daemon = { version = "0.22.0", path = "../aggregator-daemon" }
+#
+# Path-only on purpose — net-aggregator-daemon is a binary
+# crate that doesn't publish to crates.io, so giving this
+# dev-dep a `version = ...` field would make `cargo publish
+# --dry-run` (and any real publish) fail at the dependency-
+# resolution step. With only `path` set, cargo drops the
+# dev-dep entirely when packaging.
+net-aggregator-daemon = { path = "../aggregator-daemon" }
