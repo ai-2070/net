@@ -1301,6 +1301,26 @@ impl App {
         });
     }
 
+    /// Subnets known to host an aggregator source. Powers the
+    /// SUBNETS `AGG` column. Today the only sync source is
+    /// `aggregator_snapshot()` (one entry — the deck's local
+    /// aggregator if installed); a future slice can layer in a
+    /// periodically-refreshed `aggregator_registry_snapshot`
+    /// cache for cluster-wide coverage.
+    fn aggregator_source_subnets(&self) -> std::collections::HashSet<net_sdk::subnets::SubnetId> {
+        let mut out = std::collections::HashSet::new();
+        if let Some(snap) = self.deck.aggregator_snapshot() {
+            out.insert(snap.source_subnet);
+        }
+        #[cfg(feature = "demo")]
+        if out.is_empty() {
+            // Fixture aggregator lives on `1.2`; surface it so
+            // the demo SUBNETS panel lights up at least one row.
+            out.insert(crate::demo::fixtures::aggregator().source_subnet);
+        }
+        out
+    }
+
     /// Pull the subnet rollup list the SUBNETS panel renders.
     /// Mirrors the demo-fixture fallback so cursor + Enter
     /// work even when no real mesh is wired.
@@ -3264,7 +3284,15 @@ impl App {
                 );
             }
             Tab::Subnets => {
-                tabs::subnets::render(frame, chunks[3], &self.deck, self.subnets_cursor)
+                let agg_subnets = self.aggregator_source_subnets();
+                tabs::subnets::render(
+                    frame,
+                    chunks[3],
+                    &self.deck,
+                    &self.snapshot,
+                    &agg_subnets,
+                    self.subnets_cursor,
+                )
             }
             Tab::Gateways => {
                 tabs::gateways::render(frame, chunks[3], &self.deck, self.gateways_cursor)

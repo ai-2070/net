@@ -1,14 +1,18 @@
 //! SUBNETS tab — cursored, scrollable rollup of every subnet
-//! the local mesh knows about. One row per subnet with `▶`
-//! cursor marker; `j`/`k` + `g`/`G` navigation matches the
-//! BLOBS / GATEWAYS pattern.
+//! the local mesh knows about.
 //!
-//! Columns: SUBNET (dotted id, highlighted when local), DEPTH,
-//! MEMBERS (peer count), LOCAL (`yes`/`—`).
+//! Columns: `▶` cursor marker, SUBNET (dotted id), PARENT
+//! (parent's dotted id; `—` for depth-0), DEPTH, MEMBERS
+//! (count), HEALTH (`healthy/total` of member peers rolled up
+//! against the current `MeshOsSnapshot`), AGG (`yes/—` for
+//! subnets backed by a known aggregator source), LOCAL
+//! (`yes/—`).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use net_sdk::deck::{DeckClient, SubnetRollup};
+use net_sdk::deck::{DeckClient, MeshOsSnapshot, SubnetRollup};
+use net_sdk::subnets::SubnetId;
 use ratatui::{
     layout::{Alignment, Constraint, Rect},
     text::{Line, Span},
@@ -18,7 +22,14 @@ use ratatui::{
 
 use crate::{theme, widgets};
 
-pub fn render(frame: &mut Frame<'_>, area: Rect, deck: &Arc<DeckClient>, cursor: usize) {
+pub fn render(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    deck: &Arc<DeckClient>,
+    snapshot: &MeshOsSnapshot,
+    aggregator_subnets: &HashSet<SubnetId>,
+    cursor: usize,
+) {
     let local = deck.local_subnet();
     let rollups = deck.subnets_with_members(None);
     // Under `--features demo` the cluster harness boots N nodes
@@ -33,7 +44,15 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, deck: &Arc<DeckClient>, cursor:
     if local.is_none() && rollups.is_empty() {
         render_empty(frame, area);
     } else {
-        render_table(frame, area, local, &rollups, cursor);
+        render_table(
+            frame,
+            area,
+            local,
+            &rollups,
+            snapshot,
+            aggregator_subnets,
+            cursor,
+        );
     }
 }
 
@@ -53,11 +72,14 @@ fn render_empty(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_table(
     frame: &mut Frame<'_>,
     area: Rect,
-    local: Option<net_sdk::subnets::SubnetId>,
+    local: Option<SubnetId>,
     rollups: &[SubnetRollup],
+    snapshot: &MeshOsSnapshot,
+    aggregator_subnets: &HashSet<SubnetId>,
     cursor: usize,
 ) {
     let shown = rollups.len();
@@ -109,8 +131,11 @@ fn render_table(
     let header = Row::new(vec![
         Cell::from(Span::styled(" ", theme::chrome())),
         Cell::from(Span::styled("SUBNET", theme::chrome())),
+        Cell::from(Span::styled("PARENT", theme::chrome())),
         Cell::from(Span::styled("DEPTH", theme::chrome())),
         Cell::from(Span::styled("MEMBERS", theme::chrome())),
+        Cell::from(Span::styled("HEALTH", theme::chrome())),
+        Cell::from(Span::styled("AGG", theme::chrome())),
         Cell::from(Span::styled("LOCAL", theme::chrome())),
     ])
     .height(1);
@@ -125,9 +150,24 @@ fn render_table(
         } else {
             theme::text()
         };
+
+        let parent_text = if rollup.subnet.depth() == 0 {
+            "—".to_string()
+        } else {
+            rollup.subnet.parent().to_string()
+        };
+
+        let (health_text, health_style) = health_rollup(&rollup.members, snapshot);
+        let (agg_text, agg_style) = if aggregator_subnets.contains(&rollup.subnet) {
+            ("yes".to_string(), theme::green())
+        } else {
+            ("—".to_string(), theme::dim())
+        };
+
         rows.push(Row::new(vec![
             Cell::from(Span::styled(marker, theme::green_hi())),
             Cell::from(Span::styled(rollup.subnet.to_string(), subnet_style)),
+            Cell::from(Span::styled(parent_text, theme::dim())),
             Cell::from(Span::styled(
                 format!("{}", rollup.subnet.depth()),
                 theme::text(),
@@ -136,6 +176,8 @@ fn render_table(
                 format!("{}", rollup.members.len()),
                 theme::text(),
             )),
+            Cell::from(Span::styled(health_text, health_style)),
+            Cell::from(Span::styled(agg_text, agg_style)),
             Cell::from(Span::styled(
                 if rollup.is_local { "yes" } else { "—" },
                 if rollup.is_local {
@@ -151,9 +193,12 @@ fn render_table(
         rows,
         [
             Constraint::Length(2),  // cursor marker
-            Constraint::Length(20), // subnet
+            Constraint::Length(10), // subnet
+            Constraint::Length(8),  // parent
             Constraint::Length(6),  // depth
             Constraint::Length(8),  // members
+            Constraint::Length(8),  // health
+            Constraint::Length(5),  // agg
             Constraint::Min(0),     // local
         ],
     )
@@ -165,4 +210,44 @@ fn render_table(
         .filter(|s| start + *s < end);
     let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// Roll up `members` against `snapshot.peers` into a
+/// `(healthy/total, style)` chip. `—` when none of the members
+/// appear in the snapshot (common under demo fixtures + when
+/// the deck has no mesh wired). The style ladder mirrors what
+/// NODES uses for its rollup column.
+fn health_rollup(
+    members: &[u64],
+    snapshot: &MeshOsSnapshot,
+) -> (String, ratatui::style::Style) {
+    use net_sdk::deck::PeerHealthSnapshot;
+    let mut total = 0u32;
+    let mut healthy = 0u32;
+    let mut degraded = 0u32;
+    let mut unreachable = 0u32;
+    for id in members {
+        let Some(peer) = snapshot.peers.get(id) else {
+            continue;
+        };
+        total += 1;
+        match peer.health {
+            Some(PeerHealthSnapshot::Healthy) => healthy += 1,
+            Some(PeerHealthSnapshot::Degraded) => degraded += 1,
+            Some(PeerHealthSnapshot::Unreachable) => unreachable += 1,
+            _ => {}
+        }
+    }
+    if total == 0 {
+        return ("—".to_string(), theme::dim());
+    }
+    let text = format!("{healthy}/{total}");
+    let style = if unreachable > 0 {
+        theme::red()
+    } else if degraded > 0 || healthy < total {
+        theme::amber()
+    } else {
+        theme::green()
+    };
+    (text, style)
 }
