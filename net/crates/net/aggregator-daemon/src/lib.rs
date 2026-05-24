@@ -689,13 +689,22 @@ fn make_scaler(
                 RegistryRpcError::SpawnRejected(d) => RegistryRpcError::ScaleRejected(d),
                 other => other,
             })?;
+            let existing_entry = registry
+                .get(&req.group_name)
+                .ok_or_else(|| RegistryRpcError::UnknownGroup(req.group_name.clone()))?;
+            // Fast path: target == current. The replica_count
+            // accessor reads through a brief lock without
+            // allocating a per-replica snapshot or polling each
+            // replica's health() — skip the (potentially
+            // expensive) validation + scale_group invocation and
+            // return the current snapshot directly.
+            if req.target_replica_count as usize == existing_entry.replica_count().await {
+                return Ok(snapshot_group(&existing_entry).await);
+            }
             // Validate the resolved spec against the existing
             // group's live config. Read from the first replica's
             // AggregatorConfig — every replica shares the same
             // spec, so any one is representative.
-            let existing_entry = registry
-                .get(&req.group_name)
-                .ok_or_else(|| RegistryRpcError::UnknownGroup(req.group_name.clone()))?;
             {
                 let snap = existing_entry.snapshot().await;
                 if let Some(replica) = snap.replicas.first() {
