@@ -34,16 +34,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, current: Tab) {
                 format!("[{}] ", i + 1)
             };
         }
-        let letter = match tab {
-            Tab::Subnets => 'H',
-            Tab::Gateways => 'V',
-            Tab::Aggregators => 'B',
-            Tab::Audit => 'U',
-            // Any future trailing tab without a letter falls
-            // through to label-only.
-            _ => return String::new(),
-        };
-        format!("[{letter}] ")
+        // Trailing tabs reach for `Tab::letter_shortcut` so the
+        // chip + the keystroke handler (`app.rs::on_key`) stay
+        // synced. `None` falls through to label-only.
+        match tab.letter_shortcut() {
+            Some(letter) => format!("[{letter}] "),
+            None => String::new(),
+        }
     };
 
     let tabs: Vec<(String, &'static str)> = Tab::all()

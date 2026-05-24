@@ -137,6 +137,33 @@ impl Tab {
         }
     }
 
+    /// Letter-shortcut chip for tabs past the digit-shortcut
+    /// range (`Tab::PRIMARY_COUNT..`). The tab strip's `[N]`
+    /// prefix uses digits 1..9 + 0 for the first 10 tabs;
+    /// later tabs get a single uppercase letter chosen to
+    /// avoid keymap collisions documented at the keystroke
+    /// site:
+    ///   - `H` (subnets / Hierarchy) — `S` collides with
+    ///     Groups, `G` with vim-style bottom.
+    ///   - `V` (gateways / Visibility gate) — `G` taken.
+    ///   - `B` (aggregators).
+    ///   - `U` (aUdit) — `A` taken by ICE flush-avoid-lists
+    ///     on a node focus page.
+    ///
+    /// Returning `None` for primary tabs (which use digit
+    /// shortcuts) plus any future tab without an assigned
+    /// letter — the tab strip renderer falls back to a
+    /// label-only entry in that case.
+    pub fn letter_shortcut(self) -> Option<char> {
+        match self {
+            Tab::Subnets => Some('H'),
+            Tab::Gateways => Some('V'),
+            Tab::Aggregators => Some('B'),
+            Tab::Audit => Some('U'),
+            _ => None,
+        }
+    }
+
     pub fn next(self) -> Tab {
         let all = Self::all();
         // `Tab` has variants beyond `Tab::all()` (e.g. focused-
