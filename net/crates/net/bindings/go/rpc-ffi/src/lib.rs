@@ -127,6 +127,13 @@ pub const NET_RPC_ERR_STREAM_DONE: c_int = -6;
 ///     `net_rpc_metrics_snapshot`) plus the `RpcCallEventC` POD
 ///     fed to the observer dispatcher. ADDITIVE — 0x0002 consumers
 ///     keep working unchanged.
+///   - **0003** continued — Phase O-A3 of NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION:
+///     adds the `net_rpc_observer_dropped_total` symbol and the
+///     `observer_dropped_total` field on the JSON snapshot. Both
+///     are additive — the symbol is new (consumers without the
+///     declaration just don't call it) and the JSON field is
+///     ignored by decoders that don't know about it. ABI stays at
+///     0x0003 because no existing symbol's signature changed.
 pub const NET_RPC_ABI_VERSION: u32 = 0x0003;
 
 /// Returns the current ABI version. Consumers SHOULD call this at
@@ -3201,51 +3208,106 @@ pub extern "C" fn net_rpc_set_observer_dispatcher(observer: RpcObserverFn) {
     let _ = OBSERVER_DISPATCHER.set(observer);
 }
 
-/// `RpcObserver` adapter that bridges to the Go-side dispatcher.
-/// One instance per mesh that has the observer installed; cheap
-/// (no per-call allocation beyond the stack-local `RpcCallEventC`
-/// passed to the dispatcher).
-struct GoRpcObserver;
+/// Bound on the observer event buffer (v3 / O-A3). Matches the
+/// napi + pyo3 bindings' `OBSERVER_BUFFER_CAPACITY` for cross-
+/// binding consistency.
+const OBSERVER_BUFFER_CAPACITY: usize = 1024;
+
+/// Process-global count of observer events dropped because the
+/// bounded buffer was full. Surfaced via
+/// [`net_rpc_observer_dropped_total`] and via the
+/// `observer_dropped_total` field of the JSON snapshot from
+/// [`net_rpc_metrics_snapshot`].
+static OBSERVER_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// `RpcObserver` adapter that bridges to the Go-side dispatcher
+/// via a bounded mpsc + dedicated worker (v3 / O-A3).
+///
+/// The substrate dispatch thread does only a `try_send` + atomic
+/// counter on overflow. A single drain worker task consumes
+/// events from the channel and invokes the registered C
+/// dispatcher; the worker spends its entire life on a tokio task
+/// (NOT a blocking-pool worker) since the C-side dispatcher is
+/// itself non-blocking (it just calls into Go which queues to a
+/// goroutine).
+struct GoRpcObserver {
+    sender: tokio::sync::mpsc::Sender<InnerRpcCallEvent>,
+}
+
+impl GoRpcObserver {
+    /// Install a new observer: build the bounded channel, spawn
+    /// the drain worker, return the wrapping observer. The
+    /// runtime() helper provides the dedicated tokio runtime
+    /// `net-rpc-ffi` already uses for its FFI bridge.
+    fn install() -> Self {
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<InnerRpcCallEvent>(OBSERVER_BUFFER_CAPACITY);
+        runtime().spawn(async move {
+            while let Some(evt) = receiver.recv().await {
+                let dispatcher = match OBSERVER_DISPATCHER.get() {
+                    Some(d) => *d,
+                    None => continue,
+                };
+                let (status_kind, status_message): (u8, Option<&str>) = match &evt.status {
+                    InnerRpcCallStatus::Ok => (NET_RPC_STATUS_OK, None),
+                    InnerRpcCallStatus::Error(msg) => {
+                        (NET_RPC_STATUS_ERROR, Some(msg.as_str()))
+                    }
+                    InnerRpcCallStatus::Timeout => (NET_RPC_STATUS_TIMEOUT, None),
+                    InnerRpcCallStatus::Canceled => (NET_RPC_STATUS_CANCELED, None),
+                };
+                let direction = match evt.direction {
+                    InnerRpcDirection::Outbound => NET_RPC_DIRECTION_OUTBOUND,
+                    InnerRpcDirection::Inbound => NET_RPC_DIRECTION_INBOUND,
+                };
+                let (msg_ptr, msg_len) = match status_message {
+                    Some(s) => (s.as_ptr(), s.len()),
+                    None => (std::ptr::null(), 0),
+                };
+                let c_evt = RpcCallEventC {
+                    caller: evt.caller,
+                    callee: evt.callee,
+                    method_ptr: evt.method.as_ptr(),
+                    method_len: evt.method.len(),
+                    latency_ms: evt.latency_ms,
+                    status_kind,
+                    status_message_ptr: msg_ptr,
+                    status_message_len: msg_len,
+                    request_bytes: evt.request_bytes,
+                    response_bytes: evt.response_bytes,
+                    direction,
+                    ts_unix_ms: evt.ts_unix_ms,
+                };
+                // SAFETY: dispatcher is a Go-registered C function
+                // with the documented `RpcObserverFn` signature;
+                // `&c_evt` is a valid pointer to a stack-local POD
+                // that outlives this call.
+                unsafe { dispatcher(&c_evt as *const _) };
+            }
+            // Sender dropped → channel closed → worker exits.
+        });
+        Self { sender }
+    }
+}
 
 impl RpcObserver for GoRpcObserver {
     fn on_call(&self, evt: InnerRpcCallEvent) {
-        let dispatcher = match OBSERVER_DISPATCHER.get() {
-            Some(d) => *d,
-            None => return,
-        };
-        let (status_kind, status_message): (u8, Option<&str>) = match &evt.status {
-            InnerRpcCallStatus::Ok => (NET_RPC_STATUS_OK, None),
-            InnerRpcCallStatus::Error(msg) => (NET_RPC_STATUS_ERROR, Some(msg.as_str())),
-            InnerRpcCallStatus::Timeout => (NET_RPC_STATUS_TIMEOUT, None),
-            InnerRpcCallStatus::Canceled => (NET_RPC_STATUS_CANCELED, None),
-        };
-        let direction = match evt.direction {
-            InnerRpcDirection::Outbound => NET_RPC_DIRECTION_OUTBOUND,
-            InnerRpcDirection::Inbound => NET_RPC_DIRECTION_INBOUND,
-        };
-        let (msg_ptr, msg_len) = match status_message {
-            Some(s) => (s.as_ptr(), s.len()),
-            None => (std::ptr::null(), 0),
-        };
-        let c_evt = RpcCallEventC {
-            caller: evt.caller,
-            callee: evt.callee,
-            method_ptr: evt.method.as_ptr(),
-            method_len: evt.method.len(),
-            latency_ms: evt.latency_ms,
-            status_kind,
-            status_message_ptr: msg_ptr,
-            status_message_len: msg_len,
-            request_bytes: evt.request_bytes,
-            response_bytes: evt.response_bytes,
-            direction,
-            ts_unix_ms: evt.ts_unix_ms,
-        };
-        // SAFETY: dispatcher is a Go-registered C function with the
-        // documented `RpcObserverFn` signature; `&c_evt` is a valid
-        // pointer to a stack-local POD that outlives this call.
-        unsafe { dispatcher(&c_evt as *const _) };
+        // try_send is non-blocking; full or closed → drop +
+        // counter increment. The substrate dispatch path pays
+        // only this atomic-counter increment on overflow.
+        if self.sender.try_send(evt).is_err() {
+            OBSERVER_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
     }
+}
+
+/// Return the process-global observer-drop counter. Surfaced as a
+/// separate FFI symbol (in addition to the JSON snapshot's
+/// `observer_dropped_total` field) so Go consumers can read it
+/// without paying the JSON-decode cost on hot paths.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_observer_dropped_total() -> u64 {
+    OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed)
 }
 
 /// Enable (`enabled != 0`) or clear (`enabled == 0`) the observer
@@ -3270,7 +3332,7 @@ pub extern "C" fn net_rpc_observer_install(handle: *const MeshRpcHandle, enabled
         if OBSERVER_DISPATCHER.get().is_none() {
             return NET_RPC_ERR_NO_DISPATCHER;
         }
-        let obs: Arc<dyn RpcObserver> = Arc::new(GoRpcObserver);
+        let obs: Arc<dyn RpcObserver> = Arc::new(GoRpcObserver::install());
         h.node.set_rpc_observer(Some(obs));
     } else {
         h.node.set_rpc_observer(None);
@@ -3354,6 +3416,10 @@ pub extern "C" fn net_rpc_metrics_snapshot(
             "streaming_chunks_dropped_total": m.streaming_chunks_dropped_total,
             "capability_denied_total": m.capability_denied_total,
         })).collect::<Vec<_>>(),
+        // v3 / O-A3: process-global observer-drop counter. See
+        // also the dedicated `net_rpc_observer_dropped_total`
+        // FFI symbol for consumers that don't want to JSON-decode.
+        "observer_dropped_total": OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed),
     });
     let bytes = match serde_json::to_vec(&value) {
         Ok(v) => v,
