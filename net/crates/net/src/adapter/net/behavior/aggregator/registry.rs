@@ -360,18 +360,25 @@ impl AggregatorRegistry {
         let current = group.replica_count();
         let target = target_replica_count as usize;
         if target > current {
-            // Grow: invoke factory delta times.
-            for _ in 0..(target - current) {
-                let f = &mut factory;
-                group.add_replica(move |idx| f(idx)).await.map_err(|e| {
-                    AggregatorRegistryError::ScaleFailed(format!("add_replica: {e}"))
-                })?;
-            }
+            // Grow via the bulk path so on_start handlers run
+            // concurrently. Sequential per-replica `add_replica`
+            // calls would hold the entry mutex through N on_start
+            // awaits and block List / health / HealthMonitor for
+            // a 1→N grow — by funnelling through
+            // `LifecycleGroup::add_replicas`, the parallel
+            // on_start pattern from `start_replicas` is reused.
+            let delta = (target - current) as u8;
+            group.add_replicas(delta, &mut factory).await.map_err(|e| {
+                AggregatorRegistryError::ScaleFailed(format!("add_replicas: {e}"))
+            })?;
         } else if target < current {
-            // Shrink: remove_last delta times. Refuses to drop
-            // below 1 — guarded above by the `target == 0`
-            // check, so the LifecycleGroupError shouldn't fire,
-            // but we surface it cleanly if the invariant breaks.
+            // Shrink: remove_last is genuinely sequential — each
+            // pop awaits the previous handle's stop() so the
+            // parallel-Vec invariant in LifecycleGroup holds.
+            // Refuses to drop below 1 — guarded above by the
+            // `target == 0` check, so the LifecycleGroupError
+            // shouldn't fire, but we surface it cleanly if the
+            // invariant breaks.
             for _ in 0..(current - target) {
                 group.remove_last().await.map_err(|e| {
                     AggregatorRegistryError::ScaleFailed(format!("remove_last: {e}"))
