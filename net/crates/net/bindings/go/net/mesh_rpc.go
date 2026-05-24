@@ -102,8 +102,8 @@ extern int net_rpc_call_service(
     char** out_err
 );
 
-extern uint64_t net_rpc_reserve_cancel_token(void);
-extern void net_rpc_cancel_call(uint64_t token);
+extern uint64_t net_rpc_reserve_cancel_token(MeshRpcHandle* handle);
+extern void net_rpc_cancel_call(MeshRpcHandle* handle, uint64_t token);
 
 extern int net_rpc_find_service_nodes(
     MeshRpcHandle* handle,
@@ -594,7 +594,12 @@ func ABIVersion() uint32 { return uint32(C.net_rpc_abi_version()) }
 //     (consumed by mesh_rpc_typed.go's SetObserver / MetricsSnapshot).
 //     Additive — older 0x0001/0x0002 consumers compiled against a
 //     0x0003 library still work.
-const ExpectedABIVersion uint32 = 0x0003
+//   - 0x0004: Phase C-A3 — `net_rpc_reserve_cancel_token` and
+//     `net_rpc_cancel_call` gain a leading `MeshRpcHandle*`
+//     argument so cancellation routes through the substrate's
+//     per-mesh CancelRegistry. BREAKING — every caller must update
+//     both signatures.
+const ExpectedABIVersion uint32 = 0x0004
 
 // errABIMismatch is the typed error returned by CheckABI on a
 // version mismatch. Use `errors.Is(err, ErrABIMismatch)` to
@@ -640,12 +645,13 @@ func init() {
 // deadline fires, or `ctx` is canceled.
 //
 // If `ctx` cancels mid-call, a watcher goroutine fires
-// `net_rpc_cancel_call(token)` to abort the in-flight tokio
-// task on the Rust side, which drops the SDK future and triggers
-// CANCEL on the wire. The call returns `ctx.Err()` once the FFI
-// call unblocks. Cancellation is best-effort: a race between
-// completion and ctx.Done() lets whichever side wins decide the
-// outcome.
+// `net_rpc_cancel_call(handle, token)` to signal the substrate's
+// per-mesh CancelRegistry, which short-circuits the in-flight
+// call's `select!` arm to `RpcError::Cancelled`. The dropped
+// future emits CANCEL on the wire. The call returns `ctx.Err()`
+// once the FFI call unblocks. Cancellation is best-effort: a
+// race between completion and ctx.Done() lets whichever side
+// wins decide the outcome.
 func (r *MeshRpc) Call(
 	ctx context.Context,
 	targetNodeID uint64,
@@ -658,7 +664,7 @@ func (r *MeshRpc) Call(
 	cReq, freeReq := bytesToCBytes(req)
 	defer freeReq()
 
-	cancelToken, stopWatcher := installCancelWatcher(ctx)
+	cancelToken, stopWatcher := installCancelWatcher(ctx, r)
 	defer stopWatcher()
 
 	var outResp *C.uint8_t
@@ -696,7 +702,7 @@ func (r *MeshRpc) CallService(
 	cReq, freeReq := bytesToCBytes(req)
 	defer freeReq()
 
-	cancelToken, stopWatcher := installCancelWatcher(ctx)
+	cancelToken, stopWatcher := installCancelWatcher(ctx, r)
 	defer stopWatcher()
 
 	var outResp *C.uint8_t
@@ -807,27 +813,46 @@ func readCancellableResult(
 	return nil, err
 }
 
-// installCancelWatcher reserves a cancel token and, if `ctx` has
-// a Done channel, spawns a watcher goroutine that fires
-// `net_rpc_cancel_call(token)` when ctx fires. Returns the token
-// and a `stop` callback the caller MUST `defer` so the watcher
-// exits even on the success path. Idempotent stop.
+// installCancelWatcher reserves a cancel token from the mesh's
+// substrate-level CancelRegistry and, if `ctx` has a Done channel,
+// spawns a watcher goroutine that fires
+// `net_rpc_cancel_call(handle, token)` when ctx fires. Returns the
+// token and a `stop` callback the caller MUST `defer` so the
+// watcher exits even on the success path. Idempotent stop.
 //
 // `ctx == nil` or a context without a Done channel returns
 // `(0, noop)`: no token, no watcher, no cancel surface — the FFI
 // call runs in the non-cancellable fast path.
-func installCancelWatcher(ctx context.Context) (uint64, func()) {
-	if ctx == nil || ctx.Done() == nil {
+//
+// ABI 0x0004: token reservation and cancel routing are scoped to
+// the mesh, so both calls go through `r.withHandle`. If the mesh
+// is closed before the watcher fires, the cancel is a quiet no-op.
+func installCancelWatcher(ctx context.Context, r *MeshRpc) (uint64, func()) {
+	if ctx == nil || ctx.Done() == nil || r == nil {
 		return 0, func() {}
 	}
-	token := uint64(C.net_rpc_reserve_cancel_token())
+	var token uint64
+	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		token = uint64(C.net_rpc_reserve_cancel_token(h))
+	}); err != nil {
+		return 0, func() {}
+	}
+	if token == 0 {
+		return 0, func() {}
+	}
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		select {
 		case <-ctx.Done():
-			C.net_rpc_cancel_call(C.uint64_t(token))
+			// Re-acquire the read lock for the cancel call so a
+			// concurrent Close can't free the handle out from under
+			// us. ErrClosed is a quiet drop — substrate's cancel
+			// is best-effort.
+			_ = r.withHandle(func(h *C.MeshRpcHandle) {
+				C.net_rpc_cancel_call(h, C.uint64_t(token))
+			})
 		case <-stop:
 		}
 	}()

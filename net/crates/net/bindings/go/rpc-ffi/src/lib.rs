@@ -134,7 +134,17 @@ pub const NET_RPC_ERR_STREAM_DONE: c_int = -6;
 ///     declaration just don't call it) and the JSON field is
 ///     ignored by decoders that don't know about it. ABI stays at
 ///     0x0003 because no existing symbol's signature changed.
-pub const NET_RPC_ABI_VERSION: u32 = 0x0003;
+///   - **0004** — Phase C-A3 of NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION:
+///     `net_rpc_reserve_cancel_token` and `net_rpc_cancel_call`
+///     gain a leading `*mut MeshRpcHandle` argument so the cancel
+///     primitive routes through the substrate's per-mesh
+///     `CancelRegistry` (`MeshNode::reserve_cancel_token` /
+///     `MeshNode::cancel`). This makes mid-stream cancellation work
+///     uniformly across all streaming shapes — the substrate spawns
+///     a watcher task that closes the pending entry when cancel
+///     fires. BREAKING — every consumer must update both symbol
+///     signatures and rebuild against the new headers.
+pub const NET_RPC_ABI_VERSION: u32 = 0x0004;
 
 /// Returns the current ABI version. Consumers SHOULD call this at
 /// init and compare against their expected value.
@@ -184,113 +194,59 @@ static NEXT_RPC_ID: AtomicU64 = AtomicU64::new(1);
 /// up its callable in the Go-process-global handler registry.
 static NEXT_HANDLER_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Monotonic counter for in-flight call cancel tokens. Starts at
-/// 1 so `0` is reserved as "no token" sentinel.
-static NEXT_CANCEL_TOKEN: AtomicU64 = AtomicU64::new(1);
-
-/// Per-token state. CR-13: split into `cancelled` (boolean
-/// observed by `run_cancellable` after registering its handle)
-/// and `handle` (the abort handle, populated by
-/// `run_cancellable` post-spawn). Pre-CR-13 the registry was
-/// `HashMap<u64, AbortHandle>`, so a cancel arriving in the
-/// gap between `reserve_cancel_token` and the post-spawn
-/// `insert` (or even in the gap between `spawn` and `insert`)
-/// found no entry and dropped on the floor.
+/// Reserve a fresh cancel token from the substrate. The Go side
+/// uses this to set up a watcher (typically on `ctx.Done()`)
+/// BEFORE issuing the blocking call — so the watcher's call to
+/// [`net_rpc_cancel_call`] races the call's completion safely.
 ///
-/// Q18: `marked_at` records when an orphan entry (no handle yet)
-/// was created by `cancel_call`. The opportunistic GC in
-/// `cancel_call` evicts orphans older than `ORPHAN_TTL` so a
-/// `reserve_token` + `cancel_call` flow whose `rpc_call` never
-/// runs doesn't leak a registry entry forever.
-#[derive(Default)]
-struct CancelEntry {
-    cancelled: bool,
-    handle: Option<tokio::task::AbortHandle>,
-    marked_at: Option<std::time::Instant>,
-}
-
-/// How long an orphaned (cancel-only, no live handle) registry
-/// entry stays before opportunistic GC evicts it. Chosen long
-/// enough that a legitimate `reserve_cancel_token` followed by
-/// a slow dispatch (network jitter, queue contention) still
-/// finds the cancellation flag, but short enough that
-/// pathological callers — `reserve_token` then `cancel_call`
-/// without ever issuing the call — don't accumulate state.
-const ORPHAN_TTL: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// Process-global registry of in-flight call cancel state.
-/// Populated by `net_rpc_call*` when the caller passes a non-NULL
-/// `out_cancel_token` out-param; queried by `net_rpc_cancel_call`.
-/// Entry removal happens by `run_cancellable` once the call
-/// returns (success or abort path), OR by the opportunistic
-/// `ORPHAN_TTL`-based GC inside `net_rpc_cancel_call` (Q18).
-fn cancel_registry() -> &'static parking_lot::Mutex<std::collections::HashMap<u64, CancelEntry>> {
-    static REG: OnceLock<parking_lot::Mutex<std::collections::HashMap<u64, CancelEntry>>> =
-        OnceLock::new();
-    REG.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
-}
-
-/// Reserve a fresh cancel token. The Go side uses this to set up
-/// a watcher (typically on `ctx.Done()`) BEFORE issuing the
-/// blocking call — so the watcher's call to `net_rpc_cancel_call`
-/// can race the call's completion safely.
+/// Routes through [`MeshNode::reserve_cancel_token`] so the
+/// substrate's per-mesh [`CancelRegistry`] is the single source of
+/// truth; the cancel-before-register (CR-13) and orphan-TTL (Q18)
+/// races are handled there.
+///
+/// ABI 0x0004: signature gained `handle` argument so the
+/// reservation is scoped to the mesh whose calls will read it.
+/// Returns `0` if `handle` is NULL.
+///
+/// [`MeshNode::reserve_cancel_token`]: net::adapter::net::MeshNode::reserve_cancel_token
+/// [`CancelRegistry`]: net::adapter::net::cancel_registry::CancelRegistry
 #[unsafe(no_mangle)]
-pub extern "C" fn net_rpc_reserve_cancel_token() -> u64 {
-    NEXT_CANCEL_TOKEN.fetch_add(1, Ordering::Relaxed)
+pub extern "C" fn net_rpc_reserve_cancel_token(handle: *mut MeshRpcHandle) -> u64 {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return 0;
+    };
+    h.node.reserve_cancel_token()
 }
 
-/// Abort the in-flight call associated with `token`. Idempotent;
-/// no-op if the token doesn't refer to a live call (already
-/// completed, never registered, or already cancelled).
+/// Signal cancellation for `token`. Idempotent; no-op if `token`
+/// is `0`, `handle` is NULL, or no in-flight call ever reserved
+/// the token.
 ///
-/// The aborted task's future is dropped, which fires the SDK's
-/// `UnaryCallGuard::Drop` to publish CANCEL to the server. The
-/// caller-side `net_rpc_call` returns `NET_RPC_ERR_CALL_FAILED`
+/// Routes through [`MeshNode::cancel`]. The substrate fires the
+/// matching call's [`Notify`] permit, which short-circuits the
+/// call's `select!` to [`RpcError::Cancelled`]. The dropped
+/// future fires the SDK's `UnaryCallGuard::Drop` (or stream
+/// equivalents) so CANCEL still goes on the wire. The
+/// caller-side `net_rpc_call*` returns `NET_RPC_ERR_CALL_FAILED`
 /// with `out_err = "nrpc:cancelled: call cancelled by caller"`.
 ///
-/// CR-13: a cancel that arrives BEFORE `run_cancellable` has
-/// registered its abort handle (the gap between
-/// `reserve_cancel_token` and the actual `rpc_call`, or between
-/// `spawn` and `insert` inside `run_cancellable`) used to drop
-/// on the floor — the call would run to completion. Now we
-/// either abort an existing handle, or insert/mark the entry
-/// with `cancelled = true` so `run_cancellable` aborts on
-/// register.
+/// ABI 0x0004: signature gained `handle` argument so the cancel
+/// is routed to the mesh whose [`CancelRegistry`] owns the
+/// token. Tokens are process-monotonic across meshes (the
+/// substrate's `NEXT_CANCEL_TOKEN` is global) — a cancel issued
+/// against the wrong mesh creates an orphan entry that ages out
+/// via the substrate's `ORPHAN_TTL` GC.
+///
+/// [`MeshNode::cancel`]: net::adapter::net::MeshNode::cancel
+/// [`Notify`]: tokio::sync::Notify
+/// [`RpcError::Cancelled`]: net::adapter::net::mesh_rpc::RpcError::Cancelled
+/// [`CancelRegistry`]: net::adapter::net::cancel_registry::CancelRegistry
 #[unsafe(no_mangle)]
-pub extern "C" fn net_rpc_cancel_call(token: u64) {
-    if token == 0 {
+pub extern "C" fn net_rpc_cancel_call(handle: *mut MeshRpcHandle, token: u64) {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
         return;
-    }
-    let mut reg = cancel_registry().lock();
-
-    // Q18: opportunistic GC of orphaned cancel-only entries
-    // older than `ORPHAN_TTL`. Without this, a Go caller that
-    // does `reserve_cancel_token` + `cancel_call` for a token
-    // whose `rpc_call` never actually runs (e.g. context
-    // already done; a deadline-elapsed pre-check) leaves a
-    // `{cancelled: true, handle: None}` entry that nothing
-    // cleans up — unbounded memory growth proportional to the
-    // number of such never-dispatched cancels.
-    let now = std::time::Instant::now();
-    reg.retain(|_, entry| {
-        entry.handle.is_some()
-            || entry
-                .marked_at
-                .is_none_or(|t| now.duration_since(t) < ORPHAN_TTL)
-    });
-
-    let entry = reg.entry(token).or_default();
-    entry.cancelled = true;
-    if entry.marked_at.is_none() {
-        entry.marked_at = Some(now);
-    }
-    if let Some(handle) = entry.handle.take() {
-        // Drop the lock before invoking abort; abort is cheap
-        // but we don't want to hold the registry lock across
-        // arbitrary tokio internals.
-        drop(reg);
-        handle.abort();
-    }
+    };
+    h.node.cancel(token);
 }
 
 // =========================================================================
@@ -775,84 +731,24 @@ pub extern "C" fn net_rpc_call(
     } else {
         Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
     };
-    let opts = build_call_options(deadline_ms);
+    let mut opts = build_call_options(deadline_ms);
+    if cancel_token != 0 {
+        opts.cancel_token = Some(cancel_token);
+    }
     let node = h.node.clone();
 
-    let result = run_cancellable(cancel_token, async move {
+    let result = runtime().block_on(async move {
         node.call(target_node_id, &service, req_bytes, opts).await
     });
 
     match result {
-        Ok(Ok(reply)) => {
+        Ok(reply) => {
             write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
             NET_RPC_OK
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             write_err(out_err, format_rpc_error(&e));
             NET_RPC_ERR_CALL_FAILED
-        }
-        Err(CancelledError) => {
-            write_err(out_err, "cancelled: call cancelled by caller".into());
-            NET_RPC_ERR_CALL_FAILED
-        }
-    }
-}
-
-/// Sentinel for "the cancellable future was aborted by
-/// [`net_rpc_cancel_call`]." Surfaces to Go as `nrpc:cancelled:`
-/// (the Go wrapper's `parseRpcError` recognizes the kind segment).
-#[derive(Debug)]
-struct CancelledError;
-
-/// Run `fut` under [`runtime().block_on`]. If `cancel_token != 0`,
-/// register the task's `AbortHandle` so a parallel
-/// [`net_rpc_cancel_call`] aborts mid-flight (which drops the
-/// future, firing the SDK's `UnaryCallGuard::Drop` → CANCEL on
-/// the wire). The await returns `Err(CancelledError)` on abort.
-///
-/// `token == 0` short-circuits to a plain `block_on` so the
-/// non-cancellable path stays free of registry overhead.
-fn run_cancellable<F, T>(cancel_token: u64, fut: F) -> std::result::Result<T, CancelledError>
-where
-    F: std::future::Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    if cancel_token == 0 {
-        return Ok(runtime().block_on(fut));
-    }
-    let task = runtime().spawn(fut);
-    let abort_handle = task.abort_handle();
-    // CR-13: register-or-observe-prior-cancel. If
-    // `net_rpc_cancel_call` already fired between the caller's
-    // `reserve_cancel_token` and this register, the entry is
-    // present with `cancelled=true` — abort right away. Else
-    // store the abort handle so a future cancel finds it.
-    let was_already_cancelled = {
-        let mut reg = cancel_registry().lock();
-        let entry = reg.entry(cancel_token).or_default();
-        if entry.cancelled {
-            true
-        } else {
-            entry.handle = Some(abort_handle.clone());
-            false
-        }
-    };
-    if was_already_cancelled {
-        abort_handle.abort();
-    }
-    let result = runtime().block_on(task);
-    // Cleanup: drop the entry whether we registered, observed
-    // a prior cancel, or observed a successful completion.
-    cancel_registry().lock().remove(&cancel_token);
-    match result {
-        Ok(value) => Ok(value),
-        Err(join_err) if join_err.is_cancelled() => Err(CancelledError),
-        Err(_join_err) => {
-            // A panic in the SDK call surfaces here. Convert to a
-            // sentinel cancel so the caller gets a useful
-            // diagnostic rather than process-wide panic
-            // propagation across the FFI.
-            Err(CancelledError)
         }
     }
 }
@@ -886,24 +782,23 @@ pub extern "C" fn net_rpc_call_service(
     } else {
         Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
     };
-    let opts = build_call_options(deadline_ms);
+    let mut opts = build_call_options(deadline_ms);
+    if cancel_token != 0 {
+        opts.cancel_token = Some(cancel_token);
+    }
     let node = h.node.clone();
 
-    let result = run_cancellable(cancel_token, async move {
+    let result = runtime().block_on(async move {
         node.call_service(&service, req_bytes, opts).await
     });
 
     match result {
-        Ok(Ok(reply)) => {
+        Ok(reply) => {
             write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
             NET_RPC_OK
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-        Err(CancelledError) => {
-            write_err(out_err, "cancelled: call cancelled by caller".into());
             NET_RPC_ERR_CALL_FAILED
         }
     }
@@ -1207,14 +1102,16 @@ pub extern "C" fn net_rpc_call_streaming(
 /// N-16: cancellable variant of [`net_rpc_call_streaming`].
 /// Identical contract; adds a `cancel_token` parameter so the
 /// construction `block_on` (which awaits the peer's initial-frame
-/// ACK) can be aborted by [`net_rpc_cancel_call`] from another
-/// thread. The unary `net_rpc_call` path got this
-/// discipline as CR-13; the streaming variant lost the cancel hook
-/// because [`net_rpc_stream_close`] only takes effect AFTER the
-/// stream handle is constructed — a Go consumer's `ctx.Done()`
-/// watcher has nothing to call into during the construction
-/// window. `cancel_token == 0` short-circuits to the original
-/// non-cancellable path (no registry overhead).
+/// ACK) AND any mid-stream chunk can be aborted by
+/// [`net_rpc_cancel_call`] from another thread.
+///
+/// ABI 0x0004: cancellation routes through the substrate's
+/// per-mesh `CancelRegistry` via `CallOptions::cancel_token`. The
+/// substrate spawns a watcher that closes the pending entry on
+/// cancel, so a cancel fired mid-stream terminates
+/// [`net_rpc_stream_next`] cleanly with
+/// `nrpc:cancelled: call cancelled`. `cancel_token == 0`
+/// short-circuits to the no-cancel path.
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_call_streaming_cancellable(
@@ -1246,15 +1143,18 @@ pub extern "C" fn net_rpc_call_streaming_cancellable(
     if stream_window > 0 {
         opts.stream_window_initial = Some(stream_window);
     }
+    if cancel_token != 0 {
+        opts.cancel_token = Some(cancel_token);
+    }
     let node = h.node.clone();
 
-    let result = run_cancellable(cancel_token, async move {
+    let result = runtime().block_on(async move {
         node.call_streaming(target_node_id, &service, req_bytes, opts)
             .await
     });
 
     match result {
-        Ok(Ok(stream)) => {
+        Ok(stream) => {
             let call_id = stream.call_id();
             let boxed = Box::new(RpcStreamHandleC {
                 inner: Arc::new(Mutex::new(Some(stream))),
@@ -1266,15 +1166,8 @@ pub extern "C" fn net_rpc_call_streaming_cancellable(
             }
             NET_RPC_OK
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-        Err(CancelledError) => {
-            write_err(
-                out_err,
-                "cancelled: streaming call cancelled by caller before construction".into(),
-            );
             NET_RPC_ERR_CALL_FAILED
         }
     }
@@ -1545,13 +1438,16 @@ pub extern "C" fn net_rpc_call_client_stream_cancellable(
     if request_window > 0 {
         opts.request_window_initial = Some(request_window);
     }
+    if cancel_token != 0 {
+        opts.cancel_token = Some(cancel_token);
+    }
     let node = h.node.clone();
-    let result = run_cancellable(cancel_token, async move {
+    let result = runtime().block_on(async move {
         node.call_client_stream(target_node_id, &service, opts)
             .await
     });
     match result {
-        Ok(Ok(call)) => {
+        Ok(call) => {
             let call_id = call.call_id();
             let boxed = Box::new(ClientStreamCallHandleC {
                 inner: Arc::new(Mutex::new(Some(call))),
@@ -1563,12 +1459,8 @@ pub extern "C" fn net_rpc_call_client_stream_cancellable(
             }
             NET_RPC_OK
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-        Err(CancelledError) => {
-            write_err(out_err, "call cancelled".into());
             NET_RPC_ERR_CALL_FAILED
         }
     }
@@ -1878,12 +1770,15 @@ pub extern "C" fn net_rpc_call_duplex_cancellable(
     if stream_window > 0 {
         opts.stream_window_initial = Some(stream_window);
     }
+    if cancel_token != 0 {
+        opts.cancel_token = Some(cancel_token);
+    }
     let node = h.node.clone();
-    let result = run_cancellable(cancel_token, async move {
+    let result = runtime().block_on(async move {
         node.call_duplex(target_node_id, &service, opts).await
     });
     match result {
-        Ok(Ok(call)) => {
+        Ok(call) => {
             let call_id = call.call_id();
             let (sink, stream) = call.into_split();
             let boxed = Box::new(DuplexCallHandleC {
@@ -1897,12 +1792,8 @@ pub extern "C" fn net_rpc_call_duplex_cancellable(
             }
             NET_RPC_OK
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-        Err(CancelledError) => {
-            write_err(out_err, "call cancelled".into());
             NET_RPC_ERR_CALL_FAILED
         }
     }
@@ -2360,23 +2251,22 @@ pub extern "C" fn net_rpc_call_with_headers(
     };
     let mut opts = build_call_options(deadline_ms);
     opts.request_headers = headers;
+    if cancel_token != 0 {
+        opts.cancel_token = Some(cancel_token);
+    }
     let node = h.node.clone();
 
-    let result = run_cancellable(cancel_token, async move {
+    let result = runtime().block_on(async move {
         node.call(target_node_id, &service, req_bytes, opts).await
     });
 
     match result {
-        Ok(Ok(reply)) => {
+        Ok(reply) => {
             write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
             NET_RPC_OK
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-        Err(CancelledError) => {
-            write_err(out_err, "cancelled: call cancelled by caller".into());
             NET_RPC_ERR_CALL_FAILED
         }
     }
@@ -2420,23 +2310,22 @@ pub extern "C" fn net_rpc_call_service_with_headers(
     };
     let mut opts = build_call_options(deadline_ms);
     opts.request_headers = headers;
+    if cancel_token != 0 {
+        opts.cancel_token = Some(cancel_token);
+    }
     let node = h.node.clone();
 
-    let result = run_cancellable(cancel_token, async move {
+    let result = runtime().block_on(async move {
         node.call_service(&service, req_bytes, opts).await
     });
 
     match result {
-        Ok(Ok(reply)) => {
+        Ok(reply) => {
             write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
             NET_RPC_OK
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-        Err(CancelledError) => {
-            write_err(out_err, "cancelled: call cancelled by caller".into());
             NET_RPC_ERR_CALL_FAILED
         }
     }
@@ -2512,9 +2401,10 @@ pub extern "C" fn net_rpc_call_streaming_with_headers(
 
 /// N-16: cancellable variant of
 /// [`net_rpc_call_streaming_with_headers`]. Same cancellation
-/// contract as [`net_rpc_call_streaming_cancellable`]: routes the
-/// construction `block_on` through `run_cancellable` so an
-/// in-flight [`net_rpc_cancel_call`] aborts mid-construction.
+/// contract as [`net_rpc_call_streaming_cancellable`]: routes
+/// cancellation through the substrate's per-mesh `CancelRegistry`
+/// via `CallOptions::cancel_token`, so a cancel fired
+/// mid-construction OR mid-stream terminates cleanly.
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_call_streaming_with_headers_cancellable(
@@ -2553,15 +2443,18 @@ pub extern "C" fn net_rpc_call_streaming_with_headers_cancellable(
         opts.stream_window_initial = Some(stream_window);
     }
     opts.request_headers = headers;
+    if cancel_token != 0 {
+        opts.cancel_token = Some(cancel_token);
+    }
     let node = h.node.clone();
 
-    let result = run_cancellable(cancel_token, async move {
+    let result = runtime().block_on(async move {
         node.call_streaming(target_node_id, &service, req_bytes, opts)
             .await
     });
 
     match result {
-        Ok(Ok(stream)) => {
+        Ok(stream) => {
             let call_id = stream.call_id();
             let boxed = Box::new(RpcStreamHandleC {
                 inner: Arc::new(Mutex::new(Some(stream))),
@@ -2573,15 +2466,8 @@ pub extern "C" fn net_rpc_call_streaming_with_headers_cancellable(
             }
             NET_RPC_OK
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-        Err(CancelledError) => {
-            write_err(
-                out_err,
-                "cancelled: streaming call cancelled by caller before construction".into(),
-            );
             NET_RPC_ERR_CALL_FAILED
         }
     }
@@ -3853,125 +3739,15 @@ mod tests {
         assert!(b > a && c > b, "ids must be strictly increasing");
     }
 
-    /// `net_rpc_reserve_cancel_token` returns monotonically
-    /// increasing non-zero tokens, and `net_rpc_cancel_call(0)`
-    /// is a quiet no-op. Pinned: a regression to "0 is a valid
-    /// token" would silently break the cancellation path.
-    #[test]
-    fn cancel_token_reserve_and_zero_cancel_are_safe() {
-        let a = net_rpc_reserve_cancel_token();
-        let b = net_rpc_reserve_cancel_token();
-        assert!(a > 0 && b > 0 && b > a);
-        // Cancelling 0 / a never-registered token is a quiet no-op.
-        net_rpc_cancel_call(0);
-        net_rpc_cancel_call(u64::MAX);
-    }
+    // Cancel-registry unit tests live with the substrate primitive
+    // at `net/src/adapter/net/cancel_registry.rs` (CR-13
+    // cancel-before-register, Q18 orphan-TTL GC) and at the SDK
+    // integration layer at
+    // `net/tests/integration_mesh_cancel.rs` (mid-flight cancel,
+    // cancel-before-call, post-resolution cancel, all four call
+    // shapes). The FFI delegates straight through, so binding-side
+    // duplication would just track the substrate.
 
-    /// `run_cancellable` aborts the future when
-    /// `net_rpc_cancel_call(token)` fires from another thread.
-    /// Pinned: this is the load-bearing invariant the entire
-    /// ctx.Done() → CANCEL pathway depends on.
-    #[test]
-    fn run_cancellable_aborts_on_cancel_call() {
-        let token = net_rpc_reserve_cancel_token();
-        // Fire cancel from a sibling thread; the future below
-        // sleeps far longer than the cancel deadline, so if abort
-        // doesn't work the test wedges (caught by cargo's
-        // per-test timeout).
-        let cancel_token = token;
-        let canceller = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            net_rpc_cancel_call(cancel_token);
-        });
-        let result = run_cancellable(token, async move {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            "should never reach here"
-        });
-        assert!(result.is_err(), "cancel must abort the future");
-        canceller.join().unwrap();
-    }
-
-    /// CR-13: `run_cancellable` honors a cancel that arrived
-    /// BEFORE the call even started. Pre-CR-13 the registry
-    /// didn't carry a `cancelled` flag — a cancel issued
-    /// against a reserved token whose call hadn't yet inserted
-    /// the abort handle would silently drop on the floor, and
-    /// the subsequent call would run to completion despite the
-    /// caller's cancel signal.
-    #[test]
-    fn run_cancellable_honors_cancel_issued_before_register() {
-        let token = net_rpc_reserve_cancel_token();
-        // Fire cancel against the reserved token BEFORE
-        // run_cancellable runs. With CR-13 the registry now
-        // carries `cancelled=true` for this token; without
-        // CR-13 the cancel would no-op.
-        net_rpc_cancel_call(token);
-        let result = run_cancellable(token, async move {
-            // Long-running future. If the pre-cancel didn't take
-            // effect, this sleep would eventually return Ok and
-            // the test wedges (caught by cargo's per-test timeout).
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            "should never reach here"
-        });
-        assert!(
-            result.is_err(),
-            "pre-issued cancel must abort the future immediately"
-        );
-        // Registry entry should be cleaned up after run_cancellable.
-        let lingering = cancel_registry().lock().contains_key(&token);
-        assert!(
-            !lingering,
-            "registry entry must be removed after run_cancellable"
-        );
-    }
-
-    /// `run_cancellable` with token=0 short-circuits to plain
-    /// block_on — no registry overhead, no abort handle.
-    #[test]
-    fn run_cancellable_token_zero_runs_to_completion() {
-        let result = run_cancellable(0, async move { 42_u32 });
-        assert_eq!(result.unwrap(), 42);
-    }
-
-    /// Q18: a cancel issued for a token whose `rpc_call` never
-    /// runs leaves a `{cancelled, no handle}` orphan entry.
-    /// Pre-fix nothing cleaned those up, so a caller that did
-    /// `reserve_token` + `cancel_call` repeatedly without any
-    /// dispatch accumulated registry state without bound. The
-    /// opportunistic GC inside `net_rpc_cancel_call` evicts
-    /// orphans older than `ORPHAN_TTL`; we exercise that by
-    /// stamping a fake-old `marked_at` directly into the entry
-    /// and then issuing a cancel for an unrelated token.
-    #[test]
-    fn cancel_call_evicts_stale_orphan_entries() {
-        let stale_token = net_rpc_reserve_cancel_token();
-        let fresh_token = net_rpc_reserve_cancel_token();
-
-        // Stamp the stale token's entry as old enough to evict.
-        // Same shape `cancel_call` produces, but with a
-        // marked_at predating ORPHAN_TTL.
-        {
-            let mut reg = cancel_registry().lock();
-            let entry = reg.entry(stale_token).or_default();
-            entry.cancelled = true;
-            entry.marked_at = Some(std::time::Instant::now() - (ORPHAN_TTL * 2));
-        }
-
-        // Issue a cancel for an unrelated token. The opportunistic
-        // GC should evict the stale entry while inserting the
-        // fresh one.
-        net_rpc_cancel_call(fresh_token);
-
-        let reg = cancel_registry().lock();
-        assert!(
-            !reg.contains_key(&stale_token),
-            "stale orphan entry should have been evicted"
-        );
-        // Fresh entry is present (it's an orphan with current
-        // marked_at). Its eventual cleanup is its own next-call
-        // GC pass; that's the bounded behavior we want.
-        assert!(reg.contains_key(&fresh_token));
-    }
 
     /// `net_rpc_serve` rejects `handler_id == 0` with a clear
     /// error message rather than calling into the SDK with a

@@ -352,13 +352,13 @@ func TestObserverFuncNilClearShortCircuits(t *testing.T) {
 // =====================================================================
 
 func TestExpectedABIVersionMatchesNewest(t *testing.T) {
-	// Pinned so a regression to the older 0x0001 / 0x0002 wire
-	// shape (or an accidental jump past 0x0003 without all callers
-	// updating) surfaces here. The reference binding's
-	// CheckABI() panics at process init when the linked cdylib
-	// disagrees; this assert pins the source-side constant.
-	if ExpectedABIVersion != 0x0003 {
-		t.Fatalf("ExpectedABIVersion drifted: got 0x%04x, want 0x0003",
+	// Pinned so a regression to an older wire shape (or an
+	// accidental jump past 0x0004 without all callers updating)
+	// surfaces here. The reference binding's CheckABI() panics
+	// at process init when the linked cdylib disagrees; this
+	// assert pins the source-side constant.
+	if ExpectedABIVersion != 0x0004 {
+		t.Fatalf("ExpectedABIVersion drifted: got 0x%04x, want 0x0004",
 			ExpectedABIVersion)
 	}
 }
