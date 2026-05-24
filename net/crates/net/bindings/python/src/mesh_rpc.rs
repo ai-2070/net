@@ -52,7 +52,6 @@ use pyo3::create_exception;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyTuple};
 use tokio::runtime::Runtime;
-use tokio::task::AbortHandle;
 
 use ::net::adapter::net::cortex::{
     RequestStream as InnerRequestStream, RpcCallEvent as InnerRpcCallEvent,
@@ -202,22 +201,31 @@ fn rpc_error_to_pyerr(err: InnerRpcError) -> PyErr {
 // Mirrors the Go binding's net_rpc_cancel_call surface.
 // ============================================================================
 
-/// Caller-side cancel token. Pass to a unary call via
+/// Caller-side cancel token. Pass to any call via
 /// ``opts={'cancel': cancel}``; ``cancel.cancel()`` from another
 /// thread aborts the call mid-flight (CANCEL fires on the wire,
-/// caller observes ``RpcCancelledError``).
+/// the caller observes ``RpcCancelledError`` for unary or stream
+/// EOF for streaming).
+///
+/// Implementation (v3 / C-A2): delegates to the substrate's
+/// ``MeshNode::cancel(token)`` primitive. The Cancellable holds an
+/// optional ``(mesh, token)`` pair that's populated by the call
+/// site when the Cancellable is used. ``cancel()`` called before
+/// any call has been issued latches a ``pre_cancelled`` flag —
+/// the first arm observes the flag and fires cancel on the
+/// substrate immediately.
 #[pyclass(name = "Cancellable", module = "_net")]
 pub struct PyCancellable {
-    /// Set by the call site after spawning the cancellable task.
-    /// `None` until the call is in flight; cleared by
-    /// `cancel()` and by the call's natural completion.
-    handle: Mutex<Option<AbortHandle>>,
-    /// Latches `true` when a cancel has been requested. `cancel()`
-    /// can be called BEFORE the call starts; the call site checks
-    /// this flag and returns immediately if it's set, so the user-
-    /// visible behavior is "cancel takes effect at-or-before the
-    /// next FFI call."
-    cancelled: std::sync::atomic::AtomicBool,
+    /// Mesh + reserved token, populated when the Cancellable is
+    /// first used by a call site (via [`Self::arm`]). `None`
+    /// until armed; populated for the lifetime of the call.
+    armed: Mutex<Option<(Arc<MeshNode>, u64)>>,
+    /// Latches `true` when a cancel was requested before the
+    /// Cancellable was armed. `arm` observes the flag and fires
+    /// cancel on the substrate immediately so the user-visible
+    /// behavior is "cancel takes effect at-or-before the call
+    /// starts."
+    pre_cancelled: std::sync::atomic::AtomicBool,
 }
 
 #[pymethods]
@@ -225,47 +233,55 @@ impl PyCancellable {
     #[new]
     fn new() -> Self {
         Self {
-            handle: Mutex::new(None),
-            cancelled: std::sync::atomic::AtomicBool::new(false),
+            armed: Mutex::new(None),
+            pre_cancelled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// Request cancellation of the in-flight call. Idempotent.
-    /// If no call is in flight (yet OR already finished), latches
-    /// the request — the next call started with this Cancellable
-    /// returns immediately as cancelled.
+    /// Request cancellation. Idempotent. If no call is in flight
+    /// (or the Cancellable hasn't been used yet), latches the
+    /// request — the next call issued with this Cancellable will
+    /// short-circuit to cancelled.
     fn cancel(&self) {
-        self.cancelled
+        self.pre_cancelled
             .store(true, std::sync::atomic::Ordering::Release);
-        if let Some(h) = self.handle.lock().take() {
-            h.abort();
+        if let Some((mesh, token)) = self.armed.lock().take() {
+            mesh.cancel(token);
         }
     }
 
     /// `True` once cancel() has been called.
     fn is_cancelled(&self) -> bool {
-        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+        self.pre_cancelled
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
 impl PyCancellable {
-    /// Internal: set the abort handle for the in-flight call.
-    /// If `cancelled` is already true, abort immediately.
-    fn arm(&self, handle: AbortHandle) {
-        if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
-            handle.abort();
-            return;
+    /// Internal: arm the Cancellable for an in-flight call.
+    /// Reserves a token on the given mesh, stores `(mesh, token)`,
+    /// and returns the token so the caller can populate
+    /// `opts.cancel_token`. If `cancel()` was called BEFORE arm,
+    /// fires cancel on the substrate immediately (the substrate's
+    /// CR-13 pre-arm contract ensures the call short-circuits).
+    pub(crate) fn arm(&self, mesh: Arc<MeshNode>) -> u64 {
+        let token = mesh.reserve_cancel_token();
+        if self.pre_cancelled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            mesh.cancel(token);
+            return token;
         }
-        *self.handle.lock() = Some(handle);
+        *self.armed.lock() = Some((mesh, token));
+        token
     }
 
-    /// Internal: clear the abort handle on call completion. The
-    /// natural-completion path runs this so a stale AbortHandle
-    /// doesn't outlive the call (a subsequent cancel() would
-    /// otherwise abort whichever future got the recycled tokio
-    /// task slot — pathological but cheap to defend).
-    fn disarm(&self) {
-        let _ = self.handle.lock().take();
+    /// Internal: clear the armed state on call completion so a
+    /// subsequent reuse of this Cancellable starts fresh. The
+    /// `pre_cancelled` flag stays set across reuses; users
+    /// typically create a fresh Cancellable per call.
+    pub(crate) fn disarm(&self) {
+        let _ = self.armed.lock().take();
     }
 }
 
@@ -1427,63 +1443,36 @@ impl RpcDuplexHandler for PyRpcDuplexHandler {
 }
 
 /// Sentinel for the abort path of `block_until_cancellable`. The
-/// caller maps this to ``RpcCancelledError`` after re-acquiring
-/// the GIL.
-struct PyCancelledError;
-
-/// Run `fut` on the runtime under either a plain `block_on` or a
-/// spawn+abort handle, depending on whether the user passed a
-/// `Cancellable`. The non-cancellable fast path is unchanged from
-/// the previous code shape.
+/// Apply the optional ``Cancellable`` from the user's opts to the
+/// inner ``CallOptions``: reserves a token on the substrate, arms
+/// the Cancellable, and populates ``inner_opts.cancel_token``.
 ///
-/// On the cancellable path: the future is spawned as a tokio task,
-/// its `AbortHandle` is armed on the user's `Cancellable`, and we
-/// `block_on(task)`. A user calling `cancel()` from another thread
-/// triggers `JoinError::is_cancelled`, which we surface as
-/// `Err(PyCancelledError)`. The natural-completion path disarms
-/// the handle so a stale abort can't leak across calls.
-fn run_cancellable_call<F, T>(
-    runtime: &Arc<Runtime>,
+/// Returns a Py<PyCancellable> reference (cloned under the GIL) so
+/// the caller can run [`disarm_cancellable`] on completion.
+///
+/// v3 / C-A2: delegates entirely to the substrate's
+/// ``Mesh::reserve_cancel_token`` / ``Mesh::cancel`` primitives —
+/// the pyo3 binding no longer owns a local spawn+abort registry.
+fn apply_cancellable(
+    mesh: &Arc<MeshNode>,
     cancel: Option<&Py<PyCancellable>>,
-    fut: F,
-) -> std::result::Result<T, PyCancelledError>
-where
-    F: std::future::Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    let Some(cancel_py) = cancel else {
-        return Ok(runtime.block_on(fut));
-    };
+    inner_opts: &mut InnerCallOptions,
+) -> Option<Py<PyCancellable>> {
+    let cancel_py = cancel?;
+    let (cloned, token) = Python::attach(|py| {
+        let token = cancel_py.bind(py).borrow().arm(Arc::clone(mesh));
+        (cancel_py.clone_ref(py), token)
+    });
+    inner_opts.cancel_token = Some(token);
+    Some(cloned)
+}
 
-    // Pre-check: cancel() may have been called BEFORE we got
-    // here. Honor it without entering the runtime.
-    let already_cancelled = Python::attach(|py| {
-        cancel_py
-            .bind(py)
-            .borrow()
-            .cancelled
-            .load(std::sync::atomic::Ordering::Acquire)
-    });
-    if already_cancelled {
-        return Err(PyCancelledError);
-    }
-
-    let task = runtime.spawn(fut);
-    let abort_handle = task.abort_handle();
-    Python::attach(|py| {
-        cancel_py.bind(py).borrow().arm(abort_handle);
-    });
-    let result = runtime.block_on(task);
-    Python::attach(|py| {
-        cancel_py.bind(py).borrow().disarm();
-    });
-    match result {
-        Ok(v) => Ok(v),
-        Err(e) if e.is_cancelled() => Err(PyCancelledError),
-        // Panic in the SDK path — surface as cancelled so the
-        // caller gets a useful diagnostic instead of a process-
-        // wide panic across the FFI.
-        Err(_) => Err(PyCancelledError),
+/// Disarm the Cancellable returned by [`apply_cancellable`], so a
+/// subsequent `cancel()` on it doesn't try to call
+/// `Mesh::cancel(token)` for an already-resolved token. Idempotent.
+fn disarm_cancellable(cancel: Option<Py<PyCancellable>>) {
+    if let Some(c) = cancel {
+        Python::attach(|py| c.bind(py).borrow().disarm());
     }
 }
 
@@ -1787,26 +1776,19 @@ impl PyMeshRpc {
         opts: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let cancel = extract_cancellable(opts)?;
-        let inner_opts = call_options_from_dict(opts)?;
+        let mut inner_opts = call_options_from_dict(opts)?;
+        let armed_cancel = apply_cancellable(&self.node, cancel.as_ref(), &mut inner_opts);
         let req_bytes = Bytes::copy_from_slice(request.as_bytes());
         let runtime = self.runtime.clone();
         let node = self.node.clone();
         let result = py.detach(|| {
-            run_cancellable_call(&runtime, cancel.as_ref(), async move {
+            runtime.block_on(async move {
                 node.call(target_node_id, &service, req_bytes, inner_opts)
                     .await
             })
         });
-        let reply = match result {
-            Ok(Ok(reply)) => reply,
-            Ok(Err(e)) => return Err(rpc_error_to_pyerr(e)),
-            Err(PyCancelledError) => {
-                return Err(RpcCancelledError::new_err(
-                    "nrpc:cancelled: call cancelled by caller",
-                ))
-            }
-        };
-        Ok(PyBytes::new(py, reply.body.as_ref()))
+        disarm_cancellable(armed_cancel);
+        Ok(PyBytes::new(py, result.map_err(rpc_error_to_pyerr)?.body.as_ref()))
     }
 
     /// Service-discovery unary call. Resolves `service` against
@@ -1824,30 +1806,24 @@ impl PyMeshRpc {
         opts: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let cancel = extract_cancellable(opts)?;
-        let inner_opts = call_options_from_dict(opts)?;
+        let mut inner_opts = call_options_from_dict(opts)?;
+        let armed_cancel = apply_cancellable(&self.node, cancel.as_ref(), &mut inner_opts);
         let req_bytes = Bytes::copy_from_slice(request.as_bytes());
         let runtime = self.runtime.clone();
         let node = self.node.clone();
         let result = py.detach(|| {
-            run_cancellable_call(&runtime, cancel.as_ref(), async move {
+            runtime.block_on(async move {
                 node.call_service(&service, req_bytes, inner_opts).await
             })
         });
-        let reply = match result {
-            Ok(Ok(reply)) => reply,
-            Ok(Err(e)) => return Err(rpc_error_to_pyerr(e)),
-            Err(PyCancelledError) => {
-                return Err(RpcCancelledError::new_err(
-                    "nrpc:cancelled: call cancelled by caller",
-                ))
-            }
-        };
-        Ok(PyBytes::new(py, reply.body.as_ref()))
+        disarm_cancellable(armed_cancel);
+        Ok(PyBytes::new(py, result.map_err(rpc_error_to_pyerr)?.body.as_ref()))
     }
 
     /// Open a streaming-response call. Returns an [`PyRpcStream`];
     /// drain via the iterator protocol. Drop / `close()` emits
-    /// CANCEL to the server.
+    /// CANCEL to the server. Pass ``opts={'cancel': cancel}`` to
+    /// allow mid-stream cancel via :class:`Cancellable`.
     #[pyo3(signature = (target_node_id, service, request, opts=None))]
     fn call_streaming<'py>(
         &self,
@@ -1857,13 +1833,20 @@ impl PyMeshRpc {
         request: &Bound<'py, PyBytes>,
         opts: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<PyRpcStream> {
-        let opts = call_options_from_dict(opts)?;
+        let cancel = extract_cancellable(opts)?;
+        let mut inner_opts = call_options_from_dict(opts)?;
+        // armed_cancel is dropped here — the Cancellable's stored
+        // (mesh, token) outlives this call via the substrate
+        // registry. Cancel mid-stream still works because the
+        // substrate's cancel-watcher task closes the pending
+        // entry when Mesh::cancel(token) fires.
+        let _armed = apply_cancellable(&self.node, cancel.as_ref(), &mut inner_opts);
         let req_bytes = Bytes::copy_from_slice(request.as_bytes());
         let runtime = self.runtime.clone();
         let node = self.node.clone();
         let inner = py.detach(|| {
             runtime.block_on(async move {
-                node.call_streaming(target_node_id, &service, req_bytes, opts)
+                node.call_streaming(target_node_id, &service, req_bytes, inner_opts)
                     .await
                     .map_err(rpc_error_to_pyerr)
             })
@@ -1878,7 +1861,9 @@ impl PyMeshRpc {
     /// :class:`ClientStreamCall`; push chunks via ``call.send(bytes)``
     /// then ``call.finish()`` to await the terminal response. The
     /// initial REQUEST is published lazily on the first ``send``
-    /// (or on ``finish`` for the degenerate zero-send path).
+    /// (or on ``finish`` for the degenerate zero-send path). Pass
+    /// ``opts={'cancel': cancel}`` to allow mid-stream cancel via
+    /// :class:`Cancellable`.
     #[pyo3(signature = (target_node_id, service, opts=None))]
     fn call_client_stream(
         &self,
@@ -1887,12 +1872,14 @@ impl PyMeshRpc {
         service: String,
         opts: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<PyClientStreamCall> {
-        let opts = call_options_from_dict(opts)?;
+        let cancel = extract_cancellable(opts)?;
+        let mut inner_opts = call_options_from_dict(opts)?;
+        let _armed = apply_cancellable(&self.node, cancel.as_ref(), &mut inner_opts);
         let runtime = self.runtime.clone();
         let node = self.node.clone();
         let inner = py.detach(|| {
             runtime.block_on(async move {
-                node.call_client_stream(target_node_id, &service, opts)
+                node.call_client_stream(target_node_id, &service, inner_opts)
                     .await
                     .map_err(rpc_error_to_pyerr)
             })
@@ -1911,7 +1898,9 @@ impl PyMeshRpc {
     /// Open a duplex call. Returns a :class:`DuplexCall` with both
     /// send + receive surfaces. Pass
     /// ``opts={'request_window_initial': N}`` / ``opts={'stream_window_initial': N}``
-    /// to enable per-direction flow control.
+    /// to enable per-direction flow control, or
+    /// ``opts={'cancel': cancel}`` for mid-stream cancel via
+    /// :class:`Cancellable`.
     #[pyo3(signature = (target_node_id, service, opts=None))]
     fn call_duplex(
         &self,
@@ -1920,12 +1909,14 @@ impl PyMeshRpc {
         service: String,
         opts: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<PyDuplexCall> {
-        let opts = call_options_from_dict(opts)?;
+        let cancel = extract_cancellable(opts)?;
+        let mut inner_opts = call_options_from_dict(opts)?;
+        let _armed = apply_cancellable(&self.node, cancel.as_ref(), &mut inner_opts);
         let runtime = self.runtime.clone();
         let node = self.node.clone();
         let inner = py.detach(|| {
             runtime.block_on(async move {
-                node.call_duplex(target_node_id, &service, opts)
+                node.call_duplex(target_node_id, &service, inner_opts)
                     .await
                     .map_err(rpc_error_to_pyerr)
             })
