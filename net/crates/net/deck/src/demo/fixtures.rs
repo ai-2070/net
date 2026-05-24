@@ -16,7 +16,7 @@
 //! function as a fallback when the real `DeckClient` accessor
 //! returns `None` / empty.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use net_sdk::deck::{AggregatorSnapshot, GatewayStats, SubnetRollup, SummaryAnnouncement};
@@ -121,85 +121,106 @@ pub fn subnets(local_id: u64, peer_ids: &[u64]) -> (Option<SubnetId>, Vec<Subnet
 /// panel. REACH values are pre-computed against the matching
 /// subnets fixture (2.1 = 6, 3.1 = 5, 1.3 = 4 members) so the
 /// numbers in this table line up with what SUBNETS shows.
+///
+/// Computed once via `OnceLock`; subsequent calls clone the
+/// cached tuple. The clone cost (small Vec of structs with
+/// `String` + nested `SubnetId` Vec) is much smaller than
+/// rebuilding the literal `vec![]`s every frame at 8 fps on
+/// the GATEWAYS tab.
 pub fn gateways() -> (GatewayStats, Vec<GatewayExportRow>) {
-    let stats = GatewayStats {
-        local_subnet: local_subnet(),
-        forwarded: 124_587,
-        dropped: 392,
-        peer_subnets: vec![
-            SubnetId::new(&[1, 3]),
-            SubnetId::new(&[2, 1]),
-            SubnetId::new(&[3, 1]),
-        ],
-        export_rules: 3,
-    };
-    let exports = vec![
-        GatewayExportRow {
-            channel_hash: 0x4a17,
-            channel_name: Some("swarm.telemetry.pose".into()),
-            visibility: Some(Visibility::Exported),
-            targets: vec![SubnetId::new(&[2, 1]), SubnetId::new(&[3, 1])],
-            // 2.1 (6 nodes) + 3.1 (5 nodes) = 11
-            reach: 11,
-        },
-        GatewayExportRow {
-            channel_hash: 0x9b22,
-            channel_name: Some("swarm.mission.broadcast".into()),
-            visibility: Some(Visibility::Exported),
-            targets: vec![SubnetId::new(&[1, 3])],
-            // 1.3 (4 nodes)
-            reach: 4,
-        },
-        GatewayExportRow {
-            channel_hash: 0xe041,
-            channel_name: Some("capability.tether.relay".into()),
-            visibility: Some(Visibility::Exported),
-            targets: vec![SubnetId::new(&[2, 1])],
-            // 2.1 (6 nodes)
-            reach: 6,
-        },
-    ];
-    (stats, exports)
+    static CACHED: OnceLock<(GatewayStats, Vec<GatewayExportRow>)> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let stats = GatewayStats {
+                local_subnet: local_subnet(),
+                forwarded: 124_587,
+                dropped: 392,
+                peer_subnets: vec![
+                    SubnetId::new(&[1, 3]),
+                    SubnetId::new(&[2, 1]),
+                    SubnetId::new(&[3, 1]),
+                ],
+                export_rules: 3,
+            };
+            let exports = vec![
+                GatewayExportRow {
+                    channel_hash: 0x4a17,
+                    channel_name: Some("swarm.telemetry.pose".into()),
+                    visibility: Some(Visibility::Exported),
+                    targets: vec![SubnetId::new(&[2, 1]), SubnetId::new(&[3, 1])],
+                    // 2.1 (6 nodes) + 3.1 (5 nodes) = 11
+                    reach: 11,
+                },
+                GatewayExportRow {
+                    channel_hash: 0x9b22,
+                    channel_name: Some("swarm.mission.broadcast".into()),
+                    visibility: Some(Visibility::Exported),
+                    targets: vec![SubnetId::new(&[1, 3])],
+                    // 1.3 (4 nodes)
+                    reach: 4,
+                },
+                GatewayExportRow {
+                    channel_hash: 0xe041,
+                    channel_name: Some("capability.tether.relay".into()),
+                    visibility: Some(Visibility::Exported),
+                    targets: vec![SubnetId::new(&[2, 1])],
+                    // 2.1 (6 nodes)
+                    reach: 6,
+                },
+            ];
+            (stats, exports)
+        })
+        .clone()
 }
 
 /// Fixture aggregator snapshot — buckets a drone-swarm fleet
 /// by platform capability + current mission state. Picked
 /// because it reads as "obvious distributed coordination"
 /// without being on-the-nose AI-inference.
+///
+/// Computed once via `OnceLock`; subsequent calls clone the
+/// cached snapshot. The `summaries` field is `Arc`-wrapped, so
+/// the clone is one atomic-refcount bump for the largest
+/// payload; the other fields are scalars + a small `Vec<u16>`.
 pub fn aggregator() -> AggregatorSnapshot {
-    let source = local_subnet();
-    // Capability fold — bucket by airframe class + payload.
-    let capability = SummaryAnnouncement {
-        source_subnet: source,
-        fold_kind: 0x0001,
-        generation: 142,
-        buckets: vec![
-            ("class:quadcopter.payload:optical".into(), 28),
-            ("class:quadcopter.payload:lidar".into(), 14),
-            ("class:fixed-wing.payload:thermal".into(), 9),
-            ("class:vtol.payload:multispectral".into(), 6),
-            ("class:tether.payload:relay".into(), 3),
-        ],
-    };
-    // Reservation fold — bucket by current mission state.
-    let reservation = SummaryAnnouncement {
-        source_subnet: source,
-        fold_kind: 0x0002,
-        generation: 142,
-        buckets: vec![
-            ("loiter".into(), 22),
-            ("transit".into(), 14),
-            ("survey".into(), 11),
-            ("recharge".into(), 8),
-            ("return-to-base".into(), 3),
-            ("lost-link".into(), 2),
-        ],
-    };
-    AggregatorSnapshot {
-        source_subnet: source,
-        fold_kinds: vec![0x0001, 0x0002],
-        generation: 142,
-        summary_interval: Duration::from_secs(30),
-        summaries: Arc::new(vec![capability, reservation]),
-    }
+    static CACHED: OnceLock<AggregatorSnapshot> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let source = local_subnet();
+            // Capability fold — bucket by airframe class + payload.
+            let capability = SummaryAnnouncement {
+                source_subnet: source,
+                fold_kind: 0x0001,
+                generation: 142,
+                buckets: vec![
+                    ("class:quadcopter.payload:optical".into(), 28),
+                    ("class:quadcopter.payload:lidar".into(), 14),
+                    ("class:fixed-wing.payload:thermal".into(), 9),
+                    ("class:vtol.payload:multispectral".into(), 6),
+                    ("class:tether.payload:relay".into(), 3),
+                ],
+            };
+            // Reservation fold — bucket by current mission state.
+            let reservation = SummaryAnnouncement {
+                source_subnet: source,
+                fold_kind: 0x0002,
+                generation: 142,
+                buckets: vec![
+                    ("loiter".into(), 22),
+                    ("transit".into(), 14),
+                    ("survey".into(), 11),
+                    ("recharge".into(), 8),
+                    ("return-to-base".into(), 3),
+                    ("lost-link".into(), 2),
+                ],
+            };
+            AggregatorSnapshot {
+                source_subnet: source,
+                fold_kinds: vec![0x0001, 0x0002],
+                generation: 142,
+                summary_interval: Duration::from_secs(30),
+                summaries: Arc::new(vec![capability, reservation]),
+            }
+        })
+        .clone()
 }
