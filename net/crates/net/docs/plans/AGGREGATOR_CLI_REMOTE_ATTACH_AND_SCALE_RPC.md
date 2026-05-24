@@ -407,19 +407,17 @@ Mirrors the existing `list_round_trips_two_registered_groups_across_handshake` s
 
 ---
 
-## Discovered substrate gap — direct-handshake responder
+## Substrate gap — discovered + closed (task #102)
 
-Surfaced during A-6 integration testing: the substrate's dispatch loop drops direct handshake msg1 packets from peers it hasn't pre-`accept()`ed (`mesh.rs:2409-2417` + `mesh.rs:3247-3250`). Only the initiator-side has a post-start registry (`pending_direct_initiators`); the responder side is "explicitly deferred." Every CLI subprocess invocation generates a fresh ephemeral identity, so the daemon can't pre-`accept` it — meaning **production CLI remote-attach as designed in A-1..A-5 is blocked on this substrate fix**.
+A-6 integration testing surfaced that the substrate's dispatch loop drops direct handshake msg1 packets from peers it hasn't pre-`accept()`ed (`mesh.rs:2409-2417` + `mesh.rs:3247-3250`). Only the initiator-side has a post-start registry; the responder side is "explicitly deferred." Every CLI subprocess invocation generates a fresh ephemeral identity, so the daemon can't pre-`accept` it.
 
-Tracked as task #102 (`Substrate: pending_direct_responders for post-start handshake`). The fix needs to:
-- Add a responder-side registry symmetric to `pending_direct_initiators`.
-- Modify `dispatch_packet`'s `is_direct + is_handshake` arm to spawn an on-the-fly responder when no pending initiator matches and no peer is yet registered for `source`.
-- Run the Noise responder state machine inside the dispatch loop's spawn task, complete the handshake, register the new peer.
+**Closed by routing CLI handshakes through `connect_via` (routed) instead of `connect` (direct).** `handle_routed_handshake` Case 2 already accepts msg1 from fresh initiators against a running dispatch loop. The routed packet carries `src_id` (the initiator's routing-id) in the routing header (cleartext) so the responder can compute the prologue without pre-`accept`; the initiator's full u64 node_id lives in the AEAD-authenticated Noise payload.
 
-Until #102 lands:
-- A-1..A-5 wire surface ships but is "shaped only" — the CLI can build typed clients and call them, but the daemon-side dispatch drops msg1.
-- A-6's two negative-path subprocess tests (flag validation; exit before handshake) run and pass.
-- A-6's four positive-path subprocess tests (`ls --remote` / `spawn` / `scale` / `query` end-to-end) are `#[ignore]`'d with the task #102 pointer.
+Substrate change: `connect_via` now populates `addr_to_node[relay_addr]` via `entry().or_insert(...)` (mesh.rs:9442-9455). Without this, address-keyed paths like `send_subprotocol` (used by SUBSCRIBE / membership / RPC reply-channel setup) couldn't resolve the destination's node_id when relay == final dest (the CLI single-hop case). `or_insert` preserves the true multi-hop semantics — when `relay_addr` already maps to the relay's own node_id, the existing mapping is kept.
+
+CLI change: `Mesh::connect_via` exposed on the SDK; `CliContext::build_with_remote` switched from `mesh.connect(...)` to `mesh.start(); mesh.connect_via(...)` (the routed path needs the dispatch loop running before sending msg1).
+
+All four A-6 positive subprocess tests now pass. The `query` test stays `#[ignore]`'d for a different reason — fold.query handler is keyed on each replica's id, and replica id discovery from `BootedDaemon` isn't exposed today.
 
 ## Risks for the user to weigh in on
 

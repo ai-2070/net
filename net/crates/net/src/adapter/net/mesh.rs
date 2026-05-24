@@ -9429,9 +9429,18 @@ impl MeshNode {
 
         // Register the new peer with `relay_addr` as the wire address.
         // Packets to `dest_node_id` go to the relay first; the routing
-        // table does the rest. `addr_to_node` is deliberately NOT
-        // updated — `relay_addr` still maps to the relay's own node_id
-        // for direct-packet dispatch.
+        // table does the rest.
+        //
+        // `addr_to_node` is populated via `entry().or_insert(...)` so a
+        // true multi-hop scenario (where `relay_addr` already maps to
+        // the relay's own node_id from a prior handshake) keeps that
+        // mapping intact — `addr_to_node[relay_addr]` still resolves
+        // to the relay for direct-packet dispatch. But in the
+        // degenerate single-hop case (relay == final dest, e.g. the
+        // CLI remote-attach path), the slot is empty and we install
+        // `relay_addr -> dest_node_id` so address-keyed sends
+        // (`send_subprotocol` for SUBSCRIBE / membership /
+        // service-to-peer paths) can resolve the peer.
         let remote_static_pub = keys.remote_static_pub;
         let session = Arc::new(NetSession::new(
             keys,
@@ -9453,6 +9462,7 @@ impl MeshNode {
             },
         );
         self.peer_addrs.insert(dest_node_id, relay_addr);
+        self.addr_to_node.entry(relay_addr).or_insert(dest_node_id);
 
         Ok(dest_node_id)
     }

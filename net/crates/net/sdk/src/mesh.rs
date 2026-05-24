@@ -425,6 +425,32 @@ impl Mesh {
         Ok(addr)
     }
 
+    /// Routed-handshake connect. Unlike [`Self::connect`] (which
+    /// requires the responder to pre-`accept`), this path sends a
+    /// routed handshake packet so the responder's running dispatch
+    /// loop (`handle_routed_handshake` Case 2) handles msg1 from a
+    /// brand-new initiator. Use this when handshaking against a
+    /// daemon that's already `start()`ed and has no prior knowledge
+    /// of the caller's `node_id`. `start()` must be called BEFORE
+    /// this method on the local side — the dispatch loop completes
+    /// the handshake from the initiator side via
+    /// `pending_handshakes` (Case 1 of `handle_routed_handshake`).
+    ///
+    /// When `relay_addr == final_dest`, the route is degenerate
+    /// (one hop) — that's the CLI remote-attach case.
+    pub async fn connect_via(
+        &self,
+        relay_addr: &str,
+        peer_pubkey: &[u8; 32],
+        peer_node_id: u64,
+    ) -> Result<()> {
+        let addr: SocketAddr = relay_addr
+            .parse()
+            .map_err(|e| SdkError::Config(format!("invalid relay address: {}", e)))?;
+        self.node.connect_via(addr, peer_pubkey, peer_node_id).await?;
+        Ok(())
+    }
+
     /// Start the receive loop, heartbeat sender, and router.
     ///
     /// Call this after connecting to peers. Events won't be received

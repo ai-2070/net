@@ -198,21 +198,34 @@ impl CliContext {
 /// Stand up a local ephemeral mesh that has handshaked with the
 /// supplied remote target. Internal — used by
 /// [`CliContext::build_with_remote`].
+///
+/// Uses [`net_sdk::Mesh::connect_via`] (routed handshake) rather
+/// than the direct [`net_sdk::Mesh::connect`] path: direct
+/// handshakes require the responder to pre-`accept(peer_node_id)`
+/// before `start()` (mesh.rs:2409-2417 documents the gap), which
+/// the daemon can't do for ephemeral CLI clients whose
+/// `node_id` it doesn't know in advance. The routed path's
+/// `handle_routed_handshake` Case 2 handles fresh msg1 from
+/// new initiators against a running dispatch loop. The relay
+/// hop is degenerate (relay == final dest == the daemon).
 async fn build_remote_mesh(remote: RemoteAttach) -> Result<net_sdk::Mesh, CliError> {
     let mesh = net_sdk::MeshBuilder::new("127.0.0.1:0", &remote.psk)
         .map_err(|e| connection_failure(format!("mesh builder rejected bind address: {e}")))?
         .build()
         .await
         .map_err(|e| connection_failure(format!("mesh build failed: {e}")))?;
-    mesh.connect(&remote.addr.to_string(), &remote.public_key, remote.node_id)
+    // `connect_via` registers a pending-initiator entry then
+    // awaits msg2 from the dispatch loop, so start() must run
+    // before the call — otherwise no consumer picks up msg2.
+    mesh.start();
+    mesh.connect_via(&remote.addr.to_string(), &remote.public_key, remote.node_id)
         .await
         .map_err(|e| {
             connection_failure(format!(
-                "handshake with {} (node_id={}) failed: {e}",
+                "routed handshake with {} (node_id={}) failed: {e}",
                 remote.addr, remote.node_id
             ))
         })?;
-    mesh.start();
     Ok(mesh)
 }
 

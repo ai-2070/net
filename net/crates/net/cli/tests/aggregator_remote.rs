@@ -7,23 +7,26 @@
 //! code + stdout JSON shape is asserted against the daemon's
 //! registry state.
 //!
-//! # Substrate gap (positive-path tests are `#[ignore]`)
+//! # Routed-handshake bootstrap
 //!
-//! The substrate's dispatch loop drops direct handshake msg1
-//! packets from peers it hasn't pre-`accept()`ed (see
-//! `mesh.rs:2409-2417` and the `pending_direct_initiators`
-//! comment at `mesh.rs:3247-3250` — the responder-side registry
-//! is explicitly deferred). Every CLI subprocess invocation
-//! generates a fresh ephemeral identity, so the daemon can't
-//! pre-`accept` it. Until that gap closes, only the negative-
-//! path tests (which exit before the handshake) run by default.
+//! The CLI's `CliContext::build_with_remote` uses
+//! [`net_sdk::Mesh::connect_via`] (routed handshake) rather than
+//! the direct path. Direct handshakes from new peers to a
+//! started daemon are dropped by the dispatch loop (only
+//! `pending_direct_initiators` exists, not a responder-side
+//! registry — see `mesh.rs:2409-2417`). The routed path's
+//! `handle_routed_handshake` Case 2 picks up msg1 from a fresh
+//! initiator, completes the handshake, and registers the peer
+//! against a running dispatch loop.
 //!
 //! Pin set:
-//! - `ls --remote` against a daemon with two static groups   `#[ignore]`
-//! - `spawn` against a configured template adds a third      `#[ignore]`
-//! - `query` against the template's `source_subnet`          `#[ignore]`
-//! - `scale` (interim Unregister + Spawn) resizes a group    `#[ignore]`
+//! - `ls --remote` against a daemon with two static groups
+//! - `spawn` against a configured template adds a third group
+//! - `scale` (interim Unregister + Spawn) resizes a group
 //! - bad pubkey / missing flag map to typed exit codes
+//! - `query` is `#[ignore]`'d — needs replica node_id discovery
+//!   (the fold.query service handler is keyed on each replica's
+//!   keypair-derived id, not the daemon's main mesh id)
 
 use std::time::Duration;
 
@@ -123,7 +126,6 @@ async fn boot_daemon(toml: &str) -> (BootedDaemon, NamedTempFile) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "blocked on substrate direct-handshake responder gap; see task #102"]
 async fn ls_remote_lists_configured_groups() {
     let toml = format!(
         r#"
@@ -165,7 +167,6 @@ async fn ls_remote_lists_configured_groups() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "blocked on substrate direct-handshake responder gap; see task #102"]
 async fn spawn_against_template_adds_a_group() {
     let toml = format!(
         r#"
@@ -213,7 +214,6 @@ async fn spawn_against_template_adds_a_group() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "blocked on substrate direct-handshake responder gap; see task #102"]
 async fn scale_resizes_existing_group() {
     let toml = format!(
         r#"
@@ -260,7 +260,11 @@ async fn scale_resizes_existing_group() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "blocked on substrate direct-handshake responder gap; see task #102"]
+#[ignore = "needs replica node_id discovery — the fold.query service \
+            handler is keyed on each replica's keypair-derived node_id, \
+            not on the daemon's main mesh node_id. Either expose a \
+            `booted.registry.first_replica_node_id(group)` helper or \
+            spawn a single-node registry mode."]
 async fn query_returns_summary_for_configured_group() {
     let toml = format!(
         r#"
