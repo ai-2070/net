@@ -54,6 +54,7 @@ import {
   TypedDuplexSink,
   TypedDuplexStream,
   TypedResponseSink,
+  rawEventToTyped,
   type CallOptions,
   type RawMeshRpc,
   type RawClientStreamCall,
@@ -62,6 +63,9 @@ import {
   type RawDuplexSink,
   type RawDuplexStream,
   type RawResponseSink,
+  type RawRpcCallEvent,
+  type RpcCallEvent,
+  type RpcMetricsSnapshot,
   type ServeHandle,
 } from '../mesh_rpc'
 
@@ -466,6 +470,12 @@ class StubRawMeshRpc implements RawMeshRpc {
   cancelCall(_token: bigint): void {
     throw new Error('cancelCall not implemented in stub')
   }
+  setObserver(_o: unknown): void {
+    throw new Error('setObserver not implemented in stub')
+  }
+  metricsSnapshot(): never {
+    throw new Error('metricsSnapshot not implemented in stub')
+  }
 }
 
 describe('TypedMeshRpc JSON codec', () => {
@@ -633,6 +643,12 @@ describe('AbortSignal wiring on the typed wrapper', () => {
     }
     cancelCall(token: bigint): void {
       this.cancelCalls.push(token)
+    }
+    setObserver(_o: unknown): void {
+      throw new Error('setObserver not implemented')
+    }
+    metricsSnapshot(): never {
+      throw new Error('metricsSnapshot not implemented')
     }
   }
 
@@ -939,6 +955,12 @@ describe('TypedMeshRpc.serveClientStream', () => {
       findServiceNodes: () => [],
       reserveCancelToken: () => 0n,
       cancelCall: () => {},
+      setObserver: () => {
+        throw new Error('not used')
+      },
+      metricsSnapshot: () => {
+        throw new Error('not used')
+      },
     }
     const rpc = new TypedMeshRpc(stub)
     rpc.serveClientStream<{ n: number }, { sum: number }>(
@@ -1196,6 +1218,12 @@ describe('TypedMeshRpc.serveDuplex', () => {
       findServiceNodes: () => [],
       reserveCancelToken: () => 0n,
       cancelCall: () => {},
+      setObserver: () => {
+        throw new Error('not used')
+      },
+      metricsSnapshot: () => {
+        throw new Error('not used')
+      },
     }
     const rpc = new TypedMeshRpc(stub)
     let observed: { reqs: number[]; sent: string[] } | null = null
@@ -1231,3 +1259,207 @@ describe('TypedMeshRpc.serveDuplex', () => {
     ])
   })
 })
+
+// ============================================================================
+// TypedMeshRpc.setObserver + metricsSnapshot (S2-B3) — stub-level
+// forwarding + RawRpcCallEvent → RpcCallEvent normalization.
+// Live observer-firing belongs in S2-X.
+// ============================================================================
+
+describe('rawEventToTyped', () => {
+  const base: RawRpcCallEvent = {
+    caller: 0x1n,
+    callee: 0x2n,
+    method: 'echo',
+    latencyMs: 7,
+    statusKind: 'ok',
+    requestBytes: 10,
+    responseBytes: 20,
+    direction: 'outbound',
+    tsUnixMs: 1_000_000n,
+  }
+
+  it("decodes 'ok' to {kind:'ok'}", () => {
+    const evt = rawEventToTyped({ ...base, statusKind: 'ok' })
+    expect(evt.status).toEqual({ kind: 'ok' })
+  })
+
+  it("decodes 'error' to {kind:'error', message}", () => {
+    const evt = rawEventToTyped({
+      ...base,
+      statusKind: 'error',
+      statusMessage: 'connection lost',
+    })
+    expect(evt.status).toEqual({ kind: 'error', message: 'connection lost' })
+  })
+
+  it("decodes 'error' with no message to empty string", () => {
+    // The napi side promises a string when statusKind is 'error',
+    // but Node test stubs may omit it — `?? ''` keeps the shape
+    // exhaustive for downstream `switch(status.kind)` patterns.
+    const evt = rawEventToTyped({
+      ...base,
+      statusKind: 'error',
+    })
+    expect(evt.status).toEqual({ kind: 'error', message: '' })
+  })
+
+  it("decodes 'timeout' / 'canceled' to bare tags", () => {
+    const t = rawEventToTyped({ ...base, statusKind: 'timeout' })
+    const c = rawEventToTyped({ ...base, statusKind: 'canceled' })
+    expect(t.status).toEqual({ kind: 'timeout' })
+    expect(c.status).toEqual({ kind: 'canceled' })
+  })
+
+  it('preserves the remaining fields verbatim', () => {
+    const evt = rawEventToTyped(base)
+    expect(evt.caller).toBe(0x1n)
+    expect(evt.callee).toBe(0x2n)
+    expect(evt.method).toBe('echo')
+    expect(evt.latencyMs).toBe(7)
+    expect(evt.requestBytes).toBe(10)
+    expect(evt.responseBytes).toBe(20)
+    expect(evt.direction).toBe('outbound')
+    expect(evt.tsUnixMs).toBe(1_000_000n)
+  })
+})
+
+describe('TypedMeshRpc.setObserver', () => {
+  it('installs the observer through to the raw layer and decodes events', () => {
+    let installed: ((evt: RawRpcCallEvent) => void) | null | undefined =
+      undefined
+    const stub = stubRpcForObserver((o) => {
+      installed = o
+    })
+    const rpc = new TypedMeshRpc(stub)
+    const seen: RpcCallEvent[] = []
+    rpc.setObserver((evt) => seen.push(evt))
+    expect(typeof installed).toBe('function')
+
+    // Synthesize a napi-style raw event and push it through the
+    // installed wrapper. The typed handler should see a decoded
+    // tagged status.
+    installed!({
+      caller: 0xaa00n,
+      callee: 0xbb00n,
+      method: 'svc.foo',
+      latencyMs: 3,
+      statusKind: 'error',
+      statusMessage: 'no_route',
+      requestBytes: 8,
+      responseBytes: 0,
+      direction: 'outbound',
+      tsUnixMs: 1234n,
+    })
+
+    expect(seen.length).toBe(1)
+    expect(seen[0].status).toEqual({
+      kind: 'error',
+      message: 'no_route',
+    })
+    expect(seen[0].method).toBe('svc.foo')
+    expect(seen[0].latencyMs).toBe(3)
+  })
+
+  it('forwards null to the raw side to clear an installed observer', () => {
+    let installed: ((evt: RawRpcCallEvent) => void) | null | undefined =
+      undefined
+    const stub = stubRpcForObserver((o) => {
+      installed = o
+    })
+    const rpc = new TypedMeshRpc(stub)
+    rpc.setObserver(() => {})
+    expect(typeof installed).toBe('function')
+    rpc.setObserver(null)
+    expect(installed).toBeNull()
+  })
+})
+
+describe('TypedMeshRpc.metricsSnapshot', () => {
+  it('passes the raw POD through unchanged', () => {
+    const snapshot: RpcMetricsSnapshot = {
+      services: [
+        {
+          service: 'echo',
+          callsTotal: 42n,
+          errorsNoRoute: 0n,
+          errorsTimeout: 1n,
+          errorsServer: 0n,
+          errorsTransport: 0n,
+          inFlight: 0,
+          latencySumNs: 1234567n,
+          latencyCount: 42n,
+          latencyBuckets: [10n, 22n, 30n],
+          handlerInvocationsTotal: 0n,
+          handlerPanicsTotal: 0n,
+          handlerInFlight: 0,
+          handlerDurationSumNs: 0n,
+          handlerDurationCount: 0n,
+          handlerDurationBuckets: [0n, 0n, 0n],
+          streamingChunksEmittedTotal: 0n,
+          streamingChunksDroppedTotal: 0n,
+          capabilityDeniedTotal: 0n,
+        },
+      ],
+    }
+    const stub = stubRpcForMetrics(snapshot)
+    const rpc = new TypedMeshRpc(stub)
+    expect(rpc.metricsSnapshot()).toBe(snapshot)
+  })
+})
+
+function stubRpcForObserver(
+  installer: (observer: ((evt: RawRpcCallEvent) => void) | null) => void,
+): RawMeshRpc {
+  return {
+    serve: () => {
+      throw new Error('not used')
+    },
+    call: () => Promise.reject(new Error('not used')),
+    callService: () => Promise.reject(new Error('not used')),
+    callStreaming: () => Promise.reject(new Error('not used')),
+    callClientStream: () => Promise.reject(new Error('not used')),
+    serveClientStream: () => {
+      throw new Error('not used')
+    },
+    callDuplex: () => Promise.reject(new Error('not used')),
+    serveDuplex: () => {
+      throw new Error('not used')
+    },
+    findServiceNodes: () => [],
+    reserveCancelToken: () => 0n,
+    cancelCall: () => {},
+    setObserver: (o) => {
+      installer(o ?? null)
+    },
+    metricsSnapshot: () => {
+      throw new Error('not used')
+    },
+  }
+}
+
+function stubRpcForMetrics(snapshot: RpcMetricsSnapshot): RawMeshRpc {
+  return {
+    serve: () => {
+      throw new Error('not used')
+    },
+    call: () => Promise.reject(new Error('not used')),
+    callService: () => Promise.reject(new Error('not used')),
+    callStreaming: () => Promise.reject(new Error('not used')),
+    callClientStream: () => Promise.reject(new Error('not used')),
+    serveClientStream: () => {
+      throw new Error('not used')
+    },
+    callDuplex: () => Promise.reject(new Error('not used')),
+    serveDuplex: () => {
+      throw new Error('not used')
+    },
+    findServiceNodes: () => [],
+    reserveCancelToken: () => 0n,
+    cancelCall: () => {},
+    setObserver: () => {
+      throw new Error('not used')
+    },
+    metricsSnapshot: () => snapshot,
+  }
+}

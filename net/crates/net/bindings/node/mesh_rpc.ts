@@ -187,6 +187,136 @@ export interface RawMeshRpc {
   reserveCancelToken(): bigint
   /** Abort the in-flight call associated with `token`. Idempotent. */
   cancelCall(token: bigint): void
+  /**
+   * Install (or clear with `null` / `undefined`) the caller-side
+   * nRPC observer. The handler receives the napi POD
+   * (`RawRpcCallEvent`); the typed wrapper layer normalizes into
+   * a tagged-union {@link RpcCallEvent} before reaching user code.
+   * See `TypedMeshRpc.setObserver` for the locked-decision
+   * contract.
+   */
+  setObserver(
+    observer: ((evt: RawRpcCallEvent) => void) | null | undefined,
+  ): void
+  /** Snapshot the per-service nRPC metrics registry. */
+  metricsSnapshot(): RpcMetricsSnapshot
+}
+
+// ============================================================================
+// Observer + metrics POD shapes (S2-B3). Wire-compatible with the
+// napi `RpcCallEventJs` / `RpcMetricsSnapshotJs` / `ServiceMetricsJs`
+// PODs surfaced by S2-A1; the typed wrapper passes them through
+// without re-encoding.
+// ============================================================================
+
+/**
+ * Status discriminant for an observed RPC call. Match on `kind`
+ * before reading other fields; this is a string-tagged union
+ * because the napi POD layer doesn't support TS discriminated
+ * unions natively (the napi side flattens it to `statusKind:
+ * string` + `statusMessage?: string` — see {@link RpcCallEvent}).
+ */
+export type RpcCallStatus =
+  | { kind: 'ok' }
+  | { kind: 'error'; message: string }
+  | { kind: 'timeout' }
+  | { kind: 'canceled' }
+
+/**
+ * Single observed RPC call boundary. Surfaced to the observer
+ * callback installed via `TypedMeshRpc.setObserver`. Mirrors the
+ * substrate's `RpcCallEvent` field-by-field — the typed wrapper
+ * reconstructs the `RpcCallStatus` tagged union from the napi
+ * POD's flat `statusKind` / `statusMessage` pair so user code
+ * sees a TS-idiomatic discriminated union.
+ */
+export interface RpcCallEvent {
+  /** 64-bit node id of the calling node. */
+  caller: bigint
+  /** 64-bit node id of the responding node. */
+  callee: bigint
+  /** Service / method name. */
+  method: string
+  /** Elapsed time in milliseconds. */
+  latencyMs: number
+  /** Tagged-union outcome. Match on `status.kind`. */
+  status: RpcCallStatus
+  /** Wire payload size of the request body (0 when not available). */
+  requestBytes: number
+  /** Wire payload size of the response body (0 when not available). */
+  responseBytes: number
+  /** v1 only emits `"outbound"`; `"inbound"` is reserved. */
+  direction: 'outbound' | 'inbound'
+  /** Unix-ms timestamp captured at fire time. */
+  tsUnixMs: bigint
+}
+
+/**
+ * Raw napi observer event shape (POD with flat `statusKind` /
+ * `statusMessage` strings). Internal — the typed wrapper
+ * normalizes it into {@link RpcCallEvent} before reaching user
+ * code. Exported so test stubs can construct events directly.
+ */
+export interface RawRpcCallEvent {
+  caller: bigint
+  callee: bigint
+  method: string
+  latencyMs: number
+  statusKind: 'ok' | 'error' | 'timeout' | 'canceled'
+  statusMessage?: string | null
+  requestBytes: number
+  responseBytes: number
+  direction: 'outbound' | 'inbound'
+  tsUnixMs: bigint
+}
+
+/**
+ * Per-service caller + server-side nRPC counters at a point in
+ * time. Element of `RpcMetricsSnapshot.services`. All `bigint`
+ * fields are direct u64 counters; `inFlight` and `handlerInFlight`
+ * are signed i64 to track concurrent calls without underflow.
+ */
+export interface ServiceMetrics {
+  service: string
+  // ---- caller-side ----
+  callsTotal: bigint
+  errorsNoRoute: bigint
+  errorsTimeout: bigint
+  errorsServer: bigint
+  errorsTransport: bigint
+  inFlight: number
+  latencySumNs: bigint
+  latencyCount: bigint
+  /**
+   * Cumulative histogram bucket counts; index `i` corresponds to
+   * the substrate's `DEFAULT_LATENCY_BUCKETS_SECS[i]`. Last entry
+   * is the `+Inf` bucket.
+   */
+  latencyBuckets: bigint[]
+  // ---- server-side ----
+  handlerInvocationsTotal: bigint
+  handlerPanicsTotal: bigint
+  handlerInFlight: number
+  handlerDurationSumNs: bigint
+  handlerDurationCount: bigint
+  handlerDurationBuckets: bigint[]
+  streamingChunksEmittedTotal: bigint
+  streamingChunksDroppedTotal: bigint
+  capabilityDeniedTotal: bigint
+}
+
+/**
+ * Snapshot of the per-service nRPC metrics registry. Returned by
+ * `TypedMeshRpc.metricsSnapshot`. Cheap — one DashMap iteration
+ * on the substrate side. Safe to collect on every Prometheus
+ * scrape.
+ */
+export interface RpcMetricsSnapshot {
+  /**
+   * One entry per service that has been called at least once
+   * since the mesh was created. Sorted by service name.
+   */
+  services: ServiceMetrics[]
 }
 
 /**
@@ -589,6 +719,56 @@ export class TypedMeshRpc {
         return DUPLEX_TERMINAL_SENTINEL
       },
     )
+  }
+
+  // ---- observer + metrics (S2-B3) ----------------------------------------
+
+  /**
+   * Install (pass a handler) or clear (pass `null`) the caller-side
+   * nRPC observer. The handler fires once per completed outbound
+   * RPC with a decoded {@link RpcCallEvent} — the tagged
+   * `status` discriminator is reconstructed from the napi POD's
+   * flat `statusKind` / `statusMessage` fields.
+   *
+   * **Callback contract (locked decision #1).** The handler fires
+   * synchronously from the substrate's dispatch path via a TSFN in
+   * `NonBlocking` mode — if the Node event loop is wedged, events
+   * are **dropped**, not buffered. Callbacks must therefore be
+   * cheap: push into a queue or ring buffer for slow consumers;
+   * do not do work inline. A bounded-mpsc + drop-counter layer is
+   * a deliberate post-v1 follow-up.
+   *
+   * **Mid-call swap.** The substrate uses `ArcSwap` for the
+   * observer slot, so swaps are atomic — but a swap mid-call
+   * means some events fire against the old handler, some against
+   * the new. Set the observer once at startup for clean
+   * semantics.
+   *
+   * v1 only emits `direction === 'outbound'` events; the
+   * server-side `'inbound'` hook is a planned follow-up.
+   */
+  setObserver(handler: ((evt: RpcCallEvent) => void) | null): void {
+    if (handler === null) {
+      this._raw.setObserver(null)
+      return
+    }
+    // Normalize the napi POD's flat `statusKind` / `statusMessage`
+    // into the TS-idiomatic tagged `RpcCallStatus` discriminator
+    // before reaching user code.
+    this._raw.setObserver((raw: RawRpcCallEvent) => {
+      handler(rawEventToTyped(raw))
+    })
+  }
+
+  /**
+   * Snapshot the per-service nRPC metrics registry. Cheap — one
+   * DashMap iteration on the substrate side. Safe to collect on
+   * every Prometheus scrape. The returned object is a plain POD
+   * (no class wrapping); read fields directly or feed into your
+   * own exporter.
+   */
+  metricsSnapshot(): RpcMetricsSnapshot {
+    return this._raw.metricsSnapshot()
   }
 
   // ---- resilience helpers --------------------------------------------------
@@ -1786,3 +1966,39 @@ export function appError(code: number, body: string | Buffer): Error {
 export const NRPC_TYPED_BAD_REQUEST = 0x8000 as const
 /** RpcStatus::Application(0x8001): typed handler returned `throw`. */
 export const NRPC_TYPED_HANDLER_ERROR = 0x8001 as const
+
+/**
+ * Convert the napi POD shape (`RawRpcCallEvent` with flat
+ * `statusKind` / `statusMessage` fields) into the TS-idiomatic
+ * tagged `RpcCallEvent`. Exported for tests that need to
+ * synthesize observer events; production code receives already-
+ * decoded events via `TypedMeshRpc.setObserver`.
+ */
+export function rawEventToTyped(raw: RawRpcCallEvent): RpcCallEvent {
+  let status: RpcCallStatus
+  switch (raw.statusKind) {
+    case 'ok':
+      status = { kind: 'ok' }
+      break
+    case 'error':
+      status = { kind: 'error', message: raw.statusMessage ?? '' }
+      break
+    case 'timeout':
+      status = { kind: 'timeout' }
+      break
+    case 'canceled':
+      status = { kind: 'canceled' }
+      break
+  }
+  return {
+    caller: raw.caller,
+    callee: raw.callee,
+    method: raw.method,
+    latencyMs: raw.latencyMs,
+    status,
+    requestBytes: raw.requestBytes,
+    responseBytes: raw.responseBytes,
+    direction: raw.direction,
+    tsUnixMs: raw.tsUnixMs,
+  }
+}
