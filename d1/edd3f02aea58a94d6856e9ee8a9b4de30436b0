@@ -1,0 +1,26 @@
+net/crates/net/tests/integration_nrpc_cross_lang_streaming.rs
+  s_099fa7d871e34d::t_91c579f20ead2e 1049,1051-1056,1058-1081,1102-1112
+  s_099fa7d871e34d::t_5a9ae956d029a0 955-956,960-961
+  s_099fa7d871e34d::t_db0d4a4c79b926 775-954,957-959,962-1048,1050,1082-1101,1113-1189
+  s_099fa7d871e34d::t_a82227ea43c57b 1057
+  s_099fa7d871e34d::t_221c9f2bd3cb35 74-78
+net/crates/net/tests/cross_lang_nrpc/golden_vectors_streaming.json
+  s_099fa7d871e34d::t_37ac73ffced119 2-3
+  s_099fa7d871e34d::t_e787043af55604 192-272
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "d1edd3f02aea58a94d6856e9ee8a9b4de30436b0",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
