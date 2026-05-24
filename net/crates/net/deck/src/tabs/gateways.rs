@@ -22,11 +22,27 @@ use ratatui::{
 use crate::{theme, widgets};
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, deck: &Arc<DeckClient>) {
-    match deck.gateway_stats() {
-        Some(stats) => {
-            let exports = deck.gateway_exports();
-            render_table(frame, area, &stats, &exports);
+    let real_stats = deck.gateway_stats();
+    let real_exports = if real_stats.is_some() {
+        deck.gateway_exports()
+    } else {
+        Vec::new()
+    };
+    // Under `--features demo` the harness installs no gateway;
+    // substitute the demo fixture.
+    #[cfg(feature = "demo")]
+    let (stats, exports) = match real_stats {
+        Some(s) => (Some(s), real_exports),
+        None => {
+            let (s, e) = crate::demo::fixtures::gateways();
+            (Some(s), e)
         }
+    };
+    #[cfg(not(feature = "demo"))]
+    let (stats, exports) = (real_stats, real_exports);
+
+    match stats {
+        Some(stats) => render_table(frame, area, &stats, &exports),
         None => render_empty(frame, area),
     }
 }

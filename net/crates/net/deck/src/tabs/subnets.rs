@@ -23,6 +23,16 @@ use crate::{theme, widgets};
 pub fn render(frame: &mut Frame<'_>, area: Rect, deck: &Arc<DeckClient>) {
     let local = deck.local_subnet();
     let rollups = deck.subnets_with_members(None);
+    // Under `--features demo` the cluster harness boots N nodes
+    // flat under `SubnetId::GLOBAL`; substitute the demo
+    // fixture so the panel shows a realistic multi-region tree
+    // instead of an empty state.
+    #[cfg(feature = "demo")]
+    let (local, rollups) = if local.is_none() && rollups.is_empty() {
+        crate::demo::fixtures::subnets()
+    } else {
+        (local, rollups)
+    };
     if local.is_none() && rollups.is_empty() {
         render_empty(frame, area);
     } else {

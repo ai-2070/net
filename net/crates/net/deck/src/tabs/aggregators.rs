@@ -21,7 +21,12 @@ use ratatui::{
 use crate::{theme, widgets};
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, deck: &Arc<DeckClient>) {
-    match deck.aggregator_snapshot() {
+    let snap = deck.aggregator_snapshot();
+    // Under `--features demo` no AggregatorDaemon is wired into
+    // the cluster harness; substitute the demo fixture.
+    #[cfg(feature = "demo")]
+    let snap = snap.or_else(|| Some(crate::demo::fixtures::aggregator()));
+    match snap {
         None => render_empty(frame, area),
         Some(snap) => render_table(frame, area, &snap),
     }
