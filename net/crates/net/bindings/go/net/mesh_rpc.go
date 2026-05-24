@@ -587,7 +587,14 @@ func ABIVersion() uint32 { return uint32(C.net_rpc_abi_version()) }
 // ExpectedABIVersion is the C-ABI version this Go wrapper is
 // known to be source-compatible with. Bumped in lockstep with
 // `NET_RPC_ABI_VERSION` on the Rust side.
-const ExpectedABIVersion uint32 = 0x0001
+//
+//   - 0x0001: initial release (lifecycle + unary + Phase B6 streaming)
+//   - 0x0002: Phase B8 — client-streaming + duplex caller-side surface
+//   - 0x0003: Phase S1-A1 — observer + metrics-snapshot surface
+//     (consumed by mesh_rpc_typed.go's SetObserver / MetricsSnapshot).
+//     Additive — older 0x0001/0x0002 consumers compiled against a
+//     0x0003 library still work.
+const ExpectedABIVersion uint32 = 0x0003
 
 // errABIMismatch is the typed error returned by CheckABI on a
 // version mismatch. Use `errors.Is(err, ErrABIMismatch)` to

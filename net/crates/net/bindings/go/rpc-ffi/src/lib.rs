@@ -315,6 +315,47 @@ fn write_err(out_err: *mut *mut c_char, message: String) {
     }
 }
 
+/// Stable `nrpc:app_error:` error-message prefix the Go-side
+/// typed `Serve` shim uses to signal "I want a typed Application
+/// status code surfaced to the caller, not a generic Internal."
+/// Go handlers return `errors.New("nrpc:app_error:0x8000:<json
+/// body>")` and this side maps it to
+/// `RpcHandlerError::Application { code, message }`. Mirrors the
+/// napi binding's `parse_js_app_error` and the pyo3 binding's
+/// `RpcAppError` mechanism — same wire contract across all
+/// three bindings.
+const GO_APP_ERROR_PREFIX: &str = "nrpc:app_error:";
+
+/// Parse a Go-side `nrpc:app_error:0x<code>:<body>` error message
+/// into the (code, body) pair the SDK expects for
+/// `RpcHandlerError::Application`. Returns `None` if the prefix
+/// is absent or the format is malformed (caller falls through to
+/// the generic Internal mapping).
+fn parse_go_app_error(message: &str) -> Option<(u16, String)> {
+    let rest = message.strip_prefix(GO_APP_ERROR_PREFIX)?;
+    let (code_str, body) = rest.split_once(':')?;
+    let code_hex = code_str
+        .strip_prefix("0x")
+        .or(code_str.strip_prefix("0X"))?;
+    let code = u16::from_str_radix(code_hex, 16).ok()?;
+    Some((code, body.to_string()))
+}
+
+/// Convert a Go-side handler error string into either a typed
+/// `Application` or a generic `Internal` `RpcHandlerError`. The
+/// app-error path mirrors napi's `parse_js_app_error` so typed
+/// handlers in any binding can surface `RpcStatus::Application`
+/// uniformly.
+fn handler_error_from_msg(msg: String) -> RpcHandlerError {
+    if let Some((code, body)) = parse_go_app_error(&msg) {
+        return RpcHandlerError::Application {
+            code,
+            message: body,
+        };
+    }
+    RpcHandlerError::Internal(msg)
+}
+
 /// Format an inner [`InnerRpcError`] into the same stable string
 /// shape the Node + Python bindings use: a colon-delimited
 /// `<kind>: <detail>` so the Go side can parse the kind segment
@@ -462,7 +503,7 @@ impl RpcHandler for GoRpcHandler {
 
         let body = match join {
             Ok(Ok(Ok(body))) => body,
-            Ok(Ok(Err(msg))) => return Err(RpcHandlerError::Internal(msg)),
+            Ok(Ok(Err(msg))) => return Err(handler_error_from_msg(msg)),
             Ok(Err(join_err)) => {
                 return Err(RpcHandlerError::Internal(format!(
                     "Go-handler blocking task panicked: {join_err}"
@@ -2834,7 +2875,7 @@ impl RpcClientStreamingHandler for GoClientStreamingRpcHandler {
         .await;
         let body = match join {
             Ok(Ok(Ok(body))) => body,
-            Ok(Ok(Err(msg))) => return Err(RpcHandlerError::Internal(msg)),
+            Ok(Ok(Err(msg))) => return Err(handler_error_from_msg(msg)),
             Ok(Err(join_err)) => {
                 return Err(RpcHandlerError::Internal(format!(
                     "Go client-streaming blocking task panicked: {join_err}"
