@@ -115,6 +115,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, current: Tab) {
 /// trailing space). `avail` is the column count available to
 /// the strip. `current_idx` is the active tab — kept inside
 /// the returned window.
+///
+/// # See also
+///
+/// `crate::tabs::scroll_window` — the fixed-row, vertical-
+/// list sibling. Both use the same 2-pass reservation shape;
+/// the signatures differ (variable `widths` slice + `LEFT_CHIP`
+/// / `RIGHT_CHIP` = 4 / 3 cells here, vs uniform 1-cell rows
+/// + `1` / `1` chips there) so they don't share an
+/// implementation, but a change to one is usually a hint that
+/// the other deserves a look.
 fn scroll_window_horizontal(widths: &[usize], avail: usize, current_idx: usize) -> (usize, usize) {
     let n = widths.len();
     if n == 0 || avail == 0 {
