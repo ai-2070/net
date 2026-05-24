@@ -622,7 +622,7 @@ mod tests {
             .register("beta", spawn_group("beta", 50).await)
             .expect("register beta");
 
-        let response = answer(&registry, None, &RegistryRequest::List).await;
+        let response = answer(&registry, None, None, &RegistryRequest::List).await;
         match response {
             RegistryResponse::Groups(groups) => {
                 assert_eq!(groups.len(), 2);
@@ -654,7 +654,7 @@ mod tests {
     #[tokio::test]
     async fn list_against_empty_registry_returns_empty_groups() {
         let registry = Arc::new(AggregatorRegistry::new());
-        let response = answer(&registry, None, &RegistryRequest::List).await;
+        let response = answer(&registry, None, None, &RegistryRequest::List).await;
         match response {
             RegistryResponse::Groups(groups) => assert!(groups.is_empty()),
             other => panic!("expected empty Groups, got {other:?}"),
@@ -669,6 +669,7 @@ mod tests {
             .expect("register");
         let response = answer(
             &registry,
+            None,
             None,
             &RegistryRequest::Unregister {
                 group_name: "agg".into(),
@@ -688,6 +689,7 @@ mod tests {
         let response = answer(
             &registry,
             None,
+            None,
             &RegistryRequest::Unregister {
                 group_name: "missing".into(),
             },
@@ -704,6 +706,7 @@ mod tests {
         let registry = Arc::new(AggregatorRegistry::new());
         let response = answer(
             &registry,
+            None,
             None,
             &RegistryRequest::Spawn {
                 template_name: "primary".into(),
@@ -776,6 +779,7 @@ mod tests {
         let response = answer(
             &registry,
             Some(&spawner),
+            None,
             &RegistryRequest::Spawn {
                 template_name: "primary".into(),
                 group_name: "dynamic".into(),
@@ -796,6 +800,7 @@ mod tests {
         let _ = answer(
             &registry,
             None,
+            None,
             &RegistryRequest::Unregister {
                 group_name: "dynamic".into(),
             },
@@ -812,6 +817,7 @@ mod tests {
         let response = answer(
             &registry,
             Some(&spawner),
+            None,
             &RegistryRequest::Spawn {
                 template_name: "nope".into(),
                 group_name: "x".into(),
@@ -845,6 +851,7 @@ mod tests {
         let response = answer(
             &registry,
             Some(&spawner),
+            None,
             &RegistryRequest::Spawn {
                 template_name: "anything".into(),
                 group_name: "existing".into(),
@@ -881,6 +888,11 @@ mod tests {
             RegistryRequest::Unregister {
                 group_name: "old".into(),
             },
+            RegistryRequest::Scale {
+                group_name: "grow".into(),
+                template_name: "primary".into(),
+                target_replica_count: 5,
+            },
         ] {
             let bytes = postcard::to_allocvec(&req).expect("encode req");
             let decoded: RegistryRequest = postcard::from_bytes(&bytes).expect("decode req");
@@ -890,6 +902,8 @@ mod tests {
         let group_summary = RegistryGroupSummary {
             name: "test".into(),
             group_seed: [0xCDu8; 32],
+            source_subnet: SubnetId::GLOBAL,
+            fold_kinds: vec![0x0001],
             replicas: vec![RegistryReplicaSummary {
                 generation: 42,
                 healthy: false,
@@ -899,14 +913,18 @@ mod tests {
         };
         for resp in [
             RegistryResponse::Groups(vec![group_summary.clone()]),
-            RegistryResponse::Spawned(group_summary),
+            RegistryResponse::Spawned(group_summary.clone()),
             RegistryResponse::Unregistered { existed: true },
             RegistryResponse::Unregistered { existed: false },
+            RegistryResponse::Scaled(group_summary),
             RegistryResponse::Error(RegistryRpcError::DecodeFailed("bad bytes".into())),
             RegistryResponse::Error(RegistryRpcError::UnknownTemplate("missing".into())),
             RegistryResponse::Error(RegistryRpcError::DuplicateGroupName("dup".into())),
             RegistryResponse::Error(RegistryRpcError::SpawnRejected("oops".into())),
             RegistryResponse::Error(RegistryRpcError::SpawnNotSupported),
+            RegistryResponse::Error(RegistryRpcError::UnknownGroup("ghost".into())),
+            RegistryResponse::Error(RegistryRpcError::ScaleRejected("template mismatch".into())),
+            RegistryResponse::Error(RegistryRpcError::ScaleNotSupported),
         ] {
             let bytes = postcard::to_allocvec(&resp).expect("encode resp");
             let decoded: RegistryResponse = postcard::from_bytes(&bytes).expect("decode resp");

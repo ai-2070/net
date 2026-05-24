@@ -806,6 +806,8 @@ mod tests {
         let g = RegistryGroupSummary {
             name: "alpha".into(),
             group_seed: [0xABu8; 32],
+            source_subnet: crate::adapter::net::subnet::SubnetId::GLOBAL,
+            fold_kinds: vec![0x0001],
             replicas: vec![
                 crate::adapter::net::behavior::aggregator::RegistryReplicaSummary {
                     generation: 42,
