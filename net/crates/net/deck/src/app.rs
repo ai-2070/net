@@ -240,14 +240,15 @@ pub struct App {
     pub blobs_tail: crate::streams::BlobsTail,
     /// Cursor on the BLOBS tab — index into the visible
     /// (filtered) projection of `blobs_tail.snapshot()`.
+    /// Persists across tab switches so the operator's
+    /// selection survives a quick pivot away (same for every
+    /// `*_cursor` field below).
     pub blobs_cursor: usize,
-    /// Cursor on the GATEWAYS tab — index into the resolved
-    /// export-rule rows. Persists across tab switches so the
-    /// operator's selection survives a quick pivot away.
+    /// Cursor on the GATEWAYS tab — resolved export-rule rows.
     pub gateways_cursor: usize,
-    /// Cursor on the SUBNETS tab — index into `subnets_with_members`.
+    /// Cursor on the SUBNETS tab — `subnets_with_members` rows.
     pub subnets_cursor: usize,
-    /// Cursor on the AGGREGATORS tab — index into the buffered
+    /// Cursor on the AGGREGATORS tab — buffered
     /// `SummaryAnnouncement`s (newest-first).
     pub aggregators_cursor: usize,
     /// BLOBS substring search. Matches hash prefix; empty =
