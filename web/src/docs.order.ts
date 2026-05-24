@@ -64,6 +64,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     ],
     // Releases — newest first.
     releases: [
+      "RELEASE_v0.22_ALL_ALONG_THE_WATCHTOWER",
       "RELEASE_v0.21_RADAR_LOVE",
       "release-v0.20.2",
       "release-v0.20-smoke-on-the-water",
@@ -131,7 +132,9 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "tutorials/event-sourced-service": "Event-Sourced Service",
 
     // Releases
-    "RELEASE_v0.21_RADAR_LOVE": "v0.21 — Radar Love",
+    "releases/RELEASE_v0.22_ALL_ALONG_THE_WATCHTOWER":
+      "v0.22 — All Along the Watchtower",
+    "releases/RELEASE_v0.21_RADAR_LOVE": "v0.21 — Radar Love",
     "releases/release-v0.20.2": "v0.20.2",
     "releases/release-v0.20-smoke-on-the-water": "v0.20 — Smoke on the Water",
     "releases/release-v0.19-push-it-to-the-limit":
