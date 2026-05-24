@@ -1,325 +1,403 @@
-# Python SDK: side-by-side `async` + sync
+# Python SDK: side-by-side `async` + sync (whole-surface)
 
 Branch: `python-async-sdk` (suggested).
-Predecessor: [`NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION.md`](./NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION.md) — v3 promoted cancellation to a substrate primitive (`Mesh::reserve_cancel_token` / `Mesh::cancel(token)`), which this plan reuses verbatim for `asyncio.Task.cancel()` propagation. No new substrate surface; everything lands in the pyo3 binding + Python typed wrapper.
+Predecessor: [`NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION.md`](./NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION.md) — v3 promoted cancellation to a substrate primitive (`Mesh::reserve_cancel_token` / `Mesh::cancel(token)`). This plan reuses that primitive for asyncio cancellation propagation, plus the same pattern at every other module that today calls `runtime.block_on(...)` from a pyo3 method.
 
 ## Scope
 
-Add an `async` variant of the entire Python nRPC surface — `AsyncMeshRpc`, `AsyncTypedMeshRpc`, async streaming iterators, async handlers — alongside the existing sync `MeshRpc` / `TypedMeshRpc`. Both classes share the same `MeshNode` and tokio runtime; users mix as they like (sync caller + async server is fine; async caller + sync server is fine).
+Add an `Async` variant of **every Python SDK surface that performs I/O** — not just nRPC. Today the pyo3 binding spans 16 modules totaling ~16.8k LOC; ~141 method bodies wrap a `runtime.block_on(...)` to bridge from sync Python into async Rust. Each one is an opportunity to offer an `async def` sibling that returns a Python awaitable instead of blocking a thread.
 
-The existing sync API is **unchanged**. No method gets renamed, no signature shifts. Every user who imports `from net import MeshRpc` keeps working. The new surface adds, never replaces.
+The existing sync API is **unchanged**. Every method, class name, signature, and import stays put. Every existing `from net import ...` keeps working. The new surface adds parallel `Async`-prefixed classes; users mix freely on the same `NetMesh` instance.
+
+### Surface audit (modules → block-on count → async-worthiness)
+
+Counted via `grep -c "runtime.block_on\|py.detach\|py.allow_threads"` per pyo3 source file:
+
+| Module                                     | block_on | Tier | Notes                                                              |
+|--------------------------------------------|---------:|:----:|--------------------------------------------------------------------|
+| `mesh_rpc.rs` (nRPC raw + typed wrapper)   |       32 | T1   | Already detailed below; foundational for service-typed callers.   |
+| `deck.rs` (operator-side client + streams) |       21 | T3   | Snapshot / status streams are server-pushed — natural async-iter. |
+| `cortex.rs` (NetDb / Redex / Memories / Tasks) | 18   | T2   | Watch iterators today fake-sync over async tails.                  |
+| `compute.rs` (DaemonRuntime + handles)     |       14 | T2   | Daemon spawn / migrate / wait all block on RPC.                    |
+| `lib.rs` (Net event bus + NetMesh + NetStream) | 12   | T1   | `NetMesh.connect` / handshake / `NetStream.send` are network I/O. |
+| `aggregator.rs` + `capability_aggregation.rs` | 11    | T3   | `FoldQueryClient` / `RegistryClient` are RPC clients.              |
+| `groups.rs` (Replica / Fork / Standby)     |       11 | T2   | Group spawn / health / migrate.                                    |
+| `redis_dedup.rs`                           |        9 | T3   | Redis stream consumer (network I/O).                               |
+| `meshos.rs` (daemon-author SDK)            |        6 | T3   | Daemon receive / publish_log / shutdown.                           |
+| `blob.rs` (dataforts)                      |        5 | T2   | `blob_publish` / `blob_resolve` cross-mesh.                        |
+| `meshdb.rs`                                |        2 | T3   | `MeshQueryRunner.execute` is RPC-backed.                           |
+| `capabilities.rs`                          |        0 |  —   | Sync local helpers; no async value.                                |
+| `capability_aggregation.rs`                |        0 |  —   | Sync helpers.                                                      |
+| `identity.rs`                              |        0 |  —   | Sync crypto.                                                       |
+| `placement.rs`                             |        0 |  —   | Sync helpers.                                                      |
+| `subnets.rs`                               |        0 |  —   | Sync helpers.                                                      |
+
+11 modules get async siblings; 5 stay sync-only (no I/O to await over).
 
 ## Why now
 
-1. **The substrate is already async.** The pyo3 binding wraps every call in `runtime.block_on(...)` with `py.detach(...)` to release the GIL — every sync call already pays the bridge cost of blocking a thread on a tokio task. Exposing the underlying async future to Python is a small mechanical step on top, not a redesign.
-2. **The audience is bimodal.** Standard-library Python code (scripts, CLI tools, single-threaded daemons) is sync-natural; modern Python servers (FastAPI, ASGI workers, asyncio-based agent frameworks like LangGraph) are async-natural and pay a real cost for sync calls — every blocking call burns a thread-pool slot. The same caller fits both shapes today only by spawning threads around the sync API, which defeats async's whole point. Splitting at the SDK boundary lets each consumer use the idiom they already wrote everything else in.
-3. **v3 made this safe to ship.** Before v3 the bindings each carried their own cancel registry and the async story would have needed a parallel cancel adapter. With v3's `Mesh::reserve_cancel_token` + `Mesh::cancel(token)` substrate primitive, an `asyncio.Task.cancel()` listener is the exact same shape as v3's `AbortSignal` listener in napi — mint a token, register a callback, on cancel call `Mesh::cancel(token)`. No new substrate work needed.
-4. **No upstream breaking change.** Side-by-side means side-by-side. `AsyncMeshRpc` is additive at the pyo3 layer, additive at the typed-wrapper layer, additive at the typed-tests layer. Rollback is a `git revert` per slice; sync users see nothing.
+1. **The substrate is already async — every block_on is a thread-pool tax.** Each `runtime.block_on(...)` in the pyo3 binding takes a Python thread + a tokio worker hostage for the call's duration. In an asyncio-native consumer (FastAPI, LangGraph, an `aiohttp` sidecar, an `asyncio.gather` fan-out across 100 services), that pattern serializes what should be concurrent and burns the application's thread budget. Exposing the underlying futures lets `asyncio.gather` actually parallelize.
+2. **The audience is bimodal.** Standard-library Python (scripts, CLI tools) is sync-natural; modern Python servers and agent frameworks are async-natural. The same library can serve both, but only if both shapes exist as first-class surfaces — not "sync only, run it in a `ThreadPoolExecutor` if you're async."
+3. **Server-pushed streams are awkward as sync iterators.** `RedexTailIter`, `MemoryWatchIter`, `TaskWatchIter`, `SnapshotStream`, `StatusSummaryStream` are all server-pushed — the current sync iterator wraps an async `Stream` in a `runtime.block_on` per `__next__`. As async iterators they'd be the natural shape: one tokio future per `__anext__`, no blocking, no per-call thread block.
+4. **v3 made cancellation tractable.** Before v3 each pyo3 method would have needed its own cancel adapter to propagate `asyncio.Task.cancel()` through. With v3's `Mesh::reserve_cancel_token` + `Mesh::cancel(token)`, the asyncio-cancel hook is the same shape as napi's `AbortSignal` listener — mint a token, on Python-task-cancel call `Mesh::cancel(token)`. One pattern, applied uniformly across every async method.
+5. **Tiering ships value early.** T1 (nRPC + NetMesh + NetStream) is the foundation everything else builds on; users who only consume those see immediate value. T2 (cortex / compute / groups / blob) is the production-essentials block. T3 (deck / meshos / meshdb / aggregator / redis_dedup) is operator/specialty surface. Each tier is independently releasable.
 
 ## Locked decisions
 
-1. **Naming: `AsyncMeshRpc` + `AsyncTypedMeshRpc`** (parallel classes). Matches the strongest precedent in the Python ecosystem (`httpx.Client` / `httpx.AsyncClient`, `sqlalchemy.Session` / `sqlalchemy.AsyncSession`). Rejected: `acall`/`async_call` methods on the existing class (clutters the sync class and forces every user to learn both surfaces), separate `net.async_mesh_rpc` module (drives import-path drift), async-only (the whole point of "side-by-side" is keeping sync working).
-2. **Async bridge: `pyo3-async-runtimes` (tokio backend).** The maintained successor to `pyo3-asyncio`, tracks pyo3 releases. We're already on pyo3 0.28; `pyo3-async-runtimes` 0.28 is API-compatible. Rejected: hand-rolling the future-to-coroutine bridge (loose timing semantics; pyo3-async-runtimes has solved the runtime-coordination problem already).
-3. **Shared tokio runtime.** The existing `Arc<Runtime>` on `NetMesh` is the same runtime both sync `block_on` and async `future_into_py` use. One process = one tokio runtime, regardless of how many `MeshRpc` / `AsyncMeshRpc` instances exist. Rejected: per-instance runtimes (memory waste, defeats the substrate's per-process MeshNode model).
-4. **Cancellation: asyncio cancellation fires `Mesh::cancel(token)`.** When a Python `asyncio.Task` is cancelled, the in-flight Rust future receives the cancel signal via the v3 `CancelRegistry`. Mirrors the napi `AbortSignal` → `Mesh::cancel(token)` wiring shipped in C-A1. The Python typed `Cancellable` class stays as the explicit-cancel surface; asyncio cancellation becomes the implicit/ambient surface. Both reduce to the same substrate primitive.
-5. **Streaming: `async for chunk in stream` (PEP 525 async iterators).** Every streaming response (`AsyncRpcStream`, `AsyncTypedRpcStream`, the async duplex stream half) implements `__aiter__` + `__anext__`. The sync iterators (`__iter__` + `__next__`) stay on the sync classes; no class implements both protocols.
-6. **Async server handlers are first-class.** A handler registered with `async_rpc.serve_async("svc", async_handler_fn)` runs as a coroutine inside the tokio runtime, never blocking the substrate dispatch task. Sync handlers registered against `MeshRpc.serve("svc", sync_fn)` still run under `tokio::task::spawn_blocking` (existing behavior). Both can run against the same mesh.
-7. **Observer / metrics: unchanged.** v3's bounded-mpsc + drop-counter design already isolates observer dispatch from the call hot path; the observer callable runs in a tokio worker that acquires the GIL. Whether the callable is `def` or `async def` is an internal question — for now keep `def`-only and surface async observers as a deferred follow-up if real consumers need it.
-8. **Typed wrapper is its own class.** `AsyncTypedMeshRpc(raw: AsyncMeshRpc)` parallels `TypedMeshRpc(raw: MeshRpc)`. The `__init__` accepts either the raw async pyo3 class or a duck-typed test stub (mirrors the sync typed wrapper's pattern). No shared base class — Python's inheritance model would force protocol-level abstractions that hurt readability without buying composition value.
-9. **Single wheel ships both.** No feature flag, no opt-in, no `pip install net-mesh[async]`. The async surface is part of `net-mesh` from the first release that lands it. The dependency footprint is ~1 crate (`pyo3-async-runtimes`) which doesn't grow the wheel measurably.
+1. **Naming: `AsyncFoo` parallel to `Foo`** for every sync class with async-worthy methods. Matches `httpx.Client` / `httpx.AsyncClient`, `sqlalchemy.Session` / `AsyncSession`. Rejected: `acall` / `async_method` on the existing class (clutters every class; forces users to learn both surfaces), `net.async_` import path (drives module-name drift). Module-level functions get an `async_` prefix when they have async I/O (`async_blob_publish`, etc.) — Python lacks first-class function pairing, so the prefix is the cleanest disambiguator.
+2. **Async bridge: `pyo3-async-runtimes` (tokio backend).** Maintained successor to `pyo3-asyncio`; version-locks to pyo3 0.28 (current). One process-wide bridge initialized in the pymodule init.
+3. **Shared tokio runtime across sync + async.** The `Arc<Runtime>` `NetMesh` constructs is the same runtime used for `block_on` (sync calls) and `future_into_py` (async calls). One process = one tokio runtime.
+4. **Shared `MeshNode` across sync + async classes.** `AsyncMeshRpc(net_mesh)` and `MeshRpc(net_mesh)` reach the same `Arc<MeshNode>`; a server registered via `MeshRpc.serve(...)` is callable from `AsyncMeshRpc.call(...)` and vice versa. Same for every other adapter (NetDb, Redex, DaemonRuntime, etc.) — the async class is a different Python-side wrapper over the same Rust state.
+5. **Cancellation: asyncio task cancel → substrate `Mesh::cancel(token)`** at every async I/O entrypoint. Implemented once as a shared helper (`async_with_cancel!` macro or a `fn await_with_cancel<F: Future<Output = Result<T, E>>>(py: Python, node: &MeshNode, fut: F) -> PyResult<...>` adapter) and applied uniformly. For non-mesh subsystems that don't have a CancelRegistry (e.g., redis_dedup), use a per-call `Arc<Notify>` that the Python-task-cancel closure trips.
+6. **Streaming: PEP 525 async iterators** (`__aiter__` + `__anext__`) for every push-stream class. Server-pushed streams (`RedexTailIter`, `MemoryWatchIter`, `TaskWatchIter`, `SnapshotStream`, `StatusSummaryStream`) get parallel `AsyncRedexTailIter`, etc. The sync iterators stay; no class implements both protocols.
+7. **Async server handlers / callbacks where applicable.** Modules that take user-supplied callables (`MeshRpc.serve` handlers, daemon factories, `MeshBlobAdapter` hooks, deck operator-policy verifiers, redis dedup callbacks) detect `inspect.iscoroutinefunction(fn)` at register time and route async fns through a coroutine-driving path; sync fns keep their `spawn_blocking` path. Branch is per-callback at register time, no per-invocation cost.
+8. **Typed wrappers ride along.** Where a sync typed wrapper exists (today: only `mesh_rpc.py::TypedMeshRpc`), an `AsyncTypedFoo` parallel class lives in the same file. Future typed wrappers (MeshDB query DSL, etc.) get async siblings under the same convention.
+9. **Single wheel, no feature flag.** `pyo3-async-runtimes` becomes a default dep on the `net` Cargo feature (everything else cascades). Wheel grows ~50 KB; not worth the install-path bifurcation.
+10. **No public API change to existing classes.** No method moves from sync `Foo` to async `Foo` even if it would be philosophically cleaner — the goal is "side by side," and existing users seeing a method disappear is a regression. Cleanups land in a separate v0.x+1 plan if they're worth doing.
 
-Tagged `[A | B | C | T | D]`:
+Tagged `[F | T1 | T2 | T3 | TX | D]`:
 
-- **A** — raw pyo3 async client (caller-side: unary + streaming + cancel)
-- **B** — Python typed async wrapper (`AsyncTypedMeshRpc` + streaming wrappers)
-- **C** — async server handlers (raw + typed)
-- **T** — tests (raw-layer pytest-asyncio + typed-layer round-trip + sync/async interop)
-- **D** — docs + migration notes
+- **F** — foundations (pyo3-async-runtimes setup, cancel-bridge helper, async-iter adapter pattern, the migration template)
+- **T1** — connection foundations (NetMesh, NetStream, mesh_rpc raw + typed) — everything else builds on these
+- **T2** — production essentials (cortex, compute, groups, blob)
+- **T3** — operator / specialty (deck, meshos, meshdb, aggregator, redis_dedup)
+- **TX** — cross-cutting tests (sync × async interop matrix, observer back-pressure under async load, cancellation)
+- **D** — docs (per-tier docstring updates + a top-level migration guide)
 
 ---
 
 ## Status
 
-| ID    | Pri | Area            | Title                                                                                                                  |
-|-------|-----|-----------------|------------------------------------------------------------------------------------------------------------------------|
-| A-1   | H   | pyo3 / deps     | Add `pyo3-async-runtimes` dep + initialize the tokio↔asyncio bridge in `_net::register`                                |
-| A-2   | H   | pyo3 raw        | `_net.AsyncMeshRpc` class wrapping `MeshNode`; async `call` / `call_service` / `find_service_nodes` returning awaitables |
-| A-3   | H   | pyo3 raw        | Async streaming: `call_streaming` returns an async iterator; `AsyncRpcStream.__anext__` awaits one chunk from the SDK stream |
-| A-4   | H   | pyo3 raw        | Async client-streaming: `call_client_stream` → `AsyncClientStreamCall` with awaitable `send` + `finish`                |
-| A-5   | H   | pyo3 raw        | Async duplex: `call_duplex` → `AsyncDuplexCall` with awaitable `send` / `finish_sending` / async-iter receive          |
-| A-6   | H   | pyo3 raw        | asyncio cancellation propagation: cancel-on-task-cancel reuses the v3 `Mesh::cancel(token)` primitive                  |
-| B-1   | H   | typed wrapper   | `AsyncTypedMeshRpc(raw)` with async typed `call` / `call_service` (codec + raw await)                                  |
-| B-2   | H   | typed wrapper   | `AsyncTypedMeshRpc.call_streaming` returning `AsyncTypedRpcStream` (typed `async for`)                                 |
-| B-3   | H   | typed wrapper   | `AsyncTypedMeshRpc.call_client_stream` → `AsyncTypedClientStreamCall`                                                   |
-| B-4   | H   | typed wrapper   | `AsyncTypedMeshRpc.call_duplex` → `AsyncTypedDuplexCall` / `AsyncTypedDuplexSink` / `AsyncTypedDuplexStream`           |
-| C-1   | M   | pyo3 server     | Detect `async def` handlers on `AsyncMeshRpc.serve` / `serve_client_stream` / `serve_duplex`; run as coroutines        |
-| C-2   | M   | typed wrapper   | `AsyncTypedMeshRpc.serve` / `serve_client_stream` / `serve_duplex` accept async handlers                                |
-| T-1   | H   | tests           | pytest-asyncio round-trip — async caller × sync server, sync caller × async server, async × async (all four shapes)   |
-| T-2   | H   | tests           | Async cancellation: `asyncio.wait_for(..., timeout)` cancels in-flight call cleanly, server observes CANCEL            |
-| T-3   | M   | tests           | Async streaming back-pressure: slow consumer doesn't starve the substrate                                              |
-| D-1   | M   | docs            | `bindings/python/README.md` async section + migration cookbook (mixing sync + async, sharing one NetMesh)              |
+### Wave 0 — Foundations
 
-**ABI / SDK surface impact.** No substrate change. No rpc-ffi ABI bump. The Python `_net` pyo3 module gains new exported symbols (`AsyncMeshRpc`, `AsyncRpcStream`, etc.) — additive only; nothing existing is renamed or removed. Wheel size +1 dependency (`pyo3-async-runtimes`, ~50 KB compiled).
+| ID    | Pri | Area               | Title                                                                                                                |
+|-------|-----|--------------------|----------------------------------------------------------------------------------------------------------------------|
+| F-1   | H   | deps / module init | Add `pyo3-async-runtimes` dep; init `tokio::init_with_runtime(&runtime)` in the pymodule init (once per process)     |
+| F-2   | H   | shared helper      | `await_with_cancel<F>` adapter that mints a substrate cancel-token, binds it to asyncio task cancellation, awaits F  |
+| F-3   | H   | shared helper      | `AsyncIter` derive-style trait helper for streaming classes (`__aiter__` returns self, `__anext__` returns awaitable) |
+| F-4   | M   | code-review        | Document the `block_on → future_into_py` migration template + checklist in `bindings/python/src/README.md`           |
+
+### Wave T1 — Connection foundations
+
+| ID     | Pri | Area              | Title                                                                                                              |
+|--------|-----|-------------------|--------------------------------------------------------------------------------------------------------------------|
+| T1-A1  | H   | pyo3 / NetMesh    | `AsyncNetMesh`: `connect` / `accept` / async streams enumeration; share the same `MeshNode` as `NetMesh`           |
+| T1-A2  | H   | pyo3 / NetStream  | `AsyncNetStream`: awaitable `send`, async-iter `recv`; back-pressure-aware                                          |
+| T1-A3  | H   | pyo3 / mesh_rpc   | `AsyncMeshRpc.call` / `call_service` / `find_service_nodes` (async unary + sync local lookup)                       |
+| T1-A4  | H   | pyo3 / mesh_rpc   | `AsyncMeshRpc.call_streaming` → `AsyncRpcStream` with `__aiter__` / `__anext__`                                    |
+| T1-A5  | H   | pyo3 / mesh_rpc   | `AsyncMeshRpc.call_client_stream` → `AsyncClientStreamCall` (awaitable `send` / `finish`)                          |
+| T1-A6  | H   | pyo3 / mesh_rpc   | `AsyncMeshRpc.call_duplex` → `AsyncDuplexCall` / `AsyncDuplexSink` / `AsyncDuplexStream`                            |
+| T1-A7  | H   | pyo3 / mesh_rpc   | `AsyncMeshRpc.serve` / `serve_client_stream` / `serve_duplex`: detect `async def` handlers; coroutine path         |
+| T1-B1  | H   | typed wrapper     | `AsyncTypedMeshRpc.call` / `call_service` (codec + raw await) in `python/net/mesh_rpc.py`                          |
+| T1-B2  | H   | typed wrapper     | `AsyncTypedMeshRpc.call_streaming` / `AsyncTypedRpcStream` (typed `async for`)                                     |
+| T1-B3  | H   | typed wrapper     | `AsyncTypedMeshRpc.call_client_stream` / `AsyncTypedClientStreamCall`                                              |
+| T1-B4  | H   | typed wrapper     | `AsyncTypedMeshRpc.call_duplex` / `AsyncTypedDuplexCall` / sink / stream halves                                    |
+| T1-B5  | M   | typed wrapper     | `AsyncTypedMeshRpc.serve*` accept `async def` handlers; codec-wrap them                                            |
+
+### Wave T2 — Production essentials
+
+| ID     | Pri | Area               | Title                                                                                                              |
+|--------|-----|--------------------|--------------------------------------------------------------------------------------------------------------------|
+| T2-C1  | H   | pyo3 / cortex      | `AsyncNetDb`: async `get` / `put` / `delete` / `list` / `batch_put`                                                |
+| T2-C2  | H   | pyo3 / cortex      | `AsyncRedex` + `AsyncRedexFile` + `AsyncRedexTailIter` (`async for evt in file.tail(from_seq)`)                    |
+| T2-C3  | H   | pyo3 / cortex      | `AsyncMemoriesAdapter` + `AsyncMemoryWatchIter` (async `put` / `get` / `watch`)                                    |
+| T2-C4  | H   | pyo3 / cortex      | `AsyncTasksAdapter` + `AsyncTaskWatchIter` (async `submit` / `claim` / `complete` / `watch`)                       |
+| T2-D1  | H   | pyo3 / compute     | `AsyncDaemonRuntime`: async `register_kind` / `spawn` / `wait` / `migrate`                                          |
+| T2-D2  | H   | pyo3 / compute     | `AsyncDaemonHandle` + `AsyncMigrationHandle` (await on lifecycle events)                                            |
+| T2-E1  | M   | pyo3 / groups      | `AsyncReplicaGroup` / `AsyncForkGroup` / `AsyncStandbyGroup`: async `spawn` / `health` / `migrate` / `await_member` |
+| T2-F1  | H   | pyo3 / blob        | `AsyncMeshBlobAdapter` + module-level `async_blob_publish` / `async_blob_resolve`                                  |
+| T2-F2  | M   | pyo3 / blob        | Async hook support in `register_blob_adapter` (detect `async def` adapter hooks)                                    |
+
+### Wave T3 — Operator / specialty
+
+| ID     | Pri | Area                | Title                                                                                                              |
+|--------|-----|---------------------|--------------------------------------------------------------------------------------------------------------------|
+| T3-G1  | M   | pyo3 / deck         | `AsyncDeckClient`: async `connect` / `admin` / `snapshot` / `status` / `audit` / `logs`                            |
+| T3-G2  | M   | pyo3 / deck         | `AsyncSnapshotStream` + `AsyncStatusSummaryStream` (async-iter the server-pushed streams)                          |
+| T3-G3  | L   | pyo3 / deck         | `AsyncAdminCommands` / `AsyncIceCommands` (async admin-action commits)                                              |
+| T3-H1  | M   | pyo3 / meshos       | `AsyncMeshOsDaemonSdk` + `AsyncMeshOsDaemonHandle` (async `receive` / `publish_log` / `graceful_shutdown`)         |
+| T3-I1  | M   | pyo3 / meshdb       | `AsyncMeshQueryRunner.execute` returning an awaitable; query AST classes stay sync (pure data)                     |
+| T3-J1  | M   | pyo3 / aggregator   | `AsyncFoldQueryClient` (async `query` + async-iter `subscribe`); `AsyncRegistryClient`                              |
+| T3-K1  | L   | pyo3 / redis_dedup  | `AsyncRedisStreamDedup` (async `consume` / `ack` / `next`)                                                          |
+
+### Wave TX — Cross-cutting tests
+
+| ID     | Pri | Area               | Title                                                                                                                |
+|--------|-----|--------------------|----------------------------------------------------------------------------------------------------------------------|
+| TX-1   | H   | tests              | `(sync\|async) caller × (sync\|async) server` matrix on every shape (unary, streaming, client-stream, duplex)        |
+| TX-2   | H   | tests              | asyncio cancel propagation: `asyncio.wait_for(..., timeout)` → substrate cancel; orphan registry stays at 0          |
+| TX-3   | M   | tests              | Async observer back-pressure: slow async callable doesn't starve substrate; v3 drop-counter increments under load     |
+| TX-4   | M   | tests              | Async streaming back-pressure: slow async consumer doesn't starve producer; flow-control keeps drops at 0            |
+| TX-5   | M   | tests              | Per-module round-trip: every T2/T3 async class has a smoke test pinning the basic happy path                          |
+
+### Wave D — Docs
+
+| ID     | Pri | Area               | Title                                                                                                                |
+|--------|-----|--------------------|----------------------------------------------------------------------------------------------------------------------|
+| D-1    | M   | docs               | `bindings/python/README.md`: top-level "Async API" section, migration cookbook, mixing-sync-and-async patterns        |
+| D-2    | M   | docs               | Per-module docstring updates (each `Async*` class cross-references its sync sibling; sync sibling notes the async alt)|
+| D-3    | L   | docs               | Type stubs: `_net.pyi` extended with every new `Async*` class so users get IDE completion                            |
+
+**ABI / wheel impact.** No substrate change. No rpc-ffi ABI bump (still 0x0004 per v3). Wheel grows ~50 KB from `pyo3-async-runtimes`. The pyo3 module gains ~25 new `Async*` exported classes; nothing existing is renamed or removed.
 
 ---
 
 ## Phasing
 
-**Recommended order: foundations → caller-side → server-side → tests.**
+**Release strategy:** each tier ships as a separate `net-mesh` PyPI release.
 
-1. **Wave 1 — pyo3 foundations + raw async caller-side (A-1 → A-6).** A-1 lands the dep + module-level runtime wiring; A-2 establishes the pattern for awaiting Rust futures from Python; A-3/A-4/A-5 extend the pattern to streaming shapes; A-6 wires asyncio cancellation to the v3 substrate cancel-token. Each slice is independently testable against the pyo3 layer.
-2. **Wave 2 — typed wrapper (B-1 → B-4).** Pure Python (no Rust). Each slice mirrors the sync typed wrapper structurally; the change set is small per slice (~50 lines) and entirely additive.
-3. **Wave 3 — async server handlers (C-1, C-2).** Detect `inspect.iscoroutinefunction(handler)` at `serve()` time; route async handlers through a coroutine-driving worker instead of `spawn_blocking`. Server-side async unlocks the FastAPI-style pattern where a handler's body awaits downstream calls.
-4. **Wave 4 — tests + docs (T-1, T-2, T-3, D-1).** pytest-asyncio fixtures, four interop combinations, async-cancel pinning, docs.
+1. **Release v0.x — Foundations + T1.** Ship F-1..F-4 + T1-A1..T1-B5 in one cut. After this, asyncio consumers can build entire applications on `AsyncNetMesh` + `AsyncMeshRpc` / `AsyncTypedMeshRpc` without ever touching the sync API. This is the load-bearing release.
+2. **Release v0.x+1 — T2.** Production essentials: cortex (NetDb/Redex/Memories/Tasks), compute (DaemonRuntime), groups, blob. Adds async sibling for every persistent-state and daemon-supervision surface.
+3. **Release v0.x+2 — T3.** Operator + specialty: deck, meshos, meshdb, aggregator, redis_dedup. Wraps up the SDK surface.
+4. **Release v0.x+3 — TX + D polish.** Cross-cutting test matrix lands incrementally during T1/T2/T3 (each tier ships with its own happy-path tests via TX-5); TX-1..TX-4 land alongside D-1..D-3 as the surface stabilizes.
 
-Waves 1+2 can land in one release cycle. Wave 3 can land alongside or as a follow-up. Wave 4 lands incrementally per slice but blocks the v0.x release marker.
+Within each tier, slices are independent — they can land in any order. Mesh-RPC slices (T1-A3..T1-A7) have a natural sequencing (raw before typed) but no other hard dependencies.
 
 ---
 
-## Wave 1 — pyo3 foundations + raw async caller-side
+## Wave 0 — Foundations
 
-### A-1 — `pyo3-async-runtimes` dep + runtime bridge
-
-**Design.**
-- Add `pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }` to `bindings/python/Cargo.toml`. The version tracks the pyo3 we're already on.
-- In `bindings/python/src/lib.rs::register`, before any pymodule setup, call `pyo3_async_runtimes::tokio::init_with_runtime(&runtime)` exactly once. The runtime is the same `Arc<Runtime>` `PyNetMesh` constructs; `pyo3-async-runtimes` borrows it (no double-runtime tax).
-- The bridge is global per pyo3 process — there's only one Python process per `_net` import, so a one-shot `OnceLock` guard around `init_with_runtime` is correct.
-- Document in the module docstring that any consumer constructing their own `NetMesh` shares the global tokio runtime with the async surface.
-
-**Files touched.**
-- `bindings/python/Cargo.toml`.
-- `bindings/python/src/lib.rs` — add `init_with_runtime` call.
-
-**Risk.** Low. `pyo3-async-runtimes` is stable and widely deployed (Polars, RustPython embeddings, etc.). The `init_with_runtime` API has been stable across the past two minor versions.
-
-### A-2 — `_net.AsyncMeshRpc`: async `call` / `call_service` / `find_service_nodes`
+### F-1 — `pyo3-async-runtimes` dep + module bridge
 
 **Design.**
-- New `#[pyclass(name = "AsyncMeshRpc", module = "_net")]` in `bindings/python/src/mesh_rpc.rs`. Same constructor shape as `PyMeshRpc` — takes a `&NetMesh`, clones the underlying `Arc<MeshNode>`.
-- Methods return `PyResult<Bound<PyAny>>` — pyo3-async-runtimes' `future_into_py` converts a Rust future into a Python awaitable. The async function body is the same `node.call(...)` future the sync class block-on's, just unwrapped instead of awaited synchronously.
-- `find_service_nodes` is non-async on the SDK side (it's a sync DashMap read) — expose as a normal `def` method on `AsyncMeshRpc` too. Don't fake-async sync work.
-- Error mapping reuses the existing `rpc_error_to_pyerr` helper.
-- Drop-on-cancel comes for free: when the Python coroutine is cancelled, pyo3-async-runtimes aborts the underlying tokio task, which drops the Rust future and fires the SDK's `UnaryCallGuard::Drop` → CANCEL on the wire. (A-6 builds on this with explicit substrate cancel for the cancel-on-task-cancel race window.)
+- Add `pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }` to `bindings/python/Cargo.toml`. Version-locked to pyo3 0.28.
+- In `bindings/python/src/lib.rs::_net` pymodule init, before any other setup: call `pyo3_async_runtimes::tokio::init_with_runtime(&runtime)` under a `OnceLock` guard. The runtime is the shared `Arc<Runtime>` `PyNetMesh` already owns.
+- Document the global-bridge invariant in the lib.rs module docstring: "any consumer constructing their own NetMesh shares one tokio runtime with the async surface."
 
-**Files touched.**
-- `bindings/python/src/mesh_rpc.rs` — new `PyAsyncMeshRpc` struct + 3 methods.
-- `bindings/python/src/lib.rs::register` — add `PyAsyncMeshRpc` to the pymodule.
-- `bindings/python/python/net/__init__.py` — re-export `AsyncMeshRpc` from `_net`.
+**Files touched.** `bindings/python/Cargo.toml`, `bindings/python/src/lib.rs`.
 
-### A-3 — Async streaming: `call_streaming` → `AsyncRpcStream`
+### F-2 — `await_with_cancel` shared helper
 
 **Design.**
-- `AsyncMeshRpc.call_streaming(target, service, req, opts)` returns an awaitable that resolves to an `AsyncRpcStream` (a new pyo3 class). The construction-side `block_on` is replaced by `future_into_py` over the same `node.call_streaming(...).await`.
-- `AsyncRpcStream` holds `Arc<Mutex<Option<InnerRpcStream>>>` (same shape as the sync `PyRpcStream`). Exposes:
-  - `__aiter__(slf)` returns `slf` (PEP 525 async-iterable contract).
-  - `__anext__(slf)` returns an awaitable that resolves to a `bytes` chunk or raises `StopAsyncIteration` on clean EOF. Internally: take the stream lock, pull `InnerRpcStream::next().await`, release lock, return Python `bytes`.
-  - `close()` runs synchronously (just drops the inner stream); `async def aclose()` is a thin awaitable alias for consistency.
-- The async-iter contract requires that `__anext__` is callable repeatedly; each call returns a fresh awaitable. The Rust side wraps each pull in `future_into_py` per call.
-
-**Files touched.**
-- `bindings/python/src/mesh_rpc.rs` — new `PyAsyncRpcStream` + the `call_streaming` method.
-
-### A-4 — Async client-streaming: `call_client_stream` → `AsyncClientStreamCall`
-
-**Design.**
-- Mirror of A-3 for the client-streaming shape. `AsyncMeshRpc.call_client_stream(target, service, opts)` returns an awaitable yielding `AsyncClientStreamCall`.
-- `AsyncClientStreamCall` exposes:
-  - `async def send(body: bytes)` — awaits one upload credit + sends.
-  - `async def finish() -> bytes` — drains the terminal response.
-  - `def close()` / `async def aclose()` — drop the call.
-  - `call_id` property (sync read — just returns the cached u64).
-- Each method body is `future_into_py(py, async move { call.send(body).await })` pattern.
-
-**Files touched.**
-- `bindings/python/src/mesh_rpc.rs` — new `PyAsyncClientStreamCall` + the method.
-
-### A-5 — Async duplex: `call_duplex` → `AsyncDuplexCall`
-
-**Design.**
-- `AsyncMeshRpc.call_duplex(target, service, opts)` → awaitable yielding `AsyncDuplexCall`.
-- `AsyncDuplexCall`:
-  - `async def send(body: bytes)`.
-  - `async def finish_sending()`.
-  - `__aiter__` / `__anext__` for the receive half (yields `bytes`).
-  - `async def into_split() -> Tuple[AsyncDuplexSink, AsyncDuplexStream]` — splits like the sync version. The two halves are independent classes; cancellation transfers (per the substrate's keep-alive pattern from v3 C-S1 pt2).
-- `AsyncDuplexSink`: `send`, `finish`, `close`/`aclose`.
-- `AsyncDuplexStream`: `__aiter__` + `__anext__`, `close`/`aclose`.
-
-**Files touched.**
-- `bindings/python/src/mesh_rpc.rs` — three new pyclasses + the method.
-
-### A-6 — asyncio cancellation propagation
-
-**Design.**
-- pyo3-async-runtimes' `future_into_py_with_locals` (or the equivalent) takes a `CancellationToken` from `tokio_util::sync::CancellationToken` — when the Python task is cancelled, the token fires. We bind that token to a substrate cancel-token: before each call, mint `cancel_token = node.reserve_cancel_token()`, populate `opts.cancel_token`, and on the Python task's cancel signal call `node.cancel(cancel_token)`.
-- Implementation pattern (mirrors the napi v3 C-A1 wiring):
+- New helper in a new module `bindings/python/src/async_bridge.rs`:
   ```rust
-  let cancel_token = self.node.reserve_cancel_token();
-  let mut opts = opts.clone();
-  opts.cancel_token = Some(cancel_token);
-  let node_for_cancel = self.node.clone();
-  let fut = async move {
-      tokio::select! {
-          result = node.call(target, service, req, opts) => result,
-          _ = py_cancel_signal.cancelled() => Err(InnerRpcError::Cancelled),
-      }
-  };
-  future_into_py(py, fut)
+  pub fn await_with_cancel<F, T, E>(
+      py: Python<'_>,
+      node: &Arc<MeshNode>,
+      build_fut: impl FnOnce(Option<u64>) -> F,
+  ) -> PyResult<Bound<'_, PyAny>>
+  where
+      F: Future<Output = Result<T, E>> + Send + 'static,
+      T: IntoPyObject + Send + 'static,
+      E: Into<PyErr> + Send + 'static,
   ```
-- On the substrate side this needs no new work — `CancelRegistry` already pre-arms `Notify` on race-with-register, and the call's `select!` arm already short-circuits to `RpcError::Cancelled`. The "cancel signal" plumbing is purely on the pyo3 side.
-- Streaming variants get the same treatment: construction is cancellable via the same mechanism, and the substrate's `spawn_stream_cancel_watcher` (from C-S1 pt2) handles mid-stream cancel through the same `CancelRegistry` entry.
+  Mints `cancel_token = node.reserve_cancel_token()`, builds the call's future via the caller-supplied closure (which populates `opts.cancel_token = Some(token)`), wraps in a `tokio::select!` between the future and an asyncio-cancel-signal channel, returns a Python awaitable.
+- For subsystems without a `MeshNode` cancel registry (redis_dedup, blob-adapter hooks), parallel helper `await_with_notify` uses an `Arc<Notify>` instead.
+- The asyncio-cancel signal comes from `pyo3-async-runtimes`' `tokio::future_into_py_with_locals` cancellation hook (verify exact API surface — if not directly supported, register a custom callback at coroutine construction time that trips a `tokio_util::sync::CancellationToken`).
 
-**Files touched.**
-- `bindings/python/src/mesh_rpc.rs` — extend every async method body with the cancel-token plumbing.
+**Files touched.** `bindings/python/src/async_bridge.rs` (new), `bindings/python/src/lib.rs` (mod declaration).
 
-**Risk.** pyo3-async-runtimes' cancellation hook surface may need a small adapter — confirm the exact API on the chosen version before implementing. If the API doesn't expose a `CancellationToken` directly, fall back to a per-call `Arc<Notify>` that the Python-task-cancellation closure trips.
+### F-3 — Async-iter trait helper
+
+**Design.**
+- Many streaming classes need the same `__aiter__` (returns self) + `__anext__` (awaitable yielding the next item) shape. Factor into a documented pattern + an optional helper macro.
+- Pattern:
+  ```rust
+  #[pyclass(name = "AsyncFooIter")]
+  pub struct PyAsyncFooIter { inner: Arc<Mutex<Option<InnerStream>>> }
+
+  #[pymethods]
+  impl PyAsyncFooIter {
+      fn __aiter__(slf: PyRef<Self>) -> PyRef<Self> { slf }
+      fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+          let inner = self.inner.clone();
+          pyo3_async_runtimes::tokio::future_into_py(py, async move {
+              let mut guard = inner.lock();
+              let Some(stream) = guard.as_mut() else {
+                  return Err(PyStopAsyncIteration::new_err(()));
+              };
+              match stream.next().await {
+                  Some(item) => Ok(item),
+                  None => Err(PyStopAsyncIteration::new_err(())),
+              }
+          })
+      }
+  }
+  ```
+- Document in `bindings/python/src/README.md` so every wave-T2/T3 slice applies the same shape.
+
+**Files touched.** `bindings/python/src/README.md` (new pattern doc — code is per-class, no shared module needed beyond the convention).
+
+### F-4 — Migration template + checklist
+
+**Design.**
+- One-page doc in `bindings/python/src/README.md`:
+  - Before: `fn foo(&self, py: Python<'_>, ...) -> PyResult<...>` with `runtime.block_on(...)` inside `py.detach`.
+  - After: `fn foo<'py>(&self, py: Python<'py>, ...) -> PyResult<Bound<'py, PyAny>>` calling `await_with_cancel`.
+  - Error mapping reuses the existing `rpc_error_to_pyerr` / `cortex_error_to_pyerr` / etc. helpers — async path uses the same mappers, no duplication.
+- Checklist for code review:
+  - [ ] `Async*` class name matches the `Foo` it parallels.
+  - [ ] Constructor accepts the same arguments as the sync sibling (so `NetMesh` instances can be passed to either).
+  - [ ] Every awaitable method uses `await_with_cancel` (no raw `future_into_py`) — cancellation is non-negotiable.
+  - [ ] Streaming class has `__aiter__` + `__anext__`, not `__iter__` + `__next__`.
+  - [ ] Sync sibling docstring cross-references the async class; async docstring cross-references the sync class.
+
+**Files touched.** `bindings/python/src/README.md`.
 
 ---
 
-## Wave 2 — Python typed async wrapper
+## Wave T1 — Connection foundations
 
-### B-1 — `AsyncTypedMeshRpc` shell + async `call` / `call_service`
-
-**Design.**
-- New class in `bindings/python/python/net/mesh_rpc.py` (same file as the sync `TypedMeshRpc` — pure-Python wrappers all colocate).
-- `AsyncTypedMeshRpc.__init__(self, raw)` accepts an `AsyncMeshRpc` (the new pyo3 class) or any duck-typed equivalent for testing.
-- `async def call(target, service, req, opts=None) -> Resp`: encode `req` with the existing `_json_encode` helper, await `self._raw.call(target, service, body, opts)`, decode the response with `_json_decode`. The encode/decode error paths reuse the existing `RpcCodecError` mapping — no change.
-- `async def call_service` is structurally identical.
-- The sync `TypedMeshRpc` stays untouched.
-
-**Files touched.**
-- `bindings/python/python/net/mesh_rpc.py` — new class.
-- `bindings/python/python/net/__init__.py` — re-export `AsyncTypedMeshRpc`.
-
-### B-2 — `AsyncTypedMeshRpc.call_streaming` → `AsyncTypedRpcStream`
+### T1-A1 / T1-A2 — `AsyncNetMesh` + `AsyncNetStream`
 
 **Design.**
-- Same encoding shape as B-1. The `AsyncRpcStream` (pyo3) returns raw `bytes`; `AsyncTypedRpcStream` decodes each chunk to the user's `Resp` type with `_json_decode`.
-- Implements `__aiter__` + `__anext__` — `__anext__` awaits `self._raw.__anext__()`, decodes the bytes, returns the typed value. Codec failure raises `RpcCodecError` and closes the underlying stream (mirrors the sync wrapper's contract).
+- `AsyncNetMesh(keypair, [config])` — same constructor signature as `NetMesh`.
+- Async methods: `connect(target)`, `accept_stream(...)`, anything else that today does `runtime.block_on` inside the sync `NetMesh`.
+- `AsyncNetStream`: `async def send(payload)`, `async def recv()` (or `__anext__` if the underlying surface is stream-shaped). Stats accessor stays sync (it's a DashMap read).
+- Sync `NetMesh.streams()` / `connect()` etc. stay untouched.
 
-**Files touched.**
-- `bindings/python/python/net/mesh_rpc.py` — new `AsyncTypedRpcStream`.
+**Files touched.** `bindings/python/src/lib.rs` (the NetMesh / NetStream pyclass section — split into a `mesh.rs` if the file gets too large).
 
-### B-3 — `AsyncTypedMeshRpc.call_client_stream` → `AsyncTypedClientStreamCall`
+### T1-A3..T1-A7 — `AsyncMeshRpc` raw client + server
 
-**Design.**
-- `AsyncTypedClientStreamCall.send(value)` encodes `value` and awaits `raw.send(body)`.
-- `AsyncTypedClientStreamCall.finish() -> Resp` awaits `raw.finish()` and decodes.
-- `async def aclose()` for explicit close; `__aenter__` / `__aexit__` for `async with` support.
+**Design.** As detailed in the original draft of this plan (Wave 1 sections, pre-revision):
+- `AsyncMeshRpc.call` / `call_service` / `find_service_nodes` (T1-A3).
+- `AsyncMeshRpc.call_streaming` → `AsyncRpcStream` (T1-A4).
+- `AsyncMeshRpc.call_client_stream` → `AsyncClientStreamCall` (T1-A5).
+- `AsyncMeshRpc.call_duplex` → `AsyncDuplexCall` + halves (T1-A6).
+- `AsyncMeshRpc.serve` / `serve_client_stream` / `serve_duplex` with `inspect.iscoroutinefunction` detection (T1-A7).
 
-**Files touched.**
-- `bindings/python/python/net/mesh_rpc.py` — new `AsyncTypedClientStreamCall`.
+Every awaitable method routes through `await_with_cancel` from F-2.
 
-### B-4 — `AsyncTypedMeshRpc.call_duplex` → `AsyncTypedDuplexCall` + sink/stream halves
+**Files touched.** `bindings/python/src/mesh_rpc.rs`.
 
-**Design.**
-- `AsyncTypedDuplexCall.send(value)` encodes + awaits.
-- `__aiter__` + `__anext__` for the receive side.
-- `async def into_split() -> Tuple[AsyncTypedDuplexSink, AsyncTypedDuplexStream]`.
-- `AsyncTypedDuplexSink`: `send(value)`, `finish()`, `aclose()`.
-- `AsyncTypedDuplexStream`: async iterator over decoded `Resp` values.
+### T1-B1..T1-B5 — `AsyncTypedMeshRpc` typed wrapper
 
-**Files touched.**
-- `bindings/python/python/net/mesh_rpc.py` — three new classes.
+**Design.** Pure Python in `python/net/mesh_rpc.py`. Parallel `Async`-prefixed classes for every existing sync typed class: `AsyncTypedMeshRpc`, `AsyncTypedRpcStream`, `AsyncTypedClientStreamCall`, `AsyncTypedDuplexCall`, `AsyncTypedDuplexSink`, `AsyncTypedDuplexStream`, `AsyncTypedRequestStream`, `AsyncTypedResponseSink`. Each encodes / decodes JSON the same way the sync wrapper does; the only difference is `await self._raw.foo(...)` vs `self._raw.foo(...)`.
+
+**Files touched.** `bindings/python/python/net/mesh_rpc.py` (extend the existing file), `bindings/python/python/net/__init__.py` (re-exports).
 
 ---
 
-## Wave 3 — Async server-side handlers
+## Wave T2 — Production essentials
 
-### C-1 — Raw async handler detection + coroutine bridge
+For each module: per-class slice list + same-shape rules (mint cancel-token, return awaitable, async-iter for push streams). Detailed slice-level designs land in per-tier follow-up plan docs as the work begins; the structure here is the contract.
 
-**Design.**
-- `AsyncMeshRpc.serve(service, handler)` accepts either a `def` or `async def` handler. Detection at register time: `inspect.iscoroutinefunction(handler)` (Python side) or, since the Rust side receives a `Py<PyAny>`, check `handler.is_coroutine_function(py)` via a helper.
-- For an async handler, the existing `PyRpcHandler` adapter changes its `on_request` to: acquire the GIL, call the handler (returning a coroutine), pass the coroutine to `pyo3_async_runtimes::tokio::into_future` to convert it to a Rust future, await that future. No `spawn_blocking` — the coroutine awaits cooperatively, freeing the thread between awaits.
-- Sync handlers continue to use the existing `spawn_blocking` path. The branch is per-handler at register time, so no per-request cost for the sync majority.
-- `serve_client_stream` and `serve_duplex` get the same treatment — async handlers receive `AsyncRequestStream` / `AsyncResponseSink` wrappers instead of the sync flavors.
+### T2-C1..T2-C4 — `cortex.rs` (NetDb / Redex / Memories / Tasks)
 
-**Files touched.**
-- `bindings/python/src/mesh_rpc.rs` — branch `PyRpcHandler::on_request` on handler-coroutine-ness; new async-context shims for the streaming server shapes.
+**Per-class async surface:**
 
-### C-2 — Typed async server wrappers
+- `AsyncNetDb`: async `get` / `put` / `delete` / `list` / `batch_put`. Sync iterators (`list`) become async iterators.
+- `AsyncRedex`: async `open` / `append` (`AsyncRedexFile.append`), tail returns `AsyncRedexTailIter`.
+- `AsyncMemoriesAdapter`: async `put` / `get` / `delete` / `list`; `watch` returns `AsyncMemoryWatchIter`.
+- `AsyncTasksAdapter`: async `submit` / `claim` / `complete` / `fail` / `list`; `watch` returns `AsyncTaskWatchIter`.
+- All four watch / tail iterators implement `__aiter__` + `__anext__` per F-3 pattern.
 
-**Design.**
-- `AsyncTypedMeshRpc.serve(service, handler)` accepts `async def handler(req: Req) -> Resp`. Wraps the user's coroutine with codec encode/decode (`_json_encode` outbound, `_json_decode` inbound), passes the wrapped coroutine to the raw `serve` from C-1.
-- `serve_client_stream` and `serve_duplex` similarly.
+**Files touched.** `bindings/python/src/cortex.rs`.
 
-**Files touched.**
-- `bindings/python/python/net/mesh_rpc.py` — extend `AsyncTypedMeshRpc` with server methods.
+### T2-D1..T2-D2 — `compute.rs` (DaemonRuntime + handles)
+
+**Per-class async surface:**
+
+- `AsyncDaemonRuntime`: async `register_kind` (probably sync — registration is local), async `spawn` (RPC under hood), async `migrate`, async `list_daemons`.
+- `AsyncDaemonHandle`: async `wait`, async `migrate`, async `terminate`, async-iter `events` (causal event stream).
+- `AsyncMigrationHandle`: async `wait`, async `cancel`.
+- `CausalEvent` stays sync (pure data class).
+
+**Files touched.** `bindings/python/src/compute.rs`.
+
+### T2-E1 — `groups.rs` (Replica / Fork / Standby)
+
+**Per-class async surface:**
+
+- `AsyncReplicaGroup` / `AsyncForkGroup` / `AsyncStandbyGroup`:
+  - async `spawn` (constructor — returns awaitable yielding the group handle).
+  - async `health`, `await_member`, `migrate`, `terminate`.
+  - Group iteration (`__iter__` over members) stays sync (snapshot read).
+
+**Files touched.** `bindings/python/src/groups.rs`.
+
+### T2-F1..T2-F2 — `blob.rs` (dataforts)
+
+**Per-class async surface:**
+
+- `AsyncMeshBlobAdapter`: async `publish` / `resolve` / `delete`.
+- Module-level: `async_blob_publish(ref, data)`, `async_blob_resolve(ref)`. Sync `blob_publish` / `blob_resolve` stay.
+- `register_blob_adapter` accepts adapter objects whose hooks are `async def` — wraps with `pyo3_async_runtimes::tokio::into_future` per call.
+
+**Files touched.** `bindings/python/src/blob.rs`.
 
 ---
 
-## Wave 4 — Tests + docs
+## Wave T3 — Operator / specialty
 
-### T-1 — pytest-asyncio round-trip suite
+Same shape as T2 — full slice-level design lives in per-tier follow-up plan docs. Per-module class lists:
 
-**Design.**
-- New test file `bindings/python/tests/test_mesh_rpc_async.py` (sibling to the existing `test_mesh_rpc.py`).
-- pytest-asyncio fixture builds a two-node mesh + handshakes them (reuses `test_mesh_rpc.py`'s `mesh_pair` fixture if exportable; otherwise duplicate).
-- Four interop tests for every call shape (unary, server-streaming, client-streaming, duplex):
-  - async caller × async server
-  - async caller × sync server
-  - sync caller × async server
-  - sync caller × sync server (regression — the original case continues to work)
-- Each test asserts the response shape; same fixture data as the existing sync tests.
+- **T3-G1..T3-G3 (deck):** `AsyncDeckClient`, `AsyncSnapshotStream`, `AsyncStatusSummaryStream`, `AsyncAdminCommands`, `AsyncIceCommands`. Operator-policy verifier hooks (`AdminVerifier` callbacks) accept `async def` verifiers.
+- **T3-H1 (meshos):** `AsyncMeshOsDaemonSdk`, `AsyncMeshOsDaemonHandle`. Daemon-author surfaces (`receive`, `publish_log`, `graceful_shutdown`) become awaitable.
+- **T3-I1 (meshdb):** `AsyncMeshQueryRunner.execute` returns an awaitable yielding `ResultRow` / `AggregateResult` / `JoinedRow` per shape. Query AST classes (`Predicate`, `MeshQuery`, `QueryBuilder`, `WindowBoundary`, `GroupKey`, `LineageEntry`, `ExecuteOptions`, `CachePolicy`) stay sync — they're pure data builders.
+- **T3-J1 (aggregator):** `AsyncFoldQueryClient` (async `query`, async-iter `subscribe`), `AsyncRegistryClient` (async `list` / `spawn` / `scale` / `unregister`).
+- **T3-K1 (redis_dedup):** `AsyncRedisStreamDedup` — Redis is network I/O; the sync surface today blocks per-call. Async-iter `next()` over the inbound stream.
 
-**Files touched.**
-- `bindings/python/tests/test_mesh_rpc_async.py` (new).
-- `bindings/python/pyproject.toml` — add `pytest-asyncio` to dev deps if not already there.
+---
 
-### T-2 — Async cancellation pinning
+## Wave TX — Cross-cutting tests
 
-**Design.**
-- `asyncio.wait_for(async_rpc.call(...), timeout=0.1)` on a long-running call raises `asyncio.TimeoutError` (which under the hood cancels the inner task); the test asserts:
-  - the call surfaces `asyncio.CancelledError` or `TimeoutError` to the caller,
-  - the server's observer fires a `Cancelled` status event for the call,
-  - no orphan registry entries linger on the substrate (assert via `cancel_registry().len() == 0` after the test settles — exposes via a debug-only test helper if needed).
-- Mirror for streaming: `async for chunk in stream: ...` inside a `wait_for` that times out mid-stream → server observes `Cancelled`.
+### TX-1 — `(sync | async) caller × (sync | async) server` matrix
 
-**Files touched.**
-- `bindings/python/tests/test_mesh_rpc_async.py`.
+**Design.** New `bindings/python/tests/test_async_interop.py`. Per call shape (unary, server-streaming, client-streaming, duplex), four tests:
+- async caller × async server
+- async caller × sync server
+- sync caller × async server
+- sync caller × sync server (regression — the original sync API continues to work)
 
-### T-3 — Back-pressure under slow async consumer
+Two-node mesh fixture; same fixture data as the existing sync `test_mesh_rpc.py`.
 
-**Design.**
-- Server emits 10k chunks to a client whose `async for` body sleeps 1ms per chunk. Assert:
-  - the call completes (no deadlock),
-  - the substrate's per-call response-stream credit window throttles the producer (`ServiceMetrics.streaming_chunks_dropped_total == 0` since flow control should keep emissions bounded),
-  - the consumer ultimately receives all 10k chunks.
+### TX-2 — asyncio cancellation propagation
 
-**Files touched.**
-- `bindings/python/tests/test_mesh_rpc_async.py`.
+**Design.** `asyncio.wait_for(async_rpc.call(...), timeout=0.1)` on a long-running call asserts: caller surfaces `asyncio.TimeoutError`, server's observer fires `Cancelled`, substrate `CancelRegistry::len() == 0` after settling. Mirrors for streaming shapes (cancel mid-`async for`).
 
-### D-1 — Docs
+### TX-3 — Async observer back-pressure
 
-**Design.**
-- New section in `bindings/python/README.md`: "Async API".
-  - Quickstart with `AsyncMeshRpc` example (await unary + async-for streaming).
-  - Mixing sync + async on the same `NetMesh` ("they share a runtime — pick whichever fits the caller").
-  - Cancellation snippet (`asyncio.wait_for`).
-  - Migration cookbook for users who built on the sync API and want to flip a service to async: "the typed wrapper is duck-typed, so an `async def` handler just works inside a sync test as long as the test runs the coroutine via `asyncio.run`."
-- Add an async section to the Python module docstring (`net/__init__.py` and `mesh_rpc.py`).
+**Design.** A `set_observer(async_callable)` whose callable sleeps 100ms per event; fire 2000 events; assert the substrate's bounded-mpsc drops most (per v3 O-A1..O-A3) and the snapshot's `observer_dropped_total` increments correctly. Pins that async callables don't accidentally bypass the v3 back-pressure machinery.
 
-**Files touched.**
-- `bindings/python/README.md`.
-- `bindings/python/python/net/__init__.py` — module docstring extension.
+### TX-4 — Async streaming back-pressure
+
+**Design.** Server emits 10k typed chunks; client's `async for` body sleeps 1ms per chunk. Assert: complete, no drops, flow-control credits stay bounded.
+
+### TX-5 — Per-module smoke tests
+
+**Design.** One happy-path round-trip test per T2/T3 async class lands alongside its slice. Format: `test_async_<module>.py` per module. These are not exhaustive — they pin the surface exists and the basic path works; full coverage is a follow-up.
+
+---
+
+## Wave D — Docs
+
+### D-1 — `bindings/python/README.md` async section
+
+**Design.** New top-level section. Cover:
+- Quickstart: an `AsyncNetMesh` + `AsyncMeshRpc` example with `await rpc.call(...)`.
+- Async-for streaming snippet (`async for chunk in stream: ...`).
+- Mixing sync + async on one `NetMesh` ("they share a runtime — pick whichever fits the caller; a `MeshRpc` server can be called from `AsyncMeshRpc.call` and vice versa").
+- Cancellation: `asyncio.wait_for(...)` / `asyncio.Task.cancel()` integrate transparently.
+- Migration cookbook for users on the sync API who want to move a service to async.
+
+### D-2 — Per-module docstring updates
+
+**Design.** Every `Async*` class docstring cross-references its sync sibling and notes the contract ("same I/O semantics; same MeshNode; awaitable instead of blocking"). The sync sibling's docstring gains a "Async equivalent: `AsyncFoo`" line.
+
+### D-3 — Type stubs
+
+**Design.** Extend `bindings/python/python/net/_net.pyi` with every new `Async*` class. IDE completion is the deliverable; runtime behavior is independent of stubs.
 
 ---
 
 ## Deferred follow-ups (post-this-plan)
 
-1. **Async observers.** `set_observer(async_callable)` — the observer worker would drive the coroutine instead of calling under GIL. Wait for a real consumer who wants this (likely a FastAPI sidecar exporting metrics over async I/O).
-2. **`trio` / `anyio` compatibility.** Right now `pyo3-async-runtimes` is asyncio-only. `anyio` could be supported with a second backend. Wait for a consumer ask — the JS / Go side use platform-native primitives, not a portable abstraction.
-3. **Async circuit breaker + retry helpers.** The sync SDK has `RetryPolicy` / `CircuitBreaker` / `HedgePolicy` orchestration. Async equivalents — `AsyncRetryPolicy` etc. — are mostly mechanical mirrors but defer until the async caller-side is stable and users start asking for them.
-4. **Async `Cancellable` ergonomics.** The current `Cancellable` class is a sync construct (`.cancel()` from another thread). An `AsyncCancellable` that integrates with `asyncio.Event` is possible, but the natural Python-async cancel idiom is `task.cancel()` — wait until there's a demonstrated need.
-5. **Coroutine-handler timeout / deadline mapping.** When a sync handler exceeds its deadline, the substrate aborts the `spawn_blocking` task on its return. With async handlers, deadline expiration could fire `asyncio.CancelledError` inside the coroutine — but only if the handler's body cooperates with cancel points (`await`s on cancellable primitives). Document the caveat; consider an opt-in `@deadline_aware` decorator later.
-6. **AsyncIO + `_net` C extension import-order pitfalls.** If a Python process imports `_net` after asyncio's event loop is already running on a different policy, the `init_with_runtime` call may race. A-1 should pin: `init_with_runtime` is called from the pymodule init, which happens before any user code runs. If a real reproducer surfaces, add a defensive `try_init` that's idempotent.
+1. **`trio` / `anyio` compatibility.** Only asyncio supported initially (via `pyo3-async-runtimes::tokio`). `anyio` could be a second backend if a real consumer asks.
+2. **Async-native typed wrappers for MeshDB / aggregator.** This plan exposes the raw async surface; typed Python wrappers around the query DSL or aggregator client are a follow-up.
+3. **Async `Cancellable` ergonomics.** Today's `Cancellable` is a sync construct. An `AsyncCancellable` that integrates with `asyncio.Event` is possible but the canonical async-cancel idiom is `task.cancel()` — wait for a consumer ask.
+4. **`async with` everywhere.** Many Async* classes will gain `__aenter__` / `__aexit__` for `async with` ergonomics. Where the sync sibling already supports `__enter__` / `__exit__`, mirror; otherwise add only on consumer request.
+5. **Async-native circuit breaker / retry / hedge orchestration.** Sync SDK has `RetryPolicy`, `CircuitBreaker`, `HedgePolicy`. Async equivalents are mostly mechanical mirrors.
+6. **AsyncIO event-loop policy edge cases.** If a Python process embeds `_net` via a non-default asyncio loop policy (uvloop, custom), confirm `pyo3-async-runtimes` plays nicely. Likely fine; defensive: add an integration test under uvloop.
 
 ---
 
 ## Acceptance criteria
 
-- `python -c "from net import AsyncMeshRpc, AsyncTypedMeshRpc"` succeeds on the published wheel.
-- All four `(sync|async) caller × (sync|async) server` combinations pass round-trip in pytest-asyncio.
-- `asyncio.wait_for(async_rpc.call(...), timeout=...)` propagates to a substrate cancel within 50ms (server's observer fires `Cancelled`).
+- `python -c "from net import AsyncMeshRpc, AsyncTypedMeshRpc, AsyncNetMesh, AsyncNetDb, AsyncDaemonRuntime, AsyncReplicaGroup, AsyncMeshBlobAdapter"` succeeds on the v0.x+2 published wheel.
+- TX-1 matrix passes — all four (sync|async)² combinations work on every call shape.
+- `asyncio.wait_for(...)` cancellation propagates to substrate within 50ms across every async method (TX-2).
 - Wheel size delta < 200 KB compared to the v3-final wheel.
-- No sync test regressions — `test_mesh_rpc.py` continues to pass unchanged.
+- Zero sync test regressions — `test_mesh_rpc.py` and all existing module tests continue to pass unchanged.
+- Per-module type stubs land in `_net.pyi` so `mypy --strict` consumers see every new `Async*` class.
