@@ -41,39 +41,76 @@ fn local_subnet() -> SubnetId {
     SubnetId::new(&[1, 2])
 }
 
-/// Fixture rollup for the SUBNETS panel. Returns `(local,
-/// rollups)` so the render fn can swap both at once.
-pub fn subnets() -> (Option<SubnetId>, Vec<SubnetRollup>) {
+/// Fixture rollup for the SUBNETS panel.
+///
+/// Distributes the live demo cluster's real `(local_id, peer_ids)`
+/// across six synthetic subnets so the panel reads as a
+/// realistic multi-region tree AND each row's members actually
+/// resolve against `MeshOsSnapshot.peers` — drilling into a
+/// subnet shows real nodes the operator can pivot to. Previous
+/// fixture used hard-coded hex IDs (0x1101..) that had no
+/// counterparts in the snapshot, leaving every drill in an
+/// "tagged but absent from snapshot" empty state.
+///
+/// Distribution (anchor row is `local_subnet()`):
+///   1     — first quarter of peers (parent of 1.2 + 1.3)
+///   1.2   — local node + ~quarter of peers
+///   1.3   — ~quarter of peers
+///   2.1   — ~quarter of peers
+///   3.1   — remainder
+///
+/// Caller passes peers in deterministic order (BTreeMap key
+/// iteration); rotating an empty list returns six rollups with
+/// `members: vec![]` each so the panel still renders something
+/// visible when the cluster has no peers wired yet.
+pub fn subnets(local_id: u64, peer_ids: &[u64]) -> (Option<SubnetId>, Vec<SubnetRollup>) {
     let local = local_subnet();
+    let n = peer_ids.len();
+    // Slice the peer list into four roughly-equal buckets.
+    let q = n / 4;
+    let b1: Vec<u64> = peer_ids.iter().copied().take(q).collect();
+    let b2: Vec<u64> = peer_ids.iter().copied().skip(q).take(q).collect();
+    let b3: Vec<u64> = peer_ids.iter().copied().skip(2 * q).take(q).collect();
+    let b4: Vec<u64> = peer_ids.iter().copied().skip(3 * q).collect();
+    // 1.2 anchors the local node + first bucket's peers.
+    let mut local_members = vec![local_id];
+    local_members.extend(b2.iter().copied());
+
     let rollups = vec![
         SubnetRollup {
             subnet: SubnetId::new(&[1]),
-            members: vec![0x1001, 0x1002, 0x1003, 0x1004, 0x1005, 0x1006],
+            members: b1.clone(),
             is_local: false,
         },
         SubnetRollup {
             subnet: local,
-            members: vec![0x1101, 0x1102, 0x1103, 0x1104, 0x1105, 0x1106, 0x1107, 0x1108],
+            members: local_members,
             is_local: true,
         },
         SubnetRollup {
             subnet: SubnetId::new(&[1, 3]),
-            members: vec![0x1301, 0x1302, 0x1303, 0x1304],
+            members: b3.clone(),
             is_local: false,
         },
         SubnetRollup {
             subnet: SubnetId::new(&[2]),
-            members: vec![0x2001, 0x2002, 0x2003],
+            // Parent row with two children below — keep small
+            // membership so the tree reads as "region with a
+            // couple of fleets" rather than a flat dump.
+            members: b1.iter().copied().take(b1.len() / 2).collect(),
             is_local: false,
         },
         SubnetRollup {
             subnet: SubnetId::new(&[2, 1]),
-            members: vec![0x2101, 0x2102, 0x2103, 0x2104, 0x2105, 0x2106],
+            members: b4.clone(),
             is_local: false,
         },
         SubnetRollup {
             subnet: SubnetId::new(&[3, 1]),
-            members: vec![0x3101, 0x3102, 0x3103, 0x3104, 0x3105],
+            // Cross-region fleet — reuse `b3` so the SUBNETS
+            // table's HEALTH column shows realistic counts in
+            // every row.
+            members: b3,
             is_local: false,
         },
     ];

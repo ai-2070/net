@@ -83,9 +83,7 @@ fn subnet_focus_chips() -> Line<'static> {
         chip_key("Esc"),
         chip_desc(" back   "),
         chip_key("?"),
-        chip_desc(" help   "),
-        chip_key("q"),
-        chip_desc(" quit"),
+        chip_desc(" help"),
     ]);
     Line::from(spans)
 }

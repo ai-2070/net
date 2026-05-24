@@ -9,9 +9,8 @@
 //! (`yes/—`).
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
-use net_sdk::deck::{DeckClient, MeshOsSnapshot, SubnetRollup};
+use net_sdk::deck::{MeshOsSnapshot, SubnetRollup};
 use net_sdk::subnets::SubnetId;
 use ratatui::{
     layout::{Alignment, Constraint, Rect},
@@ -25,22 +24,12 @@ use crate::{theme, widgets};
 pub fn render(
     frame: &mut Frame<'_>,
     area: Rect,
-    deck: &Arc<DeckClient>,
+    local: Option<SubnetId>,
+    rollups: &[SubnetRollup],
     snapshot: &MeshOsSnapshot,
     aggregator_subnets: &HashSet<SubnetId>,
     cursor: usize,
 ) {
-    let local = deck.local_subnet();
-    let rollups = deck.subnets_with_members(None);
-    // Under `--features demo` the cluster harness boots N nodes
-    // flat under `SubnetId::GLOBAL`; substitute the fixture so
-    // the panel shows a realistic multi-region tree.
-    #[cfg(feature = "demo")]
-    let (local, rollups) = if local.is_none() && rollups.is_empty() {
-        crate::demo::fixtures::subnets()
-    } else {
-        (local, rollups)
-    };
     if local.is_none() && rollups.is_empty() {
         render_empty(frame, area);
     } else {
@@ -48,7 +37,7 @@ pub fn render(
             frame,
             area,
             local,
-            &rollups,
+            rollups,
             snapshot,
             aggregator_subnets,
             cursor,

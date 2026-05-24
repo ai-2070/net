@@ -1367,12 +1367,25 @@ impl App {
     /// Mirrors the demo-fixture fallback so cursor + Enter
     /// work even when no real mesh is wired.
     fn subnet_rollups(&self) -> Vec<net_sdk::deck::SubnetRollup> {
+        self.subnet_rollups_with_local().1
+    }
+
+    /// Same as `subnet_rollups` but also returns the resolved
+    /// `local` subnet pointer the table uses. Under
+    /// `--features demo` the fixture pulls real peer IDs from
+    /// `self.snapshot.peers` so members tagged into each fixture
+    /// subnet actually resolve when the operator drills in.
+    fn subnet_rollups_with_local(
+        &self,
+    ) -> (Option<net_sdk::subnets::SubnetId>, Vec<net_sdk::deck::SubnetRollup>) {
+        let local = self.deck.local_subnet();
         let rollups = self.deck.subnets_with_members(None);
         #[cfg(feature = "demo")]
-        if rollups.is_empty() && self.deck.local_subnet().is_none() {
-            return crate::demo::fixtures::subnets().1;
+        if rollups.is_empty() && local.is_none() {
+            let peer_ids: Vec<u64> = self.snapshot.peers.keys().copied().collect();
+            return crate::demo::fixtures::subnets(self.this_node, &peer_ids);
         }
-        rollups
+        (local, rollups)
     }
 
     fn open_blob_detail(&mut self) {
@@ -2386,14 +2399,7 @@ impl App {
     /// Count subnet rollup rows the panel will render. Same
     /// demo-fixture fallback shape as `gateway_row_count`.
     fn subnet_row_count(&self) -> usize {
-        let n = self.deck.subnets_with_members(None).len();
-        #[cfg(feature = "demo")]
-        {
-            if n == 0 && self.deck.local_subnet().is_none() {
-                return crate::demo::fixtures::subnets().1.len();
-            }
-        }
-        n
+        self.subnet_rollups_with_local().1.len()
     }
 
     fn clamp_subnets_cursor(&mut self) {
@@ -3369,10 +3375,12 @@ impl App {
             }
             Tab::Subnets => {
                 let agg_subnets = self.aggregator_source_subnets();
+                let (local, rollups) = self.subnet_rollups_with_local();
                 tabs::subnets::render(
                     frame,
                     chunks[3],
-                    &self.deck,
+                    local,
+                    &rollups,
                     &self.snapshot,
                     &agg_subnets,
                     self.subnets_cursor,
