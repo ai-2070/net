@@ -1,0 +1,21 @@
+net/crates/net/cli/src/context.rs
+  s_099fa7d871e34d::t_8e27c8fe81d89d 73-77,80,83,91,93
+  s_099fa7d871e34d::t_8ec9ba5ac03b59 196-201,208
+  s_099fa7d871e34d::t_a73f8b26a2cae2 53,55-59
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "da46de7d871b686b0000762ed6a255c315799bfa",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
