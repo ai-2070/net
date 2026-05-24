@@ -1,6 +1,6 @@
 [package]
 name = "net-meshdb-ffi"
-version = "0.21.0"
+version = "0.22.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "C ABI MeshDB query layer for the Go binding of Net"
@@ -26,7 +26,7 @@ default = []
 # over an in-memory ChainReader), so the feature list stays minimal
 # — Phase B+ slices that wire the federated transport will add
 # `net` here.
-net = { package = "net-mesh", version = "0.21.0", path = "../../..", default-features = false, features = ["meshdb"] }
+net = { package = "net-mesh", version = "0.22.0", path = "../../..", default-features = false, features = ["meshdb"] }
 parking_lot = "0.12"
 tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
 futures = "0.3"
