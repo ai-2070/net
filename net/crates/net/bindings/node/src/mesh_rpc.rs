@@ -102,6 +102,7 @@ fn nrpc_err_from_inner(err: InnerRpcError) -> Error {
             "capability_denied",
             format!("target=0x{target:x} capability={capability}"),
         ),
+        InnerRpcError::Cancelled => nrpc_err("cancelled", "call cancelled by caller"),
     }
 }
 
@@ -582,46 +583,112 @@ pub struct RpcMetricsSnapshotJs {
     /// One entry per service that has been called at least once
     /// since the mesh was created. Sorted by service name.
     pub services: Vec<ServiceMetricsJs>,
+    /// Cumulative count of observer events dropped because the
+    /// observer's bounded buffer was full at the time the
+    /// substrate dispatch path fired (v3 / O-A1). A non-zero,
+    /// climbing value indicates the installed observer can't
+    /// keep up with the dispatch rate — the operator should
+    /// either lighten the per-event callback work or push events
+    /// into their own queue and drain them off a dedicated thread.
+    pub observer_dropped_total: BigInt,
 }
 
-impl From<&InnerRpcMetricsSnapshot> for RpcMetricsSnapshotJs {
-    fn from(s: &InnerRpcMetricsSnapshot) -> Self {
+impl RpcMetricsSnapshotJs {
+    /// Build the napi snapshot. Combines the substrate's per-
+    /// service registry with the napi-local observer drop
+    /// counter (which is a per-process counter; the napi binding
+    /// doesn't currently split it by service).
+    fn build(snapshot: &InnerRpcMetricsSnapshot) -> Self {
         Self {
-            services: s.services.iter().map(ServiceMetricsJs::from).collect(),
+            services: snapshot
+                .services
+                .iter()
+                .map(ServiceMetricsJs::from)
+                .collect(),
+            observer_dropped_total: BigInt::from(
+                OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed),
+            ),
         }
     }
 }
 
 // ----------------------------------------------------------------------
-// Observer trampoline.
+// Observer trampoline — bounded mpsc + dedicated worker (v3 / O-A1).
 //
-// The substrate calls `RpcObserver::on_call` *synchronously* from
-// the dispatch task; the firing thread blocks until the call
-// returns. We bridge that to a JS function via a TSFN in
-// `NonBlocking` call mode — napi-rs queues the JS invocation and
-// the dispatch thread returns immediately. If the JS event loop
-// is wedged and the TSFN queue fills, the call is dropped (the
-// `call` return status is ignored) — the documented
-// "callbacks must be cheap" contract.
+// The substrate calls `RpcObserver::on_call` synchronously from
+// the dispatch task. v1 (S2-A1) called the TSFN directly in
+// NonBlocking mode from that thread; v3 inserts a bounded mpsc +
+// worker task so the substrate dispatch thread pays only one
+// atomic counter on overflow instead of paying the TSFN's
+// internal Mutex acquire on every event.
+//
+// Design:
+//   - On install: spawn a worker task that drains the receiver
+//     and pumps each event to the TSFN.
+//   - `on_call`: `try_send` into the channel; overflow increments
+//     the process-global `OBSERVER_DROPPED_TOTAL`. No allocation,
+//     no lock, no system call on the hot path.
+//   - On clear (or mesh drop): drop the sender → worker task
+//     exits cleanly when the channel closes.
+//
+// Locked decision #1 (NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION.md):
+// callbacks should still be cheap, but the substrate dispatch
+// path is now defended against a slow consumer — overflow drops
+// surface via the snapshot's `observer_dropped_total` counter.
 // ----------------------------------------------------------------------
+
+/// Bound on the observer event buffer. Big enough that a
+/// momentarily-slow observer doesn't lose events under normal
+/// load; small enough that an actually-broken observer surfaces
+/// drops within seconds rather than minutes. Matches the existing
+/// `RpcResponseSink`'s pump-side mpsc bound in the substrate.
+const OBSERVER_BUFFER_CAPACITY: usize = 1024;
+
+/// Process-global count of observer events dropped because the
+/// bounded buffer was full. Surfaced via
+/// [`RpcMetricsSnapshotJs::observer_dropped_total`]. Per-process
+/// (not per-mesh / per-service) because observer dispatch is
+/// fundamentally per-process; the napi binding's single
+/// dispatcher reaches every mesh in the V8 instance.
+static OBSERVER_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 type RpcObserverTsfn = ThreadsafeFunction<RpcCallEventJs, (), RpcCallEventJs, napi::Status, false>;
 
 struct NodeRpcObserver {
-    tsfn: RpcObserverTsfn,
+    sender: tokio::sync::mpsc::Sender<RpcCallEventJs>,
+}
+
+impl NodeRpcObserver {
+    /// Install a new observer: build the bounded channel, spawn
+    /// the drain worker, return the wrapping observer.
+    fn install(tsfn: RpcObserverTsfn) -> Self {
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<RpcCallEventJs>(OBSERVER_BUFFER_CAPACITY);
+        tokio::spawn(async move {
+            while let Some(evt) = receiver.recv().await {
+                // NonBlocking on the TSFN side too — if the JS
+                // event loop is wedged AND the napi-rs queue is
+                // also full, we let napi-rs drop. Our own bounded
+                // buffer is the first line of defense; the TSFN
+                // overflow path is the last-ditch fallback.
+                let _ = tsfn.call(evt, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+            // Sender dropped → channel closed → worker exits.
+        });
+        Self { sender }
+    }
 }
 
 impl RpcObserver for NodeRpcObserver {
     fn on_call(&self, evt: InnerRpcCallEvent) {
         let js_evt = RpcCallEventJs::from(&evt);
-        // NonBlocking: never wedge the dispatch path. Dropped
-        // events are part of the contract (the alternative is
-        // backpressure into the substrate's hot path, which
-        // would convert a slow JS consumer into a mesh-wide
-        // latency regression). Status is intentionally ignored.
-        let _ = self
-            .tsfn
-            .call(js_evt, ThreadsafeFunctionCallMode::NonBlocking);
+        // try_send is non-blocking; full or closed → drop +
+        // counter increment. Closed shouldn't happen in normal
+        // operation (we hold the sender until set_observer(None)
+        // or mesh drop), but it's harmless if it does.
+        if self.sender.try_send(js_evt).is_err() {
+            OBSERVER_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1918,7 +1985,7 @@ impl MeshRpc {
         match observer {
             Some(f) => {
                 let tsfn: RpcObserverTsfn = f.build_threadsafe_function().build()?;
-                let obs: Arc<dyn RpcObserver> = Arc::new(NodeRpcObserver { tsfn });
+                let obs: Arc<dyn RpcObserver> = Arc::new(NodeRpcObserver::install(tsfn));
                 self.node.set_rpc_observer(Some(obs));
             }
             None => {
@@ -1929,13 +1996,14 @@ impl MeshRpc {
     }
 
     /// Snapshot the per-service nRPC metrics registry. Cheap —
-    /// one DashMap iteration. Safe to call on every Prometheus
-    /// scrape. The returned object is a plain JS POD (BigInts
-    /// for u64 fields); read fields directly or feed into your
-    /// own exporter.
+    /// one DashMap iteration plus one atomic-load for the
+    /// process-global observer-drop counter. Safe to call on
+    /// every Prometheus scrape. The returned object is a plain
+    /// JS POD (BigInts for u64 fields); read fields directly or
+    /// feed into your own exporter.
     #[napi]
     pub fn metrics_snapshot(&self) -> RpcMetricsSnapshotJs {
-        RpcMetricsSnapshotJs::from(&self.node.rpc_metrics_snapshot())
+        RpcMetricsSnapshotJs::build(&self.node.rpc_metrics_snapshot())
     }
 }
 

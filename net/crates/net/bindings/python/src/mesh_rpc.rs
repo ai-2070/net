@@ -186,6 +186,9 @@ fn rpc_error_to_pyerr(err: InnerRpcError) -> PyErr {
                 "{ERR_NRPC_PREFIX}capability_denied: target=0x{target:x} capability={capability}"
             ))
         }
+        InnerRpcError::Cancelled => RpcCancelledError::new_err(format!(
+            "{ERR_NRPC_PREFIX}cancelled: call cancelled by caller"
+        )),
     }
 }
 
@@ -2078,6 +2081,9 @@ mod tests {
                 }
                 InnerRpcError::CapabilityDenied { target, capability } => {
                     format!("nrpc:capability_denied: target=0x{target:x} capability={capability}")
+                }
+                InnerRpcError::Cancelled => {
+                    "nrpc:cancelled: call cancelled by caller".to_string()
                 }
             }
         };

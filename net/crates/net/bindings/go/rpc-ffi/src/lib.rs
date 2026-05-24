@@ -390,6 +390,7 @@ fn format_rpc_error(err: &InnerRpcError) -> String {
         InnerRpcError::CapabilityDenied { target, capability } => {
             format!("capability_denied: target=0x{target:x} capability={capability}")
         }
+        InnerRpcError::Cancelled => "cancelled: call cancelled by caller".to_string(),
     }
 }
 
