@@ -1,0 +1,26 @@
+net/crates/net/docs/plans/NRPC_STREAMING_PARITY_AND_GO_BINDING.md
+  s_099fa7d871e34d::t_9552a53d386d88 88
+  s_099fa7d871e34d::t_61bed121424173 108
+  s_099fa7d871e34d::t_94b7d5dab61e60 12-19
+  s_099fa7d871e34d::t_d4e7072b096c3d 151
+  s_099fa7d871e34d::t_370d99daf0dd4a 328,338
+  s_099fa7d871e34d::t_2f10c781592127 472
+  s_099fa7d871e34d::t_10bb3a432c3939 491-493,495-497
+  s_099fa7d871e34d::t_b3f4319ebbb5b9 397
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "a455cdee79748fe8a3016494f8cc7250b2f50be0",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
