@@ -1,0 +1,61 @@
+net/crates/net/docs/plans/AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md
+  s_099fa7d871e34d::t_578baae7178c6a 161,163-166
+net/crates/net/src/adapter/net/behavior/aggregator/registry.rs
+  s_099fa7d871e34d::t_817a17daaf2ef8 318-386
+  s_099fa7d871e34d::t_bcc26c17e03fa0 178-181,189
+net/crates/net/src/adapter/net/behavior/aggregator/registry_service.rs
+  s_099fa7d871e34d::t_b15f789d2345ef 134-140
+  s_099fa7d871e34d::t_a56559c4e4762b 25,27-37,49
+  s_099fa7d871e34d::t_008060eccb5997 288
+  s_099fa7d871e34d::t_887f90efad8ab7 294-302,306,311-313,318,321-329,343-349
+  s_099fa7d871e34d::t_bb2e7e55d5ef6e 179-190
+  s_099fa7d871e34d::t_da71fb06d30e8d 119-121
+  s_099fa7d871e34d::t_d0e1b47694c2a5 524-527,539-553
+  s_099fa7d871e34d::t_eefb27ac2131d0 84-101
+  s_099fa7d871e34d::t_522ae6d7c0c847 225-258
+  s_099fa7d871e34d::t_bed2d33ee1d15d 359,403-441
+  s_099fa7d871e34d::t_3e19bdda876d22 447-457,461-467,471-472
+net/crates/net/src/adapter/net/behavior/aggregator/registry_client.rs
+  s_099fa7d871e34d::t_6a92a4b60a718b 189-235
+net/crates/net/sdk/src/aggregator.rs
+  s_099fa7d871e34d::t_530403cdd58b8c 74-76
+  s_099fa7d871e34d::t_7c43757fc67cee 258-275
+net/crates/net/aggregator-daemon/src/lib.rs
+  s_099fa7d871e34d::t_ac4c7d9c782544 651-745
+  s_099fa7d871e34d::t_b598a577ea3352 318-321,323,325
+net/crates/net/src/adapter/net/behavior/lifecycle/group.rs
+  s_099fa7d871e34d::t_f6cc225f9edde3 987,991,1013,1017
+  s_099fa7d871e34d::t_d399379e6265db 363-437,443-445,447,449-451,453-462
+  s_099fa7d871e34d::t_3f426eb5327d27 438-442,446,448,452
+  s_099fa7d871e34d::t_11b3fe461c0122 913-986,988-990,992-1012,1014-1016,1018-1022
+net/crates/net/src/ffi/aggregator.rs
+  s_099fa7d871e34d::t_b5e34a2b76055d 712-723
+  s_099fa7d871e34d::t_89d25bb39a1b4c 56-64
+net/crates/net/bindings/python/src/aggregator.rs
+  s_099fa7d871e34d::t_210007e996f60d 109-114
+net/crates/net/aggregator-daemon/tests/boot_and_query.rs
+  s_099fa7d871e34d::t_b5e783e6d7c220 260-441
+net/crates/net/src/adapter/net/behavior/aggregator/mod.rs
+  s_099fa7d871e34d::t_3e2be384e9508b 37-38
+net/crates/net/cli/src/commands/aggregator.rs
+  s_099fa7d871e34d::t_da3c0d8753a4d9 5,7-22,24-27,30-32
+  s_099fa7d871e34d::t_3d7e9f6df8ff04 486-489,493,496,500
+net/crates/net/bindings/node/src/aggregator.rs
+  s_099fa7d871e34d::t_4d8d24ea278b88 49-53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "2a237a7961266998ce0962f082efba5ee4cea187",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
