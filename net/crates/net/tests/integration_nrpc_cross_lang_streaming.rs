@@ -75,7 +75,7 @@ const SERVICE_DUPLEX: &str = "cross_lang_duplex_echo";
 // streaming shapes documented in this fixture are unchanged from
 // v2; the v3 invariants live in the new observer_invariants +
 // metrics_snapshot_invariants sections.
-const ABI_VERSION_EXPECTED: u32 = 3;
+const ABI_VERSION_EXPECTED: u32 = 4;
 
 // =====================================================================
 // Canonical wire shapes.
@@ -1026,6 +1026,23 @@ fn metrics_snapshot_invariants_fixture_is_well_formed() {
     assert!(
         m.get("scrape_cost").is_some(),
         "metrics_snapshot_invariants documents scrape cost",
+    );
+
+    // Envelope-level extras: v3 adds observer_dropped_total alongside
+    // the services list. Pin the field-name discriminator so a
+    // future rename surfaces here before per-binding tests start
+    // failing.
+    let extras = m
+        .get("envelope_extra_fields")
+        .and_then(|v| v.as_array())
+        .expect("metrics_snapshot_invariants documents envelope_extra_fields");
+    let names: std::collections::HashSet<&str> = extras
+        .iter()
+        .filter_map(|e| e.get("name").and_then(|v| v.as_str()))
+        .collect();
+    assert!(
+        names.contains("observer_dropped_total"),
+        "envelope_extra_fields documents observer_dropped_total",
     );
 }
 
