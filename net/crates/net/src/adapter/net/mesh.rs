@@ -1392,6 +1392,17 @@ pub struct MeshNode {
     /// relative to the observer firing path itself.
     #[cfg(feature = "cortex")]
     rpc_observer: Arc<ArcSwapOption<crate::adapter::net::cortex::rpc_observer::RpcObserverHandle>>,
+    /// Substrate-level cancel-token registry. One per mesh; shared
+    /// by every call shape (`call` / `call_service` / `call_streaming`
+    /// / `call_client_stream` / `call_duplex`) so a single
+    /// `mesh.cancel(token)` aborts the matching in-flight call
+    /// regardless of which shape opened it.
+    ///
+    /// Wraps the lock-free [`crate::adapter::net::cancel_registry::CancelRegistry`]
+    /// pattern; see that module for the CR-13 (cancel-before-register)
+    /// and Q18 (orphan-TTL GC) race fixes.
+    #[cfg(feature = "cortex")]
+    cancel_registry: Arc<crate::adapter::net::cancel_registry::CancelRegistry>,
     /// Optional migration subprotocol handler — same `ArcSwapOption`
     /// surface as on `MeshNode`, propagated into the dispatch
     /// context so the packet-receive loop stays lock-free.
@@ -2009,6 +2020,10 @@ impl MeshNode {
             rpc_route_cache: Arc::new(DashMap::new()),
             #[cfg(feature = "cortex")]
             rpc_observer: Arc::new(ArcSwapOption::empty()),
+            #[cfg(feature = "cortex")]
+            cancel_registry: Arc::new(
+                crate::adapter::net::cancel_registry::CancelRegistry::new(),
+            ),
             migration_handler: Arc::new(ArcSwapOption::empty()),
             pending_handshakes,
             pending_direct_initiators,
@@ -5277,6 +5292,52 @@ impl MeshNode {
         // (see field doc). Clone the inner `Arc<dyn ..>` so the
         // caller holds a flat handle.
         self.rpc_observer.load_full().map(|arc| (*arc).clone())
+    }
+
+    /// Reserve a fresh cancel token. Pass on a subsequent call
+    /// via [`crate::adapter::net::mesh_rpc::CallOptions::cancel_token`];
+    /// later, call [`Self::cancel`] from anywhere to abort the
+    /// in-flight task. Tokens are monotonically-increasing,
+    /// process-global, never reused. An unused reservation is
+    /// harmless — the registry only allocates an entry on the
+    /// first paired `register` or `cancel`.
+    #[cfg(feature = "cortex")]
+    pub fn reserve_cancel_token(&self) -> u64 {
+        self.cancel_registry.reserve_token()
+    }
+
+    /// Abort the in-flight call associated with `token`.
+    /// Idempotent — no-op if the token was never used, the call
+    /// already resolved, or `token == 0` (the "no token"
+    /// sentinel).
+    ///
+    /// Race-safe: a cancel that arrives BEFORE the call's
+    /// `register` runs (the gap between
+    /// [`Self::reserve_cancel_token`] and call construction)
+    /// latches a pre-cancel flag on the orphan entry; the
+    /// subsequent register pre-arms the cancel signal so the
+    /// call short-circuits to
+    /// [`crate::adapter::net::mesh_rpc::RpcError::Cancelled`]
+    /// without ever publishing the REQUEST.
+    ///
+    /// Triggers a Drop-on-cancel CANCEL frame on the wire via
+    /// the call-shape-specific guards (UnaryCallGuard /
+    /// ClientStreamCallRaw::Drop / DuplexCallRaw::Drop). See
+    /// `crate::adapter::net::cancel_registry` for the registry
+    /// implementation.
+    #[cfg(feature = "cortex")]
+    pub fn cancel(&self, token: u64) {
+        self.cancel_registry.cancel(token);
+    }
+
+    /// Internal accessor for the per-mesh cancel registry. Used
+    /// by the call shapes in `mesh_rpc.rs` to register / release
+    /// the cancel-notify for in-flight calls.
+    #[cfg(feature = "cortex")]
+    pub(crate) fn cancel_registry(
+        &self,
+    ) -> &Arc<crate::adapter::net::cancel_registry::CancelRegistry> {
+        &self.cancel_registry
     }
 
     /// Fire the installed `RpcObserver` (if any) with an

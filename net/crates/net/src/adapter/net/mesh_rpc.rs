@@ -162,6 +162,29 @@ pub struct CallOptions {
     ///
     /// Default: empty.
     pub request_headers: Vec<(String, Vec<u8>)>,
+    /// Caller-side cancel token. Mint via
+    /// [`MeshNode::reserve_cancel_token`]; pair with
+    /// [`MeshNode::cancel`] from any thread to abort the in-flight
+    /// call. `None` (or `Some(0)` — the "no token" sentinel) → no
+    /// cancel slot is reserved and the call has no external abort
+    /// path beyond Drop-on-future-cancellation.
+    ///
+    /// Honored uniformly by every call shape: `call`, `call_service`,
+    /// `call_streaming`, `call_client_stream`, `call_duplex`. The
+    /// substrate registers the token in a per-mesh cancel registry
+    /// at call construction and removes it on resolution (success,
+    /// error, or Drop). A cancel that fires mid-flight surfaces to
+    /// the caller as [`RpcError::Cancelled`] and emits CANCEL on
+    /// the wire via the existing per-call-shape guards (UnaryCallGuard,
+    /// ClientStreamCallRaw::Drop, DuplexCallRaw::Drop).
+    ///
+    /// Cancel-before-register is race-safe: a cancel that arrives
+    /// in the gap between `reserve_cancel_token` and the call's
+    /// internal register step latches a pre-cancel flag on the
+    /// registry's orphan entry; the subsequent register observes
+    /// it and the call short-circuits to [`RpcError::Cancelled`]
+    /// without ever publishing the REQUEST.
+    pub cancel_token: Option<u64>,
 }
 
 impl Default for CallOptions {
@@ -175,6 +198,7 @@ impl Default for CallOptions {
             stream_window_initial: None,
             request_window_initial: None,
             request_headers: Vec::new(),
+            cancel_token: None,
         }
     }
 }
@@ -261,6 +285,15 @@ pub enum RpcError {
         /// the gate denied.
         capability: String,
     },
+    /// Caller-side cancellation fired via
+    /// [`MeshNode::cancel`] with the call's `cancel_token`.
+    /// Triggers a Drop-on-cancel CANCEL frame on the wire so the
+    /// server's in-flight handler observes the cancel; the
+    /// awaiting caller returns this variant. NOT retried by the
+    /// default retry policy — cancellation is caller-driven and
+    /// re-issuing the call defeats the point.
+    #[error("call cancelled by caller")]
+    Cancelled,
 }
 
 /// Which side of the call surfaced a [`RpcError::Codec`] failure.
@@ -2759,6 +2792,8 @@ impl MeshNode {
         //  - the timeout path (we leave `completed=false` so Drop
         //    handles CANCEL emission; no need for a separate
         //    `send_rpc_cancel` call).
+        //  - the cancel_token path (same: leave completed=false,
+        //    Drop emits CANCEL).
         let mut guard = UnaryCallGuard {
             pending: Arc::clone(&pending),
             mesh: Arc::clone(self),
@@ -2769,15 +2804,70 @@ impl MeshNode {
             completed: false,
         };
 
-        // Race the receiver against the deadline.
+        // Substrate cancel-token plumbing (v3 / C-S1). When the
+        // caller set `opts.cancel_token`, register a Notify against
+        // the per-mesh cancel_registry. The select! arm below
+        // observes the cancel signal and short-circuits to
+        // RpcError::Cancelled, leaving guard.completed = false so
+        // Drop fires CANCEL on the wire. Release the registry
+        // entry once the call resolves so the registry doesn't
+        // grow unboundedly.
+        let cancel_token = opts.cancel_token.unwrap_or(0);
+        let cancel_notify = self.cancel_registry().register_notify(cancel_token);
+
+        // Race the receiver against the deadline AND the cancel
+        // signal. Each branch lifts to the same outcome shape
+        // (Result<Result<RpcResponsePayload, _>, Elapsed>) so the
+        // existing post-match logic stays unchanged for the ok /
+        // timeout paths; the cancel arm returns early.
         let outcome: Result<Result<RpcResponsePayload, _>, tokio::time::error::Elapsed> =
             match opts.deadline {
-                None => Ok(rx.await),
+                None => {
+                    tokio::select! {
+                        biased;
+                        _ = cancel_notify.notified() => {
+                            // Leave guard.completed = false so Drop
+                            // emits CANCEL on the wire.
+                            self.cancel_registry().release(cancel_token);
+                            metrics_guard.record(CallOutcome::Transport);
+                            self.fire_rpc_observer_outbound(
+                                target_node_id,
+                                service,
+                                started_total.elapsed().as_millis() as u32,
+                                crate::adapter::net::cortex::rpc_observer::RpcCallStatus::Canceled,
+                                request_bytes_len,
+                                0,
+                            );
+                            return Err(RpcError::Cancelled);
+                        }
+                        r = rx => Ok(r),
+                    }
+                }
                 Some(deadline) => {
                     let timeout_at = deadline.saturating_duration_since(Instant::now());
-                    tokio::time::timeout(timeout_at, rx).await
+                    tokio::select! {
+                        biased;
+                        _ = cancel_notify.notified() => {
+                            self.cancel_registry().release(cancel_token);
+                            metrics_guard.record(CallOutcome::Transport);
+                            self.fire_rpc_observer_outbound(
+                                target_node_id,
+                                service,
+                                started_total.elapsed().as_millis() as u32,
+                                crate::adapter::net::cortex::rpc_observer::RpcCallStatus::Canceled,
+                                request_bytes_len,
+                                0,
+                            );
+                            return Err(RpcError::Cancelled);
+                        }
+                        r = tokio::time::timeout(timeout_at, rx) => r,
+                    }
                 }
             };
+
+        // Whichever non-cancel path won, release the registry
+        // entry. Idempotent if the cancel arm already released.
+        self.cancel_registry().release(cancel_token);
 
         let resp = match outcome {
             Ok(Ok(resp)) => {
