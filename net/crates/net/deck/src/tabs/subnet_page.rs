@@ -15,6 +15,7 @@ use net_sdk::deck::{MeshOsSnapshot, PeerSnapshot};
 use net_sdk::subnets::SubnetId;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::Modifier,
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
@@ -54,8 +55,9 @@ pub fn render(
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        // Header card: borders + 4 identity rows.
-        .constraints([Constraint::Length(8), Constraint::Min(0)])
+        // Header card: borders + 3 identity rows (subnet id
+        // lives in the panel title now, not as a body row).
+        .constraints([Constraint::Length(7), Constraint::Min(0)])
         .split(area);
 
     render_header(frame, chunks[0], focus, snapshot);
@@ -68,10 +70,23 @@ fn render_header(
     focus: &SubnetFocusEntry,
     snapshot: &MeshOsSnapshot,
 ) {
+    // Build the title inline so the subnet id renders white +
+    // bold instead of the dim-chrome status style
+    // `widgets::section_title` would default to. The id is the
+    // page's primary identifier — it should pop, not whisper.
+    let title = Line::from(vec![
+        Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
+        Span::styled("SUBNET", theme::green_hi()),
+        Span::styled("    ", theme::chrome()),
+        Span::styled(
+            focus.subnet.to_string(),
+            theme::text().add_modifier(Modifier::BOLD),
+        ),
+    ]);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
-        .title(widgets::section_title("SUBNET", &focus.subnet.to_string()));
+        .title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -91,10 +106,6 @@ fn render_header(
         super::subnets::health_rollup(&focus.members, snapshot);
 
     let lines = vec![
-        Line::from(vec![
-            Span::styled("  id:      ", theme::chrome()),
-            Span::styled(focus.subnet.to_string(), theme::green_hi()),
-        ]),
         Line::from(vec![
             Span::styled("  depth:   ", theme::chrome()),
             Span::styled(format!("{depth}"), theme::text()),
