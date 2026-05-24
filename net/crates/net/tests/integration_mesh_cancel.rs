@@ -142,12 +142,7 @@ async fn cancel_unary_mid_flight_surfaces_cancelled_error() {
     let a_clone = a.clone();
     let call_task = tokio::spawn(async move {
         a_clone
-            .call(
-                target,
-                "unserved.svc",
-                Bytes::from_static(b"req"),
-                opts,
-            )
+            .call(target, "unserved.svc", Bytes::from_static(b"req"), opts)
             .await
     });
 
@@ -183,12 +178,7 @@ async fn cancel_before_call_aborts_immediately() {
     };
     let result = tokio::time::timeout(
         Duration::from_secs(2),
-        a.call(
-            target,
-            "unserved.svc",
-            Bytes::from_static(b"req"),
-            opts,
-        ),
+        a.call(target, "unserved.svc", Bytes::from_static(b"req"), opts),
     )
     .await
     .expect("pre-cancelled call should resolve within 2s");

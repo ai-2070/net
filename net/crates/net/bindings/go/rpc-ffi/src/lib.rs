@@ -737,9 +737,8 @@ pub extern "C" fn net_rpc_call(
     }
     let node = h.node.clone();
 
-    let result = runtime().block_on(async move {
-        node.call(target_node_id, &service, req_bytes, opts).await
-    });
+    let result = runtime()
+        .block_on(async move { node.call(target_node_id, &service, req_bytes, opts).await });
 
     match result {
         Ok(reply) => {
@@ -788,9 +787,8 @@ pub extern "C" fn net_rpc_call_service(
     }
     let node = h.node.clone();
 
-    let result = runtime().block_on(async move {
-        node.call_service(&service, req_bytes, opts).await
-    });
+    let result =
+        runtime().block_on(async move { node.call_service(&service, req_bytes, opts).await });
 
     match result {
         Ok(reply) => {
@@ -1774,9 +1772,8 @@ pub extern "C" fn net_rpc_call_duplex_cancellable(
         opts.cancel_token = Some(cancel_token);
     }
     let node = h.node.clone();
-    let result = runtime().block_on(async move {
-        node.call_duplex(target_node_id, &service, opts).await
-    });
+    let result =
+        runtime().block_on(async move { node.call_duplex(target_node_id, &service, opts).await });
     match result {
         Ok(call) => {
             let call_id = call.call_id();
@@ -2256,9 +2253,8 @@ pub extern "C" fn net_rpc_call_with_headers(
     }
     let node = h.node.clone();
 
-    let result = runtime().block_on(async move {
-        node.call(target_node_id, &service, req_bytes, opts).await
-    });
+    let result = runtime()
+        .block_on(async move { node.call(target_node_id, &service, req_bytes, opts).await });
 
     match result {
         Ok(reply) => {
@@ -2315,9 +2311,8 @@ pub extern "C" fn net_rpc_call_service_with_headers(
     }
     let node = h.node.clone();
 
-    let result = runtime().block_on(async move {
-        node.call_service(&service, req_bytes, opts).await
-    });
+    let result =
+        runtime().block_on(async move { node.call_service(&service, req_bytes, opts).await });
 
     match result {
         Ok(reply) => {
@@ -3136,9 +3131,7 @@ impl GoRpcObserver {
                 };
                 let (status_kind, status_message): (u8, Option<&str>) = match &evt.status {
                     InnerRpcCallStatus::Ok => (NET_RPC_STATUS_OK, None),
-                    InnerRpcCallStatus::Error(msg) => {
-                        (NET_RPC_STATUS_ERROR, Some(msg.as_str()))
-                    }
+                    InnerRpcCallStatus::Error(msg) => (NET_RPC_STATUS_ERROR, Some(msg.as_str())),
                     InnerRpcCallStatus::Timeout => (NET_RPC_STATUS_TIMEOUT, None),
                     InnerRpcCallStatus::Canceled => (NET_RPC_STATUS_CANCELED, None),
                 };
@@ -3750,7 +3743,6 @@ mod tests {
     // shapes). The FFI delegates straight through, so binding-side
     // duplication would just track the substrate.
 
-
     /// `net_rpc_serve` rejects `handler_id == 0` with a clear
     /// error message rather than calling into the SDK with a
     /// sentinel id. Pinned because zero is the canonical "no
@@ -3885,12 +3877,11 @@ mod tests {
     #[test]
     fn observer_drops_overflow_events_and_counts_them() {
         use ::net::adapter::net::cortex::{
-            RpcCallEvent as InnerEvt, RpcCallStatus as InnerStatus,
-            RpcDirection as InnerDir, RpcObserver,
+            RpcCallEvent as InnerEvt, RpcCallStatus as InnerStatus, RpcDirection as InnerDir,
+            RpcObserver,
         };
         let baseline = OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed);
-        let (sender, _recv) =
-            tokio::sync::mpsc::channel::<InnerEvt>(OBSERVER_BUFFER_CAPACITY);
+        let (sender, _recv) = tokio::sync::mpsc::channel::<InnerEvt>(OBSERVER_BUFFER_CAPACITY);
         let obs = GoRpcObserver { sender };
         let make_event = || InnerEvt {
             caller: 1,

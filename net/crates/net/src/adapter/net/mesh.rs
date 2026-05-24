@@ -2021,9 +2021,7 @@ impl MeshNode {
             #[cfg(feature = "cortex")]
             rpc_observer: Arc::new(ArcSwapOption::empty()),
             #[cfg(feature = "cortex")]
-            cancel_registry: Arc::new(
-                crate::adapter::net::cancel_registry::CancelRegistry::new(),
-            ),
+            cancel_registry: Arc::new(crate::adapter::net::cancel_registry::CancelRegistry::new()),
             migration_handler: Arc::new(ArcSwapOption::empty()),
             pending_handshakes,
             pending_direct_initiators,

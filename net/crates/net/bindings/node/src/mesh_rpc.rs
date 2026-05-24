@@ -556,9 +556,7 @@ impl RpcMetricsSnapshotJs {
                 .iter()
                 .map(ServiceMetricsJs::from)
                 .collect(),
-            observer_dropped_total: BigInt::from(
-                OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed),
-            ),
+            observer_dropped_total: BigInt::from(OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed)),
         }
     }
 }

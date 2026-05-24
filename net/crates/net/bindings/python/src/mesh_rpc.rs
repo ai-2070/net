@@ -266,7 +266,8 @@ impl PyCancellable {
     /// CR-13 pre-arm contract ensures the call short-circuits).
     pub(crate) fn arm(&self, mesh: Arc<MeshNode>) -> u64 {
         let token = mesh.reserve_cancel_token();
-        if self.pre_cancelled
+        if self
+            .pre_cancelled
             .load(std::sync::atomic::Ordering::Acquire)
         {
             mesh.cancel(token);
@@ -1649,8 +1650,7 @@ const OBSERVER_BUFFER_CAPACITY: usize = 1024;
 /// Process-global count of observer events dropped because the
 /// bounded buffer was full. Surfaced via
 /// `metrics_snapshot.observer_dropped_total`.
-static OBSERVER_DROPPED_TOTAL: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static OBSERVER_DROPPED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct PyRpcObserver {
     sender: tokio::sync::mpsc::Sender<InnerRpcCallEvent>,
@@ -1690,8 +1690,7 @@ impl RpcObserver for PyRpcObserver {
         // counter increment. The substrate dispatch path pays
         // only this atomic-counter increment on overflow.
         if self.sender.try_send(evt).is_err() {
-            OBSERVER_DROPPED_TOTAL
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            OBSERVER_DROPPED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -1788,7 +1787,10 @@ impl PyMeshRpc {
             })
         });
         disarm_cancellable(armed_cancel);
-        Ok(PyBytes::new(py, result.map_err(rpc_error_to_pyerr)?.body.as_ref()))
+        Ok(PyBytes::new(
+            py,
+            result.map_err(rpc_error_to_pyerr)?.body.as_ref(),
+        ))
     }
 
     /// Service-discovery unary call. Resolves `service` against
@@ -1812,12 +1814,14 @@ impl PyMeshRpc {
         let runtime = self.runtime.clone();
         let node = self.node.clone();
         let result = py.detach(|| {
-            runtime.block_on(async move {
-                node.call_service(&service, req_bytes, inner_opts).await
-            })
+            runtime
+                .block_on(async move { node.call_service(&service, req_bytes, inner_opts).await })
         });
         disarm_cancellable(armed_cancel);
-        Ok(PyBytes::new(py, result.map_err(rpc_error_to_pyerr)?.body.as_ref()))
+        Ok(PyBytes::new(
+            py,
+            result.map_err(rpc_error_to_pyerr)?.body.as_ref(),
+        ))
     }
 
     /// Open a streaming-response call. Returns an [`PyRpcStream`];
@@ -2116,9 +2120,7 @@ mod tests {
                 InnerRpcError::CapabilityDenied { target, capability } => {
                     format!("nrpc:capability_denied: target=0x{target:x} capability={capability}")
                 }
-                InnerRpcError::Cancelled => {
-                    "nrpc:cancelled: call cancelled by caller".to_string()
-                }
+                InnerRpcError::Cancelled => "nrpc:cancelled: call cancelled by caller".to_string(),
             }
         };
 
