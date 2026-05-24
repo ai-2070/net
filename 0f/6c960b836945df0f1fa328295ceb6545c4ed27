@@ -1,0 +1,20 @@
+net/crates/net/tests/parallel_bind_stress.rs
+  s_099fa7d871e34d::t_fbf957c8c37654 90,100,102,104-105,114,126-127,133-134
+  s_099fa7d871e34d::t_ad68741e766c12 55-71
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "0f6c960b836945df0f1fa328295ceb6545c4ed27",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
