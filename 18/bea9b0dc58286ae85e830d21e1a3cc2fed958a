@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/DECK_REMOTE_ATTACH_AND_SCALE_RPC.md
+  s_099fa7d871e34d::t_f39ee9a3a11aaf 1-588
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "18bea9b0dc58286ae85e830d21e1a3cc2fed958a",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
