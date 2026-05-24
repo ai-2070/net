@@ -1,0 +1,24 @@
+net/crates/net/tests/integration_nrpc_cross_lang_streaming.rs
+  s_099fa7d871e34d::t_a4fb88014e7316 1030-1046
+  s_099fa7d871e34d::t_da853f5920c6fb 78
+net/crates/net/tests/cross_lang_nrpc/golden_vectors_streaming.json
+  s_099fa7d871e34d::t_11048cb2c76055 2
+  s_099fa7d871e34d::t_b3c786c647f62f 223-227
+  s_099fa7d871e34d::t_8a1b2d747fcde5 237-239
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "d20c422ace4f515d7523e430ee28412b73abc860",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
