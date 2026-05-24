@@ -209,6 +209,11 @@ pub struct App {
     /// export-rule rows. Persists across tab switches so the
     /// operator's selection survives a quick pivot away.
     pub gateways_cursor: usize,
+    /// Cursor on the SUBNETS tab — index into `subnets_with_members`.
+    pub subnets_cursor: usize,
+    /// Cursor on the AGGREGATORS tab — index into the buffered
+    /// `SummaryAnnouncement`s (newest-first).
+    pub aggregators_cursor: usize,
     /// BLOBS substring search. Matches hash prefix; empty =
     /// no filter.
     pub blobs_search: String,
@@ -563,6 +568,8 @@ impl App {
             blobs_tail,
             blobs_cursor: 0,
             gateways_cursor: 0,
+            subnets_cursor: 0,
+            aggregators_cursor: 0,
             blobs_search: String::new(),
             blobs_search_editing: false,
             bookmarks,
@@ -1785,6 +1792,20 @@ impl App {
             KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::Gateways => {
                 self.gateways_cursor = self.gateways_cursor.saturating_sub(1);
             }
+            KeyCode::Char('j' | 's') | KeyCode::Down if self.current == Tab::Subnets => {
+                self.subnets_cursor = self.subnets_cursor.saturating_add(1);
+                self.clamp_subnets_cursor();
+            }
+            KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::Subnets => {
+                self.subnets_cursor = self.subnets_cursor.saturating_sub(1);
+            }
+            KeyCode::Char('j' | 's') | KeyCode::Down if self.current == Tab::Aggregators => {
+                self.aggregators_cursor = self.aggregators_cursor.saturating_add(1);
+                self.clamp_aggregators_cursor();
+            }
+            KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::Aggregators => {
+                self.aggregators_cursor = self.aggregators_cursor.saturating_sub(1);
+            }
             // Vim-style top/bottom on every cursor-driven tab.
             // `g` jumps to the first row / group / member; `G`
             // jumps to the last. No-op on tabs without a list.
@@ -2208,6 +2229,56 @@ impl App {
         }
     }
 
+    /// Count subnet rollup rows the panel will render. Same
+    /// demo-fixture fallback shape as `gateway_row_count`.
+    fn subnet_row_count(&self) -> usize {
+        let n = self.deck.subnets_with_members(None).len();
+        #[cfg(feature = "demo")]
+        {
+            if n == 0 && self.deck.local_subnet().is_none() {
+                return crate::demo::fixtures::subnets().1.len();
+            }
+        }
+        n
+    }
+
+    fn clamp_subnets_cursor(&mut self) {
+        let n = self.subnet_row_count();
+        if n == 0 {
+            self.subnets_cursor = 0;
+        } else if self.subnets_cursor >= n {
+            self.subnets_cursor = n - 1;
+        }
+    }
+
+    /// Count buffered summaries the AGGREGATORS panel will
+    /// render. Falls back to the fixture when the deck has no
+    /// AggregatorDaemon wired.
+    fn aggregator_row_count(&self) -> usize {
+        match self.deck.aggregator_snapshot() {
+            Some(snap) => snap.summaries.len(),
+            None => {
+                #[cfg(feature = "demo")]
+                {
+                    crate::demo::fixtures::aggregator().summaries.len()
+                }
+                #[cfg(not(feature = "demo"))]
+                {
+                    0
+                }
+            }
+        }
+    }
+
+    fn clamp_aggregators_cursor(&mut self) {
+        let n = self.aggregator_row_count();
+        if n == 0 {
+            self.aggregators_cursor = 0;
+        } else if self.aggregators_cursor >= n {
+            self.aggregators_cursor = n - 1;
+        }
+    }
+
     /// Absorb a single keypress into the active tab's search
     /// buffer. `Enter` commits (filter stays active), `Esc`
     /// cancels and clears, `Backspace` pops, any printable char
@@ -2250,6 +2321,8 @@ impl App {
             Tab::Failures => self.failures_cursor = 0,
             Tab::Blobs => self.blobs_cursor = 0,
             Tab::Gateways => self.gateways_cursor = 0,
+            Tab::Subnets => self.subnets_cursor = 0,
+            Tab::Aggregators => self.aggregators_cursor = 0,
             Tab::Groups => self.groups_cursor = DaemonCursor::default(),
             _ => {}
         }
@@ -2302,6 +2375,14 @@ impl App {
             Tab::Gateways => {
                 let n = self.gateway_row_count();
                 self.gateways_cursor = n.saturating_sub(1);
+            }
+            Tab::Subnets => {
+                let n = self.subnet_row_count();
+                self.subnets_cursor = n.saturating_sub(1);
+            }
+            Tab::Aggregators => {
+                let n = self.aggregator_row_count();
+                self.aggregators_cursor = n.saturating_sub(1);
             }
             Tab::Groups => {
                 let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
@@ -3106,11 +3187,15 @@ impl App {
                     self.blobs_search_editing,
                 );
             }
-            Tab::Subnets => tabs::subnets::render(frame, chunks[3], &self.deck),
+            Tab::Subnets => {
+                tabs::subnets::render(frame, chunks[3], &self.deck, self.subnets_cursor)
+            }
             Tab::Gateways => {
                 tabs::gateways::render(frame, chunks[3], &self.deck, self.gateways_cursor)
             }
-            Tab::Aggregators => tabs::aggregators::render(frame, chunks[3], &self.deck),
+            Tab::Aggregators => {
+                tabs::aggregators::render(frame, chunks[3], &self.deck, self.aggregators_cursor)
+            }
         }
         widgets::footer::render(
             frame,
