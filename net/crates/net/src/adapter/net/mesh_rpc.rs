@@ -387,6 +387,13 @@ pub struct RpcStream {
     /// tab + every other `RpcObserver` consumer sees one event
     /// per streaming-response call.
     observer: StreamingObserverState,
+    /// v3 cancel-watcher keep-alive (C-S1). Dropping this field
+    /// (on stream Drop) resolves the matching watcher task's
+    /// oneshot receiver with `Err`, telling the watcher to exit
+    /// cleanly + release the registry entry. When the call was
+    /// opened without `cancel_token`, this is a placeholder sender
+    /// with no watcher behind it — drop has no observable effect.
+    _cancel_keep_alive: StreamCancelKeepAlive,
 }
 
 impl RpcStream {
@@ -659,6 +666,11 @@ pub struct ClientStreamCallRaw {
     /// every `RpcObserver` consumer sees one event per
     /// client-streaming call.
     observer: StreamingObserverState,
+    /// v3 cancel-watcher keep-alive (C-S1). Dropping this field
+    /// (on call Drop) tells the watcher task to exit cleanly and
+    /// release the registry entry. See
+    /// [`spawn_stream_cancel_watcher`] for the lifecycle.
+    _cancel_keep_alive: StreamCancelKeepAlive,
 }
 
 impl ClientStreamCallRaw {
@@ -924,6 +936,14 @@ struct DuplexInner {
     /// once on Drop. The DuplexCall / DuplexSink / DuplexStream
     /// each share access via the surrounding Arc<DuplexInner>.
     observer: StreamingObserverState,
+    /// v3 cancel-watcher keep-alive (C-S1). Lives on
+    /// `Arc<DuplexInner>` so it survives `into_split` — both
+    /// halves of the duplex hold the same Arc, so the watcher
+    /// task exits only when BOTH halves drop (matching the
+    /// Drop-fires-CANCEL semantics above). Wrapped in `Option`
+    /// for `mem::take`-style construction patterns; populated
+    /// once at `call_duplex` time and never cleared.
+    _cancel_keep_alive: Option<StreamCancelKeepAlive>,
 }
 
 impl Drop for DuplexInner {
@@ -1534,6 +1554,71 @@ fn spawn_cancel_publish(
     });
 }
 
+/// Type alias for the keep-alive sender that streaming-call handles
+/// store. Its purpose is *only* to signal "stream done" when the
+/// handle drops: the cancel-watcher task `select!`s on the matching
+/// receiver, and dropping the sender (which happens on handle Drop)
+/// resolves the receiver with an `Err` so the watcher exits cleanly.
+///
+/// `()` payload because the signal IS the resolution; no data is
+/// transmitted.
+type StreamCancelKeepAlive = tokio::sync::oneshot::Sender<()>;
+
+/// Spawn a cancel-watcher task for a streaming call (call_streaming,
+/// call_client_stream, call_duplex). The watcher races
+/// `cancel_notify.notified()` against the keep-alive oneshot — first
+/// to fire wins. On cancel, the watcher drops the pending-streaming
+/// entry (which closes the receiver's mpsc, letting the stream's
+/// poll_next observe EOF), then releases the registry entry. On
+/// handle Drop, the keep-alive sender drops, the oneshot resolves
+/// `Err`, and the watcher exits via the done arm with a registry
+/// release.
+///
+/// When `cancel_token == 0` (the "no token" sentinel), this is a
+/// no-op: the returned sender is a placeholder whose drop has no
+/// observable effect, and no task is spawned. Lets the streaming
+/// call shapes always store a keep-alive on the returned handle
+/// without branching on whether a token was set.
+fn spawn_stream_cancel_watcher(
+    cancel_notify: Arc<tokio::sync::Notify>,
+    cancel_token: u64,
+    cancel_registry: Arc<crate::adapter::net::cancel_registry::CancelRegistry>,
+    pending: Arc<crate::adapter::net::cortex::RpcClientPending>,
+    call_id: u64,
+) -> StreamCancelKeepAlive {
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    if cancel_token == 0 {
+        // No-op fast path. The returned sender is held by the
+        // handle but never paired with a watcher, so its eventual
+        // drop has no effect. Avoids spawning a task per
+        // cancel-less stream.
+        return done_tx;
+    }
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = cancel_notify.notified() => {
+                // Cancel fired. Drop the pending-stream entry so
+                // the receiver's mpsc closes (causing the stream's
+                // poll_next to observe EOF via Ready(None)). The
+                // handle's Drop will then fire CANCEL on the wire
+                // via its existing per-shape Drop impl.
+                pending.cancel(call_id);
+                cancel_registry.release(cancel_token);
+            }
+            _ = done_rx => {
+                // Stream completed normally — sender dropped on
+                // handle Drop, recv returns Err. Just release the
+                // registry entry; no CANCEL emission needed (the
+                // handle's Drop handles that path itself if it
+                // wasn't a clean close).
+                cancel_registry.release(cancel_token);
+            }
+        }
+    });
+    done_tx
+}
+
 // ============================================================================
 // MeshNode extensions.
 // ============================================================================
@@ -2066,6 +2151,16 @@ impl MeshNode {
 
         let deadline_ns = opts.deadline.map(instant_to_unix_nanos).unwrap_or(0);
         let observer = StreamingObserverState::new(Arc::clone(self), target_node_id, service, 0);
+        // v3 cancel-watcher (C-S1). Same pattern as call_streaming.
+        let cancel_token = opts.cancel_token.unwrap_or(0);
+        let cancel_notify = self.cancel_registry().register_notify(cancel_token);
+        let cancel_keep_alive = spawn_stream_cancel_watcher(
+            cancel_notify,
+            cancel_token,
+            Arc::clone(self.cancel_registry()),
+            Arc::clone(&pending),
+            call_id,
+        );
         Ok(ClientStreamCallRaw {
             mesh: Arc::clone(self),
             target_node_id,
@@ -2082,6 +2177,7 @@ impl MeshNode {
             state: ClientStreamState::JustOpened,
             started: Instant::now(),
             observer,
+            _cancel_keep_alive: cancel_keep_alive,
         })
     }
 
@@ -2275,6 +2371,19 @@ impl MeshNode {
 
         let deadline_ns = opts.deadline.map(instant_to_unix_nanos).unwrap_or(0);
         let observer = StreamingObserverState::new(Arc::clone(self), target_node_id, service, 0);
+        // v3 cancel-watcher (C-S1). Lives on the shared
+        // Arc<DuplexInner> so it survives into_split — the watcher
+        // exits only when BOTH the sink AND stream halves drop
+        // (matching the existing CANCEL-on-drop semantics).
+        let cancel_token = opts.cancel_token.unwrap_or(0);
+        let cancel_notify = self.cancel_registry().register_notify(cancel_token);
+        let cancel_keep_alive = spawn_stream_cancel_watcher(
+            cancel_notify,
+            cancel_token,
+            Arc::clone(self.cancel_registry()),
+            Arc::clone(&pending),
+            call_id,
+        );
         let inner = Arc::new(DuplexInner {
             mesh: Arc::clone(self),
             target_node_id,
@@ -2284,6 +2393,7 @@ impl MeshNode {
             initial_sent: std::sync::atomic::AtomicBool::new(false),
             clean_close: std::sync::atomic::AtomicBool::new(false),
             observer,
+            _cancel_keep_alive: Some(cancel_keep_alive),
         });
         let sink = DuplexSink {
             inner: Arc::clone(&inner),
@@ -2405,6 +2515,22 @@ impl MeshNode {
         }
 
         let request_bytes_len = payload_bytes.len() as u32;
+        // v3 cancel-watcher (C-S1). Spawn the watcher task that
+        // listens for mesh.cancel(token) → drops the pending entry
+        // so the stream's mpsc closes → poll_next observes EOF →
+        // Drop fires CANCEL on the wire via the existing per-shape
+        // path. The keep-alive sender lives on the returned
+        // RpcStream so the watcher exits cleanly when the stream
+        // drops without cancel.
+        let cancel_token = opts.cancel_token.unwrap_or(0);
+        let cancel_notify = self.cancel_registry().register_notify(cancel_token);
+        let cancel_keep_alive = spawn_stream_cancel_watcher(
+            cancel_notify,
+            cancel_token,
+            Arc::clone(self.cancel_registry()),
+            Arc::clone(&pending),
+            call_id,
+        );
         Ok(RpcStream {
             mesh: Arc::clone(self),
             target_node_id,
@@ -2414,6 +2540,7 @@ impl MeshNode {
             inner: rx,
             done: false,
             stream_window: opts.stream_window_initial,
+            _cancel_keep_alive: cancel_keep_alive,
             observer: StreamingObserverState::new(
                 Arc::clone(self),
                 target_node_id,
