@@ -319,6 +319,11 @@ pub struct App {
     /// NET.MAP, DATAFORTS, or a Daemon-page placement row;
     /// cleared by `[Esc]`.
     pub node_focus: Option<crate::tabs::node_page::NodeFocusEntry>,
+    /// SUBNET focus page state — `Some` after the operator
+    /// pressed `Enter` on a cursored SUBNETS row. The focus
+    /// page renders instead of the SUBNETS list until the
+    /// operator hits `Esc`.
+    pub subnet_focus: Option<crate::tabs::subnet_page::SubnetFocusEntry>,
     /// Focused daemon — same shape as `node_focus` but for the
     /// Daemon page. Mutually exclusive with `node_focus`; each
     /// `focus_*` helper clears the other before setting.
@@ -601,6 +606,7 @@ impl App {
             modal: None,
             node_focus: None,
             daemon_focus: None,
+            subnet_focus: None,
             logs_back: None,
             toast: None,
             toast_tx,
@@ -1277,6 +1283,36 @@ impl App {
     /// The modal owns its copy of the entry so a subsequent
     /// inventory refresh (~500 ms tick) under the cursor
     /// doesn't shift the body the operator is reading.
+    /// Snapshot the cursored SUBNETS row into `subnet_focus`.
+    /// Mirrors the demo-fixture fallback so the focus page
+    /// works even when no real mesh is wired (e.g. `--features
+    /// demo`).
+    fn open_subnet_focus(&mut self) {
+        let rollups = self.subnet_rollups();
+        if rollups.is_empty() {
+            return;
+        }
+        let idx = self.subnets_cursor.min(rollups.len() - 1);
+        let row = &rollups[idx];
+        self.subnet_focus = Some(crate::tabs::subnet_page::SubnetFocusEntry {
+            subnet: row.subnet,
+            members: row.members.clone(),
+            is_local: row.is_local,
+        });
+    }
+
+    /// Pull the subnet rollup list the SUBNETS panel renders.
+    /// Mirrors the demo-fixture fallback so cursor + Enter
+    /// work even when no real mesh is wired.
+    fn subnet_rollups(&self) -> Vec<net_sdk::deck::SubnetRollup> {
+        let rollups = self.deck.subnets_with_members(None);
+        #[cfg(feature = "demo")]
+        if rollups.is_empty() && self.deck.local_subnet().is_none() {
+            return crate::demo::fixtures::subnets().1;
+        }
+        rollups
+    }
+
     fn open_blob_detail(&mut self) {
         let entries = self.blobs_tail.snapshot();
         if entries.is_empty() {
@@ -1598,6 +1634,25 @@ impl App {
                 return;
             }
         }
+        // Subnet focus page absorber. Mirrors the node-focus
+        // shape: Esc / tab-switch drop the focus; navigation
+        // keys are read-only (no Enter pivot today — the
+        // member list doesn't have child detail pages).
+        if self.subnet_focus.is_some() {
+            if matches!(code, KeyCode::Esc) {
+                self.subnet_focus = None;
+                return;
+            }
+            if is_tab_switch {
+                self.subnet_focus = None;
+                // fall through to the normal handler
+            } else if matches!(code, KeyCode::Char('?')) {
+                self.modal = Some(Modal::Help);
+                return;
+            } else {
+                return;
+            }
+        }
         // Search prompts are the second-tier absorber: while a
         // tab's `_editing` flag is set, keystrokes go into that
         // tab's query buffer rather than the normal bindings.
@@ -1883,6 +1938,13 @@ impl App {
             // entry. Snapshots the entry so a subsequent
             // inventory refresh doesn't shift the body.
             KeyCode::Enter if self.current == Tab::Blobs => self.open_blob_detail(),
+            // SUBNETS: Enter opens the SUBNET focus page for the
+            // cursored row — header (id/depth/parent/members/local)
+            // + member list with peer health rolled up from the
+            // current snapshot. Esc returns to the SUBNETS table.
+            KeyCode::Enter if self.current == Tab::Subnets => {
+                self.open_subnet_focus();
+            }
             // Open the dedicated node detail page for the
             // cursored peer on NODES (`nodes_cursor`) or NET.MAP
             // (`netmap_cursor`). Both tabs share the
@@ -3043,6 +3105,20 @@ impl App {
             );
             // Modal overlay still renders on top in case one
             // is open (rare in focus mode but possible).
+            self.render_modal_overlay(frame, area);
+            return;
+        }
+        // SUBNET focus page — same pre-emption shape as the
+        // node / daemon focus pages.
+        if let Some(focus) = self.subnet_focus.as_ref() {
+            tabs::subnet_page::render(frame, chunks[3], focus, &self.snapshot);
+            widgets::footer::render(
+                frame,
+                chunks[4],
+                self.current,
+                widgets::footer::FocusKind::Subnet,
+                self.toast.as_ref().map(|(s, _)| s.as_str()),
+            );
             self.render_modal_overlay(frame, area);
             return;
         }

@@ -14,6 +14,7 @@ pub mod node_page;
 pub mod nodes;
 pub mod nrpc;
 pub mod replicas;
+pub mod subnet_page;
 pub mod subnets;
 
 /// Window an indexable list of `total` items into `body_h` rows
