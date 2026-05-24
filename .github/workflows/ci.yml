@@ -2,6 +2,13 @@ name: CI
 
 on:
   push:
+    # Branches only — without this filter GitHub fires `push`
+    # events on tag pushes too, so every `cli-v*` / `deck-v*`
+    # release tag spawns a duplicate CI run alongside its
+    # release workflow. The release workflows themselves run
+    # their own build + tests against the same SHA; we don't
+    # need CI to repeat them per tag.
+    branches: ['**']
     paths:
       - 'net/**'
       - 'go/**'
