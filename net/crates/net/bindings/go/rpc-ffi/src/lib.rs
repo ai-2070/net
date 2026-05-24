@@ -51,9 +51,10 @@ use tokio::runtime::Runtime;
 
 use futures::StreamExt;
 use net::adapter::net::cortex::{
-    RequestStream as InnerRequestStream, RpcClientStreamingHandler, RpcContext, RpcDuplexHandler,
-    RpcHandler, RpcHandlerError, RpcResponsePayload, RpcResponseSink as InnerRpcResponseSink,
-    RpcStatus, RpcStreamingContext,
+    RequestStream as InnerRequestStream, RpcCallEvent as InnerRpcCallEvent,
+    RpcCallStatus as InnerRpcCallStatus, RpcClientStreamingHandler, RpcContext,
+    RpcDirection as InnerRpcDirection, RpcDuplexHandler, RpcHandler, RpcHandlerError, RpcObserver,
+    RpcResponsePayload, RpcResponseSink as InnerRpcResponseSink, RpcStatus, RpcStreamingContext,
 };
 use net::adapter::net::mesh_rpc::{
     CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
@@ -119,7 +120,14 @@ pub const NET_RPC_ERR_STREAM_DONE: c_int = -6;
 ///     function keeps identical signature + semantics, so a
 ///     0x0001 consumer compiled against a 0x0002 library still
 ///     works.
-pub const NET_RPC_ABI_VERSION: u32 = 0x0002;
+///   - **0003** — Phase S1-A1 of NRPC_STREAMING_PARITY_AND_GO_BINDING:
+///     adds the caller-side observer +
+///     metrics-snapshot surface
+///     (`net_rpc_set_observer_dispatcher`, `net_rpc_observer_install`,
+///     `net_rpc_metrics_snapshot`) plus the `RpcCallEventC` POD
+///     fed to the observer dispatcher. ADDITIVE — 0x0002 consumers
+///     keep working unchanged.
+pub const NET_RPC_ABI_VERSION: u32 = 0x0003;
 
 /// Returns the current ABI version. Consumers SHOULD call this at
 /// init and compare against their expected value.
@@ -3048,6 +3056,278 @@ pub extern "C" fn net_rpc_serve_duplex(
 }
 
 // =========================================================================
+// Observer + metrics-snapshot (ABI 0x0003, S1-A1).
+//
+// Mirrors the napi + pyo3 binding surface: a per-mesh callback
+// that fires once per completed outbound RPC, plus a cheap
+// snapshot of the per-service counter registry.
+//
+// Observer model:
+//   - Go calls `net_rpc_set_observer_dispatcher` once at init
+//     (OnceLock — first registration wins; mirrors the existing
+//     `net_rpc_set_handler_dispatcher` pattern).
+//   - To enable observation on a given MeshRpc, call
+//     `net_rpc_observer_install(handle, 1)`. Pass `0` to clear.
+//   - The dispatcher fires synchronously from the substrate
+//     dispatch path — the Go side MUST be cheap (push into a
+//     channel; do not block). Same contract as the JS / Python
+//     observers.
+//
+// Event lifetime:
+//   - `RpcCallEventC` fields (`method_ptr` / `status_message_ptr`)
+//     are borrowed from the substrate's stack-local event for the
+//     duration of the call. The Go side MUST copy any bytes it
+//     wants to keep BEFORE the dispatcher returns.
+//
+// Metrics snapshot:
+//   - Returns the per-service counters as a JSON document. JSON
+//     because the substrate snapshot has variable-length data
+//     (services list + histogram bucket arrays) that doesn't
+//     fit a fixed C struct cleanly; Go decodes with
+//     `encoding/json`.
+// =========================================================================
+
+/// Status discriminant for [`RpcCallEventC::status_kind`]:
+///   - 0 = Ok           (status_message_ptr is NULL)
+///   - 1 = Error        (status_message_ptr/len carry diagnostic)
+///   - 2 = Timeout      (status_message_ptr is NULL)
+///   - 3 = Canceled     (status_message_ptr is NULL)
+pub const NET_RPC_STATUS_OK: u8 = 0;
+pub const NET_RPC_STATUS_ERROR: u8 = 1;
+pub const NET_RPC_STATUS_TIMEOUT: u8 = 2;
+pub const NET_RPC_STATUS_CANCELED: u8 = 3;
+
+/// Direction discriminant for [`RpcCallEventC::direction`]:
+///   - 0 = Outbound (this node initiated the call)
+///   - 1 = Inbound  (this node received the call; reserved — v1
+///     emits only Outbound)
+pub const NET_RPC_DIRECTION_OUTBOUND: u8 = 0;
+pub const NET_RPC_DIRECTION_INBOUND: u8 = 1;
+
+/// C-ABI POD mirroring the substrate's `RpcCallEvent`. All
+/// pointer fields are borrowed for the duration of the
+/// dispatcher call only — the Go side MUST copy out anything
+/// it wants to keep before returning.
+#[repr(C)]
+pub struct RpcCallEventC {
+    /// 64-bit node id of the calling node.
+    pub caller: u64,
+    /// 64-bit node id of the responding node.
+    pub callee: u64,
+    /// UTF-8 method/service name. Borrowed; not NUL-terminated.
+    pub method_ptr: *const u8,
+    pub method_len: usize,
+    /// Elapsed time in milliseconds.
+    pub latency_ms: u32,
+    /// One of `NET_RPC_STATUS_*`.
+    pub status_kind: u8,
+    /// Operator-readable diagnostic. Non-NULL only when
+    /// `status_kind == NET_RPC_STATUS_ERROR`. Borrowed; not
+    /// NUL-terminated.
+    pub status_message_ptr: *const u8,
+    pub status_message_len: usize,
+    /// Wire payload size of the request body. 0 when not
+    /// available.
+    pub request_bytes: u32,
+    /// Wire payload size of the response body. 0 when not
+    /// available.
+    pub response_bytes: u32,
+    /// One of `NET_RPC_DIRECTION_*`. v1 only emits Outbound.
+    pub direction: u8,
+    /// Unix-ms timestamp captured at fire time (best-effort).
+    pub ts_unix_ms: u64,
+}
+
+/// C-ABI signature: fired by the substrate dispatch path on
+/// every completed outbound RPC. Implementations MUST be cheap
+/// — the substrate dispatch task blocks until the call returns.
+/// Push into a channel; do not block on I/O, locks, or syscalls.
+pub type RpcObserverFn = unsafe extern "C" fn(evt: *const RpcCallEventC);
+
+/// Process-global observer dispatcher. Set once via
+/// [`net_rpc_set_observer_dispatcher`]; subsequent calls are
+/// silently ignored (first registration wins). Per-mesh
+/// enable/disable goes through [`net_rpc_observer_install`].
+static OBSERVER_DISPATCHER: OnceLock<RpcObserverFn> = OnceLock::new();
+
+/// Register the process-wide observer dispatcher. Idempotent —
+/// only the first call takes effect. The Go binding calls this
+/// once during package init; per-mesh wiring then happens via
+/// [`net_rpc_observer_install`].
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_set_observer_dispatcher(observer: RpcObserverFn) {
+    let _ = OBSERVER_DISPATCHER.set(observer);
+}
+
+/// `RpcObserver` adapter that bridges to the Go-side dispatcher.
+/// One instance per mesh that has the observer installed; cheap
+/// (no per-call allocation beyond the stack-local `RpcCallEventC`
+/// passed to the dispatcher).
+struct GoRpcObserver;
+
+impl RpcObserver for GoRpcObserver {
+    fn on_call(&self, evt: InnerRpcCallEvent) {
+        let dispatcher = match OBSERVER_DISPATCHER.get() {
+            Some(d) => *d,
+            None => return,
+        };
+        let (status_kind, status_message): (u8, Option<&str>) = match &evt.status {
+            InnerRpcCallStatus::Ok => (NET_RPC_STATUS_OK, None),
+            InnerRpcCallStatus::Error(msg) => (NET_RPC_STATUS_ERROR, Some(msg.as_str())),
+            InnerRpcCallStatus::Timeout => (NET_RPC_STATUS_TIMEOUT, None),
+            InnerRpcCallStatus::Canceled => (NET_RPC_STATUS_CANCELED, None),
+        };
+        let direction = match evt.direction {
+            InnerRpcDirection::Outbound => NET_RPC_DIRECTION_OUTBOUND,
+            InnerRpcDirection::Inbound => NET_RPC_DIRECTION_INBOUND,
+        };
+        let (msg_ptr, msg_len) = match status_message {
+            Some(s) => (s.as_ptr(), s.len()),
+            None => (std::ptr::null(), 0),
+        };
+        let c_evt = RpcCallEventC {
+            caller: evt.caller,
+            callee: evt.callee,
+            method_ptr: evt.method.as_ptr(),
+            method_len: evt.method.len(),
+            latency_ms: evt.latency_ms,
+            status_kind,
+            status_message_ptr: msg_ptr,
+            status_message_len: msg_len,
+            request_bytes: evt.request_bytes,
+            response_bytes: evt.response_bytes,
+            direction,
+            ts_unix_ms: evt.ts_unix_ms,
+        };
+        // SAFETY: dispatcher is a Go-registered C function with the
+        // documented `RpcObserverFn` signature; `&c_evt` is a valid
+        // pointer to a stack-local POD that outlives this call.
+        unsafe { dispatcher(&c_evt as *const _) };
+    }
+}
+
+/// Enable (`enabled != 0`) or clear (`enabled == 0`) the observer
+/// on the given MeshRpc.
+///
+/// When enabled, the substrate calls the dispatcher registered
+/// via [`net_rpc_set_observer_dispatcher`] for every completed
+/// outbound RPC.
+///
+/// Returns:
+///   - `NET_RPC_OK` on success.
+///   - `NET_RPC_ERR_NULL` if `handle` is NULL.
+///   - `NET_RPC_ERR_NO_DISPATCHER` if enabling but no dispatcher
+///     was registered yet via
+///     [`net_rpc_set_observer_dispatcher`].
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_observer_install(
+    handle: *const MeshRpcHandle,
+    enabled: c_int,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if enabled != 0 {
+        if OBSERVER_DISPATCHER.get().is_none() {
+            return NET_RPC_ERR_NO_DISPATCHER;
+        }
+        let obs: Arc<dyn RpcObserver> = Arc::new(GoRpcObserver);
+        h.node.set_rpc_observer(Some(obs));
+    } else {
+        h.node.set_rpc_observer(None);
+    }
+    NET_RPC_OK
+}
+
+/// Snapshot the per-service nRPC metrics registry. On success
+/// writes `(out_json_ptr, out_json_len)` to a heap-allocated
+/// UTF-8 JSON document; caller frees via [`net_rpc_response_free`].
+///
+/// JSON shape — stable across ABI 0x0003 and forward:
+/// ```json
+/// {
+///   "services": [
+///     {
+///       "service": "echo",
+///       "calls_total": 42,
+///       "errors_no_route": 0,
+///       "errors_timeout": 1,
+///       "errors_server": 0,
+///       "errors_transport": 0,
+///       "in_flight": 0,
+///       "latency_sum_ns": 1234567,
+///       "latency_count": 42,
+///       "latency_buckets": [10, 22, 30, ...],
+///       "handler_invocations_total": 0,
+///       "handler_panics_total": 0,
+///       "handler_in_flight": 0,
+///       "handler_duration_sum_ns": 0,
+///       "handler_duration_count": 0,
+///       "handler_duration_buckets": [...],
+///       "streaming_chunks_emitted_total": 0,
+///       "streaming_chunks_dropped_total": 0,
+///       "capability_denied_total": 0
+///     }
+///   ]
+/// }
+/// ```
+///
+/// Returns:
+///   - `NET_RPC_OK` on success.
+///   - `NET_RPC_ERR_NULL` if `handle` / any out-param is NULL.
+///   - `NET_RPC_ERR_CALL_FAILED` if the JSON serialize fails
+///     (allocator OOM); `out_err` carries the diagnostic.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_metrics_snapshot(
+    handle: *const MeshRpcHandle,
+    out_json_ptr: *mut *mut u8,
+    out_json_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        write_err(out_err, "MeshRpc handle is NULL".into());
+        return NET_RPC_ERR_NULL;
+    };
+    if out_json_ptr.is_null() || out_json_len.is_null() {
+        write_err(out_err, "out_json_ptr / out_json_len is NULL".into());
+        return NET_RPC_ERR_NULL;
+    }
+    let snapshot = h.node.rpc_metrics_snapshot();
+    let value = serde_json::json!({
+        "services": snapshot.services.iter().map(|m| serde_json::json!({
+            "service": m.service,
+            "calls_total": m.calls_total,
+            "errors_no_route": m.errors_no_route,
+            "errors_timeout": m.errors_timeout,
+            "errors_server": m.errors_server,
+            "errors_transport": m.errors_transport,
+            "in_flight": m.in_flight,
+            "latency_sum_ns": m.latency_sum_ns,
+            "latency_count": m.latency_count,
+            "latency_buckets": m.latency_buckets,
+            "handler_invocations_total": m.handler_invocations_total,
+            "handler_panics_total": m.handler_panics_total,
+            "handler_in_flight": m.handler_in_flight,
+            "handler_duration_sum_ns": m.handler_duration_sum_ns,
+            "handler_duration_count": m.handler_duration_count,
+            "handler_duration_buckets": m.handler_duration_buckets,
+            "streaming_chunks_emitted_total": m.streaming_chunks_emitted_total,
+            "streaming_chunks_dropped_total": m.streaming_chunks_dropped_total,
+            "capability_denied_total": m.capability_denied_total,
+        })).collect::<Vec<_>>(),
+    });
+    let bytes = match serde_json::to_vec(&value) {
+        Ok(v) => v,
+        Err(e) => {
+            write_err(out_err, format!("metrics serialize failed: {e}"));
+            return NET_RPC_ERR_CALL_FAILED;
+        }
+    };
+    write_response(bytes, out_json_ptr, out_json_len);
+    NET_RPC_OK
+}
+
+// =========================================================================
 // Tests for pure-logic helpers.
 // =========================================================================
 
@@ -3195,11 +3475,10 @@ mod tests {
     #[test]
     fn abi_version_matches_constant() {
         assert_eq!(net_rpc_abi_version(), NET_RPC_ABI_VERSION);
-        // Phase B8-1 bumps to 0x0002 — adds client-streaming
-        // caller-side surface. Pin so a regression to 0x0001
-        // (or skipping ahead to 0x0003 without B8-2 landing)
-        // surfaces in tests.
-        assert_eq!(NET_RPC_ABI_VERSION, 0x0002);
+        // Phase S1-A1 bumps to 0x0003 — adds observer +
+        // metrics-snapshot surface. Pin so a regression to 0x0002
+        // (or accidental further bumps) surfaces in tests.
+        assert_eq!(NET_RPC_ABI_VERSION, 0x0003);
     }
 
     /// `net_rpc_client_stream_send` on a NULL handle returns

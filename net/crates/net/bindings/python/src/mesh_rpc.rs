@@ -55,9 +55,10 @@ use tokio::runtime::Runtime;
 use tokio::task::AbortHandle;
 
 use ::net::adapter::net::cortex::{
-    RequestStream as InnerRequestStream, RpcClientStreamingHandler, RpcContext, RpcDuplexHandler,
-    RpcHandler, RpcHandlerError, RpcResponsePayload, RpcResponseSink as InnerRpcResponseSink,
-    RpcStatus, RpcStreamingContext,
+    RequestStream as InnerRequestStream, RpcCallEvent as InnerRpcCallEvent,
+    RpcCallStatus as InnerRpcCallStatus, RpcClientStreamingHandler, RpcContext,
+    RpcDirection as InnerRpcDirection, RpcDuplexHandler, RpcHandler, RpcHandlerError, RpcObserver,
+    RpcResponsePayload, RpcResponseSink as InnerRpcResponseSink, RpcStatus, RpcStreamingContext,
 };
 use ::net::adapter::net::mesh_rpc::{
     CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
@@ -65,6 +66,7 @@ use ::net::adapter::net::mesh_rpc::{
     DuplexStream as InnerDuplexStream, RpcError as InnerRpcError, RpcStream as InnerRpcStream,
     ServeHandle as InnerServeHandle,
 };
+use ::net::adapter::net::mesh_rpc_metrics::ServiceMetrics as InnerServiceMetrics;
 use ::net::adapter::net::MeshNode;
 
 // ============================================================================
@@ -1483,6 +1485,184 @@ where
 }
 
 // ============================================================================
+// Observer + metrics POD shapes (S2-A2).
+//
+// Mirrors the napi binding's `RpcCallEventJs` / `ServiceMetricsJs`
+// / `RpcMetricsSnapshotJs` shapes. The only Python-specific
+// choices are:
+//   - u64 fields → plain Python int (PyO3 handles the conversion;
+//     no `BigInt` equivalent needed because Python ints are
+//     arbitrary precision).
+//   - `RpcCallStatus` tagged union → `status_kind: str` +
+//     `status_message: Optional[str]`. Same shape as the JS POD.
+//   - `RpcDirection` enum → `direction: str` (`"outbound"` /
+//     `"inbound"`).
+// ============================================================================
+
+/// Single observed RPC call boundary. Surfaced to the observer
+/// callback installed via `MeshRpc.set_observer`. Read fields
+/// directly — all attributes are plain ints / strs.
+#[pyclass(name = "RpcCallEvent", module = "_net", get_all)]
+pub struct PyRpcCallEvent {
+    /// 64-bit node id of the calling node.
+    pub caller: u64,
+    /// 64-bit node id of the responding node.
+    pub callee: u64,
+    /// Service / method name.
+    pub method: String,
+    /// Elapsed time in milliseconds.
+    pub latency_ms: u32,
+    /// `"ok"` | `"error"` | `"timeout"` | `"canceled"`. Match on
+    /// this discriminant before reading `status_message`.
+    pub status_kind: String,
+    /// Populated only when `status_kind == "error"`. Carries an
+    /// operator-readable diagnostic from the substrate.
+    pub status_message: Option<String>,
+    /// Wire payload size of the request body (0 when not
+    /// available).
+    pub request_bytes: u32,
+    /// Wire payload size of the response body (0 when not
+    /// available).
+    pub response_bytes: u32,
+    /// `"outbound"` (this node initiated) or `"inbound"` (this
+    /// node received). v1 only emits `"outbound"`.
+    pub direction: String,
+    /// Unix-ms timestamp captured at fire time.
+    pub ts_unix_ms: u64,
+}
+
+impl From<&InnerRpcCallEvent> for PyRpcCallEvent {
+    fn from(evt: &InnerRpcCallEvent) -> Self {
+        let (status_kind, status_message) = match &evt.status {
+            InnerRpcCallStatus::Ok => ("ok", None),
+            InnerRpcCallStatus::Error(msg) => ("error", Some(msg.clone())),
+            InnerRpcCallStatus::Timeout => ("timeout", None),
+            InnerRpcCallStatus::Canceled => ("canceled", None),
+        };
+        let direction = match evt.direction {
+            InnerRpcDirection::Outbound => "outbound",
+            InnerRpcDirection::Inbound => "inbound",
+        };
+        Self {
+            caller: evt.caller,
+            callee: evt.callee,
+            method: evt.method.clone(),
+            latency_ms: evt.latency_ms,
+            status_kind: status_kind.to_string(),
+            status_message,
+            request_bytes: evt.request_bytes,
+            response_bytes: evt.response_bytes,
+            direction: direction.to_string(),
+            ts_unix_ms: evt.ts_unix_ms,
+        }
+    }
+}
+
+/// Per-service caller- + server-side nRPC counters at a point
+/// in time. Element of `RpcMetricsSnapshot.services`.
+#[pyclass(name = "ServiceMetrics", module = "_net", get_all)]
+pub struct PyServiceMetrics {
+    pub service: String,
+    // ---- caller-side ----
+    pub calls_total: u64,
+    pub errors_no_route: u64,
+    pub errors_timeout: u64,
+    pub errors_server: u64,
+    pub errors_transport: u64,
+    pub in_flight: i64,
+    pub latency_sum_ns: u64,
+    pub latency_count: u64,
+    pub latency_buckets: Vec<u64>,
+    // ---- server-side ----
+    pub handler_invocations_total: u64,
+    pub handler_panics_total: u64,
+    pub handler_in_flight: i64,
+    pub handler_duration_sum_ns: u64,
+    pub handler_duration_count: u64,
+    pub handler_duration_buckets: Vec<u64>,
+    pub streaming_chunks_emitted_total: u64,
+    pub streaming_chunks_dropped_total: u64,
+    pub capability_denied_total: u64,
+}
+
+impl From<&InnerServiceMetrics> for PyServiceMetrics {
+    fn from(m: &InnerServiceMetrics) -> Self {
+        Self {
+            service: m.service.clone(),
+            calls_total: m.calls_total,
+            errors_no_route: m.errors_no_route,
+            errors_timeout: m.errors_timeout,
+            errors_server: m.errors_server,
+            errors_transport: m.errors_transport,
+            in_flight: m.in_flight,
+            latency_sum_ns: m.latency_sum_ns,
+            latency_count: m.latency_count,
+            latency_buckets: m.latency_buckets.clone(),
+            handler_invocations_total: m.handler_invocations_total,
+            handler_panics_total: m.handler_panics_total,
+            handler_in_flight: m.handler_in_flight,
+            handler_duration_sum_ns: m.handler_duration_sum_ns,
+            handler_duration_count: m.handler_duration_count,
+            handler_duration_buckets: m.handler_duration_buckets.clone(),
+            streaming_chunks_emitted_total: m.streaming_chunks_emitted_total,
+            streaming_chunks_dropped_total: m.streaming_chunks_dropped_total,
+            capability_denied_total: m.capability_denied_total,
+        }
+    }
+}
+
+/// Snapshot of the per-service nRPC metrics registry. Returned
+/// by `MeshRpc.metrics_snapshot`.
+#[pyclass(name = "RpcMetricsSnapshot", module = "_net", get_all)]
+pub struct PyRpcMetricsSnapshot {
+    /// One entry per service that has been called at least once
+    /// since the mesh was created. Sorted by service name.
+    pub services: Vec<Py<PyServiceMetrics>>,
+}
+
+// ----------------------------------------------------------------------
+// Observer trampoline.
+//
+// The substrate calls `RpcObserver::on_call` synchronously from
+// the dispatch task. We bridge that to a Python callable by
+// dispatching the call onto the tokio runtime's blocking pool —
+// the dispatch thread enqueues + returns immediately, never
+// blocking on GIL acquisition. The blocking pool is bounded; if
+// it fills up, `Handle::spawn_blocking` will block briefly
+// queueing the closure, which is the documented "callbacks must
+// be cheap" backpressure path. Errors raised by the Python
+// callback are silently swallowed — observers can't influence
+// the in-flight call.
+// ----------------------------------------------------------------------
+
+struct PyRpcObserver {
+    callable: Py<PyAny>,
+    runtime: Arc<Runtime>,
+}
+
+impl RpcObserver for PyRpcObserver {
+    fn on_call(&self, evt: InnerRpcCallEvent) {
+        let callable = Python::attach(|py| self.callable.clone_ref(py));
+        // Spawn a blocking task on the runtime so GIL acquisition
+        // never blocks the substrate dispatch thread. The returned
+        // JoinHandle is dropped — blocking tasks run to completion
+        // regardless (drop doesn't cancel).
+        self.runtime.spawn_blocking(move || {
+            Python::attach(|py| {
+                let py_evt = Py::new(py, PyRpcCallEvent::from(&evt));
+                let py_evt = match py_evt {
+                    Ok(o) => o,
+                    Err(_) => return,
+                };
+                // Ignore the result + any raised exception. A
+                // misbehaving observer must not crash the substrate.
+                let _ = callable.call1(py, (py_evt,));
+            });
+        });
+    }
+}
+
+// ============================================================================
 // PyMeshRpc — the public envelope class.
 //
 // Constructed via `MeshRpc(net_mesh)` — takes the existing NetMesh
@@ -1790,6 +1970,60 @@ impl PyMeshRpc {
     fn find_service_nodes(&self, py: Python<'_>, service: String) -> Vec<u64> {
         let node = self.node.clone();
         py.detach(|| node.find_service_nodes(&service))
+    }
+
+    // ---- observer + metrics (S2-A2) ------------------------------------
+
+    /// Install (pass a callable) or clear (pass `None`) the
+    /// caller-side nRPC observer. Replaces any previously-
+    /// installed observer.
+    ///
+    /// The callable fires once per completed outbound RPC. The
+    /// substrate dispatch thread enqueues the call onto the
+    /// tokio runtime's blocking pool, so the dispatch hot path
+    /// never blocks on GIL acquisition. Exceptions raised by the
+    /// observer are silently swallowed — observers can't
+    /// influence the in-flight call.
+    ///
+    /// Callbacks must be cheap: push events into a queue or ring
+    /// buffer for slow consumers; do not do work inline.
+    ///
+    /// v1 emits only `direction == "outbound"` events.
+    #[pyo3(signature = (observer=None))]
+    fn set_observer(&self, py: Python<'_>, observer: Option<Py<PyAny>>) -> PyResult<()> {
+        let observer = observer.filter(|o| !o.is_none(py));
+        match observer {
+            Some(callable) => {
+                if !callable.bind(py).is_callable() {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(
+                        "observer must be a callable or None",
+                    ));
+                }
+                let obs: Arc<dyn RpcObserver> = Arc::new(PyRpcObserver {
+                    callable,
+                    runtime: self.runtime.clone(),
+                });
+                self.node.set_rpc_observer(Some(obs));
+            }
+            None => {
+                self.node.set_rpc_observer(None);
+            }
+        }
+        Ok(())
+    }
+
+    /// Snapshot the per-service nRPC metrics registry. Cheap —
+    /// one DashMap iteration. Safe to call on every Prometheus
+    /// scrape. Returns an `RpcMetricsSnapshot` whose `services`
+    /// list each carries the caller + server-side counters.
+    fn metrics_snapshot(&self, py: Python<'_>) -> PyResult<Py<PyRpcMetricsSnapshot>> {
+        let inner = self.node.rpc_metrics_snapshot();
+        let services: PyResult<Vec<Py<PyServiceMetrics>>> = inner
+            .services
+            .iter()
+            .map(|m| Py::new(py, PyServiceMetrics::from(m)))
+            .collect();
+        Py::new(py, PyRpcMetricsSnapshot { services: services? })
     }
 }
 

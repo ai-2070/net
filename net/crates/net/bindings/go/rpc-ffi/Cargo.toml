@@ -38,6 +38,10 @@ libc = "0.2"
 # `StreamExt::next` for polling the SDK's `RpcStream` from the
 # C-ABI's blocking `net_rpc_stream_next` entry point.
 futures = "0.3"
+# Emits the `net_rpc_metrics_snapshot` payload — variable-length
+# data (per-service histograms + bucket arrays) serialized as
+# JSON so the Go side can decode with `encoding/json`.
+serde_json = "1"
 
 # `[profile.release]` intentionally omitted — cargo ignores non-root
 # profiles ("profiles for the non root package will be ignored"). The

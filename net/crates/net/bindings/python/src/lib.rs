@@ -2337,6 +2337,9 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<mesh_rpc::PyServeHandle>()?;
         m.add_class::<mesh_rpc::PyRpcStream>()?;
         m.add_class::<mesh_rpc::PyCancellable>()?;
+        m.add_class::<mesh_rpc::PyRpcCallEvent>()?;
+        m.add_class::<mesh_rpc::PyServiceMetrics>()?;
+        m.add_class::<mesh_rpc::PyRpcMetricsSnapshot>()?;
         m.add("RpcError", m.py().get_type::<mesh_rpc::RpcError>())?;
         m.add(
             "RpcNoRouteError",

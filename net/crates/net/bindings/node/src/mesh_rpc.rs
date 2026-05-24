@@ -44,15 +44,19 @@ use napi_derive::napi;
 use tokio::task::AbortHandle;
 
 use ::net::adapter::net::cortex::{
-    RequestStream as InnerRequestStream, RpcClientStreamingHandler, RpcContext, RpcDuplexHandler,
-    RpcHandler, RpcHandlerError, RpcResponsePayload, RpcResponseSink as InnerRpcResponseSink,
-    RpcStatus, RpcStreamingContext,
+    RequestStream as InnerRequestStream, RpcCallEvent as InnerRpcCallEvent,
+    RpcCallStatus as InnerRpcCallStatus, RpcClientStreamingHandler, RpcContext,
+    RpcDirection as InnerRpcDirection, RpcDuplexHandler, RpcHandler, RpcHandlerError, RpcObserver,
+    RpcResponsePayload, RpcResponseSink as InnerRpcResponseSink, RpcStatus, RpcStreamingContext,
 };
 use ::net::adapter::net::mesh_rpc::{
     CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
     DuplexCallRaw as InnerDuplexCallRaw, DuplexSink as InnerDuplexSink,
     DuplexStream as InnerDuplexStream, RoutingPolicy as InnerRoutingPolicy,
     RpcError as InnerRpcError, RpcStream as InnerRpcStream, ServeHandle as InnerServeHandle,
+};
+use ::net::adapter::net::mesh_rpc_metrics::{
+    RpcMetricsSnapshot as InnerRpcMetricsSnapshot, ServiceMetrics as InnerServiceMetrics,
 };
 use ::net::adapter::net::MeshNode;
 
@@ -423,6 +427,196 @@ impl RpcHandler for NodeRpcHandler {
             headers: vec![],
             body: resp_buf.to_vec().into(),
         })
+    }
+}
+
+// ============================================================================
+// Observer + metrics POD shapes (S2-A1).
+//
+// The JS surface mirrors the substrate's `RpcCallEvent` and
+// `RpcMetricsSnapshot` types — the only encoding choices are:
+//   - u64 fields → `BigInt` (per the binding convention in
+//     aggregator.rs)
+//   - `RpcCallStatus` tagged union → flattened to
+//     `statusKind: "ok"|"error"|"timeout"|"canceled"` plus an
+//     optional `statusMessage` (populated only when statusKind ==
+//     "error"). napi-rs's `#[napi(object)]` POD layer doesn't
+//     support tagged unions natively; this string-discriminant
+//     shape is the same pattern the cortex error mapping uses
+//     for its `nrpc:<kind>:<msg>` prefix.
+//   - `RpcDirection` enum → flattened to `direction:
+//     "outbound"|"inbound"` for the same reason.
+// ============================================================================
+
+/// Single observed RPC call boundary. Surfaced to the observer
+/// callback installed via [`MeshRpc::set_observer`].
+#[napi(object)]
+pub struct RpcCallEventJs {
+    /// 64-bit node id of the calling node. Equal to the local
+    /// node id on outbound events.
+    pub caller: BigInt,
+    /// 64-bit node id of the responding node.
+    pub callee: BigInt,
+    /// Service / method name.
+    pub method: String,
+    /// Elapsed time in milliseconds.
+    pub latency_ms: u32,
+    /// `"ok"` | `"error"` | `"timeout"` | `"canceled"`. The JS
+    /// side should match on this discriminant before reading
+    /// `statusMessage`.
+    pub status_kind: String,
+    /// Populated only when `statusKind === "error"`. Carries an
+    /// operator-readable diagnostic from the substrate.
+    pub status_message: Option<String>,
+    /// Wire payload size of the request body (0 when not
+    /// available).
+    pub request_bytes: u32,
+    /// Wire payload size of the response body (0 when not
+    /// available).
+    pub response_bytes: u32,
+    /// `"outbound"` (this node initiated) or `"inbound"` (this
+    /// node received). v1 only emits `"outbound"`.
+    pub direction: String,
+    /// Unix-ms timestamp captured at fire time (best-effort; 0
+    /// on a pre-1970 clock).
+    pub ts_unix_ms: BigInt,
+}
+
+impl From<&InnerRpcCallEvent> for RpcCallEventJs {
+    fn from(evt: &InnerRpcCallEvent) -> Self {
+        let (status_kind, status_message) = match &evt.status {
+            InnerRpcCallStatus::Ok => ("ok", None),
+            InnerRpcCallStatus::Error(msg) => ("error", Some(msg.clone())),
+            InnerRpcCallStatus::Timeout => ("timeout", None),
+            InnerRpcCallStatus::Canceled => ("canceled", None),
+        };
+        let direction = match evt.direction {
+            InnerRpcDirection::Outbound => "outbound",
+            InnerRpcDirection::Inbound => "inbound",
+        };
+        Self {
+            caller: BigInt::from(evt.caller),
+            callee: BigInt::from(evt.callee),
+            method: evt.method.clone(),
+            latency_ms: evt.latency_ms,
+            status_kind: status_kind.to_string(),
+            status_message,
+            request_bytes: evt.request_bytes,
+            response_bytes: evt.response_bytes,
+            direction: direction.to_string(),
+            ts_unix_ms: BigInt::from(evt.ts_unix_ms),
+        }
+    }
+}
+
+/// Per-service caller- + server-side nRPC counters at a point
+/// in time. Element of [`RpcMetricsSnapshotJs::services`].
+#[napi(object)]
+pub struct ServiceMetricsJs {
+    pub service: String,
+    // ---- caller-side ----
+    pub calls_total: BigInt,
+    pub errors_no_route: BigInt,
+    pub errors_timeout: BigInt,
+    pub errors_server: BigInt,
+    pub errors_transport: BigInt,
+    pub in_flight: i64,
+    pub latency_sum_ns: BigInt,
+    pub latency_count: BigInt,
+    /// Cumulative bucket counts; index `i` corresponds to
+    /// `DEFAULT_LATENCY_BUCKETS_SECS[i]` in the substrate. Last
+    /// entry is the `+Inf` bucket.
+    pub latency_buckets: Vec<BigInt>,
+    // ---- server-side ----
+    pub handler_invocations_total: BigInt,
+    pub handler_panics_total: BigInt,
+    pub handler_in_flight: i64,
+    pub handler_duration_sum_ns: BigInt,
+    pub handler_duration_count: BigInt,
+    pub handler_duration_buckets: Vec<BigInt>,
+    pub streaming_chunks_emitted_total: BigInt,
+    pub streaming_chunks_dropped_total: BigInt,
+    pub capability_denied_total: BigInt,
+}
+
+impl From<&InnerServiceMetrics> for ServiceMetricsJs {
+    fn from(m: &InnerServiceMetrics) -> Self {
+        Self {
+            service: m.service.clone(),
+            calls_total: BigInt::from(m.calls_total),
+            errors_no_route: BigInt::from(m.errors_no_route),
+            errors_timeout: BigInt::from(m.errors_timeout),
+            errors_server: BigInt::from(m.errors_server),
+            errors_transport: BigInt::from(m.errors_transport),
+            in_flight: m.in_flight,
+            latency_sum_ns: BigInt::from(m.latency_sum_ns),
+            latency_count: BigInt::from(m.latency_count),
+            latency_buckets: m.latency_buckets.iter().copied().map(BigInt::from).collect(),
+            handler_invocations_total: BigInt::from(m.handler_invocations_total),
+            handler_panics_total: BigInt::from(m.handler_panics_total),
+            handler_in_flight: m.handler_in_flight,
+            handler_duration_sum_ns: BigInt::from(m.handler_duration_sum_ns),
+            handler_duration_count: BigInt::from(m.handler_duration_count),
+            handler_duration_buckets: m
+                .handler_duration_buckets
+                .iter()
+                .copied()
+                .map(BigInt::from)
+                .collect(),
+            streaming_chunks_emitted_total: BigInt::from(m.streaming_chunks_emitted_total),
+            streaming_chunks_dropped_total: BigInt::from(m.streaming_chunks_dropped_total),
+            capability_denied_total: BigInt::from(m.capability_denied_total),
+        }
+    }
+}
+
+/// Snapshot of the per-service nRPC metrics registry. Returned
+/// by [`MeshRpc::metrics_snapshot`].
+#[napi(object)]
+pub struct RpcMetricsSnapshotJs {
+    /// One entry per service that has been called at least once
+    /// since the mesh was created. Sorted by service name.
+    pub services: Vec<ServiceMetricsJs>,
+}
+
+impl From<&InnerRpcMetricsSnapshot> for RpcMetricsSnapshotJs {
+    fn from(s: &InnerRpcMetricsSnapshot) -> Self {
+        Self {
+            services: s.services.iter().map(ServiceMetricsJs::from).collect(),
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
+// Observer trampoline.
+//
+// The substrate calls `RpcObserver::on_call` *synchronously* from
+// the dispatch task; the firing thread blocks until the call
+// returns. We bridge that to a JS function via a TSFN in
+// `NonBlocking` call mode — napi-rs queues the JS invocation and
+// the dispatch thread returns immediately. If the JS event loop
+// is wedged and the TSFN queue fills, the call is dropped (the
+// `call` return status is ignored) — the documented
+// "callbacks must be cheap" contract.
+// ----------------------------------------------------------------------
+
+type RpcObserverTsfn = ThreadsafeFunction<RpcCallEventJs, (), RpcCallEventJs, napi::Status, false>;
+
+struct NodeRpcObserver {
+    tsfn: RpcObserverTsfn,
+}
+
+impl RpcObserver for NodeRpcObserver {
+    fn on_call(&self, evt: InnerRpcCallEvent) {
+        let js_evt = RpcCallEventJs::from(&evt);
+        // NonBlocking: never wedge the dispatch path. Dropped
+        // events are part of the contract (the alternative is
+        // backpressure into the substrate's hot path, which
+        // would convert a slow JS consumer into a mesh-wide
+        // latency regression). Status is intentionally ignored.
+        let _ = self
+            .tsfn
+            .call(js_evt, ThreadsafeFunctionCallMode::NonBlocking);
     }
 }
 
@@ -1696,6 +1890,50 @@ impl MeshRpc {
             .into_iter()
             .map(BigInt::from)
             .collect()
+    }
+
+    // ---- observer + metrics (S2-A1) ------------------------------------
+
+    /// Install (pass a function) or clear (pass `null` /
+    /// `undefined`) the caller-side nRPC observer. Replaces any
+    /// previously-installed observer.
+    ///
+    /// The callback fires synchronously from the substrate's
+    /// dispatch task on every completed outbound RPC. The TSFN
+    /// crosses the napi boundary in `NonBlocking` mode — if the
+    /// JS event loop is wedged and the queue fills, events are
+    /// **dropped**, not buffered. Callbacks must therefore be
+    /// cheap: push into a queue or ring buffer for slow
+    /// consumers, do not do work inline.
+    ///
+    /// v1 emits only `direction === "outbound"` events; the
+    /// substrate's server-side hook is a planned follow-up.
+    #[napi]
+    pub fn set_observer(
+        &self,
+        observer: Option<Function<'_, RpcCallEventJs, ()>>,
+    ) -> Result<()> {
+        match observer {
+            Some(f) => {
+                let tsfn: RpcObserverTsfn = f.build_threadsafe_function().build()?;
+                let obs: Arc<dyn RpcObserver> = Arc::new(NodeRpcObserver { tsfn });
+                self.node.set_rpc_observer(Some(obs));
+            }
+            None => {
+                self.node.set_rpc_observer(None);
+            }
+        }
+        Ok(())
+    }
+
+    /// Snapshot the per-service nRPC metrics registry. Cheap —
+    /// one DashMap iteration. Safe to call on every Prometheus
+    /// scrape. The returned object is a plain JS POD (BigInts
+    /// for u64 fields); read fields directly or feed into your
+    /// own exporter.
+    #[napi]
+    pub fn metrics_snapshot(&self) -> RpcMetricsSnapshotJs {
+        RpcMetricsSnapshotJs::from(&self.node.rpc_metrics_snapshot())
     }
 }
 
