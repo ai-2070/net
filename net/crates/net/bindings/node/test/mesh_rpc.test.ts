@@ -713,6 +713,148 @@ describe('AbortSignal wiring on the typed wrapper', () => {
   })
 })
 
+// ============================================================================
+// AbortSignal wiring on streaming calls — v3 C-B1 (NRPC_V3) extended
+// `wireAbortSignal` from unary-only to client-streaming + duplex.
+// Pin: `signal.aborted` mid-stream invokes raw.cancelCall(token) just
+// like unary; closing the typed call detaches the listener so a
+// post-close abort doesn't double-fire.
+// ============================================================================
+
+describe('AbortSignal wiring on streaming calls', () => {
+  // Minimal raw stub for the streaming entries that captures opts,
+  // tracks reservations + cancelCall invocations, and returns
+  // controllable stub call handles so we can observe signal
+  // propagation without rebuilding the napi backend.
+  class StreamingCancelTrackingRaw implements RawMeshRpc {
+    public reservations: bigint[] = []
+    public cancelCalls: bigint[] = []
+    public capturedOpts: CallOptions | undefined = undefined
+    private nextToken = 200n
+
+    async call(): Promise<Buffer> {
+      throw new Error('call not implemented')
+    }
+    async callService(): Promise<Buffer> {
+      throw new Error('callService not implemented')
+    }
+    async callStreaming(): Promise<never> {
+      throw new Error('callStreaming not implemented')
+    }
+    async callClientStream(
+      _target: bigint,
+      _service: string,
+      opts?: CallOptions,
+    ): Promise<RawClientStreamCall> {
+      this.capturedOpts = opts
+      return new StubClientStreamCall(Buffer.from('null', 'utf-8'))
+    }
+    serveClientStream(): ServeHandle {
+      throw new Error('serveClientStream not implemented')
+    }
+    async callDuplex(
+      _target: bigint,
+      _service: string,
+      opts?: CallOptions,
+    ): Promise<RawDuplexCall> {
+      this.capturedOpts = opts
+      return new StubDuplexCall(new StubDuplexStream([]))
+    }
+    serveDuplex(): ServeHandle {
+      throw new Error('serveDuplex not implemented')
+    }
+    serve(): ServeHandle {
+      throw new Error('serve not implemented')
+    }
+    findServiceNodes(): bigint[] {
+      return []
+    }
+    reserveCancelToken(): bigint {
+      const t = this.nextToken++
+      this.reservations.push(t)
+      return t
+    }
+    cancelCall(token: bigint): void {
+      this.cancelCalls.push(token)
+    }
+    setObserver(_o: unknown): void {
+      throw new Error('setObserver not implemented')
+    }
+    metricsSnapshot(): never {
+      throw new Error('metricsSnapshot not implemented')
+    }
+  }
+
+  it('callClientStream inserts a cancelToken when signal is provided', async () => {
+    const raw = new StreamingCancelTrackingRaw()
+    const rpc = new TypedMeshRpc(raw)
+    const ac = new AbortController()
+    const call = await rpc.callClientStream(0n, 'echo', { signal: ac.signal })
+    expect(raw.reservations.length).toBe(1)
+    expect(raw.capturedOpts?.cancelToken).toBe(raw.reservations[0])
+    // signal must NOT be passed through to the napi side.
+    expect(raw.capturedOpts?.signal).toBeUndefined()
+    await call.close()
+  })
+
+  it('aborting the signal mid-client-stream fires raw.cancelCall(token)', async () => {
+    const raw = new StreamingCancelTrackingRaw()
+    const rpc = new TypedMeshRpc(raw)
+    const ac = new AbortController()
+    const call = await rpc.callClientStream(0n, 'echo', { signal: ac.signal })
+    ac.abort()
+    expect(raw.cancelCalls.length).toBe(1)
+    expect(raw.cancelCalls[0]).toBe(raw.reservations[0])
+    await call.close()
+  })
+
+  it('closing the typed client-stream detaches the listener', async () => {
+    const raw = new StreamingCancelTrackingRaw()
+    const rpc = new TypedMeshRpc(raw)
+    const ac = new AbortController()
+    const call = await rpc.callClientStream(0n, 'echo', { signal: ac.signal })
+    await call.close()
+    // Post-close abort must NOT re-fire cancelCall.
+    ac.abort()
+    expect(raw.cancelCalls.length).toBe(0)
+  })
+
+  it('callDuplex inserts a cancelToken when signal is provided', async () => {
+    const raw = new StreamingCancelTrackingRaw()
+    const rpc = new TypedMeshRpc(raw)
+    const ac = new AbortController()
+    const call = await rpc.callDuplex(0n, 'echo', { signal: ac.signal })
+    expect(raw.reservations.length).toBe(1)
+    expect(raw.capturedOpts?.cancelToken).toBe(raw.reservations[0])
+    expect(raw.capturedOpts?.signal).toBeUndefined()
+    await call.close()
+  })
+
+  it('aborting the signal mid-duplex fires raw.cancelCall(token)', async () => {
+    const raw = new StreamingCancelTrackingRaw()
+    const rpc = new TypedMeshRpc(raw)
+    const ac = new AbortController()
+    const call = await rpc.callDuplex(0n, 'echo', { signal: ac.signal })
+    ac.abort()
+    expect(raw.cancelCalls.length).toBe(1)
+    expect(raw.cancelCalls[0]).toBe(raw.reservations[0])
+    await call.close()
+  })
+
+  it('after intoSplit + sink.close, the detach has transferred', async () => {
+    const raw = new StreamingCancelTrackingRaw()
+    const rpc = new TypedMeshRpc(raw)
+    const ac = new AbortController()
+    const call = await rpc.callDuplex(0n, 'echo', { signal: ac.signal })
+    const [sink, recvStream] = await call.intoSplit()
+    await sink.close()
+    void recvStream
+    // The sink owns the detach now; post-close abort is a no-op.
+    ac.abort()
+    expect(raw.cancelCalls.length).toBe(0)
+  })
+})
+
 describe('appError', () => {
   it('formats canonical nrpc:app_error:0x<code>:<body>', () => {
     const e = appError(0x8000, '{"err":"bad"}')
