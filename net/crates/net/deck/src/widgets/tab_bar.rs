@@ -118,11 +118,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, current: Tab) {
 /// trailing space). `avail` is the column count available to
 /// the strip. `current_idx` is the active tab — kept inside
 /// the returned window.
-fn scroll_window_horizontal(
-    widths: &[usize],
-    avail: usize,
-    current_idx: usize,
-) -> (usize, usize) {
+fn scroll_window_horizontal(widths: &[usize], avail: usize, current_idx: usize) -> (usize, usize) {
     let n = widths.len();
     if n == 0 || avail == 0 {
         return (0, 0);
@@ -219,7 +215,10 @@ mod tests {
     fn current_in_middle_window_contains_it() {
         let widths = vec![10, 10, 10, 10, 10];
         let (start, end) = scroll_window_horizontal(&widths, 25, 2);
-        assert!(start <= 2 && 2 < end, "window {start}..{end} missing cursor");
+        assert!(
+            start <= 2 && 2 < end,
+            "window {start}..{end} missing cursor"
+        );
     }
 
     /// Current at tail — window slides to the right edge.

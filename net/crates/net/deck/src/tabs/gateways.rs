@@ -223,10 +223,7 @@ fn render_table(
             let i = start + offset;
             let is_cursor = i == effective_cursor;
             let marker = if is_cursor { "▶" } else { " " };
-            let name_text = row
-                .channel_name
-                .clone()
-                .unwrap_or_else(|| "—".to_string());
+            let name_text = row.channel_name.clone().unwrap_or_else(|| "—".to_string());
             let name_style = if row.channel_name.is_none() {
                 theme::dim()
             } else if is_cursor {

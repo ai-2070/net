@@ -102,8 +102,7 @@ fn render_header(
     } else {
         theme::dim()
     };
-    let (health_text, health_style) =
-        super::subnets::health_rollup(&focus.members, snapshot);
+    let (health_text, health_style) = super::subnets::health_rollup(&focus.members, snapshot);
 
     let lines = vec![
         Line::from(vec![
@@ -195,7 +194,11 @@ fn render_members(
         Span::styled(format!("{} ", theme::SECTION_PREFIX), theme::green()),
         Span::styled("MEMBERS", theme::green_hi()),
         Span::styled(
-            format!("    {} of {} in snapshot", nodes_iter.len(), focus.members.len()),
+            format!(
+                "    {} of {} in snapshot",
+                nodes_iter.len(),
+                focus.members.len()
+            ),
             theme::chrome(),
         ),
         Span::styled(format!("    {pos}/{}", nodes_iter.len()), theme::dim()),

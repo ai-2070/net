@@ -1377,7 +1377,10 @@ impl App {
     /// subnet actually resolve when the operator drills in.
     fn subnet_rollups_with_local(
         &self,
-    ) -> (Option<net_sdk::subnets::SubnetId>, Vec<net_sdk::deck::SubnetRollup>) {
+    ) -> (
+        Option<net_sdk::subnets::SubnetId>,
+        Vec<net_sdk::deck::SubnetRollup>,
+    ) {
         let local = self.deck.local_subnet();
         let rollups = self.deck.subnets_with_members(None);
         #[cfg(feature = "demo")]
@@ -3215,13 +3218,7 @@ impl App {
                 peer: &local_peer,
                 local_maintenance: &self.snapshot.local_maintenance,
             };
-            tabs::subnet_page::render(
-                frame,
-                chunks[3],
-                focus,
-                &self.snapshot,
-                Some(local_row),
-            );
+            tabs::subnet_page::render(frame, chunks[3], focus, &self.snapshot, Some(local_row));
             widgets::footer::render(
                 frame,
                 chunks[4],
