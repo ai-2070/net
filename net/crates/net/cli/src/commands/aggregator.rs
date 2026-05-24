@@ -583,11 +583,14 @@ struct RemoteLsView {
 struct RemoteLsGroupRow {
     name: String,
     group_seed: String,
+    /// Subnet the aggregator summarizes, rendered as `"3.7"`
+    /// (dotted decimal). Read from the wire reply.
+    source_subnet: String,
+    /// Fold kinds the aggregator publishes summaries for,
+    /// rendered as `0x____` strings. Read from the wire reply.
+    fold_kinds: Vec<String>,
     healthy_count: u64,
     replica_count: u64,
-    /// Per-replica rows. Source-subnet + fold-kinds aren't on
-    /// the wire today; B-2 extends `RegistryGroupSummary` and
-    /// this row picks them up automatically once that lands.
     replicas: Vec<RemoteReplicaRow>,
 }
 
@@ -598,6 +601,8 @@ impl From<&net_sdk::aggregator::RegistryGroupSummary> for RemoteLsGroupRow {
         Self {
             name: g.name.clone(),
             group_seed: hex::encode(g.group_seed),
+            source_subnet: g.source_subnet.to_string(),
+            fold_kinds: g.fold_kinds.iter().map(|k| format!("{k:#06x}")).collect(),
             healthy_count,
             replica_count: replicas.len() as u64,
             replicas,
@@ -613,6 +618,12 @@ struct SpawnView {
     /// seed (today: `blake3(name)` — the daemon owns the
     /// derivation, the operator just sees the resulting bytes).
     group_seed: String,
+    /// Subnet the aggregator summarizes — operator sanity-check
+    /// that the resolved template matches expectations.
+    source_subnet: String,
+    /// Fold kinds the aggregator publishes summaries for,
+    /// rendered as `0x____` strings.
+    fold_kinds: Vec<String>,
     replica_count: u64,
     /// Per-replica rows — same shape as `ls`'s output so
     /// consumers can reuse parsers.
@@ -624,6 +635,8 @@ impl From<&net_sdk::aggregator::RegistryGroupSummary> for SpawnView {
         Self {
             name: g.name.clone(),
             group_seed: hex::encode(g.group_seed),
+            source_subnet: g.source_subnet.to_string(),
+            fold_kinds: g.fold_kinds.iter().map(|k| format!("{k:#06x}")).collect(),
             replica_count: g.replicas.len() as u64,
             replicas: g.replicas.iter().map(RemoteReplicaRow::from).collect(),
         }
