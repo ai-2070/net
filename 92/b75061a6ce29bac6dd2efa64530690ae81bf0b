@@ -1,0 +1,31 @@
+net/crates/net/deck/src/tabs/subnets.rs
+  s_099fa7d871e34d::t_b9e1911f44a65d 1-4,6-7,14-15,21,25-26,36,61,63-73,78-87,89-102,106,110,118-123,125-126,131,155,163-169
+net/crates/net/deck/src/tabs/aggregators.rs
+  s_099fa7d871e34d::t_81cff548f8e8b6 1-4,6-12,18,21-22,28,36,57-72,78-89,91-104,108,112,120,123,133-141,153-154,157,159-160,168,176-182
+net/crates/net/deck/src/app.rs
+  s_099fa7d871e34d::t_9cbf1a0b941ee0 2232-2262,2264-2265,2269-2281
+  s_099fa7d871e34d::t_4cb0cd7a4d3f82 571-572
+  s_099fa7d871e34d::t_d850c75c0b33e2 3190-3192
+  s_099fa7d871e34d::t_d52f88d4b5f253 212-216
+  s_099fa7d871e34d::t_5ab92e9941fb2b 2379-2386
+  s_099fa7d871e34d::t_277927dc69c37d 2263,2266-2268
+  s_099fa7d871e34d::t_eec02d8206fb2d 2324-2325
+  s_099fa7d871e34d::t_e412db95ce7929 3196-3198
+  s_099fa7d871e34d::t_57208a62ff13d4 1795-1808
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "92b75061a6ce29bac6dd2efa64530690ae81bf0b",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
