@@ -72,12 +72,14 @@ fn node_focus_chips() -> Line<'static> {
     Line::from(spans)
 }
 
-/// Chips for the SUBNET focus page. Read-only today — Enter
-/// could pivot to the cursored member node once that wire-up
-/// lands; for now `Esc` is the only exit.
+/// Chips for the SUBNET focus page. j/k walks the member
+/// table; Enter drills into the NODE focus page for the
+/// cursored member.
 fn subnet_focus_chips() -> Line<'static> {
     let mut spans = base_nav();
     spans.extend([
+        chip_key("Enter"),
+        chip_desc(" node detail   "),
         chip_key("Esc"),
         chip_desc(" back   "),
         chip_key("?"),

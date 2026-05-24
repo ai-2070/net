@@ -893,6 +893,47 @@ impl App {
         }
     }
 
+    /// Step the SUBNET focus page's member cursor, clamped to
+    /// the visible (in-snapshot) member count.
+    fn step_subnet_member_cursor(&mut self, delta: i32) {
+        let Some(focus) = self.subnet_focus.as_ref() else {
+            return;
+        };
+        let n = crate::tabs::subnet_page::visible_member_count(
+            focus,
+            &self.snapshot,
+            Some(self.this_node),
+        );
+        if n == 0 {
+            return;
+        }
+        let cur = focus.member_cursor as i64 + delta as i64;
+        let last = n.saturating_sub(1) as i64;
+        let next = cur.clamp(0, last) as usize;
+        if let Some(f) = self.subnet_focus.as_mut() {
+            f.member_cursor = next;
+        }
+    }
+
+    /// Open the NODE focus page for the cursored member of the
+    /// drilled subnet. Drops `subnet_focus` so the render
+    /// dispatcher promotes the node page in its place — same
+    /// shape as `open_cursored_node_placement`.
+    fn open_cursored_subnet_member(&mut self) {
+        let Some(focus) = self.subnet_focus.as_ref() else {
+            return;
+        };
+        let Some(id) = crate::tabs::subnet_page::cursored_member_id(
+            focus,
+            &self.snapshot,
+            Some(self.this_node),
+        ) else {
+            return;
+        };
+        self.subnet_focus = None;
+        self.focus_host(id, None);
+    }
+
     /// Open the cursored placement daemon's Daemon page from the
     /// Node page focus.
     fn open_cursored_node_placement(&mut self) {
@@ -1298,6 +1339,7 @@ impl App {
             subnet: row.subnet,
             members: row.members.clone(),
             is_local: row.is_local,
+            member_cursor: 0,
         });
     }
 
@@ -1655,9 +1697,9 @@ impl App {
             }
         }
         // Subnet focus page absorber. Mirrors the node-focus
-        // shape: Esc / tab-switch drop the focus; navigation
-        // keys are read-only (no Enter pivot today — the
-        // member list doesn't have child detail pages).
+        // shape: Esc / tab-switch drop the focus; j/k/g/G walk
+        // the members table; Enter drills into the NODE focus
+        // page for the cursored member.
         if self.subnet_focus.is_some() {
             if matches!(code, KeyCode::Esc) {
                 self.subnet_focus = None;
@@ -1666,6 +1708,36 @@ impl App {
             if is_tab_switch {
                 self.subnet_focus = None;
                 // fall through to the normal handler
+            } else if matches!(code, KeyCode::Down | KeyCode::Char('j' | 's')) {
+                self.step_subnet_member_cursor(1);
+                return;
+            } else if matches!(code, KeyCode::Up | KeyCode::Char('k' | 'w')) {
+                self.step_subnet_member_cursor(-1);
+                return;
+            } else if matches!(code, KeyCode::Char('g')) {
+                if let Some(f) = self.subnet_focus.as_mut() {
+                    f.member_cursor = 0;
+                }
+                return;
+            } else if matches!(code, KeyCode::Char('G')) {
+                let n = self
+                    .subnet_focus
+                    .as_ref()
+                    .map(|f| {
+                        crate::tabs::subnet_page::visible_member_count(
+                            f,
+                            &self.snapshot,
+                            Some(self.this_node),
+                        )
+                    })
+                    .unwrap_or(0);
+                if let Some(f) = self.subnet_focus.as_mut() {
+                    f.member_cursor = n.saturating_sub(1);
+                }
+                return;
+            } else if matches!(code, KeyCode::Enter) {
+                self.open_cursored_subnet_member();
+                return;
             } else if matches!(code, KeyCode::Char('?')) {
                 self.modal = Some(Modal::Help);
                 return;
@@ -3131,7 +3203,19 @@ impl App {
         // SUBNET focus page — same pre-emption shape as the
         // node / daemon focus pages.
         if let Some(focus) = self.subnet_focus.as_ref() {
-            tabs::subnet_page::render(frame, chunks[3], focus, &self.snapshot);
+            let local_peer = self.local_peer_snapshot();
+            let local_row = tabs::subnet_page::LocalMemberRow {
+                id: self.this_node,
+                peer: &local_peer,
+                local_maintenance: &self.snapshot.local_maintenance,
+            };
+            tabs::subnet_page::render(
+                frame,
+                chunks[3],
+                focus,
+                &self.snapshot,
+                Some(local_row),
+            );
             widgets::footer::render(
                 frame,
                 chunks[4],
