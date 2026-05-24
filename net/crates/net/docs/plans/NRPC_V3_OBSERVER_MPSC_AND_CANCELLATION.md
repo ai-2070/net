@@ -11,15 +11,18 @@ Scope: close the two real DX gaps the v1 typed-nRPC surface left open before dow
 
 2. **Unified streaming cancellation.** v1 shipped three different cancellation stories across the bindings — Node `close()`-only, pyo3 `close()` via the SDK's `close_notify`, Go ctx-honored-for-unary-but-not-for-streaming. The DX gap is real: every Node user discovers within an hour of writing a `callClientStream` loop that their `AbortSignal` is silently ignored. The fix is small — the napi `MeshRpc::call_client_stream` and `::call_duplex` need the same `cancel_token` shim the unary `call` already has (line range flagged at `bindings/node/src/mesh_rpc.rs:1572-1594`). Same for pyo3's `Cancellable` and Go's `ctx.Context`. Doing this now keeps `AbortSignal` and `context.Context` working from day one, which is what JS and Go users expect by reflex.
 
+3. **Cancellation as a substrate primitive, not three parallel binding shims.** Today the napi binding owns its own `cancel_registry: HashMap<u64, AbortHandle>` (`bindings/node/src/mesh_rpc.rs:NEXT_CANCEL_TOKEN` + `lock_cancel_registry`), the pyo3 binding owns its own `Cancellable` pyclass + watcher pattern, and the Go FFI owns its own `cancel_registry` (`bindings/go/rpc-ffi/src/lib.rs:cancel_registry`). Three parallel implementations of the same idea, each with its own race-condition quirks (Q18 in the Go FFI, CR-13 in the napi binding, the close-notify-via-tokio-select! pattern in pyo3). Promoting `cancel_token: Option<u64>` to a field on the SDK's `CallOptions` lets the SDK own the registry once — bindings shed their per-binding cancel state, each becomes a thin pass-through, and any future caller (CLI, deck, custom Rust consumer) gets cancel-token semantics for free. The substrate cost is small: ~80 lines for a `Mesh::reserve_cancel_token` / `Mesh::cancel(token)` pair + a per-Mesh `cancel_registry` keyed by token, mirroring the napi binding's existing pattern but at the right layer. Without this, the v3 cancellation work would replicate the same indirection in three places, which is exactly what made v1 ship three diverged stories in the first place.
+
 ## Locked decisions for this plan
 
 1. **mpsc bound = 1024 events per mesh.** Matches the existing `RpcResponseSink`'s pump-side mpsc bound (`mesh_rpc.rs:1326-1334`). Big enough that a momentarily-slow observer doesn't lose events under normal load; small enough that an actually-broken observer surfaces drops within seconds rather than minutes. Single shared queue per mesh (not per-binding-instance) so the drop counter is meaningful at the operator level.
 2. **Drop counter is a single u64 on the snapshot, not per-service.** Observer dispatch is per-mesh, not per-service — bucketing the drop counter by service would require a second tier of mpsc queues with no diagnostic benefit. Add as `RpcMetricsSnapshot::observer_dropped_total`.
-3. **Cancellation continues to thread through the existing `cancel_token` plumbing on the napi side.** No new substrate-level concept — the typed wrappers wire `AbortSignal` / `Cancellable` / `context.Context` into the binding-local cancel-token registry, then the binding's `call_client_stream` / `call_duplex` spawn the inner SDK call inside an abortable task (mirroring the unary path at `bindings/node/src/mesh_rpc.rs:1498-1506`).
-4. **No SDK-level changes.** All three bindings handle cancellation at their own layer (the SDK's `ClientStreamCallRaw` / `DuplexCallRaw` already drop-emit CANCEL on Drop; the bindings' abortable-spawn wrapper drops the call when the cancel token fires). This keeps the v3 plan self-contained at the binding layer and avoids cascading substrate changes.
+3. **Cancellation IS a substrate primitive.** Promote `cancel_token: Option<u64>` to a field on `net::adapter::net::mesh_rpc::CallOptions` and add a `Mesh::reserve_cancel_token() -> u64` + `Mesh::cancel(token)` pair that owns a single per-mesh `cancel_registry` keyed by token. Bindings stop owning their own registries; each binding's `AbortSignal` / `Cancellable` / `context.Context` watcher becomes a thin pass-through that mints + cancels the SDK-level token. The SDK's existing `call` / `call_service` / `call_streaming` / `call_client_stream` / `call_duplex` all honor `cancel_token` uniformly — Drop-on-cancel emits CANCEL on the wire via the existing SDK primitives (`UnaryCallGuard::Drop`, `ClientStreamCallRaw::Drop`, `DuplexCallRaw::Drop`).
+4. **Migration path: bindings' existing token plumbing becomes pass-through.** The napi `lock_cancel_registry()`, pyo3 `Cancellable`, and rpc-ffi `cancel_registry` stay as user-facing surfaces (don't break the public API on each binding) but their internals delegate to the SDK's registry instead of holding their own state. The race fixes (Q18 / CR-13 / orphan-TTL) live at the SDK once instead of three times.
 
-Tagged `[A | B | C | D | T]`:
+Tagged `[S | A | B | C | D | T]`:
 
+- **S** — substrate / SDK changes (new `CallOptions::cancel_token` + `Mesh::reserve_cancel_token` / `Mesh::cancel`).
 - **A** — observer mpsc + drop-counter (napi binding + pyo3 binding + C ABI / Go FFI).
 - **B** — Node TS typed wrapper changes (re-wire `AbortSignal` for streaming; drop `stripSignal` for streaming entries).
 - **C** — Python typed wrapper changes (extend `Cancellable` to streaming).
@@ -32,34 +35,37 @@ Tagged `[A | B | C | D | T]`:
 
 | ID    | Pri | Area                | Title                                                                                          |
 |-------|-----|---------------------|------------------------------------------------------------------------------------------------|
+| C-S1  | H   | SDK substrate       | Add `cancel_token: Option<u64>` to `CallOptions` + `Mesh::reserve_cancel_token` / `Mesh::cancel(token)` + per-mesh registry; thread through `call` / `call_service` / `call_streaming` / `call_client_stream` / `call_duplex` |
+| C-S2  | H   | SDK substrate       | SDK-level integration tests: per-call-shape cancel-mid-flight emits CANCEL on the wire; cancel-on-zero-token is a no-op; reservation+cancel race is safe |
 | O-A1  | H   | napi binding        | Replace sync `NodeRpcObserver` with bounded-mpsc + drop counter; surface `observerDroppedTotal` in `metricsSnapshot` |
 | O-A2  | H   | pyo3 binding        | Replace per-event `spawn_blocking` with bounded-mpsc + worker task + drop counter; surface in `metrics_snapshot` |
 | O-A3  | H   | C ABI / Go FFI      | Replace direct dispatcher invocation with Rust-side bounded-mpsc + worker; surface drop counter in JSON of `net_rpc_metrics_snapshot` |
-| C-A1  | H   | napi binding        | Raw `MeshRpc::call_client_stream` / `::call_duplex` honor `cancel_token` opt; abortable-spawn wrapper                              |
-| C-A2  | H   | pyo3 binding        | Raw `MeshRpc::call_client_stream` / `::call_duplex` honor `Cancellable` opts; cancel via Notify                                   |
-| C-A3  | H   | Go FFI              | Add `net_rpc_call_client_stream_cancellable` + `net_rpc_call_duplex_cancellable` FFI symbols mirroring the existing `net_rpc_call_streaming_cancellable` shape |
+| C-A1  | H   | napi binding        | Migrate `lock_cancel_registry` to thin pass-through over `Mesh::cancel`; populate `opts.cancel_token` for streaming entries (delete the local AbortHandle registry) |
+| C-A2  | H   | pyo3 binding        | Migrate `Cancellable` watcher to thin pass-through over `Mesh::cancel`; populate `opts.cancel_token` for streaming entries |
+| C-A3  | H   | Go FFI              | Migrate rpc-ffi `cancel_registry` to thin pass-through over `Mesh::cancel`; add `net_rpc_call_client_stream_cancellable` + `net_rpc_call_duplex_cancellable` symbols populating `opts.cancel_token` |
 | C-B1  | M   | Node TS wrapper     | `TypedMeshRpc.callClientStream` / `callDuplex` wire `AbortSignal` end-to-end (drop `stripSignal` for streaming) |
 | C-C1  | M   | Python wrapper      | `TypedMeshRpc.call_client_stream` / `call_duplex` extract `opts['cancel']` and propagate                       |
 | C-D1  | M   | Go wrapper          | `TypedCallClientStream` / `TypedCallDuplex` propagate `ctx` through the cancellable FFI variant                |
-| O-T1  | M   | fixture + tests     | Update `golden_vectors_streaming.json::observer_invariants.firing_contract` for mpsc shape; add `observerDroppedTotal` to `metrics_snapshot_invariants` |
+| O-T1  | M   | fixture + tests     | Update `golden_vectors_streaming.json::observer_invariants.firing_contract` for mpsc shape; add `observerDroppedTotal` to `metrics_snapshot_invariants`; document the SDK-level cancel-token contract in a new `cancellation_invariants` section |
 | O-T2  | M   | tests               | Rust-side reference: drop counter increments under sustained load when the observer is intentionally slow |
 | C-T1  | M   | tests               | Rust-side reference: cancel mid-stream observed by server as `RpcStatus::Cancelled` for client-stream + duplex |
 | C-T2  | L   | per-binding tests   | Stub-level test in each binding: signal-aborted / cancellable-cancelled / ctx-cancelled streaming call propagates to `close()` on the inner call |
 
-ABI version: this plan bumps `NET_RPC_ABI_VERSION` from `0x0003` → `0x0004` because of the new cancellable FFI symbols. Additive; 0x0003 consumers keep working.
+ABI version: this plan bumps `NET_RPC_ABI_VERSION` from `0x0003` → `0x0004` because of the new cancellable FFI symbols. Additive; 0x0003 consumers keep working. The new `CallOptions::cancel_token` field is also additive on the SDK side (existing `..Default::default()` callers continue to compile).
 
 ---
 
 ## Phasing
 
-**Recommended order: O-A then C-A then wrappers then tests.**
+**Recommended order: substrate-then-bindings.** Observer (O-A*) is independent of the cancellation work and can land in parallel.
 
-1. **Wave 1 — Observer mpsc dispatch (O-A1 / O-A2 / O-A3 in parallel).** Independent files; safe to land same PR cycle.
-2. **Wave 2 — Cancellation plumbing (C-A1 / C-A2 / C-A3 in parallel).** Same independence story. C-A3 bumps the ABI version; downstream Go consumers update at the same cut.
-3. **Wave 3 — Wrappers (C-B1, C-C1, C-D1 in parallel).** Thin pass-throughs once the raw layers honor cancel.
-4. **Wave 4 — Fixture + tests (O-T1, O-T2, C-T1, C-T2).** Pin the new contract; per-binding tests land alongside their wrappers.
+1. **Wave 1 — Observer mpsc dispatch (O-A1 / O-A2 / O-A3 in parallel).** Independent files; safe to land same PR cycle. No substrate dependency.
+2. **Wave 2 — Substrate cancellation primitive (C-S1 → C-S2 sequentially).** C-S1 lands the `cancel_token` field + `Mesh::cancel` API + per-mesh registry; C-S2 is the SDK-level test suite pinning the contract. **Blocks Wave 3** — the binding migrations all depend on the SDK primitive being in place.
+3. **Wave 3 — Binding cancellation migration (C-A1 / C-A2 / C-A3 in parallel, after Wave 2).** Each binding's existing cancel surface delegates to the SDK primitive instead of holding its own state. C-A3 also bumps the ABI version; downstream Go consumers update at the same cut.
+4. **Wave 4 — Typed wrappers (C-B1, C-C1, C-D1 in parallel, after Wave 3).** Thin pass-throughs once the raw layers honor cancel.
+5. **Wave 5 — Fixture + tests (O-T1, O-T2, C-T1, C-T2).** Pin the new contract; per-binding tests land alongside their wrappers.
 
-Wave 1 and Wave 2 can land same-PR-cycle as Wave 3 — the wrapper changes don't depend on the observer mpsc landing first, and the raw cancel surface depends only on its own binding's raw layer.
+Wave 1 and Wave 2 can run in parallel (different code paths, no overlap). Wave 3 strictly follows Wave 2. Wave 4 can run alongside Wave 3 if the wrapper authors are comfortable working against the SDK-side primitive directly (they're stubs for `Mesh::cancel`).
 
 ---
 
@@ -126,52 +132,140 @@ Wave 1 and Wave 2 can land same-PR-cycle as Wave 3 — the wrapper changes don't
 
 ---
 
-## Wave 2 — Streaming cancellation plumbing
+## Wave 2 — Substrate cancellation primitive
 
-### C-A1 — napi raw `call_client_stream` + `call_duplex` honor `cancel_token`
+### C-S1 — `CallOptions::cancel_token` + `Mesh::cancel(token)` + per-mesh registry
 
-**Rationale.** The v1 typed wrapper's `stripSignal` helper drops `opts.signal` for streaming entries because the raw napi side doesn't honor it. The fix is to mirror the unary path's `run_cancellable_call` pattern at `bindings/node/src/mesh_rpc.rs:1498-1506`: when `opts.cancel_token` is non-zero, spawn the inner SDK call inside an `AbortHandle`-instrumented task, register the abort handle in the cancel registry, drop on cancel.
+**Rationale.** Three bindings reinvent the same cancel-token registry today (napi, pyo3, Go FFI), each with its own race-condition fixes (Q18 / CR-13 / orphan-TTL pattern). Promote the primitive to the SDK once so the bindings shed their state.
 
 **Design.**
-- Extend `call_client_stream` and `call_duplex` (napi) to extract `cancel_token` from `CallOptions` and wrap the inner SDK call construction in `run_cancellable_call` (the existing helper).
-- The returned `ClientStreamCall` / `DuplexCall` napi class instances participate in the cancel registry: their `close()` method also cancels via the token if one was reserved. The user's typed wrapper drops `stripSignal` and instead uses `wireAbortSignal` for the streaming entries too — the existing helper at `mesh_rpc.ts:wireAbortSignal` already mints a token + registers a listener.
-- One subtle: the unary path's cancel-aborts-the-spawn-task pattern works because the spawn task IS the call. For client-stream / duplex, the "call" is a long-lived handle; the spawn task only constructs it. So cancel needs to (a) abort the construction task if cancel fires pre-construction, AND (b) call `close()` on the returned handle if cancel fires post-construction. Resolution: the `cancel_registry` entry stores both an abort handle (for the construction task) AND a `Weak<Notify>` pointing at the handle's `close_notify` — cancel fires both. The `ClientStreamCall` / `DuplexCall` napi classes already have `close_notify: Arc<Notify>` (`mesh_rpc.rs:611`); reuse it.
+
+- **New field on `net::adapter::net::mesh_rpc::CallOptions`:**
+  ```rust
+  /// Caller-side cancel token. Mint via [`Mesh::reserve_cancel_token`];
+  /// pair with [`Mesh::cancel`] from any thread to abort the in-flight
+  /// call. `None` (or `Some(0)`) → no cancel slot is reserved and the
+  /// call has no abort path beyond Drop-on-future-cancellation.
+  ///
+  /// Honored by every call shape: `call`, `call_service`, `call_streaming`,
+  /// `call_client_stream`, `call_duplex`. The substrate registers the
+  /// token's abort handle in a per-mesh registry at call construction
+  /// and removes it on call resolution (success, error, or Drop).
+  pub cancel_token: Option<u64>,
+  ```
+- **New `Mesh` API:**
+  ```rust
+  impl Mesh {
+      /// Reserve a fresh cancel token. Monotonically-increasing,
+      /// process-global, never reused. An unused reservation is
+      /// harmless (no entry inserted until paired with a call).
+      pub fn reserve_cancel_token(&self) -> u64;
+
+      /// Abort the in-flight call associated with `token`. Idempotent —
+      /// no-op if the token was never used, the call already resolved,
+      /// or the token == 0. Triggers Drop on the call's inner future,
+      /// which fires CANCEL on the wire via the existing primitives
+      /// (UnaryCallGuard::Drop, ClientStreamCallRaw::Drop,
+      /// DuplexCallRaw::Drop).
+      ///
+      /// Race-safe: a cancel that arrives BEFORE the call's abort
+      /// handle is registered (the gap between reserve and call
+      /// construction) latches a `cancelled = true` flag on the
+      /// orphan entry; when the call later registers, it observes
+      /// the flag and aborts immediately. Mirrors the napi
+      /// binding's CR-13 fix at the SDK layer.
+      pub fn cancel(&self, token: u64);
+  }
+  ```
+- **Registry implementation.** Per-Mesh `cancel_registry: parking_lot::Mutex<HashMap<u64, CancelEntry>>` where:
+  ```rust
+  struct CancelEntry {
+      cancelled: bool,                          // CR-13: cancel before register
+      handle: Option<tokio::task::AbortHandle>, // unary + streaming-construction
+      close_notify: Option<Weak<tokio::sync::Notify>>, // streaming post-construction
+      marked_at: Option<Instant>,               // Q18: orphan TTL
+  }
+  ```
+  Lifted directly from the napi binding's existing pattern (`bindings/node/src/mesh_rpc.rs:NEXT_CANCEL_TOKEN` + `lock_cancel_registry`) — same shape, same race fixes, just at the SDK layer. Includes the orphan-TTL GC (default 120s) from the Go FFI's Q18 fix.
+- **Per-call-shape integration.**
+  - `Mesh::call` / `Mesh::call_service`: spawn the inner future inside `tokio::spawn`, register the abort handle keyed by `cancel_token` (when set), remove on resolution. Drop on registry-aborted = CANCEL on the wire via the SDK's existing UnaryCallGuard.
+  - `Mesh::call_streaming`: the returned `RpcStream` already has Drop-on-drop CANCEL; register a `Weak<Notify>` against the stream's internal close-notify so `Mesh::cancel(token)` triggers the same drop path.
+  - `Mesh::call_client_stream` / `Mesh::call_duplex`: same as `call_streaming` — register against the call's internal `close_notify` (the substrate's `ClientStreamCallRaw::close_notify` and `DuplexCallRaw::close_notify` already exist for the napi binding's `Notify::notify_one()`-on-close pattern).
 
 **Files touched.**
-- `bindings/node/src/mesh_rpc.rs:1572-1594` (`call_client_stream`) — wrap in `run_cancellable_call` + thread `close_notify` into the cancel registry.
-- `bindings/node/src/mesh_rpc.rs:1598-1621` (`call_duplex`) — same pattern.
-- `bindings/node/src/mesh_rpc.rs:reserve_cancel_token / cancel_call` — extend the registry to track per-token weak refs to `close_notify`.
+- `net/src/adapter/net/mesh_rpc.rs` — `CallOptions::cancel_token` field + `Default` impl update.
+- `net/src/adapter/net/mesh.rs` — `Mesh::reserve_cancel_token` / `Mesh::cancel` + `cancel_registry` field + GC method.
+- `net/src/adapter/net/mesh_rpc.rs::call` / `::call_service` / `::call_streaming` / `::call_client_stream` / `::call_duplex` — registration + removal hooks at each call shape's construction site.
 
-**Test plan.**
-- Stub-level: mock `MeshRpc` that captures the constructed `ClientStreamCall`; signal the abort token; assert the call's `close_notify` fires (and `Close` is observed).
-- Integration: C-T1's mid-stream cancel test exercises the full path.
+**Risks.**
+- **Drop-on-cancel race in `call_client_stream`.** The streaming construction returns a handle; if cancel fires AFTER the future returns but BEFORE the caller binds the handle to a variable (a vanishingly-small window), the handle gets dropped on caller side anyway — no behavior change. If cancel fires DURING construction (the `block_on` inside the stream's `new`), the abort handle fires and the construction future drops cleanly. Drive both via integration tests in C-S2.
+- **Orphan GC interval.** The 120s TTL matches the existing Go FFI's Q18 value. If a downstream user reserves tokens at a rate exceeding ~10/s for tokens that never get used, the registry grows to ~1200 entries before GC catches up. Acceptable; the registry is a single HashMap, not on any hot path.
 
-### C-A2 — pyo3 raw `call_client_stream` + `call_duplex` honor `Cancellable`
+**Migration.** The napi binding's `lock_cancel_registry`, pyo3's `Cancellable`, and rpc-ffi's `cancel_registry` all keep their public surface (so downstream consumers don't see API breakage). Their internals delegate to `Mesh::reserve_cancel_token` + `Mesh::cancel` instead of maintaining a local HashMap. This is the C-A1 / C-A2 / C-A3 work in Wave 3.
 
-**Rationale.** Same as C-A1 for pyo3. The pyo3 side already has `Cancellable` (mirror of napi's cancel token) wired into unary calls — extend to streaming.
+### C-S2 — SDK-level cancel-contract integration tests
 
-**Design.**
-- Mirror the napi pattern: extract `opts['cancel']` from the optional dict, attach a watcher that fires `call.close()` via the SDK's `close_notify` on cancel. The existing `extract_cancellable` + `run_cancellable_call` helpers at `bindings/python/src/mesh_rpc.rs` accept the same pattern; extend their plumbing.
-- The returned `PyClientStreamCall` / `PyDuplexCall` already have `close_notify: Arc<Notify>` — reuse.
+**Rationale.** Pin the substrate-level cancel contract before any binding migration depends on it. Once C-A1 / C-A2 / C-A3 ship, the bindings test only their pass-through layer; the SDK tests pin the contract that the pass-through relies on.
+
+**Test cases.**
+- `cancel_unary_mid_flight_emits_cancel_on_wire` — `call` with `cancel_token = Some(t)`; concurrent `mesh.cancel(t)` after the request is in flight; assert the server-side handler observes CANCEL.
+- `cancel_streaming_mid_drain_emits_cancel` — same for `call_streaming`.
+- `cancel_client_stream_mid_send_emits_cancel` — same for `call_client_stream`.
+- `cancel_duplex_mid_send_emits_cancel` — same for `call_duplex`.
+- `cancel_before_construction_aborts_cleanly` — reserve token, immediately cancel, THEN issue the call; assert the call resolves to a `Cancelled` error without ever reaching the server.
+- `cancel_after_resolution_is_noop` — reserve, issue, await success, then cancel; assert no crash, no double-CANCEL.
+- `cancel_zero_token_is_noop` — `mesh.cancel(0)` is a no-op.
+- `orphan_ttl_gc_evicts_unused_reservations` — pin the 120s TTL behavior (use `tokio::time::pause()` to skip the wait).
 
 **Files touched.**
-- `bindings/python/src/mesh_rpc.rs` — extend `call_client_stream` + `call_duplex` to accept `opts: Option<dict>` (matching the unary signature) and propagate cancel.
-- `bindings/python/python/net/mesh_rpc.py` — drop the "cancel is not propagated to streaming layer" docstring caveat from `call_client_stream` / `call_duplex`.
+- `net/tests/integration_mesh_cancel.rs` — new file.
 
-### C-A3 — Go FFI: `net_rpc_call_client_stream_cancellable` + `net_rpc_call_duplex_cancellable`
+## Wave 3 — Binding cancellation migration (over the substrate primitive)
 
-**Rationale.** The Go FFI already has the `net_rpc_call_streaming_cancellable` precedent (line range flagged in `rpc-ffi/src/lib.rs:1163-1218`); ship the same shape for the client-stream and duplex entry points so Go's idiomatic `ctx.Context` cancellation works on those surfaces too. ABI version bumps to `0x0004`.
+### C-A1 — napi: migrate `lock_cancel_registry` to substrate pass-through; populate `cancel_token` for streaming
+
+**Rationale.** Once C-S1 lands, the napi binding's local `cancel_registry` is duplicative. Migrate it to a thin pass-through over `Mesh::cancel`, and populate `CallOptions::cancel_token` for streaming entries so they get the same semantics for free.
 
 **Design.**
+- `reserve_cancel_token` napi method → `self.node.reserve_cancel_token()` (delegates).
+- `cancel_call(token)` napi method → `self.node.cancel(token)` (delegates).
+- Delete the file-local `NEXT_CANCEL_TOKEN` AtomicU64 + the `lock_cancel_registry` HashMap.
+- `call_client_stream` and `call_duplex` napi methods: extract `cancel_token` from incoming `CallOptions` and populate the inner `InnerCallOptions::cancel_token` field. The substrate side handles the rest.
+- The user's typed wrapper drops `stripSignal` and instead uses `wireAbortSignal` for the streaming entries too — the existing helper at `mesh_rpc.ts:wireAbortSignal` already mints a token + registers a listener; with the napi raw side now honoring `cancel_token` on streaming calls, the wrapper is end-to-end.
+
+**Files touched.**
+- `bindings/node/src/mesh_rpc.rs` — delete `NEXT_CANCEL_TOKEN` + `lock_cancel_registry`; `reserve_cancel_token` / `cancel_call` become pass-throughs.
+- `bindings/node/src/mesh_rpc.rs:call_client_stream / call_duplex` — populate `opts.cancel_token` when set.
+
+### C-A2 — pyo3: migrate `Cancellable` watcher to substrate pass-through
+
+**Rationale.** Same as C-A1 for pyo3. The `Cancellable` pyclass surface stays (user-facing), but its `cancel()` method delegates to `Mesh::cancel` instead of latching a local flag + waking a Notify.
+
+**Design.**
+- `Cancellable.__init__` calls `mesh.reserve_cancel_token()` (stash the mesh handle at construction).
+- `Cancellable.cancel()` calls `self._mesh.cancel(self._token)`.
+- `call_client_stream` / `call_duplex` extract `opts['cancel']` and populate `opts.cancel_token` on the inner `CallOptions`.
+- The Notify-based `close_notify` path on `PyClientStreamCall` / `PyDuplexCall` stays as an internal implementation detail; the substrate registers a `Weak<Notify>` against it on registration (per C-S1's design).
+
+**Files touched.**
+- `bindings/python/src/mesh_rpc.rs` — `PyCancellable` delegation; `call_client_stream` / `call_duplex` populate `cancel_token`.
+- `bindings/python/python/net/mesh_rpc.py` — docstring updates.
+
+### C-A3 — Go FFI: migrate rpc-ffi `cancel_registry` to substrate pass-through; add cancellable streaming variants
+
+**Rationale.** Same as C-A1 for the Go FFI. ABI bump still required for the new cancellable streaming symbols (so Go consumers can compile against them); the registry migration is internal.
+
+**Design.**
+- Delete the file-local `cancel_registry` HashMap + `CancelEntry` struct + orphan-TTL GC in `bindings/go/rpc-ffi/src/lib.rs`.
+- `net_rpc_reserve_cancel_token` / `net_rpc_cancel_call` become pass-throughs to `Mesh::reserve_cancel_token` / `Mesh::cancel` (need a static `Mesh` handle — bind to the first-constructed MeshRpc, or thread the mesh handle through the call site explicitly).
 - Add two new FFI functions:
   - `net_rpc_call_client_stream_cancellable(handle, target, service, deadline_ms, request_window, cancel_token, out_call, out_err) -> c_int`
   - `net_rpc_call_duplex_cancellable(handle, target, service, deadline_ms, stream_window, request_window, cancel_token, out_call, out_err) -> c_int`
-- Internally these mirror the cancellable unary pattern: spawn the construction onto the tokio runtime inside a `run_cancellable` block; the resulting `*ClientStreamCallHandleC` / `*DuplexCallHandleC` is stored with a back-reference to the cancel token so a subsequent `net_rpc_cancel_call(token)` triggers `Close` on the handle.
-- The Go wrapper `MeshRpc.CallClientStream(ctx, ...)` and `MeshRpc.CallDuplex(ctx, ...)` install a cancel-watcher exactly like the unary path's `installCancelWatcher(ctx)` (`mesh_rpc.go:654`).
+  Both populate `InnerCallOptions::cancel_token` and forward to the SDK. No spawn/registry work at the FFI layer.
 - ABI version bumps `0x0003 → 0x0004` because we're adding new exported symbols; existing 0x0003 symbols stay unchanged.
 
 **Files touched.**
-- `bindings/go/rpc-ffi/src/lib.rs` — two new exported functions + ABI version constant + doc-comment update.
+- `bindings/go/rpc-ffi/src/lib.rs` — delete the local cancel_registry; two new exported functions + ABI version constant + doc-comment update.
 - `bindings/go/net/mesh_rpc.go` — cgo `extern` declarations; extend `CallClientStream` / `CallDuplex` to call the cancellable variant and install the cancel watcher.
 - `bindings/go/net/mesh_rpc_typed.go` — `TypedCallClientStream` / `TypedCallDuplex` pass `ctx` through unchanged (the raw layer now honors it).
 
@@ -180,7 +274,7 @@ Wave 1 and Wave 2 can land same-PR-cycle as Wave 3 — the wrapper changes don't
 
 ---
 
-## Wave 3 — Typed wrapper pass-throughs
+## Wave 4 — Typed wrapper pass-throughs
 
 ### C-B1 — Node TS: wire `AbortSignal` for streaming
 
@@ -213,7 +307,7 @@ Wave 1 and Wave 2 can land same-PR-cycle as Wave 3 — the wrapper changes don't
 
 ---
 
-## Wave 4 — Tests + fixture
+## Wave 5 — Tests + fixture
 
 ### O-T1 — Update fixture
 
