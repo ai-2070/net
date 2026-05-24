@@ -44,13 +44,13 @@ pub(crate) fn hex_decode_32(s: &str) -> Result<[u8; 32], String> {
         .map_err(|v: Vec<u8>| format!("expected 32 bytes, got {}", v.len()))
 }
 
-/// Clap value-parser wrappers that validate at argv-parse time
-/// while preserving the operator's original `String` value for
-/// downstream consumers (the same string flows through profile
-/// fallbacks via TOML, so keeping the held type as `String`
-/// lets one resolve path handle both sources). Each parser
-/// short-circuits with a clear diagnostic when the input is
-/// malformed — clap renders the message at the offending flag.
+// Clap value-parser wrappers that validate at argv-parse time
+// while preserving the operator's original `String` value for
+// downstream consumers (the same string flows through profile
+// fallbacks via TOML, so keeping the held type as `String`
+// lets one resolve path handle both sources). Each parser
+// short-circuits with a clear diagnostic when the input is
+// malformed — clap renders the message at the offending flag.
 
 /// Parse an `IP:port` literal at argv time. Returns the string
 /// unchanged on success.

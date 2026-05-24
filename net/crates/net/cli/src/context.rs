@@ -53,7 +53,7 @@ pub struct CliContext {
     /// Connected `Mesh` when the context was built via
     /// [`CliContext::build_with_remote`]. `None` for in-process
     /// (read-local) subcommands. Holds the underlying UDP socket
-    /// + receive loop alive for the lifetime of the context;
+    /// and receive loop alive for the lifetime of the context;
     /// `Mesh::node_arc()` hands out the `Arc<MeshNode>` typed
     /// clients (`RegistryClient` / `FoldQueryClient`) consume.
     mesh: Option<net_sdk::Mesh>,

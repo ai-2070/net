@@ -1052,11 +1052,15 @@ mod tests {
         assert!(Arc::ptr_eq(&removed, &last_original));
         // The dropped replica's stop counter incremented exactly once.
         assert_eq!(removed.stops.load(Ordering::Acquire), 1);
-        // Indices 0 and 1 untouched.
-        let kept = daemons.lock();
-        assert_eq!(kept[0].stops.load(Ordering::Acquire), 0);
-        assert_eq!(kept[1].stops.load(Ordering::Acquire), 0);
-        drop(kept);
+        // Indices 0 and 1 untouched. Scope the guard so clippy's
+        // `await_holding_lock` lint sees the explicit lifetime
+        // bound — an `drop(kept)` works at runtime but clippy
+        // doesn't always recognize it.
+        {
+            let kept = daemons.lock();
+            assert_eq!(kept[0].stops.load(Ordering::Acquire), 0);
+            assert_eq!(kept[1].stops.load(Ordering::Acquire), 0);
+        }
 
         group.stop().await;
     }
