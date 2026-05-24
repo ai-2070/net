@@ -26,15 +26,15 @@
 //!
 //! `Scale { group_name, template_name, target_replica_count }`
 //! grows / shrinks an existing group in place via
-//! [`LifecycleGroup::add_replica`] /
-//! [`LifecycleGroup::remove_last`]. Surviving replicas keep
-//! their identity + generation across the resize. The
-//! `template_name` is re-supplied per call (rather than cached
-//! per group) so the daemon can re-derive the spec without
-//! growing `AggregatorGroupEntry`'s state. The handler verifies
-//! the template matches the current group's `source_subnet` +
-//! `fold_kinds` and rejects with `ScaleRejected("template
-//! mismatch")` if not.
+//! [`crate::adapter::net::behavior::lifecycle::LifecycleGroup::add_replica`]
+//! / [`crate::adapter::net::behavior::lifecycle::LifecycleGroup::remove_last`].
+//! Surviving replicas keep their identity + generation across
+//! the resize. The `template_name` is re-supplied per call
+//! (rather than cached per group) so the daemon can re-derive
+//! the spec without growing `AggregatorGroupEntry`'s state.
+//! The handler verifies the template matches the current
+//! group's `source_subnet` + `fold_kinds` and rejects with
+//! `ScaleRejected("template mismatch")` if not.
 
 use std::sync::Arc;
 
@@ -82,13 +82,14 @@ pub enum RegistryRequest {
         group_name: String,
     },
     /// Resize an existing group in place via
-    /// [`super::LifecycleGroup::add_replica`] /
-    /// [`super::LifecycleGroup::remove_last`]. Surviving replicas
-    /// keep their identity + generation; only the delta replicas
-    /// are spawned (grow) or stopped (shrink). The handler
-    /// re-resolves `template_name` against the daemon's config
-    /// and refuses the call if the resolved spec doesn't match
-    /// the group's current `source_subnet` + `fold_kinds`.
+    /// [`crate::adapter::net::behavior::lifecycle::LifecycleGroup::add_replica`]
+    /// / [`crate::adapter::net::behavior::lifecycle::LifecycleGroup::remove_last`].
+    /// Surviving replicas keep their identity + generation; only
+    /// the delta replicas are spawned (grow) or stopped (shrink).
+    /// The handler re-resolves `template_name` against the
+    /// daemon's config and refuses the call if the resolved spec
+    /// doesn't match the group's current `source_subnet` +
+    /// `fold_kinds`.
     Scale {
         /// Name of the existing group to resize.
         group_name: String,
@@ -259,9 +260,9 @@ pub struct SpawnRequest {
 /// `Scale` request arrives. The daemon's template-resolution
 /// layer plugs in here: given `(group_name, template_name,
 /// target_replica_count)`, walk the existing group in place via
-/// [`super::LifecycleGroup::add_replica`] /
-/// [`super::LifecycleGroup::remove_last`] and return the
-/// post-resize snapshot. Returning a typed
+/// [`crate::adapter::net::behavior::lifecycle::LifecycleGroup::add_replica`]
+/// / [`crate::adapter::net::behavior::lifecycle::LifecycleGroup::remove_last`]
+/// and return the post-resize snapshot. Returning a typed
 /// [`RegistryRpcError`] surfaces template mismatch /
 /// unknown-group / replica spawn failure to the wire.
 pub type ScaleFn = Box<

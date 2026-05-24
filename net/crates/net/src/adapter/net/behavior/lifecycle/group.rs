@@ -364,7 +364,8 @@ impl<L: LifecycleDaemon> LifecycleGroup<L> {
     /// factory receives the new replica's index (= current
     /// `replica_count`). Existing replicas keep their identities
     /// and their handles — neither stops nor restarts. This is the
-    /// scale-up primitive for [`AggregatorRegistry::scale_group`]
+    /// scale-up primitive for
+    /// [`crate::adapter::net::behavior::aggregator::AggregatorRegistry::scale_group`]
     /// and the `Scale` RPC.
     ///
     /// Errors:
