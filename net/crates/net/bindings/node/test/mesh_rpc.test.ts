@@ -48,8 +48,12 @@ import {
 
 import {
   TypedMeshRpc,
+  TypedClientStreamCall,
+  TypedRequestStream,
   type CallOptions,
   type RawMeshRpc,
+  type RawClientStreamCall,
+  type RawRequestStream,
   type ServeHandle,
 } from '../mesh_rpc'
 
@@ -427,6 +431,12 @@ class StubRawMeshRpc implements RawMeshRpc {
   async callStreaming(): Promise<never> {
     throw new Error('not implemented in stub')
   }
+  async callClientStream(): Promise<never> {
+    throw new Error('callClientStream not implemented in stub')
+  }
+  serveClientStream(): ServeHandle {
+    throw new Error('serveClientStream not implemented in stub')
+  }
   serve(): ServeHandle {
     throw new Error('not implemented in stub')
   }
@@ -584,6 +594,12 @@ describe('AbortSignal wiring on the typed wrapper', () => {
     async callStreaming(): Promise<never> {
       throw new Error('not implemented')
     }
+    async callClientStream(): Promise<never> {
+      throw new Error('callClientStream not implemented')
+    }
+    serveClientStream(): ServeHandle {
+      throw new Error('serveClientStream not implemented')
+    }
     serve(): ServeHandle {
       throw new Error('not implemented')
     }
@@ -690,5 +706,235 @@ describe('appError', () => {
     // so a body like "status: bad" must survive intact.
     const e = appError(0x8000, 'status: bad')
     expect(e.message).toBe('nrpc:app_error:0x8000:status: bad')
+  })
+})
+
+// ============================================================================
+// TypedClientStreamCall + TypedRequestStream (S2-B1) — stub-level
+// round-trip + encode/decode failure coverage. Live napi tests
+// against a real MeshRpc belong in S2-X.
+// ============================================================================
+
+class StubClientStreamCall implements RawClientStreamCall {
+  /** Sent chunks captured for round-trip assertion. */
+  public sent: Buffer[] = []
+  /** Terminal response bytes returned by `finish()`. */
+  public finishResponse: Buffer
+  public closed = false
+  public callIdValue = 7n
+  public flowControlledValue = false
+
+  constructor(finishResponse: Buffer) {
+    this.finishResponse = finishResponse
+  }
+
+  async send(body: Buffer): Promise<void> {
+    this.sent.push(Buffer.from(body))
+  }
+  async finish(): Promise<Buffer> {
+    return this.finishResponse
+  }
+  async callId(): Promise<bigint> {
+    return this.callIdValue
+  }
+  async flowControlled(): Promise<boolean> {
+    return this.flowControlledValue
+  }
+  async close(): Promise<void> {
+    this.closed = true
+  }
+}
+
+describe('TypedClientStreamCall', () => {
+  it('JSON-encodes each send and JSON-decodes the terminal response', async () => {
+    const raw = new StubClientStreamCall(
+      Buffer.from(JSON.stringify({ sum: 6 }), 'utf-8'),
+    )
+    const call = new TypedClientStreamCall<{ n: number }, { sum: number }>(raw)
+    await call.send({ n: 1 })
+    await call.send({ n: 2 })
+    await call.send({ n: 3 })
+    const reply = await call.finish()
+    expect(reply).toEqual({ sum: 6 })
+    expect(raw.sent.length).toBe(3)
+    expect(raw.sent[0].toString('utf-8')).toBe('{"n":1}')
+    expect(raw.sent[1].toString('utf-8')).toBe('{"n":2}')
+    expect(raw.sent[2].toString('utf-8')).toBe('{"n":3}')
+  })
+
+  it('encode failure (BigInt) throws nrpc:codec_encode', async () => {
+    const raw = new StubClientStreamCall(Buffer.from('null'))
+    const call = new TypedClientStreamCall<bigint, null>(raw)
+    let caught: Error | null = null
+    try {
+      await call.send(1n)
+    } catch (e) {
+      caught = e as Error
+    }
+    expect(caught).not.toBeNull()
+    expect(caught!.message.startsWith('nrpc:codec_encode:')).toBe(true)
+    expect(raw.sent.length).toBe(0)
+  })
+
+  it('decode failure on finish throws nrpc:codec_decode', async () => {
+    const raw = new StubClientStreamCall(Buffer.from('{not json'))
+    const call = new TypedClientStreamCall<unknown, unknown>(raw)
+    let caught: Error | null = null
+    try {
+      await call.finish()
+    } catch (e) {
+      caught = e as Error
+    }
+    expect(caught).not.toBeNull()
+    const typed = classifyError(caught) as RpcCodecError
+    expect(typed).toBeInstanceOf(RpcCodecError)
+    expect(typed.direction).toBe('decode')
+  })
+
+  it('close() is idempotent and swallows underlying errors', async () => {
+    const raw = new StubClientStreamCall(Buffer.from('null'))
+    raw.close = async (): Promise<void> => {
+      throw new Error('nrpc:stream_closed: already closed')
+    }
+    const call = new TypedClientStreamCall(raw)
+    // close() must not throw even if the raw side does — best-effort
+    // cleanup contract; mirrors TypedRpcStream.close.
+    await call.close()
+    await call.close()
+  })
+})
+
+class StubRequestStream implements RawRequestStream {
+  public callerOrigin = 0xfeedfacen
+  public callId = 42n
+  public deadlineNs = 0n
+  public headers: [string, Buffer][] = []
+  private chunks: (Buffer | null)[]
+  private idx = 0
+
+  constructor(chunks: (Buffer | null)[]) {
+    // Append a null terminator if the caller didn't.
+    const lastIsNull =
+      chunks.length > 0 && chunks[chunks.length - 1] === null
+    this.chunks = lastIsNull ? chunks : [...chunks, null]
+  }
+
+  async next(): Promise<Buffer | null> {
+    if (this.idx >= this.chunks.length) return null
+    return this.chunks[this.idx++]
+  }
+}
+
+describe('TypedRequestStream', () => {
+  it('decodes each chunk and returns null on EOF', async () => {
+    const stream = new TypedRequestStream<{ n: number }>(
+      new StubRequestStream([
+        Buffer.from('{"n":1}'),
+        Buffer.from('{"n":2}'),
+        Buffer.from('{"n":3}'),
+      ]),
+    )
+    const collected: number[] = []
+    while (true) {
+      const v = await stream.next()
+      if (v === null) break
+      collected.push(v.n)
+    }
+    expect(collected).toEqual([1, 2, 3])
+    // Subsequent next() after EOF stays null (no exception).
+    expect(await stream.next()).toBeNull()
+  })
+
+  it('async-iterates via for await', async () => {
+    const stream = new TypedRequestStream<{ k: string }>(
+      new StubRequestStream([
+        Buffer.from('{"k":"a"}'),
+        Buffer.from('{"k":"b"}'),
+      ]),
+    )
+    const collected: string[] = []
+    for await (const v of stream) {
+      collected.push(v.k)
+    }
+    expect(collected).toEqual(['a', 'b'])
+  })
+
+  it('decode failure throws nrpc:codec_decode and marks stream done', async () => {
+    const stream = new TypedRequestStream(
+      new StubRequestStream([Buffer.from('{not json')]),
+    )
+    let caught: Error | null = null
+    try {
+      await stream.next()
+    } catch (e) {
+      caught = e as Error
+    }
+    expect(caught).not.toBeNull()
+    const typed = classifyError(caught) as RpcCodecError
+    expect(typed).toBeInstanceOf(RpcCodecError)
+    expect(typed.direction).toBe('decode')
+    // Stream is marked done — subsequent next() returns null
+    // rather than re-throwing the same error.
+    expect(await stream.next()).toBeNull()
+  })
+
+  it('exposes diagnostic getters from the raw stream', async () => {
+    const raw = new StubRequestStream([])
+    raw.callerOrigin = 0xdeadbeefn
+    raw.callId = 99n
+    raw.deadlineNs = 1_700_000_000_000_000_000n
+    raw.headers = [['x-trace', Buffer.from('abc')]]
+    const stream = new TypedRequestStream(raw)
+    expect(stream.callerOrigin).toBe(0xdeadbeefn)
+    expect(stream.callId).toBe(99n)
+    expect(stream.deadlineNs).toBe(1_700_000_000_000_000_000n)
+    expect(stream.headers).toEqual([['x-trace', Buffer.from('abc')]])
+  })
+})
+
+describe('TypedMeshRpc.serveClientStream', () => {
+  it('decodes inbound chunks and encodes the terminal response', async () => {
+    let installed:
+      | ((stream: RawRequestStream) => Promise<Buffer>)
+      | undefined
+    const stub: RawMeshRpc = {
+      serve: () => {
+        throw new Error('not used')
+      },
+      call: () => Promise.reject(new Error('not used')),
+      callService: () => Promise.reject(new Error('not used')),
+      callStreaming: () => Promise.reject(new Error('not used')),
+      callClientStream: () => Promise.reject(new Error('not used')),
+      serveClientStream: (
+        _service: string,
+        handler: (s: RawRequestStream) => Promise<Buffer>,
+      ): ServeHandle => {
+        installed = handler
+        return { close: () => {}, isClosed: () => false }
+      },
+      findServiceNodes: () => [],
+      reserveCancelToken: () => 0n,
+      cancelCall: () => {},
+    }
+    const rpc = new TypedMeshRpc(stub)
+    rpc.serveClientStream<{ n: number }, { sum: number }>(
+      'sum',
+      async (stream) => {
+        let total = 0
+        for await (const req of stream) total += req.n
+        return { sum: total }
+      },
+    )
+    expect(installed).toBeDefined()
+    // Synthesize a request stream of three chunks + EOF and run
+    // the installed handler against it. The handler should return
+    // a JSON-encoded Buffer with the terminal sum.
+    const raw = new StubRequestStream([
+      Buffer.from('{"n":10}'),
+      Buffer.from('{"n":20}'),
+      Buffer.from('{"n":12}'),
+    ])
+    const respBuf = await installed!(raw)
+    expect(respBuf.toString('utf-8')).toBe('{"sum":42}')
   })
 })

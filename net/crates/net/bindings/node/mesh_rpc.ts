@@ -140,11 +140,61 @@ export interface RawMeshRpc {
     request: Buffer,
     opts?: CallOptions,
   ): Promise<RawRpcStream>
+  /**
+   * Open a client-streaming call. Returns a `RawClientStreamCall`
+   * — push chunks via `send`, then `finish` to await the terminal
+   * response.
+   */
+  callClientStream(
+    targetNodeId: bigint,
+    service: string,
+    opts?: CallOptions,
+  ): Promise<RawClientStreamCall>
+  /**
+   * Register a client-streaming handler. The handler receives a
+   * `RawRequestStream` and returns the terminal response as a
+   * Buffer. Throw `appError(code, body)` to surface a typed
+   * Application status.
+   */
+  serveClientStream(
+    service: string,
+    handler: (stream: RawRequestStream) => Promise<Buffer>,
+  ): ServeHandle
   findServiceNodes(service: string): bigint[]
   /** Mint a fresh cancel token (`bigint`). */
   reserveCancelToken(): bigint
   /** Abort the in-flight call associated with `token`. Idempotent. */
   cancelCall(token: bigint): void
+}
+
+/**
+ * Raw napi `ClientStreamCall` — minimal shape consumed by
+ * `TypedClientStreamCall`. Caller pushes typed chunks via `send`
+ * then awaits the terminal response with `finish`.
+ */
+export interface RawClientStreamCall {
+  send(body: Buffer): Promise<void>
+  finish(): Promise<Buffer>
+  callId(): Promise<bigint>
+  flowControlled(): Promise<boolean>
+  close(): Promise<void>
+}
+
+/**
+ * Raw napi `JsRequestStream` — minimal shape consumed by
+ * `TypedRequestStream` server-side. Drain via `next()` until it
+ * returns `null` (clean EOF) or throws on terminal error.
+ *
+ * The diagnostic getters (`callerOrigin`, `callId`, `deadlineNs`,
+ * `headers`) are populated at handler-dispatch time and stable
+ * for the lifetime of the stream.
+ */
+export interface RawRequestStream {
+  next(): Promise<Buffer | null>
+  readonly callerOrigin: bigint
+  readonly callId: bigint
+  readonly deadlineNs: bigint
+  readonly headers: [string, Buffer][]
 }
 
 /** Raw napi `RpcStream` — minimal shape consumed by `TypedRpcStream`. */
@@ -365,6 +415,61 @@ export class TypedMeshRpc {
     return this._raw.findServiceNodes(service)
   }
 
+  // ---- client-streaming (S2-B1) -------------------------------------------
+
+  /**
+   * Open a typed client-streaming call. Returns a
+   * `TypedClientStreamCall<Req, Resp>` — push each request via
+   * `send(value)`, then `finish()` to drain the terminal
+   * response.
+   *
+   * Cancellation: pass `opts.signal` for surface parity with
+   * unary `call`; the wrapper does NOT wire the signal into the
+   * streaming raw layer (locked decision #2 — `.close()`-only
+   * for v1). Invoke `typedCall.close()` to abort an in-flight
+   * stream. Unifying signal/token/context across streaming
+   * shapes is a deliberate post-v1 follow-up.
+   */
+  async callClientStream<Req = unknown, Resp = unknown>(
+    targetNodeId: bigint,
+    service: string,
+    opts?: CallOptions,
+  ): Promise<TypedClientStreamCall<Req, Resp>> {
+    const rawCall = await this._raw.callClientStream(
+      targetNodeId,
+      service,
+      stripSignal(opts),
+    )
+    return new TypedClientStreamCall<Req, Resp>(rawCall)
+  }
+
+  /**
+   * Register a typed client-streaming handler. The handler
+   * receives a `TypedRequestStream<Req>` (auto-decodes each
+   * inbound chunk to `Req`) and returns the terminal response
+   * `Resp` (encoded back to JSON before reaching the caller).
+   *
+   * Decode failure on a chunk surfaces from `stream.next()` as
+   * `nrpc:codec_decode:` — the handler may catch it (e.g. skip
+   * the bad chunk) or let it propagate. Letting it propagate
+   * surfaces to the caller as `RpcServerError(Internal)`; the
+   * handler may instead wrap it with `appError(NRPC_TYPED_BAD_REQUEST,
+   * ...)` to signal a typed bad-request status code.
+   */
+  serveClientStream<Req = unknown, Resp = unknown>(
+    service: string,
+    handler: (stream: TypedRequestStream<Req>) => Promise<Resp>,
+  ): ServeHandle {
+    return this._raw.serveClientStream(
+      service,
+      async (rawStream: RawRequestStream): Promise<Buffer> => {
+        const typedStream = new TypedRequestStream<Req>(rawStream)
+        const resp = await handler(typedStream)
+        return jsonEncode(resp)
+      },
+    )
+  }
+
   // ---- resilience helpers --------------------------------------------------
 
   /**
@@ -480,6 +585,177 @@ export class TypedRpcStream<Resp = unknown> implements AsyncIterable<Resp> {
       await this._raw.close()
     } catch {
       /* swallow — best-effort */
+    }
+  }
+}
+
+// ============================================================================
+// TypedClientStreamCall + TypedRequestStream (S2-B1).
+//
+// Client-streaming: caller pushes typed Reqs via `send`, then
+// `finish` awaits a single terminal Resp.
+//
+// Server-side handler shape mirrors the unary `serve`'s decode
+// boundary — chunks decode lazily inside `TypedRequestStream.next`
+// so a single malformed chunk doesn't poison the entire stream
+// (the handler can catch and skip).
+//
+// Cancellation contract (locked decision #2): v1 supports
+// `close()`-only cancellation. AbortSignal / cancel-token wiring
+// across streaming shapes is a deliberate post-v1 follow-up.
+// ============================================================================
+
+/**
+ * Typed client-streaming call handle. Push typed requests via
+ * `send`, then await the terminal response with `finish`. Drop
+ * / `close` fires CANCEL via the underlying raw call's drop.
+ */
+export class TypedClientStreamCall<Req = unknown, Resp = unknown> {
+  private readonly _raw: RawClientStreamCall
+
+  constructor(rawCall: RawClientStreamCall) {
+    this._raw = rawCall
+  }
+
+  /** Underlying raw call for users who want the Buffer-level surface. */
+  get raw(): RawClientStreamCall {
+    return this._raw
+  }
+
+  /**
+   * Encode `value` as JSON and push it as one request chunk.
+   * Throws `nrpc:codec_encode:` if encoding fails (the chunk is
+   * NOT sent in that case).
+   */
+  async send(value: Req): Promise<void> {
+    const buf = jsonEncode(value)
+    await this._raw.send(buf)
+  }
+
+  /**
+   * Close the upload direction and await the terminal response.
+   * Consumes the call — subsequent `send` / `finish` throw
+   * `stream_closed`. Decode failure on the terminal Buffer
+   * surfaces as `nrpc:codec_decode:`.
+   */
+  async finish(): Promise<Resp> {
+    const buf = await this._raw.finish()
+    return jsonDecode(buf) as Resp
+  }
+
+  /** Server-assigned `call_id`. */
+  async callId(): Promise<bigint> {
+    return await this._raw.callId()
+  }
+
+  /** `true` if the call was opened with `requestWindowInitial`. */
+  async flowControlled(): Promise<boolean> {
+    return await this._raw.flowControlled()
+  }
+
+  /**
+   * Close without finishing. Fires CANCEL on the wire if the
+   * initial REQUEST has flown. Idempotent. A concurrent in-flight
+   * `send()` awaiting flow-control credit observes `stream_closed`
+   * (locked decision #2 — this is the v1 cancellation primitive).
+   */
+  async close(): Promise<void> {
+    try {
+      await this._raw.close()
+    } catch {
+      /* swallow — best-effort */
+    }
+  }
+}
+
+/**
+ * Typed inbound request stream surfaced to client-streaming +
+ * duplex server handlers. Drain via `next()` until it returns
+ * `null` (clean EOF) or implements `AsyncIterable<Req>` for
+ * `for await (const req of stream)` style.
+ *
+ * Decode failure on a chunk surfaces as `nrpc:codec_decode:` —
+ * the handler may catch and skip, or let it propagate to abort
+ * the call. The underlying raw stream is closed on decode
+ * failure so subsequent `next()` returns `null`.
+ */
+export class TypedRequestStream<Req = unknown>
+  implements AsyncIterable<Req>
+{
+  private readonly _raw: RawRequestStream
+  private _done: boolean
+
+  constructor(rawStream: RawRequestStream) {
+    this._raw = rawStream
+    this._done = false
+  }
+
+  /** Underlying raw stream for users who need the Buffer-level surface. */
+  get raw(): RawRequestStream {
+    return this._raw
+  }
+
+  /** Caller's peer origin hash (`0n` on the loopback fast path). */
+  get callerOrigin(): bigint {
+    return this._raw.callerOrigin
+  }
+
+  /** Server-assigned `call_id`. */
+  get callId(): bigint {
+    return this._raw.callId
+  }
+
+  /**
+   * Caller's declared deadline as a Unix-nanoseconds absolute
+   * timestamp. `0n` means no deadline was declared.
+   */
+  get deadlineNs(): bigint {
+    return this._raw.deadlineNs
+  }
+
+  /**
+   * Initial-REQUEST headers carried by the caller. Each entry is
+   * `[name, value]` with `name` lowercase.
+   */
+  get headers(): [string, Buffer][] {
+    return this._raw.headers
+  }
+
+  /**
+   * Pull the next decoded request. Returns `null` on clean EOF.
+   * Throws `nrpc:codec_decode:` on decode failure (the underlying
+   * raw stream is marked closed; subsequent `next()` returns
+   * `null`).
+   */
+  async next(): Promise<Req | null> {
+    if (this._done) return null
+    let buf: Buffer | null
+    try {
+      buf = await this._raw.next()
+    } catch (e) {
+      this._done = true
+      throw e
+    }
+    if (buf === null || buf === undefined) {
+      this._done = true
+      return null
+    }
+    try {
+      return jsonDecode(buf) as Req
+    } catch (e) {
+      // Mark done so subsequent next() returns null — refuse to
+      // continue draining a stream whose framing is broken.
+      this._done = true
+      throw e
+    }
+  }
+
+  /** Async iterator support: `for await (const req of stream) { ... }`. */
+  async *[Symbol.asyncIterator](): AsyncIterator<Req> {
+    while (true) {
+      const value = await this.next()
+      if (value === null) return
+      yield value
     }
   }
 }
@@ -986,6 +1262,22 @@ interface WiredAbortSignal {
  * unchanged so the non-cancellable fast path stays free of
  * tokio-spawn / registry overhead.
  */
+/**
+ * Strip `signal` from `opts` before passing to a raw streaming
+ * entry point. The raw napi side does not honor `signal` for
+ * streaming calls (locked decision #2 — v1 streaming
+ * cancellation is `.close()`-only). Leaving `signal` in the
+ * forwarded opts would be silently ignored by the napi layer;
+ * stripping it here surfaces the omission at the wrapper
+ * boundary so an inattentive caller doesn't think they wired
+ * cancellation when they hadn't.
+ */
+function stripSignal(opts: CallOptions | undefined): CallOptions | undefined {
+  if (!opts || opts.signal === undefined) return opts
+  const { signal: _unused, ...rest } = opts
+  return rest
+}
+
 function wireAbortSignal(
   raw: RawMeshRpc,
   opts: CallOptions | undefined,
