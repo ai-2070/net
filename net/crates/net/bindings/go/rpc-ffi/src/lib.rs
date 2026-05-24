@@ -3261,10 +3261,7 @@ impl RpcObserver for GoRpcObserver {
 ///     was registered yet via
 ///     [`net_rpc_set_observer_dispatcher`].
 #[unsafe(no_mangle)]
-pub extern "C" fn net_rpc_observer_install(
-    handle: *const MeshRpcHandle,
-    enabled: c_int,
-) -> c_int {
+pub extern "C" fn net_rpc_observer_install(handle: *const MeshRpcHandle, enabled: c_int) -> c_int {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return NET_RPC_ERR_NULL;
     };

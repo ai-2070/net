@@ -2023,7 +2023,12 @@ impl PyMeshRpc {
             .iter()
             .map(|m| Py::new(py, PyServiceMetrics::from(m)))
             .collect();
-        Py::new(py, PyRpcMetricsSnapshot { services: services? })
+        Py::new(
+            py,
+            PyRpcMetricsSnapshot {
+                services: services?,
+            },
+        )
     }
 }
 
