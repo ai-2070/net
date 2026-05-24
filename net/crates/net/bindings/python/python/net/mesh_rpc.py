@@ -401,9 +401,13 @@ class TypedRpcStream:
 # Client-streaming: caller pushes typed requests via ``send``,
 # then ``finish`` awaits a single terminal response.
 #
-# Cancellation contract (locked decision #2): v1 ``close()``-only.
-# Unifying cancel-token / signal / context propagation across
-# streaming shapes is a deliberate post-v1 follow-up.
+# Cancellation contract: ``opts['cancel']`` (a ``Cancellable``)
+# is honored end-to-end via the substrate's per-mesh
+# CancelRegistry — calling ``.cancel()`` short-circuits the
+# in-flight call's ``select!`` arm to ``RpcError::Cancelled`` and
+# the dropped future emits CANCEL on the wire. ``close()`` remains
+# the explicit-drop surface and is complementary to the cancel
+# token.
 # ---------------------------------------------------------------------------
 
 
@@ -543,8 +547,9 @@ class TypedRequestStream:
 # single call. ``into_split`` separates the halves for the
 # encoder-thread / decoder-thread pattern.
 #
-# Cancellation contract (locked decision #2): v1 ``close()``-only,
-# same as client-streaming.
+# Cancellation contract: same as client-streaming —
+# ``opts['cancel']`` is honored end-to-end via the substrate's
+# CancelRegistry; ``close()`` remains the explicit-drop surface.
 # ---------------------------------------------------------------------------
 
 
@@ -896,10 +901,12 @@ class TypedMeshRpc:
         :meth:`send`, then :meth:`finish` to drain the terminal
         response.
 
-        Cancellation contract (locked decision #2): v1 supports
-        ``close()`` only. ``opts['cancel']`` is **not** wired into
-        the raw streaming layer; invoke ``typed_call.close()`` to
-        abort an in-flight stream.
+        Cancellation: pass ``opts['cancel']`` (a :class:`Cancellable`)
+        to enable substrate-level cancellation — calling
+        ``cancel.cancel()`` short-circuits the in-flight call's
+        ``select!`` arm to ``RpcError::Cancelled`` and the dropped
+        future emits CANCEL on the wire. ``typed_call.close()``
+        remains the explicit-drop surface.
         """
         raw_call = self._raw.call_client_stream(target_node_id, service, opts)
         return TypedClientStreamCall(raw_call)
@@ -944,10 +951,10 @@ class TypedMeshRpc:
         iteration, or :meth:`TypedDuplexCall.into_split` to
         separate the halves.
 
-        Cancellation contract (locked decision #2): v1 supports
-        ``close()`` only. ``opts['cancel']`` is **not** wired into
-        the raw streaming layer; invoke ``typed_call.close()`` to
-        abort an in-flight duplex.
+        Cancellation: pass ``opts['cancel']`` (a :class:`Cancellable`)
+        to enable substrate-level cancellation; same end-to-end
+        semantics as client-streaming. ``typed_call.close()``
+        remains the explicit-drop surface.
         """
         raw_call = self._raw.call_duplex(target_node_id, service, opts)
         return TypedDuplexCall(raw_call)

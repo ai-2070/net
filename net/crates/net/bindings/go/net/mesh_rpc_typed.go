@@ -381,10 +381,12 @@ func (s *TypedRpcStream[Resp]) Raw() *RpcStream { return s.raw }
 // Returns a *TypedRpcStream[Resp] — drain via Recv() until it
 // returns ok=false (clean EOF).
 //
-// Cancellation contract (locked decision #2): `ctx` is NOT wired
-// into the raw streaming layer; invoke `stream.Close()` to abort.
-// `ctx` is still used to compute the wire deadline (the raw
-// layer reads `ctx.Deadline()` at construction time).
+// Cancellation: `ctx` is honored end-to-end. When `ctx` fires
+// mid-stream the raw layer's ctx-watcher closes the stream
+// handle, dropping the SDK future and emitting CANCEL on the
+// wire. `stream.Close()` is the explicit-drop surface and is
+// idempotent with the ctx-watcher. `ctx.Deadline()` still seeds
+// the wire deadline at construction.
 func TypedCallStreaming[Req, Resp any](
 	ctx context.Context,
 	t *TypedMeshRpc,
@@ -510,8 +512,11 @@ type TypedClientStreamHandler[Req, Resp any] func(stream *TypedRequestStream[Req
 // TypedCallClientStream opens a typed client-streaming call.
 // `opts` configures the upload-side flow-control window.
 //
-// Cancellation: `.Close()` only (locked decision #2). `ctx` is
-// used for the wire deadline only.
+// Cancellation: `ctx` is honored end-to-end via the raw layer's
+// ctx-watcher (closes the call handle on ctx.Done, dropping the
+// SDK future and emitting CANCEL on the wire). `.Close()`
+// remains the explicit-drop surface and is idempotent with the
+// ctx-watcher. `ctx.Deadline()` still seeds the wire deadline.
 func TypedCallClientStream[Req, Resp any](
 	ctx context.Context,
 	t *TypedMeshRpc,
@@ -715,6 +720,10 @@ type TypedDuplexHandler[Req, Resp any] func(
 ) error
 
 // TypedCallDuplex opens a typed duplex call.
+//
+// Cancellation: same end-to-end semantics as
+// TypedCallClientStream — `ctx` fires substrate-level cancel and
+// `.Close()` is the explicit-drop surface.
 func TypedCallDuplex[Req, Resp any](
 	ctx context.Context,
 	t *TypedMeshRpc,
