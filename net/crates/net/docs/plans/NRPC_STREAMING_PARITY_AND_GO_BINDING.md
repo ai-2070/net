@@ -9,6 +9,14 @@ Scope: close two cross-language gaps in the user-facing typed nRPC surface:
 
 Explicitly **out of scope**: codec selection. JSON stays the only codec across all three bindings (no `Codec` enum extension, no protobuf bridge, no `CallOptionsTyped::codec` parity). The Rust SDK's `Codec::JsonPretty` is the only encoder option exposed at the SDK layer, and the bindings stay JSON-only per the existing contract pinned in `tests/cross_lang_nrpc/golden_vectors.json`.
 
+## Locked decisions
+
+Three risks were flagged during planning and are resolved before any slice merges. Each decision below is the contract every slice in this plan codes against:
+
+1. **Observer firing-thread cost — synchronous + documented.** Each binding's observer trampoline fires the user callback synchronously on the substrate's dispatch path. The docstring on every binding's `setObserver` / `set_observer` / `SetObserver` method must spell out "callbacks must be cheap; pushing into a queue is the safe shape for slow consumers." No bounded-mpsc + drop-on-overflow layer ships in v1.
+2. **Streaming cancellation — `close()`-only for v1.** `AbortSignal` (Node), cancel-token (pyo3), and `context.Context` (Go) are **not** wired into the typed `callClientStream` / `callDuplex` surfaces. Callers cancel a streaming RPC by invoking `.close()` on the typed handle. Per-language docstrings on the streaming entry points must call this out. Unifying the three raw-binding cancel stories so context/signal/token propagate uniformly is a deliberate post-v1 follow-up.
+3. **Go generics — free-function shape, no method-based generics.** Every typed surface in the Go binding ships as a free function with type parameters (`TypedCall[Req, Resp](ctx, rpc, target, svc, req)`) rather than a method on `*TypedMeshRpc` (Go forbids type parameters on methods). Compile-time type safety wins over reflection-based ergonomics. Streams + calls remain type-parameterized structs (`*TypedDuplexCall[Req, Resp]`) so their methods can use the struct-level type params without violating the no-method-generics rule.
+
 Tagged `[A | B | C | D]`:
 
 - **A** — Rust binding-layer changes (napi `bindings/node/src/mesh_rpc.rs` + pyo3 `bindings/python/src/mesh_rpc.rs` + C ABI `bindings/go/rpc-ffi/src/lib.rs` / `include/net_rpc.h`). Only the substrate-binding additions for observer + metrics need this slice; the streaming primitives are already exposed.
@@ -77,7 +85,7 @@ Wave 1 can land same-PR-cycle as Wave 2's first slice (B1 / C1) — the napi obs
 - `bindings/node/test/mesh_rpc.test.ts` — stub-level test that constructs a `MeshRpc`-shaped object exposing `setObserver` / `metricsSnapshot` and asserts the typed wrapper forwards correctly. Live observer firing belongs in S2-X.
 
 **Risks.**
-- TSFN backpressure: the substrate fires observers synchronously, so a slow JS observer pinning the dispatch thread is a real risk. Mitigation: document loudly that observer callbacks must be cheap (mirror the Rust trait docstring); add a per-fire `try_send` into a bounded mpsc fed by a worker that does the TSFN dispatch. Alternative: drop on overflow with a counter that surfaces in `metricsSnapshot`. **Pin in advance which mitigation ships** — affects the contract.
+- TSFN backpressure: the substrate fires observers synchronously, so a slow JS observer pins the dispatch thread. Per the locked decision (#1), v1 ships with documented-sync semantics: the docstring on `MeshRpc.setObserver` must spell out "callbacks must be cheap; push into a queue if the consumer is slow." The TSFN dispatch uses `ThreadsafeFunction::call(..., NonBlocking)` so a TSFN-queue overflow surfaces as a dropped event rather than blocking the substrate; the napi default queue size is fine for the documented contract. Bounded-mpsc + drop-counter is a deliberate post-v1 follow-up.
 
 ### S2-A2 — pyo3 `MeshRpc.set_observer(callable)` + `metrics_snapshot()`
 
@@ -97,7 +105,7 @@ Wave 1 can land same-PR-cycle as Wave 2's first slice (B1 / C1) — the napi obs
 - `bindings/python/tests/test_mesh_rpc.py` — stub-level forwarding test, mirroring the Node S2-A1 pattern.
 
 **Risks.**
-- GIL re-acquisition on every observer fire is non-trivial overhead. Document loudly + accept; an async-batched variant is a follow-up.
+- GIL re-acquisition on every observer fire is non-trivial overhead. Per the locked decision (#1), v1 ships synchronously with the `set_observer` docstring spelling out "callbacks must be cheap; push into a `queue.Queue` for slow consumers." An async-batched variant is a deliberate post-v1 follow-up.
 
 ### S2-B1 — Node `TypedMeshRpc.serveClientStream` + `callClientStream` + `TypedClientStreamCall`
 
@@ -140,7 +148,7 @@ Wave 1 can land same-PR-cycle as Wave 2's first slice (B1 / C1) — the napi obs
 - `bindings/node/test/integration_*.test.ts` (alongside the existing integration tests) — live test against a real `MeshRpc`, deferred to S2-X.
 
 **Risks.**
-- AbortSignal integration: client-stream calls are long-lived; user wants `signal.aborted → close()` semantics. The raw `ClientStreamCall` has a `close()` method but the napi binding doesn't route a `cancelToken` through `callClientStream` (verify at `bindings/node/src/mesh_rpc.rs:1572-1594` — `CallOptions` carries `cancel_token` but `call_client_stream` doesn't honor it). Either (a) document that `signal` isn't supported on streaming calls, or (b) extend the napi `callClientStream` to thread `cancel_token` through. **Recommend (a) for v1**, document as a known gap, and have the user `.close()` the call directly when aborting; (b) lands as a follow-up.
+- AbortSignal integration: client-stream calls are long-lived; user wants `signal.aborted → close()` semantics. The raw `ClientStreamCall` has a `close()` method but the napi binding doesn't route a `cancelToken` through `callClientStream` (verify at `bindings/node/src/mesh_rpc.rs:1572-1594` — `CallOptions` carries `cancel_token` but `call_client_stream` doesn't honor it). Per the locked decision (#2), v1 documents `close()`-only cancellation: `callClientStream`'s `CallOptions` parameter still accepts `signal` for surface parity, but the wrapper ignores it for streaming calls (with a one-line docstring callout) and the user invokes `typedCall.close()` directly when aborting. Unifying signal/token/context across the raw bindings is a deliberate post-v1 follow-up.
 
 ### S2-B2 — Node `TypedMeshRpc.serveDuplex` + `callDuplex` + duplex typed wrappers
 
@@ -317,17 +325,7 @@ Lands AFTER Slice 2 so the Go binding can mirror Node + Python's typed shape exa
   // []byte-level surface (cross-codec interop, raw streams).
   func (t *TypedMeshRpc) Raw() *MeshRpc { return t.raw }
   ```
-- `Call[Req, Resp any]` — but Go generics don't compose with methods, so the shape is:
-  ```go
-  func (t *TypedMeshRpc) Call(
-      ctx context.Context,
-      targetNodeID uint64,
-      service string,
-      req any,
-      resp any, // pointer to destination; json.Unmarshal target
-  ) error
-  ```
-  OR, with the generic-function pattern that's idiomatic for Go's "no methods with their own type params" rule:
+- `TypedCall[Req, Resp any]` — per the locked decision (#3), typed surfaces are free functions, not methods. Go forbids type parameters on methods, so this is the only shape that gives compile-time type safety:
   ```go
   func TypedCall[Req, Resp any](
       ctx context.Context,
@@ -337,7 +335,7 @@ Lands AFTER Slice 2 so the Go binding can mirror Node + Python's typed shape exa
       req Req,
   ) (Resp, error)
   ```
-  **Recommend the second shape.** It mirrors the Node `rpc.call<Req, Resp>(...)` ergonomics and avoids the pointer-receiver footgun. The `Call(ctx, t, target, svc, req)` form reads cleanly: `result, err := TypedCall[EchoReq, EchoResp](ctx, t, target, "echo", req)`.
+  Reads cleanly at the call site: `result, err := TypedCall[EchoReq, EchoResp](ctx, t, target, "echo", req)`. Mirrors the Node `rpc.call<Req, Resp>(...)` ergonomics with one extra positional argument (the `*TypedMeshRpc` itself).
 - `TypedCallService[Req, Resp]` — same shape, calls through to `t.raw.CallService`.
 - `TypedServe[Req, Resp](rpc *TypedMeshRpc, service string, handler func(Req) (Resp, error)) (*ServeHandle, error)` — handler shim:
   ```go
@@ -396,7 +394,7 @@ Lands AFTER Slice 2 so the Go binding can mirror Node + Python's typed shape exa
 - Decode failure mid-stream → next `Recv` returns `RpcKindCodecDecode` and subsequent returns `ErrStreamDone`.
 
 **Risks.**
-- Generic-type signature ergonomics. Since methods can't have type params, the typed stream's `Recv()` must either return `any` + a separate `RecvInto[Resp](*TypedRpcStream, *Resp) error` helper, or the stream itself must be generic (`TypedRpcStream[Resp]`). **Recommend the generic stream** — the constructor `TypedCallStreaming[Req, Resp]` carries the resp type, and `(*TypedRpcStream[Resp]).Recv() (Resp, error)` reads cleanly.
+- Per the locked decision (#3), the typed stream is generic over `Resp` at the struct level: `*TypedRpcStream[Resp]`. `(*TypedRpcStream[Resp]).Recv() (Resp, error)` is a non-generic method on a generic struct — legal Go, reads cleanly, and avoids the `any`-shape footgun.
 
 ### S1-D3 — Go client-streaming typed wrapper
 
@@ -471,7 +469,7 @@ Lands AFTER Slice 2 so the Go binding can mirror Node + Python's typed shape exa
 - `mesh_rpc_typed_test.go::observer_fires_on_call` — install observer, issue a unary call against a stub raw mesh (or a real loopback mesh if test fixtures permit), assert the callback fired with expected fields.
 
 **Risks.**
-- Same firing-thread-sync-cost issue as Node + Python. Document.
+- Same firing-thread-sync-cost issue as Node + Python. Per the locked decision (#1), v1 ships synchronously with the `SetObserver` docstring spelling out "callbacks must be cheap; push into a buffered channel for slow consumers (the cgo trampoline thread is the substrate's dispatch path)."
 
 ### S1-D6 — Go tests + integration coverage
 
@@ -490,8 +488,10 @@ Lands AFTER Slice 2 so the Go binding can mirror Node + Python's typed shape exa
 
 ---
 
-## Top risks (decide before any slice lands)
+## Deferred follow-ups (post-v1)
 
-1. **Observer firing-thread cost.** The substrate fires `RpcObserver::on_call` synchronously from the dispatch task. Every binding inherits this — slow Node TSFN dispatch, GIL re-acquisition in Python, cgo callback overhead in Go. **Decision needed:** ship with documented "callbacks must be cheap" + sync semantics, OR layer in a bounded mpsc + drop-on-overflow counter in each binding. The latter is more work but safer for production use. **Recommend documented-sync for v1**, mpsc as a follow-up; pin the decision before S2-A1 / S2-A2 land.
-2. **AbortSignal / context.Context propagation into streaming calls.** The raw napi `callClientStream` and `callDuplex` don't currently honor `cancelToken` (verified at `bindings/node/src/mesh_rpc.rs:1572-1621`); the pyo3 raw classes do via `close_notify` but not via a cancel token; the Go raw classes wire `ctx.Cancel()` into the watcher goroutine. Three different cancellation stories. **Decision needed:** unify on a single contract ("streaming calls are cancelable only via `.close()`") or extend the raw layer in each binding so cancel tokens / signals / contexts work uniformly. **Recommend "close()-only for v1"**; document; align via raw-binding follow-ups.
-3. **Generic-method ergonomics in Go.** Go forbids type parameters on methods, forcing typed RPC into a free-function shape (`TypedCall[Req, Resp](ctx, rpc, ...)` rather than `rpc.TypedCall[Req, Resp](ctx, ...)`). **Decision needed:** accept the free-function ergonomics and document loudly, OR ship a "boxed" any-typed variant (`(*TypedMeshRpc).Call(ctx, target, svc, req any, respPtr any) error`) that uses runtime reflection instead. **Recommend free-function generic** — matches modern Go idioms, gives compile-time type safety; the any-shape variant is a footgun (no compile-time signature mismatch detection).
+Three follow-up items deliberately deferred from v1; cross-referenced by the locked decisions at the top of the doc.
+
+1. **Bounded-mpsc observer dispatch.** Each binding currently fires the user observer synchronously on the substrate dispatch path; the v1 contract documents "callbacks must be cheap." A follow-up adds a bounded-mpsc + drop-on-overflow trampoline per binding, with the drop count surfaced through `metricsSnapshot` so operators can see when their observer is too slow. Lands when a production user surfaces an observer that has to do real work (logging to disk, exporting to Prometheus, etc.).
+2. **Unified streaming cancellation.** v1 ships `close()`-only cancellation across all three bindings. A follow-up extends the raw bindings so `AbortSignal` (Node), cancel-token (pyo3), and `context.Context` (Go) propagate uniformly through `callClientStream` / `callDuplex` to a single substrate-level cancel primitive. Likely involves a small change at `bindings/node/src/mesh_rpc.rs:1572-1621` (thread `cancel_token` through `call_client_stream` + `call_duplex`) and equivalent extensions on the pyo3 / Go raw layers.
+3. **`Range` iterator for Go streams.** Once the Go workspace targets Go 1.23+, add range-over-func support on `*TypedRpcStream[Resp]` and `*TypedDuplexStream[Resp]` so `for resp := range stream.Range()` works idiomatically. Until then, the explicit `Recv()` loop is the only shape.
