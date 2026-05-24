@@ -1,0 +1,22 @@
+net/crates/net/deck/src/tabs/subnets.rs
+  s_099fa7d871e34d::t_1f235f539dbce5 2,4-9,11,14-15,25-32,47-55,75,79,81-82,134,137-138,153-166,170,179-180,196-197,200-201,214-252
+net/crates/net/deck/src/app.rs
+  s_099fa7d871e34d::t_3226a4ccc243bb 1304-1323
+  s_099fa7d871e34d::t_cdfec45f409a42 3287-3295
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "b00afcc2523b4e8e74f7e76855e799c43bfc5388",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
