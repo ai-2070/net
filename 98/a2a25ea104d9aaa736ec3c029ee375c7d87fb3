@@ -1,0 +1,36 @@
+net/crates/net/bindings/go/rpc-ffi/src/lib.rs
+  s_099fa7d871e34d::t_f857fab056ea84 3103
+  s_099fa7d871e34d::t_db97c48de7987d 54-57
+  s_099fa7d871e34d::t_a1dfae099754cd 3059-3102,3104-3329
+  s_099fa7d871e34d::t_f7e84449653d30 123-130
+  s_099fa7d871e34d::t_36674134b11492 3478-3481
+net/crates/net/bindings/python/src/lib.rs
+  s_099fa7d871e34d::t_08a9975d447f46 2340-2342
+net/crates/net/bindings/go/rpc-ffi/Cargo.toml
+  s_099fa7d871e34d::t_fbfc9cf3fd32f1 41-44
+net/crates/net/bindings/node/src/mesh_rpc.rs
+  s_099fa7d871e34d::t_111fab4cec20db 434-622
+  s_099fa7d871e34d::t_429c29fa819891 47-50,58-59
+  s_099fa7d871e34d::t_60534de871ace7 1894-1937
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  s_099fa7d871e34d::t_fab4c97486b7a1 69
+  s_099fa7d871e34d::t_b4ad4de68565ea 1488-1664
+  s_099fa7d871e34d::t_a0fe13303fe8b4 58-61
+  s_099fa7d871e34d::t_7e5c53d3f9d098 1974-2027
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "98a2a25ea104d9aaa736ec3c029ee375c7d87fb3",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
