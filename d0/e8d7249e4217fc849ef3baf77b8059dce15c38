@@ -1,0 +1,28 @@
+net/crates/net/cli/src/context.rs
+  s_099fa7d871e34d::t_08deb65f86dfaa 201-210,217-221,225
+net/crates/net/src/adapter/net/mesh.rs
+  s_099fa7d871e34d::t_453df704757b3c 9432-9443,9465
+net/crates/net/sdk/src/mesh.rs
+  s_099fa7d871e34d::t_9b392947c4e8aa 428-453
+net/crates/net/cli/tests/aggregator_remote.rs
+  s_099fa7d871e34d::t_fdfe146b4e2a47 263-267
+  s_099fa7d871e34d::t_f2e42003cac99d 10,12-20,23-25,27-29
+net/crates/net/docs/plans/AGGREGATOR_CLI_REMOTE_ATTACH_AND_SCALE_RPC.md
+  s_099fa7d871e34d::t_0d84ed7942d0dc 410,412,414,416-420
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "d0e8d7249e4217fc849ef3baf77b8059dce15c38",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
