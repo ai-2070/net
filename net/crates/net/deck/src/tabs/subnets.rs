@@ -122,8 +122,6 @@ fn render_table(
         let marker = if is_cursor { "▶" } else { " " };
         let subnet_style = if is_cursor {
             theme::green_hi()
-        } else if rollup.is_local {
-            theme::green()
         } else {
             theme::text()
         };
