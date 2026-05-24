@@ -360,6 +360,106 @@ impl<L: LifecycleDaemon> LifecycleGroup<L> {
         Ok(old_replica)
     }
 
+    /// Append one replica to the group, growing it in place. The
+    /// factory receives the new replica's index (= current
+    /// `replica_count`). Existing replicas keep their identities
+    /// and their handles — neither stops nor restarts. This is the
+    /// scale-up primitive for [`AggregatorRegistry::scale_group`]
+    /// and the `Scale` RPC.
+    ///
+    /// Errors:
+    /// - `InvalidConfig` when `replica_count == u8::MAX`
+    ///   (group-size hard cap; the index field is `u8`).
+    /// - `StartFailed { index, error }` when the new handle's
+    ///   `on_start` fails. The factory's `Arc<L>` is dropped
+    ///   before the error returns, so no zombie replica leaks.
+    ///
+    /// # Placement
+    ///
+    /// `add_replica` does **not** engage the scheduler. A group
+    /// originally created via [`Self::spawn_with_placement`] still
+    /// has its placement Vec — the new replica gets no placement
+    /// entry and runs on the local node. Operators who need
+    /// placement-aware scale-up wait for a future
+    /// `add_replica_with_placement` sibling; the single-process /
+    /// single-host deployment shipping today doesn't engage that
+    /// surface.
+    pub async fn add_replica<F>(&mut self, factory: F) -> Result<u8, LifecycleGroupError>
+    where
+        F: FnOnce(u8) -> Arc<L>,
+    {
+        if self.replicas.len() >= u8::MAX as usize {
+            return Err(LifecycleGroupError::InvalidConfig(format!(
+                "cannot grow past u8::MAX replicas (current: {})",
+                self.replicas.len()
+            )));
+        }
+        // u8 cast is safe by the guard above (len < 255).
+        let new_idx = self.replicas.len() as u8;
+        let daemon = factory(new_idx);
+        let trait_obj: Arc<dyn LifecycleDaemon> = daemon.clone();
+        let handle = LifecycleHandle::start(trait_obj)
+            .await
+            .map_err(|error| LifecycleGroupError::StartFailed {
+                index: new_idx,
+                error,
+            })?;
+        self.replicas.push(daemon);
+        self.handles.push(handle);
+        Ok(new_idx)
+    }
+
+    /// Stop and pop the last replica. Returns the stopped
+    /// replica's Arc so callers can inspect post-stop state (e.g.
+    /// for forensic logging). The other replicas' handles are
+    /// untouched — neither stopped nor signalled — preserving
+    /// their identity, generation counters, and any in-memory
+    /// state.
+    ///
+    /// Refuses to drop below one replica: callers that want to
+    /// dismantle the whole group should call [`Self::stop`]
+    /// instead. Returning an error rather than completing as a
+    /// no-op surfaces the typo at the caller (e.g. operator who
+    /// meant `--replica-count 1` and wrote `--replica-count 0`).
+    ///
+    /// If the group was created via
+    /// [`Self::spawn_with_placement`], the last placement entry
+    /// is also popped so the parallel-Vec invariant
+    /// (`placements.len() == replicas.len()` when populated) is
+    /// preserved.
+    pub async fn remove_last(&mut self) -> Result<Arc<L>, LifecycleGroupError> {
+        if self.replicas.len() <= 1 {
+            return Err(LifecycleGroupError::InvalidConfig(format!(
+                "cannot remove last replica below count 1 (current: {}); \
+                 call stop() to dismantle the whole group instead",
+                self.replicas.len()
+            )));
+        }
+        // `expect_used` lint guard: the `len <= 1` check above
+        // guarantees both pops succeed; suppress lint locally
+        // rather than fall back to `unwrap_or_else` panic shapes
+        // that would obscure the invariant.
+        #[allow(clippy::expect_used)]
+        let handle = self
+            .handles
+            .pop()
+            .expect("replica_count > 1 above; handles parallel to replicas");
+        handle.stop().await;
+        #[allow(clippy::expect_used)]
+        let replica = self
+            .replicas
+            .pop()
+            .expect("replica_count > 1 above; pop after handle.stop succeeded");
+        if !self.placements.is_empty() {
+            // Parallel-Vec invariant: when placements is
+            // populated, it tracks replicas 1-to-1. Pop the last
+            // so a subsequent `placement(replicas.len()-1)` still
+            // resolves.
+            self.placements.pop();
+        }
+        Ok(replica)
+    }
+
     /// Borrow the underlying lifecycle handles. Operator
     /// tooling that wants type-erased access (e.g. iterating
     /// `daemon().name()` across heterogeneous groups in a
@@ -809,5 +909,115 @@ mod tests {
             Err(other) => panic!("expected StartFailed, got {other:?}"),
             Ok(_) => panic!("expected StartFailed, got Ok"),
         }
+    }
+
+    #[tokio::test]
+    async fn add_replica_grows_in_place_preserving_existing_replicas() {
+        let daemons: Arc<parking_lot::Mutex<Vec<Arc<CountingDaemon>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let daemons_clone = daemons.clone();
+        let mut group = LifecycleGroup::<CountingDaemon>::spawn(2, [0u8; 32], move |_idx| {
+            let d = Arc::new(CountingDaemon::new());
+            daemons_clone.lock().push(d.clone());
+            d
+        })
+        .await
+        .expect("initial spawn");
+        // Existing replicas each ran on_start exactly once.
+        for d in daemons.lock().iter() {
+            assert_eq!(d.starts.load(Ordering::Acquire), 1);
+        }
+
+        let new_replica = Arc::new(CountingDaemon::new());
+        let new_replica_clone = new_replica.clone();
+        let new_idx = group
+            .add_replica(move |_idx| new_replica_clone)
+            .await
+            .expect("add_replica");
+        assert_eq!(new_idx, 2, "new index = old replica_count");
+        assert_eq!(group.replica_count(), 3);
+        assert_eq!(new_replica.starts.load(Ordering::Acquire), 1);
+        // Critical: existing replicas did NOT restart — their
+        // start counters stay at 1 (no respawn).
+        for d in daemons.lock().iter() {
+            assert_eq!(d.starts.load(Ordering::Acquire), 1, "existing replica restarted");
+            assert_eq!(d.stops.load(Ordering::Acquire), 0, "existing replica stopped");
+        }
+
+        group.stop().await;
+    }
+
+    #[tokio::test]
+    async fn remove_last_stops_only_the_last_replica() {
+        let daemons: Arc<parking_lot::Mutex<Vec<Arc<CountingDaemon>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let daemons_clone = daemons.clone();
+        let mut group = LifecycleGroup::<CountingDaemon>::spawn(3, [0u8; 32], move |_idx| {
+            let d = Arc::new(CountingDaemon::new());
+            daemons_clone.lock().push(d.clone());
+            d
+        })
+        .await
+        .expect("spawn");
+
+        let removed = group.remove_last().await.expect("remove_last");
+        assert_eq!(group.replica_count(), 2);
+        // Returned Arc is the original index-2 replica.
+        let last_original = daemons.lock()[2].clone();
+        assert!(Arc::ptr_eq(&removed, &last_original));
+        // The dropped replica's stop counter incremented exactly once.
+        assert_eq!(removed.stops.load(Ordering::Acquire), 1);
+        // Indices 0 and 1 untouched.
+        let kept = daemons.lock();
+        assert_eq!(kept[0].stops.load(Ordering::Acquire), 0);
+        assert_eq!(kept[1].stops.load(Ordering::Acquire), 0);
+        drop(kept);
+
+        group.stop().await;
+    }
+
+    #[tokio::test]
+    async fn remove_last_refuses_to_drop_below_one() {
+        let mut group = LifecycleGroup::<CountingDaemon>::spawn(1, [0u8; 32], |_idx| {
+            Arc::new(CountingDaemon::new())
+        })
+        .await
+        .expect("spawn");
+        match group.remove_last().await {
+            Ok(_) => panic!("expected InvalidConfig, got Ok"),
+            Err(LifecycleGroupError::InvalidConfig(msg)) => {
+                assert!(msg.contains("cannot remove last replica"), "msg was: {msg}");
+            }
+            Err(other) => panic!("expected InvalidConfig, got {other:?}"),
+        }
+        // Replica still there, can still stop the group cleanly.
+        assert_eq!(group.replica_count(), 1);
+        group.stop().await;
+    }
+
+    #[tokio::test]
+    async fn add_replica_propagates_on_start_failure() {
+        let mut group = LifecycleGroup::<CountingDaemon>::spawn(1, [0u8; 32], |_idx| {
+            Arc::new(CountingDaemon::new())
+        })
+        .await
+        .expect("spawn");
+        let result = group
+            .add_replica(|_idx| {
+                let d = Arc::new(CountingDaemon::new());
+                d.fail_start.store(true, Ordering::Release);
+                d
+            })
+            .await;
+        match result {
+            Ok(_) => panic!("expected StartFailed, got Ok"),
+            Err(LifecycleGroupError::StartFailed { index, .. }) => {
+                assert_eq!(index, 1);
+            }
+            Err(other) => panic!("expected StartFailed, got {other:?}"),
+        }
+        // Group still has the original replica; no zombie added.
+        assert_eq!(group.replica_count(), 1);
+        group.stop().await;
     }
 }

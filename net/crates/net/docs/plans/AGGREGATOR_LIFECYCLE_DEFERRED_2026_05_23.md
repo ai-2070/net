@@ -158,7 +158,9 @@ The existing test (`reservation_fold_summarizer_buckets_by_state_label`) papers 
 
 ## Remaining gap
 
-All eight original items (AL-1..AL-8) are resolved. A turnkey daemon binary ships with template-based dynamic spawn, auto-respawn-by-default, and full `List`/`Spawn`/`Unregister` RPC surface. The one substrate-adjacent surface still pending:
+All eight original items (AL-1..AL-8) are resolved. A turnkey daemon binary ships with template-based dynamic spawn, auto-respawn-by-default, and full `List`/`Spawn`/`Unregister` RPC surface.
 
-- **CLI remote-attach** — `net aggregator ls / query / spawn / scale` against `--node=X` is gated on `CliContext` having a `MeshNode` it can RPC through (pre-existing substrate gap, NET_CLI_PLAN.md Phase 5). The wire surface and `RegistryClient` are ready; the gap is the CLI's MeshNode bootstrap.
-- **Scale RPC** — `LifecycleGroup` doesn't yet expose `add_replica` / `remove_last`. Scale is implementable today via Unregister + Spawn-with-different-count; a dedicated `Scale` op (in-place grow/shrink) is a small follow-up that doesn't move the trust or substrate boundaries.
+The two follow-ups originally listed here are **closed** via `docs/plans/AGGREGATOR_CLI_REMOTE_ATTACH_AND_SCALE_RPC.md`:
+
+- **CLI remote-attach** — closed. `net aggregator query/spawn/scale/ls --remote` operate against a live daemon via `RegistryClient` / `FoldQueryClient`. The CLI's `CliContext::build_with_remote` uses the routed-handshake path (`Mesh::connect_via`) so handshakes complete against a running daemon without pre-`accept`.
+- **Scale RPC** — closed. `LifecycleGroup::add_replica` / `remove_last` (substrate) + `RegistryRequest::Scale` (wire) + `AggregatorRegistry::scale_group` (server) + `RegistryClient::scale` (client) + `net aggregator scale` (CLI) form the in-place grow/shrink path. Surviving replicas keep their identity + generation across the resize. Tested end-to-end via `aggregator-daemon/tests/boot_and_query.rs::scale_*`.

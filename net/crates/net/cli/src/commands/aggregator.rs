@@ -2,34 +2,34 @@
 //! surface for the substrate's `AggregatorDaemon` state and the
 //! `AggregatorRegistry` that holds live groups.
 //!
-//! `inspect` reads the **local** aggregator's state via the
-//! `DeckClient::aggregator_*` accessors (populated when an
-//! aggregator is wired into the deck via
-//! `DeckClient::with_aggregator`). When no aggregator is
-//! installed, output is the natural "not installed" shape —
-//! same convention as `subnet show` / `gateway stats`.
+//! Verb shapes:
 //!
-//! `query` issues a `fold.query` RPC against a **remote**
-//! aggregator and prints the response. Wraps the substrate's
-//! `FoldQueryClient` with operator-friendly flag plumbing
-//! (target node id parsing, fold kind selection,
-//! summarize-now vs. latest, JSON output).
+//! - `inspect` — local. Reads the in-process aggregator's state
+//!   via `DeckClient::aggregator_*` accessors. Empty output when
+//!   no aggregator is installed (same convention as
+//!   `subnet show` / `gateway stats`).
+//! - `ls` — local by default; remote when `--node-addr` is set or
+//!   `--remote` is passed. Local reads through
+//!   `DeckClient::aggregator_registry_snapshot`; remote routes
+//!   through `RegistryClient::list`.
+//! - `query` — remote-only. Issues a `fold.query` RPC against
+//!   the target via `FoldQueryClient`. `--fresh` switches to the
+//!   cache-bypass `SummarizeNow` path.
+//! - `spawn` — remote-only. Calls `RegistryClient::spawn` with
+//!   the daemon-side template name + operator-chosen group name.
+//! - `scale` — remote-only. Calls `RegistryClient::scale` for
+//!   in-place grow/shrink; surviving replicas keep their
+//!   identity + generation across the resize.
 //!
-//! `ls` enumerates every group registered on the local node's
-//! `AggregatorRegistry` with per-replica health + generation.
-//! Reads through `DeckClient::aggregator_registry_snapshot` —
-//! when the CLI runs against a process that doesn't host a
-//! registry, output is empty (same convention as `inspect`).
-//!
-//! `spawn` and `scale` parse + validate args today but return a
-//! typed "needs daemon process" error: the one-shot CLI can't
-//! host the long-running aggregator loop. The error includes
-//! the parsed arguments so operators see what would be passed.
-//! These verbs flip to live once an aggregator-daemon binary +
-//! registry-RPC surface land.
+//! All write/RPC verbs (`query`, `spawn`, `scale`, `ls --remote`)
+//! require remote-attach flags — `--node-addr`, `--node-pubkey`,
+//! `--node-id`, `--psk-hex`, each of which can default from the
+//! profile.
 //!
 //! Phase C of `SCALING_SUBNET_SPEC.md`. Direction B / step 5 of
-//! `AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`.
+//! `AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`. Remote-attach +
+//! Scale RPC wiring lands per
+//! `AGGREGATOR_CLI_REMOTE_ATTACH_AND_SCALE_RPC.md`.
 
 use std::path::PathBuf;
 
@@ -483,38 +483,21 @@ async fn run_scale(
         sdk("internal: remote-attach context returned no mesh_node — should be unreachable")
     })?;
 
-    // Interim path: Unregister + Spawn. The dedicated `Scale`
-    // RPC in B-5 collapses these into one atomic call and
-    // preserves identity for replicas that survive the resize.
+    // Dedicated Scale RPC: grow/shrink in place. Surviving
+    // replicas keep their identity + generation across the
+    // resize. The daemon verifies the supplied template
+    // matches the group's current spec before resizing.
     use net_sdk::aggregator::RegistryClient;
     let client = RegistryClient::new(mesh);
-    let existed = client
-        .unregister(target_node_id, args.name.clone())
-        .await
-        .map_err(|e| sdk(format!("aggregator.registry unregister failed: {e}")))?;
-    if !existed {
-        return Err(sdk(format!(
-            "aggregator group `{}` is not registered on target node {}",
-            args.name, target_node_id
-        )));
-    }
     let summary = client
-        .spawn(
+        .scale(
             target_node_id,
-            args.template.clone(),
             args.name.clone(),
+            args.template.clone(),
             args.replica_count,
         )
         .await
-        .map_err(|e| {
-            sdk(format!(
-                "aggregator.registry spawn after unregister failed: {e} — \
-                 NOTE: the group was unregistered before the failure; \
-                 re-run `net aggregator spawn --name {} --template {} \
-                 --replica-count {}` to restore",
-                args.name, args.template, args.replica_count
-            ))
-        })?;
+        .map_err(|e| sdk(format!("aggregator.registry scale failed: {e}")))?;
 
     let view = SpawnView::from(&summary);
     emit_value(OutputFormat::resolve_oneshot(output), &view)

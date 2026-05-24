@@ -71,9 +71,9 @@
 pub use net::adapter::net::behavior::aggregator::{
     FoldQueryClient, FoldQueryClientError, FoldQueryError, FoldQueryOp, FoldQueryRequest,
     FoldQueryResponse, RegistryClient, RegistryClientError, RegistryGroupSummary,
-    RegistryReplicaSummary, RegistryRequest, RegistryResponse, RegistryRpcError, SpawnFn,
-    SpawnRequest, DEFAULT_QUERY_CACHE_TTL, DEFAULT_QUERY_DEADLINE, DEFAULT_REGISTRY_DEADLINE,
-    FOLD_QUERY_SERVICE, REGISTRY_SERVICE,
+    RegistryReplicaSummary, RegistryRequest, RegistryResponse, RegistryRpcError, ScaleFn,
+    ScaleRequest, SpawnFn, SpawnRequest, DEFAULT_QUERY_CACHE_TTL, DEFAULT_QUERY_DEADLINE,
+    DEFAULT_REGISTRY_DEADLINE, FOLD_QUERY_SERVICE, REGISTRY_SERVICE,
 };
 
 // ─── Daemon-author surfaces (Rust-only re-exports) ───
@@ -254,6 +254,24 @@ impl BoundRegistryClient {
         group_name: impl Into<String>,
     ) -> Result<bool, RegistryClientError> {
         self.inner.unregister(self.target_node_id, group_name).await
+    }
+
+    /// Resize a group on the bound target. See
+    /// [`RegistryClient::scale`].
+    pub async fn scale(
+        &self,
+        group_name: impl Into<String>,
+        template_name: impl Into<String>,
+        target_replica_count: u8,
+    ) -> Result<RegistryGroupSummary, RegistryClientError> {
+        self.inner
+            .scale(
+                self.target_node_id,
+                group_name,
+                template_name,
+                target_replica_count,
+            )
+            .await
     }
 }
 

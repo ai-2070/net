@@ -46,6 +46,11 @@ fn registry_err(e: RegistryClientError) -> Error {
             RegistryRpcError::SpawnNotSupported => {
                 agg_err("spawn-not-supported", "daemon is read-only")
             }
+            RegistryRpcError::UnknownGroup(g) => agg_err("unknown-group", g),
+            RegistryRpcError::ScaleRejected(d) => agg_err("scale-rejected", d),
+            RegistryRpcError::ScaleNotSupported => {
+                agg_err("scale-not-supported", "daemon doesn't accept dynamic scale")
+            }
         },
     }
 }
