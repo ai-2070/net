@@ -216,8 +216,10 @@ fn render_table(
 /// `(healthy/total, style)` chip. `—` when none of the members
 /// appear in the snapshot (common under demo fixtures + when
 /// the deck has no mesh wired). The style ladder mirrors what
-/// NODES uses for its rollup column.
-fn health_rollup(
+/// NODES uses for its rollup column. Public so the SUBNET
+/// focus page (`subnet_page::render_header`) renders the same
+/// rollup in its identity card.
+pub(super) fn health_rollup(
     members: &[u64],
     snapshot: &MeshOsSnapshot,
 ) -> (String, ratatui::style::Style) {

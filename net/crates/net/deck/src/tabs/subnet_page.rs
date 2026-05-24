@@ -41,16 +41,16 @@ pub fn render(
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        // Header card is 5 lines high (block borders + 3 rows
+        // Header card is 6 lines high (block borders + 4 rows
         // of identity); the rest is the members table.
-        .constraints([Constraint::Length(7), Constraint::Min(0)])
+        .constraints([Constraint::Length(8), Constraint::Min(0)])
         .split(area);
 
-    render_header(frame, chunks[0], focus);
+    render_header(frame, chunks[0], focus, snapshot);
     render_members(frame, chunks[1], focus, snapshot);
 }
 
-fn render_header(frame: &mut Frame<'_>, area: Rect, focus: &SubnetFocusEntry) {
+fn render_header(frame: &mut Frame<'_>, area: Rect, focus: &SubnetFocusEntry, snapshot: &MeshOsSnapshot) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::rule())
@@ -75,6 +75,9 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, focus: &SubnetFocusEntry) {
         theme::dim()
     };
 
+    let (health_text, health_style) =
+        super::subnets::health_rollup(&focus.members, snapshot);
+
     let lines = vec![
         Line::from(vec![
             Span::styled("  id:      ", theme::chrome()),
@@ -91,6 +94,10 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, focus: &SubnetFocusEntry) {
             Span::styled(format!("{}", focus.members.len()), theme::text()),
             Span::styled("    local:    ", theme::chrome()),
             Span::styled(local_str, local_style),
+        ]),
+        Line::from(vec![
+            Span::styled("  health:  ", theme::chrome()),
+            Span::styled(health_text, health_style),
         ]),
     ];
     frame.render_widget(
