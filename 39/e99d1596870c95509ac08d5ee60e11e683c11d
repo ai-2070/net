@@ -1,0 +1,19 @@
+net/crates/net/bindings/go/net/mesh_rpc_typed_test.go
+  s_099fa7d871e34d::t_b8093f647b7bbb 1-377
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "39e99d1596870c95509ac08d5ee60e11e683c11d",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
