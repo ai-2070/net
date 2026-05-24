@@ -134,6 +134,171 @@ NRPC_TYPED_HANDLER_ERROR = 0x8001
 
 
 # ---------------------------------------------------------------------------
+# Observer + metrics dataclasses (S2-C3). Mirror the pyo3
+# `RpcCallEvent` / `ServiceMetrics` / `RpcMetricsSnapshot` pyclass
+# field shapes; we reconstruct the tagged-union `status`
+# discriminator from the raw POD's flat `status_kind` /
+# `status_message` pair so user code sees a Python-idiomatic
+# union instead of two separate fields.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RpcCallStatusOk:
+    """Successful response received from the callee."""
+
+    pass
+
+
+@dataclass(frozen=True)
+class RpcCallStatusError:
+    """Server returned a typed error or transport-level failure."""
+
+    message: str
+
+
+@dataclass(frozen=True)
+class RpcCallStatusTimeout:
+    """``opts.deadline`` expired before the response arrived."""
+
+    pass
+
+
+@dataclass(frozen=True)
+class RpcCallStatusCanceled:
+    """Call dropped before completion (cancel-token / drop)."""
+
+    pass
+
+
+# Type alias for the tagged-union outcome. Use ``isinstance`` to
+# discriminate.
+RpcCallStatus = Any  # one of the four classes above
+
+
+@dataclass(frozen=True)
+class RpcCallEvent:
+    """Single observed RPC call boundary surfaced to the observer.
+
+    The ``status`` field is a tagged union — match with
+    ``isinstance`` on one of :class:`RpcCallStatusOk`,
+    :class:`RpcCallStatusError`, :class:`RpcCallStatusTimeout`,
+    or :class:`RpcCallStatusCanceled` before reading other fields.
+    """
+
+    caller: int
+    callee: int
+    method: str
+    latency_ms: int
+    status: Any
+    request_bytes: int
+    response_bytes: int
+    direction: str  # "outbound" | "inbound"
+    ts_unix_ms: int
+
+
+@dataclass(frozen=True)
+class ServiceMetrics:
+    """Per-service caller + server-side counters at a point in time.
+    Element of :class:`RpcMetricsSnapshot.services`.
+    """
+
+    service: str
+    # caller-side
+    calls_total: int
+    errors_no_route: int
+    errors_timeout: int
+    errors_server: int
+    errors_transport: int
+    in_flight: int
+    latency_sum_ns: int
+    latency_count: int
+    latency_buckets: list
+    # server-side
+    handler_invocations_total: int
+    handler_panics_total: int
+    handler_in_flight: int
+    handler_duration_sum_ns: int
+    handler_duration_count: int
+    handler_duration_buckets: list
+    streaming_chunks_emitted_total: int
+    streaming_chunks_dropped_total: int
+    capability_denied_total: int
+
+
+@dataclass(frozen=True)
+class RpcMetricsSnapshot:
+    """Snapshot of the per-service nRPC metrics registry."""
+
+    services: list  # list[ServiceMetrics]
+
+
+def _raw_event_to_typed(raw: Any) -> RpcCallEvent:
+    """Convert the pyo3 POD shape (``RpcCallEvent`` with flat
+    ``status_kind`` / ``status_message``) into the Python-idiomatic
+    tagged-union :class:`RpcCallEvent`.
+    """
+    kind = raw.status_kind
+    if kind == "ok":
+        status: Any = RpcCallStatusOk()
+    elif kind == "error":
+        status = RpcCallStatusError(message=raw.status_message or "")
+    elif kind == "timeout":
+        status = RpcCallStatusTimeout()
+    elif kind == "canceled":
+        status = RpcCallStatusCanceled()
+    else:
+        # Forward-compat: unknown kind falls back to Error(kind)
+        # so downstream code surfaces the discriminator string
+        # rather than blowing up. Update the union when the
+        # substrate adds variants.
+        status = RpcCallStatusError(message=f"unknown:{kind}")
+    return RpcCallEvent(
+        caller=int(raw.caller),
+        callee=int(raw.callee),
+        method=raw.method,
+        latency_ms=int(raw.latency_ms),
+        status=status,
+        request_bytes=int(raw.request_bytes),
+        response_bytes=int(raw.response_bytes),
+        direction=raw.direction,
+        ts_unix_ms=int(raw.ts_unix_ms),
+    )
+
+
+def _raw_service_metrics_to_typed(raw: Any) -> ServiceMetrics:
+    """Convert a pyo3 ``ServiceMetrics`` POD into the Python dataclass."""
+    return ServiceMetrics(
+        service=raw.service,
+        calls_total=int(raw.calls_total),
+        errors_no_route=int(raw.errors_no_route),
+        errors_timeout=int(raw.errors_timeout),
+        errors_server=int(raw.errors_server),
+        errors_transport=int(raw.errors_transport),
+        in_flight=int(raw.in_flight),
+        latency_sum_ns=int(raw.latency_sum_ns),
+        latency_count=int(raw.latency_count),
+        latency_buckets=list(raw.latency_buckets),
+        handler_invocations_total=int(raw.handler_invocations_total),
+        handler_panics_total=int(raw.handler_panics_total),
+        handler_in_flight=int(raw.handler_in_flight),
+        handler_duration_sum_ns=int(raw.handler_duration_sum_ns),
+        handler_duration_count=int(raw.handler_duration_count),
+        handler_duration_buckets=list(raw.handler_duration_buckets),
+        streaming_chunks_emitted_total=int(raw.streaming_chunks_emitted_total),
+        streaming_chunks_dropped_total=int(raw.streaming_chunks_dropped_total),
+        capability_denied_total=int(raw.capability_denied_total),
+    )
+
+
+def _raw_metrics_snapshot_to_typed(raw: Any) -> RpcMetricsSnapshot:
+    """Convert a pyo3 ``RpcMetricsSnapshot`` POD into the dataclass."""
+    return RpcMetricsSnapshot(
+        services=[_raw_service_metrics_to_typed(s) for s in raw.services],
+    )
+
+
+# ---------------------------------------------------------------------------
 # JSON codec helpers.
 #
 # The typed wrappers wrap the user's Python value with json.dumps /
@@ -795,6 +960,51 @@ class TypedMeshRpc:
             handler(typed_stream, typed_sink)
 
         return self._raw.serve_duplex(service, _wrapped)
+
+    # ---- observer + metrics (S2-C3) -----------------------------------------
+
+    def set_observer(
+        self,
+        observer: Optional[Callable[[RpcCallEvent], None]],
+    ) -> None:
+        """Install (pass a callable) or clear (pass ``None``) the
+        caller-side nRPC observer. The callable fires once per
+        completed outbound RPC with a decoded
+        :class:`RpcCallEvent` — the tagged-union ``status`` is
+        reconstructed from the pyo3 POD's flat ``status_kind`` /
+        ``status_message`` fields.
+
+        **Callback contract (locked decision #1).** The callable
+        fires from a tokio blocking-pool worker; the substrate
+        dispatch thread enqueues + returns immediately, so GIL
+        acquisition never blocks the hot path. Exceptions raised
+        by the observer are silently swallowed — observers must
+        not influence the in-flight call.
+
+        Callbacks must be cheap: push events into a
+        :class:`queue.Queue` for slow consumers; do not do
+        per-event work inline. Bounded queueing + drop-counters
+        are a deliberate post-v1 follow-up.
+
+        v1 emits only ``direction == "outbound"`` events; the
+        server-side hook is a planned follow-up.
+        """
+        if observer is None:
+            self._raw.set_observer(None)
+            return
+
+        def _wrapped(raw_evt: Any) -> None:
+            observer(_raw_event_to_typed(raw_evt))
+
+        self._raw.set_observer(_wrapped)
+
+    def metrics_snapshot(self) -> RpcMetricsSnapshot:
+        """Snapshot the per-service nRPC metrics registry. Cheap
+        — one DashMap iteration on the substrate side. Safe to
+        call on every Prometheus scrape. Returns a frozen
+        :class:`RpcMetricsSnapshot` dataclass.
+        """
+        return _raw_metrics_snapshot_to_typed(self._raw.metrics_snapshot())
 
     # ---- resilience ---------------------------------------------------------
 

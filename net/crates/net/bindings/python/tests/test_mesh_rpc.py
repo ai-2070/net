@@ -47,6 +47,13 @@ from net.mesh_rpc import (
     RpcServerError,
     RpcTimeoutError,
     RpcTransportError,
+    RpcCallEvent,
+    RpcCallStatusCanceled,
+    RpcCallStatusError,
+    RpcCallStatusOk,
+    RpcCallStatusTimeout,
+    RpcMetricsSnapshot,
+    ServiceMetrics,
     TypedClientStreamCall,
     TypedDuplexCall,
     TypedDuplexSink,
@@ -1054,3 +1061,201 @@ def test_typed_serve_duplex_destructures_stream_and_sink() -> None:
         '{"r":"echo:2"}',
         '{"r":"echo:3"}',
     ]
+
+
+# =========================================================================
+# TypedMeshRpc.set_observer + metrics_snapshot (S2-C3) — stub-level
+# normalization + forwarding tests. Live observer firing belongs in S2-X.
+# =========================================================================
+
+
+class _RawEvent:
+    """Stand-in for the pyo3 ``RpcCallEvent`` POD with flat
+    ``status_kind`` / ``status_message`` fields.
+    """
+
+    def __init__(
+        self,
+        *,
+        caller: int = 0x1,
+        callee: int = 0x2,
+        method: str = "echo",
+        latency_ms: int = 7,
+        status_kind: str = "ok",
+        status_message: str | None = None,
+        request_bytes: int = 10,
+        response_bytes: int = 20,
+        direction: str = "outbound",
+        ts_unix_ms: int = 1_000_000,
+    ) -> None:
+        self.caller = caller
+        self.callee = callee
+        self.method = method
+        self.latency_ms = latency_ms
+        self.status_kind = status_kind
+        self.status_message = status_message
+        self.request_bytes = request_bytes
+        self.response_bytes = response_bytes
+        self.direction = direction
+        self.ts_unix_ms = ts_unix_ms
+
+
+def test_typed_event_ok_status() -> None:
+    from net.mesh_rpc import _raw_event_to_typed
+
+    evt = _raw_event_to_typed(_RawEvent(status_kind="ok"))
+    assert isinstance(evt, RpcCallEvent)
+    assert isinstance(evt.status, RpcCallStatusOk)
+
+
+def test_typed_event_error_status_carries_message() -> None:
+    from net.mesh_rpc import _raw_event_to_typed
+
+    evt = _raw_event_to_typed(
+        _RawEvent(status_kind="error", status_message="connection lost"),
+    )
+    assert isinstance(evt.status, RpcCallStatusError)
+    assert evt.status.message == "connection lost"
+
+
+def test_typed_event_error_with_no_message_defaults_to_empty() -> None:
+    from net.mesh_rpc import _raw_event_to_typed
+
+    evt = _raw_event_to_typed(_RawEvent(status_kind="error"))
+    assert isinstance(evt.status, RpcCallStatusError)
+    assert evt.status.message == ""
+
+
+def test_typed_event_timeout_and_canceled_bare_tags() -> None:
+    from net.mesh_rpc import _raw_event_to_typed
+
+    t = _raw_event_to_typed(_RawEvent(status_kind="timeout"))
+    c = _raw_event_to_typed(_RawEvent(status_kind="canceled"))
+    assert isinstance(t.status, RpcCallStatusTimeout)
+    assert isinstance(c.status, RpcCallStatusCanceled)
+
+
+def test_typed_event_preserves_other_fields() -> None:
+    from net.mesh_rpc import _raw_event_to_typed
+
+    evt = _raw_event_to_typed(
+        _RawEvent(
+            caller=0xAA00,
+            callee=0xBB00,
+            method="svc.foo",
+            latency_ms=3,
+            request_bytes=8,
+            response_bytes=4,
+            direction="outbound",
+            ts_unix_ms=1234,
+        ),
+    )
+    assert evt.caller == 0xAA00
+    assert evt.callee == 0xBB00
+    assert evt.method == "svc.foo"
+    assert evt.latency_ms == 3
+    assert evt.request_bytes == 8
+    assert evt.response_bytes == 4
+    assert evt.direction == "outbound"
+    assert evt.ts_unix_ms == 1234
+
+
+class _CapturingObserverRpc:
+    def __init__(self) -> None:
+        self.installed = None
+
+    def set_observer(self, callable_or_none) -> None:
+        self.installed = callable_or_none
+
+
+def test_typed_set_observer_decodes_events_and_forwards() -> None:
+    stub = _CapturingObserverRpc()
+    rpc = TypedMeshRpc(stub)
+    seen: list = []
+    rpc.set_observer(lambda evt: seen.append(evt))
+    assert stub.installed is not None
+    stub.installed(
+        _RawEvent(
+            method="svc.foo",
+            status_kind="error",
+            status_message="no_route",
+        ),
+    )
+    assert len(seen) == 1
+    assert seen[0].method == "svc.foo"
+    assert isinstance(seen[0].status, RpcCallStatusError)
+    assert seen[0].status.message == "no_route"
+
+
+def test_typed_set_observer_none_clears_raw_observer() -> None:
+    stub = _CapturingObserverRpc()
+    rpc = TypedMeshRpc(stub)
+    rpc.set_observer(lambda evt: None)
+    assert stub.installed is not None
+    rpc.set_observer(None)
+    assert stub.installed is None
+
+
+class _RawServiceMetrics:
+    """Stand-in for the pyo3 ``ServiceMetrics`` POD."""
+
+    def __init__(self) -> None:
+        self.service = "echo"
+        self.calls_total = 42
+        self.errors_no_route = 0
+        self.errors_timeout = 1
+        self.errors_server = 0
+        self.errors_transport = 0
+        self.in_flight = 0
+        self.latency_sum_ns = 1234567
+        self.latency_count = 42
+        self.latency_buckets = [10, 22, 30]
+        self.handler_invocations_total = 0
+        self.handler_panics_total = 0
+        self.handler_in_flight = 0
+        self.handler_duration_sum_ns = 0
+        self.handler_duration_count = 0
+        self.handler_duration_buckets = [0, 0, 0]
+        self.streaming_chunks_emitted_total = 0
+        self.streaming_chunks_dropped_total = 0
+        self.capability_denied_total = 0
+
+
+class _RawSnapshot:
+    def __init__(self, services: list) -> None:
+        self.services = services
+
+
+class _CapturingMetricsRpc:
+    def __init__(self, snapshot: _RawSnapshot) -> None:
+        self._snapshot = snapshot
+
+    def metrics_snapshot(self) -> _RawSnapshot:
+        return self._snapshot
+
+
+def test_typed_metrics_snapshot_decodes_raw_to_dataclass() -> None:
+    raw = _RawSnapshot([_RawServiceMetrics()])
+    stub = _CapturingMetricsRpc(raw)
+    rpc = TypedMeshRpc(stub)
+    snapshot = rpc.metrics_snapshot()
+    assert isinstance(snapshot, RpcMetricsSnapshot)
+    assert len(snapshot.services) == 1
+    svc = snapshot.services[0]
+    assert isinstance(svc, ServiceMetrics)
+    assert svc.service == "echo"
+    assert svc.calls_total == 42
+    assert svc.errors_timeout == 1
+    assert svc.latency_sum_ns == 1234567
+    assert svc.latency_buckets == [10, 22, 30]
+
+
+def test_typed_metrics_snapshot_empty_services() -> None:
+    """No services iterated since the mesh was created → empty list,
+    still wrapped in the typed dataclass.
+    """
+    stub = _CapturingMetricsRpc(_RawSnapshot([]))
+    rpc = TypedMeshRpc(stub)
+    snapshot = rpc.metrics_snapshot()
+    assert isinstance(snapshot, RpcMetricsSnapshot)
+    assert snapshot.services == []
