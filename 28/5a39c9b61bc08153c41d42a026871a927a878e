@@ -1,0 +1,20 @@
+net/crates/net/cli/src/commands/aggregator.rs
+  s_099fa7d871e34d::t_e7ce96e7658cf7 586-591,604-605
+  s_099fa7d871e34d::t_f2a27ad0a93096 621-626,638-639
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "285a39c9b61bc08153c41d42a026871a927a878e",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
