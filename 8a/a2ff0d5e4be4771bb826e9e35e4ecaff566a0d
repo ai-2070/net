@@ -1,0 +1,31 @@
+net/crates/net/docs/plans/AGGREGATOR_CLI_REMOTE_ATTACH_AND_SCALE_RPC.md
+  s_099fa7d871e34d::t_07d6795c3140b2 147
+  s_099fa7d871e34d::t_5cea96fe2164f6 140,143,145
+  s_099fa7d871e34d::t_4335f7b8fd2a40 335
+  s_099fa7d871e34d::t_7ed2236a995f81 401-402
+  s_099fa7d871e34d::t_8b9969add2f8b3 8
+  s_099fa7d871e34d::t_0da76853752a2c 406
+  s_099fa7d871e34d::t_9cb585dd5fbc54 413-414
+  s_099fa7d871e34d::t_46fb3481379281 205,207
+  s_099fa7d871e34d::t_f425cad451dcef 356
+  s_099fa7d871e34d::t_a482b8f6b70128 16
+  s_099fa7d871e34d::t_dda98baf0ebf35 236
+  s_099fa7d871e34d::t_81900127972de3 35
+  s_099fa7d871e34d::t_458e0516d0b64f 366
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "8aa2ff0d5e4be4771bb826e9e35e4ecaff566a0d",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
