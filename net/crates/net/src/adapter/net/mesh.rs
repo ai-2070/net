@@ -1252,6 +1252,26 @@ const MAX_HOPS: u8 = 16;
 /// set is well under this bound).
 const MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE: usize = 256;
 
+/// How `MeshNode::install_peer` should touch the
+/// `addr_to_node` reverse index. Direct handshakes are the sole
+/// owner of `peer_addr → peer_node_id` for the connection's
+/// lifetime; routed handshakes may share `peer_addr` with a
+/// relay's own peer entry (true multi-hop case) and must not
+/// clobber it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AddrInstallMode {
+    /// Direct handshake (`connect`): unconditional
+    /// `addr_to_node[peer_addr] = peer_node_id`.
+    DirectOverwrite,
+    /// Routed handshake (`connect_via`): `or_insert(...)` —
+    /// keeps any prior mapping intact. For the degenerate
+    /// single-hop case (relay == final dest, the CLI remote-
+    /// attach pattern) the slot is empty and the destination's
+    /// `node_id` lands; for true multi-hop the relay's entry
+    /// stays.
+    RoutedPreserve,
+}
+
 /// Multi-peer mesh node.
 ///
 /// Composes `NetSession` (per-peer encryption), `NetRouter` (forwarding),
@@ -2348,6 +2368,40 @@ impl MeshNode {
             .handshake_initiator(peer_addr, peer_pubkey, peer_node_id)
             .await?;
 
+        // Shared peer install (NetSession + router + peers +
+        // peer_addrs + addr_to_node). Direct-mode overwrites
+        // addr_to_node — `peer_addr` IS the peer's wire address.
+        self.install_peer(peer_node_id, peer_addr, keys, AddrInstallMode::DirectOverwrite);
+
+        // Direct-handshake-only post-install wiring. Routed
+        // handshakes (`connect_via`) intentionally skip these:
+        // pingwave / failure_detector are for live 1-hop peers
+        // and the routed responder may not actually be 1-hop on
+        // the wire; push_local_announcement is the initiator's
+        // capability broadcast and routes through different
+        // machinery in the routed case.
+        let peer_graph_id = node_id_to_graph_id(peer_node_id);
+        let pw = EnhancedPingwave::new(peer_graph_id, 0, 1).with_load(0, HealthStatus::Healthy);
+        self.proximity_graph.on_pingwave(pw, peer_addr);
+        self.failure_detector.heartbeat(peer_node_id, peer_addr);
+        self.push_local_announcement(peer_addr).await;
+
+        Ok(peer_node_id)
+    }
+
+    /// Shared peer-install bookkeeping for both [`Self::connect`]
+    /// (direct) and [`Self::connect_via`] (routed). Wraps the
+    /// negotiated `keys` in a [`NetSession`], registers the
+    /// route + peer entry + reverse address index. The
+    /// `addr_mode` determines how `addr_to_node` is touched —
+    /// see [`AddrInstallMode`] for the rationale per caller.
+    fn install_peer(
+        &self,
+        peer_node_id: u64,
+        peer_addr: SocketAddr,
+        keys: SessionKeys,
+        addr_mode: AddrInstallMode,
+    ) {
         let remote_static_pub = keys.remote_static_pub;
         let session = Arc::new(NetSession::new(
             keys,
@@ -2355,10 +2409,7 @@ impl MeshNode {
             self.config.packet_pool_size,
             self.config.default_reliable,
         ));
-
-        // Add route so the router can forward packets to this peer
         self.router.add_route(peer_node_id, peer_addr);
-
         self.peers.insert(
             peer_node_id,
             PeerInfo {
@@ -2366,34 +2417,20 @@ impl MeshNode {
                 addr: peer_addr,
                 session,
                 remote_static_pub,
-                // Initiator-side `connect`: replay-guard is a
+                // Initiator-side: replay-guard is a
                 // responder-side concern, leave empty.
                 last_initiator_ephemeral: None,
             },
         );
-        self.addr_to_node.insert(peer_addr, peer_node_id);
-
-        // Register in peer address map (used by reroute policy)
         self.peer_addrs.insert(peer_node_id, peer_addr);
-
-        // Register in proximity graph (1-hop peer). The synthetic
-        // pingwave's `origin == peer`, so the back-compat shim
-        // attributes the edge correctly (`from_node = origin`).
-        let peer_graph_id = node_id_to_graph_id(peer_node_id);
-        let pw = EnhancedPingwave::new(peer_graph_id, 0, 1).with_load(0, HealthStatus::Healthy);
-        self.proximity_graph.on_pingwave(pw, peer_addr);
-
-        // Register with failure detector
-        self.failure_detector.heartbeat(peer_node_id, peer_addr);
-
-        // Push our most recent capability announcement to the new peer,
-        // so late joiners pick up our caps without waiting for a
-        // re-announce. Races the session's first inbound packet but
-        // that's harmless: the receiver's `index()` is version-skip
-        // safe and DashMap inserts are idempotent.
-        self.push_local_announcement(peer_addr).await;
-
-        Ok(peer_node_id)
+        match addr_mode {
+            AddrInstallMode::DirectOverwrite => {
+                self.addr_to_node.insert(peer_addr, peer_node_id);
+            }
+            AddrInstallMode::RoutedPreserve => {
+                self.addr_to_node.entry(peer_addr).or_insert(peer_node_id);
+            }
+        }
     }
 
     /// Accept a connection from a peer. Performs Noise NKpsk0 as responder.
@@ -9487,42 +9524,15 @@ impl MeshNode {
             }
         };
 
-        // Register the new peer with `relay_addr` as the wire address.
-        // Packets to `dest_node_id` go to the relay first; the routing
-        // table does the rest.
-        //
-        // `addr_to_node` is populated via `entry().or_insert(...)` so a
-        // true multi-hop scenario (where `relay_addr` already maps to
-        // the relay's own node_id from a prior handshake) keeps that
-        // mapping intact — `addr_to_node[relay_addr]` still resolves
-        // to the relay for direct-packet dispatch. But in the
-        // degenerate single-hop case (relay == final dest, e.g. the
-        // CLI remote-attach path), the slot is empty and we install
-        // `relay_addr -> dest_node_id` so address-keyed sends
-        // (`send_subprotocol` for SUBSCRIBE / membership /
-        // service-to-peer paths) can resolve the peer.
-        let remote_static_pub = keys.remote_static_pub;
-        let session = Arc::new(NetSession::new(
-            keys,
-            relay_addr,
-            self.config.packet_pool_size,
-            self.config.default_reliable,
-        ));
-        self.router.add_route(dest_node_id, relay_addr);
-        self.peers.insert(
-            dest_node_id,
-            PeerInfo {
-                node_id: dest_node_id,
-                addr: relay_addr,
-                session,
-                remote_static_pub,
-                // Initiator-side `connect_via`: responder-side
-                // replay guard doesn't read this; leave empty.
-                last_initiator_ephemeral: None,
-            },
-        );
-        self.peer_addrs.insert(dest_node_id, relay_addr);
-        self.addr_to_node.entry(relay_addr).or_insert(dest_node_id);
+        // Shared peer install. Routed-mode preserves any prior
+        // `addr_to_node[relay_addr]` entry (a true multi-hop
+        // relay keeps its own peer_id; degenerate single-hop
+        // installs the destination). Routed handshakes
+        // intentionally skip the post-install pingwave /
+        // failure_detector / announcement push — see
+        // `connect`'s wiring for the direct-handshake-only
+        // bookkeeping.
+        self.install_peer(dest_node_id, relay_addr, keys, AddrInstallMode::RoutedPreserve);
 
         Ok(dest_node_id)
     }
