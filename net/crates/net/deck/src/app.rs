@@ -205,6 +205,10 @@ pub struct App {
     /// Cursor on the BLOBS tab — index into the visible
     /// (filtered) projection of `blobs_tail.snapshot()`.
     pub blobs_cursor: usize,
+    /// Cursor on the GATEWAYS tab — index into the resolved
+    /// export-rule rows. Persists across tab switches so the
+    /// operator's selection survives a quick pivot away.
+    pub gateways_cursor: usize,
     /// BLOBS substring search. Matches hash prefix; empty =
     /// no filter.
     pub blobs_search: String,
@@ -558,6 +562,7 @@ impl App {
             nrpc_tail,
             blobs_tail,
             blobs_cursor: 0,
+            gateways_cursor: 0,
             blobs_search: String::new(),
             blobs_search_editing: false,
             bookmarks,
@@ -1773,6 +1778,13 @@ impl App {
             KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::Blobs => {
                 self.blobs_cursor = self.blobs_cursor.saturating_sub(1);
             }
+            KeyCode::Char('j' | 's') | KeyCode::Down if self.current == Tab::Gateways => {
+                self.gateways_cursor = self.gateways_cursor.saturating_add(1);
+                self.clamp_gateways_cursor();
+            }
+            KeyCode::Char('k' | 'w') | KeyCode::Up if self.current == Tab::Gateways => {
+                self.gateways_cursor = self.gateways_cursor.saturating_sub(1);
+            }
             // Vim-style top/bottom on every cursor-driven tab.
             // `g` jumps to the first row / group / member; `G`
             // jumps to the last. No-op on tabs without a list.
@@ -2171,6 +2183,31 @@ impl App {
         }
     }
 
+    /// Count gateway export rows the panel will render. Reads
+    /// `DeckClient::gateway_exports()` for the live path; under
+    /// `--features demo` the count comes from the fixture so
+    /// `gateways_cursor` clamps correctly even when no real
+    /// gateway is wired.
+    fn gateway_row_count(&self) -> usize {
+        let n = self.deck.gateway_exports().len();
+        #[cfg(feature = "demo")]
+        {
+            if n == 0 && self.deck.gateway_stats().is_none() {
+                return crate::demo::fixtures::gateways().1.len();
+            }
+        }
+        n
+    }
+
+    fn clamp_gateways_cursor(&mut self) {
+        let n = self.gateway_row_count();
+        if n == 0 {
+            self.gateways_cursor = 0;
+        } else if self.gateways_cursor >= n {
+            self.gateways_cursor = n - 1;
+        }
+    }
+
     /// Absorb a single keypress into the active tab's search
     /// buffer. `Enter` commits (filter stays active), `Esc`
     /// cancels and clears, `Backspace` pops, any printable char
@@ -2212,6 +2249,7 @@ impl App {
             Tab::Migrations => self.migration_cursor = 0,
             Tab::Failures => self.failures_cursor = 0,
             Tab::Blobs => self.blobs_cursor = 0,
+            Tab::Gateways => self.gateways_cursor = 0,
             Tab::Groups => self.groups_cursor = DaemonCursor::default(),
             _ => {}
         }
@@ -2260,6 +2298,10 @@ impl App {
             Tab::Blobs => {
                 let n = self.visible_blobs_count();
                 self.blobs_cursor = n.saturating_sub(1);
+            }
+            Tab::Gateways => {
+                let n = self.gateway_row_count();
+                self.gateways_cursor = n.saturating_sub(1);
             }
             Tab::Groups => {
                 let groups = crate::lineage::group_daemons(&self.snapshot.daemons);
@@ -3065,7 +3107,9 @@ impl App {
                 );
             }
             Tab::Subnets => tabs::subnets::render(frame, chunks[3], &self.deck),
-            Tab::Gateways => tabs::gateways::render(frame, chunks[3], &self.deck),
+            Tab::Gateways => {
+                tabs::gateways::render(frame, chunks[3], &self.deck, self.gateways_cursor)
+            }
             Tab::Aggregators => tabs::aggregators::render(frame, chunks[3], &self.deck),
         }
         widgets::footer::render(

@@ -20,7 +20,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use net_sdk::deck::{AggregatorSnapshot, GatewayStats, SubnetRollup, SummaryAnnouncement};
-use net_sdk::subnets::SubnetId;
+use net_sdk::subnets::{SubnetId, Visibility};
+
+/// One resolved gateway-export row for the demo. Wraps the
+/// substrate's `(channel_hash, targets)` tuple with the channel
+/// name + visibility + reach the table needs.
+#[derive(Clone, Debug)]
+pub struct GatewayExportRow {
+    pub channel_hash: u16,
+    pub channel_name: Option<String>,
+    pub visibility: Option<Visibility>,
+    pub targets: Vec<SubnetId>,
+    pub reach: u64,
+}
 
 /// Pinned anchor subnet for the demo — the "local" node lives in
 /// `us-east.alpha-prod`. Two-level hierarchy: region (1=us-east)
@@ -68,8 +80,11 @@ pub fn subnets() -> (Option<SubnetId>, Vec<SubnetRollup>) {
     (Some(local), rollups)
 }
 
-/// Fixture stats + export-table for the GATEWAYS panel.
-pub fn gateways() -> (GatewayStats, Vec<(u16, Vec<SubnetId>)>) {
+/// Fixture stats + resolved export rows for the GATEWAYS
+/// panel. REACH values are pre-computed against the matching
+/// subnets fixture (2.1 = 6, 3.1 = 5, 1.3 = 4 members) so the
+/// numbers in this table line up with what SUBNETS shows.
+pub fn gateways() -> (GatewayStats, Vec<GatewayExportRow>) {
     let stats = GatewayStats {
         local_subnet: local_subnet(),
         forwarded: 124_587,
@@ -82,15 +97,30 @@ pub fn gateways() -> (GatewayStats, Vec<(u16, Vec<SubnetId>)>) {
         export_rules: 3,
     };
     let exports = vec![
-        // `inference.batch.completed` → siblings + cross-region
-        // peers for demand-shaping rollups.
-        (0x4a17, vec![SubnetId::new(&[2, 1]), SubnetId::new(&[3, 1])]),
-        // `forge.rollout.broadcast` → just the sibling fleet
-        // (us-east.beta-staging) for staged rollouts.
-        (0x9b22, vec![SubnetId::new(&[1, 3])]),
-        // `capability.gpu-h100` → us-west only (cross-region
-        // capability sharing for spillover scheduling).
-        (0xe041, vec![SubnetId::new(&[2, 1])]),
+        GatewayExportRow {
+            channel_hash: 0x4a17,
+            channel_name: Some("swarm.telemetry.pose".into()),
+            visibility: Some(Visibility::Exported),
+            targets: vec![SubnetId::new(&[2, 1]), SubnetId::new(&[3, 1])],
+            // 2.1 (6 nodes) + 3.1 (5 nodes) = 11
+            reach: 11,
+        },
+        GatewayExportRow {
+            channel_hash: 0x9b22,
+            channel_name: Some("swarm.mission.broadcast".into()),
+            visibility: Some(Visibility::Exported),
+            targets: vec![SubnetId::new(&[1, 3])],
+            // 1.3 (4 nodes)
+            reach: 4,
+        },
+        GatewayExportRow {
+            channel_hash: 0xe041,
+            channel_name: Some("capability.tether.relay".into()),
+            visibility: Some(Visibility::Exported),
+            targets: vec![SubnetId::new(&[2, 1])],
+            // 2.1 (6 nodes)
+            reach: 6,
+        },
     ];
     (stats, exports)
 }
