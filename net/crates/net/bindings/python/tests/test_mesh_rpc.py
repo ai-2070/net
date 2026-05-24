@@ -47,7 +47,9 @@ from net.mesh_rpc import (
     RpcServerError,
     RpcTimeoutError,
     RpcTransportError,
+    TypedClientStreamCall,
     TypedMeshRpc,
+    TypedRequestStream,
     classify_error,
     default_breaker_failure,
     default_retryable,
@@ -618,3 +620,214 @@ def test_typed_serve_handler_runtime_exception_still_surfaces_as_internal() -> N
     assert stub.inner is not None
     with pytest.raises(RuntimeError, match="boom"):
         stub.inner(b'{"any": "valid_json"}')
+
+
+# =========================================================================
+# TypedClientStreamCall + TypedRequestStream (S2-C1) — stub-level
+# round-trip + encode/decode failure coverage. Live tests against a
+# real MeshRpc belong in S2-X (cross-language).
+# =========================================================================
+
+
+class _StubRawClientStreamCall:
+    """Stub mirroring the pyo3 ``ClientStreamCall`` surface."""
+
+    def __init__(self, finish_response: bytes) -> None:
+        self.finish_response = finish_response
+        self.sent: list[bytes] = []
+        self.closed = False
+        self._call_id = 7
+        self._flow_controlled = False
+
+    def send(self, body: bytes) -> None:
+        self.sent.append(bytes(body))
+
+    def finish(self) -> bytes:
+        return self.finish_response
+
+    def call_id(self) -> int:
+        return self._call_id
+
+    def flow_controlled(self) -> bool:
+        return self._flow_controlled
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_typed_client_stream_round_trip() -> None:
+    """Round-trip: three typed sends + a decoded terminal response."""
+    import json as _json
+
+    raw = _StubRawClientStreamCall(_json.dumps({"sum": 6}).encode("utf-8"))
+    call = TypedClientStreamCall(raw)
+    call.send({"n": 1})
+    call.send({"n": 2})
+    call.send({"n": 3})
+    assert call.finish() == {"sum": 6}
+    assert [bytes(b).decode("utf-8") for b in raw.sent] == [
+        '{"n":1}',
+        '{"n":2}',
+        '{"n":3}',
+    ]
+
+
+def test_typed_client_stream_encode_failure_raises_codec_error() -> None:
+    raw = _StubRawClientStreamCall(b"null")
+    call = TypedClientStreamCall(raw)
+
+    class NotJsonable:
+        pass
+
+    with pytest.raises(RpcCodecError):
+        call.send(NotJsonable())
+    # Encode happens before reaching the wire — no chunk sent.
+    assert raw.sent == []
+
+
+def test_typed_client_stream_finish_decode_failure_raises_codec_error() -> None:
+    raw = _StubRawClientStreamCall(b"{not json")
+    call = TypedClientStreamCall(raw)
+    with pytest.raises(RpcCodecError):
+        call.finish()
+
+
+def test_typed_client_stream_context_manager_calls_close() -> None:
+    raw = _StubRawClientStreamCall(b"null")
+    with TypedClientStreamCall(raw):
+        pass
+    assert raw.closed is True
+
+
+def test_typed_client_stream_close_swallows_underlying_errors() -> None:
+    """``close()`` is a best-effort cleanup — a raw layer that
+    raises must NOT propagate; matches TypedRpcStream.close.
+    """
+
+    class _RaisingClose(_StubRawClientStreamCall):
+        def close(self) -> None:
+            raise RuntimeError("boom")
+
+    call = TypedClientStreamCall(_RaisingClose(b"null"))
+    call.close()  # must not raise
+    call.close()  # idempotent
+
+
+class _StubRawRequestStream:
+    """Stub mirroring the pyo3 ``RequestStreamRecv`` surface —
+    iterator protocol + diagnostic getters.
+    """
+
+    def __init__(
+        self,
+        chunks: list[bytes],
+        *,
+        caller_origin: int = 0xFEEDFACE,
+        call_id: int = 42,
+        deadline_ns: int = 0,
+        headers: list | None = None,
+    ) -> None:
+        self._chunks = list(chunks)
+        self._idx = 0
+        self.caller_origin = caller_origin
+        self.call_id = call_id
+        self.deadline_ns = deadline_ns
+        self.headers = headers if headers is not None else []
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> bytes:
+        if self._idx >= len(self._chunks):
+            raise StopIteration
+        chunk = self._chunks[self._idx]
+        self._idx += 1
+        return chunk
+
+
+def test_typed_request_stream_decodes_chunks_until_eof() -> None:
+    raw = _StubRawRequestStream(
+        [b'{"n":1}', b'{"n":2}', b'{"n":3}'],
+    )
+    stream = TypedRequestStream(raw)
+    decoded = [item["n"] for item in stream]
+    assert decoded == [1, 2, 3]
+
+
+def test_typed_request_stream_decode_failure_marks_done() -> None:
+    raw = _StubRawRequestStream([b'{not json'])
+    stream = TypedRequestStream(raw)
+    with pytest.raises(RpcCodecError):
+        next(stream)
+    # Subsequent next() returns StopIteration (no re-throw) — the
+    # stream is marked done; refuse to continue draining broken
+    # framing.
+    with pytest.raises(StopIteration):
+        next(stream)
+
+
+def test_typed_request_stream_exposes_diagnostic_getters() -> None:
+    raw = _StubRawRequestStream(
+        [],
+        caller_origin=0xDEADBEEF,
+        call_id=99,
+        deadline_ns=1_700_000_000_000_000_000,
+        headers=[("x-trace", b"abc")],
+    )
+    stream = TypedRequestStream(raw)
+    assert stream.caller_origin == 0xDEADBEEF
+    assert stream.call_id == 99
+    assert stream.deadline_ns == 1_700_000_000_000_000_000
+    assert stream.headers == [("x-trace", b"abc")]
+
+
+class _CapturingClientStreamRpc:
+    """Stub that captures ``serve_client_stream`` / ``call_client_stream``
+    so we can drive the wrapper without a live binding.
+    """
+
+    def __init__(self) -> None:
+        self.inner_handler = None
+        self.call_args: tuple | None = None
+        self.returned_call: _StubRawClientStreamCall | None = None
+
+    def serve_client_stream(self, service: str, handler) -> object:  # noqa: ARG002
+        self.inner_handler = handler
+        return object()
+
+    def call_client_stream(
+        self,
+        target: int,
+        service: str,
+        opts: dict | None,
+    ) -> _StubRawClientStreamCall:
+        self.call_args = (target, service, opts)
+        self.returned_call = _StubRawClientStreamCall(b"null")
+        return self.returned_call
+
+
+def test_typed_serve_client_stream_decodes_and_encodes_round_trip() -> None:
+    stub = _CapturingClientStreamRpc()
+    rpc = TypedMeshRpc(stub)
+    rpc.serve_client_stream("sum", lambda stream: {"sum": sum(r["n"] for r in stream)})
+    assert stub.inner_handler is not None
+    # Synthesize a raw request stream and run the wrapper's
+    # installed inner handler against it. Result should be the
+    # JSON-encoded terminal sum.
+    raw_stream = _StubRawRequestStream([b'{"n":10}', b'{"n":20}', b'{"n":12}'])
+    resp = stub.inner_handler(raw_stream)
+    import json as _json
+
+    assert _json.loads(resp.decode("utf-8")) == {"sum": 42}
+
+
+def test_typed_call_client_stream_wraps_raw_call() -> None:
+    stub = _CapturingClientStreamRpc()
+    rpc = TypedMeshRpc(stub)
+    call = rpc.call_client_stream(0xCAFE, "ingest", {"deadline_ms": 1000})
+    assert isinstance(call, TypedClientStreamCall)
+    assert stub.call_args == (0xCAFE, "ingest", {"deadline_ms": 1000})
+    # Round-trip through the returned typed call to confirm wiring.
+    call.send({"k": "v"})
+    assert stub.returned_call is not None
+    assert stub.returned_call.sent[0].decode("utf-8") == '{"k":"v"}'

@@ -41,22 +41,40 @@ from typing import Any, Callable, Iterator, Optional, Sequence
 try:
     from net._net import (
         Cancellable,
+        ClientStreamCall as _RawClientStreamCall,
+        DuplexCall as _RawDuplexCall,
+        DuplexSink as _RawDuplexSink,
+        DuplexStream as _RawDuplexStream,
         MeshRpc as _RawMeshRpc,
+        RequestStreamRecv as _RawRequestStreamRecv,
+        ResponseSinkSend as _RawResponseSinkSend,
         RpcAppError,
+        RpcCallEvent as _RawRpcCallEvent,
         RpcCancelledError,
         RpcCapabilityDeniedError,
         RpcCodecError,
         RpcError,
+        RpcMetricsSnapshot as _RawRpcMetricsSnapshot,
         RpcNoRouteError,
         RpcServerError,
         RpcStream as _RawRpcStream,
         RpcTimeoutError,
         RpcTransportError,
         ServeHandle,
+        ServiceMetrics as _RawServiceMetrics,
     )
 except ImportError:  # pragma: no cover — feature-flag path
     _RawMeshRpc = None  # type: ignore[assignment]
     _RawRpcStream = None  # type: ignore[assignment]
+    _RawClientStreamCall = None  # type: ignore[assignment]
+    _RawDuplexCall = None  # type: ignore[assignment]
+    _RawDuplexSink = None  # type: ignore[assignment]
+    _RawDuplexStream = None  # type: ignore[assignment]
+    _RawRequestStreamRecv = None  # type: ignore[assignment]
+    _RawResponseSinkSend = None  # type: ignore[assignment]
+    _RawRpcCallEvent = None  # type: ignore[assignment]
+    _RawRpcMetricsSnapshot = None  # type: ignore[assignment]
+    _RawServiceMetrics = None  # type: ignore[assignment]
     RpcError = Exception  # type: ignore[misc,assignment]
     RpcNoRouteError = RpcError  # type: ignore[misc,assignment]
     RpcTimeoutError = RpcError  # type: ignore[misc,assignment]
@@ -200,6 +218,146 @@ class TypedRpcStream:
 
 
 # ---------------------------------------------------------------------------
+# TypedClientStreamCall + TypedRequestStream (S2-C1).
+#
+# Client-streaming: caller pushes typed requests via ``send``,
+# then ``finish`` awaits a single terminal response.
+#
+# Cancellation contract (locked decision #2): v1 ``close()``-only.
+# Unifying cancel-token / signal / context propagation across
+# streaming shapes is a deliberate post-v1 follow-up.
+# ---------------------------------------------------------------------------
+
+
+class TypedClientStreamCall:
+    """Typed client-streaming call handle. Push typed requests via
+    :meth:`send`, then :meth:`finish` to await the terminal
+    response. Supports the context-manager protocol so a ``with``
+    block closes the call on exit.
+
+    Encoding failures on :meth:`send` raise :class:`RpcCodecError`
+    BEFORE the chunk hits the wire; decode failure on the
+    terminal response surfaces similarly.
+    """
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+
+    @property
+    def raw(self) -> Any:
+        """Underlying raw ``ClientStreamCall`` (bytes-level surface)."""
+        return self._raw
+
+    def send(self, value: Any) -> None:
+        """Encode ``value`` as JSON and push it as one request
+        chunk. Raises :class:`RpcCodecError` on encode failure;
+        the chunk is NOT sent in that case.
+        """
+        self._raw.send(_json_encode(value))
+
+    def finish(self) -> Any:
+        """Close the upload direction and await the terminal
+        response. Consumes the call. Returns the decoded
+        response; raises :class:`RpcCodecError` on a malformed
+        terminal body.
+        """
+        return _json_decode(self._raw.finish())
+
+    def call_id(self) -> int:
+        """Server-assigned ``call_id``."""
+        return int(self._raw.call_id())
+
+    def flow_controlled(self) -> bool:
+        """``True`` if the call was opened with
+        ``request_window_initial``.
+        """
+        return bool(self._raw.flow_controlled())
+
+    def close(self) -> None:
+        """Close without finishing. Fires CANCEL via the SDK's
+        Drop. Idempotent; concurrent in-flight :meth:`send`
+        awaiting credit observes ``RpcError("send aborted by
+        close()")``.
+        """
+        try:
+            self._raw.close()
+        except Exception:
+            # Best-effort — match TypedRpcStream.close semantics.
+            pass
+
+    def __enter__(self) -> "TypedClientStreamCall":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        self.close()
+        return False
+
+
+class TypedRequestStream:
+    """Typed inbound request stream surfaced to client-streaming +
+    duplex server handlers. Iterates over decoded chunks until
+    EOF (``StopIteration``). Decode failure on a chunk raises
+    :class:`RpcCodecError` and marks the stream done so subsequent
+    ``next`` returns ``StopIteration``.
+
+    Diagnostic getters (``caller_origin``, ``call_id``,
+    ``deadline_ns``, ``headers``) are stable for the lifetime of
+    the stream.
+    """
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+        self._done = False
+
+    @property
+    def raw(self) -> Any:
+        """Underlying raw ``RequestStreamRecv``."""
+        return self._raw
+
+    @property
+    def caller_origin(self) -> int:
+        """Caller's peer origin hash (``0`` on loopback)."""
+        return int(self._raw.caller_origin)
+
+    @property
+    def call_id(self) -> int:
+        """Server-assigned ``call_id``."""
+        return int(self._raw.call_id)
+
+    @property
+    def deadline_ns(self) -> int:
+        """Caller's declared deadline as a Unix-nanoseconds absolute
+        timestamp; ``0`` means no deadline.
+        """
+        return int(self._raw.deadline_ns)
+
+    @property
+    def headers(self) -> list:
+        """Initial-REQUEST headers as ``[(name, bytes)]``."""
+        return list(self._raw.headers)
+
+    def __iter__(self) -> Iterator[Any]:
+        return self
+
+    def __next__(self) -> Any:
+        if self._done:
+            raise StopIteration
+        try:
+            chunk = next(self._raw)
+        except StopIteration:
+            self._done = True
+            raise
+        try:
+            return _json_decode(chunk)
+        except RpcCodecError:
+            # Mark done so subsequent next() returns StopIteration
+            # — refuse to continue draining a stream whose framing
+            # is broken. Mirrors TypedRpcStream's behavior.
+            self._done = True
+            raise
+
+
+# ---------------------------------------------------------------------------
 # TypedMeshRpc — public typed wrapper.
 # ---------------------------------------------------------------------------
 
@@ -322,6 +480,53 @@ class TypedMeshRpc:
     def find_service_nodes(self, service: str) -> list[int]:
         """All node ids advertising ``nrpc:<service>``."""
         return list(self._raw.find_service_nodes(service))
+
+    # ---- client-streaming (S2-C1) -------------------------------------------
+
+    def call_client_stream(
+        self,
+        target_node_id: int,
+        service: str,
+        opts: Optional[dict] = None,
+    ) -> "TypedClientStreamCall":
+        """Open a typed client-streaming call. Returns a
+        :class:`TypedClientStreamCall` — push typed requests via
+        :meth:`send`, then :meth:`finish` to drain the terminal
+        response.
+
+        Cancellation contract (locked decision #2): v1 supports
+        ``close()`` only. ``opts['cancel']`` is **not** wired into
+        the raw streaming layer; invoke ``typed_call.close()`` to
+        abort an in-flight stream.
+        """
+        raw_call = self._raw.call_client_stream(target_node_id, service, opts)
+        return TypedClientStreamCall(raw_call)
+
+    def serve_client_stream(
+        self,
+        service: str,
+        handler: Callable[["TypedRequestStream"], Any],
+    ) -> ServeHandle:
+        """Register a typed client-streaming handler. ``handler``
+        receives a :class:`TypedRequestStream` (auto-decodes each
+        inbound chunk) and returns the terminal response
+        ``Resp`` (which gets JSON-encoded back to the wire).
+
+        Decode failure on a chunk surfaces from
+        ``stream.__next__`` as :class:`RpcCodecError`. The
+        handler MAY catch and skip; letting the exception
+        propagate surfaces to the caller as
+        ``RpcStatus::Internal``. Raise
+        ``RpcAppError(NRPC_TYPED_BAD_REQUEST, body)`` to surface
+        a typed bad-request status code instead.
+        """
+
+        def _wrapped(raw_stream: Any) -> bytes:
+            typed_stream = TypedRequestStream(raw_stream)
+            resp = handler(typed_stream)
+            return _json_encode(resp)
+
+        return self._raw.serve_client_stream(service, _wrapped)
 
     # ---- resilience ---------------------------------------------------------
 
