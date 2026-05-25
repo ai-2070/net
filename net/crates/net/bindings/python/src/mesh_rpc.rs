@@ -474,6 +474,23 @@ fn check_cancel_keys_exclusive<'py>(opts: Option<&Bound<'py, PyDict>>) -> PyResu
 
 const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Resolve a `handler_timeout_ms` kwarg into a `Duration`:
+/// - `Some(0)` → near-infinite (`u64::MAX / 1000` seconds) so the
+///   handler can run as long as it likes; the substrate's own
+///   call-deadline still applies upstream.
+/// - `Some(ms)` → `Duration::from_millis(ms)`.
+/// - `None` → `DEFAULT_HANDLER_TIMEOUT` (60s).
+///
+/// Hoisted from the 6 sync/async `serve*` registration sites
+/// (P7). Picks up off-by-one bugs at the single source.
+fn resolve_handler_timeout(handler_timeout_ms: Option<u64>) -> Duration {
+    match handler_timeout_ms {
+        Some(0) => Duration::from_secs(u64::MAX / 1000),
+        Some(ms) => Duration::from_millis(ms),
+        None => DEFAULT_HANDLER_TIMEOUT,
+    }
+}
+
 struct PyRpcHandler {
     callable: Py<PyAny>,
     timeout: Duration,
@@ -2032,11 +2049,7 @@ impl PyMeshRpc {
         handler: Py<PyAny>,
         handler_timeout_ms: Option<u64>,
     ) -> PyResult<PyServeHandle> {
-        let timeout = match handler_timeout_ms {
-            Some(0) => Duration::from_secs(u64::MAX / 1000),
-            Some(ms) => Duration::from_millis(ms),
-            None => DEFAULT_HANDLER_TIMEOUT,
-        };
+        let timeout = resolve_handler_timeout(handler_timeout_ms);
         let rust_handler = Arc::new(PyRpcHandler {
             callable: handler,
             timeout,
@@ -2265,11 +2278,7 @@ impl PyMeshRpc {
         handler: Py<PyAny>,
         handler_timeout_ms: Option<u64>,
     ) -> PyResult<PyServeHandle> {
-        let timeout = match handler_timeout_ms {
-            Some(0) => Duration::from_secs(u64::MAX / 1000),
-            Some(ms) => Duration::from_millis(ms),
-            None => DEFAULT_HANDLER_TIMEOUT,
-        };
+        let timeout = resolve_handler_timeout(handler_timeout_ms);
         let rust_handler = Arc::new(PyRpcClientStreamingHandler {
             callable: handler,
             timeout,
@@ -2296,11 +2305,7 @@ impl PyMeshRpc {
         handler: Py<PyAny>,
         handler_timeout_ms: Option<u64>,
     ) -> PyResult<PyServeHandle> {
-        let timeout = match handler_timeout_ms {
-            Some(0) => Duration::from_secs(u64::MAX / 1000),
-            Some(ms) => Duration::from_millis(ms),
-            None => DEFAULT_HANDLER_TIMEOUT,
-        };
+        let timeout = resolve_handler_timeout(handler_timeout_ms);
         let rust_handler = Arc::new(PyRpcDuplexHandler {
             callable: handler,
             timeout,
@@ -2456,11 +2461,7 @@ impl PyAsyncMeshRpc {
         handler: Py<PyAny>,
         handler_timeout_ms: Option<u64>,
     ) -> PyResult<PyServeHandle> {
-        let timeout = match handler_timeout_ms {
-            Some(0) => Duration::from_secs(u64::MAX / 1000),
-            Some(ms) => Duration::from_millis(ms),
-            None => DEFAULT_HANDLER_TIMEOUT,
-        };
+        let timeout = resolve_handler_timeout(handler_timeout_ms);
         // `serve_rpc` is monomorphic in the handler type (Arc<H: Sized>),
         // so we can't unify the two arms into Arc<dyn RpcHandler>.
         // Branch the registration itself instead.
@@ -2508,11 +2509,7 @@ impl PyAsyncMeshRpc {
         handler: Py<PyAny>,
         handler_timeout_ms: Option<u64>,
     ) -> PyResult<PyServeHandle> {
-        let timeout = match handler_timeout_ms {
-            Some(0) => Duration::from_secs(u64::MAX / 1000),
-            Some(ms) => Duration::from_millis(ms),
-            None => DEFAULT_HANDLER_TIMEOUT,
-        };
+        let timeout = resolve_handler_timeout(handler_timeout_ms);
         let inner = if is_coroutine_function(py, &handler) {
             self.node.serve_rpc_client_stream(
                 &service,
@@ -2555,11 +2552,7 @@ impl PyAsyncMeshRpc {
         handler: Py<PyAny>,
         handler_timeout_ms: Option<u64>,
     ) -> PyResult<PyServeHandle> {
-        let timeout = match handler_timeout_ms {
-            Some(0) => Duration::from_secs(u64::MAX / 1000),
-            Some(ms) => Duration::from_millis(ms),
-            None => DEFAULT_HANDLER_TIMEOUT,
-        };
+        let timeout = resolve_handler_timeout(handler_timeout_ms);
         let inner = if is_coroutine_function(py, &handler) {
             self.node.serve_rpc_duplex(
                 &service,
