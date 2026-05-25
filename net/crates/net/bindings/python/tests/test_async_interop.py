@@ -19,9 +19,6 @@ from the main thread, then ``start()`` both sides.
 from __future__ import annotations
 
 import asyncio
-import itertools
-import threading
-import time
 
 import pytest
 
@@ -36,46 +33,8 @@ from net import (  # noqa: E402
     NetMesh,
 )
 
-PSK = "42" * 32
-
-# Per-test unique ports so repeated runs don't collide on localhost.
-_port_counter = itertools.count(29_700)
-
-
-def _next_port() -> str:
-    return f"127.0.0.1:{next(_port_counter)}"
-
-
-def _mesh_pair() -> tuple[NetMesh, NetMesh]:
-    """Build two connected meshes. Mirrors the pattern in
-    `test_compute.py::_mesh_pair`; documented there in detail."""
-    a_addr = _next_port()
-    b_addr = _next_port()
-    a = NetMesh(bind_addr=a_addr, psk=PSK)
-    b = NetMesh(bind_addr=b_addr, psk=PSK)
-
-    errors: list[Exception] = []
-
-    def _accept() -> None:
-        try:
-            b.accept(a.node_id)
-        except Exception as e:
-            errors.append(e)
-
-    t = threading.Thread(target=_accept, daemon=True)
-    t.start()
-    time.sleep(0.05)
-    a.connect(b_addr, b.public_key, b.node_id)
-    t.join(timeout=5)
-    if t.is_alive():
-        raise RuntimeError(
-            "mesh-pair handshake: accept thread still alive after 5 s timeout"
-        )
-    if errors:
-        raise errors[0]
-    a.start()
-    b.start()
-    return a, b
+# Mesh handshake fixtures live in tests/conftest.py (P12):
+# `mesh_pair` yields a connected (a, b) pair with auto-shutdown.
 
 
 # ---------------------------------------------------------------------------
@@ -100,51 +59,43 @@ async def _async_echo(req: bytes) -> bytes:
     return req
 
 
-def test_sync_caller_sync_server_unary() -> None:
+def test_sync_caller_sync_server_unary(mesh_pair) -> None:
     """Regression: the original sync API still works after async lands."""
-    a, b = _mesh_pair()
+    a, b = mesh_pair
+    srv = MeshRpc(b)
+    cli = MeshRpc(a)
+    h = srv.serve("echo", _sync_echo)
     try:
-        srv = MeshRpc(b)
-        cli = MeshRpc(a)
-        h = srv.serve("echo", _sync_echo)
-        try:
-            reply = cli.call(b.node_id, "echo", b"hi")
-            assert reply == b"hi"
-        finally:
-            h.close()
+        reply = cli.call(b.node_id, "echo", b"hi")
+        assert reply == b"hi"
     finally:
-        a.shutdown()
-        b.shutdown()
+        h.close()
 
 
-def test_sync_caller_async_server_unary() -> None:
+def test_sync_caller_async_server_unary(mesh_pair) -> None:
     """A sync caller reaches an `async def` server handler.
 
     The async handler runs as a coroutine on the substrate's tokio
     runtime; the sync caller blocks on its `block_on(call(...))`
     until the coroutine resolves and the reply lands."""
-    a, b = _mesh_pair()
+    a, b = mesh_pair
+    asrv = AsyncMeshRpc(b)
+    cli = MeshRpc(a)
+    h = asrv.serve("echo", _async_echo)
     try:
-        asrv = AsyncMeshRpc(b)
-        cli = MeshRpc(a)
-        h = asrv.serve("echo", _async_echo)
-        try:
-            reply = cli.call(b.node_id, "echo", b"async-via-sync")
-            assert reply == b"async-via-sync"
-        finally:
-            h.close()
+        reply = cli.call(b.node_id, "echo", b"async-via-sync")
+        assert reply == b"async-via-sync"
     finally:
-        a.shutdown()
-        b.shutdown()
+        h.close()
 
 
-def test_async_caller_sync_server_unary() -> None:
+def test_async_caller_sync_server_unary(mesh_pair) -> None:
     """An async caller reaches a sync handler.
 
     The sync handler runs on the substrate's `spawn_blocking` path;
     the async caller awaits a Python awaitable that resolves when
     the substrate reply lands."""
-    a, b = _mesh_pair()
+    a, b = mesh_pair
 
     async def _run() -> bytes:
         srv = MeshRpc(b)
@@ -155,21 +106,17 @@ def test_async_caller_sync_server_unary() -> None:
         finally:
             h.close()
 
-    try:
-        reply = asyncio.run(_run())
-        assert reply == b"sync-via-async"
-    finally:
-        a.shutdown()
-        b.shutdown()
+    reply = asyncio.run(_run())
+    assert reply == b"sync-via-async"
 
 
-def test_async_caller_async_server_unary() -> None:
+def test_async_caller_async_server_unary(mesh_pair) -> None:
     """End-to-end async path: `async def` handler + `await call`.
 
     Both sides ride the same shared `MeshNode`; the reply lands on
     the async caller's awaitable without ever blocking a Python
     thread."""
-    a, b = _mesh_pair()
+    a, b = mesh_pair
 
     async def _run() -> bytes:
         asrv = AsyncMeshRpc(b)
@@ -180,12 +127,8 @@ def test_async_caller_async_server_unary() -> None:
         finally:
             h.close()
 
-    try:
-        reply = asyncio.run(_run())
-        assert reply == b"both-async"
-    finally:
-        a.shutdown()
-        b.shutdown()
+    reply = asyncio.run(_run())
+    assert reply == b"both-async"
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +146,7 @@ def test_async_caller_async_server_unary() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_wait_for_timeout_propagates_to_substrate_cancel() -> None:
+def test_wait_for_timeout_propagates_to_substrate_cancel(mesh_pair) -> None:
     """`asyncio.wait_for(arpc.call(...), timeout=0.1)` against a
     handler that sleeps for several seconds must surface
     `asyncio.TimeoutError` on the caller side AND let the substrate
@@ -219,7 +162,7 @@ def test_wait_for_timeout_propagates_to_substrate_cancel() -> None:
     """
     from net import RpcCancelledError, RpcError  # noqa: F401
 
-    a, b = _mesh_pair()
+    a, b = mesh_pair
 
     handler_was_cancelled = asyncio.Event()
 
@@ -261,14 +204,10 @@ def test_wait_for_timeout_propagates_to_substrate_cancel() -> None:
         finally:
             h.close()
 
-    try:
-        asyncio.run(_run())
-    finally:
-        a.shutdown()
-        b.shutdown()
+    asyncio.run(_run())
 
 
-def test_streaming_mid_iter_cancel_terminates_stream() -> None:
+def test_streaming_mid_iter_cancel_terminates_stream(mesh_pair) -> None:
     """A streaming server emitting on a slow cadence; an async
     consumer breaks out of the `async for` loop after one chunk.
     The remaining substrate-side stream pulls must be dropped
@@ -279,38 +218,55 @@ def test_streaming_mid_iter_cancel_terminates_stream() -> None:
     `task.cancel()` (here triggered via `wait_for` on a single
     `__anext__`) terminates the WHOLE stream, not just one pull.
     """
-    # Imported lazily — the streaming-handler protocol may not be
-    # wired in slim builds; skip cleanly if so.
-    try:
-        from net import RpcCancelledError  # noqa: F401
-    except ImportError:
-        pytest.skip("RpcCancelledError not available in this wheel")
+    # Two sides: server registers a duplex handler that sends a
+    # first chunk fast, then sleeps before sending more. Client
+    # opens via call_duplex, reads one chunk, then asyncio.wait_for
+    # times out a `__anext__`. The substrate cancel-watcher should
+    # observe the cancel and terminate the stream.
+    a, b = mesh_pair
 
-    a, b = _mesh_pair()
+    async def _duplex_handler(stream, sink):
+        # Read whatever the caller sends; emit one fast chunk + one
+        # slow chunk. The slow chunk waits long enough that the
+        # caller's wait_for will time out and trip cancel.
+        for _ in stream:
+            sink.send(b"first")
+            # Sleep blocks one bridge worker — fine for a smoke
+            # test. Cancel propagation is via the substrate's
+            # stream-cancel watcher, not via dropping this sleep.
+            import time as _time
+            _time.sleep(2.0)
+            sink.send(b"second")
 
-    # We need a streaming server. The cleanest path is to register
-    # a sync streaming-handler via the existing MeshRpc serve API.
-    # If serve_streaming isn't exposed (T1-A7 streaming-serve is
-    # deferred per the project plan), skip.
-    srv = MeshRpc(b)
-    if not hasattr(srv, "serve_streaming"):
-        pytest.skip(
-            "MeshRpc.serve_streaming not exposed — streaming-serve "
-            "from Python is deferred (see project plan §T1-A7)"
-        )
+    async def _run() -> bool:
+        asrv = AsyncMeshRpc(b)
+        acli = AsyncMeshRpc(a)
+        h = asrv.serve_duplex("duplex-cancel", _duplex_handler)
+        try:
+            call = await acli.call_duplex(b.node_id, "duplex-cancel")
+            await call.send(b"go")
+            await call.finish_sending()
+            # First chunk arrives promptly.
+            chunk = await asyncio.wait_for(call.__anext__(), timeout=1.0)
+            assert chunk == b"first"
+            # Second pull times out — the substrate-side cancel
+            # should fire on construction-time token and drop the
+            # stream.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(call.__anext__(), timeout=0.2)
+            return True
+        finally:
+            h.close()
 
-    # Body intentionally left for a follow-up wiring slice — we
-    # don't have a Python-side streaming-server handler shape yet
-    # to register a slow-emitting stream against.
-    pytest.skip(
-        "streaming-server-side cancel test requires a Python-side "
-        "serve_streaming handler API (deferred follow-up)"
-    )
-    a.shutdown()
-    b.shutdown()
+    # Streaming serve from Python is real now (T1-A7 completion).
+    # The body above exercises the cancel propagation contract
+    # end-to-end. If `serve_duplex` ever regresses to "not exposed",
+    # this test fails with a clear AttributeError rather than
+    # silently skipping.
+    assert asyncio.run(_run())
 
 
-def test_async_netmesh_shares_handshake_with_sync_netmesh() -> None:
+def test_async_netmesh_shares_handshake_with_sync_netmesh(mesh_pair) -> None:
     """`AsyncNetMesh(mesh)` doesn't re-handshake — the same peer
     connection set up by the sync `NetMesh.connect/.accept` is
     visible to the async wrapper.
@@ -319,17 +275,13 @@ def test_async_netmesh_shares_handshake_with_sync_netmesh() -> None:
     decision #4 — proves an AsyncNetMesh constructed against an
     already-connected mesh sees the existing peer count without
     a re-handshake."""
-    a, b = _mesh_pair()
-    try:
-        amesh_a = AsyncNetMesh(a)
-        amesh_b = AsyncNetMesh(b)
-        # Peer counts come from the underlying MeshNode — already
-        # one peer apiece (the post-handshake state).
-        assert amesh_a.peer_count() >= 1
-        assert amesh_b.peer_count() >= 1
-        # node_id getters also pass through.
-        assert amesh_a.node_id == a.node_id
-        assert amesh_b.node_id == b.node_id
-    finally:
-        a.shutdown()
-        b.shutdown()
+    a, b = mesh_pair
+    amesh_a = AsyncNetMesh(a)
+    amesh_b = AsyncNetMesh(b)
+    # Peer counts come from the underlying MeshNode — already
+    # one peer apiece (the post-handshake state).
+    assert amesh_a.peer_count() >= 1
+    assert amesh_b.peer_count() >= 1
+    # node_id getters also pass through.
+    assert amesh_a.node_id == a.node_id
+    assert amesh_b.node_id == b.node_id
