@@ -56,6 +56,26 @@ fn test_config() -> MeshNodeConfig {
     cfg
 }
 
+/// Poll until `mesh` has at least `expected` cancel-registry
+/// entries, or panic if the budget expires. Replaces the
+/// hand-tuned `sleep(50..100ms)` that gated mid-flight cancel
+/// fires on "the call has reached `register_notify`".
+async fn wait_for_cancel_entries(mesh: &Arc<MeshNode>, expected: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if mesh.cancel_registry_len() >= expected {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "cancel registry never reached {expected} entries within 1s (saw {})",
+                mesh.cancel_registry_len()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 async fn build_node() -> Arc<MeshNode> {
     let keypair = EntityKeypair::generate();
     let node = MeshNode::new(keypair, test_config())
@@ -146,8 +166,9 @@ async fn cancel_unary_mid_flight_surfaces_cancelled_error() {
             .await
     });
 
-    // Give the call time to publish + reach the rx.await.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for the call's register_notify to land in the registry
+    // — that's the deterministic signal the rx.await is in flight.
+    wait_for_cancel_entries(&a, 1).await;
     a.cancel(token);
 
     let result = tokio::time::timeout(Duration::from_secs(2), call_task)
@@ -210,7 +231,7 @@ async fn cancel_after_unary_resolution_is_noop() {
             .call(target, "unserved.svc", Bytes::from_static(b"req"), opts)
             .await
     });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_cancel_entries(&a, 1).await;
     a.cancel(token);
     let _ = call_task.await.unwrap();
 
@@ -282,10 +303,10 @@ async fn cancel_streaming_mid_drain_terminates_stream() {
         .await
         .expect("call_streaming should at least open against a reachable peer");
 
-    // Give the cancel-watcher task a chance to register against
-    // the registry entry. Without this, a very fast cancel can
-    // arrive before the watcher's select! is parked.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Wait for the cancel-watcher task to register against the
+    // registry entry. Without this, a very fast cancel can arrive
+    // before the watcher's select! is parked.
+    wait_for_cancel_entries(&a, 1).await;
     a.cancel(token);
 
     // The watcher drops the pending entry → the stream's mpsc

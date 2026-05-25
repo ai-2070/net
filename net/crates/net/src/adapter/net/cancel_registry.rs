@@ -295,9 +295,15 @@ impl CancelRegistry {
     /// Number of entries currently tracked. Diagnostic; not on
     /// any hot path. Includes both registered-and-live entries
     /// and orphan cancel-only entries that haven't aged out yet.
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.lock().entries.len()
+    }
+
+    /// True iff the registry tracks zero entries. Mirrors the
+    /// [`Vec::is_empty`] convention so clippy doesn't pester
+    /// downstream consumers.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

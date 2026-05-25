@@ -5338,6 +5338,16 @@ impl MeshNode {
         &self.cancel_registry
     }
 
+    /// Number of in-flight calls currently registered with the
+    /// cancel registry. Diagnostic — exposed so integration tests
+    /// can deterministically poll for call setup completion
+    /// instead of guessing with `sleep`. Includes orphan
+    /// cancel-only entries that haven't aged out yet.
+    #[cfg(feature = "cortex")]
+    pub fn cancel_registry_len(&self) -> usize {
+        self.cancel_registry.len()
+    }
+
     /// Fire the installed `RpcObserver` (if any) with an
     /// outbound call event. No-op when no observer is wired.
     /// Called from `mesh_rpc::Mesh::call` at every exit
