@@ -1139,6 +1139,35 @@ pub struct PyAsyncMeshOsDaemonHandle {
     daemon_name: String,
 }
 
+impl PyAsyncMeshOsDaemonHandle {
+    /// P17: shared prelude for the sync handle-access methods —
+    /// `publish_log` / `publish_capabilities` / `try_next_control`
+    /// all do "try_lock + None-check" before reaching the inner
+    /// CoreHandle. Hoist to a single helper so the busy /
+    /// already_shutdown error strings live in one place.
+    ///
+    /// Returns the locked guard with the invariant that
+    /// `guard.is_some()`; callers `.as_ref().unwrap()` /
+    /// `.as_mut().unwrap()` to reach the CoreHandle.
+    fn lock_active<'a>(
+        &'a self,
+        py: Python<'_>,
+    ) -> PyResult<tokio::sync::MutexGuard<'a, Option<CoreHandle>>> {
+        let guard = self
+            .inner
+            .try_lock()
+            .map_err(|_| sdk_err(py, "busy", "another async task holds the handle's lock"))?;
+        if guard.is_none() {
+            return Err(sdk_err(
+                py,
+                "already_shutdown",
+                "daemon handle was already consumed",
+            ));
+        }
+        Ok(guard)
+    }
+}
+
 #[pymethods]
 impl PyAsyncMeshOsDaemonHandle {
     /// Consume a sync `MeshOsDaemonHandle`, transferring its
@@ -1217,14 +1246,10 @@ impl PyAsyncMeshOsDaemonHandle {
     /// substrate's log ring.
     fn publish_log<'py>(&self, py: Python<'py>, level: &str, message: &str) -> PyResult<()> {
         let lvl = parse_log_level(level)?;
-        let guard = self
-            .inner
-            .try_lock()
-            .map_err(|_| sdk_err(py, "busy", "another async task holds the handle's lock"))?;
-        let inner = guard
+        let guard = self.lock_active(py)?;
+        guard
             .as_ref()
-            .ok_or_else(|| sdk_err(py, "already_shutdown", "daemon handle was already consumed"))?;
-        inner
+            .expect("lock_active guarantees Some")
             .publish_log(lvl, message)
             .map_err(|e| sdk_err_from(py, e))
     }
@@ -1236,19 +1261,15 @@ impl PyAsyncMeshOsDaemonHandle {
         py: Python<'_>,
         caps: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<()> {
-        let guard = self
-            .inner
-            .try_lock()
-            .map_err(|_| sdk_err(py, "busy", "another async task holds the handle's lock"))?;
-        let inner = guard
-            .as_ref()
-            .ok_or_else(|| sdk_err(py, "already_shutdown", "daemon handle was already consumed"))?;
+        let guard = self.lock_active(py)?;
         let cap_set = match caps {
             Some(d) => crate::capabilities::capability_set_from_py(d)
                 .map_err(|e| sdk_err(py, "invalid_capabilities", &format!("{e}")))?,
             None => CapabilitySet::default(),
         };
-        inner
+        guard
+            .as_ref()
+            .expect("lock_active guarantees Some")
             .publish_capabilities(cap_set)
             .map_err(|e| sdk_err_from(py, e))
     }
