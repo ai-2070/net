@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/cancel_registry.rs
+  s_099fa7d871e34d::t_70a6b76d08a30a 46
+  s_099fa7d871e34d::t_f94d1bd3757d2c 406-476
+  s_099fa7d871e34d::t_49d8a475a699cf 69-90
+  s_099fa7d871e34d::t_0ee65b4ff22429 187-202,212-213,215-216,219,221-238,241-242,259-274,278-281,300
+  s_099fa7d871e34d::t_99e3b20223cc36 137-145,157-160
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "5b2f133351567afdeece929a07108f8df156b6c1",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
