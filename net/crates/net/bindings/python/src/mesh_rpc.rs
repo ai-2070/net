@@ -2018,6 +2018,11 @@ impl PyMeshRpc {
             callable: handler,
             timeout,
         });
+        // serve_rpc spawns the bridge task synchronously at register
+        // time (see substrate mesh_rpc.rs build_request_grant_emitter +
+        // dispatcher spawn). Enter the runtime so Handle::current()
+        // resolves; without this we panic with "no reactor running".
+        let _enter = self.runtime.enter();
         let inner = self
             .node
             .serve_rpc(&service, rust_handler)
@@ -2248,6 +2253,7 @@ impl PyMeshRpc {
             timeout,
             runtime: self.runtime.clone(),
         });
+        let _enter = self.runtime.enter();
         let inner = self
             .node
             .serve_rpc_client_stream(&service, rust_handler)
@@ -2275,6 +2281,7 @@ impl PyMeshRpc {
             timeout,
             runtime: self.runtime.clone(),
         });
+        let _enter = self.runtime.enter();
         let inner = self
             .node
             .serve_rpc_duplex(&service, rust_handler)
@@ -2429,6 +2436,7 @@ impl PyAsyncMeshRpc {
         // `serve_rpc` is monomorphic in the handler type (Arc<H: Sized>),
         // so we can't unify the two arms into Arc<dyn RpcHandler>.
         // Branch the registration itself instead.
+        let _enter = self.runtime.enter();
         let inner = if is_coroutine_function(py, &handler) {
             self.node.serve_rpc(
                 &service,
@@ -2474,6 +2482,7 @@ impl PyAsyncMeshRpc {
         handler_timeout_ms: Option<u64>,
     ) -> PyResult<PyServeHandle> {
         let timeout = resolve_handler_timeout(handler_timeout_ms);
+        let _enter = self.runtime.enter();
         let inner = if is_coroutine_function(py, &handler) {
             self.node.serve_rpc_client_stream(
                 &service,
@@ -2517,6 +2526,7 @@ impl PyAsyncMeshRpc {
         handler_timeout_ms: Option<u64>,
     ) -> PyResult<PyServeHandle> {
         let timeout = resolve_handler_timeout(handler_timeout_ms);
+        let _enter = self.runtime.enter();
         let inner = if is_coroutine_function(py, &handler) {
             self.node.serve_rpc_duplex(
                 &service,
