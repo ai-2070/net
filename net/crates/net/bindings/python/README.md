@@ -130,9 +130,11 @@ asyncio.run(main())
 | `RegistryClient` | `AsyncRegistryClient` | `list`, `spawn`, `unregister` |
 | `FoldQueryClient` | `AsyncFoldQueryClient` | `query_latest`, `query_summarize_now` |
 | `MeshQueryRunner` | `AsyncMeshQueryRunner` | `execute` |
-| `DeckClient` | `AsyncDeckClient` | `close`; getters stay sync; `.admin` is `AsyncAdminCommands`; `.snapshots()` / `.status_summary_stream()` return async iters |
+| `DeckClient` | `AsyncDeckClient` | `close`; getters stay sync; `.admin` is `AsyncAdminCommands`; `.ice` is `AsyncIceCommands`; `.snapshots()` / `.status_summary_stream()` return async iters |
 | `AdminCommands` | `AsyncAdminCommands` | `drain`, `enter_maintenance`, `exit_maintenance`, `cordon`, `uncordon`, `drop_replicas`, `invalidate_placement`, `restart_all_daemons`, `clear_avoid_list` |
+| `IceCommands` / `IceProposal` / `SimulatedIceProposal` | `AsyncIceCommands` / `AsyncIceProposal` / `AsyncSimulatedIceProposal` | Factories stay sync; `proposal.simulate()` and `simulated.commit()` are awaitable |
 | `SnapshotStream` / `StatusSummaryStream` | `AsyncSnapshotStream` / `AsyncStatusSummaryStream` | PEP 525 async iter |
+| `MeshOsDaemonSdk` / `MeshOsDaemonHandle` | `AsyncMeshOsDaemonSdk` / `AsyncMeshOsDaemonHandle` | `shutdown` / `next_control` / `graceful_shutdown` are awaitable; constructed via `from_sync(sync_inst)` (consumes the sync sibling) |
 
 ### Mixing sync and async
 

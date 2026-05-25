@@ -1354,7 +1354,6 @@ impl<'py> pyo3::IntoPyObject<'py> for DaemonControlWrap {
 #[pyclass(name = "AsyncMeshOsDaemonSdk", module = "net._net")]
 pub struct PyAsyncMeshOsDaemonSdk {
     inner: Arc<tokio::sync::Mutex<Option<CoreSdk>>>,
-    runtime: Arc<Runtime>,
 }
 
 #[pymethods]
@@ -1375,7 +1374,6 @@ impl PyAsyncMeshOsDaemonSdk {
         })?;
         Ok(Self {
             inner: Arc::new(tokio::sync::Mutex::new(Some(core))),
-            runtime: sdk.runtime.clone(),
         })
     }
 
@@ -1478,13 +1476,5 @@ impl PyAsyncMeshOsDaemonSdk {
             .map(|g| g.is_some())
             .unwrap_or(true);
         format!("AsyncMeshOsDaemonSdk(active={active})")
-    }
-
-    // Silence dead-code on the runtime field — exposed for parity
-    // with the sync class and held so a future TX test can pump
-    // events on the shared runtime if it needs to.
-    #[allow(dead_code)]
-    fn _runtime_ref(&self) -> bool {
-        self.runtime.handle().metrics().num_workers() > 0
     }
 }
