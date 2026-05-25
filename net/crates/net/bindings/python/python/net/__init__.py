@@ -114,6 +114,9 @@ else:
 try:
     from ._net import (
         AsyncClientStreamCall,
+        AsyncDuplexCall,
+        AsyncDuplexSink,
+        AsyncDuplexStream,
         AsyncMeshRpc,
         AsyncRpcStream,
         Cancellable,
@@ -136,6 +139,9 @@ else:
     __all__.extend(
         [
             "AsyncClientStreamCall",
+            "AsyncDuplexCall",
+            "AsyncDuplexSink",
+            "AsyncDuplexStream",
             "AsyncMeshRpc",
             "AsyncRpcStream",
             "Cancellable",

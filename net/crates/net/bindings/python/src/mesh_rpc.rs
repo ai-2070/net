@@ -2222,6 +2222,43 @@ impl PyAsyncMeshRpc {
         })
     }
 
+    /// Open a duplex call. Returns an awaitable resolving to an
+    /// :class:`AsyncDuplexCall` with both upload + download
+    /// surfaces. Use ``into_split`` to peel into independent
+    /// :class:`AsyncDuplexSink` + :class:`AsyncDuplexStream` halves.
+    ///
+    /// Sync equivalent: :meth:`MeshRpc.call_duplex`.
+    #[pyo3(signature = (target_node_id, service, opts=None))]
+    fn call_duplex<'py>(
+        &self,
+        py: Python<'py>,
+        target_node_id: u64,
+        service: String,
+        opts: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut inner_opts = call_options_from_dict(opts)?;
+        let node = self.node.clone();
+        let mesh_for_call = self.node.clone();
+        crate::async_bridge::await_with_cancel(py, &self.node, move |token| {
+            inner_opts.cancel_token = Some(token);
+            async move {
+                let inner = node
+                    .call_duplex(target_node_id, &service, inner_opts)
+                    .await
+                    .map_err(rpc_error_to_pyerr)?;
+                let call_id_cached = inner.call_id();
+                let flow_controlled_cached = inner.flow_controlled();
+                Ok::<_, PyErr>(PyAsyncDuplexCall {
+                    inner: Arc::new(Mutex::new(Some(inner))),
+                    mesh: mesh_for_call,
+                    cancel_token: token,
+                    call_id_cached,
+                    flow_controlled_cached,
+                })
+            }
+        })
+    }
+
     /// Open a streaming-response call. Returns an awaitable that
     /// resolves to an :class:`AsyncRpcStream`; iterate the stream
     /// with `async for chunk in stream:` or pull chunks one at a
@@ -2438,6 +2475,284 @@ impl PyAsyncClientStreamCall {
     }
 
     /// Async alias for :meth:`close`.
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.close();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
+    }
+}
+
+// ============================================================================
+// PyAsyncDuplexCall + PyAsyncDuplexSink + PyAsyncDuplexStream (T1-A6).
+//
+// Async duplex shape: `async def send` + `async def finish_sending`
+// for the upload side, `__aiter__`/`__anext__` (PEP 525) for the
+// download side, `into_split` to peel into independent halves.
+//
+// Every awaitable threads the construction-time cancel-token via
+// await_with_existing_token, so a mid-call task.cancel() (or
+// asyncio.wait_for timeout) tears down both halves cleanly.
+// ============================================================================
+
+#[pyclass(name = "AsyncDuplexCall", module = "_net")]
+pub struct PyAsyncDuplexCall {
+    inner: Arc<Mutex<Option<InnerDuplexCallRaw>>>,
+    mesh: Arc<MeshNode>,
+    cancel_token: u64,
+    call_id_cached: u64,
+    flow_controlled_cached: bool,
+}
+
+#[pymethods]
+impl PyAsyncDuplexCall {
+    /// Async push of one body chunk to the server.
+    fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let mesh = self.mesh.clone();
+        let token = self.cancel_token;
+        let body_bytes = Bytes::copy_from_slice(body.as_bytes());
+        crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
+            let mut call = match inner.lock().take() {
+                Some(c) => c,
+                None => return Err(RpcError::new_err("duplex call already closed")),
+            };
+            let result = call.send(body_bytes).await;
+            match result {
+                Ok(()) => {
+                    *inner.lock() = Some(call);
+                    Ok::<(), PyErr>(())
+                }
+                Err(e) => {
+                    drop(call);
+                    Err(rpc_error_to_pyerr(e))
+                }
+            }
+        })
+    }
+
+    /// Async upload-direction REQUEST_END. The response side stays
+    /// open for subsequent `__anext__` pulls.
+    fn finish_sending<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let mesh = self.mesh.clone();
+        let token = self.cancel_token;
+        crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
+            let mut call = match inner.lock().take() {
+                Some(c) => c,
+                None => return Err(RpcError::new_err("duplex call already closed")),
+            };
+            let result = call.finish_sending().await;
+            *inner.lock() = Some(call);
+            result.map_err(rpc_error_to_pyerr)
+        })
+    }
+
+    /// PEP 525 async iterator over the response side.
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Awaitable yielding the next response chunk; raises
+    /// ``StopAsyncIteration`` on clean EOF.
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let mesh = self.mesh.clone();
+        let token = self.cancel_token;
+        crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
+            let mut call = match inner.lock().take() {
+                Some(c) => c,
+                None => return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+            };
+            let next = call.next().await;
+            match next {
+                Some(Ok(bytes)) => {
+                    *inner.lock() = Some(call);
+                    Ok::<Vec<u8>, PyErr>(bytes.to_vec())
+                }
+                Some(Err(e)) => {
+                    drop(call);
+                    Err(rpc_error_to_pyerr(e))
+                }
+                None => {
+                    drop(call);
+                    Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
+                }
+            }
+        })
+    }
+
+    /// Split into independent send + receive halves. After split,
+    /// the original ``AsyncDuplexCall`` is consumed — subsequent
+    /// send / finish_sending / __anext__ raise ``RpcError``.
+    #[pyo3(name = "into_split")]
+    fn split(&self) -> PyResult<(PyAsyncDuplexSink, PyAsyncDuplexStream)> {
+        let call = self
+            .inner
+            .lock()
+            .take()
+            .ok_or_else(|| RpcError::new_err("duplex call already closed"))?;
+        let call_id = call.call_id();
+        let flow_controlled = call.flow_controlled();
+        let (sink, stream) = call.into_split();
+        Ok((
+            PyAsyncDuplexSink {
+                inner: Arc::new(Mutex::new(Some(sink))),
+                mesh: self.mesh.clone(),
+                cancel_token: self.cancel_token,
+                call_id_cached: call_id,
+                flow_controlled_cached: flow_controlled,
+            },
+            PyAsyncDuplexStream {
+                inner: Arc::new(Mutex::new(Some(stream))),
+                mesh: self.mesh.clone(),
+                cancel_token: self.cancel_token,
+                call_id_cached: call_id,
+            },
+        ))
+    }
+
+    /// Server-assigned `call_id`.
+    fn call_id(&self) -> u64 {
+        self.call_id_cached
+    }
+
+    /// ``True`` if the call was opened with a non-``None``
+    /// ``request_window_initial``.
+    fn flow_controlled(&self) -> bool {
+        self.flow_controlled_cached
+    }
+
+    /// Close the call. Fires CANCEL via the SDK's Drop. Idempotent.
+    fn close(&self) {
+        let mut guard = self.inner.lock();
+        let _ = guard.take();
+    }
+
+    /// Async alias for :meth:`close`.
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.close();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
+    }
+}
+
+#[pyclass(name = "AsyncDuplexSink", module = "_net")]
+pub struct PyAsyncDuplexSink {
+    inner: Arc<Mutex<Option<InnerDuplexSink>>>,
+    mesh: Arc<MeshNode>,
+    cancel_token: u64,
+    call_id_cached: u64,
+    flow_controlled_cached: bool,
+}
+
+#[pymethods]
+impl PyAsyncDuplexSink {
+    fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let mesh = self.mesh.clone();
+        let token = self.cancel_token;
+        let body_bytes = Bytes::copy_from_slice(body.as_bytes());
+        crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
+            let mut sink = match inner.lock().take() {
+                Some(s) => s,
+                None => return Err(RpcError::new_err("duplex sink already closed")),
+            };
+            let result = sink.send(body_bytes).await;
+            match result {
+                Ok(()) => {
+                    *inner.lock() = Some(sink);
+                    Ok::<(), PyErr>(())
+                }
+                Err(e) => {
+                    drop(sink);
+                    Err(rpc_error_to_pyerr(e))
+                }
+            }
+        })
+    }
+
+    /// Close the upload direction (emit REQUEST_END). Consumes
+    /// the sink — subsequent ``send`` raises ``RpcError``.
+    fn finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let mesh = self.mesh.clone();
+        let token = self.cancel_token;
+        crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
+            let sink = match inner.lock().take() {
+                Some(s) => s,
+                None => return Err(RpcError::new_err("duplex sink already closed")),
+            };
+            sink.finish_sending().await.map_err(rpc_error_to_pyerr)
+        })
+    }
+
+    fn call_id(&self) -> u64 {
+        self.call_id_cached
+    }
+
+    fn flow_controlled(&self) -> bool {
+        self.flow_controlled_cached
+    }
+
+    fn close(&self) {
+        let mut guard = self.inner.lock();
+        let _ = guard.take();
+    }
+
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.close();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
+    }
+}
+
+#[pyclass(name = "AsyncDuplexStream", module = "_net")]
+pub struct PyAsyncDuplexStream {
+    inner: Arc<Mutex<Option<InnerDuplexStream>>>,
+    mesh: Arc<MeshNode>,
+    cancel_token: u64,
+    call_id_cached: u64,
+}
+
+#[pymethods]
+impl PyAsyncDuplexStream {
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let mesh = self.mesh.clone();
+        let token = self.cancel_token;
+        crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
+            let mut stream = match inner.lock().take() {
+                Some(s) => s,
+                None => return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+            };
+            let next = stream.next().await;
+            match next {
+                Some(Ok(bytes)) => {
+                    *inner.lock() = Some(stream);
+                    Ok::<Vec<u8>, PyErr>(bytes.to_vec())
+                }
+                Some(Err(e)) => {
+                    drop(stream);
+                    Err(rpc_error_to_pyerr(e))
+                }
+                None => {
+                    drop(stream);
+                    Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
+                }
+            }
+        })
+    }
+
+    fn call_id(&self) -> u64 {
+        self.call_id_cached
+    }
+
+    fn close(&self) {
+        let mut guard = self.inner.lock();
+        let _ = guard.take();
+    }
+
     fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.close();
         pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
