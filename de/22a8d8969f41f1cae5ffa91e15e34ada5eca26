@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/cancel_registry.rs
+  s_099fa7d871e34d::t_74e3744af333a6 189
+  s_099fa7d871e34d::t_601aa0bd79ff8f 102-103,105-106,108-109
+  s_099fa7d871e34d::t_883deae450d074 211,221
+  s_099fa7d871e34d::t_9dab1d157ca635 226-228
+net/crates/net/docs/plans/NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION.md
+  s_099fa7d871e34d::t_f23ec1fdb0d4e0 441-443
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "de22a8d8969f41f1cae5ffa91e15e34ada5eca26",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
