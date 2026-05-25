@@ -1,0 +1,24 @@
+net/crates/net/bindings/python/src/async_bridge.rs
+  s_099fa7d871e34d::t_12807e3d8dcb0c 1-63
+net/crates/net/bindings/python/src/lib.rs
+  s_099fa7d871e34d::t_cefd1589b4c434 7
+  s_099fa7d871e34d::t_f5be610c07f98e 2278-2287
+net/crates/net/bindings/python/Cargo.toml
+  s_099fa7d871e34d::t_f5a932531686ff 117-122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "95bf8d1efce6807b4399f0d5b491d6bffba7a360",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
