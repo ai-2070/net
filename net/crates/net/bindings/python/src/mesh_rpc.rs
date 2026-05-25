@@ -506,6 +506,38 @@ enum HandlerOutcome {
     AppError { code: u16, body: Vec<u8> },
 }
 
+/// Translate a `HandlerOutcome` result into the substrate's
+/// `Result<RpcResponsePayload, RpcHandlerError>`. Hoisted from
+/// the 6 handler impls (3 sync + 3 async) where the same 3-arm
+/// match was copy-pasted (P6).
+fn finalize_handler_outcome(
+    outcome: Result<HandlerOutcome, String>,
+) -> Result<RpcResponsePayload, RpcHandlerError> {
+    match outcome {
+        Ok(HandlerOutcome::Ok(body)) => Ok(RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body: body.into(),
+        }),
+        Ok(HandlerOutcome::AppError { code, body }) => Err(RpcHandlerError::Application {
+            code,
+            message: String::from_utf8_lossy(&body).into_owned(),
+        }),
+        Err(msg) => Err(RpcHandlerError::Internal(msg)),
+    }
+}
+
+/// Map a Python exception raised inside an async handler coroutine
+/// (post-`.await`) to a `HandlerOutcome`. App-error exceptions
+/// surface as `AppError`; anything else collapses to `Err(format!)`.
+/// Caller threads the result through `finalize_handler_outcome`.
+fn pyerr_to_handler_outcome(pyerr: &PyErr, label: &str) -> Result<HandlerOutcome, String> {
+    Python::attach(|py| match extract_app_error(py, pyerr) {
+        Some((code, body)) => Ok(HandlerOutcome::AppError { code, body }),
+        None => Err(format!("Python {label} raised: {pyerr}")),
+    })
+}
+
 /// Inspect a Python exception. If it's an `RpcAppError(code, body)`,
 /// extract the (code, body) pair so the handler can surface it as
 /// `RpcResponsePayload { status: Application(code) }`. Anything
@@ -577,22 +609,7 @@ impl RpcHandler for PyRpcHandler {
         .await;
 
         match result {
-            Ok(Ok(Ok(HandlerOutcome::Ok(body)))) => Ok(RpcResponsePayload {
-                status: RpcStatus::Ok,
-                headers: vec![],
-                body: body.into(),
-            }),
-            Ok(Ok(Ok(HandlerOutcome::AppError { code, body }))) => {
-                Err(RpcHandlerError::Application {
-                    code,
-                    // RpcHandlerError::Application carries `message:
-                    // String`. The fold encodes it as the response
-                    // body; lossy-utf8 is fine because the typed
-                    // wrappers always produce utf-8 JSON.
-                    message: String::from_utf8_lossy(&body).into_owned(),
-                })
-            }
-            Ok(Ok(Err(msg))) => Err(RpcHandlerError::Internal(msg)),
+            Ok(Ok(outcome)) => finalize_handler_outcome(outcome),
             Ok(Err(join_err)) => Err(RpcHandlerError::Internal(format!(
                 "spawn_blocking task panicked: {join_err}"
             ))),
@@ -669,43 +686,17 @@ impl RpcHandler for PyAsyncRpcHandler {
                 )));
             }
         };
-        match py_result {
-            Ok(value) => {
-                let outcome = Python::attach(|py| -> Result<HandlerOutcome, String> {
-                    let bound = value.into_bound(py);
-                    let bytes_vec: Vec<u8> = bound
-                        .extract()
-                        .map_err(|e| format!("Python handler must return bytes: {e}"))?;
-                    Ok(HandlerOutcome::Ok(bytes_vec))
-                });
-                match outcome {
-                    Ok(HandlerOutcome::Ok(body)) => Ok(RpcResponsePayload {
-                        status: RpcStatus::Ok,
-                        headers: vec![],
-                        body: body.into(),
-                    }),
-                    Ok(HandlerOutcome::AppError { code, body }) => {
-                        Err(RpcHandlerError::Application {
-                            code,
-                            message: String::from_utf8_lossy(&body).into_owned(),
-                        })
-                    }
-                    Err(msg) => Err(RpcHandlerError::Internal(msg)),
-                }
-            }
-            Err(pyerr) => {
-                let app = Python::attach(|py| extract_app_error(py, &pyerr));
-                match app {
-                    Some((code, body)) => Err(RpcHandlerError::Application {
-                        code,
-                        message: String::from_utf8_lossy(&body).into_owned(),
-                    }),
-                    None => Err(RpcHandlerError::Internal(format!(
-                        "Python async handler raised: {pyerr}"
-                    ))),
-                }
-            }
-        }
+        let outcome = match py_result {
+            Ok(value) => Python::attach(|py| -> Result<HandlerOutcome, String> {
+                let bound = value.into_bound(py);
+                let bytes_vec: Vec<u8> = bound
+                    .extract()
+                    .map_err(|e| format!("Python handler must return bytes: {e}"))?;
+                Ok(HandlerOutcome::Ok(bytes_vec))
+            }),
+            Err(pyerr) => pyerr_to_handler_outcome(&pyerr, "async handler"),
+        };
+        finalize_handler_outcome(outcome)
     }
 }
 
@@ -782,33 +773,17 @@ impl RpcClientStreamingHandler for PyAsyncRpcClientStreamingHandler {
                 )));
             }
         };
-        match py_result {
-            Ok(value) => Python::attach(|py| -> Result<RpcResponsePayload, RpcHandlerError> {
+        let outcome = match py_result {
+            Ok(value) => Python::attach(|py| -> Result<HandlerOutcome, String> {
                 let bound = value.into_bound(py);
                 let bytes_vec: Vec<u8> = bound.extract().map_err(|e| {
-                    RpcHandlerError::Internal(format!(
-                        "Python async client-streaming handler must return bytes: {e}"
-                    ))
+                    format!("Python async client-streaming handler must return bytes: {e}")
                 })?;
-                Ok(RpcResponsePayload {
-                    status: RpcStatus::Ok,
-                    headers: vec![],
-                    body: bytes_vec.into(),
-                })
+                Ok(HandlerOutcome::Ok(bytes_vec))
             }),
-            Err(pyerr) => {
-                let app = Python::attach(|py| extract_app_error(py, &pyerr));
-                match app {
-                    Some((code, body)) => Err(RpcHandlerError::Application {
-                        code,
-                        message: String::from_utf8_lossy(&body).into_owned(),
-                    }),
-                    None => Err(RpcHandlerError::Internal(format!(
-                        "Python async client-streaming handler raised: {pyerr}"
-                    ))),
-                }
-            }
-        }
+            Err(pyerr) => pyerr_to_handler_outcome(&pyerr, "async client-streaming handler"),
+        };
+        finalize_handler_outcome(outcome)
     }
 }
 
@@ -876,15 +851,16 @@ impl RpcDuplexHandler for PyAsyncRpcDuplexHandler {
         match py_result {
             Ok(_) => Ok(()),
             Err(pyerr) => {
-                let app = Python::attach(|py| extract_app_error(py, &pyerr));
-                match app {
-                    Some((code, body)) => Err(RpcHandlerError::Application {
-                        code,
-                        message: String::from_utf8_lossy(&body).into_owned(),
-                    }),
-                    None => Err(RpcHandlerError::Internal(format!(
-                        "Python async duplex handler raised: {pyerr}"
-                    ))),
+                let outcome = pyerr_to_handler_outcome(&pyerr, "async duplex handler");
+                // Map onto the unit-returning duplex shape: Ok(())
+                // for AppError too (the substrate ignores the body
+                // — duplex handlers don't return a terminal reply).
+                match finalize_handler_outcome(outcome) {
+                    // finalize_handler_outcome only ever returns
+                    // Err for our Err-variant inputs; map to the
+                    // bare RpcHandlerError.
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(e),
                 }
             }
         }
@@ -1709,18 +1685,7 @@ impl RpcClientStreamingHandler for PyRpcClientStreamingHandler {
         )
         .await;
         match result {
-            Ok(Ok(Ok(HandlerOutcome::Ok(body)))) => Ok(RpcResponsePayload {
-                status: RpcStatus::Ok,
-                headers: vec![],
-                body: body.into(),
-            }),
-            Ok(Ok(Ok(HandlerOutcome::AppError { code, body }))) => {
-                Err(RpcHandlerError::Application {
-                    code,
-                    message: String::from_utf8_lossy(&body).into_owned(),
-                })
-            }
-            Ok(Ok(Err(msg))) => Err(RpcHandlerError::Internal(msg)),
+            Ok(Ok(outcome)) => finalize_handler_outcome(outcome),
             Ok(Err(join_err)) => Err(RpcHandlerError::Internal(format!(
                 "spawn_blocking task panicked: {join_err}"
             ))),
@@ -1797,14 +1762,13 @@ impl RpcDuplexHandler for PyRpcDuplexHandler {
         )
         .await;
         match result {
-            Ok(Ok(Ok(HandlerOutcome::Ok(_)))) => Ok(()),
-            Ok(Ok(Ok(HandlerOutcome::AppError { code, body }))) => {
-                Err(RpcHandlerError::Application {
-                    code,
-                    message: String::from_utf8_lossy(&body).into_owned(),
-                })
-            }
-            Ok(Ok(Err(msg))) => Err(RpcHandlerError::Internal(msg)),
+            Ok(Ok(outcome)) => match finalize_handler_outcome(outcome) {
+                // Duplex returns Result<(), _> — discard the body
+                // on Ok (it's always an empty Vec); App/Internal
+                // errors pass through.
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            },
             Ok(Err(join_err)) => Err(RpcHandlerError::Internal(format!(
                 "spawn_blocking task panicked: {join_err}"
             ))),
