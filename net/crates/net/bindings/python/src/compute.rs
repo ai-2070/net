@@ -1341,6 +1341,435 @@ impl MeshDaemon for ReconstructionErrorBridge {
 }
 
 // =========================================================================
+// AsyncDaemonRuntime + AsyncMigrationHandle — T2-D1 + T2-D2.
+//
+// Async siblings sharing the same Arc<SdkDaemonRuntime> +
+// SdkMigrationHandle as the sync siblings. start / shutdown /
+// spawn / spawn_from_snapshot / stop / snapshot / deliver /
+// start_migration / start_migration_with become awaitable.
+// register_factory / is_ready / daemon_count / expect_migration /
+// register_migration_target_identity / migration_phase stay sync
+// (no awaiting).
+//
+// PyDaemonHandle has no I/O methods — it's a pure identifier
+// carrier — so there's no AsyncDaemonHandle wrapper.
+// =========================================================================
+
+/// Async sibling of [`PyDaemonRuntime`]. Construct from a sync
+/// `DaemonRuntime`; the underlying SDK runtime is shared.
+///
+/// Sync equivalent: :class:`DaemonRuntime`.
+#[pyclass(name = "AsyncDaemonRuntime", module = "net._net")]
+pub struct PyAsyncDaemonRuntime {
+    inner: Arc<SdkDaemonRuntime>,
+    factories: Arc<DashMap<String, Py<PyAny>>>,
+}
+
+#[pymethods]
+impl PyAsyncDaemonRuntime {
+    /// Build against an existing sync `DaemonRuntime`. Cheap
+    /// (`Arc::clone`); both shapes drive the same SDK runtime.
+    #[new]
+    fn new(rt: &PyDaemonRuntime) -> Self {
+        Self {
+            inner: rt.inner.clone(),
+            factories: rt.factories.clone(),
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        self.inner.is_ready()
+    }
+
+    fn daemon_count(&self) -> u32 {
+        self.inner.daemon_count() as u32
+    }
+
+    /// Register a factory callable under `kind`. Sync — same as
+    /// :meth:`DaemonRuntime.register_factory`.
+    fn register_factory(&self, kind: String, factory: Py<PyAny>) -> PyResult<()> {
+        use dashmap::mapref::entry::Entry;
+        match self.factories.entry(kind.clone()) {
+            Entry::Occupied(_) => {
+                return Err(daemon_err(format!(
+                    "factory for kind '{kind}' is already registered"
+                )));
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(factory);
+            }
+        }
+        let factories_for_closure = self.factories.clone();
+        let kind_for_closure = kind.clone();
+        if let Err(e) = self.inner.register_factory(&kind, move || {
+            build_bridge_from_factory(&factories_for_closure, &kind_for_closure)
+        }) {
+            self.factories.remove(&kind);
+            return Err(daemon_err(e.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Transition to `Ready`. Returns an awaitable.
+    fn start<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner
+                .start()
+                .await
+                .map_err(|e| daemon_err(e.to_string()))?;
+            Ok::<(), PyErr>(())
+        })
+    }
+
+    /// Tear down the runtime. Returns an awaitable.
+    fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let factories = self.factories.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner
+                .shutdown()
+                .await
+                .map_err(|e| daemon_err(e.to_string()))?;
+            factories.clear();
+            Ok::<(), PyErr>(())
+        })
+    }
+
+    /// Spawn a daemon of `kind` under the given identity. Returns
+    /// an awaitable yielding a `DaemonHandle`.
+    #[pyo3(signature = (kind, identity, config=None))]
+    fn spawn<'py>(
+        &self,
+        py: Python<'py>,
+        kind: String,
+        identity: &crate::identity::Identity,
+        config: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if !self.factories.contains_key(&kind) {
+            return Err(daemon_err(format!(
+                "no factory registered for kind '{kind}'"
+            )));
+        }
+        let cfg = daemon_host_config_from_dict(config)?;
+        let sdk_identity = identity.to_sdk_identity();
+        // Build the bridge under the GIL synchronously before
+        // entering the awaitable — `build_bridge_inline` runs Python
+        // code (the factory call), so it must run inside the
+        // calling thread's GIL context.
+        let bridge = build_bridge_inline(py, &self.factories, &kind)?;
+        let factories_for_closure = self.factories.clone();
+        let kind_for_closure = kind.clone();
+        let kind_factory = move || -> Box<dyn MeshDaemon> {
+            build_bridge_from_factory(&factories_for_closure, &kind_for_closure)
+        };
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let handle = inner
+                .spawn_with_daemon(sdk_identity, cfg, bridge, kind_factory)
+                .await
+                .map_err(|e| daemon_err(e.to_string()))?;
+            Ok::<PyDaemonHandle, PyErr>(PyDaemonHandle::from_sdk(handle))
+        })
+    }
+
+    /// Spawn from a previously-taken snapshot. Awaitable.
+    #[pyo3(signature = (kind, identity, snapshot_bytes, config=None))]
+    fn spawn_from_snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        kind: String,
+        identity: &crate::identity::Identity,
+        snapshot_bytes: &[u8],
+        config: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if !self.factories.contains_key(&kind) {
+            return Err(daemon_err(format!(
+                "no factory registered for kind '{kind}'"
+            )));
+        }
+        let snapshot_decoded = StateSnapshot::from_bytes(snapshot_bytes)
+            .ok_or_else(|| daemon_err("snapshot decode failed"))?;
+        let cfg = daemon_host_config_from_dict(config)?;
+        let sdk_identity = identity.to_sdk_identity();
+        let bridge = build_bridge_inline(py, &self.factories, &kind)?;
+        let factories_for_closure = self.factories.clone();
+        let kind_for_closure = kind.clone();
+        let kind_factory = move || -> Box<dyn MeshDaemon> {
+            build_bridge_from_factory(&factories_for_closure, &kind_for_closure)
+        };
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let handle = inner
+                .spawn_from_snapshot_with_daemon(
+                    sdk_identity,
+                    snapshot_decoded,
+                    cfg,
+                    bridge,
+                    kind_factory,
+                )
+                .await
+                .map_err(|e| daemon_err(e.to_string()))?;
+            Ok::<PyDaemonHandle, PyErr>(PyDaemonHandle::from_sdk(handle))
+        })
+    }
+
+    /// Stop a daemon. Awaitable.
+    fn stop<'py>(&self, py: Python<'py>, origin_hash: u64) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner
+                .stop(origin_hash)
+                .await
+                .map_err(|e| daemon_err(e.to_string()))?;
+            Ok::<(), PyErr>(())
+        })
+    }
+
+    /// Take a snapshot. Awaitable resolving to ``Optional[bytes]``.
+    fn snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        origin_hash: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let snap = inner
+                .snapshot(origin_hash)
+                .await
+                .map_err(|e| daemon_err(e.to_string()))?;
+            Ok::<Option<Vec<u8>>, PyErr>(snap.map(|s| s.to_bytes().to_vec()))
+        })
+    }
+
+    /// Direct ingress for one causal event. Awaitable resolving to
+    /// ``list[bytes]`` of outputs.
+    fn deliver<'py>(
+        &self,
+        py: Python<'py>,
+        origin_hash: u64,
+        event: &PyCausalEvent,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let core_event = CausalEvent {
+            link: CausalLink {
+                origin_hash: event.origin_hash,
+                horizon_encoded: 0,
+                sequence: event.sequence,
+                parent_hash: 0,
+            },
+            payload: Bytes::copy_from_slice(&event.payload),
+            received_at: 0,
+        };
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let outputs = inner
+                .deliver(origin_hash, &core_event)
+                .map_err(|e| daemon_err(e.to_string()))?;
+            let out: Vec<Vec<u8>> = outputs
+                .into_iter()
+                .map(|ev| ev.payload.to_vec())
+                .collect();
+            Ok::<Vec<Vec<u8>>, PyErr>(out)
+        })
+    }
+
+    /// Initiate a migration. Awaitable yielding `AsyncMigrationHandle`.
+    fn start_migration<'py>(
+        &self,
+        py: Python<'py>,
+        origin_hash: u64,
+        source_node: u64,
+        target_node: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let handle = inner
+                .start_migration(origin_hash, source_node, target_node)
+                .await
+                .map_err(daemon_err_from_sdk)?;
+            Ok::<PyAsyncMigrationHandle, PyErr>(PyAsyncMigrationHandle::from_sdk(handle))
+        })
+    }
+
+    /// `start_migration` with caller-supplied options. Awaitable.
+    #[pyo3(signature = (origin_hash, source_node, target_node, opts))]
+    fn start_migration_with<'py>(
+        &self,
+        py: Python<'py>,
+        origin_hash: u64,
+        source_node: u64,
+        target_node: u64,
+        opts: &Bound<'py, PyDict>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut sdk_opts = MigrationOpts::default();
+        if let Some(v) = opts.get_item("transport_identity")? {
+            sdk_opts.transport_identity = v
+                .extract()
+                .map_err(|e| daemon_err(format!("transport_identity must be bool: {e}")))?;
+        }
+        if let Some(v) = opts.get_item("retry_not_ready_ms")? {
+            let ms: u64 = v.extract().map_err(|e| {
+                daemon_err(format!("retry_not_ready_ms must be non-negative int: {e}"))
+            })?;
+            sdk_opts.retry_not_ready = if ms == 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_millis(ms))
+            };
+        }
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let handle = inner
+                .start_migration_with(origin_hash, source_node, target_node, sdk_opts)
+                .await
+                .map_err(daemon_err_from_sdk)?;
+            Ok::<PyAsyncMigrationHandle, PyErr>(PyAsyncMigrationHandle::from_sdk(handle))
+        })
+    }
+
+    #[pyo3(signature = (kind, origin_hash, config=None))]
+    fn expect_migration(
+        &self,
+        kind: String,
+        origin_hash: u64,
+        config: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        let cfg = daemon_host_config_from_dict(config)?;
+        self.inner
+            .expect_migration(&kind, origin_hash, cfg)
+            .map_err(daemon_err_from_sdk)
+    }
+
+    #[pyo3(signature = (kind, identity, config=None))]
+    fn register_migration_target_identity(
+        &self,
+        kind: String,
+        identity: &crate::identity::Identity,
+        config: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        let sdk_identity = identity.to_sdk_identity();
+        let cfg = daemon_host_config_from_dict(config)?;
+        self.inner
+            .register_migration_target_identity(&kind, sdk_identity, cfg)
+            .map_err(daemon_err_from_sdk)
+    }
+
+    fn migration_phase(&self, origin_hash: u64) -> Option<&'static str> {
+        self.inner
+            .migration_phase(origin_hash)
+            .map(migration_phase_str)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "AsyncDaemonRuntime(ready={}, daemons={})",
+            self.inner.is_ready(),
+            self.inner.daemon_count()
+        )
+    }
+}
+
+/// Async sibling of [`PyMigrationHandle`]. Awaitable `wait` /
+/// `wait_with_timeout` / `cancel`; getters and `phase` / `phases`
+/// stay sync.
+///
+/// Sync equivalent: :class:`MigrationHandle`.
+#[pyclass(name = "AsyncMigrationHandle", module = "net._net")]
+pub struct PyAsyncMigrationHandle {
+    origin_hash: u64,
+    source_node: u64,
+    target_node: u64,
+    inner: SdkMigrationHandle,
+}
+
+impl PyAsyncMigrationHandle {
+    fn from_sdk(handle: SdkMigrationHandle) -> Self {
+        Self {
+            origin_hash: handle.origin_hash,
+            source_node: handle.source_node,
+            target_node: handle.target_node,
+            inner: handle,
+        }
+    }
+}
+
+#[pymethods]
+impl PyAsyncMigrationHandle {
+    #[getter]
+    fn origin_hash(&self) -> u64 {
+        self.origin_hash
+    }
+
+    #[getter]
+    fn source_node(&self) -> u64 {
+        self.source_node
+    }
+
+    #[getter]
+    fn target_node(&self) -> u64 {
+        self.target_node
+    }
+
+    fn phase(&self) -> Option<&'static str> {
+        self.inner.phase().map(migration_phase_str)
+    }
+
+    /// Block until the migration reaches a terminal state.
+    /// Returns an awaitable resolving to ``None`` on success;
+    /// raises `MigrationError` on abort.
+    fn wait<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner.wait().await.map_err(daemon_err_from_sdk)?;
+            Ok::<(), PyErr>(())
+        })
+    }
+
+    /// Awaitable variant with a wall-clock bound.
+    fn wait_with_timeout<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_ms: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner
+                .wait_with_timeout(std::time::Duration::from_millis(timeout_ms))
+                .await
+                .map_err(daemon_err_from_sdk)?;
+            Ok::<(), PyErr>(())
+        })
+    }
+
+    /// Request cancellation. Awaitable.
+    fn cancel<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner.cancel().await.map_err(daemon_err_from_sdk)?;
+            Ok::<(), PyErr>(())
+        })
+    }
+
+    /// Sync iterator over phase transitions — same shape as
+    /// :meth:`MigrationHandle.phases`. Use this for polling-style
+    /// observation; for terminal wait, prefer the awaitable
+    /// `wait` method.
+    fn phases(&self) -> PyMigrationPhasesIter {
+        PyMigrationPhasesIter {
+            inner: self.inner.clone(),
+            last: None,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "AsyncMigrationHandle(origin_hash={:#x}, source={:#x}, target={:#x})",
+            self.origin_hash, self.source_node, self.target_node,
+        )
+    }
+}
+
+// =========================================================================
 // Tests
 // =========================================================================
 

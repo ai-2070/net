@@ -243,6 +243,8 @@ else:
 # with the `compute` feature. Stage 5 of SDK_COMPUTE_SURFACE_PLAN.md.
 try:
     from ._net import (
+        AsyncDaemonRuntime,
+        AsyncMigrationHandle,
         CausalEvent,
         DaemonError,
         DaemonHandle,
@@ -255,6 +257,8 @@ except ImportError:
 else:
     __all__.extend(
         [
+            "AsyncDaemonRuntime",
+            "AsyncMigrationHandle",
             "CausalEvent",
             "DaemonError",
             "DaemonHandle",

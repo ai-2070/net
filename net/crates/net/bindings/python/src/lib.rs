@@ -2945,6 +2945,8 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<compute::PyCausalEvent>()?;
         m.add_class::<compute::PyMigrationHandle>()?;
         m.add_class::<compute::PyMigrationPhasesIter>()?;
+        m.add_class::<compute::PyAsyncDaemonRuntime>()?;
+        m.add_class::<compute::PyAsyncMigrationHandle>()?;
         m.add("DaemonError", m.py().get_type::<compute::DaemonError>())?;
         m.add(
             "MigrationError",
