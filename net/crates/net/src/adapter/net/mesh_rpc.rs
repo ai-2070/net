@@ -1619,6 +1619,60 @@ fn spawn_stream_cancel_watcher(
     done_tx
 }
 
+/// One-call helper that registers a cancel-notify against the
+/// caller's `opts.cancel_token` and spawns the stream cancel
+/// watcher. Used by every streaming call shape (`call_streaming`,
+/// `call_client_stream`, `call_duplex`) to keep their bodies free
+/// of the three-step token/notify/spawn boilerplate.
+///
+/// When `opts.cancel_token` is `None` (or `Some(0)`), this is the
+/// same no-op fast path as [`spawn_stream_cancel_watcher`].
+fn arm_stream_cancel(
+    mesh: &Arc<MeshNode>,
+    opts: &CallOptions,
+    pending: &Arc<crate::adapter::net::cortex::RpcClientPending>,
+    call_id: u64,
+) -> StreamCancelKeepAlive {
+    let cancel_token = opts.cancel_token.unwrap_or(0);
+    let cancel_notify = mesh.cancel_registry().register_notify(cancel_token);
+    spawn_stream_cancel_watcher(
+        cancel_notify,
+        cancel_token,
+        Arc::clone(mesh.cancel_registry()),
+        Arc::clone(pending),
+        call_id,
+    )
+}
+
+/// Side-effects + return value for the unary `call`'s cancel
+/// branch. Releases the registry entry, records the Transport
+/// outcome on the metrics guard, fires the Canceled observer
+/// event, and returns `RpcError::Cancelled`. Both the
+/// no-deadline and with-deadline `select!` arms invoke this so a
+/// shape change to the cancel outcome (extra metric, new field
+/// on the observer event) lands in exactly one place.
+fn fire_unary_cancel_outcome(
+    mesh: &Arc<MeshNode>,
+    metrics_guard: &mut crate::adapter::net::mesh_rpc_metrics::CallMetricsGuard,
+    cancel_token: u64,
+    target_node_id: u64,
+    service: &str,
+    started_total: Instant,
+    request_bytes_len: u32,
+) -> RpcError {
+    mesh.cancel_registry().release(cancel_token);
+    metrics_guard.record(crate::adapter::net::mesh_rpc_metrics::CallOutcome::Transport);
+    mesh.fire_rpc_observer_outbound(
+        target_node_id,
+        service,
+        started_total.elapsed().as_millis() as u32,
+        crate::adapter::net::cortex::rpc_observer::RpcCallStatus::Canceled,
+        request_bytes_len,
+        0,
+    );
+    RpcError::Cancelled
+}
+
 // ============================================================================
 // MeshNode extensions.
 // ============================================================================
@@ -2151,16 +2205,7 @@ impl MeshNode {
 
         let deadline_ns = opts.deadline.map(instant_to_unix_nanos).unwrap_or(0);
         let observer = StreamingObserverState::new(Arc::clone(self), target_node_id, service, 0);
-        // v3 cancel-watcher (C-S1). Same pattern as call_streaming.
-        let cancel_token = opts.cancel_token.unwrap_or(0);
-        let cancel_notify = self.cancel_registry().register_notify(cancel_token);
-        let cancel_keep_alive = spawn_stream_cancel_watcher(
-            cancel_notify,
-            cancel_token,
-            Arc::clone(self.cancel_registry()),
-            Arc::clone(&pending),
-            call_id,
-        );
+        let cancel_keep_alive = arm_stream_cancel(self, &opts, &pending, call_id);
         Ok(ClientStreamCallRaw {
             mesh: Arc::clone(self),
             target_node_id,
@@ -2371,19 +2416,11 @@ impl MeshNode {
 
         let deadline_ns = opts.deadline.map(instant_to_unix_nanos).unwrap_or(0);
         let observer = StreamingObserverState::new(Arc::clone(self), target_node_id, service, 0);
-        // v3 cancel-watcher (C-S1). Lives on the shared
-        // Arc<DuplexInner> so it survives into_split — the watcher
-        // exits only when BOTH the sink AND stream halves drop
-        // (matching the existing CANCEL-on-drop semantics).
-        let cancel_token = opts.cancel_token.unwrap_or(0);
-        let cancel_notify = self.cancel_registry().register_notify(cancel_token);
-        let cancel_keep_alive = spawn_stream_cancel_watcher(
-            cancel_notify,
-            cancel_token,
-            Arc::clone(self.cancel_registry()),
-            Arc::clone(&pending),
-            call_id,
-        );
+        // Cancel keep-alive lives on the shared Arc<DuplexInner>
+        // so it survives into_split — the watcher exits only when
+        // BOTH the sink AND stream halves drop, matching the
+        // existing CANCEL-on-drop semantics.
+        let cancel_keep_alive = arm_stream_cancel(self, &opts, &pending, call_id);
         let inner = Arc::new(DuplexInner {
             mesh: Arc::clone(self),
             target_node_id,
@@ -2515,22 +2552,9 @@ impl MeshNode {
         }
 
         let request_bytes_len = payload_bytes.len() as u32;
-        // v3 cancel-watcher (C-S1). Spawn the watcher task that
-        // listens for mesh.cancel(token) → drops the pending entry
-        // so the stream's mpsc closes → poll_next observes EOF →
-        // Drop fires CANCEL on the wire via the existing per-shape
-        // path. The keep-alive sender lives on the returned
-        // RpcStream so the watcher exits cleanly when the stream
-        // drops without cancel.
-        let cancel_token = opts.cancel_token.unwrap_or(0);
-        let cancel_notify = self.cancel_registry().register_notify(cancel_token);
-        let cancel_keep_alive = spawn_stream_cancel_watcher(
-            cancel_notify,
-            cancel_token,
-            Arc::clone(self.cancel_registry()),
-            Arc::clone(&pending),
-            call_id,
-        );
+        // Cancel keep-alive lives on the returned RpcStream so the
+        // watcher exits cleanly when the stream drops without cancel.
+        let cancel_keep_alive = arm_stream_cancel(self, &opts, &pending, call_id);
         Ok(RpcStream {
             mesh: Arc::clone(self),
             target_node_id,
@@ -2946,26 +2970,24 @@ impl MeshNode {
         // signal. Each branch lifts to the same outcome shape
         // (Result<Result<RpcResponsePayload, _>, Elapsed>) so the
         // existing post-match logic stays unchanged for the ok /
-        // timeout paths; the cancel arm returns early.
+        // timeout paths; the cancel arm returns early via
+        // fire_unary_cancel_outcome — leaves guard.completed=false
+        // so Drop emits CANCEL on the wire.
         let outcome: Result<Result<RpcResponsePayload, _>, tokio::time::error::Elapsed> =
             match opts.deadline {
                 None => {
                     tokio::select! {
                         biased;
                         _ = cancel_notify.notified() => {
-                            // Leave guard.completed = false so Drop
-                            // emits CANCEL on the wire.
-                            self.cancel_registry().release(cancel_token);
-                            metrics_guard.record(CallOutcome::Transport);
-                            self.fire_rpc_observer_outbound(
+                            return Err(fire_unary_cancel_outcome(
+                                self,
+                                &mut metrics_guard,
+                                cancel_token,
                                 target_node_id,
                                 service,
-                                started_total.elapsed().as_millis() as u32,
-                                crate::adapter::net::cortex::rpc_observer::RpcCallStatus::Canceled,
+                                started_total,
                                 request_bytes_len,
-                                0,
-                            );
-                            return Err(RpcError::Cancelled);
+                            ));
                         }
                         r = rx => Ok(r),
                     }
@@ -2975,17 +2997,15 @@ impl MeshNode {
                     tokio::select! {
                         biased;
                         _ = cancel_notify.notified() => {
-                            self.cancel_registry().release(cancel_token);
-                            metrics_guard.record(CallOutcome::Transport);
-                            self.fire_rpc_observer_outbound(
+                            return Err(fire_unary_cancel_outcome(
+                                self,
+                                &mut metrics_guard,
+                                cancel_token,
                                 target_node_id,
                                 service,
-                                started_total.elapsed().as_millis() as u32,
-                                crate::adapter::net::cortex::rpc_observer::RpcCallStatus::Canceled,
+                                started_total,
                                 request_bytes_len,
-                                0,
-                            );
-                            return Err(RpcError::Cancelled);
+                            ));
                         }
                         r = tokio::time::timeout(timeout_at, rx) => r,
                     }
