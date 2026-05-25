@@ -1003,6 +1003,184 @@ enum TailNext {
 }
 
 // =========================================================================
+// AsyncRedexFile + AsyncRedexTailIter — T2-C2.
+//
+// PyRedex itself has no block_on'd I/O — every method is local /
+// synchronous, so there's no AsyncRedex wrapper. PyRedexFile's only
+// blocking surface is `tail()` (constructs a BoxStream inside a
+// tokio runtime context); per-chunk pulls drive the BoxStream
+// forward and that's where the async iterator shape pays off.
+//
+// AsyncRedexFile: constructor from sync PyRedexFile (cheap
+// Arc::clone). Pass-through append / append_batch / read_range /
+// len / sync / close stay sync. `tail` returns an awaitable
+// resolving to AsyncRedexTailIter.
+// =========================================================================
+
+/// Async sibling of [`PyRedexFile`]. Wraps the same `Arc<RedexFile>`
+/// as the sync sibling; appends are visible across both. Pass-
+/// through writes / reads stay sync (no awaiting needed on the
+/// in-process write path); `tail` returns an awaitable yielding an
+/// `AsyncRedexTailIter`.
+///
+/// Sync equivalent: :class:`RedexFile`.
+#[pyclass(name = "AsyncRedexFile", module = "_net")]
+pub struct PyAsyncRedexFile {
+    inner: Arc<InnerRedexFile>,
+}
+
+#[pymethods]
+impl PyAsyncRedexFile {
+    /// Build against an existing sync `RedexFile`. Cheap
+    /// (`Arc::clone`); both shapes see the same retained-event
+    /// index and live appends.
+    #[new]
+    fn new(file: &PyRedexFile) -> Self {
+        Self {
+            inner: file.inner.clone(),
+        }
+    }
+
+    fn append(&self, payload: &[u8]) -> PyResult<u64> {
+        self.inner
+            .append(payload)
+            .map_err(|e| RedexError::new_err(format!("append: {}", e)))
+    }
+
+    fn append_batch(&self, payloads: Vec<Vec<u8>>) -> PyResult<Option<u64>> {
+        let bytes: Vec<Bytes> = payloads.into_iter().map(Bytes::from).collect();
+        self.inner
+            .append_batch(&bytes)
+            .map_err(|e| RedexError::new_err(format!("append_batch: {}", e)))
+    }
+
+    fn read_range(&self, start: u64, end: u64) -> Vec<PyRedexEvent> {
+        self.inner
+            .read_range(start, end)
+            .into_iter()
+            .map(PyRedexEvent::from)
+            .collect()
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn sync(&self) -> PyResult<()> {
+        self.inner
+            .sync()
+            .map_err(|e| RedexError::new_err(format!("sync: {}", e)))
+    }
+
+    fn close(&self) -> PyResult<()> {
+        self.inner
+            .close()
+            .map_err(|e| RedexError::new_err(format!("close: {}", e)))
+    }
+
+    /// Open a live tail. Returns an awaitable resolving to an
+    /// `AsyncRedexTailIter` that yields events with
+    /// `seq >= from_seq` (default `0`) — backfills the retained
+    /// range, then streams live appends. Stop with
+    /// `iter.close()` / `await iter.aclose()`.
+    #[pyo3(signature = (from_seq = 0))]
+    fn tail<'py>(&self, py: Python<'py>, from_seq: u64) -> PyResult<Bound<'py, PyAny>> {
+        let adapter = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let stream = adapter.tail(from_seq).boxed();
+            Ok::<PyAsyncRedexTailIter, PyErr>(PyAsyncRedexTailIter {
+                inner: Arc::new(RedexTailIterInner {
+                    stream: TokioMutex::new(Some(stream)),
+                    shutdown: Notify::new(),
+                    is_shutdown: AtomicBool::new(false),
+                }),
+            })
+        })
+    }
+}
+
+/// Async sibling of [`PyRedexTailIter`]. PEP 525 async iterator —
+/// ``async for ev in file.tail(seq):``. End-of-stream raises
+/// `StopAsyncIteration`; transport errors raise `RedexError`.
+///
+/// Sync equivalent: :class:`RedexTailIter`.
+#[pyclass(name = "AsyncRedexTailIter", module = "_net")]
+pub struct PyAsyncRedexTailIter {
+    inner: Arc<RedexTailIterInner>,
+}
+
+#[pymethods]
+impl PyAsyncRedexTailIter {
+    fn __aiter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if inner.is_shutdown.load(Ordering::Acquire) {
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+            }
+            let mut guard = inner.stream.lock().await;
+            let stream = match guard.as_mut() {
+                Some(s) => s,
+                None => {
+                    return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+                }
+            };
+
+            let shutdown_fut = inner.shutdown.notified();
+            tokio::pin!(shutdown_fut);
+            shutdown_fut.as_mut().enable();
+
+            if inner.is_shutdown.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+            }
+
+            let outcome = tokio::select! {
+                biased;
+                _ = shutdown_fut => {
+                    *guard = None;
+                    TailNext::End
+                }
+                msg = stream.next() => match msg {
+                    Some(Ok(ev)) => TailNext::Event(ev),
+                    Some(Err(InnerRedexError::Closed)) => {
+                        *guard = None;
+                        TailNext::End
+                    }
+                    Some(Err(e)) => {
+                        *guard = None;
+                        TailNext::Error(format!("{}", e))
+                    }
+                    None => {
+                        *guard = None;
+                        TailNext::End
+                    }
+                }
+            };
+            drop(guard);
+            match outcome {
+                TailNext::Event(ev) => Ok(PyRedexEvent::from(ev)),
+                TailNext::Error(msg) => Err(RedexError::new_err(format!("tail: {}", msg))),
+                TailNext::End => Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+            }
+        })
+    }
+
+    fn close(&self) {
+        self.inner.is_shutdown.store(true, Ordering::Release);
+        self.inner.shutdown.notify_waiters();
+    }
+
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.close();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
+    }
+}
+
+// =========================================================================
 // Tasks
 // =========================================================================
 

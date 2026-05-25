@@ -70,6 +70,8 @@ try:
     from ._net import (
         AsyncMemoriesAdapter,
         AsyncMemoryWatchIter,
+        AsyncRedexFile,
+        AsyncRedexTailIter,
         AsyncTasksAdapter,
         AsyncTaskWatchIter,
         CortexError,
@@ -95,6 +97,8 @@ else:
         [
             "AsyncMemoriesAdapter",
             "AsyncMemoryWatchIter",
+            "AsyncRedexFile",
+            "AsyncRedexTailIter",
             "AsyncTasksAdapter",
             "AsyncTaskWatchIter",
             "CortexError",
