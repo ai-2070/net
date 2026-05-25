@@ -112,7 +112,7 @@ asyncio.run(main())
 |---|---|---|
 | `NetMesh` | `AsyncNetMesh` | `connect`, `accept`, `push_to`, `poll`, `subscribe_channel`, `unsubscribe_channel`, `publish`, `announce_capabilities`, `shutdown` |
 | `NetStream` | `AsyncNetStream` | `send`, `send_with_retry`, `send_blocking` |
-| `MeshRpc` | `AsyncMeshRpc` | `call`, `call_service`, `call_streaming`, `call_client_stream`, `call_duplex`, `serve` (accepts `async def` handlers) |
+| `MeshRpc` | `AsyncMeshRpc` | `call`, `call_service`, `call_streaming`, `call_client_stream`, `call_duplex`, `serve` / `serve_client_stream` / `serve_duplex` (each accepts `async def` handlers) |
 | `RpcStream` | `AsyncRpcStream` | PEP 525 `async for chunk in stream:` |
 | `ClientStreamCall` | `AsyncClientStreamCall` | `send`, `finish` |
 | `DuplexCall` / `DuplexSink` / `DuplexStream` | `AsyncDuplexCall` / `AsyncDuplexSink` / `AsyncDuplexStream` | `send`, `finish_sending`, async-iter on the read half |

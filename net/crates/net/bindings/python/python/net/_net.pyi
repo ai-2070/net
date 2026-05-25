@@ -2007,6 +2007,18 @@ class AsyncMeshRpc:
         service: str,
         opts: Optional[Dict[str, Any]] = None,
     ) -> AsyncDuplexCall: ...
+    def serve_client_stream(
+        self,
+        service: str,
+        handler: Callable[..., Any],
+        handler_timeout_ms: Optional[int] = None,
+    ) -> ServeHandle: ...
+    def serve_duplex(
+        self,
+        service: str,
+        handler: Callable[..., Any],
+        handler_timeout_ms: Optional[int] = None,
+    ) -> ServeHandle: ...
 
 # ----- T2: cortex -----
 
