@@ -129,6 +129,40 @@ where
     })
 }
 
+/// Variant of [`await_with_cancel`] that reuses an existing
+/// cancel-token (already reserved by the call's construction
+/// path) instead of minting a fresh one. Used by per-chunk pulls
+/// on streaming iterators: every `__anext__` shares the
+/// construction-time token, so a mid-stream
+/// `asyncio.wait_for(..., timeout).cancel()` propagates to the
+/// substrate's stream cancel-watcher and terminates the WHOLE
+/// stream rather than just dropping one pull.
+#[cfg(feature = "net")]
+#[allow(dead_code)] // T1-A4+ streaming classes consume this.
+pub fn await_with_existing_token<'py, F, T, E>(
+    py: Python<'py>,
+    mesh: &Arc<MeshNode>,
+    token: u64,
+    fut: F,
+) -> PyResult<Bound<'py, PyAny>>
+where
+    F: std::future::Future<Output = Result<T, E>> + Send + 'static,
+    T: for<'p> pyo3::IntoPyObject<'p> + Send + 'static,
+    E: Into<PyErr> + Send + 'static,
+{
+    let mesh_for_guard = Arc::clone(mesh);
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let mut guard = CancelGuard {
+            mesh: mesh_for_guard,
+            token,
+            armed: true,
+        };
+        let result = fut.await;
+        guard.armed = false;
+        result.map_err(Into::into)
+    })
+}
+
 /// RAII guard whose Drop fires `mesh.cancel(token)` iff still
 /// armed when the wrapper future is dropped (the asyncio
 /// task-cancel path). Successful resolution disarms before Drop

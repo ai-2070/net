@@ -114,6 +114,7 @@ else:
 try:
     from ._net import (
         AsyncMeshRpc,
+        AsyncRpcStream,
         Cancellable,
         MeshRpc,
         RpcAppError,
@@ -134,6 +135,7 @@ else:
     __all__.extend(
         [
             "AsyncMeshRpc",
+            "AsyncRpcStream",
             "Cancellable",
             "MeshRpc",
             "RpcAppError",

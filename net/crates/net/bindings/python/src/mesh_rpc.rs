@@ -2184,6 +2184,138 @@ impl PyAsyncMeshRpc {
     fn find_service_nodes(&self, _py: Python<'_>, service: String) -> Vec<u64> {
         self.node.find_service_nodes(&service)
     }
+
+    /// Open a streaming-response call. Returns an awaitable that
+    /// resolves to an :class:`AsyncRpcStream`; iterate the stream
+    /// with `async for chunk in stream:` or pull chunks one at a
+    /// time with `await stream.__anext__()`.
+    ///
+    /// Cancellation: the construction await participates in the
+    /// asyncio task-cancel bridge (`asyncio.wait_for(...)` aborts
+    /// the open). Once open, each `__anext__` uses the same
+    /// substrate cancel-token so a mid-stream cancel terminates
+    /// the WHOLE stream cleanly.
+    ///
+    /// Sync equivalent: :meth:`MeshRpc.call_streaming`.
+    #[pyo3(signature = (target_node_id, service, request, opts=None))]
+    fn call_streaming<'py>(
+        &self,
+        py: Python<'py>,
+        target_node_id: u64,
+        service: String,
+        request: &Bound<'py, PyBytes>,
+        opts: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut inner_opts = call_options_from_dict(opts)?;
+        let req_bytes = Bytes::copy_from_slice(request.as_bytes());
+        let node = self.node.clone();
+        let mesh_for_stream = self.node.clone();
+        crate::async_bridge::await_with_cancel(py, &self.node, move |token| {
+            inner_opts.cancel_token = Some(token);
+            async move {
+                let stream = node
+                    .call_streaming(target_node_id, &service, req_bytes, inner_opts)
+                    .await
+                    .map_err(rpc_error_to_pyerr)?;
+                Ok::<_, PyErr>(PyAsyncRpcStream {
+                    inner: Arc::new(Mutex::new(Some(stream))),
+                    mesh: mesh_for_stream,
+                    cancel_token: token,
+                })
+            }
+        })
+    }
+}
+
+// ============================================================================
+// PyAsyncRpcStream — async iterator over streaming-call chunks.
+//
+// `__aiter__` + `__anext__` (PEP 525). Each `__anext__` reuses the
+// construction-time cancel-token via `await_with_existing_token`
+// so a mid-stream `asyncio.wait_for(...).cancel()` propagates to
+// the substrate's cancel-watcher and terminates the WHOLE stream
+// (not just the current pull) via the existing
+// `arm_stream_cancel` machinery on the substrate side.
+// ============================================================================
+
+#[pyclass(name = "AsyncRpcStream", module = "_net")]
+pub struct PyAsyncRpcStream {
+    inner: Arc<Mutex<Option<InnerRpcStream>>>,
+    mesh: Arc<MeshNode>,
+    cancel_token: u64,
+}
+
+#[pymethods]
+impl PyAsyncRpcStream {
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Awaitable that resolves to the next chunk as ``bytes``, or
+    /// raises ``StopAsyncIteration`` on clean EOF. Mid-stream
+    /// errors raise an :class:`RpcError` subclass.
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let mesh = self.mesh.clone();
+        let token = self.cancel_token;
+        crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
+            // Take the inner stream out of the mutex while we
+            // await — holding a std::sync::MutexGuard across
+            // an .await is unsound. A concurrent close() that
+            // takes first observes None and stops cleanly.
+            let mut stream = match inner.lock().take() {
+                Some(s) => s,
+                None => return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+            };
+            let next = stream.next().await;
+            match next {
+                Some(Ok(bytes)) => {
+                    // Put the stream back for the next pull.
+                    *inner.lock() = Some(stream);
+                    Ok::<Vec<u8>, PyErr>(bytes.to_vec())
+                }
+                Some(Err(e)) => {
+                    drop(stream);
+                    Err(rpc_error_to_pyerr(e))
+                }
+                None => {
+                    drop(stream);
+                    Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
+                }
+            }
+        })
+    }
+
+    /// Grant `n` additional flow-control credits to the server's
+    /// pump. No-op if the call didn't set `stream_window_initial`.
+    fn grant(&self, n: u32) {
+        let guard = self.inner.lock();
+        if let Some(stream) = guard.as_ref() {
+            stream.grant(n);
+        }
+    }
+
+    /// `True` if the call set `stream_window_initial`.
+    fn flow_controlled(&self) -> bool {
+        let guard = self.inner.lock();
+        guard.as_ref().map(|s| s.flow_controlled()).unwrap_or(false)
+    }
+
+    /// Close the stream; emits CANCEL to the server (best-effort).
+    /// Idempotent. Sync method — closing is a local operation that
+    /// doesn't need `await`.
+    fn close(&self) {
+        let mut guard = self.inner.lock();
+        let _ = guard.take();
+    }
+
+    /// Async alias for :meth:`close` so users can write
+    /// ``await stream.aclose()`` for consistency with other
+    /// async iterator types.
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.close();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
+    }
 }
 
 // ============================================================================

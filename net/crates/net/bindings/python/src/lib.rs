@@ -2346,6 +2346,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         // wrapper module on top of these classes.
         m.add_class::<mesh_rpc::PyMeshRpc>()?;
         m.add_class::<mesh_rpc::PyAsyncMeshRpc>()?;
+        m.add_class::<mesh_rpc::PyAsyncRpcStream>()?;
         m.add_class::<mesh_rpc::PyServeHandle>()?;
         m.add_class::<mesh_rpc::PyRpcStream>()?;
         m.add_class::<mesh_rpc::PyCancellable>()?;
