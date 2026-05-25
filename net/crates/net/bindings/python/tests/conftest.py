@@ -70,8 +70,24 @@ def mesh_pair(next_port):
     # `with_heartbeat_interval`. The default (5 s) is fine for
     # production but makes short tests race on every gossip-bound
     # state-sync (channel membership, cap-index, etc.).
-    a = NetMesh(bind_addr=a_addr, psk=PSK, heartbeat_interval_ms=200)
-    b = NetMesh(bind_addr=b_addr, psk=PSK, heartbeat_interval_ms=200)
+    #
+    # permissive_channels=True — matches the Rust default of NOT
+    # installing a `ChannelConfigRegistry` on the MeshNode. With
+    # the strict registry (the Python default), nrpc tests fail
+    # with UnknownChannel because reply-channel names are dynamic
+    # per-caller-origin and can't be pre-registered.
+    a = NetMesh(
+        bind_addr=a_addr,
+        psk=PSK,
+        heartbeat_interval_ms=200,
+        permissive_channels=True,
+    )
+    b = NetMesh(
+        bind_addr=b_addr,
+        psk=PSK,
+        heartbeat_interval_ms=200,
+        permissive_channels=True,
+    )
 
     errors: list[Exception] = []
 

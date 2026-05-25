@@ -1106,6 +1106,7 @@ mod mesh_bindings {
             subnet_policy=None,
             reflex_override=None,
             try_port_mapping=None,
+            permissive_channels=None,
         ))]
         #[allow(clippy::too_many_arguments)]
         fn new(
@@ -1133,6 +1134,17 @@ mod mesh_bindings {
             // not correctness — silently ignored when the cdylib
             // was built without `--features port-mapping`.
             try_port_mapping: Option<bool>,
+            // permissive_channels: opt out of the strict
+            // `ChannelConfigRegistry` install. When True, no
+            // registry is set on the MeshNode, so the substrate's
+            // `authorize_subscribe` treats all channels as
+            // permissive (matches the Rust default in
+            // tests/integration_nrpc_mesh.rs). When False or None
+            // (default), the strict registry is installed and
+            // every subscribed channel must be `register_channel`'d
+            // first. Test-only knob — production code should
+            // keep the strict default.
+            permissive_channels: Option<bool>,
         ) -> PyResult<Self> {
             let addr: std::net::SocketAddr = bind_addr
                 .parse()
@@ -1218,9 +1230,13 @@ mod mesh_bindings {
                 .block_on(MeshNode::new(identity, config))
                 .map_err(|e| PyRuntimeError::new_err(format!("MeshNode: {}", e)))?;
 
-            // Install shared channel-config registry.
+            // Install shared channel-config registry. Tests can
+            // opt out with `permissive_channels=True` to match the
+            // Rust integration-test default (no registry → no ACL).
             let channel_configs = Arc::new(ChannelConfigRegistry::new());
-            node.set_channel_configs(channel_configs.clone());
+            if !permissive_channels.unwrap_or(false) {
+                node.set_channel_configs(channel_configs.clone());
+            }
             // Install a fresh TokenCache — channel auth needs
             // somewhere to stash tokens presented on subscribe.
             //
