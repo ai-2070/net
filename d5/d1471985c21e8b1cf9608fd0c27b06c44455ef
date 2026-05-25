@@ -1,0 +1,21 @@
+net/crates/net/bindings/python/src/cortex.rs
+  s_099fa7d871e34d::t_5e3f5f4fb21d06 3231-3249,3251,3258,3268,3286
+  s_099fa7d871e34d::t_b050e5919a4732 1127-1147,1149,1156,1167,1194
+  s_099fa7d871e34d::t_18b0d47bd7b1c8 2866-2884,2886,2893,2903,2921
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "d5d1471985c21e8b1cf9608fd0c27b06c44455ef",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
