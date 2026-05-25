@@ -1131,7 +1131,18 @@ _STATUS_PATTERN = "status\\s*=?\\s*0x([0-9a-fA-F]+)"
 
 def _parse_status_from_message(msg: str) -> Optional[int]:
     """Best-effort parse of ``status=0xNNNN`` from an
-    ``RpcServerError`` message. Returns ``None`` if no match."""
+    ``RpcServerError`` message. Returns ``None`` if no match.
+
+    The Rust formatter at ``bindings/python/src/mesh_rpc.rs::
+    rpc_error_to_pyerr`` is the authoritative spec — a parse miss
+    here means the formatter has drifted from `_STATUS_PATTERN`.
+    ``default_retryable`` treats a parse miss as a conservative
+    retry (P14): worst-case the caller burns a retry on a
+    non-retryable status, better than silently disabling retry
+    for every ServerError after a formatter typo. The Rust-side
+    unit test at ``mesh_rpc.rs::tests::server_error_message_*``
+    catches formatter regressions.
+    """
     import re
 
     m = re.search(_STATUS_PATTERN, msg)
@@ -1215,6 +1226,21 @@ def default_retryable(err: BaseException) -> bool:
         return True
     if name == "RpcServerError":
         status = _parse_status_from_message(str(err))
+        if status is None:
+            # P14: parse miss means the Rust formatter has drifted.
+            # Default to "retry" — same as the Rust default for the
+            # common server-error statuses (Internal/Backpressure/
+            # Timeout). Fail-open is safer than silent fail-closed.
+            import warnings
+
+            warnings.warn(
+                "default_retryable: could not parse status from "
+                f"RpcServerError message {str(err)!r}; assuming "
+                "retryable (Rust formatter spec drifted?)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return True
         return status in (_STATUS_INTERNAL, _STATUS_BACKPRESSURE, _STATUS_TIMEOUT)
     return False
 
