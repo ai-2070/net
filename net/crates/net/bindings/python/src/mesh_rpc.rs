@@ -656,18 +656,20 @@ impl RpcHandler for PyAsyncRpcHandler {
         // doesn't need the GIL to make progress — the bridge
         // re-acquires it on each Python-side step.
         //
-        // Dispatch goes through `into_future_with_locals` against
-        // the server-side dispatcher loop (see
+        // Dispatch goes through `dispatch_handler_coro` against the
+        // server-side dispatcher loop (see
         // `async_bridge::dispatcher_locals`). The substrate's tokio
         // worker has no running asyncio loop of its own; the
-        // dispatcher runs in a daemon Python thread and drives
-        // every handler coroutine via `call_soon_threadsafe`.
+        // dispatcher runs in a daemon Python thread and drives every
+        // handler coroutine via `call_soon_threadsafe`. Dropping the
+        // returned Rust future cancels the dispatched task, so a
+        // substrate CANCEL frame on the caller side surfaces
+        // `asyncio.CancelledError` inside the handler's `await`.
         let fut_result = Python::attach(|py| -> Result<_, PyErr> {
-            let locals = crate::async_bridge::dispatcher_locals(py)?;
             let req_bytes = PyBytes::new(py, &req_body);
             let args = PyTuple::new(py, [req_bytes.into_any()])?;
             let coro = callable.call1(py, args)?;
-            pyo3_async_runtimes::into_future_with_locals(&locals, coro.into_bound(py))
+            crate::async_bridge::dispatch_handler_coro(py, coro.into_bound(py))
         });
         let fut = match fut_result {
             Ok(f) => f,
@@ -752,10 +754,9 @@ impl RpcClientStreamingHandler for PyAsyncRpcClientStreamingHandler {
                     headers: ctx_headers,
                 },
             )?;
-            let locals = crate::async_bridge::dispatcher_locals(py)?;
             let args = PyTuple::new(py, [stream_obj.into_any()])?;
             let coro = callable.call1(py, args)?;
-            pyo3_async_runtimes::into_future_with_locals(&locals, coro.into_bound(py))
+            crate::async_bridge::dispatch_handler_coro(py, coro.into_bound(py))
         });
         let fut = match fut_result {
             Ok(f) => f,
@@ -828,10 +829,9 @@ impl RpcDuplexHandler for PyAsyncRpcDuplexHandler {
                 },
             )?;
             let sink_obj = Py::new(py, PyResponseSinkSend { inner: sink_inner })?;
-            let locals = crate::async_bridge::dispatcher_locals(py)?;
             let args = PyTuple::new(py, [stream_obj.into_any(), sink_obj.into_any()])?;
             let coro = callable.call1(py, args)?;
-            pyo3_async_runtimes::into_future_with_locals(&locals, coro.into_bound(py))
+            crate::async_bridge::dispatch_handler_coro(py, coro.into_bound(py))
         });
         let fut = match fut_result {
             Ok(f) => f,

@@ -95,11 +95,13 @@ pub fn runtime() -> Option<tokio::runtime::Handle> {
 // dispatcher thread runs the coroutine; the Rust future resolves when
 // the coroutine returns or raises.
 //
-// One dispatcher thread is enough because handler coroutines are
-// cooperative — they `await` other I/O and yield back to the loop.
-// A handler that blocks the loop (e.g. a long sync `time.sleep`)
-// blocks every other in-flight handler, same as any asyncio
-// deployment with one event loop.
+// **Single-loop footgun.** All dispatched handler coroutines share
+// one event loop. A handler that calls blocking Python code
+// (`time.sleep`, `requests.get`, raw `socket.recv`, etc.) stalls
+// every other in-flight handler. Handlers MUST stay cooperative —
+// `await asyncio.sleep(...)`, `await aiohttp_session.get(...)`,
+// etc. Sync I/O belongs in a `loop.run_in_executor(None, blocking_fn)`
+// call so the dispatcher thread keeps draining its task queue.
 // ============================================================================
 
 #[cfg(feature = "net")]
@@ -151,6 +153,128 @@ threading.Thread(
     Ok(pyo3_async_runtimes::TaskLocals::new(
         stored.bind(py).clone(),
     ))
+}
+
+// ============================================================================
+// dispatch_handler_coro — cancel-propagating coroutine dispatch.
+//
+// `pyo3_async_runtimes::into_future_with_locals` schedules a coroutine
+// on the dispatcher loop and returns a Rust future that resolves when
+// the coroutine completes. It does NOT cancel the running coroutine
+// when the Rust future is dropped — so a substrate CANCEL frame on the
+// caller side (which drops our handler future) leaves the dispatched
+// coroutine running until natural completion. The handler never sees
+// `asyncio.CancelledError`; long-running handlers like `await
+// asyncio.sleep(10)` become zombies on operator cancel.
+//
+// This helper submits via `asyncio.run_coroutine_threadsafe`, which
+// returns a `concurrent.futures.Future` whose `.cancel()` is
+// thread-safe and arranges for `task.cancel()` to run on the
+// dispatcher loop via `call_soon_threadsafe`. A RAII guard fires
+// `.cancel()` if the Rust future is dropped before its done-callback
+// populates the result channel, surfacing `CancelledError` inside the
+// handler's `await`.
+// ============================================================================
+
+/// Type alias for the oneshot-sender slot the dispatcher's done-callback
+/// drains into. Boxed behind a `parking_lot::Mutex<Option<...>>` so the
+/// callback can `take()` it idempotently and the awaitable's task can
+/// receive the result without lock poisoning.
+#[cfg(feature = "net")]
+type CoroResultSlot =
+    Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<PyResult<Py<PyAny>>>>>>;
+
+#[cfg(feature = "net")]
+#[allow(dead_code)] // Consumed by mesh_rpc.rs async-handler bridges.
+pub fn dispatch_handler_coro(
+    py: Python<'_>,
+    coro: Bound<'_, PyAny>,
+) -> PyResult<impl std::future::Future<Output = PyResult<Py<PyAny>>> + Send> {
+    let locals = dispatcher_locals(py)?;
+    let asyncio = py.import("asyncio")?;
+    let cf_future = asyncio
+        .getattr("run_coroutine_threadsafe")?
+        .call1((coro, locals.event_loop(py)))?;
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<PyResult<Py<PyAny>>>();
+    let tx_slot: CoroResultSlot = Arc::new(parking_lot::Mutex::new(Some(tx)));
+
+    let tx_slot_cb = tx_slot.clone();
+    let callback = pyo3::types::PyCFunction::new_closure(
+        py,
+        None,
+        None,
+        move |args: &Bound<'_, pyo3::types::PyTuple>, _kwargs| -> PyResult<()> {
+            let fut = args.get_item(0)?;
+            let result = drain_cf_future(&fut);
+            if let Some(tx) = tx_slot_cb.lock().take() {
+                let _ = tx.send(result);
+            }
+            Ok(())
+        },
+    )?;
+    cf_future.call_method1("add_done_callback", (callback,))?;
+
+    // The cf_future Python object outlives both this function and the
+    // returned future — held by the guard for cancel-on-drop and dropped
+    // when the returned future is dropped or completes.
+    let cf_future_owned: Py<PyAny> = cf_future.clone().unbind();
+
+    Ok(async move {
+        let mut guard = CoroCancelGuard {
+            cf_future: Some(cf_future_owned),
+        };
+        let result = rx.await.map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "async handler dispatcher channel closed before result",
+            )
+        })?;
+        // Resolved (or the coroutine itself raised) — disarm the guard so
+        // Drop doesn't fire a redundant `.cancel()` on a finished future.
+        guard.cf_future.take();
+        result
+    })
+}
+
+/// Drain a `concurrent.futures.Future` into a Rust `PyResult`.
+/// - `cancelled()` → `RuntimeError("…cancelled")`
+/// - `exception()` returns a non-None exception → `PyErr::from_value(exc)`
+/// - `result()` is the success value.
+#[cfg(feature = "net")]
+fn drain_cf_future(fut: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    if fut.call_method0("cancelled")?.is_truthy()? {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "async handler coroutine was cancelled",
+        ));
+    }
+    let exc = fut.call_method0("exception")?;
+    if !exc.is_none() {
+        return Err(PyErr::from_value(exc));
+    }
+    let value = fut.call_method0("result")?;
+    Ok(value.unbind())
+}
+
+/// RAII guard that schedules `cf_future.cancel()` if the dispatched
+/// future is dropped before the done-callback populates the oneshot.
+/// `concurrent.futures.Future.cancel()` is thread-safe and routes
+/// through `call_soon_threadsafe(task.cancel)` on the dispatcher loop.
+#[cfg(feature = "net")]
+struct CoroCancelGuard {
+    cf_future: Option<Py<PyAny>>,
+}
+
+#[cfg(feature = "net")]
+impl Drop for CoroCancelGuard {
+    fn drop(&mut self) {
+        if let Some(fut) = self.cf_future.take() {
+            Python::attach(|py| {
+                // Best-effort: if cancel() raises (e.g. interpreter shutdown
+                // mid-drop), there's nothing useful to do.
+                let _ = fut.bind(py).call_method0("cancel");
+            });
+        }
+    }
 }
 
 // ============================================================================

@@ -188,6 +188,27 @@ async def handler(req: bytes) -> bytes:
 AsyncMeshRpc(mesh).serve("upstream", handler)
 ```
 
+Cancellation propagates end-to-end. When a caller's `asyncio.wait_for(rpc.call(...), timeout=...)` expires, the substrate fires a CANCEL frame to the server; the dispatched coroutine sees `asyncio.CancelledError` raised inside its `await`. Wrap critical sections in `try/except asyncio.CancelledError` if you need cleanup before re-raising.
+
+**Single dispatcher loop — keep handlers cooperative.** All `async def` handlers in the process share one event loop. A handler that does blocking Python I/O (`time.sleep`, `requests.get`, raw `socket.recv`, etc.) stalls every other in-flight handler. Always `await` async equivalents:
+
+```python
+# ✗ Bad — blocks the dispatcher loop for 5 seconds.
+async def handler(req: bytes) -> bytes:
+    time.sleep(5.0)
+    return req
+
+# ✓ Good — yields back to the loop.
+async def handler(req: bytes) -> bytes:
+    await asyncio.sleep(5.0)
+    return req
+
+# ✓ Good — push blocking work to a thread-pool slot.
+async def handler(req: bytes) -> bytes:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, blocking_call, req)
+```
+
 ### Migration cookbook
 
 The mechanical translation:

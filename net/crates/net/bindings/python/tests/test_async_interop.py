@@ -101,15 +101,12 @@ async def _acall_until_routed(acli, target, service, body, timeout_s=3.0):
 
 
 # Cancel propagation from the substrate's CANCEL frame into an
-# `async def` server handler's `await asyncio.sleep(...)` isn't
-# wired yet — `into_future_with_locals(&dispatcher_locals, coro)`
-# schedules the coroutine on the dispatcher loop but the future
-# returned doesn't proxy `Drop` back into a coroutine cancel. The
-# two cancel-propagation tests stay skipped until that part lands.
-_ASYNC_HANDLER_CANCEL_SKIP = pytest.mark.skip(
-    reason="async def handler cancel-propagation needs dispatcher-loop "
-    "cancel relay; follow-up tracked"
-)
+# `async def` server handler's `await asyncio.sleep(...)` is wired
+# through `async_bridge::dispatch_handler_coro`, which submits the
+# handler coroutine via `asyncio.run_coroutine_threadsafe` and
+# propagates Rust-future drop into `concurrent.futures.Future.cancel()`
+# on the dispatcher loop. The two regression tests below pin that
+# chain end-to-end.
 
 
 def test_sync_caller_sync_server_unary(mesh_pair) -> None:
@@ -203,7 +200,6 @@ def test_async_caller_async_server_unary(mesh_pair) -> None:
 # ---------------------------------------------------------------------------
 
 
-@_ASYNC_HANDLER_CANCEL_SKIP
 def test_wait_for_timeout_propagates_to_substrate_cancel(mesh_pair) -> None:
     """`asyncio.wait_for(arpc.call(...), timeout=0.1)` against a
     handler that sleeps for several seconds must surface
@@ -270,7 +266,6 @@ def test_wait_for_timeout_propagates_to_substrate_cancel(mesh_pair) -> None:
     asyncio.run(_run())
 
 
-@_ASYNC_HANDLER_CANCEL_SKIP
 def test_streaming_mid_iter_cancel_terminates_stream(mesh_pair) -> None:
     """A streaming server emitting on a slow cadence; an async
     consumer breaks out of the `async for` loop after one chunk.
