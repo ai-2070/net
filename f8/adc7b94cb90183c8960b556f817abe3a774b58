@@ -1,0 +1,19 @@
+net/crates/net/bindings/python/tests/test_async_interop.py
+  s_099fa7d871e34d::t_06c607f3525982 1-218
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "f8adc7b94cb90183c8960b556f817abe3a774b58",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
