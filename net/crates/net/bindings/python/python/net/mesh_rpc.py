@@ -1308,6 +1308,24 @@ class AsyncTypedMeshRpc:
         """
         return self._raw.find_service_nodes(service)
 
+    # ---- client-streaming (call_client_stream) -----------------------------
+
+    async def call_client_stream(
+        self,
+        target_node_id: int,
+        service: str,
+        opts: Optional[dict] = None,
+    ) -> "AsyncTypedClientStreamCall":
+        """Open a typed client-streaming call. Awaits construction
+        of the inner :class:`AsyncTypedClientStreamCall` — push
+        chunks with ``await call.send(value)``, then
+        ``await call.finish()`` to drain the terminal response.
+
+        Sync equivalent: :meth:`TypedMeshRpc.call_client_stream`.
+        """
+        raw_call = await self._raw.call_client_stream(target_node_id, service, opts)
+        return AsyncTypedClientStreamCall(raw_call)
+
     # ---- streaming-response (call_streaming) -------------------------------
 
     async def call_streaming(
@@ -1386,6 +1404,67 @@ class AsyncTypedRpcStream:
     async def aclose(self) -> None:
         """Async alias for :meth:`close`."""
         self.close()
+
+
+class AsyncTypedClientStreamCall:
+    """Async typed client-streaming call handle. Push typed
+    requests via ``await call.send(value)``, then
+    ``await call.finish()`` to drain the terminal response.
+
+    Encoding failures on :meth:`send` raise :class:`RpcCodecError`
+    BEFORE the chunk hits the wire; decode failure on the
+    terminal response surfaces similarly. Supports
+    ``async with`` so the call closes on scope exit.
+
+    Sync equivalent: :class:`TypedClientStreamCall`.
+    """
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+
+    @property
+    def raw(self) -> Any:
+        """Underlying raw ``AsyncClientStreamCall`` (bytes-level surface)."""
+        return self._raw
+
+    async def send(self, value: Any) -> None:
+        """Encode ``value`` as JSON and push it as one request
+        chunk. Raises :class:`RpcCodecError` on encode failure
+        BEFORE the chunk hits the wire.
+        """
+        await self._raw.send(_json_encode(value))
+
+    async def finish(self) -> Any:
+        """Close the upload direction and await the terminal
+        response. Consumes the call.
+        """
+        return _json_decode(await self._raw.finish())
+
+    def call_id(self) -> int:
+        """Server-assigned ``call_id``."""
+        return int(self._raw.call_id())
+
+    def flow_controlled(self) -> bool:
+        """``True`` if the call was opened with ``request_window_initial``."""
+        return bool(self._raw.flow_controlled())
+
+    def close(self) -> None:
+        """Sync close. Fires CANCEL via the SDK's Drop. Idempotent."""
+        try:
+            self._raw.close()
+        except Exception:
+            pass
+
+    async def aclose(self) -> None:
+        """Async alias for :meth:`close`."""
+        self.close()
+
+    async def __aenter__(self) -> "AsyncTypedClientStreamCall":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        self.close()
+        return False
 
 
 # ---------------------------------------------------------------------------
