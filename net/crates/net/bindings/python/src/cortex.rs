@@ -2700,3 +2700,346 @@ impl PyAsyncMemoryWatchIter {
         pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
     }
 }
+
+// =========================================================================
+// AsyncTasksAdapter + AsyncTaskWatchIter — T2-C4.
+//
+// Mirror of T2-C3 for the tasks adapter. Same pattern: async sibling
+// shares `Arc<InnerTasksAdapter>` with the sync sibling; only the
+// wait_for_*/watch_* methods need awaiting (the write surface enqueues
+// without awaiting and stays sync on both shapes).
+// =========================================================================
+
+/// Async sibling of [`PyTasksAdapter`]. Construct from a sync
+/// [`PyTasksAdapter`]; the underlying `TasksAdapter` is shared.
+///
+/// Sync equivalent: :class:`TasksAdapter`.
+#[pyclass(name = "AsyncTasksAdapter", module = "_net", from_py_object)]
+#[derive(Clone)]
+pub struct PyAsyncTasksAdapter {
+    inner: Arc<InnerTasksAdapter>,
+}
+
+#[pymethods]
+impl PyAsyncTasksAdapter {
+    /// Build against an existing sync `TasksAdapter`. Cheap
+    /// (`Arc::clone`); the inner adapter / fold task is shared.
+    #[new]
+    fn new(tasks: &PyTasksAdapter) -> Self {
+        Self {
+            inner: tasks.inner.clone(),
+        }
+    }
+
+    /// Capture a state snapshot. Sync.
+    fn snapshot(&self) -> PyResult<(Vec<u8>, Option<u64>)> {
+        self.inner
+            .snapshot()
+            .map_err(|e| CortexError::new_err(format!("snapshot failed: {}", e)))
+    }
+
+    fn create(&self, id: u64, title: String, now_ns: u64) -> PyResult<u64> {
+        self.inner
+            .create(id, title, now_ns)
+            .map_err(|e| CortexError::new_err(format!("create failed: {}", e)))
+    }
+
+    fn rename(&self, id: u64, new_title: String, now_ns: u64) -> PyResult<u64> {
+        self.inner
+            .rename(id, new_title, now_ns)
+            .map_err(|e| CortexError::new_err(format!("rename failed: {}", e)))
+    }
+
+    fn complete(&self, id: u64, now_ns: u64) -> PyResult<u64> {
+        self.inner
+            .complete(id, now_ns)
+            .map_err(|e| CortexError::new_err(format!("complete failed: {}", e)))
+    }
+
+    fn delete(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .delete(id)
+            .map_err(|e| CortexError::new_err(format!("delete failed: {}", e)))
+    }
+
+    /// Await the fold task to consume up to `seq`. Returns an
+    /// awaitable resolving to ``None`` on success.
+    fn wait_for_seq<'py>(&self, py: Python<'py>, seq: u64) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner
+                .wait_for_seq(seq)
+                .await
+                .map_err(|folded| {
+                    CortexError::new_err(format!(
+                        "wait_for_seq: fold task stopped; folded_through={folded:?}"
+                    ))
+                })?;
+            Ok::<(), PyErr>(())
+        })
+    }
+
+    /// Read-your-writes wait. `deadline_ms == 0` is non-blocking.
+    #[pyo3(signature = (token, deadline_ms = 1000))]
+    fn wait_for_token<'py>(
+        &self,
+        py: Python<'py>,
+        token: &PyWriteToken,
+        deadline_ms: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let inner_token = token.as_inner();
+        if deadline_ms == 0 {
+            let result = inner.poll_for_token(inner_token);
+            return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                result.map_err(map_wait_for_token_err)
+            });
+        }
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner
+                .wait_for_token(inner_token, std::time::Duration::from_millis(deadline_ms))
+                .await
+                .map_err(map_wait_for_token_err)
+        })
+    }
+
+    fn close(&self) -> PyResult<()> {
+        self.inner
+            .close()
+            .map_err(|e| CortexError::new_err(format!("close failed: {}", e)))
+    }
+
+    fn is_running(&self) -> bool {
+        self.inner.is_running()
+    }
+
+    fn count(&self) -> u32 {
+        self.inner.state().read().len() as u32
+    }
+
+    /// In-memory query over the fold's current state. Sync.
+    #[pyo3(signature = (
+        *,
+        status=None,
+        title_contains=None,
+        created_after_ns=None,
+        created_before_ns=None,
+        updated_after_ns=None,
+        updated_before_ns=None,
+        order_by=None,
+        limit=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn list_tasks(
+        &self,
+        status: Option<&str>,
+        title_contains: Option<String>,
+        created_after_ns: Option<u64>,
+        created_before_ns: Option<u64>,
+        updated_after_ns: Option<u64>,
+        updated_before_ns: Option<u64>,
+        order_by: Option<&str>,
+        limit: Option<u32>,
+    ) -> PyResult<Vec<PyTask>> {
+        let state_handle = self.inner.state();
+        let state = state_handle.read();
+        let mut q = state.query();
+        if let Some(s) = status {
+            q = q.where_status(parse_task_status(s)?);
+        }
+        if let Some(s) = title_contains {
+            q = q.title_contains(s);
+        }
+        if let Some(ns) = created_after_ns {
+            q = q.created_after(ns);
+        }
+        if let Some(ns) = created_before_ns {
+            q = q.created_before(ns);
+        }
+        if let Some(ns) = updated_after_ns {
+            q = q.updated_after(ns);
+        }
+        if let Some(ns) = updated_before_ns {
+            q = q.updated_before(ns);
+        }
+        if let Some(o) = order_by {
+            q = q.order_by(parse_tasks_order_by(o)?);
+        }
+        if let Some(l) = limit {
+            q = q.limit(l as usize);
+        }
+        Ok(q.collect().into_iter().map(PyTask::from).collect())
+    }
+
+    /// Returns an awaitable resolving to an `AsyncTaskWatchIter`.
+    #[pyo3(signature = (
+        *,
+        status=None,
+        title_contains=None,
+        created_after_ns=None,
+        created_before_ns=None,
+        updated_after_ns=None,
+        updated_before_ns=None,
+        order_by=None,
+        limit=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn watch_tasks<'py>(
+        &self,
+        py: Python<'py>,
+        status: Option<&str>,
+        title_contains: Option<String>,
+        created_after_ns: Option<u64>,
+        created_before_ns: Option<u64>,
+        updated_after_ns: Option<u64>,
+        updated_before_ns: Option<u64>,
+        order_by: Option<&str>,
+        limit: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let w = build_task_watcher(
+            &self.inner,
+            status,
+            title_contains,
+            created_after_ns,
+            created_before_ns,
+            updated_after_ns,
+            updated_before_ns,
+            order_by,
+            limit,
+        )?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let stream: BoxStream<'static, Vec<InnerTask>> = w.stream().boxed();
+            Ok::<PyAsyncTaskWatchIter, PyErr>(new_async_task_watch_iter(stream))
+        })
+    }
+
+    /// Atomic snapshot + watch. Returns an awaitable resolving to
+    /// ``(snapshot_list, AsyncTaskWatchIter)``.
+    #[pyo3(signature = (
+        *,
+        status=None,
+        title_contains=None,
+        created_after_ns=None,
+        created_before_ns=None,
+        updated_after_ns=None,
+        updated_before_ns=None,
+        order_by=None,
+        limit=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn snapshot_and_watch_tasks<'py>(
+        &self,
+        py: Python<'py>,
+        status: Option<&str>,
+        title_contains: Option<String>,
+        created_after_ns: Option<u64>,
+        created_before_ns: Option<u64>,
+        updated_after_ns: Option<u64>,
+        updated_before_ns: Option<u64>,
+        order_by: Option<&str>,
+        limit: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let w = build_task_watcher(
+            &self.inner,
+            status,
+            title_contains,
+            created_after_ns,
+            created_before_ns,
+            updated_after_ns,
+            updated_before_ns,
+            order_by,
+            limit,
+        )?;
+        let adapter = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (snapshot, stream) = adapter.snapshot_and_watch(w);
+            let snap_py: Vec<PyTask> = snapshot.into_iter().map(PyTask::from).collect();
+            let iter = new_async_task_watch_iter(stream);
+            Ok::<(Vec<PyTask>, PyAsyncTaskWatchIter), PyErr>((snap_py, iter))
+        })
+    }
+}
+
+fn new_async_task_watch_iter(
+    stream: BoxStream<'static, Vec<InnerTask>>,
+) -> PyAsyncTaskWatchIter {
+    PyAsyncTaskWatchIter {
+        inner: Arc::new(TaskWatchIterInner {
+            stream: TokioMutex::new(Some(stream)),
+            shutdown: Notify::new(),
+            is_shutdown: AtomicBool::new(false),
+        }),
+    }
+}
+
+/// Async sibling of [`PyTaskWatchIter`]. PEP 525 async iterator
+/// (``async for batch in iter:``).
+///
+/// Sync equivalent: :class:`TaskWatchIter`.
+#[pyclass(name = "AsyncTaskWatchIter", module = "_net")]
+pub struct PyAsyncTaskWatchIter {
+    inner: Arc<TaskWatchIterInner>,
+}
+
+#[pymethods]
+impl PyAsyncTaskWatchIter {
+    fn __aiter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if inner.is_shutdown.load(Ordering::Acquire) {
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+            }
+            let mut guard = inner.stream.lock().await;
+            let stream = match guard.as_mut() {
+                Some(s) => s,
+                None => {
+                    return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+                }
+            };
+            let shutdown_fut = inner.shutdown.notified();
+            tokio::pin!(shutdown_fut);
+            shutdown_fut.as_mut().enable();
+
+            if inner.is_shutdown.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+            }
+            let next = tokio::select! {
+                biased;
+                _ = shutdown_fut => {
+                    *guard = None;
+                    None
+                }
+                msg = stream.next() => match msg {
+                    Some(items) => Some(items),
+                    None => {
+                        *guard = None;
+                        None
+                    }
+                }
+            };
+            drop(guard);
+            match next {
+                Some(items) => {
+                    let mapped: Vec<PyTask> = items.into_iter().map(PyTask::from).collect();
+                    Ok::<Vec<PyTask>, PyErr>(mapped)
+                }
+                None => Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+            }
+        })
+    }
+
+    fn close(&self) {
+        self.inner.is_shutdown.store(true, Ordering::Release);
+        self.inner.shutdown.notify_waiters();
+    }
+
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.close();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
+    }
+}
