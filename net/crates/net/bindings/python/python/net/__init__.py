@@ -353,9 +353,12 @@ else:
 # `MeshBlobAdapter` Python class.
 try:
     from ._net import (
+        AsyncMeshBlobAdapter,
         BlobError,
         BlobRef,
         MeshBlobAdapter,
+        async_blob_publish,
+        async_blob_resolve,
         blob_adapter_ids,
         blob_adapter_registered,
         blob_publish,
@@ -369,9 +372,12 @@ except ImportError:
 else:
     __all__.extend(
         [
+            "AsyncMeshBlobAdapter",
             "BlobError",
             "BlobRef",
             "MeshBlobAdapter",
+            "async_blob_publish",
+            "async_blob_resolve",
             "blob_adapter_ids",
             "blob_adapter_registered",
             "blob_publish",

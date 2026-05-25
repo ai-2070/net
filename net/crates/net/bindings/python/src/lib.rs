@@ -2901,6 +2901,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<blob::PyChunkingStrategy>()?;
         m.add_class::<blob::PyEncoding>()?;
         m.add_class::<blob::PyMeshBlobAdapter>()?;
+        m.add_class::<blob::PyAsyncMeshBlobAdapter>()?;
         m.add(
             "DATAFORTS_BLOB_TREE_SUPPORTED",
             blob::DATAFORTS_BLOB_TREE_SUPPORTED,
@@ -2924,6 +2925,8 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(blob::blob_adapter_ids, m)?)?;
         m.add_function(wrap_pyfunction!(blob::blob_publish, m)?)?;
         m.add_function(wrap_pyfunction!(blob::blob_resolve, m)?)?;
+        m.add_function(wrap_pyfunction!(blob::async_blob_publish, m)?)?;
+        m.add_function(wrap_pyfunction!(blob::async_blob_resolve, m)?)?;
         m.add("BlobError", m.py().get_type::<blob::BlobError>())?;
 
         // Register an atexit hook so the global blob-adapter
