@@ -365,6 +365,27 @@ def _json_decode(buf: bytes) -> Any:
         raise RpcCodecError(f"client decode: {e}") from e
 
 
+def _decode_request_or_app_error(req_bytes: bytes) -> Any:
+    """Server-side request-bytes decoder used by the typed wrappers'
+    ``serve`` paths.
+
+    Tries to decode as JSON. On codec failure, raises ``RpcAppError(
+    NRPC_TYPED_BAD_REQUEST, body)`` whose body is the canonical
+    ``{"error": "invalid_request", "detail": ...}`` shape — so the
+    caller sees a typed app-error rather than the handler crashing
+    out as ``Internal``. Used by ``TypedMeshRpc.serve`` and by both
+    branches of ``AsyncTypedMeshRpc.serve``.
+    """
+    try:
+        return _json_decode(req_bytes)
+    except RpcCodecError as e:
+        body = json.dumps(
+            {"error": "invalid_request", "detail": str(e)},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        raise RpcAppError(NRPC_TYPED_BAD_REQUEST, body) from e
+
+
 # ---------------------------------------------------------------------------
 # TypedRpcStream — typed wrapper around the raw RpcStream iterator.
 #
@@ -857,14 +878,7 @@ class TypedMeshRpc:
         """
 
         def _wrapped(req_bytes: bytes) -> bytes:
-            try:
-                req = _json_decode(req_bytes)
-            except RpcCodecError as e:
-                body = json.dumps(
-                    {"error": "invalid_request", "detail": str(e)},
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                raise RpcAppError(NRPC_TYPED_BAD_REQUEST, body) from e
+            req = _decode_request_or_app_error(req_bytes)
             resp = handler(req)
             return _json_encode(resp)
 
@@ -1292,28 +1306,14 @@ class AsyncTypedMeshRpc:
         if inspect.iscoroutinefunction(handler):
 
             async def _wrapped(req_bytes: bytes) -> bytes:
-                try:
-                    req = _json_decode(req_bytes)
-                except RpcCodecError as e:
-                    body = json.dumps(
-                        {"error": "invalid_request", "detail": str(e)},
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                    raise RpcAppError(NRPC_TYPED_BAD_REQUEST, body) from e
+                req = _decode_request_or_app_error(req_bytes)
                 resp = await handler(req)
                 return _json_encode(resp)
 
             return self._raw.serve(service, _wrapped)
 
         def _wrapped_sync(req_bytes: bytes) -> bytes:
-            try:
-                req = _json_decode(req_bytes)
-            except RpcCodecError as e:
-                body = json.dumps(
-                    {"error": "invalid_request", "detail": str(e)},
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                raise RpcAppError(NRPC_TYPED_BAD_REQUEST, body) from e
+            req = _decode_request_or_app_error(req_bytes)
             resp = handler(req)
             return _json_encode(resp)
 
