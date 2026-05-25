@@ -2971,6 +2971,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<meshdb::PyCachePolicy>()?;
         m.add_class::<meshdb::PyInMemoryChainReader>()?;
         m.add_class::<meshdb::PyMeshQueryRunner>()?;
+        m.add_class::<meshdb::PyAsyncMeshQueryRunner>()?;
         m.add_class::<meshdb::PyAggregateResult>()?;
         m.add_class::<meshdb::PyGroupKey>()?;
         m.add_class::<meshdb::PyJoinedRow>()?;

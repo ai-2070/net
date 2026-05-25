@@ -1366,7 +1366,7 @@ fn shared_runtime() -> Result<Arc<Runtime>, std::io::Error> {
 #[pyclass(name = "MeshQueryRunner", module = "net._net")]
 pub struct PyMeshQueryRunner {
     runtime: Arc<Runtime>,
-    executor: LocalMeshQueryExecutor<InMemoryStore>,
+    executor: Arc<LocalMeshQueryExecutor<InMemoryStore>>,
 }
 
 #[pymethods]
@@ -1390,7 +1390,10 @@ impl PyMeshQueryRunner {
         } else {
             LocalMeshQueryExecutor::new(store)
         };
-        Ok(Self { runtime, executor })
+        Ok(Self {
+            runtime,
+            executor: Arc::new(executor),
+        })
     }
 
     /// Execute `query` synchronously. Returns the full row list
@@ -1443,6 +1446,85 @@ fn map_mesh_error(e: MeshError) -> PyErr {
         let _ = err.value(py).setattr("kind", kind);
     });
     err
+}
+
+// =========================================================================
+// AsyncMeshQueryRunner — T3-I1.
+//
+// Awaitable execute() resolving to ``list[ResultRow]``. The
+// executor is shared with a sync sibling when constructed from
+// one (Arc::clone); the standalone constructor builds its own
+// executor over the supplied reader.
+// =========================================================================
+
+/// Async sibling of [`PyMeshQueryRunner`]. Same constructor
+/// kwargs; `execute` returns an awaitable yielding the row
+/// list.
+///
+/// Sync equivalent: :class:`MeshQueryRunner`.
+#[pyclass(name = "AsyncMeshQueryRunner", module = "net._net")]
+pub struct PyAsyncMeshQueryRunner {
+    executor: Arc<LocalMeshQueryExecutor<InMemoryStore>>,
+}
+
+#[pymethods]
+impl PyAsyncMeshQueryRunner {
+    /// Build a runner over the given `InMemoryChainReader`.
+    /// `enable_cache=True` wires the Phase F LRU.
+    #[new]
+    #[pyo3(signature = (reader, enable_cache=false))]
+    fn new(reader: &PyInMemoryChainReader, enable_cache: bool) -> PyResult<Self> {
+        let store = reader.inner.clone();
+        let executor: LocalMeshQueryExecutor<InMemoryStore> = if enable_cache {
+            let cache: Arc<dyn net::adapter::net::behavior::meshdb::cache::ResultCache> =
+                Arc::new(LruResultCache::default());
+            let version_fn: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| 0);
+            LocalMeshQueryExecutor::with_cache(store, cache, version_fn)
+        } else {
+            LocalMeshQueryExecutor::new(store)
+        };
+        Ok(Self {
+            executor: Arc::new(executor),
+        })
+    }
+
+    /// Build from an existing sync `MeshQueryRunner` — Arc-shares
+    /// the executor (cache state + next-id counter are
+    /// interchangeable across both shapes).
+    #[staticmethod]
+    fn from_sync(runner: &PyMeshQueryRunner) -> Self {
+        Self {
+            executor: runner.executor.clone(),
+        }
+    }
+
+    /// Execute `query` asynchronously. Returns an awaitable
+    /// resolving to the full row list.
+    #[pyo3(signature = (query, options=None))]
+    fn execute<'py>(
+        &self,
+        py: Python<'py>,
+        query: &PyMeshQuery,
+        options: Option<PyExecuteOptions>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let plan = query.plan.clone();
+        let opts = options.map(|o| o.inner).unwrap_or_default();
+        let executor = self.executor.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            use futures::StreamExt;
+            let running = executor
+                .execute_with(plan, opts)
+                .await
+                .map_err(map_mesh_error)?;
+            let mut stream = running.rows;
+            let mut out: Vec<PyResultRow> = Vec::new();
+            while let Some(item) = stream.next().await {
+                let row = item.map_err(map_mesh_error)?;
+                out.push(row.into());
+            }
+            Ok::<Vec<PyResultRow>, PyErr>(out)
+        })
+    }
 }
 
 // Tests live in `bindings/python/tests/test_meshdb.py` — the

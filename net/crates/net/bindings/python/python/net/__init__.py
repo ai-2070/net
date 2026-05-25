@@ -567,6 +567,7 @@ else:
 try:
     from ._net import (
         AggregateResult,
+        AsyncMeshQueryRunner,
         CachePolicy,
         ExecuteOptions,
         GroupKey,
@@ -588,6 +589,7 @@ else:
     __all__.extend(
         [
             "AggregateResult",
+            "AsyncMeshQueryRunner",
             "CachePolicy",
             "ExecuteOptions",
             "GroupKey",
