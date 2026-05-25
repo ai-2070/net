@@ -691,6 +691,188 @@ impl RpcHandler for PyAsyncRpcHandler {
 }
 
 // ============================================================================
+// Async streaming-serve bridges — T1-A7 completion.
+//
+// PyAsyncRpcClientStreamingHandler / PyAsyncRpcDuplexHandler invoke
+// the Python callable to obtain a coroutine, then await it via
+// `pyo3_async_runtimes::tokio::into_future`. The stream + sink
+// handles passed to the coroutine are the existing sync wrappers
+// (PyRequestStreamRecv / PyResponseSinkSend); the async handler can
+// iterate them sync via `for chunk in stream:` (sync iter inside
+// `async fn` is fine — the chunk pull blocks one bridge worker,
+// other tasks keep running). True async iteration on the server
+// side would need parallel Async* stream/sink shims; that's a
+// follow-up if a real consumer asks.
+// ============================================================================
+
+struct PyAsyncRpcClientStreamingHandler {
+    callable: Py<PyAny>,
+    timeout: Duration,
+    runtime: Arc<Runtime>,
+}
+
+#[async_trait::async_trait]
+impl RpcClientStreamingHandler for PyAsyncRpcClientStreamingHandler {
+    async fn call(
+        &self,
+        ctx: RpcStreamingContext,
+        requests: InnerRequestStream,
+    ) -> std::result::Result<RpcResponsePayload, RpcHandlerError> {
+        let callable = Python::attach(|py| self.callable.clone_ref(py));
+        let runtime = self.runtime.clone();
+        let stream_inner = Arc::new(Mutex::new(Some(requests)));
+        let ctx_headers = Arc::new(ctx.headers);
+        let fut_result = Python::attach(|py| -> Result<_, PyErr> {
+            let stream_obj = Py::new(
+                py,
+                PyRequestStreamRecv {
+                    inner: stream_inner,
+                    runtime,
+                    caller_origin: ctx.caller_origin,
+                    call_id: ctx.call_id,
+                    deadline_ns: ctx.deadline_ns,
+                    headers: ctx_headers,
+                },
+            )?;
+            let args = PyTuple::new(py, [stream_obj.into_any()])?;
+            let coro = callable.call1(py, args)?;
+            pyo3_async_runtimes::tokio::into_future(coro.into_bound(py))
+        });
+        let fut = match fut_result {
+            Ok(f) => f,
+            Err(pyerr) => {
+                let outcome = Python::attach(|py| extract_app_error(py, &pyerr));
+                return match outcome {
+                    Some((code, body)) => Err(RpcHandlerError::Application {
+                        code,
+                        message: String::from_utf8_lossy(&body).into_owned(),
+                    }),
+                    None => Err(RpcHandlerError::Internal(format!(
+                        "Python async client-streaming handler raised: {pyerr}"
+                    ))),
+                };
+            }
+        };
+        let timeout_result = tokio::time::timeout(self.timeout, fut).await;
+        let py_result = match timeout_result {
+            Ok(r) => r,
+            Err(_) => {
+                return Err(RpcHandlerError::Internal(format!(
+                    "Python async client-streaming handler did not respond within {} ms",
+                    self.timeout.as_millis()
+                )));
+            }
+        };
+        match py_result {
+            Ok(value) => Python::attach(|py| -> Result<RpcResponsePayload, RpcHandlerError> {
+                let bound = value.into_bound(py);
+                let bytes_vec: Vec<u8> = bound.extract().map_err(|e| {
+                    RpcHandlerError::Internal(format!(
+                        "Python async client-streaming handler must return bytes: {e}"
+                    ))
+                })?;
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: bytes_vec.into(),
+                })
+            }),
+            Err(pyerr) => {
+                let app = Python::attach(|py| extract_app_error(py, &pyerr));
+                match app {
+                    Some((code, body)) => Err(RpcHandlerError::Application {
+                        code,
+                        message: String::from_utf8_lossy(&body).into_owned(),
+                    }),
+                    None => Err(RpcHandlerError::Internal(format!(
+                        "Python async client-streaming handler raised: {pyerr}"
+                    ))),
+                }
+            }
+        }
+    }
+}
+
+struct PyAsyncRpcDuplexHandler {
+    callable: Py<PyAny>,
+    timeout: Duration,
+    runtime: Arc<Runtime>,
+}
+
+#[async_trait::async_trait]
+impl RpcDuplexHandler for PyAsyncRpcDuplexHandler {
+    async fn call(
+        &self,
+        ctx: RpcStreamingContext,
+        requests: InnerRequestStream,
+        responses: InnerRpcResponseSink,
+    ) -> std::result::Result<(), RpcHandlerError> {
+        let callable = Python::attach(|py| self.callable.clone_ref(py));
+        let runtime = self.runtime.clone();
+        let stream_inner = Arc::new(Mutex::new(Some(requests)));
+        let sink_inner = Arc::new(Mutex::new(Some(responses)));
+        let ctx_headers = Arc::new(ctx.headers);
+        let fut_result = Python::attach(|py| -> Result<_, PyErr> {
+            let stream_obj = Py::new(
+                py,
+                PyRequestStreamRecv {
+                    inner: stream_inner,
+                    runtime,
+                    caller_origin: ctx.caller_origin,
+                    call_id: ctx.call_id,
+                    deadline_ns: ctx.deadline_ns,
+                    headers: ctx_headers,
+                },
+            )?;
+            let sink_obj = Py::new(py, PyResponseSinkSend { inner: sink_inner })?;
+            let args = PyTuple::new(py, [stream_obj.into_any(), sink_obj.into_any()])?;
+            let coro = callable.call1(py, args)?;
+            pyo3_async_runtimes::tokio::into_future(coro.into_bound(py))
+        });
+        let fut = match fut_result {
+            Ok(f) => f,
+            Err(pyerr) => {
+                let outcome = Python::attach(|py| extract_app_error(py, &pyerr));
+                return match outcome {
+                    Some((code, body)) => Err(RpcHandlerError::Application {
+                        code,
+                        message: String::from_utf8_lossy(&body).into_owned(),
+                    }),
+                    None => Err(RpcHandlerError::Internal(format!(
+                        "Python async duplex handler raised: {pyerr}"
+                    ))),
+                };
+            }
+        };
+        let timeout_result = tokio::time::timeout(self.timeout, fut).await;
+        let py_result = match timeout_result {
+            Ok(r) => r,
+            Err(_) => {
+                return Err(RpcHandlerError::Internal(format!(
+                    "Python async duplex handler did not respond within {} ms",
+                    self.timeout.as_millis()
+                )));
+            }
+        };
+        match py_result {
+            Ok(_) => Ok(()),
+            Err(pyerr) => {
+                let app = Python::attach(|py| extract_app_error(py, &pyerr));
+                match app {
+                    Some((code, body)) => Err(RpcHandlerError::Application {
+                        code,
+                        message: String::from_utf8_lossy(&body).into_owned(),
+                    }),
+                    None => Err(RpcHandlerError::Internal(format!(
+                        "Python async duplex handler raised: {pyerr}"
+                    ))),
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
 // PyServeHandle — context manager wrapping the inner ServeHandle.
 //
 // Supports BOTH `with rpc.serve(...) as h: ...` AND explicit
@@ -2232,6 +2414,13 @@ impl PyMeshRpc {
 #[pyclass(name = "AsyncMeshRpc", module = "_net")]
 pub struct PyAsyncMeshRpc {
     node: Arc<MeshNode>,
+    /// The parent NetMesh's `Arc<Runtime>`. Streaming-serve handler
+    /// shims (`PyAsyncRpcClientStreamingHandler` etc.) pass it down
+    /// to `PyRequestStreamRecv` so the sync `__next__` block_ons on
+    /// the same runtime the substrate stream is bound to. Unary
+    /// paths drive futures via the bridge runtime and don't read
+    /// this field.
+    runtime: Arc<Runtime>,
 }
 
 #[pymethods]
@@ -2244,7 +2433,8 @@ impl PyAsyncMeshRpc {
     #[new]
     fn new(mesh: &crate::mesh_bindings::NetMesh) -> PyResult<Self> {
         let node = mesh.node_arc_clone()?;
-        Ok(PyAsyncMeshRpc { node })
+        let runtime = mesh.runtime_arc();
+        Ok(PyAsyncMeshRpc { node, runtime })
     }
 
     /// Register a Python handler on `service`. Accepts EITHER a
@@ -2286,6 +2476,104 @@ impl PyAsyncMeshRpc {
                 Arc::new(PyRpcHandler {
                     callable: handler,
                     timeout,
+                }),
+            )
+        }
+        .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
+        Ok(PyServeHandle {
+            inner: Arc::new(Mutex::new(Some(inner))),
+        })
+    }
+
+    /// Register a Python client-streaming handler. Accepts EITHER
+    /// a sync `def handler(stream) -> bytes` OR an
+    /// `async def handler(stream) -> bytes`.
+    ///
+    /// The `stream` arg is a `RequestStreamRecv` — iterate it via
+    /// `for chunk in stream:` to drain inbound chunks. Iteration
+    /// is sync regardless of the handler's async-ness; an
+    /// `async def` handler can still `await` other work between
+    /// chunks, but the per-chunk pull blocks one bridge worker.
+    /// (True async-iter on the server side ships if a real
+    /// consumer asks.)
+    ///
+    /// Sync equivalent: :meth:`MeshRpc.serve_client_stream`.
+    #[pyo3(signature = (service, handler, handler_timeout_ms=None))]
+    fn serve_client_stream(
+        &self,
+        py: Python<'_>,
+        service: String,
+        handler: Py<PyAny>,
+        handler_timeout_ms: Option<u64>,
+    ) -> PyResult<PyServeHandle> {
+        let timeout = match handler_timeout_ms {
+            Some(0) => Duration::from_secs(u64::MAX / 1000),
+            Some(ms) => Duration::from_millis(ms),
+            None => DEFAULT_HANDLER_TIMEOUT,
+        };
+        let inner = if is_coroutine_function(py, &handler) {
+            self.node.serve_rpc_client_stream(
+                &service,
+                Arc::new(PyAsyncRpcClientStreamingHandler {
+                    callable: handler,
+                    timeout,
+                    runtime: self.runtime.clone(),
+                }),
+            )
+        } else {
+            self.node.serve_rpc_client_stream(
+                &service,
+                Arc::new(PyRpcClientStreamingHandler {
+                    callable: handler,
+                    timeout,
+                    runtime: self.runtime.clone(),
+                }),
+            )
+        }
+        .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
+        Ok(PyServeHandle {
+            inner: Arc::new(Mutex::new(Some(inner))),
+        })
+    }
+
+    /// Register a Python duplex handler. Accepts EITHER a sync
+    /// `def handler(stream, sink) -> None` OR an
+    /// `async def handler(stream, sink) -> None`.
+    ///
+    /// Same sync-stream / async-handler combination as
+    /// :meth:`serve_client_stream`. Emit response chunks via
+    /// `sink.send(bytes)`.
+    ///
+    /// Sync equivalent: :meth:`MeshRpc.serve_duplex`.
+    #[pyo3(signature = (service, handler, handler_timeout_ms=None))]
+    fn serve_duplex(
+        &self,
+        py: Python<'_>,
+        service: String,
+        handler: Py<PyAny>,
+        handler_timeout_ms: Option<u64>,
+    ) -> PyResult<PyServeHandle> {
+        let timeout = match handler_timeout_ms {
+            Some(0) => Duration::from_secs(u64::MAX / 1000),
+            Some(ms) => Duration::from_millis(ms),
+            None => DEFAULT_HANDLER_TIMEOUT,
+        };
+        let inner = if is_coroutine_function(py, &handler) {
+            self.node.serve_rpc_duplex(
+                &service,
+                Arc::new(PyAsyncRpcDuplexHandler {
+                    callable: handler,
+                    timeout,
+                    runtime: self.runtime.clone(),
+                }),
+            )
+        } else {
+            self.node.serve_rpc_duplex(
+                &service,
+                Arc::new(PyRpcDuplexHandler {
+                    callable: handler,
+                    timeout,
+                    runtime: self.runtime.clone(),
                 }),
             )
         }
