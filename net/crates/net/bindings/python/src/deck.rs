@@ -1930,6 +1930,28 @@ impl PyAsyncAdminCommands {
     fn admin(&self) -> CoreAdminCommands<'_> {
         self.client.admin()
     }
+
+    /// Helper that wraps the boilerplate every admin method shares:
+    /// clone the Arc<CoreClient>, build the SDK-call future, await
+    /// it, map DeckError→PyErr, wrap the ChainCommit. Each verb
+    /// passes its own `build` closure.
+    fn await_admin_commit<'py, B, Fut>(
+        &self,
+        py: Python<'py>,
+        build: B,
+    ) -> PyResult<Bound<'py, PyAny>>
+    where
+        B: FnOnce(Arc<CoreClient>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<CoreChainCommit, DeckError>> + Send + 'static,
+    {
+        let client = self.client.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let commit = build(client)
+                .await
+                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
+            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
+        })
+    }
 }
 
 #[pymethods]
@@ -1940,14 +1962,11 @@ impl PyAsyncAdminCommands {
         node: u64,
         drain_for_ms: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let client = self.client.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let commit = client
+        self.await_admin_commit(py, move |client| async move {
+            client
                 .admin()
                 .drain(node, Duration::from_millis(drain_for_ms))
                 .await
-                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
-            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
         })
     }
 
@@ -1959,50 +1978,26 @@ impl PyAsyncAdminCommands {
         drain_for_ms: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let drain_for = drain_for_ms.map(Duration::from_millis);
-        let client = self.client.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let commit = client
-                .admin()
-                .enter_maintenance(node, drain_for)
-                .await
-                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
-            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
+        self.await_admin_commit(py, move |client| async move {
+            client.admin().enter_maintenance(node, drain_for).await
         })
     }
 
     fn exit_maintenance<'py>(&self, py: Python<'py>, node: u64) -> PyResult<Bound<'py, PyAny>> {
-        let client = self.client.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let commit = client
-                .admin()
-                .exit_maintenance(node)
-                .await
-                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
-            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
+        self.await_admin_commit(py, move |client| async move {
+            client.admin().exit_maintenance(node).await
         })
     }
 
     fn cordon<'py>(&self, py: Python<'py>, node: u64) -> PyResult<Bound<'py, PyAny>> {
-        let client = self.client.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let commit = client
-                .admin()
-                .cordon(node)
-                .await
-                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
-            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
+        self.await_admin_commit(py, move |client| async move {
+            client.admin().cordon(node).await
         })
     }
 
     fn uncordon<'py>(&self, py: Python<'py>, node: u64) -> PyResult<Bound<'py, PyAny>> {
-        let client = self.client.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let commit = client
-                .admin()
-                .uncordon(node)
-                .await
-                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
-            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
+        self.await_admin_commit(py, move |client| async move {
+            client.admin().uncordon(node).await
         })
     }
 
@@ -2013,50 +2008,26 @@ impl PyAsyncAdminCommands {
         chains: Vec<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let chains: Vec<CoreChainId> = chains.into_iter().collect();
-        let client = self.client.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let commit = client
-                .admin()
-                .drop_replicas(node, chains)
-                .await
-                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
-            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
+        self.await_admin_commit(py, move |client| async move {
+            client.admin().drop_replicas(node, chains).await
         })
     }
 
     fn invalidate_placement<'py>(&self, py: Python<'py>, node: u64) -> PyResult<Bound<'py, PyAny>> {
-        let client = self.client.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let commit = client
-                .admin()
-                .invalidate_placement(node)
-                .await
-                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
-            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
+        self.await_admin_commit(py, move |client| async move {
+            client.admin().invalidate_placement(node).await
         })
     }
 
     fn restart_all_daemons<'py>(&self, py: Python<'py>, node: u64) -> PyResult<Bound<'py, PyAny>> {
-        let client = self.client.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let commit = client
-                .admin()
-                .restart_all_daemons(node)
-                .await
-                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
-            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
+        self.await_admin_commit(py, move |client| async move {
+            client.admin().restart_all_daemons(node).await
         })
     }
 
     fn clear_avoid_list<'py>(&self, py: Python<'py>, node: u64) -> PyResult<Bound<'py, PyAny>> {
-        let client = self.client.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let commit = client
-                .admin()
-                .clear_avoid_list(node)
-                .await
-                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
-            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
+        self.await_admin_commit(py, move |client| async move {
+            client.admin().clear_avoid_list(node).await
         })
     }
 
