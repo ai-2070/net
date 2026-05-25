@@ -257,21 +257,24 @@ export interface RpcCallEvent {
  * {@link RpcCallStatus}. Prefer these constants over hard-coding
  * the string literal in `if (evt.statusKind === '...')` checks —
  * a typo on the literal silently never fires.
+ *
+ * Named `STATUS_KIND_*` to disambiguate from the wire-level
+ * `STATUS_*` u16 status codes used by `RpcServerError`.
  */
-export const STATUS_OK = 'ok' as const
-export const STATUS_ERROR = 'error' as const
-export const STATUS_TIMEOUT = 'timeout' as const
-export const STATUS_CANCELED = 'canceled' as const
+export const STATUS_KIND_OK = 'ok' as const
+export const STATUS_KIND_ERROR = 'error' as const
+export const STATUS_KIND_TIMEOUT = 'timeout' as const
+export const STATUS_KIND_CANCELED = 'canceled' as const
 
 /** Direction-kind discriminants on `RawRpcCallEvent.direction`. */
 export const DIRECTION_OUTBOUND = 'outbound' as const
 export const DIRECTION_INBOUND = 'inbound' as const
 
 export type StatusKind =
-  | typeof STATUS_OK
-  | typeof STATUS_ERROR
-  | typeof STATUS_TIMEOUT
-  | typeof STATUS_CANCELED
+  | typeof STATUS_KIND_OK
+  | typeof STATUS_KIND_ERROR
+  | typeof STATUS_KIND_TIMEOUT
+  | typeof STATUS_KIND_CANCELED
 
 export type DirectionKind = typeof DIRECTION_OUTBOUND | typeof DIRECTION_INBOUND
 
@@ -2054,16 +2057,16 @@ export const NRPC_TYPED_HANDLER_ERROR = 0x8001 as const
 export function rawEventToTyped(raw: RawRpcCallEvent): RpcCallEvent {
   let status: RpcCallStatus
   switch (raw.statusKind) {
-    case STATUS_OK:
+    case STATUS_KIND_OK:
       status = { kind: 'ok' }
       break
-    case STATUS_ERROR:
+    case STATUS_KIND_ERROR:
       status = { kind: 'error', message: raw.statusMessage ?? '' }
       break
-    case STATUS_TIMEOUT:
+    case STATUS_KIND_TIMEOUT:
       status = { kind: 'timeout' }
       break
-    case STATUS_CANCELED:
+    case STATUS_KIND_CANCELED:
       status = { kind: 'canceled' }
       break
   }
