@@ -27,6 +27,7 @@ pyo3-asyncio integration on the binding side.
 
 from __future__ import annotations
 
+import inspect
 import json
 import random
 import threading
@@ -1266,6 +1267,57 @@ class AsyncTypedMeshRpc:
     def raw(self) -> Any:
         """Underlying raw ``AsyncMeshRpc`` (bytes-level surface)."""
         return self._raw
+
+    # ---- serve --------------------------------------------------------------
+
+    def serve(
+        self,
+        service: str,
+        handler: Callable[[Any], Any],
+    ) -> ServeHandle:
+        """Register a typed handler. Accepts EITHER a sync
+        ``def handler(req) -> resp`` OR an
+        ``async def handler(req) -> resp`` — async handlers run as
+        coroutines on the substrate's tokio runtime via the raw
+        :meth:`AsyncMeshRpc.serve` coroutine-driving path; sync
+        handlers stay on the spawn_blocking path.
+
+        Decode failures on the request surface to the caller as
+        ``NRPC_TYPED_BAD_REQUEST`` (``0x8000``) with body
+        ``{"error": "invalid_request", "detail": ...}`` — same
+        canonical-bad-request contract as :meth:`TypedMeshRpc.serve`.
+
+        Sync equivalent: :meth:`TypedMeshRpc.serve`.
+        """
+        if inspect.iscoroutinefunction(handler):
+
+            async def _wrapped(req_bytes: bytes) -> bytes:
+                try:
+                    req = _json_decode(req_bytes)
+                except RpcCodecError as e:
+                    body = json.dumps(
+                        {"error": "invalid_request", "detail": str(e)},
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    raise RpcAppError(NRPC_TYPED_BAD_REQUEST, body) from e
+                resp = await handler(req)
+                return _json_encode(resp)
+
+            return self._raw.serve(service, _wrapped)
+
+        def _wrapped_sync(req_bytes: bytes) -> bytes:
+            try:
+                req = _json_decode(req_bytes)
+            except RpcCodecError as e:
+                body = json.dumps(
+                    {"error": "invalid_request", "detail": str(e)},
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                raise RpcAppError(NRPC_TYPED_BAD_REQUEST, body) from e
+            resp = handler(req)
+            return _json_encode(resp)
+
+        return self._raw.serve(service, _wrapped_sync)
 
     # ---- call ---------------------------------------------------------------
 
