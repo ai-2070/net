@@ -610,6 +610,8 @@ else:
 # `aggregator` feature (default in the maturin-shipped wheel).
 try:
     from ._net import (
+        AsyncFoldQueryClient,
+        AsyncRegistryClient,
         DuplicateGroupName,
         FoldQueryClient,
         FoldQueryClientError,
@@ -626,6 +628,8 @@ except ImportError:
 else:
     __all__.extend(
         [
+            "AsyncFoldQueryClient",
+            "AsyncRegistryClient",
             "DuplicateGroupName",
             "FoldQueryClient",
             "FoldQueryClientError",

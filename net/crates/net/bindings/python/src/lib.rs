@@ -2993,6 +2993,8 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         m.add_class::<aggregator::PyRegistryClient>()?;
         m.add_class::<aggregator::PyFoldQueryClient>()?;
+        m.add_class::<aggregator::PyAsyncRegistryClient>()?;
+        m.add_class::<aggregator::PyAsyncFoldQueryClient>()?;
         m.add(
             "RegistryClientError",
             m.py().get_type::<aggregator::RegistryClientError>(),

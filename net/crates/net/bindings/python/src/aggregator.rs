@@ -398,3 +398,254 @@ impl PyFoldQueryClient {
         format!("FoldQueryClient(inner={:?})", Arc::as_ptr(&self.inner))
     }
 }
+
+// =========================================================================
+// Async siblings — T3-J1.
+//
+// AsyncRegistryClient / AsyncFoldQueryClient share the same
+// Arc<RwLock<SdkRegistryClient>> / Arc<RwLock<SdkFoldQueryClient>> as
+// the sync siblings. Construct from either an existing sync client
+// (cheap Arc::clone) or directly from a NetMesh. Deadline/TTL setters
+// mutate the shared inner — visible from both shapes.
+//
+// Result conversion happens via newtype wrappers that implement
+// `IntoPyObject` and call the existing dict-builder helpers, so the
+// future stays GIL-free and the PyList/PyDict construction happens
+// on the Python awaitable's resume step.
+// =========================================================================
+
+struct AsyncGroupsListWrap(Vec<RegistryGroupSummary>);
+
+impl<'py> pyo3::IntoPyObject<'py> for AsyncGroupsListWrap {
+    type Target = pyo3::types::PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        Ok(groups_to_list(py, &self.0)?.into_any())
+    }
+}
+
+struct AsyncGroupWrap(RegistryGroupSummary);
+
+impl<'py> pyo3::IntoPyObject<'py> for AsyncGroupWrap {
+    type Target = pyo3::types::PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        Ok(group_to_dict(py, &self.0)?.into_any())
+    }
+}
+
+struct AsyncSummariesListWrap(Vec<SummaryAnnouncement>);
+
+impl<'py> pyo3::IntoPyObject<'py> for AsyncSummariesListWrap {
+    type Target = pyo3::types::PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        Ok(summaries_to_list(py, &self.0)?.into_any())
+    }
+}
+
+/// Convert an `SdkRegistryClientError` to a typed PyErr without
+/// holding the GIL — `set_err_attrs` re-acquires it on resume.
+/// Returns a `(kind, detail)` pair carried by a sentinel struct;
+/// the IntoPyObject conversion (or the caller's map_err on the
+/// resolved value) finalizes via `registry_err`.
+struct AsyncRegistryClientError(SdkRegistryClientError);
+
+impl From<AsyncRegistryClientError> for PyErr {
+    fn from(value: AsyncRegistryClientError) -> Self {
+        Python::attach(|py| registry_err(py, value.0))
+    }
+}
+
+struct AsyncFoldQueryClientError(SdkFoldQueryClientError);
+
+impl From<AsyncFoldQueryClientError> for PyErr {
+    fn from(value: AsyncFoldQueryClientError) -> Self {
+        Python::attach(|py| fold_query_err(py, value.0))
+    }
+}
+
+/// Async sibling of [`PyRegistryClient`].
+///
+/// Sync equivalent: :class:`RegistryClient`.
+#[pyclass(name = "AsyncRegistryClient", module = "net._net")]
+pub struct PyAsyncRegistryClient {
+    inner: Arc<RwLock<SdkRegistryClient>>,
+}
+
+#[pymethods]
+impl PyAsyncRegistryClient {
+    /// Build against an existing sync `RegistryClient`. Cheap
+    /// (`Arc::clone`); deadline mutations on either shape are
+    /// visible to the other.
+    #[new]
+    fn new(client: &PyRegistryClient) -> Self {
+        Self {
+            inner: client.inner.clone(),
+        }
+    }
+
+    /// Build directly from a `NetMesh`. Convenience constructor
+    /// for callers that never need the sync sibling.
+    #[staticmethod]
+    fn from_mesh(mesh: &crate::mesh_bindings::NetMesh) -> PyResult<Self> {
+        let mesh_arc = mesh.node_arc_clone()?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(SdkRegistryClient::new(mesh_arc))),
+        })
+    }
+
+    fn with_deadline(slf: PyRef<'_, Self>, millis: u64) -> PyRef<'_, Self> {
+        slf.inner
+            .write()
+            .set_deadline_mut(Duration::from_millis(millis));
+        slf
+    }
+
+    /// Awaitable — enumerate groups on `target_node_id`. Resolves
+    /// to ``list[dict]``.
+    fn list<'py>(
+        &self,
+        py: Python<'py>,
+        target_node_id: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner_snapshot = self.inner.read().clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let groups = inner_snapshot
+                .list(target_node_id)
+                .await
+                .map_err(AsyncRegistryClientError)?;
+            Ok::<AsyncGroupsListWrap, PyErr>(AsyncGroupsListWrap(groups))
+        })
+    }
+
+    /// Awaitable — spawn a new group. Resolves to ``dict``.
+    fn spawn<'py>(
+        &self,
+        py: Python<'py>,
+        target_node_id: u64,
+        template_name: String,
+        group_name: String,
+        replica_count: u8,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner_snapshot = self.inner.read().clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let g = inner_snapshot
+                .spawn(target_node_id, template_name, group_name, replica_count)
+                .await
+                .map_err(AsyncRegistryClientError)?;
+            Ok::<AsyncGroupWrap, PyErr>(AsyncGroupWrap(g))
+        })
+    }
+
+    /// Awaitable — tear down a registered group.
+    fn unregister<'py>(
+        &self,
+        py: Python<'py>,
+        target_node_id: u64,
+        group_name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner_snapshot = self.inner.read().clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner_snapshot
+                .unregister(target_node_id, group_name)
+                .await
+                .map_err(AsyncRegistryClientError)
+                .map_err(Into::into)
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("AsyncRegistryClient(inner={:?})", Arc::as_ptr(&self.inner))
+    }
+}
+
+/// Async sibling of [`PyFoldQueryClient`].
+///
+/// Sync equivalent: :class:`FoldQueryClient`.
+#[pyclass(name = "AsyncFoldQueryClient", module = "net._net")]
+pub struct PyAsyncFoldQueryClient {
+    inner: Arc<RwLock<SdkFoldQueryClient>>,
+}
+
+#[pymethods]
+impl PyAsyncFoldQueryClient {
+    /// Build against an existing sync `FoldQueryClient`. TTL +
+    /// deadline + cache state are all shared.
+    #[new]
+    fn new(client: &PyFoldQueryClient) -> Self {
+        Self {
+            inner: client.inner.clone(),
+        }
+    }
+
+    /// Build directly from a `NetMesh`.
+    #[staticmethod]
+    fn from_mesh(mesh: &crate::mesh_bindings::NetMesh) -> PyResult<Self> {
+        let mesh_arc = mesh.node_arc_clone()?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(SdkFoldQueryClient::new(mesh_arc))),
+        })
+    }
+
+    fn with_ttl(slf: PyRef<'_, Self>, millis: u64) -> PyRef<'_, Self> {
+        slf.inner.write().set_ttl_mut(Duration::from_millis(millis));
+        slf
+    }
+
+    fn with_deadline(slf: PyRef<'_, Self>, millis: u64) -> PyRef<'_, Self> {
+        slf.inner
+            .write()
+            .set_deadline_mut(Duration::from_millis(millis));
+        slf
+    }
+
+    /// Awaitable cached-summary query. Resolves to ``list[dict]``.
+    fn query_latest<'py>(
+        &self,
+        py: Python<'py>,
+        target_node_id: u64,
+        kind: u16,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner_snapshot = self.inner.read().clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let summaries = inner_snapshot
+                .query_latest(target_node_id, kind)
+                .await
+                .map_err(AsyncFoldQueryClientError)?;
+            Ok::<AsyncSummariesListWrap, PyErr>(AsyncSummariesListWrap(summaries))
+        })
+    }
+
+    /// Awaitable force-fresh summary query.
+    fn query_summarize_now<'py>(
+        &self,
+        py: Python<'py>,
+        target_node_id: u64,
+        kind: u16,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner_snapshot = self.inner.read().clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let summaries = inner_snapshot
+                .query_summarize_now(target_node_id, kind)
+                .await
+                .map_err(AsyncFoldQueryClientError)?;
+            Ok::<AsyncSummariesListWrap, PyErr>(AsyncSummariesListWrap(summaries))
+        })
+    }
+
+    fn invalidate_cache(&self) {
+        self.inner.read().invalidate_cache();
+    }
+
+    fn invalidate_target(&self, target_node_id: u64) {
+        self.inner.read().invalidate_target(target_node_id);
+    }
+
+    fn __repr__(&self) -> String {
+        format!("AsyncFoldQueryClient(inner={:?})", Arc::as_ptr(&self.inner))
+    }
+}
