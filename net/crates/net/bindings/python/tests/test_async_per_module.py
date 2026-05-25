@@ -199,14 +199,20 @@ def test_async_mesh_blob_adapter_round_trip(tmp_path) -> None:
     aadapter = AsyncMeshBlobAdapter(sync)
 
     payload = b"hello async mesh blob"
-    # Construct the BlobRef the substrate expects — uri + hash +
-    # size. blake3 lives in pyo3-side helpers; we keep the smoke
-    # narrow by computing via hashlib.
+    # blake3 isn't in stdlib until 3.11; on older Pythons fall back
+    # to the `blake3` PyPI package. Mirrors the existing
+    # _blake3_digest helper in test_blob.py.
+    import hashlib
+
     try:
-        from hashlib import blake3
-    except ImportError:
-        pytest.skip("blake3 not available in this Python build")
-    blob_ref = BlobRef("mesh://tx5/blob", blake3(payload).digest(), len(payload))
+        digest = hashlib.blake3(payload).digest()  # type: ignore[attr-defined]
+    except AttributeError:
+        try:
+            import blake3 as blake3_mod  # type: ignore
+        except ImportError:
+            pytest.skip("blake3 not available (try `pip install blake3`)")
+        digest = blake3_mod.blake3(payload).digest()
+    blob_ref = BlobRef("mesh://tx5/blob", digest, len(payload))
 
     async def _run() -> bytes:
         await aadapter.store(blob_ref, payload)
