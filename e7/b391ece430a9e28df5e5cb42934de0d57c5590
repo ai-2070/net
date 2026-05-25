@@ -1,0 +1,26 @@
+net/crates/net/tests/integration_mesh_cancel.rs
+  s_099fa7d871e34d::t_9eae670ddc4074 169-171
+  s_099fa7d871e34d::t_421a8244a4ba4b 59-78
+  s_099fa7d871e34d::t_896a647f309c34 306-309
+  s_099fa7d871e34d::t_f075f45df41bd4 234
+net/crates/net/src/adapter/net/mesh.rs
+  s_099fa7d871e34d::t_6de3994c50d947 5341-5350
+net/crates/net/src/adapter/net/cancel_registry.rs
+  s_099fa7d871e34d::t_391b3aabf5e0c7 301-306
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "e7b391ece430a9e28df5e5cb42934de0d57c5590",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
