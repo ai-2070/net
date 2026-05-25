@@ -1,0 +1,24 @@
+net/crates/net/bindings/python/src/lib.rs
+  s_099fa7d871e34d::t_160f89a1de3b3f 2837-2838
+net/crates/net/bindings/python/src/cortex.rs
+  s_099fa7d871e34d::t_8c0486dc168a11 2703-3045
+net/crates/net/bindings/python/python/net/__init__.py
+  s_099fa7d871e34d::t_61b9978b09d593 98-99
+  s_099fa7d871e34d::t_754ea7ab4cac71 73-74
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "7dda2533c0042dd381c9038ae811daac6a6acef0",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
