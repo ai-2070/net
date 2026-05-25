@@ -43,7 +43,9 @@
 //!   above.
 
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -2673,7 +2675,8 @@ impl PyAsyncMeshRpc {
                 let call_id_cached = inner.call_id();
                 let flow_controlled_cached = inner.flow_controlled();
                 Ok::<_, PyErr>(PyAsyncClientStreamCall {
-                    inner: Arc::new(Mutex::new(Some(inner))),
+                    inner: Arc::new(TokioMutex::new(Some(inner))),
+                    closed: Arc::new(AtomicBool::new(false)),
                     mesh: mesh_for_call,
                     cancel_token: token,
                     call_id_cached,
@@ -2710,7 +2713,8 @@ impl PyAsyncMeshRpc {
                 let call_id_cached = inner.call_id();
                 let flow_controlled_cached = inner.flow_controlled();
                 Ok::<_, PyErr>(PyAsyncDuplexCall {
-                    inner: Arc::new(Mutex::new(Some(inner))),
+                    inner: Arc::new(TokioMutex::new(Some(inner))),
+                    closed: Arc::new(AtomicBool::new(false)),
                     mesh: mesh_for_call,
                     cancel_token: token,
                     call_id_cached,
@@ -2753,7 +2757,8 @@ impl PyAsyncMeshRpc {
                     .await
                     .map_err(rpc_error_to_pyerr)?;
                 Ok::<_, PyErr>(PyAsyncRpcStream {
-                    inner: Arc::new(Mutex::new(Some(stream))),
+                    inner: Arc::new(TokioMutex::new(Some(stream))),
+                    closed: Arc::new(AtomicBool::new(false)),
                     mesh: mesh_for_stream,
                     cancel_token: token,
                 })
@@ -2775,7 +2780,16 @@ impl PyAsyncMeshRpc {
 
 #[pyclass(name = "AsyncRpcStream", module = "_net")]
 pub struct PyAsyncRpcStream {
-    inner: Arc<Mutex<Option<InnerRpcStream>>>,
+    /// Tokio mutex (not parking_lot) so `__anext__` can hold the
+    /// guard across `stream.next().await` directly — one acquire
+    /// per pull instead of the take/put pattern that races with
+    /// `close()` (a parking_lot put-back resurrects an inner the
+    /// close had just cleared).
+    inner: Arc<TokioMutex<Option<InnerRpcStream>>>,
+    /// Set by `close()`; the next pull checks before awaiting and
+    /// exits with `StopAsyncIteration`. Source of truth for
+    /// closure — `inner: None` is just storage cleanup.
+    closed: Arc<AtomicBool>,
     mesh: Arc<MeshNode>,
     cancel_token: u64,
 }
@@ -2791,32 +2805,28 @@ impl PyAsyncRpcStream {
     /// errors raise an :class:`RpcError` subclass.
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let closed = self.closed.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
         crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
-            // Take the inner stream out of the mutex while we
-            // await — holding a std::sync::MutexGuard across
-            // an .await is unsound. A concurrent close() that
-            // takes first observes None and stops cleanly.
-            let mut stream = match inner.lock().take() {
-                Some(s) => s,
-                None => return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+            let mut guard = inner.lock().await;
+            if closed.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+            }
+            let Some(stream) = guard.as_mut() else {
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
             };
-            let next = stream.next().await;
-            match next {
-                Some(Ok(bytes)) => {
-                    // Put the stream back for the next pull.
-                    *inner.lock() = Some(stream);
-                    Ok::<crate::async_bridge::BytesReply, PyErr>(
-                        crate::async_bridge::BytesReply(bytes),
-                    )
-                }
+            match stream.next().await {
+                Some(Ok(bytes)) => Ok::<crate::async_bridge::BytesReply, PyErr>(
+                    crate::async_bridge::BytesReply(bytes),
+                ),
                 Some(Err(e)) => {
-                    drop(stream);
+                    *guard = None;
                     Err(rpc_error_to_pyerr(e))
                 }
                 None => {
-                    drop(stream);
+                    *guard = None;
                     Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
                 }
             }
@@ -2825,25 +2835,37 @@ impl PyAsyncRpcStream {
 
     /// Grant `n` additional flow-control credits to the server's
     /// pump. No-op if the call didn't set `stream_window_initial`.
+    /// Sync — uses `try_lock` so it never blocks waiting on an
+    /// in-flight pull; if the lock is held it skips (the next pull
+    /// will observe whatever the substrate-side state already is).
     fn grant(&self, n: u32) {
-        let guard = self.inner.lock();
-        if let Some(stream) = guard.as_ref() {
-            stream.grant(n);
+        if let Ok(guard) = self.inner.try_lock() {
+            if let Some(stream) = guard.as_ref() {
+                stream.grant(n);
+            }
         }
     }
 
-    /// `True` if the call set `stream_window_initial`.
+    /// `True` if the call set `stream_window_initial`. Sync via
+    /// `try_lock`; conservatively returns `false` if the lock is
+    /// held by an in-flight pull.
     fn flow_controlled(&self) -> bool {
-        let guard = self.inner.lock();
-        guard.as_ref().map(|s| s.flow_controlled()).unwrap_or(false)
+        self.inner
+            .try_lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.flow_controlled()))
+            .unwrap_or(false)
     }
 
     /// Close the stream; emits CANCEL to the server (best-effort).
-    /// Idempotent. Sync method — closing is a local operation that
-    /// doesn't need `await`.
+    /// Idempotent. Sync — sets the `closed` flag and best-effort
+    /// drops the inner stream. An in-flight pull observes the
+    /// flag on its next check.
     fn close(&self) {
-        let mut guard = self.inner.lock();
-        let _ = guard.take();
+        self.closed.store(true, Ordering::Release);
+        if let Ok(mut guard) = self.inner.try_lock() {
+            *guard = None;
+        }
     }
 
     /// Async alias for :meth:`close` so users can write
@@ -2866,7 +2888,8 @@ impl PyAsyncRpcStream {
 
 #[pyclass(name = "AsyncClientStreamCall", module = "_net")]
 pub struct PyAsyncClientStreamCall {
-    inner: Arc<Mutex<Option<InnerClientStreamCallRaw>>>,
+    inner: Arc<TokioMutex<Option<InnerClientStreamCallRaw>>>,
+    closed: Arc<AtomicBool>,
     mesh: Arc<MeshNode>,
     cancel_token: u64,
     call_id_cached: u64,
@@ -2885,22 +2908,23 @@ impl PyAsyncClientStreamCall {
         body: &Bound<'py, PyBytes>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let closed = self.closed.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
         let body_bytes = Bytes::copy_from_slice(body.as_bytes());
         crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
-            let mut call = match inner.lock().take() {
-                Some(c) => c,
-                None => return Err(RpcError::new_err("client-stream call already closed")),
+            let mut guard = inner.lock().await;
+            if closed.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(RpcError::new_err("client-stream call already closed"));
+            }
+            let Some(call) = guard.as_mut() else {
+                return Err(RpcError::new_err("client-stream call already closed"));
             };
-            let result = call.send(body_bytes).await;
-            match result {
-                Ok(()) => {
-                    *inner.lock() = Some(call);
-                    Ok::<(), PyErr>(())
-                }
+            match call.send(body_bytes).await {
+                Ok(()) => Ok::<(), PyErr>(()),
                 Err(e) => {
-                    drop(call);
+                    *guard = None;
                     Err(rpc_error_to_pyerr(e))
                 }
             }
@@ -2911,13 +2935,20 @@ impl PyAsyncClientStreamCall {
     /// call — subsequent send/finish raise ``RpcError``.
     fn finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let closed = self.closed.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
         crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
-            let call = match inner.lock().take() {
+            let mut guard = inner.lock().await;
+            if closed.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(RpcError::new_err("client-stream call already closed"));
+            }
+            let call = match guard.take() {
                 Some(c) => c,
                 None => return Err(RpcError::new_err("client-stream call already closed")),
             };
+            closed.store(true, Ordering::Release);
             let reply = call.finish().await.map_err(rpc_error_to_pyerr)?;
             Ok::<crate::async_bridge::BytesReply, PyErr>(crate::async_bridge::BytesReply(
                 reply.body,
@@ -2939,8 +2970,10 @@ impl PyAsyncClientStreamCall {
     /// Close without finishing. Fires CANCEL via the SDK's Drop
     /// if the initial REQUEST has already flown. Idempotent.
     fn close(&self) {
-        let mut guard = self.inner.lock();
-        let _ = guard.take();
+        self.closed.store(true, Ordering::Release);
+        if let Ok(mut guard) = self.inner.try_lock() {
+            *guard = None;
+        }
     }
 
     /// Async alias for :meth:`close`.
@@ -2964,7 +2997,8 @@ impl PyAsyncClientStreamCall {
 
 #[pyclass(name = "AsyncDuplexCall", module = "_net")]
 pub struct PyAsyncDuplexCall {
-    inner: Arc<Mutex<Option<InnerDuplexCallRaw>>>,
+    inner: Arc<TokioMutex<Option<InnerDuplexCallRaw>>>,
+    closed: Arc<AtomicBool>,
     mesh: Arc<MeshNode>,
     cancel_token: u64,
     call_id_cached: u64,
@@ -2980,22 +3014,23 @@ impl PyAsyncDuplexCall {
         body: &Bound<'py, PyBytes>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let closed = self.closed.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
         let body_bytes = Bytes::copy_from_slice(body.as_bytes());
         crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
-            let mut call = match inner.lock().take() {
-                Some(c) => c,
-                None => return Err(RpcError::new_err("duplex call already closed")),
+            let mut guard = inner.lock().await;
+            if closed.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(RpcError::new_err("duplex call already closed"));
+            }
+            let Some(call) = guard.as_mut() else {
+                return Err(RpcError::new_err("duplex call already closed"));
             };
-            let result = call.send(body_bytes).await;
-            match result {
-                Ok(()) => {
-                    *inner.lock() = Some(call);
-                    Ok::<(), PyErr>(())
-                }
+            match call.send(body_bytes).await {
+                Ok(()) => Ok::<(), PyErr>(()),
                 Err(e) => {
-                    drop(call);
+                    *guard = None;
                     Err(rpc_error_to_pyerr(e))
                 }
             }
@@ -3006,16 +3041,19 @@ impl PyAsyncDuplexCall {
     /// open for subsequent `__anext__` pulls.
     fn finish_sending<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let closed = self.closed.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
         crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
-            let mut call = match inner.lock().take() {
-                Some(c) => c,
-                None => return Err(RpcError::new_err("duplex call already closed")),
+            let mut guard = inner.lock().await;
+            if closed.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(RpcError::new_err("duplex call already closed"));
+            }
+            let Some(call) = guard.as_mut() else {
+                return Err(RpcError::new_err("duplex call already closed"));
             };
-            let result = call.finish_sending().await;
-            *inner.lock() = Some(call);
-            result.map_err(rpc_error_to_pyerr)
+            call.finish_sending().await.map_err(rpc_error_to_pyerr)
         })
     }
 
@@ -3028,27 +3066,28 @@ impl PyAsyncDuplexCall {
     /// ``StopAsyncIteration`` on clean EOF.
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let closed = self.closed.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
         crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
-            let mut call = match inner.lock().take() {
-                Some(c) => c,
-                None => return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+            let mut guard = inner.lock().await;
+            if closed.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+            }
+            let Some(call) = guard.as_mut() else {
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
             };
-            let next = call.next().await;
-            match next {
-                Some(Ok(bytes)) => {
-                    *inner.lock() = Some(call);
-                    Ok::<crate::async_bridge::BytesReply, PyErr>(
-                        crate::async_bridge::BytesReply(bytes),
-                    )
-                }
+            match call.next().await {
+                Some(Ok(bytes)) => Ok::<crate::async_bridge::BytesReply, PyErr>(
+                    crate::async_bridge::BytesReply(bytes),
+                ),
                 Some(Err(e)) => {
-                    drop(call);
+                    *guard = None;
                     Err(rpc_error_to_pyerr(e))
                 }
                 None => {
-                    drop(call);
+                    *guard = None;
                     Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
                 }
             }
@@ -3060,24 +3099,33 @@ impl PyAsyncDuplexCall {
     /// send / finish_sending / __anext__ raise ``RpcError``.
     #[pyo3(name = "into_split")]
     fn split(&self) -> PyResult<(PyAsyncDuplexSink, PyAsyncDuplexStream)> {
-        let call = self
+        // try_lock + flag flip: an in-flight pull holds the lock,
+        // and we don't want to wait from sync context. If the lock
+        // is busy, the caller can retry; in practice users only
+        // split before the first pull.
+        let mut guard = self
             .inner
-            .lock()
+            .try_lock()
+            .map_err(|_| RpcError::new_err("duplex call busy — split during in-flight call"))?;
+        let call = guard
             .take()
             .ok_or_else(|| RpcError::new_err("duplex call already closed"))?;
+        self.closed.store(true, Ordering::Release);
         let call_id = call.call_id();
         let flow_controlled = call.flow_controlled();
         let (sink, stream) = call.into_split();
         Ok((
             PyAsyncDuplexSink {
-                inner: Arc::new(Mutex::new(Some(sink))),
+                inner: Arc::new(TokioMutex::new(Some(sink))),
+                closed: Arc::new(AtomicBool::new(false)),
                 mesh: self.mesh.clone(),
                 cancel_token: self.cancel_token,
                 call_id_cached: call_id,
                 flow_controlled_cached: flow_controlled,
             },
             PyAsyncDuplexStream {
-                inner: Arc::new(Mutex::new(Some(stream))),
+                inner: Arc::new(TokioMutex::new(Some(stream))),
+                closed: Arc::new(AtomicBool::new(false)),
                 mesh: self.mesh.clone(),
                 cancel_token: self.cancel_token,
                 call_id_cached: call_id,
@@ -3098,8 +3146,10 @@ impl PyAsyncDuplexCall {
 
     /// Close the call. Fires CANCEL via the SDK's Drop. Idempotent.
     fn close(&self) {
-        let mut guard = self.inner.lock();
-        let _ = guard.take();
+        self.closed.store(true, Ordering::Release);
+        if let Ok(mut guard) = self.inner.try_lock() {
+            *guard = None;
+        }
     }
 
     /// Async alias for :meth:`close`.
@@ -3111,7 +3161,8 @@ impl PyAsyncDuplexCall {
 
 #[pyclass(name = "AsyncDuplexSink", module = "_net")]
 pub struct PyAsyncDuplexSink {
-    inner: Arc<Mutex<Option<InnerDuplexSink>>>,
+    inner: Arc<TokioMutex<Option<InnerDuplexSink>>>,
+    closed: Arc<AtomicBool>,
     mesh: Arc<MeshNode>,
     cancel_token: u64,
     call_id_cached: u64,
@@ -3126,22 +3177,23 @@ impl PyAsyncDuplexSink {
         body: &Bound<'py, PyBytes>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let closed = self.closed.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
         let body_bytes = Bytes::copy_from_slice(body.as_bytes());
         crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
-            let mut sink = match inner.lock().take() {
-                Some(s) => s,
-                None => return Err(RpcError::new_err("duplex sink already closed")),
+            let mut guard = inner.lock().await;
+            if closed.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(RpcError::new_err("duplex sink already closed"));
+            }
+            let Some(sink) = guard.as_mut() else {
+                return Err(RpcError::new_err("duplex sink already closed"));
             };
-            let result = sink.send(body_bytes).await;
-            match result {
-                Ok(()) => {
-                    *inner.lock() = Some(sink);
-                    Ok::<(), PyErr>(())
-                }
+            match sink.send(body_bytes).await {
+                Ok(()) => Ok::<(), PyErr>(()),
                 Err(e) => {
-                    drop(sink);
+                    *guard = None;
                     Err(rpc_error_to_pyerr(e))
                 }
             }
@@ -3152,13 +3204,20 @@ impl PyAsyncDuplexSink {
     /// the sink — subsequent ``send`` raises ``RpcError``.
     fn finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let closed = self.closed.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
         crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
-            let sink = match inner.lock().take() {
+            let mut guard = inner.lock().await;
+            if closed.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(RpcError::new_err("duplex sink already closed"));
+            }
+            let sink = match guard.take() {
                 Some(s) => s,
                 None => return Err(RpcError::new_err("duplex sink already closed")),
             };
+            closed.store(true, Ordering::Release);
             sink.finish_sending().await.map_err(rpc_error_to_pyerr)
         })
     }
@@ -3172,8 +3231,10 @@ impl PyAsyncDuplexSink {
     }
 
     fn close(&self) {
-        let mut guard = self.inner.lock();
-        let _ = guard.take();
+        self.closed.store(true, Ordering::Release);
+        if let Ok(mut guard) = self.inner.try_lock() {
+            *guard = None;
+        }
     }
 
     fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -3184,7 +3245,8 @@ impl PyAsyncDuplexSink {
 
 #[pyclass(name = "AsyncDuplexStream", module = "_net")]
 pub struct PyAsyncDuplexStream {
-    inner: Arc<Mutex<Option<InnerDuplexStream>>>,
+    inner: Arc<TokioMutex<Option<InnerDuplexStream>>>,
+    closed: Arc<AtomicBool>,
     mesh: Arc<MeshNode>,
     cancel_token: u64,
     call_id_cached: u64,
@@ -3198,27 +3260,28 @@ impl PyAsyncDuplexStream {
 
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let closed = self.closed.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
         crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
-            let mut stream = match inner.lock().take() {
-                Some(s) => s,
-                None => return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+            let mut guard = inner.lock().await;
+            if closed.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+            }
+            let Some(stream) = guard.as_mut() else {
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
             };
-            let next = stream.next().await;
-            match next {
-                Some(Ok(bytes)) => {
-                    *inner.lock() = Some(stream);
-                    Ok::<crate::async_bridge::BytesReply, PyErr>(
-                        crate::async_bridge::BytesReply(bytes),
-                    )
-                }
+            match stream.next().await {
+                Some(Ok(bytes)) => Ok::<crate::async_bridge::BytesReply, PyErr>(
+                    crate::async_bridge::BytesReply(bytes),
+                ),
                 Some(Err(e)) => {
-                    drop(stream);
+                    *guard = None;
                     Err(rpc_error_to_pyerr(e))
                 }
                 None => {
-                    drop(stream);
+                    *guard = None;
                     Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
                 }
             }
@@ -3230,8 +3293,10 @@ impl PyAsyncDuplexStream {
     }
 
     fn close(&self) {
-        let mut guard = self.inner.lock();
-        let _ = guard.take();
+        self.closed.store(true, Ordering::Release);
+        if let Ok(mut guard) = self.inner.try_lock() {
+            *guard = None;
+        }
     }
 
     fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
