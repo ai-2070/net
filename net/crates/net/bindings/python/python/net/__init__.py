@@ -524,6 +524,33 @@ else:
     except ImportError:  # pragma: no cover
         pass
 
+    # Async ice break-glass typestate (T3-G3). Separate try-import
+    # so wheels built before this slice landed still load the rest
+    # of the deck surface.
+    try:
+        from ._net import (
+            AsyncIceCommands as _DeckAsyncIceCommands,
+        )
+        from ._net import (
+            AsyncIceProposal as _DeckAsyncIceProposal,
+        )
+        from ._net import (
+            AsyncSimulatedIceProposal as _DeckAsyncSimulatedIceProposal,
+        )
+
+        DeckAsyncIceCommands = _DeckAsyncIceCommands
+        DeckAsyncIceProposal = _DeckAsyncIceProposal
+        DeckAsyncSimulatedIceProposal = _DeckAsyncSimulatedIceProposal
+        __all__.extend(
+            [
+                "DeckAsyncIceCommands",
+                "DeckAsyncIceProposal",
+                "DeckAsyncSimulatedIceProposal",
+            ]
+        )
+    except ImportError:  # pragma: no cover
+        pass
+
     # Slice 3 — ICE break-glass surface. Try-import so wheels
     # built before slice 3 still load.
     try:

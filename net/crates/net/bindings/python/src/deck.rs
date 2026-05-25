@@ -2232,6 +2232,14 @@ impl PyAsyncDeckClient {
         }
     }
 
+    #[getter]
+    fn ice(&self) -> PyAsyncIceCommands {
+        PyAsyncIceCommands {
+            client: self.client.clone(),
+            runtime: self.runtime.clone(),
+        }
+    }
+
     /// Tear down the private supervisor runtime if this client
     /// owns one (constructed via `from_seed`). Returns an
     /// awaitable. No-op for clients built against an existing
@@ -2260,6 +2268,328 @@ impl PyAsyncDeckClient {
         format!(
             "AsyncDeckClient(operator_id={:#x})",
             self.client.identity().operator_id()
+        )
+    }
+}
+
+// =========================================================================
+// AsyncIceCommands + AsyncIceProposal + AsyncSimulatedIceProposal — T3-G3.
+//
+// Async siblings of the ice break-glass typestate. Factory methods
+// stay sync (they construct a proposal husk locally, no I/O).
+// `simulate()` and `commit()` are awaitable on the async siblings.
+//
+// Mirrors the sync typestate's "consume on transition" guarantee —
+// `simulate()` consumes the AsyncIceProposal; `commit()` consumes
+// the AsyncSimulatedIceProposal. Re-calling either raises
+// `DeckSdkError(kind="already_*")`.
+// =========================================================================
+
+/// Newtype lifting `ChainCommit` into an awaitable's resolved
+/// value via `IntoPyObject`.
+struct AsyncChainCommitDeckWrap(CoreChainCommit);
+
+impl<'py> pyo3::IntoPyObject<'py> for AsyncChainCommitDeckWrap {
+    type Target = pyo3::types::PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        Ok(chain_commit_to_dict(py, &self.0)?.into_any())
+    }
+}
+
+/// Async sibling of [`PyIceCommands`]. Factory methods stay sync
+/// — they only construct a proposal husk locally. The async work
+/// happens on `AsyncIceProposal.simulate()` / `AsyncSimulatedIceProposal.commit()`.
+///
+/// Sync equivalent: :class:`IceCommands`.
+#[pyclass(name = "AsyncIceCommands", module = "net._net")]
+pub struct PyAsyncIceCommands {
+    client: Arc<CoreClient>,
+    runtime: Arc<Runtime>,
+}
+
+#[pymethods]
+impl PyAsyncIceCommands {
+    fn freeze_cluster(&self, ttl_ms: u64) -> PyAsyncIceProposal {
+        let proposal = self
+            .client
+            .ice()
+            .freeze_cluster(Duration::from_millis(ttl_ms));
+        PyAsyncIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        )
+    }
+
+    fn flush_avoid_lists(
+        &self,
+        py: Python<'_>,
+        scope: &Bound<'_, PyDict>,
+    ) -> PyResult<PyAsyncIceProposal> {
+        let scope = parse_avoid_scope(py, scope)?;
+        let proposal = self.client.ice().flush_avoid_lists(scope);
+        Ok(PyAsyncIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        ))
+    }
+
+    fn force_evict_replica(&self, chain: u64, victim: u64) -> PyAsyncIceProposal {
+        let proposal = self
+            .client
+            .ice()
+            .force_evict_replica(chain as CoreChainId, victim);
+        PyAsyncIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        )
+    }
+
+    fn force_restart_daemon(&self, id: u64, name: String) -> PyAsyncIceProposal {
+        let daemon = CoreDaemonRef { id, name };
+        let proposal = self.client.ice().force_restart_daemon(daemon);
+        PyAsyncIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        )
+    }
+
+    fn force_cutover(&self, chain: u64, target: u64) -> PyAsyncIceProposal {
+        let proposal = self
+            .client
+            .ice()
+            .force_cutover(chain as CoreChainId, target);
+        PyAsyncIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        )
+    }
+
+    fn kill_migration(&self, migration: u64) -> PyAsyncIceProposal {
+        let proposal = self
+            .client
+            .ice()
+            .kill_migration(migration as CoreMigrationId);
+        PyAsyncIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        )
+    }
+
+    fn thaw_cluster(&self) -> PyAsyncIceProposal {
+        let proposal = self.client.ice().thaw_cluster();
+        PyAsyncIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        )
+    }
+}
+
+/// Async sibling of [`PyIceProposal`]. Pre-simulation husk — call
+/// `await proposal.simulate()` to get an `AsyncSimulatedIceProposal`.
+///
+/// Sync equivalent: :class:`IceProposal`.
+#[pyclass(name = "AsyncIceProposal", module = "net._net")]
+pub struct PyAsyncIceProposal {
+    client: Arc<CoreClient>,
+    runtime: Arc<Runtime>,
+    action: parking_lot::Mutex<Option<net::adapter::net::behavior::meshos::IceActionProposal>>,
+    issued_at_ms: u64,
+}
+
+impl PyAsyncIceProposal {
+    fn from_action(
+        client: Arc<CoreClient>,
+        runtime: Arc<Runtime>,
+        action: net::adapter::net::behavior::meshos::IceActionProposal,
+        issued_at_ms: u64,
+    ) -> Self {
+        Self {
+            client,
+            runtime,
+            action: parking_lot::Mutex::new(Some(action)),
+            issued_at_ms,
+        }
+    }
+}
+
+#[pymethods]
+impl PyAsyncIceProposal {
+    #[getter]
+    fn issued_at_ms(&self) -> u64 {
+        self.issued_at_ms
+    }
+
+    /// Pre-execution preview. Returns an awaitable yielding an
+    /// `AsyncSimulatedIceProposal`. Consumes the husk —
+    /// subsequent calls raise `DeckSdkError(kind="already_simulated")`.
+    fn simulate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let action = self.action.lock().take().ok_or_else(|| {
+            deck_err(
+                py,
+                "already_simulated",
+                "AsyncIceProposal was already consumed by simulate()",
+            )
+        })?;
+        let issued_at_ms = self.issued_at_ms;
+        let client = self.client.clone();
+        let runtime = self.runtime.clone();
+        // Validate the variant up-front so an unknown-variant
+        // rejection bubbles synchronously rather than inside the
+        // future. Substrate-side simulate errors still consume the
+        // husk (matching the sync class + Go + Node).
+        build_core_proposal(&client, action.clone())
+            .map_err(|e| deck_err(py, e.kind, &e.message))?;
+        let action_for_future = action.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let proposal = build_core_proposal(&client, action_for_future).map_err(|e| {
+                Python::attach(|py| deck_err(py, e.kind, &e.message))
+            })?;
+            let blast = proposal
+                .simulate()
+                .await
+                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?
+                .blast_radius()
+                .clone();
+            Ok::<PyAsyncSimulatedIceProposal, PyErr>(PyAsyncSimulatedIceProposal {
+                client: client.clone(),
+                runtime,
+                action: parking_lot::Mutex::new(Some(action)),
+                issued_at_ms,
+                blast,
+                committed: parking_lot::Mutex::new(false),
+            })
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        let consumed = self.action.lock().is_none();
+        format!(
+            "AsyncIceProposal(consumed={consumed}, issued_at_ms={})",
+            self.issued_at_ms,
+        )
+    }
+}
+
+/// Async sibling of [`PySimulatedIceProposal`]. Only class exposing
+/// awaitable `commit()`.
+///
+/// Sync equivalent: :class:`SimulatedIceProposal`.
+#[pyclass(name = "AsyncSimulatedIceProposal", module = "net._net")]
+pub struct PyAsyncSimulatedIceProposal {
+    client: Arc<CoreClient>,
+    #[allow(dead_code)]
+    runtime: Arc<Runtime>,
+    action: parking_lot::Mutex<Option<net::adapter::net::behavior::meshos::IceActionProposal>>,
+    issued_at_ms: u64,
+    blast: net::adapter::net::behavior::meshos::BlastRadius,
+    committed: parking_lot::Mutex<bool>,
+}
+
+#[pymethods]
+impl PyAsyncSimulatedIceProposal {
+    fn blast_radius(&self, py: Python<'_>) -> PyResult<String> {
+        blast_radius_to_json(py, &self.blast)
+    }
+
+    #[getter]
+    fn issued_at_ms(&self) -> u64 {
+        self.issued_at_ms
+    }
+
+    fn blast_hash<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let hash = blast_radius_hash(&self.blast);
+        Ok(PyBytes::new(py, hash.as_ref()))
+    }
+
+    fn signing_payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let guard = self.action.lock();
+        let action = guard.as_ref().ok_or_else(|| {
+            deck_err(
+                py,
+                "already_committed",
+                "AsyncSimulatedIceProposal was already consumed by commit()",
+            )
+        })?;
+        let hash = blast_radius_hash(&self.blast);
+        let payload = ice_proposal_signing_payload(action, self.issued_at_ms, &hash);
+        Ok(PyBytes::new(py, &payload))
+    }
+
+    /// Awaitable commit. Resolves to the same chain-commit dict
+    /// shape as the sync `SimulatedIceProposal.commit()`. Consumes
+    /// the husk on success or substrate failure (matching the
+    /// sync class).
+    fn commit<'py>(
+        &self,
+        py: Python<'py>,
+        signatures: Vec<Bound<'_, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        {
+            let mut flag = self.committed.lock();
+            if *flag {
+                return Err(deck_err(
+                    py,
+                    "already_committed",
+                    "AsyncSimulatedIceProposal was already consumed by commit()",
+                ));
+            }
+            *flag = true;
+        }
+        let action = self.action.lock().take().ok_or_else(|| {
+            deck_err(
+                py,
+                "already_committed",
+                "AsyncSimulatedIceProposal was already consumed by commit()",
+            )
+        })?;
+        let mut sigs = Vec::with_capacity(signatures.len());
+        for d in signatures {
+            sigs.push(operator_signature_from_dict(py, &d)?);
+        }
+        let client = self.client.clone();
+        // Validate the variant under the GIL before entering the
+        // future so an unknown-variant rejection surfaces
+        // synchronously.
+        build_core_proposal(&client, action.clone())
+            .map_err(|e| deck_err(py, e.kind, &e.message))?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let proposal = build_core_proposal(&client, action).map_err(|e| {
+                Python::attach(|py| deck_err(py, e.kind, &e.message))
+            })?;
+            let simulated = proposal
+                .simulate()
+                .await
+                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
+            let commit = simulated
+                .commit(&sigs)
+                .await
+                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
+            Ok::<AsyncChainCommitDeckWrap, PyErr>(AsyncChainCommitDeckWrap(commit))
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        let committed = *self.committed.lock();
+        format!(
+            "AsyncSimulatedIceProposal(committed={committed}, issued_at_ms={}, affected_nodes={})",
+            self.issued_at_ms,
+            self.blast.affected_nodes.len(),
         )
     }
 }
