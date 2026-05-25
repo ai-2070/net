@@ -59,6 +59,43 @@ async def _async_echo(req: bytes) -> bytes:
     return req
 
 
+# `serve()` returns once the handler is registered locally, but the
+# channel-membership advertisement to the peer is async (rides the
+# substrate's broadcast). A `call()` issued before the peer has
+# observed the new joiner is rejected with
+# `RpcNoRouteError: membership request rejected: UnknownChannel`.
+# Production callers retry; tests use the same pattern so we don't
+# bake in a flaky fixed sleep.
+def _call_until_routed(cli, target, service, body, timeout_s=3.0):
+    import time
+
+    from net import RpcNoRouteError
+
+    deadline = time.time() + timeout_s
+    while True:
+        try:
+            return cli.call(target, service, body)
+        except RpcNoRouteError:
+            if time.time() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
+async def _acall_until_routed(acli, target, service, body, timeout_s=3.0):
+    import time as _time
+
+    from net import RpcNoRouteError
+
+    deadline = _time.time() + timeout_s
+    while True:
+        try:
+            return await acli.call(target, service, body)
+        except RpcNoRouteError:
+            if _time.time() >= deadline:
+                raise
+            await asyncio.sleep(0.05)
+
+
 def test_sync_caller_sync_server_unary(mesh_pair) -> None:
     """Regression: the original sync API still works after async lands."""
     a, b = mesh_pair
@@ -66,7 +103,7 @@ def test_sync_caller_sync_server_unary(mesh_pair) -> None:
     cli = MeshRpc(a)
     h = srv.serve("echo", _sync_echo)
     try:
-        reply = cli.call(b.node_id, "echo", b"hi")
+        reply = _call_until_routed(cli, b.node_id, "echo", b"hi")
         assert reply == b"hi"
     finally:
         h.close()
@@ -83,7 +120,7 @@ def test_sync_caller_async_server_unary(mesh_pair) -> None:
     cli = MeshRpc(a)
     h = asrv.serve("echo", _async_echo)
     try:
-        reply = cli.call(b.node_id, "echo", b"async-via-sync")
+        reply = _call_until_routed(cli, b.node_id, "echo", b"async-via-sync")
         assert reply == b"async-via-sync"
     finally:
         h.close()
@@ -102,7 +139,9 @@ def test_async_caller_sync_server_unary(mesh_pair) -> None:
         acli = AsyncMeshRpc(a)
         h = srv.serve("echo", _sync_echo)
         try:
-            return await acli.call(b.node_id, "echo", b"sync-via-async")
+            return await _acall_until_routed(
+                acli, b.node_id, "echo", b"sync-via-async"
+            )
         finally:
             h.close()
 
@@ -123,7 +162,9 @@ def test_async_caller_async_server_unary(mesh_pair) -> None:
         acli = AsyncMeshRpc(a)
         h = asrv.serve("echo", _async_echo)
         try:
-            return await acli.call(b.node_id, "echo", b"both-async")
+            return await _acall_until_routed(
+                acli, b.node_id, "echo", b"both-async"
+            )
         finally:
             h.close()
 
@@ -182,6 +223,11 @@ def test_wait_for_timeout_propagates_to_substrate_cancel(mesh_pair) -> None:
         acli = AsyncMeshRpc(a)
         h = asrv.serve("slow", _slow_handler)
         try:
+            # Give the substrate's channel-membership advertisement a
+            # beat to reach the caller. Without this the wait_for
+            # timeout below races against route-propagation, and we
+            # see NoRoute instead of the cancel we want to test.
+            await asyncio.sleep(0.5)
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(
                     acli.call(b.node_id, "slow", b"never-resolves"),
@@ -243,6 +289,13 @@ def test_streaming_mid_iter_cancel_terminates_stream(mesh_pair) -> None:
         acli = AsyncMeshRpc(a)
         h = asrv.serve_duplex("duplex-cancel", _duplex_handler)
         try:
+            # Same membership-propagation beat as the cancel test —
+            # `serve_duplex` returns once the channel is joined
+            # locally, but the join-advertisement to the caller side
+            # rides the next broadcast. Without the wait, the
+            # `call_duplex` open races the propagation and gets
+            # rejected with UnknownChannel.
+            await asyncio.sleep(0.5)
             call = await acli.call_duplex(b.node_id, "duplex-cancel")
             await call.send(b"go")
             await call.finish_sending()
