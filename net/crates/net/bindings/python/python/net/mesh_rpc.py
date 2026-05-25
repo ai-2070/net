@@ -1308,6 +1308,85 @@ class AsyncTypedMeshRpc:
         """
         return self._raw.find_service_nodes(service)
 
+    # ---- streaming-response (call_streaming) -------------------------------
+
+    async def call_streaming(
+        self,
+        target_node_id: int,
+        service: str,
+        request: Any,
+        opts: Optional[dict] = None,
+    ) -> "AsyncTypedRpcStream":
+        """Open a typed streaming-response call. Awaits the stream
+        construction; the returned :class:`AsyncTypedRpcStream`
+        decodes each chunk on `async for`. Asyncio task-cancel
+        mid-stream tears down the substrate-side pending entry
+        cleanly via the cancel-registry.
+
+        Sync equivalent: :meth:`TypedMeshRpc.call_streaming`.
+        """
+        req_bytes = _json_encode(request)
+        raw_stream = await self._raw.call_streaming(
+            target_node_id, service, req_bytes, opts
+        )
+        return AsyncTypedRpcStream(raw_stream)
+
+
+class AsyncTypedRpcStream:
+    """Async typed iterator over a streaming RPC. Each
+    ``async for`` step yields a decoded Python object. Raises
+    :class:`RpcCodecError` on a malformed chunk and closes the
+    underlying stream.
+
+    Sync equivalent: :class:`TypedRpcStream`.
+    """
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+        self._done = False
+
+    def __aiter__(self) -> "AsyncTypedRpcStream":
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._done:
+            raise StopAsyncIteration
+        try:
+            chunk = await self._raw.__anext__()
+        except StopAsyncIteration:
+            self._done = True
+            raise
+        try:
+            return _json_decode(chunk)
+        except RpcCodecError:
+            self._done = True
+            try:
+                self._raw.close()
+            except Exception:
+                # Best-effort — don't mask the original codec error.
+                pass
+            raise
+
+    def grant(self, n: int) -> None:
+        """Grant ``n`` flow-control credits to the server pump."""
+        self._raw.grant(n)
+
+    def flow_controlled(self) -> bool:
+        """``True`` if the call set ``stream_window_initial``."""
+        return bool(self._raw.flow_controlled())
+
+    def close(self) -> None:
+        """Sync close; emits CANCEL to the server. Idempotent."""
+        self._done = True
+        try:
+            self._raw.close()
+        except Exception:
+            pass
+
+    async def aclose(self) -> None:
+        """Async alias for :meth:`close`."""
+        self.close()
+
 
 # ---------------------------------------------------------------------------
 # RetryPolicy — mirrors net_sdk::mesh_rpc_resilience::RetryPolicy.
