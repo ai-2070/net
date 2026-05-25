@@ -298,13 +298,6 @@ impl CancelRegistry {
     pub fn len(&self) -> usize {
         self.entries.lock().entries.len()
     }
-
-    /// True iff the registry tracks zero entries. Mirrors the
-    /// [`Vec::is_empty`] convention so clippy doesn't pester
-    /// downstream consumers.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 #[cfg(test)]

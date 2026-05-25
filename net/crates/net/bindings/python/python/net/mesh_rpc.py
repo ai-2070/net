@@ -240,19 +240,32 @@ class RpcMetricsSnapshot:
     observer_dropped_total: int = 0
 
 
+#: Status-kind discriminants emitted on the pyo3 POD's
+#: ``status_kind`` field. Prefer these constants over hard-coding
+#: the string literal — a typo silently never fires.
+STATUS_OK = "ok"
+STATUS_ERROR = "error"
+STATUS_TIMEOUT = "timeout"
+STATUS_CANCELED = "canceled"
+
+#: Direction-kind discriminants on the pyo3 POD's ``direction``.
+DIRECTION_OUTBOUND = "outbound"
+DIRECTION_INBOUND = "inbound"
+
+
 def _raw_event_to_typed(raw: Any) -> RpcCallEvent:
     """Convert the pyo3 POD shape (``RpcCallEvent`` with flat
     ``status_kind`` / ``status_message``) into the Python-idiomatic
     tagged-union :class:`RpcCallEvent`.
     """
     kind = raw.status_kind
-    if kind == "ok":
+    if kind == STATUS_OK:
         status: Any = RpcCallStatusOk()
-    elif kind == "error":
+    elif kind == STATUS_ERROR:
         status = RpcCallStatusError(message=raw.status_message or "")
-    elif kind == "timeout":
+    elif kind == STATUS_TIMEOUT:
         status = RpcCallStatusTimeout()
-    elif kind == "canceled":
+    elif kind == STATUS_CANCELED:
         status = RpcCallStatusCanceled()
     else:
         # Forward-compat: unknown kind falls back to Error(kind)

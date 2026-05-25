@@ -345,6 +345,90 @@ Wave 1 and Wave 2 can run in parallel (different code paths, no overlap). Wave 3
 
 ---
 
+## Cancellation cookbook (cross-binding)
+
+All three bindings ride on the same substrate primitive
+(`Mesh::reserve_cancel_token` + `Mesh::cancel(token)`) but expose it
+through the idiomatic per-language cancel handle. Operators reading
+the cookbook across bindings should expect three different mental
+models for the same wire-level outcome.
+
+### Node — `AbortSignal` (idiomatic) + raw `cancelToken`
+
+```ts
+const ac = new AbortController()
+const promise = rpc.call(targetId, 'svc.echo', { x: 1 }, { signal: ac.signal })
+// later:
+ac.abort()  // → CANCEL on the wire, promise rejects with RpcCancelledError
+```
+
+Internally the typed wrapper mints a token via `raw.reserveCancelToken()`,
+populates `rawOpts.cancelToken`, attaches a one-shot listener that
+calls `raw.cancelCall(token)`, and detaches on call resolution.
+
+Power users can bypass the wrapper and reuse a token across calls:
+```ts
+const token = raw.reserveCancelToken()
+const p1 = raw.call(target, 'svc.a', body, { cancelToken: token })
+const p2 = raw.call(target, 'svc.b', body, { cancelToken: token })
+raw.cancelCall(token)  // cancels both
+```
+
+### Python — `Cancellable` (idiomatic) + raw `cancel_token`
+
+```python
+cancel = Cancellable()
+fut = rpc.call(target, 'svc.echo', payload, opts={'cancel': cancel})
+# later:
+cancel.cancel()  # → CANCEL on the wire, fut raises RpcCancelledError
+```
+
+The `Cancellable` defers token reservation until first use; calling
+`cancel()` before the call is issued is safe (latches the
+pre-cancellation flag via the substrate's CR-13 path).
+
+Power users can pass a raw token instead:
+```python
+token = rpc.raw.reserve_cancel_token()
+fut = rpc.call(target, 'svc.echo', payload, opts={'cancel_token': token})
+rpc.raw.cancel_call(token)
+```
+
+### Go — `context.Context` (idiomatic) + raw `Mesh::cancel`
+
+```go
+ctx, cancel := context.WithTimeout(parent, 5 * time.Second)
+defer cancel()
+resp, err := rpc.Call(ctx, target, "svc.echo", payload)
+// ctx.Done() fires → net_rpc_cancel_call(handle, token) fires → CANCEL on the wire
+```
+
+The typed wrapper's `installCancelWatcher` spawns a goroutine that
+listens for `ctx.Done()` and calls `net_rpc_cancel_call(handle, token)`
+through the substrate. Standard Go-idiomatic — the user never sees
+a token.
+
+For non-`context`-driven cancel (e.g. cancelling from a separate
+goroutine on a signal), reserve and pass a token explicitly via the
+raw FFI surface.
+
+### Shared invariants
+
+- **`token == 0` is the "no token" sentinel.** Reserving never
+  returns 0; cancel(0) is a no-op.
+- **Tokens are process-monotonic.** A token reserved on mesh A can
+  be passed to mesh B's `cancel()` — it's a no-op (the registries are
+  per-mesh; B's registry has no entry for it). No collision concerns.
+- **Cancel is idempotent.** Cancelling the same token twice, or
+  cancelling after the call resolves, is safe. The orphan-TTL GC
+  evicts stale entries within 120s.
+- **Drop emits CANCEL on the wire.** When a cancel fires (or the
+  call future is dropped for any other reason — `select!` cancelled,
+  hedge loser), the substrate's per-call Drop impl emits a CANCEL
+  frame to the server before the registry entry is released.
+
+---
+
 ## Deferred follow-ups (post-v3)
 
 Items deliberately deferred from v3; same convention as the v1 plan's deferred section.

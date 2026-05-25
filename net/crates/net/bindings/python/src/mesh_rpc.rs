@@ -388,6 +388,61 @@ fn extract_cancellable<'py>(
     Ok(Some(cell))
 }
 
+/// Extract the optional raw ``cancel_token`` int from the user's
+/// opts dict. Lowest-common-denominator cancel path for power
+/// users who want to manage tokens directly (e.g. reuse one
+/// token across multiple parallel calls). Mutually exclusive with
+/// ``opts['cancel']`` — passing both raises ``ValueError``.
+///
+/// Returns ``Ok(None)`` when no `cancel_token` was provided or it
+/// was explicitly ``None``. Raises ``TypeError`` if the key holds
+/// a non-int value or 0 (the sentinel).
+fn extract_cancel_token<'py>(opts: Option<&Bound<'py, PyDict>>) -> PyResult<Option<u64>> {
+    let Some(d) = opts else {
+        return Ok(None);
+    };
+    let Some(v) = d.get_item("cancel_token")? else {
+        return Ok(None);
+    };
+    if v.is_none() {
+        return Ok(None);
+    }
+    let token: u64 = v.extract().map_err(|e| {
+        pyo3::exceptions::PyTypeError::new_err(format!(
+            "opts['cancel_token'] must be a non-negative int: {e}"
+        ))
+    })?;
+    if token == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "opts['cancel_token'] == 0 is the 'no token' sentinel; \
+             pass None or omit the key instead",
+        ));
+    }
+    Ok(Some(token))
+}
+
+/// Reject the ambiguous case of both `opts['cancel']` and
+/// `opts['cancel_token']` being set — they're mutually exclusive
+/// and the precedence would be invisible to the caller.
+fn check_cancel_keys_exclusive<'py>(opts: Option<&Bound<'py, PyDict>>) -> PyResult<()> {
+    let Some(d) = opts else {
+        return Ok(());
+    };
+    let has_cancel = d
+        .get_item("cancel")?
+        .is_some_and(|v| !v.is_none());
+    let has_token = d
+        .get_item("cancel_token")?
+        .is_some_and(|v| !v.is_none());
+    if has_cancel && has_token {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "opts['cancel'] and opts['cancel_token'] are mutually exclusive; \
+             pass one or the other",
+        ));
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Handler bridging.
 //
@@ -1706,8 +1761,13 @@ impl PyMeshRpc {
         request: &Bound<'py, PyBytes>,
         opts: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyBytes>> {
+        check_cancel_keys_exclusive(opts)?;
         let cancel = extract_cancellable(opts)?;
+        let raw_cancel_token = extract_cancel_token(opts)?;
         let mut inner_opts = call_options_from_dict(opts)?;
+        if let Some(t) = raw_cancel_token {
+            inner_opts.cancel_token = Some(t);
+        }
         let armed_cancel = apply_cancellable(&self.node, cancel.as_ref(), &mut inner_opts);
         let req_bytes = Bytes::copy_from_slice(request.as_bytes());
         let runtime = self.runtime.clone();
@@ -1739,8 +1799,13 @@ impl PyMeshRpc {
         request: &Bound<'py, PyBytes>,
         opts: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyBytes>> {
+        check_cancel_keys_exclusive(opts)?;
         let cancel = extract_cancellable(opts)?;
+        let raw_cancel_token = extract_cancel_token(opts)?;
         let mut inner_opts = call_options_from_dict(opts)?;
+        if let Some(t) = raw_cancel_token {
+            inner_opts.cancel_token = Some(t);
+        }
         let armed_cancel = apply_cancellable(&self.node, cancel.as_ref(), &mut inner_opts);
         let req_bytes = Bytes::copy_from_slice(request.as_bytes());
         let runtime = self.runtime.clone();
@@ -1769,8 +1834,13 @@ impl PyMeshRpc {
         request: &Bound<'py, PyBytes>,
         opts: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<PyRpcStream> {
+        check_cancel_keys_exclusive(opts)?;
         let cancel = extract_cancellable(opts)?;
+        let raw_cancel_token = extract_cancel_token(opts)?;
         let mut inner_opts = call_options_from_dict(opts)?;
+        if let Some(t) = raw_cancel_token {
+            inner_opts.cancel_token = Some(t);
+        }
         // armed_cancel is dropped here — the Cancellable's stored
         // (mesh, token) outlives this call via the substrate
         // registry. Cancel mid-stream still works because the
@@ -1808,8 +1878,13 @@ impl PyMeshRpc {
         service: String,
         opts: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<PyClientStreamCall> {
+        check_cancel_keys_exclusive(opts)?;
         let cancel = extract_cancellable(opts)?;
+        let raw_cancel_token = extract_cancel_token(opts)?;
         let mut inner_opts = call_options_from_dict(opts)?;
+        if let Some(t) = raw_cancel_token {
+            inner_opts.cancel_token = Some(t);
+        }
         let _armed = apply_cancellable(&self.node, cancel.as_ref(), &mut inner_opts);
         let runtime = self.runtime.clone();
         let node = self.node.clone();
@@ -1845,8 +1920,13 @@ impl PyMeshRpc {
         service: String,
         opts: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<PyDuplexCall> {
+        check_cancel_keys_exclusive(opts)?;
         let cancel = extract_cancellable(opts)?;
+        let raw_cancel_token = extract_cancel_token(opts)?;
         let mut inner_opts = call_options_from_dict(opts)?;
+        if let Some(t) = raw_cancel_token {
+            inner_opts.cancel_token = Some(t);
+        }
         let _armed = apply_cancellable(&self.node, cancel.as_ref(), &mut inner_opts);
         let runtime = self.runtime.clone();
         let node = self.node.clone();

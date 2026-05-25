@@ -252,6 +252,30 @@ export interface RpcCallEvent {
 }
 
 /**
+ * Status-kind discriminants emitted on `RawRpcCallEvent.statusKind`
+ * and consumed when normalizing into the tagged-union
+ * {@link RpcCallStatus}. Prefer these constants over hard-coding
+ * the string literal in `if (evt.statusKind === '...')` checks —
+ * a typo on the literal silently never fires.
+ */
+export const STATUS_OK = 'ok' as const
+export const STATUS_ERROR = 'error' as const
+export const STATUS_TIMEOUT = 'timeout' as const
+export const STATUS_CANCELED = 'canceled' as const
+
+/** Direction-kind discriminants on `RawRpcCallEvent.direction`. */
+export const DIRECTION_OUTBOUND = 'outbound' as const
+export const DIRECTION_INBOUND = 'inbound' as const
+
+export type StatusKind =
+  | typeof STATUS_OK
+  | typeof STATUS_ERROR
+  | typeof STATUS_TIMEOUT
+  | typeof STATUS_CANCELED
+
+export type DirectionKind = typeof DIRECTION_OUTBOUND | typeof DIRECTION_INBOUND
+
+/**
  * Raw napi observer event shape (POD with flat `statusKind` /
  * `statusMessage` strings). Internal — the typed wrapper
  * normalizes it into {@link RpcCallEvent} before reaching user
@@ -262,11 +286,11 @@ export interface RawRpcCallEvent {
   callee: bigint
   method: string
   latencyMs: number
-  statusKind: 'ok' | 'error' | 'timeout' | 'canceled'
+  statusKind: StatusKind
   statusMessage?: string | null
   requestBytes: number
   responseBytes: number
-  direction: 'outbound' | 'inbound'
+  direction: DirectionKind
   tsUnixMs: bigint
 }
 
@@ -2030,16 +2054,16 @@ export const NRPC_TYPED_HANDLER_ERROR = 0x8001 as const
 export function rawEventToTyped(raw: RawRpcCallEvent): RpcCallEvent {
   let status: RpcCallStatus
   switch (raw.statusKind) {
-    case 'ok':
+    case STATUS_OK:
       status = { kind: 'ok' }
       break
-    case 'error':
+    case STATUS_ERROR:
       status = { kind: 'error', message: raw.statusMessage ?? '' }
       break
-    case 'timeout':
+    case STATUS_TIMEOUT:
       status = { kind: 'timeout' }
       break
-    case 'canceled':
+    case STATUS_CANCELED:
       status = { kind: 'canceled' }
       break
   }
