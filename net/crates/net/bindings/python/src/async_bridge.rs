@@ -75,6 +75,85 @@ pub fn runtime() -> Option<tokio::runtime::Handle> {
 }
 
 // ============================================================================
+// Server-side dispatcher event loop.
+//
+// `pyo3_async_runtimes::tokio::into_future(coro)` calls
+// `asyncio.ensure_future` via the bridge's *current* TaskLocals — the
+// event loop that drives Rust→Python coroutine bridging. Locals are
+// installed by `future_into_py` for the Python→Rust direction (a
+// Python caller awaiting a Rust future), but server-handler dispatch
+// runs in the reverse direction: a substrate tokio worker calls into
+// Python and needs to drive an `async def` handler to completion.
+// There's no Python loop running on the tokio worker — calling
+// `into_future` from there raises `RuntimeError: no running event loop`.
+//
+// Fix: spin a single daemon Python thread that runs an asyncio event
+// loop forever, and surface it as `TaskLocals` via
+// `dispatcher_locals(py)`. `PyAsyncRpcHandler` then dispatches the
+// handler coroutine through `into_future_with_locals(&locals, coro)`,
+// which `call_soon_threadsafe`s onto the dispatcher loop. The
+// dispatcher thread runs the coroutine; the Rust future resolves when
+// the coroutine returns or raises.
+//
+// One dispatcher thread is enough because handler coroutines are
+// cooperative — they `await` other I/O and yield back to the loop.
+// A handler that blocks the loop (e.g. a long sync `time.sleep`)
+// blocks every other in-flight handler, same as any asyncio
+// deployment with one event loop.
+// ============================================================================
+
+#[cfg(feature = "net")]
+static DISPATCHER_LOOP: OnceLock<pyo3::Py<pyo3::PyAny>> = OnceLock::new();
+
+/// Lazily spawn the daemon dispatcher thread and return its
+/// `TaskLocals`. Idempotent — subsequent calls return the same
+/// loop. First call boots a Python `threading.Thread` whose target
+/// runs `asyncio.run_forever()` on a fresh event loop.
+#[cfg(feature = "net")]
+#[allow(dead_code)] // Consumed by mesh_rpc.rs async-handler bridges.
+pub fn dispatcher_locals(
+    py: Python<'_>,
+) -> PyResult<pyo3_async_runtimes::TaskLocals> {
+    if let Some(loop_) = DISPATCHER_LOOP.get() {
+        return Ok(pyo3_async_runtimes::TaskLocals::new(loop_.bind(py).clone()));
+    }
+    // First call — boot the dispatcher thread. The script creates
+    // a fresh event loop, schedules `run_forever` on a daemon
+    // thread, and exposes the loop on the script's globals so we
+    // can fish it back out into Rust.
+    let globals = pyo3::types::PyDict::new(py);
+    py.run(
+        c"\
+import asyncio
+import threading
+_loop = asyncio.new_event_loop()
+def _runner():
+    asyncio.set_event_loop(_loop)
+    _loop.run_forever()
+threading.Thread(
+    target=_runner,
+    daemon=True,
+    name='net-py-async-dispatcher',
+).start()
+",
+        Some(&globals),
+        None,
+    )?;
+    let loop_bound = globals
+        .get_item("_loop")?
+        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+            "dispatcher_locals: _loop not captured by bootstrap script",
+        ))?;
+    let loop_obj: pyo3::Py<pyo3::PyAny> = loop_bound.clone().unbind();
+    // OnceLock::set is fallible on race; if a sibling thread won,
+    // discard ours (its loop is fine too — both run forever and
+    // dispatch coroutines the same way).
+    let _ = DISPATCHER_LOOP.set(loop_obj);
+    let stored = DISPATCHER_LOOP.get().expect("just set");
+    Ok(pyo3_async_runtimes::TaskLocals::new(stored.bind(py).clone()))
+}
+
+// ============================================================================
 // await_with_cancel — substrate-cancel-aware future_into_py
 // ============================================================================
 
