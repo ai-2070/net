@@ -1,0 +1,23 @@
+net/crates/net/bindings/python/tests/conftest.py
+  s_099fa7d871e34d::t_61622e7f42685a 73-90
+net/crates/net/bindings/python/src/lib.rs
+  s_099fa7d871e34d::t_491d5c5a1bb949 1137-1147
+  s_099fa7d871e34d::t_826e7a0302d9fc 1233-1235,1237-1239
+  s_099fa7d871e34d::t_4fdab18ff88f98 1109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "3d0b8154f667f60af0b7029aa87e6793b6129564",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
