@@ -2185,6 +2185,43 @@ impl PyAsyncMeshRpc {
         self.node.find_service_nodes(&service)
     }
 
+    /// Open a client-streaming call. Returns an awaitable that
+    /// resolves to an :class:`AsyncClientStreamCall`. Push chunks
+    /// with `await call.send(body)`, then `await call.finish()`
+    /// to drain the terminal response.
+    ///
+    /// Sync equivalent: :meth:`MeshRpc.call_client_stream`.
+    #[pyo3(signature = (target_node_id, service, opts=None))]
+    fn call_client_stream<'py>(
+        &self,
+        py: Python<'py>,
+        target_node_id: u64,
+        service: String,
+        opts: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut inner_opts = call_options_from_dict(opts)?;
+        let node = self.node.clone();
+        let mesh_for_call = self.node.clone();
+        crate::async_bridge::await_with_cancel(py, &self.node, move |token| {
+            inner_opts.cancel_token = Some(token);
+            async move {
+                let inner = node
+                    .call_client_stream(target_node_id, &service, inner_opts)
+                    .await
+                    .map_err(rpc_error_to_pyerr)?;
+                let call_id_cached = inner.call_id();
+                let flow_controlled_cached = inner.flow_controlled();
+                Ok::<_, PyErr>(PyAsyncClientStreamCall {
+                    inner: Arc::new(Mutex::new(Some(inner))),
+                    mesh: mesh_for_call,
+                    cancel_token: token,
+                    call_id_cached,
+                    flow_controlled_cached,
+                })
+            }
+        })
+    }
+
     /// Open a streaming-response call. Returns an awaitable that
     /// resolves to an :class:`AsyncRpcStream`; iterate the stream
     /// with `async for chunk in stream:` or pull chunks one at a
@@ -2312,6 +2349,95 @@ impl PyAsyncRpcStream {
     /// Async alias for :meth:`close` so users can write
     /// ``await stream.aclose()`` for consistency with other
     /// async iterator types.
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.close();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
+    }
+}
+
+// ============================================================================
+// PyAsyncClientStreamCall — async client-streaming call handle.
+//
+// Mirror of PyClientStreamCall's Arc<Mutex<Option<...>>> shape with
+// `async def send` / `async def finish` instead of blocking
+// methods. send() uses await_with_existing_token so a mid-send
+// task.cancel() fires mesh.cancel(token), terminating the call.
+// ============================================================================
+
+#[pyclass(name = "AsyncClientStreamCall", module = "_net")]
+pub struct PyAsyncClientStreamCall {
+    inner: Arc<Mutex<Option<InnerClientStreamCallRaw>>>,
+    mesh: Arc<MeshNode>,
+    cancel_token: u64,
+    call_id_cached: u64,
+    flow_controlled_cached: bool,
+}
+
+#[pymethods]
+impl PyAsyncClientStreamCall {
+    /// Async push of one body chunk. Awaits the initial REQUEST
+    /// publish (first call) or one upload credit (subsequent
+    /// calls under flow control). Asyncio task-cancel mid-await
+    /// fires the substrate cancel-token, terminating the call.
+    fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let mesh = self.mesh.clone();
+        let token = self.cancel_token;
+        let body_bytes = Bytes::copy_from_slice(body.as_bytes());
+        crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
+            let mut call = match inner.lock().take() {
+                Some(c) => c,
+                None => return Err(RpcError::new_err("client-stream call already closed")),
+            };
+            let result = call.send(body_bytes).await;
+            match result {
+                Ok(()) => {
+                    *inner.lock() = Some(call);
+                    Ok::<(), PyErr>(())
+                }
+                Err(e) => {
+                    drop(call);
+                    Err(rpc_error_to_pyerr(e))
+                }
+            }
+        })
+    }
+
+    /// Async REQUEST_END + terminal-response drain. Consumes the
+    /// call — subsequent send/finish raise ``RpcError``.
+    fn finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let mesh = self.mesh.clone();
+        let token = self.cancel_token;
+        crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
+            let call = match inner.lock().take() {
+                Some(c) => c,
+                None => return Err(RpcError::new_err("client-stream call already closed")),
+            };
+            let reply = call.finish().await.map_err(rpc_error_to_pyerr)?;
+            Ok::<Vec<u8>, PyErr>(reply.body.to_vec())
+        })
+    }
+
+    /// Server-assigned `call_id` for diagnostics / trace correlation.
+    fn call_id(&self) -> u64 {
+        self.call_id_cached
+    }
+
+    /// ``True`` if the call was opened with a non-``None``
+    /// ``request_window_initial``.
+    fn flow_controlled(&self) -> bool {
+        self.flow_controlled_cached
+    }
+
+    /// Close without finishing. Fires CANCEL via the SDK's Drop
+    /// if the initial REQUEST has already flown. Idempotent.
+    fn close(&self) {
+        let mut guard = self.inner.lock();
+        let _ = guard.take();
+    }
+
+    /// Async alias for :meth:`close`.
     fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.close();
         pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })

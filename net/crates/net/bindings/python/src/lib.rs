@@ -2347,6 +2347,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<mesh_rpc::PyMeshRpc>()?;
         m.add_class::<mesh_rpc::PyAsyncMeshRpc>()?;
         m.add_class::<mesh_rpc::PyAsyncRpcStream>()?;
+        m.add_class::<mesh_rpc::PyAsyncClientStreamCall>()?;
         m.add_class::<mesh_rpc::PyServeHandle>()?;
         m.add_class::<mesh_rpc::PyRpcStream>()?;
         m.add_class::<mesh_rpc::PyCancellable>()?;

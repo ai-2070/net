@@ -113,6 +113,7 @@ else:
 # once the wheel is rebuilt with `maturin develop`.
 try:
     from ._net import (
+        AsyncClientStreamCall,
         AsyncMeshRpc,
         AsyncRpcStream,
         Cancellable,
@@ -134,6 +135,7 @@ except ImportError:
 else:
     __all__.extend(
         [
+            "AsyncClientStreamCall",
             "AsyncMeshRpc",
             "AsyncRpcStream",
             "Cancellable",
