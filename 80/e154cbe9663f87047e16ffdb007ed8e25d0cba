@@ -1,0 +1,44 @@
+net/crates/net/bindings/python/src/blob.rs
+  s_099fa7d871e34d::t_35983d4989e44a 947-950
+net/crates/net/bindings/python/src/compute.rs
+  s_099fa7d871e34d::t_5ba761aa0c471b 317-320
+  s_099fa7d871e34d::t_05faea321fc7e8 786-788
+net/crates/net/bindings/python/src/meshdb.rs
+  s_099fa7d871e34d::t_2e943a9f98ab51 1364-1367
+net/crates/net/bindings/python/src/deck.rs
+  s_099fa7d871e34d::t_16d05657af878e 552-555
+  s_099fa7d871e34d::t_ab8fded45469e1 408-410
+  s_099fa7d871e34d::t_06074990e12c40 325-327
+  s_099fa7d871e34d::t_e7a9cbd4e6b979 362-365
+net/crates/net/bindings/python/src/cortex.rs
+  s_099fa7d871e34d::t_92e3f409500732 1639-1641
+  s_099fa7d871e34d::t_49535ba33cf0b8 1232-1235
+  s_099fa7d871e34d::t_aef2ccd38c7b11 2212-2214
+  s_099fa7d871e34d::t_571485dcb37a00 928-930
+  s_099fa7d871e34d::t_a86f16e6961c4b 831-833
+  s_099fa7d871e34d::t_601b800318bab3 1774-1777
+net/crates/net/bindings/python/src/aggregator.rs
+  s_099fa7d871e34d::t_bf9354039366cd 219-221
+  s_099fa7d871e34d::t_56a274217af01c 315-317
+net/crates/net/bindings/python/src/lib.rs
+  s_099fa7d871e34d::t_e97934a44c736c 1052-1054
+  s_099fa7d871e34d::t_e17e86cfa19f0f 982-984
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  s_099fa7d871e34d::t_71b7fa8d8856eb 1807-1810
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "80e154cbe9663f87047e16ffdb007ed8e25d0cba",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
