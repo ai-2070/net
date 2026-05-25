@@ -1,0 +1,28 @@
+net/crates/net/bindings/python/tests/test_async_interop.py
+  s_099fa7d871e34d::t_f29aaa272bbc70 103-111
+  s_099fa7d871e34d::t_bbcf45411f4045 206
+  s_099fa7d871e34d::t_b69bb553bb0978 273
+net/crates/net/bindings/python/src/async_bridge.rs
+  s_099fa7d871e34d::t_d12a42ce5ecef7 78-155
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  s_099fa7d871e34d::t_29459ea7f7b04a 658-664,666,671-673
+  s_099fa7d871e34d::t_86fd90b834012e 837,841-843
+  s_099fa7d871e34d::t_0a60072c381913 758,762-764
+  s_099fa7d871e34d::t_f7f1ea435e3a36 670,761,840
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "af130b05e0c29a375b90fd20153df54343132b8d",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
