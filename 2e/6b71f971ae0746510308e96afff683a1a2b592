@@ -1,0 +1,28 @@
+net/crates/net/bindings/python/tests/test_async_interop.py
+  s_099fa7d871e34d::t_5d23400294f81d 36-37
+  s_099fa7d871e34d::t_331555eb11fc20 75,81-84,86-87,89,92,98,109-110,113,119,130-131
+  s_099fa7d871e34d::t_a9e3118326efb5 287
+  s_099fa7d871e34d::t_e03e9e310a8691 149
+  s_099fa7d871e34d::t_590a4abee39559 165
+  s_099fa7d871e34d::t_71124f43b03f2f 221-259,261-266,268-269,278-286
+  s_099fa7d871e34d::t_579f87c3eba565 62,64-67,69-70,72
+  s_099fa7d871e34d::t_38dbe98dd35b20 207,210
+net/crates/net/bindings/python/tests/conftest.py
+  s_099fa7d871e34d::t_d687ec70ff7e48 1-99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "2e6b71f971ae0746510308e96afff683a1a2b592",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
