@@ -43,7 +43,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -65,6 +65,28 @@ pub const ORPHAN_TTL: Duration = Duration::from_secs(120);
 /// [`crate::adapter::net::MeshNode::cancel`] ignores. Monotonically-
 /// increasing, never reused.
 static NEXT_CANCEL_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// Shared never-firing [`Notify`] returned by [`CancelRegistry::register_notify`]
+/// when `token == 0`. Every no-cancel call (the overwhelmingly common
+/// path) clones this single `Arc` instead of allocating a fresh
+/// `Notify` per call — saves two heap allocations + two refcount ops
+/// on the unary/streaming hot paths.
+///
+/// Safe to share: nothing ever calls `notify_one` on it, so the
+/// permit-slot stays empty forever and every `notified().await`
+/// blocks indefinitely (which is the semantic we want — the call's
+/// `tokio::select!` arm fires only on the other branch).
+fn never_firing_notify() -> Arc<Notify> {
+    static NOTIFY: OnceLock<Arc<Notify>> = OnceLock::new();
+    NOTIFY.get_or_init(|| Arc::new(Notify::new())).clone()
+}
+
+/// Minimum interval between opportunistic GC sweeps. Called from
+/// the hot path ([`CancelRegistry::register_notify`]), so a full
+/// HashMap scan per call is O(N) under contention. Rate-limiting
+/// to once per second keeps orphan-TTL eviction bounded without
+/// the quadratic burst behavior.
+const GC_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Reserve a fresh cancel token. Process-global counter — every
 /// [`crate::adapter::net::MeshNode`] in the process shares the same
@@ -112,7 +134,15 @@ impl CancelEntry {
 /// and cheap on the no-cancel path (no allocation when
 /// `token == 0`).
 pub struct CancelRegistry {
-    entries: Mutex<HashMap<u64, CancelEntry>>,
+    entries: Mutex<RegistryInner>,
+}
+
+struct RegistryInner {
+    entries: HashMap<u64, CancelEntry>,
+    /// Last time [`CancelRegistry::gc`] swept the map. Rate-limits
+    /// the sweep to once per [`GC_INTERVAL`] — the hot path callers
+    /// (`register_notify`) check this before paying the O(N) scan.
+    last_gc: Instant,
 }
 
 impl Default for CancelRegistry {
@@ -124,7 +154,10 @@ impl Default for CancelRegistry {
 impl CancelRegistry {
     pub fn new() -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            entries: Mutex::new(RegistryInner {
+                entries: HashMap::new(),
+                last_gc: Instant::now(),
+            }),
         }
     }
 
@@ -151,17 +184,22 @@ impl CancelRegistry {
         if token == 0 {
             return;
         }
-        let mut entries = self.entries.lock();
-        Self::gc(&mut entries);
-        let entry = entries.entry(token).or_insert_with(CancelEntry::new);
-        entry.pre_cancelled = true;
-        if entry.marked_at.is_none() {
-            entry.marked_at = Some(Instant::now());
-        }
-        if let Some(notify) = entry.notify.as_ref() {
-            // Notify::notify_one() stores a permit so the next
-            // notified().await returns immediately. Idempotent if
-            // already permit-loaded — calling twice is harmless.
+        let notify = {
+            let mut inner = self.entries.lock();
+            // Cancel rate is low and bounded, so GC under cancel
+            // stays cheap; still gate by `last_gc` to stay
+            // symmetric with register_notify.
+            Self::maybe_gc(&mut inner);
+            let entry = inner.entries.entry(token).or_insert_with(CancelEntry::new);
+            entry.pre_cancelled = true;
+            if entry.marked_at.is_none() {
+                entry.marked_at = Some(Instant::now());
+            }
+            // Clone the Arc before releasing the lock — `notify_one`
+            // doesn't need the registry mutex.
+            entry.notify.clone()
+        };
+        if let Some(notify) = notify {
             notify.notify_one();
         }
     }
@@ -171,34 +209,39 @@ impl CancelRegistry {
     /// CR-13 race), the returned Notify is pre-armed so the first
     /// `notified().await` returns immediately.
     ///
-    /// `token == 0` short-circuits and returns a fresh Notify
-    /// that never fires — lets call shapes write
+    /// `token == 0` short-circuits to a shared never-firing Notify
+    /// (one Arc clone, no allocation) so call shapes can write
     /// `select! { _ = notify.notified() => ... }` unconditionally
-    /// without branching on `Option<Notify>`.
+    /// without branching on `Option<Notify>` and without paying an
+    /// allocation per call on the no-cancel hot path.
     pub fn register_notify(&self, token: u64) -> Arc<Notify> {
         if token == 0 {
-            // Never-firing Notify so the call's select! arm is
-            // structurally identical in the no-cancel case.
-            return Arc::new(Notify::new());
+            return never_firing_notify();
         }
-        let mut entries = self.entries.lock();
-        Self::gc(&mut entries);
-        let entry = entries.entry(token).or_insert_with(CancelEntry::new);
-        let notify = entry
-            .notify
-            .get_or_insert_with(|| Arc::new(Notify::new()))
-            .clone();
-        if entry.pre_cancelled {
+        // Snapshot (notify, was_precancelled) under the lock, then
+        // drop the guard before calling `notify_one`. Keeps the
+        // critical section to a HashMap lookup + Arc clone.
+        let (notify, was_precancelled) = {
+            let mut inner = self.entries.lock();
+            Self::maybe_gc(&mut inner);
+            let entry = inner.entries.entry(token).or_insert_with(CancelEntry::new);
+            let notify = entry
+                .notify
+                .get_or_insert_with(|| Arc::new(Notify::new()))
+                .clone();
+            let was_precancelled = entry.pre_cancelled;
+            // Once registered, the entry is no longer an orphan; the
+            // marked_at timestamp's only purpose was orphan-TTL GC.
+            entry.marked_at = None;
+            (notify, was_precancelled)
+        };
+        if was_precancelled {
             // CR-13: cancel arrived before register. Pre-arm the
             // permit so the first notified().await fires
-            // immediately. Don't clear pre_cancelled — leaving it
-            // set is idempotent (re-arm is a no-op) and a stale
-            // re-register would still observe the cancel.
+            // immediately. Calling outside the lock avoids holding
+            // the registry mutex across tokio internals.
             notify.notify_one();
         }
-        // Once registered, the entry is no longer an orphan; the
-        // marked_at timestamp's only purpose was orphan-TTL GC.
-        entry.marked_at = None;
         notify
     }
 
@@ -213,18 +256,29 @@ impl CancelRegistry {
         if token == 0 {
             return;
         }
-        let mut entries = self.entries.lock();
-        entries.remove(&token);
+        let mut inner = self.entries.lock();
+        inner.entries.remove(&token);
+    }
+
+    /// Rate-limited wrapper around [`Self::gc`]. Skips the O(N)
+    /// scan if it ran within the last [`GC_INTERVAL`] — the hot
+    /// path (`register_notify`) calls this on every register, so
+    /// without rate-limiting a burst of N concurrent calls would
+    /// pay O(N²) total scan cost.
+    fn maybe_gc(inner: &mut RegistryInner) {
+        let now = Instant::now();
+        if now.duration_since(inner.last_gc) < GC_INTERVAL {
+            return;
+        }
+        inner.last_gc = now;
+        Self::gc(&mut inner.entries);
     }
 
     /// Opportunistic eviction of orphan entries (cancel-only, no
-    /// live caller) older than [`ORPHAN_TTL`]. Called from
-    /// [`Self::cancel`] and [`Self::register_notify`] so the
-    /// registry self-prunes without a dedicated GC task.
-    ///
-    /// Entries with a registered [`Notify`] are kept regardless of
-    /// age — they represent a live caller awaiting (or about to
-    /// await) the cancel signal.
+    /// live caller) older than [`ORPHAN_TTL`]. Entries with a
+    /// registered [`Notify`] are kept regardless of age — they
+    /// represent a live caller awaiting (or about to await) the
+    /// cancel signal.
     fn gc(entries: &mut HashMap<u64, CancelEntry>) {
         let now = Instant::now();
         entries.retain(|_, entry| {
@@ -243,7 +297,7 @@ impl CancelRegistry {
     /// and orphan cancel-only entries that haven't aged out yet.
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.entries.lock().len()
+        self.entries.lock().entries.len()
     }
 }
 
@@ -348,5 +402,76 @@ mod tests {
         assert!(a >= 1, "tokens start at 1, not 0");
         assert!(b > a);
         assert!(c > b);
+    }
+
+    /// N1: `register_notify(0)` returns the same process-wide
+    /// `Arc<Notify>` on every call — no per-call allocation. The
+    /// returned Arc's strong-count grows with each clone instead
+    /// of starting fresh from 1. Pinned because the hot path's
+    /// allocator pressure is the whole motivation for the cache.
+    #[test]
+    fn zero_token_returns_shared_never_firing_notify() {
+        let reg = CancelRegistry::new();
+        let a = reg.register_notify(0);
+        let b = reg.register_notify(0);
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "both no-cancel registrations must hand back the same Arc<Notify>"
+        );
+        // The shared Arc is also the static one, so a third clone
+        // from never_firing_notify() matches.
+        let c = never_firing_notify();
+        assert!(Arc::ptr_eq(&a, &c));
+        // Zero-token registrations don't create registry entries.
+        assert_eq!(reg.len(), 0);
+    }
+
+    /// N2: `maybe_gc` skips the O(N) scan if it ran within
+    /// [`GC_INTERVAL`]. A burst of register_notify calls touches
+    /// `last_gc` exactly once, regardless of N. Pinned because
+    /// the per-call quadratic burst was the original bug.
+    #[test]
+    fn gc_rate_limited_across_burst() {
+        let reg = CancelRegistry::new();
+        // Stamp `last_gc` to "just now" so any burst inside the
+        // GC window must short-circuit.
+        {
+            let mut inner = reg.entries.lock();
+            inner.last_gc = Instant::now();
+        }
+        // Manually insert an orphan entry that would normally be
+        // collected by GC (ORPHAN_TTL = 120s; we stamp it as if it
+        // had aged out). If GC fires on the next register call,
+        // the entry vanishes.
+        let stale = next_token();
+        {
+            let mut inner = reg.entries.lock();
+            let entry = inner.entries.entry(stale).or_insert_with(CancelEntry::new);
+            entry.pre_cancelled = true;
+            entry.marked_at = Some(Instant::now() - (ORPHAN_TTL * 2));
+        }
+        // Trigger register_notify on a fresh token — should NOT
+        // evict the stale entry because GC is rate-limited.
+        let _ = reg.register_notify(next_token());
+        assert!(
+            reg.entries.lock().entries.contains_key(&stale),
+            "stale entry survives because gc is rate-limited"
+        );
+    }
+
+    /// N3: notify_one fires after the lock is released. Hard to
+    /// observe directly without instrumenting parking_lot, but we
+    /// can pin the contract by exercising the CR-13 pre-arm path
+    /// (which goes through the same code) and asserting it still
+    /// works.
+    #[tokio::test]
+    async fn pre_arm_works_with_lock_released_notify() {
+        let reg = CancelRegistry::new();
+        let token = reg.reserve_token();
+        reg.cancel(token);
+        let notify = reg.register_notify(token);
+        tokio::time::timeout(Duration::from_millis(100), notify.notified())
+            .await
+            .expect("pre-armed Notify fires even with lock-narrowed register");
     }
 }
