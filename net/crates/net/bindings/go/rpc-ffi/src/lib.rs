@@ -3112,7 +3112,7 @@ static OBSERVER_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// itself non-blocking (it just calls into Go which queues to a
 /// goroutine).
 struct GoRpcObserver {
-    sender: tokio::sync::mpsc::Sender<InnerRpcCallEvent>,
+    sender: tokio::sync::mpsc::Sender<Arc<InnerRpcCallEvent>>,
 }
 
 impl GoRpcObserver {
@@ -3120,9 +3120,14 @@ impl GoRpcObserver {
     /// the drain worker, return the wrapping observer. The
     /// runtime() helper provides the dedicated tokio runtime
     /// `net-rpc-ffi` already uses for its FFI bridge.
+    ///
+    /// N5: the channel carries `Arc<InnerRpcCallEvent>`, not the
+    /// converted `RpcCallEventC`. The substrate dispatch thread
+    /// pays only `Arc::clone` + try_send; the worker builds the
+    /// C POD lazily before invoking the Go-registered dispatcher.
     fn install() -> Self {
         let (sender, mut receiver) =
-            tokio::sync::mpsc::channel::<InnerRpcCallEvent>(OBSERVER_BUFFER_CAPACITY);
+            tokio::sync::mpsc::channel::<Arc<InnerRpcCallEvent>>(OBSERVER_BUFFER_CAPACITY);
         runtime().spawn(async move {
             while let Some(evt) = receiver.recv().await {
                 let dispatcher = match OBSERVER_DISPATCHER.get() {
@@ -3171,10 +3176,7 @@ impl GoRpcObserver {
 
 impl RpcObserver for GoRpcObserver {
     fn on_call(&self, evt: InnerRpcCallEvent) {
-        // try_send is non-blocking; full or closed → drop +
-        // counter increment. The substrate dispatch path pays
-        // only this atomic-counter increment on overflow.
-        if self.sender.try_send(evt).is_err() {
+        if self.sender.try_send(Arc::new(evt)).is_err() {
             OBSERVER_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -3881,7 +3883,8 @@ mod tests {
             RpcObserver,
         };
         let baseline = OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed);
-        let (sender, _recv) = tokio::sync::mpsc::channel::<InnerEvt>(OBSERVER_BUFFER_CAPACITY);
+        let (sender, _recv) =
+            tokio::sync::mpsc::channel::<Arc<InnerEvt>>(OBSERVER_BUFFER_CAPACITY);
         let obs = GoRpcObserver { sender };
         let make_event = || InnerEvt {
             caller: 1,

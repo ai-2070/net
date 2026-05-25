@@ -604,23 +604,31 @@ static OBSERVER_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 type RpcObserverTsfn = ThreadsafeFunction<RpcCallEventJs, (), RpcCallEventJs, napi::Status, false>;
 
 struct NodeRpcObserver {
-    sender: tokio::sync::mpsc::Sender<RpcCallEventJs>,
+    sender: tokio::sync::mpsc::Sender<Arc<InnerRpcCallEvent>>,
 }
 
 impl NodeRpcObserver {
     /// Install a new observer: build the bounded channel, spawn
     /// the drain worker, return the wrapping observer.
+    ///
+    /// N5: the channel carries `Arc<InnerRpcCallEvent>`, not the
+    /// converted `RpcCallEventJs`. On the substrate dispatch
+    /// thread, `on_call` only does `try_send(Arc::clone(&evt))` —
+    /// no string allocations, no BigInt boxing. The drain worker
+    /// builds the JS POD lazily, so dropped events cost just one
+    /// `Arc::clone` + atomic counter bump.
     fn install(tsfn: RpcObserverTsfn) -> Self {
         let (sender, mut receiver) =
-            tokio::sync::mpsc::channel::<RpcCallEventJs>(OBSERVER_BUFFER_CAPACITY);
+            tokio::sync::mpsc::channel::<Arc<InnerRpcCallEvent>>(OBSERVER_BUFFER_CAPACITY);
         tokio::spawn(async move {
             while let Some(evt) = receiver.recv().await {
+                let js_evt = RpcCallEventJs::from(evt.as_ref());
                 // NonBlocking on the TSFN side too — if the JS
                 // event loop is wedged AND the napi-rs queue is
                 // also full, we let napi-rs drop. Our own bounded
                 // buffer is the first line of defense; the TSFN
                 // overflow path is the last-ditch fallback.
-                let _ = tsfn.call(evt, ThreadsafeFunctionCallMode::NonBlocking);
+                let _ = tsfn.call(js_evt, ThreadsafeFunctionCallMode::NonBlocking);
             }
             // Sender dropped → channel closed → worker exits.
         });
@@ -630,12 +638,7 @@ impl NodeRpcObserver {
 
 impl RpcObserver for NodeRpcObserver {
     fn on_call(&self, evt: InnerRpcCallEvent) {
-        let js_evt = RpcCallEventJs::from(&evt);
-        // try_send is non-blocking; full or closed → drop +
-        // counter increment. Closed shouldn't happen in normal
-        // operation (we hold the sender until set_observer(None)
-        // or mesh drop), but it's harmless if it does.
-        if self.sender.try_send(js_evt).is_err() {
+        if self.sender.try_send(Arc::new(evt)).is_err() {
             OBSERVER_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -2198,8 +2201,9 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let baseline = OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed);
-        let (sender, _recv) =
-            tokio::sync::mpsc::channel::<RpcCallEventJs>(OBSERVER_BUFFER_CAPACITY);
+        let (sender, _recv) = tokio::sync::mpsc::channel::<Arc<InnerRpcCallEvent>>(
+            OBSERVER_BUFFER_CAPACITY,
+        );
         let obs = NodeRpcObserver { sender };
         let make_event = || InnerRpcCallEvent {
             caller: 1,

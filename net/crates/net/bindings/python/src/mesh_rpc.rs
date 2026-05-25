@@ -1653,23 +1653,25 @@ const OBSERVER_BUFFER_CAPACITY: usize = 1024;
 static OBSERVER_DROPPED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct PyRpcObserver {
-    sender: tokio::sync::mpsc::Sender<InnerRpcCallEvent>,
+    sender: tokio::sync::mpsc::Sender<Arc<InnerRpcCallEvent>>,
 }
 
 impl PyRpcObserver {
     /// Install a new observer: build the bounded channel, spawn
     /// the drain worker that acquires the GIL once per drained
     /// event and invokes the Python callable.
+    ///
+    /// N5: the channel carries `Arc<InnerRpcCallEvent>`, not the
+    /// converted `PyRpcCallEvent`. The substrate dispatch thread
+    /// pays only `Arc::clone` + try_send; the worker builds the
+    /// pyclass POD lazily under the GIL.
     fn install(callable: Py<PyAny>, runtime: Arc<Runtime>) -> Self {
         let (sender, mut receiver) =
-            tokio::sync::mpsc::channel::<InnerRpcCallEvent>(OBSERVER_BUFFER_CAPACITY);
+            tokio::sync::mpsc::channel::<Arc<InnerRpcCallEvent>>(OBSERVER_BUFFER_CAPACITY);
         runtime.spawn(async move {
             while let Some(evt) = receiver.recv().await {
-                // GIL acquisition off the substrate dispatch
-                // thread, serialized across events by the
-                // single-worker design.
                 Python::attach(|py| {
-                    let py_evt = match Py::new(py, PyRpcCallEvent::from(&evt)) {
+                    let py_evt = match Py::new(py, PyRpcCallEvent::from(evt.as_ref())) {
                         Ok(o) => o,
                         Err(_) => return,
                     };
@@ -1686,10 +1688,7 @@ impl PyRpcObserver {
 
 impl RpcObserver for PyRpcObserver {
     fn on_call(&self, evt: InnerRpcCallEvent) {
-        // try_send is non-blocking; full or closed → drop +
-        // counter increment. The substrate dispatch path pays
-        // only this atomic-counter increment on overflow.
-        if self.sender.try_send(evt).is_err() {
+        if self.sender.try_send(Arc::new(evt)).is_err() {
             OBSERVER_DROPPED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -2216,10 +2215,11 @@ mod tests {
             RpcDirection as InnerRpcDirection, RpcObserver,
         };
         use std::sync::atomic::Ordering;
+        use std::sync::Arc;
 
         let baseline = OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed);
         let (sender, _recv) =
-            tokio::sync::mpsc::channel::<InnerRpcCallEvent>(OBSERVER_BUFFER_CAPACITY);
+            tokio::sync::mpsc::channel::<Arc<InnerRpcCallEvent>>(OBSERVER_BUFFER_CAPACITY);
         let obs = PyRpcObserver { sender };
         let make_event = || InnerRpcCallEvent {
             caller: 1,
