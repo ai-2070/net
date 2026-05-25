@@ -1,0 +1,28 @@
+net/crates/net/bindings/node/mesh_rpc.ts
+  s_099fa7d871e34d::t_02f29c9ea75979 255-277,289,293
+  s_099fa7d871e34d::t_70f16576ef2a09 2057,2060,2063,2066
+net/crates/net/docs/plans/NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION.md
+  s_099fa7d871e34d::t_8da3da6eaa684d 348-431
+net/crates/net/bindings/python/python/net/mesh_rpc.py
+  s_099fa7d871e34d::t_f991581452625c 243-255,262,264,266,268
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  s_099fa7d871e34d::t_c6bd86c294c997 391-445
+  s_099fa7d871e34d::t_80c6063c641edc 1764,1766,1802,1804,1837,1839,1881,1883,1923,1925
+  s_099fa7d871e34d::t_f008c4ef57804a 1768-1770,1806-1808,1841-1843,1885-1887,1927-1929
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "71fc0bef1c24d8a9b48a4f6dda92534f025d67af",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
