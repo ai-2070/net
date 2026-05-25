@@ -1,0 +1,26 @@
+net/crates/net/bindings/python/python/net/__init__.py
+  s_099fa7d871e34d::t_01cc3ee483f680 117
+  s_099fa7d871e34d::t_e7cf46ca3aee93 138
+net/crates/net/bindings/python/src/lib.rs
+  s_099fa7d871e34d::t_f29b42d52fec39 2349
+net/crates/net/bindings/python/src/async_bridge.rs
+  s_099fa7d871e34d::t_781d728007dd78 132-165
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  s_099fa7d871e34d::t_50aa1f4aee7c2c 2187-2318
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "a9e8c6050a1368da194bde28bb84e3778a32b39d",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
