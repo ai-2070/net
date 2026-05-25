@@ -554,7 +554,9 @@ impl RpcMetricsSnapshotJs {
                 .iter()
                 .map(ServiceMetricsJs::from)
                 .collect(),
-            observer_dropped_total: BigInt::from(::net::adapter::net::cortex::observer_dropped_total()),
+            observer_dropped_total: BigInt::from(
+                ::net::adapter::net::cortex::observer_dropped_total(),
+            ),
         }
     }
 }
@@ -1861,13 +1863,11 @@ impl MeshRpc {
             Some(f) => {
                 let tsfn: RpcObserverTsfn = f.build_threadsafe_function().build()?;
                 let handle = tokio::runtime::Handle::current();
-                let channel = ::net::adapter::net::cortex::ObserverChannel::install(
-                    &handle,
-                    move |evt| {
+                let channel =
+                    ::net::adapter::net::cortex::ObserverChannel::install(&handle, move |evt| {
                         let js_evt = RpcCallEventJs::from(evt.as_ref());
                         let _ = tsfn.call(js_evt, ThreadsafeFunctionCallMode::NonBlocking);
-                    },
-                );
+                    });
                 let obs: Arc<dyn RpcObserver> = Arc::new(channel);
                 self.node.set_rpc_observer(Some(obs));
             }
@@ -2114,5 +2114,4 @@ mod tests {
             );
         }
     }
-
 }

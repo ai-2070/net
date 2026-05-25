@@ -428,12 +428,8 @@ fn check_cancel_keys_exclusive<'py>(opts: Option<&Bound<'py, PyDict>>) -> PyResu
     let Some(d) = opts else {
         return Ok(());
     };
-    let has_cancel = d
-        .get_item("cancel")?
-        .is_some_and(|v| !v.is_none());
-    let has_token = d
-        .get_item("cancel_token")?
-        .is_some_and(|v| !v.is_none());
+    let has_cancel = d.get_item("cancel")?.is_some_and(|v| !v.is_none());
+    let has_token = d.get_item("cancel_token")?.is_some_and(|v| !v.is_none());
     if has_cancel && has_token {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "opts['cancel'] and opts['cancel_token'] are mutually exclusive; \
@@ -2052,21 +2048,18 @@ impl PyMeshRpc {
                     ));
                 }
                 let handle = self.runtime.handle().clone();
-                let channel = ::net::adapter::net::cortex::ObserverChannel::install(
-                    &handle,
-                    move |evt| {
+                let channel =
+                    ::net::adapter::net::cortex::ObserverChannel::install(&handle, move |evt| {
                         Python::attach(|py| {
-                            let py_evt =
-                                match Py::new(py, PyRpcCallEvent::from(evt.as_ref())) {
-                                    Ok(o) => o,
-                                    Err(_) => return,
-                                };
+                            let py_evt = match Py::new(py, PyRpcCallEvent::from(evt.as_ref())) {
+                                Ok(o) => o,
+                                Err(_) => return,
+                            };
                             // Ignore exceptions — observers can't
                             // influence the in-flight call.
                             let _ = callable.call1(py, (py_evt,));
                         });
-                    },
-                );
+                    });
                 let obs: Arc<dyn RpcObserver> = Arc::new(channel);
                 self.node.set_rpc_observer(Some(obs));
             }
@@ -2227,5 +2220,4 @@ mod tests {
             );
         }
     }
-
 }
