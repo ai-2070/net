@@ -1,0 +1,21 @@
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  s_099fa7d871e34d::t_f5f77b72b1bcb5 2417-2423,2436-2437
+  s_099fa7d871e34d::t_60a1c46112bf84 694-874
+  s_099fa7d871e34d::t_839db59a155356 2488-2585
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "e8bd185fc68af9dd0a9c8606e043abb75add444a",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
