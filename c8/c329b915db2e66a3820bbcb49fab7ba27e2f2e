@@ -1,0 +1,25 @@
+net/crates/net/bindings/python/tests/test_async_interop.py
+  s_099fa7d871e34d::t_fc7a37bd02efc7 165-167
+  s_099fa7d871e34d::t_4af95c9c3e8ddc 106
+  s_099fa7d871e34d::t_0ab6617a30c0e3 292-298
+  s_099fa7d871e34d::t_88bb4b8d51e282 123
+  s_099fa7d871e34d::t_3cc45a672d48bf 62-98
+  s_099fa7d871e34d::t_27b930f607781c 142-144
+  s_099fa7d871e34d::t_ec4446b7b29c10 226-230
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "c8c329b915db2e66a3820bbcb49fab7ba27e2f2e",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
