@@ -4,6 +4,7 @@
 
 #[cfg(feature = "aggregator")]
 mod aggregator;
+mod async_bridge;
 #[cfg(feature = "dataforts")]
 mod blob;
 mod capability_aggregation;
@@ -2274,6 +2275,16 @@ mod mesh_bindings {
 /// Net Python module.
 #[pymodule]
 fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Initialize the tokio↔asyncio bridge once per process. Every
+    // `Async*` class landing in waves T1+ spawns Python awaitables
+    // via `pyo3_async_runtimes::tokio::future_into_py`, which
+    // requires the bridge to be initialized first. Sync bindings
+    // (`Net`, `MeshRpc`, etc.) keep their per-instance runtimes
+    // for now; T1+ slices may migrate to share the bridge runtime.
+    async_bridge::init()
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "async bridge init: {e}"
+        )))?;
     m.add_class::<Net>()?;
     m.add_class::<IngestResult>()?;
     m.add_class::<StoredEvent>()?;
