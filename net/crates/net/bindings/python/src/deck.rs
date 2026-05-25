@@ -1875,6 +1875,383 @@ impl PyAdminVerifier {
 }
 
 // =========================================================================
+// AsyncDeckClient + AsyncAdminCommands — T3-G1 + T3-G3.
+//
+// Async sibling of DeckClient wraps the same Arc<CoreClient>. close()
+// becomes awaitable; getters (identity, status, status_summary) stay
+// sync; .admin returns AsyncAdminCommands with awaitable
+// drain / enter_maintenance / etc.; .snapshots and
+// .status_summary_stream return async-iter siblings directly.
+//
+// AsyncIceCommands is deferred — the IceProposal typestate
+// (proposal → simulate → commit) needs awaitable mirrors of
+// PyIceProposal + PySimulatedIceProposal, which is more surface
+// than fits this slice.
+// =========================================================================
+
+/// Newtype around a `ChainCommit` so an awaitable can resolve to
+/// the same `PyDict` shape the sync admin methods return.
+struct AsyncChainCommitWrap(CoreChainCommit);
+
+impl<'py> pyo3::IntoPyObject<'py> for AsyncChainCommitWrap {
+    type Target = pyo3::types::PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        Ok(chain_commit_to_dict(py, &self.0)?.into_any())
+    }
+}
+
+/// Async sibling of [`PyAdminCommands`]. Wraps the same
+/// `Arc<CoreClient>`; each method commits an `AdminEvent` and
+/// returns an awaitable resolving to the same chain-commit dict
+/// shape as the sync sibling.
+///
+/// Sync equivalent: :class:`AdminCommands`.
+#[pyclass(name = "AsyncAdminCommands", module = "net._net")]
+pub struct PyAsyncAdminCommands {
+    client: Arc<CoreClient>,
+}
+
+impl PyAsyncAdminCommands {
+    fn admin(&self) -> CoreAdminCommands<'_> {
+        self.client.admin()
+    }
+}
+
+#[pymethods]
+impl PyAsyncAdminCommands {
+    fn drain<'py>(
+        &self,
+        py: Python<'py>,
+        node: u64,
+        drain_for_ms: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.client.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let commit = client
+                .admin()
+                .drain(node, Duration::from_millis(drain_for_ms))
+                .await
+                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
+            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
+        })
+    }
+
+    #[pyo3(signature = (node, drain_for_ms=None))]
+    fn enter_maintenance<'py>(
+        &self,
+        py: Python<'py>,
+        node: u64,
+        drain_for_ms: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let drain_for = drain_for_ms.map(Duration::from_millis);
+        let client = self.client.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let commit = client
+                .admin()
+                .enter_maintenance(node, drain_for)
+                .await
+                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
+            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
+        })
+    }
+
+    fn exit_maintenance<'py>(
+        &self,
+        py: Python<'py>,
+        node: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.client.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let commit = client
+                .admin()
+                .exit_maintenance(node)
+                .await
+                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
+            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
+        })
+    }
+
+    fn cordon<'py>(&self, py: Python<'py>, node: u64) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.client.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let commit = client
+                .admin()
+                .cordon(node)
+                .await
+                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
+            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
+        })
+    }
+
+    fn uncordon<'py>(&self, py: Python<'py>, node: u64) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.client.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let commit = client
+                .admin()
+                .uncordon(node)
+                .await
+                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
+            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
+        })
+    }
+
+    fn drop_replicas<'py>(
+        &self,
+        py: Python<'py>,
+        node: u64,
+        chains: Vec<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let chains: Vec<CoreChainId> = chains.into_iter().collect();
+        let client = self.client.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let commit = client
+                .admin()
+                .drop_replicas(node, chains)
+                .await
+                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
+            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
+        })
+    }
+
+    fn invalidate_placement<'py>(
+        &self,
+        py: Python<'py>,
+        node: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.client.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let commit = client
+                .admin()
+                .invalidate_placement(node)
+                .await
+                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
+            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
+        })
+    }
+
+    fn restart_all_daemons<'py>(
+        &self,
+        py: Python<'py>,
+        node: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.client.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let commit = client
+                .admin()
+                .restart_all_daemons(node)
+                .await
+                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
+            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
+        })
+    }
+
+    fn clear_avoid_list<'py>(
+        &self,
+        py: Python<'py>,
+        node: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.client.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let commit = client
+                .admin()
+                .clear_avoid_list(node)
+                .await
+                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
+            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
+        })
+    }
+
+    // Suppress dead-code on the helper accessor — used implicitly
+    // by the awaitable bodies above, which use `client.admin()`
+    // directly. Kept for parity with PyAdminCommands::admin so the
+    // two surfaces are visually aligned.
+    #[allow(dead_code)]
+    fn _admin_helper(&self) {
+        let _ = self.admin();
+    }
+}
+
+/// Async sibling of [`PyDeckClient`]. Wraps the same
+/// `Arc<CoreClient>`; close becomes awaitable, getters stay sync,
+/// and `.admin` returns `AsyncAdminCommands`.
+///
+/// Sync equivalent: :class:`DeckClient`.
+#[pyclass(name = "AsyncDeckClient", module = "net._net")]
+pub struct PyAsyncDeckClient {
+    client: Arc<CoreClient>,
+    runtime: Arc<Runtime>,
+    /// Owned SDK is held jointly with the sync sibling — only one
+    /// shape should call `close()`. If the sync sibling is built
+    /// first and the async wraps it, the sync's `Drop` drains the
+    /// SDK on GC. If only the async exists, it owns the SDK.
+    owned_sdk: parking_lot::Mutex<Option<CoreSdk>>,
+}
+
+impl Drop for PyAsyncDeckClient {
+    fn drop(&mut self) {
+        let Some(sdk) = self.owned_sdk.lock().take() else {
+            return;
+        };
+        let runtime = self.runtime.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = runtime.block_on(sdk.shutdown());
+        }));
+    }
+}
+
+#[pymethods]
+impl PyAsyncDeckClient {
+    /// Build against an existing sync `DeckClient`. Cheap
+    /// (`Arc::clone`); the sync sibling retains ownership of the
+    /// SDK (close on the sync sibling drains it).
+    #[new]
+    fn new(client: &PyDeckClient) -> Self {
+        Self {
+            client: client.client.clone(),
+            runtime: client.runtime.clone(),
+            owned_sdk: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Construct a standalone async deck client owning its own
+    /// supervisor. Mirrors `DeckClient.__new__`.
+    #[staticmethod]
+    #[pyo3(signature = (operator_seed, meshos_config=None, deck_config=None))]
+    fn from_seed(
+        py: Python<'_>,
+        operator_seed: &Bound<'_, PyBytes>,
+        meshos_config: Option<&Bound<'_, PyDict>>,
+        deck_config: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
+        let seed_bytes = operator_seed.as_bytes();
+        if seed_bytes.len() != 32 {
+            return Err(deck_err(
+                py,
+                "invalid_argument",
+                &format!(
+                    "operator_seed must be exactly 32 bytes; got {}",
+                    seed_bytes.len()
+                ),
+            ));
+        }
+        let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+        seed.copy_from_slice(seed_bytes);
+        let keypair = EntityKeypair::from_bytes(*seed);
+        let identity = CoreIdentity::from_keypair(keypair);
+
+        let sdk_cfg = crate::meshos::meshos_config_from_dict(py, meshos_config)?;
+        let deck_cfg = config_from_dict(py, deck_config)?;
+
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    deck_err(
+                        py,
+                        "runtime_start_failed",
+                        &format!("failed to build tokio runtime: {e}"),
+                    )
+                })?,
+        );
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let sdk = {
+            let _enter = runtime.enter();
+            CoreSdk::start(sdk_cfg, dispatcher)
+        };
+        let core_client = CoreClient::new(
+            sdk.runtime().handle_clone(),
+            sdk.runtime().snapshot_reader().clone(),
+            identity,
+            deck_cfg,
+        );
+        Ok(Self {
+            client: Arc::new(core_client),
+            runtime,
+            owned_sdk: parking_lot::Mutex::new(Some(sdk)),
+        })
+    }
+
+    fn identity(&self) -> PyOperatorIdentity {
+        PyOperatorIdentity {
+            inner: self.client.identity().clone(),
+        }
+    }
+
+    /// One-shot read of the latest `MeshOsSnapshot` (JSON string).
+    /// Sync — local snapshot reader.
+    fn status(&self, py: Python<'_>) -> PyResult<String> {
+        let snap = self.client.status();
+        snapshot_to_json(py, &snap)
+    }
+
+    /// One-shot read of the rolled-up `StatusSummary`. Sync.
+    fn status_summary<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let s = self.client.status_summary();
+        status_summary_to_dict(py, &s)
+    }
+
+    /// Live snapshot stream — returns an `AsyncSnapshotStream`
+    /// ready for ``async for``.
+    fn snapshots(&self) -> PyAsyncSnapshotStream {
+        let _enter = self.runtime.enter();
+        let stream = self.client.snapshots();
+        PyAsyncSnapshotStream {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(stream))),
+        }
+    }
+
+    /// Live `StatusSummary` async stream.
+    fn status_summary_stream(&self) -> PyAsyncStatusSummaryStream {
+        let _enter = self.runtime.enter();
+        let stream = self.client.status_summary_stream();
+        PyAsyncStatusSummaryStream {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(stream))),
+        }
+    }
+
+    #[getter]
+    fn admin(&self) -> PyAsyncAdminCommands {
+        PyAsyncAdminCommands {
+            client: self.client.clone(),
+        }
+    }
+
+    /// Tear down the private supervisor runtime if this client
+    /// owns one (constructed via `from_seed`). Returns an
+    /// awaitable. No-op for clients built against an existing
+    /// `DeckClient` (the sync sibling owns the SDK).
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let Some(sdk) = self.owned_sdk.lock().take() else {
+            return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                Ok::<(), PyErr>(())
+            });
+        };
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            sdk.shutdown().await.map_err(|e| {
+                Python::attach(|py| {
+                    deck_err(
+                        py,
+                        "shutdown_failed",
+                        &format!("runtime shutdown failed: {e:?}"),
+                    )
+                })
+            })?;
+            Ok::<(), PyErr>(())
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "AsyncDeckClient(operator_id={:#x})",
+            self.client.identity().operator_id()
+        )
+    }
+}
+
+// =========================================================================
 // AsyncSnapshotStream + AsyncStatusSummaryStream — T3-G2.
 //
 // PEP 525 async iterators over the existing CoreSnapshotStream /

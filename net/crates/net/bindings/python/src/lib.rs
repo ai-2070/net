@@ -3033,6 +3033,8 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<deck::PyStatusSummaryStream>()?;
         m.add_class::<deck::PyAsyncSnapshotStream>()?;
         m.add_class::<deck::PyAsyncStatusSummaryStream>()?;
+        m.add_class::<deck::PyAsyncDeckClient>()?;
+        m.add_class::<deck::PyAsyncAdminCommands>()?;
         m.add_class::<deck::PyOperatorIdentity>()?;
         m.add_class::<deck::PyLogStream>()?;
         m.add_class::<deck::PyFailureStream>()?;

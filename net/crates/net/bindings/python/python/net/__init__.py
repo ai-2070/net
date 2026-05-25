@@ -503,6 +503,27 @@ else:
     except ImportError:  # pragma: no cover
         pass
 
+    # Async deck client + admin commands (T3-G1 + T3-G3). Try-import
+    # so wheels built before the slice landed still load.
+    try:
+        from ._net import (
+            AsyncAdminCommands as _DeckAsyncAdminCommands,
+        )
+        from ._net import (
+            AsyncDeckClient as _DeckAsyncClient,
+        )
+
+        AsyncDeckClient = _DeckAsyncClient
+        DeckAsyncAdminCommands = _DeckAsyncAdminCommands
+        __all__.extend(
+            [
+                "AsyncDeckClient",
+                "DeckAsyncAdminCommands",
+            ]
+        )
+    except ImportError:  # pragma: no cover
+        pass
+
     # Slice 3 — ICE break-glass surface. Try-import so wheels
     # built before slice 3 still load.
     try:
