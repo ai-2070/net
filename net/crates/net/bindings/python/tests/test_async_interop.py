@@ -66,6 +66,10 @@ async def _async_echo(req: bytes) -> bytes:
 # `RpcNoRouteError: membership request rejected: UnknownChannel`.
 # Production callers retry; tests use the same pattern so we don't
 # bake in a flaky fixed sleep.
+_RETRY_INTERVAL_S = 0.3  # > heartbeat (200 ms); keeps the per-peer
+# auth-failure budget (default 16/min) safe across the 3 s window.
+
+
 def _call_until_routed(cli, target, service, body, timeout_s=3.0):
     import time
 
@@ -78,7 +82,7 @@ def _call_until_routed(cli, target, service, body, timeout_s=3.0):
         except RpcNoRouteError:
             if time.time() >= deadline:
                 raise
-            time.sleep(0.05)
+            time.sleep(_RETRY_INTERVAL_S)
 
 
 async def _acall_until_routed(acli, target, service, body, timeout_s=3.0):
@@ -93,7 +97,7 @@ async def _acall_until_routed(acli, target, service, body, timeout_s=3.0):
         except RpcNoRouteError:
             if _time.time() >= deadline:
                 raise
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(_RETRY_INTERVAL_S)
 
 
 def test_sync_caller_sync_server_unary(mesh_pair) -> None:

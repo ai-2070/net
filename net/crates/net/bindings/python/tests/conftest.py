@@ -66,8 +66,12 @@ def mesh_pair(next_port):
 
     a_addr = next_port()
     b_addr = next_port()
-    a = NetMesh(bind_addr=a_addr, psk=PSK)
-    b = NetMesh(bind_addr=b_addr, psk=PSK)
+    # 200 ms heartbeat — matches the Rust integration tests'
+    # `with_heartbeat_interval`. The default (5 s) is fine for
+    # production but makes short tests race on every gossip-bound
+    # state-sync (channel membership, cap-index, etc.).
+    a = NetMesh(bind_addr=a_addr, psk=PSK, heartbeat_interval_ms=200)
+    b = NetMesh(bind_addr=b_addr, psk=PSK, heartbeat_interval_ms=200)
 
     errors: list[Exception] = []
 
