@@ -1124,13 +1124,36 @@ impl PyAsyncRedexTailIter {
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // P1: when the wrapper future is dropped (asyncio
+            // task-cancel mid-await), trip shutdown so any sibling
+            // pull on the same iterator exits cleanly. Disarmed on
+            // normal resolution.
+            struct AnextCancelGuard {
+                inner: Arc<RedexTailIterInner>,
+                armed: bool,
+            }
+            impl Drop for AnextCancelGuard {
+                fn drop(&mut self) {
+                    if self.armed {
+                        self.inner.is_shutdown.store(true, Ordering::Release);
+                        self.inner.shutdown.notify_waiters();
+                    }
+                }
+            }
+            let mut anext_guard = AnextCancelGuard {
+                inner: inner.clone(),
+                armed: true,
+            };
+
             if inner.is_shutdown.load(Ordering::Acquire) {
+                anext_guard.armed = false;
                 return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
             }
             let mut guard = inner.stream.lock().await;
             let stream = match guard.as_mut() {
                 Some(s) => s,
                 None => {
+                    anext_guard.armed = false;
                     return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
                 }
             };
@@ -1141,6 +1164,7 @@ impl PyAsyncRedexTailIter {
 
             if inner.is_shutdown.load(Ordering::Acquire) {
                 *guard = None;
+                anext_guard.armed = false;
                 return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
             }
 
@@ -1167,6 +1191,7 @@ impl PyAsyncRedexTailIter {
                 }
             };
             drop(guard);
+            anext_guard.armed = false;
             match outcome {
                 TailNext::Event(ev) => Ok(PyRedexEvent::from(ev)),
                 TailNext::Error(msg) => Err(RedexError::new_err(format!("tail: {}", msg))),
@@ -2838,13 +2863,34 @@ impl PyAsyncMemoryWatchIter {
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // P1: trip shutdown on wrapper-future drop (asyncio
+            // task-cancel mid-await). Disarmed on normal resolution.
+            struct AnextCancelGuard {
+                inner: Arc<MemoryWatchIterInner>,
+                armed: bool,
+            }
+            impl Drop for AnextCancelGuard {
+                fn drop(&mut self) {
+                    if self.armed {
+                        self.inner.is_shutdown.store(true, Ordering::Release);
+                        self.inner.shutdown.notify_waiters();
+                    }
+                }
+            }
+            let mut anext_guard = AnextCancelGuard {
+                inner: inner.clone(),
+                armed: true,
+            };
+
             if inner.is_shutdown.load(Ordering::Acquire) {
+                anext_guard.armed = false;
                 return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
             }
             let mut guard = inner.stream.lock().await;
             let stream = match guard.as_mut() {
                 Some(s) => s,
                 None => {
+                    anext_guard.armed = false;
                     return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
                 }
             };
@@ -2854,6 +2900,7 @@ impl PyAsyncMemoryWatchIter {
 
             if inner.is_shutdown.load(Ordering::Acquire) {
                 *guard = None;
+                anext_guard.armed = false;
                 return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
             }
             let next = tokio::select! {
@@ -2871,6 +2918,7 @@ impl PyAsyncMemoryWatchIter {
                 }
             };
             drop(guard);
+            anext_guard.armed = false;
             match next {
                 Some(items) => {
                     let mapped: Vec<PyMemory> = items.into_iter().map(PyMemory::from).collect();
@@ -3180,13 +3228,34 @@ impl PyAsyncTaskWatchIter {
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // P1: trip shutdown on wrapper-future drop (asyncio
+            // task-cancel mid-await). Disarmed on normal resolution.
+            struct AnextCancelGuard {
+                inner: Arc<TaskWatchIterInner>,
+                armed: bool,
+            }
+            impl Drop for AnextCancelGuard {
+                fn drop(&mut self) {
+                    if self.armed {
+                        self.inner.is_shutdown.store(true, Ordering::Release);
+                        self.inner.shutdown.notify_waiters();
+                    }
+                }
+            }
+            let mut anext_guard = AnextCancelGuard {
+                inner: inner.clone(),
+                armed: true,
+            };
+
             if inner.is_shutdown.load(Ordering::Acquire) {
+                anext_guard.armed = false;
                 return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
             }
             let mut guard = inner.stream.lock().await;
             let stream = match guard.as_mut() {
                 Some(s) => s,
                 None => {
+                    anext_guard.armed = false;
                     return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
                 }
             };
@@ -3196,6 +3265,7 @@ impl PyAsyncTaskWatchIter {
 
             if inner.is_shutdown.load(Ordering::Acquire) {
                 *guard = None;
+                anext_guard.armed = false;
                 return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
             }
             let next = tokio::select! {
@@ -3213,6 +3283,7 @@ impl PyAsyncTaskWatchIter {
                 }
             };
             drop(guard);
+            anext_guard.armed = false;
             match next {
                 Some(items) => {
                     let mapped: Vec<PyTask> = items.into_iter().map(PyTask::from).collect();
