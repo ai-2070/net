@@ -111,9 +111,7 @@ static DISPATCHER_LOOP: OnceLock<pyo3::Py<pyo3::PyAny>> = OnceLock::new();
 /// runs `asyncio.run_forever()` on a fresh event loop.
 #[cfg(feature = "net")]
 #[allow(dead_code)] // Consumed by mesh_rpc.rs async-handler bridges.
-pub fn dispatcher_locals(
-    py: Python<'_>,
-) -> PyResult<pyo3_async_runtimes::TaskLocals> {
+pub fn dispatcher_locals(py: Python<'_>) -> PyResult<pyo3_async_runtimes::TaskLocals> {
     if let Some(loop_) = DISPATCHER_LOOP.get() {
         return Ok(pyo3_async_runtimes::TaskLocals::new(loop_.bind(py).clone()));
     }
@@ -139,18 +137,20 @@ threading.Thread(
         Some(&globals),
         None,
     )?;
-    let loop_bound = globals
-        .get_item("_loop")?
-        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+    let loop_bound = globals.get_item("_loop")?.ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(
             "dispatcher_locals: _loop not captured by bootstrap script",
-        ))?;
+        )
+    })?;
     let loop_obj: pyo3::Py<pyo3::PyAny> = loop_bound.clone().unbind();
     // OnceLock::set is fallible on race; if a sibling thread won,
     // discard ours (its loop is fine too — both run forever and
     // dispatch coroutines the same way).
     let _ = DISPATCHER_LOOP.set(loop_obj);
     let stored = DISPATCHER_LOOP.get().expect("just set");
-    Ok(pyo3_async_runtimes::TaskLocals::new(stored.bind(py).clone()))
+    Ok(pyo3_async_runtimes::TaskLocals::new(
+        stored.bind(py).clone(),
+    ))
 }
 
 // ============================================================================

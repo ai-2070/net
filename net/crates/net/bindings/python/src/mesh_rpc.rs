@@ -667,10 +667,7 @@ impl RpcHandler for PyAsyncRpcHandler {
             let req_bytes = PyBytes::new(py, &req_body);
             let args = PyTuple::new(py, [req_bytes.into_any()])?;
             let coro = callable.call1(py, args)?;
-            pyo3_async_runtimes::into_future_with_locals(
-                &locals,
-                coro.into_bound(py),
-            )
+            pyo3_async_runtimes::into_future_with_locals(&locals, coro.into_bound(py))
         });
         let fut = match fut_result {
             Ok(f) => f,
@@ -758,10 +755,7 @@ impl RpcClientStreamingHandler for PyAsyncRpcClientStreamingHandler {
             let locals = crate::async_bridge::dispatcher_locals(py)?;
             let args = PyTuple::new(py, [stream_obj.into_any()])?;
             let coro = callable.call1(py, args)?;
-            pyo3_async_runtimes::into_future_with_locals(
-                &locals,
-                coro.into_bound(py),
-            )
+            pyo3_async_runtimes::into_future_with_locals(&locals, coro.into_bound(py))
         });
         let fut = match fut_result {
             Ok(f) => f,
@@ -837,10 +831,7 @@ impl RpcDuplexHandler for PyAsyncRpcDuplexHandler {
             let locals = crate::async_bridge::dispatcher_locals(py)?;
             let args = PyTuple::new(py, [stream_obj.into_any(), sink_obj.into_any()])?;
             let coro = callable.call1(py, args)?;
-            pyo3_async_runtimes::into_future_with_locals(
-                &locals,
-                coro.into_bound(py),
-            )
+            pyo3_async_runtimes::into_future_with_locals(&locals, coro.into_bound(py))
         });
         let fut = match fut_result {
             Ok(f) => f,
