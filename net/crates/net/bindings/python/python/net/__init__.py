@@ -164,6 +164,8 @@ else:
 # module was built with the `net` feature.
 try:
     from ._net import (
+        AsyncNetMesh,
+        AsyncNetStream,
         BackpressureError,
         ChannelAuthError,
         ChannelError,
@@ -180,6 +182,8 @@ except ImportError:
 else:
     __all__.extend(
         [
+            "AsyncNetMesh",
+            "AsyncNetStream",
             "BackpressureError",
             "ChannelAuthError",
             "ChannelError",
