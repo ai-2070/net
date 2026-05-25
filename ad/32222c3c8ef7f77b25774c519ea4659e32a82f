@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_24_PYTHON_ASYNC_SDK.md
+  s_1481a1b87a9b66::t_e0f31698afb4f5 1-347
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "ad32222c3c8ef7f77b25774c519ea4659e32a82f",
+  "prompts": {},
+  "sessions": {
+    "s_1481a1b87a9b66": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b6b7d116-fc00-4178-aba1-c133ae7ca379",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
