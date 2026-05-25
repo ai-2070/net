@@ -213,18 +213,13 @@ impl Drop for CancelGuard {
 // ============================================================================
 
 #[allow(dead_code)] // Consumed by aggregator / blob / cortex / deck / meshos.
-pub fn await_substrate<'py, F, T, E>(
-    py: Python<'py>,
-    fut: F,
-) -> PyResult<Bound<'py, PyAny>>
+pub fn await_substrate<'py, F, T, E>(py: Python<'py>, fut: F) -> PyResult<Bound<'py, PyAny>>
 where
     F: std::future::Future<Output = Result<T, E>> + Send + 'static,
     T: for<'p> pyo3::IntoPyObject<'p> + Send + 'static,
     E: Into<PyErr> + Send + 'static,
 {
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        fut.await.map_err(Into::into)
-    })
+    pyo3_async_runtimes::tokio::future_into_py(py, async move { fut.await.map_err(Into::into) })
 }
 
 // ============================================================================

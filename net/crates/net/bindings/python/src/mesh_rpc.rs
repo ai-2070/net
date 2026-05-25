@@ -45,8 +45,8 @@
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex as TokioMutex;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex as TokioMutex;
 
 use bytes::Bytes;
 use futures::StreamExt;
