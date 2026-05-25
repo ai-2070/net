@@ -23,6 +23,8 @@ use tokio::runtime::Runtime;
 use ::net::adapter::net::MeshNode;
 #[cfg(feature = "net")]
 use pyo3::prelude::*;
+#[cfg(feature = "net")]
+use pyo3::types::PyBytes;
 
 /// Process-global tokio runtime shared between sync `block_on`
 /// call sites (the existing pyo3 bindings) and async
@@ -180,6 +182,93 @@ impl Drop for CancelGuard {
     fn drop(&mut self) {
         if self.armed {
             self.mesh.cancel(self.token);
+        }
+    }
+}
+
+// ============================================================================
+// BytesReply — zero-extra-copy reply value for awaitables.
+//
+// Async substrate calls return `bytes::Bytes` payloads. The naive path
+// `.map(|reply| reply.body.to_vec())` heap-allocates a `Vec<u8>`,
+// memcpys into it, then `IntoPyObject` allocates a `PyBytes` and
+// memcpys again — 2× the work of the sync path's single
+// `PyBytes::new(py, body.as_ref())`.
+//
+// `BytesReply` wraps the substrate `Bytes` directly. Its
+// `IntoPyObject` impl runs on the awaitable's resume step (GIL is
+// held there) and produces a `PyBytes` with one memcpy from the
+// `Bytes`'s underlying slice — same cost as the sync path.
+// ============================================================================
+
+#[cfg(feature = "net")]
+#[allow(dead_code)] // Consumed by mesh_rpc.rs async call paths.
+pub struct BytesReply(pub bytes::Bytes);
+
+#[cfg(feature = "net")]
+impl<'py> pyo3::IntoPyObject<'py> for BytesReply {
+    type Target = PyBytes;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        Ok(PyBytes::new(py, self.0.as_ref()))
+    }
+}
+
+// ============================================================================
+// await_with_notify — cancel-bridge for non-mesh subsystems.
+//
+// Mesh-substrate calls go through `await_with_cancel` /
+// `await_with_existing_token`, which use the v3 `Mesh::cancel(token)`
+// path. Subsystems that don't reach the mesh (raw `Redex` tail,
+// `MemoriesAdapter` fold watch, etc.) still benefit from
+// asyncio-task-cancel propagation — but they need a generic
+// `Arc<Notify>` instead of a substrate cancel-token, because dropping
+// the awaitable should trip a notify the inner future watches.
+//
+// Pattern: caller passes a `shutdown: Arc<Notify>` that the inner
+// future selects against. Asyncio task-cancel → tokio task drop →
+// our wrapper future drops → `NotifyGuard::drop` fires
+// `shutdown.notify_waiters()`, letting the inner future exit cleanly.
+// ============================================================================
+
+#[allow(dead_code)] // Watch-iter async siblings consume this.
+pub fn await_with_notify<'py, F, T, E>(
+    py: Python<'py>,
+    shutdown: std::sync::Arc<tokio::sync::Notify>,
+    fut: F,
+) -> PyResult<pyo3::Bound<'py, pyo3::PyAny>>
+where
+    F: std::future::Future<Output = Result<T, E>> + Send + 'static,
+    T: for<'p> pyo3::IntoPyObject<'p> + Send + 'static,
+    E: Into<pyo3::PyErr> + Send + 'static,
+{
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let mut guard = NotifyGuard {
+            notify: shutdown,
+            armed: true,
+        };
+        let result = fut.await;
+        guard.armed = false;
+        result.map_err(Into::into)
+    })
+}
+
+/// RAII sibling of [`CancelGuard`] that trips a `tokio::sync::Notify`
+/// on drop when armed. Awaitables that resolve normally disarm the
+/// guard; asyncio-task-cancel drops the wrapper future with the
+/// guard still armed, firing `notify_waiters()` so the inner
+/// `select!` exits.
+#[allow(dead_code)] // Constructed by await_with_notify.
+struct NotifyGuard {
+    notify: std::sync::Arc<tokio::sync::Notify>,
+    armed: bool,
+}
+
+impl Drop for NotifyGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.notify.notify_waiters();
         }
     }
 }

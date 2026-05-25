@@ -2607,7 +2607,7 @@ impl PyAsyncMeshRpc {
             async move {
                 node.call(target_node_id, &service, req_bytes, inner_opts)
                     .await
-                    .map(|reply| reply.body.to_vec())
+                    .map(|reply| crate::async_bridge::BytesReply(reply.body))
                     .map_err(rpc_error_to_pyerr)
             }
         })
@@ -2633,7 +2633,7 @@ impl PyAsyncMeshRpc {
             async move {
                 node.call_service(&service, req_bytes, inner_opts)
                     .await
-                    .map(|reply| reply.body.to_vec())
+                    .map(|reply| crate::async_bridge::BytesReply(reply.body))
                     .map_err(rpc_error_to_pyerr)
             }
         })
@@ -2807,7 +2807,9 @@ impl PyAsyncRpcStream {
                 Some(Ok(bytes)) => {
                     // Put the stream back for the next pull.
                     *inner.lock() = Some(stream);
-                    Ok::<Vec<u8>, PyErr>(bytes.to_vec())
+                    Ok::<crate::async_bridge::BytesReply, PyErr>(
+                        crate::async_bridge::BytesReply(bytes),
+                    )
                 }
                 Some(Err(e)) => {
                     drop(stream);
@@ -2917,7 +2919,9 @@ impl PyAsyncClientStreamCall {
                 None => return Err(RpcError::new_err("client-stream call already closed")),
             };
             let reply = call.finish().await.map_err(rpc_error_to_pyerr)?;
-            Ok::<Vec<u8>, PyErr>(reply.body.to_vec())
+            Ok::<crate::async_bridge::BytesReply, PyErr>(crate::async_bridge::BytesReply(
+                reply.body,
+            ))
         })
     }
 
@@ -3035,7 +3039,9 @@ impl PyAsyncDuplexCall {
             match next {
                 Some(Ok(bytes)) => {
                     *inner.lock() = Some(call);
-                    Ok::<Vec<u8>, PyErr>(bytes.to_vec())
+                    Ok::<crate::async_bridge::BytesReply, PyErr>(
+                        crate::async_bridge::BytesReply(bytes),
+                    )
                 }
                 Some(Err(e)) => {
                     drop(call);
@@ -3203,7 +3209,9 @@ impl PyAsyncDuplexStream {
             match next {
                 Some(Ok(bytes)) => {
                     *inner.lock() = Some(stream);
-                    Ok::<Vec<u8>, PyErr>(bytes.to_vec())
+                    Ok::<crate::async_bridge::BytesReply, PyErr>(
+                        crate::async_bridge::BytesReply(bytes),
+                    )
                 }
                 Some(Err(e)) => {
                     drop(stream);
