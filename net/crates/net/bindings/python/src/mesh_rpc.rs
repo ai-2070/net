@@ -2093,6 +2093,100 @@ impl PyMeshRpc {
 }
 
 // ============================================================================
+// PyAsyncMeshRpc — async-`def` envelope class (T1-A3+).
+//
+// Mirrors `PyMeshRpc`'s constructor + node-sharing model exactly;
+// the methods return `Bound<PyAny>` awaitables instead of blocking.
+// The asyncio task-cancel path propagates to
+// `MeshNode::cancel(token)` via the F-2 `await_with_cancel` adapter.
+//
+// Constructor accepts the same `NetMesh` instance as `PyMeshRpc`;
+// users may construct both classes against one mesh and mix calls.
+// ============================================================================
+
+#[pyclass(name = "AsyncMeshRpc", module = "_net")]
+pub struct PyAsyncMeshRpc {
+    node: Arc<MeshNode>,
+}
+
+#[pymethods]
+impl PyAsyncMeshRpc {
+    /// Build an `AsyncMeshRpc` against an existing `NetMesh`. Cheap
+    /// (`Arc::clone`); call once per mesh and reuse. Shares the
+    /// `MeshNode` with any sibling `MeshRpc` instance, so a server
+    /// registered via `MeshRpc.serve(...)` is reachable from
+    /// `AsyncMeshRpc.call(...)` and vice versa.
+    #[new]
+    fn new(mesh: &crate::mesh_bindings::NetMesh) -> PyResult<Self> {
+        let node = mesh.node_arc_clone()?;
+        Ok(PyAsyncMeshRpc { node })
+    }
+
+    /// Direct-addressed unary call. Returns an awaitable resolving
+    /// to the response body as `bytes`. Asyncio task cancellation
+    /// (e.g. `asyncio.wait_for(..., timeout=...)` expiry) fires
+    /// `MeshNode::cancel(token)` mid-flight; the awaitable then
+    /// raises `RpcCancelledError`.
+    ///
+    /// Sync equivalent: :meth:`MeshRpc.call`.
+    #[pyo3(signature = (target_node_id, service, request, opts=None))]
+    fn call<'py>(
+        &self,
+        py: Python<'py>,
+        target_node_id: u64,
+        service: String,
+        request: &Bound<'py, PyBytes>,
+        opts: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut inner_opts = call_options_from_dict(opts)?;
+        let req_bytes = Bytes::copy_from_slice(request.as_bytes());
+        let node = self.node.clone();
+        crate::async_bridge::await_with_cancel(py, &self.node, move |token| {
+            inner_opts.cancel_token = Some(token);
+            async move {
+                node.call(target_node_id, &service, req_bytes, inner_opts)
+                    .await
+                    .map(|reply| reply.body.to_vec())
+                    .map_err(rpc_error_to_pyerr)
+            }
+        })
+    }
+
+    /// Service-discovery unary call. Resolves `service` via the
+    /// local capability index + routing policy, calls, awaits.
+    ///
+    /// Sync equivalent: :meth:`MeshRpc.call_service`.
+    #[pyo3(signature = (service, request, opts=None))]
+    fn call_service<'py>(
+        &self,
+        py: Python<'py>,
+        service: String,
+        request: &Bound<'py, PyBytes>,
+        opts: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut inner_opts = call_options_from_dict(opts)?;
+        let req_bytes = Bytes::copy_from_slice(request.as_bytes());
+        let node = self.node.clone();
+        crate::async_bridge::await_with_cancel(py, &self.node, move |token| {
+            inner_opts.cancel_token = Some(token);
+            async move {
+                node.call_service(&service, req_bytes, inner_opts)
+                    .await
+                    .map(|reply| reply.body.to_vec())
+                    .map_err(rpc_error_to_pyerr)
+            }
+        })
+    }
+
+    /// All node ids advertising `nrpc:<service>` in the local
+    /// capability index. Local read — synchronous (no I/O, no
+    /// `await` needed). Identical to :meth:`MeshRpc.find_service_nodes`.
+    fn find_service_nodes(&self, _py: Python<'_>, service: String) -> Vec<u64> {
+        self.node.find_service_nodes(&service)
+    }
+}
+
+// ============================================================================
 // Tests for the pure-logic helpers — error mapping. Following the
 // existing python binding convention: pyo3's `PyErr::Drop` calls
 // Python-runtime symbols not available in standalone `cargo

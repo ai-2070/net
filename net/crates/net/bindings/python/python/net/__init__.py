@@ -113,6 +113,7 @@ else:
 # once the wheel is rebuilt with `maturin develop`.
 try:
     from ._net import (
+        AsyncMeshRpc,
         Cancellable,
         MeshRpc,
         RpcAppError,
@@ -132,6 +133,7 @@ except ImportError:
 else:
     __all__.extend(
         [
+            "AsyncMeshRpc",
             "Cancellable",
             "MeshRpc",
             "RpcAppError",

@@ -2345,6 +2345,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         // / hedge / breaker land in a follow-up phase as a Python
         // wrapper module on top of these classes.
         m.add_class::<mesh_rpc::PyMeshRpc>()?;
+        m.add_class::<mesh_rpc::PyAsyncMeshRpc>()?;
         m.add_class::<mesh_rpc::PyServeHandle>()?;
         m.add_class::<mesh_rpc::PyRpcStream>()?;
         m.add_class::<mesh_rpc::PyCancellable>()?;
