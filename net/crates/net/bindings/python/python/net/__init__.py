@@ -68,6 +68,8 @@ else:
 # the `cortex` feature (maturin's default picks it up).
 try:
     from ._net import (
+        AsyncMemoriesAdapter,
+        AsyncMemoryWatchIter,
         CortexError,
         MemoriesAdapter,
         Memory,
@@ -89,6 +91,8 @@ except ImportError:
 else:
     __all__.extend(
         [
+            "AsyncMemoriesAdapter",
+            "AsyncMemoryWatchIter",
             "CortexError",
             "MemoriesAdapter",
             "Memory",

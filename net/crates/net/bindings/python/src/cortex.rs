@@ -2275,3 +2275,428 @@ impl PyNetDb {
         )
     }
 }
+
+// =========================================================================
+// AsyncMemoriesAdapter + AsyncMemoryWatchIter — T2-C3.
+//
+// Async sibling of `PyMemoriesAdapter`. Shares the same
+// `Arc<InnerMemoriesAdapter>` as the sync sibling, so writes via
+// either are visible to the other.
+//
+// Awaitable methods (run on the pyo3-async-runtimes bridge runtime):
+//   wait_for_seq, wait_for_token, watch_memories,
+//   snapshot_and_watch_memories.
+//
+// The store/retag/pin/unpin/delete writes are synchronous on the
+// inner adapter (they enqueue into the fold task without awaiting),
+// so they keep their sync shape on the async wrapper too. Same for
+// `list_memories` (in-memory query), `snapshot`, `count`, `close`,
+// `is_running`.
+// =========================================================================
+
+/// Async sibling of [`PyMemoriesAdapter`]. Construct from a sync
+/// [`PyMemoriesAdapter`]; the underlying `MemoriesAdapter` is
+/// shared.
+///
+/// Sync equivalent: :class:`MemoriesAdapter`.
+#[pyclass(name = "AsyncMemoriesAdapter", module = "_net", from_py_object)]
+#[derive(Clone)]
+pub struct PyAsyncMemoriesAdapter {
+    inner: Arc<InnerMemoriesAdapter>,
+}
+
+#[pymethods]
+impl PyAsyncMemoriesAdapter {
+    /// Build against an existing sync `MemoriesAdapter`. Cheap
+    /// (`Arc::clone`). The two wrappers share the same inner
+    /// adapter / fold task; writes are visible across both.
+    #[new]
+    fn new(memories: &PyMemoriesAdapter) -> Self {
+        Self {
+            inner: memories.inner.clone(),
+        }
+    }
+
+    /// Capture a state snapshot for restore via
+    /// `MemoriesAdapter.open_from_snapshot`. Sync — captures from
+    /// the in-memory state, no awaiting.
+    fn snapshot(&self) -> PyResult<(Vec<u8>, Option<u64>)> {
+        self.inner
+            .snapshot()
+            .map_err(|e| CortexError::new_err(format!("snapshot failed: {}", e)))
+    }
+
+    #[pyo3(signature = (id, content, tags, source, now_ns))]
+    fn store(
+        &self,
+        id: u64,
+        content: String,
+        tags: Vec<String>,
+        source: String,
+        now_ns: u64,
+    ) -> PyResult<u64> {
+        self.inner
+            .store(id, content, tags, source, now_ns)
+            .map_err(|e| CortexError::new_err(format!("store failed: {}", e)))
+    }
+
+    fn retag(&self, id: u64, tags: Vec<String>, now_ns: u64) -> PyResult<u64> {
+        self.inner
+            .retag(id, tags, now_ns)
+            .map_err(|e| CortexError::new_err(format!("retag failed: {}", e)))
+    }
+
+    fn pin(&self, id: u64, now_ns: u64) -> PyResult<u64> {
+        self.inner
+            .pin(id, now_ns)
+            .map_err(|e| CortexError::new_err(format!("pin failed: {}", e)))
+    }
+
+    fn unpin(&self, id: u64, now_ns: u64) -> PyResult<u64> {
+        self.inner
+            .unpin(id, now_ns)
+            .map_err(|e| CortexError::new_err(format!("unpin failed: {}", e)))
+    }
+
+    fn delete(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .delete(id)
+            .map_err(|e| CortexError::new_err(format!("delete failed: {}", e)))
+    }
+
+    /// Await the fold task to consume up to `seq`. Returns an
+    /// awaitable resolving to ``None`` on success.
+    fn wait_for_seq<'py>(&self, py: Python<'py>, seq: u64) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner
+                .wait_for_seq(seq)
+                .await
+                .map_err(|folded| {
+                    CortexError::new_err(format!(
+                        "wait_for_seq: fold task stopped; folded_through={folded:?}"
+                    ))
+                })?;
+            Ok::<(), PyErr>(())
+        })
+    }
+
+    /// Read-your-writes wait. `deadline_ms == 0` is a non-blocking
+    /// poll (raises immediately if the token isn't ready).
+    #[pyo3(signature = (token, deadline_ms = 1000))]
+    fn wait_for_token<'py>(
+        &self,
+        py: Python<'py>,
+        token: &PyWriteToken,
+        deadline_ms: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let inner_token = token.as_inner();
+        if deadline_ms == 0 {
+            // Non-blocking poll — still return an awaitable for shape
+            // symmetry; resolves immediately.
+            let result = inner.poll_for_token(inner_token);
+            return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                result.map_err(map_wait_for_token_err)
+            });
+        }
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner
+                .wait_for_token(inner_token, std::time::Duration::from_millis(deadline_ms))
+                .await
+                .map_err(map_wait_for_token_err)
+        })
+    }
+
+    fn close(&self) -> PyResult<()> {
+        self.inner
+            .close()
+            .map_err(|e| CortexError::new_err(format!("close failed: {}", e)))
+    }
+
+    fn is_running(&self) -> bool {
+        self.inner.is_running()
+    }
+
+    fn count(&self) -> u32 {
+        self.inner.state().read().len() as u32
+    }
+
+    /// In-memory query over the fold's current state. Sync — no
+    /// awaiting needed.
+    #[pyo3(signature = (
+        *,
+        source=None,
+        content_contains=None,
+        tag=None,
+        any_tag=None,
+        all_tags=None,
+        pinned=None,
+        created_after_ns=None,
+        created_before_ns=None,
+        updated_after_ns=None,
+        updated_before_ns=None,
+        order_by=None,
+        limit=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn list_memories(
+        &self,
+        source: Option<String>,
+        content_contains: Option<String>,
+        tag: Option<String>,
+        any_tag: Option<Vec<String>>,
+        all_tags: Option<Vec<String>>,
+        pinned: Option<bool>,
+        created_after_ns: Option<u64>,
+        created_before_ns: Option<u64>,
+        updated_after_ns: Option<u64>,
+        updated_before_ns: Option<u64>,
+        order_by: Option<&str>,
+        limit: Option<u32>,
+    ) -> PyResult<Vec<PyMemory>> {
+        let state_handle = self.inner.state();
+        let state = state_handle.read();
+        let mut q = state.query();
+        if let Some(s) = source {
+            q = q.where_source(s);
+        }
+        if let Some(s) = content_contains {
+            q = q.content_contains(s);
+        }
+        if let Some(t) = tag {
+            q = q.where_tag(t);
+        }
+        if let Some(tags) = any_tag {
+            q = q.where_any_tag(tags);
+        }
+        if let Some(tags) = all_tags {
+            q = q.where_all_tags(tags);
+        }
+        if let Some(p) = pinned {
+            q = q.where_pinned(p);
+        }
+        if let Some(ns) = created_after_ns {
+            q = q.created_after(ns);
+        }
+        if let Some(ns) = created_before_ns {
+            q = q.created_before(ns);
+        }
+        if let Some(ns) = updated_after_ns {
+            q = q.updated_after(ns);
+        }
+        if let Some(ns) = updated_before_ns {
+            q = q.updated_before(ns);
+        }
+        if let Some(o) = order_by {
+            q = q.order_by(parse_memories_order_by(o)?);
+        }
+        if let Some(l) = limit {
+            q = q.limit(l as usize);
+        }
+        Ok(q.collect().into_iter().map(PyMemory::from).collect())
+    }
+
+    /// Returns an awaitable resolving to an `AsyncMemoryWatchIter`
+    /// over the live fold stream. Use ``async for`` on the
+    /// returned iterator.
+    #[pyo3(signature = (
+        *,
+        source=None,
+        content_contains=None,
+        tag=None,
+        any_tag=None,
+        all_tags=None,
+        pinned=None,
+        created_after_ns=None,
+        created_before_ns=None,
+        updated_after_ns=None,
+        updated_before_ns=None,
+        order_by=None,
+        limit=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn watch_memories<'py>(
+        &self,
+        py: Python<'py>,
+        source: Option<String>,
+        content_contains: Option<String>,
+        tag: Option<String>,
+        any_tag: Option<Vec<String>>,
+        all_tags: Option<Vec<String>>,
+        pinned: Option<bool>,
+        created_after_ns: Option<u64>,
+        created_before_ns: Option<u64>,
+        updated_after_ns: Option<u64>,
+        updated_before_ns: Option<u64>,
+        order_by: Option<&str>,
+        limit: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let w = build_memory_watcher(
+            &self.inner,
+            source,
+            content_contains,
+            tag,
+            any_tag,
+            all_tags,
+            pinned,
+            created_after_ns,
+            created_before_ns,
+            updated_after_ns,
+            updated_before_ns,
+            order_by,
+            limit,
+        )?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let stream: BoxStream<'static, Vec<std::sync::Arc<InnerMemory>>> = w.stream().boxed();
+            Ok::<PyAsyncMemoryWatchIter, PyErr>(new_async_memory_watch_iter(stream))
+        })
+    }
+
+    /// Atomic snapshot + watch. Returns an awaitable resolving to
+    /// ``(snapshot_list, AsyncMemoryWatchIter)``.
+    #[pyo3(signature = (
+        *,
+        source=None,
+        content_contains=None,
+        tag=None,
+        any_tag=None,
+        all_tags=None,
+        pinned=None,
+        created_after_ns=None,
+        created_before_ns=None,
+        updated_after_ns=None,
+        updated_before_ns=None,
+        order_by=None,
+        limit=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn snapshot_and_watch_memories<'py>(
+        &self,
+        py: Python<'py>,
+        source: Option<String>,
+        content_contains: Option<String>,
+        tag: Option<String>,
+        any_tag: Option<Vec<String>>,
+        all_tags: Option<Vec<String>>,
+        pinned: Option<bool>,
+        created_after_ns: Option<u64>,
+        created_before_ns: Option<u64>,
+        updated_after_ns: Option<u64>,
+        updated_before_ns: Option<u64>,
+        order_by: Option<&str>,
+        limit: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let w = build_memory_watcher(
+            &self.inner,
+            source,
+            content_contains,
+            tag,
+            any_tag,
+            all_tags,
+            pinned,
+            created_after_ns,
+            created_before_ns,
+            updated_after_ns,
+            updated_before_ns,
+            order_by,
+            limit,
+        )?;
+        let adapter = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (snapshot, stream) = adapter.snapshot_and_watch(w);
+            let snap_py: Vec<PyMemory> = snapshot.into_iter().map(PyMemory::from).collect();
+            let iter = new_async_memory_watch_iter(stream);
+            Ok::<(Vec<PyMemory>, PyAsyncMemoryWatchIter), PyErr>((snap_py, iter))
+        })
+    }
+}
+
+fn new_async_memory_watch_iter(
+    stream: BoxStream<'static, Vec<std::sync::Arc<InnerMemory>>>,
+) -> PyAsyncMemoryWatchIter {
+    PyAsyncMemoryWatchIter {
+        inner: Arc::new(MemoryWatchIterInner {
+            stream: TokioMutex::new(Some(stream)),
+            shutdown: Notify::new(),
+            is_shutdown: AtomicBool::new(false),
+        }),
+    }
+}
+
+/// Async sibling of [`PyMemoryWatchIter`]. PEP 525 async iterator
+/// (``async for batch in iter:``). Each yield is a batch of
+/// `Memory` objects matching the watch's filters.
+///
+/// Sync equivalent: :class:`MemoryWatchIter`.
+#[pyclass(name = "AsyncMemoryWatchIter", module = "_net")]
+pub struct PyAsyncMemoryWatchIter {
+    inner: Arc<MemoryWatchIterInner>,
+}
+
+#[pymethods]
+impl PyAsyncMemoryWatchIter {
+    fn __aiter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if inner.is_shutdown.load(Ordering::Acquire) {
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+            }
+            let mut guard = inner.stream.lock().await;
+            let stream = match guard.as_mut() {
+                Some(s) => s,
+                None => {
+                    return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+                }
+            };
+            let shutdown_fut = inner.shutdown.notified();
+            tokio::pin!(shutdown_fut);
+            shutdown_fut.as_mut().enable();
+
+            if inner.is_shutdown.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+            }
+            let next = tokio::select! {
+                biased;
+                _ = shutdown_fut => {
+                    *guard = None;
+                    None
+                }
+                msg = stream.next() => match msg {
+                    Some(items) => Some(items),
+                    None => {
+                        *guard = None;
+                        None
+                    }
+                }
+            };
+            drop(guard);
+            match next {
+                Some(items) => {
+                    let mapped: Vec<PyMemory> = items.into_iter().map(PyMemory::from).collect();
+                    Ok::<Vec<PyMemory>, PyErr>(mapped)
+                }
+                None => Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+            }
+        })
+    }
+
+    /// Stop the iterator. Idempotent. Subsequent `__anext__` calls
+    /// raise `StopAsyncIteration`.
+    fn close(&self) {
+        self.inner.is_shutdown.store(true, Ordering::Release);
+        self.inner.shutdown.notify_waiters();
+    }
+
+    /// Async alias for :meth:`close` so users can write
+    /// ``await iter.aclose()``.
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.close();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
+    }
+}
