@@ -2991,6 +2991,8 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         m.add_class::<meshos::PyMeshOsDaemonSdk>()?;
         m.add_class::<meshos::PyMeshOsDaemonHandle>()?;
+        m.add_class::<meshos::PyAsyncMeshOsDaemonSdk>()?;
+        m.add_class::<meshos::PyAsyncMeshOsDaemonHandle>()?;
         m.add(
             "MeshOsSdkError",
             m.py().get_type::<meshos::MeshOsSdkError>(),

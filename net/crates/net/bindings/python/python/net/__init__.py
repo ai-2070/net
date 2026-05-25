@@ -394,6 +394,8 @@ else:
 # control receive / publish_log / graceful_shutdown / metadata.
 try:
     from ._net import (
+        AsyncMeshOsDaemonHandle,
+        AsyncMeshOsDaemonSdk,
         MeshOsDaemonHandle,
         MeshOsDaemonSdk,
         MeshOsSdkError,
@@ -404,6 +406,8 @@ except ImportError:
 else:
     __all__.extend(
         [
+            "AsyncMeshOsDaemonHandle",
+            "AsyncMeshOsDaemonSdk",
             "MeshOsDaemonHandle",
             "MeshOsDaemonSdk",
             "MeshOsSdkError",
