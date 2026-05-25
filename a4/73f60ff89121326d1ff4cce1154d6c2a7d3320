@@ -1,0 +1,20 @@
+net/crates/net/bindings/python/src/meshos.rs
+  s_099fa7d871e34d::t_2b4afdeff51960 1249-1250,1252,1264,1270-1272
+  s_099fa7d871e34d::t_344200537336b8 1142-1170
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "a473f60ff89121326d1ff4cce1154d6c2a7d3320",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
