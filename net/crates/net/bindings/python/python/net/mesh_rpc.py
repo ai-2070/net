@@ -40,6 +40,12 @@ from typing import Any, Callable, Iterator, Optional, Sequence
 # will have cortex enabled.
 try:
     from net._net import (
+        AsyncClientStreamCall as _RawAsyncClientStreamCall,
+        AsyncDuplexCall as _RawAsyncDuplexCall,
+        AsyncDuplexSink as _RawAsyncDuplexSink,
+        AsyncDuplexStream as _RawAsyncDuplexStream,
+        AsyncMeshRpc as _RawAsyncMeshRpc,
+        AsyncRpcStream as _RawAsyncRpcStream,
         Cancellable,
         ClientStreamCall as _RawClientStreamCall,
         DuplexCall as _RawDuplexCall,
@@ -65,6 +71,12 @@ try:
     )
 except ImportError:  # pragma: no cover — feature-flag path
     _RawMeshRpc = None  # type: ignore[assignment]
+    _RawAsyncMeshRpc = None  # type: ignore[assignment]
+    _RawAsyncRpcStream = None  # type: ignore[assignment]
+    _RawAsyncClientStreamCall = None  # type: ignore[assignment]
+    _RawAsyncDuplexCall = None  # type: ignore[assignment]
+    _RawAsyncDuplexSink = None  # type: ignore[assignment]
+    _RawAsyncDuplexStream = None  # type: ignore[assignment]
     _RawRpcStream = None  # type: ignore[assignment]
     _RawClientStreamCall = None  # type: ignore[assignment]
     _RawDuplexCall = None  # type: ignore[assignment]
@@ -1198,6 +1210,103 @@ def default_breaker_failure(err: BaseException) -> bool:
     failures, skips application errors and codec/no-route faults.
     """
     return default_retryable(err)
+
+
+# ---------------------------------------------------------------------------
+# AsyncTypedMeshRpc — public typed wrapper, async sibling of
+# TypedMeshRpc. Same JSON encode / decode at the boundary; methods
+# return awaitables that integrate with asyncio.
+#
+# Cancellation: opts['cancel'] and opts['cancel_token'] pass
+# straight through to the raw AsyncMeshRpc layer (which already
+# wires them to the substrate cancel registry); asyncio
+# task.cancel() likewise propagates via the await_with_cancel
+# bridge installed on every awaitable method at the raw layer.
+# ---------------------------------------------------------------------------
+
+
+class AsyncTypedMeshRpc:
+    """Async typed wrapper around the raw ``AsyncMeshRpc`` pyclass.
+
+    Same JSON codec semantics as :class:`TypedMeshRpc`; every
+    method that performed I/O on the sync sibling is an
+    ``async def`` here, returning an awaitable. Asyncio
+    cancellation propagates end-to-end via the substrate's v3
+    cancel-registry primitive — `asyncio.wait_for(...)` and
+    `task.cancel()` both fire `MeshNode::cancel(token)` and the
+    awaitable raises :class:`RpcCancelledError`.
+
+    Constructed via :meth:`from_mesh` (or directly via
+    ``AsyncTypedMeshRpc(AsyncMeshRpc(net_mesh))``). Shares the
+    underlying ``MeshNode`` with any sibling :class:`TypedMeshRpc`
+    or :class:`MeshRpc` constructed against the same ``NetMesh``,
+    so servers registered on one are callable from another.
+
+    Sync equivalent: :class:`TypedMeshRpc`.
+    """
+
+    def __init__(self, raw: Any) -> None:
+        # `raw` is duck-typed: it must expose async `call` /
+        # `call_service` / `call_streaming` / `call_client_stream` /
+        # `call_duplex` and sync `find_service_nodes`. The native
+        # `_RawAsyncMeshRpc` satisfies this; tests can pass a stub.
+        self._raw = raw
+
+    @classmethod
+    def from_mesh(cls, mesh: Any) -> "AsyncTypedMeshRpc":
+        """Build an AsyncTypedMeshRpc against an existing ``NetMesh``."""
+        if _RawAsyncMeshRpc is None:
+            raise RuntimeError(
+                "net._net.AsyncMeshRpc unavailable — did the wheel get built "
+                "without the cortex feature?"
+            )
+        return cls(_RawAsyncMeshRpc(mesh))
+
+    @property
+    def raw(self) -> Any:
+        """Underlying raw ``AsyncMeshRpc`` (bytes-level surface)."""
+        return self._raw
+
+    # ---- call ---------------------------------------------------------------
+
+    async def call(
+        self,
+        target_node_id: int,
+        service: str,
+        request: Any,
+        opts: Optional[dict] = None,
+    ) -> Any:
+        """Direct-addressed typed call. Awaits the response, decodes
+        the body, returns the typed value. Raises an
+        :class:`RpcError` subclass on failure.
+
+        Sync equivalent: :meth:`TypedMeshRpc.call`.
+        """
+        req_bytes = _json_encode(request)
+        resp_bytes = await self._raw.call(target_node_id, service, req_bytes, opts)
+        return _json_decode(resp_bytes)
+
+    async def call_service(
+        self,
+        service: str,
+        request: Any,
+        opts: Optional[dict] = None,
+    ) -> Any:
+        """Service-discovery typed call. Resolves ``service`` via
+        the local capability index + routing policy, awaits.
+
+        Sync equivalent: :meth:`TypedMeshRpc.call_service`.
+        """
+        req_bytes = _json_encode(request)
+        resp_bytes = await self._raw.call_service(service, req_bytes, opts)
+        return _json_decode(resp_bytes)
+
+    def find_service_nodes(self, service: str) -> list[int]:
+        """All node ids advertising ``nrpc:<service>``. Sync — local
+        lookup, no I/O. Identical to
+        :meth:`TypedMeshRpc.find_service_nodes`.
+        """
+        return self._raw.find_service_nodes(service)
 
 
 # ---------------------------------------------------------------------------
