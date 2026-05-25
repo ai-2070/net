@@ -1308,6 +1308,25 @@ class AsyncTypedMeshRpc:
         """
         return self._raw.find_service_nodes(service)
 
+    # ---- duplex (call_duplex) ---------------------------------------------
+
+    async def call_duplex(
+        self,
+        target_node_id: int,
+        service: str,
+        opts: Optional[dict] = None,
+    ) -> "AsyncTypedDuplexCall":
+        """Open a typed duplex call. Awaits construction; the
+        returned :class:`AsyncTypedDuplexCall` exposes both
+        ``await send(value)`` and ``async for resp in call`` plus
+        ``await call.into_split()`` for independent sink + stream
+        halves.
+
+        Sync equivalent: :meth:`TypedMeshRpc.call_duplex`.
+        """
+        raw_call = await self._raw.call_duplex(target_node_id, service, opts)
+        return AsyncTypedDuplexCall(raw_call)
+
     # ---- client-streaming (call_client_stream) -----------------------------
 
     async def call_client_stream(
@@ -1465,6 +1484,192 @@ class AsyncTypedClientStreamCall:
     async def __aexit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
         self.close()
         return False
+
+
+class AsyncTypedDuplexCall:
+    """Async typed duplex call handle. Push typed requests via
+    ``await send(value)``, pull typed responses via ``async for
+    resp in call:``, or call ``await call.into_split()`` for
+    independent sink + stream halves. After :meth:`into_split`
+    returns, this call is consumed.
+
+    Sync equivalent: :class:`TypedDuplexCall`.
+    """
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+        self._done = False
+
+    @property
+    def raw(self) -> Any:
+        """Underlying raw ``AsyncDuplexCall``."""
+        return self._raw
+
+    async def send(self, value: Any) -> None:
+        """Encode + push one request chunk."""
+        await self._raw.send(_json_encode(value))
+
+    async def finish_sending(self) -> None:
+        """Close the upload direction (emit REQUEST_END). The
+        download side stays open for subsequent ``async for``
+        pulls.
+        """
+        await self._raw.finish_sending()
+
+    def __aiter__(self) -> "AsyncTypedDuplexCall":
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._done:
+            raise StopAsyncIteration
+        try:
+            chunk = await self._raw.__anext__()
+        except StopAsyncIteration:
+            self._done = True
+            raise
+        try:
+            return _json_decode(chunk)
+        except RpcCodecError:
+            self._done = True
+            try:
+                self._raw.close()
+            except Exception:
+                pass
+            raise
+
+    def into_split(self) -> tuple:
+        """Split into independent typed sink + stream halves.
+        After return, this call is consumed — subsequent
+        :meth:`send` / :meth:`__anext__` raise.
+
+        Returns ``(AsyncTypedDuplexSink, AsyncTypedDuplexStream)``.
+        """
+        raw_sink, raw_stream = self._raw.into_split()
+        self._done = True
+        return AsyncTypedDuplexSink(raw_sink), AsyncTypedDuplexStream(raw_stream)
+
+    def call_id(self) -> int:
+        """Server-assigned ``call_id``."""
+        return int(self._raw.call_id())
+
+    def flow_controlled(self) -> bool:
+        """``True`` if opened with non-``None`` ``request_window_initial``."""
+        return bool(self._raw.flow_controlled())
+
+    def close(self) -> None:
+        """Close without observing the response terminator. Fires
+        CANCEL on the wire. Idempotent.
+        """
+        self._done = True
+        try:
+            self._raw.close()
+        except Exception:
+            pass
+
+    async def aclose(self) -> None:
+        """Async alias for :meth:`close`."""
+        self.close()
+
+    async def __aenter__(self) -> "AsyncTypedDuplexCall":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        self.close()
+        return False
+
+
+class AsyncTypedDuplexSink:
+    """Send-half of a typed async duplex call after
+    :meth:`AsyncTypedDuplexCall.into_split`.
+    """
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+
+    @property
+    def raw(self) -> Any:
+        """Underlying raw ``AsyncDuplexSink``."""
+        return self._raw
+
+    async def send(self, value: Any) -> None:
+        """Encode + push one request chunk."""
+        await self._raw.send(_json_encode(value))
+
+    async def finish(self) -> None:
+        """Close the upload direction (emit REQUEST_END). Consumes
+        the sink — subsequent :meth:`send` raises.
+        """
+        await self._raw.finish()
+
+    def call_id(self) -> int:
+        return int(self._raw.call_id())
+
+    def flow_controlled(self) -> bool:
+        return bool(self._raw.flow_controlled())
+
+    def close(self) -> None:
+        """Sync close. Idempotent."""
+        try:
+            self._raw.close()
+        except Exception:
+            pass
+
+    async def aclose(self) -> None:
+        """Async alias for :meth:`close`."""
+        self.close()
+
+
+class AsyncTypedDuplexStream:
+    """Receive-half of a typed async duplex call after
+    :meth:`AsyncTypedDuplexCall.into_split`. Iterates over decoded
+    responses; decode failure raises :class:`RpcCodecError` and
+    closes the underlying stream.
+    """
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+        self._done = False
+
+    @property
+    def raw(self) -> Any:
+        """Underlying raw ``AsyncDuplexStream``."""
+        return self._raw
+
+    def __aiter__(self) -> "AsyncTypedDuplexStream":
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._done:
+            raise StopAsyncIteration
+        try:
+            chunk = await self._raw.__anext__()
+        except StopAsyncIteration:
+            self._done = True
+            raise
+        try:
+            return _json_decode(chunk)
+        except RpcCodecError:
+            self._done = True
+            try:
+                self._raw.close()
+            except Exception:
+                pass
+            raise
+
+    def call_id(self) -> int:
+        return int(self._raw.call_id())
+
+    def close(self) -> None:
+        """Sync close. Idempotent."""
+        self._done = True
+        try:
+            self._raw.close()
+        except Exception:
+            pass
+
+    async def aclose(self) -> None:
+        """Async alias for :meth:`close`."""
+        self.close()
 
 
 # ---------------------------------------------------------------------------
