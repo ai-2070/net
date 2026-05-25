@@ -193,6 +193,123 @@ def test_async_caller_async_server_unary() -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# TX-2 — asyncio cancel propagation.
+#
+# A long-running server holds the call past the caller's wait_for
+# timeout. The asyncio task-cancel must propagate to the substrate's
+# Mesh::cancel(token), which surfaces RpcCancelledError on the
+# in-flight call.
+# ---------------------------------------------------------------------------
+
+
+def test_wait_for_timeout_propagates_to_substrate_cancel() -> None:
+    """`asyncio.wait_for(arpc.call(...), timeout=0.1)` against a
+    handler that sleeps for several seconds must surface
+    `asyncio.TimeoutError` on the caller side AND let the substrate
+    cancel the in-flight call (rather than orphaning the handler
+    until natural completion).
+
+    Verification has two parts:
+    - `asyncio.TimeoutError` is raised on the caller (proves the
+      Python-side cancel fired).
+    - The handler observes `asyncio.CancelledError` mid-sleep
+      (proves the substrate cancel reached the handler coroutine
+      via the cancel-token notify path).
+    """
+    from net import RpcCancelledError, RpcError  # noqa: F401
+
+    a, b = _mesh_pair()
+
+    handler_was_cancelled = asyncio.Event()
+
+    async def _slow_handler(req: bytes) -> bytes:
+        try:
+            await asyncio.sleep(10.0)
+            return req
+        except asyncio.CancelledError:
+            # Caller's asyncio.wait_for triggered cancel — the
+            # substrate's cancel-token machinery propagated it
+            # through to this handler's await.
+            handler_was_cancelled.set()
+            raise
+
+    async def _run() -> None:
+        asrv = AsyncMeshRpc(b)
+        acli = AsyncMeshRpc(a)
+        h = asrv.serve("slow", _slow_handler)
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    acli.call(b.node_id, "slow", b"never-resolves"),
+                    timeout=0.2,
+                )
+            # Give the substrate a moment to deliver the cancel.
+            # The handler-side CancelledError fires as soon as the
+            # tokio cancel-watcher trips the substrate's cancel
+            # registry; that latency is sub-millisecond in steady
+            # state but allow a generous bound for CI.
+            try:
+                await asyncio.wait_for(
+                    handler_was_cancelled.wait(), timeout=1.0
+                )
+            except asyncio.TimeoutError:
+                pytest.fail(
+                    "handler never observed CancelledError — "
+                    "asyncio cancel did not propagate to substrate"
+                )
+        finally:
+            h.close()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        a.shutdown()
+        b.shutdown()
+
+
+def test_streaming_mid_iter_cancel_terminates_stream() -> None:
+    """A streaming server emitting on a slow cadence; an async
+    consumer breaks out of the `async for` loop after one chunk.
+    The remaining substrate-side stream pulls must be dropped
+    (substrate cancel-watcher fires on construction-time token)
+    rather than continuing in the background.
+
+    This pins the per-stream cancel contract: a mid-stream
+    `task.cancel()` (here triggered via `wait_for` on a single
+    `__anext__`) terminates the WHOLE stream, not just one pull.
+    """
+    # Imported lazily — the streaming-handler protocol may not be
+    # wired in slim builds; skip cleanly if so.
+    try:
+        from net import RpcCancelledError  # noqa: F401
+    except ImportError:
+        pytest.skip("RpcCancelledError not available in this wheel")
+
+    a, b = _mesh_pair()
+
+    # We need a streaming server. The cleanest path is to register
+    # a sync streaming-handler via the existing MeshRpc serve API.
+    # If serve_streaming isn't exposed (T1-A7 streaming-serve is
+    # deferred per the project plan), skip.
+    srv = MeshRpc(b)
+    if not hasattr(srv, "serve_streaming"):
+        pytest.skip(
+            "MeshRpc.serve_streaming not exposed — streaming-serve "
+            "from Python is deferred (see project plan §T1-A7)"
+        )
+
+    # Body intentionally left for a follow-up wiring slice — we
+    # don't have a Python-side streaming-server handler shape yet
+    # to register a slow-emitting stream against.
+    pytest.skip(
+        "streaming-server-side cancel test requires a Python-side "
+        "serve_streaming handler API (deferred follow-up)"
+    )
+    a.shutdown()
+    b.shutdown()
+
+
 def test_async_netmesh_shares_handshake_with_sync_netmesh() -> None:
     """`AsyncNetMesh(mesh)` doesn't re-handshake — the same peer
     connection set up by the sync `NetMesh.connect/.accept` is
