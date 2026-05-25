@@ -482,6 +482,27 @@ else:
         ]
     )
 
+    # Async deck streams — PEP 525 siblings of the sync iterators.
+    # Try-import so wheels built before T3-G2 landed still load.
+    try:
+        from ._net import (
+            AsyncSnapshotStream as _DeckAsyncSnapshotStream,
+        )
+        from ._net import (
+            AsyncStatusSummaryStream as _DeckAsyncStatusSummaryStream,
+        )
+
+        DeckAsyncSnapshotStream = _DeckAsyncSnapshotStream
+        DeckAsyncStatusSummaryStream = _DeckAsyncStatusSummaryStream
+        __all__.extend(
+            [
+                "DeckAsyncSnapshotStream",
+                "DeckAsyncStatusSummaryStream",
+            ]
+        )
+    except ImportError:  # pragma: no cover
+        pass
+
     # Slice 3 — ICE break-glass surface. Try-import so wheels
     # built before slice 3 still load.
     try:

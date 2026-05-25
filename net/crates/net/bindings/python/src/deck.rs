@@ -1873,3 +1873,167 @@ impl PyAdminVerifier {
         )
     }
 }
+
+// =========================================================================
+// AsyncSnapshotStream + AsyncStatusSummaryStream — T3-G2.
+//
+// PEP 525 async iterators over the existing CoreSnapshotStream /
+// CoreStatusStream. Constructed via .from_sync(sync_stream) which
+// consumes the sync stream's inner — the sync stream becomes
+// closed afterward (calling __next__ raises StopIteration).
+//
+// Each async-iter yields the same per-tick payload shape as the
+// sync sibling: SnapshotStream → JSON string, StatusSummaryStream
+// → dict.
+// =========================================================================
+
+/// Newtype wrapping a `StatusSummary` so an awaitable can resolve
+/// to a `PyDict` via `IntoPyObject` on the resume step (the
+/// dict-builder needs a `Python<'py>` token).
+struct AsyncStatusSummaryWrap(StatusSummary);
+
+impl<'py> pyo3::IntoPyObject<'py> for AsyncStatusSummaryWrap {
+    type Target = pyo3::types::PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        Ok(status_summary_to_dict(py, &self.0)?.into_any())
+    }
+}
+
+/// Async sibling of [`PySnapshotStream`]. PEP 525 async iterator
+/// — ``async for snap_json in stream:`` yields JSON strings.
+/// End-of-stream raises `StopAsyncIteration`.
+///
+/// Sync equivalent: :class:`SnapshotStream`.
+#[pyclass(name = "AsyncSnapshotStream", module = "net._net")]
+pub struct PyAsyncSnapshotStream {
+    inner: Arc<tokio::sync::Mutex<Option<CoreSnapshotStream>>>,
+}
+
+#[pymethods]
+impl PyAsyncSnapshotStream {
+    /// Consume an existing sync `SnapshotStream`, taking ownership
+    /// of its inner stream. The sync stream becomes closed —
+    /// subsequent `__next__` calls raise `StopIteration`.
+    #[staticmethod]
+    fn from_sync(stream: &mut PySnapshotStream) -> PyResult<Self> {
+        let inner = stream.inner.take().ok_or_else(|| {
+            Python::attach(|py| deck_err(py, "stream_closed", "snapshot stream was closed"))
+        })?;
+        Ok(Self {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(inner))),
+        })
+    }
+
+    fn __aiter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            let stream = match guard.as_mut() {
+                Some(s) => s,
+                None => return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+            };
+            let next = stream.next().await;
+            match next {
+                Some(Ok(snap)) => serde_json::to_string(&snap).map_err(|e| {
+                    Python::attach(|py| {
+                        deck_err(
+                            py,
+                            "snapshot_serialize_failed",
+                            &format!("MeshOsSnapshot JSON serialize: {e}"),
+                        )
+                    })
+                }),
+                Some(Err(e)) => Err(Python::attach(|py| deck_err_from(py, e))),
+                None => {
+                    *guard = None;
+                    Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
+                }
+            }
+        })
+    }
+
+    /// Stop the iterator. Idempotent.
+    fn close(&self) {
+        if let Ok(mut guard) = self.inner.try_lock() {
+            *guard = None;
+        }
+    }
+
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            *inner.lock().await = None;
+            Ok::<(), PyErr>(())
+        })
+    }
+}
+
+/// Async sibling of [`PyStatusSummaryStream`]. PEP 525 async
+/// iterator — ``async for summary in stream:`` yields the same
+/// dict shape as :meth:`StatusSummaryStream.__next__`.
+///
+/// Sync equivalent: :class:`StatusSummaryStream`.
+#[pyclass(name = "AsyncStatusSummaryStream", module = "net._net")]
+pub struct PyAsyncStatusSummaryStream {
+    inner: Arc<tokio::sync::Mutex<Option<CoreStatusStream>>>,
+}
+
+#[pymethods]
+impl PyAsyncStatusSummaryStream {
+    /// Consume an existing sync `StatusSummaryStream`.
+    #[staticmethod]
+    fn from_sync(stream: &mut PyStatusSummaryStream) -> PyResult<Self> {
+        let inner = stream.inner.take().ok_or_else(|| {
+            Python::attach(|py| {
+                deck_err(py, "stream_closed", "status summary stream was closed")
+            })
+        })?;
+        Ok(Self {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(inner))),
+        })
+    }
+
+    fn __aiter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            let stream = match guard.as_mut() {
+                Some(s) => s,
+                None => return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+            };
+            let next = stream.next().await;
+            match next {
+                Some(Ok(s)) => Ok::<AsyncStatusSummaryWrap, PyErr>(AsyncStatusSummaryWrap(s)),
+                Some(Err(e)) => Err(Python::attach(|py| deck_err_from(py, e))),
+                None => {
+                    *guard = None;
+                    Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
+                }
+            }
+        })
+    }
+
+    fn close(&self) {
+        if let Ok(mut guard) = self.inner.try_lock() {
+            *guard = None;
+        }
+    }
+
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            *inner.lock().await = None;
+            Ok::<(), PyErr>(())
+        })
+    }
+}
