@@ -2877,7 +2877,11 @@ impl PyAsyncClientStreamCall {
     /// publish (first call) or one upload credit (subsequent
     /// calls under flow control). Asyncio task-cancel mid-await
     /// fires the substrate cancel-token, terminating the call.
-    fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<Bound<'py, PyAny>> {
+    fn send<'py>(
+        &self,
+        py: Python<'py>,
+        body: &Bound<'py, PyBytes>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
@@ -2966,7 +2970,11 @@ pub struct PyAsyncDuplexCall {
 #[pymethods]
 impl PyAsyncDuplexCall {
     /// Async push of one body chunk to the server.
-    fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<Bound<'py, PyAny>> {
+    fn send<'py>(
+        &self,
+        py: Python<'py>,
+        body: &Bound<'py, PyBytes>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;
@@ -3106,7 +3114,11 @@ pub struct PyAsyncDuplexSink {
 
 #[pymethods]
 impl PyAsyncDuplexSink {
-    fn send<'py>(&self, py: Python<'py>, body: &Bound<'py, PyBytes>) -> PyResult<Bound<'py, PyAny>> {
+    fn send<'py>(
+        &self,
+        py: Python<'py>,
+        body: &Bound<'py, PyBytes>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let mesh = self.mesh.clone();
         let token = self.cancel_token;

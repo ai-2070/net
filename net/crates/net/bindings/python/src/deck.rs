@@ -1970,11 +1970,7 @@ impl PyAsyncAdminCommands {
         })
     }
 
-    fn exit_maintenance<'py>(
-        &self,
-        py: Python<'py>,
-        node: u64,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn exit_maintenance<'py>(&self, py: Python<'py>, node: u64) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let commit = client
@@ -2028,11 +2024,7 @@ impl PyAsyncAdminCommands {
         })
     }
 
-    fn invalidate_placement<'py>(
-        &self,
-        py: Python<'py>,
-        node: u64,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn invalidate_placement<'py>(&self, py: Python<'py>, node: u64) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let commit = client
@@ -2044,11 +2036,7 @@ impl PyAsyncAdminCommands {
         })
     }
 
-    fn restart_all_daemons<'py>(
-        &self,
-        py: Python<'py>,
-        node: u64,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn restart_all_daemons<'py>(&self, py: Python<'py>, node: u64) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let commit = client
@@ -2060,11 +2048,7 @@ impl PyAsyncAdminCommands {
         })
     }
 
-    fn clear_avoid_list<'py>(
-        &self,
-        py: Python<'py>,
-        node: u64,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn clear_avoid_list<'py>(&self, py: Python<'py>, node: u64) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let commit = client
@@ -2246,9 +2230,10 @@ impl PyAsyncDeckClient {
     /// `DeckClient` (the sync sibling owns the SDK).
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let Some(sdk) = self.owned_sdk.lock().take() else {
-            return pyo3_async_runtimes::tokio::future_into_py(py, async move {
-                Ok::<(), PyErr>(())
-            });
+            return pyo3_async_runtimes::tokio::future_into_py(
+                py,
+                async move { Ok::<(), PyErr>(()) },
+            );
         };
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             sdk.shutdown().await.map_err(|e| {
@@ -2457,9 +2442,8 @@ impl PyAsyncIceProposal {
             .map_err(|e| deck_err(py, e.kind, &e.message))?;
         let action_for_future = action.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let proposal = build_core_proposal(&client, action_for_future).map_err(|e| {
-                Python::attach(|py| deck_err(py, e.kind, &e.message))
-            })?;
+            let proposal = build_core_proposal(&client, action_for_future)
+                .map_err(|e| Python::attach(|py| deck_err(py, e.kind, &e.message)))?;
             let blast = proposal
                 .simulate()
                 .await
@@ -2569,9 +2553,8 @@ impl PyAsyncSimulatedIceProposal {
         build_core_proposal(&client, action.clone())
             .map_err(|e| deck_err(py, e.kind, &e.message))?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let proposal = build_core_proposal(&client, action).map_err(|e| {
-                Python::attach(|py| deck_err(py, e.kind, &e.message))
-            })?;
+            let proposal = build_core_proposal(&client, action)
+                .map_err(|e| Python::attach(|py| deck_err(py, e.kind, &e.message)))?;
             let simulated = proposal
                 .simulate()
                 .await
@@ -2710,9 +2693,7 @@ impl PyAsyncStatusSummaryStream {
     #[staticmethod]
     fn from_sync(stream: &mut PyStatusSummaryStream) -> PyResult<Self> {
         let inner = stream.inner.take().ok_or_else(|| {
-            Python::attach(|py| {
-                deck_err(py, "stream_closed", "status summary stream was closed")
-            })
+            Python::attach(|py| deck_err(py, "stream_closed", "status summary stream was closed"))
         })?;
         Ok(Self {
             inner: Arc::new(tokio::sync::Mutex::new(Some(inner))),

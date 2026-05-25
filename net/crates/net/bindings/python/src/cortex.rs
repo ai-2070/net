@@ -2567,14 +2567,11 @@ impl PyAsyncMemoriesAdapter {
     fn wait_for_seq<'py>(&self, py: Python<'py>, seq: u64) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            inner
-                .wait_for_seq(seq)
-                .await
-                .map_err(|folded| {
-                    CortexError::new_err(format!(
-                        "wait_for_seq: fold task stopped; folded_through={folded:?}"
-                    ))
-                })?;
+            inner.wait_for_seq(seq).await.map_err(|folded| {
+                CortexError::new_err(format!(
+                    "wait_for_seq: fold task stopped; folded_through={folded:?}"
+                ))
+            })?;
             Ok::<(), PyErr>(())
         })
     }
@@ -2965,14 +2962,11 @@ impl PyAsyncTasksAdapter {
     fn wait_for_seq<'py>(&self, py: Python<'py>, seq: u64) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            inner
-                .wait_for_seq(seq)
-                .await
-                .map_err(|folded| {
-                    CortexError::new_err(format!(
-                        "wait_for_seq: fold task stopped; folded_through={folded:?}"
-                    ))
-                })?;
+            inner.wait_for_seq(seq).await.map_err(|folded| {
+                CortexError::new_err(format!(
+                    "wait_for_seq: fold task stopped; folded_through={folded:?}"
+                ))
+            })?;
             Ok::<(), PyErr>(())
         })
     }
@@ -3158,9 +3152,7 @@ impl PyAsyncTasksAdapter {
     }
 }
 
-fn new_async_task_watch_iter(
-    stream: BoxStream<'static, Vec<InnerTask>>,
-) -> PyAsyncTaskWatchIter {
+fn new_async_task_watch_iter(stream: BoxStream<'static, Vec<InnerTask>>) -> PyAsyncTaskWatchIter {
     PyAsyncTaskWatchIter {
         inner: Arc::new(TaskWatchIterInner {
             stream: TokioMutex::new(Some(stream)),

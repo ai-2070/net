@@ -1421,10 +1421,7 @@ impl PyAsyncDaemonRuntime {
     fn start<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            inner
-                .start()
-                .await
-                .map_err(|e| daemon_err(e.to_string()))?;
+            inner.start().await.map_err(|e| daemon_err(e.to_string()))?;
             Ok::<(), PyErr>(())
         })
     }
@@ -1534,11 +1531,7 @@ impl PyAsyncDaemonRuntime {
     }
 
     /// Take a snapshot. Awaitable resolving to ``Optional[bytes]``.
-    fn snapshot<'py>(
-        &self,
-        py: Python<'py>,
-        origin_hash: u64,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn snapshot<'py>(&self, py: Python<'py>, origin_hash: u64) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let snap = inner
@@ -1572,10 +1565,7 @@ impl PyAsyncDaemonRuntime {
             let outputs = inner
                 .deliver(origin_hash, &core_event)
                 .map_err(|e| daemon_err(e.to_string()))?;
-            let out: Vec<Vec<u8>> = outputs
-                .into_iter()
-                .map(|ev| ev.payload.to_vec())
-                .collect();
+            let out: Vec<Vec<u8>> = outputs.into_iter().map(|ev| ev.payload.to_vec()).collect();
             Ok::<Vec<Vec<u8>>, PyErr>(out)
         })
     }

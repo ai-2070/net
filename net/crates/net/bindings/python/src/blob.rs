@@ -1475,11 +1475,7 @@ impl PyAsyncMeshBlobAdapter {
     }
 
     /// Awaitable variant of :meth:`MeshBlobAdapter.fetch`.
-    pub fn fetch<'py>(
-        &self,
-        py: Python<'py>,
-        blob_ref: &PyBlobRef,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    pub fn fetch<'py>(&self, py: Python<'py>, blob_ref: &PyBlobRef) -> PyResult<Bound<'py, PyAny>> {
         let adapter = self.inner.clone();
         let blob = blob_ref.as_inner().clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -1534,10 +1530,7 @@ impl PyAsyncMeshBlobAdapter {
         let adapter = self.inner.clone();
         let blob = blob_ref.as_inner().clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let report = adapter
-                .repair_blob(&blob)
-                .await
-                .map_err(map_blob_err)?;
+            let report = adapter.repair_blob(&blob).await.map_err(map_blob_err)?;
             Ok::<(u64, u64, u64, u64, u64, u64, u64), PyErr>((
                 report.stripes_walked,
                 report.stripes_already_healthy,

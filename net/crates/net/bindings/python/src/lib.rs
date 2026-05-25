@@ -2334,15 +2334,10 @@ mod mesh_bindings {
         ///     BackpressureError: per-stream window is full.
         ///     NotConnectedError: peer session is gone.
         ///     RuntimeError: transport failure.
-        fn send<'py>(
-            &self,
-            py: Python<'py>,
-            events: Vec<Vec<u8>>,
-        ) -> PyResult<Bound<'py, PyAny>> {
+        fn send<'py>(&self, py: Python<'py>, events: Vec<Vec<u8>>) -> PyResult<Bound<'py, PyAny>> {
             let node = self.node.clone();
             let core = self.core.clone();
-            let payloads: Vec<bytes::Bytes> =
-                events.into_iter().map(bytes::Bytes::from).collect();
+            let payloads: Vec<bytes::Bytes> = events.into_iter().map(bytes::Bytes::from).collect();
             pyo3_async_runtimes::tokio::future_into_py(py, async move {
                 node.send_on_stream(&core, &payloads)
                     .await
@@ -2362,8 +2357,7 @@ mod mesh_bindings {
         ) -> PyResult<Bound<'py, PyAny>> {
             let node = self.node.clone();
             let core = self.core.clone();
-            let payloads: Vec<bytes::Bytes> =
-                events.into_iter().map(bytes::Bytes::from).collect();
+            let payloads: Vec<bytes::Bytes> = events.into_iter().map(bytes::Bytes::from).collect();
             pyo3_async_runtimes::tokio::future_into_py(py, async move {
                 node.send_with_retry(&core, &payloads, max_retries as usize)
                     .await
@@ -2381,8 +2375,7 @@ mod mesh_bindings {
         ) -> PyResult<Bound<'py, PyAny>> {
             let node = self.node.clone();
             let core = self.core.clone();
-            let payloads: Vec<bytes::Bytes> =
-                events.into_iter().map(bytes::Bytes::from).collect();
+            let payloads: Vec<bytes::Bytes> = events.into_iter().map(bytes::Bytes::from).collect();
             pyo3_async_runtimes::tokio::future_into_py(py, async move {
                 node.send_blocking(&core, &payloads)
                     .await
@@ -2501,11 +2494,7 @@ mod mesh_bindings {
 
         /// Accept an incoming connection. Returns an awaitable
         /// resolving to the peer's observed `ip:port` as a string.
-        fn accept<'py>(
-            &self,
-            py: Python<'py>,
-            peer_node_id: u64,
-        ) -> PyResult<Bound<'py, PyAny>> {
+        fn accept<'py>(&self, py: Python<'py>, peer_node_id: u64) -> PyResult<Bound<'py, PyAny>> {
             let node = self.node.clone();
             pyo3_async_runtimes::tokio::future_into_py(py, async move {
                 let (addr, _) = node
@@ -2546,11 +2535,7 @@ mod mesh_bindings {
         }
 
         /// Poll for received events.
-        fn poll<'py>(
-            &self,
-            py: Python<'py>,
-            limit: usize,
-        ) -> PyResult<Bound<'py, PyAny>> {
+        fn poll<'py>(&self, py: Python<'py>, limit: usize) -> PyResult<Bound<'py, PyAny>> {
             let node = self.node.clone();
             pyo3_async_runtimes::tokio::future_into_py(py, async move {
                 let result = node
@@ -2734,11 +2719,7 @@ mod mesh_bindings {
         }
 
         /// Snapshot of per-stream stats.
-        fn stream_stats(
-            &self,
-            peer_node_id: u64,
-            stream_id: u64,
-        ) -> Option<NetStreamStats> {
+        fn stream_stats(&self, peer_node_id: u64, stream_id: u64) -> Option<NetStreamStats> {
             self.node
                 .stream_stats(peer_node_id, stream_id)
                 .map(|s| NetStreamStats {
@@ -2783,10 +2764,9 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // requires the bridge to be initialized first. Sync bindings
     // (`Net`, `MeshRpc`, etc.) keep their per-instance runtimes
     // for now; T1+ slices may migrate to share the bridge runtime.
-    async_bridge::init()
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "async bridge init: {e}"
-        )))?;
+    async_bridge::init().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("async bridge init: {e}"))
+    })?;
     m.add_class::<Net>()?;
     m.add_class::<IngestResult>()?;
     m.add_class::<StoredEvent>()?;

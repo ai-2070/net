@@ -513,11 +513,7 @@ impl PyAsyncRegistryClient {
 
     /// Awaitable — enumerate groups on `target_node_id`. Resolves
     /// to ``list[dict]``.
-    fn list<'py>(
-        &self,
-        py: Python<'py>,
-        target_node_id: u64,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn list<'py>(&self, py: Python<'py>, target_node_id: u64) -> PyResult<Bound<'py, PyAny>> {
         let inner_snapshot = self.inner.read().clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let groups = inner_snapshot
