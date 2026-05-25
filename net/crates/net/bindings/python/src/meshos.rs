@@ -1111,3 +1111,338 @@ impl PyMeshOsDaemonSdk {
         )
     }
 }
+
+// =========================================================================
+// AsyncMeshOsDaemonHandle + AsyncMeshOsDaemonSdk — T3-H1.
+//
+// The sync surfaces hold `Option<...>` for the consume-on-shutdown
+// shape. To support an async sibling without refactoring the sync
+// class, both async wrappers take ownership of the inner via
+// `from_sync(sync_handle)` — after conversion, the sync handle is
+// dead (its `inner.take()` returned the value).
+//
+// `tokio::sync::Mutex` (not parking_lot) is the lock type because
+// the futures hold it across `.await` on `next_control` / `shutdown`.
+// =========================================================================
+
+/// Async sibling of [`PyMeshOsDaemonHandle`]. Constructed via
+/// `from_sync(handle)`; consumes the sync handle's inner.
+///
+/// Sync equivalent: :class:`MeshOsDaemonHandle`.
+#[pyclass(name = "AsyncMeshOsDaemonHandle", module = "net._net")]
+pub struct PyAsyncMeshOsDaemonHandle {
+    /// Mutex<Option<CoreHandle>> — `next_control` and
+    /// `graceful_shutdown` hold the guard across `.await`, so the
+    /// lock must be tokio's (not parking_lot's).
+    inner: Arc<tokio::sync::Mutex<Option<CoreHandle>>>,
+    daemon_id: u64,
+    daemon_name: String,
+}
+
+impl PyAsyncMeshOsDaemonHandle {
+    /// P17: shared prelude for the sync handle-access methods —
+    /// `publish_log` / `publish_capabilities` / `try_next_control`
+    /// all do "try_lock + None-check" before reaching the inner
+    /// CoreHandle. Hoist to a single helper so the busy /
+    /// already_shutdown error strings live in one place.
+    ///
+    /// Returns the locked guard with the invariant that
+    /// `guard.is_some()`; callers `.as_ref().unwrap()` /
+    /// `.as_mut().unwrap()` to reach the CoreHandle.
+    fn lock_active<'a>(
+        &'a self,
+        py: Python<'_>,
+    ) -> PyResult<tokio::sync::MutexGuard<'a, Option<CoreHandle>>> {
+        let guard = self
+            .inner
+            .try_lock()
+            .map_err(|_| sdk_err(py, "busy", "another async task holds the handle's lock"))?;
+        if guard.is_none() {
+            return Err(sdk_err(
+                py,
+                "already_shutdown",
+                "daemon handle was already consumed",
+            ));
+        }
+        Ok(guard)
+    }
+}
+
+#[pymethods]
+impl PyAsyncMeshOsDaemonHandle {
+    /// Consume a sync `MeshOsDaemonHandle`, transferring its
+    /// underlying core handle. The sync handle becomes
+    /// `already_shutdown` afterward (calling any of its methods
+    /// raises that error).
+    #[staticmethod]
+    fn from_sync(handle: &mut PyMeshOsDaemonHandle) -> PyResult<Self> {
+        let core = handle.inner.take().ok_or_else(|| {
+            Python::attach(|py| {
+                sdk_err(py, "already_shutdown", "daemon handle was already consumed")
+            })
+        })?;
+        Ok(Self {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(core))),
+            daemon_id: handle.daemon_id,
+            daemon_name: handle.daemon_name.clone(),
+        })
+    }
+
+    #[getter]
+    fn daemon_id(&self) -> u64 {
+        self.daemon_id
+    }
+
+    #[getter]
+    fn daemon_name(&self) -> String {
+        self.daemon_name.clone()
+    }
+
+    /// Non-blocking control-event receive. Sync — no awaiting.
+    /// Returns the next event as a dict or `None` if the channel
+    /// is empty / closed / the handle was already shut down.
+    fn try_next_control<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let mut guard = self
+            .inner
+            .try_lock()
+            .map_err(|_| sdk_err(py, "busy", "another async task holds the handle's lock"))?;
+        let inner = match guard.as_mut() {
+            Some(h) => h,
+            None => return Ok(None),
+        };
+        match inner.try_next_control() {
+            Some(ev) => Ok(Some(daemon_control_to_dict(py, ev)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Awaitable control-event receive. Returns the event as a
+    /// dict on success, or `None` on `timeout_ms` elapse / runtime
+    /// shutdown.
+    #[pyo3(signature = (timeout_ms=None))]
+    fn next_control<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            let handle = match guard.as_mut() {
+                Some(h) => h,
+                None => return Ok::<Option<DaemonControlWrap>, PyErr>(None),
+            };
+            let next = match timeout_ms {
+                Some(ms) => tokio::time::timeout(Duration::from_millis(ms), handle.next_control())
+                    .await
+                    .unwrap_or_default(),
+                None => handle.next_control().await,
+            };
+            Ok(next.map(DaemonControlWrap))
+        })
+    }
+
+    /// Publish a log line. Sync — non-blocking enqueue on the
+    /// substrate's log ring.
+    fn publish_log<'py>(&self, py: Python<'py>, level: &str, message: &str) -> PyResult<()> {
+        let lvl = parse_log_level(level)?;
+        let guard = self.lock_active(py)?;
+        guard
+            .as_ref()
+            .expect("lock_active guarantees Some")
+            .publish_log(lvl, message)
+            .map_err(|e| sdk_err_from(py, e))
+    }
+
+    /// Publish capabilities. Sync.
+    #[pyo3(signature = (caps=None))]
+    fn publish_capabilities(
+        &self,
+        py: Python<'_>,
+        caps: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        let guard = self.lock_active(py)?;
+        let cap_set = match caps {
+            Some(d) => crate::capabilities::capability_set_from_py(d)
+                .map_err(|e| sdk_err(py, "invalid_capabilities", &format!("{e}")))?,
+            None => CapabilitySet::default(),
+        };
+        guard
+            .as_ref()
+            .expect("lock_active guarantees Some")
+            .publish_capabilities(cap_set)
+            .map_err(|e| sdk_err_from(py, e))
+    }
+
+    /// Awaitable graceful shutdown. Consumes the inner — subsequent
+    /// calls raise `already_shutdown`.
+    #[pyo3(signature = (grace_ms=None))]
+    fn graceful_shutdown<'py>(
+        &self,
+        py: Python<'py>,
+        grace_ms: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let grace = grace_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_GRACEFUL_SHUTDOWN);
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let handle = {
+                let mut guard = inner.lock().await;
+                match guard.take() {
+                    Some(h) => h,
+                    None => {
+                        return Err(Python::attach(|py| {
+                            sdk_err(py, "already_shutdown", "daemon handle was already consumed")
+                        }));
+                    }
+                }
+            };
+            handle
+                .graceful_shutdown(grace)
+                .await
+                .map_err(|e| Python::attach(|py| sdk_err_from(py, e)))
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        let active = self.inner.try_lock().map(|g| g.is_some()).unwrap_or(true);
+        format!(
+            "AsyncMeshOsDaemonHandle(daemon_id={:#x}, name={:?}, active={})",
+            self.daemon_id, self.daemon_name, active,
+        )
+    }
+}
+
+/// Newtype carrying a `CoreDaemonControl` from the future to the
+/// awaitable resume step, where the dict-builder runs under the
+/// GIL.
+struct DaemonControlWrap(CoreDaemonControl);
+
+impl<'py> pyo3::IntoPyObject<'py> for DaemonControlWrap {
+    type Target = pyo3::types::PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        Ok(daemon_control_to_dict(py, self.0)?.into_any())
+    }
+}
+
+/// Async sibling of [`PyMeshOsDaemonSdk`]. Constructed via
+/// `from_sync(sdk)`; consumes the sync SDK's inner.
+///
+/// Sync equivalent: :class:`MeshOsDaemonSdk`.
+#[pyclass(name = "AsyncMeshOsDaemonSdk", module = "net._net")]
+pub struct PyAsyncMeshOsDaemonSdk {
+    inner: Arc<tokio::sync::Mutex<Option<CoreSdk>>>,
+}
+
+#[pymethods]
+impl PyAsyncMeshOsDaemonSdk {
+    /// Consume a sync `MeshOsDaemonSdk`, transferring its
+    /// underlying SDK. The sync SDK becomes `already_shutdown`
+    /// afterward.
+    #[staticmethod]
+    fn from_sync(sdk: &mut PyMeshOsDaemonSdk) -> PyResult<Self> {
+        let core = sdk.inner.take().ok_or_else(|| {
+            Python::attach(|py| {
+                sdk_err(
+                    py,
+                    "already_shutdown",
+                    "MeshOsDaemonSdk was already consumed",
+                )
+            })
+        })?;
+        Ok(Self {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(core))),
+        })
+    }
+
+    /// Register a daemon. Sync (the underlying `sdk.register_daemon`
+    /// is a synchronous Rust call). Returns an
+    /// `AsyncMeshOsDaemonHandle` — async callers stay in the
+    /// async lane without conversion.
+    fn register_daemon(
+        &self,
+        py: Python<'_>,
+        daemon: Py<PyAny>,
+        identity: &crate::identity::Identity,
+    ) -> PyResult<PyAsyncMeshOsDaemonHandle> {
+        let bridge = PyDaemonBridge::from_instance(py, daemon)?;
+        let keypair = (*identity.keypair).clone();
+        let mut guard = self
+            .inner
+            .try_lock()
+            .map_err(|_| sdk_err(py, "busy", "another async task holds the SDK's lock"))?;
+        let sdk = guard.as_mut().ok_or_else(|| {
+            sdk_err(
+                py,
+                "already_shutdown",
+                "MeshOsDaemonSdk was already consumed",
+            )
+        })?;
+        let handle = py.detach(|| {
+            sdk.register_daemon(Box::new(bridge), keypair)
+                .map_err(|e| Python::attach(|py| sdk_err_from(py, e)))
+        })?;
+        let daemon_id = handle.daemon_id();
+        let daemon_name = handle.daemon_name().to_string();
+        Ok(PyAsyncMeshOsDaemonHandle {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(handle))),
+            daemon_id,
+            daemon_name,
+        })
+    }
+
+    fn dropped_control_events(&self) -> PyResult<u64> {
+        let guard = self.inner.try_lock().map_err(|_| {
+            Python::attach(|py| sdk_err(py, "busy", "another async task holds the SDK's lock"))
+        })?;
+        let sdk = guard.as_ref().ok_or_else(|| {
+            Python::attach(|py| {
+                sdk_err(
+                    py,
+                    "already_shutdown",
+                    "MeshOsDaemonSdk was already consumed",
+                )
+            })
+        })?;
+        Ok(sdk.dropped_control_events())
+    }
+
+    /// Awaitable runtime shutdown. Consumes the SDK.
+    fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let sdk = {
+                let mut guard = inner.lock().await;
+                match guard.take() {
+                    Some(s) => s,
+                    None => {
+                        return Err(Python::attach(|py| {
+                            sdk_err(
+                                py,
+                                "already_shutdown",
+                                "MeshOsDaemonSdk was already consumed",
+                            )
+                        }));
+                    }
+                }
+            };
+            sdk.shutdown().await.map(|_stats| ()).map_err(|e| {
+                Python::attach(|py| {
+                    sdk_err(
+                        py,
+                        "shutdown_failed",
+                        &format!("runtime shutdown failed: {e:?}"),
+                    )
+                })
+            })
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        let active = self.inner.try_lock().map(|g| g.is_some()).unwrap_or(true);
+        format!("AsyncMeshOsDaemonSdk(active={active})")
+    }
+}

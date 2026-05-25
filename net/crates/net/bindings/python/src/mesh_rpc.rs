@@ -43,8 +43,10 @@
 //!   above.
 
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex as TokioMutex;
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -421,6 +423,22 @@ fn extract_cancel_token<'py>(opts: Option<&Bound<'py, PyDict>>) -> PyResult<Opti
     Ok(Some(token))
 }
 
+/// `True` iff `handler` is a Python `async def` (coroutine
+/// function). Used by `AsyncMeshRpc.serve*` to route async
+/// handlers to the coroutine-driving path and sync handlers to
+/// the existing `spawn_blocking` path at register time, so the
+/// branch isn't paid per-invocation.
+fn is_coroutine_function(py: Python<'_>, handler: &Py<PyAny>) -> bool {
+    let Ok(inspect) = py.import("inspect") else {
+        return false;
+    };
+    inspect
+        .getattr("iscoroutinefunction")
+        .and_then(|f| f.call1((handler.bind(py),)))
+        .and_then(|r| r.extract::<bool>())
+        .unwrap_or(false)
+}
+
 /// Reject the ambiguous case of both `opts['cancel']` and
 /// `opts['cancel_token']` being set — they're mutually exclusive
 /// and the precedence would be invisible to the caller.
@@ -456,6 +474,23 @@ fn check_cancel_keys_exclusive<'py>(opts: Option<&Bound<'py, PyDict>>) -> PyResu
 
 const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Resolve a `handler_timeout_ms` kwarg into a `Duration`:
+/// - `Some(0)` → near-infinite (`u64::MAX / 1000` seconds) so the
+///   handler can run as long as it likes; the substrate's own
+///   call-deadline still applies upstream.
+/// - `Some(ms)` → `Duration::from_millis(ms)`.
+/// - `None` → `DEFAULT_HANDLER_TIMEOUT` (60s).
+///
+/// Hoisted from the 6 sync/async `serve*` registration sites
+/// (P7). Picks up off-by-one bugs at the single source.
+fn resolve_handler_timeout(handler_timeout_ms: Option<u64>) -> Duration {
+    match handler_timeout_ms {
+        Some(0) => Duration::from_secs(u64::MAX / 1000),
+        Some(ms) => Duration::from_millis(ms),
+        None => DEFAULT_HANDLER_TIMEOUT,
+    }
+}
+
 struct PyRpcHandler {
     callable: Py<PyAny>,
     timeout: Duration,
@@ -469,6 +504,38 @@ struct PyRpcHandler {
 enum HandlerOutcome {
     Ok(Vec<u8>),
     AppError { code: u16, body: Vec<u8> },
+}
+
+/// Translate a `HandlerOutcome` result into the substrate's
+/// `Result<RpcResponsePayload, RpcHandlerError>`. Hoisted from
+/// the 6 handler impls (3 sync + 3 async) where the same 3-arm
+/// match was copy-pasted (P6).
+fn finalize_handler_outcome(
+    outcome: Result<HandlerOutcome, String>,
+) -> Result<RpcResponsePayload, RpcHandlerError> {
+    match outcome {
+        Ok(HandlerOutcome::Ok(body)) => Ok(RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body: body.into(),
+        }),
+        Ok(HandlerOutcome::AppError { code, body }) => Err(RpcHandlerError::Application {
+            code,
+            message: String::from_utf8_lossy(&body).into_owned(),
+        }),
+        Err(msg) => Err(RpcHandlerError::Internal(msg)),
+    }
+}
+
+/// Map a Python exception raised inside an async handler coroutine
+/// (post-`.await`) to a `HandlerOutcome`. App-error exceptions
+/// surface as `AppError`; anything else collapses to `Err(format!)`.
+/// Caller threads the result through `finalize_handler_outcome`.
+fn pyerr_to_handler_outcome(pyerr: &PyErr, label: &str) -> Result<HandlerOutcome, String> {
+    Python::attach(|py| match extract_app_error(py, pyerr) {
+        Some((code, body)) => Ok(HandlerOutcome::AppError { code, body }),
+        None => Err(format!("Python {label} raised: {pyerr}")),
+    })
 }
 
 /// Inspect a Python exception. If it's an `RpcAppError(code, body)`,
@@ -542,22 +609,7 @@ impl RpcHandler for PyRpcHandler {
         .await;
 
         match result {
-            Ok(Ok(Ok(HandlerOutcome::Ok(body)))) => Ok(RpcResponsePayload {
-                status: RpcStatus::Ok,
-                headers: vec![],
-                body: body.into(),
-            }),
-            Ok(Ok(Ok(HandlerOutcome::AppError { code, body }))) => {
-                Err(RpcHandlerError::Application {
-                    code,
-                    // RpcHandlerError::Application carries `message:
-                    // String`. The fold encodes it as the response
-                    // body; lossy-utf8 is fine because the typed
-                    // wrappers always produce utf-8 JSON.
-                    message: String::from_utf8_lossy(&body).into_owned(),
-                })
-            }
-            Ok(Ok(Err(msg))) => Err(RpcHandlerError::Internal(msg)),
+            Ok(Ok(outcome)) => finalize_handler_outcome(outcome),
             Ok(Err(join_err)) => Err(RpcHandlerError::Internal(format!(
                 "spawn_blocking task panicked: {join_err}"
             ))),
@@ -565,6 +617,262 @@ impl RpcHandler for PyRpcHandler {
                 "Python handler did not respond within {} ms",
                 self.timeout.as_millis()
             ))),
+        }
+    }
+}
+
+// ============================================================================
+// PyAsyncRpcHandler — adapts an `async def` Python callable to the
+// RpcHandler trait. Each handler invocation:
+//   1. Acquires the GIL, calls the user's `handler(req)`, gets back
+//      a Python coroutine.
+//   2. Converts the coroutine to a Rust future via
+//      `pyo3_async_runtimes::tokio::into_future`.
+//   3. Awaits the future on the tokio runtime — no spawn_blocking
+//      slot needed because the awaits happen cooperatively.
+//   4. Extracts the bytes result OR an RpcAppError exception.
+//
+// Compared to the sync PyRpcHandler, this path doesn't burn a
+// blocking-pool slot per request — a server with N concurrent
+// in-flight handlers + async handlers uses N tokio tasks, not N
+// blocking-pool threads.
+// ============================================================================
+
+struct PyAsyncRpcHandler {
+    callable: Py<PyAny>,
+    timeout: Duration,
+}
+
+#[async_trait::async_trait]
+impl RpcHandler for PyAsyncRpcHandler {
+    async fn call(
+        &self,
+        ctx: RpcContext,
+    ) -> std::result::Result<RpcResponsePayload, RpcHandlerError> {
+        let callable = Python::attach(|py| self.callable.clone_ref(py));
+        let req_body = ctx.payload.body;
+        // Build the coroutine + convert to a Rust future under the
+        // GIL; we own the future from there. The future itself
+        // doesn't need the GIL to make progress — the bridge
+        // re-acquires it on each Python-side step.
+        //
+        // Dispatch goes through `into_future_with_locals` against
+        // the server-side dispatcher loop (see
+        // `async_bridge::dispatcher_locals`). The substrate's tokio
+        // worker has no running asyncio loop of its own; the
+        // dispatcher runs in a daemon Python thread and drives
+        // every handler coroutine via `call_soon_threadsafe`.
+        let fut_result = Python::attach(|py| -> Result<_, PyErr> {
+            let locals = crate::async_bridge::dispatcher_locals(py)?;
+            let req_bytes = PyBytes::new(py, &req_body);
+            let args = PyTuple::new(py, [req_bytes.into_any()])?;
+            let coro = callable.call1(py, args)?;
+            pyo3_async_runtimes::into_future_with_locals(&locals, coro.into_bound(py))
+        });
+        let fut = match fut_result {
+            Ok(f) => f,
+            Err(pyerr) => {
+                let outcome = Python::attach(|py| extract_app_error(py, &pyerr));
+                return match outcome {
+                    Some((code, body)) => Err(RpcHandlerError::Application {
+                        code,
+                        message: String::from_utf8_lossy(&body).into_owned(),
+                    }),
+                    None => Err(RpcHandlerError::Internal(format!(
+                        "Python handler raised: {pyerr}"
+                    ))),
+                };
+            }
+        };
+        let timeout_result = tokio::time::timeout(self.timeout, fut).await;
+        let py_result = match timeout_result {
+            Ok(r) => r,
+            Err(_) => {
+                return Err(RpcHandlerError::Internal(format!(
+                    "Python async handler did not respond within {} ms",
+                    self.timeout.as_millis()
+                )));
+            }
+        };
+        let outcome = match py_result {
+            Ok(value) => Python::attach(|py| -> Result<HandlerOutcome, String> {
+                let bound = value.into_bound(py);
+                let bytes_vec: Vec<u8> = bound
+                    .extract()
+                    .map_err(|e| format!("Python handler must return bytes: {e}"))?;
+                Ok(HandlerOutcome::Ok(bytes_vec))
+            }),
+            Err(pyerr) => pyerr_to_handler_outcome(&pyerr, "async handler"),
+        };
+        finalize_handler_outcome(outcome)
+    }
+}
+
+// ============================================================================
+// Async streaming-serve bridges — T1-A7 completion.
+//
+// PyAsyncRpcClientStreamingHandler / PyAsyncRpcDuplexHandler invoke
+// the Python callable to obtain a coroutine, then await it via
+// `pyo3_async_runtimes::tokio::into_future`. The stream + sink
+// handles passed to the coroutine are the existing sync wrappers
+// (PyRequestStreamRecv / PyResponseSinkSend); the async handler can
+// iterate them sync via `for chunk in stream:` (sync iter inside
+// `async fn` is fine — the chunk pull blocks one bridge worker,
+// other tasks keep running). True async iteration on the server
+// side would need parallel Async* stream/sink shims; that's a
+// follow-up if a real consumer asks.
+// ============================================================================
+
+struct PyAsyncRpcClientStreamingHandler {
+    callable: Py<PyAny>,
+    timeout: Duration,
+    runtime: Arc<Runtime>,
+}
+
+#[async_trait::async_trait]
+impl RpcClientStreamingHandler for PyAsyncRpcClientStreamingHandler {
+    async fn call(
+        &self,
+        ctx: RpcStreamingContext,
+        requests: InnerRequestStream,
+    ) -> std::result::Result<RpcResponsePayload, RpcHandlerError> {
+        let callable = Python::attach(|py| self.callable.clone_ref(py));
+        let runtime = self.runtime.clone();
+        let stream_inner = Arc::new(Mutex::new(Some(requests)));
+        let ctx_headers = Arc::new(ctx.headers);
+        let fut_result = Python::attach(|py| -> Result<_, PyErr> {
+            let stream_obj = Py::new(
+                py,
+                PyRequestStreamRecv {
+                    inner: stream_inner,
+                    runtime,
+                    caller_origin: ctx.caller_origin,
+                    call_id: ctx.call_id,
+                    deadline_ns: ctx.deadline_ns,
+                    headers: ctx_headers,
+                },
+            )?;
+            let locals = crate::async_bridge::dispatcher_locals(py)?;
+            let args = PyTuple::new(py, [stream_obj.into_any()])?;
+            let coro = callable.call1(py, args)?;
+            pyo3_async_runtimes::into_future_with_locals(&locals, coro.into_bound(py))
+        });
+        let fut = match fut_result {
+            Ok(f) => f,
+            Err(pyerr) => {
+                let outcome = Python::attach(|py| extract_app_error(py, &pyerr));
+                return match outcome {
+                    Some((code, body)) => Err(RpcHandlerError::Application {
+                        code,
+                        message: String::from_utf8_lossy(&body).into_owned(),
+                    }),
+                    None => Err(RpcHandlerError::Internal(format!(
+                        "Python async client-streaming handler raised: {pyerr}"
+                    ))),
+                };
+            }
+        };
+        let timeout_result = tokio::time::timeout(self.timeout, fut).await;
+        let py_result = match timeout_result {
+            Ok(r) => r,
+            Err(_) => {
+                return Err(RpcHandlerError::Internal(format!(
+                    "Python async client-streaming handler did not respond within {} ms",
+                    self.timeout.as_millis()
+                )));
+            }
+        };
+        let outcome = match py_result {
+            Ok(value) => Python::attach(|py| -> Result<HandlerOutcome, String> {
+                let bound = value.into_bound(py);
+                let bytes_vec: Vec<u8> = bound.extract().map_err(|e| {
+                    format!("Python async client-streaming handler must return bytes: {e}")
+                })?;
+                Ok(HandlerOutcome::Ok(bytes_vec))
+            }),
+            Err(pyerr) => pyerr_to_handler_outcome(&pyerr, "async client-streaming handler"),
+        };
+        finalize_handler_outcome(outcome)
+    }
+}
+
+struct PyAsyncRpcDuplexHandler {
+    callable: Py<PyAny>,
+    timeout: Duration,
+    runtime: Arc<Runtime>,
+}
+
+#[async_trait::async_trait]
+impl RpcDuplexHandler for PyAsyncRpcDuplexHandler {
+    async fn call(
+        &self,
+        ctx: RpcStreamingContext,
+        requests: InnerRequestStream,
+        responses: InnerRpcResponseSink,
+    ) -> std::result::Result<(), RpcHandlerError> {
+        let callable = Python::attach(|py| self.callable.clone_ref(py));
+        let runtime = self.runtime.clone();
+        let stream_inner = Arc::new(Mutex::new(Some(requests)));
+        let sink_inner = Arc::new(Mutex::new(Some(responses)));
+        let ctx_headers = Arc::new(ctx.headers);
+        let fut_result = Python::attach(|py| -> Result<_, PyErr> {
+            let stream_obj = Py::new(
+                py,
+                PyRequestStreamRecv {
+                    inner: stream_inner,
+                    runtime,
+                    caller_origin: ctx.caller_origin,
+                    call_id: ctx.call_id,
+                    deadline_ns: ctx.deadline_ns,
+                    headers: ctx_headers,
+                },
+            )?;
+            let sink_obj = Py::new(py, PyResponseSinkSend { inner: sink_inner })?;
+            let locals = crate::async_bridge::dispatcher_locals(py)?;
+            let args = PyTuple::new(py, [stream_obj.into_any(), sink_obj.into_any()])?;
+            let coro = callable.call1(py, args)?;
+            pyo3_async_runtimes::into_future_with_locals(&locals, coro.into_bound(py))
+        });
+        let fut = match fut_result {
+            Ok(f) => f,
+            Err(pyerr) => {
+                let outcome = Python::attach(|py| extract_app_error(py, &pyerr));
+                return match outcome {
+                    Some((code, body)) => Err(RpcHandlerError::Application {
+                        code,
+                        message: String::from_utf8_lossy(&body).into_owned(),
+                    }),
+                    None => Err(RpcHandlerError::Internal(format!(
+                        "Python async duplex handler raised: {pyerr}"
+                    ))),
+                };
+            }
+        };
+        let timeout_result = tokio::time::timeout(self.timeout, fut).await;
+        let py_result = match timeout_result {
+            Ok(r) => r,
+            Err(_) => {
+                return Err(RpcHandlerError::Internal(format!(
+                    "Python async duplex handler did not respond within {} ms",
+                    self.timeout.as_millis()
+                )));
+            }
+        };
+        match py_result {
+            Ok(_) => Ok(()),
+            Err(pyerr) => {
+                let outcome = pyerr_to_handler_outcome(&pyerr, "async duplex handler");
+                // Map onto the unit-returning duplex shape: Ok(())
+                // for AppError too (the substrate ignores the body
+                // — duplex handlers don't return a terminal reply).
+                match finalize_handler_outcome(outcome) {
+                    // finalize_handler_outcome only ever returns
+                    // Err for our Err-variant inputs; map to the
+                    // bare RpcHandlerError.
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            }
         }
     }
 }
@@ -1387,18 +1695,7 @@ impl RpcClientStreamingHandler for PyRpcClientStreamingHandler {
         )
         .await;
         match result {
-            Ok(Ok(Ok(HandlerOutcome::Ok(body)))) => Ok(RpcResponsePayload {
-                status: RpcStatus::Ok,
-                headers: vec![],
-                body: body.into(),
-            }),
-            Ok(Ok(Ok(HandlerOutcome::AppError { code, body }))) => {
-                Err(RpcHandlerError::Application {
-                    code,
-                    message: String::from_utf8_lossy(&body).into_owned(),
-                })
-            }
-            Ok(Ok(Err(msg))) => Err(RpcHandlerError::Internal(msg)),
+            Ok(Ok(outcome)) => finalize_handler_outcome(outcome),
             Ok(Err(join_err)) => Err(RpcHandlerError::Internal(format!(
                 "spawn_blocking task panicked: {join_err}"
             ))),
@@ -1475,14 +1772,13 @@ impl RpcDuplexHandler for PyRpcDuplexHandler {
         )
         .await;
         match result {
-            Ok(Ok(Ok(HandlerOutcome::Ok(_)))) => Ok(()),
-            Ok(Ok(Ok(HandlerOutcome::AppError { code, body }))) => {
-                Err(RpcHandlerError::Application {
-                    code,
-                    message: String::from_utf8_lossy(&body).into_owned(),
-                })
-            }
-            Ok(Ok(Err(msg))) => Err(RpcHandlerError::Internal(msg)),
+            Ok(Ok(outcome)) => match finalize_handler_outcome(outcome) {
+                // Duplex returns Result<(), _> — discard the body
+                // on Ok (it's always an empty Vec); App/Internal
+                // errors pass through.
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            },
             Ok(Err(join_err)) => Err(RpcHandlerError::Internal(format!(
                 "spawn_blocking task panicked: {join_err}"
             ))),
@@ -1683,6 +1979,10 @@ pub struct PyRpcMetricsSnapshot {
 //
 // Constructed via `MeshRpc(net_mesh)` — takes the existing NetMesh
 // and shares its MeshNode + tokio runtime.
+//
+// Async equivalent: :class:`AsyncMeshRpc` — same `MeshNode`,
+// awaitable `call` / `call_streaming` / `serve` (accepts `async def`
+// handlers).
 // ============================================================================
 
 #[pyclass(name = "MeshRpc", module = "_net")]
@@ -1723,15 +2023,16 @@ impl PyMeshRpc {
         handler: Py<PyAny>,
         handler_timeout_ms: Option<u64>,
     ) -> PyResult<PyServeHandle> {
-        let timeout = match handler_timeout_ms {
-            Some(0) => Duration::from_secs(u64::MAX / 1000),
-            Some(ms) => Duration::from_millis(ms),
-            None => DEFAULT_HANDLER_TIMEOUT,
-        };
+        let timeout = resolve_handler_timeout(handler_timeout_ms);
         let rust_handler = Arc::new(PyRpcHandler {
             callable: handler,
             timeout,
         });
+        // serve_rpc spawns the bridge task synchronously at register
+        // time (see substrate mesh_rpc.rs build_request_grant_emitter +
+        // dispatcher spawn). Enter the runtime so Handle::current()
+        // resolves; without this we panic with "no reactor running".
+        let _enter = self.runtime.enter();
         let inner = self
             .node
             .serve_rpc(&service, rust_handler)
@@ -1956,16 +2257,13 @@ impl PyMeshRpc {
         handler: Py<PyAny>,
         handler_timeout_ms: Option<u64>,
     ) -> PyResult<PyServeHandle> {
-        let timeout = match handler_timeout_ms {
-            Some(0) => Duration::from_secs(u64::MAX / 1000),
-            Some(ms) => Duration::from_millis(ms),
-            None => DEFAULT_HANDLER_TIMEOUT,
-        };
+        let timeout = resolve_handler_timeout(handler_timeout_ms);
         let rust_handler = Arc::new(PyRpcClientStreamingHandler {
             callable: handler,
             timeout,
             runtime: self.runtime.clone(),
         });
+        let _enter = self.runtime.enter();
         let inner = self
             .node
             .serve_rpc_client_stream(&service, rust_handler)
@@ -1987,16 +2285,13 @@ impl PyMeshRpc {
         handler: Py<PyAny>,
         handler_timeout_ms: Option<u64>,
     ) -> PyResult<PyServeHandle> {
-        let timeout = match handler_timeout_ms {
-            Some(0) => Duration::from_secs(u64::MAX / 1000),
-            Some(ms) => Duration::from_millis(ms),
-            None => DEFAULT_HANDLER_TIMEOUT,
-        };
+        let timeout = resolve_handler_timeout(handler_timeout_ms);
         let rust_handler = Arc::new(PyRpcDuplexHandler {
             callable: handler,
             timeout,
             runtime: self.runtime.clone(),
         });
+        let _enter = self.runtime.enter();
         let inner = self
             .node
             .serve_rpc_duplex(&service, rust_handler)
@@ -2089,6 +2384,901 @@ impl PyMeshRpc {
                 observer_dropped_total,
             },
         )
+    }
+}
+
+// ============================================================================
+// PyAsyncMeshRpc — async-`def` envelope class (T1-A3+).
+//
+// Mirrors `PyMeshRpc`'s constructor + node-sharing model exactly;
+// the methods return `Bound<PyAny>` awaitables instead of blocking.
+// The asyncio task-cancel path propagates to
+// `MeshNode::cancel(token)` via the F-2 `await_with_cancel` adapter.
+//
+// Constructor accepts the same `NetMesh` instance as `PyMeshRpc`;
+// users may construct both classes against one mesh and mix calls.
+// ============================================================================
+
+#[pyclass(name = "AsyncMeshRpc", module = "_net")]
+pub struct PyAsyncMeshRpc {
+    node: Arc<MeshNode>,
+    /// The parent NetMesh's `Arc<Runtime>`. Streaming-serve handler
+    /// shims (`PyAsyncRpcClientStreamingHandler` etc.) pass it down
+    /// to `PyRequestStreamRecv` so the sync `__next__` block_ons on
+    /// the same runtime the substrate stream is bound to. Unary
+    /// paths drive futures via the bridge runtime and don't read
+    /// this field.
+    runtime: Arc<Runtime>,
+}
+
+#[pymethods]
+impl PyAsyncMeshRpc {
+    /// Build an `AsyncMeshRpc` against an existing `NetMesh`. Cheap
+    /// (`Arc::clone`); call once per mesh and reuse. Shares the
+    /// `MeshNode` with any sibling `MeshRpc` instance, so a server
+    /// registered via `MeshRpc.serve(...)` is reachable from
+    /// `AsyncMeshRpc.call(...)` and vice versa.
+    #[new]
+    fn new(mesh: &crate::mesh_bindings::NetMesh) -> PyResult<Self> {
+        let node = mesh.node_arc_clone()?;
+        let runtime = mesh.runtime_arc();
+        Ok(PyAsyncMeshRpc { node, runtime })
+    }
+
+    /// Register a Python handler on `service`. Accepts EITHER a
+    /// sync `def handler(req: bytes) -> bytes` OR an
+    /// `async def handler(req: bytes) -> bytes` — detected via
+    /// `inspect.iscoroutinefunction` at register time. Async
+    /// handlers run as coroutines on the substrate's tokio
+    /// runtime; sync handlers keep the `spawn_blocking` path
+    /// (same semantics as :meth:`MeshRpc.serve`).
+    ///
+    /// `handler_timeout_ms` works the same as on the sync class.
+    #[pyo3(signature = (service, handler, handler_timeout_ms=None))]
+    fn serve(
+        &self,
+        py: Python<'_>,
+        service: String,
+        handler: Py<PyAny>,
+        handler_timeout_ms: Option<u64>,
+    ) -> PyResult<PyServeHandle> {
+        let timeout = resolve_handler_timeout(handler_timeout_ms);
+        // `serve_rpc` is monomorphic in the handler type (Arc<H: Sized>),
+        // so we can't unify the two arms into Arc<dyn RpcHandler>.
+        // Branch the registration itself instead.
+        let _enter = self.runtime.enter();
+        let inner = if is_coroutine_function(py, &handler) {
+            self.node.serve_rpc(
+                &service,
+                Arc::new(PyAsyncRpcHandler {
+                    callable: handler,
+                    timeout,
+                }),
+            )
+        } else {
+            self.node.serve_rpc(
+                &service,
+                Arc::new(PyRpcHandler {
+                    callable: handler,
+                    timeout,
+                }),
+            )
+        }
+        .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
+        Ok(PyServeHandle {
+            inner: Arc::new(Mutex::new(Some(inner))),
+        })
+    }
+
+    /// Register a Python client-streaming handler. Accepts EITHER
+    /// a sync `def handler(stream) -> bytes` OR an
+    /// `async def handler(stream) -> bytes`.
+    ///
+    /// The `stream` arg is a `RequestStreamRecv` — iterate it via
+    /// `for chunk in stream:` to drain inbound chunks. Iteration
+    /// is sync regardless of the handler's async-ness; an
+    /// `async def` handler can still `await` other work between
+    /// chunks, but the per-chunk pull blocks one bridge worker.
+    /// (True async-iter on the server side ships if a real
+    /// consumer asks.)
+    ///
+    /// Sync equivalent: :meth:`MeshRpc.serve_client_stream`.
+    #[pyo3(signature = (service, handler, handler_timeout_ms=None))]
+    fn serve_client_stream(
+        &self,
+        py: Python<'_>,
+        service: String,
+        handler: Py<PyAny>,
+        handler_timeout_ms: Option<u64>,
+    ) -> PyResult<PyServeHandle> {
+        let timeout = resolve_handler_timeout(handler_timeout_ms);
+        let _enter = self.runtime.enter();
+        let inner = if is_coroutine_function(py, &handler) {
+            self.node.serve_rpc_client_stream(
+                &service,
+                Arc::new(PyAsyncRpcClientStreamingHandler {
+                    callable: handler,
+                    timeout,
+                    runtime: self.runtime.clone(),
+                }),
+            )
+        } else {
+            self.node.serve_rpc_client_stream(
+                &service,
+                Arc::new(PyRpcClientStreamingHandler {
+                    callable: handler,
+                    timeout,
+                    runtime: self.runtime.clone(),
+                }),
+            )
+        }
+        .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
+        Ok(PyServeHandle {
+            inner: Arc::new(Mutex::new(Some(inner))),
+        })
+    }
+
+    /// Register a Python duplex handler. Accepts EITHER a sync
+    /// `def handler(stream, sink) -> None` OR an
+    /// `async def handler(stream, sink) -> None`.
+    ///
+    /// Same sync-stream / async-handler combination as
+    /// :meth:`serve_client_stream`. Emit response chunks via
+    /// `sink.send(bytes)`.
+    ///
+    /// Sync equivalent: :meth:`MeshRpc.serve_duplex`.
+    #[pyo3(signature = (service, handler, handler_timeout_ms=None))]
+    fn serve_duplex(
+        &self,
+        py: Python<'_>,
+        service: String,
+        handler: Py<PyAny>,
+        handler_timeout_ms: Option<u64>,
+    ) -> PyResult<PyServeHandle> {
+        let timeout = resolve_handler_timeout(handler_timeout_ms);
+        let _enter = self.runtime.enter();
+        let inner = if is_coroutine_function(py, &handler) {
+            self.node.serve_rpc_duplex(
+                &service,
+                Arc::new(PyAsyncRpcDuplexHandler {
+                    callable: handler,
+                    timeout,
+                    runtime: self.runtime.clone(),
+                }),
+            )
+        } else {
+            self.node.serve_rpc_duplex(
+                &service,
+                Arc::new(PyRpcDuplexHandler {
+                    callable: handler,
+                    timeout,
+                    runtime: self.runtime.clone(),
+                }),
+            )
+        }
+        .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
+        Ok(PyServeHandle {
+            inner: Arc::new(Mutex::new(Some(inner))),
+        })
+    }
+
+    /// Direct-addressed unary call. Returns an awaitable resolving
+    /// to the response body as `bytes`. Asyncio task cancellation
+    /// (e.g. `asyncio.wait_for(..., timeout=...)` expiry) fires
+    /// `MeshNode::cancel(token)` mid-flight; the awaitable then
+    /// raises `RpcCancelledError`.
+    ///
+    /// Sync equivalent: :meth:`MeshRpc.call`.
+    #[pyo3(signature = (target_node_id, service, request, opts=None))]
+    fn call<'py>(
+        &self,
+        py: Python<'py>,
+        target_node_id: u64,
+        service: String,
+        request: &Bound<'py, PyBytes>,
+        opts: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut inner_opts = call_options_from_dict(opts)?;
+        let req_bytes = Bytes::copy_from_slice(request.as_bytes());
+        let node = self.node.clone();
+        crate::async_bridge::await_with_cancel(py, &self.node, move |token| {
+            inner_opts.cancel_token = Some(token);
+            async move {
+                node.call(target_node_id, &service, req_bytes, inner_opts)
+                    .await
+                    .map(|reply| crate::async_bridge::BytesReply(reply.body))
+                    .map_err(rpc_error_to_pyerr)
+            }
+        })
+    }
+
+    /// Service-discovery unary call. Resolves `service` via the
+    /// local capability index + routing policy, calls, awaits.
+    ///
+    /// Sync equivalent: :meth:`MeshRpc.call_service`.
+    #[pyo3(signature = (service, request, opts=None))]
+    fn call_service<'py>(
+        &self,
+        py: Python<'py>,
+        service: String,
+        request: &Bound<'py, PyBytes>,
+        opts: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut inner_opts = call_options_from_dict(opts)?;
+        let req_bytes = Bytes::copy_from_slice(request.as_bytes());
+        let node = self.node.clone();
+        crate::async_bridge::await_with_cancel(py, &self.node, move |token| {
+            inner_opts.cancel_token = Some(token);
+            async move {
+                node.call_service(&service, req_bytes, inner_opts)
+                    .await
+                    .map(|reply| crate::async_bridge::BytesReply(reply.body))
+                    .map_err(rpc_error_to_pyerr)
+            }
+        })
+    }
+
+    /// All node ids advertising `nrpc:<service>` in the local
+    /// capability index. Local read — synchronous (no I/O, no
+    /// `await` needed). Identical to :meth:`MeshRpc.find_service_nodes`.
+    fn find_service_nodes(&self, _py: Python<'_>, service: String) -> Vec<u64> {
+        self.node.find_service_nodes(&service)
+    }
+
+    /// Open a client-streaming call. Returns an awaitable that
+    /// resolves to an :class:`AsyncClientStreamCall`. Push chunks
+    /// with `await call.send(body)`, then `await call.finish()`
+    /// to drain the terminal response.
+    ///
+    /// Sync equivalent: :meth:`MeshRpc.call_client_stream`.
+    #[pyo3(signature = (target_node_id, service, opts=None))]
+    fn call_client_stream<'py>(
+        &self,
+        py: Python<'py>,
+        target_node_id: u64,
+        service: String,
+        opts: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut inner_opts = call_options_from_dict(opts)?;
+        let node = self.node.clone();
+        let mesh_for_call = self.node.clone();
+        crate::async_bridge::await_with_cancel(py, &self.node, move |token| {
+            inner_opts.cancel_token = Some(token);
+            async move {
+                let inner = node
+                    .call_client_stream(target_node_id, &service, inner_opts)
+                    .await
+                    .map_err(rpc_error_to_pyerr)?;
+                let call_id_cached = inner.call_id();
+                let flow_controlled_cached = inner.flow_controlled();
+                Ok::<_, PyErr>(PyAsyncClientStreamCall {
+                    inner: Arc::new(TokioMutex::new(Some(inner))),
+                    closed: Arc::new(AtomicBool::new(false)),
+                    mesh: mesh_for_call,
+                    cancel_token: token,
+                    call_id_cached,
+                    flow_controlled_cached,
+                })
+            }
+        })
+    }
+
+    /// Open a duplex call. Returns an awaitable resolving to an
+    /// :class:`AsyncDuplexCall` with both upload + download
+    /// surfaces. Use ``into_split`` to peel into independent
+    /// :class:`AsyncDuplexSink` + :class:`AsyncDuplexStream` halves.
+    ///
+    /// Sync equivalent: :meth:`MeshRpc.call_duplex`.
+    #[pyo3(signature = (target_node_id, service, opts=None))]
+    fn call_duplex<'py>(
+        &self,
+        py: Python<'py>,
+        target_node_id: u64,
+        service: String,
+        opts: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut inner_opts = call_options_from_dict(opts)?;
+        let node = self.node.clone();
+        let mesh_for_call = self.node.clone();
+        crate::async_bridge::await_with_cancel(py, &self.node, move |token| {
+            inner_opts.cancel_token = Some(token);
+            async move {
+                let inner = node
+                    .call_duplex(target_node_id, &service, inner_opts)
+                    .await
+                    .map_err(rpc_error_to_pyerr)?;
+                let call_id_cached = inner.call_id();
+                let flow_controlled_cached = inner.flow_controlled();
+                Ok::<_, PyErr>(PyAsyncDuplexCall {
+                    inner: Arc::new(TokioMutex::new(Some(inner))),
+                    closed: Arc::new(AtomicBool::new(false)),
+                    mesh: mesh_for_call,
+                    cancel_token: token,
+                    call_id_cached,
+                    flow_controlled_cached,
+                })
+            }
+        })
+    }
+
+    /// Open a streaming-response call. Returns an awaitable that
+    /// resolves to an :class:`AsyncRpcStream`; iterate the stream
+    /// with `async for chunk in stream:` or pull chunks one at a
+    /// time with `await stream.__anext__()`.
+    ///
+    /// Cancellation: the construction await participates in the
+    /// asyncio task-cancel bridge (`asyncio.wait_for(...)` aborts
+    /// the open). Once open, each `__anext__` uses the same
+    /// substrate cancel-token so a mid-stream cancel terminates
+    /// the WHOLE stream cleanly.
+    ///
+    /// Sync equivalent: :meth:`MeshRpc.call_streaming`.
+    #[pyo3(signature = (target_node_id, service, request, opts=None))]
+    fn call_streaming<'py>(
+        &self,
+        py: Python<'py>,
+        target_node_id: u64,
+        service: String,
+        request: &Bound<'py, PyBytes>,
+        opts: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut inner_opts = call_options_from_dict(opts)?;
+        let req_bytes = Bytes::copy_from_slice(request.as_bytes());
+        let node = self.node.clone();
+        let mesh_for_stream = self.node.clone();
+        crate::async_bridge::await_with_cancel(py, &self.node, move |token| {
+            inner_opts.cancel_token = Some(token);
+            async move {
+                let stream = node
+                    .call_streaming(target_node_id, &service, req_bytes, inner_opts)
+                    .await
+                    .map_err(rpc_error_to_pyerr)?;
+                Ok::<_, PyErr>(PyAsyncRpcStream {
+                    inner: Arc::new(TokioMutex::new(Some(stream))),
+                    closed: Arc::new(AtomicBool::new(false)),
+                    mesh: mesh_for_stream,
+                    cancel_token: token,
+                })
+            }
+        })
+    }
+}
+
+// ============================================================================
+// PyAsyncRpcStream — async iterator over streaming-call chunks.
+//
+// `__aiter__` + `__anext__` (PEP 525). Each `__anext__` reuses the
+// construction-time cancel-token via `await_with_existing_token`
+// so a mid-stream `asyncio.wait_for(...).cancel()` propagates to
+// the substrate's cancel-watcher and terminates the WHOLE stream
+// (not just the current pull) via the existing
+// `arm_stream_cancel` machinery on the substrate side.
+// ============================================================================
+
+#[pyclass(name = "AsyncRpcStream", module = "_net")]
+pub struct PyAsyncRpcStream {
+    /// Tokio mutex (not parking_lot) so `__anext__` can hold the
+    /// guard across `stream.next().await` directly — one acquire
+    /// per pull instead of the take/put pattern that races with
+    /// `close()` (a parking_lot put-back resurrects an inner the
+    /// close had just cleared).
+    inner: Arc<TokioMutex<Option<InnerRpcStream>>>,
+    /// Set by `close()`; the next pull checks before awaiting and
+    /// exits with `StopAsyncIteration`. Source of truth for
+    /// closure — `inner: None` is just storage cleanup.
+    closed: Arc<AtomicBool>,
+    mesh: Arc<MeshNode>,
+    cancel_token: u64,
+}
+
+#[pymethods]
+impl PyAsyncRpcStream {
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Awaitable that resolves to the next chunk as ``bytes``, or
+    /// raises ``StopAsyncIteration`` on clean EOF. Mid-stream
+    /// errors raise an :class:`RpcError` subclass.
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let closed = self.closed.clone();
+        let mesh = self.mesh.clone();
+        let token = self.cancel_token;
+        crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
+            let mut guard = inner.lock().await;
+            if closed.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+            }
+            let Some(stream) = guard.as_mut() else {
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+            };
+            match stream.next().await {
+                Some(Ok(bytes)) => Ok::<crate::async_bridge::BytesReply, PyErr>(
+                    crate::async_bridge::BytesReply(bytes),
+                ),
+                Some(Err(e)) => {
+                    *guard = None;
+                    Err(rpc_error_to_pyerr(e))
+                }
+                None => {
+                    *guard = None;
+                    Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
+                }
+            }
+        })
+    }
+
+    /// Grant `n` additional flow-control credits to the server's
+    /// pump. No-op if the call didn't set `stream_window_initial`.
+    /// Sync — uses `try_lock` so it never blocks waiting on an
+    /// in-flight pull; if the lock is held it skips (the next pull
+    /// will observe whatever the substrate-side state already is).
+    fn grant(&self, n: u32) {
+        if let Ok(guard) = self.inner.try_lock() {
+            if let Some(stream) = guard.as_ref() {
+                stream.grant(n);
+            }
+        }
+    }
+
+    /// `True` if the call set `stream_window_initial`. Sync via
+    /// `try_lock`; conservatively returns `false` if the lock is
+    /// held by an in-flight pull.
+    fn flow_controlled(&self) -> bool {
+        self.inner
+            .try_lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.flow_controlled()))
+            .unwrap_or(false)
+    }
+
+    /// Close the stream; emits CANCEL to the server (best-effort).
+    /// Idempotent. Sync — sets the `closed` flag and best-effort
+    /// drops the inner stream. An in-flight pull observes the
+    /// flag on its next check.
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        if let Ok(mut guard) = self.inner.try_lock() {
+            *guard = None;
+        }
+    }
+
+    /// Async alias for :meth:`close` so users can write
+    /// ``await stream.aclose()`` for consistency with other
+    /// async iterator types.
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.close();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
+    }
+}
+
+// ============================================================================
+// PyAsyncClientStreamCall — async client-streaming call handle.
+//
+// Mirror of PyClientStreamCall's Arc<Mutex<Option<...>>> shape with
+// `async def send` / `async def finish` instead of blocking
+// methods. send() uses await_with_existing_token so a mid-send
+// task.cancel() fires mesh.cancel(token), terminating the call.
+// ============================================================================
+
+#[pyclass(name = "AsyncClientStreamCall", module = "_net")]
+pub struct PyAsyncClientStreamCall {
+    inner: Arc<TokioMutex<Option<InnerClientStreamCallRaw>>>,
+    closed: Arc<AtomicBool>,
+    mesh: Arc<MeshNode>,
+    cancel_token: u64,
+    call_id_cached: u64,
+    flow_controlled_cached: bool,
+}
+
+#[pymethods]
+impl PyAsyncClientStreamCall {
+    /// Async push of one body chunk. Awaits the initial REQUEST
+    /// publish (first call) or one upload credit (subsequent
+    /// calls under flow control). Asyncio task-cancel mid-await
+    /// fires the substrate cancel-token, terminating the call.
+    fn send<'py>(
+        &self,
+        py: Python<'py>,
+        body: &Bound<'py, PyBytes>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let closed = self.closed.clone();
+        let mesh = self.mesh.clone();
+        let token = self.cancel_token;
+        let body_bytes = Bytes::copy_from_slice(body.as_bytes());
+        crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
+            let mut guard = inner.lock().await;
+            if closed.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(RpcError::new_err("client-stream call already closed"));
+            }
+            let Some(call) = guard.as_mut() else {
+                return Err(RpcError::new_err("client-stream call already closed"));
+            };
+            match call.send(body_bytes).await {
+                Ok(()) => Ok::<(), PyErr>(()),
+                Err(e) => {
+                    *guard = None;
+                    Err(rpc_error_to_pyerr(e))
+                }
+            }
+        })
+    }
+
+    /// Async REQUEST_END + terminal-response drain. Consumes the
+    /// call — subsequent send/finish raise ``RpcError``.
+    fn finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let closed = self.closed.clone();
+        let mesh = self.mesh.clone();
+        let token = self.cancel_token;
+        crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
+            let mut guard = inner.lock().await;
+            if closed.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(RpcError::new_err("client-stream call already closed"));
+            }
+            let call = match guard.take() {
+                Some(c) => c,
+                None => return Err(RpcError::new_err("client-stream call already closed")),
+            };
+            closed.store(true, Ordering::Release);
+            let reply = call.finish().await.map_err(rpc_error_to_pyerr)?;
+            Ok::<crate::async_bridge::BytesReply, PyErr>(crate::async_bridge::BytesReply(
+                reply.body,
+            ))
+        })
+    }
+
+    /// Server-assigned `call_id` for diagnostics / trace correlation.
+    fn call_id(&self) -> u64 {
+        self.call_id_cached
+    }
+
+    /// ``True`` if the call was opened with a non-``None``
+    /// ``request_window_initial``.
+    fn flow_controlled(&self) -> bool {
+        self.flow_controlled_cached
+    }
+
+    /// Close without finishing. Fires CANCEL via the SDK's Drop
+    /// if the initial REQUEST has already flown. Idempotent.
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        if let Ok(mut guard) = self.inner.try_lock() {
+            *guard = None;
+        }
+    }
+
+    /// Async alias for :meth:`close`.
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.close();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
+    }
+}
+
+// ============================================================================
+// PyAsyncDuplexCall + PyAsyncDuplexSink + PyAsyncDuplexStream (T1-A6).
+//
+// Async duplex shape: `async def send` + `async def finish_sending`
+// for the upload side, `__aiter__`/`__anext__` (PEP 525) for the
+// download side, `into_split` to peel into independent halves.
+//
+// Every awaitable threads the construction-time cancel-token via
+// await_with_existing_token, so a mid-call task.cancel() (or
+// asyncio.wait_for timeout) tears down both halves cleanly.
+// ============================================================================
+
+#[pyclass(name = "AsyncDuplexCall", module = "_net")]
+pub struct PyAsyncDuplexCall {
+    inner: Arc<TokioMutex<Option<InnerDuplexCallRaw>>>,
+    closed: Arc<AtomicBool>,
+    mesh: Arc<MeshNode>,
+    cancel_token: u64,
+    call_id_cached: u64,
+    flow_controlled_cached: bool,
+}
+
+#[pymethods]
+impl PyAsyncDuplexCall {
+    /// Async push of one body chunk to the server.
+    fn send<'py>(
+        &self,
+        py: Python<'py>,
+        body: &Bound<'py, PyBytes>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let closed = self.closed.clone();
+        let mesh = self.mesh.clone();
+        let token = self.cancel_token;
+        let body_bytes = Bytes::copy_from_slice(body.as_bytes());
+        crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
+            let mut guard = inner.lock().await;
+            if closed.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(RpcError::new_err("duplex call already closed"));
+            }
+            let Some(call) = guard.as_mut() else {
+                return Err(RpcError::new_err("duplex call already closed"));
+            };
+            match call.send(body_bytes).await {
+                Ok(()) => Ok::<(), PyErr>(()),
+                Err(e) => {
+                    *guard = None;
+                    Err(rpc_error_to_pyerr(e))
+                }
+            }
+        })
+    }
+
+    /// Async upload-direction REQUEST_END. The response side stays
+    /// open for subsequent `__anext__` pulls.
+    fn finish_sending<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let closed = self.closed.clone();
+        let mesh = self.mesh.clone();
+        let token = self.cancel_token;
+        crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
+            let mut guard = inner.lock().await;
+            if closed.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(RpcError::new_err("duplex call already closed"));
+            }
+            let Some(call) = guard.as_mut() else {
+                return Err(RpcError::new_err("duplex call already closed"));
+            };
+            call.finish_sending().await.map_err(rpc_error_to_pyerr)
+        })
+    }
+
+    /// PEP 525 async iterator over the response side.
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Awaitable yielding the next response chunk; raises
+    /// ``StopAsyncIteration`` on clean EOF.
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let closed = self.closed.clone();
+        let mesh = self.mesh.clone();
+        let token = self.cancel_token;
+        crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
+            let mut guard = inner.lock().await;
+            if closed.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+            }
+            let Some(call) = guard.as_mut() else {
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+            };
+            match call.next().await {
+                Some(Ok(bytes)) => Ok::<crate::async_bridge::BytesReply, PyErr>(
+                    crate::async_bridge::BytesReply(bytes),
+                ),
+                Some(Err(e)) => {
+                    *guard = None;
+                    Err(rpc_error_to_pyerr(e))
+                }
+                None => {
+                    *guard = None;
+                    Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
+                }
+            }
+        })
+    }
+
+    /// Split into independent send + receive halves. After split,
+    /// the original ``AsyncDuplexCall`` is consumed — subsequent
+    /// send / finish_sending / __anext__ raise ``RpcError``.
+    #[pyo3(name = "into_split")]
+    fn split(&self) -> PyResult<(PyAsyncDuplexSink, PyAsyncDuplexStream)> {
+        // try_lock + flag flip: an in-flight pull holds the lock,
+        // and we don't want to wait from sync context. If the lock
+        // is busy, the caller can retry; in practice users only
+        // split before the first pull.
+        let mut guard = self
+            .inner
+            .try_lock()
+            .map_err(|_| RpcError::new_err("duplex call busy — split during in-flight call"))?;
+        let call = guard
+            .take()
+            .ok_or_else(|| RpcError::new_err("duplex call already closed"))?;
+        self.closed.store(true, Ordering::Release);
+        let call_id = call.call_id();
+        let flow_controlled = call.flow_controlled();
+        let (sink, stream) = call.into_split();
+        Ok((
+            PyAsyncDuplexSink {
+                inner: Arc::new(TokioMutex::new(Some(sink))),
+                closed: Arc::new(AtomicBool::new(false)),
+                mesh: self.mesh.clone(),
+                cancel_token: self.cancel_token,
+                call_id_cached: call_id,
+                flow_controlled_cached: flow_controlled,
+            },
+            PyAsyncDuplexStream {
+                inner: Arc::new(TokioMutex::new(Some(stream))),
+                closed: Arc::new(AtomicBool::new(false)),
+                mesh: self.mesh.clone(),
+                cancel_token: self.cancel_token,
+                call_id_cached: call_id,
+            },
+        ))
+    }
+
+    /// Server-assigned `call_id`.
+    fn call_id(&self) -> u64 {
+        self.call_id_cached
+    }
+
+    /// ``True`` if the call was opened with a non-``None``
+    /// ``request_window_initial``.
+    fn flow_controlled(&self) -> bool {
+        self.flow_controlled_cached
+    }
+
+    /// Close the call. Fires CANCEL via the SDK's Drop. Idempotent.
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        if let Ok(mut guard) = self.inner.try_lock() {
+            *guard = None;
+        }
+    }
+
+    /// Async alias for :meth:`close`.
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.close();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
+    }
+}
+
+#[pyclass(name = "AsyncDuplexSink", module = "_net")]
+pub struct PyAsyncDuplexSink {
+    inner: Arc<TokioMutex<Option<InnerDuplexSink>>>,
+    closed: Arc<AtomicBool>,
+    mesh: Arc<MeshNode>,
+    cancel_token: u64,
+    call_id_cached: u64,
+    flow_controlled_cached: bool,
+}
+
+#[pymethods]
+impl PyAsyncDuplexSink {
+    fn send<'py>(
+        &self,
+        py: Python<'py>,
+        body: &Bound<'py, PyBytes>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let closed = self.closed.clone();
+        let mesh = self.mesh.clone();
+        let token = self.cancel_token;
+        let body_bytes = Bytes::copy_from_slice(body.as_bytes());
+        crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
+            let mut guard = inner.lock().await;
+            if closed.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(RpcError::new_err("duplex sink already closed"));
+            }
+            let Some(sink) = guard.as_mut() else {
+                return Err(RpcError::new_err("duplex sink already closed"));
+            };
+            match sink.send(body_bytes).await {
+                Ok(()) => Ok::<(), PyErr>(()),
+                Err(e) => {
+                    *guard = None;
+                    Err(rpc_error_to_pyerr(e))
+                }
+            }
+        })
+    }
+
+    /// Close the upload direction (emit REQUEST_END). Consumes
+    /// the sink — subsequent ``send`` raises ``RpcError``.
+    fn finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let closed = self.closed.clone();
+        let mesh = self.mesh.clone();
+        let token = self.cancel_token;
+        crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
+            let mut guard = inner.lock().await;
+            if closed.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(RpcError::new_err("duplex sink already closed"));
+            }
+            let sink = match guard.take() {
+                Some(s) => s,
+                None => return Err(RpcError::new_err("duplex sink already closed")),
+            };
+            closed.store(true, Ordering::Release);
+            sink.finish_sending().await.map_err(rpc_error_to_pyerr)
+        })
+    }
+
+    fn call_id(&self) -> u64 {
+        self.call_id_cached
+    }
+
+    fn flow_controlled(&self) -> bool {
+        self.flow_controlled_cached
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        if let Ok(mut guard) = self.inner.try_lock() {
+            *guard = None;
+        }
+    }
+
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.close();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
+    }
+}
+
+#[pyclass(name = "AsyncDuplexStream", module = "_net")]
+pub struct PyAsyncDuplexStream {
+    inner: Arc<TokioMutex<Option<InnerDuplexStream>>>,
+    closed: Arc<AtomicBool>,
+    mesh: Arc<MeshNode>,
+    cancel_token: u64,
+    call_id_cached: u64,
+}
+
+#[pymethods]
+impl PyAsyncDuplexStream {
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let closed = self.closed.clone();
+        let mesh = self.mesh.clone();
+        let token = self.cancel_token;
+        crate::async_bridge::await_with_existing_token(py, &mesh, token, async move {
+            let mut guard = inner.lock().await;
+            if closed.load(Ordering::Acquire) {
+                *guard = None;
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+            }
+            let Some(stream) = guard.as_mut() else {
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+            };
+            match stream.next().await {
+                Some(Ok(bytes)) => Ok::<crate::async_bridge::BytesReply, PyErr>(
+                    crate::async_bridge::BytesReply(bytes),
+                ),
+                Some(Err(e)) => {
+                    *guard = None;
+                    Err(rpc_error_to_pyerr(e))
+                }
+                None => {
+                    *guard = None;
+                    Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
+                }
+            }
+        })
+    }
+
+    fn call_id(&self) -> u64 {
+        self.call_id_cached
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        if let Ok(mut guard) = self.inner.try_lock() {
+            *guard = None;
+        }
+    }
+
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.close();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
     }
 }
 

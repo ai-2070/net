@@ -82,6 +82,159 @@ bus = Net(
 )
 ```
 
+## Async API
+
+Every I/O surface ships a parallel `Async*` class. The sync API stays unchanged — pick whichever shape fits the caller; both share the same underlying mesh / adapter / handle and interoperate freely.
+
+### Quickstart
+
+```python
+import asyncio
+from net import NetMesh, AsyncNetMesh, AsyncMeshRpc
+
+async def main():
+    mesh = NetMesh("127.0.0.1:9000", "00" * 32)
+    mesh.start()
+
+    amesh = AsyncNetMesh(mesh)            # Arc::clone — shares the same MeshNode
+    arpc = AsyncMeshRpc(mesh)             # same — shared service registry
+
+    await amesh.connect("127.0.0.1:9001", peer_pub, peer_node_id)
+    reply = await arpc.call(peer_node_id, "echo", b"hello")
+    print(reply)
+
+asyncio.run(main())
+```
+
+### Available `Async*` classes
+
+| Sync class | Async sibling | What's awaitable |
+|---|---|---|
+| `NetMesh` | `AsyncNetMesh` | `connect`, `accept`, `push_to`, `poll`, `subscribe_channel`, `unsubscribe_channel`, `publish`, `announce_capabilities`, `shutdown` |
+| `NetStream` | `AsyncNetStream` | `send`, `send_with_retry`, `send_blocking` |
+| `MeshRpc` | `AsyncMeshRpc` | `call`, `call_service`, `call_streaming`, `call_client_stream`, `call_duplex`, `serve` / `serve_client_stream` / `serve_duplex` (each accepts `async def` handlers) |
+| `RpcStream` | `AsyncRpcStream` | PEP 525 `async for chunk in stream:` |
+| `ClientStreamCall` | `AsyncClientStreamCall` | `send`, `finish` |
+| `DuplexCall` / `DuplexSink` / `DuplexStream` | `AsyncDuplexCall` / `AsyncDuplexSink` / `AsyncDuplexStream` | `send`, `finish_sending`, async-iter on the read half |
+| `TypedMeshRpc` | `AsyncTypedMeshRpc` | Codec-wrapped variants of every `AsyncMeshRpc` shape |
+| `MemoriesAdapter` | `AsyncMemoriesAdapter` | `wait_for_seq`, `wait_for_token`, `watch_memories`, `snapshot_and_watch_memories` |
+| `MemoryWatchIter` | `AsyncMemoryWatchIter` | PEP 525 async iter |
+| `TasksAdapter` | `AsyncTasksAdapter` | `wait_for_seq`, `wait_for_token`, `watch_tasks`, `snapshot_and_watch_tasks` |
+| `TaskWatchIter` | `AsyncTaskWatchIter` | PEP 525 async iter |
+| `RedexFile` | `AsyncRedexFile` | `tail()` returns an `AsyncRedexTailIter` |
+| `RedexTailIter` | `AsyncRedexTailIter` | PEP 525 async iter |
+| `DaemonRuntime` | `AsyncDaemonRuntime` | `start`, `shutdown`, `spawn`, `spawn_from_snapshot`, `stop`, `snapshot`, `deliver`, `start_migration`, `start_migration_with` |
+| `MigrationHandle` | `AsyncMigrationHandle` | `wait`, `wait_with_timeout`, `cancel` |
+| `MeshBlobAdapter` | `AsyncMeshBlobAdapter` | `store`, `fetch`, `fetch_range`, `exists`, `repair_blob` |
+| `blob_publish` / `blob_resolve` (free fns) | `async_blob_publish` / `async_blob_resolve` | Awaitable versions of the free functions |
+| `RegistryClient` | `AsyncRegistryClient` | `list`, `spawn`, `unregister` |
+| `FoldQueryClient` | `AsyncFoldQueryClient` | `query_latest`, `query_summarize_now` |
+| `MeshQueryRunner` | `AsyncMeshQueryRunner` | `execute` |
+| `DeckClient` | `AsyncDeckClient` | `close`; getters stay sync; `.admin` is `AsyncAdminCommands`; `.ice` is `AsyncIceCommands`; `.snapshots()` / `.status_summary_stream()` return async iters |
+| `AdminCommands` | `AsyncAdminCommands` | `drain`, `enter_maintenance`, `exit_maintenance`, `cordon`, `uncordon`, `drop_replicas`, `invalidate_placement`, `restart_all_daemons`, `clear_avoid_list` |
+| `IceCommands` / `IceProposal` / `SimulatedIceProposal` | `AsyncIceCommands` / `AsyncIceProposal` / `AsyncSimulatedIceProposal` | Factories stay sync; `proposal.simulate()` and `simulated.commit()` are awaitable |
+| `SnapshotStream` / `StatusSummaryStream` | `AsyncSnapshotStream` / `AsyncStatusSummaryStream` | PEP 525 async iter |
+| `MeshOsDaemonSdk` / `MeshOsDaemonHandle` | `AsyncMeshOsDaemonSdk` / `AsyncMeshOsDaemonHandle` | `shutdown` / `next_control` / `graceful_shutdown` are awaitable; constructed via `from_sync(sync_inst)` (consumes the sync sibling) |
+
+### Mixing sync and async
+
+`Async*` classes wrap the same Rust `Arc<...>` as their sync counterparts. A server registered via `MeshRpc.serve(...)` is callable from `AsyncMeshRpc.call(...)` and vice versa — same for every adapter. Mix shapes within a single program freely; just pick the one that matches the caller (sync script: sync API; asyncio handler: async API).
+
+```python
+from net import NetMesh, MeshRpc, AsyncMeshRpc, MemoriesAdapter, AsyncMemoriesAdapter
+
+mesh = NetMesh("127.0.0.1:9000", "00" * 32)
+# A server, registered from sync code
+def echo(req: bytes) -> bytes:
+    return req
+MeshRpc(mesh).serve("echo", echo)
+
+# An async caller against the same mesh — sees the same server
+async def caller():
+    arpc = AsyncMeshRpc(mesh)
+    return await arpc.call_service("echo", b"hi")
+```
+
+### Cancellation
+
+`asyncio.wait_for(...)` cancellation propagates to the substrate's cancel registry on every nRPC call. The wrapped task drops, the substrate's `Mesh::cancel(token)` fires, and the in-flight call returns `RpcCancelledError`:
+
+```python
+import asyncio
+from net import AsyncMeshRpc, RpcCancelledError
+
+async def with_timeout(arpc):
+    try:
+        return await asyncio.wait_for(
+            arpc.call(target, "slow", b"..."),
+            timeout=0.5,
+        )
+    except (asyncio.TimeoutError, RpcCancelledError):
+        # Either is fine — the underlying call is cancelled either way.
+        return None
+```
+
+Streaming shapes propagate cancellation per construction — cancelling mid-`async for` terminates the entire stream, not just one pull. Non-mesh subsystems (channel publish, capability announce, mesh handshake) don't have substrate cancel tokens yet; asyncio cancellation still drops the awaiting tokio task, but the in-flight network round-trip may complete in the background.
+
+### `async def` server handlers
+
+`AsyncMeshRpc.serve` (and the typed `AsyncTypedMeshRpc.serve`) detect `inspect.iscoroutinefunction(handler)` at register time and route the coroutine through a dedicated dispatch path. Sync handlers keep the `spawn_blocking` shape; async handlers run as native coroutines:
+
+```python
+async def handler(req: bytes) -> bytes:
+    chunk = await fetch_from_upstream(req)
+    return chunk
+
+AsyncMeshRpc(mesh).serve("upstream", handler)
+```
+
+### Migration cookbook
+
+The mechanical translation:
+
+```python
+# Before — sync
+def listener(mesh):
+    rpc = MeshRpc(mesh)
+    reply = rpc.call(target, "svc", b"...")
+    return reply
+
+# After — async
+async def listener(mesh):
+    rpc = AsyncMeshRpc(mesh)
+    reply = await rpc.call(target, "svc", b"...")
+    return reply
+```
+
+For loops over streams:
+
+```python
+# Before — sync
+for chunk in rpc.call_streaming(...):
+    consume(chunk)
+
+# After — async
+async for chunk in arpc.call_streaming(...):
+    await consume(chunk)
+```
+
+For server-pushed watches (`watch_tasks`, `watch_memories`, `tail`, `subscribe_logs`, etc.):
+
+```python
+# Before — sync
+it = adapter.watch_memories(source="bot")
+for batch in it:
+    render(batch)
+
+# After — async
+async_adapter = AsyncMemoriesAdapter(adapter)
+it = await async_adapter.watch_memories(source="bot")
+async for batch in it:
+    await render(batch)
+```
+
+The sync `Adapter.watch_memories(...)` returns an iterator directly; the async equivalent is an awaitable yielding an async iterator (one extra `await`), because the underlying stream construction itself may run on the bridge runtime.
+
 ## Net Encrypted UDP Transport
 
 Net provides encrypted point-to-point UDP transport for high-performance scenarios:

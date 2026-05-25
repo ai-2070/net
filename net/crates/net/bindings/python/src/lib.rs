@@ -4,6 +4,7 @@
 
 #[cfg(feature = "aggregator")]
 mod aggregator;
+mod async_bridge;
 #[cfg(feature = "dataforts")]
 mod blob;
 mod capability_aggregation;
@@ -978,6 +979,9 @@ mod mesh_bindings {
     }
 
     /// Handle to an open stream. Opaque to Python callers.
+    ///
+    /// Async equivalent: :class:`AsyncNetStream` — awaitable
+    /// `send` / `send_with_retry` / `send_blocking`.
     #[pyclass]
     pub struct NetStream {
         pub(crate) peer_node_id: u64,
@@ -1045,6 +1049,9 @@ mod mesh_bindings {
     /// Manages encrypted connections to multiple peers over a single
     /// UDP socket with automatic failure detection and rerouting.
     ///
+    /// Async equivalent: :class:`AsyncNetMesh` — same `MeshNode`,
+    /// awaitable I/O methods.
+    ///
     /// ```python
     /// from net import NetMesh
     ///
@@ -1099,6 +1106,7 @@ mod mesh_bindings {
             subnet_policy=None,
             reflex_override=None,
             try_port_mapping=None,
+            permissive_channels=None,
         ))]
         #[allow(clippy::too_many_arguments)]
         fn new(
@@ -1126,6 +1134,17 @@ mod mesh_bindings {
             // not correctness — silently ignored when the cdylib
             // was built without `--features port-mapping`.
             try_port_mapping: Option<bool>,
+            // permissive_channels: opt out of the strict
+            // `ChannelConfigRegistry` install. When True, no
+            // registry is set on the MeshNode, so the substrate's
+            // `authorize_subscribe` treats all channels as
+            // permissive (matches the Rust default in
+            // tests/integration_nrpc_mesh.rs). When False or None
+            // (default), the strict registry is installed and
+            // every subscribed channel must be `register_channel`'d
+            // first. Test-only knob — production code should
+            // keep the strict default.
+            permissive_channels: Option<bool>,
         ) -> PyResult<Self> {
             let addr: std::net::SocketAddr = bind_addr
                 .parse()
@@ -1211,9 +1230,13 @@ mod mesh_bindings {
                 .block_on(MeshNode::new(identity, config))
                 .map_err(|e| PyRuntimeError::new_err(format!("MeshNode: {}", e)))?;
 
-            // Install shared channel-config registry.
+            // Install shared channel-config registry. Tests can
+            // opt out with `permissive_channels=True` to match the
+            // Rust integration-test default (no registry → no ACL).
             let channel_configs = Arc::new(ChannelConfigRegistry::new());
-            node.set_channel_configs(channel_configs.clone());
+            if !permissive_channels.unwrap_or(false) {
+                node.set_channel_configs(channel_configs.clone());
+            }
             // Install a fresh TokenCache — channel auth needs
             // somewhere to stash tokens presented on subscribe.
             //
@@ -2269,11 +2292,497 @@ mod mesh_bindings {
             self.runtime.clone()
         }
     }
+
+    // ====================================================================
+    // AsyncNetMesh / AsyncNetStream — T1-A1 + T1-A2.
+    //
+    // Parallel async surface over the same `Arc<MeshNode>` the sync
+    // `NetMesh` / `NetStream` wrap. Constructor accepts the sync
+    // `NetMesh` (cheap `Arc::clone`); handshakes, subscriptions,
+    // capability announcements, and stream registrations done via
+    // one side are visible to the other. Async I/O methods return
+    // Python awaitables via the pyo3-async-runtimes bridge.
+    //
+    // No substrate cancel-token plumbing here — `MeshNode::connect`,
+    // `subscribe_channel`, `publish`, etc. don't expose cancel-token
+    // hooks (yet). asyncio task-cancel still works: dropping the
+    // pyo3-async-runtimes-spawned task drops the underlying tokio
+    // future, which the substrate handles at session/stream level.
+    // Cancel-token wiring lands when the substrate exposes it for
+    // these surfaces.
+    // ====================================================================
+
+    /// Async sibling of [`NetStream`]. Same opaque handle to a
+    /// logical stream; awaitable `send*` methods live here so users
+    /// can write ``await stream.send(payloads)`` directly instead
+    /// of routing through `AsyncNetMesh.send_on_stream(...)`.
+    ///
+    /// Sync equivalent: :class:`NetStream`.
+    #[pyclass(name = "AsyncNetStream", module = "_net")]
+    pub struct AsyncNetStream {
+        peer_node_id: u64,
+        stream_id: u64,
+        core: CoreStream,
+        node: Arc<MeshNode>,
+    }
+
+    #[pymethods]
+    impl AsyncNetStream {
+        #[getter]
+        fn peer_node_id(&self) -> u64 {
+            self.peer_node_id
+        }
+        #[getter]
+        fn stream_id(&self) -> u64 {
+            self.stream_id
+        }
+        fn __repr__(&self) -> String {
+            format!(
+                "AsyncNetStream(peer_node_id={:#x}, stream_id={:#x})",
+                self.peer_node_id, self.stream_id
+            )
+        }
+
+        /// Send a batch of payloads. Returns an awaitable that
+        /// resolves to ``None`` on success.
+        ///
+        /// Raises:
+        ///     BackpressureError: per-stream window is full.
+        ///     NotConnectedError: peer session is gone.
+        ///     RuntimeError: transport failure.
+        fn send<'py>(&self, py: Python<'py>, events: Vec<Vec<u8>>) -> PyResult<Bound<'py, PyAny>> {
+            let node = self.node.clone();
+            let core = self.core.clone();
+            let payloads: Vec<bytes::Bytes> = events.into_iter().map(bytes::Bytes::from).collect();
+            pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                node.send_on_stream(&core, &payloads)
+                    .await
+                    .map_err(stream_error_to_py)
+            })
+        }
+
+        /// Send with up to ``max_retries`` retries on
+        /// `BackpressureError` (5 ms → 200 ms exponential).
+        /// Transport errors raise immediately.
+        #[pyo3(signature = (events, max_retries=8))]
+        fn send_with_retry<'py>(
+            &self,
+            py: Python<'py>,
+            events: Vec<Vec<u8>>,
+            max_retries: u32,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let node = self.node.clone();
+            let core = self.core.clone();
+            let payloads: Vec<bytes::Bytes> = events.into_iter().map(bytes::Bytes::from).collect();
+            pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                node.send_with_retry(&core, &payloads, max_retries as usize)
+                    .await
+                    .map_err(stream_error_to_py)
+            })
+        }
+
+        /// Block-until-success send. Retries up to 4096 times under
+        /// sustained backpressure (~13 min worst case). Use
+        /// :meth:`send_with_retry` for a tighter bound.
+        fn send_blocking<'py>(
+            &self,
+            py: Python<'py>,
+            events: Vec<Vec<u8>>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let node = self.node.clone();
+            let core = self.core.clone();
+            let payloads: Vec<bytes::Bytes> = events.into_iter().map(bytes::Bytes::from).collect();
+            pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                node.send_blocking(&core, &payloads)
+                    .await
+                    .map_err(stream_error_to_py)
+            })
+        }
+    }
+
+    /// Newtype that lets `MeshNode::publish`'s `PublishReport` be
+    /// returned from a future and converted to the same `PyDict`
+    /// shape the sync `NetMesh.publish` method returns. The
+    /// conversion runs under the GIL on the Python awaitable's
+    /// resume step.
+    struct AsyncPublishReportWrap(InnerPublishReport);
+
+    impl<'py> pyo3::IntoPyObject<'py> for AsyncPublishReportWrap {
+        type Target = pyo3::types::PyAny;
+        type Output = Bound<'py, Self::Target>;
+        type Error = PyErr;
+        fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+            Ok(publish_report_to_pydict(py, self.0)?.into_any())
+        }
+    }
+
+    /// Async sibling of [`NetMesh`]. Shares the same `Arc<MeshNode>`
+    /// as the source sync `NetMesh`; handshakes / channels /
+    /// capabilities / streams are interoperable across both shapes.
+    /// Network methods return Python awaitables; sync helpers
+    /// (getters, `find_nodes`, etc.) stay sync.
+    ///
+    /// Sync equivalent: :class:`NetMesh`.
+    #[pyclass(name = "AsyncNetMesh", module = "_net")]
+    pub struct AsyncNetMesh {
+        node: Arc<MeshNode>,
+    }
+
+    #[pymethods]
+    impl AsyncNetMesh {
+        /// Build against an existing `NetMesh`. Cheap
+        /// (`Arc::clone`); the underlying `MeshNode` is shared.
+        #[new]
+        fn new(mesh: &NetMesh) -> PyResult<Self> {
+            let node = mesh
+                .node
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| PyRuntimeError::new_err("NetMesh has been shut down"))?;
+            Ok(Self { node })
+        }
+
+        #[getter]
+        fn public_key(&self) -> String {
+            hex::encode(self.node.public_key())
+        }
+        #[getter]
+        fn entity_id(&self) -> Vec<u8> {
+            self.node.entity_id().as_bytes().to_vec()
+        }
+        #[getter]
+        fn node_id(&self) -> u64 {
+            self.node.node_id()
+        }
+        fn peer_count(&self) -> usize {
+            self.node.peer_count()
+        }
+        fn discovered_nodes(&self) -> usize {
+            self.node.proximity_graph().node_count()
+        }
+
+        fn __repr__(&self) -> String {
+            format!(
+                "AsyncNetMesh(addr={}, peers={}, nodes={})",
+                self.node.local_addr(),
+                self.node.peer_count(),
+                self.node.proximity_graph().node_count()
+            )
+        }
+
+        /// Start the receive loop + heartbeats. Sync — internal
+        /// `tokio::spawn`, no network round-trip.
+        fn start(&self) -> PyResult<()> {
+            let handle = crate::async_bridge::runtime()
+                .ok_or_else(|| PyRuntimeError::new_err("async bridge not initialized"))?;
+            let _guard = handle.enter();
+            self.node.start();
+            Ok(())
+        }
+
+        /// Initiate a handshake to `peer_addr`. Returns an
+        /// awaitable that resolves to ``None`` on success.
+        #[pyo3(signature = (peer_addr, peer_public_key, peer_node_id))]
+        fn connect<'py>(
+            &self,
+            py: Python<'py>,
+            peer_addr: &str,
+            peer_public_key: &str,
+            peer_node_id: u64,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let addr: std::net::SocketAddr = peer_addr
+                .parse()
+                .map_err(|e| PyValueError::new_err(format!("invalid address: {}", e)))?;
+            let pubkey_bytes = hex::decode(peer_public_key)
+                .map_err(|e| PyValueError::new_err(format!("invalid hex: {}", e)))?;
+            if pubkey_bytes.len() != 32 {
+                return Err(PyValueError::new_err("public key must be 32 bytes"));
+            }
+            let mut pubkey = [0u8; 32];
+            pubkey.copy_from_slice(&pubkey_bytes);
+            let node = self.node.clone();
+            pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                node.connect(addr, &pubkey, peer_node_id)
+                    .await
+                    .map_err(|e| PyRuntimeError::new_err(format!("connect: {}", e)))
+            })
+        }
+
+        /// Accept an incoming connection. Returns an awaitable
+        /// resolving to the peer's observed `ip:port` as a string.
+        fn accept<'py>(&self, py: Python<'py>, peer_node_id: u64) -> PyResult<Bound<'py, PyAny>> {
+            let node = self.node.clone();
+            pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                let (addr, _) = node
+                    .accept(peer_node_id)
+                    .await
+                    .map_err(|e| PyRuntimeError::new_err(format!("accept: {}", e)))?;
+                Ok::<String, PyErr>(addr.to_string())
+            })
+        }
+
+        /// Send raw JSON to a direct peer.
+        fn push_to<'py>(
+            &self,
+            py: Python<'py>,
+            peer_addr: &str,
+            json: String,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let addr: std::net::SocketAddr = peer_addr
+                .parse()
+                .map_err(|e| PyValueError::new_err(format!("invalid address: {}", e)))?;
+            let node = self.node.clone();
+            pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                let batch = net::event::Batch {
+                    shard_id: 0,
+                    events: vec![net::event::InternalEvent::new(
+                        bytes::Bytes::copy_from_slice(json.as_bytes()),
+                        0,
+                        0,
+                    )],
+                    sequence_start: 0,
+                    process_nonce: net::event::batch_process_nonce(),
+                };
+                node.send_to_peer(addr, &batch)
+                    .await
+                    .map(|_| true)
+                    .map_err(|e| PyRuntimeError::new_err(format!("send: {}", e)))
+            })
+        }
+
+        /// Poll for received events.
+        fn poll<'py>(&self, py: Python<'py>, limit: usize) -> PyResult<Bound<'py, PyAny>> {
+            let node = self.node.clone();
+            pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                let result = node
+                    .poll_shard(0, None, limit)
+                    .await
+                    .map_err(|e| PyRuntimeError::new_err(format!("poll: {}", e)))?;
+                let events: Vec<StoredEvent> = result
+                    .events
+                    .into_iter()
+                    .map(|e| {
+                        let raw = e.raw_str().unwrap_or("").to_string();
+                        StoredEvent {
+                            id: e.id,
+                            raw,
+                            insertion_ts: e.insertion_ts,
+                            shard_id: e.shard_id,
+                        }
+                    })
+                    .collect();
+                Ok::<Vec<StoredEvent>, PyErr>(events)
+            })
+        }
+
+        /// Subscribe to a channel on `publisher_node_id`. Optional
+        /// `token` carries a `PermissionToken` for capability auth.
+        #[pyo3(signature = (publisher_node_id, channel, token=None))]
+        fn subscribe_channel<'py>(
+            &self,
+            py: Python<'py>,
+            publisher_node_id: u64,
+            channel: &str,
+            token: Option<&[u8]>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let name = InnerChannelName::new(channel).map_err(|e| {
+                super::ChannelError::new_err(format!("channel: invalid name: {}", e))
+            })?;
+            let parsed_token = match token {
+                Some(bytes) => Some(
+                    net::adapter::net::identity::PermissionToken::from_bytes(bytes)
+                        .map_err(super::identity::token_err)?,
+                ),
+                None => None,
+            };
+            let node = self.node.clone();
+            pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                match parsed_token {
+                    Some(t) => node
+                        .subscribe_channel_with_token(publisher_node_id, name, t)
+                        .await
+                        .map_err(adapter_to_channel_pyerr),
+                    None => node
+                        .subscribe_channel(publisher_node_id, name)
+                        .await
+                        .map_err(adapter_to_channel_pyerr),
+                }
+            })
+        }
+
+        /// Unsubscribe from a channel on `publisher_node_id`.
+        fn unsubscribe_channel<'py>(
+            &self,
+            py: Python<'py>,
+            publisher_node_id: u64,
+            channel: &str,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let name = InnerChannelName::new(channel).map_err(|e| {
+                super::ChannelError::new_err(format!("channel: invalid name: {}", e))
+            })?;
+            let node = self.node.clone();
+            pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                node.unsubscribe_channel(publisher_node_id, name)
+                    .await
+                    .map_err(adapter_to_channel_pyerr)
+            })
+        }
+
+        /// Publish a payload to every subscriber. Returns an
+        /// awaitable resolving to the same dict shape as
+        /// :meth:`NetMesh.publish`.
+        #[pyo3(signature = (
+            channel,
+            payload,
+            *,
+            reliability = None,
+            on_failure = None,
+            max_inflight = None,
+        ))]
+        fn publish<'py>(
+            &self,
+            py: Python<'py>,
+            channel: &str,
+            payload: &[u8],
+            reliability: Option<&str>,
+            on_failure: Option<&str>,
+            max_inflight: Option<u32>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let name = InnerChannelName::new(channel).map_err(|e| {
+                super::ChannelError::new_err(format!("channel: invalid name: {}", e))
+            })?;
+            let mut pub_cfg = InnerPublishConfig {
+                reliability: Reliability::FireAndForget,
+                on_failure: InnerOnFailure::BestEffort,
+                max_inflight: 32,
+            };
+            if let Some(r) = reliability {
+                pub_cfg.reliability = parse_reliability_cfg(r)?;
+            }
+            if let Some(f) = on_failure {
+                pub_cfg.on_failure = parse_on_failure(f)?;
+            }
+            if let Some(n) = max_inflight {
+                pub_cfg.max_inflight = n as usize;
+            }
+            let publisher = ChannelPublisher::new(name, pub_cfg);
+            let payload_bytes = bytes::Bytes::copy_from_slice(payload);
+            let node = self.node.clone();
+            pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                let report = node
+                    .publish(&publisher, payload_bytes)
+                    .await
+                    .map_err(adapter_to_channel_pyerr)?;
+                Ok::<AsyncPublishReportWrap, PyErr>(AsyncPublishReportWrap(report))
+            })
+        }
+
+        /// Broadcast a capability announcement to every directly-
+        /// connected peer and self-index for `find_nodes` matches.
+        fn announce_capabilities<'py>(
+            &self,
+            py: Python<'py>,
+            caps: &Bound<'py, PyDict>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let core = super::capabilities::capability_set_from_py(caps)?;
+            let node = self.node.clone();
+            pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                node.announce_capabilities(core)
+                    .await
+                    .map_err(|e| PyRuntimeError::new_err(format!("capability: {}", e)))
+            })
+        }
+
+        /// Open (or look up) a stream to a connected peer. Sync —
+        /// stream registration is local; no network round-trip.
+        /// Repeated calls for the same (peer, stream_id) are
+        /// idempotent.
+        #[pyo3(signature = (
+            peer_node_id,
+            stream_id,
+            reliability=None,
+            window_bytes=DEFAULT_STREAM_WINDOW_BYTES,
+            fairness_weight=1
+        ))]
+        fn open_stream(
+            &self,
+            peer_node_id: u64,
+            stream_id: u64,
+            reliability: Option<&str>,
+            window_bytes: u32,
+            fairness_weight: u8,
+        ) -> PyResult<AsyncNetStream> {
+            let rel = parse_reliability(reliability)?;
+            let config = StreamConfig::new()
+                .with_reliability(rel)
+                .with_window_bytes(window_bytes)
+                .with_fairness_weight(fairness_weight);
+            let core = self
+                .node
+                .open_stream(peer_node_id, stream_id, config)
+                .map_err(|e| PyRuntimeError::new_err(format!("open_stream: {}", e)))?;
+            Ok(AsyncNetStream {
+                peer_node_id,
+                stream_id,
+                core,
+                node: self.node.clone(),
+            })
+        }
+
+        /// Close a stream. Sync — idempotent local operation.
+        fn close_stream(&self, peer_node_id: u64, stream_id: u64) {
+            self.node.close_stream(peer_node_id, stream_id);
+        }
+
+        /// Snapshot of per-stream stats.
+        fn stream_stats(&self, peer_node_id: u64, stream_id: u64) -> Option<NetStreamStats> {
+            self.node
+                .stream_stats(peer_node_id, stream_id)
+                .map(|s| NetStreamStats {
+                    tx_seq: s.tx_seq,
+                    rx_seq: s.rx_seq,
+                    inbound_pending: s.inbound_pending,
+                    last_activity_ns: s.last_activity_ns,
+                    active: s.active,
+                    backpressure_events: s.backpressure_events,
+                    tx_credit_remaining: s.tx_credit_remaining,
+                    tx_window: s.tx_window,
+                    credit_grants_received: s.credit_grants_received,
+                    credit_grants_sent: s.credit_grants_sent,
+                })
+        }
+
+        /// Query the local capability index.
+        fn find_nodes(&self, filter: &Bound<'_, PyDict>) -> PyResult<Vec<u64>> {
+            let core = super::capabilities::capability_filter_from_py(filter)?;
+            Ok(self.node.find_nodes_by_filter(&core))
+        }
+
+        /// Shutdown the underlying mesh node. Idempotent. Returns
+        /// an awaitable.
+        fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+            let node = self.node.clone();
+            pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                node.shutdown()
+                    .await
+                    .map_err(|e| PyRuntimeError::new_err(format!("shutdown: {}", e)))
+            })
+        }
+    }
 }
 
 /// Net Python module.
 #[pymodule]
 fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Initialize the tokio↔asyncio bridge once per process. Every
+    // `Async*` class landing in waves T1+ spawns Python awaitables
+    // via `pyo3_async_runtimes::tokio::future_into_py`, which
+    // requires the bridge to be initialized first. Sync bindings
+    // (`Net`, `MeshRpc`, etc.) keep their per-instance runtimes
+    // for now; T1+ slices may migrate to share the bridge runtime.
+    async_bridge::init().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("async bridge init: {e}"))
+    })?;
     m.add_class::<Net>()?;
     m.add_class::<IngestResult>()?;
     m.add_class::<StoredEvent>()?;
@@ -2290,6 +2799,10 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<mesh_bindings::NetStream>()?;
     #[cfg(feature = "net")]
     m.add_class::<mesh_bindings::NetStreamStats>()?;
+    #[cfg(feature = "net")]
+    m.add_class::<mesh_bindings::AsyncNetMesh>()?;
+    #[cfg(feature = "net")]
+    m.add_class::<mesh_bindings::AsyncNetStream>()?;
     #[cfg(feature = "net")]
     m.add("BackpressureError", m.py().get_type::<BackpressureError>())?;
     #[cfg(feature = "net")]
@@ -2318,14 +2831,20 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<cortex::PyRedex>()?;
         m.add_class::<cortex::PyRedexFile>()?;
         m.add_class::<cortex::PyRedexTailIter>()?;
+        m.add_class::<cortex::PyAsyncRedexFile>()?;
+        m.add_class::<cortex::PyAsyncRedexTailIter>()?;
         m.add_class::<cortex::PyRedexEvent>()?;
         m.add_class::<cortex::PyWriteToken>()?;
         m.add_class::<cortex::PyTask>()?;
         m.add_class::<cortex::PyTasksAdapter>()?;
         m.add_class::<cortex::PyTaskWatchIter>()?;
+        m.add_class::<cortex::PyAsyncTasksAdapter>()?;
+        m.add_class::<cortex::PyAsyncTaskWatchIter>()?;
         m.add_class::<cortex::PyMemory>()?;
         m.add_class::<cortex::PyMemoriesAdapter>()?;
         m.add_class::<cortex::PyMemoryWatchIter>()?;
+        m.add_class::<cortex::PyAsyncMemoriesAdapter>()?;
+        m.add_class::<cortex::PyAsyncMemoryWatchIter>()?;
         m.add_class::<cortex::PyNetDb>()?;
         m.add("CortexError", m.py().get_type::<cortex::CortexError>())?;
         m.add("NetDbError", m.py().get_type::<cortex::NetDbError>())?;
@@ -2334,6 +2853,12 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         // / hedge / breaker land in a follow-up phase as a Python
         // wrapper module on top of these classes.
         m.add_class::<mesh_rpc::PyMeshRpc>()?;
+        m.add_class::<mesh_rpc::PyAsyncMeshRpc>()?;
+        m.add_class::<mesh_rpc::PyAsyncRpcStream>()?;
+        m.add_class::<mesh_rpc::PyAsyncClientStreamCall>()?;
+        m.add_class::<mesh_rpc::PyAsyncDuplexCall>()?;
+        m.add_class::<mesh_rpc::PyAsyncDuplexSink>()?;
+        m.add_class::<mesh_rpc::PyAsyncDuplexStream>()?;
         m.add_class::<mesh_rpc::PyServeHandle>()?;
         m.add_class::<mesh_rpc::PyRpcStream>()?;
         m.add_class::<mesh_rpc::PyCancellable>()?;
@@ -2378,6 +2903,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<blob::PyChunkingStrategy>()?;
         m.add_class::<blob::PyEncoding>()?;
         m.add_class::<blob::PyMeshBlobAdapter>()?;
+        m.add_class::<blob::PyAsyncMeshBlobAdapter>()?;
         m.add(
             "DATAFORTS_BLOB_TREE_SUPPORTED",
             blob::DATAFORTS_BLOB_TREE_SUPPORTED,
@@ -2401,6 +2927,8 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(blob::blob_adapter_ids, m)?)?;
         m.add_function(wrap_pyfunction!(blob::blob_publish, m)?)?;
         m.add_function(wrap_pyfunction!(blob::blob_resolve, m)?)?;
+        m.add_function(wrap_pyfunction!(blob::async_blob_publish, m)?)?;
+        m.add_function(wrap_pyfunction!(blob::async_blob_resolve, m)?)?;
         m.add("BlobError", m.py().get_type::<blob::BlobError>())?;
 
         // Register an atexit hook so the global blob-adapter
@@ -2422,6 +2950,8 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<compute::PyCausalEvent>()?;
         m.add_class::<compute::PyMigrationHandle>()?;
         m.add_class::<compute::PyMigrationPhasesIter>()?;
+        m.add_class::<compute::PyAsyncDaemonRuntime>()?;
+        m.add_class::<compute::PyAsyncMigrationHandle>()?;
         m.add("DaemonError", m.py().get_type::<compute::DaemonError>())?;
         m.add(
             "MigrationError",
@@ -2443,6 +2973,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<meshdb::PyCachePolicy>()?;
         m.add_class::<meshdb::PyInMemoryChainReader>()?;
         m.add_class::<meshdb::PyMeshQueryRunner>()?;
+        m.add_class::<meshdb::PyAsyncMeshQueryRunner>()?;
         m.add_class::<meshdb::PyAggregateResult>()?;
         m.add_class::<meshdb::PyGroupKey>()?;
         m.add_class::<meshdb::PyJoinedRow>()?;
@@ -2456,6 +2987,8 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         m.add_class::<meshos::PyMeshOsDaemonSdk>()?;
         m.add_class::<meshos::PyMeshOsDaemonHandle>()?;
+        m.add_class::<meshos::PyAsyncMeshOsDaemonSdk>()?;
+        m.add_class::<meshos::PyAsyncMeshOsDaemonHandle>()?;
         m.add(
             "MeshOsSdkError",
             m.py().get_type::<meshos::MeshOsSdkError>(),
@@ -2465,6 +2998,8 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         m.add_class::<aggregator::PyRegistryClient>()?;
         m.add_class::<aggregator::PyFoldQueryClient>()?;
+        m.add_class::<aggregator::PyAsyncRegistryClient>()?;
+        m.add_class::<aggregator::PyAsyncFoldQueryClient>()?;
         m.add(
             "RegistryClientError",
             m.py().get_type::<aggregator::RegistryClientError>(),
@@ -2500,6 +3035,13 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<deck::PyAdminCommands>()?;
         m.add_class::<deck::PySnapshotStream>()?;
         m.add_class::<deck::PyStatusSummaryStream>()?;
+        m.add_class::<deck::PyAsyncSnapshotStream>()?;
+        m.add_class::<deck::PyAsyncStatusSummaryStream>()?;
+        m.add_class::<deck::PyAsyncDeckClient>()?;
+        m.add_class::<deck::PyAsyncAdminCommands>()?;
+        m.add_class::<deck::PyAsyncIceCommands>()?;
+        m.add_class::<deck::PyAsyncIceProposal>()?;
+        m.add_class::<deck::PyAsyncSimulatedIceProposal>()?;
         m.add_class::<deck::PyOperatorIdentity>()?;
         m.add_class::<deck::PyLogStream>()?;
         m.add_class::<deck::PyFailureStream>()?;

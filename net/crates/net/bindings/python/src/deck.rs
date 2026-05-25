@@ -322,6 +322,9 @@ fn snapshot_to_json(py: Python<'_>, snap: &MeshOsSnapshot) -> PyResult<String> {
 /// Slice 1 returns JSON strings; the `sdk-py` wrapper parses them
 /// into dicts automatically. Typed pyclass projections land in
 /// slice 2 if a consumer asks.
+///
+/// Async equivalent: :class:`AsyncSnapshotStream` — PEP 525 async
+/// iterator over the same stream shape.
 #[pyclass(name = "SnapshotStream", module = "net._net")]
 pub struct PySnapshotStream {
     inner: Option<CoreSnapshotStream>,
@@ -356,7 +359,10 @@ impl PySnapshotStream {
 }
 
 // =========================================================================
-// PyStatusSummaryStream — sync Python iterator
+// PyStatusSummaryStream — sync Python iterator.
+//
+// Async equivalent: :class:`AsyncStatusSummaryStream` — PEP 525
+// async iterator over the same stream shape.
 // =========================================================================
 
 #[pyclass(name = "StatusSummaryStream", module = "net._net")]
@@ -399,6 +405,9 @@ impl PyStatusSummaryStream {
 /// Phase 1 substrate constraint: non-signing today (the substrate
 /// records the operator id but doesn't yet route through
 /// channel-auth).
+///
+/// Async equivalent: :class:`AsyncAdminCommands` — awaitable
+/// `drain` / `enter_maintenance` / `cordon` / etc.
 #[pyclass(name = "AdminCommands", module = "net._net")]
 pub struct PyAdminCommands {
     /// `Arc<CoreClient>` lets us produce an `AdminCommands<'a>`
@@ -540,6 +549,10 @@ impl PyAdminCommands {
 /// "operator-only" mode (the binding owns the supervisor), or via
 /// `from_meshos(sdk, identity)` against an externally-managed
 /// `MeshOsDaemonSdk`.
+///
+/// Async equivalent: :class:`AsyncDeckClient` — same `CoreClient`;
+/// awaitable `close`, async-iter snapshots/status streams, and
+/// `.admin` returns `AsyncAdminCommands`.
 #[pyclass(name = "DeckClient", module = "net._net")]
 pub struct PyDeckClient {
     client: Arc<CoreClient>,
@@ -1871,5 +1884,828 @@ impl PyAdminVerifier {
             self.inner.future_skew().as_millis() as u64,
             self.inner.ice_cooldown().as_millis() as u64,
         )
+    }
+}
+
+// =========================================================================
+// AsyncDeckClient + AsyncAdminCommands — T3-G1 + T3-G3.
+//
+// Async sibling of DeckClient wraps the same Arc<CoreClient>. close()
+// becomes awaitable; getters (identity, status, status_summary) stay
+// sync; .admin returns AsyncAdminCommands with awaitable
+// drain / enter_maintenance / etc.; .snapshots and
+// .status_summary_stream return async-iter siblings directly.
+//
+// AsyncIceCommands is deferred — the IceProposal typestate
+// (proposal → simulate → commit) needs awaitable mirrors of
+// PyIceProposal + PySimulatedIceProposal, which is more surface
+// than fits this slice.
+// =========================================================================
+
+/// Newtype around a `ChainCommit` so an awaitable can resolve to
+/// the same `PyDict` shape the sync admin methods return.
+struct AsyncChainCommitWrap(CoreChainCommit);
+
+impl<'py> pyo3::IntoPyObject<'py> for AsyncChainCommitWrap {
+    type Target = pyo3::types::PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        Ok(chain_commit_to_dict(py, &self.0)?.into_any())
+    }
+}
+
+/// Async sibling of [`PyAdminCommands`]. Wraps the same
+/// `Arc<CoreClient>`; each method commits an `AdminEvent` and
+/// returns an awaitable resolving to the same chain-commit dict
+/// shape as the sync sibling.
+///
+/// Sync equivalent: :class:`AdminCommands`.
+#[pyclass(name = "AsyncAdminCommands", module = "net._net")]
+pub struct PyAsyncAdminCommands {
+    client: Arc<CoreClient>,
+}
+
+impl PyAsyncAdminCommands {
+    fn admin(&self) -> CoreAdminCommands<'_> {
+        self.client.admin()
+    }
+
+    /// Helper that wraps the boilerplate every admin method shares:
+    /// clone the Arc<CoreClient>, build the SDK-call future, await
+    /// it, map DeckError→PyErr, wrap the ChainCommit. Each verb
+    /// passes its own `build` closure.
+    fn await_admin_commit<'py, B, Fut>(
+        &self,
+        py: Python<'py>,
+        build: B,
+    ) -> PyResult<Bound<'py, PyAny>>
+    where
+        B: FnOnce(Arc<CoreClient>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<CoreChainCommit, DeckError>> + Send + 'static,
+    {
+        let client = self.client.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let commit = build(client)
+                .await
+                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
+            Ok::<AsyncChainCommitWrap, PyErr>(AsyncChainCommitWrap(commit))
+        })
+    }
+}
+
+#[pymethods]
+impl PyAsyncAdminCommands {
+    fn drain<'py>(
+        &self,
+        py: Python<'py>,
+        node: u64,
+        drain_for_ms: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.await_admin_commit(py, move |client| async move {
+            client
+                .admin()
+                .drain(node, Duration::from_millis(drain_for_ms))
+                .await
+        })
+    }
+
+    #[pyo3(signature = (node, drain_for_ms=None))]
+    fn enter_maintenance<'py>(
+        &self,
+        py: Python<'py>,
+        node: u64,
+        drain_for_ms: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let drain_for = drain_for_ms.map(Duration::from_millis);
+        self.await_admin_commit(py, move |client| async move {
+            client.admin().enter_maintenance(node, drain_for).await
+        })
+    }
+
+    fn exit_maintenance<'py>(&self, py: Python<'py>, node: u64) -> PyResult<Bound<'py, PyAny>> {
+        self.await_admin_commit(py, move |client| async move {
+            client.admin().exit_maintenance(node).await
+        })
+    }
+
+    fn cordon<'py>(&self, py: Python<'py>, node: u64) -> PyResult<Bound<'py, PyAny>> {
+        self.await_admin_commit(py, move |client| async move {
+            client.admin().cordon(node).await
+        })
+    }
+
+    fn uncordon<'py>(&self, py: Python<'py>, node: u64) -> PyResult<Bound<'py, PyAny>> {
+        self.await_admin_commit(py, move |client| async move {
+            client.admin().uncordon(node).await
+        })
+    }
+
+    fn drop_replicas<'py>(
+        &self,
+        py: Python<'py>,
+        node: u64,
+        chains: Vec<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let chains: Vec<CoreChainId> = chains.into_iter().collect();
+        self.await_admin_commit(py, move |client| async move {
+            client.admin().drop_replicas(node, chains).await
+        })
+    }
+
+    fn invalidate_placement<'py>(&self, py: Python<'py>, node: u64) -> PyResult<Bound<'py, PyAny>> {
+        self.await_admin_commit(py, move |client| async move {
+            client.admin().invalidate_placement(node).await
+        })
+    }
+
+    fn restart_all_daemons<'py>(&self, py: Python<'py>, node: u64) -> PyResult<Bound<'py, PyAny>> {
+        self.await_admin_commit(py, move |client| async move {
+            client.admin().restart_all_daemons(node).await
+        })
+    }
+
+    fn clear_avoid_list<'py>(&self, py: Python<'py>, node: u64) -> PyResult<Bound<'py, PyAny>> {
+        self.await_admin_commit(py, move |client| async move {
+            client.admin().clear_avoid_list(node).await
+        })
+    }
+
+    // Suppress dead-code on the helper accessor — used implicitly
+    // by the awaitable bodies above, which use `client.admin()`
+    // directly. Kept for parity with PyAdminCommands::admin so the
+    // two surfaces are visually aligned.
+    #[allow(dead_code)]
+    fn _admin_helper(&self) {
+        let _ = self.admin();
+    }
+}
+
+/// Async sibling of [`PyDeckClient`]. Wraps the same
+/// `Arc<CoreClient>`; close becomes awaitable, getters stay sync,
+/// and `.admin` returns `AsyncAdminCommands`.
+///
+/// Sync equivalent: :class:`DeckClient`.
+#[pyclass(name = "AsyncDeckClient", module = "net._net")]
+pub struct PyAsyncDeckClient {
+    client: Arc<CoreClient>,
+    runtime: Arc<Runtime>,
+    /// Owned SDK is held jointly with the sync sibling — only one
+    /// shape should call `close()`. If the sync sibling is built
+    /// first and the async wraps it, the sync's `Drop` drains the
+    /// SDK on GC. If only the async exists, it owns the SDK.
+    owned_sdk: parking_lot::Mutex<Option<CoreSdk>>,
+}
+
+impl Drop for PyAsyncDeckClient {
+    fn drop(&mut self) {
+        let Some(sdk) = self.owned_sdk.lock().take() else {
+            return;
+        };
+        let runtime = self.runtime.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = runtime.block_on(sdk.shutdown());
+        }));
+    }
+}
+
+#[pymethods]
+impl PyAsyncDeckClient {
+    /// Build against an existing sync `DeckClient`. Cheap
+    /// (`Arc::clone`); the sync sibling retains ownership of the
+    /// SDK (close on the sync sibling drains it).
+    #[new]
+    fn new(client: &PyDeckClient) -> Self {
+        Self {
+            client: client.client.clone(),
+            runtime: client.runtime.clone(),
+            owned_sdk: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Construct a standalone async deck client owning its own
+    /// supervisor. Mirrors `DeckClient.__new__`.
+    #[staticmethod]
+    #[pyo3(signature = (operator_seed, meshos_config=None, deck_config=None))]
+    fn from_seed(
+        py: Python<'_>,
+        operator_seed: &Bound<'_, PyBytes>,
+        meshos_config: Option<&Bound<'_, PyDict>>,
+        deck_config: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
+        let seed_bytes = operator_seed.as_bytes();
+        if seed_bytes.len() != 32 {
+            return Err(deck_err(
+                py,
+                "invalid_argument",
+                &format!(
+                    "operator_seed must be exactly 32 bytes; got {}",
+                    seed_bytes.len()
+                ),
+            ));
+        }
+        let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+        seed.copy_from_slice(seed_bytes);
+        let keypair = EntityKeypair::from_bytes(*seed);
+        let identity = CoreIdentity::from_keypair(keypair);
+
+        let sdk_cfg = crate::meshos::meshos_config_from_dict(py, meshos_config)?;
+        let deck_cfg = config_from_dict(py, deck_config)?;
+
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    deck_err(
+                        py,
+                        "runtime_start_failed",
+                        &format!("failed to build tokio runtime: {e}"),
+                    )
+                })?,
+        );
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let sdk = {
+            let _enter = runtime.enter();
+            CoreSdk::start(sdk_cfg, dispatcher)
+        };
+        let core_client = CoreClient::new(
+            sdk.runtime().handle_clone(),
+            sdk.runtime().snapshot_reader().clone(),
+            identity,
+            deck_cfg,
+        );
+        Ok(Self {
+            client: Arc::new(core_client),
+            runtime,
+            owned_sdk: parking_lot::Mutex::new(Some(sdk)),
+        })
+    }
+
+    fn identity(&self) -> PyOperatorIdentity {
+        PyOperatorIdentity {
+            inner: self.client.identity().clone(),
+        }
+    }
+
+    /// One-shot read of the latest `MeshOsSnapshot` (JSON string).
+    /// Sync — local snapshot reader.
+    fn status(&self, py: Python<'_>) -> PyResult<String> {
+        let snap = self.client.status();
+        snapshot_to_json(py, &snap)
+    }
+
+    /// One-shot read of the rolled-up `StatusSummary`. Sync.
+    fn status_summary<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let s = self.client.status_summary();
+        status_summary_to_dict(py, &s)
+    }
+
+    /// Live snapshot stream — returns an `AsyncSnapshotStream`
+    /// ready for ``async for``.
+    fn snapshots(&self) -> PyAsyncSnapshotStream {
+        let _enter = self.runtime.enter();
+        let stream = self.client.snapshots();
+        PyAsyncSnapshotStream {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(stream))),
+        }
+    }
+
+    /// Live `StatusSummary` async stream.
+    fn status_summary_stream(&self) -> PyAsyncStatusSummaryStream {
+        let _enter = self.runtime.enter();
+        let stream = self.client.status_summary_stream();
+        PyAsyncStatusSummaryStream {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(stream))),
+        }
+    }
+
+    #[getter]
+    fn admin(&self) -> PyAsyncAdminCommands {
+        PyAsyncAdminCommands {
+            client: self.client.clone(),
+        }
+    }
+
+    #[getter]
+    fn ice(&self) -> PyAsyncIceCommands {
+        PyAsyncIceCommands {
+            client: self.client.clone(),
+            runtime: self.runtime.clone(),
+        }
+    }
+
+    /// Tear down the private supervisor runtime if this client
+    /// owns one (constructed via `from_seed`). Returns an
+    /// awaitable. No-op for clients built against an existing
+    /// `DeckClient` (the sync sibling owns the SDK).
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let Some(sdk) = self.owned_sdk.lock().take() else {
+            return pyo3_async_runtimes::tokio::future_into_py(
+                py,
+                async move { Ok::<(), PyErr>(()) },
+            );
+        };
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            sdk.shutdown().await.map_err(|e| {
+                Python::attach(|py| {
+                    deck_err(
+                        py,
+                        "shutdown_failed",
+                        &format!("runtime shutdown failed: {e:?}"),
+                    )
+                })
+            })?;
+            Ok::<(), PyErr>(())
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "AsyncDeckClient(operator_id={:#x})",
+            self.client.identity().operator_id()
+        )
+    }
+}
+
+// =========================================================================
+// AsyncIceCommands + AsyncIceProposal + AsyncSimulatedIceProposal — T3-G3.
+//
+// Async siblings of the ice break-glass typestate. Factory methods
+// stay sync (they construct a proposal husk locally, no I/O).
+// `simulate()` and `commit()` are awaitable on the async siblings.
+//
+// Mirrors the sync typestate's "consume on transition" guarantee —
+// `simulate()` consumes the AsyncIceProposal; `commit()` consumes
+// the AsyncSimulatedIceProposal. Re-calling either raises
+// `DeckSdkError(kind="already_*")`.
+// =========================================================================
+
+/// Newtype lifting `ChainCommit` into an awaitable's resolved
+/// value via `IntoPyObject`.
+struct AsyncChainCommitDeckWrap(CoreChainCommit);
+
+impl<'py> pyo3::IntoPyObject<'py> for AsyncChainCommitDeckWrap {
+    type Target = pyo3::types::PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        Ok(chain_commit_to_dict(py, &self.0)?.into_any())
+    }
+}
+
+/// Async sibling of [`PyIceCommands`]. Factory methods stay sync
+/// — they only construct a proposal husk locally. The async work
+/// happens on `AsyncIceProposal.simulate()` / `AsyncSimulatedIceProposal.commit()`.
+///
+/// Sync equivalent: :class:`IceCommands`.
+#[pyclass(name = "AsyncIceCommands", module = "net._net")]
+pub struct PyAsyncIceCommands {
+    client: Arc<CoreClient>,
+    runtime: Arc<Runtime>,
+}
+
+#[pymethods]
+impl PyAsyncIceCommands {
+    fn freeze_cluster(&self, ttl_ms: u64) -> PyAsyncIceProposal {
+        let proposal = self
+            .client
+            .ice()
+            .freeze_cluster(Duration::from_millis(ttl_ms));
+        PyAsyncIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        )
+    }
+
+    fn flush_avoid_lists(
+        &self,
+        py: Python<'_>,
+        scope: &Bound<'_, PyDict>,
+    ) -> PyResult<PyAsyncIceProposal> {
+        let scope = parse_avoid_scope(py, scope)?;
+        let proposal = self.client.ice().flush_avoid_lists(scope);
+        Ok(PyAsyncIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        ))
+    }
+
+    fn force_evict_replica(&self, chain: u64, victim: u64) -> PyAsyncIceProposal {
+        let proposal = self
+            .client
+            .ice()
+            .force_evict_replica(chain as CoreChainId, victim);
+        PyAsyncIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        )
+    }
+
+    fn force_restart_daemon(&self, id: u64, name: String) -> PyAsyncIceProposal {
+        let daemon = CoreDaemonRef { id, name };
+        let proposal = self.client.ice().force_restart_daemon(daemon);
+        PyAsyncIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        )
+    }
+
+    fn force_cutover(&self, chain: u64, target: u64) -> PyAsyncIceProposal {
+        let proposal = self
+            .client
+            .ice()
+            .force_cutover(chain as CoreChainId, target);
+        PyAsyncIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        )
+    }
+
+    fn kill_migration(&self, migration: u64) -> PyAsyncIceProposal {
+        let proposal = self
+            .client
+            .ice()
+            .kill_migration(migration as CoreMigrationId);
+        PyAsyncIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        )
+    }
+
+    fn thaw_cluster(&self) -> PyAsyncIceProposal {
+        let proposal = self.client.ice().thaw_cluster();
+        PyAsyncIceProposal::from_action(
+            self.client.clone(),
+            self.runtime.clone(),
+            proposal.action().clone(),
+            proposal.issued_at_ms(),
+        )
+    }
+}
+
+/// Async sibling of [`PyIceProposal`]. Pre-simulation husk — call
+/// `await proposal.simulate()` to get an `AsyncSimulatedIceProposal`.
+///
+/// Sync equivalent: :class:`IceProposal`.
+#[pyclass(name = "AsyncIceProposal", module = "net._net")]
+pub struct PyAsyncIceProposal {
+    client: Arc<CoreClient>,
+    runtime: Arc<Runtime>,
+    action: parking_lot::Mutex<Option<net::adapter::net::behavior::meshos::IceActionProposal>>,
+    issued_at_ms: u64,
+}
+
+impl PyAsyncIceProposal {
+    fn from_action(
+        client: Arc<CoreClient>,
+        runtime: Arc<Runtime>,
+        action: net::adapter::net::behavior::meshos::IceActionProposal,
+        issued_at_ms: u64,
+    ) -> Self {
+        Self {
+            client,
+            runtime,
+            action: parking_lot::Mutex::new(Some(action)),
+            issued_at_ms,
+        }
+    }
+}
+
+#[pymethods]
+impl PyAsyncIceProposal {
+    #[getter]
+    fn issued_at_ms(&self) -> u64 {
+        self.issued_at_ms
+    }
+
+    /// Pre-execution preview. Returns an awaitable yielding an
+    /// `AsyncSimulatedIceProposal`. Consumes the husk —
+    /// subsequent calls raise `DeckSdkError(kind="already_simulated")`.
+    fn simulate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let action = self.action.lock().take().ok_or_else(|| {
+            deck_err(
+                py,
+                "already_simulated",
+                "AsyncIceProposal was already consumed by simulate()",
+            )
+        })?;
+        let issued_at_ms = self.issued_at_ms;
+        let client = self.client.clone();
+        let runtime = self.runtime.clone();
+        // Validate the variant up-front so an unknown-variant
+        // rejection bubbles synchronously rather than inside the
+        // future. Substrate-side simulate errors still consume the
+        // husk (matching the sync class + Go + Node).
+        build_core_proposal(&client, action.clone())
+            .map_err(|e| deck_err(py, e.kind, &e.message))?;
+        let action_for_future = action.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let proposal = build_core_proposal(&client, action_for_future)
+                .map_err(|e| Python::attach(|py| deck_err(py, e.kind, &e.message)))?;
+            let blast = proposal
+                .simulate()
+                .await
+                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?
+                .blast_radius()
+                .clone();
+            Ok::<PyAsyncSimulatedIceProposal, PyErr>(PyAsyncSimulatedIceProposal {
+                client: client.clone(),
+                runtime,
+                action: parking_lot::Mutex::new(Some(action)),
+                issued_at_ms,
+                blast,
+                committed: parking_lot::Mutex::new(false),
+            })
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        let consumed = self.action.lock().is_none();
+        format!(
+            "AsyncIceProposal(consumed={consumed}, issued_at_ms={})",
+            self.issued_at_ms,
+        )
+    }
+}
+
+/// Async sibling of [`PySimulatedIceProposal`]. Only class exposing
+/// awaitable `commit()`.
+///
+/// Sync equivalent: :class:`SimulatedIceProposal`.
+#[pyclass(name = "AsyncSimulatedIceProposal", module = "net._net")]
+pub struct PyAsyncSimulatedIceProposal {
+    client: Arc<CoreClient>,
+    #[allow(dead_code)]
+    runtime: Arc<Runtime>,
+    action: parking_lot::Mutex<Option<net::adapter::net::behavior::meshos::IceActionProposal>>,
+    issued_at_ms: u64,
+    blast: net::adapter::net::behavior::meshos::BlastRadius,
+    committed: parking_lot::Mutex<bool>,
+}
+
+#[pymethods]
+impl PyAsyncSimulatedIceProposal {
+    fn blast_radius(&self, py: Python<'_>) -> PyResult<String> {
+        blast_radius_to_json(py, &self.blast)
+    }
+
+    #[getter]
+    fn issued_at_ms(&self) -> u64 {
+        self.issued_at_ms
+    }
+
+    fn blast_hash<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let hash = blast_radius_hash(&self.blast);
+        Ok(PyBytes::new(py, hash.as_ref()))
+    }
+
+    fn signing_payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let guard = self.action.lock();
+        let action = guard.as_ref().ok_or_else(|| {
+            deck_err(
+                py,
+                "already_committed",
+                "AsyncSimulatedIceProposal was already consumed by commit()",
+            )
+        })?;
+        let hash = blast_radius_hash(&self.blast);
+        let payload = ice_proposal_signing_payload(action, self.issued_at_ms, &hash);
+        Ok(PyBytes::new(py, &payload))
+    }
+
+    /// Awaitable commit. Resolves to the same chain-commit dict
+    /// shape as the sync `SimulatedIceProposal.commit()`. Consumes
+    /// the husk on success or substrate failure (matching the
+    /// sync class).
+    fn commit<'py>(
+        &self,
+        py: Python<'py>,
+        signatures: Vec<Bound<'_, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        {
+            let mut flag = self.committed.lock();
+            if *flag {
+                return Err(deck_err(
+                    py,
+                    "already_committed",
+                    "AsyncSimulatedIceProposal was already consumed by commit()",
+                ));
+            }
+            *flag = true;
+        }
+        let action = self.action.lock().take().ok_or_else(|| {
+            deck_err(
+                py,
+                "already_committed",
+                "AsyncSimulatedIceProposal was already consumed by commit()",
+            )
+        })?;
+        let mut sigs = Vec::with_capacity(signatures.len());
+        for d in signatures {
+            sigs.push(operator_signature_from_dict(py, &d)?);
+        }
+        let client = self.client.clone();
+        // Validate the variant under the GIL before entering the
+        // future so an unknown-variant rejection surfaces
+        // synchronously.
+        build_core_proposal(&client, action.clone())
+            .map_err(|e| deck_err(py, e.kind, &e.message))?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let proposal = build_core_proposal(&client, action)
+                .map_err(|e| Python::attach(|py| deck_err(py, e.kind, &e.message)))?;
+            let simulated = proposal
+                .simulate()
+                .await
+                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
+            let commit = simulated
+                .commit(&sigs)
+                .await
+                .map_err(|e| Python::attach(|py| deck_err_from(py, e)))?;
+            Ok::<AsyncChainCommitDeckWrap, PyErr>(AsyncChainCommitDeckWrap(commit))
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        let committed = *self.committed.lock();
+        format!(
+            "AsyncSimulatedIceProposal(committed={committed}, issued_at_ms={}, affected_nodes={})",
+            self.issued_at_ms,
+            self.blast.affected_nodes.len(),
+        )
+    }
+}
+
+// =========================================================================
+// AsyncSnapshotStream + AsyncStatusSummaryStream — T3-G2.
+//
+// PEP 525 async iterators over the existing CoreSnapshotStream /
+// CoreStatusStream. Constructed via .from_sync(sync_stream) which
+// consumes the sync stream's inner — the sync stream becomes
+// closed afterward (calling __next__ raises StopIteration).
+//
+// Each async-iter yields the same per-tick payload shape as the
+// sync sibling: SnapshotStream → JSON string, StatusSummaryStream
+// → dict.
+// =========================================================================
+
+/// Newtype wrapping a `StatusSummary` so an awaitable can resolve
+/// to a `PyDict` via `IntoPyObject` on the resume step (the
+/// dict-builder needs a `Python<'py>` token).
+struct AsyncStatusSummaryWrap(StatusSummary);
+
+impl<'py> pyo3::IntoPyObject<'py> for AsyncStatusSummaryWrap {
+    type Target = pyo3::types::PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        Ok(status_summary_to_dict(py, &self.0)?.into_any())
+    }
+}
+
+/// Async sibling of [`PySnapshotStream`]. PEP 525 async iterator
+/// — ``async for snap_json in stream:`` yields JSON strings.
+/// End-of-stream raises `StopAsyncIteration`.
+///
+/// Sync equivalent: :class:`SnapshotStream`.
+#[pyclass(name = "AsyncSnapshotStream", module = "net._net")]
+pub struct PyAsyncSnapshotStream {
+    inner: Arc<tokio::sync::Mutex<Option<CoreSnapshotStream>>>,
+}
+
+#[pymethods]
+impl PyAsyncSnapshotStream {
+    /// Consume an existing sync `SnapshotStream`, taking ownership
+    /// of its inner stream. The sync stream becomes closed —
+    /// subsequent `__next__` calls raise `StopIteration`.
+    #[staticmethod]
+    fn from_sync(stream: &mut PySnapshotStream) -> PyResult<Self> {
+        let inner = stream.inner.take().ok_or_else(|| {
+            Python::attach(|py| deck_err(py, "stream_closed", "snapshot stream was closed"))
+        })?;
+        Ok(Self {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(inner))),
+        })
+    }
+
+    fn __aiter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            let stream = match guard.as_mut() {
+                Some(s) => s,
+                None => return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+            };
+            let next = stream.next().await;
+            match next {
+                Some(Ok(snap)) => serde_json::to_string(&snap).map_err(|e| {
+                    Python::attach(|py| {
+                        deck_err(
+                            py,
+                            "snapshot_serialize_failed",
+                            &format!("MeshOsSnapshot JSON serialize: {e}"),
+                        )
+                    })
+                }),
+                Some(Err(e)) => Err(Python::attach(|py| deck_err_from(py, e))),
+                None => {
+                    *guard = None;
+                    Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
+                }
+            }
+        })
+    }
+
+    /// Stop the iterator. Idempotent.
+    fn close(&self) {
+        if let Ok(mut guard) = self.inner.try_lock() {
+            *guard = None;
+        }
+    }
+
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            *inner.lock().await = None;
+            Ok::<(), PyErr>(())
+        })
+    }
+}
+
+/// Async sibling of [`PyStatusSummaryStream`]. PEP 525 async
+/// iterator — ``async for summary in stream:`` yields the same
+/// dict shape as :meth:`StatusSummaryStream.__next__`.
+///
+/// Sync equivalent: :class:`StatusSummaryStream`.
+#[pyclass(name = "AsyncStatusSummaryStream", module = "net._net")]
+pub struct PyAsyncStatusSummaryStream {
+    inner: Arc<tokio::sync::Mutex<Option<CoreStatusStream>>>,
+}
+
+#[pymethods]
+impl PyAsyncStatusSummaryStream {
+    /// Consume an existing sync `StatusSummaryStream`.
+    #[staticmethod]
+    fn from_sync(stream: &mut PyStatusSummaryStream) -> PyResult<Self> {
+        let inner = stream.inner.take().ok_or_else(|| {
+            Python::attach(|py| deck_err(py, "stream_closed", "status summary stream was closed"))
+        })?;
+        Ok(Self {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(inner))),
+        })
+    }
+
+    fn __aiter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            let stream = match guard.as_mut() {
+                Some(s) => s,
+                None => return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+            };
+            let next = stream.next().await;
+            match next {
+                Some(Ok(s)) => Ok::<AsyncStatusSummaryWrap, PyErr>(AsyncStatusSummaryWrap(s)),
+                Some(Err(e)) => Err(Python::attach(|py| deck_err_from(py, e))),
+                None => {
+                    *guard = None;
+                    Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
+                }
+            }
+        })
+    }
+
+    fn close(&self) {
+        if let Ok(mut guard) = self.inner.try_lock() {
+            *guard = None;
+        }
+    }
+
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            *inner.lock().await = None;
+            Ok::<(), PyErr>(())
+        })
     }
 }

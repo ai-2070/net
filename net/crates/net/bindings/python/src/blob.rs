@@ -944,6 +944,10 @@ pub fn register_blob_adapter(adapter_id: String, instance: Py<PyAny>) -> PyResul
 /// the binding pumps the substrate's tokio runtime under the
 /// hood, releasing the GIL for the duration of each call so
 /// concurrent Python threads aren't blocked.
+///
+/// Async equivalent: :class:`AsyncMeshBlobAdapter` — same inner
+/// adapter; awaitable `store` / `fetch` / `fetch_range` / `exists`
+/// / `repair_blob`.
 #[pyclass(name = "MeshBlobAdapter")]
 pub struct PyMeshBlobAdapter {
     inner: Arc<InnerMeshBlobAdapter>,
@@ -1353,6 +1357,191 @@ fn parse_overflow_spec(py: Python<'_>, spec: Bound<'_, PyAny>) -> PyResult<Inner
     }
     let _ = py; // Silence unused warning under cfg(feature) shapes.
     Ok(cfg)
+}
+
+// =========================================================================
+// Async surface — T2-F1.
+//
+// Awaitable top-level publish/resolve helpers + an AsyncMeshBlobAdapter
+// wrapper around the same Arc<InnerMeshBlobAdapter> as the sync sibling.
+// Construction (set_overflow_config, prometheus_text, etc.) stays sync;
+// the actual I/O paths become awaitables.
+// =========================================================================
+
+/// Async sibling of [`blob_publish`]. Same wire-encoded BlobRef
+/// return shape; the actual store happens on the bridge runtime
+/// instead of a blocking thread.
+///
+/// Sync equivalent: :func:`blob_publish`.
+#[pyfunction]
+pub fn async_blob_publish<'py>(
+    py: Python<'py>,
+    adapter_id: &str,
+    uri: String,
+    data: &[u8],
+) -> PyResult<Bound<'py, PyAny>> {
+    let adapter = global_blob_adapter_registry()
+        .get(adapter_id)
+        .ok_or_else(|| {
+            PyKeyError::new_err(format!("blob adapter {:?} not registered", adapter_id))
+        })?;
+    // GIL is still held — copy the payload under the GIL so we
+    // don't capture a raw pointer across the await (PyO3 `&[u8]`
+    // accepts mutable `bytearray`, whose buffer can be relocated
+    // by another Python thread).
+    let data_owned = data.to_vec();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let bytes = publish_blob(adapter.as_ref(), uri, &data_owned)
+            .await
+            .map_err(map_blob_err)?;
+        Ok::<Vec<u8>, PyErr>(bytes)
+    })
+}
+
+/// Async sibling of [`blob_resolve`].
+///
+/// Sync equivalent: :func:`blob_resolve`.
+#[pyfunction]
+pub fn async_blob_resolve<'py>(
+    py: Python<'py>,
+    adapter_id: &str,
+    payload: &[u8],
+) -> PyResult<Bound<'py, PyAny>> {
+    let adapter = global_blob_adapter_registry()
+        .get(adapter_id)
+        .ok_or_else(|| {
+            PyKeyError::new_err(format!("blob adapter {:?} not registered", adapter_id))
+        })?;
+    let payload_owned = payload.to_vec();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let bytes = resolve_payload(&payload_owned, adapter.as_ref())
+            .await
+            .map_err(map_blob_err)?;
+        Ok::<Vec<u8>, PyErr>(bytes.to_vec())
+    })
+}
+
+/// Async sibling of [`PyMeshBlobAdapter`]. Wraps the same
+/// `Arc<MeshBlobAdapter>`; the sync sibling and this class can
+/// share a single adapter (and registry entry).
+///
+/// Sync equivalent: :class:`MeshBlobAdapter`.
+#[pyclass(name = "AsyncMeshBlobAdapter", module = "_net")]
+pub struct PyAsyncMeshBlobAdapter {
+    inner: Arc<InnerMeshBlobAdapter>,
+    #[allow(dead_code)]
+    id: String,
+}
+
+#[pymethods]
+impl PyAsyncMeshBlobAdapter {
+    /// Build against an existing sync `MeshBlobAdapter`. Cheap
+    /// (`Arc::clone`); operations on either shape touch the same
+    /// underlying adapter / registry entry.
+    #[new]
+    fn new(adapter: &PyMeshBlobAdapter) -> Self {
+        Self {
+            inner: adapter.inner.clone(),
+            id: adapter.id.clone(),
+        }
+    }
+
+    /// Sync — pure rendering, no I/O.
+    pub fn prometheus_text(&self) -> String {
+        self.inner.prometheus_text()
+    }
+
+    /// v0.3 tree-walker LRU cache statistics. Sync — DashMap read.
+    pub fn tree_node_cache_stats(&self) -> Option<(u64, u64, usize, usize)> {
+        self.inner.tree_node_cache_stats()
+    }
+
+    /// Awaitable variant of :meth:`MeshBlobAdapter.store`.
+    pub fn store<'py>(
+        &self,
+        py: Python<'py>,
+        blob_ref: &PyBlobRef,
+        data: &[u8],
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let adapter = self.inner.clone();
+        let blob = blob_ref.as_inner().clone();
+        let data_owned = data.to_vec();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            adapter
+                .store(&blob, &data_owned)
+                .await
+                .map_err(map_blob_err)
+        })
+    }
+
+    /// Awaitable variant of :meth:`MeshBlobAdapter.fetch`.
+    pub fn fetch<'py>(&self, py: Python<'py>, blob_ref: &PyBlobRef) -> PyResult<Bound<'py, PyAny>> {
+        let adapter = self.inner.clone();
+        let blob = blob_ref.as_inner().clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let bytes = adapter.fetch(&blob).await.map_err(map_blob_err)?;
+            Ok::<Vec<u8>, PyErr>(bytes.to_vec())
+        })
+    }
+
+    /// Awaitable variant of :meth:`MeshBlobAdapter.fetch_range`.
+    pub fn fetch_range<'py>(
+        &self,
+        py: Python<'py>,
+        blob_ref: &PyBlobRef,
+        start: u64,
+        end: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let adapter = self.inner.clone();
+        let blob = blob_ref.as_inner().clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let bytes = adapter
+                .fetch_range(&blob, start..end)
+                .await
+                .map_err(map_blob_err)?;
+            Ok::<Vec<u8>, PyErr>(bytes.to_vec())
+        })
+    }
+
+    /// Awaitable variant of :meth:`MeshBlobAdapter.exists`.
+    pub fn exists<'py>(
+        &self,
+        py: Python<'py>,
+        blob_ref: &PyBlobRef,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let adapter = self.inner.clone();
+        let blob = blob_ref.as_inner().clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            adapter.exists(&blob).await.map_err(map_blob_err)
+        })
+    }
+
+    /// Awaitable variant of :meth:`MeshBlobAdapter.repair_blob`.
+    /// Resolves to a `(stripes_walked, stripes_already_healthy,
+    /// stripes_repaired, chunks_restored, stripes_unrecoverable,
+    /// replicated_stripes_skipped, replicated_leaves_skipped)`
+    /// tuple — same field set as the sync method's dict; left as
+    /// a tuple here to avoid building a PyDict outside the GIL.
+    pub fn repair_blob<'py>(
+        &self,
+        py: Python<'py>,
+        blob_ref: &PyBlobRef,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let adapter = self.inner.clone();
+        let blob = blob_ref.as_inner().clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let report = adapter.repair_blob(&blob).await.map_err(map_blob_err)?;
+            Ok::<(u64, u64, u64, u64, u64, u64, u64), PyErr>((
+                report.stripes_walked,
+                report.stripes_already_healthy,
+                report.stripes_repaired,
+                report.chunks_restored,
+                report.stripes_unrecoverable,
+                report.replicated_stripes_skipped,
+                report.replicated_leaves_skipped,
+            ))
+        })
+    }
 }
 
 /// Render an [`InnerOverflowConfig`] as a Python dict. Inverse

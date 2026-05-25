@@ -68,6 +68,12 @@ else:
 # the `cortex` feature (maturin's default picks it up).
 try:
     from ._net import (
+        AsyncMemoriesAdapter,
+        AsyncMemoryWatchIter,
+        AsyncRedexFile,
+        AsyncRedexTailIter,
+        AsyncTasksAdapter,
+        AsyncTaskWatchIter,
         CortexError,
         MemoriesAdapter,
         Memory,
@@ -89,6 +95,12 @@ except ImportError:
 else:
     __all__.extend(
         [
+            "AsyncMemoriesAdapter",
+            "AsyncMemoryWatchIter",
+            "AsyncRedexFile",
+            "AsyncRedexTailIter",
+            "AsyncTasksAdapter",
+            "AsyncTaskWatchIter",
             "CortexError",
             "MemoriesAdapter",
             "Memory",
@@ -113,6 +125,12 @@ else:
 # once the wheel is rebuilt with `maturin develop`.
 try:
     from ._net import (
+        AsyncClientStreamCall,
+        AsyncDuplexCall,
+        AsyncDuplexSink,
+        AsyncDuplexStream,
+        AsyncMeshRpc,
+        AsyncRpcStream,
         Cancellable,
         MeshRpc,
         RpcAppError,
@@ -132,6 +150,12 @@ except ImportError:
 else:
     __all__.extend(
         [
+            "AsyncClientStreamCall",
+            "AsyncDuplexCall",
+            "AsyncDuplexSink",
+            "AsyncDuplexStream",
+            "AsyncMeshRpc",
+            "AsyncRpcStream",
             "Cancellable",
             "MeshRpc",
             "RpcAppError",
@@ -152,6 +176,8 @@ else:
 # module was built with the `net` feature.
 try:
     from ._net import (
+        AsyncNetMesh,
+        AsyncNetStream,
         BackpressureError,
         ChannelAuthError,
         ChannelError,
@@ -168,6 +194,8 @@ except ImportError:
 else:
     __all__.extend(
         [
+            "AsyncNetMesh",
+            "AsyncNetStream",
             "BackpressureError",
             "ChannelAuthError",
             "ChannelError",
@@ -215,6 +243,8 @@ else:
 # with the `compute` feature. Stage 5 of SDK_COMPUTE_SURFACE_PLAN.md.
 try:
     from ._net import (
+        AsyncDaemonRuntime,
+        AsyncMigrationHandle,
         CausalEvent,
         DaemonError,
         DaemonHandle,
@@ -227,6 +257,8 @@ except ImportError:
 else:
     __all__.extend(
         [
+            "AsyncDaemonRuntime",
+            "AsyncMigrationHandle",
             "CausalEvent",
             "DaemonError",
             "DaemonHandle",
@@ -321,9 +353,12 @@ else:
 # `MeshBlobAdapter` Python class.
 try:
     from ._net import (
+        AsyncMeshBlobAdapter,
         BlobError,
         BlobRef,
         MeshBlobAdapter,
+        async_blob_publish,
+        async_blob_resolve,
         blob_adapter_ids,
         blob_adapter_registered,
         blob_publish,
@@ -337,9 +372,12 @@ except ImportError:
 else:
     __all__.extend(
         [
+            "AsyncMeshBlobAdapter",
             "BlobError",
             "BlobRef",
             "MeshBlobAdapter",
+            "async_blob_publish",
+            "async_blob_resolve",
             "blob_adapter_ids",
             "blob_adapter_registered",
             "blob_publish",
@@ -356,6 +394,8 @@ else:
 # control receive / publish_log / graceful_shutdown / metadata.
 try:
     from ._net import (
+        AsyncMeshOsDaemonHandle,
+        AsyncMeshOsDaemonSdk,
         MeshOsDaemonHandle,
         MeshOsDaemonSdk,
         MeshOsSdkError,
@@ -366,6 +406,8 @@ except ImportError:
 else:
     __all__.extend(
         [
+            "AsyncMeshOsDaemonHandle",
+            "AsyncMeshOsDaemonSdk",
             "MeshOsDaemonHandle",
             "MeshOsDaemonSdk",
             "MeshOsSdkError",
@@ -443,6 +485,75 @@ else:
             "deck_sdk_error_kind",
         ]
     )
+
+    # Async deck streams — PEP 525 siblings of the sync iterators.
+    # Try-import so wheels built before T3-G2 landed still load.
+    try:
+        from ._net import (
+            AsyncSnapshotStream as _DeckAsyncSnapshotStream,
+        )
+        from ._net import (
+            AsyncStatusSummaryStream as _DeckAsyncStatusSummaryStream,
+        )
+
+        DeckAsyncSnapshotStream = _DeckAsyncSnapshotStream
+        DeckAsyncStatusSummaryStream = _DeckAsyncStatusSummaryStream
+        __all__.extend(
+            [
+                "DeckAsyncSnapshotStream",
+                "DeckAsyncStatusSummaryStream",
+            ]
+        )
+    except ImportError:  # pragma: no cover
+        pass
+
+    # Async deck client + admin commands (T3-G1 + T3-G3). Try-import
+    # so wheels built before the slice landed still load.
+    try:
+        from ._net import (
+            AsyncAdminCommands as _DeckAsyncAdminCommands,
+        )
+        from ._net import (
+            AsyncDeckClient as _DeckAsyncClient,
+        )
+
+        AsyncDeckClient = _DeckAsyncClient
+        DeckAsyncAdminCommands = _DeckAsyncAdminCommands
+        __all__.extend(
+            [
+                "AsyncDeckClient",
+                "DeckAsyncAdminCommands",
+            ]
+        )
+    except ImportError:  # pragma: no cover
+        pass
+
+    # Async ice break-glass typestate (T3-G3). Separate try-import
+    # so wheels built before this slice landed still load the rest
+    # of the deck surface.
+    try:
+        from ._net import (
+            AsyncIceCommands as _DeckAsyncIceCommands,
+        )
+        from ._net import (
+            AsyncIceProposal as _DeckAsyncIceProposal,
+        )
+        from ._net import (
+            AsyncSimulatedIceProposal as _DeckAsyncSimulatedIceProposal,
+        )
+
+        DeckAsyncIceCommands = _DeckAsyncIceCommands
+        DeckAsyncIceProposal = _DeckAsyncIceProposal
+        DeckAsyncSimulatedIceProposal = _DeckAsyncSimulatedIceProposal
+        __all__.extend(
+            [
+                "DeckAsyncIceCommands",
+                "DeckAsyncIceProposal",
+                "DeckAsyncSimulatedIceProposal",
+            ]
+        )
+    except ImportError:  # pragma: no cover
+        pass
 
     # Slice 3 — ICE break-glass surface. Try-import so wheels
     # built before slice 3 still load.
@@ -529,6 +640,7 @@ else:
 try:
     from ._net import (
         AggregateResult,
+        AsyncMeshQueryRunner,
         CachePolicy,
         ExecuteOptions,
         GroupKey,
@@ -550,6 +662,7 @@ else:
     __all__.extend(
         [
             "AggregateResult",
+            "AsyncMeshQueryRunner",
             "CachePolicy",
             "ExecuteOptions",
             "GroupKey",
@@ -572,6 +685,8 @@ else:
 # `aggregator` feature (default in the maturin-shipped wheel).
 try:
     from ._net import (
+        AsyncFoldQueryClient,
+        AsyncRegistryClient,
         DuplicateGroupName,
         FoldQueryClient,
         FoldQueryClientError,
@@ -588,6 +703,8 @@ except ImportError:
 else:
     __all__.extend(
         [
+            "AsyncFoldQueryClient",
+            "AsyncRegistryClient",
             "DuplicateGroupName",
             "FoldQueryClient",
             "FoldQueryClientError",

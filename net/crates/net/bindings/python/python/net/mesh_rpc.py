@@ -27,6 +27,7 @@ pyo3-asyncio integration on the binding side.
 
 from __future__ import annotations
 
+import inspect
 import json
 import random
 import threading
@@ -40,6 +41,12 @@ from typing import Any, Callable, Iterator, Optional, Sequence
 # will have cortex enabled.
 try:
     from net._net import (
+        AsyncClientStreamCall as _RawAsyncClientStreamCall,
+        AsyncDuplexCall as _RawAsyncDuplexCall,
+        AsyncDuplexSink as _RawAsyncDuplexSink,
+        AsyncDuplexStream as _RawAsyncDuplexStream,
+        AsyncMeshRpc as _RawAsyncMeshRpc,
+        AsyncRpcStream as _RawAsyncRpcStream,
         Cancellable,
         ClientStreamCall as _RawClientStreamCall,
         DuplexCall as _RawDuplexCall,
@@ -65,6 +72,12 @@ try:
     )
 except ImportError:  # pragma: no cover — feature-flag path
     _RawMeshRpc = None  # type: ignore[assignment]
+    _RawAsyncMeshRpc = None  # type: ignore[assignment]
+    _RawAsyncRpcStream = None  # type: ignore[assignment]
+    _RawAsyncClientStreamCall = None  # type: ignore[assignment]
+    _RawAsyncDuplexCall = None  # type: ignore[assignment]
+    _RawAsyncDuplexSink = None  # type: ignore[assignment]
+    _RawAsyncDuplexStream = None  # type: ignore[assignment]
     _RawRpcStream = None  # type: ignore[assignment]
     _RawClientStreamCall = None  # type: ignore[assignment]
     _RawDuplexCall = None  # type: ignore[assignment]
@@ -350,6 +363,27 @@ def _json_decode(buf: bytes) -> Any:
         return json.loads(buf.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
         raise RpcCodecError(f"client decode: {e}") from e
+
+
+def _decode_request_or_app_error(req_bytes: bytes) -> Any:
+    """Server-side request-bytes decoder used by the typed wrappers'
+    ``serve`` paths.
+
+    Tries to decode as JSON. On codec failure, raises ``RpcAppError(
+    NRPC_TYPED_BAD_REQUEST, body)`` whose body is the canonical
+    ``{"error": "invalid_request", "detail": ...}`` shape — so the
+    caller sees a typed app-error rather than the handler crashing
+    out as ``Internal``. Used by ``TypedMeshRpc.serve`` and by both
+    branches of ``AsyncTypedMeshRpc.serve``.
+    """
+    try:
+        return _json_decode(req_bytes)
+    except RpcCodecError as e:
+        body = json.dumps(
+            {"error": "invalid_request", "detail": str(e)},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        raise RpcAppError(NRPC_TYPED_BAD_REQUEST, body) from e
 
 
 # ---------------------------------------------------------------------------
@@ -844,14 +878,7 @@ class TypedMeshRpc:
         """
 
         def _wrapped(req_bytes: bytes) -> bytes:
-            try:
-                req = _json_decode(req_bytes)
-            except RpcCodecError as e:
-                body = json.dumps(
-                    {"error": "invalid_request", "detail": str(e)},
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                raise RpcAppError(NRPC_TYPED_BAD_REQUEST, body) from e
+            req = _decode_request_or_app_error(req_bytes)
             resp = handler(req)
             return _json_encode(resp)
 
@@ -1104,7 +1131,18 @@ _STATUS_PATTERN = "status\\s*=?\\s*0x([0-9a-fA-F]+)"
 
 def _parse_status_from_message(msg: str) -> Optional[int]:
     """Best-effort parse of ``status=0xNNNN`` from an
-    ``RpcServerError`` message. Returns ``None`` if no match."""
+    ``RpcServerError`` message. Returns ``None`` if no match.
+
+    The Rust formatter at ``bindings/python/src/mesh_rpc.rs::
+    rpc_error_to_pyerr`` is the authoritative spec — a parse miss
+    here means the formatter has drifted from `_STATUS_PATTERN`.
+    ``default_retryable`` treats a parse miss as a conservative
+    retry (P14): worst-case the caller burns a retry on a
+    non-retryable status, better than silently disabling retry
+    for every ServerError after a formatter typo. The Rust-side
+    unit test at ``mesh_rpc.rs::tests::server_error_message_*``
+    catches formatter regressions.
+    """
     import re
 
     m = re.search(_STATUS_PATTERN, msg)
@@ -1188,6 +1226,21 @@ def default_retryable(err: BaseException) -> bool:
         return True
     if name == "RpcServerError":
         status = _parse_status_from_message(str(err))
+        if status is None:
+            # P14: parse miss means the Rust formatter has drifted.
+            # Default to "retry" — same as the Rust default for the
+            # common server-error statuses (Internal/Backpressure/
+            # Timeout). Fail-open is safer than silent fail-closed.
+            import warnings
+
+            warnings.warn(
+                "default_retryable: could not parse status from "
+                f"RpcServerError message {str(err)!r}; assuming "
+                "retryable (Rust formatter spec drifted?)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return True
         return status in (_STATUS_INTERNAL, _STATUS_BACKPRESSURE, _STATUS_TIMEOUT)
     return False
 
@@ -1198,6 +1251,503 @@ def default_breaker_failure(err: BaseException) -> bool:
     failures, skips application errors and codec/no-route faults.
     """
     return default_retryable(err)
+
+
+# ---------------------------------------------------------------------------
+# AsyncTypedMeshRpc — public typed wrapper, async sibling of
+# TypedMeshRpc. Same JSON encode / decode at the boundary; methods
+# return awaitables that integrate with asyncio.
+#
+# Cancellation: opts['cancel'] and opts['cancel_token'] pass
+# straight through to the raw AsyncMeshRpc layer (which already
+# wires them to the substrate cancel registry); asyncio
+# task.cancel() likewise propagates via the await_with_cancel
+# bridge installed on every awaitable method at the raw layer.
+# ---------------------------------------------------------------------------
+
+
+class AsyncTypedMeshRpc:
+    """Async typed wrapper around the raw ``AsyncMeshRpc`` pyclass.
+
+    Same JSON codec semantics as :class:`TypedMeshRpc`; every
+    method that performed I/O on the sync sibling is an
+    ``async def`` here, returning an awaitable. Asyncio
+    cancellation propagates end-to-end via the substrate's v3
+    cancel-registry primitive — `asyncio.wait_for(...)` and
+    `task.cancel()` both fire `MeshNode::cancel(token)` and the
+    awaitable raises :class:`RpcCancelledError`.
+
+    Constructed via :meth:`from_mesh` (or directly via
+    ``AsyncTypedMeshRpc(AsyncMeshRpc(net_mesh))``). Shares the
+    underlying ``MeshNode`` with any sibling :class:`TypedMeshRpc`
+    or :class:`MeshRpc` constructed against the same ``NetMesh``,
+    so servers registered on one are callable from another.
+
+    Sync equivalent: :class:`TypedMeshRpc`.
+    """
+
+    def __init__(self, raw: Any) -> None:
+        # `raw` is duck-typed: it must expose async `call` /
+        # `call_service` / `call_streaming` / `call_client_stream` /
+        # `call_duplex` and sync `find_service_nodes`. The native
+        # `_RawAsyncMeshRpc` satisfies this; tests can pass a stub.
+        self._raw = raw
+
+    @classmethod
+    def from_mesh(cls, mesh: Any) -> "AsyncTypedMeshRpc":
+        """Build an AsyncTypedMeshRpc against an existing ``NetMesh``."""
+        if _RawAsyncMeshRpc is None:
+            raise RuntimeError(
+                "net._net.AsyncMeshRpc unavailable — did the wheel get built "
+                "without the cortex feature?"
+            )
+        return cls(_RawAsyncMeshRpc(mesh))
+
+    @property
+    def raw(self) -> Any:
+        """Underlying raw ``AsyncMeshRpc`` (bytes-level surface)."""
+        return self._raw
+
+    # ---- serve --------------------------------------------------------------
+
+    def serve(
+        self,
+        service: str,
+        handler: Callable[[Any], Any],
+    ) -> ServeHandle:
+        """Register a typed handler. Accepts EITHER a sync
+        ``def handler(req) -> resp`` OR an
+        ``async def handler(req) -> resp`` — async handlers run as
+        coroutines on the substrate's tokio runtime via the raw
+        :meth:`AsyncMeshRpc.serve` coroutine-driving path; sync
+        handlers stay on the spawn_blocking path.
+
+        Decode failures on the request surface to the caller as
+        ``NRPC_TYPED_BAD_REQUEST`` (``0x8000``) with body
+        ``{"error": "invalid_request", "detail": ...}`` — same
+        canonical-bad-request contract as :meth:`TypedMeshRpc.serve`.
+
+        Sync equivalent: :meth:`TypedMeshRpc.serve`.
+        """
+        if inspect.iscoroutinefunction(handler):
+
+            async def _wrapped(req_bytes: bytes) -> bytes:
+                req = _decode_request_or_app_error(req_bytes)
+                resp = await handler(req)
+                return _json_encode(resp)
+
+            return self._raw.serve(service, _wrapped)
+
+        def _wrapped_sync(req_bytes: bytes) -> bytes:
+            req = _decode_request_or_app_error(req_bytes)
+            resp = handler(req)
+            return _json_encode(resp)
+
+        return self._raw.serve(service, _wrapped_sync)
+
+    # ---- call ---------------------------------------------------------------
+
+    async def call(
+        self,
+        target_node_id: int,
+        service: str,
+        request: Any,
+        opts: Optional[dict] = None,
+    ) -> Any:
+        """Direct-addressed typed call. Awaits the response, decodes
+        the body, returns the typed value. Raises an
+        :class:`RpcError` subclass on failure.
+
+        Sync equivalent: :meth:`TypedMeshRpc.call`.
+        """
+        req_bytes = _json_encode(request)
+        resp_bytes = await self._raw.call(target_node_id, service, req_bytes, opts)
+        return _json_decode(resp_bytes)
+
+    async def call_service(
+        self,
+        service: str,
+        request: Any,
+        opts: Optional[dict] = None,
+    ) -> Any:
+        """Service-discovery typed call. Resolves ``service`` via
+        the local capability index + routing policy, awaits.
+
+        Sync equivalent: :meth:`TypedMeshRpc.call_service`.
+        """
+        req_bytes = _json_encode(request)
+        resp_bytes = await self._raw.call_service(service, req_bytes, opts)
+        return _json_decode(resp_bytes)
+
+    def find_service_nodes(self, service: str) -> list[int]:
+        """All node ids advertising ``nrpc:<service>``. Sync — local
+        lookup, no I/O. Identical to
+        :meth:`TypedMeshRpc.find_service_nodes`.
+        """
+        return self._raw.find_service_nodes(service)
+
+    # ---- duplex (call_duplex) ---------------------------------------------
+
+    async def call_duplex(
+        self,
+        target_node_id: int,
+        service: str,
+        opts: Optional[dict] = None,
+    ) -> "AsyncTypedDuplexCall":
+        """Open a typed duplex call. Awaits construction; the
+        returned :class:`AsyncTypedDuplexCall` exposes both
+        ``await send(value)`` and ``async for resp in call`` plus
+        ``await call.into_split()`` for independent sink + stream
+        halves.
+
+        Sync equivalent: :meth:`TypedMeshRpc.call_duplex`.
+        """
+        raw_call = await self._raw.call_duplex(target_node_id, service, opts)
+        return AsyncTypedDuplexCall(raw_call)
+
+    # ---- client-streaming (call_client_stream) -----------------------------
+
+    async def call_client_stream(
+        self,
+        target_node_id: int,
+        service: str,
+        opts: Optional[dict] = None,
+    ) -> "AsyncTypedClientStreamCall":
+        """Open a typed client-streaming call. Awaits construction
+        of the inner :class:`AsyncTypedClientStreamCall` — push
+        chunks with ``await call.send(value)``, then
+        ``await call.finish()`` to drain the terminal response.
+
+        Sync equivalent: :meth:`TypedMeshRpc.call_client_stream`.
+        """
+        raw_call = await self._raw.call_client_stream(target_node_id, service, opts)
+        return AsyncTypedClientStreamCall(raw_call)
+
+    # ---- streaming-response (call_streaming) -------------------------------
+
+    async def call_streaming(
+        self,
+        target_node_id: int,
+        service: str,
+        request: Any,
+        opts: Optional[dict] = None,
+    ) -> "AsyncTypedRpcStream":
+        """Open a typed streaming-response call. Awaits the stream
+        construction; the returned :class:`AsyncTypedRpcStream`
+        decodes each chunk on `async for`. Asyncio task-cancel
+        mid-stream tears down the substrate-side pending entry
+        cleanly via the cancel-registry.
+
+        Sync equivalent: :meth:`TypedMeshRpc.call_streaming`.
+        """
+        req_bytes = _json_encode(request)
+        raw_stream = await self._raw.call_streaming(
+            target_node_id, service, req_bytes, opts
+        )
+        return AsyncTypedRpcStream(raw_stream)
+
+
+class AsyncTypedRpcStream:
+    """Async typed iterator over a streaming RPC. Each
+    ``async for`` step yields a decoded Python object. Raises
+    :class:`RpcCodecError` on a malformed chunk and closes the
+    underlying stream.
+
+    Sync equivalent: :class:`TypedRpcStream`.
+    """
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+        self._done = False
+
+    def __aiter__(self) -> "AsyncTypedRpcStream":
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._done:
+            raise StopAsyncIteration
+        try:
+            chunk = await self._raw.__anext__()
+        except StopAsyncIteration:
+            self._done = True
+            raise
+        try:
+            return _json_decode(chunk)
+        except RpcCodecError:
+            self._done = True
+            try:
+                self._raw.close()
+            except Exception:
+                # Best-effort — don't mask the original codec error.
+                pass
+            raise
+
+    def grant(self, n: int) -> None:
+        """Grant ``n`` flow-control credits to the server pump."""
+        self._raw.grant(n)
+
+    def flow_controlled(self) -> bool:
+        """``True`` if the call set ``stream_window_initial``."""
+        return bool(self._raw.flow_controlled())
+
+    def close(self) -> None:
+        """Sync close; emits CANCEL to the server. Idempotent."""
+        self._done = True
+        try:
+            self._raw.close()
+        except Exception:
+            pass
+
+    async def aclose(self) -> None:
+        """Async alias for :meth:`close`."""
+        self.close()
+
+
+class AsyncTypedClientStreamCall:
+    """Async typed client-streaming call handle. Push typed
+    requests via ``await call.send(value)``, then
+    ``await call.finish()`` to drain the terminal response.
+
+    Encoding failures on :meth:`send` raise :class:`RpcCodecError`
+    BEFORE the chunk hits the wire; decode failure on the
+    terminal response surfaces similarly. Supports
+    ``async with`` so the call closes on scope exit.
+
+    Sync equivalent: :class:`TypedClientStreamCall`.
+    """
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+
+    @property
+    def raw(self) -> Any:
+        """Underlying raw ``AsyncClientStreamCall`` (bytes-level surface)."""
+        return self._raw
+
+    async def send(self, value: Any) -> None:
+        """Encode ``value`` as JSON and push it as one request
+        chunk. Raises :class:`RpcCodecError` on encode failure
+        BEFORE the chunk hits the wire.
+        """
+        await self._raw.send(_json_encode(value))
+
+    async def finish(self) -> Any:
+        """Close the upload direction and await the terminal
+        response. Consumes the call.
+        """
+        return _json_decode(await self._raw.finish())
+
+    def call_id(self) -> int:
+        """Server-assigned ``call_id``."""
+        return int(self._raw.call_id())
+
+    def flow_controlled(self) -> bool:
+        """``True`` if the call was opened with ``request_window_initial``."""
+        return bool(self._raw.flow_controlled())
+
+    def close(self) -> None:
+        """Sync close. Fires CANCEL via the SDK's Drop. Idempotent."""
+        try:
+            self._raw.close()
+        except Exception:
+            pass
+
+    async def aclose(self) -> None:
+        """Async alias for :meth:`close`."""
+        self.close()
+
+    async def __aenter__(self) -> "AsyncTypedClientStreamCall":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        self.close()
+        return False
+
+
+class AsyncTypedDuplexCall:
+    """Async typed duplex call handle. Push typed requests via
+    ``await send(value)``, pull typed responses via ``async for
+    resp in call:``, or call ``await call.into_split()`` for
+    independent sink + stream halves. After :meth:`into_split`
+    returns, this call is consumed.
+
+    Sync equivalent: :class:`TypedDuplexCall`.
+    """
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+        self._done = False
+
+    @property
+    def raw(self) -> Any:
+        """Underlying raw ``AsyncDuplexCall``."""
+        return self._raw
+
+    async def send(self, value: Any) -> None:
+        """Encode + push one request chunk."""
+        await self._raw.send(_json_encode(value))
+
+    async def finish_sending(self) -> None:
+        """Close the upload direction (emit REQUEST_END). The
+        download side stays open for subsequent ``async for``
+        pulls.
+        """
+        await self._raw.finish_sending()
+
+    def __aiter__(self) -> "AsyncTypedDuplexCall":
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._done:
+            raise StopAsyncIteration
+        try:
+            chunk = await self._raw.__anext__()
+        except StopAsyncIteration:
+            self._done = True
+            raise
+        try:
+            return _json_decode(chunk)
+        except RpcCodecError:
+            self._done = True
+            try:
+                self._raw.close()
+            except Exception:
+                pass
+            raise
+
+    def into_split(self) -> tuple:
+        """Split into independent typed sink + stream halves.
+        After return, this call is consumed — subsequent
+        :meth:`send` / :meth:`__anext__` raise.
+
+        Returns ``(AsyncTypedDuplexSink, AsyncTypedDuplexStream)``.
+        """
+        raw_sink, raw_stream = self._raw.into_split()
+        self._done = True
+        return AsyncTypedDuplexSink(raw_sink), AsyncTypedDuplexStream(raw_stream)
+
+    def call_id(self) -> int:
+        """Server-assigned ``call_id``."""
+        return int(self._raw.call_id())
+
+    def flow_controlled(self) -> bool:
+        """``True`` if opened with non-``None`` ``request_window_initial``."""
+        return bool(self._raw.flow_controlled())
+
+    def close(self) -> None:
+        """Close without observing the response terminator. Fires
+        CANCEL on the wire. Idempotent.
+        """
+        self._done = True
+        try:
+            self._raw.close()
+        except Exception:
+            pass
+
+    async def aclose(self) -> None:
+        """Async alias for :meth:`close`."""
+        self.close()
+
+    async def __aenter__(self) -> "AsyncTypedDuplexCall":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        self.close()
+        return False
+
+
+class AsyncTypedDuplexSink:
+    """Send-half of a typed async duplex call after
+    :meth:`AsyncTypedDuplexCall.into_split`.
+    """
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+
+    @property
+    def raw(self) -> Any:
+        """Underlying raw ``AsyncDuplexSink``."""
+        return self._raw
+
+    async def send(self, value: Any) -> None:
+        """Encode + push one request chunk."""
+        await self._raw.send(_json_encode(value))
+
+    async def finish(self) -> None:
+        """Close the upload direction (emit REQUEST_END). Consumes
+        the sink — subsequent :meth:`send` raises.
+        """
+        await self._raw.finish()
+
+    def call_id(self) -> int:
+        return int(self._raw.call_id())
+
+    def flow_controlled(self) -> bool:
+        return bool(self._raw.flow_controlled())
+
+    def close(self) -> None:
+        """Sync close. Idempotent."""
+        try:
+            self._raw.close()
+        except Exception:
+            pass
+
+    async def aclose(self) -> None:
+        """Async alias for :meth:`close`."""
+        self.close()
+
+
+class AsyncTypedDuplexStream:
+    """Receive-half of a typed async duplex call after
+    :meth:`AsyncTypedDuplexCall.into_split`. Iterates over decoded
+    responses; decode failure raises :class:`RpcCodecError` and
+    closes the underlying stream.
+    """
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+        self._done = False
+
+    @property
+    def raw(self) -> Any:
+        """Underlying raw ``AsyncDuplexStream``."""
+        return self._raw
+
+    def __aiter__(self) -> "AsyncTypedDuplexStream":
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._done:
+            raise StopAsyncIteration
+        try:
+            chunk = await self._raw.__anext__()
+        except StopAsyncIteration:
+            self._done = True
+            raise
+        try:
+            return _json_decode(chunk)
+        except RpcCodecError:
+            self._done = True
+            try:
+                self._raw.close()
+            except Exception:
+                pass
+            raise
+
+    def call_id(self) -> int:
+        return int(self._raw.call_id())
+
+    def close(self) -> None:
+        """Sync close. Idempotent."""
+        self._done = True
+        try:
+            self._raw.close()
+        except Exception:
+            pass
+
+    async def aclose(self) -> None:
+        """Async alias for :meth:`close`."""
+        self.close()
 
 
 # ---------------------------------------------------------------------------
