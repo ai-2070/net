@@ -51,9 +51,10 @@ use tokio::runtime::Runtime;
 
 use futures::StreamExt;
 use net::adapter::net::cortex::{
-    RequestStream as InnerRequestStream, RpcClientStreamingHandler, RpcContext, RpcDuplexHandler,
-    RpcHandler, RpcHandlerError, RpcResponsePayload, RpcResponseSink as InnerRpcResponseSink,
-    RpcStatus, RpcStreamingContext,
+    RequestStream as InnerRequestStream, RpcCallEvent as InnerRpcCallEvent,
+    RpcCallStatus as InnerRpcCallStatus, RpcClientStreamingHandler, RpcContext,
+    RpcDirection as InnerRpcDirection, RpcDuplexHandler, RpcHandler, RpcHandlerError, RpcObserver,
+    RpcResponsePayload, RpcResponseSink as InnerRpcResponseSink, RpcStatus, RpcStreamingContext,
 };
 use net::adapter::net::mesh_rpc::{
     CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
@@ -119,7 +120,31 @@ pub const NET_RPC_ERR_STREAM_DONE: c_int = -6;
 ///     function keeps identical signature + semantics, so a
 ///     0x0001 consumer compiled against a 0x0002 library still
 ///     works.
-pub const NET_RPC_ABI_VERSION: u32 = 0x0002;
+///   - **0003** — Phase S1-A1 of NRPC_STREAMING_PARITY_AND_GO_BINDING:
+///     adds the caller-side observer +
+///     metrics-snapshot surface
+///     (`net_rpc_set_observer_dispatcher`, `net_rpc_observer_install`,
+///     `net_rpc_metrics_snapshot`) plus the `RpcCallEventC` POD
+///     fed to the observer dispatcher. ADDITIVE — 0x0002 consumers
+///     keep working unchanged.
+///   - **0003** continued — Phase O-A3 of NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION:
+///     adds the `net_rpc_observer_dropped_total` symbol and the
+///     `observer_dropped_total` field on the JSON snapshot. Both
+///     are additive — the symbol is new (consumers without the
+///     declaration just don't call it) and the JSON field is
+///     ignored by decoders that don't know about it. ABI stays at
+///     0x0003 because no existing symbol's signature changed.
+///   - **0004** — Phase C-A3 of NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION:
+///     `net_rpc_reserve_cancel_token` and `net_rpc_cancel_call`
+///     gain a leading `*mut MeshRpcHandle` argument so the cancel
+///     primitive routes through the substrate's per-mesh
+///     `CancelRegistry` (`MeshNode::reserve_cancel_token` /
+///     `MeshNode::cancel`). This makes mid-stream cancellation work
+///     uniformly across all streaming shapes — the substrate spawns
+///     a watcher task that closes the pending entry when cancel
+///     fires. BREAKING — every consumer must update both symbol
+///     signatures and rebuild against the new headers.
+pub const NET_RPC_ABI_VERSION: u32 = 0x0004;
 
 /// Returns the current ABI version. Consumers SHOULD call this at
 /// init and compare against their expected value.
@@ -169,113 +194,59 @@ static NEXT_RPC_ID: AtomicU64 = AtomicU64::new(1);
 /// up its callable in the Go-process-global handler registry.
 static NEXT_HANDLER_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Monotonic counter for in-flight call cancel tokens. Starts at
-/// 1 so `0` is reserved as "no token" sentinel.
-static NEXT_CANCEL_TOKEN: AtomicU64 = AtomicU64::new(1);
-
-/// Per-token state. CR-13: split into `cancelled` (boolean
-/// observed by `run_cancellable` after registering its handle)
-/// and `handle` (the abort handle, populated by
-/// `run_cancellable` post-spawn). Pre-CR-13 the registry was
-/// `HashMap<u64, AbortHandle>`, so a cancel arriving in the
-/// gap between `reserve_cancel_token` and the post-spawn
-/// `insert` (or even in the gap between `spawn` and `insert`)
-/// found no entry and dropped on the floor.
+/// Reserve a fresh cancel token from the substrate. The Go side
+/// uses this to set up a watcher (typically on `ctx.Done()`)
+/// BEFORE issuing the blocking call — so the watcher's call to
+/// [`net_rpc_cancel_call`] races the call's completion safely.
 ///
-/// Q18: `marked_at` records when an orphan entry (no handle yet)
-/// was created by `cancel_call`. The opportunistic GC in
-/// `cancel_call` evicts orphans older than `ORPHAN_TTL` so a
-/// `reserve_token` + `cancel_call` flow whose `rpc_call` never
-/// runs doesn't leak a registry entry forever.
-#[derive(Default)]
-struct CancelEntry {
-    cancelled: bool,
-    handle: Option<tokio::task::AbortHandle>,
-    marked_at: Option<std::time::Instant>,
-}
-
-/// How long an orphaned (cancel-only, no live handle) registry
-/// entry stays before opportunistic GC evicts it. Chosen long
-/// enough that a legitimate `reserve_cancel_token` followed by
-/// a slow dispatch (network jitter, queue contention) still
-/// finds the cancellation flag, but short enough that
-/// pathological callers — `reserve_token` then `cancel_call`
-/// without ever issuing the call — don't accumulate state.
-const ORPHAN_TTL: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// Process-global registry of in-flight call cancel state.
-/// Populated by `net_rpc_call*` when the caller passes a non-NULL
-/// `out_cancel_token` out-param; queried by `net_rpc_cancel_call`.
-/// Entry removal happens by `run_cancellable` once the call
-/// returns (success or abort path), OR by the opportunistic
-/// `ORPHAN_TTL`-based GC inside `net_rpc_cancel_call` (Q18).
-fn cancel_registry() -> &'static parking_lot::Mutex<std::collections::HashMap<u64, CancelEntry>> {
-    static REG: OnceLock<parking_lot::Mutex<std::collections::HashMap<u64, CancelEntry>>> =
-        OnceLock::new();
-    REG.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
-}
-
-/// Reserve a fresh cancel token. The Go side uses this to set up
-/// a watcher (typically on `ctx.Done()`) BEFORE issuing the
-/// blocking call — so the watcher's call to `net_rpc_cancel_call`
-/// can race the call's completion safely.
+/// Routes through [`MeshNode::reserve_cancel_token`] so the
+/// substrate's per-mesh [`CancelRegistry`] is the single source of
+/// truth; the cancel-before-register (CR-13) and orphan-TTL (Q18)
+/// races are handled there.
+///
+/// ABI 0x0004: signature gained `handle` argument so the
+/// reservation is scoped to the mesh whose calls will read it.
+/// Returns `0` if `handle` is NULL.
+///
+/// [`MeshNode::reserve_cancel_token`]: net::adapter::net::MeshNode::reserve_cancel_token
+/// [`CancelRegistry`]: net::adapter::net::cancel_registry::CancelRegistry
 #[unsafe(no_mangle)]
-pub extern "C" fn net_rpc_reserve_cancel_token() -> u64 {
-    NEXT_CANCEL_TOKEN.fetch_add(1, Ordering::Relaxed)
+pub extern "C" fn net_rpc_reserve_cancel_token(handle: *mut MeshRpcHandle) -> u64 {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return 0;
+    };
+    h.node.reserve_cancel_token()
 }
 
-/// Abort the in-flight call associated with `token`. Idempotent;
-/// no-op if the token doesn't refer to a live call (already
-/// completed, never registered, or already cancelled).
+/// Signal cancellation for `token`. Idempotent; no-op if `token`
+/// is `0`, `handle` is NULL, or no in-flight call ever reserved
+/// the token.
 ///
-/// The aborted task's future is dropped, which fires the SDK's
-/// `UnaryCallGuard::Drop` to publish CANCEL to the server. The
-/// caller-side `net_rpc_call` returns `NET_RPC_ERR_CALL_FAILED`
+/// Routes through [`MeshNode::cancel`]. The substrate fires the
+/// matching call's [`Notify`] permit, which short-circuits the
+/// call's `select!` to [`RpcError::Cancelled`]. The dropped
+/// future fires the SDK's `UnaryCallGuard::Drop` (or stream
+/// equivalents) so CANCEL still goes on the wire. The
+/// caller-side `net_rpc_call*` returns `NET_RPC_ERR_CALL_FAILED`
 /// with `out_err = "nrpc:cancelled: call cancelled by caller"`.
 ///
-/// CR-13: a cancel that arrives BEFORE `run_cancellable` has
-/// registered its abort handle (the gap between
-/// `reserve_cancel_token` and the actual `rpc_call`, or between
-/// `spawn` and `insert` inside `run_cancellable`) used to drop
-/// on the floor — the call would run to completion. Now we
-/// either abort an existing handle, or insert/mark the entry
-/// with `cancelled = true` so `run_cancellable` aborts on
-/// register.
+/// ABI 0x0004: signature gained `handle` argument so the cancel
+/// is routed to the mesh whose [`CancelRegistry`] owns the
+/// token. Tokens are process-monotonic across meshes (the
+/// substrate's `NEXT_CANCEL_TOKEN` is global) — a cancel issued
+/// against the wrong mesh creates an orphan entry that ages out
+/// via the substrate's `ORPHAN_TTL` GC.
+///
+/// [`MeshNode::cancel`]: net::adapter::net::MeshNode::cancel
+/// [`Notify`]: tokio::sync::Notify
+/// [`RpcError::Cancelled`]: net::adapter::net::mesh_rpc::RpcError::Cancelled
+/// [`CancelRegistry`]: net::adapter::net::cancel_registry::CancelRegistry
 #[unsafe(no_mangle)]
-pub extern "C" fn net_rpc_cancel_call(token: u64) {
-    if token == 0 {
+pub extern "C" fn net_rpc_cancel_call(handle: *mut MeshRpcHandle, token: u64) {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
         return;
-    }
-    let mut reg = cancel_registry().lock();
-
-    // Q18: opportunistic GC of orphaned cancel-only entries
-    // older than `ORPHAN_TTL`. Without this, a Go caller that
-    // does `reserve_cancel_token` + `cancel_call` for a token
-    // whose `rpc_call` never actually runs (e.g. context
-    // already done; a deadline-elapsed pre-check) leaves a
-    // `{cancelled: true, handle: None}` entry that nothing
-    // cleans up — unbounded memory growth proportional to the
-    // number of such never-dispatched cancels.
-    let now = std::time::Instant::now();
-    reg.retain(|_, entry| {
-        entry.handle.is_some()
-            || entry
-                .marked_at
-                .is_none_or(|t| now.duration_since(t) < ORPHAN_TTL)
-    });
-
-    let entry = reg.entry(token).or_default();
-    entry.cancelled = true;
-    if entry.marked_at.is_none() {
-        entry.marked_at = Some(now);
-    }
-    if let Some(handle) = entry.handle.take() {
-        // Drop the lock before invoking abort; abort is cheap
-        // but we don't want to hold the registry lock across
-        // arbitrary tokio internals.
-        drop(reg);
-        handle.abort();
-    }
+    };
+    h.node.cancel(token);
 }
 
 // =========================================================================
@@ -305,6 +276,47 @@ fn write_err(out_err: *mut *mut c_char, message: String) {
     unsafe {
         *out_err = cstr.into_raw();
     }
+}
+
+/// Stable `nrpc:app_error:` error-message prefix the Go-side
+/// typed `Serve` shim uses to signal "I want a typed Application
+/// status code surfaced to the caller, not a generic Internal."
+/// Go handlers return `errors.New("nrpc:app_error:0x8000:<json
+/// body>")` and this side maps it to
+/// `RpcHandlerError::Application { code, message }`. Mirrors the
+/// napi binding's `parse_js_app_error` and the pyo3 binding's
+/// `RpcAppError` mechanism — same wire contract across all
+/// three bindings.
+const GO_APP_ERROR_PREFIX: &str = "nrpc:app_error:";
+
+/// Parse a Go-side `nrpc:app_error:0x<code>:<body>` error message
+/// into the (code, body) pair the SDK expects for
+/// `RpcHandlerError::Application`. Returns `None` if the prefix
+/// is absent or the format is malformed (caller falls through to
+/// the generic Internal mapping).
+fn parse_go_app_error(message: &str) -> Option<(u16, String)> {
+    let rest = message.strip_prefix(GO_APP_ERROR_PREFIX)?;
+    let (code_str, body) = rest.split_once(':')?;
+    let code_hex = code_str
+        .strip_prefix("0x")
+        .or(code_str.strip_prefix("0X"))?;
+    let code = u16::from_str_radix(code_hex, 16).ok()?;
+    Some((code, body.to_string()))
+}
+
+/// Convert a Go-side handler error string into either a typed
+/// `Application` or a generic `Internal` `RpcHandlerError`. The
+/// app-error path mirrors napi's `parse_js_app_error` so typed
+/// handlers in any binding can surface `RpcStatus::Application`
+/// uniformly.
+fn handler_error_from_msg(msg: String) -> RpcHandlerError {
+    if let Some((code, body)) = parse_go_app_error(&msg) {
+        return RpcHandlerError::Application {
+            code,
+            message: body,
+        };
+    }
+    RpcHandlerError::Internal(msg)
 }
 
 /// Format an inner [`InnerRpcError`] into the same stable string
@@ -341,6 +353,7 @@ fn format_rpc_error(err: &InnerRpcError) -> String {
         InnerRpcError::CapabilityDenied { target, capability } => {
             format!("capability_denied: target=0x{target:x} capability={capability}")
         }
+        InnerRpcError::Cancelled => "cancelled: call cancelled by caller".to_string(),
     }
 }
 
@@ -454,7 +467,7 @@ impl RpcHandler for GoRpcHandler {
 
         let body = match join {
             Ok(Ok(Ok(body))) => body,
-            Ok(Ok(Err(msg))) => return Err(RpcHandlerError::Internal(msg)),
+            Ok(Ok(Err(msg))) => return Err(handler_error_from_msg(msg)),
             Ok(Err(join_err)) => {
                 return Err(RpcHandlerError::Internal(format!(
                     "Go-handler blocking task panicked: {join_err}"
@@ -718,84 +731,23 @@ pub extern "C" fn net_rpc_call(
     } else {
         Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
     };
-    let opts = build_call_options(deadline_ms);
+    let mut opts = build_call_options(deadline_ms);
+    if cancel_token != 0 {
+        opts.cancel_token = Some(cancel_token);
+    }
     let node = h.node.clone();
 
-    let result = run_cancellable(cancel_token, async move {
-        node.call(target_node_id, &service, req_bytes, opts).await
-    });
+    let result = runtime()
+        .block_on(async move { node.call(target_node_id, &service, req_bytes, opts).await });
 
     match result {
-        Ok(Ok(reply)) => {
+        Ok(reply) => {
             write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
             NET_RPC_OK
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             write_err(out_err, format_rpc_error(&e));
             NET_RPC_ERR_CALL_FAILED
-        }
-        Err(CancelledError) => {
-            write_err(out_err, "cancelled: call cancelled by caller".into());
-            NET_RPC_ERR_CALL_FAILED
-        }
-    }
-}
-
-/// Sentinel for "the cancellable future was aborted by
-/// [`net_rpc_cancel_call`]." Surfaces to Go as `nrpc:cancelled:`
-/// (the Go wrapper's `parseRpcError` recognizes the kind segment).
-#[derive(Debug)]
-struct CancelledError;
-
-/// Run `fut` under [`runtime().block_on`]. If `cancel_token != 0`,
-/// register the task's `AbortHandle` so a parallel
-/// [`net_rpc_cancel_call`] aborts mid-flight (which drops the
-/// future, firing the SDK's `UnaryCallGuard::Drop` → CANCEL on
-/// the wire). The await returns `Err(CancelledError)` on abort.
-///
-/// `token == 0` short-circuits to a plain `block_on` so the
-/// non-cancellable path stays free of registry overhead.
-fn run_cancellable<F, T>(cancel_token: u64, fut: F) -> std::result::Result<T, CancelledError>
-where
-    F: std::future::Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    if cancel_token == 0 {
-        return Ok(runtime().block_on(fut));
-    }
-    let task = runtime().spawn(fut);
-    let abort_handle = task.abort_handle();
-    // CR-13: register-or-observe-prior-cancel. If
-    // `net_rpc_cancel_call` already fired between the caller's
-    // `reserve_cancel_token` and this register, the entry is
-    // present with `cancelled=true` — abort right away. Else
-    // store the abort handle so a future cancel finds it.
-    let was_already_cancelled = {
-        let mut reg = cancel_registry().lock();
-        let entry = reg.entry(cancel_token).or_default();
-        if entry.cancelled {
-            true
-        } else {
-            entry.handle = Some(abort_handle.clone());
-            false
-        }
-    };
-    if was_already_cancelled {
-        abort_handle.abort();
-    }
-    let result = runtime().block_on(task);
-    // Cleanup: drop the entry whether we registered, observed
-    // a prior cancel, or observed a successful completion.
-    cancel_registry().lock().remove(&cancel_token);
-    match result {
-        Ok(value) => Ok(value),
-        Err(join_err) if join_err.is_cancelled() => Err(CancelledError),
-        Err(_join_err) => {
-            // A panic in the SDK call surfaces here. Convert to a
-            // sentinel cancel so the caller gets a useful
-            // diagnostic rather than process-wide panic
-            // propagation across the FFI.
-            Err(CancelledError)
         }
     }
 }
@@ -829,24 +781,22 @@ pub extern "C" fn net_rpc_call_service(
     } else {
         Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
     };
-    let opts = build_call_options(deadline_ms);
+    let mut opts = build_call_options(deadline_ms);
+    if cancel_token != 0 {
+        opts.cancel_token = Some(cancel_token);
+    }
     let node = h.node.clone();
 
-    let result = run_cancellable(cancel_token, async move {
-        node.call_service(&service, req_bytes, opts).await
-    });
+    let result =
+        runtime().block_on(async move { node.call_service(&service, req_bytes, opts).await });
 
     match result {
-        Ok(Ok(reply)) => {
+        Ok(reply) => {
             write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
             NET_RPC_OK
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-        Err(CancelledError) => {
-            write_err(out_err, "cancelled: call cancelled by caller".into());
             NET_RPC_ERR_CALL_FAILED
         }
     }
@@ -1150,14 +1100,16 @@ pub extern "C" fn net_rpc_call_streaming(
 /// N-16: cancellable variant of [`net_rpc_call_streaming`].
 /// Identical contract; adds a `cancel_token` parameter so the
 /// construction `block_on` (which awaits the peer's initial-frame
-/// ACK) can be aborted by [`net_rpc_cancel_call`] from another
-/// thread. The unary `net_rpc_call` path got this
-/// discipline as CR-13; the streaming variant lost the cancel hook
-/// because [`net_rpc_stream_close`] only takes effect AFTER the
-/// stream handle is constructed — a Go consumer's `ctx.Done()`
-/// watcher has nothing to call into during the construction
-/// window. `cancel_token == 0` short-circuits to the original
-/// non-cancellable path (no registry overhead).
+/// ACK) AND any mid-stream chunk can be aborted by
+/// [`net_rpc_cancel_call`] from another thread.
+///
+/// ABI 0x0004: cancellation routes through the substrate's
+/// per-mesh `CancelRegistry` via `CallOptions::cancel_token`. The
+/// substrate spawns a watcher that closes the pending entry on
+/// cancel, so a cancel fired mid-stream terminates
+/// [`net_rpc_stream_next`] cleanly with
+/// `nrpc:cancelled: call cancelled`. `cancel_token == 0`
+/// short-circuits to the no-cancel path.
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_call_streaming_cancellable(
@@ -1189,15 +1141,18 @@ pub extern "C" fn net_rpc_call_streaming_cancellable(
     if stream_window > 0 {
         opts.stream_window_initial = Some(stream_window);
     }
+    if cancel_token != 0 {
+        opts.cancel_token = Some(cancel_token);
+    }
     let node = h.node.clone();
 
-    let result = run_cancellable(cancel_token, async move {
+    let result = runtime().block_on(async move {
         node.call_streaming(target_node_id, &service, req_bytes, opts)
             .await
     });
 
     match result {
-        Ok(Ok(stream)) => {
+        Ok(stream) => {
             let call_id = stream.call_id();
             let boxed = Box::new(RpcStreamHandleC {
                 inner: Arc::new(Mutex::new(Some(stream))),
@@ -1209,15 +1164,8 @@ pub extern "C" fn net_rpc_call_streaming_cancellable(
             }
             NET_RPC_OK
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-        Err(CancelledError) => {
-            write_err(
-                out_err,
-                "cancelled: streaming call cancelled by caller before construction".into(),
-            );
             NET_RPC_ERR_CALL_FAILED
         }
     }
@@ -1488,13 +1436,16 @@ pub extern "C" fn net_rpc_call_client_stream_cancellable(
     if request_window > 0 {
         opts.request_window_initial = Some(request_window);
     }
+    if cancel_token != 0 {
+        opts.cancel_token = Some(cancel_token);
+    }
     let node = h.node.clone();
-    let result = run_cancellable(cancel_token, async move {
+    let result = runtime().block_on(async move {
         node.call_client_stream(target_node_id, &service, opts)
             .await
     });
     match result {
-        Ok(Ok(call)) => {
+        Ok(call) => {
             let call_id = call.call_id();
             let boxed = Box::new(ClientStreamCallHandleC {
                 inner: Arc::new(Mutex::new(Some(call))),
@@ -1506,12 +1457,8 @@ pub extern "C" fn net_rpc_call_client_stream_cancellable(
             }
             NET_RPC_OK
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-        Err(CancelledError) => {
-            write_err(out_err, "call cancelled".into());
             NET_RPC_ERR_CALL_FAILED
         }
     }
@@ -1821,12 +1768,14 @@ pub extern "C" fn net_rpc_call_duplex_cancellable(
     if stream_window > 0 {
         opts.stream_window_initial = Some(stream_window);
     }
+    if cancel_token != 0 {
+        opts.cancel_token = Some(cancel_token);
+    }
     let node = h.node.clone();
-    let result = run_cancellable(cancel_token, async move {
-        node.call_duplex(target_node_id, &service, opts).await
-    });
+    let result =
+        runtime().block_on(async move { node.call_duplex(target_node_id, &service, opts).await });
     match result {
-        Ok(Ok(call)) => {
+        Ok(call) => {
             let call_id = call.call_id();
             let (sink, stream) = call.into_split();
             let boxed = Box::new(DuplexCallHandleC {
@@ -1840,12 +1789,8 @@ pub extern "C" fn net_rpc_call_duplex_cancellable(
             }
             NET_RPC_OK
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-        Err(CancelledError) => {
-            write_err(out_err, "call cancelled".into());
             NET_RPC_ERR_CALL_FAILED
         }
     }
@@ -2303,23 +2248,21 @@ pub extern "C" fn net_rpc_call_with_headers(
     };
     let mut opts = build_call_options(deadline_ms);
     opts.request_headers = headers;
+    if cancel_token != 0 {
+        opts.cancel_token = Some(cancel_token);
+    }
     let node = h.node.clone();
 
-    let result = run_cancellable(cancel_token, async move {
-        node.call(target_node_id, &service, req_bytes, opts).await
-    });
+    let result = runtime()
+        .block_on(async move { node.call(target_node_id, &service, req_bytes, opts).await });
 
     match result {
-        Ok(Ok(reply)) => {
+        Ok(reply) => {
             write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
             NET_RPC_OK
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-        Err(CancelledError) => {
-            write_err(out_err, "cancelled: call cancelled by caller".into());
             NET_RPC_ERR_CALL_FAILED
         }
     }
@@ -2363,23 +2306,21 @@ pub extern "C" fn net_rpc_call_service_with_headers(
     };
     let mut opts = build_call_options(deadline_ms);
     opts.request_headers = headers;
+    if cancel_token != 0 {
+        opts.cancel_token = Some(cancel_token);
+    }
     let node = h.node.clone();
 
-    let result = run_cancellable(cancel_token, async move {
-        node.call_service(&service, req_bytes, opts).await
-    });
+    let result =
+        runtime().block_on(async move { node.call_service(&service, req_bytes, opts).await });
 
     match result {
-        Ok(Ok(reply)) => {
+        Ok(reply) => {
             write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
             NET_RPC_OK
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-        Err(CancelledError) => {
-            write_err(out_err, "cancelled: call cancelled by caller".into());
             NET_RPC_ERR_CALL_FAILED
         }
     }
@@ -2455,9 +2396,10 @@ pub extern "C" fn net_rpc_call_streaming_with_headers(
 
 /// N-16: cancellable variant of
 /// [`net_rpc_call_streaming_with_headers`]. Same cancellation
-/// contract as [`net_rpc_call_streaming_cancellable`]: routes the
-/// construction `block_on` through `run_cancellable` so an
-/// in-flight [`net_rpc_cancel_call`] aborts mid-construction.
+/// contract as [`net_rpc_call_streaming_cancellable`]: routes
+/// cancellation through the substrate's per-mesh `CancelRegistry`
+/// via `CallOptions::cancel_token`, so a cancel fired
+/// mid-construction OR mid-stream terminates cleanly.
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_call_streaming_with_headers_cancellable(
@@ -2496,15 +2438,18 @@ pub extern "C" fn net_rpc_call_streaming_with_headers_cancellable(
         opts.stream_window_initial = Some(stream_window);
     }
     opts.request_headers = headers;
+    if cancel_token != 0 {
+        opts.cancel_token = Some(cancel_token);
+    }
     let node = h.node.clone();
 
-    let result = run_cancellable(cancel_token, async move {
+    let result = runtime().block_on(async move {
         node.call_streaming(target_node_id, &service, req_bytes, opts)
             .await
     });
 
     match result {
-        Ok(Ok(stream)) => {
+        Ok(stream) => {
             let call_id = stream.call_id();
             let boxed = Box::new(RpcStreamHandleC {
                 inner: Arc::new(Mutex::new(Some(stream))),
@@ -2516,15 +2461,8 @@ pub extern "C" fn net_rpc_call_streaming_with_headers_cancellable(
             }
             NET_RPC_OK
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-        Err(CancelledError) => {
-            write_err(
-                out_err,
-                "cancelled: streaming call cancelled by caller before construction".into(),
-            );
             NET_RPC_ERR_CALL_FAILED
         }
     }
@@ -2826,7 +2764,7 @@ impl RpcClientStreamingHandler for GoClientStreamingRpcHandler {
         .await;
         let body = match join {
             Ok(Ok(Ok(body))) => body,
-            Ok(Ok(Err(msg))) => return Err(RpcHandlerError::Internal(msg)),
+            Ok(Ok(Err(msg))) => return Err(handler_error_from_msg(msg)),
             Ok(Err(join_err)) => {
                 return Err(RpcHandlerError::Internal(format!(
                     "Go client-streaming blocking task panicked: {join_err}"
@@ -3048,6 +2986,290 @@ pub extern "C" fn net_rpc_serve_duplex(
 }
 
 // =========================================================================
+// Observer + metrics-snapshot (ABI 0x0003, S1-A1).
+//
+// Mirrors the napi + pyo3 binding surface: a per-mesh callback
+// that fires once per completed outbound RPC, plus a cheap
+// snapshot of the per-service counter registry.
+//
+// Observer model:
+//   - Go calls `net_rpc_set_observer_dispatcher` once at init
+//     (OnceLock — first registration wins; mirrors the existing
+//     `net_rpc_set_handler_dispatcher` pattern).
+//   - To enable observation on a given MeshRpc, call
+//     `net_rpc_observer_install(handle, 1)`. Pass `0` to clear.
+//   - The dispatcher fires synchronously from the substrate
+//     dispatch path — the Go side MUST be cheap (push into a
+//     channel; do not block). Same contract as the JS / Python
+//     observers.
+//
+// Event lifetime:
+//   - `RpcCallEventC` fields (`method_ptr` / `status_message_ptr`)
+//     are borrowed from the substrate's stack-local event for the
+//     duration of the call. The Go side MUST copy any bytes it
+//     wants to keep BEFORE the dispatcher returns.
+//
+// Metrics snapshot:
+//   - Returns the per-service counters as a JSON document. JSON
+//     because the substrate snapshot has variable-length data
+//     (services list + histogram bucket arrays) that doesn't
+//     fit a fixed C struct cleanly; Go decodes with
+//     `encoding/json`.
+// =========================================================================
+
+/// Status discriminant for [`RpcCallEventC::status_kind`]:
+///   - 0 = Ok           (status_message_ptr is NULL)
+///   - 1 = Error        (status_message_ptr/len carry diagnostic)
+///   - 2 = Timeout      (status_message_ptr is NULL)
+///   - 3 = Canceled     (status_message_ptr is NULL)
+pub const NET_RPC_STATUS_OK: u8 = 0;
+pub const NET_RPC_STATUS_ERROR: u8 = 1;
+pub const NET_RPC_STATUS_TIMEOUT: u8 = 2;
+pub const NET_RPC_STATUS_CANCELED: u8 = 3;
+
+/// Direction discriminant for [`RpcCallEventC::direction`]:
+///   - 0 = Outbound (this node initiated the call)
+///   - 1 = Inbound  (this node received the call; reserved — v1
+///     emits only Outbound)
+pub const NET_RPC_DIRECTION_OUTBOUND: u8 = 0;
+pub const NET_RPC_DIRECTION_INBOUND: u8 = 1;
+
+/// C-ABI POD mirroring the substrate's `RpcCallEvent`. All
+/// pointer fields are borrowed for the duration of the
+/// dispatcher call only — the Go side MUST copy out anything
+/// it wants to keep before returning.
+#[repr(C)]
+pub struct RpcCallEventC {
+    /// 64-bit node id of the calling node.
+    pub caller: u64,
+    /// 64-bit node id of the responding node.
+    pub callee: u64,
+    /// UTF-8 method/service name. Borrowed; not NUL-terminated.
+    pub method_ptr: *const u8,
+    pub method_len: usize,
+    /// Elapsed time in milliseconds.
+    pub latency_ms: u32,
+    /// One of `NET_RPC_STATUS_*`.
+    pub status_kind: u8,
+    /// Operator-readable diagnostic. Non-NULL only when
+    /// `status_kind == NET_RPC_STATUS_ERROR`. Borrowed; not
+    /// NUL-terminated.
+    pub status_message_ptr: *const u8,
+    pub status_message_len: usize,
+    /// Wire payload size of the request body. 0 when not
+    /// available.
+    pub request_bytes: u32,
+    /// Wire payload size of the response body. 0 when not
+    /// available.
+    pub response_bytes: u32,
+    /// One of `NET_RPC_DIRECTION_*`. v1 only emits Outbound.
+    pub direction: u8,
+    /// Unix-ms timestamp captured at fire time (best-effort).
+    pub ts_unix_ms: u64,
+}
+
+/// C-ABI signature: fired by the substrate dispatch path on
+/// every completed outbound RPC. Implementations MUST be cheap
+/// — the substrate dispatch task blocks until the call returns.
+/// Push into a channel; do not block on I/O, locks, or syscalls.
+pub type RpcObserverFn = unsafe extern "C" fn(evt: *const RpcCallEventC);
+
+/// Process-global observer dispatcher. Set once via
+/// [`net_rpc_set_observer_dispatcher`]; subsequent calls are
+/// silently ignored (first registration wins). Per-mesh
+/// enable/disable goes through [`net_rpc_observer_install`].
+static OBSERVER_DISPATCHER: OnceLock<RpcObserverFn> = OnceLock::new();
+
+/// Register the process-wide observer dispatcher. Idempotent —
+/// only the first call takes effect. The Go binding calls this
+/// once during package init; per-mesh wiring then happens via
+/// [`net_rpc_observer_install`].
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_set_observer_dispatcher(observer: RpcObserverFn) {
+    let _ = OBSERVER_DISPATCHER.set(observer);
+}
+
+/// Build the C POD `RpcCallEventC` from the shared
+/// `Arc<InnerRpcCallEvent>` and invoke the Go-registered
+/// dispatcher. Called once per drained event by the substrate's
+/// [`::net::adapter::net::cortex::ObserverChannel`] worker — runs
+/// on a tokio task, never blocks the substrate dispatch thread.
+fn dispatch_observer_event_to_go(evt: Arc<InnerRpcCallEvent>) {
+    let dispatcher = match OBSERVER_DISPATCHER.get() {
+        Some(d) => *d,
+        None => return,
+    };
+    let (status_kind, status_message): (u8, Option<&str>) = match &evt.status {
+        InnerRpcCallStatus::Ok => (NET_RPC_STATUS_OK, None),
+        InnerRpcCallStatus::Error(msg) => (NET_RPC_STATUS_ERROR, Some(msg.as_str())),
+        InnerRpcCallStatus::Timeout => (NET_RPC_STATUS_TIMEOUT, None),
+        InnerRpcCallStatus::Canceled => (NET_RPC_STATUS_CANCELED, None),
+    };
+    let direction = match evt.direction {
+        InnerRpcDirection::Outbound => NET_RPC_DIRECTION_OUTBOUND,
+        InnerRpcDirection::Inbound => NET_RPC_DIRECTION_INBOUND,
+    };
+    let (msg_ptr, msg_len) = match status_message {
+        Some(s) => (s.as_ptr(), s.len()),
+        None => (std::ptr::null(), 0),
+    };
+    let c_evt = RpcCallEventC {
+        caller: evt.caller,
+        callee: evt.callee,
+        method_ptr: evt.method.as_ptr(),
+        method_len: evt.method.len(),
+        latency_ms: evt.latency_ms,
+        status_kind,
+        status_message_ptr: msg_ptr,
+        status_message_len: msg_len,
+        request_bytes: evt.request_bytes,
+        response_bytes: evt.response_bytes,
+        direction,
+        ts_unix_ms: evt.ts_unix_ms,
+    };
+    // SAFETY: dispatcher is a Go-registered C function with the
+    // documented `RpcObserverFn` signature; `&c_evt` is a valid
+    // pointer to a stack-local POD that outlives this call.
+    unsafe { dispatcher(&c_evt as *const _) };
+}
+
+/// Return the process-global observer-drop counter. Surfaced as a
+/// separate FFI symbol (in addition to the JSON snapshot's
+/// `observer_dropped_total` field) so Go consumers can read it
+/// without paying the JSON-decode cost on hot paths.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_observer_dropped_total() -> u64 {
+    ::net::adapter::net::cortex::observer_dropped_total()
+}
+
+/// Enable (`enabled != 0`) or clear (`enabled == 0`) the observer
+/// on the given MeshRpc.
+///
+/// When enabled, the substrate calls the dispatcher registered
+/// via [`net_rpc_set_observer_dispatcher`] for every completed
+/// outbound RPC.
+///
+/// Returns:
+///   - `NET_RPC_OK` on success.
+///   - `NET_RPC_ERR_NULL` if `handle` is NULL.
+///   - `NET_RPC_ERR_NO_DISPATCHER` if enabling but no dispatcher
+///     was registered yet via
+///     [`net_rpc_set_observer_dispatcher`].
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_observer_install(handle: *const MeshRpcHandle, enabled: c_int) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if enabled != 0 {
+        if OBSERVER_DISPATCHER.get().is_none() {
+            return NET_RPC_ERR_NO_DISPATCHER;
+        }
+        let handle = runtime().handle().clone();
+        let channel = ::net::adapter::net::cortex::ObserverChannel::install(
+            &handle,
+            dispatch_observer_event_to_go,
+        );
+        let obs: Arc<dyn RpcObserver> = Arc::new(channel);
+        h.node.set_rpc_observer(Some(obs));
+    } else {
+        h.node.set_rpc_observer(None);
+    }
+    NET_RPC_OK
+}
+
+/// Snapshot the per-service nRPC metrics registry. On success
+/// writes `(out_json_ptr, out_json_len)` to a heap-allocated
+/// UTF-8 JSON document; caller frees via [`net_rpc_response_free`].
+///
+/// JSON shape — stable across ABI 0x0003 and forward:
+/// ```json
+/// {
+///   "services": [
+///     {
+///       "service": "echo",
+///       "calls_total": 42,
+///       "errors_no_route": 0,
+///       "errors_timeout": 1,
+///       "errors_server": 0,
+///       "errors_transport": 0,
+///       "in_flight": 0,
+///       "latency_sum_ns": 1234567,
+///       "latency_count": 42,
+///       "latency_buckets": [10, 22, 30, ...],
+///       "handler_invocations_total": 0,
+///       "handler_panics_total": 0,
+///       "handler_in_flight": 0,
+///       "handler_duration_sum_ns": 0,
+///       "handler_duration_count": 0,
+///       "handler_duration_buckets": [...],
+///       "streaming_chunks_emitted_total": 0,
+///       "streaming_chunks_dropped_total": 0,
+///       "capability_denied_total": 0
+///     }
+///   ]
+/// }
+/// ```
+///
+/// Returns:
+///   - `NET_RPC_OK` on success.
+///   - `NET_RPC_ERR_NULL` if `handle` / any out-param is NULL.
+///   - `NET_RPC_ERR_CALL_FAILED` if the JSON serialize fails
+///     (allocator OOM); `out_err` carries the diagnostic.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_metrics_snapshot(
+    handle: *const MeshRpcHandle,
+    out_json_ptr: *mut *mut u8,
+    out_json_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        write_err(out_err, "MeshRpc handle is NULL".into());
+        return NET_RPC_ERR_NULL;
+    };
+    if out_json_ptr.is_null() || out_json_len.is_null() {
+        write_err(out_err, "out_json_ptr / out_json_len is NULL".into());
+        return NET_RPC_ERR_NULL;
+    }
+    let snapshot = h.node.rpc_metrics_snapshot();
+    let value = serde_json::json!({
+        "services": snapshot.services.iter().map(|m| serde_json::json!({
+            "service": m.service,
+            "calls_total": m.calls_total,
+            "errors_no_route": m.errors_no_route,
+            "errors_timeout": m.errors_timeout,
+            "errors_server": m.errors_server,
+            "errors_transport": m.errors_transport,
+            "in_flight": m.in_flight,
+            "latency_sum_ns": m.latency_sum_ns,
+            "latency_count": m.latency_count,
+            "latency_buckets": m.latency_buckets,
+            "handler_invocations_total": m.handler_invocations_total,
+            "handler_panics_total": m.handler_panics_total,
+            "handler_in_flight": m.handler_in_flight,
+            "handler_duration_sum_ns": m.handler_duration_sum_ns,
+            "handler_duration_count": m.handler_duration_count,
+            "handler_duration_buckets": m.handler_duration_buckets,
+            "streaming_chunks_emitted_total": m.streaming_chunks_emitted_total,
+            "streaming_chunks_dropped_total": m.streaming_chunks_dropped_total,
+            "capability_denied_total": m.capability_denied_total,
+        })).collect::<Vec<_>>(),
+        // v3 / O-A3: process-global observer-drop counter. See
+        // also the dedicated `net_rpc_observer_dropped_total`
+        // FFI symbol for consumers that don't want to JSON-decode.
+        "observer_dropped_total": ::net::adapter::net::cortex::observer_dropped_total(),
+    });
+    let bytes = match serde_json::to_vec(&value) {
+        Ok(v) => v,
+        Err(e) => {
+            write_err(out_err, format!("metrics serialize failed: {e}"));
+            return NET_RPC_ERR_CALL_FAILED;
+        }
+    };
+    write_response(bytes, out_json_ptr, out_json_len);
+    NET_RPC_OK
+}
+
+// =========================================================================
 // Tests for pure-logic helpers.
 // =========================================================================
 
@@ -3195,11 +3417,12 @@ mod tests {
     #[test]
     fn abi_version_matches_constant() {
         assert_eq!(net_rpc_abi_version(), NET_RPC_ABI_VERSION);
-        // Phase B8-1 bumps to 0x0002 — adds client-streaming
-        // caller-side surface. Pin so a regression to 0x0001
-        // (or skipping ahead to 0x0003 without B8-2 landing)
-        // surfaces in tests.
-        assert_eq!(NET_RPC_ABI_VERSION, 0x0002);
+        // Phase C-A3 bumps to 0x0004 — the two cancel symbols gain
+        // a leading MeshRpcHandle* argument so cancellation routes
+        // through the substrate's per-mesh CancelRegistry. Pin so
+        // an accidental regression (or further bump without all
+        // callers updating) surfaces in tests.
+        assert_eq!(NET_RPC_ABI_VERSION, 0x0004);
     }
 
     /// `net_rpc_client_stream_send` on a NULL handle returns
@@ -3469,125 +3692,14 @@ mod tests {
         assert!(b > a && c > b, "ids must be strictly increasing");
     }
 
-    /// `net_rpc_reserve_cancel_token` returns monotonically
-    /// increasing non-zero tokens, and `net_rpc_cancel_call(0)`
-    /// is a quiet no-op. Pinned: a regression to "0 is a valid
-    /// token" would silently break the cancellation path.
-    #[test]
-    fn cancel_token_reserve_and_zero_cancel_are_safe() {
-        let a = net_rpc_reserve_cancel_token();
-        let b = net_rpc_reserve_cancel_token();
-        assert!(a > 0 && b > 0 && b > a);
-        // Cancelling 0 / a never-registered token is a quiet no-op.
-        net_rpc_cancel_call(0);
-        net_rpc_cancel_call(u64::MAX);
-    }
-
-    /// `run_cancellable` aborts the future when
-    /// `net_rpc_cancel_call(token)` fires from another thread.
-    /// Pinned: this is the load-bearing invariant the entire
-    /// ctx.Done() → CANCEL pathway depends on.
-    #[test]
-    fn run_cancellable_aborts_on_cancel_call() {
-        let token = net_rpc_reserve_cancel_token();
-        // Fire cancel from a sibling thread; the future below
-        // sleeps far longer than the cancel deadline, so if abort
-        // doesn't work the test wedges (caught by cargo's
-        // per-test timeout).
-        let cancel_token = token;
-        let canceller = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            net_rpc_cancel_call(cancel_token);
-        });
-        let result = run_cancellable(token, async move {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            "should never reach here"
-        });
-        assert!(result.is_err(), "cancel must abort the future");
-        canceller.join().unwrap();
-    }
-
-    /// CR-13: `run_cancellable` honors a cancel that arrived
-    /// BEFORE the call even started. Pre-CR-13 the registry
-    /// didn't carry a `cancelled` flag — a cancel issued
-    /// against a reserved token whose call hadn't yet inserted
-    /// the abort handle would silently drop on the floor, and
-    /// the subsequent call would run to completion despite the
-    /// caller's cancel signal.
-    #[test]
-    fn run_cancellable_honors_cancel_issued_before_register() {
-        let token = net_rpc_reserve_cancel_token();
-        // Fire cancel against the reserved token BEFORE
-        // run_cancellable runs. With CR-13 the registry now
-        // carries `cancelled=true` for this token; without
-        // CR-13 the cancel would no-op.
-        net_rpc_cancel_call(token);
-        let result = run_cancellable(token, async move {
-            // Long-running future. If the pre-cancel didn't take
-            // effect, this sleep would eventually return Ok and
-            // the test wedges (caught by cargo's per-test timeout).
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            "should never reach here"
-        });
-        assert!(
-            result.is_err(),
-            "pre-issued cancel must abort the future immediately"
-        );
-        // Registry entry should be cleaned up after run_cancellable.
-        let lingering = cancel_registry().lock().contains_key(&token);
-        assert!(
-            !lingering,
-            "registry entry must be removed after run_cancellable"
-        );
-    }
-
-    /// `run_cancellable` with token=0 short-circuits to plain
-    /// block_on — no registry overhead, no abort handle.
-    #[test]
-    fn run_cancellable_token_zero_runs_to_completion() {
-        let result = run_cancellable(0, async move { 42_u32 });
-        assert_eq!(result.unwrap(), 42);
-    }
-
-    /// Q18: a cancel issued for a token whose `rpc_call` never
-    /// runs leaves a `{cancelled, no handle}` orphan entry.
-    /// Pre-fix nothing cleaned those up, so a caller that did
-    /// `reserve_token` + `cancel_call` repeatedly without any
-    /// dispatch accumulated registry state without bound. The
-    /// opportunistic GC inside `net_rpc_cancel_call` evicts
-    /// orphans older than `ORPHAN_TTL`; we exercise that by
-    /// stamping a fake-old `marked_at` directly into the entry
-    /// and then issuing a cancel for an unrelated token.
-    #[test]
-    fn cancel_call_evicts_stale_orphan_entries() {
-        let stale_token = net_rpc_reserve_cancel_token();
-        let fresh_token = net_rpc_reserve_cancel_token();
-
-        // Stamp the stale token's entry as old enough to evict.
-        // Same shape `cancel_call` produces, but with a
-        // marked_at predating ORPHAN_TTL.
-        {
-            let mut reg = cancel_registry().lock();
-            let entry = reg.entry(stale_token).or_default();
-            entry.cancelled = true;
-            entry.marked_at = Some(std::time::Instant::now() - (ORPHAN_TTL * 2));
-        }
-
-        // Issue a cancel for an unrelated token. The opportunistic
-        // GC should evict the stale entry while inserting the
-        // fresh one.
-        net_rpc_cancel_call(fresh_token);
-
-        let reg = cancel_registry().lock();
-        assert!(
-            !reg.contains_key(&stale_token),
-            "stale orphan entry should have been evicted"
-        );
-        // Fresh entry is present (it's an orphan with current
-        // marked_at). Its eventual cleanup is its own next-call
-        // GC pass; that's the bounded behavior we want.
-        assert!(reg.contains_key(&fresh_token));
-    }
+    // Cancel-registry unit tests live with the substrate primitive
+    // at `net/src/adapter/net/cancel_registry.rs` (CR-13
+    // cancel-before-register, Q18 orphan-TTL GC) and at the SDK
+    // integration layer at
+    // `net/tests/integration_mesh_cancel.rs` (mid-flight cancel,
+    // cancel-before-call, post-resolution cancel, all four call
+    // shapes). The FFI delegates straight through, so binding-side
+    // duplication would just track the substrate.
 
     /// `net_rpc_serve` rejects `handler_id == 0` with a clear
     /// error message rather than calling into the SDK with a
@@ -3710,5 +3822,17 @@ mod tests {
         let collected = unsafe { collect_headers(arr.as_ptr(), arr.len()) }.unwrap();
         assert_eq!(collected[0].0, "x-empty");
         assert!(collected[0].1.is_empty());
+    }
+
+    /// `net_rpc_observer_dropped_total()` returns the substrate's
+    /// process-global counter — the dedicated FFI symbol that lets
+    /// Go consumers scrape the drop count without paying the
+    /// JSON-decode cost on the full snapshot. Sanity-checks the
+    /// FFI hand-off matches the substrate's view.
+    #[test]
+    fn ffi_observer_dropped_total_matches_substrate() {
+        let substrate = ::net::adapter::net::cortex::observer_dropped_total();
+        let via_ffi = net_rpc_observer_dropped_total();
+        assert_eq!(substrate, via_ffi);
     }
 }

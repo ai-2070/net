@@ -47,7 +47,20 @@ from net.mesh_rpc import (
     RpcServerError,
     RpcTimeoutError,
     RpcTransportError,
+    RpcCallEvent,
+    RpcCallStatusCanceled,
+    RpcCallStatusError,
+    RpcCallStatusOk,
+    RpcCallStatusTimeout,
+    RpcMetricsSnapshot,
+    ServiceMetrics,
+    TypedClientStreamCall,
+    TypedDuplexCall,
+    TypedDuplexSink,
+    TypedDuplexStream,
     TypedMeshRpc,
+    TypedRequestStream,
+    TypedResponseSink,
     classify_error,
     default_breaker_failure,
     default_retryable,
@@ -618,3 +631,631 @@ def test_typed_serve_handler_runtime_exception_still_surfaces_as_internal() -> N
     assert stub.inner is not None
     with pytest.raises(RuntimeError, match="boom"):
         stub.inner(b'{"any": "valid_json"}')
+
+
+# =========================================================================
+# TypedClientStreamCall + TypedRequestStream (S2-C1) — stub-level
+# round-trip + encode/decode failure coverage. Live tests against a
+# real MeshRpc belong in S2-X (cross-language).
+# =========================================================================
+
+
+class _StubRawClientStreamCall:
+    """Stub mirroring the pyo3 ``ClientStreamCall`` surface."""
+
+    def __init__(self, finish_response: bytes) -> None:
+        self.finish_response = finish_response
+        self.sent: list[bytes] = []
+        self.closed = False
+        self._call_id = 7
+        self._flow_controlled = False
+
+    def send(self, body: bytes) -> None:
+        self.sent.append(bytes(body))
+
+    def finish(self) -> bytes:
+        return self.finish_response
+
+    def call_id(self) -> int:
+        return self._call_id
+
+    def flow_controlled(self) -> bool:
+        return self._flow_controlled
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_typed_client_stream_round_trip() -> None:
+    """Round-trip: three typed sends + a decoded terminal response."""
+    import json as _json
+
+    raw = _StubRawClientStreamCall(_json.dumps({"sum": 6}).encode("utf-8"))
+    call = TypedClientStreamCall(raw)
+    call.send({"n": 1})
+    call.send({"n": 2})
+    call.send({"n": 3})
+    assert call.finish() == {"sum": 6}
+    assert [bytes(b).decode("utf-8") for b in raw.sent] == [
+        '{"n":1}',
+        '{"n":2}',
+        '{"n":3}',
+    ]
+
+
+def test_typed_client_stream_encode_failure_raises_codec_error() -> None:
+    raw = _StubRawClientStreamCall(b"null")
+    call = TypedClientStreamCall(raw)
+
+    class NotJsonable:
+        pass
+
+    with pytest.raises(RpcCodecError):
+        call.send(NotJsonable())
+    # Encode happens before reaching the wire — no chunk sent.
+    assert raw.sent == []
+
+
+def test_typed_client_stream_finish_decode_failure_raises_codec_error() -> None:
+    raw = _StubRawClientStreamCall(b"{not json")
+    call = TypedClientStreamCall(raw)
+    with pytest.raises(RpcCodecError):
+        call.finish()
+
+
+def test_typed_client_stream_context_manager_calls_close() -> None:
+    raw = _StubRawClientStreamCall(b"null")
+    with TypedClientStreamCall(raw):
+        pass
+    assert raw.closed is True
+
+
+def test_typed_client_stream_close_swallows_underlying_errors() -> None:
+    """``close()`` is a best-effort cleanup — a raw layer that
+    raises must NOT propagate; matches TypedRpcStream.close.
+    """
+
+    class _RaisingClose(_StubRawClientStreamCall):
+        def close(self) -> None:
+            raise RuntimeError("boom")
+
+    call = TypedClientStreamCall(_RaisingClose(b"null"))
+    call.close()  # must not raise
+    call.close()  # idempotent
+
+
+class _StubRawRequestStream:
+    """Stub mirroring the pyo3 ``RequestStreamRecv`` surface —
+    iterator protocol + diagnostic getters.
+    """
+
+    def __init__(
+        self,
+        chunks: list[bytes],
+        *,
+        caller_origin: int = 0xFEEDFACE,
+        call_id: int = 42,
+        deadline_ns: int = 0,
+        headers: list | None = None,
+    ) -> None:
+        self._chunks = list(chunks)
+        self._idx = 0
+        self.caller_origin = caller_origin
+        self.call_id = call_id
+        self.deadline_ns = deadline_ns
+        self.headers = headers if headers is not None else []
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> bytes:
+        if self._idx >= len(self._chunks):
+            raise StopIteration
+        chunk = self._chunks[self._idx]
+        self._idx += 1
+        return chunk
+
+
+def test_typed_request_stream_decodes_chunks_until_eof() -> None:
+    raw = _StubRawRequestStream(
+        [b'{"n":1}', b'{"n":2}', b'{"n":3}'],
+    )
+    stream = TypedRequestStream(raw)
+    decoded = [item["n"] for item in stream]
+    assert decoded == [1, 2, 3]
+
+
+def test_typed_request_stream_decode_failure_marks_done() -> None:
+    raw = _StubRawRequestStream([b'{not json'])
+    stream = TypedRequestStream(raw)
+    with pytest.raises(RpcCodecError):
+        next(stream)
+    # Subsequent next() returns StopIteration (no re-throw) — the
+    # stream is marked done; refuse to continue draining broken
+    # framing.
+    with pytest.raises(StopIteration):
+        next(stream)
+
+
+def test_typed_request_stream_exposes_diagnostic_getters() -> None:
+    raw = _StubRawRequestStream(
+        [],
+        caller_origin=0xDEADBEEF,
+        call_id=99,
+        deadline_ns=1_700_000_000_000_000_000,
+        headers=[("x-trace", b"abc")],
+    )
+    stream = TypedRequestStream(raw)
+    assert stream.caller_origin == 0xDEADBEEF
+    assert stream.call_id == 99
+    assert stream.deadline_ns == 1_700_000_000_000_000_000
+    assert stream.headers == [("x-trace", b"abc")]
+
+
+class _CapturingClientStreamRpc:
+    """Stub that captures ``serve_client_stream`` / ``call_client_stream``
+    so we can drive the wrapper without a live binding.
+    """
+
+    def __init__(self) -> None:
+        self.inner_handler = None
+        self.call_args: tuple | None = None
+        self.returned_call: _StubRawClientStreamCall | None = None
+
+    def serve_client_stream(self, service: str, handler) -> object:  # noqa: ARG002
+        self.inner_handler = handler
+        return object()
+
+    def call_client_stream(
+        self,
+        target: int,
+        service: str,
+        opts: dict | None,
+    ) -> _StubRawClientStreamCall:
+        self.call_args = (target, service, opts)
+        self.returned_call = _StubRawClientStreamCall(b"null")
+        return self.returned_call
+
+
+def test_typed_serve_client_stream_decodes_and_encodes_round_trip() -> None:
+    stub = _CapturingClientStreamRpc()
+    rpc = TypedMeshRpc(stub)
+    rpc.serve_client_stream("sum", lambda stream: {"sum": sum(r["n"] for r in stream)})
+    assert stub.inner_handler is not None
+    # Synthesize a raw request stream and run the wrapper's
+    # installed inner handler against it. Result should be the
+    # JSON-encoded terminal sum.
+    raw_stream = _StubRawRequestStream([b'{"n":10}', b'{"n":20}', b'{"n":12}'])
+    resp = stub.inner_handler(raw_stream)
+    import json as _json
+
+    assert _json.loads(resp.decode("utf-8")) == {"sum": 42}
+
+
+def test_typed_call_client_stream_wraps_raw_call() -> None:
+    stub = _CapturingClientStreamRpc()
+    rpc = TypedMeshRpc(stub)
+    call = rpc.call_client_stream(0xCAFE, "ingest", {"deadline_ms": 1000})
+    assert isinstance(call, TypedClientStreamCall)
+    assert stub.call_args == (0xCAFE, "ingest", {"deadline_ms": 1000})
+    # Round-trip through the returned typed call to confirm wiring.
+    call.send({"k": "v"})
+    assert stub.returned_call is not None
+    assert stub.returned_call.sent[0].decode("utf-8") == '{"k":"v"}'
+
+
+# =========================================================================
+# TypedDuplexCall / TypedDuplexSink / TypedDuplexStream /
+# TypedResponseSink (S2-C2) — stub-level round-trip + split-halves
+# coverage. Live tests against a real MeshRpc belong in S2-X.
+# =========================================================================
+
+
+class _StubRawResponseSink:
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+        self.closed = False
+
+    def send(self, body: bytes) -> bool:
+        if self.closed:
+            return False
+        self.sent.append(bytes(body))
+        return True
+
+
+class _StubRawDuplexSink:
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+        self.finished = False
+        self.closed = False
+
+    def send(self, body: bytes) -> None:
+        self.sent.append(bytes(body))
+
+    def finish(self) -> None:
+        self.finished = True
+
+    def call_id(self) -> int:
+        return 11
+
+    def flow_controlled(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _StubRawDuplexStream:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = list(chunks)
+        self._idx = 0
+        self.closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> bytes:
+        if self._idx >= len(self._chunks):
+            raise StopIteration
+        chunk = self._chunks[self._idx]
+        self._idx += 1
+        return chunk
+
+    def call_id(self) -> int:
+        return 12
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _StubRawDuplexCall:
+    def __init__(self, stream: _StubRawDuplexStream) -> None:
+        self.sent: list[bytes] = []
+        self.finished_sending = False
+        self.closed = False
+        self.sink: _StubRawDuplexSink | None = None
+        self.stream = stream
+
+    def send(self, body: bytes) -> None:
+        self.sent.append(bytes(body))
+
+    def finish_sending(self) -> None:
+        self.finished_sending = True
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> bytes:
+        return next(self.stream)
+
+    def into_split(self):
+        sink = _StubRawDuplexSink()
+        self.sink = sink
+        return sink, self.stream
+
+    def call_id(self) -> int:
+        return 13
+
+    def flow_controlled(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_typed_duplex_round_trip() -> None:
+    """Round-trip: typed sends + typed responses interleaved."""
+    stream = _StubRawDuplexStream([b'{"r":"a"}', b'{"r":"b"}'])
+    raw = _StubRawDuplexCall(stream)
+    call = TypedDuplexCall(raw)
+    call.send({"q": 1})
+    call.send({"q": 2})
+    call.finish_sending()
+    collected = [item["r"] for item in call]
+    assert collected == ["a", "b"]
+    assert [b.decode("utf-8") for b in raw.sent] == ['{"q":1}', '{"q":2}']
+    assert raw.finished_sending is True
+
+
+def test_typed_duplex_decode_failure_closes_call() -> None:
+    stream = _StubRawDuplexStream([b'{not json'])
+    raw = _StubRawDuplexCall(stream)
+    call = TypedDuplexCall(raw)
+    with pytest.raises(RpcCodecError):
+        next(call)
+    assert raw.closed is True
+    # Subsequent next() returns StopIteration (no re-throw).
+    with pytest.raises(StopIteration):
+        next(call)
+
+
+def test_typed_duplex_into_split_yields_typed_halves() -> None:
+    stream = _StubRawDuplexStream([b'{"r":"x"}', b'{"r":"y"}'])
+    raw = _StubRawDuplexCall(stream)
+    call = TypedDuplexCall(raw)
+    sink, recv = call.into_split()
+    assert isinstance(sink, TypedDuplexSink)
+    assert isinstance(recv, TypedDuplexStream)
+    sink.send({"q": 7})
+    sink.finish()
+    assert raw.sink is not None
+    assert raw.sink.sent[0].decode("utf-8") == '{"q":7}'
+    assert raw.sink.finished is True
+    collected = [item["r"] for item in recv]
+    assert collected == ["x", "y"]
+    # The original call is consumed after into_split.
+    with pytest.raises(StopIteration):
+        next(call)
+
+
+def test_typed_duplex_close_idempotent_swallows_errors() -> None:
+    class _RaisingClose(_StubRawDuplexCall):
+        def close(self) -> None:
+            raise RuntimeError("boom")
+
+    call = TypedDuplexCall(_RaisingClose(_StubRawDuplexStream([])))
+    call.close()  # must not raise
+    call.close()  # idempotent
+
+
+def test_typed_response_sink_round_trip() -> None:
+    raw = _StubRawResponseSink()
+    sink = TypedResponseSink(raw)
+    assert sink.send({"r": 1}) is True
+    assert sink.send({"r": 2}) is True
+    assert [b.decode("utf-8") for b in raw.sent] == ['{"r":1}', '{"r":2}']
+
+
+def test_typed_response_sink_returns_false_when_closed() -> None:
+    raw = _StubRawResponseSink()
+    raw.closed = True
+    sink = TypedResponseSink(raw)
+    assert sink.send({"r": 1}) is False
+    assert raw.sent == []
+
+
+def test_typed_response_sink_encode_failure_does_not_enqueue() -> None:
+    raw = _StubRawResponseSink()
+    sink = TypedResponseSink(raw)
+
+    class NotJsonable:
+        pass
+
+    with pytest.raises(RpcCodecError):
+        sink.send(NotJsonable())
+    assert raw.sent == []
+
+
+class _CapturingDuplexRpc:
+    def __init__(self) -> None:
+        self.inner_handler = None
+
+    def serve_duplex(self, service: str, handler) -> object:  # noqa: ARG002
+        self.inner_handler = handler
+        return object()
+
+
+def test_typed_serve_duplex_destructures_stream_and_sink() -> None:
+    stub = _CapturingDuplexRpc()
+    rpc = TypedMeshRpc(stub)
+
+    observed: dict = {}
+
+    def handler(stream: TypedRequestStream, sink: TypedResponseSink) -> None:
+        reqs = []
+        for req in stream:
+            reqs.append(req["q"])
+            sink.send({"r": f"echo:{req['q']}"})
+        observed["reqs"] = reqs
+
+    rpc.serve_duplex("echo", handler)
+    assert stub.inner_handler is not None
+
+    raw_stream = _StubRawRequestStream([b'{"q":1}', b'{"q":2}', b'{"q":3}'])
+    raw_sink = _StubRawResponseSink()
+    result = stub.inner_handler(raw_stream, raw_sink)
+    assert result is None
+    assert observed["reqs"] == [1, 2, 3]
+    assert [b.decode("utf-8") for b in raw_sink.sent] == [
+        '{"r":"echo:1"}',
+        '{"r":"echo:2"}',
+        '{"r":"echo:3"}',
+    ]
+
+
+# =========================================================================
+# TypedMeshRpc.set_observer + metrics_snapshot (S2-C3) — stub-level
+# normalization + forwarding tests. Live observer firing belongs in S2-X.
+# =========================================================================
+
+
+class _RawEvent:
+    """Stand-in for the pyo3 ``RpcCallEvent`` POD with flat
+    ``status_kind`` / ``status_message`` fields.
+    """
+
+    def __init__(
+        self,
+        *,
+        caller: int = 0x1,
+        callee: int = 0x2,
+        method: str = "echo",
+        latency_ms: int = 7,
+        status_kind: str = "ok",
+        status_message: str | None = None,
+        request_bytes: int = 10,
+        response_bytes: int = 20,
+        direction: str = "outbound",
+        ts_unix_ms: int = 1_000_000,
+    ) -> None:
+        self.caller = caller
+        self.callee = callee
+        self.method = method
+        self.latency_ms = latency_ms
+        self.status_kind = status_kind
+        self.status_message = status_message
+        self.request_bytes = request_bytes
+        self.response_bytes = response_bytes
+        self.direction = direction
+        self.ts_unix_ms = ts_unix_ms
+
+
+def test_typed_event_ok_status() -> None:
+    from net.mesh_rpc import _raw_event_to_typed
+
+    evt = _raw_event_to_typed(_RawEvent(status_kind="ok"))
+    assert isinstance(evt, RpcCallEvent)
+    assert isinstance(evt.status, RpcCallStatusOk)
+
+
+def test_typed_event_error_status_carries_message() -> None:
+    from net.mesh_rpc import _raw_event_to_typed
+
+    evt = _raw_event_to_typed(
+        _RawEvent(status_kind="error", status_message="connection lost"),
+    )
+    assert isinstance(evt.status, RpcCallStatusError)
+    assert evt.status.message == "connection lost"
+
+
+def test_typed_event_error_with_no_message_defaults_to_empty() -> None:
+    from net.mesh_rpc import _raw_event_to_typed
+
+    evt = _raw_event_to_typed(_RawEvent(status_kind="error"))
+    assert isinstance(evt.status, RpcCallStatusError)
+    assert evt.status.message == ""
+
+
+def test_typed_event_timeout_and_canceled_bare_tags() -> None:
+    from net.mesh_rpc import _raw_event_to_typed
+
+    t = _raw_event_to_typed(_RawEvent(status_kind="timeout"))
+    c = _raw_event_to_typed(_RawEvent(status_kind="canceled"))
+    assert isinstance(t.status, RpcCallStatusTimeout)
+    assert isinstance(c.status, RpcCallStatusCanceled)
+
+
+def test_typed_event_preserves_other_fields() -> None:
+    from net.mesh_rpc import _raw_event_to_typed
+
+    evt = _raw_event_to_typed(
+        _RawEvent(
+            caller=0xAA00,
+            callee=0xBB00,
+            method="svc.foo",
+            latency_ms=3,
+            request_bytes=8,
+            response_bytes=4,
+            direction="outbound",
+            ts_unix_ms=1234,
+        ),
+    )
+    assert evt.caller == 0xAA00
+    assert evt.callee == 0xBB00
+    assert evt.method == "svc.foo"
+    assert evt.latency_ms == 3
+    assert evt.request_bytes == 8
+    assert evt.response_bytes == 4
+    assert evt.direction == "outbound"
+    assert evt.ts_unix_ms == 1234
+
+
+class _CapturingObserverRpc:
+    def __init__(self) -> None:
+        self.installed = None
+
+    def set_observer(self, callable_or_none) -> None:
+        self.installed = callable_or_none
+
+
+def test_typed_set_observer_decodes_events_and_forwards() -> None:
+    stub = _CapturingObserverRpc()
+    rpc = TypedMeshRpc(stub)
+    seen: list = []
+    rpc.set_observer(lambda evt: seen.append(evt))
+    assert stub.installed is not None
+    stub.installed(
+        _RawEvent(
+            method="svc.foo",
+            status_kind="error",
+            status_message="no_route",
+        ),
+    )
+    assert len(seen) == 1
+    assert seen[0].method == "svc.foo"
+    assert isinstance(seen[0].status, RpcCallStatusError)
+    assert seen[0].status.message == "no_route"
+
+
+def test_typed_set_observer_none_clears_raw_observer() -> None:
+    stub = _CapturingObserverRpc()
+    rpc = TypedMeshRpc(stub)
+    rpc.set_observer(lambda evt: None)
+    assert stub.installed is not None
+    rpc.set_observer(None)
+    assert stub.installed is None
+
+
+class _RawServiceMetrics:
+    """Stand-in for the pyo3 ``ServiceMetrics`` POD."""
+
+    def __init__(self) -> None:
+        self.service = "echo"
+        self.calls_total = 42
+        self.errors_no_route = 0
+        self.errors_timeout = 1
+        self.errors_server = 0
+        self.errors_transport = 0
+        self.in_flight = 0
+        self.latency_sum_ns = 1234567
+        self.latency_count = 42
+        self.latency_buckets = [10, 22, 30]
+        self.handler_invocations_total = 0
+        self.handler_panics_total = 0
+        self.handler_in_flight = 0
+        self.handler_duration_sum_ns = 0
+        self.handler_duration_count = 0
+        self.handler_duration_buckets = [0, 0, 0]
+        self.streaming_chunks_emitted_total = 0
+        self.streaming_chunks_dropped_total = 0
+        self.capability_denied_total = 0
+
+
+class _RawSnapshot:
+    def __init__(self, services: list) -> None:
+        self.services = services
+
+
+class _CapturingMetricsRpc:
+    def __init__(self, snapshot: _RawSnapshot) -> None:
+        self._snapshot = snapshot
+
+    def metrics_snapshot(self) -> _RawSnapshot:
+        return self._snapshot
+
+
+def test_typed_metrics_snapshot_decodes_raw_to_dataclass() -> None:
+    raw = _RawSnapshot([_RawServiceMetrics()])
+    stub = _CapturingMetricsRpc(raw)
+    rpc = TypedMeshRpc(stub)
+    snapshot = rpc.metrics_snapshot()
+    assert isinstance(snapshot, RpcMetricsSnapshot)
+    assert len(snapshot.services) == 1
+    svc = snapshot.services[0]
+    assert isinstance(svc, ServiceMetrics)
+    assert svc.service == "echo"
+    assert svc.calls_total == 42
+    assert svc.errors_timeout == 1
+    assert svc.latency_sum_ns == 1234567
+    assert svc.latency_buckets == [10, 22, 30]
+
+
+def test_typed_metrics_snapshot_empty_services() -> None:
+    """No services iterated since the mesh was created → empty list,
+    still wrapped in the typed dataclass.
+    """
+    stub = _CapturingMetricsRpc(_RawSnapshot([]))
+    rpc = TypedMeshRpc(stub)
+    snapshot = rpc.metrics_snapshot()
+    assert isinstance(snapshot, RpcMetricsSnapshot)
+    assert snapshot.services == []

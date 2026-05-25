@@ -183,6 +183,7 @@ jobs:
           --test integration_cortex_tasks
           --test integration_cortex_memories
           --test cortex_ryw_global_cap
+          --test integration_mesh_cancel
           --test integration_nrpc_loopback
           --test integration_nrpc_mesh
           --test integration_nrpc_streaming

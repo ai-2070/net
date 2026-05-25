@@ -65,6 +65,6 @@ pub use rpc::{
 };
 #[cfg(feature = "cortex")]
 pub use rpc_observer::{
-    unix_now_ms as rpc_observer_unix_now_ms, RpcCallEvent, RpcCallStatus, RpcDirection,
-    RpcObserver, RpcObserverHandle,
+    observer_dropped_total, unix_now_ms as rpc_observer_unix_now_ms, ObserverChannel, RpcCallEvent,
+    RpcCallStatus, RpcDirection, RpcObserver, RpcObserverHandle, OBSERVER_BUFFER_CAPACITY,
 };

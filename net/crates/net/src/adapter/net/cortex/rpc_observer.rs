@@ -15,6 +15,7 @@
 //! mpsc-driven handler invocation needs additional plumbing
 //! before we can record the dispatch-to-respond span cleanly.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Direction of the observed RPC boundary relative to the local
@@ -117,6 +118,84 @@ pub fn unix_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+// ============================================================================
+// ObserverChannel — bounded-mpsc trampoline shared across bindings (N4).
+//
+// Every binding (napi, pyo3, rpc-ffi) was hand-rolling the same
+// bounded-mpsc + drain-worker + drop-counter shape. Consolidating
+// here lets each binding write only its language-specific dispatch
+// closure (TSFN call / GIL-acquired Python invocation / C function
+// pointer) instead of ~55 lines of channel + worker plumbing.
+// ============================================================================
+
+/// Bound on the per-binding observer event buffer. Big enough that
+/// a momentarily-slow observer doesn't lose events under normal
+/// load; small enough that an actually-broken observer surfaces
+/// drops within seconds rather than minutes.
+pub const OBSERVER_BUFFER_CAPACITY: usize = 1024;
+
+/// Process-global count of observer events dropped because the
+/// bounded buffer was full. Shared across every binding's
+/// [`ObserverChannel`] instance. Surface via the binding's
+/// `metrics_snapshot.observer_dropped_total` field.
+///
+/// Per-process (not per-mesh / per-binding-instance) because the
+/// observer dispatch path is fundamentally per-process; consumers
+/// reading the snapshot expect a monotonic process-lifetime count.
+pub static OBSERVER_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Bounded-mpsc observer trampoline. Constructed by each language
+/// binding's `set_observer` implementation; installed on the mesh
+/// via [`super::super::MeshNode::set_rpc_observer`].
+///
+/// The substrate dispatch path's [`RpcObserver::on_call`] pays only
+/// `Arc::clone` + `try_send` + atomic counter on overflow — every
+/// allocation / GIL-acquisition / TSFN call defers to the worker
+/// drained off the dispatch thread.
+pub struct ObserverChannel {
+    sender: tokio::sync::mpsc::Sender<Arc<RpcCallEvent>>,
+}
+
+impl ObserverChannel {
+    /// Build a bounded channel + spawn a drain worker on the given
+    /// runtime handle. `dispatch` runs once per drained event on
+    /// the worker task — bindings put their language-specific
+    /// invocation here (TSFN, GIL acquisition + Python call, C
+    /// function-pointer call).
+    ///
+    /// The worker exits cleanly when the channel closes (every
+    /// `ObserverChannel` is dropped + no more senders exist).
+    pub fn install<F>(runtime: &tokio::runtime::Handle, dispatch: F) -> Self
+    where
+        F: Fn(Arc<RpcCallEvent>) + Send + 'static,
+    {
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<Arc<RpcCallEvent>>(OBSERVER_BUFFER_CAPACITY);
+        runtime.spawn(async move {
+            while let Some(evt) = receiver.recv().await {
+                dispatch(evt);
+            }
+            // Sender dropped → channel closed → worker exits.
+        });
+        Self { sender }
+    }
+}
+
+impl RpcObserver for ObserverChannel {
+    fn on_call(&self, evt: RpcCallEvent) {
+        if self.sender.try_send(Arc::new(evt)).is_err() {
+            OBSERVER_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Current value of the process-global observer drop counter.
+/// Bindings surface this via their snapshot's
+/// `observer_dropped_total` field.
+pub fn observer_dropped_total() -> u64 {
+    OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +211,60 @@ mod tests {
         // this, so a zero return would mean the SystemTime call
         // failed in a way we want to surface.
         assert!(t > 1_735_689_600_000, "unix_now_ms returned suspicious {t}");
+    }
+
+    /// `ObserverChannel::on_call` drops events when the bounded
+    /// channel fills and increments `OBSERVER_DROPPED_TOTAL` by one
+    /// per drop. The whole point of the v3 mpsc design — overflow
+    /// MUST surface via the snapshot's `observer_dropped_total` so
+    /// a slow consumer is observable from production telemetry.
+    ///
+    /// The worker gate is a `parking_lot::Mutex` held by the test
+    /// for the duration of the burst; the worker tries to lock it
+    /// once per event and blocks until the burst is done. Avoids
+    /// `std::thread::sleep` which would also block tokio shutdown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observer_channel_drops_overflow_events_and_counts_them() {
+        let handle = tokio::runtime::Handle::current();
+        let gate = Arc::new(parking_lot::Mutex::new(()));
+        let baseline = OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed);
+        let burst_guard = gate.lock();
+        let worker_gate = gate.clone();
+        let channel = ObserverChannel::install(&handle, move |_evt| {
+            let _wait = worker_gate.lock();
+        });
+        let make_event = || RpcCallEvent {
+            caller: 1,
+            callee: 2,
+            method: "test.svc.echo".into(),
+            latency_ms: 0,
+            status: RpcCallStatus::Ok,
+            request_bytes: 0,
+            response_bytes: 0,
+            direction: RpcDirection::Outbound,
+            ts_unix_ms: 0,
+        };
+        const FIRED: u64 = 2000;
+        for _ in 0..FIRED {
+            channel.on_call(make_event());
+        }
+        let dropped = OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed) - baseline;
+        // First event reaches the worker (which then blocks on the
+        // gate); OBSERVER_BUFFER_CAPACITY-1 fit in the buffer; the
+        // rest drop. Allow ±1 slack for the worker's recv-then-lock
+        // race.
+        let expected_min = FIRED - OBSERVER_BUFFER_CAPACITY as u64 - 1;
+        assert!(
+            dropped >= expected_min,
+            "expected ≥ {expected_min} drops, got {dropped}",
+        );
+        drop(burst_guard);
+    }
+
+    #[test]
+    fn observer_dropped_total_helper_matches_static() {
+        let direct = OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed);
+        let via_helper = observer_dropped_total();
+        assert_eq!(direct, via_helper);
     }
 }

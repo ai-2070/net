@@ -48,8 +48,24 @@ import {
 
 import {
   TypedMeshRpc,
+  TypedClientStreamCall,
+  TypedRequestStream,
+  TypedDuplexCall,
+  TypedDuplexSink,
+  TypedDuplexStream,
+  TypedResponseSink,
+  rawEventToTyped,
   type CallOptions,
   type RawMeshRpc,
+  type RawClientStreamCall,
+  type RawRequestStream,
+  type RawDuplexCall,
+  type RawDuplexSink,
+  type RawDuplexStream,
+  type RawResponseSink,
+  type RawRpcCallEvent,
+  type RpcCallEvent,
+  type RpcMetricsSnapshot,
   type ServeHandle,
 } from '../mesh_rpc'
 
@@ -427,6 +443,18 @@ class StubRawMeshRpc implements RawMeshRpc {
   async callStreaming(): Promise<never> {
     throw new Error('not implemented in stub')
   }
+  async callClientStream(): Promise<never> {
+    throw new Error('callClientStream not implemented in stub')
+  }
+  serveClientStream(): ServeHandle {
+    throw new Error('serveClientStream not implemented in stub')
+  }
+  async callDuplex(): Promise<never> {
+    throw new Error('callDuplex not implemented in stub')
+  }
+  serveDuplex(): ServeHandle {
+    throw new Error('serveDuplex not implemented in stub')
+  }
   serve(): ServeHandle {
     throw new Error('not implemented in stub')
   }
@@ -441,6 +469,12 @@ class StubRawMeshRpc implements RawMeshRpc {
   }
   cancelCall(_token: bigint): void {
     throw new Error('cancelCall not implemented in stub')
+  }
+  setObserver(_o: unknown): void {
+    throw new Error('setObserver not implemented in stub')
+  }
+  metricsSnapshot(): never {
+    throw new Error('metricsSnapshot not implemented in stub')
   }
 }
 
@@ -584,6 +618,18 @@ describe('AbortSignal wiring on the typed wrapper', () => {
     async callStreaming(): Promise<never> {
       throw new Error('not implemented')
     }
+    async callClientStream(): Promise<never> {
+      throw new Error('callClientStream not implemented')
+    }
+    serveClientStream(): ServeHandle {
+      throw new Error('serveClientStream not implemented')
+    }
+    async callDuplex(): Promise<never> {
+      throw new Error('callDuplex not implemented')
+    }
+    serveDuplex(): ServeHandle {
+      throw new Error('serveDuplex not implemented')
+    }
     serve(): ServeHandle {
       throw new Error('not implemented')
     }
@@ -597,6 +643,12 @@ describe('AbortSignal wiring on the typed wrapper', () => {
     }
     cancelCall(token: bigint): void {
       this.cancelCalls.push(token)
+    }
+    setObserver(_o: unknown): void {
+      throw new Error('setObserver not implemented')
+    }
+    metricsSnapshot(): never {
+      throw new Error('metricsSnapshot not implemented')
     }
   }
 
@@ -661,6 +713,148 @@ describe('AbortSignal wiring on the typed wrapper', () => {
   })
 })
 
+// ============================================================================
+// AbortSignal wiring on streaming calls — v3 C-B1 (NRPC_V3) extended
+// `wireAbortSignal` from unary-only to client-streaming + duplex.
+// Pin: `signal.aborted` mid-stream invokes raw.cancelCall(token) just
+// like unary; closing the typed call detaches the listener so a
+// post-close abort doesn't double-fire.
+// ============================================================================
+
+describe('AbortSignal wiring on streaming calls', () => {
+  // Minimal raw stub for the streaming entries that captures opts,
+  // tracks reservations + cancelCall invocations, and returns
+  // controllable stub call handles so we can observe signal
+  // propagation without rebuilding the napi backend.
+  class StreamingCancelTrackingRaw implements RawMeshRpc {
+    public reservations: bigint[] = []
+    public cancelCalls: bigint[] = []
+    public capturedOpts: CallOptions | undefined = undefined
+    private nextToken = 200n
+
+    async call(): Promise<Buffer> {
+      throw new Error('call not implemented')
+    }
+    async callService(): Promise<Buffer> {
+      throw new Error('callService not implemented')
+    }
+    async callStreaming(): Promise<never> {
+      throw new Error('callStreaming not implemented')
+    }
+    async callClientStream(
+      _target: bigint,
+      _service: string,
+      opts?: CallOptions,
+    ): Promise<RawClientStreamCall> {
+      this.capturedOpts = opts
+      return new StubClientStreamCall(Buffer.from('null', 'utf-8'))
+    }
+    serveClientStream(): ServeHandle {
+      throw new Error('serveClientStream not implemented')
+    }
+    async callDuplex(
+      _target: bigint,
+      _service: string,
+      opts?: CallOptions,
+    ): Promise<RawDuplexCall> {
+      this.capturedOpts = opts
+      return new StubDuplexCall(new StubDuplexStream([]))
+    }
+    serveDuplex(): ServeHandle {
+      throw new Error('serveDuplex not implemented')
+    }
+    serve(): ServeHandle {
+      throw new Error('serve not implemented')
+    }
+    findServiceNodes(): bigint[] {
+      return []
+    }
+    reserveCancelToken(): bigint {
+      const t = this.nextToken++
+      this.reservations.push(t)
+      return t
+    }
+    cancelCall(token: bigint): void {
+      this.cancelCalls.push(token)
+    }
+    setObserver(_o: unknown): void {
+      throw new Error('setObserver not implemented')
+    }
+    metricsSnapshot(): never {
+      throw new Error('metricsSnapshot not implemented')
+    }
+  }
+
+  it('callClientStream inserts a cancelToken when signal is provided', async () => {
+    const raw = new StreamingCancelTrackingRaw()
+    const rpc = new TypedMeshRpc(raw)
+    const ac = new AbortController()
+    const call = await rpc.callClientStream(0n, 'echo', { signal: ac.signal })
+    expect(raw.reservations.length).toBe(1)
+    expect(raw.capturedOpts?.cancelToken).toBe(raw.reservations[0])
+    // signal must NOT be passed through to the napi side.
+    expect(raw.capturedOpts?.signal).toBeUndefined()
+    await call.close()
+  })
+
+  it('aborting the signal mid-client-stream fires raw.cancelCall(token)', async () => {
+    const raw = new StreamingCancelTrackingRaw()
+    const rpc = new TypedMeshRpc(raw)
+    const ac = new AbortController()
+    const call = await rpc.callClientStream(0n, 'echo', { signal: ac.signal })
+    ac.abort()
+    expect(raw.cancelCalls.length).toBe(1)
+    expect(raw.cancelCalls[0]).toBe(raw.reservations[0])
+    await call.close()
+  })
+
+  it('closing the typed client-stream detaches the listener', async () => {
+    const raw = new StreamingCancelTrackingRaw()
+    const rpc = new TypedMeshRpc(raw)
+    const ac = new AbortController()
+    const call = await rpc.callClientStream(0n, 'echo', { signal: ac.signal })
+    await call.close()
+    // Post-close abort must NOT re-fire cancelCall.
+    ac.abort()
+    expect(raw.cancelCalls.length).toBe(0)
+  })
+
+  it('callDuplex inserts a cancelToken when signal is provided', async () => {
+    const raw = new StreamingCancelTrackingRaw()
+    const rpc = new TypedMeshRpc(raw)
+    const ac = new AbortController()
+    const call = await rpc.callDuplex(0n, 'echo', { signal: ac.signal })
+    expect(raw.reservations.length).toBe(1)
+    expect(raw.capturedOpts?.cancelToken).toBe(raw.reservations[0])
+    expect(raw.capturedOpts?.signal).toBeUndefined()
+    await call.close()
+  })
+
+  it('aborting the signal mid-duplex fires raw.cancelCall(token)', async () => {
+    const raw = new StreamingCancelTrackingRaw()
+    const rpc = new TypedMeshRpc(raw)
+    const ac = new AbortController()
+    const call = await rpc.callDuplex(0n, 'echo', { signal: ac.signal })
+    ac.abort()
+    expect(raw.cancelCalls.length).toBe(1)
+    expect(raw.cancelCalls[0]).toBe(raw.reservations[0])
+    await call.close()
+  })
+
+  it('after intoSplit + sink.close, the detach has transferred', async () => {
+    const raw = new StreamingCancelTrackingRaw()
+    const rpc = new TypedMeshRpc(raw)
+    const ac = new AbortController()
+    const call = await rpc.callDuplex(0n, 'echo', { signal: ac.signal })
+    const [sink, recvStream] = await call.intoSplit()
+    await sink.close()
+    void recvStream
+    // The sink owns the detach now; post-close abort is a no-op.
+    ac.abort()
+    expect(raw.cancelCalls.length).toBe(0)
+  })
+})
+
 describe('appError', () => {
   it('formats canonical nrpc:app_error:0x<code>:<body>', () => {
     const e = appError(0x8000, '{"err":"bad"}')
@@ -692,3 +886,722 @@ describe('appError', () => {
     expect(e.message).toBe('nrpc:app_error:0x8000:status: bad')
   })
 })
+
+// ============================================================================
+// TypedClientStreamCall + TypedRequestStream (S2-B1) — stub-level
+// round-trip + encode/decode failure coverage. Live napi tests
+// against a real MeshRpc belong in S2-X.
+// ============================================================================
+
+class StubClientStreamCall implements RawClientStreamCall {
+  /** Sent chunks captured for round-trip assertion. */
+  public sent: Buffer[] = []
+  /** Terminal response bytes returned by `finish()`. */
+  public finishResponse: Buffer
+  public closed = false
+  public callIdValue = 7n
+  public flowControlledValue = false
+
+  constructor(finishResponse: Buffer) {
+    this.finishResponse = finishResponse
+  }
+
+  async send(body: Buffer): Promise<void> {
+    this.sent.push(Buffer.from(body))
+  }
+  async finish(): Promise<Buffer> {
+    return this.finishResponse
+  }
+  async callId(): Promise<bigint> {
+    return this.callIdValue
+  }
+  async flowControlled(): Promise<boolean> {
+    return this.flowControlledValue
+  }
+  async close(): Promise<void> {
+    this.closed = true
+  }
+}
+
+describe('TypedClientStreamCall', () => {
+  it('JSON-encodes each send and JSON-decodes the terminal response', async () => {
+    const raw = new StubClientStreamCall(
+      Buffer.from(JSON.stringify({ sum: 6 }), 'utf-8'),
+    )
+    const call = new TypedClientStreamCall<{ n: number }, { sum: number }>(raw)
+    await call.send({ n: 1 })
+    await call.send({ n: 2 })
+    await call.send({ n: 3 })
+    const reply = await call.finish()
+    expect(reply).toEqual({ sum: 6 })
+    expect(raw.sent.length).toBe(3)
+    expect(raw.sent[0].toString('utf-8')).toBe('{"n":1}')
+    expect(raw.sent[1].toString('utf-8')).toBe('{"n":2}')
+    expect(raw.sent[2].toString('utf-8')).toBe('{"n":3}')
+  })
+
+  it('encode failure (BigInt) throws nrpc:codec_encode', async () => {
+    const raw = new StubClientStreamCall(Buffer.from('null'))
+    const call = new TypedClientStreamCall<bigint, null>(raw)
+    let caught: Error | null = null
+    try {
+      await call.send(1n)
+    } catch (e) {
+      caught = e as Error
+    }
+    expect(caught).not.toBeNull()
+    expect(caught!.message.startsWith('nrpc:codec_encode:')).toBe(true)
+    expect(raw.sent.length).toBe(0)
+  })
+
+  it('decode failure on finish throws nrpc:codec_decode', async () => {
+    const raw = new StubClientStreamCall(Buffer.from('{not json'))
+    const call = new TypedClientStreamCall<unknown, unknown>(raw)
+    let caught: Error | null = null
+    try {
+      await call.finish()
+    } catch (e) {
+      caught = e as Error
+    }
+    expect(caught).not.toBeNull()
+    const typed = classifyError(caught) as RpcCodecError
+    expect(typed).toBeInstanceOf(RpcCodecError)
+    expect(typed.direction).toBe('decode')
+  })
+
+  it('close() is idempotent and swallows underlying errors', async () => {
+    const raw = new StubClientStreamCall(Buffer.from('null'))
+    raw.close = async (): Promise<void> => {
+      throw new Error('nrpc:stream_closed: already closed')
+    }
+    const call = new TypedClientStreamCall(raw)
+    // close() must not throw even if the raw side does — best-effort
+    // cleanup contract; mirrors TypedRpcStream.close.
+    await call.close()
+    await call.close()
+  })
+})
+
+class StubRequestStream implements RawRequestStream {
+  public callerOrigin = 0xfeedfacen
+  public callId = 42n
+  public deadlineNs = 0n
+  public headers: [string, Buffer][] = []
+  private chunks: (Buffer | null)[]
+  private idx = 0
+
+  constructor(chunks: (Buffer | null)[]) {
+    // Append a null terminator if the caller didn't.
+    const lastIsNull =
+      chunks.length > 0 && chunks[chunks.length - 1] === null
+    this.chunks = lastIsNull ? chunks : [...chunks, null]
+  }
+
+  async next(): Promise<Buffer | null> {
+    if (this.idx >= this.chunks.length) return null
+    return this.chunks[this.idx++]
+  }
+}
+
+describe('TypedRequestStream', () => {
+  it('decodes each chunk and returns null on EOF', async () => {
+    const stream = new TypedRequestStream<{ n: number }>(
+      new StubRequestStream([
+        Buffer.from('{"n":1}'),
+        Buffer.from('{"n":2}'),
+        Buffer.from('{"n":3}'),
+      ]),
+    )
+    const collected: number[] = []
+    while (true) {
+      const v = await stream.next()
+      if (v === null) break
+      collected.push(v.n)
+    }
+    expect(collected).toEqual([1, 2, 3])
+    // Subsequent next() after EOF stays null (no exception).
+    expect(await stream.next()).toBeNull()
+  })
+
+  it('async-iterates via for await', async () => {
+    const stream = new TypedRequestStream<{ k: string }>(
+      new StubRequestStream([
+        Buffer.from('{"k":"a"}'),
+        Buffer.from('{"k":"b"}'),
+      ]),
+    )
+    const collected: string[] = []
+    for await (const v of stream) {
+      collected.push(v.k)
+    }
+    expect(collected).toEqual(['a', 'b'])
+  })
+
+  it('decode failure throws nrpc:codec_decode and marks stream done', async () => {
+    const stream = new TypedRequestStream(
+      new StubRequestStream([Buffer.from('{not json')]),
+    )
+    let caught: Error | null = null
+    try {
+      await stream.next()
+    } catch (e) {
+      caught = e as Error
+    }
+    expect(caught).not.toBeNull()
+    const typed = classifyError(caught) as RpcCodecError
+    expect(typed).toBeInstanceOf(RpcCodecError)
+    expect(typed.direction).toBe('decode')
+    // Stream is marked done — subsequent next() returns null
+    // rather than re-throwing the same error.
+    expect(await stream.next()).toBeNull()
+  })
+
+  it('exposes diagnostic getters from the raw stream', async () => {
+    const raw = new StubRequestStream([])
+    raw.callerOrigin = 0xdeadbeefn
+    raw.callId = 99n
+    raw.deadlineNs = 1_700_000_000_000_000_000n
+    raw.headers = [['x-trace', Buffer.from('abc')]]
+    const stream = new TypedRequestStream(raw)
+    expect(stream.callerOrigin).toBe(0xdeadbeefn)
+    expect(stream.callId).toBe(99n)
+    expect(stream.deadlineNs).toBe(1_700_000_000_000_000_000n)
+    expect(stream.headers).toEqual([['x-trace', Buffer.from('abc')]])
+  })
+})
+
+describe('TypedMeshRpc.serveClientStream', () => {
+  it('decodes inbound chunks and encodes the terminal response', async () => {
+    let installed:
+      | ((stream: RawRequestStream) => Promise<Buffer>)
+      | undefined
+    const stub: RawMeshRpc = {
+      serve: () => {
+        throw new Error('not used')
+      },
+      call: () => Promise.reject(new Error('not used')),
+      callService: () => Promise.reject(new Error('not used')),
+      callStreaming: () => Promise.reject(new Error('not used')),
+      callClientStream: () => Promise.reject(new Error('not used')),
+      serveClientStream: (
+        _service: string,
+        handler: (s: RawRequestStream) => Promise<Buffer>,
+      ): ServeHandle => {
+        installed = handler
+        return { close: () => {}, isClosed: () => false }
+      },
+      callDuplex: () => Promise.reject(new Error('not used')),
+      serveDuplex: () => {
+        throw new Error('not used')
+      },
+      findServiceNodes: () => [],
+      reserveCancelToken: () => 0n,
+      cancelCall: () => {},
+      setObserver: () => {
+        throw new Error('not used')
+      },
+      metricsSnapshot: () => {
+        throw new Error('not used')
+      },
+    }
+    const rpc = new TypedMeshRpc(stub)
+    rpc.serveClientStream<{ n: number }, { sum: number }>(
+      'sum',
+      async (stream) => {
+        let total = 0
+        for await (const req of stream) total += req.n
+        return { sum: total }
+      },
+    )
+    expect(installed).toBeDefined()
+    // Synthesize a request stream of three chunks + EOF and run
+    // the installed handler against it. The handler should return
+    // a JSON-encoded Buffer with the terminal sum.
+    const raw = new StubRequestStream([
+      Buffer.from('{"n":10}'),
+      Buffer.from('{"n":20}'),
+      Buffer.from('{"n":12}'),
+    ])
+    const respBuf = await installed!(raw)
+    expect(respBuf.toString('utf-8')).toBe('{"sum":42}')
+  })
+})
+
+// ============================================================================
+// TypedDuplexCall / TypedDuplexSink / TypedDuplexStream /
+// TypedResponseSink (S2-B2) — stub-level round-trip + split-halves
+// coverage. Live napi tests against a real MeshRpc belong in S2-X.
+// ============================================================================
+
+class StubResponseSink implements RawResponseSink {
+  public sent: Buffer[] = []
+  public closed = false
+  send(body: Buffer): boolean {
+    if (this.closed) return false
+    this.sent.push(Buffer.from(body))
+    return true
+  }
+}
+
+class StubDuplexSink implements RawDuplexSink {
+  public sent: Buffer[] = []
+  public finished = false
+  public closed = false
+  async send(body: Buffer): Promise<void> {
+    this.sent.push(Buffer.from(body))
+  }
+  async finish(): Promise<void> {
+    this.finished = true
+  }
+  async callId(): Promise<bigint> {
+    return 11n
+  }
+  async flowControlled(): Promise<boolean> {
+    return false
+  }
+  async close(): Promise<void> {
+    this.closed = true
+  }
+}
+
+class StubDuplexStream implements RawDuplexStream {
+  private chunks: (Buffer | null)[]
+  private idx = 0
+  public closed = false
+  constructor(chunks: (Buffer | null)[]) {
+    const lastIsNull =
+      chunks.length > 0 && chunks[chunks.length - 1] === null
+    this.chunks = lastIsNull ? chunks : [...chunks, null]
+  }
+  async next(): Promise<Buffer | null> {
+    if (this.idx >= this.chunks.length) return null
+    return this.chunks[this.idx++]
+  }
+  async callId(): Promise<bigint> {
+    return 12n
+  }
+  async close(): Promise<void> {
+    this.closed = true
+  }
+}
+
+class StubDuplexCall implements RawDuplexCall {
+  public sent: Buffer[] = []
+  public finishedSending = false
+  public closed = false
+  public sink: StubDuplexSink | null = null
+  public stream: StubDuplexStream
+  constructor(stream: StubDuplexStream) {
+    this.stream = stream
+  }
+  async send(body: Buffer): Promise<void> {
+    this.sent.push(Buffer.from(body))
+  }
+  async finishSending(): Promise<void> {
+    this.finishedSending = true
+  }
+  async next(): Promise<Buffer | null> {
+    return this.stream.next()
+  }
+  async intoSplit(): Promise<[RawDuplexSink, RawDuplexStream]> {
+    const sink = new StubDuplexSink()
+    this.sink = sink
+    return [sink, this.stream]
+  }
+  async callId(): Promise<bigint> {
+    return 13n
+  }
+  async flowControlled(): Promise<boolean> {
+    return false
+  }
+  async close(): Promise<void> {
+    this.closed = true
+  }
+}
+
+describe('TypedDuplexCall', () => {
+  it('round-trips: typed sends + typed responses', async () => {
+    const stream = new StubDuplexStream([
+      Buffer.from('{"r":"a"}'),
+      Buffer.from('{"r":"b"}'),
+    ])
+    const raw = new StubDuplexCall(stream)
+    const call = new TypedDuplexCall<{ q: number }, { r: string }>(raw)
+    await call.send({ q: 1 })
+    await call.send({ q: 2 })
+    await call.finishSending()
+    const collected: string[] = []
+    for await (const v of call) collected.push(v.r)
+    expect(collected).toEqual(['a', 'b'])
+    expect(raw.sent.map((b) => b.toString('utf-8'))).toEqual([
+      '{"q":1}',
+      '{"q":2}',
+    ])
+    expect(raw.finishedSending).toBe(true)
+  })
+
+  it('decode failure on next closes the underlying call', async () => {
+    const stream = new StubDuplexStream([Buffer.from('{not json')])
+    const raw = new StubDuplexCall(stream)
+    const call = new TypedDuplexCall(raw)
+    let caught: Error | null = null
+    try {
+      await call.next()
+    } catch (e) {
+      caught = e as Error
+    }
+    expect(caught).not.toBeNull()
+    const typed = classifyError(caught) as RpcCodecError
+    expect(typed).toBeInstanceOf(RpcCodecError)
+    expect(typed.direction).toBe('decode')
+    expect(raw.closed).toBe(true)
+    // Subsequent next() returns null instead of re-throwing.
+    expect(await call.next()).toBeNull()
+  })
+
+  it('intoSplit yields typed sink + stream halves', async () => {
+    const stream = new StubDuplexStream([
+      Buffer.from('{"r":"x"}'),
+      Buffer.from('{"r":"y"}'),
+    ])
+    const raw = new StubDuplexCall(stream)
+    const call = new TypedDuplexCall<{ q: number }, { r: string }>(raw)
+    const [sink, recvStream] = await call.intoSplit()
+    expect(sink).toBeInstanceOf(TypedDuplexSink)
+    expect(recvStream).toBeInstanceOf(TypedDuplexStream)
+    await sink.send({ q: 7 })
+    await sink.finish()
+    expect(raw.sink).not.toBeNull()
+    expect(raw.sink!.sent.length).toBe(1)
+    expect(raw.sink!.sent[0].toString('utf-8')).toBe('{"q":7}')
+    expect(raw.sink!.finished).toBe(true)
+    const collected: string[] = []
+    for await (const v of recvStream) collected.push(v.r)
+    expect(collected).toEqual(['x', 'y'])
+    // After intoSplit the original call is consumed; subsequent
+    // next() returns null and won't double-drain the stream.
+    expect(await call.next()).toBeNull()
+  })
+
+  it('close() is idempotent and swallows underlying errors', async () => {
+    const raw = new StubDuplexCall(new StubDuplexStream([]))
+    raw.close = async (): Promise<void> => {
+      throw new Error('nrpc:stream_closed: already closed')
+    }
+    const call = new TypedDuplexCall(raw)
+    await call.close()
+    await call.close()
+  })
+})
+
+describe('TypedResponseSink', () => {
+  it('JSON-encodes each send and returns true on enqueue', () => {
+    const raw = new StubResponseSink()
+    const sink = new TypedResponseSink<{ r: number }>(raw)
+    expect(sink.send({ r: 1 })).toBe(true)
+    expect(sink.send({ r: 2 })).toBe(true)
+    expect(raw.sent.map((b) => b.toString('utf-8'))).toEqual([
+      '{"r":1}',
+      '{"r":2}',
+    ])
+  })
+
+  it('returns false when the underlying raw sink is closed', () => {
+    const raw = new StubResponseSink()
+    raw.closed = true
+    const sink = new TypedResponseSink<{ r: number }>(raw)
+    expect(sink.send({ r: 1 })).toBe(false)
+    expect(raw.sent.length).toBe(0)
+  })
+
+  it('encode failure throws nrpc:codec_encode and does NOT enqueue', () => {
+    const raw = new StubResponseSink()
+    const sink = new TypedResponseSink<bigint>(raw)
+    let caught: Error | null = null
+    try {
+      sink.send(1n)
+    } catch (e) {
+      caught = e as Error
+    }
+    expect(caught).not.toBeNull()
+    expect(caught!.message.startsWith('nrpc:codec_encode:')).toBe(true)
+    expect(raw.sent.length).toBe(0)
+  })
+})
+
+describe('TypedMeshRpc.serveDuplex', () => {
+  it('destructures [stream, sink] and presents (stream, sink) to the handler', async () => {
+    let installed:
+      | ((
+          args: [RawRequestStream, RawResponseSink],
+        ) => Promise<Buffer>)
+      | undefined
+    const stub: RawMeshRpc = {
+      serve: () => {
+        throw new Error('not used')
+      },
+      call: () => Promise.reject(new Error('not used')),
+      callService: () => Promise.reject(new Error('not used')),
+      callStreaming: () => Promise.reject(new Error('not used')),
+      callClientStream: () => Promise.reject(new Error('not used')),
+      serveClientStream: () => {
+        throw new Error('not used')
+      },
+      callDuplex: () => Promise.reject(new Error('not used')),
+      serveDuplex: (
+        _service: string,
+        handler: (
+          args: [RawRequestStream, RawResponseSink],
+        ) => Promise<Buffer>,
+      ): ServeHandle => {
+        installed = handler
+        return { close: () => {}, isClosed: () => false }
+      },
+      findServiceNodes: () => [],
+      reserveCancelToken: () => 0n,
+      cancelCall: () => {},
+      setObserver: () => {
+        throw new Error('not used')
+      },
+      metricsSnapshot: () => {
+        throw new Error('not used')
+      },
+    }
+    const rpc = new TypedMeshRpc(stub)
+    let observed: { reqs: number[]; sent: string[] } | null = null
+    rpc.serveDuplex<{ q: number }, { r: string }>(
+      'echo',
+      async (stream, sink) => {
+        const reqs: number[] = []
+        const sent: string[] = []
+        for await (const req of stream) {
+          reqs.push(req.q)
+          const replied = sink.send({ r: `echo:${req.q}` })
+          if (replied) sent.push(`echo:${req.q}`)
+        }
+        observed = { reqs, sent }
+      },
+    )
+    expect(installed).toBeDefined()
+    const rawStream = new StubRequestStream([
+      Buffer.from('{"q":1}'),
+      Buffer.from('{"q":2}'),
+      Buffer.from('{"q":3}'),
+    ])
+    const rawSink = new StubResponseSink()
+    const termBuf = await installed!([rawStream, rawSink])
+    expect(observed).toEqual({ reqs: [1, 2, 3], sent: ['echo:1', 'echo:2', 'echo:3'] })
+    // Substrate discards the terminal Buffer for duplex; the
+    // wrapper returns an empty Buffer so the JS contract holds.
+    expect(termBuf.length).toBe(0)
+    expect(rawSink.sent.map((b) => b.toString('utf-8'))).toEqual([
+      '{"r":"echo:1"}',
+      '{"r":"echo:2"}',
+      '{"r":"echo:3"}',
+    ])
+  })
+})
+
+// ============================================================================
+// TypedMeshRpc.setObserver + metricsSnapshot (S2-B3) — stub-level
+// forwarding + RawRpcCallEvent → RpcCallEvent normalization.
+// Live observer-firing belongs in S2-X.
+// ============================================================================
+
+describe('rawEventToTyped', () => {
+  const base: RawRpcCallEvent = {
+    caller: 0x1n,
+    callee: 0x2n,
+    method: 'echo',
+    latencyMs: 7,
+    statusKind: 'ok',
+    requestBytes: 10,
+    responseBytes: 20,
+    direction: 'outbound',
+    tsUnixMs: 1_000_000n,
+  }
+
+  it("decodes 'ok' to {kind:'ok'}", () => {
+    const evt = rawEventToTyped({ ...base, statusKind: 'ok' })
+    expect(evt.status).toEqual({ kind: 'ok' })
+  })
+
+  it("decodes 'error' to {kind:'error', message}", () => {
+    const evt = rawEventToTyped({
+      ...base,
+      statusKind: 'error',
+      statusMessage: 'connection lost',
+    })
+    expect(evt.status).toEqual({ kind: 'error', message: 'connection lost' })
+  })
+
+  it("decodes 'error' with no message to empty string", () => {
+    // The napi side promises a string when statusKind is 'error',
+    // but Node test stubs may omit it — `?? ''` keeps the shape
+    // exhaustive for downstream `switch(status.kind)` patterns.
+    const evt = rawEventToTyped({
+      ...base,
+      statusKind: 'error',
+    })
+    expect(evt.status).toEqual({ kind: 'error', message: '' })
+  })
+
+  it("decodes 'timeout' / 'canceled' to bare tags", () => {
+    const t = rawEventToTyped({ ...base, statusKind: 'timeout' })
+    const c = rawEventToTyped({ ...base, statusKind: 'canceled' })
+    expect(t.status).toEqual({ kind: 'timeout' })
+    expect(c.status).toEqual({ kind: 'canceled' })
+  })
+
+  it('preserves the remaining fields verbatim', () => {
+    const evt = rawEventToTyped(base)
+    expect(evt.caller).toBe(0x1n)
+    expect(evt.callee).toBe(0x2n)
+    expect(evt.method).toBe('echo')
+    expect(evt.latencyMs).toBe(7)
+    expect(evt.requestBytes).toBe(10)
+    expect(evt.responseBytes).toBe(20)
+    expect(evt.direction).toBe('outbound')
+    expect(evt.tsUnixMs).toBe(1_000_000n)
+  })
+})
+
+describe('TypedMeshRpc.setObserver', () => {
+  it('installs the observer through to the raw layer and decodes events', () => {
+    let installed: ((evt: RawRpcCallEvent) => void) | null | undefined =
+      undefined
+    const stub = stubRpcForObserver((o) => {
+      installed = o
+    })
+    const rpc = new TypedMeshRpc(stub)
+    const seen: RpcCallEvent[] = []
+    rpc.setObserver((evt) => seen.push(evt))
+    expect(typeof installed).toBe('function')
+
+    // Synthesize a napi-style raw event and push it through the
+    // installed wrapper. The typed handler should see a decoded
+    // tagged status.
+    installed!({
+      caller: 0xaa00n,
+      callee: 0xbb00n,
+      method: 'svc.foo',
+      latencyMs: 3,
+      statusKind: 'error',
+      statusMessage: 'no_route',
+      requestBytes: 8,
+      responseBytes: 0,
+      direction: 'outbound',
+      tsUnixMs: 1234n,
+    })
+
+    expect(seen.length).toBe(1)
+    expect(seen[0].status).toEqual({
+      kind: 'error',
+      message: 'no_route',
+    })
+    expect(seen[0].method).toBe('svc.foo')
+    expect(seen[0].latencyMs).toBe(3)
+  })
+
+  it('forwards null to the raw side to clear an installed observer', () => {
+    let installed: ((evt: RawRpcCallEvent) => void) | null | undefined =
+      undefined
+    const stub = stubRpcForObserver((o) => {
+      installed = o
+    })
+    const rpc = new TypedMeshRpc(stub)
+    rpc.setObserver(() => {})
+    expect(typeof installed).toBe('function')
+    rpc.setObserver(null)
+    expect(installed).toBeNull()
+  })
+})
+
+describe('TypedMeshRpc.metricsSnapshot', () => {
+  it('passes the raw POD through unchanged', () => {
+    const snapshot: RpcMetricsSnapshot = {
+      services: [
+        {
+          service: 'echo',
+          callsTotal: 42n,
+          errorsNoRoute: 0n,
+          errorsTimeout: 1n,
+          errorsServer: 0n,
+          errorsTransport: 0n,
+          inFlight: 0,
+          latencySumNs: 1234567n,
+          latencyCount: 42n,
+          latencyBuckets: [10n, 22n, 30n],
+          handlerInvocationsTotal: 0n,
+          handlerPanicsTotal: 0n,
+          handlerInFlight: 0,
+          handlerDurationSumNs: 0n,
+          handlerDurationCount: 0n,
+          handlerDurationBuckets: [0n, 0n, 0n],
+          streamingChunksEmittedTotal: 0n,
+          streamingChunksDroppedTotal: 0n,
+          capabilityDeniedTotal: 0n,
+        },
+      ],
+    }
+    const stub = stubRpcForMetrics(snapshot)
+    const rpc = new TypedMeshRpc(stub)
+    expect(rpc.metricsSnapshot()).toBe(snapshot)
+  })
+})
+
+function stubRpcForObserver(
+  installer: (observer: ((evt: RawRpcCallEvent) => void) | null) => void,
+): RawMeshRpc {
+  return {
+    serve: () => {
+      throw new Error('not used')
+    },
+    call: () => Promise.reject(new Error('not used')),
+    callService: () => Promise.reject(new Error('not used')),
+    callStreaming: () => Promise.reject(new Error('not used')),
+    callClientStream: () => Promise.reject(new Error('not used')),
+    serveClientStream: () => {
+      throw new Error('not used')
+    },
+    callDuplex: () => Promise.reject(new Error('not used')),
+    serveDuplex: () => {
+      throw new Error('not used')
+    },
+    findServiceNodes: () => [],
+    reserveCancelToken: () => 0n,
+    cancelCall: () => {},
+    setObserver: (o) => {
+      installer(o ?? null)
+    },
+    metricsSnapshot: () => {
+      throw new Error('not used')
+    },
+  }
+}
+
+function stubRpcForMetrics(snapshot: RpcMetricsSnapshot): RawMeshRpc {
+  return {
+    serve: () => {
+      throw new Error('not used')
+    },
+    call: () => Promise.reject(new Error('not used')),
+    callService: () => Promise.reject(new Error('not used')),
+    callStreaming: () => Promise.reject(new Error('not used')),
+    callClientStream: () => Promise.reject(new Error('not used')),
+    serveClientStream: () => {
+      throw new Error('not used')
+    },
+    callDuplex: () => Promise.reject(new Error('not used')),
+    serveDuplex: () => {
+      throw new Error('not used')
+    },
+    findServiceNodes: () => [],
+    reserveCancelToken: () => 0n,
+    cancelCall: () => {},
+    setObserver: () => {
+      throw new Error('not used')
+    },
+    metricsSnapshot: () => snapshot,
+  }
+}

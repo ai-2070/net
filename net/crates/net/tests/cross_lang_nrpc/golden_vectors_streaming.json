@@ -1,6 +1,6 @@
 {
-  "abi_version_expected": 2,
-  "description": "Canonical cross-binding nRPC compatibility fixture for the client-streaming + duplex shapes shipped under NET_RPC_ABI_VERSION = 0x0002 (NRPC_BINDINGS_PLAN.md Phase 2). Two services, each with a documented contract and a fixed set of ok_cases. Every binding's wire-format compat test loads this file and asserts: encoding the request stream on each side, dispatching through the canonical handler, and decoding the response stream yields outputs that semantically match the fixture. Status codes, header names, and the JSON shapes are all part of the contract.",
+  "abi_version_expected": 4,
+  "description": "Canonical cross-binding nRPC compatibility fixture for the client-streaming + duplex shapes (Phase 2 NRPC_BINDINGS_PLAN) plus the observer + metrics-snapshot surface (S1-A1 of NRPC_STREAMING_PARITY_AND_GO_BINDING). ABI v3 is additive over v2: the streaming shapes documented below are unchanged from v2, plus new observer_invariants + metrics_snapshot_invariants sections that pin the cross-binding RpcCallEvent / RpcMetricsSnapshot shapes. Two services, each with a documented contract and a fixed set of ok_cases. Every binding's wire-format compat test loads this file and asserts: encoding the request stream on each side, dispatching through the canonical handler, and decoding the response stream yields outputs that semantically match the fixture. Status codes, header names, and the JSON shapes are all part of the contract.",
   "wire_snapshots": {
     "description": "Byte-exact hex snapshots of canonical RPC payload encodings, taken at the wire level (after meta serialization). Bindings re-encoding the same logical inputs MUST produce the same bytes; drift on endianness, padding, header packing, or flag-bit layout is an inter-binding wire bug, not a semantic difference the JSON-only ok_cases would catch. The substrate-side test wire_snapshots_match_fixture exercises the Rust codec against these; per-binding ports run the same assertion against their native encoders.",
     "request_payload_minimal_clientstream": {
@@ -189,5 +189,88 @@
         }
       ]
     }
-  ]
+  ],
+  "observer_invariants": {
+    "description": "Cross-binding contract for the RpcCallEvent shape surfaced by SetObserver (NRPC_STREAMING_PARITY_AND_GO_BINDING.md S1-A1 / S2-A1 / S2-A2). Every binding's observer dispatcher receives an event with these fields populated, and every typed wrapper layer normalizes the binding-specific POD shape into a tagged-union status discriminator. The fixture documents the cross-binding invariants; per-binding tests pin their own field-name casing (`statusKind` in Node, `status_kind` in Python, `status_kind` in C ABI POD, `Status: RpcCallStatus{...}` in Go).",
+    "fields": [
+      { "name": "caller",         "type": "u64",        "semantic": "Local node id (== local_node_id on Outbound events)" },
+      { "name": "callee",         "type": "u64",        "semantic": "Responding node id" },
+      { "name": "method",         "type": "str",        "semantic": "Service/method name passed to call_typed" },
+      { "name": "latency_ms",     "type": "u32",        "semantic": "Wall-clock ms; truncated from the substrate's Duration::as_millis()" },
+      { "name": "status",         "type": "tagged_union", "semantic": "Outcome discriminator; see status_discriminator below" },
+      { "name": "request_bytes",  "type": "u32",        "semantic": "Wire payload size of request body (0 when not available)" },
+      { "name": "response_bytes", "type": "u32",        "semantic": "Wire payload size of response body (0 when not available)" },
+      { "name": "direction",      "type": "enum_str",   "semantic": "'outbound' for caller-side, 'inbound' for server-side (v1 emits only 'outbound')" },
+      { "name": "ts_unix_ms",     "type": "u64",        "semantic": "Unix-ms timestamp at fire time; 0 on pre-1970 clocks" }
+    ],
+    "status_discriminator": {
+      "description": "Substrate's `RpcCallStatus` is a tagged union. The C ABI flattens it to (status_kind: u8, status_message: optional-string); the napi POD uses (statusKind: string, statusMessage: optional string); the pyo3 POD uses (status_kind: string, status_message: optional string); the Go typed wrapper reconstructs an interface union. Cross-binding contract: same four variants, same string discriminators where applicable, message present ONLY on the Error variant.",
+      "variants": [
+        { "kind": "ok",       "c_abi_value": 0, "string_discriminant": "ok",       "has_message": false },
+        { "kind": "error",    "c_abi_value": 1, "string_discriminant": "error",    "has_message": true  },
+        { "kind": "timeout",  "c_abi_value": 2, "string_discriminant": "timeout",  "has_message": false },
+        { "kind": "canceled", "c_abi_value": 3, "string_discriminant": "canceled", "has_message": false }
+      ]
+    },
+    "direction_discriminator": {
+      "description": "Substrate's `RpcDirection`. C ABI flattens to u8; higher-level bindings use the string form.",
+      "variants": [
+        { "kind": "outbound", "c_abi_value": 0, "string_discriminant": "outbound", "emitted_in_v1": true  },
+        { "kind": "inbound",  "c_abi_value": 1, "string_discriminant": "inbound",  "emitted_in_v1": false }
+      ]
+    },
+    "firing_contract": {
+      "description": "Revised v3 (NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION.md). Observers no longer fire synchronously from the substrate dispatch path. Each binding owns a bounded mpsc (1024 events) + a dedicated worker task that drains and dispatches. The substrate's emit point does a try_send; on overflow the event is dropped and a process-global drop counter increments. The drop count is surfaced through metricsSnapshot. Callbacks should still be cheap (slow callbacks back-pressure the worker and trip the drop counter), but the substrate is no longer on fire when they aren't.",
+      "napi":  "Bounded-mpsc (1024 events) + dedicated worker task pumping to the TSFN. Drop counter increments on overflow; surfaced via metricsSnapshot.observerDroppedTotal.",
+      "pyo3":  "Bounded-mpsc (1024 events) + dedicated worker task acquiring GIL once per drained event. Drop counter increments on overflow; surfaced via metrics_snapshot.observer_dropped_total.",
+      "c_abi": "Bounded-mpsc (1024 events) + Rust-side worker invoking the C function pointer. Drop counter increments on overflow; surfaced via the JSON snapshot's observer_dropped_total field and via net_rpc_observer_dropped_total.",
+      "scope": "Only direction=='outbound' events fire. Inbound (server-side handler invocation) is a planned follow-up."
+    }
+  },
+  "metrics_snapshot_invariants": {
+    "description": "Cross-binding contract for the RpcMetricsSnapshot shape returned by MetricsSnapshot (S1-A1 / S2-A1 / S2-A2). Every binding emits the same logical fields in the same order; only field-name casing differs per binding convention.",
+    "envelope": {
+      "field": "services",
+      "type": "list[ServiceMetrics]",
+      "ordering": "Sorted by service name. Empty list iff no service has been called since mesh construction."
+    },
+    "envelope_extra_fields": [
+      { "name": "observer_dropped_total", "type": "u64", "since_abi": 3, "semantic": "Process-global count of observer events the binding's bounded-mpsc dispatcher dropped on overflow. Per-binding casing: observerDroppedTotal (napi), observer_dropped_total (pyo3 + C ABI JSON snapshot). The C ABI also surfaces this via the dedicated net_rpc_observer_dropped_total symbol for low-overhead scraping." }
+    ],
+    "service_metrics_fields": [
+      { "name": "service",                          "type": "str",         "section": "identity",     "semantic": "Service name (e.g. 'echo', 'my.svc.lookup')" },
+      { "name": "calls_total",                      "type": "u64",         "section": "caller-side",  "semantic": "Total calls that resolved (success + error)" },
+      { "name": "errors_no_route",                  "type": "u64",         "section": "caller-side",  "semantic": "Calls returning RpcError::NoRoute" },
+      { "name": "errors_timeout",                   "type": "u64",         "section": "caller-side",  "semantic": "Calls returning RpcError::Timeout" },
+      { "name": "errors_server",                    "type": "u64",         "section": "caller-side",  "semantic": "Calls returning RpcError::ServerError" },
+      { "name": "errors_transport",                 "type": "u64",         "section": "caller-side",  "semantic": "Calls returning RpcError::Transport" },
+      { "name": "in_flight",                        "type": "i64",         "section": "caller-side",  "semantic": "Currently-in-flight calls (signed to absorb hedge-loser underflow during transient races)" },
+      { "name": "latency_sum_ns",                   "type": "u64",         "section": "caller-side",  "semantic": "Sum of resolved-call latencies in nanoseconds" },
+      { "name": "latency_count",                    "type": "u64",         "section": "caller-side",  "semantic": "Number of latency observations" },
+      { "name": "latency_buckets",                  "type": "list[u64]",   "section": "caller-side",  "semantic": "Cumulative histogram bucket counts; index i corresponds to DEFAULT_LATENCY_BUCKETS_SECS[i]; last entry is +Inf bucket and equals latency_count" },
+      { "name": "handler_invocations_total",        "type": "u64",         "section": "server-side",  "semantic": "Total handler invocations on this node" },
+      { "name": "handler_panics_total",             "type": "u64",         "section": "server-side",  "semantic": "Handler panics caught by the fold's catch_unwind" },
+      { "name": "handler_in_flight",                "type": "i64",         "section": "server-side",  "semantic": "Currently-running handler tasks" },
+      { "name": "handler_duration_sum_ns",          "type": "u64",         "section": "server-side",  "semantic": "Sum of handler durations in nanoseconds" },
+      { "name": "handler_duration_count",           "type": "u64",         "section": "server-side",  "semantic": "Number of handler-duration observations" },
+      { "name": "handler_duration_buckets",         "type": "list[u64]",   "section": "server-side",  "semantic": "Cumulative bucket counts for handler duration" },
+      { "name": "streaming_chunks_emitted_total",   "type": "u64",         "section": "server-side",  "semantic": "Total streaming chunks emitted via RpcResponseSink::send" },
+      { "name": "streaming_chunks_dropped_total",   "type": "u64",         "section": "server-side",  "semantic": "Total streaming chunks dropped by the per-call pump mpsc at sink.send() time (overflow signal)" },
+      { "name": "capability_denied_total",          "type": "u64",         "section": "server-side",  "semantic": "Inbound calls rejected by the capability-auth callee-side gate before handler invocation" }
+    ],
+    "per_binding_field_naming": {
+      "description": "Each binding's preferred field-name casing. Bindings re-serializing a snapshot to JSON for downstream consumers SHOULD use the substrate's snake_case form; only the in-process typed surface uses camelCase or PascalCase per language convention.",
+      "rust":   "snake_case (substrate struct fields)",
+      "node":   "camelCase (napi-rs default conversion)",
+      "python": "snake_case (pyo3 attribute access)",
+      "go":     "PascalCase struct fields with `json:\"snake_case\"` tags (the JSON wire form matches the C ABI's emitted shape)"
+    },
+    "scrape_cost": {
+      "description": "Snapshot construction is one DashMap iteration on the substrate side — O(n_services) loads, no locks held. Safe to call on every Prometheus scrape.",
+      "rust_method":  "MeshNode::rpc_metrics_snapshot()",
+      "node_method":  "MeshRpc.metricsSnapshot() — returns napi POD",
+      "python_method": "MeshRpc.metrics_snapshot() — returns pyclass POD",
+      "go_method":    "MetricsSnapshot(rpc) — JSON decode of net_rpc_metrics_snapshot output"
+    }
+  }
 }

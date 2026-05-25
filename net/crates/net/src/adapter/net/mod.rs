@@ -32,6 +32,12 @@
 
 mod batch;
 pub mod behavior;
+// SDK-level cancel-token registry consumed by the cortex `mesh_rpc`
+// call shapes. Always-built (no cortex feature gate) — the registry
+// is type-pure and small; gating it would mean two parallel
+// definitions, and the `cortex` build is the only consumer today
+// regardless.
+mod cancel_registry;
 pub mod channel;
 pub mod compute;
 mod config;

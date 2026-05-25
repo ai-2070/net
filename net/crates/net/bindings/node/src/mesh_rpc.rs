@@ -32,8 +32,7 @@
 //! the prefix to re-throw typed errors.
 
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -41,18 +40,21 @@ use futures::StreamExt;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
-use tokio::task::AbortHandle;
 
 use ::net::adapter::net::cortex::{
-    RequestStream as InnerRequestStream, RpcClientStreamingHandler, RpcContext, RpcDuplexHandler,
-    RpcHandler, RpcHandlerError, RpcResponsePayload, RpcResponseSink as InnerRpcResponseSink,
-    RpcStatus, RpcStreamingContext,
+    RequestStream as InnerRequestStream, RpcCallEvent as InnerRpcCallEvent,
+    RpcCallStatus as InnerRpcCallStatus, RpcClientStreamingHandler, RpcContext,
+    RpcDirection as InnerRpcDirection, RpcDuplexHandler, RpcHandler, RpcHandlerError, RpcObserver,
+    RpcResponsePayload, RpcResponseSink as InnerRpcResponseSink, RpcStatus, RpcStreamingContext,
 };
 use ::net::adapter::net::mesh_rpc::{
     CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
     DuplexCallRaw as InnerDuplexCallRaw, DuplexSink as InnerDuplexSink,
     DuplexStream as InnerDuplexStream, RoutingPolicy as InnerRoutingPolicy,
     RpcError as InnerRpcError, RpcStream as InnerRpcStream, ServeHandle as InnerServeHandle,
+};
+use ::net::adapter::net::mesh_rpc_metrics::{
+    RpcMetricsSnapshot as InnerRpcMetricsSnapshot, ServiceMetrics as InnerServiceMetrics,
 };
 use ::net::adapter::net::MeshNode;
 
@@ -98,71 +100,26 @@ fn nrpc_err_from_inner(err: InnerRpcError) -> Error {
             "capability_denied",
             format!("target=0x{target:x} capability={capability}"),
         ),
+        InnerRpcError::Cancelled => nrpc_err("cancelled", "call cancelled by caller"),
     }
 }
 
 // ============================================================================
 // Cancellation surface.
 //
-// AbortSignal-friendly cancel registry for in-flight unary calls.
-// JS users mint a `cancelToken: bigint` via `MeshRpc.reserveCancelToken()`,
-// pass it on the call's options, then call `MeshRpc.cancelCall(token)`
-// from a parallel context (e.g. an AbortSignal listener). The Rust
-// side spawns the call as a tokio task whose `AbortHandle` is
-// stashed under the token; cancel triggers an abort which drops the
-// SDK future and fires CANCEL on the wire.
+// AbortSignal-friendly cancel-token pass-through (v3 / C-A1).
+//
+// JS users mint a `cancelToken: bigint` via
+// `MeshRpc.reserveCancelToken()`, pass it on the call's options,
+// then call `MeshRpc.cancelCall(token)` from a parallel context
+// (e.g. an AbortSignal listener). Both methods delegate to the
+// SDK's `MeshNode::reserve_cancel_token` / `MeshNode::cancel`
+// primitives (v3 / C-S1) — the napi binding no longer owns a
+// local cancel registry. The CallOptions::cancel_token is
+// populated into the inner SDK CallOptions and the substrate
+// handles abort + CANCEL emission uniformly across every call
+// shape (unary, streaming-response, client-streaming, duplex).
 // ============================================================================
-
-/// Monotonic counter for cancel tokens. Starts at 1 so 0 is the
-/// "no cancel" sentinel.
-static NEXT_CANCEL_TOKEN: AtomicU64 = AtomicU64::new(1);
-
-/// Process-global cancel-token registry. Populated when a call
-/// is dispatched with a non-zero token; queried by `cancel_call`.
-/// parking_lot::Mutex matches the workspace lock convention and
-/// has no poison concept — the previous std::sync recovery dance
-/// is gone with the migration.
-fn cancel_registry() -> &'static Mutex<std::collections::HashMap<u64, AbortHandle>> {
-    static REG: OnceLock<Mutex<std::collections::HashMap<u64, AbortHandle>>> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-}
-
-/// Lock the cancel registry. parking_lot guards are infallible.
-fn lock_cancel_registry(
-) -> parking_lot::MutexGuard<'static, std::collections::HashMap<u64, AbortHandle>> {
-    cancel_registry().lock()
-}
-
-/// Internal sentinel for "task aborted by `cancel_call`."
-struct NodeCancelled;
-
-/// Run `fut` under a cancellable wrapper if `cancel_token != 0`,
-/// otherwise just `await` it directly. The cancellable path
-/// spawns the future as a tokio task and stashes its abort
-/// handle in the registry under the token; a parallel
-/// `cancel_call(token)` aborts mid-flight (drop fires CANCEL).
-async fn run_cancellable_call<F, T>(
-    cancel_token: u64,
-    fut: F,
-) -> std::result::Result<T, NodeCancelled>
-where
-    F: std::future::Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    if cancel_token == 0 {
-        return Ok(fut.await);
-    }
-    let task = tokio::spawn(fut);
-    let abort_handle = task.abort_handle();
-    lock_cancel_registry().insert(cancel_token, abort_handle);
-    let result = task.await;
-    lock_cancel_registry().remove(&cancel_token);
-    match result {
-        Ok(v) => Ok(v),
-        Err(e) if e.is_cancelled() => Err(NodeCancelled),
-        Err(_) => Err(NodeCancelled),
-    }
-}
 
 // ============================================================================
 // CallOptions — JS object surface.
@@ -231,11 +188,16 @@ pub struct RpcRequestHeader {
 }
 
 impl CallOptions {
-    /// Split the user-facing options into (inner SDK options,
-    /// optional cancel token). The cancel token is independent
-    /// of the SDK-level options and lives only on the binding
-    /// side.
-    fn split(self) -> (InnerCallOptions, u64) {
+    /// Convert the user-facing options into the inner SDK
+    /// `CallOptions`. With v3 / C-A1 the `cancel_token` rides on
+    /// the inner options uniformly across every call shape; the
+    /// previous `split` shim that pulled the token out for a
+    /// binding-side wrapper is gone now that the SDK owns the
+    /// primitive.
+    ///
+    /// `None` / `Some(0)` cancel-token → the SDK observes the
+    /// "no token" sentinel and does no registry work.
+    fn into_inner(self) -> InnerCallOptions {
         let mut opts = InnerCallOptions::default();
         if let Some(ms) = self.deadline_ms {
             opts.deadline = Some(Instant::now() + Duration::from_millis(ms as u64));
@@ -254,16 +216,9 @@ impl CallOptions {
             .map(crate::common::bigint_u64)
             .transpose()
             .ok()
-            .flatten()
-            .unwrap_or(0);
-        (opts, token)
-    }
-
-    /// Convenience for paths that don't need the cancel token
-    /// (only `call_streaming` keeps using this — we don't yet
-    /// plumb cancel into streaming start).
-    fn into_inner(self) -> InnerCallOptions {
-        self.split().0
+            .flatten();
+        opts.cancel_token = token.filter(|t| *t != 0);
+        opts
     }
 }
 
@@ -425,6 +380,196 @@ impl RpcHandler for NodeRpcHandler {
         })
     }
 }
+
+// ============================================================================
+// Observer + metrics POD shapes (S2-A1).
+//
+// The JS surface mirrors the substrate's `RpcCallEvent` and
+// `RpcMetricsSnapshot` types — the only encoding choices are:
+//   - u64 fields → `BigInt` (per the binding convention in
+//     aggregator.rs)
+//   - `RpcCallStatus` tagged union → flattened to
+//     `statusKind: "ok"|"error"|"timeout"|"canceled"` plus an
+//     optional `statusMessage` (populated only when statusKind ==
+//     "error"). napi-rs's `#[napi(object)]` POD layer doesn't
+//     support tagged unions natively; this string-discriminant
+//     shape is the same pattern the cortex error mapping uses
+//     for its `nrpc:<kind>:<msg>` prefix.
+//   - `RpcDirection` enum → flattened to `direction:
+//     "outbound"|"inbound"` for the same reason.
+// ============================================================================
+
+/// Single observed RPC call boundary. Surfaced to the observer
+/// callback installed via [`MeshRpc::set_observer`].
+#[napi(object)]
+pub struct RpcCallEventJs {
+    /// 64-bit node id of the calling node. Equal to the local
+    /// node id on outbound events.
+    pub caller: BigInt,
+    /// 64-bit node id of the responding node.
+    pub callee: BigInt,
+    /// Service / method name.
+    pub method: String,
+    /// Elapsed time in milliseconds.
+    pub latency_ms: u32,
+    /// `"ok"` | `"error"` | `"timeout"` | `"canceled"`. The JS
+    /// side should match on this discriminant before reading
+    /// `statusMessage`.
+    pub status_kind: String,
+    /// Populated only when `statusKind === "error"`. Carries an
+    /// operator-readable diagnostic from the substrate.
+    pub status_message: Option<String>,
+    /// Wire payload size of the request body (0 when not
+    /// available).
+    pub request_bytes: u32,
+    /// Wire payload size of the response body (0 when not
+    /// available).
+    pub response_bytes: u32,
+    /// `"outbound"` (this node initiated) or `"inbound"` (this
+    /// node received). v1 only emits `"outbound"`.
+    pub direction: String,
+    /// Unix-ms timestamp captured at fire time (best-effort; 0
+    /// on a pre-1970 clock).
+    pub ts_unix_ms: BigInt,
+}
+
+impl From<&InnerRpcCallEvent> for RpcCallEventJs {
+    fn from(evt: &InnerRpcCallEvent) -> Self {
+        let (status_kind, status_message) = match &evt.status {
+            InnerRpcCallStatus::Ok => ("ok", None),
+            InnerRpcCallStatus::Error(msg) => ("error", Some(msg.clone())),
+            InnerRpcCallStatus::Timeout => ("timeout", None),
+            InnerRpcCallStatus::Canceled => ("canceled", None),
+        };
+        let direction = match evt.direction {
+            InnerRpcDirection::Outbound => "outbound",
+            InnerRpcDirection::Inbound => "inbound",
+        };
+        Self {
+            caller: BigInt::from(evt.caller),
+            callee: BigInt::from(evt.callee),
+            method: evt.method.clone(),
+            latency_ms: evt.latency_ms,
+            status_kind: status_kind.to_string(),
+            status_message,
+            request_bytes: evt.request_bytes,
+            response_bytes: evt.response_bytes,
+            direction: direction.to_string(),
+            ts_unix_ms: BigInt::from(evt.ts_unix_ms),
+        }
+    }
+}
+
+/// Per-service caller- + server-side nRPC counters at a point
+/// in time. Element of [`RpcMetricsSnapshotJs::services`].
+#[napi(object)]
+pub struct ServiceMetricsJs {
+    pub service: String,
+    // ---- caller-side ----
+    pub calls_total: BigInt,
+    pub errors_no_route: BigInt,
+    pub errors_timeout: BigInt,
+    pub errors_server: BigInt,
+    pub errors_transport: BigInt,
+    pub in_flight: i64,
+    pub latency_sum_ns: BigInt,
+    pub latency_count: BigInt,
+    /// Cumulative bucket counts; index `i` corresponds to
+    /// `DEFAULT_LATENCY_BUCKETS_SECS[i]` in the substrate. Last
+    /// entry is the `+Inf` bucket.
+    pub latency_buckets: Vec<BigInt>,
+    // ---- server-side ----
+    pub handler_invocations_total: BigInt,
+    pub handler_panics_total: BigInt,
+    pub handler_in_flight: i64,
+    pub handler_duration_sum_ns: BigInt,
+    pub handler_duration_count: BigInt,
+    pub handler_duration_buckets: Vec<BigInt>,
+    pub streaming_chunks_emitted_total: BigInt,
+    pub streaming_chunks_dropped_total: BigInt,
+    pub capability_denied_total: BigInt,
+}
+
+impl From<&InnerServiceMetrics> for ServiceMetricsJs {
+    fn from(m: &InnerServiceMetrics) -> Self {
+        Self {
+            service: m.service.clone(),
+            calls_total: BigInt::from(m.calls_total),
+            errors_no_route: BigInt::from(m.errors_no_route),
+            errors_timeout: BigInt::from(m.errors_timeout),
+            errors_server: BigInt::from(m.errors_server),
+            errors_transport: BigInt::from(m.errors_transport),
+            in_flight: m.in_flight,
+            latency_sum_ns: BigInt::from(m.latency_sum_ns),
+            latency_count: BigInt::from(m.latency_count),
+            latency_buckets: m
+                .latency_buckets
+                .iter()
+                .copied()
+                .map(BigInt::from)
+                .collect(),
+            handler_invocations_total: BigInt::from(m.handler_invocations_total),
+            handler_panics_total: BigInt::from(m.handler_panics_total),
+            handler_in_flight: m.handler_in_flight,
+            handler_duration_sum_ns: BigInt::from(m.handler_duration_sum_ns),
+            handler_duration_count: BigInt::from(m.handler_duration_count),
+            handler_duration_buckets: m
+                .handler_duration_buckets
+                .iter()
+                .copied()
+                .map(BigInt::from)
+                .collect(),
+            streaming_chunks_emitted_total: BigInt::from(m.streaming_chunks_emitted_total),
+            streaming_chunks_dropped_total: BigInt::from(m.streaming_chunks_dropped_total),
+            capability_denied_total: BigInt::from(m.capability_denied_total),
+        }
+    }
+}
+
+/// Snapshot of the per-service nRPC metrics registry. Returned
+/// by [`MeshRpc::metrics_snapshot`].
+#[napi(object)]
+pub struct RpcMetricsSnapshotJs {
+    /// One entry per service that has been called at least once
+    /// since the mesh was created. Sorted by service name.
+    pub services: Vec<ServiceMetricsJs>,
+    /// Cumulative count of observer events dropped because the
+    /// observer's bounded buffer was full at the time the
+    /// substrate dispatch path fired (v3 / O-A1). A non-zero,
+    /// climbing value indicates the installed observer can't
+    /// keep up with the dispatch rate — the operator should
+    /// either lighten the per-event callback work or push events
+    /// into their own queue and drain them off a dedicated thread.
+    pub observer_dropped_total: BigInt,
+}
+
+impl RpcMetricsSnapshotJs {
+    /// Build the napi snapshot. Combines the substrate's per-
+    /// service registry with the shared observer drop counter
+    /// owned at the substrate layer ([`::net::adapter::net::cortex::observer_dropped_total`]).
+    fn build(snapshot: &InnerRpcMetricsSnapshot) -> Self {
+        Self {
+            services: snapshot
+                .services
+                .iter()
+                .map(ServiceMetricsJs::from)
+                .collect(),
+            observer_dropped_total: BigInt::from(
+                ::net::adapter::net::cortex::observer_dropped_total(),
+            ),
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
+// Observer trampoline — delegates to the substrate's ObserverChannel
+// (N4 consolidation of the prior NodeRpcObserver / PyRpcObserver /
+// GoRpcObserver trampolines). This binding builds only the
+// TSFN-dispatching closure; the bounded mpsc + drop counter live
+// in `::net::adapter::net::cortex::ObserverChannel`.
+// ----------------------------------------------------------------------
+
+type RpcObserverTsfn = ThreadsafeFunction<RpcCallEventJs, (), RpcCallEventJs, napi::Status, false>;
 
 // ============================================================================
 // ServeHandle — RAII wrapper around the inner ServeHandle.
@@ -1454,28 +1599,33 @@ impl MeshRpc {
     /// Reserve a fresh cancel token. Pass on a subsequent call
     /// via `opts.cancelToken`; later, call
     /// [`MeshRpc.cancel_call`] from anywhere to abort the in-
-    /// flight task. Tokens are monotonically increasing,
+    /// flight call. Tokens are monotonically-increasing,
     /// process-global, never reused — an unused reservation is
-    /// harmless (no cleanup required).
+    /// harmless (the SDK only allocates a registry entry on the
+    /// first paired register or cancel).
+    ///
+    /// Delegates to the substrate's [`MeshNode::reserve_cancel_token`]
+    /// (v3 / C-S1).
     #[napi]
     pub fn reserve_cancel_token(&self) -> BigInt {
-        BigInt::from(NEXT_CANCEL_TOKEN.fetch_add(1, Ordering::Relaxed))
+        BigInt::from(self.node.reserve_cancel_token())
     }
 
     /// Abort the in-flight call associated with `token`.
-    /// Idempotent — no-op if the token was never used or the call
-    /// already finished. The aborted task drops the SDK future
-    /// (which fires CANCEL on the wire); the awaiting `call` /
-    /// `callService` rejects with `nrpc:cancelled:`.
+    /// Idempotent — no-op if the token was never used, the call
+    /// already finished, or `token == 0`. Triggers CANCEL on the
+    /// wire via the substrate's per-call-shape Drop guards; the
+    /// awaiting `call` / `callService` rejects with
+    /// `nrpc:cancelled:`, streaming entries observe EOF on their
+    /// next pull.
+    ///
+    /// Delegates to the substrate's [`MeshNode::cancel`] (v3 /
+    /// C-S1) — the napi binding no longer owns a local cancel
+    /// registry.
     #[napi]
     pub fn cancel_call(&self, token: BigInt) -> Result<()> {
         let token = crate::common::bigint_u64(token)?;
-        if token == 0 {
-            return Ok(());
-        }
-        if let Some(handle) = lock_cancel_registry().remove(&token) {
-            handle.abort();
-        }
+        self.node.cancel(token);
         Ok(())
     }
 
@@ -1492,18 +1642,16 @@ impl MeshRpc {
         opts: Option<CallOptions>,
     ) -> Result<Buffer> {
         let target = crate::common::bigint_u64(target_node_id)?;
-        let (inner_opts, cancel_token) = opts.unwrap_or_default().split();
-        let node = self.node.clone();
+        let inner_opts = opts.unwrap_or_default().into_inner();
         let req_bytes = Bytes::copy_from_slice(request.as_ref());
-        let result = run_cancellable_call(cancel_token, async move {
-            node.call(target, &service, req_bytes, inner_opts).await
-        })
-        .await;
-        match result {
-            Ok(Ok(reply)) => Ok(Buffer::from(reply.body.as_ref())),
-            Ok(Err(e)) => Err(nrpc_err_from_inner(e)),
-            Err(NodeCancelled) => Err(nrpc_err("cancelled", "call cancelled by caller")),
-        }
+        // cancel_token lives on inner_opts; substrate handles cancel
+        // uniformly across shapes. RpcError::Cancelled maps to
+        // `nrpc:cancelled:` via the error-kind table.
+        self.node
+            .call(target, &service, req_bytes, inner_opts)
+            .await
+            .map(|reply| Buffer::from(reply.body.as_ref()))
+            .map_err(nrpc_err_from_inner)
     }
 
     /// Service-discovery unary call. Resolves `service` against
@@ -1516,18 +1664,13 @@ impl MeshRpc {
         request: Buffer,
         opts: Option<CallOptions>,
     ) -> Result<Buffer> {
-        let (inner_opts, cancel_token) = opts.unwrap_or_default().split();
-        let node = self.node.clone();
+        let inner_opts = opts.unwrap_or_default().into_inner();
         let req_bytes = Bytes::copy_from_slice(request.as_ref());
-        let result = run_cancellable_call(cancel_token, async move {
-            node.call_service(&service, req_bytes, inner_opts).await
-        })
-        .await;
-        match result {
-            Ok(Ok(reply)) => Ok(Buffer::from(reply.body.as_ref())),
-            Ok(Err(e)) => Err(nrpc_err_from_inner(e)),
-            Err(NodeCancelled) => Err(nrpc_err("cancelled", "call cancelled by caller")),
-        }
+        self.node
+            .call_service(&service, req_bytes, inner_opts)
+            .await
+            .map(|reply| Buffer::from(reply.body.as_ref()))
+            .map_err(nrpc_err_from_inner)
     }
 
     // ---- streaming ------------------------------------------------------
@@ -1697,6 +1840,54 @@ impl MeshRpc {
             .map(BigInt::from)
             .collect()
     }
+
+    // ---- observer + metrics (S2-A1) ------------------------------------
+
+    /// Install (pass a function) or clear (pass `null` /
+    /// `undefined`) the caller-side nRPC observer. Replaces any
+    /// previously-installed observer.
+    ///
+    /// The callback fires synchronously from the substrate's
+    /// dispatch task on every completed outbound RPC. The TSFN
+    /// crosses the napi boundary in `NonBlocking` mode — if the
+    /// JS event loop is wedged and the queue fills, events are
+    /// **dropped**, not buffered. Callbacks must therefore be
+    /// cheap: push into a queue or ring buffer for slow
+    /// consumers, do not do work inline.
+    ///
+    /// v1 emits only `direction === "outbound"` events; the
+    /// substrate's server-side hook is a planned follow-up.
+    #[napi]
+    pub fn set_observer(&self, observer: Option<Function<'_, RpcCallEventJs, ()>>) -> Result<()> {
+        match observer {
+            Some(f) => {
+                let tsfn: RpcObserverTsfn = f.build_threadsafe_function().build()?;
+                let handle = tokio::runtime::Handle::current();
+                let channel =
+                    ::net::adapter::net::cortex::ObserverChannel::install(&handle, move |evt| {
+                        let js_evt = RpcCallEventJs::from(evt.as_ref());
+                        let _ = tsfn.call(js_evt, ThreadsafeFunctionCallMode::NonBlocking);
+                    });
+                let obs: Arc<dyn RpcObserver> = Arc::new(channel);
+                self.node.set_rpc_observer(Some(obs));
+            }
+            None => {
+                self.node.set_rpc_observer(None);
+            }
+        }
+        Ok(())
+    }
+
+    /// Snapshot the per-service nRPC metrics registry. Cheap —
+    /// one DashMap iteration plus one atomic-load for the
+    /// process-global observer-drop counter. Safe to call on
+    /// every Prometheus scrape. The returned object is a plain
+    /// JS POD (BigInts for u64 fields); read fields directly or
+    /// feed into your own exporter.
+    #[napi]
+    pub fn metrics_snapshot(&self) -> RpcMetricsSnapshotJs {
+        RpcMetricsSnapshotJs::build(&self.node.rpc_metrics_snapshot())
+    }
 }
 
 // ============================================================================
@@ -1746,6 +1937,7 @@ mod tests {
                 InnerRpcError::CapabilityDenied { target, capability } => format!(
                     "{ERR_NRPC_PREFIX}capability_denied: target=0x{target:x} capability={capability}"
                 ),
+                InnerRpcError::Cancelled => format!("{ERR_NRPC_PREFIX}cancelled: call cancelled"),
             }
         };
 

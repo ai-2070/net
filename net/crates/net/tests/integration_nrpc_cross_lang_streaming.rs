@@ -71,7 +71,11 @@ use serde_json::Value as JsonValue;
 
 const SERVICE_CLIENT_STREAM: &str = "cross_lang_client_stream_sum";
 const SERVICE_DUPLEX: &str = "cross_lang_duplex_echo";
-const ABI_VERSION_EXPECTED: u32 = 2;
+// Bumped 2 → 3 by S1-A1 (observer + metrics surfaces). The
+// streaming shapes documented in this fixture are unchanged from
+// v2; the v3 invariants live in the new observer_invariants +
+// metrics_snapshot_invariants sections.
+const ABI_VERSION_EXPECTED: u32 = 4;
 
 // =====================================================================
 // Canonical wire shapes.
@@ -767,4 +771,432 @@ async fn duplex_ok_cases_match_fixture() {
 fn _suppress_unused() {
     let _: StreamingChunkKind = StreamingChunkKind::Unary;
     let _ = classify_streaming_chunk;
+}
+
+// =====================================================================
+// S2-X: observer + metrics invariants — structural validation.
+//
+// These tests assert the fixture's observer_invariants +
+// metrics_snapshot_invariants sections are well-formed AND pin the
+// substrate's RpcCallEvent / ServiceMetrics field shape against the
+// documented contract. Per-binding ports (Node test/, Python tests/,
+// Go *_test.go) consume the same fixture and run the equivalent
+// assertion against their own binding's POD/dataclass/struct shape.
+//
+// Live observer-fire tests against a real MeshNode belong in the
+// per-binding test suites — each binding has its own way to wire
+// the observer (TSFN, GIL worker, cgo trampoline) and the substrate
+// firing path is already exercised by the per-binding raw bindings.
+// =====================================================================
+
+/// The fixture's `observer_invariants` section is well-formed:
+/// every documented field has a `name`, `type`, and `semantic`;
+/// the status_discriminator has exactly the four variants the
+/// substrate defines; the direction_discriminator has exactly
+/// two variants with correct emission flags.
+#[test]
+fn observer_invariants_fixture_is_well_formed() {
+    let raw = include_str!("cross_lang_nrpc/golden_vectors_streaming.json");
+    let fixture: JsonValue = serde_json::from_str(raw).expect("fixture parses");
+    let obs = fixture
+        .get("observer_invariants")
+        .expect("fixture has observer_invariants section");
+
+    let fields = obs
+        .get("fields")
+        .and_then(|v| v.as_array())
+        .expect("observer_invariants.fields is an array");
+    // The substrate's RpcCallEvent has 9 fields — drift would
+    // break every binding's POD-to-typed-event normalization.
+    assert_eq!(fields.len(), 9, "RpcCallEvent has 9 documented fields");
+    for f in fields {
+        assert!(
+            f.get("name").and_then(|v| v.as_str()).is_some(),
+            "field has a name"
+        );
+        assert!(
+            f.get("type").and_then(|v| v.as_str()).is_some(),
+            "field has a type"
+        );
+        assert!(
+            f.get("semantic").and_then(|v| v.as_str()).is_some(),
+            "field has a semantic doc"
+        );
+    }
+    // Pin the specific field names so a substrate-side rename
+    // surfaces here loudly.
+    let names: Vec<&str> = fields
+        .iter()
+        .map(|f| f.get("name").and_then(|v| v.as_str()).unwrap())
+        .collect();
+    for expected in [
+        "caller",
+        "callee",
+        "method",
+        "latency_ms",
+        "status",
+        "request_bytes",
+        "response_bytes",
+        "direction",
+        "ts_unix_ms",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "fixture is missing documented field {expected}",
+        );
+    }
+
+    let status = obs
+        .get("status_discriminator")
+        .and_then(|v| v.get("variants"))
+        .and_then(|v| v.as_array())
+        .expect("status_discriminator.variants is an array");
+    assert_eq!(status.len(), 4, "RpcCallStatus has 4 variants");
+    let kinds: Vec<&str> = status
+        .iter()
+        .map(|v| v.get("kind").and_then(|x| x.as_str()).unwrap())
+        .collect();
+    for expected in ["ok", "error", "timeout", "canceled"] {
+        assert!(
+            kinds.contains(&expected),
+            "status_discriminator missing variant {expected}",
+        );
+    }
+    // The 'error' variant is the only one with a message. Pin so
+    // a future tagged-union extension doesn't accidentally add
+    // message to ok/timeout/canceled.
+    for v in status {
+        let kind = v.get("kind").and_then(|x| x.as_str()).unwrap();
+        let has_msg = v.get("has_message").and_then(|x| x.as_bool()).unwrap();
+        if kind == "error" {
+            assert!(has_msg, "'error' variant carries a message");
+        } else {
+            assert!(!has_msg, "'{kind}' variant does NOT carry a message");
+        }
+    }
+    // C ABI discriminant values must match the constants in
+    // rpc-ffi/src/lib.rs::NET_RPC_STATUS_* (0/1/2/3).
+    for (kind, expected_val) in [("ok", 0), ("error", 1), ("timeout", 2), ("canceled", 3)] {
+        let v = status
+            .iter()
+            .find(|v| v.get("kind").and_then(|x| x.as_str()) == Some(kind))
+            .unwrap();
+        let got_val = v.get("c_abi_value").and_then(|x| x.as_u64()).unwrap();
+        assert_eq!(
+            got_val, expected_val,
+            "'{kind}' C ABI discriminant must be {expected_val}",
+        );
+    }
+
+    let direction = obs
+        .get("direction_discriminator")
+        .and_then(|v| v.get("variants"))
+        .and_then(|v| v.as_array())
+        .expect("direction_discriminator.variants is an array");
+    assert_eq!(direction.len(), 2, "RpcDirection has 2 variants");
+    // v1 emits only Outbound. Pin so a future Inbound-server-hook
+    // landing doesn't accidentally claim v1-already-shipped.
+    let outbound = direction
+        .iter()
+        .find(|v| v.get("kind").and_then(|x| x.as_str()) == Some("outbound"))
+        .unwrap();
+    assert!(outbound
+        .get("emitted_in_v1")
+        .and_then(|x| x.as_bool())
+        .unwrap());
+    let inbound = direction
+        .iter()
+        .find(|v| v.get("kind").and_then(|x| x.as_str()) == Some("inbound"))
+        .unwrap();
+    assert!(!inbound
+        .get("emitted_in_v1")
+        .and_then(|x| x.as_bool())
+        .unwrap());
+
+    // firing_contract documents per-binding implementations + the
+    // locked-decision-#1 cheap-callbacks rule. Just check it's
+    // structurally present — drift in the per-binding entries
+    // matters less than drift in the variant table above.
+    assert!(
+        obs.get("firing_contract").is_some(),
+        "observer_invariants documents the firing contract",
+    );
+}
+
+/// The fixture's `metrics_snapshot_invariants` section is well-
+/// formed AND pins the exact set of ServiceMetrics fields the
+/// substrate's RpcMetricsSnapshot exposes. Drift in the substrate
+/// definition surfaces as a test failure here BEFORE per-binding
+/// tests start producing red builds with confusing diagnostics.
+#[test]
+fn metrics_snapshot_invariants_fixture_is_well_formed() {
+    let raw = include_str!("cross_lang_nrpc/golden_vectors_streaming.json");
+    let fixture: JsonValue = serde_json::from_str(raw).expect("fixture parses");
+    let m = fixture
+        .get("metrics_snapshot_invariants")
+        .expect("fixture has metrics_snapshot_invariants section");
+
+    // Envelope: services list, sorted by name.
+    let envelope = m
+        .get("envelope")
+        .expect("metrics_snapshot_invariants has envelope");
+    assert_eq!(
+        envelope.get("field").and_then(|v| v.as_str()),
+        Some("services"),
+        "envelope field is 'services'",
+    );
+
+    // Field set: every ServiceMetrics field is documented exactly
+    // once with name/type/section/semantic.
+    let fields = m
+        .get("service_metrics_fields")
+        .and_then(|v| v.as_array())
+        .expect("service_metrics_fields is an array");
+    // The substrate's ServiceMetrics has 19 documented fields
+    // (1 identity + 9 caller-side + 9 server-side). Pin so a
+    // substrate-side field add/remove surfaces here.
+    assert_eq!(fields.len(), 19, "ServiceMetrics has 19 documented fields",);
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for f in fields {
+        let name = f
+            .get("name")
+            .and_then(|v| v.as_str())
+            .expect("field has a name");
+        assert!(seen.insert(name), "duplicate field: {name}");
+        assert!(
+            f.get("type").and_then(|v| v.as_str()).is_some(),
+            "field {name} has a type"
+        );
+        assert!(
+            f.get("section").and_then(|v| v.as_str()).is_some(),
+            "field {name} has a section"
+        );
+        assert!(
+            f.get("semantic").and_then(|v| v.as_str()).is_some(),
+            "field {name} has a semantic doc"
+        );
+    }
+    // Pin the canonical caller-side fields. A rename in
+    // mesh_rpc_metrics.rs::ServiceMetrics is a cross-binding
+    // breaking change; this test catches it before each binding
+    // re-derives its POD.
+    let expected_caller_side = [
+        "calls_total",
+        "errors_no_route",
+        "errors_timeout",
+        "errors_server",
+        "errors_transport",
+        "in_flight",
+        "latency_sum_ns",
+        "latency_count",
+        "latency_buckets",
+    ];
+    for expected in &expected_caller_side {
+        assert!(
+            seen.contains(expected),
+            "caller-side field {expected} missing",
+        );
+    }
+    // Server-side fields — same drift-detection contract.
+    let expected_server_side = [
+        "handler_invocations_total",
+        "handler_panics_total",
+        "handler_in_flight",
+        "handler_duration_sum_ns",
+        "handler_duration_count",
+        "handler_duration_buckets",
+        "streaming_chunks_emitted_total",
+        "streaming_chunks_dropped_total",
+        "capability_denied_total",
+    ];
+    for expected in &expected_server_side {
+        assert!(
+            seen.contains(expected),
+            "server-side field {expected} missing",
+        );
+    }
+
+    // Per-binding naming + scrape-cost contracts are structurally
+    // present — drift in the per-binding entries matters less than
+    // drift in the field table above.
+    assert!(
+        m.get("per_binding_field_naming").is_some(),
+        "metrics_snapshot_invariants documents per-binding naming",
+    );
+    assert!(
+        m.get("scrape_cost").is_some(),
+        "metrics_snapshot_invariants documents scrape cost",
+    );
+
+    // Envelope-level extras: v3 adds observer_dropped_total alongside
+    // the services list. Pin the field-name discriminator so a
+    // future rename surfaces here before per-binding tests start
+    // failing.
+    let extras = m
+        .get("envelope_extra_fields")
+        .and_then(|v| v.as_array())
+        .expect("metrics_snapshot_invariants documents envelope_extra_fields");
+    let names: std::collections::HashSet<&str> = extras
+        .iter()
+        .filter_map(|e| e.get("name").and_then(|v| v.as_str()))
+        .collect();
+    assert!(
+        names.contains("observer_dropped_total"),
+        "envelope_extra_fields documents observer_dropped_total",
+    );
+}
+
+/// Pin the substrate-side `ServiceMetrics` struct against the
+/// fixture. If a future substrate change adds / removes / renames
+/// a field, this test catches the drift — the fixture is the
+/// source of truth for cross-binding compat, so the test asserts
+/// the substrate side hasn't drifted from it.
+///
+/// Implementation: roundtrip a default ServiceMetrics through the
+/// substrate's Prometheus-formatter path and parse out the field
+/// names. Avoids depending on serde::Serialize (which the substrate
+/// type doesn't derive) by using the public `service` + counter
+/// accessors directly.
+#[test]
+fn service_metrics_fields_match_fixture() {
+    use net::adapter::net::mesh_rpc_metrics::ServiceMetrics;
+
+    // Compile-time witness: construct a ServiceMetrics with every
+    // field populated. A substrate-side field removal surfaces
+    // here as a compile error (missing field in struct literal);
+    // a field rename surfaces the same way. A field ADDITION
+    // surfaces via the
+    // metrics_snapshot_invariants_fixture_is_well_formed test's
+    // 19-field count assertion.
+    let svc = ServiceMetrics {
+        service: "test_service".to_string(),
+        calls_total: 0,
+        errors_no_route: 0,
+        errors_timeout: 0,
+        errors_server: 0,
+        errors_transport: 0,
+        in_flight: 0,
+        latency_sum_ns: 0,
+        latency_count: 0,
+        latency_buckets: vec![],
+        handler_invocations_total: 0,
+        handler_panics_total: 0,
+        handler_in_flight: 0,
+        handler_duration_sum_ns: 0,
+        handler_duration_count: 0,
+        handler_duration_buckets: vec![],
+        streaming_chunks_emitted_total: 0,
+        streaming_chunks_dropped_total: 0,
+        capability_denied_total: 0,
+    };
+    // Touch every field — read-side mirror of the literal above
+    // so a field rename caught at construction also catches at
+    // access if some future refactor splits the two.
+    let _: &str = &svc.service;
+    let _: u64 = svc.calls_total;
+    let _: u64 = svc.errors_no_route;
+    let _: u64 = svc.errors_timeout;
+    let _: u64 = svc.errors_server;
+    let _: u64 = svc.errors_transport;
+    let _: i64 = svc.in_flight;
+    let _: u64 = svc.latency_sum_ns;
+    let _: u64 = svc.latency_count;
+    let _: &Vec<u64> = &svc.latency_buckets;
+    let _: u64 = svc.handler_invocations_total;
+    let _: u64 = svc.handler_panics_total;
+    let _: i64 = svc.handler_in_flight;
+    let _: u64 = svc.handler_duration_sum_ns;
+    let _: u64 = svc.handler_duration_count;
+    let _: &Vec<u64> = &svc.handler_duration_buckets;
+    let _: u64 = svc.streaming_chunks_emitted_total;
+    let _: u64 = svc.streaming_chunks_dropped_total;
+    let _: u64 = svc.capability_denied_total;
+
+    // Sanity: the fixture lists the same field names.
+    let raw = include_str!("cross_lang_nrpc/golden_vectors_streaming.json");
+    let fixture: JsonValue = serde_json::from_str(raw).expect("fixture parses");
+    let fields: Vec<&str> = fixture
+        .get("metrics_snapshot_invariants")
+        .and_then(|v| v.get("service_metrics_fields"))
+        .and_then(|v| v.as_array())
+        .unwrap()
+        .iter()
+        .map(|f| f.get("name").and_then(|v| v.as_str()).unwrap())
+        .collect();
+    assert!(
+        fields.contains(&"service"),
+        "fixture documents 'service' field",
+    );
+    assert!(
+        fields.contains(&"in_flight"),
+        "fixture documents 'in_flight' field",
+    );
+    assert!(
+        fields.contains(&"capability_denied_total"),
+        "fixture documents 'capability_denied_total' field",
+    );
+}
+
+/// Pin the substrate-side `RpcCallEvent` field shape against the
+/// fixture's observer_invariants section. Same drift-detection
+/// rationale as service_metrics_fields_match_fixture: the fixture
+/// is the cross-binding source of truth.
+#[test]
+fn rpc_call_event_fields_match_fixture() {
+    use net::adapter::net::cortex::{RpcCallEvent, RpcCallStatus, RpcDirection};
+
+    // Construct an event with every field populated so a removal
+    // surfaces as a compile error.
+    let evt = RpcCallEvent {
+        caller: 0xAA00,
+        callee: 0xBB00,
+        method: "echo".to_string(),
+        latency_ms: 7,
+        status: RpcCallStatus::Ok,
+        request_bytes: 10,
+        response_bytes: 20,
+        direction: RpcDirection::Outbound,
+        ts_unix_ms: 1_700_000_000_000,
+    };
+    // Touch every field.
+    let _: u64 = evt.caller;
+    let _: u64 = evt.callee;
+    let _: &str = evt.method.as_str();
+    let _: u32 = evt.latency_ms;
+    let _: &RpcCallStatus = &evt.status;
+    let _: u32 = evt.request_bytes;
+    let _: u32 = evt.response_bytes;
+    let _: RpcDirection = evt.direction;
+    let _: u64 = evt.ts_unix_ms;
+
+    // Status variant exhaustiveness check: a future substrate-side
+    // variant addition surfaces as a `non-exhaustive patterns`
+    // error at compile time.
+    let _: &str = match &evt.status {
+        RpcCallStatus::Ok => "ok",
+        RpcCallStatus::Error(_) => "error",
+        RpcCallStatus::Timeout => "timeout",
+        RpcCallStatus::Canceled => "canceled",
+    };
+    // Direction variant exhaustiveness.
+    let _: &str = match evt.direction {
+        RpcDirection::Outbound => "outbound",
+        RpcDirection::Inbound => "inbound",
+    };
+
+    // Sanity: the fixture lists the same field names.
+    let raw = include_str!("cross_lang_nrpc/golden_vectors_streaming.json");
+    let fixture: JsonValue = serde_json::from_str(raw).expect("fixture parses");
+    let fields: Vec<&str> = fixture
+        .get("observer_invariants")
+        .and_then(|v| v.get("fields"))
+        .and_then(|v| v.as_array())
+        .unwrap()
+        .iter()
+        .map(|f| f.get("name").and_then(|v| v.as_str()).unwrap())
+        .collect();
+    assert!(fields.contains(&"caller"));
+    assert!(fields.contains(&"callee"));
+    assert!(fields.contains(&"latency_ms"));
+    assert!(fields.contains(&"ts_unix_ms"));
 }

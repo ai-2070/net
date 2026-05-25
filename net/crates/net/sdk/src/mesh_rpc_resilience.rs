@@ -146,6 +146,10 @@ pub fn default_retryable(err: &RpcError) -> bool {
         // Treat as terminal so the retry budget isn't wasted on
         // a deterministic deny.
         RpcError::CapabilityDenied { .. } => false,
+        // v3 (NRPC_V3 C-S1): caller-driven cancellation via
+        // `Mesh::cancel(token)`. The caller explicitly asked to
+        // stop — retrying would defeat the cancel.
+        RpcError::Cancelled => false,
     }
 }
 
