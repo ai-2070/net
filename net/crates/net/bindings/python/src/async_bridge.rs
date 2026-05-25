@@ -187,6 +187,47 @@ impl Drop for CancelGuard {
 }
 
 // ============================================================================
+// await_substrate — marker wrapper for substrate calls that don't yet
+// thread a cancel-token through.
+//
+// `mesh_rpc.rs` routes through `await_with_cancel` because
+// `MeshNode::call(..., CallOptions { cancel_token, .. })` accepts the
+// token. Other SDK surfaces (`SdkRegistryClient::list`,
+// `FoldQueryClient::query_latest`, deck admin commits, blob
+// store/fetch, etc.) don't currently accept a cancel-token parameter
+// at the SDK boundary — adding one is a substrate-side surface
+// change, out of scope for this binding.
+//
+// In the meantime, asyncio task-cancel still works: the wrapper
+// tokio task is dropped, which drops the inner future. Rust's
+// drop semantics cancel the in-flight `.await` cooperatively. The
+// difference vs `await_with_cancel` is purely on the substrate
+// side — no CANCEL frame fires to the server, so a server-side
+// long-running handler keeps running until natural completion.
+// Client-side observers see the call as cancelled either way.
+//
+// Routing through this named helper instead of raw
+// `future_into_py` documents the intent at every call site and
+// gives a single upgrade point once the SDK exposes
+// cancel-token surfaces.
+// ============================================================================
+
+#[allow(dead_code)] // Consumed by aggregator / blob / cortex / deck / meshos.
+pub fn await_substrate<'py, F, T, E>(
+    py: Python<'py>,
+    fut: F,
+) -> PyResult<Bound<'py, PyAny>>
+where
+    F: std::future::Future<Output = Result<T, E>> + Send + 'static,
+    T: for<'p> pyo3::IntoPyObject<'p> + Send + 'static,
+    E: Into<PyErr> + Send + 'static,
+{
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        fut.await.map_err(Into::into)
+    })
+}
+
+// ============================================================================
 // BytesReply — zero-extra-copy reply value for awaitables.
 //
 // Async substrate calls return `bytes::Bytes` payloads. The naive path
