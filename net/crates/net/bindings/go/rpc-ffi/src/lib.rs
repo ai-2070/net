@@ -3089,97 +3089,48 @@ pub extern "C" fn net_rpc_set_observer_dispatcher(observer: RpcObserverFn) {
     let _ = OBSERVER_DISPATCHER.set(observer);
 }
 
-/// Bound on the observer event buffer (v3 / O-A3). Matches the
-/// napi + pyo3 bindings' `OBSERVER_BUFFER_CAPACITY` for cross-
-/// binding consistency.
-const OBSERVER_BUFFER_CAPACITY: usize = 1024;
-
-/// Process-global count of observer events dropped because the
-/// bounded buffer was full. Surfaced via
-/// [`net_rpc_observer_dropped_total`] and via the
-/// `observer_dropped_total` field of the JSON snapshot from
-/// [`net_rpc_metrics_snapshot`].
-static OBSERVER_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
-
-/// `RpcObserver` adapter that bridges to the Go-side dispatcher
-/// via a bounded mpsc + dedicated worker (v3 / O-A3).
-///
-/// The substrate dispatch thread does only a `try_send` + atomic
-/// counter on overflow. A single drain worker task consumes
-/// events from the channel and invokes the registered C
-/// dispatcher; the worker spends its entire life on a tokio task
-/// (NOT a blocking-pool worker) since the C-side dispatcher is
-/// itself non-blocking (it just calls into Go which queues to a
-/// goroutine).
-struct GoRpcObserver {
-    sender: tokio::sync::mpsc::Sender<Arc<InnerRpcCallEvent>>,
-}
-
-impl GoRpcObserver {
-    /// Install a new observer: build the bounded channel, spawn
-    /// the drain worker, return the wrapping observer. The
-    /// runtime() helper provides the dedicated tokio runtime
-    /// `net-rpc-ffi` already uses for its FFI bridge.
-    ///
-    /// N5: the channel carries `Arc<InnerRpcCallEvent>`, not the
-    /// converted `RpcCallEventC`. The substrate dispatch thread
-    /// pays only `Arc::clone` + try_send; the worker builds the
-    /// C POD lazily before invoking the Go-registered dispatcher.
-    fn install() -> Self {
-        let (sender, mut receiver) =
-            tokio::sync::mpsc::channel::<Arc<InnerRpcCallEvent>>(OBSERVER_BUFFER_CAPACITY);
-        runtime().spawn(async move {
-            while let Some(evt) = receiver.recv().await {
-                let dispatcher = match OBSERVER_DISPATCHER.get() {
-                    Some(d) => *d,
-                    None => continue,
-                };
-                let (status_kind, status_message): (u8, Option<&str>) = match &evt.status {
-                    InnerRpcCallStatus::Ok => (NET_RPC_STATUS_OK, None),
-                    InnerRpcCallStatus::Error(msg) => (NET_RPC_STATUS_ERROR, Some(msg.as_str())),
-                    InnerRpcCallStatus::Timeout => (NET_RPC_STATUS_TIMEOUT, None),
-                    InnerRpcCallStatus::Canceled => (NET_RPC_STATUS_CANCELED, None),
-                };
-                let direction = match evt.direction {
-                    InnerRpcDirection::Outbound => NET_RPC_DIRECTION_OUTBOUND,
-                    InnerRpcDirection::Inbound => NET_RPC_DIRECTION_INBOUND,
-                };
-                let (msg_ptr, msg_len) = match status_message {
-                    Some(s) => (s.as_ptr(), s.len()),
-                    None => (std::ptr::null(), 0),
-                };
-                let c_evt = RpcCallEventC {
-                    caller: evt.caller,
-                    callee: evt.callee,
-                    method_ptr: evt.method.as_ptr(),
-                    method_len: evt.method.len(),
-                    latency_ms: evt.latency_ms,
-                    status_kind,
-                    status_message_ptr: msg_ptr,
-                    status_message_len: msg_len,
-                    request_bytes: evt.request_bytes,
-                    response_bytes: evt.response_bytes,
-                    direction,
-                    ts_unix_ms: evt.ts_unix_ms,
-                };
-                // SAFETY: dispatcher is a Go-registered C function
-                // with the documented `RpcObserverFn` signature;
-                // `&c_evt` is a valid pointer to a stack-local POD
-                // that outlives this call.
-                unsafe { dispatcher(&c_evt as *const _) };
-            }
-            // Sender dropped → channel closed → worker exits.
-        });
-        Self { sender }
-    }
-}
-
-impl RpcObserver for GoRpcObserver {
-    fn on_call(&self, evt: InnerRpcCallEvent) {
-        if self.sender.try_send(Arc::new(evt)).is_err() {
-            OBSERVER_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+/// Build the C POD `RpcCallEventC` from the shared
+/// `Arc<InnerRpcCallEvent>` and invoke the Go-registered
+/// dispatcher. Called once per drained event by the substrate's
+/// [`::net::adapter::net::cortex::ObserverChannel`] worker — runs
+/// on a tokio task, never blocks the substrate dispatch thread.
+fn dispatch_observer_event_to_go(evt: Arc<InnerRpcCallEvent>) {
+    let dispatcher = match OBSERVER_DISPATCHER.get() {
+        Some(d) => *d,
+        None => return,
+    };
+    let (status_kind, status_message): (u8, Option<&str>) = match &evt.status {
+        InnerRpcCallStatus::Ok => (NET_RPC_STATUS_OK, None),
+        InnerRpcCallStatus::Error(msg) => (NET_RPC_STATUS_ERROR, Some(msg.as_str())),
+        InnerRpcCallStatus::Timeout => (NET_RPC_STATUS_TIMEOUT, None),
+        InnerRpcCallStatus::Canceled => (NET_RPC_STATUS_CANCELED, None),
+    };
+    let direction = match evt.direction {
+        InnerRpcDirection::Outbound => NET_RPC_DIRECTION_OUTBOUND,
+        InnerRpcDirection::Inbound => NET_RPC_DIRECTION_INBOUND,
+    };
+    let (msg_ptr, msg_len) = match status_message {
+        Some(s) => (s.as_ptr(), s.len()),
+        None => (std::ptr::null(), 0),
+    };
+    let c_evt = RpcCallEventC {
+        caller: evt.caller,
+        callee: evt.callee,
+        method_ptr: evt.method.as_ptr(),
+        method_len: evt.method.len(),
+        latency_ms: evt.latency_ms,
+        status_kind,
+        status_message_ptr: msg_ptr,
+        status_message_len: msg_len,
+        request_bytes: evt.request_bytes,
+        response_bytes: evt.response_bytes,
+        direction,
+        ts_unix_ms: evt.ts_unix_ms,
+    };
+    // SAFETY: dispatcher is a Go-registered C function with the
+    // documented `RpcObserverFn` signature; `&c_evt` is a valid
+    // pointer to a stack-local POD that outlives this call.
+    unsafe { dispatcher(&c_evt as *const _) };
 }
 
 /// Return the process-global observer-drop counter. Surfaced as a
@@ -3188,7 +3139,7 @@ impl RpcObserver for GoRpcObserver {
 /// without paying the JSON-decode cost on hot paths.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_observer_dropped_total() -> u64 {
-    OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed)
+    ::net::adapter::net::cortex::observer_dropped_total()
 }
 
 /// Enable (`enabled != 0`) or clear (`enabled == 0`) the observer
@@ -3213,7 +3164,12 @@ pub extern "C" fn net_rpc_observer_install(handle: *const MeshRpcHandle, enabled
         if OBSERVER_DISPATCHER.get().is_none() {
             return NET_RPC_ERR_NO_DISPATCHER;
         }
-        let obs: Arc<dyn RpcObserver> = Arc::new(GoRpcObserver::install());
+        let handle = runtime().handle().clone();
+        let channel = ::net::adapter::net::cortex::ObserverChannel::install(
+            &handle,
+            dispatch_observer_event_to_go,
+        );
+        let obs: Arc<dyn RpcObserver> = Arc::new(channel);
         h.node.set_rpc_observer(Some(obs));
     } else {
         h.node.set_rpc_observer(None);
@@ -3300,7 +3256,7 @@ pub extern "C" fn net_rpc_metrics_snapshot(
         // v3 / O-A3: process-global observer-drop counter. See
         // also the dedicated `net_rpc_observer_dropped_total`
         // FFI symbol for consumers that don't want to JSON-decode.
-        "observer_dropped_total": OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed),
+        "observer_dropped_total": ::net::adapter::net::cortex::observer_dropped_total(),
     });
     let bytes = match serde_json::to_vec(&value) {
         Ok(v) => v,
@@ -3868,48 +3824,15 @@ mod tests {
         assert!(collected[0].1.is_empty());
     }
 
-    /// `GoRpcObserver::on_call` drops events when the bounded
-    /// channel fills, incrementing `OBSERVER_DROPPED_TOTAL` by one
-    /// per drop. Mirror of the napi + pyo3 drop-counter tests —
-    /// invariant lives at the substrate dispatch boundary in all
-    /// three bindings. Pinned because the v3 locked decision #1
-    /// hinges on this counter — overflow MUST surface via
-    /// `net_rpc_observer_dropped_total` so a slow Go consumer is
-    /// observable from production telemetry.
+    /// `net_rpc_observer_dropped_total()` returns the substrate's
+    /// process-global counter — the dedicated FFI symbol that lets
+    /// Go consumers scrape the drop count without paying the
+    /// JSON-decode cost on the full snapshot. Sanity-checks the
+    /// FFI hand-off matches the substrate's view.
     #[test]
-    fn observer_drops_overflow_events_and_counts_them() {
-        use ::net::adapter::net::cortex::{
-            RpcCallEvent as InnerEvt, RpcCallStatus as InnerStatus, RpcDirection as InnerDir,
-            RpcObserver,
-        };
-        let baseline = OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed);
-        let (sender, _recv) =
-            tokio::sync::mpsc::channel::<Arc<InnerEvt>>(OBSERVER_BUFFER_CAPACITY);
-        let obs = GoRpcObserver { sender };
-        let make_event = || InnerEvt {
-            caller: 1,
-            callee: 2,
-            method: "test.svc.echo".into(),
-            latency_ms: 0,
-            status: InnerStatus::Ok,
-            request_bytes: 0,
-            response_bytes: 0,
-            direction: InnerDir::Outbound,
-            ts_unix_ms: 0,
-        };
-        const FIRED: u64 = 2000;
-        for _ in 0..FIRED {
-            obs.on_call(make_event());
-        }
-        let dropped = OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed) - baseline;
-        let expected = FIRED - OBSERVER_BUFFER_CAPACITY as u64;
-        assert!(
-            dropped >= expected,
-            "expected ≥ {expected} drops, got {dropped}",
-        );
-        // FFI sanity: the dedicated counter symbol surfaces the
-        // same value the snapshot's JSON field does.
+    fn ffi_observer_dropped_total_matches_substrate() {
+        let substrate = ::net::adapter::net::cortex::observer_dropped_total();
         let via_ffi = net_rpc_observer_dropped_total();
-        assert!(via_ffi >= dropped + baseline);
+        assert_eq!(substrate, via_ffi);
     }
 }

@@ -1620,79 +1620,12 @@ pub struct PyRpcMetricsSnapshot {
 }
 
 // ----------------------------------------------------------------------
-// Observer trampoline — bounded mpsc + dedicated worker (v3 / O-A2).
-//
-// v1 (S2-A2) spawned a fresh blocking-pool task per event via
-// `runtime.spawn_blocking`. Under sustained load this drained the
-// tokio blocking pool faster than user callbacks acquire-and-
-// release the GIL; past the pool's cap, spawn_blocking queues
-// internally with no observability.
-//
-// v3 inserts a bounded mpsc + single worker so:
-//   - The substrate dispatch thread pays only an atomic counter
-//     on overflow (vs the channel-send-or-block on every event).
-//   - Drops surface via `metrics_snapshot.observer_dropped_total`.
-//   - Serialized GIL acquisition (one worker → one acquire-release
-//     cycle per drained event) matches Python's natural threading
-//     model better than 100 concurrent blocking-pool tasks all
-//     fighting for the GIL.
-//
-// Locked decision #1 (NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION.md):
-// callbacks should still be cheap, but the substrate dispatch
-// path is defended.
+// Observer dispatch — delegates to the substrate's ObserverChannel
+// (N4 consolidation). This binding contributes only the
+// GIL-acquiring Python-callable invocation closure; the bounded
+// mpsc + drop counter live in
+// `::net::adapter::net::cortex::ObserverChannel`.
 // ----------------------------------------------------------------------
-
-/// Bound on the observer event buffer. Matches the napi binding's
-/// `OBSERVER_BUFFER_CAPACITY` (1024) for consistency across
-/// bindings.
-const OBSERVER_BUFFER_CAPACITY: usize = 1024;
-
-/// Process-global count of observer events dropped because the
-/// bounded buffer was full. Surfaced via
-/// `metrics_snapshot.observer_dropped_total`.
-static OBSERVER_DROPPED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-struct PyRpcObserver {
-    sender: tokio::sync::mpsc::Sender<Arc<InnerRpcCallEvent>>,
-}
-
-impl PyRpcObserver {
-    /// Install a new observer: build the bounded channel, spawn
-    /// the drain worker that acquires the GIL once per drained
-    /// event and invokes the Python callable.
-    ///
-    /// N5: the channel carries `Arc<InnerRpcCallEvent>`, not the
-    /// converted `PyRpcCallEvent`. The substrate dispatch thread
-    /// pays only `Arc::clone` + try_send; the worker builds the
-    /// pyclass POD lazily under the GIL.
-    fn install(callable: Py<PyAny>, runtime: Arc<Runtime>) -> Self {
-        let (sender, mut receiver) =
-            tokio::sync::mpsc::channel::<Arc<InnerRpcCallEvent>>(OBSERVER_BUFFER_CAPACITY);
-        runtime.spawn(async move {
-            while let Some(evt) = receiver.recv().await {
-                Python::attach(|py| {
-                    let py_evt = match Py::new(py, PyRpcCallEvent::from(evt.as_ref())) {
-                        Ok(o) => o,
-                        Err(_) => return,
-                    };
-                    // Ignore exceptions — observers can't
-                    // influence the in-flight call.
-                    let _ = callable.call1(py, (py_evt,));
-                });
-            }
-            // Sender dropped → channel closed → worker exits.
-        });
-        Self { sender }
-    }
-}
-
-impl RpcObserver for PyRpcObserver {
-    fn on_call(&self, evt: InnerRpcCallEvent) {
-        if self.sender.try_send(Arc::new(evt)).is_err() {
-            OBSERVER_DROPPED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-}
 
 // ============================================================================
 // PyMeshRpc — the public envelope class.
@@ -2038,8 +1971,23 @@ impl PyMeshRpc {
                         "observer must be a callable or None",
                     ));
                 }
-                let obs: Arc<dyn RpcObserver> =
-                    Arc::new(PyRpcObserver::install(callable, self.runtime.clone()));
+                let handle = self.runtime.handle().clone();
+                let channel = ::net::adapter::net::cortex::ObserverChannel::install(
+                    &handle,
+                    move |evt| {
+                        Python::attach(|py| {
+                            let py_evt =
+                                match Py::new(py, PyRpcCallEvent::from(evt.as_ref())) {
+                                    Ok(o) => o,
+                                    Err(_) => return,
+                                };
+                            // Ignore exceptions — observers can't
+                            // influence the in-flight call.
+                            let _ = callable.call1(py, (py_evt,));
+                        });
+                    },
+                );
+                let obs: Arc<dyn RpcObserver> = Arc::new(channel);
                 self.node.set_rpc_observer(Some(obs));
             }
             None => {
@@ -2060,8 +2008,7 @@ impl PyMeshRpc {
             .iter()
             .map(|m| Py::new(py, PyServiceMetrics::from(m)))
             .collect();
-        let observer_dropped_total =
-            OBSERVER_DROPPED_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
+        let observer_dropped_total = ::net::adapter::net::cortex::observer_dropped_total();
         Py::new(
             py,
             PyRpcMetricsSnapshot {
@@ -2201,46 +2148,4 @@ mod tests {
         }
     }
 
-    /// `PyRpcObserver::on_call` drops events when the bounded
-    /// channel fills, incrementing the process-global drop counter
-    /// by one per drop. Mirror of the napi binding's
-    /// `observer_drops_overflow_events_and_counts_them` — same
-    /// invariant lives at the substrate dispatch boundary in all
-    /// three bindings.
-    #[test]
-    fn pyo3_observer_drops_overflow_events_and_counts_them() {
-        use super::{PyRpcObserver, OBSERVER_BUFFER_CAPACITY, OBSERVER_DROPPED_TOTAL};
-        use ::net::adapter::net::cortex::{
-            RpcCallEvent as InnerRpcCallEvent, RpcCallStatus as InnerRpcCallStatus,
-            RpcDirection as InnerRpcDirection, RpcObserver,
-        };
-        use std::sync::atomic::Ordering;
-        use std::sync::Arc;
-
-        let baseline = OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed);
-        let (sender, _recv) =
-            tokio::sync::mpsc::channel::<Arc<InnerRpcCallEvent>>(OBSERVER_BUFFER_CAPACITY);
-        let obs = PyRpcObserver { sender };
-        let make_event = || InnerRpcCallEvent {
-            caller: 1,
-            callee: 2,
-            method: "test.svc.echo".into(),
-            latency_ms: 0,
-            status: InnerRpcCallStatus::Ok,
-            request_bytes: 0,
-            response_bytes: 0,
-            direction: InnerRpcDirection::Outbound,
-            ts_unix_ms: 0,
-        };
-        const FIRED: u64 = 2000;
-        for _ in 0..FIRED {
-            obs.on_call(make_event());
-        }
-        let dropped = OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed) - baseline;
-        let expected = FIRED - OBSERVER_BUFFER_CAPACITY as u64;
-        assert!(
-            dropped >= expected,
-            "expected ≥ {expected} drops, got {dropped}",
-        );
-    }
 }

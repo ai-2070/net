@@ -32,7 +32,6 @@
 //! the prefix to re-throw typed errors.
 
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -546,9 +545,8 @@ pub struct RpcMetricsSnapshotJs {
 
 impl RpcMetricsSnapshotJs {
     /// Build the napi snapshot. Combines the substrate's per-
-    /// service registry with the napi-local observer drop
-    /// counter (which is a per-process counter; the napi binding
-    /// doesn't currently split it by service).
+    /// service registry with the shared observer drop counter
+    /// owned at the substrate layer ([`::net::adapter::net::cortex::observer_dropped_total`]).
     fn build(snapshot: &InnerRpcMetricsSnapshot) -> Self {
         Self {
             services: snapshot
@@ -556,93 +554,20 @@ impl RpcMetricsSnapshotJs {
                 .iter()
                 .map(ServiceMetricsJs::from)
                 .collect(),
-            observer_dropped_total: BigInt::from(OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed)),
+            observer_dropped_total: BigInt::from(::net::adapter::net::cortex::observer_dropped_total()),
         }
     }
 }
 
 // ----------------------------------------------------------------------
-// Observer trampoline — bounded mpsc + dedicated worker (v3 / O-A1).
-//
-// The substrate calls `RpcObserver::on_call` synchronously from
-// the dispatch task. v1 (S2-A1) called the TSFN directly in
-// NonBlocking mode from that thread; v3 inserts a bounded mpsc +
-// worker task so the substrate dispatch thread pays only one
-// atomic counter on overflow instead of paying the TSFN's
-// internal Mutex acquire on every event.
-//
-// Design:
-//   - On install: spawn a worker task that drains the receiver
-//     and pumps each event to the TSFN.
-//   - `on_call`: `try_send` into the channel; overflow increments
-//     the process-global `OBSERVER_DROPPED_TOTAL`. No allocation,
-//     no lock, no system call on the hot path.
-//   - On clear (or mesh drop): drop the sender → worker task
-//     exits cleanly when the channel closes.
-//
-// Locked decision #1 (NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION.md):
-// callbacks should still be cheap, but the substrate dispatch
-// path is now defended against a slow consumer — overflow drops
-// surface via the snapshot's `observer_dropped_total` counter.
+// Observer trampoline — delegates to the substrate's ObserverChannel
+// (N4 consolidation of the prior NodeRpcObserver / PyRpcObserver /
+// GoRpcObserver trampolines). This binding builds only the
+// TSFN-dispatching closure; the bounded mpsc + drop counter live
+// in `::net::adapter::net::cortex::ObserverChannel`.
 // ----------------------------------------------------------------------
-
-/// Bound on the observer event buffer. Big enough that a
-/// momentarily-slow observer doesn't lose events under normal
-/// load; small enough that an actually-broken observer surfaces
-/// drops within seconds rather than minutes. Matches the existing
-/// `RpcResponseSink`'s pump-side mpsc bound in the substrate.
-const OBSERVER_BUFFER_CAPACITY: usize = 1024;
-
-/// Process-global count of observer events dropped because the
-/// bounded buffer was full. Surfaced via
-/// [`RpcMetricsSnapshotJs::observer_dropped_total`]. Per-process
-/// (not per-mesh / per-service) because observer dispatch is
-/// fundamentally per-process; the napi binding's single
-/// dispatcher reaches every mesh in the V8 instance.
-static OBSERVER_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 type RpcObserverTsfn = ThreadsafeFunction<RpcCallEventJs, (), RpcCallEventJs, napi::Status, false>;
-
-struct NodeRpcObserver {
-    sender: tokio::sync::mpsc::Sender<Arc<InnerRpcCallEvent>>,
-}
-
-impl NodeRpcObserver {
-    /// Install a new observer: build the bounded channel, spawn
-    /// the drain worker, return the wrapping observer.
-    ///
-    /// N5: the channel carries `Arc<InnerRpcCallEvent>`, not the
-    /// converted `RpcCallEventJs`. On the substrate dispatch
-    /// thread, `on_call` only does `try_send(Arc::clone(&evt))` —
-    /// no string allocations, no BigInt boxing. The drain worker
-    /// builds the JS POD lazily, so dropped events cost just one
-    /// `Arc::clone` + atomic counter bump.
-    fn install(tsfn: RpcObserverTsfn) -> Self {
-        let (sender, mut receiver) =
-            tokio::sync::mpsc::channel::<Arc<InnerRpcCallEvent>>(OBSERVER_BUFFER_CAPACITY);
-        tokio::spawn(async move {
-            while let Some(evt) = receiver.recv().await {
-                let js_evt = RpcCallEventJs::from(evt.as_ref());
-                // NonBlocking on the TSFN side too — if the JS
-                // event loop is wedged AND the napi-rs queue is
-                // also full, we let napi-rs drop. Our own bounded
-                // buffer is the first line of defense; the TSFN
-                // overflow path is the last-ditch fallback.
-                let _ = tsfn.call(js_evt, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-            // Sender dropped → channel closed → worker exits.
-        });
-        Self { sender }
-    }
-}
-
-impl RpcObserver for NodeRpcObserver {
-    fn on_call(&self, evt: InnerRpcCallEvent) {
-        if self.sender.try_send(Arc::new(evt)).is_err() {
-            OBSERVER_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
 
 // ============================================================================
 // ServeHandle — RAII wrapper around the inner ServeHandle.
@@ -1935,7 +1860,15 @@ impl MeshRpc {
         match observer {
             Some(f) => {
                 let tsfn: RpcObserverTsfn = f.build_threadsafe_function().build()?;
-                let obs: Arc<dyn RpcObserver> = Arc::new(NodeRpcObserver::install(tsfn));
+                let handle = tokio::runtime::Handle::current();
+                let channel = ::net::adapter::net::cortex::ObserverChannel::install(
+                    &handle,
+                    move |evt| {
+                        let js_evt = RpcCallEventJs::from(evt.as_ref());
+                        let _ = tsfn.call(js_evt, ThreadsafeFunctionCallMode::NonBlocking);
+                    },
+                );
+                let obs: Arc<dyn RpcObserver> = Arc::new(channel);
                 self.node.set_rpc_observer(Some(obs));
             }
             None => {
@@ -2182,52 +2115,4 @@ mod tests {
         }
     }
 
-    /// `NodeRpcObserver::on_call` drops events when the bounded
-    /// channel fills, incrementing the process-global drop counter
-    /// by one per drop. Pinned because the v3 locked decision #1
-    /// hinges on this — overflow MUST surface via the snapshot's
-    /// `observer_dropped_total` field so a slow JS consumer is
-    /// observable from production telemetry rather than a
-    /// silently-on-fire dispatch path.
-    ///
-    /// The test bypasses the TSFN-bearing `install()` by constructing
-    /// the observer struct directly with a sender whose receiver is
-    /// held but never drained — the channel fills up, every event
-    /// past 1024 hits the overflow branch. We hold `_recv` ourselves
-    /// so the channel doesn't close (which would also trip the
-    /// `is_err()` arm but for the wrong reason).
-    #[test]
-    fn observer_drops_overflow_events_and_counts_them() {
-        use std::sync::atomic::Ordering;
-
-        let baseline = OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed);
-        let (sender, _recv) = tokio::sync::mpsc::channel::<Arc<InnerRpcCallEvent>>(
-            OBSERVER_BUFFER_CAPACITY,
-        );
-        let obs = NodeRpcObserver { sender };
-        let make_event = || InnerRpcCallEvent {
-            caller: 1,
-            callee: 2,
-            method: "test.svc.echo".into(),
-            latency_ms: 0,
-            status: InnerRpcCallStatus::Ok,
-            request_bytes: 0,
-            response_bytes: 0,
-            direction: InnerRpcDirection::Outbound,
-            ts_unix_ms: 0,
-        };
-        const FIRED: u64 = 2000;
-        for _ in 0..FIRED {
-            obs.on_call(make_event());
-        }
-        let dropped = OBSERVER_DROPPED_TOTAL.load(Ordering::Relaxed) - baseline;
-        let expected = FIRED - OBSERVER_BUFFER_CAPACITY as u64;
-        // Allow slack — the counter is process-global so concurrent
-        // tests could nudge it; but the per-fire delta from THIS
-        // test must be at least the overflow count.
-        assert!(
-            dropped >= expected,
-            "expected ≥ {expected} drops, got {dropped}",
-        );
-    }
 }
