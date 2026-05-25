@@ -99,20 +99,14 @@ pub(crate) fn next_token() -> u64 {
 /// Per-token state. Carries the cancel signal and a generation
 /// marker for orphan-TTL GC.
 struct CancelEntry {
-    /// Set when [`CancelRegistry::cancel`] arrived BEFORE the
-    /// matching `register_cancel_notify` ran. The first register
-    /// observes the flag, immediately arms the returned `Notify`,
-    /// and clears the flag.
+    /// Set on the CR-13 cancel-before-register race; the eventual
+    /// register pre-arms the Notify.
     pre_cancelled: bool,
-    /// The [`Notify`] the in-flight call awaits. `None` when only
-    /// `pre_cancelled` is set (cancel-before-register). Populated
-    /// on first register; subsequent registers (if any — typical
-    /// use is 1:1) clone the existing Arc.
+    /// Lazily created on first register. `None` means only
+    /// `pre_cancelled` is set (cancel arrived first).
     notify: Option<Arc<Notify>>,
-    /// When the entry was created. Used by the orphan-TTL GC.
-    /// Set on cancel-before-register (so unused tokens can age
-    /// out); cleared after register since a registered entry has
-    /// a live caller awaiting.
+    /// Birth instant for orphan-TTL GC; cleared on register since
+    /// a registered entry has a live caller.
     marked_at: Option<Instant>,
 }
 
@@ -186,17 +180,13 @@ impl CancelRegistry {
         }
         let notify = {
             let mut inner = self.entries.lock();
-            // Cancel rate is low and bounded, so GC under cancel
-            // stays cheap; still gate by `last_gc` to stay
-            // symmetric with register_notify.
             Self::maybe_gc(&mut inner);
             let entry = inner.entries.entry(token).or_insert_with(CancelEntry::new);
             entry.pre_cancelled = true;
             if entry.marked_at.is_none() {
                 entry.marked_at = Some(Instant::now());
             }
-            // Clone the Arc before releasing the lock — `notify_one`
-            // doesn't need the registry mutex.
+            // Snapshot the Arc; notify_one runs outside the lock.
             entry.notify.clone()
         };
         if let Some(notify) = notify {
@@ -218,9 +208,7 @@ impl CancelRegistry {
         if token == 0 {
             return never_firing_notify();
         }
-        // Snapshot (notify, was_precancelled) under the lock, then
-        // drop the guard before calling `notify_one`. Keeps the
-        // critical section to a HashMap lookup + Arc clone.
+        // Snapshot under the lock; notify_one runs outside.
         let (notify, was_precancelled) = {
             let mut inner = self.entries.lock();
             Self::maybe_gc(&mut inner);
@@ -230,16 +218,14 @@ impl CancelRegistry {
                 .get_or_insert_with(|| Arc::new(Notify::new()))
                 .clone();
             let was_precancelled = entry.pre_cancelled;
-            // Once registered, the entry is no longer an orphan; the
-            // marked_at timestamp's only purpose was orphan-TTL GC.
+            // Live caller now exists; the orphan-TTL stamp no longer applies.
             entry.marked_at = None;
             (notify, was_precancelled)
         };
         if was_precancelled {
-            // CR-13: cancel arrived before register. Pre-arm the
-            // permit so the first notified().await fires
-            // immediately. Calling outside the lock avoids holding
-            // the registry mutex across tokio internals.
+            // CR-13: cancel arrived first; pre-arm the permit.
+            // Outside the lock — avoids holding the mutex across
+            // tokio internals.
             notify.notify_one();
         }
         notify
