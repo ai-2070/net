@@ -421,6 +421,22 @@ fn extract_cancel_token<'py>(opts: Option<&Bound<'py, PyDict>>) -> PyResult<Opti
     Ok(Some(token))
 }
 
+/// `True` iff `handler` is a Python `async def` (coroutine
+/// function). Used by `AsyncMeshRpc.serve*` to route async
+/// handlers to the coroutine-driving path and sync handlers to
+/// the existing `spawn_blocking` path at register time, so the
+/// branch isn't paid per-invocation.
+fn is_coroutine_function(py: Python<'_>, handler: &Py<PyAny>) -> bool {
+    let Ok(inspect) = py.import("inspect") else {
+        return false;
+    };
+    inspect
+        .getattr("iscoroutinefunction")
+        .and_then(|f| f.call1((handler.bind(py),)))
+        .and_then(|r| r.extract::<bool>())
+        .unwrap_or(false)
+}
+
 /// Reject the ambiguous case of both `opts['cancel']` and
 /// `opts['cancel_token']` being set — they're mutually exclusive
 /// and the precedence would be invisible to the caller.
@@ -565,6 +581,111 @@ impl RpcHandler for PyRpcHandler {
                 "Python handler did not respond within {} ms",
                 self.timeout.as_millis()
             ))),
+        }
+    }
+}
+
+// ============================================================================
+// PyAsyncRpcHandler — adapts an `async def` Python callable to the
+// RpcHandler trait. Each handler invocation:
+//   1. Acquires the GIL, calls the user's `handler(req)`, gets back
+//      a Python coroutine.
+//   2. Converts the coroutine to a Rust future via
+//      `pyo3_async_runtimes::tokio::into_future`.
+//   3. Awaits the future on the tokio runtime — no spawn_blocking
+//      slot needed because the awaits happen cooperatively.
+//   4. Extracts the bytes result OR an RpcAppError exception.
+//
+// Compared to the sync PyRpcHandler, this path doesn't burn a
+// blocking-pool slot per request — a server with N concurrent
+// in-flight handlers + async handlers uses N tokio tasks, not N
+// blocking-pool threads.
+// ============================================================================
+
+struct PyAsyncRpcHandler {
+    callable: Py<PyAny>,
+    timeout: Duration,
+}
+
+#[async_trait::async_trait]
+impl RpcHandler for PyAsyncRpcHandler {
+    async fn call(
+        &self,
+        ctx: RpcContext,
+    ) -> std::result::Result<RpcResponsePayload, RpcHandlerError> {
+        let callable = Python::attach(|py| self.callable.clone_ref(py));
+        let req_body = ctx.payload.body;
+        // Build the coroutine + convert to a Rust future under the
+        // GIL; we own the future from there. The future itself
+        // doesn't need the GIL to make progress — the bridge
+        // re-acquires it on each Python-side step.
+        let fut_result = Python::attach(|py| -> Result<_, PyErr> {
+            let req_bytes = PyBytes::new(py, &req_body);
+            let args = PyTuple::new(py, [req_bytes.into_any()])?;
+            let coro = callable.call1(py, args)?;
+            pyo3_async_runtimes::tokio::into_future(coro.into_bound(py))
+        });
+        let fut = match fut_result {
+            Ok(f) => f,
+            Err(pyerr) => {
+                let outcome = Python::attach(|py| extract_app_error(py, &pyerr));
+                return match outcome {
+                    Some((code, body)) => Err(RpcHandlerError::Application {
+                        code,
+                        message: String::from_utf8_lossy(&body).into_owned(),
+                    }),
+                    None => Err(RpcHandlerError::Internal(format!(
+                        "Python handler raised: {pyerr}"
+                    ))),
+                };
+            }
+        };
+        let timeout_result = tokio::time::timeout(self.timeout, fut).await;
+        let py_result = match timeout_result {
+            Ok(r) => r,
+            Err(_) => {
+                return Err(RpcHandlerError::Internal(format!(
+                    "Python async handler did not respond within {} ms",
+                    self.timeout.as_millis()
+                )));
+            }
+        };
+        match py_result {
+            Ok(value) => {
+                let outcome = Python::attach(|py| -> Result<HandlerOutcome, String> {
+                    let bound = value.into_bound(py);
+                    let bytes_vec: Vec<u8> = bound
+                        .extract()
+                        .map_err(|e| format!("Python handler must return bytes: {e}"))?;
+                    Ok(HandlerOutcome::Ok(bytes_vec))
+                });
+                match outcome {
+                    Ok(HandlerOutcome::Ok(body)) => Ok(RpcResponsePayload {
+                        status: RpcStatus::Ok,
+                        headers: vec![],
+                        body: body.into(),
+                    }),
+                    Ok(HandlerOutcome::AppError { code, body }) => {
+                        Err(RpcHandlerError::Application {
+                            code,
+                            message: String::from_utf8_lossy(&body).into_owned(),
+                        })
+                    }
+                    Err(msg) => Err(RpcHandlerError::Internal(msg)),
+                }
+            }
+            Err(pyerr) => {
+                let app = Python::attach(|py| extract_app_error(py, &pyerr));
+                match app {
+                    Some((code, body)) => Err(RpcHandlerError::Application {
+                        code,
+                        message: String::from_utf8_lossy(&body).into_owned(),
+                    }),
+                    None => Err(RpcHandlerError::Internal(format!(
+                        "Python async handler raised: {pyerr}"
+                    ))),
+                }
+            }
         }
     }
 }
@@ -2120,6 +2241,54 @@ impl PyAsyncMeshRpc {
     fn new(mesh: &crate::mesh_bindings::NetMesh) -> PyResult<Self> {
         let node = mesh.node_arc_clone()?;
         Ok(PyAsyncMeshRpc { node })
+    }
+
+    /// Register a Python handler on `service`. Accepts EITHER a
+    /// sync `def handler(req: bytes) -> bytes` OR an
+    /// `async def handler(req: bytes) -> bytes` — detected via
+    /// `inspect.iscoroutinefunction` at register time. Async
+    /// handlers run as coroutines on the substrate's tokio
+    /// runtime; sync handlers keep the `spawn_blocking` path
+    /// (same semantics as :meth:`MeshRpc.serve`).
+    ///
+    /// `handler_timeout_ms` works the same as on the sync class.
+    #[pyo3(signature = (service, handler, handler_timeout_ms=None))]
+    fn serve(
+        &self,
+        py: Python<'_>,
+        service: String,
+        handler: Py<PyAny>,
+        handler_timeout_ms: Option<u64>,
+    ) -> PyResult<PyServeHandle> {
+        let timeout = match handler_timeout_ms {
+            Some(0) => Duration::from_secs(u64::MAX / 1000),
+            Some(ms) => Duration::from_millis(ms),
+            None => DEFAULT_HANDLER_TIMEOUT,
+        };
+        // `serve_rpc` is monomorphic in the handler type (Arc<H: Sized>),
+        // so we can't unify the two arms into Arc<dyn RpcHandler>.
+        // Branch the registration itself instead.
+        let inner = if is_coroutine_function(py, &handler) {
+            self.node.serve_rpc(
+                &service,
+                Arc::new(PyAsyncRpcHandler {
+                    callable: handler,
+                    timeout,
+                }),
+            )
+        } else {
+            self.node.serve_rpc(
+                &service,
+                Arc::new(PyRpcHandler {
+                    callable: handler,
+                    timeout,
+                }),
+            )
+        }
+        .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
+        Ok(PyServeHandle {
+            inner: Arc::new(Mutex::new(Some(inner))),
+        })
     }
 
     /// Direct-addressed unary call. Returns an awaitable resolving
