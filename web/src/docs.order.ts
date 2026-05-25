@@ -64,6 +64,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     ],
     // Releases — newest first.
     releases: [
+      "RELEASE_v0.23_GIMME_SHELTER",
       "RELEASE_v0.22_ALL_ALONG_THE_WATCHTOWER",
       "RELEASE_v0.21_RADAR_LOVE",
       "release-v0.20.2",
@@ -132,6 +133,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "tutorials/event-sourced-service": "Event-Sourced Service",
 
     // Releases
+    "releases/RELEASE_v0.23_GIMME_SHELTER": "v0.23 — Gimme Shelter",
     "releases/RELEASE_v0.22_ALL_ALONG_THE_WATCHTOWER":
       "v0.22 — All Along the Watchtower",
     "releases/RELEASE_v0.21_RADAR_LOVE": "v0.21 — Radar Love",
