@@ -216,6 +216,9 @@ fn summaries_to_list<'py>(
 /// Client for the `aggregator.registry` RPC service. Construct
 /// against a live `NetMesh`; every operation issues a synchronous
 /// RPC against the named target node.
+///
+/// Async equivalent: :class:`AsyncRegistryClient` — awaitable
+/// `list` / `spawn` / `unregister`.
 #[pyclass(name = "RegistryClient", module = "net._net")]
 pub struct PyRegistryClient {
     inner: Arc<RwLock<SdkRegistryClient>>,
@@ -309,6 +312,9 @@ impl PyRegistryClient {
 /// Client for the `fold.query` RPC service. Caches recent
 /// `QueryLatest` responses by `(target, kind)` with a configurable
 /// TTL; `SummarizeNow` always goes to the wire.
+///
+/// Async equivalent: :class:`AsyncFoldQueryClient` — awaitable
+/// `query_latest` / `query_summarize_now`.
 #[pyclass(name = "FoldQueryClient", module = "net._net")]
 pub struct PyFoldQueryClient {
     inner: Arc<RwLock<SdkFoldQueryClient>>,

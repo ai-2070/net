@@ -1361,8 +1361,10 @@ fn shared_runtime() -> Result<Arc<Runtime>, std::io::Error> {
 
 /// Owns a [`LocalMeshQueryExecutor`] + a Tokio runtime; exposes
 /// `.execute(query, options) -> list[ResultRow]`. Sync drain by
-/// design — locked decision: Python is sync-first, async wrapper
-/// is a later slice.
+/// design.
+///
+/// Async equivalent: :class:`AsyncMeshQueryRunner` — Arc-shares
+/// the executor; awaitable `execute`.
 #[pyclass(name = "MeshQueryRunner", module = "net._net")]
 pub struct PyMeshQueryRunner {
     runtime: Arc<Runtime>,

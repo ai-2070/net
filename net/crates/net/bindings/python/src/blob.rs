@@ -944,6 +944,10 @@ pub fn register_blob_adapter(adapter_id: String, instance: Py<PyAny>) -> PyResul
 /// the binding pumps the substrate's tokio runtime under the
 /// hood, releasing the GIL for the duration of each call so
 /// concurrent Python threads aren't blocked.
+///
+/// Async equivalent: :class:`AsyncMeshBlobAdapter` — same inner
+/// adapter; awaitable `store` / `fetch` / `fetch_range` / `exists`
+/// / `repair_blob`.
 #[pyclass(name = "MeshBlobAdapter")]
 pub struct PyMeshBlobAdapter {
     inner: Arc<InnerMeshBlobAdapter>,

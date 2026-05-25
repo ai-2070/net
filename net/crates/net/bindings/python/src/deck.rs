@@ -322,6 +322,9 @@ fn snapshot_to_json(py: Python<'_>, snap: &MeshOsSnapshot) -> PyResult<String> {
 /// Slice 1 returns JSON strings; the `sdk-py` wrapper parses them
 /// into dicts automatically. Typed pyclass projections land in
 /// slice 2 if a consumer asks.
+///
+/// Async equivalent: :class:`AsyncSnapshotStream` — PEP 525 async
+/// iterator over the same stream shape.
 #[pyclass(name = "SnapshotStream", module = "net._net")]
 pub struct PySnapshotStream {
     inner: Option<CoreSnapshotStream>,
@@ -356,7 +359,10 @@ impl PySnapshotStream {
 }
 
 // =========================================================================
-// PyStatusSummaryStream — sync Python iterator
+// PyStatusSummaryStream — sync Python iterator.
+//
+// Async equivalent: :class:`AsyncStatusSummaryStream` — PEP 525
+// async iterator over the same stream shape.
 // =========================================================================
 
 #[pyclass(name = "StatusSummaryStream", module = "net._net")]
@@ -399,6 +405,9 @@ impl PyStatusSummaryStream {
 /// Phase 1 substrate constraint: non-signing today (the substrate
 /// records the operator id but doesn't yet route through
 /// channel-auth).
+///
+/// Async equivalent: :class:`AsyncAdminCommands` — awaitable
+/// `drain` / `enter_maintenance` / `cordon` / etc.
 #[pyclass(name = "AdminCommands", module = "net._net")]
 pub struct PyAdminCommands {
     /// `Arc<CoreClient>` lets us produce an `AdminCommands<'a>`
@@ -540,6 +549,10 @@ impl PyAdminCommands {
 /// "operator-only" mode (the binding owns the supervisor), or via
 /// `from_meshos(sdk, identity)` against an externally-managed
 /// `MeshOsDaemonSdk`.
+///
+/// Async equivalent: :class:`AsyncDeckClient` — same `CoreClient`;
+/// awaitable `close`, async-iter snapshots/status streams, and
+/// `.admin` returns `AsyncAdminCommands`.
 #[pyclass(name = "DeckClient", module = "net._net")]
 pub struct PyDeckClient {
     client: Arc<CoreClient>,

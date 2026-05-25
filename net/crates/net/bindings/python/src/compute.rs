@@ -314,6 +314,10 @@ impl PyDaemonHandle {
 
 /// Python surface for the compute runtime. One instance per
 /// `NetMesh`. Construct via `DaemonRuntime(mesh)`.
+///
+/// Async equivalent: :class:`AsyncDaemonRuntime` — same SDK
+/// runtime; awaitable `start` / `shutdown` / `spawn` /
+/// `start_migration` / etc.
 #[pyclass(name = "DaemonRuntime", module = "net._net")]
 pub struct PyDaemonRuntime {
     inner: Arc<SdkDaemonRuntime>,
@@ -779,6 +783,9 @@ impl PyDaemonRuntime {
 /// Dropping the handle does NOT cancel the migration — the
 /// orchestrator keeps driving it to completion in the background.
 /// Keep the handle to observe phase transitions or request abort.
+///
+/// Async equivalent: :class:`AsyncMigrationHandle` — same handle
+/// shape; awaitable `wait` / `wait_with_timeout` / `cancel`.
 #[pyclass(name = "MigrationHandle", module = "net._net")]
 pub struct PyMigrationHandle {
     origin_hash: u64,

@@ -979,6 +979,9 @@ mod mesh_bindings {
     }
 
     /// Handle to an open stream. Opaque to Python callers.
+    ///
+    /// Async equivalent: :class:`AsyncNetStream` — awaitable
+    /// `send` / `send_with_retry` / `send_blocking`.
     #[pyclass]
     pub struct NetStream {
         pub(crate) peer_node_id: u64,
@@ -1045,6 +1048,9 @@ mod mesh_bindings {
     ///
     /// Manages encrypted connections to multiple peers over a single
     /// UDP socket with automatic failure detection and rerouting.
+    ///
+    /// Async equivalent: :class:`AsyncNetMesh` — same `MeshNode`,
+    /// awaitable I/O methods.
     ///
     /// ```python
     /// from net import NetMesh

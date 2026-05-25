@@ -1804,6 +1804,10 @@ pub struct PyRpcMetricsSnapshot {
 //
 // Constructed via `MeshRpc(net_mesh)` — takes the existing NetMesh
 // and shares its MeshNode + tokio runtime.
+//
+// Async equivalent: :class:`AsyncMeshRpc` — same `MeshNode`,
+// awaitable `call` / `call_streaming` / `serve` (accepts `async def`
+// handlers).
 // ============================================================================
 
 #[pyclass(name = "MeshRpc", module = "_net")]

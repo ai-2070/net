@@ -828,6 +828,9 @@ impl PyRedexEvent {
 }
 
 /// Raw RedEX file handle. Cheap to share — methods take `&self`.
+///
+/// Async equivalent: :class:`AsyncRedexFile` — awaitable `tail()`
+/// returning an `AsyncRedexTailIter`.
 #[pyclass(name = "RedexFile")]
 pub struct PyRedexFile {
     inner: Arc<InnerRedexFile>,
@@ -922,6 +925,9 @@ struct RedexTailIterInner {
 }
 
 /// Sync Python iterator over a live `RedexFile.tail()`.
+///
+/// Async equivalent: :class:`AsyncRedexTailIter` — PEP 525 async
+/// iterator with the same yield shape.
 #[pyclass(name = "RedexTailIter")]
 pub struct PyRedexTailIter {
     inner: Arc<RedexTailIterInner>,
@@ -1223,6 +1229,10 @@ impl PyTask {
 }
 
 /// Typed tasks adapter handle.
+///
+/// Async equivalent: :class:`AsyncTasksAdapter` — same inner
+/// adapter; awaitable `wait_for_seq` / `wait_for_token` /
+/// `watch_tasks` / `snapshot_and_watch_tasks`.
 #[pyclass(name = "TasksAdapter", from_py_object)]
 #[derive(Clone)]
 pub struct PyTasksAdapter {
@@ -1626,6 +1636,9 @@ struct TaskWatchIterInner {
 /// Sync Python iterator over a live task filter. `__next__` blocks
 /// on the underlying stream and raises `StopIteration` when the
 /// iterator is closed or the stream ends.
+///
+/// Async equivalent: :class:`AsyncTaskWatchIter` — PEP 525 async
+/// iterator with the same yield shape.
 #[pyclass(name = "TaskWatchIter")]
 pub struct PyTaskWatchIter {
     inner: Arc<TaskWatchIterInner>,
@@ -1758,6 +1771,10 @@ impl PyMemory {
 }
 
 /// Typed memories adapter handle.
+///
+/// Async equivalent: :class:`AsyncMemoriesAdapter` — same inner
+/// adapter; awaitable `wait_for_seq` / `wait_for_token` /
+/// `watch_memories` / `snapshot_and_watch_memories`.
 #[pyclass(name = "MemoriesAdapter", from_py_object)]
 #[derive(Clone)]
 pub struct PyMemoriesAdapter {
@@ -2192,6 +2209,9 @@ struct MemoryWatchIterInner {
 }
 
 /// Sync Python iterator over a live memory filter.
+///
+/// Async equivalent: :class:`AsyncMemoryWatchIter` — PEP 525 async
+/// iterator with the same yield shape.
 #[pyclass(name = "MemoryWatchIter")]
 pub struct PyMemoryWatchIter {
     inner: Arc<MemoryWatchIterInner>,
