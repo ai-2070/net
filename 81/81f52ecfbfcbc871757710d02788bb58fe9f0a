@@ -1,0 +1,19 @@
+net/crates/net/docs/releases/RELEASE_v0.24_MONEY_FOR_NOTHING.md
+  s_ba759298e806a3::t_8d823d667e679a 1-6,8-191
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "8181f52ecfbfcbc871757710d02788bb58fe9f0a",
+  "prompts": {},
+  "sessions": {
+    "s_ba759298e806a3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5ba9d9e9-d85c-4d81-a4d4-0365c80dcc78",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
