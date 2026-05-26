@@ -1,0 +1,28 @@
+net/crates/net/src/adapter/net/behavior/safety.rs
+  s_099fa7d871e34d::t_c9cdd18d466938 1113
+  s_099fa7d871e34d::t_cdee666654a417 1086-1089
+net/crates/net/src/adapter/net/behavior/fold/capability_aggregation.rs
+  s_099fa7d871e34d::t_dde52060a561de 189
+  s_099fa7d871e34d::t_4eb78018b6bbfb 1497
+  s_099fa7d871e34d::t_c5184dbe73701c 105,109-116
+  s_099fa7d871e34d::t_ad265d5110417b 154
+net/crates/net/Cargo.toml
+  s_099fa7d871e34d::t_75e73386365154 258-265
+  s_099fa7d871e34d::t_4b633733b79cf6 98-105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "d4c58fef1f5ccf29b97e206c064c601f3653095a",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
