@@ -1850,9 +1850,8 @@ impl MeshNode {
         // handler-side counters; this one covers the path BEFORE
         // the handler runs, which the fold-side metrics never see.
         let metrics_for_bridge = Arc::clone(&metrics_handle);
-        let fold = Arc::new(Mutex::new(
-            RpcServerFold::new(handler as Arc<dyn RpcHandler>, emit).with_metrics(metrics_handle),
-        ));
+        let mut fold =
+            RpcServerFold::new(handler as Arc<dyn RpcHandler>, emit).with_metrics(metrics_handle);
 
         // Register the inbound dispatcher. Push into the mpsc;
         // the bridge task does the actual fold work.
@@ -1967,7 +1966,7 @@ impl MeshNode {
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
-                if let Err(e) = fold.lock().apply(&ev, &mut ()) {
+                if let Err(e) = fold.apply(&ev, &mut ()) {
                     tracing::warn!(error = %e, "rpc serve_rpc: fold apply error");
                 }
             }
@@ -2076,10 +2075,8 @@ impl MeshNode {
         // + pump task bump server-side counters (including the
         // streaming-only `streaming_chunks_emitted_total`).
         let metrics_handle = self.rpc_metrics_arc().for_service(service);
-        let fold = Arc::new(Mutex::new(
-            RpcServerStreamingFold::new(handler as Arc<dyn RpcStreamingHandler>, emit)
-                .with_metrics(metrics_handle),
-        ));
+        let mut fold = RpcServerStreamingFold::new(handler as Arc<dyn RpcStreamingHandler>, emit)
+            .with_metrics(metrics_handle);
         let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
             let _ = tx.try_send(ev);
         });
@@ -2098,7 +2095,7 @@ impl MeshNode {
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
-                if let Err(e) = fold.lock().apply(&ev, &mut ()) {
+                if let Err(e) = fold.apply(&ev, &mut ()) {
                     tracing::warn!(error = %e, "rpc serve_rpc_streaming: fold apply error");
                 }
             }
@@ -2201,11 +2198,12 @@ impl MeshNode {
         );
 
         let metrics_handle = self.rpc_metrics_arc().for_service(service);
-        let fold = Arc::new(Mutex::new(
-            RpcStreamingRequestFold::new(handler as Arc<dyn RpcClientStreamingHandler>, emit_resp)
-                .with_grant_emitter(emit_grant)
-                .with_metrics(metrics_handle),
-        ));
+        let mut fold = RpcStreamingRequestFold::new(
+            handler as Arc<dyn RpcClientStreamingHandler>,
+            emit_resp,
+        )
+        .with_grant_emitter(emit_grant)
+        .with_metrics(metrics_handle);
         let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
             let _ = tx.try_send(ev);
         });
@@ -2224,7 +2222,7 @@ impl MeshNode {
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
-                if let Err(e) = fold.lock().apply(&ev, &mut ()) {
+                if let Err(e) = fold.apply(&ev, &mut ()) {
                     tracing::warn!(error = %e,
                         "rpc serve_rpc_client_stream: fold apply error");
                 }
@@ -2436,11 +2434,9 @@ impl MeshNode {
         );
 
         let metrics_handle = self.rpc_metrics_arc().for_service(service);
-        let fold = Arc::new(Mutex::new(
-            RpcDuplexFold::new(handler as Arc<dyn RpcDuplexHandler>, emit_resp)
-                .with_grant_emitter(emit_grant)
-                .with_metrics(metrics_handle),
-        ));
+        let mut fold = RpcDuplexFold::new(handler as Arc<dyn RpcDuplexHandler>, emit_resp)
+            .with_grant_emitter(emit_grant)
+            .with_metrics(metrics_handle);
         let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
             let _ = tx.try_send(ev);
         });
@@ -2459,7 +2455,7 @@ impl MeshNode {
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
-                if let Err(e) = fold.lock().apply(&ev, &mut ()) {
+                if let Err(e) = fold.apply(&ev, &mut ()) {
                     tracing::warn!(error = %e,
                         "rpc serve_rpc_duplex: fold apply error");
                 }

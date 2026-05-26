@@ -16,6 +16,7 @@
 //! on top.
 
 use bytes::{Buf, BufMut, Bytes};
+use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1372,7 +1373,7 @@ pub struct RpcServerFold {
     /// CANCEL. Wrapped in `Arc<Mutex<...>>` so spawned tasks can
     /// remove their own entries without going back through the
     /// fold.
-    in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
+    in_flight: Arc<DashMap<(u64, u64), RpcCancellationToken>>,
     /// Optional per-service metrics handle. When `Some`, the
     /// spawned handler task bumps `handler_invocations_total` /
     /// `handler_in_flight` / `handler_panics_total` and records
@@ -1399,7 +1400,7 @@ impl RpcServerFold {
         Self {
             handler,
             emit,
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            in_flight: Arc::new(DashMap::new()),
             metrics: None,
             #[cfg(test)]
             test_now_ns: None,
@@ -1431,7 +1432,7 @@ impl RpcServerFold {
     /// Test-only: snapshot of the in-flight call set.
     #[cfg(test)]
     pub fn in_flight_keys(&self) -> Vec<(u64, u64)> {
-        self.in_flight.lock().keys().copied().collect()
+        self.in_flight.iter().map(|e| *e.key()).collect()
     }
 
     fn now_ns(&self) -> u64 {
@@ -1540,9 +1541,7 @@ impl RedexFold<()> for RpcServerFold {
                 // CANCEL handling broken (CANCEL events look up
                 // the now-missing key and no-op). Cleaner to refuse.
                 {
-                    let in_flight = self.in_flight.lock();
-                    if in_flight.contains_key(&key) {
-                        drop(in_flight);
+                    if self.in_flight.contains_key(&key) {
                         tracing::warn!(
                             caller_origin = format!("{:#x}", meta.origin_hash),
                             call_id = meta.seq_or_ts,
@@ -1560,7 +1559,7 @@ impl RedexFold<()> for RpcServerFold {
                     }
                 }
                 let cancellation = RpcCancellationToken::new();
-                self.in_flight.lock().insert(key, cancellation.clone());
+                self.in_flight.insert(key, cancellation.clone());
                 let handler = self.handler.clone();
                 let emit = self.emit.clone();
                 let in_flight = self.in_flight.clone();
@@ -1583,11 +1582,6 @@ impl RedexFold<()> for RpcServerFold {
                 // override its response with `RpcStatus::Cancelled`.
                 let cancel_probe = cancellation.clone();
                 tokio::spawn(async move {
-                    // Server-side metrics: count this invocation;
-                    // bump in_flight; time the handler; tally
-                    // panics. Only fires when a metrics handle was
-                    // attached via `with_metrics(...)` — test-only
-                    // folds construct without one.
                     if let Some(m) = metrics.as_ref() {
                         m.handler_invocations_total
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1678,12 +1672,12 @@ impl RedexFold<()> for RpcServerFold {
                             }
                         }
                     };
-                    in_flight.lock().remove(&key);
+                    in_flight.remove(&key);
                     emit(caller_origin, call_id, resp);
                 });
             }
             DISPATCH_RPC_CANCEL => {
-                if let Some(token) = self.in_flight.lock().remove(&key) {
+                if let Some((_, token)) = self.in_flight.remove(&key) {
                     token.cancel();
                 }
                 // Idempotent — CANCEL for an unknown call_id (e.g.
@@ -2020,7 +2014,7 @@ type FlowControlMap = Arc<Mutex<HashMap<(u64, u64), Arc<tokio::sync::Semaphore>>
 pub struct RpcServerStreamingFold {
     handler: Arc<dyn RpcStreamingHandler>,
     emit: RpcAsyncResponseEmitter,
-    in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
+    in_flight: Arc<DashMap<(u64, u64), RpcCancellationToken>>,
     /// Per-call flow-control semaphore (when the caller opted in).
     /// `Some(sem)` means "pump must `acquire().await` one permit
     /// per chunk before emitting; STREAM_GRANT events
@@ -2049,7 +2043,7 @@ impl RpcServerStreamingFold {
         Self {
             handler,
             emit,
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            in_flight: Arc::new(DashMap::new()),
             flow_control: Arc::new(Mutex::new(HashMap::new())),
             metrics: None,
         }
@@ -2071,7 +2065,7 @@ impl RpcServerStreamingFold {
     /// Test-only: snapshot of the in-flight call set.
     #[cfg(test)]
     pub fn in_flight_keys(&self) -> Vec<(u64, u64)> {
-        self.in_flight.lock().keys().copied().collect()
+        self.in_flight.iter().map(|e| *e.key()).collect()
     }
 }
 
@@ -2136,9 +2130,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
                 // clean refusal rather than waiting on a stream
                 // that will never produce output.
                 {
-                    let in_flight = self.in_flight.lock();
-                    if in_flight.contains_key(&key) {
-                        drop(in_flight);
+                    if self.in_flight.contains_key(&key) {
                         tracing::warn!(
                             caller_origin = format!("{:#x}", meta.origin_hash),
                             call_id = meta.seq_or_ts,
@@ -2166,7 +2158,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
                 // Cancellation token + in-flight bookkeeping —
                 // identical to the unary fold's pattern.
                 let cancellation = RpcCancellationToken::new();
-                self.in_flight.lock().insert(key, cancellation.clone());
+                self.in_flight.insert(key, cancellation.clone());
                 // Flow-control opt-in: parse the
                 // `nrpc-stream-window-initial` header. When
                 // present, install a per-call semaphore the pump
@@ -2350,7 +2342,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
                             }
                         }
                     };
-                    in_flight.lock().remove(&key);
+                    in_flight.remove(&key);
                     // Drop the per-call flow-control semaphore
                     // (if any) so a stale GRANT arriving after
                     // termination is silently dropped — the entry
@@ -2365,7 +2357,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
                 });
             }
             DISPATCH_RPC_CANCEL => {
-                if let Some(token) = self.in_flight.lock().remove(&key) {
+                if let Some((_, token)) = self.in_flight.remove(&key) {
                     token.cancel();
                 }
                 // Also drop the flow-control entry — the spawned
@@ -2546,7 +2538,7 @@ pub struct RpcStreamingRequestFold {
     /// refill and stall once their initial window is exhausted —
     /// honest behavior for a fold not wired up for grants).
     grant_emit: Option<RpcRequestGrantEmitter>,
-    in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
+    in_flight: Arc<DashMap<(u64, u64), RpcCancellationToken>>,
     senders: RequestChunkSenders,
     /// Optional per-service metrics handle. Same shape as the
     /// other folds. Reuses the response-side counters where they
@@ -2569,7 +2561,7 @@ impl RpcStreamingRequestFold {
             handler,
             emit,
             grant_emit: None,
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            in_flight: Arc::new(DashMap::new()),
             senders: Arc::new(Mutex::new(HashMap::new())),
             metrics: None,
         }
@@ -2601,7 +2593,7 @@ impl RpcStreamingRequestFold {
     /// Test-only: snapshot of the in-flight call set.
     #[cfg(test)]
     pub fn in_flight_keys(&self) -> Vec<(u64, u64)> {
-        self.in_flight.lock().keys().copied().collect()
+        self.in_flight.iter().map(|e| *e.key()).collect()
     }
 
     /// Test-only: snapshot of the in-flight per-call senders.
@@ -2674,9 +2666,7 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                 // would overwrite the prior sender and orphan the
                 // existing handler.
                 {
-                    let in_flight = self.in_flight.lock();
-                    if in_flight.contains_key(&key) {
-                        drop(in_flight);
+                    if self.in_flight.contains_key(&key) {
                         tracing::warn!(
                             caller_origin = format!("{:#x}", meta.origin_hash),
                             call_id = meta.seq_or_ts,
@@ -2694,7 +2684,7 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                     }
                 }
                 let cancellation = RpcCancellationToken::new();
-                self.in_flight.lock().insert(key, cancellation.clone());
+                self.in_flight.insert(key, cancellation.clone());
                 // Build the per-call request-chunk mpsc. Bounded
                 // capacity — overflow on the sender side drops the
                 // chunk (caller can re-send or, if flow-control is
@@ -2877,7 +2867,7 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                             }
                         }
                     };
-                    in_flight.lock().remove(&key);
+                    in_flight.remove(&key);
                     // Drop the per-call request-chunk sender too
                     // (idempotent — already gone if REQUEST_END
                     // arrived; defensive otherwise so a handler
@@ -2896,7 +2886,7 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                 );
             }
             DISPATCH_RPC_CANCEL => {
-                if let Some(token) = self.in_flight.lock().remove(&key) {
+                if let Some((_, token)) = self.in_flight.remove(&key) {
                     token.cancel();
                 }
                 // Drop the per-call sender so the handler's
@@ -2951,7 +2941,7 @@ pub struct RpcDuplexFold {
     emit: RpcAsyncResponseEmitter,
     /// Optional request-direction grant emitter.
     grant_emit: Option<RpcRequestGrantEmitter>,
-    in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
+    in_flight: Arc<DashMap<(u64, u64), RpcCancellationToken>>,
     senders: RequestChunkSenders,
     metrics: Option<Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>>,
 }
@@ -2966,7 +2956,7 @@ impl RpcDuplexFold {
             handler,
             emit,
             grant_emit: None,
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            in_flight: Arc::new(DashMap::new()),
             senders: Arc::new(Mutex::new(HashMap::new())),
             metrics: None,
         }
@@ -2996,7 +2986,7 @@ impl RpcDuplexFold {
     /// Test-only: snapshot of the in-flight call set.
     #[cfg(test)]
     pub fn in_flight_keys(&self) -> Vec<(u64, u64)> {
-        self.in_flight.lock().keys().copied().collect()
+        self.in_flight.iter().map(|e| *e.key()).collect()
     }
 
     /// Test-only: snapshot of the in-flight per-call senders.
@@ -3081,9 +3071,7 @@ impl RedexFold<()> for RpcDuplexFold {
                 }
                 // Duplicate-REQUEST refusal.
                 {
-                    let in_flight = self.in_flight.lock();
-                    if in_flight.contains_key(&key) {
-                        drop(in_flight);
+                    if self.in_flight.contains_key(&key) {
                         tracing::warn!(
                             caller_origin = format!("{:#x}", meta.origin_hash),
                             call_id = meta.seq_or_ts,
@@ -3109,7 +3097,7 @@ impl RedexFold<()> for RpcDuplexFold {
                     }
                 }
                 let cancellation = RpcCancellationToken::new();
-                self.in_flight.lock().insert(key, cancellation.clone());
+                self.in_flight.insert(key, cancellation.clone());
 
                 // Build per-call request-side mpsc (Phase B
                 // pattern).
@@ -3310,7 +3298,7 @@ impl RedexFold<()> for RpcDuplexFold {
                             }
                         }
                     };
-                    in_flight.lock().remove(&key);
+                    in_flight.remove(&key);
                     senders.lock().remove(&key);
                     emit(caller_origin, call_id, terminal).await;
                 });
@@ -3324,7 +3312,7 @@ impl RedexFold<()> for RpcDuplexFold {
                 );
             }
             DISPATCH_RPC_CANCEL => {
-                if let Some(token) = self.in_flight.lock().remove(&key) {
+                if let Some((_, token)) = self.in_flight.remove(&key) {
                     token.cancel();
                 }
                 self.senders.lock().remove(&key);
