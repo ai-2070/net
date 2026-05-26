@@ -1,6 +1,6 @@
-# net-deck
+# NET Deck
 
-The operator **cyberdeck** — a terminal UI for the Net mesh.
+The operator **cyberdeck** — a terminal UI for the NET mesh.
 
 Live, streaming, low-latency visibility into MeshOS, MeshDB, RedEX, and Dataforts, with signed admin actions on top. Built with [ratatui](https://github.com/ratatui/ratatui) + crossterm. Matrix palette, neon-green on pitch black.
 
@@ -81,5 +81,3 @@ Saved cluster contexts live at `$XDG_CONFIG_HOME/deck/bookmarks.toml` (or the pl
 ## License
 
 Apache-2.0. See [`LICENSE`](../LICENSE).
-
-See the [main README](../../../../README.md) for the full Net surface.
