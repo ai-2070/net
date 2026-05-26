@@ -66,6 +66,16 @@ pub enum TagMatcher {
     /// safer than silently treating bad patterns as wildcards).
     /// Compiled per `matches_one` call; callers expecting heavy
     /// reuse should pre-filter via a coarser matcher first.
+    ///
+    /// **Feature-gated.** Requires the `regex` Cargo feature on the
+    /// receiving binary. The variant is part of the wire format
+    /// unconditionally (so peers can exchange it), but a binary built
+    /// without `regex` cannot evaluate it. Callers that accept
+    /// user-supplied matchers should call [`TagMatcher::validate`]
+    /// first to surface [`TagMatcherError::RegexNotBuiltIn`]
+    /// explicitly; passing an unvalidated `Regex` matcher into
+    /// [`Fold::aggregate`] / [`Fold::capacity_ranking`] on a
+    /// regex-less binary panics with a build-time-config message.
     Regex {
         /// Regular-expression pattern to match against the tag.
         pattern: String,
@@ -89,22 +99,101 @@ pub enum TagMatcher {
     },
 }
 
+/// Error surfaced when a [`TagMatcher`] variant can't be evaluated
+/// by the current binary because the gating Cargo feature wasn't
+/// compiled in.
+///
+/// Today the only variant is [`TagMatcherError::RegexNotBuiltIn`].
+/// More variants may land if other matchers gain feature gates
+/// (e.g. a future ML-tag-classifier matcher behind `--features
+/// classify`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagMatcherError {
+    /// A [`TagMatcher::Regex`] was used, but the receiving binary
+    /// was built without `--features regex`. Carries the offending
+    /// pattern so the caller can surface it in the error message.
+    RegexNotBuiltIn {
+        /// The regex pattern the caller attempted to evaluate.
+        pattern: String,
+    },
+}
+
+impl std::fmt::Display for TagMatcherError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RegexNotBuiltIn { pattern } => write!(
+                f,
+                "TagMatcher::Regex {{ pattern: {pattern:?} }} requires the \
+                 `regex` Cargo feature; this binary was built without it. \
+                 Rebuild with `--features regex` or use a different matcher \
+                 (Exact / Prefix / Axis / AxisKey / VersionRange).",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TagMatcherError {}
+
 impl TagMatcher {
+    /// Verify this matcher can be evaluated by the current binary's
+    /// feature set. Callers that accept user-supplied matchers
+    /// (RPC handlers, language-binding constructors, CLI parsers)
+    /// should call this BEFORE handing the matcher to
+    /// [`Fold::aggregate`] / [`Fold::capacity_ranking`] so an
+    /// unsupported variant surfaces as a structured error instead
+    /// of a panic on first compile.
+    ///
+    /// Returns `Ok(())` for every variant the build supports.
+    /// Returns `Err(TagMatcherError::RegexNotBuiltIn { .. })` only
+    /// when the matcher is [`Self::Regex`] and the binary was built
+    /// without `--features regex`.
+    pub fn validate(&self) -> Result<(), TagMatcherError> {
+        match self {
+            #[cfg(not(feature = "regex"))]
+            Self::Regex { pattern } => Err(TagMatcherError::RegexNotBuiltIn {
+                pattern: pattern.clone(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
     /// Build a [`CompiledMatcher`] that pre-resolves expensive
     /// per-call work (regex compile, semver bound parse, axis-key
     /// split). Used at the top of [`Fold::aggregate`] and
     /// [`Fold::capacity_ranking`] so the per-entry walk amortizes
     /// the parse cost over every tag instead of paying it on each
     /// `matches_one` invocation.
+    ///
+    /// **Panics** if `self` is [`Self::Regex`] and the binary was
+    /// built without the `regex` Cargo feature. Callers that accept
+    /// user-supplied matchers should [`Self::validate`] first so
+    /// the build-time-config mismatch surfaces as a structured
+    /// `TagMatcherError` instead of a panic.
     fn compile(&self) -> CompiledMatcher<'_> {
         match self {
             Self::Exact { value } => CompiledMatcher::Exact { value },
             Self::Prefix { value } => CompiledMatcher::Prefix { value },
             Self::Axis { axis } => CompiledMatcher::Axis { axis: *axis },
             Self::AxisKey { axis, key } => CompiledMatcher::AxisKey { axis: *axis, key },
+            #[cfg(feature = "regex")]
             Self::Regex { pattern } => CompiledMatcher::Regex {
                 re: regex::Regex::new(pattern).ok(),
             },
+            // Feature-disabled receivers panic loudly so the
+            // build-time misconfiguration surfaces at first use.
+            // Operators get a clear "rebuild with --features regex"
+            // message instead of silent empty results that look
+            // indistinguishable from "no entries match." Callers
+            // accepting user-supplied matchers should
+            // `TagMatcher::validate(&matcher)?` ahead of this site
+            // to get a structured `TagMatcherError` instead.
+            #[cfg(not(feature = "regex"))]
+            Self::Regex { pattern } => panic!(
+                "{}",
+                TagMatcherError::RegexNotBuiltIn {
+                    pattern: pattern.clone(),
+                }
+            ),
             Self::VersionRange { axis_key, min, max } => match split_axis_key(axis_key) {
                 Some((axis, key)) => CompiledMatcher::VersionRange {
                     axis,
@@ -142,6 +231,7 @@ enum CompiledMatcher<'a> {
         axis: TaxonomyAxis,
         key: &'a str,
     },
+    #[cfg(feature = "regex")]
     Regex {
         re: Option<regex::Regex>,
     },
@@ -176,6 +266,7 @@ impl CompiledMatcher<'_> {
                 .ok()
                 .and_then(|t| t.axis_key())
                 .is_some_and(|k| k.axis == *axis && k.key == *key),
+            #[cfg(feature = "regex")]
             Self::Regex { re } => re.as_ref().is_some_and(|r| r.is_match(raw)),
             Self::VersionRange {
                 axis,
@@ -1483,6 +1574,7 @@ mod tests {
 
     // ── 6c-C: TagMatcher::Regex ────────────────────────────────
 
+    #[cfg(feature = "regex")]
     #[test]
     fn matcher_regex_matches_pattern_against_canonical_form() {
         let fold = populated_fold();
@@ -1500,6 +1592,7 @@ mod tests {
         assert_eq!(rows.len(), 3);
     }
 
+    #[cfg(feature = "regex")]
     #[test]
     fn matcher_regex_with_invalid_pattern_matches_nothing() {
         let fold = populated_fold();
@@ -1512,6 +1605,39 @@ mod tests {
             Aggregation::Count,
         );
         assert!(rows.is_empty(), "invalid regex must reject everything");
+    }
+
+    #[cfg(not(feature = "regex"))]
+    #[test]
+    fn matcher_regex_without_feature_validate_returns_explicit_error() {
+        let matcher = TagMatcher::Regex {
+            pattern: r"^hardware\.gpu".into(),
+        };
+        let err = matcher
+            .validate()
+            .expect_err("validate must surface RegexNotBuiltIn without the regex feature");
+        match err {
+            TagMatcherError::RegexNotBuiltIn { pattern } => {
+                assert_eq!(pattern, r"^hardware\.gpu");
+            }
+        }
+    }
+
+    #[cfg(not(feature = "regex"))]
+    #[test]
+    #[should_panic(expected = "requires the `regex` Cargo feature")]
+    fn matcher_regex_without_feature_aggregate_panics_with_actionable_message() {
+        let fold = populated_fold();
+        // Caller skipped `validate()` — `aggregate` must surface the
+        // build-time misconfiguration as a panic rather than a silent
+        // empty result.
+        let _ = fold.aggregate(
+            Some(TagMatcher::Regex {
+                pattern: r"^hardware\.gpu".into(),
+            }),
+            GroupBy::Publisher,
+            Aggregation::Count,
+        );
     }
 
     // ── 6c-C: TagMatcher::VersionRange ─────────────────────────

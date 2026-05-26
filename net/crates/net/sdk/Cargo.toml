@@ -1,6 +1,6 @@
 [package]
 name = "net-mesh-sdk"
-version = "0.23.0"
+version = "0.24.0"
 edition = "2021"
 description = "Ergonomic Rust SDK for the Net mesh network"
 license = "Apache-2.0"
@@ -22,7 +22,7 @@ name = "net_sdk"
 [dependencies]
 # `version` is required for `cargo publish` to resolve the dep on
 # crates.io; the `path` is preferred during local workspace builds.
-net = { package = "net-mesh", version = "0.23.0", path = "..", features = [] }
+net = { package = "net-mesh", version = "0.24.0", path = "..", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"

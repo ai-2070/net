@@ -1083,7 +1083,10 @@ pub struct SafetyEnforcer {
     kill_switch_at: RwLock<Option<Instant>>,
     /// Kill switch reason
     kill_switch_reason: RwLock<Option<String>>,
-    /// Compiled content patterns (for hot path)
+    /// Compiled content patterns (for hot path). Gated behind the
+    /// `regex` feature so consumers who don't ship pattern-matching
+    /// safety predicates skip the regex crate.
+    #[cfg(feature = "regex")]
     #[allow(dead_code)]
     compiled_patterns: RwLock<Vec<(String, regex::Regex)>>,
 }
@@ -1107,6 +1110,7 @@ impl SafetyEnforcer {
             kill_switch: AtomicBool::new(kill_switch),
             kill_switch_at: RwLock::new(None),
             kill_switch_reason: RwLock::new(None),
+            #[cfg(feature = "regex")]
             compiled_patterns: RwLock::new(Vec::new()),
         }
     }
