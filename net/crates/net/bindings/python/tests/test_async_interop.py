@@ -214,11 +214,19 @@ def test_wait_for_timeout_propagates_to_substrate_cancel(mesh_pair) -> None:
       (proves the substrate cancel reached the handler coroutine
       via the cancel-token notify path).
     """
+    import threading
+
     from net import RpcCancelledError, RpcError  # noqa: F401
 
     a, b = mesh_pair
 
-    handler_was_cancelled = asyncio.Event()
+    # `threading.Event`, not `asyncio.Event`: the handler runs on the
+    # dispatcher loop's thread, the assertion awaits on the outer
+    # `asyncio.run` loop. `asyncio.Event.set()` from a foreign loop's
+    # thread calls `fut.set_result()` → `loop.call_soon()` against
+    # the wrong loop and doesn't wake the parked waiter, so the
+    # signal would race-lose even when cancel did propagate.
+    handler_was_cancelled = threading.Event()
 
     async def _slow_handler(req: bytes) -> bytes:
         try:
@@ -250,12 +258,13 @@ def test_wait_for_timeout_propagates_to_substrate_cancel(mesh_pair) -> None:
             # The handler-side CancelledError fires as soon as the
             # tokio cancel-watcher trips the substrate's cancel
             # registry; that latency is sub-millisecond in steady
-            # state but allow a generous bound for CI.
-            try:
-                await asyncio.wait_for(
-                    handler_was_cancelled.wait(), timeout=1.0
-                )
-            except asyncio.TimeoutError:
+            # state but allow a generous bound for CI. `to_thread`
+            # bridges the blocking `threading.Event.wait` onto the
+            # outer loop without blocking it.
+            got_cancel = await asyncio.to_thread(
+                handler_was_cancelled.wait, 1.0
+            )
+            if not got_cancel:
                 pytest.fail(
                     "handler never observed CancelledError — "
                     "asyncio cancel did not propagate to substrate"
