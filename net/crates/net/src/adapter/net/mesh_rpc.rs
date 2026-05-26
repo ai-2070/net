@@ -1903,8 +1903,7 @@ impl MeshNode {
                 // to the roster lookup instead of trying to send to
                 // node 0.
                 if inbound.from_node != 0 {
-                    origin_node_cache_for_bridge
-                        .insert(inbound.origin_hash, inbound.from_node);
+                    origin_node_cache_for_bridge.insert(inbound.origin_hash, inbound.from_node);
                 }
                 // Defense-in-depth check. Skip only when the wire
                 // session resolved no NodeId (`from_node == 0` is
@@ -2094,8 +2093,7 @@ impl MeshNode {
         let bridge = tokio::spawn(async move {
             while let Some(inbound) = rx.recv().await {
                 if inbound.from_node != 0 {
-                    origin_node_cache_for_bridge
-                        .insert(inbound.origin_hash, inbound.from_node);
+                    origin_node_cache_for_bridge.insert(inbound.origin_hash, inbound.from_node);
                 }
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
@@ -2221,8 +2219,7 @@ impl MeshNode {
         let bridge = tokio::spawn(async move {
             while let Some(inbound) = rx.recv().await {
                 if inbound.from_node != 0 {
-                    origin_node_cache_for_bridge
-                        .insert(inbound.origin_hash, inbound.from_node);
+                    origin_node_cache_for_bridge.insert(inbound.origin_hash, inbound.from_node);
                 }
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
@@ -2457,8 +2454,7 @@ impl MeshNode {
         let bridge = tokio::spawn(async move {
             while let Some(inbound) = rx.recv().await {
                 if inbound.from_node != 0 {
-                    origin_node_cache_for_bridge
-                        .insert(inbound.origin_hash, inbound.from_node);
+                    origin_node_cache_for_bridge.insert(inbound.origin_hash, inbound.from_node);
                 }
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
