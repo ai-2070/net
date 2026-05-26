@@ -28,6 +28,7 @@
 //! └─────────────────────────────────────────────┘
 //! ```
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -70,6 +71,31 @@ use super::protocol::{self, EventFrame, PacketFlags, HEADER_SIZE, MAGIC, TAG_SIZ
 /// `on_bytes_consumed` adds the same overhead, keeping sender and
 /// receiver in lockstep.
 const PACKET_WIRE_OVERHEAD: usize = HEADER_SIZE + TAG_SIZE;
+
+/// Drainer wake interval for the pending-stream-grants queue. The
+/// receive path enqueues `(peer_node_id, stream_id) → total_consumed`
+/// on every accepted packet and notifies the drainer; the drainer
+/// also self-wakes on this interval as a safety net so a single
+/// inbound packet whose Notify fires during a contention race still
+/// gets emitted within bounded time. Grants are authoritative —
+/// every emission carries the receiver's full `total_consumed` —
+/// so the slight delay between enqueue and emission only affects
+/// freshness, not correctness. 1 ms keeps the worst-case
+/// backpressure-clearing latency well under the SDK's
+/// `send_with_retry` initial 5 ms backoff. See T1.1 in
+/// `PERF_AUDIT_2026_05_19_NRPC.md`.
+const STREAM_GRANT_DRAIN_INTERVAL: Duration = Duration::from_millis(1);
+
+/// One entry in the per-mesh pending-grant queue. Captures the
+/// AEAD session (for cipher + packet pool + next_control_tx_seq)
+/// and the peer's wire address. The receive path already has both
+/// resolved, so the drainer doesn't need to redo the peer lookup.
+#[derive(Clone)]
+struct PendingStreamGrant {
+    session: Arc<NetSession>,
+    peer_addr: SocketAddr,
+    total_consumed: u64,
+}
 
 /// Total wire bytes for a single Net packet carrying `payload_bytes`
 /// of AEAD-encrypted content. Saturating at `u32::MAX` so a
@@ -431,6 +457,12 @@ struct DispatchCtx {
     proximity_graph: Arc<ProximityGraph>,
     /// Partition filter — packets from blocked addresses are dropped.
     partition_filter: PartitionFilter,
+    /// Pending StreamWindow grants enqueue by the receive path,
+    /// drained by `MeshNode::spawn_stream_grant_drainer_loop`. T1.1
+    /// from `PERF_AUDIT_2026_05_19_NRPC.md`.
+    pending_stream_grants: Arc<parking_lot::Mutex<HashMap<(u64, u64), PendingStreamGrant>>>,
+    /// Wakes the grant drainer on enqueue.
+    pending_stream_grants_notify: Arc<Notify>,
     /// Settings for sessions we create during inbound dispatch (relayed
     /// handshake responder completes here).
     packet_pool_size: usize,
@@ -1754,6 +1786,21 @@ pub struct MeshNode {
     shutdown: Arc<AtomicBool>,
     /// Shutdown notifier
     shutdown_notify: Arc<Notify>,
+    /// Pending StreamWindow grants awaiting emission, keyed by
+    /// `(session_id, stream_id)`. The receive path inserts the
+    /// latest `total_consumed` here per accepted packet; the
+    /// per-mesh drainer task ([`Self::spawn_stream_grant_drainer_loop`])
+    /// pops the map and emits one wire grant per unique key. Latest-
+    /// wins overwrite semantics make this safe — grants are
+    /// authoritative (each carries the full `total_consumed`) so
+    /// a later push subsumes any pending earlier one for the same
+    /// stream. T1.1 from `PERF_AUDIT_2026_05_19_NRPC.md`.
+    pending_stream_grants: Arc<parking_lot::Mutex<HashMap<(u64, u64), PendingStreamGrant>>>,
+    /// Wakes the drainer task whenever a new pending grant lands.
+    /// The drainer also self-wakes on a short interval timer so a
+    /// missed notify (e.g. the drainer was already iterating when
+    /// the notify fired) still flushes within bounded time.
+    pending_stream_grants_notify: Arc<Notify>,
     /// Whether the node has been started
     started: AtomicBool,
     /// Number of `accept()` calls currently awaiting
@@ -2099,6 +2146,8 @@ impl MeshNode {
             tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
+            pending_stream_grants: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            pending_stream_grants_notify: Arc::new(Notify::new()),
             started: AtomicBool::new(false),
             accept_in_flight: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -2602,6 +2651,7 @@ impl MeshNode {
 
         let recv_handle = self.spawn_receive_loop();
         let heartbeat_handle = self.spawn_heartbeat_loop();
+        let stream_grant_drainer_handle = self.spawn_stream_grant_drainer_loop();
         let router_handle = match self.router.start() {
             Some(h) => h,
             None => {
@@ -2680,6 +2730,7 @@ impl MeshNode {
             let mut tasks = tasks.lock().await;
             tasks.push(recv_handle);
             tasks.push(heartbeat_handle);
+            tasks.push(stream_grant_drainer_handle);
             tasks.push(router_handle);
             tasks.push(capability_gc_handle);
             tasks.push(fold_generation_gc_handle);
@@ -2989,6 +3040,8 @@ impl MeshNode {
             socket: self.socket.clone(),
             proximity_graph: self.proximity_graph.clone(),
             partition_filter: self.partition_filter.clone(),
+            pending_stream_grants: self.pending_stream_grants.clone(),
+            pending_stream_grants_notify: self.pending_stream_grants_notify.clone(),
             packet_pool_size: self.config.packet_pool_size,
             default_reliable: self.config.default_reliable,
             session_timeout: self.config.session_timeout,
@@ -4358,28 +4411,7 @@ impl MeshNode {
             let accepted = stream.with_reliability(|r| r.on_receive(parsed.header.sequence));
             if accepted {
                 stream.update_rx_seq(parsed.header.sequence);
-                // Always bump receive-side accounting (granted and
-                // consumed bump together via on_bytes_consumed). The
-                // Option<u64> return value is intentionally ignored
-                // — the actual wire-grant emit decision goes through
-                // `take_pending_grant` below so grants coalesce
-                // across packets instead of firing one per inbound
-                // packet (which burned a tokio::spawn + AEAD encrypt
-                // + sendto per packet even on short unary RPC).
-                stream.on_bytes_consumed(payload_bytes);
-                // Coalesce: emit a wire grant only once half the
-                // sender's TX window has been consumed since the
-                // last grant. Grants are authoritative — each one
-                // carries the receiver's full `total_consumed` —
-                // so one delayed grant subsumes every grant the
-                // pre-coalesce path would have emitted for the
-                // bytes between them. Half-window keeps the sender's
-                // credit well above zero between grants, so a
-                // continuous high-rate sender never stalls waiting
-                // for replenishment. See T1.1 in
-                // `PERF_AUDIT_2026_05_19_NRPC.md`.
-                let threshold = (stream.tx_window() as u64) / 2;
-                stream.take_pending_grant(threshold)
+                stream.on_bytes_consumed(payload_bytes)
             } else {
                 None
             }
@@ -4417,13 +4449,29 @@ impl MeshNode {
                         .map(|e| (e.value().addr, e.value().session.clone()))
                 });
             if let Some((peer_addr, peer_session)) = peer {
-                Self::spawn_stream_window_grant(
-                    ctx,
-                    peer_session,
-                    peer_addr,
-                    stream_id,
-                    total_consumed,
-                );
+                if !ctx.partition_filter.contains(&peer_addr) {
+                    // Enqueue for the per-mesh drainer
+                    // (`spawn_stream_grant_drainer_loop`). Same-key
+                    // overwrites — the latest `total_consumed` wins
+                    // because grants are authoritative. Single
+                    // `Notify::notify_one` after the insert wakes
+                    // the drainer if it's currently sleeping;
+                    // sticky-permit semantics make a wake during an
+                    // in-flight drain safe (drainer will see the
+                    // new entry on its next cycle).
+                    {
+                        let mut guard = ctx.pending_stream_grants.lock();
+                        guard.insert(
+                            (peer_session.session_id(), stream_id),
+                            PendingStreamGrant {
+                                session: peer_session,
+                                peer_addr,
+                                total_consumed,
+                            },
+                        );
+                    }
+                    ctx.pending_stream_grants_notify.notify_one();
+                }
             }
         }
 
@@ -4639,58 +4687,86 @@ impl MeshNode {
         }
     }
 
-    /// Emit a `StreamWindow` credit grant back to `peer_addr` on the
-    /// existing encrypted session. Fire-and-forget — grants are
-    /// **authoritative**, so a lost grant is reconciled by the next
-    /// one that successfully arrives (each carries the receiver's
-    /// full `total_consumed` picture).
-    ///
-    /// The grant packet rides on the sentinel [`CONTROL_STREAM_ID`]
-    /// (`u64::MAX`) with a sequence drawn from
-    /// `NetSession::next_control_tx_seq`. This is a dedicated
-    /// session-level counter that cannot collide with user stream
-    /// state — a caller who opens a stream numerically equal to
-    /// `SUBPROTOCOL_STREAM_WINDOW` (0x0B00) won't see their
-    /// sequence space polluted by control traffic.
-    fn spawn_stream_window_grant(
-        ctx: &DispatchCtx,
-        session: Arc<NetSession>,
-        peer_addr: SocketAddr,
-        stream_id: u64,
-        total_consumed: u64,
-    ) {
-        if ctx.partition_filter.contains(&peer_addr) {
-            return;
-        }
-        let socket = ctx.socket.clone();
+    /// Drain the per-mesh pending-grant queue and emit one wire
+    /// `StreamWindow` packet per unique `(session_id, stream_id)`
+    /// entry. Replaces the pre-T1.1-v2 per-packet
+    /// `tokio::spawn(spawn_stream_window_grant(...))` — under load
+    /// that burned one spawn + AEAD encrypt + `sendto` per accepted
+    /// inbound packet (`PERF_AUDIT_2026_05_19_NRPC.md` T1.1). The
+    /// drainer wakes on either `pending_stream_grants_notify` or
+    /// the `STREAM_GRANT_DRAIN_INTERVAL` self-wake timer, swaps the
+    /// queue, and emits grants serially. Authoritative-grant
+    /// semantics mean a single emission per stream subsumes any
+    /// pending earlier values for that stream; the receive path's
+    /// latest-wins overwrite delivers the freshest `total_consumed`
+    /// the drainer needs.
+    fn spawn_stream_grant_drainer_loop(&self) -> JoinHandle<()> {
+        let socket = self.socket.clone();
+        let partition_filter = self.partition_filter.clone();
+        let pending = self.pending_stream_grants.clone();
+        let notify = self.pending_stream_grants_notify.clone();
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+
         tokio::spawn(async move {
-            let payload = StreamWindow {
-                stream_id,
-                total_consumed,
+            while !shutdown.load(Ordering::Acquire) {
+                // Wait for either a fresh enqueue or the drain
+                // interval, whichever fires first. The interval
+                // wake is a safety net for the case where a Notify
+                // signal raced ahead of the enqueue itself (Notify
+                // has sticky-permits semantics, so a `notify_one`
+                // followed by another `notify_one` before any
+                // `.notified()` await collapses to a single wake —
+                // a borderline-pathological case but worth covering
+                // since the cost is just a 1 ms sleep).
+                tokio::select! {
+                    _ = notify.notified() => {}
+                    _ = tokio::time::sleep(STREAM_GRANT_DRAIN_INTERVAL) => {}
+                    _ = shutdown_notify.notified() => {
+                        if shutdown.load(Ordering::Acquire) {
+                            break;
+                        }
+                    }
+                }
+
+                // Swap the pending map out under a brief lock. New
+                // enqueues after the swap go into a fresh empty
+                // map; the next drainer cycle picks them up.
+                let drained = std::mem::take(&mut *pending.lock());
+                if drained.is_empty() {
+                    continue;
+                }
+
+                for ((_, stream_id), grant) in drained {
+                    if partition_filter.contains(&grant.peer_addr) {
+                        continue;
+                    }
+                    let payload = StreamWindow {
+                        stream_id,
+                        total_consumed: grant.total_consumed,
+                    }
+                    .encode();
+                    let pool = grant.session.thread_local_pool();
+                    let mut builder = pool.get();
+                    let seq = grant.session.next_control_tx_seq();
+                    let events = vec![Bytes::copy_from_slice(&payload)];
+                    let packet = builder.build_subprotocol(
+                        CONTROL_STREAM_ID,
+                        seq,
+                        &events,
+                        PacketFlags::NONE,
+                        SUBPROTOCOL_STREAM_WINDOW,
+                    );
+                    if let Err(e) = socket.send_to(&packet, grant.peer_addr).await {
+                        tracing::debug!(error = %e, "StreamWindow grant send failed");
+                        continue;
+                    }
+                    if let Some(state) = grant.session.try_stream(stream_id) {
+                        state.note_grant_sent();
+                    }
+                }
             }
-            .encode();
-            let pool = session.thread_local_pool();
-            let mut builder = pool.get();
-            let seq = session.next_control_tx_seq();
-            let events = vec![Bytes::copy_from_slice(&payload)];
-            let packet = builder.build_subprotocol(
-                CONTROL_STREAM_ID,
-                seq,
-                &events,
-                PacketFlags::NONE,
-                SUBPROTOCOL_STREAM_WINDOW,
-            );
-            if let Err(e) = socket.send_to(&packet, peer_addr).await {
-                tracing::debug!(error = %e, "StreamWindow grant send failed");
-                return;
-            }
-            // Grant reached the wire — count it on the emitting
-            // stream so the receiver side of stats reflects
-            // cumulative grants sent.
-            if let Some(state) = session.try_stream(stream_id) {
-                state.note_grant_sent();
-            }
-        });
+        })
     }
 
     /// Spawn heartbeat sender for all peers.

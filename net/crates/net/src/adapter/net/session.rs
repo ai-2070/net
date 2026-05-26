@@ -943,17 +943,6 @@ pub struct RxCreditState {
     /// — see [`Self::on_bytes_consumed`]. `0` disables emission
     /// (the v1 unbounded escape hatch).
     window_bytes: u32,
-    /// Value of `consumed` when the last wire grant was claimed.
-    /// Consulted by [`Self::take_pending_grant`] to coalesce grant
-    /// packets across multiple receives. The wire grant cadence used
-    /// to be one per inbound packet, which burned a `tokio::spawn` +
-    /// AEAD encrypt + `sendto` per packet even for short unary RPC
-    /// where the sender's window stays nearly full — see T1.1 in
-    /// `PERF_AUDIT_2026_05_19_NRPC.md`. Grants are *authoritative*
-    /// (each carries the receiver's full `total_consumed`), so
-    /// coalescing is safe: one delayed grant subsumes every grant
-    /// the receiver would have sent for the bytes between them.
-    last_grant_at: AtomicU64,
 }
 
 impl RxCreditState {
@@ -966,7 +955,6 @@ impl RxCreditState {
             granted: AtomicU64::new(window_bytes as u64),
             consumed: AtomicU64::new(0),
             window_bytes,
-            last_grant_at: AtomicU64::new(0),
         }
     }
 
@@ -1050,44 +1038,6 @@ impl RxCreditState {
         self.granted.fetch_add(bytes, Ordering::AcqRel);
         let new_consumed = self.consumed.fetch_add(bytes, Ordering::AcqRel) + bytes;
         Some(new_consumed)
-    }
-
-    /// Attempt to claim the right to emit a wire `StreamWindow`
-    /// grant. Returns `Some(consumed)` — the cumulative consumed
-    /// count to advertise as `total_consumed` in the grant packet
-    /// — when at least `threshold` bytes have been consumed since
-    /// the last claimed grant. Returns `None` when below threshold
-    /// or when another caller raced ahead and won the CAS.
-    ///
-    /// Coalesces wire grants without breaking sender flow control:
-    /// each grant is authoritative (carries the full
-    /// `total_consumed`), so one delayed grant subsumes every grant
-    /// that would have fired for the bytes between them. As long
-    /// as `threshold` is less than the sender's TX window, the
-    /// sender never exhausts credit before a grant arrives — the
-    /// receiver consumes up to `threshold` bytes' worth of credit
-    /// before emitting, refilling the sender's view in one shot.
-    ///
-    /// Returns `None` when `window_bytes == 0` (receive-side
-    /// bookkeeping disabled — the v1 unbounded escape hatch).
-    ///
-    /// CAS-protected so two threads concurrently processing receives
-    /// on the same stream can't both fire grants for the same
-    /// consumed-byte window. The losing CAS thread leaves the next
-    /// over-threshold receive to claim.
-    pub fn take_pending_grant(&self, threshold: u64) -> Option<u64> {
-        if self.window_bytes == 0 {
-            return None;
-        }
-        let consumed = self.consumed.load(Ordering::Acquire);
-        let last = self.last_grant_at.load(Ordering::Acquire);
-        if consumed.saturating_sub(last) < threshold {
-            return None;
-        }
-        self.last_grant_at
-            .compare_exchange(last, consumed, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| consumed)
     }
 }
 
@@ -1397,15 +1347,6 @@ impl StreamState {
     /// when receive-side bookkeeping is disabled (`window_bytes == 0`).
     pub fn on_bytes_consumed(&self, bytes: u64) -> Option<u64> {
         self.rx_credit.on_bytes_consumed(bytes)
-    }
-
-    /// See [`RxCreditState::take_pending_grant`]. Returns the
-    /// cumulative `consumed` to advertise in a wire grant packet
-    /// when at least `threshold` bytes have been consumed since
-    /// the last claimed grant, or `None` otherwise.
-    #[inline]
-    pub fn take_pending_grant(&self, threshold: u64) -> Option<u64> {
-        self.rx_credit.take_pending_grant(threshold)
     }
 
     /// Increment the "grants emitted" counter. Called after a grant
