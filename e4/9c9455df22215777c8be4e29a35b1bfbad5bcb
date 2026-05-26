@@ -1,0 +1,67 @@
+net/crates/net/bindings/go/meshdb-ffi/Cargo.toml
+  s_099fa7d871e34d::t_41060d15bff7eb 3,29
+net/crates/net/sdk/Cargo.toml
+  s_099fa7d871e34d::t_41060d15bff7eb 3,25
+net/crates/net/bindings/node/Cargo.toml
+  s_099fa7d871e34d::t_41060d15bff7eb 3,130-131
+net/crates/net/cli/python/pyproject.toml
+  s_099fa7d871e34d::t_41060d15bff7eb 12
+net/crates/net/bindings/go/rpc-ffi/Cargo.toml
+  s_099fa7d871e34d::t_41060d15bff7eb 3,30
+net/crates/net/sdk-ts/package.json
+  s_099fa7d871e34d::t_41060d15bff7eb 3,32
+net/crates/net/deck/src/widgets/status_bar.rs
+  s_099fa7d871e34d::t_134d64070b9565 120
+net/crates/net/aggregator-daemon/Cargo.toml
+  s_099fa7d871e34d::t_41060d15bff7eb 3,21,28
+net/crates/net/cli/npm/package.json
+  s_099fa7d871e34d::t_41060d15bff7eb 3,30-37
+net/crates/net/deck/Cargo.toml
+  s_099fa7d871e34d::t_41060d15bff7eb 3,19
+net/crates/net/bindings/go/deck-ffi/Cargo.toml
+  s_099fa7d871e34d::t_41060d15bff7eb 3,27
+net/crates/net/fuzz/Cargo.toml
+  s_099fa7d871e34d::t_41060d15bff7eb 34
+net/crates/net/bindings/go/meshos-ffi/Cargo.toml
+  s_099fa7d871e34d::t_41060d15bff7eb 3,26
+net/crates/net/sdk-py/pyproject.toml
+  s_099fa7d871e34d::t_41060d15bff7eb 10,14
+net/crates/net/deck/src/app.rs
+  s_099fa7d871e34d::t_41060d15bff7eb 1111,1254
+net/crates/net/bindings/python/Cargo.toml
+  s_099fa7d871e34d::t_41060d15bff7eb 3,112-113
+net/crates/net/deck/npm/package.json
+  s_099fa7d871e34d::t_41060d15bff7eb 3,30-37
+net/crates/net/bindings/node/package.json
+  s_099fa7d871e34d::t_41060d15bff7eb 3
+net/crates/net/bindings/python/python/net/__init__.py
+  s_099fa7d871e34d::t_41060d15bff7eb 721
+net/crates/net/Cargo.toml
+  s_099fa7d871e34d::t_41060d15bff7eb 19
+net/crates/net/bindings/go/compute-ffi/Cargo.toml
+  s_099fa7d871e34d::t_41060d15bff7eb 3,48,52
+net/crates/net/sdk-py/src/net_sdk/__init__.py
+  s_099fa7d871e34d::t_41060d15bff7eb 208
+net/crates/net/cli/Cargo.toml
+  s_099fa7d871e34d::t_41060d15bff7eb 3,15
+net/crates/net/bindings/python/pyproject.toml
+  s_099fa7d871e34d::t_41060d15bff7eb 10
+net/crates/net/deck/python/pyproject.toml
+  s_099fa7d871e34d::t_41060d15bff7eb 11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "e49c9455df22215777c8be4e29a35b1bfbad5bcb",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
