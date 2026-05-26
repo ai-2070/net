@@ -781,9 +781,9 @@ impl Adapter for JetStreamAdapter {
 /// Enumerates the retryable kinds explicitly rather than treating
 /// every error other than `WrongLastSequence` as retryable. The
 /// permissive default amplified misconfiguration into infinite
-/// retry storms — `StreamNotFound` and the `WrongLast*` variants
-/// are structural problems that do not become recoverable on
-/// retry.
+/// retry storms — `StreamNotFound`, the `WrongLast*` variants,
+/// and `MaxPayloadExceeded` are structural problems that do not
+/// become recoverable on retry.
 ///
 /// `PublishErrorKind::Other` is async-nats's catch-all for any
 /// error variant that doesn't have a dedicated arm — auth
@@ -804,11 +804,13 @@ fn is_transient_error(e: &async_nats::jetstream::context::PublishError) -> bool 
         PublishErrorKind::TimedOut
         | PublishErrorKind::BrokenPipe
         | PublishErrorKind::MaxAckPending => true,
-        // Structural failures: missing stream and optimistic-concurrency
-        // mismatches don't fix themselves under retry.
+        // Structural failures: missing stream, optimistic-concurrency
+        // mismatches, and oversized payloads don't fix themselves under
+        // retry.
         PublishErrorKind::StreamNotFound
         | PublishErrorKind::WrongLastMessageId
-        | PublishErrorKind::WrongLastSequence => false,
+        | PublishErrorKind::WrongLastSequence
+        | PublishErrorKind::MaxPayloadExceeded => false,
         // Catch-all variant — log so the underlying cause is
         // visible, then treat as fatal.
         PublishErrorKind::Other => {
