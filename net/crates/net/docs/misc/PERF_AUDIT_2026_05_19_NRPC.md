@@ -144,6 +144,23 @@ Three cost categories dominate the per-call overhead:
   surprising (though not impossible) if a unary REQUEST/RESPONSE rides
   through it. **This is the single biggest claimed win and the most
   surprising — verify before implementing.**
+- **Status:** **landed** — confirmed via `session.rs::on_bytes_consumed`
+  (returns `Some(_)` unconditionally for every accepted packet) +
+  the 2026-05-26 flame graph. Lands as a **per-mesh drainer task**
+  (commit `b70e10290`), not the threshold-coalesce originally
+  proposed: an initial threshold attempt (commit `c38f01f53`)
+  deadlocked any sender whose `tx_window` was smaller than the
+  receiver's coalesce threshold — the receive-side stream auto-
+  creates with `DEFAULT_STREAM_WINDOW_BYTES = 64 KiB` regardless
+  of the sender's config (see `sdk/tests/mesh_stream_backpressure.rs`
+  failure under the threshold approach). The drainer decouples the
+  emission decision from the receive path: every accepted packet
+  inserts `(session_id, stream_id) → PendingStreamGrant` under a
+  brief mutex; a single per-mesh task wakes on `Notify` or a 1 ms
+  safety-net timer and emits one wire grant per unique key with
+  the latest `total_consumed` (authoritative-grant semantics make
+  the latest-wins overwrite safe). See `spawn_stream_grant_drainer_loop`
+  + the `STREAM_GRANT_DRAIN_INTERVAL` constant for the wiring.
 
 #### T1.2 — Response leg → `publish_to_peer` direct
 
@@ -160,6 +177,16 @@ Three cost categories dominate the per-call overhead:
 - **Where:** `mesh_rpc.rs:1557` (unary response emit), `:1665`
   (streaming response emit).
 - **Difficulty:** easy–medium.
+- **Status:** **landed** — commit `813f951ba`. All four reply emit
+  sites (unary `serve_rpc`, server-streaming, client-stream terminal
+  RESPONSE, duplex chunk) now route through
+  `publish_response_to_caller` instead of `mesh.publish`. The
+  helper resolves `caller_origin → node_id` first via a per-service
+  bridge-populated `RpcOriginNodeCache` (filled at REQUEST receipt
+  from the AEAD-verified `inbound.from_node`), then falls back to
+  `MeshNode::get_node_by_origin_hash`, then finally falls back to
+  `mesh.publish` (roster fan-out) on miss — preserving correctness
+  for loopback / test paths that emit with `from_node == 0`.
 
 #### T1.3 — Cache per-`(service, caller_origin)` route
 
@@ -409,6 +436,36 @@ If Tier 1 + Tier 2 land: **c1/32B ≈ 35–45 µs**, **c128 in the
 
 Tier 3 individually is small but cumulative — adds another ~2–3 µs
 once the bigger wins are in.
+
+### Measured outcome (2026-05-26)
+
+T1.2 + T1.1 v2 landed (T1.3 was already in). Re-bench against the
+same `nrpc_qps` cases the table above used as the baseline:
+
+| Configuration | Baseline (May 19) | After T1.2 + T1.1 | Δ |
+|---------------|-------------------|-------------------|------|
+| c1/32B        | ~69.6 µs          | **42.5 µs**       | -39% |
+| c128/32B      | ~1.84 ms          | **1.12 ms**       | -39% |
+| c128/32B QPS  | 69.7 K elem/s     | **114.3 K elem/s**| +64% |
+
+The c1/32B result lands at the bottom of the Tier-1+Tier-2 predicted
+range (35–45 µs) without doing any Tier 2 work — meaning the
+spawn-storm + roster fan-out combination dominated the budget more
+than the audit's tier-decomposition implied. T1.1's drainer
+batching delivered the bulk of the win (per-mesh stream-grant rate
+goes from O(packets) to O(unique streams per ~1 ms drain cycle)).
+
+c128 didn't quite reach the audit's ~150 K QPS target but cleared
+~115 K — gRPC-loopback territory. Closing the rest of that gap is
+a Tier 2 candidate (T2.1 drop the fold `Mutex`, T2.3 inline-when-
+Ready handler dispatch); the 2026-05-26 flame graph still shows
+51% of CPU in `NtWaitForAlertByThreadId` (tokio futex waits) so
+the remaining headroom is in reducing wakeups, which is what those
+Tier 2 items target.
+
+Tests: all 36 nRPC integration tests + 41 session unit tests + the
+SDK backpressure suite (incl. the `test_sdk_send_with_retry_succeeds_through_backpressure`
+case that surfaced T1.1 v1's deadlock) stay green.
 
 ## Recommended implementation order
 
