@@ -102,9 +102,18 @@ impl TagMatcher {
             Self::Prefix { value } => CompiledMatcher::Prefix { value },
             Self::Axis { axis } => CompiledMatcher::Axis { axis: *axis },
             Self::AxisKey { axis, key } => CompiledMatcher::AxisKey { axis: *axis, key },
+            #[cfg(feature = "regex")]
             Self::Regex { pattern } => CompiledMatcher::Regex {
                 re: regex::Regex::new(pattern).ok(),
             },
+            // Feature-disabled receivers preserve the existing
+            // "invalid pattern → matches nothing" fail-closed
+            // contract pinned by
+            // `matcher_regex_with_invalid_pattern_matches_nothing`.
+            // The wire-format `Regex` variant still parses; the
+            // matcher just rejects every tag.
+            #[cfg(not(feature = "regex"))]
+            Self::Regex { pattern: _ } => CompiledMatcher::MatchesNothing,
             Self::VersionRange { axis_key, min, max } => match split_axis_key(axis_key) {
                 Some((axis, key)) => CompiledMatcher::VersionRange {
                     axis,
@@ -142,6 +151,7 @@ enum CompiledMatcher<'a> {
         axis: TaxonomyAxis,
         key: &'a str,
     },
+    #[cfg(feature = "regex")]
     Regex {
         re: Option<regex::Regex>,
     },
@@ -176,6 +186,7 @@ impl CompiledMatcher<'_> {
                 .ok()
                 .and_then(|t| t.axis_key())
                 .is_some_and(|k| k.axis == *axis && k.key == *key),
+            #[cfg(feature = "regex")]
             Self::Regex { re } => re.as_ref().is_some_and(|r| r.is_match(raw)),
             Self::VersionRange {
                 axis,
@@ -1483,6 +1494,7 @@ mod tests {
 
     // ── 6c-C: TagMatcher::Regex ────────────────────────────────
 
+    #[cfg(feature = "regex")]
     #[test]
     fn matcher_regex_matches_pattern_against_canonical_form() {
         let fold = populated_fold();

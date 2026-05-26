@@ -95,10 +95,14 @@ net = [
     "dep:ed25519-dalek",
     "dep:x25519-dalek",
 ]
-# `regex` is now an unconditional dep (see `dependencies.regex`).
-# The feature is preserved as an empty alias so external callers that
-# referenced `features = ["regex"]` keep compiling.
-regex = []
+# `regex` gates `TagMatcher::Regex` capability-query matching + the
+# safety-predicate precompiled-pattern cache. Off by default — the
+# regex crate adds ~500 KiB to release artifacts and most consumers
+# never construct a `Regex` matcher. With the feature off,
+# `TagMatcher::Regex` still parses on the wire (kept in the enum for
+# format compat) but routes through the existing
+# "invalid → matches nothing" fail-closed path on the receiver side.
+regex = ["dep:regex"]
 ffi = []
 redex = ["net", "dep:tokio-stream", "dep:postcard"]
 redex-disk = ["redex"]
@@ -251,11 +255,14 @@ ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"], optional =
 # XChaCha AEAD already in-tree rather than pulling in XSalsa20.
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"], optional = true }
 # Regex for `TagMatcher::Regex` (Phase 6c-C) + the safety predicate
-# match path in `behavior::safety`. Pulled in unconditionally so the
-# aggregation surface ships uniformly across binaries; the existing
-# `regex` Cargo feature is preserved as an empty alias for callers
-# that referenced it.
-regex = "1"
+# match path in `behavior::safety`. Optional — gated behind the
+# `regex` Cargo feature. Off by default keeps ~500 KiB out of the
+# release wheel; consumers who construct `TagMatcher::Regex`
+# matchers turn it on. The wire format keeps the `Regex` variant
+# unconditionally so peers can still exchange it; receivers built
+# without the feature fail the match closed (existing "invalid
+# pattern → matches nothing" contract).
+regex = { version = "1", optional = true }
 
 # Semver-range matching for `TagMatcher::VersionRange` (Phase 6c-C).
 # Small (~50KB), no transitive load — pulled in unconditionally so
