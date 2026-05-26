@@ -4358,7 +4358,28 @@ impl MeshNode {
             let accepted = stream.with_reliability(|r| r.on_receive(parsed.header.sequence));
             if accepted {
                 stream.update_rx_seq(parsed.header.sequence);
-                stream.on_bytes_consumed(payload_bytes)
+                // Always bump receive-side accounting (granted and
+                // consumed bump together via on_bytes_consumed). The
+                // Option<u64> return value is intentionally ignored
+                // — the actual wire-grant emit decision goes through
+                // `take_pending_grant` below so grants coalesce
+                // across packets instead of firing one per inbound
+                // packet (which burned a tokio::spawn + AEAD encrypt
+                // + sendto per packet even on short unary RPC).
+                stream.on_bytes_consumed(payload_bytes);
+                // Coalesce: emit a wire grant only once half the
+                // sender's TX window has been consumed since the
+                // last grant. Grants are authoritative — each one
+                // carries the receiver's full `total_consumed` —
+                // so one delayed grant subsumes every grant the
+                // pre-coalesce path would have emitted for the
+                // bytes between them. Half-window keeps the sender's
+                // credit well above zero between grants, so a
+                // continuous high-rate sender never stalls waiting
+                // for replenishment. See T1.1 in
+                // `PERF_AUDIT_2026_05_19_NRPC.md`.
+                let threshold = (stream.tx_window() as u64) / 2;
+                stream.take_pending_grant(threshold)
             } else {
                 None
             }
