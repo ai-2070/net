@@ -2,7 +2,7 @@
 
 The operator **cyberdeck** — a terminal UI for the NET mesh.
 
-Live, streaming, low-latency visibility into MeshOS, MeshDB, RedEX, and Dataforts, with signed admin actions on top. Built with [ratatui](https://github.com/ratatui/ratatui) + crossterm. Matrix palette, neon-green on pitch black.
+Live, streaming, low-latency visibility into MeshOS, MeshDB, RedEX, and Dataforts, with signed admin actions on top. Built with ratatui + crossterm. Matrix palette, neon-green on pitch black.
 
 ![Deck — NET.MAP](https://github.com/ai-2070/net/blob/master/images/net-deck-1.png?raw=true)
 
