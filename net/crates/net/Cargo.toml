@@ -16,7 +16,7 @@ members = [
 
 [package]
 name = "net-mesh"
-version = "0.23.0"
+version = "0.24.0"
 edition = "2021"
 description = "High-performance, schema-agnostic, backend-agnostic event bus"
 license = "Apache-2.0"
