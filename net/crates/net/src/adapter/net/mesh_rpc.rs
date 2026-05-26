@@ -2198,12 +2198,10 @@ impl MeshNode {
         );
 
         let metrics_handle = self.rpc_metrics_arc().for_service(service);
-        let mut fold = RpcStreamingRequestFold::new(
-            handler as Arc<dyn RpcClientStreamingHandler>,
-            emit_resp,
-        )
-        .with_grant_emitter(emit_grant)
-        .with_metrics(metrics_handle);
+        let mut fold =
+            RpcStreamingRequestFold::new(handler as Arc<dyn RpcClientStreamingHandler>, emit_resp)
+                .with_grant_emitter(emit_grant)
+                .with_metrics(metrics_handle);
         let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
             let _ = tx.try_send(ev);
         });
