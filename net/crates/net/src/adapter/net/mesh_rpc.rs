@@ -1526,6 +1526,66 @@ fn build_request_grant_emitter(
     })
 }
 
+/// Per-service map from a caller's `origin_hash` (wire field) to the
+/// AEAD-verified `from_node` of the session that delivered their
+/// inbound REQUEST. Populated by the serve_rpc bridge tasks at
+/// REQUEST-receipt time; consulted by [`publish_response_to_caller`]
+/// to skip the roster fan-out on the response leg.
+///
+/// Lives per `serve_rpc*` registration rather than mesh-wide because
+/// the source-of-truth `MeshNode::origin_hash_to_node` is only safe
+/// to populate from *signed* capability announcements — populating
+/// it from unsigned wire `origin_hash` fields would let any session
+/// peer pre-claim arbitrary origins. This map is bridge-local and
+/// only used by the matching service's response emit, so a malicious
+/// peer can at most misdirect responses for THEIR own request — they
+/// already could.
+type RpcOriginNodeCache = Arc<dashmap::DashMap<u64, u64>>;
+
+/// Direct-send a built RESPONSE (or streaming chunk) packet to the
+/// caller's reply channel, bypassing the roster fan-out path
+/// [`MeshNode::publish`] uses.
+///
+/// **Fast path:** when the bridge has cached the caller's
+/// `from_node` (i.e. the server processed an inbound REQUEST from
+/// this caller via an AEAD-authenticated session), or when the
+/// caller's capability announcement has reached us, the response
+/// rides `publish_to_peer` — one DashMap lookup instead of roster
+/// lookup + ACL check + subnet filter + per-recipient `Vec<Bytes>`
+/// allocation.
+///
+/// **Fallback:** when neither lookup resolves — pathological cases
+/// like a test harness where the caller never announces and the
+/// bridge cache is empty — fall back to [`MeshNode::publish`] via
+/// the roster, matching the pre-T1.2 behavior verbatim.
+async fn publish_response_to_caller(
+    mesh: &MeshNode,
+    caller_origin: u64,
+    target_hint: Option<u64>,
+    reply_channel: &ChannelName,
+    payload: Bytes,
+) -> Result<(), AdapterError> {
+    let resolved = target_hint.or_else(|| mesh.get_node_by_origin_hash(caller_origin));
+    if let Some(target_node_id) = resolved {
+        let channel_id = ChannelId::new(reply_channel.clone());
+        let channel_hash = channel_id.hash();
+        let stream_id = MeshNode::publish_stream_id(&channel_id);
+        return mesh
+            .publish_to_peer(
+                target_node_id,
+                channel_hash,
+                stream_id,
+                /* reliable */ true,
+                std::slice::from_ref(&payload),
+            )
+            .await;
+    }
+    // Fallback: roster fan-out. Reached when the caller's origin is
+    // unknown to both the bridge cache AND the global reverse index.
+    let publisher = ChannelPublisher::new(reply_channel.clone(), PublishConfig::default());
+    mesh.publish(&publisher, payload).await.map(|_| ())
+}
+
 /// Shared CANCEL-publish helper: spawn a task that fires a
 /// CANCEL event for `call_id` to `target` on the request channel.
 /// Both [`RpcStream::Drop`] and [`UnaryCallGuard::Drop`] use it.
@@ -1714,6 +1774,13 @@ impl MeshNode {
         // surfaces to the caller as a timeout).
         let (tx, mut rx) = mpsc::channel::<RpcInboundEvent>(1024);
 
+        // T1.2 cache: maps each caller's wire `origin_hash` to the
+        // AEAD-verified `from_node` of the session that delivered
+        // its REQUEST. Populated by the bridge below; consumed by
+        // the emit closure so [`publish_response_to_caller`] can
+        // skip the roster fan-out on the response leg.
+        let origin_node_cache: RpcOriginNodeCache = Arc::new(dashmap::DashMap::new());
+
         // Build the emit closure. When the handler completes, the
         // fold calls this with `(caller_origin, call_id, response)`.
         // The closure publishes a RESPONSE event on
@@ -1723,9 +1790,11 @@ impl MeshNode {
         let mesh_for_emit = Arc::clone(self);
         let service_for_emit = service.to_string();
         let server_origin = self.identity_origin_hash();
+        let origin_node_cache_for_emit = Arc::clone(&origin_node_cache);
         let emit: RpcResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
             let mesh = Arc::clone(&mesh_for_emit);
             let service = service_for_emit.clone();
+            let target_hint = origin_node_cache_for_emit.get(&caller_origin).map(|v| *v);
             tokio::spawn(async move {
                 let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
                 let reply_channel = match ChannelName::new(&reply_channel_name) {
@@ -1749,8 +1818,15 @@ impl MeshNode {
                 buf.extend_from_slice(&meta.to_bytes());
                 buf.extend_from_slice(&resp.encode());
 
-                let publisher = ChannelPublisher::new(reply_channel, PublishConfig::default());
-                if let Err(e) = mesh.publish(&publisher, Bytes::from(buf)).await {
+                if let Err(e) = publish_response_to_caller(
+                    &mesh,
+                    caller_origin,
+                    target_hint,
+                    &reply_channel,
+                    Bytes::from(buf),
+                )
+                .await
+                {
                     tracing::warn!(error = %e, caller_origin = format!("{:#x}", caller_origin),
                         call_id, "rpc serve_rpc: response publish failed");
                 }
@@ -1813,10 +1889,23 @@ impl MeshNode {
         // feeds them to the fold.
         let mesh_for_bridge = Arc::clone(self);
         let service_for_bridge = service.to_string();
+        let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
         let bridge = tokio::spawn(async move {
             let tag = format!("nrpc:{}", service_for_bridge);
             use crate::adapter::net::behavior::fold::capability_bridge;
             while let Some(inbound) = rx.recv().await {
+                // T1.2 cache populate. `from_node` is the
+                // AEAD-verified session peer; `origin_hash` is the
+                // wire-claimed entity (untrusted on its own but
+                // bound here to a session peer we just authed).
+                // `from_node == 0` is the loopback/test sentinel —
+                // skip the insert so the response path falls back
+                // to the roster lookup instead of trying to send to
+                // node 0.
+                if inbound.from_node != 0 {
+                    origin_node_cache_for_bridge
+                        .insert(inbound.origin_hash, inbound.from_node);
+                }
                 // Defense-in-depth check. Skip only when the wire
                 // session resolved no NodeId (`from_node == 0` is
                 // the loopback / test sentinel per
@@ -1932,14 +2021,21 @@ impl MeshNode {
         let channel_hash = request_channel.hash();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<RpcInboundEvent>(1024);
 
+        // T1.2 cache: bridge populates from inbound.from_node, emit
+        // closure consults to skip roster fan-out. See the unary
+        // serve_rpc above for the full rationale.
+        let origin_node_cache: RpcOriginNodeCache = Arc::new(dashmap::DashMap::new());
+
         let mesh_for_emit = Arc::clone(self);
         let service_for_emit = service.to_string();
         let server_origin = self.identity_origin_hash();
+        let origin_node_cache_for_emit = Arc::clone(&origin_node_cache);
         // Async emit so the streaming fold's pump can `.await` each
         // publish — guarantees per-call chunk ordering on the wire.
         let emit: RpcAsyncResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
             let mesh = Arc::clone(&mesh_for_emit);
             let service = service_for_emit.clone();
+            let target_hint = origin_node_cache_for_emit.get(&caller_origin).map(|v| *v);
             Box::pin(async move {
                 let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
                 let reply_channel = match ChannelName::new(&reply_channel_name) {
@@ -1960,8 +2056,15 @@ impl MeshNode {
                 let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
                 buf.extend_from_slice(&meta.to_bytes());
                 buf.extend_from_slice(&resp.encode());
-                let publisher = ChannelPublisher::new(reply_channel, PublishConfig::default());
-                if let Err(e) = mesh.publish(&publisher, Bytes::from(buf)).await {
+                if let Err(e) = publish_response_to_caller(
+                    &mesh,
+                    caller_origin,
+                    target_hint,
+                    &reply_channel,
+                    Bytes::from(buf),
+                )
+                .await
+                {
                     tracing::warn!(error = %e,
                             caller_origin = format!("{:#x}", caller_origin),
                             call_id,
@@ -1987,8 +2090,13 @@ impl MeshNode {
         {
             return Err(ServeError::AlreadyServing(service.to_string()));
         }
+        let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
         let bridge = tokio::spawn(async move {
             while let Some(inbound) = rx.recv().await {
+                if inbound.from_node != 0 {
+                    origin_node_cache_for_bridge
+                        .insert(inbound.origin_hash, inbound.from_node);
+                }
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
@@ -2030,6 +2138,9 @@ impl MeshNode {
         let channel_hash = request_channel.hash();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<RpcInboundEvent>(1024);
 
+        // T1.2 cache — see serve_rpc above for full rationale.
+        let origin_node_cache: RpcOriginNodeCache = Arc::new(dashmap::DashMap::new());
+
         let mesh_for_emit = Arc::clone(self);
         let service_for_emit = service.to_string();
         let server_origin = self.identity_origin_hash();
@@ -2039,9 +2150,11 @@ impl MeshNode {
         // would require an async-await between chunks).
         let emit_resp_mesh = Arc::clone(&mesh_for_emit);
         let emit_resp_service = service_for_emit.clone();
+        let origin_node_cache_for_emit = Arc::clone(&origin_node_cache);
         let emit_resp: RpcResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
             let mesh = Arc::clone(&emit_resp_mesh);
             let service = emit_resp_service.clone();
+            let target_hint = origin_node_cache_for_emit.get(&caller_origin).map(|v| *v);
             tokio::spawn(async move {
                 let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
                 let reply_channel = match ChannelName::new(&reply_channel_name) {
@@ -2062,8 +2175,15 @@ impl MeshNode {
                 let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
                 buf.extend_from_slice(&meta.to_bytes());
                 buf.extend_from_slice(&resp.encode());
-                let publisher = ChannelPublisher::new(reply_channel, PublishConfig::default());
-                if let Err(e) = mesh.publish(&publisher, Bytes::from(buf)).await {
+                if let Err(e) = publish_response_to_caller(
+                    &mesh,
+                    caller_origin,
+                    target_hint,
+                    &reply_channel,
+                    Bytes::from(buf),
+                )
+                .await
+                {
                     tracing::warn!(error = %e,
                             caller_origin = format!("{:#x}", caller_origin),
                             call_id,
@@ -2097,8 +2217,13 @@ impl MeshNode {
         {
             return Err(ServeError::AlreadyServing(service.to_string()));
         }
+        let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
         let bridge = tokio::spawn(async move {
             while let Some(inbound) = rx.recv().await {
+                if inbound.from_node != 0 {
+                    origin_node_cache_for_bridge
+                        .insert(inbound.origin_hash, inbound.from_node);
+                }
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
@@ -2250,6 +2375,9 @@ impl MeshNode {
         let channel_hash = request_channel.hash();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<RpcInboundEvent>(1024);
 
+        // T1.2 cache — see serve_rpc above for full rationale.
+        let origin_node_cache: RpcOriginNodeCache = Arc::new(dashmap::DashMap::new());
+
         let mesh_for_emit = Arc::clone(self);
         let service_for_emit = service.to_string();
         let server_origin = self.identity_origin_hash();
@@ -2259,9 +2387,11 @@ impl MeshNode {
         // as serve_rpc_streaming).
         let emit_resp_mesh = Arc::clone(&mesh_for_emit);
         let emit_resp_service = service_for_emit.clone();
+        let origin_node_cache_for_emit = Arc::clone(&origin_node_cache);
         let emit_resp: RpcAsyncResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
             let mesh = Arc::clone(&emit_resp_mesh);
             let service = emit_resp_service.clone();
+            let target_hint = origin_node_cache_for_emit.get(&caller_origin).map(|v| *v);
             Box::pin(async move {
                 let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
                 let reply_channel = match ChannelName::new(&reply_channel_name) {
@@ -2282,8 +2412,15 @@ impl MeshNode {
                 let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
                 buf.extend_from_slice(&meta.to_bytes());
                 buf.extend_from_slice(&resp.encode());
-                let publisher = ChannelPublisher::new(reply_channel, PublishConfig::default());
-                if let Err(e) = mesh.publish(&publisher, Bytes::from(buf)).await {
+                if let Err(e) = publish_response_to_caller(
+                    &mesh,
+                    caller_origin,
+                    target_hint,
+                    &reply_channel,
+                    Bytes::from(buf),
+                )
+                .await
+                {
                     tracing::warn!(error = %e,
                             caller_origin = format!("{:#x}", caller_origin),
                             call_id,
@@ -2316,8 +2453,13 @@ impl MeshNode {
         {
             return Err(ServeError::AlreadyServing(service.to_string()));
         }
+        let origin_node_cache_for_bridge = Arc::clone(&origin_node_cache);
         let bridge = tokio::spawn(async move {
             while let Some(inbound) = rx.recv().await {
+                if inbound.from_node != 0 {
+                    origin_node_cache_for_bridge
+                        .insert(inbound.origin_hash, inbound.from_node);
+                }
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
