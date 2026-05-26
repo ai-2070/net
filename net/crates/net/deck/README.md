@@ -36,9 +36,6 @@ cargo run -p net-deck --features demo
 
 The `demo` feature wires `net_sdk::testing::ClusterHarness` — real daemons, real migrations, real blob adapters, a real `RpcObserver` feeding the NRPC tail. See `crates/net/docs/plans/DECK_DEMO_PLAN.md`.
 
-![Deck — NODES](https://github.com/ai-2070/net/blob/master/images/net-deck-2.png?raw=true)
-![Deck — NODE](https://github.com/ai-2070/net/blob/master/images/net-deck-3.png?raw=true)
-
 ## Tabs
 
 | Tab          | What it shows                                                                       |
@@ -59,7 +56,8 @@ The `demo` feature wires `net_sdk::testing::ClusterHarness` — real daemons, re
 | `AUDIT`      | RedEX-committed operator audit ledger.                                              |
 | `FAILURES`   | Recent failures across daemons, migrations, blob pulls.                             |
 
-![Deck — DATAFORTS](https://github.com/ai-2070/net/blob/master/images/net-deck-7.png?raw=true)
+![Deck — NODES](https://github.com/ai-2070/net/blob/master/images/net-deck-3.png?raw=true)
+![Deck — DATAFORTS](https://github.com/ai-2070/net/blob/master/images/net-deck-5.png?raw=true)
 
 ## Admin surface — signed ops
 
