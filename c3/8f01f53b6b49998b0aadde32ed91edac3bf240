@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/session.rs
+  s_bd240ee1a66315::t_d8ea07eb23333c 1402-1410
+  s_bd240ee1a66315::t_a9bed95d3398c0 946-956,969
+  s_bd240ee1a66315::t_0109acec0f68f0 1054-1091
+net/crates/net/src/adapter/net/mesh.rs
+  s_bd240ee1a66315::t_6cdf4ecf3e8af9 4361-4382
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "c38f01f53b6b49998b0aadde32ed91edac3bf240",
+  "prompts": {},
+  "sessions": {
+    "s_bd240ee1a66315": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "667f7870-8455-48de-a878-cbfa33c034c1",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
