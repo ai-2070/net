@@ -1,0 +1,19 @@
+net/crates/net/cli/npm/README.md
+  s_7ff155b70dd30c::t_893de7751778aa 3-9,12,16-76,78,80,82-87,89,91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "55a057ba076b96722a3083cb5293349b915b8fe5",
+  "prompts": {},
+  "sessions": {
+    "s_7ff155b70dd30c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "19b67aa4-b309-4ef8-89cf-7ac0d437c59a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
