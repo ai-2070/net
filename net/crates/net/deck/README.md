@@ -36,6 +36,9 @@ cargo run -p net-deck --features demo
 
 The `demo` feature wires `net_sdk::testing::ClusterHarness` — real daemons, real migrations, real blob adapters, a real `RpcObserver` feeding the NRPC tail. See `crates/net/docs/plans/DECK_DEMO_PLAN.md`.
 
+![Deck — NODES](https://github.com/ai-2070/net/blob/master/images/net-deck-2.png?raw=true)
+![Deck — NODE](https://github.com/ai-2070/net/blob/master/images/net-deck-3.png?raw=true)
+
 ## Tabs
 
 | Tab          | What it shows                                                                       |
@@ -56,8 +59,7 @@ The `demo` feature wires `net_sdk::testing::ClusterHarness` — real daemons, re
 | `AUDIT`      | RedEX-committed operator audit ledger.                                              |
 | `FAILURES`   | Recent failures across daemons, migrations, blob pulls.                             |
 
-![Deck — DATAFORTS](https://github.com/ai-2070/net/blob/master/images/net-deck-3.png?raw=true)
-![Deck — LOGS](https://github.com/ai-2070/net/blob/master/images/net-deck-7.png?raw=true)
+![Deck — DATAFORTS](https://github.com/ai-2070/net/blob/master/images/net-deck-7.png?raw=true)
 
 ## Admin surface — signed ops
 
@@ -71,8 +73,6 @@ Every admin action propagates as a signed event on the admin chain via RedEX:
 
 Before an ICE action commits, Deck runs a **blast-radius** simulation —
 *"This action affects 4 nodes, 12 replicas, and 2 daemons. Continue?"* — then signs with the operator key loaded from the maintenance node. Multi-operator signing and lockout timers are available for the high-authority break-glass paths.
-
-![Deck — ICE / Admin](https://github.com/ai-2070/net/blob/master/images/net-deck-9.png?raw=true)
 
 ## Bookmarks (multi-cluster)
 
