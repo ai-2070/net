@@ -1,0 +1,24 @@
+net/crates/net/sdk/tests/tool_serve_round_trip.rs
+  s_099fa7d871e34d::t_c82bef0e22b58a 524-642
+net/crates/net/sdk/src/mesh_rpc.rs
+  s_099fa7d871e34d::t_30a3ccb15aa7e6 532-559
+  s_099fa7d871e34d::t_686a30b1664927 455-469
+net/crates/net/sdk/src/tool.rs
+  s_099fa7d871e34d::t_97dc909552ad21 441-513
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "ba8aa3ec6662eab59014853597ae602dbcfc8a8d",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
