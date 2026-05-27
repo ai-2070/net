@@ -283,8 +283,12 @@ impl ToolEvent {
 /// [`crate::adapter::net::MeshNode::watch_tools`]. Implements
 /// `futures::Stream<Item = ToolListChange>`. Dropping the watch
 /// ends the underlying polling task on its next tick.
+///
+/// Backed by a bounded mpsc; a slow consumer applies backpressure
+/// to the polling task (which blocks on the next `send().await`)
+/// rather than queueing events without bound.
 pub struct ToolListWatch {
-    pub(crate) receiver: tokio::sync::mpsc::UnboundedReceiver<ToolListChange>,
+    pub(crate) receiver: tokio::sync::mpsc::Receiver<ToolListChange>,
 }
 
 impl futures::Stream for ToolListWatch {

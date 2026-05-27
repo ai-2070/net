@@ -5547,7 +5547,10 @@ impl MeshNode {
         use crate::adapter::net::cortex::tool::{ToolDescriptor, ToolListChange, ToolListWatch};
         use std::collections::HashMap;
         let interval = interval.unwrap_or_else(|| Duration::from_secs(1));
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ToolListChange>();
+        // Bounded capacity — a slow consumer backpressures the
+        // polling task (which awaits in `send`) instead of letting
+        // ToolListChange events accumulate without bound.
+        let (tx, rx) = tokio::sync::mpsc::channel::<ToolListChange>(256);
         // Take the initial baseline snapshot SYNCHRONOUSLY before
         // returning the watch handle. Without this, a caller that
         // does `let w = watch_tools(...); announce_a_tool().await` can
@@ -5580,7 +5583,7 @@ impl MeshNode {
                 // Added: in next, not in prev.
                 for (key, desc) in next.iter() {
                     if !prev.contains_key(key)
-                        && tx.send(ToolListChange::Added(desc.clone())).is_err()
+                        && tx.send(ToolListChange::Added(desc.clone())).await.is_err()
                     {
                         return;
                     }
@@ -5588,7 +5591,7 @@ impl MeshNode {
                 // Removed: in prev, not in next.
                 for (key, desc) in prev.iter() {
                     if !next.contains_key(key)
-                        && tx.send(ToolListChange::Removed(desc.clone())).is_err()
+                        && tx.send(ToolListChange::Removed(desc.clone())).await.is_err()
                     {
                         return;
                     }
@@ -5604,6 +5607,7 @@ impl MeshNode {
                                     descriptor: new_desc.clone(),
                                     prev_node_count: old_desc.node_count,
                                 })
+                                .await
                                 .is_err()
                         {
                             return;
