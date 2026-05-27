@@ -13,6 +13,12 @@ package net
 #include "net.h"
 #include <stdlib.h>
 #include <string.h>
+
+// `net_mesh_arc_clone` lives in libnet but isn't declared in net.h
+// (only in net.go.h). Forward-declare it here so mesh_rpc.go can
+// reach the inner `Arc<MeshNode>` through this package without
+// triggering a cgo "implicit declaration" warning.
+extern void* net_mesh_arc_clone(net_meshnode_t* handle);
 */
 import "C"
 
@@ -309,6 +315,24 @@ func (m *MeshNode) NodeID() uint64 {
 		return 0
 	}
 	return uint64(C.net_mesh_node_id(m.handle))
+}
+
+// arcClonePtr clones the inner `Arc<MeshNode>` and returns the raw
+// pointer as `unsafe.Pointer`. Consumed by `NewMeshRpc` (and any
+// future package-internal binding that needs an arc-clone the
+// substrate side will take ownership of). Returns nil if the node
+// is shutting down or has already been freed.
+//
+// The returned pointer is heap-allocated on the Rust side (a
+// `Box<Arc<MeshNode>>`). The consumer takes ownership; callers MUST
+// NOT free it directly.
+func (m *MeshNode) arcClonePtr() unsafe.Pointer {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return nil
+	}
+	return unsafe.Pointer(C.net_mesh_arc_clone(m.handle))
 }
 
 // EntityID returns this node's 32-byte ed25519 entity id. Matches
