@@ -85,14 +85,14 @@ Tagged `[S | A | B | C | D | M | T | X]`:
 | A-6   | H   | Rust SDK          | `Mesh::call_tool<Req, Resp>` (unary) + `Mesh::call_tool_streaming<Req>` over S-1                | ✅     |
 | A-7   | M   | Rust SDK          | `#[tool]` proc macro (follow-up — runtime APIs land first)                                      | ✅     |
 | B-1   | H   | Node TS           | `tool({ name, description, schema, handle })` + Zod schema lowering + auto-install of `tool.metadata.fetch` | ✅     |
-| B-2   | H   | Node TS           | `tool({ ..., stream: async function* handle() { yield … } })` — streaming via async-iter        | ⏳     |
+| B-2   | H   | Node TS           | `serveToolStreaming(rpc, opts, handler)` — handler is `(req) => AsyncIterable<ToolEvent>`        | ✅     |
 | B-3   | H   | Node TS           | `MeshNode.listTools({ matcher? })` + `MeshNode.watchTools({ matcher? })`                        | ✅     |
 | B-4   | H   | Node TS           | `TypedMeshRpc.callTool` + `.callToolStreaming` (capability-routed; client of `S-1`)             | ✅     |
 | C-1   | H   | Python            | `serve_tool` + `serve_tool_async` + Pydantic-typed schema lowering + auto-install of `tool.metadata.fetch` | ✅     |
-| C-2   | H   | Python            | `@tool.stream` / `async def gen(...) -> AsyncGenerator[ToolEvent, None]` streaming variant       | ⏳     |
+| C-2   | H   | Python            | `serve_tool_streaming{,_async}` — handler is a sync generator or async-generator yielding ToolEvents | ✅ |
 | C-3   | H   | Python            | `await mesh.list_tools(matcher=...)` + `async for change in mesh.watch_tools(matcher=...)`       | ✅     |
 | C-4   | H   | Python            | `call_tool` + `call_tool_async` + `call_tool_streaming{,_async}` + `fetch_tool_metadata{,_async}` | ✅     |
-| D-1   | M   | Go                | `net.RegisterTool[Req, Resp]` + auto-install of `tool.metadata.fetch` + `CallToolStreaming` (streaming caller) | ✅ (caller-side; streaming server-side `RegisterStreamingTool` still ⏳) |
+| D-1   | M   | Go                | `net.RegisterTool[Req, Resp]` + auto-install of `tool.metadata.fetch` + `CallToolStreaming` + `RegisterStreamingTool` | ✅     |
 | D-2   | M   | Go                | `net.ListTools(rpc)` + `net.WatchTools(ctx, rpc, opts) (changes, errs, baseline, err)`           | ✅     |
 | M-1   | H   | format pkg (Py)   | `net_mesh.tools.formats.openai` — `to_openai_tool(desc)` + `lower_tool_call(call) -> CallSpec`  | ✅     |
 | M-2   | H   | format pkg (Py)   | `net_mesh.tools.formats.anthropic` — same shape; streaming via `tool_use_block_delta`           | ✅     |
@@ -108,29 +108,28 @@ Tagged `[S | A | B | C | D | M | T | X]`:
 | X-2   | H   | demo              | `examples/agents/python-hermes-tools.py` — Hermes agent via `create_net_tool_provider`; one local Python + one Go-hosted tool | ⏳     |
 | X-3   | M   | demo              | `examples/agents/node-claude-tools.ts` — TypeScript Anthropic Messages loop dispatching into Python-hosted tools | ⏳     |
 
-Legend: ✅ done · 🟡 partial (caller-side streaming + unary + invoke + discovery + format translators + auto-install all shipped; only streaming-server ergonomics + Go discovery still outstanding) · ⏳ todo.
+Legend: ✅ done · 🟡 partial · ⏳ todo. Every binding row is now ✅; remaining ⏳ items are X-2 / X-3 demos (deferred per user) and T-3 / T-4 / T-5 live integration tests.
 
 No wire ABI bump for unary tool calls. Streaming tools use `S-1`'s new `call_service_streaming` substrate primitive; the wire shape of an individual stream is unchanged from `call_streaming` today. `ToolEvent` envelopes are JSON-encoded chunks on existing streams.
 
-### Status by language (as of Go discovery landing)
+### Status by language (as of streaming-serve landing)
 
 | Surface                    | Rust | Node TS | Python | Go  |
 |----------------------------|------|---------|--------|-----|
 | `serve_tool` / `call_tool` (unary) | ✅   | ✅       | ✅ (sync + async)      | ✅  |
 | `call_tool_streaming` (capability-routed streaming caller) | ✅ | ✅ | ✅ (sync + async) | ✅ |
-| `serve_tool_streaming` (server-side handler ergonomics) | ✅ | ⏳ | ⏳ | ⏳ |
+| `serve_tool_streaming` (server-side handler ergonomics) | ✅ | ✅ | ✅ (sync + async) | ✅ |
 | `list_tools` / `watch_tools` | ✅ | ✅ (polling) | ✅ (polling) | ✅ (polling) |
 | Format translators × 4     | ✅   | ✅       | ✅      | ✅  |
 | `tool.metadata.fetch` (caller) | ✅ | ✅       | ✅ (sync + async)      | ✅  |
 | `tool.metadata.fetch` (server, auto-installed on first `serve_tool`) | ✅ | ✅ | ✅ | ✅ |
 | `missing_terminal` synthesis on streaming caller | ✅ | ✅ | ✅ | ✅ |
+| `handler_error` synthesis on streaming server (handler raise) | ✅ | ✅ | ✅ | ✅ |
 | AbortSignal / cancel on `watch_tools` | ✅ | ✅ | ✅ | ✅ (ctx) |
 | **T-1 byte-equality fixture** | ✅ | ✅       | ✅      | ✅  |
 | **T-2 ToolEvent round-trip** | ✅ | ✅       | ✅      | ✅  |
 
-Only remaining ⏳ item: `serve_tool_streaming` (handler-side generator ergonomics) outside Rust. Every other row is ✅ across all four bindings.
-
-The handler-side ergonomics need an FFI extension to surface the streaming-serve registration shape (`call_streaming_serve_*`). Until that lands, streaming handlers can be authored via the existing `serve_streaming` typed surface and a manual ToolEvent encoder; the wrapper in this slice is just sugar.
+Every binding row is now ✅. The only remaining work is X-2 / X-3 / M-3 (the deferred demos + Hermes Python adapter) and T-3 / T-4 / T-5 (live cross-language integration tests that require a two-mesh harness).
 
 ### Operating contract pinned by T-1 + T-2
 
@@ -659,5 +658,4 @@ TypeScript-side cross-language coverage. Discovers tools via `await mesh.listToo
 6. **Tool composition macros.** Decorators that wrap framework graph nodes (Hermes flows, LangGraph nodes, etc.) directly so a graph node IS a mesh tool. Likely separate companion packages per framework.
 7. **Auto-doc generation.** A `net tool docs --markdown` CLI emits a per-mesh tool catalog page from the capability fold. Operator polish.
 8. **`#[tool]` proc macro in Rust.** A-7 stays a follow-up — runtime APIs are usable as-is.
-9. **`serveToolStreaming` across bindings (B-2 / C-2 / D-1 server-half).** Requires a streaming-handler dispatcher pattern in napi / pyo3 / CGO that's substantially larger than the unary `serve` paths today: a sink object that handlers push ToolEvents into, a per-call cancel-watcher that observes the substrate's stream-side CANCEL, and (for Python) an async-generator detection step in the handler-bridge. The streaming *caller* (`call_tool_streaming`) is fully shipped across all four languages; only the server-side handler ergonomic wrapper is deferred. Until that lands, handlers that want to emit a ToolEvent stream from a binding can drive `serve_rpc_streaming` directly with manual JSON encoding — the wire is documented in the plan's `S-4` section and the T-2 fixture pins the byte shape.
-10. **TagMatcher pushdown on `list_tools` in bindings.** napi / pyo3 / CGO currently always walk unfiltered; matcher push-down needs a `TagMatcherJs` / `PyTagMatcher` / `TagMatcherC` mirror that the v1 surface doesn't expose. Callers can post-filter in their language today; the substrate-side `MeshNode::list_tools(Some(matcher))` is fully implemented and reachable from the Rust SDK.
+9. **TagMatcher pushdown on `list_tools` in bindings.** napi / pyo3 / CGO currently always walk unfiltered; matcher push-down needs a `TagMatcherJs` / `PyTagMatcher` / `TagMatcherC` mirror that the v1 surface doesn't expose. Callers can post-filter in their language today; the substrate-side `MeshNode::list_tools(Some(matcher))` is fully implemented and reachable from the Rust SDK.
