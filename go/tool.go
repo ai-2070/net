@@ -614,6 +614,33 @@ func (s *ToolEventStream) CallID() uint64 {
 // CapabilitySetWire — minimal announce-merge surface
 // =============================================================================
 
+// toolCapabilityTagPrefix is the substrate-canonical tag prefix for
+// AI-tool capability announcements. A host serving "web_search"
+// publishes "ai-tool:web_search" so peers can find it via the
+// fold's tag-prefix index.
+const toolCapabilityTagPrefix = "ai-tool:"
+
+// Substrate-canonical metadata-key helpers. Mirror of the Rust
+// substrate's `description_metadata_key` / `streaming_metadata_key` /
+// `tags_metadata_key` + `ToolCapability::input_schema_metadata_key` /
+// `output_schema_metadata_key`. Centralized here so a substrate
+// rename surfaces in one place instead of five.
+func toolMetadataKeyInputSchema(toolID string) string {
+	return "tool::" + toolID + "::input_schema"
+}
+func toolMetadataKeyOutputSchema(toolID string) string {
+	return "tool::" + toolID + "::output_schema"
+}
+func toolMetadataKeyDescription(toolID string) string {
+	return "tool::" + toolID + "::description"
+}
+func toolMetadataKeyStreaming(toolID string) string {
+	return "tool::" + toolID + "::streaming"
+}
+func toolMetadataKeyTags(toolID string) string {
+	return "tool::" + toolID + "::tags"
+}
+
 // CapabilitySetWire is the minimal capability-announcement shape
 // AddToolCapabilitiesToAnnounce mutates. Defined inline because
 // `capabilities.go`'s richer `CapabilitySet` doesn't expose a
@@ -661,28 +688,24 @@ func AddToolCapabilitiesToAnnounce(
 		caps.Metadata = make(map[string]string)
 	}
 	for _, desc := range descriptors {
-		tag := "ai-tool:" + desc.ToolID
+		tag := toolCapabilityTagPrefix + desc.ToolID
 		if _, ok := tagSet[tag]; !ok {
 			tagSet[tag] = struct{}{}
 			caps.Tags = append(caps.Tags, tag)
 		}
-		// Mirror schemas into metadata under the substrate's
-		// canonical key shape (matches
-		// ToolCapability::input_schema_metadata_key in Rust).
 		if desc.InputSchema != "" {
-			caps.Metadata["tool::"+desc.ToolID+"::input_schema"] = desc.InputSchema
+			caps.Metadata[toolMetadataKeyInputSchema(desc.ToolID)] = desc.InputSchema
 		}
 		if desc.OutputSchema != "" {
-			caps.Metadata["tool::"+desc.ToolID+"::output_schema"] = desc.OutputSchema
+			caps.Metadata[toolMetadataKeyOutputSchema(desc.ToolID)] = desc.OutputSchema
 		}
 		if desc.Description != "" {
-			caps.Metadata["tool::"+desc.ToolID+"::description"] = desc.Description
+			caps.Metadata[toolMetadataKeyDescription(desc.ToolID)] = desc.Description
 		}
 		if desc.Streaming {
-			caps.Metadata["tool::"+desc.ToolID+"::streaming"] = "1"
+			caps.Metadata[toolMetadataKeyStreaming(desc.ToolID)] = "1"
 		}
 		if len(desc.Tags) > 0 {
-			// Comma-joined (substrate convention).
 			joined := ""
 			for i, t := range desc.Tags {
 				if i > 0 {
@@ -690,7 +713,7 @@ func AddToolCapabilitiesToAnnounce(
 				}
 				joined += t
 			}
-			caps.Metadata["tool::"+desc.ToolID+"::tags"] = joined
+			caps.Metadata[toolMetadataKeyTags(desc.ToolID)] = joined
 		}
 	}
 	return caps
