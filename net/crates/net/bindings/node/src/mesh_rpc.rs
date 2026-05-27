@@ -46,6 +46,7 @@ use ::net::adapter::net::cortex::{
     RpcCallStatus as InnerRpcCallStatus, RpcClientStreamingHandler, RpcContext,
     RpcDirection as InnerRpcDirection, RpcDuplexHandler, RpcHandler, RpcHandlerError, RpcObserver,
     RpcResponsePayload, RpcResponseSink as InnerRpcResponseSink, RpcStatus, RpcStreamingContext,
+    RpcStreamingHandler,
 };
 use ::net::adapter::net::mesh_rpc::{
     CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
@@ -1352,6 +1353,126 @@ impl ToNapiValue for DuplexHandlerArgs {
 type DuplexHandlerTsfn =
     ThreadsafeFunction<DuplexHandlerArgs, Promise<Buffer>, DuplexHandlerArgs, napi::Status, false>;
 
+/// Args ferried through the streaming-serve TSFN. Equivalent of
+/// `DuplexHandlerArgs` minus the request stream — streaming-serve
+/// is unary-in, many-out so the handler just gets the raw request
+/// buffer plus a JsResponseSink to push chunks into.
+pub struct StreamingHandlerArgs {
+    req: Buffer,
+    sink: JsResponseSink,
+}
+
+impl ToNapiValue for StreamingHandlerArgs {
+    unsafe fn to_napi_value(
+        env: napi::sys::napi_env,
+        val: Self,
+    ) -> napi::Result<napi::sys::napi_value> {
+        // Build a JS array `[req, sink]` like DuplexHandlerArgs;
+        // JS handler destructures via `(args) => { const [req, sink] = args; ... }`.
+        let env_wrapper = napi::Env::from_raw(env);
+        let mut arr = env_wrapper.create_array(2)?;
+        let req_val = unsafe { Buffer::to_napi_value(env, val.req)? };
+        let sink_val = unsafe { JsResponseSink::to_napi_value(env, val.sink)? };
+        let req_unknown = unsafe { napi::bindgen_prelude::Unknown::from_napi_value(env, req_val)? };
+        let sink_unknown =
+            unsafe { napi::bindgen_prelude::Unknown::from_napi_value(env, sink_val)? };
+        arr.set(0, req_unknown)?;
+        arr.set(1, sink_unknown)?;
+        unsafe { napi::bindgen_prelude::Array::to_napi_value(env, arr) }
+    }
+}
+
+/// TSFN for streaming-response handlers. JS side:
+/// `(args: [Buffer, JsResponseSink]) => Promise<Buffer>`. The
+/// Promise resolving is the "handler done" signal; the Buffer
+/// value is ignored (substrate's emit closure provides the
+/// terminal frame from the handler's `Ok(())` / `Err(_)` return).
+type StreamingHandlerTsfn = ThreadsafeFunction<
+    StreamingHandlerArgs,
+    Promise<Buffer>,
+    StreamingHandlerArgs,
+    napi::Status,
+    false,
+>;
+
+/// `RpcStreamingHandler` impl bridging to JS via TSFN. Near-copy
+/// of `NodeDuplexRpcHandler` minus the request-stream half.
+struct NodeStreamingRpcHandler {
+    tsfn: StreamingHandlerTsfn,
+    timeout: Duration,
+}
+
+#[async_trait::async_trait]
+impl RpcStreamingHandler for NodeStreamingRpcHandler {
+    async fn call(
+        &self,
+        ctx: RpcContext,
+        sink: InnerRpcResponseSink,
+    ) -> std::result::Result<(), RpcHandlerError> {
+        let args = StreamingHandlerArgs {
+            req: Buffer::from(ctx.payload.body.to_vec()),
+            sink: JsResponseSink {
+                inner: Arc::new(Mutex::new(Some(sink))),
+            },
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel::<napi::Result<Promise<Buffer>>>();
+        let status = self.tsfn.call_with_return_value(
+            args,
+            ThreadsafeFunctionCallMode::NonBlocking,
+            move |ret: napi::Result<Promise<Buffer>>, _env| {
+                let _ = tx.send(ret);
+                napi::Result::Ok(())
+            },
+        );
+        if status != napi::Status::Ok {
+            return Err(RpcHandlerError::Internal(format!(
+                "TSFN enqueue failed: {status:?}"
+            )));
+        }
+        // Single deadline spans both TSFN dispatch and Promise
+        // resolution — matches the duplex / client-streaming bridges.
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let promise = match tokio::time::timeout_at(deadline, rx).await {
+            Ok(Ok(Ok(p))) => p,
+            Ok(Ok(Err(e))) => {
+                return Err(RpcHandlerError::Internal(format!(
+                    "JS streaming handler threw synchronously: {e}"
+                )))
+            }
+            Ok(Err(_)) => {
+                return Err(RpcHandlerError::Internal(
+                    "JS streaming callback channel disconnected".into(),
+                ))
+            }
+            Err(_) => {
+                return Err(RpcHandlerError::Internal(format!(
+                    "JS streaming handler did not dispatch within {} ms",
+                    self.timeout.as_millis()
+                )))
+            }
+        };
+        match tokio::time::timeout_at(deadline, promise).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => {
+                let msg: String = format!("{e}");
+                if let Some((code, body)) = parse_js_app_error(&msg) {
+                    return Err(RpcHandlerError::Application {
+                        code,
+                        message: body,
+                    });
+                }
+                Err(RpcHandlerError::Internal(format!(
+                    "JS streaming handler promise rejected: {msg}"
+                )))
+            }
+            Err(_) => Err(RpcHandlerError::Internal(format!(
+                "JS streaming handler promise did not resolve within {} ms",
+                self.timeout.as_millis()
+            ))),
+        }
+    }
+}
+
 /// `RpcClientStreamingHandler` impl bridging to JS via TSFN.
 struct NodeClientStreamingRpcHandler {
     tsfn: ClientStreamingHandlerTsfn,
@@ -1705,6 +1826,35 @@ impl MeshRpc {
         })
     }
 
+    /// Capability-routed streaming call. Resolves `service`
+    /// against the local capability index (`nrpc:<service>` tags),
+    /// applies the routing policy + cap-auth gate that
+    /// `callService` enforces, then opens the streaming call.
+    ///
+    /// Use this — not `callStreaming` — for any streaming tool
+    /// invocation (`callToolStreaming`) so the cap-auth gate is
+    /// honored. Returns an [`RpcStream`] with the same drain /
+    /// cancel semantics as `callStreaming`.
+    #[napi]
+    pub async fn call_service_streaming(
+        &self,
+        service: String,
+        request: Buffer,
+        opts: Option<CallOptions>,
+    ) -> Result<RpcStream> {
+        let opts = opts.unwrap_or_default().into_inner();
+        let inner = self
+            .node
+            .call_service_streaming(&service, Bytes::copy_from_slice(request.as_ref()), opts)
+            .await
+            .map_err(nrpc_err_from_inner)?;
+        let flow_controlled_cached = inner.flow_controlled();
+        Ok(RpcStream {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(inner))),
+            flow_controlled_cached,
+        })
+    }
+
     // ---- ABI 0x0002 client-streaming + duplex callers (B9-1) ----
 
     /// Open a client-streaming call. Push chunks via
@@ -1820,6 +1970,47 @@ impl MeshRpc {
         let inner = self
             .node
             .serve_rpc_duplex(&service, inner_handler)
+            .map_err(|e| nrpc_err("serve_failed", format!("{e}")))?;
+        Ok(ServeHandle {
+            inner: Arc::new(Mutex::new(Some(inner))),
+        })
+    }
+
+    /// Register a server-streaming handler. JS signature:
+    /// `(args: [Buffer, JsResponseSink]) => Promise<Buffer>`. The
+    /// handler receives the request body + a sink to push chunks
+    /// into; the Promise resolving (any Buffer value, ignored) is
+    /// the "handler done" signal — substrate emits the terminal
+    /// frame at that point.
+    ///
+    /// JS destructures the args:
+    ///
+    ///   ```js
+    ///   mesh.serveStreaming("svc", async ([req, sink]) => {
+    ///     for (const chunk of generateChunks(req)) {
+    ///       sink.send(chunk)
+    ///     }
+    ///     return Buffer.alloc(0)
+    ///   });
+    ///   ```
+    ///
+    /// Wired underneath `serveToolStreaming` in the TS layer so AI
+    /// tools can emit progress / delta / result envelopes
+    /// incrementally.
+    #[napi(js_name = "serveStreaming")]
+    pub fn serve_streaming(
+        &self,
+        service: String,
+        handler: Function<'_, StreamingHandlerArgs, Promise<Buffer>>,
+    ) -> Result<ServeHandle> {
+        let tsfn: StreamingHandlerTsfn = handler.build_threadsafe_function().build()?;
+        let inner_handler = Arc::new(NodeStreamingRpcHandler {
+            tsfn,
+            timeout: DEFAULT_HANDLER_TIMEOUT,
+        });
+        let inner = self
+            .node
+            .serve_rpc_streaming(&service, inner_handler)
             .map_err(|e| nrpc_err("serve_failed", format!("{e}")))?;
         Ok(ServeHandle {
             inner: Arc::new(Mutex::new(Some(inner))),

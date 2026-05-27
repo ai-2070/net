@@ -60,6 +60,7 @@ use ::net::adapter::net::cortex::{
     RpcCallStatus as InnerRpcCallStatus, RpcClientStreamingHandler, RpcContext,
     RpcDirection as InnerRpcDirection, RpcDuplexHandler, RpcHandler, RpcHandlerError, RpcObserver,
     RpcResponsePayload, RpcResponseSink as InnerRpcResponseSink, RpcStatus, RpcStreamingContext,
+    RpcStreamingHandler,
 };
 use ::net::adapter::net::mesh_rpc::{
     CallOptions as InnerCallOptions, ClientStreamCallRaw as InnerClientStreamCallRaw,
@@ -686,7 +687,34 @@ impl RpcHandler for PyAsyncRpcHandler {
                 };
             }
         };
-        let timeout_result = tokio::time::timeout(self.timeout, fut).await;
+        // Race the handler future against the per-call cancel token.
+        // When the substrate observes a caller-side CANCEL it trips
+        // `ctx.cancellation`; falling out of the `select!` drops
+        // `fut`, which is the only handle to the dispatched Python
+        // coroutine. The drop fires `CoroCancelGuard`, which calls
+        // `cancel()` on the asyncio task back on the dispatcher loop
+        // — surfacing `asyncio.CancelledError` inside the handler's
+        // `await`. Without this race the cancel token fires, but
+        // `tokio::time::timeout(self.timeout, fut)` keeps polling the
+        // handler future to natural completion (up to `self.timeout`),
+        // so the coroutine never observes cancellation.
+        //
+        // Returning `RpcHandlerError::Internal("cancelled by caller")`
+        // is benign on the substrate side: the dispatch loop's
+        // CANCEL-wins ordering overwrites the response with
+        // `RpcStatus::Cancelled` whenever `cancellation.is_cancelled()`
+        // is true (see `cortex::rpc::dispatch` near the "CANCEL-wins
+        // ordering" comment), so the caller still sees Cancelled,
+        // not Internal.
+        let timeout_result = tokio::select! {
+            biased;
+            _ = ctx.cancellation.cancelled() => {
+                return Err(RpcHandlerError::Internal(
+                    "cancelled by caller".to_string(),
+                ));
+            }
+            r = tokio::time::timeout(self.timeout, fut) => r,
+        };
         let py_result = match timeout_result {
             Ok(r) => r,
             Err(_) => {
@@ -773,7 +801,19 @@ impl RpcClientStreamingHandler for PyAsyncRpcClientStreamingHandler {
                 };
             }
         };
-        let timeout_result = tokio::time::timeout(self.timeout, fut).await;
+        // Race against `ctx.cancellation` so a caller-side CANCEL
+        // drops the dispatched Python coroutine — same rationale as
+        // `PyAsyncRpcHandler::call`. The substrate's CANCEL-wins
+        // ordering still owns the response-status mapping.
+        let timeout_result = tokio::select! {
+            biased;
+            _ = ctx.cancellation.cancelled() => {
+                return Err(RpcHandlerError::Internal(
+                    "cancelled by caller".to_string(),
+                ));
+            }
+            r = tokio::time::timeout(self.timeout, fut) => r,
+        };
         let py_result = match timeout_result {
             Ok(r) => r,
             Err(_) => {
@@ -848,7 +888,19 @@ impl RpcDuplexHandler for PyAsyncRpcDuplexHandler {
                 };
             }
         };
-        let timeout_result = tokio::time::timeout(self.timeout, fut).await;
+        // Race against `ctx.cancellation` so a caller-side CANCEL
+        // drops the dispatched Python coroutine — same rationale as
+        // `PyAsyncRpcHandler::call`. The substrate's CANCEL-wins
+        // ordering still owns the response-status mapping.
+        let timeout_result = tokio::select! {
+            biased;
+            _ = ctx.cancellation.cancelled() => {
+                return Err(RpcHandlerError::Internal(
+                    "cancelled by caller".to_string(),
+                ));
+            }
+            r = tokio::time::timeout(self.timeout, fut) => r,
+        };
         let py_result = match timeout_result {
             Ok(r) => r,
             Err(_) => {
@@ -1790,6 +1842,143 @@ impl RpcDuplexHandler for PyRpcDuplexHandler {
     }
 }
 
+/// Async `RpcStreamingHandler` impl bridging to a Python
+/// coroutine. Signature: `async def handler(req: bytes, sink:
+/// ResponseSinkSend) -> None`. Mirrors PyAsyncRpcDuplexHandler
+/// minus the request-stream half.
+struct PyAsyncRpcStreamingHandler {
+    callable: Py<PyAny>,
+    timeout: Duration,
+}
+
+#[async_trait::async_trait]
+impl RpcStreamingHandler for PyAsyncRpcStreamingHandler {
+    async fn call(
+        &self,
+        ctx: RpcContext,
+        sink: InnerRpcResponseSink,
+    ) -> std::result::Result<(), RpcHandlerError> {
+        let callable = Python::attach(|py| self.callable.clone_ref(py));
+        let sink_inner = Arc::new(Mutex::new(Some(sink)));
+        let payload_bytes: Vec<u8> = ctx.payload.body.to_vec();
+        let fut_result = Python::attach(|py| -> Result<_, PyErr> {
+            let req_obj = PyBytes::new(py, &payload_bytes);
+            let sink_obj = Py::new(py, PyResponseSinkSend { inner: sink_inner })?;
+            let sink_bound = sink_obj.into_bound(py);
+            let args = PyTuple::new(py, [req_obj.into_any(), sink_bound.into_any()])?;
+            let coro = callable.call1(py, args)?;
+            crate::async_bridge::dispatch_handler_coro(py, coro.into_bound(py))
+        });
+        let fut = match fut_result {
+            Ok(f) => f,
+            Err(pyerr) => {
+                let outcome = Python::attach(|py| extract_app_error(py, &pyerr));
+                return match outcome {
+                    Some((code, body)) => Err(RpcHandlerError::Application {
+                        code,
+                        message: String::from_utf8_lossy(&body).into_owned(),
+                    }),
+                    None => Err(RpcHandlerError::Internal(format!(
+                        "Python async streaming handler raised: {pyerr}"
+                    ))),
+                };
+            }
+        };
+        // Race against `ctx.cancellation` so a caller-side CANCEL
+        // drops the dispatched Python coroutine — same rationale as
+        // `PyAsyncRpcHandler::call`. The substrate's CANCEL-wins
+        // ordering still owns the response-status mapping.
+        let timeout_result = tokio::select! {
+            biased;
+            _ = ctx.cancellation.cancelled() => {
+                return Err(RpcHandlerError::Internal(
+                    "cancelled by caller".to_string(),
+                ));
+            }
+            r = tokio::time::timeout(self.timeout, fut) => r,
+        };
+        let py_result = match timeout_result {
+            Ok(r) => r,
+            Err(_) => {
+                return Err(RpcHandlerError::Internal(format!(
+                    "Python async streaming handler did not respond within {} ms",
+                    self.timeout.as_millis()
+                )));
+            }
+        };
+        match py_result {
+            Ok(_) => Ok(()),
+            Err(pyerr) => {
+                let outcome = pyerr_to_handler_outcome(&pyerr, "async streaming handler");
+                match finalize_handler_outcome(outcome) {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+    }
+}
+
+/// `RpcStreamingHandler` impl bridging to a sync Python callable.
+/// Signature: `handler(req: bytes, sink: ResponseSinkSend) -> None`.
+/// The handler emits zero-or-more chunks via `sink.send(bytes)`
+/// and returns when the stream is complete. Substrate emits the
+/// terminal frame at handler-return.
+struct PyRpcStreamingHandler {
+    callable: Py<PyAny>,
+    timeout: Duration,
+}
+
+#[async_trait::async_trait]
+impl RpcStreamingHandler for PyRpcStreamingHandler {
+    async fn call(
+        &self,
+        ctx: RpcContext,
+        sink: InnerRpcResponseSink,
+    ) -> std::result::Result<(), RpcHandlerError> {
+        let callable = Python::attach(|py| self.callable.clone_ref(py));
+        let sink_inner = Arc::new(Mutex::new(Some(sink)));
+        let payload_bytes: Vec<u8> = ctx.payload.body.to_vec();
+        let result = tokio::time::timeout(
+            self.timeout,
+            tokio::task::spawn_blocking(move || -> Result<HandlerOutcome, String> {
+                Python::attach(|py| -> Result<HandlerOutcome, String> {
+                    let req_obj = PyBytes::new(py, &payload_bytes);
+                    let sink_obj = Py::new(py, PyResponseSinkSend { inner: sink_inner })
+                        .map_err(|e| format!("failed to build response sink: {e}"))?;
+                    let sink_bound = sink_obj.into_bound(py);
+                    let args = PyTuple::new(py, [req_obj.into_any(), sink_bound.into_any()])
+                        .map_err(|e| format!("failed to build args: {e}"))?;
+                    match callable.call1(py, args) {
+                        Ok(_) => Ok(HandlerOutcome::Ok(Vec::new())),
+                        Err(pyerr) => {
+                            if let Some((code, body)) = extract_app_error(py, &pyerr) {
+                                Ok(HandlerOutcome::AppError { code, body })
+                            } else {
+                                Err(format!("Python streaming handler raised: {pyerr}"))
+                            }
+                        }
+                    }
+                })
+            }),
+        )
+        .await;
+        match result {
+            Ok(Ok(outcome)) => match finalize_handler_outcome(outcome) {
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            },
+            Ok(Err(join_err)) => Err(RpcHandlerError::Internal(format!(
+                "spawn_blocking task panicked: {join_err}"
+            ))),
+            Err(_) => Err(RpcHandlerError::Internal(format!(
+                "Python streaming handler did not respond within {} ms",
+                self.timeout.as_millis()
+            ))),
+        }
+    }
+}
+
 /// Sentinel for the abort path of `block_until_cancellable`. The
 /// Apply the optional ``Cancellable`` from the user's opts to the
 /// inner ``CallOptions``: reserves a token on the substrate, arms
@@ -2160,6 +2349,47 @@ impl PyMeshRpc {
         })
     }
 
+    /// Capability-routed streaming call. Resolves ``service``
+    /// against the local capability index, applies routing +
+    /// cap-auth gate (mirrors :meth:`call_service`), then opens
+    /// the streaming call (mirrors :meth:`call_streaming` for the
+    /// returned iterator shape).
+    ///
+    /// Used by :func:`net.tool.call_tool_streaming` for streaming
+    /// tool invocations. Pass ``opts={'cancel': cancel}`` for
+    /// mid-stream cancel via :class:`Cancellable`.
+    #[pyo3(signature = (service, request, opts=None))]
+    fn call_service_streaming<'py>(
+        &self,
+        py: Python<'py>,
+        service: String,
+        request: &Bound<'py, PyBytes>,
+        opts: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<PyRpcStream> {
+        check_cancel_keys_exclusive(opts)?;
+        let cancel = extract_cancellable(opts)?;
+        let raw_cancel_token = extract_cancel_token(opts)?;
+        let mut inner_opts = call_options_from_dict(opts)?;
+        if let Some(t) = raw_cancel_token {
+            inner_opts.cancel_token = Some(t);
+        }
+        let _armed = apply_cancellable(&self.node, cancel.as_ref(), &mut inner_opts);
+        let req_bytes = Bytes::copy_from_slice(request.as_bytes());
+        let runtime = self.runtime.clone();
+        let node = self.node.clone();
+        let inner = py.detach(|| {
+            runtime.block_on(async move {
+                node.call_service_streaming(&service, req_bytes, inner_opts)
+                    .await
+                    .map_err(rpc_error_to_pyerr)
+            })
+        })?;
+        Ok(PyRpcStream {
+            inner: Arc::new(Mutex::new(Some(inner))),
+            runtime: self.runtime.clone(),
+        })
+    }
+
     /// Open a client-streaming call. Returns a
     /// :class:`ClientStreamCall`; push chunks via ``call.send(bytes)``
     /// then ``call.finish()`` to await the terminal response. The
@@ -2295,6 +2525,36 @@ impl PyMeshRpc {
         let inner = self
             .node
             .serve_rpc_duplex(&service, rust_handler)
+            .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
+        Ok(PyServeHandle {
+            inner: Arc::new(Mutex::new(Some(inner))),
+        })
+    }
+
+    /// Register a Python server-streaming handler on ``service``.
+    /// ``handler`` must be callable as
+    /// ``handler(req: bytes, sink: ResponseSinkSend) -> None``.
+    /// Emit chunks via ``sink.send(bytes)``; substrate emits the
+    /// terminal frame when the handler returns.
+    ///
+    /// Used under :func:`net.tool.serve_tool_streaming` to expose
+    /// ToolEvent-emitting handlers.
+    #[pyo3(signature = (service, handler, handler_timeout_ms=None))]
+    fn serve_streaming(
+        &self,
+        service: String,
+        handler: Py<PyAny>,
+        handler_timeout_ms: Option<u64>,
+    ) -> PyResult<PyServeHandle> {
+        let timeout = resolve_handler_timeout(handler_timeout_ms);
+        let rust_handler = Arc::new(PyRpcStreamingHandler {
+            callable: handler,
+            timeout,
+        });
+        let _enter = self.runtime.enter();
+        let inner = self
+            .node
+            .serve_rpc_streaming(&service, rust_handler)
             .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
         Ok(PyServeHandle {
             inner: Arc::new(Mutex::new(Some(inner))),
@@ -2562,6 +2822,48 @@ impl PyAsyncMeshRpc {
         })
     }
 
+    /// Register a Python server-streaming handler. Accepts EITHER
+    /// a sync `def handler(req, sink) -> None` OR an
+    /// `async def handler(req, sink) -> None`.
+    ///
+    /// Emit chunks via `sink.send(bytes)`; substrate emits the
+    /// terminal frame when the handler returns / coroutine
+    /// resolves.
+    ///
+    /// Sync equivalent: :meth:`MeshRpc.serve_streaming`.
+    #[pyo3(signature = (service, handler, handler_timeout_ms=None))]
+    fn serve_streaming(
+        &self,
+        py: Python<'_>,
+        service: String,
+        handler: Py<PyAny>,
+        handler_timeout_ms: Option<u64>,
+    ) -> PyResult<PyServeHandle> {
+        let timeout = resolve_handler_timeout(handler_timeout_ms);
+        let _enter = self.runtime.enter();
+        let inner = if is_coroutine_function(py, &handler) {
+            self.node.serve_rpc_streaming(
+                &service,
+                Arc::new(PyAsyncRpcStreamingHandler {
+                    callable: handler,
+                    timeout,
+                }),
+            )
+        } else {
+            self.node.serve_rpc_streaming(
+                &service,
+                Arc::new(PyRpcStreamingHandler {
+                    callable: handler,
+                    timeout,
+                }),
+            )
+        }
+        .map_err(|e| RpcError::new_err(format!("serve failed: {e}")))?;
+        Ok(PyServeHandle {
+            inner: Arc::new(Mutex::new(Some(inner))),
+        })
+    }
+
     /// Direct-addressed unary call. Returns an awaitable resolving
     /// to the response body as `bytes`. Asyncio task cancellation
     /// (e.g. `asyncio.wait_for(..., timeout=...)` expiry) fires
@@ -2731,6 +3033,44 @@ impl PyAsyncMeshRpc {
             async move {
                 let stream = node
                     .call_streaming(target_node_id, &service, req_bytes, inner_opts)
+                    .await
+                    .map_err(rpc_error_to_pyerr)?;
+                Ok::<_, PyErr>(PyAsyncRpcStream {
+                    inner: Arc::new(TokioMutex::new(Some(stream))),
+                    closed: Arc::new(AtomicBool::new(false)),
+                    mesh: mesh_for_stream,
+                    cancel_token: token,
+                })
+            }
+        })
+    }
+
+    /// Capability-routed streaming call. Mirrors
+    /// :meth:`call_service` for target resolution + cap-auth gate;
+    /// mirrors :meth:`call_streaming` for the chunk-iterator
+    /// return shape.
+    ///
+    /// Used by :func:`net.tool.call_tool_streaming_async` for
+    /// streaming tool invocations.
+    ///
+    /// Sync equivalent: :meth:`MeshRpc.call_service_streaming`.
+    #[pyo3(signature = (service, request, opts=None))]
+    fn call_service_streaming<'py>(
+        &self,
+        py: Python<'py>,
+        service: String,
+        request: &Bound<'py, PyBytes>,
+        opts: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut inner_opts = call_options_from_dict(opts)?;
+        let req_bytes = Bytes::copy_from_slice(request.as_bytes());
+        let node = self.node.clone();
+        let mesh_for_stream = self.node.clone();
+        crate::async_bridge::await_with_cancel(py, &self.node, move |token| {
+            inner_opts.cancel_token = Some(token);
+            async move {
+                let stream = node
+                    .call_service_streaming(&service, req_bytes, inner_opts)
                     .await
                     .map_err(rpc_error_to_pyerr)?;
                 Ok::<_, PyErr>(PyAsyncRpcStream {

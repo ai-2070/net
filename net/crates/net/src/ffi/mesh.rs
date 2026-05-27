@@ -628,7 +628,11 @@ pub unsafe extern "C" fn net_mesh_free(handle: *mut MeshNodeHandle) {
 /// from a borrowed handle without crossing the FFI boundary.
 /// Used by sibling FFI modules (`ffi::aggregator`) that need
 /// the inner Arc without round-tripping through the extern
-/// `net_mesh_arc_clone` + `net_mesh_arc_free` pair.
+/// `net_mesh_arc_clone` + `net_mesh_arc_free` pair. The only
+/// consumer (`ffi::aggregator`) is itself cortex-feature-only,
+/// so the gate keeps the symbol out of cortex-off builds and
+/// avoids a dead-code warning.
+#[cfg(feature = "cortex")]
 pub(super) fn mesh_node_arc(h: &MeshNodeHandle) -> Arc<MeshNode> {
     Arc::clone(&h.inner)
 }
@@ -4181,7 +4185,9 @@ mod nat_traversal_stub_tests {
     fn nat_type_stub_returns_unsupported() {
         let mut out_str: *mut c_char = ptr::null_mut();
         let mut out_len: usize = 0;
-        let code = net_mesh_nat_type(ptr::null_mut(), &mut out_str, &mut out_len);
+        // SAFETY: stub path — null handle is the documented sentinel
+        // the stub fast-paths to `NET_ERR_TRAVERSAL_UNSUPPORTED`.
+        let code = unsafe { net_mesh_nat_type(ptr::null_mut(), &mut out_str, &mut out_len) };
         assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
     }
 
@@ -4189,7 +4195,8 @@ mod nat_traversal_stub_tests {
     fn reflex_addr_stub_returns_unsupported() {
         let mut out_str: *mut c_char = ptr::null_mut();
         let mut out_len: usize = 0;
-        let code = net_mesh_reflex_addr(ptr::null_mut(), &mut out_str, &mut out_len);
+        // SAFETY: stub path — see `nat_type_stub_returns_unsupported`.
+        let code = unsafe { net_mesh_reflex_addr(ptr::null_mut(), &mut out_str, &mut out_len) };
         assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
     }
 
@@ -4197,7 +4204,9 @@ mod nat_traversal_stub_tests {
     fn peer_nat_type_stub_returns_unsupported() {
         let mut out_str: *mut c_char = ptr::null_mut();
         let mut out_len: usize = 0;
-        let code = net_mesh_peer_nat_type(ptr::null_mut(), 0, &mut out_str, &mut out_len);
+        // SAFETY: stub path — see `nat_type_stub_returns_unsupported`.
+        let code =
+            unsafe { net_mesh_peer_nat_type(ptr::null_mut(), 0, &mut out_str, &mut out_len) };
         assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
     }
 
@@ -4205,13 +4214,15 @@ mod nat_traversal_stub_tests {
     fn probe_reflex_stub_returns_unsupported() {
         let mut out_str: *mut c_char = ptr::null_mut();
         let mut out_len: usize = 0;
-        let code = net_mesh_probe_reflex(ptr::null_mut(), 0, &mut out_str, &mut out_len);
+        // SAFETY: stub path — see `nat_type_stub_returns_unsupported`.
+        let code = unsafe { net_mesh_probe_reflex(ptr::null_mut(), 0, &mut out_str, &mut out_len) };
         assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
     }
 
     #[test]
     fn reclassify_nat_stub_returns_unsupported() {
-        let code = net_mesh_reclassify_nat(ptr::null_mut());
+        // SAFETY: stub path — see `nat_type_stub_returns_unsupported`.
+        let code = unsafe { net_mesh_reclassify_nat(ptr::null_mut()) };
         assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
     }
 
@@ -4220,25 +4231,29 @@ mod nat_traversal_stub_tests {
         let mut a: u64 = 0;
         let mut b: u64 = 0;
         let mut c: u64 = 0;
-        let code = net_mesh_traversal_stats(ptr::null_mut(), &mut a, &mut b, &mut c);
+        // SAFETY: stub path — see `nat_type_stub_returns_unsupported`.
+        let code = unsafe { net_mesh_traversal_stats(ptr::null_mut(), &mut a, &mut b, &mut c) };
         assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
     }
 
     #[test]
     fn connect_direct_stub_returns_unsupported() {
-        let code = net_mesh_connect_direct(ptr::null_mut(), 0, ptr::null(), 0);
+        // SAFETY: stub path — see `nat_type_stub_returns_unsupported`.
+        let code = unsafe { net_mesh_connect_direct(ptr::null_mut(), 0, ptr::null(), 0) };
         assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
     }
 
     #[test]
     fn set_reflex_override_stub_returns_unsupported() {
-        let code = net_mesh_set_reflex_override(ptr::null_mut(), ptr::null());
+        // SAFETY: stub path — see `nat_type_stub_returns_unsupported`.
+        let code = unsafe { net_mesh_set_reflex_override(ptr::null_mut(), ptr::null()) };
         assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
     }
 
     #[test]
     fn clear_reflex_override_stub_returns_unsupported() {
-        let code = net_mesh_clear_reflex_override(ptr::null_mut());
+        // SAFETY: stub path — see `nat_type_stub_returns_unsupported`.
+        let code = unsafe { net_mesh_clear_reflex_override(ptr::null_mut()) };
         assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
     }
 

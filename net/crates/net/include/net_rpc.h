@@ -401,6 +401,24 @@ int net_rpc_call_streaming_with_headers_cancellable(
     RpcStreamHandleC** out_stream,
     char** out_err);
 
+/* Capability-routed streaming call. Mirrors net_rpc_call_service
+ * for target resolution + cap-auth gate; returns a stream handle
+ * with the same drain semantics as net_rpc_call_streaming.
+ * cancel_token != 0 routes through the substrate cancel-registry
+ * like net_rpc_call_streaming_cancellable.
+ *
+ * Consumed by Go's net.CallToolStreaming for streaming tool
+ * invocations. */
+int net_rpc_call_service_streaming(
+    MeshRpcHandle* handle,
+    const char* service_ptr, size_t service_len,
+    const uint8_t* req_ptr, size_t req_len,
+    uint64_t deadline_ms,
+    uint32_t stream_window,
+    uint64_t cancel_token,
+    RpcStreamHandleC** out_stream,
+    char** out_err);
+
 /* All node ids advertising `nrpc:<service>` in the local
  * capability index. On success writes a heap-allocated `u64`
  * array of length `*out_count` to `*out_ptr`; caller frees via
@@ -411,6 +429,63 @@ int net_rpc_find_service_nodes(
     MeshRpcHandle* handle,
     const char* service_ptr, size_t service_len,
     uint64_t** out_ptr, size_t* out_count,
+    char** out_err);
+
+/* Function pointer the Go side registers via
+ * net_rpc_set_streaming_handler_dispatcher. Called once per
+ * inbound streaming REQUEST; handler reads the request body once
+ * and pushes response chunks via the sink. Returns NET_RPC_OK on
+ * clean close, non-zero with *out_err set on failure. */
+typedef int (*net_rpc_streaming_handler_fn)(
+    uint64_t handler_id,
+    const uint8_t* req_ptr, size_t req_len,
+    RpcResponseSinkHandleC* response_sink,
+    char** out_err);
+
+/* Register the process-wide streaming handler dispatcher.
+ * Idempotent — first call wins. */
+void net_rpc_set_streaming_handler_dispatcher(
+    net_rpc_streaming_handler_fn dispatcher);
+
+/* Register a server-streaming handler for `service`. Same
+ * pre-registration discipline as net_rpc_serve / net_rpc_serve_duplex —
+ * caller reserves a handler_id, inserts the Go-side callable into
+ * its registry under that id, THEN calls this function. Returns
+ * NULL with *out_err set on failure. */
+ServeHandleC* net_rpc_serve_streaming(
+    MeshRpcHandle* handle,
+    const char* service_ptr, size_t service_len,
+    uint64_t handler_id,
+    uint64_t handler_timeout_ms,
+    char** out_err);
+
+/* AI-tool discovery — flat list of (tool_id, version) descriptor
+ * rows aggregated from the local capability fold. On success
+ * writes a heap-allocated JSON-encoded array (UTF-8) to
+ * (*out_json_ptr, *out_json_len); caller frees via
+ * net_rpc_response_free(ptr, len). Empty fold writes the literal
+ * `[]`. Each row matches the wire shape of
+ * `net::adapter::net::cortex::tool::ToolDescriptor`:
+ *
+ *   {
+ *     "tool_id": "...",
+ *     "name": "...",
+ *     "version": "...",
+ *     "description": "...",      // optional, null when absent
+ *     "input_schema": "...",     // JSON-Schema string, optional
+ *     "output_schema": "...",    // optional
+ *     "requires": ["..."],
+ *     "estimated_time_ms": 0,
+ *     "stateless": true,
+ *     "streaming": false,
+ *     "tags": ["..."],
+ *     "node_count": 1
+ *   }
+ *
+ * Gated on rpc-ffi's `tool` feature (default-on). */
+int net_rpc_list_tools(
+    const MeshRpcHandle* handle,
+    uint8_t** out_json_ptr, size_t* out_json_len,
     char** out_err);
 
 /* =========================================================================

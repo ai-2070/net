@@ -8,11 +8,11 @@ on:
     # release workflow. The release workflows themselves run
     # their own build + tests against the same SHA; we don't
     # need CI to repeat them per tag.
-    branches: ['**']
+    branches: ["**"]
     paths:
-      - 'net/**'
-      - 'go/**'
-      - '.github/workflows/ci.yml'
+      - "net/**"
+      - "go/**"
+      - ".github/workflows/ci.yml"
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,6 +21,7 @@ jobs:
   unit-tests:
     name: Unit tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net
@@ -64,6 +65,7 @@ jobs:
   integration-tests:
     name: Integration tests (Net, 3-node, Mikoshi, RedEX, CortEX, NetDB, nRPC, Dataforts, MeshDB, MeshOS)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net
@@ -175,10 +177,15 @@ jobs:
           --test redex_replication_e2e
 
       # === CortEX + nRPC service surface ==================================
-      - name: CortEX + nRPC
+      # `tool` chains to `cortex` (see `tool = ["cortex"]` in
+      # Cargo.toml), so adding it here is feature-graph-cheap and
+      # keeps `integration_tool_announce` — the substrate-side
+      # serve_tool / announce / tool_metadata.fetch contract pin —
+      # in this group rather than spawning a fourth compile pass.
+      - name: CortEX + nRPC + AI Tools
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features cortex
+          cargo nextest run --no-fail-fast --features "cortex tool"
           --test integration_cortex_adapter
           --test integration_cortex_tasks
           --test integration_cortex_memories
@@ -193,6 +200,7 @@ jobs:
           --test integration_nrpc_predicate_header
           --test integration_nrpc_cross_lang
           --test integration_nrpc_cross_lang_streaming
+          --test integration_tool_announce
           --test nrpc_inbound_dispatcher
           --test queue_group_dispatch
           --test aggregator_fold_query
@@ -277,6 +285,7 @@ jobs:
   loom-tests:
     name: Loom concurrency models
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net
@@ -325,6 +334,7 @@ jobs:
   rust-sdk-tests:
     name: Rust SDK tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net/sdk
@@ -350,8 +360,8 @@ jobs:
       # service containers land — same policy as the main crate's
       # `integration_redis`). Without this width, tests gated on
       # `cortex` / `testing` / `compute` / `nat-traversal` /
-      # `port-mapping` compile to empty test binaries and the
-      # contract goes silently unverified.
+      # `port-mapping` / `tool` / `macros` compile to empty test
+      # binaries and the contract goes silently unverified.
       # `cargo test` auto-discovers every `tests/*.rs` file under
       # `sdk/tests/`; the step name calls out the load-bearing
       # ones so a missing test binary is obvious in the CI log:
@@ -359,19 +369,31 @@ jobs:
       #   - mesh_rpc_bidi_typed     — Phase E client-streaming +
       #     duplex typed SDK surface (5 tests). Gated on
       #     `feature = "net" + "cortex"`, both present here.
-      - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed)
-        run: cargo test --features "net cortex testing compute nat-traversal port-mapping aggregator"
+      #   - tool_serve_round_trip   — Mesh::serve_tool + call_tool +
+      #     watch_tools live two-mesh path. Gated on
+      #     `feature = "tool" + "cortex"`.
+      #   - tool_format_golden_vectors — T-1 byte-equality
+      #     verifier (openai / anthropic / mcp / gemini lowering +
+      #     reverse). Gated on `feature = "tool"`.
+      #   - tool_event_golden_vectors  — T-2 ToolEvent envelope
+      #     round-trip verifier. Gated on `feature = "tool"`.
+      #   - tool_macro              — `#[tool]` proc-macro
+      #     expansion + serve-helper round-trip. Gated on
+      #     `feature = "macros" + "cortex"`.
+      - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed, tool_*)
+        run: cargo test --features "net cortex testing compute nat-traversal port-mapping aggregator tool macros"
 
       # SDK doctests — `///` examples in `sdk/src/`. Same feature set
       # as the test run so doc examples gated on those features
       # compile.
       - name: Run Rust SDK doctests
         if: ${{ !cancelled() }}
-        run: cargo test --doc --features "net cortex testing compute nat-traversal port-mapping"
+        run: cargo test --doc --features "net cortex testing compute nat-traversal port-mapping tool macros"
 
   node-tests:
     name: Node bindings tests (vitest)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net/bindings/node
@@ -437,6 +459,7 @@ jobs:
   sdk-ts-tests:
     name: TypeScript SDK tests (vitest + tsc)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net/sdk-ts
@@ -514,6 +537,7 @@ jobs:
   python-tests:
     name: Python bindings tests (pytest)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net/bindings/python
@@ -550,7 +574,13 @@ jobs:
           echo "VIRTUAL_ENV=${PWD}/.venv" >> "$GITHUB_ENV"
 
       - name: Install maturin and pytest
-        run: pip install --upgrade pip maturin pytest
+        # pytest-timeout surfaces the offending test on hangs —
+        # without it, a deadlock anywhere in the suite ticks the
+        # job-level timeout-minutes and the CI log gives no hint
+        # which test was stuck. 60 s is generous for unit/integration
+        # mesh tests on GHA; the longest legitimate test in the
+        # suite is well under that.
+        run: pip install --upgrade pip maturin pytest pytest-timeout
 
       # `net,cortex,compute,groups,meshdb,meshos,deck` mirrors the
       # Node binding's feature set for tests. `groups` is needed so
@@ -563,12 +593,36 @@ jobs:
       - name: Build and install bindings
         run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator
 
+      # `--timeout-method=thread` is critical for this FFI-heavy
+      # suite: the default `signal` method only works while Python
+      # is between bytecode instructions, so a deadlock inside a
+      # pyo3 call (or in a Rust-spawned thread we're waiting on)
+      # never gets interrupted. Thread-mode wakes a watchdog after
+      # the deadline regardless of where the test is blocked and
+      # dumps a full Python + C frame for the hung test.
+      #
+      # `--timeout=30` so even if a hang lands 19 min into the
+      # run, the watchdog still has a minute of budget to dump the
+      # offender before the 20-minute job ceiling fires.
+      #
+      # `-s` (`--capture=no`) disables pytest's stdout/stderr
+      # capture so timeout dumps + faulthandler traces appear in
+      # the GHA log live, not buffered behind a hung test's exit.
+      # `PYTHONFAULTHANDLER=1` enables faulthandler at interpreter
+      # startup so a hard hang in a Rust FFI call (where the
+      # pytest-timeout thread can't print through pytest's capture)
+      # still dumps a C-level stack when SIGSEGV/SIGABRT fires or
+      # when the watchdog sends the dump signal.
       - name: Run tests
-        run: pytest -v
+        env:
+          PYTHONFAULTHANDLER: "1"
+          PYTHONUNBUFFERED: "1"
+        run: pytest -v -s --timeout=30 --timeout-method=thread
 
   sdk-py-tests:
     name: Python SDK tests (sdk-py, pytest)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net/sdk-py
@@ -603,6 +657,7 @@ jobs:
   go-tests:
     name: Go bindings tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
 
@@ -625,7 +680,7 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-go-${{ hashFiles('**/Cargo.lock') }}
 
-      # The Go bindings link against FIVE cdylibs via cgo:
+      # The Go bindings link against SIX cdylibs via cgo:
       #   - `-lnet` (libnet.so, the main `net-mesh` crate) from net.go
       #   - `-lnet_compute` (libnet_compute.so, the `net-compute-ffi`
       #     workspace member at bindings/go/compute-ffi) from compute.go
@@ -635,7 +690,12 @@ jobs:
       #     workspace member at bindings/go/meshos-ffi) from meshos.go
       #   - `-lnet_deck` (libnet_deck.so, the `net-deck-ffi`
       #     workspace member at bindings/go/deck-ffi) from deck.go
-      # All five end up in `net/crates/net/target/release/`.
+      #   - `-lnet_rpc` (libnet_rpc.so, the `net-rpc-ffi`
+      #     workspace member at bindings/go/rpc-ffi) from
+      #     mesh_rpc.go / mesh_rpc_typed.go / tool.go. Added in the
+      #     NET_GO_NRPC_PORT slices (G-1..G-5) — without it the
+      #     typed/streaming/tool tests fail at link.
+      # All six end up in `net/crates/net/target/release/`.
       #
       # Features:
       #   - `net-mesh` needs `netdb,dataforts,redex-disk,nat-traversal,redis`
@@ -646,16 +706,16 @@ jobs:
       #   - `net-compute-ffi` needs `test-helpers` so the FFI symbol
       #     `net_compute_test_inject_synthetic_peer` (referenced by
       #     `groups_testhelpers.go`) is exported.
-      #   - `net-meshdb-ffi`, `net-meshos-ffi`, `net-deck-ffi` have no
-      #     extra features beyond their defaults.
+      #   - `net-meshdb-ffi`, `net-meshos-ffi`, `net-deck-ffi`,
+      #     `net-rpc-ffi` have no extra features beyond their defaults.
       #
       # Built as one cargo invocation so feature unification on the
       # shared `net-mesh` dep doesn't cause a second compilation pass.
-      - name: Build net + net_compute + net_meshdb + net_meshos + net_deck cdylibs
+      - name: Build net + net_compute + net_meshdb + net_meshos + net_deck + net_rpc cdylibs
         working-directory: net/crates/net
         run: >
           cargo build --release
-          -p net-mesh -p net-compute-ffi -p net-meshdb-ffi -p net-meshos-ffi -p net-deck-ffi
+          -p net-mesh -p net-compute-ffi -p net-meshdb-ffi -p net-meshos-ffi -p net-deck-ffi -p net-rpc-ffi
           --features "net-mesh/netdb,net-mesh/dataforts,net-mesh/redex-disk,net-mesh/nat-traversal,net-mesh/redis,net-compute-ffi/test-helpers"
 
       # `integration_test.go` gates its suite behind RUN_INTEGRATION_TESTS=1
@@ -685,6 +745,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net
@@ -748,6 +809,7 @@ jobs:
   ffi-clippy:
     name: FFI clippy (${{ matrix.crate.name }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -780,6 +842,35 @@ jobs:
             # we want CI to enforce against. The `test-helpers`
             # symbols are exercised by the `go test` suite, not by
             # consumers.
+            features: ""
+          - name: go-rpc-ffi
+            # nRPC FFI shim — carries the dispatcher trampolines
+            # (`net_rpc_set_handler_dispatcher`,
+            # `net_rpc_set_client_streaming_handler_dispatcher`,
+            # `net_rpc_set_duplex_handler_dispatcher`,
+            # `net_rpc_set_streaming_handler_dispatcher`) consumed
+            # by `go/mesh_rpc.go`. Lint-coverage gap closed when the
+            # streaming-serve dispatcher landed (G-1 of
+            # NET_GO_NRPC_PORT).
+            path: net/crates/net/bindings/go/rpc-ffi
+            features: ""
+          - name: go-meshdb-ffi
+            path: net/crates/net/bindings/go/meshdb-ffi
+            features: ""
+          - name: go-meshos-ffi
+            path: net/crates/net/bindings/go/meshos-ffi
+            features: ""
+          - name: go-deck-ffi
+            path: net/crates/net/bindings/go/deck-ffi
+            features: ""
+          - name: sdk-macros
+            # `net-mesh-sdk-macros` ships the `#[tool]` attribute
+            # proc-macro. Linted separately from the SDK because the
+            # proc-macro crate doesn't inherit feature flags from
+            # its consumers — its public surface is the macro's
+            # generated code, which the SDK's `tool_macro`
+            # integration test covers separately at runtime.
+            path: net/crates/net/sdk-macros
             features: ""
           - name: cli
             path: net/crates/net/cli
@@ -850,6 +941,7 @@ jobs:
     #     (pins the last-error envelope on every NULL-arm return)
     name: FFI tests (${{ matrix.crate.name }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -868,6 +960,9 @@ jobs:
             features: ""
           - name: go-meshdb-ffi
             path: net/crates/net/bindings/go/meshdb-ffi
+            features: ""
+          - name: go-meshos-ffi
+            path: net/crates/net/bindings/go/meshos-ffi
             features: ""
           - name: go-deck-ffi
             path: net/crates/net/bindings/go/deck-ffi
@@ -1106,6 +1201,7 @@ jobs:
     #   tests/dry_run.rs             — admin verb `--dry-run` envelope
     name: Net CLI tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net
@@ -1141,6 +1237,7 @@ jobs:
     # entries don't need a CI edit.
     name: Aggregator daemon tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net
@@ -1167,6 +1264,7 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net
@@ -1184,6 +1282,7 @@ jobs:
   doc:
     name: Documentation
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net
@@ -1227,5 +1326,34 @@ jobs:
 
       - name: Build net-aggregator-daemon documentation
         run: cargo doc -p net-aggregator-daemon --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # `net-mesh-sdk` is a substantial workspace member with most
+      # of the user-facing AI tool / nrpc / mesh / netdb docstrings.
+      # Pinning `--features full` so the full doc surface (tool +
+      # macros + nrpc + cortex + compute + groups + meshos + deck
+      # + dataforts + meshdb + aggregator + local + nat-traversal
+      # + redis + jetstream) is verified warning-free in lockstep
+      # with the `ffi-clippy` `rust-sdk` lint job.
+      - name: Build net-mesh-sdk documentation
+        run: cargo doc -p net-mesh-sdk --no-deps --features full
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # `#[tool]` proc macro crate. User-facing macro docs live
+      # here; the SDK depends on them via `pub use net_sdk_macros::tool;`.
+      - name: Build net-mesh-sdk-macros documentation
+        run: cargo doc -p net-mesh-sdk-macros --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # `net-rpc-ffi` is the cgo-facing nRPC shim. Its public
+      # surface (extern "C" fn signatures + ABI version constants
+      # + handle types) is what `go/mesh_rpc.go` documents against;
+      # keep its rustdoc warning-free so the cross-language ABI
+      # contract notes stay buildable.
+      - name: Build net-rpc-ffi documentation
+        run: cargo doc -p net-rpc-ffi --no-deps
         env:
           RUSTDOCFLAGS: -D warnings

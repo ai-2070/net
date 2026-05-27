@@ -53,6 +53,8 @@ mod placement;
 mod redis_dedup;
 #[cfg(feature = "net")]
 mod subnets;
+#[cfg(feature = "tool")]
+mod tool;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -2092,6 +2094,45 @@ mod mesh_bindings {
         pub fn has_placement_filter(&self, id: String) -> bool {
             use net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
             global_placement_filter_registry().contains(&id)
+        }
+    }
+
+    // =====================================================================
+    // AI tool calling surface — separate `#[napi] impl` block for the
+    // same expansion-time reason the NAT traversal block below calls
+    // out: napi-derive collects method names regardless of inner
+    // `#[cfg]` attributes, so a `#[cfg(feature = "tool")]` on the
+    // method alone leaves a dangling `list_tools_c_callback` reference
+    // when the feature is off. Gating the impl block itself sidesteps
+    // that.
+    // =====================================================================
+
+    #[cfg(feature = "tool")]
+    #[napi]
+    impl NetMesh {
+        /// Walk the local capability fold for every AI tool
+        /// published in the mesh and return one
+        /// [`ToolDescriptorJs`] per `(toolId, version)` slot, with
+        /// `nodeCount` filled in by the aggregating walk.
+        ///
+        /// One in-memory pass; no network. Schemas live as
+        /// JSON-encoded strings on `descriptor.inputSchema` /
+        /// `descriptor.outputSchema` — call `JSON.parse(...)` if
+        /// you need the parsed shape for a provider's
+        /// tool-definition lowering.
+        ///
+        /// Mirror of the Rust SDK's `Mesh::list_tools(None)`. v1
+        /// always walks unfiltered; matcher-pushdown lands in a
+        /// follow-up that adds `TagMatcherJs` to the napi surface.
+        #[napi]
+        pub fn list_tools(&self) -> Result<Vec<crate::tool::ToolDescriptorJs>> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            Ok(node
+                .list_tools(None)
+                .into_iter()
+                .map(crate::tool::descriptor_to_js)
+                .collect())
         }
     }
 

@@ -36,7 +36,9 @@ pub mod behavior;
 // call shapes. Always-built (no cortex feature gate) — the registry
 // is type-pure and small; gating it would mean two parallel
 // definitions, and the `cortex` build is the only consumer today
-// regardless.
+// regardless. The `#[allow(dead_code)]` on cortex-off builds keeps
+// the dead-code lint silent without a per-item annotation fan-out.
+#[cfg_attr(not(feature = "cortex"), allow(dead_code))]
 mod cancel_registry;
 pub mod channel;
 pub mod compute;

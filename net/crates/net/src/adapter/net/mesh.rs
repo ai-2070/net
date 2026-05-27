@@ -1389,6 +1389,15 @@ pub struct MeshNode {
     /// `Mesh::find_service_nodes(name)`.
     #[cfg(feature = "cortex")]
     rpc_local_services: Arc<dashmap::DashSet<String>>,
+    /// Local-only registry of AI-tool descriptors for every
+    /// `serve_tool` registration on this node. Drives the
+    /// auto-merge in [`announce_capabilities_with`] (adds the
+    /// `ai-tool:<name>` tag + the `ToolCapability` + the
+    /// description / streaming / tags metadata keys) and the
+    /// future `tool.metadata.fetch` RPC handler. Empty by default
+    /// — populated only when an SDK consumer calls `serve_tool`.
+    #[cfg(feature = "tool")]
+    tool_registry: Arc<crate::adapter::net::cortex::tool::ToolMetadataRegistry>,
     /// Caller-side per-service nRPC metrics. Updated by
     /// `Mesh::call` via the `mesh_rpc_metrics::CallMetricsGuard`
     /// RAII shim; read out via `Self::rpc_metrics_snapshot` for
@@ -1744,6 +1753,12 @@ pub struct MeshNode {
     /// AGGREGATORS panel both read through this. See
     /// [`Self::aggregator_registry`] and
     /// [`Self::set_aggregator_registry`].
+    ///
+    /// Gated on `cortex` — the registry handle types live in
+    /// `behavior::aggregator`, which only compiles when the
+    /// cortex-gated `mesh_rpc` + `cortex::rpc` surface is
+    /// available.
+    #[cfg(feature = "cortex")]
     aggregator_registry: Option<Arc<super::behavior::aggregator::AggregatorRegistry>>,
     /// Per-peer entity-id map. Keys are `node_id`; values are the
     /// 32-byte ed25519 public key carried on the peer's most recent
@@ -2061,6 +2076,8 @@ impl MeshNode {
             rpc_reply_subscriptions: Arc::new(parking_lot::Mutex::new(Vec::new())),
             #[cfg(feature = "cortex")]
             rpc_local_services: Arc::new(dashmap::DashSet::new()),
+            #[cfg(feature = "tool")]
+            tool_registry: Arc::new(crate::adapter::net::cortex::tool::ToolMetadataRegistry::new()),
             #[cfg(feature = "cortex")]
             rpc_metrics: Arc::new(crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry::new()),
             #[cfg(feature = "cortex")]
@@ -2136,7 +2153,10 @@ impl MeshNode {
             subnet_gateway: None,
             // Aggregator registry is installed lazily via
             // `set_aggregator_registry`; nodes that never run an
-            // aggregator never allocate the HashMap.
+            // aggregator never allocate the HashMap. Cortex-gated
+            // because the `AggregatorRegistry` type rides the
+            // cortex-only `mesh_rpc` / `cortex::rpc` surface.
+            #[cfg(feature = "cortex")]
             aggregator_registry: None,
             peer_entity_ids,
             origin_hash_to_node,
@@ -5334,6 +5354,267 @@ impl MeshNode {
         self.rpc_local_services.clone()
     }
 
+    /// Local-only tool-descriptor registry. SDK-side `serve_tool`
+    /// inserts here on registration + removes on Drop; the
+    /// `announce_capabilities_with` path reads from it to auto-merge
+    /// `ai-tool:<name>` tags, the typed `ToolCapability`, and the
+    /// description / streaming / tags metadata keys. Also drives the
+    /// `tool.metadata.fetch` RPC handler (A-2b) which answers
+    /// "what's the full schema for tool X on this node?".
+    #[cfg(feature = "tool")]
+    pub fn tool_registry(&self) -> &Arc<crate::adapter::net::cortex::tool::ToolMetadataRegistry> {
+        &self.tool_registry
+    }
+
+    /// Walk the capability fold for every `ToolCapability` carried
+    /// in a published `CapabilitySet`, reconstruct a
+    /// [`ToolDescriptor`](crate::adapter::net::cortex::tool::ToolDescriptor)
+    /// per (tool_id, version), and return the deduped list with
+    /// `node_count` filled in.
+    ///
+    /// One in-memory pass over the fold; no network. The fold is the
+    /// source-of-truth for cross-node tool discovery (substrate
+    /// announce merge in A-2a publishes `ToolCapability` + schema
+    /// metadata + the `ai-tool:<id>` tag on every announce).
+    ///
+    /// `matcher` is the standard
+    /// [`TagMatcher`](super::behavior::fold::capability_aggregation::TagMatcher)
+    /// — an entry is included if ANY of its tags match. Pass `None`
+    /// to skip pre-filtering. The classic use case is region-scoping
+    /// the discovery (`Some(TagMatcher::Prefix { value: "region.eu".into() })`).
+    ///
+    /// Schema hydration: schemas live in `CapabilitySet::metadata`
+    /// (too large for tag wire-format); the tag-decoded
+    /// `ToolCapability` carries `input_schema = None` / `output_schema = None`
+    /// until this method fills them from the membership's metadata
+    /// map using the
+    /// [`ToolCapability::input_schema_metadata_key`](super::behavior::capability::ToolCapability::input_schema_metadata_key)
+    /// / `output_schema_metadata_key` keys.
+    #[cfg(feature = "tool")]
+    pub fn list_tools(
+        &self,
+        matcher: Option<&super::behavior::fold::capability_aggregation::TagMatcher>,
+    ) -> Vec<crate::adapter::net::cortex::tool::ToolDescriptor> {
+        use std::collections::{HashMap, HashSet};
+
+        use super::behavior::tag::Tag;
+        use super::behavior::tag_codec::tools_from_tags;
+        use super::behavior::ToolCapability;
+        use crate::adapter::net::cortex::tool::ToolDescriptor;
+
+        // Validate the matcher up front — surface a structured panic
+        // here rather than burying it inside the fold walk, where the
+        // diagnostic would be one stack frame deeper. Mirrors the
+        // existing capability_aggregation contract: caller is expected
+        // to have run `TagMatcher::validate(&matcher)?` ahead of this
+        // call if the matcher is user-supplied.
+        if let Some(m) = matcher {
+            if let Err(e) = m.validate() {
+                panic!(
+                    "MeshNode::list_tools given a matcher this binary can't \
+                     evaluate: {e}",
+                );
+            }
+        }
+
+        // (tool_id, version) → (descriptor, contributing node ids).
+        // `HashSet<u64>` so a node serving the same (id, version)
+        // across multiple class entries counts once.
+        type Bucket = (ToolDescriptor, HashSet<u64>);
+        let mut buckets: HashMap<(String, String), Bucket> = HashMap::new();
+
+        self.capability_fold.with_state(|state| {
+            for ((_class, node_id), entry) in state.entries.iter() {
+                let membership = &entry.payload;
+                if let Some(matcher) = matcher {
+                    if !matcher.matches_any(&membership.tags) {
+                        continue;
+                    }
+                }
+                // Parse tags → reconstruct `Vec<ToolCapability>`.
+                // Tag::parse rejects malformed strings; we skip those.
+                let parsed_tags: Vec<Tag> = membership
+                    .tags
+                    .iter()
+                    .filter_map(|s| Tag::parse(s).ok())
+                    .collect();
+                let tools = tools_from_tags(&parsed_tags);
+                if tools.is_empty() {
+                    continue;
+                }
+                let metadata = &membership.metadata;
+                for mut cap in tools {
+                    // Hydrate schemas from metadata. The tag codec
+                    // doesn't carry them; the announce path stashes
+                    // them on `CapabilitySet::metadata` under these
+                    // keys (see `capability::CapabilitySet::add_tool`).
+                    if cap.input_schema.is_none() {
+                        if let Some(s) =
+                            metadata.get(&ToolCapability::input_schema_metadata_key(&cap.tool_id))
+                        {
+                            cap.input_schema = Some(s.clone());
+                        }
+                    }
+                    if cap.output_schema.is_none() {
+                        if let Some(s) =
+                            metadata.get(&ToolCapability::output_schema_metadata_key(&cap.tool_id))
+                        {
+                            cap.output_schema = Some(s.clone());
+                        }
+                    }
+                    let descriptor = ToolDescriptor::from_capability(&cap, metadata);
+                    let key = (descriptor.tool_id.clone(), descriptor.version.clone());
+                    // Latest-wins on the descriptor fields (excluding
+                    // node_count, which we fill after the walk). Two
+                    // nodes serving the same (id, version) but with
+                    // diverging metadata (description text drift, tag
+                    // additions) get the latest-seen view. Equivalent
+                    // to "take whichever entry the fold walked last";
+                    // not deterministic across runs but the fields
+                    // are operator-controlled metadata, not contract.
+                    use std::collections::hash_map::Entry;
+                    let bucket = match buckets.entry(key) {
+                        Entry::Occupied(e) => {
+                            let bucket = e.into_mut();
+                            bucket.0 = descriptor;
+                            bucket
+                        }
+                        Entry::Vacant(e) => e.insert((descriptor, HashSet::new())),
+                    };
+                    bucket.1.insert(*node_id);
+                }
+            }
+        });
+
+        let mut out: Vec<ToolDescriptor> = buckets
+            .into_iter()
+            .map(|(_, (mut desc, nodes))| {
+                desc.node_count = nodes.len() as u32;
+                desc
+            })
+            .collect();
+        // Stable order — agents iterating `list_tools` in a loop
+        // (re-rendering UI, comparing snapshots) should see the same
+        // shape from one call to the next when the underlying fold
+        // hasn't changed.
+        out.sort_by(|a, b| a.tool_id.cmp(&b.tool_id).then(a.version.cmp(&b.version)));
+        out
+    }
+
+    /// Subscribe to a stream of
+    /// [`ToolListChange`](crate::adapter::net::cortex::tool::ToolListChange)
+    /// events that reflect every dynamic addition / removal /
+    /// publisher-count change in the local capability fold's tool
+    /// view, filtered by `matcher` (same semantic as
+    /// [`Self::list_tools`]).
+    ///
+    /// The returned
+    /// [`ToolListWatch`](crate::adapter::net::cortex::tool::ToolListWatch)
+    /// is a `futures::Stream<Item = ToolListChange>`. The first
+    /// event fires AFTER the initial snapshot — callers that need
+    /// the baseline shape should call `list_tools` first and then
+    /// start the watch.
+    ///
+    /// Backed by a polling task: every `interval` (default `1s`
+    /// when `None`), the task re-runs `list_tools(&matcher)` and
+    /// diffs against its previous snapshot, emitting one event per
+    /// change. Tighter intervals lower discovery latency at the
+    /// cost of CPU; loose intervals are kinder to large folds.
+    ///
+    /// Lifecycle:
+    /// - Dropping the
+    ///   [`ToolListWatch`](crate::adapter::net::cortex::tool::ToolListWatch)
+    ///   stops the polling task on the next tick (the task observes
+    ///   the closed sender and exits).
+    /// - The watch handle never errors: a dropped fold (impossible
+    ///   while the `MeshNode` arc is alive) would simply end the
+    ///   stream. Decode-style errors don't exist here — the
+    ///   underlying walk is in-memory and infallible.
+    #[cfg(feature = "tool")]
+    pub fn watch_tools(
+        self: &Arc<Self>,
+        matcher: Option<super::behavior::fold::capability_aggregation::TagMatcher>,
+        interval: Option<Duration>,
+    ) -> crate::adapter::net::cortex::tool::ToolListWatch {
+        use crate::adapter::net::cortex::tool::{ToolDescriptor, ToolListChange, ToolListWatch};
+        use std::collections::HashMap;
+        let interval = interval.unwrap_or_else(|| Duration::from_secs(1));
+        // Bounded capacity — a slow consumer backpressures the
+        // polling task (which awaits in `send`) instead of letting
+        // ToolListChange events accumulate without bound.
+        let (tx, rx) = tokio::sync::mpsc::channel::<ToolListChange>(256);
+        // Take the initial baseline snapshot SYNCHRONOUSLY before
+        // returning the watch handle. Without this, a caller that
+        // does `let w = watch_tools(...); announce_a_tool().await` can
+        // race the spawned task — the announce may land before the
+        // task's first `list_tools` call, leaving the new tool in
+        // the baseline (and silently skipping the `Added` event).
+        let initial_snapshot: HashMap<(String, String), ToolDescriptor> = self
+            .list_tools(matcher.as_ref())
+            .into_iter()
+            .map(|d| ((d.tool_id.clone(), d.version.clone()), d))
+            .collect();
+        let node = self.clone();
+        let matcher_for_task = matcher;
+        tokio::spawn(async move {
+            let mut prev = initial_snapshot;
+            let mut ticker = tokio::time::interval(interval);
+            // Skip the first immediate tick — the snapshot was just taken.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if tx.is_closed() {
+                    return;
+                }
+                let next: HashMap<(String, String), ToolDescriptor> = node
+                    .list_tools(matcher_for_task.as_ref())
+                    .into_iter()
+                    .map(|d| ((d.tool_id.clone(), d.version.clone()), d))
+                    .collect();
+                // Added: in next, not in prev.
+                for (key, desc) in next.iter() {
+                    if !prev.contains_key(key)
+                        && tx.send(ToolListChange::Added(desc.clone())).await.is_err()
+                    {
+                        return;
+                    }
+                }
+                // Removed: in prev, not in next.
+                for (key, desc) in prev.iter() {
+                    if !next.contains_key(key)
+                        && tx
+                            .send(ToolListChange::Removed(desc.clone()))
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+                // NodeCountChanged: in both, but counts differ. (Any
+                // other field drift surfaces via this event too —
+                // descriptor carries the latest view.)
+                for (key, new_desc) in next.iter() {
+                    if let Some(old_desc) = prev.get(key) {
+                        if new_desc.node_count != old_desc.node_count
+                            && tx
+                                .send(ToolListChange::NodeCountChanged {
+                                    descriptor: new_desc.clone(),
+                                    prev_node_count: old_desc.node_count,
+                                })
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                prev = next;
+            }
+        });
+        ToolListWatch { receiver: rx }
+    }
+
     /// Per-Mesh caller-side nRPC metrics registry. Accessor for
     /// `mesh_rpc::Mesh::call` to bump counters on each outgoing
     /// call.
@@ -5541,6 +5822,7 @@ impl MeshNode {
     /// channel-publish initialization. The `debug_assert!` makes
     /// the constraint observable in tests; release builds carry
     /// the doc-comment contract only.
+    #[cfg(feature = "cortex")]
     pub fn set_aggregator_registry(
         &mut self,
         registry: Arc<super::behavior::aggregator::AggregatorRegistry>,
@@ -5560,6 +5842,7 @@ impl MeshNode {
     /// aggregators leave this empty — callers should treat the
     /// `None` case as "no aggregators registered" and skip
     /// rendering / acting.
+    #[cfg(feature = "cortex")]
     pub fn aggregator_registry(
         &self,
     ) -> Option<&Arc<super::behavior::aggregator::AggregatorRegistry>> {
@@ -7731,6 +8014,7 @@ impl MeshNode {
     /// to be open-cone), this sync self-index becomes the
     /// cold-start hole that re-opens it — extend the merged
     /// `CapabilitySet` here in lockstep.
+    #[cfg(feature = "cortex")]
     pub(crate) fn index_self_with_local_services(&self) {
         let baseline = self.user_caps_snapshot();
         let merged = {
@@ -7810,6 +8094,87 @@ impl MeshNode {
             }
             merged
         };
+
+        // Merge AI-tool registrations on top of the `nrpc:` tags.
+        // For every tool the SDK's `serve_tool` registered, this
+        // appends:
+        //   - an `ai-tool:<name>` capability tag, so
+        //     `find_nodes_for_tag_prefix("ai-tool:")` discovers
+        //     this host;
+        //   - the typed `ToolCapability` itself (added via
+        //     `CapabilitySet::add_tool`), so the typed views aggregate
+        //     a `Vec<ToolCapability>` across peers in the fold;
+        //   - the description / streaming / tags metadata keys via
+        //     `CapabilitySet::metadata`, mirroring the existing
+        //     `input_schema` / `output_schema` convention so peers
+        //     without the `tool` feature still receive the data and
+        //     just ignore the unknown keys.
+        //
+        // Tool registrations are local to this node, just like
+        // `rpc_local_services`. Drop on the SDK's `ServeHandle`
+        // removes from the registry; the next `announce_capabilities`
+        // reflects the smaller set.
+        #[cfg(feature = "tool")]
+        let caps = if self.tool_registry.is_empty() {
+            caps
+        } else {
+            use crate::adapter::net::behavior::ToolCapability;
+            use crate::adapter::net::cortex::tool::{
+                description_metadata_key, streaming_metadata_key, tags_metadata_key,
+            };
+            let snapshot = self.tool_registry.snapshot();
+            // Reconstruct ToolCapability values from each descriptor's
+            // wire-cheap fields; schemas stay in metadata (the fold
+            // has its own schema-too-large branch) so the typed-cap
+            // payload doesn't bloat.
+            let tools_to_add: Vec<ToolCapability> = snapshot
+                .iter()
+                .map(|descriptor| {
+                    let mut cap = ToolCapability::new(&descriptor.tool_id, &descriptor.name)
+                        .with_version(&descriptor.version)
+                        .with_estimated_time(descriptor.estimated_time_ms)
+                        .with_stateless(descriptor.stateless);
+                    if let Some(ref schema) = descriptor.input_schema {
+                        cap = cap.with_input_schema(schema.clone());
+                    }
+                    if let Some(ref schema) = descriptor.output_schema {
+                        cap = cap.with_output_schema(schema.clone());
+                    }
+                    for req in &descriptor.requires {
+                        cap = cap.requires(req.clone());
+                    }
+                    cap
+                })
+                .collect();
+            // Single set_tools call; O(N) total instead of the
+            // O(N²) chain of per-tool add_tool invocations.
+            let mut merged = caps.add_tools(tools_to_add);
+            for descriptor in snapshot.iter() {
+                merged = merged.add_tag(format!("ai-tool:{}", descriptor.tool_id));
+                // Description + streaming + tags ride the metadata
+                // extensibility hook (same convention input/output
+                // schemas already use). Pre-tool peers receive these
+                // keys and ignore them — no wire-breaking change.
+                if let Some(ref desc) = descriptor.description {
+                    merged = merged
+                        .with_metadata(description_metadata_key(&descriptor.tool_id), desc.clone());
+                }
+                if descriptor.streaming {
+                    merged = merged.with_metadata(
+                        streaming_metadata_key(&descriptor.tool_id),
+                        "1".to_string(),
+                    );
+                }
+                if !descriptor.tags.is_empty() {
+                    merged = merged.with_metadata(
+                        tags_metadata_key(&descriptor.tool_id),
+                        descriptor.tags.join(","),
+                    );
+                }
+            }
+            merged
+        };
+
         let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Piggyback the current NAT classification as a `nat:*`
@@ -11206,6 +11571,7 @@ mod fold_publisher_helpers_tests {
         assert_eq!(gw.dropped_count(), 0);
     }
 
+    #[cfg(feature = "cortex")]
     #[tokio::test]
     async fn aggregator_registry_is_none_until_installed() {
         // Nodes that don't run aggregators leave the registry

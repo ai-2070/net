@@ -200,7 +200,7 @@ static NEXT_HANDLER_ID: AtomicU64 = AtomicU64::new(1);
 /// [`net_rpc_cancel_call`] races the call's completion safely.
 ///
 /// Routes through [`MeshNode::reserve_cancel_token`] so the
-/// substrate's per-mesh [`CancelRegistry`] is the single source of
+/// substrate's per-mesh `CancelRegistry` is the single source of
 /// truth; the cancel-before-register (CR-13) and orphan-TTL (Q18)
 /// races are handled there.
 ///
@@ -209,7 +209,10 @@ static NEXT_HANDLER_ID: AtomicU64 = AtomicU64::new(1);
 /// Returns `0` if `handle` is NULL.
 ///
 /// [`MeshNode::reserve_cancel_token`]: net::adapter::net::MeshNode::reserve_cancel_token
-/// [`CancelRegistry`]: net::adapter::net::cancel_registry::CancelRegistry
+// Note: `CancelRegistry` is a crate-private type in the
+// substrate (`adapter::net::cancel_registry`); the link is
+// elided from rustdoc so the broken intra-doc reference
+// doesn't fail `cargo doc -D warnings`.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_reserve_cancel_token(handle: *mut MeshRpcHandle) -> u64 {
     let Some(h) = (unsafe { handle.as_ref() }) else {
@@ -231,7 +234,7 @@ pub extern "C" fn net_rpc_reserve_cancel_token(handle: *mut MeshRpcHandle) -> u6
 /// with `out_err = "nrpc:cancelled: call cancelled by caller"`.
 ///
 /// ABI 0x0004: signature gained `handle` argument so the cancel
-/// is routed to the mesh whose [`CancelRegistry`] owns the
+/// is routed to the mesh whose `CancelRegistry` owns the
 /// token. Tokens are process-monotonic across meshes (the
 /// substrate's `NEXT_CANCEL_TOKEN` is global) — a cancel issued
 /// against the wrong mesh creates an orphan entry that ages out
@@ -240,7 +243,10 @@ pub extern "C" fn net_rpc_reserve_cancel_token(handle: *mut MeshRpcHandle) -> u6
 /// [`MeshNode::cancel`]: net::adapter::net::MeshNode::cancel
 /// [`Notify`]: tokio::sync::Notify
 /// [`RpcError::Cancelled`]: net::adapter::net::mesh_rpc::RpcError::Cancelled
-/// [`CancelRegistry`]: net::adapter::net::cancel_registry::CancelRegistry
+// Note: `CancelRegistry` is a crate-private type in the
+// substrate (`adapter::net::cancel_registry`); the link is
+// elided from rustdoc so the broken intra-doc reference
+// doesn't fail `cargo doc -D warnings`.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_cancel_call(handle: *mut MeshRpcHandle, token: u64) {
     let Some(h) = (unsafe { handle.as_ref() }) else {
@@ -1150,6 +1156,73 @@ pub extern "C" fn net_rpc_call_streaming_cancellable(
         node.call_streaming(target_node_id, &service, req_bytes, opts)
             .await
     });
+
+    match result {
+        Ok(stream) => {
+            let call_id = stream.call_id();
+            let boxed = Box::new(RpcStreamHandleC {
+                inner: Arc::new(Mutex::new(Some(stream))),
+                call_id,
+                done: AtomicBool::new(false),
+            });
+            unsafe {
+                *out_stream = Box::into_raw(boxed);
+            }
+            NET_RPC_OK
+        }
+        Err(e) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Capability-routed streaming call. Mirrors
+/// [`net_rpc_call_service`] for target resolution + cap-auth gate;
+/// returns a stream handle with the same drain semantics as
+/// [`net_rpc_call_streaming`]. `cancel_token != 0` routes through
+/// the substrate's `CancelRegistry` like the cancellable streaming
+/// variant.
+///
+/// Consumed by `net.CallToolStreaming` for streaming tool
+/// invocations.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_service_streaming(
+    handle: *mut MeshRpcHandle,
+    service_ptr: *const c_char,
+    service_len: usize,
+    req_ptr: *const u8,
+    req_len: usize,
+    deadline_ms: u64,
+    stream_window: u32,
+    cancel_token: u64,
+    out_stream: *mut *mut RpcStreamHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let req_bytes = if req_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
+    };
+    let mut opts = build_call_options(deadline_ms);
+    if stream_window > 0 {
+        opts.stream_window_initial = Some(stream_window);
+    }
+    if cancel_token != 0 {
+        opts.cancel_token = Some(cancel_token);
+    }
+    let node = h.node.clone();
+
+    let result = runtime()
+        .block_on(async move { node.call_service_streaming(&service, req_bytes, opts).await });
 
     match result {
         Ok(stream) => {
@@ -2930,6 +3003,169 @@ pub extern "C" fn net_rpc_serve_client_stream(
     }
 }
 
+/// Function pointer the Go side registers via
+/// [`net_rpc_set_streaming_handler_dispatcher`].
+///
+/// Called once per inbound streaming REQUEST. The Go side reads
+/// the request body once and pushes response chunks via the sink.
+/// Returns `NET_RPC_OK` on clean close; non-zero with `*out_err`
+/// set on failure.
+pub type RpcStreamingHandlerFn = unsafe extern "C" fn(
+    handler_id: u64,
+    req_ptr: *const u8,
+    req_len: usize,
+    response_sink: *mut RpcResponseSinkHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int;
+
+/// Process-global Go-side dispatcher for server-streaming handlers.
+/// Set once via [`net_rpc_set_streaming_handler_dispatcher`].
+static STREAMING_DISPATCHER: OnceLock<RpcStreamingHandlerFn> = OnceLock::new();
+
+/// Register the process-wide streaming handler dispatcher.
+/// Idempotent — first registration wins.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_set_streaming_handler_dispatcher(dispatcher: RpcStreamingHandlerFn) {
+    let _ = STREAMING_DISPATCHER.set(dispatcher);
+}
+
+/// `RpcStreamingHandler` impl that bridges to the Go side. Same
+/// `spawn_blocking` lifecycle contract as
+/// [`GoDuplexRpcHandler`] minus the request-stream half.
+struct GoStreamingRpcHandler {
+    handler_id: u64,
+    timeout: Duration,
+}
+
+#[async_trait::async_trait]
+impl ::net::adapter::net::cortex::RpcStreamingHandler for GoStreamingRpcHandler {
+    async fn call(
+        &self,
+        ctx: RpcContext,
+        responses: InnerRpcResponseSink,
+    ) -> std::result::Result<(), RpcHandlerError> {
+        let dispatcher = match STREAMING_DISPATCHER.get() {
+            Some(d) => *d,
+            None => {
+                return Err(RpcHandlerError::Internal(
+                    "net_rpc_set_streaming_handler_dispatcher never called".into(),
+                ));
+            }
+        };
+        let handler_id = self.handler_id;
+        let timeout = self.timeout;
+        let req_body = ctx.payload.body;
+        let sink_handle = Box::into_raw(Box::new(RpcResponseSinkHandleC {
+            inner: Mutex::new(Some(responses)),
+        }));
+        let sink_handle_addr = sink_handle as usize;
+
+        let join = tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let sink_handle = sink_handle_addr as *mut RpcResponseSinkHandleC;
+                let mut err_ptr: *mut c_char = std::ptr::null_mut();
+                let code = unsafe {
+                    dispatcher(
+                        handler_id,
+                        req_body.as_ptr(),
+                        req_body.len(),
+                        sink_handle,
+                        &mut err_ptr,
+                    )
+                };
+                // Drop the sink — closes the response mpsc; the
+                // substrate fold's pump drains any final chunks
+                // then emits the terminal frame.
+                unsafe { drop(Box::from_raw(sink_handle)) };
+                if code == NET_RPC_OK {
+                    Ok(())
+                } else {
+                    let msg = if err_ptr.is_null() {
+                        format!("Go streaming handler returned code {code} with no error message")
+                    } else {
+                        let s = unsafe { std::ffi::CStr::from_ptr(err_ptr) }
+                            .to_string_lossy()
+                            .into_owned();
+                        unsafe { libc::free(err_ptr as *mut libc::c_void) };
+                        s
+                    };
+                    Err(msg)
+                }
+            }),
+        )
+        .await;
+        match join {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(msg))) => Err(RpcHandlerError::Internal(msg)),
+            Ok(Err(join_err)) => Err(RpcHandlerError::Internal(format!(
+                "Go streaming blocking task panicked: {join_err}"
+            ))),
+            Err(_elapsed) => Err(RpcHandlerError::Internal(format!(
+                "Go streaming handler timed out after {}ms",
+                timeout.as_millis()
+            ))),
+        }
+    }
+}
+
+/// Register a server-streaming handler for `service`. Same
+/// pre-registration discipline as [`net_rpc_serve`] /
+/// [`net_rpc_serve_duplex`].
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_serve_streaming(
+    handle: *mut MeshRpcHandle,
+    service_ptr: *const c_char,
+    service_len: usize,
+    handler_id: u64,
+    handler_timeout_ms: u64,
+    out_err: *mut *mut c_char,
+) -> *mut ServeHandleC {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        write_err(out_err, "MeshRpc handle is NULL".into());
+        return std::ptr::null_mut();
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return std::ptr::null_mut();
+    };
+    if STREAMING_DISPATCHER.get().is_none() {
+        write_err(
+            out_err,
+            "net_rpc_set_streaming_handler_dispatcher must be called before \
+             net_rpc_serve_streaming"
+                .into(),
+        );
+        return std::ptr::null_mut();
+    }
+    if handler_id == 0 {
+        write_err(
+            out_err,
+            "handler_id must be non-zero (reserve via net_rpc_reserve_handler_id)".into(),
+        );
+        return std::ptr::null_mut();
+    }
+    let timeout = if handler_timeout_ms == 0 {
+        DEFAULT_HANDLER_TIMEOUT
+    } else {
+        Duration::from_millis(handler_timeout_ms)
+    };
+    let rust_handler = Arc::new(GoStreamingRpcHandler {
+        handler_id,
+        timeout,
+    });
+    match h.node.serve_rpc_streaming(&service, rust_handler) {
+        Ok(inner) => Box::into_raw(Box::new(ServeHandleC {
+            inner: Arc::new(Mutex::new(Some(inner))),
+            handler_id,
+        })),
+        Err(e) => {
+            write_err(out_err, format!("serve failed: {e}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Register a duplex handler for `service`. Same pre-registration
 /// discipline as [`net_rpc_serve`] / [`net_rpc_serve_client_stream`].
 #[unsafe(no_mangle)]
@@ -3262,6 +3498,47 @@ pub extern "C" fn net_rpc_metrics_snapshot(
         Ok(v) => v,
         Err(e) => {
             write_err(out_err, format!("metrics serialize failed: {e}"));
+            return NET_RPC_ERR_CALL_FAILED;
+        }
+    };
+    write_response(bytes, out_json_ptr, out_json_len);
+    NET_RPC_OK
+}
+
+/// Aggregate the local capability fold into a flat list of
+/// AI-tool descriptors (one row per (tool_id, version)). Returns
+/// a JSON-encoded array of objects; the Go side decodes into
+/// `[]ToolDescriptor`. Empty fold → writes the JSON literal `[]`.
+///
+/// Mirror of the Rust SDK's `Mesh::list_tools(None)` + the napi
+/// `NetMesh.listTools()` + the pyo3 `NetMesh.list_tools()`.
+/// Matcher pushdown is a v1 follow-up — current call walks the
+/// entire fold and lets the caller post-filter in Go.
+///
+/// Gated on the `tool` feature; the feature is enabled in
+/// `rpc-ffi/Cargo.toml` to match `compute-ffi`'s layout
+/// invariant.
+#[cfg(feature = "tool")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_list_tools(
+    handle: *const MeshRpcHandle,
+    out_json_ptr: *mut *mut u8,
+    out_json_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        write_err(out_err, "MeshRpc handle is NULL".into());
+        return NET_RPC_ERR_NULL;
+    };
+    if out_json_ptr.is_null() || out_json_len.is_null() {
+        write_err(out_err, "out_json_ptr / out_json_len is NULL".into());
+        return NET_RPC_ERR_NULL;
+    }
+    let descriptors = h.node.list_tools(None);
+    let bytes = match serde_json::to_vec(&descriptors) {
+        Ok(v) => v,
+        Err(e) => {
+            write_err(out_err, format!("list_tools serialize failed: {e}"));
             return NET_RPC_ERR_CALL_FAILED;
         }
     };

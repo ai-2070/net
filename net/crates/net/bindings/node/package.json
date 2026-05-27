@@ -24,6 +24,10 @@
     "./aggregator": {
       "types": "./aggregator.d.ts",
       "default": "./aggregator.js"
+    },
+    "./tool": {
+      "types": "./tool.d.ts",
+      "default": "./tool.js"
     }
   },
   "napi": {
@@ -64,6 +68,8 @@
     "meshdb.d.ts",
     "aggregator.js",
     "aggregator.d.ts",
+    "tool.js",
+    "tool.d.ts",
     "*.node"
   ],
   "devDependencies": {

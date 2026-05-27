@@ -111,6 +111,15 @@ extern int net_rpc_find_service_nodes(
     uint64_t** out_ptr, size_t* out_count,
     char** out_err
 );
+// AI-tool discovery — flat list of (tool_id, version) descriptors
+// from the local capability fold. Returns a JSON-encoded array as
+// (out_json_ptr, out_json_len); caller frees via
+// net_rpc_response_free. See net_rpc.h for the row shape.
+extern int net_rpc_list_tools(
+    const MeshRpcHandle* handle,
+    uint8_t** out_json_ptr, size_t* out_json_len,
+    char** out_err
+);
 
 extern uint64_t net_rpc_reserve_handler_id(void);
 extern ServeHandleC* net_rpc_serve(
@@ -148,6 +157,19 @@ extern int net_rpc_call_streaming(
 extern int net_rpc_call_streaming_cancellable(
     MeshRpcHandle* handle,
     uint64_t target_node_id,
+    const char* service_ptr, size_t service_len,
+    const uint8_t* req_ptr, size_t req_len,
+    uint64_t deadline_ms,
+    uint32_t stream_window,
+    uint64_t cancel_token,
+    RpcStreamHandleC** out_stream,
+    char** out_err
+);
+// Capability-routed streaming call. See net_rpc_call_service for
+// the routing semantics; see net_rpc_call_streaming for the
+// drain semantics.
+extern int net_rpc_call_service_streaming(
+    MeshRpcHandle* handle,
     const char* service_ptr, size_t service_len,
     const uint8_t* req_ptr, size_t req_len,
     uint64_t deadline_ms,
@@ -283,6 +305,29 @@ extern void net_rpc_set_duplex_handler_dispatcher(
     RpcDuplexHandlerFn dispatcher
 );
 
+// Server-streaming dispatcher + serve. Mirrors the duplex surface
+// minus the request-stream half — handler gets a single request
+// body once and pushes response chunks via the sink.
+typedef int (*RpcStreamingHandlerFn)(
+    uint64_t handler_id,
+    const uint8_t* req_ptr, size_t req_len,
+    RpcResponseSinkHandleC* response_sink,
+    char** out_err);
+extern void net_rpc_set_streaming_handler_dispatcher(
+    RpcStreamingHandlerFn dispatcher);
+extern ServeHandleC* net_rpc_serve_streaming(
+    MeshRpcHandle* handle,
+    const char* service_ptr, size_t service_len,
+    uint64_t handler_id,
+    uint64_t handler_timeout_ms,
+    char** out_err);
+// Go-side trampoline registered by registerStreamingDispatcher.
+extern int go_net_rpc_streaming_trampoline(
+    uint64_t handler_id,
+    const uint8_t* req_ptr, size_t req_len,
+    RpcResponseSinkHandleC* response_sink,
+    char** out_err);
+
 extern ServeHandleC* net_rpc_serve_client_stream(
     MeshRpcHandle* handle,
     const char* service_ptr, size_t service_len,
@@ -316,6 +361,7 @@ import "C"
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -725,6 +771,45 @@ func (r *MeshRpc) CallService(
 	return readCancellableResult(ctx, code, outResp, outRespLen, outErr)
 }
 
+// ListTools aggregates the local capability fold into a flat list
+// of AI-tool descriptors. One row per (ToolID, Version); NodeCount
+// is filled by the substrate walk.
+//
+// Returns []ToolDescriptor{} (nil error) when no tools are
+// advertised. Mirror of the napi `NetMesh.listTools()`, the pyo3
+// `NetMesh.list_tools()`, and the Rust SDK's `Mesh::list_tools(None)`.
+//
+// v1 walks unfiltered; matcher pushdown is a follow-up. Caller can
+// post-filter on `desc.Tags` / `desc.ToolID` in Go.
+func (r *MeshRpc) ListTools() ([]ToolDescriptor, error) {
+	var outJSON *C.uint8_t
+	var outLen C.size_t
+	var outErr *C.char
+	var code C.int
+	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		code = C.net_rpc_list_tools(h, &outJSON, &outLen, &outErr)
+	}); err != nil {
+		return nil, err
+	}
+	if code != 0 {
+		msg := readCError(outErr)
+		return nil, parseRpcError(msg)
+	}
+	if outJSON == nil || outLen == 0 {
+		return []ToolDescriptor{}, nil
+	}
+	defer C.net_rpc_response_free(outJSON, outLen)
+	body := C.GoBytes(unsafe.Pointer(outJSON), C.int(outLen))
+	var out []ToolDescriptor
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("list_tools: decode payload: %w", err)
+	}
+	if out == nil {
+		out = []ToolDescriptor{}
+	}
+	return out, nil
+}
+
 // FindServiceNodes returns the node IDs advertising
 // `nrpc:<service>` in the local capability index. Empty slice ==
 // no providers; nil error in that case.
@@ -983,6 +1068,74 @@ func (r *MeshRpc) CallStreaming(
 			// closed.Swap is the single source of truth for "who
 			// owns the free." Whoever wins (Swap returns false)
 			// performs the C.free; the other path no-ops.
+			if !closedPtr.Swap(true) {
+				C.net_rpc_stream_free(handlePtr)
+			}
+			close(watcherDone)
+		}()
+	}
+	return stream, nil
+}
+
+// CallServiceStreaming opens a capability-routed streaming RPC.
+// Mirrors CallService for target resolution + cap-auth gate;
+// mirrors CallStreaming for the chunk-iterator return shape.
+// The returned RpcStream MUST be Closed (defer is fine); ctx
+// cancel triggers Close via the same watcher goroutine as
+// CallStreaming.
+//
+// Consumed by net.CallToolStreaming for streaming tool
+// invocations.
+func (r *MeshRpc) CallServiceStreaming(
+	ctx context.Context,
+	service string,
+	req []byte,
+	opts StreamOptions,
+) (*RpcStream, error) {
+	deadlineMs := contextDeadlineMs(ctx)
+	cService := stringToCBytes(service)
+	defer C.free(cService.ptr)
+	cReq, freeReq := bytesToCBytes(req)
+	defer freeReq()
+
+	var outStream *C.RpcStreamHandleC
+	var outErr *C.char
+	var code C.int
+	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		code = C.net_rpc_call_service_streaming(
+			h,
+			(*C.char)(cService.ptr), cService.len,
+			cReq.ptr, cReq.len,
+			C.uint64_t(deadlineMs),
+			C.uint32_t(opts.Window),
+			C.uint64_t(0), // cancel_token=0 — ctx-watcher path
+			&outStream,
+			&outErr,
+		)
+	}); err != nil {
+		return nil, err
+	}
+	if code != 0 {
+		msg := readCError(outErr)
+		return nil, parseRpcError(msg)
+	}
+	stream := &RpcStream{
+		rpc:    r,
+		handle: outStream,
+		callID: uint64(C.net_rpc_stream_call_id(outStream)),
+		closed: new(atomic.Bool),
+	}
+	runtime.SetFinalizer(stream, (*RpcStream).finalize)
+
+	if ctx != nil && ctx.Done() != nil {
+		watchCtx, cancel := context.WithCancel(ctx)
+		stream.cancel = cancel
+		stream.watcherDone = make(chan struct{})
+		closedPtr := stream.closed
+		handlePtr := outStream
+		watcherDone := stream.watcherDone
+		go func() {
+			<-watchCtx.Done()
 			if !closedPtr.Swap(true) {
 				C.net_rpc_stream_free(handlePtr)
 			}
@@ -1945,9 +2098,16 @@ type ClientStreamingHandler func(stream *RequestStreamRecv) ([]byte, error)
 // via the sink. Returns nil for clean close, an error otherwise.
 type DuplexHandler func(stream *RequestStreamRecv, sink *ResponseSinkSend) error
 
+// StreamingHandler is the user-facing signature for a server-
+// streaming nRPC handler. Reads the request body once, emits zero-
+// or-more response chunks via the sink, returns nil on clean close
+// (substrate emits the terminal frame at that point) or an error.
+type StreamingHandler func(req []byte, sink *ResponseSinkSend) error
+
 var (
 	clientStreamingDispatcherOnce sync.Once
 	duplexDispatcherOnce          sync.Once
+	streamingDispatcherOnce       sync.Once
 )
 
 func registerClientStreamingDispatcher() {
@@ -2060,6 +2220,111 @@ func safeCallDuplexHandler(h DuplexHandler, s *RequestStreamRecv, sk *ResponseSi
 		}
 	}()
 	return h(s, sk)
+}
+
+func registerStreamingDispatcher() {
+	streamingDispatcherOnce.Do(func() {
+		C.net_rpc_set_streaming_handler_dispatcher(
+			(C.RpcStreamingHandlerFn)(C.go_net_rpc_streaming_trampoline),
+		)
+	})
+}
+
+//export go_net_rpc_streaming_trampoline
+func go_net_rpc_streaming_trampoline(
+	handlerID C.uint64_t,
+	reqPtr *C.uint8_t,
+	reqLen C.size_t,
+	responseSink *C.RpcResponseSinkHandleC,
+	outErr **C.char,
+) C.int {
+	val, ok := handlerRegistry.Load(uint64(handlerID))
+	if !ok {
+		writeCError(outErr, fmt.Sprintf("no streaming handler registered for id %d", uint64(handlerID)))
+		return -1
+	}
+	handler, ok := val.(StreamingHandler)
+	if !ok {
+		writeCError(outErr, fmt.Sprintf("handler id %d is not a StreamingHandler", uint64(handlerID)))
+		return -1
+	}
+	// Copy the request body — the Rust-owned buffer's lifetime is
+	// bounded by this dispatcher call.
+	var req []byte
+	if reqLen > 0 && reqPtr != nil {
+		req = C.GoBytes(unsafe.Pointer(reqPtr), C.int(reqLen))
+	}
+	sink := &ResponseSinkSend{handle: responseSink}
+	err := safeCallStreamingHandler(handler, req, sink)
+	// Invalidate the sink wrapper before returning — Rust is about
+	// to free the underlying handle.
+	sink.invalidated.Store(1)
+	if err != nil {
+		writeCError(outErr, err.Error())
+		return -1
+	}
+	return 0
+}
+
+func safeCallStreamingHandler(h StreamingHandler, req []byte, sk *ResponseSinkSend) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("nrpc streaming handler panicked: %v", r)
+		}
+	}()
+	return h(req, sk)
+}
+
+// ServeStreaming registers a server-streaming handler for
+// `service`. Same pre-registration discipline as Serve / ServeDuplex.
+func (r *MeshRpc) ServeStreaming(service string, handler StreamingHandler) (*ServeHandle, error) {
+	return r.ServeStreamingWithOptions(service, handler, ServeOptions{})
+}
+
+// ServeStreamingWithOptions is the variant of ServeStreaming that
+// accepts a per-handler timeout.
+func (r *MeshRpc) ServeStreamingWithOptions(service string, handler StreamingHandler, opts ServeOptions) (*ServeHandle, error) {
+	if handler == nil {
+		return nil, errors.New("net.ServeStreaming: handler must be non-nil")
+	}
+	registerStreamingDispatcher()
+	hID := uint64(C.net_rpc_reserve_handler_id())
+	handlerRegistry.Store(hID, handler)
+	cService := stringToCBytes(service)
+	defer C.free(cService.ptr)
+	var timeoutMs uint64
+	if opts.HandlerTimeout > 0 {
+		ms := opts.HandlerTimeout.Milliseconds()
+		if ms < 0 {
+			ms = 0
+		}
+		timeoutMs = uint64(ms)
+	}
+	var outErr *C.char
+	var handle *C.ServeHandleC
+	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		handle = C.net_rpc_serve_streaming(
+			h,
+			(*C.char)(cService.ptr), cService.len,
+			C.uint64_t(hID),
+			C.uint64_t(timeoutMs),
+			&outErr,
+		)
+	}); err != nil {
+		handlerRegistry.Delete(hID)
+		return nil, err
+	}
+	if handle == nil {
+		handlerRegistry.Delete(hID)
+		msg := readCError(outErr)
+		if strings.Contains(msg, "already serving") {
+			return nil, fmt.Errorf("%w: %s", ErrAlreadyServing, msg)
+		}
+		return nil, fmt.Errorf("serve_streaming failed: %s", msg)
+	}
+	sh := &ServeHandle{rpc: r, handle: handle, handlerID: hID}
+	runtime.SetFinalizer(sh, (*ServeHandle).finalize)
+	return sh, nil
 }
 
 // ServeClientStream registers a client-streaming handler for

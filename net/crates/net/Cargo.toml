@@ -2,6 +2,7 @@
 members = [
     ".",
     "sdk",
+    "sdk-macros",
     "deck",
     "cli",
     "aggregator-daemon",
@@ -94,6 +95,12 @@ net = [
     "dep:blake2",
     "dep:ed25519-dalek",
     "dep:x25519-dalek",
+    # postcard is the canonical wire codec for the
+    # `behavior::{fold, group, subnet}` modules — `SubnetId` /
+    # `GroupId` round-trip + the fold dispatch / wire types both
+    # encode through it. Always pulled with `net` (was previously
+    # only reachable via the `redex` transitive activation).
+    "dep:postcard",
 ]
 # `regex` gates `TagMatcher::Regex` capability-query matching + the
 # safety-predicate precompiled-pattern cache. Off by default — the
@@ -103,6 +110,19 @@ net = [
 # format compat) but routes through the existing
 # "invalid → matches nothing" fail-closed path on the receiver side.
 regex = ["dep:regex"]
+# AI tool-calling surface — gates the `cortex::tool` module
+# (`ToolDescriptor` discovery shape + `ToolEvent` streaming envelope)
+# and the SDK-side `serve_tool` / `list_tools` / `call_tool` helpers.
+# Off by default — consumers who don't ship LLM-tool agents skip the
+# small extra surface. The wire-level pieces this composes against
+# (`ToolCapability` in `behavior::capability`, the capability fold,
+# `call_service_streaming`) compile unconditionally so peers without
+# the feature still exchange `ToolCapability` announcements.
+#
+# Requires `cortex` because `ToolDescriptor` + the future
+# `tool.metadata.fetch` RPC live alongside the existing typed-call
+# infrastructure.
+tool = ["cortex"]
 ffi = []
 redex = ["net", "dep:tokio-stream", "dep:postcard"]
 redex-disk = ["redex"]

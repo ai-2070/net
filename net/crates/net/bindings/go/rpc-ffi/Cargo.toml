@@ -16,7 +16,12 @@ name = "net_rpc"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
-default = []
+default = ["tool"]
+# `tool` exposes the `net_rpc_list_tools` C symbol + propagates the
+# `tool` feature into `net-mesh`, matching the compute-ffi build
+# (which enables `tool` for layout consistency on shared types).
+# Default-on so the shipped cdylib carries the symbol.
+tool = ["net/tool"]
 
 [dependencies]
 # Core mesh types — needed because we expose C-ABI handles that

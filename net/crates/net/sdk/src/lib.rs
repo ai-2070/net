@@ -68,6 +68,25 @@ pub mod redis_dedup;
 pub mod stream;
 #[cfg(feature = "testing")]
 pub mod testing;
+#[cfg(feature = "tool")]
+pub mod tool;
+
+/// Procedural-macro re-exports gated by the `macros` feature.
+///
+/// Currently ships the `#[tool]` attribute macro — see the
+/// per-macro docs for the full attribute surface and an example.
+/// The macro generates a sibling `<fn>_descriptor()` /
+/// `<fn>_register(mesh)` pair atop `metadata_for::<Req, Resp>(name)
+/// .build()` + `mesh.serve_tool(...)`.
+///
+/// Always pulled in alongside `tool` because the macro's expansion
+/// references `net_sdk::tool::*`; users that don't want the
+/// proc-macro2 / syn / quote build cost simply omit the `macros`
+/// feature.
+#[cfg(feature = "macros")]
+pub mod macros {
+    pub use net_sdk_macros::tool;
+}
 
 #[cfg(feature = "redis")]
 pub use redis_dedup::RedisStreamDedup;

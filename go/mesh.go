@@ -311,6 +311,24 @@ func (m *MeshNode) NodeID() uint64 {
 	return uint64(C.net_mesh_node_id(m.handle))
 }
 
+// arcClonePtr clones the inner `Arc<MeshNode>` and returns the raw
+// pointer as `unsafe.Pointer`. Consumed by `NewMeshRpc` (and any
+// future package-internal binding that needs an arc-clone the
+// substrate side will take ownership of). Returns nil if the node
+// is shutting down or has already been freed.
+//
+// The returned pointer is heap-allocated on the Rust side (a
+// `Box<Arc<MeshNode>>`). The consumer takes ownership; callers MUST
+// NOT free it directly.
+func (m *MeshNode) arcClonePtr() unsafe.Pointer {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return nil
+	}
+	return unsafe.Pointer(C.net_mesh_arc_clone(m.handle))
+}
+
 // EntityID returns this node's 32-byte ed25519 entity id. Matches
 // `IdentityFromSeed(seed).EntityID()` when the mesh was constructed
 // with `MeshConfig{IdentitySeedHex: hex.EncodeToString(seed), ...}`.

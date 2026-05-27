@@ -35,6 +35,9 @@ pub mod memories;
 #[cfg(feature = "cortex")]
 pub mod tasks;
 
+#[cfg(feature = "tool")]
+pub mod tool;
+
 pub use adapter::{
     set_global_ryw_inflight_cap, ChangeEvent, CortexAdapter, RywMetricsSnapshot, WaitForTokenError,
 };

@@ -452,6 +452,21 @@ impl Mesh {
             .await
     }
 
+    /// Service-name streaming call. Consults the capability index
+    /// for nodes advertising `nrpc:<service>`, picks one per
+    /// `opts.routing_policy`, opens a streaming call. Mirror of
+    /// [`Self::call_service`] for the streaming response shape.
+    pub async fn call_service_streaming(
+        &self,
+        service: &str,
+        payload: Bytes,
+        opts: CallOptions,
+    ) -> std::result::Result<RpcStream, RpcError> {
+        self.node()
+            .call_service_streaming(service, payload, opts)
+            .await
+    }
+
     // ---- Streaming (typed) ----
 
     /// Register a typed streaming RPC handler. The handler receives
@@ -505,6 +520,34 @@ impl Mesh {
         })?;
         let inner = self
             .call_streaming(target_node_id, service, Bytes::from(body), opts.raw)
+            .await?;
+        Ok(RpcStreamTyped {
+            inner,
+            codec: opts.codec,
+            done: false,
+            _resp: std::marker::PhantomData,
+        })
+    }
+
+    /// Service-name typed streaming call. Mirror of
+    /// [`Self::call_streaming_typed`] but routes via the capability
+    /// index. Riding [`Self::call_service_streaming`] underneath.
+    pub async fn call_service_streaming_typed<Req, Resp>(
+        &self,
+        service: &str,
+        request: &Req,
+        opts: CallOptionsTyped,
+    ) -> std::result::Result<RpcStreamTyped<Resp>, RpcError>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let body = opts.codec.encode(request).map_err(|e| RpcError::Codec {
+            direction: CodecDirection::Encode,
+            message: format!("client encode: {e}"),
+        })?;
+        let inner = self
+            .call_service_streaming(service, Bytes::from(body), opts.raw)
             .await?;
         Ok(RpcStreamTyped {
             inner,

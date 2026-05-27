@@ -1,0 +1,96 @@
+{
+  "description": "Cross-language ToolEvent envelope round-trip fixture (plan T-2). Each binding's tool-event test loads this file and asserts that deserializing `wire` into the language's ToolEvent type, then re-serializing, produces JSON byte-equal to `wire` (modulo whitespace; tests parse + deep-compare). `is_terminal` pins the terminal-envelope semantic. The Rust impl is `net::adapter::net::cortex::tool::ToolEvent`; Node TS is `ToolEvent` in `bindings/node/tool.ts`; Python is `ToolEvent` in `net.tool`; Go is `ToolEvent` in `bindings/go/net/tool.go`. The four impls share the JSON tag-form (`{\"type\": \"start\", ...}`) — adding a case here means updating all four verifier tests in lockstep.",
+  "abi_version_expected": 1,
+  "cases": [
+    {
+      "name": "start_minimal",
+      "wire": { "type": "start", "tool_id": "web_search" },
+      "is_terminal": false
+    },
+    {
+      "name": "start_with_call_id",
+      "wire": { "type": "start", "tool_id": "web_search", "call_id": 42 },
+      "is_terminal": false
+    },
+    {
+      "name": "start_with_metadata",
+      "wire": {
+        "type": "start",
+        "tool_id": "web_search",
+        "call_id": 7,
+        "metadata": { "model": "claude-3.5-sonnet", "trace_id": "abc123" }
+      },
+      "is_terminal": false
+    },
+    {
+      "name": "progress_pct_and_message",
+      "wire": { "type": "progress", "pct": 50.0, "message": "indexing" },
+      "is_terminal": false
+    },
+    {
+      "name": "progress_message_only",
+      "wire": { "type": "progress", "message": "starting" },
+      "is_terminal": false
+    },
+    {
+      "name": "progress_pct_only",
+      "wire": { "type": "progress", "pct": 75.5 },
+      "is_terminal": false
+    },
+    {
+      "name": "progress_empty",
+      "wire": { "type": "progress" },
+      "is_terminal": false
+    },
+    {
+      "name": "delta_token",
+      "wire": { "type": "delta", "data": { "token": "partial response " } },
+      "is_terminal": false
+    },
+    {
+      "name": "delta_string_data",
+      "wire": { "type": "delta", "data": "raw text chunk" },
+      "is_terminal": false
+    },
+    {
+      "name": "delta_array_data",
+      "wire": { "type": "delta", "data": [1, 2, 3] },
+      "is_terminal": false
+    },
+    {
+      "name": "result_basic",
+      "wire": { "type": "result", "data": { "results": ["hit for mesh"] } },
+      "is_terminal": true
+    },
+    {
+      "name": "result_primitive",
+      "wire": { "type": "result", "data": 42 },
+      "is_terminal": true
+    },
+    {
+      "name": "error_minimal",
+      "wire": { "type": "error", "code": "upstream_timeout", "message": "the upstream API timed out" },
+      "is_terminal": true
+    },
+    {
+      "name": "error_with_details",
+      "wire": {
+        "type": "error",
+        "code": "invalid_input",
+        "message": "missing required field `query`",
+        "details": { "field": "query", "expected_type": "string" }
+      },
+      "is_terminal": true
+    },
+    {
+      "name": "error_missing_terminal_synthesized",
+      "wire": {
+        "type": "error",
+        "code": "missing_terminal",
+        "message": "tool handler ended its stream without emitting a terminal Result or Error event"
+      },
+      "is_terminal": true,
+      "_note": "Exact shape the Rust SDK's serve_tool_streaming wrapper synthesizes when the handler omits a terminal — pin this so adapters can match on `code == 'missing_terminal'` reliably."
+    }
+  ]
+}

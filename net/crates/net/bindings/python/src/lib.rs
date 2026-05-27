@@ -1891,6 +1891,38 @@ mod mesh_bindings {
             }))
         }
 
+        /// Walk the local capability fold for every published AI
+        /// tool. Returns a list of dicts mirroring the substrate's
+        /// `ToolDescriptor` (one row per `(tool_id, version)`
+        /// slot, with `node_count` filled in by the aggregating
+        /// walk).
+        ///
+        /// One in-memory pass; no network. Schemas come back as
+        /// JSON-encoded strings on `descriptor["input_schema"]` /
+        /// `descriptor["output_schema"]` — call `json.loads(...)`
+        /// for the parsed shape that adapter packages consume when
+        /// lowering into provider-specific tool definitions.
+        ///
+        /// Mirror of the Rust SDK's `Mesh::list_tools(None)`. v1
+        /// always walks unfiltered; matcher-pushdown lands in a
+        /// follow-up that adds a `matcher` arg.
+        ///
+        /// Gated on the `tool` Cargo feature (default-on).
+        ///
+        /// Returns a JSON-encoded list of descriptors as a Python
+        /// string. The `net.tool.list_tools` wrapper parses it once
+        /// with `json.loads`. ToolDescriptor already derives
+        /// `Serialize`, so this is a single `serde_json::to_string`
+        /// instead of 12 fallible `PyDict::set_item` calls per
+        /// descriptor — meaningful on every watch_tools poll.
+        #[cfg(feature = "tool")]
+        fn list_tools(&self) -> PyResult<String> {
+            let node = self.get_node()?;
+            let descriptors = node.list_tools(None);
+            serde_json::to_string(&descriptors)
+                .map_err(|e| PyValueError::new_err(format!("list_tools serialize failed: {e}")))
+        }
+
         /// Bucketed aggregation over the local capability fold —
         /// `Fold::aggregate(matcher, group_by, agg)`. Arguments are
         /// JSON-encoded tagged unions; the sdk-py wrappers ship

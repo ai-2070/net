@@ -916,10 +916,33 @@ impl CapabilitySet {
     /// since tools live in the canonical tag set as
     /// `software.tool.<i>.*` indexed-encoding; schemas are mirrored
     /// into `metadata` by `set_tools`.
+    ///
+    /// For adding more than one tool, prefer
+    /// [`Self::add_tools`] — the batch form invokes `set_tools`
+    /// exactly once instead of N times, dropping the announce-path
+    /// cost from O(N²) to O(N).
     pub fn add_tool(mut self, tool: ToolCapability) -> Self {
         let mut tools = self.views().tools().clone();
         tools.push(tool);
         self.set_tools(tools);
+        self
+    }
+
+    /// Batch counterpart to [`Self::add_tool`] — extends the current
+    /// tool list with every element of `tools` and invokes
+    /// `set_tools` exactly once. The single-`set_tools` call clears
+    /// stale tags + metadata once and re-encodes the final list, so
+    /// the cost is O(N) regardless of how many tools the iterator
+    /// yields.
+    ///
+    /// Use this from announce paths that drain a `tool_registry`
+    /// (which can hold many tools); the per-call `add_tool` rebuilds
+    /// every previously-added tool's tags + metadata, an O(N²)
+    /// pattern in the size of the registry.
+    pub fn add_tools(mut self, tools: impl IntoIterator<Item = ToolCapability>) -> Self {
+        let mut merged = self.views().tools().clone();
+        merged.extend(tools);
+        self.set_tools(merged);
         self
     }
 
@@ -2190,13 +2213,20 @@ impl CapabilityAnnouncement {
     }
 
     /// Drop every metadata key that the substrate reserves for
-    /// local use (`intent`, `colocate-with`, `priority`, `owner`,
-    /// `tool::*`, …). Call this on every announcement decoded from
-    /// an inbound peer before its metadata is consulted by greedy
+    /// local trust use (`intent`, `colocate-with`, `priority`,
+    /// `owner`). Call this on every announcement decoded from an
+    /// inbound peer before its metadata is consulted by greedy
     /// admission, placement scoring, or anything else that lets a
     /// metadata value steer substrate decisions: pre-fix a peer
     /// could stamp `intent = "high-priority-tenant-X"` on its own
     /// announcement and steer the receiver's admission to itself.
+    ///
+    /// `tool::*` keys are NOT stripped — they're peer-advertised
+    /// AI tool descriptors (schemas, descriptions, tags) that
+    /// `MeshNode::list_tools` surfaces to agents. Substrate never
+    /// makes trust decisions from them, so stripping would only
+    /// defeat cross-mesh tool discovery. See
+    /// [`schema::METADATA_RESERVED_PREFIXES`](super::schema).
     ///
     /// The schema's `metadata_reserved` doc says these keys are
     /// **writable by user code on the local node** — the local
@@ -2211,6 +2241,11 @@ impl CapabilityAnnouncement {
             if AXIS_SCHEMA.metadata_reserved.contains(&key.as_str()) {
                 return false;
             }
+            // `metadata_reserved_prefixes` is empty as of A-4 — the
+            // `tool::*` family that used to live here is intentionally
+            // peer-advertised content. See the prefix-list doc in
+            // `behavior::schema`. The retain loop is kept for forward
+            // compat if a future substrate-trust prefix needs gating.
             !AXIS_SCHEMA
                 .metadata_reserved_prefixes
                 .iter()
@@ -2554,12 +2589,18 @@ mod tests {
         super::super::super::identity::EntityId::from_bytes([0u8; 32])
     }
     /// `strip_reserved_metadata` drops every exact-match reserved
-    /// key and every key under a reserved prefix, leaves all other
-    /// keys intact. The substrate calls this on every inbound peer
-    /// announcement before downstream consumers (greedy admission,
-    /// placement scoring) read metadata, so a peer can't steer
-    /// receiver decisions by stamping `intent`, `colocate-with`,
-    /// `priority`, `owner`, or any `tool::*` key.
+    /// key (`intent`, `colocate-with`, `priority`, `owner`) and
+    /// leaves all other keys intact. The substrate calls this on
+    /// every inbound peer announcement before downstream consumers
+    /// (greedy admission, placement scoring) read metadata, so a
+    /// peer can't steer receiver decisions through the
+    /// substrate-trusted slot keys.
+    ///
+    /// A-4 update: `tool::*` keys are NOT stripped any more — they
+    /// carry peer-advertised AI tool schemas / descriptions /
+    /// tags that `MeshNode::list_tools` surfaces to agents. The
+    /// substrate never makes trust decisions from those values, so
+    /// stripping them would only defeat cross-mesh tool discovery.
     #[test]
     fn strip_reserved_metadata_drops_reserved_keys() {
         let mut ann = CapabilityAnnouncement::new(0xDEAD, test_entity(), 7, CapabilitySet::new());
@@ -2575,9 +2616,10 @@ mod tests {
         ann.capabilities
             .metadata
             .insert("owner".into(), "attacker".into());
-        ann.capabilities
-            .metadata
-            .insert("tool::pwn".into(), "go-brrr".into());
+        ann.capabilities.metadata.insert(
+            "tool::web_search::description".into(),
+            "Search the web.".into(),
+        );
         ann.capabilities
             .metadata
             .insert("app::region".into(), "us-east".into());
@@ -2591,7 +2633,15 @@ mod tests {
         assert!(!ann.capabilities.metadata.contains_key("colocate-with"));
         assert!(!ann.capabilities.metadata.contains_key("priority"));
         assert!(!ann.capabilities.metadata.contains_key("owner"));
-        assert!(!ann.capabilities.metadata.contains_key("tool::pwn"));
+        // `tool::*` keys survive — they are peer-advertised AI tool
+        // descriptor content, not substrate trust signal.
+        assert_eq!(
+            ann.capabilities
+                .metadata
+                .get("tool::web_search::description")
+                .map(String::as_str),
+            Some("Search the web."),
+        );
         // Non-reserved keys survive — substrate only filters its
         // own reserved namespace, not the caller's app namespace.
         assert_eq!(
@@ -2712,22 +2762,29 @@ mod tests {
         assert_eq!(caps.tags, parsed.tags);
         assert_eq!(caps.views().models().len(), parsed.views().models().len());
     }
-    /// CR-16: `with_metadata` silently drops writes whose key
-    /// starts with a reserved prefix (`tool::`). Same shape as
-    /// `add_tag`'s rejection of reserved tag prefixes via
-    /// `Tag::parse_user`. Exact-match reserved keys (`intent`,
-    /// `owner`, …) are NOT gated — those are well-known
-    /// user-facing scheduler hints.
+    /// A-4: `with_metadata` consults `METADATA_RESERVED_PREFIXES`,
+    /// which is now empty — the `tool::*` family was hoisted out
+    /// because tool descriptors are peer-advertised content, not
+    /// substrate-trust slots. The gate stays wired so a future
+    /// re-add (e.g. a new substrate-internal prefix) plugs back
+    /// in here without a fan-out edit, but the current contract is
+    /// "tool::* writes pass through". Exact-match reserved keys
+    /// (`intent`, `owner`, …) are NOT gated by `with_metadata`
+    /// either — those are well-known user-facing scheduler hints
+    /// the substrate reads and the user is expected to set.
     #[test]
-    fn with_metadata_drops_reserved_prefix_keys() {
-        // `tool::*` writes silently dropped.
+    fn with_metadata_preserves_tool_prefix_after_a4() {
+        // `tool::*` writes survive — A-4 contract.
         let caps = CapabilitySet::new()
-            .with_metadata("tool::evil::input_schema", "spoof")
+            .with_metadata("tool::web_search::input_schema", "{}")
             .with_metadata("region", "us-east");
-        assert!(
-            !caps.metadata.contains_key("tool::evil::input_schema"),
-            "with_metadata must drop reserved-prefix keys: {:?}",
+        assert_eq!(
             caps.metadata
+                .get("tool::web_search::input_schema")
+                .map(|s| s.as_str()),
+            Some("{}"),
+            "tool::* writes must pass through with_metadata: {:?}",
+            caps.metadata,
         );
         // Non-reserved key passes through.
         assert_eq!(
@@ -2744,6 +2801,55 @@ mod tests {
             Some("ml-training")
         );
     }
+    /// E-2 regression: add_tools must produce the same final
+    /// CapabilitySet as N successive add_tool calls, but via one
+    /// set_tools invocation. We verify the equivalence by building
+    /// the same capability set both ways and comparing.
+    #[test]
+    fn add_tools_batch_matches_repeated_add_tool() {
+        let tools = vec![
+            ToolCapability::new("web_search", "Web Search").with_version("1.0.0"),
+            ToolCapability::new("summarize", "Summarize").with_version("1.0.0"),
+            ToolCapability::new("code_eval", "Code Eval")
+                .with_version("2.0.0")
+                .with_input_schema(r#"{"type":"object"}"#),
+        ];
+
+        let via_repeated = tools
+            .iter()
+            .fold(CapabilitySet::new(), |caps, t| caps.add_tool(t.clone()));
+        let via_batch = CapabilitySet::new().add_tools(tools.iter().cloned());
+
+        // Tag sets must be byte-equal (the canonical software.tool.*
+        // indexed encoding is order-stable for set_tools).
+        assert_eq!(via_repeated.tags, via_batch.tags);
+        // Schema metadata must be byte-equal too — set_tools is the
+        // codepath that mirrors input/output schemas.
+        assert_eq!(via_repeated.metadata, via_batch.metadata);
+        // And the typed view must agree.
+        assert_eq!(
+            via_repeated.views().tools().len(),
+            via_batch.views().tools().len()
+        );
+    }
+
+    /// E-2 regression: add_tools onto a non-empty set must extend,
+    /// not replace. Guards against a future implementation that
+    /// might mistakenly call `set_tools(iter.collect())` and drop
+    /// the prior tools.
+    #[test]
+    fn add_tools_extends_existing_tools() {
+        let caps = CapabilitySet::new()
+            .add_tool(ToolCapability::new("first", "First").with_version("1.0.0"))
+            .add_tools(vec![
+                ToolCapability::new("second", "Second").with_version("1.0.0"),
+                ToolCapability::new("third", "Third").with_version("1.0.0"),
+            ]);
+        assert!(caps.has_tool("first"));
+        assert!(caps.has_tool("second"));
+        assert!(caps.has_tool("third"));
+    }
+
     #[test]
     fn has_tag_matches_across_separator_forms() {
         // Regression for CR-1: `Tag::AxisValue` derives `PartialEq`

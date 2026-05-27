@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
+use net::adapter::net::behavior::CapabilitySet;
 use net::adapter::net::cortex::{
     RpcContext, RpcHandlerError, RpcResponseSink, RpcStreamingHandler,
 };
@@ -547,4 +548,118 @@ async fn call_streaming_rejects_zero_stream_window() {
         !matches!(err, RpcError::Codec { .. }),
         "Some(1) must clear the deadlock guard; got {err:?}",
     );
+}
+
+// ============================================================================
+// `call_service_streaming` — capability-routed mirror of `call_service`
+// that terminates in `call_streaming` rather than the unary `call`.
+//
+// Two-server topology: both servers register `serve_rpc_streaming` against
+// the same service name + announce capabilities, the caller calls
+// `call_service_streaming` and asserts the stream collects cleanly from
+// whichever server the routing policy picked. Confirms the cap-routed
+// surface composes the existing health-filter + cap-auth gate from
+// `call_service` with the existing chunk-streaming behavior from
+// `call_streaming`.
+// ============================================================================
+
+/// Best-effort polling helper — capability propagation is async, so we
+/// wait until the caller's index sees both servers before issuing calls.
+async fn wait_until<F: FnMut() -> bool>(mut cond: F, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cond()
+}
+
+#[tokio::test]
+async fn call_service_streaming_routes_via_capability_index() {
+    let server_a = build_node().await;
+    let server_b = build_node().await;
+    let caller = build_node().await;
+
+    handshake_pair(&caller, &server_a).await;
+    handshake_pair(&caller, &server_b).await;
+
+    // Both servers register the same streaming service.
+    let _serve_a = server_a
+        .serve_rpc_streaming("counter", Arc::new(CounterStreamHandler { count: 5 }))
+        .expect("serve_rpc_streaming A");
+    let _serve_b = server_b
+        .serve_rpc_streaming("counter", Arc::new(CounterStreamHandler { count: 5 }))
+        .expect("serve_rpc_streaming B");
+
+    // Both announce capabilities so the caller's index sees both.
+    server_a
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce A");
+    server_b
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce B");
+
+    // Wait for capability propagation before issuing the call.
+    assert!(
+        wait_until(
+            || {
+                let nodes = caller.find_service_nodes("counter");
+                nodes.contains(&server_a.node_id()) && nodes.contains(&server_b.node_id())
+            },
+            Duration::from_secs(5),
+        )
+        .await,
+        "capability index must discover both servers; sees {:?}",
+        caller.find_service_nodes("counter"),
+    );
+
+    // Capability-routed streaming call — caller does not pick the target.
+    let mut stream = caller
+        .call_service_streaming("counter", Bytes::from_static(b"go"), CallOptions::default())
+        .await
+        .expect("call_service_streaming must succeed");
+
+    let mut collected: Vec<String> = Vec::new();
+    while let Some(item) = stream.next().await {
+        let chunk = item.expect("chunk must be Ok");
+        collected.push(String::from_utf8(chunk.to_vec()).unwrap());
+    }
+    let expected: Vec<String> = (0..5).map(|i| format!("chunk-{i}")).collect();
+    assert_eq!(
+        collected, expected,
+        "call_service_streaming must collect all chunks from whichever \
+         server the routing policy picked",
+    );
+}
+
+#[tokio::test]
+async fn call_service_streaming_no_servers_returns_no_route() {
+    let caller = build_node().await;
+    caller.start();
+
+    let err = match caller
+        .call_service_streaming(
+            "nonexistent",
+            Bytes::from_static(b"x"),
+            CallOptions::default(),
+        )
+        .await
+    {
+        Ok(_) => panic!("call_service_streaming for unknown service must fail"),
+        Err(e) => e,
+    };
+
+    match err {
+        RpcError::NoRoute { reason, .. } => {
+            assert!(
+                reason.contains("nonexistent"),
+                "NoRoute diagnostic must name the missing service: {reason}",
+            );
+        }
+        other => panic!("expected RpcError::NoRoute, got {other:?}"),
+    }
 }

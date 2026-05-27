@@ -307,3 +307,45 @@ export type {
   SubscribeOpts,
   StoredEvent,
 } from './types';
+
+// AI tool calling — `serveTool` / `callTool` / streaming variants
+// + the four provider format translators (OpenAI / Anthropic /
+// MCP / Gemini). Detailed shape lives in `./tool.ts`, which
+// re-exports from `@net-mesh/core/tool`. Users who want only the
+// tool layer can also import from `'@net-mesh/sdk/tool'`.
+export type {
+  ToolDescriptor,
+  ToolEvent,
+  ToolEventStart,
+  ToolEventProgress,
+  ToolEventDelta,
+  ToolEventResult,
+  ToolEventError,
+  ToolOptions,
+  ToolHandler,
+  ToolServeHandle,
+  StreamingToolHandler,
+  ToolListChange,
+  WatchToolsOptions,
+  ToolMetadataResponse,
+  ToolCallSpec,
+} from './tool';
+
+export {
+  isTerminalEvent,
+  descriptorFrom,
+  serveTool,
+  serveToolStreaming,
+  callTool,
+  callToolStreaming,
+  listTools,
+  watchTools,
+  addToolCapabilitiesToAnnounce,
+  fetchToolMetadata,
+  ToolCallParseError,
+  TOOL_METADATA_FETCH_SERVICE,
+  openai,
+  anthropic,
+  mcp,
+  gemini,
+} from './tool';

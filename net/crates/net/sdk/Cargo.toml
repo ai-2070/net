@@ -32,6 +32,15 @@ tokio = { version = "1", features = ["rt", "time", "sync"] }
 pin-project-lite = "0.2"
 thiserror = "2"
 async-trait = "0.1"
+# `schemars` is gated by the `tool` feature — it powers
+# `metadata_for::<Req, Resp>(...)` which derives JSON Schema 2020-12
+# from any Rust type implementing `JsonSchema`. ~150 KiB optimized;
+# off by default.
+schemars = { version = "1", optional = true }
+# `net-mesh-sdk-macros` ships the `#[tool]` attribute proc-macro.
+# Gated by the `macros` feature so users who don't want the
+# proc-macro2 / syn / quote dep tree don't pay for it.
+net-mesh-sdk-macros = { version = "0.24.1", path = "../sdk-macros", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
@@ -39,6 +48,9 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 hdrhistogram = "7"
 postcard = { version = "1", features = ["use-std"] }
 rand = "0.10"
+# Used by the tool_calling example for its top-level Result alias.
+anyhow = "1"
+schemars = "1"
 
 [features]
 # Out-of-the-box "I downloaded the SDK and it just works": real
@@ -150,6 +162,22 @@ meshdb = ["net/meshdb"]
 # the per-binding `aggregator` Cargo features have a 1:1 SDK
 # counterpart to forward (`net-sdk/aggregator`).
 aggregator = ["net"]
+# AI tool-calling surface — re-exports `ToolDescriptor` /
+# `ToolEvent` / `ToolMetadataRegistry` from `net::adapter::net::cortex::tool`
+# and ships the `schemars`-backed `metadata_for::<Req, Resp>(name, desc)`
+# helper that builds descriptors from Rust types implementing
+# `JsonSchema`. Off by default — consumers who don't ship LLM agents
+# skip both `schemars` (~150 KiB on a release binary) and the SDK-side
+# tool helpers. Requires `cortex` because `ToolDescriptor` lives in
+# the cortex module + the future `MeshNode::list_tools` walks the
+# capability fold which `cortex` enables.
+tool = ["net/tool", "cortex", "dep:schemars"]
+# `#[tool]` proc-macro convenience. Opt-in because it pulls in
+# proc-macro2 / syn / quote (~1.2 MB build artifact) which users
+# who hand-write `metadata_for(...).build()` + `serve_tool(...)`
+# don't need. Always enabled alongside `tool` — the macro has no
+# runtime meaning without the SDK surface it expands into.
+macros = ["tool", "dep:net-mesh-sdk-macros"]
 # Testing — in-process multi-node `ClusterHarness` + bridge probes
 # (Mesh → MeshOsRuntime). Powers the deck demo and any integration
 # test that wants real UDP loopback + a real MeshOS snapshot fold
@@ -190,12 +218,19 @@ agent = [
 # bundle for an operator's full-stack daemon", not "every flag
 # this crate exposes". Consumers that want dataforts blob storage
 # or the MeshDB query plane add those flags explicitly.
-full = ["local", "nat-traversal", "redis", "jetstream", "meshos", "deck"]
+full = ["local", "nat-traversal", "redis", "jetstream", "meshos", "deck", "tool", "macros"]
 
 # nRPC quickstart — requires net + cortex.
 [[example]]
 name = "nrpc_echo"
 required-features = ["net", "cortex"]
+
+# End-to-end AI tool-calling demo — declare tools with `#[tool]`,
+# register on one mesh, discover from another, lower to OpenAI's
+# tool shape, dispatch via call_tool. Mocked LLM in-process.
+[[example]]
+name = "tool_calling"
+required-features = ["net", "macros"]
 
 # ============================================================================
 # nRPC benchmark suite. See `benches/nrpc_common/mod.rs` for the

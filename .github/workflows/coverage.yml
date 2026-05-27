@@ -84,15 +84,22 @@ jobs:
       # integration tests in `tests/`, which is where the bulk of
       # the substrate's behavioral coverage actually lives
       # (channel auth, three-node mesh, CortEX nRPC, NetDB,
-      # MeshOS / Deck pipelines, dataforts blob storage…).
+      # MeshOS / Deck pipelines, dataforts blob storage,
+      # AI tool serve/announce/dispatch…).
       # `--no-fail-fast` matches the main `integration-tests` job
       # so a flake in one test doesn't drop coverage from the
       # rest. FFI shims / bindings / benches / examples are
       # excluded in codecov.yml.
+      #
+      # `tool` opts in `integration_tool_announce` (the substrate-
+      # side serve_tool + announce-merge + tool.metadata.fetch
+      # contract pin) and the tool-aware paths in the
+      # capability/fold layer — without it the AI tool surface
+      # contributes 0% to the substrate coverage line.
       - name: Generate coverage (lcov)
         run: >
           cargo llvm-cov
-          --features "net redex cortex netdb meshos dataforts nat-traversal port-mapping"
+          --features "net redex cortex netdb meshos dataforts nat-traversal port-mapping tool"
           --no-fail-fast
           --lcov
           --output-path coverage.lcov
