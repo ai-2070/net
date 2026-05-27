@@ -614,9 +614,17 @@ impl Mesh {
 pub mod formats {
     //! Provider-native tool-definition translators.
     //!
-    //! Each submodule exports a `to_<provider>_tool(&ToolDescriptor)
-    //! -> serde_json::Value` function that produces the shape the
-    //! provider's HTTP API expects for its `tools` field.
+    //! Each submodule exports two directions of conversion:
+    //!
+    //! 1. `to_<provider>_tool(&ToolDescriptor) -> Value` —
+    //!    descriptor → provider's tool-definition shape, used to
+    //!    populate the `tools` array on a request to the provider's
+    //!    HTTP API.
+    //! 2. `lower_<provider>_tool_call(&Value) -> Result<ToolCallSpec, _>`
+    //!    — parse the provider's tool-call reply (OpenAI's
+    //!    `tool_calls[]`, Anthropic's `tool_use` content block, etc.)
+    //!    into a [`ToolCallSpec`] the agent can hand to
+    //!    `Mesh::call_tool(spec.name, &spec.arguments)`.
     //!
     //! All translators short-circuit on a missing `input_schema` by
     //! emitting an empty-object schema (`{"type": "object",
@@ -624,13 +632,81 @@ pub mod formats {
     //! schema in their strict-mode validators, but they all accept
     //! the empty-properties object as "no arguments."
     //!
-    //! The plan (M-1..M-3) defines parallel Python and TypeScript
+    //! The plan (M-1..M-4) defines parallel Python and TypeScript
     //! packages with the same lowering; this Rust module is the
     //! canonical reference. Cross-language tests (T-1) pin byte
     //! equality.
 
     use super::ToolDescriptor;
     use serde_json::{json, Value};
+
+    /// One tool invocation parsed out of a provider's reply. The
+    /// canonical hand-off shape between an LLM-provider adapter and
+    /// `Mesh::call_tool` / `Mesh::call_tool_streaming`.
+    ///
+    /// `provider_call_id` round-trips the provider's own identifier
+    /// (OpenAI's `tool_calls[].id`, Anthropic's `tool_use.id`, MCP's
+    /// optional `id`). Adapters use it to correlate the tool-call
+    /// result back into the provider's expected reply shape (e.g.
+    /// `{"role": "tool", "tool_call_id": "<id>", "content": "..."}`).
+    /// `None` when the provider didn't supply one.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ToolCallSpec {
+        /// nRPC tool_id to invoke. Matches `ToolDescriptor::tool_id` /
+        /// the `name` field every provider uses for its tool slot.
+        pub name: String,
+        /// JSON-encoded arguments to hand to `Mesh::call_tool`.
+        /// Stored as a string so the caller can either feed it
+        /// straight to a raw byte API or parse it with `serde_json`
+        /// — the parse vs. forward decision is provider-agnostic.
+        pub arguments_json: String,
+        /// Provider-supplied call id, when present. Adapters carry
+        /// this back into the tool-result reply so the LLM can
+        /// correlate the response.
+        pub provider_call_id: Option<String>,
+    }
+
+    /// Error returned when a provider's tool-call reply doesn't
+    /// match the expected shape (missing `name`, malformed
+    /// arguments, etc.). Each variant carries the field that was
+    /// missing or malformed so adapters can produce a tight
+    /// diagnostic.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ToolCallParseError {
+        /// The provider's reply was missing a required field.
+        MissingField(&'static str),
+        /// A field's type didn't match what the provider's spec
+        /// promises (e.g. `name` was not a string).
+        WrongType {
+            /// Field name in the provider's reply shape.
+            field: &'static str,
+            /// What the spec requires.
+            expected: &'static str,
+        },
+        /// The provider sent a JSON-encoded arguments string that
+        /// failed to parse. Carried verbatim so the caller can
+        /// log the offender. (OpenAI's `function.arguments` is a
+        /// string of JSON, not a parsed object — adapters
+        /// double-encode/decode the boundary.)
+        InvalidArgumentsJson(String),
+    }
+
+    impl std::fmt::Display for ToolCallParseError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::MissingField(name) => write!(f, "tool-call reply missing field `{name}`"),
+                Self::WrongType { field, expected } => write!(
+                    f,
+                    "tool-call reply field `{field}` had wrong type (expected {expected})"
+                ),
+                Self::InvalidArgumentsJson(detail) => {
+                    write!(f, "tool-call arguments were not valid JSON: {detail}")
+                }
+            }
+        }
+    }
+
+    impl std::error::Error for ToolCallParseError {}
 
     /// Parse the descriptor's stored input schema (a JSON-encoded
     /// string). Falls back to an empty-object schema if missing or
@@ -682,6 +758,61 @@ pub mod formats {
                 }
             })
         }
+
+        /// Parse one OpenAI `tool_calls[]` entry into a [`ToolCallSpec`].
+        /// OpenAI's reply shape is:
+        /// ```json
+        /// {
+        ///   "id": "<call_id>",
+        ///   "type": "function",
+        ///   "function": {
+        ///     "name": "<tool_id>",
+        ///     "arguments": "<JSON-encoded string>"
+        ///   }
+        /// }
+        /// ```
+        ///
+        /// `function.arguments` is a STRING containing JSON — the
+        /// OpenAI API doesn't parse it. The spec carries the string
+        /// verbatim so the caller can either forward to a raw byte
+        /// API or `serde_json::from_str` it. This sidesteps double
+        /// re-serialization on the happy path.
+        pub fn lower_openai_tool_call(call: &Value) -> Result<ToolCallSpec, ToolCallParseError> {
+            let function = call.get("function").ok_or(ToolCallParseError::MissingField("function"))?;
+            let name = function
+                .get("name")
+                .ok_or(ToolCallParseError::MissingField("function.name"))?
+                .as_str()
+                .ok_or(ToolCallParseError::WrongType {
+                    field: "function.name",
+                    expected: "string",
+                })?
+                .to_string();
+            let arguments_json = function
+                .get("arguments")
+                .ok_or(ToolCallParseError::MissingField("function.arguments"))?
+                .as_str()
+                .ok_or(ToolCallParseError::WrongType {
+                    field: "function.arguments",
+                    expected: "string (JSON-encoded)",
+                })?
+                .to_string();
+            // Validate it parses; fail fast with a tight diagnostic
+            // rather than letting the malformed string ride through
+            // `call_tool` and surface as a server-side decode error.
+            if let Err(e) = serde_json::from_str::<Value>(&arguments_json) {
+                return Err(ToolCallParseError::InvalidArgumentsJson(format!("{e}")));
+            }
+            let provider_call_id = call
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            Ok(ToolCallSpec {
+                name,
+                arguments_json,
+                provider_call_id,
+            })
+        }
     }
 
     /// Translators for the Anthropic Messages API `tools` array shape.
@@ -713,6 +844,47 @@ pub mod formats {
                 "input_schema": input_schema_value(desc),
             })
         }
+
+        /// Parse one Anthropic `tool_use` content block into a
+        /// [`ToolCallSpec`]. Block shape:
+        /// ```json
+        /// {
+        ///   "type": "tool_use",
+        ///   "id": "toolu_<id>",
+        ///   "name": "<tool_id>",
+        ///   "input": { … }
+        /// }
+        /// ```
+        ///
+        /// Anthropic's `input` is already a parsed object (unlike
+        /// OpenAI's string-encoded arguments), so the spec
+        /// re-serializes it once to preserve the
+        /// `arguments_json: String` contract on `ToolCallSpec`.
+        pub fn lower_anthropic_tool_use(block: &Value) -> Result<ToolCallSpec, ToolCallParseError> {
+            let name = block
+                .get("name")
+                .ok_or(ToolCallParseError::MissingField("name"))?
+                .as_str()
+                .ok_or(ToolCallParseError::WrongType {
+                    field: "name",
+                    expected: "string",
+                })?
+                .to_string();
+            let input = block
+                .get("input")
+                .ok_or(ToolCallParseError::MissingField("input"))?;
+            let arguments_json = serde_json::to_string(input)
+                .map_err(|e| ToolCallParseError::InvalidArgumentsJson(format!("{e}")))?;
+            let provider_call_id = block
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            Ok(ToolCallSpec {
+                name,
+                arguments_json,
+                provider_call_id,
+            })
+        }
     }
 
     /// Translators for the Model Context Protocol (MCP) `tools/list`
@@ -740,6 +912,102 @@ pub mod formats {
                 "name": desc.tool_id,
                 "description": desc.description.clone().unwrap_or_default(),
                 "inputSchema": input_schema_value(desc),
+            })
+        }
+
+        /// Parse an MCP `tools/call` request into a [`ToolCallSpec`].
+        /// Request params shape:
+        /// ```json
+        /// { "name": "<tool_id>", "arguments": { … } }
+        /// ```
+        ///
+        /// MCP requests don't carry a call_id at this layer (the
+        /// JSON-RPC envelope's `id` lives one level up). The spec
+        /// leaves `provider_call_id` as `None` — the caller is
+        /// expected to thread the JSON-RPC `id` separately.
+        pub fn lower_mcp_tools_call(params: &Value) -> Result<ToolCallSpec, ToolCallParseError> {
+            let name = params
+                .get("name")
+                .ok_or(ToolCallParseError::MissingField("name"))?
+                .as_str()
+                .ok_or(ToolCallParseError::WrongType {
+                    field: "name",
+                    expected: "string",
+                })?
+                .to_string();
+            let arguments = params
+                .get("arguments")
+                .ok_or(ToolCallParseError::MissingField("arguments"))?;
+            let arguments_json = serde_json::to_string(arguments)
+                .map_err(|e| ToolCallParseError::InvalidArgumentsJson(format!("{e}")))?;
+            Ok(ToolCallSpec {
+                name,
+                arguments_json,
+                provider_call_id: None,
+            })
+        }
+    }
+
+    /// Translators for the Google Gemini `generateContent` API
+    /// function-calling shape.
+    pub mod gemini {
+        use super::*;
+
+        /// Lower a [`ToolDescriptor`] into a Gemini
+        /// `FunctionDeclaration`.
+        ///
+        /// Wire shape (one entry in a
+        /// `tools[0].function_declarations[]` array):
+        /// ```json
+        /// {
+        ///   "name": "<tool_id>",
+        ///   "description": "<description>",
+        ///   "parameters": <input_schema>
+        /// }
+        /// ```
+        ///
+        /// Gemini wraps function declarations under
+        /// `tools: [{ function_declarations: [ … ] }]`; this helper
+        /// returns ONE declaration. The caller is responsible for
+        /// the outer wrapping — keeps the API symmetric with the
+        /// other provider translators.
+        pub fn to_gemini_function_declaration(desc: &ToolDescriptor) -> Value {
+            json!({
+                "name": desc.tool_id,
+                "description": desc.description.clone().unwrap_or_default(),
+                "parameters": input_schema_value(desc),
+            })
+        }
+
+        /// Parse one Gemini `functionCall` part into a
+        /// [`ToolCallSpec`]. Part shape:
+        /// ```json
+        /// { "name": "<tool_id>", "args": { … } }
+        /// ```
+        ///
+        /// Gemini doesn't supply a call id — the spec's
+        /// `provider_call_id` is `None`. Multi-call sequences are
+        /// identified positionally by their index in the model's
+        /// reply.
+        pub fn lower_gemini_function_call(call: &Value) -> Result<ToolCallSpec, ToolCallParseError> {
+            let name = call
+                .get("name")
+                .ok_or(ToolCallParseError::MissingField("name"))?
+                .as_str()
+                .ok_or(ToolCallParseError::WrongType {
+                    field: "name",
+                    expected: "string",
+                })?
+                .to_string();
+            let args = call
+                .get("args")
+                .ok_or(ToolCallParseError::MissingField("args"))?;
+            let arguments_json = serde_json::to_string(args)
+                .map_err(|e| ToolCallParseError::InvalidArgumentsJson(format!("{e}")))?;
+            Ok(ToolCallSpec {
+                name,
+                arguments_json,
+                provider_call_id: None,
             })
         }
     }
@@ -879,6 +1147,102 @@ mod tests {
     }
 
     #[test]
+    fn gemini_function_declaration_uses_parameters_field() {
+        let desc = sample_descriptor();
+        let decl = formats::gemini::to_gemini_function_declaration(&desc);
+        assert_eq!(decl["name"], "web_search");
+        assert_eq!(decl["description"], "Search the web.");
+        // Gemini uses `parameters` (same key as OpenAI, no wrapping
+        // `function` envelope). The schema rides directly underneath.
+        let params = &decl["parameters"];
+        assert!(params["properties"]["query"].is_object());
+    }
+
+    #[test]
+    fn openai_lower_tool_call_extracts_name_and_arguments() {
+        use formats::openai::lower_openai_tool_call;
+        let call = serde_json::json!({
+            "id": "call_abc123",
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "arguments": "{\"query\":\"mesh\"}"
+            }
+        });
+        let spec = lower_openai_tool_call(&call).expect("valid call parses");
+        assert_eq!(spec.name, "web_search");
+        assert_eq!(spec.arguments_json, "{\"query\":\"mesh\"}");
+        assert_eq!(spec.provider_call_id.as_deref(), Some("call_abc123"));
+    }
+
+    #[test]
+    fn openai_lower_tool_call_rejects_invalid_arguments_json() {
+        use formats::openai::lower_openai_tool_call;
+        use formats::ToolCallParseError;
+        let call = serde_json::json!({
+            "function": {
+                "name": "x",
+                "arguments": "not valid json {"
+            }
+        });
+        match lower_openai_tool_call(&call) {
+            Err(ToolCallParseError::InvalidArgumentsJson(_)) => {}
+            other => panic!("expected InvalidArgumentsJson, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anthropic_lower_tool_use_serializes_input_object() {
+        use formats::anthropic::lower_anthropic_tool_use;
+        let block = serde_json::json!({
+            "type": "tool_use",
+            "id": "toolu_xyz",
+            "name": "web_search",
+            "input": { "query": "mesh", "max_results": 5 }
+        });
+        let spec = lower_anthropic_tool_use(&block).expect("valid block parses");
+        assert_eq!(spec.name, "web_search");
+        // Re-parse to verify shape — the exact key ordering in
+        // serde_json output isn't guaranteed, so don't byte-compare.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&spec.arguments_json).expect("arguments round-trip JSON");
+        assert_eq!(parsed["query"], "mesh");
+        assert_eq!(parsed["max_results"], 5);
+        assert_eq!(spec.provider_call_id.as_deref(), Some("toolu_xyz"));
+    }
+
+    #[test]
+    fn mcp_lower_tools_call_threads_arguments_through() {
+        use formats::mcp::lower_mcp_tools_call;
+        let params = serde_json::json!({
+            "name": "web_search",
+            "arguments": { "query": "mesh" }
+        });
+        let spec = lower_mcp_tools_call(&params).expect("valid params parse");
+        assert_eq!(spec.name, "web_search");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&spec.arguments_json).expect("arguments round-trip JSON");
+        assert_eq!(parsed["query"], "mesh");
+        // MCP request params don't carry a call_id at this layer.
+        assert!(spec.provider_call_id.is_none());
+    }
+
+    #[test]
+    fn gemini_lower_function_call_handles_args_field() {
+        use formats::gemini::lower_gemini_function_call;
+        let call = serde_json::json!({
+            "name": "web_search",
+            "args": { "query": "mesh" }
+        });
+        let spec = lower_gemini_function_call(&call).expect("valid call parses");
+        assert_eq!(spec.name, "web_search");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&spec.arguments_json).expect("arguments round-trip JSON");
+        assert_eq!(parsed["query"], "mesh");
+        assert!(spec.provider_call_id.is_none(), "Gemini has no call_id");
+    }
+
+    #[test]
     fn formats_handle_missing_input_schema_with_empty_object() {
         // Build a descriptor with a None input schema (manual
         // construction since `metadata_for` always derives one).
@@ -905,5 +1269,7 @@ mod tests {
         assert_eq!(anthropic["input_schema"]["type"], "object");
         let mcp = formats::mcp::to_mcp_tool(&desc);
         assert_eq!(mcp["inputSchema"]["type"], "object");
+        let gemini = formats::gemini::to_gemini_function_declaration(&desc);
+        assert_eq!(gemini["parameters"]["type"], "object");
     }
 }
