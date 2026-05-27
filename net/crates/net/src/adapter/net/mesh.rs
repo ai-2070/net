@@ -5442,15 +5442,7 @@ impl MeshNode {
                 if tools.is_empty() {
                     continue;
                 }
-                // Convert BTreeMap → HashMap once per membership so
-                // `from_capability` can index it. Cheap (string moves
-                // only; the inner schema strings stay borrowed via
-                // clone-on-write at the descriptor layer).
-                let metadata: HashMap<String, String> = membership
-                    .metadata
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
+                let metadata = &membership.metadata;
                 for mut cap in tools {
                     // Hydrate schemas from metadata. The tag codec
                     // doesn't carry them; the announce path stashes

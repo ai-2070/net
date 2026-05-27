@@ -87,7 +87,7 @@ fn descriptor(tool_id: &str) -> ToolDescriptor {
     let cap = ToolCapability::new(tool_id, format!("Name for {tool_id}"))
         .with_version("1.0.0")
         .with_input_schema(r#"{"type":"object","properties":{"query":{"type":"string"}}}"#);
-    ToolDescriptor::from_capability(&cap, &std::collections::HashMap::new())
+    ToolDescriptor::from_capability(&cap, &std::collections::BTreeMap::new())
 }
 
 #[tokio::test]

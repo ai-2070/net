@@ -22,7 +22,7 @@
 //! slices S-2 (descriptor + fold integration) and S-4 (feature gate
 //! + envelope).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -144,7 +144,7 @@ impl ToolDescriptor {
     /// The metadata map is `CapabilitySet::metadata` — the same
     /// hook `ToolCapability::input_schema_metadata_key` /
     /// `output_schema_metadata_key` use.
-    pub fn from_capability(cap: &ToolCapability, metadata: &HashMap<String, String>) -> Self {
+    pub fn from_capability(cap: &ToolCapability, metadata: &BTreeMap<String, String>) -> Self {
         let description = metadata
             .get(&description_metadata_key(&cap.tool_id))
             .cloned();
@@ -523,7 +523,7 @@ mod tests {
     #[test]
     fn descriptor_from_capability_picks_up_metadata_fields() {
         let cap = cap("web_search");
-        let mut meta = HashMap::new();
+        let mut meta = BTreeMap::new();
         meta.insert(
             description_metadata_key("web_search"),
             "Search the web.".to_string(),
@@ -550,7 +550,7 @@ mod tests {
     #[test]
     fn descriptor_from_capability_handles_missing_metadata() {
         let cap = cap("legacy");
-        let meta = HashMap::new();
+        let meta = BTreeMap::new();
         let desc = ToolDescriptor::from_capability(&cap, &meta);
         assert!(desc.description.is_none());
         assert!(!desc.streaming);
@@ -560,7 +560,7 @@ mod tests {
     #[test]
     fn descriptor_tags_parsing_strips_whitespace_and_drops_empty() {
         let cap = cap("messy");
-        let mut meta = HashMap::new();
+        let mut meta = BTreeMap::new();
         meta.insert(tags_metadata_key("messy"), "  a , b ,, c  ,".to_string());
         let desc = ToolDescriptor::from_capability(&cap, &meta);
         assert_eq!(desc.tags, vec!["a", "b", "c"]);
@@ -654,7 +654,7 @@ mod tests {
 
     fn descriptor(tool_id: &str) -> ToolDescriptor {
         let cap = cap(tool_id);
-        ToolDescriptor::from_capability(&cap, &HashMap::new())
+        ToolDescriptor::from_capability(&cap, &BTreeMap::new())
     }
 
     #[test]
