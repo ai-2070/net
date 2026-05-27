@@ -53,8 +53,6 @@ use parking_lot::RwLock;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-#[cfg(feature = "tool")]
-use pyo3::types::PyList;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
@@ -1910,37 +1908,19 @@ mod mesh_bindings {
         /// follow-up that adds a `matcher` arg.
         ///
         /// Gated on the `tool` Cargo feature (default-on).
+        ///
+        /// Returns a JSON-encoded list of descriptors as a Python
+        /// string. The `net.tool.list_tools` wrapper parses it once
+        /// with `json.loads`. ToolDescriptor already derives
+        /// `Serialize`, so this is a single `serde_json::to_string`
+        /// instead of 12 fallible `PyDict::set_item` calls per
+        /// descriptor — meaningful on every watch_tools poll.
         #[cfg(feature = "tool")]
-        fn list_tools(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        fn list_tools(&self) -> PyResult<String> {
             let node = self.get_node()?;
             let descriptors = node.list_tools(None);
-            let out = PyList::empty(py);
-            for d in descriptors {
-                let entry = PyDict::new(py);
-                entry.set_item("tool_id", d.tool_id)?;
-                entry.set_item("name", d.name)?;
-                entry.set_item("version", d.version)?;
-                match d.description {
-                    Some(s) => entry.set_item("description", s)?,
-                    None => entry.set_item("description", py.None())?,
-                }
-                match d.input_schema {
-                    Some(s) => entry.set_item("input_schema", s)?,
-                    None => entry.set_item("input_schema", py.None())?,
-                }
-                match d.output_schema {
-                    Some(s) => entry.set_item("output_schema", s)?,
-                    None => entry.set_item("output_schema", py.None())?,
-                }
-                entry.set_item("requires", d.requires)?;
-                entry.set_item("estimated_time_ms", d.estimated_time_ms)?;
-                entry.set_item("stateless", d.stateless)?;
-                entry.set_item("streaming", d.streaming)?;
-                entry.set_item("tags", d.tags)?;
-                entry.set_item("node_count", d.node_count)?;
-                out.append(entry)?;
-            }
-            Ok(out.into())
+            serde_json::to_string(&descriptors)
+                .map_err(|e| PyValueError::new_err(format!("list_tools serialize failed: {e}")))
         }
 
         /// Bucketed aggregation over the local capability fold —

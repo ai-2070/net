@@ -528,12 +528,15 @@ def list_tools(mesh: Any) -> List[ToolDescriptor]:
     packages consume when lowering into provider-specific tool
     definitions.
 
-    The native binding returns plain dicts; this wrapper converts
-    them into :class:`ToolDescriptor` dataclass instances for type
-    safety and IDE autocomplete.
+    The native binding returns a single JSON-encoded string of all
+    descriptors; this wrapper parses it once with ``json.loads`` and
+    converts each entry to a :class:`ToolDescriptor` dataclass for
+    type safety and IDE autocomplete. Avoids the per-descriptor
+    ``PyDict_SetItem`` storm the prior implementation paid on every
+    ``watch_tools`` tick.
     """
     out: List[ToolDescriptor] = []
-    for d in mesh.list_tools():
+    for d in json.loads(mesh.list_tools()):
         out.append(
             ToolDescriptor(
                 tool_id=d["tool_id"],
