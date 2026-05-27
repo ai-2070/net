@@ -1,0 +1,28 @@
+net/crates/net/bindings/go/rpc-ffi/src/lib.rs
+  s_099fa7d871e34d::t_03149311341db6 212-215,246-249
+  s_099fa7d871e34d::t_722318fa7e4a7c 203,237
+net/crates/net/sdk/Cargo.toml
+  s_099fa7d871e34d::t_a3eb8db122f28f 221
+.github/workflows/ci.yml
+  s_099fa7d871e34d::t_5df788442af24b 923-925
+  s_099fa7d871e34d::t_2f784134319b06 1286-1314
+  s_099fa7d871e34d::t_e7e70787e6f9a5 806-834
+.github/workflows/coverage.yml
+  s_099fa7d871e34d::t_a32d2c8e8e7e19 87-88,93-98,102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "57aff8cb89e2ff9d043a0ee0eb1d454ad4e57743",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
