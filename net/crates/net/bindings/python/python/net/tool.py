@@ -253,6 +253,30 @@ def _ensure_fetch_installed(rpc: Any) -> dict:
     return entry
 
 
+def _coerce_descriptor(
+    options_or_descriptor: Union[ToolDescriptor, dict, str],
+    kwargs: dict,
+    *,
+    context: str,
+) -> ToolDescriptor:
+    """Normalize the ``options_or_descriptor`` parameter accepted by
+    every ``serve_tool*`` variant into a concrete
+    :class:`ToolDescriptor`. ``context`` names the calling function
+    for the ``TypeError`` message.
+    """
+    if isinstance(options_or_descriptor, ToolDescriptor):
+        return options_or_descriptor
+    if isinstance(options_or_descriptor, dict):
+        opts = dict(options_or_descriptor)
+        name = opts.pop("name")
+        return descriptor_for(name, **opts)
+    if isinstance(options_or_descriptor, str):
+        return descriptor_for(options_or_descriptor, **kwargs)
+    raise TypeError(
+        f"{context}: options_or_descriptor must be ToolDescriptor, dict, or str"
+    )
+
+
 def serve_tool(
     rpc: TypedMeshRpc,
     options_or_descriptor: Union[ToolDescriptor, dict, str],
@@ -285,18 +309,7 @@ def serve_tool(
     helper will atomically insert there too, making the announce-
     time merge automatic (matching the Rust SDK's contract).
     """
-    if isinstance(options_or_descriptor, ToolDescriptor):
-        descriptor = options_or_descriptor
-    elif isinstance(options_or_descriptor, dict):
-        opts = dict(options_or_descriptor)
-        name = opts.pop("name")
-        descriptor = descriptor_for(name, **opts)
-    elif isinstance(options_or_descriptor, str):
-        descriptor = descriptor_for(options_or_descriptor, **kwargs)
-    else:
-        raise TypeError(
-            "serve_tool: options_or_descriptor must be ToolDescriptor, dict, or str"
-        )
+    descriptor = _coerce_descriptor(options_or_descriptor, kwargs, context="serve_tool")
     entry = _ensure_fetch_installed(rpc)
     entry["registry"][descriptor.tool_id] = descriptor
     inner = rpc.serve(descriptor.tool_id, handler)
@@ -907,19 +920,7 @@ def serve_tool_streaming(
     envelope so callers see a typed error rather than the
     synthesized ``missing_terminal``.
     """
-    if isinstance(options_or_descriptor, ToolDescriptor):
-        base = options_or_descriptor
-    elif isinstance(options_or_descriptor, dict):
-        opts = dict(options_or_descriptor)
-        name = opts.pop("name")
-        base = descriptor_for(name, **opts)
-    elif isinstance(options_or_descriptor, str):
-        base = descriptor_for(options_or_descriptor, **kwargs)
-    else:
-        raise TypeError(
-            "serve_tool_streaming: options_or_descriptor must be "
-            "ToolDescriptor, dict, or str"
-        )
+    base = _coerce_descriptor(options_or_descriptor, kwargs, context="serve_tool_streaming")
     descriptor = ToolDescriptor(**{**base.__dict__, "streaming": True})
 
     def _stream_handler(req: Any, sink: Any) -> None:
@@ -960,19 +961,9 @@ def serve_tool_streaming_async(
     Handler exceptions map to a terminal ``handler_error``
     envelope, matching the sync wrapper's contract.
     """
-    if isinstance(options_or_descriptor, ToolDescriptor):
-        base = options_or_descriptor
-    elif isinstance(options_or_descriptor, dict):
-        opts = dict(options_or_descriptor)
-        name = opts.pop("name")
-        base = descriptor_for(name, **opts)
-    elif isinstance(options_or_descriptor, str):
-        base = descriptor_for(options_or_descriptor, **kwargs)
-    else:
-        raise TypeError(
-            "serve_tool_streaming_async: options_or_descriptor must "
-            "be ToolDescriptor, dict, or str"
-        )
+    base = _coerce_descriptor(
+        options_or_descriptor, kwargs, context="serve_tool_streaming_async"
+    )
     descriptor = ToolDescriptor(**{**base.__dict__, "streaming": True})
 
     import inspect
@@ -1038,18 +1029,7 @@ def serve_tool_async(
     doesn't need to be async), so this helper is `def` not `async
     def`.
     """
-    if isinstance(options_or_descriptor, ToolDescriptor):
-        descriptor = options_or_descriptor
-    elif isinstance(options_or_descriptor, dict):
-        opts = dict(options_or_descriptor)
-        name = opts.pop("name")
-        descriptor = descriptor_for(name, **opts)
-    elif isinstance(options_or_descriptor, str):
-        descriptor = descriptor_for(options_or_descriptor, **kwargs)
-    else:
-        raise TypeError(
-            "serve_tool_async: options_or_descriptor must be ToolDescriptor, dict, or str"
-        )
+    descriptor = _coerce_descriptor(options_or_descriptor, kwargs, context="serve_tool_async")
     entry = _ensure_fetch_installed(rpc)
     entry["registry"][descriptor.tool_id] = descriptor
     inner = rpc.serve(descriptor.tool_id, handler)
