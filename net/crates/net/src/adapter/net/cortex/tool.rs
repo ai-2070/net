@@ -89,9 +89,8 @@ pub fn tags_metadata_key(tool_id: &str) -> String {
 /// Source-of-truth fields are pulled from [`ToolCapability`]
 /// (`tool_id` / `name` / `version` / `input_schema` /
 /// `output_schema` / `requires` / `estimated_time_ms` / `stateless`)
-/// + `CapabilitySet::metadata` keys
-/// ([`description_metadata_key`] / [`streaming_metadata_key`] /
-/// [`tags_metadata_key`]).
+/// plus `CapabilitySet::metadata` keys [`description_metadata_key`],
+/// [`streaming_metadata_key`], and [`tags_metadata_key`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolDescriptor {
     /// nRPC service name. Same string the caller passes to

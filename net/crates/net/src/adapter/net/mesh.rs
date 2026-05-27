@@ -5565,18 +5565,18 @@ impl MeshNode {
                     .collect();
                 // Added: in next, not in prev.
                 for (key, desc) in next.iter() {
-                    if !prev.contains_key(key) {
-                        if tx.send(ToolListChange::Added(desc.clone())).is_err() {
-                            return;
-                        }
+                    if !prev.contains_key(key)
+                        && tx.send(ToolListChange::Added(desc.clone())).is_err()
+                    {
+                        return;
                     }
                 }
                 // Removed: in prev, not in next.
                 for (key, desc) in prev.iter() {
-                    if !next.contains_key(key) {
-                        if tx.send(ToolListChange::Removed(desc.clone())).is_err() {
-                            return;
-                        }
+                    if !next.contains_key(key)
+                        && tx.send(ToolListChange::Removed(desc.clone())).is_err()
+                    {
+                        return;
                     }
                 }
                 // NodeCountChanged: in both, but counts differ. (Any
@@ -5584,16 +5584,15 @@ impl MeshNode {
                 // descriptor carries the latest view.)
                 for (key, new_desc) in next.iter() {
                     if let Some(old_desc) = prev.get(key) {
-                        if new_desc.node_count != old_desc.node_count {
-                            if tx
+                        if new_desc.node_count != old_desc.node_count
+                            && tx
                                 .send(ToolListChange::NodeCountChanged {
                                     descriptor: new_desc.clone(),
                                     prev_node_count: old_desc.node_count,
                                 })
                                 .is_err()
-                            {
-                                return;
-                            }
+                        {
+                            return;
                         }
                     }
                 }
