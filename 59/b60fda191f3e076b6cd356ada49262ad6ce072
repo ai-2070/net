@@ -1,0 +1,24 @@
+net/crates/net/bindings/go/net/tool_format_golden_vectors_test.go
+  s_099fa7d871e34d::t_4df90cae18eccb 41-45,47-52,64-67,78-83
+  s_099fa7d871e34d::t_2cde4260a84e49 1-40,46,53-63,68-77,84-299
+net/crates/net/bindings/python/tests/test_tool_format_golden_vectors.py
+  s_099fa7d871e34d::t_2967182b13f52e 1-125
+net/crates/net/bindings/node/test/tool_format_golden_vectors.test.ts
+  s_099fa7d871e34d::t_b613147e59c9be 1-190
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "59b60fda191f3e076b6cd356ada49262ad6ce072",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
