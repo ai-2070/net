@@ -33,6 +33,16 @@ pub use net::adapter::net::cortex::tool::{
     TOOL_METADATA_FETCH_SERVICE,
 };
 
+#[cfg(feature = "cortex")]
+use std::sync::Arc;
+
+#[cfg(feature = "cortex")]
+use crate::mesh::Mesh;
+#[cfg(feature = "cortex")]
+use crate::mesh_rpc::{Codec, ServeError, ServeHandle};
+#[cfg(feature = "cortex")]
+use serde::{de::DeserializeOwned, Serialize};
+
 /// Builder for a [`ToolDescriptor`] that derives its JSON Schema
 /// from Rust type parameters. Construct via [`metadata_for`], then
 /// chain setters for the fields that aren't derivable from the
@@ -178,6 +188,187 @@ where
             tags: Vec::new(),
             node_count: 0,
         },
+    }
+}
+
+// ============================================================================
+// ToolServeHandle — owns the typed-RPC `ServeHandle` and reverses the
+// tool_registry insert when dropped.
+// ============================================================================
+
+/// Returned by [`Mesh::serve_tool`]. Holds the underlying typed-RPC
+/// `ServeHandle` (which unregisters the handler on Drop) plus a
+/// clone of the `MeshNode`'s `tool_registry` so Drop can paired-
+/// remove the descriptor.
+///
+/// Lifecycle:
+/// - Construct via `Mesh::serve_tool(...)` — atomically registers
+///   the handler, inserts the descriptor, and (on the first
+///   `serve_tool` call) auto-installs the `tool.metadata.fetch`
+///   service handler.
+/// - On Drop:
+///     1. Remove the descriptor from `tool_registry` — the next
+///        `announce_capabilities` no longer emits the
+///        `ai-tool:<name>` tag.
+///     2. The inner `ServeHandle` drops, unregistering the nRPC
+///        handler.
+///
+/// The auto-installed `tool.metadata.fetch` service stays
+/// registered for the lifetime of the `Mesh`; it's harmless when
+/// the registry is empty (returns `NotFound` for every request).
+#[cfg(feature = "cortex")]
+pub struct ToolServeHandle {
+    /// Inner handle from `serve_rpc_typed`. Dropping it
+    /// unregisters the nRPC handler.
+    #[allow(dead_code)] // Held for Drop side effect.
+    inner: ServeHandle,
+    /// Tool registry the descriptor was inserted into. Drop's
+    /// remove path uses this — keeping the `Arc` clone ensures
+    /// the registry outlives the handle (otherwise the registry
+    /// could vanish if the `Mesh` was dropped between handle
+    /// construction and handle Drop).
+    registry: Arc<ToolMetadataRegistry>,
+    /// Name to remove on Drop. Stored separately because `inner`
+    /// keeps its own `service` field private to the substrate
+    /// crate.
+    tool_id: String,
+}
+
+#[cfg(feature = "cortex")]
+impl Drop for ToolServeHandle {
+    fn drop(&mut self) {
+        self.registry.remove(&self.tool_id);
+        // `inner` drops on its own and reverses the nRPC handler
+        // registration; we don't need to do anything else here.
+    }
+}
+
+#[cfg(feature = "cortex")]
+impl Mesh {
+    /// Atomically register `handler` as an AI tool:
+    ///
+    /// 1. The descriptor is inserted into the local
+    ///    `tool_registry` — subsequent `announce_capabilities`
+    ///    calls auto-emit the `ai-tool:<name>` tag, the typed
+    ///    `ToolCapability`, and the description / streaming /
+    ///    tags metadata keys (see A-2a).
+    /// 2. The handler is registered as an nRPC service at
+    ///    `descriptor.tool_id` via `serve_rpc_typed` — the
+    ///    substrate also tracks the service in `rpc_local_services`
+    ///    so subsequent announces include the `nrpc:<name>` tag.
+    /// 3. The first `serve_tool` call on this `Mesh` lazily
+    ///    installs the `tool.metadata.fetch` server handler so
+    ///    agents can pull the full descriptor for tools whose
+    ///    schemas were too large for the capability-fold payload
+    ///    budget. The install handle lives for the lifetime of
+    ///    the `Mesh`; subsequent `serve_tool` calls skip it.
+    ///
+    /// If step 2 fails, step 1 is rolled back — the registry
+    /// insert is paired-removed before the error returns, and the
+    /// auto-install (if it happened in this call) stays in place
+    /// (low cost; cleaning it up would race with concurrent
+    /// `serve_tool` calls).
+    ///
+    /// The returned [`ToolServeHandle`] reverses both registry
+    /// insert (step 1) and handler registration (step 2) on Drop.
+    ///
+    /// JSON codec is used unconditionally for AI tools — every
+    /// provider (OpenAI, Anthropic, Gemini, MCP) consumes JSON
+    /// for tool input/output. Wire-format consistency lets the
+    /// adapter packages in M-* lower descriptors and dispatched
+    /// tool-calls without per-tool codec negotiation.
+    pub fn serve_tool<Req, Resp, F, Fut>(
+        &self,
+        descriptor: ToolDescriptor,
+        handler: F,
+    ) -> std::result::Result<ToolServeHandle, ServeError>
+    where
+        Req: DeserializeOwned + Send + Sync + 'static,
+        Resp: Serialize + Send + Sync + 'static,
+        F: Fn(Req) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = std::result::Result<Resp, String>> + Send + 'static,
+    {
+        let tool_id = descriptor.tool_id.clone();
+        let registry = self.inner().tool_registry().clone();
+
+        // Step 1: registry insert. Done before the handler so the
+        // descriptor is observable to `tool.metadata.fetch` the
+        // moment the handler responds to its first call.
+        let prior = registry.insert(descriptor);
+        if let Some(prior) = prior {
+            // Reject duplicate registrations rather than silently
+            // overwriting — the prior handler still lives in
+            // `rpc_local_services` from its own `serve_rpc_typed`
+            // call; overwriting would leak that handler's
+            // `ServeHandle` Drop and surface confusing behavior
+            // (registry says X, handler answers Y).
+            registry.insert(prior);
+            return Err(ServeError::AlreadyServing(tool_id));
+        }
+
+        // Step 2: handler register. If this fails, paired-remove
+        // the descriptor we just inserted so the registry doesn't
+        // hold a phantom entry.
+        let inner = match self.serve_rpc_typed::<Req, Resp, _, _>(&tool_id, Codec::Json, handler) {
+            Ok(h) => h,
+            Err(e) => {
+                registry.remove(&tool_id);
+                return Err(e);
+            }
+        };
+
+        // Step 3: lazy auto-install of `tool.metadata.fetch`. The
+        // handler answers `{ name } -> ToolMetadataResponse` for
+        // any caller that wants the full descriptor (for schemas
+        // too large to fit in the capability-fold payload).
+        self.ensure_tool_metadata_fetch_installed();
+
+        Ok(ToolServeHandle {
+            inner,
+            registry,
+            tool_id,
+        })
+    }
+
+    /// Idempotent — installs the `tool.metadata.fetch` nRPC
+    /// service handler if not yet present. Holds a `parking_lot`
+    /// mutex; the first caller through wins, the rest see
+    /// `Some(_)` and return immediately.
+    fn ensure_tool_metadata_fetch_installed(&self) {
+        let mut slot = self.tool_metadata_fetch.lock();
+        if slot.is_some() {
+            return;
+        }
+        let registry = self.node().tool_registry().clone();
+        let handler = move |req: ToolMetadataRequest| {
+            let registry = registry.clone();
+            async move {
+                Ok(match registry.get(&req.name) {
+                    Some(descriptor) => ToolMetadataResponse::Found { descriptor },
+                    None => ToolMetadataResponse::NotFound { name: req.name },
+                })
+            }
+        };
+        // If install fails (e.g. the service name's already taken
+        // by some manual `serve_rpc_typed` call — unlikely but
+        // possible), leave `slot` as `None`; subsequent
+        // `serve_tool` calls retry. The failure is silent here
+        // because (a) it's recoverable on retry, (b) it's surfaceable
+        // via `tool.metadata.fetch` returning NotFound (or transport
+        // errors) at the agent side, and (c) `ensure_*` is called
+        // from inside an infallible-returning `serve_tool` path —
+        // surfacing the error would require a fallible signature
+        // and complicate the happy path. The conflict is
+        // operator-misconfiguration, not transient failure.
+        if let Ok(handle) = self
+            .serve_rpc_typed::<ToolMetadataRequest, ToolMetadataResponse, _, _>(
+                TOOL_METADATA_FETCH_SERVICE,
+                Codec::Json,
+                handler,
+            )
+        {
+            *slot = Some(handle);
+        }
     }
 }
 

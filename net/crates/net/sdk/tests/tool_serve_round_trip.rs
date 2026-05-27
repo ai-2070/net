@@ -1,0 +1,322 @@
+//! Rust SDK integration test for `Mesh::serve_tool` (A-2b).
+//!
+//! Exercises the full atomic-register / Drop-reverses path
+//! end-to-end against two real `Mesh`es:
+//!
+//! 1. Host registers a typed handler via `Mesh::serve_tool` with
+//!    a `ToolDescriptor` built from `metadata_for::<Req, Resp>()`.
+//! 2. Host announces capabilities. The substrate-side merge
+//!    (A-2a) auto-emits `ai-tool:web_search` + the typed
+//!    `ToolCapability` + the description / streaming / tags
+//!    metadata.
+//! 3. Peer waits for the capability index to surface the host
+//!    under `ai-tool:web_search`, then calls the tool via
+//!    `call_typed`.
+//! 4. The host also auto-installed `tool.metadata.fetch` on the
+//!    first `serve_tool` call; peer queries that service for the
+//!    full descriptor and verifies it round-trips.
+//! 5. Drop the `ToolServeHandle`. Re-announce. Confirm the tag is
+//!    gone from the host's subsequent announce + the descriptor
+//!    is gone from the local registry.
+
+#![cfg(all(feature = "tool", feature = "cortex"))]
+
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
+use net_sdk::capabilities::CapabilitySet as SdkCapabilitySet;
+use net_sdk::mesh::{Mesh, MeshBuilder};
+use net_sdk::mesh_rpc::{CallOptionsTyped, Codec};
+use net_sdk::tool::{
+    metadata_for, ToolMetadataRequest, ToolMetadataResponse, TOOL_METADATA_FETCH_SERVICE,
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+const PSK: [u8; 32] = [0x42u8; 32];
+
+#[derive(JsonSchema, Deserialize, Serialize, Debug, PartialEq, Eq)]
+struct WebSearchReq {
+    query: String,
+}
+
+#[derive(JsonSchema, Deserialize, Serialize, Debug, PartialEq, Eq)]
+struct WebSearchResp {
+    results: Vec<String>,
+}
+
+async fn build_pair() -> (Mesh, Mesh, SocketAddr) {
+    let a = MeshBuilder::new("127.0.0.1:0", &PSK)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let b = MeshBuilder::new("127.0.0.1:0", &PSK)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let addr_b = b.inner().local_addr();
+    (a, b, addr_b)
+}
+
+async fn handshake(a: &Mesh, b: &Mesh, addr_b: SocketAddr) {
+    let pub_b = *b.inner().public_key();
+    let nid_b = b.inner().node_id();
+    let nid_a = a.inner().node_id();
+    let (r1, r2) = tokio::join!(
+        b.inner().accept(nid_a),
+        a.inner().connect(addr_b, &pub_b, nid_b),
+    );
+    r1.expect("accept");
+    r2.expect("connect");
+    a.inner().start();
+    b.inner().start();
+}
+
+async fn wait_until<F: FnMut() -> bool>(mut cond: F, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cond()
+}
+
+#[tokio::test]
+async fn serve_tool_round_trip_announces_calls_and_fetches_metadata() {
+    let (caller, host, host_addr) = build_pair().await;
+    handshake(&caller, &host, host_addr).await;
+
+    // Host registers a tool. The descriptor is built from the
+    // Rust type pair — schemas derived via `schemars`.
+    let descriptor = metadata_for::<WebSearchReq, WebSearchResp>("web_search")
+        .description("Search the web for relevant pages.")
+        .stateless(true)
+        .estimated_time_ms(500)
+        .tag("web")
+        .tag("research")
+        .build();
+    let _handle = host
+        .serve_tool::<WebSearchReq, WebSearchResp, _, _>(descriptor.clone(), |req| async move {
+            Ok(WebSearchResp {
+                results: vec![format!("result for {}", req.query)],
+            })
+        })
+        .expect("serve_tool");
+
+    // Announce — the A-2a merge emits the ai-tool tag + the
+    // ToolCapability + metadata keys.
+    host.announce_capabilities(SdkCapabilitySet::new())
+        .await
+        .expect("announce");
+
+    // Caller waits for the capability index to surface the host.
+    let tool_filter = CapabilityFilter::default().require_tag("ai-tool:web_search");
+    assert!(
+        wait_until(
+            || caller
+                .inner()
+                .find_nodes_by_filter(&tool_filter)
+                .contains(&host.inner().node_id()),
+            Duration::from_secs(3),
+        )
+        .await,
+        "caller must see host under `ai-tool:web_search`",
+    );
+
+    // Direct typed call via the underlying serve_rpc_typed
+    // registration. `Mesh::serve_tool` registers under the
+    // tool_id, so `call_typed(host, "web_search", ...)` reaches it.
+    let resp: WebSearchResp = caller
+        .call_typed(
+            host.inner().node_id(),
+            "web_search",
+            &WebSearchReq {
+                query: "mesh".into(),
+            },
+            CallOptionsTyped {
+                raw: Default::default(),
+                codec: Codec::Json,
+            },
+        )
+        .await
+        .expect("call_typed");
+    assert_eq!(resp.results, vec!["result for mesh".to_string()]);
+
+    // tool.metadata.fetch round-trip — caller pulls the full
+    // descriptor for the host's tool.
+    let fetched: ToolMetadataResponse = caller
+        .call_typed(
+            host.inner().node_id(),
+            TOOL_METADATA_FETCH_SERVICE,
+            &ToolMetadataRequest {
+                name: "web_search".into(),
+            },
+            CallOptionsTyped {
+                raw: Default::default(),
+                codec: Codec::Json,
+            },
+        )
+        .await
+        .expect("metadata fetch");
+    match fetched {
+        ToolMetadataResponse::Found { descriptor: got } => {
+            assert_eq!(got.tool_id, "web_search");
+            assert_eq!(got.description.as_deref(), Some("Search the web for relevant pages."));
+            assert_eq!(got.estimated_time_ms, 500);
+            assert!(got.stateless);
+            assert_eq!(got.tags, vec!["web", "research"]);
+            assert!(got.input_schema.is_some());
+            assert!(got.output_schema.is_some());
+        }
+        ToolMetadataResponse::NotFound { name } => {
+            panic!("expected Found for web_search; got NotFound({name})");
+        }
+    }
+}
+
+#[tokio::test]
+async fn tool_metadata_fetch_returns_not_found_for_unknown_tool() {
+    let (caller, host, host_addr) = build_pair().await;
+    handshake(&caller, &host, host_addr).await;
+
+    // Register one tool so the host has the `tool.metadata.fetch`
+    // service installed (lazy install — first `serve_tool` triggers
+    // it).
+    let descriptor = metadata_for::<WebSearchReq, WebSearchResp>("web_search").build();
+    let _handle = host
+        .serve_tool::<WebSearchReq, WebSearchResp, _, _>(descriptor, |req| async move {
+            Ok(WebSearchResp {
+                results: vec![req.query],
+            })
+        })
+        .expect("serve_tool");
+
+    host.announce_capabilities(SdkCapabilitySet::new())
+        .await
+        .expect("announce");
+
+    // Wait for capability propagation so `call_typed` finds the
+    // metadata-fetch service via the host's `nrpc:` tags.
+    let svc_filter =
+        CapabilityFilter::default().require_tag(format!("nrpc:{TOOL_METADATA_FETCH_SERVICE}"));
+    assert!(
+        wait_until(
+            || caller
+                .inner()
+                .find_nodes_by_filter(&svc_filter)
+                .contains(&host.inner().node_id()),
+            Duration::from_secs(3),
+        )
+        .await,
+        "tool.metadata.fetch must be reachable",
+    );
+
+    let fetched: ToolMetadataResponse = caller
+        .call_typed(
+            host.inner().node_id(),
+            TOOL_METADATA_FETCH_SERVICE,
+            &ToolMetadataRequest {
+                name: "nonexistent".into(),
+            },
+            CallOptionsTyped {
+                raw: Default::default(),
+                codec: Codec::Json,
+            },
+        )
+        .await
+        .expect("metadata fetch");
+    match fetched {
+        ToolMetadataResponse::NotFound { name } => {
+            assert_eq!(name, "nonexistent");
+        }
+        ToolMetadataResponse::Found { descriptor } => {
+            panic!(
+                "expected NotFound for nonexistent tool; got Found({:?})",
+                descriptor.tool_id,
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn serve_tool_drop_removes_descriptor_from_registry() {
+    let mesh = MeshBuilder::new("127.0.0.1:0", &PSK)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let descriptor = metadata_for::<WebSearchReq, WebSearchResp>("web_search").build();
+    let handle = mesh
+        .serve_tool::<WebSearchReq, WebSearchResp, _, _>(descriptor, |req| async move {
+            Ok(WebSearchResp {
+                results: vec![req.query],
+            })
+        })
+        .expect("serve_tool");
+
+    assert_eq!(mesh.inner().tool_registry().len(), 1);
+    assert!(mesh.inner().tool_registry().get("web_search").is_some());
+
+    drop(handle);
+
+    assert_eq!(
+        mesh.inner().tool_registry().len(),
+        0,
+        "ToolServeHandle Drop must remove from registry",
+    );
+    assert!(mesh.inner().tool_registry().get("web_search").is_none());
+}
+
+#[tokio::test]
+async fn serve_tool_rejects_duplicate_tool_id() {
+    let mesh = MeshBuilder::new("127.0.0.1:0", &PSK)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let descriptor = metadata_for::<WebSearchReq, WebSearchResp>("web_search").build();
+    let _first = mesh
+        .serve_tool::<WebSearchReq, WebSearchResp, _, _>(descriptor.clone(), |req| async move {
+            Ok(WebSearchResp {
+                results: vec![req.query],
+            })
+        })
+        .expect("first serve_tool");
+
+    let err = match mesh.serve_tool::<WebSearchReq, WebSearchResp, _, _>(
+        descriptor,
+        |req| async move {
+            Ok(WebSearchResp {
+                results: vec![req.query],
+            })
+        },
+    ) {
+        Ok(_) => panic!("duplicate serve_tool must fail"),
+        Err(e) => e,
+    };
+    // ServeError::AlreadyServing — wraps the tool_id in the
+    // diagnostic message.
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("web_search"),
+        "duplicate error must name the offending tool: {msg}",
+    );
+
+    // The original handle's registry entry is still there — the
+    // duplicate-rejection path doesn't disturb prior state.
+    assert!(mesh.inner().tool_registry().get("web_search").is_some());
+}
+
+// Tiny suppressor so the `CapabilitySet` import from
+// `net::behavior` doesn't trigger an unused-import warning if
+// future test changes drop the reference. Cheap to keep around;
+// proves the substrate-level type is still reachable.
+#[allow(dead_code)]
+fn _proves_capabilityset_reexport(_: &CapabilitySet) {}

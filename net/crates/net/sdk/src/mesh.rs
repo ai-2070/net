@@ -307,6 +307,8 @@ impl MeshBuilder {
             node: Arc::new(node),
             channel_configs,
             identity: sdk_identity,
+            #[cfg(feature = "tool")]
+            tool_metadata_fetch: Arc::new(parking_lot::Mutex::new(None)),
         })
     }
 }
@@ -334,6 +336,22 @@ pub struct Mesh {
     /// `MeshNode` was already handed a clone of the keypair, so this
     /// is purely for the auxiliary state that rides alongside.
     identity: Option<crate::identity::Identity>,
+    /// Lazy auto-install state for the `tool.metadata.fetch` nRPC
+    /// service. The first `Mesh::serve_tool` call locks this
+    /// mutex, sees `None`, installs the handler, and stores
+    /// `Some(handle)`. Subsequent `serve_tool` calls see `Some(_)`
+    /// and skip the install. The handle lives for the lifetime of
+    /// the `Mesh`; the service stays registered even after every
+    /// individual tool ServeHandle is dropped (low cost — the
+    /// handler just answers `NotFound` for every name once the
+    /// registry is empty again).
+    ///
+    /// `pub(crate)` so the SDK's `tool` module — which lives in a
+    /// separate file but the same crate — can reach this slot
+    /// without an accessor stub.
+    #[cfg(feature = "tool")]
+    pub(crate) tool_metadata_fetch:
+        Arc<parking_lot::Mutex<Option<crate::mesh_rpc::ServeHandle>>>,
 }
 
 impl Mesh {
@@ -990,6 +1008,8 @@ impl Mesh {
             node,
             channel_configs,
             identity,
+            #[cfg(feature = "tool")]
+            tool_metadata_fetch: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 
