@@ -1,0 +1,20 @@
+net/crates/net/bindings/python/tests/test_tool.py
+  s_099fa7d871e34d::t_68eb6366b38626 20-22,28-29
+  s_099fa7d871e34d::t_16afde000601ce 239-412
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "e55cc306653ca3b9930f2a3e7ffaa21e68e7fc8f",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
