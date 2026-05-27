@@ -597,6 +597,155 @@ impl Mesh {
 }
 
 // ============================================================================
+// Format translators
+// ============================================================================
+//
+// Lower a `ToolDescriptor` into a provider-native tool definition
+// shape (OpenAI, Anthropic, MCP). Pure functions, no transitive deps
+// beyond serde_json. Rust agent code that hits a provider's HTTP API
+// uses these to populate the `tools` array in its request payload.
+//
+// The plan's M-1/M-2/M-3 ship the same functionality in Python and
+// TypeScript packages; the Rust version here is the canonical
+// reference implementation. Cross-language tests (T-1) pin the JSON
+// shape across all three.
+
+#[cfg(feature = "cortex")]
+pub mod formats {
+    //! Provider-native tool-definition translators.
+    //!
+    //! Each submodule exports a `to_<provider>_tool(&ToolDescriptor)
+    //! -> serde_json::Value` function that produces the shape the
+    //! provider's HTTP API expects for its `tools` field.
+    //!
+    //! All translators short-circuit on a missing `input_schema` by
+    //! emitting an empty-object schema (`{"type": "object",
+    //! "properties": {}}`). Providers reject a `null` parameter
+    //! schema in their strict-mode validators, but they all accept
+    //! the empty-properties object as "no arguments."
+    //!
+    //! The plan (M-1..M-3) defines parallel Python and TypeScript
+    //! packages with the same lowering; this Rust module is the
+    //! canonical reference. Cross-language tests (T-1) pin byte
+    //! equality.
+
+    use super::ToolDescriptor;
+    use serde_json::{json, Value};
+
+    /// Parse the descriptor's stored input schema (a JSON-encoded
+    /// string). Falls back to an empty-object schema if missing or
+    /// malformed — provider strict-mode validators require a
+    /// non-null `parameters` / `input_schema` field.
+    fn input_schema_value(desc: &ToolDescriptor) -> Value {
+        desc.input_schema
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}}))
+    }
+
+    /// Translators for the OpenAI Chat Completions / Responses API
+    /// `tools` array shape.
+    pub mod openai {
+        use super::*;
+
+        /// Lower a [`ToolDescriptor`] into an OpenAI tool definition.
+        ///
+        /// Wire shape:
+        /// ```json
+        /// {
+        ///   "type": "function",
+        ///   "function": {
+        ///     "name": "<tool_id>",
+        ///     "description": "<description>",
+        ///     "parameters": <input_schema>,
+        ///     "strict": <bool>
+        ///   }
+        /// }
+        /// ```
+        ///
+        /// `strict` is set to `true` when `descriptor.input_schema` was
+        /// publishable on the fold (i.e. not dropped due to size).
+        /// OpenAI's strict-mode tool calling requires the schema to be
+        /// present and conform to a subset of JSON Schema; we surface
+        /// it as a hint, not a guarantee — callers that explicitly
+        /// need non-strict can post-process the returned `Value`.
+        pub fn to_openai_tool(desc: &ToolDescriptor) -> Value {
+            let parameters = input_schema_value(desc);
+            let strict = desc.input_schema.is_some();
+            json!({
+                "type": "function",
+                "function": {
+                    "name": desc.tool_id,
+                    "description": desc.description.clone().unwrap_or_default(),
+                    "parameters": parameters,
+                    "strict": strict,
+                }
+            })
+        }
+    }
+
+    /// Translators for the Anthropic Messages API `tools` array shape.
+    pub mod anthropic {
+        use super::*;
+
+        /// Lower a [`ToolDescriptor`] into an Anthropic tool
+        /// definition.
+        ///
+        /// Wire shape:
+        /// ```json
+        /// {
+        ///   "name": "<tool_id>",
+        ///   "description": "<description>",
+        ///   "input_schema": <input_schema>
+        /// }
+        /// ```
+        ///
+        /// Anthropic does not have a strict-mode flag at the tool
+        /// level (it relies on schema-validated tool inputs as the
+        /// default). `description` defaults to an empty string when
+        /// the descriptor omits one — Anthropic accepts it but a
+        /// real description materially affects the model's
+        /// tool-selection behavior, so callers should always set one.
+        pub fn to_anthropic_tool(desc: &ToolDescriptor) -> Value {
+            json!({
+                "name": desc.tool_id,
+                "description": desc.description.clone().unwrap_or_default(),
+                "input_schema": input_schema_value(desc),
+            })
+        }
+    }
+
+    /// Translators for the Model Context Protocol (MCP) `tools/list`
+    /// response shape.
+    pub mod mcp {
+        use super::*;
+
+        /// Lower a [`ToolDescriptor`] into an MCP tool definition.
+        ///
+        /// Wire shape:
+        /// ```json
+        /// {
+        ///   "name": "<tool_id>",
+        ///   "description": "<description>",
+        ///   "inputSchema": <input_schema>
+        /// }
+        /// ```
+        ///
+        /// MCP's tool shape is the closest to our native
+        /// `ToolDescriptor` — same `name` field, same
+        /// JSON-Schema-shaped input descriptor, just camelCase
+        /// `inputSchema` (vs Anthropic's `input_schema`).
+        pub fn to_mcp_tool(desc: &ToolDescriptor) -> Value {
+            json!({
+                "name": desc.tool_id,
+                "description": desc.description.clone().unwrap_or_default(),
+                "inputSchema": input_schema_value(desc),
+            })
+        }
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -681,5 +830,80 @@ mod tests {
             .build();
         // `tags(...)` wholesale replaces — `first` is gone.
         assert_eq!(descriptor.tags, vec!["replaced", "second"]);
+    }
+
+    fn sample_descriptor() -> ToolDescriptor {
+        metadata_for::<WebSearchReq, WebSearchResp>("web_search")
+            .description("Search the web.")
+            .build()
+    }
+
+    #[test]
+    fn openai_tool_has_function_type_and_strict_when_schema_present() {
+        let desc = sample_descriptor();
+        let tool = formats::openai::to_openai_tool(&desc);
+        assert_eq!(tool["type"], "function");
+        let function = &tool["function"];
+        assert_eq!(function["name"], "web_search");
+        assert_eq!(function["description"], "Search the web.");
+        assert_eq!(function["strict"], true);
+        // Parameters carry the schema's `properties` block.
+        let params = &function["parameters"];
+        assert!(
+            params["properties"]["query"].is_object(),
+            "input_schema's `query` property must surface in parameters",
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_carries_input_schema_directly() {
+        let desc = sample_descriptor();
+        let tool = formats::anthropic::to_anthropic_tool(&desc);
+        assert_eq!(tool["name"], "web_search");
+        assert_eq!(tool["description"], "Search the web.");
+        // Anthropic uses `input_schema` (snake_case).
+        let schema = &tool["input_schema"];
+        assert!(schema["properties"]["query"].is_object());
+        assert!(tool.get("strict").is_none(), "Anthropic has no tool-level strict flag");
+    }
+
+    #[test]
+    fn mcp_tool_uses_input_schema_camelcase() {
+        let desc = sample_descriptor();
+        let tool = formats::mcp::to_mcp_tool(&desc);
+        assert_eq!(tool["name"], "web_search");
+        assert_eq!(tool["description"], "Search the web.");
+        // MCP uses `inputSchema` (camelCase) — pinned by the spec.
+        let schema = &tool["inputSchema"];
+        assert!(schema["properties"]["query"].is_object());
+    }
+
+    #[test]
+    fn formats_handle_missing_input_schema_with_empty_object() {
+        // Build a descriptor with a None input schema (manual
+        // construction since `metadata_for` always derives one).
+        let desc = ToolDescriptor {
+            tool_id: "no_schema_tool".into(),
+            name: "no_schema_tool".into(),
+            version: "1.0.0".into(),
+            description: Some("Bare tool.".into()),
+            input_schema: None,
+            output_schema: None,
+            requires: Vec::new(),
+            estimated_time_ms: 0,
+            stateless: true,
+            streaming: false,
+            tags: Vec::new(),
+            node_count: 0,
+        };
+        // Empty-object fallback prevents provider validators from
+        // rejecting a null schema.
+        let openai = formats::openai::to_openai_tool(&desc);
+        assert_eq!(openai["function"]["parameters"]["type"], "object");
+        assert_eq!(openai["function"]["strict"], false);
+        let anthropic = formats::anthropic::to_anthropic_tool(&desc);
+        assert_eq!(anthropic["input_schema"]["type"], "object");
+        let mcp = formats::mcp::to_mcp_tool(&desc);
+        assert_eq!(mcp["inputSchema"]["type"], "object");
     }
 }
