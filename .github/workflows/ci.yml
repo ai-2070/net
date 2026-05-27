@@ -642,7 +642,7 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-go-${{ hashFiles('**/Cargo.lock') }}
 
-      # The Go bindings link against FIVE cdylibs via cgo:
+      # The Go bindings link against SIX cdylibs via cgo:
       #   - `-lnet` (libnet.so, the main `net-mesh` crate) from net.go
       #   - `-lnet_compute` (libnet_compute.so, the `net-compute-ffi`
       #     workspace member at bindings/go/compute-ffi) from compute.go
@@ -652,7 +652,12 @@ jobs:
       #     workspace member at bindings/go/meshos-ffi) from meshos.go
       #   - `-lnet_deck` (libnet_deck.so, the `net-deck-ffi`
       #     workspace member at bindings/go/deck-ffi) from deck.go
-      # All five end up in `net/crates/net/target/release/`.
+      #   - `-lnet_rpc` (libnet_rpc.so, the `net-rpc-ffi`
+      #     workspace member at bindings/go/rpc-ffi) from
+      #     mesh_rpc.go / mesh_rpc_typed.go / tool.go. Added in the
+      #     NET_GO_NRPC_PORT slices (G-1..G-5) — without it the
+      #     typed/streaming/tool tests fail at link.
+      # All six end up in `net/crates/net/target/release/`.
       #
       # Features:
       #   - `net-mesh` needs `netdb,dataforts,redex-disk,nat-traversal,redis`
@@ -663,16 +668,16 @@ jobs:
       #   - `net-compute-ffi` needs `test-helpers` so the FFI symbol
       #     `net_compute_test_inject_synthetic_peer` (referenced by
       #     `groups_testhelpers.go`) is exported.
-      #   - `net-meshdb-ffi`, `net-meshos-ffi`, `net-deck-ffi` have no
-      #     extra features beyond their defaults.
+      #   - `net-meshdb-ffi`, `net-meshos-ffi`, `net-deck-ffi`,
+      #     `net-rpc-ffi` have no extra features beyond their defaults.
       #
       # Built as one cargo invocation so feature unification on the
       # shared `net-mesh` dep doesn't cause a second compilation pass.
-      - name: Build net + net_compute + net_meshdb + net_meshos + net_deck cdylibs
+      - name: Build net + net_compute + net_meshdb + net_meshos + net_deck + net_rpc cdylibs
         working-directory: net/crates/net
         run: >
           cargo build --release
-          -p net-mesh -p net-compute-ffi -p net-meshdb-ffi -p net-meshos-ffi -p net-deck-ffi
+          -p net-mesh -p net-compute-ffi -p net-meshdb-ffi -p net-meshos-ffi -p net-deck-ffi -p net-rpc-ffi
           --features "net-mesh/netdb,net-mesh/dataforts,net-mesh/redex-disk,net-mesh/nat-traversal,net-mesh/redis,net-compute-ffi/test-helpers"
 
       # `integration_test.go` gates its suite behind RUN_INTEGRATION_TESTS=1
