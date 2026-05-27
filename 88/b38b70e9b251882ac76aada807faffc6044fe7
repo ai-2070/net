@@ -1,0 +1,21 @@
+net/crates/net/tests/cross_lang_tool_formats/golden_vectors.json
+  s_099fa7d871e34d::t_1e1b8b378e6942 1-272
+net/crates/net/sdk/tests/tool_format_golden_vectors.rs
+  s_099fa7d871e34d::t_bed28dced70654 1-219
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "88b38b70e9b251882ac76aada807faffc6044fe7",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
