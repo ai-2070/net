@@ -2938,7 +2938,7 @@ mod tests {
     /// the same capability set both ways and comparing.
     #[test]
     fn add_tools_batch_matches_repeated_add_tool() {
-        let tools = vec![
+        let tools = [
             ToolCapability::new("web_search", "Web Search").with_version("1.0.0"),
             ToolCapability::new("summarize", "Summarize").with_version("1.0.0"),
             ToolCapability::new("code_eval", "Code Eval")
