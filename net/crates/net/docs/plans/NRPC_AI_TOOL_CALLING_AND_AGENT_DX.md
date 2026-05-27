@@ -26,7 +26,7 @@ Out of scope:
 
 3. **Streaming + cancellation are already substrate primitives.** Tools that emit progress ride server-streaming nRPC. The substrate's `cancel_token` (v3) propagates "model decided to stop" all the way to the tool. No new plumbing.
 
-4. **Cross-language tool calls are the killer feature.** A Python LangGraph agent calling a Go-hosted database tool calling a Node-hosted browser tool — all transparent over the existing wire. Every other tool-calling system (MCP servers, function-calling SDKs, Modal's `cls`) needs a separate transport. Net already has the transport; we just need the convention.
+4. **Cross-language tool calls are the killer feature.** A Python Hermes agent calling a Go-hosted database tool calling a TypeScript-hosted browser-automation tool — all transparent over the existing wire. Every other tool-calling system (MCP servers, function-calling SDKs, Modal's `cls`) needs a separate transport. Net already has the transport; we just need the convention.
 
 5. **The DX gap is huge today.** Without this layer, an agent author has to: define the typed model, register an nRPC service, hand-write the JSON schema, attach the capability tag, hand-roll the discovery loop, hand-build the provider's tools array. Six steps where one decorator should do.
 
@@ -46,7 +46,7 @@ Eight decisions every slice codes against:
    - `delta { data }` — partial output (model tokens, file bytes, log lines).
    - `result { data }` — terminal full result; client sees one of these on success.
    - `error { code, message, details? }` — terminal failure with structured detail.
-   Unary tools synthesize a single `result` envelope under the hood. The convention lets every adapter (OpenAI / Anthropic / Gemini / MCP / LangChain / custom) lower envelopes into the framework's native streaming protocol without negotiation. No envelope, no adapter interop.
+   Unary tools synthesize a single `result` envelope under the hood. The convention lets every adapter (OpenAI / Anthropic / Gemini / MCP / Hermes / custom) lower envelopes into the framework's native streaming protocol without negotiation. No envelope, no adapter interop.
 
 5. **`@tool` decorator opt-in, not implicit.** Plain `rpc.serve("x", handler)` continues to register a service WITHOUT the `ai-tool:*` tag — invisible to `list_tools()`. The decorator (or its equivalent in each binding) is what makes a service a tool. Operators retain control over which nRPC services agents see.
 
@@ -54,7 +54,7 @@ Eight decisions every slice codes against:
 
 7. **Schema derivation is per-binding-idiomatic.** Python uses `pydantic.BaseModel.model_json_schema()`. TypeScript uses `zod` + `zod-to-json-schema`. Rust uses `schemars`. Go uses struct-tag-based hand-written schemas in v1 (no good `derive`-style crate that targets JSON Schema 2020-12 well); a `go-jsonschema-derive` follow-up is possible.
 
-8. **Format translators ship in one core tools package per language; LLM-provider SDKs live entirely in user code.** `@net-mesh/tools` (npm) and `net-mesh-tools` (pip) carry `formats/openai`, `formats/anthropic`, `formats/gemini`, `formats/mcp` submodules. Each translator is a small pure function from `ToolDescriptor` → provider tool-array entry. The reverse direction (`tool_use_block` → typed nRPC call) lives next to it. Users wire the result into their OpenAI / Anthropic / LangChain client; no transitive dep on any provider SDK.
+8. **Format translators ship in one core tools package per language; LLM-provider SDKs live entirely in user code.** `net-mesh-tools` (pip) carries `formats/{openai,anthropic,gemini,mcp,hermes}` submodules (Hermes is Python-side). `@net-mesh/tools` (npm) carries `formats/{openai,anthropic,gemini,mcp}` submodules. Each translator is a small pure function from `ToolDescriptor` → provider/framework tool-array entry. The reverse direction (`tool_use_block` → typed nRPC call) lives next to it. Users wire the result into their OpenAI / Anthropic / Hermes / framework-of-choice client; no transitive dep on any provider SDK.
 
 Tagged `[S | A | B | C | D | M | T | X]`:
 
@@ -96,16 +96,17 @@ Tagged `[S | A | B | C | D | M | T | X]`:
 | D-2   | M   | Go                | `mesh.ListTools(ctx, matcher)` + `mesh.WatchTools(ctx, matcher) <-chan ToolListChange`           | ⏳     |
 | M-1   | H   | format pkg (Py)   | `net_mesh.tools.formats.openai` — `to_openai_tool(desc)` + `lower_tool_call(call) -> CallSpec`  | ⏳     |
 | M-2   | H   | format pkg (Py)   | `net_mesh.tools.formats.anthropic` — same shape; streaming via `tool_use_block_delta`           | ⏳     |
-| M-3   | M   | format pkg (Py)   | `net_mesh.tools.formats.{gemini,mcp}` — same pattern                                            | ⏳     |
-| M-4   | H   | format pkg (TS)   | `@net-mesh/tools/formats/{openai,anthropic,gemini,mcp}` — mirror per submodule                  | ⏳     |
+| M-3   | H   | format pkg (Py)   | `net_mesh.tools.formats.hermes` — `create_net_tool_provider(mesh, matcher?)` + `list_tools` / `watch_tools` wiring into Hermes's tool-provider contract | ⏳     |
+| M-4   | M   | format pkg (Py)   | `net_mesh.tools.formats.{gemini,mcp}` — same pattern as M-1 / M-2                               | ⏳     |
+| M-5   | H   | format pkg (TS)   | `@net-mesh/tools/formats/{openai,anthropic,gemini,mcp}` — TS mirror per submodule               | ⏳     |
 | T-1   | H   | cross-lang tests  | Python agent (M-1) calls Go-hosted tool (D-1) — schema fidelity + golden vector + result match  | ⏳     |
 | T-2   | H   | streaming test    | `ToolEvent` envelope round-trip: server emits `start/progress/delta/result`; client decodes     | ⏳     |
 | T-3   | M   | discovery test    | TagMatcher filter: `list_tools(matcher=Prefix("region.eu"))` excludes US-region hosts            | ⏳     |
 | T-4   | M   | watch test        | Dynamic-discovery: `watch_tools` emits `Added` / `Removed` when a host registers + drops a tool | ⏳     |
 | T-5   | L   | cancellation test | `client.cancel()` mid-tool propagates substrate CANCEL; tool observes `Cancelled` status        | ⏳     |
 | X-1   | H   | docs              | `docs/AGENT_TOOLS.md` — quickstart + decorator + discovery + format translators + envelope spec | ⏳     |
-| X-2   | H   | demo              | `examples/agents/python-langchain-tools.py` — LangChain agent with one local + one Go-hosted tool | ⏳     |
-| X-3   | M   | demo              | `examples/agents/node-openai-tools.ts` — minimal OpenAI function-calling loop via `@net-mesh/tools` | ⏳     |
+| X-2   | H   | demo              | `examples/agents/python-hermes-tools.py` — Hermes agent via `create_net_tool_provider`; one local Python + one Go-hosted tool | ⏳     |
+| X-3   | M   | demo              | `examples/agents/node-claude-tools.ts` — TypeScript Anthropic Messages loop dispatching into Python-hosted tools | ⏳     |
 
 No wire ABI bump for unary tool calls. Streaming tools use `S-1`'s new `call_service_streaming` substrate primitive; the wire shape of an individual stream is unchanged from `call_streaming` today. `ToolEvent` envelopes are JSON-encoded chunks on existing streams.
 
@@ -555,13 +556,39 @@ Mid-tool `client.cancel()` propagates substrate CANCEL; the tool's stream sees `
 
 Sections: quickstart (`@tool` decorator usage), discovery (`list_tools` + `watch_tools` + TagMatcher cookbook), streaming envelopes (`ToolEvent` spec + adapter lowering examples), format packages (one section per provider), capability scoping (subnet visibility + auth), `serve_tool` atomicity contract.
 
-### X-2 — `examples/agents/python-langchain-tools.py`
+### X-2 — `examples/agents/python-hermes-tools.py`
 
-End-to-end LangChain agent. One Python `@tool` (local), one Go-hosted tool (remote). LangChain's `DynamicStructuredTool` shape gets emitted by `net_mesh.tools.formats.langchain` (companion submodule). Reviewers `python example.py` and watch a multi-step agent loop dispatch tool calls across the language boundary.
+End-to-end Hermes agent via a `create_net_tool_provider(mesh, matcher=...)` helper exported from `net_mesh.tools.formats.hermes` (Python). The provider:
 
-### X-3 — `examples/agents/node-openai-tools.ts`
+1. Connects to the local Net node, calls `await mesh.list_tools(matcher=...)`, lowers each `ToolDescriptor` into the shape Hermes's tool-provider contract expects.
+2. Subscribes via `mesh.watch_tools(matcher=...)` and re-emits Hermes's "tools changed" notification whenever the set churns — supports the dynamic-discovery half of the agent loop.
+3. On a Hermes `call_tool` callback, dispatches via `rpc.call_tool` / `rpc.call_tool_streaming`; streaming `Delta` envelopes lower into Hermes's streaming-chunk format and `Result` / `Error` surface as Hermes's terminal callbacks.
 
-Minimal OpenAI function-calling loop. Discovers tools, lowers via `formats/openai`, hands to `openai.chat.completions.create`, dispatches each tool_call via `callTool`, feeds the result back into the next message turn. Demonstrates the "mesh tools = OpenAI tools" identity claim.
+```python
+from hermes import Hermes
+from net_mesh.tools.formats.hermes import create_net_tool_provider
+
+hermes = Hermes(
+    tool_providers=[
+        create_net_tool_provider(
+            mesh=mesh,
+            # Optional capability filter — only EU-region tools, only
+            # specific providers, etc. Uses the existing TagMatcher surface.
+            matcher=TagMatcher.prefix("region.eu"),
+        ),
+    ],
+)
+
+# Hermes now sees every tool advertised on Net. Tool calls flow
+# through Net's substrate to whichever node provides the tool.
+await hermes.run(prompt="...")
+```
+
+Reviewers `python example.py` and watch Hermes drive a multi-step agent loop dispatching tool calls across the language boundary — one tool is local Python (`@tool`), the other is Go-hosted. Demonstrates the "mesh tools = Hermes tools" identity claim end-to-end.
+
+### X-3 — `examples/agents/node-claude-tools.ts`
+
+TypeScript-side cross-language coverage. Discovers tools via `await mesh.listTools(...)`, lowers via `@net-mesh/tools/formats/anthropic`, drives the Anthropic Messages API with tool use, dispatches each `tool_use` block via `rpc.callTool` / `rpc.callToolStreaming`, and accumulates streaming `Delta` envelopes into `tool_use_block_delta`s for Anthropic's streaming protocol. Two tools: one local TypeScript, one Python-hosted (mirroring X-2's split in the opposite direction). Demonstrates the "mesh tools = Claude tools" identity claim from the Node side, plus the streaming envelope contract end-to-end against a real provider.
 
 ---
 
@@ -589,7 +616,7 @@ Minimal OpenAI function-calling loop. Discovers tools, lowers via `formats/opena
 - `pip install net-mesh-tools` exposes `net_mesh.tools.formats.{openai,anthropic,gemini,mcp}`; `npm install @net-mesh/tools` exposes the same four submodules.
 - T-1 cross-lang round-trip passes; T-2 envelope contract passes byte-for-byte across all three bindings.
 - T-4 watch-tools test passes — `Added` / `Removed` / `NodeCountChanged` fire within one fold-broadcast cycle.
-- X-2 demo (`python-langchain-tools.py`) runs end-to-end against a local two-node mesh, makes a real LangChain agent call, and successfully dispatches a tool call into a Go-hosted service.
+- X-2 demo (`python-hermes-tools.py`) runs end-to-end against a local two-node mesh, drives a Hermes agent through `create_net_tool_provider`, and successfully dispatches a tool call into a Go-hosted service.
 - Wire format adds zero bytes to any non-tool-using nRPC call; the `tool.metadata.fetch` service is registered only on nodes that called `serve_tool` at least once.
 
 ---
@@ -601,6 +628,6 @@ Minimal OpenAI function-calling loop. Discovers tools, lowers via `formats/opena
 3. **Schema codegen for Go.** `go-tool-derive` reads struct tags and emits JSON Schema 2020-12. Lifts the hand-written-schema constraint from D-1.
 4. **Per-tool rate-limits + auth scopes.** Agents in `subnet:dev` may call tools at 100 QPS; agents in `subnet:prod` at 10 QPS. Rides existing channel rate-limit + capability auth + per-tool config.
 5. **Streaming tool output for OpenAI.** When OpenAI ships a native streaming tool-result protocol, update `formats/openai` accordingly. Today: unary via accumulated `delta`s.
-6. **Tool composition macros.** Decorators that wrap LangChain/LangGraph nodes directly so a graph node IS a mesh tool. Likely a separate companion package.
+6. **Tool composition macros.** Decorators that wrap framework graph nodes (Hermes flows, LangGraph nodes, etc.) directly so a graph node IS a mesh tool. Likely separate companion packages per framework.
 7. **Auto-doc generation.** A `net tool docs --markdown` CLI emits a per-mesh tool catalog page from the capability fold. Operator polish.
 8. **`#[tool]` proc macro in Rust.** A-7 stays a follow-up — runtime APIs are usable as-is.
