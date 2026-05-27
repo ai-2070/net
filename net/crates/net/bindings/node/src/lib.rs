@@ -53,6 +53,8 @@ mod placement;
 mod redis_dedup;
 #[cfg(feature = "net")]
 mod subnets;
+#[cfg(feature = "tool")]
+mod tool;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -1889,6 +1891,34 @@ mod mesh_bindings {
                 node.find_nodes_by_filter_scoped(&core, f)
             });
             Ok(ids.into_iter().map(BigInt::from).collect())
+        }
+
+        /// Walk the local capability fold for every AI tool
+        /// published in the mesh and return one
+        /// [`ToolDescriptorJs`] per `(toolId, version)` slot, with
+        /// `nodeCount` filled in by the aggregating walk.
+        ///
+        /// One in-memory pass; no network. Schemas live as
+        /// JSON-encoded strings on `descriptor.inputSchema` /
+        /// `descriptor.outputSchema` — call `JSON.parse(...)` if
+        /// you need the parsed shape for a provider's
+        /// tool-definition lowering.
+        ///
+        /// Mirror of the Rust SDK's `Mesh::list_tools(None)`. v1
+        /// always walks unfiltered; matcher-pushdown lands in a
+        /// follow-up that adds `TagMatcherJs` to the napi surface.
+        ///
+        /// Gated on the `tool` Cargo feature (default-on).
+        #[cfg(feature = "tool")]
+        #[napi]
+        pub fn list_tools(&self) -> Result<Vec<crate::tool::ToolDescriptorJs>> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            Ok(node
+                .list_tools(None)
+                .into_iter()
+                .map(crate::tool::descriptor_to_js)
+                .collect())
         }
 
         /// Bucketed aggregation over the local capability fold —

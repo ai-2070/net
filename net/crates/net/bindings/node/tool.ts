@@ -23,6 +23,17 @@
 import type { CallOptions, ServeHandle, TypedMeshRpc } from './mesh_rpc'
 import type { CapabilitySetJs, ToolJs } from './index'
 
+/**
+ * Structural shape of the napi `NetMesh.listTools()` return value
+ * — field-for-field the same as [`ToolDescriptor`]. Declared here
+ * (instead of imported from `./index`) so this file compiles
+ * cleanly before `napi build` regenerates `index.d.ts` with the
+ * new `ToolDescriptorJs` export.
+ */
+interface MeshWithListTools {
+  listTools(): ToolDescriptor[]
+}
+
 // ============================================================================
 // Wire types — mirror of the Rust `ToolDescriptor` + `ToolEvent`.
 // ============================================================================
@@ -295,6 +306,24 @@ export function addToolCapabilitiesToAnnounce(
   caps.tags = Array.from(tags)
   caps.tools = tools
   return caps
+}
+
+/**
+ * Walk the local capability fold for every published AI tool.
+ * Returns one [`ToolDescriptor`] per `(toolId, version)` slot,
+ * with `nodeCount` filled in by the aggregating walk.
+ *
+ * Pure delegation to the napi binding's `NetMesh.listTools()` (B-3
+ * of the plan). Requires the napi binding's `tool` Cargo feature
+ * (default-on); throws if the underlying mesh wasn't built with it.
+ *
+ * Schemas come back as JSON-encoded strings on
+ * `descriptor.inputSchema` / `descriptor.outputSchema` — call
+ * `JSON.parse(...)` for the parsed shape that adapter packages
+ * consume when lowering into provider-specific tool definitions.
+ */
+export function listTools(mesh: MeshWithListTools): ToolDescriptor[] {
+  return mesh.listTools()
 }
 
 // ============================================================================

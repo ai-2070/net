@@ -86,7 +86,7 @@ Tagged `[S | A | B | C | D | M | T | X]`:
 | A-7   | M   | Rust SDK          | `#[tool]` proc macro (follow-up — runtime APIs land first)                                      | ✅     |
 | B-1   | H   | Node TS           | `tool({ name, description, schema, handle })` + Zod schema lowering                              | 🟡     |
 | B-2   | H   | Node TS           | `tool({ ..., stream: async function* handle() { yield … } })` — streaming via async-iter        | ⏳     |
-| B-3   | H   | Node TS           | `MeshNode.listTools({ matcher? })` + `MeshNode.watchTools({ matcher? })`                        | ⏳     |
+| B-3   | H   | Node TS           | `MeshNode.listTools({ matcher? })` + `MeshNode.watchTools({ matcher? })`                        | 🟡     |
 | B-4   | H   | Node TS           | `TypedMeshRpc.callTool` + `.callToolStreaming` (capability-routed; client of `S-1`)             | 🟡     |
 | C-1   | H   | Python            | `from net.tools import tool` decorator (Pydantic-typed + plain-typing fallback)                  | 🟡     |
 | C-2   | H   | Python            | `@tool.stream` / `async def gen(...) -> AsyncGenerator[ToolEvent, None]` streaming variant       | ⏳     |

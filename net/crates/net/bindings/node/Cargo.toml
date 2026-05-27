@@ -41,6 +41,7 @@ default = [
     "meshdb",
     "redis",
     "aggregator",
+    "tool",
 ]
 # Pulls in `net-sdk` at its `redis` sub-feature for the
 # `RedisStreamDedup` consumer helper. The dedup helper is a thin
@@ -74,6 +75,13 @@ nat-traversal = ["net", "net/nat-traversal"]
 # Builds on `nat-traversal`.
 port-mapping = ["nat-traversal", "net/port-mapping"]
 cortex = ["net/netdb", "net/redex-disk", "dep:async-trait"]
+# AI tool calling — exposes MeshNode::list_tools() through the
+# napi class as `NetMesh.listTools()`. Includes the substrate's
+# `tool::*` types (ToolDescriptor, ToolEvent, ToolMetadataRegistry,
+# tool.metadata.fetch RPC). On by default; binary cost is small
+# (the feature is just the substrate-side types + the lazy
+# auto-installed nRPC handler in the SDK). See AGENT_TOOLS.md.
+tool = ["net/tool", "cortex"]
 # Dataforts (Rebel Yell) surface — compiles the operator methods
 # wiring greedy-LRU + data-gravity + future phases. Same shape as
 # the Python binding — depends on cortex transitively for the
