@@ -1401,6 +1401,30 @@ impl CapabilitySet {
         })
     }
 
+    /// First `AxisValue` tag matching `(axis, key)`, returning its
+    /// value if present. Linear in `tags` count with early return.
+    ///
+    /// Phase A.5.N.3 fast-path helper for single-field predicates
+    /// (`CapabilityFilter::matches` memory / VRAM checks). Avoids
+    /// forcing the full `HardwareCapabilities` decode via
+    /// `views().hardware()` when only one tag is needed. See
+    /// `docs/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` fix #2.
+    pub(crate) fn axis_value(
+        &self,
+        axis: crate::adapter::net::behavior::tag::TaxonomyAxis,
+        key: &str,
+    ) -> Option<&str> {
+        self.tags.iter().find_map(|tag| match tag {
+            Tag::AxisValue {
+                axis: a,
+                key: k,
+                value,
+                ..
+            } if *a == axis && k == key => Some(value.as_str()),
+            _ => None,
+        })
+    }
+
     /// Get all model IDs.
     ///
     /// Phase A.5.N.3: returns owned `String`s (rather than borrowed
@@ -1702,7 +1726,7 @@ impl<'a> CapabilityViews<'a> {
     /// repeated reads produce identical projections.
     fn sorted_tags(&self) -> &Vec<Tag> {
         self.sorted_tags
-            .get_or_init(|| sorted_tag_vec(&self.caps.tags))
+            .get_or_init(|| decoder_sorted_tag_vec(&self.caps.tags))
     }
 
     /// Hardware projection. Decodes the `hardware.*` axis tags
@@ -1787,6 +1811,17 @@ fn sorted_tag_vec(tags: &HashSet<Tag>) -> Vec<Tag> {
     v
 }
 
+/// Decoder-path sort: stabilizes tag order for the per-axis
+/// projection decoders. Uses `Tag`'s derived `Ord` (no per-element
+/// `String` allocation) — any total order works here as long as it
+/// is deterministic. Wire serialization keeps `sorted_tag_vec`'s
+/// `Tag::to_string()` order so signed-announcement bytes stay stable.
+fn decoder_sorted_tag_vec(tags: &HashSet<Tag>) -> Vec<Tag> {
+    let mut v: Vec<Tag> = tags.iter().cloned().collect();
+    v.sort_unstable();
+    v
+}
+
 /// Serialize a `HashSet<Tag>` as a sorted JSON array — `Tag::to_string()`
 /// order. The wire format is canonical so two ends of a signed
 /// `CapabilityAnnouncement` round-trip produce identical bytes
@@ -1806,19 +1841,23 @@ fn serialize_tags_sorted<S: serde::Serializer>(
 
 impl From<&CapabilitySet> for HardwareCapabilities {
     fn from(caps: &CapabilitySet) -> Self {
-        crate::adapter::net::behavior::tag_codec::hardware_from_tags(&sorted_tag_vec(&caps.tags))
+        crate::adapter::net::behavior::tag_codec::hardware_from_tags(&decoder_sorted_tag_vec(
+            &caps.tags,
+        ))
     }
 }
 
 impl From<&CapabilitySet> for SoftwareCapabilities {
     fn from(caps: &CapabilitySet) -> Self {
-        crate::adapter::net::behavior::tag_codec::software_from_tags(&sorted_tag_vec(&caps.tags))
+        crate::adapter::net::behavior::tag_codec::software_from_tags(&decoder_sorted_tag_vec(
+            &caps.tags,
+        ))
     }
 }
 
 impl From<&CapabilitySet> for ResourceLimits {
     fn from(caps: &CapabilitySet) -> Self {
-        crate::adapter::net::behavior::tag_codec::resource_limits_from_tags(&sorted_tag_vec(
+        crate::adapter::net::behavior::tag_codec::resource_limits_from_tags(&decoder_sorted_tag_vec(
             &caps.tags,
         ))
     }
@@ -2367,6 +2406,9 @@ impl CapabilityFilter {
     /// `views()` body becomes a tag-set scan and this matcher
     /// keeps working without further changes.
     pub fn matches(&self, caps: &CapabilitySet) -> bool {
+        use crate::adapter::net::behavior::tag::{AxisSeparator, TaxonomyAxis};
+        use crate::adapter::net::behavior::tag_codec::gpu_vendor_str;
+
         // Check tags (all required tags must be present)
         for tag in &self.require_tags {
             if !caps.has_tag(tag) {
@@ -2390,55 +2432,73 @@ impl CapabilityFilter {
             }
         }
 
-        // Phase 1 (lazy): each `views.X()` decodes only the
-        // projection it needs. `views.hardware()` does NOT force
-        // the model decoder; `views.models()` does NOT force
-        // hardware. Predicates that early-return on a hardware
-        // check pay zero cost for unused axes.
-        let views = caps.views();
-
-        // Check memory
+        // Tag-direct fast paths for single-field hardware predicates —
+        // avoid forcing the full `HardwareCapabilities` decode (sort +
+        // per-tag axis_key parse) when only one tag's value is needed.
+        // See `docs/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` fix #2.
         if let Some(min_mem) = self.min_memory_gb {
-            if views.hardware().memory_gb < min_mem {
+            let mem = caps
+                .axis_value(TaxonomyAxis::Hardware, "memory_gb")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            if mem < min_mem {
                 return false;
             }
         }
 
-        // Check GPU
         if self.require_gpu && !caps.has_gpu() {
             return false;
         }
 
-        // Check GPU vendor
         if let Some(vendor) = self.gpu_vendor {
-            if views.hardware().gpu_vendor() != Some(vendor) {
+            // O(1) HashSet probe for `hardware.gpu.vendor=<vendor>`.
+            let expected = Tag::AxisValue {
+                axis: TaxonomyAxis::Hardware,
+                key: "gpu.vendor".to_string(),
+                value: gpu_vendor_str(vendor).to_string(),
+                separator: AxisSeparator::Eq,
+            };
+            if !caps.tags.contains(&expected) {
                 return false;
             }
         }
 
-        // Check VRAM
         if let Some(min_vram) = self.min_vram_gb {
-            if views.hardware().total_vram_gb() < min_vram {
-                return false;
+            // Single-GPU fast path: `hardware.gpu.vram_gb=<n>`. Falls
+            // through to the full `HardwareCapabilities::total_vram_gb`
+            // sum for multi-GPU configs (where additional `gpu.<i>.*`
+            // tags exist beyond the primary).
+            let vram = caps
+                .axis_value(TaxonomyAxis::Hardware, "gpu.vram_gb")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            if vram < min_vram {
+                let total = caps.views().hardware().total_vram_gb();
+                if total < min_vram {
+                    return false;
+                }
             }
         }
 
-        // Check context length
-        if let Some(min_ctx) = self.min_context_length {
-            let has_sufficient = views.models().iter().any(|m| m.context_length >= min_ctx);
-            if !has_sufficient {
-                return false;
-            }
-        }
+        // Remaining predicates need the model projection — decode lazily.
+        if self.min_context_length.is_some() || !self.require_modalities.is_empty() {
+            let views = caps.views();
 
-        // Check modalities
-        for modality in &self.require_modalities {
-            let has_modality = views
-                .models()
-                .iter()
-                .any(|m| m.modalities.contains(modality));
-            if !has_modality {
-                return false;
+            if let Some(min_ctx) = self.min_context_length {
+                let has_sufficient = views.models().iter().any(|m| m.context_length >= min_ctx);
+                if !has_sufficient {
+                    return false;
+                }
+            }
+
+            for modality in &self.require_modalities {
+                let has_modality = views
+                    .models()
+                    .iter()
+                    .any(|m| m.modalities.contains(modality));
+                if !has_modality {
+                    return false;
+                }
             }
         }
 

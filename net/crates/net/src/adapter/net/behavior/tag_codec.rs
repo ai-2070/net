@@ -165,7 +165,7 @@ fn axis_value(key: &str, value: &str) -> Tag {
 
 /// Lowercase string form of a `GpuVendor` for tag emission. Inverse
 /// of [`gpu_vendor_from_str`].
-fn gpu_vendor_str(v: GpuVendor) -> &'static str {
+pub(crate) fn gpu_vendor_str(v: GpuVendor) -> &'static str {
     match v {
         GpuVendor::Unknown => "unknown",
         GpuVendor::Nvidia => "nvidia",

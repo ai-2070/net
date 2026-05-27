@@ -111,3 +111,38 @@ The "for now" arrived. The canonical tag set has roughly an order of magnitude m
 - Code: `net/crates/net/src/adapter/net/behavior/capability.rs`
 - Tag codec: `net/crates/net/src/adapter/net/behavior/tag_codec.rs`
 - Parser used for comparison: `net/crates/net/benchmarks/parse_criterion.py`
+
+## Results — fix #1 + #2 applied (2026-05-28)
+
+Baseline taken on Windows host (different hardware than the M1 Max snapshot above — compare same-run before/after, not absolute ns vs M1 Max). Criterion baseline name: `pre-fix`. Both fixes landed together; columns are pre-fix vs post-fix on the same hardware.
+
+| Benchmark | Pre-fix | Post-fix | Δ |
+|---|---|---|---|
+| `capability_filter/match_gpu_vendor` | 67.96 µs | **115.12 ns** | **−99.83%** (~590× faster) |
+| `capability_filter/match_min_memory` | 58.94 µs | **25.75 ns** | **−99.96%** (~2289× faster) |
+| `capability_filter/match_complex` | 59.85 µs | **4.41 µs** | **−92.65%** (~13.6× faster) |
+| `capability_filter/match_require_gpu` | 74.90 ns | **38.91 ns** | **−47.98%** |
+| `capability_filter/match_no_match` | 57.11 ns | **54.11 ns** | −5.4% |
+| `capability_filter/match_single_tag` | 41.10 ns | 49.89 ns | **+21.2%** (small regression — see below) |
+
+**`match_single_tag` regression (~9 ns absolute):** the rewritten `matches()` body has more `if let Some(...)` arms even for filters that only set `require_tags`, plus the `use` block at the top. The branches all predict cleanly but the added instruction count costs a few ns. Acceptable trade for the µs-scale wins on the targeted predicates; can be reclaimed later by hoisting the simple-tag fast path or splitting `matches()` into a fast / slow path on filter shape.
+
+**Tests:** all 195 lib tests with "capability" in the name pass (`cargo test --features net --lib capability`). Wire format is unchanged (the wire serializer keeps `sorted_tag_vec` with `Tag::to_string()` order; only the decoder paths switched to derived `Ord`).
+
+### What each fix did
+
+- **Fix #1** (`capability.rs:1784`): added `decoder_sorted_tag_vec` using `Tag`'s derived `Ord` via `sort_unstable()`. Kept original `sorted_tag_vec` (the `Tag::to_string()` variant) in place for `serialize_tags_sorted` so signed-announcement bytes stay byte-stable across versions. Switched `CapabilityViews::sorted_tags()` and the three `From<&CapabilitySet>` impls (`HardwareCapabilities` / `SoftwareCapabilities` / `ResourceLimits`) to the new helper. Accounts for the bulk of the `match_complex` win since that bench still decodes the models projection.
+- **Fix #2** (`capability.rs:2369`): added `CapabilitySet::axis_value(axis, key) -> Option<&str>` (pub(crate), `capability.rs:1404`). Rewrote `matches()` so single-field hardware predicates probe the tag set directly:
+  - `min_memory_gb` → `axis_value(Hardware, "memory_gb")`
+  - `gpu_vendor` → O(1) `HashSet::contains(&Tag::AxisValue { ... })` constructed from `gpu_vendor_str(vendor)` (made `pub(crate)` in `tag_codec.rs:168`)
+  - `min_vram_gb` → `axis_value(Hardware, "gpu.vram_gb")` with fall-through to `views().hardware().total_vram_gb()` for multi-GPU configs
+  - `min_context_length` / `require_modalities` still go through `views()` — they decode the models projection. The block is now lazily guarded so filters that don't set those fields never call `views()`.
+
+### What's NOT addressed yet
+
+| Family | Status |
+|---|---|
+| `capability_set/has_model` (~760 ns), `has_tool` (~740 ns) | Unchanged — still need fix #5 (lazy lookup index) |
+| `capability_set/serialize` (~52 µs), `to_bytes`/`from_bytes` | Unchanged — needs fix #3 (bincode/postcard) |
+| `capability_announcement/*` | Not re-benched (same JSON path; will move with fix #3) |
+| Repeated `matches()` on same `CapabilitySet` in a loop | Each call still allocates a new `CapabilityViews` if it falls through to the modality/ctx path. Fix #4 (cache projections on the set) addresses this. |
