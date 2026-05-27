@@ -304,6 +304,77 @@ export function serveTool<Req = unknown, Resp = unknown>(
 }
 
 /**
+ * Streaming-handler shape for `serveToolStreaming`. The handler
+ * is an async generator that yields `ToolEvent` envelopes — each
+ * yielded event is JSON-encoded and pushed onto the wire via the
+ * substrate's response sink. The generator returning normally is
+ * the "handler done" signal; if the generator never yields a
+ * terminal `result` / `error` envelope, callers see the
+ * synthesized `missing_terminal` error (the T-2 contract).
+ *
+ * Throwing inside the generator maps to a terminal error frame on
+ * the wire; the caller's `callToolStreaming` sees it as a normal
+ * `ToolEvent` with `type: "error"`.
+ */
+export type StreamingToolHandler<Req = unknown> = (
+  req: Req,
+) => AsyncIterable<ToolEvent>
+
+/**
+ * Register a streaming tool handler. The handler is an async
+ * generator that yields ToolEvents — each yielded event is
+ * forwarded to the caller via `callToolStreaming` (or any other
+ * client that drains a `tool.metadata.fetch`-discoverable
+ * streaming service).
+ *
+ * Atomic register + lazy auto-install of `tool.metadata.fetch` —
+ * same pattern as `serveTool` for unary handlers. Stamps
+ * `streaming: true` on the descriptor so peers can discover the
+ * streaming variant explicitly.
+ */
+export function serveToolStreaming<Req = unknown>(
+  rpc: TypedMeshRpc,
+  options: ToolOptions,
+  handler: StreamingToolHandler<Req>,
+): ToolServeHandle {
+  const baseDescriptor = descriptorFrom(options)
+  const descriptor: ToolDescriptor = { ...baseDescriptor, streaming: true }
+  const entry = _ensureFetchInstalled(rpc)
+  entry.registry.set(descriptor.toolId, descriptor)
+  const inner: ServeHandle = rpc.serveStreaming<Req, ToolEvent>(
+    descriptor.toolId,
+    async (req, sink) => {
+      try {
+        for await (const event of handler(req)) {
+          sink.send(event)
+        }
+      } catch (err) {
+        // Convert handler exceptions into a terminal error envelope
+        // so the caller's `callToolStreaming` sees a typed error
+        // rather than the synthesized `missing_terminal`.
+        const message = err instanceof Error ? err.message : String(err)
+        const errEvent: ToolEventError = {
+          type: 'error',
+          code: 'handler_error',
+          message,
+        }
+        sink.send(errEvent)
+      }
+    },
+  )
+  let closed = false
+  return {
+    descriptor,
+    close() {
+      if (closed) return
+      closed = true
+      entry.registry.delete(descriptor.toolId)
+      inner.close()
+    },
+  }
+}
+
+/**
  * Capability-routed unary tool invocation. Encodes `req` as JSON
  * (the codec every AI provider consumes for tool input/output),
  * dispatches via `rpc.callService(toolId, req, opts)`.

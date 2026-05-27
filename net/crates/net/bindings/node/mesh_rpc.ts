@@ -193,6 +193,22 @@ export interface RawMeshRpc {
     service: string,
     handler: (args: [RawRequestStream, RawResponseSink]) => Promise<Buffer>,
   ): ServeHandle
+  /**
+   * Register a server-streaming handler. The napi side passes a
+   * 2-tuple `[req, sink]` to the handler — the request Buffer plus
+   * a sink to push chunks into. The Promise resolving signals
+   * "handler done"; substrate emits the terminal frame at that
+   * point. Throw `appError(code, body)` to surface a typed
+   * Application status.
+   *
+   * Optional in the interface for backwards-compat with hand-rolled
+   * `RawMeshRpc` test stubs that predate the streaming-serve
+   * addition; required on real napi-backed bindings.
+   */
+  serveStreaming?(
+    service: string,
+    handler: (args: [Buffer, RawResponseSink]) => Promise<Buffer>,
+  ): ServeHandle
   findServiceNodes(service: string): bigint[]
   /** Mint a fresh cancel token (`bigint`). */
   reserveCancelToken(): bigint
@@ -776,6 +792,39 @@ export class TypedMeshRpc {
    * terminal frame automatically. To surface a typed Application
    * status, throw `appError(code, body)` from the handler.
    */
+  /**
+   * Register a typed server-streaming handler. The user signature
+   * is `(req: Req, sink: TypedResponseSink<Resp>) => Promise<void>`
+   * — the wrapper decodes the request, calls the handler, and
+   * resolves to a sentinel Buffer the substrate discards. To
+   * surface a typed Application status, throw `appError(code,
+   * body)` from the handler.
+   *
+   * Used by `serveToolStreaming` in tool.ts to expose ToolEvent-
+   * emitting handlers.
+   */
+  serveStreaming<Req = unknown, Resp = unknown>(
+    service: string,
+    handler: (req: Req, sink: TypedResponseSink<Resp>) => Promise<void>,
+  ): ServeHandle {
+    if (this._raw.serveStreaming === undefined) {
+      throw new Error(
+        'TypedMeshRpc.serveStreaming: the underlying raw binding ' +
+          "does not expose `serveStreaming`. Rebuild the native " +
+          'addon against a version that supports streaming-serve.',
+      )
+    }
+    return this._raw.serveStreaming(
+      service,
+      async ([rawReq, rawSink]: [Buffer, RawResponseSink]): Promise<Buffer> => {
+        const req = jsonDecode(rawReq) as Req
+        const typedSink = new TypedResponseSink<Resp>(rawSink)
+        await handler(req, typedSink)
+        return DUPLEX_TERMINAL_SENTINEL
+      },
+    )
+  }
+
   serveDuplex<Req = unknown, Resp = unknown>(
     service: string,
     handler: (
