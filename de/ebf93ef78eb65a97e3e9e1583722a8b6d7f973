@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/behavior/capability.rs
+  s_c61e36cbdb3bc0::t_ddeac9df4e2a5c 2941
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "deebf93ef78eb65a97e3e9e1583722a8b6d7f973",
+  "prompts": {},
+  "sessions": {
+    "s_c61e36cbdb3bc0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5fc67c78-387a-45c1-bc03-be78dc0c2b85",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
