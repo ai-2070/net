@@ -211,7 +211,7 @@ Same body as `call_service` (target enumeration → health filter → routing-po
 
 ### S-4 — `[features] tool = []` + `ToolEvent` wire type
 
-**Rationale.** Tooling is opt-in: consumers who don't need it skip the binary cost. Same mechanism as the `regex` gate in v0.24.1. Also: lock the `ToolEvent` wire shape here so every streaming binding agrees byte-for-byte.
+**Rationale.** Tooling is opt-in: consumers who don't need it skip the binary cost. Same mechanism as the `regex` gate in v0.24.0. Also: lock the `ToolEvent` wire shape here so every streaming binding agrees byte-for-byte.
 
 **Design.**
 

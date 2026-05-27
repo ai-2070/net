@@ -1,6 +1,6 @@
 {
   "name": "@net-mesh/sdk",
-  "version": "0.24.1",
+  "version": "0.25.0",
   "description": "Ergonomic TypeScript SDK for the Net mesh network",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -39,7 +39,7 @@
     "test:watch": "vitest"
   },
   "peerDependencies": {
-    "@net-mesh/core": ">=0.24.1"
+    "@net-mesh/core": ">=0.25.0"
   },
   "devDependencies": {
     "@net-mesh/core": "file:../bindings/node",
