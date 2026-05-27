@@ -52,7 +52,9 @@ mod subnets;
 use parking_lot::RwLock;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::PyDict;
+#[cfg(feature = "tool")]
+use pyo3::types::PyList;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
