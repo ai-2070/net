@@ -2815,9 +2815,9 @@ mod tests {
                 .with_input_schema(r#"{"type":"object"}"#),
         ];
 
-        let via_repeated = tools.iter().fold(CapabilitySet::new(), |caps, t| {
-            caps.add_tool(t.clone())
-        });
+        let via_repeated = tools
+            .iter()
+            .fold(CapabilitySet::new(), |caps, t| caps.add_tool(t.clone()));
         let via_batch = CapabilitySet::new().add_tools(tools.iter().cloned());
 
         // Tag sets must be byte-equal (the canonical software.tool.*

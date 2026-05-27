@@ -5583,7 +5583,10 @@ impl MeshNode {
                 // Removed: in prev, not in next.
                 for (key, desc) in prev.iter() {
                     if !next.contains_key(key)
-                        && tx.send(ToolListChange::Removed(desc.clone())).await.is_err()
+                        && tx
+                            .send(ToolListChange::Removed(desc.clone()))
+                            .await
+                            .is_err()
                     {
                         return;
                     }
