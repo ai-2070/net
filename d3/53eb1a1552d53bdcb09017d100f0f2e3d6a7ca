@@ -1,0 +1,27 @@
+net/crates/net/bindings/python/python/net/tool.py
+  s_099fa7d871e34d::t_f6cda104b0b500 259-291
+  s_099fa7d871e34d::t_5fd084b737627a 637,639
+net/crates/net/bindings/go/net/tool.go
+  s_099fa7d871e34d::t_f664b6917dbe97 300,305
+  s_099fa7d871e34d::t_bcdc45294b864f 244-274,276-283,285-291
+  s_099fa7d871e34d::t_db5bd9611b9fbf 275,284
+  s_099fa7d871e34d::t_4518f346e22f8d 23
+net/crates/net/bindings/node/tool.ts
+  s_099fa7d871e34d::t_bfed2d5e4147e6 329-365
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "d353eb1a1552d53bdcb09017d100f0f2e3d6a7ca",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
