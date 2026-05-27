@@ -687,7 +687,34 @@ impl RpcHandler for PyAsyncRpcHandler {
                 };
             }
         };
-        let timeout_result = tokio::time::timeout(self.timeout, fut).await;
+        // Race the handler future against the per-call cancel token.
+        // When the substrate observes a caller-side CANCEL it trips
+        // `ctx.cancellation`; falling out of the `select!` drops
+        // `fut`, which is the only handle to the dispatched Python
+        // coroutine. The drop fires `CoroCancelGuard`, which calls
+        // `cancel()` on the asyncio task back on the dispatcher loop
+        // — surfacing `asyncio.CancelledError` inside the handler's
+        // `await`. Without this race the cancel token fires, but
+        // `tokio::time::timeout(self.timeout, fut)` keeps polling the
+        // handler future to natural completion (up to `self.timeout`),
+        // so the coroutine never observes cancellation.
+        //
+        // Returning `RpcHandlerError::Internal("cancelled by caller")`
+        // is benign on the substrate side: the dispatch loop's
+        // CANCEL-wins ordering overwrites the response with
+        // `RpcStatus::Cancelled` whenever `cancellation.is_cancelled()`
+        // is true (see `cortex::rpc::dispatch` near the "CANCEL-wins
+        // ordering" comment), so the caller still sees Cancelled,
+        // not Internal.
+        let timeout_result = tokio::select! {
+            biased;
+            _ = ctx.cancellation.cancelled() => {
+                return Err(RpcHandlerError::Internal(
+                    "cancelled by caller".to_string(),
+                ));
+            }
+            r = tokio::time::timeout(self.timeout, fut) => r,
+        };
         let py_result = match timeout_result {
             Ok(r) => r,
             Err(_) => {
