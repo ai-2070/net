@@ -184,11 +184,16 @@ class ToolServeHandle:
     from the per-rpc registry that backs ``tool.metadata.fetch``.
     Idempotent; second ``.close()`` is a no-op. Mirror of the Rust
     ``ToolServeHandle``'s Drop semantics.
+
+    When closing the last serve handle against a given rpc, also
+    drops the fetch-handler and removes the process-global registry
+    entry so a recycled rpc doesn't leak.
     """
 
     descriptor: ToolDescriptor
     _inner: ServeHandle
     _registry: Optional[Dict[str, "ToolDescriptor"]] = None
+    _outer_key: Optional[int] = None
     _closed: bool = False
 
     def close(self) -> None:
@@ -197,6 +202,15 @@ class ToolServeHandle:
         self._closed = True
         if self._registry is not None:
             self._registry.pop(self.descriptor.tool_id, None)
+            if not self._registry and self._outer_key is not None:
+                entry = _tool_registries.pop(self._outer_key, None)
+                if entry is not None:
+                    fetch_handle = entry.get("fetch_handle")
+                    if fetch_handle is not None:
+                        try:
+                            fetch_handle.close()
+                        except Exception:
+                            pass
         self._inner.close()
 
 
@@ -317,6 +331,7 @@ def serve_tool(
         descriptor=descriptor,
         _inner=inner,
         _registry=entry["registry"],
+        _outer_key=id(rpc),
     )
 
 
@@ -957,6 +972,7 @@ def serve_tool_streaming(
         descriptor=descriptor,
         _inner=inner,
         _registry=entry["registry"],
+        _outer_key=id(rpc),
     )
 
 
@@ -1050,6 +1066,7 @@ def serve_tool_streaming_async(
         descriptor=descriptor,
         _inner=inner,
         _registry=entry["registry"],
+        _outer_key=id(rpc),
     )
 
 
@@ -1079,6 +1096,7 @@ def serve_tool_async(
         descriptor=descriptor,
         _inner=inner,
         _registry=entry["registry"],
+        _outer_key=id(rpc),
     )
 
 

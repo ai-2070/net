@@ -296,10 +296,14 @@ type ToolServeHandle struct {
 	Descriptor ToolDescriptor
 	inner      *ServeHandle
 	registry   *toolRegistryEntry
+	rpc        *TypedMeshRpc
 	closed     bool
 }
 
-// Close deregisters the handler. Idempotent.
+// Close deregisters the handler. Idempotent. When closing the last
+// serve handle against a given rpc, also drops the fetch handler
+// and removes the process-global registry entry so a recycled
+// `*TypedMeshRpc` doesn't leak.
 func (h *ToolServeHandle) Close() {
 	if h.closed {
 		return
@@ -308,7 +312,22 @@ func (h *ToolServeHandle) Close() {
 	if h.registry != nil {
 		h.registry.mu.Lock()
 		delete(h.registry.descriptors, h.Descriptor.ToolID)
+		empty := len(h.registry.descriptors) == 0
+		fetch := h.registry.fetchHandle
+		if empty {
+			h.registry.fetchHandle = nil
+		}
 		h.registry.mu.Unlock()
+		if empty && h.rpc != nil {
+			toolRegistriesMu.Lock()
+			if toolRegistries[h.rpc] == h.registry {
+				delete(toolRegistries, h.rpc)
+			}
+			toolRegistriesMu.Unlock()
+			if fetch != nil {
+				fetch.Close()
+			}
+		}
 	}
 	if h.inner != nil {
 		h.inner.Close()
@@ -412,7 +431,7 @@ func RegisterTool[Req, Resp any](
 	entry.mu.Lock()
 	entry.descriptors[descriptor.ToolID] = descriptor
 	entry.mu.Unlock()
-	return &ToolServeHandle{Descriptor: descriptor, inner: inner, registry: entry}, nil
+	return &ToolServeHandle{Descriptor: descriptor, inner: inner, registry: entry, rpc: rpc}, nil
 }
 
 // StreamingToolHandler is the user-facing signature for a
@@ -470,7 +489,7 @@ func RegisterStreamingTool[Req any](
 	entry.mu.Lock()
 	entry.descriptors[descriptor.ToolID] = descriptor
 	entry.mu.Unlock()
-	return &ToolServeHandle{Descriptor: descriptor, inner: inner, registry: entry}, nil
+	return &ToolServeHandle{Descriptor: descriptor, inner: inner, registry: entry, rpc: rpc}, nil
 }
 
 // TOOL_METADATA_FETCH_SERVICE is the nRPC service name for the
