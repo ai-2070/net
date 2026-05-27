@@ -22,10 +22,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
+
 use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use net::adapter::net::behavior::fold::capability_aggregation::TagMatcher;
 use net::adapter::net::behavior::ToolCapability;
-use net::adapter::net::cortex::tool::ToolDescriptor;
+use net::adapter::net::cortex::tool::{ToolDescriptor, ToolListChange};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
@@ -332,6 +334,135 @@ async fn list_tools_filters_by_matcher_prefix() {
     let tools = peer.list_tools(Some(&matcher));
     let ids: Vec<&str> = tools.iter().map(|t| t.tool_id.as_str()).collect();
     assert_eq!(ids, vec!["eu_tool"], "expected only eu_tool, got {ids:?}");
+}
+
+// ============================================================================
+// A-5 — watch_tools dynamic discovery
+// ============================================================================
+
+#[tokio::test]
+async fn watch_tools_emits_added_when_host_publishes_a_tool() {
+    let host = build_node().await;
+    let peer = build_node().await;
+    handshake_pair(&host, &peer).await;
+
+    // Subscribe BEFORE the host registers anything — the initial
+    // baseline snapshot is empty, so the first `Added` event is
+    // attributable to the registration that follows.
+    let mut watch = peer.watch_tools(None, Some(Duration::from_millis(100)));
+
+    host.tool_registry().insert(descriptor("late_arrival"));
+    host.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce");
+
+    // Wait for the change event, capped at 5s.
+    let event = tokio::time::timeout(Duration::from_secs(5), watch.next())
+        .await
+        .expect("watch produced an event in time")
+        .expect("stream did not close");
+    match event {
+        ToolListChange::Added(desc) => assert_eq!(desc.tool_id, "late_arrival"),
+        other => panic!("expected Added(late_arrival), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn watch_tools_emits_node_count_changed_when_second_publisher_joins() {
+    let host_a = build_node().await;
+    let host_b = build_node().await;
+    let peer = build_node().await;
+    handshake_pair(&peer, &host_a).await;
+    handshake_pair(&peer, &host_b).await;
+
+    // Host A publishes first; wait for the baseline to include it.
+    host_a.tool_registry().insert(descriptor("shared_tool"));
+    host_a
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("a announce");
+    let tool_filter = CapabilityFilter::default().require_tag("ai-tool:shared_tool");
+    assert!(
+        wait_until(
+            || peer.find_nodes_by_filter(&tool_filter).contains(&host_a.node_id()),
+            Duration::from_secs(3),
+        )
+        .await,
+        "peer must see shared_tool from A first",
+    );
+
+    // Subscribe AFTER A — baseline snapshot now has node_count=1.
+    let mut watch = peer.watch_tools(None, Some(Duration::from_millis(100)));
+
+    // Host B joins the same (tool_id, version) — node_count should bump
+    // to 2 on the next diff tick.
+    host_b.tool_registry().insert(descriptor("shared_tool"));
+    host_b
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("b announce");
+
+    let event = loop {
+        let evt = tokio::time::timeout(Duration::from_secs(5), watch.next())
+            .await
+            .expect("watch produced an event in time")
+            .expect("stream did not close");
+        // The first emission could in principle be Added if B's announce
+        // outraced the baseline snapshot. In practice the test waits for
+        // A first, so the only churn is NodeCountChanged. Filter
+        // defensively so a tick ordering hiccup doesn't flake.
+        match evt {
+            ToolListChange::NodeCountChanged { .. } => break evt,
+            ToolListChange::Added(d) if d.tool_id == "shared_tool" => continue,
+            other => panic!("unexpected event: {other:?}"),
+        }
+    };
+    match event {
+        ToolListChange::NodeCountChanged {
+            descriptor: d,
+            prev_node_count,
+        } => {
+            assert_eq!(d.tool_id, "shared_tool");
+            assert_eq!(prev_node_count, 1);
+            assert_eq!(d.node_count, 2);
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn watch_tools_polling_task_exits_when_handle_dropped() {
+    // Pinned behavior: dropping the `ToolListWatch` causes the inner
+    // polling task to exit (mpsc send fails → loop returns). We can't
+    // reach the JoinHandle from here, so the test instead verifies
+    // that a drop doesn't leak observable state: registering a new
+    // tool after the drop must NOT panic and must NOT cause the
+    // dropped watch's still-alive sender to misbehave.
+    let host = build_node().await;
+    let peer = build_node().await;
+    handshake_pair(&host, &peer).await;
+
+    {
+        let _watch = peer.watch_tools(None, Some(Duration::from_millis(50)));
+        // Drop immediately when the block ends.
+    }
+    // Give the task one tick to observe the closed channel.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    host.tool_registry().insert(descriptor("post_drop"));
+    host.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce after drop");
+
+    let tool_filter = CapabilityFilter::default().require_tag("ai-tool:post_drop");
+    assert!(
+        wait_until(
+            || peer.find_nodes_by_filter(&tool_filter).contains(&host.node_id()),
+            Duration::from_secs(3),
+        )
+        .await,
+        "post-drop announce must still propagate normally",
+    );
 }
 
 #[tokio::test]

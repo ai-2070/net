@@ -5502,6 +5502,111 @@ impl MeshNode {
         out
     }
 
+    /// Subscribe to a stream of [`ToolListChange`] events that
+    /// reflect every dynamic addition / removal / publisher-count
+    /// change in the local capability fold's tool view, filtered by
+    /// `matcher` (same semantic as
+    /// [`Self::list_tools`]).
+    ///
+    /// The returned [`ToolListWatch`] is a
+    /// `futures::Stream<Item = ToolListChange>`. The first event
+    /// fires AFTER the initial snapshot — callers that need the
+    /// baseline shape should call `list_tools` first and then start
+    /// the watch.
+    ///
+    /// Backed by a polling task: every `interval` (default `1s`
+    /// when `None`), the task re-runs `list_tools(&matcher)` and
+    /// diffs against its previous snapshot, emitting one event per
+    /// change. Tighter intervals lower discovery latency at the
+    /// cost of CPU; loose intervals are kinder to large folds.
+    ///
+    /// Lifecycle:
+    /// - Dropping the [`ToolListWatch`] stops the polling task on
+    ///   the next tick (the task observes the closed sender and
+    ///   exits).
+    /// - The watch handle never errors: a dropped fold (impossible
+    ///   while the `MeshNode` arc is alive) would simply end the
+    ///   stream. Decode-style errors don't exist here — the
+    ///   underlying walk is in-memory and infallible.
+    #[cfg(feature = "tool")]
+    pub fn watch_tools(
+        self: &Arc<Self>,
+        matcher: Option<super::behavior::fold::capability_aggregation::TagMatcher>,
+        interval: Option<Duration>,
+    ) -> crate::adapter::net::cortex::tool::ToolListWatch {
+        use std::collections::HashMap;
+        use crate::adapter::net::cortex::tool::{ToolDescriptor, ToolListChange, ToolListWatch};
+        let interval = interval.unwrap_or_else(|| Duration::from_secs(1));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ToolListChange>();
+        // Take the initial baseline snapshot SYNCHRONOUSLY before
+        // returning the watch handle. Without this, a caller that
+        // does `let w = watch_tools(...); announce_a_tool().await` can
+        // race the spawned task — the announce may land before the
+        // task's first `list_tools` call, leaving the new tool in
+        // the baseline (and silently skipping the `Added` event).
+        let initial_snapshot: HashMap<(String, String), ToolDescriptor> = self
+            .list_tools(matcher.as_ref())
+            .into_iter()
+            .map(|d| ((d.tool_id.clone(), d.version.clone()), d))
+            .collect();
+        let node = self.clone();
+        let matcher_for_task = matcher;
+        tokio::spawn(async move {
+            let mut prev = initial_snapshot;
+            let mut ticker = tokio::time::interval(interval);
+            // Skip the first immediate tick — the snapshot was just taken.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if tx.is_closed() {
+                    return;
+                }
+                let next: HashMap<(String, String), ToolDescriptor> = node
+                    .list_tools(matcher_for_task.as_ref())
+                    .into_iter()
+                    .map(|d| ((d.tool_id.clone(), d.version.clone()), d))
+                    .collect();
+                // Added: in next, not in prev.
+                for (key, desc) in next.iter() {
+                    if !prev.contains_key(key) {
+                        if tx.send(ToolListChange::Added(desc.clone())).is_err() {
+                            return;
+                        }
+                    }
+                }
+                // Removed: in prev, not in next.
+                for (key, desc) in prev.iter() {
+                    if !next.contains_key(key) {
+                        if tx.send(ToolListChange::Removed(desc.clone())).is_err() {
+                            return;
+                        }
+                    }
+                }
+                // NodeCountChanged: in both, but counts differ. (Any
+                // other field drift surfaces via this event too —
+                // descriptor carries the latest view.)
+                for (key, new_desc) in next.iter() {
+                    if let Some(old_desc) = prev.get(key) {
+                        if new_desc.node_count != old_desc.node_count {
+                            if tx
+                                .send(ToolListChange::NodeCountChanged {
+                                    descriptor: new_desc.clone(),
+                                    prev_node_count: old_desc.node_count,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+                prev = next;
+            }
+        });
+        ToolListWatch { receiver: rx }
+    }
+
     /// Per-Mesh caller-side nRPC metrics registry. Accessor for
     /// `mesh_rpc::Mesh::call` to bump counters on each outgoing
     /// call.

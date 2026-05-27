@@ -33,8 +33,8 @@ pub use net::adapter::net::behavior::fold::capability_aggregation::{
 #[cfg(feature = "cortex")]
 pub use net::adapter::net::cortex::tool::{
     description_metadata_key, streaming_metadata_key, tags_metadata_key, ToolDescriptor,
-    ToolEvent, ToolMetadataRegistry, ToolMetadataRequest, ToolMetadataResponse,
-    TOOL_METADATA_FETCH_SERVICE,
+    ToolEvent, ToolListChange, ToolListWatch, ToolMetadataRegistry, ToolMetadataRequest,
+    ToolMetadataResponse, TOOL_METADATA_FETCH_SERVICE,
 };
 
 #[cfg(feature = "cortex")]
@@ -457,6 +457,28 @@ impl Mesh {
     /// [`net::adapter::net::MeshNode::list_tools`](net::adapter::net::MeshNode::list_tools).
     pub fn list_tools(&self, matcher: Option<&TagMatcher>) -> Vec<ToolDescriptor> {
         self.inner().list_tools(matcher)
+    }
+
+    /// Subscribe to a stream of [`ToolListChange`] events for every
+    /// dynamic addition / removal / publisher-count change in the
+    /// local capability fold's tool view, filtered by `matcher`.
+    ///
+    /// `interval` controls the polling cadence; `None` uses a 1s
+    /// default. The returned [`ToolListWatch`] implements
+    /// `futures::Stream<Item = ToolListChange>`. Dropping it stops
+    /// the underlying polling task.
+    ///
+    /// First event fires AFTER the initial baseline snapshot — call
+    /// [`Self::list_tools`] first if you need the starting shape.
+    ///
+    /// Delegates to
+    /// [`net::adapter::net::MeshNode::watch_tools`](net::adapter::net::MeshNode::watch_tools).
+    pub fn watch_tools(
+        &self,
+        matcher: Option<TagMatcher>,
+        interval: Option<std::time::Duration>,
+    ) -> ToolListWatch {
+        self.node_arc().watch_tools(matcher, interval)
     }
 
     /// Idempotent — installs the `tool.metadata.fetch` nRPC

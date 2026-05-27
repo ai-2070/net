@@ -274,6 +274,90 @@ impl ToolEvent {
 }
 
 // ============================================================================
+// ToolListWatch — Stream wrapper around the watch_tools mpsc receiver
+// ============================================================================
+
+/// Stream of [`ToolListChange`] events returned by
+/// [`crate::adapter::net::MeshNode::watch_tools`]. Implements
+/// `futures::Stream<Item = ToolListChange>`. Dropping the watch
+/// ends the underlying polling task on its next tick.
+pub struct ToolListWatch {
+    pub(crate) receiver: tokio::sync::mpsc::UnboundedReceiver<ToolListChange>,
+}
+
+impl futures::Stream for ToolListWatch {
+    type Item = ToolListChange;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(cx)
+    }
+}
+
+impl ToolListWatch {
+    /// Receive the next change event. Returns `None` when the
+    /// underlying polling task exits (cannot happen while the
+    /// `MeshNode` is alive). Most callers should treat the watch
+    /// handle as a stream and `.next().await` on it instead.
+    pub async fn recv(&mut self) -> Option<ToolListChange> {
+        self.receiver.recv().await
+    }
+
+    /// Non-blocking peek: returns the next change if one is already
+    /// queued, otherwise `None`. Useful for poll-style consumers
+    /// that want to drain without waiting.
+    pub fn try_recv(&mut self) -> Option<ToolListChange> {
+        self.receiver.try_recv().ok()
+    }
+}
+
+// ============================================================================
+// ToolListChange — dynamic-discovery diff event
+// ============================================================================
+
+/// One change in the set of tools visible to the local capability
+/// fold, surfaced by [`crate::adapter::net::MeshNode::watch_tools`].
+/// Adapter packages re-emit these to the agent runtime so the
+/// model's tool list stays in sync with the mesh.
+///
+/// Identity for diffing is `(tool_id, version)`; the same `tool_id`
+/// across two versions is two independent slots. `Added` and
+/// `Removed` carry the full descriptor; `NodeCountChanged` carries
+/// the latest descriptor with the new aggregated `node_count` plus
+/// the previous count.
+///
+/// Plan: see `docs/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`,
+/// slice A-5.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolListChange {
+    /// A `(tool_id, version)` slot just appeared in the local fold.
+    /// First-arrival event — the agent should add this tool to its
+    /// tool list. `node_count` is the publisher count observed at
+    /// arrival (typically `1` unless multiple publishers landed in
+    /// the same diff window).
+    Added(ToolDescriptor),
+    /// A `(tool_id, version)` slot disappeared from the local fold —
+    /// every publisher dropped it (registry removal + announce, or
+    /// TTL expiry across the board). Carries the last-known
+    /// descriptor so the adapter has the full shape on hand to do
+    /// cleanup (e.g. remove from Anthropic `tools` array by `name`).
+    Removed(ToolDescriptor),
+    /// The publisher count for a `(tool_id, version)` slot changed,
+    /// but the slot itself stayed present. `descriptor.node_count`
+    /// is the new count; `prev_node_count` was the previously
+    /// observed value. Useful for load-balancing UI ("3 nodes can
+    /// serve this tool, up from 1").
+    NodeCountChanged {
+        /// Latest descriptor — `node_count` is the new aggregated
+        /// publisher count.
+        descriptor: ToolDescriptor,
+        /// The publisher count observed before this change.
+        prev_node_count: u32,
+    },
+}
+
+// ============================================================================
 // tool.metadata.fetch — on-demand schema pull
 // ============================================================================
 //
