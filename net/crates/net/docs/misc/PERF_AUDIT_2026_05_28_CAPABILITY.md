@@ -198,3 +198,26 @@ fn has_indexed_software_value(
 `has_model` / `has_tool` are now thin wrappers around `has_indexed_software_value`. No caching, no `OnceCell`, no API change — just dropping per-tag allocations and reordering checks so the cheap one filters first.
 
 **Implication for `axis_key()` itself**: any other caller that iterates a tag set through `axis_key()` is paying the same per-tag allocation. Worth a follow-up audit (grep for `axis_key()` callers) — likely candidates: predicate evaluation, `required_capability`, the hardware/software/models decoders. A non-cloning variant (`axis_key_ref(&self) -> Option<(TaxonomyAxis, &str)>`) would let those callers borrow.
+
+## Results — `axis_key_ref` follow-up applied (2026-05-28)
+
+The `axis_key()` audit above turned up 14 hot-path callers. Added a borrowing variant `Tag::axis_key_ref() -> Option<(TaxonomyAxis, &str)>` (`tag.rs:308`) and migrated:
+
+- All 5 view decoders in `tag_codec.rs`: `hardware_from_tags`, `software_from_tags`, `resource_limits_from_tags`, `models_from_tags`, `tools_from_tags`
+- All 5 `is_*_owned_tag` predicates in `tag_codec.rs`
+- `Predicate::Exists` (`predicate.rs:1242`) and `match_axis_tag` helper (`predicate.rs:1904`)
+- `RequiredCapability::AxisKey` (`required_capability.rs:71`)
+- `MatchKey::{Axis, AxisKey}` (`capability_aggregation.rs:284`)
+
+`axis_key()` kept for callers that need an owned `TagKey` (e.g. `diff.rs:551` which collects into `HashSet<TagKey>`).
+
+Baseline `pre-axis-key-ref` taken on the same Windows host with fixes #1 + #2 + #5 already applied.
+
+| Benchmark | Pre | Post | Δ |
+|---|---|---|---|
+| `capability_filter/match_complex` | 4.42 µs | **3.74 µs** | **−15.9%** (~683 ns) |
+| `capability_set/has_tag` | 38.04 ns | 44.87 ns | +16.5% (~7 ns; rebuild noise — `has_tag` doesn't use `axis_key`, uses `Tag::parse` + `semantic_eq`) |
+
+`match_complex` is the only filter bench that still falls through to `views().models()` (for the modality check); the saved 683 ns is the per-tag-allocation cost in `models_from_tags`'s axis_key iteration. Other callers (predicate eval, capability_aggregation, owned-tag predicates) get the same per-tag saving wherever they execute — not separately benched here.
+
+All 4133 lib tests pass.

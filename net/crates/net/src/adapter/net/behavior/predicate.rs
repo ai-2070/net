@@ -1239,7 +1239,10 @@ impl Predicate {
             // `match_axis_tag` because that helper now skips
             // `AxisPresent` (presence-only tags carry no value;
             // value predicates would otherwise see `""`).
-            Self::Exists { key } => ctx.tags.iter().any(|t| t.axis_key().as_ref() == Some(key)),
+            Self::Exists { key } => ctx
+                .tags
+                .iter()
+                .any(|t| matches!(t.axis_key_ref(), Some((a, k)) if a == key.axis && k == key.key)),
             Self::Equals { key, value } => match_axis_tag(ctx.tags, key, |v| v == value.as_str()),
             Self::NumericAtLeast { key, threshold } => match_axis_tag(ctx.tags, key, |v| {
                 v.parse::<f64>().is_ok_and(|n| n >= *threshold)
@@ -1900,12 +1903,14 @@ fn accumulate_trace(
 /// presence-aware path in `evaluate_leaf`) when key-presence
 /// without a value is the intended check.
 fn match_axis_tag(tags: &[Tag], key: &TagKey, value_pred: impl Fn(&str) -> bool) -> bool {
-    tags.iter().any(|t| {
-        t.axis_key().as_ref() == Some(key)
-            && match t {
-                Tag::AxisValue { value, .. } => value_pred(value),
-                _ => false,
-            }
+    tags.iter().any(|t| match t {
+        Tag::AxisValue {
+            axis,
+            key: k,
+            value,
+            ..
+        } => *axis == key.axis && k == &key.key && value_pred(value),
+        _ => false,
     })
 }
 
