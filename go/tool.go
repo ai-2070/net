@@ -562,17 +562,15 @@ func CallToolStreaming[Req any](
 	if err != nil {
 		return nil, err
 	}
-	return &ToolEventStream{inner: stream}, nil
+	return &ToolEventStream{inner: stream, pendingSynth: true}, nil
 }
 
-// ToolEventStream wraps a TypedRpcStream[ToolEvent] and tracks
-// whether a terminal envelope was observed. On clean EOF without
-// a terminal, the next Recv() synthesizes a `missing_terminal`
-// error event before returning ok=false.
+// ToolEventStream wraps a TypedRpcStream[ToolEvent]. On clean EOF
+// without a terminal envelope, the next Recv() emits one synthesized
+// `missing_terminal` error event before returning ok=false.
 type ToolEventStream struct {
-	inner       *TypedRpcStream[ToolEvent]
-	sawTerminal bool
-	synthesized bool
+	inner        *TypedRpcStream[ToolEvent]
+	pendingSynth bool
 }
 
 // Recv pulls the next ToolEvent. Returns (event, true, nil) for
@@ -586,12 +584,12 @@ func (s *ToolEventStream) Recv() (ToolEvent, bool, error) {
 	}
 	if ok {
 		if event.IsTerminal() {
-			s.sawTerminal = true
+			s.pendingSynth = false
 		}
 		return event, true, nil
 	}
-	if !s.sawTerminal && !s.synthesized {
-		s.synthesized = true
+	if s.pendingSynth {
+		s.pendingSynth = false
 		return ToolEvent{
 			Type:   ToolEventError,
 			Code:   "missing_terminal",

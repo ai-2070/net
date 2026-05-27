@@ -347,7 +347,7 @@ def call_tool_streaming(
     try:
         for event in stream:
             yield event
-            if isinstance(event, dict) and event.get("type") in ("result", "error"):
+            if is_terminal_event(event):
                 saw_terminal = True
     finally:
         try:
