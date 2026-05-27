@@ -68,7 +68,10 @@ impl RequiredCapability {
             Self::Tag(required) => ctx.tags.iter().any(|t| t.semantic_eq(required)),
             Self::Predicate(p) => p.evaluate(ctx),
             Self::AxisAny(axis) => ctx.tags.iter().any(|t| t.axis() == Some(*axis)),
-            Self::AxisKey(key) => ctx.tags.iter().any(|t| t.axis_key().as_ref() == Some(key)),
+            Self::AxisKey(key) => ctx
+                .tags
+                .iter()
+                .any(|t| matches!(t.axis_key_ref(), Some((a, k)) if a == key.axis && k == key.key)),
         }
     }
 }

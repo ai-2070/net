@@ -19,6 +19,17 @@ use std::hash::Hash;
 
 use crate::adapter::net::behavior::tag::Tag;
 
+/// Version-discriminator byte for the compact (postcard) wire format
+/// used by [`CapabilitySet::to_bytes_compact`] and
+/// [`CapabilityAnnouncement::to_bytes_compact`]. JSON serializations
+/// start with `b'{'` (`0x7B`); compact serializations start with this
+/// byte. Any value other than `b'{'` or this constant in the leading
+/// byte position causes `from_bytes` to return `None`.
+///
+/// The numeric value is fixed at the wire-format level — bumping it
+/// is a wire-protocol break.
+const COMPACT_FORMAT_TAG: u8 = 0x01;
+
 // ============================================================================
 // Hardware Capabilities
 // ============================================================================
@@ -1347,22 +1358,7 @@ impl CapabilitySet {
     /// directly in the canonical tag set rather than reconstructing
     /// the full `Vec<ModelCapability>` via `views()`.
     pub fn has_model(&self, model_id: &str) -> bool {
-        use crate::adapter::net::behavior::tag::TaxonomyAxis;
-        self.tags.iter().any(|tag| {
-            let Some(key) = tag.axis_key() else {
-                return false;
-            };
-            if key.axis != TaxonomyAxis::Software {
-                return false;
-            }
-            let Some(rest) = key.key.strip_prefix("model.") else {
-                return false;
-            };
-            let Some((_idx, sub)) = rest.split_once('.') else {
-                return false;
-            };
-            sub == "id" && tag.value() == Some(model_id)
-        })
+        self.has_indexed_software_value("model.", "id", model_id)
     }
 
     /// Check if has a specific tool.
@@ -1370,21 +1366,42 @@ impl CapabilitySet {
     /// Phase A.5.N.3: scans for `software.tool.<i>.tool_id=<tool_id>`
     /// directly in the canonical tag set.
     pub fn has_tool(&self, tool_id: &str) -> bool {
+        self.has_indexed_software_value("tool.", "tool_id", tool_id)
+    }
+
+    /// Shared scan body for `has_model` / `has_tool` — looks for a
+    /// `software.<family_prefix><idx>.<sub_key>=<expected_value>` tag
+    /// (e.g. `software.model.0.id=llama-3.1-7b`).
+    ///
+    /// Performance note: matches `Tag::AxisValue` directly to avoid
+    /// `Tag::axis_key()`'s per-tag `String` clone. The value compare
+    /// runs first because most tags in the set won't carry the target
+    /// value — that lets the key parse (`strip_prefix` + `split_once`)
+    /// run only on the small set of value-matching candidates. See
+    /// `docs/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` fix #5.
+    fn has_indexed_software_value(
+        &self,
+        family_prefix: &str,
+        sub_key: &str,
+        expected_value: &str,
+    ) -> bool {
         use crate::adapter::net::behavior::tag::TaxonomyAxis;
-        self.tags.iter().any(|tag| {
-            let Some(key) = tag.axis_key() else {
-                return false;
-            };
-            if key.axis != TaxonomyAxis::Software {
-                return false;
+        self.tags.iter().any(|tag| match tag {
+            Tag::AxisValue {
+                axis: TaxonomyAxis::Software,
+                key,
+                value,
+                ..
+            } if value == expected_value => {
+                let Some(rest) = key.strip_prefix(family_prefix) else {
+                    return false;
+                };
+                let Some((_idx, sub)) = rest.split_once('.') else {
+                    return false;
+                };
+                sub == sub_key
             }
-            let Some(rest) = key.key.strip_prefix("tool.") else {
-                return false;
-            };
-            let Some((_idx, sub)) = rest.split_once('.') else {
-                return false;
-            };
-            sub == "tool_id" && tag.value() == Some(tool_id)
+            _ => false,
         })
     }
 
@@ -1398,6 +1415,30 @@ impl CapabilitySet {
         self.tags.contains(&Tag::AxisPresent {
             axis: TaxonomyAxis::Hardware,
             key: "gpu".into(),
+        })
+    }
+
+    /// First `AxisValue` tag matching `(axis, key)`, returning its
+    /// value if present. Linear in `tags` count with early return.
+    ///
+    /// Phase A.5.N.3 fast-path helper for single-field predicates
+    /// (`CapabilityFilter::matches` memory / VRAM checks). Avoids
+    /// forcing the full `HardwareCapabilities` decode via
+    /// `views().hardware()` when only one tag is needed. See
+    /// `docs/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` fix #2.
+    pub(crate) fn axis_value(
+        &self,
+        axis: crate::adapter::net::behavior::tag::TaxonomyAxis,
+        key: &str,
+    ) -> Option<&str> {
+        self.tags.iter().find_map(|tag| match tag {
+            Tag::AxisValue {
+                axis: a,
+                key: k,
+                value,
+                ..
+            } if *a == axis && k == key => Some(value.as_str()),
+            _ => None,
         })
     }
 
@@ -1422,15 +1463,39 @@ impl CapabilitySet {
             .collect()
     }
 
-    /// Serialize to bytes (compact binary format)
+    /// Serialize to bytes — JSON format, kept as the default for wire
+    /// compatibility with peers running pre-postcard code. New callers
+    /// that don't need to interop with old peers should prefer
+    /// [`Self::to_bytes_compact`] (~10× faster, ~3× smaller).
     pub fn to_bytes(&self) -> Vec<u8> {
-        // Use JSON for now (can optimize to binary later)
         serde_json::to_vec(self).unwrap_or_default()
     }
 
-    /// Deserialize from bytes
+    /// Serialize to bytes using the compact postcard wire format —
+    /// a single leading `0x01` version byte followed by the postcard
+    /// payload. [`Self::from_bytes`] reads either format via
+    /// first-byte sniff, so receivers running this code accept both
+    /// compact and JSON inputs.
+    ///
+    /// See `docs/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` fix #3 for
+    /// the rollout staging — flipping `to_bytes` itself to compact is
+    /// a separate, deliberate wire-format change.
+    pub fn to_bytes_compact(&self) -> Vec<u8> {
+        let out = vec![COMPACT_FORMAT_TAG];
+        postcard::to_extend(self, out).unwrap_or_default()
+    }
+
+    /// Deserialize from bytes. Accepts both the legacy JSON wire
+    /// format (peers running pre-postcard code) and the compact
+    /// postcard format (peers using [`Self::to_bytes_compact`]).
+    /// Discriminates on the first byte: `b'{'` → JSON, `0x01` →
+    /// postcard, anything else → `None`.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        serde_json::from_slice(data).ok()
+        match data.first() {
+            Some(&b'{') => serde_json::from_slice(data).ok(),
+            Some(&COMPACT_FORMAT_TAG) => postcard::from_bytes(&data[1..]).ok(),
+            _ => None,
+        }
     }
 
     /// Compute the structural change from `prev` to `self`.
@@ -1702,7 +1767,7 @@ impl<'a> CapabilityViews<'a> {
     /// repeated reads produce identical projections.
     fn sorted_tags(&self) -> &Vec<Tag> {
         self.sorted_tags
-            .get_or_init(|| sorted_tag_vec(&self.caps.tags))
+            .get_or_init(|| decoder_sorted_tag_vec(&self.caps.tags))
     }
 
     /// Hardware projection. Decodes the `hardware.*` axis tags
@@ -1787,40 +1852,74 @@ fn sorted_tag_vec(tags: &HashSet<Tag>) -> Vec<Tag> {
     v
 }
 
-/// Serialize a `HashSet<Tag>` as a sorted JSON array — `Tag::to_string()`
-/// order. The wire format is canonical so two ends of a signed
-/// `CapabilityAnnouncement` round-trip produce identical bytes
-/// regardless of process-local `HashSet` iteration order.
+/// Decoder-path sort: stabilizes tag order for the per-axis
+/// projection decoders. Uses `Tag`'s derived `Ord` (no per-element
+/// `String` allocation) — any total order works here as long as it
+/// is deterministic. Wire serialization keeps `sorted_tag_vec`'s
+/// `Tag::to_string()` order so signed-announcement bytes stay stable.
+fn decoder_sorted_tag_vec(tags: &HashSet<Tag>) -> Vec<Tag> {
+    let mut v: Vec<Tag> = tags.iter().cloned().collect();
+    v.sort_unstable();
+    v
+}
+
+/// Serialize a `HashSet<Tag>` as a sequence of tags. For
+/// human-readable formats (JSON) the sequence is sorted via
+/// `Tag::to_string()` so a signed `CapabilityAnnouncement`
+/// round-trips byte-for-byte regardless of process-local `HashSet`
+/// iteration order — that byte stability is what makes signature
+/// verification work across peers.
+///
+/// For non-human-readable formats (postcard via
+/// [`CapabilitySet::to_bytes_compact`]) the sort is skipped:
+/// `CapabilityAnnouncement` itself never takes the compact path
+/// (its `#[serde(skip_serializing_if)]` fields don't survive
+/// positional encoding), and bare `CapabilitySet` bytes aren't
+/// signed — readers reconstruct the same `HashSet` regardless of
+/// iteration order. Skipping the sort avoids ~N × `Tag::to_string()`
+/// allocations on every compact serialize.
 fn serialize_tags_sorted<S: serde::Serializer>(
     tags: &HashSet<Tag>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     use serde::ser::SerializeSeq;
-    let sorted = sorted_tag_vec(tags);
-    let mut seq = serializer.serialize_seq(Some(sorted.len()))?;
-    for t in &sorted {
-        seq.serialize_element(t)?;
+    if serializer.is_human_readable() {
+        let sorted = sorted_tag_vec(tags);
+        let mut seq = serializer.serialize_seq(Some(sorted.len()))?;
+        for t in &sorted {
+            seq.serialize_element(t)?;
+        }
+        seq.end()
+    } else {
+        let mut seq = serializer.serialize_seq(Some(tags.len()))?;
+        for t in tags {
+            seq.serialize_element(t)?;
+        }
+        seq.end()
     }
-    seq.end()
 }
 
 impl From<&CapabilitySet> for HardwareCapabilities {
     fn from(caps: &CapabilitySet) -> Self {
-        crate::adapter::net::behavior::tag_codec::hardware_from_tags(&sorted_tag_vec(&caps.tags))
+        crate::adapter::net::behavior::tag_codec::hardware_from_tags(&decoder_sorted_tag_vec(
+            &caps.tags,
+        ))
     }
 }
 
 impl From<&CapabilitySet> for SoftwareCapabilities {
     fn from(caps: &CapabilitySet) -> Self {
-        crate::adapter::net::behavior::tag_codec::software_from_tags(&sorted_tag_vec(&caps.tags))
+        crate::adapter::net::behavior::tag_codec::software_from_tags(&decoder_sorted_tag_vec(
+            &caps.tags,
+        ))
     }
 }
 
 impl From<&CapabilitySet> for ResourceLimits {
     fn from(caps: &CapabilitySet) -> Self {
-        crate::adapter::net::behavior::tag_codec::resource_limits_from_tags(&sorted_tag_vec(
-            &caps.tags,
-        ))
+        crate::adapter::net::behavior::tag_codec::resource_limits_from_tags(
+            &decoder_sorted_tag_vec(&caps.tags),
+        )
     }
 }
 
@@ -2187,20 +2286,31 @@ impl CapabilityAnnouncement {
         self.entity_id.verify(&payload, &sig)
     }
 
-    /// Serialize to bytes
+    /// Serialize to bytes — JSON. The compact-postcard codec used by
+    /// [`CapabilitySet::to_bytes_compact`] is not applied here:
+    /// `CapabilityAnnouncement`'s wire-compat surface relies on
+    /// several `#[serde(skip_serializing_if = ...)]` field
+    /// omissions (`signature`, `hop_count`, `reflex_addr`, the three
+    /// `allowed_*` lists) so signed bytes round-trip byte-for-byte
+    /// against pre-M-1 / pre-v0.4 peers — and postcard's positional
+    /// encoding can't reconstruct an omitted field. A compact
+    /// announcement codec would need a separate canonicalized wire
+    /// struct (TODO; tracked in PERF_AUDIT_2026_05_28_CAPABILITY.md
+    /// fix #3 follow-ups).
     pub fn to_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).unwrap_or_default()
     }
 
-    /// Deserialize from bytes. Returns `None` on a JSON parse
-    /// failure OR when any v0.4 capability-auth allow-list exceeds
-    /// [`MAX_ALLOW_LIST_LEN`] — the cap is a wire-level invariant
-    /// (operators above 64 entries per axis must use a group), so
-    /// receivers reject oversized announcements at the deserializer
-    /// boundary rather than scanning unbounded vectors inside
-    /// `may_execute` on every call. Symmetric with the CLI's
-    /// announce-side check; closes the asymmetry where the
-    /// substrate accepted any vector length the wire delivered.
+    /// Deserialize from bytes (JSON only — see [`Self::to_bytes`]).
+    /// Returns `None` on a parse failure OR when any v0.4
+    /// capability-auth allow-list exceeds [`MAX_ALLOW_LIST_LEN`] —
+    /// the cap is a wire-level invariant (operators above 64 entries
+    /// per axis must use a group), so receivers reject oversized
+    /// announcements at the deserializer boundary rather than
+    /// scanning unbounded vectors inside `may_execute` on every call.
+    /// Symmetric with the CLI's announce-side check; closes the
+    /// asymmetry where the substrate accepted any vector length the
+    /// wire delivered.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         let ann: Self = serde_json::from_slice(data).ok()?;
         if ann.allowed_nodes.len() > MAX_ALLOW_LIST_LEN
@@ -2367,6 +2477,9 @@ impl CapabilityFilter {
     /// `views()` body becomes a tag-set scan and this matcher
     /// keeps working without further changes.
     pub fn matches(&self, caps: &CapabilitySet) -> bool {
+        use crate::adapter::net::behavior::tag::{AxisSeparator, TaxonomyAxis};
+        use crate::adapter::net::behavior::tag_codec::gpu_vendor_str;
+
         // Check tags (all required tags must be present)
         for tag in &self.require_tags {
             if !caps.has_tag(tag) {
@@ -2390,55 +2503,73 @@ impl CapabilityFilter {
             }
         }
 
-        // Phase 1 (lazy): each `views.X()` decodes only the
-        // projection it needs. `views.hardware()` does NOT force
-        // the model decoder; `views.models()` does NOT force
-        // hardware. Predicates that early-return on a hardware
-        // check pay zero cost for unused axes.
-        let views = caps.views();
-
-        // Check memory
+        // Tag-direct fast paths for single-field hardware predicates —
+        // avoid forcing the full `HardwareCapabilities` decode (sort +
+        // per-tag axis_key parse) when only one tag's value is needed.
+        // See `docs/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` fix #2.
         if let Some(min_mem) = self.min_memory_gb {
-            if views.hardware().memory_gb < min_mem {
+            let mem = caps
+                .axis_value(TaxonomyAxis::Hardware, "memory_gb")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            if mem < min_mem {
                 return false;
             }
         }
 
-        // Check GPU
         if self.require_gpu && !caps.has_gpu() {
             return false;
         }
 
-        // Check GPU vendor
         if let Some(vendor) = self.gpu_vendor {
-            if views.hardware().gpu_vendor() != Some(vendor) {
+            // O(1) HashSet probe for `hardware.gpu.vendor=<vendor>`.
+            let expected = Tag::AxisValue {
+                axis: TaxonomyAxis::Hardware,
+                key: "gpu.vendor".to_string(),
+                value: gpu_vendor_str(vendor).to_string(),
+                separator: AxisSeparator::Eq,
+            };
+            if !caps.tags.contains(&expected) {
                 return false;
             }
         }
 
-        // Check VRAM
         if let Some(min_vram) = self.min_vram_gb {
-            if views.hardware().total_vram_gb() < min_vram {
-                return false;
+            // Single-GPU fast path: `hardware.gpu.vram_gb=<n>`. Falls
+            // through to the full `HardwareCapabilities::total_vram_gb`
+            // sum for multi-GPU configs (where additional `gpu.<i>.*`
+            // tags exist beyond the primary).
+            let vram = caps
+                .axis_value(TaxonomyAxis::Hardware, "gpu.vram_gb")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            if vram < min_vram {
+                let total = caps.views().hardware().total_vram_gb();
+                if total < min_vram {
+                    return false;
+                }
             }
         }
 
-        // Check context length
-        if let Some(min_ctx) = self.min_context_length {
-            let has_sufficient = views.models().iter().any(|m| m.context_length >= min_ctx);
-            if !has_sufficient {
-                return false;
-            }
-        }
+        // Remaining predicates need the model projection — decode lazily.
+        if self.min_context_length.is_some() || !self.require_modalities.is_empty() {
+            let views = caps.views();
 
-        // Check modalities
-        for modality in &self.require_modalities {
-            let has_modality = views
-                .models()
-                .iter()
-                .any(|m| m.modalities.contains(modality));
-            if !has_modality {
-                return false;
+            if let Some(min_ctx) = self.min_context_length {
+                let has_sufficient = views.models().iter().any(|m| m.context_length >= min_ctx);
+                if !has_sufficient {
+                    return false;
+                }
+            }
+
+            for modality in &self.require_modalities {
+                let has_modality = views
+                    .models()
+                    .iter()
+                    .any(|m| m.modalities.contains(modality));
+                if !has_modality {
+                    return false;
+                }
             }
         }
 
@@ -2807,7 +2938,7 @@ mod tests {
     /// the same capability set both ways and comparing.
     #[test]
     fn add_tools_batch_matches_repeated_add_tool() {
-        let tools = vec![
+        let tools = [
             ToolCapability::new("web_search", "Web Search").with_version("1.0.0"),
             ToolCapability::new("summarize", "Summarize").with_version("1.0.0"),
             ToolCapability::new("code_eval", "Code Eval")
@@ -3959,6 +4090,41 @@ mod tests {
         let caps2 = CapabilitySet::from_bytes(&bytes).expect("round-trip parses");
         assert_eq!(caps, caps2);
     }
+
+    #[test]
+    fn compact_wire_format_round_trips_and_interops_with_json() {
+        // Pinned: postcard-format round-trip preserves the
+        // CapabilitySet AND a single `from_bytes` accepts both
+        // encodings. Rollout from JSON to compact requires that any
+        // peer running this code can read either format.
+        let caps = sample_capability_set();
+        let json_bytes = caps.to_bytes();
+        let compact_bytes = caps.to_bytes_compact();
+        assert_eq!(json_bytes.first(), Some(&b'{'));
+        assert_eq!(compact_bytes.first(), Some(&COMPACT_FORMAT_TAG));
+        assert!(
+            compact_bytes.len() < json_bytes.len(),
+            "compact ({} bytes) should be smaller than JSON ({} bytes)",
+            compact_bytes.len(),
+            json_bytes.len()
+        );
+        let from_json = CapabilitySet::from_bytes(&json_bytes).expect("json parses");
+        let from_compact = CapabilitySet::from_bytes(&compact_bytes).expect("compact parses");
+        assert_eq!(caps, from_json);
+        assert_eq!(caps, from_compact);
+    }
+
+    #[test]
+    fn from_bytes_rejects_unknown_format_tag() {
+        // Any leading byte other than `b'{'` or COMPACT_FORMAT_TAG
+        // is a forward-compat unknown version — we reject loudly
+        // rather than mis-decode.
+        assert!(CapabilitySet::from_bytes(&[0xFF]).is_none());
+        assert!(CapabilitySet::from_bytes(&[]).is_none());
+        // Empty postcard body after the version tag is also invalid.
+        assert!(CapabilitySet::from_bytes(&[COMPACT_FORMAT_TAG]).is_none());
+    }
+
     #[test]
     fn typed_tags_includes_legacy_string_tags() {
         // Pinned: legacy `Vec<String>` tags appear in the typed-

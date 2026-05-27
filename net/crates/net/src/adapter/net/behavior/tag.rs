@@ -296,10 +296,29 @@ impl Tag {
     /// `(axis, key)` extraction for `Predicate` evaluation. Returns
     /// `None` for `Reserved` and `Legacy` tags (which don't fit the
     /// axis taxonomy by construction).
+    ///
+    /// Allocates: the returned `TagKey` owns its `key` string. Hot
+    /// paths that iterate a tag set should prefer [`Self::axis_key_ref`]
+    /// — see `docs/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` for the
+    /// per-tag allocation cost this avoids.
     pub fn axis_key(&self) -> Option<TagKey> {
         match self {
             Self::AxisPresent { axis, key } | Self::AxisValue { axis, key, .. } => {
                 Some(TagKey::new(*axis, key.clone()))
+            }
+            Self::Reserved { .. } | Self::Legacy(_) => None,
+        }
+    }
+
+    /// Borrowing counterpart to [`Self::axis_key`] — returns
+    /// `(axis, &key)` without cloning the key string. Prefer this in
+    /// iteration / predicate hot paths; the cloning variant is only
+    /// worth it when the caller actually needs an owned `TagKey`
+    /// (e.g. collecting into a `HashSet<TagKey>` for diff).
+    pub fn axis_key_ref(&self) -> Option<(TaxonomyAxis, &str)> {
+        match self {
+            Self::AxisPresent { axis, key } | Self::AxisValue { axis, key, .. } => {
+                Some((*axis, key.as_str()))
             }
             Self::Reserved { .. } | Self::Legacy(_) => None,
         }

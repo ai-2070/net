@@ -165,7 +165,7 @@ fn axis_value(key: &str, value: &str) -> Tag {
 
 /// Lowercase string form of a `GpuVendor` for tag emission. Inverse
 /// of [`gpu_vendor_from_str`].
-fn gpu_vendor_str(v: GpuVendor) -> &'static str {
+pub(crate) fn gpu_vendor_str(v: GpuVendor) -> &'static str {
     match v {
         GpuVendor::Unknown => "unknown",
         GpuVendor::Nvidia => "nvidia",
@@ -206,12 +206,14 @@ pub fn hardware_from_tags(tags: &[Tag]) -> HardwareCapabilities {
     let mut gpu: Option<GpuInfo> = None;
 
     for tag in tags {
-        let Some(key) = tag.axis_key() else { continue };
-        if key.axis != TaxonomyAxis::Hardware {
+        let Some((axis, key)) = tag.axis_key_ref() else {
+            continue;
+        };
+        if axis != TaxonomyAxis::Hardware {
             continue;
         }
         let value = tag.value().unwrap_or("");
-        match key.key.as_str() {
+        match key {
             "cpu_cores" => {
                 hw.cpu_cores = value.parse().unwrap_or(0);
             }
@@ -348,12 +350,14 @@ pub fn software_from_tags(tags: &[Tag]) -> SoftwareCapabilities {
     let mut sw = SoftwareCapabilities::new();
 
     for tag in tags {
-        let Some(key) = tag.axis_key() else { continue };
-        if key.axis != TaxonomyAxis::Software {
+        let Some((axis, key)) = tag.axis_key_ref() else {
+            continue;
+        };
+        if axis != TaxonomyAxis::Software {
             continue;
         }
         let value = tag.value().unwrap_or("");
-        match key.key.as_str() {
+        match key {
             "os" => sw.os = value.to_string(),
             "os_version" => sw.os_version = value.to_string(),
             "cuda_version" => sw.cuda_version = Some(value.to_string()),
@@ -462,11 +466,13 @@ pub fn resource_limits_from_tags(tags: &[Tag]) -> ResourceLimits {
     let mut limits = ResourceLimits::new();
 
     for tag in tags {
-        let Some(key) = tag.axis_key() else { continue };
-        if key.axis != TaxonomyAxis::Hardware {
+        let Some((axis, key)) = tag.axis_key_ref() else {
+            continue;
+        };
+        if axis != TaxonomyAxis::Hardware {
             continue;
         }
-        let Some(sub) = key.key.strip_prefix("limits.") else {
+        let Some(sub) = key.strip_prefix("limits.") else {
             continue;
         };
         let value = tag.value().unwrap_or("");
@@ -589,11 +595,13 @@ pub fn models_from_tags(tags: &[Tag]) -> Vec<ModelCapability> {
     // ModelCapability at each index in one pass.
     let mut by_index: BTreeMap<u32, ModelFields> = BTreeMap::new();
     for tag in tags {
-        let Some(key) = tag.axis_key() else { continue };
-        if key.axis != TaxonomyAxis::Software {
+        let Some((axis, key)) = tag.axis_key_ref() else {
+            continue;
+        };
+        if axis != TaxonomyAxis::Software {
             continue;
         }
-        let Some(rest) = key.key.strip_prefix("model.") else {
+        let Some(rest) = key.strip_prefix("model.") else {
             continue;
         };
         let Some((idx_str, sub)) = rest.split_once('.') else {
@@ -759,11 +767,13 @@ pub fn tools_to_tags(tools: &[ToolCapability]) -> Vec<Tag> {
 pub fn tools_from_tags(tags: &[Tag]) -> Vec<ToolCapability> {
     let mut by_index: BTreeMap<u32, ToolFields> = BTreeMap::new();
     for tag in tags {
-        let Some(key) = tag.axis_key() else { continue };
-        if key.axis != TaxonomyAxis::Software {
+        let Some((axis, key)) = tag.axis_key_ref() else {
+            continue;
+        };
+        if axis != TaxonomyAxis::Software {
             continue;
         }
-        let Some(rest) = key.key.strip_prefix("tool.") else {
+        let Some(rest) = key.strip_prefix("tool.") else {
             continue;
         };
         let Some((idx_str, sub)) = rest.split_once('.') else {
@@ -913,22 +923,19 @@ pub fn capability_set_from_tag_set(tags: &HashSet<Tag>) -> CapabilitySet {
 /// (cpu / memory / gpu / storage / network / accelerators), excluding
 /// `hardware.limits.*` which is owned by `ResourceLimits`.
 pub fn is_hardware_owned_tag(tag: &Tag) -> bool {
-    let Some(key) = tag.axis_key() else {
+    let Some((axis, key)) = tag.axis_key_ref() else {
         return false;
     };
-    if key.axis != TaxonomyAxis::Hardware {
-        return false;
-    }
-    !key.key.starts_with("limits.")
+    axis == TaxonomyAxis::Hardware && !key.starts_with("limits.")
 }
 
 /// True if `tag` is a `hardware.limits.*` tag owned by
 /// `ResourceLimits`.
 pub fn is_resource_limits_owned_tag(tag: &Tag) -> bool {
-    let Some(key) = tag.axis_key() else {
+    let Some((axis, key)) = tag.axis_key_ref() else {
         return false;
     };
-    key.axis == TaxonomyAxis::Hardware && key.key.starts_with("limits.")
+    axis == TaxonomyAxis::Hardware && key.starts_with("limits.")
 }
 
 /// True if `tag` is a `software.*` tag owned by `SoftwareCapabilities`
@@ -936,31 +943,28 @@ pub fn is_resource_limits_owned_tag(tag: &Tag) -> bool {
 /// `software.model.*` and `software.tool.*` indexed sub-keys owned
 /// by `Vec<ModelCapability>` and `Vec<ToolCapability>`.
 pub fn is_software_owned_tag(tag: &Tag) -> bool {
-    let Some(key) = tag.axis_key() else {
+    let Some((axis, key)) = tag.axis_key_ref() else {
         return false;
     };
-    if key.axis != TaxonomyAxis::Software {
-        return false;
-    }
-    !key.key.starts_with("model.") && !key.key.starts_with("tool.")
+    axis == TaxonomyAxis::Software && !key.starts_with("model.") && !key.starts_with("tool.")
 }
 
 /// True if `tag` is a `software.model.*` tag owned by
 /// `Vec<ModelCapability>`.
 pub fn is_models_owned_tag(tag: &Tag) -> bool {
-    let Some(key) = tag.axis_key() else {
+    let Some((axis, key)) = tag.axis_key_ref() else {
         return false;
     };
-    key.axis == TaxonomyAxis::Software && key.key.starts_with("model.")
+    axis == TaxonomyAxis::Software && key.starts_with("model.")
 }
 
 /// True if `tag` is a `software.tool.*` tag owned by
 /// `Vec<ToolCapability>`.
 pub fn is_tools_owned_tag(tag: &Tag) -> bool {
-    let Some(key) = tag.axis_key() else {
+    let Some((axis, key)) = tag.axis_key_ref() else {
         return false;
     };
-    key.axis == TaxonomyAxis::Software && key.key.starts_with("tool.")
+    axis == TaxonomyAxis::Software && key.starts_with("tool.")
 }
 
 // =============================================================================

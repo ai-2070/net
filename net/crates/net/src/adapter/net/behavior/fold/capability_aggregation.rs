@@ -278,16 +278,12 @@ impl CompiledMatcher<'_> {
         match self {
             Self::Exact { value } => raw == *value,
             Self::Prefix { value } => raw.starts_with(value),
-            Self::Axis { axis } => {
-                Tag::parse(raw)
-                    .ok()
-                    .and_then(|t| t.axis_key().map(|k| k.axis))
-                    == Some(*axis)
-            }
-            Self::AxisKey { axis, key } => Tag::parse(raw)
+            Self::Axis { axis } => Tag::parse(raw)
                 .ok()
-                .and_then(|t| t.axis_key())
-                .is_some_and(|k| k.axis == *axis && k.key == *key),
+                .is_some_and(|t| t.axis_key_ref().map(|(a, _)| a) == Some(*axis)),
+            Self::AxisKey { axis, key } => Tag::parse(raw).ok().is_some_and(
+                |t| matches!(t.axis_key_ref(), Some((a, k)) if a == *axis && k == *key),
+            ),
             #[cfg(feature = "regex")]
             Self::Regex { re } => re.as_ref().is_some_and(|r| r.is_match(raw)),
             Self::VersionRange {

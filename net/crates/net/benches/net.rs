@@ -2042,6 +2042,25 @@ fn bench_capability_set(c: &mut Criterion) {
         });
     });
 
+    // Compact (postcard) codec — same semantics as serialize /
+    // deserialize / roundtrip above but through `to_bytes_compact`.
+    // Lets the audit doc compare JSON vs compact side-by-side.
+    group.bench_function("serialize_compact", |b| {
+        b.iter(|| caps.to_bytes_compact());
+    });
+
+    let compact_bytes = caps.to_bytes_compact();
+    group.bench_function("deserialize_compact", |b| {
+        b.iter(|| CapabilitySet::from_bytes(&compact_bytes));
+    });
+
+    group.bench_function("roundtrip_compact", |b| {
+        b.iter(|| {
+            let bytes = caps.to_bytes_compact();
+            CapabilitySet::from_bytes(&bytes)
+        });
+    });
+
     // Test has_* methods
     group.bench_function("has_tag", |b| {
         b.iter(|| caps.has_tag("inference"));
