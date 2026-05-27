@@ -140,6 +140,11 @@ export interface RawMeshRpc {
     request: Buffer,
     opts?: CallOptions,
   ): Promise<RawRpcStream>
+  callServiceStreaming(
+    service: string,
+    request: Buffer,
+    opts?: CallOptions,
+  ): Promise<RawRpcStream>
   /**
    * Open a client-streaming call. Returns a `RawClientStreamCall`
    * — push chunks via `send`, then `finish` to await the terminal
@@ -625,6 +630,24 @@ export class TypedMeshRpc {
       reqBuf,
       opts,
     )
+    return new TypedRpcStream<Resp>(inner)
+  }
+
+  /**
+   * Capability-routed typed streaming call. Mirrors `callService`
+   * for target resolution + cap-auth gate; mirrors `callStreaming`
+   * for the chunk-iterator return shape.
+   *
+   * Use this for streaming tool invocations: `callToolStreaming`
+   * builds on top.
+   */
+  async callServiceStreaming<Req = unknown, Resp = unknown>(
+    service: string,
+    req: Req,
+    opts?: CallOptions,
+  ): Promise<TypedRpcStream<Resp>> {
+    const reqBuf = jsonEncode(req)
+    const inner = await this._raw.callServiceStreaming(service, reqBuf, opts)
     return new TypedRpcStream<Resp>(inner)
   }
 

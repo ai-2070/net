@@ -322,6 +322,54 @@ export async function callTool<Req = unknown, Resp = unknown>(
 }
 
 /**
+ * Capability-routed streaming tool invocation. Returns an
+ * `AsyncIterable<ToolEvent>` — drain via `for await (...)` until
+ * the stream terminates. The substrate routes the call via the
+ * cap-auth gate just like `callService`; the iterator yields each
+ * JSON-decoded `ToolEvent` envelope.
+ *
+ * Synthesizes a terminal `error` event with code
+ * `missing_terminal` if the stream ends without a `result` /
+ * `error` envelope — matches the Rust SDK's `serve_tool_streaming`
+ * contract and the T-2 cross-language fixture.
+ *
+ * Cancel mid-stream by aborting `opts.signal` (wired through the
+ * substrate's cancel-registry on the underlying RpcStream).
+ */
+export async function* callToolStreaming<Req = unknown>(
+  rpc: TypedMeshRpc,
+  toolId: string,
+  req: Req,
+  opts?: CallOptions,
+): AsyncGenerator<ToolEvent, void, void> {
+  const stream = await rpc.callServiceStreaming<Req, ToolEvent>(
+    toolId,
+    req,
+    opts,
+  )
+  let sawTerminal = false
+  try {
+    for await (const event of stream) {
+      yield event
+      if (isTerminalEvent(event)) {
+        sawTerminal = true
+      }
+    }
+  } finally {
+    await stream.close().catch(() => {})
+  }
+  if (!sawTerminal) {
+    const synthesized: ToolEventError = {
+      type: 'error',
+      code: 'missing_terminal',
+      message:
+        'tool stream ended without a terminal result or error envelope',
+    }
+    yield synthesized
+  }
+}
+
+/**
  * Merge tool descriptors into a `CapabilitySetJs` so the next
  * `mesh.announceCapabilities(caps)` carries:
  *

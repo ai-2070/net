@@ -1705,6 +1705,39 @@ impl MeshRpc {
         })
     }
 
+    /// Capability-routed streaming call. Resolves `service`
+    /// against the local capability index (`nrpc:<service>` tags),
+    /// applies the routing policy + cap-auth gate that
+    /// `callService` enforces, then opens the streaming call.
+    ///
+    /// Use this — not `callStreaming` — for any streaming tool
+    /// invocation (`callToolStreaming`) so the cap-auth gate is
+    /// honored. Returns an [`RpcStream`] with the same drain /
+    /// cancel semantics as `callStreaming`.
+    #[napi]
+    pub async fn call_service_streaming(
+        &self,
+        service: String,
+        request: Buffer,
+        opts: Option<CallOptions>,
+    ) -> Result<RpcStream> {
+        let opts = opts.unwrap_or_default().into_inner();
+        let inner = self
+            .node
+            .call_service_streaming(
+                &service,
+                Bytes::copy_from_slice(request.as_ref()),
+                opts,
+            )
+            .await
+            .map_err(nrpc_err_from_inner)?;
+        let flow_controlled_cached = inner.flow_controlled();
+        Ok(RpcStream {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(inner))),
+            flow_controlled_cached,
+        })
+    }
+
     // ---- ABI 0x0002 client-streaming + duplex callers (B9-1) ----
 
     /// Open a client-streaming call. Push chunks via
