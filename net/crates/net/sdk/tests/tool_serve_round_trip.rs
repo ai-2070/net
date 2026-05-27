@@ -521,6 +521,125 @@ async fn serve_tool_streaming_forces_streaming_flag_on_descriptor() {
     );
 }
 
+// ============================================================================
+// A-6 — call_tool + call_tool_streaming (capability-routed)
+// ============================================================================
+
+#[tokio::test]
+async fn call_tool_routes_via_capability_index() {
+    let (caller, host, host_addr) = build_pair().await;
+    handshake(&caller, &host, host_addr).await;
+
+    let descriptor = metadata_for::<WebSearchReq, WebSearchResp>("web_search").build();
+    let _handle = host
+        .serve_tool::<WebSearchReq, WebSearchResp, _, _>(descriptor, |req| async move {
+            Ok(WebSearchResp {
+                results: vec![format!("hit:{}", req.query)],
+            })
+        })
+        .expect("serve_tool");
+
+    host.announce_capabilities(SdkCapabilitySet::new())
+        .await
+        .expect("announce");
+
+    // Wait for the capability index to surface the host under
+    // `nrpc:web_search` so `call_service` can route.
+    let svc_filter = CapabilityFilter::default().require_tag("nrpc:web_search");
+    assert!(
+        wait_until(
+            || caller
+                .inner()
+                .find_nodes_by_filter(&svc_filter)
+                .contains(&host.inner().node_id()),
+            Duration::from_secs(3),
+        )
+        .await,
+        "caller must see host as nrpc:web_search server",
+    );
+
+    let resp: WebSearchResp = caller
+        .call_tool("web_search", &WebSearchReq { query: "mesh".into() })
+        .await
+        .expect("call_tool succeeds");
+    assert_eq!(resp.results, vec!["hit:mesh".to_string()]);
+}
+
+#[tokio::test]
+async fn call_tool_streaming_collects_envelopes_in_order() {
+    let (caller, host, host_addr) = build_pair().await;
+    handshake(&caller, &host, host_addr).await;
+
+    let descriptor = metadata_for::<WebSearchReq, WebSearchResp>("search_stream").build();
+    let _handle = host
+        .serve_tool_streaming::<WebSearchReq, _, _, _>(descriptor, |req| async move {
+            futures::stream::iter(vec![
+                ToolEvent::Start {
+                    tool_id: "search_stream".into(),
+                    call_id: None,
+                    metadata: None,
+                },
+                ToolEvent::Progress {
+                    pct: Some(50.0),
+                    message: None,
+                },
+                ToolEvent::Delta {
+                    data: serde_json::json!({ "token": "partial " }),
+                },
+                ToolEvent::Result {
+                    data: serde_json::json!({ "results": [format!("hit for {}", req.query)] }),
+                },
+            ])
+        })
+        .expect("serve_tool_streaming");
+
+    host.announce_capabilities(SdkCapabilitySet::new())
+        .await
+        .expect("announce");
+
+    let svc_filter = CapabilityFilter::default().require_tag("nrpc:search_stream");
+    assert!(
+        wait_until(
+            || caller
+                .inner()
+                .find_nodes_by_filter(&svc_filter)
+                .contains(&host.inner().node_id()),
+            Duration::from_secs(3),
+        )
+        .await,
+        "caller must see search_stream advertised",
+    );
+
+    let stream = caller
+        .call_tool_streaming("search_stream", &WebSearchReq { query: "mesh".into() })
+        .await
+        .expect("call_tool_streaming");
+    let events: Vec<ToolEvent> = stream
+        .map(|item| item.expect("stream chunk"))
+        .collect()
+        .await;
+    assert_eq!(events.len(), 4, "expected 4 events, got {events:?}");
+    assert!(matches!(events[0], ToolEvent::Start { .. }));
+    assert!(matches!(events[1], ToolEvent::Progress { .. }));
+    assert!(matches!(events[2], ToolEvent::Delta { .. }));
+    assert!(matches!(events.last(), Some(ToolEvent::Result { .. })));
+}
+
+#[tokio::test]
+async fn call_tool_returns_no_route_when_no_server() {
+    let (caller, _host, _addr) = build_pair().await;
+    // No serve_tool on host — `nrpc:nonexistent_tool` never lands in
+    // any fold.
+    let err: Result<WebSearchResp, _> = caller
+        .call_tool("nonexistent_tool", &WebSearchReq { query: "x".into() })
+        .await;
+    match err {
+        Err(net_sdk::mesh_rpc::RpcError::NoRoute { .. }) => {}
+        Ok(_) => panic!("expected NoRoute"),
+        Err(other) => panic!("expected NoRoute, got {other:?}"),
+    }
+}
+
 // Tiny suppressor so the `CapabilitySet` import from
 // `net::behavior` doesn't trigger an unused-import warning if
 // future test changes drop the reference. Cheap to keep around;

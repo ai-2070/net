@@ -438,6 +438,79 @@ impl Mesh {
         })
     }
 
+    /// Capability-routed unary tool call. Encodes `request` as JSON,
+    /// resolves a target node from `nrpc:<tool_id>` in the local
+    /// capability fold (via [`net::adapter::net::MeshNode::call_service`]),
+    /// awaits the typed `Resp`.
+    ///
+    /// Codec is JSON unconditionally — every AI provider (OpenAI,
+    /// Anthropic, Gemini, MCP) consumes JSON for tool input/output,
+    /// so the substrate enforces one codec for the whole tool surface.
+    /// Adapters can lower descriptors and dispatched calls without
+    /// per-tool codec negotiation.
+    ///
+    /// Returns `RpcError::NoRoute` if no host currently serves the
+    /// tool. Bubbles handler errors as `RpcError::ServerError` with
+    /// status `NRPC_TYPED_HANDLER_ERROR` carrying the handler's
+    /// error message.
+    pub async fn call_tool<Req, Resp>(
+        &self,
+        tool_id: &str,
+        request: &Req,
+    ) -> std::result::Result<Resp, crate::mesh_rpc::RpcError>
+    where
+        Req: serde::Serialize,
+        Resp: serde::de::DeserializeOwned,
+    {
+        self.call_service_typed::<Req, Resp>(
+            tool_id,
+            request,
+            crate::mesh_rpc::CallOptionsTyped {
+                raw: Default::default(),
+                codec: Codec::Json,
+            },
+        )
+        .await
+    }
+
+    /// Capability-routed streaming tool call. Encodes `request` as
+    /// JSON, opens a streaming call against `nrpc:<tool_id>` via
+    /// the substrate's `call_service_streaming` (S-1), returns an
+    /// [`crate::mesh_rpc::RpcStreamTyped<ToolEvent>`] that decodes
+    /// each chunk as a [`ToolEvent`].
+    ///
+    /// Stream lifecycle:
+    /// - Server emits zero or more `Start` / `Progress` / `Delta`
+    ///   envelopes, then exactly one terminal `Result` or `Error`.
+    ///   The SDK does NOT enforce this contract on the caller side
+    ///   — it surfaces the wire events verbatim. Adapters
+    ///   (`formats/anthropic`, `formats/openai`, etc.) own the
+    ///   contract enforcement.
+    /// - If the handler ends without a terminal event, the server-
+    ///   side wrapper synthesizes
+    ///   `ToolEvent::Error { code: "missing_terminal", ... }` — see
+    ///   [`Self::serve_tool_streaming`].
+    /// - Dropping the returned stream emits CANCEL to the server
+    ///   (substrate cancel-token contract).
+    pub async fn call_tool_streaming<Req>(
+        &self,
+        tool_id: &str,
+        request: &Req,
+    ) -> std::result::Result<crate::mesh_rpc::RpcStreamTyped<ToolEvent>, crate::mesh_rpc::RpcError>
+    where
+        Req: serde::Serialize,
+    {
+        self.call_service_streaming_typed::<Req, ToolEvent>(
+            tool_id,
+            request,
+            crate::mesh_rpc::CallOptionsTyped {
+                raw: Default::default(),
+                codec: Codec::Json,
+            },
+        )
+        .await
+    }
+
     /// Walk the capability fold for every published AI tool and
     /// return one [`ToolDescriptor`] per (tool_id, version) with
     /// `node_count` filled in. One in-memory pass; no network.
