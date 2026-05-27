@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md
+  s_c61e36cbdb3bc0::t_db7508282ea071 1-113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "fc3b2ec3e7e4d5f647f261c7bc27e704a911abaa",
+  "prompts": {},
+  "sessions": {
+    "s_c61e36cbdb3bc0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5fc67c78-387a-45c1-bc03-be78dc0c2b85",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
