@@ -330,6 +330,110 @@ impl Mesh {
         })
     }
 
+    /// Streaming variant of [`Self::serve_tool`]. The handler
+    /// returns a [`futures::Stream`] of [`ToolEvent`]s; the SDK
+    /// serializes each item as one JSON-encoded chunk on the
+    /// underlying `serve_rpc_streaming_typed` path.
+    ///
+    /// Contract for handlers:
+    ///
+    /// - Emit one terminal event ([`ToolEvent::Result`] or
+    ///   [`ToolEvent::Error`]) to close the stream cleanly. The SDK
+    ///   stops driving the user's stream the moment a terminal
+    ///   event is emitted — any items the handler tries to yield
+    ///   after a terminal are not transmitted.
+    /// - If the stream ends without a terminal event, the SDK
+    ///   synthesizes [`ToolEvent::Error`] with
+    ///   `code = "missing_terminal"` so callers can rely on every
+    ///   stream ending with a terminal envelope.
+    ///
+    /// `descriptor.streaming` is forced to `true` on registration —
+    /// the `tool::<id>::streaming` metadata key emitted by the
+    /// announce merge (A-2a) reflects the actual register path the
+    /// host took, not the value the caller built into the
+    /// descriptor.
+    ///
+    /// Atomicity, Drop-reverses, and lazy `tool.metadata.fetch`
+    /// install all behave the same as [`Self::serve_tool`].
+    pub fn serve_tool_streaming<Req, F, Fut, St>(
+        &self,
+        mut descriptor: ToolDescriptor,
+        handler: F,
+    ) -> std::result::Result<ToolServeHandle, ServeError>
+    where
+        Req: DeserializeOwned + Send + Sync + 'static,
+        F: Fn(Req) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = St> + Send + 'static,
+        St: futures::Stream<Item = ToolEvent> + Send + 'static,
+    {
+        // Force the streaming flag on so announces reflect reality
+        // even if the caller forgot `.streaming(true)` on the builder.
+        descriptor.streaming = true;
+        let tool_id = descriptor.tool_id.clone();
+        let registry = self.inner().tool_registry().clone();
+
+        // Step 1: registry insert (same paired-remove rollback on
+        // failure as `serve_tool`).
+        let prior = registry.insert(descriptor);
+        if let Some(prior) = prior {
+            registry.insert(prior);
+            return Err(ServeError::AlreadyServing(tool_id));
+        }
+
+        // Step 2: typed-streaming handler register. We drive the
+        // user's stream and emit each `ToolEvent` as one chunk via
+        // the typed sink. Terminal events stop the loop; if the
+        // stream ends without one, synthesize a `missing_terminal`
+        // `Error`.
+        let handler = Arc::new(handler);
+        let inner = match self
+            .serve_rpc_streaming_typed::<Req, ToolEvent, _, _>(&tool_id, Codec::Json, move |req, sink| {
+                let handler = handler.clone();
+                async move {
+                    use futures::StreamExt;
+                    let stream = handler(req).await;
+                    futures::pin_mut!(stream);
+                    let mut seen_terminal = false;
+                    while let Some(event) = stream.next().await {
+                        let terminal = event.is_terminal();
+                        sink.send(&event)
+                            .map_err(|e| format!("tool event send: {e}"))?;
+                        if terminal {
+                            seen_terminal = true;
+                            break;
+                        }
+                    }
+                    if !seen_terminal {
+                        let synthesized = ToolEvent::Error {
+                            code: "missing_terminal".to_string(),
+                            message:
+                                "tool handler ended its stream without emitting a terminal Result or Error event"
+                                    .to_string(),
+                            details: None,
+                        };
+                        sink.send(&synthesized)
+                            .map_err(|e| format!("synthesized terminal send: {e}"))?;
+                    }
+                    Ok(())
+                }
+            }) {
+            Ok(h) => h,
+            Err(e) => {
+                registry.remove(&tool_id);
+                return Err(e);
+            }
+        };
+
+        // Step 3: lazy auto-install of `tool.metadata.fetch`.
+        self.ensure_tool_metadata_fetch_installed();
+
+        Ok(ToolServeHandle {
+            inner,
+            registry,
+            tool_id,
+        })
+    }
+
     /// Idempotent — installs the `tool.metadata.fetch` nRPC
     /// service handler if not yet present. Holds a `parking_lot`
     /// mutex; the first caller through wins, the rest see

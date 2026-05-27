@@ -24,12 +24,15 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use futures::StreamExt;
+
 use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use net_sdk::capabilities::CapabilitySet as SdkCapabilitySet;
 use net_sdk::mesh::{Mesh, MeshBuilder};
 use net_sdk::mesh_rpc::{CallOptionsTyped, Codec};
 use net_sdk::tool::{
-    metadata_for, ToolMetadataRequest, ToolMetadataResponse, TOOL_METADATA_FETCH_SERVICE,
+    metadata_for, ToolEvent, ToolMetadataRequest, ToolMetadataResponse,
+    TOOL_METADATA_FETCH_SERVICE,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -312,6 +315,210 @@ async fn serve_tool_rejects_duplicate_tool_id() {
     // The original handle's registry entry is still there — the
     // duplicate-rejection path doesn't disturb prior state.
     assert!(mesh.inner().tool_registry().get("web_search").is_some());
+}
+
+// ============================================================================
+// A-3 — serve_tool_streaming round-trip tests
+// ============================================================================
+
+#[tokio::test]
+async fn serve_tool_streaming_round_trip_emits_events_in_order() {
+    let (caller, host, host_addr) = build_pair().await;
+    handshake(&caller, &host, host_addr).await;
+
+    let descriptor = metadata_for::<WebSearchReq, WebSearchResp>("web_search_stream")
+        .description("Streaming search.")
+        .build();
+    let _handle = host
+        .serve_tool_streaming::<WebSearchReq, _, _, _>(descriptor, |req| async move {
+            futures::stream::iter(vec![
+                ToolEvent::Start {
+                    tool_id: "web_search_stream".into(),
+                    call_id: None,
+                    metadata: None,
+                },
+                ToolEvent::Progress {
+                    pct: Some(50.0),
+                    message: Some(format!("searching for {}", req.query)),
+                },
+                ToolEvent::Delta {
+                    data: serde_json::json!({ "token": "partial " }),
+                },
+                ToolEvent::Result {
+                    data: serde_json::json!({ "results": [format!("hit for {}", req.query)] }),
+                },
+            ])
+        })
+        .expect("serve_tool_streaming");
+
+    host.announce_capabilities(SdkCapabilitySet::new())
+        .await
+        .expect("announce");
+
+    let tool_filter = CapabilityFilter::default().require_tag("ai-tool:web_search_stream");
+    assert!(
+        wait_until(
+            || caller
+                .inner()
+                .find_nodes_by_filter(&tool_filter)
+                .contains(&host.inner().node_id()),
+            Duration::from_secs(3),
+        )
+        .await,
+        "caller must see streaming tool tag",
+    );
+
+    let stream = caller
+        .call_streaming_typed::<WebSearchReq, ToolEvent>(
+            host.inner().node_id(),
+            "web_search_stream",
+            &WebSearchReq {
+                query: "mesh".into(),
+            },
+            CallOptionsTyped {
+                raw: Default::default(),
+                codec: Codec::Json,
+            },
+        )
+        .await
+        .expect("call_streaming_typed");
+
+    let events: Vec<ToolEvent> = stream
+        .map(|item| item.expect("stream chunk"))
+        .collect()
+        .await;
+
+    assert_eq!(events.len(), 4, "expected 4 events; got {events:?}");
+    match &events[0] {
+        ToolEvent::Start { tool_id, .. } => assert_eq!(tool_id, "web_search_stream"),
+        other => panic!("event[0] must be Start, got {other:?}"),
+    }
+    match &events[1] {
+        ToolEvent::Progress { pct, .. } => assert_eq!(*pct, Some(50.0)),
+        other => panic!("event[1] must be Progress, got {other:?}"),
+    }
+    match &events[2] {
+        ToolEvent::Delta { data } => {
+            assert_eq!(data.get("token").and_then(|v| v.as_str()), Some("partial "));
+        }
+        other => panic!("event[2] must be Delta, got {other:?}"),
+    }
+    match &events[3] {
+        ToolEvent::Result { data } => {
+            let arr = data.get("results").and_then(|v| v.as_array()).expect("results");
+            assert_eq!(arr.len(), 1);
+            assert_eq!(arr[0].as_str(), Some("hit for mesh"));
+        }
+        other => panic!("event[3] must be Result, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn serve_tool_streaming_synthesizes_missing_terminal_when_handler_omits_one() {
+    let (caller, host, host_addr) = build_pair().await;
+    handshake(&caller, &host, host_addr).await;
+
+    // Handler emits Start + Progress + Delta then ends — no
+    // Result / Error. The SDK must synthesize an Error with
+    // `code = "missing_terminal"`.
+    let descriptor = metadata_for::<WebSearchReq, WebSearchResp>("forgetful").build();
+    let _handle = host
+        .serve_tool_streaming::<WebSearchReq, _, _, _>(descriptor, |_req| async move {
+            futures::stream::iter(vec![
+                ToolEvent::Start {
+                    tool_id: "forgetful".into(),
+                    call_id: None,
+                    metadata: None,
+                },
+                ToolEvent::Progress {
+                    pct: Some(10.0),
+                    message: None,
+                },
+                ToolEvent::Delta {
+                    data: serde_json::json!({ "token": "x" }),
+                },
+            ])
+        })
+        .expect("serve_tool_streaming");
+
+    host.announce_capabilities(SdkCapabilitySet::new())
+        .await
+        .expect("announce");
+
+    let tool_filter = CapabilityFilter::default().require_tag("ai-tool:forgetful");
+    assert!(
+        wait_until(
+            || caller
+                .inner()
+                .find_nodes_by_filter(&tool_filter)
+                .contains(&host.inner().node_id()),
+            Duration::from_secs(3),
+        )
+        .await,
+        "caller must see forgetful tool tag",
+    );
+
+    let stream = caller
+        .call_streaming_typed::<WebSearchReq, ToolEvent>(
+            host.inner().node_id(),
+            "forgetful",
+            &WebSearchReq {
+                query: "x".into(),
+            },
+            CallOptionsTyped {
+                raw: Default::default(),
+                codec: Codec::Json,
+            },
+        )
+        .await
+        .expect("call_streaming_typed");
+
+    let events: Vec<ToolEvent> = stream
+        .map(|item| item.expect("stream chunk"))
+        .collect()
+        .await;
+
+    assert_eq!(events.len(), 4, "expected 3 user events + 1 synthesized; got {events:?}");
+    match events.last().expect("synthesized terminal") {
+        ToolEvent::Error { code, .. } => {
+            assert_eq!(code, "missing_terminal");
+        }
+        other => panic!("last event must be synthesized Error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn serve_tool_streaming_forces_streaming_flag_on_descriptor() {
+    let mesh = MeshBuilder::new("127.0.0.1:0", &PSK)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    // Build a descriptor that DIDN'T set streaming=true.
+    let descriptor = metadata_for::<WebSearchReq, WebSearchResp>("forced_streaming")
+        .build();
+    assert!(!descriptor.streaming, "builder default must be false");
+
+    let _handle = mesh
+        .serve_tool_streaming::<WebSearchReq, _, _, _>(descriptor, |_req| async move {
+            futures::stream::iter(vec![ToolEvent::Result {
+                data: serde_json::json!({}),
+            }])
+        })
+        .expect("serve_tool_streaming");
+
+    // Registry entry must have streaming=true even though the
+    // caller forgot to set it on the descriptor.
+    let registered = mesh
+        .inner()
+        .tool_registry()
+        .get("forced_streaming")
+        .expect("registry entry");
+    assert!(
+        registered.streaming,
+        "serve_tool_streaming must force streaming=true",
+    );
 }
 
 // Tiny suppressor so the `CapabilitySet` import from
