@@ -420,7 +420,7 @@ func TestDiffToolIndexVersionsAreDistinctKeys(t *testing.T) {
 	if len(changes) != 1 {
 		t.Fatalf("expected 1 change (the v2 addition), got %d: %#v", len(changes), changes)
 	}
-	if changes[0].Type != "added" || changes[0].Version != "2.0.0" {
+	if changes[0].Type != "added" || changes[0].Descriptor.Version != "2.0.0" {
 		t.Errorf("expected v2 addition, got %#v", changes[0])
 	}
 }
@@ -437,13 +437,13 @@ func TestDiffToolIndexDeterministicOrdering(t *testing.T) {
 		t.Fatalf("expected 3 changes, got %d: %#v", len(changes), changes)
 	}
 	// Added group sorts a_new before b_new; remove group comes last.
-	if changes[0].ToolID != "a_new" || changes[0].Type != "added" {
+	if changes[0].Descriptor.ToolID != "a_new" || changes[0].Type != "added" {
 		t.Errorf("first change should be added/a_new: %#v", changes[0])
 	}
-	if changes[1].ToolID != "b_new" || changes[1].Type != "added" {
+	if changes[1].Descriptor.ToolID != "b_new" || changes[1].Type != "added" {
 		t.Errorf("second change should be added/b_new: %#v", changes[1])
 	}
-	if changes[2].ToolID != "z_old" || changes[2].Type != "removed" {
+	if changes[2].Descriptor.ToolID != "z_old" || changes[2].Type != "removed" {
 		t.Errorf("third change should be removed/z_old: %#v", changes[2])
 	}
 }
