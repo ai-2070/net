@@ -2071,9 +2071,7 @@ impl MeshNode {
             #[cfg(feature = "cortex")]
             rpc_local_services: Arc::new(dashmap::DashSet::new()),
             #[cfg(feature = "tool")]
-            tool_registry: Arc::new(
-                crate::adapter::net::cortex::tool::ToolMetadataRegistry::new(),
-            ),
+            tool_registry: Arc::new(crate::adapter::net::cortex::tool::ToolMetadataRegistry::new()),
             #[cfg(feature = "cortex")]
             rpc_metrics: Arc::new(crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry::new()),
             #[cfg(feature = "cortex")]
@@ -5355,9 +5353,7 @@ impl MeshNode {
     /// `tool.metadata.fetch` RPC handler (A-2b) which answers
     /// "what's the full schema for tool X on this node?".
     #[cfg(feature = "tool")]
-    pub fn tool_registry(
-        &self,
-    ) -> &Arc<crate::adapter::net::cortex::tool::ToolMetadataRegistry> {
+    pub fn tool_registry(&self) -> &Arc<crate::adapter::net::cortex::tool::ToolMetadataRegistry> {
         &self.tool_registry
     }
 
@@ -5495,11 +5491,7 @@ impl MeshNode {
         // (re-rendering UI, comparing snapshots) should see the same
         // shape from one call to the next when the underlying fold
         // hasn't changed.
-        out.sort_by(|a, b| {
-            a.tool_id
-                .cmp(&b.tool_id)
-                .then(a.version.cmp(&b.version))
-        });
+        out.sort_by(|a, b| a.tool_id.cmp(&b.tool_id).then(a.version.cmp(&b.version)));
         out
     }
 
@@ -5538,8 +5530,8 @@ impl MeshNode {
         matcher: Option<super::behavior::fold::capability_aggregation::TagMatcher>,
         interval: Option<Duration>,
     ) -> crate::adapter::net::cortex::tool::ToolListWatch {
-        use std::collections::HashMap;
         use crate::adapter::net::cortex::tool::{ToolDescriptor, ToolListChange, ToolListWatch};
+        use std::collections::HashMap;
         let interval = interval.unwrap_or_else(|| Duration::from_secs(1));
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ToolListChange>();
         // Take the initial baseline snapshot SYNCHRONOUSLY before
@@ -8142,10 +8134,8 @@ impl MeshNode {
                 // schemas already use). Pre-tool peers receive these
                 // keys and ignore them — no wire-breaking change.
                 if let Some(ref desc) = descriptor.description {
-                    merged = merged.with_metadata(
-                        description_metadata_key(&descriptor.tool_id),
-                        desc.clone(),
-                    );
+                    merged = merged
+                        .with_metadata(description_metadata_key(&descriptor.tool_id), desc.clone());
                 }
                 if descriptor.streaming {
                     merged = merged.with_metadata(

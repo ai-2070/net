@@ -350,8 +350,7 @@ pub struct Mesh {
     /// separate file but the same crate — can reach this slot
     /// without an accessor stub.
     #[cfg(feature = "tool")]
-    pub(crate) tool_metadata_fetch:
-        Arc<parking_lot::Mutex<Option<crate::mesh_rpc::ServeHandle>>>,
+    pub(crate) tool_metadata_fetch: Arc<parking_lot::Mutex<Option<crate::mesh_rpc::ServeHandle>>>,
 }
 
 impl Mesh {

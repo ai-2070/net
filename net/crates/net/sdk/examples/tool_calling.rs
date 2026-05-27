@@ -58,7 +58,7 @@ struct WebSearchResp {
     description = "Search the web for relevant pages.",
     tag = "web",
     tag = "research",
-    estimated_time_ms = 500,
+    estimated_time_ms = 500
 )]
 async fn web_search(req: WebSearchReq) -> Result<WebSearchResp, String> {
     // Real code would dispatch to a search backend here. For the
@@ -82,7 +82,7 @@ struct CalcResp {
 #[tool(
     description = "Evaluate a simple arithmetic expression.",
     tag = "math",
-    estimated_time_ms = 10,
+    estimated_time_ms = 10
 )]
 async fn calculator(req: CalcReq) -> Result<CalcResp, String> {
     Ok(CalcResp {
@@ -115,8 +115,16 @@ fn pretend_llm_reply(_lowered_tools: &[serde_json::Value]) -> serde_json::Value 
 const PSK: [u8; 32] = [0x42u8; 32];
 
 async fn build_pair() -> (Mesh, Mesh) {
-    let host = MeshBuilder::new("127.0.0.1:0", &PSK).unwrap().build().await.unwrap();
-    let agent = MeshBuilder::new("127.0.0.1:0", &PSK).unwrap().build().await.unwrap();
+    let host = MeshBuilder::new("127.0.0.1:0", &PSK)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let agent = MeshBuilder::new("127.0.0.1:0", &PSK)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
     // Handshake.
     let host_addr = host.inner().local_addr();
     let host_pub = *host.inner().public_key();
@@ -140,7 +148,9 @@ async fn main() -> anyhow::Result<()> {
     // (1) HOST: register two tools via the macro-generated *_register fns.
     let _h1 = web_search_register(&host).expect("register web_search");
     let _h2 = calculator_register(&host).expect("register calculator");
-    host.announce_capabilities(Default::default()).await.unwrap();
+    host.announce_capabilities(Default::default())
+        .await
+        .unwrap();
     println!("[host] registered 2 tools, announced capabilities");
 
     // (2) AGENT: wait for the fold to surface the host's tools, then

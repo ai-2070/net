@@ -2593,9 +2593,10 @@ mod tests {
         ann.capabilities
             .metadata
             .insert("owner".into(), "attacker".into());
-        ann.capabilities
-            .metadata
-            .insert("tool::web_search::description".into(), "Search the web.".into());
+        ann.capabilities.metadata.insert(
+            "tool::web_search::description".into(),
+            "Search the web.".into(),
+        );
         ann.capabilities
             .metadata
             .insert("app::region".into(), "us-east".into());

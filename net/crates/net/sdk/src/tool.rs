@@ -27,14 +27,12 @@
 //! slice A-1.
 
 #[cfg(feature = "cortex")]
-pub use net::adapter::net::behavior::fold::capability_aggregation::{
-    TagMatcher, TagMatcherError,
-};
+pub use net::adapter::net::behavior::fold::capability_aggregation::{TagMatcher, TagMatcherError};
 #[cfg(feature = "cortex")]
 pub use net::adapter::net::cortex::tool::{
-    description_metadata_key, streaming_metadata_key, tags_metadata_key, ToolDescriptor,
-    ToolEvent, ToolListChange, ToolListWatch, ToolMetadataRegistry, ToolMetadataRequest,
-    ToolMetadataResponse, TOOL_METADATA_FETCH_SERVICE,
+    description_metadata_key, streaming_metadata_key, tags_metadata_key, ToolDescriptor, ToolEvent,
+    ToolListChange, ToolListWatch, ToolMetadataRegistry, ToolMetadataRequest, ToolMetadataResponse,
+    TOOL_METADATA_FETCH_SERVICE,
 };
 
 #[cfg(feature = "cortex")]
@@ -173,10 +171,10 @@ where
     let name = name.into();
     let input_schema = schemars::schema_for!(Req);
     let output_schema = schemars::schema_for!(Resp);
-    let input_schema_json = serde_json::to_string(&input_schema)
-        .expect("schemars output is always valid JSON");
-    let output_schema_json = serde_json::to_string(&output_schema)
-        .expect("schemars output is always valid JSON");
+    let input_schema_json =
+        serde_json::to_string(&input_schema).expect("schemars output is always valid JSON");
+    let output_schema_json =
+        serde_json::to_string(&output_schema).expect("schemars output is always valid JSON");
     ToolMetadataBuilder {
         descriptor: ToolDescriptor {
             tool_id: name.clone(),
@@ -584,13 +582,11 @@ impl Mesh {
         // surfacing the error would require a fallible signature
         // and complicate the happy path. The conflict is
         // operator-misconfiguration, not transient failure.
-        if let Ok(handle) = self
-            .serve_rpc_typed::<ToolMetadataRequest, ToolMetadataResponse, _, _>(
-                TOOL_METADATA_FETCH_SERVICE,
-                Codec::Json,
-                handler,
-            )
-        {
+        if let Ok(handle) = self.serve_rpc_typed::<ToolMetadataRequest, ToolMetadataResponse, _, _>(
+            TOOL_METADATA_FETCH_SERVICE,
+            Codec::Json,
+            handler,
+        ) {
             *slot = Some(handle);
         }
     }
@@ -778,7 +774,9 @@ pub mod formats {
         /// API or `serde_json::from_str` it. This sidesteps double
         /// re-serialization on the happy path.
         pub fn lower_openai_tool_call(call: &Value) -> Result<ToolCallSpec, ToolCallParseError> {
-            let function = call.get("function").ok_or(ToolCallParseError::MissingField("function"))?;
+            let function = call
+                .get("function")
+                .ok_or(ToolCallParseError::MissingField("function"))?;
             let name = function
                 .get("name")
                 .ok_or(ToolCallParseError::MissingField("function.name"))?
@@ -803,10 +801,7 @@ pub mod formats {
             if let Err(e) = serde_json::from_str::<Value>(&arguments_json) {
                 return Err(ToolCallParseError::InvalidArgumentsJson(format!("{e}")));
             }
-            let provider_call_id = call
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            let provider_call_id = call.get("id").and_then(|v| v.as_str()).map(String::from);
             Ok(ToolCallSpec {
                 name,
                 arguments_json,
@@ -875,10 +870,7 @@ pub mod formats {
                 .ok_or(ToolCallParseError::MissingField("input"))?;
             let arguments_json = serde_json::to_string(input)
                 .map_err(|e| ToolCallParseError::InvalidArgumentsJson(format!("{e}")))?;
-            let provider_call_id = block
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            let provider_call_id = block.get("id").and_then(|v| v.as_str()).map(String::from);
             Ok(ToolCallSpec {
                 name,
                 arguments_json,
@@ -989,7 +981,9 @@ pub mod formats {
         /// `provider_call_id` is `None`. Multi-call sequences are
         /// identified positionally by their index in the model's
         /// reply.
-        pub fn lower_gemini_function_call(call: &Value) -> Result<ToolCallSpec, ToolCallParseError> {
+        pub fn lower_gemini_function_call(
+            call: &Value,
+        ) -> Result<ToolCallSpec, ToolCallParseError> {
             let name = call
                 .get("name")
                 .ok_or(ToolCallParseError::MissingField("name"))?
@@ -1053,11 +1047,16 @@ mod tests {
         assert!(descriptor.requires.is_empty());
 
         // Schemas must be present + parse as valid JSON.
-        let input = descriptor.input_schema.as_ref().expect("input schema present");
+        let input = descriptor
+            .input_schema
+            .as_ref()
+            .expect("input schema present");
         let parsed: serde_json::Value =
             serde_json::from_str(input).expect("input schema must be valid JSON");
         // Object with `query` + `max_results` properties.
-        let props = parsed.get("properties").expect("object schema has properties");
+        let props = parsed
+            .get("properties")
+            .expect("object schema has properties");
         assert!(props.get("query").is_some());
         assert!(props.get("max_results").is_some());
 
@@ -1132,7 +1131,10 @@ mod tests {
         // Anthropic uses `input_schema` (snake_case).
         let schema = &tool["input_schema"];
         assert!(schema["properties"]["query"].is_object());
-        assert!(tool.get("strict").is_none(), "Anthropic has no tool-level strict flag");
+        assert!(
+            tool.get("strict").is_none(),
+            "Anthropic has no tool-level strict flag"
+        );
     }
 
     #[test]

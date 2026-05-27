@@ -277,24 +277,22 @@ fn extract_req_type(func: &ItemFn) -> syn::Result<Type> {
 
 /// Pull the success type from `-> Result<Resp, _>`.
 fn extract_resp_type(func: &ItemFn) -> syn::Result<Type> {
-    let ret_ty = match &func.sig.output {
-        ReturnType::Default => {
-            return Err(syn::Error::new_spanned(
+    let ret_ty =
+        match &func.sig.output {
+            ReturnType::Default => return Err(syn::Error::new_spanned(
                 &func.sig,
                 "#[tool] requires the function to return `Result<Resp, _>` (no return type found)",
-            ))
-        }
-        ReturnType::Type(_, ty) => ty,
-    };
-    let path = match ret_ty.as_ref() {
-        Type::Path(tp) => &tp.path,
-        _ => {
-            return Err(syn::Error::new_spanned(
+            )),
+            ReturnType::Type(_, ty) => ty,
+        };
+    let path =
+        match ret_ty.as_ref() {
+            Type::Path(tp) => &tp.path,
+            _ => return Err(syn::Error::new_spanned(
                 ret_ty,
                 "#[tool] requires the return type to be `Result<Resp, _>` (got a non-path type)",
-            ))
-        }
-    };
+            )),
+        };
     let last = path.segments.last().ok_or_else(|| {
         syn::Error::new_spanned(ret_ty, "#[tool] requires a non-empty return type path")
     })?;

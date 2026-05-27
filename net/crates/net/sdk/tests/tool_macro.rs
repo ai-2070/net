@@ -35,7 +35,7 @@ struct WebSearchResp {
     tag = "web",
     tag = "research",
     stateless = true,
-    estimated_time_ms = 500,
+    estimated_time_ms = 500
 )]
 async fn web_search(req: WebSearchReq) -> Result<WebSearchResp, String> {
     Ok(WebSearchResp {
@@ -115,7 +115,11 @@ async fn macro_register_serves_tool_and_round_trips_call() {
     // Wait for the caller's fold to surface the host.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
-        if caller.list_tools(None).iter().any(|t| t.tool_id == "web_search") {
+        if caller
+            .list_tools(None)
+            .iter()
+            .any(|t| t.tool_id == "web_search")
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -124,12 +128,20 @@ async fn macro_register_serves_tool_and_round_trips_call() {
     assert!(
         visible.iter().any(|t| t.tool_id == "web_search"),
         "caller never observed web_search; got {:?}",
-        visible.iter().map(|t| t.tool_id.as_str()).collect::<Vec<_>>()
+        visible
+            .iter()
+            .map(|t| t.tool_id.as_str())
+            .collect::<Vec<_>>()
     );
 
     // call_tool round-trip.
     let resp: WebSearchResp = caller
-        .call_tool("web_search", &WebSearchReq { query: "mesh".into() })
+        .call_tool(
+            "web_search",
+            &WebSearchReq {
+                query: "mesh".into(),
+            },
+        )
         .await
         .expect("call_tool");
     assert_eq!(resp.results, vec!["hit for mesh".to_string()]);

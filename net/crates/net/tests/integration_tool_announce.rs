@@ -170,7 +170,9 @@ async fn drop_from_registry_clears_tag_on_next_announce() {
     let tool_filter = CapabilityFilter::default().require_tag("ai-tool:web_search");
     assert!(
         wait_until(
-            || peer.find_nodes_by_filter(&tool_filter).contains(&host.node_id()),
+            || peer
+                .find_nodes_by_filter(&tool_filter)
+                .contains(&host.node_id()),
             Duration::from_secs(3),
         )
         .await,
@@ -229,10 +231,8 @@ async fn list_tools_returns_descriptors_for_every_published_tool() {
 
     let tools = peer.list_tools(None);
     assert_eq!(tools.len(), 2, "expected 2 tools, got {tools:?}");
-    let by_id: std::collections::HashMap<&str, &ToolDescriptor> = tools
-        .iter()
-        .map(|t| (t.tool_id.as_str(), t))
-        .collect();
+    let by_id: std::collections::HashMap<&str, &ToolDescriptor> =
+        tools.iter().map(|t| (t.tool_id.as_str(), t)).collect();
     let search = by_id.get("web_search").expect("web_search present");
     assert_eq!(search.description.as_deref(), Some("Search the web."));
     assert_eq!(search.tags, vec!["web", "research"]);
@@ -384,7 +384,9 @@ async fn watch_tools_emits_node_count_changed_when_second_publisher_joins() {
     let tool_filter = CapabilityFilter::default().require_tag("ai-tool:shared_tool");
     assert!(
         wait_until(
-            || peer.find_nodes_by_filter(&tool_filter).contains(&host_a.node_id()),
+            || peer
+                .find_nodes_by_filter(&tool_filter)
+                .contains(&host_a.node_id()),
             Duration::from_secs(3),
         )
         .await,
@@ -457,7 +459,9 @@ async fn watch_tools_polling_task_exits_when_handle_dropped() {
     let tool_filter = CapabilityFilter::default().require_tag("ai-tool:post_drop");
     assert!(
         wait_until(
-            || peer.find_nodes_by_filter(&tool_filter).contains(&host.node_id()),
+            || peer
+                .find_nodes_by_filter(&tool_filter)
+                .contains(&host.node_id()),
             Duration::from_secs(3),
         )
         .await,

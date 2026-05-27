@@ -15,9 +15,7 @@
 
 use std::path::PathBuf;
 
-use net_sdk::tool::formats::{
-    anthropic, gemini, mcp, openai, ToolCallParseError, ToolCallSpec,
-};
+use net_sdk::tool::formats::{anthropic, gemini, mcp, openai, ToolCallParseError, ToolCallSpec};
 use net_sdk::tool::ToolDescriptor;
 use serde_json::Value;
 
@@ -33,8 +31,8 @@ fn fixture_path() -> PathBuf {
 
 fn load_fixture() -> Value {
     let path = fixture_path();
-    let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read fixture {path:?}: {e}"));
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fixture {path:?}: {e}"));
     serde_json::from_str(&raw).expect("fixture JSON parses")
 }
 
@@ -145,7 +143,11 @@ fn assert_lower_spec(case_name: &str, got: &ToolCallSpec, expected: &Value) {
     let want_id = expected.get("provider_call_id");
     match (want_id, &got.provider_call_id) {
         (Some(v), Some(g)) if v.is_string() => {
-            assert_eq!(g, v.as_str().unwrap(), "case `{case_name}`: provider_call_id");
+            assert_eq!(
+                g,
+                v.as_str().unwrap(),
+                "case `{case_name}`: provider_call_id"
+            );
         }
         (Some(v), None) if v.is_null() => {}
         (None, None) => {}

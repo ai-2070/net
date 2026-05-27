@@ -1373,8 +1373,7 @@ impl ToNapiValue for StreamingHandlerArgs {
         let mut arr = env_wrapper.create_array(2)?;
         let req_val = unsafe { Buffer::to_napi_value(env, val.req)? };
         let sink_val = unsafe { JsResponseSink::to_napi_value(env, val.sink)? };
-        let req_unknown =
-            unsafe { napi::bindgen_prelude::Unknown::from_napi_value(env, req_val)? };
+        let req_unknown = unsafe { napi::bindgen_prelude::Unknown::from_napi_value(env, req_val)? };
         let sink_unknown =
             unsafe { napi::bindgen_prelude::Unknown::from_napi_value(env, sink_val)? };
         arr.set(0, req_unknown)?;
@@ -1846,11 +1845,7 @@ impl MeshRpc {
         let opts = opts.unwrap_or_default().into_inner();
         let inner = self
             .node
-            .call_service_streaming(
-                &service,
-                Bytes::copy_from_slice(request.as_ref()),
-                opts,
-            )
+            .call_service_streaming(&service, Bytes::copy_from_slice(request.as_ref()), opts)
             .await
             .map_err(nrpc_err_from_inner)?;
         let flow_controlled_cached = inner.flow_controlled();

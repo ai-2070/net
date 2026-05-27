@@ -146,7 +146,9 @@ impl ToolDescriptor {
     /// hook `ToolCapability::input_schema_metadata_key` /
     /// `output_schema_metadata_key` use.
     pub fn from_capability(cap: &ToolCapability, metadata: &HashMap<String, String>) -> Self {
-        let description = metadata.get(&description_metadata_key(&cap.tool_id)).cloned();
+        let description = metadata
+            .get(&description_metadata_key(&cap.tool_id))
+            .cloned();
         // Streaming flag is encoded as "1" or "0" / absent — keeps
         // `CapabilitySet::metadata`'s `HashMap<String, String>`
         // shape and avoids a parallel typed map.
@@ -504,8 +506,14 @@ mod tests {
         // Same shape as `ToolCapability::input_schema_metadata_key`
         // — pinning here so a future rename catches at this test
         // before any downstream consumer drifts.
-        assert_eq!(description_metadata_key("web_search"), "tool::web_search::description");
-        assert_eq!(streaming_metadata_key("web_search"), "tool::web_search::streaming");
+        assert_eq!(
+            description_metadata_key("web_search"),
+            "tool::web_search::description"
+        );
+        assert_eq!(
+            streaming_metadata_key("web_search"),
+            "tool::web_search::streaming"
+        );
         assert_eq!(tags_metadata_key("web_search"), "tool::web_search::tags");
     }
 
@@ -530,7 +538,10 @@ mod tests {
         assert!(desc.streaming);
         assert_eq!(desc.tags, vec!["web", "research", "external"]);
         assert_eq!(desc.input_schema.as_deref(), Some(r#"{"type":"object"}"#));
-        assert_eq!(desc.node_count, 0, "node_count is filled by the aggregator, not here");
+        assert_eq!(
+            desc.node_count, 0,
+            "node_count is filled by the aggregator, not here"
+        );
     }
 
     #[test]
@@ -630,7 +641,10 @@ mod tests {
             pct: None,
             message: None,
         };
-        assert_eq!(serde_json::to_string(&event).unwrap(), r#"{"type":"progress"}"#);
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"type":"progress"}"#
+        );
     }
 
     // ── tool.metadata.fetch ─────────────────────────────────────
@@ -686,7 +700,9 @@ mod tests {
 
         // Re-insert returns the previous entry (lets the SDK detect
         // duplicate registration without a separate sentinel).
-        let prior = reg.insert(desc.clone()).expect("second insert returns prior");
+        let prior = reg
+            .insert(desc.clone())
+            .expect("second insert returns prior");
         assert_eq!(prior, desc);
 
         let removed = reg.remove("web_search").expect("remove must find it");

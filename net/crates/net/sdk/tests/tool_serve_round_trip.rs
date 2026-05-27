@@ -31,8 +31,7 @@ use net_sdk::capabilities::CapabilitySet as SdkCapabilitySet;
 use net_sdk::mesh::{Mesh, MeshBuilder};
 use net_sdk::mesh_rpc::{CallOptionsTyped, Codec};
 use net_sdk::tool::{
-    metadata_for, ToolEvent, ToolMetadataRequest, ToolMetadataResponse,
-    TOOL_METADATA_FETCH_SERVICE,
+    metadata_for, ToolEvent, ToolMetadataRequest, ToolMetadataResponse, TOOL_METADATA_FETCH_SERVICE,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -169,7 +168,10 @@ async fn serve_tool_round_trip_announces_calls_and_fetches_metadata() {
     match fetched {
         ToolMetadataResponse::Found { descriptor: got } => {
             assert_eq!(got.tool_id, "web_search");
-            assert_eq!(got.description.as_deref(), Some("Search the web for relevant pages."));
+            assert_eq!(
+                got.description.as_deref(),
+                Some("Search the web for relevant pages.")
+            );
             assert_eq!(got.estimated_time_ms, 500);
             assert!(got.stateless);
             assert_eq!(got.tags, vec!["web", "research"]);
@@ -293,17 +295,15 @@ async fn serve_tool_rejects_duplicate_tool_id() {
         })
         .expect("first serve_tool");
 
-    let err = match mesh.serve_tool::<WebSearchReq, WebSearchResp, _, _>(
-        descriptor,
-        |req| async move {
+    let err =
+        match mesh.serve_tool::<WebSearchReq, WebSearchResp, _, _>(descriptor, |req| async move {
             Ok(WebSearchResp {
                 results: vec![req.query],
             })
-        },
-    ) {
-        Ok(_) => panic!("duplicate serve_tool must fail"),
-        Err(e) => e,
-    };
+        }) {
+            Ok(_) => panic!("duplicate serve_tool must fail"),
+            Err(e) => e,
+        };
     // ServeError::AlreadyServing — wraps the tool_id in the
     // diagnostic message.
     let msg = format!("{err}");
@@ -405,7 +405,10 @@ async fn serve_tool_streaming_round_trip_emits_events_in_order() {
     }
     match &events[3] {
         ToolEvent::Result { data } => {
-            let arr = data.get("results").and_then(|v| v.as_array()).expect("results");
+            let arr = data
+                .get("results")
+                .and_then(|v| v.as_array())
+                .expect("results");
             assert_eq!(arr.len(), 1);
             assert_eq!(arr[0].as_str(), Some("hit for mesh"));
         }
@@ -462,9 +465,7 @@ async fn serve_tool_streaming_synthesizes_missing_terminal_when_handler_omits_on
         .call_streaming_typed::<WebSearchReq, ToolEvent>(
             host.inner().node_id(),
             "forgetful",
-            &WebSearchReq {
-                query: "x".into(),
-            },
+            &WebSearchReq { query: "x".into() },
             CallOptionsTyped {
                 raw: Default::default(),
                 codec: Codec::Json,
@@ -478,7 +479,11 @@ async fn serve_tool_streaming_synthesizes_missing_terminal_when_handler_omits_on
         .collect()
         .await;
 
-    assert_eq!(events.len(), 4, "expected 3 user events + 1 synthesized; got {events:?}");
+    assert_eq!(
+        events.len(),
+        4,
+        "expected 3 user events + 1 synthesized; got {events:?}"
+    );
     match events.last().expect("synthesized terminal") {
         ToolEvent::Error { code, .. } => {
             assert_eq!(code, "missing_terminal");
@@ -496,8 +501,7 @@ async fn serve_tool_streaming_forces_streaming_flag_on_descriptor() {
         .unwrap();
 
     // Build a descriptor that DIDN'T set streaming=true.
-    let descriptor = metadata_for::<WebSearchReq, WebSearchResp>("forced_streaming")
-        .build();
+    let descriptor = metadata_for::<WebSearchReq, WebSearchResp>("forced_streaming").build();
     assert!(!descriptor.streaming, "builder default must be false");
 
     let _handle = mesh
@@ -559,7 +563,12 @@ async fn call_tool_routes_via_capability_index() {
     );
 
     let resp: WebSearchResp = caller
-        .call_tool("web_search", &WebSearchReq { query: "mesh".into() })
+        .call_tool(
+            "web_search",
+            &WebSearchReq {
+                query: "mesh".into(),
+            },
+        )
         .await
         .expect("call_tool succeeds");
     assert_eq!(resp.results, vec!["hit:mesh".to_string()]);
@@ -611,7 +620,12 @@ async fn call_tool_streaming_collects_envelopes_in_order() {
     );
 
     let stream = caller
-        .call_tool_streaming("search_stream", &WebSearchReq { query: "mesh".into() })
+        .call_tool_streaming(
+            "search_stream",
+            &WebSearchReq {
+                query: "mesh".into(),
+            },
+        )
         .await
         .expect("call_tool_streaming");
     let events: Vec<ToolEvent> = stream
@@ -675,8 +689,7 @@ async fn watch_tools_emits_added_when_remote_host_registers_tool() {
 
     // Now host registers a tool. The fold must propagate, and the
     // next watch poll on the caller side must emit `Added`.
-    let descriptor =
-        metadata_for::<WebSearchReq, WebSearchResp>("dynamic_web_search").build();
+    let descriptor = metadata_for::<WebSearchReq, WebSearchResp>("dynamic_web_search").build();
     let _handle = host
         .serve_tool::<WebSearchReq, _, _, _>(descriptor.clone(), |_req| async move {
             Ok(WebSearchResp {
