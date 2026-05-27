@@ -198,8 +198,8 @@ func TestOpenAILowerToolCall(t *testing.T) {
 	if spec.ArgumentsJSON != `{"query":"mesh"}` {
 		t.Errorf("ArgumentsJSON = %q", spec.ArgumentsJSON)
 	}
-	if !spec.HasProviderCallID || spec.ProviderCallID != "call_abc" {
-		t.Errorf("ProviderCallID = %q (set=%v)", spec.ProviderCallID, spec.HasProviderCallID)
+	if spec.ProviderCallID == nil || *spec.ProviderCallID != "call_abc" {
+		t.Errorf("ProviderCallID = %v", spec.ProviderCallID)
 	}
 }
 
@@ -252,8 +252,8 @@ func TestAnthropicLowerToolUse(t *testing.T) {
 	if parsed["query"] != "mesh" {
 		t.Errorf("query = %v", parsed["query"])
 	}
-	if !spec.HasProviderCallID || spec.ProviderCallID != "toolu_xyz" {
-		t.Errorf("ProviderCallID = %q (set=%v)", spec.ProviderCallID, spec.HasProviderCallID)
+	if spec.ProviderCallID == nil || *spec.ProviderCallID != "toolu_xyz" {
+		t.Errorf("ProviderCallID = %v", spec.ProviderCallID)
 	}
 }
 
@@ -276,7 +276,7 @@ func TestMCPLowerToolsCallNoProviderCallID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LowerMCPToolsCall: %v", err)
 	}
-	if spec.HasProviderCallID {
+	if spec.ProviderCallID != nil {
 		t.Error("MCP tools/call has no provider call id at this layer")
 	}
 }
@@ -307,7 +307,7 @@ func TestGeminiLowerFunctionCallArgs(t *testing.T) {
 	if parsed["query"] != "mesh" {
 		t.Errorf("query = %v", parsed["query"])
 	}
-	if spec.HasProviderCallID {
+	if spec.ProviderCallID != nil {
 		t.Error("Gemini has no call id")
 	}
 }

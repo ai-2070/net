@@ -624,11 +624,13 @@ func AddToolCapabilitiesToAnnounce(
 // adapter and CallTool. ArgumentsJSON is a string so the boundary
 // is provider-agnostic (OpenAI's arguments arrive as a string
 // anyway; Anthropic/MCP/Gemini's parsed objects re-serialize once).
+// ProviderCallID is nil when the provider doesn't tag the call with
+// an ID (MCP, Gemini). Mirrors Rust `Option<String>` / Python
+// `Optional[str]` / Node `string | undefined`.
 type ToolCallSpec struct {
-	Name              string
-	ArgumentsJSON     string
-	ProviderCallID    string
-	HasProviderCallID bool
+	Name           string
+	ArgumentsJSON  string
+	ProviderCallID *string
 }
 
 // ToolCallParseError is returned when a provider's tool-call reply
@@ -697,8 +699,7 @@ func LowerOpenAIToolCall(call map[string]interface{}) (ToolCallSpec, error) {
 	spec.Name = name
 	spec.ArgumentsJSON = args
 	if id, ok := call["id"].(string); ok {
-		spec.ProviderCallID = id
-		spec.HasProviderCallID = true
+		spec.ProviderCallID = &id
 	}
 	return spec, nil
 }
@@ -736,8 +737,7 @@ func LowerAnthropicToolUse(block map[string]interface{}) (ToolCallSpec, error) {
 	spec.Name = name
 	spec.ArgumentsJSON = string(b)
 	if id, ok := block["id"].(string); ok {
-		spec.ProviderCallID = id
-		spec.HasProviderCallID = true
+		spec.ProviderCallID = &id
 	}
 	return spec, nil
 }

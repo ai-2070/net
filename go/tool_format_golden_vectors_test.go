@@ -205,13 +205,13 @@ func assertLowerSpec(t *testing.T, caseName string, got ToolCallSpec, expected f
 		}
 	}
 	if expected.ExpectedSpec.ProviderCallID == nil {
-		if got.HasProviderCallID {
-			t.Errorf("case %q: provider_call_id should be unset, got %q", caseName, got.ProviderCallID)
+		if got.ProviderCallID != nil {
+			t.Errorf("case %q: provider_call_id should be unset, got %q", caseName, *got.ProviderCallID)
 		}
 	} else {
-		if !got.HasProviderCallID || got.ProviderCallID != *expected.ExpectedSpec.ProviderCallID {
-			t.Errorf("case %q: provider_call_id = %q (set=%v), want %q",
-				caseName, got.ProviderCallID, got.HasProviderCallID, *expected.ExpectedSpec.ProviderCallID)
+		if got.ProviderCallID == nil || *got.ProviderCallID != *expected.ExpectedSpec.ProviderCallID {
+			t.Errorf("case %q: provider_call_id = %v, want %q",
+				caseName, got.ProviderCallID, *expected.ExpectedSpec.ProviderCallID)
 		}
 	}
 }
