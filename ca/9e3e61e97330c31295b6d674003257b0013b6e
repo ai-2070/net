@@ -1,0 +1,22 @@
+net/crates/net/bindings/go/net/tool.go
+  s_d09daf7426cb49::t_baaf62674d81cd 518-544,569,575,578,581,584,594
+go/tool.go
+  s_d09daf7426cb49::t_1aa6f201f9eb9c 617-643
+  s_d09daf7426cb49::t_ac05fbe05ed1ea 691,697,700,703,706,716
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "ca9e3e61e97330c31295b6d674003257b0013b6e",
+  "prompts": {},
+  "sessions": {
+    "s_d09daf7426cb49": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6f1c9611-fcfd-42e6-a7d8-db5962c1c885",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
