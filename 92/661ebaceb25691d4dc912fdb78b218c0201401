@@ -1,0 +1,20 @@
+net/crates/net/docs/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md
+  s_099fa7d871e34d::t_29d05ce1b88ee3 111-112,115-133
+  s_099fa7d871e34d::t_45b2415ebc6ef4 87,90-91,94-95,97-98,100-103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "92661ebaceb25691d4dc912fdb78b218c0201401",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
