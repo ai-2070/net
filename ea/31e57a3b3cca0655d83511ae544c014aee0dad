@@ -1,0 +1,26 @@
+net/crates/net/src/adapter/net/mod.rs
+  s_099fa7d871e34d::t_dd1e190ef58b7f 39-41
+net/crates/net/Cargo.toml
+  s_099fa7d871e34d::t_1fee0c429b2ff1 98-103
+net/crates/net/src/adapter/net/mesh.rs
+  s_099fa7d871e34d::t_54c0774e934fb6 8013
+net/crates/net/src/ffi/mesh.rs
+  s_099fa7d871e34d::t_1c8fa1d860f8b2 4188-4190,4198-4199,4207-4209,4217-4218,4224-4225,4234-4235,4241-4242,4248-4249,4255-4256
+  s_099fa7d871e34d::t_963a90871156fe 631-635
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "ea31e57a3b3cca0655d83511ae544c014aee0dad",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
