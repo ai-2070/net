@@ -1,0 +1,30 @@
+net/crates/net/bindings/node/tool.ts
+  s_099fa7d871e34d::t_b52b242eae0017 26-35
+  s_099fa7d871e34d::t_3887edd1a4c03a 311-328
+net/crates/net/docs/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md
+  s_099fa7d871e34d::t_fe81d29075a75d 89
+net/crates/net/bindings/node/Cargo.toml
+  s_099fa7d871e34d::t_cd976d9c71ea30 44
+  s_099fa7d871e34d::t_a1139bef5507ae 78-84
+net/crates/net/bindings/node/src/tool.rs
+  s_099fa7d871e34d::t_9a61049f29e183 1-60
+net/crates/net/bindings/node/src/lib.rs
+  s_099fa7d871e34d::t_98c5cb5fec6179 56-57
+  s_099fa7d871e34d::t_12183bb737e344 1896-1923
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "591865ac0678eec26206e8b921c6d58aa1502763",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
