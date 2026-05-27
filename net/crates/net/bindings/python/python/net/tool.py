@@ -23,7 +23,19 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Literal, Optional, TypedDict, Union
+from typing import (
+    Any,
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    TypedDict,
+    Union,
+)
 
 from .mesh_rpc import AsyncTypedMeshRpc, ServeHandle, TypedMeshRpc
 
@@ -309,6 +321,47 @@ def call_tool(
     bubbled handler errors as ``RpcServerError``).
     """
     return rpc.call_service(tool_id, request, opts)
+
+
+def call_tool_streaming(
+    rpc: TypedMeshRpc,
+    tool_id: str,
+    request: Any,
+    opts: Optional[dict] = None,
+) -> Iterator[dict]:
+    """Capability-routed streaming tool invocation.
+
+    Yields each JSON-decoded :class:`ToolEvent` envelope as the
+    handler emits them. Synthesizes a terminal
+    ``{"type": "error", "code": "missing_terminal", ...}`` event
+    if the stream ends without a ``result`` / ``error`` — matches
+    the Rust SDK's ``serve_tool_streaming`` contract and the T-2
+    cross-language fixture.
+
+    The returned iterator wraps a :class:`TypedRpcStream`; iterate
+    until exhaustion (or break out — the stream's drop emits CANCEL
+    to the host).
+    """
+    stream = rpc.call_service_streaming(tool_id, request, opts)
+    saw_terminal = False
+    try:
+        for event in stream:
+            yield event
+            if isinstance(event, dict) and event.get("type") in ("result", "error"):
+                saw_terminal = True
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+    if not saw_terminal:
+        yield {
+            "type": "error",
+            "code": "missing_terminal",
+            "message": (
+                "tool stream ended without a terminal result or error envelope"
+            ),
+        }
 
 
 #: nRPC service name for the on-demand tool-descriptor pull.
@@ -782,6 +835,44 @@ async def call_tool_async(
     return await rpc.call_service(tool_id, request, opts)
 
 
+async def call_tool_streaming_async(
+    rpc: AsyncTypedMeshRpc,
+    tool_id: str,
+    request: Any,
+    opts: Optional[dict] = None,
+) -> AsyncGenerator[dict, None]:
+    """Async equivalent of :func:`call_tool_streaming`. Yields each
+    :class:`ToolEvent` as the handler emits it; synthesizes a
+    terminal ``error`` envelope with ``code='missing_terminal'`` if
+    the stream ends without one.
+
+    Uses :meth:`AsyncTypedMeshRpc.call_service_streaming` under the
+    hood, so the substrate's asyncio cancel-bridge applies — an
+    asyncio task-cancel mid-stream terminates the WHOLE call via
+    the substrate cancel-registry.
+    """
+    stream = await rpc.call_service_streaming(tool_id, request, opts)
+    saw_terminal = False
+    try:
+        async for event in stream:
+            yield event
+            if isinstance(event, dict) and event.get("type") in ("result", "error"):
+                saw_terminal = True
+    finally:
+        try:
+            await stream.aclose()
+        except Exception:
+            pass
+    if not saw_terminal:
+        yield {
+            "type": "error",
+            "code": "missing_terminal",
+            "message": (
+                "tool stream ended without a terminal result or error envelope"
+            ),
+        }
+
+
 async def fetch_tool_metadata_async(
     rpc: AsyncTypedMeshRpc,
     host_node_id: int,
@@ -851,7 +942,9 @@ __all__ = [
     "serve_tool",
     "serve_tool_async",
     "call_tool",
+    "call_tool_streaming",
     "call_tool_async",
+    "call_tool_streaming_async",
     "fetch_tool_metadata_async",
     "list_tools",
     "watch_tools",

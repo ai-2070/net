@@ -926,6 +926,23 @@ class TypedMeshRpc:
         raw = self._raw.call_streaming(target_node_id, service, req_bytes, opts)
         return TypedRpcStream(raw)
 
+    def call_service_streaming(
+        self,
+        service: str,
+        request: Any,
+        opts: Optional[dict] = None,
+    ) -> TypedRpcStream:
+        """Capability-routed typed streaming call. Mirrors
+        :meth:`call_service` for target resolution + cap-auth gate;
+        mirrors :meth:`call_streaming` for the iterator shape.
+
+        Used by :func:`net.tool.call_tool_streaming` for streaming
+        tool invocations.
+        """
+        req_bytes = _json_encode(request)
+        raw = self._raw.call_service_streaming(service, req_bytes, opts)
+        return TypedRpcStream(raw)
+
     def find_service_nodes(self, service: str) -> list[int]:
         """All node ids advertising ``nrpc:<service>``."""
         return list(self._raw.find_service_nodes(service))
@@ -1444,6 +1461,26 @@ class AsyncTypedMeshRpc:
         raw_stream = await self._raw.call_streaming(
             target_node_id, service, req_bytes, opts
         )
+        return AsyncTypedRpcStream(raw_stream)
+
+    async def call_service_streaming(
+        self,
+        service: str,
+        request: Any,
+        opts: Optional[dict] = None,
+    ) -> "AsyncTypedRpcStream":
+        """Capability-routed typed streaming call. Mirrors
+        :meth:`call_service` for target resolution + cap-auth gate;
+        mirrors :meth:`call_streaming` for the chunk-iterator
+        return shape.
+
+        Used by :func:`net.tool.call_tool_streaming_async` for
+        streaming tool invocations.
+
+        Sync equivalent: :meth:`TypedMeshRpc.call_service_streaming`.
+        """
+        req_bytes = _json_encode(request)
+        raw_stream = await self._raw.call_service_streaming(service, req_bytes, opts)
         return AsyncTypedRpcStream(raw_stream)
 
 

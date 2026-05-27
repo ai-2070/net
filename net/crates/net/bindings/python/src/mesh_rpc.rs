@@ -2160,6 +2160,47 @@ impl PyMeshRpc {
         })
     }
 
+    /// Capability-routed streaming call. Resolves ``service``
+    /// against the local capability index, applies routing +
+    /// cap-auth gate (mirrors :meth:`call_service`), then opens
+    /// the streaming call (mirrors :meth:`call_streaming` for the
+    /// returned iterator shape).
+    ///
+    /// Used by :func:`net.tool.call_tool_streaming` for streaming
+    /// tool invocations. Pass ``opts={'cancel': cancel}`` for
+    /// mid-stream cancel via :class:`Cancellable`.
+    #[pyo3(signature = (service, request, opts=None))]
+    fn call_service_streaming<'py>(
+        &self,
+        py: Python<'py>,
+        service: String,
+        request: &Bound<'py, PyBytes>,
+        opts: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<PyRpcStream> {
+        check_cancel_keys_exclusive(opts)?;
+        let cancel = extract_cancellable(opts)?;
+        let raw_cancel_token = extract_cancel_token(opts)?;
+        let mut inner_opts = call_options_from_dict(opts)?;
+        if let Some(t) = raw_cancel_token {
+            inner_opts.cancel_token = Some(t);
+        }
+        let _armed = apply_cancellable(&self.node, cancel.as_ref(), &mut inner_opts);
+        let req_bytes = Bytes::copy_from_slice(request.as_bytes());
+        let runtime = self.runtime.clone();
+        let node = self.node.clone();
+        let inner = py.detach(|| {
+            runtime.block_on(async move {
+                node.call_service_streaming(&service, req_bytes, inner_opts)
+                    .await
+                    .map_err(rpc_error_to_pyerr)
+            })
+        })?;
+        Ok(PyRpcStream {
+            inner: Arc::new(Mutex::new(Some(inner))),
+            runtime: self.runtime.clone(),
+        })
+    }
+
     /// Open a client-streaming call. Returns a
     /// :class:`ClientStreamCall`; push chunks via ``call.send(bytes)``
     /// then ``call.finish()`` to await the terminal response. The
@@ -2731,6 +2772,44 @@ impl PyAsyncMeshRpc {
             async move {
                 let stream = node
                     .call_streaming(target_node_id, &service, req_bytes, inner_opts)
+                    .await
+                    .map_err(rpc_error_to_pyerr)?;
+                Ok::<_, PyErr>(PyAsyncRpcStream {
+                    inner: Arc::new(TokioMutex::new(Some(stream))),
+                    closed: Arc::new(AtomicBool::new(false)),
+                    mesh: mesh_for_stream,
+                    cancel_token: token,
+                })
+            }
+        })
+    }
+
+    /// Capability-routed streaming call. Mirrors
+    /// :meth:`call_service` for target resolution + cap-auth gate;
+    /// mirrors :meth:`call_streaming` for the chunk-iterator
+    /// return shape.
+    ///
+    /// Used by :func:`net.tool.call_tool_streaming_async` for
+    /// streaming tool invocations.
+    ///
+    /// Sync equivalent: :meth:`MeshRpc.call_service_streaming`.
+    #[pyo3(signature = (service, request, opts=None))]
+    fn call_service_streaming<'py>(
+        &self,
+        py: Python<'py>,
+        service: String,
+        request: &Bound<'py, PyBytes>,
+        opts: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut inner_opts = call_options_from_dict(opts)?;
+        let req_bytes = Bytes::copy_from_slice(request.as_bytes());
+        let node = self.node.clone();
+        let mesh_for_stream = self.node.clone();
+        crate::async_bridge::await_with_cancel(py, &self.node, move |token| {
+            inner_opts.cancel_token = Some(token);
+            async move {
+                let stream = node
+                    .call_service_streaming(&service, req_bytes, inner_opts)
                     .await
                     .map_err(rpc_error_to_pyerr)?;
                 Ok::<_, PyErr>(PyAsyncRpcStream {
