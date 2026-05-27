@@ -354,6 +354,166 @@ Both gated off by default. Bindings that consume `net-mesh-sdk`
 through prebuilt artifacts (Node / Python / Go) enable the feature in
 their build pipeline.
 
+## Bindings
+
+Each language binding ships a tool layer mirroring the Rust SDK
+surface. Wire byte-equality across the four implementations is
+mechanically enforced by golden-vector fixtures (T-1, T-2).
+
+### Node TS (`@net-mesh/sdk`)
+
+```ts
+import {
+  callTool,
+  fetchToolMetadata,
+  listTools,
+  serveTool,
+  watchTools,
+  openai,
+} from '@net-mesh/sdk/tool'
+
+// Server: register a tool.
+const handle = serveTool(
+  rpc,
+  {
+    name: 'web_search',
+    description: 'Search the web for relevant pages.',
+    inputSchema: { type: 'object', properties: { query: { type: 'string' } } },
+    tags: ['web', 'research'],
+    estimatedTimeMs: 500,
+  },
+  async (req: { query: string }) => ({ results: [`hit for ${req.query}`] }),
+)
+// Tear down: handle.close()
+
+// Discovery.
+const tools = listTools(mesh)               // one-shot snapshot
+for await (const change of watchTools(mesh, { intervalMs: 250 })) {
+  // 'added' | 'removed' | 'node_count_changed'
+  console.log(change.type, change.descriptor.toolId)
+}
+
+// Provider lowering + invocation.
+const apiTools = tools.map(openai.toOpenaiTool)
+// ... POST to /v1/chat/completions with `tools: apiTools` ...
+const spec = openai.lowerOpenaiToolCall(replyToolCall)
+const resp = await callTool(rpc, spec.name, JSON.parse(spec.argumentsJson))
+
+// On-demand full schema (when fold dropped it under size budget):
+const meta = await fetchToolMetadata(rpc, hostNodeId, 'web_search')
+if (meta.type === 'found') { /* meta.descriptor.inputSchema is parseable */ }
+```
+
+Streaming (`serveToolStreaming` / `callToolStreaming`) is deferred
+to a follow-up; it needs the streaming-FFI extensions in the napi
+binding.
+
+### Python (`net-mesh`)
+
+```python
+from net.tool import (
+    call_tool,
+    fetch_tool_metadata,
+    list_tools,
+    serve_tool,
+    watch_tools,
+    openai,
+)
+
+# Server: register a tool (sync handler shown; async also supported
+# via `AsyncTypedMeshRpc.serve`).
+handle = serve_tool(
+    rpc,
+    {
+        "name": "web_search",
+        "description": "Search the web for relevant pages.",
+        "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}},
+        "tags": ["web", "research"],
+        "estimated_time_ms": 500,
+    },
+    lambda req: {"results": [f"hit for {req['query']}"]},
+)
+# handle.close() to deregister.
+
+# Discovery.
+tools = list_tools(mesh)
+async for change in watch_tools(mesh, interval=0.25):
+    print(change.type, change.descriptor.tool_id)
+
+# Provider lowering + invocation.
+api_tools = [openai.to_openai_tool(t) for t in tools]
+spec = openai.lower_openai_tool_call(reply_tool_call)
+resp = call_tool(rpc, spec.name, json.loads(spec.arguments_json))
+
+# On-demand metadata fetch.
+meta = fetch_tool_metadata(rpc, host_node_id, "web_search")
+if meta["type"] == "found": ...  # meta["descriptor"]
+```
+
+Pydantic models work seamlessly — pass `MyModel.model_json_schema()`
+as the `input_schema` and the handler receives a dict that you
+deserialize with `MyModel.model_validate(req)`.
+
+### Go (`github.com/ai-2070/net/go`)
+
+```go
+import (
+    "context"
+    "github.com/ai-2070/net/go"
+)
+
+// Server: register a tool (typed handler, generics).
+desc, _ := net.DescriptorFor(net.ToolOptions{
+    Name:        "web_search",
+    Description: "Search the web for relevant pages.",
+    InputSchema: map[string]any{"type": "object", "properties": map[string]any{
+        "query": map[string]any{"type": "string"},
+    }},
+    Tags:            []string{"web", "research"},
+    EstimatedTimeMs: 500,
+})
+handle, _ := net.RegisterTool[WebSearchReq, WebSearchResp](
+    rpc, desc, func(req WebSearchReq) (WebSearchResp, error) {
+        return WebSearchResp{Results: []string{"hit for " + req.Query}}, nil
+    },
+)
+// defer handle.Close()
+
+// Provider lowering + invocation.
+apiTool := net.ToOpenAITool(desc)
+spec, _ := net.LowerOpenAIToolCall(replyMap)
+var req WebSearchReq
+json.Unmarshal([]byte(spec.ArgumentsJSON), &req)
+resp, _ := net.CallTool[WebSearchReq, WebSearchResp](
+    context.Background(), rpc, spec.Name, req,
+)
+
+// On-demand metadata fetch.
+meta, _ := net.FetchToolMetadata(context.Background(), rpc, hostNodeID, "web_search")
+if meta.Type == "found" { /* meta.Descriptor */ }
+```
+
+Go's `ListTools` / `WatchTools` are deferred — the Go binding's
+upstream CGO surface needs a `list_tools` ABI export first.
+Format translators + register + invoke + fetch_tool_metadata are
+all shipped today.
+
+### Provider format coverage
+
+All three bindings ship the same four provider translators with
+identical wire shapes (pinned by T-1 golden vectors):
+
+| Provider  | Descriptor → tool definition          | Provider reply → `ToolCallSpec`                |
+|-----------|---------------------------------------|------------------------------------------------|
+| OpenAI    | `openai.to_openai_tool(desc)`         | `openai.lower_openai_tool_call(call)`          |
+| Anthropic | `anthropic.to_anthropic_tool(desc)`   | `anthropic.lower_anthropic_tool_use(block)`    |
+| MCP       | `mcp.to_mcp_tool(desc)`               | `mcp.lower_mcp_tools_call(params)`             |
+| Gemini    | `gemini.to_gemini_function_declaration(desc)` | `gemini.lower_gemini_function_call(call)` |
+
+Same names + signatures across all four languages (snake_case in
+Python/Go, camelCase in Node TS). Empty input-schema fallback to
+`{"type": "object", "properties": {}}` is uniform.
+
 ## Plan reference
 
 See `docs/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md` for the full
