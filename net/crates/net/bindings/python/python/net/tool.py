@@ -256,6 +256,39 @@ def call_tool(
     return rpc.call_service(tool_id, request, opts)
 
 
+#: nRPC service name for the on-demand tool-descriptor pull.
+TOOL_METADATA_FETCH_SERVICE = "tool.metadata.fetch"
+
+
+def fetch_tool_metadata(
+    rpc: TypedMeshRpc,
+    host_node_id: int,
+    tool_id: str,
+    opts: Optional[dict] = None,
+) -> dict:
+    """Pull a tool's full descriptor from a specific host via the
+    auto-installed ``tool.metadata.fetch`` nRPC service.
+
+    Useful when the local fold's entry dropped the schema (size-
+    budget-exceeded) and the agent needs the full input/output
+    schemas for strict-mode provider lowering.
+
+    Returns a dict matching the substrate's
+    ``ToolMetadataResponse`` wire shape (JSON-tagged on ``type``,
+    snake_case):
+
+    - ``{"type": "found", "descriptor": {...}}`` — descriptor has
+      every field the host's tool_registry holds.
+    - ``{"type": "not_found", "name": "<tool_id>"}`` — host
+      doesn't currently serve this tool.
+
+    Mirror of calling ``mesh.call_typed(host, TOOL_METADATA_FETCH_SERVICE,
+    {"name": tool_id})`` in the Rust SDK. The handler is auto-
+    installed on the host's first ``serve_tool`` call.
+    """
+    return rpc.call(host_node_id, TOOL_METADATA_FETCH_SERVICE, {"name": tool_id}, opts)
+
+
 def list_tools(mesh: Any) -> List[ToolDescriptor]:
     """Walk the local capability fold for every published AI tool.
 
@@ -601,7 +634,9 @@ __all__ = [
     "serve_tool",
     "call_tool",
     "list_tools",
+    "fetch_tool_metadata",
     "add_tool_capabilities_to_announce",
+    "TOOL_METADATA_FETCH_SERVICE",
     "is_terminal_event",
     "openai",
     "anthropic",

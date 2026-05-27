@@ -20,6 +20,7 @@
 package net
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -240,6 +241,54 @@ func RegisterTool[Req, Resp any](
 	return &ToolServeHandle{Descriptor: descriptor, inner: inner}, nil
 }
 
+// TOOL_METADATA_FETCH_SERVICE is the nRPC service name for the
+// on-demand tool-descriptor pull. The substrate auto-installs
+// the server-side handler on the host's first serve_tool call.
+const TOOL_METADATA_FETCH_SERVICE = "tool.metadata.fetch"
+
+// ToolMetadataResponse is the wire shape of a
+// `tool.metadata.fetch` reply. JSON-tagged on `type`, snake_case:
+//
+//   - `{"type": "found", "descriptor": {...}}` — host has a
+//     serve_tool registration for the requested name.
+//   - `{"type": "not_found", "name": "..."}` — host doesn't
+//     currently serve this tool.
+//
+// Pinned by the substrate's `cortex::tool::ToolMetadataResponse`
+// enum. Use Type to discriminate; Descriptor is populated only on
+// "found".
+type ToolMetadataResponse struct {
+	Type       string          `json:"type"`
+	Descriptor *ToolDescriptor `json:"descriptor,omitempty"`
+	Name       string          `json:"name,omitempty"`
+}
+
+// FetchToolMetadata pulls a tool's full descriptor from a specific
+// host by calling the auto-installed `tool.metadata.fetch` nRPC
+// service. Useful when the local fold's entry dropped the schema
+// (size-budget-exceeded) and the agent needs the full
+// input/output schemas for strict-mode provider lowering.
+//
+// Mirror of `mesh.call_typed(host, TOOL_METADATA_FETCH_SERVICE,
+// {name: tool_id})` in the Rust SDK.
+func FetchToolMetadata(
+	ctx context.Context,
+	rpc *TypedMeshRpc,
+	hostNodeID uint64,
+	toolID string,
+) (ToolMetadataResponse, error) {
+	type req struct {
+		Name string `json:"name"`
+	}
+	return TypedCall[req, ToolMetadataResponse](
+		ctx,
+		rpc,
+		hostNodeID,
+		TOOL_METADATA_FETCH_SERVICE,
+		req{Name: toolID},
+	)
+}
+
 // CallTool dispatches a capability-routed unary tool invocation
 // via TypedCallService. JSON codec is hardwired — every AI
 // provider (OpenAI, Anthropic, Gemini, MCP) consumes JSON for tool
@@ -248,11 +297,12 @@ func RegisterTool[Req, Resp any](
 // Returns the decoded response, or an error (NoRoute if no host
 // advertises `nrpc:<toolID>`, bubbled handler errors otherwise).
 func CallTool[Req, Resp any](
+	ctx context.Context,
 	rpc *TypedMeshRpc,
 	toolID string,
 	request Req,
 ) (Resp, error) {
-	return TypedCallService[Req, Resp](rpc, toolID, request, nil)
+	return TypedCallService[Req, Resp](ctx, rpc, toolID, request)
 }
 
 // AddToolCapabilitiesToAnnounce merges tool descriptors into a

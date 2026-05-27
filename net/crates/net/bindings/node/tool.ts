@@ -326,6 +326,43 @@ export function listTools(mesh: MeshWithListTools): ToolDescriptor[] {
   return mesh.listTools()
 }
 
+/** nRPC service name for the on-demand tool-descriptor pull. */
+export const TOOL_METADATA_FETCH_SERVICE = 'tool.metadata.fetch'
+
+/** Wire-shape variants of `ToolMetadataResponse` (JSON-tagged on
+ * `type`, snake_case). Pinned by the substrate's
+ * `cortex::tool::ToolMetadataResponse` enum.
+ */
+export type ToolMetadataResponse =
+  | { type: 'found'; descriptor: ToolDescriptor }
+  | { type: 'not_found'; name: string }
+
+/**
+ * Pull a tool's full descriptor from a specific host by calling
+ * the auto-installed `tool.metadata.fetch` nRPC service. Useful
+ * when the local fold's capability-fold entry dropped the schema
+ * (size-budget-exceeded) and the agent needs the full
+ * input/output schemas for strict-mode provider lowering.
+ *
+ * Mirror of calling `mesh.call_typed(host, TOOL_METADATA_FETCH_SERVICE,
+ * { name: tool_id })` in the Rust SDK. The
+ * `tool.metadata.fetch` server-side handler is auto-installed on
+ * the host's first `serveTool` call.
+ */
+export async function fetchToolMetadata(
+  rpc: TypedMeshRpc,
+  hostNodeId: bigint,
+  toolId: string,
+  opts?: CallOptions,
+): Promise<ToolMetadataResponse> {
+  return rpc.call<{ name: string }, ToolMetadataResponse>(
+    hostNodeId,
+    TOOL_METADATA_FETCH_SERVICE,
+    { name: toolId },
+    opts,
+  )
+}
+
 // ============================================================================
 // Format translators — mirror of `net_sdk::tool::formats`
 // ============================================================================
