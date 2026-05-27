@@ -21,6 +21,7 @@ jobs:
   unit-tests:
     name: Unit tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net
@@ -64,6 +65,7 @@ jobs:
   integration-tests:
     name: Integration tests (Net, 3-node, Mikoshi, RedEX, CortEX, NetDB, nRPC, Dataforts, MeshDB, MeshOS)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net
@@ -283,6 +285,7 @@ jobs:
   loom-tests:
     name: Loom concurrency models
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net
@@ -331,6 +334,7 @@ jobs:
   rust-sdk-tests:
     name: Rust SDK tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net/sdk
@@ -389,6 +393,7 @@ jobs:
   node-tests:
     name: Node bindings tests (vitest)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net/bindings/node
@@ -454,6 +459,7 @@ jobs:
   sdk-ts-tests:
     name: TypeScript SDK tests (vitest + tsc)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net/sdk-ts
@@ -531,6 +537,7 @@ jobs:
   python-tests:
     name: Python bindings tests (pytest)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net/bindings/python
@@ -586,6 +593,7 @@ jobs:
   sdk-py-tests:
     name: Python SDK tests (sdk-py, pytest)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net/sdk-py
@@ -620,6 +628,7 @@ jobs:
   go-tests:
     name: Go bindings tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
 
@@ -707,6 +716,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net
@@ -770,6 +780,7 @@ jobs:
   ffi-clippy:
     name: FFI clippy (${{ matrix.crate.name }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -901,6 +912,7 @@ jobs:
     #     (pins the last-error envelope on every NULL-arm return)
     name: FFI tests (${{ matrix.crate.name }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -1160,6 +1172,7 @@ jobs:
     #   tests/dry_run.rs             — admin verb `--dry-run` envelope
     name: Net CLI tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net
@@ -1195,6 +1208,7 @@ jobs:
     # entries don't need a CI edit.
     name: Aggregator daemon tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net
@@ -1221,6 +1235,7 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net
@@ -1238,6 +1253,7 @@ jobs:
   doc:
     name: Documentation
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net
