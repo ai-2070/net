@@ -1,0 +1,35 @@
+net/crates/net/sdk-macros/README.md
+  s_099fa7d871e34d::t_d830f261ecda34 1-39
+net/crates/net/sdk-macros/Cargo.toml
+  s_099fa7d871e34d::t_6766df017d6c1b 1-21
+net/crates/net/Cargo.toml
+  s_099fa7d871e34d::t_b81046ea3d1ef0 5
+net/crates/net/sdk/Cargo.toml
+  s_099fa7d871e34d::t_d87b5a1daac903 172-177
+  s_099fa7d871e34d::t_22f28f790129ba 40-43
+net/crates/net/sdk/tests/tool_macro.rs
+  s_099fa7d871e34d::t_e6d5863890da73 1-139
+net/crates/net/sdk-macros/src/lib.rs
+  s_099fa7d871e34d::t_cb7bf3b26cdad1 1-327
+net/crates/net/sdk/src/lib.rs
+  s_099fa7d871e34d::t_926e2f95e089df 74-87,89-90
+  s_099fa7d871e34d::t_7a7d413c165fda 88
+net/crates/net/docs/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md
+  s_099fa7d871e34d::t_5d8cb4bf5863a5 86
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "00d79f2c17261e30e125b1c03d6bde1f3fa36318",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
