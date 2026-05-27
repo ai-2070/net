@@ -8120,7 +8120,7 @@ impl MeshNode {
                 description_metadata_key, streaming_metadata_key, tags_metadata_key,
             };
             let mut merged = caps;
-            for descriptor in self.tool_registry.snapshot() {
+            for descriptor in self.tool_registry.snapshot().iter() {
                 merged = merged.add_tag(format!("ai-tool:{}", descriptor.tool_id));
                 // Reconstruct a `ToolCapability` from the descriptor's
                 // wire-cheap fields; the schemas remain in metadata

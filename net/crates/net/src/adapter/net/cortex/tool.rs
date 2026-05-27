@@ -431,15 +431,25 @@ pub enum ToolMetadataResponse {
 /// `parking_lot::Mutex<HashMap<...>>` shape mirrors the existing
 /// `cancel_registry` + `tool_metadata` patterns in the codebase
 /// — sync access from the dispatch path, no async lock required.
+///
+/// Caches the snapshot as an `Arc<[ToolDescriptor]>` so the
+/// announce path (which calls `snapshot()` every announce — every
+/// capability-version bump) doesn't re-clone every descriptor when
+/// nothing has changed. Insert/remove invalidate the cache.
 #[derive(Debug, Default)]
 pub struct ToolMetadataRegistry {
-    inner: parking_lot::Mutex<HashMap<String, ToolDescriptor>>,
+    inner: parking_lot::Mutex<RegistryState>,
+}
+
+#[derive(Debug, Default)]
+struct RegistryState {
+    map: HashMap<String, ToolDescriptor>,
+    snapshot: Option<std::sync::Arc<[ToolDescriptor]>>,
 }
 
 impl ToolMetadataRegistry {
     /// Empty registry — what a fresh `MeshNode` ships with before
-    /// any `serve_tool` call. `Default::default()` works too;
-    /// keeping the named constructor so call sites read clearly.
+    /// any `serve_tool` call.
     pub fn new() -> Self {
         Self::default()
     }
@@ -450,20 +460,26 @@ impl ToolMetadataRegistry {
     /// rejects duplicate names rather than silently overwriting).
     pub fn insert(&self, descriptor: ToolDescriptor) -> Option<ToolDescriptor> {
         let mut guard = self.inner.lock();
-        guard.insert(descriptor.tool_id.clone(), descriptor)
+        guard.snapshot = None;
+        guard.map.insert(descriptor.tool_id.clone(), descriptor)
     }
 
     /// Look up the full descriptor for `name`. `None` when the
     /// host doesn't serve this tool. Cloned because the registry
     /// is mutex-protected; the clone is cheap (small heap fields).
     pub fn get(&self, name: &str) -> Option<ToolDescriptor> {
-        self.inner.lock().get(name).cloned()
+        self.inner.lock().map.get(name).cloned()
     }
 
     /// Remove the descriptor for `name`. Returns the removed entry
     /// if one existed. Called by the SDK's `serve_tool` Drop hook.
     pub fn remove(&self, name: &str) -> Option<ToolDescriptor> {
-        self.inner.lock().remove(name)
+        let mut guard = self.inner.lock();
+        let prev = guard.map.remove(name);
+        if prev.is_some() {
+            guard.snapshot = None;
+        }
+        prev
     }
 
     /// Returns the number of registered tools. Useful for the
@@ -471,22 +487,28 @@ impl ToolMetadataRegistry {
     /// `tool.metadata.fetch` service the first time the registry
     /// goes from empty to non-empty.
     pub fn len(&self) -> usize {
-        self.inner.lock().len()
+        self.inner.lock().map.len()
     }
 
     /// True when no tools are registered. Convenience used by the
     /// same auto-install branch (`registry.is_empty()` reads
     /// cleaner than `len() == 0` at the call site).
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().is_empty()
+        self.inner.lock().map.is_empty()
     }
 
-    /// Snapshot every descriptor as a `Vec`. Used by the
-    /// `tool.metadata.list` variant (a future addition) and by
-    /// `Deck` panels that want the full local set. Allocates;
-    /// callers that just want the count use `len()`.
-    pub fn snapshot(&self) -> Vec<ToolDescriptor> {
-        self.inner.lock().values().cloned().collect()
+    /// Snapshot every descriptor as a cached `Arc<[ToolDescriptor]>`.
+    /// First call after an insert/remove rebuilds the cache; later
+    /// calls share the same `Arc` for free.
+    pub fn snapshot(&self) -> std::sync::Arc<[ToolDescriptor]> {
+        let mut guard = self.inner.lock();
+        if let Some(s) = &guard.snapshot {
+            return s.clone();
+        }
+        let snap: std::sync::Arc<[ToolDescriptor]> =
+            guard.map.values().cloned().collect::<Vec<_>>().into();
+        guard.snapshot = Some(snap.clone());
+        snap
     }
 }
 
