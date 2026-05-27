@@ -8,11 +8,11 @@ on:
     # release workflow. The release workflows themselves run
     # their own build + tests against the same SHA; we don't
     # need CI to repeat them per tag.
-    branches: ['**']
+    branches: ["**"]
     paths:
-      - 'net/**'
-      - 'go/**'
-      - '.github/workflows/ci.yml'
+      - "net/**"
+      - "go/**"
+      - ".github/workflows/ci.yml"
 
 env:
   CARGO_TERM_COLOR: always
@@ -175,10 +175,15 @@ jobs:
           --test redex_replication_e2e
 
       # === CortEX + nRPC service surface ==================================
-      - name: CortEX + nRPC
+      # `tool` chains to `cortex` (see `tool = ["cortex"]` in
+      # Cargo.toml), so adding it here is feature-graph-cheap and
+      # keeps `integration_tool_announce` — the substrate-side
+      # serve_tool / announce / tool_metadata.fetch contract pin —
+      # in this group rather than spawning a fourth compile pass.
+      - name: CortEX + nRPC + AI Tools
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features cortex
+          cargo nextest run --no-fail-fast --features "cortex tool"
           --test integration_cortex_adapter
           --test integration_cortex_tasks
           --test integration_cortex_memories
@@ -193,6 +198,7 @@ jobs:
           --test integration_nrpc_predicate_header
           --test integration_nrpc_cross_lang
           --test integration_nrpc_cross_lang_streaming
+          --test integration_tool_announce
           --test nrpc_inbound_dispatcher
           --test queue_group_dispatch
           --test aggregator_fold_query
@@ -350,8 +356,8 @@ jobs:
       # service containers land — same policy as the main crate's
       # `integration_redis`). Without this width, tests gated on
       # `cortex` / `testing` / `compute` / `nat-traversal` /
-      # `port-mapping` compile to empty test binaries and the
-      # contract goes silently unverified.
+      # `port-mapping` / `tool` / `macros` compile to empty test
+      # binaries and the contract goes silently unverified.
       # `cargo test` auto-discovers every `tests/*.rs` file under
       # `sdk/tests/`; the step name calls out the load-bearing
       # ones so a missing test binary is obvious in the CI log:
@@ -359,15 +365,26 @@ jobs:
       #   - mesh_rpc_bidi_typed     — Phase E client-streaming +
       #     duplex typed SDK surface (5 tests). Gated on
       #     `feature = "net" + "cortex"`, both present here.
-      - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed)
-        run: cargo test --features "net cortex testing compute nat-traversal port-mapping aggregator"
+      #   - tool_serve_round_trip   — Mesh::serve_tool + call_tool +
+      #     watch_tools live two-mesh path. Gated on
+      #     `feature = "tool" + "cortex"`.
+      #   - tool_format_golden_vectors — T-1 byte-equality
+      #     verifier (openai / anthropic / mcp / gemini lowering +
+      #     reverse). Gated on `feature = "tool"`.
+      #   - tool_event_golden_vectors  — T-2 ToolEvent envelope
+      #     round-trip verifier. Gated on `feature = "tool"`.
+      #   - tool_macro              — `#[tool]` proc-macro
+      #     expansion + serve-helper round-trip. Gated on
+      #     `feature = "macros" + "cortex"`.
+      - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed, tool_*)
+        run: cargo test --features "net cortex testing compute nat-traversal port-mapping aggregator tool macros"
 
       # SDK doctests — `///` examples in `sdk/src/`. Same feature set
       # as the test run so doc examples gated on those features
       # compile.
       - name: Run Rust SDK doctests
         if: ${{ !cancelled() }}
-        run: cargo test --doc --features "net cortex testing compute nat-traversal port-mapping"
+        run: cargo test --doc --features "net cortex testing compute nat-traversal port-mapping tool macros"
 
   node-tests:
     name: Node bindings tests (vitest)
