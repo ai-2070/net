@@ -1,0 +1,22 @@
+net/crates/net/sdk/Cargo.toml
+  s_099fa7d871e34d::t_5ef2956bd7838a 51-53
+  s_099fa7d871e34d::t_2c53bf91c3975c 228-234
+net/crates/net/sdk/examples/tool_calling.rs
+  s_099fa7d871e34d::t_af0b17b8c0f10b 1-203
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "ad0208c6f585e2d8222b45b4d711280c0b6ffb2f",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
