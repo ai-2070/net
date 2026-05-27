@@ -34,6 +34,11 @@ extern int net_rpc_list_tools(
     uint8_t** out_json_ptr, size_t* out_json_len,
     char** out_err
 );
+
+// Re-declared here because cgo preludes don't cross files —
+// `mesh_rpc.go`'s prelude already declares this, but tool.go's
+// own ListTools path also needs to free the returned JSON buffer.
+extern void net_rpc_response_free(uint8_t* ptr, size_t len);
 */
 import "C"
 
