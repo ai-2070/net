@@ -168,28 +168,77 @@ def descriptor_for(
 @dataclass
 class ToolServeHandle:
     """Handle returned by :func:`serve_tool`. Call ``.close()`` to
-    deregister the underlying nRPC handler. Idempotent; second
-    ``.close()`` is a no-op. Mirror of the Rust
+    deregister the underlying nRPC handler + remove the descriptor
+    from the per-rpc registry that backs ``tool.metadata.fetch``.
+    Idempotent; second ``.close()`` is a no-op. Mirror of the Rust
     ``ToolServeHandle``'s Drop semantics.
-
-    NOTE: v1 does NOT integrate with the substrate-side
-    ``tool_registry``, so the ``ai-tool:<tool_id>`` capability tag
-    must be added to the caller's announce explicitly. See
-    :func:`add_tool_capabilities_to_announce`. Once pyo3 exposes
-    ``tool_registry()`` (Wave 3 follow-up), this handle will
-    atomically reverse both the registry insert and the handler
-    registration on ``.close()``.
     """
 
     descriptor: ToolDescriptor
     _inner: ServeHandle
+    _registry: Optional[Dict[str, "ToolDescriptor"]] = None
     _closed: bool = False
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        if self._registry is not None:
+            self._registry.pop(self.descriptor.tool_id, None)
         self._inner.close()
+
+
+# Per-rpc descriptor registries keyed by `TypedMeshRpc` id. Each
+# entry holds a `dict[tool_id -> ToolDescriptor]` and an optional
+# fetch-handler ServeHandle. The fetch handler is lazy-installed on
+# the first `serve_tool` call against a given rpc and stays alive
+# for the rpc's lifetime — harmless when the registry is empty
+# (returns NotFound for every request). Mirrors the Rust SDK's
+# `ensure_tool_metadata_fetch_installed` pattern.
+_tool_registries: Dict[int, Dict[str, Any]] = {}
+
+
+def _ensure_fetch_installed(rpc: TypedMeshRpc) -> dict:
+    key = id(rpc)
+    entry = _tool_registries.get(key)
+    if entry is not None:
+        return entry
+    registry: Dict[str, ToolDescriptor] = {}
+
+    def _fetch_handler(req: dict) -> dict:
+        name = req.get("name", "")
+        desc = registry.get(name)
+        if desc is None:
+            return {"type": "not_found", "name": name}
+        return {
+            "type": "found",
+            "descriptor": {
+                "tool_id": desc.tool_id,
+                "name": desc.name,
+                "version": desc.version,
+                "description": desc.description,
+                "input_schema": desc.input_schema,
+                "output_schema": desc.output_schema,
+                "requires": desc.requires,
+                "estimated_time_ms": desc.estimated_time_ms,
+                "stateless": desc.stateless,
+                "streaming": desc.streaming,
+                "tags": desc.tags,
+                "node_count": desc.node_count,
+            },
+        }
+
+    try:
+        fetch_handle = rpc.serve(TOOL_METADATA_FETCH_SERVICE, _fetch_handler)
+    except Exception:
+        # If install fails (service name already taken), leave it
+        # null and retry on subsequent serve_tool calls. Failure
+        # surfaces to the agent side as NoRoute / NotFound from
+        # fetch_tool_metadata.
+        fetch_handle = None
+    entry = {"registry": registry, "fetch_handle": fetch_handle}
+    _tool_registries[key] = entry
+    return entry
 
 
 def serve_tool(
@@ -236,8 +285,14 @@ def serve_tool(
         raise TypeError(
             "serve_tool: options_or_descriptor must be ToolDescriptor, dict, or str"
         )
+    entry = _ensure_fetch_installed(rpc)
+    entry["registry"][descriptor.tool_id] = descriptor
     inner = rpc.serve(descriptor.tool_id, handler)
-    return ToolServeHandle(descriptor=descriptor, _inner=inner)
+    return ToolServeHandle(
+        descriptor=descriptor,
+        _inner=inner,
+        _registry=entry["registry"],
+    )
 
 
 def call_tool(

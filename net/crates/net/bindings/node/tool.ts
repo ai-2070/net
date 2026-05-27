@@ -216,20 +216,71 @@ export interface ToolServeHandle {
   close(): void
 }
 
+// Per-rpc descriptor registries — keyed by `TypedMeshRpc` so each
+// rpc has its own tool_id → descriptor map. The `tool.metadata.fetch`
+// handler is lazy-installed on the first serveTool() against a
+// given rpc (one handle per rpc, dropped only when the process
+// exits — same lifetime contract the Rust SDK's
+// `ensure_tool_metadata_fetch_installed` follows).
+interface ToolRegistryEntry {
+  registry: Map<string, ToolDescriptor>
+  fetchHandle: ServeHandle | null
+}
+const _toolRegistries: WeakMap<TypedMeshRpc, ToolRegistryEntry> = new WeakMap()
+
+function _ensureFetchInstalled(rpc: TypedMeshRpc): ToolRegistryEntry {
+  let entry = _toolRegistries.get(rpc)
+  if (entry) return entry
+  entry = { registry: new Map(), fetchHandle: null }
+  _toolRegistries.set(rpc, entry)
+  // Register the fetch handler. The handler queries `entry.registry`
+  // for the name; falls back to NotFound. Mirrors the Rust SDK's
+  // `tool.metadata.fetch` handler shape.
+  try {
+    entry.fetchHandle = rpc.serve<{ name: string }, ToolMetadataResponse>(
+      TOOL_METADATA_FETCH_SERVICE,
+      (req) => {
+        const d = entry!.registry.get(req.name)
+        return d
+          ? { type: 'found', descriptor: d }
+          : { type: 'not_found', name: req.name }
+      },
+    )
+  } catch {
+    // If install fails (e.g. another caller already registered the
+    // service manually), leave fetchHandle null. Subsequent serveTool
+    // calls retry. Silent because the failure is recoverable +
+    // observable via `fetchToolMetadata` returning NoRoute / NotFound
+    // on the agent side.
+  }
+  return entry
+}
+
 /**
  * Register an AI tool against `rpc`. The handler is registered as
  * an nRPC service at `descriptor.toolId` with JSON codec (same as
  * the Rust SDK's `Mesh::serve_tool`).
  *
- * The caller is responsible for announcing the tool to peers — use
- * [`addToolCapabilitiesToAnnounce`] on the `CapabilitySetJs` you
- * pass to `mesh.announceCapabilities(...)` so the
- * `ai-tool:<toolId>` tag + the `ToolJs` entry land on the wire.
+ * Atomically:
+ * 1. Inserts the descriptor into a per-rpc local registry keyed on
+ *    `toolId`. The next [`fetchToolMetadata`] call against this
+ *    host can resolve the descriptor by name.
+ * 2. Registers the typed handler at `toolId` with JSON codec.
+ * 3. On the FIRST `serveTool` call against this rpc, lazy-
+ *    installs the `tool.metadata.fetch` nRPC service handler so
+ *    remote agents can pull the full descriptor for any
+ *    registered tool. Subsequent `serveTool` calls reuse the
+ *    same fetch handler. Mirrors the Rust SDK's
+ *    `ensure_tool_metadata_fetch_installed` pattern.
  *
- * Wave 3 follow-up: once the napi surface exposes
- * `tool_registry()`, this helper will atomically insert there too,
- * making the announce-time merge automatic (matching the Rust
- * SDK's contract).
+ * The caller is still responsible for announcing the tool to
+ * peers — use [`addToolCapabilitiesToAnnounce`] on the
+ * `CapabilitySetJs` you pass to `mesh.announceCapabilities(...)`.
+ *
+ * On `handle.close()`: removes the descriptor from the per-rpc
+ * registry and unregisters the handler. The lazy `tool.metadata.fetch`
+ * service stays installed for the lifetime of the rpc — harmless
+ * when empty (returns NotFound for every request).
  */
 export function serveTool<Req = unknown, Resp = unknown>(
   rpc: TypedMeshRpc,
@@ -237,6 +288,8 @@ export function serveTool<Req = unknown, Resp = unknown>(
   handler: ToolHandler<Req, Resp>,
 ): ToolServeHandle {
   const descriptor = descriptorFrom(options)
+  const entry = _ensureFetchInstalled(rpc)
+  entry.registry.set(descriptor.toolId, descriptor)
   const inner: ServeHandle = rpc.serve<Req, Resp>(descriptor.toolId, handler)
   let closed = false
   return {
@@ -244,6 +297,7 @@ export function serveTool<Req = unknown, Resp = unknown>(
     close() {
       if (closed) return
       closed = true
+      entry.registry.delete(descriptor.toolId)
       inner.close()
     },
   }
