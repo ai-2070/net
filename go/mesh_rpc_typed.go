@@ -92,6 +92,13 @@ extern int net_rpc_metrics_snapshot(
     char** out_err
 );
 
+// Re-declared here because cgo preludes don't cross files —
+// `mesh_rpc.go`'s prelude declares these too, but this file
+// also needs them (for the metrics-snapshot error path +
+// returned-JSON buffer free below).
+extern void net_rpc_free_cstring(char* s);
+extern void net_rpc_response_free(uint8_t* ptr, size_t len);
+
 // Go-side trampoline that bridges from C → Go. Declared here so the
 // cgo prelude can take its address when registering the dispatcher;
 // the definition is the //export below.
