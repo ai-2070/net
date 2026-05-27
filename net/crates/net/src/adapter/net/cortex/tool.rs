@@ -241,8 +241,9 @@ pub enum ToolEvent {
         /// `{"chunk": "<base64>"}` for binary file chunks.
         data: serde_json::Value,
     },
-    /// Terminal full result. Client sees exactly one [`Result`] OR
-    /// one [`Error`] per stream — never both.
+    /// Terminal full result. Client sees exactly one
+    /// [`Result`](ToolEvent::Result) OR one
+    /// [`Error`](ToolEvent::Error) per stream — never both.
     Result {
         /// Final result payload. Conforms to the tool's
         /// `output_schema` when one is published.

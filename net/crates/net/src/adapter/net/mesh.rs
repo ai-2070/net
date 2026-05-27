@@ -5362,7 +5362,8 @@ impl MeshNode {
     }
 
     /// Walk the capability fold for every `ToolCapability` carried
-    /// in a published `CapabilitySet`, reconstruct a [`ToolDescriptor`]
+    /// in a published `CapabilitySet`, reconstruct a
+    /// [`ToolDescriptor`](crate::adapter::net::cortex::tool::ToolDescriptor)
     /// per (tool_id, version), and return the deduped list with
     /// `node_count` filled in.
     ///
@@ -5502,17 +5503,19 @@ impl MeshNode {
         out
     }
 
-    /// Subscribe to a stream of [`ToolListChange`] events that
-    /// reflect every dynamic addition / removal / publisher-count
-    /// change in the local capability fold's tool view, filtered by
-    /// `matcher` (same semantic as
+    /// Subscribe to a stream of
+    /// [`ToolListChange`](crate::adapter::net::cortex::tool::ToolListChange)
+    /// events that reflect every dynamic addition / removal /
+    /// publisher-count change in the local capability fold's tool
+    /// view, filtered by `matcher` (same semantic as
     /// [`Self::list_tools`]).
     ///
-    /// The returned [`ToolListWatch`] is a
-    /// `futures::Stream<Item = ToolListChange>`. The first event
-    /// fires AFTER the initial snapshot — callers that need the
-    /// baseline shape should call `list_tools` first and then start
-    /// the watch.
+    /// The returned
+    /// [`ToolListWatch`](crate::adapter::net::cortex::tool::ToolListWatch)
+    /// is a `futures::Stream<Item = ToolListChange>`. The first
+    /// event fires AFTER the initial snapshot — callers that need
+    /// the baseline shape should call `list_tools` first and then
+    /// start the watch.
     ///
     /// Backed by a polling task: every `interval` (default `1s`
     /// when `None`), the task re-runs `list_tools(&matcher)` and
@@ -5521,9 +5524,10 @@ impl MeshNode {
     /// cost of CPU; loose intervals are kinder to large folds.
     ///
     /// Lifecycle:
-    /// - Dropping the [`ToolListWatch`] stops the polling task on
-    ///   the next tick (the task observes the closed sender and
-    ///   exits).
+    /// - Dropping the
+    ///   [`ToolListWatch`](crate::adapter::net::cortex::tool::ToolListWatch)
+    ///   stops the polling task on the next tick (the task observes
+    ///   the closed sender and exits).
     /// - The watch handle never errors: a dropped fold (impossible
     ///   while the `MeshNode` arc is alive) would simply end the
     ///   stream. Decode-style errors don't exist here — the
