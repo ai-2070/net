@@ -1471,11 +1471,11 @@ impl CapabilitySet {
         serde_json::to_vec(self).unwrap_or_default()
     }
 
-    /// Serialize to bytes using the compact postcard wire format
-    /// (single leading [`COMPACT_FORMAT_TAG`] version byte followed by
-    /// the postcard payload). [`Self::from_bytes`] reads either format
-    /// via first-byte sniff, so receivers running this code accept
-    /// both compact and JSON inputs.
+    /// Serialize to bytes using the compact postcard wire format —
+    /// a single leading `0x01` version byte followed by the postcard
+    /// payload. [`Self::from_bytes`] reads either format via
+    /// first-byte sniff, so receivers running this code accept both
+    /// compact and JSON inputs.
     ///
     /// See `docs/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` fix #3 for
     /// the rollout staging — flipping `to_bytes` itself to compact is
@@ -1488,8 +1488,8 @@ impl CapabilitySet {
     /// Deserialize from bytes. Accepts both the legacy JSON wire
     /// format (peers running pre-postcard code) and the compact
     /// postcard format (peers using [`Self::to_bytes_compact`]).
-    /// Discriminates on the first byte: `b'{'` → JSON,
-    /// [`COMPACT_FORMAT_TAG`] → postcard, anything else → `None`.
+    /// Discriminates on the first byte: `b'{'` → JSON, `0x01` →
+    /// postcard, anything else → `None`.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         match data.first() {
             Some(&b'{') => serde_json::from_slice(data).ok(),
