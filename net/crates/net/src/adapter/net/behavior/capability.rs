@@ -916,10 +916,33 @@ impl CapabilitySet {
     /// since tools live in the canonical tag set as
     /// `software.tool.<i>.*` indexed-encoding; schemas are mirrored
     /// into `metadata` by `set_tools`.
+    ///
+    /// For adding more than one tool, prefer
+    /// [`Self::add_tools`] — the batch form invokes `set_tools`
+    /// exactly once instead of N times, dropping the announce-path
+    /// cost from O(N²) to O(N).
     pub fn add_tool(mut self, tool: ToolCapability) -> Self {
         let mut tools = self.views().tools().clone();
         tools.push(tool);
         self.set_tools(tools);
+        self
+    }
+
+    /// Batch counterpart to [`Self::add_tool`] — extends the current
+    /// tool list with every element of `tools` and invokes
+    /// `set_tools` exactly once. The single-`set_tools` call clears
+    /// stale tags + metadata once and re-encodes the final list, so
+    /// the cost is O(N) regardless of how many tools the iterator
+    /// yields.
+    ///
+    /// Use this from announce paths that drain a `tool_registry`
+    /// (which can hold many tools); the per-call `add_tool` rebuilds
+    /// every previously-added tool's tags + metadata, an O(N²)
+    /// pattern in the size of the registry.
+    pub fn add_tools(mut self, tools: impl IntoIterator<Item = ToolCapability>) -> Self {
+        let mut merged = self.views().tools().clone();
+        merged.extend(tools);
+        self.set_tools(merged);
         self
     }
 
@@ -2778,6 +2801,55 @@ mod tests {
             Some("ml-training")
         );
     }
+    /// E-2 regression: add_tools must produce the same final
+    /// CapabilitySet as N successive add_tool calls, but via one
+    /// set_tools invocation. We verify the equivalence by building
+    /// the same capability set both ways and comparing.
+    #[test]
+    fn add_tools_batch_matches_repeated_add_tool() {
+        let tools = vec![
+            ToolCapability::new("web_search", "Web Search").with_version("1.0.0"),
+            ToolCapability::new("summarize", "Summarize").with_version("1.0.0"),
+            ToolCapability::new("code_eval", "Code Eval")
+                .with_version("2.0.0")
+                .with_input_schema(r#"{"type":"object"}"#),
+        ];
+
+        let via_repeated = tools.iter().fold(CapabilitySet::new(), |caps, t| {
+            caps.add_tool(t.clone())
+        });
+        let via_batch = CapabilitySet::new().add_tools(tools.iter().cloned());
+
+        // Tag sets must be byte-equal (the canonical software.tool.*
+        // indexed encoding is order-stable for set_tools).
+        assert_eq!(via_repeated.tags, via_batch.tags);
+        // Schema metadata must be byte-equal too — set_tools is the
+        // codepath that mirrors input/output schemas.
+        assert_eq!(via_repeated.metadata, via_batch.metadata);
+        // And the typed view must agree.
+        assert_eq!(
+            via_repeated.views().tools().len(),
+            via_batch.views().tools().len()
+        );
+    }
+
+    /// E-2 regression: add_tools onto a non-empty set must extend,
+    /// not replace. Guards against a future implementation that
+    /// might mistakenly call `set_tools(iter.collect())` and drop
+    /// the prior tools.
+    #[test]
+    fn add_tools_extends_existing_tools() {
+        let caps = CapabilitySet::new()
+            .add_tool(ToolCapability::new("first", "First").with_version("1.0.0"))
+            .add_tools(vec![
+                ToolCapability::new("second", "Second").with_version("1.0.0"),
+                ToolCapability::new("third", "Third").with_version("1.0.0"),
+            ]);
+        assert!(caps.has_tool("first"));
+        assert!(caps.has_tool("second"));
+        assert!(caps.has_tool("third"));
+    }
+
     #[test]
     fn has_tag_matches_across_separator_forms() {
         // Regression for CR-1: `Tag::AxisValue` derives `PartialEq`

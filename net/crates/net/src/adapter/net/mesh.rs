@@ -8119,28 +8119,35 @@ impl MeshNode {
             use crate::adapter::net::cortex::tool::{
                 description_metadata_key, streaming_metadata_key, tags_metadata_key,
             };
-            let mut merged = caps;
-            for descriptor in self.tool_registry.snapshot().iter() {
+            let snapshot = self.tool_registry.snapshot();
+            // Reconstruct ToolCapability values from each descriptor's
+            // wire-cheap fields; schemas stay in metadata (the fold
+            // has its own schema-too-large branch) so the typed-cap
+            // payload doesn't bloat.
+            let tools_to_add: Vec<ToolCapability> = snapshot
+                .iter()
+                .map(|descriptor| {
+                    let mut cap = ToolCapability::new(&descriptor.tool_id, &descriptor.name)
+                        .with_version(&descriptor.version)
+                        .with_estimated_time(descriptor.estimated_time_ms)
+                        .with_stateless(descriptor.stateless);
+                    if let Some(ref schema) = descriptor.input_schema {
+                        cap = cap.with_input_schema(schema.clone());
+                    }
+                    if let Some(ref schema) = descriptor.output_schema {
+                        cap = cap.with_output_schema(schema.clone());
+                    }
+                    for req in &descriptor.requires {
+                        cap = cap.requires(req.clone());
+                    }
+                    cap
+                })
+                .collect();
+            // Single set_tools call; O(N) total instead of the
+            // O(N²) chain of per-tool add_tool invocations.
+            let mut merged = caps.add_tools(tools_to_add);
+            for descriptor in snapshot.iter() {
                 merged = merged.add_tag(format!("ai-tool:{}", descriptor.tool_id));
-                // Reconstruct a `ToolCapability` from the descriptor's
-                // wire-cheap fields; the schemas remain in metadata
-                // (large enough that the fold has its own
-                // schema-too-large branch) so this doesn't bloat the
-                // typed-cap payload.
-                let mut cap = ToolCapability::new(&descriptor.tool_id, &descriptor.name)
-                    .with_version(&descriptor.version)
-                    .with_estimated_time(descriptor.estimated_time_ms)
-                    .with_stateless(descriptor.stateless);
-                if let Some(ref schema) = descriptor.input_schema {
-                    cap = cap.with_input_schema(schema.clone());
-                }
-                if let Some(ref schema) = descriptor.output_schema {
-                    cap = cap.with_output_schema(schema.clone());
-                }
-                for req in &descriptor.requires {
-                    cap = cap.requires(req.clone());
-                }
-                merged = merged.add_tool(cap);
                 // Description + streaming + tags ride the metadata
                 // extensibility hook (same convention input/output
                 // schemas already use). Pre-tool peers receive these
