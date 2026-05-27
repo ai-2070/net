@@ -256,6 +256,48 @@ def call_tool(
     return rpc.call_service(tool_id, request, opts)
 
 
+def list_tools(mesh: Any) -> List[ToolDescriptor]:
+    """Walk the local capability fold for every published AI tool.
+
+    Returns a list of :class:`ToolDescriptor` instances, one per
+    ``(tool_id, version)`` slot, with ``node_count`` filled in by
+    the aggregating walk.
+
+    Pure delegation to the pyo3 binding's ``NetMesh.list_tools()``
+    (C-3 of the plan). Requires the pyo3 binding's ``tool`` Cargo
+    feature (default-on).
+
+    Schemas come back as JSON-encoded strings on
+    ``descriptor.input_schema`` / ``descriptor.output_schema`` —
+    call ``json.loads(...)`` for the parsed shape that adapter
+    packages consume when lowering into provider-specific tool
+    definitions.
+
+    The native binding returns plain dicts; this wrapper converts
+    them into :class:`ToolDescriptor` dataclass instances for type
+    safety and IDE autocomplete.
+    """
+    out: List[ToolDescriptor] = []
+    for d in mesh.list_tools():
+        out.append(
+            ToolDescriptor(
+                tool_id=d["tool_id"],
+                name=d["name"],
+                version=d["version"],
+                description=d.get("description"),
+                input_schema=d.get("input_schema"),
+                output_schema=d.get("output_schema"),
+                requires=list(d.get("requires") or []),
+                estimated_time_ms=d.get("estimated_time_ms", 0),
+                stateless=d.get("stateless", True),
+                streaming=d.get("streaming", False),
+                tags=list(d.get("tags") or []),
+                node_count=d.get("node_count", 0),
+            )
+        )
+    return out
+
+
 def add_tool_capabilities_to_announce(
     caps: Dict[str, Any],
     descriptors: List[ToolDescriptor],
@@ -558,6 +600,7 @@ __all__ = [
     "descriptor_for",
     "serve_tool",
     "call_tool",
+    "list_tools",
     "add_tool_capabilities_to_announce",
     "is_terminal_event",
     "openai",

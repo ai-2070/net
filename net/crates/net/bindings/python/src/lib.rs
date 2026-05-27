@@ -52,7 +52,7 @@ mod subnets;
 use parking_lot::RwLock;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
@@ -1889,6 +1889,56 @@ mod mesh_bindings {
             Ok(super::capabilities::with_scope_filter(&owned, |sf| {
                 node.find_nodes_by_filter_scoped(&core, sf)
             }))
+        }
+
+        /// Walk the local capability fold for every published AI
+        /// tool. Returns a list of dicts mirroring the substrate's
+        /// `ToolDescriptor` (one row per `(tool_id, version)`
+        /// slot, with `node_count` filled in by the aggregating
+        /// walk).
+        ///
+        /// One in-memory pass; no network. Schemas come back as
+        /// JSON-encoded strings on `descriptor["input_schema"]` /
+        /// `descriptor["output_schema"]` — call `json.loads(...)`
+        /// for the parsed shape that adapter packages consume when
+        /// lowering into provider-specific tool definitions.
+        ///
+        /// Mirror of the Rust SDK's `Mesh::list_tools(None)`. v1
+        /// always walks unfiltered; matcher-pushdown lands in a
+        /// follow-up that adds a `matcher` arg.
+        ///
+        /// Gated on the `tool` Cargo feature (default-on).
+        #[cfg(feature = "tool")]
+        fn list_tools(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+            let node = self.get_node()?;
+            let descriptors = node.list_tools(None);
+            let out = PyList::empty(py);
+            for d in descriptors {
+                let entry = PyDict::new(py);
+                entry.set_item("tool_id", d.tool_id)?;
+                entry.set_item("name", d.name)?;
+                entry.set_item("version", d.version)?;
+                match d.description {
+                    Some(s) => entry.set_item("description", s)?,
+                    None => entry.set_item("description", py.None())?,
+                }
+                match d.input_schema {
+                    Some(s) => entry.set_item("input_schema", s)?,
+                    None => entry.set_item("input_schema", py.None())?,
+                }
+                match d.output_schema {
+                    Some(s) => entry.set_item("output_schema", s)?,
+                    None => entry.set_item("output_schema", py.None())?,
+                }
+                entry.set_item("requires", d.requires)?;
+                entry.set_item("estimated_time_ms", d.estimated_time_ms)?;
+                entry.set_item("stateless", d.stateless)?;
+                entry.set_item("streaming", d.streaming)?;
+                entry.set_item("tags", d.tags)?;
+                entry.set_item("node_count", d.node_count)?;
+                out.append(entry)?;
+            }
+            Ok(out.into())
         }
 
         /// Bucketed aggregation over the local capability fold —

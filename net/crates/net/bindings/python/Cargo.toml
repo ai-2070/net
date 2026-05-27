@@ -41,6 +41,7 @@ default = [
     "meshdb",
     "redis",
     "aggregator",
+    "tool",
 ]
 # Pulls in `net-sdk` at its `redis` sub-feature for the
 # `RedisStreamDedup` consumer helper. The dedup helper is a thin
@@ -66,6 +67,12 @@ nat-traversal = ["net", "net/nat-traversal"]
 # on `nat-traversal`.
 port-mapping = ["nat-traversal", "net/port-mapping"]
 cortex = ["net/netdb", "net/redex-disk", "dep:async-trait"]
+# AI tool calling — exposes MeshNode::list_tools() through the
+# pyo3 NetMesh as `mesh.list_tools()`. Includes the substrate's
+# `tool::*` types (ToolDescriptor, ToolEvent, ToolMetadataRegistry,
+# tool.metadata.fetch RPC). On by default; binary cost is small.
+# See AGENT_TOOLS.md for the surface contract.
+tool = ["net/tool", "cortex"]
 # MeshDB query layer — federated AST + planner + executor + result cache.
 # Standalone of the `net` feature: the Python SDK's first MeshDB slice
 # ships a local executor over an in-memory ChainReader, so it doesn't
