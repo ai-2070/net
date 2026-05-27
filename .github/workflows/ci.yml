@@ -600,8 +600,18 @@ jobs:
       # never gets interrupted. Thread-mode wakes a watchdog after
       # the deadline regardless of where the test is blocked and
       # dumps a full Python + C frame for the hung test.
+      #
+      # `-x` (stop at first failure) ensures pytest's summary —
+      # including the FAILED test's traceback — flushes before
+      # GHA's 20-minute job-timeout kills the runner. Without it,
+      # a hung test downstream of a real failure swallows the
+      # failure's traceback into the cancelled job.
+      #
+      # `--timeout=30` (was 60) so even if a hang lands 19 min into
+      # the run, the watchdog still has a minute of budget to dump
+      # the offender before the 20-minute job ceiling fires.
       - name: Run tests
-        run: pytest -v --timeout=60 --timeout-method=thread
+        run: pytest -v -x --timeout=30 --timeout-method=thread
 
   sdk-py-tests:
     name: Python SDK tests (sdk-py, pytest)
