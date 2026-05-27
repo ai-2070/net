@@ -93,7 +93,7 @@ Tagged `[S | A | B | C | D | M | T | X]`:
 | C-3   | H   | Python            | `await mesh.list_tools(matcher=...)` + `async for change in mesh.watch_tools(matcher=...)`       | ✅     |
 | C-4   | H   | Python            | `call_tool` + `call_tool_async` + `call_tool_streaming{,_async}` + `fetch_tool_metadata{,_async}` | ✅     |
 | D-1   | M   | Go                | `net.RegisterTool[Req, Resp]` + auto-install of `tool.metadata.fetch` + `CallToolStreaming` (streaming caller) | ✅ (caller-side; streaming server-side `RegisterStreamingTool` still ⏳) |
-| D-2   | M   | Go                | `mesh.ListTools(ctx, matcher)` + `mesh.WatchTools(ctx, matcher) <-chan ToolListChange`           | ⏳     |
+| D-2   | M   | Go                | `net.ListTools(rpc)` + `net.WatchTools(ctx, rpc, opts) (changes, errs, baseline, err)`           | ✅     |
 | M-1   | H   | format pkg (Py)   | `net_mesh.tools.formats.openai` — `to_openai_tool(desc)` + `lower_tool_call(call) -> CallSpec`  | ✅     |
 | M-2   | H   | format pkg (Py)   | `net_mesh.tools.formats.anthropic` — same shape; streaming via `tool_use_block_delta`           | ✅     |
 | M-3   | H   | format pkg (Py)   | `net_mesh.tools.formats.hermes` — `create_net_tool_provider(mesh, matcher?)` + `list_tools` / `watch_tools` wiring into Hermes's tool-provider contract | ⏳     |
@@ -112,25 +112,25 @@ Legend: ✅ done · 🟡 partial (caller-side streaming + unary + invoke + disco
 
 No wire ABI bump for unary tool calls. Streaming tools use `S-1`'s new `call_service_streaming` substrate primitive; the wire shape of an individual stream is unchanged from `call_streaming` today. `ToolEvent` envelopes are JSON-encoded chunks on existing streams.
 
-### Status by language (as of streaming-caller landing)
+### Status by language (as of Go discovery landing)
 
 | Surface                    | Rust | Node TS | Python | Go  |
 |----------------------------|------|---------|--------|-----|
 | `serve_tool` / `call_tool` (unary) | ✅   | ✅       | ✅ (sync + async)      | ✅  |
 | `call_tool_streaming` (capability-routed streaming caller) | ✅ | ✅ | ✅ (sync + async) | ✅ |
 | `serve_tool_streaming` (server-side handler ergonomics) | ✅ | ⏳ | ⏳ | ⏳ |
-| `list_tools` / `watch_tools` | ✅ | ✅ (polling) | ✅ (polling) | ⏳ |
+| `list_tools` / `watch_tools` | ✅ | ✅ (polling) | ✅ (polling) | ✅ (polling) |
 | Format translators × 4     | ✅   | ✅       | ✅      | ✅  |
 | `tool.metadata.fetch` (caller) | ✅ | ✅       | ✅ (sync + async)      | ✅  |
 | `tool.metadata.fetch` (server, auto-installed on first `serve_tool`) | ✅ | ✅ | ✅ | ✅ |
 | `missing_terminal` synthesis on streaming caller | ✅ | ✅ | ✅ | ✅ |
-| AbortSignal / cancel on `watch_tools` | ✅ | ✅ | ✅ | n/a |
+| AbortSignal / cancel on `watch_tools` | ✅ | ✅ | ✅ | ✅ (ctx) |
 | **T-1 byte-equality fixture** | ✅ | ✅       | ✅      | ✅  |
 | **T-2 ToolEvent round-trip** | ✅ | ✅       | ✅      | ✅  |
 
-Remaining ⏳ items: `serve_tool_streaming` (handler-side generator ergonomics) outside Rust, and `list_tools`/`watch_tools` in Go. The streaming-caller path is fully wired across all four languages — every binding now resolves `nrpc:<service>` via the capability fold, applies the cap-auth gate, and drains a ToolEvent stream with a uniform `missing_terminal` synthesis if the host's handler exits without a terminal envelope.
+Only remaining ⏳ item: `serve_tool_streaming` (handler-side generator ergonomics) outside Rust. Every other row is ✅ across all four bindings.
 
-The handler-side ergonomics (`serve_tool_streaming`) need an FFI extension to surface the streaming-serve registration shape (`call_streaming_serve_*`). Until that lands, streaming handlers can be authored via the existing `serve_streaming` typed surface and a manual ToolEvent encoder; the wrapper in this slice is just sugar.
+The handler-side ergonomics need an FFI extension to surface the streaming-serve registration shape (`call_streaming_serve_*`). Until that lands, streaming handlers can be authored via the existing `serve_streaming` typed surface and a manual ToolEvent encoder; the wrapper in this slice is just sugar.
 
 ### Operating contract pinned by T-1 + T-2
 
