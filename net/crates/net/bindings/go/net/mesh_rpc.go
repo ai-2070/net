@@ -305,6 +305,29 @@ extern void net_rpc_set_duplex_handler_dispatcher(
     RpcDuplexHandlerFn dispatcher
 );
 
+// Server-streaming dispatcher + serve. Mirrors the duplex surface
+// minus the request-stream half — handler gets a single request
+// body once and pushes response chunks via the sink.
+typedef int (*RpcStreamingHandlerFn)(
+    uint64_t handler_id,
+    const uint8_t* req_ptr, size_t req_len,
+    RpcResponseSinkHandleC* response_sink,
+    char** out_err);
+extern void net_rpc_set_streaming_handler_dispatcher(
+    RpcStreamingHandlerFn dispatcher);
+extern ServeHandleC* net_rpc_serve_streaming(
+    MeshRpcHandle* handle,
+    const char* service_ptr, size_t service_len,
+    uint64_t handler_id,
+    uint64_t handler_timeout_ms,
+    char** out_err);
+// Go-side trampoline registered by registerStreamingDispatcher.
+extern int go_net_rpc_streaming_trampoline(
+    uint64_t handler_id,
+    const uint8_t* req_ptr, size_t req_len,
+    RpcResponseSinkHandleC* response_sink,
+    char** out_err);
+
 extern ServeHandleC* net_rpc_serve_client_stream(
     MeshRpcHandle* handle,
     const char* service_ptr, size_t service_len,
@@ -2075,9 +2098,16 @@ type ClientStreamingHandler func(stream *RequestStreamRecv) ([]byte, error)
 // via the sink. Returns nil for clean close, an error otherwise.
 type DuplexHandler func(stream *RequestStreamRecv, sink *ResponseSinkSend) error
 
+// StreamingHandler is the user-facing signature for a server-
+// streaming nRPC handler. Reads the request body once, emits zero-
+// or-more response chunks via the sink, returns nil on clean close
+// (substrate emits the terminal frame at that point) or an error.
+type StreamingHandler func(req []byte, sink *ResponseSinkSend) error
+
 var (
 	clientStreamingDispatcherOnce sync.Once
 	duplexDispatcherOnce          sync.Once
+	streamingDispatcherOnce       sync.Once
 )
 
 func registerClientStreamingDispatcher() {
@@ -2190,6 +2220,111 @@ func safeCallDuplexHandler(h DuplexHandler, s *RequestStreamRecv, sk *ResponseSi
 		}
 	}()
 	return h(s, sk)
+}
+
+func registerStreamingDispatcher() {
+	streamingDispatcherOnce.Do(func() {
+		C.net_rpc_set_streaming_handler_dispatcher(
+			(C.RpcStreamingHandlerFn)(C.go_net_rpc_streaming_trampoline),
+		)
+	})
+}
+
+//export go_net_rpc_streaming_trampoline
+func go_net_rpc_streaming_trampoline(
+	handlerID C.uint64_t,
+	reqPtr *C.uint8_t,
+	reqLen C.size_t,
+	responseSink *C.RpcResponseSinkHandleC,
+	outErr **C.char,
+) C.int {
+	val, ok := handlerRegistry.Load(uint64(handlerID))
+	if !ok {
+		writeCError(outErr, fmt.Sprintf("no streaming handler registered for id %d", uint64(handlerID)))
+		return -1
+	}
+	handler, ok := val.(StreamingHandler)
+	if !ok {
+		writeCError(outErr, fmt.Sprintf("handler id %d is not a StreamingHandler", uint64(handlerID)))
+		return -1
+	}
+	// Copy the request body — the Rust-owned buffer's lifetime is
+	// bounded by this dispatcher call.
+	var req []byte
+	if reqLen > 0 && reqPtr != nil {
+		req = C.GoBytes(unsafe.Pointer(reqPtr), C.int(reqLen))
+	}
+	sink := &ResponseSinkSend{handle: responseSink}
+	err := safeCallStreamingHandler(handler, req, sink)
+	// Invalidate the sink wrapper before returning — Rust is about
+	// to free the underlying handle.
+	sink.invalidated.Store(1)
+	if err != nil {
+		writeCError(outErr, err.Error())
+		return -1
+	}
+	return 0
+}
+
+func safeCallStreamingHandler(h StreamingHandler, req []byte, sk *ResponseSinkSend) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("nrpc streaming handler panicked: %v", r)
+		}
+	}()
+	return h(req, sk)
+}
+
+// ServeStreaming registers a server-streaming handler for
+// `service`. Same pre-registration discipline as Serve / ServeDuplex.
+func (r *MeshRpc) ServeStreaming(service string, handler StreamingHandler) (*ServeHandle, error) {
+	return r.ServeStreamingWithOptions(service, handler, ServeOptions{})
+}
+
+// ServeStreamingWithOptions is the variant of ServeStreaming that
+// accepts a per-handler timeout.
+func (r *MeshRpc) ServeStreamingWithOptions(service string, handler StreamingHandler, opts ServeOptions) (*ServeHandle, error) {
+	if handler == nil {
+		return nil, errors.New("net.ServeStreaming: handler must be non-nil")
+	}
+	registerStreamingDispatcher()
+	hID := uint64(C.net_rpc_reserve_handler_id())
+	handlerRegistry.Store(hID, handler)
+	cService := stringToCBytes(service)
+	defer C.free(cService.ptr)
+	var timeoutMs uint64
+	if opts.HandlerTimeout > 0 {
+		ms := opts.HandlerTimeout.Milliseconds()
+		if ms < 0 {
+			ms = 0
+		}
+		timeoutMs = uint64(ms)
+	}
+	var outErr *C.char
+	var handle *C.ServeHandleC
+	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		handle = C.net_rpc_serve_streaming(
+			h,
+			(*C.char)(cService.ptr), cService.len,
+			C.uint64_t(hID),
+			C.uint64_t(timeoutMs),
+			&outErr,
+		)
+	}); err != nil {
+		handlerRegistry.Delete(hID)
+		return nil, err
+	}
+	if handle == nil {
+		handlerRegistry.Delete(hID)
+		msg := readCError(outErr)
+		if strings.Contains(msg, "already serving") {
+			return nil, fmt.Errorf("%w: %s", ErrAlreadyServing, msg)
+		}
+		return nil, fmt.Errorf("serve_streaming failed: %s", msg)
+	}
+	sh := &ServeHandle{rpc: r, handle: handle, handlerID: hID}
+	runtime.SetFinalizer(sh, (*ServeHandle).finalize)
+	return sh, nil
 }
 
 // ServeClientStream registers a client-streaming handler for

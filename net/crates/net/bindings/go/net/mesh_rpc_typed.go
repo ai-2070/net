@@ -780,6 +780,38 @@ func TypedServeDuplex[Req, Resp any](
 	return t.raw.ServeDuplex(service, shim)
 }
 
+// TypedStreamingHandler is the user-facing typed handler signature
+// for TypedServeStreaming. Receives the JSON-decoded request and a
+// typed response sink for emitting chunks.
+type TypedStreamingHandler[Req, Resp any] func(
+	req Req,
+	sink *TypedResponseSink[Resp],
+) error
+
+// TypedServeStreaming registers a typed server-streaming handler.
+// User signature is `(req, sink) → error`. The raw side's
+// `StreamingHandler(rawReq []byte, sink *ResponseSinkSend) → error`
+// is wrapped to JSON-decode the request + provide a typed sink.
+//
+// JSON decode failures on the request surface as the
+// canonical-bad-request error so the caller sees a typed mapping
+// rather than an opaque internal.
+func TypedServeStreaming[Req, Resp any](
+	t *TypedMeshRpc,
+	service string,
+	handler TypedStreamingHandler[Req, Resp],
+) (*ServeHandle, error) {
+	shim := func(rawReq []byte, rawSink *ResponseSinkSend) error {
+		req, err := jsonDecodeTyped[Req](rawReq)
+		if err != nil {
+			return fmt.Errorf("nrpc:bad_request: decode failed: %w", err)
+		}
+		typedSink := &TypedResponseSink[Resp]{raw: rawSink}
+		return handler(req, typedSink)
+	}
+	return t.raw.ServeStreaming(service, shim)
+}
+
 // =====================================================================
 // Observer + metrics (S1-D5).
 //

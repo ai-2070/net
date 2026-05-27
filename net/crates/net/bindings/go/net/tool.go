@@ -320,6 +320,64 @@ func RegisterTool[Req, Resp any](
 	return &ToolServeHandle{Descriptor: descriptor, inner: inner, registry: entry}, nil
 }
 
+// StreamingToolHandler is the user-facing signature for a
+// streaming-tool handler. Receives the typed request and a
+// TypedResponseSink for emitting ToolEvent envelopes. Returns nil
+// on clean close; substrate emits the terminal frame at handler-
+// return. Handler errors map to a terminal `handler_error`
+// ToolEvent emitted by the wrapper so callers see a typed error
+// rather than the synthesized missing_terminal.
+type StreamingToolHandler[Req any] func(
+	req Req,
+	sink *TypedResponseSink[ToolEvent],
+) error
+
+// RegisterStreamingTool registers a streaming-tool handler. Same
+// atomic register + auto-install-fetch behavior as RegisterTool,
+// but the descriptor is stamped `Streaming: true` so peer
+// discovery surfaces the streaming variant explicitly.
+//
+// Handler panics convert to a terminal handler_error envelope, so
+// the caller's CallToolStreaming sees a typed error rather than
+// the synthesized missing_terminal.
+func RegisterStreamingTool[Req any](
+	rpc *TypedMeshRpc,
+	descriptor ToolDescriptor,
+	handler StreamingToolHandler[Req],
+) (*ToolServeHandle, error) {
+	descriptor.Streaming = true
+	wrapped := func(req Req, sink *TypedResponseSink[ToolEvent]) (handlerErr error) {
+		defer func() {
+			if r := recover(); r != nil {
+				_ = sink.Send(ToolEvent{
+					Type:   ToolEventError,
+					Code:   "handler_error",
+					ErrMsg: fmt.Sprintf("%v", r),
+				})
+				handlerErr = nil
+			}
+		}()
+		if err := handler(req, sink); err != nil {
+			_ = sink.Send(ToolEvent{
+				Type:   ToolEventError,
+				Code:   "handler_error",
+				ErrMsg: err.Error(),
+			})
+			return nil
+		}
+		return nil
+	}
+	inner, err := TypedServeStreaming[Req, ToolEvent](rpc, descriptor.ToolID, wrapped)
+	if err != nil {
+		return nil, err
+	}
+	entry := ensureFetchInstalled(rpc)
+	entry.mu.Lock()
+	entry.descriptors[descriptor.ToolID] = descriptor
+	entry.mu.Unlock()
+	return &ToolServeHandle{Descriptor: descriptor, inner: inner, registry: entry}, nil
+}
+
 // TOOL_METADATA_FETCH_SERVICE is the nRPC service name for the
 // on-demand tool-descriptor pull. The substrate auto-installs
 // the server-side handler on the host's first serve_tool call.

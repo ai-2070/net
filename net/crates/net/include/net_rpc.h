@@ -431,6 +431,34 @@ int net_rpc_find_service_nodes(
     uint64_t** out_ptr, size_t* out_count,
     char** out_err);
 
+/* Function pointer the Go side registers via
+ * net_rpc_set_streaming_handler_dispatcher. Called once per
+ * inbound streaming REQUEST; handler reads the request body once
+ * and pushes response chunks via the sink. Returns NET_RPC_OK on
+ * clean close, non-zero with *out_err set on failure. */
+typedef int (*net_rpc_streaming_handler_fn)(
+    uint64_t handler_id,
+    const uint8_t* req_ptr, size_t req_len,
+    RpcResponseSinkHandleC* response_sink,
+    char** out_err);
+
+/* Register the process-wide streaming handler dispatcher.
+ * Idempotent — first call wins. */
+void net_rpc_set_streaming_handler_dispatcher(
+    net_rpc_streaming_handler_fn dispatcher);
+
+/* Register a server-streaming handler for `service`. Same
+ * pre-registration discipline as net_rpc_serve / net_rpc_serve_duplex —
+ * caller reserves a handler_id, inserts the Go-side callable into
+ * its registry under that id, THEN calls this function. Returns
+ * NULL with *out_err set on failure. */
+ServeHandleC* net_rpc_serve_streaming(
+    MeshRpcHandle* handle,
+    const char* service_ptr, size_t service_len,
+    uint64_t handler_id,
+    uint64_t handler_timeout_ms,
+    char** out_err);
+
 /* AI-tool discovery — flat list of (tool_id, version) descriptor
  * rows aggregated from the local capability fold. On success
  * writes a heap-allocated JSON-encoded array (UTF-8) to
