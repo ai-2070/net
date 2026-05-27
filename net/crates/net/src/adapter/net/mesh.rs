@@ -1389,6 +1389,15 @@ pub struct MeshNode {
     /// `Mesh::find_service_nodes(name)`.
     #[cfg(feature = "cortex")]
     rpc_local_services: Arc<dashmap::DashSet<String>>,
+    /// Local-only registry of AI-tool descriptors for every
+    /// `serve_tool` registration on this node. Drives the
+    /// auto-merge in [`announce_capabilities_with`] (adds the
+    /// `ai-tool:<name>` tag + the `ToolCapability` + the
+    /// description / streaming / tags metadata keys) and the
+    /// future `tool.metadata.fetch` RPC handler. Empty by default
+    /// — populated only when an SDK consumer calls `serve_tool`.
+    #[cfg(feature = "tool")]
+    tool_registry: Arc<crate::adapter::net::cortex::tool::ToolMetadataRegistry>,
     /// Caller-side per-service nRPC metrics. Updated by
     /// `Mesh::call` via the `mesh_rpc_metrics::CallMetricsGuard`
     /// RAII shim; read out via `Self::rpc_metrics_snapshot` for
@@ -2061,6 +2070,10 @@ impl MeshNode {
             rpc_reply_subscriptions: Arc::new(parking_lot::Mutex::new(Vec::new())),
             #[cfg(feature = "cortex")]
             rpc_local_services: Arc::new(dashmap::DashSet::new()),
+            #[cfg(feature = "tool")]
+            tool_registry: Arc::new(
+                crate::adapter::net::cortex::tool::ToolMetadataRegistry::new(),
+            ),
             #[cfg(feature = "cortex")]
             rpc_metrics: Arc::new(crate::adapter::net::mesh_rpc_metrics::RpcMetricsRegistry::new()),
             #[cfg(feature = "cortex")]
@@ -5334,6 +5347,20 @@ impl MeshNode {
         self.rpc_local_services.clone()
     }
 
+    /// Local-only tool-descriptor registry. SDK-side `serve_tool`
+    /// inserts here on registration + removes on Drop; the
+    /// `announce_capabilities_with` path reads from it to auto-merge
+    /// `ai-tool:<name>` tags, the typed `ToolCapability`, and the
+    /// description / streaming / tags metadata keys. Also drives the
+    /// `tool.metadata.fetch` RPC handler (A-2b) which answers
+    /// "what's the full schema for tool X on this node?".
+    #[cfg(feature = "tool")]
+    pub fn tool_registry(
+        &self,
+    ) -> &Arc<crate::adapter::net::cortex::tool::ToolMetadataRegistry> {
+        &self.tool_registry
+    }
+
     /// Per-Mesh caller-side nRPC metrics registry. Accessor for
     /// `mesh_rpc::Mesh::call` to bump counters on each outgoing
     /// call.
@@ -7810,6 +7837,82 @@ impl MeshNode {
             }
             merged
         };
+
+        // Merge AI-tool registrations on top of the `nrpc:` tags.
+        // For every tool the SDK's `serve_tool` registered, this
+        // appends:
+        //   - an `ai-tool:<name>` capability tag, so
+        //     `find_nodes_for_tag_prefix("ai-tool:")` discovers
+        //     this host;
+        //   - the typed `ToolCapability` itself (added via
+        //     `CapabilitySet::add_tool`), so the typed views aggregate
+        //     a `Vec<ToolCapability>` across peers in the fold;
+        //   - the description / streaming / tags metadata keys via
+        //     `CapabilitySet::metadata`, mirroring the existing
+        //     `input_schema` / `output_schema` convention so peers
+        //     without the `tool` feature still receive the data and
+        //     just ignore the unknown keys.
+        //
+        // Tool registrations are local to this node, just like
+        // `rpc_local_services`. Drop on the SDK's `ServeHandle`
+        // removes from the registry; the next `announce_capabilities`
+        // reflects the smaller set.
+        #[cfg(feature = "tool")]
+        let caps = if self.tool_registry.is_empty() {
+            caps
+        } else {
+            use crate::adapter::net::behavior::ToolCapability;
+            use crate::adapter::net::cortex::tool::{
+                description_metadata_key, streaming_metadata_key, tags_metadata_key,
+            };
+            let mut merged = caps;
+            for descriptor in self.tool_registry.snapshot() {
+                merged = merged.add_tag(format!("ai-tool:{}", descriptor.tool_id));
+                // Reconstruct a `ToolCapability` from the descriptor's
+                // wire-cheap fields; the schemas remain in metadata
+                // (large enough that the fold has its own
+                // schema-too-large branch) so this doesn't bloat the
+                // typed-cap payload.
+                let mut cap = ToolCapability::new(&descriptor.tool_id, &descriptor.name)
+                    .with_version(&descriptor.version)
+                    .with_estimated_time(descriptor.estimated_time_ms)
+                    .with_stateless(descriptor.stateless);
+                if let Some(ref schema) = descriptor.input_schema {
+                    cap = cap.with_input_schema(schema.clone());
+                }
+                if let Some(ref schema) = descriptor.output_schema {
+                    cap = cap.with_output_schema(schema.clone());
+                }
+                for req in &descriptor.requires {
+                    cap = cap.requires(req.clone());
+                }
+                merged = merged.add_tool(cap);
+                // Description + streaming + tags ride the metadata
+                // extensibility hook (same convention input/output
+                // schemas already use). Pre-tool peers receive these
+                // keys and ignore them — no wire-breaking change.
+                if let Some(ref desc) = descriptor.description {
+                    merged = merged.with_metadata(
+                        description_metadata_key(&descriptor.tool_id),
+                        desc.clone(),
+                    );
+                }
+                if descriptor.streaming {
+                    merged = merged.with_metadata(
+                        streaming_metadata_key(&descriptor.tool_id),
+                        "1".to_string(),
+                    );
+                }
+                if !descriptor.tags.is_empty() {
+                    merged = merged.with_metadata(
+                        tags_metadata_key(&descriptor.tool_id),
+                        descriptor.tags.join(","),
+                    );
+                }
+            }
+            merged
+        };
+
         let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Piggyback the current NAT classification as a `nat:*`
