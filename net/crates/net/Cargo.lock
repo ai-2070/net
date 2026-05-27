@@ -2419,6 +2419,7 @@ dependencies = [
 name = "net-mesh-sdk"
 version = "0.24.1"
 dependencies = [
+ "anyhow",
  "async-trait",
  "bytes",
  "criterion",

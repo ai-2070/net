@@ -48,6 +48,9 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 hdrhistogram = "7"
 postcard = { version = "1", features = ["use-std"] }
 rand = "0.10"
+# Used by the tool_calling example for its top-level Result alias.
+anyhow = "1"
+schemars = "1"
 
 [features]
 # Out-of-the-box "I downloaded the SDK and it just works": real
@@ -221,6 +224,13 @@ full = ["local", "nat-traversal", "redis", "jetstream", "meshos", "deck"]
 [[example]]
 name = "nrpc_echo"
 required-features = ["net", "cortex"]
+
+# End-to-end AI tool-calling demo — declare tools with `#[tool]`,
+# register on one mesh, discover from another, lower to OpenAI's
+# tool shape, dispatch via call_tool. Mocked LLM in-process.
+[[example]]
+name = "tool_calling"
+required-features = ["net", "macros"]
 
 # ============================================================================
 # nRPC benchmark suite. See `benches/nrpc_common/mod.rs` for the
