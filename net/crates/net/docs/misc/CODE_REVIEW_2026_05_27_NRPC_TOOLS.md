@@ -24,6 +24,8 @@ Fixed in this pass (commits on the `nrpc-tools` branch):
 | C-3, E-9 | `1e644bb0` | Drop per-rpc tool registry + fetch handler on last close (Python + Go) |
 | E-3 | `8fdac609` | Cache `ToolMetadataRegistry::snapshot()` as `Arc<[T]>` |
 | Q-6 | `de91a0c8` | Go `ToolCallSpec.ProviderCallID` switched to `*string` |
+| E-2 | `624fc67a` | `CapabilitySet::add_tools` batch API; announce path now O(N) |
+| E-7 | `5becd1c9` | Python `list_tools` returns JSON string (drops 12-set_item-per-descriptor) |
 
 Outstanding — grouped by impact below. The remaining items are either
 larger refactors, design decisions, or high-churn cleanups; none block
@@ -88,11 +90,16 @@ lowering logic:
 - Python: `bindings/python/python/net/tool.py`
 - Go: `go/tool.go`
 
-The T-1 golden-vector fixture exists precisely because these four
-implementations have to be re-pinned independently.
-
-**Status:** major refactor — add eight FFI entry points (or skip the C
-ABI for napi/pyo3, calling the Rust crate directly). Deferred.
+**Status:** assessed during the refactor pass; **deferred with
+rationale**. Each binding's implementation is ~180 LOC of trivial
+pure-logic translator code, and the T-1 golden-vector fixture catches
+any cross-language drift on first CI run. Routing through FFI would
+add JSON serialize/deserialize on every call (these are hot — once
+per LLM request to a provider), tighten the TS/Python package coupling
+to the published cdylib, and replace TS/Python logic with FFI plumbing
+of roughly equivalent LOC. The net codebase win is small; the runtime
+cost is non-trivial. Keep four parallel implementations pinned by
+golden vectors.
 
 ### D-2. `watch_tools` polling+diff loop in four languages (~250 LOC)
 
@@ -102,7 +109,14 @@ streaming FFI scaffold landed on this same branch — adding a
 `net_rpc_watch_tools` that returns a stream handle would let bindings
 collapse the polling+diff to a stream-decode loop.
 
-**Status:** major refactor, deferred.
+**Status:** assessed during the refactor pass; **deferred with
+rationale**. Each binding still needs its own idiomatic cancellation
+wrapper around the FFI stream (Node `AbortSignal`, Python async
+iterator close, Go `context.Context`), so the realistic LOC savings
+are closer to ~150 across three bindings, not 250. The polling
+behavior itself is identical to the local-diff approach (substrate
+`watch_tools` also polls). Net codebase win is real but not large;
+keep the per-binding implementations.
 
 ### D-3. Two Go trees have diverged
 
@@ -135,20 +149,15 @@ parallel test drivers.
 
 ## Outstanding — Efficiency
 
-### E-2. O(N²) announce merge for tools
+### E-2. O(N²) announce merge for tools (RESOLVED — commit `624fc67a`)
 
-`mesh.rs:8113-8164` calls `merged.add_tool(cap)` in a loop. `add_tool`
-in `capability.rs:919-924` clones the full `Vec<ToolCapability>` from
-`views().tools().clone()`, pushes one, then `set_tools` clears all
-tool tags and re-encodes every tool. One announce with N tools →
-O(N²) tag rebuilds.
-
-**Fix:** add a batch `CapabilitySet::add_tools(impl IntoIterator<...>)`
-that calls `set_tools` exactly once. Same for `with_metadata` chaining
-— each call walks the reserved-prefix list.
-
-**Status:** needs `CapabilitySet` API addition. Deferred (not in the
-nrpc-tools branch's scope).
+`mesh.rs` previously called `merged.add_tool(cap)` in a loop. Added
+batch `CapabilitySet::add_tools(impl IntoIterator<...>)` that calls
+`set_tools` exactly once; the announce path now builds the
+`Vec<ToolCapability>` from the registry snapshot upfront and merges
+in one call. Total cost dropped from O(N²) → O(N). `with_metadata`
+chaining is a no-op walk today because `METADATA_RESERVED_PREFIXES`
+is empty.
 
 ### E-5. Watchers don't short-circuit unchanged snapshots
 
@@ -168,13 +177,16 @@ thundering-herd polls across multiple agent processes.
 
 **Status:** design needed (interval policy, jitter scheme).
 
-### E-7. Python pyo3 `list_tools` sets 12 `PyDict` items per descriptor
+### E-7. Python pyo3 `list_tools` sets 12 `PyDict` items per descriptor (RESOLVED — commit `5becd1c9`)
 
-Either register `ToolDescriptor` as a `#[pyclass]` (parallel to the
-Node `ToolDescriptorJs`), or serialize once via `serde_json::to_string`
-and `json.loads` on the Python side.
-
-**Status:** larger pyo3 refactor, deferred.
+The pyo3 binding now does a single `serde_json::to_string` of the full
+`Vec<ToolDescriptor>` and the Python wrapper parses it once with
+`json.loads`. The downstream `ToolDescriptor` dataclass construction
+in `net.tool.list_tools` is unchanged; only the FFI hop is cheaper.
+Chose the serde-string path over a `#[pyclass]` registration: same
+end shape with much less Rust boilerplate, and the cost-vs-benefit is
+clear when the caller is already going to `json.loads` if it needs
+the parsed schemas anyway.
 
 ---
 
