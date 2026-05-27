@@ -8010,6 +8010,7 @@ impl MeshNode {
     /// to be open-cone), this sync self-index becomes the
     /// cold-start hole that re-opens it — extend the merged
     /// `CapabilitySet` here in lockstep.
+    #[cfg(feature = "cortex")]
     pub(crate) fn index_self_with_local_services(&self) {
         let baseline = self.user_caps_snapshot();
         let merged = {

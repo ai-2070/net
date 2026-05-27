@@ -95,6 +95,12 @@ net = [
     "dep:blake2",
     "dep:ed25519-dalek",
     "dep:x25519-dalek",
+    # postcard is the canonical wire codec for the
+    # `behavior::{fold, group, subnet}` modules — `SubnetId` /
+    # `GroupId` round-trip + the fold dispatch / wire types both
+    # encode through it. Always pulled with `net` (was previously
+    # only reachable via the `redex` transitive activation).
+    "dep:postcard",
 ]
 # `regex` gates `TagMatcher::Regex` capability-query matching + the
 # safety-predicate precompiled-pattern cache. Off by default — the
