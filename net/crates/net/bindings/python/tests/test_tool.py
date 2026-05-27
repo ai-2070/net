@@ -17,11 +17,16 @@ import json
 
 import pytest
 
+import asyncio
+from typing import Any, AsyncIterator, List
+
 from net.tool import (
     ToolCallParseError,
     ToolDescriptor,
     add_tool_capabilities_to_announce,
     anthropic,
+    call_tool_streaming,
+    call_tool_streaming_async,
     descriptor_for,
     gemini,
     is_terminal_event,
@@ -231,3 +236,177 @@ def test_formats_fall_back_to_empty_object_schema() -> None:
     assert anthropic.to_anthropic_tool(desc)["input_schema"]["type"] == "object"
     assert mcp.to_mcp_tool(desc)["inputSchema"]["type"] == "object"
     assert gemini.to_gemini_function_declaration(desc)["parameters"]["type"] == "object"
+
+
+# ---------------------------------------------------------------------------
+# call_tool_streaming — missing_terminal synthesis + happy paths
+# ---------------------------------------------------------------------------
+
+
+class _FakeStream:
+    """Sync iterator surface that mirrors TypedRpcStream just enough
+    for call_tool_streaming to drain. Tracks whether close() fired."""
+
+    def __init__(self, events: List[Any]) -> None:
+        self._events = list(events)
+        self.closed = False
+
+    def __iter__(self) -> "Any":
+        for e in self._events:
+            yield e
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeRpc:
+    """Mock TypedMeshRpc with just enough surface for
+    call_tool_streaming(rpc, ...)."""
+
+    def __init__(self, events: List[Any]) -> None:
+        self._events = events
+        self.last_stream: _FakeStream | None = None
+
+    def call_service_streaming(
+        self, tool_id: str, request: Any, opts: Any = None
+    ) -> _FakeStream:
+        self.last_stream = _FakeStream(self._events)
+        return self.last_stream
+
+
+def test_call_tool_streaming_passes_terminal_event_through() -> None:
+    rpc = _FakeRpc(
+        [
+            {"type": "start", "tool_id": "web_search", "call_id": 1},
+            {"type": "delta", "data": {"partial": "a"}},
+            {"type": "result", "data": {"final": "ok"}},
+        ]
+    )
+    events = list(call_tool_streaming(rpc, "web_search", {}))
+    assert len(events) == 3
+    assert events[-1]["type"] == "result"
+    # No synthesized missing_terminal envelope.
+    assert not any(
+        e.get("type") == "error" and e.get("code") == "missing_terminal" for e in events
+    )
+
+
+def test_call_tool_streaming_synthesizes_missing_terminal_on_clean_eof() -> None:
+    rpc = _FakeRpc(
+        [
+            {"type": "start", "tool_id": "web_search", "call_id": 2},
+            {"type": "delta", "data": {"partial": "no-terminal"}},
+        ]
+    )
+    events = list(call_tool_streaming(rpc, "web_search", {}))
+    # start + delta + synthesized error envelope.
+    assert len(events) == 3
+    final = events[-1]
+    # Exact byte shape pinned by T-2 fixture.
+    assert final["type"] == "error"
+    assert final["code"] == "missing_terminal"
+    assert "terminal" in final["message"].lower()
+
+
+def test_call_tool_streaming_empty_stream_emits_single_synthesized_error() -> None:
+    rpc = _FakeRpc([])
+    events = list(call_tool_streaming(rpc, "noop_tool", {}))
+    assert len(events) == 1
+    assert events[0]["type"] == "error"
+    assert events[0]["code"] == "missing_terminal"
+
+
+def test_call_tool_streaming_error_terminal_suppresses_synthesis() -> None:
+    rpc = _FakeRpc(
+        [
+            {"type": "start", "tool_id": "web_search", "call_id": 3},
+            {"type": "error", "code": "handler_panicked", "message": "boom"},
+        ]
+    )
+    events = list(call_tool_streaming(rpc, "web_search", {}))
+    assert len(events) == 2
+    # Handler's original error survives — wrapper does NOT paper over.
+    assert events[-1]["code"] == "handler_panicked"
+
+
+# ---------------------------------------------------------------------------
+# call_tool_streaming_async — same contract on the asyncio surface
+# ---------------------------------------------------------------------------
+
+
+class _FakeAsyncStream:
+    def __init__(self, events: List[Any]) -> None:
+        self._events = list(events)
+        self.closed = False
+
+    def __aiter__(self) -> "AsyncIterator[Any]":
+        async def gen() -> AsyncIterator[Any]:
+            for e in self._events:
+                yield e
+
+        return gen()
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _FakeAsyncRpc:
+    def __init__(self, events: List[Any]) -> None:
+        self._events = events
+        self.last_stream: _FakeAsyncStream | None = None
+
+    async def call_service_streaming(
+        self, tool_id: str, request: Any, opts: Any = None
+    ) -> _FakeAsyncStream:
+        self.last_stream = _FakeAsyncStream(self._events)
+        return self.last_stream
+
+
+def _drain_async(coro_factory: Any) -> List[Any]:
+    """Run an async generator factory under the asyncio runtime and
+    collect all yielded events."""
+    async def driver() -> List[Any]:
+        out: List[Any] = []
+        async for e in coro_factory():
+            out.append(e)
+        return out
+
+    return asyncio.run(driver())
+
+
+def test_call_tool_streaming_async_passes_terminal_through() -> None:
+    rpc = _FakeAsyncRpc(
+        [
+            {"type": "start", "tool_id": "web_search", "call_id": 1},
+            {"type": "result", "data": {"final": "ok"}},
+        ]
+    )
+    events = _drain_async(lambda: call_tool_streaming_async(rpc, "web_search", {}))
+    assert events[-1]["type"] == "result"
+    assert not any(
+        e.get("type") == "error" and e.get("code") == "missing_terminal" for e in events
+    )
+
+
+def test_call_tool_streaming_async_synthesizes_missing_terminal() -> None:
+    rpc = _FakeAsyncRpc(
+        [
+            {"type": "start", "tool_id": "web_search", "call_id": 2},
+            {"type": "delta", "data": {"partial": "no-terminal"}},
+        ]
+    )
+    events = _drain_async(lambda: call_tool_streaming_async(rpc, "web_search", {}))
+    assert events[-1]["type"] == "error"
+    assert events[-1]["code"] == "missing_terminal"
+    assert rpc.last_stream is not None
+    # aclose() must have fired on the underlying stream — the wrapper
+    # ALWAYS closes in the `finally` block, even when the host's
+    # handler exits without a terminal.
+    assert rpc.last_stream.closed is True
+
+
+def test_call_tool_streaming_async_empty_stream_emits_synthesized_error() -> None:
+    rpc = _FakeAsyncRpc([])
+    events = _drain_async(lambda: call_tool_streaming_async(rpc, "noop_tool", {}))
+    assert len(events) == 1
+    assert events[0]["code"] == "missing_terminal"
