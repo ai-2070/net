@@ -1,0 +1,22 @@
+net/crates/net/bindings/python/python/net/tool.py
+  s_099fa7d871e34d::t_e3faa0989f6d55 28
+  s_099fa7d871e34d::t_8bae72d01ec16f 763-838
+  s_099fa7d871e34d::t_2abc00363c63a9 201
+  s_099fa7d871e34d::t_6196a50a3a0402 852,854-855
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "37411285cfba8ebe1c883e9fbdeaeee667735bdb",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
