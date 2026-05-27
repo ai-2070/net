@@ -887,6 +887,139 @@ async def fetch_tool_metadata_async(
     return await rpc.call(host_node_id, TOOL_METADATA_FETCH_SERVICE, {"name": tool_id}, opts)
 
 
+def serve_tool_streaming(
+    rpc: TypedMeshRpc,
+    options_or_descriptor: Union[ToolDescriptor, dict, str],
+    handler: Callable[[Any], Any],
+    **kwargs: Any,
+) -> ToolServeHandle:
+    """Register a streaming tool handler. ``handler`` is a regular
+    callable taking ``(req)`` and returning an iterator (or
+    generator) of :class:`ToolEvent` dicts — each yielded event is
+    forwarded to the caller via :func:`call_tool_streaming`.
+
+    Atomic register + lazy auto-install of ``tool.metadata.fetch``
+    — same pattern as :func:`serve_tool`. Stamps ``streaming=True``
+    on the descriptor so peers can discover the streaming variant.
+
+    Handler exceptions map to a terminal
+    ``{"type": "error", "code": "handler_error", "message": str}``
+    envelope so callers see a typed error rather than the
+    synthesized ``missing_terminal``.
+    """
+    if isinstance(options_or_descriptor, ToolDescriptor):
+        base = options_or_descriptor
+    elif isinstance(options_or_descriptor, dict):
+        opts = dict(options_or_descriptor)
+        name = opts.pop("name")
+        base = descriptor_for(name, **opts)
+    elif isinstance(options_or_descriptor, str):
+        base = descriptor_for(options_or_descriptor, **kwargs)
+    else:
+        raise TypeError(
+            "serve_tool_streaming: options_or_descriptor must be "
+            "ToolDescriptor, dict, or str"
+        )
+    descriptor = ToolDescriptor(**{**base.__dict__, "streaming": True})
+
+    def _stream_handler(req: Any, sink: Any) -> None:
+        try:
+            for event in handler(req):
+                sink.send(event)
+        except Exception as exc:
+            sink.send(
+                {
+                    "type": "error",
+                    "code": "handler_error",
+                    "message": str(exc),
+                }
+            )
+
+    entry = _ensure_fetch_installed(rpc)
+    entry["registry"][descriptor.tool_id] = descriptor
+    inner = rpc.serve_streaming(descriptor.tool_id, _stream_handler)
+    return ToolServeHandle(
+        descriptor=descriptor,
+        _inner=inner,
+        _registry=entry["registry"],
+    )
+
+
+def serve_tool_streaming_async(
+    rpc: AsyncTypedMeshRpc,
+    options_or_descriptor: Union[ToolDescriptor, dict, str],
+    handler: Callable[[Any], Any],
+    **kwargs: Any,
+) -> ToolServeHandle:
+    """Async variant of :func:`serve_tool_streaming`. ``handler``
+    may be an async generator (``async def handler(req): yield
+    event``) or a sync generator returning an iterable; both are
+    detected via :mod:`inspect` and dispatched on the appropriate
+    serve path.
+
+    Handler exceptions map to a terminal ``handler_error``
+    envelope, matching the sync wrapper's contract.
+    """
+    if isinstance(options_or_descriptor, ToolDescriptor):
+        base = options_or_descriptor
+    elif isinstance(options_or_descriptor, dict):
+        opts = dict(options_or_descriptor)
+        name = opts.pop("name")
+        base = descriptor_for(name, **opts)
+    elif isinstance(options_or_descriptor, str):
+        base = descriptor_for(options_or_descriptor, **kwargs)
+    else:
+        raise TypeError(
+            "serve_tool_streaming_async: options_or_descriptor must "
+            "be ToolDescriptor, dict, or str"
+        )
+    descriptor = ToolDescriptor(**{**base.__dict__, "streaming": True})
+
+    import inspect
+
+    if inspect.isasyncgenfunction(handler):
+
+        async def _stream_async(req: Any, sink: Any) -> None:
+            try:
+                async for event in handler(req):
+                    sink.send(event)
+            except Exception as exc:
+                sink.send(
+                    {
+                        "type": "error",
+                        "code": "handler_error",
+                        "message": str(exc),
+                    }
+                )
+
+        wrapped: Callable[[Any, Any], Any] = _stream_async
+    else:
+
+        def _stream_sync(req: Any, sink: Any) -> None:
+            try:
+                for event in handler(req):
+                    sink.send(event)
+            except Exception as exc:
+                sink.send(
+                    {
+                        "type": "error",
+                        "code": "handler_error",
+                        "message": str(exc),
+                    }
+                )
+
+        wrapped = _stream_sync
+
+    entry = _ensure_fetch_installed(rpc)
+    entry["registry"][descriptor.tool_id] = descriptor
+    inner = rpc.serve_streaming(descriptor.tool_id, wrapped)
+    return ToolServeHandle(
+        descriptor=descriptor,
+        _inner=inner,
+        _registry=entry["registry"],
+    )
+
+
 def serve_tool_async(
     rpc: AsyncTypedMeshRpc,
     options_or_descriptor: Union[ToolDescriptor, dict, str],
@@ -940,7 +1073,9 @@ __all__ = [
     "ToolCallParseError",
     "descriptor_for",
     "serve_tool",
+    "serve_tool_streaming",
     "serve_tool_async",
+    "serve_tool_streaming_async",
     "call_tool",
     "call_tool_streaming",
     "call_tool_async",

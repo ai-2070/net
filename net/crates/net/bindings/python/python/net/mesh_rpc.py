@@ -1040,6 +1040,32 @@ class TypedMeshRpc:
 
         return self._raw.serve_duplex(service, _wrapped)
 
+    def serve_streaming(
+        self,
+        service: str,
+        handler: Callable[[Any, "TypedResponseSink"], None],
+    ) -> ServeHandle:
+        """Register a typed server-streaming handler. ``handler``
+        signature is ``(req: Any, sink: TypedResponseSink) -> None``:
+        the request is JSON-decoded once before the call; emit
+        response chunks via ``sink.send(value)``. Handler return
+        is ``None``; the substrate emits the terminal frame
+        automatically.
+
+        Used under :func:`net.tool.serve_tool_streaming` to expose
+        ToolEvent-emitting handlers.
+
+        Raise ``RpcAppError(code, body)`` to surface a typed
+        Application status.
+        """
+
+        def _wrapped(raw_req: bytes, raw_sink: Any) -> None:
+            req = _json_decode(raw_req)
+            typed_sink = TypedResponseSink(raw_sink)
+            handler(req, typed_sink)
+
+        return self._raw.serve_streaming(service, _wrapped)
+
     # ---- observer + metrics (S2-C3) -----------------------------------------
 
     def set_observer(
@@ -1361,6 +1387,39 @@ class AsyncTypedMeshRpc:
             return _json_encode(resp)
 
         return self._raw.serve(service, _wrapped_sync)
+
+    def serve_streaming(
+        self,
+        service: str,
+        handler: Callable[[Any, "TypedResponseSink"], Any],
+    ) -> ServeHandle:
+        """Register a typed server-streaming handler. Accepts EITHER
+        a sync ``def handler(req, sink) -> None`` OR an
+        ``async def handler(req, sink) -> None``.
+
+        The request is JSON-decoded once; emit response chunks via
+        ``sink.send(value)``. Substrate emits the terminal frame at
+        handler-return / coroutine-resolution. Raise
+        ``RpcAppError(code, body)`` to surface a typed Application
+        status.
+
+        Sync equivalent: :meth:`TypedMeshRpc.serve_streaming`.
+        """
+        if inspect.iscoroutinefunction(handler):
+
+            async def _wrapped_async(raw_req: bytes, raw_sink: Any) -> None:
+                req = _json_decode(raw_req)
+                typed_sink = TypedResponseSink(raw_sink)
+                await handler(req, typed_sink)
+
+            return self._raw.serve_streaming(service, _wrapped_async)
+
+        def _wrapped_sync(raw_req: bytes, raw_sink: Any) -> None:
+            req = _json_decode(raw_req)
+            typed_sink = TypedResponseSink(raw_sink)
+            handler(req, typed_sink)
+
+        return self._raw.serve_streaming(service, _wrapped_sync)
 
     # ---- call ---------------------------------------------------------------
 
