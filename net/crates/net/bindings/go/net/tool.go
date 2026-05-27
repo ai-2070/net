@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 )
 
 // =============================================================================
@@ -190,19 +191,14 @@ func DescriptorFor(opts ToolOptions) (ToolDescriptor, error) {
 // =============================================================================
 
 // ToolServeHandle is returned by RegisterTool. Call Close() to
-// deregister the underlying nRPC handler. Idempotent; second
-// Close() is a no-op. Mirror of the Rust ToolServeHandle's Drop
-// semantics.
-//
-// NOTE: v1 does NOT integrate with the substrate-side tool_registry,
-// so the `ai-tool:<tool_id>` capability tag must be added to the
-// caller's announce explicitly. See AddToolCapabilitiesToAnnounce.
-// Once the CGO surface exposes tool_registry (Wave 3 follow-up),
-// this handle will atomically reverse both the registry insert and
-// the handler registration on Close().
+// deregister the underlying nRPC handler + remove the descriptor
+// from the per-rpc registry that backs tool.metadata.fetch.
+// Idempotent; second Close() is a no-op. Mirror of the Rust
+// ToolServeHandle's Drop semantics.
 type ToolServeHandle struct {
 	Descriptor ToolDescriptor
 	inner      *ServeHandle
+	registry   *toolRegistryEntry
 	closed     bool
 }
 
@@ -212,23 +208,100 @@ func (h *ToolServeHandle) Close() {
 		return
 	}
 	h.closed = true
+	if h.registry != nil {
+		h.registry.mu.Lock()
+		delete(h.registry.descriptors, h.Descriptor.ToolID)
+		h.registry.mu.Unlock()
+	}
 	if h.inner != nil {
 		h.inner.Close()
 	}
+}
+
+// toolRegistryEntry holds the per-rpc descriptor map + the lazy-
+// installed tool.metadata.fetch handle. One entry per
+// *TypedMeshRpc, looked up in `toolRegistries` by pointer.
+type toolRegistryEntry struct {
+	mu          sync.Mutex
+	descriptors map[string]ToolDescriptor
+	fetchHandle *ServeHandle
+}
+
+var (
+	toolRegistriesMu sync.Mutex
+	toolRegistries   = map[*TypedMeshRpc]*toolRegistryEntry{}
+)
+
+// ensureFetchInstalled returns (or creates) the per-rpc registry
+// entry. On first call against a given rpc, registers the
+// `tool.metadata.fetch` nRPC service handler backed by the
+// per-rpc descriptor map. Subsequent calls reuse the same handler.
+// Mirrors the Rust SDK's `ensure_tool_metadata_fetch_installed`.
+func ensureFetchInstalled(rpc *TypedMeshRpc) *toolRegistryEntry {
+	toolRegistriesMu.Lock()
+	defer toolRegistriesMu.Unlock()
+	if entry, ok := toolRegistries[rpc]; ok {
+		return entry
+	}
+	entry := &toolRegistryEntry{
+		descriptors: make(map[string]ToolDescriptor),
+	}
+	// Install the fetch handler. Captures `entry` by reference so
+	// later RegisterTool calls flow descriptors into the same map
+	// the handler reads from.
+	type fetchReq struct {
+		Name string `json:"name"`
+	}
+	handle, err := TypedServe[fetchReq, ToolMetadataResponse](
+		rpc,
+		TOOL_METADATA_FETCH_SERVICE,
+		func(req fetchReq) (ToolMetadataResponse, error) {
+			entry.mu.Lock()
+			desc, ok := entry.descriptors[req.Name]
+			entry.mu.Unlock()
+			if !ok {
+				return ToolMetadataResponse{Type: "not_found", Name: req.Name}, nil
+			}
+			d := desc
+			return ToolMetadataResponse{Type: "found", Descriptor: &d}, nil
+		},
+	)
+	if err == nil {
+		entry.fetchHandle = handle
+	}
+	// If install fails (service name already taken — unlikely),
+	// leave fetchHandle nil; subsequent RegisterTool calls won't
+	// retry but the per-rpc registry still tracks descriptors for
+	// future close() bookkeeping.
+	toolRegistries[rpc] = entry
+	return entry
 }
 
 // RegisterTool registers a typed handler as an AI tool against
 // `rpc`. The handler is registered as an nRPC service at
 // `descriptor.ToolID` with JSON codec.
 //
-// The caller is responsible for announcing the tool to peers — use
-// AddToolCapabilitiesToAnnounce on the CapabilitySetWire passed to
-// the mesh's announce surface so the `ai-tool:<tool_id>` tag lands
-// on the wire.
+// Atomically:
 //
-// Wave 3 follow-up: once the CGO surface exposes tool_registry(),
-// this helper will atomically insert there too, making the
-// announce-time merge automatic (matching the Rust SDK's contract).
+//  1. Inserts the descriptor into a per-rpc local registry keyed
+//     on ToolID. The next FetchToolMetadata call against this host
+//     resolves the descriptor by name.
+//  2. Registers the typed handler at ToolID with JSON codec.
+//  3. On the FIRST RegisterTool call against this rpc, lazy-
+//     installs the tool.metadata.fetch nRPC service handler so
+//     remote agents can pull the full descriptor for any
+//     registered tool. Subsequent calls reuse the same fetch
+//     handler. Mirrors the Rust / Node TS / Python pattern.
+//
+// The caller is still responsible for announcing the tool to
+// peers — use AddToolCapabilitiesToAnnounce on the
+// CapabilitySetWire passed to the mesh's announce surface.
+//
+// On handle.Close(): removes the descriptor from the per-rpc
+// registry and unregisters the user handler. The lazy
+// tool.metadata.fetch service stays installed for the rpc's
+// lifetime (harmless when empty — returns NotFound for every
+// request).
 func RegisterTool[Req, Resp any](
 	rpc *TypedMeshRpc,
 	descriptor ToolDescriptor,
@@ -238,7 +311,11 @@ func RegisterTool[Req, Resp any](
 	if err != nil {
 		return nil, err
 	}
-	return &ToolServeHandle{Descriptor: descriptor, inner: inner}, nil
+	entry := ensureFetchInstalled(rpc)
+	entry.mu.Lock()
+	entry.descriptors[descriptor.ToolID] = descriptor
+	entry.mu.Unlock()
+	return &ToolServeHandle{Descriptor: descriptor, inner: inner, registry: entry}, nil
 }
 
 // TOOL_METADATA_FETCH_SERVICE is the nRPC service name for the
