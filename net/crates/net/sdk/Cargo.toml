@@ -37,6 +37,10 @@ async-trait = "0.1"
 # from any Rust type implementing `JsonSchema`. ~150 KiB optimized;
 # off by default.
 schemars = { version = "1", optional = true }
+# `net-mesh-sdk-macros` ships the `#[tool]` attribute proc-macro.
+# Gated by the `macros` feature so users who don't want the
+# proc-macro2 / syn / quote dep tree don't pay for it.
+net-mesh-sdk-macros = { version = "0.24.1", path = "../sdk-macros", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
@@ -165,6 +169,12 @@ aggregator = ["net"]
 # the cortex module + the future `MeshNode::list_tools` walks the
 # capability fold which `cortex` enables.
 tool = ["net/tool", "cortex", "dep:schemars"]
+# `#[tool]` proc-macro convenience. Opt-in because it pulls in
+# proc-macro2 / syn / quote (~1.2 MB build artifact) which users
+# who hand-write `metadata_for(...).build()` + `serve_tool(...)`
+# don't need. Always enabled alongside `tool` — the macro has no
+# runtime meaning without the SDK surface it expands into.
+macros = ["tool", "dep:net-mesh-sdk-macros"]
 # Testing — in-process multi-node `ClusterHarness` + bridge probes
 # (Mesh → MeshOsRuntime). Powers the deck demo and any integration
 # test that wants real UDP loopback + a real MeshOS snapshot fold

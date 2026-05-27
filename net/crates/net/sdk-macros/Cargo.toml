@@ -1,0 +1,21 @@
+[package]
+name = "net-mesh-sdk-macros"
+version = "0.24.1"
+edition = "2021"
+description = "Procedural macros for net-mesh-sdk (AI tool calling — A-7 of NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md)"
+license = "Apache-2.0"
+repository = "https://github.com/ai-2070/net"
+readme = "README.md"
+keywords = ["net", "mesh", "ai", "tool", "macro"]
+categories = ["development-tools::procedural-macro-helpers"]
+
+[lib]
+# Keep the crate name short — `use net_sdk_macros::tool;` reads
+# cleanly. The published artifact is `net-mesh-sdk-macros`.
+name = "net_sdk_macros"
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

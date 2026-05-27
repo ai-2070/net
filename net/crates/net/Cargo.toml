@@ -2,6 +2,7 @@
 members = [
     ".",
     "sdk",
+    "sdk-macros",
     "deck",
     "cli",
     "aggregator-daemon",

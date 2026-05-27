@@ -2425,6 +2425,7 @@ dependencies = [
  "futures",
  "hdrhistogram",
  "net-mesh",
+ "net-mesh-sdk-macros",
  "parking_lot 0.12.5",
  "pin-project-lite",
  "postcard",
@@ -2434,6 +2435,15 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "net-mesh-sdk-macros"
+version = "0.24.1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

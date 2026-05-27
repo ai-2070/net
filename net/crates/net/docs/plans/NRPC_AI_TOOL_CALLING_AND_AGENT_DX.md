@@ -83,7 +83,7 @@ Tagged `[S | A | B | C | D | M | T | X]`:
 | A-4   | H   | Rust SDK          | `MeshNode::list_tools(matcher)` + `Mesh::list_tools` via capability-fold walk + `tool::*` metadata pass-through | ✅     |
 | A-5   | H   | Rust SDK          | `MeshNode::watch_tools(matcher) -> Stream<ToolListChange>` for dynamic discovery (polling-backed) | ✅     |
 | A-6   | H   | Rust SDK          | `Mesh::call_tool<Req, Resp>` (unary) + `Mesh::call_tool_streaming<Req>` over S-1                | ✅     |
-| A-7   | M   | Rust SDK          | `#[tool]` proc macro (follow-up — runtime APIs land first)                                      | ⏳     |
+| A-7   | M   | Rust SDK          | `#[tool]` proc macro (follow-up — runtime APIs land first)                                      | ✅     |
 | B-1   | H   | Node TS           | `tool({ name, description, schema, handle })` + Zod schema lowering                              | 🟡     |
 | B-2   | H   | Node TS           | `tool({ ..., stream: async function* handle() { yield … } })` — streaming via async-iter        | ⏳     |
 | B-3   | H   | Node TS           | `MeshNode.listTools({ matcher? })` + `MeshNode.watchTools({ matcher? })`                        | ⏳     |
