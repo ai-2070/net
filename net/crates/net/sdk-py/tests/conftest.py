@@ -17,11 +17,41 @@ import sys
 import types
 
 
+def _make_auto_stub_module(name: str) -> types.ModuleType:
+    """Build a stub module whose unknown attribute access returns an
+    opaque placeholder class. Names ending in ``Error`` become
+    ``Exception`` subclasses so ``except StubError:`` clauses
+    type-check.
+    """
+    stub = types.ModuleType(name)
+
+    def __getattr__(attr_name: str) -> type:
+        # Dunders like ``__path__`` must NOT be auto-stubbed — Python's
+        # import machinery treats ``__path__`` as a sequence of search
+        # directories, and returning a class type triggers
+        # ``TypeError: 'type' object is not iterable`` inside
+        # ``_get_spec``. Letting AttributeError bubble lets the import
+        # machinery treat the module as a non-package, which is fine
+        # since we pre-stub each known submodule directly in
+        # ``sys.modules`` below.
+        if attr_name.startswith("__") and attr_name.endswith("__"):
+            raise AttributeError(attr_name)
+        if attr_name.endswith("Error"):
+            cls = type(attr_name, (Exception,), {})
+        else:
+            cls = type(attr_name, (), {})
+        setattr(stub, attr_name, cls)
+        return cls
+
+    stub.__getattr__ = __getattr__  # type: ignore[attr-defined]
+    return stub
+
+
 def _ensure_net_stub() -> None:
     if "net" in sys.modules:
         return
 
-    stub = types.ModuleType("net")
+    stub = _make_auto_stub_module("net")
 
     # Symbols the SDK imports from `net` at module load. Each is a
     # placeholder class; tests that need richer behavior should mock
@@ -44,22 +74,17 @@ def _ensure_net_stub() -> None:
         else:
             setattr(stub, name, type(name, (), {}))
 
-    # Future-proof against new top-level imports: any unknown attribute
-    # access on the stub module returns an opaque class. Names ending
-    # in `Error` are made Exception subclasses so wrapper modules
-    # whose `except` clauses reference them (`except CortexError:`)
-    # don't trip `TypeError: catching classes that do not inherit
-    # from BaseException`.
-    def __getattr__(attr_name: str) -> type:
-        if attr_name.endswith("Error"):
-            cls = type(attr_name, (Exception,), {})
-        else:
-            cls = type(attr_name, (), {})
-        setattr(stub, attr_name, cls)
-        return cls
-
-    stub.__getattr__ = __getattr__  # type: ignore[attr-defined]
     sys.modules["net"] = stub
+
+    # Pre-stub each submodule the SDK imports from. `net_sdk.tool`
+    # does ``from net.tool import ...`` at module load, which kicks
+    # the import machinery into ``_get_spec(net, 'tool')`` and reads
+    # ``net.__path__``. Installing the submodule directly in
+    # ``sys.modules`` short-circuits that lookup so we don't have to
+    # fake a package layout.
+    tool_stub = _make_auto_stub_module("net.tool")
+    sys.modules["net.tool"] = tool_stub
+    stub.tool = tool_stub  # type: ignore[attr-defined]
 
 
 _ensure_net_stub()
