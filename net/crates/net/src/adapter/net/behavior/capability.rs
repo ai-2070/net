@@ -2739,22 +2739,29 @@ mod tests {
         assert_eq!(caps.tags, parsed.tags);
         assert_eq!(caps.views().models().len(), parsed.views().models().len());
     }
-    /// CR-16: `with_metadata` silently drops writes whose key
-    /// starts with a reserved prefix (`tool::`). Same shape as
-    /// `add_tag`'s rejection of reserved tag prefixes via
-    /// `Tag::parse_user`. Exact-match reserved keys (`intent`,
-    /// `owner`, …) are NOT gated — those are well-known
-    /// user-facing scheduler hints.
+    /// A-4: `with_metadata` consults `METADATA_RESERVED_PREFIXES`,
+    /// which is now empty — the `tool::*` family was hoisted out
+    /// because tool descriptors are peer-advertised content, not
+    /// substrate-trust slots. The gate stays wired so a future
+    /// re-add (e.g. a new substrate-internal prefix) plugs back
+    /// in here without a fan-out edit, but the current contract is
+    /// "tool::* writes pass through". Exact-match reserved keys
+    /// (`intent`, `owner`, …) are NOT gated by `with_metadata`
+    /// either — those are well-known user-facing scheduler hints
+    /// the substrate reads and the user is expected to set.
     #[test]
-    fn with_metadata_drops_reserved_prefix_keys() {
-        // `tool::*` writes silently dropped.
+    fn with_metadata_preserves_tool_prefix_after_a4() {
+        // `tool::*` writes survive — A-4 contract.
         let caps = CapabilitySet::new()
-            .with_metadata("tool::evil::input_schema", "spoof")
+            .with_metadata("tool::web_search::input_schema", "{}")
             .with_metadata("region", "us-east");
-        assert!(
-            !caps.metadata.contains_key("tool::evil::input_schema"),
-            "with_metadata must drop reserved-prefix keys: {:?}",
+        assert_eq!(
             caps.metadata
+                .get("tool::web_search::input_schema")
+                .map(|s| s.as_str()),
+            Some("{}"),
+            "tool::* writes must pass through with_metadata: {:?}",
+            caps.metadata,
         );
         // Non-reserved key passes through.
         assert_eq!(

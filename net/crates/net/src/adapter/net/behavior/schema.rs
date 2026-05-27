@@ -952,20 +952,28 @@ mod tests {
         );
     }
 
-    /// CR-14: prefix-matched reservations (`tool::*`).
+    /// A-4: `tool::*` is intentionally NOT in `METADATA_RESERVED_PREFIXES`
+    /// any more. Tool descriptors (`tool::<id>::input_schema`,
+    /// `tool::<id>::output_schema`, `tool::<id>::description`,
+    /// `tool::<id>::streaming`, `tool::<id>::tags`) are peer-advertised
+    /// content the substrate never makes trust decisions from — flagging
+    /// them as reserved-prefix warnings would noise up cross-mesh tool
+    /// discovery. Pin the contract so a re-add doesn't sneak in.
     #[test]
-    fn validate_metadata_reserved_prefix_is_warning() {
+    fn validate_metadata_tool_prefix_is_not_warned() {
         let mut caps = CapabilitySet::new();
-        caps.metadata
-            .insert("tool::evil::input_schema".to_string(), "spoof".to_string());
+        caps.metadata.insert(
+            "tool::web_search::input_schema".to_string(),
+            "{}".to_string(),
+        );
         let report = validate_capabilities(&caps);
         assert!(report.errors.is_empty());
         assert!(
-            report.warnings.iter().any(|w| matches!(w,
-                ValidationWarning::MetadataReservedPrefix { key, prefix }
-                    if key == "tool::evil::input_schema" && prefix == "tool::"
-            )),
-            "missing MetadataReservedPrefix warning: {:?}",
+            !report
+                .warnings
+                .iter()
+                .any(|w| matches!(w, ValidationWarning::MetadataReservedPrefix { .. })),
+            "tool::* must not emit a MetadataReservedPrefix warning: {:?}",
             report.warnings,
         );
     }
@@ -1045,10 +1053,14 @@ mod tests {
         assert_eq!(pinned, expected);
     }
 
+    /// A-4 drift detector: `METADATA_RESERVED_PREFIXES` is empty by
+    /// design — tool descriptor metadata (`tool::*`) is peer-advertised
+    /// content, not a substrate-trust slot. Re-adding any prefix here
+    /// silently breaks cross-mesh tool discovery, so pin the empty set.
     #[test]
     fn validate_metadata_reserved_prefixes_pinned() {
         let pinned: HashSet<&str> = METADATA_RESERVED_PREFIXES.iter().copied().collect();
-        let expected: HashSet<&str> = ["tool::"].into_iter().collect();
+        let expected: HashSet<&str> = HashSet::new();
         assert_eq!(pinned, expected);
     }
 }
