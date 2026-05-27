@@ -13,12 +13,6 @@ package net
 #include "net.h"
 #include <stdlib.h>
 #include <string.h>
-
-// `net_mesh_arc_clone` lives in libnet but isn't declared in net.h
-// (only in net.go.h). Forward-declare it here so mesh_rpc.go can
-// reach the inner `Arc<MeshNode>` through this package without
-// triggering a cgo "implicit declaration" warning.
-extern void* net_mesh_arc_clone(net_meshnode_t* handle);
 */
 import "C"
 
