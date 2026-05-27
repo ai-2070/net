@@ -19,6 +19,17 @@ use std::hash::Hash;
 
 use crate::adapter::net::behavior::tag::Tag;
 
+/// Version-discriminator byte for the compact (postcard) wire format
+/// used by [`CapabilitySet::to_bytes_compact`] and
+/// [`CapabilityAnnouncement::to_bytes_compact`]. JSON serializations
+/// start with `b'{'` (`0x7B`); compact serializations start with this
+/// byte. Any value other than `b'{'` or this constant in the leading
+/// byte position causes `from_bytes` to return `None`.
+///
+/// The numeric value is fixed at the wire-format level — bumping it
+/// is a wire-protocol break.
+const COMPACT_FORMAT_TAG: u8 = 0x01;
+
 // ============================================================================
 // Hardware Capabilities
 // ============================================================================
@@ -1452,15 +1463,39 @@ impl CapabilitySet {
             .collect()
     }
 
-    /// Serialize to bytes (compact binary format)
+    /// Serialize to bytes — JSON format, kept as the default for wire
+    /// compatibility with peers running pre-postcard code. New callers
+    /// that don't need to interop with old peers should prefer
+    /// [`Self::to_bytes_compact`] (~10× faster, ~3× smaller).
     pub fn to_bytes(&self) -> Vec<u8> {
-        // Use JSON for now (can optimize to binary later)
         serde_json::to_vec(self).unwrap_or_default()
     }
 
-    /// Deserialize from bytes
+    /// Serialize to bytes using the compact postcard wire format
+    /// (single leading [`COMPACT_FORMAT_TAG`] version byte followed by
+    /// the postcard payload). [`Self::from_bytes`] reads either format
+    /// via first-byte sniff, so receivers running this code accept
+    /// both compact and JSON inputs.
+    ///
+    /// See `docs/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` fix #3 for
+    /// the rollout staging — flipping `to_bytes` itself to compact is
+    /// a separate, deliberate wire-format change.
+    pub fn to_bytes_compact(&self) -> Vec<u8> {
+        let out = vec![COMPACT_FORMAT_TAG];
+        postcard::to_extend(self, out).unwrap_or_default()
+    }
+
+    /// Deserialize from bytes. Accepts both the legacy JSON wire
+    /// format (peers running pre-postcard code) and the compact
+    /// postcard format (peers using [`Self::to_bytes_compact`]).
+    /// Discriminates on the first byte: `b'{'` → JSON,
+    /// [`COMPACT_FORMAT_TAG`] → postcard, anything else → `None`.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        serde_json::from_slice(data).ok()
+        match data.first() {
+            Some(&b'{') => serde_json::from_slice(data).ok(),
+            Some(&COMPACT_FORMAT_TAG) => postcard::from_bytes(&data[1..]).ok(),
+            _ => None,
+        }
     }
 
     /// Compute the structural change from `prev` to `self`.
@@ -1828,21 +1863,40 @@ fn decoder_sorted_tag_vec(tags: &HashSet<Tag>) -> Vec<Tag> {
     v
 }
 
-/// Serialize a `HashSet<Tag>` as a sorted JSON array — `Tag::to_string()`
-/// order. The wire format is canonical so two ends of a signed
-/// `CapabilityAnnouncement` round-trip produce identical bytes
-/// regardless of process-local `HashSet` iteration order.
+/// Serialize a `HashSet<Tag>` as a sequence of tags. For
+/// human-readable formats (JSON) the sequence is sorted via
+/// `Tag::to_string()` so a signed `CapabilityAnnouncement`
+/// round-trips byte-for-byte regardless of process-local `HashSet`
+/// iteration order — that byte stability is what makes signature
+/// verification work across peers.
+///
+/// For non-human-readable formats (postcard via
+/// [`CapabilitySet::to_bytes_compact`]) the sort is skipped:
+/// `CapabilityAnnouncement` itself never takes the compact path
+/// (its `#[serde(skip_serializing_if)]` fields don't survive
+/// positional encoding), and bare `CapabilitySet` bytes aren't
+/// signed — readers reconstruct the same `HashSet` regardless of
+/// iteration order. Skipping the sort avoids ~N × `Tag::to_string()`
+/// allocations on every compact serialize.
 fn serialize_tags_sorted<S: serde::Serializer>(
     tags: &HashSet<Tag>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     use serde::ser::SerializeSeq;
-    let sorted = sorted_tag_vec(tags);
-    let mut seq = serializer.serialize_seq(Some(sorted.len()))?;
-    for t in &sorted {
-        seq.serialize_element(t)?;
+    if serializer.is_human_readable() {
+        let sorted = sorted_tag_vec(tags);
+        let mut seq = serializer.serialize_seq(Some(sorted.len()))?;
+        for t in &sorted {
+            seq.serialize_element(t)?;
+        }
+        seq.end()
+    } else {
+        let mut seq = serializer.serialize_seq(Some(tags.len()))?;
+        for t in tags {
+            seq.serialize_element(t)?;
+        }
+        seq.end()
     }
-    seq.end()
 }
 
 impl From<&CapabilitySet> for HardwareCapabilities {
@@ -1863,9 +1917,9 @@ impl From<&CapabilitySet> for SoftwareCapabilities {
 
 impl From<&CapabilitySet> for ResourceLimits {
     fn from(caps: &CapabilitySet) -> Self {
-        crate::adapter::net::behavior::tag_codec::resource_limits_from_tags(&decoder_sorted_tag_vec(
-            &caps.tags,
-        ))
+        crate::adapter::net::behavior::tag_codec::resource_limits_from_tags(
+            &decoder_sorted_tag_vec(&caps.tags),
+        )
     }
 }
 
@@ -2232,20 +2286,31 @@ impl CapabilityAnnouncement {
         self.entity_id.verify(&payload, &sig)
     }
 
-    /// Serialize to bytes
+    /// Serialize to bytes — JSON. The compact-postcard codec used by
+    /// [`CapabilitySet::to_bytes_compact`] is not applied here:
+    /// `CapabilityAnnouncement`'s wire-compat surface relies on
+    /// several `#[serde(skip_serializing_if = ...)]` field
+    /// omissions (`signature`, `hop_count`, `reflex_addr`, the three
+    /// `allowed_*` lists) so signed bytes round-trip byte-for-byte
+    /// against pre-M-1 / pre-v0.4 peers — and postcard's positional
+    /// encoding can't reconstruct an omitted field. A compact
+    /// announcement codec would need a separate canonicalized wire
+    /// struct (TODO; tracked in PERF_AUDIT_2026_05_28_CAPABILITY.md
+    /// fix #3 follow-ups).
     pub fn to_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).unwrap_or_default()
     }
 
-    /// Deserialize from bytes. Returns `None` on a JSON parse
-    /// failure OR when any v0.4 capability-auth allow-list exceeds
-    /// [`MAX_ALLOW_LIST_LEN`] — the cap is a wire-level invariant
-    /// (operators above 64 entries per axis must use a group), so
-    /// receivers reject oversized announcements at the deserializer
-    /// boundary rather than scanning unbounded vectors inside
-    /// `may_execute` on every call. Symmetric with the CLI's
-    /// announce-side check; closes the asymmetry where the
-    /// substrate accepted any vector length the wire delivered.
+    /// Deserialize from bytes (JSON only — see [`Self::to_bytes`]).
+    /// Returns `None` on a parse failure OR when any v0.4
+    /// capability-auth allow-list exceeds [`MAX_ALLOW_LIST_LEN`] —
+    /// the cap is a wire-level invariant (operators above 64 entries
+    /// per axis must use a group), so receivers reject oversized
+    /// announcements at the deserializer boundary rather than
+    /// scanning unbounded vectors inside `may_execute` on every call.
+    /// Symmetric with the CLI's announce-side check; closes the
+    /// asymmetry where the substrate accepted any vector length the
+    /// wire delivered.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         let ann: Self = serde_json::from_slice(data).ok()?;
         if ann.allowed_nodes.len() > MAX_ALLOW_LIST_LEN
@@ -4025,6 +4090,41 @@ mod tests {
         let caps2 = CapabilitySet::from_bytes(&bytes).expect("round-trip parses");
         assert_eq!(caps, caps2);
     }
+
+    #[test]
+    fn compact_wire_format_round_trips_and_interops_with_json() {
+        // Pinned: postcard-format round-trip preserves the
+        // CapabilitySet AND a single `from_bytes` accepts both
+        // encodings. Rollout from JSON to compact requires that any
+        // peer running this code can read either format.
+        let caps = sample_capability_set();
+        let json_bytes = caps.to_bytes();
+        let compact_bytes = caps.to_bytes_compact();
+        assert_eq!(json_bytes.first(), Some(&b'{'));
+        assert_eq!(compact_bytes.first(), Some(&COMPACT_FORMAT_TAG));
+        assert!(
+            compact_bytes.len() < json_bytes.len(),
+            "compact ({} bytes) should be smaller than JSON ({} bytes)",
+            compact_bytes.len(),
+            json_bytes.len()
+        );
+        let from_json = CapabilitySet::from_bytes(&json_bytes).expect("json parses");
+        let from_compact = CapabilitySet::from_bytes(&compact_bytes).expect("compact parses");
+        assert_eq!(caps, from_json);
+        assert_eq!(caps, from_compact);
+    }
+
+    #[test]
+    fn from_bytes_rejects_unknown_format_tag() {
+        // Any leading byte other than `b'{'` or COMPACT_FORMAT_TAG
+        // is a forward-compat unknown version — we reject loudly
+        // rather than mis-decode.
+        assert!(CapabilitySet::from_bytes(&[0xFF]).is_none());
+        assert!(CapabilitySet::from_bytes(&[]).is_none());
+        // Empty postcard body after the version tag is also invalid.
+        assert!(CapabilitySet::from_bytes(&[COMPACT_FORMAT_TAG]).is_none());
+    }
+
     #[test]
     fn typed_tags_includes_legacy_string_tags() {
         // Pinned: legacy `Vec<String>` tags appear in the typed-

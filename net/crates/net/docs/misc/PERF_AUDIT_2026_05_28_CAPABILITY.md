@@ -143,8 +143,8 @@ Baseline taken on Windows host (different hardware than the M1 Max snapshot abov
 | Family | Status |
 |---|---|
 | `capability_set/has_model` (~760 ns), `has_tool` (~740 ns) | **Fixed** — see "Results — fix #5" below |
-| `capability_set/serialize` (~52 µs), `to_bytes`/`from_bytes` | Unchanged — needs fix #3 (bincode/postcard) |
-| `capability_announcement/*` | Not re-benched (same JSON path; will move with fix #3) |
+| `capability_set/serialize` (~52 µs), `to_bytes`/`from_bytes` | **Partially fixed** via `to_bytes_compact` — see "Results — fix #3" below |
+| `capability_announcement/*` | Compact codec NOT applied — `#[serde(skip_serializing_if)]` on `signature` / `hop_count` / `reflex_addr` / allow-lists are required for pre-M-1 / pre-v0.4 signed-byte compat, and postcard's positional encoding can't reconstruct an omitted field. Needs a separate canonicalized wire struct — deferred. |
 | Repeated `matches()` on same `CapabilitySet` in a loop | Each call still allocates a new `CapabilityViews` if it falls through to the modality/ctx path. Fix #4 (cache projections on the set) addresses this. |
 
 ## Results — fix #5 applied (2026-05-28)
@@ -221,3 +221,39 @@ Baseline `pre-axis-key-ref` taken on the same Windows host with fixes #1 + #2 + 
 `match_complex` is the only filter bench that still falls through to `views().models()` (for the modality check); the saved 683 ns is the per-tag-allocation cost in `models_from_tags`'s axis_key iteration. Other callers (predicate eval, capability_aggregation, owned-tag predicates) get the same per-tag saving wherever they execute — not separately benched here.
 
 All 4133 lib tests pass.
+
+## Results — fix #3 (compact codec) applied (2026-05-28)
+
+Added `CapabilitySet::to_bytes_compact` (postcard wire, version envelope `0x01 <payload>`) and made `from_bytes` sniff the first byte (`b'{'` → JSON, `0x01` → postcard, else → `None`). Existing `to_bytes` keeps writing JSON so wire callers (`mesh.rs`, `swarm.rs`, `proximity.rs`, CLI) don't break peers running pre-postcard code. The cutover to the compact writer is a separate, deliberate rollout commit (see "Rollout" below).
+
+| Benchmark | JSON (baseline) | Compact | Δ |
+|---|---|---|---|
+| `capability_set/serialize_compact` | 53.99 µs | **1.96 µs** | **−96.4%** (~27× faster) |
+| `capability_set/deserialize_compact` | 6.30 µs | **5.72 µs** | **−9.2%** |
+| `capability_set/roundtrip_compact` | 59.52 µs | **6.35 µs** | **−89.3%** (~9.4× faster) |
+
+### Where the win actually came from
+
+The first attempt — just swapping `serde_json::to_vec` for `postcard::to_extend` — saved ~0%. The actual bottleneck was `serialize_tags_sorted` (`capability.rs:1818`): it cloned the entire tag set and ran `sort_by_key(|t| t.to_string())`, allocating a `String` per comparison. For ~35 tags that's ~150 allocations per serialize.
+
+The fix: `serialize_tags_sorted` now branches on `serializer.is_human_readable()`. JSON keeps the sorted canonical form (signed-announcement bytes need to be byte-identical across peers). Postcard skips the sort entirely — `CapabilityAnnouncement` doesn't take the compact path so signed bytes are unaffected, and bare `CapabilitySet` compact bytes aren't signed (the only consumer is a from_bytes that reconstructs the same `HashSet` regardless of element order).
+
+This is also a one-line win for the existing fix #1 audit follow-up: any future caller using the JSON path doesn't need a sort either if they're not signing — but the current `to_bytes` (JSON) caller pool includes signed-announcement code paths, so leaving the JSON sort in place is the right default.
+
+### What was deferred (and why)
+
+`CapabilityAnnouncement::to_bytes_compact` is **not implemented**. The struct has six `#[serde(skip_serializing_if = ...)]` fields (`signature`, `hop_count`, `reflex_addr`, `allowed_nodes`, `allowed_subnets`, `allowed_groups`). JSON tolerates that fine — field names rescue the decoder. Postcard is positional and can't reconstruct an omitted field, so a postcard-encoded announcement decodes garbage. Stripping the skip attributes is not an option: the comments at `capability.rs:2014` and `:2061` document that the skip behavior is load-bearing for cross-version signed-byte compat (a pre-M-1 node's signature has to verify on a post-M-1 receiver and vice versa).
+
+The right fix is a separate `CapabilityAnnouncementWire` struct that holds every field explicitly (with `Option`/`Vec` defaults instead of skip), plus `From<&CapabilityAnnouncement>` / `Into<CapabilityAnnouncement>` impls and a custom codec. Not done — out of scope for this commit.
+
+### Rollout (not in this commit)
+
+`to_bytes` (JSON) is still the default writer for `CapabilitySet`. Wire callers continue producing JSON; new readers accept both formats. To actually realize the win on the wire:
+
+1. Land this commit. Every receiver on the new version handles both formats.
+2. Wait for the new version to roll out everywhere (or behind a feature flag / config switch on the writer side).
+3. Flip the writer: change `to_bytes` to delegate to `to_bytes_compact` (or have wire callers call `to_bytes_compact` directly).
+
+Skipping step 1 → 2 → 3 ordering means new bytes hit old peers that can't decode them. The version envelope makes the ordering safe, not optional.
+
+All 4137 lib tests pass (added 3 new tests: `compact_wire_format_round_trips_and_interops_with_json`, `from_bytes_rejects_unknown_format_tag`, and the round-trip test count moved up by one).
