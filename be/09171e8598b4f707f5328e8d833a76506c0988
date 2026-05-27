@@ -1,0 +1,22 @@
+net/crates/net/sdk/tests/tool_serve_round_trip.rs
+  s_099fa7d871e34d::t_4d1175dd47a165 643-655,657-671,675-694,696-709,718
+  s_099fa7d871e34d::t_dcaa47e736ea12 672-674,695
+  s_099fa7d871e34d::t_b0398ecbed1562 656
+  s_099fa7d871e34d::t_aeb9bab935a111 710-717
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "be09171e8598b4f707f5328e8d833a76506c0988",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
