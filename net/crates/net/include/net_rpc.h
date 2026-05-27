@@ -431,6 +431,35 @@ int net_rpc_find_service_nodes(
     uint64_t** out_ptr, size_t* out_count,
     char** out_err);
 
+/* AI-tool discovery — flat list of (tool_id, version) descriptor
+ * rows aggregated from the local capability fold. On success
+ * writes a heap-allocated JSON-encoded array (UTF-8) to
+ * (*out_json_ptr, *out_json_len); caller frees via
+ * net_rpc_response_free(ptr, len). Empty fold writes the literal
+ * `[]`. Each row matches the wire shape of
+ * `net::adapter::net::cortex::tool::ToolDescriptor`:
+ *
+ *   {
+ *     "tool_id": "...",
+ *     "name": "...",
+ *     "version": "...",
+ *     "description": "...",      // optional, null when absent
+ *     "input_schema": "...",     // JSON-Schema string, optional
+ *     "output_schema": "...",    // optional
+ *     "requires": ["..."],
+ *     "estimated_time_ms": 0,
+ *     "stateless": true,
+ *     "streaming": false,
+ *     "tags": ["..."],
+ *     "node_count": 1
+ *   }
+ *
+ * Gated on rpc-ffi's `tool` feature (default-on). */
+int net_rpc_list_tools(
+    const MeshRpcHandle* handle,
+    uint8_t** out_json_ptr, size_t* out_json_len,
+    char** out_err);
+
 /* =========================================================================
  * Serve (handler registration)
  * ========================================================================= */

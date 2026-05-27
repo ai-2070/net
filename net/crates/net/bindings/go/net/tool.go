@@ -24,7 +24,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
+	"time"
 )
 
 // =============================================================================
@@ -710,4 +712,168 @@ func LowerGeminiFunctionCall(call map[string]interface{}) (ToolCallSpec, error) 
 	spec.Name = name
 	spec.ArgumentsJSON = string(b)
 	return spec, nil
+}
+
+// =============================================================================
+// Discovery — ListTools / WatchTools (D-2)
+// =============================================================================
+
+// ListTools is a typed wrapper around MeshRpc.ListTools that
+// returns the local capability fold's AI-tool descriptors. Caller
+// can post-filter on Tags / ToolID. Empty fold returns
+// []ToolDescriptor{} with nil error.
+//
+// Mirror of the Rust SDK's `Mesh::list_tools(None)`, the Node TS
+// `MeshNode.listTools()`, and the Python `NetMesh.list_tools()`.
+func ListTools(rpc *TypedMeshRpc) ([]ToolDescriptor, error) {
+	return rpc.raw.ListTools()
+}
+
+// ToolListChange is one event in the WatchTools stream. Wire-
+// compatible with the Rust `ToolListChange` enum + the Node TS
+// `ToolListChange` discriminated union + the Python
+// `ToolListChange` tagged dataclass.
+//
+// `Type` discriminates the variant: "added", "removed",
+// "node_count_changed". Variant-specific fields are populated
+// only for their variant.
+type ToolListChange struct {
+	Type     string         `json:"type"`
+	ToolID   string         `json:"tool_id"`
+	Version  string         `json:"version"`
+	Tool     ToolDescriptor `json:"tool,omitempty"`      // Added
+	OldCount uint32         `json:"old_count,omitempty"` // NodeCountChanged
+	NewCount uint32         `json:"new_count,omitempty"` // NodeCountChanged + Added/Removed (for diff visibility)
+}
+
+// WatchOptions configures WatchTools.
+type WatchOptions struct {
+	// Interval between polls. Defaults to 1s if zero — matches
+	// the Rust SDK's `watch_tools` default + the Node/Python
+	// polling implementations.
+	Interval time.Duration
+}
+
+// WatchTools polls the local capability fold and emits a
+// ToolListChange on `<-changes` whenever a tool is added,
+// removed, or its node_count changes. Cancel via `ctx`. Errors
+// during polling are emitted on `<-errs` so the caller decides
+// whether to log + continue or stop.
+//
+// Caller-side polling-backed mirror of the Rust SDK's
+// `Mesh::watch_tools(None, interval)`. Same Diff-on-poll
+// semantics as Node TS `watchTools` + Python `watch_tools`.
+//
+// Returns the two channels + a baseline snapshot taken before the
+// goroutine starts (so initial state can be reasoned about without
+// racing with the first poll).
+func WatchTools(
+	ctx context.Context,
+	rpc *TypedMeshRpc,
+	opts WatchOptions,
+) (changes <-chan ToolListChange, errs <-chan error, baseline []ToolDescriptor, err error) {
+	if opts.Interval <= 0 {
+		opts.Interval = time.Second
+	}
+	baseline, err = rpc.raw.ListTools()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	changeCh := make(chan ToolListChange, 16)
+	errCh := make(chan error, 4)
+	prev := indexDescriptors(baseline)
+	go func() {
+		defer close(changeCh)
+		defer close(errCh)
+		ticker := time.NewTicker(opts.Interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				next, e := rpc.raw.ListTools()
+				if e != nil {
+					select {
+					case errCh <- e:
+					default: // drop if caller isn't draining
+					}
+					continue
+				}
+				nextIdx := indexDescriptors(next)
+				for _, change := range diffToolIndex(prev, nextIdx) {
+					select {
+					case <-ctx.Done():
+						return
+					case changeCh <- change:
+					}
+				}
+				prev = nextIdx
+			}
+		}
+	}()
+	return changeCh, errCh, baseline, nil
+}
+
+// indexDescriptors keys each descriptor by (tool_id, version) so
+// diffToolIndex can compare set-membership + per-key node_count.
+func indexDescriptors(descs []ToolDescriptor) map[string]ToolDescriptor {
+	idx := make(map[string]ToolDescriptor, len(descs))
+	for _, d := range descs {
+		idx[d.ToolID+"\x00"+d.Version] = d
+	}
+	return idx
+}
+
+// diffToolIndex computes the ToolListChange events that take
+// `prev` to `next`. Emits Added for new keys, Removed for missing
+// keys, NodeCountChanged for keys present in both with a different
+// NodeCount. Sort output deterministically by key so tests don't
+// flake.
+func diffToolIndex(prev, next map[string]ToolDescriptor) []ToolListChange {
+	var changes []ToolListChange
+	// Added + NodeCountChanged
+	keys := make([]string, 0, len(next))
+	for k := range next {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		n := next[k]
+		p, existed := prev[k]
+		if !existed {
+			changes = append(changes, ToolListChange{
+				Type:     "added",
+				ToolID:   n.ToolID,
+				Version:  n.Version,
+				Tool:     n,
+				NewCount: n.NodeCount,
+			})
+		} else if p.NodeCount != n.NodeCount {
+			changes = append(changes, ToolListChange{
+				Type:     "node_count_changed",
+				ToolID:   n.ToolID,
+				Version:  n.Version,
+				OldCount: p.NodeCount,
+				NewCount: n.NodeCount,
+			})
+		}
+	}
+	// Removed
+	keys = keys[:0]
+	for k := range prev {
+		if _, still := next[k]; !still {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		p := prev[k]
+		changes = append(changes, ToolListChange{
+			Type:    "removed",
+			ToolID:  p.ToolID,
+			Version: p.Version,
+		})
+	}
+	return changes
 }

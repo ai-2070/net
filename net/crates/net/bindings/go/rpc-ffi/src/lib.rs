@@ -3336,6 +3336,66 @@ pub extern "C" fn net_rpc_metrics_snapshot(
     NET_RPC_OK
 }
 
+/// Aggregate the local capability fold into a flat list of
+/// AI-tool descriptors (one row per (tool_id, version)). Returns
+/// a JSON-encoded array of objects; the Go side decodes into
+/// `[]ToolDescriptor`. Empty fold → writes the JSON literal `[]`.
+///
+/// Mirror of the Rust SDK's `Mesh::list_tools(None)` + the napi
+/// `NetMesh.listTools()` + the pyo3 `NetMesh.list_tools()`.
+/// Matcher pushdown is a v1 follow-up — current call walks the
+/// entire fold and lets the caller post-filter in Go.
+///
+/// Gated on the `tool` feature; the feature is enabled in
+/// `rpc-ffi/Cargo.toml` to match `compute-ffi`'s layout
+/// invariant.
+#[cfg(feature = "tool")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_list_tools(
+    handle: *const MeshRpcHandle,
+    out_json_ptr: *mut *mut u8,
+    out_json_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        write_err(out_err, "MeshRpc handle is NULL".into());
+        return NET_RPC_ERR_NULL;
+    };
+    if out_json_ptr.is_null() || out_json_len.is_null() {
+        write_err(out_err, "out_json_ptr / out_json_len is NULL".into());
+        return NET_RPC_ERR_NULL;
+    }
+    let descriptors = h.node.list_tools(None);
+    let value = serde_json::json!(
+        descriptors
+            .into_iter()
+            .map(|d| serde_json::json!({
+                "tool_id": d.tool_id,
+                "name": d.name,
+                "version": d.version,
+                "description": d.description,
+                "input_schema": d.input_schema,
+                "output_schema": d.output_schema,
+                "requires": d.requires,
+                "estimated_time_ms": d.estimated_time_ms,
+                "stateless": d.stateless,
+                "streaming": d.streaming,
+                "tags": d.tags,
+                "node_count": d.node_count,
+            }))
+            .collect::<Vec<_>>()
+    );
+    let bytes = match serde_json::to_vec(&value) {
+        Ok(v) => v,
+        Err(e) => {
+            write_err(out_err, format!("list_tools serialize failed: {e}"));
+            return NET_RPC_ERR_CALL_FAILED;
+        }
+    };
+    write_response(bytes, out_json_ptr, out_json_len);
+    NET_RPC_OK
+}
+
 // =========================================================================
 // Tests for pure-logic helpers.
 // =========================================================================

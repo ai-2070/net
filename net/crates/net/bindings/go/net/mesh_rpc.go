@@ -111,6 +111,15 @@ extern int net_rpc_find_service_nodes(
     uint64_t** out_ptr, size_t* out_count,
     char** out_err
 );
+// AI-tool discovery — flat list of (tool_id, version) descriptors
+// from the local capability fold. Returns a JSON-encoded array as
+// (out_json_ptr, out_json_len); caller frees via
+// net_rpc_response_free. See net_rpc.h for the row shape.
+extern int net_rpc_list_tools(
+    const MeshRpcHandle* handle,
+    uint8_t** out_json_ptr, size_t* out_json_len,
+    char** out_err
+);
 
 extern uint64_t net_rpc_reserve_handler_id(void);
 extern ServeHandleC* net_rpc_serve(
@@ -329,6 +338,7 @@ import "C"
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -736,6 +746,45 @@ func (r *MeshRpc) CallService(
 		return nil, err
 	}
 	return readCancellableResult(ctx, code, outResp, outRespLen, outErr)
+}
+
+// ListTools aggregates the local capability fold into a flat list
+// of AI-tool descriptors. One row per (ToolID, Version); NodeCount
+// is filled by the substrate walk.
+//
+// Returns []ToolDescriptor{} (nil error) when no tools are
+// advertised. Mirror of the napi `NetMesh.listTools()`, the pyo3
+// `NetMesh.list_tools()`, and the Rust SDK's `Mesh::list_tools(None)`.
+//
+// v1 walks unfiltered; matcher pushdown is a follow-up. Caller can
+// post-filter on `desc.Tags` / `desc.ToolID` in Go.
+func (r *MeshRpc) ListTools() ([]ToolDescriptor, error) {
+	var outJSON *C.uint8_t
+	var outLen C.size_t
+	var outErr *C.char
+	var code C.int
+	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		code = C.net_rpc_list_tools(h, &outJSON, &outLen, &outErr)
+	}); err != nil {
+		return nil, err
+	}
+	if code != 0 {
+		msg := readCError(outErr)
+		return nil, parseRpcError(msg)
+	}
+	if outJSON == nil || outLen == 0 {
+		return []ToolDescriptor{}, nil
+	}
+	defer C.net_rpc_response_free(outJSON, outLen)
+	body := C.GoBytes(unsafe.Pointer(outJSON), C.int(outLen))
+	var out []ToolDescriptor
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("list_tools: decode payload: %w", err)
+	}
+	if out == nil {
+		out = []ToolDescriptor{}
+	}
+	return out, nil
 }
 
 // FindServiceNodes returns the node IDs advertising
