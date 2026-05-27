@@ -14,9 +14,11 @@ import { describe, expect, it } from 'vitest'
 import {
   ToolCallParseError,
   ToolDescriptor,
+  ToolEvent,
   ToolListChange,
   addToolCapabilitiesToAnnounce,
   anthropic,
+  callToolStreaming,
   descriptorFrom,
   gemini,
   isTerminalEvent,
@@ -361,6 +363,107 @@ describe('watchTools (polling)', () => {
       expect(events[0].descriptor.toolId).toBe('shared_tool')
       expect(events[0].prevNodeCount).toBe(1)
       expect(events[0].descriptor.nodeCount).toBe(2)
+    }
+  })
+})
+
+describe('callToolStreaming', () => {
+  // Mock the minimal TypedMeshRpc surface that callToolStreaming
+  // consumes: a `callServiceStreaming` that resolves to an object
+  // that's both AsyncIterable<ToolEvent> and has a `close()` method.
+  function mockRpcYielding(events: ToolEvent[]): any {
+    let closed = false
+    return {
+      callServiceStreaming: async () => {
+        let i = 0
+        return {
+          async next(): Promise<ToolEvent | null> {
+            if (closed || i >= events.length) return null
+            return events[i++]!
+          },
+          async *[Symbol.asyncIterator]() {
+            while (true) {
+              const v = await this.next()
+              if (v === null) return
+              yield v
+            }
+          },
+          close: async () => {
+            closed = true
+          },
+        }
+      },
+    }
+  }
+
+  it('passes through terminal events without synthesis', async () => {
+    const rpc = mockRpcYielding([
+      { type: 'start', toolId: 'web_search', callId: 1 },
+      { type: 'delta', data: { partial: 'a' } },
+      { type: 'result', data: { final: 'ok' } },
+    ])
+    const collected: ToolEvent[] = []
+    for await (const event of callToolStreaming(rpc, 'web_search', {})) {
+      collected.push(event)
+    }
+    expect(collected.length).toBe(3)
+    expect(collected[collected.length - 1]?.type).toBe('result')
+    // No `missing_terminal` event should appear after the terminal.
+    expect(collected.find((e) => e.type === 'error' && (e as any).code === 'missing_terminal'))
+      .toBeUndefined()
+  })
+
+  it('synthesizes missing_terminal when stream ends without result/error', async () => {
+    const rpc = mockRpcYielding([
+      { type: 'start', toolId: 'web_search', callId: 2 },
+      { type: 'delta', data: { partial: 'partial-only' } },
+      // No result/error — stream just ends.
+    ])
+    const collected: ToolEvent[] = []
+    for await (const event of callToolStreaming(rpc, 'web_search', {})) {
+      collected.push(event)
+    }
+    expect(collected.length).toBe(3) // start + delta + synthesized error
+    const last = collected[collected.length - 1]!
+    expect(last.type).toBe('error')
+    if (last.type === 'error') {
+      // Exact byte shape pinned by T-2 fixture; the wrapper MUST emit
+      // `code: "missing_terminal"` so downstream adapters can match
+      // reliably across all four languages.
+      expect(last.code).toBe('missing_terminal')
+      expect(last.message).toMatch(/terminal result or error/i)
+    }
+  })
+
+  it('empty stream synthesizes a single missing_terminal event', async () => {
+    const rpc = mockRpcYielding([])
+    const collected: ToolEvent[] = []
+    for await (const event of callToolStreaming(rpc, 'noop_tool', {})) {
+      collected.push(event)
+    }
+    expect(collected.length).toBe(1)
+    expect(collected[0]?.type).toBe('error')
+    if (collected[0]?.type === 'error') {
+      expect(collected[0].code).toBe('missing_terminal')
+    }
+  })
+
+  it('error-terminal also suppresses the missing_terminal synthesis', async () => {
+    const rpc = mockRpcYielding([
+      { type: 'start', toolId: 'web_search', callId: 3 },
+      { type: 'error', code: 'handler_panicked', message: 'boom' },
+    ])
+    const collected: ToolEvent[] = []
+    for await (const event of callToolStreaming(rpc, 'web_search', {})) {
+      collected.push(event)
+    }
+    expect(collected.length).toBe(2)
+    const last = collected[collected.length - 1]!
+    expect(last.type).toBe('error')
+    if (last.type === 'error') {
+      // The handler's `boom` error survives — we don't paper over it
+      // with a synthesized envelope.
+      expect(last.code).toBe('handler_panicked')
     }
   })
 })

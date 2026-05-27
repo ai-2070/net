@@ -140,7 +140,13 @@ export interface RawMeshRpc {
     request: Buffer,
     opts?: CallOptions,
   ): Promise<RawRpcStream>
-  callServiceStreaming(
+  /**
+   * Capability-routed streaming. Optional in the interface for
+   * backwards-compat with hand-rolled `RawMeshRpc` test stubs that
+   * predate the streaming-caller addition; required on real napi-
+   * backed bindings.
+   */
+  callServiceStreaming?(
     service: string,
     request: Buffer,
     opts?: CallOptions,
@@ -646,6 +652,13 @@ export class TypedMeshRpc {
     req: Req,
     opts?: CallOptions,
   ): Promise<TypedRpcStream<Resp>> {
+    if (this._raw.callServiceStreaming === undefined) {
+      throw new Error(
+        'TypedMeshRpc.callServiceStreaming: the underlying raw binding ' +
+          "does not expose `callServiceStreaming`. Rebuild the native " +
+          'addon against a version that supports streaming tool calls.',
+      )
+    }
     const reqBuf = jsonEncode(req)
     const inner = await this._raw.callServiceStreaming(service, reqBuf, opts)
     return new TypedRpcStream<Resp>(inner)
