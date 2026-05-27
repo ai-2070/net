@@ -274,6 +274,133 @@ impl ToolEvent {
 }
 
 // ============================================================================
+// tool.metadata.fetch — on-demand schema pull
+// ============================================================================
+//
+// The capability fold has a per-entry payload budget — large JSON
+// schemas (multi-KB Pydantic-derived shapes, deep nested Zod output)
+// can blow it. The fold drops oversized fields, leaving the
+// `ToolDescriptor` with `input_schema: None` / `output_schema: None`
+// at discovery time. Agents that actually need the schema (to lower
+// into a provider's strict-mode tools array) call `tool.metadata.fetch`
+// against the host to pull the full descriptor on demand.
+//
+// The host's own `ToolMetadataRegistry` is the source of truth — a
+// local HashMap holding the full descriptor for every `serve_tool` on
+// this node. The registry is populated by `serve_tool` (A-2) and
+// drained by Drop on the returned `ServeHandle`.
+
+/// Canonical nRPC service name for the on-demand schema pull. Both
+/// halves of the call (the SDK-side client helper landing in A-2's
+/// `MeshNode::fetch_tool_schema` and the auto-registered server
+/// handler) use this constant so a future rename catches at one site.
+pub const TOOL_METADATA_FETCH_SERVICE: &str = "tool.metadata.fetch";
+
+/// Request body for the on-demand fetch. Wire shape: just the tool
+/// name; agents already discovered the host via the capability fold
+/// before issuing this call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolMetadataRequest {
+    /// nRPC service name of the tool whose full descriptor the
+    /// caller wants. Matches `ToolDescriptor::tool_id`.
+    pub name: String,
+}
+
+/// Response body — the full descriptor when the host knows about
+/// the named tool, or [`ToolMetadataResponse::NotFound`] when the
+/// host has no `serve_tool` registration for it. `NotFound` is a
+/// successful RPC response (not an `RpcError`) so callers can
+/// distinguish "host doesn't have this tool" from "RPC transport
+/// failed."
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolMetadataResponse {
+    /// Host has a `serve_tool` registration for `name`; descriptor
+    /// has every field the registry holds. `node_count` is left at
+    /// `0` — the aggregator on the caller's side fills it from the
+    /// fold walk.
+    Found {
+        /// Full descriptor for the requested tool.
+        descriptor: ToolDescriptor,
+    },
+    /// Host has no `serve_tool` registration for the requested
+    /// `name`. Distinct from RPC-level errors so a caller can fall
+    /// back to another host without treating this as transient.
+    NotFound {
+        /// Echo of the request name so logs / Display strings can
+        /// quote the missing tool without a separate side channel.
+        name: String,
+    },
+}
+
+/// Local-only registry holding the full `ToolDescriptor` for every
+/// tool `serve_tool` registered on this node. The
+/// `tool.metadata.fetch` handler reads this registry; `serve_tool`
+/// writes to it on registration and removes on Drop.
+///
+/// `parking_lot::Mutex<HashMap<...>>` shape mirrors the existing
+/// `cancel_registry` + `tool_metadata` patterns in the codebase
+/// — sync access from the dispatch path, no async lock required.
+#[derive(Debug, Default)]
+pub struct ToolMetadataRegistry {
+    inner: parking_lot::Mutex<HashMap<String, ToolDescriptor>>,
+}
+
+impl ToolMetadataRegistry {
+    /// Empty registry — what a fresh `MeshNode` ships with before
+    /// any `serve_tool` call. `Default::default()` works too;
+    /// keeping the named constructor so call sites read clearly.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert (or replace) the descriptor for `name`. Returns the
+    /// previous entry if one existed — callers can use this for
+    /// duplicate-registration diagnostics (the SDK's `serve_tool`
+    /// rejects duplicate names rather than silently overwriting).
+    pub fn insert(&self, descriptor: ToolDescriptor) -> Option<ToolDescriptor> {
+        let mut guard = self.inner.lock();
+        guard.insert(descriptor.tool_id.clone(), descriptor)
+    }
+
+    /// Look up the full descriptor for `name`. `None` when the
+    /// host doesn't serve this tool. Cloned because the registry
+    /// is mutex-protected; the clone is cheap (small heap fields).
+    pub fn get(&self, name: &str) -> Option<ToolDescriptor> {
+        self.inner.lock().get(name).cloned()
+    }
+
+    /// Remove the descriptor for `name`. Returns the removed entry
+    /// if one existed. Called by the SDK's `serve_tool` Drop hook.
+    pub fn remove(&self, name: &str) -> Option<ToolDescriptor> {
+        self.inner.lock().remove(name)
+    }
+
+    /// Returns the number of registered tools. Useful for the
+    /// auto-install branch — the host installs the
+    /// `tool.metadata.fetch` service the first time the registry
+    /// goes from empty to non-empty.
+    pub fn len(&self) -> usize {
+        self.inner.lock().len()
+    }
+
+    /// True when no tools are registered. Convenience used by the
+    /// same auto-install branch (`registry.is_empty()` reads
+    /// cleaner than `len() == 0` at the call site).
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().is_empty()
+    }
+
+    /// Snapshot every descriptor as a `Vec`. Used by the
+    /// `tool.metadata.list` variant (a future addition) and by
+    /// `Deck` panels that want the full local set. Allocates;
+    /// callers that just want the count use `len()`.
+    pub fn snapshot(&self) -> Vec<ToolDescriptor> {
+        self.inner.lock().values().cloned().collect()
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -419,5 +546,79 @@ mod tests {
             message: None,
         };
         assert_eq!(serde_json::to_string(&event).unwrap(), r#"{"type":"progress"}"#);
+    }
+
+    // ── tool.metadata.fetch ─────────────────────────────────────
+
+    fn descriptor(tool_id: &str) -> ToolDescriptor {
+        let cap = cap(tool_id);
+        ToolDescriptor::from_capability(&cap, &HashMap::new())
+    }
+
+    #[test]
+    fn tool_metadata_fetch_service_name_is_canonical() {
+        // Service name lives in one constant so client + server
+        // halves can't drift.
+        assert_eq!(TOOL_METADATA_FETCH_SERVICE, "tool.metadata.fetch");
+    }
+
+    #[test]
+    fn tool_metadata_response_serde_distinguishes_found_and_not_found() {
+        let found = ToolMetadataResponse::Found {
+            descriptor: descriptor("web_search"),
+        };
+        let not_found = ToolMetadataResponse::NotFound {
+            name: "missing".into(),
+        };
+        for resp in [&found, &not_found] {
+            let encoded = serde_json::to_string(resp).unwrap();
+            let decoded: ToolMetadataResponse = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(*resp, decoded, "round-trip must be byte-stable");
+        }
+        // `type` tag confirms wire-level disambiguation — a client
+        // matching on this string must keep working across releases.
+        let found_json = serde_json::to_value(&found).unwrap();
+        assert_eq!(found_json["type"], "found");
+        let nf_json = serde_json::to_value(&not_found).unwrap();
+        assert_eq!(nf_json["type"], "not_found");
+    }
+
+    #[test]
+    fn tool_metadata_registry_insert_lookup_remove_roundtrip() {
+        let reg = ToolMetadataRegistry::new();
+        assert!(reg.is_empty());
+        assert_eq!(reg.len(), 0);
+
+        let desc = descriptor("web_search");
+        assert!(
+            reg.insert(desc.clone()).is_none(),
+            "first insert returns None"
+        );
+        assert_eq!(reg.len(), 1);
+
+        let got = reg.get("web_search").expect("get must find it");
+        assert_eq!(got, desc);
+
+        // Re-insert returns the previous entry (lets the SDK detect
+        // duplicate registration without a separate sentinel).
+        let prior = reg.insert(desc.clone()).expect("second insert returns prior");
+        assert_eq!(prior, desc);
+
+        let removed = reg.remove("web_search").expect("remove must find it");
+        assert_eq!(removed, desc);
+        assert!(reg.is_empty());
+        assert!(reg.get("web_search").is_none());
+        assert!(reg.remove("web_search").is_none());
+    }
+
+    #[test]
+    fn tool_metadata_registry_snapshot_returns_all_entries() {
+        let reg = ToolMetadataRegistry::new();
+        reg.insert(descriptor("a"));
+        reg.insert(descriptor("b"));
+        reg.insert(descriptor("c"));
+        let mut names: Vec<String> = reg.snapshot().into_iter().map(|d| d.tool_id).collect();
+        names.sort();
+        assert_eq!(names, vec!["a", "b", "c"]);
     }
 }
