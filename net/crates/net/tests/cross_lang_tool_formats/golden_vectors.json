@@ -1,0 +1,272 @@
+{
+  "description": "Cross-language tool-format compatibility fixture (plan T-1). Each binding's tool-format test loads this file and asserts: (1) `to_<provider>_tool(descriptor)` emits the lowered_<provider> JSON byte-for-byte (modulo whitespace; tests parse + compare via deep-equality, not string compare), and (2) `lower_<provider>_tool_call(reply)` returns the expected ToolCallSpec. Rust impl is `net_sdk::tool::formats`; Node TS is `bindings/node/tool.ts`; Python is `net.tool`; Go is `bindings/go/net/tool.go`. The four impls stay byte-equal — adding a case here means updating all four tests in lockstep.",
+  "abi_version_expected": 1,
+  "descriptors": [
+    {
+      "name": "web_search_with_schema",
+      "input": {
+        "tool_id": "web_search",
+        "name": "web_search",
+        "version": "1.0.0",
+        "description": "Search the web for relevant pages.",
+        "input_schema_object": {
+          "type": "object",
+          "properties": {
+            "query": { "type": "string" },
+            "max_results": { "type": "integer", "default": 10 }
+          },
+          "required": ["query"]
+        },
+        "output_schema_object": null,
+        "requires": [],
+        "estimated_time_ms": 500,
+        "stateless": true,
+        "streaming": false,
+        "tags": ["web", "research"],
+        "node_count": 1
+      },
+      "lowered_openai": {
+        "type": "function",
+        "function": {
+          "name": "web_search",
+          "description": "Search the web for relevant pages.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": { "type": "string" },
+              "max_results": { "type": "integer", "default": 10 }
+            },
+            "required": ["query"]
+          },
+          "strict": true
+        }
+      },
+      "lowered_anthropic": {
+        "name": "web_search",
+        "description": "Search the web for relevant pages.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "query": { "type": "string" },
+            "max_results": { "type": "integer", "default": 10 }
+          },
+          "required": ["query"]
+        }
+      },
+      "lowered_mcp": {
+        "name": "web_search",
+        "description": "Search the web for relevant pages.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": { "type": "string" },
+            "max_results": { "type": "integer", "default": 10 }
+          },
+          "required": ["query"]
+        }
+      },
+      "lowered_gemini": {
+        "name": "web_search",
+        "description": "Search the web for relevant pages.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": { "type": "string" },
+            "max_results": { "type": "integer", "default": 10 }
+          },
+          "required": ["query"]
+        }
+      }
+    },
+    {
+      "name": "no_args_no_schema",
+      "input": {
+        "tool_id": "ping",
+        "name": "ping",
+        "version": "1.0.0",
+        "description": "Health check tool.",
+        "input_schema_object": null,
+        "output_schema_object": null,
+        "requires": [],
+        "estimated_time_ms": 0,
+        "stateless": true,
+        "streaming": false,
+        "tags": [],
+        "node_count": 0
+      },
+      "lowered_openai": {
+        "type": "function",
+        "function": {
+          "name": "ping",
+          "description": "Health check tool.",
+          "parameters": { "type": "object", "properties": {} },
+          "strict": false
+        }
+      },
+      "lowered_anthropic": {
+        "name": "ping",
+        "description": "Health check tool.",
+        "input_schema": { "type": "object", "properties": {} }
+      },
+      "lowered_mcp": {
+        "name": "ping",
+        "description": "Health check tool.",
+        "inputSchema": { "type": "object", "properties": {} }
+      },
+      "lowered_gemini": {
+        "name": "ping",
+        "description": "Health check tool.",
+        "parameters": { "type": "object", "properties": {} }
+      }
+    },
+    {
+      "name": "no_description",
+      "input": {
+        "tool_id": "bare_tool",
+        "name": "bare_tool",
+        "version": "1.0.0",
+        "description": null,
+        "input_schema_object": { "type": "object", "properties": {} },
+        "output_schema_object": null,
+        "requires": [],
+        "estimated_time_ms": 0,
+        "stateless": true,
+        "streaming": false,
+        "tags": [],
+        "node_count": 0
+      },
+      "lowered_openai": {
+        "type": "function",
+        "function": {
+          "name": "bare_tool",
+          "description": "",
+          "parameters": { "type": "object", "properties": {} },
+          "strict": true
+        }
+      },
+      "lowered_anthropic": {
+        "name": "bare_tool",
+        "description": "",
+        "input_schema": { "type": "object", "properties": {} }
+      },
+      "lowered_mcp": {
+        "name": "bare_tool",
+        "description": "",
+        "inputSchema": { "type": "object", "properties": {} }
+      },
+      "lowered_gemini": {
+        "name": "bare_tool",
+        "description": "",
+        "parameters": { "type": "object", "properties": {} }
+      }
+    }
+  ],
+  "lower_openai_cases": [
+    {
+      "name": "with_call_id",
+      "reply_json": {
+        "id": "call_abc123",
+        "type": "function",
+        "function": {
+          "name": "web_search",
+          "arguments": "{\"query\":\"mesh\",\"max_results\":5}"
+        }
+      },
+      "expected_spec": {
+        "name": "web_search",
+        "arguments_json": "{\"query\":\"mesh\",\"max_results\":5}",
+        "provider_call_id": "call_abc123"
+      }
+    },
+    {
+      "name": "without_call_id",
+      "reply_json": {
+        "type": "function",
+        "function": {
+          "name": "ping",
+          "arguments": "{}"
+        }
+      },
+      "expected_spec": {
+        "name": "ping",
+        "arguments_json": "{}",
+        "provider_call_id": null
+      }
+    }
+  ],
+  "lower_anthropic_cases": [
+    {
+      "name": "with_tool_use_id",
+      "reply_json": {
+        "type": "tool_use",
+        "id": "toolu_xyz789",
+        "name": "web_search",
+        "input": { "query": "mesh" }
+      },
+      "expected_spec": {
+        "name": "web_search",
+        "arguments_parsed": { "query": "mesh" },
+        "provider_call_id": "toolu_xyz789"
+      }
+    }
+  ],
+  "lower_mcp_cases": [
+    {
+      "name": "tools_call_basic",
+      "reply_json": {
+        "name": "web_search",
+        "arguments": { "query": "mesh" }
+      },
+      "expected_spec": {
+        "name": "web_search",
+        "arguments_parsed": { "query": "mesh" },
+        "provider_call_id": null
+      }
+    }
+  ],
+  "lower_gemini_cases": [
+    {
+      "name": "function_call_basic",
+      "reply_json": {
+        "name": "web_search",
+        "args": { "query": "mesh" }
+      },
+      "expected_spec": {
+        "name": "web_search",
+        "arguments_parsed": { "query": "mesh" },
+        "provider_call_id": null
+      }
+    }
+  ],
+  "error_cases": [
+    {
+      "name": "openai_malformed_arguments_json",
+      "provider": "openai",
+      "reply_json": {
+        "function": {
+          "name": "x",
+          "arguments": "not valid json {"
+        }
+      },
+      "_note": "OpenAI's arguments field is JSON-as-string; impls validate it parses up front to fail fast. Expected ToolCallParseError-equivalent."
+    },
+    {
+      "name": "openai_missing_function",
+      "provider": "openai",
+      "reply_json": { "id": "x" },
+      "_note": "tool_calls entry must carry a `function` field."
+    },
+    {
+      "name": "anthropic_missing_input",
+      "provider": "anthropic",
+      "reply_json": { "type": "tool_use", "name": "x" },
+      "_note": "tool_use block must carry an `input` field."
+    },
+    {
+      "name": "gemini_missing_args",
+      "provider": "gemini",
+      "reply_json": { "name": "x" },
+      "_note": "functionCall must carry an `args` field."
+    }
+  ]
+}
