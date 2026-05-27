@@ -200,7 +200,7 @@ static NEXT_HANDLER_ID: AtomicU64 = AtomicU64::new(1);
 /// [`net_rpc_cancel_call`] races the call's completion safely.
 ///
 /// Routes through [`MeshNode::reserve_cancel_token`] so the
-/// substrate's per-mesh [`CancelRegistry`] is the single source of
+/// substrate's per-mesh `CancelRegistry` is the single source of
 /// truth; the cancel-before-register (CR-13) and orphan-TTL (Q18)
 /// races are handled there.
 ///
@@ -209,7 +209,10 @@ static NEXT_HANDLER_ID: AtomicU64 = AtomicU64::new(1);
 /// Returns `0` if `handle` is NULL.
 ///
 /// [`MeshNode::reserve_cancel_token`]: net::adapter::net::MeshNode::reserve_cancel_token
-/// [`CancelRegistry`]: net::adapter::net::cancel_registry::CancelRegistry
+// Note: `CancelRegistry` is a crate-private type in the
+// substrate (`adapter::net::cancel_registry`); the link is
+// elided from rustdoc so the broken intra-doc reference
+// doesn't fail `cargo doc -D warnings`.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_reserve_cancel_token(handle: *mut MeshRpcHandle) -> u64 {
     let Some(h) = (unsafe { handle.as_ref() }) else {
@@ -231,7 +234,7 @@ pub extern "C" fn net_rpc_reserve_cancel_token(handle: *mut MeshRpcHandle) -> u6
 /// with `out_err = "nrpc:cancelled: call cancelled by caller"`.
 ///
 /// ABI 0x0004: signature gained `handle` argument so the cancel
-/// is routed to the mesh whose [`CancelRegistry`] owns the
+/// is routed to the mesh whose `CancelRegistry` owns the
 /// token. Tokens are process-monotonic across meshes (the
 /// substrate's `NEXT_CANCEL_TOKEN` is global) — a cancel issued
 /// against the wrong mesh creates an orphan entry that ages out
@@ -240,7 +243,10 @@ pub extern "C" fn net_rpc_reserve_cancel_token(handle: *mut MeshRpcHandle) -> u6
 /// [`MeshNode::cancel`]: net::adapter::net::MeshNode::cancel
 /// [`Notify`]: tokio::sync::Notify
 /// [`RpcError::Cancelled`]: net::adapter::net::mesh_rpc::RpcError::Cancelled
-/// [`CancelRegistry`]: net::adapter::net::cancel_registry::CancelRegistry
+// Note: `CancelRegistry` is a crate-private type in the
+// substrate (`adapter::net::cancel_registry`); the link is
+// elided from rustdoc so the broken intra-doc reference
+// doesn't fail `cargo doc -D warnings`.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_cancel_call(handle: *mut MeshRpcHandle, token: u64) {
     let Some(h) = (unsafe { handle.as_ref() }) else {

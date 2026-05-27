@@ -218,7 +218,7 @@ agent = [
 # bundle for an operator's full-stack daemon", not "every flag
 # this crate exposes". Consumers that want dataforts blob storage
 # or the MeshDB query plane add those flags explicitly.
-full = ["local", "nat-traversal", "redis", "jetstream", "meshos", "deck"]
+full = ["local", "nat-traversal", "redis", "jetstream", "meshos", "deck", "tool", "macros"]
 
 # nRPC quickstart — requires net + cortex.
 [[example]]

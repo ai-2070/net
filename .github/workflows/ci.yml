@@ -803,6 +803,35 @@ jobs:
             # symbols are exercised by the `go test` suite, not by
             # consumers.
             features: ""
+          - name: go-rpc-ffi
+            # nRPC FFI shim — carries the dispatcher trampolines
+            # (`net_rpc_set_handler_dispatcher`,
+            # `net_rpc_set_client_streaming_handler_dispatcher`,
+            # `net_rpc_set_duplex_handler_dispatcher`,
+            # `net_rpc_set_streaming_handler_dispatcher`) consumed
+            # by `go/mesh_rpc.go`. Lint-coverage gap closed when the
+            # streaming-serve dispatcher landed (G-1 of
+            # NET_GO_NRPC_PORT).
+            path: net/crates/net/bindings/go/rpc-ffi
+            features: ""
+          - name: go-meshdb-ffi
+            path: net/crates/net/bindings/go/meshdb-ffi
+            features: ""
+          - name: go-meshos-ffi
+            path: net/crates/net/bindings/go/meshos-ffi
+            features: ""
+          - name: go-deck-ffi
+            path: net/crates/net/bindings/go/deck-ffi
+            features: ""
+          - name: sdk-macros
+            # `net-mesh-sdk-macros` ships the `#[tool]` attribute
+            # proc-macro. Linted separately from the SDK because the
+            # proc-macro crate doesn't inherit feature flags from
+            # its consumers — its public surface is the macro's
+            # generated code, which the SDK's `tool_macro`
+            # integration test covers separately at runtime.
+            path: net/crates/net/sdk-macros
+            features: ""
           - name: cli
             path: net/crates/net/cli
             # `net-cli` pulls the SDK in with the explicit feature
@@ -890,6 +919,9 @@ jobs:
             features: ""
           - name: go-meshdb-ffi
             path: net/crates/net/bindings/go/meshdb-ffi
+            features: ""
+          - name: go-meshos-ffi
+            path: net/crates/net/bindings/go/meshos-ffi
             features: ""
           - name: go-deck-ffi
             path: net/crates/net/bindings/go/deck-ffi
@@ -1249,5 +1281,34 @@ jobs:
 
       - name: Build net-aggregator-daemon documentation
         run: cargo doc -p net-aggregator-daemon --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # `net-mesh-sdk` is a substantial workspace member with most
+      # of the user-facing AI tool / nrpc / mesh / netdb docstrings.
+      # Pinning `--features full` so the full doc surface (tool +
+      # macros + nrpc + cortex + compute + groups + meshos + deck
+      # + dataforts + meshdb + aggregator + local + nat-traversal
+      # + redis + jetstream) is verified warning-free in lockstep
+      # with the `ffi-clippy` `rust-sdk` lint job.
+      - name: Build net-mesh-sdk documentation
+        run: cargo doc -p net-mesh-sdk --no-deps --features full
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # `#[tool]` proc macro crate. User-facing macro docs live
+      # here; the SDK depends on them via `pub use net_sdk_macros::tool;`.
+      - name: Build net-mesh-sdk-macros documentation
+        run: cargo doc -p net-mesh-sdk-macros --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # `net-rpc-ffi` is the cgo-facing nRPC shim. Its public
+      # surface (extern "C" fn signatures + ABI version constants
+      # + handle types) is what `go/mesh_rpc.go` documents against;
+      # keep its rustdoc warning-free so the cross-language ABI
+      # contract notes stay buildable.
+      - name: Build net-rpc-ffi documentation
+        run: cargo doc -p net-rpc-ffi --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
