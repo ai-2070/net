@@ -289,6 +289,92 @@ def fetch_tool_metadata(
     return rpc.call(host_node_id, TOOL_METADATA_FETCH_SERVICE, {"name": tool_id}, opts)
 
 
+@dataclass
+class ToolListChangeAdded:
+    type: Literal["added"]
+    descriptor: ToolDescriptor
+
+
+@dataclass
+class ToolListChangeRemoved:
+    type: Literal["removed"]
+    descriptor: ToolDescriptor
+
+
+@dataclass
+class ToolListChangeNodeCountChanged:
+    type: Literal["node_count_changed"]
+    descriptor: ToolDescriptor
+    prev_node_count: int
+
+
+#: One change in the set of tools visible to the local capability
+#: fold. Mirror of the Rust SDK's ``ToolListChange`` enum.
+#: Wire-compatible 1:1 with the Node TS ``ToolListChange`` union.
+ToolListChange = Union[
+    ToolListChangeAdded,
+    ToolListChangeRemoved,
+    ToolListChangeNodeCountChanged,
+]
+
+
+async def watch_tools(
+    mesh: Any,
+    *,
+    interval: float = 1.0,
+):
+    """Async-iterator over [`ToolListChange`] events for every
+    dynamic addition / removal / publisher-count change in the
+    local capability fold's tool view.
+
+    Polling-backed: every ``interval`` seconds (default ``1.0``),
+    the helper re-runs :func:`list_tools` on the mesh and diffs
+    against the prior snapshot. The first event fires AFTER the
+    initial baseline — call ``list_tools(mesh)`` once before
+    consuming the iterator if you need the starting shape.
+
+    Mirror of the Rust SDK's ``Mesh::watch_tools`` and the Node TS
+    ``watchTools``. All three are polling-backed at 1s default;
+    identical semantics.
+
+    Cancel by calling :meth:`asyncio.CancelledError` on the
+    consuming task — the polling loop exits on the next tick.
+
+    Usage::
+
+        async for change in watch_tools(mesh, interval=0.25):
+            match change.type:
+                case "added":   print(f"+ {change.descriptor.tool_id}")
+                case "removed": print(f"- {change.descriptor.tool_id}")
+                case "node_count_changed":
+                    print(f"~ {change.descriptor.tool_id}: {change.prev_node_count} -> {change.descriptor.node_count}")
+    """
+    import asyncio
+
+    def snapshot() -> dict:
+        return {(d.tool_id, d.version): d for d in list_tools(mesh)}
+
+    prev = snapshot()
+    while True:
+        await asyncio.sleep(interval)
+        next_snap = snapshot()
+        for key, desc in next_snap.items():
+            if key not in prev:
+                yield ToolListChangeAdded(type="added", descriptor=desc)
+        for key, desc in prev.items():
+            if key not in next_snap:
+                yield ToolListChangeRemoved(type="removed", descriptor=desc)
+        for key, desc in next_snap.items():
+            old = prev.get(key)
+            if old is not None and old.node_count != desc.node_count:
+                yield ToolListChangeNodeCountChanged(
+                    type="node_count_changed",
+                    descriptor=desc,
+                    prev_node_count=old.node_count,
+                )
+        prev = next_snap
+
+
 def list_tools(mesh: Any) -> List[ToolDescriptor]:
     """Walk the local capability fold for every published AI tool.
 
@@ -634,6 +720,11 @@ __all__ = [
     "serve_tool",
     "call_tool",
     "list_tools",
+    "watch_tools",
+    "ToolListChange",
+    "ToolListChangeAdded",
+    "ToolListChangeRemoved",
+    "ToolListChangeNodeCountChanged",
     "fetch_tool_metadata",
     "add_tool_capabilities_to_announce",
     "TOOL_METADATA_FETCH_SERVICE",

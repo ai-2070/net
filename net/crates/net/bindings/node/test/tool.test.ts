@@ -14,6 +14,7 @@ import { describe, expect, it } from 'vitest'
 import {
   ToolCallParseError,
   ToolDescriptor,
+  ToolListChange,
   addToolCapabilitiesToAnnounce,
   anthropic,
   descriptorFrom,
@@ -21,6 +22,7 @@ import {
   isTerminalEvent,
   mcp,
   openai,
+  watchTools,
 } from '../tool'
 
 function sampleDescriptor(): ToolDescriptor {
@@ -202,6 +204,118 @@ describe('gemini format', () => {
     const parsed = JSON.parse(spec.argumentsJson)
     expect(parsed.query).toBe('mesh')
     expect(spec.providerCallId).toBeUndefined()
+  })
+})
+
+describe('watchTools (polling)', () => {
+  // The mesh stub holds a mutable descriptor list — tests poke it
+  // to simulate registrations / removals / node-count drift, then
+  // assert the watcher diffs them out as Added / Removed /
+  // NodeCountChanged events.
+  function stubMesh(initial: ToolDescriptor[]): {
+    listTools(): ToolDescriptor[]
+    set(next: ToolDescriptor[]): void
+  } {
+    let snapshot = [...initial]
+    return {
+      listTools: () => [...snapshot],
+      set: (next) => {
+        snapshot = [...next]
+      },
+    }
+  }
+
+  function makeDesc(toolId: string, nodeCount = 1): ToolDescriptor {
+    return descriptorFrom({ name: toolId, description: '' }) as ToolDescriptor &
+      Record<string, unknown> as ToolDescriptor & { nodeCount: number } as ToolDescriptor
+  }
+
+  // descriptorFrom's nodeCount defaults to 0; override for the
+  // stub so we exercise the NodeCountChanged path cleanly.
+  function desc(toolId: string, nodeCount: number): ToolDescriptor {
+    return { ...descriptorFrom({ name: toolId }), nodeCount }
+  }
+
+  it('emits Added when a tool appears after the baseline', async () => {
+    const mesh = stubMesh([])
+    const ctrl = new AbortController()
+    const events: ToolListChange[] = []
+    const iter = watchTools(mesh, { intervalMs: 25, signal: ctrl.signal })
+
+    // Add a tool *before* we start consuming so the first tick
+    // catches the diff.
+    mesh.set([desc('web_search', 1)])
+
+    void (async () => {
+      for await (const change of iter) {
+        events.push(change)
+        if (events.length >= 1) {
+          ctrl.abort()
+          break
+        }
+      }
+    })()
+
+    await new Promise((r) => setTimeout(r, 100))
+    expect(events.length).toBe(1)
+    expect(events[0]?.type).toBe('added')
+    if (events[0]?.type === 'added') {
+      expect(events[0].descriptor.toolId).toBe('web_search')
+    }
+  })
+
+  it('emits Removed when a tool disappears', async () => {
+    const mesh = stubMesh([desc('temp', 1)])
+    const ctrl = new AbortController()
+    const events: ToolListChange[] = []
+    const iter = watchTools(mesh, { intervalMs: 25, signal: ctrl.signal })
+
+    mesh.set([])
+
+    void (async () => {
+      for await (const change of iter) {
+        events.push(change)
+        if (events.length >= 1) {
+          ctrl.abort()
+          break
+        }
+      }
+    })()
+
+    await new Promise((r) => setTimeout(r, 100))
+    expect(events.length).toBe(1)
+    expect(events[0]?.type).toBe('removed')
+    if (events[0]?.type === 'removed') {
+      expect(events[0].descriptor.toolId).toBe('temp')
+    }
+  })
+
+  it('emits NodeCountChanged when publisher count drifts', async () => {
+    const mesh = stubMesh([desc('shared_tool', 1)])
+    const ctrl = new AbortController()
+    const events: ToolListChange[] = []
+    const iter = watchTools(mesh, { intervalMs: 25, signal: ctrl.signal })
+
+    mesh.set([desc('shared_tool', 2)])
+
+    void (async () => {
+      for await (const change of iter) {
+        events.push(change)
+        if (events.length >= 1) {
+          ctrl.abort()
+          break
+        }
+      }
+    })()
+
+    await new Promise((r) => setTimeout(r, 100))
+    expect(events.length).toBe(1)
+    expect(events[0]?.type).toBe('node_count_changed')
+    if (events[0]?.type === 'node_count_changed') {
+      expect(events[0].descriptor.toolId).toBe('shared_tool')
+      expect(events[0].prevNodeCount).toBe(1)
+      expect(events[0].descriptor.nodeCount).toBe(2)
+    }
   })
 })
 

@@ -326,6 +326,136 @@ export function listTools(mesh: MeshWithListTools): ToolDescriptor[] {
   return mesh.listTools()
 }
 
+// ============================================================================
+// Dynamic discovery — polling-backed watchTools (mirror of Rust A-5)
+// ============================================================================
+
+/**
+ * One change in the set of tools visible to the local capability
+ * fold. Discriminated union on `type`; identity for diffing is
+ * `(toolId, version)`.
+ *
+ * Wire-compatible 1:1 with the Rust SDK's `ToolListChange` enum
+ * (JSON tag-form `{ "type": "added", "descriptor": {...} }` /
+ * `"removed"` / `"node_count_changed"`).
+ */
+export type ToolListChange =
+  | { type: 'added'; descriptor: ToolDescriptor }
+  | { type: 'removed'; descriptor: ToolDescriptor }
+  | {
+      type: 'node_count_changed'
+      descriptor: ToolDescriptor
+      prevNodeCount: number
+    }
+
+/** Options for [`watchTools`]. */
+export interface WatchToolsOptions {
+  /** Poll interval in milliseconds. Default `1000`. */
+  intervalMs?: number
+  /**
+   * `AbortSignal` to end the watch. Aborting the signal closes
+   * the underlying async iterator on the next tick.
+   */
+  signal?: AbortSignal
+}
+
+/**
+ * Subscribe to a stream of [`ToolListChange`] events for every
+ * dynamic addition / removal / publisher-count change in the
+ * local capability fold's tool view.
+ *
+ * Polling-backed: every `intervalMs` (default `1s`), the helper
+ * re-runs [`listTools`] on the mesh and diffs against the prior
+ * snapshot. The first event fires AFTER the initial baseline —
+ * call `listTools(mesh)` once before subscribing if you need the
+ * starting shape.
+ *
+ * Mirror of the Rust SDK's `Mesh::watch_tools(matcher, interval)`
+ * (A-5). The Rust runtime version is also polling-backed —
+ * identical semantics, same default cadence. The Node version
+ * lives entirely in TS atop the existing `listTools` napi
+ * surface; no streaming FFI required.
+ *
+ * Returns an `AsyncIterable<ToolListChange>` suitable for
+ * `for await (const change of watchTools(mesh)) { ... }`. The
+ * iterator ends when `options.signal` aborts or when the
+ * underlying loop hits an unrecoverable error.
+ */
+export function watchTools(
+  mesh: MeshWithListTools,
+  options: WatchToolsOptions = {},
+): AsyncIterable<ToolListChange> {
+  const intervalMs = options.intervalMs ?? 1000
+  const signal = options.signal
+
+  // Take the baseline snapshot synchronously before the iterator
+  // is first awaited. Mirrors the Rust SDK's `watch_tools` race
+  // fix — a subscribe-then-publish call sequence must never lose
+  // the `Added` event to a spawn/announce ordering hiccup.
+  const baseline = new Map<string, ToolDescriptor>()
+  for (const t of mesh.listTools()) {
+    baseline.set(`${t.toolId}::${t.version}`, t)
+  }
+
+  async function* iterator(): AsyncGenerator<ToolListChange> {
+    let prev = baseline
+    while (true) {
+      // Sleep `intervalMs` between ticks. Abort short-circuits.
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const handle = setTimeout(resolve, intervalMs)
+          const onAbort = () => {
+            clearTimeout(handle)
+            reject(signal?.reason ?? new Error('aborted'))
+          }
+          if (signal) {
+            if (signal.aborted) {
+              clearTimeout(handle)
+              reject(signal.reason ?? new Error('aborted'))
+              return
+            }
+            signal.addEventListener('abort', onAbort, { once: true })
+          }
+        })
+      } catch {
+        return
+      }
+
+      const next = new Map<string, ToolDescriptor>()
+      for (const t of mesh.listTools()) {
+        next.set(`${t.toolId}::${t.version}`, t)
+      }
+
+      // Added: present in next, not in prev.
+      for (const [k, d] of next) {
+        if (!prev.has(k)) {
+          yield { type: 'added', descriptor: d }
+        }
+      }
+      // Removed: present in prev, not in next.
+      for (const [k, d] of prev) {
+        if (!next.has(k)) {
+          yield { type: 'removed', descriptor: d }
+        }
+      }
+      // NodeCountChanged: in both, but counts differ.
+      for (const [k, d] of next) {
+        const old = prev.get(k)
+        if (old && old.nodeCount !== d.nodeCount) {
+          yield {
+            type: 'node_count_changed',
+            descriptor: d,
+            prevNodeCount: old.nodeCount,
+          }
+        }
+      }
+      prev = next
+    }
+  }
+
+  return { [Symbol.asyncIterator]: iterator }
+}
+
 /** nRPC service name for the on-demand tool-descriptor pull. */
 export const TOOL_METADATA_FETCH_SERVICE = 'tool.metadata.fetch'
 

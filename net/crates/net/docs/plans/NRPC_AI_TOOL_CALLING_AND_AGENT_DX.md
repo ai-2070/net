@@ -86,11 +86,11 @@ Tagged `[S | A | B | C | D | M | T | X]`:
 | A-7   | M   | Rust SDK          | `#[tool]` proc macro (follow-up — runtime APIs land first)                                      | ✅     |
 | B-1   | H   | Node TS           | `tool({ name, description, schema, handle })` + Zod schema lowering                              | 🟡     |
 | B-2   | H   | Node TS           | `tool({ ..., stream: async function* handle() { yield … } })` — streaming via async-iter        | ⏳     |
-| B-3   | H   | Node TS           | `MeshNode.listTools({ matcher? })` + `MeshNode.watchTools({ matcher? })`                        | 🟡     |
+| B-3   | H   | Node TS           | `MeshNode.listTools({ matcher? })` + `MeshNode.watchTools({ matcher? })`                        | ✅     |
 | B-4   | H   | Node TS           | `TypedMeshRpc.callTool` + `.callToolStreaming` (capability-routed; client of `S-1`)             | 🟡     |
 | C-1   | H   | Python            | `from net.tools import tool` decorator (Pydantic-typed + plain-typing fallback)                  | 🟡     |
 | C-2   | H   | Python            | `@tool.stream` / `async def gen(...) -> AsyncGenerator[ToolEvent, None]` streaming variant       | ⏳     |
-| C-3   | H   | Python            | `await mesh.list_tools(matcher=...)` + `async for change in mesh.watch_tools(matcher=...)`       | 🟡     |
+| C-3   | H   | Python            | `await mesh.list_tools(matcher=...)` + `async for change in mesh.watch_tools(matcher=...)`       | ✅     |
 | C-4   | H   | Python            | `AsyncTypedMeshRpc.call_tool` + `.call_tool_streaming` (capability-routed)                       | 🟡     |
 | D-1   | M   | Go                | `net.RegisterTool[Req, Resp](rpc, meta, handler)` + streaming variant                            | 🟡     |
 | D-2   | M   | Go                | `mesh.ListTools(ctx, matcher)` + `mesh.WatchTools(ctx, matcher) <-chan ToolListChange`           | ⏳     |
