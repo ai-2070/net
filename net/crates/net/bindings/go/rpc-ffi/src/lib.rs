@@ -1171,6 +1171,73 @@ pub extern "C" fn net_rpc_call_streaming_cancellable(
     }
 }
 
+/// Capability-routed streaming call. Mirrors
+/// [`net_rpc_call_service`] for target resolution + cap-auth gate;
+/// returns a stream handle with the same drain semantics as
+/// [`net_rpc_call_streaming`]. `cancel_token != 0` routes through
+/// the substrate's `CancelRegistry` like the cancellable streaming
+/// variant.
+///
+/// Consumed by `net.CallToolStreaming` for streaming tool
+/// invocations.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_call_service_streaming(
+    handle: *mut MeshRpcHandle,
+    service_ptr: *const c_char,
+    service_len: usize,
+    req_ptr: *const u8,
+    req_len: usize,
+    deadline_ms: u64,
+    stream_window: u32,
+    cancel_token: u64,
+    out_stream: *mut *mut RpcStreamHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    let Some(service) = cstr_to_string(service_ptr, service_len) else {
+        write_err(out_err, "service name is NULL or non-UTF-8".into());
+        return NET_RPC_ERR_INVALID_UTF8;
+    };
+    let req_bytes = if req_ptr.is_null() {
+        Bytes::new()
+    } else {
+        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
+    };
+    let mut opts = build_call_options(deadline_ms);
+    if stream_window > 0 {
+        opts.stream_window_initial = Some(stream_window);
+    }
+    if cancel_token != 0 {
+        opts.cancel_token = Some(cancel_token);
+    }
+    let node = h.node.clone();
+
+    let result = runtime()
+        .block_on(async move { node.call_service_streaming(&service, req_bytes, opts).await });
+
+    match result {
+        Ok(stream) => {
+            let call_id = stream.call_id();
+            let boxed = Box::new(RpcStreamHandleC {
+                inner: Arc::new(Mutex::new(Some(stream))),
+                call_id,
+                done: AtomicBool::new(false),
+            });
+            unsafe {
+                *out_stream = Box::into_raw(boxed);
+            }
+            NET_RPC_OK
+        }
+        Err(e) => {
+            write_err(out_err, format_rpc_error(&e));
+            NET_RPC_ERR_CALL_FAILED
+        }
+    }
+}
+
 /// Block until the next chunk arrives, OR the stream terminates,
 /// OR a mid-stream error fires.
 ///

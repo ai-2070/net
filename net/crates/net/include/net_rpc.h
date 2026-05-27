@@ -401,6 +401,24 @@ int net_rpc_call_streaming_with_headers_cancellable(
     RpcStreamHandleC** out_stream,
     char** out_err);
 
+/* Capability-routed streaming call. Mirrors net_rpc_call_service
+ * for target resolution + cap-auth gate; returns a stream handle
+ * with the same drain semantics as net_rpc_call_streaming.
+ * cancel_token != 0 routes through the substrate cancel-registry
+ * like net_rpc_call_streaming_cancellable.
+ *
+ * Consumed by Go's net.CallToolStreaming for streaming tool
+ * invocations. */
+int net_rpc_call_service_streaming(
+    MeshRpcHandle* handle,
+    const char* service_ptr, size_t service_len,
+    const uint8_t* req_ptr, size_t req_len,
+    uint64_t deadline_ms,
+    uint32_t stream_window,
+    uint64_t cancel_token,
+    RpcStreamHandleC** out_stream,
+    char** out_err);
+
 /* All node ids advertising `nrpc:<service>` in the local
  * capability index. On success writes a heap-allocated `u64`
  * array of length `*out_count` to `*out_ptr`; caller frees via

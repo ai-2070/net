@@ -406,6 +406,31 @@ func TypedCallStreaming[Req, Resp any](
 	return &TypedRpcStream[Resp]{raw: raw}, nil
 }
 
+// TypedCallServiceStreaming opens a capability-routed typed
+// streaming call. Mirrors TypedCallService for target resolution
+// + cap-auth gate; mirrors TypedCallStreaming for the
+// chunk-iterator return shape.
+//
+// Used by net.CallToolStreaming for streaming tool invocations.
+// Same ctx + Close() semantics as TypedCallStreaming.
+func TypedCallServiceStreaming[Req, Resp any](
+	ctx context.Context,
+	t *TypedMeshRpc,
+	service string,
+	req Req,
+	opts StreamOptions,
+) (*TypedRpcStream[Resp], error) {
+	body, err := jsonEncodeTyped(req)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := t.raw.CallServiceStreaming(ctx, service, body, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &TypedRpcStream[Resp]{raw: raw}, nil
+}
+
 // =====================================================================
 // Client-streaming: TypedCallClientStream + TypedServeClientStream
 // + TypedClientStreamCall + TypedRequestStream (S1-D3).

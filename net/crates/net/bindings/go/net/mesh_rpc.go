@@ -156,6 +156,19 @@ extern int net_rpc_call_streaming_cancellable(
     RpcStreamHandleC** out_stream,
     char** out_err
 );
+// Capability-routed streaming call. See net_rpc_call_service for
+// the routing semantics; see net_rpc_call_streaming for the
+// drain semantics.
+extern int net_rpc_call_service_streaming(
+    MeshRpcHandle* handle,
+    const char* service_ptr, size_t service_len,
+    const uint8_t* req_ptr, size_t req_len,
+    uint64_t deadline_ms,
+    uint32_t stream_window,
+    uint64_t cancel_token,
+    RpcStreamHandleC** out_stream,
+    char** out_err
+);
 extern int net_rpc_stream_next(
     RpcStreamHandleC* stream,
     uint8_t** out_chunk_ptr, size_t* out_chunk_len,
@@ -983,6 +996,74 @@ func (r *MeshRpc) CallStreaming(
 			// closed.Swap is the single source of truth for "who
 			// owns the free." Whoever wins (Swap returns false)
 			// performs the C.free; the other path no-ops.
+			if !closedPtr.Swap(true) {
+				C.net_rpc_stream_free(handlePtr)
+			}
+			close(watcherDone)
+		}()
+	}
+	return stream, nil
+}
+
+// CallServiceStreaming opens a capability-routed streaming RPC.
+// Mirrors CallService for target resolution + cap-auth gate;
+// mirrors CallStreaming for the chunk-iterator return shape.
+// The returned RpcStream MUST be Closed (defer is fine); ctx
+// cancel triggers Close via the same watcher goroutine as
+// CallStreaming.
+//
+// Consumed by net.CallToolStreaming for streaming tool
+// invocations.
+func (r *MeshRpc) CallServiceStreaming(
+	ctx context.Context,
+	service string,
+	req []byte,
+	opts StreamOptions,
+) (*RpcStream, error) {
+	deadlineMs := contextDeadlineMs(ctx)
+	cService := stringToCBytes(service)
+	defer C.free(cService.ptr)
+	cReq, freeReq := bytesToCBytes(req)
+	defer freeReq()
+
+	var outStream *C.RpcStreamHandleC
+	var outErr *C.char
+	var code C.int
+	if err := r.withHandle(func(h *C.MeshRpcHandle) {
+		code = C.net_rpc_call_service_streaming(
+			h,
+			(*C.char)(cService.ptr), cService.len,
+			cReq.ptr, cReq.len,
+			C.uint64_t(deadlineMs),
+			C.uint32_t(opts.Window),
+			C.uint64_t(0), // cancel_token=0 — ctx-watcher path
+			&outStream,
+			&outErr,
+		)
+	}); err != nil {
+		return nil, err
+	}
+	if code != 0 {
+		msg := readCError(outErr)
+		return nil, parseRpcError(msg)
+	}
+	stream := &RpcStream{
+		rpc:    r,
+		handle: outStream,
+		callID: uint64(C.net_rpc_stream_call_id(outStream)),
+		closed: new(atomic.Bool),
+	}
+	runtime.SetFinalizer(stream, (*RpcStream).finalize)
+
+	if ctx != nil && ctx.Done() != nil {
+		watchCtx, cancel := context.WithCancel(ctx)
+		stream.cancel = cancel
+		stream.watcherDone = make(chan struct{})
+		closedPtr := stream.closed
+		handlePtr := outStream
+		watcherDone := stream.watcherDone
+		go func() {
+			<-watchCtx.Done()
 			if !closedPtr.Swap(true) {
 				C.net_rpc_stream_free(handlePtr)
 			}

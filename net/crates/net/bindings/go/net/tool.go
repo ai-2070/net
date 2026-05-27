@@ -382,6 +382,81 @@ func CallTool[Req, Resp any](
 	return TypedCallService[Req, Resp](ctx, rpc, toolID, request)
 }
 
+// CallToolStreaming opens a capability-routed streaming tool
+// invocation. Returns a `*ToolEventStream` — drain via `Recv()`
+// until ok=false (clean EOF or a terminal ToolEvent).
+//
+// The wrapper synthesizes a terminal
+// `{Type: ToolEventError, Code: "missing_terminal", ...}` event
+// if the stream ends without a Result / Error envelope — matches
+// the Rust SDK's serve_tool_streaming contract and the T-2
+// cross-language fixture.
+//
+// Cancel mid-stream via the `ctx` argument — the underlying
+// RpcStream's watcher closes the stream and emits CANCEL on the
+// wire.
+func CallToolStreaming[Req any](
+	ctx context.Context,
+	rpc *TypedMeshRpc,
+	toolID string,
+	request Req,
+) (*ToolEventStream, error) {
+	stream, err := TypedCallServiceStreaming[Req, ToolEvent](
+		ctx, rpc, toolID, request, StreamOptions{},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &ToolEventStream{inner: stream}, nil
+}
+
+// ToolEventStream wraps a TypedRpcStream[ToolEvent] and tracks
+// whether a terminal envelope was observed. On clean EOF without
+// a terminal, the next Recv() synthesizes a `missing_terminal`
+// error event before returning ok=false.
+type ToolEventStream struct {
+	inner       *TypedRpcStream[ToolEvent]
+	sawTerminal bool
+	synthesized bool
+}
+
+// Recv pulls the next ToolEvent. Returns (event, true, nil) for
+// each envelope until the stream ends. Once the stream is
+// exhausted, returns (zero, false, nil) AFTER one synthesized
+// `missing_terminal` event if no terminal was observed.
+func (s *ToolEventStream) Recv() (ToolEvent, bool, error) {
+	event, ok, err := s.inner.Recv()
+	if err != nil {
+		return ToolEvent{}, false, err
+	}
+	if ok {
+		if event.IsTerminal() {
+			s.sawTerminal = true
+		}
+		return event, true, nil
+	}
+	if !s.sawTerminal && !s.synthesized {
+		s.synthesized = true
+		return ToolEvent{
+			Type:   ToolEventError,
+			Code:   "missing_terminal",
+			ErrMsg: "tool stream ended without a terminal result or error envelope",
+		}, true, nil
+	}
+	return ToolEvent{}, false, nil
+}
+
+// Close drops the stream and emits CANCEL on the wire. Idempotent.
+func (s *ToolEventStream) Close() {
+	s.inner.Close()
+}
+
+// CallID returns the server-assigned call id — useful for trace
+// correlation.
+func (s *ToolEventStream) CallID() uint64 {
+	return s.inner.CallID()
+}
+
 // AddToolCapabilitiesToAnnounce merges tool descriptors into a
 // CapabilitySetWire so the next announce carries:
 //
