@@ -1347,22 +1347,7 @@ impl CapabilitySet {
     /// directly in the canonical tag set rather than reconstructing
     /// the full `Vec<ModelCapability>` via `views()`.
     pub fn has_model(&self, model_id: &str) -> bool {
-        use crate::adapter::net::behavior::tag::TaxonomyAxis;
-        self.tags.iter().any(|tag| {
-            let Some(key) = tag.axis_key() else {
-                return false;
-            };
-            if key.axis != TaxonomyAxis::Software {
-                return false;
-            }
-            let Some(rest) = key.key.strip_prefix("model.") else {
-                return false;
-            };
-            let Some((_idx, sub)) = rest.split_once('.') else {
-                return false;
-            };
-            sub == "id" && tag.value() == Some(model_id)
-        })
+        self.has_indexed_software_value("model.", "id", model_id)
     }
 
     /// Check if has a specific tool.
@@ -1370,21 +1355,42 @@ impl CapabilitySet {
     /// Phase A.5.N.3: scans for `software.tool.<i>.tool_id=<tool_id>`
     /// directly in the canonical tag set.
     pub fn has_tool(&self, tool_id: &str) -> bool {
+        self.has_indexed_software_value("tool.", "tool_id", tool_id)
+    }
+
+    /// Shared scan body for `has_model` / `has_tool` — looks for a
+    /// `software.<family_prefix><idx>.<sub_key>=<expected_value>` tag
+    /// (e.g. `software.model.0.id=llama-3.1-7b`).
+    ///
+    /// Performance note: matches `Tag::AxisValue` directly to avoid
+    /// `Tag::axis_key()`'s per-tag `String` clone. The value compare
+    /// runs first because most tags in the set won't carry the target
+    /// value — that lets the key parse (`strip_prefix` + `split_once`)
+    /// run only on the small set of value-matching candidates. See
+    /// `docs/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` fix #5.
+    fn has_indexed_software_value(
+        &self,
+        family_prefix: &str,
+        sub_key: &str,
+        expected_value: &str,
+    ) -> bool {
         use crate::adapter::net::behavior::tag::TaxonomyAxis;
-        self.tags.iter().any(|tag| {
-            let Some(key) = tag.axis_key() else {
-                return false;
-            };
-            if key.axis != TaxonomyAxis::Software {
-                return false;
+        self.tags.iter().any(|tag| match tag {
+            Tag::AxisValue {
+                axis: TaxonomyAxis::Software,
+                key,
+                value,
+                ..
+            } if value == expected_value => {
+                let Some(rest) = key.strip_prefix(family_prefix) else {
+                    return false;
+                };
+                let Some((_idx, sub)) = rest.split_once('.') else {
+                    return false;
+                };
+                sub == sub_key
             }
-            let Some(rest) = key.key.strip_prefix("tool.") else {
-                return false;
-            };
-            let Some((_idx, sub)) = rest.split_once('.') else {
-                return false;
-            };
-            sub == "tool_id" && tag.value() == Some(tool_id)
+            _ => false,
         })
     }
 

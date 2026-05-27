@@ -142,7 +142,59 @@ Baseline taken on Windows host (different hardware than the M1 Max snapshot abov
 
 | Family | Status |
 |---|---|
-| `capability_set/has_model` (~760 ns), `has_tool` (~740 ns) | Unchanged — still need fix #5 (lazy lookup index) |
+| `capability_set/has_model` (~760 ns), `has_tool` (~740 ns) | **Fixed** — see "Results — fix #5" below |
 | `capability_set/serialize` (~52 µs), `to_bytes`/`from_bytes` | Unchanged — needs fix #3 (bincode/postcard) |
 | `capability_announcement/*` | Not re-benched (same JSON path; will move with fix #3) |
 | Repeated `matches()` on same `CapabilitySet` in a loop | Each call still allocates a new `CapabilityViews` if it falls through to the modality/ctx path. Fix #4 (cache projections on the set) addresses this. |
+
+## Results — fix #5 applied (2026-05-28)
+
+Baseline `pre-fix-5` taken on the same Windows host after fixes #1 + #2 were already in. Both `has_*` benches scan the canonical tag set on every call; nothing in fixes #1 / #2 touched their hot path, so this is a clean before/after for #5 itself.
+
+| Benchmark | Pre-fix-5 | Post-fix-5 | Δ |
+|---|---|---|---|
+| `capability_set/has_model` | 755.54 ns | **31.65 ns** | **−95.8%** (~24× faster) |
+| `capability_set/has_tool`  | 680.02 ns | **34.69 ns** | **−94.9%** (~19.6× faster) |
+
+### Root cause (not what the doc originally said)
+
+The first diagnosis assumed the cost was the O(N) tag scan itself, and proposed a lazy lookup index. The actual cost turned out to be **`Tag::axis_key()`'s per-tag `String::clone`** (`tag.rs:299`):
+
+```rust
+pub fn axis_key(&self) -> Option<TagKey> {
+    match self {
+        Self::AxisPresent { axis, key } | Self::AxisValue { axis, key, .. } => {
+            Some(TagKey::new(*axis, key.clone()))   // alloc per tag
+        }
+        ...
+    }
+}
+```
+
+The old `has_model` / `has_tool` (`capability.rs:1349`, `:1372`) called `axis_key()` for every tag in the set — ~35 String allocations per call.
+
+### What fix #5 actually did
+
+Direct `Tag::AxisValue` pattern match, no `axis_key()`, value compare first:
+
+```rust
+fn has_indexed_software_value(
+    &self, family_prefix: &str, sub_key: &str, expected_value: &str,
+) -> bool {
+    self.tags.iter().any(|tag| match tag {
+        Tag::AxisValue { axis: TaxonomyAxis::Software, key, value, .. }
+            if value == expected_value =>
+        {
+            // Only the value-matching candidate(s) pay the key parse.
+            let Some(rest) = key.strip_prefix(family_prefix) else { return false; };
+            let Some((_idx, sub)) = rest.split_once('.') else { return false; };
+            sub == sub_key
+        }
+        _ => false,
+    })
+}
+```
+
+`has_model` / `has_tool` are now thin wrappers around `has_indexed_software_value`. No caching, no `OnceCell`, no API change — just dropping per-tag allocations and reordering checks so the cheap one filters first.
+
+**Implication for `axis_key()` itself**: any other caller that iterates a tag set through `axis_key()` is paying the same per-tag allocation. Worth a follow-up audit (grep for `axis_key()` callers) — likely candidates: predicate evaluation, `required_capability`, the hardware/software/models decoders. A non-cloning variant (`axis_key_ref(&self) -> Option<(TaxonomyAxis, &str)>`) would let those callers borrow.
