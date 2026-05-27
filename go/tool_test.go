@@ -447,3 +447,151 @@ func TestDiffToolIndexDeterministicOrdering(t *testing.T) {
 		t.Errorf("third change should be removed/z_old: %#v", changes[2])
 	}
 }
+
+// TestToolServeHandleCloseRemovesGlobalRegistryEntry pins C-3 / E-9:
+// closing the last serve handle for a given rpc must remove the
+// process-global registry entry AND clear the fetch handle. Without
+// this, long-lived processes that recycle rpcs leak one entry +
+// one fetch handler per cycle.
+func TestToolServeHandleCloseRemovesGlobalRegistryEntry(t *testing.T) {
+	// Use a non-nil rpc pointer as a map key. We don't deref it.
+	rpc := &TypedMeshRpc{}
+
+	// Pre-build an entry holding one descriptor. fetchHandle is nil
+	// so Close()'s `if fetch != nil { fetch.Close() }` skips the
+	// CGO call we can't service in a unit test.
+	entry := &toolRegistryEntry{
+		descriptors: map[string]ToolDescriptor{
+			"web_search": mkDesc("web_search", "1.0.0", 1),
+		},
+		fetchHandle: nil,
+	}
+	toolRegistriesMu.Lock()
+	toolRegistries[rpc] = entry
+	toolRegistriesMu.Unlock()
+	t.Cleanup(func() {
+		toolRegistriesMu.Lock()
+		delete(toolRegistries, rpc)
+		toolRegistriesMu.Unlock()
+	})
+
+	handle := &ToolServeHandle{
+		Descriptor: mkDesc("web_search", "1.0.0", 1),
+		inner:      nil,
+		registry:   entry,
+		rpc:        rpc,
+	}
+	handle.Close()
+
+	toolRegistriesMu.Lock()
+	_, exists := toolRegistries[rpc]
+	toolRegistriesMu.Unlock()
+	if exists {
+		t.Error("registry entry leaked after last Close")
+	}
+}
+
+// TestToolServeHandleCloseKeepsEntryWhenOthersActive pins that
+// closing ONE of multiple serve handles must NOT drop the entry
+// (would silently kill the fetch handler for the surviving tools).
+func TestToolServeHandleCloseKeepsEntryWhenOthersActive(t *testing.T) {
+	rpc := &TypedMeshRpc{}
+	entry := &toolRegistryEntry{
+		descriptors: map[string]ToolDescriptor{
+			"web_search": mkDesc("web_search", "1.0.0", 1),
+			"summarize":  mkDesc("summarize", "1.0.0", 1),
+		},
+		fetchHandle: nil,
+	}
+	toolRegistriesMu.Lock()
+	toolRegistries[rpc] = entry
+	toolRegistriesMu.Unlock()
+	t.Cleanup(func() {
+		toolRegistriesMu.Lock()
+		delete(toolRegistries, rpc)
+		toolRegistriesMu.Unlock()
+	})
+
+	h1 := &ToolServeHandle{
+		Descriptor: mkDesc("web_search", "1.0.0", 1),
+		registry:   entry,
+		rpc:        rpc,
+	}
+	h1.Close()
+
+	toolRegistriesMu.Lock()
+	_, exists := toolRegistries[rpc]
+	toolRegistriesMu.Unlock()
+	if !exists {
+		t.Error("entry dropped while other serve handle still active")
+	}
+	if len(entry.descriptors) != 1 || entry.descriptors["summarize"].ToolID != "summarize" {
+		t.Errorf("surviving descriptor wrong: %#v", entry.descriptors)
+	}
+}
+
+// TestToolListChangeJSONWireShape pins the JSON encoding of each
+// ToolListChange variant against the canonical Rust/Node/Python
+// wire shape: {type, descriptor, prev_node_count?}. Regression
+// guard for the historical Go-side divergence
+// ({tool_id, version, tool, old_count, new_count}).
+func TestToolListChangeJSONWireShape(t *testing.T) {
+	desc := mkDesc("web_search", "1.0.0", 2)
+	cases := []struct {
+		name     string
+		change   ToolListChange
+		wantKeys []string // keys that MUST appear in the JSON
+		bannedKeys []string // keys that MUST NOT appear
+	}{
+		{
+			name:       "added",
+			change:     ToolListChange{Type: "added", Descriptor: desc},
+			wantKeys:   []string{"type", "descriptor"},
+			bannedKeys: []string{"tool_id", "version", "tool", "old_count", "new_count"},
+		},
+		{
+			name:       "removed",
+			change:     ToolListChange{Type: "removed", Descriptor: desc},
+			wantKeys:   []string{"type", "descriptor"},
+			bannedKeys: []string{"tool_id", "version", "tool", "old_count", "new_count"},
+		},
+		{
+			name:       "node_count_changed",
+			change:     ToolListChange{Type: "node_count_changed", Descriptor: desc, PrevNodeCount: 1},
+			wantKeys:   []string{"type", "descriptor", "prev_node_count"},
+			bannedKeys: []string{"tool_id", "version", "tool", "old_count", "new_count"},
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			body, err := json.Marshal(c.change)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var parsed map[string]interface{}
+			if err := json.Unmarshal(body, &parsed); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			for _, k := range c.wantKeys {
+				if _, ok := parsed[k]; !ok {
+					t.Errorf("missing key %q in %s: %s", k, c.name, string(body))
+				}
+			}
+			for _, k := range c.bannedKeys {
+				if _, ok := parsed[k]; ok {
+					t.Errorf("banned key %q present in %s: %s", k, c.name, string(body))
+				}
+			}
+			// `descriptor` must be the embedded ToolDescriptor (object),
+			// not a flattened string id.
+			d, ok := parsed["descriptor"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("descriptor field is not an object: %v", parsed["descriptor"])
+			}
+			if d["tool_id"] != "web_search" {
+				t.Errorf("descriptor.tool_id = %v, want %q", d["tool_id"], "web_search")
+			}
+		})
+	}
+}

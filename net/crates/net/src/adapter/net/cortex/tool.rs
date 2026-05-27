@@ -743,8 +743,58 @@ mod tests {
         reg.insert(descriptor("a"));
         reg.insert(descriptor("b"));
         reg.insert(descriptor("c"));
-        let mut names: Vec<String> = reg.snapshot().into_iter().map(|d| d.tool_id).collect();
+        let mut names: Vec<String> = reg.snapshot().iter().map(|d| d.tool_id.clone()).collect();
         names.sort();
         assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    /// E-3 regression: consecutive `snapshot()` calls without an
+    /// intervening insert/remove must return the SAME `Arc` (cached),
+    /// not a freshly cloned Vec — that's the whole point of the cache.
+    /// Any mutation invalidates: subsequent snapshot must return a
+    /// different `Arc`.
+    #[test]
+    fn tool_metadata_registry_snapshot_caches_until_mutation() {
+        let reg = ToolMetadataRegistry::new();
+        reg.insert(descriptor("a"));
+
+        let s1 = reg.snapshot();
+        let s2 = reg.snapshot();
+        assert!(
+            std::sync::Arc::ptr_eq(&s1, &s2),
+            "two consecutive snapshots without mutation must share the same Arc"
+        );
+
+        // Insert invalidates.
+        reg.insert(descriptor("b"));
+        let s3 = reg.snapshot();
+        assert!(
+            !std::sync::Arc::ptr_eq(&s1, &s3),
+            "insert must invalidate the cached snapshot"
+        );
+
+        // Snapshot after insert is now the new cached one.
+        let s4 = reg.snapshot();
+        assert!(
+            std::sync::Arc::ptr_eq(&s3, &s4),
+            "snapshot after insert must cache again"
+        );
+
+        // Remove invalidates.
+        reg.remove("a");
+        let s5 = reg.snapshot();
+        assert!(
+            !std::sync::Arc::ptr_eq(&s3, &s5),
+            "remove must invalidate the cached snapshot"
+        );
+
+        // Remove of a non-existent key must NOT invalidate (no change).
+        let s6 = reg.snapshot();
+        reg.remove("nonexistent");
+        let s7 = reg.snapshot();
+        assert!(
+            std::sync::Arc::ptr_eq(&s6, &s7),
+            "no-op remove must not invalidate the cached snapshot"
+        );
     }
 }

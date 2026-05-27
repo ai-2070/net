@@ -21,6 +21,7 @@ import asyncio
 from typing import Any, AsyncIterator, List
 
 from net.tool import (
+    TOOL_METADATA_FETCH_SERVICE,
     ToolCallParseError,
     ToolDescriptor,
     add_tool_capabilities_to_announce,
@@ -32,7 +33,10 @@ from net.tool import (
     is_terminal_event,
     mcp,
     openai,
+    serve_tool,
+    serve_tool_streaming,
 )
+from net import tool as _tool_module
 
 
 def sample_descriptor() -> ToolDescriptor:
@@ -410,3 +414,168 @@ def test_call_tool_streaming_async_empty_stream_emits_synthesized_error() -> Non
     events = _drain_async(lambda: call_tool_streaming_async(rpc, "noop_tool", {}))
     assert len(events) == 1
     assert events[0]["code"] == "missing_terminal"
+
+
+# ---------------------------------------------------------------------------
+# serve_tool / serve_tool_streaming — registry cleanup + server-side
+# missing_terminal regression tests (C-3, E-9, E-8).
+# ---------------------------------------------------------------------------
+
+
+class _ServeHandle:
+    """Minimal stand-in for the real ServeHandle the napi/pyo3
+    layers return — just an idempotent close() flag."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _Sink:
+    """Captures sink.send(event) calls from a streaming handler."""
+
+    def __init__(self) -> None:
+        self.events: List[Any] = []
+
+    def send(self, event: Any) -> None:
+        self.events.append(event)
+
+
+class _ServeRpc:
+    """Mock TypedMeshRpc with enough surface for serve_tool +
+    serve_tool_streaming. Tracks the wrapped streaming handler so
+    tests can drive it directly with a _Sink."""
+
+    def __init__(self) -> None:
+        self.served: List[str] = []
+        self.streaming_handlers: dict = {}
+
+    def serve(self, service: str, handler: Any) -> _ServeHandle:
+        self.served.append(service)
+        return _ServeHandle()
+
+    def serve_streaming(self, service: str, handler: Any) -> _ServeHandle:
+        self.served.append(service)
+        self.streaming_handlers[service] = handler
+        return _ServeHandle()
+
+
+def _reset_registries() -> None:
+    """Clear the process-global registry so tests don't bleed into
+    each other."""
+    _tool_module._tool_registries.clear()
+
+
+def test_serve_tool_close_removes_global_registry_entry() -> None:
+    """C-3 + E-9: closing the last serve handle for an rpc must drop
+    the process-global entry AND close the fetch handler. Otherwise
+    long-lived processes recycling rpc instances leak."""
+    _reset_registries()
+    rpc = _ServeRpc()
+
+    handle = serve_tool(rpc, "web_search", lambda req: {"ok": True})
+    key = id(rpc)
+    assert key in _tool_module._tool_registries
+    entry = _tool_module._tool_registries[key]
+    fetch_handle = entry["fetch_handle"]
+    assert fetch_handle is not None
+    assert fetch_handle.closed is False
+    # Fetch handler installed alongside the user's tool.
+    assert TOOL_METADATA_FETCH_SERVICE in rpc.served
+    assert "web_search" in rpc.served
+
+    handle.close()
+
+    assert key not in _tool_module._tool_registries, "registry entry leaked"
+    assert fetch_handle.closed is True, "fetch handler must close on last serve close"
+
+
+def test_serve_tool_close_keeps_entry_if_other_serves_active() -> None:
+    """Closing ONE of two serve handles must leave the entry intact
+    so the surviving handle's fetch handler still answers."""
+    _reset_registries()
+    rpc = _ServeRpc()
+
+    h1 = serve_tool(rpc, "web_search", lambda req: 1)
+    h2 = serve_tool(rpc, "summarize", lambda req: 2)
+    key = id(rpc)
+    assert key in _tool_module._tool_registries
+    fetch_handle = _tool_module._tool_registries[key]["fetch_handle"]
+
+    h1.close()
+    assert key in _tool_module._tool_registries, "entry dropped while h2 still active"
+    assert fetch_handle.closed is False
+
+    h2.close()
+    assert key not in _tool_module._tool_registries
+    assert fetch_handle.closed is True
+
+
+def test_serve_tool_streaming_synthesizes_missing_terminal_when_handler_clean_returns() -> None:
+    """E-8 (server-side): a handler that yields events WITHOUT a
+    terminal frame must have the wrapper emit a synthesized
+    missing_terminal envelope before returning. Otherwise raw
+    clients (other languages, direct drain) see broken streams."""
+    _reset_registries()
+    rpc = _ServeRpc()
+
+    def handler(req: Any):
+        yield {"type": "start", "tool_id": "web_search"}
+        yield {"type": "delta", "data": {"partial": "no terminal here"}}
+
+    serve_tool_streaming(rpc, "web_search", handler)
+    wrapped = rpc.streaming_handlers["web_search"]
+    sink = _Sink()
+    wrapped({"any": "request"}, sink)
+
+    # start + delta + synth missing_terminal.
+    assert len(sink.events) == 3
+    final = sink.events[-1]
+    assert final["type"] == "error"
+    assert final["code"] == "missing_terminal"
+
+
+def test_serve_tool_streaming_no_synth_when_handler_yields_terminal() -> None:
+    """E-8: when the user's handler yields a terminal `result` or
+    `error`, the wrapper must NOT inject a duplicate."""
+    _reset_registries()
+    rpc = _ServeRpc()
+
+    def handler(req: Any):
+        yield {"type": "start", "tool_id": "web_search"}
+        yield {"type": "result", "data": {"final": "ok"}}
+
+    serve_tool_streaming(rpc, "web_search", handler)
+    wrapped = rpc.streaming_handlers["web_search"]
+    sink = _Sink()
+    wrapped({}, sink)
+
+    assert len(sink.events) == 2
+    assert sink.events[-1]["type"] == "result"
+    assert not any(
+        e.get("code") == "missing_terminal" for e in sink.events
+    ), "wrapper double-emitted a synth after user's terminal"
+
+
+def test_serve_tool_streaming_handler_exception_maps_to_handler_error() -> None:
+    """E-8: exceptions from the user handler convert to a terminal
+    handler_error envelope (no missing_terminal synth)."""
+    _reset_registries()
+    rpc = _ServeRpc()
+
+    def handler(req: Any):
+        yield {"type": "start", "tool_id": "web_search"}
+        raise RuntimeError("boom")
+
+    serve_tool_streaming(rpc, "web_search", handler)
+    wrapped = rpc.streaming_handlers["web_search"]
+    sink = _Sink()
+    wrapped({}, sink)
+
+    # start + handler_error
+    assert len(sink.events) == 2
+    assert sink.events[-1]["type"] == "error"
+    assert sink.events[-1]["code"] == "handler_error"
+    assert "boom" in sink.events[-1]["message"]

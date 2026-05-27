@@ -24,6 +24,7 @@ import {
   isTerminalEvent,
   mcp,
   openai,
+  serveToolStreaming,
   watchTools,
 } from '../tool'
 
@@ -465,6 +466,80 @@ describe('callToolStreaming', () => {
       // with a synthesized envelope.
       expect(last.code).toBe('handler_panicked')
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// serveToolStreaming — server-side missing_terminal synthesis (E-8).
+// ---------------------------------------------------------------------------
+
+describe('serveToolStreaming server-side terminal synthesis', () => {
+  type CapturedHandler = (req: unknown, sink: { send: (e: unknown) => void }) => Promise<void>
+
+  // Captures the wrapped handler serveToolStreaming passes to the
+  // underlying rpc.serveStreaming so tests can drive it directly.
+  function mockServeRpc(): {
+    rpc: any
+    captured: { handler: CapturedHandler | null }
+  } {
+    const captured: { handler: CapturedHandler | null } = { handler: null }
+    const rpc = {
+      // Unary serve — covers the auto-installed tool.metadata.fetch.
+      serve: () => ({ close: () => {} }),
+      // Streaming serve — capture the wrapped handler.
+      serveStreaming: <Req, Resp>(
+        _service: string,
+        handler: (req: Req, sink: { send: (e: Resp) => void }) => Promise<void> | void,
+      ) => {
+        captured.handler = handler as CapturedHandler
+        return { close: () => {} }
+      },
+    }
+    return { rpc, captured }
+  }
+
+  it('emits missing_terminal when handler returns without a terminal event', async () => {
+    const { rpc, captured } = mockServeRpc()
+    serveToolStreaming(rpc, { name: 'web_search' }, async function* () {
+      yield { type: 'start', toolId: 'web_search' } as ToolEvent
+      yield { type: 'delta', data: { partial: 'no terminal' } } as ToolEvent
+    })
+    expect(captured.handler).not.toBeNull()
+    const sent: any[] = []
+    await captured.handler!({}, { send: (e) => sent.push(e) })
+    // start + delta + synthesized missing_terminal
+    expect(sent.length).toBe(3)
+    const last = sent[sent.length - 1]
+    expect(last.type).toBe('error')
+    expect(last.code).toBe('missing_terminal')
+  })
+
+  it('does NOT emit missing_terminal when handler yields a result', async () => {
+    const { rpc, captured } = mockServeRpc()
+    serveToolStreaming(rpc, { name: 'web_search' }, async function* () {
+      yield { type: 'start', toolId: 'web_search' } as ToolEvent
+      yield { type: 'result', data: { final: 'ok' } } as ToolEvent
+    })
+    const sent: any[] = []
+    await captured.handler!({}, { send: (e) => sent.push(e) })
+    expect(sent.length).toBe(2)
+    expect(sent[sent.length - 1].type).toBe('result')
+    expect(sent.some((e) => e.type === 'error' && e.code === 'missing_terminal')).toBe(false)
+  })
+
+  it('handler exception maps to handler_error (no missing_terminal synth)', async () => {
+    const { rpc, captured } = mockServeRpc()
+    serveToolStreaming(rpc, { name: 'web_search' }, async function* () {
+      yield { type: 'start', toolId: 'web_search' } as ToolEvent
+      throw new Error('boom')
+    })
+    const sent: any[] = []
+    await captured.handler!({}, { send: (e) => sent.push(e) })
+    expect(sent.length).toBe(2)
+    const last = sent[sent.length - 1]
+    expect(last.type).toBe('error')
+    expect(last.code).toBe('handler_error')
+    expect(last.message).toContain('boom')
   })
 })
 
