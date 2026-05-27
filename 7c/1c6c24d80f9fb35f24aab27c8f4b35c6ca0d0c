@@ -1,0 +1,30 @@
+net/crates/net/sdk-ts/src/index.ts
+  s_099fa7d871e34d::t_4be7568cb806b4 310-351
+net/crates/net/sdk-ts/package.json
+  s_099fa7d871e34d::t_fc4806b48a6975 7-16
+net/crates/net/sdk-ts/src/tool.ts
+  s_099fa7d871e34d::t_03ac86f26fbae6 1-59
+net/crates/net/sdk-py/src/net_sdk/tool.py
+  s_099fa7d871e34d::t_bde225018d408f 1-94
+net/crates/net/sdk-py/src/net_sdk/__init__.py
+  s_099fa7d871e34d::t_cd23c555a79714 208-287
+net/crates/net/bindings/node/package.json
+  s_099fa7d871e34d::t_5d8793bafd8498 71-72
+  s_099fa7d871e34d::t_6804c01a76c9f6 27-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "7c1c6c24d80f9fb35f24aab27c8f4b35c6ca0d0c",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
