@@ -290,7 +290,7 @@ func TypedServe[Req, Resp any](
 	shim := func(reqBytes []byte) ([]byte, error) {
 		var req Req
 		if err := json.Unmarshal(reqBytes, &req); err != nil {
-			body := mustMarshal(struct {
+			body := mustMarshalBody(struct {
 				Err    string `json:"error"`
 				Detail string `json:"detail"`
 			}{Err: "invalid_request", Detail: err.Error()})
@@ -305,11 +305,11 @@ func TypedServe[Req, Resp any](
 	return t.raw.Serve(service, shim)
 }
 
-// mustMarshal is a small helper for shim bodies — the JSON
+// mustMarshalBody is a small helper for shim bodies — the JSON
 // canonicalization for the bad-request body never fails for the
 // static {"error":"invalid_request","detail":"..."} shape we
 // emit, so panicking on Marshal failure is a programmer error.
-func mustMarshal(v interface{}) []byte {
+func mustMarshalBody(v interface{}) []byte {
 	b, err := json.Marshal(v)
 	if err != nil {
 		panic(fmt.Sprintf("nrpc: app-error body marshal failed (shouldn't happen): %v", err))

@@ -3535,24 +3535,7 @@ pub extern "C" fn net_rpc_list_tools(
         return NET_RPC_ERR_NULL;
     }
     let descriptors = h.node.list_tools(None);
-    let value = serde_json::json!(descriptors
-        .into_iter()
-        .map(|d| serde_json::json!({
-            "tool_id": d.tool_id,
-            "name": d.name,
-            "version": d.version,
-            "description": d.description,
-            "input_schema": d.input_schema,
-            "output_schema": d.output_schema,
-            "requires": d.requires,
-            "estimated_time_ms": d.estimated_time_ms,
-            "stateless": d.stateless,
-            "streaming": d.streaming,
-            "tags": d.tags,
-            "node_count": d.node_count,
-        }))
-        .collect::<Vec<_>>());
-    let bytes = match serde_json::to_vec(&value) {
+    let bytes = match serde_json::to_vec(&descriptors) {
         Ok(v) => v,
         Err(e) => {
             write_err(out_err, format!("list_tools serialize failed: {e}"));

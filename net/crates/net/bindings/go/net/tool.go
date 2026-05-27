@@ -793,15 +793,13 @@ func ListTools(rpc *TypedMeshRpc) ([]ToolDescriptor, error) {
 // `ToolListChange` tagged dataclass.
 //
 // `Type` discriminates the variant: "added", "removed",
-// "node_count_changed". Variant-specific fields are populated
-// only for their variant.
+// "node_count_changed". `Descriptor` carries the full descriptor
+// for all three variants. `PrevNodeCount` is populated only for
+// "node_count_changed" (the new count is in `Descriptor.NodeCount`).
 type ToolListChange struct {
-	Type     string         `json:"type"`
-	ToolID   string         `json:"tool_id"`
-	Version  string         `json:"version"`
-	Tool     ToolDescriptor `json:"tool,omitempty"`      // Added
-	OldCount uint32         `json:"old_count,omitempty"` // NodeCountChanged
-	NewCount uint32         `json:"new_count,omitempty"` // NodeCountChanged + Added/Removed (for diff visibility)
+	Type          string         `json:"type"`
+	Descriptor    ToolDescriptor `json:"descriptor"`
+	PrevNodeCount uint32         `json:"prev_node_count,omitempty"`
 }
 
 // WatchOptions configures WatchTools.
@@ -901,19 +899,14 @@ func diffToolIndex(prev, next map[string]ToolDescriptor) []ToolListChange {
 		p, existed := prev[k]
 		if !existed {
 			changes = append(changes, ToolListChange{
-				Type:     "added",
-				ToolID:   n.ToolID,
-				Version:  n.Version,
-				Tool:     n,
-				NewCount: n.NodeCount,
+				Type:       "added",
+				Descriptor: n,
 			})
 		} else if p.NodeCount != n.NodeCount {
 			changes = append(changes, ToolListChange{
-				Type:     "node_count_changed",
-				ToolID:   n.ToolID,
-				Version:  n.Version,
-				OldCount: p.NodeCount,
-				NewCount: n.NodeCount,
+				Type:          "node_count_changed",
+				Descriptor:    n,
+				PrevNodeCount: p.NodeCount,
 			})
 		}
 	}
@@ -928,9 +921,8 @@ func diffToolIndex(prev, next map[string]ToolDescriptor) []ToolListChange {
 	for _, k := range keys {
 		p := prev[k]
 		changes = append(changes, ToolListChange{
-			Type:    "removed",
-			ToolID:  p.ToolID,
-			Version: p.Version,
+			Type:       "removed",
+			Descriptor: p,
 		})
 	}
 	return changes

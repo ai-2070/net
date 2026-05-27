@@ -5472,10 +5472,6 @@ impl MeshNode {
                     }
                     let descriptor = ToolDescriptor::from_capability(&cap, &metadata);
                     let key = (descriptor.tool_id.clone(), descriptor.version.clone());
-                    let bucket = buckets
-                        .entry(key)
-                        .or_insert_with(|| (descriptor.clone(), HashSet::new()));
-                    bucket.1.insert(*node_id);
                     // Latest-wins on the descriptor fields (excluding
                     // node_count, which we fill after the walk). Two
                     // nodes serving the same (id, version) but with
@@ -5484,7 +5480,16 @@ impl MeshNode {
                     // to "take whichever entry the fold walked last";
                     // not deterministic across runs but the fields
                     // are operator-controlled metadata, not contract.
-                    bucket.0 = descriptor;
+                    use std::collections::hash_map::Entry;
+                    let bucket = match buckets.entry(key) {
+                        Entry::Occupied(e) => {
+                            let bucket = e.into_mut();
+                            bucket.0 = descriptor;
+                            bucket
+                        }
+                        Entry::Vacant(e) => e.insert((descriptor, HashSet::new())),
+                    };
+                    bucket.1.insert(*node_id);
                 }
             }
         });

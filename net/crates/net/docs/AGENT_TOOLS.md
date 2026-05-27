@@ -527,9 +527,9 @@ changes, errs, baseline, _ := net.WatchTools(ctx, rpc, net.WatchOptions{})
 go func() {
     for change := range changes {
         switch change.Type {
-        case "added":              fmt.Println("+", change.ToolID, change.Version)
-        case "removed":            fmt.Println("-", change.ToolID, change.Version)
-        case "node_count_changed": fmt.Println("~", change.ToolID, change.NewCount)
+        case "added":              fmt.Println("+", change.Descriptor.ToolID, change.Descriptor.Version)
+        case "removed":            fmt.Println("-", change.Descriptor.ToolID, change.Descriptor.Version)
+        case "node_count_changed": fmt.Println("~", change.Descriptor.ToolID, change.Descriptor.NodeCount)
         }
     }
 }()

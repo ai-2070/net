@@ -369,11 +369,8 @@ func TestDiffToolIndexAdded(t *testing.T) {
 		t.Fatalf("expected 1 change, got %d", len(changes))
 	}
 	c := changes[0]
-	if c.Type != "added" || c.ToolID != "web_search" || c.NewCount != 1 {
+	if c.Type != "added" || c.Descriptor.ToolID != "web_search" || c.Descriptor.NodeCount != 1 {
 		t.Errorf("added shape wrong: %#v", c)
-	}
-	if c.Tool.ToolID != "web_search" {
-		t.Errorf("Added must carry full descriptor; got %#v", c.Tool)
 	}
 }
 
@@ -385,7 +382,7 @@ func TestDiffToolIndexRemoved(t *testing.T) {
 		t.Fatalf("expected 1 change, got %d", len(changes))
 	}
 	c := changes[0]
-	if c.Type != "removed" || c.ToolID != "temp" {
+	if c.Type != "removed" || c.Descriptor.ToolID != "temp" {
 		t.Errorf("removed shape wrong: %#v", c)
 	}
 }
@@ -398,7 +395,7 @@ func TestDiffToolIndexNodeCountChanged(t *testing.T) {
 		t.Fatalf("expected 1 change, got %d", len(changes))
 	}
 	c := changes[0]
-	if c.Type != "node_count_changed" || c.OldCount != 1 || c.NewCount != 3 {
+	if c.Type != "node_count_changed" || c.PrevNodeCount != 1 || c.Descriptor.NodeCount != 3 {
 		t.Errorf("node_count_changed shape wrong: %#v", c)
 	}
 }
