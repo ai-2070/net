@@ -6,54 +6,65 @@ Predecessors:
 - [`NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION.md`](./NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION.md) — `Mesh::reserve_cancel_token` / `Mesh::cancel(token)` substrate primitive.
 - [`PYTHON_ASYNC_SDK_SIDE_BY_SIDE.md`](./PYTHON_ASYNC_SDK_SIDE_BY_SIDE.md) — `AsyncMeshRpc` + `AsyncTypedMeshRpc`.
 - Aggregator + fold layer for cross-subnet discovery (v0.22).
+- The capability fold (`CapabilityFold` + `ToolCapability`) and `capability_aggregation::TagMatcher`, which this plan reuses for discovery instead of inventing a parallel index.
 
 ## Scope
 
 Make every typed nRPC service usable as an **AI tool** (LLM function-calling target) without bolting on a second protocol. The agent author writes `@tool def web_search(req: WebSearchReq) -> WebSearchResp`, the mesh handles registration, schema derivation, gossip, discovery, dispatch, streaming, and cancellation. Cross-language transparently: a Python agent calls a Go-hosted tool through the existing nRPC wire format.
 
 Out of scope:
-- Inventing a non-nRPC tool wire protocol. Every tool call rides `TypedMeshRpc::call<Req, Resp>`.
-- LLM provider SDKs as core deps. OpenAI / Anthropic / Gemini adapters live in companion packages (`@net-mesh/openai-tools`, `net-mesh-anthropic-tools` on pip, etc.).
+- Inventing a non-nRPC tool wire protocol. Every tool call rides `TypedMeshRpc::call<Req, Resp>` or `TypedMeshRpc::call_service_streaming<Req, Resp>`.
+- LLM provider SDKs as core deps. OpenAI / Anthropic / Gemini / MCP **format translators** live in a single companion package (`@net-mesh/tools` / `net-mesh-tools` on pip) with submodule entrypoints (`@net-mesh/tools/formats/openai`, etc.). Provider-SDK invocation glue is left to thin user code or framework-specific adapters built atop these translators.
 - Tool-authoring DSLs separate from the existing typed-handler shape. `@tool` is a thin decorator on top of `serve` + a metadata sidecar.
 - LLM inference itself. Net is the bus; agents bring their own client.
 
 ## Why now
 
-1. **The typed nRPC surface is the natural fit.** Tool calling is "send a JSON object to a named handler, await a JSON response." nRPC already does this for every binding. The only gap is metadata: tools need a description + parameter schema the model can read. Adding that as a thin layer over `TypedMeshRpc` reuses every existing surface (typed wrappers, observer, cancellation, streaming).
+1. **The typed nRPC surface is the natural fit.** Tool calling is "send a JSON object to a named handler, await a JSON response, optionally stream chunks." nRPC already does this for every binding. The only gaps are (a) metadata so a model can decide when/how to call, (b) a service-discovery streaming primitive matching the unary `call_service`, and (c) a structured event envelope for streaming output. Adding those as a thin layer over `TypedMeshRpc` reuses every existing surface (typed wrappers, observer, cancellation, capability auth, subnet visibility).
 
-2. **The mesh's discovery model already matches the agent's mental model.** An agent wants to ask "what tools can I call?" and get a list. The mesh's capability index already answers "what nodes serve service X?" Each tool becomes a capability tag (`ai-tool:<name>`), and `mesh.list_tools()` walks the same index `find_service_nodes` walks today. Subnet visibility, capability auth, region filtering — all reused, not reinvented.
+2. **The mesh's discovery model already matches the agent's mental model.** An agent wants to ask "what tools can I call?" and get a list. The capability fold already aggregates `ToolCapability` instances across every node — `list_tools()` walks the fold rather than fanning out RPC. Subnet visibility, capability auth, region filtering all reused via the existing `TagMatcher`.
 
-3. **Streaming + cancellation are already substrate primitives.** Tools that emit progress (a long-running compute task, a multi-step plan) ride server-streaming or duplex nRPC. The substrate's `cancel_token` (v3) propagates "model decided to stop" all the way to the tool. No new plumbing.
+3. **Streaming + cancellation are already substrate primitives.** Tools that emit progress ride server-streaming nRPC. The substrate's `cancel_token` (v3) propagates "model decided to stop" all the way to the tool. No new plumbing.
 
-4. **Cross-language tool calls are the killer feature.** A Python LangGraph agent calling a Go-hosted database tool calling a Node-hosted browser tool — all transparent over the existing wire. Every other tool-calling system (MCP, function-calling SDKs, Modal's `cls`) needs a separate transport. Net already has the transport; we just need the convention.
+4. **Cross-language tool calls are the killer feature.** A Python LangGraph agent calling a Go-hosted database tool calling a Node-hosted browser tool — all transparent over the existing wire. Every other tool-calling system (MCP servers, function-calling SDKs, Modal's `cls`) needs a separate transport. Net already has the transport; we just need the convention.
 
-5. **The DX gap is huge today.** Without this layer, an agent author has to: define the Pydantic model, register an nRPC service, hand-write the JSON schema, hand-roll the discovery loop, hand-build the OpenAI/Anthropic tools array. Six steps where one decorator should do.
+5. **The DX gap is huge today.** Without this layer, an agent author has to: define the typed model, register an nRPC service, hand-write the JSON schema, attach the capability tag, hand-roll the discovery loop, hand-build the provider's tools array. Six steps where one decorator should do.
 
 ## Locked decisions
 
-Six decisions every slice codes against:
+Eight decisions every slice codes against:
 
-1. **Tool name == nRPC service name.** No separate tool-name registry. A tool registered as `web_search` IS the nRPC service at channel `nrpc:web_search.requests`. Capability tag is `ai-tool:web_search`. One namespace.
+1. **Tool name == nRPC service name == capability-tag suffix.** No separate registry. A tool registered as `web_search` IS the nRPC service at channel `nrpc:web_search.requests` IS the announcement carrying `ai-tool:web_search` (plus the existing `nrpc:web_search` cap tag). One identifier, one source of truth, no mapping table.
 
-2. **Schema format = JSON Schema draft 2020-12.** OpenAI, Anthropic, and Gemini all accept it (with provider-specific subset constraints, but the canonical form is portable). The adapters in M-slices do per-provider lowering; the core wire shape is one schema.
+2. **Schema format = JSON Schema draft 2020-12.** OpenAI, Anthropic, Gemini, and MCP all consume it (with provider-specific subset constraints). The format translators do per-provider lowering; the wire shape is one schema.
 
-3. **Metadata transport = a single companion RPC service `tool.metadata`.** Each node serving tools auto-exposes this. Agents call `mesh.list_tools()` → `find_service_nodes("tool.metadata")` → fan-out RPC call → merge results → return a flat `[ToolMetadata]`. Schemas don't get gossiped on capability channels (they're too big and they change too infrequently for the gossip path to be worth it); they're pulled on demand.
+3. **Discovery is capability-fold-native, not RPC-fanout.** The capability fold already aggregates `ToolCapability` instances across every node. `list_tools()` walks the fold (one in-memory pass, no network) and returns `ToolDescriptor`s carrying id + version + node_count + small metadata. Heavy fields (full schemas) live on the descriptor when they fit; oversized schemas fall back to an on-demand `tool.metadata.fetch` RPC. The substrate publishes `ToolCapability` via the same fold path that already carries every other capability — agents inherit subnet visibility + auth for free.
 
-4. **`@tool` decorator opt-in, not implicit.** Plain `rpc.serve("x", handler)` continues to register a service WITHOUT the `ai-tool:*` tag — invisible to `list_tools()`. The decorator (or its equivalent in each binding) is what makes a service a tool. Operators retain control over which nRPC services agents see.
+4. **Streaming tools share one event envelope: `ToolEvent`.** Every streaming tool emits a typed envelope on each chunk:
+   - `start { tool_id, call_id, metadata? }` — fires once on open.
+   - `progress { pct?, message? }` — coarse progress for spinners.
+   - `delta { data }` — partial output (model tokens, file bytes, log lines).
+   - `result { data }` — terminal full result; client sees one of these on success.
+   - `error { code, message, details? }` — terminal failure with structured detail.
+   Unary tools synthesize a single `result` envelope under the hood. The convention lets every adapter (OpenAI / Anthropic / Gemini / MCP / LangChain / custom) lower envelopes into the framework's native streaming protocol without negotiation. No envelope, no adapter interop.
 
-5. **Schema derivation is per-binding-idiomatic.** Python uses `pydantic.BaseModel.model_json_schema()`. TypeScript uses `zod` + `zod-to-json-schema` (the existing ecosystem). Rust uses `schemars`. Go uses hand-written schemas in v1 (no good `derive`-style schema crate that targets JSON Schema 2020-12 well); a `go-jsonschema-derive` follow-up is possible but not required for v1.
+5. **`@tool` decorator opt-in, not implicit.** Plain `rpc.serve("x", handler)` continues to register a service WITHOUT the `ai-tool:*` tag — invisible to `list_tools()`. The decorator (or its equivalent in each binding) is what makes a service a tool. Operators retain control over which nRPC services agents see.
 
-6. **Agent adapters live in companion packages, not the core wheel/npm.** `@net-mesh/openai-tools`, `@net-mesh/anthropic-tools`, `net-mesh-openai-tools` (pip), `net-mesh-anthropic-tools` (pip). Core nRPC has zero dependency on any LLM provider's SDK. Adapters take a `[ToolMetadata]` and emit the provider's tool-array shape; they also wrap the invocation half so the agent's tool-result block is correctly populated.
+6. **`serve_tool` is atomic w.r.t. observable mesh state.** Either all of (handler registration, capability-fold publish, `nrpc:<tool_id>` tag, `ai-tool:<tool_id>` tag) succeed, or none do. Failure at any step rolls back the others. Bindings expose this as a single `serve_tool` / `tool(...).register()` call; Drop on the returned handle reverses all four.
+
+7. **Schema derivation is per-binding-idiomatic.** Python uses `pydantic.BaseModel.model_json_schema()`. TypeScript uses `zod` + `zod-to-json-schema`. Rust uses `schemars`. Go uses struct-tag-based hand-written schemas in v1 (no good `derive`-style crate that targets JSON Schema 2020-12 well); a `go-jsonschema-derive` follow-up is possible.
+
+8. **Format translators ship in one core tools package per language; LLM-provider SDKs live entirely in user code.** `@net-mesh/tools` (npm) and `net-mesh-tools` (pip) carry `formats/openai`, `formats/anthropic`, `formats/gemini`, `formats/mcp` submodules. Each translator is a small pure function from `ToolDescriptor` → provider tool-array entry. The reverse direction (`tool_use_block` → typed nRPC call) lives next to it. Users wire the result into their OpenAI / Anthropic / LangChain client; no transitive dep on any provider SDK.
 
 Tagged `[S | A | B | C | D | M | T | X]`:
 
-- **S** — substrate (`tool.metadata` RPC schema, capability-tag convention, optional `tool` cargo feature on `net-mesh`).
-- **A** — Rust SDK (`net-sdk` — `#[tool]` proc macro + `TypedMeshRpc::serve_tool` + `MeshNode::list_tools`).
-- **B** — Node TypeScript (`@net-mesh/sdk` — `tool()` helper + `MeshNode.listTools`).
-- **C** — Python (`net.tools` module — `@tool` decorator + `mesh.list_tools()` async).
-- **D** — Go (`net` package — `Tool[Req, Resp]` registration helper + `mesh.ListTools(ctx)`).
-- **M** — agent-framework adapters (OpenAI + Anthropic for Python and Node; the two languages most agent code lives in).
-- **T** — tests (cross-language discovery + invocation round-trips).
+- **S** — substrate (`call_service_streaming` primitive, `tool.metadata.fetch` RPC, `ToolCapability` fold integration, optional `tool` cargo feature).
+- **A** — Rust SDK (`net-sdk` — `TypedMeshRpc::serve_tool` / `list_tools` / `watch_tools` + `ToolEvent`).
+- **B** — Node TypeScript (`@net-mesh/sdk` — `tool()` helper + `MeshNode.listTools` / `.watchTools`).
+- **C** — Python (`net.tools` module — `@tool` decorator + `await mesh.list_tools()` / `mesh.watch_tools()`).
+- **D** — Go (`net` package — `Tool[Req, Resp]` registration helper + `mesh.ListTools(ctx)` / `mesh.WatchTools(ctx)`).
+- **M** — format translators (`@net-mesh/tools` + `net-mesh-tools` — OpenAI / Anthropic / Gemini / MCP submodules in one package per language).
+- **T** — tests (cross-language discovery + invocation round-trips + streaming envelope contract).
 - **X** — docs + examples + a demo agent.
 
 ---
@@ -62,337 +73,354 @@ Tagged `[S | A | B | C | D | M | T | X]`:
 
 | ID    | Pri | Area              | Title                                                                                          | Status |
 |-------|-----|-------------------|------------------------------------------------------------------------------------------------|--------|
-| S-1   | H   | substrate         | `tool.metadata` typed RPC service shape + `ai-tool:<name>` capability-tag convention            | ⏳     |
-| S-2   | H   | substrate         | `[features] tool = []` on `net-mesh` + optional `tool.rs` module with `ToolMetadata` wire type | ⏳     |
-| A-1   | H   | Rust SDK          | `net_sdk::tool::ToolMetadata` + `JsonSchema`-via-`schemars` integration                         | ⏳     |
-| A-2   | H   | Rust SDK          | `TypedMeshRpc::serve_tool<Req, Resp>(&self, meta, handler)` + auto-publish to `tool.metadata`  | ⏳     |
-| A-3   | H   | Rust SDK          | `MeshNode::list_tools(scope) -> Vec<ToolMetadata>` + capability-scoped discovery                | ⏳     |
-| A-4   | M   | Rust SDK          | `#[tool]` proc macro (derives schema from sig + docstring; calls `serve_tool` at runtime)       | ⏳     |
-| B-1   | H   | Node TS           | `tool({ name, description, schema, handle })` helper in `@net-mesh/sdk`                         | ⏳     |
-| B-2   | H   | Node TS           | `MeshNode.listTools(opts?) -> Promise<ToolMetadata[]>` with optional capability filter          | ⏳     |
-| B-3   | M   | Node TS           | `zod`-schema convenience: `tool({ name, schema: zodSchema, ... })` auto-converts via `zod-to-json-schema` | ⏳     |
-| C-1   | H   | Python            | `from net.tools import tool` decorator that wraps Pydantic-typed `async def` into `serve_tool` | ⏳     |
-| C-2   | H   | Python            | `await mesh.list_tools(scope=...)` returning `list[ToolMetadata]` dataclasses                   | ⏳     |
-| C-3   | M   | Python            | Plain-`typing` derivation: `@tool` works on functions WITHOUT a Pydantic model (synthesizes one) | ⏳     |
-| D-1   | M   | Go                | `net.Tool[Req, Resp](rpc, meta, handler)` registration helper + hand-written schemas in v1      | ⏳     |
-| D-2   | M   | Go                | `mesh.ListTools(ctx) -> ([]ToolMetadata, error)`                                                | ⏳     |
-| M-1   | H   | Python adapter    | `net-mesh-openai-tools` — `list.to_openai_tools()` + `invoke_tool_call(client_call)`            | ⏳     |
-| M-2   | H   | Python adapter    | `net-mesh-anthropic-tools` — `list.to_anthropic_tools()` + `invoke_tool_use(tool_use)`          | ⏳     |
-| M-3   | M   | Node adapter      | `@net-mesh/openai-tools` (npm)                                                                  | ⏳     |
-| M-4   | M   | Node adapter      | `@net-mesh/anthropic-tools` (npm)                                                               | ⏳     |
-| T-1   | H   | cross-lang tests  | `tests/cross_lang_tools/` — Python agent calls Go-hosted tool, asserts schema fidelity          | ⏳     |
-| T-2   | M   | cross-lang tests  | Streaming tool: Anthropic-style progress chunks → `serve_tool_streaming` → client-side decode  | ⏳     |
-| T-3   | M   | substrate tests   | Capability-scoped `list_tools`: subnet-local tool invisible to a peer in another subnet         | ⏳     |
-| T-4   | L   | cancellation test | `client.cancel()` mid-tool propagates substrate CANCEL; tool observes `Cancelled` status        | ⏳     |
-| X-1   | H   | docs              | `docs/AGENT_TOOLS.md` — quickstart + decorator + discovery + provider adapters                  | ⏳     |
-| X-2   | M   | demo              | `examples/agents/python-anthropic-tools.py` — end-to-end agent with two cross-language tools    | ⏳     |
-| X-3   | L   | demo              | `examples/agents/node-langchain-tools.ts` — LangChain-compatible binding                        | ⏳     |
+| S-1   | H   | substrate         | `call_service_streaming` — mirror of `call_service` returning `RpcStream` (capability-routed + auth-gated)  | ⏳     |
+| S-2   | H   | substrate         | `ToolCapability` fold integration: `serve_tool` publishes via the existing capability fold       | ⏳     |
+| S-3   | M   | substrate         | `tool.metadata.fetch(name)` RPC — on-demand pull for schemas too large for the fold              | ⏳     |
+| S-4   | H   | substrate         | `[features] tool = []` on `net-mesh` + optional `tool.rs` module + `ToolEvent` wire type        | ⏳     |
+| A-1   | H   | Rust SDK          | `net_sdk::tool::{ToolDescriptor, ToolEvent}` + `schemars` schema derivation helper              | ⏳     |
+| A-2   | H   | Rust SDK          | `TypedMeshRpc::serve_tool<Req, Resp>` (unary) + atomic 4-step register/Drop                     | ⏳     |
+| A-3   | H   | Rust SDK          | `TypedMeshRpc::serve_tool_streaming<Req, Resp>` — handler returns `Stream<ToolEvent>`           | ⏳     |
+| A-4   | H   | Rust SDK          | `MeshNode::list_tools(matcher)` returning `Vec<ToolDescriptor>` via capability-fold walk        | ⏳     |
+| A-5   | H   | Rust SDK          | `MeshNode::watch_tools(matcher) -> Stream<ToolListChange>` for dynamic discovery                | ⏳     |
+| A-6   | H   | Rust SDK          | `TypedMeshRpc::call_tool<Req, Resp>` (unary) + `::call_tool_streaming<Req, Resp>` over `S-1`    | ⏳     |
+| A-7   | M   | Rust SDK          | `#[tool]` proc macro (follow-up — runtime APIs land first)                                      | ⏳     |
+| B-1   | H   | Node TS           | `tool({ name, description, schema, handle })` + Zod schema lowering                              | ⏳     |
+| B-2   | H   | Node TS           | `tool({ ..., stream: async function* handle() { yield … } })` — streaming via async-iter        | ⏳     |
+| B-3   | H   | Node TS           | `MeshNode.listTools({ matcher? })` + `MeshNode.watchTools({ matcher? })`                        | ⏳     |
+| B-4   | H   | Node TS           | `TypedMeshRpc.callTool` + `.callToolStreaming` (capability-routed; client of `S-1`)             | ⏳     |
+| C-1   | H   | Python            | `from net.tools import tool` decorator (Pydantic-typed + plain-typing fallback)                  | ⏳     |
+| C-2   | H   | Python            | `@tool.stream` / `async def gen(...) -> AsyncGenerator[ToolEvent, None]` streaming variant       | ⏳     |
+| C-3   | H   | Python            | `await mesh.list_tools(matcher=...)` + `async for change in mesh.watch_tools(matcher=...)`       | ⏳     |
+| C-4   | H   | Python            | `AsyncTypedMeshRpc.call_tool` + `.call_tool_streaming` (capability-routed)                       | ⏳     |
+| D-1   | M   | Go                | `net.RegisterTool[Req, Resp](rpc, meta, handler)` + streaming variant                            | ⏳     |
+| D-2   | M   | Go                | `mesh.ListTools(ctx, matcher)` + `mesh.WatchTools(ctx, matcher) <-chan ToolListChange`           | ⏳     |
+| M-1   | H   | format pkg (Py)   | `net_mesh.tools.formats.openai` — `to_openai_tool(desc)` + `lower_tool_call(call) -> CallSpec`  | ⏳     |
+| M-2   | H   | format pkg (Py)   | `net_mesh.tools.formats.anthropic` — same shape; streaming via `tool_use_block_delta`           | ⏳     |
+| M-3   | M   | format pkg (Py)   | `net_mesh.tools.formats.{gemini,mcp}` — same pattern                                            | ⏳     |
+| M-4   | H   | format pkg (TS)   | `@net-mesh/tools/formats/{openai,anthropic,gemini,mcp}` — mirror per submodule                  | ⏳     |
+| T-1   | H   | cross-lang tests  | Python agent (M-1) calls Go-hosted tool (D-1) — schema fidelity + golden vector + result match  | ⏳     |
+| T-2   | H   | streaming test    | `ToolEvent` envelope round-trip: server emits `start/progress/delta/result`; client decodes     | ⏳     |
+| T-3   | M   | discovery test    | TagMatcher filter: `list_tools(matcher=Prefix("region.eu"))` excludes US-region hosts            | ⏳     |
+| T-4   | M   | watch test        | Dynamic-discovery: `watch_tools` emits `Added` / `Removed` when a host registers + drops a tool | ⏳     |
+| T-5   | L   | cancellation test | `client.cancel()` mid-tool propagates substrate CANCEL; tool observes `Cancelled` status        | ⏳     |
+| X-1   | H   | docs              | `docs/AGENT_TOOLS.md` — quickstart + decorator + discovery + format translators + envelope spec | ⏳     |
+| X-2   | H   | demo              | `examples/agents/python-langchain-tools.py` — LangChain agent with one local + one Go-hosted tool | ⏳     |
+| X-3   | M   | demo              | `examples/agents/node-openai-tools.ts` — minimal OpenAI function-calling loop via `@net-mesh/tools` | ⏳     |
 
-No wire ABI bump. `tool.metadata` is a new nRPC service registered alongside existing ones; existing peers ignore it.
+No wire ABI bump for unary tool calls. Streaming tools use `S-1`'s new `call_service_streaming` substrate primitive; the wire shape of an individual stream is unchanged from `call_streaming` today. `ToolEvent` envelopes are JSON-encoded chunks on existing streams.
 
 ---
 
 ## Phasing
 
-**Recommended order: substrate → Rust SDK → Python + Node bindings in parallel → adapters → Go → polish.**
+**Recommended order: substrate → Rust SDK → bindings (parallel) → format pkgs (parallel) → tests/docs.**
 
-1. **Wave 1 — Substrate convention (S-1, S-2).** Lock the `tool.metadata` RPC shape, the capability-tag convention, and the `tool` cargo feature. Pure-additive; no existing code changes.
+1. **Wave 1 — Substrate (S-1, S-2, S-3, S-4 in parallel).** The two foundational pieces are `S-1` (`call_service_streaming` — every streaming tool client depends on it) and `S-2` (publish `ToolCapability` via the capability fold so `list_tools` is a fold walk, not RPC fanout). `S-3` (`tool.metadata.fetch` for oversized schemas) and `S-4` (feature gate + `ToolEvent` wire type) can ship alongside.
 
-2. **Wave 2 — Rust SDK (A-1 → A-2 → A-3).** Ship the foundation everything else builds on. A-4 (proc macro) can land in parallel or as a follow-up — the runtime APIs are usable without it.
+2. **Wave 2 — Rust SDK (A-1 → A-2/A-3 → A-4/A-5 → A-6).** Sequence: build the types (`A-1`), then `serve_tool` + streaming variant (`A-2`/`A-3`), then discovery (`A-4`/`A-5`), then the client-side `call_tool` helpers (`A-6`) that ride `S-1`. `A-7` (proc macro) is a follow-up — runtime APIs are usable as-is.
 
-3. **Wave 3 — Bindings (B-* + C-* in parallel; D-* last).** Node + Python land alongside their adapter packages so launch-day agent authors see a coherent surface in both languages. Go follows because the Go binding doesn't have a schema-derivation story yet (D-1 ships with hand-written schemas; an auto-deriving helper is a follow-up).
+3. **Wave 3 — Bindings (B-*, C-*, D-* in parallel).** Each language stack lands together so launch-day agent authors see a coherent surface. D lands last only because the Go schema story is hand-written in v1 — that's an effort comment, not a dependency.
 
-4. **Wave 4 — Agent adapters (M-1..M-4).** Two adapter packages per language (OpenAI + Anthropic). Each is small (~200 LOC) — wrap the discovery result, expose provider-native tool shapes, expose an `invoke` helper that dispatches a tool call through `TypedMeshRpc::call`.
+4. **Wave 4 — Format packages (M-1..M-4 in parallel).** Python's `net-mesh-tools` and Node's `@net-mesh/tools` ship together with the four format submodules (OpenAI / Anthropic / Gemini / MCP). Each translator is a pure function; no SDK transitive deps.
 
-5. **Wave 5 — Tests + docs + demo (T-* + X-*).** Cross-language round-trips pin the schema + invocation contract; the demo agent makes the DX visible.
+5. **Wave 5 — Tests + docs + demo (T-* + X-*).** Cross-language round-trips pin the schema + invocation + envelope contracts; the demo agents make the DX visible.
 
-Wave 1 unblocks every other wave. Waves 2 and 3 can overlap once S-1 is locked. M-slices wait on their language's B/C slice. The Go slice (D) lands last so its hand-written-schema gap doesn't block the Python + Node agent flow.
+Wave 1 unblocks every other wave. Waves 2/3/4 can overlap once `S-1` + `S-2` + `S-4` are locked. The Go slice (D) is independent of the Python/Node ones.
 
 ---
 
-## Wave 1 — Substrate convention
+## Wave 1 — Substrate
 
-### S-1 — `tool.metadata` typed RPC service shape + capability-tag convention
+### S-1 — `call_service_streaming` mirror of `call_service`
 
-**Rationale.** Discovery rides nRPC. We need a single canonical service name + request/response shape so every binding's `list_tools()` interoperates with every other binding's `serve_tool`. No new wire protocol.
+**Rationale.** Today the substrate has `call_service` (capability-routed unary) and `call_streaming` (explicit-target server-streaming). It does NOT have a capability-routed streaming path. Without it, every adapter that wants a streaming tool has to manually combine `find_service_nodes` → health-filter → `TagMatcher` filter → capability-auth gate → `select_target` → `call_streaming`, and that path skips the cap-auth gate `call_service` enforces. Every other slice depends on this primitive existing.
 
 **Design.**
 
 ```rust
-// crates/net/src/adapter/net/cortex/tool.rs (new, behind `feature = "tool"`)
-
-/// Wire shape for one tool. Carried in the `tool.metadata.list` reply.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ToolMetadata {
-    /// nRPC service name. Same string the agent passes to `TypedMeshRpc::call`.
-    pub name: String,
-    /// Human-readable description; the model reads this to decide when to call.
-    pub description: String,
-    /// JSON Schema (draft 2020-12) for the request body.
-    pub parameters: serde_json::Value,
-    /// JSON Schema for the response body. Optional — many models ignore it,
-    /// but provider adapters (Anthropic strict mode, OpenAI structured output)
-    /// can opt in.
-    pub returns: Option<serde_json::Value>,
-    /// Streaming shape. `false` for unary tools; `true` for server-streaming /
-    /// duplex tools (chunked output the agent can render as it arrives).
-    pub streaming: bool,
-    /// Free-form tags the host attached at register time. Adapters surface
-    /// these as metadata; some providers (Anthropic) expose them under
-    /// `cache_control` or custom fields.
-    pub tags: Vec<String>,
-}
-
-/// `tool.metadata.list` request — agents send this to enumerate tools on a node.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ListToolsRequest {
-    /// Optional name filter (substring match). `None` = all tools.
-    pub name_contains: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListToolsResponse {
-    pub tools: Vec<ToolMetadata>,
+impl Mesh {
+    pub async fn call_service_streaming(
+        self: &Arc<Self>,
+        service: &str,
+        payload: Bytes,
+        opts: CallOptions,
+    ) -> Result<RpcStream, RpcError>;
 }
 ```
 
-**Capability tag convention.** Each tool publishes `ai-tool:<name>` on its host's capability tags. `mesh.list_tools()` walks `find_nodes_for_tag_prefix("ai-tool:")` to discover *hosts*, then RPCs `tool.metadata.list` against each to fetch the full metadata. Two-step discovery (tag lookup → metadata pull) keeps the gossip path small (just the tag) and pushes the heavy payload (the schema) to on-demand fetch.
+Same body as `call_service` (target enumeration → health filter → routing-policy sort → capability-auth filter → `select_target`) but the terminal step is `self.call_streaming(target, ...)` instead of `self.call(target, ...)`. Honors the same `CallOptions::cancel_token` (v3) and `CallOptions::deadline` the unary path honors.
 
-**Wire compat.** `ToolMetadata` is postcard-encoded; postcard is append-tolerant so future fields land additively. The `tool.metadata` service itself is just an nRPC service — peers without the `tool` feature compile and run normally; they just don't expose the service.
+**Bindings work.** Each binding's typed wrapper grows `callServiceStreaming<Req, Resp>` / `call_service_streaming` / `CallServiceStreaming[Req, Resp]` mirroring the existing `callStreaming` shape. Wire format is unchanged — this is purely a new caller-side entry point that composes existing wire-level primitives.
 
-**Files touched.**
-- `crates/net/src/adapter/net/cortex/tool.rs` (new — wire types, behind `feature = "tool"`).
-- `crates/net/src/adapter/net/cortex/mod.rs` — `pub mod tool;` (gated).
-
-### S-2 — `[features] tool = []` on `net-mesh` + module gate
-
-**Rationale.** Tooling is opt-in: consumers who don't need it shouldn't pay the (small) binary cost or the `schemars` dep when they pull `net-sdk`. Same mechanism as the `regex` feature gate in v0.24.1.
-
-**Design.** Add `[features] tool = []` to `crates/net/Cargo.toml`. The `cortex::tool` module compiles only with the feature on. The `net-sdk` crate adds an `tool` feature that flips on `net-mesh/tool` + `schemars` + the SDK-side surface from A-1 / A-2 / A-3.
-
-**Default policy.** The Rust SDK leaves `tool` OFF by default. The Python wheel, Node npm package, and Go binding leave it OFF by default. Consumers turn it on with `--features tool` (Rust / Python build) or by importing `@net-mesh/sdk-tools` (Node — separate package importable next to `@net-mesh/sdk`, mirrors the OpenAI/Anthropic adapter package pattern).
+**Cross-language test.** Add a golden vector to `tests/cross_lang_nrpc/golden_vectors.json` covering capability-routed streaming. Confirms TS / Python / Go bindings observe identical target selection, chunk ordering, and EOF semantics.
 
 **Files touched.**
-- `crates/net/Cargo.toml` — `tool = []` under `[features]`.
-- `crates/net/sdk/Cargo.toml` — `tool = ["net-mesh/tool", "dep:schemars"]`; `schemars` as an optional dep.
+- `crates/net/src/adapter/net/mesh_rpc.rs` — `call_service_streaming` parallel to existing `call_service`.
+- Each binding's `mesh_rpc.{rs,ts,py,go}` — typed wrapper entry point.
+
+### S-2 — `ToolCapability` fold integration
+
+**Rationale.** The existing capability fold already aggregates `ToolCapability` instances across every node in scope. Today `serve_tool`-like flows are missing the atomic publish — the SDK has to call `serve_rpc`, then `announce_capabilities`, then add the `nrpc:<tool_id>` tag. This slice wires `serve_tool` (A-2) to do all of that in one atomic step via the existing fold publish path; nothing here is new wire-level machinery, it's plumbing that makes `serve_tool` a single call.
+
+**Design.**
+
+- `MeshNode::tool_publish(meta: &ToolDescriptor)` — internal helper that the SDK's `serve_tool` calls after `serve_rpc` succeeds. Constructs a `ToolCapability` from the descriptor + emits an announcement via the existing `announce_capabilities` path with the `nrpc:<tool_id>` + `ai-tool:<tool_id>` tags added. The descriptor's small fields (name, version, description, node_count derived live, `stateless`, `estimated_time_ms`) embed in the capability payload; the full schema (potentially > 8 KB) lives in a local-only registry that S-3's `tool.metadata.fetch` reads.
+- `MeshNode::tool_unpublish(name: &str)` — paired Drop helper.
+
+**Files touched.**
+- `crates/net/src/adapter/net/cortex/tool.rs` (new) — internal helpers + the `ToolDescriptor` wire type.
+- `crates/net/src/adapter/net/behavior/capability.rs` — wire `ToolCapability` payload fields (additive on the existing struct).
+
+### S-3 — `tool.metadata.fetch(name)` on-demand schema pull
+
+**Rationale.** Some tool schemas are too large to gossip via the capability fold (the fold's per-entry payload budget keeps gossip light). For those, an on-demand pull via nRPC is the natural fallback. The descriptor surfaces a `has_inline_schema: bool`; agents that need a non-inline schema call `tool.metadata.fetch`.
+
+**Design.** A new typed nRPC service auto-registered on any node that has called `serve_tool`. Request is `{ name: String }`; response is `{ parameters: serde_json::Value, returns: Option<serde_json::Value> }`. The local registry lookup is one HashMap read; the round-trip is one nRPC.
+
+**Files touched.**
+- `crates/net/src/adapter/net/cortex/tool.rs` — service + handler.
+- `crates/net/sdk/src/tool.rs` — `MeshNode::fetch_tool_schema(host, name)` helper.
+
+### S-4 — `[features] tool = []` + `ToolEvent` wire type
+
+**Rationale.** Tooling is opt-in: consumers who don't need it skip the binary cost. Same mechanism as the `regex` gate in v0.24.1. Also: lock the `ToolEvent` wire shape here so every streaming binding agrees byte-for-byte.
+
+**Design.**
+
+```rust
+// crates/net/src/adapter/net/cortex/tool.rs — gated by `feature = "tool"`
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolEvent {
+    /// Fires once on stream open. Carries the substrate's call_id so
+    /// clients can correlate progress events to outstanding calls.
+    Start {
+        tool_id: String,
+        call_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+    },
+    /// Coarse progress for spinner UIs. Numeric pct and/or message.
+    Progress {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pct: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// Partial output — model tokens, file bytes, log lines. The
+    /// adapter decides how to lower these into the provider's
+    /// streaming protocol (Anthropic `tool_use_block_delta`, etc.).
+    Delta { data: serde_json::Value },
+    /// Terminal full result. Client sees exactly one `Result` OR one
+    /// `Error` per stream.
+    Result { data: serde_json::Value },
+    /// Terminal failure with structured detail. Adapter lowers this
+    /// to the provider's tool-error block.
+    Error {
+        code: String,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
+    },
+}
+```
+
+JSON-encoded per chunk. Postcard would be smaller but JSON keeps the format readable in dumps + lets clients use whatever JSON parser they already have (no codec mismatch with the bindings' typed wrappers, which already use JSON for the request body).
+
+Unary tools synthesize a single `Result` envelope server-side; clients of `call_tool` (A-6) unwrap it transparently so unary callers never see envelopes.
+
+**Files touched.**
+- `crates/net/src/adapter/net/cortex/tool.rs` — `ToolEvent` enum.
+- `crates/net/Cargo.toml` — `tool = []` feature.
+- `crates/net/sdk/Cargo.toml` — `tool = ["net-mesh/tool", "dep:schemars"]`.
 
 ---
 
 ## Wave 2 — Rust SDK
 
-### A-1 — `net_sdk::tool::ToolMetadata` + `schemars` integration
-
-**Rationale.** Re-export the wire `ToolMetadata` from the substrate as the SDK-facing type, and provide one helper that builds it from any `schemars::JsonSchema`-implementing Rust type pair.
-
-**Design.**
+### A-1 — `ToolDescriptor` + `ToolEvent` + `schemars` derivation
 
 ```rust
-// crates/net/sdk/src/tool.rs (new)
+// crates/net/sdk/src/tool.rs
 
-pub use net::adapter::net::cortex::tool::{ToolMetadata, ListToolsRequest, ListToolsResponse};
+pub use net::adapter::net::cortex::tool::{ToolEvent};
 
-/// Build `ToolMetadata` from a Rust type pair that implements
-/// `schemars::JsonSchema`. The name + description come from the
-/// caller; schemas are generated.
+/// Discovery shape — what `list_tools` returns. Lives in the
+/// capability fold; agents see one of these per (host, name).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolDescriptor {
+    /// nRPC service name. Same string `call_tool` takes.
+    pub name: String,
+    /// Tool version (semver-ish). `list_tools` dedupes by (name, version)
+    /// and merges node_counts.
+    pub version: String,
+    /// Human-readable description; the model reads this to decide when to call.
+    pub description: String,
+    /// JSON Schema for the request body. `None` when the schema is too
+    /// large for the fold; fetch via `tool.metadata.fetch`.
+    pub parameters: Option<serde_json::Value>,
+    /// JSON Schema for the response body. `None` for non-strict tools.
+    pub returns: Option<serde_json::Value>,
+    /// `true` if the handler is `serve_tool_streaming`. Adapters lower
+    /// this into their provider's streaming protocol.
+    pub streaming: bool,
+    /// Tool is a pure function (same input → same output, no session
+    /// state). Adapters use this to decide caching + parallel-invocation
+    /// safety.
+    pub stateless: bool,
+    /// Soft latency hint for the model scheduler / UI spinner.
+    pub estimated_time_ms: Option<u32>,
+    /// How many nodes currently serve this (name, version). Filled by
+    /// `list_tools`; producers leave it at 0.
+    pub node_count: u32,
+    /// Free-form tags the host attached at register time.
+    pub tags: Vec<String>,
+}
+
 pub fn metadata_for<Req: schemars::JsonSchema, Resp: schemars::JsonSchema>(
     name: impl Into<String>,
     description: impl Into<String>,
-) -> ToolMetadata {
-    let mut gen = schemars::SchemaGenerator::default();
-    let parameters = serde_json::to_value(gen.subschema_for::<Req>())
-        .expect("schemars output is always valid JSON");
-    let returns = serde_json::to_value(gen.subschema_for::<Resp>()).ok();
-    ToolMetadata {
-        name: name.into(),
-        description: description.into(),
-        parameters,
-        returns,
-        streaming: false,
-        tags: vec![],
-    }
-}
+) -> ToolDescriptor { /* schemars schema gen + sane defaults */ }
 ```
 
-**Files touched.**
-- `crates/net/sdk/src/tool.rs` (new, behind `feature = "tool"`).
-- `crates/net/sdk/src/lib.rs` — `#[cfg(feature = "tool")] pub mod tool;`.
-
-### A-2 — `TypedMeshRpc::serve_tool` + auto-publish to `tool.metadata`
-
-**Rationale.** Registering a tool should be one call. Today it's two — `rpc.serve(name, handler)` + (manual) capability-tag publish + (manual) `tool.metadata` registration. Collapse into one.
-
-**Design.**
+### A-2 — `TypedMeshRpc::serve_tool<Req, Resp>` (unary, atomic)
 
 ```rust
 impl TypedMeshRpc {
-    /// Register `handler` as a typed nRPC service AND advertise it as
-    /// an AI tool: adds the `ai-tool:<name>` capability tag and
-    /// registers metadata with the local `tool.metadata` registry.
-    /// Returns a `ServeHandle` whose Drop unregisters both.
+    /// Atomically register a unary tool. All four state changes succeed
+    /// or none do; Drop on the returned handle reverses every step.
     pub fn serve_tool<Req, Resp, H>(
         &self,
-        meta: ToolMetadata,
+        meta: ToolDescriptor,
         handler: H,
-    ) -> Result<ServeHandle, ServeError>
-    where
-        Req: DeserializeOwned + Send + Sync + 'static,
-        Resp: Serialize + Send + Sync + 'static,
-        H: TypedRpcHandler<Req, Resp> + Send + Sync + 'static,
-    {
-        // Re-uses the substrate's `MeshNode.serve_rpc` underneath.
-        let inner = self.serve(&meta.name, handler)?;
-        self.node.add_capability_tag(format!("ai-tool:{}", meta.name));
-        self.node.tool_registry().insert(meta.clone());
-        Ok(inner.with_drop_hook(move || {
-            self.node.remove_capability_tag(format!("ai-tool:{}", meta.name));
-            self.node.tool_registry().remove(&meta.name);
-        }))
-    }
+    ) -> Result<ServeHandle, ServeError>;
 }
 ```
 
-**Auto-registered `tool.metadata` service.** The first `serve_tool` call on a `MeshNode` lazily installs the `tool.metadata.list` server handler. Subsequent registrations just push into the registry. Operators who never call `serve_tool` never expose the service.
+Steps inside (atomic w.r.t. observable mesh state — rollback on any failure):
+1. `node.serve_rpc(&meta.name, …)` — register the handler.
+2. `node.tool_publish(&meta)` — adds the capability tag + emits the announcement.
+3. Insert into the local `tool_registry` (for `S-3`'s on-demand fetch).
+4. Wire the Drop hook to reverse 1 → 3.
 
-**Files touched.**
-- `crates/net/sdk/src/mesh_rpc.rs` — `serve_tool` method on `TypedMeshRpc`.
-- `crates/net/sdk/src/mesh.rs` — `tool_registry()` accessor on `MeshNode`.
-- `crates/net/src/adapter/net/cortex/tool.rs` — `ToolRegistry` (a parking_lot-protected `HashMap<String, ToolMetadata>`).
+### A-3 — `TypedMeshRpc::serve_tool_streaming<Req, Resp>`
 
-### A-3 — `MeshNode::list_tools(scope) -> Vec<ToolMetadata>`
+Same as A-2 but `handler` returns `impl Stream<Item = ToolEvent>`. The SDK serializes each item as one JSON-encoded chunk on the underlying `serve_streaming` path. Terminal `Result` or `Error` closes the stream; if the handler ends without a terminal event, the SDK synthesizes `ToolEvent::Error { code: "missing_terminal", ... }`.
 
-**Rationale.** The agent-facing discovery API. Walks the cap-index for `ai-tool:*` tag hosts, RPCs each, merges results.
-
-**Design.**
+### A-4 — `MeshNode::list_tools(matcher)` via capability-fold walk
 
 ```rust
 impl MeshNode {
-    /// Discover every tool advertised in `scope`. Returns one
-    /// `ToolMetadata` per (host, name) pair. If the same tool name is
-    /// served by multiple hosts (HA replicas), each appears once;
-    /// the caller picks one (or invokes via service-discovery and
-    /// the substrate's routing policy chooses).
-    pub async fn list_tools(&self, scope: ToolScope) -> Result<Vec<ToolMetadata>, ListToolsError> {
-        let hosts = self.find_nodes_for_tag_prefix("ai-tool:");
-        let filtered = scope.filter(hosts, &self.local_subnet());
-        let mut results = Vec::new();
-        for host in filtered {
-            // Fan out one RPC per host; small N, no parallel ceremony.
-            match self.typed_rpc().call::<_, ListToolsResponse>(
-                host,
-                "tool.metadata.list",
-                ListToolsRequest::default(),
-            ).await {
-                Ok(resp) => results.extend(resp.tools),
-                Err(e) => tracing::warn!("list_tools: {host:#x} failed: {e}"),
-            }
-        }
-        Ok(results)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum ToolScope {
-    /// Tools served by THIS node only.
-    Local,
-    /// Tools visible within the local subnet (and any subnets
-    /// where the host's announce visibility makes it reachable).
-    Subnet,
-    /// Tools globally visible — restricted to `Visibility::Global`
-    /// announcements.
-    Global,
+    /// Walk the capability fold for `ai-tool:*` capabilities matching
+    /// `matcher`. One in-memory pass; no network. Dedupes by
+    /// (name, version) and fills `node_count`.
+    pub fn list_tools(&self, matcher: Option<TagMatcher>) -> Vec<ToolDescriptor>;
 }
 ```
 
-**Capability filter.** `scope.filter(...)` consults the capability index's existing per-subnet view. A `Local` scope returns only `local_subnet == this_subnet` hosts; `Subnet` returns up to and including `ParentVisible`; `Global` returns the full set. Same model the existing aggregator query layer uses — no new auth path.
+`matcher` is the existing `capability_aggregation::TagMatcher` — same Exact / Prefix / Axis / AxisKey / Regex / VersionRange variants the aggregator already uses. Examples:
+- `Some(TagMatcher::Prefix { value: "region.eu".into() })` → tools on EU hosts only.
+- `Some(TagMatcher::AxisKey { axis: TaxonomyAxis::Hardware, key: "gpu".into() })` → tools on GPU hosts.
+- `None` → every tool in scope.
 
-**Files touched.**
-- `crates/net/sdk/src/mesh.rs` — `list_tools` + `ToolScope` enum.
-- `crates/net/sdk/src/tool.rs` — `ListToolsError`.
+Subnet visibility comes from the existing fold view — local subnet + parent-visible + global, exactly as `Fold::aggregate` already exposes. No new scope enum.
 
-### A-4 — `#[tool]` proc macro
-
-**Rationale.** Ergonomic registration without hand-rolling `ToolMetadata`. Reads:
+### A-5 — `MeshNode::watch_tools(matcher) -> Stream<ToolListChange>`
 
 ```rust
-#[tool(description = "Search the web.")]
+pub enum ToolListChange {
+    Added(ToolDescriptor),
+    Removed { name: String, version: String, host: NodeId },
+    NodeCountChanged { name: String, version: String, new_count: u32 },
+}
+```
+
+Subscribes to the fold's change-notify channel and emits diffs as they land. Agent loops use this to refresh their tools array when a new host joins or leaves — without polling. Production agent UIs depend on this.
+
+### A-6 — `TypedMeshRpc::call_tool` + `::call_tool_streaming`
+
+```rust
+impl TypedMeshRpc {
+    /// Capability-routed unary call. Looks up `name` via `find_service_nodes`,
+    /// applies the routing policy, calls `call_service`.
+    pub async fn call_tool<Req: Serialize, Resp: DeserializeOwned>(
+        &self, name: &str, req: Req,
+    ) -> Result<Resp, RpcError>;
+
+    /// Capability-routed streaming call. Same routing as `call_tool` but
+    /// terminates in `S-1`'s `call_service_streaming`. Returns a stream
+    /// of `ToolEvent`s; the caller drives the agent's UI from the events.
+    pub async fn call_tool_streaming<Req: Serialize>(
+        &self, name: &str, req: Req,
+    ) -> Result<impl Stream<Item = Result<ToolEvent, RpcError>>, RpcError>;
+}
+```
+
+For unary tools whose server side returned a synthesized `Result` envelope, `call_tool` unwraps the inner `data` so callers see a typed `Resp`, never a `ToolEvent`. Streaming callers see envelopes directly.
+
+### A-7 — `#[tool]` proc macro (follow-up)
+
+```rust
+#[tool(description = "Search the web.", stateless = true)]
 async fn web_search(req: WebSearchReq) -> WebSearchResp { ... }
 ```
 
-At call time, the macro expands to: derive `JsonSchema` for `WebSearchReq` / `WebSearchResp`, build `ToolMetadata::metadata_for::<WebSearchReq, WebSearchResp>(...)`, and emit a `register_tool(&rpc)` function the binary can call.
-
-**Design.** Companion crate `net-tool-macro` (proc-macro). Expansion:
-
-```rust
-fn register_tool(rpc: &TypedMeshRpc) -> Result<ServeHandle, ServeError> {
-    let meta = net_sdk::tool::metadata_for::<WebSearchReq, WebSearchResp>(
-        "web_search",
-        "Search the web.",
-    );
-    rpc.serve_tool::<WebSearchReq, WebSearchResp, _>(meta, web_search)
-}
-```
-
-**Tag attribute.** `#[tool(description = "...", tags = ["web", "research"])]` flows the tags into `ToolMetadata`.
-
-**Optional.** A-4 is a follow-up if a real consumer asks. The runtime APIs from A-1..A-3 are usable as-is for slightly more typing.
-
-**Files touched.**
-- `crates/net-tool-macro/` (new crate).
-- `crates/net/sdk/Cargo.toml` — re-export the macro behind `feature = "tool"`.
+Expands to a `register_<fn>(rpc)` function that builds the descriptor and calls `serve_tool`. Optional polish — the runtime APIs from A-1..A-6 work without it.
 
 ---
 
 ## Wave 3 — Bindings
 
-### B-1 — Node `tool({ name, description, schema, handle })` helper
-
-**Design.**
+### B-1..B-4 — Node TypeScript
 
 ```typescript
 // @net-mesh/sdk
-import { tool, type ToolMetadata } from '@net-mesh/sdk'
+import { tool } from '@net-mesh/sdk'
 import { z } from 'zod'
 
-const webSearchTool = tool({
+const webSearch = tool({
   name: 'web_search',
-  description: 'Search the web for relevant results.',
+  description: 'Search the web.',
+  stateless: true,
   schema: z.object({
     query: z.string(),
     maxResults: z.number().int().positive().default(10),
   }),
-  // Optional — derived from `returns` schema if present
   returns: z.object({ results: z.array(z.string()) }),
-  async handle({ query, maxResults }, ctx) {
-    // ctx carries the substrate's cancel token + headers.
-    if (ctx.signal.aborted) return { results: [] }
-    return { results: ['…'] }
+  async handle({ query, maxResults }, ctx) { /* ... */ },
+})
+
+// Streaming variant — async generator yielding ToolEvents:
+const longTask = tool({
+  name: 'long_task',
+  description: '...',
+  schema: z.object({ /* ... */ }),
+  async *stream(input, ctx) {
+    yield { type: 'progress', pct: 10 }
+    for await (const chunk of doWork(input)) {
+      yield { type: 'delta', data: chunk }
+    }
+    yield { type: 'result', data: { ok: true } }
   },
 })
 
-// Register against an existing TypedMeshRpc:
-const handle = await rpc.serveTool(webSearchTool)
+const handle = await rpc.serveTool(webSearch)
+
+// Discovery:
+const tools = await mesh.listTools({ matcher: { kind: 'prefix', value: 'region.eu' } })
+const changes = mesh.watchTools()
+for await (const change of changes) { /* ... */ }
+
+// Capability-routed invocation:
+const result = await rpc.callTool('web_search', { query: 'mesh', maxResults: 5 })
+const stream = rpc.callToolStreaming('long_task', { /* ... */ })
+for await (const event of stream) { /* ... */ }
 ```
 
-**Schema lowering.** `zod-to-json-schema` converts the Zod schema to JSON Schema 2020-12 at registration time. Cost is one-shot; the converted schema is cached on the `ToolMetadata` object.
-
-**Files touched.**
-- `bindings/node/tool.ts` (new — exports `tool`, `serveTool`, type definitions).
-- `bindings/node/package.json` — `peerDependency` on `zod` (optional); `zod-to-json-schema` as a direct dep behind the tools entrypoint.
-
-### B-2 — Node `MeshNode.listTools(opts?) -> Promise<ToolMetadata[]>`
-
-**Design.** Mirrors A-3. Optional `opts`: `{ scope?: 'local' | 'subnet' | 'global', nameContains?: string }`. Returns a flat `ToolMetadata[]` matching the Rust shape (same JSON wire encoding).
-
-### B-3 — `zod`-schema convenience
-
-Implicit in B-1; pinned here as a separate slice to allow shipping B-1 with hand-written JSON schemas first, and adding the Zod convenience as a polish step.
-
-### C-1 — Python `@tool` decorator + Pydantic schema derivation
-
-**Design.**
+### C-1..C-4 — Python
 
 ```python
-# net.tools (new module)
 from net.tools import tool
 
 class WebSearchRequest(BaseModel):
@@ -402,106 +430,94 @@ class WebSearchRequest(BaseModel):
 class WebSearchResponse(BaseModel):
     results: list[str]
 
-@tool(description="Search the web for relevant results.")
+@tool(description="Search the web.", stateless=True)
 async def web_search(req: WebSearchRequest) -> WebSearchResponse:
     return WebSearchResponse(results=["..."])
 
-# Registration:
-mesh = NetMesh(...)
-rpc = AsyncTypedMeshRpc(mesh)
+# Streaming variant:
+@tool.stream(description="Long-running task.")
+async def long_task(req: LongTaskRequest):
+    yield ToolEvent.progress(pct=10)
+    async for chunk in do_work(req):
+        yield ToolEvent.delta(chunk)
+    yield ToolEvent.result(LongTaskResponse(ok=True))
+
 handle = await web_search.register(rpc)
+
+# Discovery:
+tools = await mesh.list_tools(matcher=TagMatcher.prefix("region.eu"))
+async for change in mesh.watch_tools():
+    ...
+
+# Capability-routed invocation:
+result = await rpc.call_tool("web_search", {"query": "mesh", "max_results": 5})
+async for event in rpc.call_tool_streaming("long_task", {...}):
+    ...
 ```
 
-**Schema derivation.** `WebSearchRequest.model_json_schema()` produces JSON Schema 2020-12 natively in Pydantic 2.x. The decorator builds `ToolMetadata` at decoration time so introspection (`web_search.metadata`) works before registration.
+Plain-`typing` fallback applies the same way it did in the previous draft — `@tool` introspects signatures with `inspect.signature` + `typing.get_type_hints` and synthesizes a Pydantic model on the fly so users don't need to learn Pydantic first.
 
-**`@tool` on a plain function.** If the function's type hints aren't Pydantic models, the decorator synthesizes a Pydantic model from the signature on the fly (using `pydantic.create_model`). Plain `str`/`int`/`list[str]` / etc. all work. C-3 expands this.
-
-**Cancellation.** The handler can `await some_io()` normally; substrate cancel arrives as `asyncio.CancelledError` via the v3 dispatcher-loop relay landed in the python-async-sdks branch.
-
-**Files touched.**
-- `bindings/python/python/net/tools.py` (new).
-- `bindings/python/python/net/__init__.py` — re-export.
-
-### C-2 — `await mesh.list_tools(scope=...)`
-
-**Design.** `AsyncNetMesh.list_tools(scope: ToolScope = ToolScope.Subnet) -> list[ToolMetadata]`. `ToolMetadata` is a frozen dataclass mirroring the wire shape.
-
-### C-3 — Plain-`typing` derivation
-
-Detail: `@tool` introspects the function signature with `inspect.signature` + `typing.get_type_hints`, synthesizes a Pydantic model named `<FnName>Request` with the signature's parameter names + types + defaults. Same for the return type via `Annotated[..., Field(...)]` if needed. Covers 90% of casual tool authoring without making users learn Pydantic first.
-
-### D-1 / D-2 — Go `Tool[Req, Resp]` + `ListTools`
-
-**Design.** No proc-macro story in Go; hand-written schemas in v1:
+### D-1 / D-2 — Go
 
 ```go
-package main
-
-import (
-    "context"
-    "github.com/ai-2070/net/bindings/go/net"
+// Hand-written schema in v1; derive helper is a future slice.
+handle, err := net.RegisterTool[WebSearchReq, WebSearchResp](
+    rpc,
+    net.ToolDescriptor{
+        Name: "web_search",
+        Version: "1.0.0",
+        Description: "Search the web.",
+        Stateless: true,
+        Parameters: net.SchemaObject{ /* hand-written */ },
+    },
+    func(ctx context.Context, req WebSearchReq) (WebSearchResp, error) { /* ... */ },
 )
 
-type WebSearchReq struct{ Query string `json:"query"` }
-type WebSearchResp struct{ Results []string `json:"results"` }
-
-func main() {
-    rpc := net.NewTypedMeshRpc(rawRpc)
-    handle, err := net.RegisterTool[WebSearchReq, WebSearchResp](
-        rpc,
-        net.ToolMetadata{
-            Name: "web_search",
-            Description: "Search the web for relevant results.",
-            Parameters: net.SchemaObject{ /* hand-written */ },
-        },
-        func(ctx context.Context, req WebSearchReq) (WebSearchResp, error) {
-            return WebSearchResp{Results: []string{"..."}}, nil
-        },
-    )
-    ...
+// Discovery + watch:
+tools, err := mesh.ListTools(ctx, &net.ListToolsOpts{ Matcher: net.PrefixMatcher("region.eu") })
+changes := mesh.WatchTools(ctx, &net.ListToolsOpts{ /* ... */ })
+for change := range changes {
+    // ...
 }
 ```
 
-`net.ListTools(ctx, mesh)` mirrors A-3 with the Go-idiomatic `(values, err)` shape.
-
-**Schema derivation follow-up.** Adding a `derive`-style schema generator from Go struct tags is a future slice gated on a real consumer ask. Today's hand-written schemas are workable since the tool list is small and stable.
-
 ---
 
-## Wave 4 — Agent adapters
+## Wave 4 — Format packages (one per language, format submodules within)
 
-Two adapter packages per language. Each is small — the canonical shape is one helper to lower `[ToolMetadata]` into the provider's tool-array format + one helper to upgrade a provider's tool_use block into a typed nRPC call.
-
-### M-1 — `net-mesh-openai-tools` (Python)
+### M-1..M-3 — Python `net-mesh-tools`
 
 ```python
-from net.tools import discover
-from net_mesh_openai_tools import OpenAIToolBridge
-from openai import OpenAI
+from net_mesh.tools.formats.openai import to_openai_tool, lower_tool_call
+from net_mesh.tools.formats.anthropic import to_anthropic_tool, lower_tool_use
 
-tools = await mesh.list_tools(scope="subnet")
-bridge = OpenAIToolBridge(tools, mesh)
+# Convert descriptors to provider tool shapes:
+openai_tools = [to_openai_tool(d) for d in await mesh.list_tools()]
+anthropic_tools = [to_anthropic_tool(d) for d in await mesh.list_tools()]
 
-client = OpenAI()
-response = client.chat.completions.create(
-    model="gpt-4",
-    tools=bridge.openai_tools(),  # JSON-schema array OpenAI wants
-    messages=[...]
-)
-
-for tool_call in response.choices[0].message.tool_calls:
-    result = await bridge.invoke(tool_call)
-    # result is the typed dict the tool returned; bridge auto-encodes
-    # for the next message turn
+# Lower a provider's tool_call/tool_use into an nRPC invocation:
+call_spec = lower_tool_call(openai_tool_call)  # → {"name": "web_search", "request": {...}}
+result = await rpc.call_tool(call_spec["name"], call_spec["request"])
 ```
 
-### M-2 — `net-mesh-anthropic-tools` (Python)
+The package has zero hard dep on `openai` / `anthropic` SDKs — translators are pure functions over JSON-schema dicts and tool-call/tool-use dicts. Users pip-install `openai` separately if they want to talk to OpenAI.
 
-Mirror for Anthropic SDK + tool_use / tool_result blocks. Same shape.
+`gemini` and `mcp` translators ship in the same package; same pattern.
 
-### M-3 / M-4 — npm equivalents
+### M-4 — Node `@net-mesh/tools`
 
-`@net-mesh/openai-tools` and `@net-mesh/anthropic-tools`. Take a `ToolMetadata[]` + a `MeshRpc` instance; expose `.toOpenAITools()` / `.toAnthropicTools()` + `.invoke(toolCall)`.
+```typescript
+import { toOpenAITool, lowerToolCall } from '@net-mesh/tools/formats/openai'
+import { toAnthropicTool, lowerToolUse } from '@net-mesh/tools/formats/anthropic'
+
+const openaiTools = (await mesh.listTools()).map(toOpenAITool)
+// pass to openai.chat.completions.create({ tools: openaiTools, ... })
+
+// For streaming tools, the anthropic translator additionally exposes:
+//   lowerToolUse(toolUse, mesh): AsyncIterable<AnthropicContentBlockDelta>
+// which calls callToolStreaming, lowers each ToolEvent.delta into an
+// Anthropic content-block-delta, terminates on result/error.
+```
 
 ---
 
@@ -510,49 +526,58 @@ Mirror for Anthropic SDK + tool_use / tool_result blocks. Same shape.
 ### T-1 — Cross-lang tool round-trip
 
 `tests/cross_lang_tools/` — Python agent (M-1) calls a Go-hosted tool (D-1). Asserts:
-1. Discovery returns the tool with the expected schema.
-2. The schema, when lowered to OpenAI's tools shape, round-trips bytes-equal to a golden vector.
-3. The invocation succeeds; the result is the expected typed shape.
+1. Discovery surfaces the tool with the expected `ToolDescriptor` shape (name, version, schema, node_count = 1).
+2. Lowered to OpenAI's tools shape, the descriptor matches a golden vector byte-for-byte.
+3. The invocation succeeds; result equals the expected typed shape.
 
-### T-2 — Streaming tool
+### T-2 — `ToolEvent` envelope contract
 
-A Python tool that emits 5 progress chunks via `serve_streaming`; an Anthropic-adapter consumer iterates and accumulates. Pin the wire shape of streaming tool output.
+A Python `@tool.stream` handler emits `start → progress(10%) → delta → delta → delta → result`; a Node client consumes via `callToolStreaming` and asserts each event arrives with the expected shape + order. Cross-language pin: the JSON wire encoding must be byte-equal between bindings.
 
-### T-3 — Capability-scoped discovery
+Negative cases:
+- Server ends without a terminal event → client observes a synthesized `Error { code: "missing_terminal" }`.
+- Server emits `Error` mid-stream → client's stream closes after that frame; subsequent reads return EOF.
+- Two terminal events (a bug) → client takes the first, logs a warning on the second.
 
-Two-subnet test: a tool registered on a node in subnet A with `Visibility::SubnetLocal` is invisible to `list_tools(scope=Global)` from a node in subnet B. Pins the existing visibility model carries through.
+### T-3 — TagMatcher-filtered discovery
 
-### T-4 — Cancellation
+Three-node mesh: node A tags `region.us`, B tags `region.eu`, C tags `region.eu`. Each registers a tool. `list_tools(matcher=Prefix("region.eu"))` from a fourth observer node returns exactly the B + C tools.
 
-Mid-tool `client.cancel()` propagates substrate CANCEL; the tool observes the cancel within 50 ms (per the v3 contract). Same shape as `integration_mesh_cancel.rs::cancel_unary_mid_flight_emits_cancel_on_wire` but with a tool wrapper on the server side.
+### T-4 — Watch-tools dynamic discovery
+
+Boot a mesh; subscribe `watch_tools`; register a tool on node X; assert the subscriber sees `Added(...)` within one fold-broadcast cycle. Drop the handle; assert `Removed(...)`. Spawn a second host serving the same (name, version); assert `NodeCountChanged { new_count: 2 }`.
+
+### T-5 — Cancellation mid-tool
+
+Mid-tool `client.cancel()` propagates substrate CANCEL; the tool's stream sees `ctx.cancellation` fire within 50 ms (per the v3 contract). Adapter side receives a synthesized `Error { code: "cancelled" }` envelope.
 
 ### X-1 — `docs/AGENT_TOOLS.md`
 
-Quickstart, decorator usage, discovery, provider adapters. Cookbook: "register a tool in 10 lines"; "consume a tool from an LLM agent in 20 lines"; "stream progress from a long-running tool"; "scope tools to a subnet."
+Sections: quickstart (`@tool` decorator usage), discovery (`list_tools` + `watch_tools` + TagMatcher cookbook), streaming envelopes (`ToolEvent` spec + adapter lowering examples), format packages (one section per provider), capability scoping (subnet visibility + auth), `serve_tool` atomicity contract.
 
-### X-2 — `examples/agents/python-anthropic-tools.py`
+### X-2 — `examples/agents/python-langchain-tools.py`
 
-End-to-end agent loop. Two tools, one local (Python `@tool`) and one remote (Go-hosted). Anthropic Claude as the model. The example runs against a single-process mesh-pair so reviewers can `python example.py` and watch it work.
+End-to-end LangChain agent. One Python `@tool` (local), one Go-hosted tool (remote). LangChain's `DynamicStructuredTool` shape gets emitted by `net_mesh.tools.formats.langchain` (companion submodule). Reviewers `python example.py` and watch a multi-step agent loop dispatch tool calls across the language boundary.
 
-### X-3 — `examples/agents/node-langchain-tools.ts`
+### X-3 — `examples/agents/node-openai-tools.ts`
 
-LangChain `DynamicStructuredTool` shape; adapter package emits LangChain-compatible tools. Shows the "mesh tools = LangChain tools" identity claim.
+Minimal OpenAI function-calling loop. Discovers tools, lowers via `formats/openai`, hands to `openai.chat.completions.create`, dispatches each tool_call via `callTool`, feeds the result back into the next message turn. Demonstrates the "mesh tools = OpenAI tools" identity claim.
 
 ---
 
 ## Open questions
 
-1. **Per-call header propagation for agent observability.** Should the agent's request-id / trace-id flow into the nRPC headers? Yes, but the adapter needs to provide a hook (M-1's `bridge.invoke(tool_call, headers={...})`). Pin in M-1 design.
+1. **Per-call header propagation for agent observability.** Should the agent's request-id / trace-id flow into the nRPC headers? Yes; the format translators add a `headers?` parameter to `lowerToolCall` so callers can attach trace context. Pin in M-1 design.
 
-2. **Tool result schemas under provider strict modes.** Anthropic strict mode + OpenAI structured output both require the response schema be known. The adapter should opt in when `ToolMetadata.returns` is `Some`; flip off otherwise.
+2. **Tool result schemas under provider strict modes.** Anthropic strict mode + OpenAI structured output both require the response schema be known. The translator opts in when `ToolDescriptor.returns` is `Some`; flips off otherwise. Stays consistent across providers.
 
-3. **Streaming tool output through OpenAI.** OpenAI doesn't have a native streaming tool-result protocol. Anthropic does (via `tool_use_block_delta` + partial JSON streaming). Adapter ships partial-result streaming on Anthropic only in v1; OpenAI gets unary-only.
+3. **Streaming through OpenAI vs Anthropic.** Anthropic has `tool_use_block_delta` for partial JSON. OpenAI does not (as of writing) — its streaming protocol streams only the assistant's outer chat completion. Adapter ships streaming on Anthropic (`formats/anthropic` lowers `Delta` → `tool_use_block_delta`); OpenAI translator surfaces tools as unary only and emits a `delta`-accumulated `result` once the underlying stream terminates.
 
-4. **Identity of the agent itself as a mesh participant.** Does the agent run *inside* the mesh (a Python process with `NetMesh` + `AsyncTypedMeshRpc`), or *outside* (an OpenAI Realtime API client that connects via a gateway)? V1 assumes inside — the agent process IS a mesh node. An outside-the-mesh gateway is a follow-up (likely a `tool-gateway-daemon` that bridges a non-mesh agent to mesh-hosted tools over a single nRPC call per invocation).
+4. **Identity of the agent itself as a mesh participant.** V1 assumes inside — the agent process IS a mesh node holding `NetMesh` + `AsyncTypedMeshRpc`. Outside-the-mesh agents (browser, OpenAI Realtime client, third-party tool consumer) need a `tool-gateway-daemon` that bridges via a single nRPC call per invocation. Deferred to follow-up.
 
-5. **Tool versioning.** Multiple versions of the same tool name on the mesh — same problem as service versioning generally. The capability tag could carry `ai-tool:web_search@1.2`; `list_tools` deduplicates by name + latest version. Follow-up; v1 ships single-version assumption.
+5. **Tool versioning.** `ToolDescriptor.version` lives on the wire from day one; `list_tools` dedupes by (name, version). What's NOT yet decided: how should an agent pick between v1.2 and v1.3 of the same tool? Latest-wins by semver? Caller-specified? Default to latest-wins; expose a `version_constraint: Option<VersionReq>` on `call_tool` for explicit pinning. Pin in A-6 design.
 
-6. **MCP (Model Context Protocol) compat.** Anthropic's MCP is the closest external standard to what this plan ships. A separate `mcp-bridge` daemon could expose mesh tools to MCP clients and vice versa. Out of scope for v1 — call it out in the deferred section so users know it's tracked.
+6. **MCP compatibility — two layers.** Format-translator layer (`formats/mcp`) handles the simple case: convert `ToolDescriptor` to MCP tool shape, lower MCP tool-call to nRPC invocation. Adequate when the agent is mesh-resident and just wants to look like an MCP server to its prompt template. A separate `mcp-bridge` daemon is needed only if hosting an MCP server over a non-mesh transport (stdio, HTTP) to bridge external MCP clients into the mesh. Bridge daemon = deferred; format translator = M-3.
 
 ---
 
@@ -561,19 +586,21 @@ LangChain `DynamicStructuredTool` shape; adapter package emits LangChain-compati
 - `cargo test --features tool -- tool::` passes; `cargo doc --features tool` clean.
 - `pip install net-mesh && python -c "from net.tools import tool"` succeeds on the v0.x+1 wheel.
 - `npm install @net-mesh/sdk && grep -q 'export.*tool' node_modules/@net-mesh/sdk/dist/index.js` succeeds.
-- T-1 cross-lang round-trip passes.
-- X-2 demo (`python-anthropic-tools.py`) runs end-to-end against a local two-node mesh, makes a real Anthropic API call, and successfully dispatches a tool call into a Go-hosted service.
-- Wire format adds zero bytes to any non-tool-using nRPC call; the `tool.metadata` service is registered only on nodes that called `serve_tool` at least once.
+- `pip install net-mesh-tools` exposes `net_mesh.tools.formats.{openai,anthropic,gemini,mcp}`; `npm install @net-mesh/tools` exposes the same four submodules.
+- T-1 cross-lang round-trip passes; T-2 envelope contract passes byte-for-byte across all three bindings.
+- T-4 watch-tools test passes — `Added` / `Removed` / `NodeCountChanged` fire within one fold-broadcast cycle.
+- X-2 demo (`python-langchain-tools.py`) runs end-to-end against a local two-node mesh, makes a real LangChain agent call, and successfully dispatches a tool call into a Go-hosted service.
+- Wire format adds zero bytes to any non-tool-using nRPC call; the `tool.metadata.fetch` service is registered only on nodes that called `serve_tool` at least once.
 
 ---
 
 ## Deferred follow-ups (post-this-plan)
 
-1. **MCP bridge daemon.** Bidirectional translation: mesh tools → MCP server; MCP clients → mesh tool calls. Standalone binary, depends on `tool` feature.
-2. **Outside-the-mesh gateway.** A single TLS endpoint that fronts the mesh for agents that can't be mesh participants (browser-side agents, OpenAI Realtime, third-party tool consumers).
-3. **Schema codegen for Go.** `go-tool-derive` generator that reads struct tags and emits JSON Schema. Lifts the hand-written-schema constraint from D-1.
-4. **Tool versioning.** Per the open question; tag-encoded version + `list_tools` dedupe.
-5. **Per-tool rate-limits + auth scopes.** Agents in `subnet:dev` may call tools at 100 QPS; agents in `subnet:prod` at 10 QPS. Rides the existing channel rate-limit knob + capability auth, but needs a per-tool config layer.
-6. **Streaming tool output for OpenAI.** When OpenAI ships a native streaming tool-result protocol (currently absent), update M-1 / M-3 to use it. Today: unary on OpenAI.
-7. **Tool composition macros.** `@tool` decorators that wrap LangChain/LangGraph nodes directly so a graph node IS a mesh tool. Likely a separate companion package.
-8. **Auto-doc generation.** The `tool.metadata` registry already has descriptions + schemas; a `net tool docs --markdown` CLI could emit a per-mesh tool catalog page. Operator-facing polish.
+1. **MCP bridge daemon.** Bidirectional translation hosted over stdio / HTTP transports, for external MCP clients that aren't mesh participants. Separate concern from the M-3 format translator (which is sufficient for mesh-resident agents that want to *speak* MCP).
+2. **Outside-the-mesh gateway.** A single TLS endpoint that fronts the mesh for browser-side agents, OpenAI Realtime, and third-party tool consumers that can't run a mesh node themselves.
+3. **Schema codegen for Go.** `go-tool-derive` reads struct tags and emits JSON Schema 2020-12. Lifts the hand-written-schema constraint from D-1.
+4. **Per-tool rate-limits + auth scopes.** Agents in `subnet:dev` may call tools at 100 QPS; agents in `subnet:prod` at 10 QPS. Rides existing channel rate-limit + capability auth + per-tool config.
+5. **Streaming tool output for OpenAI.** When OpenAI ships a native streaming tool-result protocol, update `formats/openai` accordingly. Today: unary via accumulated `delta`s.
+6. **Tool composition macros.** Decorators that wrap LangChain/LangGraph nodes directly so a graph node IS a mesh tool. Likely a separate companion package.
+7. **Auto-doc generation.** A `net tool docs --markdown` CLI emits a per-mesh tool catalog page from the capability fold. Operator polish.
+8. **`#[tool]` proc macro in Rust.** A-7 stays a follow-up — runtime APIs are usable as-is.
