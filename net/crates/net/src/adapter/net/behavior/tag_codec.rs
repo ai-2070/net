@@ -946,9 +946,7 @@ pub fn is_software_owned_tag(tag: &Tag) -> bool {
     let Some((axis, key)) = tag.axis_key_ref() else {
         return false;
     };
-    axis == TaxonomyAxis::Software
-        && !key.starts_with("model.")
-        && !key.starts_with("tool.")
+    axis == TaxonomyAxis::Software && !key.starts_with("model.") && !key.starts_with("tool.")
 }
 
 /// True if `tag` is a `software.model.*` tag owned by
