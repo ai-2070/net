@@ -2834,6 +2834,92 @@ impl MeshNode {
         self.call(target, service, payload, opts).await
     }
 
+    /// Capability-routed server-streaming call. Same routing as
+    /// [`call_service`] — capability-fold lookup, health filter,
+    /// routing-policy sort, capability-auth gate, target selection —
+    /// but the terminal step is [`call_streaming`] instead of
+    /// [`call`]. Returns the substrate's `RpcStream` so callers can
+    /// drive an `async for chunk in stream:` loop.
+    ///
+    /// Use cases: an agent invoking a long-running tool that emits
+    /// progress + a terminal result, a fan-out subscriber that wants
+    /// streaming chunks from whatever node currently advertises the
+    /// service, any consumer that today reaches for
+    /// `find_service_nodes` → manual target selection → `call_streaming`
+    /// and ends up re-implementing the cap-auth gate `call_service`
+    /// already enforces.
+    ///
+    /// Honors `CallOptions::cancel_token` (v3) and
+    /// `CallOptions::deadline` exactly like `call_streaming`.
+    ///
+    /// [`call_service`]: Self::call_service
+    /// [`call_streaming`]: Self::call_streaming
+    /// [`call`]: Self::call
+    pub async fn call_service_streaming(
+        self: &Arc<Self>,
+        service: &str,
+        payload: Bytes,
+        opts: CallOptions,
+    ) -> Result<RpcStream, RpcError> {
+        let mut candidates = self.find_service_nodes(service);
+        if candidates.is_empty() {
+            return Err(RpcError::NoRoute {
+                target: 0,
+                reason: format!(
+                    "no nodes advertise `nrpc:{service}` (have any servers \
+                     for this service called serve_rpc + announce_capabilities?)"
+                ),
+            });
+        }
+
+        // Health filter — mirrors `call_service`. Candidates with no
+        // proximity entry are kept (absence of evidence ≠ evidence of
+        // unhealth); only candidates the proximity graph marks
+        // explicitly unavailable get dropped.
+        if opts.filter_unhealthy {
+            let proximity = self.proximity_graph();
+            candidates.retain(|node_id| match self.entity_id_for_node(*node_id) {
+                Some(entity_id) => match proximity.get_node(&entity_id) {
+                    Some(node) => node.is_available(),
+                    None => true,
+                },
+                None => true,
+            });
+            if candidates.is_empty() {
+                return Err(RpcError::NoRoute {
+                    target: 0,
+                    reason: format!(
+                        "every node advertising `nrpc:{service}` is marked \
+                         unhealthy by the local proximity graph",
+                    ),
+                });
+            }
+        }
+
+        // Deterministic ordering so Sticky / LowestLatency-fallback
+        // pick stably across calls — mirrors `call_service`.
+        candidates.sort_unstable();
+
+        // v0.4 capability-auth caller-side gate. Same as `call_service`:
+        // filter the candidate set BEFORE target selection so the
+        // routing policy never picks a peer the caller can't reach.
+        let tag = format!("nrpc:{service}");
+        use crate::adapter::net::behavior::fold::capability_bridge;
+        let self_id = self.node_id();
+        let any_candidate = candidates[0];
+        let fold = self.capability_fold();
+        candidates.retain(|c| capability_bridge::may_execute(fold, *c, &tag, self_id));
+        if candidates.is_empty() {
+            return Err(RpcError::CapabilityDenied {
+                target: any_candidate,
+                capability: service.to_string(),
+            });
+        }
+
+        let target = self.select_target(&candidates, &opts.routing_policy);
+        self.call_streaming(target, service, payload, opts).await
+    }
+
     /// Select a single target from `candidates` according to
     /// `policy`. Caller has already ensured `candidates` is
     /// non-empty and sorted (so `Sticky` is consistent across
