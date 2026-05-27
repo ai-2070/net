@@ -344,14 +344,24 @@ export function serveToolStreaming<Req = unknown>(
   const inner: ServeHandle = rpc.serveStreaming<Req, ToolEvent>(
     descriptor.toolId,
     async (req, sink) => {
+      let sawTerminal = false
       try {
         for await (const event of handler(req)) {
           sink.send(event)
+          if (isTerminalEvent(event)) sawTerminal = true
+        }
+        if (!sawTerminal) {
+          sink.send({
+            type: 'error',
+            code: 'missing_terminal',
+            message:
+              'tool stream ended without a terminal result or error envelope',
+          })
         }
       } catch (err) {
         // Convert handler exceptions into a terminal error envelope
-        // so the caller's `callToolStreaming` sees a typed error
-        // rather than the synthesized `missing_terminal`.
+        // so the caller sees a typed error rather than relying on
+        // the client-side missing_terminal fallback.
         const message = err instanceof Error ? err.message : String(err)
         const errEvent: ToolEventError = {
           type: 'error',

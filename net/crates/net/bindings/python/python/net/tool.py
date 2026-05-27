@@ -924,9 +924,23 @@ def serve_tool_streaming(
     descriptor = ToolDescriptor(**{**base.__dict__, "streaming": True})
 
     def _stream_handler(req: Any, sink: Any) -> None:
+        saw_terminal = False
         try:
             for event in handler(req):
                 sink.send(event)
+                if is_terminal_event(event):
+                    saw_terminal = True
+            if not saw_terminal:
+                sink.send(
+                    {
+                        "type": "error",
+                        "code": "missing_terminal",
+                        "message": (
+                            "tool stream ended without a terminal result or "
+                            "error envelope"
+                        ),
+                    }
+                )
         except Exception as exc:
             sink.send(
                 {
@@ -971,9 +985,23 @@ def serve_tool_streaming_async(
     if inspect.isasyncgenfunction(handler):
 
         async def _stream_async(req: Any, sink: Any) -> None:
+            saw_terminal = False
             try:
                 async for event in handler(req):
                     sink.send(event)
+                    if is_terminal_event(event):
+                        saw_terminal = True
+                if not saw_terminal:
+                    sink.send(
+                        {
+                            "type": "error",
+                            "code": "missing_terminal",
+                            "message": (
+                                "tool stream ended without a terminal result "
+                                "or error envelope"
+                            ),
+                        }
+                    )
             except Exception as exc:
                 sink.send(
                     {
@@ -987,9 +1015,23 @@ def serve_tool_streaming_async(
     else:
 
         def _stream_sync(req: Any, sink: Any) -> None:
+            saw_terminal = False
             try:
                 for event in handler(req):
                     sink.send(event)
+                    if is_terminal_event(event):
+                        saw_terminal = True
+                if not saw_terminal:
+                    sink.send(
+                        {
+                            "type": "error",
+                            "code": "missing_terminal",
+                            "message": (
+                                "tool stream ended without a terminal result "
+                                "or error envelope"
+                            ),
+                        }
+                    )
             except Exception as exc:
                 sink.send(
                     {
