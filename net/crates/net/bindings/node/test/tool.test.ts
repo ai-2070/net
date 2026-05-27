@@ -290,6 +290,52 @@ describe('watchTools (polling)', () => {
     }
   })
 
+  it('AbortSignal cancels the polling iterator on the next tick', async () => {
+    const mesh = stubMesh([])
+    const ctrl = new AbortController()
+    const events: ToolListChange[] = []
+    let iterationCompleted = false
+
+    const iter = watchTools(mesh, { intervalMs: 25, signal: ctrl.signal })
+
+    const consumeTask = (async () => {
+      for await (const change of iter) {
+        events.push(change)
+      }
+      iterationCompleted = true
+    })()
+
+    // Let one diff tick pass with no changes — should not produce events.
+    await new Promise((r) => setTimeout(r, 60))
+    expect(events.length).toBe(0)
+    expect(iterationCompleted).toBe(false)
+
+    // Abort. The polling loop sees the signal on its current sleep,
+    // rejects the timer Promise, and the iterator exits cleanly.
+    ctrl.abort()
+    await consumeTask
+    expect(iterationCompleted).toBe(true)
+    // The for-await terminated without throwing — that's the
+    // documented cancellation contract.
+  })
+
+  it('pre-aborted signal exits the iterator on the first tick without yielding', async () => {
+    const mesh = stubMesh([desc('preexisting', 1)])
+    const ctrl = new AbortController()
+    ctrl.abort() // Abort BEFORE consuming.
+    const events: ToolListChange[] = []
+    const iter = watchTools(mesh, { intervalMs: 50, signal: ctrl.signal })
+
+    for await (const change of iter) {
+      events.push(change)
+    }
+    // Mutating the snapshot after the abort must not surface — the
+    // iterator has already exited.
+    mesh.set([])
+    await new Promise((r) => setTimeout(r, 80))
+    expect(events.length).toBe(0)
+  })
+
   it('emits NodeCountChanged when publisher count drifts', async () => {
     const mesh = stubMesh([desc('shared_tool', 1)])
     const ctrl = new AbortController()
