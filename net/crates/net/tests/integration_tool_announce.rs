@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
+use net::adapter::net::behavior::fold::capability_aggregation::TagMatcher;
 use net::adapter::net::behavior::ToolCapability;
 use net::adapter::net::cortex::tool::ToolDescriptor;
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
@@ -182,4 +183,202 @@ async fn drop_from_registry_clears_tag_on_next_announce() {
     let removed = host.tool_registry().remove("web_search");
     assert!(removed.is_some(), "remove must return the prior entry");
     assert!(host.tool_registry().is_empty());
+}
+
+// ============================================================================
+// A-4 — list_tools walks the capability fold
+// ============================================================================
+
+#[tokio::test]
+async fn list_tools_returns_descriptors_for_every_published_tool() {
+    let host = build_node().await;
+    let peer = build_node().await;
+    handshake_pair(&host, &peer).await;
+
+    // Host serves two tools. Add a description metadata key on one
+    // of them so the descriptor's `description` round-trip is
+    // exercised end-to-end.
+    let mut search = descriptor("web_search");
+    search.description = Some("Search the web.".to_string());
+    search.tags = vec!["web".to_string(), "research".to_string()];
+    host.tool_registry().insert(search);
+    host.tool_registry().insert(descriptor("calculator"));
+    host.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce");
+
+    // Peer waits for both ai-tool tags before walking the fold.
+    let search_filter = CapabilityFilter::default().require_tag("ai-tool:web_search");
+    let calc_filter = CapabilityFilter::default().require_tag("ai-tool:calculator");
+    assert!(
+        wait_until(
+            || {
+                peer.find_nodes_by_filter(&search_filter)
+                    .contains(&host.node_id())
+                    && peer
+                        .find_nodes_by_filter(&calc_filter)
+                        .contains(&host.node_id())
+            },
+            Duration::from_secs(3),
+        )
+        .await,
+        "peer must see both tools announced",
+    );
+
+    let tools = peer.list_tools(None);
+    assert_eq!(tools.len(), 2, "expected 2 tools, got {tools:?}");
+    let by_id: std::collections::HashMap<&str, &ToolDescriptor> = tools
+        .iter()
+        .map(|t| (t.tool_id.as_str(), t))
+        .collect();
+    let search = by_id.get("web_search").expect("web_search present");
+    assert_eq!(search.description.as_deref(), Some("Search the web."));
+    assert_eq!(search.tags, vec!["web", "research"]);
+    assert_eq!(search.node_count, 1);
+    let calc = by_id.get("calculator").expect("calculator present");
+    assert!(calc.description.is_none());
+    assert_eq!(calc.node_count, 1);
+}
+
+#[tokio::test]
+async fn list_tools_hydrates_schemas_from_metadata() {
+    let host = build_node().await;
+    let peer = build_node().await;
+    handshake_pair(&host, &peer).await;
+
+    // The substrate's `from_capability` constructor copies
+    // input_schema/output_schema off the ToolCapability — we rely on
+    // them having been stashed in `CapabilitySet::metadata` on the
+    // announce path so the peer's `list_tools` can hydrate them.
+    host.tool_registry().insert(descriptor("web_search"));
+    host.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce");
+
+    let tool_filter = CapabilityFilter::default().require_tag("ai-tool:web_search");
+    assert!(
+        wait_until(
+            || peer
+                .find_nodes_by_filter(&tool_filter)
+                .contains(&host.node_id()),
+            Duration::from_secs(3),
+        )
+        .await,
+        "peer must see ai-tool:web_search",
+    );
+
+    let tools = peer.list_tools(None);
+    let search = tools
+        .iter()
+        .find(|t| t.tool_id == "web_search")
+        .expect("web_search descriptor present");
+    let schema = search
+        .input_schema
+        .as_deref()
+        .expect("input_schema hydrated from metadata");
+    assert!(
+        schema.contains("\"query\""),
+        "schema must round-trip via metadata, got {schema:?}",
+    );
+}
+
+#[tokio::test]
+async fn list_tools_filters_by_matcher_prefix() {
+    let host_eu = build_node().await;
+    let host_us = build_node().await;
+    let peer = build_node().await;
+    handshake_pair(&peer, &host_eu).await;
+    handshake_pair(&peer, &host_us).await;
+
+    host_eu.tool_registry().insert(descriptor("eu_tool"));
+    host_us.tool_registry().insert(descriptor("us_tool"));
+
+    let mut eu_caps = CapabilitySet::new();
+    eu_caps = eu_caps.add_tag("region.eu");
+    let mut us_caps = CapabilitySet::new();
+    us_caps = us_caps.add_tag("region.us");
+
+    host_eu
+        .announce_capabilities(eu_caps)
+        .await
+        .expect("eu announce");
+    host_us
+        .announce_capabilities(us_caps)
+        .await
+        .expect("us announce");
+
+    // Wait for both to land in peer's fold.
+    let eu_filter = CapabilityFilter::default().require_tag("ai-tool:eu_tool");
+    let us_filter = CapabilityFilter::default().require_tag("ai-tool:us_tool");
+    assert!(
+        wait_until(
+            || {
+                peer.find_nodes_by_filter(&eu_filter)
+                    .contains(&host_eu.node_id())
+                    && peer
+                        .find_nodes_by_filter(&us_filter)
+                        .contains(&host_us.node_id())
+            },
+            Duration::from_secs(3),
+        )
+        .await,
+        "peer must see both region tools",
+    );
+
+    // Filter to EU prefix — only the EU host's tool should surface.
+    let matcher = TagMatcher::Prefix {
+        value: "region.eu".to_string(),
+    };
+    let tools = peer.list_tools(Some(&matcher));
+    let ids: Vec<&str> = tools.iter().map(|t| t.tool_id.as_str()).collect();
+    assert_eq!(ids, vec!["eu_tool"], "expected only eu_tool, got {ids:?}");
+}
+
+#[tokio::test]
+async fn list_tools_dedupes_and_aggregates_node_count() {
+    let host_a = build_node().await;
+    let host_b = build_node().await;
+    let peer = build_node().await;
+    handshake_pair(&peer, &host_a).await;
+    handshake_pair(&peer, &host_b).await;
+
+    // Both hosts publish the SAME (tool_id, version) — list_tools
+    // must dedupe and report node_count = 2.
+    host_a.tool_registry().insert(descriptor("shared_tool"));
+    host_b.tool_registry().insert(descriptor("shared_tool"));
+    host_a
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("a announce");
+    host_b
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("b announce");
+
+    let tool_filter = CapabilityFilter::default().require_tag("ai-tool:shared_tool");
+    assert!(
+        wait_until(
+            || {
+                let hits = peer.find_nodes_by_filter(&tool_filter);
+                hits.contains(&host_a.node_id()) && hits.contains(&host_b.node_id())
+            },
+            Duration::from_secs(3),
+        )
+        .await,
+        "peer must see both hosts under ai-tool:shared_tool",
+    );
+
+    let tools = peer.list_tools(None);
+    let shared = tools
+        .iter()
+        .find(|t| t.tool_id == "shared_tool")
+        .expect("shared_tool descriptor present");
+    assert_eq!(
+        shared.node_count, 2,
+        "shared tool must aggregate node_count across both hosts",
+    );
+    // Only one descriptor row even though two hosts publish — dedupe
+    // by (tool_id, version) is the load-bearing invariant.
+    let count_rows = tools.iter().filter(|t| t.tool_id == "shared_tool").count();
+    assert_eq!(count_rows, 1, "dedupe must collapse duplicates");
 }

@@ -5361,6 +5361,147 @@ impl MeshNode {
         &self.tool_registry
     }
 
+    /// Walk the capability fold for every `ToolCapability` carried
+    /// in a published `CapabilitySet`, reconstruct a [`ToolDescriptor`]
+    /// per (tool_id, version), and return the deduped list with
+    /// `node_count` filled in.
+    ///
+    /// One in-memory pass over the fold; no network. The fold is the
+    /// source-of-truth for cross-node tool discovery (substrate
+    /// announce merge in A-2a publishes `ToolCapability` + schema
+    /// metadata + the `ai-tool:<id>` tag on every announce).
+    ///
+    /// `matcher` is the standard
+    /// [`TagMatcher`](super::behavior::fold::capability_aggregation::TagMatcher)
+    /// — an entry is included if ANY of its tags match. Pass `None`
+    /// to skip pre-filtering. The classic use case is region-scoping
+    /// the discovery (`Some(TagMatcher::Prefix { value: "region.eu".into() })`).
+    ///
+    /// Schema hydration: schemas live in `CapabilitySet::metadata`
+    /// (too large for tag wire-format); the tag-decoded
+    /// `ToolCapability` carries `input_schema = None` / `output_schema = None`
+    /// until this method fills them from the membership's metadata
+    /// map using the
+    /// [`ToolCapability::input_schema_metadata_key`](super::behavior::capability::ToolCapability::input_schema_metadata_key)
+    /// / `output_schema_metadata_key` keys.
+    #[cfg(feature = "tool")]
+    pub fn list_tools(
+        &self,
+        matcher: Option<&super::behavior::fold::capability_aggregation::TagMatcher>,
+    ) -> Vec<crate::adapter::net::cortex::tool::ToolDescriptor> {
+        use std::collections::{HashMap, HashSet};
+
+        use super::behavior::tag::Tag;
+        use super::behavior::tag_codec::tools_from_tags;
+        use super::behavior::ToolCapability;
+        use crate::adapter::net::cortex::tool::ToolDescriptor;
+
+        // Validate the matcher up front — surface a structured panic
+        // here rather than burying it inside the fold walk, where the
+        // diagnostic would be one stack frame deeper. Mirrors the
+        // existing capability_aggregation contract: caller is expected
+        // to have run `TagMatcher::validate(&matcher)?` ahead of this
+        // call if the matcher is user-supplied.
+        if let Some(m) = matcher {
+            if let Err(e) = m.validate() {
+                panic!(
+                    "MeshNode::list_tools given a matcher this binary can't \
+                     evaluate: {e}",
+                );
+            }
+        }
+
+        // (tool_id, version) → (descriptor, contributing node ids).
+        // `HashSet<u64>` so a node serving the same (id, version)
+        // across multiple class entries counts once.
+        type Bucket = (ToolDescriptor, HashSet<u64>);
+        let mut buckets: HashMap<(String, String), Bucket> = HashMap::new();
+
+        self.capability_fold.with_state(|state| {
+            for ((_class, node_id), entry) in state.entries.iter() {
+                let membership = &entry.payload;
+                if let Some(matcher) = matcher {
+                    if !matcher.matches_any(&membership.tags) {
+                        continue;
+                    }
+                }
+                // Parse tags → reconstruct `Vec<ToolCapability>`.
+                // Tag::parse rejects malformed strings; we skip those.
+                let parsed_tags: Vec<Tag> = membership
+                    .tags
+                    .iter()
+                    .filter_map(|s| Tag::parse(s).ok())
+                    .collect();
+                let tools = tools_from_tags(&parsed_tags);
+                if tools.is_empty() {
+                    continue;
+                }
+                // Convert BTreeMap → HashMap once per membership so
+                // `from_capability` can index it. Cheap (string moves
+                // only; the inner schema strings stay borrowed via
+                // clone-on-write at the descriptor layer).
+                let metadata: HashMap<String, String> = membership
+                    .metadata
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                for mut cap in tools {
+                    // Hydrate schemas from metadata. The tag codec
+                    // doesn't carry them; the announce path stashes
+                    // them on `CapabilitySet::metadata` under these
+                    // keys (see `capability::CapabilitySet::add_tool`).
+                    if cap.input_schema.is_none() {
+                        if let Some(s) =
+                            metadata.get(&ToolCapability::input_schema_metadata_key(&cap.tool_id))
+                        {
+                            cap.input_schema = Some(s.clone());
+                        }
+                    }
+                    if cap.output_schema.is_none() {
+                        if let Some(s) =
+                            metadata.get(&ToolCapability::output_schema_metadata_key(&cap.tool_id))
+                        {
+                            cap.output_schema = Some(s.clone());
+                        }
+                    }
+                    let descriptor = ToolDescriptor::from_capability(&cap, &metadata);
+                    let key = (descriptor.tool_id.clone(), descriptor.version.clone());
+                    let bucket = buckets
+                        .entry(key)
+                        .or_insert_with(|| (descriptor.clone(), HashSet::new()));
+                    bucket.1.insert(*node_id);
+                    // Latest-wins on the descriptor fields (excluding
+                    // node_count, which we fill after the walk). Two
+                    // nodes serving the same (id, version) but with
+                    // diverging metadata (description text drift, tag
+                    // additions) get the latest-seen view. Equivalent
+                    // to "take whichever entry the fold walked last";
+                    // not deterministic across runs but the fields
+                    // are operator-controlled metadata, not contract.
+                    bucket.0 = descriptor;
+                }
+            }
+        });
+
+        let mut out: Vec<ToolDescriptor> = buckets
+            .into_iter()
+            .map(|(_, (mut desc, nodes))| {
+                desc.node_count = nodes.len() as u32;
+                desc
+            })
+            .collect();
+        // Stable order — agents iterating `list_tools` in a loop
+        // (re-rendering UI, comparing snapshots) should see the same
+        // shape from one call to the next when the underlying fold
+        // hasn't changed.
+        out.sort_by(|a, b| {
+            a.tool_id
+                .cmp(&b.tool_id)
+                .then(a.version.cmp(&b.version))
+        });
+        out
+    }
+
     /// Per-Mesh caller-side nRPC metrics registry. Accessor for
     /// `mesh_rpc::Mesh::call` to bump counters on each outgoing
     /// call.

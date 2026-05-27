@@ -157,6 +157,28 @@ impl TagMatcher {
         }
     }
 
+    /// True if at least one element of `tags` matches this matcher.
+    /// Same semantic the aggregation entry points use — exposed as a
+    /// public method so off-fold callers (e.g.
+    /// [`super::super::super::MeshNode::list_tools`](super::super::super::MeshNode))
+    /// can apply the same pre-grouping filter without re-implementing
+    /// the variant dispatch.
+    ///
+    /// Compiles on every call. Callers that need to evaluate a
+    /// large entry set against the same matcher should keep the
+    /// `[`Fold::aggregate`]` path, which compiles once and reuses
+    /// across the walk. `list_tools` accepts the per-call compile
+    /// cost because the fold size is small relative to the
+    /// aggregation paths' hot loops.
+    ///
+    /// **Panics** if `self` is [`Self::Regex`] and the binary was
+    /// built without the `regex` Cargo feature; same contract as
+    /// [`Fold::aggregate`]. Call [`Self::validate`] up front if the
+    /// matcher came from an untrusted source.
+    pub fn matches_any(&self, tags: &[String]) -> bool {
+        self.compile().matches_any(tags)
+    }
+
     /// Build a [`CompiledMatcher`] that pre-resolves expensive
     /// per-call work (regex compile, semver bound parse, axis-key
     /// split). Used at the top of [`Fold::aggregate`] and

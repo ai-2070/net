@@ -27,6 +27,10 @@
 //! slice A-1.
 
 #[cfg(feature = "cortex")]
+pub use net::adapter::net::behavior::fold::capability_aggregation::{
+    TagMatcher, TagMatcherError,
+};
+#[cfg(feature = "cortex")]
 pub use net::adapter::net::cortex::tool::{
     description_metadata_key, streaming_metadata_key, tags_metadata_key, ToolDescriptor,
     ToolEvent, ToolMetadataRegistry, ToolMetadataRequest, ToolMetadataResponse,
@@ -432,6 +436,27 @@ impl Mesh {
             registry,
             tool_id,
         })
+    }
+
+    /// Walk the capability fold for every published AI tool and
+    /// return one [`ToolDescriptor`] per (tool_id, version) with
+    /// `node_count` filled in. One in-memory pass; no network.
+    ///
+    /// `matcher` is the standard substrate [`TagMatcher`] — an entry
+    /// is included if ANY of its tags match. Common shapes:
+    ///
+    /// - `None` — every tool the local fold has seen.
+    /// - `Some(TagMatcher::Prefix { value: "ai-tool:".into() })` —
+    ///   "every node advertising AT LEAST ONE AI tool" (filters out
+    ///   peers that don't publish any tool but otherwise pass the
+    ///   fold).
+    /// - `Some(TagMatcher::Prefix { value: "region.eu".into() })` —
+    ///   tools served by EU-region hosts.
+    ///
+    /// Delegates to
+    /// [`net::adapter::net::MeshNode::list_tools`](net::adapter::net::MeshNode::list_tools).
+    pub fn list_tools(&self, matcher: Option<&TagMatcher>) -> Vec<ToolDescriptor> {
+        self.inner().list_tools(matcher)
     }
 
     /// Idempotent — installs the `tool.metadata.fetch` nRPC

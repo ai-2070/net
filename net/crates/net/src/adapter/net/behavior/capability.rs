@@ -2190,13 +2190,20 @@ impl CapabilityAnnouncement {
     }
 
     /// Drop every metadata key that the substrate reserves for
-    /// local use (`intent`, `colocate-with`, `priority`, `owner`,
-    /// `tool::*`, …). Call this on every announcement decoded from
-    /// an inbound peer before its metadata is consulted by greedy
+    /// local trust use (`intent`, `colocate-with`, `priority`,
+    /// `owner`). Call this on every announcement decoded from an
+    /// inbound peer before its metadata is consulted by greedy
     /// admission, placement scoring, or anything else that lets a
     /// metadata value steer substrate decisions: pre-fix a peer
     /// could stamp `intent = "high-priority-tenant-X"` on its own
     /// announcement and steer the receiver's admission to itself.
+    ///
+    /// `tool::*` keys are NOT stripped — they're peer-advertised
+    /// AI tool descriptors (schemas, descriptions, tags) that
+    /// `MeshNode::list_tools` surfaces to agents. Substrate never
+    /// makes trust decisions from them, so stripping would only
+    /// defeat cross-mesh tool discovery. See
+    /// [`schema::METADATA_RESERVED_PREFIXES`](super::schema).
     ///
     /// The schema's `metadata_reserved` doc says these keys are
     /// **writable by user code on the local node** — the local
@@ -2211,6 +2218,11 @@ impl CapabilityAnnouncement {
             if AXIS_SCHEMA.metadata_reserved.contains(&key.as_str()) {
                 return false;
             }
+            // `metadata_reserved_prefixes` is empty as of A-4 — the
+            // `tool::*` family that used to live here is intentionally
+            // peer-advertised content. See the prefix-list doc in
+            // `behavior::schema`. The retain loop is kept for forward
+            // compat if a future substrate-trust prefix needs gating.
             !AXIS_SCHEMA
                 .metadata_reserved_prefixes
                 .iter()
@@ -2554,12 +2566,18 @@ mod tests {
         super::super::super::identity::EntityId::from_bytes([0u8; 32])
     }
     /// `strip_reserved_metadata` drops every exact-match reserved
-    /// key and every key under a reserved prefix, leaves all other
-    /// keys intact. The substrate calls this on every inbound peer
-    /// announcement before downstream consumers (greedy admission,
-    /// placement scoring) read metadata, so a peer can't steer
-    /// receiver decisions by stamping `intent`, `colocate-with`,
-    /// `priority`, `owner`, or any `tool::*` key.
+    /// key (`intent`, `colocate-with`, `priority`, `owner`) and
+    /// leaves all other keys intact. The substrate calls this on
+    /// every inbound peer announcement before downstream consumers
+    /// (greedy admission, placement scoring) read metadata, so a
+    /// peer can't steer receiver decisions through the
+    /// substrate-trusted slot keys.
+    ///
+    /// A-4 update: `tool::*` keys are NOT stripped any more — they
+    /// carry peer-advertised AI tool schemas / descriptions /
+    /// tags that `MeshNode::list_tools` surfaces to agents. The
+    /// substrate never makes trust decisions from those values, so
+    /// stripping them would only defeat cross-mesh tool discovery.
     #[test]
     fn strip_reserved_metadata_drops_reserved_keys() {
         let mut ann = CapabilityAnnouncement::new(0xDEAD, test_entity(), 7, CapabilitySet::new());
@@ -2577,7 +2595,7 @@ mod tests {
             .insert("owner".into(), "attacker".into());
         ann.capabilities
             .metadata
-            .insert("tool::pwn".into(), "go-brrr".into());
+            .insert("tool::web_search::description".into(), "Search the web.".into());
         ann.capabilities
             .metadata
             .insert("app::region".into(), "us-east".into());
@@ -2591,7 +2609,15 @@ mod tests {
         assert!(!ann.capabilities.metadata.contains_key("colocate-with"));
         assert!(!ann.capabilities.metadata.contains_key("priority"));
         assert!(!ann.capabilities.metadata.contains_key("owner"));
-        assert!(!ann.capabilities.metadata.contains_key("tool::pwn"));
+        // `tool::*` keys survive — they are peer-advertised AI tool
+        // descriptor content, not substrate trust signal.
+        assert_eq!(
+            ann.capabilities
+                .metadata
+                .get("tool::web_search::description")
+                .map(String::as_str),
+            Some("Search the web."),
+        );
         // Non-reserved keys survive — substrate only filters its
         // own reserved namespace, not the caller's app namespace.
         assert_eq!(

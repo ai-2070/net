@@ -338,9 +338,26 @@ const METADATA_RESERVED_KEYS: &[&str] = &[
     "owner",
 ];
 
-/// Reserved metadata-key prefixes (e.g. `tool::<id>::input_schema`,
-/// `tool::<id>::output_schema`).
-const METADATA_RESERVED_PREFIXES: &[&str] = &["tool::"];
+/// Reserved metadata-key prefixes.
+///
+/// Empty as of A-4 — the `tool::*` family that used to live here
+/// (`tool::<id>::input_schema`, `tool::<id>::output_schema`,
+/// `tool::<id>::description`, `tool::<id>::streaming`,
+/// `tool::<id>::tags`) is intentionally peer-advertised content
+/// (AI tool descriptors agents discover via
+/// [`crate::adapter::net::MeshNode::list_tools`](crate::adapter::net::MeshNode)).
+/// Stripping them on the inbound peer-announcement path defeats
+/// cross-mesh tool discovery. Schemas / descriptions are content
+/// for the agent's reasoning prompt, not substrate trust signal —
+/// the substrate never makes admission / placement / scope decisions
+/// from these values.
+///
+/// Substrate-trusted reserved slots stay in
+/// [`METADATA_RESERVED_KEYS`] (exact-match: `intent`,
+/// `colocate-with`, `priority`, `owner`) — those steer admission /
+/// placement / scope, so a peer must not be able to publish them
+/// and influence the receiver.
+const METADATA_RESERVED_PREFIXES: &[&str] = &[];
 
 /// The canonical axis schema. Mirrors
 /// [`docs/CAPABILITIES_SCHEMA.md`](../../../../../docs/CAPABILITIES_SCHEMA.md).
