@@ -4,6 +4,16 @@
   "description": "Ergonomic TypeScript SDK for the Net mesh network",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./tool": {
+      "types": "./dist/tool.d.ts",
+      "default": "./dist/tool.js"
+    }
+  },
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
