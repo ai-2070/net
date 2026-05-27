@@ -5462,7 +5462,7 @@ impl MeshNode {
                             cap.output_schema = Some(s.clone());
                         }
                     }
-                    let descriptor = ToolDescriptor::from_capability(&cap, &metadata);
+                    let descriptor = ToolDescriptor::from_capability(&cap, metadata);
                     let key = (descriptor.tool_id.clone(), descriptor.version.clone());
                     // Latest-wins on the descriptor fields (excluding
                     // node_count, which we fill after the walk). Two
