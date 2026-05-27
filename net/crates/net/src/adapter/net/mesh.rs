@@ -1753,6 +1753,12 @@ pub struct MeshNode {
     /// AGGREGATORS panel both read through this. See
     /// [`Self::aggregator_registry`] and
     /// [`Self::set_aggregator_registry`].
+    ///
+    /// Gated on `cortex` — the registry handle types live in
+    /// `behavior::aggregator`, which only compiles when the
+    /// cortex-gated `mesh_rpc` + `cortex::rpc` surface is
+    /// available.
+    #[cfg(feature = "cortex")]
     aggregator_registry: Option<Arc<super::behavior::aggregator::AggregatorRegistry>>,
     /// Per-peer entity-id map. Keys are `node_id`; values are the
     /// 32-byte ed25519 public key carried on the peer's most recent
@@ -2147,7 +2153,10 @@ impl MeshNode {
             subnet_gateway: None,
             // Aggregator registry is installed lazily via
             // `set_aggregator_registry`; nodes that never run an
-            // aggregator never allocate the HashMap.
+            // aggregator never allocate the HashMap. Cortex-gated
+            // because the `AggregatorRegistry` type rides the
+            // cortex-only `mesh_rpc` / `cortex::rpc` surface.
+            #[cfg(feature = "cortex")]
             aggregator_registry: None,
             peer_entity_ids,
             origin_hash_to_node,
@@ -5809,6 +5818,7 @@ impl MeshNode {
     /// channel-publish initialization. The `debug_assert!` makes
     /// the constraint observable in tests; release builds carry
     /// the doc-comment contract only.
+    #[cfg(feature = "cortex")]
     pub fn set_aggregator_registry(
         &mut self,
         registry: Arc<super::behavior::aggregator::AggregatorRegistry>,
@@ -5828,6 +5838,7 @@ impl MeshNode {
     /// aggregators leave this empty — callers should treat the
     /// `None` case as "no aggregators registered" and skip
     /// rendering / acting.
+    #[cfg(feature = "cortex")]
     pub fn aggregator_registry(
         &self,
     ) -> Option<&Arc<super::behavior::aggregator::AggregatorRegistry>> {
@@ -11548,6 +11559,7 @@ mod fold_publisher_helpers_tests {
         assert_eq!(gw.dropped_count(), 0);
     }
 
+    #[cfg(feature = "cortex")]
     #[tokio::test]
     async fn aggregator_registry_is_none_until_installed() {
         // Nodes that don't run aggregators leave the registry

@@ -11,6 +11,13 @@
 //! - Proximity graph integration (PINGWAVE++)
 //! - Safety envelope enforcement
 
+// The aggregator daemon's query/registry RPC surface rides
+// the cortex-gated `mesh_rpc` + `cortex::rpc` modules (postcard
+// codec, typed_call, RpcHandler). Without cortex the imports
+// can't resolve, so the whole submodule is cortex-feature-only.
+// Out-of-tree consumers (Node / Python / Go bindings) declare
+// their `aggregator` feature on top of `cortex` already.
+#[cfg(feature = "cortex")]
 pub mod aggregator;
 pub mod api;
 pub mod bloom;

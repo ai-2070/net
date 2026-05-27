@@ -210,8 +210,10 @@ pub mod mesh;
 /// C FFI for the `aggregator.registry` RPC client + channel
 /// visibility setter. Stage 5 of `SDK_AGGREGATOR_SUBNET_PLAN.md`.
 /// Rides the `net` feature alongside `ffi::mesh` because every
-/// op needs a `MeshNodeHandle`.
-#[cfg(feature = "net")]
+/// op needs a `MeshNodeHandle`, and `cortex` because the
+/// underlying `behavior::aggregator` module's RPC surface is
+/// cortex-only (`mesh_rpc`, `cortex::rpc`, `postcard`).
+#[cfg(all(feature = "net", feature = "cortex"))]
 #[allow(missing_docs)]
 pub mod aggregator;
 
