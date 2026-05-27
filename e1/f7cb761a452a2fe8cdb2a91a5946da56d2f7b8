@@ -1,0 +1,38 @@
+.github/workflows/ci.yml
+  s_6b7db12b2ec5aa::t_a8d87f23aa7ef1 1211
+  s_6b7db12b2ec5aa::t_8540f4b4077bb3 1238
+  s_6b7db12b2ec5aa::t_c1df7461bc32bf 596
+  s_6b7db12b2ec5aa::t_9ca216b3ddf321 1256
+  s_099fa7d871e34d::t_918b91d5006497 24,68,288,337,396
+  s_6b7db12b2ec5aa::t_3c8cba8d4d2de1 915
+  s_6b7db12b2ec5aa::t_358f7e3880167d 631
+  s_6b7db12b2ec5aa::t_8bef56f6bea3f1 1175
+  s_6b7db12b2ec5aa::t_1caf2abe60ab3b 783
+  s_6b7db12b2ec5aa::t_e629d283b7ce2c 540
+  s_6b7db12b2ec5aa::t_dc72fcab73ba1f 462
+  s_6b7db12b2ec5aa::t_b77fccc36a1752 719
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "e1f7cb761a452a2fe8cdb2a91a5946da56d2f7b8",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_6b7db12b2ec5aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d4c913b8-1cda-4c52-8367-57e8f58ce833",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
