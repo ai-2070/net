@@ -25,7 +25,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal, Optional, TypedDict, Union
 
-from .mesh_rpc import ServeHandle, TypedMeshRpc
+from .mesh_rpc import AsyncTypedMeshRpc, ServeHandle, TypedMeshRpc
 
 # =============================================================================
 # Wire types — mirror of the Rust ``ToolDescriptor`` + ``ToolEvent``.
@@ -198,7 +198,7 @@ class ToolServeHandle:
 _tool_registries: Dict[int, Dict[str, Any]] = {}
 
 
-def _ensure_fetch_installed(rpc: TypedMeshRpc) -> dict:
+def _ensure_fetch_installed(rpc: Any) -> dict:
     key = id(rpc)
     entry = _tool_registries.get(key)
     if entry is not None:
@@ -760,6 +760,82 @@ class gemini:  # noqa: N801 — namespace, not a real class
         )
 
 
+async def call_tool_async(
+    rpc: AsyncTypedMeshRpc,
+    tool_id: str,
+    request: Any,
+    opts: Optional[dict] = None,
+) -> Any:
+    """Async equivalent of :func:`call_tool` for callers using the
+    ``AsyncTypedMeshRpc`` surface.
+
+    Capability-routed unary tool invocation; awaits the response
+    and decodes the typed reply. Raises an
+    :class:`net.mesh_rpc.RpcError` subclass on failure
+    (``NoRouteError`` if no host advertises ``nrpc:<tool_id>``;
+    bubbled handler errors as ``RpcServerError``).
+
+    Used by asyncio-driven agents — the dominant pattern for
+    Python LLM integrations (Anthropic SDK, OpenAI Python SDK,
+    httpx, etc. all expose async clients).
+    """
+    return await rpc.call_service(tool_id, request, opts)
+
+
+async def fetch_tool_metadata_async(
+    rpc: AsyncTypedMeshRpc,
+    host_node_id: int,
+    tool_id: str,
+    opts: Optional[dict] = None,
+) -> dict:
+    """Async equivalent of :func:`fetch_tool_metadata`. Awaits the
+    nRPC call to the auto-installed ``tool.metadata.fetch`` service
+    on the host, returns the wire-shape ``ToolMetadataResponse``
+    dict.
+    """
+    return await rpc.call(host_node_id, TOOL_METADATA_FETCH_SERVICE, {"name": tool_id}, opts)
+
+
+def serve_tool_async(
+    rpc: AsyncTypedMeshRpc,
+    options_or_descriptor: Union[ToolDescriptor, dict, str],
+    handler: Callable[[Any], Any],
+    **kwargs: Any,
+) -> ToolServeHandle:
+    """Async-rpc equivalent of :func:`serve_tool`.
+
+    Same atomic register + auto-install-fetch behavior as the sync
+    version. The ``handler`` may be either ``def handler(req) ->
+    resp`` or ``async def handler(req) -> resp`` —
+    :meth:`AsyncTypedMeshRpc.serve` detects the coroutine-function
+    case and drives the future on the substrate's tokio runtime.
+
+    ``AsyncTypedMeshRpc.serve`` itself is sync (handler-registration
+    doesn't need to be async), so this helper is `def` not `async
+    def`.
+    """
+    if isinstance(options_or_descriptor, ToolDescriptor):
+        descriptor = options_or_descriptor
+    elif isinstance(options_or_descriptor, dict):
+        opts = dict(options_or_descriptor)
+        name = opts.pop("name")
+        descriptor = descriptor_for(name, **opts)
+    elif isinstance(options_or_descriptor, str):
+        descriptor = descriptor_for(options_or_descriptor, **kwargs)
+    else:
+        raise TypeError(
+            "serve_tool_async: options_or_descriptor must be ToolDescriptor, dict, or str"
+        )
+    entry = _ensure_fetch_installed(rpc)
+    entry["registry"][descriptor.tool_id] = descriptor
+    inner = rpc.serve(descriptor.tool_id, handler)
+    return ToolServeHandle(
+        descriptor=descriptor,
+        _inner=inner,
+        _registry=entry["registry"],
+    )
+
+
 __all__ = [
     "ToolDescriptor",
     "ToolEvent",
@@ -773,7 +849,10 @@ __all__ = [
     "ToolCallParseError",
     "descriptor_for",
     "serve_tool",
+    "serve_tool_async",
     "call_tool",
+    "call_tool_async",
+    "fetch_tool_metadata_async",
     "list_tools",
     "watch_tools",
     "ToolListChange",
