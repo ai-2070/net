@@ -1,0 +1,37 @@
+net/crates/net/bindings/go/net/tool_test.go
+  s_d09daf7426cb49::t_62d821339d080d 255-256
+  s_d09daf7426cb49::t_14b4cc5fd8b6f5 279,310
+  s_d09daf7426cb49::t_4b991697ca6aa5 201-202
+go/tool_format_golden_vectors_test.go
+  s_d09daf7426cb49::t_abafbc93aadc02 208-209,212-214
+net/crates/net/bindings/go/net/tool.go
+  s_d09daf7426cb49::t_bc315823745aab 740
+  s_d09daf7426cb49::t_c586d93aa88766 627-629,631-633
+  s_d09daf7426cb49::t_2dbe5e6ded9322 702
+go/tool.go
+  s_d09daf7426cb49::t_bb1e9c2e703b5b 749-752,754-756
+  s_d09daf7426cb49::t_4f53915ebb7a51 825
+  s_d09daf7426cb49::t_80c6af61e9e587 863
+go/tool_test.go
+  s_d09daf7426cb49::t_884462d3c29b29 201-202
+  s_d09daf7426cb49::t_9cdbdc01415013 255-256
+  s_d09daf7426cb49::t_817d260a3659d1 279,310
+net/crates/net/bindings/go/net/tool_format_golden_vectors_test.go
+  s_d09daf7426cb49::t_56ae74d8e16409 206-207,210-212
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "de91a0c87fe1733261c31b548eb4ce6596b9f3a2",
+  "prompts": {},
+  "sessions": {
+    "s_d09daf7426cb49": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6f1c9611-fcfd-42e6-a7d8-db5962c1c885",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
