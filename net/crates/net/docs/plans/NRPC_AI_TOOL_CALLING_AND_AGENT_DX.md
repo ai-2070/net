@@ -84,15 +84,15 @@ Tagged `[S | A | B | C | D | M | T | X]`:
 | A-5   | H   | Rust SDK          | `MeshNode::watch_tools(matcher) -> Stream<ToolListChange>` for dynamic discovery (polling-backed) | ✅     |
 | A-6   | H   | Rust SDK          | `Mesh::call_tool<Req, Resp>` (unary) + `Mesh::call_tool_streaming<Req>` over S-1                | ✅     |
 | A-7   | M   | Rust SDK          | `#[tool]` proc macro (follow-up — runtime APIs land first)                                      | ✅     |
-| B-1   | H   | Node TS           | `tool({ name, description, schema, handle })` + Zod schema lowering                              | 🟡     |
+| B-1   | H   | Node TS           | `tool({ name, description, schema, handle })` + Zod schema lowering + auto-install of `tool.metadata.fetch` | ✅     |
 | B-2   | H   | Node TS           | `tool({ ..., stream: async function* handle() { yield … } })` — streaming via async-iter        | ⏳     |
 | B-3   | H   | Node TS           | `MeshNode.listTools({ matcher? })` + `MeshNode.watchTools({ matcher? })`                        | ✅     |
-| B-4   | H   | Node TS           | `TypedMeshRpc.callTool` + `.callToolStreaming` (capability-routed; client of `S-1`)             | 🟡     |
-| C-1   | H   | Python            | `from net.tools import tool` decorator (Pydantic-typed + plain-typing fallback)                  | 🟡     |
+| B-4   | H   | Node TS           | `TypedMeshRpc.callTool` + `.callToolStreaming` (capability-routed; client of `S-1`)             | 🟡 (unary ✅; streaming needs napi `callServiceStreaming`) |
+| C-1   | H   | Python            | `serve_tool` + `serve_tool_async` + Pydantic-typed schema lowering + auto-install of `tool.metadata.fetch` | ✅     |
 | C-2   | H   | Python            | `@tool.stream` / `async def gen(...) -> AsyncGenerator[ToolEvent, None]` streaming variant       | ⏳     |
 | C-3   | H   | Python            | `await mesh.list_tools(matcher=...)` + `async for change in mesh.watch_tools(matcher=...)`       | ✅     |
-| C-4   | H   | Python            | `AsyncTypedMeshRpc.call_tool` + `.call_tool_streaming` (capability-routed)                       | 🟡     |
-| D-1   | M   | Go                | `net.RegisterTool[Req, Resp](rpc, meta, handler)` + streaming variant                            | 🟡     |
+| C-4   | H   | Python            | `call_tool` + `call_tool_async` + `fetch_tool_metadata{,_async}` (capability-routed)             | 🟡 (unary sync + async ✅; streaming needs pyo3 `call_service_streaming`) |
+| D-1   | M   | Go                | `net.RegisterTool[Req, Resp](rpc, meta, handler)` + auto-install of `tool.metadata.fetch` + streaming variant | 🟡 (unary ✅; streaming needs CGO `call_service_streaming`) |
 | D-2   | M   | Go                | `mesh.ListTools(ctx, matcher)` + `mesh.WatchTools(ctx, matcher) <-chan ToolListChange`           | ⏳     |
 | M-1   | H   | format pkg (Py)   | `net_mesh.tools.formats.openai` — `to_openai_tool(desc)` + `lower_tool_call(call) -> CallSpec`  | ✅     |
 | M-2   | H   | format pkg (Py)   | `net_mesh.tools.formats.anthropic` — same shape; streaming via `tool_use_block_delta`           | ✅     |
@@ -108,23 +108,25 @@ Tagged `[S | A | B | C | D | M | T | X]`:
 | X-2   | H   | demo              | `examples/agents/python-hermes-tools.py` — Hermes agent via `create_net_tool_provider`; one local Python + one Go-hosted tool | ⏳     |
 | X-3   | M   | demo              | `examples/agents/node-claude-tools.ts` — TypeScript Anthropic Messages loop dispatching into Python-hosted tools | ⏳     |
 
-Legend: ✅ done · 🟡 partial (unary register + invoke + format translators shipped; streaming + discovery follow-ups need FFI extensions) · ⏳ todo.
+Legend: ✅ done · 🟡 partial (unary register + invoke + discovery + format translators + auto-install all shipped; streaming caller/server needs FFI `call_service_streaming`) · ⏳ todo.
 
 No wire ABI bump for unary tool calls. Streaming tools use `S-1`'s new `call_service_streaming` substrate primitive; the wire shape of an individual stream is unchanged from `call_streaming` today. `ToolEvent` envelopes are JSON-encoded chunks on existing streams.
 
-### Status by language (as of T-2 landing)
+### Status by language (as of auto-install + async-helpers landing)
 
 | Surface                    | Rust | Node TS | Python | Go  |
 |----------------------------|------|---------|--------|-----|
-| `serve_tool` / `call_tool` (unary) | ✅   | ✅       | ✅      | ✅  |
+| `serve_tool` / `call_tool` (unary) | ✅   | ✅       | ✅ (sync + async)      | ✅  |
 | `serve_tool_streaming`     | ✅   | ⏳       | ⏳      | ⏳  |
-| `list_tools` / `watch_tools` | ✅ | ⏳       | ⏳      | ⏳  |
+| `list_tools` / `watch_tools` | ✅ | ✅ (polling) | ✅ (polling) | ⏳ |
 | Format translators × 4     | ✅   | ✅       | ✅      | ✅  |
-| `tool.metadata.fetch`      | ✅ (auto-installed) | ⏳ | ⏳ | ⏳ |
+| `tool.metadata.fetch` (caller) | ✅ | ✅       | ✅ (sync + async)      | ✅  |
+| `tool.metadata.fetch` (server, auto-installed on first `serve_tool`) | ✅ | ✅ | ✅ | ✅ |
+| AbortSignal / cancel on `watch_tools` | ✅ | ✅ | ✅ | n/a |
 | **T-1 byte-equality fixture** | ✅ | ✅       | ✅      | ✅  |
 | **T-2 ToolEvent round-trip** | ✅ | ✅       | ✅      | ✅  |
 
-The "🟡 partial" rows in B/C/D need FFI extensions on the bindings side (napi for Node, pyo3 for Python, CGO for Go) to expose `MeshNode::tool_registry()` for atomic register, plus streaming-call and watch-task surfaces. Until those extensions land, the v1 helpers in each binding are functional for unary register + invoke + format conversion, and the canonical T-1 / T-2 fixtures enforce wire byte-equality across all four languages mechanically.
+The remaining ⏳ items — `serve_tool_streaming` everywhere outside Rust, and `list_tools`/`watch_tools` in Go — need FFI extensions on the bindings side (napi `callServiceStreaming` for Node, pyo3 `call_service_streaming` for Python, CGO `MeshNode.list_tools` + `call_service_streaming` for Go). Until those extensions land, the v1 helpers in each binding are functional for unary register + invoke + discovery (Node/Python) + format conversion, and the canonical T-1 / T-2 fixtures enforce wire byte-equality across all four languages mechanically.
 
 ### Operating contract pinned by T-1 + T-2
 
