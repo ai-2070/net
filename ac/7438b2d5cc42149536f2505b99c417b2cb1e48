@@ -1,0 +1,19 @@
+net/crates/net/docs/AGENT_TOOLS.md
+  s_099fa7d871e34d::t_796c217297c9cb 357-516
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "ac7438b2d5cc42149536f2505b99c417b2cb1e48",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
