@@ -1,0 +1,30 @@
+net/crates/net/bindings/go/rpc-ffi/src/lib.rs
+  s_099fa7d871e34d::t_c7bb3459cb30ee 3000-3164
+net/crates/net/bindings/go/net/mesh_rpc.go
+  s_099fa7d871e34d::t_148cb7c8f71dd7 2101-2106,2110
+  s_099fa7d871e34d::t_56866fcb7b96e8 308-330
+  s_099fa7d871e34d::t_67dc989fe8381a 2225-2329
+net/crates/net/bindings/go/net/tool.go
+  s_099fa7d871e34d::t_5cc307bbffa790 323-380
+net/crates/net/bindings/go/net/mesh_rpc_typed.go
+  s_099fa7d871e34d::t_079cf3a79366e5 783-804,807-814
+  s_099fa7d871e34d::t_0b2800b452a7be 805-806
+net/crates/net/include/net_rpc.h
+  s_099fa7d871e34d::t_71721170e35416 434-461
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "08117a98ab0caa0e4705562ed36028c913338644",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
