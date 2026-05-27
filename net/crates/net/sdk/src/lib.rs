@@ -68,6 +68,8 @@ pub mod redis_dedup;
 pub mod stream;
 #[cfg(feature = "testing")]
 pub mod testing;
+#[cfg(feature = "tool")]
+pub mod tool;
 
 #[cfg(feature = "redis")]
 pub use redis_dedup::RedisStreamDedup;

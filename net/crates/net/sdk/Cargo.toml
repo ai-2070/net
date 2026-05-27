@@ -32,6 +32,11 @@ tokio = { version = "1", features = ["rt", "time", "sync"] }
 pin-project-lite = "0.2"
 thiserror = "2"
 async-trait = "0.1"
+# `schemars` is gated by the `tool` feature — it powers
+# `metadata_for::<Req, Resp>(...)` which derives JSON Schema 2020-12
+# from any Rust type implementing `JsonSchema`. ~150 KiB optimized;
+# off by default.
+schemars = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
@@ -150,6 +155,16 @@ meshdb = ["net/meshdb"]
 # the per-binding `aggregator` Cargo features have a 1:1 SDK
 # counterpart to forward (`net-sdk/aggregator`).
 aggregator = ["net"]
+# AI tool-calling surface — re-exports `ToolDescriptor` /
+# `ToolEvent` / `ToolMetadataRegistry` from `net::adapter::net::cortex::tool`
+# and ships the `schemars`-backed `metadata_for::<Req, Resp>(name, desc)`
+# helper that builds descriptors from Rust types implementing
+# `JsonSchema`. Off by default — consumers who don't ship LLM agents
+# skip both `schemars` (~150 KiB on a release binary) and the SDK-side
+# tool helpers. Requires `cortex` because `ToolDescriptor` lives in
+# the cortex module + the future `MeshNode::list_tools` walks the
+# capability fold which `cortex` enables.
+tool = ["net/tool", "cortex", "dep:schemars"]
 # Testing — in-process multi-node `ClusterHarness` + bridge probes
 # (Mesh → MeshOsRuntime). Powers the deck demo and any integration
 # test that wants real UDP loopback + a real MeshOS snapshot fold
