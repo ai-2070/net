@@ -574,7 +574,13 @@ jobs:
           echo "VIRTUAL_ENV=${PWD}/.venv" >> "$GITHUB_ENV"
 
       - name: Install maturin and pytest
-        run: pip install --upgrade pip maturin pytest
+        # pytest-timeout surfaces the offending test on hangs —
+        # without it, a deadlock anywhere in the suite ticks the
+        # job-level timeout-minutes and the CI log gives no hint
+        # which test was stuck. 60 s is generous for unit/integration
+        # mesh tests on GHA; the longest legitimate test in the
+        # suite is well under that.
+        run: pip install --upgrade pip maturin pytest pytest-timeout
 
       # `net,cortex,compute,groups,meshdb,meshos,deck` mirrors the
       # Node binding's feature set for tests. `groups` is needed so
@@ -587,8 +593,15 @@ jobs:
       - name: Build and install bindings
         run: maturin develop --no-default-features --features net,cortex,compute,groups,meshdb,meshos,deck,aggregator
 
+      # `--timeout-method=thread` is critical for this FFI-heavy
+      # suite: the default `signal` method only works while Python
+      # is between bytecode instructions, so a deadlock inside a
+      # pyo3 call (or in a Rust-spawned thread we're waiting on)
+      # never gets interrupted. Thread-mode wakes a watchdog after
+      # the deadline regardless of where the test is blocked and
+      # dumps a full Python + C frame for the hung test.
       - name: Run tests
-        run: pytest -v
+        run: pytest -v --timeout=60 --timeout-method=thread
 
   sdk-py-tests:
     name: Python SDK tests (sdk-py, pytest)
