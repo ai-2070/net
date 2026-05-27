@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/cortex/mod.rs
+  s_099fa7d871e34d::t_95d1b22d30dd98 38-40
+net/crates/net/Cargo.toml
+  s_099fa7d871e34d::t_f18bc8bfb09c40 106-118
+net/crates/net/src/adapter/net/cortex/tool.rs
+  s_099fa7d871e34d::t_030e694d8c13a9 1-224,228-229,232-237,244-245,251-258,261-423
+  s_099fa7d871e34d::t_8b7c7e09e5a9d5 225-227,230-231,238-243,246-250,259-260
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "2aa83693b52a7d7a233ab1fd273a780c20117c8c",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
