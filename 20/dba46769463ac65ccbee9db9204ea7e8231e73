@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/behavior/capability.rs
+  s_c61e36cbdb3bc0::t_e79adcc26d4526 1350,1358-1376,1378-1391,1393
+net/crates/net/docs/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md
+  s_c61e36cbdb3bc0::t_f0ee41b037366e 145
+  s_c61e36cbdb3bc0::t_6d06d0cab7150c 149-200
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "20dba46769463ac65ccbee9db9204ea7e8231e73",
+  "prompts": {},
+  "sessions": {
+    "s_c61e36cbdb3bc0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5fc67c78-387a-45c1-bc03-be78dc0c2b85",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
