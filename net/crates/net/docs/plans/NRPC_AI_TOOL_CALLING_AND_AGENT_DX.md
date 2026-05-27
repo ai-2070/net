@@ -84,23 +84,23 @@ Tagged `[S | A | B | C | D | M | T | X]`:
 | A-5   | H   | Rust SDK          | `MeshNode::watch_tools(matcher) -> Stream<ToolListChange>` for dynamic discovery (polling-backed) | ✅     |
 | A-6   | H   | Rust SDK          | `Mesh::call_tool<Req, Resp>` (unary) + `Mesh::call_tool_streaming<Req>` over S-1                | ✅     |
 | A-7   | M   | Rust SDK          | `#[tool]` proc macro (follow-up — runtime APIs land first)                                      | ⏳     |
-| B-1   | H   | Node TS           | `tool({ name, description, schema, handle })` + Zod schema lowering                              | ⏳     |
+| B-1   | H   | Node TS           | `tool({ name, description, schema, handle })` + Zod schema lowering                              | 🟡     |
 | B-2   | H   | Node TS           | `tool({ ..., stream: async function* handle() { yield … } })` — streaming via async-iter        | ⏳     |
 | B-3   | H   | Node TS           | `MeshNode.listTools({ matcher? })` + `MeshNode.watchTools({ matcher? })`                        | ⏳     |
-| B-4   | H   | Node TS           | `TypedMeshRpc.callTool` + `.callToolStreaming` (capability-routed; client of `S-1`)             | ⏳     |
-| C-1   | H   | Python            | `from net.tools import tool` decorator (Pydantic-typed + plain-typing fallback)                  | ⏳     |
+| B-4   | H   | Node TS           | `TypedMeshRpc.callTool` + `.callToolStreaming` (capability-routed; client of `S-1`)             | 🟡     |
+| C-1   | H   | Python            | `from net.tools import tool` decorator (Pydantic-typed + plain-typing fallback)                  | 🟡     |
 | C-2   | H   | Python            | `@tool.stream` / `async def gen(...) -> AsyncGenerator[ToolEvent, None]` streaming variant       | ⏳     |
 | C-3   | H   | Python            | `await mesh.list_tools(matcher=...)` + `async for change in mesh.watch_tools(matcher=...)`       | ⏳     |
-| C-4   | H   | Python            | `AsyncTypedMeshRpc.call_tool` + `.call_tool_streaming` (capability-routed)                       | ⏳     |
-| D-1   | M   | Go                | `net.RegisterTool[Req, Resp](rpc, meta, handler)` + streaming variant                            | ⏳     |
+| C-4   | H   | Python            | `AsyncTypedMeshRpc.call_tool` + `.call_tool_streaming` (capability-routed)                       | 🟡     |
+| D-1   | M   | Go                | `net.RegisterTool[Req, Resp](rpc, meta, handler)` + streaming variant                            | 🟡     |
 | D-2   | M   | Go                | `mesh.ListTools(ctx, matcher)` + `mesh.WatchTools(ctx, matcher) <-chan ToolListChange`           | ⏳     |
-| M-1   | H   | format pkg (Py)   | `net_mesh.tools.formats.openai` — `to_openai_tool(desc)` + `lower_tool_call(call) -> CallSpec`  | ⏳     |
-| M-2   | H   | format pkg (Py)   | `net_mesh.tools.formats.anthropic` — same shape; streaming via `tool_use_block_delta`           | ⏳     |
+| M-1   | H   | format pkg (Py)   | `net_mesh.tools.formats.openai` — `to_openai_tool(desc)` + `lower_tool_call(call) -> CallSpec`  | ✅     |
+| M-2   | H   | format pkg (Py)   | `net_mesh.tools.formats.anthropic` — same shape; streaming via `tool_use_block_delta`           | ✅     |
 | M-3   | H   | format pkg (Py)   | `net_mesh.tools.formats.hermes` — `create_net_tool_provider(mesh, matcher?)` + `list_tools` / `watch_tools` wiring into Hermes's tool-provider contract | ⏳     |
-| M-4   | M   | format pkg (Py)   | `net_mesh.tools.formats.{gemini,mcp}` — same pattern as M-1 / M-2                               | ⏳     |
-| M-5   | H   | format pkg (TS)   | `@net-mesh/tools/formats/{openai,anthropic,gemini,mcp}` — TS mirror per submodule               | ⏳     |
-| T-1   | H   | cross-lang tests  | Python agent (M-1) calls Go-hosted tool (D-1) — schema fidelity + golden vector + result match  | ⏳     |
-| T-2   | H   | streaming test    | `ToolEvent` envelope round-trip: server emits `start/progress/delta/result`; client decodes     | ⏳     |
+| M-4   | M   | format pkg (Py)   | `net_mesh.tools.formats.{gemini,mcp}` — same pattern as M-1 / M-2                               | ✅     |
+| M-5   | H   | format pkg (TS)   | `@net-mesh/tools/formats/{openai,anthropic,gemini,mcp}` — TS mirror per submodule               | ✅     |
+| T-1   | H   | cross-lang tests  | Python agent (M-1) calls Go-hosted tool (D-1) — schema fidelity + golden vector + result match  | ✅     |
+| T-2   | H   | streaming test    | `ToolEvent` envelope round-trip: server emits `start/progress/delta/result`; client decodes     | ✅     |
 | T-3   | M   | discovery test    | TagMatcher filter: `list_tools(matcher=Prefix("region.eu"))` excludes US-region hosts            | ⏳     |
 | T-4   | M   | watch test        | Dynamic-discovery: `watch_tools` emits `Added` / `Removed` when a host registers + drops a tool | ⏳     |
 | T-5   | L   | cancellation test | `client.cancel()` mid-tool propagates substrate CANCEL; tool observes `Cancelled` status        | ⏳     |
@@ -108,7 +108,29 @@ Tagged `[S | A | B | C | D | M | T | X]`:
 | X-2   | H   | demo              | `examples/agents/python-hermes-tools.py` — Hermes agent via `create_net_tool_provider`; one local Python + one Go-hosted tool | ⏳     |
 | X-3   | M   | demo              | `examples/agents/node-claude-tools.ts` — TypeScript Anthropic Messages loop dispatching into Python-hosted tools | ⏳     |
 
+Legend: ✅ done · 🟡 partial (unary register + invoke + format translators shipped; streaming + discovery follow-ups need FFI extensions) · ⏳ todo.
+
 No wire ABI bump for unary tool calls. Streaming tools use `S-1`'s new `call_service_streaming` substrate primitive; the wire shape of an individual stream is unchanged from `call_streaming` today. `ToolEvent` envelopes are JSON-encoded chunks on existing streams.
+
+### Status by language (as of T-2 landing)
+
+| Surface                    | Rust | Node TS | Python | Go  |
+|----------------------------|------|---------|--------|-----|
+| `serve_tool` / `call_tool` (unary) | ✅   | ✅       | ✅      | ✅  |
+| `serve_tool_streaming`     | ✅   | ⏳       | ⏳      | ⏳  |
+| `list_tools` / `watch_tools` | ✅ | ⏳       | ⏳      | ⏳  |
+| Format translators × 4     | ✅   | ✅       | ✅      | ✅  |
+| `tool.metadata.fetch`      | ✅ (auto-installed) | ⏳ | ⏳ | ⏳ |
+| **T-1 byte-equality fixture** | ✅ | ✅       | ✅      | ✅  |
+| **T-2 ToolEvent round-trip** | ✅ | ✅       | ✅      | ✅  |
+
+The "🟡 partial" rows in B/C/D need FFI extensions on the bindings side (napi for Node, pyo3 for Python, CGO for Go) to expose `MeshNode::tool_registry()` for atomic register, plus streaming-call and watch-task surfaces. Until those extensions land, the v1 helpers in each binding are functional for unary register + invoke + format conversion, and the canonical T-1 / T-2 fixtures enforce wire byte-equality across all four languages mechanically.
+
+### Operating contract pinned by T-1 + T-2
+
+- Format translators (`to_<provider>_tool`, `lower_<provider>_tool_call`) are byte-equal across Rust / Node / Python / Go for all four providers. Adding a new descriptor, lower case, or error case in
+  `tests/cross_lang_tool_formats/golden_vectors.json` means updating all four verifiers in lockstep — drift surfaces as CI failure, not a runtime surprise.
+- `ToolEvent` JSON tag-form (`{"type": "start", ...}`) deserializes + re-serializes byte-equal across all four languages for every variant + every optional-field combination listed in `tests/cross_lang_tool_formats/tool_event_vectors.json`. The synthesized `Error { code: "missing_terminal", ... }` shape is part of the fixture so adapters can match on the code reliably.
 
 ---
 
