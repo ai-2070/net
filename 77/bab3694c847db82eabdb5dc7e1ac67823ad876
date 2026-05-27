@@ -1,0 +1,23 @@
+.github/workflows/ci.yml
+  s_099fa7d871e34d::t_7ec6d96d253b37 604-606,620
+net/crates/net/bindings/python/src/mesh_rpc.rs
+  s_099fa7d871e34d::t_a2f56f269473ab 804-816
+  s_099fa7d871e34d::t_182ba16f84f991 891-903
+  s_099fa7d871e34d::t_57d056fcf68ecf 1887-1899
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "77bab3694c847db82eabdb5dc7e1ac67823ad876",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
