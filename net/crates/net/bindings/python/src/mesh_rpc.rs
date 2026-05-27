@@ -801,7 +801,19 @@ impl RpcClientStreamingHandler for PyAsyncRpcClientStreamingHandler {
                 };
             }
         };
-        let timeout_result = tokio::time::timeout(self.timeout, fut).await;
+        // Race against `ctx.cancellation` so a caller-side CANCEL
+        // drops the dispatched Python coroutine — same rationale as
+        // `PyAsyncRpcHandler::call`. The substrate's CANCEL-wins
+        // ordering still owns the response-status mapping.
+        let timeout_result = tokio::select! {
+            biased;
+            _ = ctx.cancellation.cancelled() => {
+                return Err(RpcHandlerError::Internal(
+                    "cancelled by caller".to_string(),
+                ));
+            }
+            r = tokio::time::timeout(self.timeout, fut) => r,
+        };
         let py_result = match timeout_result {
             Ok(r) => r,
             Err(_) => {
@@ -876,7 +888,19 @@ impl RpcDuplexHandler for PyAsyncRpcDuplexHandler {
                 };
             }
         };
-        let timeout_result = tokio::time::timeout(self.timeout, fut).await;
+        // Race against `ctx.cancellation` so a caller-side CANCEL
+        // drops the dispatched Python coroutine — same rationale as
+        // `PyAsyncRpcHandler::call`. The substrate's CANCEL-wins
+        // ordering still owns the response-status mapping.
+        let timeout_result = tokio::select! {
+            biased;
+            _ = ctx.cancellation.cancelled() => {
+                return Err(RpcHandlerError::Internal(
+                    "cancelled by caller".to_string(),
+                ));
+            }
+            r = tokio::time::timeout(self.timeout, fut) => r,
+        };
         let py_result = match timeout_result {
             Ok(r) => r,
             Err(_) => {
@@ -1860,7 +1884,19 @@ impl RpcStreamingHandler for PyAsyncRpcStreamingHandler {
                 };
             }
         };
-        let timeout_result = tokio::time::timeout(self.timeout, fut).await;
+        // Race against `ctx.cancellation` so a caller-side CANCEL
+        // drops the dispatched Python coroutine — same rationale as
+        // `PyAsyncRpcHandler::call`. The substrate's CANCEL-wins
+        // ordering still owns the response-status mapping.
+        let timeout_result = tokio::select! {
+            biased;
+            _ = ctx.cancellation.cancelled() => {
+                return Err(RpcHandlerError::Internal(
+                    "cancelled by caller".to_string(),
+                ));
+            }
+            r = tokio::time::timeout(self.timeout, fut) => r,
+        };
         let py_result = match timeout_result {
             Ok(r) => r,
             Err(_) => {
