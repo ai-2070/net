@@ -402,11 +402,19 @@ const resp = await callTool(rpc, spec.name, JSON.parse(spec.argumentsJson))
 // On-demand full schema (when fold dropped it under size budget):
 const meta = await fetchToolMetadata(rpc, hostNodeId, 'web_search')
 if (meta.type === 'found') { /* meta.descriptor.inputSchema is parseable */ }
+
+// Streaming tool invocation — capability-routed, drains ToolEvents.
+// The wrapper synthesizes a `missing_terminal` error envelope if the
+// host's handler exits without a result/error (matches T-2).
+for await (const event of callToolStreaming(rpc, 'web_search', { query: '...' })) {
+  if (event.type === 'delta')    { /* event.data is the partial result */ }
+  if (event.type === 'progress') { /* event.pct, event.message */ }
+  if (event.type === 'result' || event.type === 'error') break
+}
 ```
 
-Streaming (`serveToolStreaming` / `callToolStreaming`) is deferred
-to a follow-up; it needs the streaming-FFI extensions in the napi
-binding.
+Streaming server-side (`serveToolStreaming`) is deferred — see the
+plan's "Deferred follow-ups" section.
 
 ### Python (`net-mesh`)
 
@@ -448,11 +456,27 @@ resp = call_tool(rpc, spec.name, json.loads(spec.arguments_json))
 # On-demand metadata fetch.
 meta = fetch_tool_metadata(rpc, host_node_id, "web_search")
 if meta["type"] == "found": ...  # meta["descriptor"]
+
+# Streaming tool invocation — sync (returns an iterator of dicts).
+from net.tool import call_tool_streaming
+for event in call_tool_streaming(rpc, "web_search", {"query": "..."}):
+    if event["type"] == "delta": ...
+    if event["type"] in ("result", "error"): break
+
+# Async equivalent for AsyncTypedMeshRpc callers.
+from net.tool import call_tool_streaming_async
+async for event in call_tool_streaming_async(arpc, "web_search", {"query": "..."}):
+    if event["type"] == "delta": ...
+    if event["type"] in ("result", "error"): break
 ```
 
 Pydantic models work seamlessly — pass `MyModel.model_json_schema()`
 as the `input_schema` and the handler receives a dict that you
-deserialize with `MyModel.model_validate(req)`.
+deserialize with `MyModel.model_validate(req)`. Asyncio callers
+should use `serve_tool_async` + `call_tool_async` from
+`net.tool` (they accept `AsyncTypedMeshRpc` and route async
+handlers through the substrate's tokio runtime via the
+async-bridge).
 
 ### Go (`github.com/ai-2070/net/go`)
 
@@ -491,12 +515,47 @@ resp, _ := net.CallTool[WebSearchReq, WebSearchResp](
 // On-demand metadata fetch.
 meta, _ := net.FetchToolMetadata(context.Background(), rpc, hostNodeID, "web_search")
 if meta.Type == "found" { /* meta.Descriptor */ }
+
+// Discovery (local fold).
+tools, _ := net.ListTools(rpc)
+for _, t := range tools { fmt.Println(t.ToolID, t.NodeCount) }
+
+// Dynamic watch via polling (1s default; ctx-cancel ends the loop).
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+changes, errs, baseline, _ := net.WatchTools(ctx, rpc, net.WatchOptions{})
+go func() {
+    for change := range changes {
+        switch change.Type {
+        case "added":              fmt.Println("+", change.ToolID, change.Version)
+        case "removed":            fmt.Println("-", change.ToolID, change.Version)
+        case "node_count_changed": fmt.Println("~", change.ToolID, change.NewCount)
+        }
+    }
+}()
+// drain errs separately if you care about transient poll failures
+_ = baseline
+
+// Streaming tool invocation — capability-routed; iterates ToolEvents.
+stream, _ := net.CallToolStreaming[WebSearchReq](
+    context.Background(), rpc, "web_search", WebSearchReq{Query: "..."},
+)
+defer stream.Close()
+for {
+    event, ok, err := stream.Recv()
+    if err != nil  { /* handle */ break }
+    if !ok          { break }
+    if event.IsTerminal() { break }
+    // event.Type == "delta" / "progress" / "start" — render incrementally
+}
 ```
 
-Go's `ListTools` / `WatchTools` are deferred — the Go binding's
-upstream CGO surface needs a `list_tools` ABI export first.
-Format translators + register + invoke + fetch_tool_metadata are
-all shipped today.
+Streaming server-side ergonomics (`RegisterStreamingTool`) are
+deferred — see the plan's "Deferred follow-ups" section. Until
+that lands, handlers that need to emit a stream should drive the
+substrate's `serve_rpc_streaming` directly and encode `ToolEvent`
+envelopes manually (the JSON shape is documented in the Streaming
+section above).
 
 ### Provider format coverage
 
