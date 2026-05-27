@@ -73,16 +73,16 @@ Tagged `[S | A | B | C | D | M | T | X]`:
 
 | ID    | Pri | Area              | Title                                                                                          | Status |
 |-------|-----|-------------------|------------------------------------------------------------------------------------------------|--------|
-| S-1   | H   | substrate         | `call_service_streaming` — mirror of `call_service` returning `RpcStream` (capability-routed + auth-gated)  | ⏳     |
-| S-2   | H   | substrate         | `ToolCapability` fold integration: `serve_tool` publishes via the existing capability fold       | ⏳     |
-| S-3   | M   | substrate         | `tool.metadata.fetch(name)` RPC — on-demand pull for schemas too large for the fold              | ⏳     |
-| S-4   | H   | substrate         | `[features] tool = []` on `net-mesh` + optional `tool.rs` module + `ToolEvent` wire type        | ⏳     |
-| A-1   | H   | Rust SDK          | `net_sdk::tool::{ToolDescriptor, ToolEvent}` + `schemars` schema derivation helper              | ⏳     |
-| A-2   | H   | Rust SDK          | `TypedMeshRpc::serve_tool<Req, Resp>` (unary) + atomic 4-step register/Drop                     | ⏳     |
-| A-3   | H   | Rust SDK          | `TypedMeshRpc::serve_tool_streaming<Req, Resp>` — handler returns `Stream<ToolEvent>`           | ⏳     |
-| A-4   | H   | Rust SDK          | `MeshNode::list_tools(matcher)` returning `Vec<ToolDescriptor>` via capability-fold walk        | ⏳     |
-| A-5   | H   | Rust SDK          | `MeshNode::watch_tools(matcher) -> Stream<ToolListChange>` for dynamic discovery                | ⏳     |
-| A-6   | H   | Rust SDK          | `TypedMeshRpc::call_tool<Req, Resp>` (unary) + `::call_tool_streaming<Req, Resp>` over `S-1`    | ⏳     |
+| S-1   | H   | substrate         | `call_service_streaming` — mirror of `call_service` returning `RpcStream` (capability-routed + auth-gated)  | ✅     |
+| S-2   | H   | substrate         | `ToolCapability` fold integration: `serve_tool` publishes via the existing capability fold       | ✅     |
+| S-3   | M   | substrate         | `tool.metadata.fetch(name)` RPC — on-demand pull for schemas too large for the fold              | ✅     |
+| S-4   | H   | substrate         | `[features] tool = []` on `net-mesh` + optional `tool.rs` module + `ToolEvent` wire type        | ✅     |
+| A-1   | H   | Rust SDK          | `net_sdk::tool::{ToolDescriptor, ToolEvent}` + `schemars` schema derivation helper              | ✅     |
+| A-2   | H   | Rust SDK          | `Mesh::serve_tool<Req, Resp>` (unary) + atomic register/Drop + tool_registry + `tool.metadata.fetch` lazy install | ✅     |
+| A-3   | H   | Rust SDK          | `Mesh::serve_tool_streaming<Req, Resp>` — handler returns `Stream<ToolEvent>` + `missing_terminal` synthesis | ✅     |
+| A-4   | H   | Rust SDK          | `MeshNode::list_tools(matcher)` + `Mesh::list_tools` via capability-fold walk + `tool::*` metadata pass-through | ✅     |
+| A-5   | H   | Rust SDK          | `MeshNode::watch_tools(matcher) -> Stream<ToolListChange>` for dynamic discovery (polling-backed) | ✅     |
+| A-6   | H   | Rust SDK          | `Mesh::call_tool<Req, Resp>` (unary) + `Mesh::call_tool_streaming<Req>` over S-1                | ✅     |
 | A-7   | M   | Rust SDK          | `#[tool]` proc macro (follow-up — runtime APIs land first)                                      | ⏳     |
 | B-1   | H   | Node TS           | `tool({ name, description, schema, handle })` + Zod schema lowering                              | ⏳     |
 | B-2   | H   | Node TS           | `tool({ ..., stream: async function* handle() { yield … } })` — streaming via async-iter        | ⏳     |
@@ -104,7 +104,7 @@ Tagged `[S | A | B | C | D | M | T | X]`:
 | T-3   | M   | discovery test    | TagMatcher filter: `list_tools(matcher=Prefix("region.eu"))` excludes US-region hosts            | ⏳     |
 | T-4   | M   | watch test        | Dynamic-discovery: `watch_tools` emits `Added` / `Removed` when a host registers + drops a tool | ⏳     |
 | T-5   | L   | cancellation test | `client.cancel()` mid-tool propagates substrate CANCEL; tool observes `Cancelled` status        | ⏳     |
-| X-1   | H   | docs              | `docs/AGENT_TOOLS.md` — quickstart + decorator + discovery + format translators + envelope spec | ⏳     |
+| X-1   | H   | docs              | `docs/AGENT_TOOLS.md` — quickstart + decorator + discovery + format translators + envelope spec | ✅     |
 | X-2   | H   | demo              | `examples/agents/python-hermes-tools.py` — Hermes agent via `create_net_tool_provider`; one local Python + one Go-hosted tool | ⏳     |
 | X-3   | M   | demo              | `examples/agents/node-claude-tools.ts` — TypeScript Anthropic Messages loop dispatching into Python-hosted tools | ⏳     |
 
