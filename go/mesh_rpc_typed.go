@@ -101,8 +101,12 @@ extern void net_rpc_response_free(uint8_t* ptr, size_t len);
 
 // Go-side trampoline that bridges from C → Go. Declared here so the
 // cgo prelude can take its address when registering the dispatcher;
-// the definition is the //export below.
-extern void go_net_rpc_observer_trampoline(const RpcCallEventC* evt);
+// the definition is the //export below. The pointer parameter is
+// declared *without* `const` because cgo's auto-generated header
+// from the //export pragma drops C const qualifiers — keeping
+// `const` here would produce a `conflicting types` diag when
+// `_cgo_export.c` is compiled alongside this prelude.
+extern void go_net_rpc_observer_trampoline(RpcCallEventC* evt);
 */
 import "C"
 

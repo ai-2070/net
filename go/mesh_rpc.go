@@ -249,10 +249,14 @@ extern void net_rpc_duplex_stream_free(DuplexStreamHandleC* handle);
 
 // Trampoline that Rust calls back through. Defined below as a Go
 // `//export` function and registered via
-// `net_rpc_set_handler_dispatcher` during package init.
+// `net_rpc_set_handler_dispatcher` during package init. cgo's
+// auto-generated header from the //export pragma drops C `const`
+// qualifiers (Go has no const), so this forward declaration must
+// match the unqualified shape to avoid a `conflicting types` diag
+// when both this prelude and `_cgo_export.c` are compiled.
 int go_net_rpc_handler_trampoline(
     uint64_t handler_id,
-    const uint8_t* req_ptr,
+    uint8_t* req_ptr,
     size_t req_len,
     uint8_t** out_resp_ptr,
     size_t* out_resp_len,
@@ -306,9 +310,11 @@ extern ServeHandleC* net_rpc_serve_streaming(
     uint64_t handler_timeout_ms,
     char** out_err);
 // Go-side trampoline registered by registerStreamingDispatcher.
+// Drop `const uint8_t*` to `uint8_t*` for the same reason as the
+// handler trampoline above — cgo's //export header drops const.
 extern int go_net_rpc_streaming_trampoline(
     uint64_t handler_id,
-    const uint8_t* req_ptr, size_t req_len,
+    uint8_t* req_ptr, size_t req_len,
     RpcResponseSinkHandleC* response_sink,
     char** out_err);
 
