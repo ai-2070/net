@@ -855,9 +855,11 @@ func goMeshOsProcessTrampoline(
 	if d == nil {
 		return C.int(1)
 	}
-	var payload []byte
-	if payloadLen > 0 && payloadPtr != nil {
-		payload = C.GoBytes(unsafe.Pointer(payloadPtr), C.int(payloadLen))
+	// `goBytesChecked` rejects an oversized inbound payload length
+	// rather than truncating it via the 32-bit C.int cast.
+	payload, okLen := goBytesChecked(payloadPtr, payloadLen)
+	if !okLen {
+		return C.int(1)
 	}
 	event := MeshOsCausalEvent{
 		OriginHash: uint64(originHash),
@@ -916,9 +918,9 @@ func goMeshOsRestoreTrampoline(
 	if d == nil {
 		return C.int(1)
 	}
-	var state []byte
-	if payloadLen > 0 && payloadPtr != nil {
-		state = C.GoBytes(unsafe.Pointer(payloadPtr), C.int(payloadLen))
+	state, okLen := goBytesChecked(payloadPtr, payloadLen)
+	if !okLen {
+		return C.int(1)
 	}
 	if err := d.Restore(state); err != nil {
 		return C.int(1)
