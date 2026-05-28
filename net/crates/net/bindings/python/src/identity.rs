@@ -52,6 +52,7 @@ pub(crate) fn token_error_kind(e: &CoreTokenError) -> &'static str {
         CoreTokenError::InvalidFormat => "invalid_format",
         CoreTokenError::ReadOnly => "read_only",
         CoreTokenError::ZeroTtl => "zero_ttl",
+        CoreTokenError::TtlTooLong => "ttl_too_long",
     }
 }
 

@@ -55,6 +55,7 @@ fn token_error_kind(e: &TokenError) -> &'static str {
         TokenError::InvalidFormat => "invalid_format",
         TokenError::ReadOnly => "read_only",
         TokenError::ZeroTtl => "zero_ttl",
+        TokenError::TtlTooLong => "ttl_too_long",
     }
 }
 
