@@ -161,3 +161,15 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # PEP 740 attestations sign each wheel via sigstore and
+          # upload the entry to rekor.sigstore.dev. That public
+          # transparency log is an external dependency outside our
+          # control; when it 502s / drops the connection mid-request
+          # it blocks the whole release even though the wheels and
+          # the Trusted-Publishing (OIDC) path are fine. Disabled so
+          # a Rekor outage can't gate a release. Re-enable
+          # (`attestations: true`, the action default) once sigstore
+          # reliability is no longer a release risk — Trusted
+          # Publishing via `id-token: write` is unaffected either way.
+          attestations: false
