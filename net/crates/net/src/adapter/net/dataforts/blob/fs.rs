@@ -132,6 +132,40 @@ impl FileSystemAdapter {
         let shard = &hex[..2];
         self.root.join(shard).join(&hex)
     }
+
+    /// Resolve `path`'s symlinks and confirm it stays within `root`
+    /// before a read follows it.
+    ///
+    /// `store` already canonicalizes the parent on writes; the read
+    /// paths (`fetch` / `fetch_range` / `exists` / `fetch_stream`)
+    /// previously opened `path_for(hash)` directly, so a cross-process
+    /// writer who swapped `<root>/<shard>` or the blob file for a
+    /// symlink pointing outside `root` could redirect a read and
+    /// exfiltrate an arbitrary file (security audit L3). Canonicalizing
+    /// and checking containment closes the static-symlink case on
+    /// reads, mirroring the write side. This is defense-in-depth, not a
+    /// full sandbox — a post-canonicalize swap still races the open;
+    /// complete confinement needs `openat2(RESOLVE_BENEATH)` and is
+    /// out of scope here (see the type-level threat-model docs).
+    ///
+    /// Returns `Ok(true)` when the target exists and resolves inside
+    /// `root`, `Ok(false)` when it does not exist, and `Err` on an IO
+    /// error or when the resolved path escapes `root`. Must be called
+    /// from a blocking context (it issues `canonicalize` syscalls).
+    fn path_within_root(path: &Path, root: &Path) -> Result<bool, BlobError> {
+        let canon = match std::fs::canonicalize(path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(backend(e)),
+        };
+        let root_canon = std::fs::canonicalize(root).map_err(backend)?;
+        if !canon.starts_with(&root_canon) {
+            return Err(BlobError::Backend(
+                "fs adapter: resolved blob path escapes adapter root".to_string(),
+            ));
+        }
+        Ok(true)
+    }
 }
 
 fn backend(e: impl std::fmt::Display) -> BlobError {
@@ -324,6 +358,7 @@ impl BlobAdapter for FileSystemAdapter {
     async fn fetch(&self, blob_ref: &BlobRef) -> Result<Bytes, BlobError> {
         let (hash, uri) = expect_small(blob_ref)?;
         let path = self.path_for(&hash);
+        let root = self.root.clone();
         let uri = sanitize_uri_for_error(uri);
         let _permit = self
             .concurrency
@@ -333,6 +368,10 @@ impl BlobAdapter for FileSystemAdapter {
             .map_err(|_| backend("adapter concurrency semaphore closed"))?;
         tokio::task::spawn_blocking(move || -> Result<Bytes, BlobError> {
             let _permit = _permit;
+            // Reject a symlink-escape before following the path (L3).
+            if !Self::path_within_root(&path, &root)? {
+                return Err(BlobError::NotFound(uri));
+            }
             match std::fs::read(&path) {
                 Ok(bytes) => Ok(Bytes::from(bytes)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(BlobError::NotFound(uri)),
@@ -367,6 +406,7 @@ impl BlobAdapter for FileSystemAdapter {
         }
         let (hash, uri) = expect_small(blob_ref)?;
         let path = self.path_for(&hash);
+        let root = self.root.clone();
         let uri = sanitize_uri_for_error(uri);
         let start = range.start;
         let _permit = self
@@ -377,6 +417,10 @@ impl BlobAdapter for FileSystemAdapter {
             .map_err(|_| backend("adapter concurrency semaphore closed"))?;
         tokio::task::spawn_blocking(move || -> Result<Bytes, BlobError> {
             let _permit = _permit;
+            // Reject a symlink-escape before following the path (L3).
+            if !Self::path_within_root(&path, &root)? {
+                return Err(BlobError::NotFound(uri));
+            }
             let mut f = match std::fs::File::open(&path) {
                 Ok(f) => f,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -396,6 +440,7 @@ impl BlobAdapter for FileSystemAdapter {
     async fn exists(&self, blob_ref: &BlobRef) -> Result<bool, BlobError> {
         let (hash, _uri) = expect_small(blob_ref)?;
         let path = self.path_for(&hash);
+        let root = self.root.clone();
         let permit = self
             .concurrency
             .clone()
@@ -404,10 +449,12 @@ impl BlobAdapter for FileSystemAdapter {
             .map_err(|_| backend("adapter concurrency semaphore closed"))?;
         let res = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            Path::new(&path).is_file()
+            // Only report present if it resolves inside root (L3) —
+            // a symlink pointing outside is not a legitimate blob.
+            Self::path_within_root(&path, &root)
         })
         .await
-        .map_err(|e| backend(format!("join error: {}", e)))?;
+        .map_err(|e| backend(format!("join error: {}", e)))??;
         Ok(res)
     }
 
@@ -420,6 +467,7 @@ impl BlobAdapter for FileSystemAdapter {
         // on the producer side.
         let (hash, uri) = expect_small(blob_ref)?;
         let path = self.path_for(&hash);
+        let root = self.root.clone();
         let uri = sanitize_uri_for_error(uri);
         // Acquire-on-spawn: the streaming task holds the permit for
         // the duration of the read, mirroring the all-in-memory
@@ -435,6 +483,18 @@ impl BlobAdapter for FileSystemAdapter {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BlobError>>(4);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            // Reject a symlink-escape before following the path (L3).
+            match Self::path_within_root(&path, &root) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = tx.blocking_send(Err(BlobError::NotFound(uri)));
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    return;
+                }
+            }
             let mut f = match std::fs::File::open(&path) {
                 Ok(f) => f,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -789,6 +849,90 @@ mod tests {
             "adapter wrote outside its root: {:?}",
             outside_contents
         );
+        cleanup(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// Security audit L3: the read paths must not follow a blob-file
+    /// symlink that points outside the adapter root. Pre-fix `fetch` /
+    /// `exists` opened `path_for(hash)` directly, so a cross-process
+    /// writer who replaced the blob file with a symlink to an arbitrary
+    /// file could exfiltrate it. The `path_within_root` guard rejects
+    /// the escape before the read follows the link.
+    #[tokio::test]
+    async fn read_paths_reject_blob_file_symlink_escape() {
+        use futures::StreamExt;
+
+        let root = unique_root();
+        // A secret file outside the adapter root.
+        let outside = root.parent().unwrap().join(format!(
+            "secret-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        let secret_path = outside.join("secret.txt");
+        std::fs::write(&secret_path, b"TOP SECRET - must not leak").unwrap();
+
+        // Plant the blob's on-disk path as a symlink to the secret.
+        let payload = b"legit-content";
+        let hash: [u8; 32] = blake3::hash(payload).into();
+        let shard = format!("{:02x}", hash[0]);
+        let mut hex = String::new();
+        for b in &hash {
+            use std::fmt::Write;
+            let _ = write!(hex, "{:02x}", b);
+        }
+        let shard_dir = root.join(&shard);
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let blob_path = shard_dir.join(&hex);
+        std::os::unix::fs::symlink(&secret_path, &blob_path).unwrap();
+
+        let adapter = FileSystemAdapter::new("fs-read-symlink", &root);
+        let blob = BlobRef::small("file:///escape", hash, payload.len() as u64);
+
+        // fetch must NOT return the secret bytes.
+        match adapter.fetch(&blob).await {
+            Err(BlobError::Backend(msg)) => {
+                assert!(msg.contains("escapes"), "expected escape rejection, got {msg}")
+            }
+            Err(BlobError::NotFound(_)) => {} // also acceptable: deny without leak
+            Ok(bytes) => panic!(
+                "fetch followed symlink and leaked out-of-root content: {:?}",
+                bytes
+            ),
+            Err(other) => panic!("unexpected error: {:?}", other),
+        }
+
+        // exists must not report a symlink-to-outside as present.
+        match adapter.exists(&blob).await {
+            Err(BlobError::Backend(msg)) => {
+                assert!(msg.contains("escapes"), "expected escape rejection, got {msg}")
+            }
+            Ok(false) => {}
+            Ok(true) => panic!("exists reported an out-of-root symlink as present"),
+            Err(other) => panic!("unexpected error: {:?}", other),
+        }
+
+        // fetch_stream must not stream the secret bytes.
+        let mut stream = adapter.fetch_stream(&blob).await.unwrap();
+        let mut leaked = Vec::new();
+        let mut errored = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(b) => leaked.extend_from_slice(&b),
+                Err(_) => errored = true,
+            }
+        }
+        assert!(
+            errored && leaked.is_empty(),
+            "fetch_stream leaked out-of-root content: {:?}",
+            leaked
+        );
+
         cleanup(&root);
         let _ = std::fs::remove_dir_all(&outside);
     }
