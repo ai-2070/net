@@ -5,6 +5,23 @@ Scope: full-surface security pass over the `net` crate (~285k LOC Rust + Go/Pyth
 
 Findings are organised by severity. File paths are relative to repo root; line numbers reflect `master` at audit time and may drift. The codebase is unusually hardened — most classic traps already carry explicit guards and regression tests (it references prior "Cubic AI" findings and FFI handle-quiescing audits). The findings below cluster where code diverges from the project's own established safety protocols.
 
+## Resolution (2026-05-28, branch `security-1`)
+
+All findings have been remediated. Each fix carries a regression test where one was meaningful.
+
+| ID | Status | Commit |
+|----|--------|--------|
+| H1 | Fixed — `MeshBlobAdapterHandle` now embeds a `HandleGuard`; ops gate on `try_enter`, `_free` leaks the box | `fix(ffi): close blob-adapter use-after-free + gate node/redex clones` |
+| H2 | Fixed — inbound FFI bodies routed through `goBytesChecked` (rejects `len > MaxInt`); applied to both binding copies | `fix(go): reject oversized inbound FFI lengths instead of truncating` |
+| H3 | Fixed — `try_issue` rejects `duration_secs > MAX_TOKEN_TTL_SECS` (1 year) with `TokenError::TtlTooLong` | `fix(identity): bound token TTL and clock-skew tolerance` |
+| M1 | Fixed — `mesh_node_arc` / `redex_arc` hold a `try_enter` op across the clone and return `Option` | (with H1 commit) |
+| M2 | Fixed — `with_clock_skew` / `set_clock_skew` clamp to `MAX_TOKEN_CLOCK_SKEW_SECS` (5 min) | (with H3 commit) |
+| L1 | Fixed — blob-adapter ops wrapped in `adapter_guard` (`catch_unwind`) | (with H1 commit) |
+| L2 | No change — verified every `wait_for_token` consumer rejects a token whose `origin_hash` ≠ the adapter's bound origin (`WrongOrigin`); the documented adapter-is-the-trust-boundary model holds | (assessed with L3 commit) |
+| L3 | Fixed — blob read paths (`fetch`/`fetch_range`/`exists`/`fetch_stream`) canonicalize against root via `path_within_root` before following the path | `fix(dataforts): canonicalize blob read paths against root` |
+
+The remaining content below is the original audit, retained as the point-in-time record.
+
 | ID | Severity | Area | One-line |
 |----|----------|------|----------|
 | H1 | High | FFI | `MeshBlobAdapterHandle` has no `HandleGuard` → use-after-free / double-free on concurrent `_free` |
