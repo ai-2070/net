@@ -15,9 +15,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
-use tokio::sync::watch;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use tokio::sync::watch;
 
 pub mod audit;
 pub mod capability;
