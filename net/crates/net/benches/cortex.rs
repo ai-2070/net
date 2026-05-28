@@ -18,7 +18,7 @@ use net::adapter::net::cortex::memories::{MemoriesAdapter, MemoriesFilter};
 use net::adapter::net::cortex::tasks::{TaskStatus, TasksAdapter, TasksFilter};
 use net::adapter::net::netdb::NetDb;
 use net::adapter::net::netdb::NetDbSnapshot;
-use net::adapter::net::redex::Redex;
+use net::adapter::net::redex::{Redex, RedexFileConfig};
 use tokio::runtime::Runtime;
 
 const ORIGIN: u64 = 0xABCD_EF01;
@@ -140,8 +140,21 @@ fn bench_fold_barrier(c: &mut Criterion) {
 fn populated_tasks(runtime: &Runtime, n: usize) -> TasksAdapter {
     let _enter = runtime.enter();
     let redex = Redex::new();
+    // The populate loop appends up to ~2n events in a tight burst
+    // before we `wait_for_seq`. The fold subscribes through a bounded
+    // tail buffer (default 1024); if the burst outruns it the
+    // subscription lags, the fold task stops, and `wait_for_seq`
+    // returns `Err(stalled_watermark)` (the `Some(1622)` panic). Size
+    // the buffer to the load so the fold never lags during setup.
     let tasks = runtime
-        .block_on(TasksAdapter::open(&redex, ORIGIN))
+        .block_on(TasksAdapter::open_with_config(
+            &redex,
+            ORIGIN,
+            RedexFileConfig {
+                tail_buffer_size: (n * 2).max(1024),
+                ..RedexFileConfig::default()
+            },
+        ))
         .unwrap();
     let mut last_seq = 0;
     for i in 0..n {
@@ -158,8 +171,18 @@ fn populated_tasks(runtime: &Runtime, n: usize) -> TasksAdapter {
 fn populated_memories(runtime: &Runtime, n: usize) -> MemoriesAdapter {
     let _enter = runtime.enter();
     let redex = Redex::new();
+    // See `populated_tasks`: size the fold's tail buffer to the bulk
+    // load so the unpaced populate burst can't lag the subscription
+    // and stall the fold before `wait_for_seq`.
     let memories = runtime
-        .block_on(MemoriesAdapter::open(&redex, ORIGIN))
+        .block_on(MemoriesAdapter::open_with_config(
+            &redex,
+            ORIGIN,
+            RedexFileConfig {
+                tail_buffer_size: (n * 2).max(1024),
+                ..RedexFileConfig::default()
+            },
+        ))
         .unwrap();
     let tags_a = vec!["alpha".to_string()];
     let tags_b = vec!["beta".to_string()];
