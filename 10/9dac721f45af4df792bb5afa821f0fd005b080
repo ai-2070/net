@@ -1,0 +1,23 @@
+go/tool_test.go
+  s_099fa7d871e34d::t_4e6da382114347 352
+  s_099fa7d871e34d::t_77b7b3d7971671 454-456
+go/tool.go
+  s_099fa7d871e34d::t_9263329f43f36f 1025-1032,1036-1039,1041-1046,1049-1050,1060-1078,1081-1104,1106,1110-1119,1121-1122,1124,1126-1136,1138
+  s_099fa7d871e34d::t_25fc62a83034e0 42-62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "109dac721f45af4df792bb5afa821f0fd005b080",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
