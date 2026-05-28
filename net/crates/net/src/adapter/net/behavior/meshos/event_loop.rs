@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::time::{interval_at, Instant as TokioInstant, MissedTickBehavior};
 
 use super::action::{AllocateActionId, PendingAction};
@@ -71,6 +71,15 @@ pub struct MeshOsLoop {
     /// pointer store and the read path one atomic load + Arc
     /// clone — no lock contention with reconcile.
     snapshot: Arc<ArcSwap<MeshOsSnapshot>>,
+
+    /// Fires `notify_waiters()` right after each `snapshot.store`
+    /// (E-8). Paired with the `ArcSwap` — kept separate so the
+    /// read fast-path stays a lock-free atomic load (a `watch`
+    /// channel would take a read-lock per read; see the rationale
+    /// at the ArcSwap-vs-watch comment in `publish_snapshot`).
+    /// Lets deck's watch/snapshot/status streams await the next
+    /// publish instead of polling `snapshot_poll_interval`.
+    snapshot_changed: Arc<Notify>,
 
     /// Ring of the most-recently-emitted actions. The snapshot's
     /// `pending` field renders this as "what reconcile recently
@@ -358,6 +367,7 @@ impl ProbeRegistry {
 #[derive(Clone, Debug)]
 pub struct MeshOsSnapshotReader {
     snapshot: Arc<ArcSwap<MeshOsSnapshot>>,
+    snapshot_changed: Arc<Notify>,
 }
 
 impl MeshOsSnapshotReader {
@@ -374,6 +384,34 @@ impl MeshOsSnapshotReader {
     /// dropped — keep the borrow short.
     pub fn load(&self) -> arc_swap::Guard<Arc<MeshOsSnapshot>> {
         self.snapshot.load()
+    }
+
+    /// Await the next snapshot publish (E-8). Resolves once the
+    /// loop stores a fresh snapshot and fires its notify. Lets a
+    /// watcher block until there is genuinely new state instead of
+    /// re-reading on a timer.
+    ///
+    /// Missed-wakeup safety: `Notify` only wakes *currently
+    /// registered* waiters, so register this future BEFORE sampling
+    /// the snapshot you're diffing against — a publish racing the
+    /// diff then wakes the already-registered waiter rather than
+    /// being lost (same register-before-read discipline as
+    /// `watch_tools`). The loop republishes every Tick regardless,
+    /// so a missed edge is bounded by the tick interval anyway.
+    pub async fn changed(&self) {
+        self.snapshot_changed.notified().await;
+    }
+
+    /// A `'static` future that resolves on the next snapshot publish
+    /// (E-9). Unlike [`Self::changed`] (which borrows `self`), this
+    /// owns a clone of the notify `Arc`, so it can be stored + re-armed
+    /// inside a `Stream`'s `poll_next` where there is no `self` to
+    /// borrow across polls.
+    pub(crate) fn changed_owned(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let notify = Arc::clone(&self.snapshot_changed);
+        async move {
+            notify.notified().await;
+        }
     }
 }
 
@@ -526,8 +564,10 @@ impl MeshOsLoop {
             ..Default::default()
         };
         let snapshot = Arc::new(ArcSwap::from_pointee(initial_snapshot));
+        let snapshot_changed = Arc::new(Notify::new());
         let reader = MeshOsSnapshotReader {
             snapshot: Arc::clone(&snapshot),
+            snapshot_changed: Arc::clone(&snapshot_changed),
         };
         let me = Self {
             config,
@@ -537,6 +577,7 @@ impl MeshOsLoop {
             actual: MeshOsState::default(),
             desired: DesiredState::default(),
             snapshot,
+            snapshot_changed,
             recent_emissions: Vec::new(),
             probes: ProbeRegistryInner::default(),
             scheduler: SchedulerRegistry::new(),
@@ -1588,6 +1629,10 @@ impl MeshOsLoop {
         );
         snap.runtime_epoch_id = self.runtime_epoch_id;
         self.snapshot.store(Arc::new(snap));
+        // E-8: wake any deck watch/snapshot/status streams parked on
+        // `MeshOsSnapshotReader::changed()`. `notify_waiters` collapses
+        // a burst to a single wake and no-ops when nobody's waiting.
+        self.snapshot_changed.notify_waiters();
     }
 }
 

@@ -1,6 +1,6 @@
 # Polling → Event-Driven SDK Migration Plan
 
-Status: proposed
+Status: implemented (E-1..E-9; E-10 deferred)
 Owner: TBD
 Related: `CAPABILITY_BROADCAST_PLAN.md`, `NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION.md`,
 `AI_TOOL_INTEGRATION_PLAN.md`

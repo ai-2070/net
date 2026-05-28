@@ -1083,12 +1083,17 @@ impl DeckClient {
             .collect()
     }
 
-    /// Await a snapshot matching `predicate`. Polls the
-    /// snapshot reader at
-    /// [`DeckClientConfig::snapshot_poll_interval`] and resolves
-    /// with the first snapshot for which `predicate` returns
-    /// `true`. If the current snapshot already matches,
-    /// resolves immediately without sleeping.
+    /// Await a snapshot matching `predicate`. Event-driven (E-9):
+    /// blocks on the loop's snapshot-publish signal
+    /// ([`MeshOsSnapshotReader::changed`]) and re-tests `predicate`
+    /// on each publish, so a match is observed as soon as the loop
+    /// republishes rather than on the next poll tick. If the current
+    /// snapshot already matches, resolves immediately.
+    ///
+    /// [`DeckClientConfig::snapshot_poll_interval`] is retained as a
+    /// debounce ceiling, not a poll cadence: it bounds the re-test
+    /// latency even if a publish edge is missed (the loop also
+    /// republishes every Tick, so the ceiling is belt-and-suspenders).
     ///
     /// **Note on wedge risk:** if no snapshot ever matches the
     /// predicate, this future never resolves. Use
@@ -1103,12 +1108,20 @@ impl DeckClient {
         if predicate(&snap) {
             return snap;
         }
-        let interval = self
+        let ceiling = self
             .config
             .snapshot_poll_interval
             .max(Duration::from_millis(1));
         loop {
-            tokio::time::sleep(interval).await;
+            // Race the publish signal against the ceiling. The ceiling
+            // arm is the backstop for any publish that slips into the
+            // gap before `changed()` registers its waiter — bounded
+            // re-test, never a wedge.
+            tokio::select! {
+                biased;
+                _ = self.snapshot_reader.changed() => {}
+                _ = tokio::time::sleep(ceiling) => {}
+            }
             let snap = self.snapshot_reader.read();
             if predicate(&snap) {
                 return snap;
@@ -2135,14 +2148,21 @@ impl Stream for FailureStream {
     }
 }
 
-/// Stream over the runtime's snapshot reader. Polls at the
-/// configured cadence; emits a `Result<MeshOsSnapshot, DeckError>`
-/// per poll. Phase 1 emits on every poll (consumers de-dupe if
-/// they care); the substrate's tail-with-replay path replaces
-/// this with a chain-driven stream when it lands.
+/// Stream over the runtime's snapshot reader. Event-driven (E-9):
+/// emits a fresh `Result<MeshOsSnapshot, DeckError>` on each loop
+/// snapshot-publish rather than on a fixed poll tick. The configured
+/// cadence is retained as a debounce ceiling (and the first poll emits
+/// immediately so a consumer sees the initial state). Phase 1 emits on
+/// every publish (consumers de-dupe if they care); the substrate's
+/// tail-with-replay path replaces this with a chain-driven stream when
+/// it lands.
 pub struct SnapshotStream {
     reader: MeshOsSnapshotReader,
-    interval: Interval,
+    /// Debounce-ceiling timer — bounds latency if a publish edge is
+    /// missed and fires immediately on the first poll.
+    ceiling: Interval,
+    /// In-flight "next publish" future, re-armed each time it fires.
+    pending: Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
 }
 
 impl SnapshotStream {
@@ -2150,9 +2170,11 @@ impl SnapshotStream {
         // Floor the interval so a zero-duration config doesn't
         // hot-spin the executor.
         let poll_interval = poll_interval.max(Duration::from_millis(1));
+        let pending = Box::pin(reader.changed_owned());
         Self {
             reader,
-            interval: interval(poll_interval),
+            ceiling: interval(poll_interval),
+            pending,
         }
     }
 }
@@ -2161,9 +2183,19 @@ impl Stream for SnapshotStream {
     type Item = Result<MeshOsSnapshot, DeckError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.interval.poll_tick(cx) {
-            Poll::Ready(_) => Poll::Ready(Some(Ok(self.reader.read()))),
-            Poll::Pending => Poll::Pending,
+        // Poll the publish signal; re-arm for the next publish if it
+        // fired. Then poll the ceiling so its waker stays registered
+        // even when the change arm woke us. The ceiling's first tick is
+        // immediate, so the initial poll emits current state.
+        let changed = self.pending.as_mut().poll(cx).is_ready();
+        if changed {
+            self.pending = Box::pin(self.reader.changed_owned());
+        }
+        let ticked = self.ceiling.poll_tick(cx).is_ready();
+        if changed || ticked {
+            Poll::Ready(Some(Ok(self.reader.read())))
+        } else {
+            Poll::Pending
         }
     }
 }
@@ -2178,16 +2210,21 @@ impl Stream for SnapshotStream {
 /// there.
 pub struct StatusSummaryStream {
     reader: super::meshos::MeshOsSnapshotReader,
-    interval: Interval,
+    /// Debounce-ceiling timer (also fires immediately on first poll).
+    ceiling: Interval,
+    /// In-flight "next publish" future, re-armed each time it fires.
+    pending: Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     last_emitted: Option<StatusSummary>,
 }
 
 impl StatusSummaryStream {
     fn new(reader: super::meshos::MeshOsSnapshotReader, poll_interval: Duration) -> Self {
         let poll_interval = poll_interval.max(Duration::from_millis(1));
+        let pending = Box::pin(reader.changed_owned());
         Self {
             reader,
-            interval: interval(poll_interval),
+            ceiling: interval(poll_interval),
+            pending,
             last_emitted: None,
         }
     }
@@ -2197,25 +2234,31 @@ impl Stream for StatusSummaryStream {
     type Item = Result<StatusSummary, DeckError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.interval.poll_tick(cx) {
-            Poll::Ready(_) => {
-                let snap = self.reader.read();
-                let summary = build_status_summary(&snap);
-                let should_emit = match &self.last_emitted {
-                    None => true,
-                    Some(prev) => prev != &summary,
-                };
-                if should_emit {
-                    self.last_emitted = Some(summary.clone());
-                    Poll::Ready(Some(Ok(summary)))
-                } else {
-                    // The interval consumed its Ready tick on
-                    // this poll; the next poll_tick registers
-                    // its own waker for the next period.
-                    Poll::Pending
-                }
+        // Event-driven (E-9): wake on each publish or the ceiling tick,
+        // build a fresh summary, and emit only when it differs from the
+        // last (PartialEq dedup). Loop on a dedup-suppressed wake so the
+        // re-armed publish future is re-polled (registering its waker)
+        // before we park — otherwise a suppressed edge would drop the
+        // event-driven wake and fall back to the ceiling.
+        loop {
+            let changed = self.pending.as_mut().poll(cx).is_ready();
+            if changed {
+                self.pending = Box::pin(self.reader.changed_owned());
             }
-            Poll::Pending => Poll::Pending,
+            let ticked = self.ceiling.poll_tick(cx).is_ready();
+            if !changed && !ticked {
+                return Poll::Pending;
+            }
+            let summary = build_status_summary(&self.reader.read());
+            let should_emit = match &self.last_emitted {
+                None => true,
+                Some(prev) => prev != &summary,
+            };
+            if should_emit {
+                self.last_emitted = Some(summary.clone());
+                return Poll::Ready(Some(Ok(summary)));
+            }
+            // Unchanged — loop to re-poll both wake sources.
         }
     }
 }
@@ -3175,6 +3218,58 @@ mod tests {
             .expect("watcher should resolve")
             .expect("join");
         assert!(snap.freeze_remaining_ms.is_some());
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn watch_is_event_driven_resolving_far_under_the_poll_ceiling() {
+        // E-9: arm a deliberately long 30s poll-interval ceiling. If the
+        // watch still resolves in well under a second after the commit,
+        // it can only have woken on the loop's snapshot-publish signal —
+        // a regression to interval-polling would wait ~30s and trip the
+        // inner 2s timeout.
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
+                snapshot_poll_interval: Duration::from_secs(30),
+                ..DeckClientConfig::default()
+            },
+        );
+
+        let watcher = {
+            let client = DeckClient::new(
+                deck.handle.clone(),
+                deck.snapshot_reader.clone(),
+                deck.identity().clone(),
+                deck.config.clone(),
+            );
+            tokio::spawn(async move { client.watch(|s| s.freeze_remaining_ms.is_some()).await })
+        };
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let started = std::time::Instant::now();
+        let p = deck
+            .ice()
+            .freeze_cluster(Duration::from_secs(15))
+            .simulate()
+            .await
+            .expect("simulate");
+        let sig = deck
+            .identity()
+            .sign_proposal(p.action(), p.issued_at_ms(), &p.blast_hash());
+        p.commit(&[sig]).await.expect("commit");
+
+        let snap = tokio::time::timeout(Duration::from_secs(2), watcher)
+            .await
+            .expect("watch must resolve far inside the 30s ceiling")
+            .expect("join");
+        assert!(snap.freeze_remaining_ms.is_some());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "watch took {:?}, expected ≪ 30s ceiling — not event-driven",
+            started.elapsed(),
+        );
         let _ = runtime.shutdown().await;
     }
 
