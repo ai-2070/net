@@ -55,7 +55,7 @@ use net::adapter::net::channel::ChannelName;
 // from `net_sdk::identity::*` instead of reaching into the core crate.
 pub use net::adapter::net::identity::{
     EntityError, EntityId, EntityKeypair, OriginStamp, PermissionToken, TokenCache, TokenError,
-    TokenScope,
+    TokenScope, MAX_TOKEN_TTL_SECS,
 };
 
 /// Caller-owned identity bundle: one ed25519 keypair + one token
@@ -138,13 +138,17 @@ impl Identity {
     /// mint further tokens from this one).
     ///
     /// `ttl == Duration::ZERO` is soft-clamped to 1 second (the
-    /// minimum non-born-expired TTL). In debug builds a
-    /// `debug_assert!` fires so the misuse surfaces in tests; in
-    /// release the SDK keeps a non-panicking surface for callers
-    /// that may receive a zero-duration value from upstream
-    /// configuration. Callers that need to *reject* zero TTLs at
-    /// the boundary should use [`Self::try_issue_token`], which
-    /// returns `TokenError::ZeroTtl`.
+    /// minimum non-born-expired TTL), and a `ttl` longer than
+    /// [`MAX_TOKEN_TTL_SECS`] is soft-clamped down to that ceiling.
+    /// Both keep this infallible surface non-panicking: `try_issue`
+    /// rejects an over-long TTL with `TokenError::TtlTooLong`, which
+    /// the `.expect()` below would otherwise turn into a process
+    /// abort. In debug builds a `debug_assert!` fires so either misuse
+    /// surfaces in tests; in release the SDK keeps a non-panicking
+    /// surface for callers that may receive an out-of-range value from
+    /// upstream configuration. Callers that need to *reject* these at
+    /// the boundary should use [`Self::try_issue_token`], which returns
+    /// `TokenError::ZeroTtl` / `TokenError::TtlTooLong`.
     pub fn issue_token(
         &self,
         subject: EntityId,
@@ -158,10 +162,18 @@ impl Identity {
             "Identity::issue_token called with Duration::ZERO; \
              release builds soft-clamp to 1s, but the call site is likely a bug"
         );
+        debug_assert!(
+            ttl.as_secs() <= MAX_TOKEN_TTL_SECS,
+            "Identity::issue_token called with ttl > MAX_TOKEN_TTL_SECS ({MAX_TOKEN_TTL_SECS}s); \
+             release builds soft-clamp to the ceiling, but the call site is likely a bug"
+        );
         let effective_ttl = if ttl.is_zero() {
             Duration::from_secs(1)
         } else {
-            ttl
+            // Clamp to the issuance ceiling so the infallible wrapper
+            // can't panic on the `TtlTooLong` that `try_issue` returns
+            // past `MAX_TOKEN_TTL_SECS`.
+            Duration::from_secs(ttl.as_secs().min(MAX_TOKEN_TTL_SECS))
         };
         self.try_issue_token(subject, scope, channel, effective_ttl, delegation_depth)
             .expect("Identity::issue_token: invalid input (use try_issue_token for fallible)")
@@ -325,6 +337,83 @@ mod tests {
         assert!(
             matches!(err, TokenError::ZeroTtl),
             "expected ZeroTtl, got {err:?}"
+        );
+    }
+
+    /// Security-review follow-up: a `ttl` past `MAX_TOKEN_TTL_SECS`
+    /// used to reach `try_issue`, which (after audit H3) returns
+    /// `TokenError::TtlTooLong` — and the infallible wrapper's
+    /// `.expect()` would have turned that into a process abort. The
+    /// wrapper now soft-clamps down to the ceiling, mirroring the
+    /// zero-TTL soft-clamp. Release-gated like its zero-TTL sibling
+    /// because the `debug_assert!` fires under `cargo test`.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn issue_token_over_long_ttl_soft_clamps_in_release() {
+        let id = Identity::generate();
+        let subject = Identity::generate();
+        let channel = ChannelName::new("long-ttl-soft-clamp").unwrap();
+        let token = id.issue_token(
+            subject.entity_id().clone(),
+            crate::TokenScope::PUBLISH,
+            &channel,
+            // 10x the ceiling — the old saturating path would have
+            // produced a near-immortal token; clamp caps it.
+            Duration::from_secs(MAX_TOKEN_TTL_SECS * 10),
+            0,
+        );
+        assert!(
+            token.not_after < u64::MAX,
+            "clamped TTL must not saturate not_after"
+        );
+        assert!(
+            token.verify().is_ok(),
+            "clamped TTL must produce a verify-ok token"
+        );
+        assert!(
+            token.is_valid().is_ok(),
+            "clamped TTL must be live at issue time"
+        );
+    }
+
+    /// Companion to the above: in debug builds the over-long soft-clamp
+    /// fires `debug_assert!` so the misuse surfaces in tests.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "MAX_TOKEN_TTL_SECS")]
+    fn issue_token_over_long_ttl_debug_asserts() {
+        let id = Identity::generate();
+        let subject = Identity::generate();
+        let channel = ChannelName::new("long-ttl-debug").unwrap();
+        let _ = id.issue_token(
+            subject.entity_id().clone(),
+            crate::TokenScope::PUBLISH,
+            &channel,
+            Duration::from_secs(MAX_TOKEN_TTL_SECS * 10),
+            0,
+        );
+    }
+
+    /// The fallible surface rejects an over-long TTL with
+    /// `TokenError::TtlTooLong` rather than clamping — the boundary
+    /// path FFI bindings route through.
+    #[test]
+    fn try_issue_token_over_long_ttl_returns_ttl_too_long() {
+        let id = Identity::generate();
+        let subject = Identity::generate();
+        let channel = ChannelName::new("long-ttl-fallible").unwrap();
+        let err = id
+            .try_issue_token(
+                subject.entity_id().clone(),
+                crate::TokenScope::PUBLISH,
+                &channel,
+                Duration::from_secs(MAX_TOKEN_TTL_SECS + 1),
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, TokenError::TtlTooLong),
+            "expected TtlTooLong, got {err:?}"
         );
     }
 }
