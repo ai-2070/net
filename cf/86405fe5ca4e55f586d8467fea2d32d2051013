@@ -1,0 +1,32 @@
+net/crates/net/src/adapter/net/behavior/deck.rs
+  s_099fa7d871e34d::t_73f05f87e90635 1086-1096,1111,1116-1124
+  s_099fa7d871e34d::t_fb8b6cdbb66587 2151-2158,2161-2165,2173,2176-2177,2186-2198
+  s_099fa7d871e34d::t_a9e5ddce7dce9f 2213-2216,2223,2226-2227,2237-2246,2248-2261
+  s_099fa7d871e34d::t_65fed7784cc83a 3225-3275
+net/crates/net/src/adapter/net/behavior/meshos/event_loop.rs
+  s_099fa7d871e34d::t_6754fc53b80e01 75-83
+  s_099fa7d871e34d::t_6114a32ae757a6 567,570
+  s_099fa7d871e34d::t_caa96be7a6394b 404-415
+  s_099fa7d871e34d::t_19f06edbbc595d 580
+  s_099fa7d871e34d::t_7f23bc25184721 370,388-402
+  s_099fa7d871e34d::t_d8e29d8270d2fc 1632-1635
+  s_099fa7d871e34d::t_f43d161a30951b 26
+net/crates/net/docs/plans/POLLING_TO_EVENT_DRIVEN_SDK_PLAN.md
+  s_099fa7d871e34d::t_66959be0fe4228 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "cf86405fe5ca4e55f586d8467fea2d32d2051013",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
