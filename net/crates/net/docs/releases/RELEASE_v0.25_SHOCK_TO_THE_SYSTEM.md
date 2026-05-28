@@ -8,6 +8,27 @@ The v0.25 release is the result of two pushes against the same mesh-discovery su
 
 The release's organizing observation: discovery should be free in the hot path and cheap to author at the edges. The capability fold already aggregates every node's capabilities — agent discovery just walks it. The tag-set source-of-truth pattern is the right architecture, but allocating a `String` per tag per predicate match isn't its tax to pay.
 
+### Where v0.25 lands against the rest of the service-discovery field
+
+In-process capability-filter evaluation in v0.25 sits 3–7 orders of magnitude below the published latencies of the network-coordinated discovery systems the field treats as fast:
+
+| Layer | Operation | Typical latency | vs Net `has_*` (~30 ns) |
+|---|---|---|---|
+| **Net v0.25** | `has_gpu` / `has_tool` / `has_model` | **20–44 ns** | 1× |
+| **Net v0.25** | `match_min_memory` (single-field predicate) | **15 ns** | 0.5× |
+| **Net v0.25** | `match_complex` (6 chained predicates, decodes models) | **3.8 µs** | ~130× |
+| **Net v0.25** | `CapabilitySet::to_bytes_compact` (full set, postcard) | **2.0 µs** | ~70× |
+| Consul | DNS lookup, cached | 100–200 µs | 3,300–6,700× |
+| Consul | DNS lookup, uncached (server) | 600–700 µs | 20,000–23,000× |
+| Consul | client initial query | 1.6–3 ms | 53,000–100,000× |
+| etcd | lookup, recommended P99 target | < 10 ms | > 330,000× |
+| Kubernetes / CoreDNS | service lookup (ndots:5 default) | 100+ ms | > 3,300,000× |
+| mDNS / DNS-SD | best-case local resolution | < 1 ms | > 33,000× |
+
+**Caveat — apples-vs-oranges:** the v0.25 numbers measure in-process predicate evaluation against capability announcements already gossiped into the local fold. Consul / etcd / Kubernetes DNS are answering "where is service X across the cluster" with a network round-trip and (usually) a consensus quorum read. They aren't doing the same job. The fair comparison is **the in-mesh agent scheduling loop**: once announcements are in your fold (Net does that propagation via the same gossip path every other capability rides), filtering and dispatching against them is genuinely four to seven orders of magnitude faster than the registries an agent author would otherwise reach for.
+
+External sources for the published latencies in the table: [Consul DNS perf thread](https://groups.google.com/g/consul-tool/c/5gpqSAP74sY), [Consul DNS perf issue #1535](https://github.com/hashicorp/consul/issues/1535), [Consul server resource requirements](https://developer.hashicorp.com/consul/docs/install/performance), [etcd recommended practices (OKD)](https://docs.okd.io/latest/etcd/etcd-practices.html), [Kubernetes DNS ndots:5 latency](https://www.michal-drozd.com/en/blog/kubernetes-dns-caching-ndots/), [mDNS / DNS-SD discovery](https://openthread.io/guides/border-router/mdns-discovery).
+
 Below: the wins, grouped by where they fire.
 
 ---
