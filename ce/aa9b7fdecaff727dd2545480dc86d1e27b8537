@@ -1,0 +1,28 @@
+net/crates/net/src/ffi/mesh.rs
+  s_125b8227999624::t_dc20906ea49ace 187-190
+net/crates/net/src/adapter/net/identity/token.rs
+  s_125b8227999624::t_1021a7386f9f10 214-219
+  s_125b8227999624::t_4bcc1690834752 775-777,782
+  s_125b8227999624::t_04147b0c161450 637-665
+  s_125b8227999624::t_00bb0beaac80fb 249-257
+  s_125b8227999624::t_25772235195f5b 1079-1082
+  s_125b8227999624::t_6a803889decc75 2299-2305,2307,2310-2339,2344-2363,2366,2368-2386
+  s_125b8227999624::t_79b9ce542e45ab 1058-1064
+  s_125b8227999624::t_2b803b9a4d8564 804-805,807
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "ceaa9b7fdecaff727dd2545480dc86d1e27b8537",
+  "prompts": {},
+  "sessions": {
+    "s_125b8227999624": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "94c8ab71-7451-4e48-a3ea-60e5697f24fd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
