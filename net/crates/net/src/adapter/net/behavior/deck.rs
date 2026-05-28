@@ -2162,7 +2162,11 @@ pub struct SnapshotStream {
     /// missed and fires immediately on the first poll.
     ceiling: Interval,
     /// In-flight "next publish" future, re-armed each time it fires.
-    pending: Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    /// The boxed `Notified` future is `Send` but `!Sync`; the `Mutex`
+    /// restores `Sync` (required by the pyo3/napi `#[pyclass]` wrappers)
+    /// without an async lock — `poll_next` holds it only across the sync
+    /// poll, never across an await.
+    pending: std::sync::Mutex<Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
 }
 
 impl SnapshotStream {
@@ -2170,7 +2174,7 @@ impl SnapshotStream {
         // Floor the interval so a zero-duration config doesn't
         // hot-spin the executor.
         let poll_interval = poll_interval.max(Duration::from_millis(1));
-        let pending = Box::pin(reader.changed_owned());
+        let pending = std::sync::Mutex::new(Box::pin(reader.changed_owned()) as _);
         Self {
             reader,
             ceiling: interval(poll_interval),
@@ -2182,18 +2186,25 @@ impl SnapshotStream {
 impl Stream for SnapshotStream {
     type Item = Result<MeshOsSnapshot, DeckError>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // `Self: Unpin` (all fields are), so project to `&mut Self` once
+        // and borrow disjoint fields freely.
+        let this = self.get_mut();
         // Poll the publish signal; re-arm for the next publish if it
         // fired. Then poll the ceiling so its waker stays registered
         // even when the change arm woke us. The ceiling's first tick is
         // immediate, so the initial poll emits current state.
-        let changed = self.pending.as_mut().poll(cx).is_ready();
-        if changed {
-            self.pending = Box::pin(self.reader.changed_owned());
-        }
-        let ticked = self.ceiling.poll_tick(cx).is_ready();
+        let changed = {
+            let mut pending = this.pending.lock().expect("snapshot pending mutex poisoned");
+            let ready = pending.as_mut().poll(cx).is_ready();
+            if ready {
+                *pending = Box::pin(this.reader.changed_owned());
+            }
+            ready
+        };
+        let ticked = this.ceiling.poll_tick(cx).is_ready();
         if changed || ticked {
-            Poll::Ready(Some(Ok(self.reader.read())))
+            Poll::Ready(Some(Ok(this.reader.read())))
         } else {
             Poll::Pending
         }
@@ -2213,14 +2224,17 @@ pub struct StatusSummaryStream {
     /// Debounce-ceiling timer (also fires immediately on first poll).
     ceiling: Interval,
     /// In-flight "next publish" future, re-armed each time it fires.
-    pending: Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    /// `Mutex` restores `Sync` over the `Send`-but-`!Sync` boxed
+    /// future (the pyo3/napi `#[pyclass]` wrappers require it); the
+    /// lock is held only across the sync poll, never across an await.
+    pending: std::sync::Mutex<Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
     last_emitted: Option<StatusSummary>,
 }
 
 impl StatusSummaryStream {
     fn new(reader: super::meshos::MeshOsSnapshotReader, poll_interval: Duration) -> Self {
         let poll_interval = poll_interval.max(Duration::from_millis(1));
-        let pending = Box::pin(reader.changed_owned());
+        let pending = std::sync::Mutex::new(Box::pin(reader.changed_owned()) as _);
         Self {
             reader,
             ceiling: interval(poll_interval),
@@ -2233,7 +2247,8 @@ impl StatusSummaryStream {
 impl Stream for StatusSummaryStream {
     type Item = Result<StatusSummary, DeckError>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
         // Event-driven (E-9): wake on each publish or the ceiling tick,
         // build a fresh summary, and emit only when it differs from the
         // last (PartialEq dedup). Loop on a dedup-suppressed wake so the
@@ -2241,21 +2256,25 @@ impl Stream for StatusSummaryStream {
         // before we park — otherwise a suppressed edge would drop the
         // event-driven wake and fall back to the ceiling.
         loop {
-            let changed = self.pending.as_mut().poll(cx).is_ready();
-            if changed {
-                self.pending = Box::pin(self.reader.changed_owned());
-            }
-            let ticked = self.ceiling.poll_tick(cx).is_ready();
+            let changed = {
+                let mut pending = this.pending.lock().expect("status pending mutex poisoned");
+                let ready = pending.as_mut().poll(cx).is_ready();
+                if ready {
+                    *pending = Box::pin(this.reader.changed_owned());
+                }
+                ready
+            };
+            let ticked = this.ceiling.poll_tick(cx).is_ready();
             if !changed && !ticked {
                 return Poll::Pending;
             }
-            let summary = build_status_summary(&self.reader.read());
-            let should_emit = match &self.last_emitted {
+            let summary = build_status_summary(&this.reader.read());
+            let should_emit = match &this.last_emitted {
                 None => true,
                 Some(prev) => prev != &summary,
             };
             if should_emit {
-                self.last_emitted = Some(summary.clone());
+                this.last_emitted = Some(summary.clone());
                 return Poll::Ready(Some(Ok(summary)));
             }
             // Unchanged — loop to re-poll both wake sources.
