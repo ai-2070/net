@@ -2134,6 +2134,36 @@ mod mesh_bindings {
                 .map(crate::tool::descriptor_to_js)
                 .collect())
         }
+
+        /// Event-driven watch over the local capability fold's tool
+        /// view. Returns a [`ToolWatchIter`](crate::tool::ToolWatchIter)
+        /// whose `next()` yields one JSON-encoded `ToolListChange` per
+        /// addition / removal / publisher-count change — delivered the
+        /// moment the fold mutates, not on a timer. The `watchTools`
+        /// TS wrapper `JSON.parse`s each change into the discriminated
+        /// union.
+        ///
+        /// `intervalMs` is a debounce ceiling, NOT a poll cadence:
+        /// `null`/`0` is pure event-driven (idle fold = zero periodic
+        /// work); a positive value additionally guarantees a re-diff at
+        /// least every `intervalMs` as a safety net.
+        ///
+        /// `async` so the substrate diff task is spawned inside the
+        /// napi tokio runtime (the body has no `await` of its own — the
+        /// substrate `watch_tools` is sync but `tokio::spawn`s).
+        #[napi]
+        pub async fn watch_tools(
+            &self,
+            interval_ms: Option<u32>,
+        ) -> Result<crate::tool::ToolWatchIter> {
+            let node = self.node_arc_clone()?;
+            let interval = match interval_ms {
+                Some(ms) if ms > 0 => Some(std::time::Duration::from_millis(ms as u64)),
+                _ => None,
+            };
+            let watch = node.watch_tools(None, interval);
+            Ok(crate::tool::new_tool_watch_iter(watch))
+        }
     }
 
     // =====================================================================

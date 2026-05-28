@@ -27,6 +27,9 @@ import {
   serveToolStreaming,
   watchTools,
 } from '../tool'
+import { NetMesh } from '../index'
+
+const RUN_INTEGRATION_TESTS = process.env.RUN_INTEGRATION_TESTS === '1'
 
 function sampleDescriptor(): ToolDescriptor {
   return descriptorFrom({
@@ -210,161 +213,200 @@ describe('gemini format', () => {
   })
 })
 
-describe('watchTools (polling)', () => {
-  // The mesh stub holds a mutable descriptor list — tests poke it
-  // to simulate registrations / removals / node-count drift, then
-  // assert the watcher diffs them out as Added / Removed /
-  // NodeCountChanged events.
-  function stubMesh(initial: ToolDescriptor[]): {
-    listTools(): ToolDescriptor[]
-    set(next: ToolDescriptor[]): void
-  } {
-    let snapshot = [...initial]
-    return {
-      listTools: () => [...snapshot],
-      set: (next) => {
-        snapshot = [...next]
-      },
-    }
-  }
-
-  function makeDesc(toolId: string, nodeCount = 1): ToolDescriptor {
-    return descriptorFrom({ name: toolId, description: '' }) as ToolDescriptor &
-      Record<string, unknown> as ToolDescriptor & { nodeCount: number } as ToolDescriptor
-  }
-
-  // descriptorFrom's nodeCount defaults to 0; override for the
-  // stub so we exercise the NodeCountChanged path cleanly.
+describe('watchTools (event-driven)', () => {
+  // The fake mesh's watchTools() returns a native iter that yields the
+  // pre-seeded JSON changes (exactly as the napi `ToolWatchIter` would),
+  // then ends with `null`. Records the intervalMs the wrapper passes
+  // through and whether `close()` fired. Mirror of the Python E-4
+  // fake-mesh tests — the live substrate delivery is validated
+  // substrate-side + cross-language.
   function desc(toolId: string, nodeCount: number): ToolDescriptor {
     return { ...descriptorFrom({ name: toolId }), nodeCount }
   }
 
-  it('emits Added when a tool appears after the baseline', async () => {
-    const mesh = stubMesh([])
-    const ctrl = new AbortController()
-    const events: ToolListChange[] = []
-    const iter = watchTools(mesh, { intervalMs: 25, signal: ctrl.signal })
-
-    // Add a tool *before* we start consuming so the first tick
-    // catches the diff.
-    mesh.set([desc('web_search', 1)])
-
-    void (async () => {
-      for await (const change of iter) {
-        events.push(change)
-        if (events.length >= 1) {
-          ctrl.abort()
-          break
-        }
-      }
-    })()
-
-    await new Promise((r) => setTimeout(r, 100))
-    expect(events.length).toBe(1)
-    expect(events[0]?.type).toBe('added')
-    if (events[0]?.type === 'added') {
-      expect(events[0].descriptor.toolId).toBe('web_search')
+  function fakeMesh(changes: ToolListChange[]) {
+    const state = {
+      lastIntervalMs: undefined as number | null | undefined,
+      closed: false,
     }
+    const queue = changes.map((c) => JSON.stringify(c))
+    const native = {
+      async next(): Promise<string | null> {
+        return queue.length ? (queue.shift() as string) : null
+      },
+      close() {
+        state.closed = true
+      },
+    }
+    return {
+      state,
+      mesh: {
+        async watchTools(intervalMs?: number | null) {
+          state.lastIntervalMs = intervalMs
+          return native
+        },
+      },
+    }
+  }
+
+  // A native iter whose `next()` pends until `close()` — models a
+  // ceiling-less watch parked on the fold change with nothing pending.
+  function blockingFakeMesh() {
+    const state = { closed: false }
+    let resolvePending: ((v: string | null) => void) | null = null
+    const native = {
+      async next(): Promise<string | null> {
+        if (state.closed) return null
+        return new Promise<string | null>((resolve) => {
+          resolvePending = resolve
+        })
+      },
+      close() {
+        state.closed = true
+        if (resolvePending) {
+          resolvePending(null)
+          resolvePending = null
+        }
+      },
+    }
+    return {
+      state,
+      mesh: {
+        async watchTools(_intervalMs?: number | null) {
+          return native
+        },
+      },
+    }
+  }
+
+  it('parses each change variant and closes the native iter on completion', async () => {
+    const { state, mesh } = fakeMesh([
+      { type: 'added', descriptor: desc('web_search', 1) },
+      { type: 'removed', descriptor: desc('old_tool', 1) },
+      {
+        type: 'node_count_changed',
+        descriptor: desc('web_search', 3),
+        prevNodeCount: 1,
+      },
+    ])
+
+    const events: ToolListChange[] = []
+    for await (const change of watchTools(mesh)) {
+      events.push(change)
+    }
+
+    expect(events.map((e) => e.type)).toEqual([
+      'added',
+      'removed',
+      'node_count_changed',
+    ])
+    expect(events[0]?.type === 'added' && events[0].descriptor.toolId).toBe(
+      'web_search',
+    )
+    expect(events[1]?.type === 'removed' && events[1].descriptor.toolId).toBe(
+      'old_tool',
+    )
+    if (events[2]?.type === 'node_count_changed') {
+      expect(events[2].prevNodeCount).toBe(1)
+      expect(events[2].descriptor.nodeCount).toBe(3)
+    }
+    // The wrapper ALWAYS closes the native iter in its `finally`.
+    expect(state.closed).toBe(true)
   })
 
-  it('emits Removed when a tool disappears', async () => {
-    const mesh = stubMesh([desc('temp', 1)])
-    const ctrl = new AbortController()
-    const events: ToolListChange[] = []
-    const iter = watchTools(mesh, { intervalMs: 25, signal: ctrl.signal })
-
-    mesh.set([])
-
-    void (async () => {
-      for await (const change of iter) {
-        events.push(change)
-        if (events.length >= 1) {
-          ctrl.abort()
-          break
-        }
-      }
-    })()
-
-    await new Promise((r) => setTimeout(r, 100))
-    expect(events.length).toBe(1)
-    expect(events[0]?.type).toBe('removed')
-    if (events[0]?.type === 'removed') {
-      expect(events[0].descriptor.toolId).toBe('temp')
+  it('omitted interval maps to pure event-driven (null), positive to a ceiling', async () => {
+    const a = fakeMesh([])
+    for await (const _ of watchTools(a.mesh)) {
+      // drains immediately (empty)
     }
+    expect(a.state.lastIntervalMs).toBeNull()
+
+    const b = fakeMesh([])
+    for await (const _ of watchTools(b.mesh, { intervalMs: 500 })) {
+      // drains immediately (empty)
+    }
+    expect(b.state.lastIntervalMs).toBe(500)
   })
 
-  it('AbortSignal cancels the polling iterator on the next tick', async () => {
-    const mesh = stubMesh([])
+  it('AbortSignal closes the native iter and ends iteration', async () => {
+    const { state, mesh } = blockingFakeMesh()
     const ctrl = new AbortController()
-    const events: ToolListChange[] = []
     let iterationCompleted = false
 
-    const iter = watchTools(mesh, { intervalMs: 25, signal: ctrl.signal })
-
     const consumeTask = (async () => {
-      for await (const change of iter) {
-        events.push(change)
+      for await (const _ of watchTools(mesh, { signal: ctrl.signal })) {
+        // never yields — next() pends until close()
       }
       iterationCompleted = true
     })()
 
-    // Let one diff tick pass with no changes — should not produce events.
-    await new Promise((r) => setTimeout(r, 60))
-    expect(events.length).toBe(0)
+    // Give the generator a tick to subscribe + park on next().
+    await new Promise((r) => setTimeout(r, 20))
     expect(iterationCompleted).toBe(false)
 
-    // Abort. The polling loop sees the signal on its current sleep,
-    // rejects the timer Promise, and the iterator exits cleanly.
     ctrl.abort()
     await consumeTask
     expect(iterationCompleted).toBe(true)
-    // The for-await terminated without throwing — that's the
-    // documented cancellation contract.
+    expect(state.closed).toBe(true)
   })
 
-  it('pre-aborted signal exits the iterator on the first tick without yielding', async () => {
-    const mesh = stubMesh([desc('preexisting', 1)])
+  it('pre-aborted signal closes immediately without yielding', async () => {
+    const { state, mesh } = fakeMesh([
+      { type: 'added', descriptor: desc('preexisting', 1) },
+    ])
     const ctrl = new AbortController()
-    ctrl.abort() // Abort BEFORE consuming.
-    const events: ToolListChange[] = []
-    const iter = watchTools(mesh, { intervalMs: 50, signal: ctrl.signal })
+    ctrl.abort()
 
-    for await (const change of iter) {
+    const events: ToolListChange[] = []
+    for await (const change of watchTools(mesh, { signal: ctrl.signal })) {
       events.push(change)
     }
-    // Mutating the snapshot after the abort must not surface — the
-    // iterator has already exited.
-    mesh.set([])
-    await new Promise((r) => setTimeout(r, 80))
     expect(events.length).toBe(0)
+    expect(state.closed).toBe(true)
   })
+})
 
-  it('emits NodeCountChanged when publisher count drifts', async () => {
-    const mesh = stubMesh([desc('shared_tool', 1)])
-    const ctrl = new AbortController()
-    const events: ToolListChange[] = []
-    const iter = watchTools(mesh, { intervalMs: 25, signal: ctrl.signal })
+// Live end-to-end (single node, no handshake): a self-served tool
+// announced on a node fires an `Added` to a local `watchTools` watcher
+// off the substrate's capability-fold change signal — proving the napi
+// `ToolWatchIter` + the wrapper consume the real event stream, and that
+// the async-fn `watch_tools` spawns its diff task inside the napi tokio
+// runtime. Gated behind RUN_INTEGRATION_TESTS (needs the built binary).
+describe.skipIf(!RUN_INTEGRATION_TESTS)('watchTools (live single-node)', () => {
+  it('delivers an Added for a self-served tool', async () => {
+    const mesh = await NetMesh.create({
+      bindAddr: '127.0.0.1:0',
+      psk: '42'.repeat(32),
+    })
+    const it = watchTools(mesh as never)[Symbol.asyncIterator]()
+    // Kick the generator so it subscribes before we announce.
+    const firstP = it.next()
+    await new Promise((r) => setTimeout(r, 200))
 
-    mesh.set([desc('shared_tool', 2)])
+    const caps = addToolCapabilitiesToAnnounce({}, [
+      descriptorFrom({ name: 'web_search', description: 'Search the web.' }),
+    ])
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (mesh as any).announceCapabilities(caps)
 
-    void (async () => {
-      for await (const change of iter) {
-        events.push(change)
-        if (events.length >= 1) {
-          ctrl.abort()
-          break
-        }
-      }
-    })()
-
+    const res = await Promise.race([
+      firstP,
+      new Promise<never>((_, rej) =>
+        setTimeout(() => rej(new Error('timeout: no change in 4s')), 4000),
+      ),
+    ])
+    // Closing the iterator drops the substrate watch's receiver, which
+    // ends the diff task and releases its node ref — so shutdown sees no
+    // outstanding references. Give the task a beat to unwind first.
+    await it.return?.()
     await new Promise((r) => setTimeout(r, 100))
-    expect(events.length).toBe(1)
-    expect(events[0]?.type).toBe('node_count_changed')
-    if (events[0]?.type === 'node_count_changed') {
-      expect(events[0].descriptor.toolId).toBe('shared_tool')
-      expect(events[0].prevNodeCount).toBe(1)
-      expect(events[0].descriptor.nodeCount).toBe(2)
+    expect(res.done).toBe(false)
+    expect(res.value?.type).toBe('added')
+    if (res.value?.type === 'added') {
+      expect(res.value.descriptor.toolId).toBe('web_search')
     }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (mesh as any).shutdown()
   })
 })
 
