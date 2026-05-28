@@ -1,6 +1,6 @@
 [package]
 name = "net-python"
-version = "0.25.0"
+version = "0.25.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "Python bindings for Net event bus"
@@ -116,8 +116,8 @@ deck = ["meshos", "net/meshos", "net-sdk/deck"]
 aggregator = ["net", "dep:net-sdk", "net-sdk/aggregator"]
 
 [dependencies]
-net = { package = "net-mesh", version = "0.25.0", path = "../..", default-features = false }
-net-sdk = { package = "net-mesh-sdk", version = "0.25.0", path = "../../sdk", default-features = false, optional = true }
+net = { package = "net-mesh", version = "0.25.1", path = "../..", default-features = false }
+net-sdk = { package = "net-mesh-sdk", version = "0.25.1", path = "../../sdk", default-features = false, optional = true }
 dashmap = { version = "6", optional = true }
 parking_lot = "0.12"
 pyo3 = { version = "0.28.0", features = ["extension-module"] }
