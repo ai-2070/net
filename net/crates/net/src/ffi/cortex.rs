@@ -329,9 +329,15 @@ impl RedexHandle {
     /// lint trips. Suppress the lint at the method level so a
     /// future feature-OFF caller doesn't also need the
     /// `#[allow]` annotation.
+    ///
+    /// Gated on the handle's [`HandleGuard`]: the `try_enter` op is
+    /// held across the clone so a concurrent `net_redex_free` cannot
+    /// take the inner out of `ManuallyDrop` mid-clone. Returns `None`
+    /// once `_free` has begun — the caller must surface a null result.
     #[allow(dead_code)]
-    pub(crate) fn redex_arc(&self) -> Arc<InnerRedex> {
-        (*self.inner).clone()
+    pub(crate) fn redex_arc(&self) -> Option<Arc<InnerRedex>> {
+        let _op = self.guard.try_enter()?;
+        Some((*self.inner).clone())
     }
 }
 

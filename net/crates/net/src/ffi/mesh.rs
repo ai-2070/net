@@ -184,6 +184,10 @@ fn token_err_to_code(e: &CoreTokenError) -> c_int {
         // message ("token TTL must be > 0 seconds") tells the
         // caller exactly what was wrong.
         CoreTokenError::ZeroTtl => NET_ERR_TOKEN_INVALID_FORMAT,
+        // An over-long TTL is another malformed token-issue input
+        // (`duration_secs` past the hard ceiling). Same mapping as
+        // `ZeroTtl`; the `Display` message names the limit.
+        CoreTokenError::TtlTooLong => NET_ERR_TOKEN_INVALID_FORMAT,
     }
 }
 
@@ -632,9 +636,16 @@ pub unsafe extern "C" fn net_mesh_free(handle: *mut MeshNodeHandle) {
 /// consumer (`ffi::aggregator`) is itself cortex-feature-only,
 /// so the gate keeps the symbol out of cortex-off builds and
 /// avoids a dead-code warning.
+///
+/// Gated on the handle's [`HandleGuard`]: the `try_enter` op is held
+/// across the `Arc::clone` so a concurrent `net_mesh_free` cannot take
+/// the inner out of `ManuallyDrop` mid-clone. Returns `None` if `_free`
+/// has begun — callers must surface a null/error result. Once the clone
+/// lands the bumped refcount keeps the node alive independently.
 #[cfg(feature = "cortex")]
-pub(super) fn mesh_node_arc(h: &MeshNodeHandle) -> Arc<MeshNode> {
-    Arc::clone(&h.inner)
+pub(super) fn mesh_node_arc(h: &MeshNodeHandle) -> Option<Arc<MeshNode>> {
+    let _op = h.guard.try_enter()?;
+    Some(Arc::clone(&h.inner))
 }
 
 /// Clone the `Arc<MeshNode>` backing this handle and return a

@@ -666,17 +666,38 @@ func pumpIterRowsBody(ctx context.Context, iter *C.MeshDbIter, ch chan<- MeshDBR
 // Empty payloads (`len == 0` and / or null `ptr`) yield a nil
 // slice, matching the FFI's "no body" semantics.
 func copyFFIPayload(ptr *C.uint8_t, length C.size_t) ([]byte, error) {
-	if length == 0 || ptr == nil {
-		return nil, nil
-	}
-	if uint64(length) > uint64(math.MaxInt) {
+	b, ok := goBytesChecked(ptr, length)
+	if !ok {
 		return nil, ErrMeshDBRuntime
 	}
-	// unsafe.Slice handles the size_t -> int conversion via a
-	// platform-int-sized argument; bytes.Clone copies it into a
-	// Go-owned slice so the caller can free the FFI buffer.
+	return b, nil
+}
+
+// goBytesChecked turns a `(ptr, size_t len)` pair from the FFI into an
+// owned `[]byte`, refusing lengths that don't fit a Go `int`.
+//
+// It exists because `C.GoBytes(ptr, C.int(len))` casts the length to
+// `C.int`, which is 32-bit signed even on 64-bit hosts: a length with
+// bit 31 set sign-flips negative (cgo then panics with "negative
+// length", crashing the callback before any recover runs), and a
+// length >= 4 GiB mod 2^32 yields a short copy that desyncs framing.
+// Both are reachable from an inbound mesh peer's request / event body.
+// `unsafe.Slice` takes a platform-`int` (64-bit) length and
+// `bytes.Clone` copies into a Go-owned slice, sidestepping the
+// truncation entirely.
+//
+// Returns `(nil, true)` for an empty/null payload (the FFI "no body"
+// shape) and `(nil, false)` when the length is out of range; callers
+// map `false` onto their own error / status convention.
+func goBytesChecked(ptr *C.uint8_t, length C.size_t) ([]byte, bool) {
+	if length == 0 || ptr == nil {
+		return nil, true
+	}
+	if uint64(length) > uint64(math.MaxInt) {
+		return nil, false
+	}
 	view := unsafe.Slice((*byte)(unsafe.Pointer(ptr)), int(length))
-	return bytes.Clone(view), nil
+	return bytes.Clone(view), true
 }
 
 // trySend forwards `res` to `ch`, but selects on `ctx.Done()` so

@@ -476,7 +476,13 @@ func go_net_rpc_handler_trampoline(
 	// Copy request bytes into a Go-owned slice so the user's
 	// handler can capture / mutate freely without aliasing the
 	// Rust-owned buffer (which is only valid for this call).
-	req := C.GoBytes(unsafe.Pointer(reqPtr), C.int(reqLen))
+	// `goBytesChecked` (not `C.GoBytes`) so an oversized inbound
+	// length can't truncate/sign-flip via the 32-bit C.int cast.
+	req, ok := goBytesChecked(reqPtr, reqLen)
+	if !ok {
+		writeCError(outErr, fmt.Sprintf("request body length %d exceeds the maximum", uint64(reqLen)))
+		return -1
+	}
 
 	// Recover from handler panics so a buggy user handler doesn't
 	// crash the whole process.
@@ -799,7 +805,10 @@ func (r *MeshRpc) ListTools() ([]ToolDescriptor, error) {
 		return []ToolDescriptor{}, nil
 	}
 	defer C.net_rpc_response_free(outJSON, outLen)
-	body := C.GoBytes(unsafe.Pointer(outJSON), C.int(outLen))
+	body, okLen := goBytesChecked(outJSON, outLen)
+	if !okLen {
+		return nil, fmt.Errorf("list_tools: response body length %d exceeds the maximum", uint64(outLen))
+	}
 	var out []ToolDescriptor
 	if err := json.Unmarshal(body, &out); err != nil {
 		return nil, fmt.Errorf("list_tools: decode payload: %w", err)
@@ -2249,10 +2258,12 @@ func go_net_rpc_streaming_trampoline(
 		return -1
 	}
 	// Copy the request body — the Rust-owned buffer's lifetime is
-	// bounded by this dispatcher call.
-	var req []byte
-	if reqLen > 0 && reqPtr != nil {
-		req = C.GoBytes(unsafe.Pointer(reqPtr), C.int(reqLen))
+	// bounded by this dispatcher call. `goBytesChecked` rejects an
+	// oversized inbound length rather than truncating via C.int.
+	req, okLen := goBytesChecked(reqPtr, reqLen)
+	if !okLen {
+		writeCError(outErr, fmt.Sprintf("streaming request body length %d exceeds the maximum", uint64(reqLen)))
+		return -1
 	}
 	sink := &ResponseSinkSend{handle: responseSink}
 	err := safeCallStreamingHandler(handler, req, sink)

@@ -350,9 +350,11 @@ int go_net_rpc_duplex_trampoline(
 import "C"
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"runtime/cgo"
@@ -465,7 +467,13 @@ func go_net_rpc_handler_trampoline(
 	// Copy request bytes into a Go-owned slice so the user's
 	// handler can capture / mutate freely without aliasing the
 	// Rust-owned buffer (which is only valid for this call).
-	req := C.GoBytes(unsafe.Pointer(reqPtr), C.int(reqLen))
+	// `goBytesChecked` (not `C.GoBytes`) so an oversized inbound
+	// length can't truncate/sign-flip via the 32-bit C.int cast.
+	req, okLen := goBytesChecked(reqPtr, reqLen)
+	if !okLen {
+		writeCError(outErr, fmt.Sprintf("request body length %d exceeds the maximum", uint64(reqLen)))
+		return -1
+	}
 
 	// Recover from handler panics so a buggy user handler doesn't
 	// crash the whole process.
@@ -514,6 +522,33 @@ func writeCError(out **C.char, msg string) {
 	}
 	cs := C.CString(msg) // C.malloc-backed; Rust frees via libc::free.
 	*out = cs
+}
+
+// goBytesChecked turns a `(ptr, size_t len)` pair from the FFI into an
+// owned `[]byte`, refusing lengths that don't fit a Go `int`.
+//
+// It exists because `C.GoBytes(ptr, C.int(len))` casts the length to
+// `C.int`, which is 32-bit signed even on 64-bit hosts: a length with
+// bit 31 set sign-flips negative (cgo then panics with "negative
+// length", crashing the callback before any recover runs), and a
+// length >= 4 GiB mod 2^32 yields a short copy that desyncs framing.
+// Both are reachable from an inbound mesh peer's request / event body.
+// `unsafe.Slice` takes a platform-`int` (64-bit) length and
+// `bytes.Clone` copies into a Go-owned slice, sidestepping the
+// truncation entirely.
+//
+// Returns `(nil, true)` for an empty/null payload (the FFI "no body"
+// shape) and `(nil, false)` when the length is out of range; callers
+// map `false` onto their own error / status convention.
+func goBytesChecked(ptr *C.uint8_t, length C.size_t) ([]byte, bool) {
+	if length == 0 || ptr == nil {
+		return nil, true
+	}
+	if uint64(length) > uint64(math.MaxInt) {
+		return nil, false
+	}
+	view := unsafe.Slice((*byte)(unsafe.Pointer(ptr)), int(length))
+	return bytes.Clone(view), true
 }
 
 // =====================================================================
@@ -2209,10 +2244,12 @@ func go_net_rpc_streaming_trampoline(
 		return -1
 	}
 	// Copy the request body — the Rust-owned buffer's lifetime is
-	// bounded by this dispatcher call.
-	var req []byte
-	if reqLen > 0 && reqPtr != nil {
-		req = C.GoBytes(unsafe.Pointer(reqPtr), C.int(reqLen))
+	// bounded by this dispatcher call. `goBytesChecked` rejects an
+	// oversized inbound length rather than truncating via C.int.
+	req, okLen := goBytesChecked(reqPtr, reqLen)
+	if !okLen {
+		writeCError(outErr, fmt.Sprintf("streaming request body length %d exceeds the maximum", uint64(reqLen)))
+		return -1
 	}
 	sink := &ResponseSinkSend{handle: responseSink}
 	err := safeCallStreamingHandler(handler, req, sink)
