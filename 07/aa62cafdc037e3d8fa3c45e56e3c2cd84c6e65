@@ -1,0 +1,30 @@
+net/crates/net/bindings/python/python/net/tool.py
+  s_099fa7d871e34d::t_44d7c44ee552cd 572
+  s_099fa7d871e34d::t_2baf001fae966d 457-495,499,505-520,523-524,526-528,532,539-545
+net/crates/net/bindings/python/src/lib.rs
+  s_099fa7d871e34d::t_d265631dece447 2917-2918
+  s_099fa7d871e34d::t_14939fc82e96be 1926-1951,1959-1962
+  s_099fa7d871e34d::t_14d3f06b3d34b9 1952-1958
+net/crates/net/bindings/python/tests/test_tool.py
+  s_099fa7d871e34d::t_ffef2c6b11b644 583-680
+  s_099fa7d871e34d::t_b19fa4c088d9f2 681-722
+  s_099fa7d871e34d::t_c20dabd046a1a2 38
+net/crates/net/bindings/python/src/cortex.rs
+  s_099fa7d871e34d::t_6d82c625280ec5 3307-3464
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "07aa62cafdc037e3d8fa3c45e56e3c2cd84c6e65",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
