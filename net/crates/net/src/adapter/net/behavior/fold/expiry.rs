@@ -21,6 +21,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
+use tokio::sync::watch;
 
 use super::audit::FoldAuditSink;
 use super::state::{EntryTransition, FoldIndex, FoldState};
@@ -144,6 +145,7 @@ pub(super) fn spawn_expiry_task<K: FoldKind>(
     index: Weak<RwLock<K::Index>>,
     metrics: Weak<FoldMetrics>,
     audit_sink: Weak<parking_lot::RwLock<Option<Arc<dyn FoldAuditSink>>>>,
+    change_tx: Weak<watch::Sender<u64>>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -169,7 +171,16 @@ pub(super) fn spawn_expiry_task<K: FoldKind>(
             let sink_holder = audit_sink.upgrade();
             let sink_guard = sink_holder.as_ref().map(|h| h.read());
             let sink_ref = sink_guard.as_ref().and_then(|g| g.as_ref());
-            sweep_expired::<K>(&state, &index, &metrics, sink_ref);
+            let reaped = sweep_expired::<K>(&state, &index, &metrics, sink_ref);
+            // Wake fold-change subscribers if this sweep actually
+            // removed anything — a TTL-expired peer's tools should
+            // surface as a `Removed` on any `watch_*` consumer
+            // without waiting for the debounce-ceiling fallback.
+            if reaped > 0 {
+                if let Some(tx) = change_tx.upgrade() {
+                    tx.send_modify(|g| *g = g.wrapping_add(1));
+                }
+            }
         }
     })
 }
