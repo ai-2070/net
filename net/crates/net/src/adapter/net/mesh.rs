@@ -5551,6 +5551,15 @@ impl MeshNode {
         // diff task (which awaits in `send`) instead of letting
         // ToolListChange events accumulate without bound.
         let (tx, rx) = tokio::sync::mpsc::channel::<ToolListChange>(256);
+        // Cancel signal so a consumer can stop the diff task even
+        // when it's parked on the change signal with nothing reading
+        // the receiver. The task holds `cancel_task`; the returned
+        // `ToolListWatch` holds `cancel` and exposes `.cancel()` /
+        // `.cancel_handle()`. `notify_one` stores a permit, so a
+        // cancel racing the diff phase is still caught on the next
+        // `select!`.
+        let cancel = std::sync::Arc::new(Notify::new());
+        let cancel_task = cancel.clone();
         // Subscribe to the fold's change signal BEFORE taking the
         // baseline snapshot. A mutation landing between the snapshot
         // and the subscribe would otherwise be lost (the receiver
@@ -5608,6 +5617,18 @@ impl MeshNode {
                             None => std::future::pending::<()>().await,
                         }
                     } => {}
+                    // Explicit cancel (FFI close, or `ToolListWatch::cancel`).
+                    // Returning drops `tx`, which unblocks any consumer
+                    // parked in a synchronous recv with `None`.
+                    _ = cancel_task.notified() => {
+                        return;
+                    }
+                    // Receiver dropped (the `ToolListWatch` was dropped
+                    // without an explicit cancel) — stop promptly
+                    // instead of waiting for the next fold change.
+                    _ = tx.closed() => {
+                        return;
+                    }
                 }
                 if tx.is_closed() {
                     return;
@@ -5657,7 +5678,10 @@ impl MeshNode {
                 prev = next;
             }
         });
-        ToolListWatch { receiver: rx }
+        ToolListWatch {
+            receiver: rx,
+            cancel,
+        }
     }
 
     /// Per-Mesh caller-side nRPC metrics registry. Accessor for

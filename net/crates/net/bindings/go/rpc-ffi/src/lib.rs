@@ -3563,6 +3563,13 @@ pub extern "C" fn net_rpc_list_tools(
 #[cfg(feature = "tool")]
 pub struct ToolWatchHandleC {
     inner: Arc<Mutex<Option<net::adapter::net::cortex::tool::ToolListWatch>>>,
+    /// Cancel handle cloned from the `ToolListWatch`. Held
+    /// separately from `inner` so `net_rpc_watch_tools_close` can
+    /// fire it while a `next()` call has the stream taken out of
+    /// the mutex and is blocked in `recv`. Firing it exits the
+    /// substrate diff task, which drops the sender and unblocks the
+    /// parked recv with `None`.
+    cancel: Arc<tokio::sync::Notify>,
     done: AtomicBool,
 }
 
@@ -3600,8 +3607,10 @@ pub extern "C" fn net_rpc_watch_tools(
         Some(std::time::Duration::from_millis(interval_ms))
     };
     let watch = h.node.watch_tools(None, interval);
+    let cancel = watch.cancel_handle();
     let boxed = Box::new(ToolWatchHandleC {
         inner: Arc::new(Mutex::new(Some(watch))),
+        cancel,
         done: AtomicBool::new(false),
     });
     unsafe {
@@ -3701,11 +3710,18 @@ pub extern "C" fn net_rpc_watch_tools_next(
     }
 }
 
-/// Latch the watch closed and drop the inner stream (stops the
-/// substrate diff task on its next wake). Idempotent on NULL or
-/// already-closed. A `next()` blocked in flight resolves on its
-/// next event; the subsequent `next()` returns
-/// [`NET_RPC_ERR_STREAM_DONE`]. Mirrors [`net_rpc_stream_close`].
+/// Latch the watch closed and fire the substrate cancel. Safe to
+/// call from another thread while a `next()` is blocked in `recv`:
+/// firing the cancel exits the substrate diff task, which drops
+/// the sender and unblocks the parked `recv` with `None` (so the
+/// blocked `next()` returns [`NET_RPC_ERR_STREAM_DONE`] promptly
+/// instead of waiting for the next fold change). Idempotent on
+/// NULL or already-closed.
+///
+/// Note: this does NOT `take()` the inner stream — a concurrent
+/// blocked `next()` owns it. The cancel + sender-drop is what
+/// unwedges it; the stream is dropped when `next()` observes the
+/// `None` (or at `free`).
 #[cfg(feature = "tool")]
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_watch_tools_close(watch: *mut ToolWatchHandleC) {
@@ -3713,7 +3729,7 @@ pub extern "C" fn net_rpc_watch_tools_close(watch: *mut ToolWatchHandleC) {
         return;
     };
     w.done.store(true, Ordering::Relaxed);
-    let _ = w.inner.lock().take();
+    w.cancel.notify_one();
 }
 
 /// Free the watch handle. Implicitly closes if not already.
