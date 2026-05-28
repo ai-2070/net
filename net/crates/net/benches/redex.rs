@@ -16,8 +16,22 @@
 //!   `IntervalOrBytes`). Confirms the appender doesn't pay
 //!   fsync cost when the worker absorbs it (Phases 3 + 4).
 //! - **Tail latency** — append → subscriber observes the new seq
+//!
+//! ## Why the append loops recreate the file
+//!
+//! Every `append` grows an append-only segment capped at
+//! `MAX_SEGMENT_BYTES` (3 GB) with no in-loop retention/rollover. A
+//! naive `b.iter(|| f.append(..))` over a single reused file fills
+//! that 3 GB on a fast machine mid-measurement, after which every
+//! further `append` returns `PayloadTooLarge` and the `.unwrap()`
+//! panics. The append benches therefore drive `b.iter_custom` through
+//! [`timed_appends`], which recreates the backing file every
+//! [`BENCH_FILE_CAP_BYTES`] of payload — only the appends are timed,
+//! file (re)creation and teardown are excluded. This also bounds peak
+//! RAM and on-disk footprint to a single file's worth.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -36,6 +50,68 @@ fn cn(s: &str) -> ChannelName {
     ChannelName::new(s).unwrap()
 }
 
+/// Per-file payload budget before [`timed_appends`] recreates the
+/// backing file. Comfortably under `MAX_SEGMENT_BYTES` (3 GB) so a
+/// long criterion run never trips `PayloadTooLarge`, yet large enough
+/// that file (re)creation amortises across many appends and the
+/// segment reaches steady state. Doubles as the peak RAM / on-disk
+/// bound per bench.
+const BENCH_FILE_CAP_BYTES: usize = 256 * 1024 * 1024;
+
+/// How many ops a single file should absorb given `bytes_per_op`
+/// (payload size for single appends; `batch_len * payload` for batch
+/// appends). Floored at 1 so a pathologically large payload still
+/// makes progress.
+fn ops_per_file(bytes_per_op: usize) -> u64 {
+    (BENCH_FILE_CAP_BYTES / bytes_per_op.max(1)).max(1) as u64
+}
+
+/// Time exactly `iters` append-style ops, recreating the backing file
+/// every `per_file` ops so the append-only segment never fills to
+/// `MAX_SEGMENT_BYTES`. Only the `op` calls are timed; `make` and
+/// dropping its result (which, for disk benches, deletes the file's
+/// temp dir via `DirGuard`) are excluded.
+///
+/// `make` returns whatever state must stay alive for the run — a
+/// `(RedexFile, Redex, …)` tuple — and `op` is handed `&that`. The
+/// tuple drops front-to-back at the end of each file's run, so the
+/// `RedexFile` closes before any `DirGuard` removes its directory.
+fn timed_appends<T>(
+    iters: u64,
+    per_file: u64,
+    mut make: impl FnMut() -> T,
+    op: impl Fn(&T),
+) -> Duration {
+    let mut total = Duration::ZERO;
+    let mut remaining = iters;
+    while remaining > 0 {
+        let file = make();
+        let n = per_file.min(remaining);
+        let start = Instant::now();
+        for _ in 0..n {
+            op(&file);
+        }
+        total += start.elapsed();
+        remaining -= n;
+        drop(file);
+    }
+    total
+}
+
+/// Deletes a per-file temp dir on drop so a long disk bench keeps
+/// only one file's data on disk at a time. Held last in the
+/// `make`-returned tuple so the `RedexFile` (held first) closes
+/// before the directory is removed.
+#[cfg(feature = "redex-disk")]
+struct DirGuard(std::path::PathBuf);
+
+#[cfg(feature = "redex-disk")]
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 // ============================================================================
 // Append — inline vs heap.
 //
@@ -49,6 +125,9 @@ fn bench_append_inline(c: &mut Criterion) {
     let mut group = c.benchmark_group("redex_append_inline");
     group.throughput(Throughput::Elements(1));
 
+    // Inline payloads (≤8 B) live in the entry record, not the heap
+    // segment, so `append_inline` never grows `live_bytes` and a
+    // single reused file is safe here.
     group.bench_function("heap_file", |b| {
         let r = Redex::new();
         let f = r
@@ -69,14 +148,25 @@ fn bench_append_heap(c: &mut Criterion) {
         let payload = vec![0xCDu8; size];
 
         group.bench_with_input(BenchmarkId::new("heap_file", size), &size, |b, &s| {
-            let r = Redex::new();
-            let f = r
-                .open_file(
-                    &cn(&format!("bench/heap/mem/{}", s)),
-                    RedexFileConfig::default(),
+            b.iter_custom(|iters| {
+                timed_appends(
+                    iters,
+                    ops_per_file(s),
+                    || {
+                        let r = Redex::new();
+                        let f = r
+                            .open_file(
+                                &cn(&format!("bench/heap/mem/{}", s)),
+                                RedexFileConfig::default(),
+                            )
+                            .unwrap();
+                        (f, r)
+                    },
+                    |(f, _r)| {
+                        f.append(&payload).unwrap();
+                    },
                 )
-                .unwrap();
-            b.iter(|| f.append(&payload).unwrap());
+            });
         });
     }
 
@@ -100,27 +190,57 @@ fn bench_append_watcher_paths(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(payload.len() as u64));
 
     group.bench_function("no_watchers", |b| {
-        let r = Redex::new();
-        let f = r
-            .open_file(&cn("bench/watcher/none"), RedexFileConfig::default())
-            .unwrap();
-        b.iter(|| f.append(&payload).unwrap());
+        b.iter_custom(|iters| {
+            timed_appends(
+                iters,
+                ops_per_file(payload.len()),
+                || {
+                    let r = Redex::new();
+                    let f = r
+                        .open_file(&cn("bench/watcher/none"), RedexFileConfig::default())
+                        .unwrap();
+                    (f, r)
+                },
+                |(f, _r)| {
+                    f.append(&payload).unwrap();
+                },
+            )
+        });
     });
 
     group.bench_function("with_tail", |b| {
-        let _enter = runtime.enter();
-        let r = Redex::new();
-        let f = r
-            .open_file(&cn("bench/watcher/with"), RedexFileConfig::default())
-            .unwrap();
-        let mut stream = Box::pin(f.tail(0));
-        b.iter(|| {
-            f.append(&payload).unwrap();
-            // Drain so the bounded buffer never saturates and the
-            // benchmark doesn't measure disconnect handling.
-            runtime.block_on(async {
-                let _ = stream.next().await.unwrap();
-            });
+        b.iter_custom(|iters| {
+            // Heap files are non-persistent, so no fsync workers spawn
+            // at open and we don't need an ambient runtime context —
+            // `runtime.block_on` drives the drain explicitly. Recreate
+            // the file + its tail stream every `per_file` ops so the
+            // segment never fills.
+            let per_file = ops_per_file(payload.len());
+            let mut total = Duration::ZERO;
+            let mut remaining = iters;
+            while remaining > 0 {
+                let r = Redex::new();
+                let f = r
+                    .open_file(&cn("bench/watcher/with"), RedexFileConfig::default())
+                    .unwrap();
+                let mut stream = Box::pin(f.tail(0));
+                let n = per_file.min(remaining);
+                let start = Instant::now();
+                for _ in 0..n {
+                    f.append(&payload).unwrap();
+                    // Drain so the bounded buffer never saturates and
+                    // the benchmark doesn't measure disconnect handling.
+                    runtime.block_on(async {
+                        let _ = stream.next().await.unwrap();
+                    });
+                }
+                total += start.elapsed();
+                remaining -= n;
+                drop(stream);
+                drop(f);
+                drop(r);
+            }
+            total
         });
     });
 
@@ -140,12 +260,23 @@ fn bench_append_batch(c: &mut Criterion) {
     group.throughput(Throughput::Elements(BATCH as u64));
 
     group.bench_function(format!("batch_{}_x_64B", BATCH), |b| {
-        let r = Redex::new();
-        let f = r
-            .open_file(&cn("bench/batch/heap"), RedexFileConfig::default())
-            .unwrap();
         let payloads: Vec<Bytes> = (0..BATCH).map(|_| Bytes::from(vec![0xEE; 64])).collect();
-        b.iter(|| f.append_batch(&payloads).unwrap());
+        b.iter_custom(|iters| {
+            timed_appends(
+                iters,
+                ops_per_file(BATCH * 64),
+                || {
+                    let r = Redex::new();
+                    let f = r
+                        .open_file(&cn("bench/batch/heap"), RedexFileConfig::default())
+                        .unwrap();
+                    (f, r)
+                },
+                |(f, _r)| {
+                    f.append_batch(&payloads).unwrap();
+                },
+            )
+        });
     });
 
     group.finish();
@@ -162,20 +293,32 @@ fn bench_append_batch(c: &mut Criterion) {
 #[cfg(feature = "redex-disk")]
 fn bench_append_disk(c: &mut Criterion) {
     let mut group = c.benchmark_group("redex_append_disk");
-    let tmp = tempdir_prefix("redex_bench_disk");
 
     for &size in &[32usize, 256, 1024] {
         group.throughput(Throughput::Bytes(size as u64));
         let payload = vec![0xABu8; size];
 
         group.bench_with_input(BenchmarkId::new("disk_file", size), &size, |b, &s| {
-            let r = Redex::new().with_persistent_dir(&tmp);
-            let cfg = RedexFileConfig::default().with_persistent(true);
-            // Each bench gets its own channel so appends don't
-            // recover stale state between runs.
-            let name = cn(&format!("bench/disk/{}/{}", s, rand_suffix()));
-            let f = r.open_file(&name, cfg).unwrap();
-            b.iter(|| f.append(&payload).unwrap());
+            b.iter_custom(|iters| {
+                timed_appends(
+                    iters,
+                    ops_per_file(s),
+                    || {
+                        // Fresh isolated dir per file so `DirGuard` can
+                        // reclaim it; a fresh channel name avoids
+                        // recovering stale on-disk state.
+                        let dir = tempdir_prefix("redex_bench_disk");
+                        let r = Redex::new().with_persistent_dir(&dir);
+                        let cfg = RedexFileConfig::default().with_persistent(true);
+                        let name = cn(&format!("bench/disk/{}/{}", s, rand_suffix()));
+                        let f = r.open_file(&name, cfg).unwrap();
+                        (f, r, DirGuard(dir))
+                    },
+                    |(f, _r, _g)| {
+                        f.append(&payload).unwrap();
+                    },
+                )
+            });
         });
     }
 
@@ -188,7 +331,6 @@ fn bench_append_disk(c: &mut Criterion) {
 #[cfg(feature = "redex-disk")]
 fn bench_append_batch_disk(c: &mut Criterion) {
     let mut group = c.benchmark_group("redex_append_batch_disk");
-    let tmp = tempdir_prefix("redex_bench_batch_disk");
     const BATCH: usize = 64;
     group.throughput(Throughput::Elements(BATCH as u64));
 
@@ -197,12 +339,24 @@ fn bench_append_batch_disk(c: &mut Criterion) {
             BenchmarkId::new(format!("batch_{}_x", BATCH), size),
             &size,
             |b, &s| {
-                let r = Redex::new().with_persistent_dir(&tmp);
-                let cfg = RedexFileConfig::default().with_persistent(true);
-                let name = cn(&format!("bench/disk_batch/{}/{}", s, rand_suffix()));
-                let f = r.open_file(&name, cfg).unwrap();
                 let payloads: Vec<Bytes> = (0..BATCH).map(|_| Bytes::from(vec![0xEE; s])).collect();
-                b.iter(|| f.append_batch(&payloads).unwrap());
+                b.iter_custom(|iters| {
+                    timed_appends(
+                        iters,
+                        ops_per_file(BATCH * s),
+                        || {
+                            let dir = tempdir_prefix("redex_bench_batch_disk");
+                            let r = Redex::new().with_persistent_dir(&dir);
+                            let cfg = RedexFileConfig::default().with_persistent(true);
+                            let name = cn(&format!("bench/disk_batch/{}/{}", s, rand_suffix()));
+                            let f = r.open_file(&name, cfg).unwrap();
+                            (f, r, DirGuard(dir))
+                        },
+                        |(f, _r, _g)| {
+                            f.append_batch(&payloads).unwrap();
+                        },
+                    )
+                });
             },
         );
     }
@@ -220,7 +374,6 @@ fn bench_append_batch_disk(c: &mut Criterion) {
 #[cfg(feature = "redex-disk")]
 fn bench_append_disk_policies(c: &mut Criterion) {
     let mut group = c.benchmark_group("redex_append_disk_policies");
-    let tmp = tempdir_prefix("redex_bench_policies");
     let runtime = rt();
     let payload = vec![0xABu8; 256];
     group.throughput(Throughput::Bytes(payload.len() as u64));
@@ -243,19 +396,36 @@ fn bench_append_disk_policies(c: &mut Criterion) {
     ];
 
     for (name, policy) in policies {
-        group.bench_with_input(BenchmarkId::new("disk_file_256B", name), policy, |b, p| {
-            // Workers spawn at file-open time, so we need a
-            // tokio runtime in scope. The bench loop itself is
-            // synchronous — appends don't await.
-            let _enter = runtime.enter();
-            let r = Redex::new().with_persistent_dir(&tmp);
-            let cfg = RedexFileConfig::default()
-                .with_persistent(true)
-                .with_fsync_policy(*p);
-            let chan = cn(&format!("bench/policies/{}/{}", name, rand_suffix()));
-            let f = r.open_file(&chan, cfg).unwrap();
-            b.iter(|| f.append(&payload).unwrap());
-        });
+        let policy = *policy;
+        group.bench_with_input(
+            BenchmarkId::new("disk_file_256B", name),
+            &policy,
+            |b, &p| {
+                b.iter_custom(|iters| {
+                    // Fsync workers spawn at file-open time, so each
+                    // `make` opens under the runtime context. The appends
+                    // themselves are synchronous (they don't await).
+                    let _enter = runtime.enter();
+                    timed_appends(
+                        iters,
+                        ops_per_file(payload.len()),
+                        || {
+                            let dir = tempdir_prefix("redex_bench_policies");
+                            let r = Redex::new().with_persistent_dir(&dir);
+                            let cfg = RedexFileConfig::default()
+                                .with_persistent(true)
+                                .with_fsync_policy(p);
+                            let chan = cn(&format!("bench/policies/{}", rand_suffix()));
+                            let f = r.open_file(&chan, cfg).unwrap();
+                            (f, r, DirGuard(dir))
+                        },
+                        |(f, _r, _g)| {
+                            f.append(&payload).unwrap();
+                        },
+                    )
+                });
+            },
+        );
     }
 
     group.finish();
@@ -269,7 +439,6 @@ fn bench_append_disk_policies(c: &mut Criterion) {
 #[cfg(feature = "redex-disk")]
 fn bench_append_batch_disk_policies(c: &mut Criterion) {
     let mut group = c.benchmark_group("redex_append_batch_disk_policies");
-    let tmp = tempdir_prefix("redex_bench_batch_policies");
     let runtime = rt();
     const BATCH: usize = 64;
     group.throughput(Throughput::Elements(BATCH as u64));
@@ -288,17 +457,35 @@ fn bench_append_batch_disk_policies(c: &mut Criterion) {
     ];
 
     for (name, policy) in policies {
-        group.bench_with_input(BenchmarkId::new("batch_64_x_64B", name), policy, |b, p| {
-            let _enter = runtime.enter();
-            let r = Redex::new().with_persistent_dir(&tmp);
-            let cfg = RedexFileConfig::default()
-                .with_persistent(true)
-                .with_fsync_policy(*p);
-            let chan = cn(&format!("bench/batch_policies/{}/{}", name, rand_suffix()));
-            let f = r.open_file(&chan, cfg).unwrap();
-            let payloads: Vec<Bytes> = (0..BATCH).map(|_| Bytes::from(vec![0xEE; 64])).collect();
-            b.iter(|| f.append_batch(&payloads).unwrap());
-        });
+        let policy = *policy;
+        group.bench_with_input(
+            BenchmarkId::new("batch_64_x_64B", name),
+            &policy,
+            |b, &p| {
+                let payloads: Vec<Bytes> =
+                    (0..BATCH).map(|_| Bytes::from(vec![0xEE; 64])).collect();
+                b.iter_custom(|iters| {
+                    let _enter = runtime.enter();
+                    timed_appends(
+                        iters,
+                        ops_per_file(BATCH * 64),
+                        || {
+                            let dir = tempdir_prefix("redex_bench_batch_policies");
+                            let r = Redex::new().with_persistent_dir(&dir);
+                            let cfg = RedexFileConfig::default()
+                                .with_persistent(true)
+                                .with_fsync_policy(p);
+                            let chan = cn(&format!("bench/batch_policies/{}", rand_suffix()));
+                            let f = r.open_file(&chan, cfg).unwrap();
+                            (f, r, DirGuard(dir))
+                        },
+                        |(f, _r, _g)| {
+                            f.append_batch(&payloads).unwrap();
+                        },
+                    )
+                });
+            },
+        );
     }
 
     group.finish();
@@ -314,14 +501,19 @@ fn tempdir_prefix(prefix: &str) -> std::path::PathBuf {
 
 #[cfg(feature = "redex-disk")]
 fn rand_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    format!(
-        "{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    )
+    // Monotonic counter + nanos: `timed_appends` recreates files in a
+    // tight loop, so two `rand_suffix()` calls can land in the same
+    // nanosecond on a fast clock; the counter keeps channel/dir names
+    // unique regardless.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}_{}", nanos, n)
 }
 
 // ============================================================================
@@ -338,19 +530,32 @@ fn bench_tail_latency(c: &mut Criterion) {
     let runtime = rt();
 
     group.bench_function("append_to_next", |b| {
-        let _enter = runtime.enter();
-        let r = Redex::new();
-        let f = r
-            .open_file(&cn("bench/tail/latency"), RedexFileConfig::default())
-            .unwrap();
-        let mut stream = Box::pin(f.tail(0));
         let payload = vec![0u8; 32];
-
-        b.iter(|| {
-            f.append(&payload).unwrap();
-            runtime.block_on(async {
-                let _ = stream.next().await.unwrap();
-            });
+        b.iter_custom(|iters| {
+            let per_file = ops_per_file(payload.len());
+            let mut total = Duration::ZERO;
+            let mut remaining = iters;
+            while remaining > 0 {
+                let r = Redex::new();
+                let f = r
+                    .open_file(&cn("bench/tail/latency"), RedexFileConfig::default())
+                    .unwrap();
+                let mut stream = Box::pin(f.tail(0));
+                let n = per_file.min(remaining);
+                let start = Instant::now();
+                for _ in 0..n {
+                    f.append(&payload).unwrap();
+                    runtime.block_on(async {
+                        let _ = stream.next().await.unwrap();
+                    });
+                }
+                total += start.elapsed();
+                remaining -= n;
+                drop(stream);
+                drop(f);
+                drop(r);
+            }
+            total
         });
     });
 
