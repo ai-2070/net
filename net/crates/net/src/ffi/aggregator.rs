@@ -15,7 +15,6 @@
 )]
 
 use std::ffi::{c_char, c_int, CStr, CString};
-use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
@@ -146,7 +145,12 @@ pub unsafe extern "C" fn net_registry_client_new(
     if mesh_handle.is_null() {
         return std::ptr::null_mut();
     }
-    let mesh_arc = unsafe { super::mesh::mesh_node_arc(&*mesh_handle) };
+    // Gated clone of the mesh node — `None` means the mesh handle is
+    // being freed concurrently; surface a null handle rather than
+    // racing the inner out of `ManuallyDrop`.
+    let Some(mesh_arc) = (unsafe { super::mesh::mesh_node_arc(&*mesh_handle) }) else {
+        return std::ptr::null_mut();
+    };
     let boxed = Box::new(RegistryClientHandle {
         client: ParkingRwLock::new(RegistryClient::new(mesh_arc)),
         last_error_detail: ParkingMutex::new(None),
@@ -413,8 +417,9 @@ pub unsafe extern "C" fn net_register_channel(
     // mesh-FFI's net_mesh_new always installs one, so this is
     // safe; if it ever changes, the registry being `None` is
     // surfaced as NET_REGISTRY_ERR_INVALID_ARGS.
-    let mesh_arc: Arc<crate::adapter::net::MeshNode> =
-        unsafe { super::mesh::mesh_node_arc(&*mesh_handle) };
+    let Some(mesh_arc) = (unsafe { super::mesh::mesh_node_arc(&*mesh_handle) }) else {
+        return NET_REGISTRY_ERR_INVALID_ARGS;
+    };
     let Some(configs) = mesh_arc.channel_configs() else {
         return NET_REGISTRY_ERR_INVALID_ARGS;
     };
@@ -445,7 +450,9 @@ pub unsafe extern "C" fn net_fold_query_client_new(
     if mesh_handle.is_null() {
         return std::ptr::null_mut();
     }
-    let mesh_arc = unsafe { super::mesh::mesh_node_arc(&*mesh_handle) };
+    let Some(mesh_arc) = (unsafe { super::mesh::mesh_node_arc(&*mesh_handle) }) else {
+        return std::ptr::null_mut();
+    };
     let boxed = Box::new(FoldQueryClientHandle {
         client: ParkingRwLock::new(FoldQueryClient::new(mesh_arc)),
         last_error_detail: ParkingMutex::new(None),

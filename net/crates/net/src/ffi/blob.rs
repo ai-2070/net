@@ -882,13 +882,46 @@ pub unsafe extern "C" fn net_blob_register_callback_adapter(
 /// the adapter — but the FFI surface only ever hands out one
 /// handle per `_new` call; the operator clones at the Go layer
 /// if they want fan-out. Free with [`net_mesh_blob_adapter_free`].
+///
+/// Carries a [`HandleGuard`] inline so a concurrent `_free` racing an
+/// in-flight op cannot deallocate the inner out from under it. Same
+/// quiescing recipe as the cortex / mesh / redis handles: every op
+/// gates on `guard.try_enter()`; `_free` drives `guard.begin_free()`
+/// and leaks the box (dropping only the inner). See
+/// [`super::handle_guard`] for the soundness argument.
 #[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
 pub struct MeshBlobAdapterHandle {
     inner: ManuallyDrop<Arc<InnerMeshBlobAdapter>>,
+    guard: HandleGuard,
 }
 
 #[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
 use std::mem::ManuallyDrop;
+
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+use super::handle_guard::{HandleGuard, FFI_HANDLE_FREE_DEADLINE};
+
+/// Run a blob-adapter FFI body under `catch_unwind`. With
+/// `panic = "unwind"`, a panic escaping an `extern "C"` function is UB
+/// across the cgo / N-API / cffi boundary. The shim catches the
+/// unwind, logs, and returns the caller-supplied fallback — matching
+/// the protection `net_blob_publish` / `net_blob_resolve` already
+/// carry, which the metrics / config accessors previously lacked.
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+#[inline]
+fn adapter_guard<R>(name: &'static str, fallback: R, f: impl FnOnce() -> R) -> R {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(_) => {
+            tracing::error!(
+                ffi_function = name,
+                "panic caught in mesh blob adapter FFI; returning fallback to avoid \
+                 UB across the C boundary",
+            );
+            fallback
+        }
+    }
+}
 
 /// JSON shape for the `overflow` config option passed to
 /// [`net_mesh_blob_adapter_new`] + [`net_mesh_blob_adapter_set_overflow_config`].
@@ -1016,13 +1049,19 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_new(
         Ok(c) => c,
         Err(_) => return ptr::null_mut(),
     };
-    let redex_inner = unsafe { (*redex).redex_arc() };
+    // Gated clone of the redex inner — `None` means the redex handle
+    // is being freed concurrently; surface a null handle rather than
+    // racing the inner out of `ManuallyDrop`.
+    let Some(redex_inner) = (unsafe { (*redex).redex_arc() }) else {
+        return ptr::null_mut();
+    };
     let mut builder = InnerMeshBlobAdapter::new(id, redex_inner).with_persistent(persistent != 0);
     if !overflow_str.is_empty() {
         builder = builder.with_overflow(overflow_cfg);
     }
     Box::into_raw(Box::new(MeshBlobAdapterHandle {
         inner: ManuallyDrop::new(Arc::new(builder)),
+        guard: HandleGuard::new(),
     }))
 }
 
@@ -1038,8 +1077,23 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_free(handle: *mut MeshBlobAdapter
     if handle.is_null() {
         return;
     }
-    let mut boxed = unsafe { Box::from_raw(handle) };
-    unsafe { ManuallyDrop::drop(&mut boxed.inner) };
+    // Quiesce in-flight ops before dropping the inner; the box stays
+    // leaked (never `Box::from_raw`) so a concurrent op's `try_enter`
+    // fetch_add still lands on valid memory. See `super::handle_guard`.
+    let h: &MeshBlobAdapterHandle = unsafe { &*handle };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        // SAFETY: drained; sole writable reference. Single-winner
+        // contract on `begin_free` makes this `take` happen at most once.
+        unsafe {
+            let inner = ManuallyDrop::take(&mut (*handle).inner);
+            drop(inner);
+        }
+    } else {
+        tracing::warn!(
+            "net_mesh_blob_adapter_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
+    }
 }
 
 /// Store `data` of `data_len` bytes under the content address
@@ -1063,30 +1117,39 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_store(
     data: *const u8,
     data_len: usize,
 ) -> c_int {
-    if handle.is_null() || blob_ref_bytes.is_null() {
-        return NetError::NullPointer.into();
-    }
-    // `slice::from_raw_parts` requires `len <= isize::MAX`.
-    if blob_ref_len > isize::MAX as usize || data_len > isize::MAX as usize {
-        return NetError::InvalidJson.into();
-    }
-    let blob_slice = unsafe { std::slice::from_raw_parts(blob_ref_bytes, blob_ref_len) };
-    let blob_ref = match InnerBlobRef::decode(blob_slice) {
-        Ok(Some(b)) => b,
-        _ => return NET_ERR_BLOB_DECODE,
-    };
-    let data_slice = if data.is_null() {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(data, data_len) }
-    };
-    let adapter = unsafe { (*handle).inner.clone() };
-    let data_owned = data_slice.to_vec();
-    let result = block_on(async move { (*adapter).store(&blob_ref, &data_owned).await });
-    match result {
-        Ok(()) => 0,
-        Err(e) => err_to_code(&e),
-    }
+    let null_rc: c_int = NetError::NullPointer.into();
+    adapter_guard("net_mesh_blob_adapter_store", null_rc, || {
+        if handle.is_null() || blob_ref_bytes.is_null() {
+            return NetError::NullPointer.into();
+        }
+        // `slice::from_raw_parts` requires `len <= isize::MAX`.
+        if blob_ref_len > isize::MAX as usize || data_len > isize::MAX as usize {
+            return NetError::InvalidJson.into();
+        }
+        let h = unsafe { &*handle };
+        // Bail (same shape as null handle) if `_free` has begun.
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return NetError::NullPointer.into(),
+        };
+        let blob_slice = unsafe { std::slice::from_raw_parts(blob_ref_bytes, blob_ref_len) };
+        let blob_ref = match InnerBlobRef::decode(blob_slice) {
+            Ok(Some(b)) => b,
+            _ => return NET_ERR_BLOB_DECODE,
+        };
+        let data_slice = if data.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(data, data_len) }
+        };
+        let adapter = h.inner.clone();
+        let data_owned = data_slice.to_vec();
+        let result = block_on(async move { (*adapter).store(&blob_ref, &data_owned).await });
+        match result {
+            Ok(()) => 0,
+            Err(e) => err_to_code(&e),
+        }
+    })
 }
 
 /// Fetch the content for `blob_ref_bytes`. On success writes a
@@ -1106,29 +1169,37 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_fetch(
     out_data: *mut *mut u8,
     out_len: *mut usize,
 ) -> c_int {
-    if handle.is_null() || blob_ref_bytes.is_null() || out_data.is_null() || out_len.is_null() {
-        return NetError::NullPointer.into();
-    }
-    // `slice::from_raw_parts` requires `len <= isize::MAX`.
-    if blob_ref_len > isize::MAX as usize {
-        return NetError::InvalidJson.into();
-    }
-    let blob_slice = unsafe { std::slice::from_raw_parts(blob_ref_bytes, blob_ref_len) };
-    let blob_ref = match InnerBlobRef::decode(blob_slice) {
-        Ok(Some(b)) => b,
-        _ => return NET_ERR_BLOB_DECODE,
-    };
-    let adapter = unsafe { (*handle).inner.clone() };
-    let result = block_on(async move { (*adapter).fetch(&blob_ref).await });
-    match result {
-        // Allocate with the same explicit `Layout::array::<u8>(len)`
-        // path that `net_blob_free_buffer` deallocates with, so the
-        // pair is layout-symmetric regardless of any future
-        // `Vec::leak` / `into_boxed_slice` refactor inside the
-        // adapter.
-        Ok(bytes) => unsafe { write_bytes_out(&bytes, out_data, out_len) },
-        Err(e) => err_to_code(&e),
-    }
+    let null_rc: c_int = NetError::NullPointer.into();
+    adapter_guard("net_mesh_blob_adapter_fetch", null_rc, || {
+        if handle.is_null() || blob_ref_bytes.is_null() || out_data.is_null() || out_len.is_null() {
+            return NetError::NullPointer.into();
+        }
+        // `slice::from_raw_parts` requires `len <= isize::MAX`.
+        if blob_ref_len > isize::MAX as usize {
+            return NetError::InvalidJson.into();
+        }
+        let h = unsafe { &*handle };
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return NetError::NullPointer.into(),
+        };
+        let blob_slice = unsafe { std::slice::from_raw_parts(blob_ref_bytes, blob_ref_len) };
+        let blob_ref = match InnerBlobRef::decode(blob_slice) {
+            Ok(Some(b)) => b,
+            _ => return NET_ERR_BLOB_DECODE,
+        };
+        let adapter = h.inner.clone();
+        let result = block_on(async move { (*adapter).fetch(&blob_ref).await });
+        match result {
+            // Allocate with the same explicit `Layout::array::<u8>(len)`
+            // path that `net_blob_free_buffer` deallocates with, so the
+            // pair is layout-symmetric regardless of any future
+            // `Vec::leak` / `into_boxed_slice` refactor inside the
+            // adapter.
+            Ok(bytes) => unsafe { write_bytes_out(&bytes, out_data, out_len) },
+            Err(e) => err_to_code(&e),
+        }
+    })
 }
 
 /// Probe local presence — writes `1` to `*out_exists` if the chunk
@@ -1145,27 +1216,35 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_exists(
     blob_ref_len: usize,
     out_exists: *mut c_int,
 ) -> c_int {
-    if handle.is_null() || blob_ref_bytes.is_null() || out_exists.is_null() {
-        return NetError::NullPointer.into();
-    }
-    // `slice::from_raw_parts` requires `len <= isize::MAX`.
-    if blob_ref_len > isize::MAX as usize {
-        return NetError::InvalidJson.into();
-    }
-    let blob_slice = unsafe { std::slice::from_raw_parts(blob_ref_bytes, blob_ref_len) };
-    let blob_ref = match InnerBlobRef::decode(blob_slice) {
-        Ok(Some(b)) => b,
-        _ => return NET_ERR_BLOB_DECODE,
-    };
-    let adapter = unsafe { (*handle).inner.clone() };
-    let result = block_on(async move { (*adapter).exists(&blob_ref).await });
-    match result {
-        Ok(present) => {
-            unsafe { *out_exists = if present { 1 } else { 0 } };
-            0
+    let null_rc: c_int = NetError::NullPointer.into();
+    adapter_guard("net_mesh_blob_adapter_exists", null_rc, || {
+        if handle.is_null() || blob_ref_bytes.is_null() || out_exists.is_null() {
+            return NetError::NullPointer.into();
         }
-        Err(e) => err_to_code(&e),
-    }
+        // `slice::from_raw_parts` requires `len <= isize::MAX`.
+        if blob_ref_len > isize::MAX as usize {
+            return NetError::InvalidJson.into();
+        }
+        let h = unsafe { &*handle };
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return NetError::NullPointer.into(),
+        };
+        let blob_slice = unsafe { std::slice::from_raw_parts(blob_ref_bytes, blob_ref_len) };
+        let blob_ref = match InnerBlobRef::decode(blob_slice) {
+            Ok(Some(b)) => b,
+            _ => return NET_ERR_BLOB_DECODE,
+        };
+        let adapter = h.inner.clone();
+        let result = block_on(async move { (*adapter).exists(&blob_ref).await });
+        match result {
+            Ok(present) => {
+                unsafe { *out_exists = if present { 1 } else { 0 } };
+                0
+            }
+            Err(e) => err_to_code(&e),
+        }
+    })
 }
 
 /// Render the adapter's Prometheus text body. Returns a
@@ -1180,15 +1259,26 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_exists(
 pub unsafe extern "C" fn net_mesh_blob_adapter_prometheus_text(
     handle: *const MeshBlobAdapterHandle,
 ) -> *mut c_char {
-    if handle.is_null() {
-        return ptr::null_mut();
-    }
-    let adapter = unsafe { (*handle).inner.clone() };
-    let body = (*adapter).prometheus_text();
-    match std::ffi::CString::new(body) {
-        Ok(s) => s.into_raw(),
-        Err(_) => ptr::null_mut(),
-    }
+    adapter_guard(
+        "net_mesh_blob_adapter_prometheus_text",
+        ptr::null_mut(),
+        || {
+            if handle.is_null() {
+                return ptr::null_mut();
+            }
+            let h = unsafe { &*handle };
+            let _op = match h.guard.try_enter() {
+                Some(op) => op,
+                None => return ptr::null_mut(),
+            };
+            let adapter = h.inner.clone();
+            let body = (*adapter).prometheus_text();
+            match std::ffi::CString::new(body) {
+                Ok(s) => s.into_raw(),
+                Err(_) => ptr::null_mut(),
+            }
+        },
+    )
 }
 
 // ---- v0.3 active-overflow surface ----
@@ -1203,15 +1293,23 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_prometheus_text(
 pub unsafe extern "C" fn net_mesh_blob_adapter_overflow_enabled(
     handle: *const MeshBlobAdapterHandle,
 ) -> c_int {
-    if handle.is_null() {
-        return NetError::NullPointer.into();
-    }
-    let adapter = unsafe { (*handle).inner.clone() };
-    if (*adapter).overflow_enabled() {
-        1
-    } else {
-        0
-    }
+    let null_rc: c_int = NetError::NullPointer.into();
+    adapter_guard("net_mesh_blob_adapter_overflow_enabled", null_rc, || {
+        if handle.is_null() {
+            return NetError::NullPointer.into();
+        }
+        let h = unsafe { &*handle };
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return NetError::NullPointer.into(),
+        };
+        let adapter = h.inner.clone();
+        if (*adapter).overflow_enabled() {
+            1
+        } else {
+            0
+        }
+    })
 }
 
 /// True / false for `overflow_active` (the hysteresis runtime
@@ -1224,15 +1322,23 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_overflow_enabled(
 pub unsafe extern "C" fn net_mesh_blob_adapter_overflow_active(
     handle: *const MeshBlobAdapterHandle,
 ) -> c_int {
-    if handle.is_null() {
-        return NetError::NullPointer.into();
-    }
-    let adapter = unsafe { (*handle).inner.clone() };
-    if (*adapter).overflow_active() {
-        1
-    } else {
-        0
-    }
+    let null_rc: c_int = NetError::NullPointer.into();
+    adapter_guard("net_mesh_blob_adapter_overflow_active", null_rc, || {
+        if handle.is_null() {
+            return NetError::NullPointer.into();
+        }
+        let h = unsafe { &*handle };
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return NetError::NullPointer.into(),
+        };
+        let adapter = h.inner.clone();
+        if (*adapter).overflow_active() {
+            1
+        } else {
+            0
+        }
+    })
 }
 
 /// Snapshot the current overflow configuration as a JSON
@@ -1246,16 +1352,23 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_overflow_active(
 pub unsafe extern "C" fn net_mesh_blob_adapter_overflow_config(
     handle: *const MeshBlobAdapterHandle,
 ) -> *mut c_char {
-    if handle.is_null() {
-        return ptr::null_mut();
-    }
-    let adapter = unsafe { (*handle).inner.clone() };
-    let cfg = (*adapter).overflow_config();
-    let json = overflow_to_json(cfg);
-    match std::ffi::CString::new(json) {
-        Ok(s) => s.into_raw(),
-        Err(_) => ptr::null_mut(),
-    }
+    adapter_guard("net_mesh_blob_adapter_overflow_config", ptr::null_mut(), || {
+        if handle.is_null() {
+            return ptr::null_mut();
+        }
+        let h = unsafe { &*handle };
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return ptr::null_mut(),
+        };
+        let adapter = h.inner.clone();
+        let cfg = (*adapter).overflow_config();
+        let json = overflow_to_json(cfg);
+        match std::ffi::CString::new(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+    })
 }
 
 /// Flip the overflow master switch. Returns `0` on success,
@@ -1269,12 +1382,20 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_set_overflow_enabled(
     handle: *const MeshBlobAdapterHandle,
     enabled: c_int,
 ) -> c_int {
-    if handle.is_null() {
-        return NetError::NullPointer.into();
-    }
-    let adapter = unsafe { (*handle).inner.clone() };
-    (*adapter).set_overflow_enabled(enabled != 0);
-    0
+    let null_rc: c_int = NetError::NullPointer.into();
+    adapter_guard("net_mesh_blob_adapter_set_overflow_enabled", null_rc, || {
+        if handle.is_null() {
+            return NetError::NullPointer.into();
+        }
+        let h = unsafe { &*handle };
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return NetError::NullPointer.into(),
+        };
+        let adapter = h.inner.clone();
+        (*adapter).set_overflow_enabled(enabled != 0);
+        0
+    })
 }
 
 /// Replace the entire overflow configuration with the JSON
@@ -1290,20 +1411,28 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_set_overflow_config(
     handle: *const MeshBlobAdapterHandle,
     config_json: *const c_char,
 ) -> c_int {
-    if handle.is_null() || config_json.is_null() {
-        return NetError::NullPointer.into();
-    }
-    let s = match unsafe { c_str_to_owned(config_json) } {
-        Some(s) => s,
-        None => return NetError::InvalidUtf8.into(),
-    };
-    let cfg = match parse_overflow_json(&s) {
-        Ok(c) => c,
-        Err(code) => return code,
-    };
-    let adapter = unsafe { (*handle).inner.clone() };
-    (*adapter).set_overflow_config(cfg);
-    0
+    let null_rc: c_int = NetError::NullPointer.into();
+    adapter_guard("net_mesh_blob_adapter_set_overflow_config", null_rc, || {
+        if handle.is_null() || config_json.is_null() {
+            return NetError::NullPointer.into();
+        }
+        let s = match unsafe { c_str_to_owned(config_json) } {
+            Some(s) => s,
+            None => return NetError::InvalidUtf8.into(),
+        };
+        let cfg = match parse_overflow_json(&s) {
+            Ok(c) => c,
+            Err(code) => return code,
+        };
+        let h = unsafe { &*handle };
+        let _op = match h.guard.try_enter() {
+            Some(op) => op,
+            None => return NetError::NullPointer.into(),
+        };
+        let adapter = h.inner.clone();
+        (*adapter).set_overflow_config(cfg);
+        0
+    })
 }
 
 #[cfg(test)]
@@ -1591,5 +1720,82 @@ mod tests {
             assert_eq!(net_blob_unregister_adapter(id_c.as_ptr()), 1);
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Regression for the `MeshBlobAdapterHandle` use-after-free /
+    /// double-free (security audit H1). Pre-fix the handle had no
+    /// `HandleGuard`; `_free` did an unconditional `Box::from_raw`,
+    /// so an op racing `_free` read freed memory and a second `_free`
+    /// was a double-free.
+    ///
+    /// Post-fix the box is leaked on `_free` (only the inner is
+    /// dropped) and every op gates on `guard.try_enter()`. This makes
+    /// two properties observable + deterministic:
+    ///   1. An op on a freed handle bails with the null-pointer code
+    ///      (reading the still-valid leaked guard) instead of UB.
+    ///   2. A second `_free` is a no-op (single-winner `begin_free`),
+    ///      not a double-free.
+    #[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+    #[test]
+    fn blob_adapter_ops_after_free_bail_and_double_free_is_safe() {
+        use crate::ffi::cortex::{net_redex_free, net_redex_new};
+
+        let null_rc: c_int = NetError::NullPointer.into();
+        let id_c = CString::new(unique_id("ffi-blob-adapter-uaf")).unwrap();
+
+        unsafe {
+            // In-memory redex (NULL persistent_dir) → no disk needed.
+            let redex = net_redex_new(std::ptr::null());
+            assert!(!redex.is_null());
+
+            // persistent = 0 (in-memory chunks), overflow_json = NULL.
+            let adapter = net_mesh_blob_adapter_new(redex, id_c.as_ptr(), 0, std::ptr::null());
+            assert!(!adapter.is_null(), "adapter must construct");
+
+            // While live, the metrics accessors return valid results.
+            let live = net_mesh_blob_adapter_overflow_enabled(adapter);
+            assert!(live == 0 || live == 1, "live overflow_enabled in {{0,1}}");
+
+            // Free once.
+            net_mesh_blob_adapter_free(adapter);
+
+            // Ops on the freed handle must bail (guard.freeing == true →
+            // try_enter == None), NOT UAF. The leaked box keeps the
+            // guard readable.
+            assert_eq!(
+                net_mesh_blob_adapter_overflow_enabled(adapter),
+                null_rc,
+                "op on freed handle must return the null-pointer bail code",
+            );
+            assert_eq!(net_mesh_blob_adapter_overflow_active(adapter), null_rc);
+            assert!(
+                net_mesh_blob_adapter_prometheus_text(adapter).is_null(),
+                "ptr-returning op on freed handle must return null",
+            );
+            let blob_ref = [0u8; 4];
+            assert_eq!(
+                net_mesh_blob_adapter_store(
+                    adapter,
+                    blob_ref.as_ptr(),
+                    blob_ref.len(),
+                    std::ptr::null(),
+                    0,
+                ),
+                null_rc,
+                "store on freed handle must bail, not run against freed inner",
+            );
+
+            // Double free must be safe (single-winner begin_free).
+            net_mesh_blob_adapter_free(adapter);
+
+            // NULL handle is a no-op for every entry point.
+            net_mesh_blob_adapter_free(std::ptr::null_mut());
+            assert_eq!(
+                net_mesh_blob_adapter_overflow_enabled(std::ptr::null()),
+                null_rc,
+            );
+
+            net_redex_free(redex);
+        }
     }
 }
