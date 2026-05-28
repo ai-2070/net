@@ -40,17 +40,32 @@ fixes all four SDKs.**
 > Part of this migration is collapsing them onto the single substrate event
 > source.
 
-### Surfaces to AUDIT (not yet confirmed polling — verify before touching)
+### Audited candidates — verdicts (2026-05-29)
 
-These were flagged as candidates but the audit did not confirm an interval loop.
-Several are likely *already* event-driven (mpsc / `Notify`-backed). Confirm each
-before assuming work is needed:
+The four flagged surfaces were traced from API down to substrate source.
+**Three of four are already event-driven** (correctly designed as push). Only the
+deck cohort polls.
 
-- memory/task watch iterators (`MemoryWatchIter`, `TaskWatchIter`, + async)
-- redex tail iterators (`RedexTailIter`, `AsyncRedexTailIter`)
-- deck `SnapshotStream` / `StatusSummaryStream`
-- aggregator `FoldQueryClient` TTL-cache (this is a *cache*, not a watch — likely
-  out of scope; a TTL cache is a deliberate staleness budget, not a poll loop)
+| Surface | Backing | Verdict |
+|---|---|---|
+| Memories `watch` / `snapshot_and_watch` | `tokio::sync::watch::channel` (`cortex/memories/watch.rs:175`); adapter `cortex/memories/adapter.rs:309` | ✅ already push — **no work** |
+| Tasks `watch` / `snapshot_and_watch` | `tokio::sync::watch::channel` (`cortex/tasks/watch.rs:152`); adapter `cortex/tasks/adapter.rs:286` | ✅ already push — **no work** |
+| Redex `tail` | `mpsc::channel`, watcher registered under the state lock, pushed on append (`redex/file.rs:966`) | ✅ already push — **no work** |
+| Deck `watch` / `watch_timeout` / `SnapshotStream` / `StatusSummaryStream` | `tokio::time::sleep` re-reading `snapshot_reader`, `snapshot_poll_interval` (default 100 ms) — `deck.rs:1110`, `deck.rs:670`, `deck.rs:693`; cadence doc at `deck.rs:234` | ❌ **POLLING — real candidate** |
+| aggregator `FoldQueryClient` TTL-cache | TTL cache, not a watch | out of scope — a staleness budget is a feature |
+
+**The memory/task watch iterators and redex tail iterators in the bindings wrap
+these already-push substrate sources, so they need no migration.** (The earlier
+worry that they polled was unfounded.)
+
+### Deck is a second, independent polling cohort
+
+Deck's `watch` / `watch_timeout` / `SnapshotStream` / `StatusSummaryStream` all
+poll the **MeshOS snapshot fold** via `snapshot_reader.read()` on a
+`snapshot_poll_interval` timer — a *different* fold from the capability fold that
+backs `watch_tools`. So it's the same shape of fix (fold-change notify →
+await instead of sleep) applied to a second fold. It can't share E-1's notify
+(different fold) but it reuses the pattern. Tracked as slices E-8..E-9 below.
 
 ## 3. The event source that already exists
 
@@ -143,11 +158,23 @@ plan only removes the *interval timer*; it does not add a new network surface.
   instead of `setTimeout`).
 - **E-6 — Rust SDK `Mesh::watch_tools`** — expose the substrate watch as a public
   SDK method returning the `ToolListWatch` stream directly (no re-poll).
-- **E-7 — audit the "to verify" surfaces** (§2) and either confirm they're
-  already event-driven or fold them into follow-up slices.
+- **E-7 — audit the "to verify" surfaces** — ✅ DONE (2026-05-29, see §2). Memory/
+  task watchers + redex tail are already push; only deck polls. No binding work
+  for memory/task/redex.
+- **E-8 — MeshOS snapshot-fold change notify.** Mirror E-1 on the MeshOS snapshot
+  fold: fire a `Notify` (or `watch::Sender` on a snapshot generation) whenever the
+  fold the deck `snapshot_reader` reads is mutated by an admin-chain commit /
+  status update. Pure addition; no behavior change.
+- **E-9 — deck `watch` + `SnapshotStream` + `StatusSummaryStream` push loop.**
+  Swap the `tokio::time::sleep(snapshot_poll_interval)` re-read loops
+  (`deck.rs:1110`, `:670`, `:693`) for notified-await loops driven by E-8. Keep
+  `snapshot_poll_interval` as a debounce ceiling (same fallback role as
+  `watch_tools`' `Some(interval)`). Regression: existing deck watch tests
+  (`deck.rs:3118`+) must pass unchanged; add a sub-interval-latency test.
 
 Each binding slice (E-3..E-6) is independent and can land in any order once E-1/E-2
-are in. E-1 → E-2 are sequential.
+are in. E-1 → E-2 sequential; E-8 → E-9 sequential and independent of the
+tool-watch track. Memory/task/redex need no slices (already push).
 
 ## 6. Risks / watch-outs
 
