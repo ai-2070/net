@@ -161,10 +161,32 @@ plan only removes the *interval timer*; it does not add a new network surface.
 - **E-7 — audit the "to verify" surfaces** — ✅ DONE (2026-05-29, see §2). Memory/
   task watchers + redex tail are already push; only deck polls. No binding work
   for memory/task/redex.
-- **E-8 — MeshOS snapshot-fold change notify.** Mirror E-1 on the MeshOS snapshot
-  fold: fire a `Notify` (or `watch::Sender` on a snapshot generation) whenever the
-  fold the deck `snapshot_reader` reads is mutated by an admin-chain commit /
-  status update. Pure addition; no behavior change.
+- **E-8 — MeshOS snapshot publish notify.** The snapshot lives in an
+  `Arc<ArcSwap<MeshOsSnapshot>>` (`meshos/event_loop.rs:73`), read lock-free via
+  `MeshOsSnapshotReader::read`/`load` (`:359`). **Single write site**:
+  `publish_snapshot()` ends in `self.snapshot.store(Arc::new(snap))`
+  (`event_loop.rs:1590`). Pair the `ArcSwap` with an `Arc<Notify>` (keep ArcSwap
+  for the lock-free read fast-path — don't swap it for `watch`, which would take a
+  read-lock per read; the comment at `:1988` explains why ArcSwap was chosen). Fire
+  `notify_waiters()` right after the store; `MeshOsSnapshotReader` carries a clone
+  and gains `async fn changed(&self)`. Pure addition; no behavior change.
+
+  **Caveat — `publish_snapshot()` fires every Tick, not only on change**
+  (`event_loop.rs:1559`; field doc `:67` "Updated on every Tick after the reconcile
+  pass"). So the MeshOS loop *already* republishes on its own tick cadence,
+  independent of deck. Two consequences:
+  - **The win is real for deck**: deck currently runs a *second, independent* timer
+    (`snapshot_poll_interval`, default 100 ms) sampling a value the loop is already
+    republishing — two unsynchronized timers with phase-lag between them. E-8 lets
+    deck consume the loop's existing publish signal and drop its own timer; latency
+    becomes "next publish" instead of "next deck poll", with no phase-lag.
+  - **It does NOT eliminate tick-rate wakeups** — those happen on the MeshOS loop
+    regardless of whether deck watches. Driving deck to "zero periodic wakeups on an
+    idle node" would additionally require *change-gating* `publish_snapshot` (only
+    `store` + notify when the new snapshot differs from the stored one, e.g. via a
+    reconcile-bumped generation counter rather than a deep `MeshOsSnapshot` eq).
+    That's a separate optimization to the MeshOS loop itself — **out of scope for the
+    deck-watch migration; note as a follow-up (E-10, deferred).**
 - **E-9 — deck `watch` + `SnapshotStream` + `StatusSummaryStream` push loop.**
   Swap the `tokio::time::sleep(snapshot_poll_interval)` re-read loops
   (`deck.rs:1110`, `:670`, `:693`) for notified-await loops driven by E-8. Keep
