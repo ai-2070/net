@@ -447,11 +447,17 @@ impl BlobAdapter for FileSystemAdapter {
             .acquire_owned()
             .await
             .map_err(|_| backend("adapter concurrency semaphore closed"))?;
-        let res = tokio::task::spawn_blocking(move || {
+        let res = tokio::task::spawn_blocking(move || -> Result<bool, BlobError> {
             let _permit = permit;
-            // Only report present if it resolves inside root (L3) —
-            // a symlink pointing outside is not a legitimate blob.
-            Self::path_within_root(&path, &root)
+            // Reject an out-of-root symlink before probing (L3). A path
+            // that resolves outside root is not a legitimate blob.
+            if !Self::path_within_root(&path, &root)? {
+                return Ok(false);
+            }
+            // Then preserve the pre-L3 `is_file()` contract: only a
+            // regular file counts as present (a directory or other
+            // node at the slot is not a blob).
+            Ok(Path::new(&path).is_file())
         })
         .await
         .map_err(|e| backend(format!("join error: {}", e)))??;
@@ -859,6 +865,10 @@ mod tests {
     /// writer who replaced the blob file with a symlink to an arbitrary
     /// file could exfiltrate it. The `path_within_root` guard rejects
     /// the escape before the read follows the link.
+    ///
+    /// `#[cfg(unix)]` because it plants a `std::os::unix::fs::symlink`
+    /// — same gate as `store_rejects_shard_dir_symlink_escape` above.
+    #[cfg(unix)]
     #[tokio::test]
     async fn read_paths_reject_blob_file_symlink_escape() {
         use futures::StreamExt;
@@ -941,6 +951,37 @@ mod tests {
 
         cleanup(&root);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// `exists` must report `false` for a non-regular-file node at the
+    /// blob slot. The L3 read guard swapped `Path::is_file()` for an
+    /// in-root resolve check; this pins that the resolve check didn't
+    /// also start reporting a *directory* sitting at the slot as a
+    /// present blob. Cross-platform (no symlink needed).
+    #[tokio::test]
+    async fn exists_reports_false_for_directory_at_blob_slot() {
+        let root = unique_root();
+
+        let payload = b"dir-not-a-blob";
+        let hash: [u8; 32] = blake3::hash(payload).into();
+        let shard = format!("{:02x}", hash[0]);
+        let mut hex = String::new();
+        for b in &hash {
+            use std::fmt::Write;
+            let _ = write!(hex, "{:02x}", b);
+        }
+        // Plant a *directory* exactly where the blob file would live.
+        let blob_path = root.join(&shard).join(&hex);
+        std::fs::create_dir_all(&blob_path).unwrap();
+
+        let adapter = FileSystemAdapter::new("fs-exists-dir", &root);
+        let blob = BlobRef::small("file:///dir", hash, payload.len() as u64);
+        assert!(
+            !adapter.exists(&blob).await.unwrap(),
+            "a directory at the blob slot must not count as a present blob",
+        );
+
+        cleanup(&root);
     }
 
     #[tokio::test]
