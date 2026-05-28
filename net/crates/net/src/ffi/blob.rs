@@ -1352,23 +1352,27 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_overflow_active(
 pub unsafe extern "C" fn net_mesh_blob_adapter_overflow_config(
     handle: *const MeshBlobAdapterHandle,
 ) -> *mut c_char {
-    adapter_guard("net_mesh_blob_adapter_overflow_config", ptr::null_mut(), || {
-        if handle.is_null() {
-            return ptr::null_mut();
-        }
-        let h = unsafe { &*handle };
-        let _op = match h.guard.try_enter() {
-            Some(op) => op,
-            None => return ptr::null_mut(),
-        };
-        let adapter = h.inner.clone();
-        let cfg = (*adapter).overflow_config();
-        let json = overflow_to_json(cfg);
-        match std::ffi::CString::new(json) {
-            Ok(s) => s.into_raw(),
-            Err(_) => ptr::null_mut(),
-        }
-    })
+    adapter_guard(
+        "net_mesh_blob_adapter_overflow_config",
+        ptr::null_mut(),
+        || {
+            if handle.is_null() {
+                return ptr::null_mut();
+            }
+            let h = unsafe { &*handle };
+            let _op = match h.guard.try_enter() {
+                Some(op) => op,
+                None => return ptr::null_mut(),
+            };
+            let adapter = h.inner.clone();
+            let cfg = (*adapter).overflow_config();
+            let json = overflow_to_json(cfg);
+            match std::ffi::CString::new(json) {
+                Ok(s) => s.into_raw(),
+                Err(_) => ptr::null_mut(),
+            }
+        },
+    )
 }
 
 /// Flip the overflow master switch. Returns `0` on success,
@@ -1383,19 +1387,23 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_set_overflow_enabled(
     enabled: c_int,
 ) -> c_int {
     let null_rc: c_int = NetError::NullPointer.into();
-    adapter_guard("net_mesh_blob_adapter_set_overflow_enabled", null_rc, || {
-        if handle.is_null() {
-            return NetError::NullPointer.into();
-        }
-        let h = unsafe { &*handle };
-        let _op = match h.guard.try_enter() {
-            Some(op) => op,
-            None => return NetError::NullPointer.into(),
-        };
-        let adapter = h.inner.clone();
-        (*adapter).set_overflow_enabled(enabled != 0);
-        0
-    })
+    adapter_guard(
+        "net_mesh_blob_adapter_set_overflow_enabled",
+        null_rc,
+        || {
+            if handle.is_null() {
+                return NetError::NullPointer.into();
+            }
+            let h = unsafe { &*handle };
+            let _op = match h.guard.try_enter() {
+                Some(op) => op,
+                None => return NetError::NullPointer.into(),
+            };
+            let adapter = h.inner.clone();
+            (*adapter).set_overflow_enabled(enabled != 0);
+            0
+        },
+    )
 }
 
 /// Replace the entire overflow configuration with the JSON

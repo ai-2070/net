@@ -897,7 +897,10 @@ mod tests {
         // fetch must NOT return the secret bytes.
         match adapter.fetch(&blob).await {
             Err(BlobError::Backend(msg)) => {
-                assert!(msg.contains("escapes"), "expected escape rejection, got {msg}")
+                assert!(
+                    msg.contains("escapes"),
+                    "expected escape rejection, got {msg}"
+                )
             }
             Err(BlobError::NotFound(_)) => {} // also acceptable: deny without leak
             Ok(bytes) => panic!(
@@ -910,7 +913,10 @@ mod tests {
         // exists must not report a symlink-to-outside as present.
         match adapter.exists(&blob).await {
             Err(BlobError::Backend(msg)) => {
-                assert!(msg.contains("escapes"), "expected escape rejection, got {msg}")
+                assert!(
+                    msg.contains("escapes"),
+                    "expected escape rejection, got {msg}"
+                )
             }
             Ok(false) => {}
             Ok(true) => panic!("exists reported an out-of-root symlink as present"),
