@@ -53,6 +53,7 @@ net/crates/net/bindings/node/meshdb.js
 
 # Flamegraphs
 .profiling/
+DEBUG_*.md
 
 # Hermes
 hermes/
