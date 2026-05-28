@@ -5516,7 +5516,7 @@ impl MeshNode {
     /// start the watch.
     ///
     /// Event-driven: the task parks on the capability fold's
-    /// change signal ([`Fold::subscribe_changes`]) and re-diffs
+    /// change signal (`Fold::subscribe_changes`) and re-diffs
     /// only when the fold actually mutates (a local `serve_tool`,
     /// an inbound peer announcement, an eviction, or a TTL expiry)
     /// — no periodic walk on an idle fold. Change-detection latency
