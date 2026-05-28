@@ -1,0 +1,21 @@
+.github/workflows/release-crates.yml
+  s_9d403623867089::t_2147ad2c19eb75 3-4,6-8,12
+  s_9d403623867089::t_439fde1372e06a 28
+  s_9d403623867089::t_ef5ae133e48715 65-79,81,83
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "5da0a352a4b1e0f690f3f3fc706942b7e94d9447",
+  "prompts": {},
+  "sessions": {
+    "s_9d403623867089": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7d494a4b-455d-4f76-9276-4f572e80c81d",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
