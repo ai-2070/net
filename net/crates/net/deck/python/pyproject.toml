@@ -8,7 +8,7 @@ build-backend = "maturin"
 # because PyPI rejected `net-cli`. See the cross-registry naming
 # table in the top-level README.
 name = "net-deck"
-version = "0.25.1"
+version = "0.25.2"
 description = "net-deck — operator cyberdeck (terminal UI) for the Net mesh"
 readme = "README.md"
 license = { text = "Apache-2.0" }
