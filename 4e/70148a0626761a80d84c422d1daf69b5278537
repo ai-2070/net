@@ -1,0 +1,20 @@
+net/crates/net/docs/plans/POLLING_TO_EVENT_DRIVEN_SDK_PLAN.md
+  s_099fa7d871e34d::t_8c7df7d3010df7 161-173,176-177
+  s_099fa7d871e34d::t_e2b348fc617110 43,45-47,49-68
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "4e70148a0626761a80d84c422d1daf69b5278537",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
