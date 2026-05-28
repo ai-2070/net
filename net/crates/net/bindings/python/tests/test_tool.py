@@ -35,6 +35,7 @@ from net.tool import (
     openai,
     serve_tool,
     serve_tool_streaming,
+    watch_tools,
 )
 from net import tool as _tool_module
 
@@ -579,3 +580,143 @@ def test_serve_tool_streaming_handler_exception_maps_to_handler_error() -> None:
     assert sink.events[-1]["type"] == "error"
     assert sink.events[-1]["code"] == "handler_error"
     assert "boom" in sink.events[-1]["message"]
+
+
+# ---------------------------------------------------------------------------
+# watch_tools — E-4: the wrapper consumes the native event-driven async
+# iterator (yields JSON-encoded ToolListChange), parses each to its
+# dataclass, and closes the native iter on exit. Fake-mesh, deterministic
+# — live event delivery is validated substrate-side + cross-language.
+# ---------------------------------------------------------------------------
+
+
+def _desc_json(tool_id: str, version: str = "1.0.0", node_count: int = 1) -> dict:
+    return {
+        "tool_id": tool_id,
+        "name": tool_id,
+        "version": version,
+        "node_count": node_count,
+    }
+
+
+class _FakeToolWatchIter:
+    """Stand-in for the native `AsyncToolWatchIter` — yields the JSON
+    strings the real pyo3 iter would, and records `close()`."""
+
+    def __init__(self, changes: List[str]) -> None:
+        self._changes = list(changes)
+        self.closed = False
+
+    def __aiter__(self) -> "AsyncIterator[str]":
+        async def gen() -> AsyncIterator[str]:
+            for c in self._changes:
+                yield c
+
+        return gen()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeWatchMesh:
+    """Captures the `interval_ms` the wrapper passes through and hands
+    back a `_FakeToolWatchIter` over the pre-seeded changes."""
+
+    def __init__(self, changes: List[str]) -> None:
+        self._changes = changes
+        self.last_interval_ms: Any = "unset"
+        self.last_iter: _FakeToolWatchIter | None = None
+
+    def watch_tools(self, interval_ms: Any) -> _FakeToolWatchIter:
+        self.last_interval_ms = interval_ms
+        self.last_iter = _FakeToolWatchIter(self._changes)
+        return self.last_iter
+
+
+def _drain_watch(mesh: Any, **kwargs: Any) -> List[Any]:
+    async def driver() -> List[Any]:
+        out: List[Any] = []
+        async for change in watch_tools(mesh, **kwargs):
+            out.append(change)
+        return out
+
+    return asyncio.run(driver())
+
+
+def test_watch_tools_parses_each_variant_and_closes() -> None:
+    mesh = _FakeWatchMesh(
+        [
+            json.dumps({"type": "added", "descriptor": _desc_json("web_search")}),
+            json.dumps({"type": "removed", "descriptor": _desc_json("old_tool")}),
+            json.dumps(
+                {
+                    "type": "node_count_changed",
+                    "descriptor": _desc_json("web_search", node_count=3),
+                    "prev_node_count": 1,
+                }
+            ),
+        ]
+    )
+    changes = _drain_watch(mesh)
+    assert [c.type for c in changes] == ["added", "removed", "node_count_changed"]
+    assert changes[0].descriptor.tool_id == "web_search"
+    assert changes[1].descriptor.tool_id == "old_tool"
+    assert changes[2].prev_node_count == 1
+    assert changes[2].descriptor.node_count == 3
+    # The wrapper ALWAYS closes the native iter in its `finally`.
+    assert mesh.last_iter is not None and mesh.last_iter.closed is True
+
+
+def test_watch_tools_interval_none_maps_to_pure_event_driven() -> None:
+    mesh = _FakeWatchMesh([])
+    _drain_watch(mesh)
+    # None / 0 / negative => None (pure event-driven), not a poll cadence.
+    assert mesh.last_interval_ms is None
+
+
+def test_watch_tools_positive_interval_becomes_millisecond_ceiling() -> None:
+    mesh = _FakeWatchMesh([])
+    _drain_watch(mesh, interval=0.5)
+    assert mesh.last_interval_ms == 500
+
+
+def test_watch_tools_live_single_node_delivers_self_served_tool() -> None:
+    """Live end-to-end (single node, no handshake): a self-served tool
+    announced on a node fires an `Added` to a local `watch_tools` watcher
+    off the substrate's capability-fold change signal — proving the pyo3
+    `AsyncToolWatchIter` + the wrapper consume the real event stream, not
+    a poll loop. Skips on a thin wheel built without the `tool` feature.
+    """
+    pytest.importorskip("net._net")
+    import net
+
+    if not hasattr(net.NetMesh, "watch_tools"):
+        pytest.skip("wheel built without the `tool` feature")
+
+    desc = descriptor_for("web_search", description="Search the web.")
+
+    async def driver() -> Any:
+        mesh = net.NetMesh(bind_addr="127.0.0.1:0", psk="42" * 32)
+        gen = watch_tools(mesh)  # pure event-driven (no ceiling)
+
+        async def first() -> Any:
+            async for change in gen:
+                return change
+            return None
+
+        task = asyncio.create_task(first())
+        # Let the generator subscribe (its `mesh.watch_tools(...)` runs on
+        # the first `__anext__`) before the mutation, so the baseline is
+        # empty and the change is caught.
+        await asyncio.sleep(0.2)
+        caps = add_tool_capabilities_to_announce({}, [desc])
+        mesh.announce_capabilities(caps)
+        try:
+            return await asyncio.wait_for(task, timeout=5)
+        finally:
+            await gen.aclose()
+
+    change = asyncio.run(driver())
+    assert change is not None
+    assert change.type == "added"
+    assert change.descriptor.tool_id == "web_search"

@@ -454,61 +454,95 @@ ToolListChange = Union[
 ]
 
 
+def _descriptor_from_dict(d: dict) -> ToolDescriptor:
+    """Build a :class:`ToolDescriptor` from a substrate-shaped dict.
+
+    Shared by :func:`list_tools` and :func:`watch_tools` — both
+    receive descriptors as JSON from the native binding.
+    """
+    return ToolDescriptor(
+        tool_id=d["tool_id"],
+        name=d["name"],
+        version=d["version"],
+        description=d.get("description"),
+        input_schema=d.get("input_schema"),
+        output_schema=d.get("output_schema"),
+        requires=list(d.get("requires") or []),
+        estimated_time_ms=d.get("estimated_time_ms", 0),
+        stateless=d.get("stateless", True),
+        streaming=d.get("streaming", False),
+        tags=list(d.get("tags") or []),
+        node_count=d.get("node_count", 0),
+    )
+
+
+def _tool_list_change_from_dict(d: dict) -> ToolListChange:
+    """Parse one wire-shaped change dict into its dataclass variant."""
+    kind = d["type"]
+    desc = _descriptor_from_dict(d["descriptor"])
+    if kind == "added":
+        return ToolListChangeAdded(type="added", descriptor=desc)
+    if kind == "removed":
+        return ToolListChangeRemoved(type="removed", descriptor=desc)
+    if kind == "node_count_changed":
+        return ToolListChangeNodeCountChanged(
+            type="node_count_changed",
+            descriptor=desc,
+            prev_node_count=d["prev_node_count"],
+        )
+    raise ValueError(f"unknown ToolListChange type: {kind!r}")
+
+
 async def watch_tools(
     mesh: Any,
     *,
-    interval: float = 1.0,
+    interval: Optional[float] = None,
 ):
     """Async-iterator over [`ToolListChange`] events for every
     dynamic addition / removal / publisher-count change in the
     local capability fold's tool view.
 
-    Polling-backed: every ``interval`` seconds (default ``1.0``),
-    the helper re-runs :func:`list_tools` on the mesh and diffs
-    against the prior snapshot. The first event fires AFTER the
-    initial baseline — call ``list_tools(mesh)`` once before
-    consuming the iterator if you need the starting shape.
+    Event-driven: a change is delivered the moment the capability
+    fold mutates (latency is bounded by fold-apply, not a timer),
+    and an idle fold does zero periodic work. Backed by the
+    substrate ``MeshNode::watch_tools`` stream via the native
+    ``mesh.watch_tools(interval_ms)`` async iterator — no
+    client-side ``asyncio.sleep`` / re-diff. The first event fires
+    AFTER the initial baseline — call ``list_tools(mesh)`` once
+    before consuming if you need the starting shape.
+
+    ``interval`` (seconds) is a *debounce ceiling*, not a poll
+    cadence:
+
+    - ``None`` (the default) — pure event-driven; the watch only
+      wakes on a real mutation.
+    - a positive value — additionally guarantees a re-diff at least
+      every ``interval`` seconds as a safety net.
 
     Mirror of the Rust SDK's ``Mesh::watch_tools`` and the Node TS
-    ``watchTools``. All three are polling-backed at 1s default;
-    identical semantics.
+    ``watchTools`` — all three are event-driven off the same
+    substrate change signal.
 
-    Cancel by calling :meth:`asyncio.CancelledError` on the
-    consuming task — the polling loop exits on the next tick.
+    Cancel by breaking out of the ``async for`` or cancelling the
+    consuming task; the underlying substrate task is stopped on the
+    generator's ``finally``.
 
     Usage::
 
-        async for change in watch_tools(mesh, interval=0.25):
+        async for change in watch_tools(mesh):
             match change.type:
                 case "added":   print(f"+ {change.descriptor.tool_id}")
                 case "removed": print(f"- {change.descriptor.tool_id}")
                 case "node_count_changed":
                     print(f"~ {change.descriptor.tool_id}: {change.prev_node_count} -> {change.descriptor.node_count}")
     """
-    import asyncio
-
-    def snapshot() -> dict:
-        return {(d.tool_id, d.version): d for d in list_tools(mesh)}
-
-    prev = snapshot()
-    while True:
-        await asyncio.sleep(interval)
-        next_snap = snapshot()
-        for key, desc in next_snap.items():
-            if key not in prev:
-                yield ToolListChangeAdded(type="added", descriptor=desc)
-        for key, desc in prev.items():
-            if key not in next_snap:
-                yield ToolListChangeRemoved(type="removed", descriptor=desc)
-        for key, desc in next_snap.items():
-            old = prev.get(key)
-            if old is not None and old.node_count != desc.node_count:
-                yield ToolListChangeNodeCountChanged(
-                    type="node_count_changed",
-                    descriptor=desc,
-                    prev_node_count=old.node_count,
-                )
-        prev = next_snap
+    interval_ms = None if not interval or interval <= 0 else int(interval * 1000)
+    native_iter = mesh.watch_tools(interval_ms)
+    try:
+        async for raw in native_iter:
+            yield _tool_list_change_from_dict(json.loads(raw))
+    finally:
+        native_iter.close()
 
 
 def list_tools(mesh: Any) -> List[ToolDescriptor]:
@@ -535,25 +569,7 @@ def list_tools(mesh: Any) -> List[ToolDescriptor]:
     ``PyDict_SetItem`` storm the prior implementation paid on every
     ``watch_tools`` tick.
     """
-    out: List[ToolDescriptor] = []
-    for d in json.loads(mesh.list_tools()):
-        out.append(
-            ToolDescriptor(
-                tool_id=d["tool_id"],
-                name=d["name"],
-                version=d["version"],
-                description=d.get("description"),
-                input_schema=d.get("input_schema"),
-                output_schema=d.get("output_schema"),
-                requires=list(d.get("requires") or []),
-                estimated_time_ms=d.get("estimated_time_ms", 0),
-                stateless=d.get("stateless", True),
-                streaming=d.get("streaming", False),
-                tags=list(d.get("tags") or []),
-                node_count=d.get("node_count", 0),
-            )
-        )
-    return out
+    return [_descriptor_from_dict(d) for d in json.loads(mesh.list_tools())]
 
 
 def add_tool_capabilities_to_announce(
