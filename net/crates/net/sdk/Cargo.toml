@@ -80,6 +80,7 @@ default = [
     "dataforts",
     "meshdb",
     "aggregator",
+    "tool",
 ]
 # External transports (opt-in, network I/O).
 redis = ["net/redis"]
@@ -166,11 +167,15 @@ aggregator = ["net"]
 # `ToolEvent` / `ToolMetadataRegistry` from `net::adapter::net::cortex::tool`
 # and ships the `schemars`-backed `metadata_for::<Req, Resp>(name, desc)`
 # helper that builds descriptors from Rust types implementing
-# `JsonSchema`. Off by default — consumers who don't ship LLM agents
-# skip both `schemars` (~150 KiB on a release binary) and the SDK-side
-# tool helpers. Requires `cortex` because `ToolDescriptor` lives in
-# the cortex module + the future `MeshNode::list_tools` walks the
-# capability fold which `cortex` enables.
+# `JsonSchema`. On by default (in `default` + `agent`) for parity
+# with the Node / Python bindings — AI tool calling is a headline
+# surface and the only marginal cost is `schemars` (~150 KiB on a
+# release binary), small next to the dataforts / meshdb / meshos
+# surfaces `default` already pulls. Consumers who don't ship LLM
+# agents opt out via `default-features = false`. Requires `cortex`
+# because `ToolDescriptor` lives in the cortex module +
+# `MeshNode::list_tools` walks the capability fold which `cortex`
+# enables. `macros` (the `#[tool]` proc-macro) stays opt-in.
 tool = ["net/tool", "cortex", "dep:schemars"]
 # `#[tool]` proc-macro convenience. Opt-in because it pulls in
 # proc-macro2 / syn / quote (~1.2 MB build artifact) which users
@@ -209,6 +214,7 @@ agent = [
     "dataforts",
     "meshdb",
     "aggregator",
+    "tool",
 ]
 # Everything — local stack plus NAT traversal plus external
 # transports plus the operator-facing surfaces. `dataforts` and
