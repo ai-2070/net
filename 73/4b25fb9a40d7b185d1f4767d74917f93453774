@@ -1,0 +1,39 @@
+net/crates/net/src/ffi/blob.rs
+  s_125b8227999624::t_08708c73d8d9cc 1052-1057,1064
+  s_125b8227999624::t_9d14312e933f66 1080-1096
+  s_125b8227999624::t_85ef170dabdc5d 1172-1202
+  s_125b8227999624::t_769170db34e490 1219-1222,1224-1247
+  s_125b8227999624::t_04958fbb80d584 885-891,895,901-924
+  s_125b8227999624::t_a53cefd0d1e9de 1296-1312
+  s_125b8227999624::t_54d564c7bd479d 1724-1800
+  s_125b8227999624::t_016deb6a0d88c5 1385-1398
+  s_125b8227999624::t_909e37e9101e63 1414-1435
+  s_125b8227999624::t_f040faffb1a752 1262-1281
+  s_125b8227999624::t_31f11ec26e1b0a 1325-1341
+  s_125b8227999624::t_bb0cc9017f37a6 1355-1371
+  s_125b8227999624::t_979077f5910f6a 1120-1152
+net/crates/net/src/ffi/cortex.rs
+  s_125b8227999624::t_b973990f07d915 332-336,338-340
+net/crates/net/src/ffi/mesh.rs
+  s_125b8227999624::t_95fe91fadd3539 635-640,642-644
+net/crates/net/src/ffi/aggregator.rs
+  s_125b8227999624::t_7f90e25e074b8b 148-153
+  s_125b8227999624::t_f936e6c40bc424 420-422
+  s_125b8227999624::t_c2448eae3c55cf 453-455
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "734b25fb9a40d7b185d1f4767d74917f93453774",
+  "prompts": {},
+  "sessions": {
+    "s_125b8227999624": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "94c8ab71-7451-4e48-a3ea-60e5697f24fd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
