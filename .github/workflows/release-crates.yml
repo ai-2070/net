@@ -1,14 +1,15 @@
 name: Release Rust crates
 
-# Publishes `net-mesh` and `net-mesh-sdk` to crates.io.
+# Publishes `net-mesh`, `net-mesh-sdk-macros`, and `net-mesh-sdk`
+# to crates.io.
 #
-# Tag schema: `crates-v<semver>`. The two
-# crates publish in dependency order — `net-mesh` first, then
-# `net-mesh-sdk` once the index has caught up.
+# Tag schema: `crates-v<semver>`. The three crates publish in
+# dependency order — `net-mesh` and `net-mesh-sdk-macros` first
+# (independent), then `net-mesh-sdk` once the index has caught up.
 #
 # Required repository secret: `CARGO_REGISTRY_TOKEN`
 #   Generate at https://crates.io/me with the `publish-update`
-#   scope restricted to `net-mesh*` after both crates exist on
+#   scope restricted to `net-mesh*` after all crates exist on
 #   crates.io. The first publish requires a wider scope (or a
 #   broader account-level token) because crates.io scopes can
 #   only be set on existing crates.
@@ -24,7 +25,7 @@ env:
 
 jobs:
   publish:
-    name: Publish net-mesh + net-mesh-sdk
+    name: Publish net-mesh + net-mesh-sdk-macros + net-mesh-sdk
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -61,10 +62,25 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish
 
+      # `net-mesh-sdk-macros` is a pure proc-macro crate with no
+      # workspace deps — it can be dry-run and published independently
+      # of `net-mesh`. Publishing it here (before the SDK) means the
+      # SDK's `net-mesh-sdk-macros = { version = "...", path = ... }`
+      # dep resolves on crates.io during the SDK publish.
+      - name: cargo publish --dry-run (net-mesh-sdk-macros)
+        working-directory: net/crates/net/sdk-macros
+        run: cargo publish --dry-run
+
+      - name: Publish net-mesh-sdk-macros
+        working-directory: net/crates/net/sdk-macros
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
+
       # The crates.io sparse index needs a moment to expose the new
-      # version before a dependent crate's publish can resolve it.
+      # versions before a dependent crate's publish can resolve them.
       # 30 s is conservative; raise if the next step starts failing
-      # with "no matching package named `net-mesh` found".
+      # with "no matching package named `net-mesh[-sdk-macros]` found".
       - name: Wait for crates.io index
         run: sleep 30
 
