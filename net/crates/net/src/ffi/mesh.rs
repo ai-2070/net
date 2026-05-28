@@ -184,6 +184,10 @@ fn token_err_to_code(e: &CoreTokenError) -> c_int {
         // message ("token TTL must be > 0 seconds") tells the
         // caller exactly what was wrong.
         CoreTokenError::ZeroTtl => NET_ERR_TOKEN_INVALID_FORMAT,
+        // An over-long TTL is another malformed token-issue input
+        // (`duration_secs` past the hard ceiling). Same mapping as
+        // `ZeroTtl`; the `Display` message names the limit.
+        CoreTokenError::TtlTooLong => NET_ERR_TOKEN_INVALID_FORMAT,
     }
 }
 

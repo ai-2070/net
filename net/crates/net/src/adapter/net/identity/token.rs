@@ -211,6 +211,12 @@ impl PermissionToken {
             Err(TokenError::ZeroTtl) => {
                 panic!("PermissionToken::issue called with duration_secs == 0 — use try_issue")
             }
+            Err(TokenError::TtlTooLong) => {
+                panic!(
+                    "PermissionToken::issue called with duration_secs > MAX_TOKEN_TTL_SECS \
+                     ({MAX_TOKEN_TTL_SECS}s) — use try_issue"
+                )
+            }
             Err(e) => panic!("PermissionToken::issue failed: {e:?} — use try_issue"),
         }
     }
@@ -239,6 +245,15 @@ impl PermissionToken {
         // than a silent "every check fails on the receiver".
         if duration_secs == 0 {
             return Err(TokenError::ZeroTtl);
+        }
+        // Reject TTLs past the hard ceiling. An unbounded TTL (up to
+        // `u64::MAX`) saturates `not_after` into a never-expiring
+        // token that can only be retired via the advisory revocation
+        // floor — see [`MAX_TOKEN_TTL_SECS`]. Reject at issue time so
+        // the misuse surfaces as a typed error instead of an
+        // effectively immortal credential.
+        if duration_secs > MAX_TOKEN_TTL_SECS {
+            return Err(TokenError::TtlTooLong);
         }
         let now = current_timestamp();
         // Abort on `getrandom` failure rather than
@@ -619,6 +634,35 @@ pub const MAX_TOKENS_PER_SLOT: usize = 32;
 /// remain strict wall-clock checks for FFI / UI callers.
 pub const TOKEN_CLOCK_SKEW_SECS_RECOMMENDED: u64 = 60;
 
+/// Hard upper bound on a freshly-issued token's TTL (1 year).
+///
+/// `try_issue` rejects any `duration_secs` above this with
+/// [`TokenError::TtlTooLong`]. Without a cap a caller could mint a
+/// token with `duration_secs == u64::MAX`, whose `not_after`
+/// saturates and never expires — and since revocation is only the
+/// advisory per-issuer `RevocationRegistry` floor, a leaked
+/// never-expiring credential is effectively impossible to retire on a
+/// node that hasn't learned to bump the floor. Bounding the issuance
+/// window forces long-lived grants to be periodically re-issued (which
+/// re-checks the issuer's signing key and current policy) and caps the
+/// blast radius of any single leaked token. Delegation only ever
+/// narrows expiry (`delegate` copies the parent's `not_after`), so the
+/// chain stays within this bound transitively.
+pub const MAX_TOKEN_TTL_SECS: u64 = 365 * 24 * 60 * 60;
+
+/// Hard upper bound on [`TokenCache`] clock-skew tolerance (5
+/// minutes).
+///
+/// [`TokenCache::with_clock_skew`] / [`TokenCache::set_clock_skew`]
+/// clamp any larger value to this. Skew widens every token's validity
+/// window symmetrically — an out-of-bound skew would keep expired
+/// tokens accepted for that many extra seconds across the whole cache.
+/// Five minutes comfortably covers real NTP / container drift (the
+/// recommended default is [`TOKEN_CLOCK_SKEW_SECS_RECOMMENDED`] = 60s)
+/// while preventing a misconfiguration from turning the expiry check
+/// into a rubber stamp.
+pub const MAX_TOKEN_CLOCK_SKEW_SECS: u64 = 5 * 60;
+
 /// Fast permission lookup cache.
 ///
 /// Keyed by `(subject EntityId, channel_hash)`. Each slot holds a
@@ -728,12 +772,14 @@ impl TokenCache {
     /// tolerance (in seconds) applied to every [`Self::check`]
     /// time-bound evaluation. See
     /// [`TOKEN_CLOCK_SKEW_SECS_RECOMMENDED`] for the production-
-    /// recommended value.
+    /// recommended value. The tolerance is clamped to
+    /// [`MAX_TOKEN_CLOCK_SKEW_SECS`] so a misconfiguration can't widen
+    /// the validity window without bound.
     pub fn with_clock_skew(skew_secs: u64) -> Self {
         Self {
             tokens: DashMap::new(),
             revocation: Arc::new(RevocationRegistry::new()),
-            clock_skew_secs: skew_secs,
+            clock_skew_secs: skew_secs.min(MAX_TOKEN_CLOCK_SKEW_SECS),
             wildcard_inserted: AtomicBool::new(false),
         }
     }
@@ -755,9 +801,10 @@ impl TokenCache {
     /// Set the cache's clock-skew tolerance. Tokens cleared the
     /// freshness checks in [`Self::check`] are admitted while
     /// `now >= not_before - skew` AND `now < not_after + skew`.
-    /// Default is 0 (strict).
+    /// Default is 0 (strict). The value is clamped to
+    /// [`MAX_TOKEN_CLOCK_SKEW_SECS`].
     pub fn set_clock_skew(&mut self, skew_secs: u64) {
-        self.clock_skew_secs = skew_secs;
+        self.clock_skew_secs = skew_secs.min(MAX_TOKEN_CLOCK_SKEW_SECS);
     }
 
     /// Current clock-skew tolerance (seconds).
@@ -1008,6 +1055,13 @@ pub enum TokenError {
     /// time so the caller learns about the misuse instead of
     /// minting an unusable token.
     ZeroTtl,
+    /// `duration_secs` exceeded [`MAX_TOKEN_TTL_SECS`].
+    ///
+    /// An unbounded TTL saturates `not_after` into a token that never
+    /// expires and can only be retired through the advisory revocation
+    /// floor. Rejected at issue time so a leaked credential always has
+    /// a bounded lifetime.
+    TtlTooLong,
 }
 
 impl std::fmt::Display for TokenError {
@@ -1022,6 +1076,10 @@ impl std::fmt::Display for TokenError {
             Self::InvalidFormat => write!(f, "invalid token format"),
             Self::ReadOnly => write!(f, "signer keypair is public-only"),
             Self::ZeroTtl => write!(f, "token TTL must be > 0 seconds"),
+            Self::TtlTooLong => write!(
+                f,
+                "token TTL exceeds the maximum of {MAX_TOKEN_TTL_SECS} seconds"
+            ),
         }
     }
 }
@@ -2238,15 +2296,68 @@ mod tests {
         ));
     }
 
-    /// Regression for a cubic-flagged P1: `issue()` used unchecked
-    /// `now + duration_secs`, which panics in debug builds on
-    /// large TTL. Saturating add yields a never-expiring token
-    /// instead of crashing.
+    /// Security audit H3: an unbounded TTL is rejected at issue time.
+    ///
+    /// Pre-fix `issue()` saturated `now + u64::MAX` into a token whose
+    /// `not_after == u64::MAX` — a never-expiring credential retirable
+    /// only via the advisory revocation floor. `try_issue` now returns
+    /// `TtlTooLong` for any `duration_secs > MAX_TOKEN_TTL_SECS`, and
+    /// the panicking `issue` wrapper turns that into a clear panic.
     #[test]
-    fn issue_with_huge_ttl_saturates_rather_than_panics() {
+    fn issue_rejects_ttl_above_max() {
         let issuer = EntityKeypair::generate();
         let subject = EntityKeypair::generate();
-        let tok = PermissionToken::issue(
+
+        // u64::MAX (the old "immortal token" input) is rejected.
+        assert!(matches!(
+            PermissionToken::try_issue(
+                &issuer,
+                subject.entity_id().clone(),
+                TokenScope::PUBLISH,
+                0,
+                u64::MAX,
+                0,
+            ),
+            Err(TokenError::TtlTooLong)
+        ));
+
+        // One second past the ceiling is rejected.
+        assert!(matches!(
+            PermissionToken::try_issue(
+                &issuer,
+                subject.entity_id().clone(),
+                TokenScope::PUBLISH,
+                0,
+                MAX_TOKEN_TTL_SECS + 1,
+                0,
+            ),
+            Err(TokenError::TtlTooLong)
+        ));
+
+        // Exactly the ceiling is accepted and produces a bounded,
+        // non-saturated expiry.
+        let tok = PermissionToken::try_issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0,
+            MAX_TOKEN_TTL_SECS,
+            0,
+        )
+        .expect("max-TTL token must issue");
+        assert!(tok.not_after < u64::MAX, "expiry must not saturate");
+        assert!(tok.is_valid().is_ok());
+        assert!(tok.verify().is_ok());
+    }
+
+    /// The panicking `issue` wrapper surfaces an over-long TTL as a
+    /// panic rather than minting an immortal token.
+    #[test]
+    #[should_panic(expected = "MAX_TOKEN_TTL_SECS")]
+    fn issue_panics_on_ttl_above_max() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let _ = PermissionToken::issue(
             &issuer,
             subject.entity_id().clone(),
             TokenScope::PUBLISH,
@@ -2254,14 +2365,25 @@ mod tests {
             u64::MAX,
             0,
         );
-        assert_eq!(
-            tok.not_after,
-            u64::MAX,
-            "TTL=u64::MAX must saturate, not wrap or panic",
-        );
-        assert!(!tok.is_expired());
-        // Signature is still valid.
-        assert!(tok.verify().is_ok());
+    }
+
+    /// Security audit M2: `TokenCache` clock-skew tolerance is clamped
+    /// to `MAX_TOKEN_CLOCK_SKEW_SECS` so a misconfiguration can't widen
+    /// every token's validity window without bound.
+    #[test]
+    fn clock_skew_is_clamped_to_max() {
+        // Constructor clamps.
+        let cache = TokenCache::with_clock_skew(u64::MAX);
+        assert_eq!(cache.clock_skew_secs(), MAX_TOKEN_CLOCK_SKEW_SECS);
+
+        // Setter clamps.
+        let mut cache = TokenCache::new();
+        cache.set_clock_skew(u64::MAX);
+        assert_eq!(cache.clock_skew_secs(), MAX_TOKEN_CLOCK_SKEW_SECS);
+
+        // In-range values pass through unchanged.
+        let cache = TokenCache::with_clock_skew(TOKEN_CLOCK_SKEW_SECS_RECOMMENDED);
+        assert_eq!(cache.clock_skew_secs(), TOKEN_CLOCK_SKEW_SECS_RECOMMENDED);
     }
 
     /// Regression for a cubic-flagged P2: `delegate()` computed the
