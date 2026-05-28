@@ -20,6 +20,8 @@ All findings have been remediated. Each fix carries a regression test where one 
 | L2 | No change — verified every `wait_for_token` consumer rejects a token whose `origin_hash` ≠ the adapter's bound origin (`WrongOrigin`); the documented adapter-is-the-trust-boundary model holds | (assessed with L3 commit) |
 | L3 | Fixed — blob read paths (`fetch`/`fetch_range`/`exists`/`fetch_stream`) canonicalize against root via `path_within_root` before following the path | `fix(dataforts): canonicalize blob read paths against root` |
 
+Follow-up review (post-remediation): the H3 fix made `try_issue` reject an over-long TTL, which turned the SDK's *infallible* `Identity::issue_token` (`try_issue_token(...).expect(...)`) into a panic/DoS vector — now soft-clamped to `MAX_TOKEN_TTL_SECS`, mirroring the existing zero-TTL soft-clamp. The L3 read-path test was also gated on `#[cfg(unix)]` (it plants a unix symlink) and `exists` re-applied its `is_file()` contract so a directory at a blob slot isn't reported present. Commits `fix(sdk): soft-clamp over-long token TTL in infallible issue_token` and `fix(dataforts): gate L3 read-symlink test on unix + restore is_file() in exists`.
+
 The remaining content below is the original audit, retained as the point-in-time record.
 
 | ID | Severity | Area | One-line |
