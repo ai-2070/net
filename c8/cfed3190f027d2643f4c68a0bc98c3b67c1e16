@@ -1,0 +1,32 @@
+net/crates/net/bindings/node/tool.ts
+  s_099fa7d871e34d::t_d2d541f60745e1 556-563,566-567,577-587,590-591,595-596,599,602,606-610,613-619,621,623-625,627
+  s_099fa7d871e34d::t_174922bfffdf02 37-56
+net/crates/net/bindings/node/src/lib.rs
+  s_099fa7d871e34d::t_f57e0ed28efbb4 2137-2166
+net/crates/net/bindings/node/src/tool.rs
+  s_099fa7d871e34d::t_32fa88230be825 113-133,136-141,147-148
+  s_099fa7d871e34d::t_db8616ee95213d 16-21,23-24
+  s_099fa7d871e34d::t_b264bf38b6d519 68-112,134-135,142-146,149-206,216-217
+  s_099fa7d871e34d::t_5e73408139303b 207-215
+net/crates/net/bindings/node/test/tool.test.ts
+  s_099fa7d871e34d::t_9ba82b01d9baed 30-32
+  s_099fa7d871e34d::t_4d6f32bb24ea9c 216-240,242-247,252-279,282-291,294-296,298-311,313-314,317-322,324-326,328,331-332,337-338,343-344,350,353-356,358,360-361,365
+  s_099fa7d871e34d::t_7c7b174b7af3cf 398-400,409
+  s_099fa7d871e34d::t_aa4b1774d5410c 369-397,401,403-406,408
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "c8cfed3190f027d2643f4c68a0bc98c3b67c1e16",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
