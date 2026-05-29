@@ -115,19 +115,38 @@ pub fn new_tool_watch_iter(watch: ToolListWatch) -> ToolWatchIter {
 // reads `descriptor.toolId` / `nodeCount`, so the wire JSON must be
 // camelCase to round-trip into the TS discriminated union.
 fn descriptor_to_camel_json(d: ToolDescriptor) -> serde_json::Value {
+    // Destructure so a NEW `ToolDescriptor` field is a compile error
+    // here until it's mapped into the camelCase wire shape. The TS
+    // `ToolListChange` reads camelCase (`descriptor.toolId` etc.); a
+    // field silently omitted from this map would round-trip into the
+    // discriminated union as `undefined` with no test or build failure.
+    let ToolDescriptor {
+        tool_id,
+        name,
+        version,
+        description,
+        input_schema,
+        output_schema,
+        requires,
+        estimated_time_ms,
+        stateless,
+        streaming,
+        tags,
+        node_count,
+    } = d;
     serde_json::json!({
-        "toolId": d.tool_id,
-        "name": d.name,
-        "version": d.version,
-        "description": d.description,
-        "inputSchema": d.input_schema,
-        "outputSchema": d.output_schema,
-        "requires": d.requires,
-        "estimatedTimeMs": d.estimated_time_ms,
-        "stateless": d.stateless,
-        "streaming": d.streaming,
-        "tags": d.tags,
-        "nodeCount": d.node_count,
+        "toolId": tool_id,
+        "name": name,
+        "version": version,
+        "description": description,
+        "inputSchema": input_schema,
+        "outputSchema": output_schema,
+        "requires": requires,
+        "estimatedTimeMs": estimated_time_ms,
+        "stateless": stateless,
+        "streaming": streaming,
+        "tags": tags,
+        "nodeCount": node_count,
     })
 }
 
@@ -213,5 +232,82 @@ impl ToolWatchIter {
         if let Ok(mut guard) = self.inner.stream.try_lock() {
             *guard = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use net::adapter::net::cortex::tool::ToolDescriptor;
+
+    fn full_descriptor() -> ToolDescriptor {
+        ToolDescriptor {
+            tool_id: "web_search".into(),
+            name: "Web Search".into(),
+            version: "1.2.3".into(),
+            description: Some("Search the web.".into()),
+            input_schema: Some("{\"type\":\"object\"}".into()),
+            output_schema: Some("{\"type\":\"array\"}".into()),
+            requires: vec!["net".into()],
+            estimated_time_ms: 42,
+            stateless: false,
+            streaming: true,
+            tags: vec!["search".into()],
+            node_count: 7,
+        }
+    }
+
+    // The TS `ToolListChange` reads the descriptor in camelCase. Pin
+    // every key + value so a snake_case slip (or a dropped field) fails
+    // the build, not silently a consumer's `JSON.parse`. Paired with the
+    // destructure in `descriptor_to_camel_json`, which catches a NEW
+    // field at compile time.
+    #[test]
+    fn descriptor_wire_json_is_camel_case_with_every_field() {
+        let v = descriptor_to_camel_json(full_descriptor());
+        let obj = v.as_object().expect("object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "description",
+                "estimatedTimeMs",
+                "inputSchema",
+                "name",
+                "nodeCount",
+                "outputSchema",
+                "requires",
+                "stateless",
+                "streaming",
+                "tags",
+                "toolId",
+                "version",
+            ],
+            "wire descriptor must expose exactly the camelCase keys the TS reads",
+        );
+        assert_eq!(obj["toolId"], "web_search");
+        assert_eq!(obj["estimatedTimeMs"], 42);
+        assert_eq!(obj["nodeCount"], 7);
+        assert_eq!(obj["streaming"], true);
+        assert_eq!(obj["inputSchema"], "{\"type\":\"object\"}");
+    }
+
+    #[test]
+    fn change_wire_json_tags_and_carries_prev_node_count() {
+        let added = change_to_json(ToolListChange::Added(full_descriptor()));
+        assert_eq!(added["type"], "added");
+        assert_eq!(added["descriptor"]["toolId"], "web_search");
+
+        let removed = change_to_json(ToolListChange::Removed(full_descriptor()));
+        assert_eq!(removed["type"], "removed");
+
+        let bumped = change_to_json(ToolListChange::NodeCountChanged {
+            descriptor: full_descriptor(),
+            prev_node_count: 3,
+        });
+        assert_eq!(bumped["type"], "node_count_changed");
+        assert_eq!(bumped["prevNodeCount"], 3);
+        assert_eq!(bumped["descriptor"]["nodeCount"], 7);
     }
 }
