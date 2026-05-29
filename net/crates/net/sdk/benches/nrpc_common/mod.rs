@@ -350,6 +350,40 @@ pub async fn call_postcard_direct(pair: &Pair, req: &EchoReq) -> EchoResp {
     postcard::from_bytes(&reply.body).expect("postcard decode")
 }
 
+/// Postcard analog of [`call_json_direct_retrying`]: encodes the
+/// request with postcard, calls the raw `SVC_POSTCARD` service, and
+/// retries on transient transport backpressure (`RpcError::Transport`).
+/// Used by `nrpc_qps.rs` / `nrpc_tail.rs`, which drive concurrency
+/// above the link's publish budget the same way the JSON axis does —
+/// yielding on each backpressure hit so other in-flight callers make
+/// progress instead of masking saturation as a panic.
+///
+/// The request is encoded once up front (one encode per RPC, matching
+/// the typed path) and the `Bytes` handle is cheaply cloned on retry —
+/// a refcount bump, not a re-encode.
+pub async fn call_postcard_direct_retrying(pair: &Pair, req: &EchoReq) -> EchoResp {
+    use net_sdk::mesh_rpc::RpcError;
+    let body = Bytes::from(postcard::to_allocvec(req).expect("postcard encode"));
+    loop {
+        match pair
+            .caller
+            .call(
+                pair.server_node_id,
+                SVC_POSTCARD,
+                body.clone(),
+                CallOptions::default(),
+            )
+            .await
+        {
+            Ok(reply) => return postcard::from_bytes(&reply.body).expect("postcard decode"),
+            Err(RpcError::Transport(_)) => {
+                tokio::task::yield_now().await;
+            }
+            Err(e) => panic!("call postcard direct (retrying): {e}"),
+        }
+    }
+}
+
 /// Direct raw `call` with no codec — body bytes round-trip
 /// verbatim. The theoretical floor: every byte the bench
 /// measures is genuine transport cost.
