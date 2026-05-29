@@ -273,18 +273,26 @@ describe('cortex tasks watch', () => {
         .sort()
         .join(',')
 
-    const task = (async () => {
-      for await (const current of toAsyncIterable<Task>(iter)) {
-        seen.add(stateKey(current))
-        if (stateKey(current) === '1,2') {
-          iter.close()
-        }
-      }
-    })()
+    // Pull the initial empty emission BEFORE mutating. `watchTasks` is
+    // backed by `tokio::sync::watch`, which keeps only the latest value:
+    // creating tasks before the first poll would coalesce the empty
+    // baseline away ('' -> [1] -> [1,2] collapses to [1,2]), so the
+    // baseline must be observed first. Mirrors the explicit
+    // `await iter.next()` sequencing the other watch tests use.
+    seen.add(stateKey((await iter.next())!))
 
     tasks.create(1n, 'a', 100n)
     tasks.create(2n, 'b', 200n)
-    await task
+
+    // Drain the rest via the for-await-of helper until the target state.
+    // The intermediate [1] may still coalesce into [1,2]; only the final
+    // state is asserted below.
+    for await (const current of toAsyncIterable<Task>(iter)) {
+      seen.add(stateKey(current))
+      if (stateKey(current) === '1,2') {
+        iter.close()
+      }
+    }
 
     // Initial empty + final two-item state must both have been observed.
     expect(seen.has('')).toBe(true)
