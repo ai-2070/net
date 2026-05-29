@@ -418,6 +418,15 @@ impl MeshOsSnapshotReader {
     /// await re-seeds the seen generation to "now" and reintroduces the
     /// gap — so callers that need the guarantee (e.g. a long-ceiling
     /// `watch`) subscribe once and reuse.
+    ///
+    /// Note the clone inherits the source reader's *seen* generation,
+    /// which the reader never advances — so it stays at the construction-
+    /// time value (0). After any publish has bumped the generation, the
+    /// first `changed()` on a fresh subscription therefore returns
+    /// immediately. That is harmless and intended: every consumer is
+    /// built to emit current state on its first wake anyway (the deck
+    /// streams' ceiling fires immediately; `watch` pre-checks the current
+    /// snapshot before parking).
     pub(crate) fn subscribe_changes(&self) -> watch::Receiver<u64> {
         self.change_rx.clone()
     }
@@ -1677,6 +1686,25 @@ impl MeshOsLoop {
         // and wakes regardless of receiver count; it collapses a burst to
         // one observable generation. The first publish (`None`) always
         // counts as a change.
+        //
+        // Why a full structural snapshot + deep `PartialEq` every tick,
+        // and not something cheaper — both alternatives were rejected on
+        // purpose:
+        //   * A hash of the structural view is out: `MeshOsSnapshot`
+        //     carries `f32`/`f64` fields (saturation, `cpu_load_1m`, …),
+        //     so it can't derive `Hash`/`Eq` — only `PartialEq`.
+        //   * A reconcile-bumped "dirty" generation that skips the
+        //     build+compare on untouched ticks would be one missed
+        //     mutation site away from a SILENT under-signal, and some
+        //     structural transitions are time-triggered with no inbound
+        //     event (an expiring freeze clears `freeze_until` inside
+        //     `gc_freeze`), so a naive "only on inbound events" flag
+        //     would miss them outright. The deep-eq's sole failure mode
+        //     is a forgotten time-normalization, i.e. it can only ever
+        //     OVER-signal, never miss an edge — that robustness is worth
+        //     one structural rebuild per tick. The rebuild rides the
+        //     loop's existing tick cadence; revisit only if tick-rate ×
+        //     mesh-size ever makes it measurable.
         if self.last_published_structural.as_ref() != Some(&structural) {
             self.last_published_structural = Some(structural);
             self.change_tx.send_modify(|g| *g = g.wrapping_add(1));
