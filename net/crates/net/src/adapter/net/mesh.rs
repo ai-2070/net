@@ -45,7 +45,10 @@ use tokio::task::JoinHandle;
 
 use super::crypto::{handshake_prologue, CryptoError, NoiseHandshake, SessionKeys, StaticKeypair};
 use super::failure::{FailureDetector, FailureDetectorConfig};
-use super::identity::{EntityId, EntityKeypair, PermissionToken, TokenCache, TokenScope};
+use super::identity::{
+    EntityId, EntityKeypair, PermissionToken, RevocationRegistry, TokenCache, TokenChain,
+    TokenScope,
+};
 use super::pool::PacketBuilder;
 
 use super::behavior::broadcast::SUBPROTOCOL_CAPABILITY_ANN;
@@ -360,6 +363,33 @@ fn routed_rotation_outcome(
     }
 }
 
+/// A subscribe token chain retained after it cleared the root-anchored
+/// gate, plus a one-shot flag recording whether its (immutable) link
+/// signatures have already been ed25519-verified.
+///
+/// The publish fan-out re-checks every admitted subscriber's chain on
+/// every packet. Once the signatures verify the first time, subsequent
+/// re-checks take `verify_authorizes_presigned`, which skips the
+/// ed25519 work (a signature on an immutable token can't change) but
+/// still re-evaluates time bounds, revocation floors, root anchoring,
+/// and scope — all of which *can* change between publishes. So a
+/// high-fanout, deep-delegation channel stops paying N × up-to-8
+/// signature verifies per packet without weakening any live policy
+/// check.
+struct RetainedChain {
+    chain: TokenChain,
+    signatures_verified: AtomicBool,
+}
+
+impl RetainedChain {
+    fn new(chain: TokenChain) -> Self {
+        Self {
+            chain,
+            signatures_verified: AtomicBool::new(false),
+        }
+    }
+}
+
 /// Shared context for the packet dispatch loop.
 struct DispatchCtx {
     local_node_id: u64,
@@ -583,6 +613,14 @@ struct DispatchCtx {
     /// `require_token` path — unset is equivalent to "no token is
     /// ever valid."
     token_cache: Option<Arc<TokenCache>>,
+    /// Verified subscribe token chains, keyed by `(node_id,
+    /// channel_hash)`. `authorize_subscribe` stores the chain a peer
+    /// presented once it passes the root-anchored gate; the periodic
+    /// `sweep_expired_subscribers` re-verifies the stored chain against
+    /// current time + revocation so an expired or revoked credential
+    /// gets the subscriber evicted without the peer re-presenting.
+    /// Entries are dropped on unsubscribe / roster removal.
+    subscriber_chains: Arc<DashMap<(u64, ChannelHash), RetainedChain>>,
     /// Per-packet authorization fast path. `authorize_subscribe`
     /// writes on success (via `allow_channel`) so the publish
     /// fan-out can use the bloom filter + verified cache to admit
@@ -1211,12 +1249,15 @@ fn sweep_expired_subscribers(
     token_cache: Option<&Arc<TokenCache>>,
     peer_entity_ids: &DashMap<u64, EntityId>,
     channel_configs: Option<&Arc<ChannelConfigRegistry>>,
+    subscriber_chains: &DashMap<(u64, ChannelHash), RetainedChain>,
 ) {
     let (Some(cache), Some(configs)) = (token_cache, channel_configs) else {
         return;
     };
+    let revocation = cache.revocation().as_ref();
+    let skew = cache.clock_skew_secs();
     // Snapshot (node_id, entity_id) pairs so we don't hold the
-    // DashMap read guard across the token checks below.
+    // DashMap read guard across the chain checks below.
     let peers: Vec<(u64, EntityId)> = peer_entity_ids
         .iter()
         .map(|e| (*e.key(), e.value().clone()))
@@ -1227,26 +1268,30 @@ fn sweep_expired_subscribers(
             let Some(cfg) = configs.get_by_name(name.as_str()) else {
                 continue;
             };
-            if !cfg.require_token {
+            if !cfg.token_required() {
                 continue;
             }
-            // `check` validates signature + time bounds. Any error
-            // (expired, not_yet_valid, invalid_signature, not_authorized)
-            // means this subscriber is no longer authorized.
-            let authorized = cache
-                .check(
-                    &entity_id,
-                    super::identity::TokenScope::SUBSCRIBE,
-                    name.hash(),
-                )
-                .is_ok();
+            // Re-verify the chain the subscriber presented at subscribe
+            // time against the *current* clock + revocation floors.
+            // Anything that fails — expiry, a revoked root or link, a
+            // root that's no longer in `token_roots` — evicts the
+            // subscriber. A missing stored chain (e.g. process restarted
+            // and lost the in-memory map) also evicts: fail closed and
+            // force a re-subscribe that re-presents.
+            // The periodic sweep is the cold authoritative re-check; it
+            // always re-verifies signatures (full `reverify_subscribe`)
+            // rather than trusting the publish path's cached flag.
+            let authorized = subscriber_chains
+                .get(&(node_id, name.hash()))
+                .is_some_and(|r| cfg.reverify_subscribe(&r.chain, &entity_id, revocation, skew));
             if !authorized {
                 guard.revoke_channel(subscriber_origin_hash(node_id), name);
                 roster.remove(&channel_id, node_id);
+                subscriber_chains.remove(&(node_id, name.hash()));
                 tracing::debug!(
                     node_id = format!("{:#x}", node_id),
                     channel = name.as_str(),
-                    "auth: evicted subscriber with expired/invalid token",
+                    "auth: evicted subscriber with expired/invalid/revoked token chain",
                 );
             }
         }
@@ -1780,6 +1825,18 @@ pub struct MeshNode {
     /// always reject. SDK builders wire this up from the caller's
     /// `Identity`.
     token_cache: Option<Arc<TokenCache>>,
+    /// Verified subscribe token chains, keyed by `(node_id,
+    /// channel_hash)`. Shared with `MeshNode`; see the field of the
+    /// same name there.
+    subscriber_chains: Arc<DashMap<(u64, ChannelHash), RetainedChain>>,
+    /// This node's own publish credentials, keyed by `channel_hash`.
+    /// Installed via [`MeshNode::set_publish_chain`] for channels where
+    /// the node's PUBLISH grant was *delegated* (owner → … → this node)
+    /// rather than issued directly — the publish path prefers a held
+    /// chain here over a single directly-granted token from the
+    /// `TokenCache`, so a delegated publisher isn't fail-closed.
+    /// Local to the publish path; not threaded into `DispatchCtx`.
+    published_chains: Arc<DashMap<ChannelHash, TokenChain>>,
     /// Per-packet authorization fast path. Populated when a
     /// subscribe clears `authorize_subscribe`; consulted on every
     /// publish fan-out via `check_fast`. The bloom filter + verified
@@ -1992,6 +2049,15 @@ impl MeshNode {
         let peer_entity_ids_failure = peer_entity_ids.clone();
         let origin_hash_to_node_failure = origin_hash_to_node.clone();
         let capability_fold_failure = capability_fold.clone();
+        // Created here (not in the struct literal) so the failure
+        // callback can drop a dead peer's retained subscribe chains —
+        // otherwise the entries leak until an explicit unsubscribe that
+        // a failed peer never sends, and the sweep can't reclaim them
+        // (it only visits peers still in `peer_entity_ids`, which the
+        // callback below clears).
+        let subscriber_chains: Arc<DashMap<(u64, ChannelHash), RetainedChain>> =
+            Arc::new(DashMap::new());
+        let subscriber_chains_failure = subscriber_chains.clone();
         let failure_detector = FailureDetector::with_config(FailureDetectorConfig {
             timeout: config.session_timeout,
             miss_threshold: 3,
@@ -2034,6 +2100,13 @@ impl MeshNode {
             // failure; the capability fold is now consistent
             // with them.
             capability_fold_failure.evict_node(node_id, "failure-detector");
+            // Drop any retained subscribe token chains for this peer.
+            // The sweep can no longer reach them (it iterates
+            // `peer_entity_ids`, just cleared above), and a failed peer
+            // never sends the unsubscribe that would otherwise remove
+            // them — so without this they leak for the node's lifetime,
+            // and a reused `node_id` could re-validate a stale chain.
+            subscriber_chains_failure.retain(|(nid, _), _| *nid != node_id);
         })
         .on_recovery(move |node_id| rp_recovery.on_recovery(node_id));
 
@@ -2161,6 +2234,8 @@ impl MeshNode {
             peer_entity_ids,
             origin_hash_to_node,
             token_cache: None,
+            subscriber_chains,
+            published_chains: Arc::new(DashMap::new()),
             auth_guard: Arc::new(AuthGuard::new()),
             auth_failures: Arc::new(DashMap::new()),
             tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -2194,6 +2269,14 @@ impl MeshNode {
     /// rejected subscribe.
     pub fn token_cache(&self) -> Option<&Arc<TokenCache>> {
         self.token_cache.as_ref()
+    }
+
+    /// Number of retained subscribe token chains. A verified chain is
+    /// stored here only after a subscribe passes the root-anchored
+    /// gate; the sweep and publish re-check consult it. Exposed for
+    /// tests that assert a rejected subscribe retains nothing.
+    pub fn subscriber_chain_count(&self) -> usize {
+        self.subscriber_chains.len()
     }
 
     /// Get this node's ed25519 entity id (derived from the
@@ -2982,6 +3065,7 @@ impl MeshNode {
         let cache = self.token_cache.clone();
         let peer_entity_ids = self.peer_entity_ids.clone();
         let channel_configs = self.channel_configs.clone();
+        let subscriber_chains = self.subscriber_chains.clone();
         let interval = self.config.token_sweep_interval;
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
@@ -3013,6 +3097,7 @@ impl MeshNode {
                             cache.as_ref(),
                             &peer_entity_ids,
                             channel_configs.as_ref(),
+                            &subscriber_chains,
                         );
                     }
                     _ = shutdown_notify.notified() => break,
@@ -3089,6 +3174,7 @@ impl MeshNode {
             peer_entity_ids: self.peer_entity_ids.clone(),
             origin_hash_to_node: self.origin_hash_to_node.clone(),
             token_cache: self.token_cache.clone(),
+            subscriber_chains: self.subscriber_chains.clone(),
             auth_guard: self.auth_guard.clone(),
             auth_failures: self.auth_failures.clone(),
             max_auth_failures_per_window: self.config.max_auth_failures_per_window,
@@ -5951,24 +6037,63 @@ impl MeshNode {
             .await
     }
 
-    /// Subscribe with a pre-issued [`PermissionToken`] attached.
-    /// The publisher verifies the token and, on success, installs
-    /// it in its local `TokenCache` before the
-    /// `ChannelConfig::can_subscribe` check.
+    /// Subscribe with a single pre-issued [`PermissionToken`] — the
+    /// common case where the channel owner granted the subscriber
+    /// directly (a one-link chain). For a delegated credential
+    /// (owner → … → subscriber) use
+    /// [`Self::subscribe_channel_with_chain`].
+    ///
+    /// The publisher verifies the chain roots at one of the channel's
+    /// `token_roots` and binds to the subscriber's entity before
+    /// admitting the subscribe.
     pub async fn subscribe_channel_with_token(
         &self,
         publisher_node_id: u64,
         channel: ChannelName,
         token: PermissionToken,
     ) -> Result<(), AdapterError> {
+        self.subscribe_channel_with_chain(publisher_node_id, channel, TokenChain::single(token))
+            .await
+    }
+
+    /// Subscribe presenting a full delegation [`TokenChain`]
+    /// (root-to-leaf). Use when the subscriber's grant was delegated
+    /// rather than issued directly by the channel owner: the chain's
+    /// root link must be signed by one of the channel's `token_roots`
+    /// and the leaf must be bound to this node's entity. See
+    /// [`TokenChain::verify_authorizes`] for the full contract the
+    /// publisher applies.
+    pub async fn subscribe_channel_with_chain(
+        &self,
+        publisher_node_id: u64,
+        channel: ChannelName,
+        chain: TokenChain,
+    ) -> Result<(), AdapterError> {
         self.send_membership_request(
             publisher_node_id,
             channel,
             true,
-            Some(token.to_bytes()),
+            Some(chain.to_bytes()),
             None,
         )
         .await
+    }
+
+    /// Install this node's own PUBLISH credential for `channel` as a
+    /// (possibly delegated, multi-link) [`TokenChain`].
+    ///
+    /// Use this when the node's right to publish was *delegated*
+    /// (owner → … → this node) rather than granted directly by the
+    /// channel owner: the publish-side ACL builds a single-link chain
+    /// from the local `TokenCache`, whose issuer is the delegator (not
+    /// a channel root), so a delegated grant would otherwise fail the
+    /// root-anchor check and the node couldn't publish. The held chain
+    /// is preferred over the cache fallback on the publish path; its
+    /// leaf must be bound to this node's entity. Re-verified against the
+    /// current clock + revocation on every publish, so an expired or
+    /// revoked held chain fails closed like any other.
+    pub fn set_publish_chain(&self, channel: &ChannelName, chain: TokenChain) {
+        self.published_chains.insert(channel.hash(), chain);
     }
 
     /// Subscribe in the named queue group: every published event is
@@ -6003,7 +6128,7 @@ impl MeshNode {
             publisher_node_id,
             channel,
             true,
-            Some(token.to_bytes()),
+            Some(TokenChain::single(token).to_bytes()),
             Some(queue_group),
         )
         .await
@@ -6172,6 +6297,9 @@ impl MeshNode {
                 ctx.auth_guard
                     .revoke_channel(subscriber_origin_hash(from_node), &channel);
                 let id = ChannelId::new(channel);
+                // Drop the retained subscribe chain so it can't be
+                // re-validated by the sweep and doesn't leak memory.
+                ctx.subscriber_chains.remove(&(from_node, id.hash()));
                 ctx.roster.remove(&id, from_node);
                 // Unsubscribe is always accepted — idempotent even if the
                 // peer wasn't actually subscribed.
@@ -7116,22 +7244,20 @@ impl MeshNode {
             return (false, Some(AckReason::Unauthorized));
         }
 
-        // Parse + verify the presented token into a LOCAL scratch
-        // value. We do NOT insert into the shared cache until the
-        // full auth check passes — otherwise an attacker can spam
-        // self-signed subscribes (which fail at cap/visibility
-        // checks) yet leave their tokens permanently in the shared
-        // cache, exhausting memory keyed under attacker-controlled
-        // `(subject, channel_hash)` slots.
-        let presented_token = token_bytes
-            .and_then(|bytes| PermissionToken::from_bytes(bytes).ok())
-            .filter(|tok| tok.verify().is_ok());
+        // Parse the presented credential as a delegation chain. A
+        // single directly-issued token is a one-link chain. Full
+        // verification — root anchor, per-link signature/time/
+        // revocation, link continuity, monotonic authority — runs
+        // inside `cfg.can_subscribe` via `TokenChain::verify_authorizes`;
+        // here we only parse. A malformed blob parses to `None` and is
+        // treated as "no credential presented" (rejected by the gate).
+        let presented_chain = token_bytes.and_then(|bytes| TokenChain::from_bytes(bytes).ok());
 
         // Whether any cap / token gate is in play. A fully open
         // channel (no filters, no require_token) short-circuits
         // without needing a peer entity_id at all.
         let has_auth_gates =
-            cfg.publish_caps.is_some() || cfg.subscribe_caps.is_some() || cfg.require_token;
+            cfg.publish_caps.is_some() || cfg.subscribe_caps.is_some() || cfg.token_required();
         if !has_auth_gates {
             return (true, None);
         }
@@ -7148,55 +7274,67 @@ impl MeshNode {
             from_node,
         );
 
-        // Peer entity — load-bearing for `require_token`. Without
-        // it we can't validate the subject. Missing entity +
-        // require_token = reject.
+        // Revocation registry + clock skew for chain verification.
+        // Pulled from the shared token cache when present; otherwise a
+        // transient empty registry (nothing revoked) with strict skew.
+        // The `transient_revocation` binding is declared here so it
+        // outlives the borrow taken in the `None` arm.
+        let transient_revocation;
+        let (revocation, skew_secs): (&RevocationRegistry, u64) = match ctx.token_cache.as_ref() {
+            Some(cache) => (cache.revocation().as_ref(), cache.clock_skew_secs()),
+            None => {
+                transient_revocation = RevocationRegistry::new();
+                (&transient_revocation, 0)
+            }
+        };
+
+        // Peer entity — load-bearing for `require_token`: the chain's
+        // leaf subject must bind to this AEAD-verified handshake
+        // identity. Missing entity + require_token = reject.
         let Some(peer_entity) = ctx
             .peer_entity_ids
             .get(&from_node)
             .map(|e| e.value().clone())
         else {
-            if cfg.require_token {
+            if cfg.token_required() {
                 return (false, Some(AckReason::Unauthorized));
             }
-            // Cap-filter-only mode without a known entity — build a
-            // dummy id so `can_subscribe` can still run the cap
-            // match. Token check is skipped via `require_token=false`.
+            // Cap-filter-only mode without a known entity — run the
+            // cap match with a dummy id. The token gate is skipped
+            // because the channel requires no token.
             let dummy = EntityId::from_bytes([0u8; 32]);
-            let empty_cache = Arc::new(TokenCache::new());
-            return if cfg.can_subscribe(&peer_caps, &dummy, &empty_cache) {
+            return if cfg.can_subscribe(&peer_caps, &dummy, None, revocation, skew_secs) {
                 (true, None)
             } else {
                 (false, Some(AckReason::Unauthorized))
             };
         };
 
-        // Run the ACL check against a scratch cache containing only
-        // the presented token first. A positive verdict means the
-        // fresh token alone is sufficient. If that fails, fall back
-        // to the shared cache so a peer relying on a previously-
-        // stored delegation can still re-subscribe without having
-        // to re-present. The shared cache is read-only for this
-        // decision.
-        let scratch_cache = Arc::new(TokenCache::new());
-        if let Some(ref tok) = presented_token {
-            scratch_cache.insert_unchecked(tok.clone());
-        }
-        let passed_with_scratch = cfg.can_subscribe(&peer_caps, &peer_entity, &scratch_cache);
-        let passed = passed_with_scratch
-            || ctx
-                .token_cache
-                .as_ref()
-                .is_some_and(|shared| cfg.can_subscribe(&peer_caps, &peer_entity, shared));
-        if !passed {
+        if !cfg.can_subscribe(
+            &peer_caps,
+            &peer_entity,
+            presented_chain.as_ref(),
+            revocation,
+            skew_secs,
+        ) {
             return (false, Some(AckReason::Unauthorized));
         }
 
-        // Auth passed — now and only now promote the presented token
-        // to the shared cache so future subscribes on the same
-        // (subject, channel_hash) can skip re-presenting.
-        if let (Some(tok), Some(shared)) = (presented_token, ctx.token_cache.as_ref()) {
-            let _ = shared.insert(tok);
+        // Authorized. Retain the verified chain keyed by
+        // (node_id, channel_hash) so the periodic re-validation sweep
+        // (`sweep_expired_subscribers`) can re-check expiry +
+        // revocation later without the peer re-presenting. Only stored
+        // for token-gated subscribes; cap-only channels have no chain.
+        if let Some(chain) = presented_chain {
+            // `verify_authorizes` above just verified the signatures, but
+            // store the flag as unverified: cheap, and the first publish
+            // re-check re-establishes it without trusting cross-path
+            // state. (Marking it verified here would only save the one
+            // first-publish verification.)
+            ctx.subscriber_chains.insert(
+                (from_node, cfg.channel_id.hash()),
+                RetainedChain::new(chain),
+            );
         }
         (true, None)
     }
@@ -7397,7 +7535,7 @@ impl MeshNode {
                 .map(|c| c.clone())
         });
         if let Some(cfg) = cfg_snapshot.as_ref() {
-            if cfg.publish_caps.is_some() || cfg.require_token {
+            if cfg.publish_caps.is_some() || cfg.token_required() {
                 let self_caps = self
                     .local_announcement
                     .load()
@@ -7405,11 +7543,48 @@ impl MeshNode {
                     .map(|ann| ann.capabilities.clone())
                     .unwrap_or_default();
                 let self_entity = self.identity.entity_id().clone();
-                let cache = self
-                    .token_cache
-                    .clone()
-                    .unwrap_or_else(|| Arc::new(TokenCache::new()));
-                if !cfg.can_publish(&self_caps, &self_entity, &cache) {
+                // Build the publish chain. Prefer an explicitly-held
+                // (possibly delegated, multi-link) chain installed via
+                // `set_publish_chain` — its issuer can be a delegator
+                // rather than a channel root. Otherwise fall back to a
+                // single directly-granted PUBLISH token from the
+                // `TokenCache`.
+                //
+                // `get_for_action` (not `get`) selects a token that
+                // actually carries PUBLISH on this channel: a slot can
+                // hold a SUBSCRIBE token side-by-side with the PUBLISH
+                // one, and a scope-agnostic `get` would intermittently
+                // return the SUBSCRIBE token, failing the gate even
+                // though a valid PUBLISH grant is cached.
+                //
+                // The transient empty registry keeps the borrow alive
+                // when the node has no token cache configured — a held
+                // chain still publishes in that mode (nothing revoked,
+                // strict skew).
+                let held = self
+                    .published_chains
+                    .get(&cfg.channel_id.hash())
+                    .map(|c| c.value().clone());
+                let transient_revocation;
+                let (revocation, skew, chain) = match self.token_cache.as_ref() {
+                    Some(cache) => {
+                        let chain = held.or_else(|| {
+                            cache
+                                .get_for_action(
+                                    &self_entity,
+                                    TokenScope::PUBLISH,
+                                    cfg.channel_id.hash(),
+                                )
+                                .map(TokenChain::single)
+                        });
+                        (cache.revocation().as_ref(), cache.clock_skew_secs(), chain)
+                    }
+                    None => {
+                        transient_revocation = RevocationRegistry::new();
+                        (&transient_revocation, 0u64, held)
+                    }
+                };
+                if !cfg.can_publish(&self_caps, &self_entity, chain.as_ref(), revocation, skew) {
                     return Err(AdapterError::Connection(
                         "channel: publish denied by channel ACL".into(),
                     ));
@@ -7509,7 +7684,7 @@ impl MeshNode {
         let auth_guard = self.auth_guard.clone();
         let require_token = cfg_snapshot
             .as_ref()
-            .map(|c| c.require_token)
+            .map(|c| c.token_required())
             .unwrap_or(false);
         subscribers.retain(|peer_id| {
             // (1) Subnet visibility. Cheap check first — a peer in
@@ -7551,26 +7726,49 @@ impl MeshNode {
             if !require_token {
                 return true;
             }
-            // (3) Token-gated branch: ensure the subscriber still
-            // has a valid token. If the cache answer is "no valid
-            // token authorizes SUBSCRIBE on this channel," revoke
-            // inline.
-            let (Some(cache), Some(entity)) = (
-                self.token_cache.as_ref(),
-                self.peer_entity_ids.get(peer_id).map(|e| e.value().clone()),
-            ) else {
-                // Missing entity binding or no cache installed —
-                // treat as unauthorized. The subscribe path would
-                // have rejected this peer in the first place;
-                // reaching here means a config drift that we must
-                // not paper over by admitting the publish.
-                auth_guard.revoke_channel(origin, &channel_name);
-                return false;
+            // (3) Token-gated branch: re-verify the subscriber's
+            // retained token chain against the current clock +
+            // revocation floors. The chain was stored by
+            // `authorize_subscribe` when the subscribe passed; a
+            // missing chain, an expired link, a revoked root/link, or
+            // a root no longer in `token_roots` all revoke inline so
+            // the next publish takes the `Denied` path. Re-verifying
+            // the chain (not a bare `cache.check`) keeps the publish
+            // path anchored to the channel's root of trust, same as
+            // the subscribe path and the periodic sweep.
+            let entity = self.peer_entity_ids.get(peer_id).map(|e| e.value().clone());
+            let chain_ok = match (entity, self.token_cache.as_ref(), cfg_snapshot.as_ref()) {
+                (Some(entity), Some(cache), Some(cfg)) => self
+                    .subscriber_chains
+                    .get(&(*peer_id, channel_hash))
+                    .is_some_and(|r| {
+                        let revocation = cache.revocation().as_ref();
+                        let skew = cache.clock_skew_secs();
+                        // Skip the per-link ed25519 verifies once they've
+                        // verified for this immutable chain — time bounds,
+                        // revocation, anchoring, and scope are still
+                        // re-checked every packet. Avoids N × up-to-8
+                        // signature verifies per publish on a high-fanout
+                        // channel.
+                        if r.signatures_verified.load(Ordering::Relaxed) {
+                            cfg.reverify_subscribe_presigned(&r.chain, &entity, revocation, skew)
+                        } else if cfg.reverify_subscribe(&r.chain, &entity, revocation, skew) {
+                            r.signatures_verified.store(true, Ordering::Relaxed);
+                            true
+                        } else {
+                            false
+                        }
+                    }),
+                // Missing entity binding, no cache, or no channel
+                // config — treat as unauthorized. The subscribe path
+                // would have rejected this peer in the first place;
+                // reaching here means config drift we must not paper
+                // over by admitting the publish. (A missing config also
+                // means no roots, which the re-verify would reject
+                // anyway.)
+                _ => false,
             };
-            if cache
-                .check(&entity, TokenScope::SUBSCRIBE, channel_hash)
-                .is_err()
-            {
+            if !chain_ok {
                 auth_guard.revoke_channel(origin, &channel_name);
                 return false;
             }
@@ -11638,6 +11836,122 @@ mod fold_publisher_helpers_tests {
         assert_eq!(gw.local_subnet(), SubnetId::GLOBAL);
         assert_eq!(gw.forwarded_count(), 0);
         assert_eq!(gw.dropped_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_peer_eviction_drops_retained_subscribe_chains() {
+        // A peer that fails (heartbeat timeout) never sends an
+        // unsubscribe, and the periodic sweep can't reach its retained
+        // chain once `peer_entity_ids` is cleared — so the
+        // failure-detector callback must drop it directly, scoped to the
+        // failed node and nothing else.
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg =
+            MeshNodeConfig::new(addr, [0x17u8; 32]).with_session_timeout(Duration::from_millis(1));
+        let node = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+
+        let dead: u64 = 0xDEAD;
+        let live: u64 = 0xBEEF;
+        let channel_hash: ChannelHash = 0x1234;
+
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let chain = TokenChain::single(PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::SUBSCRIBE,
+            channel_hash,
+            3600,
+            0,
+        ));
+        node.subscriber_chains
+            .insert((dead, channel_hash), RetainedChain::new(chain.clone()));
+        node.subscriber_chains
+            .insert((live, channel_hash), RetainedChain::new(chain));
+        assert_eq!(node.subscriber_chains.len(), 2);
+
+        node.failure_detector.heartbeat(dead, addr);
+        node.failure_detector.heartbeat(live, addr);
+
+        // Age `dead`'s heartbeat well past `miss_threshold × timeout`,
+        // then refresh `live` so only `dead` trips.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        node.failure_detector.heartbeat(live, addr);
+
+        let failed = node.failure_detector.check_all();
+        assert!(failed.contains(&dead), "dead peer must be detected failed");
+
+        assert!(
+            node.subscriber_chains.get(&(live, channel_hash)).is_some(),
+            "live peer's retained chain must survive"
+        );
+        assert!(
+            node.subscriber_chains.get(&(dead, channel_hash)).is_none(),
+            "failed peer's retained chain must be evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_publish_chain_authorizes_publish() {
+        use crate::adapter::net::{ChannelConfig, ChannelConfigRegistry, ChannelId, ChannelName};
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x17u8; 32]);
+        let mut node = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+
+        // Channel rooted at `owner`; the publishing node is NOT a root.
+        let owner = EntityKeypair::generate();
+        let mid = EntityKeypair::generate();
+        let channel = ChannelName::new("fleet/telemetry").unwrap();
+        let registry = ChannelConfigRegistry::new();
+        registry.insert(
+            ChannelConfig::new(ChannelId::new(channel.clone()))
+                .with_token_roots(vec![owner.entity_id().clone()]),
+        );
+        node.set_channel_configs(Arc::new(registry));
+
+        // Delegated PUBLISH chain: owner -> mid -> this node. The node's
+        // own leaf token is issued by `mid` (a delegator), not a channel
+        // root, so a single-link chain from it can't anchor.
+        let root = PermissionToken::issue(
+            &owner,
+            mid.entity_id().clone(),
+            TokenScope::PUBLISH.union(TokenScope::DELEGATE),
+            channel.hash(),
+            3600,
+            2,
+        );
+        let leaf = root
+            .delegate(&mid, node.entity_id().clone(), TokenScope::PUBLISH)
+            .expect("delegation should succeed");
+        let chain = TokenChain {
+            tokens: vec![root, leaf],
+        };
+
+        let publisher = node.channel_publisher(channel.clone(), PublishConfig::default());
+
+        // Without the held chain the publish-side ACL can only build a
+        // single-link chain from the cache, which can't anchor a
+        // delegated grant -> publish denied.
+        assert!(
+            node.publish_many(&publisher, &[Bytes::from_static(b"x")])
+                .await
+                .is_err(),
+            "delegated publisher must be denied until it presents its chain"
+        );
+
+        // Install the delegated chain -> publish admitted (no
+        // subscribers, so it reports an empty fan-out).
+        node.set_publish_chain(&channel, chain);
+        let report = node
+            .publish_many(&publisher, &[Bytes::from_static(b"x")])
+            .await
+            .expect("held delegated chain must authorize publish");
+        assert_eq!(report.attempted, 0);
     }
 
     #[cfg(feature = "cortex")]

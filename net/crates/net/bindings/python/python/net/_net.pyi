@@ -738,6 +738,7 @@ class NetMesh:
         visibility: Optional[str] = None,
         reliable: Optional[bool] = None,
         require_token: Optional[bool] = None,
+        token_roots: Optional[list[bytes]] = None,
         priority: Optional[int] = None,
         max_rate_pps: Optional[int] = None,
         publish_caps: Optional[dict] = None,
@@ -750,6 +751,12 @@ class NetMesh:
         dicts (same shape as the ``filter`` argument to
         :meth:`find_nodes`) that restrict who may publish or subscribe
         based on the other node's announced capabilities.
+
+        ``require_token`` gates publish/subscribe on a valid token
+        chain; on its own (no ``token_roots``) it fails closed.
+        ``token_roots`` is a list of 32-byte entity ids whose signature
+        may root a presented chain — set it to anchor the channel's
+        root of trust.
 
         Raises ``ChannelError`` for invalid names / visibility."""
         ...

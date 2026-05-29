@@ -49,6 +49,7 @@ pub(crate) fn token_error_kind(e: &CoreTokenError) -> &'static str {
         CoreTokenError::DelegationExhausted => "delegation_exhausted",
         CoreTokenError::DelegationNotAllowed => "delegation_not_allowed",
         CoreTokenError::NotAuthorized => "not_authorized",
+        CoreTokenError::Revoked => "revoked",
         CoreTokenError::InvalidFormat => "invalid_format",
         CoreTokenError::ReadOnly => "read_only",
         CoreTokenError::ZeroTtl => "zero_ttl",

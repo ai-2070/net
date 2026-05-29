@@ -144,8 +144,10 @@ async fn subscribe_denied_by_missing_token() {
     let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
 
     let name = ChannelName::new("lab/secret").unwrap();
-    a.registry
-        .insert(ChannelConfig::new(ChannelId::new(name.clone())).with_require_token(true));
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()]),
+    );
 
     // B subscribes with no token.
     let result = b.mesh.subscribe_channel(a.mesh.node_id(), name).await;
@@ -160,8 +162,10 @@ async fn subscribe_accepted_with_valid_token() {
     let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
 
     let name = ChannelName::new("lab/signed").unwrap();
-    a.registry
-        .insert(ChannelConfig::new(ChannelId::new(name.clone())).with_require_token(true));
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()]),
+    );
 
     // Publisher issues a SUBSCRIBE token for B's entity. Duration
     // is generous so the test isn't timing-sensitive.
@@ -185,8 +189,10 @@ async fn subscribe_rejected_with_expired_token() {
     let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
 
     let name = ChannelName::new("lab/short").unwrap();
-    a.registry
-        .insert(ChannelConfig::new(ChannelId::new(name.clone())).with_require_token(true));
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()]),
+    );
 
     // 1-second token, then sleep past `not_after`.
     // (duration_secs == 0 is now rejected; mint with the minimum
@@ -214,8 +220,10 @@ async fn subscribe_rejected_with_wrong_subject_token() {
     let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
 
     let name = ChannelName::new("lab/wrong").unwrap();
-    a.registry
-        .insert(ChannelConfig::new(ChannelId::new(name.clone())).with_require_token(true));
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()]),
+    );
 
     // Token issued for a THIRD entity, not B.
     let bystander = EntityKeypair::generate();
@@ -228,10 +236,9 @@ async fn subscribe_rejected_with_wrong_subject_token() {
         0,
     );
 
-    // B presents it. Publisher's `can_subscribe` calls
-    // `token_cache.check(b.entity_id, SUBSCRIBE, hash)` which
-    // misses (the token is keyed by `bystander.entity_id`), so the
-    // check fails.
+    // B presents it. The chain roots at A (a channel root), but its
+    // leaf subject is `bystander`, not B (the presenter), so the
+    // leaf-binding check in `TokenChain::verify_authorizes` rejects it.
     let result = b
         .mesh
         .subscribe_channel_with_token(a.mesh.node_id(), name, token)
@@ -243,28 +250,36 @@ async fn subscribe_rejected_with_wrong_subject_token() {
 }
 
 #[tokio::test]
-async fn rejected_subscribe_does_not_leak_token_into_shared_cache() {
-    // Regression for a cubic-flagged P2 DoS vector: the publisher
-    // used to insert every parseable, signature-valid token into the
-    // shared `TokenCache` **before** running the ACL check. An
-    // attacker could spam self-signed tokens that fail authorization
-    // yet still land in the cache, filling memory under
-    // attacker-controlled `(subject, channel_hash)` keys.
-    //
-    // The fix defers the insert until authorization passes.
+async fn rejected_subscribe_retains_no_chain_and_no_cache_entry() {
+    // An unauthorized subscribe must leave the publisher holding no
+    // state for the rejected peer: not in the shared `TokenCache` (the
+    // original DoS vector — self-signed tokens spammed into the cache
+    // before the ACL check) and, post root-anchoring, not in
+    // `subscriber_chains` either (a retained chain would be re-checked
+    // by the sweep / publish path and is a memory-growth vector under
+    // rejected-subscribe spam). The chain store is the live guard now:
+    // the shared cache is no longer written on the subscribe path at
+    // all, so asserting only on it is vacuous.
     let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
 
     let name = ChannelName::new("lab/leak").unwrap();
-    a.registry
-        .insert(ChannelConfig::new(ChannelId::new(name.clone())).with_require_token(true));
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()]),
+    );
 
-    // Pre-test: publisher's shared cache is empty.
+    // Pre-test: publisher retains nothing.
     let shared_cache = a
         .mesh
         .token_cache()
         .cloned()
         .expect("publisher should have a shared token cache");
     assert_eq!(shared_cache.len(), 0, "precondition: empty cache");
+    assert_eq!(
+        a.mesh.subscriber_chain_count(),
+        0,
+        "precondition: no retained chains"
+    );
 
     // B signs a token intended for a THIRD bystander entity, not
     // itself. The token is signature-valid but unauthorized for B.
@@ -284,9 +299,13 @@ async fn rejected_subscribe_does_not_leak_token_into_shared_cache() {
         .await;
     assert!(result.is_err(), "unauthorized subscribe must be rejected");
 
-    // Post-test: publisher's shared cache must STILL be empty. If
-    // the pre-fix order ever returns, this will flip to non-zero
-    // and flag the regression.
+    // Post-test: a rejected subscribe must retain no chain (the live
+    // regression guard) and still touch nothing in the shared cache.
+    assert_eq!(
+        a.mesh.subscriber_chain_count(),
+        0,
+        "rejected subscribe must not retain a token chain"
+    );
     assert_eq!(
         shared_cache.len(),
         0,

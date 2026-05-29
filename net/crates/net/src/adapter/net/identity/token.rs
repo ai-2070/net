@@ -334,6 +334,16 @@ impl PermissionToken {
     /// with [`Self::is_valid`].
     pub fn is_valid_with_skew(&self, skew_secs: u64) -> Result<(), TokenError> {
         self.verify()?;
+        self.check_time_bounds(skew_secs)
+    }
+
+    /// Wall-clock window check with skew, **without** signature
+    /// verification. Split out of [`Self::is_valid_with_skew`] so a
+    /// caller that has already verified this (immutable) token's
+    /// signature can re-check only the time window on a hot path —
+    /// the signature can never change, but expiry must be re-evaluated
+    /// against the current clock on every use.
+    fn check_time_bounds(&self, skew_secs: u64) -> Result<(), TokenError> {
         let now = current_timestamp();
         // Lower bound: accept tokens whose `not_before` is up to
         // `skew_secs` in our future. `saturating_sub` pins the
@@ -593,6 +603,245 @@ impl std::fmt::Debug for PermissionToken {
             .field("delegation_depth", &self.delegation_depth)
             .field("nonce", &self.nonce)
             .finish()
+    }
+}
+
+/// Hard cap on the number of links in a [`TokenChain`]. A chain
+/// rooted at a channel owner needs only as many links as the issuer
+/// chose to allow via `delegation_depth` (a `u8`), but the wire
+/// decoder and the verify loop must both bound work against a hostile
+/// peer that ships a maximal blob. Eight links is far past any real
+/// delegation tree (owner → org → team → service is four) while
+/// keeping per-subscribe verify cost — eight ed25519 verifies — to a
+/// few hundred microseconds even on the slow path.
+pub const MAX_CHAIN_DEPTH: usize = 8;
+
+/// An ordered delegation chain anchored at a channel's authorizing
+/// issuer.
+///
+/// `tokens` is **root-to-leaf**: `tokens[0]` is the root grant (its
+/// `issuer` must be one of the channel's authorized roots) and
+/// `tokens[last]` is the credential the presenting peer holds (its
+/// `subject` must be that peer). A single-link chain is the common
+/// case — a channel owner issuing directly to a subscriber, with no
+/// intermediate delegation.
+///
+/// This is the type that closes the root-of-trust hole: the bare
+/// [`PermissionToken`] / [`TokenCache::check`] path verifies a token
+/// is internally self-consistent (the named issuer signed it) but
+/// never that the issuer has authority over the channel, so any peer
+/// could self-issue `issuer = subject = self` and pass. A `TokenChain`
+/// is only honored when its root link is signed by an issuer the
+/// channel config names as authoritative (see
+/// `ChannelConfig::token_roots`).
+#[derive(Clone, Debug)]
+pub struct TokenChain {
+    /// Root-to-leaf delegation links. Invariant (enforced by
+    /// [`Self::verify_authorizes`], not by construction): adjacent
+    /// links satisfy `child.issuer == parent.subject`, the parent
+    /// carries [`TokenScope::DELEGATE`], and scope/channel/expiry only
+    /// ever narrow down the chain.
+    pub tokens: Vec<PermissionToken>,
+}
+
+impl TokenChain {
+    /// Wrap a single token as a one-link chain (no delegation). The
+    /// token's `issuer` is both the root and the direct grantor; the
+    /// channel config must name that issuer as a root for the chain to
+    /// verify.
+    pub fn single(token: PermissionToken) -> Self {
+        Self {
+            tokens: vec![token],
+        }
+    }
+
+    /// Serialize to the wire: a `u8` link count followed by
+    /// `count × PermissionToken::WIRE_SIZE` token blobs, root-first.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + self.tokens.len() * PermissionToken::WIRE_SIZE);
+        buf.push(self.tokens.len() as u8);
+        for t in &self.tokens {
+            buf.extend_from_slice(&t.to_bytes());
+        }
+        buf
+    }
+
+    /// Deserialize from the wire. Rejects an empty chain, a count past
+    /// [`MAX_CHAIN_DEPTH`], or any length that isn't exactly
+    /// `1 + count × WIRE_SIZE` (no trailing garbage, no short read).
+    pub fn from_bytes(data: &[u8]) -> Result<Self, TokenError> {
+        let count = *data.first().ok_or(TokenError::InvalidFormat)? as usize;
+        if count == 0 || count > MAX_CHAIN_DEPTH {
+            return Err(TokenError::InvalidFormat);
+        }
+        let expected = 1 + count * PermissionToken::WIRE_SIZE;
+        if data.len() != expected {
+            return Err(TokenError::InvalidFormat);
+        }
+        let mut tokens = Vec::with_capacity(count);
+        for i in 0..count {
+            let start = 1 + i * PermissionToken::WIRE_SIZE;
+            tokens.push(PermissionToken::from_bytes(
+                &data[start..start + PermissionToken::WIRE_SIZE],
+            )?);
+        }
+        Ok(Self { tokens })
+    }
+
+    /// Verify the chain authorizes `action` on `channel_hash` for
+    /// `presenter`, rooting at one of `roots`, with no link revoked.
+    ///
+    /// The checks, in order:
+    /// 1. **Root anchor** — `tokens[0].issuer` is one of `roots`. This
+    ///    is the property the bare-token path lacks; without it any
+    ///    self-signed token passes.
+    /// 2. **Leaf binding** — `tokens[last].subject == presenter`. The
+    ///    presenter is the AEAD-verified handshake identity, so a peer
+    ///    can't present a chain minted for someone else.
+    /// 3. **Per-link validity + revocation** — every link's signature
+    ///    and time bounds hold, and no link is below its issuer's
+    ///    revocation floor. Because the root grant is itself a link,
+    ///    `revoke_below(root, …)` invalidates `tokens[0]` and so the
+    ///    whole chain — closing the "root revoke misses delegated
+    ///    descendants" gap (each delegated link also revocation-checks
+    ///    against its own issuer's floor).
+    /// 4. **Link continuity** — for each `(parent, child)`:
+    ///    `child.issuer == parent.subject` (no splicing unrelated
+    ///    tokens), `parent` carries `DELEGATE`, `child.delegation_depth
+    ///    < parent.delegation_depth`, and the child's validity window
+    ///    nests within the parent's.
+    /// 5. **Monotonic authority** — *every* link must
+    ///    `authorizes(action, channel_hash)`. Chain authority is the
+    ///    intersection of all links, so a leaf can never claim a scope
+    ///    or channel an ancestor (including the root) didn't grant —
+    ///    this is what makes delegation strictly narrowing for both
+    ///    scope bits and channel binding.
+    pub fn verify_authorizes(
+        &self,
+        action: TokenScope,
+        channel_hash: ChannelHash,
+        presenter: &EntityId,
+        roots: &[EntityId],
+        revocation: &RevocationRegistry,
+        skew_secs: u64,
+    ) -> Result<(), TokenError> {
+        self.verify_inner(
+            action,
+            channel_hash,
+            presenter,
+            roots,
+            revocation,
+            skew_secs,
+            true,
+        )
+    }
+
+    /// Same contract as [`Self::verify_authorizes`] but **skips the
+    /// ed25519 signature verification** on each link, trusting a prior
+    /// successful `verify_authorizes` for this exact chain. Tokens are
+    /// immutable, so a signature that verified once verifies forever —
+    /// nothing else about the link can change. Time bounds, revocation
+    /// floors, root anchoring, leaf binding, link continuity, and scope
+    /// are all still re-checked on every call, so expiry / revocation /
+    /// a roots change still reject. Used on the publish fan-out hot
+    /// path so a high-fanout channel doesn't pay N × up-to-8 ed25519
+    /// verifies per packet for chains it already verified at subscribe.
+    pub fn verify_authorizes_presigned(
+        &self,
+        action: TokenScope,
+        channel_hash: ChannelHash,
+        presenter: &EntityId,
+        roots: &[EntityId],
+        revocation: &RevocationRegistry,
+        skew_secs: u64,
+    ) -> Result<(), TokenError> {
+        self.verify_inner(
+            action,
+            channel_hash,
+            presenter,
+            roots,
+            revocation,
+            skew_secs,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_inner(
+        &self,
+        action: TokenScope,
+        channel_hash: ChannelHash,
+        presenter: &EntityId,
+        roots: &[EntityId],
+        revocation: &RevocationRegistry,
+        skew_secs: u64,
+        check_signatures: bool,
+    ) -> Result<(), TokenError> {
+        let first = self.tokens.first().ok_or(TokenError::InvalidFormat)?;
+        let last = self.tokens.last().ok_or(TokenError::InvalidFormat)?;
+
+        // 1. Root anchor.
+        if !roots
+            .iter()
+            .any(|r| r.as_bytes() == first.issuer.as_bytes())
+        {
+            return Err(TokenError::NotAuthorized);
+        }
+
+        // 2. Leaf bound to the presenting peer.
+        if last.subject.as_bytes() != presenter.as_bytes() {
+            return Err(TokenError::NotAuthorized);
+        }
+
+        // 3 + 5. Per-link validity, revocation, and monotonic
+        // authority. Done in one pass over every link.
+        for t in &self.tokens {
+            // Signature (unless already verified for this immutable
+            // chain) + time bounds.
+            if check_signatures {
+                t.is_valid_with_skew(skew_secs)?;
+            } else {
+                t.check_time_bounds(skew_secs)?;
+            }
+            // Revocation floor (root link catches root revocation).
+            if revocation.is_revoked(t) {
+                return Err(TokenError::Revoked);
+            }
+            // Every link must independently authorize the action on
+            // the channel — the chain grant is the intersection.
+            if !t.authorizes(action, channel_hash) {
+                return Err(TokenError::NotAuthorized);
+            }
+        }
+
+        // 4. Link continuity between adjacent (parent, child) pairs.
+        for pair in self.tokens.windows(2) {
+            let (parent, child) = (&pair[0], &pair[1]);
+            // The child must be issued by the party the parent
+            // delegated to — no splicing in an unrelated token.
+            if child.issuer.as_bytes() != parent.subject.as_bytes() {
+                return Err(TokenError::NotAuthorized);
+            }
+            // The parent must have permitted delegation at all.
+            if !parent.scope.contains(TokenScope::DELEGATE) {
+                return Err(TokenError::DelegationNotAllowed);
+            }
+            // Depth must strictly decrease so a chain can't loop or
+            // outrun the issuer's delegation budget.
+            if child.delegation_depth >= parent.delegation_depth {
+                return Err(TokenError::NotAuthorized);
+            }
+            // A child must not outlive its parent. Per-link
+            // `is_valid` already rejects an expired parent, but pin
+            // the nesting so a long-lived child can't survive a
+            // shorter-lived ancestor being dropped from a presented
+            // chain.
+            if child.not_before < parent.not_before || child.not_after > parent.not_after {
+                return Err(TokenError::NotAuthorized);
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -974,6 +1223,51 @@ impl TokenCache {
             .cloned()
     }
 
+    /// Fetch a cached token for `(subject, channel_hash)` that
+    /// currently **authorizes `action`**: valid signature, within time
+    /// bounds (honoring this cache's skew), not revoked, bound to
+    /// `subject`, and carrying `action` on this channel.
+    ///
+    /// Unlike [`Self::get`] — which returns the first *valid* token of
+    /// *any* scope — this filters by scope. A slot holds tokens of
+    /// distinct scopes side-by-side (one `PUBLISH`, one `SUBSCRIBE`),
+    /// so a caller that wraps the result in a single-link
+    /// [`TokenChain`] for a specific action (e.g. the publish path)
+    /// must not pick up a co-located token of the wrong scope —
+    /// `get` would return it intermittently (DashMap slot order) and
+    /// the chain would then fail `authorizes(action, …)` even though a
+    /// correctly-scoped token is present. Honors the wildcard slot
+    /// (`channel_hash = 0`) the same way [`Self::check`] does.
+    pub fn get_for_action(
+        &self,
+        subject: &EntityId,
+        action: TokenScope,
+        channel_hash: ChannelHash,
+    ) -> Option<PermissionToken> {
+        let authorizes = |t: &PermissionToken| {
+            t.is_valid_with_skew(self.clock_skew_secs).is_ok()
+                && !self.revocation.is_revoked(t)
+                && t.subject.as_bytes() == subject.as_bytes()
+                && t.authorizes(action, channel_hash)
+        };
+        if let Some(slot) = self.tokens.get(&(*subject.as_bytes(), channel_hash)) {
+            if let Some(t) = slot.value().iter().find(|t| authorizes(t)) {
+                return Some(t.clone());
+            }
+        }
+        // Wildcard fast path: skip the second probe when no wildcard
+        // token has ever been inserted (mirrors `check`).
+        if !self.wildcard_inserted.load(AtomicOrdering::Relaxed) {
+            return None;
+        }
+        if let Some(slot) = self.tokens.get(&(*subject.as_bytes(), 0)) {
+            if let Some(t) = slot.value().iter().find(|t| authorizes(t)) {
+                return Some(t.clone());
+            }
+        }
+        None
+    }
+
     /// Remove expired tokens.
     pub fn evict_expired(&self) {
         let now = current_timestamp();
@@ -1040,6 +1334,11 @@ pub enum TokenError {
     DelegationNotAllowed,
     /// No valid token found for the requested action.
     NotAuthorized,
+    /// A link in a presented [`TokenChain`] is at or below its
+    /// issuer's revocation floor. Distinct from [`Self::NotAuthorized`]
+    /// so operators can tell a revoked-credential rejection from a
+    /// never-authorized one.
+    Revoked,
     /// Wire format is too short or malformed.
     InvalidFormat,
     /// Issuer/signer keypair is public-only (post-migration zeroize
@@ -1073,6 +1372,7 @@ impl std::fmt::Display for TokenError {
             Self::DelegationExhausted => write!(f, "delegation depth exhausted"),
             Self::DelegationNotAllowed => write!(f, "delegation not allowed by scope"),
             Self::NotAuthorized => write!(f, "not authorized"),
+            Self::Revoked => write!(f, "token chain link is revoked"),
             Self::InvalidFormat => write!(f, "invalid token format"),
             Self::ReadOnly => write!(f, "signer keypair is public-only"),
             Self::ZeroTtl => write!(f, "token TTL must be > 0 seconds"),
@@ -2293,6 +2593,190 @@ mod tests {
         assert!(matches!(
             PermissionToken::from_bytes(truncated),
             Err(TokenError::InvalidFormat)
+        ));
+    }
+
+    fn tok_for(issuer: &EntityKeypair, subject: &EntityKeypair) -> PermissionToken {
+        PermissionToken::issue(
+            issuer,
+            subject.entity_id().clone(),
+            TokenScope::SUBSCRIBE,
+            0xABCD,
+            3600,
+            0,
+        )
+    }
+
+    #[test]
+    fn token_chain_roundtrips_single_and_multi() {
+        let a = EntityKeypair::generate();
+        let b = EntityKeypair::generate();
+        let c = EntityKeypair::generate();
+
+        for tokens in [
+            vec![tok_for(&a, &b)],
+            vec![tok_for(&a, &b), tok_for(&b, &c)],
+        ] {
+            let chain = TokenChain {
+                tokens: tokens.clone(),
+            };
+            let bytes = chain.to_bytes();
+            assert_eq!(bytes.len(), 1 + tokens.len() * PermissionToken::WIRE_SIZE);
+            let decoded = TokenChain::from_bytes(&bytes).expect("roundtrip");
+            assert_eq!(decoded.tokens.len(), tokens.len());
+            // Compare via per-token wire bytes (PermissionToken isn't Eq).
+            for (orig, got) in tokens.iter().zip(decoded.tokens.iter()) {
+                assert_eq!(orig.to_bytes(), got.to_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn token_chain_from_bytes_rejects_malformed() {
+        // Empty.
+        assert!(matches!(
+            TokenChain::from_bytes(&[]),
+            Err(TokenError::InvalidFormat)
+        ));
+        // Zero count.
+        assert!(matches!(
+            TokenChain::from_bytes(&[0u8]),
+            Err(TokenError::InvalidFormat)
+        ));
+        // Count past MAX_CHAIN_DEPTH.
+        let over = (MAX_CHAIN_DEPTH + 1) as u8;
+        let mut buf = vec![over];
+        buf.resize(1 + (over as usize) * PermissionToken::WIRE_SIZE, 0u8);
+        assert!(matches!(
+            TokenChain::from_bytes(&buf),
+            Err(TokenError::InvalidFormat)
+        ));
+        // Count says 1 but body length is wrong (trailing garbage).
+        let a = EntityKeypair::generate();
+        let b = EntityKeypair::generate();
+        let mut ok = TokenChain::single(tok_for(&a, &b)).to_bytes();
+        ok.push(0xFF);
+        assert!(matches!(
+            TokenChain::from_bytes(&ok),
+            Err(TokenError::InvalidFormat)
+        ));
+    }
+
+    /// Regression (C-1): a slot holding a SUBSCRIBE *and* a PUBLISH
+    /// token for the same (subject, channel) must hand back the token
+    /// matching the requested scope — `get` (scope-agnostic) could
+    /// return either depending on slot order, which made the publish
+    /// path intermittently deny a node that held a valid PUBLISH grant.
+    #[test]
+    fn get_for_action_selects_token_by_scope() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let channel_hash = 0x1234u64;
+        let cache = TokenCache::new();
+
+        cache.insert_unchecked(PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::SUBSCRIBE,
+            channel_hash,
+            3600,
+            0,
+        ));
+        cache.insert_unchecked(PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            channel_hash,
+            3600,
+            0,
+        ));
+
+        let pubt = cache
+            .get_for_action(subject.entity_id(), TokenScope::PUBLISH, channel_hash)
+            .expect("a PUBLISH token is cached");
+        assert!(pubt.authorizes(TokenScope::PUBLISH, channel_hash));
+
+        let sub = cache
+            .get_for_action(subject.entity_id(), TokenScope::SUBSCRIBE, channel_hash)
+            .expect("a SUBSCRIBE token is cached");
+        assert!(sub.authorizes(TokenScope::SUBSCRIBE, channel_hash));
+
+        // A scope nobody holds yields nothing rather than a wrong-scope
+        // token.
+        assert!(cache
+            .get_for_action(subject.entity_id(), TokenScope::DELEGATE, channel_hash)
+            .is_none());
+    }
+
+    /// `verify_authorizes_presigned` skips the ed25519 verifies but must
+    /// still enforce the checks that can change after the first verify:
+    /// leaf binding, revocation, and (implicitly) time bounds. Only the
+    /// immutable signature is trusted.
+    #[test]
+    fn presigned_verify_still_enforces_policy() {
+        let owner = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let channel_hash = 0xFEEDu64;
+        let roots = [owner.entity_id().clone()];
+
+        let chain = TokenChain::single(PermissionToken::issue(
+            &owner,
+            subject.entity_id().clone(),
+            TokenScope::SUBSCRIBE,
+            channel_hash,
+            3600,
+            0,
+        ));
+
+        // Fresh registry: both full and presigned accept the presenter.
+        let rev = RevocationRegistry::new();
+        assert!(chain
+            .verify_authorizes(
+                TokenScope::SUBSCRIBE,
+                channel_hash,
+                subject.entity_id(),
+                &roots,
+                &rev,
+                0,
+            )
+            .is_ok());
+        assert!(chain
+            .verify_authorizes_presigned(
+                TokenScope::SUBSCRIBE,
+                channel_hash,
+                subject.entity_id(),
+                &roots,
+                &rev,
+                0,
+            )
+            .is_ok());
+
+        // Wrong presenter is rejected on the presigned path too.
+        let attacker = EntityKeypair::generate();
+        assert!(chain
+            .verify_authorizes_presigned(
+                TokenScope::SUBSCRIBE,
+                channel_hash,
+                attacker.entity_id(),
+                &roots,
+                &rev,
+                0,
+            )
+            .is_err());
+
+        // Revoking the issuer rejects on the presigned path too — the
+        // revocation floor is re-checked even though signatures aren't.
+        rev.revoke_below(owner.entity_id(), 1);
+        assert!(matches!(
+            chain.verify_authorizes_presigned(
+                TokenScope::SUBSCRIBE,
+                channel_hash,
+                subject.entity_id(),
+                &roots,
+                &rev,
+                0,
+            ),
+            Err(TokenError::Revoked)
         ));
     }
 

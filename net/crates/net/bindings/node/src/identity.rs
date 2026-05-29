@@ -52,6 +52,7 @@ fn token_error_kind(e: &TokenError) -> &'static str {
         TokenError::DelegationExhausted => "delegation_exhausted",
         TokenError::DelegationNotAllowed => "delegation_not_allowed",
         TokenError::NotAuthorized => "not_authorized",
+        TokenError::Revoked => "revoked",
         TokenError::InvalidFormat => "invalid_format",
         TokenError::ReadOnly => "read_only",
         TokenError::ZeroTtl => "zero_ttl",

@@ -6,7 +6,7 @@
 
 use super::name::{ChannelHash, ChannelId};
 use crate::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
-use crate::adapter::net::identity::{EntityId, TokenCache, TokenScope};
+use crate::adapter::net::identity::{EntityId, RevocationRegistry, TokenChain, TokenScope};
 use dashmap::DashMap;
 
 /// Channel visibility scope.
@@ -42,6 +42,19 @@ pub struct ChannelConfig {
     pub subscribe_caps: Option<CapabilityFilter>,
     /// Whether a valid `PermissionToken` is required (in addition to capabilities).
     pub require_token: bool,
+    /// Entities whose signature roots a valid token chain for this
+    /// channel — the channel's root(s) of trust.
+    ///
+    /// When `require_token` is set, a presented [`TokenChain`] is only
+    /// honored if its root link (`tokens[0].issuer`) is one of these
+    /// entities. This is the anchor the bare-token path lacked: without
+    /// it `check`/`can_subscribe` only verified a token was internally
+    /// self-consistent (the named issuer signed it), so any peer could
+    /// self-issue `issuer = subject = self` and pass. An empty
+    /// `token_roots` combined with `require_token = true` **fails
+    /// closed** — there is no authority a chain could anchor to, so
+    /// nothing is authorized.
+    pub token_roots: Vec<EntityId>,
     /// Default priority level for this channel's packets (0 = lowest).
     pub priority: u8,
     /// Default reliability mode for streams on this channel.
@@ -59,6 +72,7 @@ impl ChannelConfig {
             publish_caps: None,
             subscribe_caps: None,
             require_token: false,
+            token_roots: Vec::new(),
             priority: 0,
             reliable: false,
             max_rate_pps: None,
@@ -89,6 +103,33 @@ impl ChannelConfig {
         self
     }
 
+    /// Require a token chain rooted at one of `roots`. Sets
+    /// `require_token = true` and installs the channel's authorizing
+    /// root(s). This is the safe way to turn on token enforcement —
+    /// `with_require_token(true)` alone (no roots) fails every
+    /// authorization closed, since a chain has no authority to anchor
+    /// to.
+    pub fn with_token_roots(mut self, roots: Vec<EntityId>) -> Self {
+        self.require_token = true;
+        self.token_roots = roots;
+        self
+    }
+
+    /// Whether this channel enforces token authorization.
+    ///
+    /// Enforcement is on when `require_token` is set **or** any
+    /// `token_roots` are configured. Coupling the two means a config
+    /// that names roots but forgot to flip `require_token` (e.g. built
+    /// by struct literal or direct field assignment rather than
+    /// [`Self::with_token_roots`]) still enforces, instead of silently
+    /// admitting every peer — the fields are both public, so the
+    /// invariant can't be guaranteed at construction. All token gates
+    /// (subscribe, publish, the periodic sweep, the publish re-check)
+    /// consult this rather than `require_token` directly.
+    pub fn token_required(&self) -> bool {
+        self.require_token || !self.token_roots.is_empty()
+    }
+
     /// Set default priority.
     pub fn with_priority(mut self, priority: u8) -> Self {
         self.priority = priority;
@@ -107,50 +148,145 @@ impl ChannelConfig {
         self
     }
 
-    /// Check if a node is authorized to publish on this channel.
+    /// Check if `entity_id` is authorized to publish on this channel,
+    /// presenting `chain`.
+    ///
+    /// See [`Self::can_subscribe`] for the chain-verification contract;
+    /// this is the `PUBLISH`-scope counterpart.
     pub fn can_publish(
         &self,
         node_caps: &CapabilitySet,
         entity_id: &EntityId,
-        token_cache: &TokenCache,
+        chain: Option<&TokenChain>,
+        revocation: &RevocationRegistry,
+        skew_secs: u64,
     ) -> bool {
-        // Check capability requirements
         if let Some(ref filter) = self.publish_caps {
             if !filter.matches(node_caps) {
                 return false;
             }
         }
-        // Check token requirement
-        if self.require_token
-            && token_cache
-                .check(entity_id, TokenScope::PUBLISH, self.channel_id.hash())
-                .is_err()
-        {
-            return false;
-        }
-        true
+        self.token_gate(TokenScope::PUBLISH, entity_id, chain, revocation, skew_secs)
     }
 
-    /// Check if a node is authorized to subscribe to this channel.
+    /// Check if `entity_id` is authorized to subscribe to this channel,
+    /// presenting `chain`.
+    ///
+    /// When `require_token` is set, `chain` must be a [`TokenChain`]
+    /// that (a) roots at one of [`Self::token_roots`], (b) is bound at
+    /// its leaf to `entity_id` (the AEAD-verified presenter), and (c)
+    /// authorizes `SUBSCRIBE` on this channel at every link with no
+    /// link revoked. A missing chain, an empty `token_roots`, or a
+    /// chain that fails verification all reject — fail closed.
     pub fn can_subscribe(
         &self,
         node_caps: &CapabilitySet,
         entity_id: &EntityId,
-        token_cache: &TokenCache,
+        chain: Option<&TokenChain>,
+        revocation: &RevocationRegistry,
+        skew_secs: u64,
     ) -> bool {
         if let Some(ref filter) = self.subscribe_caps {
             if !filter.matches(node_caps) {
                 return false;
             }
         }
-        if self.require_token
-            && token_cache
-                .check(entity_id, TokenScope::SUBSCRIBE, self.channel_id.hash())
-                .is_err()
-        {
+        self.token_gate(
+            TokenScope::SUBSCRIBE,
+            entity_id,
+            chain,
+            revocation,
+            skew_secs,
+        )
+    }
+
+    /// Shared token-chain gate for the publish / subscribe checks.
+    /// Returns `true` when token enforcement is off (capability filters
+    /// already applied by the caller), else verifies the presented
+    /// chain roots at one of `token_roots`. Fails closed when tokens
+    /// are required but no roots are configured or no chain is
+    /// presented.
+    fn token_gate(
+        &self,
+        action: TokenScope,
+        entity_id: &EntityId,
+        chain: Option<&TokenChain>,
+        revocation: &RevocationRegistry,
+        skew_secs: u64,
+    ) -> bool {
+        if !self.token_required() {
+            return true;
+        }
+        // No authorizing root → nothing can satisfy the gate. Fail
+        // closed rather than (pre-fix) honoring any self-consistent
+        // token.
+        if self.token_roots.is_empty() {
             return false;
         }
-        true
+        let Some(chain) = chain else {
+            return false;
+        };
+        chain
+            .verify_authorizes(
+                action,
+                self.channel_id.hash(),
+                entity_id,
+                &self.token_roots,
+                revocation,
+                skew_secs,
+            )
+            .is_ok()
+    }
+
+    /// Re-verify a previously-presented `SUBSCRIBE` chain against the
+    /// current clock + revocation floors, anchored to this channel's
+    /// roots. Shared by the periodic expiry sweep and the publish-time
+    /// re-check so the root-anchoring contract (which roots, which
+    /// action, which channel hash) lives in exactly one place instead
+    /// of being re-threaded at each call site — where it had already
+    /// started to diverge (`token_roots` vs. an `unwrap_or(&[])`
+    /// fallback).
+    pub fn reverify_subscribe(
+        &self,
+        chain: &TokenChain,
+        entity_id: &EntityId,
+        revocation: &RevocationRegistry,
+        skew_secs: u64,
+    ) -> bool {
+        chain
+            .verify_authorizes(
+                TokenScope::SUBSCRIBE,
+                self.channel_id.hash(),
+                entity_id,
+                &self.token_roots,
+                revocation,
+                skew_secs,
+            )
+            .is_ok()
+    }
+
+    /// Like [`Self::reverify_subscribe`] but skips the per-link ed25519
+    /// signature verification — for callers re-checking a chain whose
+    /// signatures already verified once (immutable tokens). Time
+    /// bounds, revocation, anchoring, and scope are still re-checked.
+    /// See [`TokenChain::verify_authorizes_presigned`].
+    pub fn reverify_subscribe_presigned(
+        &self,
+        chain: &TokenChain,
+        entity_id: &EntityId,
+        revocation: &RevocationRegistry,
+        skew_secs: u64,
+    ) -> bool {
+        chain
+            .verify_authorizes_presigned(
+                TokenScope::SUBSCRIBE,
+                self.channel_id.hash(),
+                entity_id,
+                &self.token_roots,
+                revocation,
+                skew_secs,
+            )
+            .is_ok()
     }
 }
 
@@ -163,6 +299,24 @@ impl ChannelConfig {
 /// `u16` fast-path hint into a list of canonical channels for receive-side
 /// dispatch (routine collisions at scale).
 ///
+/// Surface the deny-all misconfiguration loudly at registration time.
+///
+/// `require_token = true` with no `token_roots` is a valid fail-closed
+/// state (nothing is authorized), but it's far more often a mistake —
+/// `with_require_token(true)` was called instead of
+/// `with_token_roots(...)`. Logging it at insert turns a silent
+/// "every publish and subscribe is denied" into an actionable warning.
+fn warn_if_fail_closed(config: &ChannelConfig) {
+    if config.require_token && config.token_roots.is_empty() {
+        tracing::warn!(
+            channel = config.channel_id.name().as_str(),
+            "channel requires a token but has no token_roots: all publish \
+             and subscribe will be denied (fail closed). Use \
+             `with_token_roots(...)` to anchor a root of trust."
+        );
+    }
+}
+
 /// Consulted at subscription/channel-creation time (slow path).
 /// The fast path uses the `AuthGuard` bloom filter.
 pub struct ChannelConfigRegistry {
@@ -220,6 +374,7 @@ impl ChannelConfigRegistry {
     /// processes (the longest-length tiebreaker can never tie since
     /// DashMap deduplicates keys).
     pub fn insert_prefix(&self, prefix: impl Into<String>, config: ChannelConfig) {
+        warn_if_fail_closed(&config);
         self.prefix_configs.insert(prefix.into(), config);
     }
 
@@ -231,6 +386,7 @@ impl ChannelConfigRegistry {
 
     /// Register a channel configuration.
     pub fn insert(&self, config: ChannelConfig) {
+        warn_if_fail_closed(&config);
         let name = config.channel_id.name().to_string();
         let hash = config.channel_id.hash();
         let wire_hash = config.channel_id.wire_hash();
@@ -441,16 +597,34 @@ mod tests {
         }
     }
 
+    /// One-link chain wrapping a token directly issued by `issuer` to
+    /// `subject`.
+    fn direct_chain(
+        issuer: &EntityKeypair,
+        subject: &EntityKeypair,
+        scope: TokenScope,
+        channel_hash: ChannelHash,
+    ) -> TokenChain {
+        TokenChain::single(PermissionToken::issue(
+            issuer,
+            subject.entity_id().clone(),
+            scope,
+            channel_hash,
+            3600,
+            0,
+        ))
+    }
+
     #[test]
     fn test_open_channel() {
         let id = ChannelId::parse("sensors/lidar").unwrap();
         let config = ChannelConfig::new(id);
         let caps = make_caps(false);
         let entity = EntityKeypair::generate();
-        let cache = TokenCache::new();
+        let rev = RevocationRegistry::new();
 
-        assert!(config.can_publish(&caps, entity.entity_id(), &cache));
-        assert!(config.can_subscribe(&caps, entity.entity_id(), &cache));
+        assert!(config.can_publish(&caps, entity.entity_id(), None, &rev, 0));
+        assert!(config.can_subscribe(&caps, entity.entity_id(), None, &rev, 0));
     }
 
     #[test]
@@ -460,72 +634,286 @@ mod tests {
             ChannelConfig::new(id).with_publish_caps(CapabilityFilter::new().require_gpu());
 
         let entity = EntityKeypair::generate();
-        let cache = TokenCache::new();
+        let rev = RevocationRegistry::new();
 
         let no_gpu = make_caps(false);
-        assert!(!config.can_publish(&no_gpu, entity.entity_id(), &cache));
+        assert!(!config.can_publish(&no_gpu, entity.entity_id(), None, &rev, 0));
 
         let with_gpu = make_caps(true);
-        assert!(config.can_publish(&with_gpu, entity.entity_id(), &cache));
+        assert!(config.can_publish(&with_gpu, entity.entity_id(), None, &rev, 0));
     }
 
+    /// The C1 fix: a `require_token` channel anchored to an owner must
+    /// reject a self-issued token and accept an owner-issued one.
     #[test]
-    fn test_token_required_channel() {
+    fn token_channel_rejects_self_issued_accepts_owner_issued() {
         let id = ChannelId::parse("control/estop").unwrap();
+        let owner = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let config =
+            ChannelConfig::new(id.clone()).with_token_roots(vec![owner.entity_id().clone()]);
+        let caps = make_caps(false);
+        let rev = RevocationRegistry::new();
+
+        // No chain -> denied.
+        assert!(!config.can_publish(&caps, subject.entity_id(), None, &rev, 0));
+
+        // Self-issued (issuer == subject, NOT the channel owner) ->
+        // denied. Pre-fix this was the privilege-escalation hole:
+        // `verify()` + `TokenCache::check` accepted any self-consistent
+        // token regardless of issuer.
+        let self_chain = direct_chain(&subject, &subject, TokenScope::PUBLISH, id.hash());
+        assert!(
+            !config.can_publish(&caps, subject.entity_id(), Some(&self_chain), &rev, 0),
+            "self-issued token must be rejected: its issuer is not a channel root"
+        );
+
+        // Owner-issued -> allowed.
+        let owner_chain = direct_chain(&owner, &subject, TokenScope::PUBLISH, id.hash());
+        assert!(config.can_publish(&caps, subject.entity_id(), Some(&owner_chain), &rev, 0));
+    }
+
+    /// `with_require_token(true)` without any roots fails closed — there
+    /// is no authority a chain could anchor to.
+    #[test]
+    fn require_token_with_no_roots_fails_closed() {
+        let id = ChannelId::parse("control/locked").unwrap();
         let config = ChannelConfig::new(id.clone()).with_require_token(true);
         let caps = make_caps(false);
-        let issuer = EntityKeypair::generate();
+        let rev = RevocationRegistry::new();
+        let anyone = EntityKeypair::generate();
+
+        // Even an otherwise-well-formed token can't anchor to nothing.
+        let chain = direct_chain(&anyone, &anyone, TokenScope::SUBSCRIBE, id.hash());
+        assert!(!config.can_subscribe(&caps, anyone.entity_id(), Some(&chain), &rev, 0));
+        assert!(!config.can_subscribe(&caps, anyone.entity_id(), None, &rev, 0));
+    }
+
+    /// A config that names roots but never set the `require_token`
+    /// flag (e.g. built field-by-field rather than via
+    /// `with_token_roots`) must still enforce. Pre-fix the gate keyed
+    /// only off `require_token`, so this drifted-open config silently
+    /// admitted every peer.
+    #[test]
+    fn roots_without_require_token_flag_still_enforces() {
+        let id = ChannelId::parse("control/estop").unwrap();
+        let owner = EntityKeypair::generate();
         let subject = EntityKeypair::generate();
-        let cache = TokenCache::new();
+        let caps = make_caps(false);
+        let rev = RevocationRegistry::new();
 
-        // No token -> denied
-        assert!(!config.can_publish(&caps, subject.entity_id(), &cache));
+        let mut config = ChannelConfig::new(id.clone());
+        config.token_roots = vec![owner.entity_id().clone()];
+        // Deliberately leave `require_token` false — the two fields are
+        // both public and can drift out of sync.
+        assert!(!config.require_token);
+        assert!(
+            config.token_required(),
+            "named roots must imply enforcement"
+        );
 
-        // Issue a publish token for this channel
-        let token = PermissionToken::issue(
-            &issuer,
-            subject.entity_id().clone(),
+        // No chain -> denied (would have been silently admitted pre-fix).
+        assert!(!config.can_subscribe(&caps, subject.entity_id(), None, &rev, 0));
+        // Owner-issued chain -> allowed.
+        let owner_chain = direct_chain(&owner, &subject, TokenScope::SUBSCRIBE, id.hash());
+        assert!(config.can_subscribe(&caps, subject.entity_id(), Some(&owner_chain), &rev, 0));
+    }
+
+    /// The chain's leaf must be bound to the presenting entity — a peer
+    /// can't replay a chain minted for someone else.
+    #[test]
+    fn leaf_subject_must_match_presenter() {
+        let id = ChannelId::parse("control/estop").unwrap();
+        let owner = EntityKeypair::generate();
+        let intended = EntityKeypair::generate();
+        let attacker = EntityKeypair::generate();
+        let config =
+            ChannelConfig::new(id.clone()).with_token_roots(vec![owner.entity_id().clone()]);
+        let caps = make_caps(false);
+        let rev = RevocationRegistry::new();
+
+        // Owner issued this to `intended`; `attacker` presents it.
+        let chain = direct_chain(&owner, &intended, TokenScope::SUBSCRIBE, id.hash());
+        assert!(!config.can_subscribe(&caps, attacker.entity_id(), Some(&chain), &rev, 0));
+        // The intended subject is accepted.
+        assert!(config.can_subscribe(&caps, intended.entity_id(), Some(&chain), &rev, 0));
+    }
+
+    /// A valid owner → intermediate → leaf delegation chain is accepted;
+    /// scope narrows correctly down the chain.
+    #[test]
+    fn delegation_chain_accepted() {
+        let id = ChannelId::parse("fleet/telemetry").unwrap();
+        let owner = EntityKeypair::generate();
+        let mid = EntityKeypair::generate();
+        let leaf = EntityKeypair::generate();
+        let config =
+            ChannelConfig::new(id.clone()).with_token_roots(vec![owner.entity_id().clone()]);
+        let caps = make_caps(false);
+        let rev = RevocationRegistry::new();
+
+        // Owner grants `mid` SUBSCRIBE + DELEGATE, depth 2.
+        let root = PermissionToken::issue(
+            &owner,
+            mid.entity_id().clone(),
+            TokenScope::SUBSCRIBE.union(TokenScope::DELEGATE),
+            id.hash(),
+            3600,
+            2,
+        );
+        // `mid` delegates SUBSCRIBE to `leaf` (drops DELEGATE).
+        let child = root
+            .delegate(&mid, leaf.entity_id().clone(), TokenScope::SUBSCRIBE)
+            .expect("delegation should succeed");
+        let chain = TokenChain {
+            tokens: vec![root, child],
+        };
+        assert!(config.can_subscribe(&caps, leaf.entity_id(), Some(&chain), &rev, 0));
+    }
+
+    /// A chain whose links don't connect (`child.issuer != parent.subject`)
+    /// is rejected — no splicing an unrelated token onto a real root.
+    #[test]
+    fn delegation_broken_continuity_rejected() {
+        let id = ChannelId::parse("fleet/telemetry").unwrap();
+        let owner = EntityKeypair::generate();
+        let mid = EntityKeypair::generate();
+        let rogue = EntityKeypair::generate();
+        let leaf = EntityKeypair::generate();
+        let config =
+            ChannelConfig::new(id.clone()).with_token_roots(vec![owner.entity_id().clone()]);
+        let caps = make_caps(false);
+        let rev = RevocationRegistry::new();
+
+        // Real owner→mid root link.
+        let root = PermissionToken::issue(
+            &owner,
+            mid.entity_id().clone(),
+            TokenScope::SUBSCRIBE.union(TokenScope::DELEGATE),
+            id.hash(),
+            3600,
+            2,
+        );
+        // Spliced second link issued by `rogue` (NOT `mid`), so
+        // child.issuer (rogue) != root.subject (mid).
+        let spliced = PermissionToken::issue(
+            &rogue,
+            leaf.entity_id().clone(),
+            TokenScope::SUBSCRIBE,
+            id.hash(),
+            3600,
+            0,
+        );
+        let chain = TokenChain {
+            tokens: vec![root, spliced],
+        };
+        assert!(!config.can_subscribe(&caps, leaf.entity_id(), Some(&chain), &rev, 0));
+    }
+
+    /// A delegated child can't authorize a scope its parent lacked —
+    /// chain authority is the intersection of all links.
+    #[test]
+    fn delegation_cannot_broaden_scope() {
+        let id = ChannelId::parse("fleet/telemetry").unwrap();
+        let owner = EntityKeypair::generate();
+        let mid = EntityKeypair::generate();
+        let leaf = EntityKeypair::generate();
+        let config =
+            ChannelConfig::new(id.clone()).with_token_roots(vec![owner.entity_id().clone()]);
+        let caps = make_caps(false);
+        let rev = RevocationRegistry::new();
+
+        // Owner grants `mid` only SUBSCRIBE + DELEGATE — no PUBLISH.
+        let root = PermissionToken::issue(
+            &owner,
+            mid.entity_id().clone(),
+            TokenScope::SUBSCRIBE.union(TokenScope::DELEGATE),
+            id.hash(),
+            3600,
+            2,
+        );
+        // `mid` forges a child claiming PUBLISH (which it never held).
+        // `delegate` would intersect it away, so mint the child by hand
+        // to simulate a malicious intermediate.
+        let forged_child = PermissionToken::issue(
+            &mid,
+            leaf.entity_id().clone(),
             TokenScope::PUBLISH,
             id.hash(),
             3600,
             0,
         );
-        let _ = cache.insert(token);
+        let chain = TokenChain {
+            tokens: vec![root, forged_child],
+        };
+        // The root link doesn't authorize PUBLISH, so the chain can't.
+        assert!(!config.can_publish(&caps, leaf.entity_id(), Some(&chain), &rev, 0));
+    }
 
-        // With token -> allowed
-        assert!(config.can_publish(&caps, subject.entity_id(), &cache));
+    /// The H1 fix: revoking the root issuer invalidates the whole chain,
+    /// including offline-delegated descendants, because the root grant
+    /// is itself a verified link.
+    #[test]
+    fn root_revocation_kills_delegated_chain() {
+        let id = ChannelId::parse("fleet/telemetry").unwrap();
+        let owner = EntityKeypair::generate();
+        let mid = EntityKeypair::generate();
+        let leaf = EntityKeypair::generate();
+        let config =
+            ChannelConfig::new(id.clone()).with_token_roots(vec![owner.entity_id().clone()]);
+        let caps = make_caps(false);
+        let rev = RevocationRegistry::new();
+
+        let root = PermissionToken::issue(
+            &owner,
+            mid.entity_id().clone(),
+            TokenScope::SUBSCRIBE.union(TokenScope::DELEGATE),
+            id.hash(),
+            3600,
+            2,
+        );
+        let child = root
+            .delegate(&mid, leaf.entity_id().clone(), TokenScope::SUBSCRIBE)
+            .expect("delegation should succeed");
+        let chain = TokenChain {
+            tokens: vec![root, child],
+        };
+
+        // Accepted before revocation.
+        assert!(config.can_subscribe(&caps, leaf.entity_id(), Some(&chain), &rev, 0));
+
+        // Owner bumps its revocation floor above the chain's generation
+        // (0). The root link falls below the floor → whole chain dies,
+        // even though the delegated child's issuer is `mid`, not `owner`.
+        rev.revoke_below(owner.entity_id(), 1);
+        assert!(
+            !config.can_subscribe(&caps, leaf.entity_id(), Some(&chain), &rev, 0),
+            "revoking the root must kill the delegated descendant"
+        );
     }
 
     #[test]
     fn test_caps_and_token_combined() {
         let id = ChannelId::parse("compute/secure").unwrap();
+        let owner = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
         let config = ChannelConfig::new(id.clone())
             .with_publish_caps(CapabilityFilter::new().require_gpu())
-            .with_require_token(true);
+            .with_token_roots(vec![owner.entity_id().clone()]);
+        let rev = RevocationRegistry::new();
 
-        let issuer = EntityKeypair::generate();
-        let subject = EntityKeypair::generate();
-        let cache = TokenCache::new();
+        let owner_chain = direct_chain(&owner, &subject, TokenScope::PUBLISH, id.hash());
 
-        // Has GPU but no token -> denied
+        // Has GPU but no token -> denied.
         let with_gpu = make_caps(true);
-        assert!(!config.can_publish(&with_gpu, subject.entity_id(), &cache));
+        assert!(!config.can_publish(&with_gpu, subject.entity_id(), None, &rev, 0));
 
-        // Has token but no GPU -> denied
-        let token = PermissionToken::issue(
-            &issuer,
-            subject.entity_id().clone(),
-            TokenScope::PUBLISH,
-            id.hash(),
-            3600,
-            0,
-        );
-        let _ = cache.insert(token);
+        // Has token but no GPU -> denied.
         let no_gpu = make_caps(false);
-        assert!(!config.can_publish(&no_gpu, subject.entity_id(), &cache));
+        assert!(!config.can_publish(&no_gpu, subject.entity_id(), Some(&owner_chain), &rev, 0));
 
-        // Has both -> allowed
-        assert!(config.can_publish(&with_gpu, subject.entity_id(), &cache));
+        // Has both -> allowed.
+        assert!(config.can_publish(&with_gpu, subject.entity_id(), Some(&owner_chain), &rev, 0));
     }
 
     #[test]
