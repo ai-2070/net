@@ -201,6 +201,11 @@ consolidated outcome.
   changed(&self)` plus `changed_owned()` — a `'static` future for driving a
   `Stream`'s sync `poll_next` where there's no `self` to borrow across polls.
 
+  > **Superseded by E-10.** The `Notify` signal (and both `changed()` /
+  > `changed_owned()`) were replaced by a `watch::Sender<u64>` change-generation
+  > and `subscribe_changes()`. See E-10 below; the description here is the E-8
+  > state of the world, kept for the phase record.
+
   **Caveat — `publish_snapshot()` fires every Tick, not only on change.** The
   MeshOS loop *already* republishes on its own tick cadence. Consequences:
   - **The win is real for deck**: deck dropped its *second, independent* timer
@@ -220,6 +225,13 @@ consolidated outcome.
   in a `parking_lot::Mutex` (`Mutex<T>: Sync where T: Send`), locked only across
   the sync poll. Existing deck watch/stream tests pass unchanged; added
   `watch_is_event_driven_resolving_far_under_the_poll_ceiling` (30 s ceiling).
+
+  > **Superseded by E-10.** `changed_owned()` is gone; the streams now hold a
+  > *shared* `watch::Receiver<u64>` (in an async `Mutex` so the re-armed `'static`
+  > future re-borrows the same receiver) and `watch` subscribes once and reuses
+  > the receiver across iterations — which is what closes the
+  > best-effort-per-edge gap (concern #3). The `parking_lot::Mutex`-for-`Sync`
+  > divergence still applies. See E-10 below.
 
 Dependency order as landed: E-1 → E-2 → E-2b; binding slices E-3/E-4/E-5/E-6
 independent on top; E-8 → E-9 independent of the tool-watch track. Memory/task/
