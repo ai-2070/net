@@ -590,6 +590,13 @@ impl Mesh {
     /// unknown channel / rate-limited / too-many-channels) surfaces
     /// as `SdkError::ChannelRejected(reason)`. Network-level failures
     /// surface as `SdkError::Adapter(...)`.
+    ///
+    /// This bare form presents no credential. On a **token-gated**
+    /// channel it is always rejected — the publisher requires a token
+    /// chain on *every* subscribe and does not honor a credential
+    /// presented on a previous subscribe (e.g. before a reconnect or
+    /// roster eviction). Re-subscribe with
+    /// [`Self::subscribe_channel_with`] carrying the token each time.
     pub async fn subscribe_channel(
         &self,
         publisher_node_id: u64,
@@ -603,11 +610,18 @@ impl Mesh {
     /// [`PermissionToken`](crate::identity::PermissionToken).
     ///
     /// Use this when the publisher registered the channel with
-    /// `require_token = true` and/or a `subscribe_caps` filter that
-    /// your node's capabilities alone don't satisfy. The publisher
-    /// verifies the token on arrival (signature + subject matches
-    /// the subscribing peer's `EntityId`) and installs it into its
-    /// local `TokenCache` before the ACL check runs.
+    /// `token_roots` (token enforcement) and/or a `subscribe_caps`
+    /// filter that your node's capabilities alone don't satisfy. The
+    /// publisher verifies the presented token chain on arrival — it
+    /// must root at one of the channel's `token_roots`, bind at its
+    /// leaf to the subscribing peer's `EntityId`, and authorize
+    /// `SUBSCRIBE` at every link — then retains it to re-check expiry
+    /// and revocation while the subscription lives.
+    ///
+    /// The credential must be presented on **every** subscribe: a
+    /// previously-accepted chain is not reused for a later bare
+    /// [`Self::subscribe_channel`], so after a reconnect or roster
+    /// eviction you must call this again with the token.
     pub async fn subscribe_channel_with(
         &self,
         publisher_node_id: u64,
