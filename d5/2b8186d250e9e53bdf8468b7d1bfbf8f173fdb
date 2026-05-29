@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_f6c191b51f28ba::t_f46106c533dd1b 7478-7484,7489-7493
+net/crates/net/src/adapter/net/identity/token.rs
+  s_f6c191b51f28ba::t_79975aff08baa3 1159-1203
+  s_f6c191b51f28ba::t_157cffdd9da3a1 2598-2643
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "d52b8186d250e9e53bdf8468b7d1bfbf8f173fdb",
+  "prompts": {},
+  "sessions": {
+    "s_f6c191b51f28ba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "aeb41064-2c0d-418f-ad38-0589f4ebe401",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
