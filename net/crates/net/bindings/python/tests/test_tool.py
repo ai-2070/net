@@ -680,6 +680,26 @@ def test_watch_tools_positive_interval_becomes_millisecond_ceiling() -> None:
     assert mesh.last_interval_ms == 500
 
 
+def test_watch_tools_subscribes_eagerly_at_call_time() -> None:
+    # The substrate baseline snapshot is taken synchronously inside
+    # `mesh.watch_tools(...)`. The wrapper must invoke it when
+    # `watch_tools(mesh)` is CALLED — not deferred to the first
+    # `async for` — so a change published between the call and the
+    # first iteration is not lost. Assert the native iter exists before
+    # any iteration has happened.
+    mesh = _FakeWatchMesh([])
+    gen = watch_tools(mesh)
+    assert mesh.last_iter is not None, "watch_tools must subscribe eagerly at call time"
+
+    # Drain to run the generator's `finally` and close the native iter.
+    async def _drain() -> None:
+        async for _ in gen:
+            pass
+
+    asyncio.run(_drain())
+    assert mesh.last_iter.closed is True
+
+
 def test_watch_tools_live_single_node_delivers_self_served_tool() -> None:
     """Live end-to-end (single node, no handshake): a self-served tool
     announced on a node fires an `Added` to a local `watch_tools` watcher
@@ -705,9 +725,10 @@ def test_watch_tools_live_single_node_delivers_self_served_tool() -> None:
             return None
 
         task = asyncio.create_task(first())
-        # Let the generator subscribe (its `mesh.watch_tools(...)` runs on
-        # the first `__anext__`) before the mutation, so the baseline is
-        # empty and the change is caught.
+        # `watch_tools(mesh)` subscribes eagerly (its `mesh.watch_tools(...)`
+        # ran synchronously at call time, above), so the baseline is already
+        # taken and empty. The brief sleep just lets the spawned diff task
+        # settle before the mutation.
         await asyncio.sleep(0.2)
         caps = add_tool_capabilities_to_announce({}, [desc])
         mesh.announce_capabilities(caps)

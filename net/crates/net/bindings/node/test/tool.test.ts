@@ -328,6 +328,24 @@ describe('watchTools (event-driven)', () => {
     expect(b.state.lastIntervalMs).toBe(500)
   })
 
+  it('subscribes eagerly at call time, not on the first iteration', async () => {
+    // The substrate baseline is taken when the native watch is created.
+    // The wrapper must call `mesh.watchTools(...)` when `watchTools` is
+    // CALLED — not defer it to the first `for await` — so a change
+    // published before iteration begins is still observed. The fake's
+    // `watchTools` sets `lastIntervalMs` synchronously; if subscription
+    // were lazy it would still be `undefined` here.
+    const { state, mesh } = fakeMesh([])
+    const iterable = watchTools(mesh)
+    expect(state.lastIntervalMs).toBeNull()
+
+    // Drain to run the generator's `finally` and close the native iter.
+    for await (const _ of iterable) {
+      // empty
+    }
+    expect(state.closed).toBe(true)
+  })
+
   it('AbortSignal closes the native iter and ends iteration', async () => {
     const { state, mesh } = blockingFakeMesh()
     const ctrl = new AbortController()
@@ -378,8 +396,10 @@ describe.skipIf(!RUN_INTEGRATION_TESTS)('watchTools (live single-node)', () => {
       bindAddr: '127.0.0.1:0',
       psk: '42'.repeat(32),
     })
+    // `watchTools` subscribes eagerly (kicks off `mesh.watchTools()` at
+    // call time); `it.next()` then drives consumption. The sleep lets the
+    // napi diff task settle before we announce.
     const it = watchTools(mesh as never)[Symbol.asyncIterator]()
-    // Kick the generator so it subscribes before we announce.
     const firstP = it.next()
     await new Promise((r) => setTimeout(r, 200))
 

@@ -493,11 +493,11 @@ def _tool_list_change_from_dict(d: dict) -> ToolListChange:
     raise ValueError(f"unknown ToolListChange type: {kind!r}")
 
 
-async def watch_tools(
+def watch_tools(
     mesh: Any,
     *,
     interval: Optional[float] = None,
-):
+) -> AsyncIterator[ToolListChange]:
     """Async-iterator over [`ToolListChange`] events for every
     dynamic addition / removal / publisher-count change in the
     local capability fold's tool view.
@@ -507,9 +507,17 @@ async def watch_tools(
     and an idle fold does zero periodic work. Backed by the
     substrate ``MeshNode::watch_tools`` stream via the native
     ``mesh.watch_tools(interval_ms)`` async iterator — no
-    client-side ``asyncio.sleep`` / re-diff. The first event fires
-    AFTER the initial baseline — call ``list_tools(mesh)`` once
-    before consuming if you need the starting shape.
+    client-side ``asyncio.sleep`` / re-diff.
+
+    The subscription is taken eagerly — when ``watch_tools`` is
+    *called*, not on the first iteration — so a change published
+    between the call and the first ``async for`` is still observed
+    (the prior version subscribed lazily and could drop that first
+    event). Because the native ``mesh.watch_tools(...)`` takes its
+    baseline snapshot synchronously at construction, the returned
+    iterator holds a live substrate watch: consume it (or break out
+    / cancel the task) so it is closed. Call ``list_tools(mesh)``
+    once for the starting shape.
 
     ``interval`` (seconds) is a *debounce ceiling*, not a poll
     cadence:
@@ -537,12 +545,18 @@ async def watch_tools(
                     print(f"~ {change.descriptor.tool_id}: {change.prev_node_count} -> {change.descriptor.node_count}")
     """
     interval_ms = None if not interval or interval <= 0 else int(interval * 1000)
+    # Subscribe NOW (synchronously), before returning the generator —
+    # this is what makes the watch eager rather than lazy.
     native_iter = mesh.watch_tools(interval_ms)
-    try:
-        async for raw in native_iter:
-            yield _tool_list_change_from_dict(json.loads(raw))
-    finally:
-        native_iter.close()
+
+    async def _consume() -> AsyncIterator[ToolListChange]:
+        try:
+            async for raw in native_iter:
+                yield _tool_list_change_from_dict(json.loads(raw))
+        finally:
+            native_iter.close()
+
+    return _consume()
 
 
 def list_tools(mesh: Any) -> List[ToolDescriptor]:

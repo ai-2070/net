@@ -581,14 +581,17 @@ export interface WatchToolsOptions {
  * substrate-side; this just `JSON.parse`s each emitted change. No
  * client-side `setTimeout` / `listTools` re-diff loop.
  *
- * The watcher subscribes lazily on the first iteration, so a change
- * published before iteration begins can be missed — call
- * `listTools(mesh)` once for the starting shape, and begin iterating
- * before mutating if you need to catch the first event.
+ * The native subscription is kicked off eagerly — when `watchTools`
+ * is *called*, not on the first iteration — so a change published
+ * between the call and the first `for await` is not lost (the prior
+ * version subscribed lazily and could drop that first event). Because
+ * the subscription is started at call time, the returned iterable
+ * holds a live substrate watch: consume it (or abort via `signal`) so
+ * it is closed. Call `listTools(mesh)` once for the starting shape.
  *
  * Mirror of the Rust SDK's `Mesh::watch_tools(matcher, interval)`
  * and the Python `watch_tools` — all three are event-driven off the
- * same substrate change signal.
+ * same substrate change signal, and all three subscribe eagerly.
  *
  * Returns an `AsyncIterable<ToolListChange>` suitable for
  * `for await (const change of watchTools(mesh)) { ... }`. The
@@ -602,8 +605,17 @@ export function watchTools(
   const intervalMs = options.intervalMs
   const signal = options.signal
 
+  // Subscribe eagerly — at call time, not on the first iteration — so a
+  // change published before iteration begins is still observed. The
+  // generator below awaits this same promise; the extra no-op `.catch`
+  // keeps an unhandled-rejection warning from firing if the returned
+  // iterable is created but never consumed (the generator's own `await`
+  // still surfaces the real rejection to a consumer that does iterate).
+  const nativePromise = mesh.watchTools(intervalMs ?? null)
+  void nativePromise.catch(() => {})
+
   async function* iterator(): AsyncGenerator<ToolListChange> {
-    const native = await mesh.watchTools(intervalMs ?? null)
+    const native = await nativePromise
     const onAbort = () => native.close()
     if (signal) {
       if (signal.aborted) {
