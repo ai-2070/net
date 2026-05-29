@@ -3619,7 +3619,7 @@ pub extern "C" fn net_rpc_watch_tools(
     NET_RPC_OK
 }
 
-/// Block until the next [`ToolListChange`] and write it as JSON
+/// Block until the next `ToolListChange` and write it as JSON
 /// (`{"type": "added"|"removed"|"node_count_changed", "descriptor":
 /// {...}, "prev_node_count": N}`) — the same wire shape the Go
 /// `ToolListChange` decodes. Returns [`NET_RPC_ERR_STREAM_DONE`]
