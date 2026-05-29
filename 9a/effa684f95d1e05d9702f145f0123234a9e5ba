@@ -1,0 +1,19 @@
+net/crates/net/bindings/node/test/cortex.test.ts
+  s_28940c98751812::t_ecc11601dda753 276-282,286-295
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "9aeffa684f95d1e05d9702f145f0123234a9e5ba",
+  "prompts": {},
+  "sessions": {
+    "s_28940c98751812": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "20d497f6-28ee-40ab-8b63-56eb8b360808",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
