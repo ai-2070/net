@@ -582,15 +582,37 @@ impl MeshOsSnapshot {
     ///
     /// The injectable `now` is what lets the publish loop build a
     /// *structural view* for change-gating (E-10): rebuilding with a
-    /// FIXED reference cancels the per-tick progression of those fields
-    /// (both the reference and each event time are constant, so each
-    /// delta is constant), so two structural views differ only when the
-    /// genuinely structural content (daemon set, lifecycle, holders,
-    /// freeze active/inactive, …) changed — not merely because a tick
-    /// elapsed. Migration `elapsed_ms`/`age_in_phase_ms` come pre-computed
-    /// in `in_flight_migrations` (not via `now`), so they are NOT
-    /// normalized — an active migration still differs per tick, which is
-    /// the safe direction (over-signal while genuinely busy).
+    /// FIXED reference makes every relative-time field constant across
+    /// ticks (the reference and each event instant are both fixed), so
+    /// two structural views differ only when the genuinely structural
+    /// content (daemon set, lifecycle, holders, freeze active/inactive,
+    /// backoff window, …) changed — not merely because a tick elapsed.
+    ///
+    /// **Asymmetry of the loop's reference.** The loop captures its
+    /// reference at construction, so it PRECEDES every event it later
+    /// records, which makes the projection one-sided — and that one-
+    /// sidedness is intended:
+    /// - *Past*-relative fields (`age_ms`, maintenance `since_ms`,
+    ///   recently-emitted ages) saturate to `0`, because the event is
+    ///   after the reference. The structural view thus erases uptime/age
+    ///   entirely — correct, since a daemon ageing or a countdown ticking
+    ///   down is cosmetic, not a change. The one consequence to know: a
+    ///   bare event-time change with no other field change (e.g. an
+    ///   uptime reset while `lifecycle` stays `Running`) is NOT signalled.
+    ///   In practice a real restart also flips `lifecycle`, and every such
+    ///   transition does signal; this is an *under*-signal only for a
+    ///   restart so fast both publishes observe `Running` — and the
+    ///   ceiling re-read still corrects the displayed uptime.
+    /// - *Future*-relative fields (`freeze_remaining_ms`,
+    ///   backoff/crashloop `until_ms`, maintenance
+    ///   `deadline_remaining_ms`, avoid-list TTLs) are preserved as
+    ///   positive constants, so a genuine change to a freeze / backoff /
+    ///   deadline window DOES move the structural view and signal.
+    ///
+    /// Migration `elapsed_ms`/`age_in_phase_ms` come pre-computed in
+    /// `in_flight_migrations` (not via `now`), so they are NOT normalized
+    /// — an active migration still differs per tick, which is the safe
+    /// direction (over-signal while genuinely busy).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_state_at(
         now: std::time::Instant,
@@ -1275,6 +1297,82 @@ mod tests {
             build(base, &actual),
             build(base, &stopped),
             "structural view must move on a lifecycle change",
+        );
+    }
+
+    #[test]
+    fn structural_view_collapses_age_but_preserves_freeze_window() {
+        // E-10 boundary, at the temporal ordering the LOOP actually uses.
+        // `structural_ref` is captured at construction, so it PRECEDES
+        // every event the loop later records (unlike
+        // `from_state_at_fixed_reference_cancels_per_tick_progression`,
+        // which puts the event *before* the reference). Under the real
+        // ordering the fixed-reference projection is asymmetric, and this
+        // pins both halves:
+        //   * past-relative fields (age/uptime) saturate to 0 → an uptime
+        //     reset with no other change does NOT move the structural view
+        //     (age is cosmetic; a real restart also flips lifecycle),
+        //   * future-relative fields (the freeze window) are preserved → a
+        //     changed freeze deadline DOES move it.
+        let audit = std::collections::VecDeque::new();
+        let logs = std::collections::VecDeque::new();
+        // Reference precedes every event below — the production ordering.
+        let reference = Instant::now();
+        let build = |state: &MeshOsState| {
+            MeshOsSnapshot::from_state_at(
+                reference,
+                state,
+                &DesiredState::default(),
+                &[],
+                &[],
+                Vec::new(),
+                &audit,
+                &logs,
+                0,
+            )
+        };
+
+        // Two Running daemons identical but for `last_started` (an
+        // "uptime reset"), both AFTER the reference → both ages saturate
+        // to 0, so the structural views must compare equal.
+        let mut early = MeshOsState::default();
+        {
+            let mut s = DaemonStatus::default();
+            s.lifecycle = DaemonLifecycle::Running;
+            s.last_started = Some(reference + Duration::from_secs(5));
+            early.daemons.insert(dref("worker", 7), s);
+        }
+        let mut reset = MeshOsState::default();
+        {
+            let mut s = DaemonStatus::default();
+            s.lifecycle = DaemonLifecycle::Running;
+            s.last_started = Some(reference + Duration::from_secs(9));
+            reset.daemons.insert(dref("worker", 7), s);
+        }
+        assert_eq!(
+            build(&early),
+            build(&reset),
+            "uptime reset (age-only change) must NOT move the structural \
+             view under the loop's ref-before-events ordering — age is \
+             cosmetic",
+        );
+
+        // A genuine freeze-window change (future-relative) MUST move it,
+        // both on commit (None → Some) and on extending the deadline.
+        let mut frozen_short = early.clone();
+        frozen_short.freeze_until = Some(reference + Duration::from_secs(30));
+        let mut frozen_long = early.clone();
+        frozen_long.freeze_until = Some(reference + Duration::from_secs(60));
+        assert_ne!(
+            build(&early),
+            build(&frozen_short),
+            "committing a freeze must move the structural view",
+        );
+        assert_ne!(
+            build(&frozen_short),
+            build(&frozen_long),
+            "extending the freeze deadline must move the structural view \
+             (future-relative fields are preserved, not collapsed)",
         );
     }
 
