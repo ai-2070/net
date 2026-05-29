@@ -1083,12 +1083,12 @@ impl DeckClient {
             .collect()
     }
 
-    /// Await a snapshot matching `predicate`. Event-driven (E-9):
-    /// blocks on the loop's snapshot-publish signal
-    /// ([`MeshOsSnapshotReader::changed`]) and re-tests `predicate`
-    /// on each publish, so a match is observed as soon as the loop
-    /// republishes rather than on the next poll tick. If the current
-    /// snapshot already matches, resolves immediately.
+    /// Await a snapshot matching `predicate`. Event-driven (E-9/E-10):
+    /// blocks on the loop's structural change signal (the snapshot
+    /// reader's `subscribe_changes`) and re-tests `predicate` on each
+    /// change, so a match is observed as soon as the loop publishes a
+    /// structurally-changed snapshot rather than on the next poll tick.
+    /// If the current snapshot already matches, resolves immediately.
     ///
     /// [`DeckClientConfig::snapshot_poll_interval`] is retained as a
     /// debounce ceiling, not a poll cadence: it bounds the re-test
@@ -1112,14 +1112,17 @@ impl DeckClient {
             .config
             .snapshot_poll_interval
             .max(Duration::from_millis(1));
+        // Subscribe ONCE and reuse the receiver across iterations: a
+        // structural-change generation bumped between the predicate
+        // re-test and the next `changed()` await is still observed (the
+        // receiver tracks its seen generation), so this is
+        // missed-wakeup-safe and the ceiling is a true backstop — even
+        // when `snapshot_poll_interval` is set long for idle-quiet.
+        let mut change_rx = self.snapshot_reader.subscribe_changes();
         loop {
-            // Race the publish signal against the ceiling. The ceiling
-            // arm is the backstop for any publish that slips into the
-            // gap before `changed()` registers its waiter — bounded
-            // re-test, never a wedge.
             tokio::select! {
                 biased;
-                _ = self.snapshot_reader.changed() => {}
+                _ = change_rx.changed() => {}
                 _ = tokio::time::sleep(ceiling) => {}
             }
             let snap = self.snapshot_reader.read();
@@ -2148,21 +2151,47 @@ impl Stream for FailureStream {
     }
 }
 
-/// Stream over the runtime's snapshot reader. Event-driven (E-9):
-/// emits a fresh `Result<MeshOsSnapshot, DeckError>` on each loop
-/// snapshot-publish rather than on a fixed poll tick. The configured
-/// cadence is retained as a debounce ceiling (and the first poll emits
-/// immediately so a consumer sees the initial state). Phase 1 emits on
-/// every publish (consumers de-dupe if they care); the substrate's
-/// tail-with-replay path replaces this with a chain-driven stream when
-/// it lands.
+/// Shared, persistent snapshot change-generation receiver for the deck
+/// `Stream` impls. Held in an async `Mutex` so the `'static` futures the
+/// streams store in `pending` can re-borrow the SAME receiver each fire.
+/// `watch::Receiver` tracks its seen generation, so re-arming after a
+/// fire never misses a generation bumped in between — missed-wakeup-safe
+/// even with a long ceiling, unlike a fresh subscription per arm (E-10).
+type SharedSnapshotChangeRx = Arc<tokio::sync::Mutex<tokio::sync::watch::Receiver<u64>>>;
+
+/// Build the `'static` "next structural change" future a deck `Stream`
+/// stores in `pending`. Locks the shared receiver (uncontended — one
+/// per stream, one in-flight future at a time) and awaits the next
+/// change-generation bump.
+fn next_snapshot_change(
+    rx: SharedSnapshotChangeRx,
+) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        let mut guard = rx.lock().await;
+        // Err only if the loop's sender dropped (runtime gone) — then
+        // the stream falls back to its ceiling.
+        let _ = guard.changed().await;
+    })
+}
+
+/// Stream over the runtime's snapshot reader. Event-driven (E-9/E-10):
+/// wakes on the loop's structural change-generation bump or the ceiling
+/// tick, re-reads, and emits. The configured cadence is retained as a
+/// debounce ceiling (and the first poll emits immediately so a consumer
+/// sees the initial state). Phase 1 emits on every wake (consumers
+/// de-dupe if they care); the substrate's tail-with-replay path replaces
+/// this with a chain-driven stream when it lands.
 pub struct SnapshotStream {
     reader: MeshOsSnapshotReader,
     /// Debounce-ceiling timer — bounds latency if a publish edge is
     /// missed and fires immediately on the first poll.
     ceiling: Interval,
-    /// In-flight "next publish" future, re-armed each time it fires.
-    /// The boxed `Notified` future is `Send` but `!Sync`; the `Mutex`
+    /// Persistent change-generation receiver shared with `pending`'s
+    /// futures, so re-arming after a fire never misses an intervening
+    /// bump (missed-wakeup-safe).
+    change_rx: SharedSnapshotChangeRx,
+    /// In-flight "next structural change" future, re-armed each time it
+    /// fires. The boxed future is `Send` but `!Sync`; the `Mutex`
     /// restores `Sync` (required by the pyo3/napi `#[pyclass]` wrappers)
     /// without an async lock — `poll_next` holds it only across the sync
     /// poll, never across an await.
@@ -2174,10 +2203,13 @@ impl SnapshotStream {
         // Floor the interval so a zero-duration config doesn't
         // hot-spin the executor.
         let poll_interval = poll_interval.max(Duration::from_millis(1));
-        let pending = parking_lot::Mutex::new(Box::pin(reader.changed_owned()) as _);
+        let change_rx: SharedSnapshotChangeRx =
+            Arc::new(tokio::sync::Mutex::new(reader.subscribe_changes()));
+        let pending = parking_lot::Mutex::new(next_snapshot_change(change_rx.clone()));
         Self {
             reader,
             ceiling: interval(poll_interval),
+            change_rx,
             pending,
         }
     }
@@ -2198,7 +2230,7 @@ impl Stream for SnapshotStream {
             let mut pending = this.pending.lock();
             let ready = pending.as_mut().poll(cx).is_ready();
             if ready {
-                *pending = Box::pin(this.reader.changed_owned());
+                *pending = next_snapshot_change(this.change_rx.clone());
             }
             ready
         };
@@ -2223,8 +2255,11 @@ pub struct StatusSummaryStream {
     reader: super::meshos::MeshOsSnapshotReader,
     /// Debounce-ceiling timer (also fires immediately on first poll).
     ceiling: Interval,
-    /// In-flight "next publish" future, re-armed each time it fires.
-    /// `Mutex` restores `Sync` over the `Send`-but-`!Sync` boxed
+    /// Persistent change-generation receiver shared with `pending`'s
+    /// futures (missed-wakeup-safe re-arm; see [`SnapshotStream`]).
+    change_rx: SharedSnapshotChangeRx,
+    /// In-flight "next structural change" future, re-armed each time it
+    /// fires. `Mutex` restores `Sync` over the `Send`-but-`!Sync` boxed
     /// future (the pyo3/napi `#[pyclass]` wrappers require it); the
     /// lock is held only across the sync poll, never across an await.
     pending: parking_lot::Mutex<Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
@@ -2234,10 +2269,13 @@ pub struct StatusSummaryStream {
 impl StatusSummaryStream {
     fn new(reader: super::meshos::MeshOsSnapshotReader, poll_interval: Duration) -> Self {
         let poll_interval = poll_interval.max(Duration::from_millis(1));
-        let pending = parking_lot::Mutex::new(Box::pin(reader.changed_owned()) as _);
+        let change_rx: SharedSnapshotChangeRx =
+            Arc::new(tokio::sync::Mutex::new(reader.subscribe_changes()));
+        let pending = parking_lot::Mutex::new(next_snapshot_change(change_rx.clone()));
         Self {
             reader,
             ceiling: interval(poll_interval),
+            change_rx,
             pending,
             last_emitted: None,
         }
@@ -2260,7 +2298,7 @@ impl Stream for StatusSummaryStream {
                 let mut pending = this.pending.lock();
                 let ready = pending.as_mut().poll(cx).is_ready();
                 if ready {
-                    *pending = Box::pin(this.reader.changed_owned());
+                    *pending = next_snapshot_change(this.change_rx.clone());
                 }
                 ready
             };
@@ -2521,6 +2559,64 @@ mod tests {
             saw_transition,
             "stream should have surfaced a non-Active local_maintenance after enter_maintenance",
         );
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn change_signal_stays_quiet_on_idle_ticks_and_fires_on_structural_change() {
+        // E-10 core guarantee. The loop publishes (and the snapshot's
+        // time-projected fields advance) every tick, but the change
+        // GENERATION must bump only on a genuine structural change — so
+        // a consumer parked purely on the signal isn't woken by cosmetic
+        // per-tick churn. fast_config ticks ~10ms, so several ticks pass
+        // inside each sleep window below.
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate());
+
+        let mut rx = deck.snapshot_reader.subscribe_changes();
+        // Let the runtime settle (its initial structural publishes) then
+        // clear the seen mark so we measure only what happens next.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        rx.borrow_and_update();
+
+        // Many idle ticks elapse. age_ms etc. advance in the stored
+        // snapshot every tick, but nothing structural changed — the
+        // generation must not move.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !rx.has_changed().unwrap(),
+            "change signal fired on idle ticks — per-tick time progression \
+             must NOT count as a structural change",
+        );
+
+        // A real structural change (freeze commit: freeze_until None→Some)
+        // must bump the generation promptly.
+        let p = deck
+            .ice()
+            .freeze_cluster(Duration::from_secs(15))
+            .simulate()
+            .await
+            .expect("simulate");
+        let sig = deck
+            .identity()
+            .sign_proposal(p.action(), p.issued_at_ms(), &p.blast_hash());
+        p.commit(&[sig]).await.expect("commit");
+
+        tokio::time::timeout(Duration::from_secs(2), rx.changed())
+            .await
+            .expect("a structural change must fire the signal well inside the timeout")
+            .expect("change sender alive");
+
+        // And once the freeze is committed, the countdown ticking down
+        // every tick must NOT keep bumping the generation.
+        rx.borrow_and_update();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !rx.has_changed().unwrap(),
+            "freeze countdown advancing must not bump the change generation",
+        );
+
         let _ = runtime.shutdown().await;
     }
 

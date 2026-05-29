@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch};
 use tokio::time::{interval_at, Instant as TokioInstant, MissedTickBehavior};
 
 use super::action::{AllocateActionId, PendingAction};
@@ -72,14 +72,32 @@ pub struct MeshOsLoop {
     /// clone — no lock contention with reconcile.
     snapshot: Arc<ArcSwap<MeshOsSnapshot>>,
 
-    /// Fires `notify_waiters()` right after each `snapshot.store`
-    /// (E-8). Paired with the `ArcSwap` — kept separate so the
-    /// read fast-path stays a lock-free atomic load (a `watch`
-    /// channel would take a read-lock per read; see the rationale
-    /// at the ArcSwap-vs-watch comment in `publish_snapshot`).
-    /// Lets deck's watch/snapshot/status streams await the next
-    /// publish instead of polling `snapshot_poll_interval`.
-    snapshot_changed: Arc<Notify>,
+    /// Monotonic change-generation, bumped right after `snapshot.store`
+    /// but ONLY when the snapshot's *structural* content changed (E-10)
+    /// — not on the cosmetic per-tick advance of time-projected fields
+    /// (`age_ms`, `freeze_remaining_ms`, …). Kept separate from the
+    /// `ArcSwap` (which still backs the lock-free `read()` fast-path)
+    /// rather than carrying the snapshot in the `watch` itself.
+    /// `watch<u64>` over `Notify` so a consumer parked purely on the
+    /// signal is missed-wakeup-safe: a bump landing between two
+    /// `changed()` awaits is still observed on the next await. Lets
+    /// deck's watch/snapshot/status surfaces wake on real change instead
+    /// of polling `snapshot_poll_interval`.
+    change_tx: watch::Sender<u64>,
+
+    /// The previous publish's structural view (built via
+    /// [`MeshOsSnapshot::from_state_at`] against [`Self::structural_ref`]).
+    /// `publish_snapshot` compares the new structural view against this
+    /// to decide whether to bump `change_tx`. `None` until the first
+    /// publish, which therefore always counts as a change.
+    last_published_structural: Option<MeshOsSnapshot>,
+
+    /// Fixed reference instant for the structural-view projection.
+    /// Captured once at construction; because both it and every event
+    /// time are constant, the relative-time fields project to constants
+    /// and cancel out across ticks, leaving only genuine structural
+    /// diffs to drive the change signal.
+    structural_ref: std::time::Instant,
 
     /// Ring of the most-recently-emitted actions. The snapshot's
     /// `pending` field renders this as "what reconcile recently
@@ -367,7 +385,7 @@ impl ProbeRegistry {
 #[derive(Clone, Debug)]
 pub struct MeshOsSnapshotReader {
     snapshot: Arc<ArcSwap<MeshOsSnapshot>>,
-    snapshot_changed: Arc<Notify>,
+    change_rx: watch::Receiver<u64>,
 }
 
 impl MeshOsSnapshotReader {
@@ -386,32 +404,31 @@ impl MeshOsSnapshotReader {
         self.snapshot.load()
     }
 
-    /// Await the next snapshot publish (E-8). Resolves once the
-    /// loop stores a fresh snapshot and fires its notify. Lets a
-    /// watcher block until there is genuinely new state instead of
-    /// re-reading on a timer.
+    /// A persistent subscription to the snapshot change-generation
+    /// (E-8/E-10). Hold the returned [`watch::Receiver`] and
+    /// `await rx.changed()` to wake on the next *structural* change —
+    /// the generation is bumped by `publish_snapshot` only when the
+    /// snapshot's structural content changed, not on the per-tick
+    /// advance of time-projected fields.
     ///
-    /// Missed-wakeup safety: `Notify` only wakes *currently
-    /// registered* waiters, so register this future BEFORE sampling
-    /// the snapshot you're diffing against — a publish racing the
-    /// diff then wakes the already-registered waiter rather than
-    /// being lost (same register-before-read discipline as
-    /// `watch_tools`). The loop republishes every Tick regardless,
-    /// so a missed edge is bounded by the tick interval anyway.
-    pub async fn changed(&self) {
-        self.snapshot_changed.notified().await;
-    }
-
-    /// A `'static` future that resolves on the next snapshot publish
-    /// (E-9). Unlike [`Self::changed`] (which borrows `self`), this
-    /// owns a clone of the notify `Arc`, so it can be stored + re-armed
-    /// inside a `Stream`'s `poll_next` where there is no `self` to
-    /// borrow across polls.
-    pub(crate) fn changed_owned(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
-        let notify = Arc::clone(&self.snapshot_changed);
-        async move {
-            notify.notified().await;
-        }
+    /// Missed-wakeup-safe **only while one receiver is held across
+    /// awaits**: `watch` tracks the seen generation, so a bump landing
+    /// between two `changed()` calls on the SAME receiver is still
+    /// observed on the next call. A fresh `subscribe_changes()` per
+    /// await re-seeds the seen generation to "now" and reintroduces the
+    /// gap — so callers that need the guarantee (e.g. a long-ceiling
+    /// `watch`) subscribe once and reuse.
+    ///
+    /// Note the clone inherits the source reader's *seen* generation,
+    /// which the reader never advances — so it stays at the construction-
+    /// time value (0). After any publish has bumped the generation, the
+    /// first `changed()` on a fresh subscription therefore returns
+    /// immediately. That is harmless and intended: every consumer is
+    /// built to emit current state on its first wake anyway (the deck
+    /// streams' ceiling fires immediately; `watch` pre-checks the current
+    /// snapshot before parking).
+    pub(crate) fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.change_rx.clone()
     }
 }
 
@@ -564,10 +581,12 @@ impl MeshOsLoop {
             ..Default::default()
         };
         let snapshot = Arc::new(ArcSwap::from_pointee(initial_snapshot));
-        let snapshot_changed = Arc::new(Notify::new());
+        // Generation-0 channel; the loop owns the sender, each reader
+        // holds a subscribed receiver.
+        let (change_tx, _) = watch::channel(0u64);
         let reader = MeshOsSnapshotReader {
             snapshot: Arc::clone(&snapshot),
-            snapshot_changed: Arc::clone(&snapshot_changed),
+            change_rx: change_tx.subscribe(),
         };
         let me = Self {
             config,
@@ -577,7 +596,9 @@ impl MeshOsLoop {
             actual: MeshOsState::default(),
             desired: DesiredState::default(),
             snapshot,
-            snapshot_changed,
+            change_tx,
+            last_published_structural: None,
+            structural_ref: std::time::Instant::now(),
             recent_emissions: Vec::new(),
             probes: ProbeRegistryInner::default(),
             scheduler: SchedulerRegistry::new(),
@@ -1607,7 +1628,7 @@ impl MeshOsLoop {
         }
     }
 
-    fn publish_snapshot(&self) {
+    fn publish_snapshot(&mut self) {
         // Read the executor's failures ring under a short read
         // lock and copy it into the snapshot. The lock is held
         // only across the clone to keep the executor's write
@@ -1617,7 +1638,35 @@ impl MeshOsLoop {
             None => Vec::new(),
         };
         let in_flight_migrations = self.migration_snapshot_source.list();
+
+        // The published snapshot projects time-relative fields against
+        // `last_tick`, so it advances every tick — STORED every tick so
+        // a consumer re-reading on its ceiling always sees live `age_ms`
+        // / `freeze_remaining_ms`. The store itself is a cheap atomic
+        // swap.
         let mut snap = MeshOsSnapshot::from_state(
+            &self.actual,
+            &self.desired,
+            &self.recent_emissions,
+            &failures,
+            in_flight_migrations.clone(),
+            &self.admin_audit_ring,
+            &self.log_ring,
+            self.config.this_node,
+        );
+        snap.runtime_epoch_id = self.runtime_epoch_id;
+
+        // E-10: a STRUCTURAL view of the same state, projected against a
+        // fixed reference so per-tick time progression cancels. Only a
+        // genuine structural change (daemon set, lifecycle, replica
+        // holders, freeze active/inactive, emitted actions, audit/log
+        // rings, …) makes this differ from the last published one.
+        // (Active-migration `elapsed_ms` is NOT normalized — it comes
+        // pre-computed in `in_flight_migrations` — so an in-flight
+        // migration still bumps every tick, the safe over-signal
+        // direction.)
+        let mut structural = MeshOsSnapshot::from_state_at(
+            self.structural_ref,
             &self.actual,
             &self.desired,
             &self.recent_emissions,
@@ -1627,12 +1676,39 @@ impl MeshOsLoop {
             &self.log_ring,
             self.config.this_node,
         );
-        snap.runtime_epoch_id = self.runtime_epoch_id;
+        structural.runtime_epoch_id = self.runtime_epoch_id;
+
         self.snapshot.store(Arc::new(snap));
-        // E-8: wake any deck watch/snapshot/status streams parked on
-        // `MeshOsSnapshotReader::changed()`. `notify_waiters` collapses
-        // a burst to a single wake and no-ops when nobody's waiting.
-        self.snapshot_changed.notify_waiters();
+
+        // Bump the change-generation ONLY on a real structural change,
+        // so a consumer parked purely on the signal wakes on transitions,
+        // not on cosmetic countdown ticks. `send_modify` always applies
+        // and wakes regardless of receiver count; it collapses a burst to
+        // one observable generation. The first publish (`None`) always
+        // counts as a change.
+        //
+        // Why a full structural snapshot + deep `PartialEq` every tick,
+        // and not something cheaper — both alternatives were rejected on
+        // purpose:
+        //   * A hash of the structural view is out: `MeshOsSnapshot`
+        //     carries `f32`/`f64` fields (saturation, `cpu_load_1m`, …),
+        //     so it can't derive `Hash`/`Eq` — only `PartialEq`.
+        //   * A reconcile-bumped "dirty" generation that skips the
+        //     build+compare on untouched ticks would be one missed
+        //     mutation site away from a SILENT under-signal, and some
+        //     structural transitions are time-triggered with no inbound
+        //     event (an expiring freeze clears `freeze_until` inside
+        //     `gc_freeze`), so a naive "only on inbound events" flag
+        //     would miss them outright. The deep-eq's sole failure mode
+        //     is a forgotten time-normalization, i.e. it can only ever
+        //     OVER-signal, never miss an edge — that robustness is worth
+        //     one structural rebuild per tick. The rebuild rides the
+        //     loop's existing tick cadence; revisit only if tick-rate ×
+        //     mesh-size ever makes it measurable.
+        if self.last_published_structural.as_ref() != Some(&structural) {
+            self.last_published_structural = Some(structural);
+            self.change_tx.send_modify(|g| *g = g.wrapping_add(1));
+        }
     }
 }
 
