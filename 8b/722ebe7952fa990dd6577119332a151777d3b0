@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/SECURITY_AUDIT_2026_05_29_CHANNEL_AUTH.md
+  s_bd240ee1a66315::t_95ee6da13d0048 1-164
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "8b722ebe7952fa990dd6577119332a151777d3b0",
+  "prompts": {},
+  "sessions": {
+    "s_bd240ee1a66315": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "667f7870-8455-48de-a878-cbfa33c034c1",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
