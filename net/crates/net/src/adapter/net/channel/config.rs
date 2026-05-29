@@ -115,6 +115,21 @@ impl ChannelConfig {
         self
     }
 
+    /// Whether this channel enforces token authorization.
+    ///
+    /// Enforcement is on when `require_token` is set **or** any
+    /// `token_roots` are configured. Coupling the two means a config
+    /// that names roots but forgot to flip `require_token` (e.g. built
+    /// by struct literal or direct field assignment rather than
+    /// [`Self::with_token_roots`]) still enforces, instead of silently
+    /// admitting every peer — the fields are both public, so the
+    /// invariant can't be guaranteed at construction. All token gates
+    /// (subscribe, publish, the periodic sweep, the publish re-check)
+    /// consult this rather than `require_token` directly.
+    pub fn token_required(&self) -> bool {
+        self.require_token || !self.token_roots.is_empty()
+    }
+
     /// Set default priority.
     pub fn with_priority(mut self, priority: u8) -> Self {
         self.priority = priority;
@@ -186,7 +201,7 @@ impl ChannelConfig {
     }
 
     /// Shared token-chain gate for the publish / subscribe checks.
-    /// Returns `true` when `require_token` is off (capability filters
+    /// Returns `true` when token enforcement is off (capability filters
     /// already applied by the caller), else verifies the presented
     /// chain roots at one of `token_roots`. Fails closed when tokens
     /// are required but no roots are configured or no chain is
@@ -199,7 +214,7 @@ impl ChannelConfig {
         revocation: &RevocationRegistry,
         skew_secs: u64,
     ) -> bool {
-        if !self.require_token {
+        if !self.token_required() {
             return true;
         }
         // No authorizing root → nothing can satisfy the gate. Fail
@@ -233,6 +248,24 @@ impl ChannelConfig {
 /// `u16` fast-path hint into a list of canonical channels for receive-side
 /// dispatch (routine collisions at scale).
 ///
+/// Surface the deny-all misconfiguration loudly at registration time.
+///
+/// `require_token = true` with no `token_roots` is a valid fail-closed
+/// state (nothing is authorized), but it's far more often a mistake —
+/// `with_require_token(true)` was called instead of
+/// `with_token_roots(...)`. Logging it at insert turns a silent
+/// "every publish and subscribe is denied" into an actionable warning.
+fn warn_if_fail_closed(config: &ChannelConfig) {
+    if config.require_token && config.token_roots.is_empty() {
+        tracing::warn!(
+            channel = config.channel_id.name().as_str(),
+            "channel requires a token but has no token_roots: all publish \
+             and subscribe will be denied (fail closed). Use \
+             `with_token_roots(...)` to anchor a root of trust."
+        );
+    }
+}
+
 /// Consulted at subscription/channel-creation time (slow path).
 /// The fast path uses the `AuthGuard` bloom filter.
 pub struct ChannelConfigRegistry {
@@ -290,6 +323,7 @@ impl ChannelConfigRegistry {
     /// processes (the longest-length tiebreaker can never tie since
     /// DashMap deduplicates keys).
     pub fn insert_prefix(&self, prefix: impl Into<String>, config: ChannelConfig) {
+        warn_if_fail_closed(&config);
         self.prefix_configs.insert(prefix.into(), config);
     }
 
@@ -301,6 +335,7 @@ impl ChannelConfigRegistry {
 
     /// Register a channel configuration.
     pub fn insert(&self, config: ChannelConfig) {
+        warn_if_fail_closed(&config);
         let name = config.channel_id.name().to_string();
         let hash = config.channel_id.hash();
         let wire_hash = config.channel_id.wire_hash();
@@ -601,6 +636,33 @@ mod tests {
         let chain = direct_chain(&anyone, &anyone, TokenScope::SUBSCRIBE, id.hash());
         assert!(!config.can_subscribe(&caps, anyone.entity_id(), Some(&chain), &rev, 0));
         assert!(!config.can_subscribe(&caps, anyone.entity_id(), None, &rev, 0));
+    }
+
+    /// A config that names roots but never set the `require_token`
+    /// flag (e.g. built field-by-field rather than via
+    /// `with_token_roots`) must still enforce. Pre-fix the gate keyed
+    /// only off `require_token`, so this drifted-open config silently
+    /// admitted every peer.
+    #[test]
+    fn roots_without_require_token_flag_still_enforces() {
+        let id = ChannelId::parse("control/estop").unwrap();
+        let owner = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let caps = make_caps(false);
+        let rev = RevocationRegistry::new();
+
+        let mut config = ChannelConfig::new(id.clone());
+        config.token_roots = vec![owner.entity_id().clone()];
+        // Deliberately leave `require_token` false — the two fields are
+        // both public and can drift out of sync.
+        assert!(!config.require_token);
+        assert!(config.token_required(), "named roots must imply enforcement");
+
+        // No chain -> denied (would have been silently admitted pre-fix).
+        assert!(!config.can_subscribe(&caps, subject.entity_id(), None, &rev, 0));
+        // Owner-issued chain -> allowed.
+        let owner_chain = direct_chain(&owner, &subject, TokenScope::SUBSCRIBE, id.hash());
+        assert!(config.can_subscribe(&caps, subject.entity_id(), Some(&owner_chain), &rev, 0));
     }
 
     /// The chain's leaf must be bound to the presenting entity — a peer

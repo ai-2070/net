@@ -1241,7 +1241,7 @@ fn sweep_expired_subscribers(
             let Some(cfg) = configs.get_by_name(name.as_str()) else {
                 continue;
             };
-            if !cfg.require_token {
+            if !cfg.token_required() {
                 continue;
             }
             // Re-verify the chain the subscriber presented at subscribe
@@ -7204,7 +7204,7 @@ impl MeshNode {
         // channel (no filters, no require_token) short-circuits
         // without needing a peer entity_id at all.
         let has_auth_gates =
-            cfg.publish_caps.is_some() || cfg.subscribe_caps.is_some() || cfg.require_token;
+            cfg.publish_caps.is_some() || cfg.subscribe_caps.is_some() || cfg.token_required();
         if !has_auth_gates {
             return (true, None);
         }
@@ -7243,12 +7243,12 @@ impl MeshNode {
             .get(&from_node)
             .map(|e| e.value().clone())
         else {
-            if cfg.require_token {
+            if cfg.token_required() {
                 return (false, Some(AckReason::Unauthorized));
             }
             // Cap-filter-only mode without a known entity — run the
             // cap match with a dummy id. The token gate is skipped
-            // because require_token == false.
+            // because the channel requires no token.
             let dummy = EntityId::from_bytes([0u8; 32]);
             return if cfg.can_subscribe(&peer_caps, &dummy, None, revocation, skew_secs) {
                 (true, None)
@@ -7475,7 +7475,7 @@ impl MeshNode {
                 .map(|c| c.clone())
         });
         if let Some(cfg) = cfg_snapshot.as_ref() {
-            if cfg.publish_caps.is_some() || cfg.require_token {
+            if cfg.publish_caps.is_some() || cfg.token_required() {
                 let self_caps = self
                     .local_announcement
                     .load()
@@ -7615,7 +7615,7 @@ impl MeshNode {
         let auth_guard = self.auth_guard.clone();
         let require_token = cfg_snapshot
             .as_ref()
-            .map(|c| c.require_token)
+            .map(|c| c.token_required())
             .unwrap_or(false);
         subscribers.retain(|peer_id| {
             // (1) Subnet visibility. Cheap check first — a peer in
