@@ -44,6 +44,51 @@ attack surface. It is only worth doing if a deployment actually uses
 delegated publish grants; direct-issued publishers (the common case)
 already work via the single-link wrap and are unaffected.
 
+## Status — core implemented 2026-05-30
+
+Phases 1–2 and the core of phase 4 shipped in commit `4666d639f`
+(`feat(mesh): let delegated publishers present a held publish chain`).
+The as-built API differs from the sketch below; reconciled here (the
+Design section is left as the original proposal — this section is the
+source of truth for what exists):
+
+- **Store** — `MeshNode.published_chains: Arc<DashMap<ChannelHash,
+  TokenChain>>`, exactly as designed. Not threaded into `DispatchCtx`
+  (the publish gate runs on `&self` in `publish_many`).
+- **Install API** — shipped as an **infallible setter keyed by an
+  explicit channel name**:
+  `MeshNode::set_publish_chain(&self, channel: &ChannelName, chain: TokenChain)`
+  — not the `install_publish_chain(chain) -> Result` that derived the
+  key from `chain.tokens.last().channel_hash`. Taking the channel from
+  the caller **resolves the WILDCARD-leaf open question by
+  construction**: a WILDCARD publish chain is stored under whichever
+  channel(s) the operator names, so there is no leaf-`channel_hash`
+  ambiguity to special-case.
+- **Leaf-subject validation** — not enforced at install. The
+  publish-time `verify_authorizes` already binds the chain leaf to this
+  node's entity, so a mis-installed chain fails *closed* at publish
+  (denied), never silently honored. Install stays a cheap setter,
+  matching the plan's "authoritative check at publish time" philosophy.
+- **`publish_many` wiring** — store-first, falling back to a single-link
+  chain from the cache, as designed — except the fallback uses the
+  scope-aware `TokenCache::get_for_action(.., PUBLISH, ..)` (added in
+  `d52b8186d`) instead of scope-agnostic `get`, so a SUBSCRIBE token
+  sharing the slot can't shadow the PUBLISH grant.
+- **Test** — `delegated_publish_chain_authorizes_publish` (mesh.rs)
+  covers delegated-accept and the no-chain denial.
+
+**Deferred** (gated on a real consumer, per the threat framing):
+
+- `remove_publish_chain` — re-issue is already covered by overwriting
+  via `set_publish_chain`; explicit removal is cleanup only.
+- Rust SDK `Mesh::set_publish_chain` pass-through.
+- FFI / language-binding install entry point — still the binding
+  follow-up in the security audit doc.
+- Extra publish-path tests (root-revoke-kills-publish, direct-grant
+  fallback, self-issued-rejected). The verification logic is the shared
+  `verify_authorizes`, already covered on the subscribe side in
+  `channel/config.rs`.
+
 ## Scope
 
 **In scope:**
@@ -147,44 +192,52 @@ only change is *where the chain comes from*.
 
 ## Phases
 
-1. **Store + API.** Add `published_chains` to `MeshNode` + construction;
-   `install_publish_chain` (with leaf-subject check) + `remove_publish_chain`.
-   Resolve the WILDCARD-leaf keying question first.
-2. **Wire `publish_many`.** Store-first lookup with the single-link
-   fallback. No signature change to `can_publish`.
-3. **SDK surface.** `Mesh::install_publish_chain` / `remove_publish_chain`
-   pass-throughs.
-4. **Tests.** See below.
-5. **Docs.** Flip the "multi-hop locally-held publish" follow-up in the
-   security audit doc to resolved; leave the FFI/binding follow-up open.
+1. **[done]** **Store + API.** `published_chains` on `MeshNode` +
+   construction; `set_publish_chain(channel, chain)` (infallible setter,
+   keyed by the caller-supplied channel — see Status). WILDCARD-leaf
+   keying question is moot under this API.
+2. **[done]** **Wire `publish_many`.** Store-first lookup with the
+   single-link fallback (`get_for_action`). No signature change to
+   `can_publish`.
+3. **[deferred]** **SDK surface.** `Mesh::set_publish_chain`
+   pass-through (+ `remove_publish_chain` if added).
+4. **[partial]** **Tests.** `delegated_publish_chain_authorizes_publish`
+   done; the rest (below) deferred.
+5. **[done]** **Docs.** "Multi-hop locally-held publish" follow-up in
+   the security audit doc flipped to resolved; FFI/binding follow-up
+   left open.
 
 ## Testing
 
 - **Unit (`channel/config.rs` already covers `verify_authorizes`)** —
   no new verification logic, so the store tests live at the mesh layer.
-- **`install_publish_chain` rejects a chain whose leaf isn't self.**
-- **Integration (`channel_auth_hardening.rs` or a new
-  `publish_chain.rs`):**
-  - Delegated publish accepted: owner → mid (PUBLISH+DELEGATE) → this
-    node (PUBLISH); install the 2-link chain; publish succeeds and a
-    subscriber receives it.
-  - Direct-grant fallback still works with no installed chain (owner
-    issues PUBLISH directly to the node; token in cache; publish
-    succeeds) — guards against regressing the common path.
-  - Root revoke kills publish: `revoke_below(owner, …)` after a
-    successful delegated publish → next publish denied.
-  - Self-issued publish chain rejected (issuer ∉ `token_roots`), same
-    as the subscribe-side C1 test but on the publish path.
+- **[done] Delegated publish accepted** — `mesh.rs`
+  `delegated_publish_chain_authorizes_publish`: owner → mid
+  (PUBLISH+DELEGATE) → this node (PUBLISH); without the held chain the
+  publish is denied, after `set_publish_chain` it is admitted.
+- **[deferred] Direct-grant fallback** with no installed chain (owner
+  issues PUBLISH directly; token in cache; publish succeeds) — guards
+  the common path against regression.
+- **[deferred] Root revoke kills publish** — `revoke_below(owner, …)`
+  after a successful delegated publish → next publish denied.
+- **[deferred] Self-issued publish chain rejected** (issuer ∉
+  `token_roots`), the publish-path mirror of the subscribe-side C1 test.
+
+The setter is infallible (no leaf-subject check at install), so the
+planned "rejects a chain whose leaf isn't self" install test no longer
+applies — that binding is enforced at publish time by `verify_authorizes`
+and covered by the subscribe-side `leaf_subject_must_match_presenter`.
 
 ## Risks / open questions
 
-- **WILDCARD-leaf publish chains.** A credential authorizing PUBLISH on
-  *every* channel (WILDCARD scope) has no single `channel_hash` to key
-  the store on. Options: (a) reject WILDCARD chains from the publish
-  store and require per-channel chains; (b) keep a separate
-  `Vec<TokenChain>` of wildcard publish chains consulted on a
-  store miss. (a) is simpler and matches how rare cross-channel publish
-  grants are; pick it unless a consumer needs (b).
+- **WILDCARD-leaf publish chains.** *Resolved* by the as-built API: the
+  setter keys on the caller-supplied `ChannelName`, not on a hash
+  derived from the leaf, so a WILDCARD publish chain is simply stored
+  under each channel the operator wants it used on. No special-case or
+  separate wildcard list needed. (A node holding one WILDCARD publish
+  credential it wants to use across many channels must call
+  `set_publish_chain` once per channel; acceptable given how rare
+  cross-channel publish grants are.)
 - **Low value if delegated publish is unused.** Gate the work on a real
   need — direct publishers are already fine. If no deployment delegates
   publish rights, this plan can sit until one does.

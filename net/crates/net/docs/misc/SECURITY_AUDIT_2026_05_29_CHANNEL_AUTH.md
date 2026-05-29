@@ -61,12 +61,17 @@ Key implementation notes:
 
 Known follow-ups (not security-blocking; fail closed):
 
-- Multi-hop **locally-held publish** credentials: `publish_many` builds
-  a single-link chain from the local token cache, so a delegated
-  publish grant a node holds for itself fails closed until a
-  held-chain store is added.
-- **FFI / language bindings** still present a single token; multi-hop
-  delegation over those surfaces needs a chain-bytes entry point.
+- ~~Multi-hop **locally-held publish** credentials~~ — **resolved**
+  (`4666d639f`). `MeshNode::set_publish_chain` installs a held publish
+  chain that `publish_many` prefers over the single-link cache fallback,
+  so a delegated publish grant anchors correctly. See
+  [`docs/plans/PUBLISH_CHAIN_CREDENTIAL_PLAN.md`](../plans/PUBLISH_CHAIN_CREDENTIAL_PLAN.md);
+  the Rust SDK pass-through and an FFI install entry point are deferred
+  (gated on a consumer).
+- **FFI / language bindings** can now configure a channel's
+  `token_roots` (`c844f5615`), but still present a single token on
+  subscribe and have no publish-chain install entry point; multi-hop
+  delegation over those surfaces needs the chain-bytes plumbing.
 
 ---
 
