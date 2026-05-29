@@ -23,7 +23,21 @@ security property the branch establishes; the highest-impact items are
 two availability regressions (publishers and binding-registered channels
 that now fail closed) and one resource leak.
 
-Findings grouped by impact. Line numbers are approximate (post-branch).
+**All findings below were fixed on this branch** (one commit each):
+
+| Tag | Commit | Fix |
+|---|---|---|
+| C-1 | `d52b8186d` | `TokenCache::get_for_action` — publish selects a PUBLISH-scoped token |
+| C-3 | `c11c4846c` | failure-detector callback evicts the dead peer's retained chains |
+| A-1, C-4 | `8e8e163d5` | `token_required()` couples enforcement to roots; warn on deny-all config |
+| D-1 | `d776fceb0` | `ChannelConfig::reverify_subscribe` centralizes the re-check |
+| T-1 | `660dce7df` | leak test repointed at `subscriber_chains` |
+| A-2 | `4666d639f` | `set_publish_chain` lets delegated publishers present a held chain |
+| C-2 | `c844f5615` | `token_roots` exposed on Node / Python / C-FFI `register_channel` |
+| E-1 | `f191941cb` | publish re-check skips redundant ed25519 verifies (presigned path) |
+| B-1 | `70fb39d82` | SDK subscribe docs note credential required every subscribe |
+
+Findings grouped by impact. Line numbers are approximate (pre-fix).
 
 | Tag | Impact | What |
 |---|---|---|
