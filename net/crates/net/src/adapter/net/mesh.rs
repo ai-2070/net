@@ -9071,6 +9071,72 @@ impl MeshNode {
         }
         self.announce_capabilities(caps).await
     }
+
+    /// Call the `blob.fetch_chunk` service on `target_node_id` for a
+    /// single segment of the chunk addressed by `hash`. `range` is an
+    /// optional half-open `[start, end)` byte window; `None` fetches
+    /// the chunk's first
+    /// [`super::dataforts::blob::FETCH_CHUNK_SEGMENT_BYTES`] bytes.
+    /// The server clamps any window wider than one segment, so one
+    /// round trip yields at most one segment.
+    ///
+    /// This is the single-call primitive; the adapter's cross-peer
+    /// fetch fallback (federation S-2) drives the paging loop over
+    /// segments and the failover across advertised holders. The call
+    /// rides the shared UDP transport — no per-call connection setup.
+    ///
+    /// Maps any transport / codec failure to [`BlobError`] so callers
+    /// fold it uniformly with local-fetch errors.
+    ///
+    /// [`BlobError`]: super::dataforts::blob::BlobError
+    pub async fn send_blob_fetch_chunk(
+        self: &Arc<Self>,
+        target_node_id: u64,
+        hash: [u8; 32],
+        range: Option<(u64, u64)>,
+    ) -> Result<
+        super::dataforts::blob::fetch_rpc::FetchChunkResponse,
+        super::dataforts::blob::BlobError,
+    > {
+        use super::dataforts::blob::fetch_rpc::{
+            FetchChunkRequest, FetchChunkResponse, BLOB_FETCH_CHUNK_SERVICE,
+        };
+        use super::dataforts::blob::BlobError;
+
+        let request = FetchChunkRequest { hash, range };
+        let body = postcard::to_allocvec(&request)
+            .map_err(|e| BlobError::Backend(format!("blob fetch_chunk: encode failed: {e}")))?;
+        let reply = self
+            .call(
+                target_node_id,
+                BLOB_FETCH_CHUNK_SERVICE,
+                bytes::Bytes::from(body),
+                super::mesh_rpc::CallOptions::default(),
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("blob fetch_chunk: RPC failed: {e}")))?;
+        let resp: FetchChunkResponse = postcard::from_bytes(&reply.body).map_err(|e| {
+            BlobError::Backend(format!("blob fetch_chunk: decode reply failed: {e}"))
+        })?;
+        Ok(resp)
+    }
+
+    /// Register the receive-side `blob.fetch_chunk` handler on this
+    /// node. The handler serves chunks from `adapter`'s local store
+    /// (via [`super::dataforts::blob::MeshBlobAdapter::fetch_chunk_local`])
+    /// and never fans a request back out to the mesh.
+    ///
+    /// Returns the [`super::mesh_rpc::ServeHandle`] the operator drops
+    /// to deregister. A second registration under the same service
+    /// name returns [`super::mesh_rpc::ServeError::AlreadyServing`].
+    pub fn serve_blob_fetch_chunk(
+        self: &Arc<Self>,
+        adapter: Arc<super::dataforts::blob::MeshBlobAdapter>,
+    ) -> Result<super::mesh_rpc::ServeHandle, super::mesh_rpc::ServeError> {
+        use super::dataforts::blob::fetch_rpc::{BlobFetchChunkHandler, BLOB_FETCH_CHUNK_SERVICE};
+        let handler = Arc::new(BlobFetchChunkHandler::new(adapter));
+        self.serve_rpc(BLOB_FETCH_CHUNK_SERVICE, handler)
+    }
 }
 
 #[cfg(feature = "net")]

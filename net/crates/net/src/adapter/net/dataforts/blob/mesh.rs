@@ -2479,6 +2479,26 @@ impl MeshBlobAdapter {
     /// that's N×payload_size bytes of memcpy avoided.
     #[doc(hidden)]
     pub async fn fetch_chunk(&self, hash: &[u8; 32]) -> Result<Bytes, BlobError> {
+        // v0.2: local-only read. The cross-peer fallback (S-2) wraps
+        // this in [`Self::fetch_chunk`]'s public surface once the
+        // `blob.fetch_chunk` nRPC consumer side lands; the RPC
+        // *handler* (S-1) always reads through this local-only path
+        // so a serve never recurses back out to the mesh.
+        self.fetch_chunk_local(hash).await
+    }
+
+    /// Local-only chunk read. Reads the content-addressed chunk
+    /// file from the node's own Redex and verifies its BLAKE3 hash;
+    /// never consults peers. Returns `BlobError::NotFound` when the
+    /// chunk file is absent or empty.
+    ///
+    /// This is the read the `blob.fetch_chunk` nRPC handler serves
+    /// from — keeping it distinct from the peer-aware
+    /// [`Self::fetch_chunk`] guarantees a serving node answers from
+    /// its own store and can never fan a fetch back out to the mesh
+    /// (which would loop a chunk request between two peers that both
+    /// miss locally).
+    pub(crate) async fn fetch_chunk_local(&self, hash: &[u8; 32]) -> Result<Bytes, BlobError> {
         let channel = Self::chunk_channel(hash);
         let cfg = self.chunk_file_config();
         let file = self

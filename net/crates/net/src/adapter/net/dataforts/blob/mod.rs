@@ -23,6 +23,11 @@ pub mod conformance;
 pub mod dispatch;
 pub mod erasure;
 pub mod error;
+/// Cross-peer chunk-fetch nRPC service. Requires the `cortex` RPC
+/// layer (the [`crate::adapter::net::cortex::RpcHandler`] surface);
+/// `dataforts` alone implies `redex` but not `cortex`.
+#[cfg(feature = "cortex")]
+pub mod fetch_rpc;
 pub mod fs;
 pub mod mesh;
 pub mod metrics;
@@ -98,6 +103,11 @@ pub use dispatch::{
     classify_payload, publish_blob, publish_blob_ref, resolve_payload, EventPayload,
 };
 pub use error::BlobError;
+#[cfg(feature = "cortex")]
+pub use fetch_rpc::{
+    BlobFetchChunkHandler, FetchChunkRequest, FetchChunkResponse, BLOB_FETCH_CHUNK_SERVICE,
+    FETCH_CHUNK_SEGMENT_BYTES,
+};
 pub use fs::FileSystemAdapter;
 pub use mesh::{
     MeshBlobAdapter, OverflowConfig, RepairReport, DEFAULT_BLOB_HEAT_HALF_LIFE,
