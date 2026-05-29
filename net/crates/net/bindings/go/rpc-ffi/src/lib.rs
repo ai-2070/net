@@ -3547,6 +3547,206 @@ pub extern "C" fn net_rpc_list_tools(
 }
 
 // =========================================================================
+// AI-tool dynamic discovery — event-driven watch (E-3 of
+// POLLING_TO_EVENT_DRIVEN_SDK_PLAN). Surfaces the substrate's
+// `MeshNode::watch_tools` stream (push-driven off the capability
+// fold's change signal) so the Go binding no longer runs its own
+// ticker + diff over the unary `list_tools` RPC.
+// =========================================================================
+
+/// Opaque handle wrapping the substrate `ToolListWatch` stream.
+/// Same shape as [`RpcStreamHandleC`]: the inner stream sits behind
+/// an `Arc<Mutex<Option<...>>>` so `close()` can `take()` it
+/// idempotently and `next()` re-stores it between polls. Dropping
+/// the inner stream drops its mpsc receiver, which the substrate's
+/// diff task observes (closed sender) and exits.
+#[cfg(feature = "tool")]
+pub struct ToolWatchHandleC {
+    inner: Arc<Mutex<Option<net::adapter::net::cortex::tool::ToolListWatch>>>,
+    /// Cancel handle cloned from the `ToolListWatch`. Held
+    /// separately from `inner` so `net_rpc_watch_tools_close` can
+    /// fire it while a `next()` call has the stream taken out of
+    /// the mutex and is blocked in `recv`. Firing it exits the
+    /// substrate diff task, which drops the sender and unblocks the
+    /// parked recv with `None`.
+    cancel: Arc<tokio::sync::Notify>,
+    done: AtomicBool,
+}
+
+/// Open an event-driven tool-list watch. `interval_ms == 0` is
+/// pure event-driven (no debounce ceiling — an idle fold does zero
+/// periodic work); non-zero arms a debounce-ceiling re-diff every
+/// `interval_ms`. Per-change delivery is via
+/// [`net_rpc_watch_tools_next`].
+///
+/// The baseline snapshot is taken synchronously inside
+/// `watch_tools`, so the first `next()` reflects the first change
+/// AFTER the call — callers wanting the baseline shape call
+/// `net_rpc_list_tools` first.
+///
+/// Gated on the `tool` feature (matches `net_rpc_list_tools`).
+#[cfg(feature = "tool")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_watch_tools(
+    handle: *const MeshRpcHandle,
+    interval_ms: u64,
+    out_watch: *mut *mut ToolWatchHandleC,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        write_err(out_err, "MeshRpc handle is NULL".into());
+        return NET_RPC_ERR_NULL;
+    };
+    if out_watch.is_null() {
+        write_err(out_err, "out_watch is NULL".into());
+        return NET_RPC_ERR_NULL;
+    }
+    let interval = if interval_ms == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(interval_ms))
+    };
+    let watch = h.node.watch_tools(None, interval);
+    let cancel = watch.cancel_handle();
+    let boxed = Box::new(ToolWatchHandleC {
+        inner: Arc::new(Mutex::new(Some(watch))),
+        cancel,
+        done: AtomicBool::new(false),
+    });
+    unsafe {
+        *out_watch = Box::into_raw(boxed);
+    }
+    NET_RPC_OK
+}
+
+/// Block until the next `ToolListChange` and write it as JSON
+/// (`{"type": "added"|"removed"|"node_count_changed", "descriptor":
+/// {...}, "prev_node_count": N}`) — the same wire shape the Go
+/// `ToolListChange` decodes. Returns [`NET_RPC_ERR_STREAM_DONE`]
+/// once the watch is closed (the `MeshNode` arc dropped, which
+/// can't happen while the handle is alive, or the handle was
+/// explicitly closed). Mirrors [`net_rpc_stream_next`]'s
+/// take-poll-restore + done-latch discipline.
+#[cfg(feature = "tool")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_watch_tools_next(
+    watch: *mut ToolWatchHandleC,
+    out_json_ptr: *mut *mut u8,
+    out_json_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    use net::adapter::net::cortex::tool::ToolListChange;
+    let Some(w) = (unsafe { watch.as_ref() }) else {
+        return NET_RPC_ERR_NULL;
+    };
+    if out_json_ptr.is_null() || out_json_len.is_null() {
+        write_err(out_err, "out_json_ptr / out_json_len is NULL".into());
+        return NET_RPC_ERR_NULL;
+    }
+    if w.done.load(Ordering::Relaxed) {
+        unsafe {
+            *out_json_ptr = std::ptr::null_mut();
+            *out_json_len = 0;
+        }
+        return NET_RPC_ERR_STREAM_DONE;
+    }
+    let inner_opt = w.inner.lock().take();
+    let mut inner = match inner_opt {
+        Some(i) => i,
+        None => {
+            w.done.store(true, Ordering::Relaxed);
+            unsafe {
+                *out_json_ptr = std::ptr::null_mut();
+                *out_json_len = 0;
+            }
+            return NET_RPC_ERR_STREAM_DONE;
+        }
+    };
+    let item = runtime().block_on(async { inner.next().await });
+    match item {
+        Some(change) => {
+            // Put the stream back for subsequent polls.
+            *w.inner.lock() = Some(inner);
+            // `ToolListChange` isn't `Serialize`; map to the wire
+            // shape the cross-language bindings agree on. The inner
+            // `ToolDescriptor` IS `Serialize`.
+            let json = match change {
+                ToolListChange::Added(d) => {
+                    serde_json::json!({ "type": "added", "descriptor": d })
+                }
+                ToolListChange::Removed(d) => {
+                    serde_json::json!({ "type": "removed", "descriptor": d })
+                }
+                ToolListChange::NodeCountChanged {
+                    descriptor,
+                    prev_node_count,
+                } => serde_json::json!({
+                    "type": "node_count_changed",
+                    "descriptor": descriptor,
+                    "prev_node_count": prev_node_count,
+                }),
+            };
+            match serde_json::to_vec(&json) {
+                Ok(v) => {
+                    write_response(v, out_json_ptr, out_json_len);
+                    NET_RPC_OK
+                }
+                Err(e) => {
+                    w.done.store(true, Ordering::Relaxed);
+                    write_err(out_err, format!("watch_tools serialize failed: {e}"));
+                    NET_RPC_ERR_CALL_FAILED
+                }
+            }
+        }
+        None => {
+            drop(inner);
+            w.done.store(true, Ordering::Relaxed);
+            unsafe {
+                *out_json_ptr = std::ptr::null_mut();
+                *out_json_len = 0;
+            }
+            NET_RPC_ERR_STREAM_DONE
+        }
+    }
+}
+
+/// Latch the watch closed and fire the substrate cancel. Safe to
+/// call from another thread while a `next()` is blocked in `recv`:
+/// firing the cancel exits the substrate diff task, which drops
+/// the sender and unblocks the parked `recv` with `None` (so the
+/// blocked `next()` returns [`NET_RPC_ERR_STREAM_DONE`] promptly
+/// instead of waiting for the next fold change). Idempotent on
+/// NULL or already-closed.
+///
+/// Note: this does NOT `take()` the inner stream — a concurrent
+/// blocked `next()` owns it. The cancel + sender-drop is what
+/// unwedges it; the stream is dropped when `next()` observes the
+/// `None` (or at `free`).
+#[cfg(feature = "tool")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_watch_tools_close(watch: *mut ToolWatchHandleC) {
+    let Some(w) = (unsafe { watch.as_ref() }) else {
+        return;
+    };
+    w.done.store(true, Ordering::Relaxed);
+    w.cancel.notify_one();
+}
+
+/// Free the watch handle. Implicitly closes if not already.
+/// Idempotent on NULL. The caller MUST ensure no `next()` is in
+/// flight on another thread when this is called.
+#[cfg(feature = "tool")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_rpc_watch_tools_free(watch: *mut ToolWatchHandleC) {
+    if watch.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(watch));
+    }
+}
+
+// =========================================================================
 // Tests for pure-logic helpers.
 // =========================================================================
 

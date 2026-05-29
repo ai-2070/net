@@ -349,7 +349,7 @@ func TestEmptySchemaFallback(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// diffToolIndex — WatchTools diffing logic (pure function; no CGO needed).
+// Shared descriptor helper for tool tests.
 // ---------------------------------------------------------------------------
 
 func mkDesc(toolID, version string, nodeCount uint32) ToolDescriptor {
@@ -358,93 +358,6 @@ func mkDesc(toolID, version string, nodeCount uint32) ToolDescriptor {
 		Name:      toolID,
 		Version:   version,
 		NodeCount: nodeCount,
-	}
-}
-
-func TestDiffToolIndexAdded(t *testing.T) {
-	prev := indexDescriptors(nil)
-	next := indexDescriptors([]ToolDescriptor{mkDesc("web_search", "1.0.0", 1)})
-	changes := diffToolIndex(prev, next)
-	if len(changes) != 1 {
-		t.Fatalf("expected 1 change, got %d", len(changes))
-	}
-	c := changes[0]
-	if c.Type != "added" || c.Descriptor.ToolID != "web_search" || c.Descriptor.NodeCount != 1 {
-		t.Errorf("added shape wrong: %#v", c)
-	}
-}
-
-func TestDiffToolIndexRemoved(t *testing.T) {
-	prev := indexDescriptors([]ToolDescriptor{mkDesc("temp", "1.0.0", 1)})
-	next := indexDescriptors(nil)
-	changes := diffToolIndex(prev, next)
-	if len(changes) != 1 {
-		t.Fatalf("expected 1 change, got %d", len(changes))
-	}
-	c := changes[0]
-	if c.Type != "removed" || c.Descriptor.ToolID != "temp" {
-		t.Errorf("removed shape wrong: %#v", c)
-	}
-}
-
-func TestDiffToolIndexNodeCountChanged(t *testing.T) {
-	prev := indexDescriptors([]ToolDescriptor{mkDesc("shared", "1.0.0", 1)})
-	next := indexDescriptors([]ToolDescriptor{mkDesc("shared", "1.0.0", 3)})
-	changes := diffToolIndex(prev, next)
-	if len(changes) != 1 {
-		t.Fatalf("expected 1 change, got %d", len(changes))
-	}
-	c := changes[0]
-	if c.Type != "node_count_changed" || c.PrevNodeCount != 1 || c.Descriptor.NodeCount != 3 {
-		t.Errorf("node_count_changed shape wrong: %#v", c)
-	}
-}
-
-func TestDiffToolIndexNoChangeSameNodeCount(t *testing.T) {
-	prev := indexDescriptors([]ToolDescriptor{mkDesc("stable", "1.0.0", 2)})
-	next := indexDescriptors([]ToolDescriptor{mkDesc("stable", "1.0.0", 2)})
-	changes := diffToolIndex(prev, next)
-	if len(changes) != 0 {
-		t.Errorf("expected no changes for identical state, got %#v", changes)
-	}
-}
-
-func TestDiffToolIndexVersionsAreDistinctKeys(t *testing.T) {
-	// Same tool_id, two versions — diff sees them as separate slots.
-	prev := indexDescriptors([]ToolDescriptor{mkDesc("svc", "1.0.0", 1)})
-	next := indexDescriptors([]ToolDescriptor{
-		mkDesc("svc", "1.0.0", 1),
-		mkDesc("svc", "2.0.0", 1),
-	})
-	changes := diffToolIndex(prev, next)
-	if len(changes) != 1 {
-		t.Fatalf("expected 1 change (the v2 addition), got %d: %#v", len(changes), changes)
-	}
-	if changes[0].Type != "added" || changes[0].Descriptor.Version != "2.0.0" {
-		t.Errorf("expected v2 addition, got %#v", changes[0])
-	}
-}
-
-func TestDiffToolIndexDeterministicOrdering(t *testing.T) {
-	// Adds are emitted in (tool_id, version) order, then removes.
-	prev := indexDescriptors([]ToolDescriptor{mkDesc("z_old", "1.0.0", 1)})
-	next := indexDescriptors([]ToolDescriptor{
-		mkDesc("b_new", "1.0.0", 1),
-		mkDesc("a_new", "1.0.0", 1),
-	})
-	changes := diffToolIndex(prev, next)
-	if len(changes) != 3 {
-		t.Fatalf("expected 3 changes, got %d: %#v", len(changes), changes)
-	}
-	// Added group sorts a_new before b_new; remove group comes last.
-	if changes[0].Descriptor.ToolID != "a_new" || changes[0].Type != "added" {
-		t.Errorf("first change should be added/a_new: %#v", changes[0])
-	}
-	if changes[1].Descriptor.ToolID != "b_new" || changes[1].Type != "added" {
-		t.Errorf("second change should be added/b_new: %#v", changes[1])
-	}
-	if changes[2].Descriptor.ToolID != "z_old" || changes[2].Type != "removed" {
-		t.Errorf("third change should be removed/z_old: %#v", changes[2])
 	}
 }
 
@@ -538,9 +451,9 @@ func TestToolServeHandleCloseKeepsEntryWhenOthersActive(t *testing.T) {
 func TestToolListChangeJSONWireShape(t *testing.T) {
 	desc := mkDesc("web_search", "1.0.0", 2)
 	cases := []struct {
-		name     string
-		change   ToolListChange
-		wantKeys []string // keys that MUST appear in the JSON
+		name       string
+		change     ToolListChange
+		wantKeys   []string // keys that MUST appear in the JSON
 		bannedKeys []string // keys that MUST NOT appear
 	}{
 		{

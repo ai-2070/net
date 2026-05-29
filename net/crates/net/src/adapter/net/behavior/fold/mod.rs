@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use tokio::sync::watch;
 
 pub mod audit;
 pub mod capability;
@@ -224,6 +225,17 @@ pub struct Fold<K: FoldKind> {
     /// inside the task would let it exit on its own, but only
     /// after one sweep-interval tick).
     sweep_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Monotonic change-generation, bumped on every mutation that
+    /// alters what queries observe — apply (Insert/Replace),
+    /// `evict_node`, the expiry sweep, and `restore`. Consumers
+    /// take a [`watch::Receiver`] via [`Self::subscribe_changes`]
+    /// and `await rx.changed()` to react push-style instead of
+    /// polling. `watch` is missed-wakeup-safe: a bump between two
+    /// `changed()` awaits is still observed on the next await, and
+    /// it's multi-consumer. Wrapped in `Arc` so the background
+    /// expiry task holds a `Weak` and can signal reaps without
+    /// keeping the fold alive.
+    change_tx: Arc<watch::Sender<u64>>,
 }
 
 impl<K: FoldKind> Fold<K> {
@@ -246,6 +258,13 @@ impl<K: FoldKind> Fold<K> {
         let index = Arc::new(RwLock::new(K::build_index()));
         let metrics = Arc::new(FoldMetrics::new());
         let audit_sink: Arc<RwLock<Option<Arc<dyn FoldAuditSink>>>> = Arc::new(RwLock::new(None));
+        // Generation-0 channel. The initial receiver is dropped
+        // immediately — `subscribe_changes` mints fresh receivers
+        // on demand, and `send_modify` applies (and bumps the
+        // generation) regardless of how many receivers exist, so a
+        // zero-receiver fold still tracks changes for the next
+        // subscriber.
+        let change_tx = Arc::new(watch::channel(0u64).0);
 
         // Spawn the background sweeper only on a non-zero interval
         // AND from inside a tokio runtime. Synchronous test paths
@@ -260,6 +279,7 @@ impl<K: FoldKind> Fold<K> {
                 Arc::downgrade(&index),
                 Arc::downgrade(&metrics),
                 Arc::downgrade(&audit_sink),
+                Arc::downgrade(&change_tx),
                 interval,
             ))
         };
@@ -270,7 +290,32 @@ impl<K: FoldKind> Fold<K> {
             metrics,
             audit_sink,
             sweep_handle,
+            change_tx,
         }
+    }
+
+    /// Bump the change-generation, waking every
+    /// [`Self::subscribe_changes`] receiver. `send_modify` always
+    /// applies (never errors on zero receivers) and notifies
+    /// synchronously; the bump is a single short lock on the watch
+    /// channel, safe to call while holding the fold's state/index
+    /// write locks (the watch lock is a leaf — no re-entry).
+    #[inline]
+    fn signal_changed(&self) {
+        self.change_tx.send_modify(|g| *g = g.wrapping_add(1));
+    }
+
+    /// Subscribe to fold-change notifications. `await rx.changed()`
+    /// resolves whenever the fold mutates (apply Insert/Replace,
+    /// `evict_node`, expiry sweep, `restore`). Missed-wakeup-safe:
+    /// a mutation between two `changed()` awaits is still observed
+    /// on the next await. The `u64` payload is the monotonic
+    /// change-generation — useful for tests / debugging; consumers
+    /// that only need "something changed" can ignore the value and
+    /// re-query the fold. Basis for push-based `watch_*` surfaces
+    /// (replaces interval polling).
+    pub fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.change_tx.subscribe()
     }
 
     /// Apply a verified signed announcement to the fold.
@@ -321,6 +366,7 @@ impl<K: FoldKind> Fold<K> {
                 self.emit_audit(audit);
                 state.entries.insert(key, entry);
                 self.metrics.on_insert();
+                self.signal_changed();
                 Ok(ApplyOutcome::Inserted)
             }
             MergeAction::Replace => {
@@ -365,6 +411,7 @@ impl<K: FoldKind> Fold<K> {
                 self.emit_audit(audit);
                 state.entries.insert(key, new_entry);
                 self.metrics.on_replace();
+                self.signal_changed();
                 Ok(ApplyOutcome::Replaced)
             }
             MergeAction::Reject => {
@@ -405,6 +452,7 @@ impl<K: FoldKind> Fold<K> {
         let Some(keys) = state.by_node.remove(&node_id) else {
             return;
         };
+        let mut removed = 0usize;
         for key in keys {
             if let Some(old_entry) = state.entries.remove(&key) {
                 index.on_remove(&key, &old_entry.payload);
@@ -415,7 +463,11 @@ impl<K: FoldKind> Fold<K> {
                 });
                 self.emit_audit(audit);
                 self.metrics.on_evict();
+                removed += 1;
             }
+        }
+        if removed > 0 {
+            self.signal_changed();
         }
     }
 
@@ -498,6 +550,10 @@ impl<K: FoldKind> Fold<K> {
 
         let new_len = state.entries.len() as u64;
         self.metrics.on_snapshot_restored(new_len);
+        // Restore replaced the entire entry set (cleared, then
+        // repopulated) — a change for any watcher even when the
+        // restored set is empty.
+        self.signal_changed();
         Ok(())
     }
 
@@ -566,7 +622,11 @@ impl<K: FoldKind> Fold<K> {
         let sink_holder = self.audit_sink.clone();
         let sink_guard = sink_holder.read();
         let sink_ref = sink_guard.as_ref();
-        expiry::sweep_expired::<K>(&self.state, &self.index, &self.metrics, sink_ref)
+        let reaped = expiry::sweep_expired::<K>(&self.state, &self.index, &self.metrics, sink_ref);
+        if reaped > 0 {
+            self.signal_changed();
+        }
+        reaped
     }
 
     /// Internal: forward an [`AuditEvent`] returned by

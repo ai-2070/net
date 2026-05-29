@@ -1923,6 +1923,43 @@ mod mesh_bindings {
                 .map_err(|e| PyValueError::new_err(format!("list_tools serialize failed: {e}")))
         }
 
+        /// Event-driven watch over the local capability fold's tool
+        /// view. Returns an `AsyncToolWatchIter` (PEP 525 async
+        /// iterator) yielding one JSON-encoded `ToolListChange` per
+        /// addition / removal / publisher-count change — delivered the
+        /// moment the fold mutates, not on a timer. The
+        /// `net.tool.watch_tools` wrapper parses each JSON change into
+        /// the matching dataclass.
+        ///
+        /// `interval_ms` is a debounce ceiling, NOT a poll cadence:
+        /// `None`/`0` is pure event-driven (idle fold = zero periodic
+        /// work); a positive value additionally guarantees a re-diff at
+        /// least every `interval_ms` as a safety net.
+        ///
+        /// Mirror of the Rust SDK's `Mesh::watch_tools` and the Node
+        /// `watchTools`. Gated on the `tool` Cargo feature (default-on).
+        #[cfg(feature = "tool")]
+        #[pyo3(signature = (interval_ms=None))]
+        fn watch_tools(
+            &self,
+            interval_ms: Option<u64>,
+        ) -> PyResult<super::cortex::PyAsyncToolWatchIter> {
+            let node = self.node_arc_clone()?;
+            let interval = match interval_ms {
+                Some(ms) if ms > 0 => Some(std::time::Duration::from_millis(ms)),
+                _ => None,
+            };
+            // `watch_tools` spawns the substrate diff task, so it must be
+            // called inside a tokio runtime context. The calling thread
+            // here is the asyncio/GIL thread, not a tokio worker — enter
+            // the shared runtime for the spawn. The guard only scopes the
+            // `tokio::spawn`; the task then lives on the runtime's workers.
+            let rt = self.runtime_arc();
+            let _guard = rt.enter();
+            let watch = node.watch_tools(None, interval);
+            Ok(super::cortex::new_async_tool_watch_iter(watch))
+        }
+
         /// Bucketed aggregation over the local capability fold —
         /// `Fold::aggregate(matcher, group_by, agg)`. Arguments are
         /// JSON-encoded tagged unions; the sdk-py wrappers ship
@@ -2877,6 +2914,8 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<cortex::PyMemoryWatchIter>()?;
         m.add_class::<cortex::PyAsyncMemoriesAdapter>()?;
         m.add_class::<cortex::PyAsyncMemoryWatchIter>()?;
+        #[cfg(feature = "tool")]
+        m.add_class::<cortex::PyAsyncToolWatchIter>()?;
         m.add_class::<cortex::PyNetDb>()?;
         m.add("CortexError", m.py().get_type::<cortex::CortexError>())?;
         m.add("NetDbError", m.py().get_type::<cortex::NetDbError>())?;

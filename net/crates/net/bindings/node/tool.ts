@@ -34,6 +34,26 @@ interface MeshWithListTools {
   listTools(): ToolDescriptor[]
 }
 
+/**
+ * Structural shape of the napi `ToolWatchIter` — an async iterator
+ * over the substrate `watch_tools` stream. `next()` resolves to one
+ * JSON-encoded `ToolListChange`, or `null` when the stream ends /
+ * is closed. Declared here so this file compiles before `napi build`
+ * regenerates `index.d.ts` with the `ToolWatchIter` export.
+ */
+interface NativeToolWatchIter {
+  next(): Promise<string | null>
+  close(): void
+}
+
+/**
+ * Structural shape of the napi `NetMesh.watchTools(intervalMs)`
+ * surface consumed by [`watchTools`].
+ */
+interface MeshWithWatchTools {
+  watchTools(intervalMs?: number | null): Promise<NativeToolWatchIter>
+}
+
 // ============================================================================
 // Wire types — mirror of the Rust `ToolDescriptor` + `ToolEvent`.
 // ============================================================================
@@ -533,11 +553,18 @@ export type ToolListChange =
 
 /** Options for [`watchTools`]. */
 export interface WatchToolsOptions {
-  /** Poll interval in milliseconds. Default `1000`. */
+  /**
+   * Debounce ceiling in milliseconds — NOT a poll cadence.
+   *
+   * Omitted / `0` is pure event-driven: a change is delivered the
+   * moment the capability fold mutates, and an idle fold does zero
+   * periodic work. A positive value additionally guarantees a
+   * re-diff at least every `intervalMs` as a safety net.
+   */
   intervalMs?: number
   /**
-   * `AbortSignal` to end the watch. Aborting the signal closes
-   * the underlying async iterator on the next tick.
+   * `AbortSignal` to end the watch. Aborting closes the underlying
+   * native iterator, which ends the stream promptly.
    */
   signal?: AbortSignal
 }
@@ -547,92 +574,69 @@ export interface WatchToolsOptions {
  * dynamic addition / removal / publisher-count change in the
  * local capability fold's tool view.
  *
- * Polling-backed: every `intervalMs` (default `1s`), the helper
- * re-runs [`listTools`] on the mesh and diffs against the prior
- * snapshot. The first event fires AFTER the initial baseline —
- * call `listTools(mesh)` once before subscribing if you need the
- * starting shape.
+ * Event-driven: consumes the substrate's `MeshNode::watch_tools`
+ * stream via the napi `ToolWatchIter` — a change is delivered the
+ * moment the fold mutates (latency is bounded by fold-apply, not a
+ * timer), and an idle fold does zero periodic work. The diff happens
+ * substrate-side; this just `JSON.parse`s each emitted change. No
+ * client-side `setTimeout` / `listTools` re-diff loop.
+ *
+ * The native subscription is kicked off eagerly — when `watchTools`
+ * is *called*, not on the first iteration — so a change published
+ * between the call and the first `for await` is not lost (the prior
+ * version subscribed lazily and could drop that first event). Because
+ * the subscription is started at call time, the returned iterable
+ * holds a live substrate watch: consume it (or abort via `signal`) so
+ * it is closed. Call `listTools(mesh)` once for the starting shape.
  *
  * Mirror of the Rust SDK's `Mesh::watch_tools(matcher, interval)`
- * (A-5). The Rust runtime version is also polling-backed —
- * identical semantics, same default cadence. The Node version
- * lives entirely in TS atop the existing `listTools` napi
- * surface; no streaming FFI required.
+ * and the Python `watch_tools` — all three are event-driven off the
+ * same substrate change signal, and all three subscribe eagerly.
  *
  * Returns an `AsyncIterable<ToolListChange>` suitable for
  * `for await (const change of watchTools(mesh)) { ... }`. The
- * iterator ends when `options.signal` aborts or when the
- * underlying loop hits an unrecoverable error.
+ * iterator ends when `options.signal` aborts, when the stream is
+ * closed, or on an unrecoverable error.
  */
 export function watchTools(
-  mesh: MeshWithListTools,
+  mesh: MeshWithWatchTools,
   options: WatchToolsOptions = {},
 ): AsyncIterable<ToolListChange> {
-  const intervalMs = options.intervalMs ?? 1000
+  const intervalMs = options.intervalMs
   const signal = options.signal
 
-  // Take the baseline snapshot synchronously before the iterator
-  // is first awaited. Mirrors the Rust SDK's `watch_tools` race
-  // fix — a subscribe-then-publish call sequence must never lose
-  // the `Added` event to a spawn/announce ordering hiccup.
-  const baseline = new Map<string, ToolDescriptor>()
-  for (const t of mesh.listTools()) {
-    baseline.set(`${t.toolId}::${t.version}`, t)
-  }
+  // Subscribe eagerly — at call time, not on the first iteration — so a
+  // change published before iteration begins is still observed. The
+  // generator below awaits this same promise; the extra no-op `.catch`
+  // keeps an unhandled-rejection warning from firing if the returned
+  // iterable is created but never consumed (the generator's own `await`
+  // still surfaces the real rejection to a consumer that does iterate).
+  const nativePromise = mesh.watchTools(intervalMs ?? null)
+  void nativePromise.catch(() => {})
 
   async function* iterator(): AsyncGenerator<ToolListChange> {
-    let prev = baseline
-    while (true) {
-      // Sleep `intervalMs` between ticks. Abort short-circuits.
-      try {
-        await new Promise<void>((resolve, reject) => {
-          const handle = setTimeout(resolve, intervalMs)
-          const onAbort = () => {
-            clearTimeout(handle)
-            reject(signal?.reason ?? new Error('aborted'))
-          }
-          if (signal) {
-            if (signal.aborted) {
-              clearTimeout(handle)
-              reject(signal.reason ?? new Error('aborted'))
-              return
-            }
-            signal.addEventListener('abort', onAbort, { once: true })
-          }
-        })
-      } catch {
+    const native = await nativePromise
+    const onAbort = () => native.close()
+    if (signal) {
+      if (signal.aborted) {
+        native.close()
         return
       }
-
-      const next = new Map<string, ToolDescriptor>()
-      for (const t of mesh.listTools()) {
-        next.set(`${t.toolId}::${t.version}`, t)
-      }
-
-      // Added: present in next, not in prev.
-      for (const [k, d] of next) {
-        if (!prev.has(k)) {
-          yield { type: 'added', descriptor: d }
+      signal.addEventListener('abort', onAbort, { once: true })
+    }
+    try {
+      while (true) {
+        const raw = await native.next()
+        if (raw == null) {
+          return
         }
+        yield JSON.parse(raw) as ToolListChange
       }
-      // Removed: present in prev, not in next.
-      for (const [k, d] of prev) {
-        if (!next.has(k)) {
-          yield { type: 'removed', descriptor: d }
-        }
+    } finally {
+      if (signal) {
+        signal.removeEventListener('abort', onAbort)
       }
-      // NodeCountChanged: in both, but counts differ.
-      for (const [k, d] of next) {
-        const old = prev.get(k)
-        if (old && old.nodeCount !== d.nodeCount) {
-          yield {
-            type: 'node_count_changed',
-            descriptor: d,
-            prevNodeCount: old.nodeCount,
-          }
-        }
-      }
-      prev = next
+      native.close()
     }
   }
 

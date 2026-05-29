@@ -5515,17 +5515,26 @@ impl MeshNode {
     /// the baseline shape should call `list_tools` first and then
     /// start the watch.
     ///
-    /// Backed by a polling task: every `interval` (default `1s`
-    /// when `None`), the task re-runs `list_tools(&matcher)` and
-    /// diffs against its previous snapshot, emitting one event per
-    /// change. Tighter intervals lower discovery latency at the
-    /// cost of CPU; loose intervals are kinder to large folds.
+    /// Event-driven: the task parks on the capability fold's
+    /// change signal (`Fold::subscribe_changes`) and re-diffs
+    /// only when the fold actually mutates (a local `serve_tool`,
+    /// an inbound peer announcement, an eviction, or a TTL expiry)
+    /// — no periodic walk on an idle fold. Change-detection latency
+    /// is bounded by fold-apply latency, not a poll interval.
+    ///
+    /// `interval`:
+    /// - `None` — pure event-driven; the task only wakes on a fold
+    ///   change. An idle fold does zero periodic work.
+    /// - `Some(d)` — event-driven plus a debounce *ceiling*: a
+    ///   safety-net re-diff fires at least every `d` even absent a
+    ///   change signal. Use this only if you want a hard upper
+    ///   bound on staleness independent of the signal path.
     ///
     /// Lifecycle:
     /// - Dropping the
     ///   [`ToolListWatch`](crate::adapter::net::cortex::tool::ToolListWatch)
-    ///   stops the polling task on the next tick (the task observes
-    ///   the closed sender and exits).
+    ///   stops the task on its next wake (the task observes the
+    ///   closed sender and exits).
     /// - The watch handle never errors: a dropped fold (impossible
     ///   while the `MeshNode` arc is alive) would simply end the
     ///   stream. Decode-style errors don't exist here — the
@@ -5538,11 +5547,26 @@ impl MeshNode {
     ) -> crate::adapter::net::cortex::tool::ToolListWatch {
         use crate::adapter::net::cortex::tool::{ToolDescriptor, ToolListChange, ToolListWatch};
         use std::collections::HashMap;
-        let interval = interval.unwrap_or_else(|| Duration::from_secs(1));
         // Bounded capacity — a slow consumer backpressures the
-        // polling task (which awaits in `send`) instead of letting
+        // diff task (which awaits in `send`) instead of letting
         // ToolListChange events accumulate without bound.
         let (tx, rx) = tokio::sync::mpsc::channel::<ToolListChange>(256);
+        // Cancel signal so a consumer can stop the diff task even
+        // when it's parked on the change signal with nothing reading
+        // the receiver. The task holds `cancel_task`; the returned
+        // `ToolListWatch` holds `cancel` and exposes `.cancel()` /
+        // `.cancel_handle()`. `notify_one` stores a permit, so a
+        // cancel racing the diff phase is still caught on the next
+        // `select!`.
+        let cancel = std::sync::Arc::new(Notify::new());
+        let cancel_task = cancel.clone();
+        // Subscribe to the fold's change signal BEFORE taking the
+        // baseline snapshot. A mutation landing between the snapshot
+        // and the subscribe would otherwise be lost (the receiver
+        // would start past that change's generation); subscribing
+        // first guarantees any such change re-fires `changed()` and
+        // we re-diff — at worst a redundant pass that finds nothing.
+        let mut change_rx = self.capability_fold.subscribe_changes();
         // Take the initial baseline snapshot SYNCHRONOUSLY before
         // returning the watch handle. Without this, a caller that
         // does `let w = watch_tools(...); announce_a_tool().await` can
@@ -5556,14 +5580,56 @@ impl MeshNode {
             .collect();
         let node = self.clone();
         let matcher_for_task = matcher;
+        // `Some(d)` arms a debounce-ceiling timer; `None` leaves the
+        // loop purely change-driven (no periodic wakeups).
+        let ceiling = interval;
         tokio::spawn(async move {
             let mut prev = initial_snapshot;
-            let mut ticker = tokio::time::interval(interval);
-            // Skip the first immediate tick — the snapshot was just taken.
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            ticker.tick().await;
+            let mut ticker = ceiling.map(|d| {
+                let mut t = tokio::time::interval(d);
+                t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                t
+            });
+            // Consume the immediate first tick — the snapshot was
+            // just taken, so the ceiling clock starts from "now".
+            if let Some(t) = ticker.as_mut() {
+                t.tick().await;
+            }
             loop {
-                ticker.tick().await;
+                // Wake on either a fold change or (if armed) the
+                // debounce-ceiling tick. With no ceiling, the timer
+                // arm is a never-resolving future, so only fold
+                // changes drive the loop.
+                tokio::select! {
+                    r = change_rx.changed() => {
+                        // Err means the fold's change-sender dropped
+                        // — impossible while `node` (which owns the
+                        // fold Arc) is alive, but exit cleanly if so.
+                        if r.is_err() {
+                            return;
+                        }
+                    }
+                    _ = async {
+                        match ticker.as_mut() {
+                            Some(t) => {
+                                t.tick().await;
+                            }
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {}
+                    // Explicit cancel (FFI close, or `ToolListWatch::cancel`).
+                    // Returning drops `tx`, which unblocks any consumer
+                    // parked in a synchronous recv with `None`.
+                    _ = cancel_task.notified() => {
+                        return;
+                    }
+                    // Receiver dropped (the `ToolListWatch` was dropped
+                    // without an explicit cancel) — stop promptly
+                    // instead of waiting for the next fold change.
+                    _ = tx.closed() => {
+                        return;
+                    }
+                }
                 if tx.is_closed() {
                     return;
                 }
@@ -5612,7 +5678,10 @@ impl MeshNode {
                 prev = next;
             }
         });
-        ToolListWatch { receiver: rx }
+        ToolListWatch {
+            receiver: rx,
+            cancel,
+        }
     }
 
     /// Per-Mesh caller-side nRPC metrics registry. Accessor for

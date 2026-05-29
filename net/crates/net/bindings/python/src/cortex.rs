@@ -3304,3 +3304,161 @@ impl PyAsyncTaskWatchIter {
         pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
     }
 }
+
+// =========================================================================
+// AsyncToolWatchIter — E-4 of POLLING_TO_EVENT_DRIVEN_SDK_PLAN.
+//
+// Wraps the substrate `MeshNode::watch_tools` stream (event-driven off
+// the capability fold's change signal) as a PEP 525 async iterator.
+// Each yield is a JSON-encoded `ToolListChange` (`{"type", "descriptor",
+// "prev_node_count"?}`) — the Python `net.tool.watch_tools` wrapper
+// parses it into the matching dataclass, the same JSON-bridge contract
+// `NetMesh.list_tools` already uses. Replaces the prior `asyncio.sleep`
+// poll loop in the Python wrapper.
+//
+// Cancellation: same shape as the memory/task watch iters. The
+// `AnextCancelGuard` trips `shutdown` on asyncio task-cancel mid-await;
+// `close`/`aclose` trip it explicitly. Either way the select's shutdown
+// arm wins and the `BoxStream` (the substrate `ToolListWatch`) is
+// dropped — dropping its receiver closes the substrate channel
+// (`tx.closed()`), so the substrate diff task exits even when it was
+// parked on the fold change with no ceiling.
+// =========================================================================
+
+#[cfg(feature = "tool")]
+struct ToolWatchIterInner {
+    stream:
+        TokioMutex<Option<BoxStream<'static, ::net::adapter::net::cortex::tool::ToolListChange>>>,
+    shutdown: Notify,
+    is_shutdown: AtomicBool,
+}
+
+/// Async iterator (`async for change in iter:`) over the live
+/// `watch_tools` stream. Each yield is a JSON-encoded `ToolListChange`.
+#[cfg(feature = "tool")]
+#[pyclass(name = "AsyncToolWatchIter", module = "_net")]
+pub struct PyAsyncToolWatchIter {
+    inner: Arc<ToolWatchIterInner>,
+}
+
+#[cfg(feature = "tool")]
+pub(crate) fn new_async_tool_watch_iter(
+    watch: ::net::adapter::net::cortex::tool::ToolListWatch,
+) -> PyAsyncToolWatchIter {
+    let stream: BoxStream<'static, ::net::adapter::net::cortex::tool::ToolListChange> =
+        watch.boxed();
+    PyAsyncToolWatchIter {
+        inner: Arc::new(ToolWatchIterInner {
+            stream: TokioMutex::new(Some(stream)),
+            shutdown: Notify::new(),
+            is_shutdown: AtomicBool::new(false),
+        }),
+    }
+}
+
+#[cfg(feature = "tool")]
+#[pymethods]
+impl PyAsyncToolWatchIter {
+    fn __aiter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        use ::net::adapter::net::cortex::tool::ToolListChange;
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            struct AnextCancelGuard {
+                inner: Arc<ToolWatchIterInner>,
+                armed: bool,
+            }
+            impl Drop for AnextCancelGuard {
+                fn drop(&mut self) {
+                    if self.armed {
+                        self.inner.is_shutdown.store(true, Ordering::Release);
+                        self.inner.shutdown.notify_waiters();
+                    }
+                }
+            }
+            let mut anext_guard = AnextCancelGuard {
+                inner: inner.clone(),
+                armed: true,
+            };
+
+            if inner.is_shutdown.load(Ordering::Acquire) {
+                anext_guard.armed = false;
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+            }
+            let mut guard = inner.stream.lock().await;
+            let stream = match guard.as_mut() {
+                Some(s) => s,
+                None => {
+                    anext_guard.armed = false;
+                    return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+                }
+            };
+            let shutdown_fut = inner.shutdown.notified();
+            tokio::pin!(shutdown_fut);
+            shutdown_fut.as_mut().enable();
+
+            if inner.is_shutdown.load(Ordering::Acquire) {
+                *guard = None;
+                anext_guard.armed = false;
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+            }
+            let next = tokio::select! {
+                biased;
+                _ = shutdown_fut => {
+                    *guard = None;
+                    None
+                }
+                msg = stream.next() => match msg {
+                    Some(change) => Some(change),
+                    None => {
+                        *guard = None;
+                        None
+                    }
+                }
+            };
+            drop(guard);
+            anext_guard.armed = false;
+            match next {
+                Some(change) => {
+                    let json = match change {
+                        ToolListChange::Added(d) => {
+                            serde_json::json!({ "type": "added", "descriptor": d })
+                        }
+                        ToolListChange::Removed(d) => {
+                            serde_json::json!({ "type": "removed", "descriptor": d })
+                        }
+                        ToolListChange::NodeCountChanged {
+                            descriptor,
+                            prev_node_count,
+                        } => serde_json::json!({
+                            "type": "node_count_changed",
+                            "descriptor": descriptor,
+                            "prev_node_count": prev_node_count,
+                        }),
+                    };
+                    serde_json::to_string(&json).map_err(|e| {
+                        PyValueError::new_err(format!("watch_tools serialize failed: {e}"))
+                    })
+                }
+                None => Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+            }
+        })
+    }
+
+    /// Stop the iterator. Idempotent. Subsequent `__anext__` calls
+    /// raise `StopAsyncIteration`.
+    fn close(&self) {
+        self.inner.is_shutdown.store(true, Ordering::Release);
+        self.inner.shutdown.notify_waiters();
+    }
+
+    /// Async alias for :meth:`close` so users can write
+    /// ``await iter.aclose()``.
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.close();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
+    }
+}

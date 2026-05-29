@@ -534,10 +534,20 @@ impl Mesh {
     /// dynamic addition / removal / publisher-count change in the
     /// local capability fold's tool view, filtered by `matcher`.
     ///
-    /// `interval` controls the polling cadence; `None` uses a 1s
-    /// default. The returned [`ToolListWatch`] implements
-    /// `futures::Stream<Item = ToolListChange>`. Dropping it stops
-    /// the underlying polling task.
+    /// Event-driven: a change is delivered the moment the capability
+    /// fold mutates (latency is bounded by fold-apply, not a timer),
+    /// and an idle fold does zero periodic work.
+    ///
+    /// `interval` is a *debounce ceiling*, not a poll cadence:
+    /// - `None` — pure event-driven; the watch only wakes on a real
+    ///   mutation.
+    /// - `Some(d)` — additionally guarantees a re-diff at least every
+    ///   `d` as a safety net, independent of the change signal.
+    ///
+    /// The returned [`ToolListWatch`] implements
+    /// `futures::Stream<Item = ToolListChange>`. Dropping it — or
+    /// calling [`ToolListWatch::cancel`] — ends the stream and stops
+    /// the underlying substrate task.
     ///
     /// First event fires AFTER the initial baseline snapshot — call
     /// [`Self::list_tools`] first if you need the starting shape.

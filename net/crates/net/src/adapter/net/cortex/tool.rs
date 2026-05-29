@@ -281,14 +281,29 @@ impl ToolEvent {
 
 /// Stream of [`ToolListChange`] events returned by
 /// [`crate::adapter::net::MeshNode::watch_tools`]. Implements
-/// `futures::Stream<Item = ToolListChange>`. Dropping the watch
-/// ends the underlying polling task on its next tick.
+/// `futures::Stream<Item = ToolListChange>`.
 ///
 /// Backed by a bounded mpsc; a slow consumer applies backpressure
-/// to the polling task (which blocks on the next `send().await`)
+/// to the diff task (which blocks on the next `send().await`)
 /// rather than queueing events without bound.
+///
+/// Two ways to end the watch:
+/// - Drop the `ToolListWatch` — the diff task observes the closed
+///   receiver (`tx.closed()`) on its next wake and exits.
+/// - Call [`Self::cancel`] — wakes the diff task immediately even
+///   if it's parked on the fold change signal with no consumer
+///   reading. This is the path FFI bindings use: a blocking
+///   `next` parked on the receiver can't be interrupted by
+///   dropping the receiver (the blocked recv owns it), so the
+///   cancel fires the task to exit, which drops the *sender* and
+///   unblocks the parked recv with `None`.
 pub struct ToolListWatch {
     pub(crate) receiver: tokio::sync::mpsc::Receiver<ToolListChange>,
+    /// Fires the diff task's `select!` cancel arm. Cloned into the
+    /// task at construction; `notify_one` stores a permit so a
+    /// cancel racing the task's diff phase is still observed on the
+    /// next `select!`.
+    pub(crate) cancel: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl futures::Stream for ToolListWatch {
@@ -302,10 +317,27 @@ impl futures::Stream for ToolListWatch {
 }
 
 impl ToolListWatch {
+    /// Signal the diff task to stop. Idempotent. Wakes the task
+    /// even when it's parked on the fold change signal, so a
+    /// consumer blocked in a synchronous `next` (e.g. an FFI
+    /// binding) unblocks promptly: the task exits, drops its
+    /// sender, and the blocked recv returns `None`.
+    pub fn cancel(&self) {
+        self.cancel.notify_one();
+    }
+
+    /// Clone the cancel handle so a holder separate from the
+    /// receiver (e.g. an FFI handle that has taken the receiver out
+    /// to block on it) can fire cancellation. Firing it has the
+    /// same effect as [`Self::cancel`].
+    pub fn cancel_handle(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.cancel.clone()
+    }
+
     /// Receive the next change event. Returns `None` when the
-    /// underlying polling task exits (cannot happen while the
-    /// `MeshNode` is alive). Most callers should treat the watch
-    /// handle as a stream and `.next().await` on it instead.
+    /// diff task exits (consumer dropped the watch, or [`Self::cancel`]
+    /// fired). Most callers should treat the watch handle as a
+    /// stream and `.next().await` on it instead.
     pub async fn recv(&mut self) -> Option<ToolListChange> {
         self.receiver.recv().await
     }

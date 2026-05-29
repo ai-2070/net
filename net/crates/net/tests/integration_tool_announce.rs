@@ -470,6 +470,67 @@ async fn watch_tools_polling_task_exits_when_handle_dropped() {
 }
 
 #[tokio::test]
+async fn watch_tools_delivers_change_well_under_the_debounce_ceiling() {
+    // E-2: the watch is event-driven — a change is delivered as soon
+    // as the capability fold mutates, NOT on the next ceiling tick.
+    // Arm a deliberately long 30s ceiling; if the event still arrives
+    // in well under a second, it can only have come from the fold's
+    // change signal (the ceiling timer is 30s away). A regression to
+    // interval-polling would make this wait ~30s and trip the inner
+    // 2s timeout.
+    let host = build_node().await;
+    let peer = build_node().await;
+    handshake_pair(&host, &peer).await;
+
+    let mut watch = peer.watch_tools(None, Some(Duration::from_secs(30)));
+
+    let started = std::time::Instant::now();
+    host.tool_registry().insert(descriptor("fast_path"));
+    host.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce");
+
+    let event = tokio::time::timeout(Duration::from_secs(2), watch.next())
+        .await
+        .expect("event must arrive far inside the 30s ceiling")
+        .expect("stream did not close");
+    match event {
+        ToolListChange::Added(desc) => assert_eq!(desc.tool_id, "fast_path"),
+        other => panic!("expected Added(fast_path), got {other:?}"),
+    }
+    // Belt-and-suspenders: prove it was sub-ceiling, not luck.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "change delivery took {:?}, expected ≪ 30s ceiling — \
+         watch is not event-driven",
+        started.elapsed(),
+    );
+}
+
+#[tokio::test]
+async fn watch_tools_cancel_ends_the_stream_promptly() {
+    // E-2b: `cancel()` must end the stream even when the diff task
+    // is parked on the fold change signal with no pending change.
+    // With no ceiling (`None`) the task only wakes on a fold change
+    // or a cancel — so absent cancel, `next()` would block forever
+    // here. The cancel exits the task, drops its sender, and the
+    // stream ends with `None`. This is the substrate basis for
+    // prompt FFI/Go shutdown on `ctx.Done()`.
+    let host = build_node().await;
+    let peer = build_node().await;
+    handshake_pair(&host, &peer).await;
+
+    let mut watch = peer.watch_tools(None, None);
+    watch.cancel();
+
+    let ended = tokio::time::timeout(Duration::from_secs(2), watch.next()).await;
+    assert!(
+        matches!(ended, Ok(None)),
+        "cancel must end the stream promptly; got {ended:?}",
+    );
+}
+
+#[tokio::test]
 async fn list_tools_dedupes_and_aggregates_node_count() {
     let host_a = build_node().await;
     let host_b = build_node().await;

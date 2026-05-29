@@ -170,6 +170,57 @@ fn stale_generation_is_rejected_by_default_merge() {
 }
 
 #[test]
+fn subscribe_changes_fires_on_real_mutations_only() {
+    // E-1: the fold's change-generation signal must fire on every
+    // mutation that alters what queries observe (Insert, Replace,
+    // evict) and stay silent on no-ops (Rejected apply, evict of an
+    // absent node). `Fold::new()` skips the background sweeper when
+    // there's no ambient runtime, so this runs as a plain sync test
+    // using the `watch::Receiver` `has_changed` / `borrow_and_update`
+    // pair instead of awaiting `changed()`.
+    let fold: Fold<CapFold> = Fold::new();
+    let mut rx = fold.subscribe_changes();
+    assert!(
+        !rx.has_changed().unwrap(),
+        "fresh subscriber sees no change before any mutation"
+    );
+
+    // Insert → fires.
+    fold.apply(cap_announcement(0x42, 0x1000, 1, vec!["gpu"]))
+        .expect("insert");
+    assert!(rx.has_changed().unwrap(), "insert signals a change");
+    rx.borrow_and_update();
+
+    // Replace (higher generation) → fires.
+    fold.apply(cap_announcement(0x42, 0x1000, 2, vec!["gpu", "h100"]))
+        .expect("replace");
+    assert!(rx.has_changed().unwrap(), "replace signals a change");
+    rx.borrow_and_update();
+
+    // Rejected (stale generation) → must NOT fire.
+    let outcome = fold
+        .apply(cap_announcement(0x42, 0x1000, 1, vec!["stale"]))
+        .expect("apply ok");
+    assert_eq!(outcome, ApplyOutcome::Rejected);
+    assert!(
+        !rx.has_changed().unwrap(),
+        "rejected (no-op) apply must not signal a change"
+    );
+
+    // evict_node of a present node → fires.
+    fold.evict_node(0x42, "test");
+    assert!(rx.has_changed().unwrap(), "evict signals a change");
+    rx.borrow_and_update();
+
+    // evict_node of an absent node → must NOT fire.
+    fold.evict_node(0x999, "absent");
+    assert!(
+        !rx.has_changed().unwrap(),
+        "evicting an absent node must not signal a change"
+    );
+}
+
+#[test]
 fn higher_generation_replaces_existing_entry_and_index() {
     let fold: Fold<CapFold> = Fold::new();
     fold.apply(cap_announcement(0x42, 0x1000, 1, vec!["old-tag"]))
