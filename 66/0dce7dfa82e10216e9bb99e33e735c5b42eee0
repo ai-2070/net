@@ -1,0 +1,21 @@
+net/crates/net/tests/channel_auth.rs
+  s_f6c191b51f28ba::t_e6d45cfdabb399 253-262,271,278-282,302-308
+net/crates/net/src/adapter/net/mesh.rs
+  s_f6c191b51f28ba::t_bb73f9e7e13325 2235-2242
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "660dce7dfa82e10216e9bb99e33e735c5b42eee0",
+  "prompts": {},
+  "sessions": {
+    "s_f6c191b51f28ba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "aeb41064-2c0d-418f-ad38-0589f4ebe401",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
