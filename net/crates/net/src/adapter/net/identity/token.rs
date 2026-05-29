@@ -1156,6 +1156,51 @@ impl TokenCache {
             .cloned()
     }
 
+    /// Fetch a cached token for `(subject, channel_hash)` that
+    /// currently **authorizes `action`**: valid signature, within time
+    /// bounds (honoring this cache's skew), not revoked, bound to
+    /// `subject`, and carrying `action` on this channel.
+    ///
+    /// Unlike [`Self::get`] — which returns the first *valid* token of
+    /// *any* scope — this filters by scope. A slot holds tokens of
+    /// distinct scopes side-by-side (one `PUBLISH`, one `SUBSCRIBE`),
+    /// so a caller that wraps the result in a single-link
+    /// [`TokenChain`] for a specific action (e.g. the publish path)
+    /// must not pick up a co-located token of the wrong scope —
+    /// `get` would return it intermittently (DashMap slot order) and
+    /// the chain would then fail `authorizes(action, …)` even though a
+    /// correctly-scoped token is present. Honors the wildcard slot
+    /// (`channel_hash = 0`) the same way [`Self::check`] does.
+    pub fn get_for_action(
+        &self,
+        subject: &EntityId,
+        action: TokenScope,
+        channel_hash: ChannelHash,
+    ) -> Option<PermissionToken> {
+        let authorizes = |t: &PermissionToken| {
+            t.is_valid_with_skew(self.clock_skew_secs).is_ok()
+                && !self.revocation.is_revoked(t)
+                && t.subject.as_bytes() == subject.as_bytes()
+                && t.authorizes(action, channel_hash)
+        };
+        if let Some(slot) = self.tokens.get(&(*subject.as_bytes(), channel_hash)) {
+            if let Some(t) = slot.value().iter().find(|t| authorizes(t)) {
+                return Some(t.clone());
+            }
+        }
+        // Wildcard fast path: skip the second probe when no wildcard
+        // token has ever been inserted (mirrors `check`).
+        if !self.wildcard_inserted.load(AtomicOrdering::Relaxed) {
+            return None;
+        }
+        if let Some(slot) = self.tokens.get(&(*subject.as_bytes(), 0)) {
+            if let Some(t) = slot.value().iter().find(|t| authorizes(t)) {
+                return Some(t.clone());
+            }
+        }
+        None
+    }
+
     /// Remove expired tokens.
     pub fn evict_expired(&self) {
         let now = current_timestamp();
@@ -2548,6 +2593,52 @@ mod tests {
             TokenChain::from_bytes(&ok),
             Err(TokenError::InvalidFormat)
         ));
+    }
+
+    /// Regression (C-1): a slot holding a SUBSCRIBE *and* a PUBLISH
+    /// token for the same (subject, channel) must hand back the token
+    /// matching the requested scope — `get` (scope-agnostic) could
+    /// return either depending on slot order, which made the publish
+    /// path intermittently deny a node that held a valid PUBLISH grant.
+    #[test]
+    fn get_for_action_selects_token_by_scope() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let channel_hash = 0x1234u64;
+        let cache = TokenCache::new();
+
+        cache.insert_unchecked(PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::SUBSCRIBE,
+            channel_hash,
+            3600,
+            0,
+        ));
+        cache.insert_unchecked(PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            channel_hash,
+            3600,
+            0,
+        ));
+
+        let pubt = cache
+            .get_for_action(subject.entity_id(), TokenScope::PUBLISH, channel_hash)
+            .expect("a PUBLISH token is cached");
+        assert!(pubt.authorizes(TokenScope::PUBLISH, channel_hash));
+
+        let sub = cache
+            .get_for_action(subject.entity_id(), TokenScope::SUBSCRIBE, channel_hash)
+            .expect("a SUBSCRIBE token is cached");
+        assert!(sub.authorizes(TokenScope::SUBSCRIBE, channel_hash));
+
+        // A scope nobody holds yields nothing rather than a wrong-scope
+        // token.
+        assert!(cache
+            .get_for_action(subject.entity_id(), TokenScope::DELEGATE, channel_hash)
+            .is_none());
     }
 
     /// Security audit H3: an unbounded TTL is rejected at issue time.

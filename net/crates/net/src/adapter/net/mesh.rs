@@ -7475,11 +7475,22 @@ impl MeshNode {
                 // they fail closed here, which is safe (publish denied).
                 // The transient empty registry/cache keeps the borrow
                 // alive when the node has no token cache configured.
+                //
+                // `get_for_action` (not `get`) selects a token that
+                // actually carries PUBLISH on this channel: a slot can
+                // hold a SUBSCRIBE token side-by-side with the PUBLISH
+                // one, and a scope-agnostic `get` would intermittently
+                // return the SUBSCRIBE token, failing the gate even
+                // though a valid PUBLISH grant is cached.
                 let transient_revocation;
                 let (revocation, skew, chain) = match self.token_cache.as_ref() {
                     Some(cache) => {
                         let chain = cache
-                            .get(&self_entity, cfg.channel_id.hash())
+                            .get_for_action(
+                                &self_entity,
+                                TokenScope::PUBLISH,
+                                cfg.channel_id.hash(),
+                            )
                             .map(TokenChain::single);
                         (cache.revocation().as_ref(), cache.clock_skew_secs(), chain)
                     }
