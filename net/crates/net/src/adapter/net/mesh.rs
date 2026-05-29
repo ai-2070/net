@@ -363,6 +363,33 @@ fn routed_rotation_outcome(
     }
 }
 
+/// A subscribe token chain retained after it cleared the root-anchored
+/// gate, plus a one-shot flag recording whether its (immutable) link
+/// signatures have already been ed25519-verified.
+///
+/// The publish fan-out re-checks every admitted subscriber's chain on
+/// every packet. Once the signatures verify the first time, subsequent
+/// re-checks take `verify_authorizes_presigned`, which skips the
+/// ed25519 work (a signature on an immutable token can't change) but
+/// still re-evaluates time bounds, revocation floors, root anchoring,
+/// and scope — all of which *can* change between publishes. So a
+/// high-fanout, deep-delegation channel stops paying N × up-to-8
+/// signature verifies per packet without weakening any live policy
+/// check.
+struct RetainedChain {
+    chain: TokenChain,
+    signatures_verified: AtomicBool,
+}
+
+impl RetainedChain {
+    fn new(chain: TokenChain) -> Self {
+        Self {
+            chain,
+            signatures_verified: AtomicBool::new(false),
+        }
+    }
+}
+
 /// Shared context for the packet dispatch loop.
 struct DispatchCtx {
     local_node_id: u64,
@@ -593,7 +620,7 @@ struct DispatchCtx {
     /// current time + revocation so an expired or revoked credential
     /// gets the subscriber evicted without the peer re-presenting.
     /// Entries are dropped on unsubscribe / roster removal.
-    subscriber_chains: Arc<DashMap<(u64, ChannelHash), TokenChain>>,
+    subscriber_chains: Arc<DashMap<(u64, ChannelHash), RetainedChain>>,
     /// Per-packet authorization fast path. `authorize_subscribe`
     /// writes on success (via `allow_channel`) so the publish
     /// fan-out can use the bloom filter + verified cache to admit
@@ -1222,7 +1249,7 @@ fn sweep_expired_subscribers(
     token_cache: Option<&Arc<TokenCache>>,
     peer_entity_ids: &DashMap<u64, EntityId>,
     channel_configs: Option<&Arc<ChannelConfigRegistry>>,
-    subscriber_chains: &DashMap<(u64, ChannelHash), TokenChain>,
+    subscriber_chains: &DashMap<(u64, ChannelHash), RetainedChain>,
 ) {
     let (Some(cache), Some(configs)) = (token_cache, channel_configs) else {
         return;
@@ -1251,9 +1278,12 @@ fn sweep_expired_subscribers(
             // subscriber. A missing stored chain (e.g. process restarted
             // and lost the in-memory map) also evicts: fail closed and
             // force a re-subscribe that re-presents.
+            // The periodic sweep is the cold authoritative re-check; it
+            // always re-verifies signatures (full `reverify_subscribe`)
+            // rather than trusting the publish path's cached flag.
             let authorized = subscriber_chains
                 .get(&(node_id, name.hash()))
-                .is_some_and(|chain| cfg.reverify_subscribe(&chain, &entity_id, revocation, skew));
+                .is_some_and(|r| cfg.reverify_subscribe(&r.chain, &entity_id, revocation, skew));
             if !authorized {
                 guard.revoke_channel(subscriber_origin_hash(node_id), name);
                 roster.remove(&channel_id, node_id);
@@ -1798,7 +1828,7 @@ pub struct MeshNode {
     /// Verified subscribe token chains, keyed by `(node_id,
     /// channel_hash)`. Shared with `MeshNode`; see the field of the
     /// same name there.
-    subscriber_chains: Arc<DashMap<(u64, ChannelHash), TokenChain>>,
+    subscriber_chains: Arc<DashMap<(u64, ChannelHash), RetainedChain>>,
     /// This node's own publish credentials, keyed by `channel_hash`.
     /// Installed via [`MeshNode::set_publish_chain`] for channels where
     /// the node's PUBLISH grant was *delegated* (owner → … → this node)
@@ -2025,7 +2055,7 @@ impl MeshNode {
         // a failed peer never sends, and the sweep can't reclaim them
         // (it only visits peers still in `peer_entity_ids`, which the
         // callback below clears).
-        let subscriber_chains: Arc<DashMap<(u64, ChannelHash), TokenChain>> =
+        let subscriber_chains: Arc<DashMap<(u64, ChannelHash), RetainedChain>> =
             Arc::new(DashMap::new());
         let subscriber_chains_failure = subscriber_chains.clone();
         let failure_detector = FailureDetector::with_config(FailureDetectorConfig {
@@ -7296,8 +7326,13 @@ impl MeshNode {
         // revocation later without the peer re-presenting. Only stored
         // for token-gated subscribes; cap-only channels have no chain.
         if let Some(chain) = presented_chain {
+            // `verify_authorizes` above just verified the signatures, but
+            // store the flag as unverified: cheap, and the first publish
+            // re-check re-establishes it without trusting cross-path
+            // state. (Marking it verified here would only save the one
+            // first-publish verification.)
             ctx.subscriber_chains
-                .insert((from_node, cfg.channel_id.hash()), chain);
+                .insert((from_node, cfg.channel_id.hash()), RetainedChain::new(chain));
         }
         (true, None)
     }
@@ -7704,13 +7739,23 @@ impl MeshNode {
                 (Some(entity), Some(cache), Some(cfg)) => self
                     .subscriber_chains
                     .get(&(*peer_id, channel_hash))
-                    .is_some_and(|chain| {
-                        cfg.reverify_subscribe(
-                            &chain,
-                            &entity,
-                            cache.revocation().as_ref(),
-                            cache.clock_skew_secs(),
-                        )
+                    .is_some_and(|r| {
+                        let revocation = cache.revocation().as_ref();
+                        let skew = cache.clock_skew_secs();
+                        // Skip the per-link ed25519 verifies once they've
+                        // verified for this immutable chain — time bounds,
+                        // revocation, anchoring, and scope are still
+                        // re-checked every packet. Avoids N × up-to-8
+                        // signature verifies per publish on a high-fanout
+                        // channel.
+                        if r.signatures_verified.load(Ordering::Relaxed) {
+                            cfg.reverify_subscribe_presigned(&r.chain, &entity, revocation, skew)
+                        } else if cfg.reverify_subscribe(&r.chain, &entity, revocation, skew) {
+                            r.signatures_verified.store(true, Ordering::Relaxed);
+                            true
+                        } else {
+                            false
+                        }
                     }),
                 // Missing entity binding, no cache, or no channel
                 // config — treat as unauthorized. The subscribe path
@@ -11820,8 +11865,9 @@ mod fold_publisher_helpers_tests {
             0,
         ));
         node.subscriber_chains
-            .insert((dead, channel_hash), chain.clone());
-        node.subscriber_chains.insert((live, channel_hash), chain);
+            .insert((dead, channel_hash), RetainedChain::new(chain.clone()));
+        node.subscriber_chains
+            .insert((live, channel_hash), RetainedChain::new(chain));
         assert_eq!(node.subscriber_chains.len(), 2);
 
         node.failure_detector.heartbeat(dead, addr);

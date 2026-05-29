@@ -334,6 +334,16 @@ impl PermissionToken {
     /// with [`Self::is_valid`].
     pub fn is_valid_with_skew(&self, skew_secs: u64) -> Result<(), TokenError> {
         self.verify()?;
+        self.check_time_bounds(skew_secs)
+    }
+
+    /// Wall-clock window check with skew, **without** signature
+    /// verification. Split out of [`Self::is_valid_with_skew`] so a
+    /// caller that has already verified this (immutable) token's
+    /// signature can re-check only the time window on a hot path —
+    /// the signature can never change, but expiry must be re-evaluated
+    /// against the current clock on every use.
+    fn check_time_bounds(&self, skew_secs: u64) -> Result<(), TokenError> {
         let now = current_timestamp();
         // Lower bound: accept tokens whose `not_before` is up to
         // `skew_secs` in our future. `saturating_sub` pins the
@@ -715,6 +725,58 @@ impl TokenChain {
         revocation: &RevocationRegistry,
         skew_secs: u64,
     ) -> Result<(), TokenError> {
+        self.verify_inner(
+            action,
+            channel_hash,
+            presenter,
+            roots,
+            revocation,
+            skew_secs,
+            true,
+        )
+    }
+
+    /// Same contract as [`Self::verify_authorizes`] but **skips the
+    /// ed25519 signature verification** on each link, trusting a prior
+    /// successful `verify_authorizes` for this exact chain. Tokens are
+    /// immutable, so a signature that verified once verifies forever —
+    /// nothing else about the link can change. Time bounds, revocation
+    /// floors, root anchoring, leaf binding, link continuity, and scope
+    /// are all still re-checked on every call, so expiry / revocation /
+    /// a roots change still reject. Used on the publish fan-out hot
+    /// path so a high-fanout channel doesn't pay N × up-to-8 ed25519
+    /// verifies per packet for chains it already verified at subscribe.
+    pub fn verify_authorizes_presigned(
+        &self,
+        action: TokenScope,
+        channel_hash: ChannelHash,
+        presenter: &EntityId,
+        roots: &[EntityId],
+        revocation: &RevocationRegistry,
+        skew_secs: u64,
+    ) -> Result<(), TokenError> {
+        self.verify_inner(
+            action,
+            channel_hash,
+            presenter,
+            roots,
+            revocation,
+            skew_secs,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_inner(
+        &self,
+        action: TokenScope,
+        channel_hash: ChannelHash,
+        presenter: &EntityId,
+        roots: &[EntityId],
+        revocation: &RevocationRegistry,
+        skew_secs: u64,
+        check_signatures: bool,
+    ) -> Result<(), TokenError> {
         let first = self.tokens.first().ok_or(TokenError::InvalidFormat)?;
         let last = self.tokens.last().ok_or(TokenError::InvalidFormat)?;
 
@@ -734,8 +796,13 @@ impl TokenChain {
         // 3 + 5. Per-link validity, revocation, and monotonic
         // authority. Done in one pass over every link.
         for t in &self.tokens {
-            // Signature + time bounds.
-            t.is_valid_with_skew(skew_secs)?;
+            // Signature (unless already verified for this immutable
+            // chain) + time bounds.
+            if check_signatures {
+                t.is_valid_with_skew(skew_secs)?;
+            } else {
+                t.check_time_bounds(skew_secs)?;
+            }
             // Revocation floor (root link catches root revocation).
             if revocation.is_revoked(t) {
                 return Err(TokenError::Revoked);
@@ -2639,6 +2706,78 @@ mod tests {
         assert!(cache
             .get_for_action(subject.entity_id(), TokenScope::DELEGATE, channel_hash)
             .is_none());
+    }
+
+    /// `verify_authorizes_presigned` skips the ed25519 verifies but must
+    /// still enforce the checks that can change after the first verify:
+    /// leaf binding, revocation, and (implicitly) time bounds. Only the
+    /// immutable signature is trusted.
+    #[test]
+    fn presigned_verify_still_enforces_policy() {
+        let owner = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let channel_hash = 0xFEEDu64;
+        let roots = [owner.entity_id().clone()];
+
+        let chain = TokenChain::single(PermissionToken::issue(
+            &owner,
+            subject.entity_id().clone(),
+            TokenScope::SUBSCRIBE,
+            channel_hash,
+            3600,
+            0,
+        ));
+
+        // Fresh registry: both full and presigned accept the presenter.
+        let rev = RevocationRegistry::new();
+        assert!(chain
+            .verify_authorizes(
+                TokenScope::SUBSCRIBE,
+                channel_hash,
+                subject.entity_id(),
+                &roots,
+                &rev,
+                0,
+            )
+            .is_ok());
+        assert!(chain
+            .verify_authorizes_presigned(
+                TokenScope::SUBSCRIBE,
+                channel_hash,
+                subject.entity_id(),
+                &roots,
+                &rev,
+                0,
+            )
+            .is_ok());
+
+        // Wrong presenter is rejected on the presigned path too.
+        let attacker = EntityKeypair::generate();
+        assert!(chain
+            .verify_authorizes_presigned(
+                TokenScope::SUBSCRIBE,
+                channel_hash,
+                attacker.entity_id(),
+                &roots,
+                &rev,
+                0,
+            )
+            .is_err());
+
+        // Revoking the issuer rejects on the presigned path too — the
+        // revocation floor is re-checked even though signatures aren't.
+        rev.revoke_below(owner.entity_id(), 1);
+        assert!(matches!(
+            chain.verify_authorizes_presigned(
+                TokenScope::SUBSCRIBE,
+                channel_hash,
+                subject.entity_id(),
+                &roots,
+                &rev,
+                0,
+            ),
+            Err(TokenError::Revoked)
+        ));
     }
 
     /// Security audit H3: an unbounded TTL is rejected at issue time.

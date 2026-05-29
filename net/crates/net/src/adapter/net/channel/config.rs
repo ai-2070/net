@@ -264,6 +264,30 @@ impl ChannelConfig {
             )
             .is_ok()
     }
+
+    /// Like [`Self::reverify_subscribe`] but skips the per-link ed25519
+    /// signature verification — for callers re-checking a chain whose
+    /// signatures already verified once (immutable tokens). Time
+    /// bounds, revocation, anchoring, and scope are still re-checked.
+    /// See [`TokenChain::verify_authorizes_presigned`].
+    pub fn reverify_subscribe_presigned(
+        &self,
+        chain: &TokenChain,
+        entity_id: &EntityId,
+        revocation: &RevocationRegistry,
+        skew_secs: u64,
+    ) -> bool {
+        chain
+            .verify_authorizes_presigned(
+                TokenScope::SUBSCRIBE,
+                self.channel_id.hash(),
+                entity_id,
+                &self.token_roots,
+                revocation,
+                skew_secs,
+            )
+            .is_ok()
+    }
 }
 
 /// Registry of channel configurations.
