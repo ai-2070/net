@@ -2166,7 +2166,7 @@ pub struct SnapshotStream {
     /// restores `Sync` (required by the pyo3/napi `#[pyclass]` wrappers)
     /// without an async lock — `poll_next` holds it only across the sync
     /// poll, never across an await.
-    pending: std::sync::Mutex<Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+    pending: parking_lot::Mutex<Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
 }
 
 impl SnapshotStream {
@@ -2174,7 +2174,7 @@ impl SnapshotStream {
         // Floor the interval so a zero-duration config doesn't
         // hot-spin the executor.
         let poll_interval = poll_interval.max(Duration::from_millis(1));
-        let pending = std::sync::Mutex::new(Box::pin(reader.changed_owned()) as _);
+        let pending = parking_lot::Mutex::new(Box::pin(reader.changed_owned()) as _);
         Self {
             reader,
             ceiling: interval(poll_interval),
@@ -2195,7 +2195,7 @@ impl Stream for SnapshotStream {
         // even when the change arm woke us. The ceiling's first tick is
         // immediate, so the initial poll emits current state.
         let changed = {
-            let mut pending = this.pending.lock().expect("snapshot pending mutex poisoned");
+            let mut pending = this.pending.lock();
             let ready = pending.as_mut().poll(cx).is_ready();
             if ready {
                 *pending = Box::pin(this.reader.changed_owned());
@@ -2227,14 +2227,14 @@ pub struct StatusSummaryStream {
     /// `Mutex` restores `Sync` over the `Send`-but-`!Sync` boxed
     /// future (the pyo3/napi `#[pyclass]` wrappers require it); the
     /// lock is held only across the sync poll, never across an await.
-    pending: std::sync::Mutex<Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+    pending: parking_lot::Mutex<Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
     last_emitted: Option<StatusSummary>,
 }
 
 impl StatusSummaryStream {
     fn new(reader: super::meshos::MeshOsSnapshotReader, poll_interval: Duration) -> Self {
         let poll_interval = poll_interval.max(Duration::from_millis(1));
-        let pending = std::sync::Mutex::new(Box::pin(reader.changed_owned()) as _);
+        let pending = parking_lot::Mutex::new(Box::pin(reader.changed_owned()) as _);
         Self {
             reader,
             ceiling: interval(poll_interval),
@@ -2257,7 +2257,7 @@ impl Stream for StatusSummaryStream {
         // event-driven wake and fall back to the ceiling.
         loop {
             let changed = {
-                let mut pending = this.pending.lock().expect("status pending mutex poisoned");
+                let mut pending = this.pending.lock();
                 let ready = pending.as_mut().poll(cx).is_ready();
                 if ready {
                     *pending = Box::pin(this.reader.changed_owned());
