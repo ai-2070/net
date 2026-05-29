@@ -19,6 +19,34 @@ use super::error::RedexError;
 /// below to leave room for concurrent appends during a retention sweep.
 pub(super) const MAX_SEGMENT_BYTES: usize = 3 * 1024 * 1024 * 1024; // 3 GB
 
+/// Backing store for a [`HeapSegment`], in one of two states.
+///
+/// The active `Mut` state is the append hot path: `extend_from_slice`
+/// straight into a `BytesMut`, no per-append round-trip. A `read`
+/// transitions to `Frozen` (one `freeze`) so it can hand out zero-copy
+/// `Bytes` slices; the next `append` transitions back to `Mut` via
+/// `try_into_mut` (O(1) when no reader holds an outstanding slice; a
+/// single copy when one does). An append-only burst therefore never
+/// freezes — see the type docs for why this matters.
+#[derive(Debug)]
+enum Buf {
+    /// Appendable. No outstanding zero-copy reader slice can reference
+    /// this allocation (reads transition to `Frozen` first).
+    Mut(BytesMut),
+    /// Immutable snapshot. `read` slices this with a refcount bump.
+    Frozen(Bytes),
+}
+
+impl Buf {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Buf::Mut(m) => m.len(),
+            Buf::Frozen(b) => b.len(),
+        }
+    }
+}
+
 /// In-memory payload segment.
 ///
 /// Append-only from the caller's perspective. The retention sweep may
@@ -26,25 +54,26 @@ pub(super) const MAX_SEGMENT_BYTES: usize = 3 * 1024 * 1024 * 1024; // 3 GB
 /// all live offsets stored in `RedexEntry` records are absolute over
 /// the logical seq-space and translated through `base_offset` on read.
 ///
-/// The buffer is held as a [`Bytes`] so `read` returns zero-copy
-/// `Bytes::slice` snapshots — refcount bumps only. Pre-fix
-/// [perf #51 in `docs/performance/net-perf-analysis.md`] `read`
-/// did a full `Bytes::copy_from_slice` on every call, costing one
-/// memcpy per materialized event on every `tail` / `read_range` /
-/// `read_one` / replication ship / watcher delivery path. For a
-/// 4KB-payload watcher at 100K ev/s that was 400 MB/s of pure
-/// memory bandwidth wasted on the copy.
+/// `read` returns zero-copy `Bytes::slice` snapshots — refcount bumps
+/// only (perf #51). Pre-#51 `read` did a full `Bytes::copy_from_slice`
+/// on every call, ~400 MB/s of wasted memcpy for a 4 KB watcher at
+/// 100K ev/s.
 ///
-/// Appends use [`Bytes::try_into_mut`] to extend in place when the
-/// segment is the sole owner (the common case — readers consume
-/// returned `Bytes` slices and drop them quickly). When outstanding
-/// reader slices exist, `try_into_mut` falls back to a single
-/// `BytesMut` allocation; existing slices keep their portion of
-/// the old `Bytes` alive via refcount and stay valid.
+/// The buffer is held in two states ([`Buf`]) so the zero-copy read
+/// win doesn't tax the write hot path. The first cut of #51 held the
+/// buffer as a single `Bytes` and round-tripped
+/// `try_into_mut` + `freeze` on **every** append — a constant
+/// per-append cost (atomic refcount churn + `Shared` init) that
+/// regressed `cortex_ingest/tasks_create` ~1.5× (125 ns → 190 ns).
+/// Now appends extend an active `BytesMut` directly and only `freeze`
+/// lazily when a `read` actually needs a snapshot, so an append-only
+/// burst pays zero freezes while reads stay zero-copy. Outstanding
+/// reader slices keep their portion of the old allocation alive via
+/// refcount and stay valid across the next append's transition.
 #[derive(Debug)]
 pub struct HeapSegment {
-    buf: Bytes,
-    /// The absolute offset of the first byte currently in `buf`.
+    buf: Buf,
+    /// The absolute offset of the first byte currently in the buffer.
     /// Starts at 0 and increases as eviction compacts the head.
     base_offset: u64,
 }
@@ -53,66 +82,91 @@ impl HeapSegment {
     /// Create an empty segment.
     pub fn new() -> Self {
         Self {
-            buf: Bytes::new(),
+            buf: Buf::Mut(BytesMut::new()),
             base_offset: 0,
         }
     }
 
     /// Create an empty segment with `capacity` bytes reserved.
     pub fn with_capacity(capacity: usize) -> Self {
-        // BytesMut::with_capacity reserves; freezing immediately
-        // yields a Bytes whose capacity hint is carried into the
-        // first `try_into_mut` round-trip.
         Self {
-            buf: BytesMut::with_capacity(capacity).freeze(),
+            buf: Buf::Mut(BytesMut::with_capacity(capacity)),
             base_offset: 0,
         }
     }
 
     /// Build a segment from pre-existing payload bytes (e.g. replayed
     /// from disk). The bytes become the live region starting at
-    /// absolute offset 0.
+    /// absolute offset 0. Kept appendable (`Mut`) so the first append
+    /// after recovery is a plain extend.
     #[cfg(feature = "redex-disk")]
     pub(super) fn from_existing(buf: Vec<u8>) -> Self {
         Self {
-            buf: Bytes::from(buf),
+            buf: Buf::Mut(BytesMut::from(&buf[..])),
             base_offset: 0,
         }
     }
 
-    /// Acquire the underlying buffer as a mutable [`BytesMut`].
+    /// Ensure the buffer is in the `Mut` state and return it for
+    /// appending.
     ///
-    /// Fast path: when no reader holds a `Bytes` slice into the
-    /// current buf, [`Bytes::try_into_mut`] returns the same
-    /// allocation as a `BytesMut` in O(1). Slow path: an outstanding
-    /// reader (typical only briefly during watcher delivery) forces
-    /// a single `BytesMut::extend_from_slice` copy of the live
-    /// region — the next `freeze` yields a fresh `Bytes` and the
-    /// reader's stale snapshot stays valid via its own refcount.
-    fn take_mut_or_copy(&mut self, additional: usize) -> BytesMut {
-        match std::mem::take(&mut self.buf).try_into_mut() {
-            Ok(m) => m,
-            Err(bytes) => {
-                let mut m = BytesMut::with_capacity(bytes.len() + additional);
-                m.extend_from_slice(&bytes);
-                m
-            }
+    /// No-op when already `Mut` (the append-burst common case — pure
+    /// `extend_from_slice`, no round-trip). When `Frozen`, reclaims the
+    /// allocation via [`Bytes::try_into_mut`] (O(1) if no reader holds
+    /// an outstanding slice) or, when a reader still does, copies the
+    /// live region once into a fresh `BytesMut` — that reader's slice
+    /// keeps the old allocation alive via its own refcount.
+    fn ensure_mut(&mut self) -> &mut BytesMut {
+        if let Buf::Frozen(_) = self.buf {
+            let Buf::Frozen(bytes) = std::mem::replace(&mut self.buf, Buf::Mut(BytesMut::new()))
+            else {
+                unreachable!("just matched Frozen")
+            };
+            let m = match bytes.try_into_mut() {
+                Ok(m) => m,
+                Err(bytes) => {
+                    let mut m = BytesMut::with_capacity(bytes.len());
+                    m.extend_from_slice(&bytes);
+                    m
+                }
+            };
+            self.buf = Buf::Mut(m);
+        }
+        match &mut self.buf {
+            Buf::Mut(m) => m,
+            Buf::Frozen(_) => unreachable!("converted to Mut above"),
+        }
+    }
+
+    /// Ensure the buffer is in the `Frozen` state and return the
+    /// snapshot for zero-copy slicing. Freezes once on the
+    /// `Mut`→`Frozen` transition; subsequent reads with no intervening
+    /// append are pure refcount bumps.
+    fn ensure_frozen(&mut self) -> &Bytes {
+        if let Buf::Mut(_) = self.buf {
+            let Buf::Mut(m) = std::mem::replace(&mut self.buf, Buf::Frozen(Bytes::new())) else {
+                unreachable!("just matched Mut")
+            };
+            self.buf = Buf::Frozen(m.freeze());
+        }
+        match &self.buf {
+            Buf::Frozen(b) => b,
+            Buf::Mut(_) => unreachable!("converted to Frozen above"),
         }
     }
 
     /// Append `payload` and return the absolute offset it was written
     /// at (offset in the logical seq-space, not in the backing buffer).
     pub fn append(&mut self, payload: &[u8]) -> Result<u64, RedexError> {
-        if self.buf.len().saturating_add(payload.len()) > MAX_SEGMENT_BYTES {
+        let live = self.buf.len();
+        if live.saturating_add(payload.len()) > MAX_SEGMENT_BYTES {
             return Err(RedexError::PayloadTooLarge {
                 size: payload.len(),
-                max: MAX_SEGMENT_BYTES.saturating_sub(self.buf.len()),
+                max: MAX_SEGMENT_BYTES.saturating_sub(live),
             });
         }
-        let offset = self.base_offset + self.buf.len() as u64;
-        let mut m = self.take_mut_or_copy(payload.len());
-        m.extend_from_slice(payload);
-        self.buf = m.freeze();
+        let offset = self.base_offset + live as u64;
+        self.ensure_mut().extend_from_slice(payload);
         Ok(offset)
     }
 
@@ -126,19 +180,19 @@ impl HeapSegment {
     /// when the buffer needs to grow.
     pub fn append_many(&mut self, payloads: &[Bytes]) -> Result<u64, RedexError> {
         let total: usize = payloads.iter().map(|p| p.len()).sum();
-        if self.buf.len().saturating_add(total) > MAX_SEGMENT_BYTES {
+        let live = self.buf.len();
+        if live.saturating_add(total) > MAX_SEGMENT_BYTES {
             return Err(RedexError::PayloadTooLarge {
                 size: total,
-                max: MAX_SEGMENT_BYTES.saturating_sub(self.buf.len()),
+                max: MAX_SEGMENT_BYTES.saturating_sub(live),
             });
         }
-        let first = self.base_offset + self.buf.len() as u64;
-        let mut m = self.take_mut_or_copy(total);
+        let first = self.base_offset + live as u64;
+        let m = self.ensure_mut();
         m.reserve(total);
         for p in payloads {
             m.extend_from_slice(p);
         }
-        self.buf = m.freeze();
         Ok(first)
     }
 
@@ -148,7 +202,10 @@ impl HeapSegment {
     ///
     /// Zero-copy: returns a [`Bytes`] slice that shares the
     /// underlying allocation with the segment (refcount bump only).
-    pub fn read(&self, offset: u64, len: u32) -> Option<Bytes> {
+    /// Takes `&mut self` because the first read after an append
+    /// freezes the active buffer once; callers already hold the
+    /// `RedexFile` state lock exclusively, so this adds no contention.
+    pub fn read(&mut self, offset: u64, len: u32) -> Option<Bytes> {
         let len = len as usize;
         if offset < self.base_offset {
             return None;
@@ -158,7 +215,7 @@ impl HeapSegment {
         if end > self.buf.len() {
             return None;
         }
-        Some(self.buf.slice(rel..end))
+        Some(self.ensure_frozen().slice(rel..end))
     }
 
     /// Number of live bytes currently in the segment.
@@ -202,44 +259,59 @@ impl HeapSegment {
     /// Used by checksum-on-read regression tests to simulate
     /// on-disk corruption without going through a real I/O path.
     ///
-    /// Takes a closure rather than returning `&mut [u8]` because
-    /// the new `Bytes`-backed buffer needs a `try_into_mut` /
-    /// `freeze` round-trip to give the test a mutable view, and a
-    /// returned `&mut [u8]` would dangle past the temporary
-    /// `BytesMut`. The closure scopes the borrow correctly.
+    /// Takes a closure rather than returning `&mut [u8]` because the
+    /// mutable view borrows the active `BytesMut` for the closure's
+    /// scope; a returned `&mut [u8]` would outlive a subsequent
+    /// state transition.
     #[cfg(test)]
     pub(super) fn with_bytes_for_test_mut<F>(&mut self, f: F)
     where
         F: FnOnce(&mut [u8]),
     {
-        let mut m = self.take_mut_or_copy(0);
-        f(&mut m);
-        self.buf = m.freeze();
+        let m = self.ensure_mut();
+        f(&mut m[..]);
+    }
+
+    /// Test-only: data pointer of the current live buffer, for the
+    /// zero-copy read pins. `BytesMut::freeze` (the `Mut`→`Frozen`
+    /// transition) converts in place without moving the allocation,
+    /// so a pointer captured while `Mut` equals the `Frozen` slice
+    /// pointer a subsequent `read` returns — letting the pins prove
+    /// `read` is zero-copy across the freeze.
+    #[cfg(test)]
+    pub(super) fn buf_data_ptr(&self) -> *const u8 {
+        match &self.buf {
+            Buf::Mut(m) => m.as_ptr(),
+            Buf::Frozen(b) => b.as_ptr(),
+        }
     }
 
     /// Evict the prefix of the segment strictly below `new_base` in
     /// the absolute offset space.
     ///
-    /// Returns the number of bytes evicted. The retained tail
-    /// becomes a fresh `Bytes` slice — refcount bump only.
-    /// Existing reader slices into the evicted prefix stay valid
-    /// via their own refcounts to the prior allocation.
+    /// Returns the number of bytes evicted. The retained tail is
+    /// copied into a fresh appendable `BytesMut` so subsequent appends
+    /// stay on the zero-round-trip fast path; any existing reader
+    /// slices into the evicted prefix stay valid via their own
+    /// refcounts to the prior allocation.
     pub fn evict_prefix_to(&mut self, new_base: u64) -> u64 {
         if new_base <= self.base_offset {
             return 0;
         }
+        let live = self.buf.len();
         let delta = (new_base - self.base_offset) as usize;
-        let delta = delta.min(self.buf.len());
-        // `Bytes::slice` is zero-copy; the old buf is dropped as
-        // soon as the last outstanding reader releases its slice.
-        // Materialize the tail into a fresh BytesMut so subsequent
-        // appends can `try_into_mut` cheaply — otherwise the
-        // sub-Bytes returned by `slice` still references the
-        // original allocation and `try_into_mut` would have to
-        // copy on every append.
-        let mut m = BytesMut::with_capacity(self.buf.len() - delta);
-        m.extend_from_slice(&self.buf[delta..]);
-        self.buf = m.freeze();
+        let delta = delta.min(live);
+        // Copy the retained tail into a fresh `BytesMut` and keep the
+        // segment appendable. Storing the tail as `Mut` (rather than a
+        // zero-copy `slice` of the old allocation) means the next
+        // append is a plain extend instead of a `try_into_mut` that
+        // would have to copy off the still-referenced prior buffer.
+        let mut m = BytesMut::with_capacity(live - delta);
+        match &self.buf {
+            Buf::Mut(b) => m.extend_from_slice(&b[delta..]),
+            Buf::Frozen(b) => m.extend_from_slice(&b[delta..]),
+        }
+        self.buf = Buf::Mut(m);
         self.base_offset += delta as u64;
         delta as u64
     }
@@ -380,7 +452,7 @@ mod tests {
         let mut seg = HeapSegment::new();
         let payload = b"the quick brown fox jumps over the lazy dog";
         seg.append(payload).unwrap();
-        let buf_ptr = seg.buf.as_ptr();
+        let buf_ptr = seg.buf_data_ptr();
 
         let slice = seg.read(0, payload.len() as u32).unwrap();
         // Full-range read returns a Bytes whose data pointer
@@ -439,7 +511,7 @@ mod tests {
         let mut seg = HeapSegment::new();
         let payload = b"the quick brown fox jumps over the lazy dog";
         seg.append(payload).unwrap();
-        let buf_ptr = seg.buf.as_ptr();
+        let buf_ptr = seg.buf_data_ptr();
 
         // Simulate the regression: a fresh allocation carrying
         // the same five bytes the zero-copy `read(4, 5)` would

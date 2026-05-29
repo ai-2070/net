@@ -1034,8 +1034,14 @@ impl RedexFile {
         // appends. The pre-flight above guarantees we won't hit the
         // `Full` path here — defensively handle it anyway in case a
         // payload evicts between the count and the materialize.
-        for entry in state.index[start..].iter() {
-            let event = match materialize(entry, &state.segment) {
+        //
+        // Copy the backfill entries (`RedexEntry: Copy`, 20 B each,
+        // bounded by `buffer`) out of the index so `materialize` can
+        // take `&mut state.segment` without aliasing the `index`
+        // borrow through the `MutexGuard` deref.
+        let backfill: Vec<RedexEntry> = state.index[start..].to_vec();
+        for entry in &backfill {
+            let event = match materialize(entry, &mut state.segment) {
                 Some(e) => e,
                 None => continue, // payload evicted between index retain and read
             };
@@ -1077,12 +1083,17 @@ impl RedexFile {
         if end <= start {
             return Vec::new();
         }
-        let state = self.inner.state.lock();
+        let mut state = self.inner.state.lock();
         let lo = state.index.partition_point(|e| e.seq < start);
         let hi = state.index.partition_point(|e| e.seq < end);
-        let mut out = Vec::with_capacity(hi.saturating_sub(lo));
-        for entry in &state.index[lo..hi] {
-            if let Some(ev) = materialize(entry, &state.segment) {
+        // Copy the in-range entries out first (`RedexEntry: Copy`) so
+        // `materialize` can take `&mut state.segment` without aliasing
+        // the `index` borrow through the `MutexGuard` deref. The
+        // payload itself stays zero-copy via `segment.read`.
+        let entries: Vec<RedexEntry> = state.index[lo..hi].to_vec();
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            if let Some(ev) = materialize(entry, &mut state.segment) {
                 out.push(ev);
             }
         }
@@ -1098,11 +1109,13 @@ impl RedexFile {
     /// O(N), scanning the entire index even for trivially-absent
     /// seqs (perf #52).
     pub fn read_one(&self, seq: u64) -> Option<RedexEvent> {
-        let state = self.inner.state.lock();
+        let mut state = self.inner.state.lock();
         let lo = state.index.partition_point(|e| e.seq < seq);
-        let entry = state.index.get(lo)?;
+        // Copy the entry out (`RedexEntry: Copy`) so `materialize` can
+        // borrow `&mut state.segment` without aliasing `index`.
+        let entry = *state.index.get(lo)?;
         if entry.seq == seq {
-            materialize(entry, &state.segment)
+            materialize(&entry, &mut state.segment)
         } else {
             None
         }
@@ -1520,7 +1533,7 @@ impl std::fmt::Debug for RedexFile {
 /// downstream consumer. We surface a checksum mismatch by
 /// returning `None` (same channel `materialize` already uses for
 /// "couldn't construct an event" signals).
-fn materialize(entry: &RedexEntry, segment: &HeapSegment) -> Option<RedexEvent> {
+fn materialize(entry: &RedexEntry, segment: &mut HeapSegment) -> Option<RedexEvent> {
     let payload = if entry.is_inline() {
         Bytes::copy_from_slice(&entry.inline_payload()?)
     } else {
