@@ -293,7 +293,9 @@ follow-ups:
   `cRPCStreamDone` constant.
 
 **E-10 — change-gate `publish_snapshot` + missed-wakeup-safe signal.** ✅ DONE
-(2026-05-29, post-review). A naive snapshot-equality gate is useless here: the
+(2026-05-29, post-review). Full design record (incl. the not-taken
+client-side-time-projection route): `MESHOS_SNAPSHOT_CHANGE_GATING_PLAN.md`. A
+naive snapshot-equality gate is useless here: the
 snapshot's time-projected fields (`age_ms`, `freeze_remaining_ms`, `until_ms`,
 migration `elapsed_ms`) are `last_tick - event_time`, so they advance every tick
 whenever the underlying state is active. As built:
