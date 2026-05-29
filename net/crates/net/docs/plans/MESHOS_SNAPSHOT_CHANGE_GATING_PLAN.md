@@ -61,10 +61,22 @@ content changed.
   `now = last_tick` (unchanged behavior).
 - Each publish, the loop builds a **structural view** via `from_state_at(structural_ref, ..)`
   where `structural_ref` is a fixed instant captured at loop construction. Because
-  both the reference and every event time are constant, each relative-time delta is
-  a constant — so the structural view is invariant to tick progression, and differs
-  only on a genuine structural change (daemon set, lifecycle, replica holders,
-  freeze active/inactive, emitted actions, audit/log rings, …).
+  both the reference and every event time are fixed, every relative-time field is a
+  *constant* across ticks — so the structural view is invariant to tick progression,
+  and differs only on a genuine structural change (daemon set, lifecycle, replica
+  holders, freeze active/inactive, emitted actions, audit/log rings, …).
+  - **The reference is one-sided, by construction.** It is captured at startup, so
+    it *precedes* every event the loop later records. That makes the projection
+    asymmetric — and the asymmetry is what we want:
+    - *Past*-relative fields (`age_ms`, peer/maintenance `since_ms`,
+      `recently_emitted[].age_ms`) project to `now - event` with `now` before the
+      event, so they **saturate to 0** and drop out of the comparison entirely.
+      Uptime/age is cosmetic; erasing it is the point.
+    - *Future*-relative fields (`freeze_remaining_ms`, backoff/crashloop `until_ms`,
+      maintenance `deadline_remaining_ms`, avoid-list TTLs) project to
+      `event - now` with the event after `now`, so they stay **positive constants**
+      that encode the absolute deadline. A real change to a freeze/backoff/deadline
+      window therefore *does* move the view and signal.
 - `publish_snapshot` stores the real snapshot every tick, then bumps the
   change-generation **only if** the structural view differs from the last one
   (`last_published_structural`).
@@ -82,6 +94,28 @@ as time-relative — and we don't normalize fields explicitly; the fixed-referen
 rebuild does it uniformly. (Active-migration `elapsed_ms` is pre-computed outside
 `from_state`, so it is NOT cancelled — an in-flight migration over-signals every
 tick. Acceptable: you're genuinely busy.)
+
+**The one under-signal (intended).** Because past-relative fields saturate to 0
+(§3 Mechanism), a change that manifests *only* as a past event-time shift — e.g. a
+daemon's `last_started` moving while `lifecycle` stays `Running` (an "uptime
+reset") — does not move the structural view and is not signalled. This is the
+deliberate trade: age is cosmetic. A real restart also flips `lifecycle`
+(`Running`→`Stopped`/`Starting`→`Running`), and each of those transitions does
+signal; the only gap is a restart so fast both publishes observe `Running`, and
+even then a ceiling re-read still surfaces the corrected uptime. Pinned by
+`structural_view_collapses_age_but_preserves_freeze_window` (see Tests).
+
+**Why deep-eq, not something cheaper.** Two alternatives were considered and
+rejected on purpose:
+- *Hashing the structural view* is impossible — `MeshOsSnapshot` carries `f32`/
+  `f64` fields (`saturation`, `cpu_load_1m`, …), so it can't derive `Hash`/`Eq`,
+  only `PartialEq`.
+- *A reconcile-bumped "dirty" generation* that skips the build+compare on untouched
+  ticks would be one missed mutation site away from a **silent under-signal**, and
+  some structural transitions are time-triggered with no inbound event (an expiring
+  freeze clears `freeze_until` inside `gc_freeze`), which a naive "only on inbound
+  events" flag would miss outright. The deep-eq's sole failure mode is the safe one
+  (over-signal), so its robustness is worth one rebuild per tick.
 
 ### What it delivers / doesn't
 
@@ -102,11 +136,22 @@ tick. Acceptable: you're genuinely busy.)
 - `from_state_at` refactor + invariance test.
 - `publish_snapshot` gate + `Notify`→`watch<u64>` + deck `watch`/`SnapshotStream`/
   `StatusSummaryStream` consumers + the quiet-on-idle/fires-on-change runtime test.
+- Post-review follow-ups (2026-05-29): corrected the `from_state_at` doc to state
+  the one-sided projection accurately + added the age-collapse/freeze-preserve
+  test; recorded the deep-eq rationale in `publish_snapshot`; noted the
+  first-`changed()` semantics on `subscribe_changes`; marked the E-8/E-9
+  `changed()`/`changed_owned()` references in the parent plan as superseded.
 
 ### Tests
 
 - `snapshot.rs::from_state_at_fixed_reference_cancels_per_tick_progression` — the
-  fixed-ref view is invariant to `last_tick` yet moves on a lifecycle change.
+  fixed-ref view is invariant to `last_tick` yet moves on a lifecycle change. Note:
+  this test places the event *before* the reference, so it exercises the
+  positive-constant-delta path, not the saturate-to-0 path the loop actually hits.
+- `snapshot.rs::structural_view_collapses_age_but_preserves_freeze_window` — the
+  production ordering (reference *before* events): an age-only "uptime reset" must
+  NOT move the structural view, while committing/extending a freeze window must.
+  Pins both halves of the §3 asymmetry.
 - `deck.rs::change_signal_stays_quiet_on_idle_ticks_and_fires_on_structural_change`
   — end-to-end: generation quiet across idle ticks *and* a freeze countdown, fires
   promptly on a freeze commit.
