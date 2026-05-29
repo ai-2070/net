@@ -1,6 +1,6 @@
 # Polling → Event-Driven SDK Migration Plan
 
-Status: implemented (E-1..E-9; E-10 deferred)
+Status: implemented (E-1..E-10)
 Owner: TBD
 Related: `CAPABILITY_BROADCAST_PLAN.md`, `NRPC_V3_OBSERVER_MPSC_AND_CANCELLATION.md`,
 `AI_TOOL_INTEGRATION_PLAN.md`
@@ -292,14 +292,33 @@ follow-ups:
 - **Named FFI code.** The Go watch loop's bare `-6` (STREAM_DONE) is now a named
   `cRPCStreamDone` constant.
 
-**Deferred (E-10).** Change-gate `publish_snapshot` (only `store` + notify when the
-new snapshot differs, via a reconcile-bumped generation counter) to eliminate
-tick-rate wakeups on an idle MeshOS loop. Out of scope for the deck-watch
-migration; a separate optimization to the loop itself. The deck `SnapshotStream` /
-`StatusSummaryStream` "best-effort per edge" property (a publish landing between a
-`Ready` return and the next re-armed `changed()` poll is coalesced, bounded by the
-ceiling) is a consequence of the `Notify` design and is resolved by the same E-10
-generation-counter work — left as-is until then.
+**E-10 — change-gate `publish_snapshot` + missed-wakeup-safe signal.** ✅ DONE
+(2026-05-29, post-review). A naive snapshot-equality gate is useless here: the
+snapshot's time-projected fields (`age_ms`, `freeze_remaining_ms`, `until_ms`,
+migration `elapsed_ms`) are `last_tick - event_time`, so they advance every tick
+whenever the underlying state is active. As built:
+- `MeshOsSnapshot::from_state_at(now, ..)` was extracted so the loop can build a
+  **structural view** against a FIXED reference instant; because both the
+  reference and each event time are constant, the relative-time deltas project to
+  constants and cancel across ticks, leaving only genuine structural diffs.
+- `publish_snapshot` still **stores** a fresh snapshot every tick (live
+  age/countdown preserved for ceiling re-reads — no frozen fields, no broken
+  time-based predicates), but bumps the change-generation only when the structural
+  view differs. Failure direction is safe: a forgotten normalization over-signals,
+  never misses an edge. (Active-migration `elapsed_ms` isn't normalized — it's
+  pre-computed — so an in-flight migration over-signals per tick, acceptable.)
+- The signal moved from `Notify` to `watch::Sender<u64>`. A consumer holding one
+  receiver across awaits is now missed-wakeup-safe, so a long `snapshot_poll_interval`
+  is safe to use for idle-quiet — which also **closes the deck-stream
+  best-effort-per-edge gap (concern #3)**: the deck `watch` loop subscribes once,
+  and the two `Stream` impls hold a shared receiver and re-arm from it.
+
+  **Boundary.** This delivers a real "changed-only" signal + a *safe* idle-quiet
+  path (operators set a long ceiling). It does NOT change default behavior: with
+  the default 100 ms ceiling the deck streams still tick (correctly — that's what
+  keeps live counters live). Fully automatic idle-quiet *with* smoothly-ticking
+  counters would need moving time projection client-side (an absolute-timestamp
+  snapshot schema change) — out of scope, a separate effort.
 
 **Validation note.** The dev box has no C toolchain, so Go cgo link is
 CI-validated; the Rust sides of all bindings compile locally with `--features
