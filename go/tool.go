@@ -1020,6 +1020,13 @@ type ToolListChange struct {
 	PrevNodeCount uint32         `json:"prev_node_count,omitempty"`
 }
 
+// cRPCStreamDone is the rpc-ffi return code (NET_RPC_ERR_STREAM_DONE)
+// signalling a streaming surface produced its last item — a clean end
+// or a cancel. The substrate codes are not otherwise enumerated in Go
+// (mesh_rpc.go uses the bare literal with a comment); named here for
+// the watch loop's switch below.
+const cRPCStreamDone = -6
+
 // WatchOptions configures WatchTools.
 type WatchOptions struct {
 	// Interval is the debounce ceiling for the substrate watch.
@@ -1128,7 +1135,7 @@ func WatchTools(
 					return
 				case changeCh <- change:
 				}
-			case rc == -6: // NET_RPC_ERR_STREAM_DONE — clean end / cancelled
+			case rc == cRPCStreamDone: // clean end / cancelled
 				return
 			default:
 				select {
