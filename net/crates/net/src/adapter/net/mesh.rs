@@ -2232,6 +2232,14 @@ impl MeshNode {
         self.token_cache.as_ref()
     }
 
+    /// Number of retained subscribe token chains. A verified chain is
+    /// stored here only after a subscribe passes the root-anchored
+    /// gate; the sweep and publish re-check consult it. Exposed for
+    /// tests that assert a rejected subscribe retains nothing.
+    pub fn subscriber_chain_count(&self) -> usize {
+        self.subscriber_chains.len()
+    }
+
     /// Get this node's ed25519 entity id (derived from the
     /// keypair handed to `MeshNode::new`). 32 bytes. Used by
     /// `CapabilityAnnouncement` + channel-auth path.
