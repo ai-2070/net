@@ -137,73 +137,103 @@ plan only removes the *interval timer*; it does not add a new network surface.
 
 ## 5. Slices
 
-- **E-1 — substrate fold-change notify.** Add the notify + `bump_capability_version`
-  helper, wire both mutation sites. Pure addition; no behavior change yet.
-  Unit test: announce a tool → notify fires; withdraw → fires.
-- **E-2 — `watch_tools` push loop.** Swap the interval loop for the
-  notified-await loop; keep `Some(interval)` as the debounce-ceiling fallback.
-  Regression: existing `watch_tools` integration test must pass unchanged
-  (it asserts Added/Removed/NodeCountChanged ordering, not timing). Add a test
-  asserting change latency ≪ interval (e.g. emit within 50 ms with a 5 s
-  "interval").
-- **E-3 — collapse Go `WatchTools`** onto the substrate stream. Drop
-  `time.NewTicker` + `diffToolIndex`; consume the substrate-emitted
-  `ToolListChange` via the existing streaming FFI surface
-  (`net_rpc_serve_streaming` / the watch FFI if one exists, else add a
-  `net_*_watch_tools` streaming export). Keep `WatchOptions.Interval` as the
-  debounce ceiling for signature stability.
-- **E-4 — collapse Python `watch_tools`** likewise (async-gen wrapping the
-  substrate stream instead of `asyncio.sleep`).
-- **E-5 — collapse Node `watchTools`** likewise (async-iter over the napi stream
-  instead of `setTimeout`).
-- **E-6 — Rust SDK `Mesh::watch_tools`** — expose the substrate watch as a public
-  SDK method returning the `ToolListWatch` stream directly (no re-poll).
+All implementation slices landed (2026-05-29). Status + as-built notes per
+slice; divergences from the original sketch are flagged. See §8 for the
+consolidated outcome.
+
+- **E-1 — substrate fold-change notify.** ✅ DONE. As-built diverged from the
+  "two mutation sites + `bump_capability_version`" sketch: the change signal is a
+  `watch::Sender<u64>` *inside the `Fold`* (`behavior/fold/mod.rs`), fired by a
+  private `signal_changed()` from every real mutation path — `apply`
+  (Inserted/Replaced), `evict_node`, `restore`, and `sweep_expired` (the expiry
+  task holds a `Weak` clone, `expiry.rs`). Consumers subscribe via
+  `Fold::subscribe_changes() -> watch::Receiver<u64>`. `watch<u64>` over `Notify`
+  because the generation counter is missed-wakeup-safe. The local self-index runs
+  through `capability_fold.apply`, so it fires the signal too — no separate mesh
+  site needed. Unit test: `subscribe_changes_fires_on_real_mutations_only`.
+- **E-2 — `watch_tools` push loop.** ✅ DONE. `MeshNode::watch_tools` subscribes
+  `subscribe_changes()` *before* the baseline snapshot, then loops over a
+  `tokio::select!` of `change_rx.changed()`, an `Option<Interval>` ceiling arm
+  (`None => pending()`), and `tx.closed()`. `interval` is now a debounce ceiling,
+  not a cadence. Latency test
+  (`watch_tools_delivers_change_well_under_the_debounce_ceiling`) proves sub-ceiling
+  delivery with a 30 s ceiling.
+- **E-2b — cancelable `watch_tools`** (extra slice not in the original sketch).
+  A parked FFI/iterator `next()` *owns* the receiver, so dropping it can't
+  interrupt a blocked recv. Added a `cancel: Arc<Notify>` to `ToolListWatch` +
+  `cancel()` / `cancel_handle()`; the substrate loop gained a
+  `cancel.notified() => return` arm so firing it exits the task → drops the sender
+  → unblocks the parked recv with `None`. Substrate + the Go FFI both use it.
+- **E-3 — Go `WatchTools`.** ✅ DONE. Added a dedicated `net_rpc_watch_tools*` FFI
+  surface (`ToolWatchHandleC` + `_next`/`_close`/`_free`, all `#[cfg(feature =
+  "tool")]`) — the serve-streaming surface didn't fit. `go/tool.go` drops
+  `time.NewTicker` + `diffToolIndex` and consumes it via a two-goroutine
+  closer/freer + watcher model (coordinated by a `watcherDone` channel) so `_free`
+  happens exactly once and ctx-cancel unblocks a parked `_next`. `WatchOptions.Interval`
+  kept as the debounce ceiling (`0` = pure event-driven). Go cgo can't compile on
+  the dev box (no C toolchain); rpc-ffi compiles with `--features tool` and the
+  extern signatures are cross-checked against the Rust exports — link is
+  CI-validated.
+- **E-4 — Python `watch_tools`.** ✅ DONE. pyo3 `AsyncToolWatchIter` (PEP 525)
+  wraps the substrate stream; `NetMesh.watch_tools(interval_ms)` enters the shared
+  tokio runtime to spawn the diff task. `net.tool.watch_tools` async-fors over it,
+  parsing each JSON `ToolListChange` (substrate **snake_case** serde shape) into its
+  dataclass. `interval=None` is pure event-driven. Fake-mesh + live single-node
+  tests pass.
+- **E-5 — Node `watchTools`.** ✅ DONE. napi `ToolWatchIter` (`async next()` /
+  `close()`); `async NetMesh.watchTools(intervalMs)` spawns the diff task on the
+  napi runtime. The TS wrapper async-fors over it. **Divergence:** the Node wire
+  JSON is emitted **camelCase** (matching `ToolDescriptorJs` / `listTools`), unlike
+  Python/Go which consume the substrate snake_case shape. `close()` eagerly drops
+  the stream so an active watch doesn't keep the node un-shutdownable. Fake-iter +
+  live single-node tests pass.
+- **E-6 — Rust SDK `Mesh::watch_tools`.** ✅ DONE. The method already delegated
+  straight to the substrate watch (no re-poll); updated the stale doc (interval is
+  a ceiling, `None` is pure event-driven, `cancel`/drop ends the stream) and added a
+  single-node SDK test (sub-ceiling delivery + prompt cancel).
 - **E-7 — audit the "to verify" surfaces** — ✅ DONE (2026-05-29, see §2). Memory/
   task watchers + redex tail are already push; only deck polls. No binding work
   for memory/task/redex.
-- **E-8 — MeshOS snapshot publish notify.** The snapshot lives in an
-  `Arc<ArcSwap<MeshOsSnapshot>>` (`meshos/event_loop.rs:73`), read lock-free via
-  `MeshOsSnapshotReader::read`/`load` (`:359`). **Single write site**:
-  `publish_snapshot()` ends in `self.snapshot.store(Arc::new(snap))`
-  (`event_loop.rs:1590`). Pair the `ArcSwap` with an `Arc<Notify>` (keep ArcSwap
-  for the lock-free read fast-path — don't swap it for `watch`, which would take a
-  read-lock per read; the comment at `:1988` explains why ArcSwap was chosen). Fire
-  `notify_waiters()` right after the store; `MeshOsSnapshotReader` carries a clone
-  and gains `async fn changed(&self)`. Pure addition; no behavior change.
+- **E-8 — MeshOS snapshot publish notify.** ✅ DONE. Paired the
+  `Arc<ArcSwap<MeshOsSnapshot>>` with an `Arc<Notify>` (ArcSwap kept for the
+  lock-free read fast-path); `publish_snapshot()` fires `notify_waiters()` right
+  after the store. `MeshOsSnapshotReader` carries a clone and gained `async fn
+  changed(&self)` plus `changed_owned()` — a `'static` future for driving a
+  `Stream`'s sync `poll_next` where there's no `self` to borrow across polls.
 
-  **Caveat — `publish_snapshot()` fires every Tick, not only on change**
-  (`event_loop.rs:1559`; field doc `:67` "Updated on every Tick after the reconcile
-  pass"). So the MeshOS loop *already* republishes on its own tick cadence,
-  independent of deck. Two consequences:
-  - **The win is real for deck**: deck currently runs a *second, independent* timer
-    (`snapshot_poll_interval`, default 100 ms) sampling a value the loop is already
-    republishing — two unsynchronized timers with phase-lag between them. E-8 lets
-    deck consume the loop's existing publish signal and drop its own timer; latency
-    becomes "next publish" instead of "next deck poll", with no phase-lag.
+  **Caveat — `publish_snapshot()` fires every Tick, not only on change.** The
+  MeshOS loop *already* republishes on its own tick cadence. Consequences:
+  - **The win is real for deck**: deck dropped its *second, independent* timer
+    (`snapshot_poll_interval`) and consumes the loop's existing publish signal —
+    latency is "next publish", no phase-lag.
   - **It does NOT eliminate tick-rate wakeups** — those happen on the MeshOS loop
-    regardless of whether deck watches. Driving deck to "zero periodic wakeups on an
-    idle node" would additionally require *change-gating* `publish_snapshot` (only
-    `store` + notify when the new snapshot differs from the stored one, e.g. via a
-    reconcile-bumped generation counter rather than a deep `MeshOsSnapshot` eq).
-    That's a separate optimization to the MeshOS loop itself — **out of scope for the
-    deck-watch migration; note as a follow-up (E-10, deferred).**
+    regardless. Driving deck to "zero periodic wakeups on an idle node" needs
+    *change-gating* `publish_snapshot` (a reconcile-bumped generation counter
+    rather than a deep `MeshOsSnapshot` eq) — **deferred as E-10.**
 - **E-9 — deck `watch` + `SnapshotStream` + `StatusSummaryStream` push loop.**
-  Swap the `tokio::time::sleep(snapshot_poll_interval)` re-read loops
-  (`deck.rs:1110`, `:670`, `:693`) for notified-await loops driven by E-8. Keep
-  `snapshot_poll_interval` as a debounce ceiling (same fallback role as
-  `watch_tools`' `Some(interval)`). Regression: existing deck watch tests
-  (`deck.rs:3118`+) must pass unchanged; add a sub-interval-latency test.
+  ✅ DONE. `DeckClient::watch` now `select!`s `changed()` against the
+  `snapshot_poll_interval` ceiling. The two `Stream` impls hold an in-flight
+  `changed_owned()` future, re-armed each fire, with the `Interval` as a ceiling
+  backstop (its immediate first tick preserves "first poll emits current state").
+  **Divergence:** the boxed `Notified` future is `Send` but `!Sync`, so the
+  pyo3/napi `#[pyclass]` wrappers (which require `Send + Sync`) forced wrapping it
+  in a `parking_lot::Mutex` (`Mutex<T>: Sync where T: Send`), locked only across
+  the sync poll. Existing deck watch/stream tests pass unchanged; added
+  `watch_is_event_driven_resolving_far_under_the_poll_ceiling` (30 s ceiling).
 
-Each binding slice (E-3..E-6) is independent and can land in any order once E-1/E-2
-are in. E-1 → E-2 sequential; E-8 → E-9 sequential and independent of the
-tool-watch track. Memory/task/redex need no slices (already push).
+Dependency order as landed: E-1 → E-2 → E-2b; binding slices E-3/E-4/E-5/E-6
+independent on top; E-8 → E-9 independent of the tool-watch track. Memory/task/
+redex needed no slices (already push).
 
 ## 6. Risks / watch-outs
 
-- **Missed-wakeup safety.** `Notify` only wakes *currently registered* waiters.
-  Register the `notified()` future **before** the diff (as in E-2's snippet) so a
-  mutation between diff-end and await-start isn't lost. The `Some(interval)`
-  debounce ceiling is the belt-and-suspenders backstop.
+- **Missed-wakeup safety.** Handled two ways as built: the tool-watch track uses a
+  `watch::Sender<u64>` *generation counter* (E-1), which is intrinsically
+  missed-wakeup-safe — a bump between diff and await is observed by the next
+  `changed()` regardless of registration timing. The deck track uses `Notify`
+  (E-8); there the `snapshot_poll_interval` ceiling is the backstop for any publish
+  that slips into the gap before the next `changed()` registers, and the MeshOS
+  loop republishes every Tick anyway, so a missed edge is bounded by the tick.
 - **Burst coalescing.** N announcements in one tick should produce *one* diff
   pass that emits N `Added`s, not N diff passes. `Notify::notify_waiters` already
   collapses to a single wake — good. Just don't re-arm inside the diff.
@@ -216,11 +246,44 @@ tool-watch track. Memory/task/redex need no slices (already push).
 
 ## 7. Done criteria
 
-- `MeshNode::watch_tools` has no `tokio::time::interval` on its hot path;
+- ✅ `MeshNode::watch_tools` has no `tokio::time::interval` on its hot path;
   change-detection latency is bounded by fold-apply latency, not the interval.
-- Go/Python/Node watch surfaces no longer run their own ticker/`sleep`/`setTimeout`
-  loop; they consume the single substrate event source.
-- Existing `watch_tools` ordering/contract tests pass unchanged; a new
-  latency test proves sub-interval delivery.
-- Idle CPU: a node with a live `watch_tools` and a quiet fold does zero periodic
-  fold walks.
+- ✅ Go/Python/Node watch surfaces no longer run their own ticker/`sleep`/`setTimeout`
+  loop; they consume the single substrate event source (Go via the
+  `net_rpc_watch_tools*` FFI, Python via `AsyncToolWatchIter`, Node via
+  `ToolWatchIter`).
+- ✅ Existing `watch_tools` ordering/contract tests pass unchanged; latency tests
+  prove sub-ceiling delivery (substrate, Rust SDK, deck).
+- ✅ Idle CPU: a node with a live `watch_tools` and a quiet fold does zero periodic
+  fold walks (the watcher parks on `change_rx.changed()` / `tx.closed()`).
+
+## 8. Implementation outcome (2026-05-29)
+
+Landed on branch `event-driven-sdks`. Commit map:
+
+- E-1/E-2/E-2b — substrate change signal, push loop, cancel (`5575c20d9` +
+  predecessors).
+- E-3b — Go `WatchTools` over the FFI watch.
+- E-6 — Rust SDK doc + single-node test.
+- E-4 — Python pyo3 iter + async-gen.
+- E-5 — Node napi iter + TS wrapper (+ camelCase-wire and shutdownable-on-close
+  fixes).
+- E-8/E-9 — deck snapshot notify + push loops, plus a follow-up making the stream
+  `pending` future `Sync` via `parking_lot::Mutex` for the pyclass wrappers, and
+  two broken-intra-doc-link fixes surfaced by `-D rustdoc::broken-intra-doc-links`.
+
+**Known limitation.** An active tool-watch holds an `Arc<MeshNode>` (the spawned
+diff task captures it) until the iterator is closed/dropped. The Node `close()`
+drops the stream eagerly so the node stays shutdownable; the substrate watch
+otherwise releases its ref when the receiver drops. Not a leak, but worth knowing
+when reasoning about shutdown with a live watcher.
+
+**Deferred (E-10).** Change-gate `publish_snapshot` (only `store` + notify when the
+new snapshot differs, via a reconcile-bumped generation counter) to eliminate
+tick-rate wakeups on an idle MeshOS loop. Out of scope for the deck-watch
+migration; a separate optimization to the loop itself.
+
+**Validation note.** The dev box has no C toolchain, so Go cgo link is
+CI-validated; the Rust sides of all bindings compile locally with `--features
+tool`, and Python/Node additionally pass live single-node delivery tests built via
+maturin / `napi build`.
