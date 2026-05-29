@@ -561,7 +561,48 @@ impl MeshOsSnapshot {
         this_node: NodeId,
     ) -> Self {
         let now = actual.last_tick.unwrap_or_else(std::time::Instant::now);
+        Self::from_state_at(
+            now,
+            actual,
+            desired,
+            pending,
+            recent_failures,
+            in_flight_migrations,
+            admin_audit_ring,
+            log_ring,
+            this_node,
+        )
+    }
 
+    /// Build a snapshot projecting every relative-time field
+    /// (`age_ms`, `until_ms`, `freeze_remaining_ms`, peer/maintenance
+    /// `since_ms`, avoid-list TTLs, `recently_emitted` ages) against an
+    /// explicit `now` instead of `actual.last_tick`. [`Self::from_state`]
+    /// is this with `now = last_tick`.
+    ///
+    /// The injectable `now` is what lets the publish loop build a
+    /// *structural view* for change-gating (E-10): rebuilding with a
+    /// FIXED reference cancels the per-tick progression of those fields
+    /// (both the reference and each event time are constant, so each
+    /// delta is constant), so two structural views differ only when the
+    /// genuinely structural content (daemon set, lifecycle, holders,
+    /// freeze active/inactive, …) changed — not merely because a tick
+    /// elapsed. Migration `elapsed_ms`/`age_in_phase_ms` come pre-computed
+    /// in `in_flight_migrations` (not via `now`), so they are NOT
+    /// normalized — an active migration still differs per tick, which is
+    /// the safe direction (over-signal while genuinely busy).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_state_at(
+        now: std::time::Instant,
+        actual: &MeshOsState,
+        desired: &DesiredState,
+        pending: &[PendingAction],
+        recent_failures: &[FailureRecord],
+        in_flight_migrations: Vec<MigrationSnapshot>,
+        admin_audit_ring: &std::collections::VecDeque<super::ice::AdminAuditRecord>,
+        log_ring: &std::collections::VecDeque<super::logs::LogRecord>,
+        this_node: NodeId,
+    ) -> Self {
         let daemons = actual
             .daemons
             .iter()
@@ -1146,6 +1187,95 @@ mod tests {
         let daemon = snap.daemons.get(&2).expect("daemon present");
         assert!(daemon.age_ms >= 30_000, "got age_ms = {}", daemon.age_ms);
         assert!(daemon.age_ms < 60_000, "got age_ms = {}", daemon.age_ms);
+    }
+
+    #[test]
+    fn from_state_at_fixed_reference_cancels_per_tick_progression() {
+        // E-10 building block. `from_state` projects relative-time
+        // fields against `actual.last_tick`, so two snapshots a tick
+        // apart over identical state still differ (age_ms moved). The
+        // change-gate instead builds a STRUCTURAL VIEW via
+        // `from_state_at` with a FIXED reference: that view must be
+        // invariant to `last_tick` (so an idle tick does not look like a
+        // change) yet still move on a genuine structural change.
+        let mut actual = MeshOsState::default();
+        let base = Instant::now();
+        let mut status = DaemonStatus::default();
+        status.lifecycle = DaemonLifecycle::Running;
+        status.last_started = base.checked_sub(Duration::from_secs(5));
+        actual.daemons.insert(dref("worker", 7), status);
+
+        let audit = std::collections::VecDeque::new();
+        let logs = std::collections::VecDeque::new();
+        let build = |reference: Instant, state: &MeshOsState| {
+            MeshOsSnapshot::from_state_at(
+                reference,
+                state,
+                &DesiredState::default(),
+                &[],
+                &[],
+                Vec::new(),
+                &audit,
+                &logs,
+                0,
+            )
+        };
+
+        let t1 = base;
+        let t2 = base + Duration::from_secs(1);
+
+        // The real `from_state` path advances age_ms with last_tick, so
+        // a quiet tick already differs — why a naive eq gate is useless.
+        let mut a1 = actual.clone();
+        a1.last_tick = Some(t1);
+        let mut a2 = actual.clone();
+        a2.last_tick = Some(t2);
+        assert_ne!(
+            MeshOsSnapshot::from_state(
+                &a1,
+                &DesiredState::default(),
+                &[],
+                &[],
+                Vec::new(),
+                &audit,
+                &logs,
+                0,
+            ),
+            MeshOsSnapshot::from_state(
+                &a2,
+                &DesiredState::default(),
+                &[],
+                &[],
+                Vec::new(),
+                &audit,
+                &logs,
+                0,
+            ),
+            "real snapshot must advance age_ms across a quiet tick",
+        );
+
+        // The structural view at a FIXED reference ignores last_tick
+        // entirely, so the same state at two different ticks compares
+        // equal — the gate sees no change and won't signal.
+        assert_eq!(
+            build(base, &a1),
+            build(base, &a2),
+            "structural view must be invariant to last_tick (no spurious change)",
+        );
+
+        // A genuine structural change (lifecycle flip) still moves the
+        // structural view, so the gate fires on real transitions.
+        let mut stopped = actual.clone();
+        stopped
+            .daemons
+            .get_mut(&dref("worker", 7))
+            .unwrap()
+            .lifecycle = DaemonLifecycle::Stopped;
+        assert_ne!(
+            build(base, &actual),
+            build(base, &stopped),
+            "structural view must move on a lifecycle change",
+        );
     }
 
     #[test]
