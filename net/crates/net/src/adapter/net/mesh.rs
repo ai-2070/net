@@ -8762,6 +8762,63 @@ impl MeshNode {
         self.announce_capabilities(snapshot).await
     }
 
+    /// Strip every `causal:<hex64>*` tag for a blob chunk's 64-char
+    /// content hex from `caps` and insert `replacement`. Hex-string
+    /// variant of [`Self::replace_causal_tags`] for the content-
+    /// addressed blob-chunk family.
+    ///
+    /// Blob chunks advertise `causal:<hex64>` (64 hex chars); causal
+    /// chains advertise `causal:<hex16>` (16 hex chars). The two
+    /// never collide under [`Self::is_causal_for`]'s exact-boundary
+    /// match: a 64-char body's char at index 16 is a hex digit, not
+    /// `:` / `[` / end, so a 16-char chain query never strips a blob
+    /// tag and vice versa.
+    #[cfg(feature = "dataforts")]
+    fn replace_blob_causal_tags(caps: &mut CapabilitySet, hex64: &str, replacement: Option<Tag>) {
+        caps.tags.retain(|t| !Self::is_causal_for(t, hex64));
+        if let Some(t) = replacement {
+            caps.tags.insert(t);
+        }
+    }
+
+    /// Advertise that this node holds the blob chunk addressed by the
+    /// 32-byte content `hash`. Emits the presence-form
+    /// `causal:<hex64>` reserved tag and re-broadcasts the node's
+    /// capability announcement so peers can discover this node as a
+    /// holder via [`Self::find_blob_chunk_holders`].
+    ///
+    /// Idempotent on the chunk identity — a prior advertisement for
+    /// the same `hash` is replaced. This is the consumer-side wiring
+    /// of the `causal:<hex>` convention the federation blob transfer
+    /// (S-3) needs: content-addressed per-chunk discovery, distinct
+    /// from RedEX replication's per-node chain advertisement.
+    ///
+    /// Note (scaling): each call re-broadcasts the full capability
+    /// set, and every advertised chunk is a tag in that set. Fine for
+    /// the single-blob / few-chunk case; advertising tens of
+    /// thousands of chunks (a `node_modules` transfer) needs a
+    /// batched or summarized advertisement — tracked as a follow-up
+    /// (see the blob-transfer plan's open questions).
+    #[cfg(feature = "dataforts")]
+    pub async fn announce_blob_chunk(&self, hash: &[u8; 32]) -> Result<(), AdapterError> {
+        let hex = Self::blob_hex(hash);
+        let replacement = Tag::parse(&format!("causal:{hex}")).ok();
+        let mut snapshot = self.user_caps_snapshot();
+        Self::replace_blob_causal_tags(&mut snapshot, &hex, replacement);
+        self.announce_capabilities(snapshot).await
+    }
+
+    /// Withdraw this node's `causal:<hex64>` advertisement for the
+    /// blob chunk addressed by `hash` and re-broadcast. Idempotent —
+    /// repeated calls converge to the chunk tag being absent.
+    #[cfg(feature = "dataforts")]
+    pub async fn withdraw_blob_chunk(&self, hash: &[u8; 32]) -> Result<(), AdapterError> {
+        let hex = Self::blob_hex(hash);
+        let mut snapshot = self.user_caps_snapshot();
+        Self::replace_blob_causal_tags(&mut snapshot, &hex, None);
+        self.announce_capabilities(snapshot).await
+    }
+
     /// Annotate the local capability set with a `heat:<hex>=<rate>`
     /// reserved tag for `origin_hash` and re-broadcast. Replaces
     /// any prior heat tag for the same chain — the most recent
@@ -9122,18 +9179,28 @@ impl MeshNode {
     }
 
     /// Register the receive-side `blob.fetch_chunk` handler on this
-    /// node. The handler serves chunks from `adapter`'s local store
-    /// (via [`super::dataforts::blob::MeshBlobAdapter::fetch_chunk_local`])
+    /// node and wire the adapter for full cross-peer participation.
+    /// The handler serves chunks from `adapter`'s local store (via
+    /// [`super::dataforts::blob::MeshBlobAdapter::fetch_chunk_local`])
     /// and never fans a request back out to the mesh.
     ///
+    /// Also calls
+    /// [`super::dataforts::blob::MeshBlobAdapter::enable_peer_fetch`]
+    /// so this one call sets up the bidirectional transfer surface:
+    /// the node serves chunks AND advertises `causal:<hex>` for chunks
+    /// it stores, falls back to peers on a local fetch miss (S-2), and
+    /// reports `replicas_observed` in `stat`.
+    ///
     /// Returns the [`super::mesh_rpc::ServeHandle`] the operator drops
-    /// to deregister. A second registration under the same service
-    /// name returns [`super::mesh_rpc::ServeError::AlreadyServing`].
+    /// to deregister the handler. A second registration under the same
+    /// service name returns
+    /// [`super::mesh_rpc::ServeError::AlreadyServing`].
     pub fn serve_blob_fetch_chunk(
         self: &Arc<Self>,
         adapter: Arc<super::dataforts::blob::MeshBlobAdapter>,
     ) -> Result<super::mesh_rpc::ServeHandle, super::mesh_rpc::ServeError> {
         use super::dataforts::blob::fetch_rpc::{BlobFetchChunkHandler, BLOB_FETCH_CHUNK_SERVICE};
+        adapter.enable_peer_fetch(self);
         let handler = Arc::new(BlobFetchChunkHandler::new(adapter));
         self.serve_rpc(BLOB_FETCH_CHUNK_SERVICE, handler)
     }
@@ -9271,6 +9338,68 @@ impl MeshNode {
         // measured RTT in ascending order, then unmeasured peers,
         // ties broken by lex NodeId. Mirrors the
         // `REDEX_DISTRIBUTED_PLAN.md` §4 `elect()` ordering.
+        let self_id = self.node_id;
+        let proximity = self.proximity_graph.clone();
+        let rtt_of = |node: u64| -> Option<std::time::Duration> {
+            if node == self_id {
+                Some(std::time::Duration::ZERO)
+            } else {
+                let graph_id = node_id_to_graph_id(node);
+                proximity.nearest_rtt(|n| n.node_id == graph_id)
+            }
+        };
+        holders.sort_by(|&a, &b| {
+            let rtt_a = rtt_of(a);
+            let rtt_b = rtt_of(b);
+            match (rtt_a, rtt_b) {
+                (Some(da), Some(db)) => match da.cmp(&db) {
+                    std::cmp::Ordering::Equal => a.cmp(&b),
+                    other => other,
+                },
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.cmp(&b),
+            }
+        });
+        holders
+    }
+
+    /// Return every node currently advertising the blob chunk
+    /// addressed by the 32-byte content `hash` (via its
+    /// `causal:<hex64>` presence tag — see
+    /// [`Self::announce_blob_chunk`]). Includes this node when self-
+    /// indexed. Sorted by ascending RTT from this node (self first,
+    /// unmeasured peers last, ties broken by ascending NodeId) so the
+    /// fetch fallback tries the closest healthy holder first.
+    ///
+    /// Reads the capability fold directly; no broadcast. Content-
+    /// addressed analogue of [`Self::find_chain_holders`] — keyed on
+    /// the blob's 64-char content hex rather than a chain's 16-char
+    /// origin hex.
+    #[cfg(feature = "dataforts")]
+    pub fn find_blob_chunk_holders(&self, hash: &[u8; 32]) -> Vec<u64> {
+        let hex = Self::blob_hex(hash);
+        let mut holders: Vec<u64> = self.capability_fold.with_state(|state| {
+            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for (_key, entry) in state.entries.iter() {
+                if seen.contains(&entry.node_id) {
+                    continue;
+                }
+                if entry
+                    .payload
+                    .tags
+                    .iter()
+                    .any(|t| Self::is_causal_for_str(t, &hex))
+                {
+                    seen.insert(entry.node_id);
+                }
+            }
+            seen.into_iter().collect::<Vec<u64>>()
+        });
+
+        // Proximity sort: identical ordering discipline to
+        // `find_chain_holders` — self first (RTT 0), measured peers
+        // ascending, unmeasured last, lex NodeId ties.
         let self_id = self.node_id;
         let proximity = self.proximity_graph.clone();
         let rtt_of = |node: u64| -> Option<std::time::Duration> {
@@ -13217,6 +13346,70 @@ mod chain_helper_tests {
             &causal_tag(format!("{theirs}:100")),
             &our,
         ));
+    }
+
+    /// Federation S-3: blob chunks advertise `causal:<hex64>` and
+    /// causal chains advertise `causal:<hex16>`. The two families
+    /// must be disjoint under `is_causal_for` so advertising or
+    /// withdrawing one never touches the other — otherwise a chain
+    /// withdrawal could silently drop a blob holder advertisement
+    /// (or vice versa).
+    #[cfg(feature = "dataforts")]
+    #[test]
+    fn blob_and_chain_causal_tags_are_disjoint() {
+        // Construct a chunk hash whose first 16 hex chars equal a
+        // chain origin's hex — the worst case for a false match.
+        let chain_origin = 0x0123_4567_89ab_cdef_u64;
+        let chain_hex = MeshNode::chain_hex(chain_origin); // 16 chars
+        let mut hash = [0u8; 32];
+        hash[0] = 0x01;
+        hash[1] = 0x23;
+        hash[2] = 0x45;
+        hash[3] = 0x67;
+        hash[4] = 0x89;
+        hash[5] = 0xab;
+        hash[6] = 0xcd;
+        hash[7] = 0xef;
+        let blob_hex = MeshNode::blob_hex(&hash); // 64 chars
+        assert!(blob_hex.starts_with(&chain_hex));
+
+        let blob_tag = causal_tag(&blob_hex);
+        let chain_tag = causal_tag(&chain_hex);
+
+        // A chain query (16-char hex) must NOT match the blob tag:
+        // index 16 of the 64-char body is a hex digit, not `:`/`[`/end.
+        assert!(!MeshNode::is_causal_for(&blob_tag, &chain_hex));
+        // A blob query (64-char hex) must NOT match the chain tag:
+        // the 16-char body is shorter than the 64-char prefix.
+        assert!(!MeshNode::is_causal_for(&chain_tag, &blob_hex));
+        // Each matches its own family.
+        assert!(MeshNode::is_causal_for(&blob_tag, &blob_hex));
+        assert!(MeshNode::is_causal_for(&chain_tag, &chain_hex));
+    }
+
+    /// Federation S-3: `replace_blob_causal_tags` inserts/replaces a
+    /// blob holder advertisement without disturbing a co-resident
+    /// chain advertisement in the same capability set.
+    #[cfg(feature = "dataforts")]
+    #[test]
+    fn replace_blob_causal_tags_leaves_chain_tags_intact() {
+        let mut hash = [0u8; 32];
+        hash[0] = 0x77;
+        let blob_hex = MeshNode::blob_hex(&hash);
+        let chain_tag = causal_tag(format!("{}:42", MeshNode::chain_hex(0x42)));
+
+        let mut caps = CapabilitySet::default();
+        caps.tags.insert(chain_tag.clone());
+
+        // Insert the blob advertisement.
+        MeshNode::replace_blob_causal_tags(&mut caps, &blob_hex, Some(causal_tag(&blob_hex)));
+        assert!(caps.tags.contains(&causal_tag(&blob_hex)));
+        assert!(caps.tags.contains(&chain_tag), "chain tag untouched");
+
+        // Withdraw the blob advertisement — chain tag still present.
+        MeshNode::replace_blob_causal_tags(&mut caps, &blob_hex, None);
+        assert!(!caps.tags.contains(&causal_tag(&blob_hex)));
+        assert!(caps.tags.contains(&chain_tag), "chain tag survives withdraw");
     }
 
     #[test]

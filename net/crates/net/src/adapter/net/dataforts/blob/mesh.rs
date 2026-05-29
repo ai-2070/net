@@ -388,6 +388,27 @@ pub struct MeshBlobAdapter {
     /// `auto_repair_on_fetch=true` then storms `store_chunk`
     /// calls for the same stripe at fetch rate.
     repair_cooldown: Arc<parking_lot::Mutex<HashMap<[u8; 32], std::time::Instant>>>,
+    /// Optional back-reference to the local mesh node, wired by
+    /// [`crate::adapter::net::MeshNode::serve_blob_fetch_chunk`] via
+    /// [`Self::enable_peer_fetch`]. Present iff this adapter
+    /// participates in cross-peer blob transfer:
+    ///
+    /// - `store` advertises `causal:<hex>` for each chunk it lands so
+    ///   peers can discover this node as a holder;
+    /// - `fetch` falls back to peers advertising the chunk on a local
+    ///   miss (federation S-2);
+    /// - `stat` reports `replicas_observed` from the capability fold.
+    ///
+    /// Absent (the default) keeps the adapter local-only — the v0.2
+    /// behavior unchanged.
+    ///
+    /// `Weak` so the adapter↔mesh cycle doesn't leak (the mesh's nRPC
+    /// fold owns the fetch-chunk handler, which holds an
+    /// `Arc<MeshBlobAdapter>`; the adapter holds the mesh back).
+    /// `Arc<RwLock<_>>` so the field stays `Clone` (the adapter
+    /// derives `Clone`) and every clone shares one wiring cell.
+    peer_fetch_mesh:
+        Arc<parking_lot::RwLock<Option<std::sync::Weak<crate::adapter::net::MeshNode>>>>,
 }
 
 impl MeshBlobAdapter {
@@ -420,6 +441,53 @@ impl MeshBlobAdapter {
             rs_encoder_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             repair_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             auto_repair_on_fetch: false,
+            peer_fetch_mesh: Arc::new(parking_lot::RwLock::new(None)),
+        }
+    }
+
+    /// Wire a back-reference to the local mesh node so this adapter
+    /// participates in cross-peer blob transfer: it advertises
+    /// `causal:<hex>` for chunks it stores, falls back to peers on a
+    /// local fetch miss (federation S-2), and reports
+    /// `replicas_observed` in [`BlobAdapter::stat`]. Invoked by
+    /// [`crate::adapter::net::MeshNode::serve_blob_fetch_chunk`]; also
+    /// callable directly for fetch-only participation.
+    ///
+    /// Stores a `Weak` to avoid an adapter↔mesh reference cycle.
+    /// Idempotent — re-wiring replaces the prior reference. Visible
+    /// across every clone of this adapter (shared cell).
+    pub fn enable_peer_fetch(&self, mesh: &Arc<crate::adapter::net::MeshNode>) {
+        *self.peer_fetch_mesh.write() = Some(Arc::downgrade(mesh));
+    }
+
+    /// Upgrade the mesh back-reference, if wired and still alive.
+    /// `None` when peer fetch was never enabled or the mesh has been
+    /// dropped — callers treat that as "local-only".
+    pub(crate) fn peer_fetch_mesh(&self) -> Option<Arc<crate::adapter::net::MeshNode>> {
+        self.peer_fetch_mesh
+            .read()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Best-effort advertise that this node now holds the chunk
+    /// addressed by `hash`, so peers discover it via the
+    /// `causal:<hex>` capability tag. No-op when peer fetch isn't
+    /// wired. Spawns the capability re-broadcast so a slow or failing
+    /// announce never blocks — or fails — the store that triggered
+    /// it; a dropped advertisement only delays discovery until the
+    /// next announce.
+    fn advertise_chunk_held(&self, hash: [u8; 32]) {
+        if let Some(mesh) = self.peer_fetch_mesh() {
+            tokio::spawn(async move {
+                if let Err(e) = mesh.announce_blob_chunk(&hash).await {
+                    tracing::debug!(
+                        error = %e,
+                        hash = %hex32(&hash),
+                        "blob: announce causal tag failed",
+                    );
+                }
+            });
         }
     }
 
@@ -2453,12 +2521,18 @@ impl MeshBlobAdapter {
             }
             self.refcount
                 .store_observed(*hash, bytes.len() as u64, now_ms);
+            // The chunk is present locally (idempotent re-store) — make
+            // sure peers can still discover us as a holder.
+            self.advertise_chunk_held(*hash);
             return Ok(());
         }
         file.append(bytes)
             .map_err(|e| BlobError::Backend(format!("mesh blob: append chunk: {}", e)))?;
         self.refcount
             .store_observed(*hash, bytes.len() as u64, now_ms);
+        // Advertise the new holding so peers can fetch this chunk from
+        // us via `blob.fetch_chunk`. Best-effort; never fails the store.
+        self.advertise_chunk_held(*hash);
         Ok(())
     }
 
@@ -3494,13 +3568,34 @@ impl BlobAdapter for MeshBlobAdapter {
     }
 
     async fn stat(&self, blob_ref: &BlobRef) -> Result<BlobStat, BlobError> {
-        // v0.2 PR-4a — `last_seen_unix_ms` now comes from the
-        // refcount table when the hash is tracked. For Small
-        // blobs that's the single chunk; for Manifest blobs we
-        // surface the most recent touch across all chunks.
-        // `replicas_observed` still 0 until the cross-node
-        // advertisement count wires up (PR-5).
+        // `last_seen_unix_ms` comes from the refcount table when the
+        // hash is tracked. For Small blobs that's the single chunk;
+        // for Manifest blobs we surface the most recent touch across
+        // all chunks.
         let replica_target = self.replication.as_ref().map(|c| c.factor);
+        // `replicas_observed` (federation S-3): count distinct peers
+        // advertising the blob's `causal:<hex>` tag in the local
+        // capability fold. Requires the mesh back-reference
+        // (`enable_peer_fetch`); without it the adapter is local-only
+        // and reports 0. A Manifest is only as replicated as its
+        // least-replicated chunk, so we take the min over chunks; a
+        // Tree surfaces the root node's holder count as a proxy
+        // (mirrors the `last_seen` treatment — a full tree walk is
+        // out of scope here).
+        let replicas_observed = match self.peer_fetch_mesh() {
+            Some(mesh) => match blob_ref {
+                BlobRef::Small { hash, .. } => mesh.find_blob_chunk_holders(hash).len() as u32,
+                BlobRef::Manifest { chunks, .. } => chunks
+                    .iter()
+                    .map(|c| mesh.find_blob_chunk_holders(&c.hash).len() as u32)
+                    .min()
+                    .unwrap_or(0),
+                BlobRef::Tree { root_hash, .. } => {
+                    mesh.find_blob_chunk_holders(root_hash).len() as u32
+                }
+            },
+            None => 0,
+        };
         let last_seen_unix_ms = match blob_ref {
             BlobRef::Small { hash, .. } => self.refcount.get(hash).map(|e| e.last_seen_unix_ms),
             BlobRef::Manifest { chunks, .. } => chunks
@@ -3518,7 +3613,7 @@ impl BlobAdapter for MeshBlobAdapter {
         };
         Ok(BlobStat {
             size: blob_ref.size(),
-            replicas_observed: 0,
+            replicas_observed,
             replica_target,
             last_seen_unix_ms,
             encoding: blob_ref.encoding(),
