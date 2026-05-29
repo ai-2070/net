@@ -172,6 +172,11 @@ fn token_err_to_code(e: &CoreTokenError) -> c_int {
         CoreTokenError::DelegationExhausted => NET_ERR_TOKEN_DELEGATION_EXHAUSTED,
         CoreTokenError::DelegationNotAllowed => NET_ERR_TOKEN_DELEGATION_NOT_ALLOWED,
         CoreTokenError::NotAuthorized => NET_ERR_TOKEN_NOT_AUTHORIZED,
+        // A revoked chain link is an authorization failure from the
+        // caller's perspective — the credential was valid-shaped but
+        // is no longer honored. Same code as `NotAuthorized`; the
+        // `Display` message distinguishes the cause.
+        CoreTokenError::Revoked => NET_ERR_TOKEN_NOT_AUTHORIZED,
         // Maps to `NET_ERR_IDENTITY` since a public-only keypair
         // is fundamentally an identity-availability issue, not a
         // token-content issue. The error message in `Display`

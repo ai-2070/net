@@ -144,8 +144,10 @@ async fn subscribe_denied_by_missing_token() {
     let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
 
     let name = ChannelName::new("lab/secret").unwrap();
-    a.registry
-        .insert(ChannelConfig::new(ChannelId::new(name.clone())).with_require_token(true));
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()]),
+    );
 
     // B subscribes with no token.
     let result = b.mesh.subscribe_channel(a.mesh.node_id(), name).await;
@@ -160,8 +162,10 @@ async fn subscribe_accepted_with_valid_token() {
     let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
 
     let name = ChannelName::new("lab/signed").unwrap();
-    a.registry
-        .insert(ChannelConfig::new(ChannelId::new(name.clone())).with_require_token(true));
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()]),
+    );
 
     // Publisher issues a SUBSCRIBE token for B's entity. Duration
     // is generous so the test isn't timing-sensitive.
@@ -185,8 +189,10 @@ async fn subscribe_rejected_with_expired_token() {
     let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
 
     let name = ChannelName::new("lab/short").unwrap();
-    a.registry
-        .insert(ChannelConfig::new(ChannelId::new(name.clone())).with_require_token(true));
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()]),
+    );
 
     // 1-second token, then sleep past `not_after`.
     // (duration_secs == 0 is now rejected; mint with the minimum
@@ -214,8 +220,10 @@ async fn subscribe_rejected_with_wrong_subject_token() {
     let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
 
     let name = ChannelName::new("lab/wrong").unwrap();
-    a.registry
-        .insert(ChannelConfig::new(ChannelId::new(name.clone())).with_require_token(true));
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()]),
+    );
 
     // Token issued for a THIRD entity, not B.
     let bystander = EntityKeypair::generate();
@@ -228,10 +236,9 @@ async fn subscribe_rejected_with_wrong_subject_token() {
         0,
     );
 
-    // B presents it. Publisher's `can_subscribe` calls
-    // `token_cache.check(b.entity_id, SUBSCRIBE, hash)` which
-    // misses (the token is keyed by `bystander.entity_id`), so the
-    // check fails.
+    // B presents it. The chain roots at A (a channel root), but its
+    // leaf subject is `bystander`, not B (the presenter), so the
+    // leaf-binding check in `TokenChain::verify_authorizes` rejects it.
     let result = b
         .mesh
         .subscribe_channel_with_token(a.mesh.node_id(), name, token)
@@ -255,8 +262,10 @@ async fn rejected_subscribe_does_not_leak_token_into_shared_cache() {
     let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
 
     let name = ChannelName::new("lab/leak").unwrap();
-    a.registry
-        .insert(ChannelConfig::new(ChannelId::new(name.clone())).with_require_token(true));
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()]),
+    );
 
     // Pre-test: publisher's shared cache is empty.
     let shared_cache = a

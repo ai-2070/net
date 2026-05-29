@@ -213,8 +213,10 @@ async fn auth_guard_populated_for_token_gated_subscribe() {
     );
 
     let channel = ChannelName::new("auth/token").unwrap();
-    a.registry
-        .insert(ChannelConfig::new(ChannelId::new(channel.clone())).with_require_token(true));
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(channel.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()]),
+    );
 
     let token = PermissionToken::issue(
         &a.keypair,
@@ -371,8 +373,10 @@ async fn expired_token_evicts_subscriber_within_one_sweep() {
     );
 
     let channel = ChannelName::new("auth/expiring").unwrap();
-    a.registry
-        .insert(ChannelConfig::new(ChannelId::new(channel.clone())).with_require_token(true));
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(channel.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()]),
+    );
 
     // Publisher needs its own PUBLISH token on a `require_token`
     // channel — `can_publish` gates the fan-out before the
@@ -469,8 +473,10 @@ async fn publish_skips_expired_subscriber_when_sweep_is_disabled() {
     );
 
     let channel = ChannelName::new("auth/nosweep").unwrap();
-    a.registry
-        .insert(ChannelConfig::new(ChannelId::new(channel.clone())).with_require_token(true));
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(channel.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()]),
+    );
 
     // Long-lived publish token for A.
     let pub_token = PermissionToken::issue(

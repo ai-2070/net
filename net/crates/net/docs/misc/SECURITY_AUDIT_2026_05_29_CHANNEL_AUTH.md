@@ -22,6 +22,52 @@ Line numbers reflect `master` at audit time and may drift.
 | C1 | Critical | Identity / channel-auth | `require_token` channels accept self-issued tokens — no channel owner / authorizing-issuer anchor anywhere |
 | H1 | High | Identity | `delegate()` rewrites `issuer` to the delegator; root revocation never reaches delegated descendants, contradicting the documented transitive-revoke guarantee |
 
+## Resolution (2026-05-29)
+
+Both findings remediated via a root-anchored `TokenChain`. Backwards
+compatibility was explicitly waived, so the wire credential changed
+from a single token to a delegation chain.
+
+| ID | Status | Where |
+|----|--------|-------|
+| C1 | Fixed — channels carry `ChannelConfig::token_roots`; a presented chain must root at one of them, bind its leaf to the AEAD-verified presenter, and authorize the action at every link. `require_token` with empty roots fails closed. | `identity/token.rs` (`TokenChain::verify_authorizes`), `channel/config.rs` (`token_roots`, `with_token_roots`, `can_subscribe`/`can_publish`), `mesh.rs` (`authorize_subscribe`, `publish_many`, `sweep_expired_subscribers`) |
+| H1 | Fixed — the root grant is itself a verified link in the presented chain, so `revoke_below(root, …)` invalidates `tokens[0]` and the whole chain; every link is also revocation-checked against its own issuer floor. | `identity/token.rs` (`TokenChain::verify_authorizes` per-link revocation) |
+
+Key implementation notes:
+
+- **`TokenChain`** (`identity/token.rs`): root-to-leaf `Vec<PermissionToken>`,
+  `u8` count + N×169 B wire format, capped at `MAX_CHAIN_DEPTH = 8`.
+  `verify_authorizes` checks root anchor, leaf binding, per-link
+  signature/time/revocation, link continuity (`child.issuer ==
+  parent.subject`, parent has `DELEGATE`, depth decrement, time
+  nesting), and monotonic authority (every link authorizes the action
+  — chain grant is the intersection).
+- **Chain retention** (`mesh.rs`): `subscriber_chains:
+  DashMap<(node_id, channel_hash), TokenChain>` holds the verified
+  chain so the periodic sweep and the publish-fan-out lazy re-check
+  re-verify against current time + revocation without the peer
+  re-presenting. Dropped on unsubscribe / eviction.
+- **Wire**: the membership `Subscribe.token` field carries chain bytes
+  (its length-prefixed-opaque framing was already agnostic — no
+  `membership.rs` codec change). `MeshNode::subscribe_channel_with_token`
+  wraps a single token as a one-link chain;
+  `subscribe_channel_with_chain` presents a delegated chain.
+- **Tests**: `channel/config.rs` unit tests cover self-issued reject,
+  owner-issued accept, empty-roots fail-closed, leaf-subject binding,
+  delegation accept, broken-continuity reject, scope-broaden reject,
+  and root-revoke-kills-chain; `token.rs` covers chain wire round-trip
+  + malformed rejection; the `channel_auth` / `channel_auth_hardening`
+  integration suites were migrated to `with_token_roots`.
+
+Known follow-ups (not security-blocking; fail closed):
+
+- Multi-hop **locally-held publish** credentials: `publish_many` builds
+  a single-link chain from the local token cache, so a delegated
+  publish grant a node holds for itself fails closed until a
+  held-chain store is added.
+- **FFI / language bindings** still present a single token; multi-hop
+  delegation over those surfaces needs a chain-bytes entry point.
+
 ---
 
 ## CRITICAL

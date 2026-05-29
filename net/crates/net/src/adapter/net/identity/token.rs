@@ -596,6 +596,188 @@ impl std::fmt::Debug for PermissionToken {
     }
 }
 
+/// Hard cap on the number of links in a [`TokenChain`]. A chain
+/// rooted at a channel owner needs only as many links as the issuer
+/// chose to allow via `delegation_depth` (a `u8`), but the wire
+/// decoder and the verify loop must both bound work against a hostile
+/// peer that ships a maximal blob. Eight links is far past any real
+/// delegation tree (owner → org → team → service is four) while
+/// keeping per-subscribe verify cost — eight ed25519 verifies — to a
+/// few hundred microseconds even on the slow path.
+pub const MAX_CHAIN_DEPTH: usize = 8;
+
+/// An ordered delegation chain anchored at a channel's authorizing
+/// issuer.
+///
+/// `tokens` is **root-to-leaf**: `tokens[0]` is the root grant (its
+/// `issuer` must be one of the channel's authorized roots) and
+/// `tokens[last]` is the credential the presenting peer holds (its
+/// `subject` must be that peer). A single-link chain is the common
+/// case — a channel owner issuing directly to a subscriber, with no
+/// intermediate delegation.
+///
+/// This is the type that closes the root-of-trust hole: the bare
+/// [`PermissionToken`] / [`TokenCache::check`] path verifies a token
+/// is internally self-consistent (the named issuer signed it) but
+/// never that the issuer has authority over the channel, so any peer
+/// could self-issue `issuer = subject = self` and pass. A `TokenChain`
+/// is only honored when its root link is signed by an issuer the
+/// channel config names as authoritative (see
+/// `ChannelConfig::token_roots`).
+#[derive(Clone, Debug)]
+pub struct TokenChain {
+    /// Root-to-leaf delegation links. Invariant (enforced by
+    /// [`Self::verify_authorizes`], not by construction): adjacent
+    /// links satisfy `child.issuer == parent.subject`, the parent
+    /// carries [`TokenScope::DELEGATE`], and scope/channel/expiry only
+    /// ever narrow down the chain.
+    pub tokens: Vec<PermissionToken>,
+}
+
+impl TokenChain {
+    /// Wrap a single token as a one-link chain (no delegation). The
+    /// token's `issuer` is both the root and the direct grantor; the
+    /// channel config must name that issuer as a root for the chain to
+    /// verify.
+    pub fn single(token: PermissionToken) -> Self {
+        Self {
+            tokens: vec![token],
+        }
+    }
+
+    /// Serialize to the wire: a `u8` link count followed by
+    /// `count × PermissionToken::WIRE_SIZE` token blobs, root-first.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + self.tokens.len() * PermissionToken::WIRE_SIZE);
+        buf.push(self.tokens.len() as u8);
+        for t in &self.tokens {
+            buf.extend_from_slice(&t.to_bytes());
+        }
+        buf
+    }
+
+    /// Deserialize from the wire. Rejects an empty chain, a count past
+    /// [`MAX_CHAIN_DEPTH`], or any length that isn't exactly
+    /// `1 + count × WIRE_SIZE` (no trailing garbage, no short read).
+    pub fn from_bytes(data: &[u8]) -> Result<Self, TokenError> {
+        let count = *data.first().ok_or(TokenError::InvalidFormat)? as usize;
+        if count == 0 || count > MAX_CHAIN_DEPTH {
+            return Err(TokenError::InvalidFormat);
+        }
+        let expected = 1 + count * PermissionToken::WIRE_SIZE;
+        if data.len() != expected {
+            return Err(TokenError::InvalidFormat);
+        }
+        let mut tokens = Vec::with_capacity(count);
+        for i in 0..count {
+            let start = 1 + i * PermissionToken::WIRE_SIZE;
+            tokens.push(PermissionToken::from_bytes(
+                &data[start..start + PermissionToken::WIRE_SIZE],
+            )?);
+        }
+        Ok(Self { tokens })
+    }
+
+    /// Verify the chain authorizes `action` on `channel_hash` for
+    /// `presenter`, rooting at one of `roots`, with no link revoked.
+    ///
+    /// The checks, in order:
+    /// 1. **Root anchor** — `tokens[0].issuer` is one of `roots`. This
+    ///    is the property the bare-token path lacks; without it any
+    ///    self-signed token passes.
+    /// 2. **Leaf binding** — `tokens[last].subject == presenter`. The
+    ///    presenter is the AEAD-verified handshake identity, so a peer
+    ///    can't present a chain minted for someone else.
+    /// 3. **Per-link validity + revocation** — every link's signature
+    ///    and time bounds hold, and no link is below its issuer's
+    ///    revocation floor. Because the root grant is itself a link,
+    ///    `revoke_below(root, …)` invalidates `tokens[0]` and so the
+    ///    whole chain — closing the "root revoke misses delegated
+    ///    descendants" gap (each delegated link also revocation-checks
+    ///    against its own issuer's floor).
+    /// 4. **Link continuity** — for each `(parent, child)`:
+    ///    `child.issuer == parent.subject` (no splicing unrelated
+    ///    tokens), `parent` carries `DELEGATE`, `child.delegation_depth
+    ///    < parent.delegation_depth`, and the child's validity window
+    ///    nests within the parent's.
+    /// 5. **Monotonic authority** — *every* link must
+    ///    `authorizes(action, channel_hash)`. Chain authority is the
+    ///    intersection of all links, so a leaf can never claim a scope
+    ///    or channel an ancestor (including the root) didn't grant —
+    ///    this is what makes delegation strictly narrowing for both
+    ///    scope bits and channel binding.
+    pub fn verify_authorizes(
+        &self,
+        action: TokenScope,
+        channel_hash: ChannelHash,
+        presenter: &EntityId,
+        roots: &[EntityId],
+        revocation: &RevocationRegistry,
+        skew_secs: u64,
+    ) -> Result<(), TokenError> {
+        let first = self.tokens.first().ok_or(TokenError::InvalidFormat)?;
+        let last = self.tokens.last().ok_or(TokenError::InvalidFormat)?;
+
+        // 1. Root anchor.
+        if !roots
+            .iter()
+            .any(|r| r.as_bytes() == first.issuer.as_bytes())
+        {
+            return Err(TokenError::NotAuthorized);
+        }
+
+        // 2. Leaf bound to the presenting peer.
+        if last.subject.as_bytes() != presenter.as_bytes() {
+            return Err(TokenError::NotAuthorized);
+        }
+
+        // 3 + 5. Per-link validity, revocation, and monotonic
+        // authority. Done in one pass over every link.
+        for t in &self.tokens {
+            // Signature + time bounds.
+            t.is_valid_with_skew(skew_secs)?;
+            // Revocation floor (root link catches root revocation).
+            if revocation.is_revoked(t) {
+                return Err(TokenError::Revoked);
+            }
+            // Every link must independently authorize the action on
+            // the channel — the chain grant is the intersection.
+            if !t.authorizes(action, channel_hash) {
+                return Err(TokenError::NotAuthorized);
+            }
+        }
+
+        // 4. Link continuity between adjacent (parent, child) pairs.
+        for pair in self.tokens.windows(2) {
+            let (parent, child) = (&pair[0], &pair[1]);
+            // The child must be issued by the party the parent
+            // delegated to — no splicing in an unrelated token.
+            if child.issuer.as_bytes() != parent.subject.as_bytes() {
+                return Err(TokenError::NotAuthorized);
+            }
+            // The parent must have permitted delegation at all.
+            if !parent.scope.contains(TokenScope::DELEGATE) {
+                return Err(TokenError::DelegationNotAllowed);
+            }
+            // Depth must strictly decrease so a chain can't loop or
+            // outrun the issuer's delegation budget.
+            if child.delegation_depth >= parent.delegation_depth {
+                return Err(TokenError::NotAuthorized);
+            }
+            // A child must not outlive its parent. Per-link
+            // `is_valid` already rejects an expired parent, but pin
+            // the nesting so a long-lived child can't survive a
+            // shorter-lived ancestor being dropped from a presented
+            // chain.
+            if child.not_before < parent.not_before || child.not_after > parent.not_after {
+                return Err(TokenError::NotAuthorized);
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Soft cap on the number of `(subject, channel_hash)` slots in a
 /// [`TokenCache`]. Set well above any realistic deployment (a node
 /// with 65 K distinct subject-channel pairs is itself an outlier)
@@ -1040,6 +1222,11 @@ pub enum TokenError {
     DelegationNotAllowed,
     /// No valid token found for the requested action.
     NotAuthorized,
+    /// A link in a presented [`TokenChain`] is at or below its
+    /// issuer's revocation floor. Distinct from [`Self::NotAuthorized`]
+    /// so operators can tell a revoked-credential rejection from a
+    /// never-authorized one.
+    Revoked,
     /// Wire format is too short or malformed.
     InvalidFormat,
     /// Issuer/signer keypair is public-only (post-migration zeroize
@@ -1073,6 +1260,7 @@ impl std::fmt::Display for TokenError {
             Self::DelegationExhausted => write!(f, "delegation depth exhausted"),
             Self::DelegationNotAllowed => write!(f, "delegation not allowed by scope"),
             Self::NotAuthorized => write!(f, "not authorized"),
+            Self::Revoked => write!(f, "token chain link is revoked"),
             Self::InvalidFormat => write!(f, "invalid token format"),
             Self::ReadOnly => write!(f, "signer keypair is public-only"),
             Self::ZeroTtl => write!(f, "token TTL must be > 0 seconds"),
@@ -2292,6 +2480,72 @@ mod tests {
         let truncated = &tok.to_bytes()[..PermissionToken::WIRE_SIZE - 1];
         assert!(matches!(
             PermissionToken::from_bytes(truncated),
+            Err(TokenError::InvalidFormat)
+        ));
+    }
+
+    fn tok_for(issuer: &EntityKeypair, subject: &EntityKeypair) -> PermissionToken {
+        PermissionToken::issue(
+            issuer,
+            subject.entity_id().clone(),
+            TokenScope::SUBSCRIBE,
+            0xABCD,
+            3600,
+            0,
+        )
+    }
+
+    #[test]
+    fn token_chain_roundtrips_single_and_multi() {
+        let a = EntityKeypair::generate();
+        let b = EntityKeypair::generate();
+        let c = EntityKeypair::generate();
+
+        for tokens in [
+            vec![tok_for(&a, &b)],
+            vec![tok_for(&a, &b), tok_for(&b, &c)],
+        ] {
+            let chain = TokenChain {
+                tokens: tokens.clone(),
+            };
+            let bytes = chain.to_bytes();
+            assert_eq!(bytes.len(), 1 + tokens.len() * PermissionToken::WIRE_SIZE);
+            let decoded = TokenChain::from_bytes(&bytes).expect("roundtrip");
+            assert_eq!(decoded.tokens.len(), tokens.len());
+            // Compare via per-token wire bytes (PermissionToken isn't Eq).
+            for (orig, got) in tokens.iter().zip(decoded.tokens.iter()) {
+                assert_eq!(orig.to_bytes(), got.to_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn token_chain_from_bytes_rejects_malformed() {
+        // Empty.
+        assert!(matches!(
+            TokenChain::from_bytes(&[]),
+            Err(TokenError::InvalidFormat)
+        ));
+        // Zero count.
+        assert!(matches!(
+            TokenChain::from_bytes(&[0u8]),
+            Err(TokenError::InvalidFormat)
+        ));
+        // Count past MAX_CHAIN_DEPTH.
+        let over = (MAX_CHAIN_DEPTH + 1) as u8;
+        let mut buf = vec![over];
+        buf.resize(1 + (over as usize) * PermissionToken::WIRE_SIZE, 0u8);
+        assert!(matches!(
+            TokenChain::from_bytes(&buf),
+            Err(TokenError::InvalidFormat)
+        ));
+        // Count says 1 but body length is wrong (trailing garbage).
+        let a = EntityKeypair::generate();
+        let b = EntityKeypair::generate();
+        let mut ok = TokenChain::single(tok_for(&a, &b)).to_bytes();
+        ok.push(0xFF);
+        assert!(matches!(
+            TokenChain::from_bytes(&ok),
             Err(TokenError::InvalidFormat)
         ));
     }
