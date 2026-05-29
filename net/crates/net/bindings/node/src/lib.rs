@@ -1130,6 +1130,14 @@ mod mesh_bindings {
         /// Capability filter each subscriber must satisfy. Rejected
         /// as `Unauthorized` on mismatch.
         pub subscribe_caps: Option<crate::capabilities::CapabilityFilterJs>,
+        /// Root(s) of trust for token authorization: 32-byte entity ids
+        /// whose signature may root a presented token chain. Setting
+        /// this turns on `requireToken` and anchors the channel — a
+        /// chain is only honored if its root link was issued by one of
+        /// these entities. `requireToken: true` with no `tokenRoots`
+        /// fails every authorization closed (no authority to anchor
+        /// to), so prefer this to `requireToken` alone.
+        pub token_roots: Option<Vec<Buffer>>,
     }
 
     impl ChannelConfigJs {
@@ -1146,6 +1154,19 @@ mod mesh_bindings {
             }
             if let Some(req) = self.require_token {
                 cfg = cfg.with_require_token(req);
+            }
+            if let Some(roots) = self.token_roots {
+                let mut parsed = Vec::with_capacity(roots.len());
+                for buf in roots {
+                    let arr: [u8; 32] = buf.as_ref().try_into().map_err(|_| {
+                        Error::from_reason(format!(
+                            "channel: token_roots entry must be 32 bytes, got {}",
+                            buf.len()
+                        ))
+                    })?;
+                    parsed.push(net::adapter::net::identity::EntityId::from_bytes(arr));
+                }
+                cfg = cfg.with_token_roots(parsed);
             }
             if let Some(p) = self.priority {
                 cfg = cfg.with_priority(p);

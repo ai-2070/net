@@ -1595,9 +1595,15 @@ mod mesh_bindings {
         ///         'exported', 'global'. Default 'global'.
         ///     reliable: Default reliability for streams on this
         ///         channel.
-        ///     require_token: v1 only supports `False` — token
-        ///         enforcement arrives with the security plan's
-        ///         identity surface.
+        ///     require_token: Require a valid token chain to publish
+        ///         or subscribe. On its own (no `token_roots`) this
+        ///         fails every authorization closed — pass
+        ///         `token_roots` to anchor a root of trust.
+        ///     token_roots: List of 32-byte entity ids whose signature
+        ///         may root a presented token chain. Setting this turns
+        ///         on token enforcement and anchors the channel: a
+        ///         chain is honored only if its root link was issued by
+        ///         one of these entities.
         ///     priority: 0 = lowest.
         ///     max_rate_pps: Rate cap in packets per second.
         ///
@@ -1609,6 +1615,7 @@ mod mesh_bindings {
             visibility = None,
             reliable = None,
             require_token = None,
+            token_roots = None,
             priority = None,
             max_rate_pps = None,
             publish_caps = None,
@@ -1621,6 +1628,7 @@ mod mesh_bindings {
             visibility: Option<&str>,
             reliable: Option<bool>,
             require_token: Option<bool>,
+            token_roots: Option<Vec<Vec<u8>>>,
             priority: Option<u8>,
             max_rate_pps: Option<u32>,
             publish_caps: Option<&Bound<'_, PyDict>>,
@@ -1638,6 +1646,19 @@ mod mesh_bindings {
             }
             if let Some(t) = require_token {
                 cfg = cfg.with_require_token(t);
+            }
+            if let Some(roots) = token_roots {
+                let mut parsed = Vec::with_capacity(roots.len());
+                for bytes in roots {
+                    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                        ChannelError::new_err(format!(
+                            "channel: token_roots entry must be 32 bytes, got {}",
+                            bytes.len()
+                        ))
+                    })?;
+                    parsed.push(net::adapter::net::identity::EntityId::from_bytes(arr));
+                }
+                cfg = cfg.with_token_roots(parsed);
             }
             if let Some(p) = priority {
                 cfg = cfg.with_priority(p);

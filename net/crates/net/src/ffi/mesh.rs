@@ -1712,6 +1712,12 @@ struct ChannelConfigInput {
     visibility: Option<String>,
     reliable: Option<bool>,
     require_token: Option<bool>,
+    /// Root(s) of trust for token authorization: hex-encoded 32-byte
+    /// entity ids (64 hex chars each) whose signature may root a
+    /// presented token chain. Setting this turns on token enforcement
+    /// and anchors the channel; `require_token` alone (no roots) fails
+    /// every authorization closed.
+    token_roots: Option<Vec<String>>,
     priority: Option<u8>,
     max_rate_pps: Option<u32>,
     /// Capability filter restricting who may publish on this
@@ -1770,6 +1776,20 @@ pub unsafe extern "C" fn net_mesh_register_channel(
     }
     if let Some(t) = input.require_token {
         cfg = cfg.with_require_token(t);
+    }
+    if let Some(roots) = input.token_roots {
+        let mut parsed = Vec::with_capacity(roots.len());
+        for hex_id in roots {
+            let bytes = match hex::decode(&hex_id) {
+                Ok(b) => b,
+                Err(_) => return NET_ERR_CHANNEL,
+            };
+            let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) else {
+                return NET_ERR_CHANNEL;
+            };
+            parsed.push(EntityId::from_bytes(arr));
+        }
+        cfg = cfg.with_token_roots(parsed);
     }
     if let Some(p) = input.priority {
         cfg = cfg.with_priority(p);
