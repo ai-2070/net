@@ -1799,6 +1799,14 @@ pub struct MeshNode {
     /// channel_hash)`. Shared with `MeshNode`; see the field of the
     /// same name there.
     subscriber_chains: Arc<DashMap<(u64, ChannelHash), TokenChain>>,
+    /// This node's own publish credentials, keyed by `channel_hash`.
+    /// Installed via [`MeshNode::set_publish_chain`] for channels where
+    /// the node's PUBLISH grant was *delegated* (owner → … → this node)
+    /// rather than issued directly — the publish path prefers a held
+    /// chain here over a single directly-granted token from the
+    /// `TokenCache`, so a delegated publisher isn't fail-closed.
+    /// Local to the publish path; not threaded into `DispatchCtx`.
+    published_chains: Arc<DashMap<ChannelHash, TokenChain>>,
     /// Per-packet authorization fast path. Populated when a
     /// subscribe clears `authorize_subscribe`; consulted on every
     /// publish fan-out via `check_fast`. The bloom filter + verified
@@ -2197,6 +2205,7 @@ impl MeshNode {
             origin_hash_to_node,
             token_cache: None,
             subscriber_chains,
+            published_chains: Arc::new(DashMap::new()),
             auth_guard: Arc::new(AuthGuard::new()),
             auth_failures: Arc::new(DashMap::new()),
             tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -6040,6 +6049,23 @@ impl MeshNode {
         .await
     }
 
+    /// Install this node's own PUBLISH credential for `channel` as a
+    /// (possibly delegated, multi-link) [`TokenChain`].
+    ///
+    /// Use this when the node's right to publish was *delegated*
+    /// (owner → … → this node) rather than granted directly by the
+    /// channel owner: the publish-side ACL builds a single-link chain
+    /// from the local `TokenCache`, whose issuer is the delegator (not
+    /// a channel root), so a delegated grant would otherwise fail the
+    /// root-anchor check and the node couldn't publish. The held chain
+    /// is preferred over the cache fallback on the publish path; its
+    /// leaf must be bound to this node's entity. Re-verified against the
+    /// current clock + revocation on every publish, so an expired or
+    /// revoked held chain fails closed like any other.
+    pub fn set_publish_chain(&self, channel: &ChannelName, chain: TokenChain) {
+        self.published_chains.insert(channel.hash(), chain);
+    }
+
     /// Subscribe in the named queue group: every published event is
     /// delivered to exactly ONE member of the group, distributed
     /// round-robin across members. The publisher's roster carries
@@ -7480,14 +7506,12 @@ impl MeshNode {
                     .map(|ann| ann.capabilities.clone())
                     .unwrap_or_default();
                 let self_entity = self.identity.entity_id().clone();
-                // Build the publish chain from the local node's own
-                // cached token for this channel — a single-link chain
-                // (the node was directly granted PUBLISH by the channel
-                // owner). Multi-hop *locally-held* delegated publish
-                // credentials would need a held-chain store; until then
-                // they fail closed here, which is safe (publish denied).
-                // The transient empty registry/cache keeps the borrow
-                // alive when the node has no token cache configured.
+                // Build the publish chain. Prefer an explicitly-held
+                // (possibly delegated, multi-link) chain installed via
+                // `set_publish_chain` — its issuer can be a delegator
+                // rather than a channel root. Otherwise fall back to a
+                // single directly-granted PUBLISH token from the
+                // `TokenCache`.
                 //
                 // `get_for_action` (not `get`) selects a token that
                 // actually carries PUBLISH on this channel: a slot can
@@ -7495,21 +7519,32 @@ impl MeshNode {
                 // one, and a scope-agnostic `get` would intermittently
                 // return the SUBSCRIBE token, failing the gate even
                 // though a valid PUBLISH grant is cached.
+                //
+                // The transient empty registry keeps the borrow alive
+                // when the node has no token cache configured — a held
+                // chain still publishes in that mode (nothing revoked,
+                // strict skew).
+                let held = self
+                    .published_chains
+                    .get(&cfg.channel_id.hash())
+                    .map(|c| c.value().clone());
                 let transient_revocation;
                 let (revocation, skew, chain) = match self.token_cache.as_ref() {
                     Some(cache) => {
-                        let chain = cache
-                            .get_for_action(
-                                &self_entity,
-                                TokenScope::PUBLISH,
-                                cfg.channel_id.hash(),
-                            )
-                            .map(TokenChain::single);
+                        let chain = held.or_else(|| {
+                            cache
+                                .get_for_action(
+                                    &self_entity,
+                                    TokenScope::PUBLISH,
+                                    cfg.channel_id.hash(),
+                                )
+                                .map(TokenChain::single)
+                        });
                         (cache.revocation().as_ref(), cache.clock_skew_secs(), chain)
                     }
                     None => {
                         transient_revocation = RevocationRegistry::new();
-                        (&transient_revocation, 0u64, None)
+                        (&transient_revocation, 0u64, held)
                     }
                 };
                 if !cfg.can_publish(&self_caps, &self_entity, chain.as_ref(), revocation, skew) {
@@ -11808,6 +11843,67 @@ mod fold_publisher_helpers_tests {
             node.subscriber_chains.get(&(dead, channel_hash)).is_none(),
             "failed peer's retained chain must be evicted"
         );
+    }
+
+    #[tokio::test]
+    async fn delegated_publish_chain_authorizes_publish() {
+        use crate::adapter::net::{ChannelConfig, ChannelConfigRegistry, ChannelId, ChannelName};
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x17u8; 32]);
+        let mut node = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+
+        // Channel rooted at `owner`; the publishing node is NOT a root.
+        let owner = EntityKeypair::generate();
+        let mid = EntityKeypair::generate();
+        let channel = ChannelName::new("fleet/telemetry").unwrap();
+        let registry = ChannelConfigRegistry::new();
+        registry.insert(
+            ChannelConfig::new(ChannelId::new(channel.clone()))
+                .with_token_roots(vec![owner.entity_id().clone()]),
+        );
+        node.set_channel_configs(Arc::new(registry));
+
+        // Delegated PUBLISH chain: owner -> mid -> this node. The node's
+        // own leaf token is issued by `mid` (a delegator), not a channel
+        // root, so a single-link chain from it can't anchor.
+        let root = PermissionToken::issue(
+            &owner,
+            mid.entity_id().clone(),
+            TokenScope::PUBLISH.union(TokenScope::DELEGATE),
+            channel.hash(),
+            3600,
+            2,
+        );
+        let leaf = root
+            .delegate(&mid, node.entity_id().clone(), TokenScope::PUBLISH)
+            .expect("delegation should succeed");
+        let chain = TokenChain {
+            tokens: vec![root, leaf],
+        };
+
+        let publisher = node.channel_publisher(channel.clone(), PublishConfig::default());
+
+        // Without the held chain the publish-side ACL can only build a
+        // single-link chain from the cache, which can't anchor a
+        // delegated grant -> publish denied.
+        assert!(
+            node.publish_many(&publisher, &[Bytes::from_static(b"x")])
+                .await
+                .is_err(),
+            "delegated publisher must be denied until it presents its chain"
+        );
+
+        // Install the delegated chain -> publish admitted (no
+        // subscribers, so it reports an empty fan-out).
+        node.set_publish_chain(&channel, chain);
+        let report = node
+            .publish_many(&publisher, &[Bytes::from_static(b"x")])
+            .await
+            .expect("held delegated chain must authorize publish");
+        assert_eq!(report.attempted, 0);
     }
 
     #[cfg(feature = "cortex")]
