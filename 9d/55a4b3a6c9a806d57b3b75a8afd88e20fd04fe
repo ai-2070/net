@@ -1,0 +1,56 @@
+net/crates/net/tests/channel_auth_hardening.rs
+  s_bd240ee1a66315::t_2adb541a6b0de5 216-219,376-379,476-479
+net/crates/net/docs/misc/SECURITY_AUDIT_2026_05_29_CHANNEL_AUTH.md
+  s_bd240ee1a66315::t_6660000f58a9a0 25-70
+net/crates/net/src/adapter/net/mesh.rs
+  s_bd240ee1a66315::t_819f2c0cbc674c 5988-5996,6002-6018,6024
+  s_bd240ee1a66315::t_1d081b27b6c568 1225,1230-1231,1233,1247-1267,1271,1275
+  s_bd240ee1a66315::t_70b0c03383c9a3 2194
+  s_bd240ee1a66315::t_458e963437aecc 3048
+  s_bd240ee1a66315::t_b2f09ee7b20c1b 6231-6233
+  s_bd240ee1a66315::t_2f805a23af03a7 7178-7185,7208-7224,7233-7235,7237,7244-7250,7254-7261
+  s_bd240ee1a66315::t_b5bee58b720753 7470-7491
+  s_bd240ee1a66315::t_2f3a86ca3daeca 3125
+  s_bd240ee1a66315::t_1d8f9e5e9425fb 589-596
+  s_bd240ee1a66315::t_d2ad95f688c6f7 1809-1812
+  s_bd240ee1a66315::t_1bc9684b1f0c2c 7633-7663,7667-7669,7671
+  s_bd240ee1a66315::t_bc3c308d55752a 3016
+  s_bd240ee1a66315::t_be37f8c5b50c61 48-51
+  s_bd240ee1a66315::t_f17a9ee4d9ff06 6062
+net/crates/net/src/adapter/net/channel/config.rs
+  s_bd240ee1a66315::t_1bd9d9677412f3 136-140,145-147,154,157-165,170-172,179-183,185-208,211-223
+  s_bd240ee1a66315::t_69598449c6ac86 514-531,538,540-541,551,554,557,560-561,563,565-594,597-598,600-604,606-724,730-767,769-776,782-783,786-787,789,791,793,795,797,799-800
+  s_bd240ee1a66315::t_6fe12cdf1e4670 9
+  s_bd240ee1a66315::t_c8df944bb77cb1 45-57
+  s_bd240ee1a66315::t_a5fcac9f48cce2 75
+  s_bd240ee1a66315::t_e64a4f3e51cca2 106-117
+net/crates/net/src/ffi/mesh.rs
+  s_bd240ee1a66315::t_9679995ff1de61 175-179
+net/crates/net/tests/channel_auth.rs
+  s_bd240ee1a66315::t_68476c799ae266 147-150,165-168,192-195,223-226,265-268
+  s_bd240ee1a66315::t_8c9758898f1e92 239-241
+net/crates/net/src/adapter/net/identity/mod.rs
+  s_bd240ee1a66315::t_7e9e699285061b 18-20
+net/crates/net/src/adapter/net/identity/token.rs
+  s_bd240ee1a66315::t_55ea6fe63e43bb 1263
+  s_bd240ee1a66315::t_6dd9121848e3da 1225-1229
+  s_bd240ee1a66315::t_9a7fd3f36fc481 599-626,628-780
+  s_bd240ee1a66315::t_86c34b2dc3d4d1 627
+  s_bd240ee1a66315::t_3e46f6c693dbe1 2487-2552
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "9d55a4b3a6c9a806d57b3b75a8afd88e20fd04fe",
+  "prompts": {},
+  "sessions": {
+    "s_bd240ee1a66315": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "667f7870-8455-48de-a878-cbfa33c034c1",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
