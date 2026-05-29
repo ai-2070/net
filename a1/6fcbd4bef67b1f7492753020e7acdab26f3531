@@ -1,0 +1,21 @@
+net/crates/net/bindings/python/src/identity.rs
+  s_bd240ee1a66315::t_3db4354744dafc 52
+net/crates/net/bindings/node/src/identity.rs
+  s_bd240ee1a66315::t_dbaf7f0de4cb01 55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "a16fcbd4bef67b1f7492753020e7acdab26f3531",
+  "prompts": {},
+  "sessions": {
+    "s_bd240ee1a66315": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "667f7870-8455-48de-a878-cbfa33c034c1",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
