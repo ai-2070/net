@@ -1,0 +1,21 @@
+net/crates/net/docs/plans/MESHOS_SNAPSHOT_CHANGE_GATING_PLAN.md
+  s_fdb46fb80683d5::t_c755ef6182964a 64-79
+  s_fdb46fb80683d5::t_97389523c64bea 139-143,148-154
+  s_fdb46fb80683d5::t_de64a0d269da6b 98-119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "4c2de9b796d2caee452707c4c4038ec3bf175aa1",
+  "prompts": {},
+  "sessions": {
+    "s_fdb46fb80683d5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9a93586-a0dc-4f55-bb20-4b9647fcd32d",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
