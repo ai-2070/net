@@ -1,5 +1,5 @@
 [toolchain]
-channel = "1.95.0"
+channel = "1.96.0"
 # `llvm-tools-preview` is required by `cargo-llvm-cov` (the coverage
 # tool wired up in `.github/workflows/coverage.yml`) — it provides
 # the `llvm-profdata` + `llvm-cov` binaries source-based coverage
