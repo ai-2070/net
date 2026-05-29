@@ -1253,18 +1253,7 @@ fn sweep_expired_subscribers(
             // force a re-subscribe that re-presents.
             let authorized = subscriber_chains
                 .get(&(node_id, name.hash()))
-                .is_some_and(|chain| {
-                    chain
-                        .verify_authorizes(
-                            super::identity::TokenScope::SUBSCRIBE,
-                            name.hash(),
-                            &entity_id,
-                            &cfg.token_roots,
-                            revocation,
-                            skew,
-                        )
-                        .is_ok()
-                });
+                .is_some_and(|chain| cfg.reverify_subscribe(&chain, &entity_id, revocation, skew));
             if !authorized {
                 guard.revoke_channel(subscriber_origin_hash(node_id), name);
                 roster.remove(&channel_id, node_id);
@@ -7668,31 +7657,25 @@ impl MeshNode {
             // path anchored to the channel's root of trust, same as
             // the subscribe path and the periodic sweep.
             let entity = self.peer_entity_ids.get(peer_id).map(|e| e.value().clone());
-            let chain_ok = match (entity, self.token_cache.as_ref()) {
-                (Some(entity), Some(cache)) => self
+            let chain_ok = match (entity, self.token_cache.as_ref(), cfg_snapshot.as_ref()) {
+                (Some(entity), Some(cache), Some(cfg)) => self
                     .subscriber_chains
                     .get(&(*peer_id, channel_hash))
                     .is_some_and(|chain| {
-                        let roots = cfg_snapshot
-                            .as_ref()
-                            .map(|c| c.token_roots.as_slice())
-                            .unwrap_or(&[]);
-                        chain
-                            .verify_authorizes(
-                                TokenScope::SUBSCRIBE,
-                                channel_hash,
-                                &entity,
-                                roots,
-                                cache.revocation().as_ref(),
-                                cache.clock_skew_secs(),
-                            )
-                            .is_ok()
+                        cfg.reverify_subscribe(
+                            &chain,
+                            &entity,
+                            cache.revocation().as_ref(),
+                            cache.clock_skew_secs(),
+                        )
                     }),
-                // Missing entity binding or no cache installed —
-                // treat as unauthorized. The subscribe path would
-                // have rejected this peer in the first place;
+                // Missing entity binding, no cache, or no channel
+                // config — treat as unauthorized. The subscribe path
+                // would have rejected this peer in the first place;
                 // reaching here means config drift we must not paper
-                // over by admitting the publish.
+                // over by admitting the publish. (A missing config also
+                // means no roots, which the re-verify would reject
+                // anyway.)
                 _ => false,
             };
             if !chain_ok {

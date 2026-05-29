@@ -237,6 +237,33 @@ impl ChannelConfig {
             )
             .is_ok()
     }
+
+    /// Re-verify a previously-presented `SUBSCRIBE` chain against the
+    /// current clock + revocation floors, anchored to this channel's
+    /// roots. Shared by the periodic expiry sweep and the publish-time
+    /// re-check so the root-anchoring contract (which roots, which
+    /// action, which channel hash) lives in exactly one place instead
+    /// of being re-threaded at each call site — where it had already
+    /// started to diverge (`token_roots` vs. an `unwrap_or(&[])`
+    /// fallback).
+    pub fn reverify_subscribe(
+        &self,
+        chain: &TokenChain,
+        entity_id: &EntityId,
+        revocation: &RevocationRegistry,
+        skew_secs: u64,
+    ) -> bool {
+        chain
+            .verify_authorizes(
+                TokenScope::SUBSCRIBE,
+                self.channel_id.hash(),
+                entity_id,
+                &self.token_roots,
+                revocation,
+                skew_secs,
+            )
+            .is_ok()
+    }
 }
 
 /// Registry of channel configurations.
