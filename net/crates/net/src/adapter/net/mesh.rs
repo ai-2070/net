@@ -2022,6 +2022,15 @@ impl MeshNode {
         let peer_entity_ids_failure = peer_entity_ids.clone();
         let origin_hash_to_node_failure = origin_hash_to_node.clone();
         let capability_fold_failure = capability_fold.clone();
+        // Created here (not in the struct literal) so the failure
+        // callback can drop a dead peer's retained subscribe chains —
+        // otherwise the entries leak until an explicit unsubscribe that
+        // a failed peer never sends, and the sweep can't reclaim them
+        // (it only visits peers still in `peer_entity_ids`, which the
+        // callback below clears).
+        let subscriber_chains: Arc<DashMap<(u64, ChannelHash), TokenChain>> =
+            Arc::new(DashMap::new());
+        let subscriber_chains_failure = subscriber_chains.clone();
         let failure_detector = FailureDetector::with_config(FailureDetectorConfig {
             timeout: config.session_timeout,
             miss_threshold: 3,
@@ -2064,6 +2073,13 @@ impl MeshNode {
             // failure; the capability fold is now consistent
             // with them.
             capability_fold_failure.evict_node(node_id, "failure-detector");
+            // Drop any retained subscribe token chains for this peer.
+            // The sweep can no longer reach them (it iterates
+            // `peer_entity_ids`, just cleared above), and a failed peer
+            // never sends the unsubscribe that would otherwise remove
+            // them — so without this they leak for the node's lifetime,
+            // and a reused `node_id` could re-validate a stale chain.
+            subscriber_chains_failure.retain(|(nid, _), _| *nid != node_id);
         })
         .on_recovery(move |node_id| rp_recovery.on_recovery(node_id));
 
@@ -2191,7 +2207,7 @@ impl MeshNode {
             peer_entity_ids,
             origin_hash_to_node,
             token_cache: None,
-            subscriber_chains: Arc::new(DashMap::new()),
+            subscriber_chains,
             auth_guard: Arc::new(AuthGuard::new()),
             auth_failures: Arc::new(DashMap::new()),
             tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -11747,6 +11763,60 @@ mod fold_publisher_helpers_tests {
         assert_eq!(gw.local_subnet(), SubnetId::GLOBAL);
         assert_eq!(gw.forwarded_count(), 0);
         assert_eq!(gw.dropped_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_peer_eviction_drops_retained_subscribe_chains() {
+        // A peer that fails (heartbeat timeout) never sends an
+        // unsubscribe, and the periodic sweep can't reach its retained
+        // chain once `peer_entity_ids` is cleared — so the
+        // failure-detector callback must drop it directly, scoped to the
+        // failed node and nothing else.
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg =
+            MeshNodeConfig::new(addr, [0x17u8; 32]).with_session_timeout(Duration::from_millis(1));
+        let node = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+
+        let dead: u64 = 0xDEAD;
+        let live: u64 = 0xBEEF;
+        let channel_hash: ChannelHash = 0x1234;
+
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let chain = TokenChain::single(PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::SUBSCRIBE,
+            channel_hash,
+            3600,
+            0,
+        ));
+        node.subscriber_chains
+            .insert((dead, channel_hash), chain.clone());
+        node.subscriber_chains.insert((live, channel_hash), chain);
+        assert_eq!(node.subscriber_chains.len(), 2);
+
+        node.failure_detector.heartbeat(dead, addr);
+        node.failure_detector.heartbeat(live, addr);
+
+        // Age `dead`'s heartbeat well past `miss_threshold × timeout`,
+        // then refresh `live` so only `dead` trips.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        node.failure_detector.heartbeat(live, addr);
+
+        let failed = node.failure_detector.check_all();
+        assert!(failed.contains(&dead), "dead peer must be detected failed");
+
+        assert!(
+            node.subscriber_chains.get(&(live, channel_hash)).is_some(),
+            "live peer's retained chain must survive"
+        );
+        assert!(
+            node.subscriber_chains.get(&(dead, channel_hash)).is_none(),
+            "failed peer's retained chain must be evicted"
+        );
     }
 
     #[cfg(feature = "cortex")]
