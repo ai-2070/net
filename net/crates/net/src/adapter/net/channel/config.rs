@@ -707,7 +707,10 @@ mod tests {
         // Deliberately leave `require_token` false — the two fields are
         // both public and can drift out of sync.
         assert!(!config.require_token);
-        assert!(config.token_required(), "named roots must imply enforcement");
+        assert!(
+            config.token_required(),
+            "named roots must imply enforcement"
+        );
 
         // No chain -> denied (would have been silently admitted pre-fix).
         assert!(!config.can_subscribe(&caps, subject.entity_id(), None, &rev, 0));

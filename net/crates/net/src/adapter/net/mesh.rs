@@ -7331,8 +7331,10 @@ impl MeshNode {
             // re-check re-establishes it without trusting cross-path
             // state. (Marking it verified here would only save the one
             // first-publish verification.)
-            ctx.subscriber_chains
-                .insert((from_node, cfg.channel_id.hash()), RetainedChain::new(chain));
+            ctx.subscriber_chains.insert(
+                (from_node, cfg.channel_id.hash()),
+                RetainedChain::new(chain),
+            );
         }
         (true, None)
     }
