@@ -2553,12 +2553,174 @@ impl MeshBlobAdapter {
     /// that's N×payload_size bytes of memcpy avoided.
     #[doc(hidden)]
     pub async fn fetch_chunk(&self, hash: &[u8; 32]) -> Result<Bytes, BlobError> {
-        // v0.2: local-only read. The cross-peer fallback (S-2) wraps
-        // this in [`Self::fetch_chunk`]'s public surface once the
-        // `blob.fetch_chunk` nRPC consumer side lands; the RPC
-        // *handler* (S-1) always reads through this local-only path
-        // so a serve never recurses back out to the mesh.
-        self.fetch_chunk_local(hash).await
+        // Local store first. On a miss, fall back to peers advertising
+        // `causal:<hex>` for this chunk (federation S-2) when peer
+        // fetch is wired; the RPC *handler* (S-1) reads through
+        // `fetch_chunk_local` instead, so a serving node never fans a
+        // request back out to the mesh.
+        match self.fetch_chunk_local(hash).await {
+            Ok(bytes) => Ok(bytes),
+            Err(local_miss @ BlobError::NotFound(_)) => {
+                self.fetch_chunk_from_peers(hash, local_miss).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Cross-peer fetch fallback (federation S-2). Consults the
+    /// capability fold for nodes advertising `causal:<hex>` for
+    /// `hash`, pages the chunk from the closest healthy holder over
+    /// the `blob.fetch_chunk` nRPC, verifies the assembled bytes
+    /// against the content hash, stores them locally (so the next
+    /// fetch is local and the node becomes a holder), and returns.
+    ///
+    /// Failover: a holder that misses, errors, or returns bytes that
+    /// fail verification is skipped and the next advertised holder is
+    /// tried. When peer fetch isn't wired, no holder advertises the
+    /// chunk, or every holder fails, the original local-miss error is
+    /// returned unchanged.
+    ///
+    /// The auto-store on success is what makes caching and cross-
+    /// directory dedup emergent properties of the adapter rather than
+    /// a separate layer: identical content fetched once is local
+    /// thereafter, and a second file sharing chunks finds them
+    /// already present.
+    #[cfg(feature = "cortex")]
+    async fn fetch_chunk_from_peers(
+        &self,
+        hash: &[u8; 32],
+        local_miss: BlobError,
+    ) -> Result<Bytes, BlobError> {
+        let Some(mesh) = self.peer_fetch_mesh() else {
+            // Local-only adapter — no fallback.
+            return Err(local_miss);
+        };
+        let self_id = mesh.node_id();
+        // Proximity-sorted holders, excluding ourselves (we already
+        // missed locally). The capability fold's self-index would
+        // otherwise list us as a phantom holder.
+        let holders: Vec<u64> = mesh
+            .find_blob_chunk_holders(hash)
+            .into_iter()
+            .filter(|&node| node != self_id)
+            .collect();
+        if holders.is_empty() {
+            return Err(local_miss);
+        }
+        for holder in holders {
+            match self.fetch_chunk_from_one_peer(&mesh, holder, hash).await {
+                Ok(bytes) => {
+                    // Verify before trusting a peer's bytes — a buggy or
+                    // adversarial holder could serve mismatched content.
+                    let computed: [u8; 32] = blake3::hash(&bytes).into();
+                    if computed != *hash {
+                        tracing::warn!(
+                            holder,
+                            hash = %hex32(hash),
+                            "blob fetch_chunk: peer served bytes failing verification; trying next holder",
+                        );
+                        continue;
+                    }
+                    // Auto-store: makes the next fetch local, dedups
+                    // shared content, and advertises us as a holder. A
+                    // store failure must not fail the fetch — we still
+                    // hold the verified bytes in hand.
+                    if let Err(e) = self.store_chunk(hash, &bytes).await {
+                        tracing::debug!(
+                            error = %e,
+                            hash = %hex32(hash),
+                            "blob fetch_chunk: local auto-store after peer fetch failed",
+                        );
+                    }
+                    return Ok(bytes);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        holder,
+                        hash = %hex32(hash),
+                        "blob fetch_chunk: holder fetch failed; trying next holder",
+                    );
+                    continue;
+                }
+            }
+        }
+        Err(local_miss)
+    }
+
+    /// Page a whole chunk from a single peer over the segmented
+    /// `blob.fetch_chunk` nRPC. Issues successive range requests
+    /// (each ≤ [`super::fetch_rpc::FETCH_CHUNK_SEGMENT_BYTES`]) until
+    /// the full chunk is assembled. Returns `NotFound` if the holder
+    /// no longer has the chunk, `Backend` on a protocol violation
+    /// (offset skew, no-progress empty segment).
+    #[cfg(feature = "cortex")]
+    async fn fetch_chunk_from_one_peer(
+        &self,
+        mesh: &Arc<crate::adapter::net::MeshNode>,
+        holder: u64,
+        hash: &[u8; 32],
+    ) -> Result<Bytes, BlobError> {
+        use super::fetch_rpc::{FetchChunkResponse, FETCH_CHUNK_SEGMENT_BYTES};
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut offset: u64 = 0;
+        loop {
+            let end = offset.saturating_add(FETCH_CHUNK_SEGMENT_BYTES);
+            let resp = mesh
+                .send_blob_fetch_chunk(holder, *hash, Some((offset, end)))
+                .await?;
+            match resp {
+                FetchChunkResponse::NotFound => {
+                    return Err(BlobError::NotFound(format!("mesh://{}", hex32(hash))));
+                }
+                FetchChunkResponse::Segment {
+                    total_len,
+                    offset: seg_offset,
+                    data,
+                } => {
+                    if seg_offset != offset {
+                        return Err(BlobError::Backend(format!(
+                            "blob fetch_chunk: holder {holder} returned offset {seg_offset}, expected {offset}",
+                        )));
+                    }
+                    if total_len == 0 {
+                        // A content-addressed chunk is never empty; an
+                        // empty total means the holder doesn't really
+                        // have it.
+                        return Err(BlobError::NotFound(format!("mesh://{}", hex32(hash))));
+                    }
+                    if buf.is_empty() {
+                        buf.reserve(total_len as usize);
+                    }
+                    if data.is_empty() {
+                        // No forward progress — bail rather than spin
+                        // against a misbehaving holder.
+                        return Err(BlobError::Backend(format!(
+                            "blob fetch_chunk: holder {holder} returned empty segment at offset {offset}",
+                        )));
+                    }
+                    offset = offset.saturating_add(data.len() as u64);
+                    buf.extend_from_slice(&data);
+                    if offset >= total_len {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(Bytes::from(buf))
+    }
+
+    /// Local-only build (no `cortex` RPC layer): there is no peer to
+    /// fetch from, so a local miss is final. Keeps the public
+    /// [`Self::fetch_chunk`] body identical across feature configs.
+    #[cfg(not(feature = "cortex"))]
+    async fn fetch_chunk_from_peers(
+        &self,
+        _hash: &[u8; 32],
+        local_miss: BlobError,
+    ) -> Result<Bytes, BlobError> {
+        Err(local_miss)
     }
 
     /// Local-only chunk read. Reads the content-addressed chunk
