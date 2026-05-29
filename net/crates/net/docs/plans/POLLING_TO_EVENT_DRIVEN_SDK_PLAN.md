@@ -278,10 +278,28 @@ drops the stream eagerly so the node stays shutdownable; the substrate watch
 otherwise releases its ref when the receiver drops. Not a leak, but worth knowing
 when reasoning about shutdown with a live watcher.
 
+**Post-review fixes (2026-05-29).** A review pass over the branch landed three
+follow-ups:
+- **Eager subscribe (Node/Python).** The Node TS and Python `watch_tools`
+  wrappers subscribed to the substrate watch lazily — on the first iteration of
+  the returned async iterable — so a change published between the `watch_tools()`
+  call and the first iteration was dropped. Both now subscribe at call time
+  (Python fully closes the race since the pyo3 iter takes its baseline
+  synchronously; Node kicks off the napi promise eagerly), matching the Rust SDK.
+- **camelCase wire-shape guard.** `descriptor_to_camel_json` (Node) now
+  destructures `ToolDescriptor`, so a new field is a compile error until it's
+  mapped into the camelCase wire shape; unit tests pin the exact key set.
+- **Named FFI code.** The Go watch loop's bare `-6` (STREAM_DONE) is now a named
+  `cRPCStreamDone` constant.
+
 **Deferred (E-10).** Change-gate `publish_snapshot` (only `store` + notify when the
 new snapshot differs, via a reconcile-bumped generation counter) to eliminate
 tick-rate wakeups on an idle MeshOS loop. Out of scope for the deck-watch
-migration; a separate optimization to the loop itself.
+migration; a separate optimization to the loop itself. The deck `SnapshotStream` /
+`StatusSummaryStream` "best-effort per edge" property (a publish landing between a
+`Ready` return and the next re-armed `changed()` poll is coalesced, bounded by the
+ceiling) is a consequence of the `Notify` design and is resolved by the same E-10
+generation-counter work — left as-is until then.
 
 **Validation note.** The dev box has no C toolchain, so Go cgo link is
 CI-validated; the Rust sides of all bindings compile locally with `--features
