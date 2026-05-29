@@ -1083,12 +1083,12 @@ impl DeckClient {
             .collect()
     }
 
-    /// Await a snapshot matching `predicate`. Event-driven (E-9):
-    /// blocks on the loop's snapshot-publish signal
-    /// ([`MeshOsSnapshotReader::changed`]) and re-tests `predicate`
-    /// on each publish, so a match is observed as soon as the loop
-    /// republishes rather than on the next poll tick. If the current
-    /// snapshot already matches, resolves immediately.
+    /// Await a snapshot matching `predicate`. Event-driven (E-9/E-10):
+    /// blocks on the loop's structural change signal (the snapshot
+    /// reader's `subscribe_changes`) and re-tests `predicate` on each
+    /// change, so a match is observed as soon as the loop publishes a
+    /// structurally-changed snapshot rather than on the next poll tick.
+    /// If the current snapshot already matches, resolves immediately.
     ///
     /// [`DeckClientConfig::snapshot_poll_interval`] is retained as a
     /// debounce ceiling, not a poll cadence: it bounds the re-test
