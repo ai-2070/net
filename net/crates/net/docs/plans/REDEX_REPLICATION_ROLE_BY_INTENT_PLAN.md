@@ -21,6 +21,12 @@ For content-addressed blob chunks the role is **known by intent**, not decided b
 
 The general placement-driven auto-election (the original "Phase F") is a different, harder problem — `elect()` sets self-RTT = 0 (`replication_election.rs:123`), so a symmetric cold start has every node electing itself (dual-leader, resolved only by after-the-fact convergence). We do **not** need that for blobs and explicitly do **not** take it on here. Role-by-intent sidesteps the election consensus problem entirely.
 
+## Locked decisions (2026-05-30)
+
+1. **Reader signal:** keep `CapabilitySelected` for the reader's `Idle → Replica`. **No `ClaimReplica` signal** — it adds matrix/metric/mental surface to express something already expressible; `CapabilitySelected` ("this node opened the channel and is a placement-eligible participant") is semantically fine for CA blob replication. Revisit only when a non-blob channel needs distinct fetch-intent instrumentation.
+2. **No empty-file guard on `ClaimLeadership`.** The role state machine is a *coordination* semantic and must not inspect blob-storage state (cross-layer coupling / architectural violation). Authority in a CA system = "I hold the object," enforced by the **caller contract** (`become_chunk_leader` is only called post-`store`), not by the state machine. Document the contract; keep the SM pure and orthogonal.
+3. **`ClaimLeadership` gets its own metric label**, distinct from `ElectionWon`. Intent-leadership must not pollute election telemetry — ops needs to distinguish a CA-writer claiming leadership from real election pathology (RTT thrash, partition recovery, conflict resolution). No overlap.
+
 ## Plan
 
 ### R-1: add a direct `Idle → Leader` transition
@@ -29,7 +35,7 @@ The general placement-driven auto-election (the original "Phase F") is a differe
 
 **What:** add a new `TransitionSignal::ClaimLeadership` and permit `(Idle, Leader, ClaimLeadership)` in the matrix. Semantics: "this node holds the authoritative copy and claims leadership for the channel" — the content-addressed-writer case. Update `pair_is_valid_for_some_signal` and the matrix-coverage test (valid-pair count goes 8 → 9).
 
-Optionally add `TransitionSignal::ClaimReplica` as an honest alias for the reader's `Idle → Replica` (today reusing `CapabilitySelected`, which is about placement-filter selection, not fetch intent). Low priority — `CapabilitySelected` already works; decide during implementation whether the clarity is worth the extra signal.
+Per decision 1, **no `ClaimReplica`** — the reader keeps using `CapabilitySelected`. Per decision 3, wherever the coordinator maps signals to transition metrics, `ClaimLeadership` gets its **own label**, never folded into `ElectionWon` / election-thrash counters.
 
 ### R-2: expose a clean coordinator claim path
 
@@ -61,8 +67,8 @@ Optionally add `TransitionSignal::ClaimReplica` as an honest alias for the reade
 - **No change to the wire protocol** (`SyncRequest`/`SyncResponse`/heartbeat) or to durability/retention semantics.
 - **No removal of the manual-driving public API.** `become_chunk_leader`/`become_chunk_replica` stay as the primitive; they just transition honestly now.
 
-## Risks & open questions
+## Risks & resolved questions
 
-- **Relaxing "Leader only via election."** Audit every consumer that might assume a Leader came through `Candidate` (metrics labels like `election_thrash_total`, any invariant in `replication_runtime.rs`/`replication_coordinator.rs`). `ClaimLeadership` should be its own metric label, distinct from `ElectionWon`, so dashboards don't read intent-claims as election thrash.
-- **Two nodes claim leadership for the same content** (both `store` the same chunk). Both go `Idle → Leader` directly. Dual-leader convergence must still fire (`PeerLeaderObserved` on heartbeat) and converge to one — verify it does for two intent-claimed leaders, not just two election-won ones. Harmless either way (identical bytes), but it should converge, not thrash.
-- **A claimed Leader with an empty file.** `become_chunk_leader` is only called post-`store` (file non-empty), so this shouldn't happen via the blob path; but the transition itself doesn't check file state. Decide whether to guard (reject claim on empty file) or document the caller contract.
+- **Relaxing "Leader only via election."** Audit every consumer that might assume a Leader came through `Candidate` (metric labels like `election_thrash_total`, any invariant in `replication_runtime.rs`/`replication_coordinator.rs`). **Resolved (decision 3):** `ClaimLeadership` is its own metric label, never folded into `ElectionWon` / thrash counters, so dashboards don't read intent-claims as election pathology.
+- **Two nodes claim leadership for the same content** (both `store` the same chunk). Both go `Idle → Leader` directly. Dual-leader convergence must still fire (`PeerLeaderObserved` on heartbeat) and converge to one — verify it does for two intent-claimed leaders, not just two election-won ones (add a test if not covered). Harmless either way (identical bytes), but it must converge, not thrash.
+- **A claimed Leader with an empty file.** **Resolved (decision 2):** no guard in the state machine — that would couple the coordination layer to blob-storage state. The caller contract (`become_chunk_leader` only post-`store`) is the enforcement; documented on the helper. An empty-file claim is only reachable by API misuse.
