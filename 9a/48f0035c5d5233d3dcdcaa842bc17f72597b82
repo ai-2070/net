@@ -1,0 +1,19 @@
+net/crates/net/tests/cross_peer_blob.rs
+  s_3813c1cf893940::t_15ca16a4d0eb71 299-411
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "9a48f0035c5d5233d3dcdcaa842bc17f72597b82",
+  "prompts": {},
+  "sessions": {
+    "s_3813c1cf893940": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8f529043-9c28-441a-89cc-3de50f96f588",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
