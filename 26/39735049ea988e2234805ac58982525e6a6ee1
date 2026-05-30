@@ -1,0 +1,23 @@
+net/crates/net/tests/cross_peer_blob.rs
+  s_3813c1cf893940::t_d95da4c7c36e20 299-315,317,320
+  s_3813c1cf893940::t_fb76ace15268a5 298,316,318-319,322-400
+  s_3813c1cf893940::t_f6a433bb9d28fa 321
+net/crates/net/src/adapter/net/dataforts/dir.rs
+  s_3813c1cf893940::t_b9f56e0df0c8bb 22-35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "2639735049ea988e2234805ac58982525e6a6ee1",
+  "prompts": {},
+  "sessions": {
+    "s_3813c1cf893940": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8f529043-9c28-441a-89cc-3de50f96f588",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
