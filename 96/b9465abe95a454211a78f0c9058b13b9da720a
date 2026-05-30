@@ -1,0 +1,23 @@
+net/crates/net/tests/redex_transfer_bench.rs
+  s_3813c1cf893940::t_3ba0f04347f5d1 1-21,55-112,114-125,127-134,136-190,192-193,218,221-229,231-238,240-247,249-264,266-267
+  s_3813c1cf893940::t_f3d09ccb6dc6f6 191,194-217,219-220,230
+  s_3813c1cf893940::t_a1c4e4599c48dd 239,248,265
+  s_3813c1cf893940::t_0551ccdb269ab4 22-54
+  s_3813c1cf893940::t_fa3d8068c963f8 113,126,135
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "96b9465abe95a454211a78f0c9058b13b9da720a",
+  "prompts": {},
+  "sessions": {
+    "s_3813c1cf893940": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8f529043-9c28-441a-89cc-3de50f96f588",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
