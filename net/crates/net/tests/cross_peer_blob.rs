@@ -387,15 +387,18 @@ async fn replication_transfers_past_advertisement_ceiling() {
 }
 
 /// Federation phase 2 — END-TO-END directory transfer via replication,
-/// past the advertisement ceiling. A 25-file tree (more chunks than a
-/// single capability announcement can advertise) moves A→B purely over
-/// RedEX replication: no per-chunk `causal` tag, no fetch RPC.
+/// past the advertisement ceiling, TRANSPARENTLY. A 60-file tree (far
+/// more chunks than a single capability announcement can advertise)
+/// moves A→B over RedEX replication using plain `store_dir`/`fetch_dir`
+/// — no `become_*` calls, no per-chunk `causal` tag, no fetch RPC. The
+/// replication-configured adapter auto-leaders on store (A-1) and
+/// auto-replicas + pulls on fetch (A-2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replicated_directory_transfer_end_to_end() {
-    use net::adapter::net::dataforts::{become_dir_leader, fetch_dir_replicated, store_dir};
+    use net::adapter::net::dataforts::{fetch_dir, store_dir};
     use net::adapter::net::redex::{PlacementStrategy, ReplicationConfig};
 
-    const N_FILES: usize = 25;
+    const N_FILES: usize = 60;
 
     let node_a = build_node().await;
     let node_b = build_node().await;
@@ -433,23 +436,17 @@ async fn replicated_directory_transfer_end_to_end() {
         std::fs::write(sub.join(format!("f{i}.bin")), &content).unwrap();
     }
 
-    // A stores the tree and becomes leader for every chunk.
+    // A stores the tree — auto-leaders every chunk (A-1). No become_*.
     let root_ref = store_dir(adapter_a.as_ref(), &src)
         .await
         .expect("A store_dir");
-    become_dir_leader(&adapter_a, &root_ref)
-        .await
-        .expect("A become_dir_leader");
 
-    // B pulls the whole tree via replication and reconstructs it.
-    fetch_dir_replicated(
-        &adapter_b,
-        &root_ref,
-        &dst,
-        std::time::Duration::from_secs(20),
-    )
-    .await
-    .expect("B fetch_dir_replicated");
+    // B reconstructs by fetching — each fetch auto-replicas + pulls via
+    // replication (A-2), blocking until local. No become_*, no RPC, no
+    // advertisement.
+    fetch_dir(adapter_b.as_ref(), &root_ref, &dst)
+        .await
+        .expect("B fetch_dir");
 
     // Verify every file byte-for-byte.
     for i in 0..N_FILES {

@@ -111,6 +111,19 @@ pub const DEFAULT_OVERFLOW_MAX_PUSHES_PER_TICK: usize = 16;
 /// consumers needing TB-scale walks page through smaller slices.
 pub const MAX_FETCH_RANGE_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// How long a replication-mode `fetch` waits for the replication
+/// runtime to deliver a missing chunk before giving up. Generous —
+/// covers discovery (heartbeat) + the SyncRequest/SyncResponse/apply
+/// round-trip across a slow link. A miss past this surfaces as
+/// `NotFound`, same as the RPC path's holder-exhaustion.
+pub const REPLICATION_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Poll cadence while waiting on a replication-mode fetch. Short
+/// enough that localhost transfers feel immediate, long enough not to
+/// spin. The replication runtime drives delivery on its own heartbeat;
+/// this only paces the local-store re-read.
+pub const REPLICATION_FETCH_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 /// Type alias for the per-adapter Reed-Solomon encoder cache.
 /// Factored out to keep the field declaration readable and to
 /// satisfy clippy's type-complexity threshold.
@@ -2589,6 +2602,9 @@ impl MeshBlobAdapter {
             // The chunk is present locally (idempotent re-store) — make
             // sure peers can still discover us as a holder.
             self.advertise_chunk_held(*hash);
+            // Role-by-intent: the writer is the authoritative source, so
+            // a replication-configured adapter leads this chunk channel.
+            self.auto_leader_if_replicated(hash).await;
             return Ok(());
         }
         file.append(bytes)
@@ -2598,7 +2614,29 @@ impl MeshBlobAdapter {
         // Advertise the new holding so peers can fetch this chunk from
         // us via `blob.fetch_chunk`. Best-effort; never fails the store.
         self.advertise_chunk_held(*hash);
+        // Role-by-intent: a replication-configured adapter becomes Leader
+        // for the chunk it just wrote, so its replication runtime serves
+        // the bytes to fetchers. No-op without replication.
+        self.auto_leader_if_replicated(hash).await;
         Ok(())
+    }
+
+    /// If replication is configured, drive this node to Leader for the
+    /// chunk channel of `hash` (role-by-intent: the content-addressed
+    /// writer is the authoritative source). Best-effort — a transition
+    /// failure is logged but never fails the store. No-op when
+    /// replication isn't configured (the per-chunk `causal` + RPC path).
+    async fn auto_leader_if_replicated(&self, hash: &[u8; 32]) {
+        if self.replication.is_none() {
+            return;
+        }
+        if let Err(e) = self.become_chunk_leader(hash).await {
+            tracing::warn!(
+                error = %e,
+                hash = %hex32(hash),
+                "blob: auto-leader on store failed; chunk may not replicate until re-stored",
+            );
+        }
     }
 
     /// Fetch a single chunk by hash. Returns `BlobError::NotFound`
@@ -2618,17 +2656,55 @@ impl MeshBlobAdapter {
     /// that's N×payload_size bytes of memcpy avoided.
     #[doc(hidden)]
     pub async fn fetch_chunk(&self, hash: &[u8; 32]) -> Result<Bytes, BlobError> {
-        // Local store first. On a miss, fall back to peers advertising
-        // `causal:<hex>` for this chunk (federation S-2) when peer
-        // fetch is wired; the RPC *handler* (S-1) reads through
-        // `fetch_chunk_local` instead, so a serving node never fans a
-        // request back out to the mesh.
+        // Local store first. On a miss, the pull path is determined by
+        // config, never raced or mixed:
+        //   - with_replication → pull via the replication runtime
+        //     (reliable, scalable, role-by-intent). The fetcher becomes
+        //     a Replica and blocks until the leader's bytes arrive.
+        //   - otherwise → the per-chunk `causal` + `blob.fetch_chunk`
+        //     RPC fallback (S-2), for small chunks / discovery-driven
+        //     pulls.
+        // The RPC *handler* (S-1) reads through `fetch_chunk_local`
+        // instead, so a serving node never fans a request back out.
         match self.fetch_chunk_local(hash).await {
             Ok(bytes) => Ok(bytes),
             Err(local_miss @ BlobError::NotFound(_)) => {
-                self.fetch_chunk_from_peers(hash, local_miss).await
+                if self.replication.is_some() {
+                    self.fetch_chunk_via_replication(hash, local_miss).await
+                } else {
+                    self.fetch_chunk_from_peers(hash, local_miss).await
+                }
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// Replication-mode pull (role-by-intent receiver side). The local
+    /// miss already opened the chunk channel with replication armed
+    /// (via `fetch_chunk_local`'s `open_file`), so this drives the node
+    /// to Replica and polls the local store until the replication
+    /// runtime delivers the leader's bytes, or the timeout elapses.
+    ///
+    /// Used only when `with_replication` is configured — replication is
+    /// the transport, never raced with or falling back to the RPC path.
+    async fn fetch_chunk_via_replication(
+        &self,
+        hash: &[u8; 32],
+        local_miss: BlobError,
+    ) -> Result<Bytes, BlobError> {
+        self.become_chunk_replica(hash).await?;
+        let deadline = std::time::Instant::now() + REPLICATION_FETCH_TIMEOUT;
+        loop {
+            match self.fetch_chunk_local(hash).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(BlobError::NotFound(_)) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(local_miss);
+                    }
+                    tokio::time::sleep(REPLICATION_FETCH_POLL_INTERVAL).await;
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
 
@@ -3790,6 +3866,20 @@ impl BlobAdapter for MeshBlobAdapter {
             self.redex.open_file(&channel, cfg.clone()).map_err(|e| {
                 BlobError::Backend(format!("mesh blob: prefetch open chunk: {}", e))
             })?;
+            // Role-by-intent: a prefetch means "I want this chunk", so a
+            // replication-configured adapter becomes a Replica and its
+            // runtime starts pulling from the channel's leader. No-op
+            // without replication (the chunk just sits open until the
+            // RPC/causal fetch path pulls it).
+            if self.replication.is_some() {
+                if let Err(e) = self.become_chunk_replica(&hash).await {
+                    tracing::warn!(
+                        error = %e,
+                        hash = %hex32(&hash),
+                        "blob: prefetch auto-replica failed",
+                    );
+                }
+            }
         }
         Ok(())
     }

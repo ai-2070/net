@@ -38,8 +38,8 @@ pub use greedy::{
 
 #[cfg(feature = "dataforts")]
 pub use dir::{
-    become_dir_leader, fetch_dir, fetch_dir_replicated, fetch_dir_with_concurrency, store_dir,
-    DirEntry, DirError, DirManifest, DirNode, DEFAULT_DIR_FETCH_CONCURRENCY,
+    fetch_dir, fetch_dir_with_concurrency, store_dir, DirEntry, DirError, DirManifest, DirNode,
+    DEFAULT_DIR_FETCH_CONCURRENCY,
 };
 
 #[cfg(feature = "dataforts")]
