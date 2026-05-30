@@ -163,7 +163,11 @@ async fn cross_peer_blob_fetch_round_trip() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut observed = 0u32;
     while tokio::time::Instant::now() < deadline {
-        observed = adapter_b.stat(&blob_ref).await.expect("B stat").replicas_observed;
+        observed = adapter_b
+            .stat(&blob_ref)
+            .await
+            .expect("B stat")
+            .replicas_observed;
         if observed >= 2 {
             break;
         }

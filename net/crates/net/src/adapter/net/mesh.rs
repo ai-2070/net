@@ -13416,7 +13416,10 @@ mod chain_helper_tests {
         // Withdraw the blob advertisement — chain tag still present.
         MeshNode::replace_blob_causal_tags(&mut caps, &blob_hex, None);
         assert!(!caps.tags.contains(&causal_tag(&blob_hex)));
-        assert!(caps.tags.contains(&chain_tag), "chain tag survives withdraw");
+        assert!(
+            caps.tags.contains(&chain_tag),
+            "chain tag survives withdraw"
+        );
     }
 
     #[test]
