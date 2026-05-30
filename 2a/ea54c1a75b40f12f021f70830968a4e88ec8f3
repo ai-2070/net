@@ -1,0 +1,42 @@
+net/crates/net/src/adapter/net/redex/replication_metrics.rs
+  s_3813c1cf893940::t_cd0ada64744b31 134
+  s_3813c1cf893940::t_a56e42361ece71 502-507
+  s_3813c1cf893940::t_2586bdcd375b47 302
+  s_3813c1cf893940::t_2f1b58482bc80a 787-788
+  s_3813c1cf893940::t_c86a106091b3ce 749,764
+  s_3813c1cf893940::t_abc0cf869f0f32 364-367
+  s_3813c1cf893940::t_9a9c4672949a81 191-197
+  s_3813c1cf893940::t_7fc4972f0d41a0 107-111
+  s_3813c1cf893940::t_3065fa0703a431 456
+net/crates/net/src/adapter/net/dataforts/blob/mesh.rs
+  s_3813c1cf893940::t_0115b384fa6deb 513-525,538-541
+net/crates/net/src/adapter/net/redex/replication_state.rs
+  s_3813c1cf893940::t_b0022f8e614043 222
+  s_3813c1cf893940::t_100ffe1e1b9d9e 51-59
+  s_3813c1cf893940::t_6d8bb85706226f 160-162
+  s_3813c1cf893940::t_e46ca38d0d2961 488,490
+  s_3813c1cf893940::t_a8def24e357d32 18,26-30
+  s_3813c1cf893940::t_f570aec3911916 311-329,335,338,341,346-366
+  s_3813c1cf893940::t_ad519a7e1fc671 529-533
+net/crates/net/tests/cross_peer_blob.rs
+  s_3813c1cf893940::t_22c9ac404bd6e4 483-487
+net/crates/net/src/adapter/net/redex/replication_coordinator.rs
+  s_3813c1cf893940::t_dc989bb490fcd9 408-417
+  s_3813c1cf893940::t_6d7032e8addbfa 427-428,432,444-445
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "2aea54c1a75b40f12f021f70830968a4e88ec8f3",
+  "prompts": {},
+  "sessions": {
+    "s_3813c1cf893940": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8f529043-9c28-441a-89cc-3de50f96f588",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
