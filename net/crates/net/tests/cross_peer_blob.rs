@@ -296,6 +296,119 @@ async fn cross_peer_directory_transfer() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// Federation phase 2 — RedEX replication transfers MORE chunks than
+/// the per-chunk advertisement ceiling, reliably and with no per-chunk
+/// `causal` tag at all. This is the path that scales the demo.
+///
+/// Replication has no auto-election yet (the unwired "Phase F"), so the
+/// roles are driven manually — exactly as `redex_replication_e2e.rs`
+/// does — A's chunk channels to Leader, B's to Replica. The replica
+/// then pulls each chunk's single event via the real heartbeat →
+/// SyncRequest → SyncResponse → apply cycle. Neither adapter wires the
+/// fetch RPC, so a successful LOCAL fetch on B proves replication — not
+/// the RPC and not advertisement — delivered every chunk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replication_transfers_past_advertisement_ceiling() {
+    use net::adapter::net::channel::ChannelName;
+    use net::adapter::net::dataforts::blob::BlobAdapter;
+    use net::adapter::net::redex::{
+        PlacementStrategy, ReplicaRole, ReplicationConfig, TransitionSignal,
+    };
+
+    // Well past the ~15-20 chunks/node advertisement ceiling.
+    const N: usize = 30;
+
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_a, &node_b).await;
+    let a_id = node_a.node_id();
+    let b_id = node_b.node_id();
+
+    let redex_a = Arc::new(Redex::new());
+    redex_a.enable_replication(node_a.clone());
+    let redex_b = Arc::new(Redex::new());
+    redex_b.enable_replication(node_b.clone());
+
+    let cfg = ReplicationConfig::new()
+        .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]))
+        .with_heartbeat_ms(100);
+    cfg.validate().expect("valid cfg");
+
+    // No serve_blob_fetch_chunk / enable_peer_fetch on either adapter:
+    // no fetch RPC, no causal advertisement. Pure replication.
+    let adapter_a = Arc::new(MeshBlobAdapter::new("a", redex_a.clone()).with_replication(cfg.clone()));
+    let adapter_b = Arc::new(MeshBlobAdapter::new("b", redex_b.clone()).with_replication(cfg.clone()));
+
+    // Manually drive a chunk channel's coordinator to Leader / Replica
+    // (Idle is the spawn state; auto-elect is unwired Phase F).
+    async fn drive_leader(redex: &Redex, name: &ChannelName) {
+        let c = redex
+            .replication_coordinator_for(name)
+            .expect("leader coordinator");
+        c.transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
+            .await
+            .unwrap();
+        c.transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
+            .await
+            .unwrap();
+        c.transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
+            .await
+            .unwrap();
+    }
+    async fn drive_replica(redex: &Redex, name: &ChannelName) {
+        let c = redex
+            .replication_coordinator_for(name)
+            .expect("replica coordinator");
+        c.transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
+            .await
+            .unwrap();
+    }
+
+    // A stores N distinct chunks and becomes leader for each channel.
+    let mut blobs = Vec::new();
+    for i in 0..N {
+        let bytes: Vec<u8> = (0..800).map(|j| ((i * 7 + j) % 251) as u8).collect();
+        let (hash, blob_ref) = small_ref(&bytes);
+        adapter_a.store(&blob_ref, &bytes).await.expect("A store");
+        let name = MeshBlobAdapter::chunk_channel_for_hash(&hash);
+        drive_leader(&redex_a, &name).await;
+        blobs.push((hash, blob_ref, bytes));
+    }
+
+    // B opens each channel (prefetch) and becomes replica.
+    for (hash, blob_ref, _) in &blobs {
+        adapter_b.prefetch(blob_ref).await.expect("B prefetch");
+        let name = MeshBlobAdapter::chunk_channel_for_hash(hash);
+        drive_replica(&redex_b, &name).await;
+    }
+
+    // Poll until replication has delivered every chunk locally to B.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut delivered = 0usize;
+    while tokio::time::Instant::now() < deadline {
+        delivered = 0;
+        for (_, blob_ref, _) in &blobs {
+            if adapter_b.fetch(blob_ref).await.is_ok() {
+                delivered += 1;
+            }
+        }
+        if delivered == N {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        delivered, N,
+        "replication must deliver all {N} chunks (got {delivered}) — well past the advertisement ceiling",
+    );
+
+    // Verify every delivered chunk byte-for-byte.
+    for (_, blob_ref, bytes) in &blobs {
+        let got = adapter_b.fetch(blob_ref).await.expect("B local fetch");
+        assert_eq!(got.as_ref(), bytes.as_slice(), "chunk bytes must match");
+    }
+}
+
 /// Federation phase 2 — directory transfer at the per-chunk
 /// advertisement ceiling, with throughput.
 ///
