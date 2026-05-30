@@ -19,6 +19,20 @@
 //! Content addressing makes dedup automatic: two files with identical
 //! bytes resolve to the same blob and store/transfer once.
 //!
+//! # Scale ceiling (cross-peer)
+//!
+//! On a cross-peer adapter, leaf discovery relies on each chunk's
+//! `causal:<hex>` advertisement (S-3). That advertisement rides a node's
+//! single-datagram capability announcement, so only ~15-20 chunks per
+//! node fit before tags fall off the wire — measured: a 10-file tree
+//! transfers, a 100-file tree fails with `NotFound` for the chunks whose
+//! tags didn't fit. The directory wrapper itself is correct at any size;
+//! the bottleneck is the per-chunk advertisement. The `node_modules`-
+//! scale demo needs the chunk pull routed through RedEX replication's
+//! per-NODE advertisement instead (one tag covers all of a node's
+//! chunks). See the cross-peer scale test + the `nrpc-not-for-bulk-transfer`
+//! project memory.
+//!
 //! # Safety
 //!
 //! Manifest paths can come from a peer, so [`fetch_dir`] validates
