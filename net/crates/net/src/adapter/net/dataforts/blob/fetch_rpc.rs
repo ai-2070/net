@@ -8,22 +8,29 @@
 //! that misses a chunk locally calls the service (see S-2's
 //! [`MeshBlobAdapter::fetch`] fallback) to pull the bytes.
 //!
-//! # Why unary + range paging rather than whole-chunk streaming
+//! # Why unary + range paging, and the segment-size constraint
 //!
 //! A blob chunk can be a full [`super::blob_ref::BLOB_CHUNK_SIZE_BYTES`]
-//! (4 MiB) — exactly the nRPC body cap
-//! ([`crate::adapter::net::cortex::MAX_RPC_BODY_LEN`]). A whole-chunk
-//! response plus postcard framing would overflow that cap, and the
-//! streaming sink ([`crate::adapter::net::cortex::RpcResponseSink`])
-//! drops chunks on overflow — a dropped frame mid-chunk corrupts the
-//! reassembled blob (caught by the fetch-side BLAKE3 verify, but only
-//! after the round trip is wasted). So `blob.fetch_chunk` is a unary
-//! request/response that serves a bounded
-//! [`FETCH_CHUNK_SEGMENT_BYTES`] window; the caller pages a larger
-//! chunk across several requests. Unary RPC carries substrate-managed
-//! per-call reliability with no silent-drop failure mode. Whole-chunk
-//! streaming is a documented follow-up (the plan's "probably 256KB"
-//! threshold) once flow-controlled streaming is the better trade.
+//! (4 MiB). The unary nRPC *reply* path
+//! ([`crate::adapter::net::MeshNode`]'s `publish_to_peer`) sends one
+//! UDP datagram per response with no fragmentation, so a reply must
+//! fit a single datagram (~MTU). `blob.fetch_chunk` therefore serves a
+//! bounded [`FETCH_CHUNK_SEGMENT_BYTES`] window sized under the MTU and
+//! the caller pages a larger chunk across several requests. Unary RPC
+//! carries substrate-managed per-call reliability with no silent-drop
+//! failure mode — correct at any chunk size, just chattier than a
+//! single transfer.
+//!
+//! **Follow-up (required before the `node_modules`-scale demo):** the
+//! sub-MTU segment makes a multi-MB chunk cost thousands of round
+//! trips, which would undercut the architectural throughput claim at
+//! phase-2 scale. The plan's whole-chunk streaming variant
+//! (`serve_rpc_streaming` / `call_streaming`, the "probably 256KB"
+//! threshold) fragments naturally into ≤MTU frames and is the
+//! efficient path for large chunks; it lands as its own stage with the
+//! flow-control + frame-loss handling that the streaming sink
+//! ([`crate::adapter::net::cortex::RpcResponseSink`], which drops on
+//! overflow) requires.
 //!
 //! Each call rides the shared `UdpSocket` in `router.rs`, multiplexed
 //! with every other in-flight operation — no per-call connection
@@ -57,12 +64,15 @@ use super::mesh::MeshBlobAdapter;
 pub const BLOB_FETCH_CHUNK_SERVICE: &str = "dataforts.blob.fetch_chunk";
 
 /// Maximum bytes a single [`FetchChunkResponse::Segment`] carries.
-/// 1 MiB sits well under the 4 MiB
-/// [`crate::adapter::net::cortex::MAX_RPC_BODY_LEN`] so a segment plus
-/// postcard framing never overflows the unary body cap, regardless of
-/// chunk size. Callers fetching a chunk larger than this page the
-/// remainder with successive range requests.
-pub const FETCH_CHUNK_SEGMENT_BYTES: u64 = 1024 * 1024;
+/// Sized under the UDP MTU because the unary nRPC reply path sends one
+/// unfragmented datagram per response (see the module docs): a segment
+/// plus the response framing (24-byte event meta + postcard header +
+/// wire/AEAD overhead) must fit a single datagram. 1 KiB leaves
+/// comfortable headroom under a 1400-ish-byte MTU. Callers fetching a
+/// chunk larger than this page the remainder with successive range
+/// requests; the streaming variant (module-doc follow-up) removes the
+/// per-segment round trip for large chunks.
+pub const FETCH_CHUNK_SEGMENT_BYTES: u64 = 1024;
 
 /// Wire request body for a chunk fetch. Encoded via postcard.
 ///

@@ -9163,12 +9163,19 @@ impl MeshNode {
         let request = FetchChunkRequest { hash, range };
         let body = postcard::to_allocvec(&request)
             .map_err(|e| BlobError::Backend(format!("blob fetch_chunk: encode failed: {e}")))?;
+        // Bound each call so an unresponsive holder fails over to the
+        // next advertised one rather than hanging the fetch
+        // indefinitely (CallOptions::default() has no deadline).
+        let opts = super::mesh_rpc::CallOptions {
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(15)),
+            ..Default::default()
+        };
         let reply = self
             .call(
                 target_node_id,
                 BLOB_FETCH_CHUNK_SERVICE,
                 bytes::Bytes::from(body),
-                super::mesh_rpc::CallOptions::default(),
+                opts,
             )
             .await
             .map_err(|e| BlobError::Backend(format!("blob fetch_chunk: RPC failed: {e}")))?;
