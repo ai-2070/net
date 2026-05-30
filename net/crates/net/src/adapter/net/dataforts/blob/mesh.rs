@@ -491,6 +491,71 @@ impl MeshBlobAdapter {
         }
     }
 
+    /// Drive this node to **Leader** for the chunk channel of `hash`,
+    /// so its replication runtime serves `SyncRequest`s from replicas.
+    /// This is the source side of replication-mode bulk transfer — the
+    /// path that scales past the per-chunk `causal` advertisement
+    /// ceiling (see `tests/cross_peer_blob.rs`).
+    ///
+    /// Requires the adapter to be built [`Self::with_replication`] and
+    /// the chunk channel to already be open (e.g. after [`Self::store`]).
+    /// Idempotent: returns `Ok(())` if already Leader. Drives the role
+    /// manually (Idle→Replica→Candidate→Leader) because RedEX has no
+    /// auto-election yet (the unwired "Phase F"); when that lands this
+    /// helper becomes a no-op.
+    pub async fn become_chunk_leader(&self, hash: &[u8; 32]) -> Result<(), BlobError> {
+        use crate::adapter::net::redex::{ReplicaRole, TransitionSignal};
+        let name = Self::chunk_channel(hash);
+        let coord = self.redex.replication_coordinator_for(&name).ok_or_else(|| {
+            BlobError::Backend(
+                "become_chunk_leader: no replication coordinator (channel not open with replication?)"
+                    .to_string(),
+            )
+        })?;
+        if coord.role() == ReplicaRole::Leader {
+            return Ok(());
+        }
+        let step = |role, signal| {
+            let coord = coord.clone();
+            async move {
+                coord.transition_to(role, signal).await.map_err(|e| {
+                    BlobError::Backend(format!("become_chunk_leader: transition {role:?}: {e}"))
+                })
+            }
+        };
+        step(ReplicaRole::Replica, TransitionSignal::CapabilitySelected).await?;
+        step(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats).await?;
+        step(ReplicaRole::Leader, TransitionSignal::ElectionWon).await?;
+        Ok(())
+    }
+
+    /// Drive this node to **Replica** for the chunk channel of `hash`,
+    /// so its replication runtime pulls the chunk from the channel's
+    /// leader. This is the receiver side of replication-mode bulk
+    /// transfer; pair it with [`Self::prefetch`] (which opens the
+    /// channel) and then poll a local fetch until the chunk lands.
+    ///
+    /// Requires [`Self::with_replication`] and the channel open.
+    /// Idempotent: returns `Ok(())` if already Replica or Leader.
+    pub async fn become_chunk_replica(&self, hash: &[u8; 32]) -> Result<(), BlobError> {
+        use crate::adapter::net::redex::{ReplicaRole, TransitionSignal};
+        let name = Self::chunk_channel(hash);
+        let coord = self.redex.replication_coordinator_for(&name).ok_or_else(|| {
+            BlobError::Backend(
+                "become_chunk_replica: no replication coordinator (channel not open with replication?)"
+                    .to_string(),
+            )
+        })?;
+        if matches!(coord.role(), ReplicaRole::Replica | ReplicaRole::Leader) {
+            return Ok(());
+        }
+        coord
+            .transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
+            .await
+            .map_err(|e| BlobError::Backend(format!("become_chunk_replica: transition: {e}")))?;
+        Ok(())
+    }
+
     /// Enable fetch-path opportunistic auto-repair for RS-encoded
     /// blobs. When set, every successful reconstruction inside
     /// `fetch_range` re-stores the missing data chunks under

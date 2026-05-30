@@ -309,11 +309,8 @@ async fn cross_peer_directory_transfer() {
 /// the RPC and not advertisement — delivered every chunk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replication_transfers_past_advertisement_ceiling() {
-    use net::adapter::net::channel::ChannelName;
     use net::adapter::net::dataforts::blob::BlobAdapter;
-    use net::adapter::net::redex::{
-        PlacementStrategy, ReplicaRole, ReplicationConfig, TransitionSignal,
-    };
+    use net::adapter::net::redex::{PlacementStrategy, ReplicationConfig};
 
     // Well past the ~15-20 chunks/node advertisement ceiling.
     const N: usize = 30;
@@ -336,50 +333,30 @@ async fn replication_transfers_past_advertisement_ceiling() {
 
     // No serve_blob_fetch_chunk / enable_peer_fetch on either adapter:
     // no fetch RPC, no causal advertisement. Pure replication.
-    let adapter_a = Arc::new(MeshBlobAdapter::new("a", redex_a.clone()).with_replication(cfg.clone()));
-    let adapter_b = Arc::new(MeshBlobAdapter::new("b", redex_b.clone()).with_replication(cfg.clone()));
+    let adapter_a = Arc::new(MeshBlobAdapter::new("a", redex_a).with_replication(cfg.clone()));
+    let adapter_b = Arc::new(MeshBlobAdapter::new("b", redex_b).with_replication(cfg.clone()));
 
-    // Manually drive a chunk channel's coordinator to Leader / Replica
-    // (Idle is the spawn state; auto-elect is unwired Phase F).
-    async fn drive_leader(redex: &Redex, name: &ChannelName) {
-        let c = redex
-            .replication_coordinator_for(name)
-            .expect("leader coordinator");
-        c.transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-            .await
-            .unwrap();
-        c.transition_to(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats)
-            .await
-            .unwrap();
-        c.transition_to(ReplicaRole::Leader, TransitionSignal::ElectionWon)
-            .await
-            .unwrap();
-    }
-    async fn drive_replica(redex: &Redex, name: &ChannelName) {
-        let c = redex
-            .replication_coordinator_for(name)
-            .expect("replica coordinator");
-        c.transition_to(ReplicaRole::Replica, TransitionSignal::CapabilitySelected)
-            .await
-            .unwrap();
-    }
-
-    // A stores N distinct chunks and becomes leader for each channel.
+    // A stores N distinct chunks and becomes leader for each channel
+    // (the replication-mode source-side adapter helper).
     let mut blobs = Vec::new();
     for i in 0..N {
         let bytes: Vec<u8> = (0..800).map(|j| ((i * 7 + j) % 251) as u8).collect();
         let (hash, blob_ref) = small_ref(&bytes);
         adapter_a.store(&blob_ref, &bytes).await.expect("A store");
-        let name = MeshBlobAdapter::chunk_channel_for_hash(&hash);
-        drive_leader(&redex_a, &name).await;
+        adapter_a
+            .become_chunk_leader(&hash)
+            .await
+            .expect("A become leader");
         blobs.push((hash, blob_ref, bytes));
     }
 
     // B opens each channel (prefetch) and becomes replica.
     for (hash, blob_ref, _) in &blobs {
         adapter_b.prefetch(blob_ref).await.expect("B prefetch");
-        let name = MeshBlobAdapter::chunk_channel_for_hash(hash);
-        drive_replica(&redex_b, &name).await;
+        adapter_b
+            .become_chunk_replica(hash)
+            .await
+            .expect("B become replica");
     }
 
     // Poll until replication has delivered every chunk locally to B.
