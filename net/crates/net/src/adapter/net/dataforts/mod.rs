@@ -15,6 +15,11 @@
 #[cfg(feature = "dataforts")]
 pub mod blob;
 
+/// Directory transfer over the blob layer (per-file substrate
+/// operations + tree reconstruction).
+#[cfg(feature = "dataforts")]
+pub mod dir;
+
 #[cfg(feature = "dataforts")]
 pub mod greedy;
 
@@ -29,6 +34,12 @@ pub use greedy::{
     GreedyClusterMetrics, GreedyClusterMetricsAtomic, GreedyConfig, GreedyConfigError,
     GreedyMetricsRegistry, GreedyMetricsSnapshot, GreedyObserver, GreedyRuntime, IntentMatchPolicy,
     ScopeLabel,
+};
+
+#[cfg(feature = "dataforts")]
+pub use dir::{
+    fetch_dir, fetch_dir_with_concurrency, store_dir, DirEntry, DirError, DirManifest, DirNode,
+    DEFAULT_DIR_FETCH_CONCURRENCY,
 };
 
 #[cfg(feature = "dataforts")]

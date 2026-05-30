@@ -211,3 +211,87 @@ async fn cross_peer_blob_fetch_not_found_when_no_holder() {
         "expected NotFound, got {err:?}",
     );
 }
+
+/// Federation phase 2 — directory transfer between peers. A stores a
+/// small tree (each file its own blob); B reconstructs it by fetching
+/// the manifest and each leaf blob over the mesh, every leaf an
+/// independent per-file substrate operation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_peer_directory_transfer() {
+    use net::adapter::net::dataforts::{fetch_dir, store_dir};
+
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_b, &node_a).await;
+
+    let redex_a = Arc::new(Redex::new());
+    let adapter_a = Arc::new(MeshBlobAdapter::new("a", redex_a));
+    let redex_b = Arc::new(Redex::new());
+    let adapter_b = Arc::new(MeshBlobAdapter::new("b", redex_b));
+
+    // A serves + advertises; B fetches.
+    let _serve_a = node_a
+        .serve_blob_fetch_chunk(adapter_a.clone())
+        .expect("serve A");
+    adapter_b.enable_peer_fetch(&node_b);
+
+    // Build a small source tree on disk.
+    let tmp = std::env::temp_dir().join(format!(
+        "net-xpeer-dir-{}-{}",
+        std::process::id(),
+        node_a.node_id()
+    ));
+    let src = tmp.join("src");
+    let dst = tmp.join("dst");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(src.join("pkg/lib")).unwrap();
+    std::fs::write(src.join("index.js"), b"module.exports = 1;").unwrap();
+    std::fs::write(src.join("pkg/main.js"), vec![3u8; 40_000]).unwrap();
+    std::fs::write(src.join("pkg/lib/util.js"), b"util code here").unwrap();
+    // Duplicate content across two files — content addressing dedups.
+    std::fs::write(src.join("pkg/copy.js"), b"module.exports = 1;").unwrap();
+
+    // A stores the directory (per-file blobs + manifest blob).
+    let root_ref = store_dir(adapter_a.as_ref(), &src)
+        .await
+        .expect("A store_dir");
+
+    // Force a synchronous final announcement carrying every accumulated
+    // causal:<hex> tag (store's per-chunk advertises are best-effort
+    // spawned), then wait for B to fold it. The manifest blob is small,
+    // so its single chunk hash stands in for "A's caps are folded".
+    let manifest_hash = *root_ref.small_hash().expect("small manifest");
+    node_a
+        .announce_blob_chunk(&manifest_hash)
+        .await
+        .expect("A announce manifest");
+    node_b
+        .announce_capabilities(net::adapter::net::behavior::capability::CapabilitySet::new())
+        .await
+        .expect("B announce");
+    let a_id = node_a.node_id();
+    wait_until(
+        || node_b.find_blob_chunk_holders(&manifest_hash).contains(&a_id),
+        "B to fold A's directory chunk advertisements",
+    )
+    .await;
+
+    // B reconstructs the tree, fetching every leaf over the mesh.
+    fetch_dir(adapter_b.as_ref(), &root_ref, &dst)
+        .await
+        .expect("B fetch_dir");
+
+    for rel in [
+        "index.js",
+        "pkg/main.js",
+        "pkg/lib/util.js",
+        "pkg/copy.js",
+    ] {
+        let want = std::fs::read(src.join(rel)).unwrap();
+        let got = std::fs::read(dst.join(rel)).unwrap();
+        assert_eq!(want, got, "file {rel} must transfer byte-for-byte");
+    }
+    assert!(dst.join("pkg/lib").is_dir(), "nested dirs reconstructed");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
