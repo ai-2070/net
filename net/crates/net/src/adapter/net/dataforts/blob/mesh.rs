@@ -510,12 +510,19 @@ impl MeshBlobAdapter {
     /// path that scales past the per-chunk `causal` advertisement
     /// ceiling (see `tests/cross_peer_blob.rs`).
     ///
-    /// Requires the adapter to be built [`Self::with_replication`] and
-    /// the chunk channel to already be open (e.g. after [`Self::store`]).
-    /// Idempotent: returns `Ok(())` if already Leader. Drives the role
-    /// manually (Idle→Replica→Candidate→Leader) because RedEX has no
-    /// auto-election yet (the unwired "Phase F"); when that lands this
-    /// helper becomes a no-op.
+    /// Role-by-intent: a content-addressed writer is the authoritative
+    /// source, so it claims leadership directly via the
+    /// `ClaimLeadership` transition (`Idle → Leader`) — no election.
+    ///
+    /// **Caller contract:** only claim leadership when this node
+    /// actually holds the bytes (call it after [`Self::store`]). The
+    /// state machine deliberately does NOT inspect storage state (that
+    /// would couple the replication coordinator to the blob layer), so
+    /// a claim on a chunk this node doesn't hold is API misuse.
+    ///
+    /// Requires the adapter built [`Self::with_replication`] and the
+    /// chunk channel already open. Idempotent: `Ok(())` if already
+    /// Leader.
     pub async fn become_chunk_leader(&self, hash: &[u8; 32]) -> Result<(), BlobError> {
         use crate::adapter::net::redex::{ReplicaRole, TransitionSignal};
         let name = Self::chunk_channel(hash);
@@ -528,17 +535,10 @@ impl MeshBlobAdapter {
         if coord.role() == ReplicaRole::Leader {
             return Ok(());
         }
-        let step = |role, signal| {
-            let coord = coord.clone();
-            async move {
-                coord.transition_to(role, signal).await.map_err(|e| {
-                    BlobError::Backend(format!("become_chunk_leader: transition {role:?}: {e}"))
-                })
-            }
-        };
-        step(ReplicaRole::Replica, TransitionSignal::CapabilitySelected).await?;
-        step(ReplicaRole::Candidate, TransitionSignal::MissedHeartbeats).await?;
-        step(ReplicaRole::Leader, TransitionSignal::ElectionWon).await?;
+        coord
+            .transition_to(ReplicaRole::Leader, TransitionSignal::ClaimLeadership)
+            .await
+            .map_err(|e| BlobError::Backend(format!("become_chunk_leader: claim leadership: {e}")))?;
         Ok(())
     }
 

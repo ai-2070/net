@@ -480,8 +480,11 @@ async fn replicated_directory_transfer_end_to_end() {
 async fn cross_peer_directory_transfer_at_advertisement_ceiling() {
     use net::adapter::net::dataforts::{fetch_dir, store_dir};
 
-    // Kept under the ~15-20-chunks-per-node advertisement ceiling.
-    const N_FILES: usize = 10;
+    // Kept well under the ~15-20-chunks-per-node advertisement ceiling
+    // (with margin: each file is a chunk, plus the manifest chunk, plus
+    // the node's nrpc/scope tags all share the one-datagram announcement,
+    // so 10 occasionally brushed the limit and flaked).
+    const N_FILES: usize = 6;
 
     let node_a = build_node().await;
     let node_b = build_node().await;

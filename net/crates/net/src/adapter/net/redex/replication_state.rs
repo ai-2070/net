@@ -15,12 +15,19 @@
 //! | From      | To        | Trigger                                                |
 //! |-----------|-----------|--------------------------------------------------------|
 //! | `Idle`    | `Replica` | Capability filter selected this node                   |
+//! | `Idle`    | `Leader`  | Content-addressed writer claims authority (`ClaimLeadership`) |
 //! | `Replica` | `Candidate` | 3 consecutive missed leader heartbeats              |
 //! | `Candidate` | `Leader`  | Won the deterministic `elect()`                    |
 //! | `Candidate` | `Replica` | Lost the deterministic `elect()`                   |
 //! | `Leader`  | `Idle`    | Graceful relinquish (admin / `leader_pinned` migration) |
 //! | `Replica` | `Idle`    | Disk pressure withdrawal under `UnderCapacity::Withdraw` |
 //! | `*`       | `Idle`    | Channel close                                          |
+//!
+//! `Idle → Leader` is the role-by-intent path: a node that holds the
+//! authoritative (content-addressed) bytes claims leadership directly,
+//! without an election. It does NOT replace the election path
+//! (`Replica → Candidate → Leader`) — leader-loss recovery still runs
+//! that. See `docs/plans/REDEX_REPLICATION_ROLE_BY_INTENT_PLAN.md`.
 //!
 //! Self-transitions and any other pair are invalid. Phase F's DST
 //! harness models the same matrix; this module's tests pin every
@@ -41,6 +48,15 @@ pub enum TransitionSignal {
     /// Capability filter / `PlacementFilter` selected this node as
     /// a replica. Drives `Idle → Replica`.
     CapabilitySelected,
+    /// This node holds the authoritative (content-addressed) copy and
+    /// claims leadership for the channel directly — role-by-intent, no
+    /// election. Drives `Idle → Leader`. Distinct from `ElectionWon`
+    /// (which is leader-loss recovery) so transition metrics never read
+    /// an intent-claim as election thrash. Caller contract: only claim
+    /// leadership when the local copy is actually present (e.g. post-
+    /// `store`); the state machine deliberately does not inspect storage
+    /// state.
+    ClaimLeadership,
     /// 3 consecutive leader heartbeats missed within the §6
     /// hysteresis window. Drives `Replica → Candidate`.
     MissedHeartbeats,
@@ -141,6 +157,10 @@ impl StateTransition {
                 ReplicaRole::Replica,
                 TransitionSignal::CapabilitySelected,
             ) | (
+                ReplicaRole::Idle,
+                ReplicaRole::Leader,
+                TransitionSignal::ClaimLeadership,
+            ) | (
                 ReplicaRole::Replica,
                 ReplicaRole::Candidate,
                 TransitionSignal::MissedHeartbeats,
@@ -199,6 +219,7 @@ fn pair_is_valid_for_some_signal(from: ReplicaRole, to: ReplicaRole) -> bool {
     matches!(
         (from, to),
         (ReplicaRole::Idle, ReplicaRole::Replica)
+            | (ReplicaRole::Idle, ReplicaRole::Leader)
             | (ReplicaRole::Replica, ReplicaRole::Candidate)
             | (ReplicaRole::Candidate, ReplicaRole::Leader)
             | (ReplicaRole::Candidate, ReplicaRole::Replica)
@@ -287,20 +308,62 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_pair_idle_to_leader() {
+    fn idle_to_leader_via_claim_leadership() {
+        // Role-by-intent: a content-addressed writer claims leadership
+        // directly, no election.
+        let t = StateTransition::apply(
+            ReplicaRole::Idle,
+            ReplicaRole::Leader,
+            TransitionSignal::ClaimLeadership,
+        )
+        .expect("Idle → Leader via ClaimLeadership is valid");
+        assert_eq!(t.from, ReplicaRole::Idle);
+        assert_eq!(t.to, ReplicaRole::Leader);
+        assert_eq!(t.signal, TransitionSignal::ClaimLeadership);
+    }
+
+    #[test]
+    fn idle_to_leader_under_election_signal_is_signal_mismatch() {
+        // `Idle → Leader` is now a valid PAIR (via ClaimLeadership), so
+        // using the election signal surfaces as a signal mismatch, not
+        // an invalid pair — the election path is `Candidate → Leader`.
         let err = StateTransition::apply(
             ReplicaRole::Idle,
             ReplicaRole::Leader,
             TransitionSignal::ElectionWon,
         )
-        .expect_err("Idle → Leader is not in the matrix");
+        .expect_err("ElectionWon does not drive Idle → Leader");
         assert!(matches!(
             err,
-            StateTransitionError::InvalidPair {
+            StateTransitionError::SignalMismatch {
                 from: ReplicaRole::Idle,
                 to: ReplicaRole::Leader,
+                signal: TransitionSignal::ElectionWon,
             }
         ));
+    }
+
+    #[test]
+    fn claim_leadership_only_drives_idle_to_leader() {
+        // ClaimLeadership is not a general-purpose promotion: it drives
+        // exactly `Idle → Leader` and nothing else.
+        for from in [
+            ReplicaRole::Leader,
+            ReplicaRole::Replica,
+            ReplicaRole::Candidate,
+        ] {
+            for to in [
+                ReplicaRole::Leader,
+                ReplicaRole::Replica,
+                ReplicaRole::Candidate,
+                ReplicaRole::Idle,
+            ] {
+                assert!(
+                    StateTransition::apply(from, to, TransitionSignal::ClaimLeadership).is_err(),
+                    "ClaimLeadership must not drive {from:?} → {to:?}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -422,8 +485,9 @@ mod tests {
             ReplicaRole::Candidate,
             ReplicaRole::Idle,
         ];
-        const SIGNALS: [TransitionSignal; 7] = [
+        const SIGNALS: [TransitionSignal; 8] = [
             TransitionSignal::CapabilitySelected,
+            TransitionSignal::ClaimLeadership,
             TransitionSignal::MissedHeartbeats,
             TransitionSignal::ElectionWon,
             TransitionSignal::ElectionLost,
@@ -462,10 +526,10 @@ mod tests {
                 }
             }
         }
-        // 7 valid (from, to) pairs total per plan §3:
-        // Idle→Replica, Replica→Candidate, Candidate→Leader,
-        // Candidate→Replica, Leader→Idle, Replica→Idle, Idle→Idle.
-        // Plus Candidate→Idle is reachable via ChannelClose. So 8.
-        assert_eq!(valid_pairs, 8, "expected 8 reachable (from, to) pairs");
+        // Valid (from, to) pairs: Idle→Replica, Idle→Leader (role-by-
+        // intent), Replica→Candidate, Candidate→Leader, Candidate→
+        // Replica, Leader→Idle, Replica→Idle, Idle→Idle. Plus
+        // Candidate→Idle reachable via ChannelClose. So 9.
+        assert_eq!(valid_pairs, 9, "expected 9 reachable (from, to) pairs");
     }
 }

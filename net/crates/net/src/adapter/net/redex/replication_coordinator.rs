@@ -405,7 +405,16 @@ impl ReplicationCoordinator {
         // fails, the operator-facing counter reflects the state
         // change that actually happened.
         if transition.to == ReplicaRole::Leader {
-            self.metrics.incr_leader_change();
+            // Role-by-intent claims (`Idle → Leader` via ClaimLeadership)
+            // bump a dedicated counter so they never inflate the
+            // election-completion metric / dashboards (decision 3 of
+            // REDEX_REPLICATION_ROLE_BY_INTENT_PLAN.md). Election-won
+            // leadership (`Candidate → Leader`) keeps `leader_changes`.
+            if transition.signal == TransitionSignal::ClaimLeadership {
+                self.metrics.incr_role_claim();
+            } else {
+                self.metrics.incr_leader_change();
+            }
         }
         if matches!(transition.signal, TransitionSignal::MissedHeartbeats) {
             // The election-thrash 30-s window is enforced by the
@@ -415,11 +424,12 @@ impl ReplicationCoordinator {
             self.metrics.incr_election_thrash();
         }
 
-        // Side-effect on the chain-tag layer. Plan §3 pins
-        // emission to exactly two transitions:
+        // Side-effect on the chain-tag layer. Emission is pinned to the
+        // transitions that make this node a holder:
         //
         //   - `Idle → Replica`          (capability filter selected)
         //   - `Candidate → Leader`      (won the election)
+        //   - `Idle → Leader`           (claimed authority by intent)
         //
         // Other valid transitions stay in the "already advertising"
         // window — `Replica → Candidate` and `Candidate → Replica`
@@ -431,7 +441,8 @@ impl ReplicationCoordinator {
         let is_withdraw = transition.to == ReplicaRole::Idle;
         let result = match (transition.from, transition.to) {
             (ReplicaRole::Idle, ReplicaRole::Replica)
-            | (ReplicaRole::Candidate, ReplicaRole::Leader) => {
+            | (ReplicaRole::Candidate, ReplicaRole::Leader)
+            | (ReplicaRole::Idle, ReplicaRole::Leader) => {
                 let tip = self.tail_seq.load(Ordering::Relaxed);
                 self.sink.announce_chain(origin, tip).await
             }

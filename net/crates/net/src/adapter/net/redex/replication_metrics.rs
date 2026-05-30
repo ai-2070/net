@@ -104,6 +104,11 @@ pub struct ChannelMetricsAtomic {
     /// even though local state is Idle. Recovery is opportunistic
     /// on the next `transition_to` call.
     pub announce_divergence_total: AtomicU64,
+    /// Cumulative `Idle → Leader` transitions via `ClaimLeadership`
+    /// (a content-addressed writer claiming authority by intent).
+    /// Kept distinct from `leader_changes_total` so intent-claims
+    /// never inflate the election-completion counter / dashboards.
+    pub role_claims_total: AtomicU64,
 }
 
 impl Default for ChannelMetricsAtomic {
@@ -126,6 +131,7 @@ impl ChannelMetricsAtomic {
             election_thrash_total: AtomicU64::new(0),
             witness_withdrawals_total: AtomicU64::new(0),
             announce_divergence_total: AtomicU64::new(0),
+            role_claims_total: AtomicU64::new(0),
         }
     }
 
@@ -180,6 +186,13 @@ impl ChannelMetricsAtomic {
     /// the operator-facing escape valve.
     pub fn incr_election_thrash(&self) {
         self.election_thrash_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump the role-claim counter on an `Idle → Leader` transition
+    /// via `ClaimLeadership` (role-by-intent). Distinct from
+    /// `incr_leader_change` so intent-claims don't read as elections.
+    pub fn incr_role_claim(&self) {
+        self.role_claims_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Bump the witness-withdrawal counter when this node speaks
@@ -286,6 +299,7 @@ impl ReplicationMetricsRegistry {
                 election_thrash_total: m.election_thrash_total.load(Ordering::Relaxed),
                 witness_withdrawals_total: m.witness_withdrawals_total.load(Ordering::Relaxed),
                 announce_divergence_total: m.announce_divergence_total.load(Ordering::Relaxed),
+                role_claims_total: m.role_claims_total.load(Ordering::Relaxed),
             });
         }
         // Stable order — the snapshot's serialized form (and
@@ -347,6 +361,10 @@ pub struct ChannelMetrics {
     /// says otherwise; recovery is opportunistic on the next
     /// `transition_to` call.
     pub announce_divergence_total: u64,
+    /// Cumulative `Idle → Leader` transitions via `ClaimLeadership`
+    /// (role-by-intent — a content-addressed writer claiming
+    /// authority). Distinct from `leader_changes_total` (elections).
+    pub role_claims_total: u64,
 }
 
 /// Read-side snapshot of every tracked channel, sorted by channel
@@ -435,6 +453,7 @@ impl ReplicationMetricsSnapshot {
             bump("election_thrash_total", c.election_thrash_total);
             bump("witness_withdrawals_total", c.witness_withdrawals_total);
             bump("announce_divergence_total", c.announce_divergence_total);
+            bump("role_claims_total", c.role_claims_total);
         }
         totals
     }
@@ -479,6 +498,12 @@ const COUNTER_DESCRIPTORS: &[(&str, &str, CounterGetter)] = &[
          non-zero values mean the mesh may still advertise this node as a chain holder.",
         "dataforts_replication_announce_divergence_total",
         |c| c.announce_divergence_total,
+    ),
+    (
+        "Idle->Leader transitions via ClaimLeadership (a content-addressed writer claiming \
+         authority by intent); distinct from leader elections.",
+        "dataforts_replication_role_claims_total",
+        |c| c.role_claims_total,
     ),
 ];
 
@@ -721,6 +746,7 @@ mod tests {
         m.incr_skip_ahead();
         m.incr_election_thrash();
         m.incr_witness_withdrawal();
+        m.incr_role_claim();
         m.record_leader_lag(Duration::from_millis(125));
         m.record_replica_lag(Duration::from_secs(2));
         let text = reg.snapshot().prometheus_text();
@@ -735,6 +761,7 @@ mod tests {
             "dataforts_replication_election_thrash_total",
             "dataforts_replication_witness_withdrawals_total",
             "dataforts_replication_announce_divergence_total",
+            "dataforts_replication_role_claims_total",
         ] {
             assert!(
                 text.contains(name),
@@ -757,8 +784,8 @@ mod tests {
         // HELP + TYPE blocks per metric.
         let help_lines = text.matches("# HELP ").count();
         let type_lines = text.matches("# TYPE ").count();
-        assert_eq!(help_lines, 8, "expected 8 HELP lines, got {help_lines}");
-        assert_eq!(type_lines, 8, "expected 8 TYPE lines, got {type_lines}");
+        assert_eq!(help_lines, 9, "expected 9 HELP lines, got {help_lines}");
+        assert_eq!(type_lines, 9, "expected 9 TYPE lines, got {type_lines}");
     }
 
     #[test]
