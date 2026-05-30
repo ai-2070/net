@@ -50,7 +50,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::blob::{chunk_payload, BlobAdapter, BlobError, BlobRef, Encoding};
+use super::blob::{chunk_payload, BlobAdapter, BlobError, BlobRef, Encoding, MeshBlobAdapter};
 
 /// URI stamped on directory-layer blobs. Opaque to the mesh adapter
 /// (the content hash is the authoritative address); the scheme just
@@ -400,6 +400,113 @@ pub async fn fetch_dir_with_concurrency(
     }
 
     Ok(())
+}
+
+// ── Replication-mode transfer (scales past the advertisement ceiling) ──
+//
+// The default `store_dir`/`fetch_dir` path discovers each leaf via its
+// per-chunk `causal:<hex>` advertisement, which caps at ~15-20 chunks per
+// node (a node's announcement is one datagram). For larger trees, move
+// the bytes over RedEX replication instead: one per-node replica-set, no
+// per-chunk tag. Replication has no auto-election yet ("Phase F"), so the
+// source drives its chunk channels to Leader and the receiver drives its
+// to Replica via the adapter helpers — see
+// `tests/cross_peer_blob.rs::replication_transfers_past_advertisement_ceiling`.
+
+/// Chunk hashes a [`BlobRef`] resolves to (one for `Small`, N for a
+/// `Manifest`).
+fn chunk_hashes(blob_ref: &BlobRef) -> Vec<[u8; 32]> {
+    if let Some(h) = blob_ref.small_hash() {
+        vec![*h]
+    } else {
+        blob_ref.chunks().iter().map(|c| c.hash).collect()
+    }
+}
+
+/// Source side of a replication-mode directory transfer: become Leader
+/// for every chunk of the manifest and of every file, so a receiver can
+/// pull the whole tree via replication. Requires the adapter built
+/// `with_replication` and [`store_dir`] already run (channels open).
+pub async fn become_dir_leader(
+    adapter: &MeshBlobAdapter,
+    manifest_ref: &BlobRef,
+) -> Result<(), DirError> {
+    for h in chunk_hashes(manifest_ref) {
+        adapter.become_chunk_leader(&h).await?;
+    }
+    let manifest_bytes = adapter.fetch(manifest_ref).await?;
+    let manifest: DirManifest =
+        postcard::from_bytes(&manifest_bytes).map_err(|e| DirError::Manifest(e.to_string()))?;
+    for entry in &manifest.entries {
+        if let DirNode::File { blob, .. } = &entry.node {
+            let blob_ref = BlobRef::decode(blob)?
+                .ok_or_else(|| DirError::Manifest("file entry carried a non-blob ref".into()))?;
+            for h in chunk_hashes(&blob_ref) {
+                adapter.become_chunk_leader(&h).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pull every chunk of `blob_ref` to local via replication: open the
+/// chunk channels ([`prefetch`](super::blob::BlobAdapter::prefetch)),
+/// become Replica for each, and poll until the blob resolves locally.
+async fn pull_blob_replicated(
+    adapter: &MeshBlobAdapter,
+    blob_ref: &BlobRef,
+    deadline: tokio::time::Instant,
+) -> Result<(), DirError> {
+    use super::blob::BlobAdapter;
+    adapter.prefetch(blob_ref).await?;
+    for h in chunk_hashes(blob_ref) {
+        adapter.become_chunk_replica(&h).await?;
+    }
+    loop {
+        if adapter.fetch(blob_ref).await.is_ok() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DirError::Blob(BlobError::NotFound(
+                "replication pull timed out before the blob became local".into(),
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Receiver side of a replication-mode directory transfer: pull the
+/// manifest and every leaf blob from the known source via replication
+/// (no per-chunk advertisement — scales past the ceiling), then
+/// reconstruct the tree under `dest`. The source must have run
+/// [`become_dir_leader`] for the same `manifest_ref`. `timeout` bounds
+/// the wait for each blob to replicate locally.
+pub async fn fetch_dir_replicated(
+    adapter: &MeshBlobAdapter,
+    manifest_ref: &BlobRef,
+    dest: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<(), DirError> {
+    use super::blob::BlobAdapter;
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    // Pull the manifest first so we know the leaf set.
+    pull_blob_replicated(adapter, manifest_ref, deadline).await?;
+    let manifest_bytes = adapter.fetch(manifest_ref).await?;
+    let manifest: DirManifest =
+        postcard::from_bytes(&manifest_bytes).map_err(|e| DirError::Manifest(e.to_string()))?;
+
+    // Pull every file blob via replication.
+    for entry in &manifest.entries {
+        if let DirNode::File { blob, .. } = &entry.node {
+            let blob_ref = BlobRef::decode(blob)?
+                .ok_or_else(|| DirError::Manifest("file entry carried a non-blob ref".into()))?;
+            pull_blob_replicated(adapter, &blob_ref, deadline).await?;
+        }
+    }
+
+    // Everything is local now — reconstruct via the standard path.
+    fetch_dir(adapter, manifest_ref, dest).await
 }
 
 #[cfg(test)]

@@ -386,6 +386,82 @@ async fn replication_transfers_past_advertisement_ceiling() {
     }
 }
 
+/// Federation phase 2 — END-TO-END directory transfer via replication,
+/// past the advertisement ceiling. A 25-file tree (more chunks than a
+/// single capability announcement can advertise) moves A→B purely over
+/// RedEX replication: no per-chunk `causal` tag, no fetch RPC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replicated_directory_transfer_end_to_end() {
+    use net::adapter::net::dataforts::{become_dir_leader, fetch_dir_replicated, store_dir};
+    use net::adapter::net::redex::{PlacementStrategy, ReplicationConfig};
+
+    const N_FILES: usize = 25;
+
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_a, &node_b).await;
+    let a_id = node_a.node_id();
+    let b_id = node_b.node_id();
+
+    let redex_a = Arc::new(Redex::new());
+    redex_a.enable_replication(node_a.clone());
+    let redex_b = Arc::new(Redex::new());
+    redex_b.enable_replication(node_b.clone());
+
+    let cfg = ReplicationConfig::new()
+        .with_placement(PlacementStrategy::Pinned(vec![a_id, b_id]))
+        .with_heartbeat_ms(100);
+    cfg.validate().expect("valid cfg");
+
+    // No serve_blob_fetch_chunk / enable_peer_fetch: pure replication.
+    let adapter_a = Arc::new(MeshBlobAdapter::new("a", redex_a).with_replication(cfg.clone()));
+    let adapter_b = Arc::new(MeshBlobAdapter::new("b", redex_b).with_replication(cfg.clone()));
+
+    // Build a 25-file tree on disk.
+    let tmp = std::env::temp_dir().join(format!(
+        "net-repl-dir-{}-{}",
+        std::process::id(),
+        node_a.node_id()
+    ));
+    let src = tmp.join("src");
+    let dst = tmp.join("dst");
+    let _ = std::fs::remove_dir_all(&tmp);
+    for i in 0..N_FILES {
+        let sub = src.join(format!("d{}", i % 5));
+        std::fs::create_dir_all(&sub).unwrap();
+        let content: Vec<u8> = (0..900).map(|j| ((i * 13 + j) % 251) as u8).collect();
+        std::fs::write(sub.join(format!("f{i}.bin")), &content).unwrap();
+    }
+
+    // A stores the tree and becomes leader for every chunk.
+    let root_ref = store_dir(adapter_a.as_ref(), &src)
+        .await
+        .expect("A store_dir");
+    become_dir_leader(&adapter_a, &root_ref)
+        .await
+        .expect("A become_dir_leader");
+
+    // B pulls the whole tree via replication and reconstructs it.
+    fetch_dir_replicated(
+        &adapter_b,
+        &root_ref,
+        &dst,
+        std::time::Duration::from_secs(20),
+    )
+    .await
+    .expect("B fetch_dir_replicated");
+
+    // Verify every file byte-for-byte.
+    for i in 0..N_FILES {
+        let rel = format!("d{}/f{i}.bin", i % 5);
+        let want = std::fs::read(src.join(&rel)).unwrap();
+        let got = std::fs::read(dst.join(&rel)).unwrap();
+        assert_eq!(want, got, "file {rel} must transfer byte-for-byte via replication");
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// Federation phase 2 — directory transfer at the per-chunk
 /// advertisement ceiling, with throughput.
 ///
