@@ -1,0 +1,20 @@
+net/crates/net/docs/plans/DATAFORTS_BLOB_TRANSFER_PLAN.md
+  s_3813c1cf893940::t_d4882d8ed6bef7 3,6-19
+  s_3813c1cf893940::t_195182ebe2e411 220-222,224,226,228,230
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "0ae0feeaf709e6423491ea57dda09e87ce3aab0f",
+  "prompts": {},
+  "sessions": {
+    "s_3813c1cf893940": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8f529043-9c28-441a-89cc-3de50f96f588",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
