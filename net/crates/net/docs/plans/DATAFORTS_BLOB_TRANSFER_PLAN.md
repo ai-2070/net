@@ -1,7 +1,22 @@
 # Datafort blob transfer — federation prerequisites
 
-**Status:** Planning. Substrate-side prerequisite for the Hermes-to-Hermes federation work and the directory-transfer demo that lands the substrate's architectural claim with the audience that matters.
+**Status:** Substrate work + phase-1 + phase-2 structure DONE and tested; scale path validated. Remaining: wire automatic replication roles (see [`DATAFORTS_BLOB_REPLICATION_AUTOROLE_PLAN.md`](DATAFORTS_BLOB_REPLICATION_AUTOROLE_PLAN.md)) + benchmark numbers + demo materials. See "Implementation status & findings" below.
 **Scope:** Close the gap between Datafort's local blob storage (which is mature) and cross-peer fetch via `causal:<hex>` advertisement (which is the documented follow-up not yet landed). Demonstrate it at realistic scale — `node_modules` between paired machines — in a way that makes the architectural property visible, not just the surface outcome.
+
+## Implementation status & findings (updated 2026-05-30)
+
+**Done & tested** (branch `blob-transfer`):
+- **S-1** `blob.fetch_chunk` nRPC service, **S-2** fetch-fallback-to-peers + auto-store cache, **S-3** `causal:<hex>` advertise/discover + `replicas_observed`.
+- **Phase 1** cross-peer blob fetch, e2e (`tests/cross_peer_blob.rs`).
+- **Phase 2 structure**: directory wrapper (`dataforts/dir`: `store_dir`/`fetch_dir`) — per-file blobs, manifest, tree reconstruction (paths/modes/symlinks), local + cross-peer tested.
+- **Scale path**: replication-mode transfer (`become_chunk_leader`/`become_chunk_replica` + `become_dir_leader`/`fetch_dir_replicated`) — a 25-file tree moves A→B purely over RedEX replication, past the advertisement ceiling.
+
+**Findings that reshaped the plan** (the original design assumed the nRPC + per-chunk-`causal` path would carry the demo; it can't, at scale):
+1. **nRPC is not a reliable bulk transport.** Unary replies are a single unfragmented UDP datagram (~MTU cap); streaming responses are fire-and-forget (drop under burst, no retransmission). So the unary `fetch_chunk` pages sub-MTU — correct but chatty — and is only suitable for small chunks / discovery-driven pulls.
+2. **Per-chunk `causal:<hex>` advertisement does not scale.** A node's capability announcement is one datagram; each held chunk adds a ~71-byte tag, so only ~15-20 chunks/node fit before tags fall off the wire. Measured: a 10-file directory transfers cross-peer, a 100-file one fails with `NotFound`.
+3. **RedEX replication IS the reliable, scalable bulk path** — but it has no auto-election yet (a freshly-opened channel sits in `Idle`; every production `transition_to(Leader|Replica)` is test-only). Driving roles manually (writer→Leader, fetcher→Replica) works and is proven at scale today; making it automatic is the [auto-role plan](DATAFORTS_BLOB_REPLICATION_AUTOROLE_PLAN.md).
+
+**Net:** the `node_modules`-scale demo runs over **replication** (per-node replica set, no per-chunk tag), not the per-chunk `causal` + nRPC path. The nRPC/`causal` path stays for small chunks and discovery-driven pulls.
 
 ## What the demo is actually demonstrating
 
@@ -202,14 +217,16 @@ Total substrate work: ~430 LoC plus tests. Total test work: ~700 LoC plus the di
 
 ## Open questions for after the test phases
 
-These don't block the plan but are worth knowing exist:
+These don't block the plan but are worth knowing exist. Several are now **answered empirically** (2026-05-30):
 
-- **How does the directory wrapper handle very large single files?** A 10GB ML model file inside `node_modules` would stress the streaming layer in ways a 200MB `node_modules` doesn't. Worth testing once basic cases pass.
+- **ANSWERED — Does the `causal:<hash>` advertisement scale to millions of chunks?** **No.** It caps at ~15-20 chunks/node: a node's capability announcement is a single datagram and each chunk's `causal:<hex64>` tag is ~71 bytes. A 10-file directory transfers cross-peer; a 100-file one fails (`NotFound` for the chunks whose tags didn't fit). **This is why the scale demo runs over replication (one per-node replica set), not per-chunk advertisement.** The per-chunk `causal` path stays for small chunks / discovery-driven pulls.
 
-- **What's the optimal concurrency for parallel chunk fetches?** Too few = leaves throughput on the table; too many = memory pressure and (less critically than with TCP) some marginal saturation. Default should be reasonable; configurable for power users. The UDP transport handles much higher concurrency than TCP-based alternatives, but it's not infinite.
+- **PARTLY ANSWERED — What's the right transport for bulk at scale?** Not nRPC: unary replies are single-datagram (~MTU), streaming responses are fire-and-forget (lossy under burst). RedEX replication (windowed, retransmitting) is the bulk path — see findings above and the [auto-role plan](DATAFORTS_BLOB_REPLICATION_AUTOROLE_PLAN.md).
 
-- **Does the `causal:<hash>` advertisement scale to millions of chunks?** The capability fold handles a lot, but a `target/` directory might produce 50k+ chunks. Test phase 2 will give the first real datapoint.
+- **How does the directory wrapper handle very large single files?** A 10GB ML model file inside `node_modules` would stress the streaming layer in ways a 200MB `node_modules` doesn't. Worth testing once basic cases pass. (Over replication, large files chunk into ≤4 MiB Manifest chunks, each its own replicated channel.)
 
-- **What happens when a peer with a chunk goes offline mid-transfer?** Substrate failover should pick another peer if multiple advertise the chunk; if only one peer had it, the fetch fails. Test resilience explicitly.
+- **What's the optimal concurrency for parallel chunk fetches?** `fetch_dir` defaults to 64 in-flight leaf fetches (`DEFAULT_DIR_FETCH_CONCURRENCY`), configurable. Tune against real `node_modules` once the replication-mode transfer is transparent.
+
+- **What happens when a peer with a chunk goes offline mid-transfer?** On the replication path this is replication's failover/recovery (its concern, not the blob layer's). On the per-chunk RPC path, the fetcher tries the next advertised holder. Test resilience explicitly once auto-role lands.
 
 These are real questions but they're empirical — the answer comes from running the tests, not from designing more upfront.
