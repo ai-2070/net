@@ -50,6 +50,10 @@ l0/
 net/crates/net/deck-*.txt
 net/crates/net/bindings/node/meshdb.d.ts
 net/crates/net/bindings/node/meshdb.js
+net/crates/net/bindings/node/aggregator.d.ts
+net/crates/net/bindings/node/aggregator.js
+net/crates/net/bindings/node/tool.d.ts
+net/crates/net/bindings/node/tool.js
 
 # Flamegraphs
 .profiling/
