@@ -102,7 +102,7 @@ describe('Channel authentication', () => {
 
     const chan: ChannelConfig = {
       name: 'lab/secret-no-token',
-      requireToken: true,
+      tokenRoots: [a.entityId()],
     };
     a.registerChannel(chan);
 
@@ -136,7 +136,9 @@ describe('Channel authentication', () => {
 
     const chan: ChannelConfig = {
       name: 'lab/token-gated',
-      requireToken: true,
+      // A (the publisher / token issuer) is the channel's root of
+      // trust; the single-token chain B presents must root at it.
+      tokenRoots: [a.entityId()],
     };
     a.registerChannel(chan);
 
@@ -178,7 +180,7 @@ describe('Channel authentication', () => {
     await a.announceCapabilities({});
     await b.announceCapabilities({});
 
-    const chan: ChannelConfig = { name: 'lab/wrong-subject', requireToken: true };
+    const chan: ChannelConfig = { name: 'lab/wrong-subject', tokenRoots: [a.entityId()] };
     a.registerChannel(chan);
 
     // Same race as `subscribe_accepted_with_valid_token`: if A
@@ -188,9 +190,10 @@ describe('Channel authentication', () => {
     const bId = b.nodeId();
     await waitUntil(() => a.findNodes({}).includes(bId));
 
-    // Token issued for a third, unrelated entity — B attempts
-    // to use it anyway. Publisher's cache will be keyed by the
-    // wrong subject; `can_subscribe(b.entity, ...)` misses.
+    // Token issued for a third, unrelated entity — B attempts to use
+    // it anyway. The chain roots at A (a valid root) but its leaf
+    // subject is the bystander, not B (the presenter), so the
+    // leaf-binding check rejects it.
     const bystander = Identity.generate();
     const token = aIdentity.issueToken({
       subject: bystander.entityId,

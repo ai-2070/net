@@ -471,6 +471,7 @@ export class MeshNode {
         visibility: config.visibility,
         reliable: config.reliable,
         requireToken: config.requireToken,
+        tokenRoots: config.tokenRoots,
         priority: config.priority,
         maxRatePps: config.maxRatePps,
         publishCaps: config.publishCaps
@@ -492,11 +493,14 @@ export class MeshNode {
    *
    * Pass `opts.token` to present a
    * {@link Token PermissionToken} issued by the publisher — required
-   * when the channel was registered with `requireToken: true` or
-   * when your caps alone don't satisfy `subscribeCaps`. The
-   * publisher verifies the signature, checks `subject ===
-   * thisNode.entityId`, installs it in its local cache, then runs
-   * the ACL check.
+   * when the channel was registered with `tokenRoots` (token
+   * enforcement) or when your caps alone don't satisfy
+   * `subscribeCaps`. The publisher verifies the presented token chain
+   * — it must root at one of the channel's `tokenRoots`, bind at its
+   * leaf to this node's entity id, and authorize `subscribe` — before
+   * admitting the subscribe. The credential must be presented on every
+   * subscribe; a previously-accepted one is not reused for a later
+   * bare subscribe.
    *
    * Throws a {@link ChannelAuthError} or {@link ChannelError} on
    * rejection; network-level failures propagate as plain `Error`.
@@ -708,8 +712,18 @@ export interface ChannelConfig {
   /**
    * When true, subscribers must present a valid
    * `PermissionToken` whose subject matches their entity id.
+   * On its own (no `tokenRoots`) this fails every authorization
+   * closed — pass `tokenRoots` to anchor a root of trust.
    */
   requireToken?: boolean;
+  /**
+   * Root(s) of trust for token authorization: 32-byte entity ids
+   * whose signature may root a presented token chain. Setting this
+   * turns on token enforcement and anchors the channel — a chain is
+   * only honored if its root link was issued by one of these
+   * entities (e.g. the publisher that issues subscribe tokens).
+   */
+  tokenRoots?: Buffer[];
   /** Priority (0 = lowest). */
   priority?: number;
   /** Rate cap in packets per second. */
