@@ -347,4 +347,69 @@ mod tests {
             transfer_blob_err(backend()).reason
         );
     }
+
+    fn to_hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    }
+
+    // The Node wire types wrap the substrate `TransferControl` /
+    // `TransferHeader` and ride the same postcard codec, so they must
+    // emit the bytes the cross-language golden vectors lock
+    // (sdk/tests/transfer_golden_vectors.rs +
+    // tests/cross_lang_transfer_formats/transfer_vectors.json, T-B).
+    // This pins the Node tier to those vectors at `cargo test` time
+    // without needing a built native module — a substrate wire change
+    // that skipped the fixture regen would fail here too.
+
+    #[test]
+    fn transfer_control_matches_golden_vectors() {
+        // Request encodes as variant tag 0x00 followed by the raw 32-byte
+        // hash; decode round-trips the hash.
+        for hash in [[0u8; 32], [0xABu8; 32], [0xFFu8; 32]] {
+            let ctl = TransferControl::request(Buffer::from(hash.to_vec())).unwrap();
+            let encoded = ctl.encode().unwrap();
+            assert_eq!(to_hex(&encoded), format!("00{}", to_hex(&hash)));
+
+            let decoded = TransferControl::decode(encoded).unwrap();
+            assert_eq!(decoded.hash().as_ref(), &hash);
+        }
+    }
+
+    #[test]
+    fn transfer_header_matches_golden_vectors() {
+        // (logical value, expected postcard hex) straight from the fixture.
+        let found_cases: &[(u64, &str)] = &[
+            (0, "0000"),
+            (1, "0001"),
+            (300, "00ac02"),
+            (4 * 1024 * 1024, "0080808002"),
+            (u64::MAX, "00ffffffffffffffffff01"),
+        ];
+        for &(total_len, expected_hex) in found_cases {
+            let hdr = TransferHeader::found(BigInt::from(total_len));
+            assert_eq!(to_hex(&hdr.encode().unwrap()), expected_hex, "found {total_len}");
+
+            let decoded = TransferHeader::decode(Buffer::from(
+                (0..expected_hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&expected_hex[i..i + 2], 16).unwrap())
+                    .collect::<Vec<_>>(),
+            ))
+            .unwrap();
+            assert!(decoded.is_found());
+            assert_eq!(decoded.total_len().map(|b| b.get_u64().1), Some(total_len));
+        }
+
+        // NotFound is the single byte 0x01.
+        let nf = TransferHeader::not_found();
+        assert_eq!(to_hex(&nf.encode().unwrap()), "01");
+        let decoded = TransferHeader::decode(Buffer::from(vec![0x01u8])).unwrap();
+        assert!(!decoded.is_found());
+        assert_eq!(decoded.total_len().map(|b| b.get_u64().1), None);
+    }
 }
