@@ -2360,12 +2360,27 @@ impl MeshBlobAdapter {
     /// operator opts into disk persistence via [`Self::with_persistent`]
     /// and into cross-node replication via [`Self::with_replication`].
     fn chunk_file_config(&self) -> RedexFileConfig {
-        let mut cfg = RedexFileConfig::new().with_persistent(self.persistent);
+        // A chunk is written ONCE (one append of the whole content-
+        // addressed payload), and the heap segment is grow-only — it
+        // sizes itself to the content on that single append. So default
+        // the initial reservation to 0 rather than inheriting
+        // `RedexFileConfig`'s 64 MiB prealloc. That prealloc, ×
+        // one-file-per-chunk, is exactly what made a many-small-file
+        // directory (tens of thousands of chunks) reserve hundreds of
+        // GiB up front and OOM: 30k chunks × 64 MiB ≈ 1.9 TiB of
+        // reservation for ~90 MiB of actual content. With a 0 hint, N
+        // chunks cost ≈ Σ(content), not N × 64 MiB — `max_memory_bytes`
+        // is only the up-front reservation here (the segment grows past
+        // it up to the 3 GB hard limit), so dropping it costs nothing at
+        // store time beyond one content-sized allocation per chunk.
+        // `with_chunk_file_max_memory_bytes` still lets an operator pre-
+        // reserve if they know their chunks are uniformly large.
+        let reservation = self.chunk_file_max_memory_bytes.unwrap_or(0);
+        let mut cfg = RedexFileConfig::new()
+            .with_persistent(self.persistent)
+            .with_max_memory_bytes(reservation);
         if let Some(rep) = self.replication.clone() {
             cfg = cfg.with_replication(Some(rep));
-        }
-        if let Some(bytes) = self.chunk_file_max_memory_bytes {
-            cfg = cfg.with_max_memory_bytes(bytes);
         }
         cfg
     }

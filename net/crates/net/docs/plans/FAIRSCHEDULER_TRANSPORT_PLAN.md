@@ -135,6 +135,16 @@ Pass criteria:
 - Memory peak under 500 MB on both sides regardless of total size.
 - **Throughput at high file count within 80% of throughput at low file count for equal byte volume.** This is the architectural property: 200 MB across 30,000 files should be within 20% of 200 MB across 200 files. The router's fair scheduler amortizing per-stream overhead is what makes this hold; if it doesn't hold, the architectural claim needs revision.
 
+#### Phase 2 — MEASURED (2026-05-31, `tests/dir_transfer.rs`)
+
+The architectural claim **holds**; running at scale surfaced two issues, one fixed and one substrate-level.
+
+- **Throughput-invariance: CONFIRMED.** `bench_throughput_invariance` — equal 8 MiB volume, few-large (2×4 MiB) vs many-small (1024×8 KiB): ratio **1.28** (target ≥ 0.80). Throughput tracks *volume, not file count*; many-small is faster because more concurrent streams fill the pipe better. The fair scheduler amortizes per-stream overhead as claimed.
+- **Transfer rate holds with file count.** `bench_nodemodules_scale` — a 1244-file deep-nested tree reconstructs byte-for-byte at ~1900 files/s, vs ~2100 files/s at 332 files.
+- **FIXED — transfer streams leaked.** Each transfer left its stream open on both sides (reclaimed only at the 300 s idle timeout), so a directory pull accumulated one live stream per chunk. Now `serve_chunk` closes the reply stream after send and the engine closes the receive stream on completion (commit `c38fa1af1`). A FIN + ack-tracked close that survives mid-transfer loss on a lossy link is a follow-up.
+- **Concurrent large-file transfers** need `recv_buf ≥ ~concurrency × tx-window` (the 5 MiB transfer window is per-stream, so aggregate in-flight scales with concurrency).
+- **STORE memory wall — FIXED (was the 30k-file blocker).** `MeshBlobAdapter` opens one RedEX chunk-file per chunk, and each used to pre-reserve `RedexFileConfig::max_memory_bytes` (default 64 MiB) up front (`HeapSegment::with_capacity`); thousands of small chunks blew the commit limit (a 64 MiB alloc failed at ~1.3k files). Fix: `max_memory_bytes` is only an *initial reservation hint* (the grow-only segment extends past it to the 3 GB hard limit), so `chunk_file_config` now defaults a chunk file's reservation to **0** — a write-once chunk's single append sizes the segment to its content. N chunks cost ≈ Σ(content) instead of N × 64 MiB. **Verified:** `bench_nodemodules_scale` now moves a **12,430-file / 27.4 MiB** tree byte-for-byte on the default (un-capped) config in ~8.3 s (~1490 files/s), where it previously OOM'd at ~1.3k files. The full 25-40k range is now a question of patience, not memory.
+
 ### Phase 3: Concurrent mixed workload
 
 The bandwidth-fairness test. Start a directory transfer of a large `node_modules` between two peers. While the transfer is in progress, run other substrate operations across the mesh — tool calls, health checks, capability updates, smaller transfers between other peer pairs.
@@ -182,6 +192,14 @@ The framing matters as much as the numbers. The demo materials should anchor on 
 11. **Demo materials** written against the actual measured numbers.
 
 If any test phase reveals a problem with the architectural framing, the framing changes before the next phase runs. Better to discover the truth at phase 2 than at PR review.
+
+## Substrate follow-up: on-demand chunk-segment sizing — DONE
+
+**Problem.** The blob store opens one RedEX chunk-file per chunk, and `RedexFile::new` pre-reserved `min(max_memory_bytes, 64 MiB)` via `HeapSegment::with_capacity`. So N chunks reserved `N × 64 MiB` up front regardless of content. At node_modules scale (tens of thousands of tiny chunks) that's hundreds of GiB → OOM. Capping `max_memory_bytes` lower only traded the ceiling for a floor (`N × cap`).
+
+**Fix (landed).** `max_memory_bytes` turned out to be *only* the initial reservation hint — `HeapSegment` is grow-only and extends past it to the 3 GB hard limit (the field is read at exactly one site, `file.rs:110`). So no `redex/segment.rs` change was needed: `MeshBlobAdapter::chunk_file_config` now defaults the reservation to **0**, and a write-once chunk's single append sizes the segment to its content. `with_chunk_file_max_memory_bytes` is retained for operators who want to pre-reserve uniformly-large chunks.
+
+**Verified.** `bench_nodemodules_scale` moves a 12,430-file / 27.4 MiB tree byte-for-byte on the default config (~8.3 s, ~1490 files/s) — previously OOM'd at ~1.3k files. 492 lib blob tests + the transfer/dir/fairness suites pass unchanged. The general `RedexFileConfig` default (64 MiB) is left as-is (append-heavy event logs may want the prealloc); only the write-once chunk path opts out.
 
 ## Open questions worth flagging but not blocking
 

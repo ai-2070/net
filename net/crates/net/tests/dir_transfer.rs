@@ -260,19 +260,12 @@ async fn bench_nodemodules_scale() {
     // a Windows host the per-datagram loopback latency caps throughput
     // (see transfer_fairness bench), so we report the actual numbers and
     // the structural correctness rather than asserting the wall-clock.
-    const PACKAGES: usize = 150; // ~1.3k files
+    const PACKAGES: usize = 1500; // ~13k files — toward node_modules scale
     const CONCURRENCY: usize = 16;
-    // The blob store opens one RedEX chunk-file per chunk, each
-    // PRE-RESERVING `max_memory_bytes` (default 64 MiB). With thousands
-    // of small chunks that explodes the commit (1.3k × 64 MiB ≈ 83 GiB →
-    // OOM). Cap each chunk file at 128 KiB — comfortably above the
-    // largest file here (~60 KiB bundles) and the directory manifest
-    // (~80 KiB at this file count). NOTE: this cap is a uniform per-chunk
-    // floor, so `chunk_count × cap` still bounds how far this scales; a
-    // true 30k-file node_modules needs on-demand segment sizing in RedEX
-    // (reserve-to-content, not reserve-to-max). That's the real
-    // store-side scale fix and is out of scope for the transport.
-    const CHUNK_CAP: usize = 128 * 1024;
+    // No per-chunk memory cap: the store now defaults chunk files to a
+    // 0 initial reservation and the grow-only segment sizes to content
+    // (the on-demand-sizing fix). So ~13k chunks cost ≈ Σ(content), not
+    // 13k × 64 MiB. This is the regime that OOM'd before the fix.
 
     let node_a = build_node().await;
     let node_b = build_node().await;
@@ -280,7 +273,7 @@ async fn bench_nodemodules_scale() {
     let a_id = node_a.node_id();
 
     let redex_a = Arc::new(Redex::new());
-    let adapter_a = Arc::new(MeshBlobAdapter::new("a", redex_a).with_chunk_file_max_memory_bytes(CHUNK_CAP));
+    let adapter_a = Arc::new(MeshBlobAdapter::new("a", redex_a));
     let redex_b = Arc::new(Redex::new());
     let adapter_b = Arc::new(MeshBlobAdapter::new("b", redex_b));
     node_a.serve_blob_transfer(adapter_a.clone());
