@@ -19,7 +19,9 @@ use super::crypto::{PacketCipher, SessionKeys};
 // `SharedPacketPool` is intentionally absent — `NetSession` uses
 // only `SharedLocalPool` as the single TX-side AEAD source.
 use super::pool::SharedLocalPool;
-use super::reliability::{create_reliability_mode, ReliabilityMode, RetransmitDescriptor};
+use super::reliability::{
+    create_reliability_mode, ReliabilityMode, ReliableStream, RetransmitDescriptor,
+};
 use super::stream::DEFAULT_STREAM_WINDOW_BYTES;
 use super::transport::ParsedPacket;
 
@@ -1123,10 +1125,15 @@ impl StreamState {
         tx_window: u32,
         epoch: u64,
     ) -> Self {
+        // Size the retransmit window to the tx-credit window so the
+        // sender can never have more packets in flight than it can
+        // retransmit (H-1). Cheap: `pending` grows on demand, so a large
+        // window costs no up-front memory.
+        let max_pending = ReliableStream::max_pending_for_window(tx_window);
         Self {
             tx_seq: AtomicU64::new(0),
             rx_seq: AtomicU64::new(0),
-            reliability: parking_lot::Mutex::new(create_reliability_mode(reliable)),
+            reliability: parking_lot::Mutex::new(create_reliability_mode(reliable, max_pending)),
             inbound: SegQueue::new(),
             active: AtomicBool::new(true),
             last_activity: AtomicU64::new(current_timestamp()),

@@ -223,18 +223,51 @@ impl ReliableStream {
     /// Default retransmit timeout
     pub const DEFAULT_RTO: Duration = Duration::from_millis(50);
 
-    /// Default max pending packets
+    /// Default max pending packets — also the floor when the window is
+    /// auto-sized from a stream's tx-window (see
+    /// [`Self::max_pending_for_window`]).
     pub const DEFAULT_MAX_PENDING: usize = 32;
+
+    /// Lower bound on the per-packet size assumed when sizing the
+    /// retransmit window from a tx-window. The window must track at least
+    /// `tx_window / MIN_TRACKED_PACKET_BYTES` packets so nothing in flight
+    /// is evicted before it can be retransmitted. 512 B covers bulk (MTU)
+    /// and typical control packets; sub-512 B spam on a huge window is the
+    /// only residual eviction risk — surfaced loudly via
+    /// [`Self::untracked_evictions`] (H-2).
+    pub const MIN_TRACKED_PACKET_BYTES: u32 = 512;
+
+    /// Hard cap on the auto-sized retransmit window, bounding the pending
+    /// queue's worst-case growth under sustained loss.
+    pub const MAX_RETRANSMIT_WINDOW: usize = 16_384;
 
     /// Default max retries
     pub const DEFAULT_MAX_RETRIES: u8 = 3;
 
-    /// Create a new reliable stream with default settings
+    /// Size the retransmit window to a stream's tx-credit window so the
+    /// sender can never have more packets in flight than it can
+    /// retransmit (the H-1 invariant: tx-window ≤ retransmit-window).
+    /// `tx_window == 0` (backpressure disabled) falls back to the default.
+    pub fn max_pending_for_window(tx_window: u32) -> usize {
+        if tx_window == 0 {
+            return Self::DEFAULT_MAX_PENDING;
+        }
+        ((tx_window / Self::MIN_TRACKED_PACKET_BYTES) as usize)
+            .max(Self::DEFAULT_MAX_PENDING)
+            .min(Self::MAX_RETRANSMIT_WINDOW)
+    }
+
+    /// Create a new reliable stream with default settings.
+    ///
+    /// `pending` is NOT pre-reserved: it grows on demand to the actual
+    /// in-flight count (itself bounded by the tx-window's bytes), so a
+    /// generous `max_pending` costs nothing up front — important when
+    /// thousands of small-payload streams each carry a reliability state.
     pub fn new() -> Self {
         Self {
             next_expected: 0,
             sack_bitmap: 0,
-            pending: VecDeque::with_capacity(Self::DEFAULT_MAX_PENDING),
+            pending: VecDeque::new(),
             rto: Self::DEFAULT_RTO,
             max_pending: Self::DEFAULT_MAX_PENDING,
             max_retries: Self::DEFAULT_MAX_RETRIES,
@@ -242,12 +275,13 @@ impl ReliableStream {
         }
     }
 
-    /// Create with custom settings
+    /// Create with custom settings. `pending` grows on demand (no
+    /// pre-reservation) — see [`Self::new`].
     pub fn with_settings(rto: Duration, max_pending: usize, max_retries: u8) -> Self {
         Self {
             next_expected: 0,
             sack_bitmap: 0,
-            pending: VecDeque::with_capacity(max_pending),
+            pending: VecDeque::new(),
             rto,
             max_pending,
             max_retries,
@@ -369,14 +403,22 @@ impl ReliabilityMode for ReliableStream {
         if self.pending.len() >= self.max_pending {
             self.pending.pop_front();
             self.untracked_evictions = self.untracked_evictions.saturating_add(1);
-            tracing::warn!(
-                untracked_evictions = self.untracked_evictions,
-                max_pending = self.max_pending,
-                "ReliableStream: retransmit window full; evicted oldest \
-                 unacked packet — NACK for that seq can no longer \
-                 recover it. Increase max_pending or apply upstream \
-                 backpressure.",
-            );
+            // Rate-limit the warning: the first eviction is the signal,
+            // then every 64th, so a stream stuck in sustained overflow
+            // surfaces in logs without drowning them. With H-1 sizing the
+            // window to the tx-window this should never fire for a
+            // well-configured stream — if it does, the window/packet-size
+            // assumption was violated and data was genuinely lost.
+            if self.untracked_evictions == 1 || self.untracked_evictions.is_multiple_of(64) {
+                tracing::warn!(
+                    untracked_evictions = self.untracked_evictions,
+                    max_pending = self.max_pending,
+                    "ReliableStream: retransmit window full; evicted oldest \
+                     unacked packet — NACK for that seq can no longer \
+                     recover it. Increase max_pending or apply upstream \
+                     backpressure.",
+                );
+            }
         }
         self.pending.push_back(UnackedPacket {
             descriptor,
@@ -525,10 +567,18 @@ impl std::fmt::Debug for ReliableStream {
     }
 }
 
-/// Create a boxed reliability mode from configuration
-pub fn create_reliability_mode(reliable: bool) -> Box<dyn ReliabilityMode> {
+/// Create a boxed reliability mode from configuration. For reliable
+/// streams the retransmit window (`max_pending`) is supplied by the
+/// caller — sized to the stream's tx-window via
+/// [`ReliableStream::max_pending_for_window`] so the sender can never
+/// have more in flight than it can retransmit.
+pub fn create_reliability_mode(reliable: bool, max_pending: usize) -> Box<dyn ReliabilityMode> {
     if reliable {
-        Box::new(ReliableStream::new())
+        Box::new(ReliableStream::with_settings(
+            ReliableStream::DEFAULT_RTO,
+            max_pending,
+            ReliableStream::DEFAULT_MAX_RETRIES,
+        ))
     } else {
         Box::new(FireAndForget::new())
     }
@@ -551,6 +601,57 @@ mod tests {
             events: vec![packet],
             flags: PacketFlags::RELIABLE,
         })
+    }
+
+    #[test]
+    fn max_pending_scales_with_window_floored_and_capped() {
+        // 0 window (backpressure disabled) → default floor.
+        assert_eq!(
+            ReliableStream::max_pending_for_window(0),
+            ReliableStream::DEFAULT_MAX_PENDING
+        );
+        // Small window → floored at the default.
+        assert_eq!(
+            ReliableStream::max_pending_for_window(1024),
+            ReliableStream::DEFAULT_MAX_PENDING
+        );
+        // Mid window → tx_window / MIN_TRACKED_PACKET_BYTES.
+        assert_eq!(
+            ReliableStream::max_pending_for_window(1024 * 1024),
+            (1024 * 1024) / ReliableStream::MIN_TRACKED_PACKET_BYTES as usize
+        );
+        // Huge window → capped.
+        assert_eq!(
+            ReliableStream::max_pending_for_window(u32::MAX),
+            ReliableStream::MAX_RETRANSMIT_WINDOW
+        );
+    }
+
+    #[test]
+    fn large_window_tracks_all_inflight_without_eviction() {
+        // H-1: with a window > the legacy fixed 32, no unacked packet is
+        // evicted before it can be retransmitted. Pre-H-1, packet 0 would
+        // be evicted once packet 32 was sent and a NACK for it would find
+        // nothing to resend.
+        let mut s = ReliableStream::with_settings(Duration::from_millis(50), 100, 3);
+        for seq in 0..100u64 {
+            s.on_send(descriptor(seq, Bytes::from_static(b"payload")));
+        }
+        assert_eq!(
+            s.untracked_evictions(),
+            0,
+            "a 100-deep window must track all 100 in-flight packets"
+        );
+        // A NACK for the oldest sequence still recovers it.
+        let nack = NackPayload {
+            next_expected: 0,
+            missing_bitmap: 0,
+        };
+        let resent = s.on_nack(&nack);
+        assert!(
+            resent.iter().any(|d| d.seq == 0),
+            "oldest in-flight packet must still be retransmittable"
+        );
     }
 
     #[test]
@@ -781,10 +882,10 @@ mod tests {
 
     #[test]
     fn test_create_reliability_mode() {
-        let mode = create_reliability_mode(false);
+        let mode = create_reliability_mode(false, ReliableStream::DEFAULT_MAX_PENDING);
         assert_eq!(mode.name(), "fire-and-forget");
 
-        let mode = create_reliability_mode(true);
+        let mode = create_reliability_mode(true, ReliableStream::DEFAULT_MAX_PENDING);
         assert_eq!(mode.name(), "reliable");
     }
 
