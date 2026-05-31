@@ -111,6 +111,50 @@ async fn concurrent_transfers_both_succeed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "benchmark — run with --ignored --nocapture"]
+async fn bench_single_transfer_throughput() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_b, &node_a).await;
+    let a_id = node_a.node_id();
+
+    let redex_a = Arc::new(Redex::new());
+    let adapter_a = Arc::new(MeshBlobAdapter::new("a", redex_a));
+    let redex_b = Arc::new(Redex::new());
+    let adapter_b = Arc::new(MeshBlobAdapter::new("b", redex_b));
+    node_a.serve_blob_transfer(adapter_a.clone());
+    node_b.serve_blob_transfer(adapter_b);
+
+    let len = 4 * 1024 * 1024usize;
+    let bytes = payload(len, 7);
+    let (h, r) = small_ref(&bytes);
+    adapter_a.store(&r, &bytes).await.expect("store");
+
+    // Warm one transfer, then time a second (excludes any first-touch
+    // session/stream setup cost).
+    let _ = node_b.transfer_fetch_chunk(a_id, h).await.expect("warm");
+    let start = Instant::now();
+    let got = node_b.transfer_fetch_chunk(a_id, h).await.expect("fetch");
+    let elapsed = start.elapsed();
+
+    let mib = got.len() as f64 / (1024.0 * 1024.0);
+    let pkts = got.len().div_ceil(8000);
+    println!("── single transfer throughput ──");
+    println!("  {mib:.1} MiB in {elapsed:?} = {:.1} MiB/s", mib / elapsed.as_secs_f64());
+    println!(
+        "  ~{pkts} packets ⇒ {:.0} pkt/s, {:.3} ms/packet",
+        pkts as f64 / elapsed.as_secs_f64(),
+        elapsed.as_secs_f64() * 1000.0 / pkts as f64
+    );
+    println!(
+        "  note: single-stream rate here is bounded by per-datagram loopback\n  \
+         latency on this host (recvmmsg batch-receive is Linux-only), not credit\n  \
+         stalls — concurrent aggregate is higher, so the pipe has headroom."
+    );
+    assert_eq!(got.len(), len);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "benchmark — run with --ignored --nocapture"]
 async fn bench_concurrent_transfer_throughput() {
     let node_a = build_node().await;
     let node_b = build_node().await;

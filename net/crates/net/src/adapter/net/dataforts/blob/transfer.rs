@@ -94,6 +94,37 @@ pub fn next_transfer_stream_id() -> u64 {
 /// backpressure).
 const DATA_FRAME_BYTES: usize = 8000;
 
+/// Tx-credit window for a serving transfer stream, in on-wire bytes.
+///
+/// The default stream window (64 KiB, `DEFAULT_STREAM_WINDOW_BYTES`)
+/// holds only ~8 data frames in flight, so a multi-MiB chunk exhausts
+/// credit dozens of times and each stall pays `send_with_retry`'s
+/// ≥5 ms backoff even though the receiver's `StreamWindow` grant lands
+/// in <1 ms — throughput collapses to the stall cadence, not the link.
+///
+/// A serving stream carries at most one chunk
+/// ([`BLOB_CHUNK_SIZE_BYTES`](super::BLOB_CHUNK_SIZE_BYTES) = 4 MiB of
+/// *payload*), so a window that covers a full chunk's *on-wire* size —
+/// payload **plus** the per-packet framing the credit accounting
+/// charges (Net header + AEAD tag + event-frame length prefix, ~90 B ×
+/// ~525 frames ≈ 47 KiB for a max chunk) — lets the whole chunk stream
+/// without the per-event sends ever running out of credit mid-chunk.
+/// 5 MiB clears that with headroom. The receiver's continuous
+/// `StreamWindow` grants (drained every ≤1 ms) then only matter for
+/// chunks at the very top of the size range; below that the sender
+/// never blocks on credit at all.
+///
+/// This is the lever that fixed the throughput/fairness regression: the
+/// 64 KiB default window held ~8 frames, so a multi-MiB chunk exhausted
+/// credit dozens of times and each stall paid `send_with_retry`'s ≥5 ms
+/// backoff even though the grant lands in <1 ms — turning a smooth
+/// transfer into a stop-go stutter that also smeared concurrent
+/// transfers' interleaving. Fairness is otherwise unaffected: the
+/// [`FairScheduler`](crate::adapter::net::router::FairScheduler)
+/// interleaves by per-round quantum at dequeue time regardless of any
+/// one stream's window or queue depth.
+const TRANSFER_STREAM_WINDOW_BYTES: u32 = 5 * 1024 * 1024;
+
 /// Upper bound the receiver accepts for a chunk's `total_len`, so a
 /// misbehaving holder can't claim a huge length and OOM the buffer.
 /// Generous above the 4 MiB single-chunk max.
@@ -331,6 +362,7 @@ async fn serve_chunk(
     let cfg = StreamConfig::new()
         .with_reliability(Reliability::Reliable)
         .with_scheduled(true)
+        .with_window_bytes(TRANSFER_STREAM_WINDOW_BYTES)
         .with_fairness_weight(1);
     let stream = match mesh.open_stream(requester, stream_id, cfg) {
         Ok(s) => s,
@@ -352,6 +384,16 @@ async fn serve_chunk(
             if send_one(&mesh, &stream, postcard_event(&header)).await.is_err() {
                 return;
             }
+            // One reliable event per ~8 KiB frame. Because
+            // `TRANSFER_STREAM_WINDOW_BYTES` covers a whole chunk's
+            // on-wire size, the per-event credit never runs dry
+            // mid-chunk, so these sends don't stall into
+            // `send_with_retry`'s backoff (the 64 KiB default window
+            // exhausted every ~8 frames and each stall paid ≥5 ms even
+            // though the receiver's grant lands in <1 ms). Per-event
+            // (not batched) keeps each `send_with_retry` independently
+            // safe: a one-packet call can't partially commit and then
+            // resend a duplicate under a fresh sequence on retry.
             for chunk in bytes.chunks(DATA_FRAME_BYTES) {
                 if send_one(&mesh, &stream, Bytes::copy_from_slice(chunk))
                     .await
