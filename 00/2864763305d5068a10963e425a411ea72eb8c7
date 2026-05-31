@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/dataforts/blob/transfer.rs
+  s_3813c1cf893940::t_da14149fe03624 389-393
+  s_3813c1cf893940::t_a4d56e5cde4db3 225-250
+net/crates/net/docs/plans/FAIRSCHEDULER_TRANSPORT_PLAN.md
+  s_3813c1cf893940::t_460418e0ea8616 67-69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "002864763305d5068a10963e425a411ea72eb8c7",
+  "prompts": {},
+  "sessions": {
+    "s_3813c1cf893940": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8f529043-9c28-441a-89cc-3de50f96f588",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
