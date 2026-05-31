@@ -24,7 +24,15 @@
 - **H-3 ✅** give-up detection: a packet past `max_retries` is dropped + flags the stream failed → `SUBPROTOCOL_STREAM_RESET` → receiver fails its blob-transfer read promptly (`on_reset` → `BlobError`) instead of stalling to the 30 s timeout.
 - **H-9 ✅ (NEW — prerequisite for H-3)** ack-driven pruning of the retransmit window. The window was never pruned on the happy path, so packets lingered until the RTO and spuriously resent; H-3 turned that into a spurious give-up (broke the 2 MiB transfer). Fixed by piggybacking the receiver's `next_expected` on the StreamWindow grant (now 24 B, +`ack_seq`); the sender prunes via `ReliableStream::on_ack`.
 
-Remaining: H-4..H-8 (deferred, below).
+**H-4..H-8 also DONE** (commits `f8e9059cf`, `e809fabcc`, `d163f0b29`):
+- **H-8 ✅** ordering contract — investigated, no live bug (substrate delivers arrival-order + `seq`; transfer reorders itself, nRPC frames its own order + is fire-and-forget). Corrected the `Reliability::Reliable` doc (it falsely claimed in-order) and documented the contract at the delivery site. A general in-order buffer is deferred (no consumer needs it).
+- **H-4 ✅** receiver-side proactive NACK on the retransmit-loop tick (`collect_gap_nacks`) — recovers a quiet gap (tail loss / sender paused on credit) within a tick instead of waiting the sender's RTO.
+- **H-7 ✅** `MeshNode::close_stream_graceful` — waits for the reliable layer to drain (all acked) or a timeout before closing, so retransmit can fill gaps pre-teardown; `serve_chunk` uses it (replaced its hand-rolled ack-wait).
+- **H-5 ✅** adaptive RTO (RFC 6298 SRTT/RTTVAR, Karn, clamped [10 ms, 2 s]).
+- **H-6 ✅** Reno-style congestion window (slow-start/CA growth, MD on NACK loss, reset-to-floor on timeout) gating `send_on_stream` via `can_send`; no-op on loss-free paths.
+- Also removed a dead inherent `on_ack` that shadowed the trait method for concrete callers (production dispatched through `Box<dyn>` so it was test-only, but a footgun).
+
+The whole plan (H-1..H-9) is complete.
 
 ## Stages (done)
 
