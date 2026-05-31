@@ -9205,6 +9205,74 @@ impl MeshNode {
         }
     }
 
+    /// Fetch the chunk addressed by `hash` from whichever connected
+    /// peer holds it, without the caller naming a holder. Probes peers
+    /// in turn over the transfer transport: a peer that lacks the chunk
+    /// replies `NotFound` promptly (so misses are cheap), and the first
+    /// peer that serves the BLAKE3-verified bytes wins. Returns
+    /// [`BlobError::NotFound`] if no connected peer has it (the caller
+    /// may then fall back to its own backend or fail the read).
+    ///
+    /// This is the usable "fetch by content hash" entry point that
+    /// [`Self::transfer_fetch_chunk`] (which requires a known holder)
+    /// can't be on its own.
+    ///
+    /// **Discovery model (deliberate).** v1 probes connected peers
+    /// directly rather than consulting the capability fold for
+    /// `causal:<hash>` advertisers. The per-chunk `causal:<hex64>` tag
+    /// is a single-datagram advertisement that caps at ~15-20
+    /// chunks/node, so it does not scale as a per-chunk holder index —
+    /// which is exactly why the directory transfer
+    /// ([`super::dataforts::dir`]) pulls from a *known* source instead.
+    /// Probing sidesteps the ceiling entirely: the holder's prompt
+    /// `NotFound` is the membership test. A future optimization can use
+    /// a node-level "serves blobs" capability (one tag, no ceiling) or a
+    /// dedicated zero-byte probe frame to ORDER / prune candidates and
+    /// to stay robust against a silent peer; today each probe is bounded
+    /// by [`DISCOVERY_PROBE_TIMEOUT`] so one unresponsive peer can't
+    /// stall the whole search.
+    ///
+    /// [`BlobError::NotFound`]: super::dataforts::blob::BlobError::NotFound
+    /// [`DISCOVERY_PROBE_TIMEOUT`]: Self::transfer_fetch_chunk_discovered
+    pub async fn transfer_fetch_chunk_discovered(
+        self: &Arc<Self>,
+        hash: [u8; 32],
+    ) -> Result<bytes::Bytes, super::dataforts::blob::BlobError> {
+        use super::dataforts::blob::BlobError;
+
+        // Generous enough for a max-chunk (≤4 MiB) transfer from a
+        // healthy holder, tight enough that a silent peer only costs
+        // this once before the search moves on. A miss returns its
+        // `NotFound` long before this fires.
+        const DISCOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+        let candidates: Vec<u64> = self.peers.iter().map(|e| *e.key()).collect();
+        if candidates.is_empty() {
+            return Err(BlobError::NotFound(format!(
+                "blob transfer: no connected peers to discover mesh://{}",
+                Self::blob_hex(&hash)
+            )));
+        }
+        for peer in candidates {
+            match tokio::time::timeout(
+                DISCOVERY_PROBE_TIMEOUT,
+                self.transfer_fetch_chunk(peer, hash),
+            )
+            .await
+            {
+                // First holder to serve the verified bytes wins.
+                Ok(Ok(bytes)) => return Ok(bytes),
+                // Peer doesn't have it / transient error / went silent —
+                // try the next candidate.
+                Ok(Err(_)) | Err(_) => continue,
+            }
+        }
+        Err(BlobError::NotFound(format!(
+            "blob transfer: no connected peer served mesh://{}",
+            Self::blob_hex(&hash)
+        )))
+    }
+
     /// Send a blob-transfer control packet (subprotocol-tagged, tiny)
     /// to `peer` on `stream_id`. Goes straight to the socket — control
     /// is a single small packet; reliability is the requester's

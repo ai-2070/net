@@ -130,6 +130,72 @@ async fn transfer_fetch_chunk_large_exercises_window_refill() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_fetch_chunk_discovered_finds_the_holder() {
+    // B is connected to two peers: A holds the chunk, C does not. B
+    // fetches by hash alone (no named holder) and discovery probes its
+    // peers until one serves it — A's bytes come back, C's prompt
+    // NotFound is just skipped.
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    let node_c = build_node().await;
+    // B (requester) connects to both A (holder) and C (non-holder).
+    handshake(&node_b, &node_a).await;
+    handshake(&node_b, &node_c).await;
+    let a_id = node_a.node_id();
+
+    let redex_a = Arc::new(Redex::new());
+    let adapter_a = Arc::new(MeshBlobAdapter::new("a", redex_a));
+    let redex_b = Arc::new(Redex::new());
+    let adapter_b = Arc::new(MeshBlobAdapter::new("b", redex_b));
+    let redex_c = Arc::new(Redex::new());
+    let adapter_c = Arc::new(MeshBlobAdapter::new("c", redex_c));
+    node_a.serve_blob_transfer(adapter_a.clone());
+    node_b.serve_blob_transfer(adapter_b);
+    node_c.serve_blob_transfer(adapter_c);
+
+    // Only A holds the chunk.
+    let bytes = payload(40_000);
+    let (hash, blob_ref) = small_ref(&bytes);
+    adapter_a.store(&blob_ref, &bytes).await.expect("A store");
+    let _ = a_id;
+
+    let got = node_b
+        .transfer_fetch_chunk_discovered(hash)
+        .await
+        .expect("B discovers + fetches from whichever peer holds it");
+    assert_eq!(
+        got.as_ref(),
+        bytes.as_slice(),
+        "discovered chunk must match byte-for-byte",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_fetch_chunk_discovered_none_hold_it() {
+    // No connected peer holds the chunk → discovery exhausts its
+    // candidates and returns NotFound (the caller fails over / errors).
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_b, &node_a).await;
+
+    let redex_a = Arc::new(Redex::new());
+    let adapter_a = Arc::new(MeshBlobAdapter::new("a", redex_a));
+    let redex_b = Arc::new(Redex::new());
+    let adapter_b = Arc::new(MeshBlobAdapter::new("b", redex_b));
+    node_a.serve_blob_transfer(adapter_a);
+    node_b.serve_blob_transfer(adapter_b);
+
+    let bytes = payload(2048);
+    let (hash, _) = small_ref(&bytes);
+    use net::adapter::net::dataforts::blob::BlobError;
+    let err = node_b
+        .transfer_fetch_chunk_discovered(hash)
+        .await
+        .expect_err("no peer holds it");
+    assert!(matches!(err, BlobError::NotFound(_)), "got {err:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transfer_fetch_chunk_not_found() {
     let node_a = build_node().await;
     let node_b = build_node().await;
