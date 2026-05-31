@@ -10,7 +10,7 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "module": "CommonJS",
-    "moduleResolution": "bundler",
+    "moduleResolution": "node10",
     "target": "ES2022",
     "lib": ["ES2022"],
     "outDir": ".",
@@ -24,7 +24,7 @@
     "types": ["node"],
   },
   // Source files only; tests stay under the base config.
-  "include": ["errors.ts", "mesh_rpc.ts", "meshdb.ts", "aggregator.ts"],
+  "include": ["errors.ts", "mesh_rpc.ts", "meshdb.ts", "aggregator.ts", "tool.ts"],
   "exclude": [
     "node_modules",
     "dist",
