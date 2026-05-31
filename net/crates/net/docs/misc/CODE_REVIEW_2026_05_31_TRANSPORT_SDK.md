@@ -128,3 +128,30 @@ read accurately until T-H lands.
 Mergeable. Finding #1 is the only one worth resolving or explicitly
 tracking before this reaches a thin-build Go consumer; the rest are
 polish / follow-up.
+
+## Resolution (2026-05-31)
+
+All findings addressed on `transport-sdk`, one commit each:
+
+1. **Transport feature-off stubs** — `src/ffi/transport_stubs.rs` added
+   (mirrors `ffi::blob_stubs`); Go maps `-107` → `"feature-not-built"`.
+   Verified thin-config build + stub tests, and full-quad build with
+   stubs compiled out (no symbol conflict). Also wrapped the latent
+   missing-`unsafe` in the `blob_stubs` test now that the thin config is
+   test-compiled. → `fix(ffi): transport feature-off stubs…`
+2. **`NotFound` vs `AllPeersFailed` in py/node** — discovery `NotFound`
+   re-tagged as "all peers failed" in both bindings; Node unit tests
+   cover the re-tag + fall-through. → `fix(bindings): distinguish
+   all-peers-failed…`
+3. **Out-param zeroing** — `net_fetch_dir` / `net_dir_manifest_read`
+   zero on entry; guarantee documented in `net_transport.h`. →
+   `fix(ffi): zero out-params on entry…`
+4. **`-212` reserved gap** — documented in both `net_transport.h` and
+   `src/ffi/transport.rs`; drift test still green. → `docs(ffi): note
+   -212 is reserved…`
+5. **Cross-language vectors** — Node wire types pinned to the canonical
+   `transfer_vectors.json` vectors via `cargo test`-time unit tests.
+   Python's pyo3 codec needs a live GIL under `extension-module`, so a
+   runnable test there isn't reasonable; that tier stays on
+   `py_compile` + the deferred T-H behavioural test. → `test(node): pin
+   transport wire types…`
