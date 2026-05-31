@@ -97,34 +97,37 @@ const DATA_FRAME_BYTES: usize = 8000;
 
 /// Tx-credit window for a serving transfer stream, in on-wire bytes.
 ///
-/// The default stream window (64 KiB, `DEFAULT_STREAM_WINDOW_BYTES`)
-/// holds only ~8 data frames in flight, so a multi-MiB chunk exhausts
-/// credit dozens of times and each stall pays `send_with_retry`'s
-/// ≥5 ms backoff even though the receiver's `StreamWindow` grant lands
-/// in <1 ms — throughput collapses to the stall cadence, not the link.
+/// **Invariant: the flow-control window must not exceed the reliability
+/// retransmit window.** A reliable stream only tracks its most recent
+/// `ReliableStream::DEFAULT_MAX_PENDING` (32) unacked packets for
+/// retransmit; an unacked packet that ages past that window is evicted
+/// and a later NACK can no longer recover it. If the tx-credit window
+/// lets more than that many packets fly before the receiver's grants
+/// catch up — which happens precisely when the receiver is slow, e.g.
+/// several transfers contending for one recv loop — then an early drop
+/// is unrecoverable and the transfer stalls to the 30 s timeout.
 ///
-/// A serving stream carries at most one chunk
-/// ([`BLOB_CHUNK_SIZE_BYTES`](super::BLOB_CHUNK_SIZE_BYTES) = 4 MiB of
-/// *payload*), so a window that covers a full chunk's *on-wire* size —
-/// payload **plus** the per-packet framing the credit accounting
-/// charges (Net header + AEAD tag + event-frame length prefix, ~90 B ×
-/// ~525 frames ≈ 47 KiB for a max chunk) — lets the whole chunk stream
-/// without the per-event sends ever running out of credit mid-chunk.
-/// 5 MiB clears that with headroom. The receiver's continuous
-/// `StreamWindow` grants (drained every ≤1 ms) then only matter for
-/// chunks at the very top of the size range; below that the sender
-/// never blocks on credit at all.
+/// So size the window to ≈ the retransmit window: `DEFAULT_MAX_PENDING`
+/// frames. Charged on-wire bytes per packet exceed `DATA_FRAME_BYTES`
+/// (header + AEAD tag + framing), so a window of `DEFAULT_MAX_PENDING ×
+/// DATA_FRAME_BYTES` admits *fewer* than `DEFAULT_MAX_PENDING` packets
+/// in flight — comfortably inside the retransmit window.
 ///
-/// This is the lever that fixed the throughput/fairness regression: the
-/// 64 KiB default window held ~8 frames, so a multi-MiB chunk exhausted
-/// credit dozens of times and each stall paid `send_with_retry`'s ≥5 ms
-/// backoff even though the grant lands in <1 ms — turning a smooth
-/// transfer into a stop-go stutter that also smeared concurrent
-/// transfers' interleaving. Fairness is otherwise unaffected: the
-/// [`FairScheduler`](crate::adapter::net::router::FairScheduler)
-/// interleaves by per-round quantum at dequeue time regardless of any
-/// one stream's window or queue depth.
-const TRANSFER_STREAM_WINDOW_BYTES: u32 = 5 * 1024 * 1024;
+/// This is smaller than a whole chunk, so a multi-MiB chunk refills the
+/// window several times and a refill that finds no credit pays
+/// `send_with_retry`'s backoff. That costs little in practice: measured
+/// single-stream throughput is the same as with a 5 MiB window (it's
+/// bounded by per-datagram loopback latency, not credit), and concurrent
+/// transfers keep the pipe full across streams. An earlier 5 MiB window
+/// *looked* faster but silently violated the invariant above — concurrent
+/// large transfers corrupted/timed out (see tests/transfer_concurrency.rs).
+/// Coupling the window to the retransmit window is the correctness fix;
+/// raising both together (a per-stream retransmit-window knob) is a
+/// possible future throughput lever but must avoid pre-reserving large
+/// retransmit buffers per stream (that re-creates the many-small-stream
+/// memory blow-up).
+const TRANSFER_STREAM_WINDOW_BYTES: u32 =
+    crate::adapter::net::ReliableStream::DEFAULT_MAX_PENDING as u32 * DATA_FRAME_BYTES as u32;
 
 /// Upper bound the receiver accepts for a chunk's `total_len`, so a
 /// misbehaving holder can't claim a huge length and OOM the buffer.
