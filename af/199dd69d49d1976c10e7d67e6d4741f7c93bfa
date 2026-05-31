@@ -1,0 +1,45 @@
+net/crates/net/src/adapter/net/subprotocol/stream_window.rs
+  s_3813c1cf893940::t_68f3fb3b177f81 272-274
+net/crates/net/src/adapter/net/dataforts/dir.rs
+  s_3813c1cf893940::t_68f3fb3b177f81 276-277,437-444
+  s_3813c1cf893940::t_20310dd5a5c58e 434-436
+net/crates/net/src/adapter/net/reliability.rs
+  s_3813c1cf893940::t_073cc5186ade0b 335-336,338
+  s_3813c1cf893940::t_5d77e5b4282fd6 649
+  s_3813c1cf893940::t_68f3fb3b177f81 984-987
+net/crates/net/src/adapter/net/dataforts/blob/mod.rs
+  s_3813c1cf893940::t_68f3fb3b177f81 127
+net/crates/net/tests/scheduled_stream.rs
+  s_3813c1cf893940::t_68f3fb3b177f81 92-94
+net/crates/net/tests/transfer_concurrency.rs
+  s_3813c1cf893940::t_68f3fb3b177f81 40-44,61-63,68-71,104-106,126-132,166-170,200-204
+net/crates/net/src/adapter/net/dataforts/blob/transfer.rs
+  s_3813c1cf893940::t_68f3fb3b177f81 395-397,404-406,509-512
+net/crates/net/src/adapter/net/mesh.rs
+  s_3813c1cf893940::t_68f3fb3b177f81 476-477,1782-1783,5058-5061,5115-5119,5173-5177,9478-9480,9592-9594,10625-10632,10653-10660
+  s_3813c1cf893940::t_0976327e0ad910 5172,5178
+net/crates/net/tests/transfer_fairness.rs
+  s_3813c1cf893940::t_68f3fb3b177f81 70-72,77-80,147-150,217-228
+net/crates/net/tests/blob_transfer.rs
+  s_3813c1cf893940::t_68f3fb3b177f81 63-66
+net/crates/net/src/adapter/net/router.rs
+  s_3813c1cf893940::t_22e5ec0ca23875 652-655
+net/crates/net/tests/dir_transfer.rs
+  s_3813c1cf893940::t_68f3fb3b177f81 149-158,174-177,208-212,248-250,274-276,289-293,297-301,371-374,406,430-433,435-441,482-485
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "af199dd69d49d1976c10e7d67e6d4741f7c93bfa",
+  "prompts": {},
+  "sessions": {
+    "s_3813c1cf893940": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8f529043-9c28-441a-89cc-3de50f96f588",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
