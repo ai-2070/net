@@ -7,29 +7,26 @@
 //! # Handle model
 //!
 //! Transfer is node-driven in the substrate, so these functions take
-//! the existing [`MeshNodeHandle`](super::mesh::MeshNodeHandle) from
-//! the mesh surface (`net_mesh_*`) plus, for the store / serve side,
-//! the [`MeshBlobAdapterHandle`](super::blob::MeshBlobAdapterHandle)
-//! from the blob surface (`net_mesh_blob_adapter_*`). No new handle
-//! type is introduced. Both are cloned under their owning handle's
-//! guard for the duration of an op (see `mesh_node_arc` /
-//! `blob_adapter_arc`), so a concurrent `_free` cannot deallocate the
-//! inner mid-call.
+//! the existing `MeshNodeHandle` from the mesh surface (`net_mesh_*`)
+//! plus, for the store / serve side, the `MeshBlobAdapterHandle` from
+//! the blob surface (`net_mesh_blob_adapter_*`). No new handle type is
+//! introduced. Both are cloned under their owning handle's guard for the
+//! duration of an op (see `mesh_node_arc` / `blob_adapter_arc`), so a
+//! concurrent `_free` cannot deallocate the inner mid-call.
 //!
 //! # Serving is required to fetch
 //!
-//! A node must install the transfer engine via
-//! [`net_serve_blob_transfer`] before it can serve chunks to peers OR
-//! issue its own fetches — an un-installed node returns
-//! `NET_ERR_TRANSFER_ENGINE_NOT_INSTALLED`.
+//! A node must install the transfer engine via `net_serve_blob_transfer`
+//! before it can serve chunks to peers OR issue its own fetches — an
+//! un-installed node returns `NET_ERR_TRANSFER_ENGINE_NOT_INSTALLED`.
 //!
 //! # Memory + errors
 //!
 //! Owned byte buffers (`out_bytes` / `out_len`) are freed with
-//! [`net_transport_free_buffer`]; JSON strings (`net_dir_manifest_read`)
-//! with [`net_free_string`](super::net_free_string). Errors are negative
-//! `c_int` codes in the `NET_ERR_TRANSFER_*` / `NET_ERR_DIR_*` band; the
-//! per-code meaning is in `include/net_transport.h`.
+//! `net_transport_free_buffer`; JSON strings (`net_dir_manifest_read`)
+//! with `net_free_string`. Errors are negative `c_int` codes in the
+//! `NET_ERR_TRANSFER_*` / `NET_ERR_DIR_*` band; the per-code meaning is
+//! in `include/net_transport.h`.
 //!
 //! # Async
 //!
