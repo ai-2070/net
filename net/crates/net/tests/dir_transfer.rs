@@ -202,3 +202,52 @@ async fn directory_transfer_many_small_files() {
     assert_eq!(stats.files, n, "all {n} files transferred");
     assert_eq!(read_tree(dest.path()), read_tree(src.path()), "trees match");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn directory_transfer_large_multichunk_file() {
+    // A file larger than the 4 MiB chunk threshold becomes a
+    // BlobRef::Manifest (multiple content-addressed chunks). This
+    // exercises the dir wrapper's transfer_fetch_blob Manifest branch —
+    // fetch each chunk by hash via the transfer transport and
+    // concatenate in manifest order — which the small-file tests never
+    // hit (they're all single-chunk Small blobs).
+    use net::adapter::net::dataforts::blob::BLOB_CHUNK_SIZE_BYTES;
+
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_b, &node_a).await;
+    let a_id = node_a.node_id();
+
+    let redex_a = Arc::new(Redex::new());
+    let adapter_a = Arc::new(MeshBlobAdapter::new("a", redex_a));
+    let redex_b = Arc::new(Redex::new());
+    let adapter_b = Arc::new(MeshBlobAdapter::new("b", redex_b));
+    node_a.serve_blob_transfer(adapter_a.clone());
+    node_b.serve_blob_transfer(adapter_b);
+
+    // ~9 MiB ⇒ 3 chunks (4 MiB + 4 MiB + ~1 MiB). A small sibling file
+    // checks the mixed Manifest+Small case in one tree.
+    let big_len = 9 * 1024 * 1024usize;
+    assert!(big_len as u64 > BLOB_CHUNK_SIZE_BYTES, "must exceed one chunk");
+    let big: Vec<u8> = (0..big_len).map(|i| (i % 251) as u8).collect();
+
+    let src = TempDir::new("bigsrc");
+    write(src.path(), "small.txt", b"a small sibling");
+    write(src.path(), "data/big.bin", &big);
+
+    let manifest_ref = store_dir(&adapter_a, src.path()).await.expect("store_dir");
+    let dest = TempDir::new("bigdest");
+    let stats = fetch_dir(&node_b, a_id, &manifest_ref, dest.path(), 0)
+        .await
+        .expect("fetch_dir");
+
+    assert_eq!(stats.files, 2, "both files transferred");
+    assert_eq!(stats.bytes, (big_len + 15) as u64, "byte total");
+    let got = read_tree(dest.path());
+    assert_eq!(got.get("data/big.bin").map(|v| v.len()), Some(big_len));
+    assert_eq!(
+        read_tree(dest.path()),
+        read_tree(src.path()),
+        "multi-chunk file + sibling reconstruct byte-for-byte"
+    );
+}
