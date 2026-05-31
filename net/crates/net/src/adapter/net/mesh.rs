@@ -10559,6 +10559,15 @@ impl MeshNode {
             Some(state) if state.epoch() != stream.epoch => {
                 return Err(StreamError::NotConnected);
             }
+            // Congestion gate (H-6): if in-flight is already at the
+            // congestion window, back-pressure — the caller's
+            // `send_with_retry` retries as acks open the window, pacing
+            // the stream to its cwnd under loss. Loss-free streams never
+            // hit this (cwnd grows past the in-flight count), so normal
+            // and low-volume (nRPC) traffic is unaffected.
+            Some(state) if reliable && !state.with_reliability(|r| r.can_send()) => {
+                return Err(StreamError::Backpressure);
+            }
             Some(_) => {}
         }
 
