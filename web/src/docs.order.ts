@@ -64,7 +64,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     ],
     // Releases — newest first.
     releases: [
-      "RELEASE_v0.25.2_SHOCK_TO_THE_SYSTEM",
+      "RELEASE_v0.26_MONKEY_BUSINESS",
       "RELEASE_v0.25_SHOCK_TO_THE_SYSTEM",
       "RELEASE_v0.24_MONEY_FOR_NOTHING",
       "RELEASE_v0.23_GIMME_SHELTER",
@@ -136,15 +136,14 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "tutorials/event-sourced-service": "Event-Sourced Service",
 
     // Releases
-    "releases/RELEASE_v0.25.2_SHOCK_TO_THE_SYSTEM":
-      "v0.25.2 — Shock To The System",
+    "releases/RELEASE_v0.26_MONKEY_BUSINESS": "v0.26 — Monkey Business",
     "releases/RELEASE_v0.25_SHOCK_TO_THE_SYSTEM": "v0.25 — Shock To The System",
     "releases/RELEASE_v0.24_MONEY_FOR_NOTHING": "v0.24 — Money For Nothing",
     "releases/RELEASE_v0.23_GIMME_SHELTER": "v0.23 — Gimme Shelter",
     "releases/RELEASE_v0.22_ALL_ALONG_THE_WATCHTOWER":
       "v0.22 — All Along the Watchtower",
     "releases/RELEASE_v0.21_RADAR_LOVE": "v0.21 — Radar Love",
-    "releases/release-v0.20.2": "v0.20.2",
+    "releases/release-v0.20.2": "v0.20.2 — Smoke on the Water",
     "releases/release-v0.20-smoke-on-the-water": "v0.20 — Smoke on the Water",
     "releases/release-v0.19-push-it-to-the-limit":
       "v0.19 — Push It to the Limit",
