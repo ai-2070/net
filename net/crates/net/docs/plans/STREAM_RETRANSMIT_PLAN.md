@@ -1,6 +1,8 @@
 # Stream retransmit — wiring reliable-stream loss recovery
 
-**Status:** New. Makes `MeshNode` reliable streams actually recover lost packets. Cross-cutting: benefits every reliable stream (nRPC streaming, blob transfer, …), not just blob transfer.
+**Status:** DONE (commit `78bfc4ee2`). `MeshNode` reliable streams now recover lost packets. Cross-cutting: benefits every reliable stream (nRPC streaming, blob transfer, …).
+
+**Outcome:** D-1..D-4 wired + two receiver-reliability fixes (create-reliable-on-RELIABLE-flag; requester opens its receive stream reliable; `serve_chunk` waits for ack before close). Verified in `tests/transfer_concurrency.rs`: mid-stream loss recovers via NACK; tail loss recovers via the timeout loop; the concurrent-4 MiB sweep now passes k=2..8 (retransmit also recovers recv-buffer-overflow drops). 3307 lib tests + transfer/dir/fairness/scheduled/nrpc-mesh suites green. The `mod.rs` legacy send path was left as-is.
 
 ## The gap (verified 2026-05-31)
 
