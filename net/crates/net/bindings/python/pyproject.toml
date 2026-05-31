@@ -7,7 +7,7 @@ build-backend = "maturin"
 # (see `[tool.maturin].module-name` and `python-source` below) so
 # user code keeps `from net import ...` working.
 name = "net-mesh"
-version = "0.25.2"
+version = "0.26.0"
 description = "High-performance, schema-agnostic event bus for AI runtime workloads"
 readme = "README.md"
 license = { text = "Apache-2.0" }
