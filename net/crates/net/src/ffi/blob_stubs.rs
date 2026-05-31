@@ -156,49 +156,53 @@ mod tests {
     #[test]
     fn stubs_return_feature_not_built_when_dataforts_off() {
         let null_handle = std::ptr::null::<MeshBlobAdapterHandle>();
-        assert_eq!(
-            net_mesh_blob_adapter_store(null_handle, std::ptr::null(), 0, std::ptr::null(), 0),
-            NET_ERR_FEATURE_NOT_BUILT
-        );
-        assert_eq!(
-            net_mesh_blob_adapter_fetch(
-                null_handle,
+        // SAFETY: every stub is a pure constant/null return — it never
+        // dereferences its pointer args, so NULL is fine.
+        unsafe {
+            assert_eq!(
+                net_mesh_blob_adapter_store(null_handle, std::ptr::null(), 0, std::ptr::null(), 0),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            assert_eq!(
+                net_mesh_blob_adapter_fetch(
+                    null_handle,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut()
+                ),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            assert_eq!(
+                net_mesh_blob_adapter_exists(null_handle, std::ptr::null(), 0, std::ptr::null_mut()),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            assert_eq!(
+                net_mesh_blob_adapter_overflow_enabled(null_handle),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            assert_eq!(
+                net_mesh_blob_adapter_overflow_active(null_handle),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            assert_eq!(
+                net_mesh_blob_adapter_set_overflow_enabled(null_handle, 1),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            assert_eq!(
+                net_mesh_blob_adapter_set_overflow_config(null_handle, std::ptr::null()),
+                NET_ERR_FEATURE_NOT_BUILT
+            );
+            assert!(net_mesh_blob_adapter_new(
+                std::ptr::null_mut(),
                 std::ptr::null(),
                 0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut()
-            ),
-            NET_ERR_FEATURE_NOT_BUILT
-        );
-        assert_eq!(
-            net_mesh_blob_adapter_exists(null_handle, std::ptr::null(), 0, std::ptr::null_mut()),
-            NET_ERR_FEATURE_NOT_BUILT
-        );
-        assert_eq!(
-            net_mesh_blob_adapter_overflow_enabled(null_handle),
-            NET_ERR_FEATURE_NOT_BUILT
-        );
-        assert_eq!(
-            net_mesh_blob_adapter_overflow_active(null_handle),
-            NET_ERR_FEATURE_NOT_BUILT
-        );
-        assert_eq!(
-            net_mesh_blob_adapter_set_overflow_enabled(null_handle, 1),
-            NET_ERR_FEATURE_NOT_BUILT
-        );
-        assert_eq!(
-            net_mesh_blob_adapter_set_overflow_config(null_handle, std::ptr::null()),
-            NET_ERR_FEATURE_NOT_BUILT
-        );
-        assert!(net_mesh_blob_adapter_new(
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            0,
-            std::ptr::null()
-        )
-        .is_null());
-        assert!(net_mesh_blob_adapter_prometheus_text(null_handle).is_null());
-        assert!(net_mesh_blob_adapter_overflow_config(null_handle).is_null());
-        net_mesh_blob_adapter_free(std::ptr::null_mut());
+                std::ptr::null()
+            )
+            .is_null());
+            assert!(net_mesh_blob_adapter_prometheus_text(null_handle).is_null());
+            assert!(net_mesh_blob_adapter_overflow_config(null_handle).is_null());
+            net_mesh_blob_adapter_free(std::ptr::null_mut());
+        }
     }
 }

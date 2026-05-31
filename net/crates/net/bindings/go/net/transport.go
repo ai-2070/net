@@ -89,6 +89,13 @@ const (
 	errDirInvalidManifest         = -210
 	errDirPathInvalid             = -211
 	errDirIO                      = -213
+	// errFeatureNotBuilt mirrors the cortex `NET_ERR_FEATURE_NOT_BUILT`
+	// (-107). Not a transport-band code: it's what the feature-off
+	// stubs (`ffi::transport_stubs`) return when libnet was built
+	// without the `net + dataforts + netdb + redex-disk` quad, so the
+	// transport symbols resolve but every call routes here instead of
+	// crashing at program load.
+	errFeatureNotBuilt = -107
 )
 
 // TransferError is the typed error returned by the transport wrappers.
@@ -135,6 +142,8 @@ func errFromCode(code int) error {
 			return "dir-path-invalid"
 		case errDirIO:
 			return "dir-io"
+		case errFeatureNotBuilt:
+			return "feature-not-built"
 		default:
 			return "unknown"
 		}

@@ -75,9 +75,13 @@ Python + TypeScript + Go reference binding).
 - **C async trio** — `net_fetch_blob_async` / `net_transfer_await` /
   `net_transfer_cancel` (sound spawn-on-runtime + handle lifecycle). The
   synchronous surface covers the blocking call shape bindings need first.
-- **C feature-off stubs** — `transport_stubs`-style symbols for builds
-  without the quad, so an unconditional cgo linker resolves them. Lands
-  with **T-F** (the first such linker).
+- ~~**C feature-off stubs** — `transport_stubs`-style symbols for builds
+  without the quad, so an unconditional cgo linker resolves them.~~
+  **Landed** in `src/ffi/transport_stubs.rs` (mirrors `ffi::blob_stubs`):
+  active when `netdb + redex-disk` are on but the transport quad is not
+  fully satisfied; every symbol returns `NET_ERR_FEATURE_NOT_BUILT`
+  (-107) / null / no-op. The Go binding maps -107 to the
+  `"feature-not-built"` error kind.
 - **SDK `MeshNode` (mesh.ts) delegation** — the node-driven ops now exist
   as methods on the napi `NetMesh` class, but the SDK-side `MeshNode`
   wrapper in `sdk-ts/src/mesh.ts` should add thin delegating methods (and

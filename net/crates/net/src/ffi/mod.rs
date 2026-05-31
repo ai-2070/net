@@ -212,8 +212,7 @@ pub mod mesh;
 /// node's transfer engine via the existing `MeshNodeHandle` +
 /// `MeshBlobAdapterHandle`, so it rides `net` + the blob-adapter feature
 /// set (the adapter handle needs `netdb` + `redex-disk`). Feature-off
-/// stubs land with the Go binding (T-F) — the first unconditional linker
-/// of these symbols.
+/// stubs for builds missing the quad live in `transport_stubs` below.
 #[cfg(all(
     feature = "net",
     feature = "dataforts",
@@ -222,6 +221,19 @@ pub mod mesh;
 ))]
 #[allow(missing_docs)]
 pub mod transport;
+
+/// Feature-off stubs for the transport symbols
+/// (`net_serve_blob_transfer` / `net_fetch_blob*` / `net_store_dir` /
+/// `net_fetch_dir` / `net_dir_manifest_read` / `net_transport_free_buffer`)
+/// when the quad above is not fully built. The Go binding
+/// (`bindings/go/net/transport.go`) links these unconditionally, so a
+/// libnet without the quad must still satisfy them — each stub returns
+/// `NET_ERR_FEATURE_NOT_BUILT` (or null / no-op) so Go programs route to
+/// a clean error rather than fail at program load. Empty (compiled out)
+/// when the quad is on — the real impls in `ffi::transport` then own the
+/// symbol names. Mirrors `ffi::blob_stubs`.
+#[allow(missing_docs)]
+pub mod transport_stubs;
 
 /// C FFI for the `aggregator.registry` RPC client + channel
 /// visibility setter. Stage 5 of `SDK_AGGREGATOR_SUBNET_PLAN.md`.
