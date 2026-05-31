@@ -39,7 +39,7 @@
     "test:watch": "vitest"
   },
   "peerDependencies": {
-    "@net-mesh/core": ">=0.27.0-beta.1"
+    "@net-mesh/core": "0.27.0-beta.1"
   },
   "devDependencies": {
     "@net-mesh/core": "file:../bindings/node",
