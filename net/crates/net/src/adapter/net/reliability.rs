@@ -332,9 +332,10 @@ impl ReliableStream {
         if tx_window == 0 {
             return Self::DEFAULT_MAX_PENDING;
         }
+        // DEFAULT_MAX_PENDING (32) <= MAX_RETRANSMIT_WINDOW (16384), so the
+        // clamp bounds are well-ordered.
         ((tx_window / Self::MIN_TRACKED_PACKET_BYTES) as usize)
-            .max(Self::DEFAULT_MAX_PENDING)
-            .min(Self::MAX_RETRANSMIT_WINDOW)
+            .clamp(Self::DEFAULT_MAX_PENDING, Self::MAX_RETRANSMIT_WINDOW)
     }
 
     /// Create a new reliable stream with default settings.
@@ -645,7 +646,7 @@ impl ReliabilityMode for ReliableStream {
         // (a genuinely new gap) and ignore duplicates for the same/older
         // head gap; a lost retransmit is then recovered by the RTO-paced
         // timeout path, not by the NACK flood.
-        let new_loss = self.recover.map_or(true, |r| nack.next_expected > r);
+        let new_loss = self.recover.is_none_or(|r| nack.next_expected > r);
         if !new_loss {
             return Vec::new();
         }
@@ -980,7 +981,10 @@ mod tests {
         };
         assert!(!s.on_nack(&nack).is_empty(), "NACK retransmits seq 5");
         assert!(s.cwnd < before, "fast-retransmit halves cwnd");
-        assert!(s.cwnd >= ReliableStream::MIN_CWND, "but not below the floor");
+        assert!(
+            s.cwnd >= ReliableStream::MIN_CWND,
+            "but not below the floor"
+        );
     }
 
     #[test]

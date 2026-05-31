@@ -273,8 +273,8 @@ pub async fn store_dir(adapter: &MeshBlobAdapter, root: &Path) -> Result<BlobRef
         version: DIR_MANIFEST_VERSION,
         entries,
     };
-    let manifest_bytes = postcard::to_allocvec(&manifest)
-        .map_err(|e| DirError::Manifest(format!("encode: {e}")))?;
+    let manifest_bytes =
+        postcard::to_allocvec(&manifest).map_err(|e| DirError::Manifest(format!("encode: {e}")))?;
     let chunked = chunk_payload(&manifest_bytes)?;
     let mhash: [u8; 32] = blake3::hash(&manifest_bytes).into();
     let manifest_ref =
@@ -431,11 +431,17 @@ pub async fn fetch_dir(
         let byte_sem = byte_sem.clone();
         let mode = *mode;
         tasks.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await.expect("semaphore not closed");
-            let _bytes_permit = byte_sem
-                .acquire_many(in_flight)
-                .await
-                .expect("byte semaphore not closed");
+            // The semaphores live for the whole `fetch_dir` call and are
+            // never closed, so `acquire` can't actually fail here — map
+            // the impossible error to a typed failure rather than panic.
+            let _permit = sem.acquire().await.map_err(|_| {
+                DirError::Blob(BlobError::Backend("dir fetch: semaphore closed".into()))
+            })?;
+            let _bytes_permit = byte_sem.acquire_many(in_flight).await.map_err(|_| {
+                DirError::Blob(BlobError::Backend(
+                    "dir fetch: byte semaphore closed".into(),
+                ))
+            })?;
             let bytes = transfer_fetch_blob(&node, source, &blob_ref).await?;
             let len = bytes.len() as u64;
             // Offload only large writes (T-3); small files write inline.

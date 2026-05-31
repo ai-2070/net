@@ -67,12 +67,17 @@ async fn handshake(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
 /// Distinct content per `seed` so the two blobs hash differently (and
 /// hence ride distinct chunk channels + transfer streams).
 fn payload(len: usize, seed: u8) -> Vec<u8> {
-    (0..len).map(|i| ((i + seed as usize) % 251) as u8).collect()
+    (0..len)
+        .map(|i| ((i + seed as usize) % 251) as u8)
+        .collect()
 }
 
 fn small_ref(bytes: &[u8]) -> ([u8; 32], BlobRef) {
     let hash: [u8; 32] = blake3::hash(bytes).into();
-    (hash, BlobRef::small("mesh://fairness", hash, bytes.len() as u64))
+    (
+        hash,
+        BlobRef::small("mesh://fairness", hash, bytes.len() as u64),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -139,7 +144,10 @@ async fn bench_single_transfer_throughput() {
     let mib = got.len() as f64 / (1024.0 * 1024.0);
     let pkts = got.len().div_ceil(8000);
     println!("── single transfer throughput ──");
-    println!("  {mib:.1} MiB in {elapsed:?} = {:.1} MiB/s", mib / elapsed.as_secs_f64());
+    println!(
+        "  {mib:.1} MiB in {elapsed:?} = {:.1} MiB/s",
+        mib / elapsed.as_secs_f64()
+    );
     println!(
         "  ~{pkts} packets ⇒ {:.0} pkt/s, {:.3} ms/packet",
         pkts as f64 / elapsed.as_secs_f64(),
@@ -206,9 +214,18 @@ async fn bench_concurrent_transfer_throughput() {
     println!("── concurrent transfer fairness ──");
     println!("  two 4 MiB transfers from one holder, equal weight (1:1)");
     println!("  total:      {total_mib:.1} MiB in {total_elapsed:?} = {throughput:.1} MiB/s");
-    println!("  transfer 1: {:.1} MiB in {e1:?}", len1 as f64 / (1024.0 * 1024.0));
-    println!("  transfer 2: {:.1} MiB in {e2:?}", len2 as f64 / (1024.0 * 1024.0));
-    println!("  finish gap: {gap:.4}s ({:.1}% of total) — lower ⇒ fairer interleaving", gap_frac * 100.0);
+    println!(
+        "  transfer 1: {:.1} MiB in {e1:?}",
+        len1 as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "  transfer 2: {:.1} MiB in {e2:?}",
+        len2 as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "  finish gap: {gap:.4}s ({:.1}% of total) — lower ⇒ fairer interleaving",
+        gap_frac * 100.0
+    );
 
     assert_eq!(len1, each);
     assert_eq!(len2, each);

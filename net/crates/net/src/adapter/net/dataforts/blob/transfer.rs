@@ -392,16 +392,18 @@ impl BlobTransferEngine {
                 }
                 Ok(TransferHeader::Found { total_len }) => {
                     entry.total_len = Some(total_len);
-                    entry.buf.reserve(total_len.min(TRANSFER_MAX_CHUNK_BYTES) as usize);
+                    entry
+                        .buf
+                        .reserve(total_len.min(TRANSFER_MAX_CHUNK_BYTES) as usize);
                     if total_len == 0 {
                         ReassembleStep::Complete
                     } else {
                         ReassembleStep::Continue
                     }
                 }
-                Err(e) => ReassembleStep::Fail(BlobError::Backend(format!(
-                    "transfer: bad header: {e}"
-                ))),
+                Err(e) => {
+                    ReassembleStep::Fail(BlobError::Backend(format!("transfer: bad header: {e}")))
+                }
             }
         } else {
             let total = entry.total_len.unwrap_or(0);
@@ -504,7 +506,10 @@ async fn serve_chunk(
             let header = TransferHeader::Found {
                 total_len: bytes.len() as u64,
             };
-            if send_one(&mesh, &stream, postcard_event(&header)).await.is_ok() {
+            if send_one(&mesh, &stream, postcard_event(&header))
+                .await
+                .is_ok()
+            {
                 // One reliable event per ~8 KiB frame. Because
                 // `TRANSFER_STREAM_WINDOW_BYTES` covers a whole chunk's
                 // on-wire size, the per-event credit never runs dry

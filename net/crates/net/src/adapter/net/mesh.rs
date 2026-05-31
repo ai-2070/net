@@ -473,9 +473,8 @@ struct DispatchCtx {
     /// `is_transfer_stream_id` data divert consult it. `None` until a
     /// node calls `serve_blob_transfer`.
     #[cfg(feature = "dataforts")]
-    blob_transfer_engine: Arc<
-        parking_lot::RwLock<Option<Arc<super::dataforts::blob::transfer::BlobTransferEngine>>>,
-    >,
+    blob_transfer_engine:
+        Arc<parking_lot::RwLock<Option<Arc<super::dataforts::blob::transfer::BlobTransferEngine>>>>,
     /// In-flight initiator handshakes; dispatch completes them when a
     /// matching routed msg2 arrives.
     pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
@@ -1780,9 +1779,8 @@ pub struct MeshNode {
     /// Installed by [`Self::serve_blob_transfer`]; drives on-demand
     /// cross-peer blob fetch over reliable scheduled streams.
     #[cfg(feature = "dataforts")]
-    blob_transfer_engine: Arc<
-        parking_lot::RwLock<Option<Arc<super::dataforts::blob::transfer::BlobTransferEngine>>>,
-    >,
+    blob_transfer_engine:
+        Arc<parking_lot::RwLock<Option<Arc<super::dataforts::blob::transfer::BlobTransferEngine>>>>,
     /// Monotonic version counter used when stamping our own
     /// announcements. `CapabilityIndex::index` skips older versions,
     /// so this must move forward across restarts if the caller wants
@@ -5057,13 +5055,10 @@ impl MeshNode {
                     // out-of-order arrival (which creates the gap) reliably
                     // triggers a NACK here; tail loss (no later arrival) is
                     // covered by the timeout retransmit loop.
-                    let nack = grant
-                        .session
-                        .try_stream(stream_id)
-                        .and_then(|state| {
-                            state.note_grant_sent();
-                            state.with_reliability(|r| r.build_nack())
-                        });
+                    let nack = grant.session.try_stream(stream_id).and_then(|state| {
+                        state.note_grant_sent();
+                        state.with_reliability(|r| r.build_nack())
+                    });
                     if let Some(nack) = nack {
                         let payload = StreamNack {
                             stream_id,
@@ -5117,8 +5112,11 @@ impl MeshNode {
                 // the `peers` DashMap guard across the socket awaits
                 // below (that could deadlock against a concurrent peer
                 // insert/remove on the same shard).
-                let mut work: Vec<(SocketAddr, Arc<NetSession>, Vec<Arc<super::RetransmitDescriptor>>)> =
-                    Vec::new();
+                let mut work: Vec<(
+                    SocketAddr,
+                    Arc<NetSession>,
+                    Vec<Arc<super::RetransmitDescriptor>>,
+                )> = Vec::new();
                 for peer in peers.iter() {
                     let due = peer.value().session.collect_timed_out_retransmits();
                     if !due.is_empty() {
@@ -5171,8 +5169,13 @@ impl MeshNode {
                 // case. Duplicate NACKs are harmless — `on_nack` resends
                 // are bounded by `max_retries` and deduped by the
                 // receiver.
-                let mut gaps: Vec<(SocketAddr, Arc<NetSession>, Vec<(u64, super::protocol::NackPayload)>)> =
-                    Vec::new();
+                // (peer addr, its session, [(stream_id, NACK)…]) per peer.
+                type GapWork = Vec<(
+                    SocketAddr,
+                    Arc<NetSession>,
+                    Vec<(u64, super::protocol::NackPayload)>,
+                )>;
+                let mut gaps: GapWork = Vec::new();
                 for peer in peers.iter() {
                     let g = peer.value().session.collect_gap_nacks();
                     if !g.is_empty() {
@@ -9472,7 +9475,9 @@ impl MeshNode {
             Ok(Ok(result)) => result,
             Ok(Err(_canceled)) => {
                 engine.cancel_pending(stream_id);
-                Err(BlobError::Backend("blob transfer: engine dropped the reply".into()))
+                Err(BlobError::Backend(
+                    "blob transfer: engine dropped the reply".into(),
+                ))
             }
             Err(_elapsed) => {
                 engine.cancel_pending(stream_id);
@@ -9584,12 +9589,9 @@ impl MeshNode {
             PacketFlags::RELIABLE,
             super::dataforts::blob::SUBPROTOCOL_BLOB_TRANSFER,
         );
-        self.socket
-            .send_to(&packet, dest_addr)
-            .await
-            .map_err(|e| {
-                super::AdapterError::Connection(format!("transfer control: send failed: {e}"))
-            })?;
+        self.socket.send_to(&packet, dest_addr).await.map_err(|e| {
+            super::AdapterError::Connection(format!("transfer control: send failed: {e}"))
+        })?;
         Ok(())
     }
 }
@@ -10620,7 +10622,14 @@ impl MeshNode {
                 self.deliver_stream_packet(scheduled, &packet, peer_addr, stream_id)
                     .await?;
                 guard.commit(); // accepted (socket or scheduler) — bytes are the receiver's now
-                Self::register_retransmit(&session, stream_id, stream.epoch, seq, &current_batch, flags);
+                Self::register_retransmit(
+                    &session,
+                    stream_id,
+                    stream.epoch,
+                    seq,
+                    &current_batch,
+                    flags,
+                );
                 current_batch.clear();
                 current_size = 0;
             }
@@ -10641,7 +10650,14 @@ impl MeshNode {
             self.deliver_stream_packet(scheduled, &packet, peer_addr, stream_id)
                 .await?;
             guard.commit();
-            Self::register_retransmit(&session, stream_id, stream.epoch, seq, &current_batch, flags);
+            Self::register_retransmit(
+                &session,
+                stream_id,
+                stream.epoch,
+                seq,
+                &current_batch,
+                flags,
+            );
         }
 
         drop(builder);

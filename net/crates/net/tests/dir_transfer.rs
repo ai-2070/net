@@ -146,8 +146,16 @@ async fn directory_transfer_reconstructs_tree() {
     // directory.
     let src = TempDir::new("src");
     write(src.path(), "readme.txt", b"hello directory transfer");
-    write(src.path(), "a/one.bin", &(0..5000u32).map(|i| i as u8).collect::<Vec<_>>());
-    write(src.path(), "a/b/two.bin", &(0..50_000u32).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+    write(
+        src.path(),
+        "a/one.bin",
+        &(0..5000u32).map(|i| i as u8).collect::<Vec<_>>(),
+    );
+    write(
+        src.path(),
+        "a/b/two.bin",
+        &(0..50_000u32).map(|i| (i % 251) as u8).collect::<Vec<_>>(),
+    );
     write(src.path(), "a/b/empty.dat", b"");
     std::fs::create_dir_all(src.path().join("c/empty_dir")).unwrap();
 
@@ -163,7 +171,10 @@ async fn directory_transfer_reconstructs_tree() {
     // Files reconstructed byte-for-byte.
     let want = read_tree(src.path());
     let got = read_tree(dest.path());
-    assert_eq!(got, want, "reconstructed tree must match source byte-for-byte");
+    assert_eq!(
+        got, want,
+        "reconstructed tree must match source byte-for-byte"
+    );
     assert_eq!(stats.files, want.len(), "stats.files matches file count");
 
     // The empty directory survived.
@@ -194,7 +205,11 @@ async fn directory_transfer_many_small_files() {
     let n = 200usize; // well past the ~15-20 advertisement ceiling
     for i in 0..n {
         let body = format!("file {i} contents — {}", "x".repeat(i % 64));
-        write(src.path(), &format!("pkg{}/mod{}.js", i % 12, i), body.as_bytes());
+        write(
+            src.path(),
+            &format!("pkg{}/mod{}.js", i % 12, i),
+            body.as_bytes(),
+        );
     }
 
     let manifest_ref = store_dir(&adapter_a, src.path()).await.expect("store_dir");
@@ -230,7 +245,9 @@ async fn directory_transfer_many_large_files() {
     let src = TempDir::new("biglots-src");
     let n = 6usize;
     for i in 0..n {
-        let body: Vec<u8> = (0..4 * 1024 * 1024usize).map(|j| ((j + i) % 251) as u8).collect();
+        let body: Vec<u8> = (0..4 * 1024 * 1024usize)
+            .map(|j| ((j + i) % 251) as u8)
+            .collect();
         write(src.path(), &format!("artifact{i}.bin"), &body);
     }
 
@@ -254,7 +271,9 @@ fn gen_node_modules(root: &Path, packages: usize) -> (usize, u64) {
     let mut files = 0usize;
     let mut bytes = 0u64;
     let mut emit = |rel: String, len: usize, seed: u8| {
-        let body: Vec<u8> = (0..len).map(|i| ((i + seed as usize) % 251) as u8).collect();
+        let body: Vec<u8> = (0..len)
+            .map(|i| ((i + seed as usize) % 251) as u8)
+            .collect();
         write(root, &rel, &body);
         files += 1;
         bytes += len as u64;
@@ -267,11 +286,19 @@ fn gen_node_modules(root: &Path, packages: usize) -> (usize, u64) {
         emit(format!("{pkg}/README.md"), 500 + (p % 1500), 3);
         // a lib/ dir with several modules (depth 3)
         for f in 0..(3 + p % 5) {
-            emit(format!("{pkg}/lib/mod{f}.js"), 300 + (p * f % 6000), (f + 4) as u8);
+            emit(
+                format!("{pkg}/lib/mod{f}.js"),
+                300 + (p * f % 6000),
+                (f + 4) as u8,
+            );
         }
         // every 7th package has a bigger bundled artifact + deeper nest
         if p % 7 == 0 {
-            emit(format!("{pkg}/dist/bundle.min.js"), 40_000 + (p % 20_000), 9);
+            emit(
+                format!("{pkg}/dist/bundle.min.js"),
+                40_000 + (p % 20_000),
+                9,
+            );
             emit(
                 format!("{pkg}/node_modules/dep{p}/index.js"),
                 600 + (p % 2000),
@@ -341,7 +368,10 @@ async fn bench_nodemodules_scale() {
         mib / xfer_elapsed.as_secs_f64(),
         stats.files as f64 / xfer_elapsed.as_secs_f64()
     );
-    println!("  stats:    {} files, {} dirs, {} bytes", stats.files, stats.dirs, stats.bytes);
+    println!(
+        "  stats:    {} files, {} dirs, {} bytes",
+        stats.files, stats.dirs, stats.bytes
+    );
 
     // Correctness is the hard pass criterion regardless of platform speed.
     assert_eq!(stats.files, file_count, "every file transferred");
@@ -373,8 +403,7 @@ async fn bench_throughput_invariance() {
         handshake(&node_b, &node_a).await;
         let a_id = node_a.node_id();
         let adapter_a = Arc::new(
-            MeshBlobAdapter::new("a", Arc::new(Redex::new()))
-                .with_chunk_file_max_memory_bytes(cap),
+            MeshBlobAdapter::new("a", Arc::new(Redex::new())).with_chunk_file_max_memory_bytes(cap),
         );
         let adapter_b = Arc::new(MeshBlobAdapter::new("b", Arc::new(Redex::new())));
         node_a.serve_blob_transfer(adapter_a.clone());
@@ -398,9 +427,18 @@ async fn bench_throughput_invariance() {
         rate
     }
 
-    println!("── throughput invariance (equal {} MiB volume) ──", VOLUME / (1024 * 1024));
+    println!(
+        "── throughput invariance (equal {} MiB volume) ──",
+        VOLUME / (1024 * 1024)
+    );
     // Low file count: few 4 MiB files (cap covers one 4 MiB chunk).
-    let low = run_arm("few-large ", VOLUME / (4 * 1024 * 1024), 4 * 1024 * 1024, 5 * 1024 * 1024).await;
+    let low = run_arm(
+        "few-large ",
+        VOLUME / (4 * 1024 * 1024),
+        4 * 1024 * 1024,
+        5 * 1024 * 1024,
+    )
+    .await;
     // High file count: many 8 KiB files (cap covers the ~80 KiB manifest).
     let high = run_arm("many-small", VOLUME / (8 * 1024), 8 * 1024, 256 * 1024).await;
     let ratio = high / low;
@@ -441,7 +479,10 @@ async fn directory_transfer_large_multichunk_file() {
     // ~9 MiB ⇒ 3 chunks (4 MiB + 4 MiB + ~1 MiB). A small sibling file
     // checks the mixed Manifest+Small case in one tree.
     let big_len = 9 * 1024 * 1024usize;
-    assert!(big_len as u64 > BLOB_CHUNK_SIZE_BYTES, "must exceed one chunk");
+    assert!(
+        big_len as u64 > BLOB_CHUNK_SIZE_BYTES,
+        "must exceed one chunk"
+    );
     let big: Vec<u8> = (0..big_len).map(|i| (i % 251) as u8).collect();
 
     let src = TempDir::new("bigsrc");

@@ -60,7 +60,10 @@ fn payload(len: usize) -> Vec<u8> {
 
 fn small_ref(bytes: &[u8]) -> ([u8; 32], BlobRef) {
     let hash: [u8; 32] = blake3::hash(bytes).into();
-    (hash, BlobRef::small("mesh://transfer", hash, bytes.len() as u64))
+    (
+        hash,
+        BlobRef::small("mesh://transfer", hash, bytes.len() as u64),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

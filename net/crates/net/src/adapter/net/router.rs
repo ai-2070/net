@@ -649,7 +649,10 @@ impl NetRouter {
                     // Test-only loss injection: drop every Nth packet.
                     let n = drop_every_n.load(Ordering::Relaxed);
                     if n > 0
-                        && drop_counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1) % n == 0
+                        && drop_counter
+                            .fetch_add(1, Ordering::Relaxed)
+                            .wrapping_add(1)
+                            .is_multiple_of(n)
                     {
                         continue; // simulated drop — never hits the wire
                     }

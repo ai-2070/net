@@ -37,7 +37,11 @@ fn config(socket_buf: usize) -> MeshNodeConfig {
 
 async fn build_node(socket_buf: usize) -> Arc<MeshNode> {
     let keypair = EntityKeypair::generate();
-    Arc::new(MeshNode::new(keypair, config(socket_buf)).await.expect("new"))
+    Arc::new(
+        MeshNode::new(keypair, config(socket_buf))
+            .await
+            .expect("new"),
+    )
 }
 
 async fn handshake(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
@@ -54,12 +58,17 @@ async fn handshake(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
 }
 
 fn payload(len: usize, seed: u8) -> Vec<u8> {
-    (0..len).map(|i| ((i + seed as usize) % 251) as u8).collect()
+    (0..len)
+        .map(|i| ((i + seed as usize) % 251) as u8)
+        .collect()
 }
 
 fn small_ref(bytes: &[u8]) -> ([u8; 32], BlobRef) {
     let hash: [u8; 32] = blake3::hash(bytes).into();
-    (hash, BlobRef::small("mesh://conc", hash, bytes.len() as u64))
+    (
+        hash,
+        BlobRef::small("mesh://conc", hash, bytes.len() as u64),
+    )
 }
 
 /// Fetch `k` distinct 4 MiB blobs from one holder concurrently. Returns
@@ -92,7 +101,9 @@ async fn run_level(
     let mut tasks = Vec::with_capacity(k);
     for h in hashes {
         let nb = node_b.clone();
-        tasks.push(tokio::spawn(async move { nb.transfer_fetch_chunk(a_id, h).await }));
+        tasks.push(tokio::spawn(async move {
+            nb.transfer_fetch_chunk(a_id, h).await
+        }));
     }
     let mut ok = 0usize;
     let mut first_err: Option<String> = None;
@@ -112,7 +123,13 @@ async fn run_level(
     }
     let elapsed = start.elapsed();
     let sched = node_a.router().scheduler();
-    (ok, elapsed, sched.total_queued(), sched.total_dropped(), first_err)
+    (
+        ok,
+        elapsed,
+        sched.total_queued(),
+        sched.total_dropped(),
+        first_err,
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -146,7 +163,11 @@ async fn retransmit_recovers_dropped_data_packets() {
         .transfer_fetch_chunk(a_id, h)
         .await
         .expect("transfer must recover dropped packets via retransmit");
-    assert_eq!(got.as_ref(), bytes.as_slice(), "recovered chunk byte-for-byte");
+    assert_eq!(
+        got.as_ref(),
+        bytes.as_slice(),
+        "recovered chunk byte-for-byte"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -176,7 +197,11 @@ async fn retransmit_recovers_tail_loss() {
         .transfer_fetch_chunk(a_id, h)
         .await
         .expect("tail-dropped packet must be recovered by the timeout retransmit");
-    assert_eq!(got.as_ref(), bytes.as_slice(), "tail-recovered chunk byte-for-byte");
+    assert_eq!(
+        got.as_ref(),
+        bytes.as_slice(),
+        "tail-recovered chunk byte-for-byte"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

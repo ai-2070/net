@@ -89,7 +89,9 @@ async fn scheduled_stream_routes_through_scheduler_default_does_not() {
         .open_stream(
             b_id,
             0x4000_0000_0000_0002,
-            StreamConfig::new().with_scheduled(true).with_fairness_weight(4),
+            StreamConfig::new()
+                .with_scheduled(true)
+                .with_fairness_weight(4),
         )
         .expect("open scheduled stream");
     node_a

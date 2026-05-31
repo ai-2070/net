@@ -269,7 +269,9 @@ mod tests {
 
     #[test]
     fn stream_reset_round_trip() {
-        let msg = StreamReset { stream_id: 0x2000_0000_0000_0001 };
+        let msg = StreamReset {
+            stream_id: 0x2000_0000_0000_0001,
+        };
         assert_eq!(StreamReset::decode(&msg.encode()).unwrap(), msg);
     }
 }

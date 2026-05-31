@@ -124,10 +124,10 @@ pub use overflow::{
 };
 pub use publish_with_blob::{publish_with_blob, BlobDurability, PublishWithBlobReceipt};
 pub use refcount::{should_sweep, BlobRefcountTable, RefcountEntry, DEFAULT_RETENTION_FLOOR};
+pub use registry::{global_blob_adapter_registry, BlobAdapterRegistry, BlobAdapterRegistryError};
 pub use transfer::{
     is_transfer_stream_id, next_transfer_stream_id, transfer_stream_id, SUBPROTOCOL_BLOB_TRANSFER,
 };
-pub use registry::{global_blob_adapter_registry, BlobAdapterRegistry, BlobAdapterRegistryError};
 
 #[cfg(test)]
 mod hex32_tests {
