@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_31_TRANSPORT_SDK.md
+  s_4e65c03b4a88ec::t_48a0ddb20bb4e1 131-157
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "6a9b6871f1bace38ca409d951a4243e263a725e2",
+  "prompts": {},
+  "sessions": {
+    "s_4e65c03b4a88ec": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f38fba46-70fe-4a54-9993-f298695ba62b",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
