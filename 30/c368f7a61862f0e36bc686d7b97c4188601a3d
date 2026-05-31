@@ -1,0 +1,24 @@
+net/crates/net/bindings/python/src/transport.rs
+  s_4e65c03b4a88ec::t_de1004ded7f385 297
+  s_4e65c03b4a88ec::t_46276fb79a5ff6 54-67
+net/crates/net/bindings/node/src/transport.rs
+  s_4e65c03b4a88ec::t_e94e375810b2f5 323-350
+  s_4e65c03b4a88ec::t_869de64793e299 180-193
+  s_4e65c03b4a88ec::t_c2204175617d28 287
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "30c368f7a61862f0e36bc686d7b97c4188601a3d",
+  "prompts": {},
+  "sessions": {
+    "s_4e65c03b4a88ec": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f38fba46-70fe-4a54-9993-f298695ba62b",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
