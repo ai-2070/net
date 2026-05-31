@@ -1,0 +1,9 @@
+net/crates/net/bindings/node/tsconfig.build.json
+  ai_agent 13,27-33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "bc929eb9122969e54ba24aec081681e6170215c6",
+  "prompts": {}
+}
