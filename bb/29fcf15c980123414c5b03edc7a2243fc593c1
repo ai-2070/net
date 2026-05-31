@@ -1,0 +1,42 @@
+net/crates/net/src/adapter/net/session.rs
+  s_3813c1cf893940::t_35a3092edf9e39 274-287
+net/crates/net/src/adapter/net/mesh.rs
+  s_3813c1cf893940::t_42b34c0ad5066a 4195-4215
+  s_3813c1cf893940::t_a4018bc97c566c 5013-5021,5025
+  s_3813c1cf893940::t_aa7c1248290b8d 126-127
+  s_3813c1cf893940::t_dbaf7044599d3f 5127-5154
+  s_3813c1cf893940::t_07bf8f5878fc74 4126-4130
+net/crates/net/src/adapter/net/dataforts/blob/transfer.rs
+  s_3813c1cf893940::t_01f2c2658a2831 271-284
+net/crates/net/src/adapter/net/reliability.rs
+  s_3813c1cf893940::t_0c3689ab84dac5 245-249
+  s_3813c1cf893940::t_5c36e909e213d7 600-610
+  s_3813c1cf893940::t_db1e1d81b213c9 563-564,566,569-586,588-590,596-597
+  s_3813c1cf893940::t_39cb0a4e9bde01 305,320
+  s_3813c1cf893940::t_d68903f5f4d2b1 90-104
+  s_3813c1cf893940::t_0aa5aa25f426a2 80-89
+  s_3813c1cf893940::t_2f99f95e18c998 721-748
+net/crates/net/src/adapter/net/subprotocol/stream_window.rs
+  s_3813c1cf893940::t_d829ee58cc706b 78-82
+  s_3813c1cf893940::t_c7df39c618f120 178-207
+  s_3813c1cf893940::t_3bc1370de26234 217,227-228,233-234,249,256-273
+  s_3813c1cf893940::t_5d641cf43b657e 34-42
+  s_3813c1cf893940::t_e54533b0cf0e0a 43-44
+  s_3813c1cf893940::t_c1c9a7ca22cac0 103-104,108,118,122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "bb29fcf15c980123414c5b03edc7a2243fc593c1",
+  "prompts": {},
+  "sessions": {
+    "s_3813c1cf893940": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8f529043-9c28-441a-89cc-3de50f96f588",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
