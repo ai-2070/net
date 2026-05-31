@@ -4777,17 +4777,18 @@ impl MeshNode {
         // async dispatch.
         // Blob-transfer data divert (FairScheduler transport plan):
         // reliable event-plane data on a transfer stream-id goes to the
-        // transfer engine's reassembly — NOT the event bus. We're past
-        // the `on_receive` reliability gate (so these events are
-        // in-order + deduped) and past the StreamWindow grant (so the
-        // sender's tx-credit keeps flowing); the transfer stream-id
-        // convention (bit 61 set, bit 48 clear) makes this a couple of
-        // bitops on the hot path.
+        // transfer engine's reassembly — NOT the event bus. `on_receive`
+        // deduped + windowed this packet but does NOT order it (it
+        // accepts out-of-order sequences for SACK), so we hand the
+        // engine the packet's `sequence` and it reorders by it (header =
+        // seq 0, data = seq 1..N). The transfer stream-id convention
+        // (bit 61 set, bit 48 clear) makes this a couple of bitops on
+        // the hot path.
         #[cfg(feature = "dataforts")]
         if super::dataforts::blob::is_transfer_stream_id(stream_id) {
             let engine_guard = ctx.blob_transfer_engine.read();
             if let Some(engine) = engine_guard.as_ref() {
-                engine.on_data(stream_id, events);
+                engine.on_data(stream_id, parsed.header.sequence, events);
             }
             return;
         }

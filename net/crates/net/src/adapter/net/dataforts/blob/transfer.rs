@@ -30,6 +30,7 @@
 //! from subprotocol streams (which never set bit 61). The low 48 bits
 //! carry a per-transfer nonce, so bit 48 stays clear by construction.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -137,6 +138,15 @@ const TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30)
 /// Retry budget for an individual stream send under backpressure.
 const SEND_RETRIES: usize = 64;
 
+/// Cap on how far ahead of the next-expected sequence the receiver will
+/// buffer out-of-order transfer packets. The sender can't have more than
+/// its tx window (`TRANSFER_STREAM_WINDOW_BYTES` ≈ 640 frames) in flight,
+/// so legitimate reordering never spans more than that; 1024 leaves
+/// margin while bounding the reorder buffer (a far-future seq is dropped
+/// and the sender retransmits it once the gap closes). Also bounds memory
+/// against a misbehaving holder spraying sparse high sequences.
+const MAX_REORDER_AHEAD: u64 = 1024;
+
 // ── Wire frames ────────────────────────────────────────────────────
 
 /// Control frame, carried on a `SUBPROTOCOL_BLOB_TRANSFER` packet with
@@ -167,6 +177,19 @@ pub enum TransferHeader {
 
 type DoneTx = tokio::sync::oneshot::Sender<Result<Bytes, BlobError>>;
 
+/// Outcome of folding one reassembly event. Hoisted to module scope so
+/// both `on_data` (drives the loop) and `process_event` (folds one
+/// event) share it without re-acquiring the DashMap guard across a
+/// `finish` (which removes the entry).
+enum ReassembleStep {
+    /// More events expected.
+    Continue,
+    /// Terminal failure (NotFound, over-length, bad header, cap).
+    Fail(BlobError),
+    /// All declared bytes received — verify + deliver.
+    Complete,
+}
+
 /// Requester-side in-flight transfer state, keyed by transfer stream id.
 struct PendingInbound {
     /// The peer we're fetching from — needed to close the receive-side
@@ -178,6 +201,14 @@ struct PendingInbound {
     /// `None` until the `TransferHeader` lands; then the declared length.
     total_len: Option<u64>,
     buf: Vec<u8>,
+    /// Next reliable sequence to process. The divert delivers packets in
+    /// ARRIVAL order (the substrate's `on_receive` accepts out-of-order
+    /// sequences for SACK), so the engine reorders by sequence: header is
+    /// seq 0, data frames are seq 1..N in send order.
+    next_seq: u64,
+    /// Out-of-order packets buffered until their sequence becomes
+    /// contiguous, keyed by sequence. Bounded by [`MAX_REORDER_AHEAD`].
+    reorder: BTreeMap<u64, Vec<Bytes>>,
     /// Taken and fired once on completion (success / NotFound / error).
     done: Option<DoneTx>,
 }
@@ -222,6 +253,8 @@ impl BlobTransferEngine {
                 expected_hash,
                 total_len: None,
                 buf: Vec::new(),
+                next_seq: 0,
+                reorder: BTreeMap::new(),
                 done: Some(done),
             },
         );
@@ -280,74 +313,98 @@ impl BlobTransferEngine {
         });
     }
 
-    /// Requester side: reliable, in-order data-plane events for a
-    /// transfer stream were diverted here (before the event bus). The
-    /// first event is the [`TransferHeader`]; the rest are raw bytes.
-    pub fn on_data(&self, stream_id: u64, events: Vec<Bytes>) {
-        // Each completion path extracts what it needs from the map
-        // entry, drops the guard, removes the entry, then fires the
-        // oneshot — never holding a DashMap guard across `remove`.
-        enum Step {
-            Continue,
-            Fail(BlobError),
-            Complete,
-        }
-        for event in events {
-            let step = {
-                let mut entry = match self.pending.get_mut(&stream_id) {
-                    Some(e) => e,
-                    None => return, // already completed / cancelled
-                };
-                if entry.total_len.is_none() {
-                    match postcard::from_bytes::<TransferHeader>(&event) {
-                        Ok(TransferHeader::NotFound) => {
-                            Step::Fail(BlobError::NotFound("transfer: holder NotFound".into()))
-                        }
-                        Ok(TransferHeader::Found { total_len })
-                            if total_len > TRANSFER_MAX_CHUNK_BYTES =>
-                        {
-                            Step::Fail(BlobError::Backend(format!(
-                                "transfer: total_len {total_len} exceeds cap"
-                            )))
-                        }
-                        Ok(TransferHeader::Found { total_len }) => {
-                            entry.total_len = Some(total_len);
-                            entry.buf.reserve(total_len.min(TRANSFER_MAX_CHUNK_BYTES) as usize);
-                            if total_len == 0 {
-                                Step::Complete
-                            } else {
-                                Step::Continue
-                            }
-                        }
-                        Err(e) => {
-                            Step::Fail(BlobError::Backend(format!("transfer: bad header: {e}")))
-                        }
-                    }
-                } else {
-                    let total = entry.total_len.unwrap_or(0);
-                    if (entry.buf.len() as u64).saturating_add(event.len() as u64) > total {
-                        Step::Fail(BlobError::Backend(
-                            "transfer: holder sent more than total_len".into(),
-                        ))
-                    } else {
-                        entry.buf.extend_from_slice(&event);
-                        if entry.buf.len() as u64 >= total {
-                            Step::Complete
-                        } else {
-                            Step::Continue
-                        }
-                    }
-                }
+    /// Requester side: a transfer packet at reliable sequence `seq` was
+    /// diverted here. **Events arrive in transmission order only when the
+    /// wire didn't reorder** — the substrate's `on_receive` accepts
+    /// out-of-order sequences (for SACK), and the divert hands them over
+    /// in arrival order, so this method reorders by `seq` itself: it
+    /// buffers out-of-order packets and processes events strictly in
+    /// sequence (header = seq 0, data = seq 1..N). Duplicates (seq already
+    /// processed or buffered) and far-future seqs are dropped; the sender
+    /// retransmits a dropped far-future packet once the gap closes.
+    pub fn on_data(&self, stream_id: u64, seq: u64, events: Vec<Bytes>) {
+        let outcome = {
+            let mut entry = match self.pending.get_mut(&stream_id) {
+                Some(e) => e,
+                None => return, // already completed / cancelled
             };
-            match step {
-                Step::Continue => {}
-                Step::Fail(err) => {
-                    self.finish(stream_id, Err(err));
-                    return;
+            // Dedup + bound: ignore already-consumed sequences, duplicate
+            // buffered ones, and anything beyond the reorder horizon.
+            if seq < entry.next_seq
+                || entry.reorder.contains_key(&seq)
+                || seq >= entry.next_seq.saturating_add(MAX_REORDER_AHEAD)
+            {
+                return;
+            }
+            entry.reorder.insert(seq, events);
+
+            // Release every now-contiguous packet in sequence order,
+            // processing its events until one is terminal.
+            let mut outcome = ReassembleStep::Continue;
+            loop {
+                let ns = entry.next_seq;
+                let Some(ready) = entry.reorder.remove(&ns) else {
+                    break;
+                };
+                entry.next_seq += 1;
+                for event in &ready {
+                    outcome = Self::process_event(&mut entry, event);
+                    if !matches!(outcome, ReassembleStep::Continue) {
+                        break;
+                    }
                 }
-                Step::Complete => {
-                    self.finish_verified(stream_id);
-                    return;
+                if !matches!(outcome, ReassembleStep::Continue) {
+                    break;
+                }
+            }
+            outcome
+        };
+        match outcome {
+            ReassembleStep::Continue => {}
+            ReassembleStep::Fail(err) => self.finish(stream_id, Err(err)),
+            ReassembleStep::Complete => self.finish_verified(stream_id),
+        }
+    }
+
+    /// Fold one in-sequence event into the pending reassembly: the first
+    /// event (seq 0) is the [`TransferHeader`]; the rest are raw chunk
+    /// bytes appended in order.
+    fn process_event(entry: &mut PendingInbound, event: &Bytes) -> ReassembleStep {
+        if entry.total_len.is_none() {
+            match postcard::from_bytes::<TransferHeader>(event) {
+                Ok(TransferHeader::NotFound) => {
+                    ReassembleStep::Fail(BlobError::NotFound("transfer: holder NotFound".into()))
+                }
+                Ok(TransferHeader::Found { total_len }) if total_len > TRANSFER_MAX_CHUNK_BYTES => {
+                    ReassembleStep::Fail(BlobError::Backend(format!(
+                        "transfer: total_len {total_len} exceeds cap"
+                    )))
+                }
+                Ok(TransferHeader::Found { total_len }) => {
+                    entry.total_len = Some(total_len);
+                    entry.buf.reserve(total_len.min(TRANSFER_MAX_CHUNK_BYTES) as usize);
+                    if total_len == 0 {
+                        ReassembleStep::Complete
+                    } else {
+                        ReassembleStep::Continue
+                    }
+                }
+                Err(e) => ReassembleStep::Fail(BlobError::Backend(format!(
+                    "transfer: bad header: {e}"
+                ))),
+            }
+        } else {
+            let total = entry.total_len.unwrap_or(0);
+            if (entry.buf.len() as u64).saturating_add(event.len() as u64) > total {
+                ReassembleStep::Fail(BlobError::Backend(
+                    "transfer: holder sent more than total_len".into(),
+                ))
+            } else {
+                entry.buf.extend_from_slice(event);
+                if entry.buf.len() as u64 >= total {
+                    ReassembleStep::Complete
+                } else {
+                    ReassembleStep::Continue
                 }
             }
         }
