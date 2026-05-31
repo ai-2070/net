@@ -1,0 +1,23 @@
+net/crates/net/include/net_transport.h
+  s_4e65c03b4a88ec::t_1ca731c3f1629a 168-169
+  s_4e65c03b4a88ec::t_52de70c5ee7765 151-153
+net/crates/net/src/ffi/transport.rs
+  s_4e65c03b4a88ec::t_32097826abd862 411-417
+  s_4e65c03b4a88ec::t_e3b68a590b4542 356-364
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "a081c178febc9c508d2d2c6f713eb2a14e57064b",
+  "prompts": {},
+  "sessions": {
+    "s_4e65c03b4a88ec": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f38fba46-70fe-4a54-9993-f298695ba62b",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
