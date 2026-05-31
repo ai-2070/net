@@ -402,6 +402,12 @@ pub struct NetRouter {
     bytes_forwarded: AtomicU64,
     total_latency_ns: AtomicU64,
     latency_samples: AtomicU64,
+    /// Test-only fault injection: when `> 0`, the send loop drops every
+    /// Nth dequeued (scheduled) packet instead of sending it, simulating
+    /// link loss for reliability tests. `0` (default) disables it — one
+    /// relaxed load per send, negligible. Shared into the send-loop task.
+    test_drop_every_n: Arc<AtomicU64>,
+    test_drop_counter: Arc<AtomicU64>,
 }
 
 impl NetRouter {
@@ -428,7 +434,16 @@ impl NetRouter {
             bytes_forwarded: AtomicU64::new(0),
             total_latency_ns: AtomicU64::new(0),
             latency_samples: AtomicU64::new(0),
+            test_drop_every_n: Arc::new(AtomicU64::new(0)),
+            test_drop_counter: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Test-only: drop every `n`th dequeued (scheduled) packet in the
+    /// send loop to simulate link loss. `0` disables. Used by reliability
+    /// / retransmit tests; has no effect on the default (`0`) path.
+    pub fn set_test_drop_every_n(&self, n: u64) {
+        self.test_drop_every_n.store(n, Ordering::Relaxed);
     }
 
     /// Get local address
@@ -624,11 +639,23 @@ impl NetRouter {
         let socket = self.socket.clone();
         let scheduler = self.scheduler.clone();
         let running = self.running.clone();
+        let drop_every_n = self.test_drop_every_n.clone();
+        let drop_counter = self.test_drop_counter.clone();
 
         Some(tokio::spawn(async move {
             while running.load(Ordering::Acquire) {
                 // Dequeue and send
                 if let Some(packet) = scheduler.dequeue() {
+                    // Test-only loss injection: drop every Nth packet.
+                    let n = drop_every_n.load(Ordering::Relaxed);
+                    if n > 0
+                        && drop_counter
+                            .fetch_add(1, Ordering::Relaxed)
+                            .wrapping_add(1)
+                            .is_multiple_of(n)
+                    {
+                        continue; // simulated drop — never hits the wire
+                    }
                     let _ = socket.send_to(&packet.data, packet.dest).await;
                 } else {
                     // Wait for new packets (with timeout).
@@ -1342,6 +1369,80 @@ mod tests {
             "weight-1 stream should ship <= 1 packet before round reset; \
              saw {}",
             counts[1]
+        );
+    }
+
+    /// Anti-starvation: a bulk transfer with a huge backlog must NOT
+    /// head-of-line-block a competing interactive stream of equal
+    /// weight. This is the property that justifies routing blob
+    /// transfers through the scheduler (FairScheduler transport plan) —
+    /// a 2 MiB transfer (~260 packets) queued ahead of a few
+    /// interactive packets cannot make the interactive flow wait for
+    /// the whole transfer to drain; round-robin interleaves them so
+    /// every interactive packet is serviced within a bounded number of
+    /// dequeues regardless of how deep the bulk backlog is.
+    #[test]
+    fn bulk_backlog_does_not_starve_an_equal_weight_interactive_stream() {
+        let scheduler = FairScheduler::new(1, 512);
+        let bulk = 1u64;
+        let interactive = 2u64;
+        scheduler.set_stream_weight(bulk, 1);
+        scheduler.set_stream_weight(interactive, 1);
+
+        let dest: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        // A transfer-scale backlog on the bulk stream …
+        let bulk_backlog = 260usize;
+        for _ in 0..bulk_backlog {
+            scheduler.enqueue(QueuedPacket {
+                data: Bytes::from_static(&[0u8; 16]),
+                dest,
+                stream_id: bulk,
+                priority: false,
+                queued_at: Instant::now(),
+            });
+        }
+        // … and just a handful of interactive packets behind it.
+        let interactive_count = 4usize;
+        for _ in 0..interactive_count {
+            scheduler.enqueue(QueuedPacket {
+                data: Bytes::from_static(&[0u8; 16]),
+                dest,
+                stream_id: interactive,
+                priority: false,
+                queued_at: Instant::now(),
+            });
+        }
+
+        // Drain, recording the dequeue index at which each interactive
+        // packet emerges.
+        let mut last_interactive_at = 0usize;
+        let mut seen_interactive = 0usize;
+        for idx in 0..(bulk_backlog + interactive_count) {
+            if let Some(pkt) = scheduler.dequeue() {
+                if pkt.stream_id == interactive {
+                    seen_interactive += 1;
+                    last_interactive_at = idx;
+                }
+            }
+        }
+
+        assert_eq!(
+            seen_interactive, interactive_count,
+            "every interactive packet must be delivered"
+        );
+        // With quantum 1 and equal weight, round-robin alternates one
+        // bulk, one interactive per round, so the k-th interactive
+        // packet emerges by dequeue ~2k — bounded by 2×count, utterly
+        // independent of the 260-deep bulk backlog. If the scheduler
+        // had FIFO/head-of-line semantics, the last interactive packet
+        // would not appear until index ~260.
+        assert!(
+            last_interactive_at <= 2 * interactive_count,
+            "interactive stream starved: last interactive packet at dequeue {} \
+             (bulk backlog {}); fair interleaving should deliver it by ~{}",
+            last_interactive_at,
+            bulk_backlog,
+            2 * interactive_count
         );
     }
 

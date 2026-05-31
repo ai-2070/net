@@ -19,7 +19,9 @@ use super::crypto::{PacketCipher, SessionKeys};
 // `SharedPacketPool` is intentionally absent — `NetSession` uses
 // only `SharedLocalPool` as the single TX-side AEAD source.
 use super::pool::SharedLocalPool;
-use super::reliability::{create_reliability_mode, ReliabilityMode};
+use super::reliability::{
+    create_reliability_mode, ReliabilityMode, ReliableStream, RetransmitDescriptor,
+};
 use super::stream::DEFAULT_STREAM_WINDOW_BYTES;
 use super::transport::ParsedPacket;
 
@@ -233,6 +235,69 @@ impl NetSession {
         self.streams
             .entry(stream_id)
             .or_insert_with(|| StreamState::new(self.default_reliable))
+    }
+
+    /// Like [`Self::get_or_create_stream`], but the receiver-side stream
+    /// is created reliable when the arriving packet is `RELIABLE`-flagged
+    /// — the sender's reliability is a property of the traffic, not of
+    /// the receiver's `default_reliable`. Without this the auto-created
+    /// receive stream is `FireAndForget` and never builds a NACK, so a
+    /// reliable sender's lost packets are unrecoverable. Only affects the
+    /// reliability mode at first-touch (creation); an existing stream
+    /// keeps its mode.
+    pub fn get_or_create_stream_for_packet(
+        &self,
+        stream_id: u64,
+        reliable: bool,
+    ) -> dashmap::mapref::one::RefMut<'_, u64, StreamState> {
+        self.streams
+            .entry(stream_id)
+            .or_insert_with(|| StreamState::new(reliable))
+    }
+
+    /// Collect retransmit descriptors for every reliable stream whose
+    /// oldest unacked packet has exceeded its RTO. Drives the timeout
+    /// backstop (STREAM_RETRANSMIT D-4) that recovers tail loss — the
+    /// last packets dropped, with no later arrival to trigger a
+    /// receiver NACK. Each call advances the per-packet retry clock, so
+    /// a descriptor isn't re-emitted until another RTO elapses, and a
+    /// packet past `max_retries` is dropped from the window.
+    pub fn collect_timed_out_retransmits(&self) -> Vec<Arc<RetransmitDescriptor>> {
+        let mut out = Vec::new();
+        for entry in self.streams.iter() {
+            let mut due = entry.value().with_reliability(|r| r.get_timed_out());
+            out.append(&mut due);
+        }
+        out
+    }
+
+    /// Collect a NACK for every stream that currently has a gap (H-4):
+    /// `(stream_id, NackPayload)`. Driven on a timer so a persistent gap
+    /// with no further arrivals is re-requested promptly, rather than
+    /// waiting for the *sender's* RTO (the grant-piggybacked NACK only
+    /// fires when a packet is accepted, i.e. when there IS new activity).
+    pub fn collect_gap_nacks(&self) -> Vec<(u64, super::protocol::NackPayload)> {
+        let mut out = Vec::new();
+        for entry in self.streams.iter() {
+            if let Some(nack) = entry.value().with_reliability(|r| r.build_nack()) {
+                out.push((*entry.key(), nack));
+            }
+        }
+        out
+    }
+
+    /// Take-and-clear the "given up" flag across all streams, returning
+    /// the ids of streams whose reliable layer exhausted retransmits on
+    /// some packet (H-3). The caller signals a reset to the peer so the
+    /// receiver fails fast instead of stalling to a timeout.
+    pub fn take_failed_stream_ids(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        for entry in self.streams.iter() {
+            if entry.value().with_reliability(|r| r.take_failed()) {
+                out.push(*entry.key());
+            }
+        }
+        out
     }
 
     /// Look up stream state without creating it. Returns `None` if the
@@ -1089,10 +1154,15 @@ impl StreamState {
         tx_window: u32,
         epoch: u64,
     ) -> Self {
+        // Size the retransmit window to the tx-credit window so the
+        // sender can never have more packets in flight than it can
+        // retransmit (H-1). Cheap: `pending` grows on demand, so a large
+        // window costs no up-front memory.
+        let max_pending = ReliableStream::max_pending_for_window(tx_window);
         Self {
             tx_seq: AtomicU64::new(0),
             rx_seq: AtomicU64::new(0),
-            reliability: parking_lot::Mutex::new(create_reliability_mode(reliable)),
+            reliability: parking_lot::Mutex::new(create_reliability_mode(reliable, max_pending)),
             inbound: SegQueue::new(),
             active: AtomicBool::new(true),
             last_activity: AtomicU64::new(current_timestamp()),

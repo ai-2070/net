@@ -77,6 +77,40 @@ pub trait ReliabilityMode: Send + Sync {
     /// [`Self::on_nack`] for the `Arc`-sharing contract.
     fn get_timed_out(&mut self) -> Vec<Arc<RetransmitDescriptor>>;
 
+    /// Take-and-clear the "stream has given up" flag (H-3): `true` once
+    /// after a packet exhausts `max_retries` while still unacked — the
+    /// reliable layer can no longer recover that gap, so the caller
+    /// should signal a stream reset to the peer rather than let it stall
+    /// to a higher-level timeout. Default `false` (fire-and-forget never
+    /// gives up — it tracks nothing).
+    fn take_failed(&mut self) -> bool {
+        false
+    }
+
+    /// The receiver's cumulative ack — the lowest sequence not yet
+    /// contiguously received (`next_expected`). The peer piggybacks this
+    /// on its window grants so the sender can prune (H-9). Default 0
+    /// (fire-and-forget tracks no sequence).
+    fn rx_ack_seq(&self) -> u64 {
+        0
+    }
+
+    /// Sender-side: a cumulative ack arrived — every sequence below
+    /// `ack_seq` has been received, so drop them from the retransmit
+    /// window (H-9). Without this, packets linger in `pending` on the
+    /// happy path until they spuriously time out and get resent (and,
+    /// post-H-3, spuriously give up). Default no-op.
+    fn on_ack(&mut self, _ack_seq: u64) {}
+
+    /// Whether the sender may put another packet in flight under its
+    /// congestion window (H-6). Default `true` (fire-and-forget has no
+    /// congestion state). A reliable stream returns `false` once
+    /// in-flight reaches its cwnd, so the send path back-pressures and
+    /// paces to the cwnd under loss.
+    fn can_send(&self) -> bool {
+        true
+    }
+
     /// Check if there are unacknowledged packets
     fn has_pending(&self) -> bool;
 
@@ -217,42 +251,186 @@ pub struct ReliableStream {
     /// their actual sustained reliable-stream throughput. Pre-fix
     /// the eviction was unobservable.
     untracked_evictions: u64,
+    /// Set when a packet exhausts `max_retries` while still unacked
+    /// (H-3): the reliable layer has given up on that gap. Taken-and-
+    /// cleared via [`Self::take_failed`] so the owning node can signal a
+    /// stream reset to the peer rather than let it stall to a timeout.
+    failed: bool,
+    /// Smoothed RTT estimate (RFC 6298, α=1/8); `None` until the first
+    /// RTT sample. Drives the adaptive `rto` (H-5).
+    srtt: Option<Duration>,
+    /// RTT variance estimate (RFC 6298, β=1/4).
+    rttvar: Duration,
+    /// Congestion window in packets (H-6, Reno-style AIMD): the cap on
+    /// in-flight (unacked) packets. Grows on clean acks (slow-start then
+    /// congestion-avoidance), halves on a NACK-driven loss, and resets to
+    /// the floor on a timeout. On a loss-free path it just grows past the
+    /// retransmit window and never gates.
+    cwnd: f64,
+    /// Slow-start threshold — above it, growth switches from slow-start
+    /// (+1/ack) to congestion-avoidance (+1/cwnd per ack).
+    ssthresh: f64,
+    /// Fast-recovery "recover point" (T-1): the `next_expected` of the
+    /// loss episode currently being recovered. `Some(r)` means we've
+    /// already reacted to the gap at `r` (resent + one cwnd cut) and are
+    /// awaiting its repair; further NACKs at `next_expected <= r` are
+    /// duplicates (the receiver re-NACKs every tick, faster than one RTT
+    /// on a high-RTT link) and must be ignored so they don't re-resend,
+    /// re-halve cwnd, or bump `retries` toward a spurious give-up.
+    /// Cleared (`None`) once a cumulative ack advances past `r`.
+    recover: Option<u64>,
 }
 
 impl ReliableStream {
-    /// Default retransmit timeout
+    /// Default retransmit timeout — the starting RTO before any RTT
+    /// sample, and the value used by fixed-RTO callers.
     pub const DEFAULT_RTO: Duration = Duration::from_millis(50);
 
-    /// Default max pending packets
+    /// Lower bound on the adaptive RTO (H-5). Floors the estimate so a
+    /// near-zero localhost RTT can't drive the RTO below the grant-drain
+    /// + processing latency and cause spurious resends.
+    pub const MIN_RTO: Duration = Duration::from_millis(10);
+
+    /// Upper bound on the adaptive RTO (H-5). Caps how long a genuinely
+    /// lost packet waits before the timeout backstop resends it.
+    pub const MAX_RTO: Duration = Duration::from_secs(2);
+
+    /// Default max pending packets — also the floor when the window is
+    /// auto-sized from a stream's tx-window (see
+    /// [`Self::max_pending_for_window`]).
     pub const DEFAULT_MAX_PENDING: usize = 32;
+
+    /// Lower bound on the per-packet size assumed when sizing the
+    /// retransmit window from a tx-window. The window must track at least
+    /// `tx_window / MIN_TRACKED_PACKET_BYTES` packets so nothing in flight
+    /// is evicted before it can be retransmitted. 512 B covers bulk (MTU)
+    /// and typical control packets; sub-512 B spam on a huge window is the
+    /// only residual eviction risk — surfaced loudly via
+    /// [`Self::untracked_evictions`] (H-2).
+    pub const MIN_TRACKED_PACKET_BYTES: u32 = 512;
+
+    /// Hard cap on the auto-sized retransmit window, bounding the pending
+    /// queue's worst-case growth under sustained loss.
+    pub const MAX_RETRANSMIT_WINDOW: usize = 16_384;
 
     /// Default max retries
     pub const DEFAULT_MAX_RETRIES: u8 = 3;
 
-    /// Create a new reliable stream with default settings
+    /// Initial congestion window in packets (H-6). ~TCP initial window;
+    /// big enough that low-volume reliable streams (nRPC) never feel it.
+    pub const INIT_CWND: f64 = 32.0;
+
+    /// Congestion-window floor — a stream under sustained loss still
+    /// makes forward progress at this many packets in flight.
+    pub const MIN_CWND: f64 = 2.0;
+
+    /// Size the retransmit window to a stream's tx-credit window so the
+    /// sender can never have more packets in flight than it can
+    /// retransmit (the H-1 invariant: tx-window ≤ retransmit-window).
+    /// `tx_window == 0` (backpressure disabled) falls back to the default.
+    pub fn max_pending_for_window(tx_window: u32) -> usize {
+        if tx_window == 0 {
+            return Self::DEFAULT_MAX_PENDING;
+        }
+        // DEFAULT_MAX_PENDING (32) <= MAX_RETRANSMIT_WINDOW (16384), so the
+        // clamp bounds are well-ordered.
+        ((tx_window / Self::MIN_TRACKED_PACKET_BYTES) as usize)
+            .clamp(Self::DEFAULT_MAX_PENDING, Self::MAX_RETRANSMIT_WINDOW)
+    }
+
+    /// Create a new reliable stream with default settings.
+    ///
+    /// `pending` is NOT pre-reserved: it grows on demand to the actual
+    /// in-flight count (itself bounded by the tx-window's bytes), so a
+    /// generous `max_pending` costs nothing up front — important when
+    /// thousands of small-payload streams each carry a reliability state.
     pub fn new() -> Self {
         Self {
             next_expected: 0,
             sack_bitmap: 0,
-            pending: VecDeque::with_capacity(Self::DEFAULT_MAX_PENDING),
+            pending: VecDeque::new(),
             rto: Self::DEFAULT_RTO,
             max_pending: Self::DEFAULT_MAX_PENDING,
             max_retries: Self::DEFAULT_MAX_RETRIES,
             untracked_evictions: 0,
+            failed: false,
+            srtt: None,
+            rttvar: Duration::ZERO,
+            cwnd: Self::INIT_CWND,
+            ssthresh: f64::MAX,
+            recover: None,
         }
     }
 
-    /// Create with custom settings
+    /// Create with custom settings. `pending` grows on demand (no
+    /// pre-reservation) — see [`Self::new`].
     pub fn with_settings(rto: Duration, max_pending: usize, max_retries: u8) -> Self {
         Self {
             next_expected: 0,
             sack_bitmap: 0,
-            pending: VecDeque::with_capacity(max_pending),
+            pending: VecDeque::new(),
             rto,
             max_pending,
             max_retries,
             untracked_evictions: 0,
+            failed: false,
+            srtt: None,
+            rttvar: Duration::ZERO,
+            cwnd: Self::INIT_CWND,
+            ssthresh: f64::MAX,
+            recover: None,
         }
+    }
+
+    /// Multiplicative decrease on a NACK-driven (fast-retransmit) loss:
+    /// ssthresh ← cwnd/2, cwnd ← ssthresh (H-6).
+    fn on_loss_fast(&mut self) {
+        self.ssthresh = (self.cwnd / 2.0).max(Self::MIN_CWND);
+        self.cwnd = self.ssthresh;
+    }
+
+    /// Stronger backoff on a timeout (a clearer congestion signal than a
+    /// NACK): ssthresh ← cwnd/2, cwnd ← floor — restart slow-start (H-6).
+    fn on_loss_timeout(&mut self) {
+        self.ssthresh = (self.cwnd / 2.0).max(Self::MIN_CWND);
+        self.cwnd = Self::MIN_CWND;
+    }
+
+    /// Grow the congestion window for one acked packet: slow-start
+    /// (+1) below ssthresh, congestion-avoidance (+1/cwnd) above. Capped
+    /// at the retransmit window (can't have more in flight than tracked).
+    fn grow_cwnd(&mut self) {
+        if self.cwnd < self.ssthresh {
+            self.cwnd += 1.0;
+        } else {
+            self.cwnd += 1.0 / self.cwnd;
+        }
+        let cap = self.max_pending as f64;
+        if self.cwnd > cap {
+            self.cwnd = cap;
+        }
+    }
+
+    /// Fold an RTT sample into the smoothed estimate and recompute the
+    /// RTO (RFC 6298). Called from `on_ack` for non-retransmitted
+    /// packets only (Karn's algorithm — a retransmitted packet's ack is
+    /// ambiguous). The RTO is clamped to [`Self::MIN_RTO`, `Self::MAX_RTO`].
+    fn update_rto(&mut self, rtt: Duration) {
+        match self.srtt {
+            None => {
+                self.srtt = Some(rtt);
+                self.rttvar = rtt / 2;
+            }
+            Some(srtt) => {
+                let err = srtt.abs_diff(rtt);
+                // RTTVAR = 3/4·RTTVAR + 1/4·|SRTT-RTT|
+                self.rttvar = (self.rttvar * 3 + err) / 4;
+                // SRTT = 7/8·SRTT + 1/8·RTT
+                self.srtt = Some((srtt * 7 + rtt) / 8);
+            }
+        }
+        let srtt = self.srtt.unwrap_or(rtt);
+        self.rto = (srtt + self.rttvar * 4).clamp(Self::MIN_RTO, Self::MAX_RTO);
     }
 
     /// Number of unacknowledged packets that the stream evicted from
@@ -297,19 +475,6 @@ impl ReliableStream {
     /// [`Self::last_received_contiguous`] instead.
     pub fn ack_seq(&self) -> u64 {
         self.next_expected.saturating_sub(1)
-    }
-
-    /// Process an acknowledgment. `acked` is the highest sequence the
-    /// peer has contiguously received.
-    pub fn on_ack(&mut self, acked: u64) {
-        // Remove all pending packets up to and including acked.
-        while let Some(front) = self.pending.front() {
-            if front.seq() <= acked {
-                self.pending.pop_front();
-            } else {
-                break;
-            }
-        }
     }
 
     /// Check if there are gaps in received sequences.
@@ -369,14 +534,22 @@ impl ReliabilityMode for ReliableStream {
         if self.pending.len() >= self.max_pending {
             self.pending.pop_front();
             self.untracked_evictions = self.untracked_evictions.saturating_add(1);
-            tracing::warn!(
-                untracked_evictions = self.untracked_evictions,
-                max_pending = self.max_pending,
-                "ReliableStream: retransmit window full; evicted oldest \
-                 unacked packet — NACK for that seq can no longer \
-                 recover it. Increase max_pending or apply upstream \
-                 backpressure.",
-            );
+            // Rate-limit the warning: the first eviction is the signal,
+            // then every 64th, so a stream stuck in sustained overflow
+            // surfaces in logs without drowning them. With H-1 sizing the
+            // window to the tx-window this should never fire for a
+            // well-configured stream — if it does, the window/packet-size
+            // assumption was violated and data was genuinely lost.
+            if self.untracked_evictions == 1 || self.untracked_evictions.is_multiple_of(64) {
+                tracing::warn!(
+                    untracked_evictions = self.untracked_evictions,
+                    max_pending = self.max_pending,
+                    "ReliableStream: retransmit window full; evicted oldest \
+                     unacked packet — NACK for that seq can no longer \
+                     recover it. Increase max_pending or apply upstream \
+                     backpressure.",
+                );
+            }
         }
         self.pending.push_back(UnackedPacket {
             descriptor,
@@ -461,6 +634,24 @@ impl ReliabilityMode for ReliableStream {
     }
 
     fn on_nack(&mut self, nack: &NackPayload) -> Vec<Arc<RetransmitDescriptor>> {
+        // Fast-recovery dedup (T-1): react to a loss episode only once.
+        // The receiver re-NACKs a persistent gap every tick (25 ms),
+        // which on a link with RTT > tick arrives several times before
+        // the first retransmit can return. Without this guard each
+        // duplicate would resend the same packet (bandwidth
+        // amplification), halve cwnd again (collapsing it far below what
+        // one loss warrants), and bump `retries` — tripping a spurious
+        // give-up + StreamReset while the retransmit is still in flight.
+        // We react when `next_expected` advances past the recover point
+        // (a genuinely new gap) and ignore duplicates for the same/older
+        // head gap; a lost retransmit is then recovered by the RTO-paced
+        // timeout path, not by the NACK flood.
+        let new_loss = self.recover.is_none_or(|r| nack.next_expected > r);
+        if !new_loss {
+            return Vec::new();
+        }
+        self.recover = Some(nack.next_expected);
+
         let mut retransmits = Vec::new();
 
         // Find packets to retransmit based on NACK. Return the
@@ -481,26 +672,102 @@ impl ReliabilityMode for ReliableStream {
             }
         }
 
+        // A NACK-driven retransmit is a loss signal → multiplicative
+        // decrease (H-6, fast retransmit).
+        if !retransmits.is_empty() {
+            self.on_loss_fast();
+        }
         retransmits
     }
 
     fn get_timed_out(&mut self) -> Vec<Arc<RetransmitDescriptor>> {
         let now = Instant::now();
+        let rto = self.rto;
+        let max_retries = self.max_retries;
         let mut retransmits = Vec::new();
+        let mut gave_up = false;
 
         // Per perf #133 — `Arc::clone` bumps a refcount instead of
-        // deep-cloning the `Vec<Bytes>` events list per timed-out
-        // packet.
-        for unacked in &mut self.pending {
-            if now.duration_since(unacked.sent_at) > self.rto && unacked.retries < self.max_retries
-            {
-                retransmits.push(Arc::clone(&unacked.descriptor));
-                unacked.retries += 1;
-                unacked.sent_at = now;
+        // deep-cloning the `Vec<Bytes>` events list per timed-out packet.
+        // A packet that has timed out AND exhausted its retries is
+        // dropped from the window (it can't be recovered) and flags the
+        // stream as failed (H-3) — previously such packets stayed stuck
+        // in `pending` forever, leaking and stalling silently.
+        self.pending.retain_mut(|unacked| {
+            if now.duration_since(unacked.sent_at) > rto {
+                if unacked.retries < max_retries {
+                    retransmits.push(Arc::clone(&unacked.descriptor));
+                    unacked.retries += 1;
+                    unacked.sent_at = now;
+                    true // keep — still recoverable
+                } else {
+                    gave_up = true;
+                    false // drop — retransmits exhausted
+                }
+            } else {
+                true // not yet due
             }
+        });
+        if gave_up {
+            self.failed = true;
+        }
+        // A timeout retransmit is a stronger congestion signal than a
+        // NACK → restart slow-start from the floor (H-6).
+        if !retransmits.is_empty() {
+            self.on_loss_timeout();
         }
 
         retransmits
+    }
+
+    fn take_failed(&mut self) -> bool {
+        std::mem::take(&mut self.failed)
+    }
+
+    fn rx_ack_seq(&self) -> u64 {
+        self.next_expected
+    }
+
+    fn on_ack(&mut self, ack_seq: u64) {
+        // Single pass over `pending` (T-7): for every acked sequence
+        // (`seq < ack_seq`, contiguously received) fold an RTT sample
+        // (H-5, Karn — non-retransmitted only; `pending` is seq-ordered
+        // so the last such packet is the freshest), count it for cwnd
+        // growth (H-6), then drop it from the retransmit window (H-9).
+        let now = Instant::now();
+        let mut sample = None;
+        let mut acked = 0usize;
+        self.pending.retain(|u| {
+            if u.seq() < ack_seq {
+                if u.retries == 0 {
+                    sample = Some(now.duration_since(u.sent_at));
+                }
+                acked += 1;
+                false // drop — acked
+            } else {
+                true // keep — still in flight
+            }
+        });
+        if let Some(rtt) = sample {
+            self.update_rto(rtt);
+        }
+        for _ in 0..acked {
+            self.grow_cwnd();
+        }
+        // Fast recovery (T-1): a cumulative ack past the recover point
+        // means the loss episode is repaired — leave recovery so the
+        // next genuinely-new gap reacts.
+        if self.recover.is_some_and(|r| ack_seq > r) {
+            self.recover = None;
+        }
+    }
+
+    fn can_send(&self) -> bool {
+        // H-6: cap in-flight (unacked) packets at the congestion window.
+        // On a loss-free path cwnd grows past the retransmit window, so
+        // `pending.len()` (also ≤ retransmit window) never reaches it —
+        // the gate only bites under sustained loss, which is the point.
+        (self.pending.len() as f64) < self.cwnd
     }
 
     #[inline]
@@ -525,10 +792,18 @@ impl std::fmt::Debug for ReliableStream {
     }
 }
 
-/// Create a boxed reliability mode from configuration
-pub fn create_reliability_mode(reliable: bool) -> Box<dyn ReliabilityMode> {
+/// Create a boxed reliability mode from configuration. For reliable
+/// streams the retransmit window (`max_pending`) is supplied by the
+/// caller — sized to the stream's tx-window via
+/// [`ReliableStream::max_pending_for_window`] so the sender can never
+/// have more in flight than it can retransmit.
+pub fn create_reliability_mode(reliable: bool, max_pending: usize) -> Box<dyn ReliabilityMode> {
     if reliable {
-        Box::new(ReliableStream::new())
+        Box::new(ReliableStream::with_settings(
+            ReliableStream::DEFAULT_RTO,
+            max_pending,
+            ReliableStream::DEFAULT_MAX_RETRIES,
+        ))
     } else {
         Box::new(FireAndForget::new())
     }
@@ -551,6 +826,207 @@ mod tests {
             events: vec![packet],
             flags: PacketFlags::RELIABLE,
         })
+    }
+
+    #[test]
+    fn max_pending_scales_with_window_floored_and_capped() {
+        // 0 window (backpressure disabled) → default floor.
+        assert_eq!(
+            ReliableStream::max_pending_for_window(0),
+            ReliableStream::DEFAULT_MAX_PENDING
+        );
+        // Small window → floored at the default.
+        assert_eq!(
+            ReliableStream::max_pending_for_window(1024),
+            ReliableStream::DEFAULT_MAX_PENDING
+        );
+        // Mid window → tx_window / MIN_TRACKED_PACKET_BYTES.
+        assert_eq!(
+            ReliableStream::max_pending_for_window(1024 * 1024),
+            (1024 * 1024) / ReliableStream::MIN_TRACKED_PACKET_BYTES as usize
+        );
+        // Huge window → capped.
+        assert_eq!(
+            ReliableStream::max_pending_for_window(u32::MAX),
+            ReliableStream::MAX_RETRANSMIT_WINDOW
+        );
+    }
+
+    #[test]
+    fn large_window_tracks_all_inflight_without_eviction() {
+        // H-1: with a window > the legacy fixed 32, no unacked packet is
+        // evicted before it can be retransmitted. Pre-H-1, packet 0 would
+        // be evicted once packet 32 was sent and a NACK for it would find
+        // nothing to resend.
+        let mut s = ReliableStream::with_settings(Duration::from_millis(50), 100, 3);
+        for seq in 0..100u64 {
+            s.on_send(descriptor(seq, Bytes::from_static(b"payload")));
+        }
+        assert_eq!(
+            s.untracked_evictions(),
+            0,
+            "a 100-deep window must track all 100 in-flight packets"
+        );
+        // A NACK for the oldest sequence still recovers it.
+        let nack = NackPayload {
+            next_expected: 0,
+            missing_bitmap: 0,
+        };
+        let resent = s.on_nack(&nack);
+        assert!(
+            resent.iter().any(|d| d.seq == 0),
+            "oldest in-flight packet must still be retransmittable"
+        );
+    }
+
+    #[test]
+    fn exhausted_retransmits_flag_failure_and_drop() {
+        // H-3: a packet that times out past `max_retries` is dropped from
+        // the window and flags the stream failed (so the owner can send a
+        // reset) — instead of staying stuck forever and stalling silently.
+        let rto = Duration::from_millis(5);
+        let max_retries = 2u8;
+        let mut s = ReliableStream::with_settings(rto, 32, max_retries);
+        s.on_send(descriptor(0, Bytes::from_static(b"x")));
+        assert!(!s.take_failed());
+
+        // Each RTO elapse → one retransmit, until retries are exhausted.
+        for _ in 0..max_retries {
+            std::thread::sleep(rto * 2);
+            assert_eq!(s.get_timed_out().len(), 1, "still retransmitting");
+            assert!(!s.take_failed(), "not failed while retries remain");
+        }
+
+        // Next timeout: retries exhausted → give up.
+        std::thread::sleep(rto * 2);
+        assert!(
+            s.get_timed_out().is_empty(),
+            "no retransmit emitted once max_retries is hit"
+        );
+        assert!(s.take_failed(), "stream flagged failed after giving up");
+        assert!(!s.take_failed(), "take_failed clears the flag");
+        assert!(!s.has_pending(), "given-up packet dropped from the window");
+    }
+
+    #[test]
+    fn adaptive_rto_rfc6298_and_clamps() {
+        // H-5 (deterministic — drives `update_rto` directly to avoid
+        // wall-clock flakiness under parallel test load).
+        let mut s = ReliableStream::with_settings(Duration::from_millis(50), 32, 3);
+        // First sample: srtt=rtt, rttvar=rtt/2 → rto = rtt + 4·(rtt/2) = 3·rtt.
+        s.update_rto(Duration::from_millis(20));
+        assert_eq!(s.rto, Duration::from_millis(60), "first sample → 3×RTT");
+        // A huge RTT estimate caps at MAX_RTO.
+        s.update_rto(Duration::from_secs(10));
+        assert_eq!(s.rto, ReliableStream::MAX_RTO, "RTO capped at MAX");
+        // A fresh stream with a tiny RTT floors at MIN_RTO.
+        let mut s2 = ReliableStream::with_settings(Duration::from_millis(50), 32, 3);
+        s2.update_rto(Duration::from_micros(1));
+        assert_eq!(s2.rto, ReliableStream::MIN_RTO, "tiny RTT floored at MIN");
+    }
+
+    #[test]
+    fn adaptive_rto_skips_retransmitted_samples_karn() {
+        // H-5 / Karn: a retransmitted packet's ack is ambiguous, so it
+        // must not update the RTT estimate.
+        let mut s = ReliableStream::with_settings(Duration::from_millis(10), 32, 3);
+        s.on_send(descriptor(0, Bytes::from_static(b"x")));
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(s.get_timed_out().len(), 1, "timed-out packet retransmitted");
+        s.on_ack(1); // ack — but seq 0 was retransmitted
+        assert_eq!(
+            s.rto,
+            Duration::from_millis(10),
+            "Karn: no RTT sample taken from a retransmitted packet"
+        );
+    }
+
+    #[test]
+    fn congestion_window_grows_on_ack_resets_on_timeout() {
+        // H-6 AIMD: clean acks grow cwnd (slow-start); a timeout collapses
+        // it to the floor.
+        let mut s = ReliableStream::with_settings(Duration::from_millis(10), 1000, 3);
+        for seq in 0..30u64 {
+            s.on_send(descriptor(seq, Bytes::from_static(b"x")));
+        }
+        s.on_ack(10); // 10 clean acks → slow-start +10
+        assert!(
+            s.cwnd > ReliableStream::INIT_CWND,
+            "cwnd grows on clean acks"
+        );
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(
+            !s.get_timed_out().is_empty(),
+            "remaining packets time out and retransmit"
+        );
+        assert_eq!(
+            s.cwnd,
+            ReliableStream::MIN_CWND,
+            "a timeout collapses cwnd to the floor"
+        );
+    }
+
+    #[test]
+    fn congestion_window_halves_on_nack_loss() {
+        // H-6: a NACK-driven (fast) retransmit halves cwnd, not to the floor.
+        let mut s = ReliableStream::with_settings(Duration::from_millis(50), 1000, 3);
+        for seq in 0..20u64 {
+            s.on_send(descriptor(seq, Bytes::from_static(b"x")));
+        }
+        let before = s.cwnd;
+        // NACK requesting seq 5 (and a couple more via the bitmap).
+        let nack = NackPayload {
+            next_expected: 5,
+            missing_bitmap: 0,
+        };
+        assert!(!s.on_nack(&nack).is_empty(), "NACK retransmits seq 5");
+        assert!(s.cwnd < before, "fast-retransmit halves cwnd");
+        assert!(
+            s.cwnd >= ReliableStream::MIN_CWND,
+            "but not below the floor"
+        );
+    }
+
+    #[test]
+    fn duplicate_nacks_for_same_gap_are_deduped() {
+        // T-1 fast-recovery dedup: a burst of NACKs for the same head gap
+        // (the receiver re-NACKs every tick, faster than one RTT) must
+        // react only once — no re-resend, no further cwnd cut, no extra
+        // `retries` bump → no spurious give-up while the retransmit is in
+        // flight.
+        let mut s = ReliableStream::with_settings(Duration::from_millis(50), 1000, 3);
+        for seq in 0..10u64 {
+            s.on_send(descriptor(seq, Bytes::from_static(b"x")));
+        }
+        let cwnd0 = s.cwnd;
+        let nack = NackPayload {
+            next_expected: 3,
+            missing_bitmap: 0,
+        };
+        // First NACK for the gap at seq 3 → one retransmit + one cwnd cut.
+        assert_eq!(s.on_nack(&nack).len(), 1, "first NACK retransmits seq 3");
+        let cwnd1 = s.cwnd;
+        assert!(cwnd1 < cwnd0, "first NACK halves cwnd");
+        // A flood of identical NACKs → all ignored.
+        for _ in 0..5 {
+            assert!(
+                s.on_nack(&nack).is_empty(),
+                "duplicate NACK for the same gap is ignored"
+            );
+        }
+        assert_eq!(s.cwnd, cwnd1, "cwnd is not cut again by duplicate NACKs");
+        assert!(!s.take_failed(), "no spurious give-up from the NACK flood");
+
+        // Once the gap is repaired (ack advances past it), a NACK for a
+        // NEW, later gap reacts again.
+        s.on_ack(4); // seq 3 acked → recovery ends
+        let cwnd2 = s.cwnd;
+        let nack2 = NackPayload {
+            next_expected: 7,
+            missing_bitmap: 0,
+        };
+        assert_eq!(s.on_nack(&nack2).len(), 1, "a new gap reacts");
+        assert!(s.cwnd < cwnd2, "a new loss episode cuts cwnd again");
     }
 
     #[test]
@@ -666,8 +1142,9 @@ mod tests {
 
         assert!(mode.has_pending());
 
-        // ACK should clear pending
-        mode.on_ack(2);
+        // ACK should clear pending. `on_ack` takes the cumulative ack =
+        // next_expected (exclusive), so 3 acks seq 1 and 2.
+        mode.on_ack(3);
         assert!(!mode.has_pending());
     }
 
@@ -781,10 +1258,10 @@ mod tests {
 
     #[test]
     fn test_create_reliability_mode() {
-        let mode = create_reliability_mode(false);
+        let mode = create_reliability_mode(false, ReliableStream::DEFAULT_MAX_PENDING);
         assert_eq!(mode.name(), "fire-and-forget");
 
-        let mode = create_reliability_mode(true);
+        let mode = create_reliability_mode(true, ReliableStream::DEFAULT_MAX_PENDING);
         assert_eq!(mode.name(), "reliable");
     }
 
@@ -1008,14 +1485,13 @@ mod tests {
 
     #[test]
     fn test_regression_duplicate_seq_zero_rejected() {
-        // Regression: on_receive had a special case for seq=0 that checked
-        // `seq == 0 && self.ack_seq == 0`. After receiving seq 0, ack_seq
-        // was still 0, so a duplicate seq 0 hit the same early return and
-        // was accepted again — violating exactly-once delivery for reliable
-        // streams.
-        //
-        // Fix: added `received_first` flag to distinguish "never received
-        // anything" from "received seq 0".
+        // Regression: a duplicate seq 0 must be rejected for exactly-once
+        // delivery. `on_receive` rejects any `seq < next_expected` as a
+        // duplicate: after seq 0 is accepted, `next_expected` advances to
+        // 1, so a re-delivered seq 0 (0 < 1) is rejected. (An earlier
+        // impl special-cased `seq == 0 && ack_seq == 0`; since `ack_seq`
+        // stayed 0 right after receiving seq 0, that path re-accepted the
+        // duplicate — the `next_expected`-based check has no such hole.)
         let mut mode = ReliableStream::new();
 
         // First reception of seq 0 should succeed
@@ -1035,12 +1511,11 @@ mod tests {
 
     #[test]
     fn test_regression_seq_zero_after_higher_seqs_rejected() {
-        // Regression: seq 0 arriving after ack_seq had advanced (e.g., to 5)
-        // would pass the `seq == 0 && !received_first` check (false, so it
-        // fell through) and then hit `seq <= self.ack_seq` → duplicate.
-        // That path was correct, but an earlier version without received_first
-        // would have reset ack_seq to 0, moving the window backwards.
-        // This test ensures the fix holds.
+        // Regression: seq 0 arriving after the window has advanced (e.g.
+        // next_expected = 6) must be rejected as a duplicate. The
+        // `seq < next_expected` check covers it and must not move the
+        // window backwards. (An earlier seq-0 special case risked
+        // resetting the window to 0.) This test ensures the fix holds.
         let mut mode = ReliableStream::new();
 
         // Receive 0..5 in order
@@ -1208,26 +1683,33 @@ mod tests {
         assert_eq!(r.events, events_b);
         assert_eq!(r.flags, PacketFlags::RELIABLE);
 
-        // The descriptor has the inputs needed for
-        // `PacketBuilder::build(stream_id, seq, &events, flags)`.
-        // Each retransmit lets the caller produce a fresh-counter
-        // packet — distinct from the original even though the
-        // descriptor itself is identical to what was originally
-        // pushed. This is what fixes the replay-window rejection.
-        let nack2 = NackPayload {
+        // A duplicate NACK for the same head gap is deduped (T-1) — the
+        // first retransmit is in flight, so re-NACKing must not re-emit.
+        let dup = NackPayload {
             next_expected: 1,
+            missing_bitmap: 0,
+        };
+        assert!(
+            mode.on_nack(&dup).is_empty(),
+            "duplicate NACK for the same gap is deduped"
+        );
+
+        // A NACK for a genuinely newer gap (seq 2) does re-emit, carrying
+        // its own pre-encryption descriptor. Each retransmit lets the
+        // caller produce a fresh-counter packet — the descriptor inputs
+        // (stream_id/events/flags) are what fix the replay-window
+        // rejection; cipher-counter freshness is the rebuild caller's job.
+        let nack2 = NackPayload {
+            next_expected: 2,
             missing_bitmap: 0,
         };
         let retransmits2 = mode.on_nack(&nack2);
         assert_eq!(retransmits2.len(), 1);
         let r2 = &retransmits2[0];
-        // The descriptor is the same — the *cipher counter* freshness
-        // is the responsibility of the rebuild caller, not of the
-        // reliability layer.
-        assert_eq!(r2.seq, r.seq);
-        assert_eq!(r2.events, r.events);
-        assert_eq!(r2.flags, r.flags);
-        assert_eq!(r2.stream_id, r.stream_id);
+        assert_eq!(r2.seq, 2);
+        assert_eq!(r2.events, events_c);
+        assert_eq!(r2.flags, PacketFlags::RELIABLE);
+        assert_eq!(r2.stream_id, 7);
     }
 
     /// Pin crypto-session perf #133: `on_nack` and `get_timed_out`

@@ -15,6 +15,11 @@
 #[cfg(feature = "dataforts")]
 pub mod blob;
 
+/// On-demand cross-peer directory transfer over router streams — pulls
+/// a whole tree from a known source via the blob-transfer primitive.
+#[cfg(feature = "dataforts")]
+pub mod dir;
+
 #[cfg(feature = "dataforts")]
 pub mod greedy;
 
@@ -57,4 +62,10 @@ pub use blob::{
     DEFAULT_OVERFLOW_LOW_WATER_RATIO, DEFAULT_OVERFLOW_MAX_PUSHES_PER_TICK,
     DEFAULT_OVERFLOW_TICK_INTERVAL_MS, DEFAULT_RETENTION_FLOOR, HEALTH_GATE_CLEAR_THRESHOLD,
     HEALTH_GATE_EMIT_THRESHOLD,
+};
+
+#[cfg(feature = "dataforts")]
+pub use dir::{
+    fetch_dir, store_dir, DirEntry, DirError, DirManifest, DirStats, EntryKind,
+    DEFAULT_FETCH_CONCURRENCY, DIR_MANIFEST_VERSION,
 };

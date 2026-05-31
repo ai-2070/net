@@ -89,6 +89,13 @@ const PACKET_WIRE_OVERHEAD: usize = HEADER_SIZE + TAG_SIZE;
 /// `PERF_AUDIT_2026_05_19_NRPC.md`.
 const STREAM_GRANT_DRAIN_INTERVAL: Duration = Duration::from_millis(1);
 
+/// Tick interval for the timeout-driven retransmit loop (STREAM_RETRANSMIT
+/// D-4). Half the reliability RTO (`ReliableStream::DEFAULT_RTO`, 50 ms)
+/// so a timed-out packet is resent within ~1 RTO. This backstops tail
+/// loss — the last packets dropped, with no later arrival to trigger a
+/// receiver NACK.
+const RETRANSMIT_TICK: Duration = Duration::from_millis(25);
+
 /// One entry in the per-mesh pending-grant queue. Captures the
 /// AEAD session (for cipher + packet pool + next_control_tx_seq)
 /// and the peer's wire address. The receive path already has both
@@ -115,7 +122,10 @@ use super::router::{NetRouter, RouterConfig};
 use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subnet::{DropReason, SubnetGateway, SubnetId, SubnetPolicy};
-use super::subprotocol::stream_window::{StreamWindow, SUBPROTOCOL_STREAM_WINDOW};
+use super::subprotocol::stream_window::{
+    StreamNack, StreamReset, StreamWindow, SUBPROTOCOL_STREAM_NACK, SUBPROTOCOL_STREAM_RESET,
+    SUBPROTOCOL_STREAM_WINDOW,
+};
 use super::subprotocol::MigrationSubprotocolHandler;
 use super::transport::{NetSocket, PacketReceiver, ParsedPacket, SocketBufferConfig};
 use super::Visibility;
@@ -458,6 +468,13 @@ struct DispatchCtx {
     /// `parking_lot::RwLock` are single-digit-nanoseconds.
     #[cfg(feature = "dataforts")]
     greedy_observer: Arc<parking_lot::RwLock<Option<Arc<dyn super::dataforts::GreedyObserver>>>>,
+    /// Optional blob-transfer engine (FairScheduler transport). The
+    /// `SUBPROTOCOL_BLOB_TRANSFER` control branch and the
+    /// `is_transfer_stream_id` data divert consult it. `None` until a
+    /// node calls `serve_blob_transfer`.
+    #[cfg(feature = "dataforts")]
+    blob_transfer_engine:
+        Arc<parking_lot::RwLock<Option<Arc<super::dataforts::blob::transfer::BlobTransferEngine>>>>,
     /// In-flight initiator handshakes; dispatch completes them when a
     /// matching routed msg2 arrives.
     pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
@@ -1758,6 +1775,12 @@ pub struct MeshNode {
     /// `!Sized` and `ArcSwapOption` doesn't accept it.
     #[cfg(feature = "dataforts")]
     greedy_observer: Arc<parking_lot::RwLock<Option<Arc<dyn super::dataforts::GreedyObserver>>>>,
+    /// Optional blob-transfer engine (FairScheduler transport plan).
+    /// Installed by [`Self::serve_blob_transfer`]; drives on-demand
+    /// cross-peer blob fetch over reliable scheduled streams.
+    #[cfg(feature = "dataforts")]
+    blob_transfer_engine:
+        Arc<parking_lot::RwLock<Option<Arc<super::dataforts::blob::transfer::BlobTransferEngine>>>>,
     /// Monotonic version counter used when stamping our own
     /// announcements. `CapabilityIndex::index` skips older versions,
     /// so this must move forward across restarts if the caller wants
@@ -2216,6 +2239,8 @@ impl MeshNode {
             fold_generations: Arc::new(DashMap::new()),
             #[cfg(feature = "dataforts")]
             greedy_observer: Arc::new(parking_lot::RwLock::new(None)),
+            #[cfg(feature = "dataforts")]
+            blob_transfer_engine: Arc::new(parking_lot::RwLock::new(None)),
             capability_version: Arc::new(AtomicU64::new(0)),
             local_subnet,
             local_subnet_policy,
@@ -2755,6 +2780,7 @@ impl MeshNode {
         let recv_handle = self.spawn_receive_loop();
         let heartbeat_handle = self.spawn_heartbeat_loop();
         let stream_grant_drainer_handle = self.spawn_stream_grant_drainer_loop();
+        let retransmit_handle = self.spawn_retransmit_loop();
         let router_handle = match self.router.start() {
             Some(h) => h,
             None => {
@@ -2834,6 +2860,7 @@ impl MeshNode {
             tasks.push(recv_handle);
             tasks.push(heartbeat_handle);
             tasks.push(stream_grant_drainer_handle);
+            tasks.push(retransmit_handle);
             tasks.push(router_handle);
             tasks.push(capability_gc_handle);
             tasks.push(fold_generation_gc_handle);
@@ -3138,6 +3165,8 @@ impl MeshNode {
             fold_router: self.fold_router.clone(),
             #[cfg(feature = "dataforts")]
             greedy_observer: self.greedy_observer.clone(),
+            #[cfg(feature = "dataforts")]
+            blob_transfer_engine: self.blob_transfer_engine.clone(),
             pending_handshakes: self.pending_handshakes.clone(),
             pending_direct_initiators: self.pending_direct_initiators.clone(),
             static_keypair: self.static_keypair.clone(),
@@ -4092,12 +4121,92 @@ impl MeshNode {
                             );
                         } else if let Some(state) = session.try_stream(grant.stream_id) {
                             state.apply_authoritative_grant(grant.total_consumed);
+                            // Prune the retransmit window up to the peer's
+                            // cumulative ack (H-9) — stops acked packets
+                            // from lingering, timing out, and spuriously
+                            // resending (or, post-H-3, spuriously failing).
+                            state.with_reliability(|r| r.on_ack(grant.ack_seq));
                         }
                     }
                     Err(e) => {
                         tracing::debug!(error = %e, "malformed StreamWindow grant");
                     }
                 }
+            }
+            return;
+        }
+
+        // Retransmit NACK (STREAM_RETRANSMIT D-3): the peer is missing
+        // sequences on a stream we're sending it. Pull the matching
+        // retransmit descriptors via `on_nack` and rebuild + resend each
+        // with a FRESH AEAD counter — the descriptor stashed the
+        // pre-encryption inputs precisely so a resend isn't a stale-
+        // counter replay (which the receiver's replay window would
+        // reject). `dispatch_packet` is sync, so encrypt the wire bytes
+        // here (under the session's builder) and hand the awaiting sends
+        // to a spawned task.
+        if parsed.header.subprotocol_id == SUBPROTOCOL_STREAM_NACK {
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+            let mut packets: Vec<Bytes> = Vec::new();
+            for payload in events {
+                let sn = match StreamNack::decode(&payload) {
+                    Ok(sn) => sn,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "malformed StreamNack");
+                        continue;
+                    }
+                };
+                // Don't resurrect a recently-closed stream's send state.
+                if session.is_grant_quarantined(sn.stream_id) {
+                    continue;
+                }
+                let Some(state) = session.try_stream(sn.stream_id) else {
+                    continue;
+                };
+                let nack = super::protocol::NackPayload {
+                    next_expected: sn.next_expected,
+                    missing_bitmap: sn.missing_bitmap,
+                };
+                let descriptors = state.with_reliability(|r| r.on_nack(&nack));
+                if descriptors.is_empty() {
+                    continue;
+                }
+                let pool = session.thread_local_pool();
+                let mut builder = pool.get();
+                for d in &descriptors {
+                    let p = builder.build(d.stream_id, d.seq, &d.events, d.flags);
+                    packets.push(Bytes::copy_from_slice(&p));
+                }
+            }
+            if !packets.is_empty() {
+                let socket = ctx.socket.clone();
+                let dest = parsed.source;
+                tokio::spawn(async move {
+                    for p in packets {
+                        let _ = socket.send_to(&p, dest).await;
+                    }
+                });
+            }
+            return;
+        }
+
+        // Stream reset (STREAM_RETRANSMIT H-3): the sender gave up
+        // retransmitting this stream. Fail any pending blob-transfer read
+        // on it now (distinct error) instead of waiting for the caller's
+        // timeout, and drop the local receive-stream state.
+        if parsed.header.subprotocol_id == SUBPROTOCOL_STREAM_RESET {
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+            for payload in events {
+                let Ok(reset) = StreamReset::decode(&payload) else {
+                    continue;
+                };
+                #[cfg(feature = "dataforts")]
+                if super::dataforts::blob::is_transfer_stream_id(reset.stream_id) {
+                    if let Some(engine) = ctx.blob_transfer_engine.read().as_ref() {
+                        engine.on_reset(reset.stream_id);
+                    }
+                }
+                session.close_stream(reset.stream_id);
             }
             return;
         }
@@ -4182,6 +4291,34 @@ impl MeshNode {
             }
             for payload in events {
                 Self::dispatch_replication_payload(&payload, from_node, router.as_ref());
+            }
+            return;
+        }
+
+        // Blob transfer control plane (FairScheduler transport plan):
+        // a `TransferControl::Request` initiating an on-demand fetch.
+        // The engine spawns a serving task that streams the chunk back
+        // on the requester's transfer stream-id. `None` engine = this
+        // node doesn't serve transfers = drop. The bulk DATA does NOT
+        // ride this subprotocol — it rides reliable event-plane streams
+        // and is diverted to the engine by `is_transfer_stream_id` in
+        // `process_local_packet` (so it gets in-order retransmit).
+        #[cfg(feature = "dataforts")]
+        if parsed.header.subprotocol_id == super::dataforts::blob::SUBPROTOCOL_BLOB_TRANSFER {
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+            if events.is_empty() {
+                return;
+            }
+            let engine_guard = ctx.blob_transfer_engine.read();
+            let Some(engine) = engine_guard.as_ref() else {
+                return;
+            };
+            if from_node == 0 {
+                return;
+            }
+            let stream_id = parsed.header.stream_id;
+            for payload in events {
+                engine.on_request(from_node, stream_id, &payload);
             }
             return;
         }
@@ -4513,7 +4650,13 @@ impl MeshNode {
         // separately slow daemon is still backstopped by the
         // existing shard-queue-depth limits.
         let grant_bytes = {
-            let stream = session.get_or_create_stream(stream_id);
+            // Create the receive-side stream reliable when the packet is
+            // RELIABLE-flagged, so it tracks SACK and can NACK lost
+            // sequences. The sender's reliability is a property of the
+            // traffic (the flag), not the receiver's default_reliable.
+            let reliable_pkt = parsed.header.flags.contains(PacketFlags::RELIABLE);
+            let stream = session
+                .get_or_create_stream_for_packet(stream_id, ctx.default_reliable || reliable_pkt);
             let accepted = stream.with_reliability(|r| r.on_receive(parsed.header.sequence));
             if accepted {
                 stream.update_rx_seq(parsed.header.sequence);
@@ -4728,6 +4871,24 @@ impl MeshNode {
         // event when the observer is installed. The runtime
         // itself spawns a tokio task per event to absorb the
         // async dispatch.
+        // Blob-transfer data divert (FairScheduler transport plan):
+        // reliable event-plane data on a transfer stream-id goes to the
+        // transfer engine's reassembly — NOT the event bus. `on_receive`
+        // deduped + windowed this packet but does NOT order it (it
+        // accepts out-of-order sequences for SACK), so we hand the
+        // engine the packet's `sequence` and it reorders by it (header =
+        // seq 0, data = seq 1..N). The transfer stream-id convention
+        // (bit 61 set, bit 48 clear) makes this a couple of bitops on
+        // the hot path.
+        #[cfg(feature = "dataforts")]
+        if super::dataforts::blob::is_transfer_stream_id(stream_id) {
+            let engine_guard = ctx.blob_transfer_engine.read();
+            if let Some(engine) = engine_guard.as_ref() {
+                engine.on_data(stream_id, parsed.header.sequence, events);
+            }
+            return;
+        }
+
         #[cfg(feature = "dataforts")]
         let greedy = ctx.greedy_observer.read().clone();
 
@@ -4774,6 +4935,15 @@ impl MeshNode {
             None
         };
 
+        // Delivery-order contract (H-8): events are pushed in ARRIVAL
+        // order, each tagged with the packet's `seq`. The reliability
+        // layer guarantees gap-free eventual delivery (retransmit), but
+        // NOT ordering at this point — an out-of-order arrival or a
+        // retransmit lands here in the order it hit the wire. Consumers
+        // needing strict order reassemble by `StoredEvent::seq` (see the
+        // blob-transfer engine's reorder buffer); ones that frame their
+        // own ordering (nRPC keys on EventMeta/call_id) or tolerate
+        // reordering ignore it.
         let queue = inbound.entry(shard_id).or_default();
         let seq = parsed.header.sequence;
         for (i, event_data) in events.into_iter().enumerate() {
@@ -4847,9 +5017,19 @@ impl MeshNode {
                     if partition_filter.contains(&grant.peer_addr) {
                         continue;
                     }
+                    // Piggyback the receiver's cumulative reliable ack
+                    // (next_expected) so the sender prunes its retransmit
+                    // window of everything below it (H-9). 0 for
+                    // non-reliable receive streams.
+                    let ack_seq = grant
+                        .session
+                        .try_stream(stream_id)
+                        .map(|s| s.with_reliability(|r| r.rx_ack_seq()))
+                        .unwrap_or(0);
                     let payload = StreamWindow {
                         stream_id,
                         total_consumed: grant.total_consumed,
+                        ack_seq,
                     }
                     .encode();
                     let pool = grant.session.thread_local_pool();
@@ -4867,8 +5047,161 @@ impl MeshNode {
                         tracing::debug!(error = %e, "StreamWindow grant send failed");
                         continue;
                     }
-                    if let Some(state) = grant.session.try_stream(stream_id) {
+                    // Piggyback a retransmit NACK (STREAM_RETRANSMIT D-2):
+                    // if this stream has gaps, ask the sender to resend the
+                    // missing sequences. Reuses the grant drainer's per-
+                    // stream-per-cycle throttling and peer resolution. A
+                    // grant is enqueued on every accepted packet, so an
+                    // out-of-order arrival (which creates the gap) reliably
+                    // triggers a NACK here; tail loss (no later arrival) is
+                    // covered by the timeout retransmit loop.
+                    let nack = grant.session.try_stream(stream_id).and_then(|state| {
                         state.note_grant_sent();
+                        state.with_reliability(|r| r.build_nack())
+                    });
+                    if let Some(nack) = nack {
+                        let payload = StreamNack {
+                            stream_id,
+                            next_expected: nack.next_expected,
+                            missing_bitmap: nack.missing_bitmap,
+                        }
+                        .encode();
+                        let nseq = grant.session.next_control_tx_seq();
+                        let nevents = vec![Bytes::copy_from_slice(&payload)];
+                        let npacket = builder.build_subprotocol(
+                            CONTROL_STREAM_ID,
+                            nseq,
+                            &nevents,
+                            PacketFlags::NONE,
+                            SUBPROTOCOL_STREAM_NACK,
+                        );
+                        if let Err(e) = socket.send_to(&npacket, grant.peer_addr).await {
+                            tracing::debug!(error = %e, "StreamNack send failed");
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    /// Timeout-driven retransmit (STREAM_RETRANSMIT D-4). Every
+    /// [`RETRANSMIT_TICK`], walk peers' reliable streams for packets whose
+    /// RTO has elapsed and resend them (rebuilt with a fresh AEAD counter,
+    /// sent direct). This recovers tail loss — the NACK path only fires
+    /// when a *later* packet arrives out of order, so the final dropped
+    /// packets of a stream have nothing to trigger a NACK. Descriptors
+    /// past `max_retries` are dropped from the window by `get_timed_out`.
+    fn spawn_retransmit_loop(&self) -> JoinHandle<()> {
+        let peers = self.peers.clone();
+        let socket = self.socket.clone();
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+
+        tokio::spawn(async move {
+            while !shutdown.load(Ordering::Acquire) {
+                tokio::select! {
+                    _ = tokio::time::sleep(RETRANSMIT_TICK) => {}
+                    _ = shutdown_notify.notified() => {
+                        if shutdown.load(Ordering::Acquire) {
+                            break;
+                        }
+                    }
+                }
+
+                // Snapshot the due retransmits per peer WITHOUT holding
+                // the `peers` DashMap guard across the socket awaits
+                // below (that could deadlock against a concurrent peer
+                // insert/remove on the same shard).
+                let mut work: Vec<(
+                    SocketAddr,
+                    Arc<NetSession>,
+                    Vec<Arc<super::RetransmitDescriptor>>,
+                )> = Vec::new();
+                for peer in peers.iter() {
+                    let due = peer.value().session.collect_timed_out_retransmits();
+                    if !due.is_empty() {
+                        work.push((peer.value().addr, peer.value().session.clone(), due));
+                    }
+                }
+                for (addr, session, due) in work {
+                    let pool = session.thread_local_pool();
+                    let mut builder = pool.get();
+                    for d in due {
+                        let packet = builder.build(d.stream_id, d.seq, &d.events, d.flags);
+                        let _ = socket.send_to(&packet, addr).await;
+                    }
+                }
+
+                // H-3: any stream whose reliable layer gave up
+                // retransmitting → tell the peer to fail its pending read
+                // now (a `StreamReset`) instead of stalling to a timeout.
+                let mut resets: Vec<(SocketAddr, Arc<NetSession>, Vec<u64>)> = Vec::new();
+                for peer in peers.iter() {
+                    let failed = peer.value().session.take_failed_stream_ids();
+                    if !failed.is_empty() {
+                        resets.push((peer.value().addr, peer.value().session.clone(), failed));
+                    }
+                }
+                for (addr, session, failed) in resets {
+                    let pool = session.thread_local_pool();
+                    let mut builder = pool.get();
+                    for stream_id in failed {
+                        let payload = StreamReset { stream_id }.encode();
+                        let seq = session.next_control_tx_seq();
+                        let events = vec![Bytes::copy_from_slice(&payload)];
+                        let packet = builder.build_subprotocol(
+                            CONTROL_STREAM_ID,
+                            seq,
+                            &events,
+                            PacketFlags::NONE,
+                            SUBPROTOCOL_STREAM_RESET,
+                        );
+                        let _ = socket.send_to(&packet, addr).await;
+                    }
+                }
+
+                // H-4: receiver-side proactive NACK. Re-request any
+                // persistent gap on a stream we're receiving, so a hole
+                // with no further arrivals (e.g. tail loss, or a sender
+                // paused on credit) recovers within a tick instead of
+                // waiting for the sender's RTO. The grant-piggybacked
+                // NACK only fires on new activity; this covers the quiet
+                // case. Duplicate NACKs are harmless — `on_nack` resends
+                // are bounded by `max_retries` and deduped by the
+                // receiver.
+                // (peer addr, its session, [(stream_id, NACK)…]) per peer.
+                type GapWork = Vec<(
+                    SocketAddr,
+                    Arc<NetSession>,
+                    Vec<(u64, super::protocol::NackPayload)>,
+                )>;
+                let mut gaps: GapWork = Vec::new();
+                for peer in peers.iter() {
+                    let g = peer.value().session.collect_gap_nacks();
+                    if !g.is_empty() {
+                        gaps.push((peer.value().addr, peer.value().session.clone(), g));
+                    }
+                }
+                for (addr, session, g) in gaps {
+                    let pool = session.thread_local_pool();
+                    let mut builder = pool.get();
+                    for (stream_id, nack) in g {
+                        let payload = StreamNack {
+                            stream_id,
+                            next_expected: nack.next_expected,
+                            missing_bitmap: nack.missing_bitmap,
+                        }
+                        .encode();
+                        let seq = session.next_control_tx_seq();
+                        let events = vec![Bytes::copy_from_slice(&payload)];
+                        let packet = builder.build_subprotocol(
+                            CONTROL_STREAM_ID,
+                            seq,
+                            &events,
+                            PacketFlags::NONE,
+                            SUBPROTOCOL_STREAM_NACK,
+                        );
+                        let _ = socket.send_to(&packet, addr).await;
                     }
                 }
             }
@@ -9073,6 +9406,196 @@ impl MeshNode {
     }
 }
 
+#[cfg(feature = "dataforts")]
+impl MeshNode {
+    /// Install the blob-transfer engine over `adapter` (FairScheduler
+    /// transport plan). After this, the node serves on-demand chunk
+    /// fetches (the `SUBPROTOCOL_BLOB_TRANSFER` control branch + the
+    /// transfer-stream data divert route to the engine) and can issue
+    /// them via [`Self::transfer_fetch_chunk`]. Idempotent — re-install
+    /// replaces the engine.
+    pub fn serve_blob_transfer(
+        self: &Arc<Self>,
+        adapter: Arc<super::dataforts::blob::MeshBlobAdapter>,
+    ) {
+        let engine = Arc::new(super::dataforts::blob::transfer::BlobTransferEngine::new(
+            self, adapter,
+        ));
+        *self.blob_transfer_engine.write() = Some(engine);
+    }
+
+    /// Fetch the chunk addressed by `hash` from `holder` over a
+    /// reliable, scheduled transfer stream — bytes move over the
+    /// FairScheduler-managed stream transport, not RedEX replication or
+    /// nRPC. Returns the BLAKE3-verified bytes, or
+    /// [`BlobError::NotFound`] on a holder miss / timeout (so the caller
+    /// can fail over to another advertised holder).
+    ///
+    /// [`BlobError`]: super::dataforts::blob::BlobError
+    /// [`BlobError::NotFound`]: super::dataforts::blob::BlobError::NotFound
+    pub async fn transfer_fetch_chunk(
+        self: &Arc<Self>,
+        holder: u64,
+        hash: [u8; 32],
+    ) -> Result<bytes::Bytes, super::dataforts::blob::BlobError> {
+        use super::dataforts::blob::transfer::{next_transfer_stream_id, TransferControl};
+        use super::dataforts::blob::BlobError;
+
+        let engine = self.blob_transfer_engine.read().clone().ok_or_else(|| {
+            BlobError::Backend("blob transfer: engine not installed (serve_blob_transfer?)".into())
+        })?;
+        let stream_id = next_transfer_stream_id();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        engine.register_pending(stream_id, holder, hash, tx);
+
+        // Open the receive stream RELIABLE up front so it tracks SACK and
+        // NACKs lost sequences. The holder sends RELIABLE data; the
+        // requester must mirror that reliability to recover drops —
+        // otherwise the receive stream (auto-created on first packet, or
+        // by the control send below) defaults to fire-and-forget and
+        // never asks for a retransmit. Receiver-only, so no scheduled
+        // flag / fairness weight is needed.
+        let _ = self.open_stream(
+            holder,
+            stream_id,
+            StreamConfig::new().with_reliability(super::Reliability::Reliable),
+        );
+
+        if let Err(e) = self
+            .send_transfer_control(holder, stream_id, &TransferControl::Request { hash })
+            .await
+        {
+            engine.cancel_pending(stream_id);
+            return Err(BlobError::Backend(format!(
+                "blob transfer: send request failed: {e}"
+            )));
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_canceled)) => {
+                engine.cancel_pending(stream_id);
+                Err(BlobError::Backend(
+                    "blob transfer: engine dropped the reply".into(),
+                ))
+            }
+            Err(_elapsed) => {
+                engine.cancel_pending(stream_id);
+                Err(BlobError::NotFound(format!(
+                    "blob transfer: timed out fetching mesh://{}",
+                    Self::blob_hex(&hash)
+                )))
+            }
+        }
+    }
+
+    /// Fetch the chunk addressed by `hash` from whichever connected
+    /// peer holds it, without the caller naming a holder. Probes peers
+    /// in turn over the transfer transport: a peer that lacks the chunk
+    /// replies `NotFound` promptly (so misses are cheap), and the first
+    /// peer that serves the BLAKE3-verified bytes wins. Returns
+    /// [`BlobError::NotFound`] if no connected peer has it (the caller
+    /// may then fall back to its own backend or fail the read).
+    ///
+    /// This is the usable "fetch by content hash" entry point that
+    /// [`Self::transfer_fetch_chunk`] (which requires a known holder)
+    /// can't be on its own.
+    ///
+    /// **Discovery model (deliberate).** v1 probes connected peers
+    /// directly rather than consulting the capability fold for
+    /// `causal:<hash>` advertisers. The per-chunk `causal:<hex64>` tag
+    /// is a single-datagram advertisement that caps at ~15-20
+    /// chunks/node, so it does not scale as a per-chunk holder index —
+    /// which is exactly why the directory transfer
+    /// ([`super::dataforts::dir`]) pulls from a *known* source instead.
+    /// Probing sidesteps the ceiling entirely: the holder's prompt
+    /// `NotFound` is the membership test. A future optimization can use
+    /// a node-level "serves blobs" capability (one tag, no ceiling) or a
+    /// dedicated zero-byte probe frame to ORDER / prune candidates and
+    /// to stay robust against a silent peer; today each probe is bounded
+    /// by [`DISCOVERY_PROBE_TIMEOUT`] so one unresponsive peer can't
+    /// stall the whole search.
+    ///
+    /// [`BlobError::NotFound`]: super::dataforts::blob::BlobError::NotFound
+    /// [`DISCOVERY_PROBE_TIMEOUT`]: Self::transfer_fetch_chunk_discovered
+    pub async fn transfer_fetch_chunk_discovered(
+        self: &Arc<Self>,
+        hash: [u8; 32],
+    ) -> Result<bytes::Bytes, super::dataforts::blob::BlobError> {
+        use super::dataforts::blob::BlobError;
+
+        // Generous enough for a max-chunk (≤4 MiB) transfer from a
+        // healthy holder, tight enough that a silent peer only costs
+        // this once before the search moves on. A miss returns its
+        // `NotFound` long before this fires.
+        const DISCOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+        let candidates: Vec<u64> = self.peers.iter().map(|e| *e.key()).collect();
+        if candidates.is_empty() {
+            return Err(BlobError::NotFound(format!(
+                "blob transfer: no connected peers to discover mesh://{}",
+                Self::blob_hex(&hash)
+            )));
+        }
+        for peer in candidates {
+            match tokio::time::timeout(
+                DISCOVERY_PROBE_TIMEOUT,
+                self.transfer_fetch_chunk(peer, hash),
+            )
+            .await
+            {
+                // First holder to serve the verified bytes wins.
+                Ok(Ok(bytes)) => return Ok(bytes),
+                // Peer doesn't have it / transient error / went silent —
+                // try the next candidate.
+                Ok(Err(_)) | Err(_) => continue,
+            }
+        }
+        Err(BlobError::NotFound(format!(
+            "blob transfer: no connected peer served mesh://{}",
+            Self::blob_hex(&hash)
+        )))
+    }
+
+    /// Send a blob-transfer control packet (subprotocol-tagged, tiny)
+    /// to `peer` on `stream_id`. Goes straight to the socket — control
+    /// is a single small packet; reliability is the requester's
+    /// timeout-and-retry, not per-packet retransmit.
+    async fn send_transfer_control(
+        &self,
+        peer: u64,
+        stream_id: u64,
+        control: &super::dataforts::blob::transfer::TransferControl,
+    ) -> Result<(), super::AdapterError> {
+        let (dest_addr, session) = match self.peers.get(&peer) {
+            Some(p) => (p.value().addr, p.value().session.clone()),
+            None => {
+                return Err(super::AdapterError::Connection(format!(
+                    "transfer control: no session for {peer:#x}"
+                )))
+            }
+        };
+        let bytes = bytes::Bytes::from(postcard::to_allocvec(control).map_err(|e| {
+            super::AdapterError::Connection(format!("transfer control: encode failed: {e}"))
+        })?);
+        let pool = session.thread_local_pool();
+        let mut builder = pool.get();
+        let seq = session.get_or_create_stream(stream_id).next_tx_seq();
+        let events = [bytes];
+        let packet = builder.build_subprotocol(
+            stream_id,
+            seq,
+            &events,
+            PacketFlags::RELIABLE,
+            super::dataforts::blob::SUBPROTOCOL_BLOB_TRANSFER,
+        );
+        self.socket.send_to(&packet, dest_addr).await.map_err(|e| {
+            super::AdapterError::Connection(format!("transfer control: send failed: {e}"))
+        })?;
+        Ok(())
+    }
+}
+
 #[cfg(feature = "net")]
 impl MeshNode {
     /// Install (or replace) the `SUBPROTOCOL_REDEX` inbound
@@ -9953,6 +10476,38 @@ impl MeshNode {
         }
     }
 
+    /// Close a reliable stream **gracefully** (H-7, `DrainThenClose`):
+    /// wait until the reliability layer has no unacked packets — i.e. the
+    /// receiver has acked everything (with H-9 ack-pruning, `pending`
+    /// empties as grants arrive) — or `timeout` elapses, then close. Use
+    /// after the last bytes of a reliable send so retransmit can still
+    /// fill gaps before teardown; closing eagerly (`close_stream`) drops
+    /// the retransmit window and can strand a lost tail packet on a lossy
+    /// link. A fire-and-forget stream (nothing tracked) drains instantly.
+    pub async fn close_stream_graceful(
+        &self,
+        peer_node_id: u64,
+        stream_id: u64,
+        timeout: Duration,
+    ) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let drained = match self.peers.get(&peer_node_id) {
+                Some(p) => p
+                    .session
+                    .try_stream(stream_id)
+                    .map(|s| !s.with_reliability(|r| r.has_pending()))
+                    .unwrap_or(true), // stream already gone → nothing to drain
+                None => true, // peer gone → nothing to drain
+            };
+            if drained || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        self.close_stream(peer_node_id, stream_id);
+    }
+
     /// Send a batch of events on an explicit stream.
     ///
     /// Uses the stream's reliability mode from its original `open_stream`
@@ -9987,6 +10542,11 @@ impl MeshNode {
 
         let stream_id = stream.stream_id;
         let reliable = stream.config.reliability.is_reliable();
+        // Opt-in: bulk-transfer streams route their originating sends
+        // through the FairScheduler (T-0.5) instead of straight to the
+        // socket, so they participate in per-stream weighted fairness.
+        // Default streams keep the direct path (zero blast radius).
+        let scheduled = stream.config.scheduled;
 
         // Refuse to send on a stream that isn't currently open, OR
         // whose live state has a different epoch than the handle. The
@@ -10000,6 +10560,15 @@ impl MeshNode {
             None => return Err(StreamError::NotConnected),
             Some(state) if state.epoch() != stream.epoch => {
                 return Err(StreamError::NotConnected);
+            }
+            // Congestion gate (H-6): if in-flight is already at the
+            // congestion window, back-pressure — the caller's
+            // `send_with_retry` retries as acks open the window, pacing
+            // the stream to its cwnd under loss. Loss-free streams never
+            // hit this (cwnd grows past the in-flight count), so normal
+            // and low-volume (nRPC) traffic is unaffected.
+            Some(state) if reliable && !state.with_reliability(|r| r.can_send()) => {
+                return Err(StreamError::Backpressure);
             }
             Some(_) => {}
         }
@@ -10050,9 +10619,17 @@ impl MeshNode {
                     TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
                 };
                 let packet = builder.build(stream_id, seq, &current_batch, flags);
-                let send_res = self.socket.send_to(&packet, peer_addr).await;
-                send_res.map_err(|e| StreamError::Transport(format!("send failed: {}", e)))?;
-                guard.commit(); // socket accepted the packet — bytes are the receiver's now
+                self.deliver_stream_packet(scheduled, &packet, peer_addr, stream_id)
+                    .await?;
+                guard.commit(); // accepted (socket or scheduler) — bytes are the receiver's now
+                Self::register_retransmit(
+                    &session,
+                    stream_id,
+                    stream.epoch,
+                    seq,
+                    &current_batch,
+                    flags,
+                );
                 current_batch.clear();
                 current_size = 0;
             }
@@ -10070,14 +10647,105 @@ impl MeshNode {
                     TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
                 };
             let packet = builder.build(stream_id, seq, &current_batch, flags);
-            let send_res = self.socket.send_to(&packet, peer_addr).await;
-            send_res.map_err(|e| StreamError::Transport(format!("send failed: {}", e)))?;
+            self.deliver_stream_packet(scheduled, &packet, peer_addr, stream_id)
+                .await?;
             guard.commit();
+            Self::register_retransmit(
+                &session,
+                stream_id,
+                stream.epoch,
+                seq,
+                &current_batch,
+                flags,
+            );
         }
 
         drop(builder);
         session.touch();
         Ok(())
+    }
+
+    /// Register a just-sent reliable packet for retransmit (STREAM_RETRANSMIT
+    /// plan D-1). Stashing the pre-encryption descriptor (not the wire
+    /// bytes) lets the NACK / timeout retransmit paths rebuild the packet
+    /// with a fresh AEAD counter — a stale-counter replay would be
+    /// rejected by the receiver's replay window. No-op for unreliable
+    /// streams. The epoch guard skips registration if a close+reopen
+    /// raced and replaced the stream state since the credit was acquired.
+    ///
+    /// Clock note (T-4): `on_send` stamps `sent_at = Instant::now()` here,
+    /// at enqueue time. For a `scheduled` stream the packet may then sit
+    /// in the FairScheduler queue before the router's send loop ships it,
+    /// so a deep scheduler backlog starts the RTT/RTO clock slightly
+    /// before the packet is on the wire — biasing the adaptive-RTO sample
+    /// low and risking a marginally early timeout-driven resend. This
+    /// self-corrects (the next clean RTT sample re-converges) and the
+    /// scheduler queue is shallow in practice; stamping at dequeue would
+    /// need the descriptor visible in the router send loop, which it
+    /// isn't, so the enqueue-time stamp is accepted.
+    fn register_retransmit(
+        session: &Arc<NetSession>,
+        stream_id: u64,
+        epoch: u64,
+        seq: u64,
+        events: &[Bytes],
+        flags: PacketFlags,
+    ) {
+        if !flags.contains(PacketFlags::RELIABLE) {
+            return;
+        }
+        let descriptor = Arc::new(super::RetransmitDescriptor {
+            seq,
+            stream_id,
+            events: events.to_vec(),
+            flags,
+        });
+        if let Some(state) = session.try_stream(stream_id) {
+            if state.epoch() == epoch {
+                state.with_reliability(|r| r.on_send(descriptor));
+            }
+        }
+    }
+
+    /// Deliver one built stream packet, either straight to the socket
+    /// (the default direct path) or — when the stream is `scheduled`
+    /// (T-0.5) — by enqueueing it on the router's
+    /// [`FairScheduler`](super::router::FairScheduler) so the router's
+    /// send loop ships it under per-stream weighted fairness.
+    ///
+    /// A full scheduler queue surfaces as [`StreamError::Backpressure`]
+    /// (same shape as a tx-credit `WindowFull`), so `send_with_retry`
+    /// rides it. Scheduled sends pay one `Bytes` copy (the build pool
+    /// buffer is reused after the call); bulk transfer absorbs it.
+    async fn deliver_stream_packet(
+        &self,
+        scheduled: bool,
+        packet: &[u8],
+        peer_addr: SocketAddr,
+        stream_id: u64,
+    ) -> Result<(), StreamError> {
+        if scheduled {
+            let queued = super::router::QueuedPacket {
+                data: Bytes::copy_from_slice(packet),
+                dest: peer_addr,
+                stream_id,
+                // Bulk data rides non-priority; the scheduler's
+                // priority lane is reserved for control/interactive.
+                priority: false,
+                queued_at: std::time::Instant::now(),
+            };
+            if self.router.scheduler().enqueue(queued) {
+                Ok(())
+            } else {
+                Err(StreamError::Backpressure)
+            }
+        } else {
+            self.socket
+                .send_to(packet, peer_addr)
+                .await
+                .map(|_| ())
+                .map_err(|e| StreamError::Transport(format!("send failed: {}", e)))
+        }
     }
 
     /// Send `events` on `stream`, retrying on `Backpressure` with
