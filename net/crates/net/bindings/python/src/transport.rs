@@ -51,6 +51,20 @@ fn map_blob_err(e: InnerBlobError) -> PyErr {
     TransferError::new_err(format!("{e}"))
 }
 
+/// Like [`map_blob_err`], but for holder-discovery fetches. The
+/// substrate reports "no connected peer served it" as a bare
+/// `NotFound`; re-tag it as "all peers failed" so the message
+/// distinguishes it from a named-holder miss — mirroring the Rust SDK's
+/// `TransferError::AllPeersFailed` and the C/Go `all-peers-failed` code.
+fn map_discovered_blob_err(e: InnerBlobError) -> PyErr {
+    match e {
+        InnerBlobError::NotFound(m) => {
+            TransferError::new_err(format!("all peers failed: {m}"))
+        }
+        other => map_blob_err(other),
+    }
+}
+
 fn map_dir_err(e: InnerDirError) -> PyErr {
     TransferError::new_err(format!("{e}"))
 }
@@ -280,7 +294,7 @@ fn fetch_blob_discovered<'py>(
             }
         })
     });
-    let bytes = result.map_err(map_blob_err)?;
+    let bytes = result.map_err(map_discovered_blob_err)?;
     Ok(PyBytes::new(py, &bytes))
 }
 

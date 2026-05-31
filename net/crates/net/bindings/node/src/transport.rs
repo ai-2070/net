@@ -177,6 +177,20 @@ fn transfer_blob_err(e: InnerBlobError) -> Error {
     Error::from_reason(format!("transfer: {e}"))
 }
 
+/// Like [`transfer_blob_err`], but for holder-discovery fetches. The
+/// substrate reports "no connected peer served it" as a bare
+/// `NotFound`; re-tag it as "all peers failed" so the message
+/// distinguishes it from a named-holder miss — mirroring the Rust SDK's
+/// `TransferError::AllPeersFailed` and the C/Go `all-peers-failed` code.
+fn transfer_discovered_blob_err(e: InnerBlobError) -> Error {
+    match e {
+        InnerBlobError::NotFound(m) => {
+            Error::from_reason(format!("transfer: all peers failed: {m}"))
+        }
+        other => transfer_blob_err(other),
+    }
+}
+
 fn transfer_dir_err(e: InnerDirError) -> Error {
     Error::from_reason(format!("transfer: {e}"))
 }
@@ -270,7 +284,7 @@ impl NetMesh {
         let blob_ref = blob_ref.as_inner().clone();
         let bytes = fetch_blob_bytes_discovered(&node, &blob_ref)
             .await
-            .map_err(transfer_blob_err)?;
+            .map_err(transfer_discovered_blob_err)?;
         Ok(Buffer::from(bytes))
     }
 
@@ -304,5 +318,33 @@ impl NetMesh {
             files: BigInt::from(stats.files as u64),
             bytes: BigInt::from(stats.bytes),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovered_not_found_is_retagged_all_peers_failed() {
+        // A discovery NotFound must read as "all peers failed", distinct
+        // from the named-holder "not found" a plain fetch surfaces.
+        let e = transfer_discovered_blob_err(InnerBlobError::NotFound("hash xyz".into()));
+        assert_eq!(e.reason, "transfer: all peers failed: hash xyz");
+        // A plain fetch keeps the bare not-found message.
+        let plain = transfer_blob_err(InnerBlobError::NotFound("hash xyz".into()));
+        assert!(plain.reason.contains("not found"));
+        assert!(!plain.reason.contains("all peers failed"));
+    }
+
+    #[test]
+    fn discovered_non_not_found_falls_through_unchanged() {
+        // Non-NotFound errors are not re-tagged — they map identically
+        // through both paths.
+        let backend = || InnerBlobError::Backend("boom".into());
+        assert_eq!(
+            transfer_discovered_blob_err(backend()).reason,
+            transfer_blob_err(backend()).reason
+        );
     }
 }
