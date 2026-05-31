@@ -89,6 +89,13 @@ const PACKET_WIRE_OVERHEAD: usize = HEADER_SIZE + TAG_SIZE;
 /// `PERF_AUDIT_2026_05_19_NRPC.md`.
 const STREAM_GRANT_DRAIN_INTERVAL: Duration = Duration::from_millis(1);
 
+/// Tick interval for the timeout-driven retransmit loop (STREAM_RETRANSMIT
+/// D-4). Half the reliability RTO (`ReliableStream::DEFAULT_RTO`, 50 ms)
+/// so a timed-out packet is resent within ~1 RTO. This backstops tail
+/// loss — the last packets dropped, with no later arrival to trigger a
+/// receiver NACK.
+const RETRANSMIT_TICK: Duration = Duration::from_millis(25);
+
 /// One entry in the per-mesh pending-grant queue. Captures the
 /// AEAD session (for cipher + packet pool + next_control_tx_seq)
 /// and the peer's wire address. The receive path already has both
@@ -115,7 +122,9 @@ use super::router::{NetRouter, RouterConfig};
 use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subnet::{DropReason, SubnetGateway, SubnetId, SubnetPolicy};
-use super::subprotocol::stream_window::{StreamWindow, SUBPROTOCOL_STREAM_WINDOW};
+use super::subprotocol::stream_window::{
+    StreamNack, StreamWindow, SUBPROTOCOL_STREAM_NACK, SUBPROTOCOL_STREAM_WINDOW,
+};
 use super::subprotocol::MigrationSubprotocolHandler;
 use super::transport::{NetSocket, PacketReceiver, ParsedPacket, SocketBufferConfig};
 use super::Visibility;
@@ -2772,6 +2781,7 @@ impl MeshNode {
         let recv_handle = self.spawn_receive_loop();
         let heartbeat_handle = self.spawn_heartbeat_loop();
         let stream_grant_drainer_handle = self.spawn_stream_grant_drainer_loop();
+        let retransmit_handle = self.spawn_retransmit_loop();
         let router_handle = match self.router.start() {
             Some(h) => h,
             None => {
@@ -2851,6 +2861,7 @@ impl MeshNode {
             tasks.push(recv_handle);
             tasks.push(heartbeat_handle);
             tasks.push(stream_grant_drainer_handle);
+            tasks.push(retransmit_handle);
             tasks.push(router_handle);
             tasks.push(capability_gc_handle);
             tasks.push(fold_generation_gc_handle);
@@ -4121,6 +4132,60 @@ impl MeshNode {
             return;
         }
 
+        // Retransmit NACK (STREAM_RETRANSMIT D-3): the peer is missing
+        // sequences on a stream we're sending it. Pull the matching
+        // retransmit descriptors via `on_nack` and rebuild + resend each
+        // with a FRESH AEAD counter — the descriptor stashed the
+        // pre-encryption inputs precisely so a resend isn't a stale-
+        // counter replay (which the receiver's replay window would
+        // reject). `dispatch_packet` is sync, so encrypt the wire bytes
+        // here (under the session's builder) and hand the awaiting sends
+        // to a spawned task.
+        if parsed.header.subprotocol_id == SUBPROTOCOL_STREAM_NACK {
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+            let mut packets: Vec<Bytes> = Vec::new();
+            for payload in events {
+                let sn = match StreamNack::decode(&payload) {
+                    Ok(sn) => sn,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "malformed StreamNack");
+                        continue;
+                    }
+                };
+                // Don't resurrect a recently-closed stream's send state.
+                if session.is_grant_quarantined(sn.stream_id) {
+                    continue;
+                }
+                let Some(state) = session.try_stream(sn.stream_id) else {
+                    continue;
+                };
+                let nack = super::protocol::NackPayload {
+                    next_expected: sn.next_expected,
+                    missing_bitmap: sn.missing_bitmap,
+                };
+                let descriptors = state.with_reliability(|r| r.on_nack(&nack));
+                if descriptors.is_empty() {
+                    continue;
+                }
+                let pool = session.thread_local_pool();
+                let mut builder = pool.get();
+                for d in &descriptors {
+                    let p = builder.build(d.stream_id, d.seq, &d.events, d.flags);
+                    packets.push(Bytes::copy_from_slice(&p));
+                }
+            }
+            if !packets.is_empty() {
+                let socket = ctx.socket.clone();
+                let dest = parsed.source;
+                tokio::spawn(async move {
+                    for p in packets {
+                        let _ = socket.send_to(&p, dest).await;
+                    }
+                });
+            }
+            return;
+        }
+
         // Channel membership: Subscribe / Unsubscribe / Ack.
         //
         // Iterate every event in the frame. `events.into_iter()
@@ -4560,7 +4625,13 @@ impl MeshNode {
         // separately slow daemon is still backstopped by the
         // existing shard-queue-depth limits.
         let grant_bytes = {
-            let stream = session.get_or_create_stream(stream_id);
+            // Create the receive-side stream reliable when the packet is
+            // RELIABLE-flagged, so it tracks SACK and can NACK lost
+            // sequences. The sender's reliability is a property of the
+            // traffic (the flag), not the receiver's default_reliable.
+            let reliable_pkt = parsed.header.flags.contains(PacketFlags::RELIABLE);
+            let stream = session
+                .get_or_create_stream_for_packet(stream_id, ctx.default_reliable || reliable_pkt);
             let accepted = stream.with_reliability(|r| r.on_receive(parsed.header.sequence));
             if accepted {
                 stream.update_rx_seq(parsed.header.sequence);
@@ -4932,8 +5003,88 @@ impl MeshNode {
                         tracing::debug!(error = %e, "StreamWindow grant send failed");
                         continue;
                     }
-                    if let Some(state) = grant.session.try_stream(stream_id) {
-                        state.note_grant_sent();
+                    // Piggyback a retransmit NACK (STREAM_RETRANSMIT D-2):
+                    // if this stream has gaps, ask the sender to resend the
+                    // missing sequences. Reuses the grant drainer's per-
+                    // stream-per-cycle throttling and peer resolution. A
+                    // grant is enqueued on every accepted packet, so an
+                    // out-of-order arrival (which creates the gap) reliably
+                    // triggers a NACK here; tail loss (no later arrival) is
+                    // covered by the timeout retransmit loop.
+                    let nack = grant
+                        .session
+                        .try_stream(stream_id)
+                        .and_then(|state| {
+                            state.note_grant_sent();
+                            state.with_reliability(|r| r.build_nack())
+                        });
+                    if let Some(nack) = nack {
+                        let payload = StreamNack {
+                            stream_id,
+                            next_expected: nack.next_expected,
+                            missing_bitmap: nack.missing_bitmap,
+                        }
+                        .encode();
+                        let nseq = grant.session.next_control_tx_seq();
+                        let nevents = vec![Bytes::copy_from_slice(&payload)];
+                        let npacket = builder.build_subprotocol(
+                            CONTROL_STREAM_ID,
+                            nseq,
+                            &nevents,
+                            PacketFlags::NONE,
+                            SUBPROTOCOL_STREAM_NACK,
+                        );
+                        if let Err(e) = socket.send_to(&npacket, grant.peer_addr).await {
+                            tracing::debug!(error = %e, "StreamNack send failed");
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    /// Timeout-driven retransmit (STREAM_RETRANSMIT D-4). Every
+    /// [`RETRANSMIT_TICK`], walk peers' reliable streams for packets whose
+    /// RTO has elapsed and resend them (rebuilt with a fresh AEAD counter,
+    /// sent direct). This recovers tail loss — the NACK path only fires
+    /// when a *later* packet arrives out of order, so the final dropped
+    /// packets of a stream have nothing to trigger a NACK. Descriptors
+    /// past `max_retries` are dropped from the window by `get_timed_out`.
+    fn spawn_retransmit_loop(&self) -> JoinHandle<()> {
+        let peers = self.peers.clone();
+        let socket = self.socket.clone();
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+
+        tokio::spawn(async move {
+            while !shutdown.load(Ordering::Acquire) {
+                tokio::select! {
+                    _ = tokio::time::sleep(RETRANSMIT_TICK) => {}
+                    _ = shutdown_notify.notified() => {
+                        if shutdown.load(Ordering::Acquire) {
+                            break;
+                        }
+                    }
+                }
+
+                // Snapshot the due retransmits per peer WITHOUT holding
+                // the `peers` DashMap guard across the socket awaits
+                // below (that could deadlock against a concurrent peer
+                // insert/remove on the same shard).
+                let mut work: Vec<(SocketAddr, Arc<NetSession>, Vec<Arc<super::RetransmitDescriptor>>)> =
+                    Vec::new();
+                for peer in peers.iter() {
+                    let due = peer.value().session.collect_timed_out_retransmits();
+                    if !due.is_empty() {
+                        work.push((peer.value().addr, peer.value().session.clone(), due));
+                    }
+                }
+                for (addr, session, due) in work {
+                    let pool = session.thread_local_pool();
+                    let mut builder = pool.get();
+                    for d in due {
+                        let packet = builder.build(d.stream_id, d.seq, &d.events, d.flags);
+                        let _ = socket.send_to(&packet, addr).await;
                     }
                 }
             }
@@ -9180,6 +9331,19 @@ impl MeshNode {
         let (tx, rx) = tokio::sync::oneshot::channel();
         engine.register_pending(stream_id, holder, hash, tx);
 
+        // Open the receive stream RELIABLE up front so it tracks SACK and
+        // NACKs lost sequences. The holder sends RELIABLE data; the
+        // requester must mirror that reliability to recover drops —
+        // otherwise the receive stream (auto-created on first packet, or
+        // by the control send below) defaults to fire-and-forget and
+        // never asks for a retransmit. Receiver-only, so no scheduled
+        // flag / fairness weight is needed.
+        let _ = self.open_stream(
+            holder,
+            stream_id,
+            StreamConfig::new().with_reliability(super::Reliability::Reliable),
+        );
+
         if let Err(e) = self
             .send_transfer_control(holder, stream_id, &TransferControl::Request { hash })
             .await
@@ -10301,6 +10465,7 @@ impl MeshNode {
                 self.deliver_stream_packet(scheduled, &packet, peer_addr, stream_id)
                     .await?;
                 guard.commit(); // accepted (socket or scheduler) — bytes are the receiver's now
+                Self::register_retransmit(&session, stream_id, stream.epoch, seq, &current_batch, flags);
                 current_batch.clear();
                 current_size = 0;
             }
@@ -10321,11 +10486,43 @@ impl MeshNode {
             self.deliver_stream_packet(scheduled, &packet, peer_addr, stream_id)
                 .await?;
             guard.commit();
+            Self::register_retransmit(&session, stream_id, stream.epoch, seq, &current_batch, flags);
         }
 
         drop(builder);
         session.touch();
         Ok(())
+    }
+
+    /// Register a just-sent reliable packet for retransmit (STREAM_RETRANSMIT
+    /// plan D-1). Stashing the pre-encryption descriptor (not the wire
+    /// bytes) lets the NACK / timeout retransmit paths rebuild the packet
+    /// with a fresh AEAD counter — a stale-counter replay would be
+    /// rejected by the receiver's replay window. No-op for unreliable
+    /// streams. The epoch guard skips registration if a close+reopen
+    /// raced and replaced the stream state since the credit was acquired.
+    fn register_retransmit(
+        session: &Arc<NetSession>,
+        stream_id: u64,
+        epoch: u64,
+        seq: u64,
+        events: &[Bytes],
+        flags: PacketFlags,
+    ) {
+        if !flags.contains(PacketFlags::RELIABLE) {
+            return;
+        }
+        let descriptor = Arc::new(super::RetransmitDescriptor {
+            seq,
+            stream_id,
+            events: events.to_vec(),
+            flags,
+        });
+        if let Some(state) = session.try_stream(stream_id) {
+            if state.epoch() == epoch {
+                state.with_reliability(|r| r.on_send(descriptor));
+            }
+        }
     }
 
     /// Deliver one built stream packet, either straight to the socket

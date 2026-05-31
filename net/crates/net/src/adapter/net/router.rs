@@ -402,6 +402,12 @@ pub struct NetRouter {
     bytes_forwarded: AtomicU64,
     total_latency_ns: AtomicU64,
     latency_samples: AtomicU64,
+    /// Test-only fault injection: when `> 0`, the send loop drops every
+    /// Nth dequeued (scheduled) packet instead of sending it, simulating
+    /// link loss for reliability tests. `0` (default) disables it — one
+    /// relaxed load per send, negligible. Shared into the send-loop task.
+    test_drop_every_n: Arc<AtomicU64>,
+    test_drop_counter: Arc<AtomicU64>,
 }
 
 impl NetRouter {
@@ -428,7 +434,16 @@ impl NetRouter {
             bytes_forwarded: AtomicU64::new(0),
             total_latency_ns: AtomicU64::new(0),
             latency_samples: AtomicU64::new(0),
+            test_drop_every_n: Arc::new(AtomicU64::new(0)),
+            test_drop_counter: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Test-only: drop every `n`th dequeued (scheduled) packet in the
+    /// send loop to simulate link loss. `0` disables. Used by reliability
+    /// / retransmit tests; has no effect on the default (`0`) path.
+    pub fn set_test_drop_every_n(&self, n: u64) {
+        self.test_drop_every_n.store(n, Ordering::Relaxed);
     }
 
     /// Get local address
@@ -624,11 +639,20 @@ impl NetRouter {
         let socket = self.socket.clone();
         let scheduler = self.scheduler.clone();
         let running = self.running.clone();
+        let drop_every_n = self.test_drop_every_n.clone();
+        let drop_counter = self.test_drop_counter.clone();
 
         Some(tokio::spawn(async move {
             while running.load(Ordering::Acquire) {
                 // Dequeue and send
                 if let Some(packet) = scheduler.dequeue() {
+                    // Test-only loss injection: drop every Nth packet.
+                    let n = drop_every_n.load(Ordering::Relaxed);
+                    if n > 0
+                        && drop_counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1) % n == 0
+                    {
+                        continue; // simulated drop — never hits the wire
+                    }
                     let _ = socket.send_to(&packet.data, packet.dest).await;
                 } else {
                     // Wait for new packets (with timeout).

@@ -526,16 +526,29 @@ async fn serve_chunk(
         }
     }
 
-    // Reclaim the serving stream once we've finished sending (or bailed).
-    // The already-enqueued scheduler packets reach the receiver
-    // regardless of session-stream state, so closing here doesn't drop
-    // bytes on the loss-free local path — it just stops the serving node
-    // from leaking one live stream per served chunk until the 300 s idle
-    // timeout (the symmetric half of the receive-side close, and what
-    // makes directory-scale fan-out not exhaust memory). A FIN + ack-
-    // tracked close that stays correct under mid-transfer loss on a lossy
-    // link is a follow-up; localhost-scale transfer doesn't exercise
-    // retransmit.
+    // Keep the stream — and its retransmit descriptors — alive until the
+    // receiver has acked every sent byte, so NACK-driven resends can fill
+    // any gaps (closing earlier tears down the retransmit window before a
+    // NACK round-trip, which is exactly what made lossy transfers hang).
+    // The receiver's `StreamWindow` grants refund tx credit as it
+    // consumes; `tx_credit_remaining == tx_window` means nothing is
+    // outstanding. Then reclaim the stream — without this wait it would
+    // leak one live stream per chunk until the 300 s idle timeout
+    // (directory-scale fan-out would exhaust memory). Bounded by
+    // `TRANSFER_TIMEOUT` so a vanished receiver can't pin the stream.
+    let deadline = std::time::Instant::now() + TRANSFER_TIMEOUT;
+    loop {
+        match mesh.stream_stats(requester, stream_id) {
+            // Fully acked (or backpressure disabled) → safe to close.
+            Some(s) if s.tx_window == 0 || s.tx_credit_remaining >= s.tx_window => break,
+            Some(_) => {}
+            None => break, // stream already gone (closed / evicted)
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
     mesh.close_stream(requester, stream_id);
 }
 

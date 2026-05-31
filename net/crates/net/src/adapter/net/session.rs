@@ -19,7 +19,7 @@ use super::crypto::{PacketCipher, SessionKeys};
 // `SharedPacketPool` is intentionally absent — `NetSession` uses
 // only `SharedLocalPool` as the single TX-side AEAD source.
 use super::pool::SharedLocalPool;
-use super::reliability::{create_reliability_mode, ReliabilityMode};
+use super::reliability::{create_reliability_mode, ReliabilityMode, RetransmitDescriptor};
 use super::stream::DEFAULT_STREAM_WINDOW_BYTES;
 use super::transport::ParsedPacket;
 
@@ -233,6 +233,40 @@ impl NetSession {
         self.streams
             .entry(stream_id)
             .or_insert_with(|| StreamState::new(self.default_reliable))
+    }
+
+    /// Like [`Self::get_or_create_stream`], but the receiver-side stream
+    /// is created reliable when the arriving packet is `RELIABLE`-flagged
+    /// — the sender's reliability is a property of the traffic, not of
+    /// the receiver's `default_reliable`. Without this the auto-created
+    /// receive stream is `FireAndForget` and never builds a NACK, so a
+    /// reliable sender's lost packets are unrecoverable. Only affects the
+    /// reliability mode at first-touch (creation); an existing stream
+    /// keeps its mode.
+    pub fn get_or_create_stream_for_packet(
+        &self,
+        stream_id: u64,
+        reliable: bool,
+    ) -> dashmap::mapref::one::RefMut<'_, u64, StreamState> {
+        self.streams
+            .entry(stream_id)
+            .or_insert_with(|| StreamState::new(reliable))
+    }
+
+    /// Collect retransmit descriptors for every reliable stream whose
+    /// oldest unacked packet has exceeded its RTO. Drives the timeout
+    /// backstop (STREAM_RETRANSMIT D-4) that recovers tail loss — the
+    /// last packets dropped, with no later arrival to trigger a
+    /// receiver NACK. Each call advances the per-packet retry clock, so
+    /// a descriptor isn't re-emitted until another RTO elapses, and a
+    /// packet past `max_retries` is dropped from the window.
+    pub fn collect_timed_out_retransmits(&self) -> Vec<Arc<RetransmitDescriptor>> {
+        let mut out = Vec::new();
+        for entry in self.streams.iter() {
+            let mut due = entry.value().with_reliability(|r| r.get_timed_out());
+            out.append(&mut due);
+        }
+        out
     }
 
     /// Look up stream state without creating it. Returns `None` if the
