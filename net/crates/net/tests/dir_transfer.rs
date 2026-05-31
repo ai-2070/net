@@ -19,8 +19,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use net::adapter::net::dataforts::blob::MeshBlobAdapter;
-use net::adapter::net::dataforts::dir::{fetch_dir, store_dir};
+use net::adapter::net::dataforts::blob::{
+    chunk_payload, BlobAdapter, BlobRef, Encoding, MeshBlobAdapter,
+};
+use net::adapter::net::dataforts::dir::{
+    fetch_dir, store_dir, DirEntry, DirManifest, EntryKind, DIR_MANIFEST_VERSION,
+};
 use net::adapter::net::redex::Redex;
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
@@ -504,4 +508,216 @@ async fn directory_transfer_large_multichunk_file() {
         read_tree(src.path()),
         "multi-chunk file + sibling reconstruct byte-for-byte"
     );
+}
+
+// ── Atomic reconstruction (FETCH_DIR_ATOMIC_PLAN) ───────────────────
+
+/// Lowercase-hex of a 32-byte hash.
+fn hex32(h: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(64);
+    for b in h {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Store a hand-crafted manifest as a blob on `adapter` and return its
+/// ref — lets a test drive `fetch_dir` with a manifest that `store_dir`
+/// would never emit (e.g. one whose entry path escapes the destination,
+/// to deterministically fail reconstruction after the temp dir exists).
+async fn store_manifest(adapter: &MeshBlobAdapter, manifest: &DirManifest) -> BlobRef {
+    let bytes = postcard::to_allocvec(manifest).unwrap();
+    let hash: [u8; 32] = blake3::hash(&bytes).into();
+    let chunked = chunk_payload(&bytes).unwrap();
+    let blob_ref = chunked
+        .into_blob_ref(format!("mesh://{}", hex32(&hash)), Encoding::Replicated)
+        .unwrap();
+    adapter.store(&blob_ref, &bytes).await.unwrap();
+    blob_ref
+}
+
+/// Names under `parent` that look like `fetch_dir` temp/backup orphans
+/// for destination `base` (`.<base>.fetch_*` / `.<base>.replaced_*`).
+fn temp_orphans(parent: &Path, base: &str) -> Vec<String> {
+    let fetch_pfx = format!(".{base}.fetch_");
+    let repl_pfx = format!(".{base}.replaced_");
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(parent) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&fetch_pfx) || name.starts_with(&repl_pfx) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// Successful replacement installs the new tree AND drops files from a
+/// previous version that aren't in the new manifest (no stale-file
+/// accumulation), leaving no temp/backup orphans.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fetch_dir_replaces_and_removes_stale_files() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_b, &node_a).await;
+    let a_id = node_a.node_id();
+
+    let adapter_a = Arc::new(MeshBlobAdapter::new("a", Arc::new(Redex::new())));
+    node_a.serve_blob_transfer(adapter_a.clone());
+    node_b.serve_blob_transfer(Arc::new(MeshBlobAdapter::new("b", Arc::new(Redex::new()))));
+
+    // v1 = {a.txt: "A1", b.txt: "B1"}.
+    let src1 = TempDir::new("src1");
+    write(src1.path(), "a.txt", b"A1");
+    write(src1.path(), "b.txt", b"B1");
+    let m1 = store_dir(&adapter_a, src1.path()).await.expect("store v1");
+
+    // v2 = {a.txt: "A2"} only.
+    let src2 = TempDir::new("src2");
+    write(src2.path(), "a.txt", b"A2");
+    let m2 = store_dir(&adapter_a, src2.path()).await.expect("store v2");
+
+    let parent = TempDir::new("parent");
+    let dest = parent.path().join("dest");
+
+    fetch_dir(&node_b, a_id, &m1, &dest, 0).await.expect("fetch v1");
+    assert_eq!(
+        read_tree(&dest).keys().cloned().collect::<Vec<_>>(),
+        vec!["a.txt".to_string(), "b.txt".to_string()],
+        "v1 has both files"
+    );
+
+    fetch_dir(&node_b, a_id, &m2, &dest, 0).await.expect("fetch v2");
+    let got = read_tree(&dest);
+    assert_eq!(
+        got.keys().cloned().collect::<Vec<_>>(),
+        vec!["a.txt".to_string()],
+        "stale b.txt removed by the atomic replace"
+    );
+    assert_eq!(got.get("a.txt").map(Vec::as_slice), Some(&b"A2"[..]), "new content");
+    assert!(
+        temp_orphans(parent.path(), "dest").is_empty(),
+        "no temp/backup orphans after a successful replace"
+    );
+}
+
+/// A failure mid-reconstruction (here: an unsafe manifest path, which
+/// fails after the temp dir is created) leaves an existing `dest`
+/// byte-for-byte untouched and removes the temp tree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fetch_dir_failure_preserves_existing_dest() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_b, &node_a).await;
+    let a_id = node_a.node_id();
+
+    let adapter_a = Arc::new(MeshBlobAdapter::new("a", Arc::new(Redex::new())));
+    node_a.serve_blob_transfer(adapter_a.clone());
+    node_b.serve_blob_transfer(Arc::new(MeshBlobAdapter::new("b", Arc::new(Redex::new()))));
+
+    // Seed `dest` with a known good tree.
+    let src = TempDir::new("src");
+    write(src.path(), "keep.txt", b"original");
+    let m_good = store_dir(&adapter_a, src.path()).await.expect("store good");
+    let parent = TempDir::new("parent");
+    let dest = parent.path().join("dest");
+    fetch_dir(&node_b, a_id, &m_good, &dest, 0).await.expect("seed dest");
+    let before = read_tree(&dest);
+
+    // A manifest whose entry escapes the destination root → reconstruction
+    // fails (UnsafePath) after the temp dir is created.
+    let bad = DirManifest {
+        version: DIR_MANIFEST_VERSION,
+        entries: vec![DirEntry {
+            path: "../escape.txt".into(),
+            kind: EntryKind::File {
+                mode: 0o644,
+                blob: BlobRef::small("mesh://x", [0xAB; 32], 4).encode(),
+            },
+        }],
+    };
+    let m_bad = store_manifest(&adapter_a, &bad).await;
+
+    let err = fetch_dir(&node_b, a_id, &m_bad, &dest, 0).await;
+    assert!(err.is_err(), "unsafe manifest path must fail the fetch");
+
+    assert_eq!(read_tree(&dest), before, "dest unchanged after the failure");
+    assert!(
+        temp_orphans(parent.path(), "dest").is_empty(),
+        "temp tree cleaned up on failure"
+    );
+}
+
+/// A failure when `dest` did not exist must not leave `dest` (nor any
+/// temp orphan) behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fetch_dir_failure_does_not_create_dest() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_b, &node_a).await;
+    let a_id = node_a.node_id();
+
+    let adapter_a = Arc::new(MeshBlobAdapter::new("a", Arc::new(Redex::new())));
+    node_a.serve_blob_transfer(adapter_a.clone());
+    node_b.serve_blob_transfer(Arc::new(MeshBlobAdapter::new("b", Arc::new(Redex::new()))));
+
+    let bad = DirManifest {
+        version: DIR_MANIFEST_VERSION,
+        entries: vec![DirEntry {
+            path: "../escape.txt".into(),
+            kind: EntryKind::File {
+                mode: 0o644,
+                blob: BlobRef::small("mesh://x", [0xCD; 32], 4).encode(),
+            },
+        }],
+    };
+    let m_bad = store_manifest(&adapter_a, &bad).await;
+
+    let parent = TempDir::new("parent");
+    let dest = parent.path().join("never");
+    assert!(fetch_dir(&node_b, a_id, &m_bad, &dest, 0).await.is_err());
+    assert!(!dest.exists(), "dest must not exist after a failed fetch");
+    assert!(
+        temp_orphans(parent.path(), "never").is_empty(),
+        "no temp orphan after a failed fetch into a fresh dest"
+    );
+}
+
+/// Two concurrent fetches into sibling destinations don't collide on
+/// their temp paths and each reconstructs its own tree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_fetch_into_adjacent_dests() {
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_b, &node_a).await;
+    let a_id = node_a.node_id();
+
+    let adapter_a = Arc::new(MeshBlobAdapter::new("a", Arc::new(Redex::new())));
+    node_a.serve_blob_transfer(adapter_a.clone());
+    node_b.serve_blob_transfer(Arc::new(MeshBlobAdapter::new("b", Arc::new(Redex::new()))));
+
+    let src1 = TempDir::new("src1");
+    write(src1.path(), "x.txt", b"tree-one");
+    let m1 = store_dir(&adapter_a, src1.path()).await.expect("store 1");
+    let src2 = TempDir::new("src2");
+    write(src2.path(), "y.txt", b"tree-two");
+    let m2 = store_dir(&adapter_a, src2.path()).await.expect("store 2");
+
+    let parent = TempDir::new("parent");
+    let dest_a = parent.path().join("a");
+    let dest_b = parent.path().join("b");
+
+    let (r1, r2) = tokio::join!(
+        fetch_dir(&node_b, a_id, &m1, &dest_a, 0),
+        fetch_dir(&node_b, a_id, &m2, &dest_b, 0),
+    );
+    r1.expect("fetch a");
+    r2.expect("fetch b");
+
+    assert_eq!(read_tree(&dest_a), read_tree(src1.path()), "dest_a == src1");
+    assert_eq!(read_tree(&dest_b), read_tree(src2.path()), "dest_b == src2");
+    assert!(temp_orphans(parent.path(), "a").is_empty());
+    assert!(temp_orphans(parent.path(), "b").is_empty());
 }
