@@ -86,6 +86,9 @@ pub const NET_ERR_TRANSFER_INVALID_ARGUMENT: c_int = -209;
 pub const NET_ERR_DIR_INVALID_MANIFEST: c_int = -210;
 /// A manifest entry path escaped the destination root.
 pub const NET_ERR_DIR_PATH_INVALID: c_int = -211;
+// -212 is reserved for a future NET_ERR_DIR_SYMLINK_UNSUPPORTED (planned
+// in TRANSPORT_SDK_PLAN.md but unused today — `DirError` has no symlink
+// variant). Left as a gap so the eventual code keeps its planned value.
 /// Filesystem I/O failed during directory reconstruction.
 pub const NET_ERR_DIR_IO: c_int = -213;
 

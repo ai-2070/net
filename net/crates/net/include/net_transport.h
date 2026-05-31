@@ -83,6 +83,9 @@ extern "C" {
 #define NET_ERR_TRANSFER_INVALID_ARGUMENT   -209  /* bad path / oversize length / etc. */
 #define NET_ERR_DIR_INVALID_MANIFEST        -210  /* manifest decode / version failure */
 #define NET_ERR_DIR_PATH_INVALID            -211  /* manifest entry escaped dest root  */
+/* -212 is reserved for a future NET_ERR_DIR_SYMLINK_UNSUPPORTED (planned
+ * in TRANSPORT_SDK_PLAN.md but unused today — DirError has no symlink
+ * variant). Left as a gap so the eventual code keeps its planned value. */
 #define NET_ERR_DIR_IO                      -213  /* filesystem I/O failed on fetch    */
 
 /* ── Shared opaque handles (defined identically in net.go.h) ──────── *
