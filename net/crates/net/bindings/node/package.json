@@ -1,6 +1,6 @@
 {
   "name": "@net-mesh/core",
-  "version": "0.25.2",
+  "version": "0.27.0",
   "description": "High-performance, schema-agnostic event bus for AI runtime workloads",
   "main": "index.js",
   "types": "index.d.ts",
