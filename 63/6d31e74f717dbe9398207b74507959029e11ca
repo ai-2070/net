@@ -1,0 +1,28 @@
+net/crates/net/src/adapter/net/dataforts/dir.rs
+  s_2bfa2af80cf7fe::t_fd543aba66beda 635
+  s_2bfa2af80cf7fe::t_b593d621d19113 552-568,570
+  s_2bfa2af80cf7fe::t_8129ff53911144 589
+  s_2bfa2af80cf7fe::t_45c81042e98909 337-340,343-371,390-420,428,440-441,443,475,491,537,569,571-588,590-634,636-660
+net/crates/net/Cargo.toml
+  s_2bfa2af80cf7fe::t_53fed189838e97 319-323
+net/crates/net/tests/dir_transfer.rs
+  s_2bfa2af80cf7fe::t_5c2bd58bf4197e 512-723
+  s_2bfa2af80cf7fe::t_ed29b9ab086691 25-27
+  s_2bfa2af80cf7fe::t_b323dba1ac25bb 22-24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "636d31e74f717dbe9398207b74507959029e11ca",
+  "prompts": {},
+  "sessions": {
+    "s_2bfa2af80cf7fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f0709c4d-be5c-4dfc-a42e-ab0b2c117aa5",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
