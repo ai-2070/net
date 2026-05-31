@@ -1,0 +1,25 @@
+net/crates/net/docs/plans/FAIRSCHEDULER_TRANSPORT_PLAN.md
+  s_3813c1cf893940::t_c82d702d9f04a1 173-180
+  s_3813c1cf893940::t_b26aa62001d151 33-43
+  s_3813c1cf893940::t_ccbb2e14121c77 67,69,71
+  s_3813c1cf893940::t_c273eaadb2d3f7 77,81
+  s_3813c1cf893940::t_07d89f186d2949 15,21-29
+  s_3813c1cf893940::t_07c597dc062610 112
+  s_3813c1cf893940::t_869ff2a1208064 170-172
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "e0417028795f89daf7bfed5a08b4f0db4888a3a1",
+  "prompts": {},
+  "sessions": {
+    "s_3813c1cf893940": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8f529043-9c28-441a-89cc-3de50f96f588",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
