@@ -954,6 +954,15 @@ pub struct PyMeshBlobAdapter {
     id: String,
 }
 
+impl PyMeshBlobAdapter {
+    /// Clone the inner `Arc<MeshBlobAdapter>` for the sibling transport
+    /// bindings (`crate::transport`), which install it as the node's
+    /// transfer engine / pass it to `store_dir`.
+    pub(crate) fn inner_arc(&self) -> Arc<InnerMeshBlobAdapter> {
+        self.inner.clone()
+    }
+}
+
 #[pymethods]
 impl PyMeshBlobAdapter {
     /// Construct a substrate-owned blob adapter against `redex`.

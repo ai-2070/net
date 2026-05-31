@@ -1,0 +1,16 @@
+{
+  "_comment": "Canonical postcard wire vectors for TransferControl / TransferHeader (Transport SDK plan T-B). Regenerate via the emit_fixture test.",
+  "transfer_control": [
+    { "name": "request_hash_zero", "fields": { "hash": "0000000000000000000000000000000000000000000000000000000000000000" }, "postcard_hex": "000000000000000000000000000000000000000000000000000000000000000000" },
+    { "name": "request_hash_sequential", "fields": { "hash": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" }, "postcard_hex": "00000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" },
+    { "name": "request_hash_ff", "fields": { "hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }, "postcard_hex": "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }
+  ],
+  "transfer_header": [
+    { "name": "found_zero", "fields": { "kind": "found", "total_len": 0 }, "postcard_hex": "0000" },
+    { "name": "found_one", "fields": { "kind": "found", "total_len": 1 }, "postcard_hex": "0001" },
+    { "name": "found_300", "fields": { "kind": "found", "total_len": 300 }, "postcard_hex": "00ac02" },
+    { "name": "found_4mib", "fields": { "kind": "found", "total_len": 4194304 }, "postcard_hex": "0080808002" },
+    { "name": "found_u64_max", "fields": { "kind": "found", "total_len": 18446744073709551615 }, "postcard_hex": "00ffffffffffffffffff01" },
+    { "name": "not_found", "fields": { "kind": "not_found" }, "postcard_hex": "01" }
+  ]
+}

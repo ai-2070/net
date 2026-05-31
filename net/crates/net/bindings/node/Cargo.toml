@@ -89,7 +89,7 @@ tool = ["net/tool", "cortex"]
 # Toggling greedy / gravity at runtime is via `Redex::enable_*`
 # methods; the Cargo feature only gates whether the binding
 # surface compiles at all.
-dataforts = ["cortex", "net", "net/dataforts"]
+dataforts = ["cortex", "net", "net/dataforts", "dep:postcard"]
 # Compute surface — `DaemonRuntime`, `MeshDaemon`, migration.
 # Depends on `net` (mesh transport is what daemons ride) and
 # brings in `net-sdk` at its `compute` feature for the

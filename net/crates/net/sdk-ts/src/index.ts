@@ -296,6 +296,17 @@ export type {
 // module directly.
 export { RedisStreamDedup } from './redis-dedup';
 
+// Transport surface (blob + directory transfer over the fairscheduler
+// stream transport). Wire types + stream-id helpers; node-driven ops
+// follow with the Node behavioural tests (T-H).
+export {
+  TransferControl,
+  TransferHeader,
+  transferStreamId,
+  isTransferStreamId,
+  nextTransferStreamId,
+} from './transport';
+
 // Types.
 export type {
   NetNodeConfig,

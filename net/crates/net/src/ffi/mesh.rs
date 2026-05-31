@@ -647,7 +647,10 @@ pub unsafe extern "C" fn net_mesh_free(handle: *mut MeshNodeHandle) {
 /// the inner out of `ManuallyDrop` mid-clone. Returns `None` if `_free`
 /// has begun — callers must surface a null/error result. Once the clone
 /// lands the bumped refcount keeps the node alive independently.
-#[cfg(feature = "cortex")]
+// Available to the aggregator FFI (`cortex`) and the transport FFI
+// (`dataforts`), both of which clone the node Arc to drive an op under
+// the handle guard.
+#[cfg(any(feature = "cortex", feature = "dataforts"))]
 pub(super) fn mesh_node_arc(h: &MeshNodeHandle) -> Option<Arc<MeshNode>> {
     let _op = h.guard.try_enter()?;
     Some(Arc::clone(&h.inner))
