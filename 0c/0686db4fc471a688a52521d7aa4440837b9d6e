@@ -1,0 +1,25 @@
+net/crates/net/sdk/src/dataforts.rs
+  s_2bfa2af80cf7fe::t_92d529f4e174bb 10-14
+net/crates/net/sdk/src/transport.rs
+  s_2bfa2af80cf7fe::t_933ff5b50bd6ad 1-50,52-264,269-275,298-385
+  s_2bfa2af80cf7fe::t_27a63427a7c263 265-268,276-297
+  s_2bfa2af80cf7fe::t_f7a8ccf2d1d6f9 51
+net/crates/net/sdk/src/lib.rs
+  s_2bfa2af80cf7fe::t_b3bb7a3ae94749 73-79
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "0c0686db4fc471a688a52521d7aa4440837b9d6e",
+  "prompts": {},
+  "sessions": {
+    "s_2bfa2af80cf7fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f0709c4d-be5c-4dfc-a42e-ab0b2c117aa5",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
