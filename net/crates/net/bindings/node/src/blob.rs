@@ -1258,6 +1258,15 @@ pub struct MeshBlobAdapter {
     id: String,
 }
 
+impl MeshBlobAdapter {
+    /// Clone the inner `Arc<MeshBlobAdapter>` for the sibling transport
+    /// bindings (`crate::transport`), which install it as the node's
+    /// transfer engine / pass it to `store_dir`.
+    pub(crate) fn inner_arc(&self) -> Arc<InnerMeshBlobAdapter> {
+        self.inner.clone()
+    }
+}
+
 #[cfg(feature = "dataforts")]
 #[napi]
 impl MeshBlobAdapter {

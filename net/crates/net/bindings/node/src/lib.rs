@@ -8,6 +8,8 @@
 // separately would only enable combinations that aren't meaningful.
 #[cfg(feature = "dataforts")]
 mod blob;
+#[cfg(feature = "dataforts")]
+mod transport;
 #[cfg(feature = "net")]
 mod capabilities;
 mod capability_aggregation;
