@@ -1,0 +1,22 @@
+net/crates/net/docs/plans/TRANSPORT_SDK_STATUS.md
+  s_2bfa2af80cf7fe::t_8c2fc3765a54aa 43-46
+  s_2bfa2af80cf7fe::t_89d245cd393309 1-16,18-42,47-80,86-103
+  s_2bfa2af80cf7fe::t_27ca899641c481 17
+  s_2bfa2af80cf7fe::t_3698b605f5a644 81-85
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "cc3a61247cc8bdcb5fdf36163eaba911579bee9e",
+  "prompts": {},
+  "sessions": {
+    "s_2bfa2af80cf7fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f0709c4d-be5c-4dfc-a42e-ab0b2c117aa5",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
