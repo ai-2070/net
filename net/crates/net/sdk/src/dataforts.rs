@@ -7,6 +7,11 @@
 //! so consumers (e.g. the Deck's DATAFORTS tab) don't have to
 //! reach through internal module paths.
 //!
+//! This module is the storage + operator read side. The on-demand
+//! cross-peer *movement* surface (blob transfer, directory transfer,
+//! the fairscheduler stream-id helpers) lives in
+//! [`net_sdk::transport`](crate::transport).
+//!
 //! Scope of this re-export: the snapshot types operators read
 //! (`BlobMetrics`, `BlobMetricsSnapshot`, `OverflowMetricsSnapshot`)
 //! plus the health-gate constants + helper. The full blob-adapter

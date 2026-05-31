@@ -70,6 +70,13 @@ pub mod stream;
 pub mod testing;
 #[cfg(feature = "tool")]
 pub mod tool;
+// On-demand cross-peer movement primitives (blob + directory transfer
+// over the fairscheduler stream transport). Needs the networked node
+// (`net`) and the blob storage layer (`dataforts`); the transfer
+// surface lives here rather than in `dataforts` (which is storage +
+// operator read side).
+#[cfg(all(feature = "net", feature = "dataforts"))]
+pub mod transport;
 
 /// Procedural-macro re-exports gated by the `macros` feature.
 ///
