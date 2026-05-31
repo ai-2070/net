@@ -107,7 +107,10 @@ fn every_transport_error_define_matches_rust_constant() {
             NET_ERR_TRANSFER_ALL_PEERS_FAILED,
         ),
         ("NET_ERR_TRANSFER_CANCELLED", NET_ERR_TRANSFER_CANCELLED),
-        ("NET_ERR_TRANSFER_NULL_POINTER", NET_ERR_TRANSFER_NULL_POINTER),
+        (
+            "NET_ERR_TRANSFER_NULL_POINTER",
+            NET_ERR_TRANSFER_NULL_POINTER,
+        ),
         (
             "NET_ERR_TRANSFER_SHUTTING_DOWN",
             NET_ERR_TRANSFER_SHUTTING_DOWN,

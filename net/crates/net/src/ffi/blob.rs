@@ -1104,9 +1104,7 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_free(handle: *mut MeshBlobAdapter
 /// alive independently. Returns `None` once `_free` has begun. Mirrors
 /// [`super::mesh::mesh_node_arc`].
 #[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
-pub(super) fn blob_adapter_arc(
-    h: &MeshBlobAdapterHandle,
-) -> Option<Arc<InnerMeshBlobAdapter>> {
+pub(super) fn blob_adapter_arc(h: &MeshBlobAdapterHandle) -> Option<Arc<InnerMeshBlobAdapter>> {
     let _op = h.guard.try_enter()?;
     Some(Arc::clone(&h.inner))
 }

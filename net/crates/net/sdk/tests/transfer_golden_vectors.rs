@@ -82,7 +82,9 @@ fn transfer_control_round_trips_golden_vectors() {
     let fixture: Value =
         serde_json::from_str(&std::fs::read_to_string(fixture_path()).expect("read fixture"))
             .expect("fixture JSON parses");
-    let cases = fixture["transfer_control"].as_array().expect("control cases");
+    let cases = fixture["transfer_control"]
+        .as_array()
+        .expect("control cases");
     assert!(!cases.is_empty(), "no transfer_control cases");
     for case in cases {
         let name = case["name"].as_str().unwrap();

@@ -189,9 +189,7 @@ async fn fetch_blob_bytes(
     match blob_ref {
         BlobRef::Small { hash, .. } => Ok(node.transfer_fetch_chunk(source, *hash).await?.to_vec()),
         BlobRef::Manifest {
-            chunks,
-            total_size,
-            ..
+            chunks, total_size, ..
         } => {
             let mut buf = Vec::with_capacity(*total_size as usize);
             for chunk in chunks {
@@ -378,7 +376,9 @@ pub unsafe extern "C" fn net_fetch_dir(
         Err(code) => return code,
     };
     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        block_on(async move { substrate_fetch_dir(&node_arc, source_id, &blob_ref, &dest, 0).await })
+        block_on(
+            async move { substrate_fetch_dir(&node_arc, source_id, &blob_ref, &dest, 0).await },
+        )
     }));
     match outcome {
         Err(_) => NET_ERR_TRANSFER_PANIC,
@@ -503,7 +503,9 @@ mod tests {
             NET_ERR_TRANSFER_HASH_MISMATCH
         );
         assert_eq!(
-            blob_err_code(&BlobError::Backend("blob transfer: engine not installed".into())),
+            blob_err_code(&BlobError::Backend(
+                "blob transfer: engine not installed".into()
+            )),
             NET_ERR_TRANSFER_ENGINE_NOT_INSTALLED
         );
         assert_eq!(

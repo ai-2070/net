@@ -174,7 +174,12 @@ mod tests {
                 NET_ERR_FEATURE_NOT_BUILT
             );
             assert_eq!(
-                net_mesh_blob_adapter_exists(null_handle, std::ptr::null(), 0, std::ptr::null_mut()),
+                net_mesh_blob_adapter_exists(
+                    null_handle,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut()
+                ),
                 NET_ERR_FEATURE_NOT_BUILT
             );
             assert_eq!(

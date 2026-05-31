@@ -27,8 +27,9 @@ use pyo3::types::PyBytes;
 use net::adapter::net::dataforts::blob::transfer::{TransferControl, TransferHeader};
 use net::adapter::net::dataforts::blob::{
     is_transfer_stream_id as core_is_transfer_stream_id,
-    next_transfer_stream_id as core_next_transfer_stream_id, transfer_stream_id as core_transfer_stream_id,
-    BlobError as InnerBlobError, BlobRef as InnerBlobRef,
+    next_transfer_stream_id as core_next_transfer_stream_id,
+    transfer_stream_id as core_transfer_stream_id, BlobError as InnerBlobError,
+    BlobRef as InnerBlobRef,
 };
 use net::adapter::net::dataforts::{
     fetch_dir as core_fetch_dir, store_dir as core_store_dir, DirError as InnerDirError,
@@ -58,9 +59,7 @@ fn map_blob_err(e: InnerBlobError) -> PyErr {
 /// `TransferError::AllPeersFailed` and the C/Go `all-peers-failed` code.
 fn map_discovered_blob_err(e: InnerBlobError) -> PyErr {
     match e {
-        InnerBlobError::NotFound(m) => {
-            TransferError::new_err(format!("all peers failed: {m}"))
-        }
+        InnerBlobError::NotFound(m) => TransferError::new_err(format!("all peers failed: {m}")),
         other => map_blob_err(other),
     }
 }
@@ -215,9 +214,7 @@ async fn fetch_blob_bytes(
             Ok(node.transfer_fetch_chunk(holder, *hash).await?.to_vec())
         }
         InnerBlobRef::Manifest {
-            chunks,
-            total_size,
-            ..
+            chunks, total_size, ..
         } => {
             let mut buf = Vec::with_capacity(*total_size as usize);
             for chunk in chunks {
@@ -276,9 +273,7 @@ fn fetch_blob_discovered<'py>(
                     Ok(node.transfer_fetch_chunk_discovered(*hash).await?.to_vec())
                 }
                 InnerBlobRef::Manifest {
-                    chunks,
-                    total_size,
-                    ..
+                    chunks, total_size, ..
                 } => {
                     let mut buf = Vec::with_capacity(*total_size as usize);
                     for chunk in chunks {

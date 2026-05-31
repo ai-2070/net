@@ -392,7 +392,11 @@ mod tests {
         ];
         for &(total_len, expected_hex) in found_cases {
             let hdr = TransferHeader::found(BigInt::from(total_len));
-            assert_eq!(to_hex(&hdr.encode().unwrap()), expected_hex, "found {total_len}");
+            assert_eq!(
+                to_hex(&hdr.encode().unwrap()),
+                expected_hex,
+                "found {total_len}"
+            );
 
             let decoded = TransferHeader::decode(Buffer::from(
                 (0..expected_hex.len())

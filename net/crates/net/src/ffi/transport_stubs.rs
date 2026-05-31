@@ -144,7 +144,12 @@ mod tests {
                 NET_ERR_FEATURE_NOT_BUILT
             );
             assert_eq!(
-                net_store_dir(null, std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut()),
+                net_store_dir(
+                    null,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut()
+                ),
                 NET_ERR_FEATURE_NOT_BUILT
             );
             assert_eq!(

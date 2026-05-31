@@ -133,9 +133,7 @@ impl From<BlobError> for TransferError {
     fn from(e: BlobError) -> Self {
         match e {
             BlobError::NotFound(m) => Self::NotFound(m),
-            BlobError::HashMismatch { expected, actual } => {
-                Self::HashMismatch { expected, actual }
-            }
+            BlobError::HashMismatch { expected, actual } => Self::HashMismatch { expected, actual },
             other => Self::Substrate(other.to_string()),
         }
     }
@@ -186,9 +184,7 @@ pub async fn fetch_blob(
     match blob_ref {
         BlobRef::Small { hash, .. } => Ok(node.transfer_fetch_chunk(source, *hash).await?),
         BlobRef::Manifest {
-            chunks,
-            total_size,
-            ..
+            chunks, total_size, ..
         } => {
             let mut buf = BytesMut::with_capacity(*total_size as usize);
             for chunk in chunks {
@@ -229,9 +225,7 @@ pub async fn fetch_blob_discovered(
     match blob_ref {
         BlobRef::Small { hash, .. } => discovered(*hash).await,
         BlobRef::Manifest {
-            chunks,
-            total_size,
-            ..
+            chunks, total_size, ..
         } => {
             let mut buf = BytesMut::with_capacity(*total_size as usize);
             for chunk in chunks {

@@ -8,8 +8,6 @@
 // separately would only enable combinations that aren't meaningful.
 #[cfg(feature = "dataforts")]
 mod blob;
-#[cfg(feature = "dataforts")]
-mod transport;
 #[cfg(feature = "net")]
 mod capabilities;
 mod capability_aggregation;
@@ -27,6 +25,8 @@ mod compute;
 mod cortex;
 #[cfg(feature = "groups")]
 mod groups;
+#[cfg(feature = "dataforts")]
+mod transport;
 // nRPC binding (B1: raw-bytes serve_rpc / call / call_streaming).
 // Reuses the cortex feature gate because nRPC is part of the
 // cortex / netdb feature unit.

@@ -7,11 +7,11 @@ mod aggregator;
 mod async_bridge;
 #[cfg(feature = "dataforts")]
 mod blob;
-#[cfg(feature = "dataforts")]
-mod transport;
 mod capability_aggregation;
 #[cfg(feature = "cortex")]
 mod cortex;
+#[cfg(feature = "dataforts")]
+mod transport;
 // Identity / capabilities / subnets ride the `net` feature as a
 // single security unit — they share `adapter::net`'s subprotocol
 // dispatch and are operationally inseparable.
