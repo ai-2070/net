@@ -1,0 +1,19 @@
+net/crates/net/bindings/node/src/transport.rs
+  s_4e65c03b4a88ec::t_47b1f78287ea52 350-414
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "0c7023b37a2374e7ae3d7ae345cec7fe973333b9",
+  "prompts": {},
+  "sessions": {
+    "s_4e65c03b4a88ec": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f38fba46-70fe-4a54-9993-f298695ba62b",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
