@@ -9987,6 +9987,11 @@ impl MeshNode {
 
         let stream_id = stream.stream_id;
         let reliable = stream.config.reliability.is_reliable();
+        // Opt-in: bulk-transfer streams route their originating sends
+        // through the FairScheduler (T-0.5) instead of straight to the
+        // socket, so they participate in per-stream weighted fairness.
+        // Default streams keep the direct path (zero blast radius).
+        let scheduled = stream.config.scheduled;
 
         // Refuse to send on a stream that isn't currently open, OR
         // whose live state has a different epoch than the handle. The
@@ -10050,9 +10055,9 @@ impl MeshNode {
                     TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
                 };
                 let packet = builder.build(stream_id, seq, &current_batch, flags);
-                let send_res = self.socket.send_to(&packet, peer_addr).await;
-                send_res.map_err(|e| StreamError::Transport(format!("send failed: {}", e)))?;
-                guard.commit(); // socket accepted the packet — bytes are the receiver's now
+                self.deliver_stream_packet(scheduled, &packet, peer_addr, stream_id)
+                    .await?;
+                guard.commit(); // accepted (socket or scheduler) — bytes are the receiver's now
                 current_batch.clear();
                 current_size = 0;
             }
@@ -10070,14 +10075,55 @@ impl MeshNode {
                     TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
                 };
             let packet = builder.build(stream_id, seq, &current_batch, flags);
-            let send_res = self.socket.send_to(&packet, peer_addr).await;
-            send_res.map_err(|e| StreamError::Transport(format!("send failed: {}", e)))?;
+            self.deliver_stream_packet(scheduled, &packet, peer_addr, stream_id)
+                .await?;
             guard.commit();
         }
 
         drop(builder);
         session.touch();
         Ok(())
+    }
+
+    /// Deliver one built stream packet, either straight to the socket
+    /// (the default direct path) or — when the stream is `scheduled`
+    /// (T-0.5) — by enqueueing it on the router's
+    /// [`FairScheduler`](super::router::FairScheduler) so the router's
+    /// send loop ships it under per-stream weighted fairness.
+    ///
+    /// A full scheduler queue surfaces as [`StreamError::Backpressure`]
+    /// (same shape as a tx-credit `WindowFull`), so `send_with_retry`
+    /// rides it. Scheduled sends pay one `Bytes` copy (the build pool
+    /// buffer is reused after the call); bulk transfer absorbs it.
+    async fn deliver_stream_packet(
+        &self,
+        scheduled: bool,
+        packet: &[u8],
+        peer_addr: SocketAddr,
+        stream_id: u64,
+    ) -> Result<(), StreamError> {
+        if scheduled {
+            let queued = super::router::QueuedPacket {
+                data: Bytes::copy_from_slice(packet),
+                dest: peer_addr,
+                stream_id,
+                // Bulk data rides non-priority; the scheduler's
+                // priority lane is reserved for control/interactive.
+                priority: false,
+                queued_at: std::time::Instant::now(),
+            };
+            if self.router.scheduler().enqueue(queued) {
+                Ok(())
+            } else {
+                Err(StreamError::Backpressure)
+            }
+        } else {
+            self.socket
+                .send_to(packet, peer_addr)
+                .await
+                .map(|_| ())
+                .map_err(|e| StreamError::Transport(format!("send failed: {}", e)))
+        }
     }
 
     /// Send `events` on `stream`, retrying on `Backpressure` with

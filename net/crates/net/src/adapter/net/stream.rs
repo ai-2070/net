@@ -85,6 +85,16 @@ pub struct StreamConfig {
     /// Fair-scheduler quantum multiplier. `1` is equal-share; higher
     /// means this stream gets proportionally more packets per round.
     pub fairness_weight: u8,
+    /// Route this stream's *originating* sends through the router's
+    /// [`FairScheduler`](crate::adapter::net::router::FairScheduler)
+    /// rather than straight to the socket. Default `false` — every
+    /// existing caller (nRPC streaming, control traffic) keeps the
+    /// direct `socket.send_to` path. Set `true` for bulk transfers so
+    /// their sends participate in per-stream weighted fairness and
+    /// can't monopolize the link against other scheduled streams. The
+    /// scheduler's queue depth becomes an additional backpressure
+    /// source (surfaced as [`StreamError::Backpressure`]).
+    pub scheduled: bool,
     /// What to do with pending outbound packets on close.
     pub close_behavior: CloseBehavior,
 }
@@ -95,6 +105,7 @@ impl Default for StreamConfig {
             reliability: Reliability::FireAndForget,
             window_bytes: DEFAULT_STREAM_WINDOW_BYTES,
             fairness_weight: 1,
+            scheduled: false,
             close_behavior: CloseBehavior::DropAndClose,
         }
     }
@@ -122,6 +133,13 @@ impl StreamConfig {
     pub fn with_fairness_weight(mut self, weight: u8) -> Self {
         // 0 would starve this stream; clamp up to 1.
         self.fairness_weight = weight.max(1);
+        self
+    }
+
+    /// Route this stream's originating sends through the router's
+    /// fair scheduler (see [`Self::scheduled`]). Use for bulk transfers.
+    pub fn with_scheduled(mut self, scheduled: bool) -> Self {
+        self.scheduled = scheduled;
         self
     }
 
