@@ -37,7 +37,10 @@ use std::sync::Arc;
 use bytes::{BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 
-use super::blob::{chunk_payload, BlobAdapter, BlobError, BlobRef, Encoding, MeshBlobAdapter};
+use super::blob::{
+    chunk_payload, BlobAdapter, BlobError, BlobRef, Encoding, MeshBlobAdapter,
+    BLOB_CHUNK_SIZE_BYTES,
+};
 use crate::adapter::net::MeshNode;
 
 /// Manifest schema version. Bumps independently of the blob-ref wire
@@ -50,6 +53,20 @@ pub const DIR_MANIFEST_VERSION: u8 = 1;
 /// transport + FairScheduler handle byte-level fairness underneath, so
 /// this only bounds how many files race for the window at once.
 pub const DEFAULT_FETCH_CONCURRENCY: usize = 16;
+
+/// Aggregate in-flight byte budget across concurrent leaf fetches in
+/// [`fetch_dir`]. The per-stream tx window is large (≈ a whole chunk),
+/// so the file-count cap alone does NOT bound how many bytes are in
+/// flight at once: N concurrent large files put ≈ N × chunk bytes on the
+/// wire, and once that exceeds what the receiver's single recv loop can
+/// drain, the kernel recv buffer overflows, packets drop, and (today)
+/// the transfer can't recover. This budget caps aggregate in-flight: a
+/// file reserves ≈ its current chunk's worth, so many tiny files run
+/// wide while large files run only a couple at a time. 8 MiB matches the
+/// concurrency that transfers cleanly in the diagnostic sweep against an
+/// 8-16 MiB socket recv buffer; deployments that size their recv buffer
+/// higher can raise this constant for more large-file parallelism.
+pub const DEFAULT_INFLIGHT_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 
 // ── Errors ──────────────────────────────────────────────────────────
 
@@ -349,6 +366,13 @@ pub async fn fetch_dir(
         concurrency
     };
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    // Aggregate in-flight byte budget (permits = bytes). A file reserves
+    // ≈ its current chunk's worth, so large files self-limit to a couple
+    // concurrent while small files stay bounded only by the count cap.
+    // Capped at u32 (the budget fits) and clamped to [1, budget] so even
+    // a file larger than the budget can run (alone).
+    let budget = u32::try_from(DEFAULT_INFLIGHT_BUDGET_BYTES).unwrap_or(u32::MAX);
+    let byte_sem = Arc::new(tokio::sync::Semaphore::new(budget as usize));
     let mut tasks = Vec::new();
     for entry in &manifest.entries {
         let EntryKind::File { mode, blob } = &entry.kind else {
@@ -358,11 +382,23 @@ pub async fn fetch_dir(
         let blob_ref = BlobRef::decode(blob)
             .map_err(DirError::Blob)?
             .ok_or_else(|| DirError::Manifest(format!("entry {} has no blob ref", entry.path)))?;
+        // Bytes this file can have in flight at once ≈ its current chunk
+        // (chunks pull sequentially), bounded by the budget.
+        let in_flight = blob_ref
+            .size()
+            .min(BLOB_CHUNK_SIZE_BYTES)
+            .min(budget as u64)
+            .max(1) as u32;
         let node = node.clone();
         let sem = sem.clone();
+        let byte_sem = byte_sem.clone();
         let mode = *mode;
         tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore not closed");
+            let _bytes_permit = byte_sem
+                .acquire_many(in_flight)
+                .await
+                .expect("byte semaphore not closed");
             let bytes = transfer_fetch_blob(&node, source, &blob_ref).await?;
             write_file(&safe, &bytes, mode)?;
             Ok::<u64, DirError>(bytes.len() as u64)

@@ -207,6 +207,45 @@ async fn directory_transfer_many_small_files() {
     assert_eq!(read_tree(dest.path()), read_tree(src.path()), "trees match");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn directory_transfer_many_large_files() {
+    // Several 4 MiB files in one tree, pulled at the default fan-out.
+    // Without the in-flight byte budget, the default concurrency (16)
+    // would put ~16 × 4 MiB on the wire at once, overflow the recv
+    // buffer, and time out (see tests/transfer_concurrency.rs). The
+    // budget self-limits large files to a couple concurrent so the tree
+    // transfers cleanly.
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_b, &node_a).await;
+    let a_id = node_a.node_id();
+
+    let redex_a = Arc::new(Redex::new());
+    let adapter_a = Arc::new(MeshBlobAdapter::new("a", redex_a));
+    let redex_b = Arc::new(Redex::new());
+    let adapter_b = Arc::new(MeshBlobAdapter::new("b", redex_b));
+    node_a.serve_blob_transfer(adapter_a.clone());
+    node_b.serve_blob_transfer(adapter_b);
+
+    let src = TempDir::new("biglots-src");
+    let n = 6usize;
+    for i in 0..n {
+        let body: Vec<u8> = (0..4 * 1024 * 1024usize).map(|j| ((j + i) % 251) as u8).collect();
+        write(src.path(), &format!("artifact{i}.bin"), &body);
+    }
+
+    let manifest_ref = store_dir(&adapter_a, src.path()).await.expect("store_dir");
+    let dest = TempDir::new("biglots-dest");
+    // Pass the default fan-out (16) — the byte budget, not this count, is
+    // what keeps concurrent large files from overflowing the buffer.
+    let stats = fetch_dir(&node_b, a_id, &manifest_ref, dest.path(), 16)
+        .await
+        .expect("fetch_dir (many large files)");
+
+    assert_eq!(stats.files, n, "all {n} large files transferred");
+    assert_eq!(read_tree(dest.path()), read_tree(src.path()), "trees match");
+}
+
 /// Generate a `node_modules`-shaped tree under `root`: many packages,
 /// each with a few small metadata/source files at depth 2-4, some
 /// packages carrying a larger bundled file, and (on unix) a `.bin`
