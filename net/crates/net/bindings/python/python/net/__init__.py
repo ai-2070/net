@@ -389,6 +389,42 @@ else:
     )
 
 
+# Transport surface (blob + directory transfer over the fairscheduler
+# stream transport). Present iff built with the `dataforts` feature.
+try:
+    from ._net import (
+        TransferControl,
+        TransferError,
+        TransferHeader,
+        fetch_blob,
+        fetch_blob_discovered,
+        fetch_dir,
+        is_transfer_stream_id,
+        next_transfer_stream_id,
+        serve_blob_transfer,
+        store_dir,
+        transfer_stream_id,
+    )
+except ImportError:
+    pass
+else:
+    __all__.extend(
+        [
+            "TransferControl",
+            "TransferError",
+            "TransferHeader",
+            "fetch_blob",
+            "fetch_blob_discovered",
+            "fetch_dir",
+            "is_transfer_stream_id",
+            "next_transfer_stream_id",
+            "serve_blob_transfer",
+            "store_dir",
+            "transfer_stream_id",
+        ]
+    )
+
+
 # MeshOS daemon-author SDK. Present iff the native module was built
 # with the `meshos` Cargo feature. Slice 1 surface — register /
 # control receive / publish_log / graceful_shutdown / metadata.

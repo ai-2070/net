@@ -7,6 +7,8 @@ mod aggregator;
 mod async_bridge;
 #[cfg(feature = "dataforts")]
 mod blob;
+#[cfg(feature = "dataforts")]
+mod transport;
 mod capability_aggregation;
 #[cfg(feature = "cortex")]
 mod cortex;
@@ -2355,6 +2357,9 @@ mod mesh_bindings {
         /// by sibling-feature modules (`compute`, `mesh_rpc`) to
         /// share the live mesh node without opening a second
         /// socket.
+        // Also reachable under `dataforts` (the transport bindings clone
+        // the node Arc); `dataforts` enables `cortex`, so this gate
+        // already covers it.
         #[cfg(any(feature = "compute", feature = "cortex", feature = "aggregator"))]
         pub(crate) fn node_arc_clone(&self) -> PyResult<Arc<MeshNode>> {
             self.node
@@ -3022,6 +3027,10 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(blob::async_blob_publish, m)?)?;
         m.add_function(wrap_pyfunction!(blob::async_blob_resolve, m)?)?;
         m.add("BlobError", m.py().get_type::<blob::BlobError>())?;
+
+        // Transport surface (blob + directory transfer over the
+        // fairscheduler stream transport — Transport SDK plan T-D).
+        transport::register(m)?;
 
         // Register an atexit hook so the global blob-adapter
         // registry is drained while the interpreter is still
