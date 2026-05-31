@@ -4937,6 +4937,15 @@ impl MeshNode {
             None
         };
 
+        // Delivery-order contract (H-8): events are pushed in ARRIVAL
+        // order, each tagged with the packet's `seq`. The reliability
+        // layer guarantees gap-free eventual delivery (retransmit), but
+        // NOT ordering at this point — an out-of-order arrival or a
+        // retransmit lands here in the order it hit the wire. Consumers
+        // needing strict order reassemble by `StoredEvent::seq` (see the
+        // blob-transfer engine's reorder buffer); ones that frame their
+        // own ordering (nRPC keys on EventMeta/call_id) or tolerate
+        // reordering ignore it.
         let queue = inbound.entry(shard_id).or_default();
         let seq = parsed.header.sequence;
         for (i, event_data) in events.into_iter().enumerate() {

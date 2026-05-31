@@ -33,8 +33,20 @@ pub enum Reliability {
     /// no ACK/NACK tracking. Monotonic sequence numbers on the wire so
     /// callers that care can detect gaps / reorder themselves.
     FireAndForget,
-    /// Retransmit lost packets based on NACKs from the receiver. In-order
-    /// delivery within the stream.
+    /// Retransmit lost packets (receiver NACKs + a sender timeout
+    /// backstop; the retransmit window is sized to the tx-window so
+    /// nothing in flight is unrecoverable). Guarantees **gap-free
+    /// eventual delivery** of every byte.
+    ///
+    /// **Ordering contract (H-8):** the substrate does NOT reorder for
+    /// you. Accepted packets — including out-of-order arrivals and
+    /// retransmits — are delivered to the inbound queue in **arrival
+    /// order**, each tagged with its monotonic `seq`. A consumer that
+    /// needs strict in-order bytes must reassemble by `seq` itself (the
+    /// blob-transfer engine's per-stream reorder buffer is the reference
+    /// example). Consumers that frame their own ordering (nRPC streaming
+    /// keys on `EventMeta`/`call_id`) or tolerate reordering need do
+    /// nothing. Reliable here means "no loss", not "delivered in order".
     Reliable,
 }
 
