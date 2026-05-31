@@ -353,6 +353,15 @@ pub unsafe extern "C" fn net_fetch_dir(
     if node.is_null() || manifest_ref.is_null() || dest_path.is_null() {
         return NET_ERR_TRANSFER_NULL_POINTER;
     }
+    // Zero the optional out-params up front (each may be NULL to ignore)
+    // so a caller that reads them after a non-OK return sees 0 rather
+    // than stale stack garbage. Mirrors net_fetch_blob / net_store_dir.
+    if !out_files.is_null() {
+        unsafe { *out_files = 0 };
+    }
+    if !out_bytes.is_null() {
+        unsafe { *out_bytes = 0 };
+    }
     let node_arc = match mesh_node_arc(unsafe { &*node }) {
         Some(n) => n,
         None => return NET_ERR_TRANSFER_SHUTTING_DOWN,
@@ -398,6 +407,13 @@ pub unsafe extern "C" fn net_dir_manifest_read(
 ) -> c_int {
     if node.is_null() || manifest_ref.is_null() || out_json.is_null() || out_len.is_null() {
         return NET_ERR_TRANSFER_NULL_POINTER;
+    }
+    // Zero the out-params up front so a caller that reads them after a
+    // non-OK return sees (NULL, 0) rather than stale stack garbage.
+    // Mirrors net_fetch_blob / net_store_dir.
+    unsafe {
+        *out_json = ptr::null_mut();
+        *out_len = 0;
     }
     let node_arc = match mesh_node_arc(unsafe { &*node }) {
         Some(n) => n,

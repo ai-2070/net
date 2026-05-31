@@ -148,8 +148,9 @@ int net_store_dir(const net_mesh_blob_adapter_t* adapter,
  * (manifest_ref, manifest_ref_len) from `source_id` and reconstruct it
  * under `dest_path` (created if absent). Writes the number of files
  * written to *out_files and total bytes to *out_bytes; either out-param
- * may be NULL to ignore. Manifest paths are validated to stay within
- * `dest_path`.
+ * may be NULL to ignore. Both are set to 0 on entry, so on any non-OK
+ * return they read 0 rather than an indeterminate value. Manifest paths
+ * are validated to stay within `dest_path`.
  */
 int net_fetch_dir(const net_meshnode_t* node,
                   uint64_t source_id,
@@ -164,6 +165,8 @@ int net_fetch_dir(const net_meshnode_t* node,
  * from `source_id` WITHOUT reconstructing the tree, writing it as a JSON
  * string to (*out_json, *out_len) for introspection (entry paths, kinds,
  * modes, per-file blob refs). Free the string with net_free_string.
+ * (*out_json, *out_len) is set to (NULL, 0) on entry, so on any non-OK
+ * return it reads (NULL, 0) rather than an indeterminate value.
  */
 int net_dir_manifest_read(const net_meshnode_t* node,
                           uint64_t source_id,
