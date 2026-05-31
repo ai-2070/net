@@ -12,15 +12,35 @@ The substrate's `router.rs` already provides every primitive needed for bulk byt
 - **Per-packet priority.** `priority: u8` and `PacketFlags::PRIORITY` let control messages and interactive operations bypass bulk traffic. `priority_bypass` config in the router enables fast-path delivery.
 - **Substrate-level reliability semantics, per-packet.** `PacketFlags::RELIABLE` and `PacketFlags::NACK` mean reliability is a per-packet decision. Bulk transfer chunks ride reliable; control messages can be reliable or not as appropriate.
 - **Stream lifecycle.** `PacketFlags::FIN` closes streams. Idle streams get cleaned up after `idle_timeout_ns`. No explicit open handshake needed — traffic on a new `stream_id` opens the stream implicitly.
-- **Fragmentation.** Built into the wire format (`frag_flags`, `fragment_id`, `fragment_offset`). Chunks larger than `MAX_PAYLOAD_SIZE` (8108 bytes) get fragmented at the substrate level.
+- **Reliable in-order delivery.** A stream opened `Reliability::Reliable` delivers its byte sequence in order and gap-free (per-packet retransmit, SACK/NACK). This is what we build chunk-reassembly on.
 - **Encryption.** ChaCha20-Poly1305 per-packet, keyed off the session. Already handles confidentiality and integrity at the wire level.
 - **Session and authentication.** `session_id` in the header binds packets to authenticated sessions. The substrate's existing channel-auth determines whether a peer can publish/subscribe on a given channel.
 
 The transfer demo's architectural claim is that all of this composes correctly for high-throughput, many-stream, fairness-preserved bulk byte movement. The new code is the thin convention layer that says "blob transfer uses streams this way" — not new transport, not new scheduling, not new auth.
 
+## Verified substrate facts + two corrections (2026-05-30)
+
+Reading `router.rs`, `protocol.rs`, `mesh.rs`, `session.rs` against the claims above, two assumptions don't hold as written and shape the build:
+
+1. **Fragmentation is NOT implemented — only reserved.** `protocol.rs` has the header fields (`frag_flags`, `fragment_id`, `fragment_offset`) + a `with_fragment()` builder, but nothing in the data path fragments or reassembles (the builder is only used in a unit test; `send_on_stream` MTU-packs into one packet and rejects oversize). **So the transfer chunks the blob into ≤`MAX_PAYLOAD_SIZE` (8108 B) pieces itself and reassembles by concatenating the reliable stream's in-order events until FIN.** The reliable stream does the hard part (ordering, retransmit); the transfer just splits and concatenates.
+
+2. **The FairScheduler arbitrates only RELAYED traffic, not originating sends.** The router send loop sends only what's `enqueue`d to the scheduler; `route_packet` enqueues only the *forward* path; originating `send_on_stream` calls `socket.send_to` **directly**, bypassing the scheduler. So `open_stream`'s `set_stream_weight` governs a stream only when this node *relays* it — for a direct two-peer transfer (the demo topology) the scheduler is not in the path at all. **Fix: T-0.5 adds an opt-in `StreamConfig.scheduled` flag that routes a stream's originating sends through the scheduler**, so bulk-transfer streams get real fairness while control/RPC/replication keep the direct path.
+
+**Bandwidth note:** the FairScheduler gives *fairness* among scheduled streams, not an absolute bytes/sec ceiling. "Don't starve the box" for bulk is covered by fairness (interactive sends stay direct and bypass the bulk queue) + the tx-credit window; a hard rate cap (token bucket) is a separate, optional pacing step if ever needed — not in this plan's core.
+
 ## What needs to be built
 
-Five small pieces, in order.
+Six small pieces, in order.
+
+### T-0.5: Route opt-in scheduled streams through the FairScheduler
+
+**Where:** `stream.rs` (`StreamConfig`), `mesh.rs` (`send_on_stream`).
+
+**What:** add `StreamConfig.scheduled: bool` (default `false`). When set, `send_on_stream` enqueues each built packet to `router.scheduler()` (a `QueuedPacket { data, dest, stream_id, priority }`) instead of calling `socket.send_to` directly; the router's existing send loop dequeues and sends it, applying the per-stream weight `set_stream_weight` already configures. tx-credit is acquired *before* enqueue (flow control unchanged); a full scheduler queue maps to `StreamError::Backpressure` (same as `WindowFull`, so `send_with_retry` handles it); per-stream queues are FIFO so reliable in-order holds. Default-`false` keeps every existing caller (nRPC streaming, etc.) on the direct path — zero blast radius outside opted-in transfer streams.
+
+Cost: one `Bytes` copy per packet on the scheduled path (the build pool buffer is reused after the call). Acceptable for bulk; optimizable later.
+
+**Size:** ~30 LoC + tests.
 
 ### T-1: Subprotocol ID and stream-allocation convention
 
@@ -44,21 +64,21 @@ The control packet is tiny — content hash (32 bytes), some framing — fits we
 
 **Where:** Same module as T-2.
 
-**What:** A handler registered for `SUBPROTOCOL_BLOB_TRANSFER` that receives the control packet on a new stream, validates authorization (the request arrived on an authenticated session; the requester is subscribed to a channel that authorizes them to read this content; existing channel-auth gates this), looks up the chunk in local storage, and sends it back on the same stream as fragmented payload packets terminated by a FIN.
+**What:** A handler registered for `SUBPROTOCOL_BLOB_TRANSFER` that receives the control packet on a new stream, validates authorization (the request arrived on an authenticated session; the requester is subscribed to a channel that authorizes them to read this content; existing channel-auth gates this), looks up the chunk in local storage, and sends it back on the same stream — **chunked into ≤`MAX_PAYLOAD_SIZE` reliable events (the transfer splits; the substrate does NOT fragment, per the corrections above) and terminated by a FIN.**
 
-The bytes get sent through the router's normal send path with the allocated stream_id, which means they automatically participate in the fair scheduler's per-stream allocation. Stream weight can be set high or low depending on whether the transfer should be aggressive or background.
+The stream is opened **scheduled (T-0.5) + weighted**, so its sends ride the fair scheduler's per-stream allocation. Weight can be high or low depending on whether the transfer should be aggressive or background.
 
-**Size:** ~200 LoC including the handler registration, auth check (uses existing primitives), local lookup (uses existing `MeshBlobAdapter::fetch` for the local case), and stream-write logic.
+**Size:** ~200 LoC including the handler registration, auth check (uses existing primitives), local lookup (uses existing `MeshBlobAdapter::fetch` for the local case), and the chunked stream-write loop.
 
 ### T-4: Receive-side reassembly and integrity check
 
 **Where:** Same module.
 
-**What:** On the requesting peer, packets arriving on the allocated transfer stream get reassembled (substrate handles fragmentation reassembly already; this layer just collects the reassembled chunk bytes). When the FIN arrives, verify the received content matches the requested hash (BLAKE2 or whichever hash the content-addressing uses). On match, store locally via existing `MeshBlobAdapter::store`. On mismatch, error.
+**What:** On the requesting peer, the reliable transfer stream delivers events in order; this layer **concatenates them in arrival order into the chunk buffer** (the substrate does NOT reassemble — it just guarantees order + gap-free, per the corrections). When the FIN arrives, verify the assembled content matches the requested hash (BLAKE3, the content-addressing hash). On match, store locally via existing `MeshBlobAdapter::store`. On mismatch, error. Bound the buffer by an expected-size cap so a misbehaving sender can't OOM the receiver.
 
 If the request times out without a FIN, the stream gets torn down via the router's idle timeout, the fetch returns error, and the caller can retry against a different peer advertising the same chunk.
 
-**Size:** ~150 LoC. Most of the work is integrity verification and timeout handling; reassembly is provided by the substrate.
+**Size:** ~150 LoC: an in-order concatenation buffer keyed on the transfer stream, integrity verification, and timeout handling.
 
 ### T-5: Directory transfer wrapper
 
@@ -89,7 +109,7 @@ Realistic effort: 2-3 weeks of focused work. The substrate work is small because
 - **No new wire format.** Uses the existing 68-byte `NetHeader` with `subprotocol_id` distinguishing transfer traffic.
 - **No new dispatch path through CortEX.** Transfer rides on the router's stream-level dispatch via `subprotocol_id`, parallel to but separate from CortEX's RPC dispatch.
 - **No new RPC mechanism.** Not an extension of nRPC. The control packet that initiates transfer is a single small packet, not an RPC call.
-- **No new scheduler or bandwidth-management mechanism.** Reuses the `FairScheduler` exactly as it exists.
+- **No new scheduler.** Reuses the `FairScheduler` as-is; T-0.5 only adds an opt-in `StreamConfig.scheduled` flag that routes a stream's *originating* sends through it (today only relayed packets are scheduled). No new scheduling algorithm, no new bandwidth mechanism — just letting originating transfer streams participate in the fairness that already exists.
 - **No new encryption, session, or auth machinery.** All inherited from the substrate's existing wire format.
 - **No abuse of the capability fold.** The fold is used for discovery (which is what it's for) at fold-appropriate frequency (`causal:<hash>` advertisements are stable for as long as a peer holds a chunk). The transfer negotiation itself happens in router streams, not through fold mutations.
 - **No new mechanism for replication.** RedEX continues to handle steady-state replication exactly as it does today. Transfer is an unrelated on-demand path that uses different primitives.
@@ -147,16 +167,17 @@ The framing matters as much as the numbers. The demo materials should anchor on 
 
 ## Order
 
-1. **T-1** (subprotocol and stream conventions) — half a day.
-2. **T-2** (discovery-to-stream bridge) — two to three days.
-3. **T-3** (transfer handler with auth) — three days.
-4. **T-4** (receive-side reassembly and integrity) — two days.
-5. **Phase 1 test passes** before moving to T-5.
-6. **T-5** (directory wrapper) — three to five days.
-7. **Phase 2 test** at realistic `node_modules` scale.
-8. **Phase 3 test** for concurrent mixed workload.
-9. **Phase 4 test** for large-file stress.
-10. **Demo materials** written against the actual measured numbers.
+1. **T-0.5** (opt-in scheduled-stream routing) — half a day; unit-test that a scheduled stream's sends go through the scheduler and a default stream's don't.
+2. **T-1** (subprotocol and stream conventions) — half a day.
+3. **T-2** (discovery-to-stream bridge) — two to three days.
+4. **T-3** (transfer handler with auth) — three days.
+5. **T-4** (receive-side reassembly and integrity) — two days.
+6. **Phase 1 test passes** before moving to T-5.
+7. **T-5** (directory wrapper) — three to five days.
+8. **Phase 2 test** at realistic `node_modules` scale.
+9. **Phase 3 test** for concurrent mixed workload.
+10. **Phase 4 test** for large-file stress.
+11. **Demo materials** written against the actual measured numbers.
 
 If any test phase reveals a problem with the architectural framing, the framing changes before the next phase runs. Better to discover the truth at phase 2 than at PR review.
 
