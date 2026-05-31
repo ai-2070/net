@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use net::adapter::net::dataforts::blob::MeshBlobAdapter;
 use net::adapter::net::dataforts::dir::{fetch_dir, store_dir};
@@ -25,7 +25,11 @@ use net::adapter::net::redex::Redex;
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
 
 const PSK: [u8; 32] = [0x42u8; 32];
-const SOCKET_BUF: usize = 8 * 1024 * 1024;
+// 16 MiB so a few concurrent large-file transfers (5 MiB tx window each)
+// don't overflow the kernel recv buffer — the flow-control window is
+// per-stream, so aggregate in-flight scales with concurrency. Small-file
+// workloads never approach this.
+const SOCKET_BUF: usize = 16 * 1024 * 1024;
 
 fn test_config() -> MeshNodeConfig {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -201,6 +205,183 @@ async fn directory_transfer_many_small_files() {
 
     assert_eq!(stats.files, n, "all {n} files transferred");
     assert_eq!(read_tree(dest.path()), read_tree(src.path()), "trees match");
+}
+
+/// Generate a `node_modules`-shaped tree under `root`: many packages,
+/// each with a few small metadata/source files at depth 2-4, some
+/// packages carrying a larger bundled file, and (on unix) a `.bin`
+/// symlink. Deterministic content. Returns `(file_count, total_bytes)`.
+fn gen_node_modules(root: &Path, packages: usize) -> (usize, u64) {
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    let mut emit = |rel: String, len: usize, seed: u8| {
+        let body: Vec<u8> = (0..len).map(|i| ((i + seed as usize) % 251) as u8).collect();
+        write(root, &rel, &body);
+        files += 1;
+        bytes += len as u64;
+    };
+    for p in 0..packages {
+        let pkg = format!("node_modules/pkg{p:04}");
+        // package.json + entry + readme — the small-file bulk.
+        emit(format!("{pkg}/package.json"), 200 + (p % 400), 1);
+        emit(format!("{pkg}/index.js"), 800 + (p * 7 % 4000), 2);
+        emit(format!("{pkg}/README.md"), 500 + (p % 1500), 3);
+        // a lib/ dir with several modules (depth 3)
+        for f in 0..(3 + p % 5) {
+            emit(format!("{pkg}/lib/mod{f}.js"), 300 + (p * f % 6000), (f + 4) as u8);
+        }
+        // every 7th package has a bigger bundled artifact + deeper nest
+        if p % 7 == 0 {
+            emit(format!("{pkg}/dist/bundle.min.js"), 40_000 + (p % 20_000), 9);
+            emit(
+                format!("{pkg}/node_modules/dep{p}/index.js"),
+                600 + (p % 2000),
+                11,
+            );
+        }
+    }
+    // A symlink (best-effort; only exercised where the OS + privilege
+    // allow — fetch_dir tolerates failure and read_tree skips links).
+    #[cfg(unix)]
+    {
+        let link = root.join("node_modules/.bin/cli");
+        let _ = std::fs::create_dir_all(link.parent().unwrap());
+        let _ = std::os::unix::fs::symlink("../pkg0000/index.js", &link);
+    }
+    (files, bytes)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "scale benchmark — run with --ignored --nocapture"]
+async fn bench_nodemodules_scale() {
+    // Phase 2 of FAIRSCHEDULER_TRANSPORT_PLAN: a node_modules-shaped
+    // tree transferred between paired nodes. NOTE: the plan's absolute
+    // target (200 MB / 30k files < 30 s) is a LINUX-localhost figure; on
+    // a Windows host the per-datagram loopback latency caps throughput
+    // (see transfer_fairness bench), so we report the actual numbers and
+    // the structural correctness rather than asserting the wall-clock.
+    const PACKAGES: usize = 150; // ~1.3k files
+    const CONCURRENCY: usize = 16;
+    // The blob store opens one RedEX chunk-file per chunk, each
+    // PRE-RESERVING `max_memory_bytes` (default 64 MiB). With thousands
+    // of small chunks that explodes the commit (1.3k × 64 MiB ≈ 83 GiB →
+    // OOM). Cap each chunk file at 128 KiB — comfortably above the
+    // largest file here (~60 KiB bundles) and the directory manifest
+    // (~80 KiB at this file count). NOTE: this cap is a uniform per-chunk
+    // floor, so `chunk_count × cap` still bounds how far this scales; a
+    // true 30k-file node_modules needs on-demand segment sizing in RedEX
+    // (reserve-to-content, not reserve-to-max). That's the real
+    // store-side scale fix and is out of scope for the transport.
+    const CHUNK_CAP: usize = 128 * 1024;
+
+    let node_a = build_node().await;
+    let node_b = build_node().await;
+    handshake(&node_b, &node_a).await;
+    let a_id = node_a.node_id();
+
+    let redex_a = Arc::new(Redex::new());
+    let adapter_a = Arc::new(MeshBlobAdapter::new("a", redex_a).with_chunk_file_max_memory_bytes(CHUNK_CAP));
+    let redex_b = Arc::new(Redex::new());
+    let adapter_b = Arc::new(MeshBlobAdapter::new("b", redex_b));
+    node_a.serve_blob_transfer(adapter_a.clone());
+    node_b.serve_blob_transfer(adapter_b);
+
+    let src = TempDir::new("nm-src");
+    let (file_count, total_bytes) = gen_node_modules(src.path(), PACKAGES);
+    let mib = total_bytes as f64 / (1024.0 * 1024.0);
+
+    let store_start = Instant::now();
+    let manifest_ref = store_dir(&adapter_a, src.path()).await.expect("store_dir");
+    let store_elapsed = store_start.elapsed();
+
+    let dest = TempDir::new("nm-dest");
+    let xfer_start = Instant::now();
+    let stats = fetch_dir(&node_b, a_id, &manifest_ref, dest.path(), CONCURRENCY)
+        .await
+        .expect("fetch_dir");
+    let xfer_elapsed = xfer_start.elapsed();
+
+    println!("── node_modules-scale transfer ──");
+    println!("  tree:     {file_count} files, {mib:.1} MiB (deep-nested, mixed sizes)");
+    println!("  store:    {store_elapsed:?}");
+    println!(
+        "  transfer: {xfer_elapsed:?} = {:.1} MiB/s, {:.0} files/s",
+        mib / xfer_elapsed.as_secs_f64(),
+        stats.files as f64 / xfer_elapsed.as_secs_f64()
+    );
+    println!("  stats:    {} files, {} dirs, {} bytes", stats.files, stats.dirs, stats.bytes);
+
+    // Correctness is the hard pass criterion regardless of platform speed.
+    assert_eq!(stats.files, file_count, "every file transferred");
+    assert_eq!(stats.bytes, total_bytes, "byte total matches");
+    assert_eq!(
+        read_tree(dest.path()),
+        read_tree(src.path()),
+        "reconstructed node_modules matches source byte-for-byte",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "scale benchmark — run with --ignored --nocapture"]
+async fn bench_throughput_invariance() {
+    // The architectural claim (plan Phase 2): for EQUAL byte volume,
+    // throughput at high file count should be within 80% of throughput
+    // at low file count — i.e. the fair scheduler amortizes per-stream
+    // overhead so volume, not file count, sets the rate. Measure both
+    // extremes and report the ratio. Honest finding either way.
+    const VOLUME: usize = 8 * 1024 * 1024; // 8 MiB each arm
+    const CONCURRENCY: usize = 8;
+
+    // `cap` is the per-chunk RedEX segment reservation — it must cover
+    // the arm's largest chunk (the file, or the directory manifest)
+    // while keeping `chunk_count × cap` bounded (see the scale bench).
+    async fn run_arm(label: &str, files: usize, file_len: usize, cap: usize) -> f64 {
+        let node_a = build_node().await;
+        let node_b = build_node().await;
+        handshake(&node_b, &node_a).await;
+        let a_id = node_a.node_id();
+        let adapter_a = Arc::new(
+            MeshBlobAdapter::new("a", Arc::new(Redex::new()))
+                .with_chunk_file_max_memory_bytes(cap),
+        );
+        let adapter_b = Arc::new(MeshBlobAdapter::new("b", Arc::new(Redex::new())));
+        node_a.serve_blob_transfer(adapter_a.clone());
+        node_b.serve_blob_transfer(adapter_b);
+
+        let src = TempDir::new("inv-src");
+        for f in 0..files {
+            let body: Vec<u8> = (0..file_len).map(|i| ((i + f) % 251) as u8).collect();
+            write(src.path(), &format!("d{}/f{f}.bin", f % 32), &body);
+        }
+        let manifest_ref = store_dir(&adapter_a, src.path()).await.expect("store_dir");
+        let dest = TempDir::new("inv-dest");
+        let start = Instant::now();
+        let stats = fetch_dir(&node_b, a_id, &manifest_ref, dest.path(), CONCURRENCY)
+            .await
+            .expect("fetch_dir");
+        let elapsed = start.elapsed();
+        let mib = stats.bytes as f64 / (1024.0 * 1024.0);
+        let rate = mib / elapsed.as_secs_f64();
+        println!("  {label}: {files} files × {file_len} B = {mib:.1} MiB in {elapsed:?} = {rate:.2} MiB/s");
+        rate
+    }
+
+    println!("── throughput invariance (equal {} MiB volume) ──", VOLUME / (1024 * 1024));
+    // Low file count: few 4 MiB files (cap covers one 4 MiB chunk).
+    let low = run_arm("few-large ", VOLUME / (4 * 1024 * 1024), 4 * 1024 * 1024, 5 * 1024 * 1024).await;
+    // High file count: many 8 KiB files (cap covers the ~80 KiB manifest).
+    let high = run_arm("many-small", VOLUME / (8 * 1024), 8 * 1024, 256 * 1024).await;
+    let ratio = high / low;
+    println!("  invariance ratio (many-small / few-large): {ratio:.2}  (plan target ≥ 0.80)");
+    if ratio >= 0.80 {
+        println!("  ✓ throughput scales with volume, not file count");
+    } else {
+        println!(
+            "  ✗ per-file overhead is significant: many-small is {:.0}% of few-large throughput",
+            ratio * 100.0
+        );
+    }
+    // Report-only — this bench documents the property; it does not gate CI.
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
