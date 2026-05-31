@@ -36,13 +36,13 @@ Tagged `[B | H | M | L]`:
 
 | ID  | Pri | Area              | Title                                                                                      | Status |
 |-----|-----|-------------------|--------------------------------------------------------------------------------------------|--------|
-| T-1 | H   | reliability       | Proactive gap-NACK has no RTT-relative throttle → retransmit amplification + premature give-up on high-RTT links | Open |
-| T-2 | H   | wire / compat     | `StreamWindow` grew 16 → 24 B + new subprotocol IDs with no version negotiation            | Open |
-| T-3 | M   | dir transfer      | `dir.rs` performs blocking `std::fs` inside async contexts                                  | Open |
-| T-4 | L   | reliability       | `register_retransmit` stamps `sent_at` at scheduler-enqueue time, not wire time             | Open |
-| T-5 | L   | transfer (docs)   | Stale `TRANSFER_STREAM_WINDOW_BYTES` comments ("≈ 640 frames"; manual-coupling framing)     | Open |
-| T-6 | L   | reliability (docs)| `test_regression_duplicate_seq_zero_rejected` comment describes a non-existent `received_first` flag | Open |
-| T-7 | L   | reliability       | `on_ack` iterates `pending` three times                                                     | Open |
+| T-1 | H   | reliability       | Proactive gap-NACK has no RTT-relative throttle → retransmit amplification + premature give-up on high-RTT links | Fixed (`2e721b8a8`) — sender-side fast-recovery dedup (`recover` point), react once per loss episode |
+| T-2 | H   | wire / compat     | `StreamWindow` grew 16 → 24 B + new subprotocol IDs with no version negotiation            | Won't fix — coordinated transport change, not a rolling-upgrade target (backwards-compat out of scope) |
+| T-3 | M   | dir transfer      | `dir.rs` performs blocking `std::fs` inside async contexts                                  | Fixed (`2e721b8a8`) — walk + mkdir/symlink on `spawn_blocking`; per-file I/O size-gated (256 KiB) |
+| T-4 | L   | reliability       | `register_retransmit` stamps `sent_at` at scheduler-enqueue time, not wire time             | Fixed (`2e721b8a8`) — documented the enqueue-time clock + self-correction |
+| T-5 | L   | transfer (docs)   | Stale `TRANSFER_STREAM_WINDOW_BYTES` comments ("≈ 640 frames"; manual-coupling framing)     | Fixed (`2e721b8a8`) — ≈ 32 frames; H-1 auto-couples the retransmit window |
+| T-6 | L   | reliability (docs)| `test_regression_duplicate_seq_zero_rejected` comment describes a non-existent `received_first` flag | Fixed (`2e721b8a8`) — comments describe the `next_expected` logic |
+| T-7 | L   | reliability       | `on_ack` iterates `pending` three times                                                     | Fixed (`2e721b8a8`) — single `retain` pass |
 
 ---
 
