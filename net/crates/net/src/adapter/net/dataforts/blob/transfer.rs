@@ -540,30 +540,14 @@ async fn serve_chunk(
         }
     }
 
-    // Keep the stream — and its retransmit descriptors — alive until the
-    // receiver has acked every sent byte, so NACK-driven resends can fill
-    // any gaps (closing earlier tears down the retransmit window before a
-    // NACK round-trip, which is exactly what made lossy transfers hang).
-    // The receiver's `StreamWindow` grants refund tx credit as it
-    // consumes; `tx_credit_remaining == tx_window` means nothing is
-    // outstanding. Then reclaim the stream — without this wait it would
-    // leak one live stream per chunk until the 300 s idle timeout
-    // (directory-scale fan-out would exhaust memory). Bounded by
-    // `TRANSFER_TIMEOUT` so a vanished receiver can't pin the stream.
-    let deadline = std::time::Instant::now() + TRANSFER_TIMEOUT;
-    loop {
-        match mesh.stream_stats(requester, stream_id) {
-            // Fully acked (or backpressure disabled) → safe to close.
-            Some(s) if s.tx_window == 0 || s.tx_credit_remaining >= s.tx_window => break,
-            Some(_) => {}
-            None => break, // stream already gone (closed / evicted)
-        }
-        if std::time::Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    }
-    mesh.close_stream(requester, stream_id);
+    // Close gracefully (H-7): wait until the receiver has acked every
+    // sent byte (so NACK-driven resends can still fill gaps) before
+    // tearing down the retransmit window — closing eagerly strands a lost
+    // tail packet on a lossy link. Bounded by `TRANSFER_TIMEOUT` so a
+    // vanished receiver can't pin the stream; reclaiming it also stops
+    // directory-scale fan-out from leaking one live stream per chunk.
+    mesh.close_stream_graceful(requester, stream_id, TRANSFER_TIMEOUT)
+        .await;
 }
 
 fn postcard_event<T: Serialize>(value: &T) -> Bytes {

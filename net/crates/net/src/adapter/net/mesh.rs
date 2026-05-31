@@ -5161,6 +5161,46 @@ impl MeshNode {
                         let _ = socket.send_to(&packet, addr).await;
                     }
                 }
+
+                // H-4: receiver-side proactive NACK. Re-request any
+                // persistent gap on a stream we're receiving, so a hole
+                // with no further arrivals (e.g. tail loss, or a sender
+                // paused on credit) recovers within a tick instead of
+                // waiting for the sender's RTO. The grant-piggybacked
+                // NACK only fires on new activity; this covers the quiet
+                // case. Duplicate NACKs are harmless — `on_nack` resends
+                // are bounded by `max_retries` and deduped by the
+                // receiver.
+                let mut gaps: Vec<(SocketAddr, Arc<NetSession>, Vec<(u64, super::protocol::NackPayload)>)> =
+                    Vec::new();
+                for peer in peers.iter() {
+                    let g = peer.value().session.collect_gap_nacks();
+                    if !g.is_empty() {
+                        gaps.push((peer.value().addr, peer.value().session.clone(), g));
+                    }
+                }
+                for (addr, session, g) in gaps {
+                    let pool = session.thread_local_pool();
+                    let mut builder = pool.get();
+                    for (stream_id, nack) in g {
+                        let payload = StreamNack {
+                            stream_id,
+                            next_expected: nack.next_expected,
+                            missing_bitmap: nack.missing_bitmap,
+                        }
+                        .encode();
+                        let seq = session.next_control_tx_seq();
+                        let events = vec![Bytes::copy_from_slice(&payload)];
+                        let packet = builder.build_subprotocol(
+                            CONTROL_STREAM_ID,
+                            seq,
+                            &events,
+                            PacketFlags::NONE,
+                            SUBPROTOCOL_STREAM_NACK,
+                        );
+                        let _ = socket.send_to(&packet, addr).await;
+                    }
+                }
             }
         })
     }
@@ -10432,6 +10472,38 @@ impl MeshNode {
         if let Some(peer) = self.peers.get(&peer_node_id) {
             peer.session.close_stream(stream_id);
         }
+    }
+
+    /// Close a reliable stream **gracefully** (H-7, `DrainThenClose`):
+    /// wait until the reliability layer has no unacked packets — i.e. the
+    /// receiver has acked everything (with H-9 ack-pruning, `pending`
+    /// empties as grants arrive) — or `timeout` elapses, then close. Use
+    /// after the last bytes of a reliable send so retransmit can still
+    /// fill gaps before teardown; closing eagerly (`close_stream`) drops
+    /// the retransmit window and can strand a lost tail packet on a lossy
+    /// link. A fire-and-forget stream (nothing tracked) drains instantly.
+    pub async fn close_stream_graceful(
+        &self,
+        peer_node_id: u64,
+        stream_id: u64,
+        timeout: Duration,
+    ) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let drained = match self.peers.get(&peer_node_id) {
+                Some(p) => p
+                    .session
+                    .try_stream(stream_id)
+                    .map(|s| !s.with_reliability(|r| r.has_pending()))
+                    .unwrap_or(true), // stream already gone → nothing to drain
+                None => true, // peer gone → nothing to drain
+            };
+            if drained || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        self.close_stream(peer_node_id, stream_id);
     }
 
     /// Send a batch of events on an explicit stream.

@@ -271,6 +271,21 @@ impl NetSession {
         out
     }
 
+    /// Collect a NACK for every stream that currently has a gap (H-4):
+    /// `(stream_id, NackPayload)`. Driven on a timer so a persistent gap
+    /// with no further arrivals is re-requested promptly, rather than
+    /// waiting for the *sender's* RTO (the grant-piggybacked NACK only
+    /// fires when a packet is accepted, i.e. when there IS new activity).
+    pub fn collect_gap_nacks(&self) -> Vec<(u64, super::protocol::NackPayload)> {
+        let mut out = Vec::new();
+        for entry in self.streams.iter() {
+            if let Some(nack) = entry.value().with_reliability(|r| r.build_nack()) {
+                out.push((*entry.key(), nack));
+            }
+        }
+        out
+    }
+
     /// Take-and-clear the "given up" flag across all streams, returning
     /// the ids of streams whose reliable layer exhausted retransmits on
     /// some packet (H-3). The caller signals a reset to the peer so the
