@@ -1,0 +1,20 @@
+net/crates/net/bindings/go/net/transport.go
+  s_2bfa2af80cf7fe::t_289b6169d22e63 1-77,92-286
+  s_2bfa2af80cf7fe::t_d1838172d3bbfd 78-91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "b0ccd322f2ffe739ff86514724536884fb4af39d",
+  "prompts": {},
+  "sessions": {
+    "s_2bfa2af80cf7fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f0709c4d-be5c-4dfc-a42e-ab0b2c117aa5",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
