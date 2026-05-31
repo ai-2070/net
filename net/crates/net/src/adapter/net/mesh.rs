@@ -9177,7 +9177,7 @@ impl MeshNode {
         })?;
         let stream_id = next_transfer_stream_id();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        engine.register_pending(stream_id, hash, tx);
+        engine.register_pending(stream_id, holder, hash, tx);
 
         if let Err(e) = self
             .send_transfer_control(holder, stream_id, &TransferControl::Request { hash })

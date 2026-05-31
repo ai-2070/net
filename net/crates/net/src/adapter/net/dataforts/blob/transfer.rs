@@ -169,6 +169,11 @@ type DoneTx = tokio::sync::oneshot::Sender<Result<Bytes, BlobError>>;
 
 /// Requester-side in-flight transfer state, keyed by transfer stream id.
 struct PendingInbound {
+    /// The peer we're fetching from — needed to close the receive-side
+    /// stream once the transfer settles (otherwise streams leak: one
+    /// per fetched chunk, reclaimed only at the 300 s idle timeout,
+    /// which exhausts memory at directory scale).
+    holder: u64,
     expected_hash: [u8; 32],
     /// `None` until the `TransferHeader` lands; then the declared length.
     total_len: Option<u64>,
@@ -201,10 +206,19 @@ impl BlobTransferEngine {
 
     /// Register a requester-side pending transfer before the Request is
     /// sent, so the reply (header/data on `stream_id`) can be matched.
-    pub fn register_pending(&self, stream_id: u64, expected_hash: [u8; 32], done: DoneTx) {
+    /// `holder` is the serving peer, recorded so the receive-side stream
+    /// can be closed when the transfer settles.
+    pub fn register_pending(
+        &self,
+        stream_id: u64,
+        holder: u64,
+        expected_hash: [u8; 32],
+        done: DoneTx,
+    ) {
         self.pending.insert(
             stream_id,
             PendingInbound {
+                holder,
                 expected_hash,
                 total_len: None,
                 buf: Vec::new(),
@@ -345,6 +359,7 @@ impl BlobTransferEngine {
             if let Some(tx) = pending.done.take() {
                 let _ = tx.send(result);
             }
+            self.close_receive_stream(pending.holder, stream_id);
         }
     }
 
@@ -368,6 +383,20 @@ impl BlobTransferEngine {
         };
         if let Some(tx) = pending.done.take() {
             let _ = tx.send(result);
+        }
+        self.close_receive_stream(pending.holder, stream_id);
+    }
+
+    /// Tear down the receive-side stream once a transfer settles. The
+    /// data is fully received (or the transfer failed), so no more
+    /// packets are expected; reclaiming the stream keeps a high-file-
+    /// count directory pull from accumulating one live stream per chunk
+    /// until the 300 s idle timeout (which exhausts memory at scale). A
+    /// late retransmit after close is harmless — it re-creates an empty
+    /// stream that finds no pending entry and idles out.
+    fn close_receive_stream(&self, holder: u64, stream_id: u64) {
+        if let Some(mesh) = self.mesh.upgrade() {
+            mesh.close_stream(holder, stream_id);
         }
     }
 }
@@ -408,25 +437,25 @@ async fn serve_chunk(
             let header = TransferHeader::Found {
                 total_len: bytes.len() as u64,
             };
-            if send_one(&mesh, &stream, postcard_event(&header)).await.is_err() {
-                return;
-            }
-            // One reliable event per ~8 KiB frame. Because
-            // `TRANSFER_STREAM_WINDOW_BYTES` covers a whole chunk's
-            // on-wire size, the per-event credit never runs dry
-            // mid-chunk, so these sends don't stall into
-            // `send_with_retry`'s backoff (the 64 KiB default window
-            // exhausted every ~8 frames and each stall paid ≥5 ms even
-            // though the receiver's grant lands in <1 ms). Per-event
-            // (not batched) keeps each `send_with_retry` independently
-            // safe: a one-packet call can't partially commit and then
-            // resend a duplicate under a fresh sequence on retry.
-            for chunk in bytes.chunks(DATA_FRAME_BYTES) {
-                if send_one(&mesh, &stream, Bytes::copy_from_slice(chunk))
-                    .await
-                    .is_err()
-                {
-                    return;
+            if send_one(&mesh, &stream, postcard_event(&header)).await.is_ok() {
+                // One reliable event per ~8 KiB frame. Because
+                // `TRANSFER_STREAM_WINDOW_BYTES` covers a whole chunk's
+                // on-wire size, the per-event credit never runs dry
+                // mid-chunk, so these sends don't stall into
+                // `send_with_retry`'s backoff (the 64 KiB default window
+                // exhausted every ~8 frames and each stall paid ≥5 ms
+                // even though the receiver's grant lands in <1 ms).
+                // Per-event (not batched) keeps each `send_with_retry`
+                // independently safe: a one-packet call can't partially
+                // commit and then resend a duplicate under a fresh
+                // sequence on retry.
+                for chunk in bytes.chunks(DATA_FRAME_BYTES) {
+                    if send_one(&mesh, &stream, Bytes::copy_from_slice(chunk))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             }
         }
@@ -436,6 +465,18 @@ async fn serve_chunk(
             let _ = send_one(&mesh, &stream, postcard_event(&TransferHeader::NotFound)).await;
         }
     }
+
+    // Reclaim the serving stream once we've finished sending (or bailed).
+    // The already-enqueued scheduler packets reach the receiver
+    // regardless of session-stream state, so closing here doesn't drop
+    // bytes on the loss-free local path — it just stops the serving node
+    // from leaking one live stream per served chunk until the 300 s idle
+    // timeout (the symmetric half of the receive-side close, and what
+    // makes directory-scale fan-out not exhaust memory). A FIN + ack-
+    // tracked close that stays correct under mid-transfer loss on a lossy
+    // link is a follow-up; localhost-scale transfer doesn't exercise
+    // retransmit.
+    mesh.close_stream(requester, stream_id);
 }
 
 fn postcard_event<T: Serialize>(value: &T) -> Bytes {
