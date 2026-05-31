@@ -97,35 +97,28 @@ const DATA_FRAME_BYTES: usize = 8000;
 
 /// Tx-credit window for a serving transfer stream, in on-wire bytes.
 ///
-/// **Invariant: the flow-control window must not exceed the reliability
-/// retransmit window.** A reliable stream only tracks its most recent
-/// `ReliableStream::DEFAULT_MAX_PENDING` (32) unacked packets for
-/// retransmit; an unacked packet that ages past that window is evicted
-/// and a later NACK can no longer recover it. If the tx-credit window
-/// lets more than that many packets fly before the receiver's grants
-/// catch up — which happens precisely when the receiver is slow, e.g.
-/// several transfers contending for one recv loop — then an early drop
-/// is unrecoverable and the transfer stalls to the 30 s timeout.
+/// Sized to ≈ `DEFAULT_MAX_PENDING` (32) frames worth: `DEFAULT_MAX_PENDING
+/// × DATA_FRAME_BYTES` ≈ 256 KiB. Charged on-wire bytes per packet exceed
+/// `DATA_FRAME_BYTES` (Net header + AEAD tag + framing), so this admits
+/// *fewer* than 32 packets in flight.
 ///
-/// So size the window to ≈ the retransmit window: `DEFAULT_MAX_PENDING`
-/// frames. Charged on-wire bytes per packet exceed `DATA_FRAME_BYTES`
-/// (header + AEAD tag + framing), so a window of `DEFAULT_MAX_PENDING ×
-/// DATA_FRAME_BYTES` admits *fewer* than `DEFAULT_MAX_PENDING` packets
-/// in flight — comfortably inside the retransmit window.
+/// Since H-1 the reliability **retransmit window auto-sizes from this
+/// tx-window** (`ReliableStream::max_pending_for_window`), so the
+/// "in-flight ≤ retransmit-window" invariant holds automatically for any
+/// window value — an unacked packet aged past the retransmit window
+/// would be evicted and unrecoverable, but the retransmit window now
+/// always covers the flow-control window. This constant therefore no
+/// longer *manually* couples to the fixed 32 (pre-H-1 it had to).
 ///
-/// This is smaller than a whole chunk, so a multi-MiB chunk refills the
-/// window several times and a refill that finds no credit pays
-/// `send_with_retry`'s backoff. That costs little in practice: measured
-/// single-stream throughput is the same as with a 5 MiB window (it's
-/// bounded by per-datagram loopback latency, not credit), and concurrent
-/// transfers keep the pipe full across streams. An earlier 5 MiB window
-/// *looked* faster but silently violated the invariant above — concurrent
-/// large transfers corrupted/timed out (see tests/transfer_concurrency.rs).
-/// Coupling the window to the retransmit window is the correctness fix;
-/// raising both together (a per-stream retransmit-window knob) is a
-/// possible future throughput lever but must avoid pre-reserving large
-/// retransmit buffers per stream (that re-creates the many-small-stream
-/// memory blow-up).
+/// It's kept modest because a larger window buys nothing here: measured
+/// single-stream throughput is bounded by per-datagram loopback latency,
+/// not credit, and concurrent transfers keep the pipe full across
+/// streams. (An earlier 5 MiB window pre-dated H-1's auto-sizing and,
+/// against the then-fixed 32-packet retransmit window, let concurrent
+/// large transfers drop packets past recovery — see
+/// tests/transfer_concurrency.rs.) A multi-MiB chunk refills this window
+/// several times; a refill that finds no credit pays `send_with_retry`'s
+/// backoff, which is negligible on the loopback-latency-bound path.
 const TRANSFER_STREAM_WINDOW_BYTES: u32 =
     crate::adapter::net::ReliableStream::DEFAULT_MAX_PENDING as u32 * DATA_FRAME_BYTES as u32;
 
@@ -143,7 +136,7 @@ const SEND_RETRIES: usize = 64;
 
 /// Cap on how far ahead of the next-expected sequence the receiver will
 /// buffer out-of-order transfer packets. The sender can't have more than
-/// its tx window (`TRANSFER_STREAM_WINDOW_BYTES` ≈ 640 frames) in flight,
+/// its tx window (`TRANSFER_STREAM_WINDOW_BYTES` ≈ 32 frames) in flight,
 /// so legitimate reordering never spans more than that; 1024 leaves
 /// margin while bounding the reorder buffer (a far-future seq is dropped
 /// and the sender retransmits it once the gap closes). Also bounds memory

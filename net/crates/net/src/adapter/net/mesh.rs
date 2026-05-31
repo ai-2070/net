@@ -10656,6 +10656,17 @@ impl MeshNode {
     /// rejected by the receiver's replay window. No-op for unreliable
     /// streams. The epoch guard skips registration if a close+reopen
     /// raced and replaced the stream state since the credit was acquired.
+    ///
+    /// Clock note (T-4): `on_send` stamps `sent_at = Instant::now()` here,
+    /// at enqueue time. For a `scheduled` stream the packet may then sit
+    /// in the FairScheduler queue before the router's send loop ships it,
+    /// so a deep scheduler backlog starts the RTT/RTO clock slightly
+    /// before the packet is on the wire — biasing the adaptive-RTO sample
+    /// low and risking a marginally early timeout-driven resend. This
+    /// self-corrects (the next clean RTT sample re-converges) and the
+    /// scheduler queue is shallow in practice; stamping at dequeue would
+    /// need the descriptor visible in the router send loop, which it
+    /// isn't, so the enqueue-time stamp is accepted.
     fn register_retransmit(
         session: &Arc<NetSession>,
         stream_id: u64,

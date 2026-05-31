@@ -54,6 +54,17 @@ pub const DIR_MANIFEST_VERSION: u8 = 1;
 /// this only bounds how many files race for the window at once.
 pub const DEFAULT_FETCH_CONCURRENCY: usize = 16;
 
+/// File size above which a single read/write is offloaded to the
+/// blocking pool (T-3). Below it the I/O is sub-millisecond, so doing it
+/// inline avoids `spawn_blocking` dispatch overhead — which at
+/// node_modules scale (tens of thousands of small files) otherwise
+/// dominates and tanks throughput. Large files (where the blocking I/O
+/// could actually stall an executor thread) are offloaded. The recursive
+/// directory walk and the mkdir / symlink passes are always offloaded
+/// (one `spawn_blocking` each — they're tight syscall loops regardless
+/// of file size).
+const BLOCKING_FS_THRESHOLD: u64 = 256 * 1024;
+
 /// Aggregate in-flight byte budget across concurrent leaf fetches in
 /// [`fetch_dir`]. The per-stream tx window is large (≈ a whole chunk),
 /// so the file-count cap alone does NOT bound how many bytes are in
@@ -198,16 +209,26 @@ pub struct DirStats {
 /// manifest. Non-regular, non-dir, non-symlink nodes are skipped.
 pub async fn store_dir(adapter: &MeshBlobAdapter, root: &Path) -> Result<BlobRef, DirError> {
     let mut entries: Vec<DirEntry> = Vec::new();
-    // Deterministic order: collect raw FS entries, sort by relative
-    // path, then store. `BTreeSet` of (path, is_for_sort) is overkill;
-    // a Vec + sort is clearer.
-    let mut raw: Vec<(String, std::fs::Metadata, PathBuf)> = Vec::new();
-    walk(root, root, &mut raw)?;
+    // Directory traversal (`read_dir` + `symlink_metadata`, recursive) is
+    // blocking FS — run it on the blocking pool so it doesn't stall an
+    // async executor thread at node_modules scale (T-3). Deterministic
+    // order: collect, then sort by relative path.
+    let root_buf = root.to_path_buf();
+    let mut raw = tokio::task::spawn_blocking(
+        move || -> Result<Vec<(String, std::fs::Metadata, PathBuf)>, DirError> {
+            let mut raw = Vec::new();
+            walk(&root_buf, &root_buf, &mut raw)?;
+            Ok(raw)
+        },
+    )
+    .await
+    .map_err(|e| DirError::Io(std::io::Error::other(e)))??;
     raw.sort_by(|a, b| a.0.cmp(&b.0));
 
     for (rel, meta, abs) in raw {
         let file_type = meta.file_type();
         if file_type.is_symlink() {
+            // read_link is a single tiny syscall — inline.
             let target = std::fs::read_link(&abs)?;
             entries.push(DirEntry {
                 path: rel,
@@ -223,7 +244,15 @@ pub async fn store_dir(adapter: &MeshBlobAdapter, root: &Path) -> Result<BlobRef
                 },
             });
         } else if file_type.is_file() {
-            let bytes = std::fs::read(&abs)?;
+            // Offload only large reads (T-3); small files read inline
+            // (sub-ms, cheaper than spawn_blocking dispatch).
+            let bytes = if meta.len() > BLOCKING_FS_THRESHOLD {
+                tokio::task::spawn_blocking(move || std::fs::read(&abs))
+                    .await
+                    .map_err(|e| DirError::Io(std::io::Error::other(e)))??
+            } else {
+                std::fs::read(&abs)?
+            };
             let chunked = chunk_payload(&bytes)?;
             let hash: [u8; 32] = blake3::hash(&bytes).into();
             let uri = format!("mesh://{}", hex(&hash));
@@ -332,7 +361,6 @@ pub async fn fetch_dir(
     }
 
     let dest = dest.to_path_buf();
-    std::fs::create_dir_all(&dest)?;
     let mut stats = DirStats::default();
 
     // Pass 1: create every directory (explicit Dir entries + each
@@ -352,12 +380,21 @@ pub async fn fetch_dir(
             }
         }
     }
-    for dir in &want_dirs {
-        if !dir.exists() {
-            std::fs::create_dir_all(dir)?;
-            stats.dirs += 1;
+    // Create dirs (incl. `dest`) on the blocking pool (T-3).
+    let dest_for_dirs = dest.clone();
+    stats.dirs = tokio::task::spawn_blocking(move || -> Result<usize, DirError> {
+        std::fs::create_dir_all(&dest_for_dirs)?;
+        let mut n = 0;
+        for dir in &want_dirs {
+            if !dir.exists() {
+                std::fs::create_dir_all(dir)?;
+                n += 1;
+            }
         }
-    }
+        Ok(n)
+    })
+    .await
+    .map_err(|e| DirError::Io(std::io::Error::other(e)))??;
 
     // Pass 2: fetch + write files with bounded concurrency.
     let concurrency = if concurrency == 0 {
@@ -400,8 +437,16 @@ pub async fn fetch_dir(
                 .await
                 .expect("byte semaphore not closed");
             let bytes = transfer_fetch_blob(&node, source, &blob_ref).await?;
-            write_file(&safe, &bytes, mode)?;
-            Ok::<u64, DirError>(bytes.len() as u64)
+            let len = bytes.len() as u64;
+            // Offload only large writes (T-3); small files write inline.
+            if len > BLOCKING_FS_THRESHOLD {
+                tokio::task::spawn_blocking(move || write_file(&safe, &bytes, mode))
+                    .await
+                    .map_err(|e| DirError::Io(std::io::Error::other(e)))??;
+            } else {
+                write_file(&safe, &bytes, mode)?;
+            }
+            Ok::<u64, DirError>(len)
         }));
     }
     for task in tasks {
@@ -420,17 +465,23 @@ pub async fn fetch_dir(
     }
 
     // Pass 3: symlinks last (targets may be files just written).
+    // Resolve safe paths (CPU) here, then create the links on the
+    // blocking pool (T-3). A platform that can't create a symlink (e.g.
+    // Windows without privilege) is tolerated — the files still landed.
+    let mut links: Vec<(String, PathBuf)> = Vec::new();
     for entry in &manifest.entries {
         if let EntryKind::Symlink { target } = &entry.kind {
-            let safe = safe_join(&dest, &entry.path)?;
-            if make_symlink(target, &safe).is_ok() {
-                stats.symlinks += 1;
-            }
-            // A platform that can't create the symlink (e.g. Windows
-            // without privilege) is tolerated — the tree's files still
-            // landed; the link is best-effort.
+            links.push((target.clone(), safe_join(&dest, &entry.path)?));
         }
     }
+    stats.symlinks = tokio::task::spawn_blocking(move || {
+        links
+            .into_iter()
+            .filter(|(target, safe)| make_symlink(target, safe).is_ok())
+            .count()
+    })
+    .await
+    .map_err(|e| DirError::Io(std::io::Error::other(e)))?;
 
     Ok(stats)
 }

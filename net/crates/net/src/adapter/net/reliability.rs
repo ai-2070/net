@@ -270,6 +270,15 @@ pub struct ReliableStream {
     /// Slow-start threshold — above it, growth switches from slow-start
     /// (+1/ack) to congestion-avoidance (+1/cwnd per ack).
     ssthresh: f64,
+    /// Fast-recovery "recover point" (T-1): the `next_expected` of the
+    /// loss episode currently being recovered. `Some(r)` means we've
+    /// already reacted to the gap at `r` (resent + one cwnd cut) and are
+    /// awaiting its repair; further NACKs at `next_expected <= r` are
+    /// duplicates (the receiver re-NACKs every tick, faster than one RTT
+    /// on a high-RTT link) and must be ignored so they don't re-resend,
+    /// re-halve cwnd, or bump `retries` toward a spurious give-up.
+    /// Cleared (`None`) once a cumulative ack advances past `r`.
+    recover: Option<u64>,
 }
 
 impl ReliableStream {
@@ -348,6 +357,7 @@ impl ReliableStream {
             rttvar: Duration::ZERO,
             cwnd: Self::INIT_CWND,
             ssthresh: f64::MAX,
+            recover: None,
         }
     }
 
@@ -367,6 +377,7 @@ impl ReliableStream {
             rttvar: Duration::ZERO,
             cwnd: Self::INIT_CWND,
             ssthresh: f64::MAX,
+            recover: None,
         }
     }
 
@@ -622,6 +633,24 @@ impl ReliabilityMode for ReliableStream {
     }
 
     fn on_nack(&mut self, nack: &NackPayload) -> Vec<Arc<RetransmitDescriptor>> {
+        // Fast-recovery dedup (T-1): react to a loss episode only once.
+        // The receiver re-NACKs a persistent gap every tick (25 ms),
+        // which on a link with RTT > tick arrives several times before
+        // the first retransmit can return. Without this guard each
+        // duplicate would resend the same packet (bandwidth
+        // amplification), halve cwnd again (collapsing it far below what
+        // one loss warrants), and bump `retries` — tripping a spurious
+        // give-up + StreamReset while the retransmit is still in flight.
+        // We react when `next_expected` advances past the recover point
+        // (a genuinely new gap) and ignore duplicates for the same/older
+        // head gap; a lost retransmit is then recovered by the RTO-paced
+        // timeout path, not by the NACK flood.
+        let new_loss = self.recover.map_or(true, |r| nack.next_expected > r);
+        if !new_loss {
+            return Vec::new();
+        }
+        self.recover = Some(nack.next_expected);
+
         let mut retransmits = Vec::new();
 
         // Find packets to retransmit based on NACK. Return the
@@ -699,29 +728,37 @@ impl ReliabilityMode for ReliableStream {
     }
 
     fn on_ack(&mut self, ack_seq: u64) {
-        // RTT sample for the adaptive RTO (H-5), Karn's algorithm: the
-        // freshest now-acked packet that was NOT retransmitted (a
-        // retransmitted packet's ack is ambiguous). `pending` is
-        // seq-ordered, so the last acked, retries==0 packet is freshest.
+        // Single pass over `pending` (T-7): for every acked sequence
+        // (`seq < ack_seq`, contiguously received) fold an RTT sample
+        // (H-5, Karn — non-retransmitted only; `pending` is seq-ordered
+        // so the last such packet is the freshest), count it for cwnd
+        // growth (H-6), then drop it from the retransmit window (H-9).
         let now = Instant::now();
         let mut sample = None;
-        for u in &self.pending {
-            if u.seq() < ack_seq && u.retries == 0 {
-                sample = Some(now.duration_since(u.sent_at));
+        let mut acked = 0usize;
+        self.pending.retain(|u| {
+            if u.seq() < ack_seq {
+                if u.retries == 0 {
+                    sample = Some(now.duration_since(u.sent_at));
+                }
+                acked += 1;
+                false // drop — acked
+            } else {
+                true // keep — still in flight
             }
-        }
+        });
         if let Some(rtt) = sample {
             self.update_rto(rtt);
         }
-        // Grow the congestion window for each newly-acked packet (H-6).
-        let acked = self.pending.iter().filter(|u| u.seq() < ack_seq).count();
         for _ in 0..acked {
             self.grow_cwnd();
         }
-        // Every sequence < ack_seq has been received contiguously by the
-        // peer — drop them from the retransmit window. `pending` is
-        // ordered by send time (≈ seq), so this is a cheap prefix drop.
-        self.pending.retain(|u| u.seq() >= ack_seq);
+        // Fast recovery (T-1): a cumulative ack past the recover point
+        // means the loss episode is repaired — leave recovery so the
+        // next genuinely-new gap reacts.
+        if self.recover.is_some_and(|r| ack_seq > r) {
+            self.recover = None;
+        }
     }
 
     fn can_send(&self) -> bool {
@@ -944,6 +981,48 @@ mod tests {
         assert!(!s.on_nack(&nack).is_empty(), "NACK retransmits seq 5");
         assert!(s.cwnd < before, "fast-retransmit halves cwnd");
         assert!(s.cwnd >= ReliableStream::MIN_CWND, "but not below the floor");
+    }
+
+    #[test]
+    fn duplicate_nacks_for_same_gap_are_deduped() {
+        // T-1 fast-recovery dedup: a burst of NACKs for the same head gap
+        // (the receiver re-NACKs every tick, faster than one RTT) must
+        // react only once — no re-resend, no further cwnd cut, no extra
+        // `retries` bump → no spurious give-up while the retransmit is in
+        // flight.
+        let mut s = ReliableStream::with_settings(Duration::from_millis(50), 1000, 3);
+        for seq in 0..10u64 {
+            s.on_send(descriptor(seq, Bytes::from_static(b"x")));
+        }
+        let cwnd0 = s.cwnd;
+        let nack = NackPayload {
+            next_expected: 3,
+            missing_bitmap: 0,
+        };
+        // First NACK for the gap at seq 3 → one retransmit + one cwnd cut.
+        assert_eq!(s.on_nack(&nack).len(), 1, "first NACK retransmits seq 3");
+        let cwnd1 = s.cwnd;
+        assert!(cwnd1 < cwnd0, "first NACK halves cwnd");
+        // A flood of identical NACKs → all ignored.
+        for _ in 0..5 {
+            assert!(
+                s.on_nack(&nack).is_empty(),
+                "duplicate NACK for the same gap is ignored"
+            );
+        }
+        assert_eq!(s.cwnd, cwnd1, "cwnd is not cut again by duplicate NACKs");
+        assert!(!s.take_failed(), "no spurious give-up from the NACK flood");
+
+        // Once the gap is repaired (ack advances past it), a NACK for a
+        // NEW, later gap reacts again.
+        s.on_ack(4); // seq 3 acked → recovery ends
+        let cwnd2 = s.cwnd;
+        let nack2 = NackPayload {
+            next_expected: 7,
+            missing_bitmap: 0,
+        };
+        assert_eq!(s.on_nack(&nack2).len(), 1, "a new gap reacts");
+        assert!(s.cwnd < cwnd2, "a new loss episode cuts cwnd again");
     }
 
     #[test]
@@ -1402,14 +1481,13 @@ mod tests {
 
     #[test]
     fn test_regression_duplicate_seq_zero_rejected() {
-        // Regression: on_receive had a special case for seq=0 that checked
-        // `seq == 0 && self.ack_seq == 0`. After receiving seq 0, ack_seq
-        // was still 0, so a duplicate seq 0 hit the same early return and
-        // was accepted again — violating exactly-once delivery for reliable
-        // streams.
-        //
-        // Fix: added `received_first` flag to distinguish "never received
-        // anything" from "received seq 0".
+        // Regression: a duplicate seq 0 must be rejected for exactly-once
+        // delivery. `on_receive` rejects any `seq < next_expected` as a
+        // duplicate: after seq 0 is accepted, `next_expected` advances to
+        // 1, so a re-delivered seq 0 (0 < 1) is rejected. (An earlier
+        // impl special-cased `seq == 0 && ack_seq == 0`; since `ack_seq`
+        // stayed 0 right after receiving seq 0, that path re-accepted the
+        // duplicate — the `next_expected`-based check has no such hole.)
         let mut mode = ReliableStream::new();
 
         // First reception of seq 0 should succeed
@@ -1429,12 +1507,11 @@ mod tests {
 
     #[test]
     fn test_regression_seq_zero_after_higher_seqs_rejected() {
-        // Regression: seq 0 arriving after ack_seq had advanced (e.g., to 5)
-        // would pass the `seq == 0 && !received_first` check (false, so it
-        // fell through) and then hit `seq <= self.ack_seq` → duplicate.
-        // That path was correct, but an earlier version without received_first
-        // would have reset ack_seq to 0, moving the window backwards.
-        // This test ensures the fix holds.
+        // Regression: seq 0 arriving after the window has advanced (e.g.
+        // next_expected = 6) must be rejected as a duplicate. The
+        // `seq < next_expected` check covers it and must not move the
+        // window backwards. (An earlier seq-0 special case risked
+        // resetting the window to 0.) This test ensures the fix holds.
         let mut mode = ReliableStream::new();
 
         // Receive 0..5 in order
@@ -1602,26 +1679,33 @@ mod tests {
         assert_eq!(r.events, events_b);
         assert_eq!(r.flags, PacketFlags::RELIABLE);
 
-        // The descriptor has the inputs needed for
-        // `PacketBuilder::build(stream_id, seq, &events, flags)`.
-        // Each retransmit lets the caller produce a fresh-counter
-        // packet — distinct from the original even though the
-        // descriptor itself is identical to what was originally
-        // pushed. This is what fixes the replay-window rejection.
-        let nack2 = NackPayload {
+        // A duplicate NACK for the same head gap is deduped (T-1) — the
+        // first retransmit is in flight, so re-NACKing must not re-emit.
+        let dup = NackPayload {
             next_expected: 1,
+            missing_bitmap: 0,
+        };
+        assert!(
+            mode.on_nack(&dup).is_empty(),
+            "duplicate NACK for the same gap is deduped"
+        );
+
+        // A NACK for a genuinely newer gap (seq 2) does re-emit, carrying
+        // its own pre-encryption descriptor. Each retransmit lets the
+        // caller produce a fresh-counter packet — the descriptor inputs
+        // (stream_id/events/flags) are what fix the replay-window
+        // rejection; cipher-counter freshness is the rebuild caller's job.
+        let nack2 = NackPayload {
+            next_expected: 2,
             missing_bitmap: 0,
         };
         let retransmits2 = mode.on_nack(&nack2);
         assert_eq!(retransmits2.len(), 1);
         let r2 = &retransmits2[0];
-        // The descriptor is the same — the *cipher counter* freshness
-        // is the responsibility of the rebuild caller, not of the
-        // reliability layer.
-        assert_eq!(r2.seq, r.seq);
-        assert_eq!(r2.events, r.events);
-        assert_eq!(r2.flags, r.flags);
-        assert_eq!(r2.stream_id, r.stream_id);
+        assert_eq!(r2.seq, 2);
+        assert_eq!(r2.events, events_c);
+        assert_eq!(r2.flags, PacketFlags::RELIABLE);
+        assert_eq!(r2.stream_id, 7);
     }
 
     /// Pin crypto-session perf #133: `on_nack` and `get_timed_out`
