@@ -207,6 +207,22 @@ pub mod blob_stubs;
 #[allow(missing_docs)]
 pub mod mesh;
 
+/// C FFI for the transport surface (blob + directory transfer over the
+/// fairscheduler stream transport — Transport SDK plan T-C). Drives the
+/// node's transfer engine via the existing `MeshNodeHandle` +
+/// `MeshBlobAdapterHandle`, so it rides `net` + the blob-adapter feature
+/// set (the adapter handle needs `netdb` + `redex-disk`). Feature-off
+/// stubs land with the Go binding (T-F) — the first unconditional linker
+/// of these symbols.
+#[cfg(all(
+    feature = "net",
+    feature = "dataforts",
+    feature = "netdb",
+    feature = "redex-disk"
+))]
+#[allow(missing_docs)]
+pub mod transport;
+
 /// C FFI for the `aggregator.registry` RPC client + channel
 /// visibility setter. Stage 5 of `SDK_AGGREGATOR_SUBNET_PLAN.md`.
 /// Rides the `net` feature alongside `ffi::mesh` because every

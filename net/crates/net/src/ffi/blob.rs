@@ -1096,6 +1096,21 @@ pub unsafe extern "C" fn net_mesh_blob_adapter_free(handle: *mut MeshBlobAdapter
     }
 }
 
+/// Clone the `Arc<MeshBlobAdapter>` backing this handle under the
+/// handle guard, for the sibling transport FFI (`ffi::transport`). The
+/// `try_enter` op is held across the `Arc::clone` so a concurrent
+/// `net_mesh_blob_adapter_free` cannot take the inner out of
+/// `ManuallyDrop` mid-clone; the bumped refcount then keeps the adapter
+/// alive independently. Returns `None` once `_free` has begun. Mirrors
+/// [`super::mesh::mesh_node_arc`].
+#[cfg(all(feature = "dataforts", feature = "netdb", feature = "redex-disk"))]
+pub(super) fn blob_adapter_arc(
+    h: &MeshBlobAdapterHandle,
+) -> Option<Arc<InnerMeshBlobAdapter>> {
+    let _op = h.guard.try_enter()?;
+    Some(Arc::clone(&h.inner))
+}
+
 /// Store `data` of `data_len` bytes under the content address
 /// declared by `blob_ref_bytes` (a previously-encoded `BlobRef`
 /// wire blob from `net_blob_publish` or constructed externally).
