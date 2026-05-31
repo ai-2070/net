@@ -1,0 +1,30 @@
+net/crates/net/src/ffi/mod.rs
+  s_4e65c03b4a88ec::t_41a28942ef2dd5 215
+  s_4e65c03b4a88ec::t_7e3059cf37f65d 225-237
+net/crates/net/src/ffi/transport_stubs.rs
+  s_4e65c03b4a88ec::t_92fe23d920758e 1-119,176-177
+  s_4e65c03b4a88ec::t_17969b32fb1a8c 120-175
+net/crates/net/src/ffi/blob_stubs.rs
+  s_4e65c03b4a88ec::t_793bc11e6b052d 159-197,200-206
+net/crates/net/docs/plans/TRANSPORT_SDK_STATUS.md
+  s_4e65c03b4a88ec::t_554ca4ebbc877a 78-84
+net/crates/net/bindings/go/net/transport.go
+  s_4e65c03b4a88ec::t_6bb681c71c862f 145-146
+  s_4e65c03b4a88ec::t_34e06db6551002 92-98
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "b771d7f8eab0f26c6cdd1bb439b76767be4ce2b4",
+  "prompts": {},
+  "sessions": {
+    "s_4e65c03b4a88ec": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f38fba46-70fe-4a54-9993-f298695ba62b",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
