@@ -458,6 +458,14 @@ struct DispatchCtx {
     /// `parking_lot::RwLock` are single-digit-nanoseconds.
     #[cfg(feature = "dataforts")]
     greedy_observer: Arc<parking_lot::RwLock<Option<Arc<dyn super::dataforts::GreedyObserver>>>>,
+    /// Optional blob-transfer engine (FairScheduler transport). The
+    /// `SUBPROTOCOL_BLOB_TRANSFER` control branch and the
+    /// `is_transfer_stream_id` data divert consult it. `None` until a
+    /// node calls `serve_blob_transfer`.
+    #[cfg(feature = "dataforts")]
+    blob_transfer_engine: Arc<
+        parking_lot::RwLock<Option<Arc<super::dataforts::blob::transfer::BlobTransferEngine>>>,
+    >,
     /// In-flight initiator handshakes; dispatch completes them when a
     /// matching routed msg2 arrives.
     pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
@@ -1758,6 +1766,13 @@ pub struct MeshNode {
     /// `!Sized` and `ArcSwapOption` doesn't accept it.
     #[cfg(feature = "dataforts")]
     greedy_observer: Arc<parking_lot::RwLock<Option<Arc<dyn super::dataforts::GreedyObserver>>>>,
+    /// Optional blob-transfer engine (FairScheduler transport plan).
+    /// Installed by [`Self::serve_blob_transfer`]; drives on-demand
+    /// cross-peer blob fetch over reliable scheduled streams.
+    #[cfg(feature = "dataforts")]
+    blob_transfer_engine: Arc<
+        parking_lot::RwLock<Option<Arc<super::dataforts::blob::transfer::BlobTransferEngine>>>,
+    >,
     /// Monotonic version counter used when stamping our own
     /// announcements. `CapabilityIndex::index` skips older versions,
     /// so this must move forward across restarts if the caller wants
@@ -2216,6 +2231,8 @@ impl MeshNode {
             fold_generations: Arc::new(DashMap::new()),
             #[cfg(feature = "dataforts")]
             greedy_observer: Arc::new(parking_lot::RwLock::new(None)),
+            #[cfg(feature = "dataforts")]
+            blob_transfer_engine: Arc::new(parking_lot::RwLock::new(None)),
             capability_version: Arc::new(AtomicU64::new(0)),
             local_subnet,
             local_subnet_policy,
@@ -3138,6 +3155,8 @@ impl MeshNode {
             fold_router: self.fold_router.clone(),
             #[cfg(feature = "dataforts")]
             greedy_observer: self.greedy_observer.clone(),
+            #[cfg(feature = "dataforts")]
+            blob_transfer_engine: self.blob_transfer_engine.clone(),
             pending_handshakes: self.pending_handshakes.clone(),
             pending_direct_initiators: self.pending_direct_initiators.clone(),
             static_keypair: self.static_keypair.clone(),
@@ -4186,6 +4205,34 @@ impl MeshNode {
             return;
         }
 
+        // Blob transfer control plane (FairScheduler transport plan):
+        // a `TransferControl::Request` initiating an on-demand fetch.
+        // The engine spawns a serving task that streams the chunk back
+        // on the requester's transfer stream-id. `None` engine = this
+        // node doesn't serve transfers = drop. The bulk DATA does NOT
+        // ride this subprotocol — it rides reliable event-plane streams
+        // and is diverted to the engine by `is_transfer_stream_id` in
+        // `process_local_packet` (so it gets in-order retransmit).
+        #[cfg(feature = "dataforts")]
+        if parsed.header.subprotocol_id == super::dataforts::blob::SUBPROTOCOL_BLOB_TRANSFER {
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+            if events.is_empty() {
+                return;
+            }
+            let engine_guard = ctx.blob_transfer_engine.read();
+            let Some(engine) = engine_guard.as_ref() else {
+                return;
+            };
+            if from_node == 0 {
+                return;
+            }
+            let stream_id = parsed.header.stream_id;
+            for payload in events {
+                engine.on_request(from_node, stream_id, &payload);
+            }
+            return;
+        }
+
         // MeshDB: federated query traffic on `SUBPROTOCOL_MESHDB`.
         // Both directions (requests caller → server, responses
         // server → caller) ride the same subprotocol slot; the
@@ -4728,6 +4775,23 @@ impl MeshNode {
         // event when the observer is installed. The runtime
         // itself spawns a tokio task per event to absorb the
         // async dispatch.
+        // Blob-transfer data divert (FairScheduler transport plan):
+        // reliable event-plane data on a transfer stream-id goes to the
+        // transfer engine's reassembly — NOT the event bus. We're past
+        // the `on_receive` reliability gate (so these events are
+        // in-order + deduped) and past the StreamWindow grant (so the
+        // sender's tx-credit keeps flowing); the transfer stream-id
+        // convention (bit 61 set, bit 48 clear) makes this a couple of
+        // bitops on the hot path.
+        #[cfg(feature = "dataforts")]
+        if super::dataforts::blob::is_transfer_stream_id(stream_id) {
+            let engine_guard = ctx.blob_transfer_engine.read();
+            if let Some(engine) = engine_guard.as_ref() {
+                engine.on_data(stream_id, events);
+            }
+            return;
+        }
+
         #[cfg(feature = "dataforts")]
         let greedy = ctx.greedy_observer.read().clone();
 
@@ -9070,6 +9134,116 @@ impl MeshNode {
             caps.tags.remove(&target);
         }
         self.announce_capabilities(caps).await
+    }
+}
+
+#[cfg(feature = "dataforts")]
+impl MeshNode {
+    /// Install the blob-transfer engine over `adapter` (FairScheduler
+    /// transport plan). After this, the node serves on-demand chunk
+    /// fetches (the `SUBPROTOCOL_BLOB_TRANSFER` control branch + the
+    /// transfer-stream data divert route to the engine) and can issue
+    /// them via [`Self::transfer_fetch_chunk`]. Idempotent — re-install
+    /// replaces the engine.
+    pub fn serve_blob_transfer(
+        self: &Arc<Self>,
+        adapter: Arc<super::dataforts::blob::MeshBlobAdapter>,
+    ) {
+        let engine = Arc::new(super::dataforts::blob::transfer::BlobTransferEngine::new(
+            self, adapter,
+        ));
+        *self.blob_transfer_engine.write() = Some(engine);
+    }
+
+    /// Fetch the chunk addressed by `hash` from `holder` over a
+    /// reliable, scheduled transfer stream — bytes move over the
+    /// FairScheduler-managed stream transport, not RedEX replication or
+    /// nRPC. Returns the BLAKE3-verified bytes, or
+    /// [`BlobError::NotFound`] on a holder miss / timeout (so the caller
+    /// can fail over to another advertised holder).
+    ///
+    /// [`BlobError`]: super::dataforts::blob::BlobError
+    /// [`BlobError::NotFound`]: super::dataforts::blob::BlobError::NotFound
+    pub async fn transfer_fetch_chunk(
+        self: &Arc<Self>,
+        holder: u64,
+        hash: [u8; 32],
+    ) -> Result<bytes::Bytes, super::dataforts::blob::BlobError> {
+        use super::dataforts::blob::transfer::{next_transfer_stream_id, TransferControl};
+        use super::dataforts::blob::BlobError;
+
+        let engine = self.blob_transfer_engine.read().clone().ok_or_else(|| {
+            BlobError::Backend("blob transfer: engine not installed (serve_blob_transfer?)".into())
+        })?;
+        let stream_id = next_transfer_stream_id();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        engine.register_pending(stream_id, hash, tx);
+
+        if let Err(e) = self
+            .send_transfer_control(holder, stream_id, &TransferControl::Request { hash })
+            .await
+        {
+            engine.cancel_pending(stream_id);
+            return Err(BlobError::Backend(format!(
+                "blob transfer: send request failed: {e}"
+            )));
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_canceled)) => {
+                engine.cancel_pending(stream_id);
+                Err(BlobError::Backend("blob transfer: engine dropped the reply".into()))
+            }
+            Err(_elapsed) => {
+                engine.cancel_pending(stream_id);
+                Err(BlobError::NotFound(format!(
+                    "blob transfer: timed out fetching mesh://{}",
+                    Self::blob_hex(&hash)
+                )))
+            }
+        }
+    }
+
+    /// Send a blob-transfer control packet (subprotocol-tagged, tiny)
+    /// to `peer` on `stream_id`. Goes straight to the socket — control
+    /// is a single small packet; reliability is the requester's
+    /// timeout-and-retry, not per-packet retransmit.
+    async fn send_transfer_control(
+        &self,
+        peer: u64,
+        stream_id: u64,
+        control: &super::dataforts::blob::transfer::TransferControl,
+    ) -> Result<(), super::AdapterError> {
+        let (dest_addr, session) = match self.peers.get(&peer) {
+            Some(p) => (p.value().addr, p.value().session.clone()),
+            None => {
+                return Err(super::AdapterError::Connection(format!(
+                    "transfer control: no session for {peer:#x}"
+                )))
+            }
+        };
+        let bytes = bytes::Bytes::from(postcard::to_allocvec(control).map_err(|e| {
+            super::AdapterError::Connection(format!("transfer control: encode failed: {e}"))
+        })?);
+        let pool = session.thread_local_pool();
+        let mut builder = pool.get();
+        let seq = session.get_or_create_stream(stream_id).next_tx_seq();
+        let events = [bytes];
+        let packet = builder.build_subprotocol(
+            stream_id,
+            seq,
+            &events,
+            PacketFlags::RELIABLE,
+            super::dataforts::blob::SUBPROTOCOL_BLOB_TRANSFER,
+        );
+        self.socket
+            .send_to(&packet, dest_addr)
+            .await
+            .map_err(|e| {
+                super::AdapterError::Connection(format!("transfer control: send failed: {e}"))
+            })?;
+        Ok(())
     }
 }
 
