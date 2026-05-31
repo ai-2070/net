@@ -1,0 +1,28 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_3813c1cf893940::t_ab3487d08cb7b5 1769-1775
+  s_3813c1cf893940::t_b9d2a235236c70 461-468
+  s_3813c1cf893940::t_5ee468b7c304d1 4208-4235
+  s_3813c1cf893940::t_4c8138182d3ccd 9140-9249
+  s_3813c1cf893940::t_43a7fce1584cb0 2234-2235
+  s_3813c1cf893940::t_c90a65054bf8e3 3158-3159
+  s_3813c1cf893940::t_02b90097572553 4778-4794
+net/crates/net/tests/blob_transfer.rs
+  s_3813c1cf893940::t_2331c1641213d8 1-101,133-155
+  s_3813c1cf893940::t_bc7c31528444d4 102-132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "0f28c77add79c9df019d4a63cea2084752bae39a",
+  "prompts": {},
+  "sessions": {
+    "s_3813c1cf893940": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8f529043-9c28-441a-89cc-3de50f96f588",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
