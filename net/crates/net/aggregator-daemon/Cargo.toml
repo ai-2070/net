@@ -1,6 +1,6 @@
 [package]
 name = "net-aggregator-daemon"
-version = "0.27.0"
+version = "0.27.0-beta.1"
 edition = "2021"
 description = "Long-running daemon that hosts net-mesh AggregatorRegistry + aggregator groups"
 license = "Apache-2.0"
@@ -18,14 +18,14 @@ path = "src/main.rs"
 [dependencies]
 # Substrate primitives — aggregator + lifecycle + registry +
 # RPC service all live behind the SDK's `net` feature surface.
-net-sdk = { package = "net-mesh-sdk", version = "0.27.0", path = "../sdk", default-features = false, features = [
+net-sdk = { package = "net-mesh-sdk", version = "0.27.0-beta.1", path = "../sdk", default-features = false, features = [
     "net",
     "nat-traversal",
 ] }
 # Direct dep on the underlying crate so the binary can reach
 # the typed surfaces the SDK doesn't re-export (AggregatorConfig,
 # LifecycleGroup, etc).
-net = { package = "net-mesh", version = "0.27.0", path = ".." }
+net = { package = "net-mesh", version = "0.27.0-beta.1", path = ".." }
 
 # Argv parsing.
 clap = { version = "4", features = ["derive", "env"] }
