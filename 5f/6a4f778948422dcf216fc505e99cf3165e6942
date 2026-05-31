@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/DATAFORTS_BLOB_TRANSFER_FAIRSCHEDULER_PLAN.md
+  s_3813c1cf893940::t_182f21980f78ef 1-88
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "5f6a4f778948422dcf216fc505e99cf3165e6942",
+  "prompts": {},
+  "sessions": {
+    "s_3813c1cf893940": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8f529043-9c28-441a-89cc-3de50f96f588",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
