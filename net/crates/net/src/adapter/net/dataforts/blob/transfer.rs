@@ -268,6 +268,20 @@ impl BlobTransferEngine {
         self.pending.remove(&stream_id);
     }
 
+    /// The holder's reliable layer gave up retransmitting this transfer
+    /// stream (STREAM_RETRANSMIT H-3 reset). Fail the pending read now
+    /// with a distinct error so the caller can fail over to another
+    /// holder immediately instead of waiting for the 30 s timeout.
+    /// No-op if the transfer already settled.
+    pub fn on_reset(&self, stream_id: u64) {
+        self.finish(
+            stream_id,
+            Err(BlobError::Backend(
+                "transfer: holder reset stream (retransmit exhausted)".into(),
+            )),
+        );
+    }
+
     /// Serving side: a `TransferControl::Request` arrived on `stream_id`
     /// from `requester`. Spawn a task that reads the chunk locally and
     /// streams it back on the same (transfer) stream.

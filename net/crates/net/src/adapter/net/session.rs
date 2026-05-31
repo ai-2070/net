@@ -271,6 +271,20 @@ impl NetSession {
         out
     }
 
+    /// Take-and-clear the "given up" flag across all streams, returning
+    /// the ids of streams whose reliable layer exhausted retransmits on
+    /// some packet (H-3). The caller signals a reset to the peer so the
+    /// receiver fails fast instead of stalling to a timeout.
+    pub fn take_failed_stream_ids(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        for entry in self.streams.iter() {
+            if entry.value().with_reliability(|r| r.take_failed()) {
+                out.push(*entry.key());
+            }
+        }
+        out
+    }
+
     /// Look up stream state without creating it. Returns `None` if the
     /// stream was never opened or has been closed.
     pub fn try_stream(

@@ -77,6 +77,31 @@ pub trait ReliabilityMode: Send + Sync {
     /// [`Self::on_nack`] for the `Arc`-sharing contract.
     fn get_timed_out(&mut self) -> Vec<Arc<RetransmitDescriptor>>;
 
+    /// Take-and-clear the "stream has given up" flag (H-3): `true` once
+    /// after a packet exhausts `max_retries` while still unacked — the
+    /// reliable layer can no longer recover that gap, so the caller
+    /// should signal a stream reset to the peer rather than let it stall
+    /// to a higher-level timeout. Default `false` (fire-and-forget never
+    /// gives up — it tracks nothing).
+    fn take_failed(&mut self) -> bool {
+        false
+    }
+
+    /// The receiver's cumulative ack — the lowest sequence not yet
+    /// contiguously received (`next_expected`). The peer piggybacks this
+    /// on its window grants so the sender can prune (H-9). Default 0
+    /// (fire-and-forget tracks no sequence).
+    fn rx_ack_seq(&self) -> u64 {
+        0
+    }
+
+    /// Sender-side: a cumulative ack arrived — every sequence below
+    /// `ack_seq` has been received, so drop them from the retransmit
+    /// window (H-9). Without this, packets linger in `pending` on the
+    /// happy path until they spuriously time out and get resent (and,
+    /// post-H-3, spuriously give up). Default no-op.
+    fn on_ack(&mut self, _ack_seq: u64) {}
+
     /// Check if there are unacknowledged packets
     fn has_pending(&self) -> bool;
 
@@ -217,6 +242,11 @@ pub struct ReliableStream {
     /// their actual sustained reliable-stream throughput. Pre-fix
     /// the eviction was unobservable.
     untracked_evictions: u64,
+    /// Set when a packet exhausts `max_retries` while still unacked
+    /// (H-3): the reliable layer has given up on that gap. Taken-and-
+    /// cleared via [`Self::take_failed`] so the owning node can signal a
+    /// stream reset to the peer rather than let it stall to a timeout.
+    failed: bool,
 }
 
 impl ReliableStream {
@@ -272,6 +302,7 @@ impl ReliableStream {
             max_pending: Self::DEFAULT_MAX_PENDING,
             max_retries: Self::DEFAULT_MAX_RETRIES,
             untracked_evictions: 0,
+            failed: false,
         }
     }
 
@@ -286,6 +317,7 @@ impl ReliableStream {
             max_pending,
             max_retries,
             untracked_evictions: 0,
+            failed: false,
         }
     }
 
@@ -528,21 +560,52 @@ impl ReliabilityMode for ReliableStream {
 
     fn get_timed_out(&mut self) -> Vec<Arc<RetransmitDescriptor>> {
         let now = Instant::now();
+        let rto = self.rto;
+        let max_retries = self.max_retries;
         let mut retransmits = Vec::new();
+        let mut gave_up = false;
 
         // Per perf #133 — `Arc::clone` bumps a refcount instead of
-        // deep-cloning the `Vec<Bytes>` events list per timed-out
-        // packet.
-        for unacked in &mut self.pending {
-            if now.duration_since(unacked.sent_at) > self.rto && unacked.retries < self.max_retries
-            {
-                retransmits.push(Arc::clone(&unacked.descriptor));
-                unacked.retries += 1;
-                unacked.sent_at = now;
+        // deep-cloning the `Vec<Bytes>` events list per timed-out packet.
+        // A packet that has timed out AND exhausted its retries is
+        // dropped from the window (it can't be recovered) and flags the
+        // stream as failed (H-3) — previously such packets stayed stuck
+        // in `pending` forever, leaking and stalling silently.
+        self.pending.retain_mut(|unacked| {
+            if now.duration_since(unacked.sent_at) > rto {
+                if unacked.retries < max_retries {
+                    retransmits.push(Arc::clone(&unacked.descriptor));
+                    unacked.retries += 1;
+                    unacked.sent_at = now;
+                    true // keep — still recoverable
+                } else {
+                    gave_up = true;
+                    false // drop — retransmits exhausted
+                }
+            } else {
+                true // not yet due
             }
+        });
+        if gave_up {
+            self.failed = true;
         }
 
         retransmits
+    }
+
+    fn take_failed(&mut self) -> bool {
+        std::mem::take(&mut self.failed)
+    }
+
+    fn rx_ack_seq(&self) -> u64 {
+        self.next_expected
+    }
+
+    fn on_ack(&mut self, ack_seq: u64) {
+        // Every sequence < ack_seq has been received contiguously by the
+        // peer — drop them from the retransmit window. `pending` is
+        // ordered by send time (≈ seq), so this is a cheap prefix drop.
+        self.pending.retain(|u| u.seq() >= ack_seq);
     }
 
     #[inline]
@@ -652,6 +715,35 @@ mod tests {
             resent.iter().any(|d| d.seq == 0),
             "oldest in-flight packet must still be retransmittable"
         );
+    }
+
+    #[test]
+    fn exhausted_retransmits_flag_failure_and_drop() {
+        // H-3: a packet that times out past `max_retries` is dropped from
+        // the window and flags the stream failed (so the owner can send a
+        // reset) — instead of staying stuck forever and stalling silently.
+        let rto = Duration::from_millis(5);
+        let max_retries = 2u8;
+        let mut s = ReliableStream::with_settings(rto, 32, max_retries);
+        s.on_send(descriptor(0, Bytes::from_static(b"x")));
+        assert!(!s.take_failed());
+
+        // Each RTO elapse → one retransmit, until retries are exhausted.
+        for _ in 0..max_retries {
+            std::thread::sleep(rto * 2);
+            assert_eq!(s.get_timed_out().len(), 1, "still retransmitting");
+            assert!(!s.take_failed(), "not failed while retries remain");
+        }
+
+        // Next timeout: retries exhausted → give up.
+        std::thread::sleep(rto * 2);
+        assert!(
+            s.get_timed_out().is_empty(),
+            "no retransmit emitted once max_retries is hit"
+        );
+        assert!(s.take_failed(), "stream flagged failed after giving up");
+        assert!(!s.take_failed(), "take_failed clears the flag");
+        assert!(!s.has_pending(), "given-up packet dropped from the window");
     }
 
     #[test]

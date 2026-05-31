@@ -123,7 +123,8 @@ use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subnet::{DropReason, SubnetGateway, SubnetId, SubnetPolicy};
 use super::subprotocol::stream_window::{
-    StreamNack, StreamWindow, SUBPROTOCOL_STREAM_NACK, SUBPROTOCOL_STREAM_WINDOW,
+    StreamNack, StreamReset, StreamWindow, SUBPROTOCOL_STREAM_NACK, SUBPROTOCOL_STREAM_RESET,
+    SUBPROTOCOL_STREAM_WINDOW,
 };
 use super::subprotocol::MigrationSubprotocolHandler;
 use super::transport::{NetSocket, PacketReceiver, ParsedPacket, SocketBufferConfig};
@@ -4122,6 +4123,11 @@ impl MeshNode {
                             );
                         } else if let Some(state) = session.try_stream(grant.stream_id) {
                             state.apply_authoritative_grant(grant.total_consumed);
+                            // Prune the retransmit window up to the peer's
+                            // cumulative ack (H-9) — stops acked packets
+                            // from lingering, timing out, and spuriously
+                            // resending (or, post-H-3, spuriously failing).
+                            state.with_reliability(|r| r.on_ack(grant.ack_seq));
                         }
                     }
                     Err(e) => {
@@ -4182,6 +4188,27 @@ impl MeshNode {
                         let _ = socket.send_to(&p, dest).await;
                     }
                 });
+            }
+            return;
+        }
+
+        // Stream reset (STREAM_RETRANSMIT H-3): the sender gave up
+        // retransmitting this stream. Fail any pending blob-transfer read
+        // on it now (distinct error) instead of waiting for the caller's
+        // timeout, and drop the local receive-stream state.
+        if parsed.header.subprotocol_id == SUBPROTOCOL_STREAM_RESET {
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+            for payload in events {
+                let Ok(reset) = StreamReset::decode(&payload) else {
+                    continue;
+                };
+                #[cfg(feature = "dataforts")]
+                if super::dataforts::blob::is_transfer_stream_id(reset.stream_id) {
+                    if let Some(engine) = ctx.blob_transfer_engine.read().as_ref() {
+                        engine.on_reset(reset.stream_id);
+                    }
+                }
+                session.close_stream(reset.stream_id);
             }
             return;
         }
@@ -4983,9 +5010,19 @@ impl MeshNode {
                     if partition_filter.contains(&grant.peer_addr) {
                         continue;
                     }
+                    // Piggyback the receiver's cumulative reliable ack
+                    // (next_expected) so the sender prunes its retransmit
+                    // window of everything below it (H-9). 0 for
+                    // non-reliable receive streams.
+                    let ack_seq = grant
+                        .session
+                        .try_stream(stream_id)
+                        .map(|s| s.with_reliability(|r| r.rx_ack_seq()))
+                        .unwrap_or(0);
                     let payload = StreamWindow {
                         stream_id,
                         total_consumed: grant.total_consumed,
+                        ack_seq,
                     }
                     .encode();
                     let pool = grant.session.thread_local_pool();
@@ -5084,6 +5121,34 @@ impl MeshNode {
                     let mut builder = pool.get();
                     for d in due {
                         let packet = builder.build(d.stream_id, d.seq, &d.events, d.flags);
+                        let _ = socket.send_to(&packet, addr).await;
+                    }
+                }
+
+                // H-3: any stream whose reliable layer gave up
+                // retransmitting → tell the peer to fail its pending read
+                // now (a `StreamReset`) instead of stalling to a timeout.
+                let mut resets: Vec<(SocketAddr, Arc<NetSession>, Vec<u64>)> = Vec::new();
+                for peer in peers.iter() {
+                    let failed = peer.value().session.take_failed_stream_ids();
+                    if !failed.is_empty() {
+                        resets.push((peer.value().addr, peer.value().session.clone(), failed));
+                    }
+                }
+                for (addr, session, failed) in resets {
+                    let pool = session.thread_local_pool();
+                    let mut builder = pool.get();
+                    for stream_id in failed {
+                        let payload = StreamReset { stream_id }.encode();
+                        let seq = session.next_control_tx_seq();
+                        let events = vec![Bytes::copy_from_slice(&payload)];
+                        let packet = builder.build_subprotocol(
+                            CONTROL_STREAM_ID,
+                            seq,
+                            &events,
+                            PacketFlags::NONE,
+                            SUBPROTOCOL_STREAM_RESET,
+                        );
                         let _ = socket.send_to(&packet, addr).await;
                     }
                 }
