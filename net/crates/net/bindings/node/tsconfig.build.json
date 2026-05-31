@@ -30,6 +30,7 @@
     "meshdb.ts",
     "aggregator.ts",
     "tool.ts",
+    "transport.ts",
   ],
   "exclude": [
     "node_modules",
