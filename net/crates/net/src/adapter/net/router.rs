@@ -1345,6 +1345,80 @@ mod tests {
         );
     }
 
+    /// Anti-starvation: a bulk transfer with a huge backlog must NOT
+    /// head-of-line-block a competing interactive stream of equal
+    /// weight. This is the property that justifies routing blob
+    /// transfers through the scheduler (FairScheduler transport plan) —
+    /// a 2 MiB transfer (~260 packets) queued ahead of a few
+    /// interactive packets cannot make the interactive flow wait for
+    /// the whole transfer to drain; round-robin interleaves them so
+    /// every interactive packet is serviced within a bounded number of
+    /// dequeues regardless of how deep the bulk backlog is.
+    #[test]
+    fn bulk_backlog_does_not_starve_an_equal_weight_interactive_stream() {
+        let scheduler = FairScheduler::new(1, 512);
+        let bulk = 1u64;
+        let interactive = 2u64;
+        scheduler.set_stream_weight(bulk, 1);
+        scheduler.set_stream_weight(interactive, 1);
+
+        let dest: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        // A transfer-scale backlog on the bulk stream …
+        let bulk_backlog = 260usize;
+        for _ in 0..bulk_backlog {
+            scheduler.enqueue(QueuedPacket {
+                data: Bytes::from_static(&[0u8; 16]),
+                dest,
+                stream_id: bulk,
+                priority: false,
+                queued_at: Instant::now(),
+            });
+        }
+        // … and just a handful of interactive packets behind it.
+        let interactive_count = 4usize;
+        for _ in 0..interactive_count {
+            scheduler.enqueue(QueuedPacket {
+                data: Bytes::from_static(&[0u8; 16]),
+                dest,
+                stream_id: interactive,
+                priority: false,
+                queued_at: Instant::now(),
+            });
+        }
+
+        // Drain, recording the dequeue index at which each interactive
+        // packet emerges.
+        let mut last_interactive_at = 0usize;
+        let mut seen_interactive = 0usize;
+        for idx in 0..(bulk_backlog + interactive_count) {
+            if let Some(pkt) = scheduler.dequeue() {
+                if pkt.stream_id == interactive {
+                    seen_interactive += 1;
+                    last_interactive_at = idx;
+                }
+            }
+        }
+
+        assert_eq!(
+            seen_interactive, interactive_count,
+            "every interactive packet must be delivered"
+        );
+        // With quantum 1 and equal weight, round-robin alternates one
+        // bulk, one interactive per round, so the k-th interactive
+        // packet emerges by dequeue ~2k — bounded by 2×count, utterly
+        // independent of the 260-deep bulk backlog. If the scheduler
+        // had FIFO/head-of-line semantics, the last interactive packet
+        // would not appear until index ~260.
+        assert!(
+            last_interactive_at <= 2 * interactive_count,
+            "interactive stream starved: last interactive packet at dequeue {} \
+             (bulk backlog {}); fair interleaving should deliver it by ~{}",
+            last_interactive_at,
+            bulk_backlog,
+            2 * interactive_count
+        );
+    }
+
     /// Regression: BUG_REPORT.md #31 — `round_robin_idx` was
     /// `fetch_add(1)`-ed unconditionally on every `dequeue` call,
     /// so polls that returned `None` (no streams have packets)
