@@ -1,0 +1,19 @@
+net/crates/net/src/ffi/transport.rs
+  s_4e65c03b4a88ec::t_725e5dc8d6e09e 10-15,19-21,26-29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "4c0fdeb4b44309435d4ce5d6daf9092ceff36fba",
+  "prompts": {},
+  "sessions": {
+    "s_4e65c03b4a88ec": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f38fba46-70fe-4a54-9993-f298695ba62b",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
