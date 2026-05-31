@@ -222,10 +222,32 @@ impl BlobTransferEngine {
     /// from `requester`. Spawn a task that reads the chunk locally and
     /// streams it back on the same (transfer) stream.
     ///
-    /// NOTE: this first slice does not yet gate on channel-auth — the
-    /// session is authenticated, but the per-content authorization the
-    /// plan calls for (requester subscribed to a channel that grants
-    /// read) is a T-3 follow-up. Documented so it isn't forgotten.
+    /// # Authorization model: possession-of-hash is the capability
+    ///
+    /// A transfer is **content-addressed** — the request names a 32-byte
+    /// BLAKE3 hash, not a channel. A blob can belong to many channels (or
+    /// none), so channel-scoped read-auth doesn't map onto a bare hash.
+    /// The deliberate model (chosen over channel-auth / capability
+    /// tokens) is **possession-of-hash**: a peer that presents a valid
+    /// content hash may fetch the bytes that hash to it. The 256-bit
+    /// BLAKE3 digest is an unguessable bearer capability — you cannot
+    /// enumerate or forge it, so knowing it is itself the grant.
+    ///
+    /// Two substrate guarantees backstop this, both already enforced:
+    /// 1. **Authenticated session.** This handler only runs for a packet
+    ///    that AEAD-decrypted under an established session with a
+    ///    resolved `requester` (the dispatch branch rejects `from_node
+    ///    == 0`), so an unauthenticated/forged peer never reaches here.
+    /// 2. **Established peer for the reply.** [`serve_chunk`] streams the
+    ///    bytes via `MeshNode::open_stream(requester, …)`, which requires
+    ///    `requester` to be a connected peer — bytes never flow to an
+    ///    unknown origin.
+    ///
+    /// **Caveat (by design):** the hash is a *bearer* token — anyone who
+    /// learns it can fetch the content from any holder. Callers that need
+    /// stronger confinement must treat content hashes for sensitive blobs
+    /// as secrets (don't log/publish them to parties who shouldn't read
+    /// the content), or layer channel/capability auth above this transport.
     pub fn on_request(&self, requester: u64, stream_id: u64, payload: &[u8]) {
         let control: TransferControl = match postcard::from_bytes(payload) {
             Ok(c) => c,
@@ -364,6 +386,11 @@ async fn serve_chunk(
         .with_scheduled(true)
         .with_window_bytes(TRANSFER_STREAM_WINDOW_BYTES)
         .with_fairness_weight(1);
+    // `open_stream` requires `requester` to be a connected peer (an
+    // established, authenticated session), so this is also the
+    // authorization gate for the possession-of-hash model (see
+    // `BlobTransferEngine::on_request`): bytes only ever flow to a peer
+    // we have a live session with, and only for the exact hash it asked.
     let stream = match mesh.open_stream(requester, stream_id, cfg) {
         Ok(s) => s,
         Err(e) => {
