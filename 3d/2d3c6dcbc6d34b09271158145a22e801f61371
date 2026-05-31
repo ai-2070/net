@@ -1,0 +1,26 @@
+net/crates/net/sdk-ts/src/mesh.ts
+  s_f6c191b51f28ba::t_d5163129c0c2e9 474
+  s_f6c191b51f28ba::t_0b2e834c576108 496-503
+  s_f6c191b51f28ba::t_08acff211bc2eb 715-716,719-726
+net/crates/net/sdk-ts/test/channel_auth.test.ts
+  s_f6c191b51f28ba::t_800c70d826fbde 139-141
+  s_f6c191b51f28ba::t_3b3fc2b412c786 105
+  s_f6c191b51f28ba::t_d36e3658e92749 183
+  s_f6c191b51f28ba::t_77ff97f57ca36c 193-196
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "3d2d3c6dcbc6d34b09271158145a22e801f61371",
+  "prompts": {},
+  "sessions": {
+    "s_f6c191b51f28ba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "aeb41064-2c0d-418f-ad38-0589f4ebe401",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
