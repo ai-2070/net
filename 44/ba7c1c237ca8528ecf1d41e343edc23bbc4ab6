@@ -1,0 +1,19 @@
+web/src/content/docs/releases/RELEASE_v0.26_MONKEY_BUSINESS.md
+  s_f6c191b51f28ba::t_0bb762b781f3e4 4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "44ba7c1c237ca8528ecf1d41e343edc23bbc4ab6",
+  "prompts": {},
+  "sessions": {
+    "s_f6c191b51f28ba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "aeb41064-2c0d-418f-ad38-0589f4ebe401",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
