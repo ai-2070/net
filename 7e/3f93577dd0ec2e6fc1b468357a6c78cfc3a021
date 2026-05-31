@@ -1,0 +1,20 @@
+net/crates/net/bindings/node/tsconfig.build.json
+  s_bf11f44b9f777f::t_34cd0b2d6d45c6 13
+  s_bf11f44b9f777f::t_270f572f573f28 27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "7e3f93577dd0ec2e6fc1b468357a6c78cfc3a021",
+  "prompts": {},
+  "sessions": {
+    "s_bf11f44b9f777f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f5c243ac-ce51-4618-a3ca-cdb9a1f7f953",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
