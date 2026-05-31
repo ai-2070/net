@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_05_31_FAIRSCHEDULER_TRANSPORT.md
+  s_2bfa2af80cf7fe::t_f3e9036206aa1d 1-221
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "67f7390fa62a327b4246e7eb85900a87e1609ee0",
+  "prompts": {},
+  "sessions": {
+    "s_2bfa2af80cf7fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f0709c4d-be5c-4dfc-a42e-ab0b2c117aa5",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
