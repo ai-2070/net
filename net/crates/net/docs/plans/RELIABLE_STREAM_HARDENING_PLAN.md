@@ -15,7 +15,18 @@
 | **H-7** | **`CloseBehavior::DrainThenClose` is not honored** by `close_stream` (it removes state immediately). `serve_chunk` hand-rolls an ack-wait close; this should be a first-class stream primitive. | Low |
 | **H-8** | **In-order delivery is not a guarantee.** `on_receive` accepts out-of-order sequences; the substrate delivers events in *arrival* order. The blob-transfer engine reorders by seq itself — but other reliable-stream consumers (nRPC streaming reassembly?) may assume in-order delivery and silently corrupt under reordering/retransmit. Needs investigation, then either an in-order delivery buffer or a documented contract. | **Investigate (potential High)** |
 
-## Stages (in-scope now)
+## Status
+
+**H-1, H-2, H-3 DONE** (commits `3a4b2dce1`, `bb29fcf15`), plus **H-9** (discovered while doing H-3):
+
+- **H-1 ✅** retransmit window auto-sized to the tx-window (`max_pending_for_window`); `pending` no longer pre-reserved. Invariant tx-window ≤ retransmit-window now holds for any window.
+- **H-2 ✅** eviction warning rate-limited (first, then every 64th) + `untracked_evictions()` accessor.
+- **H-3 ✅** give-up detection: a packet past `max_retries` is dropped + flags the stream failed → `SUBPROTOCOL_STREAM_RESET` → receiver fails its blob-transfer read promptly (`on_reset` → `BlobError`) instead of stalling to the 30 s timeout.
+- **H-9 ✅ (NEW — prerequisite for H-3)** ack-driven pruning of the retransmit window. The window was never pruned on the happy path, so packets lingered until the RTO and spuriously resent; H-3 turned that into a spurious give-up (broke the 2 MiB transfer). Fixed by piggybacking the receiver's `next_expected` on the StreamWindow grant (now 24 B, +`ack_seq`); the sender prunes via `ReliableStream::on_ack`.
+
+Remaining: H-4..H-8 (deferred, below).
+
+## Stages (done)
 
 ### H-1 — Auto-size the retransmit window to the tx-window; stop pre-reserving
 - `ReliableStream::pending` is created with `VecDeque::new()` (grow-on-demand), NOT `with_capacity(max_pending)` — so the retransmit window can be generous without per-stream up-front memory; the queue only grows to the actual in-flight count, itself bounded by the tx-window bytes.
