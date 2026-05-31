@@ -9,13 +9,14 @@
 //! source**: it pulls the manifest, then every leaf, over the reliable
 //! scheduled stream transport — and reconstructs the tree on disk.
 //!
-//! [`blob transfer`]: super::blob::transfer
+//! [`blob transfer`]: crate::adapter::net::dataforts::blob::transfer
 //!
 //! # Why a known source (no per-chunk discovery)
 //!
 //! The receiver already knows which peer it is pulling the directory
 //! from, and that peer holds the whole tree, so every chunk is fetched
-//! with [`MeshNode::transfer_fetch_chunk`] against that one `source`.
+//! with [`crate::adapter::net::MeshNode::transfer_fetch_chunk`] against
+//! that one `source`.
 //! There is deliberately **no** `causal:<hash>` per-chunk advertisement
 //! in this path: capability announcements are a single datagram and the
 //! per-chunk tag caps at ~15-20 chunks/node, so advertisement-driven

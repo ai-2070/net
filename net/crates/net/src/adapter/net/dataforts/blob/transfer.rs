@@ -295,7 +295,7 @@ impl BlobTransferEngine {
     ///    that AEAD-decrypted under an established session with a
     ///    resolved `requester` (the dispatch branch rejects `from_node
     ///    == 0`), so an unauthenticated/forged peer never reaches here.
-    /// 2. **Established peer for the reply.** [`serve_chunk`] streams the
+    /// 2. **Established peer for the reply.** `serve_chunk` streams the
     ///    bytes via `MeshNode::open_stream(requester, …)`, which requires
     ///    `requester` to be a connected peer — bytes never flow to an
     ///    unknown origin.
