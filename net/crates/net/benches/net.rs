@@ -4271,10 +4271,19 @@ fn bench_context_store(c: &mut Criterion) {
         .with_sampling(SamplingStrategy::AlwaysOn);
 
     group.bench_function("create_context", |b| {
-        b.iter(|| store.create_context(node_id));
+        b.iter(|| {
+            // Reclaim each context's slot immediately. With `AlwaysOn`
+            // sampling every create commits a `max_traces` slot, so a
+            // long criterion run would otherwise fill the store to
+            // capacity and every subsequent call (here and at the
+            // `unwrap` below) would return `CapacityExceeded`.
+            let ctx = store.create_context(node_id).expect("capacity available");
+            store.complete_trace(&ctx.trace_id);
+        });
     });
 
-    // Pre-create some contexts
+    // Pre-create a context for the read/append benches below. The
+    // create loop above reclaims its slots, so the store has room.
     let ctx = store.create_context(node_id).unwrap();
 
     group.bench_function("get_context", |b| {
