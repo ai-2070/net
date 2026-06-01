@@ -313,8 +313,13 @@ Lifting it requires one of two **larger, separate efforts**, both out of scope h
    `spawn_receive_loop` on Linux; on Windows, RIO or multi-socket `SO_REUSEPORT`.
    Attacks the ~22 % syscall bucket directly.
 
-Recommend closing this plan at the **diagnosis + ruled-out-fixes** milestone and
-opening a focused protocol plan for (1) if the unary QPS ceiling is a priority.
+Recommend closing this plan at the **diagnosis + ruled-out-fixes** milestone. The
+ack-piggyback approach (1) is now designed in
+[`NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md`](NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md), which
+shows a reliable unary RPC is actually **4 packets** (REQUEST + RESPONSE + a grant
+in *each* direction) and that piggybacking the ack collapses it to 2 — halving
+recv-loop packets/call. That plan is design-complete and awaiting review before any
+wire change.
 
 > **Superseded:** the verdict's first instinct ("move decrypt off the recv loop")
 > is now a **non-lever (~5 %)** and removed from the critical path. See "Rejected"
