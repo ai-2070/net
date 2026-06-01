@@ -4104,29 +4104,16 @@ impl MeshNode {
             for payload in events {
                 match StreamWindow::decode(&payload) {
                     Ok(grant) => {
-                        // Quarantine guard: a grant that arrives for a
-                        // stream closed within `GRANT_QUARANTINE_WINDOW`
-                        // is dropped, even if the stream has already been
-                        // reopened with the same id. Without this the
-                        // in-flight grant from the *previous* lifetime
-                        // would spuriously credit the new `StreamState`
-                        // and let the sender exceed its intended window.
-                        // Grants for closed / unknown streams are also
-                        // dropped silently — the sender will time out on
-                        // its own.
-                        if session.is_grant_quarantined(grant.stream_id) {
-                            tracing::debug!(
-                                stream_id = format!("{:#x}", grant.stream_id),
-                                "dropping StreamWindow grant for recently-closed stream"
-                            );
-                        } else if let Some(state) = session.try_stream(grant.stream_id) {
-                            state.apply_authoritative_grant(grant.total_consumed);
-                            // Prune the retransmit window up to the peer's
-                            // cumulative ack (H-9) — stops acked packets
-                            // from lingering, timing out, and spuriously
-                            // resending (or, post-H-3, spuriously failing).
-                            state.with_reliability(|r| r.on_ack(grant.ack_seq));
-                        }
+                        // Quarantine + monotonic-credit + retransmit-window
+                        // prune (H-9) all live in
+                        // `apply_authoritative_grant_with_ack`, shared with
+                        // the piggybacked `DISPATCH_STREAM_ACK` path so the
+                        // two can't drift.
+                        session.apply_authoritative_grant_with_ack(
+                            grant.stream_id,
+                            grant.total_consumed,
+                            grant.ack_seq,
+                        );
                     }
                     Err(e) => {
                         tracing::debug!(error = %e, "malformed StreamWindow grant");

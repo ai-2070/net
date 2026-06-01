@@ -630,6 +630,40 @@ impl NetSession {
         false
     }
 
+    /// Apply an authoritative `StreamWindow` grant to `stream_id`:
+    /// refresh transmit credit (`total_consumed`, monotonic) and prune
+    /// the retransmit window up to the peer's cumulative ack
+    /// (`ack_seq`). A grant for a stream closed within
+    /// `GRANT_QUARANTINE_WINDOW` is dropped so an in-flight grant from
+    /// a prior stream lifetime can't credit a same-id reopen; a grant
+    /// for an unknown/closed stream is silently ignored (the sender
+    /// times out on its own).
+    ///
+    /// Single source of truth for grant application: both the standalone
+    /// `SUBPROTOCOL_STREAM_WINDOW` packet handler and the piggybacked
+    /// `DISPATCH_STREAM_ACK` event path route through here so they can't
+    /// drift (see `NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md`). Idempotent +
+    /// monotonic, so a stream receiving both an embedded ack and a late
+    /// standalone grant converges rather than regresses.
+    pub fn apply_authoritative_grant_with_ack(
+        &self,
+        stream_id: u64,
+        total_consumed: u64,
+        ack_seq: u64,
+    ) {
+        if self.is_grant_quarantined(stream_id) {
+            tracing::debug!(
+                stream_id = format!("{:#x}", stream_id),
+                "dropping StreamWindow grant for recently-closed stream"
+            );
+            return;
+        }
+        if let Some(state) = self.try_stream(stream_id) {
+            state.apply_authoritative_grant(total_consumed);
+            state.with_reliability(|r| r.on_ack(ack_seq));
+        }
+    }
+
     /// Remove streams whose `last_activity` is older than `max_idle`,
     /// keeping the active count at or below `max_streams` by LRU-evicting
     /// the oldest if still over cap. Returns the number of streams
@@ -2737,6 +2771,59 @@ mod tests {
         // The reopened stream's credit is untouched — we don't call
         // apply_authoritative_grant under quarantine.
         assert_eq!(session.try_stream(sid).unwrap().tx_credit_remaining(), 100);
+    }
+
+    #[test]
+    fn test_apply_grant_with_ack_credits_open_stream() {
+        // Shared apply path (used by both the standalone StreamWindow
+        // packet handler and the piggybacked DISPATCH_STREAM_ACK event)
+        // must self-heal credit on an open stream, identically to a
+        // direct `apply_authoritative_grant`.
+        let sid = 0x51u64;
+        let session = session_with_stream(sid, 100);
+        {
+            let stream = session.try_stream(sid).unwrap();
+            assert!(stream.try_acquire_tx_credit(70));
+            assert_eq!(stream.tx_credit_remaining(), 30);
+        }
+        session.apply_authoritative_grant_with_ack(sid, 70, 0);
+        assert_eq!(session.try_stream(sid).unwrap().tx_credit_remaining(), 100);
+    }
+
+    #[test]
+    fn test_apply_grant_with_ack_drops_quarantined_stream() {
+        // A grant routed through the shared path for a stream closed
+        // within the quarantine window must NOT credit a same-id reopen
+        // — the quarantine guard lives inside the shared method so the
+        // embedded-ack path inherits it.
+        let sid = 0x52u64;
+        let session = session_with_stream(sid, 100);
+        session.close_stream(sid);
+        session.open_stream_full(sid, false, 1, 100);
+        {
+            let stream = session.try_stream(sid).unwrap();
+            assert!(stream.try_acquire_tx_credit(70));
+            assert_eq!(stream.tx_credit_remaining(), 30);
+        }
+        // Quarantined → grant dropped → reopened stream's credit
+        // stays at 30 rather than self-healing back to 100.
+        session.apply_authoritative_grant_with_ack(sid, 70, 0);
+        assert_eq!(session.try_stream(sid).unwrap().tx_credit_remaining(), 30);
+    }
+
+    #[test]
+    fn test_apply_grant_with_ack_unknown_stream_is_noop() {
+        // A grant for a never-opened stream is silently ignored (no
+        // panic, no state) — matches the standalone handler's behavior
+        // for grants on closed/unknown streams.
+        let session = Arc::new(NetSession::new(
+            test_keys(),
+            "127.0.0.1:9999".parse().unwrap(),
+            4,
+            false,
+        ));
+        session.apply_authoritative_grant_with_ack(0xDEAD, 100, 5);
+        assert!(session.try_stream(0xDEAD).is_none());
     }
 
     #[test]
