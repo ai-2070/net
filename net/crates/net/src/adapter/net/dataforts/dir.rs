@@ -334,16 +334,41 @@ fn mode_of(_meta: &std::fs::Metadata) -> u32 {
 // ── Fetch ───────────────────────────────────────────────────────────
 
 /// Pull the directory whose manifest is `manifest_ref` from `source`
-/// and reconstruct it under `dest`. Every blob (the manifest, then each
-/// file) is fetched over the reliable scheduled stream transport via
-/// [`MeshNode::transfer_fetch_chunk`] against the single known
-/// `source`. File fetches run with bounded concurrency
+/// and reconstruct it under `dest`, **atomically**. Every blob (the
+/// manifest, then each file) is fetched over the reliable scheduled
+/// stream transport via [`MeshNode::transfer_fetch_chunk`] against the
+/// single known `source`. File fetches run with bounded concurrency
 /// (`concurrency`, or [`DEFAULT_FETCH_CONCURRENCY`] when 0).
 ///
-/// Directories are created before files (no mkdir races), then files
-/// are fetched concurrently, then symlinks last (their targets may
-/// point at files just written). Manifest paths are validated to stay
-/// within `dest`.
+/// # Atomicity
+///
+/// The tree is reconstructed in a sibling temp directory
+/// (`<parent>/.<basename>.fetch_<rand>` — same filesystem as `dest`, so
+/// the final rename is atomic), then swapped into place. `dest` therefore
+/// ends up as the **complete** new tree, or is left **exactly as it was**:
+///
+/// - On any failure mid-fetch (a chunk fails, the peer drops, a manifest
+///   path is unsafe), the temp tree is removed and `dest` is untouched.
+/// - On success, the temp tree is renamed onto `dest`. If `dest` already
+///   existed, its old contents are moved aside and removed after the new
+///   tree is in place — so a replace also drops files from a previous
+///   version that aren't in the new manifest (no stale-file accumulation).
+///
+/// This is *replacement*-atomicity, **not** *observer*-atomicity: a
+/// process reading files inside `dest` during the swap may see the old
+/// tree one moment and a missing path the next — the rename invalidates
+/// open handles, and the two-rename replace has a brief window where
+/// `dest` is absent. Callers needing observer-atomicity coordinate at a
+/// higher layer.
+///
+/// **Platform note:** atomicity relies on POSIX `rename` semantics. On
+/// Windows `rename` differs around an existing destination; the swap
+/// moves the old tree aside first so it works there too, but the
+/// substrate is POSIX-first and Windows support is best-effort.
+///
+/// Directories are created before files (no mkdir races), then files are
+/// fetched concurrently, then symlinks last. Manifest paths are validated
+/// to stay within the destination.
 pub async fn fetch_dir(
     node: &Arc<MeshNode>,
     source: u64,
@@ -362,6 +387,37 @@ pub async fn fetch_dir(
     }
 
     let dest = dest.to_path_buf();
+    // Reconstruct into a sibling temp dir, then install it atomically.
+    let work = alloc_temp_dir(&dest).await?;
+    let stats = match reconstruct_tree(node, source, &manifest, &work, concurrency).await {
+        Ok(stats) => stats,
+        Err(e) => {
+            // Best-effort cleanup so no `.<base>.fetch_*` orphan lingers;
+            // the unique, `.`-prefixed name keeps an orphan (if removal
+            // also fails) from colliding with a future run and visible to
+            // operators. `dest` was never touched.
+            let work = work.clone();
+            let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&work)).await;
+            return Err(e);
+        }
+    };
+    install_tree(work, dest).await?;
+    Ok(stats)
+}
+
+/// Reconstruct the manifest's tree under `root` (a temp dir). Pass 1
+/// creates directories, pass 2 fetches + writes files concurrently, pass
+/// 3 creates symlinks. The concurrency / byte-budget / blocking-pool
+/// logic is unchanged from the in-place version — only the write root
+/// differs; the caller renames `root` onto the user's `dest` on success.
+async fn reconstruct_tree(
+    node: &Arc<MeshNode>,
+    source: u64,
+    manifest: &DirManifest,
+    root: &Path,
+    concurrency: usize,
+) -> Result<DirStats, DirError> {
+    let root = root.to_path_buf();
     let mut stats = DirStats::default();
 
     // Pass 1: create every directory (explicit Dir entries + each
@@ -369,7 +425,7 @@ pub async fn fetch_dir(
     // never race on mkdir.
     let mut want_dirs: BTreeSet<PathBuf> = BTreeSet::new();
     for entry in &manifest.entries {
-        let safe = safe_join(&dest, &entry.path)?;
+        let safe = safe_join(&root, &entry.path)?;
         match &entry.kind {
             EntryKind::Dir { .. } => {
                 want_dirs.insert(safe);
@@ -381,10 +437,10 @@ pub async fn fetch_dir(
             }
         }
     }
-    // Create dirs (incl. `dest`) on the blocking pool (T-3).
-    let dest_for_dirs = dest.clone();
+    // Create dirs (incl. the temp root) on the blocking pool (T-3).
+    let root_for_dirs = root.clone();
     stats.dirs = tokio::task::spawn_blocking(move || -> Result<usize, DirError> {
-        std::fs::create_dir_all(&dest_for_dirs)?;
+        std::fs::create_dir_all(&root_for_dirs)?;
         let mut n = 0;
         for dir in &want_dirs {
             if !dir.exists() {
@@ -416,7 +472,7 @@ pub async fn fetch_dir(
         let EntryKind::File { mode, blob } = &entry.kind else {
             continue;
         };
-        let safe = safe_join(&dest, &entry.path)?;
+        let safe = safe_join(&root, &entry.path)?;
         let blob_ref = BlobRef::decode(blob)
             .map_err(DirError::Blob)?
             .ok_or_else(|| DirError::Manifest(format!("entry {} has no blob ref", entry.path)))?;
@@ -432,7 +488,7 @@ pub async fn fetch_dir(
         let byte_sem = byte_sem.clone();
         let mode = *mode;
         tasks.push(tokio::spawn(async move {
-            // The semaphores live for the whole `fetch_dir` call and are
+            // The semaphores live for the whole reconstruction and are
             // never closed, so `acquire` can't actually fail here — map
             // the impossible error to a typed failure rather than panic.
             let _permit = sem.acquire().await.map_err(|_| {
@@ -478,7 +534,7 @@ pub async fn fetch_dir(
     let mut links: Vec<(String, PathBuf)> = Vec::new();
     for entry in &manifest.entries {
         if let EntryKind::Symlink { target } = &entry.kind {
-            links.push((target.clone(), safe_join(&dest, &entry.path)?));
+            links.push((target.clone(), safe_join(&root, &entry.path)?));
         }
     }
     stats.symlinks = tokio::task::spawn_blocking(move || {
@@ -491,6 +547,117 @@ pub async fn fetch_dir(
     .map_err(|e| DirError::Io(std::io::Error::other(e)))?;
 
     Ok(stats)
+}
+
+/// A process-unique `u64` for temp / backup path suffixes. The monotonic
+/// counter guarantees two concurrent allocations in this process never
+/// collide; the time + pid mix guards against cross-process / cross-run
+/// reuse of the same parent directory. The caller's create-with-
+/// `AlreadyExists`-retry is the final backstop. Dependency-free on purpose
+/// — `rand` is only a dev-dependency here.
+fn unique_suffix() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    seq ^ nanos.rotate_left(17) ^ (std::process::id() as u64).rotate_left(43)
+}
+
+/// Allocate a fresh sibling temp directory for `dest`
+/// (`<parent>/.<basename>.fetch_<suffix>`), creating `dest`'s parent first
+/// so the eventual rename has a target. Sibling placement keeps the temp
+/// on the same filesystem as `dest` — a cross-filesystem temp would make
+/// `rename` silently fall back to copy-and-delete, breaking atomicity.
+/// Retries on the (astronomically unlikely) random-suffix collision.
+async fn alloc_temp_dir(dest: &Path) -> Result<PathBuf, DirError> {
+    let parent = match dest.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        // Bare relative name ("foo") or no parent → use the cwd.
+        _ => PathBuf::from("."),
+    };
+    let base = dest
+        .file_name()
+        .ok_or_else(|| DirError::UnsafePath(dest.to_string_lossy().into_owned()))?
+        .to_string_lossy()
+        .into_owned();
+    tokio::task::spawn_blocking(move || -> Result<PathBuf, DirError> {
+        std::fs::create_dir_all(&parent)?;
+        for _ in 0..8 {
+            let work = parent.join(format!(".{base}.fetch_{:016x}", unique_suffix()));
+            match std::fs::create_dir(&work) {
+                Ok(()) => return Ok(work),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(DirError::Io(e)),
+            }
+        }
+        Err(DirError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "fetch_dir: could not allocate a unique temp directory",
+        )))
+    })
+    .await
+    .map_err(|e| DirError::Io(std::io::Error::other(e)))?
+}
+
+/// Atomically install the completed temp tree `work` at `dest`.
+///
+/// If `dest` is absent, a single `rename` moves the tree in. If `dest`
+/// exists, a two-rename swap (move the old tree to a `.replaced_<rand>`
+/// sibling, move the new tree in, then drop the old) replaces it: a crash
+/// between renames leaves either the old or the new tree at `dest`, never
+/// neither. The swap window where `dest` is briefly absent is the
+/// documented limit on observer-atomicity (see [`fetch_dir`]). On the
+/// rare failure of the second rename the old tree is restored. All FS ops
+/// run on the blocking pool (T-3).
+async fn install_tree(work: PathBuf, dest: PathBuf) -> Result<(), DirError> {
+    tokio::task::spawn_blocking(move || -> Result<(), DirError> {
+        if !dest.exists() {
+            return std::fs::rename(&work, &dest).map_err(|e| {
+                let _ = std::fs::remove_dir_all(&work);
+                DirError::Io(e)
+            });
+        }
+        let parent = match dest.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let base = dest
+            .file_name()
+            .ok_or_else(|| DirError::UnsafePath(dest.to_string_lossy().into_owned()))?
+            .to_string_lossy()
+            .into_owned();
+        // Pick an unused backup path for the old tree.
+        let mut backup = None;
+        for _ in 0..8 {
+            let cand = parent.join(format!(".{base}.replaced_{:016x}", unique_suffix()));
+            if !cand.exists() {
+                backup = Some(cand);
+                break;
+            }
+        }
+        let backup = backup.ok_or_else(|| {
+            DirError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "fetch_dir: could not allocate a backup path",
+            ))
+        })?;
+        // Move the old tree aside, then the new tree in. If the second
+        // rename fails, restore the old tree and surface the error.
+        std::fs::rename(&dest, &backup).map_err(DirError::Io)?;
+        if let Err(e) = std::fs::rename(&work, &dest) {
+            let _ = std::fs::rename(&backup, &dest);
+            let _ = std::fs::remove_dir_all(&work);
+            return Err(DirError::Io(e));
+        }
+        // New tree is in place; drop the old one (best effort).
+        let _ = std::fs::remove_dir_all(&backup);
+        Ok(())
+    })
+    .await
+    .map_err(|e| DirError::Io(std::io::Error::other(e)))?
 }
 
 /// Fetch a whole blob (all of its chunks) from `source` over the

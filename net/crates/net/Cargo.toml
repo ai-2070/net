@@ -316,6 +316,11 @@ clap = { version = "4", features = ["derive", "env"], optional = true }
 tokio = { version = "1", features = ["full", "test-util"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
 rand = "0.10"
+# Already normal (feature-gated) deps; declared here too so the
+# `dir_transfer` integration test can hand-craft a manifest blob to
+# drive fetch_dir's failure path (atomic-reconstruction tests).
+blake3 = "1"
+postcard = { version = "1", features = ["use-std"] }
 # Loom only enters the dep graph when tests are built with
 # `RUSTFLAGS="--cfg loom"`. Gating via cfg so the default
 # `cargo test` / `cargo build` paths don't pay its build cost.
