@@ -415,11 +415,27 @@ pub async fn call_raw_direct_retrying(pair: &Pair, body: Bytes) -> Bytes {
 // Runtime constructor — multi-threaded tokio runtime used by
 // every bench. 4 workers matches the existing test/example
 // setup (nrpc_echo.rs:60).
+//
+// The worker-thread count is overridable via the
+// `NRPC_BENCH_WORKER_THREADS` env var so the concurrency-scaling
+// sweep (Phase 0a of NRPC_QPS_CONCURRENCY_SCALING_PLAN.md) can run
+// 4 / 8 / 16 workers without a recompile. Both nodes of a `Pair`
+// share this single runtime, so the count caps the cores available
+// to client + server combined. Unset / unparseable → 4 (the
+// baseline every committed bench number was taken at).
 // ============================================================================
+
+pub fn worker_threads() -> usize {
+    std::env::var("NRPC_BENCH_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4)
+}
 
 pub fn runtime() -> Runtime {
     RtBuilder::new_multi_thread()
-        .worker_threads(4)
+        .worker_threads(worker_threads())
         .enable_all()
         .build()
         .expect("tokio runtime")
