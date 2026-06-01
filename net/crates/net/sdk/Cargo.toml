@@ -260,6 +260,14 @@ name = "nrpc_qps"
 harness = false
 required-features = ["net", "cortex"]
 
+# QPS concurrency-scaling probe — fixed concurrency spread across
+# 1 / 4 / 16 independent channels. Isolates per-channel bridge/mutex
+# vs shared recv-loop bottleneck (NRPC_QPS_CONCURRENCY_SCALING_PLAN.md).
+[[bench]]
+name = "nrpc_qps_shard"
+harness = false
+required-features = ["net", "cortex"]
+
 # Item 3 — server-streaming msgs/sec via `call_streaming_typed`.
 # Client-streaming and full duplex are channel-layer features and
 # bench separately (not here).
