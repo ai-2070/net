@@ -292,15 +292,14 @@ pub async fn call_json_direct(pair: &Pair, req: &EchoReq) -> EchoResp {
 }
 
 /// Same as [`call_json_direct`] but retries on transient transport
-/// backpressure (`RpcError::Transport(...)`). At high concurrency
-/// the per-stream publish budget fills up — mesh_rpc.rs:1158
-/// classifies these as retriable on purpose. The bench yields
-/// after each backpressure hit so other in-flight callers make
+/// backpressure (`RpcError::Transport(...)`). The per-stream publish
+/// budget fills up either at high concurrency (`nrpc_qps` /
+/// `nrpc_tail`) or when a single large unary body chunks past the
+/// budget (`nrpc_payload`) — mesh_rpc.rs:1158 classifies these as
+/// retriable on purpose. The bench yields after each backpressure
+/// hit so the transport flushes and other in-flight callers make
 /// progress; the resulting wall-clock latency reflects real
 /// saturation behavior rather than masking it as a panic.
-///
-/// Used by `nrpc_qps.rs` and `nrpc_tail.rs` which deliberately
-/// drive concurrency above the link's natural budget.
 pub async fn call_json_direct_retrying(pair: &Pair, req: &EchoReq) -> EchoResp {
     use net_sdk::mesh_rpc::RpcError;
     loop {
@@ -350,6 +349,33 @@ pub async fn call_postcard_direct(pair: &Pair, req: &EchoReq) -> EchoResp {
     postcard::from_bytes(&reply.body).expect("postcard decode")
 }
 
+/// Same as [`call_postcard_direct`] but retries on transient
+/// transport backpressure, mirroring [`call_json_direct_retrying`].
+/// Used by `nrpc_payload` where large bodies chunk past the
+/// per-stream publish budget. Re-encoding per attempt is intentional:
+/// a backpressured `call` published nothing the server accepted, so
+/// the retry is a fresh call, not a duplicate.
+pub async fn call_postcard_direct_retrying(pair: &Pair, req: &EchoReq) -> EchoResp {
+    use net_sdk::mesh_rpc::RpcError;
+    let body = postcard::to_allocvec(req).expect("postcard encode");
+    loop {
+        match pair
+            .caller
+            .call(
+                pair.server_node_id,
+                SVC_POSTCARD,
+                Bytes::from(body.clone()),
+                CallOptions::default(),
+            )
+            .await
+        {
+            Ok(reply) => return postcard::from_bytes(&reply.body).expect("postcard decode"),
+            Err(RpcError::Transport(_)) => tokio::task::yield_now().await,
+            Err(e) => panic!("call postcard (retrying): {e}"),
+        }
+    }
+}
+
 /// Direct raw `call` with no codec — body bytes round-trip
 /// verbatim. The theoretical floor: every byte the bench
 /// measures is genuine transport cost.
@@ -359,6 +385,30 @@ pub async fn call_raw_direct(pair: &Pair, body: Bytes) -> Bytes {
         .await
         .expect("call raw")
         .body
+}
+
+/// Same as [`call_raw_direct`] but retries on transient transport
+/// backpressure, mirroring [`call_json_direct_retrying`]. Used by
+/// `nrpc_payload` where large bodies chunk past the per-stream
+/// publish budget.
+pub async fn call_raw_direct_retrying(pair: &Pair, body: Bytes) -> Bytes {
+    use net_sdk::mesh_rpc::RpcError;
+    loop {
+        match pair
+            .caller
+            .call(
+                pair.server_node_id,
+                SVC_RAW,
+                body.clone(),
+                CallOptions::default(),
+            )
+            .await
+        {
+            Ok(reply) => return reply.body,
+            Err(RpcError::Transport(_)) => tokio::task::yield_now().await,
+            Err(e) => panic!("call raw (retrying): {e}"),
+        }
+    }
 }
 
 // ============================================================================

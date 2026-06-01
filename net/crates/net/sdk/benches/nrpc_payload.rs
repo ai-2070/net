@@ -33,7 +33,8 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 mod nrpc_common;
 
 use nrpc_common::{
-    call_json_direct, call_postcard_direct, call_raw_direct, payload, runtime, EchoReq, Pair,
+    call_json_direct_retrying, call_postcard_direct_retrying, call_raw_direct_retrying, payload,
+    runtime, EchoReq, Pair,
 };
 
 const SIZES: &[(&str, usize)] = &[
@@ -63,7 +64,7 @@ fn bench_payload(c: &mut Criterion) {
         };
         group.bench_with_input(BenchmarkId::new("json", label), &req, |b, req| {
             b.to_async(&rt).iter(|| async {
-                let resp = call_json_direct(&pair, req).await;
+                let resp = call_json_direct_retrying(&pair, req).await;
                 std::hint::black_box(resp);
             });
         });
@@ -73,7 +74,7 @@ fn bench_payload(c: &mut Criterion) {
         };
         group.bench_with_input(BenchmarkId::new("postcard", label), &req, |b, req| {
             b.to_async(&rt).iter(|| async {
-                let resp = call_postcard_direct(&pair, req).await;
+                let resp = call_postcard_direct_retrying(&pair, req).await;
                 std::hint::black_box(resp);
             });
         });
@@ -81,7 +82,7 @@ fn bench_payload(c: &mut Criterion) {
         let body = Bytes::copy_from_slice(payload(size).as_bytes());
         group.bench_with_input(BenchmarkId::new("raw", label), &body, |b, body| {
             b.to_async(&rt).iter(|| async {
-                let resp = call_raw_direct(&pair, body.clone()).await;
+                let resp = call_raw_direct_retrying(&pair, body.clone()).await;
                 std::hint::black_box(resp);
             });
         });
