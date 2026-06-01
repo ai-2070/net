@@ -89,8 +89,8 @@ profiles the **c16/c128 ceiling** specifically.
 |---|---|---|
 | 0 — Diagnose: which stage is the wall | ✅ Done | **Verdict: shared single recv loop + inline decrypt.** Worker sweep flat; sharding doesn't help. See Findings below. |
 | 1 — Multi-channel shard bench variant | ✅ Done | `nrpc_qps_shard` landed (`benches/nrpc_qps_shard.rs`); sharding *lowers* throughput → rules out per-channel bridge/mutex |
-| 2 — Fix the bottleneck Phase 0 names | ◐ Scoped to HEAD; awaiting sign-off on T1.1 | T1.2 **already done**; T2.3/T3.4 won't move a syscall-bound ceiling. Only **T1.1 (skip unary StreamWindow grants)** hits the recv loop — but it changes credit accounting, so design is up for review before editing. Decrypt-off-loop withdrawn; T2.1 disproven |
-| 3 — Re-bench + document the curve | ☐ Not started | Capture before/after once Phase 2 lands; update this table |
+| 2 — Fix the bottleneck Phase 0 names | ⛔ No safe in-scope lever | T1.2 already shipped; decrypt-off-loop withdrawn (~5%); T2.1 disproven; T2.3/T3.4 won't move a syscall wall; **T1.1 unsafe — grants are the sole ACK**, skipping ⇒ retransmit storm. Ceiling is structural; real fixes (ack-piggyback wire change / batched recv) are separate efforts |
+| 3 — Re-bench + document the curve | ⊘ N/A this plan | No library change landed to re-bench. Belongs to whichever follow-up plan implements ack-piggyback or batched recv |
 
 ---
 
@@ -266,41 +266,71 @@ HEAD before writing any code:
   DoS protection) and capable of stalling *streaming* if mis-tuned. **Needs a
   designed threshold + `nrpc_streaming.rs` as the gate; not a casual edit.**
 
-**Status:** stopping here for sign-off on the T1.1 approach before modifying
-flow-control accounting. Proposed design below.
+#### T1.1 as scoped is UNSAFE — grants are the sole ACK (verified 2026-06-01)
 
-#### Proposed T1.1 design (for review)
+Tracing the ack path before editing killed the "skip unary grants" design:
 
-- Add a per-`RxCreditState` "consumed-since-last-grant" accumulator. Emit a grant
-  only when it crosses a fraction of `window_bytes` (start conservative, e.g.
-  **½ window**); otherwise bump bookkeeping and return `None` (no grant enqueued).
-- Wire-safe because grants are **authoritative + self-healing** (each carries full
-  `total_consumed`; `session.rs:1069-1076`): skipping intermediate grants is
-  already tolerated, a later grant reconciles. The sender only stalls if its credit
-  reaches 0 before a grant arrives — so the threshold must be **strictly below** the
-  window so a grant is always in flight before the sender drains.
-- Unary (consumes ≪ window in one packet) emits **zero** grants → removes the
-  per-request lock + notify + grant packet from both recv loops.
-- **Gate:** `nrpc_streaming.rs` (no stall / no throughput regression) +
-  `nrpc_qps c16/32B` (ceiling should rise) + existing session/stream credit tests.
-- **Rollback:** single accumulator + one comparison; revert is trivial.
+- **`on_ack` has exactly one production caller** — the inbound StreamWindow handler
+  (`mesh.rs:4128`: `state.with_reliability(|r| r.on_ack(grant.ack_seq))`). The
+  `StreamWindow` message carries **both** `total_consumed` (credit) **and** `ack_seq`
+  (cumulative reliable ack); `subprotocol/stream_window.rs:70-83`.
+- **There is no standalone positive-ACK packet** and **data packets carry no
+  `ack_seq`** — the 68-byte `NetHeader` (`protocol.rs:114-147`) has no ack field, and
+  the RPC RESPONSE rides an ordinary data packet on the reply channel. Only
+  `SUBPROTOCOL_STREAM_NACK` (negative) and `STREAM_RESET` exist besides the grant.
+- **Retransmit is timer-driven** (`spawn_retransmit_loop`, `mesh.rs:5087`; RTO 50 ms,
+  `max_retries` 3, then StreamReset — `reliability.rs:683`). A reliable packet leaves
+  the retransmit window **only** via `on_ack`.
+
+So for a unary RPC the caller's single reliable REQUEST is acked **only** by the
+StreamWindow grant the server sends back. **Skip that grant → the request is never
+acked → retransmitted on a 50 ms RTO up to 3× → StreamReset.** The "optimization"
+would cause retransmit storms and stream failure, not a speedup. **Not doing it.**
+
+#### What the safe version would actually require (out of scope here)
+
+The grant is doing *necessary* work (it is the ack). The only way to drop the
+separate grant packet on unary is to **piggyback the ack onto the RPC RESPONSE** —
+the response already flows server→caller, so a cross-stream `ack_seq` on the data
+header would let the standalone grant be skipped. That is a **wire-format / protocol
+change** (header field + sender apply path + interop), not a tuning knob. It belongs
+in a protocol plan (cf. `NRPC_FLAMEGRAPH.md` T1.1, which framed grant-coalescing
+without accounting for the ack role), not in this QPS investigation.
+
+#### Net result for Phase 2
+
+**No safe, in-scope lever moves the c16 syscall-bound ceiling.** Summary:
+T1.2 already shipped; decrypt-off-loop ~5 % and withdrawn; T2.1 disproven; T2.3/T3.4
+won't move a syscall wall; T1.1 (skip unary grants) is unsafe because grants are the
+sole ack. The ceiling is a **structural property** of the current
+single-recv-loop + per-packet-grant-ack protocol on a non-batched (Windows) socket.
+Lifting it requires one of two **larger, separate efforts**, both out of scope here:
+
+1. **Ack-piggyback wire change** — carry `ack_seq` on data/response packets so unary
+   needs no standalone grant. Removes a packet (and its recv-loop processing on both
+   ends) per unary round trip.
+2. **Batched / parallel receive** — wire `BatchedPacketReceiver` (recvmmsg) into
+   `spawn_receive_loop` on Linux; on Windows, RIO or multi-socket `SO_REUSEPORT`.
+   Attacks the ~22 % syscall bucket directly.
+
+Recommend closing this plan at the **diagnosis + ruled-out-fixes** milestone and
+opening a focused protocol plan for (1) if the unary QPS ceiling is a priority.
 
 > **Superseded:** the verdict's first instinct ("move decrypt off the recv loop")
 > is now a **non-lever (~5 %)** and removed from the critical path. See "Rejected"
 > at the end of this section. T2.1 (per-channel fold mutex) was already disproven by
 > the shard test.
 
-### #1 — Coalesce StreamWindow grants on unary (T1.1) — **biggest win**
-`NRPC_FLAMEGRAPH.md` confirms (from source, `session.rs:1012-1041` + `mesh.rs:4399`)
-that every accepted inbound data packet fires a StreamWindow grant — so a unary
-round trip carries **2 extra grant packets**, each = 1 `sendto` + 1 recv-loop
-wakeup + 1 AEAD on *both* ends. Coalescing/skipping grants on unary directly
-removes packets from the single recv loop — the exact resource Phase 0 named — so
-it should lift the c16/c128 ceiling, not just c1.
-- **Risk:** medium — touches flow control; the streaming benches
-  (`nrpc_streaming.rs`) + `nrpc_qps c128/16KiB` must stay green.
-- **Synergy:** this is already the #1 item in `NRPC_FLAMEGRAPH.md`; this plan adds
-  the throughput-ceiling justification on top of the latency one.
+### #1 — Coalesce StreamWindow grants on unary (T1.1) — ❌ **UNSAFE, rejected**
+The intent was right (each unary round trip carries extra grant packets that hit the
+single recv loop on both ends — `session.rs:1012-1041` + `mesh.rs:4663`). **But the
+grant *is* the ACK** (see "T1.1 as scoped is UNSAFE" above): `on_ack` is driven only
+by the inbound grant (`mesh.rs:4128`), data packets carry no `ack_seq`, and retransmit
+is timer-driven. Skipping the unary grant ⇒ request never acked ⇒ 50 ms-RTO retransmit
+×3 ⇒ StreamReset. The safe form is an **ack-piggyback wire change** (out of scope);
+see the "What the safe version would actually require" subsection.
+- The `NRPC_FLAMEGRAPH.md` framing of this item did not account for the grant's ack
+  role; that latency-side win, if pursued, needs the same wire change.
 
 ### #2 — Response leg → `publish_to_peer` direct (T1.2) — **low-risk**
 Response path uses `mesh.publish` (roster fan-out + ACL + subnet filter + a
