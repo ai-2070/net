@@ -1,0 +1,25 @@
+web/src/components/BenchmarksSection.tsx
+  s_1291e0cfda1b6e::t_ddba8e3486eec5 22,26-27,31-32
+  s_1291e0cfda1b6e::t_a40346841bf26f 61-62,66-67,71-72
+  s_1291e0cfda1b6e::t_9b0bbff58d8be4 158
+  s_1291e0cfda1b6e::t_9f9c4868c7406b 41,46-47,51-52
+  s_1291e0cfda1b6e::t_4820a56c9e64d9 96-97,101-102
+  s_1291e0cfda1b6e::t_f6fcde664fee71 82,86-87
+  s_1291e0cfda1b6e::t_766180928774c1 178
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "6516db422b93d9f3b2fbb9eaf188f7eec53c2123",
+  "prompts": {},
+  "sessions": {
+    "s_1291e0cfda1b6e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ae75b390-b0b4-4360-8561-da36d3399a98",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
