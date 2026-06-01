@@ -631,11 +631,18 @@ pub fn find_nodes_matching_scoped(
 ) -> Vec<NodeId> {
     let fold_filter = translate_filter(legacy);
     // Borrow-and-filter, same as `find_nodes_matching`: resolve
-    // candidate keys via the index, then run the post-filter and
-    // scope gate against borrowed payloads without cloning.
-    let mut out: Vec<NodeId> = fold.with_state_and_index(|state, index| {
+    // candidate keys via the index and run the range post-filter
+    // against borrowed payloads without cloning. We derive each
+    // survivor's scope here too (cheap, just parses the borrowed
+    // tags), but we do NOT call `same_subnet_lookup` under the
+    // lock — it's a caller-supplied closure opaque to the bridge,
+    // so running it while we hold the fold read locks risks lock
+    // contention or re-entrancy (a closure that itself queries the
+    // fold). Collect `(node, scope)` and apply the subnet/scope
+    // gate after the locks drop.
+    let scoped: Vec<(NodeId, CapabilityScope)> = fold.with_state_and_index(|state, index| {
         let candidates = resolve_candidate_keys(state, index, &fold_filter);
-        let mut ids: Vec<NodeId> = Vec::with_capacity(candidates.len());
+        let mut acc: Vec<(NodeId, CapabilityScope)> = Vec::with_capacity(candidates.len());
         for key in candidates {
             let Some(entry) = state.entries.get(&key) else {
                 continue;
@@ -646,15 +653,19 @@ pub fn find_nodes_matching_scoped(
             if !membership_passes_range_filter(membership, legacy) {
                 continue;
             }
-            let candidate_scope = scope_from_membership_tags(&membership.tags);
-            let same_subnet = same_subnet_lookup(key.1);
-            if !matches_scope(&candidate_scope, scope, same_subnet) {
-                continue;
-            }
-            ids.push(key.1);
+            acc.push((key.1, scope_from_membership_tags(&membership.tags)));
         }
-        ids
+        acc
     });
+    // Locks released: apply the scope gate, invoking the caller's
+    // subnet closure outside any fold lock.
+    let mut out: Vec<NodeId> = scoped
+        .into_iter()
+        .filter(|(node_id, candidate_scope)| {
+            matches_scope(candidate_scope, scope, same_subnet_lookup(*node_id))
+        })
+        .map(|(node_id, _)| node_id)
+        .collect();
     // Sort + dedup: deterministic order and one entry per publisher
     // (a publisher may match under multiple classes).
     out.sort_unstable();
