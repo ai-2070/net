@@ -1,0 +1,65 @@
+net/crates/net/cli/python/pyproject.toml
+  ai_agent 12
+net/crates/net/deck/npm/package.json
+  ai_agent 3,30-37
+net/crates/net/sdk-py/pyproject.toml
+  ai_agent 10,14
+net/crates/net/bindings/go/meshdb-ffi/Cargo.toml
+  ai_agent 3,29
+net/crates/net/fuzz/Cargo.lock
+  ai_agent 1058
+net/crates/net/bindings/python/uv.lock
+  ai_agent 37
+net/crates/net/bindings/go/deck-ffi/Cargo.toml
+  ai_agent 3,27
+net/crates/net/bindings/python/Cargo.toml
+  ai_agent 3,119-120
+net/crates/net/deck/src/app.rs
+  ai_agent 1111,1254
+net/crates/net/bindings/node/package.json
+  ai_agent 3
+net/crates/net/sdk-ts/package.json
+  ai_agent 3,42
+net/crates/net/deck/Cargo.toml
+  ai_agent 3,19
+net/crates/net/bindings/node/Cargo.toml
+  ai_agent 3,138-139
+net/crates/net/deck/python/pyproject.toml
+  ai_agent 11
+net/crates/net/bindings/python/python/net/__init__.py
+  ai_agent 757
+net/crates/net/cli/Cargo.toml
+  ai_agent 3,15
+net/crates/net/bindings/go/rpc-ffi/Cargo.toml
+  ai_agent 3,35
+net/crates/net/Cargo.lock
+  ai_agent 2280,2302,2329,2344,2362,2374,2420,2443,2452,2464,2475,2498,2519
+net/crates/net/sdk/Cargo.toml
+  ai_agent 3,25,43
+net/crates/net/Cargo.toml
+  ai_agent 20
+web/package-lock.json
+  ai_agent 14457,15116-15117
+net/crates/net/bindings/python/pyproject.toml
+  ai_agent 10
+net/crates/net/sdk-macros/Cargo.toml
+  ai_agent 3
+net/crates/net/cli/npm/package.json
+  ai_agent 3,30-37
+net/crates/net/aggregator-daemon/Cargo.toml
+  ai_agent 3,21,28
+net/crates/net/bindings/go/meshos-ffi/Cargo.toml
+  ai_agent 3,26
+net/crates/net/bindings/go/compute-ffi/Cargo.toml
+  ai_agent 3,48,52
+net/crates/net/fuzz/Cargo.toml
+  ai_agent 34
+net/crates/net/sdk-py/src/net_sdk/__init__.py
+  ai_agent 288
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "090c5555dbfffd7eed7f4fa46f409cbb992771d6",
+  "prompts": {}
+}
