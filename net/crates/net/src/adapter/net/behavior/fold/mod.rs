@@ -448,10 +448,7 @@ impl<K: FoldKind> Fold<K> {
     /// needs (e.g. a `Vec<NodeId>`) instead of cloning every
     /// matched payload out through [`FoldKind::Result`]. Bulk
     /// filter paths that discard the payload should prefer this.
-    pub fn with_state_and_index<R>(
-        &self,
-        f: impl FnOnce(&FoldState<K>, &K::Index) -> R,
-    ) -> R {
+    pub fn with_state_and_index<R>(&self, f: impl FnOnce(&FoldState<K>, &K::Index) -> R) -> R {
         self.metrics.on_query();
         let state = self.state.read();
         let index = self.index.read();

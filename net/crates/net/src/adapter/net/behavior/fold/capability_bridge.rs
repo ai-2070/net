@@ -763,9 +763,9 @@ mod tests {
         assert!(tags.contains(&"software.model.0.id=llama3".to_string()));
         // ...but never the index-only synthetic tags.
         assert!(
-            !tags
-                .iter()
-                .any(|t| t.starts_with("model:") || t.starts_with("tool:") || t.starts_with("gpu:")),
+            !tags.iter().any(|t| t.starts_with("model:")
+                || t.starts_with("tool:")
+                || t.starts_with("gpu:")),
             "synthetic index tags leaked into enumeration: {tags:?}"
         );
 
