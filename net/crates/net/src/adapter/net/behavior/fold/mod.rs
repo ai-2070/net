@@ -437,6 +437,24 @@ impl<K: FoldKind> Fold<K> {
         K::query(&state, &index, q)
     }
 
+    /// Read-only access to both the live state and the secondary
+    /// index under their read locks for the closure's duration.
+    /// Both locks are read-acquired, so concurrent callers still
+    /// run in parallel.
+    ///
+    /// This is the borrow-only counterpart to [`Self::query`]: it
+    /// lets a caller resolve candidates via the index and inspect
+    /// the matching entries *by reference*, returning only what it
+    /// needs (e.g. a `Vec<NodeId>`) instead of cloning every
+    /// matched payload out through [`FoldKind::Result`]. Bulk
+    /// filter paths that discard the payload should prefer this.
+    pub fn with_state_and_index<R>(&self, f: impl FnOnce(&FoldState<K>, &K::Index) -> R) -> R {
+        self.metrics.on_query();
+        let state = self.state.read();
+        let index = self.index.read();
+        f(&state, &index)
+    }
+
     /// Force-remove every entry owned by `node_id`. Called when
     /// SWIM (or an operator) declares the node dead so the
     /// fold's view of liveness matches the substrate's. O(keys

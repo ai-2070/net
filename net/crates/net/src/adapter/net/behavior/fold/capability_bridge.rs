@@ -24,69 +24,96 @@
 //! - [`find_nodes_matching_scoped`] — the fold-flavored
 //!   replacement for the legacy `find_nodes_scoped`.
 
-use std::collections::HashSet;
-
 use super::super::capability::{
     matches_scope, CapabilityAnnouncement, CapabilityFilter as LegacyFilter, CapabilityScope,
     GpuVendor, ScopeFilter,
 };
 use super::capability::{
-    CapabilityFilter, CapabilityFold, CapabilityMembership, CapabilityQuery, HardwareSummary,
+    resolve_candidate_keys, CapabilityFilter, CapabilityFold, CapabilityMembership, HardwareSummary,
 };
 use super::state::FoldError;
 use super::{ApplyOutcome, EnvelopeMeta, Fold, FoldKind, NodeId, NodeState, SignedAnnouncement};
 
 /// Translate the legacy
 /// [`behavior::capability::CapabilityFilter`](super::super::capability::CapabilityFilter)
-/// into the fold's composite filter shape. Encodes models /
-/// tools as canonical `"model:<name>"` / `"tool:<name>"` tags so
-/// the fold's tag-based secondary index can resolve them via
-/// the same intersection that handles plain tag predicates.
+/// into the fold's composite filter shape. The `require_models`,
+/// `require_tools`, `require_gpu`, and `gpu_vendor` axes become
+/// `tag_groups_all` entries built from the index-only synthetic
+/// tags (`model:<id>`, `tool:<id>`, `gpu:present`,
+/// `gpu:vendor:<v>`) the fold derives at insert, so the fold's
+/// secondary index resolves them with no per-candidate parse —
+/// each axis is one group (OR within the axis, AND across axes).
 ///
-/// Range predicates (`min_memory_gb`, `min_vram_gb`,
-/// `require_gpu`, `gpu_vendor`) and free-form fields
-/// (`require_modalities`, `min_context_length`) are NOT carried
-/// here — callers run them through [`membership_passes_post_filter`]
-/// against each candidate the fold returns. The
-/// `require_modalities` and `min_context_length` axes are
-/// silently dropped on the fold path because the fold's
-/// [`CapabilityMembership`] payload doesn't carry the model
-/// metadata needed to evaluate them; callers that need them
-/// keep the legacy index until the fold's payload is extended.
+/// The true range predicates (`min_memory_gb`, `min_vram_gb`) and
+/// free-form fields (`require_modalities`, `min_context_length`)
+/// are NOT carried here — the *bulk* path runs the ranges through
+/// [`membership_passes_range_filter`] against each borrowed
+/// candidate, and the single-target path runs the full
+/// [`membership_passes_post_filter`]. The `require_modalities` and
+/// `min_context_length` axes are silently dropped on the fold path
+/// because the fold's [`CapabilityMembership`] payload doesn't
+/// carry the model metadata needed to evaluate them; callers that
+/// need them keep the legacy index until the fold's payload is
+/// extended.
 pub fn translate_filter(legacy: &LegacyFilter) -> CapabilityFilter {
-    // Models and tools are NOT pushed into `tags_all` — the canonical
-    // wire form for those is a multi-tag bundle
-    // (`software.model.<i>.id=<name>`, `software.tool.<i>.tool_id=<name>`)
-    // that doesn't match a single `model:<name>` / `tool:<name>` tag.
-    // They're handled in `membership_passes_post_filter` via the
-    // legacy `CapabilitySet::has_model` / `has_tool` scan.
+    // Each non-tag axis becomes one `tag_groups_all` group of
+    // index-only synthetic tags. `require_models` / `require_tools`
+    // are "any of" (union → multi-element group); `require_gpu` /
+    // `gpu_vendor` are single-element groups. The synthetic tags
+    // are manufactured at insert by `derive_synthetic_index_tags`
+    // from the canonical `software.model.<i>.id=` /
+    // `software.tool.<i>.tool_id=` bundles and the hardware
+    // projection, and `tag_groups_all` resolves against the
+    // index's separate `by_synthetic` map — so a raw published tag
+    // whose string happens to equal a synthetic key (e.g. a
+    // `Tag::Legacy("model:llama3")`) can never satisfy these axes.
+    let mut tag_groups_all: Vec<Vec<String>> = Vec::new();
+    if !legacy.require_models.is_empty() {
+        tag_groups_all.push(
+            legacy
+                .require_models
+                .iter()
+                .map(|m| format!("model:{m}"))
+                .collect(),
+        );
+    }
+    if !legacy.require_tools.is_empty() {
+        tag_groups_all.push(
+            legacy
+                .require_tools
+                .iter()
+                .map(|t| format!("tool:{t}"))
+                .collect(),
+        );
+    }
+    if legacy.require_gpu {
+        tag_groups_all.push(vec!["gpu:present".to_string()]);
+    }
+    if let Some(vendor) = legacy.gpu_vendor {
+        tag_groups_all.push(vec![format!("gpu:vendor:{}", gpu_vendor_canonical(vendor))]);
+    }
     CapabilityFilter {
         class: None,
         tags_all: legacy.require_tags.clone(),
         tags_any: Vec::new(),
+        tag_groups_all,
         state: None,
         region: None,
         limit: 0,
     }
 }
 
-/// `true` if `membership` satisfies the post-query predicates
-/// the fold's index doesn't natively support. Caller is
-/// expected to have already filtered candidates through the
-/// fold's secondary index via [`translate_filter`].
-pub fn membership_passes_post_filter(
+/// `true` if `membership` satisfies the *range* predicates the
+/// fold's secondary index can't resolve — `min_memory_gb` and
+/// `min_vram_gb`. The bulk filter path uses this against borrowed
+/// candidates after the index has already resolved the tag /
+/// model / tool / gpu axes (the latter three via the synthetic-tag
+/// groups `translate_filter` builds), so re-checking those here
+/// would be redundant work.
+pub fn membership_passes_range_filter(
     membership: &CapabilityMembership,
     legacy: &LegacyFilter,
 ) -> bool {
-    if legacy.require_gpu {
-        let has_gpu = match &membership.hardware {
-            Some(h) => h.gpu_count > 0 || h.gpu_vendor.is_some(),
-            None => false,
-        };
-        if !has_gpu {
-            return false;
-        }
-    }
     if let Some(min_mem) = legacy.min_memory_gb {
         let mem = membership
             .hardware
@@ -104,6 +131,38 @@ pub fn membership_passes_post_filter(
             .and_then(|h| h.vram_gb)
             .unwrap_or(0);
         if vram < min_vram {
+            return false;
+        }
+    }
+    true
+}
+
+/// `true` if `membership` satisfies every post-query predicate the
+/// fold's tag intersection doesn't itself enforce: the range
+/// predicates ([`membership_passes_range_filter`]) plus GPU
+/// presence / vendor and model / tool membership.
+///
+/// This is the full, self-contained matcher used by the
+/// single-target path ([`target_matches_filter`]), which walks one
+/// publisher's entries directly and does NOT consult the secondary
+/// index. The bulk path resolves the gpu / model / tool axes
+/// through the index's synthetic-tag groups instead and only needs
+/// [`membership_passes_range_filter`];
+/// `target_matches_filter_agrees_with_find_nodes_matching` pins
+/// that the two stay equivalent.
+pub fn membership_passes_post_filter(
+    membership: &CapabilityMembership,
+    legacy: &LegacyFilter,
+) -> bool {
+    if !membership_passes_range_filter(membership, legacy) {
+        return false;
+    }
+    if legacy.require_gpu {
+        let has_gpu = match &membership.hardware {
+            Some(h) => h.gpu_count > 0 || h.gpu_vendor.is_some(),
+            None => false,
+        };
+        if !has_gpu {
             return false;
         }
     }
@@ -406,18 +465,34 @@ pub fn translate_announcement(
 /// multiple classes counts once).
 pub fn find_nodes_matching(fold: &Fold<CapabilityFold>, legacy: &LegacyFilter) -> Vec<NodeId> {
     let fold_filter = translate_filter(legacy);
-    let matches = fold.query(CapabilityQuery::Composite(fold_filter));
-    let mut node_set: HashSet<NodeId> = HashSet::new();
-    for ((_class, node_id), membership) in matches {
-        if membership_passes_post_filter(&membership, legacy) {
-            node_set.insert(node_id);
+    // Resolve the indexed-axis candidate keys and run the
+    // non-indexed post-filter against *borrowed* payloads, all
+    // under one read-lock acquisition. The bulk path only needs
+    // node ids out, so we never clone a `CapabilityMembership` —
+    // unlike the `Vec<CapabilityMatch>` query path, which clones
+    // every match before the caller can discard it.
+    let mut out: Vec<NodeId> = fold.with_state_and_index(|state, index| {
+        let candidates = resolve_candidate_keys(state, index, &fold_filter);
+        let mut ids: Vec<NodeId> = Vec::with_capacity(candidates.len());
+        for key in candidates {
+            let Some(entry) = state.entries.get(&key) else {
+                continue;
+            };
+            // The index already resolved the tag / model / tool /
+            // gpu axes; only the range predicates remain.
+            if membership_passes_range_filter(&entry.payload, legacy) {
+                ids.push(key.1);
+            }
         }
-    }
-    // Sort so callers (e.g. the scheduler's `FirstMatch` placement)
-    // see a deterministic order across processes; HashSet iteration
-    // is randomized.
-    let mut out: Vec<NodeId> = node_set.into_iter().collect();
+        ids
+    });
+    // Sort + dedup: callers (e.g. the scheduler's `FirstMatch`
+    // placement) need a deterministic order across processes, and a
+    // publisher present in multiple classes must count once. Sorting
+    // the Vec and deduping is cheaper than routing through a
+    // `HashSet<NodeId>` first.
     out.sort_unstable();
+    out.dedup();
     out
 }
 
@@ -555,21 +630,46 @@ pub fn find_nodes_matching_scoped(
     same_subnet_lookup: impl Fn(NodeId) -> bool,
 ) -> Vec<NodeId> {
     let fold_filter = translate_filter(legacy);
-    let matches = fold.query(CapabilityQuery::Composite(fold_filter));
-    let mut node_set: HashSet<NodeId> = HashSet::new();
-    for ((_class, node_id), membership) in matches {
-        if !membership_passes_post_filter(&membership, legacy) {
-            continue;
+    // Borrow-and-filter, same as `find_nodes_matching`: resolve
+    // candidate keys via the index and run the range post-filter
+    // against borrowed payloads without cloning. We derive each
+    // survivor's scope here too (cheap, just parses the borrowed
+    // tags), but we do NOT call `same_subnet_lookup` under the
+    // lock — it's a caller-supplied closure opaque to the bridge,
+    // so running it while we hold the fold read locks risks lock
+    // contention or re-entrancy (a closure that itself queries the
+    // fold). Collect `(node, scope)` and apply the subnet/scope
+    // gate after the locks drop.
+    let scoped: Vec<(NodeId, CapabilityScope)> = fold.with_state_and_index(|state, index| {
+        let candidates = resolve_candidate_keys(state, index, &fold_filter);
+        let mut acc: Vec<(NodeId, CapabilityScope)> = Vec::with_capacity(candidates.len());
+        for key in candidates {
+            let Some(entry) = state.entries.get(&key) else {
+                continue;
+            };
+            let membership = &entry.payload;
+            // The index already resolved the tag / model / tool /
+            // gpu axes; only the range predicates remain.
+            if !membership_passes_range_filter(membership, legacy) {
+                continue;
+            }
+            acc.push((key.1, scope_from_membership_tags(&membership.tags)));
         }
-        let candidate_scope = scope_from_membership_tags(&membership.tags);
-        let same_subnet = same_subnet_lookup(node_id);
-        if !matches_scope(&candidate_scope, scope, same_subnet) {
-            continue;
-        }
-        node_set.insert(node_id);
-    }
-    let mut out: Vec<NodeId> = node_set.into_iter().collect();
+        acc
+    });
+    // Locks released: apply the scope gate, invoking the caller's
+    // subnet closure outside any fold lock.
+    let mut out: Vec<NodeId> = scoped
+        .into_iter()
+        .filter(|(node_id, candidate_scope)| {
+            matches_scope(candidate_scope, scope, same_subnet_lookup(*node_id))
+        })
+        .map(|(node_id, _)| node_id)
+        .collect();
+    // Sort + dedup: deterministic order and one entry per publisher
+    // (a publisher may match under multiple classes).
     out.sort_unstable();
+    out.dedup();
     out
 }
 
@@ -580,6 +680,7 @@ mod tests {
         EnvelopeMeta, FoldKind, NodeState, SignedAnnouncement,
     };
     use crate::adapter::net::identity::EntityKeypair;
+    use std::collections::HashSet;
     use std::time::Duration;
 
     fn sign_member(
@@ -618,24 +719,88 @@ mod tests {
     }
 
     #[test]
-    fn translate_filter_passes_require_tags_through_and_defers_models_and_tools() {
+    fn translate_filter_passes_require_tags_through_and_groups_models_tools_gpu() {
         let legacy = LegacyFilter {
             require_tags: vec!["gpu".into()],
-            require_models: vec!["llama3".into()],
+            require_models: vec!["llama3".into(), "mistral".into()],
             require_tools: vec!["ffmpeg".into()],
+            require_gpu: true,
+            gpu_vendor: Some(GpuVendor::Nvidia),
             ..LegacyFilter::default()
         };
         let fold_filter = translate_filter(&legacy);
-        // `require_tags` go directly through.
+        // `require_tags` go directly through to `tags_all` (AND).
         assert_eq!(fold_filter.tags_all, vec!["gpu".to_string()]);
-        // `require_models` / `require_tools` are NOT encoded as fold
-        // tags — the canonical wire form is multi-tag bundles
-        // (`software.model.<i>.id=...`) that `membership_passes_post_filter`
-        // matches via `CapabilitySet::has_model` / `has_tool`. A
-        // `model:<name>` / `tool:<name>` tag would never match an
-        // honest publisher.
-        assert!(!fold_filter.tags_all.contains(&"model:llama3".to_string()));
-        assert!(!fold_filter.tags_all.contains(&"tool:ffmpeg".to_string()));
+        // Models / tools / gpu / vendor are encoded as the
+        // index-only synthetic-tag groups the fold derives at
+        // insert — one group per axis (OR within, AND across).
+        // `require_models` is "any of", so both models land in a
+        // single group.
+        assert_eq!(
+            fold_filter.tag_groups_all,
+            vec![
+                vec!["model:llama3".to_string(), "model:mistral".to_string()],
+                vec!["tool:ffmpeg".to_string()],
+                vec!["gpu:present".to_string()],
+                vec!["gpu:vendor:nvidia".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn synthetic_index_tags_are_queryable_but_never_leak_into_enumeration() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let hw = HardwareSummary {
+            gpu_vendor: Some("nvidia".into()),
+            gpu_count: 1,
+            memory_gb: Some(64),
+            vram_gb: Some(24),
+        };
+        fold.apply(sign_member(
+            &kp,
+            0xAA,
+            0x100,
+            vec![
+                "gpu",
+                "software.model.0.id=llama3",
+                "software.tool.0.tool_id=ffmpeg",
+            ],
+            Some(hw),
+        ))
+        .expect("apply AA");
+
+        // Tag enumeration returns the real published tags...
+        let tags = super::super::capability::capability_tags_for(&fold, 0xAA);
+        assert!(tags.contains(&"gpu".to_string()));
+        assert!(tags.contains(&"software.model.0.id=llama3".to_string()));
+        // ...but never the index-only synthetic tags.
+        assert!(
+            !tags.iter().any(|t| t.starts_with("model:")
+                || t.starts_with("tool:")
+                || t.starts_with("gpu:")),
+            "synthetic index tags leaked into enumeration: {tags:?}"
+        );
+
+        // Yet the synthetic tags ARE resolvable through the index.
+        let by_model = find_nodes_matching(
+            &fold,
+            &LegacyFilter {
+                require_models: vec!["llama3".into()],
+                ..LegacyFilter::default()
+            },
+        );
+        assert_eq!(by_model, vec![0xAA]);
+        let by_tool_and_gpu = find_nodes_matching(
+            &fold,
+            &LegacyFilter {
+                require_tools: vec!["ffmpeg".into()],
+                require_gpu: true,
+                gpu_vendor: Some(GpuVendor::Nvidia),
+                ..LegacyFilter::default()
+            },
+        );
+        assert_eq!(by_tool_and_gpu, vec![0xAA]);
     }
 
     #[test]
@@ -746,10 +911,48 @@ mod tests {
         // fast path can't silently drift from the bulk query.
         let fold = new_fold();
         let kp = EntityKeypair::generate();
-        fold.apply(sign_member(&kp, 0xAA, 0x100, vec!["gpu", "cuda"], None))
-            .expect("apply AA");
+        let nvidia_hw = HardwareSummary {
+            gpu_vendor: Some("nvidia".into()),
+            gpu_count: 2,
+            memory_gb: Some(128),
+            vram_gb: Some(80),
+        };
+        // AA: gpu tags + a model/tool bundle + nvidia hardware.
+        fold.apply(sign_member(
+            &kp,
+            0xAA,
+            0x100,
+            vec![
+                "gpu",
+                "cuda",
+                "software.model.0.id=llama3",
+                "software.tool.0.tool_id=ffmpeg",
+            ],
+            Some(nvidia_hw),
+        ))
+        .expect("apply AA");
+        // BB: cpu-only, no hardware, no bundles.
         fold.apply(sign_member(&kp, 0xBB, 0x100, vec!["cpu-only"], None))
             .expect("apply BB");
+        // CC: a spoofer. Emits raw tags whose strings collide with
+        // the index-only synthetic namespace, but carries no real
+        // model/tool bundle and no hardware. Both paths must agree
+        // it matches none of the model/tool/gpu axes — the synthetic
+        // index is fed only by `derive_synthetic_index_tags`, never
+        // by raw published tag strings.
+        fold.apply(sign_member(
+            &kp,
+            0xCC,
+            0x100,
+            vec![
+                "model:llama3",
+                "tool:ffmpeg",
+                "gpu:present",
+                "gpu:vendor:nvidia",
+            ],
+            None,
+        ))
+        .expect("apply CC");
 
         let probe = |legacy: &LegacyFilter, candidates: &[NodeId]| {
             let bulk: HashSet<NodeId> = find_nodes_matching(&fold, legacy).into_iter().collect();
@@ -759,7 +962,7 @@ mod tests {
                     target_matches_filter(&fold, n, legacy),
                     "node 0x{:x} verdict mismatch for filter {:?}",
                     n,
-                    legacy.require_tags
+                    legacy
                 );
             }
         };
@@ -772,6 +975,42 @@ mod tests {
         f.require_tags.push("gpu".into());
         probe(&f, &[0xAA, 0xBB, 0xCC]);
 
+        // The index-resolved axes must agree between paths too:
+        // a present model, a missing model, a present tool, GPU
+        // presence, and a matching/mismatching vendor.
+        // 0xCC is probed on every index-resolved axis: its raw
+        // colliding tags must NOT satisfy any of them on either path.
+        let model_hit = LegacyFilter {
+            require_models: vec!["llama3".into()],
+            ..LegacyFilter::default()
+        };
+        probe(&model_hit, &[0xAA, 0xBB, 0xCC]);
+        let model_miss = LegacyFilter {
+            require_models: vec!["does-not-exist".into()],
+            ..LegacyFilter::default()
+        };
+        probe(&model_miss, &[0xAA, 0xBB, 0xCC]);
+        let tool_hit = LegacyFilter {
+            require_tools: vec!["ffmpeg".into()],
+            ..LegacyFilter::default()
+        };
+        probe(&tool_hit, &[0xAA, 0xBB, 0xCC]);
+        let gpu = LegacyFilter {
+            require_gpu: true,
+            ..LegacyFilter::default()
+        };
+        probe(&gpu, &[0xAA, 0xBB, 0xCC]);
+        let vendor_hit = LegacyFilter {
+            gpu_vendor: Some(GpuVendor::Nvidia),
+            ..LegacyFilter::default()
+        };
+        probe(&vendor_hit, &[0xAA, 0xBB, 0xCC]);
+        let vendor_miss = LegacyFilter {
+            gpu_vendor: Some(GpuVendor::Amd),
+            ..LegacyFilter::default()
+        };
+        probe(&vendor_miss, &[0xAA, 0xBB]);
+
         // Unknown publisher: per-target check returns false (matches
         // bulk path's "missing publishers don't appear").
         assert!(!target_matches_filter(
@@ -779,6 +1018,115 @@ mod tests {
             0xDEAD,
             &LegacyFilter::default()
         ));
+    }
+
+    #[test]
+    fn raw_tags_cannot_spoof_the_synthetic_model_tool_gpu_namespace() {
+        // The model / tool / gpu axes resolve through the index-only
+        // synthetic tag map, which is fed solely by
+        // `derive_synthetic_index_tags`. A publisher must not be able
+        // to satisfy those axes by emitting a raw tag string that
+        // happens to equal a synthetic key — published tags are
+        // arbitrary (`Tag::Legacy` round-trips verbatim), so this
+        // would otherwise be a free capability spoof on the bulk
+        // path while the single-target path (which scans the real
+        // bundle / hardware) disagreed.
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let nvidia_hw = HardwareSummary {
+            gpu_vendor: Some("nvidia".into()),
+            gpu_count: 1,
+            memory_gb: Some(64),
+            vram_gb: Some(24),
+        };
+        // Honest node: real model/tool bundle + nvidia hardware.
+        fold.apply(sign_member(
+            &kp,
+            0xAA,
+            0x100,
+            vec![
+                "software.model.0.id=llama3",
+                "software.tool.0.tool_id=ffmpeg",
+            ],
+            Some(nvidia_hw),
+        ))
+        .expect("apply AA");
+        // Spoofer: raw tags string-equal to the synthetic keys, but
+        // no bundle and no hardware.
+        fold.apply(sign_member(
+            &kp,
+            0xBB,
+            0x100,
+            vec![
+                "model:llama3",
+                "tool:ffmpeg",
+                "gpu:present",
+                "gpu:vendor:nvidia",
+            ],
+            None,
+        ))
+        .expect("apply BB");
+
+        // Only the honest node resolves on each axis — the spoofer is
+        // invisible to the synthetic index.
+        let model = find_nodes_matching(
+            &fold,
+            &LegacyFilter {
+                require_models: vec!["llama3".into()],
+                ..LegacyFilter::default()
+            },
+        );
+        assert_eq!(model, vec![0xAA]);
+        let tool = find_nodes_matching(
+            &fold,
+            &LegacyFilter {
+                require_tools: vec!["ffmpeg".into()],
+                ..LegacyFilter::default()
+            },
+        );
+        assert_eq!(tool, vec![0xAA]);
+        let gpu = find_nodes_matching(
+            &fold,
+            &LegacyFilter {
+                require_gpu: true,
+                ..LegacyFilter::default()
+            },
+        );
+        assert_eq!(gpu, vec![0xAA]);
+        let vendor = find_nodes_matching(
+            &fold,
+            &LegacyFilter {
+                gpu_vendor: Some(GpuVendor::Nvidia),
+                ..LegacyFilter::default()
+            },
+        );
+        assert_eq!(vendor, vec![0xAA]);
+
+        // And the bulk verdict for the spoofer matches the
+        // single-target path on every axis (both: no match).
+        for legacy in [
+            LegacyFilter {
+                require_models: vec!["llama3".into()],
+                ..LegacyFilter::default()
+            },
+            LegacyFilter {
+                require_tools: vec!["ffmpeg".into()],
+                ..LegacyFilter::default()
+            },
+            LegacyFilter {
+                require_gpu: true,
+                ..LegacyFilter::default()
+            },
+            LegacyFilter {
+                gpu_vendor: Some(GpuVendor::Nvidia),
+                ..LegacyFilter::default()
+            },
+        ] {
+            assert!(
+                !target_matches_filter(&fold, 0xBB, &legacy),
+                "spoofer unexpectedly matched single-target path for {legacy:?}"
+            );
+        }
     }
 
     #[test]
