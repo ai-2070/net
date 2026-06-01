@@ -104,7 +104,16 @@ fn bench_proximity_graph(c: &mut Criterion) {
         graph.on_pingwave(pw, addr);
     }
 
-    // Process a new pingwave
+    // Process a new pingwave.
+    //
+    // Uses a dedicated graph: this closure inserts a brand-new node on
+    // every Criterion iteration (millions of them over a measurement
+    // window). Running it against the shared `graph` would balloon that
+    // graph to millions of entries before the read-path benchmarks
+    // below execute, making `all_nodes_100` clone millions of nodes
+    // instead of 100 — a ~quarter-second artifact that has nothing to
+    // do with the cost of listing 100 nodes.
+    let growth_graph = ProximityGraph::new(my_id, ProximityConfig::default());
     group.bench_function("on_pingwave_new", |b| {
         let mut seq = 10000u64;
         b.iter(|| {
@@ -113,7 +122,7 @@ fn bench_proximity_graph(c: &mut Criterion) {
             node_id[0..8].copy_from_slice(&seq.to_le_bytes());
             let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
             let pw = EnhancedPingwave::new(node_id, seq, 3);
-            graph.on_pingwave(pw, addr);
+            growth_graph.on_pingwave(pw, addr);
         });
     });
 
