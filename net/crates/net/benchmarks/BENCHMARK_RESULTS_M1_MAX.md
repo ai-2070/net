@@ -4014,13 +4014,151 @@ span/with_kind          time:   [338.25 ns 339.81 ns 341.30 ns]
                         thrpt:  [2.9300 Melem/s 2.9428 Melem/s 2.9564 Melem/s]
 
 context_store/create_context
-                        time:   [96.780 µs 96.833 µs 96.884 µs]
-                        thrpt:  [10.322 Kelem/s 10.327 Kelem/s 10.333 Kelem/s]
-Found 10 outliers among 100 measurements (10.00%)
-  3 (3.00%) low mild
+                        time:   [979.19 ns 982.19 ns 985.61 ns]
+                        thrpt:  [1.0146 Melem/s 1.0181 Melem/s 1.0213 Melem/s]
+                 change:
+                        time:   [−98.985% −98.982% −98.979%] (p = 0.00 < 0.05)
+                        thrpt:  [+9695.1% +9722.4% +9750.7%]
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+context_store/get_context
+                        time:   [50.684 ns 50.741 ns 50.800 ns]
+                        thrpt:  [19.685 Melem/s 19.708 Melem/s 19.730 Melem/s]
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) low mild
   2 (2.00%) high mild
-  5 (5.00%) high severe
+  1 (1.00%) high severe
+context_store/add_span  time:   [395.82 ns 397.10 ns 398.37 ns]
+                        thrpt:  [2.5102 Melem/s 2.5183 Melem/s 2.5264 Melem/s]
+Found 13 outliers among 100 measurements (13.00%)
+  11 (11.00%) low mild
+  1 (1.00%) high mild
+  1 (1.00%) high severe
 
-thread 'main' (321763961) panicked at benches/net.rs:4278:45:
-called `Result::unwrap()` on an `Err` value: CapacityExceeded
-note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+propagation_context/from_context
+                        time:   [854.01 ns 857.80 ns 861.29 ns]
+                        thrpt:  [1.1610 Melem/s 1.1658 Melem/s 1.1709 Melem/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+propagation_context/to_context
+                        time:   [919.66 ns 923.37 ns 927.03 ns]
+                        thrpt:  [1.0787 Melem/s 1.0830 Melem/s 1.0874 Melem/s]
+
+context_store_concurrent/concurrent_get
+                        time:   [58.813 ns 58.860 ns 58.919 ns]
+                        thrpt:  [16.973 Melem/s 16.989 Melem/s 17.003 Melem/s]
+Found 16 outliers among 100 measurements (16.00%)
+  4 (4.00%) high mild
+  12 (12.00%) high severe
+
+endpoint/create         time:   [3.0523 ns 3.0531 ns 3.0543 ns]
+                        thrpt:  [327.41 Melem/s 327.53 Melem/s 327.63 Melem/s]
+Found 11 outliers among 100 measurements (11.00%)
+  2 (2.00%) high mild
+  9 (9.00%) high severe
+endpoint/create_with_config
+                        time:   [107.71 ns 108.54 ns 109.50 ns]
+                        thrpt:  [9.1324 Melem/s 9.2129 Melem/s 9.2844 Melem/s]
+endpoint/effective_weight
+                        time:   [310.31 ps 310.41 ps 310.54 ps]
+                        thrpt:  [3.2202 Gelem/s 3.2215 Gelem/s 3.2225 Gelem/s]
+Found 13 outliers among 100 measurements (13.00%)
+  3 (3.00%) high mild
+  10 (10.00%) high severe
+
+load_metrics/load_score time:   [310.64 ps 311.27 ps 312.09 ps]
+                        thrpt:  [3.2042 Gelem/s 3.2126 Gelem/s 3.2192 Gelem/s]
+Found 19 outliers among 100 measurements (19.00%)
+  2 (2.00%) high mild
+  17 (17.00%) high severe
+load_metrics/is_overloaded
+                        time:   [310.29 ps 310.37 ps 310.48 ps]
+                        thrpt:  [3.2208 Gelem/s 3.2219 Gelem/s 3.2228 Gelem/s]
+Found 14 outliers among 100 measurements (14.00%)
+  4 (4.00%) high mild
+  10 (10.00%) high severe
+
+lb_strategies/round_robin
+                        time:   [1.9372 µs 1.9444 µs 1.9519 µs]
+                        thrpt:  [512.31 Kelem/s 514.28 Kelem/s 516.21 Kelem/s]
+lb_strategies/weighted_round_robin
+                        time:   [1.9634 µs 1.9672 µs 1.9713 µs]
+                        thrpt:  [507.29 Kelem/s 508.33 Kelem/s 509.33 Kelem/s]
+Found 6 outliers among 100 measurements (6.00%)
+  3 (3.00%) high mild
+  3 (3.00%) high severe
+lb_strategies/least_connections
+                        time:   [1.9255 µs 1.9278 µs 1.9301 µs]
+                        thrpt:  [518.12 Kelem/s 518.74 Kelem/s 519.35 Kelem/s]
+Found 7 outliers among 100 measurements (7.00%)
+  4 (4.00%) low mild
+  1 (1.00%) high mild
+  2 (2.00%) high severe
+lb_strategies/random    time:   [2.2207 µs 2.2242 µs 2.2276 µs]
+                        thrpt:  [448.92 Kelem/s 449.60 Kelem/s 450.31 Kelem/s]
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+lb_strategies/power_of_two
+                        time:   [2.5137 µs 2.5171 µs 2.5206 µs]
+                        thrpt:  [396.73 Kelem/s 397.29 Kelem/s 397.83 Kelem/s]
+Found 6 outliers among 100 measurements (6.00%)
+  5 (5.00%) high mild
+  1 (1.00%) high severe
+lb_strategies/consistent_hash
+                        time:   [81.110 µs 86.808 µs 92.756 µs]
+                        thrpt:  [10.781 Kelem/s 11.520 Kelem/s 12.329 Kelem/s]
+lb_strategies/least_load
+                        time:   [2.1424 µs 2.1468 µs 2.1525 µs]
+                        thrpt:  [464.58 Kelem/s 465.80 Kelem/s 466.77 Kelem/s]
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) high mild
+  2 (2.00%) high severe
+
+lb_scaling/select/10    time:   [1.9239 µs 1.9303 µs 1.9365 µs]
+                        thrpt:  [516.40 Kelem/s 518.06 Kelem/s 519.78 Kelem/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high severe
+lb_scaling/select/50    time:   [2.4740 µs 2.4754 µs 2.4772 µs]
+                        thrpt:  [403.69 Kelem/s 403.97 Kelem/s 404.20 Kelem/s]
+Found 5 outliers among 100 measurements (5.00%)
+  1 (1.00%) low severe
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+lb_scaling/select/100   time:   [3.0845 µs 3.0908 µs 3.0968 µs]
+                        thrpt:  [322.92 Kelem/s 323.54 Kelem/s 324.20 Kelem/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high severe
+lb_scaling/select/500   time:   [5.3662 µs 5.3718 µs 5.3780 µs]
+                        thrpt:  [185.94 Kelem/s 186.16 Kelem/s 186.35 Kelem/s]
+Found 11 outliers among 100 measurements (11.00%)
+  5 (5.00%) high mild
+  6 (6.00%) high severe
+
+lb_zone_aware/zone_match
+                        time:   [1.9842 µs 1.9881 µs 1.9925 µs]
+                        thrpt:  [501.88 Kelem/s 503.00 Kelem/s 503.99 Kelem/s]
+Found 12 outliers among 100 measurements (12.00%)
+  1 (1.00%) low mild
+  2 (2.00%) high mild
+  9 (9.00%) high severe
+lb_zone_aware/zone_fallback
+                        time:   [1.9372 µs 1.9423 µs 1.9470 µs]
+                        thrpt:  [513.60 Kelem/s 514.85 Kelem/s 516.21 Kelem/s]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+
+lb_health_updates/update_health
+                        time:   [25.936 ns 26.248 ns 26.617 ns]
+                        thrpt:  [37.571 Melem/s 38.098 Melem/s 38.557 Melem/s]
+Found 13 outliers among 100 measurements (13.00%)
+  9 (9.00%) high mild
+  4 (4.00%) high severe
+lb_health_updates/update_metrics
+                        time:   [131.47 ns 133.57 ns 135.16 ns]
+                        thrpt:  [7.3989 Melem/s 7.4868 Melem/s 7.6062 Melem/s]
+Found 28 outliers among 100 measurements (28.00%)
+  16 (16.00%) low severe
+  1 (1.00%) low mild
+  11 (11.00%) high mild
