@@ -1,0 +1,21 @@
+net/crates/net/docs/plans/NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md
+  s_c24b2495bec0fd::t_c14404db981709 1-192
+net/crates/net/docs/plans/NRPC_QPS_CONCURRENCY_SCALING_PLAN.md
+  s_c24b2495bec0fd::t_db41ca66c7f046 316-322
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "e571461ac0b8db4334f97e4fd8a9e05695a28567",
+  "prompts": {},
+  "sessions": {
+    "s_c24b2495bec0fd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e01a2998-9b21-43ec-bf62-bf4d7367328d",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
