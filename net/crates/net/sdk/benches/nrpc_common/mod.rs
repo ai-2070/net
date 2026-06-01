@@ -36,6 +36,12 @@ use tokio::runtime::{Builder as RtBuilder, Runtime};
 // ============================================================================
 
 pub const SVC_JSON: &str = "bench_echo_json";
+/// Prefix for the per-shard JSON echo services registered by
+/// [`Pair::new_sharded`]. Shard `i` is served as
+/// `"{SVC_JSON_SHARD_PREFIX}{i}"`. Used by `nrpc_qps_shard.rs` to
+/// spread load across N independent channels (each gets its own
+/// bridge task + fold mutex).
+pub const SVC_JSON_SHARD_PREFIX: &str = "bench_echo_json_shard_";
 pub const SVC_POSTCARD: &str = "bench_echo_postcard";
 pub const SVC_RAW: &str = "bench_echo_raw";
 pub const SVC_JSON_STREAM: &str = "bench_stream_json";
@@ -76,10 +82,49 @@ pub struct Pair {
     pub server: Mesh,
     pub caller: Mesh,
     pub server_node_id: u64,
+    /// Service names registered by [`Pair::new_sharded`], in shard
+    /// order. Empty for a [`Pair::new`] pair. [`call_json_shard_retrying`]
+    /// indexes into this to fan calls across channels.
+    pub shard_services: Vec<String>,
     // Keep ServeHandles alive for the lifetime of the Pair. The
     // RPC dispatcher unregisters on Drop, so binding to `_` would
     // tear the service down immediately (see nrpc_echo.rs:98).
     _handles: Vec<net_sdk::mesh_rpc::ServeHandle>,
+}
+
+/// Build two `Mesh` nodes on `127.0.0.1:0`, handshake them
+/// (concurrent accept + connect), and start both. Shared by
+/// [`Pair::new`] and [`Pair::new_sharded`] so the ~25-line build +
+/// handshake dance lives in one place. Returns
+/// `(server, caller, server_node_id)`.
+async fn build_handshaken_pair() -> (Mesh, Mesh, u64) {
+    let psk = [0x42u8; 32];
+    let server = MeshBuilder::new("127.0.0.1:0", &psk)
+        .expect("builder")
+        .build()
+        .await
+        .expect("server build");
+    let caller = MeshBuilder::new("127.0.0.1:0", &psk)
+        .expect("builder")
+        .build()
+        .await
+        .expect("caller build");
+
+    let server_addr = server.local_addr().to_string();
+    let server_pub = *server.public_key();
+    let server_id = server.node_id();
+    let caller_id = caller.node_id();
+
+    // Concurrent accept + connect — matches nrpc_echo.rs:81.
+    let (accept_res, connect_res) = tokio::join!(server.accept(caller_id), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        caller.connect(&server_addr, &server_pub, server_id).await
+    });
+    accept_res.expect("accept");
+    connect_res.expect("connect");
+    server.start();
+    caller.start();
+    (server, caller, server_id)
 }
 
 impl Pair {
@@ -89,32 +134,7 @@ impl Pair {
     /// to learn about the JSON service (sentinel — all three
     /// land in the same announce).
     pub async fn new() -> Self {
-        let psk = [0x42u8; 32];
-        let server = MeshBuilder::new("127.0.0.1:0", &psk)
-            .expect("builder")
-            .build()
-            .await
-            .expect("server build");
-        let caller = MeshBuilder::new("127.0.0.1:0", &psk)
-            .expect("builder")
-            .build()
-            .await
-            .expect("caller build");
-
-        let server_addr = server.local_addr().to_string();
-        let server_pub = *server.public_key();
-        let server_id = server.node_id();
-        let caller_id = caller.node_id();
-
-        // Concurrent accept + connect — matches nrpc_echo.rs:81.
-        let (accept_res, connect_res) = tokio::join!(server.accept(caller_id), async {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            caller.connect(&server_addr, &server_pub, server_id).await
-        });
-        accept_res.expect("accept");
-        connect_res.expect("connect");
-        server.start();
-        caller.start();
+        let (server, caller, server_id) = build_handshaken_pair().await;
 
         // Three unary echo services — one per codec.
         let h_json = server
@@ -210,7 +230,66 @@ impl Pair {
             server,
             caller,
             server_node_id: server_id,
+            shard_services: Vec::new(),
             _handles: vec![h_json, h_post, h_raw, h_stream, h_client_stream, h_duplex],
+        }
+    }
+
+    /// Build a handshaken pair serving `shards` independent JSON echo
+    /// services (`{SVC_JSON_SHARD_PREFIX}{0..shards}`), each with its
+    /// own bridge task + fold mutex on the server. Used by
+    /// `nrpc_qps_shard.rs` (Phase 1 of the QPS concurrency-scaling
+    /// plan) to test whether spreading load across channels lifts the
+    /// single-channel throughput ceiling.
+    ///
+    /// `shards == 1` reproduces the single-channel `nrpc_qps` setup
+    /// (every call hits one bridge/mutex) and serves as the in-bench
+    /// baseline. Routing is direct (`call_typed` by node id), so the
+    /// announce below exists only to keep the server's channel
+    /// registration on the same proven path as `new()`; no discovery
+    /// wait is needed for direct calls, but we wait for shard 0 to
+    /// converge as a readiness sentinel.
+    pub async fn new_sharded(shards: usize) -> Self {
+        assert!(shards >= 1, "shards must be >= 1");
+        let (server, caller, server_id) = build_handshaken_pair().await;
+
+        let mut handles = Vec::with_capacity(shards);
+        let mut shard_services = Vec::with_capacity(shards);
+        for i in 0..shards {
+            let svc = format!("{SVC_JSON_SHARD_PREFIX}{i}");
+            let h = server
+                .serve_rpc_typed(&svc, Codec::Json, |req: EchoReq| async move {
+                    Ok::<_, String>(EchoResp { body: req.body })
+                })
+                .expect("serve json shard");
+            handles.push(h);
+            shard_services.push(svc);
+        }
+
+        server
+            .inner()
+            .announce_capabilities(CapabilitySet::new())
+            .await
+            .expect("announce");
+        let sentinel = &shard_services[0];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if !caller.find_service_nodes(sentinel).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !caller.find_service_nodes(sentinel).is_empty(),
+            "shard discovery did not converge within 2s"
+        );
+
+        Self {
+            server,
+            caller,
+            server_node_id: server_id,
+            shard_services,
+            _handles: handles,
         }
     }
 }
@@ -292,15 +371,14 @@ pub async fn call_json_direct(pair: &Pair, req: &EchoReq) -> EchoResp {
 }
 
 /// Same as [`call_json_direct`] but retries on transient transport
-/// backpressure (`RpcError::Transport(...)`). At high concurrency
-/// the per-stream publish budget fills up — mesh_rpc.rs:1158
-/// classifies these as retriable on purpose. The bench yields
-/// after each backpressure hit so other in-flight callers make
+/// backpressure (`RpcError::Transport(...)`). The per-stream publish
+/// budget fills up either at high concurrency (`nrpc_qps` /
+/// `nrpc_tail`) or when a single large unary body chunks past the
+/// budget (`nrpc_payload`) — mesh_rpc.rs:1158 classifies these as
+/// retriable on purpose. The bench yields after each backpressure
+/// hit so the transport flushes and other in-flight callers make
 /// progress; the resulting wall-clock latency reflects real
 /// saturation behavior rather than masking it as a panic.
-///
-/// Used by `nrpc_qps.rs` and `nrpc_tail.rs` which deliberately
-/// drive concurrency above the link's natural budget.
 pub async fn call_json_direct_retrying(pair: &Pair, req: &EchoReq) -> EchoResp {
     use net_sdk::mesh_rpc::RpcError;
     loop {
@@ -319,6 +397,30 @@ pub async fn call_json_direct_retrying(pair: &Pair, req: &EchoReq) -> EchoResp {
                 tokio::task::yield_now().await;
             }
             Err(e) => panic!("call json direct (retrying): {e}"),
+        }
+    }
+}
+
+/// Direct `call_typed` against shard `shard % shards` of a pair
+/// built with [`Pair::new_sharded`]. Retries on transient transport
+/// backpressure exactly like [`call_json_direct_retrying`]. The bench
+/// loop passes the in-flight index as `shard` so calls round-robin
+/// across channels; with `shards == 1` every call lands on the one
+/// channel (the single-channel baseline).
+pub async fn call_json_shard_retrying(pair: &Pair, req: &EchoReq, shard: usize) -> EchoResp {
+    use net_sdk::mesh_rpc::RpcError;
+    let svc = &pair.shard_services[shard % pair.shard_services.len()];
+    loop {
+        match pair
+            .caller
+            .call_typed::<_, EchoResp>(pair.server_node_id, svc, req, CallOptionsTyped::default())
+            .await
+        {
+            Ok(resp) => return resp,
+            Err(RpcError::Transport(_)) => {
+                tokio::task::yield_now().await;
+            }
+            Err(e) => panic!("call json shard (retrying): {e}"),
         }
     }
 }
@@ -350,6 +452,33 @@ pub async fn call_postcard_direct(pair: &Pair, req: &EchoReq) -> EchoResp {
     postcard::from_bytes(&reply.body).expect("postcard decode")
 }
 
+/// Same as [`call_postcard_direct`] but retries on transient
+/// transport backpressure, mirroring [`call_json_direct_retrying`].
+/// Used by `nrpc_payload` where large bodies chunk past the
+/// per-stream publish budget. Re-encoding per attempt is intentional:
+/// a backpressured `call` published nothing the server accepted, so
+/// the retry is a fresh call, not a duplicate.
+pub async fn call_postcard_direct_retrying(pair: &Pair, req: &EchoReq) -> EchoResp {
+    use net_sdk::mesh_rpc::RpcError;
+    let body = postcard::to_allocvec(req).expect("postcard encode");
+    loop {
+        match pair
+            .caller
+            .call(
+                pair.server_node_id,
+                SVC_POSTCARD,
+                Bytes::from(body.clone()),
+                CallOptions::default(),
+            )
+            .await
+        {
+            Ok(reply) => return postcard::from_bytes(&reply.body).expect("postcard decode"),
+            Err(RpcError::Transport(_)) => tokio::task::yield_now().await,
+            Err(e) => panic!("call postcard (retrying): {e}"),
+        }
+    }
+}
+
 /// Direct raw `call` with no codec — body bytes round-trip
 /// verbatim. The theoretical floor: every byte the bench
 /// measures is genuine transport cost.
@@ -361,15 +490,55 @@ pub async fn call_raw_direct(pair: &Pair, body: Bytes) -> Bytes {
         .body
 }
 
+/// Same as [`call_raw_direct`] but retries on transient transport
+/// backpressure, mirroring [`call_json_direct_retrying`]. Used by
+/// `nrpc_payload` where large bodies chunk past the per-stream
+/// publish budget.
+pub async fn call_raw_direct_retrying(pair: &Pair, body: Bytes) -> Bytes {
+    use net_sdk::mesh_rpc::RpcError;
+    loop {
+        match pair
+            .caller
+            .call(
+                pair.server_node_id,
+                SVC_RAW,
+                body.clone(),
+                CallOptions::default(),
+            )
+            .await
+        {
+            Ok(reply) => return reply.body,
+            Err(RpcError::Transport(_)) => tokio::task::yield_now().await,
+            Err(e) => panic!("call raw (retrying): {e}"),
+        }
+    }
+}
+
 // ============================================================================
 // Runtime constructor — multi-threaded tokio runtime used by
 // every bench. 4 workers matches the existing test/example
 // setup (nrpc_echo.rs:60).
+//
+// The worker-thread count is overridable via the
+// `NRPC_BENCH_WORKER_THREADS` env var so the concurrency-scaling
+// sweep (Phase 0a of NRPC_QPS_CONCURRENCY_SCALING_PLAN.md) can run
+// 4 / 8 / 16 workers without a recompile. Both nodes of a `Pair`
+// share this single runtime, so the count caps the cores available
+// to client + server combined. Unset / unparseable → 4 (the
+// baseline every committed bench number was taken at).
 // ============================================================================
+
+pub fn worker_threads() -> usize {
+    std::env::var("NRPC_BENCH_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4)
+}
 
 pub fn runtime() -> Runtime {
     RtBuilder::new_multi_thread()
-        .worker_threads(4)
+        .worker_threads(worker_threads())
         .enable_all()
         .build()
         .expect("tokio runtime")
