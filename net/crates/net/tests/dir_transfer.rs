@@ -582,21 +582,29 @@ async fn fetch_dir_replaces_and_removes_stale_files() {
     let parent = TempDir::new("parent");
     let dest = parent.path().join("dest");
 
-    fetch_dir(&node_b, a_id, &m1, &dest, 0).await.expect("fetch v1");
+    fetch_dir(&node_b, a_id, &m1, &dest, 0)
+        .await
+        .expect("fetch v1");
     assert_eq!(
         read_tree(&dest).keys().cloned().collect::<Vec<_>>(),
         vec!["a.txt".to_string(), "b.txt".to_string()],
         "v1 has both files"
     );
 
-    fetch_dir(&node_b, a_id, &m2, &dest, 0).await.expect("fetch v2");
+    fetch_dir(&node_b, a_id, &m2, &dest, 0)
+        .await
+        .expect("fetch v2");
     let got = read_tree(&dest);
     assert_eq!(
         got.keys().cloned().collect::<Vec<_>>(),
         vec!["a.txt".to_string()],
         "stale b.txt removed by the atomic replace"
     );
-    assert_eq!(got.get("a.txt").map(Vec::as_slice), Some(&b"A2"[..]), "new content");
+    assert_eq!(
+        got.get("a.txt").map(Vec::as_slice),
+        Some(&b"A2"[..]),
+        "new content"
+    );
     assert!(
         temp_orphans(parent.path(), "dest").is_empty(),
         "no temp/backup orphans after a successful replace"
@@ -623,7 +631,9 @@ async fn fetch_dir_failure_preserves_existing_dest() {
     let m_good = store_dir(&adapter_a, src.path()).await.expect("store good");
     let parent = TempDir::new("parent");
     let dest = parent.path().join("dest");
-    fetch_dir(&node_b, a_id, &m_good, &dest, 0).await.expect("seed dest");
+    fetch_dir(&node_b, a_id, &m_good, &dest, 0)
+        .await
+        .expect("seed dest");
     let before = read_tree(&dest);
 
     // A manifest whose entry escapes the destination root → reconstruction
