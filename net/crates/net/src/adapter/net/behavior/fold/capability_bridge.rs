@@ -31,7 +31,7 @@ use super::super::capability::{
     GpuVendor, ScopeFilter,
 };
 use super::capability::{
-    CapabilityFilter, CapabilityFold, CapabilityMembership, CapabilityQuery, HardwareSummary,
+    resolve_candidate_keys, CapabilityFilter, CapabilityFold, CapabilityMembership, HardwareSummary,
 };
 use super::state::FoldError;
 use super::{ApplyOutcome, EnvelopeMeta, Fold, FoldKind, NodeId, NodeState, SignedAnnouncement};
@@ -406,13 +406,25 @@ pub fn translate_announcement(
 /// multiple classes counts once).
 pub fn find_nodes_matching(fold: &Fold<CapabilityFold>, legacy: &LegacyFilter) -> Vec<NodeId> {
     let fold_filter = translate_filter(legacy);
-    let matches = fold.query(CapabilityQuery::Composite(fold_filter));
-    let mut node_set: HashSet<NodeId> = HashSet::new();
-    for ((_class, node_id), membership) in matches {
-        if membership_passes_post_filter(&membership, legacy) {
-            node_set.insert(node_id);
+    // Resolve the indexed-axis candidate keys and run the
+    // non-indexed post-filter against *borrowed* payloads, all
+    // under one read-lock acquisition. The bulk path only needs
+    // node ids out, so we never clone a `CapabilityMembership` —
+    // unlike the `Vec<CapabilityMatch>` query path, which clones
+    // every match before the caller can discard it.
+    let node_set: HashSet<NodeId> = fold.with_state_and_index(|state, index| {
+        let candidates = resolve_candidate_keys(state, index, &fold_filter);
+        let mut set: HashSet<NodeId> = HashSet::new();
+        for key in candidates {
+            let Some(entry) = state.entries.get(&key) else {
+                continue;
+            };
+            if membership_passes_post_filter(&entry.payload, legacy) {
+                set.insert(key.1);
+            }
         }
-    }
+        set
+    });
     // Sort so callers (e.g. the scheduler's `FirstMatch` placement)
     // see a deterministic order across processes; HashSet iteration
     // is randomized.
@@ -555,19 +567,29 @@ pub fn find_nodes_matching_scoped(
     same_subnet_lookup: impl Fn(NodeId) -> bool,
 ) -> Vec<NodeId> {
     let fold_filter = translate_filter(legacy);
-    let matches = fold.query(CapabilityQuery::Composite(fold_filter));
-    let mut node_set: HashSet<NodeId> = HashSet::new();
-    for ((_class, node_id), membership) in matches {
-        if !membership_passes_post_filter(&membership, legacy) {
-            continue;
+    // Borrow-and-filter, same as `find_nodes_matching`: resolve
+    // candidate keys via the index, then run the post-filter and
+    // scope gate against borrowed payloads without cloning.
+    let node_set: HashSet<NodeId> = fold.with_state_and_index(|state, index| {
+        let candidates = resolve_candidate_keys(state, index, &fold_filter);
+        let mut set: HashSet<NodeId> = HashSet::new();
+        for key in candidates {
+            let Some(entry) = state.entries.get(&key) else {
+                continue;
+            };
+            let membership = &entry.payload;
+            if !membership_passes_post_filter(membership, legacy) {
+                continue;
+            }
+            let candidate_scope = scope_from_membership_tags(&membership.tags);
+            let same_subnet = same_subnet_lookup(key.1);
+            if !matches_scope(&candidate_scope, scope, same_subnet) {
+                continue;
+            }
+            set.insert(key.1);
         }
-        let candidate_scope = scope_from_membership_tags(&membership.tags);
-        let same_subnet = same_subnet_lookup(node_id);
-        if !matches_scope(&candidate_scope, scope, same_subnet) {
-            continue;
-        }
-        node_set.insert(node_id);
-    }
+        set
+    });
     let mut out: Vec<NodeId> = node_set.into_iter().collect();
     out.sort_unstable();
     out

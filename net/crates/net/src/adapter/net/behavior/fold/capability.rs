@@ -357,14 +357,23 @@ fn resolve_keys_all_tags(index: &CapabilityIndexInner, tags: &[String]) -> HashS
     candidates
 }
 
-/// Evaluate a [`CapabilityQuery::Composite`] filter — chooses
-/// the most-selective indexed dimension as the seed candidate
-/// set, then filters the rest in memory.
-fn composite_query(
+/// Resolve the set of `(class, node)` keys a
+/// [`CapabilityFilter`] selects on its *indexed* axes — tags,
+/// state, region, class. Chooses the most-selective indexed
+/// dimension as the seed, then tightens with the rest in memory.
+///
+/// Does NOT clone any payload, and does NOT apply `filter.limit`
+/// or non-indexed predicates (hardware / model / tool). Callers
+/// that only need keys — or that post-filter against borrowed
+/// payloads — use this directly via
+/// [`Fold::with_state_and_index`]; [`composite_query`] layers the
+/// payload materialization + limit on top for the
+/// `Vec<CapabilityMatch>` query path.
+pub(crate) fn resolve_candidate_keys(
     state: &FoldState<CapabilityFold>,
     index: &CapabilityIndexInner,
     filter: &CapabilityFilter,
-) -> Vec<CapabilityMatch> {
+) -> HashSet<(u64, NodeId)> {
     // Seed candidate set: prefer tags_all (typically most
     // selective), then state, then region, then class scan as
     // fallback.
@@ -429,6 +438,19 @@ fn composite_query(
         candidates.retain(|k| strict_set.contains(k));
     }
 
+    candidates
+}
+
+/// Evaluate a [`CapabilityQuery::Composite`] filter — resolves
+/// the indexed-axis candidate set via [`resolve_candidate_keys`],
+/// then materializes each match (cloning the payload) and applies
+/// `filter.limit`.
+fn composite_query(
+    state: &FoldState<CapabilityFold>,
+    index: &CapabilityIndexInner,
+    filter: &CapabilityFilter,
+) -> Vec<CapabilityMatch> {
+    let candidates = resolve_candidate_keys(state, index, filter);
     // Materialize matches + apply limit.
     let mut matches: Vec<CapabilityMatch> = candidates
         .into_iter()
