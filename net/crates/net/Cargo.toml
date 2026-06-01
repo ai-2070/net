@@ -460,6 +460,15 @@ opt-level = 3
 [profile.bench]
 lto = true
 codegen-units = 1
+# The `bench` profile inherits its defaults from `release`, which sets
+# `panic = "abort"`. A libtest/Criterion harness must unwind, so the
+# bench binary is forced to `unwind` while the inherited `abort` still
+# governs the lib deps (`net`, `thiserror`, `bytes`, …) — producing
+# "requires panic strategy `abort` … incompatible with `unwind`" link
+# errors under `cargo bench` (and `cargo test --release`). Pin the whole
+# bench build graph back to `unwind`; the real release binaries keep
+# `abort` via `[profile.release]`.
+panic = "unwind"
 
 # Fast compile times for development
 [profile.dev]
