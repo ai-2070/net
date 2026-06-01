@@ -1,0 +1,25 @@
+net/crates/net/sdk/benches/nrpc_payload.rs
+  s_b1f4a7ee26790a::t_a645cde5edc005 67
+  s_b1f4a7ee26790a::t_58fc27761d3089 36-37
+  s_b1f4a7ee26790a::t_901e75244c6e8d 77
+  s_b1f4a7ee26790a::t_857c2fb68678a5 85
+net/crates/net/sdk/benches/nrpc_common/mod.rs
+  s_b1f4a7ee26790a::t_d7a3b9aded472c 352-378,390-411
+  s_b1f4a7ee26790a::t_550c7aa1335502 295-300
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "a262bbccc22334676bd9e9b3c88c825fda901044",
+  "prompts": {},
+  "sessions": {
+    "s_b1f4a7ee26790a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cbe27940-6bcc-4bff-92d8-2ff784d8b082",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
