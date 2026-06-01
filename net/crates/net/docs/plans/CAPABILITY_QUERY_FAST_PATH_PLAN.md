@@ -9,6 +9,8 @@ every existing correctness test stays green. Touches
 `src/adapter/net/behavior/fold/capability.rs`,
 `src/adapter/net/behavior/fold/capability_bridge.rs`, and `mod.rs`.
 
+All benchmarks were measured on an M1 Max.
+
 Result over a 10k-node fold (before → after, all three layers plus the
 follow-up index/post-filter tightening):
 
