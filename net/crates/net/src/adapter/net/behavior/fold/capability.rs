@@ -198,6 +198,16 @@ pub type CapabilityMatch = ((u64, NodeId), CapabilityMembership);
 pub struct CapabilityIndexInner {
     /// tag → set of (class, node) keys carrying that tag.
     by_tag: HashMap<String, HashSet<(u64, NodeId)>>,
+    /// Index-only synthetic tag (`model:`/`tool:`/`gpu:`) → set of
+    /// (class, node) keys. Kept in a SEPARATE map from `by_tag` so a
+    /// raw published tag string can never collide with a synthetic
+    /// key: published tags are arbitrary strings (`Tag::Legacy`
+    /// round-trips verbatim), so a publisher emitting a plain
+    /// `"model:llama3"` tag must not be able to satisfy a
+    /// `require_models` query it lacks the real bundle for. The bulk
+    /// model/tool/gpu axes (`tag_groups_all`) resolve against this
+    /// map only — see [`group_union`].
+    by_synthetic: HashMap<String, HashSet<(u64, NodeId)>>,
     /// region → set of (class, node) keys.
     by_region: HashMap<String, HashSet<(u64, NodeId)>>,
     /// state → set of (class, node) keys.
@@ -209,12 +219,14 @@ impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
         for tag in &payload.tags {
             self.by_tag.entry(tag.clone()).or_default().insert(*key);
         }
-        // Index-only synthetic tags (model:/tool:/gpu:) so the
-        // model / tool / gpu filter axes resolve through the same
-        // tag bucket as plain tags instead of a per-query full scan.
-        // Parsed once here at insert, never per query.
+        // Index-only synthetic tags (model:/tool:/gpu:) live in
+        // their own `by_synthetic` map so the model / tool / gpu
+        // filter axes resolve without a per-query full scan and
+        // without risking collision against a raw published tag of
+        // the same string. Parsed once here at insert, never per
+        // query.
         for tag in derive_synthetic_index_tags(payload) {
-            self.by_tag.entry(tag).or_default().insert(*key);
+            self.by_synthetic.entry(tag).or_default().insert(*key);
         }
         if let Some(region) = &payload.region {
             self.by_region
@@ -237,10 +249,10 @@ impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
         // Mirror the synthetic tags added in `on_insert`. Derived
         // from the same payload, so the set is identical.
         for tag in derive_synthetic_index_tags(payload) {
-            if let Some(set) = self.by_tag.get_mut(&tag) {
+            if let Some(set) = self.by_synthetic.get_mut(&tag) {
                 set.remove(key);
                 if set.is_empty() {
-                    self.by_tag.remove(&tag);
+                    self.by_synthetic.remove(&tag);
                 }
             }
         }
@@ -262,6 +274,7 @@ impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
 
     fn clear(&mut self) {
         self.by_tag.clear();
+        self.by_synthetic.clear();
         self.by_region.clear();
         self.by_state.clear();
     }
@@ -454,53 +467,57 @@ pub(crate) fn resolve_candidate_keys(
     index: &CapabilityIndexInner,
     filter: &CapabilityFilter,
 ) -> HashSet<(u64, NodeId)> {
-    // Materialize each group's union exactly once (OR within a
-    // group). The most-selective one may serve as the seed; the
-    // rest tighten the candidate set further down. Computing them
-    // up front avoids rebuilding the seed group's union a second
-    // time in the retain pass.
-    let mut group_unions: Vec<HashSet<(u64, NodeId)>> = filter
-        .tag_groups_all
-        .iter()
-        .filter(|g| !g.is_empty())
-        .map(|g| group_union(index, g))
-        .collect();
+    // Each group's union (OR within a group) is needed both to seed
+    // (when no `tags_all` is present) and to tighten further down.
+    // `group_unions` holds the ones that still need to be applied as
+    // retain filters; the seed branch may consume one of them.
+    let mut group_unions: Vec<HashSet<(u64, NodeId)>> = Vec::new();
 
     // Seed candidate set: prefer tags_all (typically most
     // selective), then the most-selective tag group, then state,
     // then region, then class scan as fallback.
     let mut candidates: HashSet<(u64, NodeId)> = if !filter.tags_all.is_empty() {
-        resolve_keys_all_tags(index, &filter.tags_all)
-    } else if !group_unions.is_empty() {
-        // Seed from the smallest group union, removing it so the
-        // retain pass below doesn't re-scan it.
-        // Non-empty (checked above), so min_by_key yields Some; the
-        // `unwrap_or(0)` is just a panic-free fallback.
-        let smallest = group_unions
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, u)| u.len())
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        group_unions.swap_remove(smallest)
-    } else if let Some(state_filter) = filter.state {
-        index
-            .by_state
-            .get(&state_filter)
-            .cloned()
-            .unwrap_or_default()
-    } else if let Some(region) = &filter.region {
-        index.by_region.get(region).cloned().unwrap_or_default()
-    } else if let Some(class) = filter.class {
-        state
-            .entries
-            .keys()
-            .filter(|(c, _)| *c == class)
-            .copied()
-            .collect()
+        let seed = resolve_keys_all_tags(index, &filter.tags_all);
+        // Only materialize the group unions if the seed left
+        // something to filter — when `tags_all` selects nothing the
+        // result is already empty, so building them is wasted work.
+        if !seed.is_empty() {
+            group_unions = build_group_unions(index, &filter.tag_groups_all);
+        }
+        seed
     } else {
-        // No selective predicate → every key.
-        state.entries.keys().copied().collect()
+        group_unions = build_group_unions(index, &filter.tag_groups_all);
+        if !group_unions.is_empty() {
+            // Seed from the smallest group union, removing it so the
+            // retain pass below doesn't re-scan it.
+            // Non-empty (checked above), so min_by_key yields Some;
+            // the `unwrap_or(0)` is just a panic-free fallback.
+            let smallest = group_unions
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, u)| u.len())
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            group_unions.swap_remove(smallest)
+        } else if let Some(state_filter) = filter.state {
+            index
+                .by_state
+                .get(&state_filter)
+                .cloned()
+                .unwrap_or_default()
+        } else if let Some(region) = &filter.region {
+            index.by_region.get(region).cloned().unwrap_or_default()
+        } else if let Some(class) = filter.class {
+            state
+                .entries
+                .keys()
+                .filter(|(c, _)| *c == class)
+                .copied()
+                .collect()
+        } else {
+            // No selective predicate → every key.
+            state.entries.keys().copied().collect()
+        }
     };
 
     // Tighten with remaining predicates.
@@ -551,12 +568,34 @@ pub(crate) fn resolve_candidate_keys(
     candidates
 }
 
+/// Materialize the union for each non-empty group in
+/// `tag_groups_all` (OR within a group). Empty groups carry no
+/// constraint, so they're skipped rather than producing an empty
+/// union that would wrongly clear every candidate.
+fn build_group_unions(
+    index: &CapabilityIndexInner,
+    groups: &[Vec<String>],
+) -> Vec<HashSet<(u64, NodeId)>> {
+    groups
+        .iter()
+        .filter(|g| !g.is_empty())
+        .map(|g| group_union(index, g))
+        .collect()
+}
+
 /// Union of the `(class, node)` keys carrying at least one tag in
 /// `group` — the OR-within-a-group half of `tag_groups_all`.
+///
+/// Resolves against `by_synthetic`, NOT `by_tag`: every
+/// `tag_groups_all` entry is an index-only synthetic key
+/// (`model:`/`tool:`/`gpu:`) manufactured by
+/// `derive_synthetic_index_tags`. Reading the synthetic map keeps a
+/// raw published tag of the same string from satisfying a model /
+/// tool / gpu axis it has no real bundle / hardware for.
 fn group_union(index: &CapabilityIndexInner, group: &[String]) -> HashSet<(u64, NodeId)> {
     let mut union: HashSet<(u64, NodeId)> = HashSet::new();
     for tag in group {
-        if let Some(bucket) = index.by_tag.get(tag) {
+        if let Some(bucket) = index.by_synthetic.get(tag) {
             union.extend(bucket.iter().copied());
         }
     }

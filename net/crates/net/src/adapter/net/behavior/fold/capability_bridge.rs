@@ -63,8 +63,10 @@ pub fn translate_filter(legacy: &LegacyFilter) -> CapabilityFilter {
     // are manufactured at insert by `derive_synthetic_index_tags`
     // from the canonical `software.model.<i>.id=` /
     // `software.tool.<i>.tool_id=` bundles and the hardware
-    // projection — a publisher never emits them on the wire, so a
-    // synthetic group key can't be matched by raw published tags.
+    // projection, and `tag_groups_all` resolves against the
+    // index's separate `by_synthetic` map — so a raw published tag
+    // whose string happens to equal a synthetic key (e.g. a
+    // `Tag::Legacy("model:llama3")`) can never satisfy these axes.
     let mut tag_groups_all: Vec<Vec<String>> = Vec::new();
     if !legacy.require_models.is_empty() {
         tag_groups_all.push(
@@ -921,6 +923,25 @@ mod tests {
         // BB: cpu-only, no hardware, no bundles.
         fold.apply(sign_member(&kp, 0xBB, 0x100, vec!["cpu-only"], None))
             .expect("apply BB");
+        // CC: a spoofer. Emits raw tags whose strings collide with
+        // the index-only synthetic namespace, but carries no real
+        // model/tool bundle and no hardware. Both paths must agree
+        // it matches none of the model/tool/gpu axes — the synthetic
+        // index is fed only by `derive_synthetic_index_tags`, never
+        // by raw published tag strings.
+        fold.apply(sign_member(
+            &kp,
+            0xCC,
+            0x100,
+            vec![
+                "model:llama3",
+                "tool:ffmpeg",
+                "gpu:present",
+                "gpu:vendor:nvidia",
+            ],
+            None,
+        ))
+        .expect("apply CC");
 
         let probe = |legacy: &LegacyFilter, candidates: &[NodeId]| {
             let bulk: HashSet<NodeId> = find_nodes_matching(&fold, legacy).into_iter().collect();
@@ -946,31 +967,33 @@ mod tests {
         // The index-resolved axes must agree between paths too:
         // a present model, a missing model, a present tool, GPU
         // presence, and a matching/mismatching vendor.
+        // 0xCC is probed on every index-resolved axis: its raw
+        // colliding tags must NOT satisfy any of them on either path.
         let model_hit = LegacyFilter {
             require_models: vec!["llama3".into()],
             ..LegacyFilter::default()
         };
-        probe(&model_hit, &[0xAA, 0xBB]);
+        probe(&model_hit, &[0xAA, 0xBB, 0xCC]);
         let model_miss = LegacyFilter {
             require_models: vec!["does-not-exist".into()],
             ..LegacyFilter::default()
         };
-        probe(&model_miss, &[0xAA, 0xBB]);
+        probe(&model_miss, &[0xAA, 0xBB, 0xCC]);
         let tool_hit = LegacyFilter {
             require_tools: vec!["ffmpeg".into()],
             ..LegacyFilter::default()
         };
-        probe(&tool_hit, &[0xAA, 0xBB]);
+        probe(&tool_hit, &[0xAA, 0xBB, 0xCC]);
         let gpu = LegacyFilter {
             require_gpu: true,
             ..LegacyFilter::default()
         };
-        probe(&gpu, &[0xAA, 0xBB]);
+        probe(&gpu, &[0xAA, 0xBB, 0xCC]);
         let vendor_hit = LegacyFilter {
             gpu_vendor: Some(GpuVendor::Nvidia),
             ..LegacyFilter::default()
         };
-        probe(&vendor_hit, &[0xAA, 0xBB]);
+        probe(&vendor_hit, &[0xAA, 0xBB, 0xCC]);
         let vendor_miss = LegacyFilter {
             gpu_vendor: Some(GpuVendor::Amd),
             ..LegacyFilter::default()
@@ -984,6 +1007,115 @@ mod tests {
             0xDEAD,
             &LegacyFilter::default()
         ));
+    }
+
+    #[test]
+    fn raw_tags_cannot_spoof_the_synthetic_model_tool_gpu_namespace() {
+        // The model / tool / gpu axes resolve through the index-only
+        // synthetic tag map, which is fed solely by
+        // `derive_synthetic_index_tags`. A publisher must not be able
+        // to satisfy those axes by emitting a raw tag string that
+        // happens to equal a synthetic key — published tags are
+        // arbitrary (`Tag::Legacy` round-trips verbatim), so this
+        // would otherwise be a free capability spoof on the bulk
+        // path while the single-target path (which scans the real
+        // bundle / hardware) disagreed.
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let nvidia_hw = HardwareSummary {
+            gpu_vendor: Some("nvidia".into()),
+            gpu_count: 1,
+            memory_gb: Some(64),
+            vram_gb: Some(24),
+        };
+        // Honest node: real model/tool bundle + nvidia hardware.
+        fold.apply(sign_member(
+            &kp,
+            0xAA,
+            0x100,
+            vec![
+                "software.model.0.id=llama3",
+                "software.tool.0.tool_id=ffmpeg",
+            ],
+            Some(nvidia_hw),
+        ))
+        .expect("apply AA");
+        // Spoofer: raw tags string-equal to the synthetic keys, but
+        // no bundle and no hardware.
+        fold.apply(sign_member(
+            &kp,
+            0xBB,
+            0x100,
+            vec![
+                "model:llama3",
+                "tool:ffmpeg",
+                "gpu:present",
+                "gpu:vendor:nvidia",
+            ],
+            None,
+        ))
+        .expect("apply BB");
+
+        // Only the honest node resolves on each axis — the spoofer is
+        // invisible to the synthetic index.
+        let model = find_nodes_matching(
+            &fold,
+            &LegacyFilter {
+                require_models: vec!["llama3".into()],
+                ..LegacyFilter::default()
+            },
+        );
+        assert_eq!(model, vec![0xAA]);
+        let tool = find_nodes_matching(
+            &fold,
+            &LegacyFilter {
+                require_tools: vec!["ffmpeg".into()],
+                ..LegacyFilter::default()
+            },
+        );
+        assert_eq!(tool, vec![0xAA]);
+        let gpu = find_nodes_matching(
+            &fold,
+            &LegacyFilter {
+                require_gpu: true,
+                ..LegacyFilter::default()
+            },
+        );
+        assert_eq!(gpu, vec![0xAA]);
+        let vendor = find_nodes_matching(
+            &fold,
+            &LegacyFilter {
+                gpu_vendor: Some(GpuVendor::Nvidia),
+                ..LegacyFilter::default()
+            },
+        );
+        assert_eq!(vendor, vec![0xAA]);
+
+        // And the bulk verdict for the spoofer matches the
+        // single-target path on every axis (both: no match).
+        for legacy in [
+            LegacyFilter {
+                require_models: vec!["llama3".into()],
+                ..LegacyFilter::default()
+            },
+            LegacyFilter {
+                require_tools: vec!["ffmpeg".into()],
+                ..LegacyFilter::default()
+            },
+            LegacyFilter {
+                require_gpu: true,
+                ..LegacyFilter::default()
+            },
+            LegacyFilter {
+                gpu_vendor: Some(GpuVendor::Nvidia),
+                ..LegacyFilter::default()
+            },
+        ] {
+            assert!(
+                !target_matches_filter(&fold, 0xBB, &legacy),
+                "spoofer unexpectedly matched single-target path for {legacy:?}"
+            );
+        }
     }
 
     #[test]
