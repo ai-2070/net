@@ -21,7 +21,7 @@
 //!     -p net-mesh-sdk
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use net_sdk::mesh_rpc::CallOptionsTyped;
+use net_sdk::mesh_rpc::{CallOptionsTyped, RpcError};
 
 #[path = "nrpc_common/mod.rs"]
 mod nrpc_common;
@@ -59,7 +59,26 @@ fn bench_client_streaming(c: &mut Criterion) {
                         .await
                         .expect("open client stream");
                     for _ in 0..count {
-                        call.send(req).await.expect("typed send");
+                        // Streaming `count` frames back-to-back can
+                        // fill the per-stream publish window faster
+                        // than the server drains the upload. mesh_rpc
+                        // surfaces that as a retriable
+                        // `RpcError::Transport(_)` (see
+                        // `call_json_direct_retrying`); yield and
+                        // resend the same frame rather than panicking.
+                        // The frame isn't published on a backpressure
+                        // error, so the resend is not a duplicate, and
+                        // the server's consumption + transport acks
+                        // reopen the window so the retry progresses.
+                        loop {
+                            match call.send(req).await {
+                                Ok(()) => break,
+                                Err(RpcError::Transport(_)) => {
+                                    tokio::task::yield_now().await;
+                                }
+                                Err(e) => panic!("typed send: {e}"),
+                            }
+                        }
                     }
                     let resp = call.finish().await.expect("typed finish");
                     std::hint::black_box(resp);
