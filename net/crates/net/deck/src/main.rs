@@ -32,6 +32,16 @@ mod widgets;
 
 use app::App;
 
+// The deck is a long-running operator TUI that re-renders and folds
+// live cluster telemetry, allocating small buffers continuously.
+// mimalloc avoids macOS libmalloc's nano-zone (<=256B) size-class
+// cliff (~-69% on the 256B path) and is 2-3x faster on small
+// allocations. Library crates stay allocator-neutral; the choice
+// belongs to the binary. See
+// docs/performance/net-simd-crypto-and-allocator-followups.md.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;

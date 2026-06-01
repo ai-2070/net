@@ -38,6 +38,15 @@ use clap::{Parser, Subcommand};
 use crate::error::CliError;
 use crate::output::OutputFormat;
 
+// mimalloc avoids macOS libmalloc's nano-zone (<=256B) size-class
+// cliff (~-69% on the 256B per-packet/per-event path) and is 2-3x
+// faster on small allocations. Most subcommands are short-lived, but
+// `daemon-run` hosts long-running mesh services where this matters.
+// Library crates stay allocator-neutral; the choice belongs to the
+// binary. See docs/performance/net-simd-crypto-and-allocator-followups.md.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Global argv shape — applies to every subcommand.
 #[derive(Parser, Debug)]
 #[command(

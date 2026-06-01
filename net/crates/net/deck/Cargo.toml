@@ -15,6 +15,9 @@ path = "src/main.rs"
 ratatui = "0.30"
 crossterm = "0.29"
 color-eyre = "0.6"
+# Global allocator — see the #[global_allocator] in src/main.rs and
+# docs/performance/net-simd-crypto-and-allocator-followups.md.
+mimalloc = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
 net-mesh-sdk = { version = "0.27.0", path = "../sdk", features = ["meshos", "deck", "dataforts"] }
 bytes = "1"
