@@ -12,16 +12,16 @@ every existing correctness test stays green. Touches
 Result over a 10k-node fold (before → after, all three layers plus the
 follow-up index/post-filter tightening):
 
-| query | before | after | factor |
+| query | original | now | factor |
 |---|---|---|---|
-| `query_single_tag` | ~14 ms | ~0.18 ms | ~77× |
-| `query_complex` | ~14 ms | ~0.36 ms | ~39× |
-| `query_require_gpu` | ~29 ms | ~0.37 ms | ~79× |
-| `query_gpu_vendor` | ~29.5 ms | ~0.61 ms | ~48× |
-| `query_min_memory` | ~29.7 ms | ~0.49 ms | ~61× |
-| `query_model` | ~108 ms | ~0.088 ms | ~1230× |
-| `query_tool` | ~108 ms | ~0.37 ms | ~290× |
-| `query_no_results` | ~155 ns | ~71 ns | ~2.2× |
+| `query_single_tag` | 14.2 ms | 184 µs | ~77× |
+| `query_complex` | 14.2 ms | 364 µs | ~39× |
+| `query_require_gpu` | 29.1 ms | 366 µs | ~79× |
+| `query_gpu_vendor` | 29.5 ms | 614 µs | ~48× |
+| `query_min_memory` | 29.7 ms | 486 µs | ~61× |
+| `query_model` | 108 ms | **88 µs** | **~1230×** |
+| `query_tool` | 109 ms | 374 µs | ~290× |
+| `query_no_results` | 155 ns | 71 ns | ~2.2× |
 
 Layer 3 (the plan's confidence step) is satisfied without new work: the existing `query_model` /
 `query_tool` benches *are* the indexed-path regression guards, and Layer 1 added the
