@@ -1,0 +1,36 @@
+net/crates/net/src/adapter/net/behavior/fold/capability.rs
+  s_85537f308db692::t_6c2376885c058d 457-468,474-476,479-483,485
+  s_85537f308db692::t_e40cd57e2df486 541-546,558-569
+  s_85537f308db692::t_c99bd7400f1391 169-177
+  s_85537f308db692::t_216243fcae44d8 212-218,237-243
+  s_85537f308db692::t_2f1bf3804f088d 270-323
+  s_85537f308db692::t_31f4fb050302b7 537-540
+  s_85537f308db692::t_f82faae8bf8d8e 470-471
+  s_85537f308db692::t_ff9ed7925b6df6 477-478,484
+net/crates/net/src/adapter/net/behavior/fold/capability_bridge.rs
+  s_85537f308db692::t_fa6845ba4e8126 898-918,930,943-975
+  s_85537f308db692::t_b2ada3ad442b4d 642-644
+  s_85537f308db692::t_ae57ef80604e17 41-47,49-59
+  s_85537f308db692::t_632e7492e3608e 758
+  s_85537f308db692::t_5969e8d4666193 735-757,759-787
+  s_85537f308db692::t_474a31c4d04d2a 106-113,137-165
+  s_85537f308db692::t_a5285c4be4fe0c 61-94,99
+  s_85537f308db692::t_f966b3fc867b4e 706,709,711-712,716,718-731
+  s_85537f308db692::t_71d269dae031bd 481-483
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "654d97b15cf4927951603f7bb47b43fe98d9269a",
+  "prompts": {},
+  "sessions": {
+    "s_85537f308db692": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4b369ef9-b577-4f98-a088-b97e6cf98967",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
