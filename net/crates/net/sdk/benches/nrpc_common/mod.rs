@@ -413,12 +413,7 @@ pub async fn call_json_shard_retrying(pair: &Pair, req: &EchoReq, shard: usize) 
     loop {
         match pair
             .caller
-            .call_typed::<_, EchoResp>(
-                pair.server_node_id,
-                svc,
-                req,
-                CallOptionsTyped::default(),
-            )
+            .call_typed::<_, EchoResp>(pair.server_node_id, svc, req, CallOptionsTyped::default())
             .await
         {
             Ok(resp) => return resp,
