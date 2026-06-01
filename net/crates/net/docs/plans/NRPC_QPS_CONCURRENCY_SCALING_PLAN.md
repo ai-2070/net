@@ -89,7 +89,7 @@ profiles the **c16/c128 ceiling** specifically.
 |---|---|---|
 | 0 — Diagnose: which stage is the wall | ✅ Done | **Verdict: shared single recv loop + inline decrypt.** Worker sweep flat; sharding doesn't help. See Findings below. |
 | 1 — Multi-channel shard bench variant | ✅ Done | `nrpc_qps_shard` landed (`benches/nrpc_qps_shard.rs`); sharding *lowers* throughput → rules out per-channel bridge/mutex |
-| 2 — Fix the bottleneck Phase 0 names | ◐ Re-scoped, not implemented | Recv stage is **syscall/wake-bound, not decrypt-bound** (flamegraph). Levers: #1 T1.1 coalesce unary grants, #2 T1.2 direct response, #3 T2.3/T3.4. Decrypt-off-loop **withdrawn (~5%)**; T2.1 disproven |
+| 2 — Fix the bottleneck Phase 0 names | ◐ Scoped to HEAD; awaiting sign-off on T1.1 | T1.2 **already done**; T2.3/T3.4 won't move a syscall-bound ceiling. Only **T1.1 (skip unary StreamWindow grants)** hits the recv loop — but it changes credit accounting, so design is up for review before editing. Decrypt-off-loop withdrawn; T2.1 disproven |
 | 3 — Re-bench + document the curve | ☐ Not started | Capture before/after once Phase 2 lands; update this table |
 
 ---
@@ -237,6 +237,53 @@ The binding stage is the single shared recv loop (Phase 0). But the scoping read
 above shows that stage is **syscall/wake-bound, not decrypt-bound** — so the fix is
 to cut **syscalls and wakeups per round trip**, *not* to move decrypt. Levers
 below, ranked by value/risk after the course-correction.
+
+### Implementation scoping — current code state (2026-06-01)
+
+The codebase advanced past the flamegraph audit; re-checking each lever against
+HEAD before writing any code:
+
+- **#2 T1.2 — already implemented.** `publish_response_to_caller`
+  (`mesh_rpc.rs:1561`) resolves `caller_origin` → node (bridge cache `target_hint`,
+  else `get_node_by_origin_hash`) and ships the response via `publish_to_peer`,
+  falling back to roster `publish` only when origin is unknown. All four response
+  emitters (`mesh_rpc.rs:1794/2034/2152/2388`) route through it. **No work left.**
+- **#3 T3.4** (gate `catch_unwind`, `cortex/rpc.rs:1613`) is isolated but
+  ~100–300 ns/call — invisible against a syscall-bound ceiling. **T2.3** (inline
+  ready handler) is *not* cheap: it entangles the `in_flight` registration,
+  cancel-wins ordering, panic scope, and metrics (`cortex/rpc.rs:1562-1625`), and it
+  would run handler bodies on the single bridge task — risking *serialization* of
+  the very work the spawn exists to parallelize. Neither moves the c16 ceiling.
+- **#1 T1.1 — the only lever that touches the bottleneck, and it is real
+  flow-control work.** The StreamWindow grant path runs **inline on the recv loop**
+  (`mesh.rs:4652-4725`): every accepted packet → `on_bytes_consumed` → peer resolve
+  → `pending_stream_grants.lock()` → `notify_one`, and later a grant packet on the
+  wire (recv-loop work on *both* ends). For unary (one packet each way) this is pure
+  overhead. But `on_bytes_consumed` (`session.rs:1077-1106`) **refills credit 1:1 on
+  every packet by design** (bumps `granted` and `consumed` together to hold
+  `outstanding` at `window_bytes`). Skipping grants on unary therefore means
+  changing the credit-accounting cadence — safety-relevant (credit is kernel-buffer
+  DoS protection) and capable of stalling *streaming* if mis-tuned. **Needs a
+  designed threshold + `nrpc_streaming.rs` as the gate; not a casual edit.**
+
+**Status:** stopping here for sign-off on the T1.1 approach before modifying
+flow-control accounting. Proposed design below.
+
+#### Proposed T1.1 design (for review)
+
+- Add a per-`RxCreditState` "consumed-since-last-grant" accumulator. Emit a grant
+  only when it crosses a fraction of `window_bytes` (start conservative, e.g.
+  **½ window**); otherwise bump bookkeeping and return `None` (no grant enqueued).
+- Wire-safe because grants are **authoritative + self-healing** (each carries full
+  `total_consumed`; `session.rs:1069-1076`): skipping intermediate grants is
+  already tolerated, a later grant reconciles. The sender only stalls if its credit
+  reaches 0 before a grant arrives — so the threshold must be **strictly below** the
+  window so a grant is always in flight before the sender drains.
+- Unary (consumes ≪ window in one packet) emits **zero** grants → removes the
+  per-request lock + notify + grant packet from both recv loops.
+- **Gate:** `nrpc_streaming.rs` (no stall / no throughput regression) +
+  `nrpc_qps c16/32B` (ceiling should rise) + existing session/stream credit tests.
+- **Rollback:** single accumulator + one comparison; revert is trivial.
 
 > **Superseded:** the verdict's first instinct ("move decrypt off the recv loop")
 > is now a **non-lever (~5 %)** and removed from the critical path. See "Rejected"
