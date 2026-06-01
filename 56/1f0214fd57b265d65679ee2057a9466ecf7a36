@@ -1,0 +1,19 @@
+net/crates/net/benches/mesh.rs
+  s_0eac3caeab1808::t_bdcd0416ae9e33 107-116,125
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "561f0214fd57b265d65679ee2057a9466ecf7a36",
+  "prompts": {},
+  "sessions": {
+    "s_0eac3caeab1808": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3197676b-6f3c-4090-a256-b355b7bc4413",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
