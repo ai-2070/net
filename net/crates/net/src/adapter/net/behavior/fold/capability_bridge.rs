@@ -38,55 +38,82 @@ use super::{ApplyOutcome, EnvelopeMeta, Fold, FoldKind, NodeId, NodeState, Signe
 
 /// Translate the legacy
 /// [`behavior::capability::CapabilityFilter`](super::super::capability::CapabilityFilter)
-/// into the fold's composite filter shape. Encodes models /
-/// tools as canonical `"model:<name>"` / `"tool:<name>"` tags so
-/// the fold's tag-based secondary index can resolve them via
-/// the same intersection that handles plain tag predicates.
+/// into the fold's composite filter shape. The `require_models`,
+/// `require_tools`, `require_gpu`, and `gpu_vendor` axes become
+/// `tag_groups_all` entries built from the index-only synthetic
+/// tags (`model:<id>`, `tool:<id>`, `gpu:present`,
+/// `gpu:vendor:<v>`) the fold derives at insert, so the fold's
+/// secondary index resolves them with no per-candidate parse —
+/// each axis is one group (OR within the axis, AND across axes).
 ///
-/// Range predicates (`min_memory_gb`, `min_vram_gb`,
-/// `require_gpu`, `gpu_vendor`) and free-form fields
-/// (`require_modalities`, `min_context_length`) are NOT carried
-/// here — callers run them through [`membership_passes_post_filter`]
-/// against each candidate the fold returns. The
-/// `require_modalities` and `min_context_length` axes are
-/// silently dropped on the fold path because the fold's
-/// [`CapabilityMembership`] payload doesn't carry the model
-/// metadata needed to evaluate them; callers that need them
-/// keep the legacy index until the fold's payload is extended.
+/// The true range predicates (`min_memory_gb`, `min_vram_gb`) and
+/// free-form fields (`require_modalities`, `min_context_length`)
+/// are NOT carried here — the *bulk* path runs the ranges through
+/// [`membership_passes_range_filter`] against each borrowed
+/// candidate, and the single-target path runs the full
+/// [`membership_passes_post_filter`]. The `require_modalities` and
+/// `min_context_length` axes are silently dropped on the fold path
+/// because the fold's [`CapabilityMembership`] payload doesn't
+/// carry the model metadata needed to evaluate them; callers that
+/// need them keep the legacy index until the fold's payload is
+/// extended.
 pub fn translate_filter(legacy: &LegacyFilter) -> CapabilityFilter {
-    // Models and tools are NOT pushed into `tags_all` — the canonical
-    // wire form for those is a multi-tag bundle
-    // (`software.model.<i>.id=<name>`, `software.tool.<i>.tool_id=<name>`)
-    // that doesn't match a single `model:<name>` / `tool:<name>` tag.
-    // They're handled in `membership_passes_post_filter` via the
-    // legacy `CapabilitySet::has_model` / `has_tool` scan.
+    // Each non-tag axis becomes one `tag_groups_all` group of
+    // index-only synthetic tags. `require_models` / `require_tools`
+    // are "any of" (union → multi-element group); `require_gpu` /
+    // `gpu_vendor` are single-element groups. The synthetic tags
+    // are manufactured at insert by `derive_synthetic_index_tags`
+    // from the canonical `software.model.<i>.id=` /
+    // `software.tool.<i>.tool_id=` bundles and the hardware
+    // projection — a publisher never emits them on the wire, so a
+    // synthetic group key can't be matched by raw published tags.
+    let mut tag_groups_all: Vec<Vec<String>> = Vec::new();
+    if !legacy.require_models.is_empty() {
+        tag_groups_all.push(
+            legacy
+                .require_models
+                .iter()
+                .map(|m| format!("model:{m}"))
+                .collect(),
+        );
+    }
+    if !legacy.require_tools.is_empty() {
+        tag_groups_all.push(
+            legacy
+                .require_tools
+                .iter()
+                .map(|t| format!("tool:{t}"))
+                .collect(),
+        );
+    }
+    if legacy.require_gpu {
+        tag_groups_all.push(vec!["gpu:present".to_string()]);
+    }
+    if let Some(vendor) = legacy.gpu_vendor {
+        tag_groups_all.push(vec![format!("gpu:vendor:{}", gpu_vendor_canonical(vendor))]);
+    }
     CapabilityFilter {
         class: None,
         tags_all: legacy.require_tags.clone(),
         tags_any: Vec::new(),
+        tag_groups_all,
         state: None,
         region: None,
         limit: 0,
     }
 }
 
-/// `true` if `membership` satisfies the post-query predicates
-/// the fold's index doesn't natively support. Caller is
-/// expected to have already filtered candidates through the
-/// fold's secondary index via [`translate_filter`].
-pub fn membership_passes_post_filter(
+/// `true` if `membership` satisfies the *range* predicates the
+/// fold's secondary index can't resolve — `min_memory_gb` and
+/// `min_vram_gb`. The bulk filter path uses this against borrowed
+/// candidates after the index has already resolved the tag /
+/// model / tool / gpu axes (the latter three via the synthetic-tag
+/// groups `translate_filter` builds), so re-checking those here
+/// would be redundant work.
+pub fn membership_passes_range_filter(
     membership: &CapabilityMembership,
     legacy: &LegacyFilter,
 ) -> bool {
-    if legacy.require_gpu {
-        let has_gpu = match &membership.hardware {
-            Some(h) => h.gpu_count > 0 || h.gpu_vendor.is_some(),
-            None => false,
-        };
-        if !has_gpu {
-            return false;
-        }
-    }
     if let Some(min_mem) = legacy.min_memory_gb {
         let mem = membership
             .hardware
@@ -104,6 +131,38 @@ pub fn membership_passes_post_filter(
             .and_then(|h| h.vram_gb)
             .unwrap_or(0);
         if vram < min_vram {
+            return false;
+        }
+    }
+    true
+}
+
+/// `true` if `membership` satisfies every post-query predicate the
+/// fold's tag intersection doesn't itself enforce: the range
+/// predicates ([`membership_passes_range_filter`]) plus GPU
+/// presence / vendor and model / tool membership.
+///
+/// This is the full, self-contained matcher used by the
+/// single-target path ([`target_matches_filter`]), which walks one
+/// publisher's entries directly and does NOT consult the secondary
+/// index. The bulk path resolves the gpu / model / tool axes
+/// through the index's synthetic-tag groups instead and only needs
+/// [`membership_passes_range_filter`];
+/// `target_matches_filter_agrees_with_find_nodes_matching` pins
+/// that the two stay equivalent.
+pub fn membership_passes_post_filter(
+    membership: &CapabilityMembership,
+    legacy: &LegacyFilter,
+) -> bool {
+    if !membership_passes_range_filter(membership, legacy) {
+        return false;
+    }
+    if legacy.require_gpu {
+        let has_gpu = match &membership.hardware {
+            Some(h) => h.gpu_count > 0 || h.gpu_vendor.is_some(),
+            None => false,
+        };
+        if !has_gpu {
             return false;
         }
     }
@@ -419,7 +478,9 @@ pub fn find_nodes_matching(fold: &Fold<CapabilityFold>, legacy: &LegacyFilter) -
             let Some(entry) = state.entries.get(&key) else {
                 continue;
             };
-            if membership_passes_post_filter(&entry.payload, legacy) {
+            // The index already resolved the tag / model / tool /
+            // gpu axes; only the range predicates remain.
+            if membership_passes_range_filter(&entry.payload, legacy) {
                 set.insert(key.1);
             }
         }
@@ -578,7 +639,9 @@ pub fn find_nodes_matching_scoped(
                 continue;
             };
             let membership = &entry.payload;
-            if !membership_passes_post_filter(membership, legacy) {
+            // The index already resolved the tag / model / tool /
+            // gpu axes; only the range predicates remain.
+            if !membership_passes_range_filter(membership, legacy) {
                 continue;
             }
             let candidate_scope = scope_from_membership_tags(&membership.tags);
@@ -640,24 +703,88 @@ mod tests {
     }
 
     #[test]
-    fn translate_filter_passes_require_tags_through_and_defers_models_and_tools() {
+    fn translate_filter_passes_require_tags_through_and_groups_models_tools_gpu() {
         let legacy = LegacyFilter {
             require_tags: vec!["gpu".into()],
-            require_models: vec!["llama3".into()],
+            require_models: vec!["llama3".into(), "mistral".into()],
             require_tools: vec!["ffmpeg".into()],
+            require_gpu: true,
+            gpu_vendor: Some(GpuVendor::Nvidia),
             ..LegacyFilter::default()
         };
         let fold_filter = translate_filter(&legacy);
-        // `require_tags` go directly through.
+        // `require_tags` go directly through to `tags_all` (AND).
         assert_eq!(fold_filter.tags_all, vec!["gpu".to_string()]);
-        // `require_models` / `require_tools` are NOT encoded as fold
-        // tags — the canonical wire form is multi-tag bundles
-        // (`software.model.<i>.id=...`) that `membership_passes_post_filter`
-        // matches via `CapabilitySet::has_model` / `has_tool`. A
-        // `model:<name>` / `tool:<name>` tag would never match an
-        // honest publisher.
-        assert!(!fold_filter.tags_all.contains(&"model:llama3".to_string()));
-        assert!(!fold_filter.tags_all.contains(&"tool:ffmpeg".to_string()));
+        // Models / tools / gpu / vendor are encoded as the
+        // index-only synthetic-tag groups the fold derives at
+        // insert — one group per axis (OR within, AND across).
+        // `require_models` is "any of", so both models land in a
+        // single group.
+        assert_eq!(
+            fold_filter.tag_groups_all,
+            vec![
+                vec!["model:llama3".to_string(), "model:mistral".to_string()],
+                vec!["tool:ffmpeg".to_string()],
+                vec!["gpu:present".to_string()],
+                vec!["gpu:vendor:nvidia".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn synthetic_index_tags_are_queryable_but_never_leak_into_enumeration() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let hw = HardwareSummary {
+            gpu_vendor: Some("nvidia".into()),
+            gpu_count: 1,
+            memory_gb: Some(64),
+            vram_gb: Some(24),
+        };
+        fold.apply(sign_member(
+            &kp,
+            0xAA,
+            0x100,
+            vec![
+                "gpu",
+                "software.model.0.id=llama3",
+                "software.tool.0.tool_id=ffmpeg",
+            ],
+            Some(hw),
+        ))
+        .expect("apply AA");
+
+        // Tag enumeration returns the real published tags...
+        let tags = super::super::capability::capability_tags_for(&fold, 0xAA);
+        assert!(tags.contains(&"gpu".to_string()));
+        assert!(tags.contains(&"software.model.0.id=llama3".to_string()));
+        // ...but never the index-only synthetic tags.
+        assert!(
+            !tags
+                .iter()
+                .any(|t| t.starts_with("model:") || t.starts_with("tool:") || t.starts_with("gpu:")),
+            "synthetic index tags leaked into enumeration: {tags:?}"
+        );
+
+        // Yet the synthetic tags ARE resolvable through the index.
+        let by_model = find_nodes_matching(
+            &fold,
+            &LegacyFilter {
+                require_models: vec!["llama3".into()],
+                ..LegacyFilter::default()
+            },
+        );
+        assert_eq!(by_model, vec![0xAA]);
+        let by_tool_and_gpu = find_nodes_matching(
+            &fold,
+            &LegacyFilter {
+                require_tools: vec!["ffmpeg".into()],
+                require_gpu: true,
+                gpu_vendor: Some(GpuVendor::Nvidia),
+                ..LegacyFilter::default()
+            },
+        );
+        assert_eq!(by_tool_and_gpu, vec![0xAA]);
     }
 
     #[test]
@@ -768,8 +895,27 @@ mod tests {
         // fast path can't silently drift from the bulk query.
         let fold = new_fold();
         let kp = EntityKeypair::generate();
-        fold.apply(sign_member(&kp, 0xAA, 0x100, vec!["gpu", "cuda"], None))
-            .expect("apply AA");
+        let nvidia_hw = HardwareSummary {
+            gpu_vendor: Some("nvidia".into()),
+            gpu_count: 2,
+            memory_gb: Some(128),
+            vram_gb: Some(80),
+        };
+        // AA: gpu tags + a model/tool bundle + nvidia hardware.
+        fold.apply(sign_member(
+            &kp,
+            0xAA,
+            0x100,
+            vec![
+                "gpu",
+                "cuda",
+                "software.model.0.id=llama3",
+                "software.tool.0.tool_id=ffmpeg",
+            ],
+            Some(nvidia_hw),
+        ))
+        .expect("apply AA");
+        // BB: cpu-only, no hardware, no bundles.
         fold.apply(sign_member(&kp, 0xBB, 0x100, vec!["cpu-only"], None))
             .expect("apply BB");
 
@@ -781,7 +927,7 @@ mod tests {
                     target_matches_filter(&fold, n, legacy),
                     "node 0x{:x} verdict mismatch for filter {:?}",
                     n,
-                    legacy.require_tags
+                    legacy
                 );
             }
         };
@@ -793,6 +939,40 @@ mod tests {
         let mut f = LegacyFilter::default();
         f.require_tags.push("gpu".into());
         probe(&f, &[0xAA, 0xBB, 0xCC]);
+
+        // The index-resolved axes must agree between paths too:
+        // a present model, a missing model, a present tool, GPU
+        // presence, and a matching/mismatching vendor.
+        let model_hit = LegacyFilter {
+            require_models: vec!["llama3".into()],
+            ..LegacyFilter::default()
+        };
+        probe(&model_hit, &[0xAA, 0xBB]);
+        let model_miss = LegacyFilter {
+            require_models: vec!["does-not-exist".into()],
+            ..LegacyFilter::default()
+        };
+        probe(&model_miss, &[0xAA, 0xBB]);
+        let tool_hit = LegacyFilter {
+            require_tools: vec!["ffmpeg".into()],
+            ..LegacyFilter::default()
+        };
+        probe(&tool_hit, &[0xAA, 0xBB]);
+        let gpu = LegacyFilter {
+            require_gpu: true,
+            ..LegacyFilter::default()
+        };
+        probe(&gpu, &[0xAA, 0xBB]);
+        let vendor_hit = LegacyFilter {
+            gpu_vendor: Some(GpuVendor::Nvidia),
+            ..LegacyFilter::default()
+        };
+        probe(&vendor_hit, &[0xAA, 0xBB]);
+        let vendor_miss = LegacyFilter {
+            gpu_vendor: Some(GpuVendor::Amd),
+            ..LegacyFilter::default()
+        };
+        probe(&vendor_miss, &[0xAA, 0xBB]);
 
         // Unknown publisher: per-target check returns false (matches
         // bulk path's "missing publishers don't appear").

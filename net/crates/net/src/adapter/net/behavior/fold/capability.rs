@@ -166,6 +166,15 @@ pub struct CapabilityFilter {
     /// Tags the entry must carry at least one of (union).
     /// Empty = no constraint.
     pub tags_any: Vec<String>,
+    /// Conjunction of disjunctions: the entry must carry at least
+    /// one tag from *every* group (AND across groups, OR within a
+    /// group). Used for filter axes whose legacy semantics are
+    /// "any of these must match" but which AND with the other
+    /// axes — `require_models`, `require_tools`, `require_gpu`,
+    /// `gpu_vendor` — encoded as the index-only synthetic tags
+    /// [`derive_synthetic_index_tags`] produces. Empty = no
+    /// constraint.
+    pub tag_groups_all: Vec<Vec<String>>,
     /// State filter (None = any).
     pub state: Option<NodeState>,
     /// Region filter (None = any).
@@ -200,6 +209,13 @@ impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
         for tag in &payload.tags {
             self.by_tag.entry(tag.clone()).or_default().insert(*key);
         }
+        // Index-only synthetic tags (model:/tool:/gpu:) so the
+        // model / tool / gpu filter axes resolve through the same
+        // tag bucket as plain tags instead of a per-query full scan.
+        // Parsed once here at insert, never per query.
+        for tag in derive_synthetic_index_tags(payload) {
+            self.by_tag.entry(tag).or_default().insert(*key);
+        }
         if let Some(region) = &payload.region {
             self.by_region
                 .entry(region.clone())
@@ -215,6 +231,16 @@ impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
                 set.remove(key);
                 if set.is_empty() {
                     self.by_tag.remove(tag);
+                }
+            }
+        }
+        // Mirror the synthetic tags added in `on_insert`. Derived
+        // from the same payload, so the set is identical.
+        for tag in derive_synthetic_index_tags(payload) {
+            if let Some(set) = self.by_tag.get_mut(&tag) {
+                set.remove(key);
+                if set.is_empty() {
+                    self.by_tag.remove(&tag);
                 }
             }
         }
@@ -239,6 +265,60 @@ impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
         self.by_region.clear();
         self.by_state.clear();
     }
+}
+
+/// Derive the index-only synthetic tags for a membership: the
+/// `model:<id>` / `tool:<id>` / `gpu:present` / `gpu:vendor:<v>`
+/// keys that let the secondary index resolve the filter axes the
+/// plain-tag index doesn't natively carry.
+///
+/// These live ONLY in the index — they are never written into
+/// `payload.tags`, so tag enumeration (`capability_tags_for`) is
+/// unaffected. Models / tools are read from the canonical
+/// `software.model.<i>.id=<v>` / `software.tool.<i>.tool_id=<v>`
+/// bundles using the same `Tag::AxisValue` shape
+/// `CapabilitySet::has_model` / `has_tool` match; GPU presence /
+/// vendor come from the hardware projection, matching the legacy
+/// `require_gpu` (`gpu_count > 0 || gpu_vendor.is_some()`) and
+/// `gpu_vendor` predicates.
+///
+/// Must stay the exact inverse of the tags `translate_filter`
+/// emits, or model / tool / gpu queries silently diverge between
+/// the bulk index path and the single-target post-filter path —
+/// `target_matches_filter_agrees_with_find_nodes_matching` guards
+/// this.
+fn derive_synthetic_index_tags(payload: &CapabilityMembership) -> Vec<String> {
+    use super::super::tag::{Tag, TaxonomyAxis};
+    let mut out = Vec::new();
+    for s in &payload.tags {
+        let Ok(Tag::AxisValue {
+            axis: TaxonomyAxis::Software,
+            key,
+            value,
+            ..
+        }) = Tag::parse(s)
+        else {
+            continue;
+        };
+        if let Some(rest) = key.strip_prefix("model.") {
+            if matches!(rest.split_once('.'), Some((_, "id"))) {
+                out.push(format!("model:{value}"));
+            }
+        } else if let Some(rest) = key.strip_prefix("tool.") {
+            if matches!(rest.split_once('.'), Some((_, "tool_id"))) {
+                out.push(format!("tool:{value}"));
+            }
+        }
+    }
+    if let Some(h) = &payload.hardware {
+        if h.gpu_count > 0 || h.gpu_vendor.is_some() {
+            out.push("gpu:present".to_string());
+        }
+        if let Some(vendor) = &h.gpu_vendor {
+            out.push(format!("gpu:vendor:{vendor}"));
+        }
+    }
+    out
 }
 
 /// Marker type for the [`FoldKind`] impl.
@@ -374,11 +454,35 @@ pub(crate) fn resolve_candidate_keys(
     index: &CapabilityIndexInner,
     filter: &CapabilityFilter,
 ) -> HashSet<(u64, NodeId)> {
+    // Materialize each group's union exactly once (OR within a
+    // group). The most-selective one may serve as the seed; the
+    // rest tighten the candidate set further down. Computing them
+    // up front avoids rebuilding the seed group's union a second
+    // time in the retain pass.
+    let mut group_unions: Vec<HashSet<(u64, NodeId)>> = filter
+        .tag_groups_all
+        .iter()
+        .filter(|g| !g.is_empty())
+        .map(|g| group_union(index, g))
+        .collect();
+
     // Seed candidate set: prefer tags_all (typically most
-    // selective), then state, then region, then class scan as
-    // fallback.
+    // selective), then the most-selective tag group, then state,
+    // then region, then class scan as fallback.
     let mut candidates: HashSet<(u64, NodeId)> = if !filter.tags_all.is_empty() {
         resolve_keys_all_tags(index, &filter.tags_all)
+    } else if !group_unions.is_empty() {
+        // Seed from the smallest group union, removing it so the
+        // retain pass below doesn't re-scan it.
+        // Non-empty (checked above), so min_by_key yields Some; the
+        // `unwrap_or(0)` is just a panic-free fallback.
+        let smallest = group_unions
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, u)| u.len())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        group_unions.swap_remove(smallest)
     } else if let Some(state_filter) = filter.state {
         index
             .by_state
@@ -430,6 +534,16 @@ pub(crate) fn resolve_candidate_keys(
         candidates.retain(|k| tags_any_union.contains(k));
     }
 
+    // AND across groups, OR within each group: a candidate must
+    // appear in every remaining group's union (the seed group, if
+    // any, was already consumed above).
+    for union in &group_unions {
+        candidates.retain(|k| union.contains(k));
+        if candidates.is_empty() {
+            break;
+        }
+    }
+
     // tags_all is already enforced by `resolve_keys_all_tags`
     // when used as the seed; if the seed came from a different
     // dimension, we still need to filter on tags_all here.
@@ -439,6 +553,18 @@ pub(crate) fn resolve_candidate_keys(
     }
 
     candidates
+}
+
+/// Union of the `(class, node)` keys carrying at least one tag in
+/// `group` — the OR-within-a-group half of `tag_groups_all`.
+fn group_union(index: &CapabilityIndexInner, group: &[String]) -> HashSet<(u64, NodeId)> {
+    let mut union: HashSet<(u64, NodeId)> = HashSet::new();
+    for tag in group {
+        if let Some(bucket) = index.by_tag.get(tag) {
+            union.extend(bucket.iter().copied());
+        }
+    }
+    union
 }
 
 /// Evaluate a [`CapabilityQuery::Composite`] filter — resolves
