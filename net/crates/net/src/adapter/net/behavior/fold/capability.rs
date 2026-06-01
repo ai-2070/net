@@ -172,7 +172,7 @@ pub struct CapabilityFilter {
     /// "any of these must match" but which AND with the other
     /// axes — `require_models`, `require_tools`, `require_gpu`,
     /// `gpu_vendor` — encoded as the index-only synthetic tags
-    /// [`derive_synthetic_index_tags`] produces. Empty = no
+    /// `derive_synthetic_index_tags` produces. Empty = no
     /// constraint.
     pub tag_groups_all: Vec<Vec<String>>,
     /// State filter (None = any).
