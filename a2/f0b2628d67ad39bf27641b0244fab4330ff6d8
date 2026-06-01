@@ -1,0 +1,23 @@
+net/crates/net/sdk/benches/nrpc_duplex.rs
+  s_b1f4a7ee26790a::t_d1047c654b4b84 20
+  s_b1f4a7ee26790a::t_09b83064047a35 64-85
+net/crates/net/sdk/benches/nrpc_client_streaming.rs
+  s_b1f4a7ee26790a::t_a726eb163e97bb 62-81
+  s_b1f4a7ee26790a::t_bdae89ffad5640 24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "a2f0b2628d67ad39bf27641b0244fab4330ff6d8",
+  "prompts": {},
+  "sessions": {
+    "s_b1f4a7ee26790a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cbe27940-6bcc-4bff-92d8-2ff784d8b082",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
