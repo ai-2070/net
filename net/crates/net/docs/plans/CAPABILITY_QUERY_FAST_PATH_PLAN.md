@@ -9,17 +9,19 @@ every existing correctness test stays green. Touches
 `src/adapter/net/behavior/fold/capability.rs`,
 `src/adapter/net/behavior/fold/capability_bridge.rs`, and `mod.rs`.
 
-Result over a 10k-node fold (before → after, all three layers):
+Result over a 10k-node fold (before → after, all three layers plus the
+follow-up index/post-filter tightening):
 
 | query | before | after | factor |
 |---|---|---|---|
-| `query_single_tag` | ~14 ms | ~0.18 ms | ~80× |
-| `query_complex` | ~14 ms | ~0.37 ms | ~38× |
-| `query_require_gpu` | ~29 ms | ~0.79 ms | ~37× |
-| `query_gpu_vendor` | ~29.5 ms | ~1.0 ms | ~29× |
-| `query_min_memory` | ~29.7 ms | ~0.87 ms | ~34× |
-| `query_model` | ~108 ms | ~0.19 ms | ~560× |
-| `query_tool` | ~108 ms | ~0.79 ms | ~137× |
+| `query_single_tag` | ~14 ms | ~0.18 ms | ~77× |
+| `query_complex` | ~14 ms | ~0.36 ms | ~39× |
+| `query_require_gpu` | ~29 ms | ~0.37 ms | ~79× |
+| `query_gpu_vendor` | ~29.5 ms | ~0.61 ms | ~48× |
+| `query_min_memory` | ~29.7 ms | ~0.49 ms | ~61× |
+| `query_model` | ~108 ms | ~0.088 ms | ~1230× |
+| `query_tool` | ~108 ms | ~0.37 ms | ~290× |
+| `query_no_results` | ~155 ns | ~71 ns | ~2.2× |
 
 Layer 3 (the plan's confidence step) is satisfied without new work: the existing `query_model` /
 `query_tool` benches *are* the indexed-path regression guards, and Layer 1 added the
