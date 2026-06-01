@@ -3244,3 +3244,126 @@ lb_health_updates/update_metrics
 Found 8 outliers among 100 measurements (8.00%)
   5 (5.00%) high mild
   3 (3.00%) high severe
+
+redex_append_inline/heap_file
+                        time:   [45.023 ns 45.482 ns 45.959 ns]
+                        thrpt:  [21.758 Melem/s 21.987 Melem/s 22.211 Melem/s]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high severe
+
+redex_append_heap/heap_file/32
+                        time:   [50.975 ns 51.263 ns 51.558 ns]
+                        thrpt:  [591.91 MiB/s 595.31 MiB/s 598.68 MiB/s]
+redex_append_heap/heap_file/256
+                        time:   [108.41 ns 110.52 ns 112.63 ns]
+                        thrpt:  [2.1169 GiB/s 2.1573 GiB/s 2.1993 GiB/s]
+redex_append_heap/heap_file/1024
+                        time:   [302.25 ns 308.69 ns 316.15 ns]
+                        thrpt:  [3.0166 GiB/s 3.0894 GiB/s 3.1553 GiB/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) low mild
+
+redex_append_watcher_paths/no_watchers
+                        time:   [108.41 ns 110.57 ns 112.71 ns]
+                        thrpt:  [2.1153 GiB/s 2.1564 GiB/s 2.1993 GiB/s]
+redex_append_watcher_paths/with_tail
+                        time:   [263.39 ns 268.45 ns 272.95 ns]
+                        thrpt:  [894.44 MiB/s 909.46 MiB/s 926.90 MiB/s]
+
+redex_append_batch/batch_64_x_64B
+                        time:   [2.7376 µs 2.8139 µs 2.9003 µs]
+                        thrpt:  [22.067 Melem/s 22.744 Melem/s 23.378 Melem/s]
+Found 3 outliers among 100 measurements (3.00%)
+  3 (3.00%) high mild
+
+redex_append_disk/disk_file/32
+                        time:   [11.193 µs 11.262 µs 11.332 µs]
+                        thrpt:  [2.6932 MiB/s 2.7099 MiB/s 2.7265 MiB/s]
+Found 6 outliers among 100 measurements (6.00%)
+  3 (3.00%) high mild
+  3 (3.00%) high severe
+redex_append_disk/disk_file/256
+                        time:   [12.529 µs 14.057 µs 15.641 µs]
+                        thrpt:  [15.609 MiB/s 17.368 MiB/s 19.486 MiB/s]
+Found 16 outliers among 100 measurements (16.00%)
+  4 (4.00%) high mild
+  12 (12.00%) high severe
+redex_append_disk/disk_file/1024
+                        time:   [26.043 µs 26.419 µs 27.006 µs]
+                        thrpt:  [36.160 MiB/s 36.964 MiB/s 37.498 MiB/s]
+Found 10 outliers among 100 measurements (10.00%)
+  4 (4.00%) high mild
+  6 (6.00%) high severe
+
+redex_append_batch_disk/batch_64_x/64
+                        time:   [41.914 µs 43.918 µs 46.163 µs]
+                        thrpt:  [1.3864 Melem/s 1.4572 Melem/s 1.5269 Melem/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high severe
+redex_append_batch_disk/batch_64_x/1024
+                        time:   [133.15 µs 148.36 µs 163.63 µs]
+                        thrpt:  [391.13 Kelem/s 431.39 Kelem/s 480.67 Kelem/s]
+
+redex_append_disk_policies/disk_file_256B/never
+                        time:   [24.090 µs 24.366 µs 24.711 µs]
+                        thrpt:  [9.8800 MiB/s 10.020 MiB/s 10.134 MiB/s]
+Found 10 outliers among 100 measurements (10.00%)
+  6 (6.00%) high mild
+  4 (4.00%) high severe
+Benchmarking redex_append_disk_policies/disk_file_256B/every_n_1: Warming up for 3.0000 s
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 5.7s, enable flat sampling, or reduce sample count to 60.
+redex_append_disk_policies/disk_file_256B/every_n_1
+                        time:   [1.2945 ms 1.3728 ms 1.4376 ms]
+                        thrpt:  [173.90 KiB/s 182.11 KiB/s 193.12 KiB/s]
+Found 20 outliers among 100 measurements (20.00%)
+  8 (8.00%) low severe
+  7 (7.00%) low mild
+  2 (2.00%) high mild
+  3 (3.00%) high severe
+redex_append_disk_policies/disk_file_256B/every_n_64
+                        time:   [40.170 µs 40.833 µs 41.728 µs]
+                        thrpt:  [5.8507 MiB/s 5.9791 MiB/s 6.0777 MiB/s]
+Found 7 outliers among 100 measurements (7.00%)
+  2 (2.00%) high mild
+  5 (5.00%) high severe
+redex_append_disk_policies/disk_file_256B/interval_50ms
+                        time:   [25.004 µs 25.211 µs 25.413 µs]
+                        thrpt:  [9.6071 MiB/s 9.6837 MiB/s 9.7639 MiB/s]
+Found 8 outliers among 100 measurements (8.00%)
+  3 (3.00%) high mild
+  5 (5.00%) high severe
+redex_append_disk_policies/disk_file_256B/interval_or_bytes
+                        time:   [11.815 µs 11.958 µs 12.153 µs]
+                        thrpt:  [20.090 MiB/s 20.417 MiB/s 20.663 MiB/s]
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+
+redex_append_batch_disk_policies/batch_64_x_64B/never
+                        time:   [19.306 µs 20.725 µs 22.450 µs]
+                        thrpt:  [2.8507 Melem/s 3.0880 Melem/s 3.3149 Melem/s]
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) high mild
+  3 (3.00%) high severe
+Benchmarking redex_append_batch_disk_policies/batch_64_x_64B/every_n_1: Warming up for 3.0000 s
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 5.3s, enable flat sampling, or reduce sample count to 60.
+redex_append_batch_disk_policies/batch_64_x_64B/every_n_1
+                        time:   [2.3399 ms 3.0066 ms 3.6038 ms]
+                        thrpt:  [17.759 Kelem/s 21.286 Kelem/s 27.352 Kelem/s]
+Found 28 outliers among 100 measurements (28.00%)
+  4 (4.00%) low severe
+  4 (4.00%) low mild
+  1 (1.00%) high mild
+  19 (19.00%) high severe
+redex_append_batch_disk_policies/batch_64_x_64B/interval_or_bytes_small
+                        time:   [4.9861 ms 5.1345 ms 5.2528 ms]
+                        thrpt:  [12.184 Kelem/s 12.465 Kelem/s 12.836 Kelem/s]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) low severe
+
+redex_tail/append_to_next
+                        time:   [355.94 ns 358.18 ns 361.34 ns]
+                        thrpt:  [2.7675 Melem/s 2.7919 Melem/s 2.8095 Melem/s]
+Found 6 outliers among 100 measurements (6.00%)
+  3 (3.00%) high mild
+  3 (3.00%) high severe
