@@ -3849,6 +3849,30 @@ impl MeshNode {
         });
     }
 
+    /// Decode a piggybacked transport ack (`DISPATCH_STREAM_ACK`) out
+    /// of a cortex event payload. Returns the embedded `StreamWindow`
+    /// — describing the *reverse-direction* stream to ack — when
+    /// `event` is such an event and its 24-byte tail decodes; else
+    /// `None`.
+    ///
+    /// MUST only be called on EventMeta-prefixed (cortex) events: raw
+    /// shard payloads carry no dispatch byte, so a coincidental `0x17`
+    /// first byte would be misread. The only caller
+    /// ([`Self::process_local_packet`]) is gated on a registered RPC
+    /// dispatcher, which guarantees EventMeta framing. See
+    /// `NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md`.
+    #[cfg(feature = "cortex")]
+    fn decode_embedded_stream_ack(event: &[u8]) -> Option<StreamWindow> {
+        use crate::adapter::net::cortex::{DISPATCH_STREAM_ACK, EVENT_META_SIZE};
+        if event.first() != Some(&DISPATCH_STREAM_ACK) {
+            return None;
+        }
+        if event.len() < EVENT_META_SIZE {
+            return None;
+        }
+        StreamWindow::decode(&event[EVENT_META_SIZE..]).ok()
+    }
+
     /// Process a locally-destined packet: decrypt and queue events.
     ///
     /// This is the same logic as `NetAdapter::process_packet` but extracted
@@ -4615,7 +4639,10 @@ impl MeshNode {
         // symmetric — the sender debits the same quantity via
         // `wire_bytes_for_payload` on admission.
         let payload_bytes = (decrypted.len() + PACKET_WIRE_OVERHEAD) as u64;
-        let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+        // `mut` so the cortex dispatch hook below can strip any
+        // piggybacked `DISPATCH_STREAM_ACK` control events in place
+        // after applying them to session reliability.
+        let mut events = EventFrame::read_events(decrypted, parsed.header.event_count);
 
         let stream_id = parsed.header.stream_id;
         let shard_id = if num_shards > 0 {
@@ -4818,6 +4845,31 @@ impl MeshNode {
                 );
                 return;
             };
+            // Ack-piggyback (NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md): a
+            // peer may fold `DISPATCH_STREAM_ACK` control events into
+            // this frame to acknowledge the reverse-direction stream
+            // without a standalone `SUBPROTOCOL_STREAM_WINDOW` packet.
+            // Apply them to session reliability here — the session is
+            // in scope and the registered-dispatcher gate above
+            // guarantees every event is EventMeta-prefixed, so byte 0
+            // is a real dispatch type rather than raw payload — then
+            // strip them so they never reach the RPC dispatcher (they
+            // carry no application payload). `retain` is in place: no
+            // allocation, and no element is removed until a peer
+            // actually emits these (sender + capability negotiation
+            // are later steps), so this is a single byte-compare per
+            // event on the hot path today.
+            events.retain(|event_data| match Self::decode_embedded_stream_ack(event_data) {
+                Some(grant) => {
+                    session.apply_authoritative_grant_with_ack(
+                        grant.stream_id,
+                        grant.total_consumed,
+                        grant.ack_seq,
+                    );
+                    false
+                }
+                None => true,
+            });
             match snapshot {
                 Snapshot::Single(canonical, disp) => {
                     for event_data in events.into_iter() {
@@ -12221,6 +12273,66 @@ mod reclassify_override_race_tests {
 
         assert_eq!(node.nat_class(), NatClass::Cone);
         assert_eq!(node.reflex_addr(), Some(probed));
+    }
+}
+
+#[cfg(all(test, feature = "cortex"))]
+mod embedded_stream_ack_tests {
+    //! `decode_embedded_stream_ack` — the receiver half of the
+    //! ack-piggyback path (NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md). Pins
+    //! that a `DISPATCH_STREAM_ACK` event decodes to its embedded
+    //! `StreamWindow`, and that non-ack / malformed events are ignored
+    //! so the hot-path `retain` only ever strips genuine acks.
+
+    use super::*;
+    use crate::adapter::net::cortex::{EventMeta, DISPATCH_RPC_RESPONSE, DISPATCH_STREAM_ACK};
+
+    fn event(dispatch: u8, tail: Option<StreamWindow>) -> Vec<u8> {
+        let mut ev = EventMeta::new(dispatch, 0, 0xC0FFEE, 1, 0).to_bytes().to_vec();
+        if let Some(sw) = tail {
+            ev.extend_from_slice(&sw.encode());
+        }
+        ev
+    }
+
+    #[test]
+    fn decodes_stream_ack_event() {
+        let sw = StreamWindow {
+            stream_id: 0xAB,
+            total_consumed: 100,
+            ack_seq: 7,
+        };
+        let got = MeshNode::decode_embedded_stream_ack(&event(DISPATCH_STREAM_ACK, Some(sw)))
+            .expect("DISPATCH_STREAM_ACK event must decode");
+        assert_eq!(
+            (got.stream_id, got.total_consumed, got.ack_seq),
+            (0xAB, 100, 7)
+        );
+    }
+
+    #[test]
+    fn ignores_non_ack_dispatch() {
+        // A normal RPC response event (byte 0 != 0x17) is left for the
+        // dispatcher, never mistaken for a transport ack.
+        let sw = StreamWindow {
+            stream_id: 1,
+            total_consumed: 2,
+            ack_seq: 3,
+        };
+        assert!(MeshNode::decode_embedded_stream_ack(&event(DISPATCH_RPC_RESPONSE, Some(sw))).is_none());
+    }
+
+    #[test]
+    fn rejects_ack_dispatch_with_no_stream_window_tail() {
+        // Right dispatch byte, but the 24-byte StreamWindow tail is
+        // missing — must not partially apply.
+        assert!(MeshNode::decode_embedded_stream_ack(&event(DISPATCH_STREAM_ACK, None)).is_none());
+    }
+
+    #[test]
+    fn rejects_payload_shorter_than_event_meta() {
+        assert!(MeshNode::decode_embedded_stream_ack(&[DISPATCH_STREAM_ACK]).is_none());
+        assert!(MeshNode::decode_embedded_stream_ack(&[]).is_none());
     }
 }
 

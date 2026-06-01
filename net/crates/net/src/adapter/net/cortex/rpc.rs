@@ -100,6 +100,24 @@ pub const DISPATCH_RPC_REQUEST_CHUNK: u8 = 0x15;
 /// take it).
 pub const DISPATCH_RPC_REQUEST_GRANT: u8 = 0x16;
 
+/// Transport ack-piggyback control event
+/// (`NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md`). Folded into a data
+/// packet's event frame to carry the **reverse-direction** stream's
+/// reliability ACK + credit without a standalone
+/// `SUBPROTOCOL_STREAM_WINDOW` packet. The payload after the
+/// `EventMeta` prefix is the 24-byte `StreamWindow` encoding
+/// (`stream_id`, `total_consumed`, `ack_seq`) for the stream being
+/// acked — a *different* stream than the carrying packet's own
+/// `header.stream_id`.
+///
+/// Unlike the `DISPATCH_RPC_*` values this is **not** RPC application
+/// data: the receive loop applies it to session reliability via
+/// `NetSession::apply_authoritative_grant_with_ack` and strips it
+/// before RPC dispatch (`mesh.rs::process_local_packet`). It is only
+/// ever valid on cortex (EventMeta-prefixed) traffic. Receiver-applied
+/// only until the sender + capability negotiation land.
+pub const DISPATCH_STREAM_ACK: u8 = 0x17;
+
 // ============================================================================
 // `RpcRequestPayload::flags` bit assignments.
 // ============================================================================
@@ -4017,6 +4035,7 @@ mod tests {
         assert_eq!(DISPATCH_RPC_STREAM_GRANT, 0x14);
         assert_eq!(DISPATCH_RPC_REQUEST_CHUNK, 0x15);
         assert_eq!(DISPATCH_RPC_REQUEST_GRANT, 0x16);
+        assert_eq!(DISPATCH_STREAM_ACK, 0x17);
     }
 
     /// Regression: encoder bounds. Encoding a service name longer
