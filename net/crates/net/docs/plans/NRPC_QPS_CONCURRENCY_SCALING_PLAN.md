@@ -87,10 +87,10 @@ profiles the **c16/c128 ceiling** specifically.
 
 | Phase | State | Notes |
 |---|---|---|
-| 0 — Diagnose: which stage is the wall | ☐ Not started | Discriminating experiments below |
-| 1 — Multi-channel shard bench variant | ☐ Not started | Settles per-channel bridge/mutex hypothesis |
-| 2 — Fix the bottleneck Phase 0 names | ☐ Blocked on Phase 0 | Candidate fixes pre-scoped below |
-| 3 — Re-bench + document the curve | ☐ Not started | Capture before/after; update this table |
+| 0 — Diagnose: which stage is the wall | ✅ Done | **Verdict: shared single recv loop + inline decrypt.** Worker sweep flat; sharding doesn't help. See Findings below. |
+| 1 — Multi-channel shard bench variant | ✅ Done | `nrpc_qps_shard` landed (`benches/nrpc_qps_shard.rs`); sharding *lowers* throughput → rules out per-channel bridge/mutex |
+| 2 — Fix the bottleneck Phase 0 names | ◐ Selected, not implemented | Branch chosen: **move AEAD decrypt off the recv loop**. T2.1 (fold mutex) de-prioritized — disproven as the wall |
+| 3 — Re-bench + document the curve | ☐ Not started | Capture before/after once Phase 2 lands; update this table |
 
 ---
 
@@ -135,6 +135,62 @@ relevant for honest benchmarking even if not a library fix.
 **Phase 0 exit:** a one-paragraph verdict naming the binding stage, backed by the
 0b result + the per-thread CPU observation. Record it in the Status table.
 
+### Findings — 2026-06-01 (Windows 11, 24 logical cores)
+
+Quick reads (criterion `--warm-up-time 1 --measurement-time 3 --sample-size 20`;
+point estimate = median of the reported `[low mid high]`). These are diagnostic,
+not the final published numbers — Phase 3 re-runs the full matrix.
+
+**0a — worker-thread sweep** (`nrpc_qps`, `NRPC_BENCH_WORKER_THREADS`, 32 B):
+
+| workers | c1/32B | c16/32B | scaling c1→c16 |
+|--------:|-------:|--------:|---------------:|
+| 4       | 24.2 K | 83.7 K  | 3.5×           |
+| 8       | 22.2 K | 84.2 K  | 3.8×           |
+| 16      | 22.9 K | 83.6 K  | 3.7×           |
+
+The **c16 ceiling is invariant to worker count** (84 K ± noise across 4/8/16), and
+c1 *drops* slightly as workers increase (more idle threads = more scheduling
+overhead for a single in-flight call). If throughput were CPU-bound across the
+worker pool, 16 workers would have lifted the ceiling well above 4 workers. It did
+not. → **not thread/CPU-parallelism bound.** (This corrects the plan's original
+"4 threads / 42 µs ≈ 95 K" framing: the ~4× is *not* load spread over 4 cores.)
+
+**0b/1 — channel shard** (`nrpc_qps_shard`, c16/32B, 4 workers):
+
+| shards | c16/32B | per-channel in-flight |
+|-------:|--------:|----------------------:|
+| 1      | 89.5 K  | 16                    |
+| 4      | 80.7 K  | 4                     |
+| 16     | 75.6 K  | 1                     |
+
+Giving every request its **own** channel (own bridge task + own `fold` mutex)
+makes throughput *worse*, not better — the opposite of what a per-channel
+serialization bottleneck would show. The slight regression is consistent with more
+channels = more bridge tasks competing for the same worker threads while the shared
+upstream stage stays pinned. → **not per-channel bridge/mutex bound (T2.1 is not
+the wall).**
+
+### Verdict
+
+Both experiments point the same way: the c16/c128 ceiling is set by a **single
+shared-consumer stage upstream of dispatch** — the **one socket recv loop that does
+inline AEAD decrypt** (`mesh.rs:3144` + `mesh.rs:3856`). It is pinned to one core
+and every inbound request (and, symmetrically on the client, every response) must
+pass through it. The observed ~4× c1→c16 gain is **pipeline parallelism** across
+the few single-consumer stages (server recv/decrypt → bridge → client
+recv/decrypt), which merely happened to sit near 4 — *not* CPU spread over 4
+worker threads, and *not* relieved by sharding channels.
+
+**Still owed (cheap, optional corroboration):** `top -H` / per-thread CPU under
+c16 to *see* the recv-loop thread pinned near 100 % while peers idle. The two
+throughput experiments already agree, so this is confirmation, not a gate.
+
+> Note: c128/32B point estimates were not captured cleanly — at 128 in-flight the
+> bench can't fit 20 samples into a 3 s window (criterion warns and the summary
+> line format shifts). Phase 3 will give c128 a longer measurement window. It does
+> not affect the verdict, which rests on the c16 ceiling and the shard curve.
+
 ---
 
 ## Phase 1 — Multi-channel shard bench variant
@@ -159,6 +215,11 @@ library fix.
 
 Pre-scoped candidates, mapped to existing audit T-items. **Implement only the one
 Phase 0 selects.**
+
+> **Phase 0 selected: stages 1–2 (single recv loop + inline decrypt).** Implement
+> the "If stages 1–2" branch below. The "If stage 4 — T2.1" branch is retained for
+> the record but **disproven as the wall** (sharding channels lowered throughput),
+> so it is not on the critical path for this plan.
 
 ### If stage 4 (bridge task / `fold` mutex per channel) — **T2.1**
 Drop the fold's outer `Mutex` + `in_flight: DashMap` (audit T2.1). Inbound REQUEST
