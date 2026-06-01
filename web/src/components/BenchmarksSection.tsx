@@ -19,17 +19,17 @@ const BENCH_GROUPS: readonly BenchGroup[] = [
       {
         op: "routing header forward",
         m1: { ns: "0.57 ns", rate: "1.75G/s" },
-        i9: { ns: "0.20 ns", rate: "5.06G/s" },
+        i9: { ns: "0.20 ns", rate: "4.99G/s" },
       },
       {
         op: "header serialize",
-        m1: { ns: "1.98 ns", rate: "505M/s" },
-        i9: { ns: "1.31 ns", rate: "762M/s" },
+        m1: { ns: "2.19 ns", rate: "456M/s" },
+        i9: { ns: "1.21 ns", rate: "829M/s" },
       },
       {
         op: "routing lookup (hit)",
-        m1: { ns: "38 ns", rate: "26.3M/s" },
-        i9: { ns: "38 ns", rate: "26.7M/s" },
+        m1: { ns: "40 ns", rate: "25.2M/s" },
+        i9: { ns: "38 ns", rate: "26.3M/s" },
       },
     ],
   },
@@ -38,18 +38,18 @@ const BENCH_GROUPS: readonly BenchGroup[] = [
     rows: [
       {
         op: "1 hop",
-        m1: { ns: "59 ns", rate: "16.9M/s" },
+        m1: { ns: "57 ns", rate: "17.4M/s" },
         i9: { ns: "53 ns", rate: "18.7M/s" },
       },
       {
         op: "3 hops",
-        m1: { ns: "163 ns", rate: "6.13M/s" },
-        i9: { ns: "121 ns", rate: "8.29M/s" },
+        m1: { ns: "160 ns", rate: "6.23M/s" },
+        i9: { ns: "122 ns", rate: "8.18M/s" },
       },
       {
         op: "5 hops",
-        m1: { ns: "274 ns", rate: "3.66M/s" },
-        i9: { ns: "190 ns", rate: "5.27M/s" },
+        m1: { ns: "257 ns", rate: "3.90M/s" },
+        i9: { ns: "196 ns", rate: "5.09M/s" },
       },
     ],
   },
@@ -58,18 +58,18 @@ const BENCH_GROUPS: readonly BenchGroup[] = [
     rows: [
       {
         op: "heartbeat",
-        m1: { ns: "29 ns", rate: "34.5M/s" },
-        i9: { ns: "35 ns", rate: "28.4M/s" },
+        m1: { ns: "29 ns", rate: "34.7M/s" },
+        i9: { ns: "36 ns", rate: "28.0M/s" },
       },
       {
         op: "circuit breaker check",
-        m1: { ns: "13 ns", rate: "74.4M/s" },
-        i9: { ns: "10 ns", rate: "98.4M/s" },
+        m1: { ns: "9.55 ns", rate: "105M/s" },
+        i9: { ns: "11 ns", rate: "90.3M/s" },
       },
       {
         op: "full fail + recover",
-        m1: { ns: "288 ns", rate: "3.47M/s" },
-        i9: { ns: "255 ns", rate: "3.92M/s" },
+        m1: { ns: "274 ns", rate: "3.65M/s" },
+        i9: { ns: "249 ns", rate: "4.02M/s" },
       },
     ],
   },
@@ -79,12 +79,12 @@ const BENCH_GROUPS: readonly BenchGroup[] = [
       {
         op: "pingwave roundtrip",
         m1: { ns: "0.93 ns", rate: "1.07G/s" },
-        i9: { ns: "0.65 ns", rate: "1.55G/s" },
+        i9: { ns: "0.69 ns", rate: "1.46G/s" },
       },
       {
         op: "new peer discovery",
-        m1: { ns: "113 ns", rate: "8.83M/s" },
-        i9: { ns: "152 ns", rate: "6.59M/s" },
+        m1: { ns: "93 ns", rate: "10.8M/s" },
+        i9: { ns: "47 ns", rate: "21.2M/s" },
       },
     ],
   },
@@ -93,13 +93,13 @@ const BENCH_GROUPS: readonly BenchGroup[] = [
     rows: [
       {
         op: "filter (require GPU)",
-        m1: { ns: "4.05 ns", rate: "247M/s" },
-        i9: { ns: "1.78 ns", rate: "561M/s" },
+        m1: { ns: "47 ns", rate: "21.4M/s" },
+        i9: { ns: "44 ns", rate: "22.8M/s" },
       },
       {
         op: "GPU check",
-        m1: { ns: "0.31 ns", rate: "3.21G/s" },
-        i9: { ns: "0.20 ns", rate: "5.01G/s" },
+        m1: { ns: "40 ns", rate: "25.3M/s" },
+        i9: { ns: "41 ns", rate: "24.7M/s" },
       },
     ],
   },
@@ -155,7 +155,7 @@ export function BenchmarksSection() {
           <hr className="border-0 border-t border-line my-5" />
           <BenchKpi
             label="// hot path"
-            value="5.06"
+            value="4.99"
             unit="G/s"
             note="Operations per second on a single core for the forward path. Five billion. Per second. Per core."
           />
@@ -175,7 +175,7 @@ export function BenchmarksSection() {
             <br />
             <b className="text-ink font-medium">► i9-14900K</b> @5GHz, Win11
             <br />
-            <b className="text-ink font-medium">► date</b> 2026-04-27
+            <b className="text-ink font-medium">► date</b> 2026-06-01
             <br />
             <b className="text-ink font-medium">► profile</b> release + LTO +
             CG=1
