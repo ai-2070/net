@@ -185,8 +185,9 @@ no grant.
 
 | Step | State |
 |---|---|
-| Design (this doc) | ✅ Drafted, awaiting review |
-| 1 — additive embedded-ack apply | ☐ Not started |
-| 2 — capability negotiation + sender emit | ☐ Not started |
+| Design (this doc) | ✅ Drafted |
+| 0 — extract shared grant-apply path | ✅ Done (`ca4fc7d5c`) — `NetSession::apply_authoritative_grant_with_ack` |
+| 1 — additive embedded-ack apply | ✅ Done (`d3fe1b12b`) — `DISPATCH_STREAM_ACK` + receiver apply/strip, inert until a sender emits |
+| 2 — capability negotiation + sender emit | ◐ Next — the transport↔RPC seam (response-emit needs the request stream's `rx_ack_seq`) |
 | 3 — suppress standalone grant | ☐ Not started |
 | 4 — re-bench + report | ☐ Not started |
