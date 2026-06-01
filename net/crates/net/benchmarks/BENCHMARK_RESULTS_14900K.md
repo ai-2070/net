@@ -3367,3 +3367,21 @@ redex_tail/append_to_next
 Found 6 outliers among 100 measurements (6.00%)
   3 (3.00%) high mild
   3 (3.00%) high severe
+
+standard_placement_score/baseline_no_custom_filter/100
+                        time:   [45.633 µs 45.679 µs 45.722 µs]
+                        thrpt:  [2.1871 Melem/s 2.1892 Melem/s 2.1914 Melem/s]
+Found 7 outliers among 100 measurements (7.00%)
+  3 (3.00%) high mild
+  4 (4.00%) high severe
+standard_placement_score/with_custom_filter_rust_callback/100
+                        time:   [50.733 µs 50.783 µs 50.835 µs]
+                        thrpt:  [1.9671 Melem/s 1.9692 Melem/s 1.9711 Melem/s]
+Found 4 outliers among 100 measurements (4.00%)
+  4 (4.00%) high mild
+standard_placement_score/with_custom_filter_predicate/100
+                        time:   [86.080 µs 86.168 µs 86.257 µs]
+                        thrpt:  [1.1593 Melem/s 1.1605 Melem/s 1.1617 Melem/s]
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) high mild
+  3 (3.00%) high severe
