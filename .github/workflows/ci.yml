@@ -557,8 +557,15 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Match `net/crates/net/rust-toolchain.toml` directly so the
+      # pinned 1.96.0 toolchain is installed up-front rather than
+      # auto-fetched mid-`maturin develop` by rustup (which has flaked
+      # — partial download leaves `rustc` absent on the new toolchain).
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          components: clippy, rustfmt, llvm-tools-preview
 
       - name: Cache cargo
         uses: actions/cache@v5
