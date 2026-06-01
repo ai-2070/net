@@ -81,10 +81,28 @@ fn bench_event_creation(c: &mut Criterion) {
 
     let ts_gen = TimestampGenerator::new();
 
+    // End-to-end "build a Value, then make an event from it". This is a
+    // strict SUPERSET of `json_creation` below: it builds the same
+    // serde_json Value *and then* serializes it to the canonical `Bytes`
+    // form. The delta over json_creation is one serde_json::to_vec into a
+    // 128-byte-preallocated Vec, moved zero-copy into Bytes — necessary
+    // work to produce the stored representation, not waste. So
+    // internal_event_new > json_creation is expected, not "backwards".
     group.bench_function("internal_event_new", |b| {
         b.iter(|| {
             InternalEvent::from_value(json!({"token": "hello", "index": 42}), ts_gen.next(), 0)
         });
+    });
+
+    // The allocation-free ingestion floor: callers that already hold
+    // pre-serialized bytes go through Shard::try_push_raw -> the
+    // InternalEvent::new path, which only stamps metadata (Bytes clone is
+    // a refcount bump, no serialize, no alloc). This is the lower bound
+    // and the escape hatch from from_value's serialization cost.
+    let pre_serialized =
+        bytes::Bytes::from(serde_json::to_vec(&json!({"token": "hello", "index": 42})).unwrap());
+    group.bench_function("internal_event_from_bytes", |b| {
+        b.iter(|| InternalEvent::new(pre_serialized.clone(), ts_gen.next(), 0));
     });
 
     group.bench_function("json_creation", |b| {
