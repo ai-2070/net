@@ -71,6 +71,17 @@ thiserror = "2"
 # `Arc<MeshNode>` + every group lifecycle method is async.
 futures = "0.3"
 
+# Global allocator. This is a long-running daemon whose hot paths
+# allocate small buffers per packet/event; the default system
+# allocator (macOS libmalloc) has a nano-zone (<=256B) size-class
+# boundary that makes 256-512B allocations markedly slower than both
+# smaller and larger ones. mimalloc has uniform size-class behaviour
+# and is 2-3x faster on these small allocations — measured -69% on the
+# 256B frame-write path. See docs/performance/net-simd-crypto-and-
+# allocator-followups.md. A library must stay allocator-neutral, so
+# the #[global_allocator] lives here in the binary, not in net-mesh.
+mimalloc = "0.1"
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
