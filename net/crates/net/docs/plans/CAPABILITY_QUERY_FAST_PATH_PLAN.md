@@ -2,14 +2,31 @@
 
 ## Status
 
-**Planned, not started.** Performance rework of the `CapabilityFold` bulk query path
-(`find_nodes_matching` → `Fold::query(Composite)` → `composite_query`). Layered into four
+**Layers 0–2 landed; Layer 3 satisfied.** Performance rework of the `CapabilityFold` bulk query
+path (`find_nodes_matching` → `Fold::query(Composite)` → `composite_query`). Layered into four
 independently-shippable steps; the first earns its existence on its own. No behavior change —
-every existing correctness test must stay green. Touches
-`src/adapter/net/behavior/fold/capability.rs` and
-`src/adapter/net/behavior/fold/capability_bridge.rs`, plus benches in `benches/net.rs`.
+every existing correctness test stays green. Touches
+`src/adapter/net/behavior/fold/capability.rs`,
+`src/adapter/net/behavior/fold/capability_bridge.rs`, and `mod.rs`.
 
-This is a real cost, not a benchmark artifact. Over a 10k-node fold:
+Result over a 10k-node fold (before → after, all three layers):
+
+| query | before | after | factor |
+|---|---|---|---|
+| `query_single_tag` | ~14 ms | ~0.18 ms | ~80× |
+| `query_complex` | ~14 ms | ~0.37 ms | ~38× |
+| `query_require_gpu` | ~29 ms | ~0.79 ms | ~37× |
+| `query_gpu_vendor` | ~29.5 ms | ~1.0 ms | ~29× |
+| `query_min_memory` | ~29.7 ms | ~0.87 ms | ~34× |
+| `query_model` | ~108 ms | ~0.19 ms | ~560× |
+| `query_tool` | ~108 ms | ~0.79 ms | ~137× |
+
+Layer 3 (the plan's confidence step) is satisfied without new work: the existing `query_model` /
+`query_tool` benches *are* the indexed-path regression guards, and Layer 1 added the
+group-translation test, the bulk/single-target agreement test extended to model/tool/gpu/vendor,
+and the synthetic-tags-stay-index-only test.
+
+The original cost, for the record — a real cost, not a benchmark artifact. Over a 10k-node fold:
 
 | query | time | why |
 |---|---|---|
