@@ -3385,3 +3385,89 @@ standard_placement_score/with_custom_filter_predicate/100
 Found 4 outliers among 100 measurements (4.00%)
   1 (1.00%) high mild
   3 (3.00%) high severe
+
+shard_manager/ingest_json/1
+                        time:   [452.27 ns 487.78 ns 516.92 ns]
+                        thrpt:  [1.9345 Melem/s 2.0501 Melem/s 2.2111 Melem/s]
+shard_manager/ingest_json/4
+                        time:   [585.11 ns 588.53 ns 592.11 ns]
+                        thrpt:  [1.6889 Melem/s 1.6992 Melem/s 1.7091 Melem/s]
+shard_manager/ingest_json/8
+                        time:   [583.97 ns 586.46 ns 589.30 ns]
+                        thrpt:  [1.6969 Melem/s 1.7051 Melem/s 1.7124 Melem/s]
+Found 15 outliers among 100 measurements (15.00%)
+  12 (12.00%) high mild
+  3 (3.00%) high severe
+shard_manager/ingest_json/16
+                        time:   [590.86 ns 593.85 ns 596.61 ns]
+                        thrpt:  [1.6761 Melem/s 1.6839 Melem/s 1.6924 Melem/s]
+shard_manager/ingest_raw/1
+                        time:   [165.36 ns 165.66 ns 165.98 ns]
+                        thrpt:  [6.0247 Melem/s 6.0363 Melem/s 6.0473 Melem/s]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+shard_manager/ingest_raw/4
+                        time:   [165.64 ns 166.02 ns 166.42 ns]
+                        thrpt:  [6.0089 Melem/s 6.0234 Melem/s 6.0371 Melem/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+shard_manager/ingest_raw/8
+                        time:   [165.72 ns 166.10 ns 166.51 ns]
+                        thrpt:  [6.0055 Melem/s 6.0205 Melem/s 6.0344 Melem/s]
+Found 5 outliers among 100 measurements (5.00%)
+  3 (3.00%) high mild
+  2 (2.00%) high severe
+shard_manager/ingest_raw/16
+                        time:   [166.13 ns 166.50 ns 166.90 ns]
+                        thrpt:  [5.9917 Melem/s 6.0059 Melem/s 6.0192 Melem/s]
+Found 6 outliers among 100 measurements (6.00%)
+  6 (6.00%) high mild
+
+event_size/small_50b_json
+                        time:   [503.77 ns 507.61 ns 511.33 ns]
+                        thrpt:  [1.9557 Melem/s 1.9700 Melem/s 1.9850 Melem/s]
+event_size/small_50b_raw
+                        time:   [166.63 ns 166.95 ns 167.25 ns]
+                        thrpt:  [5.9792 Melem/s 5.9897 Melem/s 6.0013 Melem/s]
+event_size/medium_200b_json
+                        time:   [892.15 ns 978.37 ns 1.0757 µs]
+                        thrpt:  [929.61 Kelem/s 1.0221 Melem/s 1.1209 Melem/s]
+Found 27 outliers among 100 measurements (27.00%)
+  14 (14.00%) low severe
+  3 (3.00%) high mild
+  10 (10.00%) high severe
+event_size/medium_200b_raw
+                        time:   [111.98 ns 119.73 ns 127.45 ns]
+                        thrpt:  [7.8462 Melem/s 8.3522 Melem/s 8.9303 Melem/s]
+Found 10 outliers among 100 measurements (10.00%)
+  1 (1.00%) high mild
+  9 (9.00%) high severe
+event_size/large_1kb_json
+                        time:   [6.0356 µs 6.2277 µs 6.4484 µs]
+                        thrpt:  [155.08 Kelem/s 160.57 Kelem/s 165.68 Kelem/s]
+Found 21 outliers among 100 measurements (21.00%)
+  5 (5.00%) high mild
+  16 (16.00%) high severe
+event_size/large_1kb_raw
+                        time:   [166.11 ns 166.54 ns 167.02 ns]
+                        thrpt:  [5.9872 Melem/s 6.0045 Melem/s 6.0200 Melem/s]
+Found 8 outliers among 100 measurements (8.00%)
+  4 (4.00%) high mild
+  4 (4.00%) high severe
+
+parallel/threads/1      time:   [3.5974 ms 3.6264 ms 3.6590 ms]
+                        thrpt:  [2.7330 Melem/s 2.7576 Melem/s 2.7798 Melem/s]
+Found 11 outliers among 100 measurements (11.00%)
+  1 (1.00%) high mild
+  10 (10.00%) high severe
+parallel/threads/2      time:   [4.4810 ms 4.5060 ms 4.5326 ms]
+                        thrpt:  [4.4125 Melem/s 4.4385 Melem/s 4.4633 Melem/s]
+Found 4 outliers among 100 measurements (4.00%)
+  3 (3.00%) high mild
+  1 (1.00%) high severe
+parallel/threads/4      time:   [5.3838 ms 5.4852 ms 5.6061 ms]
+                        thrpt:  [7.1350 Melem/s 7.2923 Melem/s 7.4298 Melem/s]
+Found 9 outliers among 100 measurements (9.00%)
+  9 (9.00%) high severe
+parallel/threads/8      time:   [4.0360 ms 4.0920 ms 4.1483 ms]
+                        thrpt:  [19.285 Melem/s 19.550 Melem/s 19.822 Melem/s]
