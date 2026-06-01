@@ -230,6 +230,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo nextest run --no-fail-fast --features "dataforts redex-disk" --test dataforts_blob_e2e
 
+      # === Transport C ABI error-code mirror ==============================
+      # Parses `include/net_transport.h` and asserts every `#define
+      # NET_*` matches its Rust `pub const NET_*` sibling. Gated on
+      # `net + dataforts + netdb + redex-disk` per the test's cfg.
+      - name: Transport error-code mirror
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --no-fail-fast --features "net dataforts netdb redex-disk" --test transport_error_codes
+
       # === Dataforts net-blob CLI =========================================
       # Pulls in clap via the `cli` feature; kept separate so the
       # non-CLI dataforts groups don't pay the clap compile cost.
@@ -381,7 +389,7 @@ jobs:
       #     expansion + serve-helper round-trip. Gated on
       #     `feature = "macros" + "cortex"`.
       - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed, tool_*)
-        run: cargo test --features "net cortex testing compute nat-traversal port-mapping aggregator tool macros"
+        run: cargo test --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros"
 
       # SDK doctests — `///` examples in `sdk/src/`. Same feature set
       # as the test run so doc examples gated on those features
