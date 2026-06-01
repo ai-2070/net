@@ -24,8 +24,6 @@
 //! - [`find_nodes_matching_scoped`] — the fold-flavored
 //!   replacement for the legacy `find_nodes_scoped`.
 
-use std::collections::HashSet;
-
 use super::super::capability::{
     matches_scope, CapabilityAnnouncement, CapabilityFilter as LegacyFilter, CapabilityScope,
     GpuVendor, ScopeFilter,
@@ -471,9 +469,9 @@ pub fn find_nodes_matching(fold: &Fold<CapabilityFold>, legacy: &LegacyFilter) -
     // node ids out, so we never clone a `CapabilityMembership` —
     // unlike the `Vec<CapabilityMatch>` query path, which clones
     // every match before the caller can discard it.
-    let node_set: HashSet<NodeId> = fold.with_state_and_index(|state, index| {
+    let mut out: Vec<NodeId> = fold.with_state_and_index(|state, index| {
         let candidates = resolve_candidate_keys(state, index, &fold_filter);
-        let mut set: HashSet<NodeId> = HashSet::new();
+        let mut ids: Vec<NodeId> = Vec::with_capacity(candidates.len());
         for key in candidates {
             let Some(entry) = state.entries.get(&key) else {
                 continue;
@@ -481,16 +479,18 @@ pub fn find_nodes_matching(fold: &Fold<CapabilityFold>, legacy: &LegacyFilter) -
             // The index already resolved the tag / model / tool /
             // gpu axes; only the range predicates remain.
             if membership_passes_range_filter(&entry.payload, legacy) {
-                set.insert(key.1);
+                ids.push(key.1);
             }
         }
-        set
+        ids
     });
-    // Sort so callers (e.g. the scheduler's `FirstMatch` placement)
-    // see a deterministic order across processes; HashSet iteration
-    // is randomized.
-    let mut out: Vec<NodeId> = node_set.into_iter().collect();
+    // Sort + dedup: callers (e.g. the scheduler's `FirstMatch`
+    // placement) need a deterministic order across processes, and a
+    // publisher present in multiple classes must count once. Sorting
+    // the Vec and deduping is cheaper than routing through a
+    // `HashSet<NodeId>` first.
     out.sort_unstable();
+    out.dedup();
     out
 }
 
@@ -631,9 +631,9 @@ pub fn find_nodes_matching_scoped(
     // Borrow-and-filter, same as `find_nodes_matching`: resolve
     // candidate keys via the index, then run the post-filter and
     // scope gate against borrowed payloads without cloning.
-    let node_set: HashSet<NodeId> = fold.with_state_and_index(|state, index| {
+    let mut out: Vec<NodeId> = fold.with_state_and_index(|state, index| {
         let candidates = resolve_candidate_keys(state, index, &fold_filter);
-        let mut set: HashSet<NodeId> = HashSet::new();
+        let mut ids: Vec<NodeId> = Vec::with_capacity(candidates.len());
         for key in candidates {
             let Some(entry) = state.entries.get(&key) else {
                 continue;
@@ -649,12 +649,14 @@ pub fn find_nodes_matching_scoped(
             if !matches_scope(&candidate_scope, scope, same_subnet) {
                 continue;
             }
-            set.insert(key.1);
+            ids.push(key.1);
         }
-        set
+        ids
     });
-    let mut out: Vec<NodeId> = node_set.into_iter().collect();
+    // Sort + dedup: deterministic order and one entry per publisher
+    // (a publisher may match under multiple classes).
     out.sort_unstable();
+    out.dedup();
     out
 }
 
@@ -665,6 +667,7 @@ mod tests {
         EnvelopeMeta, FoldKind, NodeState, SignedAnnouncement,
     };
     use crate::adapter::net::identity::EntityKeypair;
+    use std::collections::HashSet;
     use std::time::Duration;
 
     fn sign_member(

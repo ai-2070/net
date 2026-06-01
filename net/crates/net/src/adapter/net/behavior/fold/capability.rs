@@ -544,14 +544,10 @@ pub(crate) fn resolve_candidate_keys(
         }
     }
 
-    // tags_all is already enforced by `resolve_keys_all_tags`
-    // when used as the seed; if the seed came from a different
-    // dimension, we still need to filter on tags_all here.
-    if !filter.tags_all.is_empty() {
-        let strict_set = resolve_keys_all_tags(index, &filter.tags_all);
-        candidates.retain(|k| strict_set.contains(k));
-    }
-
+    // No tags_all re-check needed: when `tags_all` is non-empty it
+    // is always the seed (the first branch above), so `candidates`
+    // already equals its intersection and every retain since has
+    // only narrowed it.
     candidates
 }
 
