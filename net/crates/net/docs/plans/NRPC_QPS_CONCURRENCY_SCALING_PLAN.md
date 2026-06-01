@@ -89,7 +89,7 @@ profiles the **c16/c128 ceiling** specifically.
 |---|---|---|
 | 0 — Diagnose: which stage is the wall | ✅ Done | **Verdict: shared single recv loop + inline decrypt.** Worker sweep flat; sharding doesn't help. See Findings below. |
 | 1 — Multi-channel shard bench variant | ✅ Done | `nrpc_qps_shard` landed (`benches/nrpc_qps_shard.rs`); sharding *lowers* throughput → rules out per-channel bridge/mutex |
-| 2 — Fix the bottleneck Phase 0 names | ◐ Selected, not implemented | Branch chosen: **move AEAD decrypt off the recv loop**. T2.1 (fold mutex) de-prioritized — disproven as the wall |
+| 2 — Fix the bottleneck Phase 0 names | ◐ Re-scoped, not implemented | Recv stage is **syscall/wake-bound, not decrypt-bound** (flamegraph). Levers: #1 T1.1 coalesce unary grants, #2 T1.2 direct response, #3 T2.3/T3.4. Decrypt-off-loop **withdrawn (~5%)**; T2.1 disproven |
 | 3 — Re-bench + document the curve | ☐ Not started | Capture before/after once Phase 2 lands; update this table |
 
 ---
@@ -186,6 +186,26 @@ worker threads, and *not* relieved by sharding channels.
 c16 to *see* the recv-loop thread pinned near 100 % while peers idle. The two
 throughput experiments already agree, so this is confirmation, not a gate.
 
+#### What the recv-loop stage actually spends time on (course-correction)
+
+Naming the *stage* (single recv loop) is not the same as naming the *cost*. Source
+read of the loop + cross-reference to [`NRPC_FLAMEGRAPH.md`](NRPC_FLAMEGRAPH.md):
+
+- The loop is **one `recv_buf_from` syscall at a time** (`transport.rs:280`, via
+  `PacketReceiver`). A `BatchedPacketReceiver` (recvmmsg) exists but is **Linux-only
+  and not wired into `spawn_receive_loop`**; the bench host is Windows, which has no
+  recvmmsg.
+- Flamegraph bucket split: **`NtWaitForAlertByThreadId` ~51 %** (wakeups /
+  park-unpark), **transport syscalls ~22 %** (`sendto` + IOCP), **AEAD decrypt
+  ~5 %** ("crypto is invisible in the flame graph").
+
+So the recv-loop stage is **syscall- and wake-latency-bound, not decrypt-bound.**
+This **invalidates the Phase 2 branch the verdict first selected** ("move decrypt
+off the recv loop"): at ~12 µs/packet on the loop, decrypt is ~0.6 µs — removing it
+buys ~5 % (~84 K → ~88 K) and is not worth reordering replay-counter admission for.
+The real levers reduce **syscalls and wakeups per round trip** — see the rewritten
+Phase 2.
+
 > Note: c128/32B point estimates were not captured cleanly — at 128 in-flight the
 > bench can't fit 20 samples into a 3 s window (criterion warns and the summary
 > line format shifts). Phase 3 will give c128 a longer measurement window. It does
@@ -213,43 +233,61 @@ library fix.
 
 ## Phase 2 — Fix the bottleneck Phase 0 names
 
-Pre-scoped candidates, mapped to existing audit T-items. **Implement only the one
-Phase 0 selects.**
+The binding stage is the single shared recv loop (Phase 0). But the scoping read
+above shows that stage is **syscall/wake-bound, not decrypt-bound** — so the fix is
+to cut **syscalls and wakeups per round trip**, *not* to move decrypt. Levers
+below, ranked by value/risk after the course-correction.
 
-> **Phase 0 selected: stages 1–2 (single recv loop + inline decrypt).** Implement
-> the "If stages 1–2" branch below. The "If stage 4 — T2.1" branch is retained for
-> the record but **disproven as the wall** (sharding channels lowered throughput),
-> so it is not on the critical path for this plan.
+> **Superseded:** the verdict's first instinct ("move decrypt off the recv loop")
+> is now a **non-lever (~5 %)** and removed from the critical path. See "Rejected"
+> at the end of this section. T2.1 (per-channel fold mutex) was already disproven by
+> the shard test.
 
-### If stage 4 (bridge task / `fold` mutex per channel) — **T2.1**
-Drop the fold's outer `Mutex` + `in_flight: DashMap` (audit T2.1). Inbound REQUEST
-crosses ~4 mutex regions today; under single-channel saturation this is exactly
-when contention bites. Requires `RedexFold::apply` to take `&self` (interior
-mutability) instead of `&mut self`, or a sharded lock.
-- **Risk:** medium — touches the `RedexFold` trait signature. Needs the full redex
-  fold test suite green.
-- **Cheaper interim:** more bridge tasks per channel, or shard the channel
-  (Phase 1 already proves whether this helps).
+### #1 — Coalesce StreamWindow grants on unary (T1.1) — **biggest win**
+`NRPC_FLAMEGRAPH.md` confirms (from source, `session.rs:1012-1041` + `mesh.rs:4399`)
+that every accepted inbound data packet fires a StreamWindow grant — so a unary
+round trip carries **2 extra grant packets**, each = 1 `sendto` + 1 recv-loop
+wakeup + 1 AEAD on *both* ends. Coalescing/skipping grants on unary directly
+removes packets from the single recv loop — the exact resource Phase 0 named — so
+it should lift the c16/c128 ceiling, not just c1.
+- **Risk:** medium — touches flow control; the streaming benches
+  (`nrpc_streaming.rs`) + `nrpc_qps c128/16KiB` must stay green.
+- **Synergy:** this is already the #1 item in `NRPC_FLAMEGRAPH.md`; this plan adds
+  the throughput-ceiling justification on top of the latency one.
 
-### If stages 1–2 (single recv loop + inline decrypt)
-Move AEAD decrypt **off** the recv loop: the loop does the cheap counter/AAD admit
-check, then hands the ciphertext to the spawned task (or a small decrypt worker
-pool) where decrypt + decode happen in parallel. Keeps the loop doing only socket
-drain + routing.
-- **Risk:** medium-high — reorders the decrypt/`try_admit_rx_counter` sequence
-  (`mesh.rs:3856`); replay-window admission must stay correct. Needs the transport
-  replay/counter tests.
-- **Synergy:** also lifts the c128 ceiling and helps the `16KiB` rows.
+### #2 — Response leg → `publish_to_peer` direct (T1.2) — **low-risk**
+Response path uses `mesh.publish` (roster fan-out + ACL + subnet filter + a
+`Vec<Bytes>` alloc) when `caller_origin` already pins the target node. Switching to
+`publish_to_peer` removes that per-response overhead. Mechanical, ~4 sites
+(`mesh_rpc.rs:1510,1753,1964,2066,2286`). Low risk.
 
-### Regardless of stage — bundle the cheap wins (from `NRPC_FLAMEGRAPH.md`)
+### #3 — Drop spawn+wake per call (T2.3 + T3.4) — **cheap**
 - **T2.3** — inline the handler when its future is `Ready` instead of always
-  `tokio::spawn` (`cortex/rpc.rs:1585`). The bench handler is synchronous; this
-  removes one spawn+wake per call. ~1–3 µs/call, directly relevant since the
-  spawn-storm dominates wall time.
+  `tokio::spawn` (`cortex/rpc.rs:1585`). The echo handler is synchronous; removes
+  one spawn+wake per call — directly attacks the 51 % wake-latency bucket.
 - **T3.4** — gate `catch_unwind` behind a feature so the microbench path skips it.
 
-These reduce per-request work on *every* stage, so they help the ceiling whichever
-hypothesis wins. Bundle with the selected structural fix; re-bench between.
+### #4 — Parallelize/batch the recv syscall — **structural, platform-split**
+The deepest fix for the named stage, but the most involved:
+- **Linux:** wire the existing `BatchedPacketReceiver` (recvmmsg) into
+  `spawn_receive_loop` so one syscall drains many datagrams — amortizes the ~22 %
+  syscall bucket. The code exists (`transport.rs:297`, `linux.rs`); it is just not
+  on the live receive path.
+- **Windows (the bench host):** no recvmmsg. Options are registered I/O (RIO) or
+  multiple recv loops on `SO_REUSEPORT`-style sockets — both change the one-node /
+  one-socket model and are out of scope until #1–#3 are measured.
+- **Risk:** high; defer until #1–#3 land and Phase 3 re-bench shows residual
+  headroom against the syscall wall.
+
+### Rejected — move decrypt off the recv loop
+Originally selected by the Phase 0 verdict; **withdrawn**. Decrypt is ~5 % of the
+loop's time (`NRPC_FLAMEGRAPH.md`: "crypto is invisible"). Moving it would buy
+~5 % while reordering the `decrypt → try_admit_rx_counter` replay-admission
+sequence (`mesh.rs:3892-3900`) and risking a per-packet unbounded-spawn DoS amp.
+Bad value-for-risk; not doing it.
+
+**Sequence:** #2 (mechanical, low risk) → #3 (cheap) → re-bench → #1 (biggest, needs
+streaming bench green) → re-bench → reassess #4 only if a syscall wall remains.
 
 ---
 
@@ -267,14 +305,17 @@ hypothesis wins. Bundle with the selected structural fix; re-bench between.
 
 ## Risks & guardrails
 
-- **Don't regress c1 latency.** Moving decrypt to the spawned task adds a hop on
-  the single-request path; verify c1/32B does not climb (it is the headline
-  latency number). The streaming benches (`nrpc_streaming.rs`) and
+- **Don't regress c1 latency.** c1/32B is the headline latency number; verify it
+  does not climb after any change. The streaming benches (`nrpc_streaming.rs`) and
   `nrpc_qps c128/16KiB` are the regression tripwires named in `NRPC_FLAMEGRAPH.md`.
-- **Replay-window correctness** if decrypt moves off the recv loop — counter
-  admission order must be preserved. Transport replay tests gate this.
-- **`RedexFold` trait churn** if T2.1 is chosen — wide blast radius; sequence it
-  last and keep the redex fold suite green.
+- **Flow-control correctness (T1.1, lever #1).** Coalescing/skipping StreamWindow
+  grants must not starve *streaming* traffic of window credit — only unary (single
+  packet each way) is safe to skip. `nrpc_streaming.rs` is the gate.
+- **Withdrawn risk — decrypt reorder.** The earlier "decrypt off the recv loop"
+  branch carried a replay-window-ordering risk and a per-packet unbounded-spawn DoS
+  amp; both are moot now that the branch is rejected (see Phase 2 "Rejected").
+- **`RedexFold` trait churn (T2.1)** is also off the table — T2.1 was disproven as
+  the wall by the shard test, so its wide-blast-radius trait change is not needed.
 - **Bench honesty:** the shared single 4-thread runtime for both client and server
   (Phase 0c) means the *measured* ceiling is partly an artifact of the harness, not
   the protocol. Note this wherever the number is quoted.
