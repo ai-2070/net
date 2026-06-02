@@ -391,9 +391,19 @@ impl std::fmt::Debug for PacketReceiver {
 /// The underlying `BatchedTransport` contains `!Send` raw pointers, so it
 /// cannot live inside a `tokio::spawn` future. Instead, a dedicated OS thread
 /// owns the transport and sends received packets over a bounded channel.
+///
+/// The channel carries a *whole recvmmsg batch* per message (not one packet
+/// per message): a 64-packet recvmmsg costs one `blocking_send` and one
+/// cross-thread handoff instead of 64, so the per-packet overhead the syscall
+/// batching removed isn't silently re-imposed by the channel. `recv()` drains
+/// the most-recent batch from `pending` front-to-back (preserving arrival
+/// order) before pulling the next batch off the channel, so its
+/// one-packet-at-a-time signature is unchanged.
 #[cfg(target_os = "linux")]
 pub struct BatchedPacketReceiver {
-    rx: tokio::sync::mpsc::Receiver<(Bytes, SocketAddr)>,
+    rx: tokio::sync::mpsc::Receiver<Vec<(Bytes, SocketAddr)>>,
+    /// Packets from the batch currently being drained, in arrival order.
+    pending: std::collections::VecDeque<(Bytes, SocketAddr)>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     _socket: Arc<UdpSocket>,
     _thread: Option<std::thread::JoinHandle<()>>,
@@ -418,7 +428,14 @@ impl BatchedPacketReceiver {
         // Apply high-throughput socket tuning
         let _ = super::linux::configure_socket_for_throughput(fd);
 
-        let (tx, rx) = tokio::sync::mpsc::channel(1024);
+        // Channel depth is in *batches* now, not packets. Worst case it
+        // buffers `RECV_BATCH_CHANNEL_DEPTH * MAX_BATCH_SIZE` packets in front
+        // of the kernel socket buffer; once full, the thread's `blocking_send`
+        // parks, the kernel buffer fills, and existing flow control takes over
+        // (unchanged backpressure). Tune against the c128 measurement — see
+        // NRPC_RECV_LOOP_BATCHING_PLAN.
+        const RECV_BATCH_CHANNEL_DEPTH: usize = 64;
+        let (tx, rx) = tokio::sync::mpsc::channel(RECV_BATCH_CHANNEL_DEPTH);
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_shutdown = shutdown.clone();
 
@@ -477,10 +494,11 @@ impl BatchedPacketReceiver {
                             }
                             // One non-empty recvmmsg = one ingress syscall.
                             record_recv_batch(packets.len() as u64, measure);
-                            for packet in packets {
-                                if tx.blocking_send(packet).is_err() {
-                                    return;
-                                }
+                            // Hand the whole batch over in a single channel op
+                            // (one cross-thread handoff per recvmmsg, not per
+                            // packet). `recv()` drains it front-to-back.
+                            if tx.blocking_send(packets).is_err() {
+                                return;
                             }
                         }
                         Err(e) => {
@@ -528,6 +546,7 @@ impl BatchedPacketReceiver {
 
         Self {
             rx,
+            pending: std::collections::VecDeque::new(),
             shutdown,
             _socket: socket,
             _thread: Some(thread),
@@ -535,11 +554,30 @@ impl BatchedPacketReceiver {
     }
 
     /// Receive the next packet.
+    ///
+    /// Drains the current batch front-to-back (arrival order) before pulling
+    /// the next recvmmsg batch off the channel, so callers still see one
+    /// packet at a time in the order the kernel delivered them. Returns
+    /// `ConnectionReset` once the receive thread has exited and every buffered
+    /// packet has been handed out.
     pub async fn recv(&mut self) -> io::Result<(Bytes, SocketAddr)> {
-        self.rx
-            .recv()
-            .await
-            .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionReset, "batch receiver closed"))
+        loop {
+            if let Some(packet) = self.pending.pop_front() {
+                return Ok(packet);
+            }
+            match self.rx.recv().await {
+                // The thread only sends non-empty batches; the loop re-checks
+                // `pending` and returns the first packet. (An empty batch, were
+                // one ever sent, simply loops back to await the next.)
+                Some(batch) => self.pending.extend(batch),
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "batch receiver closed",
+                    ))
+                }
+            }
+        }
     }
 }
 
