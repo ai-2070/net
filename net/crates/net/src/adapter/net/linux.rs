@@ -66,6 +66,31 @@ pub struct BatchedTransport {
     recv_buffers: Vec<BytesMut>,
 }
 
+// SAFETY: `BatchedTransport` is auto-`!Send` only because `iovecs`/`msgs`
+// hold raw `libc::iovec`/`mmsghdr` pointers. Those pointers are *scratch*:
+// every `send_batch_chunk`/`recv_batch*` call overwrites them at the top of
+// the call to point into that call's own buffers, uses them solely for the
+// duration of one synchronous syscall, and never reads them between calls —
+// between calls they are inert integers. All access is through `&mut self`,
+// so a value is only ever touched by one thread at a time and never aliased.
+// Transferring ownership across threads (what `Send` permits — e.g. a Tokio
+// task resumed on a different worker after an `.await`) therefore moves only
+// inert bits; no pointer is dereferenced on the basis of which thread owns
+// the struct. The router's send loop relies on this to hold one reusable
+// transport across its await points instead of reallocating the scratch per
+// flush. Not `Sync`: nothing here is designed for concurrent shared access.
+unsafe impl Send for BatchedTransport {}
+
+// Compile-time guard for the `unsafe impl Send` above: the router's send loop
+// is a `Send` Tokio task that owns one `BatchedTransport` across its `.await`
+// points, so a refactor that drops the impl (or adds a `!Send` field) must
+// fail to build right here rather than as an opaque "future is not Send"
+// error deep in the router. The closure is only type-checked, never called.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<BatchedTransport>();
+};
+
 impl BatchedTransport {
     /// Create a new batched transport from a socket file descriptor,
     /// allocating both send-side scratch (iovecs/msgs/addrs) and the
@@ -792,6 +817,64 @@ mod tests {
             "send_batch with {total} packets reported only {sent}; \
              chunking past MAX_BATCH_SIZE = {MAX_BATCH_SIZE} did not run"
         );
+    }
+
+    /// One transport, reused across calls to different targets — the exact
+    /// shape the router's send loop now relies on (it owns a single
+    /// `BatchedTransport` for its lifetime and flushes each dest group
+    /// through it). Each `send_batch` rewrites the iovec/addr scratch from
+    /// scratch, so a single transport must deliver each batch to the right
+    /// peer, in order, with no bleed-through from a prior call's pointers.
+    #[test]
+    fn send_batch_reuses_one_transport_across_targets() {
+        let recv_a = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let recv_b = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let send_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let timeout = std::time::Duration::from_secs(2);
+        // Hard-bound each recv so a misroute (e.g. a stale target from the
+        // previous call) surfaces as a timeout failure, not a hung test.
+        recv_a.set_read_timeout(Some(timeout)).unwrap();
+        recv_b.set_read_timeout(Some(timeout)).unwrap();
+        let addr_a = recv_a.local_addr().unwrap();
+        let addr_b = recv_b.local_addr().unwrap();
+
+        let mut transport = BatchedTransport::new_send_only(send_sock.as_raw_fd());
+
+        // Call 1 → A (two packets), call 2 → B, call 3 → A again. The
+        // interleaving forces the scratch to retarget A→B→A across reuses.
+        assert_eq!(
+            transport
+                .send_batch(
+                    &[Bytes::from_static(b"a1"), Bytes::from_static(b"a2")],
+                    addr_a
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            transport
+                .send_batch(&[Bytes::from_static(b"b1")], addr_b)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            transport
+                .send_batch(&[Bytes::from_static(b"a3")], addr_a)
+                .unwrap(),
+            1
+        );
+
+        // A receives a1, a2, a3 in send order (loopback preserves per-peer
+        // order); B receives exactly b1 — proving the per-call rewrite.
+        let mut buf = [0u8; 16];
+        let recv = |s: &UdpSocket, b: &mut [u8]| {
+            let n = s.recv(b).expect("recv within timeout");
+            b[..n].to_vec()
+        };
+        assert_eq!(&recv(&recv_a, &mut buf)[..], &b"a1"[..]);
+        assert_eq!(&recv(&recv_a, &mut buf)[..], &b"a2"[..]);
+        assert_eq!(&recv(&recv_a, &mut buf)[..], &b"a3"[..]);
+        assert_eq!(&recv(&recv_b, &mut buf)[..], &b"b1"[..]);
     }
 
     /// `recv_batch_blocking` happy path (linux.rs:370-440). The

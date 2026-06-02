@@ -222,6 +222,30 @@ jobs:
           --test dataforts_greedy_e2e
           --test dataforts_gravity_e2e
 
+      # === Scheduled-stream batched drain (Linux sendmmsg send path) ======
+      # The whole NRPC_SEND_LOOP_BATCHING_PLAN gate, in one compile. The
+      # scheduled-stream egress ships packets via the send loop's batched,
+      # group-by-destination drain, which calls `sendmmsg` behind
+      # `cfg(target_os = "linux")` — a block that does not compile on the
+      # macOS dev host, so this Linux job is the gate that actually compiles
+      # AND exercises it. `dataforts` pulls in `net`, so all three drain
+      # tests build under one feature set:
+      #   - send_drain_depth      — floods 16 concurrent scheduled streams,
+      #                             prints the packets/syscall-collapse factor;
+      #   - scheduled_stream      — pins the scheduled-vs-direct routing;
+      #   - scheduled_stream_integrity — fetches blobs over reliable scheduled
+      #     streams and asserts BYTE-FOR-BYTE delivery through the batch path
+      #     (incl. a tiny-send-buffer phase that forces the sendmmsg partial
+      #     -send / EWOULDBLOCK tail), the integrity check the others can't make.
+      # `--no-capture` surfaces the measurement + verified-blob/flush counts.
+      - name: Scheduled-stream batched drain (Linux sendmmsg path)
+        if: ${{ !cancelled() }}
+        run: >
+          cargo nextest run --no-fail-fast --features dataforts --no-capture
+          --test send_drain_depth
+          --test scheduled_stream
+          --test scheduled_stream_integrity
+
       # === Dataforts blob e2e (multi-node + migration) ====================
       # `redex-disk` is required so MeshBlobAdapter can spin up a real
       # on-disk RedEX per node — separate from the in-memory dataforts

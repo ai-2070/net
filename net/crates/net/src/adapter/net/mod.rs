@@ -152,6 +152,13 @@ pub use route::{
     ROUTING_HEADER_SIZE,
 };
 pub use router::{FairScheduler, NetRouter, RouteAction, RouterConfig, RouterError, RouterStats};
+// Send-loop drain instrument (NRPC_SEND_LOOP_BATCHING_PLAN). Re-exported only
+// so the in-repo integration tests (which compile as external crates) can
+// drive it; `#[doc(hidden)]` keeps it out of the crate's documented surface.
+#[doc(hidden)]
+pub use router::{
+    arm_send_drain_histo, send_batch_stats, send_drain_histo_snapshot, send_drain_max,
+};
 pub use session::{NetSession, SessionManager, StreamState, TxAdmit, TxSlotGuard};
 pub use state::{
     CausalChainBuilder, CausalEvent, CausalLink, ChainError, EntityLog, HorizonEncoder, LogError,
