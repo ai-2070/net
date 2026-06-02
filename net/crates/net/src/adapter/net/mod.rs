@@ -189,6 +189,7 @@ pub use transport::{NetSocket, PacketReceiver, PacketSender, ParsedPacket, Socke
 #[doc(hidden)]
 pub use transport::{
     arm_recv_drain_histo, recv_batch_stats, recv_drain_histo_snapshot, recv_drain_max,
+    RECV_DRAIN_BUCKETS,
 };
 
 use async_trait::async_trait;

@@ -30,17 +30,30 @@ use super::protocol::{NetHeader, HEADER_SIZE, MAX_PACKET_SIZE};
 mod recv_instrument {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    static RECV_DRAIN_HISTO: [AtomicU64; 9] = [
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-    ];
+    /// Largest batch a single `recvmmsg` can return — mirrors
+    /// `linux::MAX_BATCH_SIZE`. Kept here as a literal because the instrument
+    /// also compiles off Linux (where the `linux` module is absent) yet must
+    /// still size its buckets; the Linux build statically asserts the two agree
+    /// (see the `const _` check below) so they cannot drift.
+    const RECV_BATCH_CAP: u64 = 64;
+
+    /// Number of histogram buckets: one power-of-two band per reachable batch
+    /// size, so there is no bucket a `recvmmsg` capped at `RECV_BATCH_CAP` can
+    /// never fill. Bucket `i` (`i < RECV_DRAIN_BUCKETS - 1`) counts batches in
+    /// `[2^i, 2^(i+1))`; the final bucket holds `[2^(BUCKETS-1), CAP]`. For
+    /// `CAP = 64` that is 7 buckets (top band `64+`, only 64 reachable).
+    #[doc(hidden)]
+    pub const RECV_DRAIN_BUCKETS: usize = RECV_BATCH_CAP.ilog2() as usize + 1;
+
+    // The instrument's bucket cap must track the kernel batch cap it measures.
+    #[cfg(target_os = "linux")]
+    const _: () = assert!(
+        RECV_BATCH_CAP as usize == super::super::linux::MAX_BATCH_SIZE,
+        "RECV_BATCH_CAP must mirror linux::MAX_BATCH_SIZE",
+    );
+
+    static RECV_DRAIN_HISTO: [AtomicU64; RECV_DRAIN_BUCKETS] =
+        [const { AtomicU64::new(0) }; RECV_DRAIN_BUCKETS];
     static RECV_DRAIN_ARMED: AtomicBool = AtomicBool::new(false);
     static RECV_DRAIN_MAX: AtomicU64 = AtomicU64::new(0);
     static RECV_BATCH_SYSCALLS: AtomicU64 = AtomicU64::new(0);
@@ -53,12 +66,13 @@ mod recv_instrument {
         RECV_DRAIN_ARMED.store(true, Ordering::Relaxed);
     }
 
-    /// Snapshot the recv-batch-size histogram. Index `i` (for `i < 8`) counts
-    /// `recvmmsg` returns whose packet count fell in `[2^i, 2^(i+1))`; index
-    /// `8` is `[256, ∞)`.
+    /// Snapshot the recv-batch-size histogram. Bucket `i`
+    /// (`i < RECV_DRAIN_BUCKETS - 1`) counts `recvmmsg` returns whose packet
+    /// count fell in `[2^i, 2^(i+1))`; the final bucket holds everything from
+    /// `2^(RECV_DRAIN_BUCKETS - 1)` up to the batch cap.
     #[doc(hidden)]
-    pub fn recv_drain_histo_snapshot() -> [u64; 9] {
-        let mut out = [0u64; 9];
+    pub fn recv_drain_histo_snapshot() -> [u64; RECV_DRAIN_BUCKETS] {
+        let mut out = [0u64; RECV_DRAIN_BUCKETS];
         for (i, b) in RECV_DRAIN_HISTO.iter().enumerate() {
             out[i] = b.load(Ordering::Relaxed);
         }
@@ -103,8 +117,8 @@ mod recv_instrument {
         }
         RECV_BATCH_SYSCALLS.fetch_add(1, Ordering::Relaxed);
         RECV_BATCH_PACKETS.fetch_add(packets, Ordering::Relaxed);
-        // floor(log2(packets)), clamped to the top bucket.
-        let bucket = (63 - packets.leading_zeros()).min(8) as usize;
+        // floor(log2(packets)), clamped to the top (open-ended) bucket.
+        let bucket = (63 - packets.leading_zeros()).min(RECV_DRAIN_BUCKETS as u32 - 1) as usize;
         RECV_DRAIN_HISTO[bucket].fetch_add(1, Ordering::Relaxed);
         RECV_DRAIN_MAX.fetch_max(packets, Ordering::Relaxed);
     }
@@ -113,6 +127,7 @@ mod recv_instrument {
 #[cfg(feature = "batched-ingress")]
 pub use recv_instrument::{
     arm_recv_drain_histo, recv_batch_stats, recv_drain_histo_snapshot, recv_drain_max,
+    RECV_DRAIN_BUCKETS,
 };
 
 /// Default receive buffer size (64 MB)
@@ -695,6 +710,29 @@ mod tests {
 
     async fn test_socket(addr: SocketAddr) -> io::Result<NetSocket> {
         NetSocket::with_config(addr, SocketBufferConfig::for_testing()).await
+    }
+
+    /// The recv-batch histogram must size its buckets to exactly the reachable
+    /// batch range — `floor(log2(cap)) + 1` power-of-two bands — so no bucket
+    /// is permanently empty and the cap maps to the final bucket with no clamp
+    /// loss. `recvmmsg` is capped at `linux::MAX_BATCH_SIZE` (= 64), giving 7
+    /// buckets. (Cross-platform: validates the sizing the `record_recv_batch`
+    /// clamp depends on, without needing the Linux-only recv path.)
+    #[cfg(feature = "batched-ingress")]
+    #[test]
+    fn recv_histo_buckets_cover_exactly_the_reachable_range() {
+        const CAP: u64 = 64; // mirrors linux::MAX_BATCH_SIZE (statically asserted in recv_instrument)
+        assert_eq!(
+            RECV_DRAIN_BUCKETS,
+            CAP.ilog2() as usize + 1,
+            "one power-of-two band per reachable batch size"
+        );
+        // A full `CAP`-packet recvmmsg lands in the final bucket via
+        // floor(log2), so the clamp never truncates anything in [1, CAP]...
+        assert_eq!(63 - CAP.leading_zeros(), RECV_DRAIN_BUCKETS as u32 - 1);
+        // ...and one below the cap lands one bucket lower — the bands are tight,
+        // not all collapsed into an oversized top bucket.
+        assert_eq!(63 - (CAP - 1).leading_zeros(), RECV_DRAIN_BUCKETS as u32 - 2);
     }
 
     #[tokio::test]

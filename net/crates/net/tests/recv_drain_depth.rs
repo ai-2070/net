@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use net::adapter::net::{
     arm_recv_drain_histo, recv_batch_stats, recv_drain_histo_snapshot, recv_drain_max,
-    EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig,
+    EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig, RECV_DRAIN_BUCKETS,
 };
 use net::adapter::Adapter; // MeshNode::shutdown for graceful teardown
 use tokio::net::UdpSocket;
@@ -160,18 +160,29 @@ async fn measure_recv_batch_collapse() {
 
 /// Print a bucketed recvmmsg-batch-size histogram, with a lower bound on
 /// packets accounted (sum of count × 2^bucket). Mirrors `send_drain_depth`.
-fn print_histo(title: &str, histo: &[u64; 9], header: &str) {
-    let labels = [
-        "1", "2-3", "4-7", "8-15", "16-31", "32-63", "64-127", "128-255", "256+",
-    ];
+/// Labels are derived from the bucket index so they always match the actual
+/// `RECV_DRAIN_BUCKETS` range — no hand-maintained list claiming bands the
+/// `recvmmsg` cap can never reach.
+fn print_histo(title: &str, histo: &[u64; RECV_DRAIN_BUCKETS], header: &str) {
     let mut total_batches = 0u64;
     let mut weighted = 0u64;
     eprintln!("\n=== recvmmsg batch size: {title} ===");
     eprintln!("  {header}");
-    for (i, label) in labels.iter().enumerate() {
-        let count = histo[i];
+    for (i, &count) in histo.iter().enumerate() {
         total_batches += count;
         weighted += count * (1u64 << i);
+        // Bucket i covers [2^i, 2^(i+1)); the final bucket is open-topped.
+        let lo = 1u64 << i;
+        let label = if i + 1 == RECV_DRAIN_BUCKETS {
+            format!("{lo}+")
+        } else {
+            let hi = (1u64 << (i + 1)) - 1;
+            if lo == hi {
+                format!("{lo}")
+            } else {
+                format!("{lo}-{hi}")
+            }
+        };
         let bar = "#".repeat(count.min(60) as usize);
         eprintln!("  batch {label:>8} : {count:>8}  {bar}");
     }
