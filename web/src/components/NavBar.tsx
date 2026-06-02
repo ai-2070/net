@@ -1,12 +1,12 @@
 import Link from "next/link";
 
 const NAV_LINKS: ReadonlyArray<{ href: string; label: string }> = [
-  { href: "#what", label: "SPEC" },
-  { href: "#bench", label: "BENCH" },
-  { href: "#runtime", label: "RUNTIME" },
-  { href: "#apps", label: "APPS" },
-  { href: "#install", label: "SDKS" },
-  { href: "#wall", label: "BLACKWALL" },
+  { href: "/#what", label: "SPEC" },
+  { href: "/#bench", label: "BENCH" },
+  { href: "/#runtime", label: "RUNTIME" },
+  { href: "/#apps", label: "APPS" },
+  { href: "/#install", label: "SDKS" },
+  { href: "/#wall", label: "BLACKWALL" },
   { href: "/docs", label: "DOCS" },
 ];
 
