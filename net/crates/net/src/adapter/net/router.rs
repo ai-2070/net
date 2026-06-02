@@ -19,6 +19,62 @@ use tokio::sync::Notify;
 use super::protocol::HEADER_SIZE;
 use super::route::{RoutingHeader, RoutingTable, ROUTING_HEADER_SIZE};
 
+// --- Phase 0 instrument (NRPC_SEND_LOOP_BATCHING_PLAN) -------------------
+//
+// Measures the send loop's *drain run-length*: how many packets
+// `scheduler.dequeue()` returns back-to-back before the loop falls through
+// to `wait()`. This is the batchability signal — a sendmmsg drain only pays
+// when runs are long. Off unless `arm_send_drain_histo()` is called BEFORE
+// the send loop starts (the loop latches the flag once at startup), so an
+// unarmed/production loop pays only a stack-local increment. Measurement
+// scaffolding — not intended to ship.
+static SEND_DRAIN_HISTO: [AtomicU64; 9] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static SEND_DRAIN_ARMED: AtomicBool = AtomicBool::new(false);
+static SEND_DRAIN_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// Arm the send-loop drain-run histogram. Must be called BEFORE the
+/// router's send loop starts — the loop reads the flag once at startup.
+pub fn arm_send_drain_histo() {
+    SEND_DRAIN_ARMED.store(true, Ordering::Relaxed);
+}
+
+/// Snapshot the drain-run histogram. Index `i` (for `i < 8`) counts drain
+/// runs whose length fell in `[2^i, 2^(i+1))`; index `8` is `[256, ∞)`.
+pub fn send_drain_histo_snapshot() -> [u64; 9] {
+    let mut out = [0u64; 9];
+    for (i, b) in SEND_DRAIN_HISTO.iter().enumerate() {
+        out[i] = b.load(Ordering::Relaxed);
+    }
+    out
+}
+
+/// Longest single drain run observed so far (exact, not bucketed).
+pub fn send_drain_max() -> u64 {
+    SEND_DRAIN_MAX.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn record_drain_run(run_len: u64) {
+    if run_len == 0 {
+        return;
+    }
+    // floor(log2(run_len)), clamped to the top bucket.
+    let bucket = (63 - run_len.leading_zeros()).min(8) as usize;
+    SEND_DRAIN_HISTO[bucket].fetch_add(1, Ordering::Relaxed);
+    SEND_DRAIN_MAX.fetch_max(run_len, Ordering::Relaxed);
+}
+// ------------------------------------------------------------------------
+
 /// Router configuration
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
@@ -643,9 +699,14 @@ impl NetRouter {
         let drop_counter = self.test_drop_counter.clone();
 
         Some(tokio::spawn(async move {
+            // Phase 0 instrument: latch the arm flag once; when armed, count
+            // how many packets we drain back-to-back before blocking.
+            let measure_drain = SEND_DRAIN_ARMED.load(Ordering::Relaxed);
+            let mut drain_run: u64 = 0;
             while running.load(Ordering::Acquire) {
                 // Dequeue and send
                 if let Some(packet) = scheduler.dequeue() {
+                    drain_run += 1;
                     // Test-only loss injection: drop every Nth packet.
                     let n = drop_every_n.load(Ordering::Relaxed);
                     if n > 0
@@ -658,6 +719,11 @@ impl NetRouter {
                     }
                     let _ = socket.send_to(&packet.data, packet.dest).await;
                 } else {
+                    // Drain run ended — record its length, then block.
+                    if measure_drain {
+                        record_drain_run(drain_run);
+                    }
+                    drain_run = 0;
                     // Wait for new packets (with timeout).
                     //
                     // The `notify_one` → `wait()` pattern is

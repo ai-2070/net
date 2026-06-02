@@ -163,8 +163,8 @@ fd-compatibility unknown. Two real caveats remain, both addressed in Phase 1:
 | Phase | State | Notes |
 |---|---|---|
 | **Lead finding — send loop off the unary path** | ✅ Done (code trace 2026-06-02) | Unary RPC sends bypass the scheduler: `call`→`publish_to_peer`→`socket.send_to` (`mesh.rs:8342`); responses same (`mesh_rpc.rs:1574`). Scheduler send loop drains only `scheduled=true` streams (`mesh.rs:10710`). **Send-loop batching cannot move `nrpc_qps`.** Re-scopes Phases 0/1 to the scheduled-stream egress. |
-| 0 — Measure drain depth on the **scheduled-stream** egress | ☐ Todo | Pointless against `nrpc_qps` (loop sees no unary traffic — that's the finding). Run instead under a **bulk/streaming** workload that sets `scheduled=true`, to size batch N. `total_queued()` is cumulative not depth — use drain run-length (below). |
-| 1 — Batch drain in the scheduled-stream send loop | ☐ Todo | Scope: scheduled streams only. Drain up to N, one `send_batch` (Linux) / `send_to` loop (portable). Loop-owned reusable `BatchedTransport` (single consumer ⇒ no lock, no per-call alloc). Skip-guard needs a NEW `current_depth` atomic — `total_queued()` is cumulative. |
+| 0 — Measure drain depth on the **scheduled-stream** egress | ✅ Done (measured 2026-06-02, macOS) | **Verdict: drain depth ≈ 1 even for a saturated, backpressure-disabled single scheduled stream.** 4,580 / 4,589 drain runs were length 1 (99.8%); longest run 4–7. Producer's per-packet build+encrypt never outruns the loop's per-packet `send_to`. See Findings. |
+| 1 — Batch drain in the scheduled-stream send loop | ✅ Justified by evidence (Result B), ☐ build | Single stream = depth 1 (useless), but **16 concurrent scheduled streams = one 14,720-packet drain run → ~64× syscall cut** with `sendmmsg`. Scope strictly to concurrent scheduled bulk egress. Design below: drain up to N, reusable `BatchedTransport`, `current_depth` guard, `EWOULDBLOCK` fallback. Linux-only win. |
 | 2 — Saturated one-way send bench | ☐ Todo | New `nrpc_send_throughput` (fire-and-forget over a **scheduled stream**, no response await) — the honest home for the 10–20× sendmmsg claim and its regression guard. Keep `nrpc_qps` as the latency story. |
 | 3 — Multi-send-loop option (documented, not built) | ☐ Analysis only | Cross-platform alternative to sendmmsg, but breaks the FairScheduler's advertised property — see hazard below. Treat as scheduler redesign, not drop-in. |
 | — Unary `nrpc_qps` lever (out of scope here) | ➜ Elsewhere | Not send batching. See [`NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md`](NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md) (fewer packets) + batched recv in [`NRPC_QPS_CONCURRENCY_SCALING_PLAN.md`](NRPC_QPS_CONCURRENCY_SCALING_PLAN.md). |
@@ -201,16 +201,72 @@ paying the Linux-`cfg` + `EWOULDBLOCK` surface.
 **Phase 0 exit:** a one-line verdict with the measured run-length distribution
 under bulk streaming + the typical N, recorded in the Status table.
 
+### Findings — 2026-06-02 (macOS, loopback, 4 worker threads)
+
+Instrument: an armed-once drain-run histogram in the send loop
+(`router.rs`, `arm_send_drain_histo` / `send_drain_histo_snapshot`); driver:
+`tests/send_drain_depth.rs`. Workload: 40 bursts × 800 × 1 KiB events on one
+`scheduled=true` stream with `window_bytes=0` (backpressure disabled), batched
+~7 events/packet → **4,600 packets** through the `FairScheduler`.
+
+**Result A — single saturated stream (1 producer), 4,600 packets:**
+
+| drain run-length | count | share |
+|---|---:|---:|
+| **1**       | 4,600 | **100 %** |
+| ≥2          | 0     | 0 % |
+
+`backpressure=0` (never WindowFull, never queue-full) — the *best case* for
+backlog: the producer was never throttled and **still** could not get ahead of
+the drain loop. The producer pays a per-packet `build` (AEAD encrypt of the
+~7-event batch) + credit acquire + retransmit-register *inline* before each
+`enqueue`, which costs ≳ the loop's per-packet `send_to` on loopback — so
+`notify_one` → drain-one → `wait()` runs 1:1 and the queue never accumulates.
+Empirically confirms the in-code aside that "the scheduler queue is shallow in
+practice" (`mesh.rs:10683`). **Single-stream → nothing to batch.**
+
+**Result B — 16 concurrent scheduled streams (16 producers), 14,720 packets,
+no inter-round sleep:**
+
+| drain run-length | count |
+|---|---:|
+| 1 … 255     | 0 |
+| **≥256**    | **1** |
+| **longest single run (exact)** | **14,720 packets** |
+
+With 16 independent producers feeding the one drain loop, the loop **never
+found the queue empty** during the flood — it drained all 14,720 packets in a
+**single continuous run**. This is the FairScheduler's actual purpose (fairness
+across concurrent bulk streams), and it is **exactly the deep-backlog workload
+where `sendmmsg` pays**: at `MAX_BATCH_SIZE = 64`, that one run collapses from
+14,720 `send_to` syscalls to ⌈14720/64⌉ = **230 `sendmmsg` calls — a 64×
+syscall reduction** (plus the matching collapse of send-loop wakeups).
+
+### Verdict matrix
+
+| workload | drain depth | batching? | evidence |
+|---|---|---|---|
+| unary `nrpc_qps` | — (off the send loop) | **No** | code trace (lead finding) |
+| single scheduled stream | **1** | **No** | Result A (measured) |
+| **N concurrent scheduled streams** | **very deep (one 14.7k run)** | **Yes — ~64×** | Result B (measured) |
+
+So the original sendmmsg instinct was **right for a workload nobody had named**
+— concurrent scheduled bulk transfers — and **wrong for the one that prompted
+it** (unary QPS). Phase 1 is **revived but precisely scoped to the concurrent
+scheduled-stream egress**; it must never be pitched against `nrpc_qps` again.
+
 ---
 
 ## Phase 1 — Batch drain in the scheduled-stream send loop
 
-**Scope: the scheduled bulk-transfer / streaming egress only** (the lead finding
-rules out unary). The shape is **conditional skip**: batch when packets are already
-waiting, fall through to single `send_to` when they are not — so a lone scheduled
-packet is unaffected and the win is captured whenever a stream backs up. The two
-details that make it good rather than merely correct are the **depth probe** and
-**transport reuse**.
+**Scope: the *concurrent* scheduled bulk-transfer egress only** — the lead finding
+rules out unary, and Result A rules out the single-stream case (depth 1). The win
+is real only when *multiple* scheduled streams feed the loop concurrently
+(Result B: one 14,720-packet run). The shape is **conditional skip**: batch when
+packets are already waiting, fall through to single `send_to` when they are not —
+so a lone scheduled packet is unaffected and the win is captured whenever
+concurrent producers back the loop up. The two details that make it good rather
+than merely correct are the **depth probe** and **transport reuse**.
 
 > **Correction (verified against HEAD):** the earlier draft proposed guarding on
 > `total_queued() <= 1`. That does not work — `total_queued` is a monotonic
@@ -287,11 +343,14 @@ explicitly wherever the number is quoted so the macOS gap is not a surprise.
 Give the 10–20× sendmmsg claim a workload that actually exercises it, separate
 from the latency bench:
 
-- New bench `nrpc_send_throughput` (or a group in `nrpc_qps.rs`): blast a bulk
-  payload over a **scheduled stream** (`config.scheduled = true`, the only path the
-  send loop drains) fire-and-forget, measure packets/sec drained by the send loop.
-  This is where the per-stream queues back up and `sendmmsg` shows its win — a plain
-  unary fire-and-forget would *still* bypass the loop per the lead finding.
+- New bench `nrpc_send_throughput` (or a group in `nrpc_qps.rs`): blast bulk
+  payloads over **N concurrent scheduled streams** (`config.scheduled = true`, the
+  only path the send loop drains; N ≥ 8 per Result B) fire-and-forget, measure
+  packets/sec drained by the send loop. This is where the loop sustains a deep run
+  and `sendmmsg` shows its win — a *single* stream stays at depth 1 (Result A) and a
+  unary fire-and-forget bypasses the loop entirely (lead finding). The
+  `tests/send_drain_depth.rs` driver already demonstrates the backlog and can seed
+  this bench.
 - Axes: payload `32B`/`1KiB`, batch on/off (so the bench is also the before/after
   for Phase 1).
 - Keep `nrpc_qps` untouched as the latency/round-trip story; document that the two
