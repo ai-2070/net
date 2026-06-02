@@ -1,0 +1,21 @@
+.github/workflows/ci.yml
+  s_d52d14967fa252::t_00d626487c8547 260-264,271
+net/crates/net/tests/recv_drain_depth.rs
+  s_d52d14967fa252::t_64b8bc90683877 1-180
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "4c2bbade7e6cb13ba7087dd94d5d64271a2e3c22",
+  "prompts": {},
+  "sessions": {
+    "s_d52d14967fa252": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9dae3b01-197b-4714-8eb8-ecf2a4c826ff",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
