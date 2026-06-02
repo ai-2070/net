@@ -11,6 +11,125 @@ use tokio::net::UdpSocket;
 
 use super::protocol::{NetHeader, HEADER_SIZE, MAX_PACKET_SIZE};
 
+// --- Recv-loop batching instrument (NRPC_RECV_LOOP_BATCHING_PLAN) --------
+//
+// Symmetric to the send-loop drain instrument in `router.rs`. Measures the
+// receive path's *batch size*: how many packets a single `recvmmsg`
+// (`BatchedTransport::recv_batch`) returned. `packets / syscalls` is the
+// realized ingress syscall-collapse factor — the recv analogue of the send
+// side's packets/flush ratio. Off unless `arm_recv_drain_histo()` is called
+// BEFORE the receive thread starts (the thread latches the flag once at
+// startup), so an unarmed loop does zero recording.
+//
+// Compiled only under the `batched-ingress` build feature — the instrument
+// measures the batched receive path, so when that path isn't built neither is
+// this. Measurement scaffolding, not supported public API: every entry point
+// is `#[doc(hidden)]` and re-exported only so the in-repo integration tests
+// (which compile as external crates) can drive it.
+#[cfg(feature = "batched-ingress")]
+mod recv_instrument {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    /// Largest batch a single `recvmmsg` can return — mirrors
+    /// `linux::MAX_BATCH_SIZE`. Kept here as a literal because the instrument
+    /// also compiles off Linux (where the `linux` module is absent) yet must
+    /// still size its buckets; the Linux build statically asserts the two agree
+    /// (see the `const _` check below) so they cannot drift.
+    const RECV_BATCH_CAP: u64 = 64;
+
+    /// Number of histogram buckets: one power-of-two band per reachable batch
+    /// size, so there is no bucket a `recvmmsg` capped at `RECV_BATCH_CAP` can
+    /// never fill. Bucket `i` (`i < RECV_DRAIN_BUCKETS - 1`) counts batches in
+    /// `[2^i, 2^(i+1))`; the final bucket holds `[2^(BUCKETS-1), CAP]`. For
+    /// `CAP = 64` that is 7 buckets (top band `64+`, only 64 reachable).
+    #[doc(hidden)]
+    pub const RECV_DRAIN_BUCKETS: usize = RECV_BATCH_CAP.ilog2() as usize + 1;
+
+    // The instrument's bucket cap must track the kernel batch cap it measures.
+    #[cfg(target_os = "linux")]
+    const _: () = assert!(
+        RECV_BATCH_CAP as usize == super::super::linux::MAX_BATCH_SIZE,
+        "RECV_BATCH_CAP must mirror linux::MAX_BATCH_SIZE",
+    );
+
+    static RECV_DRAIN_HISTO: [AtomicU64; RECV_DRAIN_BUCKETS] =
+        [const { AtomicU64::new(0) }; RECV_DRAIN_BUCKETS];
+    static RECV_DRAIN_ARMED: AtomicBool = AtomicBool::new(false);
+    static RECV_DRAIN_MAX: AtomicU64 = AtomicU64::new(0);
+    static RECV_BATCH_SYSCALLS: AtomicU64 = AtomicU64::new(0);
+    static RECV_BATCH_PACKETS: AtomicU64 = AtomicU64::new(0);
+
+    /// Arm the recv-batch-size histogram. Must be called BEFORE the receive
+    /// thread starts — the thread reads the flag once at startup.
+    #[doc(hidden)]
+    pub fn arm_recv_drain_histo() {
+        RECV_DRAIN_ARMED.store(true, Ordering::Relaxed);
+    }
+
+    /// Snapshot the recv-batch-size histogram. Bucket `i`
+    /// (`i < RECV_DRAIN_BUCKETS - 1`) counts `recvmmsg` returns whose packet
+    /// count fell in `[2^i, 2^(i+1))`; the final bucket holds everything from
+    /// `2^(RECV_DRAIN_BUCKETS - 1)` up to the batch cap.
+    #[doc(hidden)]
+    pub fn recv_drain_histo_snapshot() -> [u64; RECV_DRAIN_BUCKETS] {
+        let mut out = [0u64; RECV_DRAIN_BUCKETS];
+        for (i, b) in RECV_DRAIN_HISTO.iter().enumerate() {
+            out[i] = b.load(Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// Largest single `recvmmsg` batch observed so far (exact, not bucketed).
+    #[doc(hidden)]
+    pub fn recv_drain_max() -> u64 {
+        RECV_DRAIN_MAX.load(Ordering::Relaxed)
+    }
+
+    /// `(syscalls, packets)` received via the batched-ingress path.
+    /// `packets / syscalls` is the realized recv syscall-collapse factor
+    /// (→ `MAX_BATCH_SIZE` as the socket saturates).
+    #[doc(hidden)]
+    pub fn recv_batch_stats() -> (u64, u64) {
+        (
+            RECV_BATCH_SYSCALLS.load(Ordering::Relaxed),
+            RECV_BATCH_PACKETS.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Latch the arm flag (called once at receive-thread startup, mirroring
+    /// the send loop's `measure_drain`). Only compiled on Linux, the sole
+    /// batched recv path; the per-packet fallback elsewhere has no batch to
+    /// record.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub(super) fn recv_drain_armed() -> bool {
+        RECV_DRAIN_ARMED.load(Ordering::Relaxed)
+    }
+
+    /// Record one non-empty `recvmmsg` batch of `packets` packets. `armed` is
+    /// the value latched at thread startup; when false this is a no-op so the
+    /// production path pays nothing.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub(super) fn record_recv_batch(packets: u64, armed: bool) {
+        if !armed || packets == 0 {
+            return;
+        }
+        RECV_BATCH_SYSCALLS.fetch_add(1, Ordering::Relaxed);
+        RECV_BATCH_PACKETS.fetch_add(packets, Ordering::Relaxed);
+        // floor(log2(packets)), clamped to the top (open-ended) bucket.
+        let bucket = (63 - packets.leading_zeros()).min(RECV_DRAIN_BUCKETS as u32 - 1) as usize;
+        RECV_DRAIN_HISTO[bucket].fetch_add(1, Ordering::Relaxed);
+        RECV_DRAIN_MAX.fetch_max(packets, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "batched-ingress")]
+pub use recv_instrument::{
+    arm_recv_drain_histo, recv_batch_stats, recv_drain_histo_snapshot, recv_drain_max,
+    RECV_DRAIN_BUCKETS,
+};
+
 /// Default receive buffer size (64 MB)
 pub const DEFAULT_RECV_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 
@@ -299,9 +418,40 @@ impl std::fmt::Debug for PacketReceiver {
 /// The underlying `BatchedTransport` contains `!Send` raw pointers, so it
 /// cannot live inside a `tokio::spawn` future. Instead, a dedicated OS thread
 /// owns the transport and sends received packets over a bounded channel.
+///
+/// The channel carries a *whole recvmmsg batch* per message (not one packet
+/// per message): a 64-packet recvmmsg costs one `blocking_send` and one
+/// cross-thread handoff instead of 64, so the per-packet overhead the syscall
+/// batching removed isn't silently re-imposed by the channel. `recv()` drains
+/// the most-recent batch from `pending` front-to-back (preserving arrival
+/// order) before pulling the next batch off the channel, so its
+/// one-packet-at-a-time signature is unchanged.
+///
+/// # Shared by two consumers — the batching applies to both, by design
+///
+/// This type is **not** gated on the `batched-ingress` feature. It backs two
+/// receive loops on Linux:
+///  * `NetAdapter::spawn_receiver` — always, on Linux.
+///  * The mesh receive loop — only when `MeshNodeConfig::batched_ingress` is
+///    set (which additionally requires the `batched-ingress` build feature).
+///
+/// The batch-carrying channel above (and its `RECV_BATCH_CHANNEL_DEPTH`-deep
+/// queue, measured in *batches* not packets) is therefore a deliberate change
+/// to both paths, not just the opt-in mesh one. It is transparent: `recv()`'s
+/// contract (one packet at a time, arrival order) is unchanged, and the
+/// `batched-ingress` instrument is the only feature-gated addition. The depth
+/// change shifts the buffering/backpressure point for `NetAdapter` too — see
+/// `RECV_BATCH_CHANNEL_DEPTH` in `new` for the worst-case bound and why it
+/// preserves the existing flow-control behavior.
 #[cfg(target_os = "linux")]
 pub struct BatchedPacketReceiver {
-    rx: tokio::sync::mpsc::Receiver<(Bytes, SocketAddr)>,
+    rx: tokio::sync::mpsc::Receiver<Vec<(Bytes, SocketAddr)>>,
+    /// Packets from the batch currently being drained, in arrival order. A
+    /// `vec::IntoIter` rather than a `VecDeque` so adopting a freshly received
+    /// batch is a move of the channel's `Vec` (zero element copies); the common
+    /// case is `pending` already exhausted before the next batch arrives, so
+    /// there is nothing to splice and a copy would be pure overhead.
+    pending: std::vec::IntoIter<(Bytes, SocketAddr)>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     _socket: Arc<UdpSocket>,
     _thread: Option<std::thread::JoinHandle<()>>,
@@ -326,7 +476,14 @@ impl BatchedPacketReceiver {
         // Apply high-throughput socket tuning
         let _ = super::linux::configure_socket_for_throughput(fd);
 
-        let (tx, rx) = tokio::sync::mpsc::channel(1024);
+        // Channel depth is in *batches* now, not packets. Worst case it
+        // buffers `RECV_BATCH_CHANNEL_DEPTH * MAX_BATCH_SIZE` packets in front
+        // of the kernel socket buffer; once full, the thread's `blocking_send`
+        // parks, the kernel buffer fills, and existing flow control takes over
+        // (unchanged backpressure). Tune against the c128 measurement — see
+        // NRPC_RECV_LOOP_BATCHING_PLAN.
+        const RECV_BATCH_CHANNEL_DEPTH: usize = 64;
+        let (tx, rx) = tokio::sync::mpsc::channel(RECV_BATCH_CHANNEL_DEPTH);
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_shutdown = shutdown.clone();
 
@@ -349,6 +506,16 @@ impl BatchedPacketReceiver {
                 // when empty) is the design that keeps the shared
                 // socket clean. The `SO_RCVTIMEO` path is gone.
                 let mut transport = super::linux::BatchedTransport::new(fd);
+
+                // Latch the recv instrument once at startup (mirrors the send
+                // loop's `measure_drain`): when armed, each non-empty recvmmsg
+                // records its batch size; when unarmed, recording is a no-op.
+                // Only present under the `batched-ingress` feature (the
+                // instrument it feeds is gated there); this receiver is also
+                // used by NetAdapter without the feature, where it doesn't
+                // record.
+                #[cfg(feature = "batched-ingress")]
+                let measure = recv_instrument::recv_drain_armed();
 
                 // Backoff state for the soft-error path. Pre-fix
                 // the thread spun at 1ms forever on persistent
@@ -378,11 +545,24 @@ impl BatchedPacketReceiver {
                                 std::thread::sleep(std::time::Duration::from_millis(1));
                                 continue;
                             }
-                            for packet in packets {
-                                if tx.blocking_send(packet).is_err() {
-                                    return;
-                                }
+                            // Capture the batch size before the move so it can
+                            // be recorded AFTER a successful handoff: a batch
+                            // dropped because the channel closed mid-teardown is
+                            // never delivered to the consumer, so counting it
+                            // before the send would inflate the syscall/packet
+                            // tallies by the in-flight batch at shutdown.
+                            #[cfg(feature = "batched-ingress")]
+                            let batch_len = packets.len() as u64;
+                            // Hand the whole batch over in a single channel op
+                            // (one cross-thread handoff per recvmmsg, not per
+                            // packet). `recv()` drains it front-to-back.
+                            if tx.blocking_send(packets).is_err() {
+                                return;
                             }
+                            // One non-empty recvmmsg, successfully handed off,
+                            // is one ingress syscall the consumer will observe.
+                            #[cfg(feature = "batched-ingress")]
+                            recv_instrument::record_recv_batch(batch_len, measure);
                         }
                         Err(e) => {
                             if thread_shutdown.load(Ordering::Acquire) {
@@ -429,6 +609,7 @@ impl BatchedPacketReceiver {
 
         Self {
             rx,
+            pending: Vec::new().into_iter(),
             shutdown,
             _socket: socket,
             _thread: Some(thread),
@@ -436,11 +617,33 @@ impl BatchedPacketReceiver {
     }
 
     /// Receive the next packet.
+    ///
+    /// Drains the current batch front-to-back (arrival order) before pulling
+    /// the next recvmmsg batch off the channel, so callers still see one
+    /// packet at a time in the order the kernel delivered them. Returns
+    /// `ConnectionReset` once the receive thread has exited and every buffered
+    /// packet has been handed out.
     pub async fn recv(&mut self) -> io::Result<(Bytes, SocketAddr)> {
-        self.rx
-            .recv()
-            .await
-            .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionReset, "batch receiver closed"))
+        loop {
+            if let Some(packet) = self.pending.next() {
+                return Ok(packet);
+            }
+            match self.rx.recv().await {
+                // The thread only sends non-empty batches; the loop re-checks
+                // `pending` and returns the first packet. (An empty batch, were
+                // one ever sent, yields an empty iterator that loops straight
+                // back to await the next.) The assignment is synchronous right
+                // after the channel yields — no await between taking the batch
+                // and adopting it — so a cancelled `recv()` can't drop packets.
+                Some(batch) => self.pending = batch.into_iter(),
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "batch receiver closed",
+                    ))
+                }
+            }
+        }
     }
 }
 
@@ -449,6 +652,15 @@ impl Drop for BatchedPacketReceiver {
     fn drop(&mut self) {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Release);
+        // Close the channel BEFORE joining. The recv thread only checks
+        // `shutdown` at the top of its loop, so a thread currently parked in
+        // `blocking_send` on a full channel would never see the flag — and the
+        // consumer side (us) is being torn down, so nothing drains the channel
+        // to unblock it. Closing the receiver makes that parked `blocking_send`
+        // return `Err`, on which the thread returns; otherwise `join()` below
+        // deadlocks. (The shutdown store still covers the common case where the
+        // thread is in its idle poll.)
+        self.rx.close();
         if let Some(thread) = self._thread.take() {
             let _ = thread.join();
         }
@@ -515,6 +727,32 @@ mod tests {
 
     async fn test_socket(addr: SocketAddr) -> io::Result<NetSocket> {
         NetSocket::with_config(addr, SocketBufferConfig::for_testing()).await
+    }
+
+    /// The recv-batch histogram must size its buckets to exactly the reachable
+    /// batch range — `floor(log2(cap)) + 1` power-of-two bands — so no bucket
+    /// is permanently empty and the cap maps to the final bucket with no clamp
+    /// loss. `recvmmsg` is capped at `linux::MAX_BATCH_SIZE` (= 64), giving 7
+    /// buckets. (Cross-platform: validates the sizing the `record_recv_batch`
+    /// clamp depends on, without needing the Linux-only recv path.)
+    #[cfg(feature = "batched-ingress")]
+    #[test]
+    fn recv_histo_buckets_cover_exactly_the_reachable_range() {
+        const CAP: u64 = 64; // mirrors linux::MAX_BATCH_SIZE (statically asserted in recv_instrument)
+        assert_eq!(
+            RECV_DRAIN_BUCKETS,
+            CAP.ilog2() as usize + 1,
+            "one power-of-two band per reachable batch size"
+        );
+        // A full `CAP`-packet recvmmsg lands in the final bucket via
+        // floor(log2), so the clamp never truncates anything in [1, CAP]...
+        assert_eq!(63 - CAP.leading_zeros(), RECV_DRAIN_BUCKETS as u32 - 1);
+        // ...and one below the cap lands one bucket lower — the bands are tight,
+        // not all collapsed into an oversized top bucket.
+        assert_eq!(
+            63 - (CAP - 1).leading_zeros(),
+            RECV_DRAIN_BUCKETS as u32 - 2
+        );
     }
 
     #[tokio::test]
@@ -843,6 +1081,19 @@ mod tests {
             3,
             "BatchedPacketReceiver did not deliver three loopback datagrams within 2 s"
         );
+        // Arrival order must be preserved end-to-end: the recv thread fills the
+        // batch in recvmmsg order and `recv()` drains `pending` (a vec::IntoIter)
+        // front-to-back. From a single loopback sender that means the `i` byte
+        // is monotonic 0,1,2 regardless of whether the kernel coalesced the
+        // three into one recvmmsg batch or returned them singly. Guards the
+        // drain-order contract the IngressReceiver relies on.
+        for (k, data) in got.iter().enumerate() {
+            assert_eq!(
+                data[1], k as u8,
+                "BatchedPacketReceiver reordered packets: position {k} carried marker {}",
+                data[1]
+            );
+        }
 
         // Dropping the receiver sets the shutdown AtomicBool and
         // joins the thread. If the loop body doesn't notice the

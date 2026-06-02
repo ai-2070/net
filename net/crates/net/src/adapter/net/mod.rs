@@ -180,6 +180,17 @@ pub use swarm::{
     MAX_GRAPH_NODES, MAX_SEEN_PINGWAVES, PINGWAVE_SIZE,
 };
 pub use transport::{NetSocket, PacketReceiver, PacketSender, ParsedPacket, SocketBufferConfig};
+// Recv-loop batching instrument (NRPC_RECV_LOOP_BATCHING_PLAN), symmetric to
+// the send-side drain instrument. Compiled only under the `batched-ingress`
+// build feature (it measures that path). Re-exported only so the in-repo
+// integration tests can drive it; `#[doc(hidden)]` keeps it off the
+// documented surface.
+#[cfg(feature = "batched-ingress")]
+#[doc(hidden)]
+pub use transport::{
+    arm_recv_drain_histo, recv_batch_stats, recv_drain_histo_snapshot, recv_drain_max,
+    RECV_DRAIN_BUCKETS,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -813,6 +824,12 @@ impl NetAdapter {
     ///
     /// On Linux, uses a dedicated OS thread with batched recvmmsg for up to
     /// 64 packets per syscall. On other platforms, uses standard async recv.
+    ///
+    /// Note: `BatchedPacketReceiver`'s channel carries a whole recvmmsg batch
+    /// per message (depth measured in batches, not packets). That is a shared
+    /// property of the type — see its docstring — and applies here regardless
+    /// of the `batched-ingress` feature, which only gates the mesh opt-in and
+    /// the measurement instrument, not this always-on adapter path.
     #[cfg(target_os = "linux")]
     fn spawn_receiver(
         shutdown: Arc<AtomicBool>,

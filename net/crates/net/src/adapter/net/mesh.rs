@@ -677,6 +677,22 @@ pub struct MeshNodeConfig {
     pub packet_pool_size: usize,
     /// Default reliability mode
     pub default_reliable: bool,
+    /// Use the Linux batched-ingress receive path (`recvmmsg` via a dedicated
+    /// thread + batched channel) for the steady-state receive loop, instead of
+    /// the per-packet `recv_buf_from` path.
+    ///
+    /// **Runtime flag, present only under the `batched-ingress` build feature**
+    /// — the build feature decides whether the batching path is compiled in at
+    /// all; this flag decides whether it's used at runtime. **Default `false`**
+    /// and a no-op off Linux. Batched ingress collapses receive syscalls under
+    /// sustained high-throughput load, but routes every inbound packet through
+    /// a cross-thread channel hop — which can add latency to low-concurrency
+    /// traffic (e.g. nRPC unary) that the per-packet path doesn't pay. Per
+    /// NRPC_RECV_LOOP_BATCHING_PLAN this stays opt-in until the c128 throughput
+    /// and unary-latency measurement justifies flipping the default; the flag
+    /// exists so that measurement can A/B the two paths on the real mesh loop.
+    #[cfg(feature = "batched-ingress")]
+    pub batched_ingress: bool,
     /// Handshake timeout per attempt
     pub handshake_timeout: Duration,
     /// Handshake retries
@@ -852,6 +868,8 @@ impl MeshNodeConfig {
             num_shards: 4,
             packet_pool_size: 64,
             default_reliable: false,
+            #[cfg(feature = "batched-ingress")]
+            batched_ingress: false,
             handshake_timeout: Duration::from_secs(5),
             handshake_retries: 3,
             socket_buffers: SocketBufferConfig::for_testing(),
@@ -916,6 +934,16 @@ impl MeshNodeConfig {
     /// Set number of shards.
     pub fn with_num_shards(mut self, n: u16) -> Self {
         self.num_shards = n;
+        self
+    }
+
+    /// Opt into the Linux batched-ingress receive path. See
+    /// [`MeshNodeConfig::batched_ingress`] for the latency/throughput
+    /// trade-off and why it defaults off. No-op off Linux. Requires the
+    /// `batched-ingress` build feature.
+    #[cfg(feature = "batched-ingress")]
+    pub fn with_batched_ingress(mut self, enabled: bool) -> Self {
+        self.batched_ingress = enabled;
         self
     }
 
@@ -3145,6 +3173,10 @@ impl MeshNode {
         let socket = self.socket.socket_arc();
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
+        // Only read where the batched path can actually run (Linux + feature);
+        // elsewhere the per-packet path is the only option.
+        #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
+        let batched_ingress = self.config.batched_ingress;
 
         let ctx = DispatchCtx {
             local_node_id: self.node_id,
@@ -3211,8 +3243,69 @@ impl MeshNode {
             auth_throttle_duration: self.config.auth_throttle_duration,
         };
 
+        // Local receiver abstraction so the select! loop body below is
+        // written once across the per-packet path and the Linux batched-
+        // ingress path. The `recv()` contract is identical (one packet at a
+        // time, arrival order); only construction differs.
+        enum IngressReceiver {
+            Single(PacketReceiver),
+            #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
+            Batched(super::transport::BatchedPacketReceiver),
+        }
+        impl IngressReceiver {
+            #[inline]
+            async fn recv(&mut self) -> std::io::Result<(Bytes, SocketAddr)> {
+                match self {
+                    IngressReceiver::Single(r) => r.recv().await,
+                    #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
+                    IngressReceiver::Batched(r) => r.recv().await,
+                }
+            }
+
+            /// Whether a `ConnectionReset` from `recv()` means the receiver is
+            /// permanently dead and the loop must stop. True only for the
+            /// batched receiver, whose `recv()` returns `ConnectionReset` once
+            /// its backing thread has exited (and on every call thereafter, so
+            /// looping would busy-spin). For the per-packet receiver a
+            /// `ConnectionReset` is a transient socket error (e.g. an ICMP
+            /// port-unreachable surfaced on the next recv) to log and tolerate.
+            #[inline]
+            fn reset_is_fatal(&self) -> bool {
+                match self {
+                    IngressReceiver::Single(_) => false,
+                    #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
+                    IngressReceiver::Batched(_) => true,
+                }
+            }
+        }
+
         tokio::spawn(async move {
-            let mut receiver = PacketReceiver::new(socket);
+            // Opt-in (default off) batched ingress on Linux; everywhere else,
+            // and when the flag is off, the per-packet path is unchanged. See
+            // MeshNodeConfig::batched_ingress for the latency/throughput
+            // trade-off this gates.
+            let mut receiver = {
+                #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
+                {
+                    if batched_ingress {
+                        IngressReceiver::Batched(super::transport::BatchedPacketReceiver::new(
+                            socket,
+                        ))
+                    } else {
+                        IngressReceiver::Single(PacketReceiver::new(socket))
+                    }
+                }
+                // No batched path here: either not Linux, or the
+                // `batched-ingress` feature isn't built in.
+                #[cfg(not(all(target_os = "linux", feature = "batched-ingress")))]
+                {
+                    IngressReceiver::Single(PacketReceiver::new(socket))
+                }
+            };
+            // A ConnectionReset is fatal only for the batched receiver (its
+            // recv thread died); for the per-packet path it's transient. Decide
+            // once by receiver variant rather than re-checking the flag.
+            let reset_is_fatal = receiver.reset_is_fatal();
 
             while !shutdown.load(Ordering::Acquire) {
                 tokio::select! {
@@ -3220,6 +3313,21 @@ impl MeshNode {
                         match result {
                             Ok((data, source)) => {
                                 Self::dispatch_packet(data, source, &ctx);
+                            }
+                            // Batched receiver: a ConnectionReset means its recv
+                            // thread exited (transport.rs) and every future
+                            // recv() will also fail — stop rather than busy-spin.
+                            // The per-packet path treats it as transient (below).
+                            Err(e)
+                                if reset_is_fatal
+                                    && e.kind() == std::io::ErrorKind::ConnectionReset =>
+                            {
+                                if !shutdown.load(Ordering::Acquire) {
+                                    tracing::warn!(
+                                        "mesh batch receiver thread exited, stopping receiver"
+                                    );
+                                }
+                                break;
                             }
                             Err(e) => {
                                 if !shutdown.load(Ordering::Acquire) {
