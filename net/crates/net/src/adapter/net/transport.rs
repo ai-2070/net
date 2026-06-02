@@ -586,6 +586,15 @@ impl Drop for BatchedPacketReceiver {
     fn drop(&mut self) {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Release);
+        // Close the channel BEFORE joining. The recv thread only checks
+        // `shutdown` at the top of its loop, so a thread currently parked in
+        // `blocking_send` on a full channel would never see the flag — and the
+        // consumer side (us) is being torn down, so nothing drains the channel
+        // to unblock it. Closing the receiver makes that parked `blocking_send`
+        // return `Err`, on which the thread returns; otherwise `join()` below
+        // deadlocks. (The shutdown store still covers the common case where the
+        // thread is in its idle poll.)
+        self.rx.close();
         if let Some(thread) = self._thread.take() {
             let _ = thread.join();
         }
