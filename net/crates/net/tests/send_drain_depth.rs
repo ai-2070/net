@@ -96,7 +96,7 @@ async fn measure_scheduled_stream_drain_depth() {
     const BURST: usize = 800; // < max_queue_depth (1024)
     const ROUNDS: usize = 40;
     let event = Bytes::from(vec![0xABu8; 1024]);
-    let events: Vec<Bytes> = std::iter::repeat(event).take(BURST).collect();
+    let events: Vec<Bytes> = std::iter::repeat_n(event, BURST).collect();
 
     let mut sent_ok = 0usize;
     let mut backpressure = 0usize;
