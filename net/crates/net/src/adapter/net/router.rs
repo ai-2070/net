@@ -806,11 +806,18 @@ impl NetRouter {
             // it can't accumulate a stale entry per peer forever under churn.
             const MAX_DRAIN: usize = 64;
             let mut groups: Vec<(SocketAddr, Vec<Bytes>)> = Vec::new();
-            // Linux-only batched sender over the same socket fd. Constructed
-            // once; `send_batch` allocates its own scratch per call (a known
-            // cost — a loop-owned reusable transport is a follow-up).
+            // Linux-only batched sender over the same socket fd. The send loop
+            // is the socket's sole, single-threaded sender, so it owns one
+            // `BatchedTransport` for its whole lifetime and reuses the iovec /
+            // mmsghdr / sockaddr scratch across every flush — no per-flush
+            // allocation. (`PacketSender::send_batch` builds a fresh transport
+            // each call to stay shareable across concurrent senders; here there
+            // is exactly one sender, so we hold the reusable form directly.)
             #[cfg(target_os = "linux")]
-            let batch_sender = super::transport::PacketSender::new(socket.clone());
+            let mut batch_sender = {
+                use std::os::unix::io::AsRawFd;
+                super::linux::BatchedTransport::new_send_only(socket.as_raw_fd())
+            };
 
             while running.load(Ordering::Acquire) {
                 // Dequeue and send

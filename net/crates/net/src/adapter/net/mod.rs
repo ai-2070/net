@@ -151,9 +151,7 @@ pub use route::{
     AggregateStats, RouteEntry, RouteFlags, RoutingHeader, RoutingTable, SchedulerStreamStats,
     ROUTING_HEADER_SIZE,
 };
-pub use router::{
-    FairScheduler, NetRouter, RouteAction, RouterConfig, RouterError, RouterStats,
-};
+pub use router::{FairScheduler, NetRouter, RouteAction, RouterConfig, RouterError, RouterStats};
 // Send-loop drain instrument (NRPC_SEND_LOOP_BATCHING_PLAN). Re-exported only
 // so the in-repo integration tests (which compile as external crates) can
 // drive it; `#[doc(hidden)]` keeps it out of the crate's documented surface.
