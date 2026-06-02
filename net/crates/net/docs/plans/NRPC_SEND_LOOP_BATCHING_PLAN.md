@@ -164,7 +164,7 @@ fd-compatibility unknown. Two real caveats remain, both addressed in Phase 1:
 |---|---|---|
 | **Lead finding — send loop off the unary path** | ✅ Done (code trace 2026-06-02) | Unary RPC sends bypass the scheduler: `call`→`publish_to_peer`→`socket.send_to` (`mesh.rs:8342`); responses same (`mesh_rpc.rs:1574`). Scheduler send loop drains only `scheduled=true` streams (`mesh.rs:10710`). **Send-loop batching cannot move `nrpc_qps`.** Re-scopes Phases 0/1 to the scheduled-stream egress. |
 | 0 — Measure drain depth on the **scheduled-stream** egress | ✅ Done (measured 2026-06-02, macOS) | **Verdict: drain depth ≈ 1 even for a saturated, backpressure-disabled single scheduled stream.** 4,580 / 4,589 drain runs were length 1 (99.8%); longest run 4–7. Producer's per-packet build+encrypt never outruns the loop's per-packet `send_to`. See Findings. |
-| 1 — Batch drain in the scheduled-stream send loop | ✅ Implemented; portable validated here, **Linux path now CI-gated** | Added `FairScheduler::current_depth` (real depth, vs cumulative `total_queued`); send loop now: depth 0 → single `send_to` (unchanged), else drain ≤64 grouped **by destination** → one `send_batch`/peer (Linux) or per-packet (portable). Measured **64.0 packets/flush = 64× fewer send syscalls**; fairness + grouping + depth unit tests + single-stream fast path green. CI step compiles+runs the `cfg(linux)` sendmmsg path. Remaining gap: delivery-integrity assertion through sendmmsg (see gaps). |
+| 1 — Batch drain in the scheduled-stream send loop | ✅ Implemented & **Linux-validated (CI green)** | Added `FairScheduler::current_depth`; send loop: depth 0 → single `send_to` (unchanged), else drain ≤64 grouped **by destination** → one `send_batch`/peer (Linux) or per-packet (portable). **CI on ubuntu-latest compiled + ran the `cfg(linux)` sendmmsg path: 61.9 packets/`sendmmsg` ≈ 62×** on real syscalls. Fairness + grouping + depth unit tests + single-stream fast path green. Remaining gap: delivery-integrity assertion through sendmmsg (see gaps). |
 | 2 — Saturated one-way send bench | ☐ Todo | New `nrpc_send_throughput` (fire-and-forget over a **scheduled stream**, no response await) — the honest home for the 10–20× sendmmsg claim and its regression guard. Keep `nrpc_qps` as the latency story. |
 | 3 — Multi-send-loop option (documented, not built) | ☐ Analysis only | Cross-platform alternative to sendmmsg, but breaks the FairScheduler's advertised property — see hazard below. Treat as scheduler redesign, not drop-in. |
 | — Unary `nrpc_qps` lever (out of scope here) | ➜ Elsewhere | Not send batching. See [`NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md`](NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md) (fewer packets) + batched recv in [`NRPC_QPS_CONCURRENCY_SCALING_PLAN.md`](NRPC_QPS_CONCURRENCY_SCALING_PLAN.md). |
@@ -385,6 +385,26 @@ from macOS was tried first but is blocked by a `-sys` dep needing
 **What the gate proves:** the Linux block **compiles**, the batch drain **runs**
 on real Linux sockets without panic/error under a 16-stream flood, routing holds,
 and the packets/syscall collapse prints in the log.
+
+#### CI result — 2026-06-02 (Linux / ubuntu-latest) ✅ PASSED
+
+Both tests green; the `cfg(linux)` `sendmmsg` path **compiled and ran**:
+
+- **Single stream:** 4,575 / 4,587 runs length-1 (99.7 %) — depth ≈ 1, identical
+  conclusion to the macOS run. Single stream still has nothing to batch.
+- **16 concurrent streams:** 14,729 packets → **238 flushes → 61.9 packets per
+  `sendmmsg` ≈ 62×** fewer send syscalls — at the theoretical 64 ceiling. The
+  collapse is real on **actual syscalls**, not just the flush-count proxy the
+  macOS run measured.
+- **Platform difference (expected):** macOS drained the flood as *one* continuous
+  14,720-packet run; Linux broke into **5 runs** (longest 3,745). Real `sendmmsg`
+  drains the queue fast enough that the single-consumer loop occasionally catches
+  up and empties between bursts — yet batches still fill to ~62, so the syscall
+  win is undiminished. (Confirms the win comes from *concurrency-driven backlog*,
+  and that a faster consumer shortens runs without shrinking batches.)
+
+So the headline is validated on real hardware: **concurrent scheduled bulk streams
+→ ~62× fewer send syscalls** via the batched group-by-dest drain.
 
 ### Gaps still open
 
