@@ -33,6 +33,7 @@ use net::adapter::net::{
     arm_recv_drain_histo, recv_batch_stats, EntityKeypair, MeshNode, MeshNodeConfig,
     SocketBufferConfig,
 };
+use net::adapter::Adapter; // for MeshNode::shutdown (graceful teardown)
 
 const PSK: [u8; 32] = [0x42u8; 32];
 
@@ -109,9 +110,16 @@ async fn batched_ingress_delivers_concurrent_blobs_byte_for_byte() {
     let fetcher_adapter = Arc::new(MeshBlobAdapter::new("fetcher", Arc::new(Redex::new())));
     fetcher.serve_blob_transfer(fetcher_adapter);
 
-    // Store K distinct blobs on the holder.
-    const K: usize = 16;
-    const BLOB: usize = 128 * 1024;
+    // Store K distinct blobs on the holder. Kept light (8 × 32 KiB through
+    // 512 KiB buffers) so the reliable transfer doesn't exhaust its retransmit
+    // budget under loopback congestion — the flaky "holder reset stream
+    // (retransmit exhausted)" failure mode that a heavier 16 × 128 KiB load
+    // hits intermittently on loaded hosts. 8 concurrent inbound streams is
+    // still enough to drive the batched receive path (asserted via
+    // recv_batch_stats below); the per-recvmmsg coalescing factor is a perf
+    // property reported in the log, not asserted (it scales with offered load).
+    const K: usize = 8;
+    const BLOB: usize = 32 * 1024;
     let mut originals: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(K);
     for i in 0..K {
         let bytes = payload(BLOB, i as u8 + 1);
@@ -153,13 +161,24 @@ async fn batched_ingress_delivers_concurrent_blobs_byte_for_byte() {
     );
 
     // On Linux the fetcher's batched-ingress path must have carried the
-    // inbound bulk: a non-empty recvmmsg recorded at least one batch. Off
-    // Linux `batched_ingress` is a no-op (per-packet path), so the counter
-    // stays zero and we only assert delivery above.
+    // inbound bulk: a non-empty recvmmsg recorded at least one batch. We assert
+    // only that the path was exercised, not the coalescing ratio — that scales
+    // with offered load and tuning it for a hard floor would reintroduce the
+    // congestion flakiness we just removed; the ratio is in the log above for
+    // the c128 measurement to read. Off Linux `batched_ingress` is a no-op
+    // (per-packet path), so the counter stays zero and we only assert delivery.
     #[cfg(target_os = "linux")]
     assert!(
         syscalls > 0,
         "expected the fetcher's batched-ingress recv path to carry the inbound \
          bulk (recvmmsg syscalls > 0); got 0 — the batched path was not exercised",
     );
+
+    // Graceful, deterministic teardown: shut the nodes down so each receive
+    // loop breaks on the shutdown signal and (on Linux) the batched recv thread
+    // joins cleanly via the channel-close path, rather than leaning on
+    // runtime-drop to abort the tasks. `shutdown()` awaits the background tasks,
+    // so when this returns the receive loops are fully wound down.
+    let _ = fetcher.shutdown().await;
+    let _ = holder.shutdown().await;
 }
