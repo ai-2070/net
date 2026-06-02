@@ -133,7 +133,12 @@ async fn run_and_verify(label: &str, k: usize, blob: usize, holder_send_buf: usi
     for t in tasks {
         let (h, original, got) = t.await.expect("join");
         let got = got.unwrap_or_else(|e| panic!("[{label}] fetch {:02x?} failed: {e:?}", &h[..4]));
-        assert_eq!(got.len(), original.len(), "[{label}] blob {:02x?}: length", &h[..4]);
+        assert_eq!(
+            got.len(),
+            original.len(),
+            "[{label}] blob {:02x?}: length",
+            &h[..4]
+        );
         assert!(
             got[..] == original[..],
             "[{label}] blob {:02x?}: CONTENT mismatch through the batched drain",
@@ -141,7 +146,10 @@ async fn run_and_verify(label: &str, k: usize, blob: usize, holder_send_buf: usi
         );
         verified += 1;
     }
-    assert_eq!(verified, k, "[{label}] all {k} blobs must verify byte-for-byte");
+    assert_eq!(
+        verified, k,
+        "[{label}] all {k} blobs must verify byte-for-byte"
+    );
 
     let (f1, p1) = send_batch_stats();
     let (flushes, packets) = (f1 - f0, p1 - p0);

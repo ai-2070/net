@@ -1053,7 +1053,11 @@ mod tests {
         assert!(scheduler.enqueue(mk(0, true)));
         assert_eq!(scheduler.current_depth(), 7);
         assert!(!scheduler.enqueue(mk(0, true))); // priority lane full
-        assert_eq!(scheduler.current_depth(), 7, "rejected enqueue bumped depth");
+        assert_eq!(
+            scheduler.current_depth(),
+            7,
+            "rejected enqueue bumped depth"
+        );
 
         // Drain everything → back to 0.
         let mut drained = 0;
@@ -1101,7 +1105,11 @@ mod tests {
         group_by_dest(&mut groups, c, mk(9));
         assert_eq!(groups.len(), 3, "dest slots persist across drains");
         assert!(groups[0].1.is_empty() && groups[1].1.is_empty());
-        assert_eq!(groups[2].1, vec![mk(9)], "existing slot reused, not duplicated");
+        assert_eq!(
+            groups[2].1,
+            vec![mk(9)],
+            "existing slot reused, not duplicated"
+        );
     }
 
     #[test]
