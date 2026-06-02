@@ -238,6 +238,22 @@ jobs:
           --test dataforts_greedy_e2e
           --test dataforts_gravity_e2e
 
+      # === Scheduled-stream batched-drain integrity (Linux sendmmsg) ======
+      # Verifies bytes shipped through the send loop's batched group-by-dest
+      # drain (NRPC_SEND_LOOP_BATCHING_PLAN) arrive BYTE-FOR-BYTE — the
+      # integrity check `send_drain_depth` cannot make (it is FireAndForget
+      # with a `send_to` fallback, so a silently mis-delivering sendmmsg
+      # passes it). Reliable blob transfer rides `scheduled = true` streams,
+      # so 16 concurrent fetches drive the holder's single send loop into the
+      # batch path; on Linux this exercises the real `sendmmsg` + tail
+      # fallback under end-to-end content verification. `--no-capture`
+      # surfaces the verified-blob / flush counts in the log.
+      - name: Scheduled-stream batched-drain integrity
+        if: ${{ !cancelled() }}
+        run: >
+          cargo nextest run --no-fail-fast --features dataforts --no-capture
+          --test scheduled_stream_integrity
+
       # === Dataforts blob e2e (multi-node + migration) ====================
       # `redex-disk` is required so MeshBlobAdapter can spin up a real
       # on-disk RedEX per node — separate from the in-memory dataforts

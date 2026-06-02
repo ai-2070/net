@@ -164,7 +164,7 @@ fd-compatibility unknown. Two real caveats remain, both addressed in Phase 1:
 |---|---|---|
 | **Lead finding — send loop off the unary path** | ✅ Done (code trace 2026-06-02) | Unary RPC sends bypass the scheduler: `call`→`publish_to_peer`→`socket.send_to` (`mesh.rs:8342`); responses same (`mesh_rpc.rs:1574`). Scheduler send loop drains only `scheduled=true` streams (`mesh.rs:10710`). **Send-loop batching cannot move `nrpc_qps`.** Re-scopes Phases 0/1 to the scheduled-stream egress. |
 | 0 — Measure drain depth on the **scheduled-stream** egress | ✅ Done (measured 2026-06-02, macOS) | **Verdict: drain depth ≈ 1 even for a saturated, backpressure-disabled single scheduled stream.** 4,580 / 4,589 drain runs were length 1 (99.8%); longest run 4–7. Producer's per-packet build+encrypt never outruns the loop's per-packet `send_to`. See Findings. |
-| 1 — Batch drain in the scheduled-stream send loop | ✅ Implemented & **Linux-validated (CI green)** | Added `FairScheduler::current_depth`; send loop: depth 0 → single `send_to` (unchanged), else drain ≤64 grouped **by destination** → one `send_batch`/peer (Linux) or per-packet (portable). **CI on ubuntu-latest compiled + ran the `cfg(linux)` sendmmsg path: 61.9 packets/`sendmmsg` ≈ 62×** on real syscalls. Fairness + grouping + depth unit tests + single-stream fast path green. Remaining gap: delivery-integrity assertion through sendmmsg (see gaps). |
+| 1 — Batch drain in the scheduled-stream send loop | ✅ Implemented & **Linux-validated (CI green)** | Added `FairScheduler::current_depth`; send loop: depth 0 → single `send_to` (unchanged), else drain ≤64 grouped **by destination** → one `send_batch`/peer (Linux) or per-packet (portable). **CI on ubuntu-latest compiled + ran the `cfg(linux)` sendmmsg path: 61.9 packets/`sendmmsg` ≈ 62×** on real syscalls. Fairness + grouping + depth unit tests + single-stream fast path green. **Delivery integrity closed:** `scheduled_stream_integrity` fetches 16 blobs over reliable scheduled streams, asserts byte-for-byte through the batch path (16/16 locally), CI-gated on Linux. Remaining: forced `EWOULDBLOCK`/partial-send fault injection. |
 | 2 — Saturated one-way send bench | ☐ Todo | New `nrpc_send_throughput` (fire-and-forget over a **scheduled stream**, no response await) — the honest home for the 10–20× sendmmsg claim and its regression guard. Keep `nrpc_qps` as the latency story. |
 | 3 — Multi-send-loop option (documented, not built) | ☐ Analysis only | Cross-platform alternative to sendmmsg, but breaks the FairScheduler's advertised property — see hazard below. Treat as scheduler redesign, not drop-in. |
 | — Unary `nrpc_qps` lever (out of scope here) | ➜ Elsewhere | Not send batching. See [`NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md`](NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md) (fewer packets) + batched recv in [`NRPC_QPS_CONCURRENCY_SCALING_PLAN.md`](NRPC_QPS_CONCURRENCY_SCALING_PLAN.md). |
@@ -406,20 +406,35 @@ Both tests green; the `cfg(linux)` `sendmmsg` path **compiled and ran**:
 So the headline is validated on real hardware: **concurrent scheduled bulk streams
 → ~62× fewer send syscalls** via the batched group-by-dest drain.
 
+### Delivery integrity — closed (`scheduled_stream_integrity`, 2026-06-02)
+
+The earlier gap ("a silently mis-delivering sendmmsg would pass `send_drain_depth`
+because it's `FireAndForget` with a `send_to` fallback") is now covered by a
+**reliable** end-to-end integrity test, wired into CI:
+
+- `tests/scheduled_stream_integrity.rs` (`#![cfg(feature = "dataforts")]`):
+  16 blobs fetched concurrently from one holder over **reliable blob transfer**,
+  whose holder-side data rides `scheduled = true` streams
+  (`dataforts/blob/transfer.rs:484`) → the holder's send loop backs up into the
+  **batch path**. Every fetched blob is asserted **byte-for-byte** against its
+  source, and `flushes > 0` asserts the batch path was actually used.
+- **Local result (macOS, portable drain):** `16/16 blobs byte-for-byte`,
+  286 packets in 8 flushes — integrity holds and the batch path is exercised even
+  without real `sendmmsg`.
+- **On Linux CI** the same test runs the real `sendmmsg` + tail-fallback **under
+  content verification**, so a mis-delivering or byte-corrupting batch send now
+  fails the build. Added as the `Scheduled-stream batched-drain integrity` step
+  (`--features dataforts`).
+- Kept light (128 KiB blobs, 512 KiB buffers) so it binds on macOS — unlike
+  `transfer_concurrency` (4 MiB / 8 MiB, `os error 55` on macOS), which stays out
+  of CI.
+
 ### Gaps still open
 
-- **Delivery integrity *through* `sendmmsg` is not asserted.** `send_drain_depth`
-  uses `FireAndForget` and the drain falls back to `send_to` on a `send_batch`
-  error (`unwrap_or(0)` + tail loop), so a *silently mis-delivering* sendmmsg would
-  not fail the test — only a compile error or panic would. A **reliable** scheduled
-  stream that verifies received bytes is needed to prove the batched bytes actually
-  arrive. `transfer_concurrency` is the closest existing integrity test but is
-  **deliberately not in CI** (resource-heavy; can't even bind on macOS,
-  `os error 55`), so it was not wired into the gate. A focused reliable-scheduled
-  -stream integrity test is the right follow-up.
 - **`partial-send tail / `EWOULDBLOCK` fallback** runs only when the kernel
-  back-pressures — the flood may not reliably trigger it in CI. Not separately
-  forced yet.
+  back-pressures — neither the flood nor the integrity test reliably forces it.
+  A fault-injection variant (shrink the send buffer to provoke `EWOULDBLOCK`)
+  would pin it; not done yet.
 
 ### Follow-ups (deferred)
 
