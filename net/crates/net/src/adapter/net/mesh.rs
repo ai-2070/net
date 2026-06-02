@@ -3252,6 +3252,22 @@ impl MeshNode {
                     IngressReceiver::Batched(r) => r.recv().await,
                 }
             }
+
+            /// Whether a `ConnectionReset` from `recv()` means the receiver is
+            /// permanently dead and the loop must stop. True only for the
+            /// batched receiver, whose `recv()` returns `ConnectionReset` once
+            /// its backing thread has exited (and on every call thereafter, so
+            /// looping would busy-spin). For the per-packet receiver a
+            /// `ConnectionReset` is a transient socket error (e.g. an ICMP
+            /// port-unreachable surfaced on the next recv) to log and tolerate.
+            #[inline]
+            fn reset_is_fatal(&self) -> bool {
+                match self {
+                    IngressReceiver::Single(_) => false,
+                    #[cfg(target_os = "linux")]
+                    IngressReceiver::Batched(_) => true,
+                }
+            }
         }
 
         tokio::spawn(async move {
@@ -3276,6 +3292,10 @@ impl MeshNode {
                     IngressReceiver::Single(PacketReceiver::new(socket))
                 }
             };
+            // A ConnectionReset is fatal only for the batched receiver (its
+            // recv thread died); for the per-packet path it's transient. Decide
+            // once by receiver variant rather than re-checking the flag.
+            let reset_is_fatal = receiver.reset_is_fatal();
 
             while !shutdown.load(Ordering::Acquire) {
                 tokio::select! {
@@ -3284,10 +3304,14 @@ impl MeshNode {
                             Ok((data, source)) => {
                                 Self::dispatch_packet(data, source, &ctx);
                             }
-                            // The batched receiver surfaces a dead recv thread
-                            // as ConnectionReset (transport.rs); stop the loop
-                            // rather than spin on a permanently-failing recv.
-                            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                            // Batched receiver: a ConnectionReset means its recv
+                            // thread exited (transport.rs) and every future
+                            // recv() will also fail — stop rather than busy-spin.
+                            // The per-packet path treats it as transient (below).
+                            Err(e)
+                                if reset_is_fatal
+                                    && e.kind() == std::io::ErrorKind::ConnectionReset =>
+                            {
                                 if !shutdown.load(Ordering::Acquire) {
                                     tracing::warn!(
                                         "mesh batch receiver thread exited, stopping receiver"
