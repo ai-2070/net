@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use net::adapter::net::{
-    arm_send_drain_histo, send_drain_histo_snapshot, send_drain_max, EntityKeypair, MeshNode,
-    MeshNodeConfig, SocketBufferConfig, StreamConfig,
+    arm_send_drain_histo, send_batch_stats, send_drain_histo_snapshot, send_drain_max,
+    EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig, StreamConfig,
 };
 
 const TEST_BUFFER_SIZE: usize = 4 * 1024 * 1024;
@@ -159,6 +159,12 @@ async fn measure_scheduled_stream_drain_depth() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let histo_multi_total = send_drain_histo_snapshot();
+    let (flushes, batched_packets) = send_batch_stats();
+    let avg_batch = if flushes > 0 {
+        batched_packets as f64 / flushes as f64
+    } else {
+        0.0
+    };
     print_histo(
         &format!("{STREAMS} concurrent scheduled streams ({STREAMS} producers)"),
         &histo_multi_total,
@@ -168,6 +174,12 @@ async fn measure_scheduled_stream_drain_depth() {
             scheduler.total_queued(),
             send_drain_max(),
         ),
+    );
+    eprintln!(
+        "  batched-drain path: {flushes} flushes (= sendmmsg syscalls on Linux) for \
+         {batched_packets} packets  =>  avg {avg_batch:.1} packets/syscall \
+         ({:.0}x fewer send syscalls)\n",
+        avg_batch.max(1.0),
     );
 
     let total_runs: u64 = histo_single.iter().sum();

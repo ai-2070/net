@@ -164,7 +164,7 @@ fd-compatibility unknown. Two real caveats remain, both addressed in Phase 1:
 |---|---|---|
 | **Lead finding — send loop off the unary path** | ✅ Done (code trace 2026-06-02) | Unary RPC sends bypass the scheduler: `call`→`publish_to_peer`→`socket.send_to` (`mesh.rs:8342`); responses same (`mesh_rpc.rs:1574`). Scheduler send loop drains only `scheduled=true` streams (`mesh.rs:10710`). **Send-loop batching cannot move `nrpc_qps`.** Re-scopes Phases 0/1 to the scheduled-stream egress. |
 | 0 — Measure drain depth on the **scheduled-stream** egress | ✅ Done (measured 2026-06-02, macOS) | **Verdict: drain depth ≈ 1 even for a saturated, backpressure-disabled single scheduled stream.** 4,580 / 4,589 drain runs were length 1 (99.8%); longest run 4–7. Producer's per-packet build+encrypt never outruns the loop's per-packet `send_to`. See Findings. |
-| 1 — Batch drain in the scheduled-stream send loop | ✅ Justified by evidence (Result B), ☐ build | Single stream = depth 1 (useless), but **16 concurrent scheduled streams = one 14,720-packet drain run → ~64× syscall cut** with `sendmmsg`. Scope strictly to concurrent scheduled bulk egress. Design below: drain up to N, reusable `BatchedTransport`, `current_depth` guard, `EWOULDBLOCK` fallback. Linux-only win. |
+| 1 — Batch drain in the scheduled-stream send loop | ✅ Implemented; portable path validated, **Linux path unvalidated on this host** | Added `FairScheduler::current_depth` (real depth, vs cumulative `total_queued`); send loop now: depth 0 → single `send_to` (unchanged), else drain ≤64 grouped **by destination** → one `send_batch`/peer (Linux) or per-packet (portable). Measured **64.0 packets/flush = 64× fewer send syscalls** on the 16-stream workload; fairness suite + single-stream fast path green. See Phase 1 results + gaps. |
 | 2 — Saturated one-way send bench | ☐ Todo | New `nrpc_send_throughput` (fire-and-forget over a **scheduled stream**, no response await) — the honest home for the 10–20× sendmmsg claim and its regression guard. Keep `nrpc_qps` as the latency story. |
 | 3 — Multi-send-loop option (documented, not built) | ☐ Analysis only | Cross-platform alternative to sendmmsg, but breaks the FairScheduler's advertised property — see hazard below. Treat as scheduler redesign, not drop-in. |
 | — Unary `nrpc_qps` lever (out of scope here) | ➜ Elsewhere | Not send batching. See [`NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md`](NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md) (fewer packets) + batched recv in [`NRPC_QPS_CONCURRENCY_SCALING_PLAN.md`](NRPC_QPS_CONCURRENCY_SCALING_PLAN.md). |
@@ -328,6 +328,61 @@ loop:
 
 This is the lever the original sendmmsg suggestion was reaching for — correctly
 scoped to where backlog exists, not to unary `nrpc_qps`.
+
+### Design constraint discovered during build: batch is **per-destination**
+
+`PacketSender::send_batch` / `BatchedTransport::send_batch` take a **single**
+`target: SocketAddr` for the whole call (`linux.rs:144`, all packets → one
+`sockaddr`; also rejects IPv6 with `Unsupported`). But the scheduler interleaves
+streams that may target **different peers**, so a drained batch can be mixed-dest.
+The drain therefore **groups the drained packets by destination** and issues one
+`send_batch` per peer. Per-stream ordering is preserved (packets to the same peer
+keep dequeue order; the receiver demuxes by `stream_id`). When all concurrent
+streams target one peer (the common bulk-fan-in case) there is exactly one group
+and batches fill to 64.
+
+### Phase 1 results — 2026-06-02 (macOS, portable path)
+
+Implemented: `FairScheduler::current_depth` (enqueue `+1`, every successful pop
+`-1`, `router.rs`); send loop reworked to depth-0 fast path + group-by-dest drain
+(≤64) with a loop-owned reusable `groups` buffer; Linux `send_batch` per group
+with async tail fallback behind `cfg(target_os="linux")`; portable per-packet
+path elsewhere. Re-running the Phase 0 driver:
+
+- **Single stream:** 4,600/4,600 still depth-1 → **100 % on the fast path**, zero
+  behavior change (verified by the histogram, unchanged from before).
+- **16 concurrent streams:** 14,720 packets → **230 flushes → exactly 64.0
+  packets/flush = 64× fewer send syscalls** (one `sendmmsg` per flush on Linux).
+- **Fairness suite green:** `test_fair_scheduler_*`,
+  `round_robin_idx_advances_only_on_successful_pop` (#31 pin),
+  `test_fair_scheduler_respects_stream_weight`, `*_priority`, `*_no_starvation`,
+  `*_cleanup_called` — all pass. `scheduled_stream` routing test passes.
+
+### Gaps — NOT yet validated (require a Linux host / CI)
+
+- **The actual `sendmmsg` syscall path is `cfg(target_os="linux")`** — it does not
+  compile or run on this macOS host. The 64× is the *measured group/flush count*
+  (exactly what becomes sendmmsg calls on Linux), but the syscall itself, the
+  partial-send tail fallback, and `EWOULDBLOCK` handling are **unexercised here.**
+  Must run the driver + `transfer_concurrency` on Linux before merge.
+- **Reliable-bulk end-to-end integrity through the batch path** is unverified on
+  this host: `transfer_concurrency` (the data-integrity + retransmit test) **cannot
+  bind** on macOS (`os error 55`, large `SO_*BUF`) — fails identically with and
+  without this change, so it neither validates nor regresses here.
+- **`current_depth` accounting under drops:** `enqueue` returning `false`
+  (queue/priority full) correctly does *not* increment; every `Some` return from
+  `dequeue` decrements. A focused unit test asserting depth returns to 0 after
+  enqueue/drain cycles would lock this in (TODO).
+
+### Follow-ups (deferred)
+
+- **Loop-owned reusable `BatchedTransport`** instead of `PacketSender::send_batch`
+  (which rebuilds 3 × `Vec::with_capacity(64)` per call, `transport.rs:492-496`).
+  The single-consumer send loop can own one `mut BatchedTransport` — no lock. Skipped
+  in v1 to reuse the already-tested wrapper and shrink the untested Linux surface.
+- **Prune stale dest slots** in `groups` (currently grows to the active-peer set).
+- **Wakeup collapse** (the 51 % `NtWaitForAlertByThreadId` bucket) is a *latency*
+  win the batch drain also enables but this plan does not measure.
 
 ### Cross-platform
 

@@ -73,6 +73,49 @@ fn record_drain_run(run_len: u64) {
     SEND_DRAIN_HISTO[bucket].fetch_add(1, Ordering::Relaxed);
     SEND_DRAIN_MAX.fetch_max(run_len, Ordering::Relaxed);
 }
+
+// One flush = one destination group sent in a drain = one `sendmmsg`
+// syscall on Linux. The packets/flush ratio is the syscall-collapse factor.
+static SEND_BATCH_FLUSHES: AtomicU64 = AtomicU64::new(0);
+static SEND_BATCH_PACKETS: AtomicU64 = AtomicU64::new(0);
+
+/// `(flushes, packets)` sent via the batched-drain path. `packets / flushes`
+/// is the realized syscall-collapse factor (≈ `MAX_BATCH_SIZE` when full).
+pub fn send_batch_stats() -> (u64, u64) {
+    (
+        SEND_BATCH_FLUSHES.load(Ordering::Relaxed),
+        SEND_BATCH_PACKETS.load(Ordering::Relaxed),
+    )
+}
+
+#[inline]
+fn record_batch_flush(packets: u64) {
+    SEND_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed);
+    SEND_BATCH_PACKETS.fetch_add(packets, Ordering::Relaxed);
+}
+
+/// Append `data` to the destination group for `dest`, creating the group if
+/// this is the first packet for that peer in the current drain. Linear scan
+/// over `groups` — fine, since the distinct-peer count per drain is small.
+#[inline]
+fn group_by_dest(groups: &mut Vec<(SocketAddr, Vec<Bytes>)>, dest: SocketAddr, data: Bytes) {
+    match groups.iter_mut().find(|(d, _)| *d == dest) {
+        Some((_, v)) => v.push(data),
+        None => groups.push((dest, vec![data])),
+    }
+}
+
+/// Test-only loss injection shared by the single and batched send paths:
+/// returns `true` when this packet should be dropped (every Nth, `n > 0`).
+#[inline]
+fn drop_injected(drop_every_n: &AtomicU64, drop_counter: &AtomicU64) -> bool {
+    let n = drop_every_n.load(Ordering::Relaxed);
+    n > 0
+        && drop_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
+            .is_multiple_of(n)
+}
 // ------------------------------------------------------------------------
 
 /// Router configuration
@@ -218,6 +261,12 @@ pub struct FairScheduler {
     /// trigger. Decoupled from `round_robin_idx` so the rotation fix
     /// doesn't accidentally suppress cleanup.
     dequeue_call_count: AtomicU64,
+    /// **Current** in-queue packet count (enqueued minus dequeued),
+    /// across the priority lane and all per-stream queues. Unlike
+    /// `total_queued` (a cumulative enqueue counter that never
+    /// decrements), this reflects live backlog — the send loop reads it
+    /// to decide whether a batched drain is worthwhile.
+    current_depth: AtomicU64,
 }
 
 impl FairScheduler {
@@ -233,6 +282,7 @@ impl FairScheduler {
             total_dropped: AtomicU64::new(0),
             round_robin_idx: AtomicU64::new(0),
             dequeue_call_count: AtomicU64::new(0),
+            current_depth: AtomicU64::new(0),
         }
     }
 
@@ -255,6 +305,7 @@ impl FairScheduler {
             // Priority packets bypass fair scheduling
             if self.priority_queue.push(packet).is_ok() {
                 self.total_queued.fetch_add(1, Ordering::Relaxed);
+                self.current_depth.fetch_add(1, Ordering::Relaxed);
                 self.notify.notify_one();
                 return true;
             }
@@ -268,6 +319,7 @@ impl FairScheduler {
 
             if queue.push(packet).is_ok() {
                 self.total_queued.fetch_add(1, Ordering::Relaxed);
+                self.current_depth.fetch_add(1, Ordering::Relaxed);
                 self.notify.notify_one();
                 return true;
             }
@@ -294,6 +346,7 @@ impl FairScheduler {
 
         // Priority queue first
         if let Some(packet) = self.priority_queue.pop() {
+            self.current_depth.fetch_sub(1, Ordering::Relaxed);
             return Some(packet);
         }
 
@@ -330,6 +383,7 @@ impl FairScheduler {
                 if queue.sent_this_round() < stream_quantum && !queue.is_empty() {
                     if let Some(packet) = queue.pop() {
                         queue.increment_sent();
+                        self.current_depth.fetch_sub(1, Ordering::Relaxed);
                         // Advance the rotation cursor only on
                         // successful pop.
                         self.round_robin_idx.fetch_add(1, Ordering::Relaxed);
@@ -363,6 +417,7 @@ impl FairScheduler {
                 if let Some(queue) = self.streams.get(&key) {
                     if let Some(packet) = queue.pop() {
                         queue.increment_sent();
+                        self.current_depth.fetch_sub(1, Ordering::Relaxed);
                         self.round_robin_idx.fetch_add(1, Ordering::Relaxed);
                         return Some(packet);
                     }
@@ -376,6 +431,13 @@ impl FairScheduler {
     /// Wait for new packets
     pub async fn wait(&self) {
         self.notify.notified().await;
+    }
+
+    /// Current live backlog: packets enqueued but not yet dequeued,
+    /// summed across the priority lane and all per-stream queues.
+    /// Distinct from [`Self::total_queued`], which only counts upward.
+    pub fn current_depth(&self) -> u64 {
+        self.current_depth.load(Ordering::Relaxed)
     }
 
     /// Get total queued count
@@ -703,21 +765,86 @@ impl NetRouter {
             // how many packets we drain back-to-back before blocking.
             let measure_drain = SEND_DRAIN_ARMED.load(Ordering::Relaxed);
             let mut drain_run: u64 = 0;
+
+            // Batched-drain scratch (Phase 1, NRPC_SEND_LOOP_BATCHING_PLAN).
+            // When the scheduler has a backlog, drain up to MAX_DRAIN packets
+            // and ship them grouped by destination — one `sendmmsg` per peer
+            // on Linux, falling back to per-packet `send_to` elsewhere. The
+            // `groups` Vec (and its inner Vecs) is reused across drains to
+            // avoid per-drain allocation; only the dest set grows, bounded by
+            // the number of active peers.
+            const MAX_DRAIN: usize = 64;
+            let mut groups: Vec<(SocketAddr, Vec<Bytes>)> = Vec::new();
+            // Linux-only batched sender over the same socket fd. Constructed
+            // once; `send_batch` allocates its own scratch per call (a known
+            // cost — a loop-owned reusable transport is a follow-up).
+            #[cfg(target_os = "linux")]
+            let batch_sender = super::transport::PacketSender::new(socket.clone());
+
             while running.load(Ordering::Acquire) {
                 // Dequeue and send
-                if let Some(packet) = scheduler.dequeue() {
+                if let Some(first) = scheduler.dequeue() {
                     drain_run += 1;
-                    // Test-only loss injection: drop every Nth packet.
-                    let n = drop_every_n.load(Ordering::Relaxed);
-                    if n > 0
-                        && drop_counter
-                            .fetch_add(1, Ordering::Relaxed)
-                            .wrapping_add(1)
-                            .is_multiple_of(n)
-                    {
-                        continue; // simulated drop — never hits the wire
+
+                    // Fast path: nothing else queued → send this one packet
+                    // directly, exactly as before. Keeps depth-≤1 traffic
+                    // (single scheduled stream, sparse sends) on the original
+                    // zero-overhead path. Guarded by the live `current_depth`.
+                    if scheduler.current_depth() == 0 {
+                        if !drop_injected(&drop_every_n, &drop_counter) {
+                            let _ = socket.send_to(&first.data, first.dest).await;
+                        }
+                        continue;
                     }
-                    let _ = socket.send_to(&packet.data, packet.dest).await;
+
+                    // Backlog present → batched drain. Reset the per-dest
+                    // buffers (keep the dest slots), then group up to MAX_DRAIN.
+                    for (_, v) in groups.iter_mut() {
+                        v.clear();
+                    }
+                    if !drop_injected(&drop_every_n, &drop_counter) {
+                        group_by_dest(&mut groups, first.dest, first.data);
+                    }
+                    let mut drained = 1usize;
+                    while drained < MAX_DRAIN {
+                        match scheduler.dequeue() {
+                            Some(p) => {
+                                drain_run += 1;
+                                drained += 1;
+                                if !drop_injected(&drop_every_n, &drop_counter) {
+                                    group_by_dest(&mut groups, p.dest, p.data);
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+
+                    // Flush each destination group: one batched syscall per
+                    // peer on Linux, per-packet send elsewhere.
+                    for (dest, data) in groups.iter() {
+                        if data.is_empty() {
+                            continue;
+                        }
+                        #[cfg(target_os = "linux")]
+                        {
+                            // sendmmsg the group; async-send any unsent tail
+                            // (partial send / EWOULDBLOCK) so we preserve
+                            // backpressure rather than dropping or spinning.
+                            let sent = batch_sender.send_batch(data, *dest).unwrap_or(0);
+                            for d in &data[sent..] {
+                                let _ = socket.send_to(d, *dest).await;
+                            }
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            for d in data {
+                                let _ = socket.send_to(d, *dest).await;
+                            }
+                        }
+                        if measure_drain {
+                            record_batch_flush(data.len() as u64);
+                        }
+                    }
                 } else {
                     // Drain run ended — record its length, then block.
                     if measure_drain {
@@ -893,6 +1020,52 @@ mod tests {
             counts[stream as usize] += 1;
         }
         assert_eq!(counts, [4, 4, 4]);
+    }
+
+    #[test]
+    fn current_depth_tracks_live_backlog_and_returns_to_zero() {
+        // `total_queued` is cumulative; `current_depth` must reflect the
+        // live backlog (enqueued − dequeued) across the priority lane and
+        // per-stream queues, and a rejected enqueue must not bump it.
+        let scheduler = FairScheduler::new(2, 4); // per-queue cap = 4
+        let mk = |stream_id: u64, priority: bool| QueuedPacket {
+            data: Bytes::from(vec![0u8; 32]),
+            dest: "127.0.0.1:9000".parse().unwrap(),
+            stream_id,
+            priority,
+            queued_at: Instant::now(),
+        };
+
+        assert_eq!(scheduler.current_depth(), 0);
+
+        // 3 on a stream + 2 on the priority lane → depth 5.
+        for _ in 0..3 {
+            assert!(scheduler.enqueue(mk(1, false)));
+        }
+        for _ in 0..2 {
+            assert!(scheduler.enqueue(mk(0, true)));
+        }
+        assert_eq!(scheduler.current_depth(), 5);
+
+        // Overflow the priority lane (cap 4): two pushes succeed (already
+        // had 2), the 5th is rejected and must NOT change depth.
+        assert!(scheduler.enqueue(mk(0, true)));
+        assert!(scheduler.enqueue(mk(0, true)));
+        assert_eq!(scheduler.current_depth(), 7);
+        assert!(!scheduler.enqueue(mk(0, true))); // priority lane full
+        assert_eq!(scheduler.current_depth(), 7, "rejected enqueue bumped depth");
+
+        // Drain everything → back to 0.
+        let mut drained = 0;
+        while scheduler.dequeue().is_some() {
+            drained += 1;
+        }
+        assert_eq!(drained, 7);
+        assert_eq!(scheduler.current_depth(), 0, "depth did not return to zero");
+
+        // total_queued stays cumulative (7 successful enqueues), unchanged
+        // by draining — the contrast the new counter exists to provide.
+        assert_eq!(scheduler.total_queued(), 7);
     }
 
     #[test]
