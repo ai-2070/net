@@ -869,9 +869,15 @@ impl NetRouter {
                         }
                         #[cfg(target_os = "linux")]
                         {
-                            // sendmmsg the group; async-send any unsent tail
-                            // (partial send / EWOULDBLOCK) so we preserve
-                            // backpressure rather than dropping or spinning.
+                            // `send_batch` is a synchronous `sendmmsg` on the
+                            // socket's non-blocking fd — it returns immediately
+                            // (filling the kernel buffer, then partial /
+                            // EWOULDBLOCK), so it does NOT block the worker and
+                            // must not be moved to `spawn_blocking`. The async
+                            // `send_to` below ships any unsent tail (partial
+                            // send / EWOULDBLOCK), which re-registers the waker
+                            // so we preserve backpressure rather than dropping
+                            // or spinning.
                             let sent = batch_sender.send_batch(data, *dest).unwrap_or(0);
                             for d in &data[sent..] {
                                 let _ = socket.send_to(d, *dest).await;
