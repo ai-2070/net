@@ -1,0 +1,22 @@
+net/crates/net/tests/batched_ingress_integrity.rs
+  s_d52d14967fa252::t_734073d03003f3 113-122
+  s_d52d14967fa252::t_78601f185463ac 36
+  s_d52d14967fa252::t_78fb3033eb16e9 176-183
+  s_d52d14967fa252::t_081418505a02a0 164-169
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "a1f7b6762854d8bfa8195e03aedee06f2779c25a",
+  "prompts": {},
+  "sessions": {
+    "s_d52d14967fa252": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9dae3b01-197b-4714-8eb8-ecf2a4c826ff",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
