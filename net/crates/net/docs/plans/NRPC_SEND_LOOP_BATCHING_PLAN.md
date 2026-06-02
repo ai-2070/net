@@ -448,8 +448,8 @@ rides along.
 ### Gaps still open
 
 *(none material — all paths exercised; remaining work is the deferred follow-ups
-below: reusable `BatchedTransport`, stale-slot pruning, wakeup-collapse latency
-measurement.)*
+below: reusable `BatchedTransport` and wakeup-collapse latency measurement.
+Stale-slot pruning is now done — see follow-ups.)*
 
 ### Follow-ups (deferred)
 
@@ -457,7 +457,12 @@ measurement.)*
   (which rebuilds 3 × `Vec::with_capacity(64)` per call, `transport.rs:492-496`).
   The single-consumer send loop can own one `mut BatchedTransport` — no lock. Skipped
   in v1 to reuse the already-tested wrapper and shrink the untested Linux surface.
-- **Prune stale dest slots** in `groups` (currently grows to the active-peer set).
+- ~~**Prune stale dest slots** in `groups`~~ — **done** (`reset_dest_groups`):
+  the dest-slot set was growing monotonically (one slot per peer ever seen) under
+  peer churn, inflating memory and the linear `group_by_dest` scan (flagged in
+  review). Reset now keeps slot reuse for the hot path but drops the whole set
+  once it exceeds `MAX_DRAIN`, so it stays at `cap + 1` worst case. Pinned by
+  `reset_dest_groups_stays_bounded_under_peer_churn`.
 - **Wakeup collapse** (the 51 % `NtWaitForAlertByThreadId` bucket) is a *latency*
   win the batch drain also enables but this plan does not measure.
 

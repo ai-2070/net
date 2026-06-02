@@ -96,12 +96,32 @@ fn record_batch_flush(packets: u64) {
 
 /// Append `data` to the destination group for `dest`, creating the group if
 /// this is the first packet for that peer in the current drain. Linear scan
-/// over `groups` — fine, since the distinct-peer count per drain is small.
+/// over `groups` — fine, since the distinct-peer count per drain is small
+/// (and bounded by `reset_dest_groups`).
 #[inline]
 fn group_by_dest(groups: &mut Vec<(SocketAddr, Vec<Bytes>)>, dest: SocketAddr, data: Bytes) {
     match groups.iter_mut().find(|(d, _)| *d == dest) {
         Some((_, v)) => v.push(data),
         None => groups.push((dest, vec![data])),
+    }
+}
+
+/// Reset the per-destination group buffers between drains. Reuses the slots
+/// (and their grown inner-Vec capacity) to avoid reallocating on the send
+/// hot path, but drops the whole set once it exceeds `cap` so the dest set
+/// cannot grow without bound under peer churn — a node that sends to many
+/// distinct peers over its lifetime would otherwise keep a stale slot per
+/// peer forever, inflating memory and the linear `group_by_dest` scan. One
+/// drain touches at most `cap` (`MAX_DRAIN`) dests, so the bounded set stays
+/// at `cap + 1` worst case.
+#[inline]
+fn reset_dest_groups(groups: &mut Vec<(SocketAddr, Vec<Bytes>)>, cap: usize) {
+    if groups.len() > cap {
+        groups.clear();
+    } else {
+        for (_, v) in groups.iter_mut() {
+            v.clear();
+        }
     }
 }
 
@@ -770,9 +790,10 @@ impl NetRouter {
             // When the scheduler has a backlog, drain up to MAX_DRAIN packets
             // and ship them grouped by destination — one `sendmmsg` per peer
             // on Linux, falling back to per-packet `send_to` elsewhere. The
-            // `groups` Vec (and its inner Vecs) is reused across drains to
-            // avoid per-drain allocation; only the dest set grows, bounded by
-            // the number of active peers.
+            // `groups` holds one (dest, packets) slot per peer touched in a
+            // drain. Inner Vecs are reused across drains to avoid reallocating
+            // on the hot path; the slot set is bounded on reset (see below) so
+            // it can't accumulate a stale entry per peer forever under churn.
             const MAX_DRAIN: usize = 64;
             let mut groups: Vec<(SocketAddr, Vec<Bytes>)> = Vec::new();
             // Linux-only batched sender over the same socket fd. Constructed
@@ -798,10 +819,8 @@ impl NetRouter {
                     }
 
                     // Backlog present → batched drain. Reset the per-dest
-                    // buffers (keep the dest slots), then group up to MAX_DRAIN.
-                    for (_, v) in groups.iter_mut() {
-                        v.clear();
-                    }
+                    // buffers for this drain (bounded — see `reset_dest_groups`).
+                    reset_dest_groups(&mut groups, MAX_DRAIN);
                     if !drop_injected(&drop_every_n, &drop_counter) {
                         group_by_dest(&mut groups, first.dest, first.data);
                     }
@@ -1109,6 +1128,27 @@ mod tests {
             groups[2].1,
             vec![mk(9)],
             "existing slot reused, not duplicated"
+        );
+    }
+
+    #[test]
+    fn reset_dest_groups_stays_bounded_under_peer_churn() {
+        // Regression for the unbounded dest-slot cache: simulate many drains,
+        // each to a brand-new peer (worst-case churn). Without the cap the slot
+        // set would grow to one entry per peer ever seen (here 500); the
+        // bounded reset must keep it at `cap + 1`.
+        const CAP: usize = 64;
+        let mut groups: Vec<(SocketAddr, Vec<Bytes>)> = Vec::new();
+        let mut max_len = 0usize;
+        for port in 0u16..500 {
+            reset_dest_groups(&mut groups, CAP);
+            let dest: SocketAddr = format!("127.0.0.1:{}", port + 1).parse().unwrap();
+            group_by_dest(&mut groups, dest, Bytes::from_static(b"x"));
+            max_len = max_len.max(groups.len());
+        }
+        assert!(
+            max_len <= CAP + 1,
+            "dest-group set must stay bounded under churn; peaked at {max_len}",
         );
     }
 
