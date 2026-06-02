@@ -824,6 +824,12 @@ impl NetAdapter {
     ///
     /// On Linux, uses a dedicated OS thread with batched recvmmsg for up to
     /// 64 packets per syscall. On other platforms, uses standard async recv.
+    ///
+    /// Note: `BatchedPacketReceiver`'s channel carries a whole recvmmsg batch
+    /// per message (depth measured in batches, not packets). That is a shared
+    /// property of the type — see its docstring — and applies here regardless
+    /// of the `batched-ingress` feature, which only gates the mesh opt-in and
+    /// the measurement instrument, not this always-on adapter path.
     #[cfg(target_os = "linux")]
     fn spawn_receiver(
         shutdown: Arc<AtomicBool>,

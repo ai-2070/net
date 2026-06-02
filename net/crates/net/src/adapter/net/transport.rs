@@ -426,6 +426,23 @@ impl std::fmt::Debug for PacketReceiver {
 /// the most-recent batch from `pending` front-to-back (preserving arrival
 /// order) before pulling the next batch off the channel, so its
 /// one-packet-at-a-time signature is unchanged.
+///
+/// # Shared by two consumers — the batching applies to both, by design
+///
+/// This type is **not** gated on the `batched-ingress` feature. It backs two
+/// receive loops on Linux:
+///  * `NetAdapter::spawn_receiver` — always, on Linux.
+///  * The mesh receive loop — only when `MeshNodeConfig::batched_ingress` is
+///    set (which additionally requires the `batched-ingress` build feature).
+///
+/// The batch-carrying channel above (and its `RECV_BATCH_CHANNEL_DEPTH`-deep
+/// queue, measured in *batches* not packets) is therefore a deliberate change
+/// to both paths, not just the opt-in mesh one. It is transparent: `recv()`'s
+/// contract (one packet at a time, arrival order) is unchanged, and the
+/// `batched-ingress` instrument is the only feature-gated addition. The depth
+/// change shifts the buffering/backpressure point for `NetAdapter` too — see
+/// `RECV_BATCH_CHANNEL_DEPTH` in `new` for the worst-case bound and why it
+/// preserves the existing flow-control behavior.
 #[cfg(target_os = "linux")]
 pub struct BatchedPacketReceiver {
     rx: tokio::sync::mpsc::Receiver<Vec<(Bytes, SocketAddr)>>,
