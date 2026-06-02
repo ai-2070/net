@@ -142,22 +142,6 @@ jobs:
           --test proxy_coverage_gaps
           --test stream_config_and_error_display
 
-      # === Scheduled-stream batched drain (Linux sendmmsg send path) ======
-      # The scheduled-stream egress ships packets via the send loop's
-      # batched, group-by-destination drain (NRPC_SEND_LOOP_BATCHING_PLAN),
-      # which calls `sendmmsg` behind `cfg(target_os = "linux")`. That block
-      # does not compile on the macOS dev host, so this Linux job is the gate
-      # that actually compiles AND exercises it: `send_drain_depth` floods 16
-      # concurrent scheduled streams through the batch path, `scheduled_stream`
-      # pins the routing. `--no-capture` surfaces the measured
-      # packets/syscall-collapse factor in the CI log.
-      - name: Scheduled-stream batched drain (Linux sendmmsg path)
-        if: ${{ !cancelled() }}
-        run: >
-          cargo nextest run --no-fail-fast --features net --no-capture
-          --test scheduled_stream
-          --test send_drain_depth
-
       # === NAT traversal ==================================================
       - name: NAT traversal
         if: ${{ !cancelled() }}
@@ -238,20 +222,28 @@ jobs:
           --test dataforts_greedy_e2e
           --test dataforts_gravity_e2e
 
-      # === Scheduled-stream batched-drain integrity (Linux sendmmsg) ======
-      # Verifies bytes shipped through the send loop's batched group-by-dest
-      # drain (NRPC_SEND_LOOP_BATCHING_PLAN) arrive BYTE-FOR-BYTE — the
-      # integrity check `send_drain_depth` cannot make (it is FireAndForget
-      # with a `send_to` fallback, so a silently mis-delivering sendmmsg
-      # passes it). Reliable blob transfer rides `scheduled = true` streams,
-      # so 16 concurrent fetches drive the holder's single send loop into the
-      # batch path; on Linux this exercises the real `sendmmsg` + tail
-      # fallback under end-to-end content verification. `--no-capture`
-      # surfaces the verified-blob / flush counts in the log.
-      - name: Scheduled-stream batched-drain integrity
+      # === Scheduled-stream batched drain (Linux sendmmsg send path) ======
+      # The whole NRPC_SEND_LOOP_BATCHING_PLAN gate, in one compile. The
+      # scheduled-stream egress ships packets via the send loop's batched,
+      # group-by-destination drain, which calls `sendmmsg` behind
+      # `cfg(target_os = "linux")` — a block that does not compile on the
+      # macOS dev host, so this Linux job is the gate that actually compiles
+      # AND exercises it. `dataforts` pulls in `net`, so all three drain
+      # tests build under one feature set:
+      #   - send_drain_depth      — floods 16 concurrent scheduled streams,
+      #                             prints the packets/syscall-collapse factor;
+      #   - scheduled_stream      — pins the scheduled-vs-direct routing;
+      #   - scheduled_stream_integrity — fetches blobs over reliable scheduled
+      #     streams and asserts BYTE-FOR-BYTE delivery through the batch path
+      #     (incl. a tiny-send-buffer phase that forces the sendmmsg partial
+      #     -send / EWOULDBLOCK tail), the integrity check the others can't make.
+      # `--no-capture` surfaces the measurement + verified-blob/flush counts.
+      - name: Scheduled-stream batched drain (Linux sendmmsg path)
         if: ${{ !cancelled() }}
         run: >
           cargo nextest run --no-fail-fast --features dataforts --no-capture
+          --test send_drain_depth
+          --test scheduled_stream
           --test scheduled_stream_integrity
 
       # === Dataforts blob e2e (multi-node + migration) ====================
