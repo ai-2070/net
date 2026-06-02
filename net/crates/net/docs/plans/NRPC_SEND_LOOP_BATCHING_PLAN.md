@@ -164,7 +164,7 @@ fd-compatibility unknown. Two real caveats remain, both addressed in Phase 1:
 |---|---|---|
 | **Lead finding — send loop off the unary path** | ✅ Done (code trace 2026-06-02) | Unary RPC sends bypass the scheduler: `call`→`publish_to_peer`→`socket.send_to` (`mesh.rs:8342`); responses same (`mesh_rpc.rs:1574`). Scheduler send loop drains only `scheduled=true` streams (`mesh.rs:10710`). **Send-loop batching cannot move `nrpc_qps`.** Re-scopes Phases 0/1 to the scheduled-stream egress. |
 | 0 — Measure drain depth on the **scheduled-stream** egress | ✅ Done (measured 2026-06-02, macOS) | **Verdict: drain depth ≈ 1 even for a saturated, backpressure-disabled single scheduled stream.** 4,580 / 4,589 drain runs were length 1 (99.8%); longest run 4–7. Producer's per-packet build+encrypt never outruns the loop's per-packet `send_to`. See Findings. |
-| 1 — Batch drain in the scheduled-stream send loop | ✅ Implemented; portable path validated, **Linux path unvalidated on this host** | Added `FairScheduler::current_depth` (real depth, vs cumulative `total_queued`); send loop now: depth 0 → single `send_to` (unchanged), else drain ≤64 grouped **by destination** → one `send_batch`/peer (Linux) or per-packet (portable). Measured **64.0 packets/flush = 64× fewer send syscalls** on the 16-stream workload; fairness suite + single-stream fast path green. See Phase 1 results + gaps. |
+| 1 — Batch drain in the scheduled-stream send loop | ✅ Implemented; portable validated here, **Linux path now CI-gated** | Added `FairScheduler::current_depth` (real depth, vs cumulative `total_queued`); send loop now: depth 0 → single `send_to` (unchanged), else drain ≤64 grouped **by destination** → one `send_batch`/peer (Linux) or per-packet (portable). Measured **64.0 packets/flush = 64× fewer send syscalls**; fairness + grouping + depth unit tests + single-stream fast path green. CI step compiles+runs the `cfg(linux)` sendmmsg path. Remaining gap: delivery-integrity assertion through sendmmsg (see gaps). |
 | 2 — Saturated one-way send bench | ☐ Todo | New `nrpc_send_throughput` (fire-and-forget over a **scheduled stream**, no response await) — the honest home for the 10–20× sendmmsg claim and its regression guard. Keep `nrpc_qps` as the latency story. |
 | 3 — Multi-send-loop option (documented, not built) | ☐ Analysis only | Cross-platform alternative to sendmmsg, but breaks the FairScheduler's advertised property — see hazard below. Treat as scheduler redesign, not drop-in. |
 | — Unary `nrpc_qps` lever (out of scope here) | ➜ Elsewhere | Not send batching. See [`NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md`](NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md) (fewer packets) + batched recv in [`NRPC_QPS_CONCURRENCY_SCALING_PLAN.md`](NRPC_QPS_CONCURRENCY_SCALING_PLAN.md). |
@@ -365,26 +365,41 @@ path elsewhere. Re-running the Phase 0 driver:
   — depth tracks enqueue−dequeue across priority + stream lanes, a rejected
   (queue-full) enqueue does not bump it, and a full drain returns it to 0.
 
-### Gaps — NOT yet validated (require a Linux host / CI)
+### Linux validation — CI gate added (2026-06-02)
 
-- **The actual `sendmmsg` syscall path is `cfg(target_os="linux")`** — it does not
-  compile or run on this macOS host. The 64× is the *measured group/flush count*
-  (exactly what becomes sendmmsg calls on Linux), but the syscall itself, the
-  partial-send tail fallback, and `EWOULDBLOCK` handling are **unexercised here.**
-  Must run the driver + `transfer_concurrency` on Linux before merge. *(A cross
-  `cargo check --target x86_64-unknown-linux-gnu` was attempted to at least
-  type-check the cfg block; it's blocked by a `-sys` dep needing
-  `x86_64-linux-gnu-gcc`, absent here. So even compile-checking the Linux block
-  requires a Linux host / CI — the cfg block was written by review against the
-  confirmed `send_batch` signature, not compiled.)*
-- **Reliable-bulk end-to-end integrity through the batch path** is unverified on
-  this host: `transfer_concurrency` (the data-integrity + retransmit test) **cannot
-  bind** on macOS (`os error 55`, large `SO_*BUF`) — fails identically with and
-  without this change, so it neither validates nor regresses here.
-- **`current_depth` accounting under drops:** `enqueue` returning `false`
-  (queue/priority full) correctly does *not* increment; every `Some` return from
-  `dequeue` decrements. A focused unit test asserting depth returns to 0 after
-  enqueue/drain cycles would lock this in (TODO).
+A named step in the `integration-tests` job (`ubuntu-latest`) now **compiles and
+runs** the `cfg(target_os="linux")` path that the macOS dev host cannot:
+
+```yaml
+- name: Scheduled-stream batched drain (Linux sendmmsg path)
+  run: cargo nextest run --no-fail-fast --features net --no-capture
+       --test scheduled_stream --test send_drain_depth
+```
+
+(Added because *none* of `scheduled_stream` / `send_drain_depth` /
+`transfer_concurrency` were referenced anywhere in `ci.yml` — the batch path had
+no CI coverage at all.) A cross `cargo check --target x86_64-unknown-linux-gnu`
+from macOS was tried first but is blocked by a `-sys` dep needing
+`x86_64-linux-gnu-gcc`, so CI is the only place the cfg block compiles.
+
+**What the gate proves:** the Linux block **compiles**, the batch drain **runs**
+on real Linux sockets without panic/error under a 16-stream flood, routing holds,
+and the packets/syscall collapse prints in the log.
+
+### Gaps still open
+
+- **Delivery integrity *through* `sendmmsg` is not asserted.** `send_drain_depth`
+  uses `FireAndForget` and the drain falls back to `send_to` on a `send_batch`
+  error (`unwrap_or(0)` + tail loop), so a *silently mis-delivering* sendmmsg would
+  not fail the test — only a compile error or panic would. A **reliable** scheduled
+  stream that verifies received bytes is needed to prove the batched bytes actually
+  arrive. `transfer_concurrency` is the closest existing integrity test but is
+  **deliberately not in CI** (resource-heavy; can't even bind on macOS,
+  `os error 55`), so it was not wired into the gate. A focused reliable-scheduled
+  -stream integrity test is the right follow-up.
+- **`partial-send tail / `EWOULDBLOCK` fallback** runs only when the kernel
+  back-pressures — the flood may not reliably trigger it in CI. Not separately
+  forced yet.
 
 ### Follow-ups (deferred)
 

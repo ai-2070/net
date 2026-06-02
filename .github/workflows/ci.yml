@@ -142,6 +142,22 @@ jobs:
           --test proxy_coverage_gaps
           --test stream_config_and_error_display
 
+      # === Scheduled-stream batched drain (Linux sendmmsg send path) ======
+      # The scheduled-stream egress ships packets via the send loop's
+      # batched, group-by-destination drain (NRPC_SEND_LOOP_BATCHING_PLAN),
+      # which calls `sendmmsg` behind `cfg(target_os = "linux")`. That block
+      # does not compile on the macOS dev host, so this Linux job is the gate
+      # that actually compiles AND exercises it: `send_drain_depth` floods 16
+      # concurrent scheduled streams through the batch path, `scheduled_stream`
+      # pins the routing. `--no-capture` surfaces the measured
+      # packets/syscall-collapse factor in the CI log.
+      - name: Scheduled-stream batched drain (Linux sendmmsg path)
+        if: ${{ !cancelled() }}
+        run: >
+          cargo nextest run --no-fail-fast --features net --no-capture
+          --test scheduled_stream
+          --test send_drain_depth
+
       # === NAT traversal ==================================================
       - name: NAT traversal
         if: ${{ !cancelled() }}
