@@ -164,7 +164,7 @@ fd-compatibility unknown. Two real caveats remain, both addressed in Phase 1:
 |---|---|---|
 | **Lead finding — send loop off the unary path** | ✅ Done (code trace 2026-06-02) | Unary RPC sends bypass the scheduler: `call`→`publish_to_peer`→`socket.send_to` (`mesh.rs:8342`); responses same (`mesh_rpc.rs:1574`). Scheduler send loop drains only `scheduled=true` streams (`mesh.rs:10710`). **Send-loop batching cannot move `nrpc_qps`.** Re-scopes Phases 0/1 to the scheduled-stream egress. |
 | 0 — Measure drain depth on the **scheduled-stream** egress | ✅ Done (measured 2026-06-02, macOS) | **Verdict: drain depth ≈ 1 even for a saturated, backpressure-disabled single scheduled stream.** 4,580 / 4,589 drain runs were length 1 (99.8%); longest run 4–7. Producer's per-packet build+encrypt never outruns the loop's per-packet `send_to`. See Findings. |
-| 1 — Batch drain in the scheduled-stream send loop | ✅ Implemented & **Linux-validated (CI green)** | Added `FairScheduler::current_depth`; send loop: depth 0 → single `send_to` (unchanged), else drain ≤64 grouped **by destination** → one `send_batch`/peer (Linux) or per-packet (portable). **CI on ubuntu-latest compiled + ran the `cfg(linux)` sendmmsg path: 61.9 packets/`sendmmsg` ≈ 62×** on real syscalls. Fairness + grouping + depth unit tests + single-stream fast path green. **Delivery integrity closed:** `scheduled_stream_integrity` fetches 16 blobs over reliable scheduled streams, asserts byte-for-byte through the batch path (16/16 locally), CI-gated on Linux. Remaining: forced `EWOULDBLOCK`/partial-send fault injection. |
+| 1 — Batch drain in the scheduled-stream send loop | ✅ Implemented & **Linux-validated (CI green)** | Added `FairScheduler::current_depth`; send loop: depth 0 → single `send_to` (unchanged), else drain ≤64 grouped **by destination** → one `send_batch`/peer (Linux) or per-packet (portable). **CI on ubuntu-latest compiled + ran the `cfg(linux)` sendmmsg path: 61.9 packets/`sendmmsg` ≈ 62×** on real syscalls. Fairness + grouping + depth unit tests + single-stream fast path green. **Delivery integrity closed:** `scheduled_stream_integrity` fetches blobs over reliable scheduled streams, asserts byte-for-byte through the batch path (16/16 locally), CI-gated on Linux — including a **tiny-send-buffer phase** that forces the `sendmmsg` partial-send / `EWOULDBLOCK` tail-fallback under verification. No material gaps left; deferred follow-ups only (reusable transport, slot pruning, wakeup-collapse latency). |
 | 2 — Saturated one-way send bench | ☐ Todo | New `nrpc_send_throughput` (fire-and-forget over a **scheduled stream**, no response await) — the honest home for the 10–20× sendmmsg claim and its regression guard. Keep `nrpc_qps` as the latency story. |
 | 3 — Multi-send-loop option (documented, not built) | ☐ Analysis only | Cross-platform alternative to sendmmsg, but breaks the FairScheduler's advertised property — see hazard below. Treat as scheduler redesign, not drop-in. |
 | — Unary `nrpc_qps` lever (out of scope here) | ➜ Elsewhere | Not send batching. See [`NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md`](NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md) (fewer packets) + batched recv in [`NRPC_QPS_CONCURRENCY_SCALING_PLAN.md`](NRPC_QPS_CONCURRENCY_SCALING_PLAN.md). |
@@ -429,12 +429,27 @@ because it's `FireAndForget` with a `send_to` fallback") is now covered by a
   `transfer_concurrency` (4 MiB / 8 MiB, `os error 55` on macOS), which stays out
   of CI.
 
+### Partial-send / `EWOULDBLOCK` tail fallback — covered (2026-06-02)
+
+`scheduled_stream_integrity` now runs a **second phase** with a **16 KiB holder
+send buffer**. Under the 12-stream concurrent flood, a ~90 KiB `send_batch` group
+cannot fit, so on Linux `sendmmsg` returns a partial count (or `EWOULDBLOCK`) and
+the drain's `for d in &data[sent..] { send_to … }` tail-fallback executes — and the
+**reliable byte-for-byte assertion still holds**, so a broken tail (wrong slice,
+dropped tail, mis-order) fails the build. Local (macOS, portable path): both
+phases green — `normal` 16/16, `tiny-send-buf` 12/12 byte-for-byte. The CI step is
+unchanged (it already runs `--test scheduled_stream_integrity`); the new phase
+rides along.
+
+> Caveat: on macOS phase 2 takes the portable `send_to` path (no `sendmmsg`), so it
+> proves delivery-under-squeeze but not the sendmmsg tail itself — that assertion
+> lands on Linux CI, where the cfg block is live.
+
 ### Gaps still open
 
-- **`partial-send tail / `EWOULDBLOCK` fallback** runs only when the kernel
-  back-pressures — neither the flood nor the integrity test reliably forces it.
-  A fault-injection variant (shrink the send buffer to provoke `EWOULDBLOCK`)
-  would pin it; not done yet.
+*(none material — all paths exercised; remaining work is the deferred follow-ups
+below: reusable `BatchedTransport`, stale-slot pruning, wakeup-collapse latency
+measurement.)*
 
 ### Follow-ups (deferred)
 

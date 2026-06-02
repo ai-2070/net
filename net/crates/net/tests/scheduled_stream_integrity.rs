@@ -11,11 +11,19 @@
 //! `scheduled = true` streams (`dataforts/blob/transfer.rs`), so fetching K
 //! blobs concurrently from one holder makes its single send loop back up into
 //! the batch path. The transfer is RELIABLE, so every byte must arrive; we
-//! assert each fetched blob matches its source byte-for-byte, and that the
+//! assert each fetched blob matches its source byte-for-byte and that the
 //! batched drain was actually exercised (flushes > 0).
 //!
-//! Kept light (small blobs, modest socket buffers) so it runs in CI and on the
-//! macOS dev host — unlike `transfer_concurrency` (4 MiB blobs / 8 MiB buffers,
+//! Two phases:
+//!   1. normal socket buffers — `sendmmsg` mostly sends the whole group.
+//!   2. **tiny send buffer** — on Linux this forces `sendmmsg` partial sends /
+//!      `EWOULDBLOCK`, so the drain's async `send_to` tail-fallback executes;
+//!      integrity must still hold byte-for-byte. (On macOS phase 2 runs the
+//!      portable per-packet path, which also backpressures — it verifies the
+//!      test still delivers, but the sendmmsg tail is a Linux-CI assertion.)
+//!
+//! Kept light (small blobs, modest buffers) so it runs in CI and on the macOS
+//! dev host — unlike `transfer_concurrency` (4 MiB blobs / 8 MiB buffers,
 //! which can't even bind on macOS).
 //!
 //! Run: cargo test --features dataforts --test scheduled_stream_integrity -- --nocapture
@@ -34,24 +42,23 @@ use net::adapter::net::{
 };
 
 const PSK: [u8; 32] = [0x42u8; 32];
-const SOCK_BUF: usize = 512 * 1024;
 
-fn config() -> MeshNodeConfig {
+fn config(send_buf: usize, recv_buf: usize) -> MeshNodeConfig {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut cfg = MeshNodeConfig::new(addr, PSK)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(30))
         .with_handshake(3, Duration::from_secs(2));
     cfg.socket_buffers = SocketBufferConfig {
-        send_buffer_size: SOCK_BUF,
-        recv_buffer_size: SOCK_BUF,
+        send_buffer_size: send_buf,
+        recv_buffer_size: recv_buf,
     };
     cfg
 }
 
-async fn build_node() -> Arc<MeshNode> {
+async fn build_node(send_buf: usize, recv_buf: usize) -> Arc<MeshNode> {
     Arc::new(
-        MeshNode::new(EntityKeypair::generate(), config())
+        MeshNode::new(EntityKeypair::generate(), config(send_buf, recv_buf))
             .await
             .expect("new"),
     )
@@ -86,14 +93,17 @@ fn blob_ref(bytes: &[u8]) -> ([u8; 32], BlobRef) {
     )
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn batched_drain_delivers_concurrent_blobs_byte_for_byte() {
-    // Arm so the batched drain counts flushes (gated on the arm flag); must
-    // precede start(), which the handshake performs.
-    arm_send_drain_histo();
+/// Store `k` blobs of `blob` bytes on a holder, fetch them all concurrently
+/// from a fetcher (→ `k` concurrent scheduled streams through the holder's
+/// batched send loop), assert each arrives byte-for-byte, and return
+/// `(flushes, packets)` the batch path shipped during this run (delta).
+async fn run_and_verify(label: &str, k: usize, blob: usize, holder_send_buf: usize) {
+    let (f0, p0) = send_batch_stats();
 
-    let holder = build_node().await; // serves blobs; its send loop batches.
-    let fetcher = build_node().await; // fetches all blobs concurrently.
+    // Tiny send buffer goes on the holder (the batching sender); the fetcher
+    // keeps a roomy recv buffer so the bottleneck is the holder's send path.
+    let holder = build_node(holder_send_buf, 512 * 1024).await;
+    let fetcher = build_node(512 * 1024, 512 * 1024).await;
     handshake(&fetcher, &holder).await;
     let holder_id = holder.node_id();
 
@@ -102,20 +112,15 @@ async fn batched_drain_delivers_concurrent_blobs_byte_for_byte() {
     let fetcher_adapter = Arc::new(MeshBlobAdapter::new("fetcher", Arc::new(Redex::new())));
     fetcher.serve_blob_transfer(fetcher_adapter);
 
-    // K distinct blobs: enough packets/blob × concurrency to back the holder's
-    // single send loop into the batch path.
-    const K: usize = 16;
-    const BLOB: usize = 128 * 1024;
-    let mut originals: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(K);
-    for i in 0..K {
-        let bytes = payload(BLOB, i as u8 + 1);
+    let mut originals: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(k);
+    for i in 0..k {
+        let bytes = payload(blob, i as u8 + 1);
         let (h, r) = blob_ref(&bytes);
         adapter.store(&r, &bytes).await.expect("store");
         originals.push((h, bytes));
     }
 
-    // Fetch all K concurrently → K concurrent scheduled streams holder→fetcher.
-    let mut tasks = Vec::with_capacity(K);
+    let mut tasks = Vec::with_capacity(k);
     for (h, bytes) in originals {
         let f = fetcher.clone();
         tasks.push(tokio::spawn(async move {
@@ -127,26 +132,42 @@ async fn batched_drain_delivers_concurrent_blobs_byte_for_byte() {
     let mut verified = 0usize;
     for t in tasks {
         let (h, original, got) = t.await.expect("join");
-        let got = got.unwrap_or_else(|e| panic!("fetch {:02x?} failed: {e:?}", &h[..4]));
-        assert_eq!(got.len(), original.len(), "blob {:02x?}: length", &h[..4]);
+        let got = got.unwrap_or_else(|e| panic!("[{label}] fetch {:02x?} failed: {e:?}", &h[..4]));
+        assert_eq!(got.len(), original.len(), "[{label}] blob {:02x?}: length", &h[..4]);
         assert!(
             got[..] == original[..],
-            "blob {:02x?}: CONTENT mismatch through the batched drain",
+            "[{label}] blob {:02x?}: CONTENT mismatch through the batched drain",
             &h[..4]
         );
         verified += 1;
     }
-    assert_eq!(verified, K, "all {K} blobs must verify byte-for-byte");
+    assert_eq!(verified, k, "[{label}] all {k} blobs must verify byte-for-byte");
 
-    let (flushes, packets) = send_batch_stats();
+    let (f1, p1) = send_batch_stats();
+    let (flushes, packets) = (f1 - f0, p1 - p0);
     eprintln!(
-        "integrity: {verified}/{K} blobs byte-for-byte; batched drain shipped \
-         {packets} packets in {flushes} flushes"
+        "[{label}] {verified}/{k} blobs byte-for-byte; batched drain shipped \
+         {packets} packets in {flushes} flushes (holder send_buf={holder_send_buf})"
     );
     assert!(
         flushes > 0,
-        "expected the holder send loop to use the batched drain (flushes > 0); got 0 \
-         — concurrency did not back the scheduler up, so this run did not actually \
-         exercise the batch path",
+        "[{label}] expected the holder send loop to use the batched drain \
+         (flushes > 0); got 0 — concurrency did not back the scheduler up, so this \
+         run did not exercise the batch path",
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batched_drain_delivers_concurrent_blobs_byte_for_byte() {
+    // Arm so the batched drain counts flushes (gated on the arm flag); must
+    // precede start(), which each handshake performs.
+    arm_send_drain_histo();
+
+    // Phase 1 — roomy send buffer: sendmmsg mostly ships the whole group.
+    run_and_verify("normal", 16, 128 * 1024, 512 * 1024).await;
+
+    // Phase 2 — tiny holder send buffer: on Linux this forces sendmmsg partial
+    // sends / EWOULDBLOCK, so the drain's async send_to tail-fallback runs.
+    // Integrity must still hold. Smaller blobs keep it quick under the squeeze.
+    run_and_verify("tiny-send-buf", 12, 64 * 1024, 16 * 1024).await;
 }
