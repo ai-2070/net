@@ -681,14 +681,17 @@ pub struct MeshNodeConfig {
     /// thread + batched channel) for the steady-state receive loop, instead of
     /// the per-packet `recv_buf_from` path.
     ///
-    /// **Default `false`** and a no-op off Linux. Batched ingress collapses
-    /// receive syscalls under sustained high-throughput load, but routes every
-    /// inbound packet through a cross-thread channel hop — which can add
-    /// latency to low-concurrency traffic (e.g. nRPC unary) that the
-    /// per-packet path doesn't pay. Per NRPC_RECV_LOOP_BATCHING_PLAN this stays
-    /// opt-in until the c128 throughput + unary-latency measurement justifies
-    /// flipping the default; the flag exists so that measurement can A/B the
-    /// two paths on the real mesh loop.
+    /// **Runtime flag, present only under the `batched-ingress` build feature**
+    /// — the build feature decides whether the batching path is compiled in at
+    /// all; this flag decides whether it's used at runtime. **Default `false`**
+    /// and a no-op off Linux. Batched ingress collapses receive syscalls under
+    /// sustained high-throughput load, but routes every inbound packet through
+    /// a cross-thread channel hop — which can add latency to low-concurrency
+    /// traffic (e.g. nRPC unary) that the per-packet path doesn't pay. Per
+    /// NRPC_RECV_LOOP_BATCHING_PLAN this stays opt-in until the c128 throughput
+    /// and unary-latency measurement justifies flipping the default; the flag
+    /// exists so that measurement can A/B the two paths on the real mesh loop.
+    #[cfg(feature = "batched-ingress")]
     pub batched_ingress: bool,
     /// Handshake timeout per attempt
     pub handshake_timeout: Duration,
@@ -865,6 +868,7 @@ impl MeshNodeConfig {
             num_shards: 4,
             packet_pool_size: 64,
             default_reliable: false,
+            #[cfg(feature = "batched-ingress")]
             batched_ingress: false,
             handshake_timeout: Duration::from_secs(5),
             handshake_retries: 3,
@@ -935,7 +939,9 @@ impl MeshNodeConfig {
 
     /// Opt into the Linux batched-ingress receive path. See
     /// [`MeshNodeConfig::batched_ingress`] for the latency/throughput
-    /// trade-off and why it defaults off. No-op off Linux.
+    /// trade-off and why it defaults off. No-op off Linux. Requires the
+    /// `batched-ingress` build feature.
+    #[cfg(feature = "batched-ingress")]
     pub fn with_batched_ingress(mut self, enabled: bool) -> Self {
         self.batched_ingress = enabled;
         self
@@ -3167,6 +3173,9 @@ impl MeshNode {
         let socket = self.socket.socket_arc();
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
+        // Only read where the batched path can actually run (Linux + feature);
+        // elsewhere the per-packet path is the only option.
+        #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
         let batched_ingress = self.config.batched_ingress;
 
         let ctx = DispatchCtx {
@@ -3240,7 +3249,7 @@ impl MeshNode {
         // time, arrival order); only construction differs.
         enum IngressReceiver {
             Single(PacketReceiver),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
             Batched(super::transport::BatchedPacketReceiver),
         }
         impl IngressReceiver {
@@ -3248,7 +3257,7 @@ impl MeshNode {
             async fn recv(&mut self) -> std::io::Result<(Bytes, SocketAddr)> {
                 match self {
                     IngressReceiver::Single(r) => r.recv().await,
-                    #[cfg(target_os = "linux")]
+                    #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
                     IngressReceiver::Batched(r) => r.recv().await,
                 }
             }
@@ -3264,7 +3273,7 @@ impl MeshNode {
             fn reset_is_fatal(&self) -> bool {
                 match self {
                     IngressReceiver::Single(_) => false,
-                    #[cfg(target_os = "linux")]
+                    #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
                     IngressReceiver::Batched(_) => true,
                 }
             }
@@ -3276,7 +3285,7 @@ impl MeshNode {
             // MeshNodeConfig::batched_ingress for the latency/throughput
             // trade-off this gates.
             let mut receiver = {
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
                 {
                     if batched_ingress {
                         IngressReceiver::Batched(super::transport::BatchedPacketReceiver::new(
@@ -3286,9 +3295,10 @@ impl MeshNode {
                         IngressReceiver::Single(PacketReceiver::new(socket))
                     }
                 }
-                #[cfg(not(target_os = "linux"))]
+                // No batched path here: either not Linux, or the
+                // `batched-ingress` feature isn't built in.
+                #[cfg(not(all(target_os = "linux", feature = "batched-ingress")))]
                 {
-                    let _ = batched_ingress; // no batched path off Linux
                     IngressReceiver::Single(PacketReceiver::new(socket))
                 }
             };

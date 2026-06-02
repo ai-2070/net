@@ -109,6 +109,16 @@ net = [
 # `TagMatcher::Regex` still parses on the wire (kept in the enum for
 # format compat) but routes through the existing
 # "invalid → matches nothing" fail-closed path on the receiver side.
+# Batched ingress (NRPC_RECV_LOOP_BATCHING_PLAN) — compile the mesh
+# receive loop's Linux `recvmmsg` batched-ingress path and its
+# measurement instrument at all. Two-level gate: this build flag decides
+# whether the batching code is *included*; `MeshNodeConfig::batched_ingress`
+# (only present with this feature) decides whether it's *enabled* at
+# runtime. Off by default — batched ingress is pending the c128 latency
+# measurement, and the per-packet path stays the only one in default builds.
+# Depends on `net` (the adapter the gated code lives in) so enabling it
+# alone is self-contained rather than a silent no-op.
+batched-ingress = ["net"]
 regex = ["dep:regex"]
 # AI tool-calling surface — gates the `cortex::tool` module
 # (`ToolDescriptor` discovery shape + `ToolEvent` streaming envelope)

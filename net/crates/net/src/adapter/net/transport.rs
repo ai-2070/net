@@ -6,7 +6,6 @@
 use bytes::{Bytes, BytesMut};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 
@@ -20,88 +19,101 @@ use super::protocol::{NetHeader, HEADER_SIZE, MAX_PACKET_SIZE};
 // realized ingress syscall-collapse factor — the recv analogue of the send
 // side's packets/flush ratio. Off unless `arm_recv_drain_histo()` is called
 // BEFORE the receive thread starts (the thread latches the flag once at
-// startup), so an unarmed/production loop does zero recording.
+// startup), so an unarmed loop does zero recording.
 //
-// Measurement scaffolding — not part of the supported public API. Every
-// entry point is `#[doc(hidden)]` and re-exported only so the in-repo
-// integration tests (which compile as external crates) can drive it.
-static RECV_DRAIN_HISTO: [AtomicU64; 9] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-static RECV_DRAIN_ARMED: AtomicBool = AtomicBool::new(false);
-static RECV_DRAIN_MAX: AtomicU64 = AtomicU64::new(0);
-static RECV_BATCH_SYSCALLS: AtomicU64 = AtomicU64::new(0);
-static RECV_BATCH_PACKETS: AtomicU64 = AtomicU64::new(0);
+// Compiled only under the `batched-ingress` build feature — the instrument
+// measures the batched receive path, so when that path isn't built neither is
+// this. Measurement scaffolding, not supported public API: every entry point
+// is `#[doc(hidden)]` and re-exported only so the in-repo integration tests
+// (which compile as external crates) can drive it.
+#[cfg(feature = "batched-ingress")]
+mod recv_instrument {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Arm the recv-batch-size histogram. Must be called BEFORE the receive
-/// thread starts — the thread reads the flag once at startup.
-#[doc(hidden)]
-pub fn arm_recv_drain_histo() {
-    RECV_DRAIN_ARMED.store(true, Ordering::Relaxed);
-}
+    static RECV_DRAIN_HISTO: [AtomicU64; 9] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static RECV_DRAIN_ARMED: AtomicBool = AtomicBool::new(false);
+    static RECV_DRAIN_MAX: AtomicU64 = AtomicU64::new(0);
+    static RECV_BATCH_SYSCALLS: AtomicU64 = AtomicU64::new(0);
+    static RECV_BATCH_PACKETS: AtomicU64 = AtomicU64::new(0);
 
-/// Snapshot the recv-batch-size histogram. Index `i` (for `i < 8`) counts
-/// `recvmmsg` returns whose packet count fell in `[2^i, 2^(i+1))`; index `8`
-/// is `[256, ∞)`.
-#[doc(hidden)]
-pub fn recv_drain_histo_snapshot() -> [u64; 9] {
-    let mut out = [0u64; 9];
-    for (i, b) in RECV_DRAIN_HISTO.iter().enumerate() {
-        out[i] = b.load(Ordering::Relaxed);
+    /// Arm the recv-batch-size histogram. Must be called BEFORE the receive
+    /// thread starts — the thread reads the flag once at startup.
+    #[doc(hidden)]
+    pub fn arm_recv_drain_histo() {
+        RECV_DRAIN_ARMED.store(true, Ordering::Relaxed);
     }
-    out
-}
 
-/// Largest single `recvmmsg` batch observed so far (exact, not bucketed).
-#[doc(hidden)]
-pub fn recv_drain_max() -> u64 {
-    RECV_DRAIN_MAX.load(Ordering::Relaxed)
-}
-
-/// `(syscalls, packets)` received via the batched-ingress path.
-/// `packets / syscalls` is the realized recv syscall-collapse factor
-/// (→ `MAX_BATCH_SIZE` as the socket saturates).
-#[doc(hidden)]
-pub fn recv_batch_stats() -> (u64, u64) {
-    (
-        RECV_BATCH_SYSCALLS.load(Ordering::Relaxed),
-        RECV_BATCH_PACKETS.load(Ordering::Relaxed),
-    )
-}
-
-/// Latch the arm flag (called once at receive-thread startup, mirroring the
-/// send loop's `measure_drain`). Only compiled on Linux, the sole batched
-/// recv path; the per-packet fallback elsewhere has no batch to record.
-#[cfg(target_os = "linux")]
-#[inline]
-fn recv_drain_armed() -> bool {
-    RECV_DRAIN_ARMED.load(Ordering::Relaxed)
-}
-
-/// Record one non-empty `recvmmsg` batch of `packets` packets. `armed` is the
-/// value latched at thread startup; when false this is a no-op so the
-/// production path pays nothing.
-#[cfg(target_os = "linux")]
-#[inline]
-fn record_recv_batch(packets: u64, armed: bool) {
-    if !armed || packets == 0 {
-        return;
+    /// Snapshot the recv-batch-size histogram. Index `i` (for `i < 8`) counts
+    /// `recvmmsg` returns whose packet count fell in `[2^i, 2^(i+1))`; index
+    /// `8` is `[256, ∞)`.
+    #[doc(hidden)]
+    pub fn recv_drain_histo_snapshot() -> [u64; 9] {
+        let mut out = [0u64; 9];
+        for (i, b) in RECV_DRAIN_HISTO.iter().enumerate() {
+            out[i] = b.load(Ordering::Relaxed);
+        }
+        out
     }
-    RECV_BATCH_SYSCALLS.fetch_add(1, Ordering::Relaxed);
-    RECV_BATCH_PACKETS.fetch_add(packets, Ordering::Relaxed);
-    // floor(log2(packets)), clamped to the top bucket.
-    let bucket = (63 - packets.leading_zeros()).min(8) as usize;
-    RECV_DRAIN_HISTO[bucket].fetch_add(1, Ordering::Relaxed);
-    RECV_DRAIN_MAX.fetch_max(packets, Ordering::Relaxed);
+
+    /// Largest single `recvmmsg` batch observed so far (exact, not bucketed).
+    #[doc(hidden)]
+    pub fn recv_drain_max() -> u64 {
+        RECV_DRAIN_MAX.load(Ordering::Relaxed)
+    }
+
+    /// `(syscalls, packets)` received via the batched-ingress path.
+    /// `packets / syscalls` is the realized recv syscall-collapse factor
+    /// (→ `MAX_BATCH_SIZE` as the socket saturates).
+    #[doc(hidden)]
+    pub fn recv_batch_stats() -> (u64, u64) {
+        (
+            RECV_BATCH_SYSCALLS.load(Ordering::Relaxed),
+            RECV_BATCH_PACKETS.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Latch the arm flag (called once at receive-thread startup, mirroring
+    /// the send loop's `measure_drain`). Only compiled on Linux, the sole
+    /// batched recv path; the per-packet fallback elsewhere has no batch to
+    /// record.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub(super) fn recv_drain_armed() -> bool {
+        RECV_DRAIN_ARMED.load(Ordering::Relaxed)
+    }
+
+    /// Record one non-empty `recvmmsg` batch of `packets` packets. `armed` is
+    /// the value latched at thread startup; when false this is a no-op so the
+    /// production path pays nothing.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub(super) fn record_recv_batch(packets: u64, armed: bool) {
+        if !armed || packets == 0 {
+            return;
+        }
+        RECV_BATCH_SYSCALLS.fetch_add(1, Ordering::Relaxed);
+        RECV_BATCH_PACKETS.fetch_add(packets, Ordering::Relaxed);
+        // floor(log2(packets)), clamped to the top bucket.
+        let bucket = (63 - packets.leading_zeros()).min(8) as usize;
+        RECV_DRAIN_HISTO[bucket].fetch_add(1, Ordering::Relaxed);
+        RECV_DRAIN_MAX.fetch_max(packets, Ordering::Relaxed);
+    }
 }
+
+#[cfg(feature = "batched-ingress")]
+pub use recv_instrument::{
+    arm_recv_drain_histo, recv_batch_stats, recv_drain_histo_snapshot, recv_drain_max,
+};
 
 /// Default receive buffer size (64 MB)
 pub const DEFAULT_RECV_BUFFER_SIZE: usize = 64 * 1024 * 1024;
@@ -462,7 +474,12 @@ impl BatchedPacketReceiver {
                 // Latch the recv instrument once at startup (mirrors the send
                 // loop's `measure_drain`): when armed, each non-empty recvmmsg
                 // records its batch size; when unarmed, recording is a no-op.
-                let measure = recv_drain_armed();
+                // Only present under the `batched-ingress` feature (the
+                // instrument it feeds is gated there); this receiver is also
+                // used by NetAdapter without the feature, where it doesn't
+                // record.
+                #[cfg(feature = "batched-ingress")]
+                let measure = recv_instrument::recv_drain_armed();
 
                 // Backoff state for the soft-error path. Pre-fix
                 // the thread spun at 1ms forever on persistent
@@ -493,7 +510,8 @@ impl BatchedPacketReceiver {
                                 continue;
                             }
                             // One non-empty recvmmsg = one ingress syscall.
-                            record_recv_batch(packets.len() as u64, measure);
+                            #[cfg(feature = "batched-ingress")]
+                            recv_instrument::record_recv_batch(packets.len() as u64, measure);
                             // Hand the whole batch over in a single channel op
                             // (one cross-thread handoff per recvmmsg, not per
                             // packet). `recv()` drains it front-to-back.

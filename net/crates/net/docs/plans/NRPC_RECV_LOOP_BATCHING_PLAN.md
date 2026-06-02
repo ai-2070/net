@@ -5,8 +5,20 @@
 **Implemented opt-in (default OFF); flipping the default is parked pending the
 c128 measurement.**
 
-Stages 1–5 of this plan have shipped behind `MeshNodeConfig::batched_ingress`
-(default `false`, no-op off Linux):
+Gated at two levels:
+
+- **Build feature `batched-ingress`** (off by default) decides whether the
+  batching path — the mesh receive-loop integration and the recv instrument —
+  is *compiled in at all*. Default builds contain only the per-packet path.
+- **Runtime flag `MeshNodeConfig::batched_ingress`** (present only under that
+  feature, default `false`, no-op off Linux) decides whether it's *enabled*.
+
+(The shared `BatchedPacketReceiver` / `recv_batch` machinery stays compiled
+unconditionally — it predates this work and is also used by `NetAdapter`'s
+ingress; the feature gates the mesh-node integration + instrument, not that
+shared wrapper.)
+
+Stages 1–5 of this plan have shipped under the `batched-ingress` feature:
 
 1. Recv-side instrument (`arm_recv_drain_histo` / `recv_drain_histo_snapshot` /
    `recv_drain_max` / `recv_batch_stats`, `#[doc(hidden)]` in `transport.rs`).

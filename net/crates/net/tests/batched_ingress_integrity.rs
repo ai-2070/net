@@ -21,7 +21,9 @@
 //!
 //! Run: cargo test --features dataforts --test batched_ingress_integrity -- --nocapture
 
-#![cfg(feature = "dataforts")]
+// Needs `dataforts` (blob transfer) and `batched-ingress` (the receive path +
+// `with_batched_ingress` builder this test exercises).
+#![cfg(all(feature = "dataforts", feature = "batched-ingress"))]
 
 use std::net::SocketAddr;
 use std::sync::Arc;

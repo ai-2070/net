@@ -181,8 +181,11 @@ pub use swarm::{
 };
 pub use transport::{NetSocket, PacketReceiver, PacketSender, ParsedPacket, SocketBufferConfig};
 // Recv-loop batching instrument (NRPC_RECV_LOOP_BATCHING_PLAN), symmetric to
-// the send-side drain instrument. Re-exported only so the in-repo integration
-// tests can drive it; `#[doc(hidden)]` keeps it off the documented surface.
+// the send-side drain instrument. Compiled only under the `batched-ingress`
+// build feature (it measures that path). Re-exported only so the in-repo
+// integration tests can drive it; `#[doc(hidden)]` keeps it off the
+// documented surface.
+#[cfg(feature = "batched-ingress")]
 #[doc(hidden)]
 pub use transport::{
     arm_recv_drain_histo, recv_batch_stats, recv_drain_histo_snapshot, recv_drain_max,

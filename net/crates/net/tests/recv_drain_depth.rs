@@ -23,7 +23,9 @@
 //!
 //! Run: `cargo test --features net --test recv_drain_depth -- --nocapture`
 
-#![cfg(feature = "net")]
+// Needs `batched-ingress` (the recvmmsg path + instrument + `with_batched_ingress`
+// builder); that feature pulls in `net`.
+#![cfg(feature = "batched-ingress")]
 
 use std::net::SocketAddr;
 use std::sync::Arc;

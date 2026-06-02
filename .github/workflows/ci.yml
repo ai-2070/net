@@ -266,7 +266,7 @@ jobs:
       - name: Batched ingress (Linux recvmmsg path)
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features dataforts --no-capture
+          cargo nextest run --no-fail-fast --features dataforts,batched-ingress --no-capture
           --test batched_ingress_integrity
           --test recv_drain_depth
 
