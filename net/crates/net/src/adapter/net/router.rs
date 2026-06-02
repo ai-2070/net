@@ -1069,6 +1069,42 @@ mod tests {
     }
 
     #[test]
+    fn group_by_dest_partitions_preserving_per_dest_order() {
+        // The batched drain groups a mixed-destination run into one bucket
+        // per peer (send_batch is single-target). This pins the two
+        // invariants the send loop relies on: (1) packets to the same peer
+        // keep dequeue order; (2) the reuse-clear pattern empties the inner
+        // vecs while keeping the dest slots for the next drain.
+        let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let c: SocketAddr = "127.0.0.1:3".parse().unwrap();
+        let mk = |n: u8| Bytes::from(vec![n]);
+
+        let mut groups: Vec<(SocketAddr, Vec<Bytes>)> = Vec::new();
+        // Interleaved across three peers.
+        group_by_dest(&mut groups, a, mk(1));
+        group_by_dest(&mut groups, b, mk(2));
+        group_by_dest(&mut groups, a, mk(3));
+        group_by_dest(&mut groups, c, mk(4));
+        group_by_dest(&mut groups, b, mk(5));
+
+        assert_eq!(groups.len(), 3, "one group per distinct peer");
+        // Slots appear in first-seen order; packets within a peer keep order.
+        assert_eq!(groups[0], (a, vec![mk(1), mk(3)]));
+        assert_eq!(groups[1], (b, vec![mk(2), mk(5)]));
+        assert_eq!(groups[2], (c, vec![mk(4)]));
+
+        // Reuse: clear inner vecs (keep slots), regroup one peer.
+        for (_, v) in groups.iter_mut() {
+            v.clear();
+        }
+        group_by_dest(&mut groups, c, mk(9));
+        assert_eq!(groups.len(), 3, "dest slots persist across drains");
+        assert!(groups[0].1.is_empty() && groups[1].1.is_empty());
+        assert_eq!(groups[2].1, vec![mk(9)], "existing slot reused, not duplicated");
+    }
+
+    #[test]
     fn test_fair_scheduler_priority() {
         let scheduler = FairScheduler::new(2, 16);
 

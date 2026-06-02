@@ -357,6 +357,13 @@ path elsewhere. Re-running the Phase 0 driver:
   `round_robin_idx_advances_only_on_successful_pop` (#31 pin),
   `test_fair_scheduler_respects_stream_weight`, `*_priority`, `*_no_starvation`,
   `*_cleanup_called` — all pass. `scheduled_stream` routing test passes.
+- **Grouping logic unit-tested:** `group_by_dest_partitions_preserving_per_dest_order`
+  pins the multi-destination case the 16-stream integration test does *not* cover
+  (it targets one peer → one group): interleaved packets to 3 peers partition into
+  3 ordered groups, and the reuse-clear keeps slots while emptying inner vecs.
+- **`current_depth` accounting:** `current_depth_tracks_live_backlog_and_returns_to_zero`
+  — depth tracks enqueue−dequeue across priority + stream lanes, a rejected
+  (queue-full) enqueue does not bump it, and a full drain returns it to 0.
 
 ### Gaps — NOT yet validated (require a Linux host / CI)
 
@@ -364,7 +371,12 @@ path elsewhere. Re-running the Phase 0 driver:
   compile or run on this macOS host. The 64× is the *measured group/flush count*
   (exactly what becomes sendmmsg calls on Linux), but the syscall itself, the
   partial-send tail fallback, and `EWOULDBLOCK` handling are **unexercised here.**
-  Must run the driver + `transfer_concurrency` on Linux before merge.
+  Must run the driver + `transfer_concurrency` on Linux before merge. *(A cross
+  `cargo check --target x86_64-unknown-linux-gnu` was attempted to at least
+  type-check the cfg block; it's blocked by a `-sys` dep needing
+  `x86_64-linux-gnu-gcc`, absent here. So even compile-checking the Linux block
+  requires a Linux host / CI — the cfg block was written by review against the
+  confirmed `send_batch` signature, not compiled.)*
 - **Reliable-bulk end-to-end integrity through the batch path** is unverified on
   this host: `transfer_concurrency` (the data-integrity + retransmit test) **cannot
   bind** on macOS (`os error 55`, large `SO_*BUF`) — fails identically with and
