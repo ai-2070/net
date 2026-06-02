@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/transport.rs
+  s_6c5221c01e7170::t_2f83a961733430 1026-1038
+  s_6c5221c01e7170::t_194181858b798b 580
+  s_6c5221c01e7170::t_f4472ab7843725 596,602-606
+  s_6c5221c01e7170::t_64ba5608bc4f48 417-422
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "ce52c2262b2ed7df4926e1214cdde7e5415244fc",
+  "prompts": {},
+  "sessions": {
+    "s_6c5221c01e7170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f37db5c6-b2d5-4a32-b8d0-45008d549c08",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
