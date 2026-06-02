@@ -84,10 +84,22 @@ failed," when the truth is it was never exercised.
   live receive loop (noted in the companion plan).
 
 So the gap is not "sendmmsg is missing." It is that **the send loop is not
-batch-shaped**, and at `nrpc_qps`'s queue depth there is nothing to batch. The
-router uses the async `tokio::net::UdpSocket::send_to`, whereas `send_batch`
-operates on a raw fd synchronously — wiring them together is a real (small)
-integration with a tokio-readiness caveat (see Risks), not a drop-in.
+batch-shaped**, and at `nrpc_qps`'s queue depth there is nothing to batch.
+
+**The fd plumbing is clean.** `send_batch` takes `&self`, borrows the fd from the
+shared `Arc<UdpSocket>` via `AsRawFd`, and builds a `BatchedTransport::new_send_only(fd)`
+internally (`transport.rs:497-503`) — it does **not** own a separate socket. So the
+router can call `sendmmsg` against its *existing* socket fd; there is no
+fd-compatibility unknown. Two real caveats remain, both addressed in Phase 1:
+
+- **Per-call allocation.** `PacketSender::send_batch` rebuilds a `BatchedTransport`
+  (3 × `Vec::with_capacity(64)`) on *every* call — the doc comment says it must,
+  because a shared `PacketSender` would otherwise need a lock on the hot path
+  (`transport.rs:492-496`). The router's send loop is a *single task*, so it can
+  sidestep this by owning one `BatchedTransport` and reusing it (no lock).
+- **tokio-readiness bypass.** `send_batch` is a synchronous `sendmmsg` on the
+  non-blocking fd; it returns `EWOULDBLOCK` instead of providing the backpressure
+  `send_to().await` gives. Needs an async fallback (see Risks).
 
 ## Goals
 
@@ -117,17 +129,22 @@ integration with a tokio-readiness caveat (see Risks), not a drop-in.
 
 | Phase | State | Notes |
 |---|---|---|
-| 0 — Measure send-queue depth at dequeue | ☐ Todo | The gate. Expectation: depth ≈ 1 at c1, small/bursty at c16 → confirms `nrpc_qps` cannot exercise send batching. If depth is unexpectedly deep, re-open Phase 1 as an `nrpc_qps` lever. |
-| 1 — Batch-shaped drain in the send loop | ☐ Todo (gated on 0 + a workload that backlogs) | Opportunistic drain: pop up to N, one `send_batch` (Linux) / loop of `send_to` (portable); degrades to single send at depth 1. Helps saturated/streaming bursts, ~nothing for unary `nrpc_qps`. |
+| 0 — Measure send-queue depth at dequeue | ☐ Todo | **Not a c1-safety gate** (the Phase 1 skip handles c1) — it (a) confirms the batch branch *fires* on real traffic rather than being born cold, and (b) sizes the typical batch N. Expectation: depth ≈ 1 at c1, small/bursty at c16/c128. |
+| 1 — Conditional-skip batch drain in the send loop | ☐ Todo | Guard on the cheap `total_queued()` atomic: depth ≤ 1 → `send_to` (unary path unchanged); else drain up to N and one `send_batch` (Linux) / `send_to` loop (portable). Loop-owned reusable `BatchedTransport` (single consumer ⇒ no lock, no per-call alloc). Helps saturated/streaming bursts, ~nothing for unary `nrpc_qps`. |
 | 2 — Saturated one-way send bench | ☐ Todo | New `nrpc_send_throughput` (fire-and-forget, no response await) — the honest home for the 10–20× sendmmsg claim and its regression guard. Keep `nrpc_qps` as the latency story. |
 | 3 — Multi-send-loop option (documented, not built) | ☐ Analysis only | Cross-platform alternative to sendmmsg, but breaks the FairScheduler's advertised property — see hazard below. Treat as scheduler redesign, not drop-in. |
 
 ---
 
-## Phase 0 — Measure send-queue depth (the gate)
+## Phase 0 — Measure send-queue depth (sizing, not safety gate)
 
-Before any send-path code, prove what depth the send loop actually sees. This is
-the experiment that decides whether Phase 1 is an `nrpc_qps` lever at all.
+The Phase 1 conditional skip already keeps c1 safe, so this is **not** a gate on
+correctness. It answers two questions cheaply before paying the Linux-`cfg` +
+`EWOULDBLOCK` surface: (a) does the batch branch ever *fire* on real traffic, or
+is the send queue structurally depth-1 because the recv-loop wall throttles
+arrivals upstream — i.e. would the path be born cold? and (b) what is the typical
+burst N, which decides whether the loop-owned reusable transport (Phase 1) is
+worth it.
 
 - Add a transient counter/histogram at `router.rs:648`: sample
   `scheduler.total_queued()` (already exists, `router.rs:326`) at the moment
@@ -136,44 +153,66 @@ the experiment that decides whether Phase 1 is an `nrpc_qps` lever at all.
   ships in the hot path.
 - Run `nrpc_qps c1/32B`, `c16/32B`, `c128/32B`.
 - **Expected:** depth ≈ 1 at c1; small bursts (≤ in-flight) at c16/c128 that only
-  occasionally exceed 1 at the dequeue instant. → confirms send batching is not an
-  `nrpc_qps` lever; proceed to Phase 2 (honest bench) and treat Phase 1 as a
-  streaming/saturated optimization only.
-- **If instead** depth is consistently deep at c16/c128 → the burst *does* pile up
-  and Phase 1 becomes a real `nrpc_qps` lever; re-rank accordingly.
+  occasionally exceed 1 at the dequeue instant. → send batching is not an
+  `nrpc_qps` lever; if the branch is effectively cold even at c128, Phase 1 is a
+  streaming/saturated optimization only and may not be worth the surface — proceed
+  to Phase 2 (honest bench) to find a workload that does backlog.
+- **If instead** depth is consistently deep at c16/c128 → the burst *does* pile up,
+  Phase 1 becomes a real `nrpc_qps` lever, and the typical depth sizes N (and
+  justifies the reusable transport); re-rank accordingly.
 
-**Phase 0 exit:** a one-line verdict with the measured depth distribution,
-recorded in the Status table. Cheap, and it is the whole ballgame.
+**Phase 0 exit:** a one-line verdict with the measured depth distribution + the
+typical batch N, recorded in the Status table. Cheap, and it sizes the rest.
 
 ---
 
-## Phase 1 — Batch-shaped drain in the send loop
+## Phase 1 — Conditional-skip batch drain in the send loop
 
-Only worthwhile for workloads that *do* backlog (saturated publish, streaming
-bulk). Shape the loop so batching is automatic when packets are present and a
-no-op cost when they are not:
+The right shape is **conditional skip**: batch when packets are already waiting,
+fall through to today's single `send_to` when they are not — so the unary path is
+untouched and the win is captured automatically whenever a burst exists. The two
+details that make it good rather than merely correct are the **depth probe** and
+**transport reuse**.
 
 ```text
 loop:
-  drain up to N packets from scheduler.dequeue()  (N = MAX_BATCH_SIZE = 64)
-  if batch.len() == 1 -> socket.send_to(...)            // unary fast path, unchanged cost
-  else (Linux)        -> PacketSender::send_batch(...)  // one sendmmsg
-  else (portable)     -> for p in batch { send_to(p) }  // degrades gracefully
-  if drained nothing  -> select! { wait(), sleep(1ms) }
+  let packet = scheduler.dequeue()? ;                  // first packet (today's path)
+  if scheduler.total_queued() <= 1 {                   // cheap atomic load — NOT a 2nd dequeue()
+      socket.send_to(&packet.data, packet.dest).await; // unary fast path, ~unchanged cost
+  } else {
+      drain up to N more via dequeue() into batch       (N = MAX_BATCH_SIZE = 64)
+      #[cfg(linux)]      batched_transport.send_batch(&batch, dest)   // one sendmmsg, reused transport
+      #[cfg(not(linux))] for p in &batch { send_to(p).await }         // portable fallback
+      // on EWOULDBLOCK from sendmmsg: fall back to async send_to(p).await for backpressure
+  }
+  if drained nothing -> select! { wait(), sleep(1ms) }
 ```
 
+- **Probe with the atomic, not a speculative `dequeue()`.** Deciding batch-vs-single
+  by calling `dequeue()` again would allocate a `Vec<u64>` of stream keys per call
+  (`router.rs:245`) and scan the DashMap — that puts an allocation on the unary
+  path, regressing the c1 tripwire. `total_queued()` (`router.rs:326`) is a single
+  `AtomicU64` load: the skip stays near-free, which is what makes "just wire it in"
+  actually safe for c1. (Caveat: `total_queued` counts *all* streams, and the WRR
+  quantum may not let one drain pull them all in a single pass; that only means an
+  occasional batch is smaller than the count suggested — never a correctness issue.)
+- **Loop-owned reusable `BatchedTransport`.** Construct one
+  `BatchedTransport::new_send_only(fd)` when the send loop starts and reuse it every
+  drain. The send loop is a *single task*, so the lock that forced
+  `PacketSender::send_batch` to rebuild per call (`transport.rs:492-496`) is
+  unnecessary here — this avoids the 3 × `Vec::with_capacity(64)` allocation per
+  batch, which matters most at small bursts where it would otherwise eat the
+  syscall saving.
 - **Collapses both syscalls *and* send-loop wakeups** when a burst is present (one
   drain handles many packets instead of re-entering the loop per packet) — the
   wakeup collapse is the more interesting half given the 51 %
   `NtWaitForAlertByThreadId` bucket from the flamegraph.
-- **Degrades to today's behavior at depth 1**, so c1 latency is not regressed
+- **Degrades to today's behavior at depth ≤ 1**, so c1 latency is not regressed
   (verify — c1/32B is a tripwire).
-- **Integration caveat (Linux):** `send_batch` is a synchronous raw-fd
-  `sendmmsg`; the router socket is a tokio `UdpSocket` in non-blocking mode.
-  Calling `sendmmsg` on its fd is non-blocking (fine for the common case) but
-  bypasses tokio's writability readiness — on `EWOULDBLOCK` (full send buffer)
-  the drain must fall back to the async `send_to().await` for backpressure, not
-  spin. Pull the fd via `AsRawFd`; keep the async socket as the backpressure path.
+- **EWOULDBLOCK fallback (Linux).** The synchronous `sendmmsg` on the non-blocking
+  fd bypasses tokio's writability; on a full send buffer it returns `EWOULDBLOCK`.
+  The drain must fall back to async `send_to().await` for the unsent tail, never
+  spin or drop.
 - **Test-only loss injection** (`router.rs:649-658`, `drop_every_n`) must be
   applied per-packet *inside* the batch, not per-drain, or the simulated-loss
   tests change meaning.
