@@ -257,12 +257,18 @@ jobs:
       #     delivery, then that the batched recv path actually carried the bulk
       #     (`recv_batch_stats().syscalls > 0`) — the assertion that only fires
       #     on Linux where the recvmmsg path is live.
+      #   - recv_drain_depth — floods a node with fire-and-forget datagrams (no
+      #     reliability, so no retransmit-exhaustion flakiness) and asserts the
+      #     recvmmsg path collapsed syscalls (`packets > syscalls`), printing the
+      #     packets/syscall factor — the heavy-load recv analogue of
+      #     send_drain_depth.
       # `--no-capture` surfaces the packets/recvmmsg-batch collapse counts.
       - name: Batched ingress (Linux recvmmsg path)
         if: ${{ !cancelled() }}
         run: >
           cargo nextest run --no-fail-fast --features dataforts --no-capture
           --test batched_ingress_integrity
+          --test recv_drain_depth
 
       # === Dataforts blob e2e (multi-node + migration) ====================
       # `redex-disk` is required so MeshBlobAdapter can spin up a real
