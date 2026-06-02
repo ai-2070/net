@@ -26,8 +26,14 @@ use super::route::{RoutingHeader, RoutingTable, ROUTING_HEADER_SIZE};
 // to `wait()`. This is the batchability signal — a sendmmsg drain only pays
 // when runs are long. Off unless `arm_send_drain_histo()` is called BEFORE
 // the send loop starts (the loop latches the flag once at startup), so an
-// unarmed/production loop pays only a stack-local increment. Measurement
-// scaffolding — not intended to ship.
+// unarmed/production loop pays only a stack-local increment.
+//
+// Measurement scaffolding — not part of the supported public API. The
+// arm/snapshot entry points are re-exported only so the in-repo integration
+// tests (`send_drain_depth`, `scheduled_stream_integrity`), which compile as
+// external crates, can drive them; every such entry point is `#[doc(hidden)]`
+// so it never appears in the crate's documented surface and downstream code
+// is not invited to depend on it.
 static SEND_DRAIN_HISTO: [AtomicU64; 9] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -44,12 +50,14 @@ static SEND_DRAIN_MAX: AtomicU64 = AtomicU64::new(0);
 
 /// Arm the send-loop drain-run histogram. Must be called BEFORE the
 /// router's send loop starts — the loop reads the flag once at startup.
+#[doc(hidden)]
 pub fn arm_send_drain_histo() {
     SEND_DRAIN_ARMED.store(true, Ordering::Relaxed);
 }
 
 /// Snapshot the drain-run histogram. Index `i` (for `i < 8`) counts drain
 /// runs whose length fell in `[2^i, 2^(i+1))`; index `8` is `[256, ∞)`.
+#[doc(hidden)]
 pub fn send_drain_histo_snapshot() -> [u64; 9] {
     let mut out = [0u64; 9];
     for (i, b) in SEND_DRAIN_HISTO.iter().enumerate() {
@@ -59,6 +67,7 @@ pub fn send_drain_histo_snapshot() -> [u64; 9] {
 }
 
 /// Longest single drain run observed so far (exact, not bucketed).
+#[doc(hidden)]
 pub fn send_drain_max() -> u64 {
     SEND_DRAIN_MAX.load(Ordering::Relaxed)
 }
@@ -81,6 +90,7 @@ static SEND_BATCH_PACKETS: AtomicU64 = AtomicU64::new(0);
 
 /// `(flushes, packets)` sent via the batched-drain path. `packets / flushes`
 /// is the realized syscall-collapse factor (≈ `MAX_BATCH_SIZE` when full).
+#[doc(hidden)]
 pub fn send_batch_stats() -> (u64, u64) {
     (
         SEND_BATCH_FLUSHES.load(Ordering::Relaxed),
@@ -805,6 +815,12 @@ impl NetRouter {
             while running.load(Ordering::Acquire) {
                 // Dequeue and send
                 if let Some(first) = scheduler.dequeue() {
+                    // Count every packet `dequeue()` hands back, by design:
+                    // `drain_run` measures the scheduler's drain run-length,
+                    // not wire packets, so test-injected drops below still
+                    // count (in production `drop_every_n == 0`, so there are
+                    // none). This is deliberately distinct from the batch-flush
+                    // packet counter, which tracks only what reaches the wire.
                     drain_run += 1;
 
                     // Fast path: nothing else queued → send this one packet
