@@ -414,8 +414,12 @@ impl std::fmt::Debug for PacketReceiver {
 #[cfg(target_os = "linux")]
 pub struct BatchedPacketReceiver {
     rx: tokio::sync::mpsc::Receiver<Vec<(Bytes, SocketAddr)>>,
-    /// Packets from the batch currently being drained, in arrival order.
-    pending: std::collections::VecDeque<(Bytes, SocketAddr)>,
+    /// Packets from the batch currently being drained, in arrival order. A
+    /// `vec::IntoIter` rather than a `VecDeque` so adopting a freshly received
+    /// batch is a move of the channel's `Vec` (zero element copies); the common
+    /// case is `pending` already exhausted before the next batch arrives, so
+    /// there is nothing to splice and a copy would be pure overhead.
+    pending: std::vec::IntoIter<(Bytes, SocketAddr)>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     _socket: Arc<UdpSocket>,
     _thread: Option<std::thread::JoinHandle<()>>,
@@ -573,7 +577,7 @@ impl BatchedPacketReceiver {
 
         Self {
             rx,
-            pending: std::collections::VecDeque::new(),
+            pending: Vec::new().into_iter(),
             shutdown,
             _socket: socket,
             _thread: Some(thread),
@@ -589,14 +593,17 @@ impl BatchedPacketReceiver {
     /// packet has been handed out.
     pub async fn recv(&mut self) -> io::Result<(Bytes, SocketAddr)> {
         loop {
-            if let Some(packet) = self.pending.pop_front() {
+            if let Some(packet) = self.pending.next() {
                 return Ok(packet);
             }
             match self.rx.recv().await {
                 // The thread only sends non-empty batches; the loop re-checks
                 // `pending` and returns the first packet. (An empty batch, were
-                // one ever sent, simply loops back to await the next.)
-                Some(batch) => self.pending.extend(batch),
+                // one ever sent, yields an empty iterator that loops straight
+                // back to await the next.) The assignment is synchronous right
+                // after the channel yields — no await between taking the batch
+                // and adopting it — so a cancelled `recv()` can't drop packets.
+                Some(batch) => self.pending = batch.into_iter(),
                 None => {
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionReset,
@@ -1016,6 +1023,19 @@ mod tests {
             3,
             "BatchedPacketReceiver did not deliver three loopback datagrams within 2 s"
         );
+        // Arrival order must be preserved end-to-end: the recv thread fills the
+        // batch in recvmmsg order and `recv()` drains `pending` (a vec::IntoIter)
+        // front-to-back. From a single loopback sender that means the `i` byte
+        // is monotonic 0,1,2 regardless of whether the kernel coalesced the
+        // three into one recvmmsg batch or returned them singly. Guards the
+        // drain-order contract the IngressReceiver relies on.
+        for (k, data) in got.iter().enumerate() {
+            assert_eq!(
+                data[1], k as u8,
+                "BatchedPacketReceiver reordered packets: position {k} carried marker {}",
+                data[1]
+            );
+        }
 
         // Dropping the receiver sets the shutdown AtomicBool and
         // joins the thread. If the loop body doesn't notice the
