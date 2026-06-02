@@ -2,7 +2,34 @@
 
 ## Status
 
-**Parked, pending the c128 measurement — but most of the substrate already exists.**
+**Implemented opt-in (default OFF); flipping the default is parked pending the
+c128 measurement.**
+
+Stages 1–5 of this plan have shipped behind `MeshNodeConfig::batched_ingress`
+(default `false`, no-op off Linux):
+
+1. Recv-side instrument (`arm_recv_drain_histo` / `recv_drain_histo_snapshot` /
+   `recv_drain_max` / `recv_batch_stats`, `#[doc(hidden)]` in `transport.rs`).
+2. Gap-fix #1: the batched receiver hands a whole recvmmsg batch over the
+   channel per syscall instead of one packet per `blocking_send`.
+3. The mesh receive loop (`MeshNode::spawn_receive_loop`) uses
+   `BatchedPacketReceiver` when `batched_ingress` is on, via a local
+   `IngressReceiver` enum so the dispatch loop is written once.
+4. `tests/batched_ingress_integrity.rs` — byte-for-byte delivery through the
+   batched path + (Linux) `recv_batch_stats().syscalls > 0`.
+5. Linux CI step exercising the recvmmsg path.
+
+What remains is **the decision**, not the code: run the c128 throughput +
+unary-latency measurement (below), and if it justifies the cross-thread
+channel-hop tax, flip `batched_ingress` to default-on (or enable it per
+deployment). Gap-fix #2 (kernel-blocking idle instead of the 1 ms poll) is
+still deferred — measure first. The rest of this document is the original
+design rationale, retained for that decision.
+
+NOTE: the Linux recvmmsg path is not compilable on the Windows dev host used
+to implement these stages (cross toolchain unavailable, WSL broken), so the
+batched arm is validated by reasoning + the Linux CI gate; the off path,
+config plumbing, instrument, and integrity harness build and pass locally.
 
 The original framing of this plan ("build a recvmmsg wrapper symmetric to the
 sendmmsg work") is out of date. While auditing the code for this plan we found
