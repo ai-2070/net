@@ -180,6 +180,13 @@ pub use swarm::{
     MAX_GRAPH_NODES, MAX_SEEN_PINGWAVES, PINGWAVE_SIZE,
 };
 pub use transport::{NetSocket, PacketReceiver, PacketSender, ParsedPacket, SocketBufferConfig};
+// Recv-loop batching instrument (NRPC_RECV_LOOP_BATCHING_PLAN), symmetric to
+// the send-side drain instrument. Re-exported only so the in-repo integration
+// tests can drive it; `#[doc(hidden)]` keeps it off the documented surface.
+#[doc(hidden)]
+pub use transport::{
+    arm_recv_drain_histo, recv_batch_stats, recv_drain_histo_snapshot, recv_drain_max,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
