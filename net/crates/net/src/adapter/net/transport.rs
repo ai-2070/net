@@ -509,15 +509,24 @@ impl BatchedPacketReceiver {
                                 std::thread::sleep(std::time::Duration::from_millis(1));
                                 continue;
                             }
-                            // One non-empty recvmmsg = one ingress syscall.
+                            // Capture the batch size before the move so it can
+                            // be recorded AFTER a successful handoff: a batch
+                            // dropped because the channel closed mid-teardown is
+                            // never delivered to the consumer, so counting it
+                            // before the send would inflate the syscall/packet
+                            // tallies by the in-flight batch at shutdown.
                             #[cfg(feature = "batched-ingress")]
-                            recv_instrument::record_recv_batch(packets.len() as u64, measure);
+                            let batch_len = packets.len() as u64;
                             // Hand the whole batch over in a single channel op
                             // (one cross-thread handoff per recvmmsg, not per
                             // packet). `recv()` drains it front-to-back.
                             if tx.blocking_send(packets).is_err() {
                                 return;
                             }
+                            // One non-empty recvmmsg, successfully handed off,
+                            // is one ingress syscall the consumer will observe.
+                            #[cfg(feature = "batched-ingress")]
+                            recv_instrument::record_recv_batch(batch_len, measure);
                         }
                         Err(e) => {
                             if thread_shutdown.load(Ordering::Acquire) {
