@@ -1,0 +1,37 @@
+net/crates/net/docs/plans/NRPC_SEND_LOOP_BATCHING_PLAN.md
+  s_a612fb4983d0dc::t_b3a8456acb31bb 167
+  s_a612fb4983d0dc::t_f5eac9162031dd 262-269
+  s_a612fb4983d0dc::t_6f5e44d633d83e 166
+  s_a612fb4983d0dc::t_dd38f06d1f6734 346-353
+  s_a612fb4983d0dc::t_2d7e8e2076dfa7 204-211,214-215,257
+  s_a612fb4983d0dc::t_0f85923a3a5468 212-213,216-256
+net/crates/net/src/adapter/net/mod.rs
+  s_a612fb4983d0dc::t_f0d18d7e23143f 155-156
+  s_a612fb4983d0dc::t_0bd207965a9c19 154,157
+net/crates/net/src/adapter/net/router.rs
+  s_a612fb4983d0dc::t_c5f29d1de1c795 22-42,44-60,66-73,75-77
+  s_a612fb4983d0dc::t_e8470961889140 702-705,709
+  s_a612fb4983d0dc::t_bffaa086a7e75d 43,61-65,74
+  s_a612fb4983d0dc::t_0c4d5ebd282948 722-726
+net/crates/net/tests/send_drain_depth.rs
+  s_a612fb4983d0dc::t_26cb8779dbb666 1-27,30-116,126,158,171-172,174-182,204
+  s_a612fb4983d0dc::t_be32782c4ee3ba 117-125,127-157,159-166,170,173,183-203
+  s_a612fb4983d0dc::t_053614def24e65 167-169
+  s_a612fb4983d0dc::t_3fb783f405b9b9 28-29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "4aaff7b0c5c9c38f3cc6e36db9a835acb099a356",
+  "prompts": {},
+  "sessions": {
+    "s_a612fb4983d0dc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0f534a7d-bb9e-41e2-a556-7ffdaa01b76c",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

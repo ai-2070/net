@@ -1,0 +1,23 @@
+net/crates/net/docs/plans/NRPC_SEND_LOOP_BATCHING_PLAN.md
+  s_a612fb4983d0dc::t_e5b1c9f39f6df8 139,141-147
+  s_a612fb4983d0dc::t_bb77d21fc45e0e 87-102
+  s_a612fb4983d0dc::t_b276f451cf6a12 132-133
+  s_a612fb4983d0dc::t_7f4e507e3b5ae2 156-162,164-165
+  s_a612fb4983d0dc::t_e47ff40c1283fa 169,171-175,179-188,191-205,210,212-215
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "947128a93b5d01e35d08a95b7e279abe2025b30d",
+  "prompts": {},
+  "sessions": {
+    "s_a612fb4983d0dc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0f534a7d-bb9e-41e2-a556-7ffdaa01b76c",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
