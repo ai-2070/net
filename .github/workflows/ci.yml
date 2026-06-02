@@ -246,6 +246,24 @@ jobs:
           --test scheduled_stream
           --test scheduled_stream_integrity
 
+      # === Batched ingress (Linux recvmmsg receive path) ==================
+      # The NRPC_RECV_LOOP_BATCHING_PLAN gate. The mesh receive loop drains the
+      # socket via `recvmmsg` (BatchedPacketReceiver) when
+      # `MeshNodeConfig::with_batched_ingress(true)` is set — a path behind
+      # `cfg(target_os = "linux")` that does not compile on the macOS dev host,
+      # so this Linux job is the gate that compiles AND exercises it.
+      #   - batched_ingress_integrity — fetches blobs concurrently into a
+      #     fetcher built with batched ingress and asserts BYTE-FOR-BYTE
+      #     delivery, then that the batched recv path actually carried the bulk
+      #     (`recv_batch_stats().syscalls > 0`) — the assertion that only fires
+      #     on Linux where the recvmmsg path is live.
+      # `--no-capture` surfaces the packets/recvmmsg-batch collapse counts.
+      - name: Batched ingress (Linux recvmmsg path)
+        if: ${{ !cancelled() }}
+        run: >
+          cargo nextest run --no-fail-fast --features dataforts --no-capture
+          --test batched_ingress_integrity
+
       # === Dataforts blob e2e (multi-node + migration) ====================
       # `redex-disk` is required so MeshBlobAdapter can spin up a real
       # on-disk RedEX per node — separate from the in-memory dataforts
