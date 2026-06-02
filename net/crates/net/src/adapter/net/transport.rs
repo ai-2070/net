@@ -749,7 +749,10 @@ mod tests {
         assert_eq!(63 - CAP.leading_zeros(), RECV_DRAIN_BUCKETS as u32 - 1);
         // ...and one below the cap lands one bucket lower — the bands are tight,
         // not all collapsed into an oversized top bucket.
-        assert_eq!(63 - (CAP - 1).leading_zeros(), RECV_DRAIN_BUCKETS as u32 - 2);
+        assert_eq!(
+            63 - (CAP - 1).leading_zeros(),
+            RECV_DRAIN_BUCKETS as u32 - 2
+        );
     }
 
     #[tokio::test]
