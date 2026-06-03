@@ -1,0 +1,9 @@
+web/src/components/NavBar.tsx
+  ai_agent 11-12,14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "e7368350332fd399dc89de314bf8d5ccca801b01",
+  "prompts": {}
+}
