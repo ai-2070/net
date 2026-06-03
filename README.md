@@ -662,35 +662,28 @@ The numbers that matter for real workloads — ingest, fold, query, snapshot —
 
 `[profile.release]`: `lto = true`, `codegen-units = 1`, `panic = "abort"`, `opt-level = 3`. Three additional profiles ship in the crate's `Cargo.toml`: `release-with-debug` (release + `debug = true` for profiling), `native` (release + thin LTO for faster local links — pair with `RUSTFLAGS="-C target-cpu=native"`), and `bench` (full LTO, single codegen unit).
 
-Feature set affects `.rlib` and `.a` (which keep all compiled code for downstream linking) but is **near-invisible on the shipped cdylib for pure-Rust features** — LTO + dead-code elimination strips unreferenced code across feature boundaries, so the deployed `.dylib`/`.dll`/`.so` stays near-constant across the storage / compute / NAT-classifier combinations. Features that pull in substantial external dependency trees (UPnP's HTTP + XML stack) are the exception, and the table makes that explicit.
+Feature set affects `.rlib` and `.a` (which keep all compiled code for downstream linking) far more than the shipped cdylib — LTO + dead-code elimination strips unreferenced code across feature boundaries, so pure-Rust storage primitives add almost nothing to the deployed `.dylib`/`.dll`/`.so`. The folded-state query + blob + supervisor surfaces add real code, and features that pull in substantial external dependency trees (an MQ client, UPnP's HTTP + XML stack) are heavier still — the table walks the progression from bare transport to the full stack.
 
-**Core cdylib** (`libnet.dylib`, the engine the bindings consume):
+**Core cdylib** (`libnet.dylib`, the engine the bindings consume). Rows are cumulative — each adds the named features to the row above:
 
 | Features | `libnet.dylib` (cdylib) | `libnet.rlib` | `libnet.a` |
 |----------|------------------------:|--------------:|-----------:|
-| `net` | **1.92 MB** | 22.4 MB | 35.3 MB |
-| `net` + `redex` | **1.92 MB** | 22.8 MB | 35.6 MB |
-| `net` + `redex` + `redex-disk` | **1.92 MB** | 22.9 MB | 35.7 MB |
-| `net` + `redex` + `redex-disk` + `cortex` | **1.92 MB** | 24.8 MB | 36.6 MB |
-| `net` + `redex` + `redex-disk` + `cortex` + `netdb` | **2.21 MB** | 25.9 MB | 37.3 MB |
-| `net` + `nat-traversal` | **2.03 MB** | 23.6 MB | 36.1 MB |
-| `net` + `nat-traversal` + `port-mapping` | **3.44 MB** | 27.0 MB | 47.6 MB |
+| `net` + `nat-traversal` | **2.62 MB** | 35.6 MB | 42.3 MB |
+| `+ redex + redex-disk` | **2.64 MB** | 38.7 MB | 43.8 MB |
+| `+ cortex + netdb + dataforts + meshos` | **3.82 MB** | 64.5 MB | 55.1 MB |
+| `+ redis` | **4.39 MB** | 65.1 MB | 62.7 MB |
+| `+ jetstream` (instead of `redis`) | **5.87 MB** | 67.9 MB | 80.8 MB |
 
-**Binding cdylib** (`libnet_node.dylib`, the `.node` file shipped to Node users; the Python PyO3 module has the same shape):
-
-| Features | `libnet_node.dylib` |
-|----------|--------------------:|
-| `net` | **2.68 MB** |
-| `net` + `compute` | **3.02 MB** |
-| `net` + `compute` + `groups` | **3.23 MB** |
+The third row — `net + nat-traversal + redex + redex-disk + cortex + netdb + dataforts + meshos` — is the full folded-state stack: durable append-only logs, the cross-model query façade, Dataforts blob storage, and the MeshOS supervisor. It's the realistic "everything on" core build short of the optional external-service adapters.
 
 - `libnet.dylib` — shipped core cdylib (consumed by Node / Python / C bindings).
 - `libnet.rlib` — Rust static lib with metadata (consumed by other Rust crates).
 - `libnet.a` — C/C++ static lib, pre-LTO, expected for `staticlib`.
-- `libnet_node.dylib` — Node binding cdylib (what ships as `net.darwin-arm64.node`).
 
-Measured on `aarch64-apple-darwin`, 2026-04-24.
+Measured on `aarch64-apple-darwin`, 2026-06-03.
 
-The core cdylib stays at **1.92 MB across the four storage / compute combinations** — opting into RedEX, disk durability, or CortEX adds well under 1% to the deployed binary because dead-code elimination strips whatever the caller doesn't reference. `netdb` (the cross-model query façade that builds on `cortex`) adds **~301 KB** of Prisma-style query code paths. `nat-traversal` adds **~112 KB** (classifier FSM + rendezvous wire codec + the `connect_direct` orchestration path). `port-mapping` is the outlier at **+1.41 MB** — the extra weight is `igd-next`'s UPnP-IGD client, which pulls in a SOAP / XML stack and HTTP machinery that the rest of the mesh doesn't use; NAT-PMP alone is ~100 lines of wire codec inlined in the crate (no external dep), so a deployment that only needs NAT-PMP could strip UPnP support and stay near the `nat-traversal` line.
+`nat-traversal` adds **~94 KB** over bare `net` (classifier FSM + rendezvous wire codec + the `connect_direct` orchestration path). Layering RedEX + disk durability on top costs **~20 KB** on the cdylib — the durable-log primitives are near-free after dead-code elimination strips whatever the caller doesn't reference, even though the `.rlib` grows by ~3 MB. The folded-state + query + blob + supervisor jump (`cortex + netdb + dataforts + meshos`) is where the cdylib actually grows — **+1.18 MB** — because CortEX's fold dispatch, NetDB's Prisma-style query paths, the Dataforts CDC/erasure code, and the MeshOS reconcile loop all ship referenced code. The two external-service adapters are the heavy opt-ins: `redis` adds **+0.57 MB** (the `redis` client crate), and `jetstream` is the outlier at **+2.05 MB** — `async-nats` pulls in a large dependency tree the rest of the mesh doesn't use.
 
-The `compute` and `groups` features live at the binding / SDK layer (`net-sdk`'s `DaemonRuntime`, `Mikoshi` migration orchestrator, `ReplicaGroup` / `ForkGroup` / `StandbyGroup`) rather than in the core crate, so they don't appear in the core cdylib table. Enabling them on the binding cdylib adds **~349 KB** for `compute` and another **~216 KB** for `groups` on top — the Node `.node` file grows from 2.68 MB to 3.23 MB with the full stack. The `.rlib` and `.a` grow with features because they must preserve every compiled symbol for downstream linkers; only the shipped cdylibs feel the full benefit of LTO.
+The `compute` and `groups` features live at the binding / SDK layer (`net-sdk`'s `DaemonRuntime`, `Mikoshi` migration orchestrator, `ReplicaGroup` / `ForkGroup` / `StandbyGroup`) rather than in the core crate, so they don't change the `libnet.dylib` figures above — they only add weight to the binding cdylib (`libnet_node.dylib` / the Python PyO3 module / the `.node` shipped to npm). The `.rlib` and `.a` grow with features because they must preserve every compiled symbol for downstream linkers; only the shipped cdylibs feel the full benefit of LTO.
+
+The measurement harness lives in [`net/crates/net/tools/binary-size/`](net/crates/net/tools/binary-size/) — run `./measure_sizes.sh` to refresh these numbers after a dependency or feature change.
