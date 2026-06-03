@@ -1,0 +1,20 @@
+web/src/components/NavBar.tsx
+  ai_agent 8
+  s_11865f24cd1e4f::t_f9520c3cc044a0 1-2,4-5,17-21,23-64,77-92
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "335fb3f4b4c53ee2f99fcca279ed88bcd290bc84",
+  "prompts": {},
+  "sessions": {
+    "s_11865f24cd1e4f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "434eff69-6a6a-44a7-ba05-08c01001dac9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
