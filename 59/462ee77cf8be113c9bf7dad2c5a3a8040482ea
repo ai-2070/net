@@ -1,0 +1,56 @@
+net/crates/net/Cargo.toml
+  s_f6c191b51f28ba::t_fb639726bec4b1 20
+net/crates/net/sdk-macros/Cargo.toml
+  s_f6c191b51f28ba::t_9ead2d05b15a88 3
+net/crates/net/bindings/node/Cargo.toml
+  s_f6c191b51f28ba::t_0c20ca2aa2ef4f 138-139
+  s_f6c191b51f28ba::t_1735c0829a27d4 3
+net/crates/net/bindings/go/meshos-ffi/Cargo.toml
+  s_f6c191b51f28ba::t_e5c7f135bbd0a4 3,26
+net/crates/net/bindings/go/rpc-ffi/Cargo.toml
+  s_f6c191b51f28ba::t_e5c7f135bbd0a4 3,35
+net/crates/net/bindings/go/deck-ffi/Cargo.toml
+  s_f6c191b51f28ba::t_e5c7f135bbd0a4 3,27
+net/crates/net/bindings/node/package.json
+  s_f6c191b51f28ba::t_895b52866fb6ee 3
+net/crates/net/bindings/go/compute-ffi/Cargo.toml
+  s_f6c191b51f28ba::t_e5c7f135bbd0a4 3,48,52
+net/crates/net/aggregator-daemon/Cargo.toml
+  s_f6c191b51f28ba::t_e5c7f135bbd0a4 3,21,28
+net/crates/net/fuzz/Cargo.toml
+  s_f6c191b51f28ba::t_e5c7f135bbd0a4 34
+net/crates/net/bindings/go/meshdb-ffi/Cargo.toml
+  s_f6c191b51f28ba::t_e5c7f135bbd0a4 3,29
+net/crates/net/sdk/Cargo.toml
+  s_f6c191b51f28ba::t_4bd2b35379a3ba 25
+  s_f6c191b51f28ba::t_912306ddf1c4f5 43
+  s_f6c191b51f28ba::t_a2a555d481728a 3
+net/crates/net/sdk-ts/package.json
+  s_f6c191b51f28ba::t_4a7c42c98316bc 3
+  s_f6c191b51f28ba::t_2b9085b88aa0ab 42
+net/crates/net/cli/Cargo.toml
+  s_f6c191b51f28ba::t_e5c7f135bbd0a4 3,15
+net/crates/net/bindings/python/Cargo.toml
+  s_f6c191b51f28ba::t_177c2e0d16f2e4 119-120
+  s_f6c191b51f28ba::t_e91b4873f66be9 3
+net/crates/net/bindings/python/pyproject.toml
+  s_f6c191b51f28ba::t_ef4dbf2983abd8 10
+net/crates/net/deck/Cargo.toml
+  s_f6c191b51f28ba::t_e5c7f135bbd0a4 3,19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "59462ee77cf8be113c9bf7dad2c5a3a8040482ea",
+  "prompts": {},
+  "sessions": {
+    "s_f6c191b51f28ba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "aeb41064-2c0d-418f-ad38-0589f4ebe401",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
