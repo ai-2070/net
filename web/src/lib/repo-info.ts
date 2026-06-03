@@ -64,6 +64,18 @@ export function extractCodename(
   return m && m[1] ? m[1] : null;
 }
 
+// Matches an alpha/beta prerelease identifier in a semver tag, e.g.
+// `v1.2.0-alpha`, `v1.2.0-beta.3`, `1.2.0alpha1`. Bounded so a stable
+// tag that merely contains the substring elsewhere isn't excluded.
+const ALPHA_BETA_RE = /[-._]?(alpha|beta)(\b|\d|[-._])/i;
+
+// A release is "stable" when GitHub hasn't flagged it as a prerelease
+// and its tag carries no alpha/beta identifier.
+export function isStableRelease(r: GhRelease): boolean {
+  if (r.prerelease) return false;
+  return !ALPHA_BETA_RE.test(r.tag_name ?? "");
+}
+
 export function ghHeaders(): HeadersInit {
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
@@ -129,7 +141,7 @@ export async function fetchAllReleases(): Promise<ReadonlyArray<Release>> {
     if (!res.ok) return [];
     const data = (await res.json()) as ReadonlyArray<GhRelease>;
     return data.flatMap<Release>((r) => {
-      if (!r.tag_name) return [];
+      if (!r.tag_name || !isStableRelease(r)) return [];
       const md = (r.body ?? "").replace(/\r\n/g, "\n").trim();
       return [
         {
