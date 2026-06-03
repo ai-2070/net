@@ -70,6 +70,14 @@ jobs:
           test -f dist/index.d.ts || (echo "dist/index.d.ts missing"; exit 1)
 
       - name: Publish to npm
-        run: npm publish --access public
+        shell: bash
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          case "$VERSION" in
+            *-*) DIST_TAG="$(printf '%s' "${VERSION#*-}" | cut -d. -f1)" ;;
+            *)   DIST_TAG="latest" ;;
+          esac
+          echo "Publishing $VERSION with npm dist-tag: $DIST_TAG"
+          npm publish --access public --tag "$DIST_TAG"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

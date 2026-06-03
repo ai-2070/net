@@ -212,7 +212,20 @@ jobs:
         run: ls -la npm/
 
       - name: Publish to npm
+        shell: bash
         run: |
-          npm publish --access public
+          VERSION="$(node -p "require('./package.json').version")"
+          case "$VERSION" in
+            *-*) DIST_TAG="$(printf '%s' "${VERSION#*-}" | cut -d. -f1)" ;;
+            *)   DIST_TAG="latest" ;;
+          esac
+          echo "Publishing $VERSION with npm dist-tag: $DIST_TAG"
+          # `npm_config_tag` is npm's env form of `--tag`. It is inherited by the
+          # per-platform `npm publish` calls that `napi prepublish` (invoked from
+          # this package's prepublishOnly) shells out to and which take no flag of
+          # their own. npm refuses to publish a prerelease under the default
+          # `latest` tag, so a beta/rc must set this on every publish.
+          export npm_config_tag="$DIST_TAG"
+          npm publish --access public --tag "$DIST_TAG"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
