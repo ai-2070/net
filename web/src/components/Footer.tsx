@@ -6,13 +6,14 @@ const FOOTER_SPEC: ReadonlyArray<{
   label: string;
   class?: string;
 }> = [
-  { href: "#topology", label: "Topology classes" },
-  { href: "#properties", label: "Protocol properties" },
-  { href: "#mikoshi", label: "Mikoshi" },
-  { href: "#runtime", label: "Compute runtime" },
-  { href: "#apps", label: "Applications" },
-  { href: "#wall", label: "The Blackwall" },
-  { href: "#releases", label: "Releases" },
+  { href: "/#topology", label: "Topology classes" },
+  { href: "/#properties", label: "Protocol properties" },
+  { href: "/#mikoshi", label: "Mikoshi" },
+  { href: "/#runtime", label: "Compute runtime" },
+  { href: "/#apps", label: "Applications" },
+  { href: "/#meshos", label: "MeshOS" },
+  { href: "/#wall", label: "The Blackwall" },
+  { href: "/#releases", label: "Releases" },
 ];
 
 const FOOTER_DOCS: ReadonlyArray<{
