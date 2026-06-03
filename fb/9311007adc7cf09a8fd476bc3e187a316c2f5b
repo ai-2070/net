@@ -1,0 +1,21 @@
+net/crates/net/fuzz/fuzz_targets/snapshot_reassembler_feed.rs
+  s_9990d5bc6d9e95::t_73cca552421ffe 39
+  s_9990d5bc6d9e95::t_1e65639d420063 49,52-53
+  s_9990d5bc6d9e95::t_8572113b4b0e0d 28,30-32
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "fb9311007adc7cf09a8fd476bc3e187a316c2f5b",
+  "prompts": {},
+  "sessions": {
+    "s_9990d5bc6d9e95": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b988e726-59f1-485c-8600-ff8e3d4106d2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
