@@ -215,7 +215,15 @@ jobs:
 
       - name: Publish to npm
         working-directory: pkg-${{ matrix.npm-suffix }}
-        run: npm publish --access public --provenance
+        shell: bash
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          case "$VERSION" in
+            *-*) DIST_TAG="$(printf '%s' "${VERSION#*-}" | cut -d. -f1)" ;;
+            *)   DIST_TAG="latest" ;;
+          esac
+          echo "Publishing $VERSION with npm dist-tag: $DIST_TAG"
+          npm publish --access public --provenance --tag "$DIST_TAG"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -250,6 +258,14 @@ jobs:
           fi
 
       - name: Publish to npm
-        run: npm publish --access public --provenance
+        shell: bash
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          case "$VERSION" in
+            *-*) DIST_TAG="$(printf '%s' "${VERSION#*-}" | cut -d. -f1)" ;;
+            *)   DIST_TAG="latest" ;;
+          esac
+          echo "Publishing $VERSION with npm dist-tag: $DIST_TAG"
+          npm publish --access public --provenance --tag "$DIST_TAG"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
