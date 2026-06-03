@@ -1,0 +1,9 @@
+web/src/components/HeroSection.tsx
+  ai_agent 7-8,730-731,735
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "f1b707cb5946548557bf27c17bc2bb2606f41f2e",
+  "prompts": {}
+}
