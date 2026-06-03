@@ -25,16 +25,18 @@ use net::adapter::net::compute::SnapshotReassembler;
 
 // Structured input: parse the fuzz buffer as a sequence of
 // calls. First byte = op count (0..=32). Each op consumes
-// 16 bytes: (origin u32) | (seq_through u64) | (chunk_index u32)
+// 25 bytes: (origin u64) | (seq_through u64) | (chunk_index u32)
 // | (total_chunks u32) | (payload_len u8) — followed by
-// `payload_len` bytes of chunk data (capped).
+// `payload_len` bytes of chunk data (capped). `origin` is the
+// full u64 `daemon_origin` wire field, so the fuzzer can reach
+// the entire origin space rather than just the low 32 bits.
 fuzz_target!(|data: &[u8]| {
     let mut r = SnapshotReassembler::new();
     let mut cursor = 0usize;
     // Track the most-recently-fed origin so the post-loop
     // cancel actually exercises a populated slot rather than
     // a hardcoded origin that libfuzzer never saw (cubic P2).
-    let mut last_origin: Option<u32> = None;
+    let mut last_origin: Option<u64> = None;
 
     // Max ops per fuzz input — bounds wall-clock per case so
     // the fuzzer can explore shape space instead of depth.
@@ -44,11 +46,11 @@ fuzz_target!(|data: &[u8]| {
     let n_ops = n_ops.min(MAX_OPS);
 
     for _ in 0..n_ops {
-        if data.len() < cursor + 21 {
+        if data.len() < cursor + 25 {
             break;
         }
-        let origin = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
-        cursor += 4;
+        let origin = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+        cursor += 8;
         let seq_through = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
         cursor += 8;
         let chunk_index = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
