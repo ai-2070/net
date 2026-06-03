@@ -1,0 +1,9 @@
+web/src/components/Footer.tsx
+  ai_agent 9-16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "393716e42555e1135b9832480463722a3a744216",
+  "prompts": {}
+}
