@@ -48,7 +48,15 @@ fn test_config() -> MeshNodeConfig {
     let mut cfg = MeshNodeConfig::new(addr, PSK)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))
-        .with_handshake(3, Duration::from_secs(2));
+        // Generous handshake budget. Under nextest / llvm-cov the runner
+        // is heavily loaded (dozens of mesh tests in parallel), which
+        // starves recv loops enough that a *localhost* handshake
+        // round-trip can blow a tight 2s × 3 budget — surfacing as a
+        // "handshake timeout" flake during topology setup, not in the
+        // behavior under test. 4 attempts × 4s rides out the stalls.
+        // (Only the deliberate wrong-pubkey failure paths pay the full
+        // budget; success-path connects still complete on attempt 1.)
+        .with_handshake(4, Duration::from_secs(4));
     cfg.socket_buffers = SocketBufferConfig {
         send_buffer_size: TEST_BUFFER_SIZE,
         recv_buffer_size: TEST_BUFFER_SIZE,
