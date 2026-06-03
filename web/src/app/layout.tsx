@@ -9,6 +9,7 @@ import { PostHogProvider } from "@/components/PostHogProvider";
 import { RepoInfoProvider } from "@/components/RepoInfoProvider";
 import { TopStatusBar } from "@/components/TopStatusBar";
 import { getRepoInfo } from "@/lib/repo-info";
+import { siteUrl } from "@/lib/site-url";
 
 const jetbrainsMono = JetBrains_Mono({
   variable: "--font-jetbrains-mono",
@@ -29,6 +30,7 @@ const spaceGrotesk = Space_Grotesk({
 });
 
 export const metadata: Metadata = {
+  metadataBase: new URL(siteUrl()),
   title: "NET — Network Event Transport. A latency-first encrypted mesh.",
   description:
     "NET is a latency-first encrypted mesh runtime. Every device is a first-class node on a flat, encrypted topology. Nanosecond scheduling, zero-copy forwarding, capability-based routing. ~2.53 MB deployed binary.",
