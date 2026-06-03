@@ -1055,7 +1055,7 @@ dependencies = [
 
 [[package]]
 name = "net-mesh"
-version = "0.27.0"
+version = "0.27.0-beta.1"
 dependencies = [
  "arc-swap",
  "async-trait",
