@@ -5,7 +5,7 @@ import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 
 const NAV_LINKS: ReadonlyArray<{ href: string; label: string }> = [
-  { href: "/", label: "HOME" },
+  { href: "/#what", label: "HOME" },
   { href: "/#bench", label: "BENCH" },
   { href: "/#runtime", label: "RUNTIME" },
   { href: "/#apps", label: "APPS" },
