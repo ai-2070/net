@@ -21,7 +21,6 @@
 // language tests (T-1) will pin byte equality across both.
 
 import type { CallOptions, ServeHandle, TypedMeshRpc } from './mesh_rpc'
-import type { CapabilitySetJs, ToolJs } from './index'
 
 /**
  * Structural shape of the napi `NetMesh.listTools()` return value
@@ -52,6 +51,35 @@ interface NativeToolWatchIter {
  */
 interface MeshWithWatchTools {
   watchTools(intervalMs?: number | null): Promise<NativeToolWatchIter>
+}
+
+/**
+ * Structural mirror of the napi `ToolJs` capability-fold entry —
+ * declared here, like the shapes above, so this file type-checks
+ * before `napi build` regenerates `index.d.ts`. Field-for-field
+ * identical to `index.d.ts`'s `ToolJs`.
+ */
+interface ToolJs {
+  toolId: string
+  name?: string
+  version?: string
+  inputSchema?: string
+  outputSchema?: string
+  requires?: Array<string>
+  estimatedTimeMs?: number
+  stateless?: boolean
+}
+
+/**
+ * Structural mirror of the napi `CapabilitySetJs`, narrowed to the
+ * two fields `addToolCapabilitiesToAnnounce` reads/writes. Every napi
+ * `CapabilitySetJs` field is optional, so this narrower shape stays
+ * assignable in both directions — a full capability set passes in,
+ * and the returned object still flows into `announceCapabilities(...)`.
+ */
+interface CapabilitySetJs {
+  tags?: Array<string>
+  tools?: Array<ToolJs>
 }
 
 // ============================================================================
