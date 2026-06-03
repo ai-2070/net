@@ -4,6 +4,8 @@ import { PacketRain } from "./PacketRain";
 import { useRepoInfo } from "./RepoInfoProvider";
 import { buildQuarter } from "@/lib/utils";
 import { useState, useEffect, useRef, useMemo } from "react";
+import Link from "next/link";
+import globals from "@/lib/globals";
 
 interface Node3D {
   x: number;
@@ -725,12 +727,12 @@ export function HeroSection() {
           </p>
 
           <div className="mt-11 flex gap-3 flex-wrap items-center">
-            <a
-              href="#install"
+            <Link
+              href={globals.links.install}
               className="btn-primary inline-flex items-center gap-2.5 px-5 py-3 text-[11px] tracking-[0.12em] uppercase font-semibold no-underline border border-accent bg-accent text-bg transition-all"
             >
               ↓ Install NET <span className="text-sm">→</span>
-            </a>
+            </Link>
             <a
               href="#bench"
               className="btn-ghost inline-flex items-center gap-2.5 px-5 py-3 text-[11px] tracking-[0.12em] uppercase font-semibold no-underline border border-ink-faint text-ink transition-all"
