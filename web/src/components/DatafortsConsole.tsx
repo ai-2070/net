@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 
 interface PoolNode {
   id: string;
@@ -54,92 +54,107 @@ const BAR_WIDTH = 22;
 export function DatafortsConsole() {
   const [nodes, setNodes] = useState<ReadonlyArray<PoolNode>>(POOL_INITIAL);
   const [events, setEvents] = useState<ReadonlyArray<PoolEvent>>([]);
+  // Persist across effect re-runs (incl. StrictMode's double-invoke) so
+  // event ids stay globally unique and the tick reads the latest pool.
+  const eventIdRef = useRef(0);
+  const nodesRef = useRef<ReadonlyArray<PoolNode>>(POOL_INITIAL);
 
   useEffect(() => {
-    let eventCounter = 0;
-
-    const pushEvent = (kind: PoolEvent["kind"], body: string): void => {
-      eventCounter += 1;
-      const e: PoolEvent = { id: eventCounter, ts: poolTs(), kind, body };
-      setEvents((prev) => [...prev.slice(-5), e]);
+    const makeEvent = (kind: PoolEvent["kind"], body: string): PoolEvent => {
+      eventIdRef.current += 1;
+      return { id: eventIdRef.current, ts: poolTs(), kind, body };
+    };
+    const emit = (evs: ReadonlyArray<PoolEvent>): void => {
+      if (evs.length === 0) return;
+      setEvents((prev) => [...prev, ...evs].slice(-6));
     };
 
     // seed initial event log so the panel doesn't look empty
-    pushEvent("push", `0x4d8d → 0xeb29 · 8.4M · accepted · 204ms`);
-    pushEvent("heat", `0x7e3a · rate 0.78 · gravity → 0x7af3`);
-    pushEvent("cool", `0xb547 · rate 0.12 · evictable`);
-    pushEvent("absorb", `0x9a3e · free +18% · open`);
-    pushEvent("push", `0x2c91 → 0x9a3e · 18.2M · accepted · 156ms`);
+    emit([
+      makeEvent("push", `0x4d8d → 0xeb29 · 8.4M · accepted · 204ms`),
+      makeEvent("heat", `0x7e3a · rate 0.78 · gravity → 0x7af3`),
+      makeEvent("cool", `0xb547 · rate 0.12 · evictable`),
+      makeEvent("absorb", `0x9a3e · free +18% · open`),
+      makeEvent("push", `0x2c91 → 0x9a3e · 18.2M · accepted · 156ms`),
+    ]);
 
     const id = window.setInterval(() => {
-      setNodes((prev) => {
-        const next = prev.map((n) => {
-          const drift = (Math.random() - 0.45) * 0.05;
-          return {
-            ...n,
-            fill: Math.max(0.12, Math.min(0.96, n.fill + drift)),
-          };
-        });
+      const prev = nodesRef.current;
+      const next = prev.map((n) => {
+        const drift = (Math.random() - 0.45) * 0.05;
+        return {
+          ...n,
+          fill: Math.max(0.12, Math.min(0.96, n.fill + drift)),
+        };
+      });
 
-        // any node over high-water → overflow into lowest neighbor
-        const overIdx = next.findIndex((n) => n.fill >= POOL_HIGH);
-        if (overIdx >= 0) {
-          let toIdx = -1;
-          let minFill = 1;
-          for (let i = 0; i < next.length; i++) {
-            if (i === overIdx) continue;
-            const f = next[i]?.fill ?? 1;
-            if (f < minFill) {
-              minFill = f;
-              toIdx = i;
-            }
-          }
-          if (toIdx >= 0) {
-            const amount = 0.1;
-            const from = next[overIdx];
-            const to = next[toIdx];
-            if (from && to) {
-              next[overIdx] = { ...from, fill: from.fill - amount };
-              next[toIdx] = { ...to, fill: Math.min(0.96, to.fill + amount) };
-              const size = pickHumanBytes(8, 220);
-              const ms = Math.floor(150 + Math.random() * 220);
-              const fromShort = from.id.slice(-4);
-              const toShort = to.id.slice(-4);
-              pushEvent(
-                "push",
-                `0x${shortHash().slice(0, 4)} · 0x${fromShort} → 0x${toShort} · ${size} · ${ms}ms`,
-              );
-            }
+      const evs: PoolEvent[] = [];
+
+      // any node over high-water → overflow into lowest neighbor
+      const overIdx = next.findIndex((n) => n.fill >= POOL_HIGH);
+      if (overIdx >= 0) {
+        let toIdx = -1;
+        let minFill = 1;
+        for (let i = 0; i < next.length; i++) {
+          if (i === overIdx) continue;
+          const f = next[i]?.fill ?? 1;
+          if (f < minFill) {
+            minFill = f;
+            toIdx = i;
           }
         }
-
-        // occasional heat/cool/absorb events
-        const r = Math.random();
-        if (r < 0.22) {
-          const rate = (0.4 + Math.random() * 0.5).toFixed(2);
-          pushEvent(
-            "heat",
-            `0x${shortHash().slice(0, 4)} · rate ${rate} · gravity active`,
-          );
-        } else if (r < 0.4) {
-          const rate = (0.05 + Math.random() * 0.18).toFixed(2);
-          pushEvent(
-            "cool",
-            `0x${shortHash().slice(0, 4)} · rate ${rate} · evictable`,
-          );
-        } else if (r < 0.5) {
-          const node = next[Math.floor(Math.random() * next.length)];
-          if (node && node.fill < 0.5) {
-            const freePct = Math.round((1 - node.fill) * 100);
-            pushEvent(
-              "absorb",
-              `${node.id.slice(-6)} · free ${freePct}% · open`,
+        if (toIdx >= 0) {
+          const amount = 0.1;
+          const from = next[overIdx];
+          const to = next[toIdx];
+          if (from && to) {
+            next[overIdx] = { ...from, fill: from.fill - amount };
+            next[toIdx] = { ...to, fill: Math.min(0.96, to.fill + amount) };
+            const size = pickHumanBytes(8, 220);
+            const ms = Math.floor(150 + Math.random() * 220);
+            const fromShort = from.id.slice(-4);
+            const toShort = to.id.slice(-4);
+            evs.push(
+              makeEvent(
+                "push",
+                `0x${shortHash().slice(0, 4)} · 0x${fromShort} → 0x${toShort} · ${size} · ${ms}ms`,
+              ),
             );
           }
         }
+      }
 
-        return next;
-      });
+      // occasional heat/cool/absorb events
+      const r = Math.random();
+      if (r < 0.22) {
+        const rate = (0.4 + Math.random() * 0.5).toFixed(2);
+        evs.push(
+          makeEvent(
+            "heat",
+            `0x${shortHash().slice(0, 4)} · rate ${rate} · gravity active`,
+          ),
+        );
+      } else if (r < 0.4) {
+        const rate = (0.05 + Math.random() * 0.18).toFixed(2);
+        evs.push(
+          makeEvent(
+            "cool",
+            `0x${shortHash().slice(0, 4)} · rate ${rate} · evictable`,
+          ),
+        );
+      } else if (r < 0.5) {
+        const node = next[Math.floor(Math.random() * next.length)];
+        if (node && node.fill < 0.5) {
+          const freePct = Math.round((1 - node.fill) * 100);
+          evs.push(
+            makeEvent("absorb", `${node.id.slice(-6)} · free ${freePct}% · open`),
+          );
+        }
+      }
+
+      nodesRef.current = next;
+      setNodes(next);
+      emit(evs);
     }, 1400);
 
     return () => window.clearInterval(id);
