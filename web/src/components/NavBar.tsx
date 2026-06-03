@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
+import globals from "@/lib/globals";
 
 const NAV_LINKS: ReadonlyArray<{ href: string; label: string }> = [
   { href: "/#what", label: "HOME" },
@@ -93,20 +94,20 @@ export function NavBar() {
           );
         })}
         <li>
-          <a
-            href="#install"
+          <Link
+            href={globals.links.install}
             className="install-btn bg-accent text-bg border border-accent px-3.5 py-1.5 text-[11px] tracking-[0.08em] uppercase font-semibold transition-colors"
           >
             ↓ INSTALL
-          </a>
+          </Link>
         </li>
       </ul>
-      <a
-        href="#install"
+      <Link
+        href={globals.links.install}
         className="lg:hidden ml-auto install-btn bg-accent text-bg border border-accent px-3.5 py-1.5 text-[11px] tracking-[0.08em] uppercase font-semibold transition-colors"
       >
         ↓ INSTALL
-      </a>
+      </Link>
     </nav>
   );
 }
