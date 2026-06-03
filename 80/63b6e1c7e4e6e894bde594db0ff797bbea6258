@@ -1,0 +1,35 @@
+web/src/lib/docs-language.ts
+  s_11865f24cd1e4f::t_1d5a2c568c2259 18-27
+web/src/components/DocsSidebar.tsx
+  s_11865f24cd1e4f::t_27094a7b4cb058 6-7
+  s_11865f24cd1e4f::t_6cf8f4fdf2240c 330
+web/src/store/useLanguageStore.ts
+  s_11865f24cd1e4f::t_d75c36718a4273 4-5,21-25,28-56,58-59,61-64,68
+  s_11865f24cd1e4f::t_adacf4a7a222e5 1-3,6-20,26-27,57,60,65-67,69-70
+web/src/app/docs/layout.tsx
+  s_11865f24cd1e4f::t_747cf3a90a908a 38
+  s_11865f24cd1e4f::t_750d8c61ce90e3 4
+  s_11865f24cd1e4f::t_24d12f576d5122 19-20
+web/src/components/LanguageHydrator.tsx
+  s_11865f24cd1e4f::t_7032c85a320f34 1-12,14-16
+  s_11865f24cd1e4f::t_42105b5d3da84f 13
+web/src/components/LanguageSwitcher.tsx
+  s_11865f24cd1e4f::t_c146053dc154e2 4
+  s_11865f24cd1e4f::t_369b50a621efa7 15-16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "8063b6e1c7e4e6e894bde594db0ff797bbea6258",
+  "prompts": {},
+  "sessions": {
+    "s_11865f24cd1e4f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "434eff69-6a6a-44a7-ba05-08c01001dac9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
