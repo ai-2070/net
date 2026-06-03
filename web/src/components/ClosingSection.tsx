@@ -1,6 +1,7 @@
 import { SectionLabel } from "./SectionLabel";
 import { DisplayHeading } from "./DisplayHeading";
 import globals from "@/lib/globals";
+import Link from "next/link";
 
 export function ClosingSection() {
   return (
@@ -59,12 +60,12 @@ export function ClosingSection() {
           <br />
           running.
         </div>
-        <a
+        <Link
           href={globals.links.install}
           className="btn-primary inline-flex items-center gap-2.5 px-5 py-3 text-[11px] tracking-[0.12em] uppercase font-semibold no-underline border border-accent bg-accent text-bg transition-all mt-5"
         >
           ↓ Install NET <span className="text-sm">→</span>
-        </a>
+        </Link>
       </div>
     </section>
   );
