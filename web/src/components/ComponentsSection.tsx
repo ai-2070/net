@@ -38,7 +38,7 @@ const COMPONENTS: readonly ComponentSpec[] = [
         consensus — log is local, replay is local, retention is local.
       </>
     ),
-    stats: "21.3 M append/s · 138 ns tail",
+    stats: "28.7 M append/s · 161 ns tail",
   },
   {
     num: "▸ component.03",
@@ -57,7 +57,7 @@ const COMPONENTS: readonly ComponentSpec[] = [
         access.
       </>
     ),
-    stats: "8.98 ns find_unique · 8.87 M ingest/s",
+    stats: "9.11 ns find_unique · 4.07 M ingest/s",
   },
   {
     num: "▸ component.04",
@@ -74,7 +74,7 @@ const COMPONENTS: readonly ComponentSpec[] = [
         languages.
       </>
     ),
-    stats: "6.30 μs open · 48 KB / 1K rows",
+    stats: "26.4 μs decode · 48 KB / 1K rows",
   },
 ];
 
