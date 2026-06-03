@@ -8,8 +8,10 @@ const NAV_LINKS: ReadonlyArray<{ href: string; label: string }> = [
   { href: "/#what", label: "HOME" },
   { href: "/#bench", label: "BENCH" },
   { href: "/#runtime", label: "RUNTIME" },
-  { href: "/#apps", label: "APPS" },
+  { href: "/#dataforts", label: "DATAFORTS" },
+  { href: "/#meshos", label: "MESHOS" },
   { href: "/#install", label: "SDKS" },
+  { href: "/#apps", label: "APPS" },
   { href: "/#wall", label: "BLACKWALL" },
   { href: "/docs", label: "DOCS" },
 ];
