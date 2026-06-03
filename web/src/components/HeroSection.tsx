@@ -356,7 +356,7 @@ function MeshViz() {
       <div className="grid grid-cols-2 gap-3 mt-3.5 pt-3.5 border-t border-line">
         <MeshStat label="forward / hop" value="0.57" unit="ns" />
         <MeshStat label="recovery cycle" value="274" unit="ns" />
-        <MeshStat label="cdylib size" value="1.92" unit="mb" />
+        <MeshStat label="cdylib size" value="2.53" unit="mb" />
         <MeshStat label="throughput" value="26.3" unit="M ops/s" />
       </div>
     </div>
