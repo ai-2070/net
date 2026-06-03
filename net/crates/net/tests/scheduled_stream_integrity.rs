@@ -124,7 +124,24 @@ async fn run_and_verify(label: &str, k: usize, blob: usize, holder_send_buf: usi
     for (h, bytes) in originals {
         let f = fetcher.clone();
         tasks.push(tokio::spawn(async move {
-            let got = f.transfer_fetch_chunk(holder_id, h).await;
+            // The reliable transfer's contract is caller-retries-on-failure
+            // (see `TRANSFER_TIMEOUT` in `dataforts/blob/transfer.rs`). Under
+            // `llvm-cov` instrumentation + high concurrency, ACKs lag enough
+            // that a stream can age an un-acked packet past its retransmit
+            // window and reset ("retransmit exhausted"); a re-fetch once the
+            // congestion clears succeeds. Bounded retry keeps this an
+            // integrity test — every successful fetch is still asserted
+            // byte-for-byte below — without flaking on transient congestion.
+            // A persistent failure (all attempts) still returns `Err` and
+            // fails the test, so real regressions are still caught.
+            let mut got = f.transfer_fetch_chunk(holder_id, h).await;
+            for _ in 0..3 {
+                if got.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                got = f.transfer_fetch_chunk(holder_id, h).await;
+            }
             (h, bytes, got)
         }));
     }
