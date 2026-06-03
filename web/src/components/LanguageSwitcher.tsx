@@ -1,7 +1,7 @@
 "use client";
 
 import { LANGUAGES, type Language } from "@/lib/docs-language";
-import { useLanguage } from "@/components/LanguageContext";
+import { useLanguageStore } from "@/store/useLanguageStore";
 
 const LABELS: Record<Language, string> = {
   rust: "Rust",
@@ -12,7 +12,8 @@ const LABELS: Record<Language, string> = {
 };
 
 export function LanguageSwitcher({ className = "" }: { className?: string }) {
-  const { language, setLanguage } = useLanguage();
+  const language = useLanguageStore((s) => s.language);
+  const setLanguage = useLanguageStore((s) => s.setLanguage);
 
   return (
     <div

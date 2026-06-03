@@ -15,3 +15,13 @@ export const DEFAULT_LANGUAGE: Language = "rust";
 export function isLanguage(s: string | null | undefined): s is Language {
   return (LANGUAGES as readonly string[]).includes(s ?? "");
 }
+
+/** Returns true if an entry is visible under the current language. An
+ * entry with no `languages` field (or an empty array) is universal. */
+export function entryVisibleIn(
+  entry: { languages?: Language[] },
+  current: Language,
+): boolean {
+  if (!entry.languages || entry.languages.length === 0) return true;
+  return entry.languages.includes(current);
+}

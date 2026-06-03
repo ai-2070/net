@@ -1,7 +1,7 @@
 import { NavBar } from "@/components/NavBar";
 import { DocsSidebar } from "@/components/DocsSidebar";
 import { DocsDrawer } from "@/components/DocsDrawer";
-import { LanguageProvider } from "@/components/LanguageContext";
+import { LanguageHydrator } from "@/components/LanguageHydrator";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { getClientDocTree } from "@/lib/docs";
 
@@ -16,7 +16,8 @@ export default function DocsLayout({
 }) {
   const tree = getClientDocTree();
   return (
-    <LanguageProvider>
+    <>
+      <LanguageHydrator />
       <NavBar />
       {/* Mobile/tablet nav: sticky toggle bar + slide-in drawer (hidden at lg+). */}
       <DocsDrawer tree={tree} />
@@ -34,6 +35,6 @@ export default function DocsLayout({
           {children}
         </div>
       </div>
-    </LanguageProvider>
+    </>
   );
 }

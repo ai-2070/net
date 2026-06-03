@@ -3,8 +3,8 @@
 import { useMemo } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { entryVisibleIn, useLanguage } from "@/components/LanguageContext";
-import type { Language } from "@/lib/docs-language";
+import { entryVisibleIn, type Language } from "@/lib/docs-language";
+import { useLanguageStore } from "@/store/useLanguageStore";
 import type {
   ClientDocFile,
   ClientDocFolder,
@@ -327,7 +327,7 @@ export function DocsSidebar({
 }) {
   const pathname = usePathname() ?? "/docs";
   const active = activeFromPath(pathname);
-  const { language } = useLanguage();
+  const language = useLanguageStore((s) => s.language);
   const visibleTree = useMemo(
     () => filterTree(tree, language),
     [tree, language],
