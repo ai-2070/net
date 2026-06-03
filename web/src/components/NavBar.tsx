@@ -6,7 +6,7 @@ import { useEffect, useState } from "react";
 import globals from "@/lib/globals";
 
 const NAV_LINKS: ReadonlyArray<{ href: string; label: string }> = [
-  { href: "/#what", label: "HOME" },
+  { href: "/#hero", label: "HOME" },
   { href: "/#bench", label: "BENCH" },
   { href: "/#runtime", label: "RUNTIME" },
   { href: "/#dataforts", label: "DATAFORTS" },

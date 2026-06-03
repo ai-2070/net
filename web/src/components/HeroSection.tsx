@@ -689,7 +689,10 @@ export function HeroSection() {
     buildDate === "—" ? version : `${version} / ${buildQuarter(buildDate)}`;
 
   return (
-    <section className="hero relative overflow-hidden border-b border-line px-6 pt-[60px] pb-20">
+    <section
+      id="hero"
+      className="hero relative overflow-hidden border-b border-line px-6 pt-[60px] pb-20"
+    >
       <PacketRain />
       <div className="relative grid grid-cols-1 lg:grid-cols-[1fr_520px] gap-12">
         <div>
