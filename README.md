@@ -668,7 +668,7 @@ Feature set affects `.rlib` and `.a` (which keep all compiled code for downstrea
 
 | Features | `libnet.dylib` (cdylib) | `libnet.rlib` | `libnet.a` |
 |----------|------------------------:|--------------:|-----------:|
-| `net` (bare transport) | **2.53 MB** | 34.4 MB | 41.4 MB |
+| `net` | **2.53 MB** | 34.4 MB | 41.4 MB |
 | `+ nat-traversal` | **2.62 MB** | 35.6 MB | 42.3 MB |
 | `+ redex + redex-disk` | **2.64 MB** | 38.7 MB | 43.8 MB |
 | `+ cortex + netdb + dataforts + meshos` | **3.82 MB** | 64.5 MB | 55.1 MB |
