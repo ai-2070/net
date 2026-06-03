@@ -668,13 +668,14 @@ Feature set affects `.rlib` and `.a` (which keep all compiled code for downstrea
 
 | Features | `libnet.dylib` (cdylib) | `libnet.rlib` | `libnet.a` |
 |----------|------------------------:|--------------:|-----------:|
-| `net` + `nat-traversal` | **2.62 MB** | 35.6 MB | 42.3 MB |
+| `net` (bare transport) | **2.53 MB** | 34.4 MB | 41.4 MB |
+| `+ nat-traversal` | **2.62 MB** | 35.6 MB | 42.3 MB |
 | `+ redex + redex-disk` | **2.64 MB** | 38.7 MB | 43.8 MB |
 | `+ cortex + netdb + dataforts + meshos` | **3.82 MB** | 64.5 MB | 55.1 MB |
 | `+ redis` | **4.39 MB** | 65.1 MB | 62.7 MB |
 | `+ jetstream` (instead of `redis`) | **5.87 MB** | 67.9 MB | 80.8 MB |
 
-The third row — `net + nat-traversal + redex + redex-disk + cortex + netdb + dataforts + meshos` — is the full folded-state stack: durable append-only logs, the cross-model query façade, Dataforts blob storage, and the MeshOS supervisor. It's the realistic "everything on" core build short of the optional external-service adapters.
+The fourth row — `net + nat-traversal + redex + redex-disk + cortex + netdb + dataforts + meshos` — is the full folded-state stack: durable append-only logs, the cross-model query façade, Dataforts blob storage, and the MeshOS supervisor. It's the realistic "everything on" core build short of the optional external-service adapters.
 
 - `libnet.dylib` — shipped core cdylib (consumed by Node / Python / C bindings).
 - `libnet.rlib` — Rust static lib with metadata (consumed by other Rust crates).
