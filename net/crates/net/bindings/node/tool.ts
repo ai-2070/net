@@ -20,8 +20,8 @@
 // `net_sdk::tool` + `net_sdk::tool::formats` modules — cross-
 // language tests (T-1) will pin byte equality across both.
 
-import type { CallOptions, ServeHandle, TypedMeshRpc } from './mesh_rpc'
-import type { CapabilitySetJs, ToolJs } from './index'
+import type { CallOptions, ServeHandle, TypedMeshRpc } from "./mesh_rpc";
+import type { CapabilitySetJs, ToolJs } from "./index";
 
 /**
  * Structural shape of the napi `NetMesh.listTools()` return value
@@ -31,7 +31,7 @@ import type { CapabilitySetJs, ToolJs } from './index'
  * new `ToolDescriptorJs` export.
  */
 interface MeshWithListTools {
-  listTools(): ToolDescriptor[]
+  listTools(): ToolDescriptor[];
 }
 
 /**
@@ -42,8 +42,8 @@ interface MeshWithListTools {
  * regenerates `index.d.ts` with the `ToolWatchIter` export.
  */
 interface NativeToolWatchIter {
-  next(): Promise<string | null>
-  close(): void
+  next(): Promise<string | null>;
+  close(): void;
 }
 
 /**
@@ -51,7 +51,36 @@ interface NativeToolWatchIter {
  * surface consumed by [`watchTools`].
  */
 interface MeshWithWatchTools {
-  watchTools(intervalMs?: number | null): Promise<NativeToolWatchIter>
+  watchTools(intervalMs?: number | null): Promise<NativeToolWatchIter>;
+}
+
+/**
+ * Structural mirror of the napi `ToolJs` capability-fold entry —
+ * declared here, like the shapes above, so this file type-checks
+ * before `napi build` regenerates `index.d.ts`. Field-for-field
+ * identical to `index.d.ts`'s `ToolJs`.
+ */
+interface ToolJs {
+  toolId: string;
+  name?: string;
+  version?: string;
+  inputSchema?: string;
+  outputSchema?: string;
+  requires?: Array<string>;
+  estimatedTimeMs?: number;
+  stateless?: boolean;
+}
+
+/**
+ * Structural mirror of the napi `CapabilitySetJs`, narrowed to the
+ * two fields `addToolCapabilitiesToAnnounce` reads/writes. Every napi
+ * `CapabilitySetJs` field is optional, so this narrower shape stays
+ * assignable in both directions — a full capability set passes in,
+ * and the returned object still flows into `announceCapabilities(...)`.
+ */
+interface CapabilitySetJs {
+  tags?: Array<string>;
+  tools?: Array<ToolJs>;
 }
 
 // ============================================================================
@@ -72,29 +101,29 @@ interface MeshWithWatchTools {
  */
 export interface ToolDescriptor {
   /** nRPC service name. Same string `callTool(...)` takes. */
-  toolId: string
+  toolId: string;
   /** Human-readable name. Defaults to `toolId` if unset. */
-  name: string
+  name: string;
   /** Tool version (semver-ish). Defaults to `"1.0.0"`. */
-  version: string
+  version: string;
   /** Human-readable description; LLMs read this to decide when to call. */
-  description?: string
+  description?: string;
   /** JSON-encoded JSON Schema (draft 2020-12) for the request body. */
-  inputSchema?: string
+  inputSchema?: string;
   /** JSON-encoded JSON Schema (draft 2020-12) for the response body. */
-  outputSchema?: string
+  outputSchema?: string;
   /** Required capabilities / dependencies (free-form strings). */
-  requires: string[]
+  requires: string[];
   /** Soft latency hint (ms); `0` = no estimate. */
-  estimatedTimeMs: number
+  estimatedTimeMs: number;
   /** True if the tool is a pure function (no session state). */
-  stateless: boolean
+  stateless: boolean;
   /** True if the tool is server-streaming (uses `serveToolStreaming`). */
-  streaming: boolean
+  streaming: boolean;
   /** Free-form host-attached tags (e.g. `["web", "research"]`). */
-  tags: string[]
+  tags: string[];
   /** How many nodes currently serve this `(toolId, version)`. */
-  nodeCount: number
+  nodeCount: number;
 }
 
 /**
@@ -113,41 +142,41 @@ export type ToolEvent =
   | ToolEventProgress
   | ToolEventDelta
   | ToolEventResult
-  | ToolEventError
+  | ToolEventError;
 
 export interface ToolEventStart {
-  type: 'start'
-  toolId: string
-  callId?: number
-  metadata?: unknown
+  type: "start";
+  toolId: string;
+  callId?: number;
+  metadata?: unknown;
 }
 
 export interface ToolEventProgress {
-  type: 'progress'
-  pct?: number
-  message?: string
+  type: "progress";
+  pct?: number;
+  message?: string;
 }
 
 export interface ToolEventDelta {
-  type: 'delta'
-  data: unknown
+  type: "delta";
+  data: unknown;
 }
 
 export interface ToolEventResult {
-  type: 'result'
-  data: unknown
+  type: "result";
+  data: unknown;
 }
 
 export interface ToolEventError {
-  type: 'error'
-  code: string
-  message: string
-  details?: unknown
+  type: "error";
+  code: string;
+  message: string;
+  details?: unknown;
 }
 
 /** True if `event` is a terminal envelope (`result` or `error`). */
 export function isTerminalEvent(event: ToolEvent): boolean {
-  return event.type === 'result' || event.type === 'error'
+  return event.type === "result" || event.type === "error";
 }
 
 // ============================================================================
@@ -166,23 +195,23 @@ export function isTerminalEvent(event: ToolEvent): boolean {
  */
 export interface ToolOptions {
   /** nRPC service name + tool identifier. Required. */
-  name: string
+  name: string;
   /** Human-readable description. Strongly recommended. */
-  description?: string
+  description?: string;
   /** Version. Defaults to `"1.0.0"`. */
-  version?: string
+  version?: string;
   /** JSON Schema object for the request. */
-  inputSchema?: object
+  inputSchema?: object;
   /** JSON Schema object for the response. */
-  outputSchema?: object
+  outputSchema?: object;
   /** Required capabilities / dependencies. */
-  requires?: string[]
+  requires?: string[];
   /** Soft latency hint (ms). */
-  estimatedTimeMs?: number
+  estimatedTimeMs?: number;
   /** Pure-function flag. Default `true`. */
-  stateless?: boolean
+  stateless?: boolean;
   /** Free-form tags. */
-  tags?: string[]
+  tags?: string[];
 }
 
 /** Construct a [`ToolDescriptor`] from a `ToolOptions` literal. */
@@ -190,17 +219,21 @@ export function descriptorFrom(options: ToolOptions): ToolDescriptor {
   return {
     toolId: options.name,
     name: options.name,
-    version: options.version ?? '1.0.0',
+    version: options.version ?? "1.0.0",
     description: options.description,
-    inputSchema: options.inputSchema ? JSON.stringify(options.inputSchema) : undefined,
-    outputSchema: options.outputSchema ? JSON.stringify(options.outputSchema) : undefined,
+    inputSchema: options.inputSchema
+      ? JSON.stringify(options.inputSchema)
+      : undefined,
+    outputSchema: options.outputSchema
+      ? JSON.stringify(options.outputSchema)
+      : undefined,
     requires: options.requires ?? [],
     estimatedTimeMs: options.estimatedTimeMs ?? 0,
     stateless: options.stateless ?? true,
     streaming: false,
     tags: options.tags ?? [],
     nodeCount: 0,
-  }
+  };
 }
 
 // ============================================================================
@@ -213,7 +246,7 @@ export function descriptorFrom(options: ToolOptions): ToolDescriptor {
  */
 export type ToolHandler<Req = unknown, Resp = unknown> = (
   req: Req,
-) => Resp | Promise<Resp>
+) => Resp | Promise<Resp>;
 
 /**
  * Handle returned by `serveTool`. Calling `.close()` deregisters the
@@ -231,9 +264,9 @@ export type ToolHandler<Req = unknown, Resp = unknown> = (
  */
 export interface ToolServeHandle {
   /** The descriptor under which the tool was registered. */
-  readonly descriptor: ToolDescriptor
+  readonly descriptor: ToolDescriptor;
   /** Deregister the handler. Idempotent. */
-  close(): void
+  close(): void;
 }
 
 // Per-rpc descriptor registries — keyed by `TypedMeshRpc` so each
@@ -243,16 +276,16 @@ export interface ToolServeHandle {
 // exits — same lifetime contract the Rust SDK's
 // `ensure_tool_metadata_fetch_installed` follows).
 interface ToolRegistryEntry {
-  registry: Map<string, ToolDescriptor>
-  fetchHandle: ServeHandle | null
+  registry: Map<string, ToolDescriptor>;
+  fetchHandle: ServeHandle | null;
 }
-const _toolRegistries: WeakMap<TypedMeshRpc, ToolRegistryEntry> = new WeakMap()
+const _toolRegistries: WeakMap<TypedMeshRpc, ToolRegistryEntry> = new WeakMap();
 
 function _ensureFetchInstalled(rpc: TypedMeshRpc): ToolRegistryEntry {
-  let entry = _toolRegistries.get(rpc)
-  if (entry) return entry
-  entry = { registry: new Map(), fetchHandle: null }
-  _toolRegistries.set(rpc, entry)
+  let entry = _toolRegistries.get(rpc);
+  if (entry) return entry;
+  entry = { registry: new Map(), fetchHandle: null };
+  _toolRegistries.set(rpc, entry);
   // Register the fetch handler. The handler queries `entry.registry`
   // for the name; falls back to NotFound. Mirrors the Rust SDK's
   // `tool.metadata.fetch` handler shape.
@@ -260,12 +293,12 @@ function _ensureFetchInstalled(rpc: TypedMeshRpc): ToolRegistryEntry {
     entry.fetchHandle = rpc.serve<{ name: string }, ToolMetadataResponse>(
       TOOL_METADATA_FETCH_SERVICE,
       (req) => {
-        const d = entry!.registry.get(req.name)
+        const d = entry!.registry.get(req.name);
         return d
-          ? { type: 'found', descriptor: d }
-          : { type: 'not_found', name: req.name }
+          ? { type: "found", descriptor: d }
+          : { type: "not_found", name: req.name };
       },
-    )
+    );
   } catch {
     // If install fails (e.g. another caller already registered the
     // service manually), leave fetchHandle null. Subsequent serveTool
@@ -273,7 +306,7 @@ function _ensureFetchInstalled(rpc: TypedMeshRpc): ToolRegistryEntry {
     // observable via `fetchToolMetadata` returning NoRoute / NotFound
     // on the agent side.
   }
-  return entry
+  return entry;
 }
 
 /**
@@ -307,20 +340,20 @@ export function serveTool<Req = unknown, Resp = unknown>(
   options: ToolOptions,
   handler: ToolHandler<Req, Resp>,
 ): ToolServeHandle {
-  const descriptor = descriptorFrom(options)
-  const entry = _ensureFetchInstalled(rpc)
-  entry.registry.set(descriptor.toolId, descriptor)
-  const inner: ServeHandle = rpc.serve<Req, Resp>(descriptor.toolId, handler)
-  let closed = false
+  const descriptor = descriptorFrom(options);
+  const entry = _ensureFetchInstalled(rpc);
+  entry.registry.set(descriptor.toolId, descriptor);
+  const inner: ServeHandle = rpc.serve<Req, Resp>(descriptor.toolId, handler);
+  let closed = false;
   return {
     descriptor,
     close() {
-      if (closed) return
-      closed = true
-      entry.registry.delete(descriptor.toolId)
-      inner.close()
+      if (closed) return;
+      closed = true;
+      entry.registry.delete(descriptor.toolId);
+      inner.close();
     },
-  }
+  };
 }
 
 /**
@@ -338,7 +371,7 @@ export function serveTool<Req = unknown, Resp = unknown>(
  */
 export type StreamingToolHandler<Req = unknown> = (
   req: Req,
-) => AsyncIterable<ToolEvent>
+) => AsyncIterable<ToolEvent>;
 
 /**
  * Register a streaming tool handler. The handler is an async
@@ -357,51 +390,51 @@ export function serveToolStreaming<Req = unknown>(
   options: ToolOptions,
   handler: StreamingToolHandler<Req>,
 ): ToolServeHandle {
-  const baseDescriptor = descriptorFrom(options)
-  const descriptor: ToolDescriptor = { ...baseDescriptor, streaming: true }
-  const entry = _ensureFetchInstalled(rpc)
-  entry.registry.set(descriptor.toolId, descriptor)
+  const baseDescriptor = descriptorFrom(options);
+  const descriptor: ToolDescriptor = { ...baseDescriptor, streaming: true };
+  const entry = _ensureFetchInstalled(rpc);
+  entry.registry.set(descriptor.toolId, descriptor);
   const inner: ServeHandle = rpc.serveStreaming<Req, ToolEvent>(
     descriptor.toolId,
     async (req, sink) => {
-      let sawTerminal = false
+      let sawTerminal = false;
       try {
         for await (const event of handler(req)) {
-          sink.send(event)
-          if (isTerminalEvent(event)) sawTerminal = true
+          sink.send(event);
+          if (isTerminalEvent(event)) sawTerminal = true;
         }
         if (!sawTerminal) {
           sink.send({
-            type: 'error',
-            code: 'missing_terminal',
+            type: "error",
+            code: "missing_terminal",
             message:
-              'tool stream ended without a terminal result or error envelope',
-          })
+              "tool stream ended without a terminal result or error envelope",
+          });
         }
       } catch (err) {
         // Convert handler exceptions into a terminal error envelope
         // so the caller sees a typed error rather than relying on
         // the client-side missing_terminal fallback.
-        const message = err instanceof Error ? err.message : String(err)
+        const message = err instanceof Error ? err.message : String(err);
         const errEvent: ToolEventError = {
-          type: 'error',
-          code: 'handler_error',
+          type: "error",
+          code: "handler_error",
           message,
-        }
-        sink.send(errEvent)
+        };
+        sink.send(errEvent);
       }
     },
-  )
-  let closed = false
+  );
+  let closed = false;
   return {
     descriptor,
     close() {
-      if (closed) return
-      closed = true
-      entry.registry.delete(descriptor.toolId)
-      inner.close()
+      if (closed) return;
+      closed = true;
+      entry.registry.delete(descriptor.toolId);
+      inner.close();
     },
-  }
+  };
 }
 
 /**
@@ -419,7 +452,7 @@ export async function callTool<Req = unknown, Resp = unknown>(
   req: Req,
   opts?: CallOptions,
 ): Promise<Resp> {
-  return rpc.callService<Req, Resp>(toolId, req, opts)
+  return rpc.callService<Req, Resp>(toolId, req, opts);
 }
 
 /**
@@ -447,26 +480,25 @@ export async function* callToolStreaming<Req = unknown>(
     toolId,
     req,
     opts,
-  )
-  let sawTerminal = false
+  );
+  let sawTerminal = false;
   try {
     for await (const event of stream) {
-      yield event
+      yield event;
       if (isTerminalEvent(event)) {
-        sawTerminal = true
+        sawTerminal = true;
       }
     }
   } finally {
-    await stream.close().catch(() => {})
+    await stream.close().catch(() => {});
   }
   if (!sawTerminal) {
     const synthesized: ToolEventError = {
-      type: 'error',
-      code: 'missing_terminal',
-      message:
-        'tool stream ended without a terminal result or error envelope',
-    }
-    yield synthesized
+      type: "error",
+      code: "missing_terminal",
+      message: "tool stream ended without a terminal result or error envelope",
+    };
+    yield synthesized;
   }
 }
 
@@ -490,11 +522,11 @@ export function addToolCapabilitiesToAnnounce(
   caps: CapabilitySetJs,
   descriptors: ToolDescriptor[],
 ): CapabilitySetJs {
-  if (descriptors.length === 0) return caps
-  const tags = new Set(caps.tags ?? [])
-  const tools: ToolJs[] = [...(caps.tools ?? [])]
+  if (descriptors.length === 0) return caps;
+  const tags = new Set(caps.tags ?? []);
+  const tools: ToolJs[] = [...(caps.tools ?? [])];
   for (const desc of descriptors) {
-    tags.add(`ai-tool:${desc.toolId}`)
+    tags.add(`ai-tool:${desc.toolId}`);
     tools.push({
       toolId: desc.toolId,
       name: desc.name,
@@ -504,11 +536,11 @@ export function addToolCapabilitiesToAnnounce(
       requires: desc.requires,
       estimatedTimeMs: desc.estimatedTimeMs,
       stateless: desc.stateless,
-    })
+    });
   }
-  caps.tags = Array.from(tags)
-  caps.tools = tools
-  return caps
+  caps.tags = Array.from(tags);
+  caps.tools = tools;
+  return caps;
 }
 
 /**
@@ -526,7 +558,7 @@ export function addToolCapabilitiesToAnnounce(
  * consume when lowering into provider-specific tool definitions.
  */
 export function listTools(mesh: MeshWithListTools): ToolDescriptor[] {
-  return mesh.listTools()
+  return mesh.listTools();
 }
 
 // ============================================================================
@@ -543,13 +575,13 @@ export function listTools(mesh: MeshWithListTools): ToolDescriptor[] {
  * `"removed"` / `"node_count_changed"`).
  */
 export type ToolListChange =
-  | { type: 'added'; descriptor: ToolDescriptor }
-  | { type: 'removed'; descriptor: ToolDescriptor }
+  | { type: "added"; descriptor: ToolDescriptor }
+  | { type: "removed"; descriptor: ToolDescriptor }
   | {
-      type: 'node_count_changed'
-      descriptor: ToolDescriptor
-      prevNodeCount: number
-    }
+      type: "node_count_changed";
+      descriptor: ToolDescriptor;
+      prevNodeCount: number;
+    };
 
 /** Options for [`watchTools`]. */
 export interface WatchToolsOptions {
@@ -561,12 +593,12 @@ export interface WatchToolsOptions {
    * periodic work. A positive value additionally guarantees a
    * re-diff at least every `intervalMs` as a safety net.
    */
-  intervalMs?: number
+  intervalMs?: number;
   /**
    * `AbortSignal` to end the watch. Aborting closes the underlying
    * native iterator, which ends the stream promptly.
    */
-  signal?: AbortSignal
+  signal?: AbortSignal;
 }
 
 /**
@@ -602,8 +634,8 @@ export function watchTools(
   mesh: MeshWithWatchTools,
   options: WatchToolsOptions = {},
 ): AsyncIterable<ToolListChange> {
-  const intervalMs = options.intervalMs
-  const signal = options.signal
+  const intervalMs = options.intervalMs;
+  const signal = options.signal;
 
   // Subscribe eagerly — at call time, not on the first iteration — so a
   // change published before iteration begins is still observed. The
@@ -611,48 +643,48 @@ export function watchTools(
   // keeps an unhandled-rejection warning from firing if the returned
   // iterable is created but never consumed (the generator's own `await`
   // still surfaces the real rejection to a consumer that does iterate).
-  const nativePromise = mesh.watchTools(intervalMs ?? null)
-  void nativePromise.catch(() => {})
+  const nativePromise = mesh.watchTools(intervalMs ?? null);
+  void nativePromise.catch(() => {});
 
   async function* iterator(): AsyncGenerator<ToolListChange> {
-    const native = await nativePromise
-    const onAbort = () => native.close()
+    const native = await nativePromise;
+    const onAbort = () => native.close();
     if (signal) {
       if (signal.aborted) {
-        native.close()
-        return
+        native.close();
+        return;
       }
-      signal.addEventListener('abort', onAbort, { once: true })
+      signal.addEventListener("abort", onAbort, { once: true });
     }
     try {
       while (true) {
-        const raw = await native.next()
+        const raw = await native.next();
         if (raw == null) {
-          return
+          return;
         }
-        yield JSON.parse(raw) as ToolListChange
+        yield JSON.parse(raw) as ToolListChange;
       }
     } finally {
       if (signal) {
-        signal.removeEventListener('abort', onAbort)
+        signal.removeEventListener("abort", onAbort);
       }
-      native.close()
+      native.close();
     }
   }
 
-  return { [Symbol.asyncIterator]: iterator }
+  return { [Symbol.asyncIterator]: iterator };
 }
 
 /** nRPC service name for the on-demand tool-descriptor pull. */
-export const TOOL_METADATA_FETCH_SERVICE = 'tool.metadata.fetch'
+export const TOOL_METADATA_FETCH_SERVICE = "tool.metadata.fetch";
 
 /** Wire-shape variants of `ToolMetadataResponse` (JSON-tagged on
  * `type`, snake_case). Pinned by the substrate's
  * `cortex::tool::ToolMetadataResponse` enum.
  */
 export type ToolMetadataResponse =
-  | { type: 'found'; descriptor: ToolDescriptor }
-  | { type: 'not_found'; name: string }
+  | { type: "found"; descriptor: ToolDescriptor }
+  | { type: "not_found"; name: string };
 
 /**
  * Pull a tool's full descriptor from a specific host by calling
@@ -677,7 +709,7 @@ export async function fetchToolMetadata(
     TOOL_METADATA_FETCH_SERVICE,
     { name: toolId },
     opts,
-  )
+  );
 }
 
 // ============================================================================
@@ -699,30 +731,30 @@ export async function fetchToolMetadata(
 /** Canonical hand-off between a provider adapter and `callTool`. */
 export interface ToolCallSpec {
   /** nRPC tool_id to invoke. */
-  name: string
+  name: string;
   /** JSON-encoded arguments to pass to `callTool` (caller parses). */
-  argumentsJson: string
+  argumentsJson: string;
   /** Provider-supplied call id when present (for reply correlation). */
-  providerCallId?: string
+  providerCallId?: string;
 }
 
 /** Thrown when a provider's tool-call reply doesn't match its spec. */
 export class ToolCallParseError extends Error {
   constructor(message: string) {
-    super(message)
-    this.name = 'ToolCallParseError'
+    super(message);
+    this.name = "ToolCallParseError";
   }
 }
 
 function inputSchemaValue(desc: ToolDescriptor): object {
-  if (!desc.inputSchema) return { type: 'object', properties: {} }
+  if (!desc.inputSchema) return { type: "object", properties: {} };
   try {
-    return JSON.parse(desc.inputSchema) as object
+    return JSON.parse(desc.inputSchema) as object;
   } catch {
     // Schema string was malformed (shouldn't happen for descriptors
     // built via `descriptorFrom`). Empty-object fallback keeps
     // provider validators happy.
-    return { type: 'object', properties: {} }
+    return { type: "object", properties: {} };
   }
 }
 
@@ -737,14 +769,14 @@ export const openai = {
    */
   toOpenaiTool(desc: ToolDescriptor): object {
     return {
-      type: 'function',
+      type: "function",
       function: {
         name: desc.toolId,
-        description: desc.description ?? '',
+        description: desc.description ?? "",
         parameters: inputSchemaValue(desc),
         strict: desc.inputSchema !== undefined,
       },
-    }
+    };
   },
 
   /**
@@ -754,33 +786,36 @@ export const openai = {
    * fast instead of riding through `callTool`.
    */
   lowerOpenaiToolCall(call: Record<string, unknown>): ToolCallSpec {
-    const fn = call['function'] as Record<string, unknown> | undefined
-    if (!fn) throw new ToolCallParseError('tool-call reply missing field `function`')
-    const name = fn['name']
-    if (typeof name !== 'string') {
-      throw new ToolCallParseError('tool-call reply field `function.name` must be a string')
-    }
-    const argumentsField = fn['arguments']
-    if (typeof argumentsField !== 'string') {
+    const fn = call["function"] as Record<string, unknown> | undefined;
+    if (!fn)
+      throw new ToolCallParseError("tool-call reply missing field `function`");
+    const name = fn["name"];
+    if (typeof name !== "string") {
       throw new ToolCallParseError(
-        'tool-call reply field `function.arguments` must be a JSON-encoded string',
-      )
+        "tool-call reply field `function.name` must be a string",
+      );
+    }
+    const argumentsField = fn["arguments"];
+    if (typeof argumentsField !== "string") {
+      throw new ToolCallParseError(
+        "tool-call reply field `function.arguments` must be a JSON-encoded string",
+      );
     }
     try {
-      JSON.parse(argumentsField)
+      JSON.parse(argumentsField);
     } catch (e) {
       throw new ToolCallParseError(
         `tool-call arguments were not valid JSON: ${(e as Error).message}`,
-      )
+      );
     }
-    const id = call['id']
+    const id = call["id"];
     return {
       name,
       argumentsJson: argumentsField,
-      providerCallId: typeof id === 'string' ? id : undefined,
-    }
+      providerCallId: typeof id === "string" ? id : undefined,
+    };
   },
-}
+};
 
 /** Anthropic Messages API `tools` array + `tool_use` content blocks. */
 export const anthropic = {
@@ -795,9 +830,9 @@ export const anthropic = {
   toAnthropicTool(desc: ToolDescriptor): object {
     return {
       name: desc.toolId,
-      description: desc.description ?? '',
+      description: desc.description ?? "",
       input_schema: inputSchemaValue(desc),
-    }
+    };
   },
 
   /**
@@ -807,22 +842,24 @@ export const anthropic = {
    * `argumentsJson: string` invariant.
    */
   lowerAnthropicToolUse(block: Record<string, unknown>): ToolCallSpec {
-    const name = block['name']
-    if (typeof name !== 'string') {
-      throw new ToolCallParseError('tool_use block field `name` must be a string')
+    const name = block["name"];
+    if (typeof name !== "string") {
+      throw new ToolCallParseError(
+        "tool_use block field `name` must be a string",
+      );
     }
-    if (!('input' in block)) {
-      throw new ToolCallParseError('tool_use block missing field `input`')
+    if (!("input" in block)) {
+      throw new ToolCallParseError("tool_use block missing field `input`");
     }
-    const argumentsJson = JSON.stringify(block['input'])
-    const id = block['id']
+    const argumentsJson = JSON.stringify(block["input"]);
+    const id = block["id"];
     return {
       name,
       argumentsJson,
-      providerCallId: typeof id === 'string' ? id : undefined,
-    }
+      providerCallId: typeof id === "string" ? id : undefined,
+    };
   },
-}
+};
 
 /** Model Context Protocol `tools/list` + `tools/call`. */
 export const mcp = {
@@ -830,9 +867,9 @@ export const mcp = {
   toMcpTool(desc: ToolDescriptor): object {
     return {
       name: desc.toolId,
-      description: desc.description ?? '',
+      description: desc.description ?? "",
       inputSchema: inputSchemaValue(desc),
-    }
+    };
   },
 
   /**
@@ -842,20 +879,24 @@ export const mcp = {
    * independently.
    */
   lowerMcpToolsCall(params: Record<string, unknown>): ToolCallSpec {
-    const name = params['name']
-    if (typeof name !== 'string') {
-      throw new ToolCallParseError('tools/call params field `name` must be a string')
+    const name = params["name"];
+    if (typeof name !== "string") {
+      throw new ToolCallParseError(
+        "tools/call params field `name` must be a string",
+      );
     }
-    if (!('arguments' in params)) {
-      throw new ToolCallParseError('tools/call params missing field `arguments`')
+    if (!("arguments" in params)) {
+      throw new ToolCallParseError(
+        "tools/call params missing field `arguments`",
+      );
     }
     return {
       name,
-      argumentsJson: JSON.stringify(params['arguments']),
+      argumentsJson: JSON.stringify(params["arguments"]),
       providerCallId: undefined,
-    }
+    };
   },
-}
+};
 
 /** Gemini `generateContent` function-calling shape. */
 export const gemini = {
@@ -870,9 +911,9 @@ export const gemini = {
   toGeminiFunctionDeclaration(desc: ToolDescriptor): object {
     return {
       name: desc.toolId,
-      description: desc.description ?? '',
+      description: desc.description ?? "",
       parameters: inputSchemaValue(desc),
-    }
+    };
   },
 
   /**
@@ -881,17 +922,19 @@ export const gemini = {
    * `undefined` (multi-call sequences are positional).
    */
   lowerGeminiFunctionCall(call: Record<string, unknown>): ToolCallSpec {
-    const name = call['name']
-    if (typeof name !== 'string') {
-      throw new ToolCallParseError('functionCall field `name` must be a string')
+    const name = call["name"];
+    if (typeof name !== "string") {
+      throw new ToolCallParseError(
+        "functionCall field `name` must be a string",
+      );
     }
-    if (!('args' in call)) {
-      throw new ToolCallParseError('functionCall missing field `args`')
+    if (!("args" in call)) {
+      throw new ToolCallParseError("functionCall missing field `args`");
     }
     return {
       name,
-      argumentsJson: JSON.stringify(call['args']),
+      argumentsJson: JSON.stringify(call["args"]),
       providerCallId: undefined,
-    }
+    };
   },
-}
+};
