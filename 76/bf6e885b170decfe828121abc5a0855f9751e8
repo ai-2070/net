@@ -1,0 +1,27 @@
+web/src/app/sitemap.ts
+  s_11865f24cd1e4f::t_dff968f0bf67d9 1-3,5-52
+  s_11865f24cd1e4f::t_b285946a71244a 4
+web/src/app/layout.tsx
+  s_11865f24cd1e4f::t_b34ac678ef63fd 33
+  s_11865f24cd1e4f::t_cbec9a0cdc45f4 12
+web/src/lib/site-url.ts
+  s_11865f24cd1e4f::t_688cf8a55f906b 1-12
+web/src/app/robots.ts
+  s_11865f24cd1e4f::t_5da58d7402b35a 1-18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "76bf6e885b170decfe828121abc5a0855f9751e8",
+  "prompts": {},
+  "sessions": {
+    "s_11865f24cd1e4f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "434eff69-6a6a-44a7-ba05-08c01001dac9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
