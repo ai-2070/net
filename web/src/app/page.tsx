@@ -20,10 +20,11 @@ import { BenchmarksSection } from "@/components/BenchmarksSection";
 import { PropertiesSection } from "@/components/PropertiesSection";
 import { WhyNotBestEffortSection } from "@/components/WhyNotBestEffortSection";
 import { TopologyClassesSection } from "@/components/TopologyClassesSection";
+import { PageContainer } from "@/components/PageContainer";
 
 export default function Home(): JSX.Element {
   return (
-    <>
+    <PageContainer>
       <NavBar />
       <main className="pt-20 max-w-[1440px] mx-auto">
         <SeedBanner />
@@ -45,6 +46,6 @@ export default function Home(): JSX.Element {
         <FooterDivider />
         <Footer />
       </main>
-    </>
+    </PageContainer>
   );
 }

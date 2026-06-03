@@ -46,7 +46,7 @@ export default async function RootLayout({
       lang="en"
       className={`${jetbrainsMono.variable} ${majorMonoDisplay.variable} ${spaceGrotesk.variable} h-full antialiased`}
     >
-      <body className="bg-bg text-ink overflow-x-hidden font-mono min-h-full">
+      <body className="bg-black">
         <PostHogProvider>
           <RepoInfoProvider value={repoInfo}>
             <TopStatusBar {...repoInfo} />

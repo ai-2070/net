@@ -4,6 +4,7 @@ import { DocsDrawer } from "@/components/DocsDrawer";
 import { LanguageHydrator } from "@/components/LanguageHydrator";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { getClientDocTree } from "@/lib/docs";
+import { PageContainer } from "@/components/PageContainer";
 
 export const metadata = {
   title: "Docs · Net",
@@ -16,7 +17,7 @@ export default function DocsLayout({
 }) {
   const tree = getClientDocTree();
   return (
-    <>
+    <PageContainer className="bg-black">
       <LanguageHydrator />
       <NavBar />
       {/* Mobile/tablet nav: sticky toggle bar + slide-in drawer (hidden at lg+). */}
@@ -35,6 +36,6 @@ export default function DocsLayout({
           {children}
         </div>
       </div>
-    </>
+    </PageContainer>
   );
 }
