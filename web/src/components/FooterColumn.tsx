@@ -1,4 +1,5 @@
 import { cn } from "@/lib/cn";
+import Link from "next/link";
 
 export function FooterColumn({
   title,
@@ -17,7 +18,7 @@ export function FooterColumn({
           const external = /^https?:\/\//i.test(it.href);
           return (
             <li key={it.label}>
-              <a
+              <Link
                 href={it.href}
                 {...(external
                   ? { target: "_blank", rel: "noopener noreferrer" }
@@ -28,7 +29,7 @@ export function FooterColumn({
                 )}
               >
                 {it.label}
-              </a>
+              </Link>
             </li>
           );
         })}
