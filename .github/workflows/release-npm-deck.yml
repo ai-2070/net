@@ -204,7 +204,7 @@ jobs:
             version: env.VERSION,
             description: `Prebuilt net-deck binary for ${env.NODE_OS}-${env.NODE_CPU}${env.NODE_LIBC ? ' (' + env.NODE_LIBC + ')' : ''}`,
             license: 'Apache-2.0',
-            repository: { type: 'git', url: 'https://github.com/ai-2070/net' },
+            repository: { type: 'git', url: 'git+https://github.com/ai-2070/net.git' },
             os: [env.NODE_OS],
             cpu: [env.NODE_CPU],
             files: [`bin/${env.BIN_NAME}`, 'README.md', 'LICENSE'],
