@@ -1,0 +1,27 @@
+.github/workflows/release-npm-sdk.yml
+  s_f6c191b51f28ba::t_7212c63a52273b 73-81
+.github/workflows/release-npm.yml
+  s_f6c191b51f28ba::t_569a67e18328ec 215,217-229
+.github/workflows/release-npm-deck.yml
+  s_f6c191b51f28ba::t_fb7ceb3139b51f 261-269
+  s_f6c191b51f28ba::t_63e63e688aa444 218-226
+.github/workflows/release-npm-cli.yml
+  s_f6c191b51f28ba::t_edb589a6c80d42 240-248
+  s_f6c191b51f28ba::t_f98a45f1e9dabb 283-291
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "8fba3925e4a217ba4949530f9aab447fff82c80b",
+  "prompts": {},
+  "sessions": {
+    "s_f6c191b51f28ba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "aeb41064-2c0d-418f-ad38-0589f4ebe401",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
