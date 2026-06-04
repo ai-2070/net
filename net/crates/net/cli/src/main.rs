@@ -145,6 +145,9 @@ enum Command {
     /// `AggregatorDaemon` inspection + remote query.
     #[command(subcommand)]
     Aggregator(commands::aggregator::AggregatorCommand),
+    /// Blob + directory transfer (recv/send/ls/status/cancel).
+    #[command(subcommand)]
+    Transfer(commands::transfer::TransferCommand),
     /// Emit a shell-completion script (bash/zsh/fish/powershell).
     Completion(commands::completion::CompletionArgs),
     /// Emit the troff(1) man page on stdout.
@@ -230,6 +233,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Aggregator(cmd) => {
             commands::aggregator::run(cmd, output, config_path, profile).await
         }
+        Command::Transfer(cmd) => commands::transfer::run(cmd, output, config_path, profile).await,
         Command::Completion(args) => commands::completion::run::<Cli>(args),
         Command::Man => commands::man::run::<Cli>(),
     }

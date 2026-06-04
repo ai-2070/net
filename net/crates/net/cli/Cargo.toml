@@ -43,6 +43,8 @@ tokio = { version = "1", features = [
     "time",
     "signal",
     "fs",
+    "io-std",
+    "io-util",
 ] }
 
 # Serde stack for output dispatch + identity/config file parsing.
@@ -53,6 +55,15 @@ serde_yaml = "0.9"
 # Pretty terminal tables for `--output table` (Phase 1: read-only
 # views).
 comfy-table = "7"
+
+# Progress display for `net transfer recv-blob` / `recv-dir`. The SDK
+# fetch is a single await with no per-chunk callback, so this drives a
+# steady-tick spinner while the fetch runs, then a final one-line
+# summary — live feedback for the directory-transfer demo without
+# fabricating per-chunk counts the substrate doesn't surface. Drawn to
+# stderr and suppressed under `--quiet` / non-TTY so it never pollutes
+# `--output json` on stdout.
+indicatif = "0.17"
 
 # Tracing-subscriber wires `-v` / `-vv` / `-vvv` to env-filter
 # levels. Format pinned to compact for stderr.

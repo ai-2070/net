@@ -65,6 +65,16 @@ pub use net::adapter::net::dataforts::blob::{
     MeshBlobAdapter, SUBPROTOCOL_BLOB_TRANSFER,
 };
 
+// Store-side helpers for building a content-addressed [`BlobRef`] from raw
+// bytes without reaching into the substrate: [`chunk_payload`] splits a byte
+// slice into the inline-or-chunked shape and [`ChunkedPayload::into_blob_ref`]
+// finishes it into a [`BlobRef::Small`] / [`BlobRef::Manifest`] under an
+// [`Encoding`]. These are the inverse of [`fetch_blob`] — what a publisher runs
+// to learn the reference a peer will [`fetch_blob`] by. Re-exported so the
+// `net transfer send-blob` CLI verb (and any SDK consumer staging content for
+// fetch) doesn't reimplement chunk sizing / hashing.
+pub use net::adapter::net::dataforts::{chunk_payload, ChunkedPayload, Encoding};
+
 // Directory transfer: the substrate `store_dir` is usable as-is (it
 // takes a `&MeshBlobAdapter`); the fetch side is wrapped below because
 // the substrate function needs the internal node handle. The manifest
