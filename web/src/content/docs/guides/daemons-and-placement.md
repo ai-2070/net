@@ -6,7 +6,7 @@ Daemons are how you turn the event bus from a transport into a substrate for dis
 
 ## The `MeshDaemon` trait
 
-The contract is small. Implement five methods:
+The contract for synchronous, WASM-friendly daemons is small. Implement five methods:
 
 ```rust
 use net::adapter::net::compute::{MeshDaemon, DaemonError};
@@ -53,7 +53,7 @@ Five methods, four concerns:
 A few constraints worth honoring:
 
 - **`process()` must be fast.** Tens of microseconds, ideally. Heavy work should be deferred to a background task that publishes back into the bus.
-- **All methods are synchronous.** This is for WASM compatibility — daemons are designed to be runnable both in-process and as WASM modules, and the WASM ABI doesn't allow async.
+- **All methods are synchronous.** This is for WASM compatibility — `MeshDaemon` is designed to be runnable both in-process and as WASM modules, and the WASM ABI doesn't allow async. For daemons that need an async loop, use the `LifecycleDaemon` sibling trait described below.
 - **No generics or associated types.** The daemon trait is `dyn`-compatible because the runtime tracks daemons as trait objects.
 
 ## Spawning
@@ -71,7 +71,7 @@ let registration = mesh.register_daemon(host).await?;
 
 ## Placement
 
-Where a daemon ends up running is decided by the placement scheduler. The scheduler reads the daemon's `requirements()`, queries the mesh's capability index for matching nodes, and scores each candidate. The default scorer combines five axes:
+Where a daemon ends up running is decided by the placement scheduler. The scheduler reads the daemon's `requirements()`, queries the mesh's capability fold for matching nodes, and scores each candidate. The default scorer combines five axes:
 
 - **Capability match.** Does the node satisfy the filter? Hard veto if not.
 - **Load.** How many other daemons is the node running, and how much spare capacity does it have?
@@ -100,17 +100,96 @@ let placement = StandardPlacement::with_custom_filter_id("gpu-vram-fits");
 
 Custom filters compose with the built-in axes — your predicate's verdict is one input to the score, not a hard override. The same callback shape exists in every binding (Rust, TS, Python, Go, C), and predicates built through the substrate's `Predicate` AST evaluate identically across all of them, so a placement filter written in TS produces the same verdict as one written in Rust.
 
+## Async daemons — the `LifecycleDaemon` trait
+
+Some daemons need an async loop: they publish on a periodic timer, call out to other services, or pump a long-running operation alongside event processing. The `MeshDaemon` trait is synchronous-by-design for WASM compatibility, so for those cases the runtime provides an async sibling: `LifecycleDaemon`.
+
+```rust
+use net::adapter::net::compute::lifecycle::{LifecycleDaemon, LifecycleHandle};
+
+#[async_trait::async_trait]
+impl LifecycleDaemon for HealthScraper {
+    fn requirements(&self) -> CapabilityFilter { CapabilityFilter::any() }
+
+    async fn on_start(&mut self, ctx: &LifecycleContext) -> Result<(), DaemonError> {
+        self.client = HttpClient::connect(&self.endpoint).await?;
+        Ok(())
+    }
+
+    async fn tick(&mut self, ctx: &LifecycleContext) -> Result<(), DaemonError> {
+        let metrics = self.client.fetch_metrics().await?;
+        ctx.publish("metrics/scraped", metrics).await?;
+        Ok(())
+    }
+
+    async fn on_stop(&mut self, _: &LifecycleContext) -> Result<(), DaemonError> {
+        self.client.shutdown().await.ok();
+        Ok(())
+    }
+}
+
+let handle: LifecycleHandle = LifecycleHandle::start(HealthScraper::new(endpoint)).await?;
+```
+
+`LifecycleHandle` is an RAII wrapper that owns the tokio loop; dropping it stops the daemon cleanly. The tick loop checks an internal shutdown flag between iterations so a long-running `tick().await` doesn't get its task dropped mid-flight by the backstop timeout. Combined with `LifecycleGroup<L>` (an N-replica primitive generic over the lifecycle daemon), the same handle drives both single-daemon and replicated-daemon deployments.
+
+When a `LifecycleGroup` is registered with a `HealthMonitor`, the monitor watches per-replica health and re-spawns failed replicas via the group's factory closure with exponential backoff. `register_with_monitor` is the one-call constructor that wires the registry and the monitor together — operators don't thread them by hand.
+
+## Aggregator daemons
+
+The canonical use of `LifecycleDaemon` is the aggregator: a daemon that sits one tier up from a source subnet, subscribes to that subnet's detail channels through the gateway, summarizes what it sees, and publishes the summary upward. The substrate ships an `AggregatorDaemon` implementation plus an `AggregatorRegistry` that lives on `MeshNode` alongside `DaemonRegistry`.
+
+```rust
+use net::adapter::net::compute::aggregator::{AggregatorConfig, AggregatorDaemon};
+
+let config = AggregatorConfig {
+    source_subnet: SubnetId::new(&[3, 7]),         // a fleet subnet
+    summary_visibility: Visibility::ParentVisible, // visible at the region tier
+    summary_targets: vec![],
+    fold_kinds: vec![FOLD_CAPABILITY, FOLD_RESERVATION],
+    summary_interval: Duration::from_secs(30),
+    custom_summarizers: vec![],
+};
+
+let group = LifecycleGroup::with_factor(3, move || {
+    AggregatorDaemon::new(config.clone())
+});
+
+mesh.register_aggregator_group(group).await?;
+```
+
+Each replica publishes summaries independently — no election machinery, no leader. Subscribers see N summary announcements per cycle and the fold's merge picks the latest by generation. Operators can `scale_to(1)` when availability isn't the constraint. State across re-placements rebuilds from incoming channel announcements + TTL refreshes within one TTL cycle.
+
+For operators who don't want to embed the substrate in their own process, the `net-aggregator-daemon` binary boots from a TOML config, registers templates the operator can instantiate by name, defaults to auto-respawn-on-failure, and prints a single JSON bootstrap line on stdout (`{"node_id": …, "bound_addr": …, "public_key_hex": …}`) so tools that orchestrate it can find its address and pubkey without parsing logs.
+
+```toml
+# net-aggregator-daemon.toml
+[[template]]
+name = "fleet-summary"
+source_subnet = [3, 7]
+summary_visibility = "parent-visible"
+fold_kinds = ["capability", "reservation"]
+summary_interval = "30s"
+
+[[group]]
+template = "fleet-summary"
+name = "fleet-west"
+replicas = 3
+```
+
+The `aggregator.registry` RPC service lets any node enumerate, spawn, scale, and unregister aggregator groups on any other node. The CLI exposes `net aggregator spawn / scale / ls / query --remote --node-addr <ip:port> --node-pubkey <hex>` for operating against a live daemon over the wire.
+
 ## Replica groups
 
 A `ReplicaGroup` runs N copies of the same daemon across the mesh, with load-balanced routing to whichever replica is closest or least loaded. Replica identities are deterministic — they're derived from a group seed plus an index — so a failed replica re-spawns with the same identity on a different node without coordination:
 
 ```rust
-use net::adapter::net::compute::ReplicaGroup;
+use net::adapter::net::compute::{ReplicaGroup, LoadBalancer};
 
 let group = ReplicaGroup::new(group_id, group_seed)
-    .with_factor(3)
-    .with_load_balancer(LoadBalancer::round_robin())
-    .with_daemon_factory(|| CounterDaemon { count: 0 });
+    .with_factor(5)
+    .with_load_balancer(LoadBalancer::least_connections())
+    .with_daemon_factory(|| StatelessWorker::new());
 
 let registration = mesh.register_replica_group(group).await?;
 ```
@@ -145,7 +224,7 @@ let group = ForkGroup::from_parent(parent_origin, fork_seq)
 let registration = mesh.register_fork_group(group).await?;
 ```
 
-Each fork records its lineage in a `ForkRecord` with a verifiable sentinel hash; any node on the mesh can verify the fork is legitimate. The forks themselves are normal daemons, registered in the daemon registry, addressable by their own identities.
+Each fork records its lineage in a `ForkRecord` carrying a verifiable sentinel hash; any node on the mesh can verify the fork is legitimate. The forks themselves are normal daemons, registered in the daemon registry, addressable by their own identities.
 
 | Pattern        | Identity                              | Routing            | State    | Recovery                                  |
 |----------------|---------------------------------------|--------------------|----------|-------------------------------------------|
@@ -153,6 +232,7 @@ Each fork records its lineage in a `ForkRecord` with a verifiable sentinel hash;
 | Replica group  | Deterministic from seed + index       | Load-balanced     | Stateless| Re-derive on a new node                   |
 | Standby group  | Deterministic from seed; active flag  | Always to active  | Stateful | Standby promotes + replays buffer        |
 | Fork group     | Random per fork, stored for recovery  | Per-fork direct   | Either   | Re-spawn from stored secret               |
+| Lifecycle group| As per the inner `LifecycleDaemon`    | Per replica       | Either   | `HealthMonitor` respawn via factory       |
 
 ## Capability-aware daemons
 

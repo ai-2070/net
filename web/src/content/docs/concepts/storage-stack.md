@@ -48,9 +48,11 @@ NetDB is opt-in. It's the layer you reach for when "talk to the right node and r
 
 ## Dataforts
 
-Sitting alongside the three-layer stack is Dataforts: content-addressed blob storage with a greedy-LRU cache and gravity-based placement. Dataforts is for the payloads that don't belong in events themselves — large model weights, training datasets, video segments, anything where you want deduplication and locality but don't need fine-grained causal ordering.
+Sitting alongside the three-layer stack is Dataforts: content-addressed blob storage with a greedy-LRU cache, gravity-based placement, and a dedicated transport for fetching blobs across the mesh. Dataforts is for the payloads that don't belong in events themselves — large model weights, training datasets, video segments, file trees, anything where you want deduplication and locality but don't need fine-grained causal ordering.
 
 A blob in Dataforts is referenced by its content hash. Producers `put` a blob and get back a `BlobRef`; consumers `get` a `BlobRef` and the runtime fetches the bytes from the nearest node that has them, populating the local cache as it goes. The greedy-LRU policy decides what to evict when the cache is full; the data-gravity counters bias caching and placement toward the nodes that read each blob most often.
+
+Transfer itself rides a dedicated subprotocol on top of the substrate's scheduled streams. A node holding a chunk advertises it through the capability fold (`causal:<blake3-hex>`); a node that wants the chunk consults the fold to find a holder, opens a stream weighted by the fair scheduler, and reassembles the bytes from the reliable in-order delivery. Manifest fetches parallelize the per-chunk requests so a thousand-chunk blob comes down at link speed, not chunk-by-chunk round-trip-bound speed. Larger directory trees move through the same primitive via an atomic `fetch_dir` that either materializes the whole tree or leaves the destination untouched on failure.
 
 Dataforts uses RedEX underneath to track blob metadata and the heat counters that drive placement. Once you have a `BlobRef`, you can pass it through events, store it in folds, and join against it in NetDB queries — blobs and events compose, with the bus carrying the small payloads and Dataforts carrying the large ones.
 

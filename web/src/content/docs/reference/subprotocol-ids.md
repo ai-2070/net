@@ -4,7 +4,7 @@ Every Net packet carries a 16-bit `subprotocol_id` in its header. The id tells t
 
 ## ID space
 
-| Range              | Purpose                                                    |
+| ID                 | Purpose                                                    |
 |--------------------|------------------------------------------------------------|
 | `0x0000`           | Plain events — no subprotocol, raw payload                 |
 | `0x0001..=0x03FF`  | Reserved for core protocols                                |
@@ -12,7 +12,6 @@ Every Net packet carries a 16-bit `subprotocol_id` in its header. The id tells t
 | `0x0401`           | State snapshots                                            |
 | `0x0500`           | Daemon migration                                           |
 | `0x0600`           | Subprotocol negotiation                                    |
-| `0x0601`           | Handshake relay (relayed Noise NKpsk0)                     |
 | `0x0700`           | Continuity proofs                                          |
 | `0x0701`           | Fork announcements                                         |
 | `0x0702`           | Continuity proof transfer                                  |
@@ -20,12 +19,17 @@ Every Net packet carries a 16-bit `subprotocol_id` in its header. The id tells t
 | `0x0801`           | Log reconciliation                                         |
 | `0x0900`           | Replica group coordination (reserved, not active)          |
 | `0x0A00`           | Channel membership                                         |
-| `0x0B00`           | Stream-window flow control                                 |
+| `0x0B00`           | Stream-window flow control (24-byte payload, carries `ack_seq` for ack-driven retransmit pruning) |
+| `0x0B01`           | Stream NACK — reliable-stream retransmit signaling         |
+| `0x0B02`           | Stream RESET — reliable-stream hard-failure signal         |
 | `0x0C00`           | Capability announcement                                    |
 | `0x0D00`           | NAT-traversal reflex                                       |
 | `0x0D01`           | NAT-traversal rendezvous                                   |
 | `0x0E00`           | RedEX distributed replication                              |
-| `0x1000..=0xEFFF`  | Vendor / third-party                                       |
+| `0x0F00`           | MeshDB federated query                                     |
+| `0x1000`           | Fold framework dispatch (typed fold envelopes, `kind` selects the fold)  |
+| `0x1100`           | Blob transfer (content-addressed fetch over scheduled streams) |
+| `0x1200..=0xEFFF`  | Vendor / third-party                                       |
 | `0xF000..=0xFFFF`  | Experimental / ephemeral                                   |
 
 ## The opaque-forwarding guarantee

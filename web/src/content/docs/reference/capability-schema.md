@@ -94,10 +94,11 @@ A handful of prefixes carry specific meaning to the substrate, outside the four 
 
 | Prefix       | Meaning                                                                |
 |--------------|------------------------------------------------------------------------|
-| `causal:`    | Node's position in the causal graph; used for routing causal events    |
+| `causal:`    | Node's position in the causal graph; also used by blob transfer (a node holding a chunk advertises `causal:<blake3-hex>`) |
 | `fork-of:`   | Marks a node as a fork or replica of another entity                    |
 | `heat:`      | Data-gravity counters (read frequency, write frequency)                |
 | `scope:`     | Visibility scope for cross-subnet capability propagation               |
+| `ai-tool:`   | Marks a node as serving the named LLM-callable tool; added automatically by `serve_tool` |
 | `subprotocol:` | Subprotocols the node handles (added automatically by the registry)   |
 
 ## Reserved metadata keys

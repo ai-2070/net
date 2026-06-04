@@ -39,7 +39,7 @@ If you want a minimal build — just the in-memory bus, no mesh, no persistence 
 
 ```toml
 [dependencies]
-net-mesh = { version = "0.20", default-features = false }
+net-mesh = { version = "0.27", default-features = false }
 ```
 
 ## Node

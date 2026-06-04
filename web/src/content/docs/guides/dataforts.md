@@ -1,6 +1,6 @@
 # Blob Storage with Dataforts
 
-Dataforts is the layer in Net that handles large, content-addressed payloads — the things that are too big to live inline in events but too important to leave on a separate object store. Model weights, training data, video segments, generated artifacts, anything where you want deduplication, locality, and the same identity-bound access semantics the rest of Net gives you.
+Dataforts is the layer in Net that handles large, content-addressed payloads — the things that are too big to live inline in events but too important to leave on a separate object store. Model weights, training data, video segments, generated artifacts, file trees, anything where you want deduplication, locality, and the same identity-bound access semantics the rest of Net gives you.
 
 A blob in Dataforts is referenced by its content hash. Producers put bytes in and get back a `BlobRef`; consumers hand a `BlobRef` to the runtime and get bytes out. Where the bytes physically live is the runtime's problem — it caches popular content near the readers that want it, evicts cold content under memory pressure, and migrates hot content toward the nodes that read it most.
 
@@ -22,7 +22,17 @@ let bytes = blobs.get(&blob_ref).await?;
 
 `put` is content-addressed. Putting the same bytes twice returns the same `BlobRef`; the runtime deduplicates automatically and never stores the same content twice on the same node. The hash is BLAKE3, chunked with content-defined chunking — so editing the middle of a file doesn't invalidate the chunks at the start or end, and the unchanged chunks dedupe across versions.
 
-`get` is location-aware. The runtime looks for the blob in the local cache first, then asks the mesh for the nearest node that has it, then fetches in parallel from multiple holders if that's faster. The first byte returned to your code typically comes from the closest cache; the rest streams in behind it.
+`get` is location-aware. The runtime looks for the blob in the local cache first, then asks the mesh for the nearest node that has it, then fetches in parallel from multiple holders if that's faster. Manifest fetches stream the per-chunk requests concurrently — a thousand-chunk blob completes in roughly the slowest single-chunk round-trip, not the sum of all of them. The first byte returned to your code typically comes from the closest cache; the rest streams in behind it.
+
+## How the transfer actually works
+
+Discovery and transfer ride the substrate's existing primitives — there's no separate transfer process, no broker, no out-of-band protocol.
+
+**Discovery is fold-based.** A node holding a chunk advertises it through the capability fold with a `causal:<blake3-hex>` tag. A node that wants the chunk consults the fold in memory, finds the nearest holder, and opens a transfer stream to it. The 256-bit BLAKE3 digest is treated as an unguessable bearer token — anyone who learns it can fetch from any holder, so sensitive-content callers must treat the hash as a secret or layer channel / capability auth above the transport.
+
+**Transfer rides a scheduled stream.** The dedicated blob-transfer subprotocol opens a fair-scheduled reliable stream between the requester and the holder. The holder chunks the blob into ≤8108-byte reliable events terminated by FIN; the receiver concatenates by arrival order and verifies the BLAKE3 digest matches the request. Because the stream is scheduled, multiple in-flight transfers share the link fairly — a 16-GB model download doesn't starve interactive RPC.
+
+**Auto-store + heat bump on fetch.** Once a blob's bytes arrive, the local Dataforts adapter automatically stores them and bumps the heat counter for the receiver. The next request for the same blob hits the local cache; the next request in the deployment for the same blob can pull from this node instead of crossing the original boundary.
 
 ## Passing blobs through events
 
@@ -46,6 +56,25 @@ process_artifact(&bytes);
 ```
 
 The producer puts the bytes once. The reference fans out through the bus to every consumer. Each consumer pulls the bytes from the nearest holder — sometimes that's the producer, sometimes it's a peer that read it earlier and cached it. Network traffic scales with how many distinct consumers actually want the blob, not with how many subscribers the channel has.
+
+## Directory trees with `store_dir` and `fetch_dir`
+
+Directory transfer is a first-class operation on top of the blob primitive. `store_dir` walks a local directory, hashes each file and each subtree, and writes a manifest blob that references them all; `fetch_dir` consumes a manifest blob and materializes the tree on the receiving side.
+
+```rust
+use net::adapter::net::dataforts::dir::{store_dir, fetch_dir};
+
+// Producer side
+let root_ref: BlobRef = store_dir(&blobs, "./workspace").await?;
+publish_event(WorkspaceReady { root: root_ref });
+
+// Consumer side
+fetch_dir(&blobs, &root_ref, "./materialized").await?;
+```
+
+`fetch_dir` is **atomic**. The runtime writes the entire tree into a sibling temp path on the same filesystem, and only renames into the caller's `dest` once every file, directory, and symlink has materialized successfully. A failure mid-fetch — network loss, disk-full, the process getting killed — removes the partial temp tree and leaves `dest` exactly as it was before the call. There's no rollback machinery to wrap around it at the application layer; the contract is the substrate's.
+
+If `dest` already exists, the runtime swaps the new tree in with the old tree preserved as a backup until the swap completes, then removes the backup — so a crash between renames leaves either the new tree or the old tree, never neither and never both. Because the temp path is a sibling of `dest` on the same filesystem, the rename is a true atomic operation rather than a copy-and-delete masquerading as one.
 
 ## Caching
 
@@ -75,6 +104,33 @@ The persistent tier uses BLAKE3 as the file name, content-defined chunking to sp
 
 `blobs.flush()` forces a sync to the persistent tier. You won't usually call it — the runtime flushes on its own schedule — but it's available when you need a hard durability barrier (e.g. before acknowledging an upload to an external caller).
 
+## The transport SDK
+
+Five language tiers — Rust (`net_sdk::transport`), C (`net.h` extensions), Python (pyo3), TypeScript (napi-rs), Go (CGO over C) — expose the same three operations:
+
+```rust
+// Rust
+let bytes = fetch_blob(&mesh, &blob_ref).await?;
+let root  = store_dir(&blobs, "./src").await?;
+fetch_dir(&blobs, &root, "./out").await?;
+```
+
+```ts
+// TypeScript
+const bytes = await fetchBlob(mesh, blobRef);
+const root  = await storeDir(blobs, "./src");
+await fetchDir(blobs, root, "./out");
+```
+
+```python
+# Python
+bytes_ = await fetch_blob(mesh, blob_ref)
+root   = await store_dir(blobs, "./src")
+await fetch_dir(blobs, root, "./out")
+```
+
+The SDK stays deliberately thin — no retry policy, no rollback machinery beyond the substrate's own atomicity, no directory-sync primitives. Substrate primitives are exposed; applications compose policy above. The `DirManifest` and `DirEntry` introspection types are also re-exported so applications that want to walk a manifest before materializing it (build systems, dependency resolvers, agent delegators) can do so without reaching into substrate internals.
+
 ## Operator surface
 
 The runtime exposes per-blob, per-node, per-cluster counters:
@@ -102,4 +158,4 @@ The rule of thumb is around tens of kilobytes. If your payload fits comfortably 
 
 The model is composable. The bus moves the small references at high frequency; Dataforts moves the large payloads on demand. CortEX folds can hold `BlobRef`s in their state; NetDB queries can join against them; nRPC can return them. The blob's identity, like everything else in Net, is content-bound and verifiable — the hash *is* the reference, so a forged `BlobRef` won't decode to the wrong bytes.
 
-For the workloads Dataforts is built for — model serving, dataset distribution, large-payload event sourcing, content delivery on the mesh — the alternative is bolting an external object store onto the side of your event bus and writing your own glue. Dataforts is what's there if you don't want to.
+For the workloads Dataforts is built for — model serving, dataset distribution, large-payload event sourcing, content delivery on the mesh, workspace transfer between agents — the alternative is bolting an external object store onto the side of your event bus and writing your own glue. Dataforts is what's there if you don't want to.
