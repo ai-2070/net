@@ -86,7 +86,6 @@ impl CliContext {
     /// transfer subcommands consume this — they run `serve_blob_transfer`
     /// then `fetch_blob` / `fetch_dir` through the same connected handle
     /// the aggregator RPC clients route through.
-    #[allow(dead_code)]
     pub fn mesh(&self) -> Option<&net_sdk::Mesh> {
         self.mesh.as_ref()
     }
@@ -95,7 +94,6 @@ impl CliContext {
     /// was built via [`Self::build`] (no remote attach). Transfer
     /// verbs that always connect to a holder call this so the
     /// "should be unreachable" branch isn't restated per call site.
-    #[allow(dead_code)]
     pub fn require_mesh(&self) -> Result<&net_sdk::Mesh, CliError> {
         self.mesh().ok_or_else(|| {
             crate::error::sdk(
