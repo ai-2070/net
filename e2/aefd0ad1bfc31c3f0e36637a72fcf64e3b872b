@@ -1,0 +1,19 @@
+net/crates/net/docs/releases/RELEASE_v0.27_PURPLE_RAIN.md
+  s_e802155ff9ef32::t_fa7529f3e11a8e 146-155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "e2aefd0ad1bfc31c3f0e36637a72fcf64e3b872b",
+  "prompts": {},
+  "sessions": {
+    "s_e802155ff9ef32": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4e7ed794-33fe-4781-8585-c1e89f2c852c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
