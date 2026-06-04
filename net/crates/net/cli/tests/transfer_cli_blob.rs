@@ -201,3 +201,26 @@ async fn recv_blob_rejects_bogus_ref() {
     .await;
     assert_eq!(code, 2, "expected InvalidArgs exit code");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recv_blob_without_attach_is_invalid_args() {
+    // A well-formed `--blob-ref` but no remote-attach target (and no
+    // profile defaults under the empty temp HOME) is a typed InvalidArgs
+    // (exit 2): `require_remote_attach` rejects before any network work.
+    let home = TempDir::new().expect("home");
+    let out = TempDir::new().expect("out").path().join("x.bin");
+    let (code, _stdout, stderr) = run_transfer(
+        &home,
+        vec![
+            "recv-blob".into(),
+            "--blob-ref".into(),
+            // 32-byte all-zero hash — parses as a valid Small ref, so the
+            // failure can only come from the missing holder target.
+            "0".repeat(64),
+            "--out".into(),
+            out.display().to_string(),
+        ],
+    )
+    .await;
+    assert_eq!(code, 2, "expected InvalidArgs exit code; stderr={stderr}");
+}
