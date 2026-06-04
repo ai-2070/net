@@ -4,6 +4,10 @@ This demo shows `net transfer recv-dir` pulling a whole directory tree
 from a holder node and reconstructing it atomically, with throughput that
 is largely invariant to file count.
 
+> Binary name: the CLI ships as `net-mesh`. The examples below write
+> `net transfer …` for brevity; substitute your installed binary name
+> (e.g. `net-mesh transfer …`) when copy/pasting.
+
 ## The headline shape
 
 ```
