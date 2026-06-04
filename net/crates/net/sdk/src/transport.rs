@@ -193,7 +193,20 @@ pub fn serve_blob_transfer_rpc(
     mesh: &Mesh,
     adapter: Arc<MeshBlobAdapter>,
 ) -> Result<ServeHandle, ServeError> {
-    mesh.node().serve_blob_transfer_with_rpc(adapter)
+    // Install the engine (and hold its handle so the RPC reports on the
+    // exact registry doing the fetches), then serve the handler through
+    // `Mesh::serve_rpc` — which auto-registers the `blob.transfers` request
+    // channel + reply prefix in the SDK's ChannelConfigRegistry, so a node
+    // with a restrictive registry (the MeshBuilder default) still admits
+    // the RPC's channel membership. Serving via `MeshNode::serve_rpc`
+    // directly would skip that registration and fail with UnknownChannel.
+    let engine = mesh.node().serve_blob_transfer(adapter);
+    mesh.serve_rpc(
+        net::adapter::net::dataforts::blob::TRANSFER_SERVICE,
+        Arc::new(net::adapter::net::dataforts::blob::TransferRpcHandler::new(
+            engine,
+        )),
+    )
 }
 
 // ── Blob fetch ──────────────────────────────────────────────────────

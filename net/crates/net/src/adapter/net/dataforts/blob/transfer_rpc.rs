@@ -105,8 +105,9 @@ pub(crate) fn answer(
 }
 
 /// RPC handler holding the live engine. Registered under
-/// [`TRANSFER_SERVICE`] via
-/// [`crate::adapter::net::MeshNode::serve_blob_transfer_with_rpc`].
+/// [`TRANSFER_SERVICE`] — the SDK's `transport::serve_blob_transfer_rpc`
+/// installs the engine and serves this handler through `Mesh::serve_rpc`
+/// (which auto-registers the service's channels).
 pub struct TransferRpcHandler {
     engine: Arc<BlobTransferEngine>,
 }

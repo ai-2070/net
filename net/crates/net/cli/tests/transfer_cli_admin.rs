@@ -39,9 +39,12 @@ async fn boot_holder() -> (Mesh, transport::ServeHandle) {
         .build()
         .await
         .expect("mesh build");
-    mesh.start();
+    // Register the RPC service BEFORE start() (mirrors the aggregator
+    // daemon boot order) so the `blob.transfers.requests` channel
+    // subscription is wired into the dispatch loop before it spins up.
     let adapter = Arc::new(MeshBlobAdapter::new("holder", Arc::new(Redex::new())));
     let serve = transport::serve_blob_transfer_rpc(&mesh, adapter).expect("serve transfers rpc");
+    mesh.start();
     (mesh, serve)
 }
 
