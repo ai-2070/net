@@ -1,6 +1,6 @@
 # Identity
 
-Identity in Net is bound to cryptographic keys, not to network addresses, hostnames, or hardware. An entity is its ed25519 public key. Every other identifier — the 4-byte origin hash in the packet header, the 8-byte node ID used for routing, the entries in capability sets and channel rosters — is derived from that key. Move the key to a different machine and the entity moves with it; revoke the key and every reference to the entity becomes invalid at the same moment.
+Identity in Net is bound to cryptographic keys, not to network addresses, hostnames, or hardware. An entity is its ed25519 public key. Every other identifier — the 8-byte origin hash in the packet header, the 8-byte node ID used for routing, the entries in capability sets and channel rosters — is derived from that key. Move the key to a different machine and the entity moves with it; revoke the key and every reference to the entity becomes invalid at the same moment.
 
 This is the design choice that makes the rest of Net work. Wire-speed authorization needs an identifier small enough to fit in the packet header. Daemon migration needs an identifier that survives a node going away. Capability advertising needs an identifier that can't be forged. A key-bound identity gives you all three without compromise.
 
@@ -10,7 +10,7 @@ The fundamental object is the `EntityId`: a 32-byte ed25519 public key. Most ent
 
 Two derived identifiers ride in the packet header on every packet:
 
-- **`origin_hash`** is a 4-byte BLAKE2s-MAC of the public key under the domain string `"net-origin-v1"`. It's the field that wire-speed authorization, deduplication, and routing look at on the hot path. Four bytes is small enough to fit a great many of them in L1 cache; the MAC construction is collision-resistant enough that two production entities won't collide in any realistic deployment.
+- **`origin_hash`** is an 8-byte BLAKE2s-MAC of the public key under the domain string `"net-origin-v1"`. It's the field that wire-speed authorization, deduplication, and routing look at on the hot path. The substrate uses the full 64-bit value as a hard reverse-index to the publisher's `NodeId`, which makes adversarial collision-grinding cost roughly 2^32 work per target — well past the line where a brittle 32-bit hash would have been a routing-impersonation primitive.
 - **`node_id`** is an 8-byte BLAKE2s-MAC under `"net-node-id-v1"`. It replaces what would otherwise be an arbitrary u64 in swarm and routing tables — and because it's derived from the same key, a node's identity in routing matches its identity in authorization, with no possibility of impersonation.
 
 Both derivations are cached in an `OriginStamp` at session startup, so the per-packet cost is a single u32 field write — no signing, no hashing on the hot path.

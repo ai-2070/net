@@ -16,7 +16,7 @@ You work mostly at the top. The bottom two layers are visible only when somethin
 
 ## Transport
 
-The transport layer moves encrypted bytes between nodes. It's a UDP-based mesh protocol with a 64-byte header aligned to a single CPU cache line, encrypted with a Noise NKpsk0 handshake and ChaCha20-Poly1305 frames. Forwarding nodes can route a packet by reading the header alone — they never decrypt the payload.
+The transport layer moves encrypted bytes between nodes. It's a UDP-based mesh protocol with a 68-byte header, 8-byte aligned, encrypted with a Noise NKpsk0 handshake and ChaCha20-Poly1305 frames. Forwarding nodes can route a packet by reading the header alone — they never decrypt the payload.
 
 The protocol is designed so that the routing decision, the access-control decision, and the deduplication decision all fit inside that one cache line. That's how Net sustains the throughput it does: nothing on the hot path requires a system call beyond `recvmsg`, and nothing requires a cryptographic operation beyond the one-time AEAD verify on packets destined for the local node.
 
@@ -26,7 +26,7 @@ Above the wire format, transport handles connection setup, session keys, congest
 
 The identity layer answers three questions about every packet on the wire: who sent it, what channel it's claiming, and whether the sender is allowed to use that channel. Identity is bound to keys, not addresses — an entity is its ed25519 public key, and that key follows the entity if it migrates to a different node.
 
-Every packet header carries a 4-byte `origin_hash` that's a domain-separated hash of the sender's public key. Forwarding nodes can authorize the packet against a 4 KB bloom filter that fits in L1 cache, in under ten nanoseconds, without ever touching the payload. The full identity check (token signature verification, capability matching) happens at session and subscription time, not per-packet — the bloom filter caches the positive verdict.
+Every packet header carries an 8-byte `origin_hash` that's a domain-separated BLAKE2s-MAC of the sender's public key. Forwarding nodes can authorize the packet against a 4 KB bloom filter that fits in L1 cache, in under ten nanoseconds, without ever touching the payload. The full identity check (token signature verification, capability matching) happens at session and subscription time, not per-packet — the bloom filter caches the positive verdict.
 
 On top of identity sit two coordination primitives. Channels are named endpoints with visibility scopes and capability-based access policy. Permission tokens are signed, scoped, time-bound delegations that grant specific entities specific rights on specific channels. Both compose with capabilities, which are tag-and-metadata advertisements that nodes broadcast to describe what they can do.
 
