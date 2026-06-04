@@ -24,10 +24,10 @@ Tagged `[A | B | C | D]`:
 | A-3  | H   | context           | confirm `CliContext::mesh_node()` from aggregator work supports transfer flows       |
 | A-4  | M   | output            | progress bar component + JSON / human output modes via `OutputFormat`                |
 | B-1  | H   | recv blob         | `net transfer recv-blob --from <peer> --blob-ref <ref> --out <path>`                 |
-| B-2  | H   | send blob         | `net transfer send-blob <path> --to <peer>` (publishes + signals)                    |
+| B-2  | H   | send blob         | `net transfer send-blob <path> [--store <dir>]` (computes ref; stages for fetch)     |
 | B-3  | M   | tests             | `tests/transfer_cli_blob.rs` — two-daemon subprocess round-trip                      |
 | C-1  | H   | recv dir          | `net transfer recv-dir --from <peer> --remote-ref <ref> --out <path>`                |
-| C-2  | M   | send dir          | `net transfer send-dir <path> --to <peer>` (publishes manifest + chunks)             |
+| C-2  | M   | send dir          | `net transfer send-dir <path> [--store <dir>]` (computes manifest ref; stages it)    |
 | C-3  | H   | tests             | `tests/transfer_cli_dir.rs` — atomic reconstruction validation                       |
 | D-1  | M   | ls                | `net transfer ls` — active transfers from local engine state                         |
 | D-2  | M   | status            | `net transfer status <transfer-id>` — per-transfer detail                            |
@@ -76,13 +76,25 @@ pub enum TransferCommand {
 
 **Common flags across send/recv:**
 
-- `--node` (existing convention): which local node ID to operate against.
-- `--identity <path>`: optional identity override.
-- `--from <peer-id>` / `--to <peer-id>`: counterparty selection. Reuse `parse_u64_flexible` (`parsers.rs`) for peer IDs.
-- `--blob-ref <hex>`: content-addressed blob reference. 32-byte hex. Reuse the lifted `hex_decode_32` helper from aggregator work (lift to `parsers.rs` if not already done).
-- `--remote-ref <hex>`: directory manifest reference.
-- `--out <path>` / positional source path: local filesystem paths. `PathBuf` via clap's built-in support.
-- `--format` (`OutputFormat::Json` | `OutputFormat::Text`): output mode. Reuse existing `prelude::OutputFormat`.
+- `--node` / `--identity <path>` (recv verbs): local node id + optional
+  identity override for the ephemeral mesh that handshakes with the holder.
+- Remote-attach (recv verbs): `--node-addr` / `--node-pubkey` / `--node-id`
+  / `--psk-hex` — the holder target, each defaultable from the profile
+  (same set as `net aggregator`). `--from <peer-id>` selects the source
+  peer, defaulting to `--node-id`. (There is no `--to`: send is
+  publish-and-fetch, not push.) Reuse `parse_u64_flexible` (`parsers.rs`)
+  for peer ids.
+- `--blob-ref <hex>`: content reference for blobs. Accept either a 32-byte
+  hash (single-chunk content) or a full encoded `BlobRef` hex (works for
+  chunked content too).
+- `--remote-ref <hex>`: directory manifest reference (same dual form).
+- `--out <path>` / positional source path: local filesystem paths. `PathBuf`
+  via clap's built-in support.
+- `--concurrency <n>` (recv-dir): leaf-file fetch concurrency passed through
+  to `fetch_dir` (`0` → its `DEFAULT_FETCH_CONCURRENCY`).
+- `--store <dir>` (send verbs): optional on-disk store to stage bytes into.
+- `--output` (`json|yaml|ndjson|table|text`): output mode, via the shared
+  global flag + `OutputFormat`.
 
 **No new parser primitives.** Everything composes against `parsers.rs` plus clap's standard support. If anything is missing it's a one-function addition to `parsers.rs` rather than a new parser module.
 
@@ -104,7 +116,7 @@ The aggregator remote-attach work (`AGGREGATOR_CLI_REMOTE_ATTACH_AND_SCALE_RPC.m
 
 ### B-1 — `net transfer recv-blob`
 
-**Wraps:** `transport::fetch_blob(mesh, adapter, peer_id, blob_ref, opts)` (`sdk/src/transport.rs:178`).
+**Wraps:** `transport::fetch_blob(mesh, source, blob_ref)` (`sdk/src/transport.rs:188`). No `adapter` or `opts` parameter; returns `Result<Bytes, TransferError>`.
 
 **Operator invocation:**
 
@@ -152,7 +164,7 @@ net transfer send-blob ./payload.bin
 
 ### C-1 — `net transfer recv-dir`
 
-**Wraps:** `transport::fetch_dir(mesh, adapter, peer_id, remote_ref, local_path, opts)` (`sdk/src/transport.rs:304`).
+**Wraps:** `transport::fetch_dir(mesh, source, manifest_ref, dest, concurrency)` (`sdk/src/transport.rs:314`). No `adapter` or `opts` parameter; takes `concurrency: usize` (`0` uses `DEFAULT_FETCH_CONCURRENCY`). Returns `Result<DirStats, TransferError>`.
 
 **Operator invocation:**
 

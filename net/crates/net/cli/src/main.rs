@@ -206,6 +206,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
     let output = cli.output;
     let config_path = cli.config.as_deref();
     let profile = cli.profile.as_str();
+    let quiet = cli.quiet;
     match cli.command {
         Command::Version => commands::version::run(output).await,
         Command::Identity(cmd) => commands::identity::run(cmd, output).await,
@@ -233,7 +234,9 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Aggregator(cmd) => {
             commands::aggregator::run(cmd, output, config_path, profile).await
         }
-        Command::Transfer(cmd) => commands::transfer::run(cmd, output, config_path, profile).await,
+        Command::Transfer(cmd) => {
+            commands::transfer::run(cmd, output, config_path, profile, quiet).await
+        }
         Command::Completion(args) => commands::completion::run::<Cli>(args),
         Command::Man => commands::man::run::<Cli>(),
     }

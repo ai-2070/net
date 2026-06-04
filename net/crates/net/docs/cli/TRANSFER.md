@@ -22,7 +22,7 @@ handled by the substrate; the CLI surfaces the controls.
 | `send-dir`  | publish | Compute a directory's manifest reference; optionally stage it. |
 | `ls`        | inspect | List active transfers on the local node. |
 | `status`    | inspect | Show one transfer's detail. |
-| `cancel`    | inspect | Cancel an in-progress transfer. |
+| `cancel`    | action  | Cancel an in-progress transfer. |
 
 `recv-*` verbs connect to a holder and therefore take **remote-attach**
 flags (same as `net aggregator`): `--node-addr <IP:PORT>`,
@@ -82,7 +82,7 @@ $ net transfer recv-blob \
   "out": "./received.bin",
   "bytes": 204800,
   "duration_secs": 0.04,
-  "throughput_mib_s": 4882.8
+  "throughput_mib_s": 4.88
 }
 ```
 

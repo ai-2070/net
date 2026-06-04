@@ -158,14 +158,15 @@ pub async fn run(
     output: Option<OutputFormat>,
     config_path: Option<&std::path::Path>,
     profile_name: &str,
+    quiet: bool,
 ) -> Result<(), CliError> {
     match cmd {
         TransferCommand::RecvBlob(args) => {
-            run_recv_blob(args, output, config_path, profile_name).await
+            run_recv_blob(args, output, config_path, profile_name, quiet).await
         }
         TransferCommand::SendBlob(args) => run_send_blob(args, output).await,
         TransferCommand::RecvDir(args) => {
-            run_recv_dir(args, output, config_path, profile_name).await
+            run_recv_dir(args, output, config_path, profile_name, quiet).await
         }
         TransferCommand::SendDir(args) => run_send_dir(args, output).await,
         TransferCommand::Ls(_) => run_ls(output).await,
@@ -181,6 +182,7 @@ async fn run_recv_blob(
     output: Option<OutputFormat>,
     config_path: Option<&std::path::Path>,
     profile_name: &str,
+    quiet: bool,
 ) -> Result<(), CliError> {
     let blob_ref = parse_content_ref(&args.blob_ref, "--blob-ref")?;
 
@@ -202,7 +204,10 @@ async fn run_recv_blob(
         Arc::new(MeshBlobAdapter::new("recv", Arc::new(Redex::new()))),
     );
 
-    let spinner = Progress::start(&format!("fetching blob from peer {source}"));
+    let spinner = Progress::start(
+        &format!("fetching blob from peer {source}"),
+        progress_enabled(output, quiet),
+    );
     let started = Instant::now();
     let bytes = transport::fetch_blob(mesh, source, &blob_ref)
         .await
@@ -244,7 +249,7 @@ async fn run_send_blob(args: SendBlobArgs, output: Option<OutputFormat>) -> Resu
 
     let staged = match args.store.as_deref() {
         Some(dir) => {
-            let adapter = persistent_adapter(dir, "send-blob")?;
+            let adapter = persistent_adapter(dir, "send-blob").await?;
             adapter
                 .store(&blob_ref, &bytes)
                 .await
@@ -277,6 +282,7 @@ async fn run_recv_dir(
     output: Option<OutputFormat>,
     config_path: Option<&std::path::Path>,
     profile_name: &str,
+    quiet: bool,
 ) -> Result<(), CliError> {
     let manifest_ref = parse_content_ref(&args.remote_ref, "--remote-ref")?;
 
@@ -293,7 +299,10 @@ async fn run_recv_dir(
         Arc::new(MeshBlobAdapter::new("recv", Arc::new(Redex::new()))),
     );
 
-    let spinner = Progress::start(&format!("reconstructing directory from peer {source}"));
+    let spinner = Progress::start(
+        &format!("reconstructing directory from peer {source}"),
+        progress_enabled(output, quiet),
+    );
     let started = Instant::now();
     // `fetch_dir` handles the atomic sibling-temp-dir reconstruction and
     // rolls back on failure, so the target is unchanged unless this
@@ -339,7 +348,7 @@ async fn run_send_dir(args: SendDirArgs, output: Option<OutputFormat>) -> Result
     // an ephemeral in-memory one (manifest computed, bytes not retained).
     let (adapter, staged) = match args.store.as_deref() {
         Some(dir) => (
-            persistent_adapter(dir, "send-dir")?,
+            persistent_adapter(dir, "send-dir").await?,
             Some(dir.display().to_string()),
         ),
         None => (
@@ -468,8 +477,12 @@ fn require_remote_attach(
 /// Build a persistent on-disk blob adapter rooted at `dir`. The bytes
 /// staged here are durable so a node configured against the same
 /// directory can serve them.
-fn persistent_adapter(dir: &std::path::Path, id: &str) -> Result<Arc<MeshBlobAdapter>, CliError> {
-    std::fs::create_dir_all(dir)
+async fn persistent_adapter(
+    dir: &std::path::Path,
+    id: &str,
+) -> Result<Arc<MeshBlobAdapter>, CliError> {
+    tokio::fs::create_dir_all(dir)
+        .await
         .map_err(|e| generic(format!("create store dir {}: {e}", dir.display())))?;
     let redex = Arc::new(Redex::new().with_persistent_dir(dir));
     Ok(Arc::new(
@@ -536,15 +549,30 @@ fn throughput_mib_s(bytes: u64, elapsed: std::time::Duration) -> f64 {
     }
 }
 
-/// Thin wrapper over an indicatif spinner that no-ops off a TTY (tests,
-/// pipes, `--output json` consumers) so the diagnostic never lands on
-/// stdout or clutters non-interactive output.
+/// Whether the recv-progress spinner should be drawn: only for a *human*
+/// effective output format (`table` / `text`) and not under `--quiet`.
+/// `--output json` (or any machine format) and `--quiet` both suppress it
+/// so an operator asking for machine-readable or silent operation gets no
+/// stderr chatter. The stderr-TTY check is applied separately in
+/// [`Progress::start`] (pipes/tests get nothing regardless).
+fn progress_enabled(output: Option<OutputFormat>, quiet: bool) -> bool {
+    !quiet
+        && matches!(
+            OutputFormat::resolve_oneshot(output),
+            OutputFormat::Table | OutputFormat::Text
+        )
+}
+
+/// Thin wrapper over an indicatif spinner that no-ops unless `enabled`
+/// (see [`progress_enabled`]) AND stderr is a TTY (tests, pipes get
+/// nothing) — so the diagnostic never lands on stdout or clutters
+/// machine-readable / quiet / non-interactive output.
 struct Progress(Option<indicatif::ProgressBar>);
 
 impl Progress {
-    fn start(msg: &str) -> Self {
+    fn start(msg: &str, enabled: bool) -> Self {
         use std::io::IsTerminal as _;
-        if !std::io::stderr().is_terminal() {
+        if !enabled || !std::io::stderr().is_terminal() {
             return Self(None);
         }
         let pb = indicatif::ProgressBar::new_spinner();
