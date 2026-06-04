@@ -1,0 +1,25 @@
+net/crates/net/docs/cli/TRANSFER.md
+  s_6c5221c01e7170::t_a8d02c9afa44d2 1-188
+net/crates/net/docs/demos/dir_transfer/README.md
+  s_6c5221c01e7170::t_6c21843eba3dd9 1-68
+net/crates/net/cli/tests/transfer_cli_dir.rs
+  s_6c5221c01e7170::t_ab993c3b1a3bca 43-46,212-215
+net/crates/net/cli/tests/transfer_cli_blob.rs
+  s_6c5221c01e7170::t_ab993c3b1a3bca 126-129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "63622509047d1dc7497605f9ec214d8e973b50bd",
+  "prompts": {},
+  "sessions": {
+    "s_6c5221c01e7170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f37db5c6-b2d5-4a32-b8d0-45008d549c08",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
