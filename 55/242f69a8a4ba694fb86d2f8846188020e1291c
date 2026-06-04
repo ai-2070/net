@@ -1,0 +1,35 @@
+web/src/content/docs/reference/capability-schema.md
+  s_e802155ff9ef32::t_7af2f1433cb426 97,101
+web/src/content/docs/start/install.md
+  s_e802155ff9ef32::t_0fb339f3892922 42
+web/src/content/docs/guides/dataforts.md
+  s_e802155ff9ef32::t_388287dd484084 3,25-35,60-78,107-133,161
+web/src/content/docs/guides/daemons-and-placement.md
+  s_e802155ff9ef32::t_ce8be79bf41ae5 9,56,74,103-181,187,190-192,227,235
+web/src/content/docs/concepts/capabilities.md
+  s_e802155ff9ef32::t_61d819c96771e7 3,5,18,36,38-50,62-63,70,74-75,81
+web/src/content/docs/reference/error-codes.md
+  s_e802155ff9ef32::t_b679a52693bba9 100-156
+web/src/content/docs/reference/subprotocol-ids.md
+  s_e802155ff9ef32::t_a64d797201faf2 7,22-24,29-32
+web/src/content/docs/guides/nrpc.md
+  s_e802155ff9ef32::t_20e31008f788da 3,5,32,47,57-80,82-105,108,127,129,131,134-150,152,154-173,176-180,198-266,268,270-271,273-276,279
+web/src/content/docs/concepts/storage-stack.md
+  s_e802155ff9ef32::t_e3a16a8f96c222 51,55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "55242f69a8a4ba694fb86d2f8846188020e1291c",
+  "prompts": {},
+  "sessions": {
+    "s_e802155ff9ef32": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4e7ed794-33fe-4781-8585-c1e89f2c852c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
