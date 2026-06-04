@@ -20,12 +20,13 @@ handled by the substrate; the CLI surfaces the controls.
 | `send-blob` | publish | Compute a blob's content reference; optionally stage bytes to a store. |
 | `recv-dir`  | pull | Reconstruct a directory tree atomically under `--out`. |
 | `send-dir`  | publish | Compute a directory's manifest reference; optionally stage it. |
-| `ls`        | inspect | List active transfers on the local node. |
-| `status`    | inspect | Show one transfer's detail. |
-| `cancel`    | action  | Cancel an in-progress transfer. |
+| `ls`        | inspect | List a holder's in-flight (incoming) transfers. |
+| `status`    | inspect | Show one transfer's detail by stream id. |
+| `cancel`    | action  | Cancel one in-progress transfer by stream id. |
 
-`recv-*` verbs connect to a holder and therefore take **remote-attach**
-flags (same as `net aggregator`): `--node-addr <IP:PORT>`,
+`recv-*` **and** `ls` / `status` / `cancel` connect to a holder and
+therefore take **remote-attach** flags (same as `net aggregator`):
+`--node-addr <IP:PORT>`,
 `--node-pubkey <HEX>`, `--node-id <N>`, `--psk-hex <HEX>`. Each can be
 defaulted in your profile (`node_addr` / `node_pubkey` / `node_id` /
 `psk_hex`); the CLI flag wins when both are set.
@@ -148,17 +149,33 @@ error (fetch failed, hash mismatch, store error), `6` connection failure.
 
 ---
 
-## 6. `ls` / `status` / `cancel` — current limitation
+## 6. `ls` / `status` / `cancel` — transfer introspection
 
-The substrate's `BlobTransferEngine` tracks in-flight transfers in a
-per-node registry, but **exposes no enumeration accessor**, and a
-single-shot CLI invocation owns no long-lived transfer engine. So today
-these verbs report against the local (empty) engine and emit a `note`
-documenting the gap, rather than pretending to inspect a remote daemon's
-transfers. They become live once the substrate grows a
-transfers-list / cancel RPC (see `TRANSFER_CLI_PLAN.md` Gap D). The JSON
-shapes (`transfers[]`, `found`, `cancelled`) are stable so consumers can
-code against them ahead of that wiring.
+These query a holder's transfer engine over the mesh via the
+`blob.transfers` RPC (remote-attach, same flags as `recv-*`). They report
+the holder's **requester-side, in-flight** transfers — what that node is
+currently *fetching*. Serving tasks (bytes the node hands out to others)
+are fire-and-forget and not tracked, so they don't appear.
+
+```sh
+# What is this holder currently fetching?
+$ net transfer ls --node-addr <ip:port> --node-pubkey <hex> --node-id <N> --psk-hex <hex>
+{ "transfer_count": 1, "transfers": [
+    { "transfer_id": 2305843..., "peer": 884, "hash": "9f3c…",
+      "bytes_received": 1048576, "total_bytes": 4194304 } ] }
+
+# Detail / cancel one transfer by its stream id (the `transfer_id` above):
+$ net transfer status 2305843009213693952 --node-addr … --psk-hex …
+{ "transfer_id": 2305843009213693952, "found": true, "transfer": { … } }
+
+$ net transfer cancel 2305843009213693952 --node-addr … --psk-hex …
+{ "transfer_id": 2305843009213693952, "cancelled": true }
+```
+
+`cancel` drops the pending entry on the holder, failing its awaiting
+fetch. `status`/`cancel` return `found: false` / `cancelled: false` when
+no transfer with that id is pending. The serving node must install the RPC
+(`transport::serve_blob_transfer_rpc`, or a daemon that does).
 
 ---
 

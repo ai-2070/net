@@ -29,7 +29,7 @@ Tagged `[A | B | C | D]`:
 | C-1  | H   | recv dir          | `net transfer recv-dir --from <peer> --remote-ref <ref> --out <path>`                |
 | C-2  | M   | send dir          | `net transfer send-dir <path> [--store <dir>]` (computes manifest ref; stages it)    |
 | C-3  | H   | tests             | `tests/transfer_cli_dir.rs` — atomic reconstruction validation                       |
-| D-1  | M   | ls                | `net transfer ls` — active transfers from local engine state                         |
+| D-1  | M   | ls                | `net transfer ls` — a holder's in-flight transfers via the `blob.transfers` RPC      |
 | D-2  | M   | status            | `net transfer status <transfer-id>` — per-transfer detail                            |
 | D-3  | L   | cancel            | `net transfer cancel <transfer-id>` — explicit cancellation                          |
 | D-4  | L   | docs              | `docs/cli/TRANSFER.md` operator guide + integration into top-level CLI help          |
@@ -213,29 +213,41 @@ net transfer send-dir ./source_directory
 
 ## Gap D — Operational visibility
 
+**As built.** ls/status/cancel are **remote** verbs over the new
+`blob.transfers` RPC (`transfer_rpc.rs`), not local reads — a single-shot
+CLI owns no engine. They remote-attach to a holder (same flags as
+`recv-*`) and query that node's engine, which the holder exposes via
+`transport::serve_blob_transfer_rpc`. The engine gained
+`list_pending` / `get_pending` / `cancel_pending_reporting` +
+a serde `TransferStatus`; the typed `BlobTransferClient` mirrors the
+`aggregator.registry` client.
+
 ### D-1 — `net transfer ls`
 
-**What it shows.** Active transfers on the local node from the engine's perspective. The engine tracks pending transfers via `BlobTransferEngine::register_pending` (`transfer.rs:238`); ls reads the same registry.
+**What it shows.** The holder's **requester-side** in-flight transfers
+(what it's fetching). The engine tracks these via
+`BlobTransferEngine::register_pending` (`transfer.rs`); `list_pending`
+snapshots the same registry. Serving tasks aren't tracked, so `kind` is
+always `recv`.
 
-**Output (human):**
-
-```
-TRANSFER-ID          DIRECTION  PEER      KIND  PROGRESS         RATE
-12345678901234567    recv       87432     dir   23,891/30,247    38.4 MB/s
-12345678901234568    send       22198     blob  442/512 MB       55.1 MB/s
-```
-
-**Output (JSON):** structured array, one object per active transfer.
+**Output (JSON):** `{ transfer_count, transfers: [ { transfer_id, peer,
+hash, bytes_received, total_bytes? } ] }`.
 
 ### D-2 — `net transfer status <transfer-id>`
 
-**What it shows.** Detail view of one transfer: streams open, chunks completed, errors, current peer state, ETA. Reads from the same engine state ls uses.
+**What it shows.** One transfer by stream id (`get_pending`): peer, hash,
+bytes received, declared total. `{ transfer_id, found, transfer? }`.
 
 ### D-3 — `net transfer cancel <transfer-id>`
 
-**What it does.** Calls `BlobTransferEngine::cancel_pending(stream_id)` (`transfer.rs:260`). On the receiver side, this also triggers any cleanup the temp-dir machinery requires.
+**What it does.** Calls `cancel_pending_reporting(stream_id)` on the
+holder's engine, dropping the pending entry (which fails its awaiting
+fetch). Returns `{ transfer_id, cancelled }` (`cancelled: false` when no
+such transfer was pending).
 
-**Behaviour on partial transfers.** Cancel of a `recv-dir` mid-flight: the temp directory is removed, the target is unchanged (because temp-and-rename hasn't committed yet). Same atomicity guarantee as failure cases.
+**Behaviour on partial transfers.** Cancel of a `recv-dir` mid-flight: the
+temp directory is removed, the target is unchanged (temp-and-rename hasn't
+committed). Same atomicity guarantee as failure cases.
 
 ### D-4 — Docs
 
