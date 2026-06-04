@@ -1,0 +1,39 @@
+net/crates/net/docs/plans/TRANSFER_CLI_PLAN.md
+  s_6c5221c01e7170::t_d09cd1c7acd53a 30
+  s_6c5221c01e7170::t_f3d326699a01fe 27
+  s_6c5221c01e7170::t_b902e8d384d291 119
+  s_6c5221c01e7170::t_a576bf09130c21 79-97
+  s_6c5221c01e7170::t_74751d0e6d8161 167
+net/crates/net/cli/src/commands/transfer.rs
+  s_6c5221c01e7170::t_ddb899a91bf87d 351
+  s_6c5221c01e7170::t_c424160c522753 207-210
+  s_6c5221c01e7170::t_06b32fa12ee1ca 552-569,573,575
+  s_6c5221c01e7170::t_8c3e9b799187b0 252
+  s_6c5221c01e7170::t_1f0617f5fc02f6 285
+  s_6c5221c01e7170::t_b40604ab51af67 302-305
+  s_6c5221c01e7170::t_f9e28aaa543629 185
+  s_6c5221c01e7170::t_bf2a022bf17cfd 480-485
+  s_6c5221c01e7170::t_6714d2e9e88d33 161,165,169
+net/crates/net/docs/cli/TRANSFER.md
+  s_6c5221c01e7170::t_1a3c3fac6451e3 85
+  s_6c5221c01e7170::t_5808b97855625d 25
+net/crates/net/cli/src/main.rs
+  s_6c5221c01e7170::t_b7a0abb9bd8be8 237-239
+  s_6c5221c01e7170::t_1b243e795c8b4c 209
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "4eca229404bad8d95cfc9ee74cd0b53e9fc3d8a6",
+  "prompts": {},
+  "sessions": {
+    "s_6c5221c01e7170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f37db5c6-b2d5-4a32-b8d0-45008d549c08",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
