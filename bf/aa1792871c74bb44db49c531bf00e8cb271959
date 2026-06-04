@@ -1,0 +1,39 @@
+net/crates/net/src/adapter/net/dataforts/blob/transfer_rpc.rs
+  s_6c5221c01e7170::t_66549fecaa6a10 1-299
+net/crates/net/cli/src/commands/transfer.rs
+  s_6c5221c01e7170::t_8de2da777389c1 142-149,153,155-161,166,168-174
+  s_6c5221c01e7170::t_717ec873e062dc 727-729,732-734,736-752,757,759-760,765
+  s_6c5221c01e7170::t_2b55eba5191a6c 193-199
+  s_6c5221c01e7170::t_5a6819b275aa90 401-439,441-442,449-455,457-470,472-474,481-487,489-502,504-505
+net/crates/net/sdk/src/transport.rs
+  s_6c5221c01e7170::t_897f5d0979ac56 68-78
+  s_6c5221c01e7170::t_7b123e76a4f2ee 186-198
+net/crates/net/src/adapter/net/dataforts/blob/mod.rs
+  s_6c5221c01e7170::t_c5baabc8bfba3f 132-137
+  s_6c5221c01e7170::t_9b2b338a628cf8 39-41
+net/crates/net/src/adapter/net/dataforts/blob/transfer.rs
+  s_6c5221c01e7170::t_0994e2bb45db6e 652-692
+  s_6c5221c01e7170::t_fd9648bad3586d 212-228,230-242
+  s_6c5221c01e7170::t_8e4bb4cceb1e16 229
+  s_6c5221c01e7170::t_d15872d5f2a32b 295-317
+net/crates/net/src/adapter/net/mesh.rs
+  s_6c5221c01e7170::t_9b82027bea070e 9535-9561
+net/crates/net/cli/tests/transfer_cli_admin.rs
+  s_6c5221c01e7170::t_cb4aafdcefc4f5 1-137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "bfaa1792871c74bb44db49c531bf00e8cb271959",
+  "prompts": {},
+  "sessions": {
+    "s_6c5221c01e7170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f37db5c6-b2d5-4a32-b8d0-45008d549c08",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
