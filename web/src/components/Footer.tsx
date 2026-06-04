@@ -22,28 +22,36 @@ const FOOTER_DOCS: ReadonlyArray<{
   class?: string;
 }> = [
   {
-    href: "https://github.com/ai-2070/net/blob/master/net/crates/net/README.md",
-    label: "README.md",
+    href: "/docs/start/quickstart",
+    label: "Quickstart",
   },
   {
-    href: "https://github.com/ai-2070/net/blob/master/net/crates/net/docs/COMPUTE.md",
-    label: "COMPUTE.md",
+    href: "/docs/concepts/architecture",
+    label: "Architecture",
   },
   {
-    href: "https://github.com/ai-2070/net/blob/master/net/crates/net/docs/CHANNELS.md",
-    label: "CHANNELS.md",
+    href: "/docs/concepts/channels",
+    label: "Channels",
   },
   {
-    href: "https://github.com/ai-2070/net/blob/master/net/crates/net/docs/SUBNETS.md",
-    label: "SUBNETS.md",
+    href: "/docs/concepts/events-and-causality",
+    label: "Events and Causality",
   },
   {
-    href: "https://github.com/ai-2070/net/blob/master/net/crates/net/docs/SUBPROTOCOLS.md",
-    label: "SUBPROTOCOLS.md",
+    href: "/docs/concepts/identity",
+    label: "Identity",
   },
   {
-    href: "https://github.com/ai-2070/net/blob/master/net/crates/net/BENCHMARKS.md",
-    label: "BENCHMARKS.md",
+    href: "/docs/concepts/capabilities",
+    label: "Capabilities",
+  },
+  {
+    href: "/docs/concepts/subnets",
+    label: "Subnets",
+  },
+  {
+    href: "/docs/concepts/storage-stack",
+    label: "Storage",
   },
 ];
 
