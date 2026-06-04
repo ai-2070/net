@@ -1,0 +1,27 @@
+web/src/content/docs/reference/wire-format.md
+  s_e802155ff9ef32::t_ab874f42d738b3 122
+  s_e802155ff9ef32::t_bab153b4fc6cd7 5,13,15,17,19-21,23,25,27,29-31,33,35-37,41,50,60
+  s_e802155ff9ef32::t_d76fe47d4ebb24 87-88,90
+web/src/content/docs/concepts/architecture.md
+  s_e802155ff9ef32::t_2235db590e15f0 19
+  s_e802155ff9ef32::t_d8dea155d5d54e 29
+web/src/content/docs/concepts/identity.md
+  s_e802155ff9ef32::t_fa0d2245ee1d75 3
+  s_e802155ff9ef32::t_7ba9dab739beba 13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "2ae5a1fda600068ff7c1b1775c136b3337cfa5d5",
+  "prompts": {},
+  "sessions": {
+    "s_e802155ff9ef32": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4e7ed794-33fe-4781-8585-c1e89f2c852c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
