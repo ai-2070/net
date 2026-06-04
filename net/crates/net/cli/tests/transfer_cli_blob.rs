@@ -123,7 +123,10 @@ async fn recv_blob_fetches_byte_for_byte() {
     args.extend(attach(&holder));
 
     let (code, stdout, stderr) = run_transfer(&home, args).await;
-    assert_eq!(code, 0, "recv-blob failed: stderr={stderr}\nstdout={stdout}");
+    assert_eq!(
+        code, 0,
+        "recv-blob failed: stderr={stderr}\nstdout={stdout}"
+    );
 
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("non-JSON stdout ({e}): {stdout}"));

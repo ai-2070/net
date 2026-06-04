@@ -40,7 +40,10 @@ fn build_source_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
         ("src/main.rs", "fn main() {}\n".repeat(64)),
         ("src/lib.rs", "pub fn lib() {}\n".repeat(64)),
         ("src/util/mod.rs", "pub mod util;\n".repeat(32)),
-        ("data/blob.bin", "binary-ish payload \u{1f9ea}\n".repeat(256)),
+        (
+            "data/blob.bin",
+            "binary-ish payload \u{1f9ea}\n".repeat(256),
+        ),
         ("data/nested/deep.txt", "deep file\n".repeat(128)),
     ];
     for (rel, content) in files {
@@ -206,5 +209,8 @@ async fn send_dir_computes_matching_manifest_ref() {
     .await;
     assert_eq!(code, 0, "send-dir failed: stderr={stderr}");
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("parse send-dir");
-    assert_eq!(parsed["remote_ref"], expected_hex, "manifest ref mismatch: {stdout}");
+    assert_eq!(
+        parsed["remote_ref"], expected_hex,
+        "manifest ref mismatch: {stdout}"
+    );
 }
