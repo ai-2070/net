@@ -1,0 +1,23 @@
+net/crates/net/docs/cli/TRANSFER.md
+  s_6c5221c01e7170::t_1c31409d1ddad6 23-25,27-29
+  s_6c5221c01e7170::t_89349368699d21 152-178
+net/crates/net/docs/plans/TRANSFER_CLI_PLAN.md
+  s_6c5221c01e7170::t_0db8d4f5ce92c6 32
+  s_6c5221c01e7170::t_654e7b28437337 216-223,225,227-231,233-234,238-239,243-246,248-250
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "c9ff0ef5128f81547e8dfe8fbd5853250136d35a",
+  "prompts": {},
+  "sessions": {
+    "s_6c5221c01e7170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f37db5c6-b2d5-4a32-b8d0-45008d549c08",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
