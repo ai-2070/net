@@ -143,6 +143,16 @@ The v0.27 nRPC pass started as a `nrpc_qps` audit and turned into three threads.
 
 ---
 
+## Dependency updates
+
+One major-version bump and a clutch of routine patches.
+
+**`shlex` 1.3.0 → 2.0.1.** The only major-version bump in the set. The crate's quoting surface at the substrate's call sites is unchanged in behavior, but downstream consumers that pin `shlex = "1"` in their own `Cargo.toml` will need to widen the requirement to resolve cleanly against v0.27.
+
+**Routine patch bumps.** Alphabetical: `bitflags` (2.11.1 → 2.12.1), `cc` (1.2.62 → 1.2.63), `ctor` (1.0.6 → 1.0.7), `generator` (0.8.8 → 0.8.9), `hyper` (1.10.0 → 1.10.1), `igd-next` (0.17.0 → 0.17.1), `log` (0.4.30 → 0.4.31), `mio` (1.2.0 → 1.2.1), `redis` (1.2.1 → 1.2.2), `rustls-native-certs` (0.8.3 → 0.8.4), `socket2` (0.6.3 → 0.6.4), `typenum` (1.20.0 → 1.20.1), `unicode-segmentation` (1.13.2 → 1.13.3), `uuid` (1.23.1 → 1.23.2), `zerocopy` and `zerocopy-derive` (both 0.8.49 → 0.8.50). `Cargo.lock` carries the exact pinned versions.
+
+---
+
 Released 2026-06-04.
 
 ## License
