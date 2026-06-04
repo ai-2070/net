@@ -65,6 +65,17 @@ pub use net::adapter::net::dataforts::blob::{
     MeshBlobAdapter, SUBPROTOCOL_BLOB_TRANSFER,
 };
 
+// Operator-introspection RPC over a node's transfer engine: the typed
+// client + status shape behind `net transfer ls / status / cancel`, and
+// the server-side error variants for matching. [`serve_blob_transfer_rpc`]
+// (below) installs the matching handler.
+pub use net::adapter::net::dataforts::blob::{
+    BlobTransferClient, TransferClientError, TransferRpcError, TransferStatus,
+};
+// Returned by [`serve_blob_transfer_rpc`]; the caller holds it to keep the
+// RPC registered (drop = stop answering).
+pub use net::adapter::net::mesh_rpc::{ServeError, ServeHandle};
+
 // Store-side helpers for building a content-addressed [`BlobRef`] from raw
 // bytes without reaching into the substrate: [`chunk_payload`] splits a byte
 // slice into the inline-or-chunked shape and [`ChunkedPayload::into_blob_ref`]
@@ -170,6 +181,19 @@ impl From<DirError> for TransferError {
 /// Idempotent — re-installing replaces the engine.
 pub fn serve_blob_transfer(mesh: &Mesh, adapter: Arc<MeshBlobAdapter>) {
     mesh.node().serve_blob_transfer(adapter);
+}
+
+/// Like [`serve_blob_transfer`] but also registers the `blob.transfers`
+/// operator-introspection RPC (list / status / cancel) over the same
+/// engine, so a remote operator (`net transfer ls / status / cancel`) can
+/// query and cancel this node's in-flight, requester-side transfers.
+/// Returns the [`ServeHandle`]; **hold it** for as long as the RPC should
+/// answer (dropping it stops the RPC; the engine itself stays installed).
+pub fn serve_blob_transfer_rpc(
+    mesh: &Mesh,
+    adapter: Arc<MeshBlobAdapter>,
+) -> Result<ServeHandle, ServeError> {
+    mesh.node().serve_blob_transfer_with_rpc(adapter)
 }
 
 // ── Blob fetch ──────────────────────────────────────────────────────

@@ -139,18 +139,39 @@ pub struct SendDirArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct LsArgs {}
+pub struct LsArgs {
+    #[arg(long)]
+    pub identity: Option<PathBuf>,
+    #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
+    pub node: u64,
+    #[command(flatten)]
+    pub attach: RemoteAttachArgs,
+}
 
 #[derive(Args, Debug)]
 pub struct StatusArgs {
-    /// Transfer id (stream id) to inspect.
+    /// Transfer id (stream id) to inspect (decimal or `0x`-hex).
     pub transfer_id: String,
+
+    #[arg(long)]
+    pub identity: Option<PathBuf>,
+    #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
+    pub node: u64,
+    #[command(flatten)]
+    pub attach: RemoteAttachArgs,
 }
 
 #[derive(Args, Debug)]
 pub struct CancelArgs {
-    /// Transfer id (stream id) to cancel.
+    /// Transfer id (stream id) to cancel (decimal or `0x`-hex).
     pub transfer_id: String,
+
+    #[arg(long)]
+    pub identity: Option<PathBuf>,
+    #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
+    pub node: u64,
+    #[command(flatten)]
+    pub attach: RemoteAttachArgs,
 }
 
 pub async fn run(
@@ -169,9 +190,13 @@ pub async fn run(
             run_recv_dir(args, output, config_path, profile_name, quiet).await
         }
         TransferCommand::SendDir(args) => run_send_dir(args, output).await,
-        TransferCommand::Ls(_) => run_ls(output).await,
-        TransferCommand::Status(args) => run_status(args, output).await,
-        TransferCommand::Cancel(args) => run_cancel(args, output).await,
+        TransferCommand::Ls(args) => run_ls(args, output, config_path, profile_name).await,
+        TransferCommand::Status(args) => {
+            run_status(args, output, config_path, profile_name).await
+        }
+        TransferCommand::Cancel(args) => {
+            run_cancel(args, output, config_path, profile_name).await
+        }
     }
 }
 
@@ -373,57 +398,116 @@ async fn run_send_dir(args: SendDirArgs, output: Option<OutputFormat>) -> Result
 
 // ── ls / status / cancel ────────────────────────────────────────────
 
-async fn run_ls(output: Option<OutputFormat>) -> Result<(), CliError> {
-    // No substrate bootstrap: the engine exposes no transfer-enumeration
-    // accessor and a single-shot CLI owns no persistent engine, so the
-    // active set is always empty. Booting a mesh node here would pay a
-    // real cost for a guaranteed-empty result, so — like `status` /
-    // `cancel` — this reports honestly without connecting. See the module
-    // docs + `note`.
+/// `ls` / `status` / `cancel` all query the holder's `blob.transfers`
+/// engine over the mesh (remote-attach), reporting that node's in-flight
+/// **requester-side** transfers (what it is currently fetching). Build the
+/// connected client once per verb.
+async fn transfer_client(
+    attach: &RemoteAttachArgs,
+    identity: Option<&std::path::Path>,
+    node: u64,
+    config_path: Option<&std::path::Path>,
+    profile_name: &str,
+    verb: &str,
+) -> Result<(CliContext, u64), CliError> {
+    let profile = resolve_profile(config_path, profile_name).await?;
+    let remote = require_remote_attach(&profile, attach, verb)?;
+    let target = remote.node_id;
+    let ctx = CliContext::build_with_remote(&profile, identity, node, false, remote).await?;
+    Ok((ctx, target))
+}
+
+async fn run_ls(
+    args: LsArgs,
+    output: Option<OutputFormat>,
+    config_path: Option<&std::path::Path>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    let (ctx, target) = transfer_client(
+        &args.attach,
+        args.identity.as_deref(),
+        args.node,
+        config_path,
+        profile_name,
+        "ls",
+    )
+    .await?;
+    let client = transport::BlobTransferClient::new(ctx.require_mesh_node()?);
+    let transfers = client
+        .list(target)
+        .await
+        .map_err(|e| sdk(format!("blob.transfers list on peer {target} failed: {e}")))?;
     let view = LsView {
-        transfer_count: 0,
-        transfers: Vec::new(),
-        note: ENGINE_INTROSPECTION_NOTE,
+        transfer_count: transfers.len() as u64,
+        transfers: transfers.iter().map(TransferRow::from).collect(),
     };
     emit_value(OutputFormat::resolve_oneshot(output), &view)
         .map_err(|e| generic(format!("write transfer ls: {e}")))?;
     Ok(())
 }
 
-async fn run_status(args: StatusArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
-    let _ = parse_u64_flexible(&args.transfer_id)
+async fn run_status(
+    args: StatusArgs,
+    output: Option<OutputFormat>,
+    config_path: Option<&std::path::Path>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    let stream_id = parse_u64_flexible(&args.transfer_id)
         .map_err(|e| invalid_args(format!("transfer-id `{}`: {e}", args.transfer_id)))?;
+    let (ctx, target) = transfer_client(
+        &args.attach,
+        args.identity.as_deref(),
+        args.node,
+        config_path,
+        profile_name,
+        "status",
+    )
+    .await?;
+    let client = transport::BlobTransferClient::new(ctx.require_mesh_node()?);
+    let found = client
+        .get(target, stream_id)
+        .await
+        .map_err(|e| sdk(format!("blob.transfers status on peer {target} failed: {e}")))?;
     let view = StatusView {
-        transfer_id: args.transfer_id,
-        found: false,
-        note: ENGINE_INTROSPECTION_NOTE,
+        transfer_id: stream_id,
+        found: found.is_some(),
+        transfer: found.as_ref().map(TransferRow::from),
     };
     emit_value(OutputFormat::resolve_oneshot(output), &view)
         .map_err(|e| generic(format!("write transfer status: {e}")))?;
     Ok(())
 }
 
-async fn run_cancel(args: CancelArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
-    let _ = parse_u64_flexible(&args.transfer_id)
+async fn run_cancel(
+    args: CancelArgs,
+    output: Option<OutputFormat>,
+    config_path: Option<&std::path::Path>,
+    profile_name: &str,
+) -> Result<(), CliError> {
+    let stream_id = parse_u64_flexible(&args.transfer_id)
         .map_err(|e| invalid_args(format!("transfer-id `{}`: {e}", args.transfer_id)))?;
-    // `BlobTransferEngine::cancel_pending` is idempotent, but a
-    // single-shot CLI owns no live engine carrying this transfer, so
-    // there is nothing local to cancel. Report honestly rather than
-    // claim a cancellation that didn't happen.
+    let (ctx, target) = transfer_client(
+        &args.attach,
+        args.identity.as_deref(),
+        args.node,
+        config_path,
+        profile_name,
+        "cancel",
+    )
+    .await?;
+    let client = transport::BlobTransferClient::new(ctx.require_mesh_node()?);
+    let cancelled = client
+        .cancel(target, stream_id)
+        .await
+        .map_err(|e| sdk(format!("blob.transfers cancel on peer {target} failed: {e}")))?;
     let view = CancelView {
-        transfer_id: args.transfer_id,
-        cancelled: false,
-        note: ENGINE_INTROSPECTION_NOTE,
+        transfer_id: stream_id,
+        cancelled,
     };
     emit_value(OutputFormat::resolve_oneshot(output), &view)
         .map_err(|e| generic(format!("write transfer cancel: {e}")))?;
     Ok(())
 }
-
-const ENGINE_INTROSPECTION_NOTE: &str =
-    "the substrate BlobTransferEngine exposes no transfer-enumeration accessor and a \
-     single-shot CLI owns no persistent transfer engine; ls/status/cancel become live \
-     against a running daemon once a transfers-list/cancel RPC lands (TRANSFER_CLI_PLAN Gap D).";
 
 // ── helpers ─────────────────────────────────────────────────────────
 
@@ -638,31 +722,46 @@ struct SendDirView {
 struct LsView {
     transfer_count: u64,
     transfers: Vec<TransferRow>,
-    note: &'static str,
 }
 
-/// Forward-compat shape for a live transfer row. Not constructed yet —
-/// the engine exposes no enumeration to populate it (see `LsView.note`);
-/// kept so the JSON schema is stable when the substrate RPC lands.
+/// One in-flight (requester-side) transfer, rendered from a
+/// [`transport::TransferStatus`]. `kind` is always `recv` — the engine
+/// tracks fetches, not serving tasks.
 #[derive(Serialize)]
-#[allow(dead_code)]
 struct TransferRow {
-    transfer_id: String,
-    direction: String,
+    /// Transfer stream id (the cancel handle).
+    transfer_id: u64,
+    /// Peer the bytes are being fetched from.
     peer: u64,
-    kind: String,
+    /// Lowercase-hex BLAKE3 content address being fetched.
+    hash: String,
+    bytes_received: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_bytes: Option<u64>,
+}
+
+impl From<&transport::TransferStatus> for TransferRow {
+    fn from(s: &transport::TransferStatus) -> Self {
+        Self {
+            transfer_id: s.stream_id,
+            peer: s.holder,
+            hash: hex::encode(s.expected_hash),
+            bytes_received: s.bytes_received,
+            total_bytes: s.total_bytes,
+        }
+    }
 }
 
 #[derive(Serialize)]
 struct StatusView {
-    transfer_id: String,
+    transfer_id: u64,
     found: bool,
-    note: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transfer: Option<TransferRow>,
 }
 
 #[derive(Serialize)]
 struct CancelView {
-    transfer_id: String,
+    transfer_id: u64,
     cancelled: bool,
-    note: &'static str,
 }

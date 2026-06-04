@@ -9532,6 +9532,33 @@ impl MeshNode {
         *self.blob_transfer_engine.write() = Some(engine);
     }
 
+    /// Like [`Self::serve_blob_transfer`] but also registers the
+    /// `blob.transfers` operator-introspection RPC (list / status / cancel)
+    /// over the same engine, so a remote operator can query / cancel this
+    /// node's in-flight (requester-side) transfers (`net transfer ls /
+    /// status / cancel`). Returns the [`ServeHandle`]; drop it to stop
+    /// answering the RPC (the engine itself stays installed).
+    ///
+    /// [`ServeHandle`]: super::mesh_rpc::ServeHandle
+    pub fn serve_blob_transfer_with_rpc(
+        self: &Arc<Self>,
+        adapter: Arc<super::dataforts::blob::MeshBlobAdapter>,
+    ) -> Result<super::mesh_rpc::ServeHandle, super::mesh_rpc::ServeError> {
+        let engine = Arc::new(super::dataforts::blob::transfer::BlobTransferEngine::new(
+            self, adapter,
+        ));
+        // Store the engine (same slot serve_blob_transfer uses) AND serve
+        // the RPC over that exact handle, so the registry the RPC reports on
+        // is the one actually doing the fetches.
+        *self.blob_transfer_engine.write() = Some(engine.clone());
+        self.serve_rpc(
+            super::dataforts::blob::transfer_rpc::TRANSFER_SERVICE,
+            Arc::new(super::dataforts::blob::transfer_rpc::TransferRpcHandler::new(
+                engine,
+            )),
+        )
+    }
+
     /// Fetch the chunk addressed by `hash` from `holder` over a
     /// reliable, scheduled transfer stream — bytes move over the
     /// FairScheduler-managed stream transport, not RedEX replication or

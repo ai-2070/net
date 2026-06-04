@@ -36,6 +36,9 @@ pub mod stripe_index;
 /// On-demand cross-peer blob transfer over router streams (FairScheduler
 /// transport plan). Distinct from RedEX replication and nRPC.
 pub mod transfer;
+/// `blob.transfers` operator-introspection RPC (list / status / cancel)
+/// over a node's [`transfer::BlobTransferEngine`].
+pub mod transfer_rpc;
 
 /// Format a 32-byte content hash as the lowercase 64-char hex
 /// string used throughout the blob layer for channel names,
@@ -126,7 +129,12 @@ pub use publish_with_blob::{publish_with_blob, BlobDurability, PublishWithBlobRe
 pub use refcount::{should_sweep, BlobRefcountTable, RefcountEntry, DEFAULT_RETENTION_FLOOR};
 pub use registry::{global_blob_adapter_registry, BlobAdapterRegistry, BlobAdapterRegistryError};
 pub use transfer::{
-    is_transfer_stream_id, next_transfer_stream_id, transfer_stream_id, SUBPROTOCOL_BLOB_TRANSFER,
+    is_transfer_stream_id, next_transfer_stream_id, transfer_stream_id, TransferStatus,
+    SUBPROTOCOL_BLOB_TRANSFER,
+};
+pub use transfer_rpc::{
+    BlobTransferClient, TransferClientError, TransferRpcError, TransferRpcHandler,
+    TransferRpcRequest, TransferRpcResponse, DEFAULT_TRANSFER_DEADLINE, TRANSFER_SERVICE,
 };
 
 #[cfg(test)]

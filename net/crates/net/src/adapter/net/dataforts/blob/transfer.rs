@@ -209,6 +209,37 @@ struct PendingInbound {
     done: Option<DoneTx>,
 }
 
+impl PendingInbound {
+    /// Point-in-time snapshot of this transfer for operator introspection.
+    fn status(&self, stream_id: u64) -> TransferStatus {
+        TransferStatus {
+            stream_id,
+            holder: self.holder,
+            expected_hash: self.expected_hash,
+            bytes_received: self.buf.len() as u64,
+            total_bytes: self.total_len,
+        }
+    }
+}
+
+/// A point-in-time snapshot of one **requester-side** in-flight transfer,
+/// for operator introspection (the `blob.transfers` RPC behind
+/// `net transfer ls` / `status`). Serving-side tasks are not tracked, so
+/// this reflects what the node is currently *fetching*, not what it serves.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TransferStatus {
+    /// Transfer stream id — the transfer's identity / cancel handle.
+    pub stream_id: u64,
+    /// Peer node id the bytes are being fetched from.
+    pub holder: u64,
+    /// BLAKE3 content address being fetched.
+    pub expected_hash: [u8; 32],
+    /// Bytes reassembled so far.
+    pub bytes_received: u64,
+    /// Declared total once the transfer header arrived; `None` before then.
+    pub total_bytes: Option<u64>,
+}
+
 /// Drives blob transfer over router streams (FairScheduler transport).
 /// Installed on a node via
 /// [`crate::adapter::net::MeshNode::serve_blob_transfer`]. Holds a
@@ -259,6 +290,29 @@ impl BlobTransferEngine {
     /// Drop a pending transfer (timeout / give-up). Idempotent.
     pub fn cancel_pending(&self, stream_id: u64) {
         self.pending.remove(&stream_id);
+    }
+
+    /// Snapshot every requester-side in-flight transfer (operator
+    /// introspection — `net transfer ls`). Receiver-side only.
+    pub fn list_pending(&self) -> Vec<TransferStatus> {
+        self.pending
+            .iter()
+            .map(|e| e.value().status(*e.key()))
+            .collect()
+    }
+
+    /// Snapshot one in-flight transfer by stream id, or `None` if it isn't
+    /// pending (already settled, cancelled, or never existed).
+    pub fn get_pending(&self, stream_id: u64) -> Option<TransferStatus> {
+        self.pending.get(&stream_id).map(|e| e.value().status(stream_id))
+    }
+
+    /// Like [`Self::cancel_pending`] but reports whether a transfer was
+    /// actually removed — for the operator cancel surface, which
+    /// distinguishes "cancelled" from "no such transfer". Dropping the
+    /// entry drops its `done` sender, failing the awaiting fetch.
+    pub fn cancel_pending_reporting(&self, stream_id: u64) -> bool {
+        self.pending.remove(&stream_id).is_some()
     }
 
     /// The holder's reliable layer gave up retransmitting this transfer
@@ -594,5 +648,46 @@ mod tests {
         let b = next_transfer_stream_id();
         assert_ne!(a, b);
         assert!(is_transfer_stream_id(a) && is_transfer_stream_id(b));
+    }
+
+    /// The introspection accessors behind `blob.transfers` (list / get /
+    /// cancel-reporting) must reflect `register_pending` and report removal.
+    #[tokio::test]
+    async fn engine_accessors_report_and_cancel_pending() {
+        use crate::adapter::net::identity::EntityKeypair;
+        use crate::adapter::net::redex::Redex;
+        use crate::adapter::net::MeshNodeConfig;
+
+        let addr = "127.0.0.1:0".parse().expect("addr");
+        let node = Arc::new(
+            MeshNode::new(EntityKeypair::generate(), MeshNodeConfig::new(addr, [0x17u8; 32]))
+                .await
+                .expect("node"),
+        );
+        let adapter = Arc::new(MeshBlobAdapter::new("t", Arc::new(Redex::new())));
+        let engine = BlobTransferEngine::new(&node, adapter);
+
+        assert!(engine.list_pending().is_empty());
+
+        let sid = transfer_stream_id(99);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        engine.register_pending(sid, 7, [0xABu8; 32], tx);
+
+        let listed = engine.list_pending();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].stream_id, sid);
+        assert_eq!(listed[0].holder, 7);
+        assert_eq!(listed[0].expected_hash, [0xABu8; 32]);
+        assert_eq!(listed[0].bytes_received, 0);
+        assert_eq!(listed[0].total_bytes, None);
+
+        let got = engine.get_pending(sid).expect("pending present");
+        assert_eq!(got.holder, 7);
+        assert!(engine.get_pending(transfer_stream_id(1234)).is_none());
+
+        // Cancel reports existence once, then is idempotently false.
+        assert!(engine.cancel_pending_reporting(sid));
+        assert!(!engine.cancel_pending_reporting(sid));
+        assert!(engine.list_pending().is_empty());
     }
 }
