@@ -23,7 +23,7 @@ const INSTALL_CARDS: readonly InstallCard[] = [
     ext: ".ts",
     cmd: "$ npm i @net-mesh/sdk\n       @net-mesh/core",
     copy: "npm i @net-mesh/sdk @net-mesh/core",
-    meta: "scope: @ai2070",
+    meta: "scope: @net-mesh",
   },
   {
     lang: "Python",
