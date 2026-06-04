@@ -45,7 +45,7 @@ use crate::parsers::parse_u64_flexible;
 use crate::prelude::{emit_value, OutputFormat};
 
 use net_sdk::dataforts::{BlobAdapter, MeshBlobAdapter, Redex};
-use net_sdk::transport::{self, BlobRef, ChunkedPayload, Encoding, DEFAULT_FETCH_CONCURRENCY};
+use net_sdk::transport::{self, BlobRef, ChunkedPayload, Encoding};
 
 #[derive(Subcommand, Debug)]
 pub enum TransferCommand {
@@ -73,8 +73,8 @@ pub enum TransferCommand {
 pub struct RecvBlobArgs {
     /// Holder peer id to fetch from (decimal or `0x`-hex). Defaults to
     /// the remote-attach `--node-id` (the node you handshook with).
-    #[arg(long, value_parser = crate::parsers::parse_u64_flexible_string)]
-    pub from: Option<String>,
+    #[arg(long, value_parser = crate::parsers::parse_u64_flexible)]
+    pub from: Option<u64>,
     /// Content reference: a 32-byte hash (single-chunk blob) or the full
     /// encoded `BlobRef` hex that `send-blob` prints for chunked content.
     #[arg(long = "blob-ref")]
@@ -106,8 +106,8 @@ pub struct SendBlobArgs {
 pub struct RecvDirArgs {
     /// Holder peer id to fetch from (decimal or `0x`-hex). Defaults to
     /// the remote-attach `--node-id`.
-    #[arg(long, value_parser = crate::parsers::parse_u64_flexible_string)]
-    pub from: Option<String>,
+    #[arg(long, value_parser = crate::parsers::parse_u64_flexible)]
+    pub from: Option<u64>,
     /// Directory manifest reference: a 32-byte hash or the full encoded
     /// `BlobRef` hex that `send-dir` prints.
     #[arg(long = "remote-ref")]
@@ -139,12 +139,7 @@ pub struct SendDirArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct LsArgs {
-    #[arg(long)]
-    pub identity: Option<PathBuf>,
-    #[arg(long, default_value_t = crate::prelude::DEFAULT_SUPERVISOR_NODE)]
-    pub node: u64,
-}
+pub struct LsArgs {}
 
 #[derive(Args, Debug)]
 pub struct StatusArgs {
@@ -173,7 +168,7 @@ pub async fn run(
             run_recv_dir(args, output, config_path, profile_name).await
         }
         TransferCommand::SendDir(args) => run_send_dir(args, output).await,
-        TransferCommand::Ls(args) => run_ls(args, output, config_path, profile_name).await,
+        TransferCommand::Ls(_) => run_ls(output).await,
         TransferCommand::Status(args) => run_status(args, output).await,
         TransferCommand::Cancel(args) => run_cancel(args, output).await,
     }
@@ -193,10 +188,8 @@ async fn run_recv_blob(
     let remote = require_remote_attach(&profile, &args.attach, "recv-blob")?;
     // `--from` overrides the attach target (fetch via a relay you
     // handshook with); otherwise the holder is the node you connected to.
-    let source = match &args.from {
-        Some(s) => parse_u64_flexible(s).map_err(|e| invalid_args(format!("--from `{s}`: {e}")))?,
-        None => remote.node_id,
-    };
+    // (Parsed to `u64` at argv time, so no fallible re-parse here.)
+    let source = args.from.unwrap_or(remote.node_id);
     let ctx =
         CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)
             .await?;
@@ -289,10 +282,8 @@ async fn run_recv_dir(
 
     let profile = resolve_profile(config_path, profile_name).await?;
     let remote = require_remote_attach(&profile, &args.attach, "recv-dir")?;
-    let source = match &args.from {
-        Some(s) => parse_u64_flexible(s).map_err(|e| invalid_args(format!("--from `{s}`: {e}")))?,
-        None => remote.node_id,
-    };
+    // `--from` is parsed to `u64` at argv time; default to the attach target.
+    let source = args.from.unwrap_or(remote.node_id);
     let ctx =
         CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)
             .await?;
@@ -302,18 +293,14 @@ async fn run_recv_dir(
         Arc::new(MeshBlobAdapter::new("recv", Arc::new(Redex::new()))),
     );
 
-    let concurrency = if args.concurrency == 0 {
-        DEFAULT_FETCH_CONCURRENCY
-    } else {
-        args.concurrency
-    };
-
     let spinner = Progress::start(&format!("reconstructing directory from peer {source}"));
     let started = Instant::now();
     // `fetch_dir` handles the atomic sibling-temp-dir reconstruction and
     // rolls back on failure, so the target is unchanged unless this
-    // returns Ok.
-    let stats = transport::fetch_dir(mesh, source, &manifest_ref, &args.out, concurrency)
+    // returns Ok. It also maps `concurrency == 0` to its own
+    // `DEFAULT_FETCH_CONCURRENCY`, so we pass the operator's value through
+    // verbatim rather than pre-resolving it here.
+    let stats = transport::fetch_dir(mesh, source, &manifest_ref, &args.out, args.concurrency)
         .await
         .map_err(|e| sdk(format!("fetch_dir from peer {source} failed: {e}")))?;
     let elapsed = started.elapsed();
@@ -377,19 +364,13 @@ async fn run_send_dir(args: SendDirArgs, output: Option<OutputFormat>) -> Result
 
 // ── ls / status / cancel ────────────────────────────────────────────
 
-async fn run_ls(
-    args: LsArgs,
-    output: Option<OutputFormat>,
-    config_path: Option<&std::path::Path>,
-    profile_name: &str,
-) -> Result<(), CliError> {
-    // Build the in-process context so the verb behaves like the other
-    // local read verbs (and validates identity/profile), but the
-    // substrate exposes no transfer-enumeration accessor and a
-    // single-shot CLI owns no persistent engine, so the active set is
-    // always empty here. See the module docs + `note`.
-    let profile = resolve_profile(config_path, profile_name).await?;
-    let _ctx = CliContext::build(&profile, args.identity.as_deref(), args.node, false).await?;
+async fn run_ls(output: Option<OutputFormat>) -> Result<(), CliError> {
+    // No substrate bootstrap: the engine exposes no transfer-enumeration
+    // accessor and a single-shot CLI owns no persistent engine, so the
+    // active set is always empty. Booting a mesh node here would pay a
+    // real cost for a guaranteed-empty result, so — like `status` /
+    // `cancel` — this reports honestly without connecting. See the module
+    // docs + `note`.
     let view = LsView {
         transfer_count: 0,
         transfers: Vec::new(),
