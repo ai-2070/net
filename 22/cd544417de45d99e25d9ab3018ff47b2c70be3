@@ -1,0 +1,19 @@
+net/crates/net/cli/tests/transfer_cli_admin.rs
+  s_6c5221c01e7170::t_f6fedbe75eb258 147-156
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "22cd544417de45d99e25d9ab3018ff47b2c70be3",
+  "prompts": {},
+  "sessions": {
+    "s_6c5221c01e7170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f37db5c6-b2d5-4a32-b8d0-45008d549c08",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
