@@ -1,5 +1,13 @@
 # Typegen CLI plan — TypeScript and Python bindings from discovered tool descriptors
 
+**Status: ✅ Core complete** on branch `typegen-cli` (Gaps A–D + most of E).
+`net-mesh typegen (generate|snapshot|diff)` ships for TypeScript and Python
+from live discovery or a pinned snapshot. Deferred (need external
+toolchains, tracked as follow-ups): the downstream `tsc --noEmit` /
+`mypy --strict` CI checks (E-2 / E-3 / E-5 CI gating) and streaming-tool
+call helpers. See `docs/cli/TYPEGEN.md` for the operator/developer guide and
+the "Landed" / "Deviations" notes below.
+
 Branch: `typegen-cli`.
 Predecessor work: `ToolDescriptor` (`net/crates/net/src/adapter/net/cortex/tool.rs:95`), `ToolCapability` with `input_schema` / `output_schema` JSON Schema fields (`net/crates/net/src/adapter/net/behavior/capability.rs:482-499`), `MeshNode::list_tools` aggregation across the capability fold, the metadata-key conventions for tool descriptions / streaming / tags (`description_metadata_key` / `streaming_metadata_key` / `tags_metadata_key` in `cortex/tool.rs`).
 Scope: ship `net-mesh typegen` CLI commands that generate language-specific typed bindings (TypeScript `.d.ts` + runtime helpers, Python `.pyi` stubs + Pydantic models) from `ToolDescriptor`s retrieved through `list_tools` or read from a pinned snapshot file.
@@ -24,28 +32,53 @@ Tagged `[A | B | C | D | E]`:
 
 ## Status
 
-| ID   | Pri | Area              | Title                                                                                |
-|------|-----|-------------------|--------------------------------------------------------------------------------------|
-| A-1  | H   | command skeleton  | `commands/typegen.rs` — `TypegenCommand` enum + clap subcommand wiring               |
-| A-2  | H   | descriptor fetch  | `--query` flag + `MeshNode::list_tools` call + descriptor filtering                  |
-| A-3  | H   | snapshot format   | `TypegenSnapshot` struct + JSON serialization + version field for forward-compat     |
-| A-4  | M   | output            | per-language writer interface + `--out` directory layout convention                  |
-| B-1  | H   | TS codegen        | JSON Schema → TS interface translation (objects, primitives, enums, unions, arrays)  |
-| B-2  | H   | TS module shape   | `.d.ts` file per tool + index re-export + `tools.ts` runtime helpers                 |
-| B-3  | M   | TS edge cases     | `additionalProperties`, `oneOf` / `anyOf` / `allOf`, `$ref`, nullable patterns       |
-| B-4  | M   | TS tests          | snapshot tests against fixture descriptors with golden TS outputs                    |
-| C-1  | H   | Python codegen    | JSON Schema → Pydantic v2 model translation                                          |
-| C-2  | H   | Python stubs      | `.pyi` stub generation for non-Pydantic consumers                                    |
-| C-3  | M   | Python module     | per-tool module + `__init__.py` re-export + typed call helpers                       |
-| C-4  | M   | Python tests      | snapshot tests against fixture descriptors with golden Python outputs                |
-| D-1  | M   | snapshot verb     | `net-mesh typegen snapshot --query ... --out tools.snapshot`                              |
-| D-2  | M   | regenerate verb   | `net-mesh typegen --language ts --from-snapshot tools.snapshot --out ./generated/`        |
-| D-3  | M   | diff              | `net-mesh typegen diff --from old.snapshot --to new.snapshot` — schema-evolution view     |
-| E-1  | H   | integration tests | `tests/typegen_cli_ts.rs`, `tests/typegen_cli_python.rs` — end-to-end CLI runs       |
-| E-2  | M   | downstream check  | TS test: generated `.d.ts` imported in a tsc-strict project, compiles               |
-| E-3  | M   | downstream check  | Python test: generated Pydantic models pass mypy --strict                            |
-| E-4  | L   | docs              | `docs/cli/TYPEGEN.md` operator/developer guide                                       |
-| E-5  | L   | tidy              | clippy + rustfmt; CI gating on the downstream type-checks                            |
+| ID   | Pri | Done | Area              | Title                                                                                |
+|------|-----|------|-------------------|--------------------------------------------------------------------------------------|
+| A-1  | H   | ✅   | command skeleton  | `commands/typegen/` — `TypegenCommand` enum + clap subcommand wiring                 |
+| A-2  | H   | ✅   | descriptor fetch  | live `Mesh::list_tools` (remote-attach + discovery poll) or `--from-snapshot`; `--tag`/`--tool` filter |
+| A-3  | H   | ✅   | snapshot format   | `TypegenSnapshot` + `SnapshotQuery` JSON (v1, stable-ordered, forward-compat guard)  |
+| A-4  | M   | ✅   | output            | `GeneratedFile` writer + per-language `--out` directory layout                       |
+| B-1  | H   | ✅   | TS codegen        | shared schema IR → TS types (objects, primitives, enums, unions, arrays, tuples, refs) |
+| B-2  | H   | ✅   | TS module shape   | one `.ts` per tool + `index.ts` re-export + `meta.json` (see deviation)              |
+| B-3  | M   | ✅   | TS edge cases     | `additionalProperties`, `oneOf`/`anyOf`/`allOf`, local `$ref`, nullable, tuples      |
+| B-4  | M   | ✅   | TS tests          | unit tests over the translator + module shape (substring assertions, not goldens)   |
+| C-1  | H   | ✅   | Python codegen    | schema IR → Pydantic v2 models                                                       |
+| C-2  | H   | ✅   | Python stubs      | `.pyi` stubs rendered from the same decl list (can't drift from `models.py`)         |
+| C-3  | M   | ✅   | Python module     | per-tool package + `__init__.py` re-export + typed call helper                       |
+| C-4  | M   | ✅   | Python tests      | unit tests over the Pydantic/stub/call rendering                                     |
+| D-1  | M   | ✅   | snapshot verb     | `net-mesh typegen snapshot --out tools.snapshot`                                     |
+| D-2  | M   | ✅   | regenerate verb   | `net-mesh typegen generate --language ts --from-snapshot tools.snapshot`             |
+| D-3  | M   | ✅   | diff              | `net-mesh typegen diff --from old --to new` — schema-evolution view + BREAKING flags |
+| E-1  | H   | ✅   | integration tests | `tests/typegen_cli_{ts,python,diff}.rs` — end-to-end CLI runs (offline via snapshot) |
+| E-2  | M   | ⏳   | downstream check  | TS: generated output in a tsc-strict project (needs Node in CI)                     |
+| E-3  | M   | ⏳   | downstream check  | Python: generated models pass `mypy --strict` (needs Python in CI)                  |
+| E-4  | L   | ✅   | docs              | `docs/cli/TYPEGEN.md` operator/developer guide                                       |
+| E-5  | L   | ◐    | tidy              | clippy + rustfmt done; CI gating on downstream type-checks deferred with E-2/E-3     |
+
+### Landed commits
+
+| Gap | Commit | Summary |
+|-----|--------|---------|
+| A+B | `fed4e0cf8` | command family, snapshot format, fetch, shared schema IR, TS renderer |
+| C   | `8dc6f4e25` | Python renderer (Pydantic + stubs); `Additional::Unspecified` IR refinement |
+| D   | `89105eb19` | snapshot diff with BREAKING heuristics |
+
+### Deviations from the plan as written
+
+- **B-2**: one `.ts` per tool, not a `.d.ts` + `.ts` split. A `foo.d.ts` is
+  the ambient declaration *for* `foo.ts` (same module), so the runtime
+  `Meta` const can't live in the `.d.ts`. A single `.ts` is correct and
+  tsc-strict-clean.
+- **A-1**: `generate` / `snapshot` carry remote-attach flags (live discovery
+  must join the mesh — the plan's args only had `--node`); `--tag` / `--tool`
+  filter both live and snapshot sources (the plan's "mutually exclusive with
+  `--from-snapshot`" would block the useful filter-a-snapshot case).
+- **B-4 / C-4**: substring/structural unit tests rather than golden files —
+  less brittle to formatting tweaks while still pinning every translation
+  rule; the end-to-end CLI tests (E-1) check real generated output.
+- **Schema IR**: `additionalProperties` absent is treated strictly (no open
+  index signature / `extra="allow"`) — only explicit `true`/typed opens an
+  object — so generated types stay tight by default.
 
 ---
 
