@@ -300,4 +300,150 @@ mod tests {
             assert_eq!(resp, back);
         }
     }
+
+    /// Build a node + an `Arc`-wrapped engine over it, for exercising
+    /// `answer` and the handler against real engine state. Mirrors the
+    /// `transfer.rs` engine-accessor test setup.
+    async fn build_engine() -> (Arc<MeshNode>, Arc<BlobTransferEngine>) {
+        use crate::adapter::net::dataforts::blob::MeshBlobAdapter;
+        use crate::adapter::net::identity::EntityKeypair;
+        use crate::adapter::net::redex::Redex;
+        use crate::adapter::net::MeshNodeConfig;
+
+        let addr = "127.0.0.1:0".parse().expect("addr");
+        let node = Arc::new(
+            MeshNode::new(
+                EntityKeypair::generate(),
+                MeshNodeConfig::new(addr, [0x17u8; 32]),
+            )
+            .await
+            .expect("node"),
+        );
+        let adapter = Arc::new(MeshBlobAdapter::new("rpc-test", Arc::new(Redex::new())));
+        let engine = Arc::new(BlobTransferEngine::new(&node, adapter));
+        (node, engine)
+    }
+
+    /// `answer` is the pure request → response logic; it must reflect the
+    /// engine's live state for each verb (empty, populated, post-cancel).
+    #[tokio::test]
+    async fn answer_reflects_engine_state_for_each_verb() {
+        let (_node, engine) = build_engine().await;
+        let sid = super::super::transfer_stream_id(99);
+
+        // Empty registry.
+        assert_eq!(
+            answer(&engine, &TransferRpcRequest::List),
+            TransferRpcResponse::Transfers(vec![])
+        );
+        assert_eq!(
+            answer(&engine, &TransferRpcRequest::Get { stream_id: sid }),
+            TransferRpcResponse::Transfer(None)
+        );
+
+        // Register a pending transfer; List + Get now surface it.
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        engine.register_pending(sid, 7, [0xABu8; 32], tx);
+        match answer(&engine, &TransferRpcRequest::List) {
+            TransferRpcResponse::Transfers(v) => {
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].stream_id, sid);
+                assert_eq!(v[0].holder, 7);
+                assert_eq!(v[0].expected_hash, [0xABu8; 32]);
+            }
+            other => panic!("expected Transfers, got {other:?}"),
+        }
+        match answer(&engine, &TransferRpcRequest::Get { stream_id: sid }) {
+            TransferRpcResponse::Transfer(Some(s)) => assert_eq!(s.holder, 7),
+            other => panic!("expected Transfer(Some), got {other:?}"),
+        }
+
+        // Cancel reports existence once, then false; the registry empties.
+        assert_eq!(
+            answer(&engine, &TransferRpcRequest::Cancel { stream_id: sid }),
+            TransferRpcResponse::Cancelled { existed: true }
+        );
+        assert_eq!(
+            answer(&engine, &TransferRpcRequest::Cancel { stream_id: sid }),
+            TransferRpcResponse::Cancelled { existed: false }
+        );
+        assert_eq!(
+            answer(&engine, &TransferRpcRequest::List),
+            TransferRpcResponse::Transfers(vec![])
+        );
+    }
+
+    /// The `RpcHandler` decodes the request, answers it, and encodes the
+    /// reply — and an undecodable body must come back as a `DecodeFailed`
+    /// application error inside an `Ok` envelope (never an `Err`, so the
+    /// transport stays healthy).
+    #[tokio::test]
+    async fn handler_answers_valid_request_and_wraps_bad_body() {
+        use crate::adapter::net::cortex::rpc::{RpcCancellationToken, RpcRequestPayload};
+
+        let (_node, engine) = build_engine().await;
+        let handler = TransferRpcHandler::new(engine);
+
+        let make_ctx = |body: Vec<u8>| RpcContext {
+            caller_origin: 1,
+            call_id: 2,
+            payload: RpcRequestPayload {
+                service: TRANSFER_SERVICE.to_string(),
+                deadline_ns: 0,
+                flags: 0,
+                headers: Vec::new(),
+                body: Bytes::from(body),
+            },
+            cancellation: RpcCancellationToken::new(),
+            trace_context: None,
+        };
+
+        // Valid List → Ok status, body decodes to an (empty) Transfers reply.
+        let body = postcard::to_allocvec(&TransferRpcRequest::List).expect("encode req");
+        let resp = handler.call(make_ctx(body)).await.expect("handler ok");
+        assert_eq!(resp.status, RpcStatus::Ok);
+        match postcard::from_bytes::<TransferRpcResponse>(&resp.body).expect("decode resp") {
+            TransferRpcResponse::Transfers(v) => assert!(v.is_empty()),
+            other => panic!("expected Transfers, got {other:?}"),
+        }
+
+        // Undecodable body (a discriminant past the last variant) → Ok
+        // envelope carrying DecodeFailed.
+        let resp = handler
+            .call(make_ctx(vec![0x7F]))
+            .await
+            .expect("handler ok");
+        assert_eq!(resp.status, RpcStatus::Ok);
+        match postcard::from_bytes::<TransferRpcResponse>(&resp.body).expect("decode resp") {
+            TransferRpcResponse::Error(TransferRpcError::DecodeFailed(_)) => {}
+            other => panic!("expected Error(DecodeFailed), got {other:?}"),
+        }
+    }
+
+    /// `TransferClientError` must preserve the failure category across the
+    /// `From` conversions the client relies on (`?` from `typed_call`).
+    #[test]
+    fn client_error_conversions_preserve_category() {
+        let e: TransferClientError = RpcError::Timeout { elapsed_ms: 5 }.into();
+        assert!(matches!(e, TransferClientError::Transport(_)));
+
+        let e: TransferClientError =
+            TypedCallError::Transport(RpcError::Timeout { elapsed_ms: 1 }).into();
+        assert!(matches!(e, TransferClientError::Transport(_)));
+
+        let e: TransferClientError = TypedCallError::Codec("boom".into()).into();
+        assert!(matches!(e, TransferClientError::Codec(m) if m == "boom"));
+    }
+
+    /// `new` adopts the default deadline; `with_deadline` overrides it.
+    #[tokio::test]
+    async fn client_new_defaults_deadline_and_with_deadline_overrides() {
+        let (node, _engine) = build_engine().await;
+        let client = BlobTransferClient::new(node);
+        assert_eq!(client.deadline, DEFAULT_TRANSFER_DEADLINE);
+
+        let custom = Duration::from_millis(250);
+        let client = client.with_deadline(custom);
+        assert_eq!(client.deadline, custom);
+    }
 }
