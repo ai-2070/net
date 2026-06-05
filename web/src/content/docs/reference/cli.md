@@ -124,20 +124,19 @@ Code generation from discovered AI tool descriptors. The command walks the local
 Generate bindings for one or more discovered tools.
 
 ```
-net-mesh typegen generate --language <LANG> --out <PATH> [SELECTOR]
+net-mesh typegen generate --language <LANG> [--out <PATH>] [SELECTOR]
 ```
 
 | Argument | Description |
 |---|---|
 | `--language <LANG>` | Output language: `ts` or `python` |
-| `--out <PATH>` | Output directory |
-| `--tags <TAGS>` | Comma-separated list of tags to match (e.g. `weather,location`) |
-| `--tools <IDS>` | Comma-separated list of tool IDs to match exactly (e.g. `acme.web-search`) |
-| `--from-snapshot <FILE>` | Regenerate from a saved snapshot instead of querying the mesh |
-| `--update` | Overwrite existing files; without, the command fails on collision |
-| `--node <ID>` | Query a specific node's fold instead of the local one |
+| `--out <PATH>` | Output directory (default `./generated`) |
+| `--tag <TAG>` | Repeatable — include a tool if *any* of its tags match (e.g. `--tag weather --tag location`) |
+| `--tool <TOOL_ID>` | Repeatable — include a tool by exact id (e.g. `--tool acme/web-search`) |
+| `--from-snapshot <PATH>` | Regenerate from a saved snapshot instead of querying the mesh |
+| `--node <ID>` | Query a specific node's fold instead of the default supervisor |
 
-Selectors (`--tags`, `--tools`) compose: tools matching *any* tag in `--tags` OR *any* id in `--tools` are emitted. With neither selector, every discovered tool is emitted.
+Selectors (`--tag`, `--tool`) compose: tools matching *any* `--tag` OR *any* `--tool` are emitted. With neither selector, every discovered tool is emitted. Live discovery also takes the remote-attach flags (`--node-addr`, `--node-pubkey`, `--node-id`, `--psk-hex`), each defaultable in the profile; `--from-snapshot` needs none of them.
 
 Output is one module per tool. The tool's JSON Schema lowers to TypeScript interfaces (for `ts`) or Pydantic v2 models (for `python`); each module also exports:
 
@@ -151,20 +150,20 @@ TypeScript output ships as `.ts` files and assumes `@net-mesh/core` is available
 Capture the current matching descriptor set into a versioned snapshot file.
 
 ```
-net-mesh typegen snapshot --out <FILE> [SELECTOR]
+net-mesh typegen snapshot --out <PATH> [SELECTOR]
 ```
 
-Selectors match `generate`. The snapshot is a JSON file with a `format_version`, a `captured_at` timestamp, the `source_query` (which selectors were used), and the captured `descriptors`. Snapshots are stable across substrate releases within the same `format_version`.
+Selectors (`--tag`, `--tool`) match `generate`. The snapshot is a JSON file with a `format_version`, a `captured_at` timestamp, the `source_query` (which selectors were used), and the captured `descriptors`. Snapshots are stable across substrate releases within the same `format_version`.
 
 ### `diff`
 
 Show what changed between two snapshots.
 
 ```
-net-mesh typegen diff <A> <B>
+net-mesh typegen diff --from <PATH> --to <PATH> [--exit-code]
 ```
 
-Output lists added tools, removed tools, version bumps, and schema deltas (added/removed/changed fields on requests and responses). Exit code is `0` if the snapshots are byte-equivalent, `1` if they differ.
+Output lists added tools, removed tools, version bumps, and schema deltas (added/removed/changed fields on requests and responses), with `[BREAKING]` markers. By default the command exits `0`; pass `--exit-code` to exit `14` when any BREAKING change is detected (for gating CI). The structured report is available under `--output json` / `yaml`.
 
 ## Exit codes
 
