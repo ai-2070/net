@@ -1,0 +1,21 @@
+web/src/content/docs/reference/subprotocol-ids.md
+  s_e802155ff9ef32::t_e39b0db5555357 34-35
+  s_e802155ff9ef32::t_c96aa7ce08d673 106
+  s_e802155ff9ef32::t_eb6ee724c91630 7-8,12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "ce348c302805e5e4e8c45c618af9ea9fcc65020f",
+  "prompts": {},
+  "sessions": {
+    "s_e802155ff9ef32": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4e7ed794-33fe-4781-8585-c1e89f2c852c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
