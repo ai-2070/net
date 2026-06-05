@@ -44,17 +44,30 @@ fn find_tsc() -> Option<(String, Vec<String>)> {
     candidates.push(("npx.cmd".into(), vec!["--no-install".into(), "tsc".into()]));
 
     for (program, args) in candidates {
-        let ok = Command::new(&program)
-            .args(&args)
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if ok {
+        let Ok(out) = Command::new(&program).args(&args).arg("--version").output() else {
+            continue;
+        };
+        // The tsconfig uses `moduleResolution: bundler`, which needs TS ≥ 5.0;
+        // an older `tsc` errors on the config rather than type-checking, so
+        // treat it as absent (skip) instead of a spurious failure.
+        if out.status.success()
+            && tsc_major(&String::from_utf8_lossy(&out.stdout)).is_some_and(|m| m >= 5)
+        {
             return Some((program, args));
         }
     }
     None
+}
+
+/// Major version from `tsc --version` output (`"Version 6.0.3"` → `6`).
+fn tsc_major(version_output: &str) -> Option<u32> {
+    version_output
+        .split_whitespace()
+        .last()?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
 }
 
 #[test]
