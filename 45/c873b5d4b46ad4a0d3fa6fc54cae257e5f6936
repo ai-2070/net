@@ -1,0 +1,21 @@
+net/crates/net/cli/src/commands/typegen/mod.rs
+  s_c2219187d98495::t_0b0ee32a9eaf13 456-470
+  s_c2219187d98495::t_6a6e4311907e6c 630-659
+  s_c2219187d98495::t_2979e0d91c7d57 229-241
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "45c873b5d4b46ad4a0d3fa6fc54cae257e5f6936",
+  "prompts": {},
+  "sessions": {
+    "s_c2219187d98495": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2beba2b0-0a94-4ee2-8338-fba35f7c1a49",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
