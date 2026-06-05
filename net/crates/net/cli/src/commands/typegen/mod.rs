@@ -230,6 +230,16 @@ async fn run_generate(
         })
         .collect();
 
+    // Nothing matched (empty mesh, over-narrow --tag/--tool, or every tool
+    // skipped): say so, since `generate` otherwise reports success while
+    // writing only the index + metadata files.
+    if usable.is_empty() {
+        eprintln!(
+            "warning: no tools to generate (after filters and schema skips); \
+             only index + metadata files will be written."
+        );
+    }
+
     // Distinct tool ids can sanitize to the same module basename and would
     // silently overwrite each other's files; warn loudly rather than lose one.
     for (base, ids) in basename_collisions(&usable) {
