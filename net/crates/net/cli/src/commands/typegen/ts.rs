@@ -197,7 +197,10 @@ fn render_type_decl(name: &str, schema: &Schema, doc: Option<&str>, ctx: &Ctx) -
             }
             match &obj.additional {
                 Additional::Typed(t) => {
-                    s.push_str(&format!("  [key: string]: {};\n", render_type(t, ctx)));
+                    s.push_str(&format!(
+                        "  [key: string]: {};\n",
+                        typed_index_value(obj, t, ctx)
+                    ));
                 }
                 Additional::Allowed if !obj.properties.is_empty() => {
                     s.push_str("  [key: string]: unknown;\n");
@@ -273,11 +276,31 @@ fn render_inline_object(obj: &schema::ObjectSchema, ctx: &Ctx) -> String {
         })
         .collect();
     match &obj.additional {
-        Additional::Typed(t) => fields.push(format!("[key: string]: {}", render_type(t, ctx))),
+        Additional::Typed(t) => fields.push(format!("[key: string]: {}", typed_index_value(obj, t, ctx))),
         Additional::Allowed => fields.push("[key: string]: unknown".into()),
         Additional::Denied | Additional::Unspecified => {}
     }
     format!("{{ {} }}", fields.join("; "))
+}
+
+/// Index-signature value type for an object that mixes named properties with a
+/// typed `additionalProperties`. tsc-strict requires every named property type
+/// to be assignable to the index type, so widen it to the union of the extra
+/// type and each property's type (optional props contribute `undefined`).
+fn typed_index_value(obj: &schema::ObjectSchema, extra: &Schema, ctx: &Ctx) -> String {
+    let mut parts = vec![render_type(extra, ctx)];
+    let mut push = |t: String| {
+        if !parts.contains(&t) {
+            parts.push(t);
+        }
+    };
+    for (field, prop) in &obj.properties {
+        push(render_type(prop, ctx));
+        if !obj.required.contains(field) {
+            push("undefined".into());
+        }
+    }
+    parts.join(" | ")
 }
 
 fn union(branches: &[Schema], ctx: &Ctx, sep: &str) -> String {
@@ -451,6 +474,17 @@ mod tests {
         );
         // Open object with no props → Record<string, unknown>.
         assert_eq!(ty(r#"{"type":"object"}"#), "Record<string, unknown>");
+    }
+
+    #[test]
+    fn typed_index_signature_widens_to_cover_named_props() {
+        // Named string prop + typed (number) extras: the index type must
+        // include the property type or tsc-strict rejects the object.
+        // `name` is optional → its `undefined` is folded in too.
+        assert_eq!(
+            ty(r#"{"type":"object","properties":{"name":{"type":"string"}},"required":[],"additionalProperties":{"type":"number"}}"#),
+            "{ name?: string; [key: string]: number | string | undefined }"
+        );
     }
 
     #[test]

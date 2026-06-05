@@ -10,7 +10,10 @@ use serde_json::json;
 use tempfile::TempDir;
 
 fn snapshot_json() -> Vec<u8> {
-    let input = r#"{"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer"}},"required":["query"]}"#;
+    // `additionalProperties` is typed (string) while a named prop is a number:
+    // the generated index signature must widen to cover the named-prop types,
+    // or `tsc --strict` rejects the object. Exercises the widening fix.
+    let input = r#"{"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer"}},"required":["query"],"additionalProperties":{"type":"string"}}"#;
     let output = r##"{"type":"object","properties":{"results":{"type":"array","items":{"$ref":"#/$defs/Result"}}},"$defs":{"Result":{"type":"object","properties":{"url":{"type":"string"},"title":{"type":"string"}},"required":["url","title"]}}}"##;
     let snapshot = json!({
         "format_version": 1,
@@ -90,7 +93,8 @@ fn generated_ts_typechecks_under_tsc_strict() {
         String::from_utf8_lossy(&status.stderr)
     );
 
-    // Strict tsconfig (kept TS 4.x-compatible: `moduleResolution: node`).
+    // Strict tsconfig (`moduleResolution: bundler` needs TS ≥ 5.0; CI installs
+    // a current TypeScript, so the check runs there).
     std::fs::write(
         work.path().join("tsconfig.json"),
         r#"{

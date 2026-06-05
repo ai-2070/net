@@ -1293,7 +1293,7 @@ jobs:
         with:
           node-version: "24"
       - name: Install tsc
-        run: npm install -g typescript
+        run: npm install -g typescript@6
 
       - name: Install Python
         uses: actions/setup-python@v5
