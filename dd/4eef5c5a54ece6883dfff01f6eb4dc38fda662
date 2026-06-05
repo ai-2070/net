@@ -1,0 +1,26 @@
+.github/workflows/ci.yml
+  s_a529d97b04ee8d::t_3f5293e2449426 1288-1290,1292-1293,1295-1297,1299-1300,1302-1304
+net/crates/net/cli/tests/typegen_downstream_python.rs
+  s_a529d97b04ee8d::t_5f65fdbefc8fae 37-38,40
+net/crates/net/docs/plans/TYPEGEN_CLI_PLAN.md
+  s_a529d97b04ee8d::t_7744e4295e8c99 7-9
+  s_a529d97b04ee8d::t_b98ae4f4153656 58
+net/crates/net/docs/cli/TYPEGEN.md
+  s_a529d97b04ee8d::t_cca2e0d5a48bd8 181-185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "dd4eef5c5a54ece6883dfff01f6eb4dc38fda662",
+  "prompts": {},
+  "sessions": {
+    "s_a529d97b04ee8d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e636aa40-01b9-46e0-a6ac-2e827a24c073",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
