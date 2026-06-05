@@ -235,25 +235,37 @@ async fn run_recv_blob(
         progress_enabled(output, quiet),
     );
     let started = Instant::now();
-    let bytes = transport::fetch_blob(mesh, source, &blob_ref)
-        .await
-        .map_err(|e| {
+    // Stream the blob chunk-by-chunk straight to disk rather than
+    // assembling the whole payload in RAM first: peak memory is ~one chunk,
+    // so the practical size ceiling is free disk, not process memory.
+    // `fetch_blob_stream` yields verified chunks in manifest order, so
+    // writing them sequentially preserves integrity (no whole-blob rehash).
+    use futures::StreamExt as _;
+    // `fetch_blob_stream` returns a `!Unpin` stream (an `unfold`), so pin it
+    // on the stack before polling with `next()`.
+    let mut stream = std::pin::pin!(transport::fetch_blob_stream(mesh, source, &blob_ref));
+    let mut writer = AtomicFileWriter::create(&args.out).await?;
+    let mut total: u64 = 0;
+    while let Some(item) = stream.next().await {
+        let chunk = item.map_err(|e| {
             sdk(format!(
                 "fetch_blob from peer {source} failed: {e}{}",
                 relay_hint(source, attached)
             ))
         })?;
+        total += chunk.len() as u64;
+        writer.write_chunk(&chunk).await?;
+    }
+    writer.commit().await?;
     let elapsed = started.elapsed();
     spinner.finish();
-
-    write_atomic(&args.out, &bytes).await?;
 
     let view = RecvBlobView {
         peer: source,
         out: args.out.display().to_string(),
-        bytes: bytes.len() as u64,
+        bytes: total,
         duration_secs: elapsed.as_secs_f64(),
-        throughput_mib_s: throughput_mib_s(bytes.len() as u64, elapsed),
+        throughput_mib_s: throughput_mib_s(total, elapsed),
     };
     emit_value(OutputFormat::resolve_oneshot(output), &view)
         .map_err(|e| generic(format!("write recv-blob result: {e}")))?;
@@ -627,29 +639,68 @@ async fn read_source(path: &std::path::Path) -> Result<Vec<u8>, CliError> {
     }
 }
 
-/// Write `bytes` to `out` atomically: write `<out>.partial` then rename
-/// over `out`. On failure the partial file is left for inspection (not
-/// auto-cleaned) — matching `fetch_dir`'s temp-and-rename semantics.
-async fn write_atomic(out: &std::path::Path, bytes: &[u8]) -> Result<(), CliError> {
-    let partial = partial_path(out);
-    if let Some(parent) = out.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| generic(format!("create out dir {}: {e}", parent.display())))?;
+/// Streaming temp-and-rename atomic writer: open `<out>.partial`, append
+/// chunks as they arrive, then flush + rename over `<out>` on
+/// [`Self::commit`]. A reader never observes a half-written target; on any
+/// failure (the writer is dropped without committing) the `.partial` is
+/// left in place for inspection — matching `fetch_dir`'s temp-and-rename
+/// semantics and `TRANSFER.md` §5.
+struct AtomicFileWriter {
+    partial: PathBuf,
+    out: PathBuf,
+    file: tokio::fs::File,
+}
+
+impl AtomicFileWriter {
+    /// Create the parent directory (if any) and open `<out>.partial`.
+    async fn create(out: &std::path::Path) -> Result<Self, CliError> {
+        let partial = partial_path(out);
+        if let Some(parent) = out.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| generic(format!("create out dir {}: {e}", parent.display())))?;
+            }
         }
+        let file = tokio::fs::File::create(&partial)
+            .await
+            .map_err(|e| generic(format!("create {}: {e}", partial.display())))?;
+        Ok(Self {
+            partial,
+            out: out.to_path_buf(),
+            file,
+        })
     }
-    tokio::fs::write(&partial, bytes)
-        .await
-        .map_err(|e| generic(format!("write {}: {e}", partial.display())))?;
-    tokio::fs::rename(&partial, out).await.map_err(|e| {
-        generic(format!(
-            "rename {} -> {}: {e} (partial left in place)",
-            partial.display(),
-            out.display()
-        ))
-    })?;
-    Ok(())
+
+    /// Append one chunk to the partial file.
+    async fn write_chunk(&mut self, bytes: &[u8]) -> Result<(), CliError> {
+        use tokio::io::AsyncWriteExt as _;
+        self.file
+            .write_all(bytes)
+            .await
+            .map_err(|e| generic(format!("write {}: {e}", self.partial.display())))
+    }
+
+    /// Flush the partial file, close it, and rename it over the
+    /// destination. Closing before the rename keeps the commit portable
+    /// (Windows refuses to rename a file that is still open).
+    async fn commit(mut self) -> Result<(), CliError> {
+        use tokio::io::AsyncWriteExt as _;
+        self.file
+            .flush()
+            .await
+            .map_err(|e| generic(format!("flush {}: {e}", self.partial.display())))?;
+        drop(self.file);
+        tokio::fs::rename(&self.partial, &self.out)
+            .await
+            .map_err(|e| {
+                generic(format!(
+                    "rename {} -> {}: {e} (partial left in place)",
+                    self.partial.display(),
+                    self.out.display()
+                ))
+            })
+    }
 }
 
 /// `<out>.partial` sibling path for the atomic write.

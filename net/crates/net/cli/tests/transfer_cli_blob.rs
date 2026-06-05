@@ -141,6 +141,93 @@ async fn recv_blob_fetches_byte_for_byte() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recv_blob_streams_a_multi_chunk_blob_byte_for_byte() {
+    // 10 MiB spans multiple 4 MiB chunks, so this exercises the streamed
+    // multi-chunk path (`fetch_blob_stream` → `AtomicFileWriter`) end to
+    // end rather than the single-chunk fast path above. The receiver never
+    // holds the whole blob — chunks land on disk as they arrive — but the
+    // reconstructed file must still match the holder's bytes exactly.
+    let bytes = payload(10 * 1024 * 1024, 13);
+    let (holder, blob_ref) = boot_holder_with_blob(&bytes).await;
+    let encoded = hex::encode(blob_ref.encode());
+
+    let home = TempDir::new().expect("home");
+    let out_dir = TempDir::new().expect("out");
+    let out_path = out_dir.path().join("big.bin");
+
+    let mut args = vec![
+        "recv-blob".into(),
+        "--blob-ref".into(),
+        encoded,
+        "--out".into(),
+        out_path.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ];
+    args.extend(attach(&holder));
+
+    let (code, stdout, stderr) = run_transfer(&home, args).await;
+    assert_eq!(
+        code, 0,
+        "recv-blob failed: stderr={stderr}\nstdout={stdout}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("non-JSON stdout ({e}): {stdout}"));
+    assert_eq!(parsed["bytes"], bytes.len() as u64, "stdout={stdout}");
+
+    let got = std::fs::read(&out_path).expect("read out");
+    assert_eq!(
+        got, bytes,
+        "multi-chunk blob differs from the holder's blob"
+    );
+    assert!(
+        !out_dir.path().join("big.bin.partial").exists(),
+        "stray .partial left behind after a successful multi-chunk fetch"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recv_blob_failure_leaves_partial_not_target() {
+    // Boot a holder whose engine is installed and serving, but which does
+    // NOT hold the content we ask for. The fetch fails (holder NotFound),
+    // so the verb must exit non-zero, leave NO committed `--out`, and leave
+    // the `<out>.partial` behind for inspection (TRANSFER.md §5).
+    let (holder, _present) = boot_holder_with_blob(&payload(1024, 1)).await;
+    let missing = transport::chunk_payload(&payload(8 * 1024, 99))
+        .expect("chunk payload")
+        .into_blob_ref("mesh://missing", Encoding::Replicated)
+        .expect("blob ref");
+    let encoded = hex::encode(missing.encode());
+
+    let home = TempDir::new().expect("home");
+    let out_dir = TempDir::new().expect("out");
+    let out_path = out_dir.path().join("never.bin");
+
+    let mut args = vec![
+        "recv-blob".into(),
+        "--blob-ref".into(),
+        encoded,
+        "--out".into(),
+        out_path.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ];
+    args.extend(attach(&holder));
+
+    let (code, _stdout, _stderr) = run_transfer(&home, args).await;
+    assert_ne!(code, 0, "expected a non-zero exit for a failed fetch");
+    assert!(
+        !out_path.exists(),
+        "the destination must not be committed on failure"
+    );
+    assert!(
+        out_dir.path().join("never.bin.partial").exists(),
+        "the .partial must be left in place for inspection on failure"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn send_blob_computes_the_same_reference_the_holder_stored() {
     // The publish side (`send-blob`) and the storage side
     // (`chunk_payload` → `store`) must derive the identical reference, or
