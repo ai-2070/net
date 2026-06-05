@@ -99,7 +99,10 @@ async fn ls_status_cancel_round_trip_over_rpc() {
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("non-JSON stdout ({e}): {stdout}"));
     assert_eq!(parsed["transfer_count"], 0, "stdout={stdout}");
-    assert!(parsed["transfers"].as_array().expect("transfers array").is_empty());
+    assert!(parsed["transfers"]
+        .as_array()
+        .expect("transfers array")
+        .is_empty());
 
     // status <id> → not found (no such pending transfer), exit 0.
     let mut args = vec![
@@ -136,5 +139,8 @@ async fn ls_without_attach_exits_invalid_args() {
     let home = TempDir::new().expect("home");
     let (code, _stdout, _stderr) =
         run_transfer(&home, vec!["ls".into(), "--output".into(), "json".into()]).await;
-    assert_eq!(code, 2, "expected InvalidArgs exit code for ls without attach");
+    assert_eq!(
+        code, 2,
+        "expected InvalidArgs exit code for ls without attach"
+    );
 }

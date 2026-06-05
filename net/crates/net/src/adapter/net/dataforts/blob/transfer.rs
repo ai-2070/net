@@ -304,7 +304,9 @@ impl BlobTransferEngine {
     /// Snapshot one in-flight transfer by stream id, or `None` if it isn't
     /// pending (already settled, cancelled, or never existed).
     pub fn get_pending(&self, stream_id: u64) -> Option<TransferStatus> {
-        self.pending.get(&stream_id).map(|e| e.value().status(stream_id))
+        self.pending
+            .get(&stream_id)
+            .map(|e| e.value().status(stream_id))
     }
 
     /// Like [`Self::cancel_pending`] but reports whether a transfer was
@@ -660,9 +662,12 @@ mod tests {
 
         let addr = "127.0.0.1:0".parse().expect("addr");
         let node = Arc::new(
-            MeshNode::new(EntityKeypair::generate(), MeshNodeConfig::new(addr, [0x17u8; 32]))
-                .await
-                .expect("node"),
+            MeshNode::new(
+                EntityKeypair::generate(),
+                MeshNodeConfig::new(addr, [0x17u8; 32]),
+            )
+            .await
+            .expect("node"),
         );
         let adapter = Arc::new(MeshBlobAdapter::new("t", Arc::new(Redex::new())));
         let engine = BlobTransferEngine::new(&node, adapter);

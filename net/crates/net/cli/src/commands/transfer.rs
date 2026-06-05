@@ -191,12 +191,8 @@ pub async fn run(
         }
         TransferCommand::SendDir(args) => run_send_dir(args, output).await,
         TransferCommand::Ls(args) => run_ls(args, output, config_path, profile_name).await,
-        TransferCommand::Status(args) => {
-            run_status(args, output, config_path, profile_name).await
-        }
-        TransferCommand::Cancel(args) => {
-            run_cancel(args, output, config_path, profile_name).await
-        }
+        TransferCommand::Status(args) => run_status(args, output, config_path, profile_name).await,
+        TransferCommand::Cancel(args) => run_cancel(args, output, config_path, profile_name).await,
     }
 }
 
@@ -464,10 +460,11 @@ async fn run_status(
     )
     .await?;
     let client = transport::BlobTransferClient::new(ctx.require_mesh_node()?);
-    let found = client
-        .get(target, stream_id)
-        .await
-        .map_err(|e| sdk(format!("blob.transfers status on peer {target} failed: {e}")))?;
+    let found = client.get(target, stream_id).await.map_err(|e| {
+        sdk(format!(
+            "blob.transfers status on peer {target} failed: {e}"
+        ))
+    })?;
     let view = StatusView {
         transfer_id: stream_id,
         found: found.is_some(),
@@ -496,10 +493,11 @@ async fn run_cancel(
     )
     .await?;
     let client = transport::BlobTransferClient::new(ctx.require_mesh_node()?);
-    let cancelled = client
-        .cancel(target, stream_id)
-        .await
-        .map_err(|e| sdk(format!("blob.transfers cancel on peer {target} failed: {e}")))?;
+    let cancelled = client.cancel(target, stream_id).await.map_err(|e| {
+        sdk(format!(
+            "blob.transfers cancel on peer {target} failed: {e}"
+        ))
+    })?;
     let view = CancelView {
         transfer_id: stream_id,
         cancelled,
