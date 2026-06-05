@@ -1,0 +1,20 @@
+net/crates/net/cli/src/commands/transfer.rs
+  s_a529d97b04ee8d::t_8425b64a65141b 785-845
+  s_a529d97b04ee8d::t_03c146208acd11 515-521
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "5b11e34f2d66071c89f25c6161e26dde0eeeb708",
+  "prompts": {},
+  "sessions": {
+    "s_a529d97b04ee8d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e636aa40-01b9-46e0-a6ac-2e827a24c073",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
