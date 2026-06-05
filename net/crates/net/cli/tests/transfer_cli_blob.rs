@@ -88,6 +88,30 @@ async fn run_transfer(home: &TempDir, args: Vec<String>) -> (i32, String, String
     .expect("spawn_blocking")
 }
 
+/// Like [`run_transfer`] but pipes `stdin` to the process — for the
+/// `send-blob -` (read from stdin) path.
+async fn run_transfer_stdin(
+    home: &TempDir,
+    args: Vec<String>,
+    stdin: Vec<u8>,
+) -> (i32, String, String) {
+    let bin = cli_cmd(home);
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = bin;
+        cmd.arg("transfer");
+        cmd.args(&args);
+        cmd.write_stdin(stdin);
+        let output = cmd.output().expect("invoke net-mesh");
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    })
+    .await
+    .expect("spawn_blocking")
+}
+
 fn attach(holder: &Mesh) -> Vec<String> {
     vec![
         "--node-addr".into(),
@@ -310,4 +334,152 @@ async fn recv_blob_without_attach_is_invalid_args() {
     )
     .await;
     assert_eq!(code, 2, "expected InvalidArgs exit code; stderr={stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_blob_multi_chunk_ref_matches_buffered() {
+    // A >4 MiB payload spans multiple chunks → Manifest. The streamed
+    // send-blob must derive the IDENTICAL reference the buffered
+    // chunk_payload path produces, or recv-blob could never name it. Also
+    // pins the multi-chunk view shape (≥ 3 chunks, no bare `hash` field).
+    let bytes = payload(10 * 1024 * 1024, 21);
+    let expected = transport::chunk_payload(&bytes)
+        .expect("chunk payload")
+        .into_blob_ref("mesh://transfer", Encoding::Replicated)
+        .expect("blob ref");
+    let expected_hex = hex::encode(expected.encode());
+
+    let home = TempDir::new().expect("home");
+    let src_dir = TempDir::new().expect("src");
+    let src = src_dir.path().join("big.bin");
+    std::fs::write(&src, &bytes).expect("write src");
+
+    let (code, stdout, stderr) = run_transfer(
+        &home,
+        vec![
+            "send-blob".into(),
+            src.display().to_string(),
+            "--output".into(),
+            "json".into(),
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "send-blob failed: stderr={stderr}");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("parse send-blob");
+    assert_eq!(
+        parsed["blob_ref"], expected_hex,
+        "multi-chunk ref mismatch: {stdout}"
+    );
+    assert_eq!(parsed["size"], bytes.len() as u64);
+    assert!(
+        parsed["chunks"].as_u64().expect("chunks") >= 3,
+        "expected ≥3 chunks for a 10 MiB payload: {stdout}"
+    );
+    // Multi-chunk → the bare-hash convenience field is omitted.
+    assert!(
+        parsed["hash"].is_null(),
+        "multi-chunk should omit hash: {stdout}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_blob_reads_from_stdin() {
+    // `send-blob -` streams the payload from stdin and must derive the same
+    // reference as the equivalent file input.
+    let bytes = payload(300 * 1024, 5);
+    let expected = transport::chunk_payload(&bytes)
+        .expect("chunk payload")
+        .into_blob_ref("mesh://transfer", Encoding::Replicated)
+        .expect("blob ref");
+    let expected_hex = hex::encode(expected.encode());
+
+    let home = TempDir::new().expect("home");
+    let (code, stdout, stderr) = run_transfer_stdin(
+        &home,
+        vec![
+            "send-blob".into(),
+            "-".into(),
+            "--output".into(),
+            "json".into(),
+        ],
+        bytes.clone(),
+    )
+    .await;
+    assert_eq!(code, 0, "send-blob - failed: stderr={stderr}");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("parse send-blob");
+    assert_eq!(
+        parsed["blob_ref"], expected_hex,
+        "stdin ref mismatch: {stdout}"
+    );
+    assert_eq!(parsed["size"], bytes.len() as u64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_blob_store_then_recv_round_trip() {
+    // End-to-end tie of Gap B (streamed send) to Gap A (streamed recv):
+    // `send-blob --store` stages a multi-chunk blob's chunks to disk; a
+    // holder rooted at that same store dir serves them; `recv-blob` then
+    // fetches the blob back byte-for-byte.
+    let bytes = payload(6 * 1024 * 1024, 33); // multi-chunk
+    let home = TempDir::new().expect("home");
+    let store_dir = TempDir::new().expect("store");
+    let src_dir = TempDir::new().expect("src");
+    let src = src_dir.path().join("payload.bin");
+    std::fs::write(&src, &bytes).expect("write src");
+
+    // 1. Stage the bytes into an on-disk store.
+    let (code, stdout, stderr) = run_transfer(
+        &home,
+        vec![
+            "send-blob".into(),
+            src.display().to_string(),
+            "--store".into(),
+            store_dir.path().display().to_string(),
+            "--output".into(),
+            "json".into(),
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "send-blob --store failed: stderr={stderr}");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("parse send-blob");
+    assert_eq!(
+        parsed["staged_to"],
+        store_dir.path().display().to_string(),
+        "stdout={stdout}"
+    );
+    let blob_ref_hex = parsed["blob_ref"].as_str().expect("blob_ref").to_string();
+
+    // 2. Boot a holder whose persistent adapter is rooted at the same store
+    //    dir (same id as the CLI's `send-blob` adapter) so it serves the
+    //    staged chunks.
+    let mesh = MeshBuilder::new("127.0.0.1:0", &psk())
+        .expect("mesh builder")
+        .build()
+        .await
+        .expect("mesh build");
+    mesh.start();
+    let redex = Arc::new(Redex::new().with_persistent_dir(store_dir.path()));
+    let adapter = Arc::new(MeshBlobAdapter::new("send-blob", redex).with_persistent(true));
+    transport::serve_blob_transfer(&mesh, adapter);
+
+    // 3. Fetch it back and compare byte-for-byte.
+    let out_dir = TempDir::new().expect("out");
+    let out_path = out_dir.path().join("got.bin");
+    let mut args = vec![
+        "recv-blob".into(),
+        "--blob-ref".into(),
+        blob_ref_hex,
+        "--out".into(),
+        out_path.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ];
+    args.extend(attach(&mesh));
+    let (code, stdout, stderr) = run_transfer(&home, args).await;
+    assert_eq!(
+        code, 0,
+        "recv-blob failed: stderr={stderr}\nstdout={stdout}"
+    );
+    let got = std::fs::read(&out_path).expect("read out");
+    assert_eq!(got, bytes, "round-tripped blob differs from source");
 }

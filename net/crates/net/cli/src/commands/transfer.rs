@@ -43,8 +43,8 @@ use crate::error::{generic, invalid_args, sdk, CliError};
 use crate::parsers::parse_u64_flexible;
 use crate::prelude::{emit_value, OutputFormat};
 
-use net_sdk::dataforts::{BlobAdapter, MeshBlobAdapter, Redex};
-use net_sdk::transport::{self, BlobRef, ChunkedPayload, Encoding};
+use net_sdk::dataforts::{MeshBlobAdapter, Redex};
+use net_sdk::transport::{self, BlobRef, Encoding};
 
 #[derive(Subcommand, Debug)]
 pub enum TransferCommand {
@@ -275,43 +275,57 @@ async fn run_recv_blob(
 // ── send-blob ───────────────────────────────────────────────────────
 
 async fn run_send_blob(args: SendBlobArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
-    let bytes = read_source(&args.path).await?;
-
-    // Compute the content-addressed reference: `chunk_payload` decides
-    // inline (single-chunk) vs chunked, then `into_blob_ref` finalizes a
-    // Small / Manifest `BlobRef` — the exact value `recv-blob` fetches by.
-    let chunked =
-        transport::chunk_payload(&bytes).map_err(|e| sdk(format!("chunk payload: {e}")))?;
-    let (small_hash, chunk_count) = match &chunked {
-        ChunkedPayload::Inline { hash, .. } => (Some(hex::encode(hash)), 1usize),
-        ChunkedPayload::Chunked { chunks, .. } => (None, chunks.len()),
-    };
-    let blob_ref = chunked
-        .into_blob_ref("mesh://transfer", Encoding::Replicated)
-        .map_err(|e| sdk(format!("build blob ref: {e}")))?;
-
-    let staged = match args.store.as_deref() {
-        Some(dir) => {
-            let adapter = persistent_adapter(dir, "send-blob").await?;
-            adapter
-                .store(&blob_ref, &bytes)
-                .await
-                .map_err(|e| sdk(format!("stage blob into {}: {e}", dir.display())))?;
-            Some(dir.display().to_string())
-        }
+    // Stage destination: a persistent adapter when `--store` is given, else
+    // `None` — a dry run that computes the reference without persisting.
+    let adapter = match args.store.as_deref() {
+        Some(dir) => Some(persistent_adapter(dir, "send-blob").await?),
         None => None,
+    };
+
+    // Stream the source chunk-at-a-time into the content-addressed
+    // reference (and, with `--store`, into the adapter as each chunk is
+    // read) so the whole file is never held in memory. `store_blob_reader`
+    // returns the exact `BlobRef` the buffered `chunk_payload` path would —
+    // the value `recv-blob` fetches by.
+    let blob_ref = if args.path.as_os_str() == "-" {
+        transport::store_blob_reader(
+            adapter.as_deref(),
+            tokio::io::stdin(),
+            "mesh://transfer",
+            Encoding::Replicated,
+        )
+        .await
+    } else {
+        let file = tokio::fs::File::open(&args.path)
+            .await
+            .map_err(|e| generic(format!("open {}: {e}", args.path.display())))?;
+        transport::store_blob_reader(
+            adapter.as_deref(),
+            file,
+            "mesh://transfer",
+            Encoding::Replicated,
+        )
+        .await
+    }
+    .map_err(|e| sdk(format!("send blob from {}: {e}", args.path.display())))?;
+
+    let (small_hash, chunk_count) = match &blob_ref {
+        // Bare chunk hash, present only for a single-chunk blob (so the
+        // short form is unambiguous).
+        BlobRef::Small { hash, .. } => (Some(hex::encode(hash)), 1u64),
+        BlobRef::Manifest { chunks, .. } => (None, chunks.len() as u64),
+        // `store_blob_reader` only ever yields Small / Manifest.
+        BlobRef::Tree { .. } => (None, 0),
     };
 
     let view = SendBlobView {
         // Full-fidelity reference: works for single- and multi-chunk
         // content. `recv-blob --blob-ref <this>` decodes it back.
         blob_ref: hex::encode(blob_ref.encode()),
-        // Convenience: the bare chunk hash, present only for a
-        // single-chunk blob (so the short form is unambiguous).
         hash: small_hash,
-        size: bytes.len() as u64,
-        chunks: chunk_count as u64,
-        staged_to: staged,
+        size: blob_ref.size(),
+        chunks: chunk_count,
+        staged_to: args.store.as_deref().map(|d| d.display().to_string()),
     };
     emit_value(OutputFormat::resolve_oneshot(output), &view)
         .map_err(|e| generic(format!("write send-blob result: {e}")))?;
@@ -620,23 +634,6 @@ async fn persistent_adapter(
     Ok(Arc::new(
         MeshBlobAdapter::new(id, redex).with_persistent(true),
     ))
-}
-
-/// Read the send source: a file path, or stdin when the path is `-`.
-async fn read_source(path: &std::path::Path) -> Result<Vec<u8>, CliError> {
-    if path.as_os_str() == "-" {
-        use tokio::io::AsyncReadExt as _;
-        let mut buf = Vec::new();
-        tokio::io::stdin()
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|e| generic(format!("read stdin: {e}")))?;
-        Ok(buf)
-    } else {
-        tokio::fs::read(path)
-            .await
-            .map_err(|e| generic(format!("read {}: {e}", path.display())))
-    }
 }
 
 /// Streaming temp-and-rename atomic writer: open `<out>.partial`, append

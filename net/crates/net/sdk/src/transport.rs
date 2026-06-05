@@ -86,6 +86,14 @@ pub use net::adapter::net::mesh_rpc::{ServeError, ServeHandle};
 // fetch) doesn't reimplement chunk sizing / hashing.
 pub use net::adapter::net::dataforts::{chunk_payload, ChunkedPayload, Encoding};
 
+// Streaming store: chunk an `AsyncRead` into content-addressed chunks and
+// assemble the same [`BlobRef`] `chunk_payload(...).into_blob_ref(...)`
+// yields, but without buffering the whole payload — peak memory is one
+// chunk. `adapter = Some` persists each chunk as it is read (the
+// `send-blob --store` path); `None` computes the reference only (the dry
+// path). The streaming inverse of [`fetch_blob_stream`].
+pub use net::adapter::net::dataforts::store_blob_reader;
+
 // Directory transfer: the substrate `store_dir` is usable as-is (it
 // takes a `&MeshBlobAdapter`); the fetch side is wrapped below because
 // the substrate function needs the internal node handle. The manifest
