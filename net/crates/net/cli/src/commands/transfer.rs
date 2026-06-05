@@ -663,10 +663,24 @@ impl Progress {
         Self(Some(pb))
     }
 
-    fn finish(self) {
-        if let Some(pb) = self.0 {
+    /// Clear the spinner before emitting the success summary. Idempotent,
+    /// and the [`Drop`] impl runs the same teardown — so the error path
+    /// (an early `?` return before `finish`) still clears the spinner
+    /// rather than leaving a stale frame above the error on stderr.
+    fn finish(mut self) {
+        self.clear();
+    }
+
+    fn clear(&mut self) {
+        if let Some(pb) = self.0.take() {
             pb.finish_and_clear();
         }
+    }
+}
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 
