@@ -1,0 +1,26 @@
+net/crates/net/cli/tests/transfer_cli_dir.rs
+  s_a529d97b04ee8d::t_4cf6ad728aa678 185-224
+net/crates/net/docs/cli/TRANSFER.md
+  s_a529d97b04ee8d::t_61bc4db41809a1 217-220
+net/crates/net/src/adapter/net/dataforts/dir.rs
+  s_a529d97b04ee8d::t_e152a7cc15245a 701-703,710-716,721-724,735,743-746
+  s_a529d97b04ee8d::t_0094c70aa7b8ee 42
+  s_a529d97b04ee8d::t_a7093c74250be0 502-523
+  s_a529d97b04ee8d::t_0eeea2b25d972f 704-709,717-720,725-734,736-742
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "b309087df9305db9ccee2e8957d002c4b50b2672",
+  "prompts": {},
+  "sessions": {
+    "s_a529d97b04ee8d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e636aa40-01b9-46e0-a6ac-2e827a24c073",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
