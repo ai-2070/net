@@ -34,6 +34,14 @@ Discovery and transfer ride the substrate's existing primitives — there's no s
 
 **Auto-store + heat bump on fetch.** Once a blob's bytes arrive, the local Dataforts adapter automatically stores them and bumps the heat counter for the receiver. The next request for the same blob hits the local cache; the next request in the deployment for the same blob can pull from this node instead of crossing the original boundary.
 
+### Memory footprint
+
+Both sides of a transfer stream chunk-at-a-time, so peak memory for a single transfer is roughly one chunk (4 MiB) regardless of total blob size. The receive path writes each verified chunk straight to disk via an atomic-rename writer — it opens an `<out>.partial` file, appends each chunk as it lands, and renames into place once the manifest is fully consumed. The send path reads through `store_blob_reader`, hashing and persisting each chunk as it's pulled from the source (a file, stdin, or any `AsyncRead`). Large leaves inside a directory tree get the same treatment inside `fetch_dir` — anything above one chunk streams to disk rather than buffering.
+
+The only remaining per-chunk cap is `TRANSFER_MAX_CHUNK_BYTES` (16 MiB), which guards against a misbehaving holder claiming an absurd chunk size. Total transfer size is bounded by free disk, not by RAM. A 100 GB blob moves through the same memory footprint as a 100 MB blob.
+
+The CLI surfaces this directly: `net-mesh transfer recv-blob` shows a determinate byte-progress bar driven from the per-chunk loop, so an operator watching a long transfer sees byte-count and percentage rather than a generic spinner.
+
 ## Passing blobs through events
 
 A `BlobRef` is small (32 bytes plus a few framing bytes). It's small enough to put in an event payload, store in a CortEX state, or pass as an RPC argument. The pattern that makes Dataforts useful in practice is putting the bytes in Dataforts and the reference in the bus:

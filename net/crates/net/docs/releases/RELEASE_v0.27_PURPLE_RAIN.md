@@ -100,7 +100,47 @@ The substrate's router has had every primitive bulk byte movement needs — stre
 
 **Atomic `fetch_dir`.** `dataforts::dir::fetch_dir` used to write directly under the caller's `dest` and leave it in a partial state on any mid-fetch failure. v0.27 replaces the direct write with a sibling-temp-path + atomic-rename pattern — the destination either becomes the complete new tree or remains exactly as it was before the call. Failure is a complete rollback with no SDK-side wrapping required.
 
+**Streaming send and receive.** Pre-v0.27, single-file transfers were bounded by available process memory, not by disk: the receive path assembled the entire blob in one `BytesMut` before writing, and the send path slurped the whole source file before chunking. v0.27 streams chunk-at-a-time on both sides. The receive path appends each verified chunk to an `<out>.partial` and renames on commit; the send path reads through a new `store_blob_reader` substrate helper that hashes and stores each chunk as it's consumed. Large directory leaves (above one chunk) get the same treatment inside `fetch_dir`. Peak memory drops to roughly one chunk (4 MiB) everywhere; the only remaining cap is the per-chunk `TRANSFER_MAX_CHUNK_BYTES` ceiling (16 MiB), and total transfer size is now disk-bound. The CLI's `recv-blob` also gains a determinate byte-progress bar driven from the per-chunk loop.
+
 **Transport SDK in five tiers.** Rust (`net_sdk::transport`), C (`net.h` extensions), Python (pyo3), TypeScript (napi-rs), Go (CGO over C) all gain `fetch_blob(blob_ref) -> Bytes`, `store_dir(adapter, root) -> blob_ref`, `fetch_dir(adapter, root_blob_ref, dest)`, plus the `DirManifest` / `DirEntry` introspection types. The SDK stays thin — no retry policy, no rollback machinery, no directory-sync primitives. Substrate primitives exposed; applications compose policy above.
+
+---
+
+## Operator CLI — `net-mesh transfer` and `net-mesh typegen`
+
+The operator surface grows two new subcommands, both layered over primitives that already shipped.
+
+**`net-mesh transfer`.** A first-class CLI for blob and directory transport. Six verbs against a live `MeshNode` resolved through the standard `CliContext`:
+
+| Command | What it does |
+|---|---|
+| `net-mesh transfer recv-blob <source> <ref> --out <path>` | Fetch a single blob from a peer and stream it to disk |
+| `net-mesh transfer send-blob <path> [--store]` | Chunk a file (or stdin via `-`), optionally persist each chunk, and print the resulting `BlobRef` |
+| `net-mesh transfer recv-dir <source> <root-ref> --dest <path>` | Materialize a directory tree atomically — the destination either becomes the complete tree or stays untouched |
+| `net-mesh transfer send-dir <path>` | Walk a directory, hash everything, print the root manifest's `BlobRef` |
+| `net-mesh transfer ls` | List active transfers on the local node |
+| `net-mesh transfer status <transfer-id>` / `cancel <transfer-id>` | Inspect or abort an in-flight transfer |
+
+Progress renders as a determinate byte bar for sized fetches and a spinner for unknown sizes; piping into `send-blob` from stdin or redirecting `recv-blob` to stdout lets the verbs compose with the rest of the shell. The commands ship behind the existing `cli` feature flag — library consumers don't pay the `clap` build cost.
+
+**`net-mesh typegen`.** Code generation from discovered AI tool descriptors. Walks the capability fold for `ai-tool:*` tags, fetches each matching descriptor's metadata (via `tool.metadata.fetch`), and emits typed bindings:
+
+```sh
+net-mesh typegen generate --language ts     --tags weather              --out ./generated
+net-mesh typegen generate --language python --tools acme.web-search     --out ./generated
+```
+
+Output is one module per tool. The tool's JSON Schema lowers to TypeScript interfaces (for `ts`) or Pydantic v2 models (for `python`); each module also exports a typed call helper (`callAcmeWebSearch(mesh, request)` for TS, `call_acme_web_search(mesh, request)` for Python) plus a `…Meta` constant carrying the descriptor's metadata (tool id, version, streaming flag, tags, description). The bindings work cross-language by construction — every typed call lands on the same wire RPC, so a Python agent calling a TypeScript tool calling a Go server is the same shape as a Rust client calling a Rust server.
+
+The companion verbs make the workflow reproducible:
+
+| Command | What it does |
+|---|---|
+| `net-mesh typegen snapshot --out <file>` | Capture the current matching descriptors into a versioned snapshot |
+| `net-mesh typegen generate --from-snapshot <file>` | Regenerate bindings from a snapshot without re-querying the mesh — useful for hermetic CI builds |
+| `net-mesh typegen diff <a> <b>` | Show what changed between two snapshots (added/removed tools, schema deltas) |
+
+The substrate-side surface (`list_tools`, the capability fold, `tool.metadata.fetch`) all shipped earlier; v0.27 is the operator-facing assembly.
 
 ---
 
