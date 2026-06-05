@@ -138,12 +138,12 @@ field's type changed, an enum value removed, a nullable field made
 non-nullable, or an output field removed. Enum *widening* and
 required→optional are listed but not flagged.
 
-**Depth caveat:** the diff compares top-level fields one level deep. A field
-whose type is a nested object or a `$ref` is compared by its *shape category*
-(`object` / `ref:Name`), not recursively — so a change *inside* a nested
-object (e.g. a required sub-field added) or behind an unchanged `$ref` name is
-**not** surfaced, even if it would break callers. Bump the tool `version` (or
-flatten the schema) when evolving nested structures so the change is visible.
+**Depth caveat:** inline nested objects are compared recursively (a change
+inside them surfaces with a dotted path, e.g. `input.address.zip`). What stays
+shallow is structure *behind a `$ref`* (compared by `ref:Name`, since the diff
+doesn't expand `$defs`) and the element type of an *array of objects* — a
+change there isn't surfaced. Bump the tool `version` when evolving a `$def` or
+array element so the change is visible.
 
 ---
 

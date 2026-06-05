@@ -254,13 +254,25 @@ fn diff_objects(
                         breaking: false,
                     });
                 }
-                // Type / nullability / enum.
-                if let Some((detail, breaking)) = type_change(old_schema, new_schema) {
-                    out.push(Change {
-                        path,
-                        detail,
-                        breaking,
-                    });
+                // A field that is an inline object on both sides is compared
+                // recursively, so a breaking change *inside* the nested object
+                // (e.g. a required sub-field added) surfaces with a dotted
+                // path. (Objects behind a `$ref` stay shallow — `Ref` is a
+                // leaf — so bump the tool version when evolving `$defs`.)
+                match (old_schema, new_schema) {
+                    (Schema::Object(oo), Schema::Object(no)) => {
+                        diff_objects(&path, oo, no, is_input, out);
+                    }
+                    // Type / nullability / enum.
+                    _ => {
+                        if let Some((detail, breaking)) = type_change(old_schema, new_schema) {
+                            out.push(Change {
+                                path,
+                                detail,
+                                breaking,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -370,8 +382,18 @@ fn canonical(s: &Schema) -> String {
                 .join(", ")
         ),
         Schema::Const(v) => format!("const({v})"),
-        Schema::Union(b) => b.iter().map(canonical).collect::<Vec<_>>().join(" | "),
-        Schema::Intersection(p) => p.iter().map(canonical).collect::<Vec<_>>().join(" & "),
+        // Sort branch strings so member order is irrelevant: `string | null`
+        // and `null | string` are the same type and mustn't diff as a change.
+        Schema::Union(b) => {
+            let mut parts: Vec<String> = b.iter().map(canonical).collect();
+            parts.sort();
+            parts.join(" | ")
+        }
+        Schema::Intersection(p) => {
+            let mut parts: Vec<String> = p.iter().map(canonical).collect();
+            parts.sort();
+            parts.join(" & ")
+        }
         Schema::Ref(n) => format!("ref:{n}"),
         Schema::Unknown => "unknown".into(),
     }
@@ -528,6 +550,42 @@ mod tests {
             .changes
             .iter()
             .any(|c| c.detail.contains("added")));
+    }
+
+    #[test]
+    fn detects_breaking_change_inside_nested_object() {
+        // `address` is a nested object; its `zip` goes optional → required.
+        let old = r#"{"type":"object","properties":{"address":{"type":"object","properties":{"zip":{"type":"string"}}}}}"#;
+        let new = r#"{"type":"object","properties":{"address":{"type":"object","properties":{"zip":{"type":"string"}},"required":["zip"]}}}"#;
+        let r = diff(
+            &snap(vec![tool("t", "1.0.0", Some(old), None)]),
+            &snap(vec![tool("t", "1.1.0", Some(new), None)]),
+        );
+        assert_eq!(r.changed.len(), 1, "{:?}", r.changed);
+        let changes = &r.changed[0].changes;
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path == "input.address.zip" && c.breaking),
+            "expected nested breaking change, got {changes:?}"
+        );
+        assert_eq!(r.breaking_count, 1);
+    }
+
+    #[test]
+    fn union_member_reordering_is_not_a_change() {
+        // Same union, different member order — must not diff as a type change.
+        let old = r#"{"type":"object","properties":{"v":{"oneOf":[{"type":"string"},{"type":"integer"}]}}}"#;
+        let new = r#"{"type":"object","properties":{"v":{"oneOf":[{"type":"integer"},{"type":"string"}]}}}"#;
+        let r = diff(
+            &snap(vec![tool("t", "1.0.0", Some(old), None)]),
+            &snap(vec![tool("t", "1.0.0", Some(new), None)]),
+        );
+        assert!(
+            r.changed.is_empty(),
+            "reordered union diffed: {:?}",
+            r.changed
+        );
     }
 
     #[test]
