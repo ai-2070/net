@@ -200,18 +200,24 @@ bytes are partitioned. The `recv-dir` summary reports
 
 ### Memory use
 
-`send-blob` and `recv-blob` buffer the **whole blob in memory**: the
-publisher reads the entire source file before computing its reference, and
-the fetcher assembles the full blob in RAM before the atomic write. Budget
-roughly one blob's size of memory per concurrent `*-blob` invocation, and
-prefer the directory verbs for very large payloads.
+`send-blob` and `recv-blob` **stream to and from disk** — they never hold
+the whole blob in memory. `recv-blob` writes each verified chunk to
+`<out>.partial` as it arrives; `send-blob` reads the source (file or
+stdin) one chunk at a time, hashing and (with `--store`) persisting each
+before reading the next. Peak memory is roughly **one chunk** (4 MiB), so
+the practical size ceiling for a single file is free disk, not RAM.
 
-`send-dir` / `recv-dir` do **not** buffer the whole tree — they
+The one hard bound that remains is **per chunk**: the receiver rejects any
+single chunk whose declared length exceeds `TRANSFER_MAX_CHUNK_BYTES`
+(16 MiB), guarding against a misbehaving holder. Normal chunks are 4 MiB.
+
+`send-dir` / `recv-dir` likewise don't buffer the whole tree — they
 content-address and fetch leaf files individually, bounded by
 `--concurrency` (recv side), so peak memory tracks a handful of in-flight
-leaves rather than the total transfer size. A directory of many small
-files is therefore the memory-friendly shape; a single multi-gigabyte
-file is still held whole while its one leaf is in flight.
+leaves rather than the total transfer size. A single very large *leaf*
+file inside a directory is still held whole while it is in flight (unlike
+`recv-blob`, the per-leaf dir path does not yet stream to disk); for one
+huge standalone file, prefer `recv-blob`.
 
 ---
 
