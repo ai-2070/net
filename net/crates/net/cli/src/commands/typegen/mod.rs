@@ -17,6 +17,7 @@
 //! `ts.rs` / `python.rs` render it). The CLI plumbs source → codegen →
 //! disk.
 
+mod diff;
 mod python;
 mod schema;
 mod ts;
@@ -307,10 +308,22 @@ async fn run_snapshot(
 
 // ── diff ────────────────────────────────────────────────────────────
 
-async fn run_diff(_args: DiffArgs, _output: Option<OutputFormat>) -> Result<(), CliError> {
-    Err(generic(
-        "typegen diff is not implemented yet (TYPEGEN_CLI_PLAN Gap D)",
-    ))
+async fn run_diff(args: DiffArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
+    let from = read_snapshot(&args.from)?;
+    let to = read_snapshot(&args.to)?;
+    let report = diff::diff(&from, &to);
+
+    match OutputFormat::resolve_oneshot(output) {
+        // Human formats get the operator-facing report; machine formats get
+        // the structured tree.
+        OutputFormat::Table | OutputFormat::Text => {
+            print!("{}", diff::render_text(&report));
+        }
+        format => {
+            emit_value(format, &report).map_err(|e| generic(format!("write typegen diff: {e}")))?;
+        }
+    }
+    Ok(())
 }
 
 // ── descriptor sources ──────────────────────────────────────────────
@@ -322,6 +335,18 @@ fn load_snapshot_source(
     tags: &[String],
     tools: &[String],
 ) -> Result<(Vec<ToolDescriptor>, GenMeta), CliError> {
+    let snapshot = read_snapshot(path)?;
+    let meta = GenMeta {
+        source_label: format!("snapshot {}", path.display()),
+        captured_at: snapshot.captured_at.clone(),
+        format_version: snapshot.format_version,
+    };
+    let descriptors = filter_descriptors(snapshot.descriptors, tags, tools);
+    Ok((descriptors, meta))
+}
+
+/// Read + validate a snapshot file into a [`TypegenSnapshot`].
+fn read_snapshot(path: &Path) -> Result<TypegenSnapshot, CliError> {
     let bytes = std::fs::read(path)
         .map_err(|e| generic(format!("read snapshot {}: {e}", path.display())))?;
     let snapshot: TypegenSnapshot = serde_json::from_slice(&bytes).map_err(|e| {
@@ -338,13 +363,7 @@ fn load_snapshot_source(
             SNAPSHOT_FORMAT_VERSION
         )));
     }
-    let descriptors = filter_descriptors(snapshot.descriptors, tags, tools);
-    let meta = GenMeta {
-        source_label: format!("snapshot {}", path.display()),
-        captured_at: snapshot.captured_at,
-        format_version: snapshot.format_version,
-    };
-    Ok((descriptors, meta))
+    Ok(snapshot)
 }
 
 /// Discover descriptors live: remote-attach, let the fold populate, then
