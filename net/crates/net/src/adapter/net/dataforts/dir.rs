@@ -39,7 +39,7 @@ use bytes::{BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 
 use super::blob::{
-    chunk_payload, BlobAdapter, BlobError, BlobRef, Encoding, MeshBlobAdapter,
+    chunk_payload, BlobAdapter, BlobError, BlobRef, ChunkRef, Encoding, MeshBlobAdapter,
     BLOB_CHUNK_SIZE_BYTES,
 };
 use crate::adapter::net::MeshNode;
@@ -499,17 +499,29 @@ async fn reconstruct_tree(
                     "dir fetch: byte semaphore closed".into(),
                 ))
             })?;
-            let bytes = transfer_fetch_blob(&node, source, &blob_ref).await?;
-            let len = bytes.len() as u64;
-            // Offload only large writes (T-3); small files write inline.
-            if len > BLOCKING_FS_THRESHOLD {
-                tokio::task::spawn_blocking(move || write_file(&safe, &bytes, mode))
-                    .await
-                    .map_err(|e| DirError::Io(std::io::Error::other(e)))??;
-            } else {
-                write_file(&safe, &bytes, mode)?;
+            // A multi-chunk (Manifest) leaf streams straight to disk one
+            // chunk at a time, so a large single file never spikes memory to
+            // its full size — peak is ~one chunk. A single-chunk (Small)
+            // leaf is ≤ one chunk anyway, so it takes the buffered
+            // inline/offloaded write fast path.
+            match &blob_ref {
+                BlobRef::Manifest { chunks, .. } => {
+                    fetch_blob_to_file(&node, source, chunks, &safe, mode).await
+                }
+                _ => {
+                    let bytes = transfer_fetch_blob(&node, source, &blob_ref).await?;
+                    let len = bytes.len() as u64;
+                    // Offload only large writes (T-3); small files write inline.
+                    if len > BLOCKING_FS_THRESHOLD {
+                        tokio::task::spawn_blocking(move || write_file(&safe, &bytes, mode))
+                            .await
+                            .map_err(|e| DirError::Io(std::io::Error::other(e)))??;
+                    } else {
+                        write_file(&safe, &bytes, mode)?;
+                    }
+                    Ok::<u64, DirError>(len)
+                }
             }
-            Ok::<u64, DirError>(len)
         }));
     }
     for task in tasks {
@@ -684,6 +696,52 @@ async fn transfer_fetch_blob(
             "dir transfer: BlobRef::Tree not supported by the directory wrapper".into(),
         ))),
     }
+}
+
+/// Stream a multi-chunk leaf straight to `path`, fetching and writing one
+/// chunk at a time so a large leaf is never buffered whole (peak ~one
+/// chunk). Returns the bytes written. Mirrors [`write_file`]'s mode
+/// application.
+///
+/// The substrate's tokio build has no `fs` feature (file I/O is sync
+/// `std::fs` offloaded to the blocking pool — see [`write_file`]), so each
+/// chunk write runs on `spawn_blocking` with the open handle threaded
+/// through, keeping the async worker free during the actual write.
+async fn fetch_blob_to_file(
+    node: &Arc<MeshNode>,
+    source: u64,
+    chunks: &[ChunkRef],
+    path: &Path,
+    mode: u32,
+) -> Result<u64, DirError> {
+    let create_path = path.to_path_buf();
+    let mut file = tokio::task::spawn_blocking(move || std::fs::File::create(&create_path))
+        .await
+        .map_err(|e| DirError::Io(std::io::Error::other(e)))??;
+    let mut written: u64 = 0;
+    for chunk in chunks {
+        let bytes = node.transfer_fetch_chunk(source, chunk.hash).await?;
+        written += bytes.len() as u64;
+        // Offload the blocking write, moving the handle in and back out so
+        // the next chunk writes to the same file.
+        file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+            use std::io::Write as _;
+            let mut f = file;
+            f.write_all(&bytes)?;
+            Ok(f)
+        })
+        .await
+        .map_err(|e| DirError::Io(std::io::Error::other(e)))??;
+    }
+    // Flush + close on the blocking pool, then apply the mode.
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write as _;
+        file.flush()
+    })
+    .await
+    .map_err(|e| DirError::Io(std::io::Error::other(e)))??;
+    apply_mode(path, mode)?;
+    Ok(written)
 }
 
 // ── Path safety + FS apply ──────────────────────────────────────────

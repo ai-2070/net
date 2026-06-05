@@ -214,10 +214,10 @@ single chunk whose declared length exceeds `TRANSFER_MAX_CHUNK_BYTES`
 `send-dir` / `recv-dir` likewise don't buffer the whole tree — they
 content-address and fetch leaf files individually, bounded by
 `--concurrency` (recv side), so peak memory tracks a handful of in-flight
-leaves rather than the total transfer size. A single very large *leaf*
-file inside a directory is still held whole while it is in flight (unlike
-`recv-blob`, the per-leaf dir path does not yet stream to disk); for one
-huge standalone file, prefer `recv-blob`.
+leaves rather than the total transfer size. A large multi-chunk leaf
+streams to disk one chunk at a time too (like `recv-blob`), so even a
+directory containing one huge file stays bounded to ~one chunk per
+in-flight leaf.
 
 ---
 
