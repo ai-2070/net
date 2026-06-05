@@ -1,0 +1,19 @@
+net/crates/net/docs/cli/TRANSFER.md
+  s_a529d97b04ee8d::t_1d87b165c5f829 203-214,217-220
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "857ff32236b9e7a8d96f1952e60560c82d747b71",
+  "prompts": {},
+  "sessions": {
+    "s_a529d97b04ee8d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e636aa40-01b9-46e0-a6ac-2e827a24c073",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
