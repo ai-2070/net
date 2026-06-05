@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/TRANSFER_STREAMING_PLAN.md
+  s_a529d97b04ee8d::t_c5e558a8220453 1-185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "922543e0d9869062086b824d01963d2a507d4e59",
+  "prompts": {},
+  "sessions": {
+    "s_a529d97b04ee8d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e636aa40-01b9-46e0-a6ac-2e827a24c073",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
