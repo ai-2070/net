@@ -322,8 +322,15 @@ async fn run_send_blob(args: SendBlobArgs, output: Option<OutputFormat>) -> Resu
         // short form is unambiguous).
         BlobRef::Small { hash, .. } => (Some(hex::encode(hash)), 1u64),
         BlobRef::Manifest { chunks, .. } => (None, chunks.len() as u64),
-        // `store_blob_reader` only ever yields Small / Manifest.
-        BlobRef::Tree { .. } => (None, 0),
+        // `store_blob_reader` only ever yields Small / Manifest. Surface a
+        // Tree as a hard error rather than fabricating `chunks: 0` — an
+        // invariant break should fail loudly, not emit wrong output.
+        BlobRef::Tree { .. } => {
+            return Err(sdk(
+                "internal: store_blob_reader yielded a Tree BlobRef \
+                 (it only produces Small / Manifest) — please report",
+            ));
+        }
     };
 
     let view = SendBlobView {
