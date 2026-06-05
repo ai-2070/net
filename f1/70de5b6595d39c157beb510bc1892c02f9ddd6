@@ -1,0 +1,19 @@
+web/src/app/sitemap.ts
+  s_e802155ff9ef32::t_977c7e12cc3735 2,13-24,30,41,47-50
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "f170de5b6595d39c157beb510bc1892c02f9ddd6",
+  "prompts": {},
+  "sessions": {
+    "s_e802155ff9ef32": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4e7ed794-33fe-4781-8585-c1e89f2c852c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
