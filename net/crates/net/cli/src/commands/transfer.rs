@@ -326,10 +326,8 @@ async fn run_send_blob(args: SendBlobArgs, output: Option<OutputFormat>) -> Resu
         // Tree as a hard error rather than fabricating `chunks: 0` — an
         // invariant break should fail loudly, not emit wrong output.
         BlobRef::Tree { .. } => {
-            return Err(sdk(
-                "internal: store_blob_reader yielded a Tree BlobRef \
-                 (it only produces Small / Manifest) — please report",
-            ));
+            return Err(sdk("internal: store_blob_reader yielded a Tree BlobRef \
+                 (it only produces Small / Manifest) — please report"));
         }
     };
 
