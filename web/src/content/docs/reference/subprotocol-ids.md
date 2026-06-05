@@ -4,12 +4,12 @@ Every Net packet carries a 16-bit `subprotocol_id` in its header. The id tells t
 
 ## ID space
 
-The space is 16 bits — 65,536 IDs. The substrate has carved out the first `0x2000` for its own use; vendors get most of the rest; the top `0x1000` is for experiments that don't need a permanent assignment.
+The space is 16 bits — 65,536 IDs. The substrate has carved out the first `0x2200` for its own use; vendors get most of the rest; the top `0x1000` is for experiments that don't need a permanent assignment.
 
 | ID                 | Purpose                                                    |
 |--------------------|------------------------------------------------------------|
 | `0x0000`           | Plain events — no subprotocol, raw payload                 |
-| `0x0001..=0x1FFF`  | Reserved for substrate / core protocols (see assignments below) |
+| `0x0001..=0x21FF`  | Reserved for substrate / core protocols (see assignments below) |
 | `0x0400`           | Causal events                                              |
 | `0x0401`           | State snapshots                                            |
 | `0x0500`           | Daemon migration                                           |
@@ -31,8 +31,8 @@ The space is 16 bits — 65,536 IDs. The substrate has carved out the first `0x2
 | `0x0F00`           | MeshDB federated query                                     |
 | `0x1000`           | Fold framework dispatch (typed fold envelopes, `kind` selects the fold)  |
 | `0x1100`           | Blob transfer (content-addressed fetch over scheduled streams) |
-| `0x1200..=0x1FFF`  | Reserved for future substrate subprotocols                 |
-| `0x2000..=0xEFFF`  | Vendor / third-party                                       |
+| `0x1200..=0x21FF`  | Reserved for future substrate subprotocols                 |
+| `0x2200..=0xEFFF`  | Vendor / third-party                                       |
 | `0xF000..=0xFFFF`  | Experimental / ephemeral                                   |
 
 ## The opaque-forwarding guarantee
@@ -103,7 +103,7 @@ let migration_targets = capability_index.query(&filter);
 
 The process is the same whether you're adding to core or to a vendor extension:
 
-1. **Pick an id.** Core subprotocols go into `0x0001..=0x1FFF` — by convention each new subsystem claims a `0xXY00` base and uses the low byte for variants (e.g. `0x0B00` / `0x0B01` / `0x0B02` for the stream-window family). Vendor extensions go into `0x2000..=0xEFFF`. Experimental work goes into `0xF000..=0xFFFF`.
+1. **Pick an id.** Core subprotocols go into `0x0001..=0x21FF` — by convention each new subsystem claims a `0xXY00` base and uses the low byte for variants (e.g. `0x0B00` / `0x0B01` / `0x0B02` for the stream-window family). Vendor extensions go into `0x2200..=0xEFFF`. Experimental work goes into `0xF000..=0xFFFF`.
 2. **Define a descriptor.** Name, version, `min_compatible`. The version pair tracks breaking changes (major) and backward-compatible changes (minor).
 3. **Register a handler.** `SubprotocolRegistry::register(descriptor)`; the dispatch surface picks up the registration.
 4. **Enrich capabilities.** Once the handler is registered, `enrich_capabilities()` will add the `subprotocol:0x<id>` tag automatically.
