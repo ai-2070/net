@@ -17,7 +17,9 @@ use serde_json::json;
 use tempfile::TempDir;
 
 fn snapshot_json() -> Vec<u8> {
-    let input = r#"{"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer"}},"required":["query"]}"#;
+    // `sort-order` is a non-identifier property → sanitized attr `sort_order`
+    // + `Field(alias="sort-order")`; exercises the populate_by_name path.
+    let input = r#"{"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer"},"sort-order":{"type":"string"}},"required":["query"]}"#;
     let output = r##"{"type":"object","properties":{"results":{"type":"array","items":{"$ref":"#/$defs/Result"}}},"$defs":{"Result":{"type":"object","properties":{"url":{"type":"string"},"title":{"type":"string"}},"required":["url","title"]}}}"##;
     let snapshot = json!({
         "format_version": 1,
@@ -128,7 +130,9 @@ fn generated_python_compiles_and_typechecks() {
         \n\
         \n\
         def build() -> AcmeWebSearchRequest:\n\
-        \x20   return AcmeWebSearchRequest(query=\"net mesh\", max_results=5)\n\
+        \x20   # Omits the optional max_results / sort-order: optional fields\n\
+        \x20   # must be omittable under mypy --strict (the .pyi default fix).\n\
+        \x20   return AcmeWebSearchRequest(query=\"net mesh\")\n\
         \n\
         \n\
         def count(res: AcmeWebSearchResponse) -> int:\n\
@@ -157,9 +161,35 @@ fn generated_python_compiles_and_typechecks() {
         String::from_utf8_lossy(&parse.stderr)
     );
 
-    // (2) mypy --strict — only when mypy + pydantic are available.
     let have_mypy = tool_available(&py, &["-m", "mypy", "--version"]);
     let have_pydantic = tool_available(&py, &["-c", "import pydantic"]);
+
+    // (2) Runtime gate — construct the model by the *safe attr name* of an
+    // aliased field and round-trip through `model_dump(by_alias=True)`. This
+    // only works when `populate_by_name=True` is emitted; without it Pydantic
+    // rejects construction by attr name, so this is the regression guard.
+    if have_pydantic {
+        let probe = Command::new(&py)
+            .args([
+                "-c",
+                "from generated.acme_web_search import AcmeWebSearchRequest\n\
+                 r = AcmeWebSearchRequest(query='q', sort_order='asc')\n\
+                 d = r.model_dump(exclude_none=True, by_alias=True)\n\
+                 assert d['sort-order'] == 'asc', d\n\
+                 assert d['query'] == 'q', d\n",
+            ])
+            .current_dir(work.path())
+            .output()
+            .expect("run pydantic runtime probe");
+        assert!(
+            probe.status.success(),
+            "pydantic rejected construction by attr name (populate_by_name missing?):\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&probe.stdout),
+            String::from_utf8_lossy(&probe.stderr)
+        );
+    }
+
+    // (3) mypy --strict — only when mypy + pydantic are available.
     if !have_mypy || !have_pydantic {
         eprintln!(
             "skipping E-3 mypy portion (mypy={have_mypy}, pydantic={have_pydantic}); syntax gate passed"

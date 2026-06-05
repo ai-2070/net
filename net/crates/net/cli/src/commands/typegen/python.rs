@@ -347,9 +347,10 @@ fn render_models_py(d: &ToolDescriptor, meta: &GenMeta, b: &Builder) -> String {
     out.push_str(&docstring_header(d, meta));
     out.push_str("from __future__ import annotations\n");
 
-    let needs_configdict = b.decls.iter().any(
-        |decl| matches!(decl, Decl::Class(c) if matches!(c.extra, Extra::Allow | Extra::Forbid)),
-    );
+    let needs_configdict = b
+        .decls
+        .iter()
+        .any(|decl| matches!(decl, Decl::Class(c) if class_needs_config(c)));
     let needs_field = b
         .decls
         .iter()
@@ -378,22 +379,39 @@ fn render_models_py(d: &ToolDescriptor, meta: &GenMeta, b: &Builder) -> String {
     out
 }
 
+/// Does this class need a `model_config = ConfigDict(...)` line? True when
+/// `additionalProperties` was specified (`extra=`) or any field carries an
+/// alias (`populate_by_name=True`, so the model can be constructed by the
+/// safe attribute name — what the `.pyi` stub advertises — not just the
+/// alias).
+fn class_needs_config(c: &ClassDecl) -> bool {
+    !matches!(c.extra, Extra::Default) || c.fields.iter().any(|f| f.alias.is_some())
+}
+
 fn render_class_py(c: &ClassDecl) -> String {
     let mut s = format!("class {}({}):\n", c.name, c.bases.join(", "));
     if let Some(doc) = &c.doc {
         s.push_str(&format!("    \"\"\"{}\"\"\"\n", doc_safe(doc)));
     }
-    let has_config = match c.extra {
-        Extra::Allow => {
-            s.push_str("    model_config = ConfigDict(extra=\"allow\")\n");
-            true
-        }
-        Extra::Forbid => {
-            s.push_str("    model_config = ConfigDict(extra=\"forbid\")\n");
-            true
-        }
-        Extra::Default => false,
-    };
+    let mut config_args: Vec<&str> = Vec::new();
+    match c.extra {
+        Extra::Allow => config_args.push("extra=\"allow\""),
+        Extra::Forbid => config_args.push("extra=\"forbid\""),
+        Extra::Default => {}
+    }
+    // A non-identifier / keyword property name is exposed as a safe attr +
+    // `Field(alias=...)`; without `populate_by_name` Pydantic would reject
+    // construction by that attr name at runtime, contradicting the stub.
+    if c.fields.iter().any(|f| f.alias.is_some()) {
+        config_args.push("populate_by_name=True");
+    }
+    let has_config = !config_args.is_empty();
+    if has_config {
+        s.push_str(&format!(
+            "    model_config = ConfigDict({})\n",
+            config_args.join(", ")
+        ));
+    }
     let mut body = false;
     for f in &c.fields {
         body = true;
@@ -437,10 +455,13 @@ fn render_models_pyi(b: &Builder) -> String {
                     out.push_str("    ...\n");
                 } else {
                     for f in &c.fields {
-                        // `= ...` marks a default so the Pydantic mypy plugin
-                        // treats optional fields as optional in the
-                        // synthesized `__init__`.
-                        let default = if f.required { "" } else { " = ..." };
+                        // Optional fields get a real `= None` default. (`= ...`
+                        // would be read as Pydantic's *required* Ellipsis
+                        // sentinel by the mypy plugin, forcing callers to pass
+                        // every optional field.) Every optional field's
+                        // annotation already includes `| None`, so `None` is
+                        // assignable.
+                        let default = if f.required { "" } else { " = None" };
                         out.push_str(&format!(
                             "    {}: {}{}\n",
                             f.name,
@@ -772,6 +793,20 @@ mod tests {
     }
 
     #[test]
+    fn pyi_optional_field_defaults_to_none_not_ellipsis() {
+        let d = descriptor(
+            r#"{"type":"object","properties":{"q":{"type":"string"},"limit":{"type":"integer"}},"required":["q"]}"#,
+            None,
+        );
+        let t = render_tool(&d, &meta()).expect("render");
+        // `= ...` is Pydantic's *required* sentinel to the mypy plugin; an
+        // optional field must use a real `= None` default so callers can omit it.
+        assert!(t.models_pyi.contains("limit: int | None = None"), "{}", t.models_pyi);
+        assert!(!t.models_pyi.contains("= ..."), "{}", t.models_pyi);
+        assert!(t.models_pyi.contains("q: str\n"), "{}", t.models_pyi);
+    }
+
+    #[test]
     fn enum_and_invalid_field_name() {
         let d = descriptor(
             r#"{"type":"object","properties":{"mode":{"enum":["fast","slow"]},"weird-name":{"type":"string"}},"required":["mode","weird-name"]}"#,
@@ -783,10 +818,33 @@ mod tests {
         assert!(py.contains("Literal"), "{py}");
         assert!(py.contains(r#"mode: Literal["fast", "slow"]"#), "{py}");
         // Invalid identifier → sanitized attr + Field(alias=...).
-        assert!(py.contains("from pydantic import BaseModel, Field"), "{py}");
+        assert!(py.contains("from pydantic import BaseModel, ConfigDict, Field"), "{py}");
         assert!(
             py.contains(r#"weird_name: str = Field(alias="weird-name")"#),
             "{py}"
+        );
+        // populate_by_name so the model is constructible by the safe attr
+        // name the .pyi advertises (not only by the alias).
+        assert!(
+            py.contains("model_config = ConfigDict(populate_by_name=True)"),
+            "{py}"
+        );
+    }
+
+    #[test]
+    fn alias_config_merges_with_extra() {
+        // additionalProperties:false (→ extra="forbid") plus an aliased field
+        // must yield a single merged ConfigDict.
+        let d = descriptor(
+            r#"{"type":"object","properties":{"weird-name":{"type":"string"}},"required":["weird-name"],"additionalProperties":false}"#,
+            None,
+        );
+        let t = render_tool(&d, &meta()).expect("render");
+        assert!(
+            t.models_py
+                .contains(r#"model_config = ConfigDict(extra="forbid", populate_by_name=True)"#),
+            "{}",
+            t.models_py
         );
     }
 
