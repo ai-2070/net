@@ -37,7 +37,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
 
   const staticPages: MetadataRoute.Sitemap = [
     {
-      url: `${globals.site.href}/`,
+      url: globals.site.href,
       lastModified: now,
       changeFrequency: "weekly",
       priority: 1,
