@@ -256,7 +256,7 @@ fn render_inline_object(obj: &schema::ObjectSchema, ctx: &Ctx) -> String {
         return match &obj.additional {
             Additional::Typed(t) => format!("Record<string, {}>", render_type(t, ctx)),
             Additional::Denied => "Record<string, never>".into(),
-            Additional::Allowed => "Record<string, unknown>".into(),
+            Additional::Allowed | Additional::Unspecified => "Record<string, unknown>".into(),
         };
     }
     let mut fields: Vec<String> = obj
@@ -274,7 +274,7 @@ fn render_inline_object(obj: &schema::ObjectSchema, ctx: &Ctx) -> String {
     match &obj.additional {
         Additional::Typed(t) => fields.push(format!("[key: string]: {}", render_type(t, ctx))),
         Additional::Allowed => fields.push("[key: string]: unknown".into()),
-        Additional::Denied => {}
+        Additional::Denied | Additional::Unspecified => {}
     }
     format!("{{ {} }}", fields.join("; "))
 }

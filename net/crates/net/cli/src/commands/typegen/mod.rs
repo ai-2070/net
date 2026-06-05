@@ -17,6 +17,7 @@
 //! `ts.rs` / `python.rs` render it). The CLI plumbs source → codegen →
 //! disk.
 
+mod python;
 mod schema;
 mod ts;
 
@@ -226,11 +227,7 @@ async fn run_generate(
 
     let files = match args.language {
         Language::Ts => ts::generate(&usable, &meta, &mut skipped)?,
-        Language::Python => {
-            return Err(generic(
-                "python codegen is not implemented yet (TYPEGEN_CLI_PLAN Gap C)",
-            ))
-        }
+        Language::Python => python::generate(&usable, &meta, &mut skipped)?,
     };
 
     let written = write_generated(&args.out, &files).await?;

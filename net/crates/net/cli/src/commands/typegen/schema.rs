@@ -64,9 +64,14 @@ pub struct ObjectSchema {
 /// `additionalProperties` handling.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Additional {
+    /// `additionalProperties` absent. JSON Schema's default is "open", but
+    /// for codegen we treat it as "don't add extras" so generated types
+    /// stay strict — most tool schemas omit the keyword without intending
+    /// an open object.
+    Unspecified,
     /// `additionalProperties: false` — closed object.
     Denied,
-    /// `additionalProperties: true` or absent — open object, untyped extras.
+    /// `additionalProperties: true` — explicitly open, untyped extras.
     Allowed,
     /// `additionalProperties: <schema>` — open object, typed extras.
     Typed(Box<Schema>),
@@ -220,7 +225,8 @@ fn parse_object(obj: &serde_json::Map<String, Value>) -> Result<ObjectSchema, Sc
         _ => BTreeSet::new(),
     };
     let additional = match obj.get("additionalProperties") {
-        None | Some(Value::Bool(true)) => Additional::Allowed,
+        None => Additional::Unspecified,
+        Some(Value::Bool(true)) => Additional::Allowed,
         Some(Value::Bool(false)) => Additional::Denied,
         Some(schema) => Additional::Typed(Box::new(parse_node(schema)?)),
     };
