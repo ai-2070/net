@@ -56,6 +56,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "wire-format",
       "replication-config",
       "error-codes",
+      "cli",
     ],
     tutorials: [
       "fleet-telemetry",
@@ -130,6 +131,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "reference/wire-format": "Wire Format",
     "reference/replication-config": "Replication Configuration",
     "reference/error-codes": "Error Codes",
+    "reference/cli": "CLI Reference",
 
     // Tutorials
     "tutorials/fleet-telemetry": "Fleet Telemetry",
