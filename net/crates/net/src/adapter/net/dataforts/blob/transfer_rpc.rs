@@ -1,19 +1,19 @@
 //! `blob.transfers` RPC service + client — operator-introspection surface
-//! over a node's [`BlobTransferEngine`].
+//! over a node's `BlobTransferEngine`.
 //!
 //! Mirrors the `aggregator.registry` pattern (postcard-encoded request /
-//! response enums, an [`RpcHandler`] holding the live engine, a pure-fn
-//! `answer` for unit testing, and a typed client wrapping
-//! [`typed_call`]). It powers `net transfer ls / status / cancel`: a
-//! remote-attached client asks a daemon's engine what it is currently
-//! fetching and can cancel a specific transfer.
+//! response enums, an `RpcHandler` holding the live engine, a pure-fn
+//! `answer` for unit testing, and a typed client wrapping `typed_call`).
+//! It powers `net transfer ls / status / cancel`: a remote-attached client
+//! asks a daemon's engine what it is currently fetching and can cancel a
+//! specific transfer.
 //!
 //! # Receiver-side only
 //!
 //! The engine tracks **requester-side** in-flight transfers (what this
 //! node is fetching). Serving tasks are fire-and-forget and not tracked,
 //! so `ls` reflects fetches, not what the node serves. See
-//! [`BlobTransferEngine::list_pending`].
+//! `BlobTransferEngine::list_pending`.
 
 use std::sync::Arc;
 use std::time::Duration;
