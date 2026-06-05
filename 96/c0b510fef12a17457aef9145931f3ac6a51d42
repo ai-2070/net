@@ -1,0 +1,34 @@
+net/crates/net/cli/src/commands/typegen/python.rs
+  s_a529d97b04ee8d::t_bb76e74753c62c 510-513,517,522
+  s_a529d97b04ee8d::t_273f4611cad2af 440-449
+  s_a529d97b04ee8d::t_69982a3c6b5052 418-419
+  s_a529d97b04ee8d::t_1c23fb74eb7c8d 384
+  s_a529d97b04ee8d::t_2aeccb48e1d4a4 574,580-583,587-591
+net/crates/net/cli/tests/typegen_downstream_python.rs
+  s_a529d97b04ee8d::t_58769ff92180db 1-186
+net/crates/net/docs/plans/TYPEGEN_CLI_PLAN.md
+  s_a529d97b04ee8d::t_c7c4115150d33b 55-56,58
+  s_a529d97b04ee8d::t_35015177f0eb54 3,5-11
+net/crates/net/cli/src/commands/typegen/ts.rs
+  s_a529d97b04ee8d::t_1ea23676f57c72 176-177
+net/crates/net/docs/cli/TYPEGEN.md
+  s_a529d97b04ee8d::t_fcc97d4a08a149 170-186,190-191
+net/crates/net/cli/tests/typegen_downstream_ts.rs
+  s_a529d97b04ee8d::t_a404dbaa45614e 1-150
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "96c0b510fef12a17457aef9145931f3ac6a51d42",
+  "prompts": {},
+  "sessions": {
+    "s_a529d97b04ee8d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e636aa40-01b9-46e0-a6ac-2e827a24c073",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
