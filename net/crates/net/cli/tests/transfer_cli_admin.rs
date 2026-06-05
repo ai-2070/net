@@ -144,3 +144,13 @@ async fn ls_without_attach_exits_invalid_args() {
         "expected InvalidArgs exit code for ls without attach"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_rejects_non_numeric_id() {
+    // The transfer-id is parsed to u64 before remote-attach is resolved, so
+    // a non-numeric id is a typed InvalidArgs (exit 2) with no holder.
+    let home = TempDir::new().expect("home");
+    let (code, _stdout, _stderr) =
+        run_transfer(&home, vec!["status".into(), "not-an-id".into()]).await;
+    assert_eq!(code, 2, "expected InvalidArgs exit code for a bad transfer-id");
+}
