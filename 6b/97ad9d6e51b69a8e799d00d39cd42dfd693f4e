@@ -1,0 +1,21 @@
+web/src/content/docs/reference/cli.md
+  s_c2219187d98495::t_5b2e20b210b8ea 163,166
+  s_c2219187d98495::t_0acb5cba1f96f7 153,156
+  s_c2219187d98495::t_b9a8085da1b07f 127,133-137,139
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "6b97ad9d6e51b69a8e799d00d39cd42dfd693f4e",
+  "prompts": {},
+  "sessions": {
+    "s_c2219187d98495": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2beba2b0-0a94-4ee2-8338-fba35f7c1a49",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
