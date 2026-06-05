@@ -152,5 +152,8 @@ async fn status_rejects_non_numeric_id() {
     let home = TempDir::new().expect("home");
     let (code, _stdout, _stderr) =
         run_transfer(&home, vec!["status".into(), "not-an-id".into()]).await;
-    assert_eq!(code, 2, "expected InvalidArgs exit code for a bad transfer-id");
+    assert_eq!(
+        code, 2,
+        "expected InvalidArgs exit code for a bad transfer-id"
+    );
 }
