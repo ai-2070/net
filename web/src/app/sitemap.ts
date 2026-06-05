@@ -2,6 +2,7 @@ import { statSync } from "node:fs";
 import type { MetadataRoute } from "next";
 import { getAllSlugs, resolveDoc } from "@/lib/docs";
 import { siteUrl } from "@/lib/site-url";
+import globals from "@/lib/globals";
 
 // Static SSG sitemap. Next emits this as /sitemap.xml at build time; every
 // docs path is enumerated from the same source of truth the pages use
@@ -23,18 +24,17 @@ function docLastModified(slug: string[], fallback: Date): Date {
 }
 
 export default function sitemap(): MetadataRoute.Sitemap {
-  const base = siteUrl();
   const now = new Date();
 
   const staticPages: MetadataRoute.Sitemap = [
     {
-      url: `${base}/`,
+      url: `${globals.site.href}/`,
       lastModified: now,
       changeFrequency: "weekly",
       priority: 1,
     },
     {
-      url: `${base}/docs`,
+      url: `${globals.site.href}/docs`,
       lastModified: now,
       changeFrequency: "weekly",
       priority: 0.8,
@@ -42,7 +42,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
   ];
 
   const docPages: MetadataRoute.Sitemap = getAllSlugs().map((slug) => ({
-    url: `${base}/docs/${slug.join("/")}`,
+    url: `${globals.site.href}/docs/${slug.join("/")}`,
     lastModified: docLastModified(slug, now),
     changeFrequency: "monthly",
     priority: 0.6,

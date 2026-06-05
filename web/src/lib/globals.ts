@@ -11,6 +11,9 @@ const globals = {
   isClient: typeof window !== "undefined",
   defaultTtl: 2 * 60 * 1000, // 2 minutes,
   email: "makerseven7@gmail.com",
+  site: {
+    href: "https://ai2070.net",
+  },
   links: {
     install: "/docs/start/quickstart",
   },
