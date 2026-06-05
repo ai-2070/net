@@ -182,6 +182,47 @@ async fn recv_dir_reconstructs_tree_atomically() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recv_dir_streams_a_large_multi_chunk_leaf() {
+    // A directory with one >4 MiB leaf exercises the streamed per-leaf
+    // write path (`fetch_blob_to_file`): the large file is reconstructed by
+    // writing chunks to disk as they arrive, never buffered whole. A small
+    // sibling covers the unchanged buffered (Small) fast path in the same
+    // run. Both must reconstruct byte-for-byte.
+    let src_dir = TempDir::new().expect("src");
+    let big: Vec<u8> = (0..(6 * 1024 * 1024usize))
+        .map(|i| (i.wrapping_mul(31) % 251) as u8)
+        .collect();
+    std::fs::write(src_dir.path().join("big.bin"), &big).expect("write big");
+    std::fs::write(src_dir.path().join("small.txt"), b"hello\n").expect("write small");
+
+    let (holder, manifest_ref) = boot_holder_with_dir(src_dir.path()).await;
+    let encoded = hex::encode(manifest_ref.encode());
+
+    let home = TempDir::new().expect("home");
+    let out_parent = TempDir::new().expect("out parent");
+    let out_path = out_parent.path().join("received_dir");
+
+    let mut args = vec![
+        "recv-dir".into(),
+        "--remote-ref".into(),
+        encoded,
+        "--out".into(),
+        out_path.display().to_string(),
+        "--output".into(),
+        "json".into(),
+    ];
+    args.extend(attach(&holder));
+
+    let (code, stdout, stderr) = run_transfer(&home, args).await;
+    assert_eq!(code, 0, "recv-dir failed: stderr={stderr}\nstdout={stdout}");
+
+    let got_big = std::fs::read(out_path.join("big.bin")).expect("read big");
+    assert_eq!(got_big, big, "large streamed leaf differs from source");
+    let got_small = std::fs::read(out_path.join("small.txt")).expect("read small");
+    assert_eq!(got_small, b"hello\n", "small leaf differs from source");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn send_dir_computes_matching_manifest_ref() {
     // `send-dir` and the holder's `store_dir` must derive the identical
     // content-addressed manifest reference (store_dir is deterministic

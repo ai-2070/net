@@ -2936,6 +2936,101 @@ pub struct RepairReport {
     pub replicated_leaves_skipped: u64,
 }
 
+/// Stream-chunk `reader` into content-addressed chunks and return the
+/// assembled [`BlobRef`] — the exact reference
+/// `chunk_payload(bytes).into_blob_ref(uri, encoding)` produces for the
+/// same bytes, but without ever holding the whole payload in memory (peak
+/// is one [`BLOB_CHUNK_SIZE_BYTES`] window).
+///
+/// When `adapter` is `Some`, every chunk is persisted via the adapter as
+/// it is read (the `net transfer send-blob --store` path); when `None`,
+/// the reference is computed without persisting anything (the dry
+/// `send-blob` path). Either way at most one chunk is buffered at a time.
+///
+/// Boundary parity with [`chunk_payload`]: a payload `≤
+/// BLOB_CHUNK_SIZE_BYTES` (including empty) yields a [`BlobRef::Small`];
+/// strictly larger yields a [`BlobRef::Manifest`]. A single chunk hashes
+/// the whole payload, so the `Small` hash matches `chunk_payload`'s
+/// `Inline` hash exactly.
+pub async fn store_blob_reader<R>(
+    adapter: Option<&MeshBlobAdapter>,
+    mut reader: R,
+    uri: impl Into<String>,
+    encoding: Encoding,
+) -> Result<BlobRef, BlobError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    let chunk_size = BLOB_CHUNK_SIZE_BYTES as usize;
+    let mut buf = vec![0u8; chunk_size];
+    let mut chunks: Vec<ChunkRef> = Vec::new();
+    let mut total: u64 = 0;
+
+    loop {
+        // Fill the window: read until it is full or the reader hits EOF.
+        // A fill shorter than `chunk_size` means EOF reached, so this is
+        // the last (possibly partial) chunk.
+        let mut filled = 0usize;
+        while filled < chunk_size {
+            let n = reader
+                .read(&mut buf[filled..])
+                .await
+                .map_err(|e| BlobError::Backend(format!("read source: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+
+        if filled == 0 {
+            // EOF with an empty window. If we have not emitted any chunk
+            // yet the payload is empty — emit the single empty chunk so the
+            // result matches `chunk_payload`'s Inline-empty shape. Otherwise
+            // the previous full window was the last chunk; just stop (don't
+            // append a spurious empty trailing chunk for an exactly-aligned
+            // payload, which would wrongly promote a Small to a Manifest).
+            if chunks.is_empty() {
+                let hash: [u8; 32] = blake3::hash(&[]).into();
+                if let Some(a) = adapter {
+                    a.store_chunk(&hash, &[]).await?;
+                }
+                chunks.push(ChunkRef { hash, size: 0 });
+            }
+            break;
+        }
+
+        let chunk = &buf[..filled];
+        let hash: [u8; 32] = blake3::hash(chunk).into();
+        if let Some(a) = adapter {
+            a.store_chunk(&hash, chunk).await?;
+        }
+        chunks.push(ChunkRef {
+            hash,
+            size: filled as u32,
+        });
+        total += filled as u64;
+
+        if filled < chunk_size {
+            break; // short read → last chunk
+        }
+        // Full window: loop again to see whether more bytes follow.
+    }
+
+    if chunks.len() <= 1 {
+        // `Small` (including the empty payload): a single chunk is the
+        // whole payload, so its hash is the content hash.
+        let hash = chunks
+            .first()
+            .map(|c| c.hash)
+            .unwrap_or_else(|| blake3::hash(&[]).into());
+        Ok(BlobRef::small(uri, hash, total))
+    } else {
+        BlobRef::manifest(uri, encoding, chunks)
+    }
+}
+
 #[async_trait]
 impl BlobAdapter for MeshBlobAdapter {
     fn adapter_id(&self) -> &str {
@@ -3781,6 +3876,47 @@ mod tests {
         adapter.store(&blob, &payload).await.unwrap();
         let fetched = adapter.fetch(&blob).await.unwrap();
         assert_eq!(fetched, payload);
+    }
+
+    #[tokio::test]
+    async fn store_blob_reader_matches_chunk_payload_across_boundaries() {
+        // The streaming store must produce the byte-identical BlobRef the
+        // buffered chunk_payload → into_blob_ref path yields, including at
+        // the Small/Manifest boundary (≤ one chunk = Small; strictly larger
+        // = Manifest) and for the empty payload. `None` adapter exercises
+        // the compute-only (dry) path.
+        let chunk = BLOB_CHUNK_SIZE_BYTES as usize;
+        let sizes = [0usize, 1, 100, chunk - 1, chunk, chunk + 1, 2 * chunk + 7];
+        for &n in &sizes {
+            let bytes: Vec<u8> = (0..n).map(|i| (i.wrapping_mul(31) % 251) as u8).collect();
+            let expected = chunk_payload(&bytes)
+                .expect("chunk_payload")
+                .into_blob_ref("mesh://x", Encoding::Replicated)
+                .expect("into_blob_ref");
+            let got = store_blob_reader(None, &bytes[..], "mesh://x", Encoding::Replicated)
+                .await
+                .expect("store_blob_reader");
+            assert_eq!(got, expected, "ref mismatch at size {n}");
+        }
+    }
+
+    #[tokio::test]
+    async fn store_blob_reader_persists_fetchable_chunks() {
+        // With an adapter, each chunk is stored as it streams; the assembled
+        // ref must fetch back byte-for-byte over the multi-chunk path.
+        let adapter = make_adapter();
+        let n = 2 * BLOB_CHUNK_SIZE_BYTES as usize + 1024; // spans 3 chunks
+        let bytes: Vec<u8> = (0..n).map(|i| (i.wrapping_mul(7) % 251) as u8).collect();
+
+        let blob = store_blob_reader(Some(&adapter), &bytes[..], "mesh://x", Encoding::Replicated)
+            .await
+            .expect("store_blob_reader");
+        assert!(
+            matches!(blob, BlobRef::Manifest { .. }),
+            "expected a Manifest for a 3-chunk payload"
+        );
+        let fetched = adapter.fetch(&blob).await.expect("fetch");
+        assert_eq!(&fetched[..], &bytes[..]);
     }
 
     #[tokio::test]

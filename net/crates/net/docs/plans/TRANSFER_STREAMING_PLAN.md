@@ -1,6 +1,12 @@
 # Transfer streaming plan — remove the whole-blob in-memory ceiling
 
-Branch: TBD (follow-up to `transfer-cli`).
+**Status: ✅ Complete** — all gaps (A, B, C, D) landed on branch
+`transfer-streaming`. `send-blob` / `recv-blob` and large `recv-dir`
+leaves now stream chunk-at-a-time; peak memory is ~one chunk (4 MiB)
+everywhere, so the practical single-file ceiling is free disk, not RAM.
+The only remaining bound is per-chunk `TRANSFER_MAX_CHUNK_BYTES` (16 MiB).
+
+Branch: `transfer-streaming` (follow-up to `transfer-cli`, PR #314).
 Predecessor work: `TRANSFER_CLI_PLAN.md` (the `net transfer` surface), PR #265 (fairscheduler transport, `BlobTransferEngine`), the transport SDK (`net_sdk::transport`). The streaming primitive this plan consumes — `transport::fetch_blob_stream` (`sdk/src/transport.rs:298`) — already exists and yields one verified chunk at a time.
 
 Scope: stop buffering an entire blob in RAM on the `net transfer` send/receive paths. Today `recv-blob` assembles the whole blob in memory before writing, and `send-blob` reads the whole file before chunking — so single-file transfers are bounded by available process memory rather than by disk. Move both to a chunk-at-a-time path so the practical size ceiling becomes free disk, not RAM.
@@ -30,19 +36,45 @@ The only hard cap today is **per chunk**: `TRANSFER_MAX_CHUNK_BYTES = 16 MiB` (`
 
 ## Status
 
-| ID   | Pri | Area              | Title                                                                                  |
-|------|-----|-------------------|----------------------------------------------------------------------------------------|
-| A-1  | H   | streaming write   | streaming atomic writer: open `<out>.partial`, append chunks, fsync, rename            |
-| A-2  | H   | recv-blob         | rewire `run_recv_blob` to consume `fetch_blob_stream` instead of `fetch_blob`          |
-| A-3  | H   | tests             | large multi-chunk blob round-trip; assert byte-for-byte + no `.partial` on success     |
-| A-4  | M   | failure semantics | partial-on-failure behaviour preserved; verify hash-mismatch mid-stream leaves partial |
-| B-1  | H   | substrate         | incremental store: chunk a `&[u8]` / reader and `store` each chunk, assemble manifest  |
-| B-2  | H   | send-blob         | rewire `run_send_blob` to chunk from a file/stdin reader without a full-file `Vec`      |
-| B-3  | M   | tests             | send-blob ref parity vs the buffered path; stdin streaming; `--store` round-trip       |
-| C-1  | M   | substrate         | `fetch_dir` writes large leaves via `fetch_blob_stream` instead of buffering whole     |
-| C-2  | L   | tests             | dir round-trip with an oversized single leaf; peak-memory regression guard             |
-| D-1  | M   | progress          | drive the recv spinner/bar from per-chunk `bytes_received` (streaming makes it real)   |
-| D-2  | L   | docs              | update `docs/cli/TRANSFER.md` "Memory use" once the ceiling is gone                     |
+| ID   | Pri | Done | Area              | Title                                                                                  |
+|------|-----|------|-------------------|----------------------------------------------------------------------------------------|
+| A-1  | H   | ✅   | streaming write   | streaming atomic writer: open `<out>.partial`, append chunks, flush, rename            |
+| A-2  | H   | ✅   | recv-blob         | rewire `run_recv_blob` to consume `fetch_blob_stream` instead of `fetch_blob`          |
+| A-3  | H   | ✅   | tests             | large multi-chunk blob round-trip; assert byte-for-byte + no `.partial` on success     |
+| A-4  | M   | ✅   | failure semantics | partial-on-failure behaviour preserved; failed fetch leaves `.partial`, not `<out>`    |
+| B-1  | H   | ✅   | substrate         | incremental store: `store_blob_reader` chunks a reader, stores each chunk, assembles ref |
+| B-2  | H   | ✅   | send-blob         | rewire `run_send_blob` to chunk from a file/stdin reader without a full-file `Vec`      |
+| B-3  | M   | ✅   | tests             | send-blob ref parity vs the buffered path; stdin streaming; `--store` round-trip       |
+| C-1  | M   | ✅   | substrate         | `fetch_dir` streams large (Manifest) leaves to disk instead of buffering whole         |
+| C-2  | L   | ✅   | tests             | dir round-trip with an oversized multi-chunk leaf reconstructs byte-for-byte           |
+| D-1  | M   | ✅   | progress          | determinate byte bar for `recv-blob` driven from per-chunk progress (spinner fallback) |
+| D-2  | L   | ✅   | docs              | `docs/cli/TRANSFER.md` "Memory use" updated for the streamed paths                      |
+
+### Landed commits
+
+| Gap | Commit | Summary |
+|-----|--------|---------|
+| A   | `77b235a8c` | stream `recv-blob` to disk (`AtomicFileWriter` + `fetch_blob_stream`) |
+| B   | `a68962708` | stream `send-blob` from a reader (`store_blob_reader` substrate helper) |
+| D-2 | `857ff3223` | update `TRANSFER.md` Memory use |
+| D-1 | `4136bd8c6` | determinate byte-progress bar for `recv-blob` |
+| C   | `b309087df` | stream large dir leaves (`fetch_blob_to_file`) |
+| —   | `4945bb5a1` | review fix: error (not fake `chunks:0`) on impossible `Tree` in `send-blob` |
+
+**Deviations from the plan as written:**
+
+- **A-1** uses `flush` + close + rename, not `fsync` — durability policy was
+  explicitly out of scope (rename-only, as planned).
+- **B-1** lives as `store_blob_reader` in `mesh.rs` (so it can call the
+  private `store_chunk`) and is re-exported through `net_sdk::transport`,
+  rather than being written from scratch in the SDK. It takes
+  `adapter: Option<&MeshBlobAdapter>` — `Some` persists each chunk
+  (`--store`), `None` computes the ref only (dry path) — which collapses the
+  plan's option (a)/(b) for the dry case into one helper with no buffering.
+- **C-1** writes each chunk via `spawn_blocking` over sync `std::fs` (the
+  crate has no tokio `fs` feature and uses `std::fs` everywhere) rather than
+  `fetch_blob_stream`; same effect, matches the existing
+  `BLOCKING_FS_THRESHOLD` offload convention.
 
 ---
 

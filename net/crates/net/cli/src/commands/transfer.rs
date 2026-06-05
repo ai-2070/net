@@ -43,8 +43,8 @@ use crate::error::{generic, invalid_args, sdk, CliError};
 use crate::parsers::parse_u64_flexible;
 use crate::prelude::{emit_value, OutputFormat};
 
-use net_sdk::dataforts::{BlobAdapter, MeshBlobAdapter, Redex};
-use net_sdk::transport::{self, BlobRef, ChunkedPayload, Encoding};
+use net_sdk::dataforts::{MeshBlobAdapter, Redex};
+use net_sdk::transport::{self, BlobRef, Encoding};
 
 #[derive(Subcommand, Debug)]
 pub enum TransferCommand {
@@ -230,30 +230,50 @@ async fn run_recv_blob(
         Arc::new(MeshBlobAdapter::new("recv", Arc::new(Redex::new()))),
     );
 
-    let spinner = Progress::start(
-        &format!("fetching blob from peer {source}"),
-        progress_enabled(output, quiet),
-    );
+    // A determinate byte bar when the total size is known up front (a
+    // Manifest ref, or a Small ref carrying its size); a spinner otherwise
+    // (e.g. a bare-hash `--blob-ref`, whose size is unknown on the wire).
+    let label = format!("fetching blob from peer {source}");
+    let enabled = progress_enabled(output, quiet);
+    let declared = blob_ref.size();
+    let progress = if declared > 0 {
+        Progress::start_bytes(&label, declared, enabled)
+    } else {
+        Progress::start(&label, enabled)
+    };
     let started = Instant::now();
-    let bytes = transport::fetch_blob(mesh, source, &blob_ref)
-        .await
-        .map_err(|e| {
+    // Stream the blob chunk-by-chunk straight to disk rather than
+    // assembling the whole payload in RAM first: peak memory is ~one chunk,
+    // so the practical size ceiling is free disk, not process memory.
+    // `fetch_blob_stream` yields verified chunks in manifest order, so
+    // writing them sequentially preserves integrity (no whole-blob rehash).
+    use futures::StreamExt as _;
+    // `fetch_blob_stream` returns a `!Unpin` stream (an `unfold`), so pin it
+    // on the stack before polling with `next()`.
+    let mut stream = std::pin::pin!(transport::fetch_blob_stream(mesh, source, &blob_ref));
+    let mut writer = AtomicFileWriter::create(&args.out).await?;
+    let mut total: u64 = 0;
+    while let Some(item) = stream.next().await {
+        let chunk = item.map_err(|e| {
             sdk(format!(
                 "fetch_blob from peer {source} failed: {e}{}",
                 relay_hint(source, attached)
             ))
         })?;
+        total += chunk.len() as u64;
+        progress.inc(chunk.len() as u64);
+        writer.write_chunk(&chunk).await?;
+    }
+    writer.commit().await?;
     let elapsed = started.elapsed();
-    spinner.finish();
-
-    write_atomic(&args.out, &bytes).await?;
+    progress.finish();
 
     let view = RecvBlobView {
         peer: source,
         out: args.out.display().to_string(),
-        bytes: bytes.len() as u64,
+        bytes: total,
         duration_secs: elapsed.as_secs_f64(),
-        throughput_mib_s: throughput_mib_s(bytes.len() as u64, elapsed),
+        throughput_mib_s: throughput_mib_s(total, elapsed),
     };
     emit_value(OutputFormat::resolve_oneshot(output), &view)
         .map_err(|e| generic(format!("write recv-blob result: {e}")))?;
@@ -263,43 +283,62 @@ async fn run_recv_blob(
 // ── send-blob ───────────────────────────────────────────────────────
 
 async fn run_send_blob(args: SendBlobArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
-    let bytes = read_source(&args.path).await?;
-
-    // Compute the content-addressed reference: `chunk_payload` decides
-    // inline (single-chunk) vs chunked, then `into_blob_ref` finalizes a
-    // Small / Manifest `BlobRef` — the exact value `recv-blob` fetches by.
-    let chunked =
-        transport::chunk_payload(&bytes).map_err(|e| sdk(format!("chunk payload: {e}")))?;
-    let (small_hash, chunk_count) = match &chunked {
-        ChunkedPayload::Inline { hash, .. } => (Some(hex::encode(hash)), 1usize),
-        ChunkedPayload::Chunked { chunks, .. } => (None, chunks.len()),
-    };
-    let blob_ref = chunked
-        .into_blob_ref("mesh://transfer", Encoding::Replicated)
-        .map_err(|e| sdk(format!("build blob ref: {e}")))?;
-
-    let staged = match args.store.as_deref() {
-        Some(dir) => {
-            let adapter = persistent_adapter(dir, "send-blob").await?;
-            adapter
-                .store(&blob_ref, &bytes)
-                .await
-                .map_err(|e| sdk(format!("stage blob into {}: {e}", dir.display())))?;
-            Some(dir.display().to_string())
-        }
+    // Stage destination: a persistent adapter when `--store` is given, else
+    // `None` — a dry run that computes the reference without persisting.
+    let adapter = match args.store.as_deref() {
+        Some(dir) => Some(persistent_adapter(dir, "send-blob").await?),
         None => None,
+    };
+
+    // Stream the source chunk-at-a-time into the content-addressed
+    // reference (and, with `--store`, into the adapter as each chunk is
+    // read) so the whole file is never held in memory. `store_blob_reader`
+    // returns the exact `BlobRef` the buffered `chunk_payload` path would —
+    // the value `recv-blob` fetches by.
+    let blob_ref = if args.path.as_os_str() == "-" {
+        transport::store_blob_reader(
+            adapter.as_deref(),
+            tokio::io::stdin(),
+            "mesh://transfer",
+            Encoding::Replicated,
+        )
+        .await
+    } else {
+        let file = tokio::fs::File::open(&args.path)
+            .await
+            .map_err(|e| generic(format!("open {}: {e}", args.path.display())))?;
+        transport::store_blob_reader(
+            adapter.as_deref(),
+            file,
+            "mesh://transfer",
+            Encoding::Replicated,
+        )
+        .await
+    }
+    .map_err(|e| sdk(format!("send blob from {}: {e}", args.path.display())))?;
+
+    let (small_hash, chunk_count) = match &blob_ref {
+        // Bare chunk hash, present only for a single-chunk blob (so the
+        // short form is unambiguous).
+        BlobRef::Small { hash, .. } => (Some(hex::encode(hash)), 1u64),
+        BlobRef::Manifest { chunks, .. } => (None, chunks.len() as u64),
+        // `store_blob_reader` only ever yields Small / Manifest. Surface a
+        // Tree as a hard error rather than fabricating `chunks: 0` — an
+        // invariant break should fail loudly, not emit wrong output.
+        BlobRef::Tree { .. } => {
+            return Err(sdk("internal: store_blob_reader yielded a Tree BlobRef \
+                 (it only produces Small / Manifest) — please report"));
+        }
     };
 
     let view = SendBlobView {
         // Full-fidelity reference: works for single- and multi-chunk
         // content. `recv-blob --blob-ref <this>` decodes it back.
         blob_ref: hex::encode(blob_ref.encode()),
-        // Convenience: the bare chunk hash, present only for a
-        // single-chunk blob (so the short form is unambiguous).
         hash: small_hash,
-        size: bytes.len() as u64,
-        chunks: chunk_count as u64,
-        staged_to: staged,
+        size: blob_ref.size(),
+        chunks: chunk_count,
+        staged_to: args.store.as_deref().map(|d| d.display().to_string()),
     };
     emit_value(OutputFormat::resolve_oneshot(output), &view)
         .map_err(|e| generic(format!("write send-blob result: {e}")))?;
@@ -610,46 +649,68 @@ async fn persistent_adapter(
     ))
 }
 
-/// Read the send source: a file path, or stdin when the path is `-`.
-async fn read_source(path: &std::path::Path) -> Result<Vec<u8>, CliError> {
-    if path.as_os_str() == "-" {
-        use tokio::io::AsyncReadExt as _;
-        let mut buf = Vec::new();
-        tokio::io::stdin()
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|e| generic(format!("read stdin: {e}")))?;
-        Ok(buf)
-    } else {
-        tokio::fs::read(path)
-            .await
-            .map_err(|e| generic(format!("read {}: {e}", path.display())))
-    }
+/// Streaming temp-and-rename atomic writer: open `<out>.partial`, append
+/// chunks as they arrive, then flush + rename over `<out>` on
+/// [`Self::commit`]. A reader never observes a half-written target; on any
+/// failure (the writer is dropped without committing) the `.partial` is
+/// left in place for inspection — matching `fetch_dir`'s temp-and-rename
+/// semantics and `TRANSFER.md` §5.
+struct AtomicFileWriter {
+    partial: PathBuf,
+    out: PathBuf,
+    file: tokio::fs::File,
 }
 
-/// Write `bytes` to `out` atomically: write `<out>.partial` then rename
-/// over `out`. On failure the partial file is left for inspection (not
-/// auto-cleaned) — matching `fetch_dir`'s temp-and-rename semantics.
-async fn write_atomic(out: &std::path::Path, bytes: &[u8]) -> Result<(), CliError> {
-    let partial = partial_path(out);
-    if let Some(parent) = out.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| generic(format!("create out dir {}: {e}", parent.display())))?;
+impl AtomicFileWriter {
+    /// Create the parent directory (if any) and open `<out>.partial`.
+    async fn create(out: &std::path::Path) -> Result<Self, CliError> {
+        let partial = partial_path(out);
+        if let Some(parent) = out.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| generic(format!("create out dir {}: {e}", parent.display())))?;
+            }
         }
+        let file = tokio::fs::File::create(&partial)
+            .await
+            .map_err(|e| generic(format!("create {}: {e}", partial.display())))?;
+        Ok(Self {
+            partial,
+            out: out.to_path_buf(),
+            file,
+        })
     }
-    tokio::fs::write(&partial, bytes)
-        .await
-        .map_err(|e| generic(format!("write {}: {e}", partial.display())))?;
-    tokio::fs::rename(&partial, out).await.map_err(|e| {
-        generic(format!(
-            "rename {} -> {}: {e} (partial left in place)",
-            partial.display(),
-            out.display()
-        ))
-    })?;
-    Ok(())
+
+    /// Append one chunk to the partial file.
+    async fn write_chunk(&mut self, bytes: &[u8]) -> Result<(), CliError> {
+        use tokio::io::AsyncWriteExt as _;
+        self.file
+            .write_all(bytes)
+            .await
+            .map_err(|e| generic(format!("write {}: {e}", self.partial.display())))
+    }
+
+    /// Flush the partial file, close it, and rename it over the
+    /// destination. Closing before the rename keeps the commit portable
+    /// (Windows refuses to rename a file that is still open).
+    async fn commit(mut self) -> Result<(), CliError> {
+        use tokio::io::AsyncWriteExt as _;
+        self.file
+            .flush()
+            .await
+            .map_err(|e| generic(format!("flush {}: {e}", self.partial.display())))?;
+        drop(self.file);
+        tokio::fs::rename(&self.partial, &self.out)
+            .await
+            .map_err(|e| {
+                generic(format!(
+                    "rename {} -> {}: {e} (partial left in place)",
+                    self.partial.display(),
+                    self.out.display()
+                ))
+            })
+    }
 }
 
 /// `<out>.partial` sibling path for the atomic write.
@@ -700,6 +761,37 @@ impl Progress {
         pb.enable_steady_tick(std::time::Duration::from_millis(120));
         pb.set_message(msg.to_string());
         Self(Some(pb))
+    }
+
+    /// Determinate byte-progress bar for a transfer whose total size is
+    /// known up front (a `Manifest` ref, or a `Small` ref that carries its
+    /// size). Advance it with [`Self::inc`] as each chunk lands. Falls back
+    /// to the same no-op-unless-TTY gating as [`Self::start`]; callers use
+    /// [`Self::start`] (a spinner) when the total is unknown.
+    fn start_bytes(msg: &str, total: u64, enabled: bool) -> Self {
+        use std::io::IsTerminal as _;
+        if !enabled || !std::io::stderr().is_terminal() {
+            return Self(None);
+        }
+        let pb = indicatif::ProgressBar::new(total);
+        pb.set_draw_target(indicatif::ProgressDrawTarget::stderr());
+        pb.enable_steady_tick(std::time::Duration::from_millis(120));
+        let style = indicatif::ProgressStyle::with_template(
+            "{msg} [{bar:30}] {bytes}/{total_bytes} ({bytes_per_sec})",
+        )
+        .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+        .progress_chars("=>-");
+        pb.set_style(style);
+        pb.set_message(msg.to_string());
+        Self(Some(pb))
+    }
+
+    /// Advance a determinate bar by `n` bytes. No-op for a spinner or a
+    /// disabled (`None`) progress handle.
+    fn inc(&self, n: u64) {
+        if let Some(pb) = &self.0 {
+            pb.inc(n);
+        }
     }
 
     /// Clear the spinner before emitting the success summary. Idempotent,
