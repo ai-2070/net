@@ -257,11 +257,29 @@ fn diff_objects(
                 // A field that is an inline object on both sides is compared
                 // recursively, so a breaking change *inside* the nested object
                 // (e.g. a required sub-field added) surfaces with a dotted
-                // path. (Objects behind a `$ref` stay shallow — `Ref` is a
-                // leaf — so bump the tool version when evolving `$defs`.)
-                match (old_schema, new_schema) {
+                // path. Null is stripped first so a *nullable* object field
+                // (`object | null`) recurses too; its nullability transition is
+                // reported alongside. (Objects behind a `$ref` stay shallow —
+                // `Ref` is a leaf — so bump the tool version when evolving
+                // `$defs`.)
+                let (old_base, old_null) = strip_null(old_schema);
+                let (new_base, new_null) = strip_null(new_schema);
+                match (old_base, new_base) {
                     (Schema::Object(oo), Schema::Object(no)) => {
                         diff_objects(&path, oo, no, is_input, out);
+                        if old_null && !new_null {
+                            out.push(Change {
+                                path,
+                                detail: "nullable → non-nullable".into(),
+                                breaking: true,
+                            });
+                        } else if !old_null && new_null {
+                            out.push(Change {
+                                path,
+                                detail: "non-nullable → nullable".into(),
+                                breaking: false,
+                            });
+                        }
                     }
                     // Type / nullability / enum.
                     _ => {
@@ -570,6 +588,27 @@ mod tests {
             "expected nested breaking change, got {changes:?}"
         );
         assert_eq!(r.breaking_count, 1);
+    }
+
+    #[test]
+    fn detects_breaking_change_inside_nullable_object() {
+        // `address` is a *nullable* object (`object | null`); a required
+        // sub-field added inside it must still surface as breaking.
+        let old = r#"{"type":"object","properties":{"address":{"type":"object","nullable":true,"properties":{"zip":{"type":"string"}}}}}"#;
+        let new = r#"{"type":"object","properties":{"address":{"type":"object","nullable":true,"properties":{"zip":{"type":"string"},"city":{"type":"string"}},"required":["city"]}}}"#;
+        let r = diff(
+            &snap(vec![tool("t", "1.0.0", Some(old), None)]),
+            &snap(vec![tool("t", "1.1.0", Some(new), None)]),
+        );
+        assert_eq!(r.changed.len(), 1, "{:?}", r.changed);
+        assert!(
+            r.changed[0]
+                .changes
+                .iter()
+                .any(|c| c.path == "input.address.city" && c.breaking),
+            "expected nested breaking change in nullable object, got {:?}",
+            r.changed[0].changes
+        );
     }
 
     #[test]
