@@ -23,6 +23,7 @@ net-sdk = { package = "net-mesh-sdk", version = "0.27.0", path = "../sdk", defau
     "dataforts",
     "meshdb",
     "aggregator",
+    "tool",
 ] }
 
 # Clap derives the argv parser from typed structs; `env` enables

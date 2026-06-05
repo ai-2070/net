@@ -148,6 +148,9 @@ enum Command {
     /// Blob + directory transfer (recv/send/ls/status/cancel).
     #[command(subcommand)]
     Transfer(commands::transfer::TransferCommand),
+    /// Generate typed language bindings from discovered tool descriptors.
+    #[command(subcommand)]
+    Typegen(commands::typegen::TypegenCommand),
     /// Emit a shell-completion script (bash/zsh/fish/powershell).
     Completion(commands::completion::CompletionArgs),
     /// Emit the troff(1) man page on stdout.
@@ -237,6 +240,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Transfer(cmd) => {
             commands::transfer::run(cmd, output, config_path, profile, quiet).await
         }
+        Command::Typegen(cmd) => commands::typegen::run(cmd, output, config_path, profile).await,
         Command::Completion(args) => commands::completion::run::<Cli>(args),
         Command::Man => commands::man::run::<Cli>(),
     }
