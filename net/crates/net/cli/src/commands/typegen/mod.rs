@@ -118,6 +118,10 @@ pub struct DiffArgs {
     /// Updated snapshot to compare against the baseline.
     #[arg(long, value_name = "PATH")]
     pub to: PathBuf,
+    /// Exit non-zero (code 14) when any BREAKING change is detected — for
+    /// gating CI on schema evolution. The report is still printed.
+    #[arg(long)]
+    pub exit_code: bool,
 }
 
 // ── snapshot format ─────────────────────────────────────────────────
@@ -335,6 +339,16 @@ async fn run_diff(args: DiffArgs, output: Option<OutputFormat>) -> Result<(), Cl
         format => {
             emit_value(format, &report).map_err(|e| generic(format!("write typegen diff: {e}")))?;
         }
+    }
+
+    if args.exit_code && report.breaking_count > 0 {
+        return Err(CliError::new(
+            crate::error::ExitCodeKind::TypegenBreakingChanges,
+            format!(
+                "{} BREAKING schema change(s) detected",
+                report.breaking_count
+            ),
+        ));
     }
     Ok(())
 }

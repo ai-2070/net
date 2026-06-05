@@ -124,7 +124,13 @@ Schema changes (1):
 1 changed tool(s), 1 marked BREAKING.
 ```
 
-`diff` emits the structured report under `--output json` / `yaml`.
+`diff` emits the structured report under `--output json` / `yaml`. Pass
+`--exit-code` to make `diff` exit non-zero (code **14**) when any BREAKING
+change is detected — the report still prints, so it can gate a CI step:
+
+```sh
+$ net-mesh typegen diff --from committed.snapshot --to fresh.snapshot --exit-code
+```
 
 **What `[BREAKING]` means** (conservative — anything that could plausibly
 break a caller): a required field added, an optional field made required, a

@@ -102,4 +102,53 @@ fn diff_reports_additions_and_breaking_changes() {
     let rendered = String::from_utf8_lossy(&text.stdout);
     assert!(rendered.contains("Added tools (1):"), "{rendered}");
     assert!(rendered.contains("[BREAKING]"), "{rendered}");
+
+    // --exit-code: breaking changes present → exit 14, report still printed.
+    let gated = cli(&home)
+        .args([
+            "typegen",
+            "diff",
+            "--from",
+            from.to_str().expect("from"),
+            "--to",
+            to.to_str().expect("to"),
+            "--output",
+            "text",
+            "--exit-code",
+        ])
+        .output()
+        .expect("invoke");
+    assert_eq!(gated.status.code(), Some(14), "expected exit 14 on breaking change");
+    assert!(
+        String::from_utf8_lossy(&gated.stdout).contains("[BREAKING]"),
+        "report should still print under --exit-code"
+    );
+}
+
+#[test]
+fn diff_exit_code_zero_when_no_breaking_change() {
+    let home = TempDir::new().expect("home");
+    let work = TempDir::new().expect("work");
+    let from = work.path().join("old.snapshot");
+    let to = work.path().join("new.snapshot");
+
+    let old_input = r#"{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}"#;
+    // Only an optional field added — non-breaking.
+    let new_input = r#"{"type":"object","properties":{"q":{"type":"string"},"hint":{"type":"string"}},"required":["q"]}"#;
+    std::fs::write(&from, snapshot(json!([tool("acme/search", "1.0.0", old_input)]))).expect("old");
+    std::fs::write(&to, snapshot(json!([tool("acme/search", "1.1.0", new_input)]))).expect("new");
+
+    let out = cli(&home)
+        .args([
+            "typegen",
+            "diff",
+            "--from",
+            from.to_str().expect("from"),
+            "--to",
+            to.to_str().expect("to"),
+            "--exit-code",
+        ])
+        .output()
+        .expect("invoke");
+    assert!(out.status.success(), "non-breaking diff should exit 0 even with --exit-code");
 }

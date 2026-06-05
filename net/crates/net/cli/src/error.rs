@@ -12,9 +12,10 @@
 //! Codes 10–19 are reserved per subcommand. Each subcommand picks
 //! a base from this table and offsets within:
 //!
-//! - `net daemon` — 10 = factory-not-found
-//! - `net db`     — 11 = query-parse-failed
-//! - `net db`     — 12 = predicate-DSL-parse-failed
+//! - `net daemon`  — 10 = factory-not-found
+//! - `net db`      — 11 = query-parse-failed
+//! - `net db`      — 12 = predicate-DSL-parse-failed
+//! - `net typegen` — 14 = breaking schema change (diff --exit-code)
 //!
 //! New subcommand-specific codes get a documented offset under
 //! the subcommand's module + a row in this table.
@@ -63,6 +64,10 @@ pub enum ExitCodeKind {
     /// (operator's key + signature pair did not validate against
     /// the simulated envelope).
     IceSignatureInvalid = 13,
+    /// `net typegen diff --exit-code` — at least one BREAKING schema
+    /// change was detected between the two snapshots. Distinct from a
+    /// generic failure (1) so CI gates can `case $?` on it specifically.
+    TypegenBreakingChanges = 14,
 }
 
 /// Typed CLI error. Carries the exit-code discriminator + a
@@ -160,5 +165,6 @@ mod tests {
         assert_eq!(ExitCodeKind::DbQueryParseFailed as u8, 11);
         assert_eq!(ExitCodeKind::DbPredicateParseFailed as u8, 12);
         assert_eq!(ExitCodeKind::IceSignatureInvalid as u8, 13);
+        assert_eq!(ExitCodeKind::TypegenBreakingChanges as u8, 14);
     }
 }
