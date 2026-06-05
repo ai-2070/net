@@ -189,6 +189,21 @@ fetch concurrency keeps the transport saturated regardless of how the
 bytes are partitioned. The `recv-dir` summary reports
 `throughput_mib_s` for the run.
 
+### Memory use
+
+`send-blob` and `recv-blob` buffer the **whole blob in memory**: the
+publisher reads the entire source file before computing its reference, and
+the fetcher assembles the full blob in RAM before the atomic write. Budget
+roughly one blob's size of memory per concurrent `*-blob` invocation, and
+prefer the directory verbs for very large payloads.
+
+`send-dir` / `recv-dir` do **not** buffer the whole tree — they
+content-address and fetch leaf files individually, bounded by
+`--concurrency` (recv side), so peak memory tracks a handful of in-flight
+leaves rather than the total transfer size. A directory of many small
+files is therefore the memory-friendly shape; a single multi-gigabyte
+file is still held whole while its one leaf is in flight.
+
 ---
 
 ## 8. Scope (what this is not)
