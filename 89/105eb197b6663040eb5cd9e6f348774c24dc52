@@ -1,0 +1,25 @@
+net/crates/net/cli/src/commands/typegen/mod.rs
+  s_a529d97b04ee8d::t_3be7061e0a6eef 20
+  s_a529d97b04ee8d::t_8971242bcc959f 311-326
+  s_a529d97b04ee8d::t_9a0f0342ef0d07 338-349,366
+net/crates/net/cli/src/commands/typegen/diff.rs
+  s_a529d97b04ee8d::t_c61392a377fec1 1-140,142-302,304-462,464-466,468-538,540-545
+net/crates/net/cli/tests/typegen_cli_diff.rs
+  s_a529d97b04ee8d::t_a172dae2b42d1b 1-48,50-105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "89105eb197b6663040eb5cd9e6f348774c24dc52",
+  "prompts": {},
+  "sessions": {
+    "s_a529d97b04ee8d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e636aa40-01b9-46e0-a6ac-2e827a24c073",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
