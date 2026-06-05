@@ -187,8 +187,29 @@ jobs:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install dependencies
         run: npm i
+
+      # Generate the napi JS loader (`index.js`) + type defs
+      # (`index.d.ts`). Both are gitignored — produced by `napi
+      # build` from the `#[napi]` macro expansion, so a fresh
+      # checkout here lacks them. napi has no types-only mode, so we
+      # run the (faster) debug build purely for the generated
+      # `index.{js,d.ts}`: they are byte-identical to the release
+      # build's, and the throwaway host `.node` is removed below so
+      # it can't shadow the release binaries downloaded from the
+      # build matrix. Without this the published tarball is missing
+      # its declared `main`/`types` entry (`index.js`) and `build:ts`
+      # cannot resolve `./index`.
+      - name: Generate JS loader + type defs
+        run: npm run build:debug
+
+      - name: Drop throwaway debug binary
+        shell: bash
+        run: rm -f net.*.node
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
