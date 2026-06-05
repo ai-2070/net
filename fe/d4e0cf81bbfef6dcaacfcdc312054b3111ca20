@@ -1,0 +1,47 @@
+net/crates/net/cli/src/main.rs
+  s_a529d97b04ee8d::t_89f0fa3e6d209d 243
+  s_a529d97b04ee8d::t_b929cba7561a76 151-153
+net/crates/net/cli/src/commands/typegen/schema.rs
+  s_a529d97b04ee8d::t_881625d7b6e84d 1-172,174-180,182-295,300-306,313-355,357-358,362-385
+  s_a529d97b04ee8d::t_7fa78a2613014b 296-299,307-312,359-361
+  s_a529d97b04ee8d::t_b6c099fe3effc8 356
+  s_a529d97b04ee8d::t_56497ed6fb6e9a 173,181
+net/crates/net/cli/src/commands/mod.rs
+  s_a529d97b04ee8d::t_7f3613c86a787d 34
+net/crates/net/cli/tests/typegen_cli_ts.rs
+  s_a529d97b04ee8d::t_baaab9d84d7dfe 1-86,91-92,109-179
+  s_a529d97b04ee8d::t_7fa78a2613014b 87-90,93-108
+net/crates/net/cli/src/commands/typegen/mod.rs
+  s_a529d97b04ee8d::t_dfe7c32425cae3 344
+  s_a529d97b04ee8d::t_f4da4091c245fc 1-30,32-64,68-69,73-172,179-191,193-227,229-320,323-324,326-343,345-495,503-602
+  s_a529d97b04ee8d::t_6323a7d1496754 321-322,325
+  s_a529d97b04ee8d::t_b263a034080b0d 228
+  s_a529d97b04ee8d::t_7fa78a2613014b 173-178,496-502
+  s_a529d97b04ee8d::t_6589b514ab4442 65-67,70-72
+  s_a529d97b04ee8d::t_b3e6af0e7872b6 192
+  s_a529d97b04ee8d::t_039c7330b394dd 31
+net/crates/net/cli/Cargo.toml
+  s_a529d97b04ee8d::t_140059db873953 26
+net/crates/net/cli/src/commands/typegen/ts.rs
+  s_a529d97b04ee8d::t_c1cb8ebc76ff42 382-422,425,427-431,433-466,470-485,494-497,502,507-519
+  s_a529d97b04ee8d::t_826f9a6bfed6f9 432
+  s_a529d97b04ee8d::t_d4350ef88e19b3 167
+  s_a529d97b04ee8d::t_7fa78a2613014b 15,40,180-182,185-189,209-212,243,266-270,304-306,365,423-424,426,467-469,486-493,498-501,503-506
+  s_a529d97b04ee8d::t_d432103c85d523 1-14,16-39,41-166,168-179,183-184,190-208,213-242,244-265,271-303,307-364,366-381
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "fed4e0cf81bbfef6dcaacfcdc312054b3111ca20",
+  "prompts": {},
+  "sessions": {
+    "s_a529d97b04ee8d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e636aa40-01b9-46e0-a6ac-2e827a24c073",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
