@@ -226,6 +226,19 @@ async fn run_generate(
         })
         .collect();
 
+    // Distinct tool ids can sanitize to the same module basename and would
+    // silently overwrite each other's files; warn loudly rather than lose one.
+    for (base, ids) in basename_collisions(&usable) {
+        eprintln!(
+            "warning: tools {} all map to module `{base}` and will overwrite each \
+             other's output; rename a tool id to disambiguate.",
+            ids.iter()
+                .map(|id| format!("`{id}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     let files = match args.language {
         Language::Ts => ts::generate(&usable, &meta, &mut skipped)?,
         Language::Python => python::generate(&usable, &meta, &mut skipped)?,
@@ -440,6 +453,21 @@ fn filter_descriptors(
     filter_by_tools(by_tag, tools)
 }
 
+/// Groups of tool ids that sanitize to the same [`module_basename`] (only
+/// genuine collisions — groups of size ≥ 2 — are returned, sorted by basename
+/// for deterministic output).
+fn basename_collisions(descriptors: &[ToolDescriptor]) -> Vec<(String, Vec<String>)> {
+    let mut groups: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for d in descriptors {
+        groups
+            .entry(module_basename(&d.tool_id))
+            .or_default()
+            .push(d.tool_id.clone());
+    }
+    groups.into_iter().filter(|(_, ids)| ids.len() > 1).collect()
+}
+
 fn filter_by_tools(descriptors: Vec<ToolDescriptor>, tools: &[String]) -> Vec<ToolDescriptor> {
     if tools.is_empty() {
         descriptors
@@ -597,6 +625,36 @@ mod tests {
     fn civil_from_days_known_dates() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(18_993), (2022, 1, 1));
+    }
+
+    fn desc(tool_id: &str) -> ToolDescriptor {
+        ToolDescriptor {
+            tool_id: tool_id.into(),
+            name: tool_id.into(),
+            version: "1.0.0".into(),
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            requires: vec![],
+            estimated_time_ms: 0,
+            stateless: true,
+            streaming: false,
+            tags: vec![],
+            node_count: 1,
+        }
+    }
+
+    #[test]
+    fn basename_collisions_detects_only_clashing_ids() {
+        // `web-search` and `web_search` both sanitize to `web_search`.
+        let descriptors = vec![desc("acme/web-search"), desc("acme/web_search"), desc("acme/maps")];
+        let collisions = basename_collisions(&descriptors);
+        assert_eq!(collisions.len(), 1, "{collisions:?}");
+        assert_eq!(collisions[0].0, "acme_web_search");
+        assert_eq!(
+            collisions[0].1,
+            vec!["acme/web-search".to_string(), "acme/web_search".to_string()]
+        );
     }
 
     #[test]
