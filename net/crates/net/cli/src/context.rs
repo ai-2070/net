@@ -327,6 +327,26 @@ pub fn resolve_remote_attach(
     }))
 }
 
+/// Resolve remote-attach to a concrete [`RemoteAttach`], or fail with
+/// `missing` when no target is configured (flags + profile both empty).
+/// Shared by every remote-only verb (`aggregator`, `transfer`, `typegen`)
+/// so the resolve-then-require pattern lives in one place; `missing` lets
+/// each command phrase its own "needs a target" guidance.
+pub fn require_remote_attach(
+    profile: &Profile,
+    args: &crate::commands::aggregator::RemoteAttachArgs,
+    missing: impl FnOnce() -> CliError,
+) -> Result<RemoteAttach, CliError> {
+    resolve_remote_attach(
+        profile,
+        args.node_addr.as_deref(),
+        args.node_pubkey.as_deref(),
+        args.remote_node_id.as_deref(),
+        args.psk_hex.as_deref(),
+    )?
+    .ok_or_else(missing)
+}
+
 pub(crate) async fn load_identity_keypair(path: &Path) -> Result<EntityKeypair, CliError> {
     let text = tokio::fs::read_to_string(path).await.map_err(|e| {
         generic(format!(

@@ -38,7 +38,7 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::commands::aggregator::RemoteAttachArgs;
-use crate::context::{resolve_profile, resolve_remote_attach, CliContext, RemoteAttach};
+use crate::context::{resolve_profile, CliContext, RemoteAttach};
 use crate::error::{generic, invalid_args, sdk, CliError};
 use crate::parsers::parse_u64_flexible;
 use crate::prelude::{emit_value, OutputFormat};
@@ -617,14 +617,7 @@ fn require_remote_attach(
     args: &RemoteAttachArgs,
     verb: &str,
 ) -> Result<RemoteAttach, CliError> {
-    let resolved = resolve_remote_attach(
-        profile,
-        args.node_addr.as_deref(),
-        args.node_pubkey.as_deref(),
-        args.remote_node_id.as_deref(),
-        args.psk_hex.as_deref(),
-    )?;
-    resolved.ok_or_else(|| {
+    crate::context::require_remote_attach(profile, args, || {
         invalid_args(format!(
             "net transfer {verb} needs a holder target: pass --node-addr <IP:PORT> \
              --node-pubkey <HEX> --node-id <N> --psk-hex <HEX> (each can be defaulted \

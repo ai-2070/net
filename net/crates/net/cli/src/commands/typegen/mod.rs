@@ -29,7 +29,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::aggregator::RemoteAttachArgs;
-use crate::context::{resolve_profile, resolve_remote_attach, CliContext};
+use crate::context::{require_remote_attach, resolve_profile, CliContext};
 use crate::error::{generic, invalid_args, CliError};
 use crate::prelude::{emit_value, OutputFormat};
 
@@ -415,14 +415,7 @@ async fn fetch_live_source(
     profile_name: &str,
 ) -> Result<(Vec<ToolDescriptor>, GenMeta), CliError> {
     let profile = resolve_profile(config_path, profile_name).await?;
-    let remote = resolve_remote_attach(
-        &profile,
-        attach.node_addr.as_deref(),
-        attach.node_pubkey.as_deref(),
-        attach.remote_node_id.as_deref(),
-        attach.psk_hex.as_deref(),
-    )?
-    .ok_or_else(|| {
+    let remote = require_remote_attach(&profile, attach, || {
         invalid_args(
             "net typegen live discovery needs a mesh target: pass --node-addr <IP:PORT> \
              --node-pubkey <HEX> --node-id <N> --psk-hex <HEX> (each defaultable in the \
@@ -435,8 +428,17 @@ async fn fetch_live_source(
     // The fold populates asynchronously after attach. Poll until it
     // reports tools or the budget elapses, so a single-shot CLI doesn't
     // race discovery and emit an empty result.
-    let descriptors = discover_with_timeout(mesh, Duration::from_secs(5)).await;
-    let descriptors = filter_descriptors(descriptors, tags, tools);
+    let raw = discover_with_timeout(mesh, Duration::from_secs(5)).await;
+    // An empty result here means the poll budget elapsed before any tool
+    // appeared (the only way the loop returns empty). Treating that as a clean
+    // empty set would silently emit nothing, so flag it.
+    if raw.is_empty() {
+        eprintln!(
+            "warning: live discovery found no tools within 5s — the capability fold may still \
+             be populating, or this node advertises none; proceeding with an empty set."
+        );
+    }
+    let descriptors = filter_descriptors(raw, tags, tools);
 
     let meta = GenMeta {
         source_label: "live discovery".to_string(),
