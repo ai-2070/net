@@ -512,7 +512,13 @@ async fn run_cancel(
 /// `Small` blob) or the full encoded `BlobRef` hex that `send-*` prints
 /// for chunked content / directory manifests.
 fn parse_content_ref(s: &str, flag: &str) -> Result<BlobRef, CliError> {
-    let trimmed = s.trim().trim_start_matches("0x").trim_start_matches("0X");
+    // Strip at most one `0x` / `0X` prefix (not `trim_start_matches`, which
+    // would peel repeated prefixes off a `0x0x…` typo).
+    let body = s.trim();
+    let trimmed = body
+        .strip_prefix("0x")
+        .or_else(|| body.strip_prefix("0X"))
+        .unwrap_or(body);
     let bytes = hex::decode(trimmed)
         .map_err(|e| invalid_args(format!("{flag} `{s}` is not valid hex: {e}")))?;
     if bytes.len() == 32 {
@@ -775,4 +781,65 @@ struct StatusView {
 struct CancelView {
     transfer_id: u64,
     cancelled: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_content_ref_accepts_a_bare_32_byte_hash() {
+        let hex = "ab".repeat(32); // 64 hex chars = 32 bytes
+        let parsed = parse_content_ref(&hex, "--blob-ref").expect("bare hash parses");
+        match parsed {
+            BlobRef::Small {
+                hash, size, uri, ..
+            } => {
+                assert_eq!(hash, [0xabu8; 32]);
+                // Size is unknown on the wire for the bare-hash form; the
+                // Small fetch path keys on the hash and ignores it.
+                assert_eq!(size, 0);
+                assert_eq!(uri, format!("mesh://{hex}"));
+            }
+            other => panic!("expected Small, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_content_ref_strips_a_single_0x_prefix() {
+        let hex = "cd".repeat(32);
+        let lower = parse_content_ref(&format!("0x{hex}"), "--blob-ref").expect("0x prefix");
+        let upper = parse_content_ref(&format!("0X{hex}"), "--blob-ref").expect("0X prefix");
+        let bare = parse_content_ref(&hex, "--blob-ref").expect("bare");
+        // The URI is derived from the prefix-stripped body, so all three
+        // forms must resolve to the identical reference.
+        assert_eq!(lower, bare);
+        assert_eq!(upper, bare);
+    }
+
+    #[test]
+    fn parse_content_ref_does_not_peel_a_doubled_0x_prefix() {
+        // `trim_start_matches` would have stripped both, turning a typo into
+        // a silently-different (or accidentally-valid) ref. `strip_prefix`
+        // peels one, leaving a non-hex `0x…` body that is rejected.
+        let doubled = format!("0x0x{}", "ef".repeat(32));
+        assert!(parse_content_ref(&doubled, "--blob-ref").is_err());
+    }
+
+    #[test]
+    fn parse_content_ref_round_trips_a_full_encoded_ref() {
+        // A full encoded BlobRef (longer than 32 bytes) takes the decode
+        // path and must reconstruct the original verbatim.
+        let original = BlobRef::small("mesh://x".to_string(), [7u8; 32], 123);
+        let encoded = hex::encode(original.encode());
+        let parsed = parse_content_ref(&encoded, "--remote-ref").expect("full ref decodes");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn parse_content_ref_rejects_non_hex_and_wrong_length() {
+        assert!(parse_content_ref("not-hex", "--blob-ref").is_err());
+        // 16 bytes: valid hex, but neither a 32-byte hash nor a decodable ref.
+        assert!(parse_content_ref(&"ab".repeat(16), "--blob-ref").is_err());
+    }
 }
