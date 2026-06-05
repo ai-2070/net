@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/dataforts/blob/transfer_rpc.rs
+  s_a529d97b04ee8d::t_725b2e1d9462a0 303-411,416-448
+  s_a529d97b04ee8d::t_0b22b9a4bb176b 412-415
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "a68659c5f73c93b5f96b4cb93d969b70f318f1c7",
+  "prompts": {},
+  "sessions": {
+    "s_a529d97b04ee8d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e636aa40-01b9-46e0-a6ac-2e827a24c073",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
