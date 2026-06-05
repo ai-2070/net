@@ -1,0 +1,19 @@
+net/crates/net/cli/tests/typegen_downstream_ts.rs
+  s_c2219187d98495::t_d56061d189be16 47-55,62-70
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "dcb64835151d8803e6d23a287c19bb4e3ffd31b7",
+  "prompts": {},
+  "sessions": {
+    "s_c2219187d98495": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2beba2b0-0a94-4ee2-8338-fba35f7c1a49",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
