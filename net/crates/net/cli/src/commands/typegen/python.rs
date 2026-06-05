@@ -818,7 +818,11 @@ mod tests {
         let t = render_tool(&d, &meta()).expect("render");
         // `= ...` is Pydantic's *required* sentinel to the mypy plugin; an
         // optional field must use a real `= None` default so callers can omit it.
-        assert!(t.models_pyi.contains("limit: int | None = None"), "{}", t.models_pyi);
+        assert!(
+            t.models_pyi.contains("limit: int | None = None"),
+            "{}",
+            t.models_pyi
+        );
         assert!(!t.models_pyi.contains("= ..."), "{}", t.models_pyi);
         assert!(t.models_pyi.contains("q: str\n"), "{}", t.models_pyi);
     }
@@ -835,7 +839,10 @@ mod tests {
         assert!(py.contains("Literal"), "{py}");
         assert!(py.contains(r#"mode: Literal["fast", "slow"]"#), "{py}");
         // Invalid identifier → sanitized attr + Field(alias=...).
-        assert!(py.contains("from pydantic import BaseModel, ConfigDict, Field"), "{py}");
+        assert!(
+            py.contains("from pydantic import BaseModel, ConfigDict, Field"),
+            "{py}"
+        );
         assert!(
             py.contains(r#"weird_name: str = Field(alias="weird-name")"#),
             "{py}"

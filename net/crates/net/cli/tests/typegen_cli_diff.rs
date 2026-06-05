@@ -118,7 +118,11 @@ fn diff_reports_additions_and_breaking_changes() {
         ])
         .output()
         .expect("invoke");
-    assert_eq!(gated.status.code(), Some(14), "expected exit 14 on breaking change");
+    assert_eq!(
+        gated.status.code(),
+        Some(14),
+        "expected exit 14 on breaking change"
+    );
     assert!(
         String::from_utf8_lossy(&gated.stdout).contains("[BREAKING]"),
         "report should still print under --exit-code"
@@ -135,8 +139,16 @@ fn diff_exit_code_zero_when_no_breaking_change() {
     let old_input = r#"{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}"#;
     // Only an optional field added — non-breaking.
     let new_input = r#"{"type":"object","properties":{"q":{"type":"string"},"hint":{"type":"string"}},"required":["q"]}"#;
-    std::fs::write(&from, snapshot(json!([tool("acme/search", "1.0.0", old_input)]))).expect("old");
-    std::fs::write(&to, snapshot(json!([tool("acme/search", "1.1.0", new_input)]))).expect("new");
+    std::fs::write(
+        &from,
+        snapshot(json!([tool("acme/search", "1.0.0", old_input)])),
+    )
+    .expect("old");
+    std::fs::write(
+        &to,
+        snapshot(json!([tool("acme/search", "1.1.0", new_input)])),
+    )
+    .expect("new");
 
     let out = cli(&home)
         .args([
@@ -150,5 +162,8 @@ fn diff_exit_code_zero_when_no_breaking_change() {
         ])
         .output()
         .expect("invoke");
-    assert!(out.status.success(), "non-breaking diff should exit 0 even with --exit-code");
+    assert!(
+        out.status.success(),
+        "non-breaking diff should exit 0 even with --exit-code"
+    );
 }

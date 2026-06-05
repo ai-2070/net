@@ -274,7 +274,9 @@ fn render_inline_object(obj: &schema::ObjectSchema, ctx: &Ctx) -> String {
         })
         .collect();
     match &obj.additional {
-        Additional::Typed(t) => fields.push(format!("[key: string]: {}", typed_index_value(obj, t, ctx))),
+        Additional::Typed(t) => {
+            fields.push(format!("[key: string]: {}", typed_index_value(obj, t, ctx)))
+        }
         Additional::Allowed => fields.push("[key: string]: unknown".into()),
         Additional::Denied | Additional::Unspecified => {}
     }
@@ -480,7 +482,9 @@ mod tests {
         // include the property type or tsc-strict rejects the object.
         // `name` is optional → its `undefined` is folded in too.
         assert_eq!(
-            ty(r#"{"type":"object","properties":{"name":{"type":"string"}},"required":[],"additionalProperties":{"type":"number"}}"#),
+            ty(
+                r#"{"type":"object","properties":{"name":{"type":"string"}},"required":[],"additionalProperties":{"type":"number"}}"#
+            ),
             "{ name?: string; [key: string]: number | string | undefined }"
         );
     }

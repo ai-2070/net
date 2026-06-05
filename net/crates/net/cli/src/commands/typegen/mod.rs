@@ -489,7 +489,10 @@ fn basename_collisions(descriptors: &[ToolDescriptor]) -> Vec<(String, Vec<Strin
             .or_default()
             .push(d.tool_id.clone());
     }
-    groups.into_iter().filter(|(_, ids)| ids.len() > 1).collect()
+    groups
+        .into_iter()
+        .filter(|(_, ids)| ids.len() > 1)
+        .collect()
 }
 
 fn filter_by_tools(descriptors: Vec<ToolDescriptor>, tools: &[String]) -> Vec<ToolDescriptor> {
@@ -671,7 +674,11 @@ mod tests {
     #[test]
     fn basename_collisions_detects_only_clashing_ids() {
         // `web-search` and `web_search` both sanitize to `web_search`.
-        let descriptors = vec![desc("acme/web-search"), desc("acme/web_search"), desc("acme/maps")];
+        let descriptors = vec![
+            desc("acme/web-search"),
+            desc("acme/web_search"),
+            desc("acme/maps"),
+        ];
         let collisions = basename_collisions(&descriptors);
         assert_eq!(collisions.len(), 1, "{collisions:?}");
         assert_eq!(collisions[0].0, "acme_web_search");
