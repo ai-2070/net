@@ -148,6 +148,9 @@ impl Builder {
                 suggested.to_string()
             }
             Schema::Enum(values) => self.literal(values),
+            // PEP 586 forbids float members in `Literal[...]`; a float const
+            // degrades to the base `float` type.
+            Schema::Const(v) if is_float_value(v) => "float".into(),
             Schema::Const(v) => {
                 self.needs_literal = true;
                 format!("Literal[{}]", py_literal(v))
@@ -180,6 +183,15 @@ impl Builder {
 
     fn literal(&mut self, values: &[serde_json::Value]) -> String {
         if values.is_empty() {
+            self.needs_any = true;
+            return "Any".into();
+        }
+        // PEP 586 forbids float members in `Literal[...]`. If any value is a
+        // float, degrade: all-numeric → `float`, otherwise → `Any`.
+        if values.iter().any(is_float_value) {
+            if values.iter().all(serde_json::Value::is_number) {
+                return "float".into();
+            }
             self.needs_any = true;
             return "Any".into();
         }
@@ -614,6 +626,11 @@ fn doc_safe(s: &str) -> String {
 
 // ── value / identifier helpers ──────────────────────────────────────
 
+/// A JSON number that isn't an integer (so it can't be a `Literal` member).
+fn is_float_value(v: &serde_json::Value) -> bool {
+    v.is_number() && v.as_i64().is_none() && v.as_u64().is_none()
+}
+
 /// A JSON literal as a Python `Literal[...]` member.
 fn py_literal(v: &serde_json::Value) -> String {
     match v {
@@ -882,6 +899,21 @@ mod tests {
             "{}",
             t2.call_py
         );
+    }
+
+    #[test]
+    fn float_enum_and_const_degrade_from_literal() {
+        // PEP 586 disallows float literals; these must not emit `Literal[...]`.
+        let d = descriptor(
+            r#"{"type":"object","properties":{"ratio":{"enum":[0.5,1.5]},"pi":{"const":3.14}},"required":["ratio","pi"]}"#,
+            None,
+        );
+        let t = render_tool(&d, &meta()).expect("render");
+        let py = &t.models_py;
+        assert!(py.contains("ratio: float\n"), "{py}");
+        assert!(py.contains("pi: float\n"), "{py}");
+        assert!(!py.contains("Literal[0.5"), "{py}");
+        assert!(!py.contains("Literal[3.14"), "{py}");
     }
 
     #[test]
