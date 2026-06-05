@@ -1,0 +1,29 @@
+net/crates/net/cli/src/commands/aggregator.rs
+  s_c2219187d98495::t_1ea898de774fa5 317
+  s_c2219187d98495::t_153e32ce945887 39
+net/crates/net/cli/src/context.rs
+  s_c2219187d98495::t_465052ac735410 330-349
+net/crates/net/cli/src/commands/transfer.rs
+  s_c2219187d98495::t_3177be72784e96 620
+  s_c2219187d98495::t_464b4f81718cbd 41
+net/crates/net/cli/src/commands/typegen/mod.rs
+  s_c2219187d98495::t_05539987f65529 32
+  s_c2219187d98495::t_812713b936ed50 418
+  s_c2219187d98495::t_db3ad48ac23898 431-441
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "da78e847b52819e77808924536f1427eb6fb585a",
+  "prompts": {},
+  "sessions": {
+    "s_c2219187d98495": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2beba2b0-0a94-4ee2-8338-fba35f7c1a49",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
