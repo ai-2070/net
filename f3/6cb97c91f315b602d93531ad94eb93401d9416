@@ -1,0 +1,23 @@
+net/crates/net/cli/src/commands/transfer.rs
+  s_6c5221c01e7170::t_d2ed98d59e5a74 63,65,67
+  s_6c5221c01e7170::t_eaefce9d168278 22-27,29-31
+net/crates/net/src/adapter/net/dataforts/blob/transfer.rs
+  s_6c5221c01e7170::t_371bb8874f21c1 331-333,335
+  s_6c5221c01e7170::t_bff9db5438fc46 290-293,295-309
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "f36cb97c91f315b602d93531ad94eb93401d9416",
+  "prompts": {},
+  "sessions": {
+    "s_6c5221c01e7170": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f37db5c6-b2d5-4a32-b8d0-45008d549c08",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
