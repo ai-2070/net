@@ -241,16 +241,27 @@ async fn run_generate(
     }
 
     // Distinct tool ids can sanitize to the same module basename and would
-    // silently overwrite each other's files; warn loudly rather than lose one.
-    for (base, ids) in basename_collisions(&usable) {
-        eprintln!(
-            "warning: tools {} all map to module `{base}` and will overwrite each \
-             other's output; rename a tool id to disambiguate.",
-            ids.iter()
-                .map(|id| format!("`{id}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+    // silently overwrite each other's files. That's data loss, so refuse the
+    // run and tell the operator exactly which ids clash.
+    let collisions = basename_collisions(&usable);
+    if !collisions.is_empty() {
+        let detail = collisions
+            .iter()
+            .map(|(base, ids)| {
+                format!(
+                    "`{base}` ← {}",
+                    ids.iter()
+                        .map(|id| format!("`{id}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(invalid_args(format!(
+            "tool ids collide after sanitization and would overwrite each other's generated \
+             files: {detail}. Rename a tool id, or narrow the set with --tag / --tool."
+        )));
     }
 
     let files = match args.language {

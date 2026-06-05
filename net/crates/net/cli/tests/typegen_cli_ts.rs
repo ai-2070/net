@@ -177,3 +177,65 @@ fn generate_ts_filters_by_tool_id() {
         "filtered-out tool should not be generated"
     );
 }
+
+#[test]
+fn generate_fails_on_module_basename_collision() {
+    // `acme/web-search` and `acme/web_search` both sanitize to
+    // `acme_web_search`; generating both would overwrite one file, so the
+    // command must refuse rather than silently lose output.
+    let home = TempDir::new().expect("home");
+    let work = TempDir::new().expect("work");
+    let snap = work.path().join("tools.snapshot");
+    let out = work.path().join("generated");
+
+    let schema = r#"{"type":"object","properties":{"q":{"type":"string"}}}"#;
+    let snapshot = json!({
+        "format_version": 1,
+        "captured_at": "2026-06-04T10:00:00Z",
+        "source_query": { "tags": [], "tools": [] },
+        "descriptors": [
+            {
+                "tool_id": "acme/web-search", "name": "A", "version": "1.0.0",
+                "description": null, "input_schema": schema, "output_schema": null,
+                "requires": [], "estimated_time_ms": 0, "stateless": true,
+                "streaming": false, "tags": [], "node_count": 1
+            },
+            {
+                "tool_id": "acme/web_search", "name": "B", "version": "1.0.0",
+                "description": null, "input_schema": schema, "output_schema": null,
+                "requires": [], "estimated_time_ms": 0, "stateless": true,
+                "streaming": false, "tags": [], "node_count": 1
+            }
+        ]
+    });
+    std::fs::write(&snap, serde_json::to_vec(&snapshot).expect("ser")).expect("write");
+
+    let output = cli(&home)
+        .args([
+            "typegen",
+            "generate",
+            "--language",
+            "ts",
+            "--from-snapshot",
+            snap.to_str().expect("snap"),
+            "--out",
+            out.to_str().expect("out"),
+        ])
+        .output()
+        .expect("invoke net-mesh");
+
+    // Exit code 2 (InvalidArgs) and a message naming the clashing module.
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "expected collision to fail the run"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("collide"), "stderr={stderr}");
+    assert!(stderr.contains("acme_web_search"), "stderr={stderr}");
+    // No partial output written.
+    assert!(
+        !out.join("tools").join("acme_web_search.ts").exists(),
+        "no module should be written when generation is refused"
+    );
+}
