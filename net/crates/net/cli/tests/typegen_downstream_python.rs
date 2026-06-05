@@ -34,9 +34,10 @@ fn snapshot_json() -> Vec<u8> {
     serde_json::to_vec_pretty(&snapshot).expect("serialize snapshot")
 }
 
-/// First working Python interpreter (`python`, then `py`), or `None`.
+/// First working Python interpreter (`python`, `python3`, then the Windows
+/// `py` launcher), or `None`.
 fn python() -> Option<String> {
-    for cand in ["python", "py"] {
+    for cand in ["python", "python3", "py"] {
         let ok = Command::new(cand)
             .arg("--version")
             .output()

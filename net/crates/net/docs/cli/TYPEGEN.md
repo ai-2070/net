@@ -178,16 +178,15 @@ emitted:
   runs `mypy --strict` (with the Pydantic plugin) against a consumer.
 
 Both **skip cleanly** when the toolchain is absent (no `tsc`, or no
-`mypy` / `pydantic`), so `cargo test` still passes on a bare machine. To
-exercise them, install the toolchains first: `npm i -g typescript` for TS;
-`pip install mypy pydantic` for Python. Set `TYPEGEN_TSC` to point at a
-specific `tsc` if it isn't on `PATH`.
+`mypy` / `pydantic`), so `cargo test` still passes on a bare machine. CI's
+`cli-tests` job installs them (`npm i -g typescript`, `pip install mypy
+pydantic`) so the checks run there. To run them locally, install the same
+toolchains; set `TYPEGEN_TSC` to point at a specific `tsc` if it isn't on
+`PATH`.
 
 ## 8. Not yet wired
 
 - **Streaming-tool call helpers** — `ToolDescriptor::streaming` is captured
   in the metadata, but the helpers are currently the unary shape.
-- **CI gating** — the downstream tests run automatically when the toolchains
-  are present; a CI step that installs them is the remaining tidy.
 - **Go / other languages**, custom templates, and per-language packaging are
   out of scope (see `TYPEGEN_CLI_PLAN.md`).

@@ -1285,6 +1285,23 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-cli-${{ hashFiles('**/Cargo.lock') }}
 
+      # Toolchains for the typegen downstream type-checks (E-2 / E-3). Without
+      # these, tests/typegen_downstream_{ts,python}.rs self-skip; installing
+      # them here makes those checks actually run.
+      - name: Install Node + TypeScript
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install tsc
+        run: npm install -g typescript
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install mypy + pydantic
+        run: python -m pip install --upgrade mypy pydantic
+
       - name: Run net-cli tests
         run: cargo test -p net-cli
 

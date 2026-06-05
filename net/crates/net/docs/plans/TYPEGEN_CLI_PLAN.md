@@ -4,9 +4,9 @@
 `net-mesh typegen (generate|snapshot|diff)` ships for TypeScript and Python
 from live discovery or a pinned snapshot. Downstream type-checks (E-2 / E-3)
 verify the generated code actually passes `tsc --noEmit` strict and
-`mypy --strict` (Pydantic plugin); they self-skip when the toolchain is
-absent. Remaining tidy: a CI step that installs tsc / mypy+pydantic so those
-checks run in CI (E-5), and streaming-tool call helpers. See
+`mypy --strict` (Pydantic plugin); the `cli-tests` CI job installs
+tsc / mypy+pydantic so they run there (and self-skip locally when the
+toolchain is absent). Remaining: streaming-tool call helpers. See
 `docs/cli/TYPEGEN.md` for the operator/developer guide and the "Landed" /
 "Deviations" notes below.
 
@@ -55,7 +55,7 @@ Tagged `[A | B | C | D | E]`:
 | E-2  | M   | ✅   | downstream check  | `tests/typegen_downstream_ts.rs` — generated output passes `tsc --noEmit` strict (self-skips if no tsc) |
 | E-3  | M   | ✅   | downstream check  | `tests/typegen_downstream_python.rs` — ast-parse + `mypy --strict` w/ pydantic plugin (self-skips if absent) |
 | E-4  | L   | ✅   | docs              | `docs/cli/TYPEGEN.md` operator/developer guide                                       |
-| E-5  | L   | ◐    | tidy              | clippy + rustfmt done; downstream tests self-skip — a CI step installing tsc/mypy+pydantic is the remaining bit |
+| E-5  | L   | ✅   | tidy              | clippy + rustfmt; `cli-tests` CI job installs tsc + mypy/pydantic so E-2/E-3 run there |
 
 ### Landed commits
 
