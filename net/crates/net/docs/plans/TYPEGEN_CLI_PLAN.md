@@ -2,7 +2,7 @@
 
 Branch: `typegen-cli`.
 Predecessor work: `ToolDescriptor` (`net/crates/net/src/adapter/net/cortex/tool.rs:95`), `ToolCapability` with `input_schema` / `output_schema` JSON Schema fields (`net/crates/net/src/adapter/net/behavior/capability.rs:482-499`), `MeshNode::list_tools` aggregation across the capability fold, the metadata-key conventions for tool descriptions / streaming / tags (`description_metadata_key` / `streaming_metadata_key` / `tags_metadata_key` in `cortex/tool.rs`).
-Scope: ship `net typegen` CLI commands that generate language-specific typed bindings (TypeScript `.d.ts` + runtime helpers, Python `.pyi` stubs + Pydantic models) from `ToolDescriptor`s retrieved through `list_tools` or read from a pinned snapshot file.
+Scope: ship `net-mesh typegen` CLI commands that generate language-specific typed bindings (TypeScript `.d.ts` + runtime helpers, Python `.pyi` stubs + Pydantic models) from `ToolDescriptor`s retrieved through `list_tools` or read from a pinned snapshot file.
 
 **Why this exists.** `ToolDescriptor::input_schema` / `output_schema` carry JSON Schema (draft 2020-12) as strings. Today every consumer that wants typed access has to write its own schema → language-type translation. Two well-supported language ecosystems (TS + Python) deserve first-class codegen so developers writing code against discovered tools get IDE support — autocomplete, type checking, hover docs — instead of dynamic `dict` / `object` access.
 
@@ -38,9 +38,9 @@ Tagged `[A | B | C | D | E]`:
 | C-2  | H   | Python stubs      | `.pyi` stub generation for non-Pydantic consumers                                    |
 | C-3  | M   | Python module     | per-tool module + `__init__.py` re-export + typed call helpers                       |
 | C-4  | M   | Python tests      | snapshot tests against fixture descriptors with golden Python outputs                |
-| D-1  | M   | snapshot verb     | `net typegen snapshot --query ... --out tools.snapshot`                              |
-| D-2  | M   | regenerate verb   | `net typegen --language ts --from-snapshot tools.snapshot --out ./generated/`        |
-| D-3  | M   | diff              | `net typegen diff --from old.snapshot --to new.snapshot` — schema-evolution view     |
+| D-1  | M   | snapshot verb     | `net-mesh typegen snapshot --query ... --out tools.snapshot`                              |
+| D-2  | M   | regenerate verb   | `net-mesh typegen --language ts --from-snapshot tools.snapshot --out ./generated/`        |
+| D-3  | M   | diff              | `net-mesh typegen diff --from old.snapshot --to new.snapshot` — schema-evolution view     |
 | E-1  | H   | integration tests | `tests/typegen_cli_ts.rs`, `tests/typegen_cli_python.rs` — end-to-end CLI runs       |
 | E-2  | M   | downstream check  | TS test: generated `.d.ts` imported in a tsc-strict project, compiles               |
 | E-3  | M   | downstream check  | Python test: generated Pydantic models pass mypy --strict                            |
@@ -412,12 +412,12 @@ Same pattern as B-4. `crates/net/cli/tests/typegen_python_snapshots.rs` runs fix
 
 ## Gap D — Snapshot / regenerate / diff
 
-### D-1 — `net typegen snapshot`
+### D-1 — `net-mesh typegen snapshot`
 
 Captures the current `list_tools` result for later reproducible regeneration.
 
 ```
-net typegen snapshot \
+net-mesh typegen snapshot \
     --tag tool \
     --out ./tools.snapshot
 ```
@@ -432,12 +432,12 @@ net typegen snapshot \
 
 The `generate --from-snapshot` path described in A-1. Useful for CI / reproducible builds where the substrate's live tool population shouldn't influence the build output.
 
-### D-3 — `net typegen diff`
+### D-3 — `net-mesh typegen diff`
 
 Compares two snapshots, surfaces schema-evolution information.
 
 ```
-net typegen diff --from old.snapshot --to new.snapshot
+net-mesh typegen diff --from old.snapshot --to new.snapshot
 ```
 
 **Output:**
@@ -484,7 +484,7 @@ Non-breaking changes (description text, tags, estimated_time_ms) get listed but 
 
 ### E-1 — Integration tests
 
-`tests/typegen_cli_ts.rs` and `tests/typegen_cli_python.rs`. Spawn a daemon subprocess, register a few test tools with known schemas via the existing test fixtures, run `net typegen generate` end-to-end, validate the output directory contents.
+`tests/typegen_cli_ts.rs` and `tests/typegen_cli_python.rs`. Spawn a daemon subprocess, register a few test tools with known schemas via the existing test fixtures, run `net-mesh typegen generate` end-to-end, validate the output directory contents.
 
 ### E-2 — Downstream TS type-check
 
@@ -594,4 +594,4 @@ These are unknowns that the plan flags but doesn't resolve. The implementer addr
 
 ## Connection to existing CLI
 
-`net typegen` slots into the existing `commands/` directory alongside `cap`, `aggregator`, `channel`, `subnet`, etc. The dispatch pattern, output formatting, and context construction reuse the established conventions. Nothing about typegen requires a new CLI subsystem — it's another verb family on the same surface.
+`net-mesh typegen` slots into the existing `commands/` directory alongside `cap`, `aggregator`, `channel`, `subnet`, etc. The dispatch pattern, output formatting, and context construction reuse the established conventions. Nothing about typegen requires a new CLI subsystem — it's another verb family on the same surface.
