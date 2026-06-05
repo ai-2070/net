@@ -63,7 +63,7 @@ comfy-table = "7"
 # fabricating per-chunk counts the substrate doesn't surface. Drawn to
 # stderr and suppressed under `--quiet` / non-TTY so it never pollutes
 # `--output json` on stdout.
-indicatif = "0.17"
+indicatif = "0.18"
 
 # Tracing-subscriber wires `-v` / `-vv` / `-vvv` to env-filter
 # levels. Format pinned to compact for stderr.
