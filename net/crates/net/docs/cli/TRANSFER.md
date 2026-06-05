@@ -136,6 +136,12 @@ backup-and-rollback design.
 - **Network drop mid-transfer** — the engine retries failed chunks within
   a transfer; a transfer that exhausts its budget surfaces as a
   non-zero exit with the substrate error. Re-run to restart.
+- **Relayed `--from` fetch fails** — when `--from` names a peer *other*
+  than the node you attached to, the fetch is routed through the attach
+  node, which must have a route to the holder. A failure here is reported
+  with a hint naming both ends (`… via attach node <N>; ensure <N> has a
+  route to <holder>`); verify the relay actually peers with the holder, or
+  attach directly to the holder and drop `--from`.
 - **`HashMismatch`** — fetched bytes did not hash to the expected
   address. The substrate verifies every fetch, so this is a hard
   integrity failure, never silently accepted; the suspect bytes are not

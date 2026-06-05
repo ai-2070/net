@@ -216,7 +216,8 @@ async fn run_recv_blob(
     // `--from` overrides the attach target (fetch via a relay you
     // handshook with); otherwise the holder is the node you connected to.
     // (Parsed to `u64` at argv time, so no fallible re-parse here.)
-    let source = args.from.unwrap_or(remote.node_id);
+    let attached = remote.node_id;
+    let source = args.from.unwrap_or(attached);
     let ctx =
         CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)
             .await?;
@@ -236,7 +237,12 @@ async fn run_recv_blob(
     let started = Instant::now();
     let bytes = transport::fetch_blob(mesh, source, &blob_ref)
         .await
-        .map_err(|e| sdk(format!("fetch_blob from peer {source} failed: {e}")))?;
+        .map_err(|e| {
+            sdk(format!(
+                "fetch_blob from peer {source} failed: {e}{}",
+                relay_hint(source, attached)
+            ))
+        })?;
     let elapsed = started.elapsed();
     spinner.finish();
 
@@ -314,7 +320,8 @@ async fn run_recv_dir(
     let profile = resolve_profile(config_path, profile_name).await?;
     let remote = require_remote_attach(&profile, &args.attach, "recv-dir")?;
     // `--from` is parsed to `u64` at argv time; default to the attach target.
-    let source = args.from.unwrap_or(remote.node_id);
+    let attached = remote.node_id;
+    let source = args.from.unwrap_or(attached);
     let ctx =
         CliContext::build_with_remote(&profile, args.identity.as_deref(), args.node, false, remote)
             .await?;
@@ -336,7 +343,12 @@ async fn run_recv_dir(
     // verbatim rather than pre-resolving it here.
     let stats = transport::fetch_dir(mesh, source, &manifest_ref, &args.out, args.concurrency)
         .await
-        .map_err(|e| sdk(format!("fetch_dir from peer {source} failed: {e}")))?;
+        .map_err(|e| {
+            sdk(format!(
+                "fetch_dir from peer {source} failed: {e}{}",
+                relay_hint(source, attached)
+            ))
+        })?;
     let elapsed = started.elapsed();
     spinner.finish();
 
@@ -541,6 +553,22 @@ fn parse_content_ref(s: &str, flag: &str) -> Result<BlobRef, CliError> {
         Err(e) => Err(invalid_args(format!(
             "{flag} `{s}` is neither a 32-byte hash nor a valid encoded BlobRef: {e}"
         ))),
+    }
+}
+
+/// Hint appended to a fetch failure when `--from` named a peer other than
+/// the attach node: the failure is then often a missing relay route (the
+/// attach node has to be able to reach the holder). Empty when fetching
+/// directly from the attach node, where no relay is involved and the hint
+/// would just be noise.
+fn relay_hint(source: u64, attached: u64) -> String {
+    if source == attached {
+        String::new()
+    } else {
+        format!(
+            " (fetching from peer {source} via attach node {attached}; \
+             ensure {attached} has a route to {source})"
+        )
     }
 }
 
@@ -846,5 +874,15 @@ mod tests {
         assert!(parse_content_ref("not-hex", "--blob-ref").is_err());
         // 16 bytes: valid hex, but neither a 32-byte hash nor a decodable ref.
         assert!(parse_content_ref(&"ab".repeat(16), "--blob-ref").is_err());
+    }
+
+    #[test]
+    fn relay_hint_only_fires_for_a_relayed_fetch() {
+        // Fetching directly from the attach node: no relay, no hint.
+        assert_eq!(relay_hint(42, 42), "");
+        // `--from` names a different peer: hint names both ends so the
+        // operator knows which node needs the route.
+        let hint = relay_hint(7, 42);
+        assert!(hint.contains('7') && hint.contains("42"), "hint: {hint}");
     }
 }
