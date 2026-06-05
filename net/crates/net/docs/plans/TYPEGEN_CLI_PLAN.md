@@ -1,12 +1,14 @@
 # Typegen CLI plan — TypeScript and Python bindings from discovered tool descriptors
 
-**Status: ✅ Core complete** on branch `typegen-cli` (Gaps A–D + most of E).
+**Status: ✅ Complete** on branch `typegen-cli` (Gaps A–E).
 `net-mesh typegen (generate|snapshot|diff)` ships for TypeScript and Python
-from live discovery or a pinned snapshot. Deferred (need external
-toolchains, tracked as follow-ups): the downstream `tsc --noEmit` /
-`mypy --strict` CI checks (E-2 / E-3 / E-5 CI gating) and streaming-tool
-call helpers. See `docs/cli/TYPEGEN.md` for the operator/developer guide and
-the "Landed" / "Deviations" notes below.
+from live discovery or a pinned snapshot. Downstream type-checks (E-2 / E-3)
+verify the generated code actually passes `tsc --noEmit` strict and
+`mypy --strict` (Pydantic plugin); they self-skip when the toolchain is
+absent. Remaining tidy: a CI step that installs tsc / mypy+pydantic so those
+checks run in CI (E-5), and streaming-tool call helpers. See
+`docs/cli/TYPEGEN.md` for the operator/developer guide and the "Landed" /
+"Deviations" notes below.
 
 Branch: `typegen-cli`.
 Predecessor work: `ToolDescriptor` (`net/crates/net/src/adapter/net/cortex/tool.rs:95`), `ToolCapability` with `input_schema` / `output_schema` JSON Schema fields (`net/crates/net/src/adapter/net/behavior/capability.rs:482-499`), `MeshNode::list_tools` aggregation across the capability fold, the metadata-key conventions for tool descriptions / streaming / tags (`description_metadata_key` / `streaming_metadata_key` / `tags_metadata_key` in `cortex/tool.rs`).
@@ -50,10 +52,10 @@ Tagged `[A | B | C | D | E]`:
 | D-2  | M   | ✅   | regenerate verb   | `net-mesh typegen generate --language ts --from-snapshot tools.snapshot`             |
 | D-3  | M   | ✅   | diff              | `net-mesh typegen diff --from old --to new` — schema-evolution view + BREAKING flags |
 | E-1  | H   | ✅   | integration tests | `tests/typegen_cli_{ts,python,diff}.rs` — end-to-end CLI runs (offline via snapshot) |
-| E-2  | M   | ⏳   | downstream check  | TS: generated output in a tsc-strict project (needs Node in CI)                     |
-| E-3  | M   | ⏳   | downstream check  | Python: generated models pass `mypy --strict` (needs Python in CI)                  |
+| E-2  | M   | ✅   | downstream check  | `tests/typegen_downstream_ts.rs` — generated output passes `tsc --noEmit` strict (self-skips if no tsc) |
+| E-3  | M   | ✅   | downstream check  | `tests/typegen_downstream_python.rs` — ast-parse + `mypy --strict` w/ pydantic plugin (self-skips if absent) |
 | E-4  | L   | ✅   | docs              | `docs/cli/TYPEGEN.md` operator/developer guide                                       |
-| E-5  | L   | ◐    | tidy              | clippy + rustfmt done; CI gating on downstream type-checks deferred with E-2/E-3     |
+| E-5  | L   | ◐    | tidy              | clippy + rustfmt done; downstream tests self-skip — a CI step installing tsc/mypy+pydantic is the remaining bit |
 
 ### Landed commits
 

@@ -173,7 +173,8 @@ fn render_named(
 /// `export type Name = <type>;` for anything else.
 fn render_type_decl(name: &str, schema: &Schema, doc: Option<&str>, ctx: &Ctx) -> String {
     let doc_line = match doc {
-        Some(d) => format!("/** {d} */\n"),
+        // Split any `*/` so a description can't close the doc comment early.
+        Some(d) => format!("/** {} */\n", d.replace("*/", "* /")),
         None => String::new(),
     };
     match schema {
