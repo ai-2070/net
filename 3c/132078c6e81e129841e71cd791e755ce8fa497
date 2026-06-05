@@ -1,0 +1,22 @@
+net/crates/net/cli/src/commands/typegen/python.rs
+  s_c2219187d98495::t_473ca95e4a6823 151-153
+  s_c2219187d98495::t_b1fc76ce614ba3 905-918
+  s_c2219187d98495::t_88036253c119af 629-633
+  s_c2219187d98495::t_78bbc1387eaa04 189-197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "3c132078c6e81e129841e71cd791e755ce8fa497",
+  "prompts": {},
+  "sessions": {
+    "s_c2219187d98495": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2beba2b0-0a94-4ee2-8338-fba35f7c1a49",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
