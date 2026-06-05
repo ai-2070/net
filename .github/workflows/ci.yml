@@ -1289,7 +1289,7 @@ jobs:
       # these, tests/typegen_downstream_{ts,python}.rs self-skip; installing
       # them here makes those checks actually run.
       - name: Install Node + TypeScript
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "24"
       - name: Install tsc
