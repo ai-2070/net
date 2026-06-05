@@ -1,0 +1,29 @@
+net/crates/net/cli/src/error.rs
+  s_c2219187d98495::t_ac633ea3a017b8 15-18
+  s_c2219187d98495::t_36466ca65d79b1 67-70
+  s_c2219187d98495::t_3dd481ee11ddd7 168
+net/crates/net/cli/src/commands/typegen/mod.rs
+  s_c2219187d98495::t_9612beb88ea91a 343-352
+  s_c2219187d98495::t_2423b964ff9eff 121-124
+net/crates/net/cli/tests/typegen_cli_diff.rs
+  s_c2219187d98495::t_64c67915dd9429 105-114,117-153
+  s_c2219187d98495::t_cd073f3f0f1f8a 115-116
+net/crates/net/docs/cli/TYPEGEN.md
+  s_c2219187d98495::t_eb423040c84f20 127-133
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "7d0b2102f57fcd5016820e3ee623f53e74d13d50",
+  "prompts": {},
+  "sessions": {
+    "s_c2219187d98495": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2beba2b0-0a94-4ee2-8338-fba35f7c1a49",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
