@@ -9522,14 +9522,19 @@ impl MeshNode {
     /// transfer-stream data divert route to the engine) and can issue
     /// them via [`Self::transfer_fetch_chunk`]. Idempotent — re-install
     /// replaces the engine.
+    ///
+    /// Returns the installed engine handle — the same one stored on the
+    /// node — so callers (e.g. the `blob.transfers` RPC install) can serve
+    /// introspection over the exact registry that's doing the fetches.
     pub fn serve_blob_transfer(
         self: &Arc<Self>,
         adapter: Arc<super::dataforts::blob::MeshBlobAdapter>,
-    ) {
+    ) -> Arc<super::dataforts::blob::transfer::BlobTransferEngine> {
         let engine = Arc::new(super::dataforts::blob::transfer::BlobTransferEngine::new(
             self, adapter,
         ));
-        *self.blob_transfer_engine.write() = Some(engine);
+        *self.blob_transfer_engine.write() = Some(engine.clone());
+        engine
     }
 
     /// Fetch the chunk addressed by `hash` from `holder` over a

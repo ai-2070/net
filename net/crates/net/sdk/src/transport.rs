@@ -65,6 +65,27 @@ pub use net::adapter::net::dataforts::blob::{
     MeshBlobAdapter, SUBPROTOCOL_BLOB_TRANSFER,
 };
 
+// Operator-introspection RPC over a node's transfer engine: the typed
+// client + status shape behind `net transfer ls / status / cancel`, and
+// the server-side error variants for matching. [`serve_blob_transfer_rpc`]
+// (below) installs the matching handler.
+pub use net::adapter::net::dataforts::blob::{
+    BlobTransferClient, TransferClientError, TransferRpcError, TransferStatus,
+};
+// Returned by [`serve_blob_transfer_rpc`]; the caller holds it to keep the
+// RPC registered (drop = stop answering).
+pub use net::adapter::net::mesh_rpc::{ServeError, ServeHandle};
+
+// Store-side helpers for building a content-addressed [`BlobRef`] from raw
+// bytes without reaching into the substrate: [`chunk_payload`] splits a byte
+// slice into the inline-or-chunked shape and [`ChunkedPayload::into_blob_ref`]
+// finishes it into a [`BlobRef::Small`] / [`BlobRef::Manifest`] under an
+// [`Encoding`]. These are the inverse of [`fetch_blob`] — what a publisher runs
+// to learn the reference a peer will [`fetch_blob`] by. Re-exported so the
+// `net transfer send-blob` CLI verb (and any SDK consumer staging content for
+// fetch) doesn't reimplement chunk sizing / hashing.
+pub use net::adapter::net::dataforts::{chunk_payload, ChunkedPayload, Encoding};
+
 // Directory transfer: the substrate `store_dir` is usable as-is (it
 // takes a `&MeshBlobAdapter`); the fetch side is wrapped below because
 // the substrate function needs the internal node handle. The manifest
@@ -160,6 +181,32 @@ impl From<DirError> for TransferError {
 /// Idempotent — re-installing replaces the engine.
 pub fn serve_blob_transfer(mesh: &Mesh, adapter: Arc<MeshBlobAdapter>) {
     mesh.node().serve_blob_transfer(adapter);
+}
+
+/// Like [`serve_blob_transfer`] but also registers the `blob.transfers`
+/// operator-introspection RPC (list / status / cancel) over the same
+/// engine, so a remote operator (`net transfer ls / status / cancel`) can
+/// query and cancel this node's in-flight, requester-side transfers.
+/// Returns the [`ServeHandle`]; **hold it** for as long as the RPC should
+/// answer (dropping it stops the RPC; the engine itself stays installed).
+pub fn serve_blob_transfer_rpc(
+    mesh: &Mesh,
+    adapter: Arc<MeshBlobAdapter>,
+) -> Result<ServeHandle, ServeError> {
+    // Install the engine (and hold its handle so the RPC reports on the
+    // exact registry doing the fetches), then serve the handler through
+    // `Mesh::serve_rpc` — which auto-registers the `blob.transfers` request
+    // channel + reply prefix in the SDK's ChannelConfigRegistry, so a node
+    // with a restrictive registry (the MeshBuilder default) still admits
+    // the RPC's channel membership. Serving via `MeshNode::serve_rpc`
+    // directly would skip that registration and fail with UnknownChannel.
+    let engine = mesh.node().serve_blob_transfer(adapter);
+    mesh.serve_rpc(
+        net::adapter::net::dataforts::blob::TRANSFER_SERVICE,
+        Arc::new(net::adapter::net::dataforts::blob::TransferRpcHandler::new(
+            engine,
+        )),
+    )
 }
 
 // ── Blob fetch ──────────────────────────────────────────────────────

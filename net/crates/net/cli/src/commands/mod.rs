@@ -30,4 +30,5 @@ pub mod port;
 pub mod rpc;
 pub mod snapshot;
 pub mod subnet;
+pub mod transfer;
 pub mod version;
