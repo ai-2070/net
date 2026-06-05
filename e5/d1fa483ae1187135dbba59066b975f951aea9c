@@ -1,0 +1,19 @@
+.github/workflows/release-npm.yml
+  s_996a7cdd98d020::t_fc8468ef5278b0 190-192,196-212
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "e5d1fa483ae1187135dbba59066b975f951aea9c",
+  "prompts": {},
+  "sessions": {
+    "s_996a7cdd98d020": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ce5045bb-33dd-4863-bbec-e42c3f1157e9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
