@@ -19,17 +19,16 @@
 //!   no "push" — this is the publish-and-fetch model (`TRANSFER_CLI_PLAN`
 //!   "Out of scope: net transfer push"). Without `--store` the verb only
 //!   prints the reference (a dry content-address computation).
-//! - `ls` / `status` / `cancel` — **transfer registry**. The substrate's
-//!   `BlobTransferEngine` tracks in-flight transfers in a per-node
-//!   registry, but exposes no enumeration accessor and the single-shot
-//!   CLI owns no long-lived engine, so these report against the local
-//!   (empty) engine and document the substrate gap rather than silently
-//!   pretending to inspect a remote daemon. They become live once the
-//!   substrate grows a transfers-list/cancel RPC.
+//! - `ls` / `status` / `cancel` — **remote**. Query a holder's transfer
+//!   engine over the `blob.transfers` RPC (remote-attach), reporting that
+//!   node's requester-side in-flight transfers (what it's fetching). A
+//!   single-shot CLI owns no engine, so there is nothing local to inspect;
+//!   the holder exposes the RPC via `transport::serve_blob_transfer_rpc`.
+//!   `cancel` drops the holder's pending entry, failing its awaiting fetch.
 //!
-//! `recv-*` verbs require remote-attach flags — `--node-addr`,
-//! `--node-pubkey`, `--node-id`, `--psk-hex` — each defaultable from the
-//! profile, exactly like the aggregator RPC verbs.
+//! `recv-*` **and** `ls` / `status` / `cancel` require remote-attach flags
+//! — `--node-addr`, `--node-pubkey`, `--node-id`, `--psk-hex` — each
+//! defaultable from the profile, exactly like the aggregator RPC verbs.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -61,11 +60,11 @@ pub enum TransferCommand {
     /// Publish a directory: emit its manifest + chunk references (and
     /// optionally stage them to a local store).
     SendDir(SendDirArgs),
-    /// List active transfers on the local node's transfer engine.
+    /// List a holder's in-flight (incoming) transfers over the mesh.
     Ls(LsArgs),
-    /// Show detail for a specific transfer by id.
+    /// Show one of a holder's transfers by stream id.
     Status(StatusArgs),
-    /// Cancel an in-progress transfer by id.
+    /// Cancel one of a holder's in-progress transfers by stream id.
     Cancel(CancelArgs),
 }
 

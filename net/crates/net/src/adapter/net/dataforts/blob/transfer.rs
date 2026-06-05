@@ -287,9 +287,26 @@ impl BlobTransferEngine {
         );
     }
 
-    /// Drop a pending transfer (timeout / give-up). Idempotent.
+    /// Drop a pending transfer (timeout / give-up). Idempotent. Closes the
+    /// receive-side stream too (mirroring the settle path) so a cancelled
+    /// transfer doesn't linger as a live stream until the 300 s idle
+    /// timeout — the same leak the completion path avoids.
     pub fn cancel_pending(&self, stream_id: u64) {
-        self.pending.remove(&stream_id);
+        self.remove_and_close(stream_id);
+    }
+
+    /// Remove a pending transfer and tear down its receive-side stream,
+    /// reporting whether one was present. Shared by [`Self::cancel_pending`]
+    /// and [`Self::cancel_pending_reporting`]; the held `holder` is what
+    /// lets us close the stream without re-deriving the peer.
+    fn remove_and_close(&self, stream_id: u64) -> bool {
+        match self.pending.remove(&stream_id) {
+            Some((_, pending)) => {
+                self.close_receive_stream(pending.holder, stream_id);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Snapshot every requester-side in-flight transfer (operator
@@ -311,10 +328,11 @@ impl BlobTransferEngine {
 
     /// Like [`Self::cancel_pending`] but reports whether a transfer was
     /// actually removed — for the operator cancel surface, which
-    /// distinguishes "cancelled" from "no such transfer". Dropping the
-    /// entry drops its `done` sender, failing the awaiting fetch.
+    /// distinguishes "cancelled" from "no such transfer". Closes the
+    /// receive-side stream and drops the entry's `done` sender, failing the
+    /// awaiting fetch.
     pub fn cancel_pending_reporting(&self, stream_id: u64) -> bool {
-        self.pending.remove(&stream_id).is_some()
+        self.remove_and_close(stream_id)
     }
 
     /// The holder's reliable layer gave up retransmitting this transfer
