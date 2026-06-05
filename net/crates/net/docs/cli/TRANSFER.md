@@ -174,8 +174,11 @@ $ net transfer cancel 2305843009213693952 --node-addr … --psk-hex …
 
 `cancel` drops the pending entry on the holder, failing its awaiting
 fetch. `status`/`cancel` return `found: false` / `cancelled: false` when
-no transfer with that id is pending. The serving node must install the RPC
-(`transport::serve_blob_transfer_rpc`, or a daemon that does).
+no transfer with that id is pending — and **exit `0` in that case**: a
+no-op is not an error. Script against the `found` / `cancelled` field, not
+the exit code (a non-zero exit means the RPC itself failed — no route,
+timeout, or the engine isn't installed). The serving node must install the
+RPC (`transport::serve_blob_transfer_rpc`, or a daemon that does).
 
 ---
 

@@ -60,11 +60,16 @@ pub enum TransferCommand {
     /// Publish a directory: emit its manifest + chunk references (and
     /// optionally stage them to a local store).
     SendDir(SendDirArgs),
-    /// List a holder's in-flight (incoming) transfers over the mesh.
+    /// List a holder's in-flight transfers over the mesh — what that node
+    /// is *fetching* (requester side), not what it serves to others.
     Ls(LsArgs),
-    /// Show one of a holder's transfers by stream id.
+    /// Show one of a holder's fetches by stream id. Exits 0 with
+    /// `found: false` when no such transfer is pending (check the field,
+    /// not the exit code).
     Status(StatusArgs),
-    /// Cancel one of a holder's in-progress transfers by stream id.
+    /// Cancel one of a holder's in-progress fetches by stream id. Exits 0
+    /// with `cancelled: false` when there was nothing to cancel (check the
+    /// field, not the exit code).
     Cancel(CancelArgs),
 }
 
