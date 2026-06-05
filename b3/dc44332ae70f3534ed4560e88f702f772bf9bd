@@ -1,0 +1,27 @@
+net/crates/net/cli/tests/typegen_downstream_python.rs
+  s_c2219187d98495::t_4fa396066d2b94 20-22
+  s_c2219187d98495::t_8c8ff526efa0d1 133-135
+  s_c2219187d98495::t_465aa57908f4ee 166-192
+net/crates/net/cli/src/commands/typegen/python.rs
+  s_c2219187d98495::t_97819eaee792a9 382-390,396-414
+  s_c2219187d98495::t_ef86cdeb2c6095 821,826-847
+  s_c2219187d98495::t_a20704792cc908 350-353
+  s_c2219187d98495::t_8ef512a093edf1 458-464
+  s_c2219187d98495::t_37291812471683 796-808
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "b3dc44332ae70f3534ed4560e88f702f772bf9bd",
+  "prompts": {},
+  "sessions": {
+    "s_c2219187d98495": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2beba2b0-0a94-4ee2-8338-fba35f7c1a49",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
