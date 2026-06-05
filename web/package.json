@@ -119,7 +119,7 @@
     "@tanstack/react-query-devtools": "5.101.0",
     "@types/node": "24.13.0",
     "@types/prettier": "3.0.0",
-    "@types/react": "19.2.16",
+    "@types/react": "19.2.17",
     "@types/react-dom": "19.2.3",
     "@types/unist": "3.0.3",
     "@types/uuid": "11.0.0",
