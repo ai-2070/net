@@ -230,10 +230,17 @@ async fn run_recv_blob(
         Arc::new(MeshBlobAdapter::new("recv", Arc::new(Redex::new()))),
     );
 
-    let spinner = Progress::start(
-        &format!("fetching blob from peer {source}"),
-        progress_enabled(output, quiet),
-    );
+    // A determinate byte bar when the total size is known up front (a
+    // Manifest ref, or a Small ref carrying its size); a spinner otherwise
+    // (e.g. a bare-hash `--blob-ref`, whose size is unknown on the wire).
+    let label = format!("fetching blob from peer {source}");
+    let enabled = progress_enabled(output, quiet);
+    let declared = blob_ref.size();
+    let progress = if declared > 0 {
+        Progress::start_bytes(&label, declared, enabled)
+    } else {
+        Progress::start(&label, enabled)
+    };
     let started = Instant::now();
     // Stream the blob chunk-by-chunk straight to disk rather than
     // assembling the whole payload in RAM first: peak memory is ~one chunk,
@@ -254,11 +261,12 @@ async fn run_recv_blob(
             ))
         })?;
         total += chunk.len() as u64;
+        progress.inc(chunk.len() as u64);
         writer.write_chunk(&chunk).await?;
     }
     writer.commit().await?;
     let elapsed = started.elapsed();
-    spinner.finish();
+    progress.finish();
 
     let view = RecvBlobView {
         peer: source,
@@ -748,6 +756,37 @@ impl Progress {
         pb.enable_steady_tick(std::time::Duration::from_millis(120));
         pb.set_message(msg.to_string());
         Self(Some(pb))
+    }
+
+    /// Determinate byte-progress bar for a transfer whose total size is
+    /// known up front (a `Manifest` ref, or a `Small` ref that carries its
+    /// size). Advance it with [`Self::inc`] as each chunk lands. Falls back
+    /// to the same no-op-unless-TTY gating as [`Self::start`]; callers use
+    /// [`Self::start`] (a spinner) when the total is unknown.
+    fn start_bytes(msg: &str, total: u64, enabled: bool) -> Self {
+        use std::io::IsTerminal as _;
+        if !enabled || !std::io::stderr().is_terminal() {
+            return Self(None);
+        }
+        let pb = indicatif::ProgressBar::new(total);
+        pb.set_draw_target(indicatif::ProgressDrawTarget::stderr());
+        pb.enable_steady_tick(std::time::Duration::from_millis(120));
+        let style = indicatif::ProgressStyle::with_template(
+            "{msg} [{bar:30}] {bytes}/{total_bytes} ({bytes_per_sec})",
+        )
+        .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+        .progress_chars("=>-");
+        pb.set_style(style);
+        pb.set_message(msg.to_string());
+        Self(Some(pb))
+    }
+
+    /// Advance a determinate bar by `n` bytes. No-op for a spinner or a
+    /// disabled (`None`) progress handle.
+    fn inc(&self, n: u64) {
+        if let Some(pb) = &self.0 {
+            pb.inc(n);
+        }
     }
 
     /// Clear the spinner before emitting the success summary. Idempotent,
