@@ -99,7 +99,7 @@ fn generated_ts_typechecks_under_tsc_strict() {
     "noEmit": true,
     "target": "es2020",
     "module": "esnext",
-    "moduleResolution": "node",
+    "moduleResolution": "bundler",
     "lib": ["es2020"],
     "skipLibCheck": true,
     "types": []
