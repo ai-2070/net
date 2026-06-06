@@ -1,0 +1,21 @@
+web/src/components/DocsPrevNext.tsx
+  s_e802155ff9ef32::t_847704da0951d5 66,71-81,91,96-103
+web/src/lib/docs.ts
+  s_e802155ff9ef32::t_f33657289bda5d 413-414,422,424-426,428-432,437-439,441
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "06b353aa20e4e6e45c0c370e79afcc39b8325c17",
+  "prompts": {},
+  "sessions": {
+    "s_e802155ff9ef32": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4e7ed794-33fe-4781-8585-c1e89f2c852c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
