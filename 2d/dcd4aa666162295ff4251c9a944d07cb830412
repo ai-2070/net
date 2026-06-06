@@ -1,0 +1,20 @@
+web/src/components/DocsSearchModal.tsx
+  s_e802155ff9ef32::t_6d280f8a09f3e8 10-11,29-40,51-54,57-74,80-101,103-120,123,130-134,136-140,142-147,149,157,164-167,179,181-182,184,188-191,193,203-209,259-261,351,356
+  s_e802155ff9ef32::t_1f701419cdcd95 168-176,178,183,185-187,192,194-202,210
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "2ddcd4aa666162295ff4251c9a944d07cb830412",
+  "prompts": {},
+  "sessions": {
+    "s_e802155ff9ef32": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4e7ed794-33fe-4781-8585-c1e89f2c852c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
