@@ -1,0 +1,26 @@
+web/src/app/api/search-index/route.ts
+  s_e802155ff9ef32::t_c7ca285f173a69 1-11
+web/src/lib/search-index.ts
+  s_e802155ff9ef32::t_d8d9a8bfa98e43 1-172
+web/src/app/docs/layout.tsx
+  s_e802155ff9ef32::t_7baad0daff9826 4
+  s_e802155ff9ef32::t_d2bf1238f21fa7 24-26
+web/src/components/DocsSearchModal.tsx
+  s_e802155ff9ef32::t_05fe0b9831d242 1-350
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "9771644c6df1b1c7df4f812ebf596f7b32af6e07",
+  "prompts": {},
+  "sessions": {
+    "s_e802155ff9ef32": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4e7ed794-33fe-4781-8585-c1e89f2c852c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
