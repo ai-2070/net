@@ -1,6 +1,7 @@
 import { NavBar } from "@/components/NavBar";
 import { DocsSidebar } from "@/components/DocsSidebar";
 import { DocsDrawer } from "@/components/DocsDrawer";
+import { DocsSearchModal } from "@/components/DocsSearchModal";
 import { LanguageHydrator } from "@/components/LanguageHydrator";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { getClientDocTree } from "@/lib/docs";
@@ -20,6 +21,9 @@ export default function DocsLayout({
     <PageContainer className="bg-black">
       <LanguageHydrator />
       <NavBar />
+      {/* Press-`/` search overlay; renders only while open and mounts a
+          global keypress listener for the lifetime of the docs layout. */}
+      <DocsSearchModal />
       {/* Mobile/tablet nav: sticky toggle bar + slide-in drawer (hidden at lg+). */}
       <DocsDrawer tree={tree} />
       <div className="pt-20 max-w-[1440px] mx-auto">
