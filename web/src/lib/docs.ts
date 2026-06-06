@@ -410,7 +410,8 @@ function flattenForLinearOrder(tree: DocTree): LinearDoc[] {
     out.push({ slug: f.slug, title: f.title });
   }
   for (const folder of tree.folders) {
-    addFolder(folder, out, folder.title);
+    // Top-level folders have no parent section to label them with.
+    addFolder(folder, out, undefined);
   }
   return out;
 }
@@ -418,17 +419,26 @@ function flattenForLinearOrder(tree: DocTree): LinearDoc[] {
 function addFolder(
   folder: DocFolder,
   out: LinearDoc[],
-  section: string,
+  parentSection: string | undefined,
 ): void {
+  // A folder README IS the section landing — its context label is the
+  // *parent* folder's title (if any), not its own. Using its own title would
+  // render the section line and the page title as the same string.
   if (folder.readme) {
-    out.push({ slug: folder.slug, title: folder.title, section });
+    out.push({
+      slug: folder.slug,
+      title: folder.title,
+      section: parentSection,
+    });
   }
   for (const child of folder.children) {
     if (child.kind === "file") {
       if (folder.readme && child === folder.readme) continue;
-      out.push({ slug: child.slug, title: child.title, section });
+      // Children get the *containing* folder's title as their section
+      // context, regardless of how deeply nested the folder is.
+      out.push({ slug: child.slug, title: child.title, section: folder.title });
     } else {
-      addFolder(child, out, child.title);
+      addFolder(child, out, folder.title);
     }
   }
 }

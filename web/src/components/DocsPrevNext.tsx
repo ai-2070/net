@@ -63,18 +63,23 @@ export function DocsPrevNextBottom({
       {prev ? (
         <Link
           href={hrefFor(prev.slug)}
-          className="group border border-line bg-bg-2/30 px-4 py-4 transition-colors hover:border-accent-dim hover:bg-bg-2/60"
+          className="group flex flex-col border border-line bg-bg-2/30 px-4 py-4 transition-colors hover:border-accent-dim hover:bg-bg-2/60"
         >
           <div className="flex items-center gap-2 font-mono text-[10px] tracking-[0.18em] uppercase text-ink-faint group-hover:text-accent mb-1.5 transition-colors">
             <span aria-hidden>←</span> previous
           </div>
-          {prev.section ? (
-            <div className="font-mono text-[10px] text-ink-dim tracking-[0.06em] mb-1">
-              {prev.section}
+          {/* `mt-auto` pushes section + title to the bottom of the card so
+              titles line up across prev / next even when one card has a
+              section label and the other doesn't. */}
+          <div className="mt-auto">
+            {prev.section ? (
+              <div className="font-mono text-[10px] text-ink-dim tracking-[0.06em] mb-1">
+                {prev.section}
+              </div>
+            ) : null}
+            <div className="font-mono text-[14px] text-ink group-hover:text-accent transition-colors font-semibold leading-snug truncate">
+              {prev.title}
             </div>
-          ) : null}
-          <div className="font-mono text-[14px] text-ink group-hover:text-accent transition-colors font-semibold leading-snug truncate">
-            {prev.title}
           </div>
         </Link>
       ) : (
@@ -83,18 +88,20 @@ export function DocsPrevNextBottom({
       {next ? (
         <Link
           href={hrefFor(next.slug)}
-          className="group border border-line bg-bg-2/30 px-4 py-4 transition-colors hover:border-accent-dim hover:bg-bg-2/60 sm:text-right"
+          className="group flex flex-col border border-line bg-bg-2/30 px-4 py-4 transition-colors hover:border-accent-dim hover:bg-bg-2/60 sm:text-right"
         >
           <div className="flex items-center gap-2 font-mono text-[10px] tracking-[0.18em] uppercase text-ink-faint group-hover:text-accent mb-1.5 transition-colors sm:justify-end">
             next <span aria-hidden>→</span>
           </div>
-          {next.section ? (
-            <div className="font-mono text-[10px] text-ink-dim tracking-[0.06em] mb-1">
-              {next.section}
+          <div className="mt-auto">
+            {next.section ? (
+              <div className="font-mono text-[10px] text-ink-dim tracking-[0.06em] mb-1">
+                {next.section}
+              </div>
+            ) : null}
+            <div className="font-mono text-[14px] text-ink group-hover:text-accent transition-colors font-semibold leading-snug truncate">
+              {next.title}
             </div>
-          ) : null}
-          <div className="font-mono text-[14px] text-ink group-hover:text-accent transition-colors font-semibold leading-snug truncate">
-            {next.title}
           </div>
         </Link>
       ) : (
