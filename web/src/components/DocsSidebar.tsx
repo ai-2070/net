@@ -104,7 +104,8 @@ function FileRow({
 }) {
   const on = isActive(node.slug, active);
   const treeChar = isLast ? "└─" : "├─";
-  const tag = hashHex4(node.slug.join("/"));
+  // const tag = hashHex4(node.slug.join("/"));
+
   return (
     <Link
       href={slugHref(node.slug)}
@@ -132,14 +133,14 @@ function FileRow({
           █
         </span>
       ) : null}
-      <span
+      {/*<span
         className={`shrink-0 ml-2 text-[9px] tracking-[0.04em] tabular-nums transition-colors ${
           on ? "text-accent-dim" : "text-ink-faint group-hover:text-ink-dim"
         }`}
         aria-hidden
       >
         ·{tag}
-      </span>
+      </span>*/}
     </Link>
   );
 }
