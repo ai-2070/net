@@ -230,9 +230,16 @@ export default async function DocPage({ params }: PageProps) {
   const source = readDocSource(resolved.file);
   const toc = extractToc(source);
   // For folder READMEs the URL uses the folder slug ([..., "plans"]) not
-  // the README's own slug ([..., "plans", "readme"]). Pick the right one
-  // so prev/next maps to the same key used by the sidebar order.
-  const lookupSlug = resolved.folder ? resolved.folder.slug : resolved.file.slug;
+  // the README's own slug ([..., "plans", "readme"]). Detect that via
+  // identity — `resolveDoc` returns the same `DocFile` the folder holds as
+  // its readme when (and only when) the URL pointed at the folder itself.
+  // A bare truthy check on `resolved.folder` would fire for every nested
+  // file (the resolver always sets the containing folder) and route
+  // prev/next to the README's neighbors instead of the page's own.
+  const isFolderReadme = resolved.folder?.readme === resolved.file;
+  const lookupSlug = isFolderReadme
+    ? resolved.folder!.slug
+    : resolved.file.slug;
   const { prev, next } = getPrevNext(lookupSlug);
   return (
     <>
