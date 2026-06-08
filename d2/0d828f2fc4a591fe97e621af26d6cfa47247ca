@@ -1,0 +1,28 @@
+net/crates/net/src/adapter/net/behavior/proximity.rs
+  s_6d49e1791ecda2::t_8fd9836fb1a3c7 14
+  s_6d49e1791ecda2::t_8c92b3f880df8c 504-506
+  s_6d49e1791ecda2::t_5e45b2dba2a7a5 455-461
+  s_6d49e1791ecda2::t_c04a53b8701e85 628-632,640
+  s_6d49e1791ecda2::t_c899723c190190 1003
+  s_6d49e1791ecda2::t_47e18ee848fa19 751
+  s_6d49e1791ecda2::t_86852451b0a57c 1396-1409,1411-1433
+  s_6d49e1791ecda2::t_748712e9a9ffea 702,713-721,723-725
+  s_6d49e1791ecda2::t_899940af6526a1 1410
+  s_6d49e1791ecda2::t_1b664af4b62812 975-978,988-990
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "d20d828f2fc4a591fe97e621af26d6cfa47247ca",
+  "prompts": {},
+  "sessions": {
+    "s_6d49e1791ecda2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0a4a66ed-48bf-46dc-9395-07f0622bc33a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
