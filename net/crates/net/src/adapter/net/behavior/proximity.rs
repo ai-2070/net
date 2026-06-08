@@ -11,7 +11,7 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::capability::{CapabilityFilter, CapabilitySet};
@@ -452,6 +452,13 @@ pub struct ProximityGraph {
     edges: DashMap<(NodeId, NodeId), ProximityEdge>,
     /// Seen pingwaves for deduplication
     seen_pingwaves: DashMap<(NodeId, u64), Instant>,
+    /// O(1) entry counts for `nodes` / `edges` / `seen_pingwaves`. Avoids the
+    /// per-shard walk of `DashMap::len()` (~1us) in `node_count()` / `stats()`.
+    /// Maintained exactly on every insert and decremented on eviction. See
+    /// docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §2.
+    num_nodes: AtomicUsize,
+    num_edges: AtomicUsize,
+    num_seen: AtomicUsize,
     /// Next pingwave sequence
     next_seq: AtomicU64,
     /// Local capability hash
@@ -494,6 +501,9 @@ impl ProximityGraph {
             nodes: DashMap::new(),
             edges: DashMap::new(),
             seen_pingwaves: DashMap::new(),
+            num_nodes: AtomicUsize::new(0),
+            num_edges: AtomicUsize::new(0),
+            num_seen: AtomicUsize::new(0),
             next_seq: AtomicU64::new(1),
             local_capability_hash: AtomicU64::new(0),
             local_capability_version: AtomicU64::new(0),
@@ -615,15 +625,19 @@ impl ProximityGraph {
             self.stats.pingwaves_dropped.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        self.seen_pingwaves.insert(key, Instant::now());
+        // Key the dedup-count bump on the insert result (None == new key) so
+        // it stays exact even under a concurrent insert of the same key.
+        if self.seen_pingwaves.insert(key, Instant::now()).is_none() {
+            self.num_seen.fetch_add(1, Ordering::Relaxed);
+        }
 
         // Update or create node
-        let _is_new = !self.nodes.contains_key(&pw.origin_id);
         self.nodes
             .entry(pw.origin_id)
             .and_modify(|node| node.update_from_pingwave(&pw, from_addr))
             .or_insert_with(|| {
                 self.stats.nodes_discovered.fetch_add(1, Ordering::Relaxed);
+                self.num_nodes.fetch_add(1, Ordering::Relaxed);
                 ProximityNode::from_pingwave(&pw, from_addr)
             });
 
@@ -685,6 +699,7 @@ impl ProximityGraph {
     /// the self → peer edge added at session setup); leave the
     /// existing latency alone in that case.
     fn insert_or_update_edge(&self, from: NodeId, to: NodeId, sample_us: u64) {
+        let mut edge_inserted = false;
         self.edges
             .entry((from, to))
             .and_modify(|edge| {
@@ -695,13 +710,19 @@ impl ProximityGraph {
                 }
                 edge.last_updated = Instant::now();
             })
-            .or_insert(ProximityEdge {
-                from,
-                to,
-                latency_us: sample_us,
-                last_updated: Instant::now(),
-                reliability: 1.0,
+            .or_insert_with(|| {
+                edge_inserted = true;
+                ProximityEdge {
+                    from,
+                    to,
+                    latency_us: sample_us,
+                    last_updated: Instant::now(),
+                    reliability: 1.0,
+                }
             });
+        if edge_inserted {
+            self.num_edges.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Drop edges whose `last_updated` is older than `max_age`. Called
@@ -727,6 +748,7 @@ impl ProximityGraph {
             }
             !is_stale
         });
+        self.num_edges.fetch_sub(removed, Ordering::Relaxed);
         removed
     }
 
@@ -950,6 +972,10 @@ impl ProximityGraph {
             }
         });
 
+        // Keep the O(1) counters exact after eviction.
+        self.num_nodes.fetch_sub(removed_nodes, Ordering::Relaxed);
+        self.num_seen.fetch_sub(removed_pingwaves, Ordering::Relaxed);
+
         CleanupStats {
             removed_nodes,
             removed_pingwaves,
@@ -959,9 +985,9 @@ impl ProximityGraph {
     /// Get statistics snapshot
     pub fn stats(&self) -> ProximityStatsSnapshot {
         ProximityStatsSnapshot {
-            node_count: self.nodes.len(),
-            edge_count: self.edges.len(),
-            dedup_cache_size: self.seen_pingwaves.len(),
+            node_count: self.num_nodes.load(Ordering::Relaxed),
+            edge_count: self.num_edges.load(Ordering::Relaxed),
+            dedup_cache_size: self.num_seen.load(Ordering::Relaxed),
             pingwaves_sent: self.stats.pingwaves_sent.load(Ordering::Relaxed),
             pingwaves_received: self.stats.pingwaves_received.load(Ordering::Relaxed),
             pingwaves_forwarded: self.stats.pingwaves_forwarded.load(Ordering::Relaxed),
@@ -974,7 +1000,7 @@ impl ProximityGraph {
 
     /// Get node count
     pub fn node_count(&self) -> usize {
-        self.nodes.len()
+        self.num_nodes.load(Ordering::Relaxed)
     }
 }
 
@@ -1365,6 +1391,45 @@ mod tests {
         let stats = graph.cleanup();
         assert_eq!(stats.removed_nodes, 1);
         assert_eq!(graph.node_count(), 0);
+    }
+
+    /// The O(1) `num_nodes` / `num_edges` / `num_seen` counters backing
+    /// `node_count()` / `stats()` must stay exactly in step with the
+    /// underlying `DashMap` lengths across inserts, duplicates, edge
+    /// sweeps, and node/dedup cleanup.
+    #[test]
+    fn proximity_entry_counters_track_map_lengths() {
+        let config = ProximityConfig {
+            node_timeout: Duration::from_millis(5),
+            dedup_timeout: Duration::from_millis(5),
+            ..Default::default()
+        };
+        let graph = ProximityGraph::new(make_node_id(1), config);
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        for origin in 2u8..6 {
+            graph.on_pingwave(EnhancedPingwave::new(make_node_id(origin), 1, 3), from);
+        }
+        let s = graph.stats();
+        assert_eq!(s.node_count, graph.nodes.len());
+        assert_eq!(s.edge_count, graph.edges.len());
+        assert_eq!(s.dedup_cache_size, graph.seen_pingwaves.len());
+
+        // Duplicate (origin, seq) must not double-count.
+        graph.on_pingwave(EnhancedPingwave::new(make_node_id(2), 1, 3), from);
+        assert_eq!(graph.stats().dedup_cache_size, graph.seen_pingwaves.len());
+        assert_eq!(graph.node_count(), graph.nodes.len());
+
+        // Edge sweep must keep edge_count in step.
+        std::thread::sleep(Duration::from_millis(10));
+        graph.sweep_stale_edges(Duration::from_millis(5));
+        assert_eq!(graph.stats().edge_count, graph.edges.len());
+
+        // Node/dedup cleanup must keep their counters in step.
+        graph.cleanup();
+        let s = graph.stats();
+        assert_eq!(s.node_count, graph.nodes.len());
+        assert_eq!(s.dedup_cache_size, graph.seen_pingwaves.len());
     }
 
     #[test]
