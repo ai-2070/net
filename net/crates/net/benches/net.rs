@@ -1727,11 +1727,18 @@ fn bench_failure_detector(c: &mut Criterion) {
         b.iter(|| detector.heartbeat(500, addr));
     });
 
+    // Dedicated detector: heartbeat_new inserts a fresh id every iteration,
+    // which over a Criterion measurement window balloons the map to millions
+    // of entries. Sharing the main `detector` would pollute the steady-state
+    // 1000-node fixture that check_all/stats measure against (the source of
+    // the old multi-hundred-ms check_all artifact). See
+    // docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §7.
+    let growth_detector = FailureDetector::new();
     group.bench_function("heartbeat_new", |b| {
         let mut id = 10000u64;
         let addr: std::net::SocketAddr = "127.0.0.1:8000".parse().unwrap();
         b.iter(|| {
-            detector.heartbeat(id, addr);
+            growth_detector.heartbeat(id, addr);
             id += 1;
         });
     });

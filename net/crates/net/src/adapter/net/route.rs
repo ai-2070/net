@@ -8,7 +8,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// Routing header size in bytes.
@@ -478,6 +478,13 @@ pub struct RoutingTable {
     /// cheap and lock-free. Initialized to `u64::MAX` (effectively
     /// disabled) — `MeshNode` sets this at construction.
     max_route_age_nanos: AtomicU64,
+    /// O(1) entry counts for `routes` / `stream_stats`. `DashMap::len()`
+    /// walks every shard (~1us); the stream-admission gate (`may_admit_stream`,
+    /// per novel stream) and route_count()/stream_count()/aggregate_stats read
+    /// these atomics instead. Maintained exactly on every insert/remove. See
+    /// docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §2/§4.
+    num_routes: AtomicUsize,
+    num_streams: AtomicUsize,
 }
 
 impl RoutingTable {
@@ -488,6 +495,8 @@ impl RoutingTable {
             stream_stats: DashMap::new(),
             local_id,
             max_route_age_nanos: AtomicU64::new(u64::MAX),
+            num_routes: AtomicUsize::new(0),
+            num_streams: AtomicUsize::new(0),
         }
     }
 
@@ -505,7 +514,14 @@ impl RoutingTable {
     /// indirect routes installed from pingwaves carry `hop_count + 2`, so
     /// they're never below 2). Also refreshes `updated_at`.
     pub fn add_route(&self, dest_id: u64, next_hop: SocketAddr) {
-        self.routes.insert(dest_id, RouteEntry::new(next_hop));
+        // insert returns the previous value; None == genuinely new key.
+        if self
+            .routes
+            .insert(dest_id, RouteEntry::new(next_hop))
+            .is_none()
+        {
+            self.num_routes.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Add or update a route with an explicit metric.
@@ -524,6 +540,7 @@ impl RoutingTable {
         match self.routes.entry(dest_id) {
             Entry::Vacant(v) => {
                 v.insert(RouteEntry::with_metric(next_hop, metric));
+                self.num_routes.fetch_add(1, Ordering::Relaxed);
             }
             Entry::Occupied(mut o) => {
                 if metric < o.get().metric {
@@ -544,7 +561,10 @@ impl RoutingTable {
 
     /// Remove a route
     pub fn remove_route(&self, dest_id: u64) -> Option<RouteEntry> {
-        self.routes.remove(&dest_id).map(|(_, v)| v)
+        self.routes.remove(&dest_id).map(|(_, v)| {
+            self.num_routes.fetch_sub(1, Ordering::Relaxed);
+            v
+        })
     }
 
     /// Remove the route for `dest_id` only if its current `next_hop`
@@ -553,9 +573,14 @@ impl RoutingTable {
     /// a newer concurrently-written entry. Returns `true` if the entry
     /// was removed.
     pub fn remove_route_if_next_hop_is(&self, dest_id: u64, expected_next_hop: SocketAddr) -> bool {
-        self.routes
+        let removed = self
+            .routes
             .remove_if(&dest_id, |_, entry| entry.next_hop == expected_next_hop)
-            .is_some()
+            .is_some();
+        if removed {
+            self.num_routes.fetch_sub(1, Ordering::Relaxed);
+        }
+        removed
     }
 
     /// Look up next hop for destination.
@@ -613,6 +638,7 @@ impl RoutingTable {
             }
             keep
         });
+        self.num_routes.fetch_sub(removed, Ordering::Relaxed);
         removed
     }
 
@@ -638,12 +664,40 @@ impl RoutingTable {
         dest_id == self.local_id
     }
 
-    /// Get or create stream stats
+    /// Get or create the stream-stats entry, maintaining `num_streams`.
+    /// All `stream_stats` insertions funnel through here so the O(1) count
+    /// stays exact (the Vacant arm is the only branch that grows the map).
+    fn stream_entry(
+        &self,
+        stream_id: u64,
+    ) -> dashmap::mapref::one::RefMut<'_, u64, SchedulerStreamStats> {
+        use dashmap::mapref::entry::Entry;
+        match self.stream_stats.entry(stream_id) {
+            Entry::Occupied(o) => o.into_ref(),
+            Entry::Vacant(v) => {
+                self.num_streams.fetch_add(1, Ordering::Relaxed);
+                v.insert(SchedulerStreamStats::default())
+            }
+        }
+    }
+
+    /// Get stream stats, creating the entry if absent.
+    ///
+    /// Shares the [`MAX_STREAM_STATS`] admission gate with the `record_*`
+    /// methods: an existing entry is always returned, but a novel
+    /// `stream_id` is only created (and returned) while the map is below
+    /// the cap, returning `None` once it's reached. Without this gate,
+    /// `get_stream_stats` was an unbounded-growth hole — it inserted a
+    /// fresh entry for any id regardless of the cap the `record_*` path
+    /// enforces.
     pub fn get_stream_stats(
         &self,
         stream_id: u64,
-    ) -> dashmap::mapref::one::Ref<'_, u64, SchedulerStreamStats> {
-        self.stream_stats.entry(stream_id).or_default().downgrade()
+    ) -> Option<dashmap::mapref::one::Ref<'_, u64, SchedulerStreamStats>> {
+        if !self.may_admit_stream(stream_id) {
+            return None;
+        }
+        Some(self.stream_entry(stream_id).downgrade())
     }
 
     /// Returns true if this stream id may be inserted into
@@ -658,7 +712,7 @@ impl RoutingTable {
         if self.stream_stats.contains_key(&stream_id) {
             return true;
         }
-        self.stream_stats.len() < MAX_STREAM_STATS
+        self.num_streams.load(Ordering::Relaxed) < MAX_STREAM_STATS
     }
 
     /// Record incoming packet for stream
@@ -666,10 +720,7 @@ impl RoutingTable {
         if !self.may_admit_stream(stream_id) {
             return;
         }
-        self.stream_stats
-            .entry(stream_id)
-            .or_default()
-            .record_in(bytes);
+        self.stream_entry(stream_id).record_in(bytes);
     }
 
     /// Record outgoing packet for stream
@@ -677,10 +728,7 @@ impl RoutingTable {
         if !self.may_admit_stream(stream_id) {
             return;
         }
-        self.stream_stats
-            .entry(stream_id)
-            .or_default()
-            .record_out(bytes);
+        self.stream_entry(stream_id).record_out(bytes);
     }
 
     /// Record dropped packet for stream
@@ -688,20 +736,17 @@ impl RoutingTable {
         if !self.may_admit_stream(stream_id) {
             return;
         }
-        self.stream_stats
-            .entry(stream_id)
-            .or_default()
-            .record_drop();
+        self.stream_entry(stream_id).record_drop();
     }
 
     /// Get number of routes
     pub fn route_count(&self) -> usize {
-        self.routes.len()
+        self.num_routes.load(Ordering::Relaxed)
     }
 
     /// Get number of active streams
     pub fn stream_count(&self) -> usize {
-        self.stream_stats.len()
+        self.num_streams.load(Ordering::Relaxed)
     }
 
     /// Mark route as inactive (on failure)
@@ -738,6 +783,7 @@ impl RoutingTable {
                 true
             }
         });
+        self.num_streams.fetch_sub(removed, Ordering::Relaxed);
         removed
     }
 
@@ -754,8 +800,8 @@ impl RoutingTable {
         }
 
         AggregateStats {
-            routes: self.routes.len(),
-            streams: self.stream_stats.len(),
+            routes: self.num_routes.load(Ordering::Relaxed),
+            streams: self.num_streams.load(Ordering::Relaxed),
             packets_in: total_in,
             packets_out: total_out,
             packets_dropped: total_drops,
@@ -1030,6 +1076,47 @@ mod tests {
         assert_eq!(stats.packets_in, 3);
         assert_eq!(stats.packets_out, 1);
         assert_eq!(stats.packets_dropped, 1);
+    }
+
+    /// route_count() / stream_count() / aggregate_stats.{routes,streams} read
+    /// O(1) counters that must track the maps across add (new vs overwrite vs
+    /// worse-metric), remove, route sweep, and idle-stream cleanup.
+    #[test]
+    fn route_and_stream_counts_track_inserts_and_removals() {
+        let table = RoutingTable::new(0x1);
+        let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:2".parse().unwrap();
+
+        table.add_route(0x10, a);
+        table.add_route(0x11, b);
+        table.add_route(0x10, b); // overwrite same dest — not a new route
+        assert_eq!(table.route_count(), 2);
+
+        table.add_route_with_metric(0x12, a, 5); // new dest
+        assert_eq!(table.route_count(), 3);
+        table.add_route_with_metric(0x12, b, 9); // worse metric — kept, no add
+        assert_eq!(table.route_count(), 3);
+
+        assert!(table.remove_route(0x10).is_some());
+        assert_eq!(table.route_count(), 2);
+        assert!(table.remove_route(0x999).is_none()); // absent — no change
+        assert_eq!(table.route_count(), 2);
+
+        table.record_in(1, 10);
+        table.record_in(2, 10);
+        table.record_in(1, 10); // existing stream — not new
+        assert_eq!(table.stream_count(), 2);
+
+        let agg = table.aggregate_stats();
+        assert_eq!(agg.routes, 2);
+        assert_eq!(agg.streams, 2);
+
+        // Sweep every route (ZERO max-age makes all stale) and clean up every
+        // idle stream (idle_nanos = 0) — both counters must return to 0.
+        table.sweep_stale(std::time::Duration::ZERO);
+        assert_eq!(table.route_count(), 0);
+        table.cleanup_idle_streams(0);
+        assert_eq!(table.stream_count(), 0);
     }
 
     /// A direct route (metric 1) must NOT be replaced by an indirect
@@ -1379,6 +1466,50 @@ mod tests {
             stats.get_packets_in() >= 2,
             "existing entry must continue to record despite the \
              cap — fix is admit-side only"
+        );
+    }
+
+    /// `get_stream_stats` shares the `record_*` admission gate: it returns
+    /// an existing entry, creates+returns a novel one below the cap, but
+    /// returns `None` (without growing the map) for a novel id once the cap
+    /// is reached. Pre-fix it inserted unconditionally — an unbounded-growth
+    /// hole the `record_*` path had already closed.
+    #[test]
+    fn get_stream_stats_respects_stream_cap() {
+        let table = RoutingTable::new(0xCAFE);
+
+        // Below the cap: a novel id is created and returned.
+        assert!(
+            table.get_stream_stats(1).is_some(),
+            "novel stream below the cap must be created and returned"
+        );
+        assert_eq!(table.stream_count(), 1);
+
+        // Fill the rest of the way to the cap via the public record path.
+        for i in 2..=MAX_STREAM_STATS as u64 {
+            table.record_in(i, 1);
+        }
+        assert_eq!(table.stream_count(), MAX_STREAM_STATS);
+
+        // At the cap: a novel id must NOT be created, and the map must
+        // not grow.
+        let novel = MAX_STREAM_STATS as u64 + 100;
+        assert!(
+            table.get_stream_stats(novel).is_none(),
+            "novel stream at cap must return None instead of inserting \
+             (pre-fix get_stream_stats grew the map unboundedly)"
+        );
+        assert!(!table.stream_stats.contains_key(&novel));
+        assert_eq!(
+            table.stream_count(),
+            MAX_STREAM_STATS,
+            "get_stream_stats must not grow the map past the cap"
+        );
+
+        // An existing id is always returned, even at the cap.
+        assert!(
+            table.get_stream_stats(1).is_some(),
+            "existing stream must always be returned, even at the cap"
         );
     }
 

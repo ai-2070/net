@@ -1848,7 +1848,12 @@ impl<'a> CapabilityViews<'a> {
 /// so consecutive `views()` calls produce identical projections.
 fn sorted_tag_vec(tags: &HashSet<Tag>) -> Vec<Tag> {
     let mut v: Vec<Tag> = tags.iter().cloned().collect();
-    v.sort_by_key(|a| a.to_string());
+    // `sort_by_cached_key` computes each `Tag::to_string()` exactly once
+    // (N allocations) instead of `sort_by_key`'s re-evaluation on every
+    // comparison (~N log N allocations). Output order is identical, so signed
+    // announcement bytes stay stable. See
+    // docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §3.
+    v.sort_by_cached_key(|a| a.to_string());
     v
 }
 
@@ -2892,6 +2897,56 @@ mod tests {
         );
         assert_eq!(caps.tags, parsed.tags);
         assert_eq!(caps.views().models().len(), parsed.views().models().len());
+    }
+
+    /// Regression guard for the `sort_by_cached_key` optimization in
+    /// `sorted_tag_vec`: human-readable (JSON) serialization must remain
+    /// byte-stable regardless of `HashSet` iteration order, otherwise signed
+    /// `CapabilityAnnouncement` bytes would diverge across peers.
+    #[test]
+    fn json_tag_serialization_is_byte_stable_across_insertion_orders() {
+        // Plain legacy tags (no axis prefixes, no substring overlaps) so
+        // `Tag::to_string()` == the input string and ordering is unambiguous.
+        let tags = [
+            "inference",
+            "alpha",
+            "zulu",
+            "mike",
+            "bravo",
+            "yankee",
+            "delta",
+        ];
+
+        let mut forward = CapabilitySet::new();
+        for t in tags.iter() {
+            forward = forward.add_tag(*t);
+        }
+        let mut reverse = CapabilitySet::new();
+        for t in tags.iter().rev() {
+            reverse = reverse.add_tag(*t);
+        }
+        assert_eq!(forward.tags.len(), tags.len(), "all tags should parse");
+
+        // JSON (human-readable) bytes must be identical regardless of the
+        // order tags were inserted into the underlying HashSet.
+        let a = serde_json::to_vec(&forward).unwrap();
+        let b = serde_json::to_vec(&reverse).unwrap();
+        assert_eq!(
+            a, b,
+            "JSON serialization must be insertion-order-independent"
+        );
+
+        // The emitted `tags` array must be in `Tag::to_string()` sorted order.
+        let value: serde_json::Value = serde_json::from_slice(&a).unwrap();
+        let emitted: Vec<String> = value["tags"]
+            .as_array()
+            .expect("tags is a JSON array")
+            .iter()
+            .map(|t| t.as_str().unwrap().to_string())
+            .collect();
+        let mut expected = emitted.clone();
+        expected.sort();
+        assert_eq!(emitted, expected, "tags must be emitted in sorted order");
     }
     /// A-4: `with_metadata` consults `METADATA_RESERVED_PREFIXES`,
     /// which is now empty — the `tool::*` family was hoisted out
