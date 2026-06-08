@@ -2,8 +2,7 @@
 #
 # No CPU-feature baseline is enforced, so builds stay portable across all x86-64
 # and ARM hosts. The x86-64 SIMD crypto speedup is opt-in per deploy — e.g.
-# `RUSTFLAGS="-C target-feature=+avx2" cargo build --release`. Rationale + full
-# perf audit: docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §1.
+# `RUSTFLAGS="-C target-feature=+avx2" cargo build --release`.
 
 [profile.release]
 # LTO and codegen-units are configured in Cargo.toml.
