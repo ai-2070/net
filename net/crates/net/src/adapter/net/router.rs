@@ -1360,7 +1360,10 @@ mod tests {
         let _ = router.route_packet(packet.freeze(), from);
 
         // The stream stats should be keyed by the correct stream_id
-        let stats = router.routing_table().get_stream_stats(expected_stream_id);
+        let stats = router
+            .routing_table()
+            .get_stream_stats(expected_stream_id)
+            .expect("stream stats recorded for the routed packet");
         assert_eq!(
             stats.get_packets_in(),
             1,
@@ -1564,7 +1567,10 @@ mod tests {
         let result = router.route_packet(packet.freeze(), from);
         assert!(matches!(result, Err(RouterError::TtlExpired)));
 
-        let stats = router.routing_table().get_stream_stats(stream_id);
+        let stats = router
+            .routing_table()
+            .get_stream_stats(stream_id)
+            .expect("stream stats present for the dropped packet");
         assert_eq!(
             stats.get_packets_in(),
             0,

@@ -681,12 +681,23 @@ impl RoutingTable {
         }
     }
 
-    /// Get or create stream stats
+    /// Get stream stats, creating the entry if absent.
+    ///
+    /// Shares the [`MAX_STREAM_STATS`] admission gate with the `record_*`
+    /// methods: an existing entry is always returned, but a novel
+    /// `stream_id` is only created (and returned) while the map is below
+    /// the cap, returning `None` once it's reached. Without this gate,
+    /// `get_stream_stats` was an unbounded-growth hole — it inserted a
+    /// fresh entry for any id regardless of the cap the `record_*` path
+    /// enforces.
     pub fn get_stream_stats(
         &self,
         stream_id: u64,
-    ) -> dashmap::mapref::one::Ref<'_, u64, SchedulerStreamStats> {
-        self.stream_entry(stream_id).downgrade()
+    ) -> Option<dashmap::mapref::one::Ref<'_, u64, SchedulerStreamStats>> {
+        if !self.may_admit_stream(stream_id) {
+            return None;
+        }
+        Some(self.stream_entry(stream_id).downgrade())
     }
 
     /// Returns true if this stream id may be inserted into
@@ -1455,6 +1466,50 @@ mod tests {
             stats.get_packets_in() >= 2,
             "existing entry must continue to record despite the \
              cap — fix is admit-side only"
+        );
+    }
+
+    /// `get_stream_stats` shares the `record_*` admission gate: it returns
+    /// an existing entry, creates+returns a novel one below the cap, but
+    /// returns `None` (without growing the map) for a novel id once the cap
+    /// is reached. Pre-fix it inserted unconditionally — an unbounded-growth
+    /// hole the `record_*` path had already closed.
+    #[test]
+    fn get_stream_stats_respects_stream_cap() {
+        let table = RoutingTable::new(0xCAFE);
+
+        // Below the cap: a novel id is created and returned.
+        assert!(
+            table.get_stream_stats(1).is_some(),
+            "novel stream below the cap must be created and returned"
+        );
+        assert_eq!(table.stream_count(), 1);
+
+        // Fill the rest of the way to the cap via the public record path.
+        for i in 2..=MAX_STREAM_STATS as u64 {
+            table.record_in(i, 1);
+        }
+        assert_eq!(table.stream_count(), MAX_STREAM_STATS);
+
+        // At the cap: a novel id must NOT be created, and the map must
+        // not grow.
+        let novel = MAX_STREAM_STATS as u64 + 100;
+        assert!(
+            table.get_stream_stats(novel).is_none(),
+            "novel stream at cap must return None instead of inserting \
+             (pre-fix get_stream_stats grew the map unboundedly)"
+        );
+        assert!(!table.stream_stats.contains_key(&novel));
+        assert_eq!(
+            table.stream_count(),
+            MAX_STREAM_STATS,
+            "get_stream_stats must not grow the map past the cap"
+        );
+
+        // An existing id is always returned, even at the cap.
+        assert!(
+            table.get_stream_stats(1).is_some(),
+            "existing stream must always be returned, even at the cap"
         );
     }
 
