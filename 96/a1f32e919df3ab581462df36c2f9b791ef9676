@@ -1,0 +1,22 @@
+net/crates/net/docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md
+  s_6d49e1791ecda2::t_99e7ef1b44a4d5 334-338
+  s_6d49e1791ecda2::t_8a5b1022e4b8b2 72-73,75-91
+net/crates/net/.cargo/config.toml
+  s_6d49e1791ecda2::t_dfce2dd53265df 3-7,9-23,38-46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "96a1f32e919df3ab581462df36c2f9b791ef9676",
+  "prompts": {},
+  "sessions": {
+    "s_6d49e1791ecda2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0a4a66ed-48bf-46dc-9395-07f0622bc33a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
