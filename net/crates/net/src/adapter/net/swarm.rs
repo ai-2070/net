@@ -853,7 +853,8 @@ impl LocalGraph {
 
         // Keep the O(1) counters exact after eviction.
         self.num_nodes.fetch_sub(removed_nodes, Ordering::Relaxed);
-        self.num_seen.fetch_sub(removed_pingwaves, Ordering::Relaxed);
+        self.num_seen
+            .fetch_sub(removed_pingwaves, Ordering::Relaxed);
 
         (removed_nodes, removed_pingwaves)
     }
@@ -988,9 +989,7 @@ mod tests {
         assert_eq!(graph.seen_pingwaves.len(), MAX_SEEN_PINGWAVES);
         // The direct inserts above bypass `on_pingwave`, so sync the O(1)
         // counter the soft-cap gate now reads to match the pre-filled state.
-        graph
-            .num_seen
-            .store(MAX_SEEN_PINGWAVES, Ordering::Relaxed);
+        graph.num_seen.store(MAX_SEEN_PINGWAVES, Ordering::Relaxed);
 
         // Send a novel pingwave → must be dropped.
         let novel_pw = Pingwave::new(0xCAFE, 1, 3);
@@ -1024,7 +1023,10 @@ mod tests {
         }
         assert_eq!(graph.node_count(), graph.nodes.len());
         assert_eq!(graph.node_count(), 5);
-        assert_eq!(graph.stats().pingwave_cache_size, graph.seen_pingwaves.len());
+        assert_eq!(
+            graph.stats().pingwave_cache_size,
+            graph.seen_pingwaves.len()
+        );
         assert_eq!(graph.stats().pingwave_cache_size, 5);
 
         // A duplicate (origin, seq) must not double-count either map.
@@ -1042,7 +1044,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         graph.cleanup();
         assert_eq!(graph.node_count(), graph.nodes.len());
-        assert_eq!(graph.stats().pingwave_cache_size, graph.seen_pingwaves.len());
+        assert_eq!(
+            graph.stats().pingwave_cache_size,
+            graph.seen_pingwaves.len()
+        );
     }
 
     /// Regression for BUG_AUDIT_2026_04_30_CORE.md #120: pre-fix

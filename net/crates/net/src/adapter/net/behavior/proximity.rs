@@ -974,7 +974,8 @@ impl ProximityGraph {
 
         // Keep the O(1) counters exact after eviction.
         self.num_nodes.fetch_sub(removed_nodes, Ordering::Relaxed);
-        self.num_seen.fetch_sub(removed_pingwaves, Ordering::Relaxed);
+        self.num_seen
+            .fetch_sub(removed_pingwaves, Ordering::Relaxed);
 
         CleanupStats {
             removed_nodes,

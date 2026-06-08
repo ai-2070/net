@@ -2907,7 +2907,15 @@ mod tests {
     fn json_tag_serialization_is_byte_stable_across_insertion_orders() {
         // Plain legacy tags (no axis prefixes, no substring overlaps) so
         // `Tag::to_string()` == the input string and ordering is unambiguous.
-        let tags = ["inference", "alpha", "zulu", "mike", "bravo", "yankee", "delta"];
+        let tags = [
+            "inference",
+            "alpha",
+            "zulu",
+            "mike",
+            "bravo",
+            "yankee",
+            "delta",
+        ];
 
         let mut forward = CapabilitySet::new();
         for t in tags.iter() {
@@ -2923,7 +2931,10 @@ mod tests {
         // order tags were inserted into the underlying HashSet.
         let a = serde_json::to_vec(&forward).unwrap();
         let b = serde_json::to_vec(&reverse).unwrap();
-        assert_eq!(a, b, "JSON serialization must be insertion-order-independent");
+        assert_eq!(
+            a, b,
+            "JSON serialization must be insertion-order-independent"
+        );
 
         // The emitted `tags` array must be in `Tag::to_string()` sorted order.
         let value: serde_json::Value = serde_json::from_slice(&a).unwrap();

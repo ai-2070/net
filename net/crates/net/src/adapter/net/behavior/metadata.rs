@@ -1037,8 +1037,7 @@ impl MetadataStore {
         // pattern used by `TokenCache::insert_unchecked` and
         // `ContextStore::create_context`.
         if let Some(max) = self.max_capacity {
-            if !self.nodes.contains_key(&node_id)
-                && self.node_count.load(Ordering::Relaxed) >= max
+            if !self.nodes.contains_key(&node_id) && self.node_count.load(Ordering::Relaxed) >= max
             {
                 return Err(MetadataError::CapacityExceeded);
             }
@@ -2003,9 +2002,7 @@ mod tests {
         let store = MetadataStore::new();
         for i in 0..4u8 {
             store
-                .upsert(
-                    NodeMetadata::new(make_node_id(i)).with_status(NodeStatus::Online),
-                )
+                .upsert(NodeMetadata::new(make_node_id(i)).with_status(NodeStatus::Online))
                 .unwrap();
         }
         assert_eq!(store.len(), 4);
