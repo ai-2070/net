@@ -305,3 +305,47 @@ it carries `content` + tags `Vec<String>` + `source`.)
 6. Fix the bench fixtures (§7) so the 168/198/670 ms numbers reflect reality.
 
 Items 1 and 2 are trivial, safe, and high-impact.
+
+---
+
+## Resolution (2026-06-08)
+
+Implemented on branch `perf/benchmark-wins-2026-06-08`, one commit per concern,
+each with tests; full lib suite (4192 tests) green and all benches compile.
+
+- **§1 Crypto AVX2** — DONE. `.cargo/config.toml` now sets a portable `+avx2`
+  floor; `bench-native` alias injects `target-cpu=native`.
+- **§2 / §4 O(1) counters** — DONE across all five subsystems. `AtomicUsize`
+  counters maintained on insert/remove/eviction replace `DashMap::len()` shard
+  walks in `LocalGraph`, `ProximityGraph`, `MetadataStore`, `FailureDetector`,
+  and `RoutingTable` (incl. the hot `seen_pingwaves` and `may_admit_stream`
+  gates). `MetadataStore::stats()` now reads the inverted indexes instead of a
+  full scan + per-node `String` alloc. `FailureDetector::check_all()` reads the
+  clock once per sweep.
+  - The `FailureDetector` per-status (healthy/suspected/failed) tally is left
+    as a scan **by design**: it's observability-only, and node status is
+    mutated in place (`get_mut().status = …`) by tests, so maintained
+    per-status counters would silently drift. The scan is always exact.
+- **§3 Capability serialize** — DONE (`sort_by_cached_key`).
+- **§5 Capability query single-axis fast path** — **NOT done (deliberate).**
+  `resolve_candidate_keys` is an intricate query planner whose `HashSet` +
+  sort/dedup guarantee correctness when a node appears under multiple classes.
+  The fold scan is by-design (see memory `capability-checks-use-folds`). The
+  ~1.5–2× win applies only to broad queries returning thousands of rows; the
+  regression risk to the capability-routing path outweighs it. Revisit only
+  with a dedicated correctness harness.
+- **§6 Cortex ingest scratch buffer** — **NOT done (no actual win).** On
+  inspection `ingest_typed` already does a single `postcard::to_allocvec` whose
+  `Vec` is moved into `Bytes` zero-copy (`Bytes::from`). A reused scratch buffer
+  would force `Bytes::copy_from_slice` — adding a copy, not removing the alloc.
+  The ~214 ns is postcard serialization + checksum, not avoidable allocation.
+- **§7 Benchmark artifacts** — PARTIALLY addressed. The `stats`/`len`/
+  `node_count` multi-hundred-ms/µs artifacts are now moot because those methods
+  are O(1) regardless of map size (§2/§4). `check_all` is still O(n), so its
+  bench fixture was fixed: `heartbeat_new` got a dedicated `growth_detector` so
+  it no longer bloats the steady-state detector that `check_all` measures. The
+  shared-`PacketPool` contention bench is a bench-only anti-pattern baseline
+  (production uses `ThreadLocalPool`) and is kept as a documented contrast. The
+  `event/internal_event_new` bench keeps its name (an explanatory comment
+  already documents that it measures `from_value`); renaming would only break
+  Criterion baseline continuity.
