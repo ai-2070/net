@@ -905,6 +905,28 @@ pub struct GraphStats {
 mod tests {
     use super::*;
 
+    /// Test-only counted inserts. Some tests pre-seed a specific topology
+    /// (e.g. nodes at exact hop distances, or `seen_pingwaves` filled to the
+    /// cap) that the public `on_pingwave`/`on_capability` paths can't easily
+    /// reproduce. Doing that with raw `nodes.insert`/`seen_pingwaves.insert`
+    /// desyncs the O(1) counters from the maps — which both masks a counter
+    /// regression in the real paths and risks an `AtomicUsize` underflow if
+    /// the test later hits a counted removal (`cleanup`). Funnel every test
+    /// insert through these so the counters stay exact.
+    impl LocalGraph {
+        fn insert_node_for_test(&self, id: u64, info: NodeInfo) {
+            if self.nodes.insert(id, info).is_none() {
+                self.num_nodes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        fn mark_seen_for_test(&self, key: (u64, u64)) {
+            if self.seen_pingwaves.insert(key, Instant::now()).is_none() {
+                self.num_seen.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     #[test]
     fn test_pingwave_roundtrip() {
         let pw = Pingwave::new(0x123456789ABCDEF0, 42, 3);
@@ -980,16 +1002,14 @@ mod tests {
         let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
         // Pre-fill seen_pingwaves to the cap with synthetic keys
-        // that won't collide with the test's input.
+        // that won't collide with the test's input. The counted helper
+        // keeps `num_seen` (which the soft-cap gate reads) in step with
+        // the map.
         for i in 0..MAX_SEEN_PINGWAVES as u64 {
-            graph
-                .seen_pingwaves
-                .insert((0xDEAD_BEEF_0000 + i, 0), Instant::now());
+            graph.mark_seen_for_test((0xDEAD_BEEF_0000 + i, 0));
         }
         assert_eq!(graph.seen_pingwaves.len(), MAX_SEEN_PINGWAVES);
-        // The direct inserts above bypass `on_pingwave`, so sync the O(1)
-        // counter the soft-cap gate now reads to match the pre-filled state.
-        graph.num_seen.store(MAX_SEEN_PINGWAVES, Ordering::Relaxed);
+        assert_eq!(graph.stats().pingwave_cache_size, MAX_SEEN_PINGWAVES);
 
         // Send a novel pingwave → must be dropped.
         let novel_pw = Pingwave::new(0xCAFE, 1, 3);
@@ -1276,15 +1296,15 @@ mod tests {
         let graph = LocalGraph::new(0x1, 8);
         let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
-        // Pre-populate `nodes` to the cap with synthetic ids.
+        // Pre-populate `nodes` to the cap with synthetic ids. The counted
+        // helper keeps `num_nodes` (which the soft-cap gate reads) in step
+        // with the map.
         for i in 0..MAX_GRAPH_NODES as u64 {
             let id = 0xDEAD_BEEF_0000 + i;
-            graph.nodes.insert(id, NodeInfo::new(id, from, 1));
+            graph.insert_node_for_test(id, NodeInfo::new(id, from, 1));
         }
         assert_eq!(graph.nodes.len(), MAX_GRAPH_NODES);
-        // Direct inserts bypass `on_pingwave`; sync the O(1) counter the
-        // soft-cap gate now reads to match the pre-filled state.
-        graph.num_nodes.store(MAX_GRAPH_NODES, Ordering::Relaxed);
+        assert_eq!(graph.node_count(), MAX_GRAPH_NODES);
 
         // A pingwave from a novel origin must NOT be inserted.
         let novel_pw = Pingwave::new(0xFACE, 1, 3);
@@ -1380,8 +1400,8 @@ mod tests {
 
         // Add some nodes
         let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-        graph.nodes.insert(0x2222, NodeInfo::new(0x2222, addr, 1));
-        graph.nodes.insert(0x3333, NodeInfo::new(0x3333, addr, 2));
+        graph.insert_node_for_test(0x2222, NodeInfo::new(0x2222, addr, 1));
+        graph.insert_node_for_test(0x3333, NodeInfo::new(0x3333, addr, 2));
 
         // Add capabilities
         let caps1 = Capabilities::new().with_gpu(true).with_tool("python");
@@ -1489,9 +1509,9 @@ mod tests {
         let graph = LocalGraph::new(0x1111, 3);
         let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
         // Three nodes at distinct hop distances with distinct tags.
-        graph.nodes.insert(0x2222, NodeInfo::new(0x2222, addr, 1));
-        graph.nodes.insert(0x3333, NodeInfo::new(0x3333, addr, 2));
-        graph.nodes.insert(0x4444, NodeInfo::new(0x4444, addr, 3));
+        graph.insert_node_for_test(0x2222, NodeInfo::new(0x2222, addr, 1));
+        graph.insert_node_for_test(0x3333, NodeInfo::new(0x3333, addr, 2));
+        graph.insert_node_for_test(0x4444, NodeInfo::new(0x4444, addr, 3));
 
         let caps_gpu = Capabilities::new().with_gpu(true).with_tag("inference");
         let caps_cpu = Capabilities::new().with_gpu(false).with_tag("training");
@@ -1499,6 +1519,9 @@ mod tests {
         graph.on_capability(CapabilityAd::new(0x3333, 1, caps_cpu), addr);
         // 0x4444 has no capabilities advertised — must be
         // excluded from tag/gpu searches but counted in hop searches.
+        // The counted helper must leave node_count() exact against the map.
+        assert_eq!(graph.node_count(), graph.nodes.len());
+        assert_eq!(graph.node_count(), 3);
         (graph, addr)
     }
 
