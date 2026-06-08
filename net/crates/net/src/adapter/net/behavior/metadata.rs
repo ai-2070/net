@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -966,6 +966,11 @@ pub struct MetadataStore {
     query_count: AtomicU64,
     /// Update counter
     update_count: AtomicU64,
+    /// O(1) live node count. `DashMap::len()` walks every shard (~1us); the
+    /// capacity gate in `upsert` and `len()`/`stats()` read this instead.
+    /// Maintained exactly on the Vacant-insert / remove paths. See
+    /// docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §2/§4.
+    node_count: AtomicUsize,
     /// Maximum capacity
     max_capacity: Option<usize>,
 }
@@ -983,6 +988,7 @@ impl MetadataStore {
             by_owner: DashMap::new(),
             query_count: AtomicU64::new(0),
             update_count: AtomicU64::new(0),
+            node_count: AtomicUsize::new(0),
             max_capacity: None,
         }
     }
@@ -1031,7 +1037,9 @@ impl MetadataStore {
         // pattern used by `TokenCache::insert_unchecked` and
         // `ContextStore::create_context`.
         if let Some(max) = self.max_capacity {
-            if !self.nodes.contains_key(&node_id) && self.nodes.len() >= max {
+            if !self.nodes.contains_key(&node_id)
+                && self.node_count.load(Ordering::Relaxed) >= max
+            {
                 return Err(MetadataError::CapacityExceeded);
             }
         }
@@ -1061,6 +1069,8 @@ impl MetadataStore {
             Entry::Vacant(slot) => {
                 self.add_to_indexes(&metadata);
                 slot.insert(Arc::new(metadata));
+                // Genuine insert (the only branch that grows `nodes`).
+                self.node_count.fetch_add(1, Ordering::Relaxed);
             }
             Entry::Occupied(mut slot) => {
                 // Read the old metadata WHILE holding the entry
@@ -1108,6 +1118,7 @@ impl MetadataStore {
     pub fn remove(&self, node_id: &NodeId) -> Option<Arc<NodeMetadata>> {
         if let Some((_, meta)) = self.nodes.remove(node_id) {
             self.remove_from_indexes(&meta);
+            self.node_count.fetch_sub(1, Ordering::Relaxed);
             Some(meta)
         } else {
             None
@@ -1242,23 +1253,34 @@ impl MetadataStore {
 
     /// Get statistics
     pub fn stats(&self) -> MetadataStoreStats {
-        let mut by_status: HashMap<NodeStatus, usize> = HashMap::new();
-        let mut by_tier: HashMap<NetworkTier, usize> = HashMap::new();
-        let mut by_continent: HashMap<String, usize> = HashMap::new();
-
-        for entry in self.nodes.iter() {
-            let meta = entry.value();
-            *by_status.entry(meta.status).or_default() += 1;
-            *by_tier.entry(meta.topology.tier).or_default() += 1;
-            if let Some(ref loc) = meta.location {
-                *by_continent
-                    .entry(loc.region.continent().to_string())
-                    .or_default() += 1;
-            }
-        }
+        // Histograms come straight from the inverted indexes, which
+        // add_to_indexes/remove_from_indexes keep in sync. This is
+        // O(distinct keys) — a handful of statuses/tiers/continents —
+        // instead of an O(nodes) full scan with a String allocation per
+        // node. `remove_from_indexes` can leave an empty set behind, so
+        // skip zero-count buckets to match the old scan's "absent key"
+        // output (a status with no nodes was simply never in the map).
+        let by_status: HashMap<NodeStatus, usize> = self
+            .by_status
+            .iter()
+            .filter(|e| !e.value().is_empty())
+            .map(|e| (*e.key(), e.value().len()))
+            .collect();
+        let by_tier: HashMap<NetworkTier, usize> = self
+            .by_tier
+            .iter()
+            .filter(|e| !e.value().is_empty())
+            .map(|e| (*e.key(), e.value().len()))
+            .collect();
+        let by_continent: HashMap<String, usize> = self
+            .by_continent
+            .iter()
+            .filter(|e| !e.value().is_empty())
+            .map(|e| (e.key().clone(), e.value().len()))
+            .collect();
 
         MetadataStoreStats {
-            total_nodes: self.nodes.len(),
+            total_nodes: self.node_count.load(Ordering::Relaxed),
             by_status,
             by_tier,
             by_continent,
@@ -1269,12 +1291,12 @@ impl MetadataStore {
 
     /// Number of nodes
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.node_count.load(Ordering::Relaxed)
     }
 
     /// Check if empty
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.node_count.load(Ordering::Relaxed) == 0
     }
 
     /// Clear all nodes
@@ -1312,6 +1334,10 @@ impl MetadataStore {
         for key in keys {
             if let Some((_, meta)) = self.nodes.remove(&key) {
                 self.remove_from_indexes(&meta);
+                // Per-remove decrement (not store(0)) so a concurrent upsert
+                // landing during the drain keeps its own +1 — the count stays
+                // exact w.r.t. `nodes` rather than racing to a wrong 0.
+                self.node_count.fetch_sub(1, Ordering::Relaxed);
             }
         }
         // Defense-in-depth: clear any residual entries that may
@@ -1965,6 +1991,54 @@ mod tests {
         assert_eq!(stats.by_status.get(&NodeStatus::Offline), Some(&2));
         assert_eq!(stats.queries, 2);
         assert_eq!(stats.updates, 5);
+    }
+
+    /// `stats()` is now computed from the inverted indexes and
+    /// `total_nodes` / `len()` from an O(1) counter. Verify both stay
+    /// exact across upsert, status change, remove (which can leave an
+    /// empty index bucket — that bucket must NOT surface as a 0 count),
+    /// and clear.
+    #[test]
+    fn stats_and_len_track_inserts_removes_and_status_changes() {
+        let store = MetadataStore::new();
+        for i in 0..4u8 {
+            store
+                .upsert(
+                    NodeMetadata::new(make_node_id(i)).with_status(NodeStatus::Online),
+                )
+                .unwrap();
+        }
+        assert_eq!(store.len(), 4);
+        assert_eq!(store.stats().total_nodes, 4);
+        assert_eq!(store.stats().by_status.get(&NodeStatus::Online), Some(&4));
+
+        // Re-upsert (same id, new status) must not grow len, and must move
+        // the node between status buckets.
+        store
+            .upsert(NodeMetadata::new(make_node_id(0)).with_status(NodeStatus::Offline))
+            .unwrap();
+        assert_eq!(store.len(), 4, "re-upsert must not change node count");
+        let s = store.stats();
+        assert_eq!(s.by_status.get(&NodeStatus::Online), Some(&3));
+        assert_eq!(s.by_status.get(&NodeStatus::Offline), Some(&1));
+
+        // Remove the only Offline node — its bucket empties and must drop
+        // out of the histogram entirely (not report 0).
+        store.remove(&make_node_id(0));
+        assert_eq!(store.len(), 3);
+        let s = store.stats();
+        assert_eq!(s.total_nodes, 3);
+        assert_eq!(
+            s.by_status.get(&NodeStatus::Offline),
+            None,
+            "emptied status bucket must not appear in stats"
+        );
+
+        store.clear();
+        assert_eq!(store.len(), 0);
+        assert!(store.is_empty());
+        assert_eq!(store.stats().total_nodes, 0);
+        assert!(store.stats().by_status.is_empty());
     }
 
     // ========================================================================
