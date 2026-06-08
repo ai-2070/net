@@ -115,7 +115,7 @@
     "@next/bundle-analyzer": "16.2.7",
     "@next/eslint-plugin-next": "16.2.7",
     "@tailwindcss/postcss": "4.3.0",
-    "@tailwindcss/typography": "0.5.19",
+    "@tailwindcss/typography": "0.5.20",
     "@tanstack/react-query-devtools": "5.101.0",
     "@types/node": "24.13.1",
     "@types/prettier": "3.0.0",
