@@ -1,27 +1,28 @@
 # Cargo configuration for optimized builds
 #
-# AVX2 baseline (x86-64 ONLY): the RustCrypto ChaCha20/Poly1305 backends only
-# compile their AVX2 SIMD path when AVX2 is enabled at build time. Without it
-# the AEAD falls back to the portable software path on x86-64, adding ~1us of
-# fixed cost to *every* encrypt call (see
-# docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §1).
+# No CPU-feature baseline is enforced here: builds stay portable across every
+# x86-64 and ARM host by default. Selecting a CPU baseline is a deployment
+# decision, so it's left to the operator rather than baked into committed config
+# (an enforced `+avx2` would crash on pre-AVX2 x86-64 and is meaningless on ARM).
 #
-# Scoped to `cfg(target_arch = "x86_64")` on purpose:
-#   * `+avx2` is not a valid feature on aarch64/arm — an unconditional `[build]`
-#     rustflags would emit an "unknown feature specified" warning on every ARM
-#     build (Apple Silicon, AWS Graviton, ARM Linux) and otherwise do nothing.
-#   * ARM needs no flag here: NEON is baseline on aarch64, so the crypto crates
-#     already compile their NEON backends. ARM was never on the x86 software
-#     path, so it gains nothing from (and must not carry) the AVX2 flag.
+# Performance note — SIMD crypto (opt-in): the RustCrypto ChaCha20/Poly1305
+# AEAD only compiles its AVX2 SIMD path on x86-64 when AVX2 is enabled at build
+# time. Without it, x86-64 falls back to the portable software path, which adds
+# ~1us of fixed cost to every encrypt call (see
+# docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §1). ARM is unaffected — NEON
+# is baseline on aarch64, so the NEON backend is always compiled there.
 #
-# `+avx2` is a portable floor for the modern x86-64 server class (NOT
-# `target-cpu=native`), so x86-64 binaries stay distributable across hosts.
-# Pre-AVX2 x86-64 hardware is unsupported by this baseline.
+# To opt into the x86-64 SIMD path for a build/deploy you control, set RUSTFLAGS
+# for that invocation (env is the highest-precedence rustflags source and works
+# on any arch):
 #
-# cargo joins all matching `[target.'cfg(...)']` rustflags, so on x86_64-linux
-# this stacks with the (currently empty) target_os sections below.
-[target.'cfg(target_arch = "x86_64")']
-rustflags = ["-C", "target-feature=+avx2"]
+#   # portable across the modern x86-64 server class:
+#   RUSTFLAGS="-C target-feature=+avx2" cargo build --release
+#   # or tuned to the exact local CPU (not distributable):
+#   RUSTFLAGS="-C target-cpu=native" cargo bench --features net --bench net
+#
+# Prefer wiring this into CI/release profiles for the specific target class you
+# ship, not into this file.
 
 # Environment-specific overrides
 [target.'cfg(target_os = "linux")']
@@ -34,13 +35,3 @@ rustflags = ["-C", "target-feature=+avx2"]
 [profile.release]
 # LTO and codegen-units are already set in Cargo.toml
 # Additional flags can be added here if needed
-
-# For maximum performance on the local CPU (any architecture), benchmark with
-# the native-CPU flag via RUSTFLAGS. The env var is a higher-precedence rustflags
-# source than the `[target.'cfg(...)']` floor above, so it cleanly overrides it
-# on x86-64 and works identically on ARM:
-#
-#   RUSTFLAGS="-C target-cpu=native" cargo bench --features net --bench net
-#
-# (A cargo alias can't set env vars and `--config build.rustflags=...` is a
-# lower-precedence source than the cfg floor, so the env var is the right knob.)

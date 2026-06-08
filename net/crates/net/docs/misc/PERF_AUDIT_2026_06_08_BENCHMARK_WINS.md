@@ -4,8 +4,9 @@ Source data: `crates/net/benchmarks/BENCHMARK_RESULTS_14900K.md` (Intel i9-14900
 logical cores). Investigation root-caused each hotspot against current `src/`.
 
 > **Status: resolved (2026-06-08).** The findings below were the starting point; the
-> fixes were implemented on branch `perf/benchmark-wins-2026-06-08` (8 commits, one per
-> concern, each with tests; full lib suite — 4192 tests — green). Each section heading
+> fixes were implemented on branch `perf/benchmark-wins-2026-06-08` (one commit per
+> concern, each with tests; full lib suite — 4192 tests — green). Note §1 (crypto SIMD)
+> is a documented opt-in, not an enforced build flag — see its section. Each heading
 > carries its outcome (✅ done / ⛔ not done). The per-item resolution, including the
 > deliberate non-fixes and their rationale, is in **[Resolution](#resolution-2026-06-08)**
 > at the bottom. The original findings are kept in present tense as the record of what was
@@ -22,7 +23,7 @@ Recommended order of attack is at the bottom.
 
 ---
 
-## 1. (Highest leverage) Crypto runs on the software AEAD backend, not AVX2 — ✅ DONE
+## 1. (Highest leverage) Crypto runs on the software AEAD backend, not AVX2 — 📌 DOCUMENTED (opt-in; deliberately NOT enforced in committed config)
 
 **Symptom.** Every `encrypt` call carries ~1.0–1.1 µs of *fixed* cost, independent of
 payload size:
@@ -69,30 +70,32 @@ build sets no CPU-feature flags.**
 **Hot path.** `src/adapter/net/crypto.rs:661` `encrypt_in_place`; caller
 `src/adapter/net/pool.rs:181`.
 
-**Fix (implemented).** Enable the SIMD backend via a build flag — no source change.
-The flag MUST be scoped to x86-64, not put in an unconditional `[build]` section:
+**Fix — documented opt-in, NOT enforced in committed config.** The SIMD backend
+is enabled by a build-time CPU-feature flag; the win is real but **enforcing a CPU
+baseline is a deployment decision, not something to bake into the repo's
+`.cargo/config.toml`.** An enforced `+avx2` would produce SIGILL binaries on
+pre-AVX2 x86-64 and is meaningless on ARM. So the committed config enforces
+nothing; operators opt in for the target class they ship:
 
-```toml
-# .cargo/config.toml — applies only when building FOR x86-64
-[target.'cfg(target_arch = "x86_64")']
-rustflags = ["-C", "target-feature=+avx2"]
+```sh
+# portable across the modern x86-64 server class:
+RUSTFLAGS="-C target-feature=+avx2" cargo build --release
+# or tuned to the exact local CPU (not distributable):
+RUSTFLAGS="-C target-cpu=native" cargo bench --features net --bench net
 ```
 
-- `+avx2` is a portable floor for the modern x86-64 server class (not
-  `target-cpu=native`, so binaries stay distributable).
-- **ARM:** `+avx2` is invalid on `aarch64`/`arm`. An unconditional `[build]`
-  rustflags would emit `unknown feature specified for -Ctarget-feature: avx2` on
-  every ARM build (Apple Silicon, AWS Graviton, ARM Linux) and otherwise do
-  nothing. Scoping to `cfg(target_arch = "x86_64")` keeps ARM builds clean. ARM
-  needs no flag — NEON is baseline on `aarch64`, so the ChaCha20/Poly1305 crates
-  already compile their NEON backends; ARM was never on the x86 software path.
-- For max local-CPU perf on any arch, benchmark with
-  `RUSTFLAGS="-C target-cpu=native" cargo bench` (env is a higher-precedence
-  rustflags source than the cfg floor; a cargo alias can't set env vars).
+- Prefer wiring this into the CI/release profile for the specific target class,
+  not into `.cargo/config.toml`.
+- **ARM is unaffected either way:** `+avx2` is invalid on `aarch64`/`arm` (would
+  only emit `unknown feature specified for -Ctarget-feature: avx2`). ARM needs
+  no flag — NEON is baseline on `aarch64`, so the ChaCha20/Poly1305 crates always
+  compile their NEON backends. ARM was never on the x86 software path.
 
-**Expected.** ~5–10× on the fixed cost: 64 B encrypt ~1.13 µs → ~100–200 ns; 4096 B
-~3.13 µs → ~0.6–1 µs. This is on **every packet**, so it lifts the entire data path,
-`net_packet_build`, and both `cipher_comparison` groups at once.
+**Expected (when opted in on x86-64).** ~5–10× on the fixed cost: 64 B encrypt
+~1.13 µs → ~100–200 ns; 4096 B ~3.13 µs → ~0.6–1 µs — on **every packet**, so it
+lifts the entire data path, `net_packet_build`, and both `cipher_comparison`
+groups. **Default builds keep the software path**, i.e. the current measured
+baseline; nothing regresses, the win is just unlocked per deploy.
 
 **Caveat.** Assumes the deploy target has AVX2. If the build host may differ from prod,
 prefer explicit `-C target-feature=+avx2` over `target-cpu=native`.
@@ -312,8 +315,10 @@ it carries `content` + tags `Vec<String>` + `source`.)
 
 ## Recommended order of attack
 
-1. **Crypto AVX2 flag** (§1) — one config line, ~5–10× on the entire data path.
-   *Verify the deploy-target CPU first; prefer `+avx2` over `native` if build host ≠ prod.*
+1. **Crypto SIMD opt-in** (§1) — ~5–10× on the entire data path, but enabled per
+   deploy via `RUSTFLAGS`, NOT enforced in committed config (would SIGILL on
+   pre-AVX2 x86-64; meaningless on ARM). Wire it into the release/CI profile for
+   the x86-64 target class you ship.
 2. **`sort_by_key` → `sort_by_cached_key`** (§3) — one word, ~5–10× on capability
    serialize, zero risk, wire-compatible.
 3. **`AtomicUsize` for `seen_pingwaves` count** (§2a) — real hot-path tax, ~20–60×.
@@ -331,11 +336,15 @@ Items 1 and 2 are trivial, safe, and high-impact.
 Implemented on branch `perf/benchmark-wins-2026-06-08`, one commit per concern,
 each with tests; full lib suite (4192 tests) green and all benches compile.
 
-- **§1 Crypto AVX2** — DONE. `.cargo/config.toml` sets a portable `+avx2` floor
-  scoped to `[target.'cfg(target_arch = "x86_64")']` so ARM (`aarch64`) builds
-  are unaffected — no spurious `unknown feature` warning, and ARM already uses
-  its baseline-NEON crypto backends. Max local perf via
-  `RUSTFLAGS="-C target-cpu=native" cargo bench`.
+- **§1 Crypto AVX2** — DOCUMENTED, opt-in (not enforced). We initially scoped a
+  `+avx2` floor to `[target.'cfg(target_arch = "x86_64")']`, then removed it
+  entirely: enforcing a CPU baseline in committed config is a deployment decision
+  and would break pre-AVX2 x86-64 (SIGILL). `.cargo/config.toml` now enforces no
+  CPU flags; operators opt in per target class via
+  `RUSTFLAGS="-C target-feature=+avx2"` (or `target-cpu=native`). The audit doc
+  and the config comment document the win and how to unlock it. ARM is unaffected
+  (baseline NEON; `+avx2` is invalid there). Default builds keep the software
+  path — the current measured baseline, no regression.
 - **§2 / §4 O(1) counters** — DONE across all five subsystems. `AtomicUsize`
   counters maintained on insert/remove/eviction replace `DashMap::len()` shard
   walks in `LocalGraph`, `ProximityGraph`, `MetadataStore`, `FailureDetector`,
