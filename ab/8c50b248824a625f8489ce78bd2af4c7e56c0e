@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/route.rs
+  s_8870c7403329c0::t_d3c6385af1e516 684-692,696-700
+  s_8870c7403329c0::t_07ca074fe5dea0 1472-1515
+net/crates/net/src/adapter/net/router.rs
+  s_8870c7403329c0::t_74dfcc3f599fa7 1570-1573
+  s_8870c7403329c0::t_c9b69e97621ce2 1363-1366
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "ab8c50b248824a625f8489ce78bd2af4c7e56c0e",
+  "prompts": {},
+  "sessions": {
+    "s_8870c7403329c0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0cc782bd-f8c5-40e5-80e4-a9c79b6b7195",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
