@@ -1,37 +1,9 @@
-# Cargo configuration for optimized builds
+# Build configuration.
 #
-# No CPU-feature baseline is enforced here: builds stay portable across every
-# x86-64 and ARM host by default. Selecting a CPU baseline is a deployment
-# decision, so it's left to the operator rather than baked into committed config
-# (an enforced `+avx2` would crash on pre-AVX2 x86-64 and is meaningless on ARM).
-#
-# Performance note — SIMD crypto (opt-in): the RustCrypto ChaCha20/Poly1305
-# AEAD only compiles its AVX2 SIMD path on x86-64 when AVX2 is enabled at build
-# time. Without it, x86-64 falls back to the portable software path, which adds
-# ~1us of fixed cost to every encrypt call (see
-# docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §1). ARM is unaffected — NEON
-# is baseline on aarch64, so the NEON backend is always compiled there.
-#
-# To opt into the x86-64 SIMD path for a build/deploy you control, set RUSTFLAGS
-# for that invocation (env is the highest-precedence rustflags source and works
-# on any arch):
-#
-#   # portable across the modern x86-64 server class:
-#   RUSTFLAGS="-C target-feature=+avx2" cargo build --release
-#   # or tuned to the exact local CPU (not distributable):
-#   RUSTFLAGS="-C target-cpu=native" cargo bench --features net --bench net
-#
-# Prefer wiring this into CI/release profiles for the specific target class you
-# ship, not into this file.
+# No CPU-feature baseline is enforced, so builds stay portable across all x86-64
+# and ARM hosts. The x86-64 SIMD crypto speedup is opt-in per deploy — e.g.
+# `RUSTFLAGS="-C target-feature=+avx2" cargo build --release`. Rationale + full
+# perf audit: docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §1.
 
-# Environment-specific overrides
-[target.'cfg(target_os = "linux")']
-# Linux-specific optimizations (e.g., for io_uring support in future)
-
-[target.'cfg(target_os = "macos")']
-# macOS-specific settings
-
-# Profile overrides for release builds
 [profile.release]
-# LTO and codegen-units are already set in Cargo.toml
-# Additional flags can be added here if needed
+# LTO and codegen-units are configured in Cargo.toml.
