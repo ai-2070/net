@@ -10,7 +10,7 @@ use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -90,8 +90,16 @@ impl NodeState {
         self.total_heartbeats += 1;
     }
 
-    fn check(&mut self, timeout: Duration, suspicion_threshold: u32, miss_threshold: u32) {
-        let elapsed = self.last_heartbeat.elapsed();
+    fn check(
+        &mut self,
+        now: Instant,
+        timeout: Duration,
+        suspicion_threshold: u32,
+        miss_threshold: u32,
+    ) {
+        // `now` is read once by the caller and shared across the whole
+        // check_all sweep instead of a per-node clock read.
+        let elapsed = now.saturating_duration_since(self.last_heartbeat);
 
         if elapsed > timeout {
             // Compute how many heartbeat intervals have been missed based on
@@ -143,6 +151,11 @@ pub struct FailureDetector {
     total_failures: AtomicU64,
     /// Total recoveries
     total_recoveries: AtomicU64,
+    /// O(1) tracked-node count. `DashMap::len()` walks every shard (~1us);
+    /// node_count()/stats().nodes_tracked read this instead. Maintained on the
+    /// insert (heartbeat) / remove / cleanup paths — the only ones that change
+    /// map size. See docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §4.
+    num_nodes: AtomicUsize,
     /// Last cleanup time
     last_cleanup: Mutex<Instant>,
 }
@@ -162,6 +175,7 @@ impl FailureDetector {
             on_recovery: None,
             total_failures: AtomicU64::new(0),
             total_recoveries: AtomicU64::new(0),
+            num_nodes: AtomicUsize::new(0),
             last_cleanup: Mutex::new(Instant::now()),
         }
     }
@@ -197,6 +211,7 @@ impl FailureDetector {
     /// shard lock.
     pub fn heartbeat(&self, node_id: u64, addr: SocketAddr) {
         let mut should_notify_recovery = false;
+        let mut node_inserted = false;
         self.nodes
             .entry(node_id)
             .and_modify(|state| {
@@ -208,7 +223,13 @@ impl FailureDetector {
                     should_notify_recovery = true;
                 }
             })
-            .or_insert_with(|| NodeState::new(addr));
+            .or_insert_with(|| {
+                node_inserted = true;
+                NodeState::new(addr)
+            });
+        if node_inserted {
+            self.num_nodes.fetch_add(1, Ordering::Relaxed);
+        }
 
         if should_notify_recovery {
             if let Some(ref cb) = self.on_recovery {
@@ -230,9 +251,12 @@ impl FailureDetector {
     pub fn check_all(&self) -> Vec<u64> {
         let mut newly_failed = Vec::new();
 
+        // Read the clock once for the whole sweep instead of per node.
+        let now = Instant::now();
         for mut entry in self.nodes.iter_mut() {
             let prev_status = entry.status;
             entry.check(
+                now,
                 self.config.timeout,
                 self.config.suspicion_threshold,
                 self.config.miss_threshold,
@@ -290,7 +314,9 @@ impl FailureDetector {
 
     /// Remove a node from tracking
     pub fn remove(&self, node_id: u64) {
-        self.nodes.remove(&node_id);
+        if self.nodes.remove(&node_id).is_some() {
+            self.num_nodes.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Clean up stale entries (nodes that have been failed for too long)
@@ -322,10 +348,18 @@ impl FailureDetector {
             }
         });
 
+        self.num_nodes.fetch_sub(removed, Ordering::Relaxed);
         removed
     }
 
     /// Get statistics
+    ///
+    /// `nodes_tracked` reads the O(1) counter; the per-status tally is still
+    /// a single pass over the entries. That scan is observability-only (not on
+    /// any hot path) and is deliberately NOT replaced by per-status counters:
+    /// node status is mutated in-place via `get_mut().status = ...` in tests
+    /// and could be elsewhere, which would silently drift maintained counters.
+    /// The scan is always exact.
     pub fn stats(&self) -> FailureStats {
         let mut healthy = 0;
         let mut suspected = 0;
@@ -341,7 +375,7 @@ impl FailureDetector {
         }
 
         FailureStats {
-            nodes_tracked: self.nodes.len(),
+            nodes_tracked: self.num_nodes.load(Ordering::Relaxed),
             nodes_healthy: healthy,
             nodes_suspected: suspected,
             nodes_failed: failed,
@@ -352,7 +386,7 @@ impl FailureDetector {
 
     /// Get node count
     pub fn node_count(&self) -> usize {
-        self.nodes.len()
+        self.num_nodes.load(Ordering::Relaxed)
     }
 }
 
@@ -920,6 +954,33 @@ mod tests {
 
         assert_eq!(detector.status(0x1234), NodeStatus::Healthy);
         assert_eq!(detector.node_count(), 1);
+    }
+
+    /// node_count() / stats().nodes_tracked read an O(1) counter that must
+    /// track the map across new heartbeats, duplicate heartbeats (no growth),
+    /// and removal.
+    #[test]
+    fn node_count_tracks_heartbeats_and_removal() {
+        let detector = FailureDetector::new();
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        detector.heartbeat(1, addr);
+        detector.heartbeat(2, addr);
+        detector.heartbeat(3, addr);
+        assert_eq!(detector.node_count(), 3);
+        assert_eq!(detector.stats().nodes_tracked, 3);
+
+        // Duplicate heartbeat for an existing node must not grow the count.
+        detector.heartbeat(1, addr);
+        assert_eq!(detector.node_count(), 3, "re-heartbeat must not grow count");
+
+        detector.remove(2);
+        assert_eq!(detector.node_count(), 2);
+        assert_eq!(detector.stats().nodes_tracked, 2);
+
+        // Removing an absent node is a no-op for the counter.
+        detector.remove(999);
+        assert_eq!(detector.node_count(), 2);
     }
 
     #[test]
