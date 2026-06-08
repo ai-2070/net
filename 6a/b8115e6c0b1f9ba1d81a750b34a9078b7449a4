@@ -1,0 +1,28 @@
+net/crates/net/src/adapter/net/behavior/metadata.rs
+  s_6d49e1791ecda2::t_36865d4455b867 1996-2003,2005-2043
+  s_6d49e1791ecda2::t_41718f7d4afb9c 1040-1042
+  s_6d49e1791ecda2::t_d0ae0be27d442d 1121
+  s_6d49e1791ecda2::t_00e256a382e5c1 991
+  s_6d49e1791ecda2::t_44b701d4ee672c 1337-1340
+  s_6d49e1791ecda2::t_203f6a30a2cfb0 1256-1280,1283,1294,1299
+  s_6d49e1791ecda2::t_7f41b50ed8ea82 969-973
+  s_6d49e1791ecda2::t_c2ba74e2b8ba0b 2004
+  s_6d49e1791ecda2::t_42d80c7405d6c8 10
+  s_6d49e1791ecda2::t_431536aa2c4b8f 1072-1073
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "6ab8115e6c0b1f9ba1d81a750b34a9078b7449a4",
+  "prompts": {},
+  "sessions": {
+    "s_6d49e1791ecda2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0a4a66ed-48bf-46dc-9395-07f0622bc33a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
