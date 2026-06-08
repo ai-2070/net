@@ -1,0 +1,29 @@
+net/crates/net/src/adapter/net/swarm.rs
+  s_6d49e1791ecda2::t_8b3d601cfb0f3d 989-993
+  s_6d49e1791ecda2::t_eeadcab821c7be 13
+  s_6d49e1791ecda2::t_924724914c8aed 667,672-674
+  s_6d49e1791ecda2::t_8b1a98d13d2db4 472-482
+  s_6d49e1791ecda2::t_aafcfe88281c87 589-591,594
+  s_6d49e1791ecda2::t_f94fd542bcf5f7 1280-1282
+  s_6d49e1791ecda2::t_3a283310d1d492 559-562,566-574
+  s_6d49e1791ecda2::t_ccd87f9f6cd132 500-502
+  s_6d49e1791ecda2::t_0d655949c498c4 688,695,700-702,708,715-721
+  s_6d49e1791ecda2::t_c9dc9db4cb9b36 1012-1047
+  s_6d49e1791ecda2::t_ad630bae7bd29f 854-857,864-866,872,877
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "cac93223f95039ef6e66121f9dd258d19dfba83d",
+  "prompts": {},
+  "sessions": {
+    "s_6d49e1791ecda2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0a4a66ed-48bf-46dc-9395-07f0622bc33a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
