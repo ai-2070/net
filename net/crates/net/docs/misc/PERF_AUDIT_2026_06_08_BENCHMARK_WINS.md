@@ -1,8 +1,15 @@
 # Performance Audit — Benchmark Wins (2026-06-08)
 
 Source data: `crates/net/benchmarks/BENCHMARK_RESULTS_14900K.md` (Intel i9-14900K, 32
-logical cores). Investigation root-caused each hotspot against current `src/`. **No code
-was changed** — this document is findings + concrete fix proposals.
+logical cores). Investigation root-caused each hotspot against current `src/`.
+
+> **Status: resolved (2026-06-08).** The findings below were the starting point; the
+> fixes were implemented on branch `perf/benchmark-wins-2026-06-08` (8 commits, one per
+> concern, each with tests; full lib suite — 4192 tests — green). Each section heading
+> carries its outcome (✅ done / ⛔ not done). The per-item resolution, including the
+> deliberate non-fixes and their rationale, is in **[Resolution](#resolution-2026-06-08)**
+> at the bottom. The original findings are kept in present tense as the record of what was
+> diagnosed.
 
 The work is split into two buckets:
 
@@ -15,7 +22,7 @@ Recommended order of attack is at the bottom.
 
 ---
 
-## 1. (Highest leverage) Crypto runs on the software AEAD backend, not AVX2
+## 1. (Highest leverage) Crypto runs on the software AEAD backend, not AVX2 — ✅ DONE
 
 **Symptom.** Every `encrypt` call carries ~1.0–1.1 µs of *fixed* cost, independent of
 payload size:
@@ -81,7 +88,7 @@ prefer explicit `-C target-feature=+avx2` over `target-cpu=native`.
 
 ---
 
-## 2. (Cross-cutting) `DashMap::len()` is a 128-shard walk (~950 ns) — and it's on a hot path
+## 2. (Cross-cutting) `DashMap::len()` is a 128-shard walk (~950 ns) — and it's on a hot path — ✅ DONE
 
 `DashMap::len()` locks and sums every shard's length. Default shard count is the next
 power of two of `4 × num_cpus` → **128 shards** on the 14900K. So every `.len()` is ~128
@@ -129,7 +136,7 @@ Same root cause, same fix (AtomicUsize maintained on the existing mutation choke
 
 ---
 
-## 3. (One-word fix) Capability serialize allocates a String per comparison
+## 3. (One-word fix) Capability serialize allocates a String per comparison — ✅ DONE
 
 **Symptom (backwards ratio — serialize slower than deserialize):**
 
@@ -170,7 +177,7 @@ signature-safe.** Optionally also drop the `tags.iter().cloned().collect()` clon
 
 ---
 
-## 4. `stats()` recomputes full-map aggregates (+ a String alloc per element)
+## 4. `stats()` recomputes full-map aggregates (+ a String alloc per element) — ✅ DONE (failure per-status tally kept as a scan, by design)
 
 These methods full-scan the backing map on every call instead of maintaining
 incrementally-updated counters. (Note: the *headline* ms-scale numbers for some of these
@@ -212,7 +219,7 @@ Sums three per-stream atomics over a full `stream_stats` scan + two `.len()` sha
 
 ---
 
-## 5. (Moderate) Capability query double-materializes the candidate set
+## 5. (Moderate) Capability query double-materializes the candidate set — ⛔ NOT DONE (correctness risk vs. moderate win; see Resolution)
 
 **Symptom:** broad queries are hundreds of µs — `capability_fold_query/query_single_tag`
 150 µs, `query_gpu_vendor` 491 µs, `find_best_simple` 302 µs.
@@ -239,7 +246,7 @@ allocation/hashing.
 
 ---
 
-## 6. (Minor) Cortex ingest allocates a serialize buffer per event
+## 6. (Minor) Cortex ingest allocates a serialize buffer per event — ⛔ NOT DONE (no real win; `Bytes::from` is already zero-copy)
 
 `cortex_ingest/tasks_create` = 214 ns, `memories_store` = 451 ns. Hot path `ingest_typed`
 (`src/adapter/net/cortex/tasks/adapter.rs:484-505`,
@@ -254,7 +261,7 @@ it carries `content` + tags `Vec<String>` + `source`.)
 
 ---
 
-## 7. NOT real wins — benchmark artifacts (do not chase these numbers)
+## 7. NOT real wins — benchmark artifacts (do not chase these numbers) — ✅ ADDRESSED (stats/len artifacts moot post-§2/§4; check_all fixture fixed)
 
 - **`failure_detector/check_all` = 670 ms, `failure_detector/stats` = 198 ms,
   `metadata_store_basic/stats` = 168 ms, `metadata_store_basic/len` = 950 ns.**
