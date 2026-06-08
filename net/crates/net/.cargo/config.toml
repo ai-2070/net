@@ -1,11 +1,17 @@
 # Cargo configuration for optimized builds
 #
-# Note: target-cpu=native generates binaries optimized for the current CPU.
-# For portable binaries, remove or comment out the rustflags below.
-
-# Uncomment for maximum performance on the local machine:
-# [build]
-# rustflags = ["-C", "target-cpu=native"]
+# AVX2 baseline: the RustCrypto ChaCha20/Poly1305 backends only compile their
+# SIMD path when AVX2 is enabled at build time. Without it the AEAD falls back
+# to the portable software path, which adds ~1us of fixed cost to *every*
+# encrypt call (see docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §1).
+# `+avx2` is a portable floor for the modern x86-64 server class this targets;
+# it is NOT `target-cpu=native`, so binaries stay distributable across hosts.
+#
+# Pre-AVX2 hardware (very old/low-end x86-64) is unsupported by this baseline.
+# Override per-build with e.g. `RUSTFLAGS="-C target-cpu=native"` for local max
+# performance, or `RUSTFLAGS=""` to fall back to the portable baseline.
+[build]
+rustflags = ["-C", "target-feature=+avx2"]
 
 # Environment-specific overrides
 [target.'cfg(target_os = "linux")']
@@ -19,6 +25,8 @@
 # LTO and codegen-units are already set in Cargo.toml
 # Additional flags can be added here if needed
 
-# Alias for running benchmarks with native CPU
+# Alias for running benchmarks tuned for the local CPU (max performance).
+# Injects target-cpu=native explicitly so the cipher backends pick the best
+# SIMD path available on this machine, overriding the portable +avx2 floor.
 [alias]
-bench-native = "bench --release"
+bench-native = "bench --release --config build.rustflags=[\"-C\",\"target-cpu=native\"]"
