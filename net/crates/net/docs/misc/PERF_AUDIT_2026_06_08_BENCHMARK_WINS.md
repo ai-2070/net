@@ -69,15 +69,26 @@ build sets no CPU-feature flags.**
 **Hot path.** `src/adapter/net/crypto.rs:661` `encrypt_in_place`; caller
 `src/adapter/net/pool.rs:181`.
 
-**Fix.** Enable the SIMD backend — no source change:
+**Fix (implemented).** Enable the SIMD backend via a build flag — no source change.
+The flag MUST be scoped to x86-64, not put in an unconditional `[build]` section:
 
-- Uncomment in `.cargo/config.toml`:
-  ```toml
-  [build]
-  rustflags = ["-C", "target-cpu=native"]
-  ```
-- Or set a portable floor for the x86-64 deploy class:
-  `RUSTFLAGS="-C target-feature=+avx2"` (or `+avx2,+sse4.1`).
+```toml
+# .cargo/config.toml — applies only when building FOR x86-64
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-feature=+avx2"]
+```
+
+- `+avx2` is a portable floor for the modern x86-64 server class (not
+  `target-cpu=native`, so binaries stay distributable).
+- **ARM:** `+avx2` is invalid on `aarch64`/`arm`. An unconditional `[build]`
+  rustflags would emit `unknown feature specified for -Ctarget-feature: avx2` on
+  every ARM build (Apple Silicon, AWS Graviton, ARM Linux) and otherwise do
+  nothing. Scoping to `cfg(target_arch = "x86_64")` keeps ARM builds clean. ARM
+  needs no flag — NEON is baseline on `aarch64`, so the ChaCha20/Poly1305 crates
+  already compile their NEON backends; ARM was never on the x86 software path.
+- For max local-CPU perf on any arch, benchmark with
+  `RUSTFLAGS="-C target-cpu=native" cargo bench` (env is a higher-precedence
+  rustflags source than the cfg floor; a cargo alias can't set env vars).
 
 **Expected.** ~5–10× on the fixed cost: 64 B encrypt ~1.13 µs → ~100–200 ns; 4096 B
 ~3.13 µs → ~0.6–1 µs. This is on **every packet**, so it lifts the entire data path,
@@ -320,8 +331,11 @@ Items 1 and 2 are trivial, safe, and high-impact.
 Implemented on branch `perf/benchmark-wins-2026-06-08`, one commit per concern,
 each with tests; full lib suite (4192 tests) green and all benches compile.
 
-- **§1 Crypto AVX2** — DONE. `.cargo/config.toml` now sets a portable `+avx2`
-  floor; `bench-native` alias injects `target-cpu=native`.
+- **§1 Crypto AVX2** — DONE. `.cargo/config.toml` sets a portable `+avx2` floor
+  scoped to `[target.'cfg(target_arch = "x86_64")']` so ARM (`aarch64`) builds
+  are unaffected — no spurious `unknown feature` warning, and ARM already uses
+  its baseline-NEON crypto backends. Max local perf via
+  `RUSTFLAGS="-C target-cpu=native" cargo bench`.
 - **§2 / §4 O(1) counters** — DONE across all five subsystems. `AtomicUsize`
   counters maintained on insert/remove/eviction replace `DashMap::len()` shard
   walks in `LocalGraph`, `ProximityGraph`, `MetadataStore`, `FailureDetector`,
