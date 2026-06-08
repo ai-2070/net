@@ -1,8 +1,24 @@
-# Build configuration.
+# Cargo configuration for optimized builds
 #
-# No CPU-feature baseline is enforced, so builds stay portable across all x86-64
-# and ARM hosts. The x86-64 SIMD crypto speedup is opt-in per deploy — e.g.
-# `RUSTFLAGS="-C target-feature=+avx2" cargo build --release`.
+# Note: target-cpu=native generates binaries optimized for the current CPU.
+# For portable binaries, remove or comment out the rustflags below.
 
+# Uncomment for maximum performance on the local machine:
+# [build]
+# rustflags = ["-C", "target-cpu=native"]
+
+# Environment-specific overrides
+[target.'cfg(target_os = "linux")']
+# Linux-specific optimizations (e.g., for io_uring support in future)
+
+[target.'cfg(target_os = "macos")']
+# macOS-specific settings
+
+# Profile overrides for release builds
 [profile.release]
-# LTO and codegen-units are configured in Cargo.toml.
+# LTO and codegen-units are already set in Cargo.toml
+# Additional flags can be added here if needed
+
+# Alias for running benchmarks with native CPU
+[alias]
+bench-native = "bench --release"
