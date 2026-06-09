@@ -38,8 +38,34 @@ pub const SUBNET_TAG_PREFIX: &str = "subnet:";
 /// so the substrate keeps the option of changing the internal
 /// representation (e.g. a typed length tag) without breaking
 /// the public surface.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[expect(
+    clippy::derived_hash_with_manual_eq,
+    reason = "manual PartialEq is constant-time but byte-identical to the \
+              derived one; the Hash/Eq invariant (equal values hash equal) \
+              holds because both operate on the same 16 bytes"
+)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Serialize, Deserialize)]
 pub struct SubnetId(pub(crate) [u8; 16]);
+
+impl PartialEq for SubnetId {
+    /// Constant-time equality. In the stricter-membership mode
+    /// documented on this module a `SubnetId` is a bearer secret
+    /// ("hard to guess"), so a data-dependent early-exit compare
+    /// leaks it through timing. Fold every byte difference into one
+    /// accumulator and branch once at the end; `black_box` stops the
+    /// optimizer from reintroducing a short-circuit.
+    ///
+    /// Consistent with the derived `Hash`/`Eq`, so map-key use is
+    /// unaffected (well-known public values like `GLOBAL` compare
+    /// correctly too — constant time is simply harmless for them).
+    fn eq(&self, other: &Self) -> bool {
+        let mut diff = 0u8;
+        for (a, b) in self.0.iter().zip(other.0.iter()) {
+            diff |= a ^ b;
+        }
+        std::hint::black_box(diff) == 0
+    }
+}
 
 impl SubnetId {
     /// Construct from raw bytes.
@@ -128,5 +154,20 @@ mod tests {
         let bytes = postcard::to_allocvec(&s).unwrap();
         let decoded: SubnetId = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, s);
+    }
+
+    #[test]
+    fn constant_time_eq_preserves_equality_semantics() {
+        assert_eq!(SubnetId([0x11; 16]), SubnetId([0x11; 16]));
+        assert_ne!(SubnetId([0x00; 16]), SubnetId([0xFF; 16]));
+        let mut first_byte = [0x11; 16];
+        first_byte[0] = 0x12;
+        assert_ne!(SubnetId([0x11; 16]), SubnetId(first_byte));
+        let mut last_byte = [0x11; 16];
+        last_byte[15] = 0x12;
+        assert_ne!(SubnetId([0x11; 16]), SubnetId(last_byte));
+        let mut set = std::collections::HashSet::new();
+        set.insert(SubnetId([0x11; 16]));
+        assert!(set.contains(&SubnetId([0x11; 16])));
     }
 }
