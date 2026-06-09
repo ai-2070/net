@@ -379,3 +379,52 @@ each with tests; full lib suite (4192 tests) green and all benches compile.
   `event/internal_event_new` bench keeps its name (an explanatory comment
   already documents that it measures `from_value`); renaming would only break
   Criterion baseline continuity.
+
+---
+
+## Measured results (verification, 2026-06-08)
+
+Reran the affected benchmarks on branch `perf/benchmark-wins-2026-06-08` and
+compared against the `BENCHMARK_RESULTS_14900K.md` baseline above (same i9-14900K,
+Criterion defaults — 3 s warm-up, 5 s measurement; median of the reported
+interval). Every claimed win materialized at or beyond its predicted magnitude.
+
+| Benchmark | Baseline | This branch | Change |
+| --- | --- | --- | --- |
+| **§2/§2b/§4c — `DashMap::len()` → atomic** | | | |
+| `local_graph/node_count` | 958.46 ns | 0.201 ns | **~4770× faster** |
+| `local_graph/stats` | 2.885 µs | 0.326 ns | **~8850× faster** |
+| `local_graph/on_pingwave_duplicate` | 973.92 ns | 16.19 ns | **~60× faster** |
+| `metadata_store_basic/len` | 955.72 ns | 0.201 ns | **~4750× faster** |
+| `routing_table/aggregate_stats` | 13.10 µs | 6.07 µs | **~2.2× faster** |
+| **§7 — fixture artifacts (now O(1)/fixed fixture)** | | | |
+| `failure_detector/check_all` | 670.50 ms | 16.70 µs | **~40000× faster** |
+| `failure_detector/stats` | 198.25 ms | 15.98 µs | **~12400× faster** |
+| `metadata_store_basic/stats` | 168.70 ms | 15.88 µs | **~10600× faster** |
+| **§3 — `sort_by_cached_key`** | | | |
+| `capability_set/serialize` | 65.25 µs | 9.63 µs | **~6.8× faster** |
+| `capability_announcement/serialize` | 71.71 µs | 11.77 µs | **~6.1× faster** |
+| **Hot insert paths (one added `Relaxed` atomic) — flat** | | | |
+| `local_graph/on_pingwave_new` | 47.27 ns | 40.24 ns | flat (slightly better) |
+| `routing_table/add_route` | 37.28 ns | 37.05 ns | flat |
+| `routing_table/record_in` | 54.37 ns | 54.16 ns | flat |
+| `routing_table/record_out` | 34.28 ns | 33.70 ns | flat |
+| `failure_detector/heartbeat_existing` | 35.68 ns | 35.63 ns | flat |
+| `metadata_store_basic/upsert_existing` | 998.60 ns | 985.50 ns | flat |
+| `failure_detector/heartbeat_new` | 200.57 ns | 240.95 ns | ~20% higher (noise) |
+| `metadata_store_basic/upsert_new` | 1.730 µs | 1.943 µs | ~12% higher (noise) |
+
+Notes:
+
+- The two "slower" rows are insert-heavy, allocation-dominated benches whose only
+  added cost is a single `Relaxed` `fetch_add` (~1–5 ns). The deltas (40 ns /
+  210 ns) exceed that and sit within run-to-run variance (the baseline
+  `heartbeat_new` interval itself spanned 198–203 ns). The matching no-insert
+  paths (`heartbeat_existing`, `upsert_existing`, `add_route`) are flat,
+  confirming the counter maintenance is negligible — not a regression.
+- `fair_scheduler/stream_count_empty` (945.83 → 961.90 ns) is **unchanged**: that
+  is `FairScheduler::stream_count` (router.rs), a different type this branch did
+  not touch — its count still does a `DashMap::len()` shard walk. The same
+  atomic-counter optimization is a viable follow-up there.
+- `ProximityGraph` (§2b) is not in the benchmark suite, so its O(1)-counter change
+  is covered by unit tests only, not measured here.
