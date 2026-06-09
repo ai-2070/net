@@ -1791,20 +1791,40 @@ impl MeshNode {
         let service_for_emit = service.to_string();
         let server_origin = self.identity_origin_hash();
         let origin_node_cache_for_emit = Arc::clone(&origin_node_cache);
+        // §8b reply-channel cache: the reply channel name is
+        // `<service>.replies.<caller_origin:016x>` — deterministic from
+        // `(service, caller_origin)`, and `service` is fixed for this
+        // `serve_rpc`, so it varies only by `caller_origin`. `ChannelName` is
+        // `Arc<str>`, so a cache hit is an Arc bump; this removes the per-
+        // response `format!` String + `ChannelName::new` (`Arc<str>`) allocation
+        // (and the per-call `service.clone()`) the emit closure used to pay on
+        // every response. Keyed by `caller_origin`, bounded by peer count — the
+        // same growth profile as `origin_node_cache` above.
+        let reply_channel_cache: Arc<dashmap::DashMap<u64, ChannelName>> =
+            Arc::new(dashmap::DashMap::new());
         let emit: RpcResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
             let mesh = Arc::clone(&mesh_for_emit);
-            let service = service_for_emit.clone();
             let target_hint = origin_node_cache_for_emit.get(&caller_origin).map(|v| *v);
-            tokio::spawn(async move {
-                let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
-                let reply_channel = match ChannelName::new(&reply_channel_name) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(error = %e, channel = %reply_channel_name,
-                            "rpc serve_rpc: invalid reply channel name");
-                        return;
+            // Resolve the reply channel from cache (Arc bump on hit; one
+            // `format!` + `ChannelName::new` the first time we see a caller).
+            let reply_channel = match reply_channel_cache.get(&caller_origin) {
+                Some(c) => c.clone(),
+                None => {
+                    let name = format!("{service_for_emit}.replies.{caller_origin:016x}");
+                    match ChannelName::new(&name) {
+                        Ok(c) => {
+                            reply_channel_cache.insert(caller_origin, c.clone());
+                            c
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, channel = %name,
+                                "rpc serve_rpc: invalid reply channel name");
+                            return;
+                        }
                     }
-                };
+                }
+            };
+            tokio::spawn(async move {
                 // Build the RESPONSE event envelope: 24-byte meta
                 // + encoded RpcResponsePayload.
                 let meta = EventMeta::new(
