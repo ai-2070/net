@@ -16,7 +16,7 @@
   "dependencies": {
     "@mdx-js/loader": "3.1.1",
     "@mdx-js/react": "3.1.1",
-    "@next/mdx": "16.2.7",
+    "@next/mdx": "16.2.9",
     "@phosphor-icons/react": "2.1.10",
     "@posthog/react": "^1",
     "@prisma/adapter-neon": "7.8.0",
@@ -78,7 +78,7 @@
     "moment": "2.30.1",
     "moment-timezone": "0.6.2",
     "motion": "12.40.0",
-    "next": "16.2.7",
+    "next": "16.2.9",
     "next-mdx-remote": "6.0.0",
     "next-recaptcha-v3": "1.5.3",
     "next-sitemap": "4.2.3",
@@ -112,8 +112,8 @@
     "zustand": "5.0.14"
   },
   "devDependencies": {
-    "@next/bundle-analyzer": "16.2.7",
-    "@next/eslint-plugin-next": "16.2.7",
+    "@next/bundle-analyzer": "16.2.9",
+    "@next/eslint-plugin-next": "16.2.9",
     "@tailwindcss/postcss": "4.3.0",
     "@tailwindcss/typography": "0.5.20",
     "@tanstack/react-query-devtools": "5.101.0",
@@ -126,7 +126,7 @@
     "@types/ws": "8.18.1",
     "cross-env": "10.1.0",
     "eslint": "10.4.1",
-    "eslint-config-next": "16.2.7",
+    "eslint-config-next": "16.2.9",
     "prettier": "3.8.4",
     "prettier-plugin-tailwindcss": "0.8.0",
     "prisma": "7.8.0",
