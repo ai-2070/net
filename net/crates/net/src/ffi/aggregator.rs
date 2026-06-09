@@ -15,9 +15,12 @@
 )]
 
 use std::ffi::{c_char, c_int, CStr, CString};
+use std::mem::ManuallyDrop;
 use std::time::Duration;
 
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
+
+use super::handle_guard::{HandleGuard, FFI_HANDLE_FREE_DEADLINE};
 
 use crate::adapter::net::behavior::aggregator::{
     FoldQueryClient, FoldQueryClientError, FoldQueryError, RegistryClient, RegistryClientError,
@@ -128,9 +131,18 @@ impl NetVisibility {
 /// `parking_lot::Mutex`; the lifetime contract for pointers
 /// returned by [`net_registry_last_error_detail`] is "valid
 /// until the next op on this handle or until free".
+///
+/// Uses the same `HandleGuard` quiescing recipe as the
+/// cortex/mesh/redis-dedup handles (see [`super::handle_guard`]):
+/// the inner fields live in `ManuallyDrop`, every op gates on
+/// `guard.try_enter()`, and `_free` drains in-flight ops via
+/// `begin_free()` before dropping the inner — the box itself is
+/// leaked, never `Box::from_raw`'d, so a `_free` racing a
+/// concurrent op can't deallocate the lock out from under it.
 pub struct RegistryClientHandle {
-    client: ParkingRwLock<RegistryClient>,
-    last_error_detail: ParkingMutex<Option<CString>>,
+    client: ManuallyDrop<ParkingRwLock<RegistryClient>>,
+    last_error_detail: ManuallyDrop<ParkingMutex<Option<CString>>>,
+    guard: HandleGuard,
 }
 
 // ─── Constructor / free / builder ───
@@ -152,20 +164,36 @@ pub unsafe extern "C" fn net_registry_client_new(
         return std::ptr::null_mut();
     };
     let boxed = Box::new(RegistryClientHandle {
-        client: ParkingRwLock::new(RegistryClient::new(mesh_arc)),
-        last_error_detail: ParkingMutex::new(None),
+        client: ManuallyDrop::new(ParkingRwLock::new(RegistryClient::new(mesh_arc))),
+        last_error_detail: ManuallyDrop::new(ParkingMutex::new(None)),
+        guard: HandleGuard::new(),
     });
     Box::into_raw(boxed)
 }
 
 /// Free a `RegistryClient` handle produced by
-/// [`net_registry_client_new`]. Idempotent on NULL.
+/// [`net_registry_client_new`]. Idempotent on NULL and on a
+/// second call (the `begin_free` single-winner contract gates the
+/// inner drop). Quiesces in-flight ops before dropping the inner;
+/// the box stays leaked so a concurrent op can't UAF the handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_registry_client_free(handle: *mut RegistryClientHandle) {
     if handle.is_null() {
         return;
     }
-    drop(unsafe { Box::from_raw(handle) });
+    let h: &RegistryClientHandle = unsafe { &*handle };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        // SAFETY: drained; sole writable reference. Box leaked.
+        unsafe {
+            ManuallyDrop::drop(&mut (*handle).client);
+            ManuallyDrop::drop(&mut (*handle).last_error_detail);
+        }
+    } else {
+        tracing::warn!(
+            "net_registry_client_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
+    }
 }
 
 /// Override the per-call deadline in milliseconds. `millis == 0`
@@ -182,6 +210,10 @@ pub unsafe extern "C" fn net_registry_client_set_deadline(
         return;
     }
     let h: &RegistryClientHandle = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return,
+    };
     let deadline = if millis == 0 {
         DEFAULT_REGISTRY_DEADLINE
     } else {
@@ -261,6 +293,15 @@ where
         return std::ptr::null_mut();
     }
     let h: &RegistryClientHandle = unsafe { &*handle };
+    // Bail with INVALID_ARGS (same shape as a NULL handle) if
+    // `_free` has begun — a freed handle is effectively invalid.
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => {
+            unsafe { write_kind(out_error_kind, NET_REGISTRY_ERR_INVALID_ARGS) };
+            return std::ptr::null_mut();
+        }
+    };
     let client = h.client.read().clone();
     match op(client) {
         Ok(json) => unsafe { json_to_raw(json, out_error_kind) },
@@ -339,6 +380,13 @@ pub unsafe extern "C" fn net_registry_client_unregister(
         return -1;
     };
     let h: &RegistryClientHandle = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => {
+            unsafe { write_kind(out_error_kind, NET_REGISTRY_ERR_INVALID_ARGS) };
+            return -1;
+        }
+    };
     let client = h.client.read().clone();
     match block_on(client.unregister(target_node_id, group)) {
         Ok(existed) => {
@@ -374,6 +422,10 @@ pub unsafe extern "C" fn net_registry_last_error_detail(
         return std::ptr::null();
     }
     let h: &RegistryClientHandle = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return std::ptr::null(),
+    };
     let guard = h.last_error_detail.lock();
     match guard.as_ref() {
         Some(c) => c.as_ptr(),
@@ -435,9 +487,13 @@ pub unsafe extern "C" fn net_register_channel(
 /// `RwLock` so `set_ttl` / `set_deadline` writers serialize with
 /// in-flight ops, and the cache (held by the inner client's
 /// `Arc<RwLock<HashMap<...>>>`) survives deadline / TTL changes.
+///
+/// Same `HandleGuard` quiescing recipe as
+/// [`RegistryClientHandle`].
 pub struct FoldQueryClientHandle {
-    client: ParkingRwLock<FoldQueryClient>,
-    last_error_detail: ParkingMutex<Option<CString>>,
+    client: ManuallyDrop<ParkingRwLock<FoldQueryClient>>,
+    last_error_detail: ManuallyDrop<ParkingMutex<Option<CString>>>,
+    guard: HandleGuard,
 }
 
 /// Construct a `FoldQueryClient` against an existing
@@ -454,19 +510,34 @@ pub unsafe extern "C" fn net_fold_query_client_new(
         return std::ptr::null_mut();
     };
     let boxed = Box::new(FoldQueryClientHandle {
-        client: ParkingRwLock::new(FoldQueryClient::new(mesh_arc)),
-        last_error_detail: ParkingMutex::new(None),
+        client: ManuallyDrop::new(ParkingRwLock::new(FoldQueryClient::new(mesh_arc))),
+        last_error_detail: ManuallyDrop::new(ParkingMutex::new(None)),
+        guard: HandleGuard::new(),
     });
     Box::into_raw(boxed)
 }
 
-/// Free a `FoldQueryClient` handle. Idempotent on NULL.
+/// Free a `FoldQueryClient` handle. Idempotent on NULL and on a
+/// second call. Quiesces in-flight ops before dropping the inner;
+/// the box stays leaked so a concurrent op can't UAF the handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_fold_query_client_free(handle: *mut FoldQueryClientHandle) {
     if handle.is_null() {
         return;
     }
-    drop(unsafe { Box::from_raw(handle) });
+    let h: &FoldQueryClientHandle = unsafe { &*handle };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        // SAFETY: drained; sole writable reference. Box leaked.
+        unsafe {
+            ManuallyDrop::drop(&mut (*handle).client);
+            ManuallyDrop::drop(&mut (*handle).last_error_detail);
+        }
+    } else {
+        tracing::warn!(
+            "net_fold_query_client_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
+    }
 }
 
 /// Override the cache TTL in milliseconds. `millis == 0` disables
@@ -481,6 +552,10 @@ pub unsafe extern "C" fn net_fold_query_client_set_ttl(
         return;
     }
     let h: &FoldQueryClientHandle = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return,
+    };
     h.client.write().set_ttl_mut(Duration::from_millis(millis));
 }
 
@@ -495,6 +570,10 @@ pub unsafe extern "C" fn net_fold_query_client_set_deadline(
         return;
     }
     let h: &FoldQueryClientHandle = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return,
+    };
     let deadline = if millis == 0 {
         DEFAULT_QUERY_DEADLINE
     } else {
@@ -554,6 +633,10 @@ pub unsafe extern "C" fn net_fold_query_client_invalidate_cache(
         return;
     }
     let h: &FoldQueryClientHandle = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return,
+    };
     h.client.read().invalidate_cache();
 }
 
@@ -567,6 +650,10 @@ pub unsafe extern "C" fn net_fold_query_client_invalidate_target(
         return;
     }
     let h: &FoldQueryClientHandle = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return,
+    };
     h.client.read().invalidate_target(target_node_id);
 }
 
@@ -581,6 +668,10 @@ pub unsafe extern "C" fn net_fold_query_last_error_detail(
         return std::ptr::null();
     }
     let h: &FoldQueryClientHandle = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return std::ptr::null(),
+    };
     let guard = h.last_error_detail.lock();
     match guard.as_ref() {
         Some(c) => c.as_ptr(),
@@ -612,6 +703,15 @@ where
         return std::ptr::null_mut();
     }
     let h: &FoldQueryClientHandle = unsafe { &*handle };
+    // Bail with INVALID_ARGS (same shape as a NULL handle) if
+    // `_free` has begun — a freed handle is effectively invalid.
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => {
+            unsafe { write_kind(out_error_kind, NET_REGISTRY_ERR_INVALID_ARGS) };
+            return std::ptr::null_mut();
+        }
+    };
     let client = h.client.read().clone();
     match op(client) {
         Ok(json) => unsafe { json_to_raw(json, out_error_kind) },
