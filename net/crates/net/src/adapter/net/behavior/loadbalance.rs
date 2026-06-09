@@ -692,6 +692,20 @@ pub struct LoadBalancerStats {
     pub avg_load_score: f64,
 }
 
+/// Shard count for the consistent-hash ring.
+///
+/// `DashMap::new()` defaults to `4 × num_cpus` shards (128 on a 32-thread
+/// host). The ring holds `virtual_nodes × endpoints` entries and
+/// `select_consistent_hash` walks it, so the default over-sharding added a
+/// ~128-shard-lock fixed cost to every consistent-hash selection (measured
+/// ~19% of it). A small fixed count keeps the walk cheap while leaving room for
+/// concurrent ring inserts on add/remove.
+///
+/// (The `endpoints` map keeps the default on purpose: `select`/`stats` read the
+/// `endpoint_list` snapshot, not `endpoints.iter()`, so its shard count only
+/// affects concurrent point lookups — where more shards is better.)
+const HASH_RING_SHARDS: usize = 8;
+
 /// Distributed load balancer
 pub struct LoadBalancer {
     /// Configuration
@@ -737,7 +751,7 @@ impl LoadBalancer {
             rr_counter: AtomicU64::new(0),
             total_selections: AtomicU64::new(0),
             failed_selections: AtomicU64::new(0),
-            hash_ring: DashMap::new(),
+            hash_ring: DashMap::with_shard_amount(HASH_RING_SHARDS),
             virtual_nodes: 150,
         }
     }
