@@ -254,6 +254,13 @@ struct EndpointState {
     /// Whether a half-open probe request is currently in flight. Only one
     /// request is admitted per recovery cycle to test the endpoint.
     half_open_probe: std::sync::atomic::AtomicBool,
+    /// Set when the endpoint is removed from the balancer. The flat snapshot
+    /// shares this `Arc`, so a selector iterating a snapshot taken *before* a
+    /// concurrent removal (and before the rebuild that drops the endpoint)
+    /// sees it as unavailable immediately. Without this, that selector could
+    /// pick a gone endpoint, fail the `endpoints.get` reservation, and burn a
+    /// retry — exhausting into a transient false `NoEndpointsAvailable`.
+    removed: std::sync::atomic::AtomicBool,
 }
 
 impl EndpointState {
@@ -274,6 +281,7 @@ impl EndpointState {
             circuit_open: std::sync::atomic::AtomicBool::new(false),
             circuit_open_time: Mutex::new(None),
             half_open_probe: std::sync::atomic::AtomicBool::new(false),
+            removed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -311,7 +319,9 @@ impl EndpointState {
     }
 
     fn is_available(&self) -> bool {
-        self.is_enabled() && self.health().can_receive_traffic()
+        !self.removed.load(Ordering::Acquire)
+            && self.is_enabled()
+            && self.health().can_receive_traffic()
     }
 
     /// Atomically reserve a connection slot if the endpoint is below cap.
@@ -758,7 +768,11 @@ impl LoadBalancer {
     pub fn remove_endpoint(&self, node_id: &NodeId) {
         let _guard = self.membership_lock.lock();
         self.remove_from_hash_ring(node_id);
-        self.endpoints.remove(node_id);
+        if let Some((_, state)) = self.endpoints.remove(node_id) {
+            // Flag the shared EndpointState so an in-flight selector reading a
+            // pre-rebuild snapshot treats it as unavailable (see field doc).
+            state.removed.store(true, Ordering::Release);
+        }
         self.rebuild_endpoint_list();
     }
 
@@ -2753,6 +2767,40 @@ mod tests {
             }),
             "snapshot must contain only live endpoints"
         );
+    }
+
+    /// A snapshot taken before a removal still holds the endpoint's `Arc`
+    /// (exactly what an in-flight `select()` iterates). After removal that
+    /// endpoint must report unavailable through the *stale* snapshot — so the
+    /// strategy filters it out instead of selecting a gone endpoint and
+    /// burning a reservation retry into a false `NoEndpointsAvailable`.
+    #[test]
+    fn removed_endpoint_is_unavailable_through_a_stale_snapshot() {
+        let lb = LoadBalancer::with_strategy(Strategy::RoundRobin);
+        lb.add_endpoint(Endpoint::new(make_node_id(1)));
+        lb.add_endpoint(Endpoint::new(make_node_id(2)));
+
+        // Capture the snapshot BEFORE removal — holds Arcs to both endpoints.
+        let stale = lb.endpoint_list.load_full();
+        assert_eq!(stale.len(), 2);
+
+        lb.remove_endpoint(&make_node_id(1));
+
+        // Through the stale snapshot, the removed endpoint is now unavailable;
+        // the survivor stays available.
+        for state in stale.iter() {
+            if state.node_id == make_node_id(1) {
+                assert!(
+                    !state.is_available(),
+                    "removed endpoint must be unavailable via the stale snapshot"
+                );
+            } else {
+                assert!(
+                    state.is_available(),
+                    "surviving endpoint must remain available"
+                );
+            }
+        }
     }
 
     // ---------- LoadBalancerError Display ----------
