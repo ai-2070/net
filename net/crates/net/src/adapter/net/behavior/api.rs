@@ -1689,20 +1689,27 @@ impl ApiRegistry {
             }
         }
 
-        // Remove old indexes if updating
-        if let Some(old) = self.nodes.get(&node_id) {
-            self.remove_from_indexes(&old);
-        }
-
         let ann = Arc::new(announcement);
 
-        // Add to indexes
-        self.add_to_indexes(&ann);
-
-        // Store. A `None` return means this node_id was new, so bump the
-        // O(1) node counter exactly once (updates keep the count unchanged).
-        if self.nodes.insert(node_id, ann).is_none() {
-            self.node_count.fetch_add(1, Ordering::Relaxed);
+        // Read-old / re-index / store, all inside the `nodes` entry lock so a
+        // concurrent re-registration of the same node_id can't interleave and
+        // drift `total_endpoints` (which would underflow on the `fetch_sub`) or
+        // `by_api_name` (now surfaced by `stats()`). The index maps touched by
+        // add/remove_from_indexes are distinct from `nodes`, so holding the
+        // entry lock across them can't deadlock. Mirrors `MetadataStore::upsert`.
+        use dashmap::mapref::entry::Entry;
+        match self.nodes.entry(node_id) {
+            Entry::Occupied(mut slot) => {
+                let old = slot.get().clone();
+                self.remove_from_indexes(&old);
+                self.add_to_indexes(&ann);
+                slot.insert(ann);
+            }
+            Entry::Vacant(slot) => {
+                self.add_to_indexes(&ann);
+                slot.insert(ann);
+                self.node_count.fetch_add(1, Ordering::Relaxed);
+            }
         }
         self.update_count.fetch_add(1, Ordering::Relaxed);
 
@@ -2401,6 +2408,49 @@ mod tests {
         assert_eq!(s.total_nodes, 0);
         assert_eq!(s.total_endpoints, 0);
         assert!(s.apis_by_name.is_empty());
+    }
+
+    /// Concurrent re-registration of the SAME node_id must keep the O(1)
+    /// counters exact: each `register` is an atomic remove-old + add-new under
+    /// the `nodes` entry lock, so `total_endpoints` can't drift (or underflow
+    /// on the `fetch_sub`) and `node_count` stays 1. Pre-fix the
+    /// read-old/add-indexes/insert steps were separately locked and could
+    /// interleave under contention.
+    #[test]
+    fn concurrent_same_node_register_keeps_counters_exact() {
+        use std::sync::Arc as StdArc;
+
+        let registry = StdArc::new(ApiRegistry::new());
+        let threads = 16;
+        let iters = 200;
+
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let registry = StdArc::clone(&registry);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..iters {
+                    let schema = ApiSchema::new("api", ApiVersion::new(1, 0, 0))
+                        .add_endpoint(ApiEndpoint::new("/a", ApiMethod::Get))
+                        .add_endpoint(ApiEndpoint::new("/b", ApiMethod::Post));
+                    registry
+                        .register(ApiAnnouncement::new(make_node_id(0), vec![schema]))
+                        .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Exactly one node with two endpoints, regardless of interleaving.
+        assert_eq!(registry.len(), 1);
+        let s = registry.stats();
+        assert_eq!(s.total_nodes, 1);
+        assert_eq!(
+            s.total_endpoints, 2,
+            "total_endpoints must not drift or underflow under concurrent re-register"
+        );
+        assert_eq!(s.apis_by_name.get("api"), Some(&1));
     }
 
     /// `path_matches` (no-alloc) must agree with `matches_path(..).is_some()`
