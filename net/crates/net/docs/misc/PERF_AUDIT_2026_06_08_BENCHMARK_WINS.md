@@ -506,6 +506,31 @@ Notes:
   `lb_scaling` rows show the fixed shard-walk floor is gone (the residual at /500
   is real per-endpoint filter + strategy work).
 
+### Re-verification after review fixes (2026-06-09)
+
+The §8 work drew a code review that hardened both subsystems on `performance-6`:
+`LoadBalancer` gained a membership `Mutex` (serializing add/remove + snapshot
+rebuild) and a `removed` `AtomicBool` on `EndpointState` (checked in
+`is_available()`); `ApiRegistry::register` became atomic under the `nodes` entry
+lock and `clear()` switched to drain-and-decrement. The §8 benchmarks were rerun
+to confirm none of this regressed the wins.
+
+**No regression.** The `select` hot path — which now performs one extra
+`AtomicBool::load(Acquire)` per endpoint in `is_available()` — stays in the same
+regime: `lb_scaling/select/10` and `lb_strategies/round_robin` both measured
+~340–410 ns (vs the 5.59 µs pre-snapshot baseline), i.e. the §8b win is intact.
+The membership `Mutex` is off the hot path (add/remove only; `select`/`stats`
+just read the snapshot). The `ApiRegistry` `len` (203 ps), `stats` (~7–11 µs,
+still a single `by_api_name` shard-walk floor), and `find_by_endpoint` (~1.9–2.2 ms)
+paths are untouched by the fixes and measured within noise.
+
+**Caveat — dev-box variance.** These sub-µs `select` benches show ±~40–50%
+run-to-run swing on this machine (e.g. `round_robin` measured 363 → 553 → 393 ns
+across three back-to-back runs, with `select/10` tracking it at 338–409 ns). The
+table figures above remain the representative numbers; the review fixes add no
+measurable cost on top of them (~1 ns × endpoints for the per-endpoint atomic
+load, and zero on the hot path for the membership `Mutex`).
+
 ---
 
 ## Follow-ups (remaining opportunities)
