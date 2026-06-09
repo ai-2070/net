@@ -1604,11 +1604,17 @@ pub struct IndexedApiNode {
 pub struct ApiRegistryStats {
     /// Total nodes registered
     pub total_nodes: usize,
-    /// Total API schemas
+    /// Number of distinct (provider node, API name) pairs — i.e.
+    /// `apis_by_name.values().sum()`. NOT a count of schema *objects*: a node
+    /// that lists the same API name in two schemas counts once (the registry
+    /// indexes API name → provider set, so a name has at most one entry per
+    /// node). For distinct names per node these coincide.
     pub total_schemas: usize,
-    /// Total endpoints
+    /// Total endpoint *instances* across all registered schemas (a node's two
+    /// same-named schemas contribute both their endpoint counts).
     pub total_endpoints: usize,
-    /// APIs by name
+    /// For each API name, the number of distinct provider nodes advertising it
+    /// (deduplicated per node).
     pub apis_by_name: HashMap<String, usize>,
     /// Query count
     pub queries: u64,
@@ -2408,6 +2414,49 @@ mod tests {
         assert_eq!(s.total_nodes, 0);
         assert_eq!(s.total_endpoints, 0);
         assert!(s.apis_by_name.is_empty());
+    }
+
+    /// stats() is derived from the `by_api_name` *provider set*, so a single
+    /// node listing the same API name in two schemas counts as ONE provider
+    /// for that name (and one toward `total_schemas`) — while every endpoint
+    /// instance still counts toward `total_endpoints`. Pins the deduped-per-node
+    /// semantics documented on `ApiRegistryStats`; they differ from a naive
+    /// schema-object count only in this degenerate duplicate-name case.
+    #[test]
+    fn stats_dedupes_duplicate_api_names_within_a_node() {
+        let registry = ApiRegistry::new();
+        let dup_a = ApiSchema::new("dup", ApiVersion::new(1, 0, 0))
+            .add_endpoint(ApiEndpoint::new("/a", ApiMethod::Get));
+        let dup_b = ApiSchema::new("dup", ApiVersion::new(2, 0, 0))
+            .add_endpoint(ApiEndpoint::new("/b", ApiMethod::Get))
+            .add_endpoint(ApiEndpoint::new("/c", ApiMethod::Post));
+        registry
+            .register(ApiAnnouncement::new(make_node_id(0), vec![dup_a, dup_b]))
+            .unwrap();
+
+        let s = registry.stats();
+        assert_eq!(s.total_nodes, 1);
+        assert_eq!(
+            s.apis_by_name.get("dup"),
+            Some(&1),
+            "one node = one provider of 'dup', even with two same-named schemas"
+        );
+        assert_eq!(s.total_schemas, 1, "total_schemas counts (node, name) pairs");
+        assert_eq!(
+            s.total_endpoints, 3,
+            "every endpoint instance still counts (1 + 2)"
+        );
+
+        // A second node advertising 'dup' bumps the provider count to 2.
+        let other = ApiSchema::new("dup", ApiVersion::new(1, 0, 0))
+            .add_endpoint(ApiEndpoint::new("/a", ApiMethod::Get));
+        registry
+            .register(ApiAnnouncement::new(make_node_id(1), vec![other]))
+            .unwrap();
+        let s = registry.stats();
+        assert_eq!(s.apis_by_name.get("dup"), Some(&2));
+        assert_eq!(s.total_schemas, 2);
+        assert_eq!(s.total_endpoints, 4);
     }
 
     /// Concurrent re-registration of the SAME node_id must keep the O(1)
