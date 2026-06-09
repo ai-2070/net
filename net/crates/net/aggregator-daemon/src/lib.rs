@@ -292,6 +292,10 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
             })?;
     let config: Config = toml::from_str(&raw).map_err(DaemonError::ConfigParse)?;
 
+    // The config holds the mesh PSK; warn if it's readable by other
+    // local users (advisory — see `warn_if_config_world_readable`).
+    warn_if_config_world_readable(&cli.config).await;
+
     // CLI listen override.
     let listen = cli.listen.unwrap_or(config.listen.clone());
     let listen_addr: std::net::SocketAddr =
@@ -818,6 +822,37 @@ fn decode_hex_32(s: &str) -> Result<[u8; 32], String> {
 fn decode_psk(s: &str) -> Result<[u8; 32], DaemonError> {
     decode_hex_32(s).map_err(DaemonError::PskInvalid)
 }
+
+/// Warn (don't fail) if the daemon config is group- or
+/// world-readable. The config holds `psk_hex` — the mesh
+/// pre-shared key that gates every handshake — so a permissive
+/// mode is the same exposure `cli/identity.rs` guards its seed
+/// against. We only warn rather than refuse: unlike the identity
+/// seed (created by our own CLI with mode 0600), the daemon config
+/// is operator-authored and may live under a deployment's own
+/// permission scheme, so failing closed would be too aggressive.
+/// No-op on non-Unix (no clean mode bits via `std::fs`).
+#[cfg(unix)]
+async fn warn_if_config_world_readable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = tokio::fs::metadata(path).await else {
+        return;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    // Group/other readable (or writable) → the PSK is exposed.
+    if mode & 0o077 != 0 {
+        tracing::warn!(
+            config = %path.display(),
+            mode = format!("{mode:#o}"),
+            "aggregator config is group/world-accessible but holds the mesh \
+             PSK (psk_hex); tighten to 0600 so the pre-shared key isn't \
+             readable by other local users",
+        );
+    }
+}
+
+#[cfg(not(unix))]
+async fn warn_if_config_world_readable(_path: &std::path::Path) {}
 
 fn decode_seed(s: &str) -> Result<[u8; 32], String> {
     decode_hex_32(s)
