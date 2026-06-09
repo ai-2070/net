@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/behavior/loadbalance.rs
+  s_8870c7403329c0::t_e16b50284822ba 284
+  s_8870c7403329c0::t_8d079ff6e44822 771-775
+  s_8870c7403329c0::t_5de831de768c67 2772-2805
+  s_8870c7403329c0::t_ce511f773f0987 322-324
+  s_8870c7403329c0::t_290f7ee59d7f8e 257-263
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "e575b1430aacfbe5a4e80eab4cead93ecbe2e790",
+  "prompts": {},
+  "sessions": {
+    "s_8870c7403329c0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0cc782bd-f8c5-40e5-80e4-a9c79b6b7195",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
