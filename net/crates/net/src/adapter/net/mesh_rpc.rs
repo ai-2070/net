@@ -564,7 +564,7 @@ async fn publish_request_chunk(
     let meta = EventMeta::new(DISPATCH_RPC_REQUEST_CHUNK, 0, self_origin, chunk.call_id, 0);
     let mut buf = Vec::with_capacity(EVENT_META_SIZE + chunk.encoded_len());
     buf.extend_from_slice(&meta.to_bytes());
-    buf.extend_from_slice(&chunk.encode());
+    chunk.encode_into(&mut buf);
     let request_channel_id = ChannelId::new(request_channel.clone());
     let request_channel_hash = request_channel_id.hash();
     let stream_id = MeshNode::publish_stream_id(&request_channel_id);
@@ -858,7 +858,7 @@ impl ClientStreamCallRaw {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, self.self_origin, self.call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + req.encoded_len());
         buf.extend_from_slice(&meta.to_bytes());
-        buf.extend_from_slice(&req.encode());
+        req.encode_into(&mut buf);
         let request_channel_id = ChannelId::new(self.request_channel.clone());
         let request_channel_hash = request_channel_id.hash();
         let stream_id = MeshNode::publish_stream_id(&request_channel_id);
@@ -1104,7 +1104,7 @@ impl DuplexSink {
         );
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + req.encoded_len());
         buf.extend_from_slice(&meta.to_bytes());
-        buf.extend_from_slice(&req.encode());
+        req.encode_into(&mut buf);
         let request_channel_id = ChannelId::new(self.inner.request_channel.clone());
         let request_channel_hash = request_channel_id.hash();
         let stream_id = MeshNode::publish_stream_id(&request_channel_id);
@@ -1836,7 +1836,7 @@ impl MeshNode {
                 );
                 let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
                 buf.extend_from_slice(&meta.to_bytes());
-                buf.extend_from_slice(&resp.encode());
+                resp.encode_into(&mut buf);
 
                 if let Err(e) = publish_response_to_caller(
                     &mesh,
@@ -2074,7 +2074,7 @@ impl MeshNode {
                 );
                 let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
                 buf.extend_from_slice(&meta.to_bytes());
-                buf.extend_from_slice(&resp.encode());
+                resp.encode_into(&mut buf);
                 if let Err(e) = publish_response_to_caller(
                     &mesh,
                     caller_origin,
@@ -2192,7 +2192,7 @@ impl MeshNode {
                 );
                 let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
                 buf.extend_from_slice(&meta.to_bytes());
-                buf.extend_from_slice(&resp.encode());
+                resp.encode_into(&mut buf);
                 if let Err(e) = publish_response_to_caller(
                     &mesh,
                     caller_origin,
@@ -2428,7 +2428,7 @@ impl MeshNode {
                 );
                 let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
                 buf.extend_from_slice(&meta.to_bytes());
-                buf.extend_from_slice(&resp.encode());
+                resp.encode_into(&mut buf);
                 if let Err(e) = publish_response_to_caller(
                     &mesh,
                     caller_origin,
@@ -2692,7 +2692,7 @@ impl MeshNode {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, self_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + req.body.len() + 32);
         buf.extend_from_slice(&meta.to_bytes());
-        buf.extend_from_slice(&req.encode());
+        req.encode_into(&mut buf);
 
         let payload_bytes = Bytes::from(buf);
         if let Err(e) = self
@@ -3121,7 +3121,7 @@ impl MeshNode {
         let meta = EventMeta::new(DISPATCH_RPC_REQUEST, 0, self_origin, call_id, 0);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + req.body.len() + 32);
         buf.extend_from_slice(&meta.to_bytes());
-        buf.extend_from_slice(&req.encode());
+        req.encode_into(&mut buf);
 
         // Send the REQUEST directly to `target_node_id` via
         // `publish_to_peer`, bypassing the local subscriber roster
