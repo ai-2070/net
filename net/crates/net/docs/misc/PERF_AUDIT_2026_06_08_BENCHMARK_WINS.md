@@ -497,14 +497,39 @@ Notes:
   candidates: an endpoint whose first path segment is a parameter (`/{tenant}/…`)
   is indexed under a different prefix than a concrete query path, so an index
   lookup would miss it. Allocation removal was the safe, large lever.
-- §8b `lb_strategies/consistent_hash` (50.6 → 74.4 µs) is **not improved** by this
-  change: its cost is dominated by the separate `hash_ring` `DashMap` walk
-  (`virtual_nodes × endpoints`), which `select`'s snapshot does not touch. The
-  delta is run-to-run/thermal variance on the dev box. Applying the same snapshot
-  treatment to `hash_ring` is a viable follow-up. The other strategies (RR, LC,
-  P2, random, least-load — all 10-endpoint `select`s) dropped ~12–24×, and the
-  `lb_scaling` rows show the fixed shard-walk floor is gone (the residual at /500
-  is real per-endpoint filter + strategy work).
+- §8b `lb_strategies/consistent_hash` was **not improved by the snapshot** (its
+  cost is the separate `hash_ring` `DashMap` walk, `virtual_nodes × endpoints`,
+  which `select`'s snapshot doesn't touch) — but it was subsequently fixed by
+  **right-sizing the `hash_ring` shard count** (`HASH_RING_SHARDS = 8` vs the
+  `DashMap::new()` default of `4 × num_cpus` = 128): ~20% faster (49.1 → 39.8 µs,
+  reproduced across two runs), no new invariants. See "Snapshot vs. right-sized
+  DashMap" below. The other strategies (RR, LC, P2, random, least-load — all
+  10-endpoint `select`s) dropped ~12–24×, and the `lb_scaling` rows show the
+  fixed shard-walk floor is gone (the residual at /500 is real per-endpoint
+  filter + strategy work).
+
+### Snapshot vs. right-sized DashMap (2026-06-09)
+
+A natural question on §8b: was the `ArcSwap<Vec>` snapshot (with its dual
+source-of-truth, membership `Mutex`, and `removed` flag) actually necessary, or
+would simply *right-sizing* the over-sharded `endpoints` `DashMap` have captured
+the win more cheaply? Prototyped and benchmarked head-to-head (Criterion
+`--baseline`, same session):
+
+| bench | snapshot (kept) | right-sized 8-shard `DashMap` | Δ |
+| --- | --- | --- | --- |
+| `lb_strategies/round_robin` | 369 ns | 730 ns | **+106%** |
+| `lb_strategies/least_connections` | 379 ns | 734 ns | +98% |
+| `lb_scaling/select/10` | 369 ns | 738 ns | +100% |
+| `lb_scaling/select/500` | 4.47 µs | 6.95 µs | +55% |
+
+The snapshot **wins ~2×** on the iterate-heavy `select` path: a wait-free
+`ArcSwap` load over a contiguous `Vec` beats locking even 8 `DashMap` shards and
+chasing scattered HashMap buckets. So the snapshot earns its complexity and
+stays. The *one* salvageable idea from the prototype — right-sizing `hash_ring`,
+which the snapshot doesn't cover — was kept (the ~20% `consistent_hash` win
+above); `endpoints` keeps the default shard count since `select`/`stats` read
+the snapshot, not `endpoints.iter()`.
 
 ### Re-verification after review fixes (2026-06-09)
 
@@ -538,12 +563,14 @@ load, and zero on the hot path for the membership `Mutex`).
 Identified during this audit but not yet done. Each is independent and low-risk
 except where noted.
 
-- **`hash_ring` snapshot for `consistent_hash`** — small. `select_consistent_hash`
-  walks the `hash_ring` `DashMap` (`virtual_nodes × endpoints` ≈ 1500 entries for
-  10 endpoints), the dominant cost behind `lb_strategies/consistent_hash` (~50–74 µs
-  vs sub-µs for the other strategies). Apply the same `ArcSwap` snapshot treatment
-  as §8b (rebuild on add/remove), or precompute a sorted ring `Vec` for binary
-  search. Expected: ~50 µs → low-µs. File: `loadbalance.rs`.
+- **`hash_ring` for `consistent_hash`** — *partially done.* Right-sized the ring's
+  shard count (`HASH_RING_SHARDS = 8`) for a ~20% win (49.1 → 39.8 µs) at zero
+  invariant cost — see "Snapshot vs. right-sized DashMap" above. The larger lever
+  remains: `select_consistent_hash` still does an O(ring) walk
+  (`virtual_nodes × endpoints` ≈ 1500 entries), so it's still ~40 µs vs sub-µs for
+  the other strategies. Precomputing a **sorted ring `Vec` for binary search**
+  (rebuilt on add/remove, like §8b's snapshot) would take it to low-µs. File:
+  `loadbalance.rs`.
 - **`FairScheduler::stream_count` → `AtomicUsize`** — trivial. Still a
   `DashMap::len()` shard walk (`fair_scheduler/stream_count_empty` ≈ 960 ns); the
   same atomic-counter pattern as §2 applies. File: `src/adapter/net/router.rs`.
