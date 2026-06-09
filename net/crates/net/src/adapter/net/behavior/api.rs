@@ -1688,8 +1688,7 @@ impl ApiRegistry {
 
         // Check capacity (O(1) counter, not a per-shard DashMap::len walk).
         if let Some(max) = self.max_capacity {
-            if !self.nodes.contains_key(&node_id)
-                && self.node_count.load(Ordering::Relaxed) >= max
+            if !self.nodes.contains_key(&node_id) && self.node_count.load(Ordering::Relaxed) >= max
             {
                 return Err(RegistryError::CapacityExceeded);
             }
@@ -2455,7 +2454,10 @@ mod tests {
             Some(&1),
             "one node = one provider of 'dup', even with two same-named schemas"
         );
-        assert_eq!(s.total_schemas, 1, "total_schemas counts (node, name) pairs");
+        assert_eq!(
+            s.total_schemas, 1,
+            "total_schemas counts (node, name) pairs"
+        );
         assert_eq!(
             s.total_endpoints, 3,
             "every endpoint instance still counts (1 + 2)"
@@ -2566,7 +2568,13 @@ mod tests {
         let live_endpoints: usize = registry
             .nodes
             .iter()
-            .map(|e| e.value().schemas.iter().map(|s| s.endpoints.len()).sum::<usize>())
+            .map(|e| {
+                e.value()
+                    .schemas
+                    .iter()
+                    .map(|s| s.endpoints.len())
+                    .sum::<usize>()
+            })
             .sum();
         assert_eq!(
             registry.stats().total_endpoints,

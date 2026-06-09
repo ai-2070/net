@@ -782,8 +782,11 @@ impl LoadBalancer {
     /// so they need no rebuild. This is the only place that pays the
     /// `DashMap::iter()` shard walk; the hot path reads the snapshot.
     fn rebuild_endpoint_list(&self) {
-        let list: Vec<Arc<EndpointState>> =
-            self.endpoints.iter().map(|e| Arc::clone(e.value())).collect();
+        let list: Vec<Arc<EndpointState>> = self
+            .endpoints
+            .iter()
+            .map(|e| Arc::clone(e.value()))
+            .collect();
         self.endpoint_list.store(Arc::new(list));
     }
 
