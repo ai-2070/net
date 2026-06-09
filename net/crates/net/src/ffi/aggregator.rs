@@ -128,9 +128,10 @@ impl NetVisibility {
 /// (entry points are called from many threads in async runtimes)
 /// can share read access while a `set_deadline` writer
 /// serializes. `last_error_detail` lives behind a separate
-/// `parking_lot::Mutex`; the lifetime contract for pointers
-/// returned by [`net_registry_last_error_detail`] is "valid
-/// until the next op on this handle or until free".
+/// `parking_lot::Mutex`; [`net_registry_last_error_detail`]
+/// returns an owned copy of its contents (freed with
+/// `net_free_string`), so the returned pointer never aliases this
+/// mutex-owned slot and can't dangle on overwrite/free.
 ///
 /// Uses the same `HandleGuard` quiescing recipe as the
 /// cortex/mesh/redis-dedup handles (see [`super::handle_guard`]):
@@ -407,29 +408,37 @@ pub unsafe extern "C" fn net_registry_client_unregister(
 }
 
 /// Get the operator-facing detail string for the most recent
-/// non-OK op on this handle. Returns a NUL-terminated C string
-/// owned by the handle — the pointer is valid until the next
-/// op (which may overwrite it) or until the handle is freed.
-/// Returns NULL when no error has been recorded.
+/// non-OK op on this handle. Returns a freshly-allocated,
+/// NUL-terminated C string that the **caller owns and must free
+/// with `net_free_string`**. Returns NULL when no error has been
+/// recorded.
 ///
-/// Callers wanting to hold the string across other ops should
-/// copy it before doing anything else with the handle.
+/// An owned copy (rather than a borrow into the handle) is
+/// deliberate: a borrowed pointer into the handle's
+/// `Mutex`-owned `CString` would dangle the moment a concurrent
+/// op overwrote the slot or `_free` dropped the inner — a
+/// use-after-free under the multi-threaded usage this handle
+/// advertises. We snapshot under the lock and hand back an
+/// independent allocation, so the returned pointer's lifetime is
+/// the caller's alone.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_registry_last_error_detail(
     handle: *mut RegistryClientHandle,
-) -> *const c_char {
+) -> *mut c_char {
     if handle.is_null() {
-        return std::ptr::null();
+        return std::ptr::null_mut();
     }
     let h: &RegistryClientHandle = unsafe { &*handle };
     let _op = match h.guard.try_enter() {
         Some(op) => op,
-        None => return std::ptr::null(),
+        None => return std::ptr::null_mut(),
     };
     let guard = h.last_error_detail.lock();
     match guard.as_ref() {
-        Some(c) => c.as_ptr(),
-        None => std::ptr::null(),
+        // Clone the contents out from under the lock into a fresh
+        // allocation the caller frees with `net_free_string`.
+        Some(c) => c.clone().into_raw(),
+        None => std::ptr::null_mut(),
     }
 }
 
@@ -658,24 +667,27 @@ pub unsafe extern "C" fn net_fold_query_client_invalidate_target(
 }
 
 /// Operator-facing detail string for the most recent non-OK
-/// fold-query op. Same valid-until contract as
-/// [`net_registry_last_error_detail`].
+/// fold-query op. Returns a freshly-allocated, caller-owned C
+/// string to be freed with `net_free_string` (NULL if no error
+/// recorded). Same owned-copy rationale as
+/// [`net_registry_last_error_detail`] — never a borrow into the
+/// handle, which would dangle on a concurrent overwrite/free.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_fold_query_last_error_detail(
     handle: *mut FoldQueryClientHandle,
-) -> *const c_char {
+) -> *mut c_char {
     if handle.is_null() {
-        return std::ptr::null();
+        return std::ptr::null_mut();
     }
     let h: &FoldQueryClientHandle = unsafe { &*handle };
     let _op = match h.guard.try_enter() {
         Some(op) => op,
-        None => return std::ptr::null(),
+        None => return std::ptr::null_mut(),
     };
     let guard = h.last_error_detail.lock();
     match guard.as_ref() {
-        Some(c) => c.as_ptr(),
-        None => std::ptr::null(),
+        Some(c) => c.clone().into_raw(),
+        None => std::ptr::null_mut(),
     }
 }
 
