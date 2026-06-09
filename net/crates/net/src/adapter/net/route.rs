@@ -683,7 +683,7 @@ impl RoutingTable {
 
     /// Get stream stats, creating the entry if absent.
     ///
-    /// Shares the [`MAX_STREAM_STATS`] admission gate with the `record_*`
+    /// Shares the `MAX_STREAM_STATS` admission gate with the `record_*`
     /// methods: an existing entry is always returned, but a novel
     /// `stream_id` is only created (and returned) while the map is below
     /// the cap, returning `None` once it's reached. Without this gate,

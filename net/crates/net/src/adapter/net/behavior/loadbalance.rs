@@ -254,6 +254,13 @@ struct EndpointState {
     /// Whether a half-open probe request is currently in flight. Only one
     /// request is admitted per recovery cycle to test the endpoint.
     half_open_probe: std::sync::atomic::AtomicBool,
+    /// Set when the endpoint is removed from the balancer. The flat snapshot
+    /// shares this `Arc`, so a selector iterating a snapshot taken *before* a
+    /// concurrent removal (and before the rebuild that drops the endpoint)
+    /// sees it as unavailable immediately. Without this, that selector could
+    /// pick a gone endpoint, fail the `endpoints.get` reservation, and burn a
+    /// retry — exhausting into a transient false `NoEndpointsAvailable`.
+    removed: std::sync::atomic::AtomicBool,
 }
 
 impl EndpointState {
@@ -274,6 +281,7 @@ impl EndpointState {
             circuit_open: std::sync::atomic::AtomicBool::new(false),
             circuit_open_time: Mutex::new(None),
             half_open_probe: std::sync::atomic::AtomicBool::new(false),
+            removed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -311,7 +319,9 @@ impl EndpointState {
     }
 
     fn is_available(&self) -> bool {
-        self.is_enabled() && self.health().can_receive_traffic()
+        !self.removed.load(Ordering::Acquire)
+            && self.is_enabled()
+            && self.health().can_receive_traffic()
     }
 
     /// Atomically reserve a connection slot if the endpoint is below cap.
@@ -682,12 +692,42 @@ pub struct LoadBalancerStats {
     pub avg_load_score: f64,
 }
 
+/// Shard count for the consistent-hash ring.
+///
+/// `DashMap::new()` defaults to `4 × num_cpus` shards (128 on a 32-thread
+/// host). The ring holds `virtual_nodes × endpoints` entries and
+/// `select_consistent_hash` walks it, so the default over-sharding added a
+/// ~128-shard-lock fixed cost to every consistent-hash selection (measured
+/// ~19% of it). A small fixed count keeps the walk cheap while leaving room for
+/// concurrent ring inserts on add/remove.
+///
+/// (The `endpoints` map keeps the default on purpose: `select`/`stats` read the
+/// `endpoint_list` snapshot, not `endpoints.iter()`, so its shard count only
+/// affects concurrent point lookups — where more shards is better.)
+const HASH_RING_SHARDS: usize = 8;
+
 /// Distributed load balancer
 pub struct LoadBalancer {
     /// Configuration
     config: LoadBalancerConfig,
-    /// Endpoints by node ID
+    /// Endpoints by node ID — authoritative store for point lookups
+    /// (get / reservation / health updates).
     endpoints: DashMap<NodeId, Arc<EndpointState>>,
+    /// Flat snapshot of the same endpoints, rebuilt only when the SET changes
+    /// (add/remove). `select()`/`stats()` iterate this instead of
+    /// `DashMap::iter()`, which walks every shard (4*num_cpus, e.g. 128) even
+    /// for a handful of endpoints — the fixed cost that dominated select().
+    /// The Arcs are shared with `endpoints`, so live per-endpoint atomic state
+    /// (health, connections, circuit) is read correctly through the snapshot.
+    endpoint_list: ArcSwap<Vec<Arc<EndpointState>>>,
+    /// Serializes endpoint SET changes (add/remove) so the `endpoints`
+    /// mutation, hash-ring update, and `endpoint_list` rebuild commit as one
+    /// unit. Without it, two concurrent membership changes can interleave such
+    /// that a rebuild observing the map *before* another thread's mutation
+    /// stores its stale snapshot last — dropping a just-added endpoint (or
+    /// resurrecting a removed one) from `endpoint_list` until the next change.
+    /// Not taken on the hot path (`select`/`stats` only read the snapshot).
+    membership_lock: Mutex<()>,
     /// Round-robin counter
     rr_counter: AtomicU64,
     /// Total selections
@@ -706,10 +746,12 @@ impl LoadBalancer {
         Self {
             config,
             endpoints: DashMap::new(),
+            endpoint_list: ArcSwap::from_pointee(Vec::new()),
+            membership_lock: Mutex::new(()),
             rr_counter: AtomicU64::new(0),
             total_selections: AtomicU64::new(0),
             failed_selections: AtomicU64::new(0),
-            hash_ring: DashMap::new(),
+            hash_ring: DashMap::with_shard_amount(HASH_RING_SHARDS),
             virtual_nodes: 150,
         }
     }
@@ -725,17 +767,41 @@ impl LoadBalancer {
     /// Add an endpoint
     pub fn add_endpoint(&self, endpoint: Endpoint) {
         let node_id = endpoint.node_id;
+        // Hold `membership_lock` across the mutation + rebuild so a concurrent
+        // add/remove can't store a stale snapshot over ours (see field doc).
+        let _guard = self.membership_lock.lock();
         self.endpoints
             .insert(node_id, Arc::new(EndpointState::new(endpoint)));
 
         // Add to hash ring for consistent hashing
         self.add_to_hash_ring(node_id);
+        self.rebuild_endpoint_list();
     }
 
     /// Remove an endpoint
     pub fn remove_endpoint(&self, node_id: &NodeId) {
+        let _guard = self.membership_lock.lock();
         self.remove_from_hash_ring(node_id);
-        self.endpoints.remove(node_id);
+        if let Some((_, state)) = self.endpoints.remove(node_id) {
+            // Flag the shared EndpointState so an in-flight selector reading a
+            // pre-rebuild snapshot treats it as unavailable (see field doc).
+            state.removed.store(true, Ordering::Release);
+        }
+        self.rebuild_endpoint_list();
+    }
+
+    /// Rebuild the flat endpoint snapshot iterated by `select`/`stats`.
+    /// Called only when the endpoint SET changes (add/remove) — per-endpoint
+    /// state updates mutate shared atomics visible through the existing Arcs,
+    /// so they need no rebuild. This is the only place that pays the
+    /// `DashMap::iter()` shard walk; the hot path reads the snapshot.
+    fn rebuild_endpoint_list(&self) {
+        let list: Vec<Arc<EndpointState>> = self
+            .endpoints
+            .iter()
+            .map(|e| Arc::clone(e.value()))
+            .collect();
+        self.endpoint_list.store(Arc::new(list));
     }
 
     /// Update endpoint health
@@ -907,9 +973,9 @@ impl LoadBalancer {
         let mut available = Vec::new();
         let mut zone_matches = Vec::new();
 
-        for entry in self.endpoints.iter() {
-            let state = entry.value();
-
+        // Iterate the flat snapshot rather than DashMap::iter (shard walk).
+        let snapshot = self.endpoint_list.load();
+        for state in snapshot.iter() {
             // Check basic availability
             if !state.is_available() {
                 continue;
@@ -1329,8 +1395,8 @@ impl LoadBalancer {
         let mut total_connections = 0u64;
         let mut total_load = 0.0;
 
-        for entry in self.endpoints.iter() {
-            let state = entry.value();
+        let snapshot = self.endpoint_list.load();
+        for state in snapshot.iter() {
             if state.health() == HealthStatus::Healthy {
                 healthy += 1;
             }
@@ -1338,7 +1404,7 @@ impl LoadBalancer {
             total_load += state.load_score();
         }
 
-        let endpoint_count = self.endpoints.len() as u32;
+        let endpoint_count = snapshot.len() as u32;
 
         LoadBalancerStats {
             total_selections: self.total_selections.load(Ordering::Relaxed),
@@ -1356,27 +1422,25 @@ impl LoadBalancer {
 
     /// Get all endpoints as snapshots
     pub fn endpoints(&self) -> Vec<Endpoint> {
-        self.endpoints
+        self.endpoint_list
+            .load()
             .iter()
-            .map(|e| {
-                let state = e.value();
-                Endpoint {
-                    node_id: state.node_id,
-                    weight: state.weight,
-                    health: state.health(),
-                    metrics: state.metrics(),
-                    tags: state.tags.clone(),
-                    priority: state.priority,
-                    enabled: state.is_enabled(),
-                    zone: state.zone.clone(),
-                }
+            .map(|state| Endpoint {
+                node_id: state.node_id,
+                weight: state.weight,
+                health: state.health(),
+                metrics: state.metrics(),
+                tags: state.tags.clone(),
+                priority: state.priority,
+                enabled: state.is_enabled(),
+                zone: state.zone.clone(),
             })
             .collect()
     }
 
     /// Get endpoint count
     pub fn endpoint_count(&self) -> usize {
-        self.endpoints.len()
+        self.endpoint_list.load().len()
     }
 }
 
@@ -2629,6 +2693,131 @@ mod tests {
             snapshot.iter().map(|e| (e.node_id[0], e.weight)).collect();
         assert_eq!(weights.get(&1), Some(&50));
         assert_eq!(weights.get(&2), Some(&75));
+    }
+
+    /// The endpoint snapshot (iterated by select/stats/count) must be rebuilt
+    /// on remove: counts drop and the removed endpoint is never selected.
+    #[test]
+    fn removing_an_endpoint_updates_snapshot_and_stops_selection() {
+        let lb = LoadBalancer::with_strategy(Strategy::RoundRobin);
+        for i in 1..=3u8 {
+            lb.add_endpoint(Endpoint::new(make_node_id(i)));
+        }
+        assert_eq!(lb.endpoint_count(), 3);
+        assert_eq!(lb.stats().active_endpoints, 3);
+
+        lb.remove_endpoint(&make_node_id(2));
+        assert_eq!(lb.endpoint_count(), 2, "count must drop after remove");
+        assert_eq!(lb.stats().active_endpoints, 2);
+        assert!(
+            lb.endpoints().iter().all(|e| e.node_id != make_node_id(2)),
+            "removed endpoint must be gone from the snapshot"
+        );
+
+        // The removed endpoint must never be selected.
+        let ctx = RequestContext::new();
+        for _ in 0..50 {
+            let sel = lb.select(&ctx).unwrap();
+            assert_ne!(
+                sel.node_id,
+                make_node_id(2),
+                "removed endpoint must not be selected"
+            );
+            lb.record_completion(&sel.node_id, true);
+        }
+    }
+
+    /// Concurrent membership changes must leave `endpoint_list` (read by
+    /// select/stats/count) exactly consistent with the authoritative
+    /// `endpoints` map. Pre-fix, a rebuild that observed the map before a
+    /// concurrent mutation could store its stale snapshot last, dropping a
+    /// just-added endpoint from rotation (or resurrecting a removed one).
+    #[test]
+    fn concurrent_membership_changes_keep_snapshot_consistent() {
+        use std::collections::HashSet;
+        use std::sync::Arc as StdArc;
+
+        let lb = StdArc::new(LoadBalancer::with_strategy(Strategy::RoundRobin));
+        let n: u8 = 64;
+
+        // Concurrent adds.
+        let mut handles = Vec::new();
+        for i in 1..=n {
+            let lb = StdArc::clone(&lb);
+            handles.push(std::thread::spawn(move || {
+                lb.add_endpoint(Endpoint::new(make_node_id(i)));
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // The snapshot must match the authoritative map exactly — not a
+        // single add may be lost to a stale rebuild.
+        assert_eq!(lb.endpoint_count(), n as usize);
+        assert_eq!(lb.endpoint_count(), lb.endpoints.len());
+        let snap: HashSet<_> = lb.endpoints().iter().map(|e| e.node_id).collect();
+        assert_eq!(
+            snap.len(),
+            n as usize,
+            "every added endpoint must appear in the snapshot"
+        );
+
+        // Concurrent removes (the even ids) must stay consistent too.
+        let mut handles = Vec::new();
+        for i in (2..=n).step_by(2) {
+            let lb = StdArc::clone(&lb);
+            handles.push(std::thread::spawn(move || {
+                lb.remove_endpoint(&make_node_id(i));
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(lb.endpoint_count(), lb.endpoints.len());
+        assert_eq!(lb.endpoint_count(), (n / 2) as usize);
+        assert!(
+            lb.endpoints().iter().all(|e| {
+                let raw = e.node_id;
+                // Odd ids only should remain.
+                lb.endpoints.contains_key(&raw)
+            }),
+            "snapshot must contain only live endpoints"
+        );
+    }
+
+    /// A snapshot taken before a removal still holds the endpoint's `Arc`
+    /// (exactly what an in-flight `select()` iterates). After removal that
+    /// endpoint must report unavailable through the *stale* snapshot — so the
+    /// strategy filters it out instead of selecting a gone endpoint and
+    /// burning a reservation retry into a false `NoEndpointsAvailable`.
+    #[test]
+    fn removed_endpoint_is_unavailable_through_a_stale_snapshot() {
+        let lb = LoadBalancer::with_strategy(Strategy::RoundRobin);
+        lb.add_endpoint(Endpoint::new(make_node_id(1)));
+        lb.add_endpoint(Endpoint::new(make_node_id(2)));
+
+        // Capture the snapshot BEFORE removal — holds Arcs to both endpoints.
+        let stale = lb.endpoint_list.load_full();
+        assert_eq!(stale.len(), 2);
+
+        lb.remove_endpoint(&make_node_id(1));
+
+        // Through the stale snapshot, the removed endpoint is now unavailable;
+        // the survivor stays available.
+        for state in stale.iter() {
+            if state.node_id == make_node_id(1) {
+                assert!(
+                    !state.is_available(),
+                    "removed endpoint must be unavailable via the stale snapshot"
+                );
+            } else {
+                assert!(
+                    state.is_available(),
+                    "surviving endpoint must remain available"
+                );
+            }
+        }
     }
 
     // ---------- LoadBalancerError Display ----------

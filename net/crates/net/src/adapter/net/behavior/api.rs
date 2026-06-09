@@ -9,7 +9,7 @@
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1120,6 +1120,30 @@ impl ApiEndpoint {
 
         Some(params)
     }
+
+    /// Like [`Self::matches_path`] but only reports whether the path matches,
+    /// without allocating the captured-parameter map (or the intermediate
+    /// segment `Vec`s). Use this on lookup paths that discard the params
+    /// (e.g. `ApiRegistry::find_by_endpoint`); `matches_path` re-derives the
+    /// params when a caller actually needs them.
+    pub fn path_matches(&self, path: &str) -> bool {
+        let mut self_parts = self.path.split('/');
+        let mut path_parts = path.split('/');
+        loop {
+            match (self_parts.next(), path_parts.next()) {
+                (Some(sp), Some(pp)) => {
+                    let is_param = sp.starts_with('{') && sp.ends_with('}');
+                    if !is_param && sp != pp {
+                        return false;
+                    }
+                }
+                // Both exhausted with every segment matched.
+                (None, None) => return true,
+                // Differing segment counts.
+                _ => return false,
+            }
+        }
+    }
 }
 
 /// API validation errors
@@ -1338,7 +1362,7 @@ impl ApiSchema {
 
         self.endpoints
             .iter()
-            .find(|e| e.method == method && e.matches_path(&full_path).is_some())
+            .find(|e| e.method == method && e.path_matches(&full_path))
     }
 
     /// Get all endpoints with a specific tag
@@ -1502,7 +1526,7 @@ impl ApiQuery {
         if let Some(ref path) = self.endpoint_path {
             let method = self.endpoint_method;
             let found = schema.endpoints.iter().any(|e| {
-                let path_matches = e.matches_path(path).is_some() || e.path.contains(path);
+                let path_matches = e.path_matches(path) || e.path.contains(path);
                 let method_matches = method.is_none_or(|m| e.method == m);
                 path_matches && method_matches
             });
@@ -1580,11 +1604,17 @@ pub struct IndexedApiNode {
 pub struct ApiRegistryStats {
     /// Total nodes registered
     pub total_nodes: usize,
-    /// Total API schemas
+    /// Number of distinct (provider node, API name) pairs — i.e.
+    /// `apis_by_name.values().sum()`. NOT a count of schema *objects*: a node
+    /// that lists the same API name in two schemas counts once (the registry
+    /// indexes API name → provider set, so a name has at most one entry per
+    /// node). For distinct names per node these coincide.
     pub total_schemas: usize,
-    /// Total endpoints
+    /// Total endpoint *instances* across all registered schemas (a node's two
+    /// same-named schemas contribute both their endpoint counts).
     pub total_endpoints: usize,
-    /// APIs by name
+    /// For each API name, the number of distinct provider nodes advertising it
+    /// (deduplicated per node).
     pub apis_by_name: HashMap<String, usize>,
     /// Query count
     pub queries: u64,
@@ -1606,6 +1636,12 @@ pub struct ApiRegistry {
     query_count: AtomicU64,
     /// Update counter
     update_count: AtomicU64,
+    /// O(1) live node count and total endpoint count. `DashMap::len()` walks
+    /// every shard (~1us) and `stats()` previously full-scanned every node and
+    /// schema; these atomics make `len()`/`stats()`/the capacity gate O(1).
+    /// Maintained on register / unregister / clear and in the index helpers.
+    node_count: AtomicUsize,
+    total_endpoints: AtomicUsize,
     /// Maximum capacity
     max_capacity: Option<usize>,
 }
@@ -1633,6 +1669,8 @@ impl ApiRegistry {
             by_endpoint: DashMap::new(),
             query_count: AtomicU64::new(0),
             update_count: AtomicU64::new(0),
+            node_count: AtomicUsize::new(0),
+            total_endpoints: AtomicUsize::new(0),
             max_capacity: None,
         }
     }
@@ -1648,25 +1686,36 @@ impl ApiRegistry {
     pub fn register(&self, announcement: ApiAnnouncement) -> Result<(), RegistryError> {
         let node_id = announcement.node_id;
 
-        // Check capacity
+        // Check capacity (O(1) counter, not a per-shard DashMap::len walk).
         if let Some(max) = self.max_capacity {
-            if !self.nodes.contains_key(&node_id) && self.nodes.len() >= max {
+            if !self.nodes.contains_key(&node_id) && self.node_count.load(Ordering::Relaxed) >= max
+            {
                 return Err(RegistryError::CapacityExceeded);
             }
         }
 
-        // Remove old indexes if updating
-        if let Some(old) = self.nodes.get(&node_id) {
-            self.remove_from_indexes(&old);
-        }
-
         let ann = Arc::new(announcement);
 
-        // Add to indexes
-        self.add_to_indexes(&ann);
-
-        // Store
-        self.nodes.insert(node_id, ann);
+        // Read-old / re-index / store, all inside the `nodes` entry lock so a
+        // concurrent re-registration of the same node_id can't interleave and
+        // drift `total_endpoints` (which would underflow on the `fetch_sub`) or
+        // `by_api_name` (now surfaced by `stats()`). The index maps touched by
+        // add/remove_from_indexes are distinct from `nodes`, so holding the
+        // entry lock across them can't deadlock. Mirrors `MetadataStore::upsert`.
+        use dashmap::mapref::entry::Entry;
+        match self.nodes.entry(node_id) {
+            Entry::Occupied(mut slot) => {
+                let old = slot.get().clone();
+                self.remove_from_indexes(&old);
+                self.add_to_indexes(&ann);
+                slot.insert(ann);
+            }
+            Entry::Vacant(slot) => {
+                self.add_to_indexes(&ann);
+                slot.insert(ann);
+                self.node_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         self.update_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
@@ -1676,6 +1725,7 @@ impl ApiRegistry {
     pub fn unregister(&self, node_id: &NodeId) -> Option<Arc<ApiAnnouncement>> {
         if let Some((_, ann)) = self.nodes.remove(node_id) {
             self.remove_from_indexes(&ann);
+            self.node_count.fetch_sub(1, Ordering::Relaxed);
             Some(ann)
         } else {
             None
@@ -1738,12 +1788,16 @@ impl ApiRegistry {
                     return None;
                 }
 
-                // Check if any schema has this endpoint
+                // Check if any schema has this endpoint. Uses the allocation-
+                // free `path_matches` (this lookup discards the captured
+                // params) instead of `matches_path`, which allocated two Vecs
+                // + a HashMap + a String per endpoint per node — the dominant
+                // cost of this scan.
                 let has_endpoint = ann.schemas.iter().any(|schema| {
                     schema
                         .endpoints
                         .iter()
-                        .any(|e| e.method == method && e.matches_path(path).is_some())
+                        .any(|e| e.method == method && e.path_matches(path))
                 });
 
                 if has_endpoint {
@@ -1793,21 +1847,25 @@ impl ApiRegistry {
     }
 
     /// Get statistics
+    ///
+    /// `apis_by_name` is read from the `by_api_name` inverted index (providers
+    /// per API name) rather than re-scanning every node's schemas; empty index
+    /// buckets left by `remove_from_indexes` are skipped. `total_nodes` and
+    /// `total_endpoints` read O(1) counters. This avoids the O(nodes × schemas)
+    /// full scan (+ per-schema String clone) the old implementation paid on
+    /// every call.
     pub fn stats(&self) -> ApiRegistryStats {
-        let mut apis_by_name: HashMap<String, usize> = HashMap::new();
-        let mut total_endpoints = 0;
-
-        for entry in self.nodes.iter() {
-            for schema in &entry.value().schemas {
-                *apis_by_name.entry(schema.name.clone()).or_default() += 1;
-                total_endpoints += schema.endpoints.len();
-            }
-        }
+        let apis_by_name: HashMap<String, usize> = self
+            .by_api_name
+            .iter()
+            .filter(|e| !e.value().is_empty())
+            .map(|e| (e.key().clone(), e.value().len()))
+            .collect();
 
         ApiRegistryStats {
-            total_nodes: self.nodes.len(),
+            total_nodes: self.node_count.load(Ordering::Relaxed),
             total_schemas: apis_by_name.values().sum(),
-            total_endpoints,
+            total_endpoints: self.total_endpoints.load(Ordering::Relaxed),
             apis_by_name,
             queries: self.query_count.load(Ordering::Relaxed),
             updates: self.update_count.load(Ordering::Relaxed),
@@ -1816,17 +1874,33 @@ impl ApiRegistry {
 
     /// Number of registered nodes
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.node_count.load(Ordering::Relaxed)
     }
 
     /// Check if empty
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.node_count.load(Ordering::Relaxed) == 0
     }
 
     /// Clear all registrations
     pub fn clear(&self) {
-        self.nodes.clear();
+        // Drain per-key (not `nodes.clear()` + `store(0)`) so the O(1) counters
+        // decrement in lock-step with the map. A bulk clear that `store(0)`s
+        // the counters races a concurrent `register`/`unregister` whose
+        // `fetch_add`/`fetch_sub` can land just after the store — wrapping
+        // `node_count`/`total_endpoints` to `usize::MAX` and wedging the
+        // capacity gate and `len()`. `nodes.remove` and the index ops are the
+        // same chokepoints the live paths use, so the count stays exact w.r.t.
+        // the map. Mirrors `MetadataStore::clear`.
+        let keys: Vec<NodeId> = self.nodes.iter().map(|r| *r.key()).collect();
+        for key in keys {
+            if let Some((_, ann)) = self.nodes.remove(&key) {
+                self.remove_from_indexes(&ann); // also decrements total_endpoints
+                self.node_count.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        // Defense-in-depth: clear any index residue from a concurrent register
+        // that landed after key collection (a happy-path no-op).
         self.by_api_name.clear();
         self.by_tag.clear();
         self.by_endpoint.clear();
@@ -1851,6 +1925,7 @@ impl ApiRegistry {
     // Private helper to add indexes
     fn add_to_indexes(&self, ann: &ApiAnnouncement) {
         let node_id = ann.node_id;
+        let mut added_endpoints = 0usize;
 
         for schema in &ann.schemas {
             // API name index
@@ -1869,12 +1944,16 @@ impl ApiRegistry {
                 let prefix = endpoint_prefix(&endpoint.path);
                 self.by_endpoint.entry(prefix).or_default().insert(node_id);
             }
+            added_endpoints += schema.endpoints.len();
         }
+        self.total_endpoints
+            .fetch_add(added_endpoints, Ordering::Relaxed);
     }
 
     // Private helper to remove indexes
     fn remove_from_indexes(&self, ann: &ApiAnnouncement) {
         let node_id = ann.node_id;
+        let mut removed_endpoints = 0usize;
 
         for schema in &ann.schemas {
             if let Some(mut set) = self.by_api_name.get_mut(&schema.name) {
@@ -1893,7 +1972,10 @@ impl ApiRegistry {
                     set.remove(&node_id);
                 }
             }
+            removed_endpoints += schema.endpoints.len();
         }
+        self.total_endpoints
+            .fetch_sub(removed_endpoints, Ordering::Relaxed);
     }
 }
 
@@ -2294,6 +2376,235 @@ mod tests {
         assert_eq!(stats.total_endpoints, 10);
         assert_eq!(stats.queries, 2);
         assert_eq!(stats.updates, 5);
+    }
+
+    /// The O(1) node/endpoint counters backing len()/stats() (and the
+    /// index-derived apis_by_name) must stay exact across register, in-place
+    /// update (same node_id, different schema), unregister, and clear.
+    #[test]
+    fn stats_and_len_track_register_update_unregister_clear() {
+        let registry = ApiRegistry::new();
+        for i in 0..4u8 {
+            let schema = ApiSchema::new("api", ApiVersion::new(1, 0, 0))
+                .add_endpoint(ApiEndpoint::new("/a", ApiMethod::Get))
+                .add_endpoint(ApiEndpoint::new("/b", ApiMethod::Post));
+            registry
+                .register(ApiAnnouncement::new(make_node_id(i), vec![schema]))
+                .unwrap();
+        }
+        assert_eq!(registry.len(), 4);
+        let s = registry.stats();
+        assert_eq!(s.total_nodes, 4);
+        assert_eq!(s.apis_by_name.get("api"), Some(&4));
+        assert_eq!(s.total_schemas, 4);
+        assert_eq!(s.total_endpoints, 8);
+
+        // Update node 0 in place: "api" (2 endpoints) -> "api2" (1 endpoint).
+        let schema = ApiSchema::new("api2", ApiVersion::new(1, 0, 0))
+            .add_endpoint(ApiEndpoint::new("/c", ApiMethod::Get));
+        registry
+            .register(ApiAnnouncement::new(make_node_id(0), vec![schema]))
+            .unwrap();
+        assert_eq!(registry.len(), 4, "update must not grow node count");
+        let s = registry.stats();
+        assert_eq!(s.total_nodes, 4);
+        assert_eq!(s.apis_by_name.get("api"), Some(&3));
+        assert_eq!(s.apis_by_name.get("api2"), Some(&1));
+        assert_eq!(s.total_endpoints, 7); // 3*2 + 1*1
+
+        // Unregister.
+        assert!(registry.unregister(&make_node_id(1)).is_some());
+        assert_eq!(registry.len(), 3);
+        assert_eq!(registry.stats().total_nodes, 3);
+        assert!(registry.unregister(&make_node_id(99)).is_none());
+        assert_eq!(registry.len(), 3);
+
+        // Clear resets every counter and the index-derived histogram.
+        registry.clear();
+        assert_eq!(registry.len(), 0);
+        assert!(registry.is_empty());
+        let s = registry.stats();
+        assert_eq!(s.total_nodes, 0);
+        assert_eq!(s.total_endpoints, 0);
+        assert!(s.apis_by_name.is_empty());
+    }
+
+    /// stats() is derived from the `by_api_name` *provider set*, so a single
+    /// node listing the same API name in two schemas counts as ONE provider
+    /// for that name (and one toward `total_schemas`) — while every endpoint
+    /// instance still counts toward `total_endpoints`. Pins the deduped-per-node
+    /// semantics documented on `ApiRegistryStats`; they differ from a naive
+    /// schema-object count only in this degenerate duplicate-name case.
+    #[test]
+    fn stats_dedupes_duplicate_api_names_within_a_node() {
+        let registry = ApiRegistry::new();
+        let dup_a = ApiSchema::new("dup", ApiVersion::new(1, 0, 0))
+            .add_endpoint(ApiEndpoint::new("/a", ApiMethod::Get));
+        let dup_b = ApiSchema::new("dup", ApiVersion::new(2, 0, 0))
+            .add_endpoint(ApiEndpoint::new("/b", ApiMethod::Get))
+            .add_endpoint(ApiEndpoint::new("/c", ApiMethod::Post));
+        registry
+            .register(ApiAnnouncement::new(make_node_id(0), vec![dup_a, dup_b]))
+            .unwrap();
+
+        let s = registry.stats();
+        assert_eq!(s.total_nodes, 1);
+        assert_eq!(
+            s.apis_by_name.get("dup"),
+            Some(&1),
+            "one node = one provider of 'dup', even with two same-named schemas"
+        );
+        assert_eq!(
+            s.total_schemas, 1,
+            "total_schemas counts (node, name) pairs"
+        );
+        assert_eq!(
+            s.total_endpoints, 3,
+            "every endpoint instance still counts (1 + 2)"
+        );
+
+        // A second node advertising 'dup' bumps the provider count to 2.
+        let other = ApiSchema::new("dup", ApiVersion::new(1, 0, 0))
+            .add_endpoint(ApiEndpoint::new("/a", ApiMethod::Get));
+        registry
+            .register(ApiAnnouncement::new(make_node_id(1), vec![other]))
+            .unwrap();
+        let s = registry.stats();
+        assert_eq!(s.apis_by_name.get("dup"), Some(&2));
+        assert_eq!(s.total_schemas, 2);
+        assert_eq!(s.total_endpoints, 4);
+    }
+
+    /// Concurrent re-registration of the SAME node_id must keep the O(1)
+    /// counters exact: each `register` is an atomic remove-old + add-new under
+    /// the `nodes` entry lock, so `total_endpoints` can't drift (or underflow
+    /// on the `fetch_sub`) and `node_count` stays 1. Pre-fix the
+    /// read-old/add-indexes/insert steps were separately locked and could
+    /// interleave under contention.
+    #[test]
+    fn concurrent_same_node_register_keeps_counters_exact() {
+        use std::sync::Arc as StdArc;
+
+        let registry = StdArc::new(ApiRegistry::new());
+        let threads = 16;
+        let iters = 200;
+
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let registry = StdArc::clone(&registry);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..iters {
+                    let schema = ApiSchema::new("api", ApiVersion::new(1, 0, 0))
+                        .add_endpoint(ApiEndpoint::new("/a", ApiMethod::Get))
+                        .add_endpoint(ApiEndpoint::new("/b", ApiMethod::Post));
+                    registry
+                        .register(ApiAnnouncement::new(make_node_id(0), vec![schema]))
+                        .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Exactly one node with two endpoints, regardless of interleaving.
+        assert_eq!(registry.len(), 1);
+        let s = registry.stats();
+        assert_eq!(s.total_nodes, 1);
+        assert_eq!(
+            s.total_endpoints, 2,
+            "total_endpoints must not drift or underflow under concurrent re-register"
+        );
+        assert_eq!(s.apis_by_name.get("api"), Some(&1));
+    }
+
+    /// `clear()` must not race the per-op counter updates into underflow.
+    /// Concurrent register/unregister + clear must leave `node_count`/
+    /// `total_endpoints` exactly tracking the map — never wrapped to a huge
+    /// value. Pre-fix, `clear()` `store(0)`'d the counters while a concurrent
+    /// `unregister`'s `fetch_sub(1)` could land just after, wrapping to
+    /// `usize::MAX`.
+    #[test]
+    fn concurrent_clear_does_not_underflow_counters() {
+        use std::sync::Arc as StdArc;
+
+        let registry = StdArc::new(ApiRegistry::new());
+        let mut handles = Vec::new();
+
+        // Writers: repeatedly register then unregister their own node.
+        for t in 0..8u8 {
+            let registry = StdArc::clone(&registry);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..500 {
+                    let schema = ApiSchema::new("api", ApiVersion::new(1, 0, 0))
+                        .add_endpoint(ApiEndpoint::new("/a", ApiMethod::Get));
+                    registry
+                        .register(ApiAnnouncement::new(make_node_id(t), vec![schema]))
+                        .unwrap();
+                    registry.unregister(&make_node_id(t));
+                }
+            }));
+        }
+        // Clearer: hammer clear() against the writers.
+        {
+            let registry = StdArc::clone(&registry);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..500 {
+                    registry.clear();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // After quiescence the counters must equal the authoritative map
+        // exactly — a wrapped/underflowed counter would diverge wildly.
+        assert_eq!(
+            registry.len(),
+            registry.nodes.len(),
+            "node_count must track the map, not underflow"
+        );
+        let live_endpoints: usize = registry
+            .nodes
+            .iter()
+            .map(|e| {
+                e.value()
+                    .schemas
+                    .iter()
+                    .map(|s| s.endpoints.len())
+                    .sum::<usize>()
+            })
+            .sum();
+        assert_eq!(
+            registry.stats().total_endpoints,
+            live_endpoints,
+            "total_endpoints must track the map, not underflow"
+        );
+    }
+
+    /// `path_matches` (no-alloc) must agree with `matches_path(..).is_some()`
+    /// — find_by_endpoint and friends were switched to it.
+    #[test]
+    fn path_matches_agrees_with_matches_path() {
+        let e = ApiEndpoint::new("/models/{model_id}/infer", ApiMethod::Post);
+        for p in [
+            "/models/llama-7b/infer", // match (param)
+            "/models/llama-7b/train", // wrong tail
+            "/models/infer",          // too few segments
+            "/models/a/infer/x",      // too many segments
+        ] {
+            assert_eq!(
+                e.path_matches(p),
+                e.matches_path(p).is_some(),
+                "disagreement on {p}"
+            );
+        }
+        assert!(e.path_matches("/models/llama-7b/infer"));
+
+        let lit = ApiEndpoint::new("/health", ApiMethod::Get);
+        assert!(lit.path_matches("/health"));
+        assert!(!lit.path_matches("/healthz"));
     }
 
     /// `endpoint_prefix` replaces the previous

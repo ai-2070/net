@@ -313,6 +313,51 @@ it carries `content` + tags `Vec<String>` + `source`.)
 
 ---
 
+## 8. Follow-up wins (post-audit) — ✅ DONE
+
+A second pass over the *full* `BENCHMARK_RESULTS_14900K.md` (the loadbalance /
+rule-engine / tracing / API-registry tail not examined in the first audit)
+surfaced two more instances of the same patterns. Both landed on `performance-6`.
+
+### 8a. `ApiRegistry` — `DashMap::len()` + full-scan `stats()` + allocating `find_by_endpoint`
+
+Same shape as §2/§4 plus an allocation bug. File:
+`src/adapter/net/behavior/api.rs`.
+
+- `len()`/`is_empty()`/`stats().total_nodes` and the register capacity gate
+  called `DashMap::len()`. Added a `node_count` `AtomicUsize` maintained on
+  register (insert-returns-`None`) / unregister / clear.
+- `stats()` full-scanned every node and schema (cloning a `String` per schema) —
+  ~200 ms against the inflated fixture. Now reads `apis_by_name` from the
+  `by_api_name` inverted index (skipping empty buckets) and `total_endpoints`
+  from an `AtomicUsize` maintained in the index helpers — O(distinct names), no
+  scan.
+- `find_by_endpoint` called `matches_path(..).is_some()`, which allocated two
+  `Vec`s + a `HashMap` + a `String` per endpoint per node just to get a bool.
+  Added an allocation-free `ApiEndpoint::path_matches() -> bool` and used it here
+  and at the two other `.is_some()`-discarding call sites. The full scan is kept
+  (sound for endpoints whose first path segment is a parameter, which the
+  `by_endpoint` prefix index would miss), so semantics are identical — guarded by
+  a `path_matches`-vs-`matches_path` equivalence test.
+
+### 8b. `LoadBalancer::select` iterated a `DashMap` (shard walk) per selection
+
+`select()` → `get_available_endpoints()` iterated `endpoints` via `DashMap::iter`,
+which visits every shard (`4 × num_cpus` ≈ 128) regardless of endpoint count — a
+large fixed floor on every selection (the ~5 µs base in `lb_scaling` that barely
+grew with endpoint count). File: `src/adapter/net/behavior/loadbalance.rs`.
+
+Kept the `DashMap` as the authoritative point-lookup store (the reservation step,
+health/metric updates) and added an `ArcSwap<Vec<Arc<EndpointState>>>` snapshot
+rebuilt only when the endpoint SET changes (add/remove); `select`/`stats`/
+`endpoints`/`endpoint_count` iterate the flat snapshot — no shard walk on the hot
+path. The `Arc`s are shared, so live per-endpoint atomic state still reads
+correctly, and the reservation step still consults the `DashMap`, so a stale
+snapshot offering a just-removed endpoint is harmless (`get()` returns `None` and
+selection retries). `arc-swap` was already a dependency.
+
+---
+
 ## Recommended order of attack
 
 1. **Crypto SIMD opt-in** (§1) — ~5–10× on the entire data path, but enabled per
@@ -379,15 +424,21 @@ each with tests; full lib suite (4192 tests) green and all benches compile.
   `event/internal_event_new` bench keeps its name (an explanatory comment
   already documents that it measures `from_value`); renaming would only break
   Criterion baseline continuity.
+- **§8 Follow-up wins** — DONE on `performance-6` (after the §1–§7 work merged via
+  PR #339). `ApiRegistry` O(1) count + index-derived `stats()` + allocation-free
+  `find_by_endpoint`; `LoadBalancer::select` iterates an `ArcSwap` snapshot
+  instead of `DashMap::iter`. Both with tests; full lib suite green. Measured
+  results below.
 
 ---
 
 ## Measured results (verification, 2026-06-08)
 
-Reran the affected benchmarks on branch `perf/benchmark-wins-2026-06-08` and
-compared against the `BENCHMARK_RESULTS_14900K.md` baseline above (same i9-14900K,
-Criterion defaults — 3 s warm-up, 5 s measurement; median of the reported
-interval). Every claimed win materialized at or beyond its predicted magnitude.
+Reran the affected benchmarks (§2–§7 on `perf/benchmark-wins-2026-06-08`; the §8
+follow-up rows on `performance-6`) and compared against the
+`BENCHMARK_RESULTS_14900K.md` baseline above (same i9-14900K, Criterion defaults —
+3 s warm-up, 5 s measurement; median of the reported interval). Every claimed win
+materialized at or beyond its predicted magnitude.
 
 | Benchmark | Baseline | This branch | Change |
 | --- | --- | --- | --- |
@@ -413,6 +464,18 @@ interval). Every claimed win materialized at or beyond its predicted magnitude.
 | `metadata_store_basic/upsert_existing` | 998.60 ns | 985.50 ns | flat |
 | `failure_detector/heartbeat_new` | 200.57 ns | 240.95 ns | ~20% higher (noise) |
 | `metadata_store_basic/upsert_new` | 1.730 µs | 1.943 µs | ~12% higher (noise) |
+| **§8a — `ApiRegistry` O(1) count + indexed stats + no-alloc endpoint match** | | | |
+| `api_registry_basic/len` | 1.4158 µs | 0.203 ns | **~6970× faster** |
+| `api_registry_basic/stats` | 201.24 ms | 6.683 µs | **~30000× faster** |
+| `api_registry_query/find_by_endpoint` | 6.9817 ms | 1.882 ms | **~3.7× faster** |
+| **§8b — `LoadBalancer::select` snapshot (no shard walk)** | | | |
+| `lb_scaling/select/10` | 5.5862 µs | 616.0 ns | **~9.1× faster** |
+| `lb_scaling/select/50` | 6.6546 µs | 1.756 µs | **~3.8× faster** |
+| `lb_scaling/select/100` | 8.0355 µs | 3.169 µs | **~2.5× faster** |
+| `lb_scaling/select/500` | 11.875 µs | 7.559 µs | **~1.6× faster** |
+| `lb_strategies/round_robin` | 8.2373 µs | 340.98 ns | **~24× faster** |
+| `lb_strategies/power_of_two` | 10.635 µs | 702.86 ns | **~15× faster** |
+| `lb_strategies/consistent_hash` | 50.628 µs | 39.8 µs | **~1.27× faster** — via `hash_ring` shard right-sizing, NOT the snapshot (see note) |
 
 Notes:
 
@@ -428,3 +491,104 @@ Notes:
   atomic-counter optimization is a viable follow-up there.
 - `ProximityGraph` (§2b) is not in the benchmark suite, so its O(1)-counter change
   is covered by unit tests only, not measured here.
+- §8a `find_by_endpoint` (6.98 ms → 1.88 ms) keeps the full scan — the 3.7× comes
+  from dropping the per-endpoint `Vec`/`HashMap`/`String` allocation, not from
+  candidate reduction. The `by_endpoint` prefix index can't safely narrow
+  candidates: an endpoint whose first path segment is a parameter (`/{tenant}/…`)
+  is indexed under a different prefix than a concrete query path, so an index
+  lookup would miss it. Allocation removal was the safe, large lever.
+- §8b `lb_strategies/consistent_hash` was **not improved by the snapshot** (its
+  cost is the separate `hash_ring` `DashMap` walk, `virtual_nodes × endpoints`,
+  which `select`'s snapshot doesn't touch) — but it was subsequently fixed by
+  **right-sizing the `hash_ring` shard count** (`HASH_RING_SHARDS = 8` vs the
+  `DashMap::new()` default of `4 × num_cpus` = 128): ~20% faster (49.1 → 39.8 µs,
+  reproduced across two runs), no new invariants. See "Snapshot vs. right-sized
+  DashMap" below. The other strategies (RR, LC, P2, random, least-load — all
+  10-endpoint `select`s) dropped ~12–24×, and the `lb_scaling` rows show the
+  fixed shard-walk floor is gone (the residual at /500 is real per-endpoint
+  filter + strategy work).
+
+### Snapshot vs. right-sized DashMap (2026-06-09)
+
+A natural question on §8b: was the `ArcSwap<Vec>` snapshot (with its dual
+source-of-truth, membership `Mutex`, and `removed` flag) actually necessary, or
+would simply *right-sizing* the over-sharded `endpoints` `DashMap` have captured
+the win more cheaply? Prototyped and benchmarked head-to-head (Criterion
+`--baseline`, same session):
+
+| bench | snapshot (kept) | right-sized 8-shard `DashMap` | Δ |
+| --- | --- | --- | --- |
+| `lb_strategies/round_robin` | 369 ns | 730 ns | **+106%** |
+| `lb_strategies/least_connections` | 379 ns | 734 ns | +98% |
+| `lb_scaling/select/10` | 369 ns | 738 ns | +100% |
+| `lb_scaling/select/500` | 4.47 µs | 6.95 µs | +55% |
+
+The snapshot **wins ~2×** on the iterate-heavy `select` path: a wait-free
+`ArcSwap` load over a contiguous `Vec` beats locking even 8 `DashMap` shards and
+chasing scattered HashMap buckets. So the snapshot earns its complexity and
+stays. The *one* salvageable idea from the prototype — right-sizing `hash_ring`,
+which the snapshot doesn't cover — was kept (the ~20% `consistent_hash` win
+above); `endpoints` keeps the default shard count since `select`/`stats` read
+the snapshot, not `endpoints.iter()`.
+
+### Re-verification after review fixes (2026-06-09)
+
+The §8 work drew a code review that hardened both subsystems on `performance-6`:
+`LoadBalancer` gained a membership `Mutex` (serializing add/remove + snapshot
+rebuild) and a `removed` `AtomicBool` on `EndpointState` (checked in
+`is_available()`); `ApiRegistry::register` became atomic under the `nodes` entry
+lock and `clear()` switched to drain-and-decrement. The §8 benchmarks were rerun
+to confirm none of this regressed the wins.
+
+**No regression.** The `select` hot path — which now performs one extra
+`AtomicBool::load(Acquire)` per endpoint in `is_available()` — stays in the same
+regime: `lb_scaling/select/10` and `lb_strategies/round_robin` both measured
+~340–410 ns (vs the 5.59 µs pre-snapshot baseline), i.e. the §8b win is intact.
+The membership `Mutex` is off the hot path (add/remove only; `select`/`stats`
+just read the snapshot). The `ApiRegistry` `len` (203 ps), `stats` (~7–11 µs,
+still a single `by_api_name` shard-walk floor), and `find_by_endpoint` (~1.9–2.2 ms)
+paths are untouched by the fixes and measured within noise.
+
+**Caveat — dev-box variance.** These sub-µs `select` benches show ±~40–50%
+run-to-run swing on this machine (e.g. `round_robin` measured 363 → 553 → 393 ns
+across three back-to-back runs, with `select/10` tracking it at 338–409 ns). The
+table figures above remain the representative numbers; the review fixes add no
+measurable cost on top of them (~1 ns × endpoints for the per-endpoint atomic
+load, and zero on the hot path for the membership `Mutex`).
+
+---
+
+## Follow-ups (remaining opportunities)
+
+Identified during this audit but not yet done. Each is independent and low-risk
+except where noted.
+
+- **`hash_ring` for `consistent_hash`** — *partially done.* Right-sized the ring's
+  shard count (`HASH_RING_SHARDS = 8`) for a ~20% win (49.1 → 39.8 µs) at zero
+  invariant cost — see "Snapshot vs. right-sized DashMap" above. The larger lever
+  remains: `select_consistent_hash` still does an O(ring) walk
+  (`virtual_nodes × endpoints` ≈ 1500 entries), so it's still ~40 µs vs sub-µs for
+  the other strategies. Precomputing a **sorted ring `Vec` for binary search**
+  (rebuilt on add/remove, like §8b's snapshot) would take it to low-µs. File:
+  `loadbalance.rs`.
+- **`FairScheduler::stream_count` → `AtomicUsize`** — trivial. Still a
+  `DashMap::len()` shard walk (`fair_scheduler/stream_count_empty` ≈ 960 ns); the
+  same atomic-counter pattern as §2 applies. File: `src/adapter/net/router.rs`.
+- **§5 capability query single-axis fast path** — moderate, deferred. ~1.5–2× on
+  broad queries that return thousands of rows, by skipping the intermediate
+  `HashSet`/sort when one selective dimension and no further predicates apply.
+  Requires a dedicated correctness harness first (multi-class dedup; the fold scan
+  is by-design — see memory `capability-checks-use-folds`). Risk to the
+  capability-routing path is why it's deferred, not its difficulty.
+- **`ApiRegistry::find_by_endpoint` candidate narrowing** — moderate. §8a removed
+  the per-endpoint allocation but kept the full scan. Narrowing via an index would
+  need to handle endpoints whose first path segment is a parameter (`/{tenant}/…`),
+  which the current `by_endpoint` prefix index mis-keys — e.g. index on
+  `(method, segment_count)` or a param-aware key. Only worth it if endpoint
+  lookups become hot with many diverse registered APIs. File: `api.rs`.
+
+Out of scope / not pursued (see Resolution for why): §6 cortex scratch buffer
+(no real win — `Bytes::from` is already zero-copy), the `FailureDetector`
+per-status tally (observability-only; counters would drift against in-place test
+mutation), and enforcing the §1 AVX2 flag in committed config (a deployment
+decision left to operators).
