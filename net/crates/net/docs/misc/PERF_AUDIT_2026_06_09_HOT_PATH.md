@@ -189,6 +189,105 @@ migration — `mesh.rs:4120,4292,4567`) and don't fire in steady state.
 
 ---
 
+## 8. WIDENED: nRPC dispatch layer — flamegraph items verified, two NEW per-call costs
+
+The dispatch layer (`mesh_rpc.rs` + `cortex/rpc.rs`) was traced end-to-end for one
+unary RPC on both sides. First, current state of the known `NRPC_FLAMEGRAPH.md` items
+— **two of them are in worse shape than their plan status suggests**:
+
+| item | plan status | actual state (2026-06-09) |
+|---|---|---|
+| T1.1 grants on unary | "landed (drainer)" | drainer landed, but grants still fire **unconditionally on every accepted packet** (`mesh.rs:4771` → `session.rs:1077-1106` always grants when `window_bytes != 0`, default 65536) — 2 grant wakeups per unary RT remain; full fix is the ack-piggyback plan (§2) |
+| T1.2 response via `publish_to_peer` | "landed" | **partially landed**: the origin cache + `publish_response_to_caller` exist (`mesh_rpc.rs:1561-1587`), but the emit closure still wraps every response in `tokio::spawn` (`mesh_rpc.rs:1798`) — see new finding 8a |
+| T2.2 `encode_into` | open | confirmed open: no `encode_into` variant exists; `req.encode()` allocates a `Vec` then `extend_from_slice`s into the caller's buf — double copy (`mesh_rpc.rs:3102-3104`) |
+| T3.4 `catch_unwind` | open | confirmed open, always-on, 4 sites (`cortex/rpc.rs:1613,2281,2792,3217`) |
+| T2.1 fold/in-flight Mutex | open | confirmed open; `in_flight` Mutex is locked **twice** on the request path (dup-check `cortex/rpc.rs:1543`, insert `:1563`) + once more in the spawned task (`:1681`) |
+
+**New findings (not in the flamegraph catalog):**
+
+- **8a. One `tokio::spawn` per response** (`mesh_rpc.rs:1798-1833`): the emit closure
+  spawns a task for every response publish. *Est.* 1–2 µs scheduling per RT, and it is
+  one of the 4–6 spawns the flamegraph counted. The T1.2 cache hit makes the publish
+  itself cheap (`publish_to_peer`), so the spawn is now the dominant cost of the
+  response leg — inline the publish into the handler task (it's already spawned) or
+  feed a drainer like T1.1 did.
+- **8b. Reply-channel string per response** (`mesh_rpc.rs:1799-1800`):
+  `format!("{service}.replies.{caller_origin:016x}")` + `ChannelName::new()` — two
+  heap allocs per response that are deterministic from `(service, caller_origin)` and
+  cacheable alongside the T1.2 origin cache. *Est.* 50–100 ns.
+- **8c. Per-call alloc/lock census** (for the record): 9–12 heap allocations and ~6
+  lock/DashMap touches per unary RT across both sides (header Vec, `service.to_string()`
+  `mesh_rpc.rs:3095`, encode bufs ×2, decode service String, reply-channel ×2, pending
+  insert, route cache, cancel registry `:3191`, in-flight ×3, origin cache).
+- **8d. Metrics are always-on**, *est.* ~400–500 ns per RT: client + server guards bump
+  in-flight/outcome atomics and each walk an **11-bucket latency histogram loop**
+  (`mesh_rpc_metrics.rs:136-175,679-720`, `cortex/rpc.rs:1591-1625`). Atomics-only (no
+  allocs) so it hides from heap profiles; visible at µbench scale. A
+  one-branch `metrics_enabled` gate would reclaim it where wanted.
+- **8e. Wakeup count confirmed**: 4–5 wakeup events per unary RT as the code stands
+  (grant drainer notify, handler spawn, response spawn, client oneshot) — matches the
+  51% futex-wait attribution. §1 + §2 + 8a together are what move this.
+
+---
+
+## 9. WIDENED: FFI / bindings layer — clean; the gap is defaults, not code
+
+All published benchmarks measure the Rust core; SDK consumers cross this layer. Verdict:
+**the bindings practice zero-copy discipline and are not the bottleneck** — worth
+recording so nobody re-audits them:
+
+- C FFI: handle validation is pointer-alignment only (no registry lock); per-call cost
+  is an atomic guard pair (~20 ns, `ffi/handle_guard.rs:88-114`); `net_ingest_raw_batch`
+  crosses the boundary once for N events (`ffi/mod.rs:886-983`).
+- Node/NAPI: `push()`/`push_batch()` are zero-copy Buffer paths, ~50–100 ns/event
+  (`bindings/node/src/lib.rs:382-431`); `ingest_raw_sync` pays a JSON parse (~500 ns) —
+  control-plane only.
+- Python: `ingest_raw_batch` ~100–200 ns/event (`bindings/python/src/lib.rs:646-656`);
+  the dict-taking `ingest()` costs 0.5–2 µs (GIL + `json.dumps`, `:633-637`).
+- Go: no Rust-side binding cost, but the cgo crossing itself is ~0.5–3 µs per call —
+  batch API is *essential* for Go consumers, not an optimization.
+
+**Actionable:** this is a docs/defaults gap, not a code gap. The batch APIs exist and
+are correctly annotated as "most efficient"; SDK examples and quickstarts should make
+them the *default* shape (especially Go and Python), and the dict/JSON-string
+convenience paths should carry a "control-plane only" note. The marketplace/L0
+integration goes through these SDKs, so the per-call tier table above is the real
+consumer-facing perf story.
+
+---
+
+## 10. WIDENED: RedEX append + watcher wake path
+
+Phases 1–4 of `REDEX_DISK_THROUGHPUT_PLAN.md` verified present in the code (coalesced
+dat/idx/ts writes `redex/disk.rs:1027-1127`, atomic fsync signaling `:600-632`). Two
+items:
+
+- **Per-event, per-subscriber watcher sends** (`redex/file.rs:1561-1580`): delivery
+  does `try_send(Ok(event.clone()))` per watcher per event — at 100K ev/s × 5 watchers
+  that is 500K channel wakes/s, and it is where the "RedEX wake: 5–10 µs" line in
+  `PERF_AUDIT_2026_05_19_NRPC.md` lives. The v1 watcher model is live-tail by design;
+  batched delivery is a v2 architecture item. Listed as the known ceiling, not a bug.
+- **`bench_append_batch_disk` has still never been run** — phases 1–4 claim
+  multi-× wins with no captured before/after. Cheap to close; do it with the next
+  bench sweep.
+
+CortEX fold dispatch: decode path is zero-copy (`Bytes::slice`, postcard), context
+construction allocation-free (`cortex/rpc.rs:1495,1598-1604`); the only hot-path issue
+is the in-flight Mutex already tracked as T2.1 (§8 table).
+
+---
+
+## 11. WIDENED: consumer drain/delivery — clean
+
+Audited the other side of the bus (drain → subscriber): `pop_batch_into` amortization,
+adaptive batcher velocity sampling (dual-bounded deque, recalc every 10 ms, not
+per-event — `shard/batch.rs:81-122`), merge-side filter eval on pre-compiled paths
+(`consumer/merge.rs:721`) and the O(n log n) cross-shard ordering sort (`:758-763`)
+are all the intended per-event/per-poll costs of the features they implement. No
+findings; do not re-audit.
+
+---
+
 ## Explicit non-goals (don't spend time here)
 
 - **AEAD algorithm swap** (ChaCha20-Poly1305 → AES-GCM): crypto is ~5% of CPU; saves
@@ -198,6 +297,11 @@ migration — `mesh.rs:4120,4292,4567`) and don't fire in steady state.
 - **Ring buffer / shard mapper / timestamp generator**: done (§7).
 - **Moving decrypt off the recv loop**: ~5% win, not worth reordering flow control
   (already rejected in the QPS plan).
+- **Binding internals rewrite**: the FFI layer is clean (§9); the win there is SDK
+  docs/defaults, not code.
+- **Consumer drain / merge**: clean (§11).
+- **RedEX watcher batching in v1**: per-event live-tail delivery is the v1 model's
+  ceiling by design; the fix is the v2 architecture, not a patch (§10).
 
 ---
 
@@ -205,9 +309,15 @@ migration — `mesh.rs:4120,4292,4567`) and don't fire in steady state.
 
 1. **§1 gap-fix #1 (batched channel hop, ~40 LoC), then run the c128 measurement** —
    unblocks the recv-loop batching default and is the gate for the structural ceiling.
-2. **§4 event-id allocation** — small, unconditional, no protocol change; can land
+2. **§8a response-spawn elimination + §8b reply-channel cache** — contained diffs in
+   `mesh_rpc.rs`, no wire change, directly attacks the wakeup count (8e); biggest
+   bang-for-effort after §1.
+3. **§4 event-id allocation** — small, unconditional, no protocol change; can land
    independently any time.
-3. **§2 ack-piggyback** — the big unary lever; schedule as its own wire-change effort
-   with cross-binding compat.
-4. **§3 deployment decision on SIMD artifacts** — a build-pipeline decision, not code.
-5. **§6 micro-items (T3.4, T2.2)** — opportunistic; re-bench T2.1 only after §1 lands.
+4. **§2 ack-piggyback** — the big unary lever (finishes what T1.1 started, see §8
+   table); schedule as its own wire-change effort with cross-binding compat.
+5. **§3 deployment decision on SIMD artifacts** — a build-pipeline decision, not code.
+6. **§6/§8 micro-items (T3.4, T2.2, §8d metrics gate)** — opportunistic; re-bench
+   T2.1 only after §1 lands.
+7. **§9 SDK docs/defaults pass + §10 run `bench_append_batch_disk`** — cheap,
+   non-code, closes the record.
