@@ -505,3 +505,38 @@ Notes:
   P2, random, least-load — all 10-endpoint `select`s) dropped ~12–24×, and the
   `lb_scaling` rows show the fixed shard-walk floor is gone (the residual at /500
   is real per-endpoint filter + strategy work).
+
+---
+
+## Follow-ups (remaining opportunities)
+
+Identified during this audit but not yet done. Each is independent and low-risk
+except where noted.
+
+- **`hash_ring` snapshot for `consistent_hash`** — small. `select_consistent_hash`
+  walks the `hash_ring` `DashMap` (`virtual_nodes × endpoints` ≈ 1500 entries for
+  10 endpoints), the dominant cost behind `lb_strategies/consistent_hash` (~50–74 µs
+  vs sub-µs for the other strategies). Apply the same `ArcSwap` snapshot treatment
+  as §8b (rebuild on add/remove), or precompute a sorted ring `Vec` for binary
+  search. Expected: ~50 µs → low-µs. File: `loadbalance.rs`.
+- **`FairScheduler::stream_count` → `AtomicUsize`** — trivial. Still a
+  `DashMap::len()` shard walk (`fair_scheduler/stream_count_empty` ≈ 960 ns); the
+  same atomic-counter pattern as §2 applies. File: `src/adapter/net/router.rs`.
+- **§5 capability query single-axis fast path** — moderate, deferred. ~1.5–2× on
+  broad queries that return thousands of rows, by skipping the intermediate
+  `HashSet`/sort when one selective dimension and no further predicates apply.
+  Requires a dedicated correctness harness first (multi-class dedup; the fold scan
+  is by-design — see memory `capability-checks-use-folds`). Risk to the
+  capability-routing path is why it's deferred, not its difficulty.
+- **`ApiRegistry::find_by_endpoint` candidate narrowing** — moderate. §8a removed
+  the per-endpoint allocation but kept the full scan. Narrowing via an index would
+  need to handle endpoints whose first path segment is a parameter (`/{tenant}/…`),
+  which the current `by_endpoint` prefix index mis-keys — e.g. index on
+  `(method, segment_count)` or a param-aware key. Only worth it if endpoint
+  lookups become hot with many diverse registered APIs. File: `api.rs`.
+
+Out of scope / not pursued (see Resolution for why): §6 cortex scratch buffer
+(no real win — `Bytes::from` is already zero-copy), the `FailureDetector`
+per-status tally (observability-only; counters would drift against in-place test
+mutation), and enforcing the §1 AVX2 flag in committed config (a deployment
+decision left to operators).
