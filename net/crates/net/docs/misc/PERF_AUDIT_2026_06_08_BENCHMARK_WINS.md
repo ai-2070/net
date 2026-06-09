@@ -475,7 +475,7 @@ materialized at or beyond its predicted magnitude.
 | `lb_scaling/select/500` | 11.875 µs | 7.559 µs | **~1.6× faster** |
 | `lb_strategies/round_robin` | 8.2373 µs | 340.98 ns | **~24× faster** |
 | `lb_strategies/power_of_two` | 10.635 µs | 702.86 ns | **~15× faster** |
-| `lb_strategies/consistent_hash` | 50.628 µs | 74.44 µs | not improved (see note) |
+| `lb_strategies/consistent_hash` | 50.628 µs | 39.8 µs | **~1.27× faster** — via `hash_ring` shard right-sizing, NOT the snapshot (see note) |
 
 Notes:
 
