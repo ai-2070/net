@@ -1,0 +1,33 @@
+net/crates/net/src/ffi/aggregator.rs
+  s_4160fa41eb84b4::t_e50aae253edd34 555-558
+  s_4160fa41eb84b4::t_78fd5c99192a7f 383-389
+  s_4160fa41eb84b4::t_d0f2e2cd49d3e9 213-216
+  s_4160fa41eb84b4::t_18c165a8b5e70e 653-656
+  s_4160fa41eb84b4::t_bd751580aa599d 296-304
+  s_4160fa41eb84b4::t_8a4926021afa1e 573-576
+  s_4160fa41eb84b4::t_35fae164f0bdf2 636-639
+  s_4160fa41eb84b4::t_d2e7ad0a159167 706-714
+  s_4160fa41eb84b4::t_6c23daed4c3f98 134-141,143-145
+  s_4160fa41eb84b4::t_34f6b123918164 425-428
+  s_4160fa41eb84b4::t_210d6ead4db470 513-515,520-522,528-540
+  s_4160fa41eb84b4::t_cfa119e5a0e620 18,23
+  s_4160fa41eb84b4::t_5c7e7c37519902 490-492,494-496
+  s_4160fa41eb84b4::t_e945f1f785514f 167-169,175-178,184-196
+  s_4160fa41eb84b4::t_cd299dc1bd0d22 671-674
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "df130771681453ff8a3b684ff0a0021a97569b52",
+  "prompts": {},
+  "sessions": {
+    "s_4160fa41eb84b4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "da4c2a25-92aa-407a-ac64-a2a5503b6a99",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
