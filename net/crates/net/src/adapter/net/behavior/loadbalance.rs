@@ -696,6 +696,14 @@ pub struct LoadBalancer {
     /// The Arcs are shared with `endpoints`, so live per-endpoint atomic state
     /// (health, connections, circuit) is read correctly through the snapshot.
     endpoint_list: ArcSwap<Vec<Arc<EndpointState>>>,
+    /// Serializes endpoint SET changes (add/remove) so the `endpoints`
+    /// mutation, hash-ring update, and `endpoint_list` rebuild commit as one
+    /// unit. Without it, two concurrent membership changes can interleave such
+    /// that a rebuild observing the map *before* another thread's mutation
+    /// stores its stale snapshot last — dropping a just-added endpoint (or
+    /// resurrecting a removed one) from `endpoint_list` until the next change.
+    /// Not taken on the hot path (`select`/`stats` only read the snapshot).
+    membership_lock: Mutex<()>,
     /// Round-robin counter
     rr_counter: AtomicU64,
     /// Total selections
@@ -715,6 +723,7 @@ impl LoadBalancer {
             config,
             endpoints: DashMap::new(),
             endpoint_list: ArcSwap::from_pointee(Vec::new()),
+            membership_lock: Mutex::new(()),
             rr_counter: AtomicU64::new(0),
             total_selections: AtomicU64::new(0),
             failed_selections: AtomicU64::new(0),
@@ -734,6 +743,9 @@ impl LoadBalancer {
     /// Add an endpoint
     pub fn add_endpoint(&self, endpoint: Endpoint) {
         let node_id = endpoint.node_id;
+        // Hold `membership_lock` across the mutation + rebuild so a concurrent
+        // add/remove can't store a stale snapshot over ours (see field doc).
+        let _guard = self.membership_lock.lock();
         self.endpoints
             .insert(node_id, Arc::new(EndpointState::new(endpoint)));
 
@@ -744,6 +756,7 @@ impl LoadBalancer {
 
     /// Remove an endpoint
     pub fn remove_endpoint(&self, node_id: &NodeId) {
+        let _guard = self.membership_lock.lock();
         self.remove_from_hash_ring(node_id);
         self.endpoints.remove(node_id);
         self.rebuild_endpoint_list();
@@ -2681,6 +2694,65 @@ mod tests {
             );
             lb.record_completion(&sel.node_id, true);
         }
+    }
+
+    /// Concurrent membership changes must leave `endpoint_list` (read by
+    /// select/stats/count) exactly consistent with the authoritative
+    /// `endpoints` map. Pre-fix, a rebuild that observed the map before a
+    /// concurrent mutation could store its stale snapshot last, dropping a
+    /// just-added endpoint from rotation (or resurrecting a removed one).
+    #[test]
+    fn concurrent_membership_changes_keep_snapshot_consistent() {
+        use std::collections::HashSet;
+        use std::sync::Arc as StdArc;
+
+        let lb = StdArc::new(LoadBalancer::with_strategy(Strategy::RoundRobin));
+        let n: u8 = 64;
+
+        // Concurrent adds.
+        let mut handles = Vec::new();
+        for i in 1..=n {
+            let lb = StdArc::clone(&lb);
+            handles.push(std::thread::spawn(move || {
+                lb.add_endpoint(Endpoint::new(make_node_id(i)));
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // The snapshot must match the authoritative map exactly — not a
+        // single add may be lost to a stale rebuild.
+        assert_eq!(lb.endpoint_count(), n as usize);
+        assert_eq!(lb.endpoint_count(), lb.endpoints.len());
+        let snap: HashSet<_> = lb.endpoints().iter().map(|e| e.node_id).collect();
+        assert_eq!(
+            snap.len(),
+            n as usize,
+            "every added endpoint must appear in the snapshot"
+        );
+
+        // Concurrent removes (the even ids) must stay consistent too.
+        let mut handles = Vec::new();
+        for i in (2..=n).step_by(2) {
+            let lb = StdArc::clone(&lb);
+            handles.push(std::thread::spawn(move || {
+                lb.remove_endpoint(&make_node_id(i));
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(lb.endpoint_count(), lb.endpoints.len());
+        assert_eq!(lb.endpoint_count(), (n / 2) as usize);
+        assert!(
+            lb.endpoints().iter().all(|e| {
+                let raw = e.node_id;
+                // Odd ids only should remain.
+                lb.endpoints.contains_key(&raw)
+            }),
+            "snapshot must contain only live endpoints"
+        );
     }
 
     // ---------- LoadBalancerError Display ----------
