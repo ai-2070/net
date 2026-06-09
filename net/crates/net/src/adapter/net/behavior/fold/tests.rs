@@ -602,9 +602,16 @@ use super::dispatch::{DispatchError, FoldRegistry};
 use super::wire::placeholder_signature;
 use super::wire::WireError;
 
+/// Sign a capability envelope as an *honest* publisher would: the
+/// envelope's `node_id` is the keypair's own node id. `verify`
+/// binds the two, so a self-consistent envelope is the only shape
+/// that survives the dispatch path. Tests that need to simulate a
+/// node id distinct from the signing keypair (the forgery the
+/// binding check rejects, or multi-node fold-keying via the
+/// already-verified `apply` path) construct envelopes directly or
+/// via the placeholder/`apply` helpers instead.
 fn sign_cap_ann(
     keypair: &EntityKeypair,
-    node_id: NodeId,
     class: u64,
     generation: u64,
     tags: Vec<&str>,
@@ -613,7 +620,7 @@ fn sign_cap_ann(
         keypair,
         CapFold::KIND_ID,
         class,
-        node_id,
+        keypair.entity_id().node_id(),
         generation,
         EnvelopeMeta::default(),
         CapPayload {
@@ -627,7 +634,7 @@ fn sign_cap_ann(
 #[test]
 fn signed_announcement_round_trips_through_postcard_encode_decode() {
     let kp = EntityKeypair::generate();
-    let ann = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu", "h100"]);
+    let ann = sign_cap_ann(&kp, 0x1000, 1, vec!["gpu", "h100"]);
 
     let bytes = ann.encode().expect("encode");
     let decoded = SignedAnnouncement::<CapPayload>::decode(&bytes).expect("decode");
@@ -646,7 +653,7 @@ fn signed_announcement_round_trips_through_postcard_encode_decode() {
 #[test]
 fn signature_verifies_against_publisher_identity() {
     let kp = EntityKeypair::generate();
-    let ann = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu"]);
+    let ann = sign_cap_ann(&kp, 0x1000, 1, vec!["gpu"]);
     ann.verify(kp.entity_id())
         .expect("verify must accept untampered envelope");
 }
@@ -655,7 +662,7 @@ fn signature_verifies_against_publisher_identity() {
 fn verify_rejects_signature_from_a_different_keypair() {
     let signer = EntityKeypair::generate();
     let imposter = EntityKeypair::generate();
-    let ann = sign_cap_ann(&signer, 0x42, 0x1000, 1, vec!["gpu"]);
+    let ann = sign_cap_ann(&signer, 0x1000, 1, vec!["gpu"]);
     // Verifying against a DIFFERENT identity must fail —
     // otherwise impersonation is trivial.
     match ann.verify(imposter.entity_id()) {
@@ -667,7 +674,7 @@ fn verify_rejects_signature_from_a_different_keypair() {
 #[test]
 fn verify_rejects_tampered_payload() {
     let kp = EntityKeypair::generate();
-    let mut ann = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu"]);
+    let mut ann = sign_cap_ann(&kp, 0x1000, 1, vec!["gpu"]);
     // Tamper: swap a tag. The signing bytes change but the
     // signature doesn't — verify must reject.
     ann.payload.tags = vec!["malicious-tag".into()];
@@ -696,7 +703,7 @@ fn verify_rejects_placeholder_signature_sentinel() {
 #[test]
 fn verify_rejects_signature_of_wrong_length() {
     let kp = EntityKeypair::generate();
-    let mut ann = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu"]);
+    let mut ann = sign_cap_ann(&kp, 0x1000, 1, vec!["gpu"]);
     // Truncate the signature.
     ann.signature.pop();
     match ann.verify(kp.entity_id()) {
@@ -708,11 +715,11 @@ fn verify_rejects_signature_of_wrong_length() {
 #[test]
 fn decode_and_verify_drives_the_dispatch_hot_path() {
     let kp = EntityKeypair::generate();
-    let ann = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu"]);
+    let ann = sign_cap_ann(&kp, 0x1000, 1, vec!["gpu"]);
     let bytes = ann.encode().expect("encode");
     let verified = SignedAnnouncement::<CapPayload>::decode_and_verify(&bytes, kp.entity_id())
         .expect("decode + verify must succeed for a freshly-signed envelope");
-    assert_eq!(verified.node_id, 0x42);
+    assert_eq!(verified.node_id, kp.entity_id().node_id());
     assert_eq!(verified.payload.tags, vec!["gpu".to_string()]);
 }
 
@@ -730,7 +737,7 @@ fn fold_registry_routes_envelope_to_correct_fold_by_kind() {
     assert!(registry.get(0xBADD).is_none());
 
     let kp = EntityKeypair::generate();
-    let cap_ann = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu", "h100"]);
+    let cap_ann = sign_cap_ann(&kp, 0x1000, 1, vec!["gpu", "h100"]);
     let cap_bytes = cap_ann.encode().expect("encode");
 
     let outcome = registry
@@ -748,14 +755,14 @@ fn fold_registry_routes_envelope_to_correct_fold_by_kind() {
         class: 0x1000,
         required_tag: Some("h100".into()),
     });
-    assert_eq!(hits, vec![(0x1000, 0x42)]);
+    assert_eq!(hits, vec![(0x1000, kp.entity_id().node_id())]);
 }
 
 #[test]
 fn registry_rejects_envelope_for_unknown_kind() {
     let registry = FoldRegistry::new();
     let kp = EntityKeypair::generate();
-    let ann = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu"]);
+    let ann = sign_cap_ann(&kp, 0x1000, 1, vec!["gpu"]);
     let bytes = ann.encode().expect("encode");
 
     // No fold registered → UnknownKind.
@@ -812,7 +819,10 @@ fn registry_rejects_envelope_whose_kind_disagrees_with_routed_fold() {
         &kp,
         0xFFFF, // wrong kind
         0x1000,
-        0x42,
+        // Self-consistent node_id so the envelope clears the
+        // publisher-binding check and actually reaches the
+        // kind-mismatch arm this test exercises.
+        kp.entity_id().node_id(),
         1,
         EnvelopeMeta::default(),
         CapPayload {
@@ -878,7 +888,7 @@ fn fold_registry_implements_channel_router_trait() {
     let registry: Arc<dyn FoldChannelRouter> = Arc::new(registry);
 
     let kp = EntityKeypair::generate();
-    let ann = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu"]);
+    let ann = sign_cap_ann(&kp, 0x1000, 1, vec!["gpu"]);
     let bytes = ann.encode().expect("encode");
 
     let outcome = registry
@@ -901,7 +911,7 @@ fn channel_router_surface_propagates_signature_failure() {
 
     let signer = EntityKeypair::generate();
     let imposter = EntityKeypair::generate();
-    let ann = sign_cap_ann(&signer, 0x42, 0x1000, 1, vec!["gpu"]);
+    let ann = sign_cap_ann(&signer, 0x1000, 1, vec!["gpu"]);
     let bytes = ann.encode().expect("encode");
 
     // Route claiming the imposter's identity → InvalidSignature.
@@ -923,7 +933,7 @@ fn channel_router_drops_envelope_for_unknown_kind() {
     let router: Arc<dyn FoldChannelRouter> = Arc::new(registry);
 
     let kp = EntityKeypair::generate();
-    let ann = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu"]);
+    let ann = sign_cap_ann(&kp, 0x1000, 1, vec!["gpu"]);
     let bytes = ann.encode().expect("encode");
 
     match router.try_route(kp.entity_id(), &bytes) {
@@ -973,7 +983,7 @@ fn publisher_to_receiver_full_pipeline_in_process() {
     // 1. Publisher side: sign an announcement with the publisher's
     //    keypair and produce the on-wire bytes.
     let publisher_kp = EntityKeypair::generate();
-    let ann = sign_cap_ann(&publisher_kp, 0x42, 0x1000, 1, vec!["gpu", "h100"]);
+    let ann = sign_cap_ann(&publisher_kp, 0x1000, 1, vec!["gpu", "h100"]);
     let wire_bytes = ann.encode().expect("publisher: encode succeeds");
 
     // 2. Receiver side: install a FoldRegistry as the channel
@@ -1000,7 +1010,7 @@ fn publisher_to_receiver_full_pipeline_in_process() {
         class: 0x1000,
         required_tag: Some("h100".into()),
     });
-    assert_eq!(hits, vec![(0x1000, 0x42)]);
+    assert_eq!(hits, vec![(0x1000, publisher_kp.entity_id().node_id())]);
     assert_eq!(cap_fold.metrics().applies_inserted(), 1);
 }
 
@@ -1017,7 +1027,7 @@ fn publisher_encode_is_stable_across_calls() {
     // for a given (keypair, payload) under Ed25519, so the
     // wire bytes are deterministic end-to-end.
     let kp = EntityKeypair::generate();
-    let ann1 = sign_cap_ann(&kp, 0x42, 0x1000, 1, vec!["gpu", "h100"]);
+    let ann1 = sign_cap_ann(&kp, 0x1000, 1, vec!["gpu", "h100"]);
     let ann2 = ann1.clone();
     assert_eq!(
         ann1.encode().expect("first encode"),
@@ -1037,7 +1047,7 @@ fn receiver_rejects_envelope_signed_for_a_different_publisher() {
     let real_publisher = EntityKeypair::generate();
     let session_owner = EntityKeypair::generate(); // resolved by mesh
 
-    let ann = sign_cap_ann(&real_publisher, 0x42, 0x1000, 1, vec!["gpu"]);
+    let ann = sign_cap_ann(&real_publisher, 0x1000, 1, vec!["gpu"]);
     let wire_bytes = ann.encode().expect("encode");
 
     let registry = FoldRegistry::new();
@@ -1056,6 +1066,65 @@ fn receiver_rejects_envelope_signed_for_a_different_publisher() {
         cap_fold.metrics().applies_inserted(),
         0,
         "no apply may be credited to the fold when verify fails"
+    );
+}
+
+#[test]
+fn verify_rejects_envelope_claiming_a_foreign_node_id() {
+    // Capability-injection / reservation-hijack regression.
+    //
+    // A peer signs a *validly* signed envelope with its OWN key
+    // but stamps another node's `node_id` into the body. The
+    // Ed25519 signature is genuine, so the signature check alone
+    // passes — but `Fold::apply` keys all state on `node_id`, so
+    // accepting this lets the attacker plant capability/reservation
+    // entries under the victim's key. `verify` must bind the claim
+    // to the signing publisher and reject the mismatch.
+    let attacker = EntityKeypair::generate();
+    let victim = EntityKeypair::generate();
+    let victim_node = victim.entity_id().node_id();
+
+    // Hand-sign with the attacker's key but claim the victim's
+    // node_id. Signing over the forged bytes yields a genuine
+    // signature, so this is NOT caught by the signature check.
+    let forged = SignedAnnouncement::sign(
+        &attacker,
+        CapFold::KIND_ID,
+        0x1000,
+        victim_node,
+        1,
+        EnvelopeMeta::default(),
+        CapPayload {
+            class_hash: 0x1000,
+            tags: vec!["nrpc:settlement".into()],
+        },
+    )
+    .expect("sign over forged body succeeds");
+
+    // Direct verify against the true signer rejects the mismatch.
+    match forged.verify(attacker.entity_id()) {
+        Err(WireError::NodeIdMismatch { claimed, publisher }) => {
+            assert_eq!(claimed, victim_node);
+            assert_eq!(publisher, attacker.entity_id().node_id());
+        }
+        other => panic!("expected NodeIdMismatch, got {other:?}"),
+    }
+
+    // Same rejection through the full dispatch path, and no apply
+    // is credited to the fold.
+    let bytes = forged.encode().expect("encode");
+    let registry = FoldRegistry::new();
+    let cap_fold: Arc<Fold<CapFold>> = Arc::new(Fold::new());
+    registry.register(cap_fold.clone());
+    let router: Arc<dyn FoldChannelRouter> = Arc::new(registry);
+    match router.try_route(attacker.entity_id(), &bytes) {
+        Err(DispatchError::Wire(WireError::NodeIdMismatch { .. })) => {}
+        other => panic!("expected NodeIdMismatch through dispatch, got {other:?}"),
+    }
+    assert_eq!(
+        cap_fold.metrics().applies_inserted(),
+        0,
+        "a node_id-forged envelope must never reach fold state"
     );
 }
 

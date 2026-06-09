@@ -192,6 +192,22 @@ pub enum WireError {
     #[error("publisher public key bytes are not a valid Ed25519 point")]
     InvalidPublicKey,
 
+    /// The envelope's `node_id` claim doesn't match the node id
+    /// derived from the signature-verified publisher. A valid
+    /// signature only proves the publisher signed *these bytes* —
+    /// without this check a peer could sign an envelope claiming
+    /// any other node's id, and `Fold::apply` keys all state on
+    /// `node_id`, so the forged entry would land in the victim's
+    /// capability/reservation state (cross-node injection). The
+    /// publisher *is* the node; the two must agree.
+    #[error("envelope node_id {claimed} does not match publisher node_id {publisher}")]
+    NodeIdMismatch {
+        /// `node_id` field decoded from the envelope.
+        claimed: NodeId,
+        /// Node id derived from the verified publisher `EntityId`.
+        publisher: NodeId,
+    },
+
     /// The decoded envelope's `kind` field doesn't match the
     /// fold it was dispatched into. The dispatch layer catches
     /// this BEFORE handing the envelope to `Fold::apply` so a
@@ -334,7 +350,24 @@ impl<P: Serialize + DeserializeOwned> SignedAnnouncement<P> {
                 WireError::InvalidPublicKey
             }
             _ => WireError::InvalidSignature,
-        })
+        })?;
+
+        // Bind the envelope's `node_id` claim to the publisher that
+        // signed it. A valid signature only proves the publisher
+        // signed *these exact bytes* — it says nothing about whether
+        // the embedded `node_id` is the publisher's own. `Fold::apply`
+        // keys all state on `node_id`, so accepting a mismatched claim
+        // lets any peer plant entries under another node's key
+        // (capability injection / reservation hijack). The publisher
+        // IS the node; require the two to agree.
+        if self.node_id != publisher.node_id() {
+            return Err(WireError::NodeIdMismatch {
+                claimed: self.node_id,
+                publisher: publisher.node_id(),
+            });
+        }
+
+        Ok(())
     }
 
     /// Encode the full envelope to wire bytes via postcard.
