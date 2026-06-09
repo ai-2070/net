@@ -686,8 +686,16 @@ pub struct LoadBalancerStats {
 pub struct LoadBalancer {
     /// Configuration
     config: LoadBalancerConfig,
-    /// Endpoints by node ID
+    /// Endpoints by node ID — authoritative store for point lookups
+    /// (get / reservation / health updates).
     endpoints: DashMap<NodeId, Arc<EndpointState>>,
+    /// Flat snapshot of the same endpoints, rebuilt only when the SET changes
+    /// (add/remove). `select()`/`stats()` iterate this instead of
+    /// `DashMap::iter()`, which walks every shard (4*num_cpus, e.g. 128) even
+    /// for a handful of endpoints — the fixed cost that dominated select().
+    /// The Arcs are shared with `endpoints`, so live per-endpoint atomic state
+    /// (health, connections, circuit) is read correctly through the snapshot.
+    endpoint_list: ArcSwap<Vec<Arc<EndpointState>>>,
     /// Round-robin counter
     rr_counter: AtomicU64,
     /// Total selections
@@ -706,6 +714,7 @@ impl LoadBalancer {
         Self {
             config,
             endpoints: DashMap::new(),
+            endpoint_list: ArcSwap::from_pointee(Vec::new()),
             rr_counter: AtomicU64::new(0),
             total_selections: AtomicU64::new(0),
             failed_selections: AtomicU64::new(0),
@@ -730,12 +739,25 @@ impl LoadBalancer {
 
         // Add to hash ring for consistent hashing
         self.add_to_hash_ring(node_id);
+        self.rebuild_endpoint_list();
     }
 
     /// Remove an endpoint
     pub fn remove_endpoint(&self, node_id: &NodeId) {
         self.remove_from_hash_ring(node_id);
         self.endpoints.remove(node_id);
+        self.rebuild_endpoint_list();
+    }
+
+    /// Rebuild the flat endpoint snapshot iterated by `select`/`stats`.
+    /// Called only when the endpoint SET changes (add/remove) — per-endpoint
+    /// state updates mutate shared atomics visible through the existing Arcs,
+    /// so they need no rebuild. This is the only place that pays the
+    /// `DashMap::iter()` shard walk; the hot path reads the snapshot.
+    fn rebuild_endpoint_list(&self) {
+        let list: Vec<Arc<EndpointState>> =
+            self.endpoints.iter().map(|e| Arc::clone(e.value())).collect();
+        self.endpoint_list.store(Arc::new(list));
     }
 
     /// Update endpoint health
@@ -907,9 +929,9 @@ impl LoadBalancer {
         let mut available = Vec::new();
         let mut zone_matches = Vec::new();
 
-        for entry in self.endpoints.iter() {
-            let state = entry.value();
-
+        // Iterate the flat snapshot rather than DashMap::iter (shard walk).
+        let snapshot = self.endpoint_list.load();
+        for state in snapshot.iter() {
             // Check basic availability
             if !state.is_available() {
                 continue;
@@ -1329,8 +1351,8 @@ impl LoadBalancer {
         let mut total_connections = 0u64;
         let mut total_load = 0.0;
 
-        for entry in self.endpoints.iter() {
-            let state = entry.value();
+        let snapshot = self.endpoint_list.load();
+        for state in snapshot.iter() {
             if state.health() == HealthStatus::Healthy {
                 healthy += 1;
             }
@@ -1338,7 +1360,7 @@ impl LoadBalancer {
             total_load += state.load_score();
         }
 
-        let endpoint_count = self.endpoints.len() as u32;
+        let endpoint_count = snapshot.len() as u32;
 
         LoadBalancerStats {
             total_selections: self.total_selections.load(Ordering::Relaxed),
@@ -1356,27 +1378,25 @@ impl LoadBalancer {
 
     /// Get all endpoints as snapshots
     pub fn endpoints(&self) -> Vec<Endpoint> {
-        self.endpoints
+        self.endpoint_list
+            .load()
             .iter()
-            .map(|e| {
-                let state = e.value();
-                Endpoint {
-                    node_id: state.node_id,
-                    weight: state.weight,
-                    health: state.health(),
-                    metrics: state.metrics(),
-                    tags: state.tags.clone(),
-                    priority: state.priority,
-                    enabled: state.is_enabled(),
-                    zone: state.zone.clone(),
-                }
+            .map(|state| Endpoint {
+                node_id: state.node_id,
+                weight: state.weight,
+                health: state.health(),
+                metrics: state.metrics(),
+                tags: state.tags.clone(),
+                priority: state.priority,
+                enabled: state.is_enabled(),
+                zone: state.zone.clone(),
             })
             .collect()
     }
 
     /// Get endpoint count
     pub fn endpoint_count(&self) -> usize {
-        self.endpoints.len()
+        self.endpoint_list.load().len()
     }
 }
 
@@ -2629,6 +2649,38 @@ mod tests {
             snapshot.iter().map(|e| (e.node_id[0], e.weight)).collect();
         assert_eq!(weights.get(&1), Some(&50));
         assert_eq!(weights.get(&2), Some(&75));
+    }
+
+    /// The endpoint snapshot (iterated by select/stats/count) must be rebuilt
+    /// on remove: counts drop and the removed endpoint is never selected.
+    #[test]
+    fn removing_an_endpoint_updates_snapshot_and_stops_selection() {
+        let lb = LoadBalancer::with_strategy(Strategy::RoundRobin);
+        for i in 1..=3u8 {
+            lb.add_endpoint(Endpoint::new(make_node_id(i)));
+        }
+        assert_eq!(lb.endpoint_count(), 3);
+        assert_eq!(lb.stats().active_endpoints, 3);
+
+        lb.remove_endpoint(&make_node_id(2));
+        assert_eq!(lb.endpoint_count(), 2, "count must drop after remove");
+        assert_eq!(lb.stats().active_endpoints, 2);
+        assert!(
+            lb.endpoints().iter().all(|e| e.node_id != make_node_id(2)),
+            "removed endpoint must be gone from the snapshot"
+        );
+
+        // The removed endpoint must never be selected.
+        let ctx = RequestContext::new();
+        for _ in 0..50 {
+            let sel = lb.select(&ctx).unwrap();
+            assert_ne!(
+                sel.node_id,
+                make_node_id(2),
+                "removed endpoint must not be selected"
+            );
+            lb.record_completion(&sel.node_id, true);
+        }
     }
 
     // ---------- LoadBalancerError Display ----------
