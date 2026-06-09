@@ -3,6 +3,9 @@
 Source: code inspection of the mesh packet path (`src/adapter/net/`), the in-process
 bus ingest path (`src/bus.rs`, `src/shard/`, `src/timestamp.rs`), and a sweep of the
 existing perf plan docs to establish what is already identified, shipped, or gated.
+Widened same-day (§8–§11) to the layers the first pass skipped: the nRPC dispatch
+layer above the transport (`mesh_rpc.rs` + `cortex/rpc.rs`), the FFI/bindings surface
+(the path SDK consumers actually hit), and the RedEX/CortEX/consumer-drain paths.
 Numbers from `BENCHMARKS.md` (2026-04-27, M1 Max + i9-14900K) and the prior audits are
 used as the baseline; per-item costs below marked *est.* are reasoned from the code,
 not re-measured.
