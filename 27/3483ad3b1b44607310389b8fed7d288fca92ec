@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/behavior/subnet.rs
+  s_4160fa41eb84b4::t_5e051fa043813b 41-46
+  s_4160fa41eb84b4::t_81f3a0c360d5c7 47-62
+  s_4160fa41eb84b4::t_40a3443f109428 152-166
+net/crates/net/src/adapter/net/behavior/group.rs
+  s_4160fa41eb84b4::t_e44f169a261d2e 46-51
+  s_4160fa41eb84b4::t_b12e41c519bf18 52-66
+  s_4160fa41eb84b4::t_7700bf8912e9e8 151-169
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "273483ad3b1b44607310389b8fed7d288fca92ec",
+  "prompts": {},
+  "sessions": {
+    "s_4160fa41eb84b4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "da4c2a25-92aa-407a-ac64-a2a5503b6a99",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

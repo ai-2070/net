@@ -1,0 +1,28 @@
+net/crates/net/fuzz/fuzz_targets/blob_transfer_header_decode.rs
+  s_4160fa41eb84b4::t_752287aa3b94c3 1-34
+net/crates/net/fuzz/fuzz_targets/membership_decode.rs
+  s_4160fa41eb84b4::t_d026eb50f4c026 1-40
+net/crates/net/fuzz/Cargo.toml
+  s_4160fa41eb84b4::t_8676deab8eb886 31-35,38-41
+  s_4160fa41eb84b4::t_8c550ef0581347 82-109
+net/crates/net/fuzz/fuzz_targets/cortex_rpc_request_decode.rs
+  s_4160fa41eb84b4::t_ba36bcb4f7afb1 1-44
+net/crates/net/fuzz/fuzz_targets/bindings_from_bytes.rs
+  s_4160fa41eb84b4::t_127ea15e8a584d 1-42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "0fbd6b8d454a9311776bac66a77dcc1efb857991",
+  "prompts": {},
+  "sessions": {
+    "s_4160fa41eb84b4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "da4c2a25-92aa-407a-ac64-a2a5503b6a99",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
