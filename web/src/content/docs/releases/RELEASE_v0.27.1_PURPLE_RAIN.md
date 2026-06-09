@@ -1,7 +1,5 @@
 # Net v0.27.1 — "Purple Rain"
 
-*A point release carries the same codename because it's the same song — just the room gone quiet enough to hear it. The film ends on the long-decaying piano chord after the band finally plays together; v0.27 was that chord struck, and v0.27.1 is letting it ring without the amp hum underneath. No new material. The set list is identical. This is the encore played tighter: a performance audit walked every "count" and "stats" call on the hot paths and found the substrate had been paying a ~950 ns 128-shard `DashMap::len()` tax to answer questions it could have answered with a single atomic load — plus a clutch of benchmark numbers that were never real, just shared fixtures bleeding into each other. v0.27.1 makes the substrate stop paying for what it can count, and corrects the record on what it never actually cost. Wire format unchanged; behavior unchanged; the same chord, decaying cleaner.*
-
 ## A pure performance release — nothing on the wire moves
 
 v0.27.1 ships no new systems, no new SDK surface, and no protocol changes. Every change either replaces an O(shards) operation with an O(1) atomic, swaps an O(n) full-scan for an index read, deletes an allocation, or corrects a benchmark fixture that was reporting fiction. The work is recorded in full in [`docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md`](../misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md); this log is the operator-facing summary.
