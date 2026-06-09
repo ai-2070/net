@@ -1,0 +1,34 @@
+net/crates/net/src/adapter/net/behavior/fold/capability.rs
+  s_4160fa41eb84b4::t_91826844e1f1ab 1367-1368,1371
+net/crates/net/src/adapter/net/behavior/fold/wire.rs
+  s_4160fa41eb84b4::t_bb989a41c066c2 195-210
+  s_4160fa41eb84b4::t_1cbbfab904acec 353-370
+net/crates/net/src/adapter/net/behavior/fold/tests.rs
+  s_4160fa41eb84b4::t_c4cd5c084380e0 637,656,665,677,706,718,740,765,891,914,936,986,1030,1050
+  s_4160fa41eb84b4::t_f6ed2177df63ea 822-825
+  s_4160fa41eb84b4::t_ed70147851196e 758
+  s_4160fa41eb84b4::t_0b8aac80f1aac8 1013
+  s_4160fa41eb84b4::t_be516b1c3937fe 605-612,623
+  s_4160fa41eb84b4::t_2b1f102a7c7050 1072-1130
+  s_4160fa41eb84b4::t_f671e8de8a63f3 722
+net/crates/net/src/adapter/net/behavior/fold/routing.rs
+  s_4160fa41eb84b4::t_72aa5ca7ad25f0 414-417
+net/crates/net/src/adapter/net/behavior/fold/reservation.rs
+  s_4160fa41eb84b4::t_8c23b159de464c 1084-1086,1089,1093
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "cbbf5ac4eb0a42df213b710e28ac23254b9b2de5",
+  "prompts": {},
+  "sessions": {
+    "s_4160fa41eb84b4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "da4c2a25-92aa-407a-ac64-a2a5503b6a99",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
