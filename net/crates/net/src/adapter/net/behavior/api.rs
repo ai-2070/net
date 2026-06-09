@@ -1634,7 +1634,6 @@ pub struct ApiRegistry {
     /// every shard (~1us) and `stats()` previously full-scanned every node and
     /// schema; these atomics make `len()`/`stats()`/the capacity gate O(1).
     /// Maintained on register / unregister / clear and in the index helpers.
-    /// See docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §2/§4.
     node_count: AtomicUsize,
     total_endpoints: AtomicUsize,
     /// Maximum capacity
