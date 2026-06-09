@@ -1,0 +1,20 @@
+net/crates/net/aggregator-daemon/src/lib.rs
+  s_4160fa41eb84b4::t_9acb59860f20a9 295-298
+  s_4160fa41eb84b4::t_f7af62cfb34dfa 826-856
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "5309ade1eed07c4e7cc7f1c1264dd71573bc2b4a",
+  "prompts": {},
+  "sessions": {
+    "s_4160fa41eb84b4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "da4c2a25-92aa-407a-ac64-a2a5503b6a99",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
