@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/SECURITY_AUDIT_2026_06_09_NET_CRATE.md
+  s_4160fa41eb84b4::t_f2cb4ed4f67012 1-221
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "ec8d7fe5a9a0e4b2b9ba0a2da255a4c5b0bf2291",
+  "prompts": {},
+  "sessions": {
+    "s_4160fa41eb84b4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "da4c2a25-92aa-407a-ac64-a2a5503b6a99",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
