@@ -546,7 +546,13 @@ async fn reconstruct_tree(
     let mut links: Vec<(String, PathBuf)> = Vec::new();
     for entry in &manifest.entries {
         if let EntryKind::Symlink { target } = &entry.kind {
-            links.push((target.clone(), safe_join(&root, &entry.path)?));
+            let safe = safe_join(&root, &entry.path)?;
+            // The link path is confined by `safe_join`, but the target
+            // is attacker-controlled too — a hostile sender could plant
+            // `link -> /etc/passwd` or `link -> ../../../../etc`. Reject
+            // any target that would point outside the fetched tree.
+            check_link_target(&entry.path, target)?;
+            links.push((target.clone(), safe));
         }
     }
     stats.symlinks = tokio::task::spawn_blocking(move || {
@@ -768,6 +774,51 @@ fn safe_join(dest: &Path, rel: &str) -> Result<PathBuf, DirError> {
     Ok(out)
 }
 
+/// Reject a symlink target that would escape the reconstruction root.
+///
+/// The link itself lives at `root/link_rel` (already confined by
+/// [`safe_join`]); its target is resolved by the OS relative to the
+/// link's parent directory. Since the manifest is attacker-controlled,
+/// a target like `/etc/passwd` or `../../../../etc` must not yield a
+/// link pointing outside the fetched tree.
+///
+/// This is a purely lexical check — no filesystem access — so it is
+/// immune to TOCTOU and copes with dangling targets. Absolute targets
+/// are rejected outright; for relative targets, the running directory
+/// depth below root (starting at the link's parent) must never go
+/// negative as `..` components are applied. Chained in-tree symlinks
+/// stay safe because every link target is validated the same way.
+fn check_link_target(link_rel: &str, target: &str) -> Result<(), DirError> {
+    let t = Path::new(target);
+    if t.is_absolute() {
+        return Err(DirError::UnsafePath(target.to_owned()));
+    }
+    // Depth of the link's parent dir below root = the number of Normal
+    // components in `link_rel` minus the link's own filename. `link_rel`
+    // is non-empty and has at least the filename (safe_join enforces).
+    let link_depth = Path::new(link_rel)
+        .components()
+        .filter(|c| matches!(c, Component::Normal(_)))
+        .count();
+    let mut depth: isize = link_depth.saturating_sub(1) as isize;
+    for comp in t.components() {
+        match comp {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(DirError::UnsafePath(target.to_owned()));
+                }
+            }
+            // RootDir / Prefix (Windows `C:\`, `\\?\`) — absolute-ish;
+            // `is_absolute` catches most, this is the defensive backstop.
+            _ => return Err(DirError::UnsafePath(target.to_owned())),
+        }
+    }
+    Ok(())
+}
+
 fn write_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), DirError> {
     std::fs::write(path, bytes)?;
     apply_mode(path, mode)?;
@@ -837,6 +888,30 @@ mod tests {
         assert!(safe_join(dest, "a/../../escape").is_err());
         assert!(safe_join(dest, "/abs/path").is_err());
         assert!(safe_join(dest, "").is_err());
+    }
+
+    #[test]
+    fn check_link_target_accepts_in_tree_targets() {
+        // Relative target staying inside the tree, from a nested link.
+        assert!(check_link_target("sub/link", "file.txt").is_ok());
+        assert!(check_link_target("sub/link", "../other/file.txt").is_ok());
+        // `..` that pops back to root but no further is fine.
+        assert!(check_link_target("a/b/link", "../../c").is_ok());
+        // Self-referential `.` components are harmless.
+        assert!(check_link_target("link", "./peer").is_ok());
+    }
+
+    #[test]
+    fn check_link_target_rejects_escapes() {
+        // Absolute target — the classic `link -> /etc/passwd`.
+        assert!(check_link_target("link", "/etc/passwd").is_err());
+        // Relative target escaping above root from a top-level link.
+        assert!(check_link_target("link", "../etc").is_err());
+        // Deep `..` chain that escapes even from a nested link.
+        assert!(check_link_target("a/b/link", "../../../../etc").is_err());
+        // Escapes midway then comes back — still rejected (the
+        // intermediate step left the tree).
+        assert!(check_link_target("link", "../../a/b").is_err());
     }
 
     #[test]
