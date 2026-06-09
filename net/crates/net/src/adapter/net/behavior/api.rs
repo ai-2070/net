@@ -1885,12 +1885,26 @@ impl ApiRegistry {
 
     /// Clear all registrations
     pub fn clear(&self) {
-        self.nodes.clear();
+        // Drain per-key (not `nodes.clear()` + `store(0)`) so the O(1) counters
+        // decrement in lock-step with the map. A bulk clear that `store(0)`s
+        // the counters races a concurrent `register`/`unregister` whose
+        // `fetch_add`/`fetch_sub` can land just after the store — wrapping
+        // `node_count`/`total_endpoints` to `usize::MAX` and wedging the
+        // capacity gate and `len()`. `nodes.remove` and the index ops are the
+        // same chokepoints the live paths use, so the count stays exact w.r.t.
+        // the map. Mirrors `MetadataStore::clear`.
+        let keys: Vec<NodeId> = self.nodes.iter().map(|r| *r.key()).collect();
+        for key in keys {
+            if let Some((_, ann)) = self.nodes.remove(&key) {
+                self.remove_from_indexes(&ann); // also decrements total_endpoints
+                self.node_count.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        // Defense-in-depth: clear any index residue from a concurrent register
+        // that landed after key collection (a happy-path no-op).
         self.by_api_name.clear();
         self.by_tag.clear();
         self.by_endpoint.clear();
-        self.node_count.store(0, Ordering::Relaxed);
-        self.total_endpoints.store(0, Ordering::Relaxed);
     }
 
     /// Remove expired entries
@@ -2500,6 +2514,65 @@ mod tests {
             "total_endpoints must not drift or underflow under concurrent re-register"
         );
         assert_eq!(s.apis_by_name.get("api"), Some(&1));
+    }
+
+    /// `clear()` must not race the per-op counter updates into underflow.
+    /// Concurrent register/unregister + clear must leave `node_count`/
+    /// `total_endpoints` exactly tracking the map — never wrapped to a huge
+    /// value. Pre-fix, `clear()` `store(0)`'d the counters while a concurrent
+    /// `unregister`'s `fetch_sub(1)` could land just after, wrapping to
+    /// `usize::MAX`.
+    #[test]
+    fn concurrent_clear_does_not_underflow_counters() {
+        use std::sync::Arc as StdArc;
+
+        let registry = StdArc::new(ApiRegistry::new());
+        let mut handles = Vec::new();
+
+        // Writers: repeatedly register then unregister their own node.
+        for t in 0..8u8 {
+            let registry = StdArc::clone(&registry);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..500 {
+                    let schema = ApiSchema::new("api", ApiVersion::new(1, 0, 0))
+                        .add_endpoint(ApiEndpoint::new("/a", ApiMethod::Get));
+                    registry
+                        .register(ApiAnnouncement::new(make_node_id(t), vec![schema]))
+                        .unwrap();
+                    registry.unregister(&make_node_id(t));
+                }
+            }));
+        }
+        // Clearer: hammer clear() against the writers.
+        {
+            let registry = StdArc::clone(&registry);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..500 {
+                    registry.clear();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // After quiescence the counters must equal the authoritative map
+        // exactly — a wrapped/underflowed counter would diverge wildly.
+        assert_eq!(
+            registry.len(),
+            registry.nodes.len(),
+            "node_count must track the map, not underflow"
+        );
+        let live_endpoints: usize = registry
+            .nodes
+            .iter()
+            .map(|e| e.value().schemas.iter().map(|s| s.endpoints.len()).sum::<usize>())
+            .sum();
+        assert_eq!(
+            registry.stats().total_endpoints,
+            live_endpoints,
+            "total_endpoints must track the map, not underflow"
+        );
     }
 
     /// `path_matches` (no-alloc) must agree with `matches_path(..).is_some()`
