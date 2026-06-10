@@ -759,6 +759,47 @@ fn fold_registry_routes_envelope_to_correct_fold_by_kind() {
 }
 
 #[test]
+fn two_publishers_dispatch_into_distinct_by_node_entries() {
+    // Multi-publisher coverage through the FULL dispatch path
+    // (decode_and_verify → apply), not direct `apply`. Two distinct
+    // keypairs each publish a self-consistent envelope; the fold must
+    // key them under their own node_ids, so a query returns one hit per
+    // publisher. This is the keying invariant `sign_cap_ann`'s old
+    // explicit-node_id parameter used to exercise — pinned here so a
+    // regression that collapsed per-publisher keying (e.g. keying on a
+    // cached/routed node instead of the envelope's) can't pass silently.
+    let registry = FoldRegistry::new();
+    let cap_fold: Arc<Fold<CapFold>> = Arc::new(Fold::new());
+    registry.register(cap_fold.clone());
+
+    let kp_a = EntityKeypair::generate();
+    let kp_b = EntityKeypair::generate();
+    let node_a = kp_a.entity_id().node_id();
+    let node_b = kp_b.entity_id().node_id();
+    assert_ne!(node_a, node_b, "distinct keypairs → distinct node ids");
+
+    for (kp, eid) in [(&kp_a, kp_a.entity_id()), (&kp_b, kp_b.entity_id())] {
+        let bytes = sign_cap_ann(kp, 0x1000, 1, vec!["gpu"])
+            .encode()
+            .expect("encode");
+        let outcome = registry.dispatch(&bytes, eid).expect("dispatch succeeds");
+        assert_eq!(outcome, ApplyOutcome::Inserted);
+    }
+    assert_eq!(cap_fold.metrics().applies_inserted(), 2);
+
+    // The query returns one (class, node_id) hit per publisher, keyed on
+    // each envelope's own node — order is map-dependent, so compare sets.
+    let mut hits = cap_fold.query(CapQuery {
+        class: 0x1000,
+        required_tag: Some("gpu".into()),
+    });
+    hits.sort();
+    let mut want = vec![(0x1000u64, node_a), (0x1000u64, node_b)];
+    want.sort();
+    assert_eq!(hits, want);
+}
+
+#[test]
 fn registry_rejects_envelope_for_unknown_kind() {
     let registry = FoldRegistry::new();
     let kp = EntityKeypair::generate();

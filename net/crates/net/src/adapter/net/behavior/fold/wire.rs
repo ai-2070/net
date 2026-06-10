@@ -359,11 +359,14 @@ impl<P: Serialize + DeserializeOwned> SignedAnnouncement<P> {
         // keys all state on `node_id`, so accepting a mismatched claim
         // lets any peer plant entries under another node's key
         // (capability injection / reservation hijack). The publisher
-        // IS the node; require the two to agree.
-        if self.node_id != publisher.node_id() {
+        // IS the node; require the two to agree. `node_id()` is a
+        // BLAKE2s-MAC over the pubkey, not a field read, so derive it
+        // once and reuse it for the error too.
+        let publisher_node = publisher.node_id();
+        if self.node_id != publisher_node {
             return Err(WireError::NodeIdMismatch {
                 claimed: self.node_id,
-                publisher: publisher.node_id(),
+                publisher: publisher_node,
             });
         }
 
