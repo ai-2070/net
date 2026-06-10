@@ -207,12 +207,19 @@ unary RPC on both sides. First, current state of the known `NRPC_FLAMEGRAPH.md` 
 
 **New findings (not in the flamegraph catalog):**
 
-- **8a. One `tokio::spawn` per response** (`mesh_rpc.rs:1798-1833`): the emit closure
-  spawns a task for every response publish. *Est.* 1–2 µs scheduling per RT, and it is
-  one of the 4–6 spawns the flamegraph counted. The T1.2 cache hit makes the publish
-  itself cheap (`publish_to_peer`), so the spawn is now the dominant cost of the
-  response leg — inline the publish into the handler task (it's already spawned) or
-  feed a drainer like T1.1 did.
+- **8a. One `tokio::spawn` per response** (`mesh_rpc.rs:1798-1833`) — ✅ DONE. The emit
+  closure spawned a task for every response publish. *Est.* 1–2 µs scheduling per RT,
+  one of the 4–6 spawns the flamegraph counted; with the T1.2 cache making the publish
+  itself cheap, the spawn was the dominant cost of the response leg. Fixed via the T1.1
+  drainer pattern: the (sync) emit closure now builds the wire payload and `try_send`s
+  an `RpcResponseJob` to a single per-service drain task that does the `.await` publish
+  — no per-response spawn, bounded channel (drop-on-overflow), FIFO. Streaming/duplex
+  variants keep their per-emit spawn (unary is the QPS hot path). Correctness pinned by
+  the full lib suite + two-mesh round-trip + serve-handle-drop in-flight tests.
+  *Measurement note:* the win is ~1–2 µs/RT, below this dev box's Windows-loopback
+  variance floor — a before/after on `nrpc_qps` showed `c1/32B` −3.6% (p<0.05) but the
+  other c1/c16 bars within noise; authoritative measurement remains the Linux flamegraph
+  environment (consistent with the rest of this wire-path audit).
 - **8b. Reply-channel string per response** (`mesh_rpc.rs:1799-1800`):
   `format!("{service}.replies.{caller_origin:016x}")` + `ChannelName::new()` — two
   heap allocs per response that are deterministic from `(service, caller_origin)` and
