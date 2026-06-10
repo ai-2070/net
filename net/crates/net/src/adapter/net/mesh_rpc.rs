@@ -398,11 +398,19 @@ pub struct RpcStream {
     /// error). Subsequent polls return `None`.
     done: bool,
     /// `Some(_)` if this stream uses flow control (caller set
-    /// `CallOptions::stream_window_initial`). Auto-grant emits 1
-    /// credit per delivered chunk, which keeps the server's
-    /// credit at roughly the initial window. `None` → no flow
-    /// control; `poll_next` does not emit grants.
+    /// `CallOptions::stream_window_initial`). Auto-grant
+    /// accumulates 1 credit per delivered chunk and fires one
+    /// batched `spawn_grant_publish` once the accumulator reaches
+    /// `window / 2` (or 1 for tiny windows). Keeps the server's
+    /// pump fed at roughly the configured rate without the per-
+    /// chunk spawn-storm + AEAD-storm the pre-fix path produced.
+    /// `None` → no flow control; `poll_next` does not emit grants.
+    /// Per PERF_AUDIT_2026_06_10_FULL_CRATE.md §3.3.
     stream_window: Option<u32>,
+    /// Auto-grant accumulator: chunks delivered since the last
+    /// emitted grant. Flushed at the `window / 2` threshold (see
+    /// the doc on [`Self::stream_window`]).
+    grant_pending: u32,
     /// Observer-fire bookkeeping. Latched on terminal observation
     /// in `poll_next`; fired once from `Drop` so the Deck NRPC
     /// tab + every other `RpcObserver` consumer sees one event
@@ -504,22 +512,35 @@ impl futures::Stream for RpcStream {
         }
         match self.inner.poll_recv(cx) {
             std::task::Poll::Ready(Some(StreamItem::Chunk(body))) => {
-                // Auto-grant 1 credit per delivered chunk so the
-                // server's pump stays at roughly the initial
-                // window. No-op when the stream isn't flow-
-                // controlled. For batched cadence, callers can
-                // skip auto-grant by NOT setting
-                // `stream_window_initial` and using `RpcStream::grant`
-                // directly with their preferred batching.
-                if self.stream_window.is_some() {
-                    spawn_grant_publish(
-                        Arc::clone(&self.mesh),
-                        self.target_node_id,
-                        self.request_channel.clone(),
-                        self.self_origin,
-                        self.call_id,
-                        1,
-                    );
+                // Auto-grant: accumulate 1 credit per delivered
+                // chunk and fire a batched `spawn_grant_publish`
+                // only when the accumulator reaches `window / 2`
+                // (or 1 for tiny windows). Per PERF_AUDIT §3.3 —
+                // pre-fix this spawned one task + one reliable
+                // AEAD packet per chunk, a spawn-storm + AEAD-
+                // storm under bursting; the server side already
+                // fixed the identical shape via
+                // `build_request_grant_emitter` (§3.3 audit text).
+                // Callers needing finer cadence still have
+                // `RpcStream::grant` for explicit batches.
+                if let Some(window) = self.stream_window {
+                    self.grant_pending = self.grant_pending.saturating_add(1);
+                    // `window / 2` clamped to 1 so a window of 1
+                    // still grants per chunk (pre-fix behavior for
+                    // the degenerate case).
+                    let threshold = window.saturating_div(2).max(1);
+                    if self.grant_pending >= threshold {
+                        let amount = self.grant_pending;
+                        self.grant_pending = 0;
+                        spawn_grant_publish(
+                            Arc::clone(&self.mesh),
+                            self.target_node_id,
+                            self.request_channel.clone(),
+                            self.self_origin,
+                            self.call_id,
+                            amount,
+                        );
+                    }
                 }
                 self.observer.add_response_bytes(body.len() as u32);
                 std::task::Poll::Ready(Some(Ok(body)))
@@ -2839,6 +2860,7 @@ impl MeshNode {
             inner: rx,
             done: false,
             stream_window: opts.stream_window_initial,
+            grant_pending: 0,
             _cancel_keep_alive: cancel_keep_alive,
             observer: StreamingObserverState::new(
                 Arc::clone(self),
