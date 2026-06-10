@@ -228,12 +228,54 @@ pub use routing::{route_to_shard, stream_id_from_bytes, stream_id_from_key};
 /// everywhere. `unwrap_or_default()` returning `Duration::ZERO`
 /// for a pre-epoch clock would also produce identical timestamps
 /// that break ordering.
+/// Threshold below which the cached coarse-clock reading is reused
+/// instead of re-reading the OS wall clock. 1 ms is well below the
+/// session-timeout / heartbeat / NACK cadence the consumers care
+/// about (those tick on the seconds scale), and well above the
+/// `Instant::now` cost (~10 ns) we still pay per call to gate the
+/// cache. Per PERF_AUDIT §2.7.
+const COARSE_CLOCK_REFRESH_NS: u64 = 1_000_000; // 1 ms
+
 #[inline]
 pub(crate) fn current_timestamp() -> u64 {
-    let elapsed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+    // **PERF_AUDIT §2.7.** Per-packet RX/TX paths each call
+    // `current_timestamp()` twice (one stream `touch` + one session
+    // `touch`). On Windows `SystemTime::now()` is
+    // `GetSystemTimePreciseAsFileTime` (~600 ns); on Linux it's
+    // `clock_gettime(CLOCK_REALTIME)` (~120 ns). At sustained packet
+    // rates the four wall-clock reads per ping eat measurable CPU.
+    //
+    // Coarse-clock cache: a `thread_local!` Cell holds the last
+    // `(Instant, u64-ns)` pair. Each call asks `Instant::now()`
+    // (~10 ns — TSC-backed on both Linux and Windows) whether 1 ms
+    // has elapsed; if not, the cached `u64` is reused. Repeated
+    // calls within the same millisecond from the same thread pay
+    // one Instant comparison instead of one OS wall-clock syscall.
+    //
+    // Consumers (`session.is_timed_out` against multi-second
+    // timeouts, `last_activity_ns` for diagnostics) are insensitive
+    // to ≤ 1 ms drift; the wire envelopes that need absolute epoch
+    // ns (capability announcements, snapshots) call
+    // `current_timestamp_micros` or stamp `SystemTime::now()`
+    // directly — neither hits this path.
+    thread_local! {
+        static COARSE_CLOCK: std::cell::Cell<Option<(std::time::Instant, u64)>>
+            = const { std::cell::Cell::new(None) };
+    }
+    COARSE_CLOCK.with(|cell| {
+        let now_inst = std::time::Instant::now();
+        if let Some((last_inst, last_ns)) = cell.get() {
+            if now_inst.duration_since(last_inst).as_nanos() < COARSE_CLOCK_REFRESH_NS as u128 {
+                return last_ns;
+            }
+        }
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        cell.set(Some((now_inst, ns)));
+        ns
+    })
 }
 
 /// Current timestamp in microseconds since the Unix epoch.
@@ -1279,6 +1321,47 @@ mod tests {
 
         let adapter = NetAdapter::new(config).unwrap();
         assert_eq!(adapter.name(), "net");
+    }
+
+    /// PERF_AUDIT §2.7 — `current_timestamp()` must reuse its
+    /// cached coarse-clock reading within the 1 ms refresh
+    /// window, AND must monotonically advance the cached value
+    /// after a refresh (no time travel backwards on the cache
+    /// boundary).
+    #[test]
+    fn current_timestamp_reuses_cache_within_refresh_window() {
+        // Burst of N reads in well under 1 ms: every return value
+        // must equal the first. Pre-fix every call paid a
+        // wall-clock syscall and could differ by ns.
+        let first = current_timestamp();
+        let mut all_same = true;
+        for _ in 0..100 {
+            if current_timestamp() != first {
+                all_same = false;
+                break;
+            }
+        }
+        assert!(
+            all_same,
+            "tight read burst must hit the coarse-clock cache",
+        );
+    }
+
+    #[test]
+    fn current_timestamp_advances_after_refresh_interval() {
+        // After sleeping past the refresh interval, the next read
+        // must return a larger value — pins that the cache
+        // actually refreshes rather than getting stuck on the
+        // initial reading.
+        let first = current_timestamp();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let later = current_timestamp();
+        assert!(
+            later > first,
+            "post-refresh reading must advance: first={}, later={}",
+            first,
+            later
+        );
     }
 
     #[test]
