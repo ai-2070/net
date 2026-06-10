@@ -371,7 +371,31 @@ struct RpcResponseJob {
     call_id: u64,
     target_hint: Option<u64>,
     reply_channel: ChannelName,
+    /// PERF_AUDIT §3.10 — cached
+    /// `ChannelId::new(reply_channel).hash()`, populated by the
+    /// emit closure's `reply_channel_cache` lookup. Pre-fix the
+    /// drainer re-ran xxh3 over the channel name per response;
+    /// the same `OriginKeyedLru` now caches the triple so a
+    /// cache hit is one Arc bump + two `u64` copies.
+    reply_channel_hash: ChannelHash,
+    /// PERF_AUDIT §3.10 — cached
+    /// `MeshNode::publish_stream_id(&reply_channel_id)`.
+    reply_stream_id: u64,
     payload: Bytes,
+}
+
+/// Cached triple `(ChannelName, ChannelHash, stream_id)` for the
+/// per-caller reply channel. Stored in the per-`serve_rpc`
+/// `OriginKeyedLru` so each subsequent response to the same
+/// caller is one Arc bump on the name + two `u64` copies — no
+/// xxh3, no `publish_stream_id`.
+///
+/// Per PERF_AUDIT §3.10.
+#[derive(Clone)]
+struct CachedReplyChannel {
+    name: ChannelName,
+    hash: ChannelHash,
+    stream_id: u64,
 }
 
 // ============================================================================
@@ -391,6 +415,15 @@ pub struct RpcStream {
     mesh: Arc<MeshNode>,
     target_node_id: u64,
     request_channel: ChannelName,
+    /// Cached `ChannelId::new(request_channel).hash()`. Pre-fix
+    /// `spawn_grant_publish` re-ran xxh3 over the channel name on
+    /// every auto/explicit grant — per PERF_AUDIT §3.10 the value
+    /// is invariant for the stream's lifetime, so we cache it once
+    /// at construction.
+    request_channel_hash: ChannelHash,
+    /// Cached `MeshNode::publish_stream_id(&request_channel_id)`.
+    /// Same reasoning as `request_channel_hash`.
+    request_stream_id: u64,
     self_origin: u64,
     call_id: u64,
     inner: tokio::sync::mpsc::UnboundedReceiver<StreamItem>,
@@ -458,7 +491,8 @@ impl RpcStream {
         spawn_grant_publish(
             Arc::clone(&self.mesh),
             self.target_node_id,
-            self.request_channel.clone(),
+            self.request_channel_hash,
+            self.request_stream_id,
             self.self_origin,
             self.call_id,
             amount,
@@ -471,19 +505,22 @@ impl RpcStream {
 /// [`RpcStream::poll_next`]. Same direct-unicast publish path as
 /// [`spawn_cancel_publish`], just with a different dispatch byte
 /// + a 4-byte u32 payload.
+///
+/// PERF_AUDIT §3.10 — takes `request_channel_hash` and
+/// `request_stream_id` as pre-computed inputs (cached on
+/// `RpcStream`) so the per-chunk grant path doesn't re-run
+/// `ChannelId::new` + xxh3 on every call.
 fn spawn_grant_publish(
     mesh: Arc<MeshNode>,
     target: u64,
-    request_channel: ChannelName,
+    request_channel_hash: ChannelHash,
+    request_stream_id: u64,
     self_origin: u64,
     call_id: u64,
     amount: u32,
 ) {
     tokio::spawn(async move {
         let meta = EventMeta::new(DISPATCH_RPC_STREAM_GRANT, 0, self_origin, call_id, 0);
-        let request_channel_id = ChannelId::new(request_channel);
-        let request_channel_hash = request_channel_id.hash();
-        let stream_id = MeshNode::publish_stream_id(&request_channel_id);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + 4);
         buf.extend_from_slice(&meta.to_bytes());
         buf.extend_from_slice(&encode_stream_grant(amount));
@@ -492,7 +529,7 @@ fn spawn_grant_publish(
             .publish_to_peer(
                 target,
                 request_channel_hash,
-                stream_id,
+                request_stream_id,
                 /* reliable */ true,
                 std::slice::from_ref(&payload),
             )
@@ -535,7 +572,8 @@ impl futures::Stream for RpcStream {
                         spawn_grant_publish(
                             Arc::clone(&self.mesh),
                             self.target_node_id,
-                            self.request_channel.clone(),
+                            self.request_channel_hash,
+                            self.request_stream_id,
                             self.self_origin,
                             self.call_id,
                             amount,
@@ -596,10 +634,15 @@ impl Drop for RpcStream {
 /// Shared REQUEST_CHUNK-publish helper. Builds the wire frame and
 /// fires through `publish_to_peer` direct-unicast (same routing
 /// pattern as the initial REQUEST — caller knows the target).
+/// PERF_AUDIT §3.10 — accepts pre-computed
+/// `request_channel_hash` and `request_stream_id` (cached on
+/// `ClientStreamCallRaw`) so the per-chunk client-stream send path
+/// doesn't re-run `ChannelId::new` + xxh3 on every chunk.
 async fn publish_request_chunk(
     mesh: &Arc<MeshNode>,
     target: u64,
-    request_channel: &ChannelName,
+    request_channel_hash: ChannelHash,
+    request_stream_id: u64,
     self_origin: u64,
     chunk: &RpcRequestChunkPayload,
 ) -> Result<(), RpcError> {
@@ -607,14 +650,11 @@ async fn publish_request_chunk(
     let mut buf = Vec::with_capacity(EVENT_META_SIZE + chunk.encoded_len());
     buf.extend_from_slice(&meta.to_bytes());
     chunk.encode_into(&mut buf);
-    let request_channel_id = ChannelId::new(request_channel.clone());
-    let request_channel_hash = request_channel_id.hash();
-    let stream_id = MeshNode::publish_stream_id(&request_channel_id);
     let payload = Bytes::from(buf);
     mesh.publish_to_peer(
         target,
         request_channel_hash,
-        stream_id,
+        request_stream_id,
         /* reliable */ true,
         std::slice::from_ref(&payload),
     )
@@ -674,6 +714,12 @@ pub struct ClientStreamCallRaw {
     mesh: Arc<MeshNode>,
     target_node_id: u64,
     request_channel: ChannelName,
+    /// PERF_AUDIT §3.10 — cached `ChannelId::new(request_channel).hash()`
+    /// so per-chunk REQUEST_CHUNK publishes don't re-run xxh3.
+    request_channel_hash: ChannelHash,
+    /// PERF_AUDIT §3.10 — cached
+    /// `MeshNode::publish_stream_id(&request_channel_id)`.
+    request_stream_id: u64,
     self_origin: u64,
     call_id: u64,
     service: String,
@@ -775,7 +821,8 @@ impl ClientStreamCallRaw {
                 publish_request_chunk(
                     &self.mesh,
                     self.target_node_id,
-                    &self.request_channel,
+                    self.request_channel_hash,
+                    self.request_stream_id,
                     self.self_origin,
                     &chunk,
                 )
@@ -817,7 +864,8 @@ impl ClientStreamCallRaw {
                 publish_request_chunk(
                     &self.mesh,
                     self.target_node_id,
-                    &self.request_channel,
+                    self.request_channel_hash,
+                    self.request_stream_id,
                     self.self_origin,
                     &chunk,
                 )
@@ -901,15 +949,14 @@ impl ClientStreamCallRaw {
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + req.encoded_len());
         buf.extend_from_slice(&meta.to_bytes());
         req.encode_into(&mut buf);
-        let request_channel_id = ChannelId::new(self.request_channel.clone());
-        let request_channel_hash = request_channel_id.hash();
-        let stream_id = MeshNode::publish_stream_id(&request_channel_id);
         let payload = Bytes::from(buf);
+        // PERF_AUDIT §3.10 — use the cached hash + stream_id from
+        // construction; no per-publish `ChannelId::new` + xxh3.
         self.mesh
             .publish_to_peer(
                 self.target_node_id,
-                request_channel_hash,
-                stream_id,
+                self.request_channel_hash,
+                self.request_stream_id,
                 /* reliable */ true,
                 std::slice::from_ref(&payload),
             )
@@ -962,6 +1009,11 @@ struct DuplexInner {
     mesh: Arc<MeshNode>,
     target_node_id: u64,
     request_channel: ChannelName,
+    /// PERF_AUDIT §3.10 — cached channel-id hash + stream id so
+    /// per-chunk publishes from the upload side don't re-run
+    /// `ChannelId::new` + xxh3.
+    request_channel_hash: ChannelHash,
+    request_stream_id: u64,
     self_origin: u64,
     call_id: u64,
     /// Whether the initial REQUEST was successfully published.
@@ -1071,7 +1123,8 @@ impl DuplexSink {
                 publish_request_chunk(
                     &self.inner.mesh,
                     self.inner.target_node_id,
-                    &self.inner.request_channel,
+                    self.inner.request_channel_hash,
+                    self.inner.request_stream_id,
                     self.inner.self_origin,
                     &chunk,
                 )
@@ -1108,7 +1161,8 @@ impl DuplexSink {
                 publish_request_chunk(
                     &self.inner.mesh,
                     self.inner.target_node_id,
-                    &self.inner.request_channel,
+                    self.inner.request_channel_hash,
+                    self.inner.request_stream_id,
                     self.inner.self_origin,
                     &chunk,
                 )
@@ -1147,16 +1201,15 @@ impl DuplexSink {
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + req.encoded_len());
         buf.extend_from_slice(&meta.to_bytes());
         req.encode_into(&mut buf);
-        let request_channel_id = ChannelId::new(self.inner.request_channel.clone());
-        let request_channel_hash = request_channel_id.hash();
-        let stream_id = MeshNode::publish_stream_id(&request_channel_id);
         let payload = Bytes::from(buf);
+        // PERF_AUDIT §3.10 — cached hash + stream_id from the
+        // inner `ClientStreamCallRaw`.
         self.inner
             .mesh
             .publish_to_peer(
                 self.inner.target_node_id,
-                request_channel_hash,
-                stream_id,
+                self.inner.request_channel_hash,
+                self.inner.request_stream_id,
                 /* reliable */ true,
                 std::slice::from_ref(&payload),
             )
@@ -1652,23 +1705,27 @@ impl<V: Clone> OriginKeyedLru<V> {
 /// like a test harness where the caller never announces and the
 /// bridge cache is empty — fall back to [`MeshNode::publish`] via
 /// the roster, matching the pre-T1.2 behavior verbatim.
+/// PERF_AUDIT §3.10 — accepts pre-computed
+/// `reply_channel_hash` and `reply_stream_id` so the per-response
+/// path doesn't re-run `ChannelId::new` + xxh3 + `publish_stream_id`
+/// on every send. The emit closure's `OriginKeyedLru<CachedReplyChannel>`
+/// caches the triple per caller_origin.
 async fn publish_response_to_caller(
     mesh: &MeshNode,
     caller_origin: u64,
     target_hint: Option<u64>,
     reply_channel: &ChannelName,
+    reply_channel_hash: ChannelHash,
+    reply_stream_id: u64,
     payload: Bytes,
 ) -> Result<(), AdapterError> {
     let resolved = target_hint.or_else(|| mesh.get_node_by_origin_hash(caller_origin));
     if let Some(target_node_id) = resolved {
-        let channel_id = ChannelId::new(reply_channel.clone());
-        let channel_hash = channel_id.hash();
-        let stream_id = MeshNode::publish_stream_id(&channel_id);
         return mesh
             .publish_to_peer(
                 target_node_id,
-                channel_hash,
-                stream_id,
+                reply_channel_hash,
+                reply_stream_id,
                 /* reliable */ true,
                 std::slice::from_ref(&payload),
             )
@@ -1897,7 +1954,11 @@ impl MeshNode {
         // bounded the same way as `origin_node_cache` above — an
         // `OriginKeyedLru`, not an unbounded map, so a crafted-origin flood
         // can't amplify server memory (a miss just rebuilds the name).
-        let reply_channel_cache: Arc<OriginKeyedLru<ChannelName>> = Arc::new(OriginKeyedLru::new());
+        // PERF_AUDIT §3.10 — cache the triple (name, hash, stream_id)
+        // per caller_origin so the per-response drainer doesn't
+        // recompute xxh3 + publish_stream_id on every send.
+        let reply_channel_cache: Arc<OriginKeyedLru<CachedReplyChannel>> =
+            Arc::new(OriginKeyedLru::new());
         // §8a response drainer channel. Bounded like the inbound channel; a
         // full channel means the drainer can't keep up, so we drop (the
         // caller times out) rather than block the fold.
@@ -1906,14 +1967,22 @@ impl MeshNode {
             let target_hint = origin_node_cache_for_emit.get(caller_origin);
             // Resolve the reply channel from cache (Arc bump on hit; one
             // `format!` + `ChannelName::new` the first time we see a caller).
-            let reply_channel = match reply_channel_cache.get(caller_origin) {
+            let cached = match reply_channel_cache.get(caller_origin) {
                 Some(c) => c,
                 None => {
                     let name = format!("{service_for_emit}.replies.{caller_origin:016x}");
                     match ChannelName::new(&name) {
-                        Ok(c) => {
-                            reply_channel_cache.insert(caller_origin, c.clone());
-                            c
+                        Ok(channel_name) => {
+                            // Compute hash + stream_id ONCE per caller_origin
+                            // and stash them alongside the name.
+                            let channel_id = ChannelId::new(channel_name.clone());
+                            let triple = CachedReplyChannel {
+                                hash: channel_id.hash(),
+                                stream_id: MeshNode::publish_stream_id(&channel_id),
+                                name: channel_name,
+                            };
+                            reply_channel_cache.insert(caller_origin, triple.clone());
+                            triple
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, channel = %name,
@@ -1941,7 +2010,9 @@ impl MeshNode {
                     caller_origin,
                     call_id,
                     target_hint,
-                    reply_channel,
+                    reply_channel: cached.name,
+                    reply_channel_hash: cached.hash,
+                    reply_stream_id: cached.stream_id,
                     payload: Bytes::from(buf),
                 })
                 .is_err()
@@ -2107,6 +2178,8 @@ impl MeshNode {
                     job.caller_origin,
                     job.target_hint,
                     &job.reply_channel,
+                    job.reply_channel_hash,
+                    job.reply_stream_id,
                     job.payload,
                 )
                 .await
@@ -2204,11 +2277,22 @@ impl MeshNode {
                 let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
                 buf.extend_from_slice(&meta.to_bytes());
                 resp.encode_into(&mut buf);
+                // PERF_AUDIT §3.10: compute hash + stream_id at the
+                // call site. These legacy streaming paths don't yet
+                // cache the triple via `OriginKeyedLru<CachedReplyChannel>`;
+                // wiring them up is a follow-up — for now the
+                // compute happens here per response, same as the
+                // pre-fix in-function shape.
+                let reply_channel_id = ChannelId::new(reply_channel.clone());
+                let reply_channel_hash = reply_channel_id.hash();
+                let reply_stream_id = MeshNode::publish_stream_id(&reply_channel_id);
                 if let Err(e) = publish_response_to_caller(
                     &mesh,
                     caller_origin,
                     target_hint,
                     &reply_channel,
+                    reply_channel_hash,
+                    reply_stream_id,
                     Bytes::from(buf),
                 )
                 .await
@@ -2325,11 +2409,22 @@ impl MeshNode {
                 let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
                 buf.extend_from_slice(&meta.to_bytes());
                 resp.encode_into(&mut buf);
+                // PERF_AUDIT §3.10: compute hash + stream_id at the
+                // call site. These legacy streaming paths don't yet
+                // cache the triple via `OriginKeyedLru<CachedReplyChannel>`;
+                // wiring them up is a follow-up — for now the
+                // compute happens here per response, same as the
+                // pre-fix in-function shape.
+                let reply_channel_id = ChannelId::new(reply_channel.clone());
+                let reply_channel_hash = reply_channel_id.hash();
+                let reply_stream_id = MeshNode::publish_stream_id(&reply_channel_id);
                 if let Err(e) = publish_response_to_caller(
                     &mesh,
                     caller_origin,
                     target_hint,
                     &reply_channel,
+                    reply_channel_hash,
+                    reply_stream_id,
                     Bytes::from(buf),
                 )
                 .await
@@ -2487,6 +2582,8 @@ impl MeshNode {
             mesh: Arc::clone(self),
             target_node_id,
             request_channel: route.request_channel.clone(),
+            request_channel_hash: route.request_channel_hash,
+            request_stream_id: route.request_stream_id,
             self_origin,
             call_id,
             service: service.to_string(),
@@ -2564,11 +2661,22 @@ impl MeshNode {
                 let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
                 buf.extend_from_slice(&meta.to_bytes());
                 resp.encode_into(&mut buf);
+                // PERF_AUDIT §3.10: compute hash + stream_id at the
+                // call site. These legacy streaming paths don't yet
+                // cache the triple via `OriginKeyedLru<CachedReplyChannel>`;
+                // wiring them up is a follow-up — for now the
+                // compute happens here per response, same as the
+                // pre-fix in-function shape.
+                let reply_channel_id = ChannelId::new(reply_channel.clone());
+                let reply_channel_hash = reply_channel_id.hash();
+                let reply_stream_id = MeshNode::publish_stream_id(&reply_channel_id);
                 if let Err(e) = publish_response_to_caller(
                     &mesh,
                     caller_origin,
                     target_hint,
                     &reply_channel,
+                    reply_channel_hash,
+                    reply_stream_id,
                     Bytes::from(buf),
                 )
                 .await
@@ -2721,6 +2829,8 @@ impl MeshNode {
             mesh: Arc::clone(self),
             target_node_id,
             request_channel: route.request_channel.clone(),
+            request_channel_hash: route.request_channel_hash,
+            request_stream_id: route.request_stream_id,
             self_origin,
             call_id,
             initial_sent: std::sync::atomic::AtomicBool::new(false),
@@ -2855,6 +2965,11 @@ impl MeshNode {
             mesh: Arc::clone(self),
             target_node_id,
             request_channel: route.request_channel.clone(),
+            // PERF_AUDIT §3.10 — cache the channel hash + stream
+            // id from `route` so per-chunk grants in `poll_next`
+            // don't re-run `ChannelId::new` + xxh3.
+            request_channel_hash: route.request_channel_hash,
+            request_stream_id: route.request_stream_id,
             self_origin,
             call_id,
             inner: rx,
@@ -3165,7 +3280,7 @@ impl MeshNode {
         target_node_id: u64,
         service: &str,
         payload: Bytes,
-        opts: CallOptions,
+        mut opts: CallOptions,
     ) -> Result<RpcReply, RpcError> {
         // `started_total` brackets the entire call for the
         // `RpcObserver` latency field; the substrate-internal
@@ -3249,7 +3364,13 @@ impl MeshNode {
         // so name collisions resolve to caller-overrides via the
         // server-side `predicate_from_rpc_headers` first-match
         // semantics.
-        headers.extend(opts.request_headers.iter().cloned());
+        // PERF_AUDIT §3.11 — `opts` is owned by this function and
+        // its `request_headers` are unused after this point;
+        // `Vec::append(&mut other)` drains `other` into `headers`
+        // with zero allocation, vs the pre-fix
+        // `.iter().cloned()` which deep-cloned each
+        // `(String, Vec<u8>)` pair into a fresh entry.
+        headers.append(&mut opts.request_headers);
         let req = RpcRequestPayload {
             service: service.to_string(),
             deadline_ns: opts.deadline.map(instant_to_unix_nanos).unwrap_or(0),
