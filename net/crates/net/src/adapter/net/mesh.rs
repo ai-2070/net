@@ -3735,10 +3735,31 @@ impl MeshNode {
                     }
                     let mut fwd_header = routing_header;
                     fwd_header.forward();
-                    let mut new_data = bytes::BytesMut::with_capacity(data.len());
-                    new_data.extend_from_slice(&fwd_header.to_bytes());
-                    new_data.extend_from_slice(&data[ROUTING_HEADER_SIZE..]);
-                    let forwarded = new_data.freeze();
+                    // Fast path (PERF_AUDIT §2.5 — port of perf #18
+                    // already in router.rs:728): when the inbound
+                    // `data` is sole-owned (the typical case for UDP
+                    // packets just received from the socket), patch
+                    // the routing header bytes in place. Refcount
+                    // bump only — no fresh allocation, no body
+                    // memcpy. Pre-fix this allocated a fresh
+                    // BytesMut the size of the entire packet and
+                    // memcpy'd the whole body (~8 KB) per forward;
+                    // for a relay node moving high pps, this was
+                    // bandwidth-class waste. Slow path stays the
+                    // pre-fix allocation strategy for the rare case
+                    // where someone holds an outstanding clone.
+                    let forwarded = match data.try_into_mut() {
+                        Ok(mut mut_data) => {
+                            fwd_header.write_at(&mut mut_data[..ROUTING_HEADER_SIZE]);
+                            mut_data.freeze()
+                        }
+                        Err(orig_data) => {
+                            let mut new_data = bytes::BytesMut::with_capacity(orig_data.len());
+                            new_data.extend_from_slice(&fwd_header.to_bytes());
+                            new_data.extend_from_slice(&orig_data[ROUTING_HEADER_SIZE..]);
+                            new_data.freeze()
+                        }
+                    };
                     let socket = ctx.socket.clone();
                     tokio::spawn(async move {
                         let _ = socket.send_to(&forwarded, next_hop).await;
