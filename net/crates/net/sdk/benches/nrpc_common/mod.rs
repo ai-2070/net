@@ -73,6 +73,30 @@ pub fn payload(n: usize) -> String {
     "A".repeat(n)
 }
 
+/// Hard ceiling on how long a single `call_*_retrying` will spin on
+/// transport backpressure before giving up. The retry loop yields on
+/// `RpcError::Transport(_)` so other in-flight callers can flush; under a
+/// *sustainable* offered load the queue drains in well under a second.
+/// Without a ceiling, an offered concurrency the transport CANNOT sustain
+/// (e.g. c128 here) makes the call spin forever — the bar never converges
+/// and Criterion runs it for minutes (long enough to trip unrelated TTLs).
+/// 20 s converts that livelock into a fast, clearly-labeled failure.
+const RETRY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Yield on transport backpressure, but panic once [`RETRY_DEADLINE`] has
+/// elapsed since `deadline_base` — so a saturated bar fails fast and
+/// legibly instead of livelocking. `ctx` names the call site.
+async fn backpressure_yield(deadline_base: std::time::Instant, ctx: &str) {
+    if deadline_base.elapsed() >= RETRY_DEADLINE {
+        panic!(
+            "{ctx}: transport saturated — no progress within {RETRY_DEADLINE:?} of \
+             backpressure retries. The offered concurrency exceeds what this transport \
+             sustains on this host; this bar is not measurable here (don't chase it)."
+        );
+    }
+    tokio::task::yield_now().await;
+}
+
 // ============================================================================
 // Pair — two `Mesh` nodes in one process, fully handshaken,
 // every echo service pre-registered, discovery primed.
@@ -381,6 +405,7 @@ pub async fn call_json_direct(pair: &Pair, req: &EchoReq) -> EchoResp {
 /// saturation behavior rather than masking it as a panic.
 pub async fn call_json_direct_retrying(pair: &Pair, req: &EchoReq) -> EchoResp {
     use net_sdk::mesh_rpc::RpcError;
+    let deadline_base = std::time::Instant::now();
     loop {
         match pair
             .caller
@@ -394,7 +419,7 @@ pub async fn call_json_direct_retrying(pair: &Pair, req: &EchoReq) -> EchoResp {
         {
             Ok(resp) => return resp,
             Err(RpcError::Transport(_)) => {
-                tokio::task::yield_now().await;
+                backpressure_yield(deadline_base, "call_json_direct_retrying").await;
             }
             Err(e) => panic!("call json direct (retrying): {e}"),
         }
@@ -410,6 +435,7 @@ pub async fn call_json_direct_retrying(pair: &Pair, req: &EchoReq) -> EchoResp {
 pub async fn call_json_shard_retrying(pair: &Pair, req: &EchoReq, shard: usize) -> EchoResp {
     use net_sdk::mesh_rpc::RpcError;
     let svc = &pair.shard_services[shard % pair.shard_services.len()];
+    let deadline_base = std::time::Instant::now();
     loop {
         match pair
             .caller
@@ -418,7 +444,7 @@ pub async fn call_json_shard_retrying(pair: &Pair, req: &EchoReq, shard: usize) 
         {
             Ok(resp) => return resp,
             Err(RpcError::Transport(_)) => {
-                tokio::task::yield_now().await;
+                backpressure_yield(deadline_base, "call_json_shard_retrying").await;
             }
             Err(e) => panic!("call json shard (retrying): {e}"),
         }
@@ -461,6 +487,7 @@ pub async fn call_postcard_direct(pair: &Pair, req: &EchoReq) -> EchoResp {
 pub async fn call_postcard_direct_retrying(pair: &Pair, req: &EchoReq) -> EchoResp {
     use net_sdk::mesh_rpc::RpcError;
     let body = postcard::to_allocvec(req).expect("postcard encode");
+    let deadline_base = std::time::Instant::now();
     loop {
         match pair
             .caller
@@ -473,7 +500,9 @@ pub async fn call_postcard_direct_retrying(pair: &Pair, req: &EchoReq) -> EchoRe
             .await
         {
             Ok(reply) => return postcard::from_bytes(&reply.body).expect("postcard decode"),
-            Err(RpcError::Transport(_)) => tokio::task::yield_now().await,
+            Err(RpcError::Transport(_)) => {
+                backpressure_yield(deadline_base, "call_postcard_direct_retrying").await
+            }
             Err(e) => panic!("call postcard (retrying): {e}"),
         }
     }
@@ -496,6 +525,7 @@ pub async fn call_raw_direct(pair: &Pair, body: Bytes) -> Bytes {
 /// publish budget.
 pub async fn call_raw_direct_retrying(pair: &Pair, body: Bytes) -> Bytes {
     use net_sdk::mesh_rpc::RpcError;
+    let deadline_base = std::time::Instant::now();
     loop {
         match pair
             .caller
@@ -508,7 +538,9 @@ pub async fn call_raw_direct_retrying(pair: &Pair, body: Bytes) -> Bytes {
             .await
         {
             Ok(reply) => return reply.body,
-            Err(RpcError::Transport(_)) => tokio::task::yield_now().await,
+            Err(RpcError::Transport(_)) => {
+                backpressure_yield(deadline_base, "call_raw_direct_retrying").await
+            }
             Err(e) => panic!("call raw (retrying): {e}"),
         }
     }
