@@ -1,0 +1,19 @@
+net/crates/net/src/ffi/handle_guard.rs
+  s_a5c4e2705614a2::t_110cd62d7a3e83 56-61,63-64,69-70
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "7e292f7c0d8fdbb802f568500e8cd13a2bbfe7bf",
+  "prompts": {},
+  "sessions": {
+    "s_a5c4e2705614a2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dde62c09-939e-4d68-9413-cc55de446038",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
