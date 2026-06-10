@@ -294,6 +294,134 @@ pub fn synthesize_capability_set(
     caps
 }
 
+/// Default capacity for the per-fold capability-set cache. Covers
+/// typical mesh sizes; an operator-tuned `MeshNode` can override
+/// via [`CapabilitySetCache::with_capacity`].
+const CAPABILITY_SET_CACHE_DEFAULT_CAPACITY: usize = 256;
+
+/// Bounded LRU cache of synthesized `Arc<CapabilitySet>` per node,
+/// invalidated by the fold's change-generation
+/// ([`Fold::change_generation`]). Eliminates the multi-µs re-parse
+/// + re-allocate that `synthesize_capability_set` does per call on
+/// the hot paths (per-packet greedy admission at mesh.rs:5181,
+/// per-candidate `placement_score`, per-candidate `best_by_score`,
+/// per-call `may_execute` retain loops). Per
+/// PERF_AUDIT_2026_06_10_FULL_CRATE.md §4.1.
+///
+/// The generation is global to the fold — any fold change
+/// invalidates every cached entry. That's coarse but accurate:
+/// announcement rates are low relative to scoring/per-packet
+/// rates, so the cache stays warm in steady state. On a generation
+/// bump the next access re-synthesizes and re-caches under the new
+/// generation; entries for other nodes return stale results once,
+/// triggering their own re-synthesize on access.
+///
+/// Cache hits return a refcount-bumped `Arc` (~ns); misses pay the
+/// existing `synthesize_capability_set` cost plus one Arc alloc.
+pub struct CapabilitySetCache {
+    inner: parking_lot::Mutex<lru::LruCache<NodeId, CachedCapabilitySetEntry>>,
+}
+
+struct CachedCapabilitySetEntry {
+    generation: u64,
+    caps: std::sync::Arc<super::super::capability::CapabilitySet>,
+}
+
+impl CapabilitySetCache {
+    /// Construct with the default capacity (256 entries).
+    pub fn new() -> Self {
+        Self::with_capacity(CAPABILITY_SET_CACHE_DEFAULT_CAPACITY)
+    }
+
+    /// Construct with a caller-supplied capacity. `capacity == 0`
+    /// is treated as 1 to satisfy `lru::LruCache`'s NonZero
+    /// contract — the caller would have to deliberately defeat
+    /// the cache to set 0, so silently rounding up is friendlier
+    /// than panicking.
+    pub fn with_capacity(capacity: usize) -> Self {
+        let cap = std::num::NonZeroUsize::new(capacity.max(1))
+            .expect("max(1) yields >= 1, NonZeroUsize::new always succeeds");
+        Self {
+            inner: parking_lot::Mutex::new(lru::LruCache::new(cap)),
+        }
+    }
+
+    /// Return a refcount-shareable snapshot of `node_id`'s
+    /// capability set against the current fold generation. Cache
+    /// hit returns an `Arc::clone`; miss re-synthesizes via
+    /// [`synthesize_capability_set`] and stores against the
+    /// fold's current generation before returning.
+    pub fn get_or_synthesize(
+        &self,
+        fold: &Fold<CapabilityFold>,
+        node_id: NodeId,
+    ) -> std::sync::Arc<super::super::capability::CapabilitySet> {
+        let current_gen = fold.change_generation();
+        // Fast path — cache hit at the current generation.
+        {
+            let mut lru = self.inner.lock();
+            if let Some(entry) = lru.get(&node_id) {
+                if entry.generation == current_gen {
+                    return entry.caps.clone();
+                }
+            }
+        }
+        // Miss / stale. Synthesize outside the cache lock so we
+        // don't serialize callers on a long synthesize (the fold's
+        // own read lock still serializes the with_state body, but
+        // that's much cheaper).
+        let caps = std::sync::Arc::new(synthesize_capability_set(fold, node_id));
+        // Re-read the generation AFTER synthesize and store
+        // against it — captures any fold change that ran while we
+        // were synthesizing, so the cache entry is at least as
+        // fresh as our synthesized snapshot. A worse-case race
+        // just refreshes the entry on the next access.
+        let post_gen = fold.change_generation();
+        {
+            let mut lru = self.inner.lock();
+            lru.put(
+                node_id,
+                CachedCapabilitySetEntry {
+                    generation: post_gen,
+                    caps: caps.clone(),
+                },
+            );
+        }
+        caps
+    }
+
+    /// Drop every cached entry. Useful in tests; production code
+    /// relies on the change-generation invalidation.
+    pub fn clear(&self) {
+        self.inner.lock().clear();
+    }
+
+    /// Number of currently-cached entries (any generation).
+    /// Used by tests + operator metrics. Cheap; takes the lock.
+    pub fn len(&self) -> usize {
+        self.inner.lock().len()
+    }
+
+    /// True if no entries are cached.
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().is_empty()
+    }
+}
+
+impl Default for CapabilitySetCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for CapabilitySetCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapabilitySetCache")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
 /// `true` if `caller_node` is authorized to invoke `target_node`
 /// for `capability_tag`. Mirrors the legacy
 /// `CapabilityIndex::may_execute` semantics against the fold's
@@ -1255,5 +1383,105 @@ mod tests {
             find_nodes_matching_scoped(&fold, &legacy, &ScopeFilter::SameSubnet, lookup);
         nodes.sort();
         assert_eq!(nodes, vec![0xBB]);
+    }
+
+    /// PERF_AUDIT §4.1 — cache hits return the SAME `Arc` instance
+    /// across calls without re-synthesizing. Pre-fix, every call
+    /// to `synthesize_capability_set` allocated a fresh
+    /// `CapabilitySet`; with the cache, hits are refcount bumps of
+    /// one shared snapshot.
+    #[test]
+    fn capability_set_cache_returns_same_arc_on_hit() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(sign_member(&kp, 0xAB, 0x100, vec!["gpu"], None))
+            .expect("apply AB");
+
+        let cache = CapabilitySetCache::new();
+        let first = cache.get_or_synthesize(&fold, 0xAB);
+        let second = cache.get_or_synthesize(&fold, 0xAB);
+        // Arc::ptr_eq is the strict guarantee the audit asks for —
+        // hits must be refcount bumps, not fresh allocations.
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "cache hit must return the same Arc instance"
+        );
+        // And the content must reflect the fold state.
+        // Tag::Display round-trips byte-for-byte across all variants,
+        // so checking the display form is the robust shape-agnostic
+        // way to assert the published "gpu" tag landed in the cache.
+        assert!(
+            first.tags.iter().any(|t| t.to_string() == "gpu"),
+            "synthesized capability set should contain the published `gpu` tag: {:?}",
+            first.tags
+        );
+    }
+
+    /// PERF_AUDIT §4.1 — a fold mutation must invalidate the
+    /// cached entry on the next access, returning a fresh `Arc`
+    /// whose contents reflect the post-mutation state.
+    #[test]
+    fn capability_set_cache_invalidates_on_fold_change() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(sign_member(&kp, 0xCD, 0x100, vec!["gpu"], None))
+            .expect("apply CD v1");
+        let cache = CapabilitySetCache::new();
+        let v1 = cache.get_or_synthesize(&fold, 0xCD);
+        let v1_tag_count = v1.tags.len();
+
+        // Replace announcement with a richer tag set (bumps the
+        // fold's change generation via the apply path).
+        let v2_ann = SignedAnnouncement::sign(
+            &kp,
+            super::super::capability::CapabilityFold::KIND_ID,
+            0x100,
+            0xCD,
+            2,
+            EnvelopeMeta::default(),
+            CapabilityMembership {
+                class_hash: 0x100,
+                tags: vec!["gpu".into(), "cuda".into(), "fp16".into()],
+                hardware: None,
+                state: NodeState::Idle,
+                region: None,
+                price_quote: None,
+                reflex_addr: None,
+                allowed_nodes: Vec::new(),
+                allowed_subnets: Vec::new(),
+                allowed_groups: Vec::new(),
+                metadata: std::collections::BTreeMap::new(),
+            },
+        )
+        .expect("sign v2");
+        fold.apply(v2_ann).expect("apply CD v2");
+
+        let v2 = cache.get_or_synthesize(&fold, 0xCD);
+        assert!(
+            !std::sync::Arc::ptr_eq(&v1, &v2),
+            "fold change must invalidate the cached entry"
+        );
+        assert!(
+            v2.tags.len() > v1_tag_count,
+            "post-mutation cache miss must reflect the new tag set"
+        );
+    }
+
+    /// PERF_AUDIT §4.1 — unknown node (no fold entry) returns an
+    /// empty set; the cache should still populate against it so a
+    /// subsequent lookup is a refcount hit, not a no-op
+    /// re-synthesize.
+    #[test]
+    fn capability_set_cache_populates_for_unknown_node() {
+        let fold = new_fold();
+        let cache = CapabilitySetCache::new();
+        let first = cache.get_or_synthesize(&fold, 0xDEAD_BEEF);
+        assert!(first.tags.is_empty());
+        assert!(first.metadata.is_empty());
+        let second = cache.get_or_synthesize(&fold, 0xDEAD_BEEF);
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "unknown-node entries still hit the cache on repeat access"
+        );
     }
 }

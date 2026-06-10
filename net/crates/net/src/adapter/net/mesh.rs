@@ -581,6 +581,13 @@ struct DispatchCtx {
     /// `SUBPROTOCOL_CAPABILITY_ANN` packets land here via the
     /// bridge's `translate_announcement`.
     capability_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
+    /// Generation-keyed LRU cache of synthesized
+    /// `Arc<CapabilitySet>` per node. Backs the per-packet greedy
+    /// admission scope (mesh.rs `process_data_packet`) and other
+    /// callers that previously paid 3-5 µs + ~100 allocs every
+    /// time they needed a node's parsed capability set. Per
+    /// PERF_AUDIT_2026_06_10_FULL_CRATE.md §4.1.
+    capability_set_cache: Arc<super::behavior::fold::capability_bridge::CapabilitySetCache>,
     /// Dedup cache for multi-hop capability announcements, keyed by
     /// `(origin_node_id, version)`. Written by the dispatch handler
     /// before indexing + forwarding so a `(origin, version)` tuple
@@ -1727,6 +1734,12 @@ pub struct MeshNode {
     /// internal [`super::behavior::fold::FoldRegistry`] (installed
     /// as the [`Self::fold_router`] router by default).
     capability_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
+    /// Per PERF_AUDIT §4.1: generation-keyed snapshot of synthesized
+    /// `Arc<CapabilitySet>` per node, shared with `DispatchCtx` so
+    /// the per-packet greedy admission path (and other hot callers)
+    /// don't re-parse + re-allocate the full capability set every
+    /// call.
+    capability_set_cache: Arc<super::behavior::fold::capability_bridge::CapabilitySetCache>,
     /// Reservation fold, mirroring [`Self::capability_fold`]
     /// at the per-resource granularity. Always allocated so the
     /// aggregator's reservation summarizer + future
@@ -2125,6 +2138,12 @@ impl MeshNode {
         let capability_fold: Arc<
             super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>,
         > = Arc::new(super::behavior::fold::Fold::new());
+        // Per PERF_AUDIT §4.1: generation-keyed LRU snapshot of the
+        // parsed capability set per node. Sized for typical mesh
+        // sizes; tunable later if operator load demands it.
+        let capability_set_cache = Arc::new(
+            super::behavior::fold::capability_bridge::CapabilitySetCache::new(),
+        );
         let reservation_fold: Arc<
             super::behavior::fold::Fold<super::behavior::fold::ReservationFold>,
         > = Arc::new(super::behavior::fold::Fold::new());
@@ -2311,6 +2330,7 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             traversal_stats: Arc::new(super::traversal::TraversalStats::new()),
             capability_fold,
+            capability_set_cache,
             reservation_fold,
             seen_announcements: Arc::new(DashMap::new()),
             last_announce_at: Arc::new(parking_lot::Mutex::new(None)),
@@ -3372,6 +3392,7 @@ impl MeshNode {
             traversal_config: self.traversal_config.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
             capability_fold: self.capability_fold.clone(),
+            capability_set_cache: self.capability_set_cache.clone(),
             seen_announcements: self.seen_announcements.clone(),
             require_signed_capabilities: self.config.require_signed_capabilities,
             local_subnet: self.local_subnet,
@@ -5177,14 +5198,19 @@ impl MeshNode {
         > = if greedy.is_some() {
             let origin_hash: u64 = parsed.header.origin_hash;
             let publisher_node = ctx.origin_hash_to_node.get(&origin_hash).map(|v| *v);
-            let caps = match publisher_node {
-                Some(nid) => super::behavior::fold::capability_bridge::synthesize_capability_set(
-                    &ctx.capability_fold,
-                    nid,
+            // Per PERF_AUDIT §4.1: route through the generation-keyed
+            // cache instead of re-synthesizing per packet. A 30-tag
+            // capability set parses to ~3-5 µs + ~100 allocs per
+            // synthesize; a cache hit returns an Arc::clone (~ns).
+            // The cache is generation-invalidated by the fold's
+            // change_tx, so an inbound `SUBPROTOCOL_CAPABILITY_ANN`
+            // bumps it correctly.
+            Some(match publisher_node {
+                Some(nid) => ctx.capability_set_cache.get_or_synthesize(&ctx.capability_fold, nid),
+                None => std::sync::Arc::new(
+                    crate::adapter::net::behavior::capability::CapabilitySet::new(),
                 ),
-                None => crate::adapter::net::behavior::capability::CapabilitySet::new(),
-            };
-            Some(std::sync::Arc::new(caps))
+            })
         } else {
             None
         };

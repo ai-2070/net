@@ -318,6 +318,16 @@ impl<K: FoldKind> Fold<K> {
         self.change_tx.subscribe()
     }
 
+    /// Read the current change-generation without subscribing.
+    /// Hot caches (e.g. `CapabilitySetCache`) check this against
+    /// their stored generation to detect staleness; cheaper than
+    /// `subscribe_changes().borrow()` because it skips minting a
+    /// receiver. Per PERF_AUDIT §4.1.
+    #[inline]
+    pub fn change_generation(&self) -> u64 {
+        *self.change_tx.borrow()
+    }
+
     /// Apply a verified signed announcement to the fold.
     ///
     /// Rejects the wire-format `generation == 0` sentinel, then
