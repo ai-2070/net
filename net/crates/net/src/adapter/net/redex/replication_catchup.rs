@@ -305,9 +305,15 @@ pub fn handle_sync_request(
         // diverged from the surrounding pattern; future reviewers
         // copying the loop body would carry the unguarded version.
         acc = acc.saturating_add(cost);
+        // `ev.payload` is a refcount-shareable Bytes from the heap
+        // segment. Pre-fix this did `to_vec()` (full memcpy +
+        // alloc) which `SyncResponse::to_bytes` then copied again
+        // into the wire frame — two unnecessary copies on the
+        // leader send path. With `SyncEvent.payload: Bytes` this
+        // becomes a refcount bump. Per §5.4.
         out.push(SyncEvent {
             event_seq: ev.entry.seq,
-            payload: ev.payload.to_vec(),
+            payload: ev.payload.clone(),
         });
     }
 
@@ -414,13 +420,12 @@ pub fn apply_sync_response(
             divergence_suspected,
         });
     }
-    // Apply via append_batch. We hand each payload as a `Bytes`
-    // (cheap clone-of-`Vec<u8>`) so we don't double-copy.
-    let payloads: Vec<Bytes> = response
-        .events
-        .iter()
-        .map(|e| Bytes::from(e.payload.clone()))
-        .collect();
+    // Apply via append_batch. Each payload is already a Bytes
+    // (Vec<u8> → Bytes was the §5.2 fix); cloning is now a true
+    // refcount bump rather than the alloc + memcpy that
+    // `Bytes::from(e.payload.clone())` produced when payload was
+    // a Vec<u8>. Per PERF_AUDIT §5.2.
+    let payloads: Vec<Bytes> = response.events.iter().map(|e| e.payload.clone()).collect();
     let appended = payloads.len() as u64;
     file.append_batch(&payloads)
         .map_err(|e| ApplyError::AppendFailed(format!("{e:?}")))?;
@@ -560,7 +565,7 @@ mod tests {
         assert_eq!(resp.first_seq, 0);
         assert_eq!(resp.events[0].event_seq, 0);
         assert_eq!(resp.events[4].event_seq, 4);
-        assert_eq!(resp.events[0].payload, b"evt-0");
+        assert_eq!(resp.events[0].payload.as_ref(), b"evt-0");
     }
 
     #[test]
@@ -804,7 +809,7 @@ mod tests {
             let events: Vec<SyncEvent> = (0..chunk_size)
                 .map(|i| SyncEvent {
                     event_seq: 4 + i as u64,
-                    payload: format!("e-{i}").into_bytes(),
+                    payload: bytes::Bytes::from(format!("e-{i}").into_bytes()),
                 })
                 .collect();
             let response = SyncResponse {
@@ -839,15 +844,15 @@ mod tests {
             events: vec![
                 SyncEvent {
                     event_seq: 0,
-                    payload: b"first".to_vec(),
+                    payload: bytes::Bytes::from_static(b"first"),
                 },
                 SyncEvent {
                     event_seq: 1,
-                    payload: b"second".to_vec(),
+                    payload: bytes::Bytes::from_static(b"second"),
                 },
                 SyncEvent {
                     event_seq: 2,
-                    payload: b"third".to_vec(),
+                    payload: bytes::Bytes::from_static(b"third"),
                 },
             ],
             request_id: 0,
@@ -884,7 +889,7 @@ mod tests {
             leader_first_retained_seq: 0,
             events: vec![SyncEvent {
                 event_seq: 0,
-                payload: b"x".to_vec(),
+                payload: bytes::Bytes::from_static(b"x"),
             }],
             request_id: 0,
         };
@@ -902,7 +907,7 @@ mod tests {
             leader_first_retained_seq: 0,
             events: vec![SyncEvent {
                 event_seq: 5, // declared 0 but actually 5
-                payload: b"x".to_vec(),
+                payload: bytes::Bytes::from_static(b"x"),
             }],
             request_id: 0,
         };
@@ -921,15 +926,15 @@ mod tests {
             events: vec![
                 SyncEvent {
                     event_seq: 0,
-                    payload: b"a".to_vec(),
+                    payload: bytes::Bytes::from_static(b"a"),
                 },
                 SyncEvent {
                     event_seq: 1,
-                    payload: b"b".to_vec(),
+                    payload: bytes::Bytes::from_static(b"b"),
                 },
                 SyncEvent {
                     event_seq: 3, // gap! should be 2
-                    payload: b"c".to_vec(),
+                    payload: bytes::Bytes::from_static(b"c"),
                 },
             ],
             request_id: 0,
@@ -957,14 +962,14 @@ mod tests {
             events: vec![
                 SyncEvent {
                     event_seq: u64::MAX,
-                    payload: b"last".to_vec(),
+                    payload: bytes::Bytes::from_static(b"last"),
                 },
                 // Whatever this seq is, `prev + 1` overflows so
                 // the loop must report NonMonotonic at index 1
                 // rather than panic.
                 SyncEvent {
                     event_seq: 0,
-                    payload: b"wraparound".to_vec(),
+                    payload: bytes::Bytes::from_static(b"wraparound"),
                 },
             ],
             request_id: 0,
@@ -987,11 +992,11 @@ mod tests {
             events: vec![
                 SyncEvent {
                     event_seq: 0,
-                    payload: b"a".to_vec(),
+                    payload: bytes::Bytes::from_static(b"a"),
                 },
                 SyncEvent {
                     event_seq: 0, // duplicate
-                    payload: b"a-dup".to_vec(),
+                    payload: bytes::Bytes::from_static(b"a-dup"),
                 },
             ],
             request_id: 0,
@@ -1012,7 +1017,7 @@ mod tests {
             leader_first_retained_seq: 0,
             events: vec![SyncEvent {
                 event_seq: 2,
-                payload: b"stale".to_vec(),
+                payload: bytes::Bytes::from_static(b"stale"),
             }],
             request_id: 0,
         };
@@ -1041,7 +1046,7 @@ mod tests {
             leader_first_retained_seq: 0,
             events: vec![SyncEvent {
                 event_seq: 5,
-                payload: b"future".to_vec(),
+                payload: bytes::Bytes::from_static(b"future"),
             }],
             request_id: 0,
         };
@@ -1082,7 +1087,7 @@ mod tests {
             leader_first_retained_seq: 5,
             events: vec![SyncEvent {
                 event_seq: 5,
-                payload: b"future".to_vec(),
+                payload: bytes::Bytes::from_static(b"future"),
             }],
             request_id: 0,
         };
@@ -1138,7 +1143,7 @@ mod tests {
             leader_first_retained_seq: 3,
             events: vec![SyncEvent {
                 event_seq: 5,
-                payload: b"future".to_vec(),
+                payload: bytes::Bytes::from_static(b"future"),
             }],
             request_id: 0,
         };
@@ -1270,11 +1275,11 @@ mod tests {
             events: vec![
                 SyncEvent {
                     event_seq: 10,
-                    payload: vec![b'A'],
+                    payload: bytes::Bytes::from_static(b"A"),
                 },
                 SyncEvent {
                     event_seq: 11,
-                    payload: vec![b'B'],
+                    payload: bytes::Bytes::from_static(b"B"),
                 },
             ],
             request_id: 0,

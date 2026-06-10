@@ -195,12 +195,21 @@ impl SyncNackError {
 /// One event record inside a [`SyncResponse`] chunk. `event_seq`
 /// values are strictly increasing across a chunk; gaps within a chunk
 /// are not permitted (gaps come as explicit skip-ahead in Phase D).
+///
+/// `payload` is a [`bytes::Bytes`] so the leader can carry a refcount
+/// slice of the heap-segment zero-copy through `to_bytes`, and the
+/// replica can pass it into `append_batch` without re-allocating.
+/// Pre-fix (`payload: Vec<u8>`) the leader copied each payload twice
+/// (segment→Vec at `handle_sync_request`, Vec→wire at `to_bytes`) and
+/// the replica copied once more (`Bytes::from(payload.clone())` in
+/// `apply_sync_response`, which is a Vec clone + alloc, NOT a
+/// refcount bump). Per PERF_AUDIT_2026_06_10_FULL_CRATE.md §5.2/§5.4.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncEvent {
     /// Monotonic sequence number assigned by the channel's leader.
     pub event_seq: u64,
     /// Opaque event body bytes — the layer-7 payload.
-    pub payload: Vec<u8>,
+    pub payload: bytes::Bytes,
 }
 
 /// Replica → leader: pull request for events
@@ -557,7 +566,15 @@ impl SyncResponse {
                     have: data.len(),
                 });
             }
-            let event_payload = cursor[..payload_len].to_vec();
+            // Wire input is borrowed — there's no zero-copy slice
+            // we could hand out without keeping `data` alive across
+            // the return. Materialize once into a `Bytes` so the
+            // downstream apply path (`apply_sync_response` →
+            // `append_batch`) gets refcount semantics from here
+            // forward. Per §5.2 — the wire→Bytes alloc is the one
+            // unavoidable copy on the replica receive path; the
+            // rest of the apply pipeline is now refcount-clones.
+            let event_payload = bytes::Bytes::copy_from_slice(&cursor[..payload_len]);
             cursor.advance(payload_len);
             events.push(SyncEvent {
                 event_seq,
@@ -895,15 +912,15 @@ mod tests {
             events: vec![
                 SyncEvent {
                     event_seq: 100,
-                    payload: b"hello".to_vec(),
+                    payload: bytes::Bytes::from_static(b"hello"),
                 },
                 SyncEvent {
                     event_seq: 101,
-                    payload: b"world".to_vec(),
+                    payload: bytes::Bytes::from_static(b"world"),
                 },
                 SyncEvent {
                     event_seq: 102,
-                    payload: vec![], // empty payload — explicitly representable
+                    payload: bytes::Bytes::new(), // empty payload — explicitly representable
                 },
             ],
             request_id: 123,
@@ -946,7 +963,7 @@ mod tests {
             leader_first_retained_seq: 0,
             events: vec![SyncEvent {
                 event_seq: 1,
-                payload: b"truncated".to_vec(),
+                payload: bytes::Bytes::from_static(b"truncated"),
             }],
             request_id: 0,
         }
