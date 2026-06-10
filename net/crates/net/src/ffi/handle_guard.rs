@@ -411,7 +411,10 @@ mod tests {
     fn begin_free_detailed_distinguishes_outcomes() {
         // Fresh guard, no ops → Drained (the winner).
         let g = HandleGuard::new();
-        assert_eq!(g.begin_free_detailed(Duration::from_millis(50)), BeginFree::Drained);
+        assert_eq!(
+            g.begin_free_detailed(Duration::from_millis(50)),
+            BeginFree::Drained
+        );
         // Second call → AlreadyFreeing (benign repeat, not a timeout).
         assert_eq!(
             g.begin_free_detailed(Duration::from_millis(50)),
