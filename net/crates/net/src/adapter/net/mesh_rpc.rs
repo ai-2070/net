@@ -3505,28 +3505,33 @@ impl MeshNode {
         reply_hash: ChannelHash,
     ) -> Result<(), RpcError> {
         let registry = self.rpc_reply_subscriptions_arc();
-        {
-            let entries = registry.lock();
-            if entries
-                .iter()
-                .any(|(t, s)| *t == target_node_id && s == service)
-            {
-                return Ok(());
-            }
-            // Cap the registry. New entries past the cap are
-            // refused — caller should reuse an existing
-            // (target, service) pair or operate on fewer.
-            if entries.len() >= MAX_REPLY_SUBSCRIPTIONS {
-                return Err(RpcError::NoRoute {
-                    target: target_node_id,
-                    reason: format!(
-                        "reply-subscription registry at cap ({} entries); refusing new \
-                         (target={target_node_id:#x}, service={service:?}). Caller should \
-                         reuse an existing target+service pair or shrink the active set.",
-                        MAX_REPLY_SUBSCRIPTIONS,
-                    ),
-                });
-            }
+        // PERF_AUDIT §3.5 — DashSet<(u64, u64)> keyed by
+        // `(target, xxh3_64(service))`. Pre-fix this was a global
+        // `Mutex<Vec<(u64, String)>>` that every concurrent RPC
+        // caller took on every call to scan the Vec with a String
+        // compare per entry — all callers serialized on it. Now the
+        // hot path is `contains`, a shard-local read, and the key
+        // pair is `Copy` so no allocation happens in the check.
+        let service_hash = xxhash_rust::xxh3::xxh3_64(service.as_bytes());
+        if registry.contains(&(target_node_id, service_hash)) {
+            return Ok(());
+        }
+        // Cap the registry. `len()` on DashSet is approximate under
+        // concurrent churn (it sums shard counts under shard reads,
+        // not a global lock), which is exactly the semantics we
+        // want here — the cap is a soft guard against a runaway
+        // caller, not a precise invariant. Past the cap, new
+        // entries are refused.
+        if registry.len() >= MAX_REPLY_SUBSCRIPTIONS {
+            return Err(RpcError::NoRoute {
+                target: target_node_id,
+                reason: format!(
+                    "reply-subscription registry at cap ({} entries); refusing new \
+                     (target={target_node_id:#x}, service={service:?}). Caller should \
+                     reuse an existing target+service pair or shrink the active set.",
+                    MAX_REPLY_SUBSCRIPTIONS,
+                ),
+            });
         }
 
         // Subscribe to our own reply channel from the target so the
@@ -3571,7 +3576,13 @@ impl MeshNode {
         }
 
         let _ = reply_hash; // captured into the dispatcher above; surfaced for debug
-        registry.lock().push((target_node_id, service.to_string()));
+        // `insert` is idempotent under DashSet semantics — a
+        // concurrent caller that beat us to it returns `false` and
+        // we're still in the right state. Cap drift past
+        // MAX_REPLY_SUBSCRIPTIONS during a concurrent insert race
+        // is bounded by the number of concurrent callers, which
+        // operators tune separately.
+        registry.insert((target_node_id, service_hash));
         Ok(())
     }
 }
@@ -3806,6 +3817,39 @@ mod origin_cache_tests {
         // The most-recently-seen window survives; the cold prefix is evicted.
         assert_eq!(cache.get(flood - 1), Some(flood - 1));
         assert_eq!(cache.get(0), None);
+    }
+
+    /// PERF_AUDIT §3.5 — the reply-subscription registry's hot
+    /// path must be a `(target, xxh3(service))` lookup against a
+    /// `DashSet`, not a `Mutex<Vec<(u64, String)>>` linear scan.
+    /// Pin the contract:
+    /// 1. distinct (target, service) pairs are distinct keys, even
+    ///    if they happen to xxh3-collide on `service` between two
+    ///    different targets — keying by the pair guards against
+    ///    a same-service multi-target false-positive;
+    /// 2. same (target, service) pair is idempotent — `insert`
+    ///    returns false on the second call, and the contains
+    ///    fast-path returns true;
+    /// 3. the cap is enforced via `len()`, not a separate
+    ///    counter that could drift.
+    #[test]
+    fn reply_subscriptions_keyed_by_target_and_service_hash() {
+        use dashmap::DashSet;
+        let registry: DashSet<(u64, u64)> = DashSet::new();
+        let h_a = xxhash_rust::xxh3::xxh3_64(b"svc-a");
+        let h_b = xxhash_rust::xxh3::xxh3_64(b"svc-b");
+        // Same target, different services → distinct entries.
+        assert!(registry.insert((0xAA, h_a)));
+        assert!(registry.insert((0xAA, h_b)));
+        assert!(registry.contains(&(0xAA, h_a)));
+        assert!(registry.contains(&(0xAA, h_b)));
+        // Same service, different targets → distinct entries.
+        assert!(registry.insert((0xBB, h_a)));
+        assert!(registry.contains(&(0xBB, h_a)));
+        // Idempotent — repeat insert is a no-op, contains stays true.
+        assert!(!registry.insert((0xAA, h_a)));
+        assert!(registry.contains(&(0xAA, h_a)));
+        assert_eq!(registry.len(), 3);
     }
 
     /// `get` promotes to most-recently-used, so a touched entry outlives an

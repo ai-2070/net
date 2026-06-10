@@ -1522,12 +1522,22 @@ pub struct MeshNode {
     /// cross the wire and so must be unpredictable.)
     #[cfg(feature = "cortex")]
     rpc_round_robin_cursor: Arc<std::sync::atomic::AtomicU64>,
-    /// Tracks `(target_node_id, service)` pairs we've already
+    /// Tracks `(target_node_id, xxh3(service))` pairs we've already
     /// established a reply-channel subscription for. `Mesh::call`
     /// consults this to skip the round-trip subscribe on
     /// subsequent calls to the same (target, service).
+    ///
+    /// **PERF_AUDIT §3.5** — pre-fix this was a global
+    /// `parking_lot::Mutex<Vec<(u64, String)>>` that every
+    /// concurrent RPC caller took on every `call` to do an
+    /// `iter().any(|(t, s)| ... && s == service)` String compare.
+    /// All callers serialized on it. Now it's a `DashSet` of
+    /// `(target, xxh3_64(service))` pairs — the contains-check is a
+    /// shard-local read (no global lock), and the key is two `u64`s
+    /// (no String alloc / compare). The xxh3 cost is `~10 ns` on
+    /// the service bytes once per call.
     #[cfg(feature = "cortex")]
-    rpc_reply_subscriptions: Arc<parking_lot::Mutex<Vec<(u64, String)>>>,
+    rpc_reply_subscriptions: Arc<dashmap::DashSet<(u64, u64)>>,
     /// nRPC services the local node currently handles (registered
     /// via `Mesh::serve_rpc`, deregistered when the `ServeHandle`
     /// drops). `announce_capabilities` merges these as
@@ -2273,7 +2283,7 @@ impl MeshNode {
             #[cfg(feature = "cortex")]
             rpc_round_robin_cursor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
-            rpc_reply_subscriptions: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            rpc_reply_subscriptions: Arc::new(dashmap::DashSet::new()),
             #[cfg(feature = "cortex")]
             rpc_local_services: Arc::new(dashmap::DashSet::new()),
             #[cfg(feature = "tool")]
@@ -5954,9 +5964,7 @@ impl MeshNode {
     /// subscriptions. Accessor for `mesh_rpc::Mesh::call`'s
     /// lazy-subscribe path.
     #[cfg(feature = "cortex")]
-    pub(super) fn rpc_reply_subscriptions_arc(
-        &self,
-    ) -> Arc<parking_lot::Mutex<Vec<(u64, String)>>> {
+    pub(super) fn rpc_reply_subscriptions_arc(&self) -> Arc<dashmap::DashSet<(u64, u64)>> {
         self.rpc_reply_subscriptions.clone()
     }
 
