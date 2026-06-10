@@ -1364,9 +1364,11 @@ mod tests {
         registry.register(fold.clone());
 
         let kp = EntityKeypair::generate();
+        // Dispatch verifies the publisher-binding, so an honest
+        // envelope must carry the signer's own node_id.
         let ann = sign_cap(
             &kp,
-            0xA,
+            kp.entity_id().node_id(),
             1,
             0x100,
             vec!["gpu"],

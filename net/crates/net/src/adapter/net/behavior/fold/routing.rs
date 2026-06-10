@@ -411,7 +411,10 @@ mod tests {
         registry.register(fold.clone());
 
         let kp = EntityKeypair::generate();
-        let ann = sign_route(&kp, 0xAA, 1, 0x42, addr(7000), 1, 0xAA);
+        // Dispatch verifies the publisher-binding, so an honest
+        // envelope must carry the signer's own node_id.
+        let nid = kp.entity_id().node_id();
+        let ann = sign_route(&kp, nid, 1, 0x42, addr(7000), 1, nid);
         let bytes = ann.encode().expect("encode");
         let outcome = registry.dispatch(&bytes, kp.entity_id()).expect("dispatch");
         assert_eq!(outcome, ApplyOutcome::Inserted);

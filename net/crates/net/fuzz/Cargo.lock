@@ -1049,8 +1049,10 @@ dependencies = [
 name = "net-fuzz"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "libfuzzer-sys",
  "net-mesh",
+ "postcard",
 ]
 
 [[package]]
@@ -1084,6 +1086,7 @@ dependencies = [
  "serde_json",
  "snow",
  "socket2",
+ "subtle",
  "thiserror",
  "tokio",
  "tokio-stream",

@@ -543,10 +543,30 @@ async fn reconstruct_tree(
     // Resolve safe paths (CPU) here, then create the links on the
     // blocking pool (T-3). A platform that can't create a symlink (e.g.
     // Windows without privilege) is tolerated — the files still landed.
+    // Collect the normalized paths of every declared symlink first. The
+    // tree is reconstructed into a private, initially-empty temp dir, so
+    // these are the only symlinks that can ever exist in it — which is
+    // what lets the lexical `check_link_target` below reason about
+    // symlink *composition* (one link resolving through another).
+    let mut symlink_paths: BTreeSet<Vec<String>> = BTreeSet::new();
+    for entry in &manifest.entries {
+        if let EntryKind::Symlink { .. } = &entry.kind {
+            if let Some(c) = normal_components(&entry.path) {
+                symlink_paths.insert(c);
+            }
+        }
+    }
     let mut links: Vec<(String, PathBuf)> = Vec::new();
     for entry in &manifest.entries {
         if let EntryKind::Symlink { target } = &entry.kind {
-            links.push((target.clone(), safe_join(&root, &entry.path)?));
+            let safe = safe_join(&root, &entry.path)?;
+            // The link path is confined by `safe_join`, but the target is
+            // attacker-controlled too — a hostile sender could plant
+            // `link -> /etc/passwd`, `link -> ../../../../etc`, or a *pair*
+            // of links that compose to escape (`a -> .`, `b -> a/../..`).
+            // Reject any link the OS could resolve outside the tree.
+            check_link_target(&entry.path, target, &symlink_paths)?;
+            links.push((target.clone(), safe));
         }
     }
     stats.symlinks = tokio::task::spawn_blocking(move || {
@@ -768,6 +788,135 @@ fn safe_join(dest: &Path, rel: &str) -> Result<PathBuf, DirError> {
     Ok(out)
 }
 
+/// Fold one path component to a canonical key for declared-symlink
+/// matching, tracking how the destination filesystem compares names.
+///
+/// Default macOS (APFS/HFS+) and Windows volumes compare filenames
+/// **case-insensitively**, and APFS/HFS+ additionally compare
+/// **normalization-insensitively** — the precomposed `é` (U+00E9) and
+/// the decomposed `e`+◌́ (U+0065 U+0301) name the same entry. The
+/// composition check matches a target's components against the declared
+/// symlink set; if that match used raw bytes, a hostile manifest could
+/// declare symlink `é` (one form) and route a target through the other
+/// form (or a case variant) to slip past the check while the OS still
+/// resolves them as the same link.
+///
+/// Fold to a single key — lowercase, then NFC-normalize — so equivalent
+/// names collapse together. This over-rejects names that are genuinely
+/// distinct on a case-/normalization-sensitive FS (Linux ext4), an
+/// acceptable safety bias for an attacker-controlled manifest. It's a
+/// close approximation of the OS folding (true caseless matching also
+/// folds e.g. `ß`→`ss`), erring toward rejection.
+fn fold_component(c: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    c.to_lowercase().nfc().collect()
+}
+
+/// Normalize a manifest relative path to its sequence of plain-name
+/// components (case-folded via [`fold_component`]), dropping `.`
+/// segments and rejecting anything else (`..`, root, drive prefix).
+/// Returns `None` for a path that isn't a pure in-tree descent — used
+/// both to key the declared-symlink set and to walk a link's own
+/// location.
+fn normal_components(rel: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for comp in Path::new(rel).components() {
+        match comp {
+            Component::Normal(c) => out.push(fold_component(&c.to_string_lossy())),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Reject a symlink the OS could resolve outside the reconstruction
+/// root, *accounting for other symlinks in the same manifest*.
+///
+/// The link itself lives at `root/link_rel` (already confined by
+/// [`safe_join`]); its target is resolved by the OS relative to the
+/// link's parent directory. Since the manifest is attacker-controlled,
+/// a target like `/etc/passwd` or `../../../../etc` must not yield a
+/// link pointing outside the fetched tree.
+///
+/// This is a purely lexical check — no filesystem access — so it is
+/// immune to TOCTOU and copes with dangling targets. It is *complete*
+/// against symlink composition because the tree is reconstructed into a
+/// private, initially-empty temp dir: `symlinks` holds every path that
+/// can be a symlink in it, so the check can refuse any link the OS would
+/// resolve *through* another symlink (where the simple depth model no
+/// longer holds). Concretely it rejects:
+///
+///  1. absolute / drive-prefixed targets;
+///  2. targets whose `..` chain pops above root;
+///  3. links whose own parent path, or whose target's intermediate
+///     components, traverse a declared symlink — e.g. `a -> .` plus
+///     `b -> a/sub/../../etc`, where following `a` (→ root) then `..`
+///     escapes even though every component looks in-tree lexically.
+///
+/// A symlink as the link's *final* target component is fine (the OS
+/// lands on it but doesn't traverse it); that destination is validated
+/// in its own right when its entry is processed.
+///
+/// Matching against `symlinks` is case- and normalization-insensitive
+/// (see [`fold_component`]) so a casing or Unicode-normalization variant
+/// can't bypass the check on a case-/normalization-insensitive
+/// filesystem (notably default APFS).
+fn check_link_target(
+    link_rel: &str,
+    target: &str,
+    symlinks: &BTreeSet<Vec<String>>,
+) -> Result<(), DirError> {
+    let t = Path::new(target);
+    if t.is_absolute() {
+        return Err(DirError::UnsafePath(target.to_owned()));
+    }
+    // Resolution starts in the link's parent directory. Build it as a
+    // root-relative component stack we can push/pop as `..`/names apply.
+    let mut stack =
+        normal_components(link_rel).ok_or_else(|| DirError::UnsafePath(link_rel.to_owned()))?;
+    // Drop the link's own filename → its parent directory.
+    stack.pop();
+    // Every ancestor of the link must be a real directory, not a
+    // symlink, or the link isn't actually created where its path says.
+    for i in 1..=stack.len() {
+        if symlinks.contains(&stack[..i].to_vec()) {
+            return Err(DirError::UnsafePath(link_rel.to_owned()));
+        }
+    }
+
+    let comps: Vec<Component> = t.components().collect();
+    for (idx, comp) in comps.iter().enumerate() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // `..` pops one level; underflow means the resolved path
+                // escaped above root.
+                if stack.pop().is_none() {
+                    return Err(DirError::UnsafePath(target.to_owned()));
+                }
+            }
+            Component::Normal(c) => {
+                // Case-folded to match `symlinks` (built via
+                // `normal_components`), so a casing variant can't dodge
+                // the traversal check on a case-insensitive FS.
+                stack.push(fold_component(&c.to_string_lossy()));
+                // A symlink in any *non-final* position is followed by the
+                // OS to an unknown location, so the lexical depth model no
+                // longer holds — reject (can't prove confinement).
+                let is_final = idx + 1 == comps.len();
+                if !is_final && symlinks.contains(&stack) {
+                    return Err(DirError::UnsafePath(target.to_owned()));
+                }
+            }
+            // RootDir / Prefix (Windows `C:\`, `\\?\`) — absolute-ish;
+            // `is_absolute` catches most, this is the defensive backstop.
+            _ => return Err(DirError::UnsafePath(target.to_owned())),
+        }
+    }
+    Ok(())
+}
+
 fn write_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), DirError> {
     std::fs::write(path, bytes)?;
     apply_mode(path, mode)?;
@@ -837,6 +986,113 @@ mod tests {
         assert!(safe_join(dest, "a/../../escape").is_err());
         assert!(safe_join(dest, "/abs/path").is_err());
         assert!(safe_join(dest, "").is_err());
+    }
+
+    fn no_symlinks() -> BTreeSet<Vec<String>> {
+        BTreeSet::new()
+    }
+
+    #[test]
+    fn check_link_target_accepts_in_tree_targets() {
+        let s = no_symlinks();
+        // Relative target staying inside the tree, from a nested link.
+        assert!(check_link_target("sub/link", "file.txt", &s).is_ok());
+        assert!(check_link_target("sub/link", "../other/file.txt", &s).is_ok());
+        // `..` that pops back to root but no further is fine.
+        assert!(check_link_target("a/b/link", "../../c", &s).is_ok());
+        // Self-referential `.` components are harmless.
+        assert!(check_link_target("link", "./peer", &s).is_ok());
+    }
+
+    #[test]
+    fn check_link_target_rejects_escapes() {
+        let s = no_symlinks();
+        // Absolute target — the classic `link -> /etc/passwd`.
+        assert!(check_link_target("link", "/etc/passwd", &s).is_err());
+        // Relative target escaping above root from a top-level link.
+        assert!(check_link_target("link", "../etc", &s).is_err());
+        // Deep `..` chain that escapes even from a nested link.
+        assert!(check_link_target("a/b/link", "../../../../etc", &s).is_err());
+        // Escapes midway then comes back — still rejected (the
+        // intermediate step left the tree).
+        assert!(check_link_target("link", "../../a/b", &s).is_err());
+    }
+
+    #[test]
+    fn check_link_target_rejects_composed_symlink_escape() {
+        // The composition attack the lexical-only check missed: `a -> .`
+        // is in-tree (resolves to root), but a *second* link that
+        // traverses `a` and then walks `..` escapes, because following
+        // `a` lands at root yet the lexical model counted `a` as a
+        // descent. With `a` in the declared-symlink set, the second link
+        // is rejected.
+        let mut s = BTreeSet::new();
+        s.insert(vec!["a".to_string()]);
+
+        // `a -> .` itself is fine — it stays at root.
+        assert!(check_link_target("a", ".", &s).is_ok());
+        // `b -> a/sub/../../etc` is lexically depth-neutral but resolves
+        // through `a` (a symlink) → reject.
+        assert!(check_link_target("b", "a/sub/../../etc", &s).is_err());
+        // Pointing *at* the symlink as the final component is allowed
+        // (the OS lands on `a`, doesn't traverse it; `a` is validated
+        // separately).
+        assert!(check_link_target("b", "a", &s).is_ok());
+    }
+
+    #[test]
+    fn check_link_target_rejects_composed_escape_with_different_case() {
+        // On a case-insensitive FS (Windows, default macOS) `A` and `a`
+        // are the same entry, so a casing variant must not dodge the
+        // traversal check. The set is keyed via `normal_components`,
+        // which case-folds, and the target walk folds too.
+        let mut s = BTreeSet::new();
+        s.insert(normal_components("a").unwrap()); // declared symlink `a`
+
+        // Target routes through `A` (== `a`) then escapes → reject.
+        assert!(check_link_target("b", "A/sub/../../etc", &s).is_err());
+        // A symlink declared in upper case is matched by a lower-case
+        // traversal too (folding is symmetric).
+        let mut s2 = BTreeSet::new();
+        s2.insert(normal_components("Dir").unwrap());
+        assert!(check_link_target("b", "dir/sub/../../../etc", &s2).is_err());
+        // A link sitting under a case-variant of a symlinked parent is
+        // likewise rejected.
+        assert!(check_link_target("A/inner", "x", &s).is_err());
+    }
+
+    #[test]
+    fn check_link_target_rejects_composed_escape_with_different_unicode_form() {
+        // On a normalization-insensitive FS (default APFS) the
+        // precomposed and decomposed forms of an accented name are the
+        // same entry, so a normalization variant must not dodge the
+        // traversal check. Declare the symlink in NFC form, route the
+        // target through the NFD form.
+        const NFC: &str = "caf\u{00E9}"; // "café" precomposed
+        const NFD: &str = "cafe\u{0301}"; // "café" decomposed
+                                          // Sanity: the two forms are byte-distinct (raw-bytes matching
+                                          // would miss the bypass) but fold to the same key.
+        assert_ne!(NFC, NFD);
+        assert_eq!(fold_component(NFC), fold_component(NFD));
+
+        let mut s = BTreeSet::new();
+        s.insert(normal_components(NFC).unwrap()); // symlink declared NFC
+
+        // Target routes through the NFD form (== NFC on APFS) → reject.
+        assert!(check_link_target("b", &format!("{NFD}/sub/../../etc"), &s).is_err());
+        // Mixed case + normalization variant also folds and is rejected.
+        let upper_nfd = format!("CAFE{}", "\u{0301}");
+        assert!(check_link_target("b", &format!("{upper_nfd}/x/../../../etc"), &s).is_err());
+    }
+
+    #[test]
+    fn check_link_target_rejects_link_under_a_symlinked_parent() {
+        // Write-side composition: if `d` is a symlink, a link declared at
+        // `d/inner` would be created *through* `d` (an unknown location).
+        // Reject it regardless of its target.
+        let mut s = BTreeSet::new();
+        s.insert(vec!["d".to_string()]);
+        assert!(check_link_target("d/inner", "file.txt", &s).is_err());
     }
 
     #[test]

@@ -28,10 +28,17 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+# `bytes` is the input type for the cortex nRPC decoders;
+# `postcard` decodes the blob TransferHeader directly. Versions
+# pinned to the parent crate's.
+bytes = "1"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 # Depend on the parent crate with every feature the fuzz
 # targets need. `port-mapping` pulls in NAT-PMP + UPnP decoders;
-# `nat-traversal` surfaces classify + reflex types.
-net = { package = "net-mesh", version = "0.27.1", path = "..", features = ["net", "nat-traversal", "port-mapping"] }
+# `nat-traversal` surfaces classify + reflex types; `cortex`
+# surfaces the nRPC request decoder; `dataforts` surfaces the
+# blob TransferHeader.
+net = { package = "net-mesh", version = "0.27.1", path = "..", features = ["net", "nat-traversal", "port-mapping", "cortex", "dataforts"] }
 
 # Prevent this from being pulled into the parent workspace —
 # cargo-fuzz is designed to be invoked from inside this dir.
@@ -69,6 +76,34 @@ bench = false
 [[bin]]
 name = "routing_header_from_bytes"
 path = "fuzz_targets/routing_header_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "membership_decode"
+path = "fuzz_targets/membership_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bindings_from_bytes"
+path = "fuzz_targets/bindings_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cortex_rpc_request_decode"
+path = "fuzz_targets/cortex_rpc_request_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blob_transfer_header_decode"
+path = "fuzz_targets/blob_transfer_header_decode.rs"
 test = false
 doc = false
 bench = false

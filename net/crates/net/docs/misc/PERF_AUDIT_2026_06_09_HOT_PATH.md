@@ -3,9 +3,11 @@
 Source: code inspection of the mesh packet path (`src/adapter/net/`), the in-process
 bus ingest path (`src/bus.rs`, `src/shard/`, `src/timestamp.rs`), and a sweep of the
 existing perf plan docs to establish what is already identified, shipped, or gated.
-Widened same-day (§8–§11) to the layers the first pass skipped: the nRPC dispatch
-layer above the transport (`mesh_rpc.rs` + `cortex/rpc.rs`), the FFI/bindings surface
-(the path SDK consumers actually hit), and the RedEX/CortEX/consumer-drain paths.
+Widened same-day in two rounds: §8–§11 cover the nRPC dispatch layer above the
+transport (`mesh_rpc.rs` + `cortex/rpc.rs`), the FFI/bindings surface (the path SDK
+consumers actually hit), and the RedEX/CortEX/consumer-drain paths; §12–§14 cover
+the remainder — behavior/ modules, the Dataforts blob path, and the control-plane
+surfaces — all of which came back clean, completing coverage of the crate.
 Numbers from `BENCHMARKS.md` (2026-04-27, M1 Max + i9-14900K) and the prior audits are
 used as the baseline; per-item costs below marked *est.* are reasoned from the code,
 not re-measured.
@@ -288,6 +290,93 @@ findings; do not re-audit.
 
 ---
 
+## 12. WIDENED (round 3): behavior/ modules — prior fixes verified, no new findings
+
+All fixes from `PERF_AUDIT_2026_05_28_CAPABILITY.md` and
+`PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md` verified present in the code (sorted-tag `sort_unstable` +
+`sort_by_cached_key` `capability.rs:1856,1865`, tag-direct filter fast paths `:2369`,
+axis_key alloc removal `:1349,1372`, AtomicUsize counters across swarm/metadata/
+proximity/route). The two deliberately-pending items stand: compact codec (fix #3,
+blocked on `#[serde(skip_serializing_if)]` signed-bytes compat, documented at
+`capability.rs:2061`) and the OnceCell projection cache (fix #4, deferred pending
+evidence of repeated `views()` on the same set).
+
+The previously-unaudited surfaces are clean, classified by where they run:
+
+- **Fold dispatch + apply** (hot, per-announce): RwLock read + O(1) HashMap lookup
+  (`fold/dispatch.rs:212-222`), O(1) merge decide, postcard encode/decode ~100–200 ns
+  per envelope — intrinsic wire cost. Ed25519 verify (~50 µs) dominates every inbound
+  envelope; the double postcard encode in sign/verify (`fold/wire.rs:243-346`) is
+  <0.3% of that. Nothing to do without a wire-format change.
+- **Safety envelope** (hot, per-check): kill-switch bool + rate-limit atomics +
+  policy loop, ~10–50 ns (`safety.rs:1125-1151`); regex compilation happens at
+  envelope-update time, never per-check (`safety.rs:1091,1119`). Clean.
+- **Group/subnet tag parse** (warm, per-announce): hex decode ~50–100 ns. Clean.
+- **Metadata upsert** (hot): one `&'static str → String` index-key alloc per upsert
+  (`metadata.rs:1344`), ~20–50 ns, intrinsic to owned-key indexes. Not worth chasing.
+
+No new regressions. **behavior/ is closed.**
+
+---
+
+## 13. WIDENED (round 3): Dataforts blob path — clean; one opt-in lock noted
+
+The throughput-critical paths verified, with several previously-landed perf fixes
+confirmed in code:
+
+- **Put**: CDC chunking is zero-copy (`BytesMut::split_to(..).freeze()`,
+  `dataforts/blob/cdc.rs:379`) with the adversarial-input rescan amortizer
+  (`cdc.rs:282-348`); per-chunk BLAKE3 is stateless/SIMD; stream accumulation drains
+  via `mem::replace`, no per-chunk copy (`blob/mesh.rs:1274-1298`). Clean.
+- **Get**: manifest fetch is 16-way concurrent (`buffered(16)`, `mesh.rs:3255-3297`),
+  reassembly preallocates and pays exactly one memcpy per chunk (optimal for joining
+  discontiguous buffers, `mesh.rs:3299-3311`), range fetches return zero-copy
+  `Bytes::slice` (`mesh.rs:3410-3470`), verification is single-pass
+  (`blob/dispatch.rs:124-206`). Clean.
+- **Erasure coding**: stripe-level, runs only on RS-encoded put / repair / future
+  auto-repair — correctly off the healthy-blob hot path. GC and pinning are
+  background-only. Clean.
+- **Tree node cache**: O(1) after the `lru`-crate fix (`blob_tree_cache.rs:66-200`).
+
+One finding, LOW severity: **per-fetch heat-registry mutex** (`mesh.rs:764-771`) —
+when data-gravity heat is enabled (opt-in via `with_blob_heat`), every fetch takes
+the registry lock to bump 1–128 counters. The lock never spans I/O, so this is
+CPU-contention-only under very high fan-out reads; if it ever profiles, batch the
+bumps or shard the registry. Informational: the `net-blob` CLI `put` full-buffers the
+input file (`bin/net-blob.rs:353-387`) — fine for an operator tool, but worth a doc
+note pointing bulk producers at `store_stream_tree`. **Dataforts is closed.**
+
+---
+
+## 14. WIDENED (round 3): control-plane surfaces — all correctly cold; benchmark "alarms" root-caused
+
+The key question — does any gated/control-plane surface leak work onto the hot path —
+answers **no** across the board:
+
+- **FailureDetector** — the alarming benchmark rows (`check_all` 342 ms, `stats`
+  80–100 ms in BENCHMARKS.md) are **benchmark-fixture artifacts of an O(nodes) scan
+  reported per-element**, not hot-path costs: `check_all` runs once per
+  `heartbeat_interval` (default 5 s, driven from `mesh.rs:5446`) and costs ~204 µs at
+  5,000 nodes (the scaling table in BENCHMARKS.md confirms) — ~40 µs/s amortized.
+  Callbacks fire after the iteration lock is released (`failure.rs:271-275`). `stats`
+  is observability-only by documented design (`failure.rs:358-362`). Per-heartbeat
+  costs on the actual hot path are 14–242 ns. Consider annotating those two rows in
+  BENCHMARKS.md so nobody else flags them.
+- **MeshOS**: reconcile is tick-driven (~250 ms, `behavior/meshos/event_loop.rs:
+  803-940`), drains a bounded 32-event batch per tick, and does NOT subscribe to the
+  full bus stream — discrete `MeshOsEvent`s fan in from subsystems. Clean.
+- **Aggregator-daemon**: interval-driven (`behavior/aggregator/daemon.rs:197-224`),
+  O(fold entries) per tick, no live subscription. Clean.
+- **NetDB/MeshDB**: query-on-demand over snapshots; no live subscriber, no per-event
+  work when idle. Clean.
+- **Deck**: watch-driven snapshot reads; no resident stats polling against the
+  expensive aggregate paths. Clean.
+
+**Control-plane is closed. With §8–§14, every surface in the net crate has now been
+audited or has a recorded clean verdict; the survey is complete.**
+
+---
+
 ## Explicit non-goals (don't spend time here)
 
 - **AEAD algorithm swap** (ChaCha20-Poly1305 → AES-GCM): crypto is ~5% of CPU; saves
@@ -319,5 +408,5 @@ findings; do not re-audit.
 5. **§3 deployment decision on SIMD artifacts** — a build-pipeline decision, not code.
 6. **§6/§8 micro-items (T3.4, T2.2, §8d metrics gate)** — opportunistic; re-bench
    T2.1 only after §1 lands.
-7. **§9 SDK docs/defaults pass + §10 run `bench_append_batch_disk`** — cheap,
-   non-code, closes the record.
+7. **§9 SDK docs/defaults pass + §10 run `bench_append_batch_disk` + §14 annotate
+   the FailureDetector rows in BENCHMARKS.md** — cheap, non-code, closes the record.

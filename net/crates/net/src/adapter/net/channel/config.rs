@@ -30,15 +30,34 @@ pub enum Visibility {
 /// 2. If `publish_caps` is set, node's `CapabilitySet` must match the filter
 /// 3. If `require_token` is true, node must also have a valid `PermissionToken`
 /// 4. On success, `(origin_hash, channel_hash)` is inserted into the `AuthGuard`
+///
+/// # Capability filters are advisory, not an access boundary
+///
+/// `publish_caps` / `subscribe_caps` match against a node's
+/// *self-advertised* `CapabilitySet`: a peer declares its own
+/// capabilities in its own signed announcement, so any peer can
+/// satisfy a cap-filter simply by advertising the required tag
+/// (e.g. self-asserting `role:admin`). Treat cap-filters as
+/// matchmaking / intent-routing, **not** as a security boundary.
+///
+/// The actual access boundary is `require_token` + `token_roots`:
+/// a root-anchored [`TokenChain`] cannot be forged because each link
+/// is signature-verified up to a root the channel explicitly trusts.
+/// Any channel that must restrict who can publish or subscribe must
+/// use token enforcement; a cap-filter alone restricts nothing.
 #[derive(Debug, Clone)]
 pub struct ChannelConfig {
     /// Channel identity (name + hash).
     pub channel_id: ChannelId,
     /// Visibility scope for subnet routing.
     pub visibility: Visibility,
-    /// Capability requirements for publishing. `None` = any node can publish.
+    /// Capability requirements for publishing. `None` = any node can
+    /// publish. Advisory only — matched against the node's
+    /// self-advertised caps; use `require_token` for a real boundary.
     pub publish_caps: Option<CapabilityFilter>,
-    /// Capability requirements for subscribing. `None` = any node can subscribe.
+    /// Capability requirements for subscribing. `None` = any node can
+    /// subscribe. Advisory only — matched against the node's
+    /// self-advertised caps; use `require_token` for a real boundary.
     pub subscribe_caps: Option<CapabilityFilter>,
     /// Whether a valid `PermissionToken` is required (in addition to capabilities).
     pub require_token: bool,
@@ -86,12 +105,22 @@ impl ChannelConfig {
     }
 
     /// Set capability requirements for publishing.
+    ///
+    /// Advisory matchmaking, not access control: caps are
+    /// self-advertised, so any peer can satisfy the filter by
+    /// declaring the tag. Combine with [`Self::with_token_roots`] to
+    /// actually restrict publishers.
     pub fn with_publish_caps(mut self, filter: CapabilityFilter) -> Self {
         self.publish_caps = Some(filter);
         self
     }
 
     /// Set capability requirements for subscribing.
+    ///
+    /// Advisory matchmaking, not access control: caps are
+    /// self-advertised, so any peer can satisfy the filter by
+    /// declaring the tag. Combine with [`Self::with_token_roots`] to
+    /// actually restrict subscribers.
     pub fn with_subscribe_caps(mut self, filter: CapabilityFilter) -> Self {
         self.subscribe_caps = Some(filter);
         self
