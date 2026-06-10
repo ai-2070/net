@@ -729,25 +729,61 @@ impl ReliabilityMode for ReliableStream {
     }
 
     fn on_ack(&mut self, ack_seq: u64) {
-        // Single pass over `pending` (T-7): for every acked sequence
-        // (`seq < ack_seq`, contiguously received) fold an RTT sample
-        // (H-5, Karn — non-retransmitted only; `pending` is seq-ordered
-        // so the last such packet is the freshest), count it for cwnd
-        // growth (H-6), then drop it from the retransmit window (H-9).
+        // Pop-front fast path (PERF_AUDIT §3.4): the retransmit
+        // window is seq-ordered by insertion (`on_send` pushes to
+        // back) so the acked prefix lives at the head. Pre-fix
+        // this was a full `pending.retain(|u| u.seq() >= ack_seq)`
+        // — O(retransmit_window) per ACK, and on a busy bulk
+        // stream the window can grow to MAX_RETRANSMIT_WINDOW
+        // (16_384), ACKs arrive every ms via the grant drainer,
+        // and the scan dominated CPU.
+        //
+        // Karn semantics preserved: only non-retransmitted
+        // packets (retries == 0) contribute RTT samples, and the
+        // freshest such sample wins because we walk front-to-
+        // back — same direction `retain` did pre-fix.
         let now = Instant::now();
         let mut sample = None;
         let mut acked = 0usize;
-        self.pending.retain(|u| {
-            if u.seq() < ack_seq {
+        while let Some(front) = self.pending.front() {
+            if front.seq() >= ack_seq {
+                break;
+            }
+            if front.retries == 0 {
+                sample = Some(now.duration_since(front.sent_at));
+            }
+            acked += 1;
+            self.pending.pop_front();
+        }
+        // Straggler tail sweep: a concurrent `send_on_stream` can
+        // register a packet whose seq is older than `ack_seq` but
+        // ends up behind a newer packet (mesh.rs awaits the
+        // socket before registering, so two senders can interleave
+        // out-of-order at the tail). These are rare; a bounded
+        // look-ahead handles them without falling back to the full
+        // O(window) scan. STRAGGLER_LOOKAHEAD = 32 covers the
+        // realistic concurrent-sender count comfortably.
+        const STRAGGLER_LOOKAHEAD: usize = 32;
+        let mut idx = 0;
+        while idx < STRAGGLER_LOOKAHEAD && idx < self.pending.len() {
+            if self.pending[idx].seq() < ack_seq {
+                // `remove(idx)` is O(min(idx, len - idx)) — at most
+                // STRAGGLER_LOOKAHEAD = 32 element shifts, bounded
+                // and independent of total window size.
+                let u = self
+                    .pending
+                    .remove(idx)
+                    .expect("idx < len verified by the while guard");
                 if u.retries == 0 {
                     sample = Some(now.duration_since(u.sent_at));
                 }
                 acked += 1;
-                false // drop — acked
+                // Don't bump `idx` — the slot now holds what was
+                // at `idx + 1`.
             } else {
-                true // keep — still in flight
+                idx += 1;
             }
-        });
+        }
         if let Some(rtt) = sample {
             self.update_rto(rtt);
         }
@@ -1129,6 +1165,52 @@ mod tests {
         assert!(!mode.on_receive(2));
 
         assert_eq!(mode.ack_seq(), 2);
+    }
+
+    /// PERF_AUDIT §3.4 — the pop-front fast path must drain the
+    /// acked prefix from `pending` in one bounded sweep, leaving
+    /// only the still-in-flight tail behind. This is the steady-
+    /// state shape (no concurrent reorder).
+    #[test]
+    fn on_ack_pops_acked_prefix_and_keeps_in_flight_tail() {
+        let mut mode = ReliableStream::new();
+        for i in 0..10u64 {
+            mode.on_send(descriptor(i, Bytes::from(format!("p{i}"))));
+        }
+        assert_eq!(mode.pending.len(), 10);
+        // Ack through seq 6 (exclusive); seqs 0..=5 should be gone.
+        mode.on_ack(6);
+        assert_eq!(mode.pending.len(), 4);
+        let remaining_seqs: Vec<u64> = mode.pending.iter().map(|u| u.seq()).collect();
+        assert_eq!(remaining_seqs, vec![6, 7, 8, 9]);
+    }
+
+    /// PERF_AUDIT §3.4 — the straggler tail sweep must handle an
+    /// out-of-order packet whose seq is below `ack_seq` but ended
+    /// up behind a newer packet in the deque (the realistic
+    /// concurrent-`send_on_stream` race the audit calls out). The
+    /// sweep is bounded; this test fits comfortably inside the
+    /// 32-element look-ahead.
+    #[test]
+    fn on_ack_picks_up_straggler_behind_newer_packet() {
+        let mut mode = ReliableStream::new();
+        // Insert in deliberately-out-of-order shape: seqs 0..=4 in
+        // order, then seq 7, then seq 5 (the straggler), then seq 6
+        // (newer-ordered).
+        for i in 0..=4u64 {
+            mode.on_send(descriptor(i, Bytes::from(format!("p{i}"))));
+        }
+        mode.on_send(descriptor(7, Bytes::from_static(b"p7")));
+        mode.on_send(descriptor(5, Bytes::from_static(b"p5"))); // straggler
+        mode.on_send(descriptor(6, Bytes::from_static(b"p6")));
+        assert_eq!(mode.pending.len(), 8);
+        // Ack through seq 6 (exclusive). Front drains 0..=4
+        // (5 entries). Then the deque holds [7, 5, 6]; the straggler
+        // sweep should pick up seq 5 (and seq 6 if its seq < ack_seq;
+        // here 6 < 6 is false, so it stays).
+        mode.on_ack(6);
+        let remaining_seqs: Vec<u64> = mode.pending.iter().map(|u| u.seq()).collect();
+        assert_eq!(remaining_seqs, vec![7, 6]);
     }
 
     #[test]
