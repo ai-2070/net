@@ -231,11 +231,23 @@ pub fn handle_sync_request(
         effective_budget = effective_budget.min(CHUNK_MAX_BACKGROUND_SOFT_CAP_BYTES);
     }
 
-    // Read a generous window — file's local retention may have
-    // trimmed seqs; `read_range` silently skips evicted entries.
-    // We pull `local_next` as the upper bound so we don't miss
-    // recent events, then cull to the byte budget afterward.
-    let events = file.read_range(request.since_seq, local_next);
+    // Read a budget-bounded window. Pre-fix this called
+    // `file.read_range(since_seq, local_next)` with no cap and culled
+    // afterward — a replica 1 GB behind made the leader scan + xxh3
+    // every payload in the backlog just to ship 64 MiB. The pre-walk
+    // inside `read_range_limited` now sums index `payload_len`s
+    // (cheap, no materialize, no checksum) and only fetches the
+    // events that fit. The caller's loop below still enforces the
+    // exact per-event-cost budget (which includes the 12-byte
+    // SyncEvent header) and the hard-ceiling-first-event NACK rule
+    // — `read_range_limited` is permitted to overshoot by a small
+    // margin because it accounts only for payload bytes. Per
+    // PERF_AUDIT_2026_06_10_FULL_CRATE.md §5.1.
+    let events = file.read_range_limited(
+        request.since_seq,
+        local_next,
+        effective_budget as u64,
+    );
     if events.is_empty() {
         // Range was non-empty per `local_next > since_seq` but
         // `read_range` returned nothing — every requested seq has
