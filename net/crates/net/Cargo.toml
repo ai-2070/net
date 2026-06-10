@@ -397,6 +397,11 @@ name = "placement"
 harness = false
 required-features = ["net"]
 
+[[bench]]
+name = "origin_cache_bench"
+harness = false
+required-features = ["net"]
+
 [[test]]
 name = "integration_redis"
 path = "tests/integration_redis.rs"
