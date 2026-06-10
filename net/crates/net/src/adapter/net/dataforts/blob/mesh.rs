@@ -2284,13 +2284,21 @@ impl MeshBlobAdapter {
                     // the contract and the implementation is the
                     // `fetch_chunk` test's job to catch.
                     // RS reconstruction needs mutable buffers
-                    // (resize + in-place decode). Materialize the
-                    // Bytes into an owned Vec here — the
-                    // surrounding paths still benefit from the
-                    // fetch_chunk-side Bytes hand-off, but the
-                    // reconstruction inner loop requires owned
-                    // backing.
-                    let mut bytes_vec = bytes.to_vec();
+                    // (resize + in-place decode). PERF_AUDIT §6.12
+                    // — when `bytes` is sole-owned (`fetch_chunk`
+                    // typically hands back a refcount=1 `Bytes`),
+                    // `try_into_mut` returns the existing
+                    // allocation as `BytesMut` in O(1) and we
+                    // skip the full-shard memcpy `to_vec()` was
+                    // paying. Only short data shards (length <
+                    // shard_len) need a resize, which is the
+                    // existing pre-fix code. The slow path (an
+                    // outstanding clone forced a copy) still works
+                    // — we just lose the §6.12 win for that shard.
+                    let mut bytes_vec = match bytes.try_into_mut() {
+                        Ok(mut_data) => mut_data.into(),
+                        Err(orig) => orig.to_vec(),
+                    };
                     // Pad data shards to the post-padding length
                     // before passing to the encoder. Parity
                     // shards are already at shard_len.
@@ -2884,11 +2892,15 @@ impl MeshBlobAdapter {
                 Ok(bytes) => {
                     let computed: [u8; 32] = blake3::hash(&bytes).into();
                     if computed == chunk.hash {
-                        // Materialize the Bytes into an owned Vec
-                        // for the RS encoder's mutable buffer
-                        // contract (same rationale as the
-                        // reconstruction path above).
-                        shards.push(Some(bytes.to_vec()));
+                        // PERF_AUDIT §6.12 — try_into_mut to skip
+                        // the full-shard memcpy when `bytes` is
+                        // sole-owned (the typical case for a fresh
+                        // `fetch_chunk`).
+                        let bytes_vec = match bytes.try_into_mut() {
+                            Ok(mut_data) => mut_data.into(),
+                            Err(orig) => orig.to_vec(),
+                        };
+                        shards.push(Some(bytes_vec));
                         surviving += 1;
                         continue;
                     }

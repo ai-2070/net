@@ -4964,28 +4964,34 @@ impl MeshNode {
         };
 
         if let Some(total_consumed) = grant_bytes {
-            // Resolve the sending peer via two O(1) DashMap lookups
-            // (`addr_to_node` → `peers`) instead of a linear scan over
-            // `ctx.peers`. At high peer counts the scan would make
-            // packet receive cost proportional to peer count — the
-            // hot path needs to stay constant-time.
+            // Resolve the sending peer.
             //
-            // The addr-based lookup is validated against the arriving
-            // `session.session_id()` because multiple peers can share
-            // a source address in relay scenarios: `addr_to_node` is
-            // keyed by last-seen source and may resolve to a different
-            // peer than the one this packet authenticated as. On
-            // mismatch (or miss) fall back to a session_id scan so the
-            // grant is guaranteed to go back on the session the
-            // accepted bytes arrived on.
-            let peer_addr = session.peer_addr();
-            let peer = ctx
-                .addr_to_node
-                .get(&peer_addr)
-                .and_then(|node_id| {
-                    ctx.peers.get(&*node_id).and_then(|p| {
+            // PERF_AUDIT §2.8 — try `session.cached_node_id()` first
+            // (one Relaxed atomic load), then `ctx.peers.get(nid)`.
+            // Pre-fix this went through `addr_to_node.get` →
+            // `peers.get` → session-id validation → O(peers)
+            // iter().find fallback — even though the session itself
+            // already cached its NodeId at handshake time. The
+            // addr_to_node lookup is still used as a second-tier
+            // fallback for the brief window before `cache_node_id`
+            // publishes; the linear scan is the last-resort fallback
+            // for the legitimate session-id-mismatch case (relay-
+            // shared source address).
+            let peer = session
+                .cached_node_id()
+                .and_then(|nid| {
+                    ctx.peers.get(&nid).and_then(|p| {
                         (p.value().session.session_id() == session.session_id())
                             .then(|| (p.value().addr, p.value().session.clone()))
+                    })
+                })
+                .or_else(|| {
+                    let peer_addr = session.peer_addr();
+                    ctx.addr_to_node.get(&peer_addr).and_then(|node_id| {
+                        ctx.peers.get(&*node_id).and_then(|p| {
+                            (p.value().session.session_id() == session.session_id())
+                                .then(|| (p.value().addr, p.value().session.clone()))
+                        })
                     })
                 })
                 .or_else(|| {
