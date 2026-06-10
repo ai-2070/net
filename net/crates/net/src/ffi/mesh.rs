@@ -858,8 +858,9 @@ pub unsafe extern "C" fn net_mesh_start(handle: *mut MeshNodeHandle) -> c_int {
     };
     let node = h.inner.clone();
     // `start` spawns internal tasks via tokio::spawn; run under the
-    // shared runtime.
-    block_on(async move { node.start() });
+    // shared runtime. `start_arc` also enables the periodic capability
+    // re-announce (keeps the node discoverable past one TTL).
+    block_on(async move { node.start_arc() });
     0
 }
 

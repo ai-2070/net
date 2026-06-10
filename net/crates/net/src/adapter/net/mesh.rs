@@ -738,6 +738,24 @@ pub struct MeshNodeConfig {
     /// values waste CPU; high values keep stale peers queryable past
     /// their TTL.
     pub capability_gc_interval: Duration,
+    /// How often this node re-announces its own capabilities to keep its
+    /// entry alive. Capability entries carry a TTL (default 300 s) and the
+    /// fold sweeper evicts them on expiry, so without a periodic
+    /// re-announce a node's own self-entry ages out of its LOCAL fold —
+    /// after which its callee-side nRPC capability gate
+    /// (`may_execute(self, …)`) finds no self-entry and denies every
+    /// inbound call — AND out of every PEER's fold, so it stops being
+    /// discoverable (`find_service_nodes` returns empty). Both happen ~one
+    /// TTL after the last announce. The loop re-broadcasts with a TTL of
+    /// `2 ×` this interval, so a single missed re-announce can't expire
+    /// the entry. `Duration::MAX` disables the loop (for nodes that
+    /// re-announce on their own cadence). Default 150 s (→ 300 s TTL,
+    /// matching the announce default).
+    ///
+    /// The loop runs only for nodes started via [`MeshNode::start_arc`]
+    /// (the SDK / FFI path) — re-broadcasting needs an owned `Arc`. A bare
+    /// [`MeshNode::start`] omits it.
+    pub capability_reannounce_interval: Duration,
     /// This node's subnet. Defaults to [`SubnetId::GLOBAL`] — "no
     /// restriction." Visibility checks compare against this value on
     /// both the publish and subscribe paths.
@@ -881,6 +899,7 @@ impl MeshNodeConfig {
             membership_ack_timeout: Duration::from_secs(5),
             require_signed_capabilities: true,
             capability_gc_interval: Duration::from_secs(60),
+            capability_reannounce_interval: Duration::from_secs(150),
             subnet: SubnetId::GLOBAL,
             subnet_policy: None,
             default_visibility: Visibility::Global,
@@ -965,6 +984,14 @@ impl MeshNodeConfig {
     /// Set the capability-index GC sweep interval.
     pub fn with_capability_gc_interval(mut self, interval: Duration) -> Self {
         self.capability_gc_interval = interval;
+        self
+    }
+
+    /// Set the capability self-re-announce interval. See
+    /// [`Self::capability_reannounce_interval`]. `Duration::MAX` disables
+    /// the loop.
+    pub fn with_capability_reannounce_interval(mut self, interval: Duration) -> Self {
+        self.capability_reannounce_interval = interval;
         self
     }
 
@@ -1926,6 +1953,13 @@ pub struct MeshNode {
     pending_stream_grants_notify: Arc<Notify>,
     /// Whether the node has been started
     started: AtomicBool,
+    /// Weak self-reference, set by [`Self::start_arc`] when the node is
+    /// driven through an `Arc`. The capability re-announce loop upgrades it
+    /// each tick to call `announce_capabilities` (the broadcast goes
+    /// through `&self` per-peer sends, so it needs an owned `Arc`). Unset
+    /// on a bare [`Self::start`] of a non-`Arc` node, in which case the
+    /// loop is a no-op. Set-once.
+    self_weak: std::sync::OnceLock<std::sync::Weak<MeshNode>>,
     /// Number of `accept()` calls currently awaiting
     /// `handshake_responder`. A simple `started.load(Acquire)`
     /// guard at `accept` entry is a TOCTOU — `start()` could fire
@@ -2297,6 +2331,7 @@ impl MeshNode {
             pending_stream_grants: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             pending_stream_grants_notify: Arc::new(Notify::new()),
             started: AtomicBool::new(false),
+            self_weak: std::sync::OnceLock::new(),
             accept_in_flight: std::sync::atomic::AtomicUsize::new(0),
         })
     }
@@ -2780,6 +2815,12 @@ impl MeshNode {
     /// `started.load` and its `handshake_responder` poll, after
     /// which the dispatcher would race the responder for the
     /// inbound msg1.
+    ///
+    /// Note: this does NOT enable the periodic capability re-announce
+    /// (which keeps the node's entry alive in its own and peers' folds
+    /// past one TTL) — that needs an owned `Arc` to re-broadcast. Drive
+    /// the node through [`Self::start_arc`] (as the SDK / FFI do) to get
+    /// it; a bare `start` is for short-lived / test nodes.
     pub fn start(&self) {
         use std::sync::atomic::Ordering as AtOrd;
         if self.started.swap(true, AtOrd::SeqCst) {
@@ -2821,6 +2862,7 @@ impl MeshNode {
             }
         };
         let capability_gc_handle = self.spawn_capability_gc_loop();
+        let capability_reannounce_handle = self.spawn_capability_reannounce_loop();
         let fold_generation_gc_handle = self.spawn_fold_generation_gc_loop();
         let token_sweep_handle = self.spawn_token_sweep_loop();
         // Port-mapping task is opt-in — only spawned when the
@@ -2891,6 +2933,7 @@ impl MeshNode {
             tasks.push(retransmit_handle);
             tasks.push(router_handle);
             tasks.push(capability_gc_handle);
+            tasks.push(capability_reannounce_handle);
             tasks.push(fold_generation_gc_handle);
             tasks.push(token_sweep_handle);
             #[cfg(feature = "port-mapping")]
@@ -2898,6 +2941,23 @@ impl MeshNode {
                 tasks.push(h);
             }
         });
+    }
+
+    /// Start the node through its `Arc`, enabling the periodic capability
+    /// re-announce on top of everything [`Self::start`] does. The
+    /// re-announce re-broadcasts this node's capabilities every
+    /// [`MeshNodeConfig::capability_reannounce_interval`], keeping its
+    /// entry alive in its own fold (so its callee-side nRPC gate doesn't
+    /// expire its own services) AND in every peer's fold (so it stays
+    /// discoverable) past one announcement TTL. Production entry points
+    /// (the SDK, the FFI) call this; a bare [`Self::start`] omits the
+    /// re-announce (fine for short-lived / test nodes). Idempotent.
+    pub fn start_arc(self: &Arc<Self>) {
+        // Store the weak before `start` spawns the re-announce loop, which
+        // captures it. `set` only fails if already set (a re-start) — the
+        // existing weak is equally valid, so ignore the result.
+        let _ = self.self_weak.set(Arc::downgrade(self));
+        self.start();
     }
 
     /// Spawn the NAT classification loop. Waits until at least 2
@@ -3059,6 +3119,64 @@ impl MeshNode {
                 tokio::select! {
                     _ = tick.tick() => {
                         seen.retain(|_, instant| instant.elapsed() < dedup_retention);
+                    }
+                    _ = shutdown_notify.notified() => break,
+                }
+            }
+        })
+    }
+
+    /// Spawn the periodic capability re-announce loop.
+    ///
+    /// Capability fold entries carry a TTL (default 300 s) and the
+    /// background sweeper evicts them on expiry. Without a periodic
+    /// re-announce, a node's own self-entry ages out of its LOCAL fold
+    /// ~one TTL after its last announce — after which its callee-side nRPC
+    /// capability gate (`may_execute(self, …)`) finds no self-entry and
+    /// denies every inbound call (the failure the c128 nRPC bench tripped
+    /// once it ran past one TTL) — AND out of every PEER's fold, so it
+    /// stops being discoverable.
+    ///
+    /// Every [`MeshNodeConfig::capability_reannounce_interval`] the loop
+    /// re-broadcasts the current capability set via `announce_capabilities`
+    /// with a TTL of `2 ×` the interval (floored at 1 s, since the announce
+    /// TTL is whole-seconds), so a single missed tick can't expire the
+    /// entry. This refreshes both the local self-index and peers' folds.
+    /// `Duration::MAX` disables the loop.
+    ///
+    /// Re-broadcasting needs an owned `Arc` (the per-peer sends go through
+    /// `&self`), so the loop upgrades the `Weak` stored by [`Self::start_arc`]
+    /// each tick — using a `Weak` (not `Arc`) so the task doesn't keep the
+    /// node alive. A bare [`Self::start`] never set that weak, so the loop is
+    /// a no-op there (`start_arc` is the path that enables re-announce).
+    fn spawn_capability_reannounce_loop(&self) -> JoinHandle<()> {
+        let interval = self.config.capability_reannounce_interval;
+        // `Some` only when the node was started via `start_arc`.
+        let weak = self.self_weak.get().cloned();
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        tokio::spawn(async move {
+            // No owned-`Arc` path (bare start) or disabled → nothing to do.
+            let (Some(weak), false) = (weak, interval == Duration::MAX) else {
+                let _ = shutdown_notify.notified().await;
+                return;
+            };
+            // TTL = 2× interval so an entry survives a missed re-announce;
+            // floored at 1 s because `announce_capabilities_with` truncates
+            // the TTL to whole seconds.
+            let ttl = interval.saturating_mul(2).max(Duration::from_secs(1));
+            let mut tick = tokio::time::interval(nonzero_interval(interval));
+            // Skip the immediate t=0 tick — the initial announce (if any)
+            // already laid the entry down; this loop only refreshes it.
+            tick.tick().await;
+            while !shutdown.load(Ordering::Acquire) {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        let Some(node) = weak.upgrade() else { break };
+                        let caps = node.user_caps_snapshot();
+                        if let Err(e) = node.announce_capabilities_with(caps, ttl, true).await {
+                            tracing::debug!(error = %e, "capability re-announce failed");
+                        }
                     }
                     _ = shutdown_notify.notified() => break,
                 }
@@ -12201,6 +12319,74 @@ mod reclassify_override_race_tests {
                 .await
                 .expect("MeshNode::new"),
         )
+    }
+
+    /// Regression for the capability re-announce loop. A node's own
+    /// capability self-entry TTL-expires and the fold sweeper reaps it,
+    /// after which (a) its callee-side nRPC gate denies its own services
+    /// and (b) peers can no longer discover it. The loop must re-announce
+    /// on its cadence — keeping the self-entry alive past its TTL (checked
+    /// here) while advancing `capability_version` (the actual broadcast).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capability_reannounce_keeps_self_entry_alive_past_ttl() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x21u8; 32])
+            .with_capability_reannounce_interval(Duration::from_millis(40));
+        let node = Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        );
+        // Self-entry with a deliberately short TTL — without the loop it
+        // would expire and the fold sweeper (500 ms) would reap it.
+        node.announce_capabilities_with(CapabilitySet::new(), Duration::from_millis(120), true)
+            .await
+            .expect("announce");
+        node.start_arc();
+
+        let v0 = node.capability_version.load(Ordering::Relaxed);
+        // Past the 120 ms TTL and a fold sweep tick.
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        let present = node
+            .capability_fold
+            .with_state(|s| s.by_node.contains_key(&node.node_id));
+        let v1 = node.capability_version.load(Ordering::Relaxed);
+        assert!(
+            present,
+            "self-entry must survive past its TTL while the re-announce loop runs"
+        );
+        assert!(
+            v1 >= v0 + 3,
+            "the loop must re-announce (broadcast) periodically: version {v0} -> {v1}"
+        );
+    }
+
+    /// Control for the above: with the loop disabled (`Duration::MAX`),
+    /// the self-entry expires and is swept — the pre-fix behavior, pinned
+    /// so the loop's effect is unambiguous.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capability_self_entry_expires_without_reannounce() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x22u8; 32])
+            .with_capability_reannounce_interval(Duration::MAX);
+        let node = Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        );
+        node.announce_capabilities_with(CapabilitySet::new(), Duration::from_millis(120), true)
+            .await
+            .expect("announce");
+        node.start_arc();
+
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        let present = node
+            .capability_fold
+            .with_state(|s| s.by_node.contains_key(&node.node_id));
+        assert!(
+            !present,
+            "without the re-announce loop the self-entry must expire and be swept"
+        );
     }
 
     /// Pre-fix behavior: with override inactive, the commit

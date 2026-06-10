@@ -486,7 +486,10 @@ impl Mesh {
     /// Call this after connecting to peers. Events won't be received
     /// until `start()` is called.
     pub fn start(&self) {
-        self.node.start();
+        // `start_arc` (vs bare `start`) enables the periodic capability
+        // re-announce, keeping this node's entry alive in its own and
+        // peers' folds past one announcement TTL.
+        self.node.start_arc();
     }
 
     /// Number of connected peers.
