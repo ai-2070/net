@@ -276,9 +276,15 @@ items:
   that is 500K channel wakes/s, and it is where the "RedEX wake: 5–10 µs" line in
   `PERF_AUDIT_2026_05_19_NRPC.md` lives. The v1 watcher model is live-tail by design;
   batched delivery is a v2 architecture item. Listed as the known ceiling, not a bug.
-- **`bench_append_batch_disk` has still never been run** — phases 1–4 claim
-  multi-× wins with no captured before/after. Cheap to close; do it with the next
-  bench sweep.
+- **`bench_append_batch_disk`** — ✅ run (2026-06-10, Windows dev box; first capture).
+  64-event batches: **64 B → 20.2 µs/batch (~3.17 M ev/s)**, **1 KiB → 62.5 µs/batch
+  (~1.02 M ev/s)** ≈ ~315 ns/event. The companion
+  `redex_append_batch_disk_policies` confirms the Phase 3/4 background-fsync design:
+  `never`/default ~23 µs/batch vs `every_n_1` (synchronous fsync per batch) ~853 µs/batch
+  — i.e. the appender pays only the page-cache write and coalescing is **~40×** faster
+  than per-batch fsync. (No true before/after — the pre-phase code isn't checked out —
+  but the policy split is direct evidence the phases 1–4 wins are real. Windows numbers;
+  not added to `BENCHMARKS.md`, which is M1/i9-format.)
 
 CortEX fold dispatch: decode path is zero-copy (`Bytes::slice`, postcard), context
 construction allocation-free (`cortex/rpc.rs:1495,1598-1604`); the only hot-path issue
