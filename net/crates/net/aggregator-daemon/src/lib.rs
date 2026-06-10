@@ -290,11 +290,15 @@ pub async fn boot(cli: Cli) -> Result<BootedDaemon, DaemonError> {
                 path: cli.config.clone(),
                 error: e,
             })?;
-    let config: Config = toml::from_str(&raw).map_err(DaemonError::ConfigParse)?;
 
     // The config holds the mesh PSK; warn if it's readable by other
     // local users (advisory — see `warn_if_config_world_readable`).
+    // Checked here, *before* parsing: a malformed config still exposed
+    // the PSK on disk, so the operator must hear about loose perms even
+    // when boot is about to fail on a `ConfigParse` error.
     warn_if_config_world_readable(&cli.config).await;
+
+    let config: Config = toml::from_str(&raw).map_err(DaemonError::ConfigParse)?;
 
     // CLI listen override.
     let listen = cli.listen.unwrap_or(config.listen.clone());
@@ -826,17 +830,30 @@ fn decode_psk(s: &str) -> Result<[u8; 32], DaemonError> {
 /// Warn (don't fail) if the daemon config is group- or
 /// world-readable. The config holds `psk_hex` — the mesh
 /// pre-shared key that gates every handshake — so a permissive
-/// mode is the same exposure `cli/identity.rs` guards its seed
-/// against. We only warn rather than refuse: unlike the identity
-/// seed (created by our own CLI with mode 0600), the daemon config
-/// is operator-authored and may live under a deployment's own
-/// permission scheme, so failing closed would be too aggressive.
-/// No-op on non-Unix (no clean mode bits via `std::fs`).
+/// mode is the same exposure `cli/identity.rs::check_strict_permissions`
+/// guards its seed against. The detection rule (mode `& 0o077`) is
+/// deliberately identical; the *policy* differs: the CLI fails closed
+/// because it created the seed at 0600, whereas the daemon config is
+/// operator-authored and may live under a deployment's own permission
+/// scheme, so we only warn. Kept as a separate local check rather than
+/// a shared cross-crate helper because the CLI reaches this crate only
+/// transitively (via `net-sdk`) and the shared kernel is two lines.
 #[cfg(unix)]
 async fn warn_if_config_world_readable(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = tokio::fs::metadata(path).await else {
-        return;
+    let meta = match tokio::fs::metadata(path).await {
+        Ok(m) => m,
+        // Couldn't stat the file we just read — surface it (don't go
+        // silent) so a missing exposure check is at least observable.
+        Err(e) => {
+            tracing::debug!(
+                config = %path.display(),
+                error = %e,
+                "could not stat aggregator config to check permissions; \
+                 skipping the PSK-exposure check",
+            );
+            return;
+        }
     };
     let mode = meta.permissions().mode() & 0o777;
     // Group/other readable (or writable) → the PSK is exposed.
@@ -851,8 +868,19 @@ async fn warn_if_config_world_readable(path: &std::path::Path) {
     }
 }
 
+/// Non-Unix has no clean mode bits via `std::fs`, so the permission
+/// gate can't run — but stay loud about it rather than silent (parity
+/// with the CLI's Windows branch), since the PSK-bearing config is just
+/// as exposable under a permissive NTFS ACL.
 #[cfg(not(unix))]
-async fn warn_if_config_world_readable(_path: &std::path::Path) {}
+async fn warn_if_config_world_readable(path: &std::path::Path) {
+    tracing::warn!(
+        config = %path.display(),
+        "aggregator config permission check is a no-op on this platform; \
+         the file holds the mesh PSK (psk_hex) — restrict its ACL so it \
+         isn't readable by other local users",
+    );
+}
 
 fn decode_seed(s: &str) -> Result<[u8; 32], String> {
     decode_hex_32(s)
