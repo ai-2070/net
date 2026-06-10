@@ -1872,20 +1872,14 @@ impl MeshBlobAdapter {
             } else {
                 // Fetch the node's bytes (each tree node is
                 // itself a chunk-shaped Small blob at
-                // `dataforts/blob/<hex32>`).
+                // `dataforts/blob/<hex32>`). PERF_AUDIT §6.11 —
+                // `fetch_chunk` already blake3-verifies the
+                // returned payload against `node_hash`; the prior
+                // defense-in-depth recompute here was pure waste
+                // and only ever fired on a `fetch_chunk` bug, in
+                // which case its own verify would already have
+                // caught the mismatch. Drop the recompute.
                 let bytes = self.fetch_chunk(&node_hash).await?;
-                // BLAKE3 cross-check against the parent's
-                // stored child hash. `fetch_chunk` already
-                // verifies; the re-check here is defense-in-
-                // depth + makes the tree-walk integrity
-                // invariant explicit at this layer.
-                let computed: [u8; 32] = blake3::hash(&bytes).into();
-                if computed != node_hash {
-                    return Err(BlobError::HashMismatch {
-                        expected: node_hash,
-                        actual: computed,
-                    });
-                }
                 // Populate the cache for the next walk that
                 // touches this node. Bytes are cloned only on
                 // the miss path; the hit path returns the
@@ -2280,20 +2274,15 @@ impl MeshBlobAdapter {
         for (i, chunk) in stripe.chunks.iter().enumerate() {
             match self.fetch_chunk(&chunk.hash).await {
                 Ok(bytes) => {
-                    // Verify hash before trusting the bytes — the
-                    // fetch_chunk path already does this, but
-                    // belt-and-braces for reconstruction inputs.
-                    let computed: [u8; 32] = blake3::hash(&bytes).into();
-                    if computed != chunk.hash {
-                        // Treat as missing for reconstruction
-                        // purposes — the RS encoder requires
-                        // trusted inputs.
-                        shards.push(None);
-                        if i < k_usize {
-                            missing_data_indices.push(i);
-                        }
-                        continue;
-                    }
+                    // PERF_AUDIT §6.11 — `fetch_chunk` already
+                    // blake3-verifies the returned payload against
+                    // `chunk.hash`. The prior belt-and-braces
+                    // recompute here was pure waste — by the time
+                    // `bytes` is in hand, the hash equality is a
+                    // contract that has already been checked. Drop
+                    // the recompute; any future divergence between
+                    // the contract and the implementation is the
+                    // `fetch_chunk` test's job to catch.
                     // RS reconstruction needs mutable buffers
                     // (resize + in-place decode). Materialize the
                     // Bytes into an owned Vec here — the

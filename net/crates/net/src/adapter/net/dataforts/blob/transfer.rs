@@ -595,13 +595,26 @@ async fn serve_chunk(
                 // independently safe: a one-packet call can't partially
                 // commit and then resend a duplicate under a fresh
                 // sequence on retry.
-                for chunk in bytes.chunks(DATA_FRAME_BYTES) {
-                    if send_one(&mesh, &stream, Bytes::copy_from_slice(chunk))
+                // PERF_AUDIT §6.6 — `bytes` is already a refcounted
+                // `Bytes`; slice into it instead of copying each
+                // 8 KiB frame. A 16 MiB chunk served to a peer
+                // previously paid ~2048 allocations + a full 16 MiB
+                // memcpy here; with slicing it pays N refcount
+                // bumps and zero memcpy. `Bytes::slice` returns a
+                // sub-view that keeps the original buffer alive,
+                // which is exactly what we want — the source
+                // `bytes` stays in scope for the whole loop.
+                let total = bytes.len();
+                let mut offset = 0;
+                while offset < total {
+                    let end = (offset + DATA_FRAME_BYTES).min(total);
+                    if send_one(&mesh, &stream, bytes.slice(offset..end))
                         .await
                         .is_err()
                     {
                         break;
                     }
+                    offset = end;
                 }
             }
         }
