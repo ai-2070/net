@@ -53,18 +53,21 @@
 //! add a handle:
 //!
 //! 1. Wrap every inner field in [`std::mem::ManuallyDrop`] and embed
-//!    one [`HandleGuard`] (not in `ManuallyDrop` — it must outlive
-//!    the inner so post-free `try_enter` calls land on valid memory).
-//! 2. In every `extern "C"` op, gate on [`HandleGuard::try_enter`]
-//!    *before* touching any inner field, and return the handle's
+//!    one [`crate::ffi::handle_guard::HandleGuard`] (not in
+//!    `ManuallyDrop` — it must outlive the inner so post-free
+//!    `try_enter` calls land on valid memory).
+//! 2. In every `extern "C"` op, gate on
+//!    [`crate::ffi::handle_guard::HandleGuard::try_enter`] *before*
+//!    touching any inner field, and return the handle's
 //!    "invalid/shutting down" sentinel (NULL / error code) on `None`.
-//! 3. Don't hold the returned [`HandleOp`] across a long blocking
+//! 3. Don't hold the returned
+//!    [`crate::ffi::handle_guard::HandleOp`] across a long blocking
 //!    call — clone the (Arc-backed) inner out, drop the guard, then
 //!    re-enter only to write back, so a concurrent `_free` never
 //!    waits on a caller-set deadline (see `ffi::aggregator`).
 //! 4. In `_free`, gate the `ManuallyDrop::drop` of each inner field
-//!    on [`HandleGuard::begin_free`] returning `true`; never
-//!    `Box::from_raw` — leak the box.
+//!    on [`crate::ffi::handle_guard::HandleGuard::begin_free`]
+//!    returning `true`; never `Box::from_raw` — leak the box.
 //! 5. Any pointer handed back to C must be an owned copy, never a
 //!    borrow into a `ManuallyDrop` field (which `_free` can drop).
 
