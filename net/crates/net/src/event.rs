@@ -559,16 +559,21 @@ impl Serialize for StoredEvent {
         // mode in audit / signing pipelines that look at the
         // re-emitted JSON.
         //
-        // `RawValue::from_string` validates the JSON (so the
+        // `from_str::<&RawValue>` validates the JSON (so the
         // pre-existing "invalid raw JSON returns a serde error,
-        // not a silent null" guarantee is preserved), but emits
-        // the original bytes verbatim instead of round-tripping
-        // through a value tree.
+        // not a silent null" guarantee is preserved) AND borrows
+        // the input bytes — no allocation.
+        //
+        // PERF_AUDIT §1.8 — pre-fix this used
+        // `RawValue::from_string(raw_str.to_string())`, which
+        // allocated a fresh `String` copy of the entire payload
+        // per serialized event. The borrowed form is byte-for-byte
+        // identical on the wire but skips the copy.
         let raw_str = std::str::from_utf8(&self.raw)
             .map_err(|e| serde::ser::Error::custom(format!("invalid raw UTF-8: {}", e)))?;
-        let raw_value = serde_json::value::RawValue::from_string(raw_str.to_string())
+        let raw_value: &serde_json::value::RawValue = serde_json::from_str(raw_str)
             .map_err(|e| serde::ser::Error::custom(format!("invalid raw JSON: {}", e)))?;
-        state.serialize_field("raw", &*raw_value)?;
+        state.serialize_field("raw", raw_value)?;
         state.serialize_field("insertion_ts", &self.insertion_ts)?;
         state.serialize_field("shard_id", &self.shard_id)?;
         // Always emit `dedup_id` to keep the wire shape stable —

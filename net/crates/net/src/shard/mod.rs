@@ -316,12 +316,58 @@ pub struct ShardTable {
     /// locking the shard mutex.
     counters: Vec<Arc<ShardCounters>>,
     /// Map from shard ID to index in `shards`/`counters`.
-    shard_index: std::collections::HashMap<u16, usize>,
+    ///
+    /// PERF_AUDIT §1.5 — uses `BuildU16IdentityHasher`, a hand-rolled
+    /// `BuildHasher` that returns the key bytes verbatim (no SipHash
+    /// mixing). Shard IDs are internally allocated by the bus / mapper,
+    /// not influenced by external input, so the DoS-resistance SipHash
+    /// is there to provide is irrelevant here — identity hashing on a
+    /// `u16` is collision-free and ~10× faster than the std default.
+    shard_index: std::collections::HashMap<u16, usize, BuildU16IdentityHasher>,
 }
+
+/// Identity hasher for `u16` map keys. Shard IDs live in `0..=65535`
+/// and are allocated by the bus / mapper — never by external input —
+/// so the SipHash mixing the std default provides for DoS-resistance
+/// adds ~15-25 ns per lookup with zero benefit. The identity hash
+/// drops that to ~1 ns and stays collision-free across the entire
+/// `u16` range.
+///
+/// Per PERF_AUDIT_2026_06_10_FULL_CRATE.md §1.5.
+#[derive(Default, Clone)]
+struct U16IdentityHasher(u64);
+
+impl std::hash::Hasher for U16IdentityHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write_u16(&mut self, v: u16) {
+        self.0 = v as u64;
+    }
+    /// Defensive fallback. The std `Hash for u16` impl calls
+    /// `write_u16` directly, so this byte path is only reached if
+    /// someone hashes a non-u16 key against this hasher (which would
+    /// be a bug). Pack the first 8 bytes into a u64 so the result is
+    /// at least defined, and let it surface as a runtime hash collision
+    /// rather than a panic.
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes.iter().take(8) {
+            self.0 = self.0.rotate_left(8) ^ (b as u64);
+        }
+    }
+}
+
+type BuildU16IdentityHasher = std::hash::BuildHasherDefault<U16IdentityHasher>;
 
 impl ShardTable {
     fn new(shards: Vec<Shard>) -> Self {
-        let mut shard_index = std::collections::HashMap::with_capacity(shards.len());
+        let mut shard_index = std::collections::HashMap::with_capacity_and_hasher(
+            shards.len(),
+            BuildU16IdentityHasher::default(),
+        );
         let mut counters = Vec::with_capacity(shards.len());
         let shards: Vec<_> = shards
             .into_iter()
@@ -653,7 +699,20 @@ impl ShardManager {
         // Bucket by table index. Using a Vec<Vec<_>> keyed by index is
         // cheaper than a HashMap for the common case of a small
         // shard count.
-        let mut groups: Vec<Vec<Bytes>> = (0..table.shards.len()).map(|_| Vec::new()).collect();
+        //
+        // PERF_AUDIT §1.7 — pre-size each per-shard `Vec<Bytes>` to
+        // the expected per-shard event count (events.len() / nshards),
+        // doubled for headroom. Pre-fix every group started at
+        // capacity 0 and grew by doubling, paying `nshards + 1`
+        // allocations and ~2× redundant memmove of the 32-byte
+        // `Bytes` handles per batch. `events.len() / shards.len() * 2`
+        // covers the typical uniformly-distributed batch with a small
+        // overshoot, and the rare worst-case (all events in one shard)
+        // still grows by doubling from a non-zero base.
+        let per_group_hint = (events.len() / table.shards.len().max(1)) * 2;
+        let mut groups: Vec<Vec<Bytes>> = (0..table.shards.len())
+            .map(|_| Vec::with_capacity(per_group_hint))
+            .collect();
         let mut group_ids: Vec<u16> = vec![0; groups.len()];
 
         let mut unrouted = 0usize;
@@ -816,7 +875,7 @@ impl ShardManager {
         F: FnOnce(
             &Vec<Arc<parking_lot::Mutex<Shard>>>,
             &Vec<Arc<ShardCounters>>,
-            &std::collections::HashMap<u16, usize>,
+            &std::collections::HashMap<u16, usize, BuildU16IdentityHasher>,
         ) -> ShardTable,
     {
         let _guard = self.rebuild_lock.lock();
