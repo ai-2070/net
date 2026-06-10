@@ -1311,8 +1311,10 @@ impl MeshBlobAdapter {
         // Finalize the tree. Persist every trailing node + the
         // root before returning the BlobRef.
         let output = builder.finalize()?;
+        // Builder-emitted node hashes are blake3(bytes) computed
+        // inside TreeBuilder — trusted, skip the verify pass. (§6.2)
         for node in &output.trailing_nodes {
-            self.store_chunk(&node.hash, &node.bytes).await?;
+            self.store_chunk_prehashed(&node.hash, &node.bytes).await?;
         }
         // `root_bytes.is_empty()` signals "already in chunk
         // store" — the streamed-child peel in TreeBuilder::finalize
@@ -1321,7 +1323,7 @@ impl MeshBlobAdapter {
         // that case; the chunk store already carries
         // (root_hash → child bytes).
         if !output.root_bytes.is_empty() {
-            self.store_chunk(&output.root_hash, &output.root_bytes)
+            self.store_chunk_prehashed(&output.root_hash, &output.root_bytes)
                 .await?;
         }
 
@@ -1392,8 +1394,10 @@ impl MeshBlobAdapter {
         }
 
         let output = builder.finalize()?;
+        // Builder-emitted node hashes are blake3(bytes) computed
+        // inside TreeBuilder — trusted, skip the verify pass. (§6.2)
         for node in &output.trailing_nodes {
-            self.store_chunk(&node.hash, &node.bytes).await?;
+            self.store_chunk_prehashed(&node.hash, &node.bytes).await?;
         }
         // `root_bytes.is_empty()` signals "already in chunk
         // store" — the streamed-child peel in TreeBuilder::finalize
@@ -1402,7 +1406,7 @@ impl MeshBlobAdapter {
         // that case; the chunk store already carries
         // (root_hash → child bytes).
         if !output.root_bytes.is_empty() {
-            self.store_chunk(&output.root_hash, &output.root_bytes)
+            self.store_chunk_prehashed(&output.root_hash, &output.root_bytes)
                 .await?;
         }
 
@@ -1469,7 +1473,10 @@ impl MeshBlobAdapter {
             // into the striper).
             let parity_iter = closed.block.chunks.iter().filter(|c| c.is_parity());
             for (p_ref, p_bytes) in parity_iter.zip(closed.parity_bytes.iter()) {
-                adapter.store_chunk(&p_ref.hash, p_bytes).await?;
+                // Parity hashes were computed inside
+                // `RsEncoder::encode` (erasure.rs) over these exact
+                // bytes — trusted, skip the verify pass. (§6.2)
+                adapter.store_chunk_prehashed(&p_ref.hash, p_bytes).await?;
             }
             let data_count = closed.block.chunks.iter().filter(|c| c.is_data()).count() as u64;
             *data_chunk_count = data_chunk_count.saturating_add(data_count);
@@ -1489,8 +1496,11 @@ impl MeshBlobAdapter {
             let leaf_hash: [u8; 32] = blake3::hash(&leaf_bytes).into();
             let leaf_size = leaf.covered_bytes();
             // Persist the leaf as a tree-node chunk (same channel
-            // shape as data chunks).
-            adapter.store_chunk(&leaf_hash, &leaf_bytes).await?;
+            // shape as data chunks). `leaf_hash` was just hashed
+            // over `leaf_bytes` above — trusted. (§6.2)
+            adapter
+                .store_chunk_prehashed(&leaf_hash, &leaf_bytes)
+                .await?;
             // Lift into the internal-cascade builder. The
             // emitted nodes (the leaf itself + any internal
             // closures) are returned but the leaf bytes we
@@ -1501,9 +1511,13 @@ impl MeshBlobAdapter {
             // Persist every internal-level closure (the leaf
             // emission at level 0 is already stored; only the
             // level > 0 internals need separate persistence).
+            // Builder-emitted node hashes are blake3(bytes) computed
+            // inside TreeBuilder — trusted. (§6.2)
             for node in &emitted {
                 if node.level > 0 {
-                    adapter.store_chunk(&node.hash, &node.bytes).await?;
+                    adapter
+                        .store_chunk_prehashed(&node.hash, &node.bytes)
+                        .await?;
                 }
             }
             Ok(())
@@ -1534,7 +1548,10 @@ impl MeshBlobAdapter {
                                 Vec::with_capacity(chunk_size_usize),
                             );
                             let chunk_hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
-                            self.store_chunk(&chunk_hash, &chunk_bytes).await?;
+                            // Hash was just computed over chunk_bytes
+                            // — trusted, skip verify. (§6.2)
+                            self.store_chunk_prehashed(&chunk_hash, &chunk_bytes)
+                                .await?;
                             let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
                             if let Some(closed) = striper.push_chunk(chunk_bytes, cref)? {
                                 flush_stripe(self, closed, &mut builder, &mut data_chunk_count)
@@ -1546,7 +1563,9 @@ impl MeshBlobAdapter {
                 if !buffer.is_empty() {
                     let chunk_bytes = std::mem::take(&mut buffer);
                     let chunk_hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
-                    self.store_chunk(&chunk_hash, &chunk_bytes).await?;
+                    // Just-computed hash — trusted. (§6.2)
+                    self.store_chunk_prehashed(&chunk_hash, &chunk_bytes)
+                        .await?;
                     let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
                     if let Some(closed) = striper.push_chunk(chunk_bytes, cref)? {
                         flush_stripe(self, closed, &mut builder, &mut data_chunk_count).await?;
@@ -1561,7 +1580,9 @@ impl MeshBlobAdapter {
                     chunker.extend(bytes.as_ref());
                     while let Some(chunk_bytes) = chunker.try_next_chunk() {
                         let chunk_hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
-                        self.store_chunk(&chunk_hash, &chunk_bytes).await?;
+                        // Just-computed hash — trusted. (§6.2)
+                        self.store_chunk_prehashed(&chunk_hash, &chunk_bytes)
+                            .await?;
                         let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
                         // RS striper still owns Vec<u8> internally; one
                         // copy here is the cost of routing CDC output
@@ -1576,7 +1597,9 @@ impl MeshBlobAdapter {
                 }
                 for chunk_bytes in chunker.finalize() {
                     let chunk_hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
-                    self.store_chunk(&chunk_hash, &chunk_bytes).await?;
+                    // Just-computed hash — trusted. (§6.2)
+                    self.store_chunk_prehashed(&chunk_hash, &chunk_bytes)
+                        .await?;
                     let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
                     if let Some(closed) = striper.push_chunk(chunk_bytes.to_vec(), cref)? {
                         flush_stripe(self, closed, &mut builder, &mut data_chunk_count).await?;
@@ -1600,8 +1623,10 @@ impl MeshBlobAdapter {
         }
 
         let output = builder.finalize()?;
+        // Builder-emitted node hashes are blake3(bytes) computed
+        // inside TreeBuilder — trusted, skip the verify pass. (§6.2)
         for node in &output.trailing_nodes {
-            self.store_chunk(&node.hash, &node.bytes).await?;
+            self.store_chunk_prehashed(&node.hash, &node.bytes).await?;
         }
         // `root_bytes.is_empty()` signals "already in chunk
         // store" — the streamed-child peel in TreeBuilder::finalize
@@ -1610,7 +1635,7 @@ impl MeshBlobAdapter {
         // that case; the chunk store already carries
         // (root_hash → child bytes).
         if !output.root_bytes.is_empty() {
-            self.store_chunk(&output.root_hash, &output.root_bytes)
+            self.store_chunk_prehashed(&output.root_hash, &output.root_bytes)
                 .await?;
         }
 
@@ -2013,12 +2038,14 @@ impl MeshBlobAdapter {
         // addressed and reachable for any future re-attempt
         // (the chunk's hash matches its bytes regardless of
         // whether a tree references it yet).
-        self.store_chunk(&hash, chunk_bytes).await?;
+        // Just-computed hash + builder-emitted nodes — trusted,
+        // skip the verify pass. (§6.2)
+        self.store_chunk_prehashed(&hash, chunk_bytes).await?;
         // Push into the builder; persist any cascade-closed nodes
         // before returning.
         let closed = builder.push_chunk(ChunkRefV3::data(hash, chunk_size))?;
         for node in &closed {
-            self.store_chunk(&node.hash, &node.bytes).await?;
+            self.store_chunk_prehashed(&node.hash, &node.bytes).await?;
         }
         Ok(())
     }
@@ -2271,7 +2298,12 @@ impl MeshBlobAdapter {
                     );
                     continue;
                 }
-                if let Err(e) = self.store_chunk(&chunk_ref.hash, logical_bytes).await {
+                // Local verify above pinned `computed == chunk_ref.hash`
+                // — trusted, skip the redundant in-store verify. (§6.2)
+                if let Err(e) = self
+                    .store_chunk_prehashed(&chunk_ref.hash, logical_bytes)
+                    .await
+                {
                     tracing::warn!(
                         hash = ?chunk_ref.hash,
                         error = %e,
@@ -2413,6 +2445,37 @@ impl MeshBlobAdapter {
                 actual: computed,
             });
         }
+        self.store_chunk_with_lock(hash, bytes).await
+    }
+
+    /// Internal: store a chunk whose `hash` the caller has already
+    /// verified (or just computed) over `bytes`. Skips the per-call
+    /// blake3 second-pass guard that `store_chunk` does — for hot
+    /// in-crate callers (CDC/Fixed chunker, `emit_tree_chunk`,
+    /// `flush_stripe` parity/leaf/internals, `TreeBuilder` finalize,
+    /// manifest store after `chunk_payload` verification) the bytes
+    /// were hashed the line before and re-hashing is pure waste.
+    /// Per PERF_AUDIT_2026_06_10_FULL_CRATE.md §6.2.
+    ///
+    /// This is `pub(crate)` only because the trusted callers live in
+    /// sibling modules; outside the crate, use `store_chunk` (or the
+    /// `BlobAdapter::store` surface) which never trusts the caller.
+    pub(crate) async fn store_chunk_prehashed(
+        &self,
+        hash: &[u8; 32],
+        bytes: &[u8],
+    ) -> Result<(), BlobError> {
+        self.store_chunk_with_lock(hash, bytes).await
+    }
+
+    /// Body shared by `store_chunk` (verifying) and
+    /// `store_chunk_prehashed` (trusts caller): per-hash lock acquire,
+    /// run `store_chunk_locked`, best-effort lock-entry cleanup.
+    async fn store_chunk_with_lock(
+        &self,
+        hash: &[u8; 32],
+        bytes: &[u8],
+    ) -> Result<(), BlobError> {
         // Per-hash serialization: one in-flight `store_chunk` per
         // content hash at a time. The lock entry is created lazily
         // and best-effort reclaimed after the store completes.
@@ -2893,7 +2956,10 @@ impl MeshBlobAdapter {
             // partial-write across the chunk pool is an operator-
             // visible persistence problem that should NOT be
             // swallowed as "just one bad stripe."
-            self.store_chunk(&chunk_ref.hash, logical_bytes).await?;
+            // Local verify above pinned `computed == chunk_ref.hash`
+            // — trusted, skip the redundant in-store verify. (§6.2)
+            self.store_chunk_prehashed(&chunk_ref.hash, logical_bytes)
+                .await?;
             chunks_restored += 1;
         }
         report.stripes_repaired = report.stripes_repaired.saturating_add(1);
@@ -3000,7 +3066,8 @@ where
             if chunks.is_empty() {
                 let hash: [u8; 32] = blake3::hash(&[]).into();
                 if let Some(a) = adapter {
-                    a.store_chunk(&hash, &[]).await?;
+                    // Just-computed hash — trusted. (§6.2)
+                    a.store_chunk_prehashed(&hash, &[]).await?;
                 }
                 chunks.push(ChunkRef { hash, size: 0 });
             }
@@ -3010,7 +3077,8 @@ where
         let chunk = &buf[..filled];
         let hash: [u8; 32] = blake3::hash(chunk).into();
         if let Some(a) = adapter {
-            a.store_chunk(&hash, chunk).await?;
+            // Just-computed hash — trusted. (§6.2)
+            a.store_chunk_prehashed(&hash, chunk).await?;
         }
         chunks.push(ChunkRef {
             hash,
@@ -3163,9 +3231,14 @@ impl BlobAdapter for MeshBlobAdapter {
                         (rc.hash, bytes_arc.slice(offset..end))
                     })
                     .collect();
+                // Trusted: `chunk_payload` produces (hash, &bytes)
+                // pairs where hash = blake3(bytes), and the verify
+                // loop above already asserted hash equality between
+                // the recomputed chunks and the declared manifest
+                // entries. Skip the per-chunk verify pass. (§6.2)
                 let mut futs = futures::stream::iter(store_items.into_iter().map(
                     |(hash, chunk): ([u8; 32], Bytes)| async move {
-                        self.store_chunk(&hash, &chunk).await
+                        self.store_chunk_prehashed(&hash, &chunk).await
                     },
                 ))
                 .buffer_unordered(MANIFEST_STORE_CONCURRENCY);
@@ -4193,6 +4266,49 @@ mod tests {
         assert!(
             matches!(err, BlobError::HashMismatch { .. }),
             "idempotent fast-path must reject length-mismatched existing bytes; got {:?}",
+            err
+        );
+    }
+
+    /// PERF_AUDIT §6.2 — `store_chunk_prehashed` is the in-crate
+    /// trusted entry that skips the second-pass blake3 guard. It
+    /// must still drive content correctly when the (hash, bytes)
+    /// pair is consistent. The contract is "the caller guarantees
+    /// hash == blake3(bytes)" — if they lie, we don't promise
+    /// detection (and `fetch_chunk`'s read-side verify will catch
+    /// it later). This test pins the well-formed contract.
+    #[tokio::test]
+    async fn store_chunk_prehashed_round_trips_against_fetch() {
+        let adapter = make_adapter();
+        let payload: Vec<u8> = b"prehashed round-trip".to_vec();
+        let hash: [u8; 32] = blake3::hash(&payload).into();
+        adapter
+            .store_chunk_prehashed(&hash, &payload)
+            .await
+            .expect("prehashed store accepts well-formed input");
+        let fetched = adapter.fetch_chunk(&hash).await.unwrap();
+        assert_eq!(&fetched[..], &payload[..]);
+    }
+
+    /// PERF_AUDIT §6.2 — the public `BlobAdapter::store` surface
+    /// must keep verifying caller-supplied bytes against the
+    /// declared hash (the verify lives in `store_chunk`, not in
+    /// `store_chunk_prehashed`). This test pins that the
+    /// refactor did not accidentally bypass the verify on the
+    /// untrusted entry point.
+    #[tokio::test]
+    async fn store_chunk_public_path_still_verifies_caller_bytes() {
+        use crate::adapter::net::dataforts::blob::adapter::BlobAdapter;
+        let adapter = make_adapter();
+        let advertised: &[u8] = b"truth-bytes-xx"; // 14 bytes
+        let attempted: Vec<u8> = b"lie-bytes-zzzz".to_vec(); // 14 bytes — same length
+        assert_eq!(advertised.len(), attempted.len());
+        let hash: [u8; 32] = blake3::hash(advertised).into();
+        let blob = BlobRef::small("mesh://verify-after-refactor", hash, attempted.len() as u64);
+        let err = adapter.store(&blob, &attempted).await.unwrap_err();
+        assert!(
+            matches!(err, BlobError::HashMismatch { .. }),
+            "public store must verify caller bytes; got {:?}",
             err
         );
     }
