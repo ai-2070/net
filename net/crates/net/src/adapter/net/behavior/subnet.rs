@@ -21,6 +21,7 @@
 //! existing channel-auth-token idiom.
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 /// Wire-format tag prefix for self-declared subnet membership.
 /// Operators emit `subnet:<32-hex-char>` as a capability tag on
@@ -51,19 +52,15 @@ impl PartialEq for SubnetId {
     /// Constant-time equality. In the stricter-membership mode
     /// documented on this module a `SubnetId` is a bearer secret
     /// ("hard to guess"), so a data-dependent early-exit compare
-    /// leaks it through timing. Fold every byte difference into one
-    /// accumulator and branch once at the end; `black_box` stops the
-    /// optimizer from reintroducing a short-circuit.
+    /// leaks it through timing. Delegate to `subtle`'s audited,
+    /// optimizer-resistant `ConstantTimeEq` rather than a hand-rolled
+    /// `black_box` fold.
     ///
     /// Consistent with the derived `Hash`/`Eq`, so map-key use is
     /// unaffected (well-known public values like `GLOBAL` compare
     /// correctly too — constant time is simply harmless for them).
     fn eq(&self, other: &Self) -> bool {
-        let mut diff = 0u8;
-        for (a, b) in self.0.iter().zip(other.0.iter()) {
-            diff |= a ^ b;
-        }
-        std::hint::black_box(diff) == 0
+        self.0.ct_eq(&other.0).into()
     }
 }
 

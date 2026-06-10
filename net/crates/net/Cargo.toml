@@ -95,6 +95,9 @@ net = [
     "dep:blake2",
     "dep:ed25519-dalek",
     "dep:x25519-dalek",
+    # Constant-time byte compares for the bearer-secret newtypes
+    # (`GroupId` / `SubnetId`); already in the tree via the dalek stack.
+    "dep:subtle",
     # postcard is the canonical wire codec for the
     # `behavior::{fold, group, subnet}` modules — `SubnetId` /
     # `GroupId` round-trip + the fold dispatch / wire types both
@@ -284,6 +287,11 @@ ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"], optional =
 # construction mirrors libsodium's `crypto_box_seal` but uses the
 # XChaCha AEAD already in-tree rather than pulling in XSalsa20.
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"], optional = true }
+# Audited, optimizer-resistant constant-time primitives. Used for the
+# bearer-secret newtype compares (`GroupId` / `SubnetId`); already
+# compiled in transitively via the dalek/curve25519 stack, so a direct
+# (optional) dep adds nothing to the build.
+subtle = { version = "2", optional = true }
 # Regex for `TagMatcher::Regex` (Phase 6c-C) + the safety predicate
 # match path in `behavior::safety`. Optional — gated behind the
 # `regex` Cargo feature. Off by default keeps ~500 KiB out of the

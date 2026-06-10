@@ -28,6 +28,7 @@
 //! placement, this is about access control. No relationship.
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 /// Wire-format tag prefix for self-declared group membership.
 /// Operators emit `group:<64-hex-char>` as a capability tag on
@@ -57,17 +58,14 @@ impl PartialEq for GroupId {
     /// knowing the 32 random bytes *is* membership — so a
     /// data-dependent early-exit compare (the derived `PartialEq`)
     /// leaks the secret through timing. Fold every byte difference
-    /// into one accumulator and branch once at the end; `black_box`
-    /// stops the optimizer from reintroducing a short-circuit.
+    /// into one accumulator. Delegates to `subtle`'s audited,
+    /// optimizer-resistant `ConstantTimeEq` rather than a hand-rolled
+    /// `black_box` fold.
     ///
     /// Consistent with the derived `Hash`/`Eq` (equal bytes compare
     /// equal and hash equal), so use as a map key is unaffected.
     fn eq(&self, other: &Self) -> bool {
-        let mut diff = 0u8;
-        for (a, b) in self.0.iter().zip(other.0.iter()) {
-            diff |= a ^ b;
-        }
-        std::hint::black_box(diff) == 0
+        self.0.ct_eq(&other.0).into()
     }
 }
 
