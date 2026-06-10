@@ -526,20 +526,25 @@ impl<'a> PlacementFilter for StandardPlacement<'a> {
 
         // Look up the candidate's announced caps. Phase 3b
         // routes through the fold's tag set via
-        // capability_bridge::synthesize_capability_set; the
-        // synthesized CapabilitySet carries tags only (the fold
-        // doesn't model the legacy metadata map). Hard veto if
-        // the publisher isn't known to the fold at all
+        // capability_bridge::synthesize_capability_set_if_known;
+        // the synthesized CapabilitySet carries tags only (the
+        // fold doesn't model the legacy metadata map). Hard veto
+        // if the publisher isn't known to the fold at all
         // (matches the legacy with_caps `Option::None` shape:
         // "unindexed candidate"); empty-tag publishers ARE
         // indexed and proceed to the scoring axes.
-        let known = self
-            .fold
-            .with_state(|state| state.by_node.contains_key(target));
-        if !known {
-            return None;
-        }
-        let target_caps = capability_bridge::synthesize_capability_set(self.fold, *target);
+        //
+        // PERF_AUDIT §4.9 — pre-fix this took the fold's read
+        // lock twice per candidate (one `with_state`
+        // contains_key probe + one `synthesize_capability_set`
+        // body that took its own lock). The new
+        // `synthesize_capability_set_if_known` folds both into a
+        // single `with_state` that returns `None` on the
+        // known-check miss path.
+        let target_caps = capability_bridge::synthesize_capability_set_if_known(
+            self.fold,
+            *target,
+        )?;
         (|target_caps: &CapabilitySet| -> Option<f32> {
             // Hard-constraint check: artifact's `required` caps
             // must be a subset of the target's tag set. `Chain`

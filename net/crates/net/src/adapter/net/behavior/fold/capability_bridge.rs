@@ -272,11 +272,28 @@ pub fn synthesize_capability_set(
     fold: &Fold<CapabilityFold>,
     node_id: NodeId,
 ) -> super::super::capability::CapabilitySet {
-    let mut caps = super::super::capability::CapabilitySet::new();
+    synthesize_capability_set_if_known(fold, node_id).unwrap_or_default()
+}
+
+/// `synthesize_capability_set` with an explicit "known to the fold"
+/// signal: returns `None` when `node_id` has no fold entries at all
+/// (matches the placement-side hard-veto contract: "unindexed
+/// candidate" → reject without scoring).
+///
+/// Per PERF_AUDIT §4.9 — placement_score previously took the fold's
+/// read lock twice per candidate: once for a `by_node.contains_key`
+/// known-check, once for the full synthesize. Both can be served by
+/// a single `with_state` that probes `by_node`, returns `None` on
+/// miss, and synthesizes the set on hit. Cuts the per-candidate
+/// lock acquisitions from 2 to 1, halving the lock-contention
+/// surface area on the read side under high candidate counts.
+pub fn synthesize_capability_set_if_known(
+    fold: &Fold<CapabilityFold>,
+    node_id: NodeId,
+) -> Option<super::super::capability::CapabilitySet> {
     fold.with_state(|state| {
-        let Some(keys) = state.by_node.get(&node_id) else {
-            return;
-        };
+        let keys = state.by_node.get(&node_id)?;
+        let mut caps = super::super::capability::CapabilitySet::new();
         for k in keys {
             let Some(entry) = state.entries.get(k) else {
                 continue;
@@ -290,8 +307,8 @@ pub fn synthesize_capability_set(
                 caps.metadata.insert(mk.clone(), mv.clone());
             }
         }
-    });
-    caps
+        Some(caps)
+    })
 }
 
 /// Default capacity for the per-fold capability-set cache. Covers
