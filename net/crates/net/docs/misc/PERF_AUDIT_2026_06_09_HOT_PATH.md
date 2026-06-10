@@ -377,6 +377,43 @@ audited or has a recorded clean verdict; the survey is complete.**
 
 ---
 
+## 15. CORRECTNESS (found while baselining the QPS bench): a node expires its own capability entry and denies its own services — ✅ FIXED
+
+Not a perf item, but surfaced by this work and worth recording. While capturing a
+`nrpc_qps` baseline to measure §8a, the **c128** bar deterministically panicked with
+`CapabilityDenied`. Root cause (instrumented, conclusive):
+
+1. At c128 the transport saturates; `call_json_direct_retrying` retried `Transport`
+   backpressure with no deadline, so the bar **livelocked** — it ran for **>300 s**
+   instead of ~8 s, making ~no progress. (Same livelock that hung the 16 KiB bar.)
+2. Capability fold entries carry a TTL (default 300 s) and the sweeper reaps them on
+   expiry. **Nothing periodically re-announced the node's own entry** — no background
+   loop did, and `serve_rpc`'s announce is one-time. So ~300 s in, the self-entry
+   expired (`lived_ms=300433`, instrumented) and was swept (`total_nodes → 0`).
+3. The callee-side cap-auth gate (`may_execute(self, …)`, `mesh_rpc.rs`) then found no
+   self-entry → `CapabilityDenied` on every inbound call. Peers also expire the node's
+   announcement after one TTL, so it stops being discoverable too.
+
+So **any node serving RPC continuously past one TTL (≈5 min) without re-announcing
+would start rejecting all inbound calls AND drop off discovery** — a self-inflicted
+outage, masked until now because every test/bench runs far under 300 s (only the c128
+livelock ran long enough to trip it).
+
+**Fixes (committed):**
+- **Periodic re-announce** — `spawn_capability_reannounce_loop` re-broadcasts the
+  node's capabilities every `MeshNodeConfig::capability_reannounce_interval`
+  (default 150 s) with a 2×-interval TTL, refreshing both the local self-index (callee
+  gate) and peers' folds (discovery). Re-broadcasting needs an owned `Arc` (the per-peer
+  sends are `&self`), so `MeshNode::start_arc(self: &Arc<Self>)` stores a `Weak` the
+  loop upgrades each tick; the SDK (`Mesh::start`) and FFI (`net_mesh_start`) call it. A
+  bare `start(&self)` keeps its signature — no test-caller churn — and omits the loop
+  (fine for the short-lived non-`Arc` nodes that take it). A/B tests pin both directions.
+- **Bench-harness livelock** — `call_*_retrying` now bounds backpressure retries with a
+  20 s `RETRY_DEADLINE`, so a saturated bar fails fast (`c128/32B` in ~24 s vs ~5 min)
+  with `transport saturated … not measurable here`, instead of livelocking past a TTL.
+
+---
+
 ## Explicit non-goals (don't spend time here)
 
 - **AEAD algorithm swap** (ChaCha20-Poly1305 → AES-GCM): crypto is ~5% of CPU; saves
