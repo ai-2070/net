@@ -1499,7 +1499,18 @@ mod tests {
             0,
         )
         .expect("ttl=1 must mint cleanly (boundary)");
-        assert!(token.is_valid().is_ok());
+        // ttl=1 must produce a non-born-expired token — a positive lifetime
+        // (`not_after > not_before`) is exactly the property that distinguishes
+        // it from the ttl=0 case `try_issue` rejects. Deterministic, no clock.
+        assert!(token.not_after > token.not_before);
+        // ...and it must validate as minted. `is_valid()` re-reads the
+        // second-resolution clock, and a 1 s token's window is exactly
+        // `[issue_second, issue_second+1)`; a check that races into the next
+        // wall-clock second (a sub-ms slip under load) sees `now == not_after`
+        // and reports expired. A 1 s skew tolerates that single boundary
+        // crossing — it doesn't weaken the assertion for a real born-expired
+        // token, which `try_issue` already rejected above.
+        assert!(token.is_valid_with_skew(1).is_ok());
     }
 
     #[test]
