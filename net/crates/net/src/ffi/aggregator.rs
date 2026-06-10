@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 
-use super::handle_guard::{HandleGuard, FFI_HANDLE_FREE_DEADLINE};
+use super::handle_guard::{BeginFree, HandleGuard, FFI_HANDLE_FREE_DEADLINE};
 
 use crate::adapter::net::behavior::aggregator::{
     FoldQueryClient, FoldQueryClientError, FoldQueryError, RegistryClient, RegistryClientError,
@@ -183,17 +183,23 @@ pub unsafe extern "C" fn net_registry_client_free(handle: *mut RegistryClientHan
         return;
     }
     let h: &RegistryClientHandle = unsafe { &*handle };
-    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
-        // SAFETY: drained; sole writable reference. Box leaked.
-        unsafe {
-            ManuallyDrop::drop(&mut (*handle).client);
-            ManuallyDrop::drop(&mut (*handle).last_error_detail);
+    match h.guard.begin_free_detailed(FFI_HANDLE_FREE_DEADLINE) {
+        BeginFree::Drained => {
+            // SAFETY: drained; sole writable reference. Box leaked.
+            unsafe {
+                ManuallyDrop::drop(&mut (*handle).client);
+                ManuallyDrop::drop(&mut (*handle).last_error_detail);
+            }
         }
-    } else {
-        tracing::warn!(
-            "net_registry_client_free: in-flight ops did not drain within deadline; \
-             leaking inner to avoid use-after-free"
-        );
+        // Benign repeat free — a prior call owns the inner; nothing
+        // to do and nothing leaked by this call.
+        BeginFree::AlreadyFreeing => {}
+        BeginFree::TimedOut => {
+            tracing::warn!(
+                "net_registry_client_free: in-flight ops did not drain within deadline; \
+                 leaking inner to avoid use-after-free"
+            );
+        }
     }
 }
 
@@ -546,17 +552,23 @@ pub unsafe extern "C" fn net_fold_query_client_free(handle: *mut FoldQueryClient
         return;
     }
     let h: &FoldQueryClientHandle = unsafe { &*handle };
-    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
-        // SAFETY: drained; sole writable reference. Box leaked.
-        unsafe {
-            ManuallyDrop::drop(&mut (*handle).client);
-            ManuallyDrop::drop(&mut (*handle).last_error_detail);
+    match h.guard.begin_free_detailed(FFI_HANDLE_FREE_DEADLINE) {
+        BeginFree::Drained => {
+            // SAFETY: drained; sole writable reference. Box leaked.
+            unsafe {
+                ManuallyDrop::drop(&mut (*handle).client);
+                ManuallyDrop::drop(&mut (*handle).last_error_detail);
+            }
         }
-    } else {
-        tracing::warn!(
-            "net_fold_query_client_free: in-flight ops did not drain within deadline; \
-             leaking inner to avoid use-after-free"
-        );
+        // Benign repeat free — a prior call owns the inner; nothing
+        // to do and nothing leaked by this call.
+        BeginFree::AlreadyFreeing => {}
+        BeginFree::TimedOut => {
+            tracing::warn!(
+                "net_fold_query_client_free: in-flight ops did not drain within deadline; \
+                 leaking inner to avoid use-after-free"
+            );
+        }
     }
 }
 
