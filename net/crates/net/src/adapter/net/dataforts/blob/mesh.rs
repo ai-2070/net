@@ -2448,22 +2448,28 @@ impl MeshBlobAdapter {
         let now_ms = now_unix_ms();
         if !file.is_empty() {
             // Idempotent fast-path. Content-addressed semantics
-            // promise the on-disk bytes match the hash, but a
-            // corrupted prior write (e.g. replication catch-up
-            // wrote bad bytes before our honest store landed)
-            // would otherwise be silently affirmed. Verify before
-            // returning Ok.
-            let events = file.read_range(0, file.len() as u64);
-            let existing = events.into_iter().next().ok_or_else(|| {
-                BlobError::Backend(
-                    "mesh blob: chunk file non-empty but read returned no events".to_string(),
-                )
-            })?;
-            let computed_existing: [u8; 32] = blake3::hash(&existing.payload).into();
-            if computed_existing != *hash {
+            // promise the on-disk bytes match the hash (verified on
+            // the original store and again on every read via
+            // `fetch_chunk` / `materialize`). Re-reading + re-hashing
+            // the entire on-disk payload on every dedup hit pays
+            // O(chunk_size) for ≈ zero additional protection over
+            // length-compare: the failure mode the deep check was
+            // designed to catch — a truncated replication catch-up —
+            // shows up as a length mismatch (the truncated payload is
+            // shorter than the honest one). Same-length on-disk
+            // corruption is rare under content-addressing and is the
+            // GC/scrub sweep's job, not the per-store hot path. Per
+            // PERF_AUDIT_2026_06_10_FULL_CRATE.md §6.3.
+            let existing_len = file.retained_bytes();
+            if existing_len != bytes.len() as u64 {
                 return Err(BlobError::HashMismatch {
                     expected: *hash,
-                    actual: computed_existing,
+                    // Length-mismatch under content-addressing: the
+                    // on-disk content can't possibly hash to
+                    // `expected` because it's a different size. We
+                    // surface a sentinel actual rather than paying the
+                    // O(chunk_size) hash we just elided.
+                    actual: [0u8; 32],
                 });
             }
             self.refcount
@@ -4148,13 +4154,17 @@ mod tests {
         );
     }
 
-    /// Idempotent fast-path must verify the existing on-disk
-    /// bytes against the supplied hash. A pre-existing corrupted
-    /// payload at the same channel (e.g. truncated replication
-    /// catch-up) surfaces as `HashMismatch` rather than silently
-    /// being affirmed by an honest caller's `store`.
+    /// Idempotent fast-path must reject a length-mismatched
+    /// pre-existing payload at the same channel (e.g. truncated
+    /// replication catch-up) — surfaces as `HashMismatch` rather
+    /// than silently being affirmed by an honest caller's `store`.
+    /// Per PERF_AUDIT §6.3 the fast-path now compares length only
+    /// (no re-hash of the existing bytes); same-length on-disk
+    /// corruption is left to GC/scrub. The legacy test still
+    /// passes because the poisoned bytes here are a different
+    /// length from the honest payload.
     #[tokio::test]
-    async fn store_chunk_idempotent_path_verifies_existing_bytes() {
+    async fn store_chunk_idempotent_path_rejects_length_mismatch() {
         use crate::adapter::net::dataforts::blob::adapter::BlobAdapter;
         let adapter = make_adapter();
         // Pre-poison the chunk channel for our intended hash with
@@ -4182,9 +4192,49 @@ mod tests {
         let err = adapter.store(&blob, &intended_payload).await.unwrap_err();
         assert!(
             matches!(err, BlobError::HashMismatch { .. }),
-            "idempotent fast-path must verify existing bytes; got {:?}",
+            "idempotent fast-path must reject length-mismatched existing bytes; got {:?}",
             err
         );
+    }
+
+    /// PERF_AUDIT §6.3 — the dedup fast-path must not pay the
+    /// O(chunk_size) read + hash on every duplicate store. With
+    /// length-only verification, a same-length corrupted
+    /// pre-existing payload (the GC/scrub failure mode the audit
+    /// explicitly defers) is no longer caught at store time; this
+    /// test asserts the new behavior to lock the cost-shift in
+    /// place and to act as a regression guard against accidental
+    /// reintroduction of the deep re-hash.
+    #[tokio::test]
+    async fn store_chunk_idempotent_path_accepts_same_length_existing_bytes() {
+        use crate::adapter::net::dataforts::blob::adapter::BlobAdapter;
+        let adapter = make_adapter();
+        let intended_payload = b"honest payload!!".to_vec(); // 16 bytes
+        let intended_hash: [u8; 32] = blake3::hash(&intended_payload).into();
+        let channel = MeshBlobAdapter::chunk_channel_for_hash(&intended_hash);
+        let file = adapter
+            .redex
+            .open_file(&channel, RedexFileConfig::new())
+            .unwrap();
+        // Pre-poison with bytes of the same length but different
+        // content. Under the legacy deep re-hash this would have
+        // returned HashMismatch; under length-only verification it
+        // succeeds (verification deferred to GC/scrub).
+        let corrupt: Vec<u8> = b"CCCCCCCCCCCCCCCC".to_vec();
+        assert_eq!(corrupt.len(), intended_payload.len());
+        file.append(&corrupt).unwrap();
+
+        let blob = BlobRef::small(
+            "mesh://same-len",
+            intended_hash,
+            intended_payload.len() as u64,
+        );
+        // The fast-path now trusts content-addressing and length;
+        // it should accept this store (no read + hash performed).
+        adapter
+            .store(&blob, &intended_payload)
+            .await
+            .expect("length-only verification accepts same-length pre-existing");
     }
 
     #[tokio::test]
