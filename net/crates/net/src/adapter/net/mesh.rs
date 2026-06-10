@@ -4480,8 +4480,14 @@ impl MeshNode {
                 let pool = session.thread_local_pool();
                 let mut builder = pool.get();
                 for d in &descriptors {
+                    // PERF_AUDIT §2.10: `builder.build` already
+                    // returns owned `Bytes`; the pre-fix
+                    // `Bytes::copy_from_slice(&p)` added a second
+                    // allocation + full-packet memcpy per
+                    // retransmit. Loss-path only, but the burst
+                    // fires exactly when the link is stressed.
                     let p = builder.build(d.stream_id, d.seq, &d.events, d.flags);
-                    packets.push(Bytes::copy_from_slice(&p));
+                    packets.push(p);
                 }
             }
             if !packets.is_empty() {
@@ -4530,13 +4536,9 @@ impl MeshNode {
             if events.is_empty() {
                 return;
             }
-            let from_node = ctx
-                .peers
-                .iter()
-                .find(|e| e.value().session.session_id() == session.session_id())
-                .map(|e| e.value().node_id)
-                .unwrap_or(0);
-
+            // PERF_AUDIT §2.9: `from_node` is the resolved peer
+            // node_id the dispatch site already looked up via
+            // session_id — no need to re-scan `peers` here.
             for payload in events {
                 Self::handle_membership_message(&payload, from_node, ctx);
             }
@@ -4557,13 +4559,8 @@ impl MeshNode {
             if events.is_empty() {
                 return;
             }
-            let from_node = ctx
-                .peers
-                .iter()
-                .find(|e| e.value().session.session_id() == session.session_id())
-                .map(|e| e.value().node_id)
-                .unwrap_or(0);
-
+            // PERF_AUDIT §2.9: use the parameter — see comment in
+            // the membership branch above.
             for payload in events {
                 Self::handle_capability_announcement(&payload, from_node, ctx);
             }
@@ -4722,12 +4719,10 @@ impl MeshNode {
             if events.is_empty() {
                 return;
             }
-            let from_node = ctx
-                .peers
-                .iter()
-                .find(|e| e.value().session.session_id() == session.session_id())
-                .map(|e| e.value().node_id)
-                .unwrap_or(0);
+            // PERF_AUDIT §2.9: use the parameter — same shape as
+            // the membership/capability branches. The zero-check
+            // guard below still fires for the (vanishingly rare)
+            // PSK-zero node case.
             if from_node == 0 {
                 return;
             }
@@ -4813,12 +4808,8 @@ impl MeshNode {
             if events.is_empty() {
                 return;
             }
-            let from_node = ctx
-                .peers
-                .iter()
-                .find(|e| e.value().session.session_id() == session.session_id())
-                .map(|e| e.value().node_id)
-                .unwrap_or(0);
+            // PERF_AUDIT §2.9: use the parameter — same shape as
+            // the reflex branch above.
             if from_node == 0 {
                 return;
             }

@@ -306,10 +306,27 @@ impl NetProxy {
             return ForwardResult::Dropped(ProxyError::TtlExpired);
         }
 
-        // Build forwarded packet with updated header
-        let mut fwd_data = BytesMut::with_capacity(data.len());
-        new_header.write_to(&mut fwd_data);
-        fwd_data.extend_from_slice(&data[ROUTING_HEADER_SIZE..]);
+        // Build forwarded packet with updated header.
+        // PERF_AUDIT §3.7 — port of perf #18 (already in
+        // router.rs:728): fast-path the typical sole-owned `Bytes`
+        // with `try_into_mut` + `write_at` so the body never gets
+        // copied. Pre-fix this allocated a fresh BytesMut the size
+        // of the whole packet and `extend_from_slice`d the body
+        // per forwarded packet — for a standalone-proxy
+        // deployment moving high pps, the body memcpy was the
+        // dominant per-packet cost.
+        let fwd_data = match data.try_into_mut() {
+            Ok(mut mut_data) => {
+                new_header.write_at(&mut mut_data[..ROUTING_HEADER_SIZE]);
+                mut_data.freeze()
+            }
+            Err(orig_data) => {
+                let mut new_data = BytesMut::with_capacity(orig_data.len());
+                new_header.write_to(&mut new_data);
+                new_data.extend_from_slice(&orig_data[ROUTING_HEADER_SIZE..]);
+                new_data.freeze()
+            }
+        };
 
         let latency_ns = start.elapsed().as_nanos() as u64;
 
@@ -323,7 +340,7 @@ impl NetProxy {
 
         ForwardResult::Forwarded {
             next_hop,
-            packet: fwd_data.freeze(),
+            packet: fwd_data,
             latency_ns,
         }
     }
