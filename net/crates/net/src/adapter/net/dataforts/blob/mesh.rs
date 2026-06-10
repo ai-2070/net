@@ -116,6 +116,51 @@ pub const MAX_FETCH_RANGE_BYTES: u64 = 1024 * 1024 * 1024;
 /// satisfy clippy's type-complexity threshold.
 type RsEncoderCache = Arc<parking_lot::Mutex<HashMap<(u8, u8), Arc<super::erasure::RsEncoder>>>>;
 
+/// Threshold (bytes) above which blake3 hashing is moved off the
+/// tokio runtime via `spawn_blocking`. Below this, the synchronous
+/// blake3 SIMD path is faster than the spawn_blocking handoff
+/// (~µs).  At 128 KiB the hash takes ~50 µs and starts to push the
+/// runtime worker into the "long task" regime; above it, multi-MiB
+/// CDC chunks run for 1–5 ms each — well into territory that stalls
+/// every other task on the worker.  Per
+/// PERF_AUDIT_2026_06_10_FULL_CRATE.md §6.1.
+pub(crate) const BLAKE3_OFFLOAD_THRESHOLD_BYTES: usize = 128 * 1024;
+
+/// Hash `bytes` with blake3, moving the work to the tokio blocking
+/// pool when `bytes.len() >= BLAKE3_OFFLOAD_THRESHOLD_BYTES`.
+/// Takes ownership of a `Vec<u8>` so the spawn_blocking closure
+/// runs against owned data (no extra copy); returns the bytes back
+/// along with the hash so the caller can continue using them.
+///
+/// Below the threshold the inline blake3 path is faster than the
+/// spawn handoff — we short-circuit and return immediately.
+pub(crate) async fn blake3_hash_offload_vec(bytes: Vec<u8>) -> ([u8; 32], Vec<u8>) {
+    if bytes.len() < BLAKE3_OFFLOAD_THRESHOLD_BYTES {
+        let hash: [u8; 32] = blake3::hash(&bytes).into();
+        return (hash, bytes);
+    }
+    tokio::task::spawn_blocking(move || {
+        let hash: [u8; 32] = blake3::hash(&bytes).into();
+        (hash, bytes)
+    })
+    .await
+    .expect("blake3 spawn_blocking panicked")
+}
+
+/// `Bytes` variant of [`blake3_hash_offload_vec`] — refcount-clones
+/// for the spawn_blocking closure instead of moving (Bytes clones
+/// are O(1) refcount bumps), so the caller can keep using the input
+/// after the hash returns.
+pub(crate) async fn blake3_hash_offload_bytes(bytes: &Bytes) -> [u8; 32] {
+    if bytes.len() < BLAKE3_OFFLOAD_THRESHOLD_BYTES {
+        return blake3::hash(bytes).into();
+    }
+    let snapshot = bytes.clone();
+    tokio::task::spawn_blocking(move || blake3::hash(&snapshot).into())
+        .await
+        .expect("blake3 spawn_blocking panicked")
+}
+
 /// Three capability probes a producer consults before publishing
 /// a v0.3 blob: Tree-support (used as the Tree-vs-Manifest gate),
 /// CDC-support (used by [`super::cdc::cdc_downgrade`]), and
@@ -1547,7 +1592,11 @@ impl MeshBlobAdapter {
                                 &mut buffer,
                                 Vec::with_capacity(chunk_size_usize),
                             );
-                            let chunk_hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
+                            // Offload blake3 for multi-MiB chunks so
+                            // the tokio runtime worker doesn't stall
+                            // for the multi-ms hash. (§6.1)
+                            let (chunk_hash, chunk_bytes) =
+                                blake3_hash_offload_vec(chunk_bytes).await;
                             // Hash was just computed over chunk_bytes
                             // — trusted, skip verify. (§6.2)
                             self.store_chunk_prehashed(&chunk_hash, &chunk_bytes)
@@ -1562,7 +1611,9 @@ impl MeshBlobAdapter {
                 }
                 if !buffer.is_empty() {
                     let chunk_bytes = std::mem::take(&mut buffer);
-                    let chunk_hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
+                    // Offload blake3 for multi-MiB chunks. (§6.1)
+                    let (chunk_hash, chunk_bytes) =
+                        blake3_hash_offload_vec(chunk_bytes).await;
                     // Just-computed hash — trusted. (§6.2)
                     self.store_chunk_prehashed(&chunk_hash, &chunk_bytes)
                         .await?;
@@ -1579,7 +1630,9 @@ impl MeshBlobAdapter {
                     let bytes = maybe?;
                     chunker.extend(bytes.as_ref());
                     while let Some(chunk_bytes) = chunker.try_next_chunk() {
-                        let chunk_hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
+                        // Offload blake3 for multi-MiB chunks. (§6.1)
+                        let chunk_hash =
+                            blake3_hash_offload_bytes(&chunk_bytes).await;
                         // Just-computed hash — trusted. (§6.2)
                         self.store_chunk_prehashed(&chunk_hash, &chunk_bytes)
                             .await?;
@@ -1596,7 +1649,8 @@ impl MeshBlobAdapter {
                     }
                 }
                 for chunk_bytes in chunker.finalize() {
-                    let chunk_hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
+                    // Offload blake3 for multi-MiB chunks. (§6.1)
+                    let chunk_hash = blake3_hash_offload_bytes(&chunk_bytes).await;
                     // Just-computed hash — trusted. (§6.2)
                     self.store_chunk_prehashed(&chunk_hash, &chunk_bytes)
                         .await?;
@@ -2031,7 +2085,20 @@ impl MeshBlobAdapter {
                 TREE_LEAF_CHUNK_MAX_BYTES
             )));
         }
-        let hash: [u8; 32] = blake3::hash(chunk_bytes).into();
+        // Offload blake3 to the blocking pool when the chunk is
+        // big enough to stall the runtime worker. We hash via a
+        // refcounted `Bytes` snapshot rather than an owned move so
+        // the slice borrow we hold survives across the await — both
+        // `store_chunk_prehashed` and the builder push want
+        // `chunk_bytes` afterwards. (§6.1)
+        let hash: [u8; 32] = if chunk_bytes.len() >= BLAKE3_OFFLOAD_THRESHOLD_BYTES {
+            let snapshot = Bytes::copy_from_slice(chunk_bytes);
+            tokio::task::spawn_blocking(move || blake3::hash(&snapshot).into())
+                .await
+                .expect("blake3 spawn_blocking panicked")
+        } else {
+            blake3::hash(chunk_bytes).into()
+        };
         let chunk_size = chunk_bytes.len() as u32;
         // Persist the chunk bytes first so a crash between this
         // and the tree-builder push leaves the chunk content-
@@ -2437,8 +2504,18 @@ impl MeshBlobAdapter {
         // Defensive: verify the supplied bytes hash to the supplied
         // hash. The substrate-side `store` already verified at the
         // top of the call; this is a second-pass guard in case
-        // this helper is called from a non-substrate path.
-        let computed: [u8; 32] = blake3::hash(bytes).into();
+        // this helper is called from a non-substrate path. Offload
+        // the verify hash to the blocking pool above threshold so
+        // a multi-MiB Small/Manifest store doesn't stall the runtime
+        // worker. (§6.1)
+        let computed: [u8; 32] = if bytes.len() >= BLAKE3_OFFLOAD_THRESHOLD_BYTES {
+            let snapshot = Bytes::copy_from_slice(bytes);
+            tokio::task::spawn_blocking(move || blake3::hash(&snapshot).into())
+                .await
+                .expect("blake3 spawn_blocking panicked")
+        } else {
+            blake3::hash(bytes).into()
+        };
         if computed != *hash {
             return Err(BlobError::HashMismatch {
                 expected: *hash,
@@ -4268,6 +4345,56 @@ mod tests {
             "idempotent fast-path must reject length-mismatched existing bytes; got {:?}",
             err
         );
+    }
+
+    /// PERF_AUDIT §6.1 — the offloaded blake3 path must agree with
+    /// the inline path for every input size, especially at the
+    /// threshold boundary. Asserts both helpers match
+    /// `blake3::hash` directly so we can't regress the offload into
+    /// a subtle mis-hash by accident.
+    #[tokio::test]
+    async fn blake3_hash_offload_matches_inline_around_threshold() {
+        use super::{
+            blake3_hash_offload_bytes, blake3_hash_offload_vec, BLAKE3_OFFLOAD_THRESHOLD_BYTES,
+        };
+        // Test sizes that bracket the threshold from below, at, and
+        // above — exercises both the inline short-circuit branch
+        // and the spawn_blocking branch.
+        for size in [
+            0usize,
+            1,
+            64,
+            BLAKE3_OFFLOAD_THRESHOLD_BYTES - 1,
+            BLAKE3_OFFLOAD_THRESHOLD_BYTES,
+            BLAKE3_OFFLOAD_THRESHOLD_BYTES + 1,
+            BLAKE3_OFFLOAD_THRESHOLD_BYTES * 2,
+            BLAKE3_OFFLOAD_THRESHOLD_BYTES * 4 + 17,
+        ] {
+            // Deterministic-but-varied content so identical-zero
+            // collisions can't accidentally pass.
+            let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let expected: [u8; 32] = blake3::hash(&payload).into();
+
+            let (offload_hash_vec, returned) = blake3_hash_offload_vec(payload.clone()).await;
+            assert_eq!(
+                offload_hash_vec, expected,
+                "Vec offload hash mismatch at size {}",
+                size
+            );
+            assert_eq!(
+                returned, payload,
+                "Vec offload must return the original bytes at size {}",
+                size
+            );
+
+            let snapshot = bytes::Bytes::from(payload);
+            let offload_hash_bytes = blake3_hash_offload_bytes(&snapshot).await;
+            assert_eq!(
+                offload_hash_bytes, expected,
+                "Bytes offload hash mismatch at size {}",
+                size
+            );
+        }
     }
 
     /// PERF_AUDIT §6.2 — `store_chunk_prehashed` is the in-crate
