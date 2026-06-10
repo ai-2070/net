@@ -351,6 +351,28 @@ pub struct MeshBlobAdapter {
     /// concurrent stores, not by total distinct hashes ever
     /// seen.
     in_flight_stores: Arc<DashMap<[u8; 32], Arc<tokio::sync::Mutex<()>>>>,
+    /// Small LRU of open chunk-file `RedexFile` handles keyed by
+    /// blob hash.
+    ///
+    /// **PERF_AUDIT §6.7** — pre-fix every `fetch_chunk` /
+    /// `store_chunk` / `chunk_exists` rebuilt the channel name + a
+    /// fresh `RedexFileConfig` (cloning `self.replication`) and
+    /// called `Redex::open_file`, whose reopen fast path still
+    /// runs `ensure_reopen_replication_matches`, an
+    /// `is_authorized` ACL probe, a `replication.validate()`, and
+    /// a `replication.read().is_none()` check. Per-tree-walk that
+    /// adds up to thousands of redundant probes. Caching the
+    /// already-resolved `RedexFile` (Arc clone — refcount bump
+    /// only) collapses the per-op cost to one Mutex lock + LRU
+    /// touch.
+    ///
+    /// The cap is intentionally small: tree walks burst over a
+    /// handful of nodes + chunks at a time, and a stale cached
+    /// handle is functionally identical to a fresh open because
+    /// `Redex::open_file` is idempotent on `(name, config)` — an
+    /// LRU eviction just means the next access pays the open
+    /// cost once, then re-caches.
+    chunk_file_cache: Arc<parking_lot::Mutex<lru::LruCache<[u8; 32], crate::adapter::net::redex::RedexFile>>>,
     /// Active-overflow knobs (v0.3 P1 surface). Held behind
     /// an `Arc<RwLock<_>>` so the boolean toggle + threshold
     /// updates are cheap, lock-free for the steady-state
@@ -455,6 +477,12 @@ impl MeshBlobAdapter {
             blob_heat: None,
             blob_heat_half_life: DEFAULT_BLOB_HEAT_HALF_LIFE,
             in_flight_stores: Arc::new(DashMap::new()),
+            // PERF_AUDIT §6.7 — 64-entry LRU; covers a typical
+            // tree walk's working set (depth × fanout) without
+            // pinning much memory.
+            chunk_file_cache: Arc::new(parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(64).expect("64 != 0"),
+            ))),
             overflow: Arc::new(parking_lot::RwLock::new(OverflowConfig::default())),
             overflow_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tree_node_cache: None,
@@ -1208,6 +1236,11 @@ impl MeshBlobAdapter {
         if let Some(cache) = self.tree_node_cache.as_ref() {
             cache.lock().remove(hash);
         }
+        // PERF_AUDIT §6.7 — also drop the cached chunk-file
+        // handle. A re-store of the same hash after delete must
+        // open a fresh RedexFile rather than hitting the stale
+        // handle for the just-unlinked file.
+        self.chunk_file_cache.lock().pop(hash);
         Ok(())
     }
 
@@ -2452,6 +2485,32 @@ impl MeshBlobAdapter {
         ChannelName::new(&name).expect("hex-formatted name under reserved prefix is always valid")
     }
 
+    /// Look up an open `RedexFile` for the chunk identified by
+    /// `hash`, opening (and caching) it on miss. Used by
+    /// `fetch_chunk` / `store_chunk_locked` / `chunk_exists` to
+    /// elide the per-call `chunk_channel` build, `chunk_file_config`
+    /// (which clones `self.replication`), `Redex::open_file`'s ACL
+    /// probe + replication validate + reopen-match — none of which
+    /// vary across operations on the same hash.
+    ///
+    /// Per PERF_AUDIT §6.7.
+    fn open_chunk_file_cached(
+        &self,
+        hash: &[u8; 32],
+    ) -> Result<crate::adapter::net::redex::RedexFile, BlobError> {
+        if let Some(file) = self.chunk_file_cache.lock().get(hash).cloned() {
+            return Ok(file);
+        }
+        let channel = Self::chunk_channel(hash);
+        let cfg = self.chunk_file_config();
+        let file = self
+            .redex
+            .open_file(&channel, cfg)
+            .map_err(|e| BlobError::Backend(format!("mesh blob: open chunk file: {}", e)))?;
+        self.chunk_file_cache.lock().put(*hash, file.clone());
+        Ok(file)
+    }
+
     /// `RedexFileConfig` template applied to every chunk open. The
     /// operator opts into disk persistence via [`Self::with_persistent`]
     /// and into cross-node replication via [`Self::with_replication`].
@@ -2576,12 +2635,10 @@ impl MeshBlobAdapter {
     /// Split out so the lock-acquire / cleanup wrapper can early-
     /// return cleanly via `?` without the per-hash entry leaking.
     async fn store_chunk_locked(&self, hash: &[u8; 32], bytes: &[u8]) -> Result<(), BlobError> {
-        let channel = Self::chunk_channel(hash);
-        let cfg = self.chunk_file_config();
-        let file = self
-            .redex
-            .open_file(&channel, cfg)
-            .map_err(|e| BlobError::Backend(format!("mesh blob: open chunk file: {}", e)))?;
+        // PERF_AUDIT §6.7 — cached open elides the per-call
+        // channel name build + RedexFileConfig clone + Redex ACL
+        // probe + replication validate + reopen-match.
+        let file = self.open_chunk_file_cached(hash)?;
         let now_ms = now_unix_ms();
         if !file.is_empty() {
             // Idempotent fast-path. Content-addressed semantics
@@ -2637,12 +2694,10 @@ impl MeshBlobAdapter {
     /// that's N×payload_size bytes of memcpy avoided.
     #[doc(hidden)]
     pub async fn fetch_chunk(&self, hash: &[u8; 32]) -> Result<Bytes, BlobError> {
-        let channel = Self::chunk_channel(hash);
-        let cfg = self.chunk_file_config();
-        let file = self
-            .redex
-            .open_file(&channel, cfg)
-            .map_err(|e| BlobError::Backend(format!("mesh blob: open chunk file: {}", e)))?;
+        // PERF_AUDIT §6.7 — cached open elides the per-call
+        // channel name build + RedexFileConfig clone + Redex ACL
+        // probe + replication validate + reopen-match.
+        let file = self.open_chunk_file_cached(hash)?;
         let len = file.len() as u64;
         if len == 0 {
             return Err(BlobError::NotFound(format!("mesh://{}", hex32(hash))));
@@ -3931,12 +3986,8 @@ impl MeshBlobAdapter {
     /// scans against an arbitrarily-large hash list should be
     /// aware that the side effect compounds.
     fn chunk_exists(&self, hash: &[u8; 32]) -> Result<bool, BlobError> {
-        let channel = Self::chunk_channel(hash);
-        let cfg = self.chunk_file_config();
-        let file = self
-            .redex
-            .open_file(&channel, cfg)
-            .map_err(|e| BlobError::Backend(format!("mesh blob: open chunk file: {}", e)))?;
+        // PERF_AUDIT §6.7 — cached open.
+        let file = self.open_chunk_file_cached(hash)?;
         Ok(!file.is_empty())
     }
 
@@ -4022,6 +4073,46 @@ mod tests {
             hash,
             payload.len() as u64,
         )
+    }
+
+    /// PERF_AUDIT §6.7 — the chunk-file handle cache MUST
+    /// invalidate on `delete_chunk` so a re-store + fetch after
+    /// delete sees the fresh file rather than reading from a
+    /// stale handle that points at the now-unlinked file.
+    #[tokio::test]
+    async fn delete_chunk_invalidates_handle_cache_before_restore() {
+        use crate::adapter::net::dataforts::blob::adapter::BlobAdapter;
+        let adapter = make_adapter();
+        let payload_v1 = b"original payload".to_vec();
+        let hash_v1: [u8; 32] = blake3::hash(&payload_v1).into();
+        let blob_v1 = BlobRef::small(
+            format!("mesh://{}", hex32(&hash_v1)),
+            hash_v1,
+            payload_v1.len() as u64,
+        );
+        adapter.store(&blob_v1, &payload_v1).await.unwrap();
+
+        // Warm the cache via a fetch.
+        let got = adapter.fetch(&blob_v1).await.unwrap();
+        assert_eq!(got.as_ref(), payload_v1.as_slice());
+
+        // Delete the chunk — the cache slot MUST go away.
+        adapter.delete_chunk(&hash_v1).await.unwrap();
+
+        // Fetching again must NOT see the deleted-but-cached
+        // handle as alive. NotFound is the correct outcome here.
+        let after = adapter.fetch(&blob_v1).await;
+        assert!(
+            matches!(after, Err(BlobError::NotFound(_))),
+            "fetch after delete must surface NotFound; got {after:?}",
+        );
+
+        // Re-store under the same hash — must succeed (no stale
+        // handle pointing at a phantom file) and the subsequent
+        // fetch must return the fresh bytes.
+        adapter.store(&blob_v1, &payload_v1).await.unwrap();
+        let after_restore = adapter.fetch(&blob_v1).await.unwrap();
+        assert_eq!(after_restore.as_ref(), payload_v1.as_slice());
     }
 
     #[tokio::test]
