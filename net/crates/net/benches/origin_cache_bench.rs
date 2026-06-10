@@ -12,10 +12,11 @@
 //!
 //! Run: `cargo bench --bench origin_cache_bench --features net`
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use dashmap::DashMap;
 use lru::LruCache;
 use parking_lot::Mutex;
+use std::hint::black_box;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
