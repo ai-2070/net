@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/channel/roster.rs
+  s_d4a014e53aa1f5::t_6ae0484aaf0525 247
+  s_d4a014e53aa1f5::t_1a474f9a2f0974 169
+  s_d4a014e53aa1f5::t_02909c2c385bf9 304,306,317
+  s_d4a014e53aa1f5::t_06f99bf9fe2322 179-181
+  s_d4a014e53aa1f5::t_8bf1d9891273a6 62-70,72-82,92-93,99-101,103,110-143
+  s_d4a014e53aa1f5::t_c22ddd0679fa2a 279
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "87fc34ace5ac546acac443b544de7b532124d31f",
+  "prompts": {},
+  "sessions": {
+    "s_d4a014e53aa1f5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a6af4feb-518f-4835-a66d-5b2f7797adef",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
