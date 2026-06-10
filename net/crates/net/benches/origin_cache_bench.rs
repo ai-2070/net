@@ -73,7 +73,11 @@ fn bench_origin_cache(c: &mut Criterion) {
         });
         g.bench_function("mutex_lru", |b| {
             b.iter_batched(
-                || Mutex::new(LruCache::<u64, Arc<str>>::new(NonZeroUsize::new(CAP).unwrap())),
+                || {
+                    Mutex::new(LruCache::<u64, Arc<str>>::new(
+                        NonZeroUsize::new(CAP).unwrap(),
+                    ))
+                },
                 |lru| {
                     {
                         let mut l = lru.lock();
