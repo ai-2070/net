@@ -1227,6 +1227,26 @@ fn nonzero_interval(d: Duration) -> Duration {
     }
 }
 
+/// TTL the capability re-announce loop stamps on its broadcasts.
+///
+/// The loop ticks every `reannounce_interval`, but
+/// [`MeshNode::announce_capabilities_with`] rate-limits the actual network
+/// broadcast to at most once per `min_announce_interval`. So the cadence
+/// peers *actually* see a refresh at is `max(reannounce_interval,
+/// min_announce_interval)`, not `reannounce_interval`. We stamp `2 ×` that
+/// effective cadence so a peer entry survives one missed broadcast; using the
+/// bare `reannounce_interval` would let peer entries expire whenever it is
+/// configured below `min_announce_interval` (the broadcast is throttled away,
+/// but the TTL was sized as if it weren't). Floored at 1 s because the
+/// announce TTL is truncated to whole seconds on the wire.
+#[inline]
+fn capability_reannounce_ttl(reannounce_interval: Duration, min_announce_interval: Duration) -> Duration {
+    reannounce_interval
+        .max(min_announce_interval)
+        .saturating_mul(2)
+        .max(Duration::from_secs(1))
+}
+
 /// Race a punch-observer `oneshot::Receiver` against a deadline
 /// and handle cleanup of the shared `punch_observers` map with
 /// the correct semantics for each outcome. Returns `true` when
@@ -3138,11 +3158,18 @@ impl MeshNode {
     /// stops being discoverable.
     ///
     /// Every [`MeshNodeConfig::capability_reannounce_interval`] the loop
-    /// re-broadcasts the current capability set via `announce_capabilities`
-    /// with a TTL of `2 ×` the interval (floored at 1 s, since the announce
-    /// TTL is whole-seconds), so a single missed tick can't expire the
-    /// entry. This refreshes both the local self-index and peers' folds.
-    /// `Duration::MAX` disables the loop.
+    /// re-broadcasts the current capability set via `announce_capabilities`,
+    /// refreshing both the local self-index and peers' folds. The TTL it
+    /// stamps comes from [`capability_reannounce_ttl`]: `2 ×` the *effective*
+    /// broadcast cadence, which is `max(reannounce_interval,
+    /// min_announce_interval)` — because `announce_capabilities_with`
+    /// rate-limits the network broadcast to `min_announce_interval`, so a
+    /// reannounce interval set *below* it cannot actually push to peers any
+    /// faster. Stamping `2 × reannounce_interval` there would let peer
+    /// entries expire before the throttle releases the next broadcast; folding
+    /// the throttle into the TTL keeps them alive. (The local self-index is
+    /// refreshed every call regardless of the throttle, so this only matters
+    /// for peers.) `Duration::MAX` disables the loop.
     ///
     /// Re-broadcasting needs an owned `Arc` (the per-peer sends go through
     /// `&self`), so the loop upgrades the `Weak` stored by [`Self::start_arc`]
@@ -3151,6 +3178,7 @@ impl MeshNode {
     /// a no-op there (`start_arc` is the path that enables re-announce).
     fn spawn_capability_reannounce_loop(&self) -> JoinHandle<()> {
         let interval = self.config.capability_reannounce_interval;
+        let min_announce = self.config.min_announce_interval;
         // `Some` only when the node was started via `start_arc`.
         let weak = self.self_weak.get().cloned();
         let shutdown = self.shutdown.clone();
@@ -3161,10 +3189,7 @@ impl MeshNode {
                 let _ = shutdown_notify.notified().await;
                 return;
             };
-            // TTL = 2× interval so an entry survives a missed re-announce;
-            // floored at 1 s because `announce_capabilities_with` truncates
-            // the TTL to whole seconds.
-            let ttl = interval.saturating_mul(2).max(Duration::from_secs(1));
+            let ttl = capability_reannounce_ttl(interval, min_announce);
             let mut tick = tokio::time::interval(nonzero_interval(interval));
             // Skip the immediate t=0 tick — the initial announce (if any)
             // already laid the entry down; this loop only refreshes it.
@@ -12387,6 +12412,50 @@ mod reclassify_override_race_tests {
             !present,
             "without the re-announce loop the self-entry must expire and be swept"
         );
+    }
+
+    /// Regression for the P2 throttle interaction: when the re-announce
+    /// interval is configured *below* `min_announce_interval`, the loop ticks
+    /// fast but `announce_capabilities_with` rate-limits the network broadcast
+    /// to `min_announce_interval`. The stamped TTL must cover that *effective*
+    /// (throttled) cadence — `2 × min_announce_interval` here — not the bare
+    /// `2 × reannounce_interval`, which would expire on peers before the
+    /// throttle releases the next broadcast.
+    #[test]
+    fn reannounce_ttl_covers_throttled_broadcast_cadence() {
+        // reannounce 40 ms ≪ min_announce 10 s: the throttle dominates.
+        let ttl = capability_reannounce_ttl(
+            Duration::from_millis(40),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            ttl,
+            Duration::from_secs(20),
+            "TTL must be 2× the effective (throttled) cadence, not 2× the 40 ms tick"
+        );
+    }
+
+    /// When the re-announce interval dominates `min_announce_interval`, the
+    /// throttle is a no-op and the TTL is just `2 × reannounce_interval`.
+    #[test]
+    fn reannounce_ttl_uses_reannounce_when_it_dominates() {
+        // Defaults: reannounce 150 s, min_announce 10 s.
+        let ttl = capability_reannounce_ttl(
+            Duration::from_secs(150),
+            Duration::from_secs(10),
+        );
+        assert_eq!(ttl, Duration::from_secs(300));
+    }
+
+    /// Both intervals sub-second → the TTL still floors at 1 s, since the
+    /// announce TTL is truncated to whole seconds on the wire.
+    #[test]
+    fn reannounce_ttl_floors_at_one_second() {
+        let ttl = capability_reannounce_ttl(
+            Duration::from_millis(40),
+            Duration::from_millis(50),
+        );
+        assert_eq!(ttl, Duration::from_secs(1));
     }
 
     /// Pre-fix behavior: with override inactive, the commit
