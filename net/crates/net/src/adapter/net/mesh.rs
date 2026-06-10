@@ -1240,7 +1240,10 @@ fn nonzero_interval(d: Duration) -> Duration {
 /// but the TTL was sized as if it weren't). Floored at 1 s because the
 /// announce TTL is truncated to whole seconds on the wire.
 #[inline]
-fn capability_reannounce_ttl(reannounce_interval: Duration, min_announce_interval: Duration) -> Duration {
+fn capability_reannounce_ttl(
+    reannounce_interval: Duration,
+    min_announce_interval: Duration,
+) -> Duration {
     reannounce_interval
         .max(min_announce_interval)
         .saturating_mul(2)
@@ -12424,10 +12427,7 @@ mod reclassify_override_race_tests {
     #[test]
     fn reannounce_ttl_covers_throttled_broadcast_cadence() {
         // reannounce 40 ms ≪ min_announce 10 s: the throttle dominates.
-        let ttl = capability_reannounce_ttl(
-            Duration::from_millis(40),
-            Duration::from_secs(10),
-        );
+        let ttl = capability_reannounce_ttl(Duration::from_millis(40), Duration::from_secs(10));
         assert_eq!(
             ttl,
             Duration::from_secs(20),
@@ -12440,10 +12440,7 @@ mod reclassify_override_race_tests {
     #[test]
     fn reannounce_ttl_uses_reannounce_when_it_dominates() {
         // Defaults: reannounce 150 s, min_announce 10 s.
-        let ttl = capability_reannounce_ttl(
-            Duration::from_secs(150),
-            Duration::from_secs(10),
-        );
+        let ttl = capability_reannounce_ttl(Duration::from_secs(150), Duration::from_secs(10));
         assert_eq!(ttl, Duration::from_secs(300));
     }
 
@@ -12451,10 +12448,7 @@ mod reclassify_override_race_tests {
     /// announce TTL is truncated to whole seconds on the wire.
     #[test]
     fn reannounce_ttl_floors_at_one_second() {
-        let ttl = capability_reannounce_ttl(
-            Duration::from_millis(40),
-            Duration::from_millis(50),
-        );
+        let ttl = capability_reannounce_ttl(Duration::from_millis(40), Duration::from_millis(50));
         assert_eq!(ttl, Duration::from_secs(1));
     }
 

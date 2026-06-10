@@ -1870,8 +1870,7 @@ impl MeshNode {
         // bounded the same way as `origin_node_cache` above — an
         // `OriginKeyedLru`, not an unbounded map, so a crafted-origin flood
         // can't amplify server memory (a miss just rebuilds the name).
-        let reply_channel_cache: Arc<OriginKeyedLru<ChannelName>> =
-            Arc::new(OriginKeyedLru::new());
+        let reply_channel_cache: Arc<OriginKeyedLru<ChannelName>> = Arc::new(OriginKeyedLru::new());
         // §8a response drainer channel. Bounded like the inbound channel; a
         // full channel means the drainer can't keep up, so we drop (the
         // caller times out) rather than block the fold.
