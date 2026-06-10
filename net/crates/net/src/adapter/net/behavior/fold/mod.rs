@@ -504,6 +504,20 @@ impl<K: FoldKind> Fold<K> {
     /// the legitimate way to add entries to a live fold;
     /// restore is for cold-start / forced-reset only.
     ///
+    /// # Trust invariant
+    ///
+    /// `restore` repopulates `by_node` keyed directly on each
+    /// entry's `node_id` and performs **no** signature or
+    /// publisher-binding check — unlike the wire path, where
+    /// [`SignedAnnouncement::verify`] binds `node_id` to the
+    /// signing publisher. The snapshot is therefore trusted: only
+    /// ever pass one produced locally by [`Self::snapshot`] (or
+    /// durably persisted from it). Never feed a peer-supplied /
+    /// lower-privilege-writable snapshot here — doing so would let
+    /// a remote party plant capability/reservation entries under
+    /// arbitrary `node_id`s, reopening the cross-node injection the
+    /// wire-level binding closes.
+    ///
     /// Re-anchors `received_at` / `expires_at` against the
     /// current `Instant::now()` and consumes the wall-clock
     /// interval since `snap.taken_at_unix_us` out of each entry's

@@ -28,6 +28,7 @@
 //! placement, this is about access control. No relationship.
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 /// Wire-format tag prefix for self-declared group membership.
 /// Operators emit `group:<64-hex-char>` as a capability tag on
@@ -43,8 +44,30 @@ pub const GROUP_TAG_PREFIX: &str = "group:";
 /// callers go through [`Self::from_bytes`] / [`Self::as_bytes`]
 /// so the substrate keeps the option of changing the internal
 /// representation without breaking the public surface.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[expect(
+    clippy::derived_hash_with_manual_eq,
+    reason = "manual PartialEq is constant-time but byte-identical to the \
+              derived one; the Hash/Eq invariant (equal values hash equal) \
+              holds because both operate on the same 32 bytes"
+)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Serialize, Deserialize)]
 pub struct GroupId(pub(crate) [u8; 32]);
+
+impl PartialEq for GroupId {
+    /// Constant-time equality. A `GroupId` is a bearer secret —
+    /// knowing the 32 random bytes *is* membership — so a
+    /// data-dependent early-exit compare (the derived `PartialEq`)
+    /// leaks the secret through timing. Fold every byte difference
+    /// into one accumulator. Delegates to `subtle`'s audited,
+    /// optimizer-resistant `ConstantTimeEq` rather than a hand-rolled
+    /// `black_box` fold.
+    ///
+    /// Consistent with the derived `Hash`/`Eq` (equal bytes compare
+    /// equal and hash equal), so use as a map key is unaffected.
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ct_eq(&other.0).into()
+    }
+}
 
 impl GroupId {
     /// Construct from raw bytes.
@@ -126,6 +149,26 @@ mod tests {
         let a = GroupId([0x11; 32]);
         let b = GroupId([0x22; 32]);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn constant_time_eq_preserves_equality_semantics() {
+        // The constant-time PartialEq must agree with byte equality
+        // on every shape: identical, fully different, and a single
+        // differing byte at the start or end (the cases an early-exit
+        // compare would short-circuit on).
+        assert_eq!(GroupId([0x11; 32]), GroupId([0x11; 32]));
+        assert_ne!(GroupId([0x00; 32]), GroupId([0xFF; 32]));
+        let mut first_byte = [0x11; 32];
+        first_byte[0] = 0x12;
+        assert_ne!(GroupId([0x11; 32]), GroupId(first_byte));
+        let mut last_byte = [0x11; 32];
+        last_byte[31] = 0x12;
+        assert_ne!(GroupId([0x11; 32]), GroupId(last_byte));
+        // Hash/Eq stay consistent: equal ids usable as map keys.
+        let mut set = std::collections::HashSet::new();
+        set.insert(GroupId([0x11; 32]));
+        assert!(set.contains(&GroupId([0x11; 32])));
     }
 
     #[test]

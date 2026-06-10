@@ -1081,13 +1081,16 @@ mod tests {
         registry.register(fold.clone());
 
         let kp = EntityKeypair::generate();
+        // Dispatch verifies the publisher-binding, so an honest
+        // envelope must carry the signer's own node_id.
+        let nid = kp.entity_id().node_id();
         let ann = sign_res(
             &kp,
-            0xA,
+            nid,
             1,
             0x123,
             ReservationState::Reserved {
-                holder: 0xA,
+                holder: nid,
                 until_unix_us: fresh_deadline_us(),
             },
         );

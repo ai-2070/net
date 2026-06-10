@@ -43,6 +43,33 @@
 //! types are small (a few pointers + atomics), so total leak grows
 //! with cumulative `open + free` cycles — acceptable for the
 //! soundness gain.
+//!
+//! ## Adopting the guard on a NEW handle (checklist)
+//!
+//! The protocol is applied by convention at each call site rather
+//! than via a wrapper type (the inline form is uniform across the
+//! cortex / mesh / redis-dedup / aggregator handles). Miss any step
+//! and the UAF this module exists to prevent comes back, so when you
+//! add a handle:
+//!
+//! 1. Wrap every inner field in [`std::mem::ManuallyDrop`] and embed
+//!    one [`crate::ffi::handle_guard::HandleGuard`] (not in
+//!    `ManuallyDrop` — it must outlive the inner so post-free
+//!    `try_enter` calls land on valid memory).
+//! 2. In every `extern "C"` op, gate on
+//!    [`crate::ffi::handle_guard::HandleGuard::try_enter`] *before*
+//!    touching any inner field, and return the handle's
+//!    "invalid/shutting down" sentinel (NULL / error code) on `None`.
+//! 3. Don't hold the returned
+//!    [`crate::ffi::handle_guard::HandleOp`] across a long blocking
+//!    call — clone the (Arc-backed) inner out, drop the guard, then
+//!    re-enter only to write back, so a concurrent `_free` never
+//!    waits on a caller-set deadline (see `ffi::aggregator`).
+//! 4. In `_free`, gate the `ManuallyDrop::drop` of each inner field
+//!    on [`crate::ffi::handle_guard::HandleGuard::begin_free`]
+//!    returning `true`; never `Box::from_raw` — leak the box.
+//! 5. Any pointer handed back to C must be an owned copy, never a
+//!    borrow into a `ManuallyDrop` field (which `_free` can drop).
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -58,6 +85,23 @@ use std::time::{Duration, Instant};
 /// to absorb a wedged adapter without reflexively leaking on a
 /// transient stall.
 pub const FFI_HANDLE_FREE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Outcome of [`HandleGuard::begin_free_detailed`] — lets a `_free`
+/// log accurately instead of treating every non-success the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeginFree {
+    /// This call won the free race AND in-flight ops drained: the
+    /// caller owns the right to take/drop the inner exactly once.
+    Drained,
+    /// A prior `_free` already won for this handle (benign repeat
+    /// free). The caller must NOT touch the inner — the winner has
+    /// it — and nothing is leaked by this call, so don't warn.
+    AlreadyFreeing,
+    /// This call won the free race but in-flight ops did not drain
+    /// within the deadline. The caller must leak the inner (a
+    /// concurrent op may still be reading it) — worth a warning.
+    TimedOut,
+}
 
 /// Per-handle quiescing core. Lives inline inside each handle
 /// struct. `try_enter` returns a guard that prevents `_free` from
@@ -142,6 +186,17 @@ impl HandleGuard {
     /// out, or this caller is the loser. "No NEW ops will start"
     /// is set as soon as the winner flips the flag.
     pub fn begin_free(&self, deadline: Duration) -> bool {
+        matches!(self.begin_free_detailed(deadline), BeginFree::Drained)
+    }
+
+    /// Same protocol as [`Self::begin_free`] but distinguishes the
+    /// two `false` outcomes so a caller can log accurately: a benign
+    /// repeat `_free` ([`BeginFree::AlreadyFreeing`]) leaks nothing
+    /// and shouldn't warn, whereas a genuine drain timeout
+    /// ([`BeginFree::TimedOut`]) deliberately leaks the inner and is
+    /// worth a warning. The single-winner contract is unchanged:
+    /// exactly one caller ever sees [`BeginFree::Drained`].
+    pub fn begin_free_detailed(&self, deadline: Duration) -> BeginFree {
         // compare_exchange so only one caller wins the right to
         // flip false→true. Losers (whether racing concurrently
         // or strictly after) get an Err and bail without ever
@@ -156,7 +211,7 @@ impl HandleGuard {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            return false;
+            return BeginFree::AlreadyFreeing;
         }
         let start = Instant::now();
         // Spin-with-sleep is appropriate: ops are sub-second; the
@@ -167,11 +222,11 @@ impl HandleGuard {
         // the deadline is large enough to absorb normal jitter.
         while self.active_ops.load(Ordering::SeqCst) > 0 {
             if start.elapsed() >= deadline {
-                return false;
+                return BeginFree::TimedOut;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        true
+        BeginFree::Drained
     }
 
     /// True if `begin_free` has been called for this handle.
@@ -350,6 +405,49 @@ mod tests {
             "second begin_free must bail — only the first caller \
              owns the right to take the inner",
         );
+    }
+
+    /// Pin: `begin_free_detailed` distinguishes the three outcomes,
+    /// so `_free` can warn only on a genuine drain timeout and stay
+    /// quiet on a benign repeat free.
+    #[test]
+    fn begin_free_detailed_distinguishes_outcomes() {
+        // Fresh guard, no ops → Drained (the winner).
+        let g = HandleGuard::new();
+        assert_eq!(
+            g.begin_free_detailed(Duration::from_millis(50)),
+            BeginFree::Drained
+        );
+        // Second call → AlreadyFreeing (benign repeat, not a timeout).
+        assert_eq!(
+            g.begin_free_detailed(Duration::from_millis(50)),
+            BeginFree::AlreadyFreeing
+        );
+
+        // Op held past the deadline → TimedOut for the winner.
+        let g2 = Arc::new(HandleGuard::new());
+        let g2_op = g2.clone();
+        let release = Arc::new(AtomicBool::new(false));
+        let release_op = release.clone();
+        let worker = std::thread::spawn(move || {
+            let op = g2_op.try_enter().expect("op must enter");
+            while !release_op.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(op);
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            g2.begin_free_detailed(Duration::from_millis(40)),
+            BeginFree::TimedOut
+        );
+        // After a timed-out winner, a later call is still AlreadyFreeing.
+        assert_eq!(
+            g2.begin_free_detailed(Duration::from_millis(40)),
+            BeginFree::AlreadyFreeing
+        );
+        release.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
     }
 
     /// Pin: a second `begin_free` after a TIMED-OUT first call

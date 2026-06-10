@@ -457,12 +457,13 @@ int net_registry_client_unregister(
 
 /*
  * Operator-facing detail string for the most recent non-OK op.
- * Returns a NUL-terminated C string owned by the handle —
- * valid until the next op on the handle (which may overwrite)
- * or until the handle is freed. Returns NULL when no error has
- * been recorded.
+ * Returns a freshly-allocated, NUL-terminated C string that the
+ * CALLER OWNS and must free with `net_free_string`. Returns NULL
+ * when no error has been recorded. (The returned copy is
+ * independent of the handle, so it stays valid across other ops
+ * and a concurrent free.)
  */
-const char* net_registry_last_error_detail(net_registry_client_handle_t* handle);
+char* net_registry_last_error_detail(net_registry_client_handle_t* handle);
 
 /*
  * Register a channel with a specific visibility tier. Mirrors
@@ -548,10 +549,11 @@ void net_fold_query_client_invalidate_target(
 
 /*
  * Operator-facing detail string for the most recent non-OK
- * fold-query op on this handle. Same valid-until contract as
- * `net_registry_last_error_detail`.
+ * fold-query op on this handle. Same caller-owned contract as
+ * `net_registry_last_error_detail`: free the returned string
+ * with `net_free_string`.
  */
-const char* net_fold_query_last_error_detail(
+char* net_fold_query_last_error_detail(
     net_fold_query_client_handle_t* handle);
 
 #ifdef __cplusplus
