@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/behavior/fold/capability.rs
+  s_d4a014e53aa1f5::t_8556c94d0b2746 349-363
+  s_d4a014e53aa1f5::t_dd8e624fc46c5b 996-1105
+net/crates/net/src/adapter/net/behavior/fold/state.rs
+  s_d4a014e53aa1f5::t_c313eb0bd0124b 244-265
+net/crates/net/src/adapter/net/behavior/fold/mod.rs
+  s_d4a014e53aa1f5::t_4ec1300aaf92b0 408-421
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "ae6239a44040de6b67ffb47f985e92b6d1b34586",
+  "prompts": {},
+  "sessions": {
+    "s_d4a014e53aa1f5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a6af4feb-518f-4835-a66d-5b2f7797adef",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
