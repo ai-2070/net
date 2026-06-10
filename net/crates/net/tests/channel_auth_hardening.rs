@@ -394,13 +394,21 @@ async fn expired_token_evicts_subscriber_within_one_sweep() {
         .insert(pub_token)
         .expect("install publish token");
 
-    // Short-lived subscribe token — 1 second.
+    // Short-lived subscribe token. 3 s (not 1 s) for the same
+    // second-resolution-clock reason as commit f01b4d86a's fix to the
+    // sibling `publish_skips_expired_subscriber*` test: `current_timestamp`
+    // is unix-seconds granularity, so a 1 s token issued partway through a
+    // wall-clock second can already be expired by the time A's gate validates
+    // the subscribe handshake on a loaded runner — making this `subscribe`
+    // (which must succeed so there's a subscriber to later evict) flake with
+    // `Unauthorized`. 3 s leaves ~2 s of slack to subscribe; the post-subscribe
+    // sleep below is bumped proportionally so the sweep still crosses expiry.
     let token = PermissionToken::issue(
         &a.keypair,
         b.keypair.entity_id().clone(),
         TokenScope::SUBSCRIBE,
         channel.hash(),
-        1,
+        3,
         0,
     );
 
@@ -415,8 +423,10 @@ async fn expired_token_evicts_subscriber_within_one_sweep() {
         "subscribe didn't populate the guard",
     );
 
-    // Wait past the token's TTL + one sweep tick.
-    tokio::time::sleep(Duration::from_millis(1_400)).await;
+    // Wait past the token's TTL (second-resolution: worst-case expiry is ~4 s
+    // from issue) + one 200 ms sweep tick. The `wait_until` below polls for the
+    // revocation, so this only needs to reliably cross expiry.
+    tokio::time::sleep(Duration::from_millis(4_500)).await;
 
     // Sweep should have pulled B off the roster and revoked the
     // guard entry. Give the async loop one more tick to land.
