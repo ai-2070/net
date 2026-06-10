@@ -711,6 +711,26 @@ impl ShardManager {
         Some(ShardRef { shard })
     }
 
+    /// Lock-free per-batch counter bump for the supplied shard. The
+    /// `batches_dispatched` field lives on the parallel
+    /// `Vec<Arc<ShardCounters>>` precisely so stats can be recorded
+    /// without taking the producer-hot shard mutex. Returns `false`
+    /// when `id` is unknown (e.g. the shard was just removed); the
+    /// caller treats that as a no-op. Per PERF_AUDIT §1.4.
+    pub fn record_batch_dispatch(&self, id: u16) -> bool {
+        let table = self.table.load();
+        let Some(idx) = self.resolve_idx(&table, id) else {
+            return false;
+        };
+        let Some(counters) = table.counters.get(idx) else {
+            return false;
+        };
+        counters
+            .batches_dispatched
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        true
+    }
+
     /// Execute a function with exclusive access to a shard.
     pub fn with_shard<F, R>(&self, id: u16, f: F) -> Option<R>
     where
@@ -1158,6 +1178,35 @@ mod tests {
         assert_eq!(metrics.event_rate, 16);
         assert!(metrics.fill_ratio > 0.0);
         assert!(metrics.avg_push_latency_ns > 0);
+    }
+
+    /// PERF_AUDIT §1.4 — `ShardManager::record_batch_dispatch` must
+    /// hit the lock-free per-shard counter (no shard-mutex lock).
+    /// Pin: a sequence of calls bumps the counter to the expected
+    /// total; unknown shard ids return false and do not bump
+    /// anything; the read path (`ShardManager::stats()`) reflects
+    /// the increments.
+    #[test]
+    fn record_batch_dispatch_is_lock_free_and_aggregates() {
+        let manager = ShardManager::new(2, 1024, BackpressureMode::DropNewest);
+        let shard_ids = manager.shard_ids();
+        assert_eq!(shard_ids.len(), 2);
+        for _ in 0..7 {
+            assert!(manager.record_batch_dispatch(shard_ids[0]));
+        }
+        for _ in 0..3 {
+            assert!(manager.record_batch_dispatch(shard_ids[1]));
+        }
+        // Unknown id → no-op.
+        assert!(!manager.record_batch_dispatch(0xFFFF));
+
+        // Stats aggregator sums across shards.
+        let stats = manager.stats();
+        assert_eq!(
+            stats.batches_dispatched, 10,
+            "aggregated batches_dispatched must equal the sum of per-shard \
+             record_batch_dispatch calls"
+        );
     }
 
     #[test]

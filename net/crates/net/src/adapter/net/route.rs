@@ -667,16 +667,30 @@ impl RoutingTable {
     /// Get or create the stream-stats entry, maintaining `num_streams`.
     /// All `stream_stats` insertions funnel through here so the O(1) count
     /// stays exact (the Vacant arm is the only branch that grows the map).
-    fn stream_entry(
+    ///
+    /// Folds the `MAX_STREAM_STATS` admission gate into the same
+    /// `entry()` call — per PERF_AUDIT §3.12 the prior `record_*`
+    /// path called `may_admit_stream` (contains_key, one shard lock)
+    /// then `stream_entry` (entry, second shard lock) for every
+    /// recorded packet. Returns `None` when admitting would breach
+    /// the cap.
+    fn stream_entry_admitted(
         &self,
         stream_id: u64,
-    ) -> dashmap::mapref::one::RefMut<'_, u64, SchedulerStreamStats> {
+    ) -> Option<dashmap::mapref::one::RefMut<'_, u64, SchedulerStreamStats>> {
         use dashmap::mapref::entry::Entry;
         match self.stream_stats.entry(stream_id) {
-            Entry::Occupied(o) => o.into_ref(),
+            Entry::Occupied(o) => Some(o.into_ref()),
             Entry::Vacant(v) => {
+                // Admit only while below cap. Soft check — concurrent
+                // inserts may race the load + fetch_add window, but the
+                // overshoot is bounded by the number of concurrent
+                // admissions and trims back on `prune_stale_streams`.
+                if self.num_streams.load(Ordering::Relaxed) >= MAX_STREAM_STATS {
+                    return None;
+                }
                 self.num_streams.fetch_add(1, Ordering::Relaxed);
-                v.insert(SchedulerStreamStats::default())
+                Some(v.insert(SchedulerStreamStats::default()))
             }
         }
     }
@@ -694,49 +708,30 @@ impl RoutingTable {
         &self,
         stream_id: u64,
     ) -> Option<dashmap::mapref::one::Ref<'_, u64, SchedulerStreamStats>> {
-        if !self.may_admit_stream(stream_id) {
-            return None;
-        }
-        Some(self.stream_entry(stream_id).downgrade())
-    }
-
-    /// Returns true if this stream id may be inserted into
-    /// `stream_stats`. Existing entries always proceed; new
-    /// entries are admitted only if the map is below
-    /// [`MAX_STREAM_STATS`]. The check has a TOCTOU
-    /// race against concurrent inserters but is intentionally
-    /// soft — we only need to bound growth, not enforce a strict
-    /// upper bound.
-    #[inline]
-    fn may_admit_stream(&self, stream_id: u64) -> bool {
-        if self.stream_stats.contains_key(&stream_id) {
-            return true;
-        }
-        self.num_streams.load(Ordering::Relaxed) < MAX_STREAM_STATS
+        // Single shard-lock access — PERF_AUDIT §3.12. Downgrade to a
+        // read-Ref for the public return shape.
+        self.stream_entry_admitted(stream_id).map(|e| e.downgrade())
     }
 
     /// Record incoming packet for stream
     pub fn record_in(&self, stream_id: u64, bytes: u64) {
-        if !self.may_admit_stream(stream_id) {
-            return;
+        if let Some(e) = self.stream_entry_admitted(stream_id) {
+            e.record_in(bytes);
         }
-        self.stream_entry(stream_id).record_in(bytes);
     }
 
     /// Record outgoing packet for stream
     pub fn record_out(&self, stream_id: u64, bytes: u64) {
-        if !self.may_admit_stream(stream_id) {
-            return;
+        if let Some(e) = self.stream_entry_admitted(stream_id) {
+            e.record_out(bytes);
         }
-        self.stream_entry(stream_id).record_out(bytes);
     }
 
     /// Record dropped packet for stream
     pub fn record_drop(&self, stream_id: u64) {
-        if !self.may_admit_stream(stream_id) {
-            return;
+        if let Some(e) = self.stream_entry_admitted(stream_id) {
+            e.record_drop();
         }
-        self.stream_entry(stream_id).record_drop();
     }
 
     /// Get number of routes

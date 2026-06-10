@@ -2371,9 +2371,15 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                             stats
                                 .events_dispatched
                                 .fetch_add(batch_len, AtomicOrdering::Relaxed);
-                            if let Some(shard_ref) = shard_manager.shard(shard_id) {
-                                shard_ref.lock().record_batch_dispatch();
-                            }
+                            // PERF_AUDIT §1.4 — lock-free counter
+                            // bump on the per-shard `ShardCounters`
+                            // (parallel `Vec` exposed by
+                            // `ShardManager`). Pre-fix this
+                            // `shard_ref.lock().record_batch_dispatch()`
+                            // took the producer-hot shard mutex just
+                            // to bump an atomic, injecting periodic
+                            // latency spikes into the ingest path.
+                            shard_manager.record_batch_dispatch(shard_id);
                         }
                     }
                 }
@@ -2426,9 +2432,15 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                             stats
                                 .events_dispatched
                                 .fetch_add(batch_len, AtomicOrdering::Relaxed);
-                            if let Some(shard_ref) = shard_manager.shard(shard_id) {
-                                shard_ref.lock().record_batch_dispatch();
-                            }
+                            // PERF_AUDIT §1.4 — lock-free counter
+                            // bump on the per-shard `ShardCounters`
+                            // (parallel `Vec` exposed by
+                            // `ShardManager`). Pre-fix this
+                            // `shard_ref.lock().record_batch_dispatch()`
+                            // took the producer-hot shard mutex just
+                            // to bump an atomic, injecting periodic
+                            // latency spikes into the ingest path.
+                            shard_manager.record_batch_dispatch(shard_id);
                         }
                     }
                 }
