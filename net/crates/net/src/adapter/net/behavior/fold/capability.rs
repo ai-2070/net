@@ -212,10 +212,21 @@ pub type CapabilityMatch = ((u64, NodeId), CapabilityMembership);
 /// find-in-region, find-by-state) without scanning the full
 /// store. `Composite` queries pick the most selective indexed
 /// dimension and filter the others in-memory.
+///
+/// **PERF_AUDIT §4.6** — the inner `HashSet<(u64, NodeId)>` candidate
+/// sets use [`BuildU64TupleHasher`], a fast multiplicative mixer for
+/// `(u64, u64)` keys. Pre-fix these used the std SipHash default,
+/// which paid ~15-25 ns of mixing per insert/contains/remove on keys
+/// that are already xxh3-hashed identity bytes (so collision
+/// resistance is already there at construction; SipHash's DoS
+/// resistance adds zero protection). The outer `HashMap<String, _>` /
+/// `HashMap<NodeState, _>` keep the default hasher: tag / region
+/// strings come from publishers and the SipHash protection is
+/// legitimately relevant there.
 #[derive(Debug, Default)]
 pub struct CapabilityIndexInner {
     /// tag → set of (class, node) keys carrying that tag.
-    by_tag: HashMap<String, HashSet<(u64, NodeId)>>,
+    by_tag: HashMap<String, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
     /// Index-only synthetic tag (`model:`/`tool:`/`gpu:`) → set of
     /// (class, node) keys. Kept in a SEPARATE map from `by_tag` so a
     /// raw published tag string can never collide with a synthetic
@@ -225,12 +236,51 @@ pub struct CapabilityIndexInner {
     /// `require_models` query it lacks the real bundle for. The bulk
     /// model/tool/gpu axes (`tag_groups_all`) resolve against this
     /// map only — see [`group_union`].
-    by_synthetic: HashMap<String, HashSet<(u64, NodeId)>>,
+    by_synthetic: HashMap<String, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
     /// region → set of (class, node) keys.
-    by_region: HashMap<String, HashSet<(u64, NodeId)>>,
+    by_region: HashMap<String, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
     /// state → set of (class, node) keys.
-    by_state: HashMap<NodeState, HashSet<(u64, NodeId)>>,
+    by_state: HashMap<NodeState, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
 }
+
+/// Fast multiplicative `(u64, u64)` mixer for the inverted-index
+/// candidate sets. Per PERF_AUDIT §4.6 — see [`CapabilityIndexInner`]
+/// for the threat-model rationale (keys come from already-verified
+/// announcements; SipHash DoS resistance is irrelevant).
+///
+/// `Hash for (u64, u64)` is `write_u64(self.0); write_u64(self.1);`,
+/// so a hasher with a fast `write_u64` step and the byte-fallback for
+/// completeness mixes the pair correctly in 2 multiplications.
+#[derive(Default, Clone)]
+pub(crate) struct U64TupleHasher(u64);
+
+impl std::hash::Hasher for U64TupleHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        // FxHash-style step: rotate, xor, multiply by a large odd
+        // constant. ~1 ns; well-distributed for already-hashed input.
+        const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(FX_SEED);
+    }
+    /// Defensive byte fallback — the std `Hash` impl for `(u64, u64)`
+    /// calls `write_u64` directly, but a future change to the tuple's
+    /// hash impl could route through `write(&[u8])`. Pack up to 8
+    /// bytes per chunk and reuse `write_u64`.
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            self.write_u64(u64::from_le_bytes(buf));
+        }
+    }
+}
+
+pub(crate) type BuildU64TupleHasher = std::hash::BuildHasherDefault<U64TupleHasher>;
 
 impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
     fn on_insert(&mut self, key: &(u64, NodeId), payload: &CapabilityMembership) {
@@ -432,7 +482,10 @@ impl FoldKind for CapabilityFold {
 /// as the candidate set, then retain only candidates present
 /// in every subsequent bucket. Empty `tags` returns every key
 /// (matches the `tags_all = []` "no constraint" convention).
-fn resolve_keys_all_tags(index: &CapabilityIndexInner, tags: &[String]) -> HashSet<(u64, NodeId)> {
+fn resolve_keys_all_tags(
+    index: &CapabilityIndexInner,
+    tags: &[String],
+) -> HashSet<(u64, NodeId), BuildU64TupleHasher> {
     if tags.is_empty() {
         // No tag constraint → every indexed key. Use the by_state
         // index as a proxy: every entry is indexed under exactly
@@ -449,16 +502,17 @@ fn resolve_keys_all_tags(index: &CapabilityIndexInner, tags: &[String]) -> HashS
     tags_by_selectivity.sort_by_key(|t| index.by_tag.get(*t).map(|s| s.len()).unwrap_or(0));
 
     let Some(first) = tags_by_selectivity.first() else {
-        return HashSet::new();
+        return HashSet::default();
     };
     let Some(initial) = index.by_tag.get(*first) else {
         // First tag has no entries → intersection is empty.
-        return HashSet::new();
+        return HashSet::default();
     };
-    let mut candidates: HashSet<(u64, NodeId)> = initial.iter().copied().collect();
+    let mut candidates: HashSet<(u64, NodeId), BuildU64TupleHasher> =
+        initial.iter().copied().collect();
     for tag in tags_by_selectivity.iter().skip(1) {
         let Some(bucket) = index.by_tag.get(*tag) else {
-            return HashSet::new();
+            return HashSet::default();
         };
         candidates.retain(|k| bucket.contains(k));
         if candidates.is_empty() {
@@ -484,17 +538,17 @@ pub(crate) fn resolve_candidate_keys(
     state: &FoldState<CapabilityFold>,
     index: &CapabilityIndexInner,
     filter: &CapabilityFilter,
-) -> HashSet<(u64, NodeId)> {
+) -> HashSet<(u64, NodeId), BuildU64TupleHasher> {
     // Each group's union (OR within a group) is needed both to seed
     // (when no `tags_all` is present) and to tighten further down.
     // `group_unions` holds the ones that still need to be applied as
     // retain filters; the seed branch may consume one of them.
-    let mut group_unions: Vec<HashSet<(u64, NodeId)>> = Vec::new();
+    let mut group_unions: Vec<HashSet<(u64, NodeId), BuildU64TupleHasher>> = Vec::new();
 
     // Seed candidate set: prefer tags_all (typically most
     // selective), then the most-selective tag group, then state,
     // then region, then class scan as fallback.
-    let mut candidates: HashSet<(u64, NodeId)> = if !filter.tags_all.is_empty() {
+    let mut candidates: HashSet<(u64, NodeId), BuildU64TupleHasher> = if !filter.tags_all.is_empty() {
         let seed = resolve_keys_all_tags(index, &filter.tags_all);
         // Only materialize the group unions if the seed left
         // something to filter — when `tags_all` selects nothing the
@@ -593,7 +647,7 @@ pub(crate) fn resolve_candidate_keys(
 fn build_group_unions(
     index: &CapabilityIndexInner,
     groups: &[Vec<String>],
-) -> Vec<HashSet<(u64, NodeId)>> {
+) -> Vec<HashSet<(u64, NodeId), BuildU64TupleHasher>> {
     groups
         .iter()
         .filter(|g| !g.is_empty())
@@ -610,8 +664,11 @@ fn build_group_unions(
 /// `derive_synthetic_index_tags`. Reading the synthetic map keeps a
 /// raw published tag of the same string from satisfying a model /
 /// tool / gpu axis it has no real bundle / hardware for.
-fn group_union(index: &CapabilityIndexInner, group: &[String]) -> HashSet<(u64, NodeId)> {
-    let mut union: HashSet<(u64, NodeId)> = HashSet::new();
+fn group_union(
+    index: &CapabilityIndexInner,
+    group: &[String],
+) -> HashSet<(u64, NodeId), BuildU64TupleHasher> {
+    let mut union: HashSet<(u64, NodeId), BuildU64TupleHasher> = HashSet::default();
     for tag in group {
         if let Some(bucket) = index.by_synthetic.get(tag) {
             union.extend(bucket.iter().copied());
