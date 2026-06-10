@@ -1,0 +1,24 @@
+net/crates/net/src/event.rs
+  s_d4a014e53aa1f5::t_fb5a62d018ad0f 562,564-571,574,576
+net/crates/net/src/shard/mod.rs
+  s_d4a014e53aa1f5::t_216402053043ee 878
+  s_d4a014e53aa1f5::t_8ff0c54d3c0ce7 702-715
+  s_d4a014e53aa1f5::t_038735e4b48ba1 319-326,329-363
+  s_d4a014e53aa1f5::t_1c72300c7b4071 367-370
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "8a46e5487d39415ba2195deb52bf121ab606189d",
+  "prompts": {},
+  "sessions": {
+    "s_d4a014e53aa1f5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a6af4feb-518f-4835-a66d-5b2f7797adef",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
