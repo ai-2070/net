@@ -788,16 +788,33 @@ fn safe_join(dest: &Path, rel: &str) -> Result<PathBuf, DirError> {
     Ok(out)
 }
 
+/// Case-fold one path component for declared-symlink matching.
+///
+/// Windows and the default macOS (APFS/HFS+) volumes are
+/// case-*insensitive*, so `A` and `a` name the same entry there. The
+/// composition check matches a target's components against the set of
+/// declared symlink paths; if that match were case-sensitive, a hostile
+/// manifest could declare symlink `a` and route a target through `A` to
+/// slip past the check while the OS still resolves them as the same
+/// link. Fold to lowercase so the comparison tracks the filesystem.
+/// This over-rejects a genuinely case-distinct sibling on a
+/// case-sensitive FS (Linux ext4), an acceptable safety bias for an
+/// attacker-controlled manifest.
+fn fold_component(c: &str) -> String {
+    c.to_lowercase()
+}
+
 /// Normalize a manifest relative path to its sequence of plain-name
-/// components, dropping `.` segments and rejecting anything else
-/// (`..`, root, drive prefix). Returns `None` for a path that isn't a
-/// pure in-tree descent — used both to key the declared-symlink set and
-/// to walk a link's own location.
+/// components (case-folded via [`fold_component`]), dropping `.`
+/// segments and rejecting anything else (`..`, root, drive prefix).
+/// Returns `None` for a path that isn't a pure in-tree descent — used
+/// both to key the declared-symlink set and to walk a link's own
+/// location.
 fn normal_components(rel: &str) -> Option<Vec<String>> {
     let mut out = Vec::new();
     for comp in Path::new(rel).components() {
         match comp {
-            Component::Normal(c) => out.push(c.to_string_lossy().into_owned()),
+            Component::Normal(c) => out.push(fold_component(&c.to_string_lossy())),
             Component::CurDir => {}
             _ => return None,
         }
@@ -832,6 +849,10 @@ fn normal_components(rel: &str) -> Option<Vec<String>> {
 /// A symlink as the link's *final* target component is fine (the OS
 /// lands on it but doesn't traverse it); that destination is validated
 /// in its own right when its entry is processed.
+///
+/// Matching against `symlinks` is case-insensitive (see
+/// [`fold_component`]) so a casing variant can't bypass the check on a
+/// case-insensitive filesystem.
 fn check_link_target(
     link_rel: &str,
     target: &str,
@@ -867,7 +888,10 @@ fn check_link_target(
                 }
             }
             Component::Normal(c) => {
-                stack.push(c.to_string_lossy().into_owned());
+                // Case-folded to match `symlinks` (built via
+                // `normal_components`), so a casing variant can't dodge
+                // the traversal check on a case-insensitive FS.
+                stack.push(fold_component(&c.to_string_lossy()));
                 // A symlink in any *non-final* position is followed by the
                 // OS to an unknown location, so the lexical depth model no
                 // longer holds — reject (can't prove confinement).
@@ -1005,6 +1029,27 @@ mod tests {
         // (the OS lands on `a`, doesn't traverse it; `a` is validated
         // separately).
         assert!(check_link_target("b", "a", &s).is_ok());
+    }
+
+    #[test]
+    fn check_link_target_rejects_composed_escape_with_different_case() {
+        // On a case-insensitive FS (Windows, default macOS) `A` and `a`
+        // are the same entry, so a casing variant must not dodge the
+        // traversal check. The set is keyed via `normal_components`,
+        // which case-folds, and the target walk folds too.
+        let mut s = BTreeSet::new();
+        s.insert(normal_components("a").unwrap()); // declared symlink `a`
+
+        // Target routes through `A` (== `a`) then escapes → reject.
+        assert!(check_link_target("b", "A/sub/../../etc", &s).is_err());
+        // A symlink declared in upper case is matched by a lower-case
+        // traversal too (folding is symmetric).
+        let mut s2 = BTreeSet::new();
+        s2.insert(normal_components("Dir").unwrap());
+        assert!(check_link_target("b", "dir/sub/../../../etc", &s2).is_err());
+        // A link sitting under a case-variant of a symlinked parent is
+        // likewise rejected.
+        assert!(check_link_target("A/inner", "x", &s).is_err());
     }
 
     #[test]
