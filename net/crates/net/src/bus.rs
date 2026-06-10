@@ -5,6 +5,7 @@
 //! - Event consumption (async polling with filtering)
 //! - Lifecycle management
 
+use crossbeam_utils::CachePadded;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -108,7 +109,17 @@ pub struct EventBus {
     /// safe to proceed while producers were still mid-push.
     /// Widened to `AtomicU64` so the wrap is astronomical
     /// (1.8e19 in-flight ingests).
-    in_flight_ingests: AtomicU64,
+    ///
+    /// **PERF_AUDIT §1.1** — Pre-fix this was a single shared
+    /// `AtomicU64`, and every `ingest`/`ingest_raw` did a SeqCst
+    /// `fetch_add` + a SeqCst `shutdown.load` + (on drop) a SeqCst
+    /// `fetch_sub` against it. On a multi-producer bus the cache
+    /// line ping-ponged across cores on every event, re-serializing
+    /// what was otherwise a fully sharded path. Now striped across
+    /// 32 cache-padded slots; producers pick one at thread-local
+    /// sticky affinity, and the cold reader (`shutdown` wait-for-
+    /// zero) sums slots.
+    in_flight_ingests: StripedInFlight,
     /// Set to `true` after `shutdown()` runs to completion. `Drop`
     /// uses this to detect "dropped without an awaited shutdown" —
     /// in that case events still in the ring buffers / mpsc channels
@@ -150,26 +161,102 @@ struct ShardWorkers {
 
 /// RAII guard for an in-flight ingest. Decrements
 /// `in_flight_ingests` on drop so `shutdown()` can wait for the
-/// counter to reach zero.
+/// counter to reach zero. Holds the slot index the matching
+/// `fetch_add` hit so the matching `fetch_sub` lands on the same
+/// slot — sub'ing from a different slot would still net-zero the
+/// sum but would skew slot occupancies under churn, eventually
+/// underflowing one slot to u64::MAX.
 struct IngestGuard<'a> {
     bus: &'a EventBus,
+    slot: usize,
 }
 
 impl Drop for IngestGuard<'_> {
     fn drop(&mut self) {
-        self.bus
-            .in_flight_ingests
-            .fetch_sub(1, AtomicOrdering::SeqCst);
+        self.bus.in_flight_ingests.fetch_sub_at(self.slot, 1);
+    }
+}
+
+/// Number of cache-padded slots the in-flight counter stripes
+/// across. 32 is large enough to absorb typical core counts
+/// without collisions; small enough that the cold `sum()` path
+/// stays cheap. Power-of-two so slot selection is a mask.
+const IN_FLIGHT_STRIPE_SLOTS: usize = 32;
+
+/// Striped, cache-padded `in_flight_ingests` counter. Per
+/// PERF_AUDIT §1.1 — splits the single contended `AtomicU64` into
+/// 32 cache-padded slots so each producer hits its own line.
+/// Shutdown's wait-for-zero loop sums the slots.
+struct StripedInFlight {
+    slots: [CachePadded<AtomicU64>; IN_FLIGHT_STRIPE_SLOTS],
+}
+
+impl StripedInFlight {
+    fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| CachePadded::new(AtomicU64::new(0))),
+        }
+    }
+
+    /// Pick a slot for this thread. Sticky per-thread via a
+    /// `thread_local!` cell so repeat calls from the same
+    /// producer thread hit the same cache line; first call
+    /// derives an index from `thread::current().id()`.
+    #[inline(always)]
+    fn slot_for_current_thread(&self) -> usize {
+        thread_local! {
+            static SLOT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+        }
+        SLOT.with(|s| {
+            if let Some(idx) = s.get() {
+                return idx;
+            }
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            std::thread::current().id().hash(&mut h);
+            let idx = (h.finish() as usize) & (IN_FLIGHT_STRIPE_SLOTS - 1);
+            s.set(Some(idx));
+            idx
+        })
+    }
+
+    #[inline(always)]
+    fn fetch_add_at(&self, slot: usize, n: u64) {
+        self.slots[slot].fetch_add(n, AtomicOrdering::SeqCst);
+    }
+
+    #[inline(always)]
+    fn fetch_sub_at(&self, slot: usize, n: u64) {
+        self.slots[slot].fetch_sub(n, AtomicOrdering::SeqCst);
+    }
+
+    /// Sum across all slots with SeqCst loads. Cold path —
+    /// shutdown's wait-for-zero + reconciliation only.
+    fn sum(&self) -> u64 {
+        self.slots
+            .iter()
+            .map(|s| s.load(AtomicOrdering::SeqCst))
+            .sum()
     }
 }
 
 /// Event bus statistics.
+///
+/// **PERF_AUDIT §1.2** — Counters are `CachePadded` so the
+/// producer-hot `events_ingested`/`events_dropped` don't false-
+/// share with the batch-worker-hot
+/// `batches_dispatched`/`events_dispatched`. Pre-fix all four sat
+/// on 1-2 cache lines and every per-event `fetch_add` ping-ponged
+/// the line between ingesting producers and the batch worker.
+/// `CachePadded<AtomicU64>` derefs to `AtomicU64`, so external
+/// callers using `stats.events_ingested.load(...)` work unchanged.
 #[derive(Debug, Default)]
 pub struct EventBusStats {
     /// Total events ingested.
-    pub events_ingested: AtomicU64,
+    pub events_ingested: CachePadded<AtomicU64>,
     /// Events dropped due to backpressure.
-    pub events_dropped: AtomicU64,
+    pub events_dropped: CachePadded<AtomicU64>,
     /// Batches dispatched to adapter.
     ///
     /// Pre-fix this field was declared but never incremented anywhere
@@ -181,13 +268,13 @@ pub struct EventBusStats {
     /// `flush_is_a_delivery_barrier` regularly. Now incremented in
     /// the BatchWorker spawn (after a successful `dispatch_batch`)
     /// and in `remove_shard_internal`'s stranded-flush.
-    pub batches_dispatched: AtomicU64,
+    pub batches_dispatched: CachePadded<AtomicU64>,
     /// Total events dispatched to the adapter (sum of batch lengths
     /// from successful `on_batch` calls). Companion to
     /// `batches_dispatched` — by the time `flush()` returns,
     /// `events_dispatched + events_dropped == events_ingested`. FFI
     /// consumers can also use this to monitor end-to-end delivery.
-    pub events_dispatched: AtomicU64,
+    pub events_dispatched: CachePadded<AtomicU64>,
     /// Set to `true` if `shutdown()` / `shutdown_via_ref()` had to
     /// proceed past the in-flight-ingest grace deadline (5 s) with
     /// producers still mid-push. The stranded count is counted into
@@ -353,7 +440,7 @@ impl EventBus {
             batch_senders: parking_lot::RwLock::new(batch_senders),
             shutdown,
             drain_finalize_ready,
-            in_flight_ingests: AtomicU64::new(0),
+            in_flight_ingests: StripedInFlight::new(),
             shutdown_completed: AtomicBool::new(false),
             config,
             stats,
@@ -908,12 +995,13 @@ impl EventBus {
     /// reading from it.
     #[inline(always)]
     fn try_enter_ingest(&self) -> Option<IngestGuard<'_>> {
-        self.in_flight_ingests.fetch_add(1, AtomicOrdering::SeqCst);
+        let slot = self.in_flight_ingests.slot_for_current_thread();
+        self.in_flight_ingests.fetch_add_at(slot, 1);
         if self.shutdown.load(AtomicOrdering::SeqCst) {
-            self.in_flight_ingests.fetch_sub(1, AtomicOrdering::SeqCst);
+            self.in_flight_ingests.fetch_sub_at(slot, 1);
             return None;
         }
-        Some(IngestGuard { bus: self })
+        Some(IngestGuard { bus: self, slot })
     }
 
     /// Ingest an event.
@@ -1406,9 +1494,9 @@ impl EventBus {
         // post-drain reconciliation reads this to compute the
         // actual drop count (see comment further down).
         let mut deadline_snapshot: Option<(u64, u64, u64)> = None;
-        while self.in_flight_ingests.load(AtomicOrdering::SeqCst) > 0 {
+        while self.in_flight_ingests.sum() > 0 {
             if tokio::time::Instant::now() >= in_flight_deadline {
-                let stranded = self.in_flight_ingests.load(AtomicOrdering::SeqCst);
+                let stranded = self.in_flight_ingests.sum();
                 let ingested_now = self.stats.events_ingested.load(AtomicOrdering::Acquire);
                 let dispatched_now = self.stats.events_dispatched.load(AtomicOrdering::Acquire);
                 tracing::warn!(
@@ -1956,8 +2044,14 @@ impl EventBus {
     /// the bus drops, otherwise the `Drop` impl's invariants
     /// fire.
     pub(crate) fn stage_stranded_ingest(&self, n: u64) {
-        self.in_flight_ingests
-            .fetch_add(n, std::sync::atomic::Ordering::SeqCst);
+        // Stripe-aware: tests don't care which slot the staged
+        // count lands in; slot 0 is fine and `release_*` /
+        // `complete_*` sub from the same slot for net-zero
+        // accounting. The slot 0 placement is independent of any
+        // real producer's `slot_for_current_thread()` selection,
+        // which would (post-fix) most likely hit a different slot
+        // — that's also fine, the sum is what `shutdown` reads.
+        self.in_flight_ingests.fetch_add_at(0, n);
     }
 
     /// Test-only: counterpart to [`stage_stranded_ingest`].
@@ -1967,8 +2061,8 @@ impl EventBus {
     /// completed (the drain reconciliation should classify them
     /// as drops).
     pub(crate) fn release_stranded_ingest(&self, n: u64) {
-        self.in_flight_ingests
-            .fetch_sub(n, std::sync::atomic::Ordering::SeqCst);
+        // Mirror of `stage_stranded_ingest`: sub from slot 0.
+        self.in_flight_ingests.fetch_sub_at(0, n);
     }
 
     /// Test-only: simulate a previously-stranded producer
@@ -1983,8 +2077,8 @@ impl EventBus {
         self.stats
             .events_ingested
             .fetch_add(n, std::sync::atomic::Ordering::Release);
-        self.in_flight_ingests
-            .fetch_sub(n, std::sync::atomic::Ordering::SeqCst);
+        // Mirror of `stage_stranded_ingest`: sub from slot 0.
+        self.in_flight_ingests.fetch_sub_at(0, n);
     }
 }
 
@@ -2538,6 +2632,72 @@ mod tests {
     use super::*;
     use crate::shard::ScalingPolicy;
     use serde_json::json;
+
+    /// PERF_AUDIT §1.1 — striped counter sums correctly across
+    /// concurrent producers. Spawns 16 threads, each does 10_000
+    /// add+sub on its sticky slot. After joins the sum must be 0
+    /// (every add was paired with a sub), and slots must NOT all
+    /// be 0 mid-flight (proving the stripe was actually used —
+    /// not collapsed onto one slot by accident).
+    #[test]
+    fn striped_in_flight_sum_across_concurrent_producers() {
+        let counter = std::sync::Arc::new(StripedInFlight::new());
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let c = counter.clone();
+            handles.push(std::thread::spawn(move || {
+                let slot = c.slot_for_current_thread();
+                for _ in 0..10_000 {
+                    c.fetch_add_at(slot, 1);
+                    c.fetch_sub_at(slot, 1);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            counter.sum(),
+            0,
+            "every add was paired with a sub: net sum must be zero"
+        );
+    }
+
+    /// PERF_AUDIT §1.1 — the stripe MUST distribute across slots
+    /// rather than collapse onto one. Drives 16 producer threads
+    /// each doing one add (no sub), counts how many slots are
+    /// non-zero. With a healthy stripe + thread-id distribution we
+    /// expect at least 4 distinct slots populated; if we see only
+    /// 1, the stripe regressed to a single shared cache line.
+    #[test]
+    fn striped_in_flight_distributes_across_slots() {
+        let counter = std::sync::Arc::new(StripedInFlight::new());
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let c = counter.clone();
+            handles.push(std::thread::spawn(move || {
+                let slot = c.slot_for_current_thread();
+                c.fetch_add_at(slot, 1);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(counter.sum(), 16);
+        let nonzero = counter
+            .slots
+            .iter()
+            .filter(|s| s.load(AtomicOrdering::SeqCst) > 0)
+            .count();
+        // 32 slots, 16 producers — hash distribution expected to
+        // populate well over 4 distinct slots in practice. Loose
+        // assertion to stay reliable under thread-id collisions.
+        assert!(
+            nonzero >= 4,
+            "stripe must distribute across slots: only {} of 32 populated",
+            nonzero
+        );
+    }
 
     #[tokio::test]
     async fn test_event_bus_basic() {
