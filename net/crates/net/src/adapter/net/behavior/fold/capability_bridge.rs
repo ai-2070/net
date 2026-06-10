@@ -610,6 +610,27 @@ pub fn translate_announcement(
 /// multiple classes counts once).
 pub fn find_nodes_matching(fold: &Fold<CapabilityFold>, legacy: &LegacyFilter) -> Vec<NodeId> {
     let fold_filter = translate_filter(legacy);
+    let range_predicates_present = legacy.min_memory_gb.is_some()
+        || legacy.min_vram_gb.is_some()
+        || !legacy.require_modalities.is_empty()
+        || legacy.min_context_length.is_some();
+    // PERF_AUDIT §4.11 — permissive fast path: when no field of
+    // the translated filter constrains the candidate set AND no
+    // legacy range/modality predicate would tighten the post-
+    // filter, the result is simply "every distinct publisher
+    // node id in the fold". Skip the full `HashSet<(class,
+    // NodeId)>` build + per-key retain loops that the general
+    // path runs, and the per-entry payload borrow + range check
+    // the legacy post-filter does. `state.by_node` already keys
+    // by NodeId so iteration is dedup-free; sort to preserve the
+    // deterministic-order contract callers rely on.
+    if fold_filter.is_permissive() && !range_predicates_present {
+        return fold.with_state(|state| {
+            let mut ids: Vec<NodeId> = state.by_node.keys().copied().collect();
+            ids.sort_unstable();
+            ids
+        });
+    }
     // Resolve the indexed-axis candidate keys and run the
     // non-indexed post-filter against *borrowed* payloads, all
     // under one read-lock acquisition. The bulk path only needs

@@ -781,10 +781,16 @@ impl<'a> StandardPlacement<'a> {
                 if self.intent_registry.is_empty() {
                     return 1.0;
                 }
-                let any_satisfied = self
-                    .intent_registry
-                    .iter()
-                    .any(|(_, reqs)| evaluate_required_caps(target_caps, reqs) >= 1.0);
+                // PERF_AUDIT §4.3 — materialize the candidate's
+                // tag set ONCE outside the loop. Pre-fix this
+                // re-cloned every Tag (each carrying multiple
+                // String fields) into a fresh Vec per registered
+                // intent — O(intents × tags) String allocations
+                // per candidate.
+                let tags: Vec<Tag> = target_caps.tags.iter().cloned().collect();
+                let any_satisfied = self.intent_registry.iter().any(|(_, reqs)| {
+                    evaluate_required_caps_with_tags(&tags, &target_caps.metadata, reqs) >= 1.0
+                });
                 if any_satisfied {
                     1.0
                 } else {
@@ -1215,9 +1221,34 @@ fn evaluate_required_caps(target_caps: &CapabilitySet, reqs: &[RequiredCapabilit
         return 1.0;
     }
     // Materialize tags into a Vec so EvalContext can borrow a slice.
+    //
+    // NOTE: callers that evaluate MULTIPLE `reqs` lists against the
+    // same `target_caps` (e.g. the `AnyOfLocalCapabilities` intent
+    // policy, which iterates every registered intent) should use
+    // [`evaluate_required_caps_with_tags`] and materialize the tag
+    // vector ONCE outside the loop. Per PERF_AUDIT §4.3 the prior
+    // path cloned every `Tag` (each carrying multiple `String`
+    // fields) on every iteration — O(intents × tags) String
+    // allocations per candidate.
     let tags: Vec<Tag> = target_caps.tags.iter().cloned().collect();
-    let ctx =
-        crate::adapter::net::behavior::predicate::EvalContext::new(&tags, &target_caps.metadata);
+    evaluate_required_caps_with_tags(&tags, &target_caps.metadata, reqs)
+}
+
+/// Pre-materialized-tags variant of [`evaluate_required_caps`].
+/// Callers that evaluate multiple `reqs` lists against the same
+/// `target_caps` materialize the tag vector once and call this in
+/// a loop, vs paying the O(tags) clone per evaluation.
+///
+/// Per PERF_AUDIT §4.3.
+fn evaluate_required_caps_with_tags(
+    tags: &[Tag],
+    metadata: &std::collections::BTreeMap<String, String>,
+    reqs: &[RequiredCapability],
+) -> f32 {
+    if reqs.is_empty() {
+        return 1.0;
+    }
+    let ctx = crate::adapter::net::behavior::predicate::EvalContext::new(tags, metadata);
     if reqs.iter().all(|r| r.evaluate(&ctx)) {
         1.0
     } else {

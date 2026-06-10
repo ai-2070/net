@@ -183,6 +183,24 @@ pub struct CapabilityFilter {
     pub limit: usize,
 }
 
+impl CapabilityFilter {
+    /// `true` when no field constrains the candidate set — every
+    /// node in the fold is admissible. Per PERF_AUDIT §4.11 the
+    /// bulk `find_nodes_matching` path short-circuits on this so
+    /// the permissive case (e.g. `LegacyPlacement::permissive`)
+    /// skips the full `HashSet<(class, NodeId)>` build + retain
+    /// loop + sort + dedup that the general path runs.
+    #[inline]
+    pub fn is_permissive(&self) -> bool {
+        self.class.is_none()
+            && self.tags_all.is_empty()
+            && self.tags_any.is_empty()
+            && self.tag_groups_all.is_empty()
+            && self.state.is_none()
+            && self.region.is_none()
+    }
+}
+
 /// One query result row.
 pub type CapabilityMatch = ((u64, NodeId), CapabilityMembership);
 
@@ -612,15 +630,23 @@ fn composite_query(
     filter: &CapabilityFilter,
 ) -> Vec<CapabilityMatch> {
     let candidates = resolve_candidate_keys(state, index, filter);
-    // Materialize matches + apply limit.
-    let mut matches: Vec<CapabilityMatch> = candidates
+    // Materialize matches + apply limit during materialization.
+    //
+    // PERF_AUDIT §4.10 — pre-fix this collected every match (deep-
+    // cloning every `CapabilityMembership` payload — tags Vec,
+    // metadata BTreeMap, allow-lists) and only truncated AFTER. A
+    // query with a small `limit` against a large candidate set
+    // paid the full deep-clone cost on every over-limit match
+    // just to drop it on the next line. With `take` before
+    // `collect`, the clone runs exactly `limit` times.
+    let it = candidates
         .into_iter()
-        .filter_map(|k| state.entries.get(&k).map(|e| (k, e.payload.clone())))
-        .collect();
-    if filter.limit > 0 && matches.len() > filter.limit {
-        matches.truncate(filter.limit);
+        .filter_map(|k| state.entries.get(&k).map(|e| (k, e.payload.clone())));
+    if filter.limit > 0 {
+        it.take(filter.limit).collect()
+    } else {
+        it.collect()
     }
-    matches
 }
 
 /// Return the union of every tag this publisher has advertised
