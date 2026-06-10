@@ -59,10 +59,27 @@ pub enum SubscriptionMode {
 }
 
 /// One queue group's state on a single channel.
+///
+/// **PERF_AUDIT §3.6** — pre-fix `members` was a `DashSet<u64>` and
+/// `select` materialized a fresh `Vec` every publish via
+/// `.iter().map(|e| *e).collect()`. Membership changes are rare
+/// relative to publishes, so the audit's recommended shape is an
+/// ArcSwap snapshot: lock-free reads on the hot publish path
+/// (`select` becomes a refcount bump on a shared `Arc<Vec<u64>>`),
+/// and rare membership writes serialize through a small mutex while
+/// they rebuild the snapshot.
 struct QueueGroup {
-    members: DashSet<u64>,
-    /// Round-robin cursor. `select()` snapshots `members` into a
-    /// Vec and returns `members[cursor.fetch_add(1) % vec.len()]`.
+    members: arc_swap::ArcSwap<Vec<u64>>,
+    /// Serializes membership writes — `insert`/`remove` do a
+    /// load-modify-store cycle on `members`, so without
+    /// serialization two concurrent writes could each load the
+    /// same snapshot and clobber the other's update. The mutex
+    /// is uncontended in practice (membership churns at handshake
+    /// / heartbeat cadence, not per-publish), and `select` does
+    /// NOT touch it.
+    write_lock: parking_lot::Mutex<()>,
+    /// Round-robin cursor. `select()` reads the `ArcSwap`
+    /// snapshot and returns `snapshot[cursor.fetch_add(1) % len]`.
     /// `Relaxed` is sufficient — there's no happens-before edge
     /// the cursor needs to enforce; uneven distribution under
     /// reordering is a metric, not a correctness concern.
@@ -72,22 +89,58 @@ struct QueueGroup {
 impl QueueGroup {
     fn new() -> Self {
         Self {
-            members: DashSet::new(),
+            members: arc_swap::ArcSwap::from_pointee(Vec::new()),
+            write_lock: parking_lot::Mutex::new(()),
             cursor: AtomicUsize::new(0),
         }
     }
 
     /// Pick one member for this dispatch. Returns `None` if the
-    /// group is empty. The selection is round-robin against a
-    /// snapshot — concurrent membership changes don't poison the
-    /// dispatch (they take effect on the next call).
+    /// group is empty. The selection is round-robin against the
+    /// current ArcSwap snapshot — concurrent membership changes
+    /// take effect on the next call.
     fn select(&self) -> Option<u64> {
-        let snapshot: Vec<u64> = self.members.iter().map(|e| *e).collect();
+        let snapshot = self.members.load();
         if snapshot.is_empty() {
             return None;
         }
         let idx = self.cursor.fetch_add(1, Ordering::Relaxed) % snapshot.len();
         Some(snapshot[idx])
+    }
+
+    /// Insert `node_id`. Returns `true` if it was newly added.
+    /// Mirrors the pre-fix `DashSet::insert(...).is_some()`
+    /// contract: idempotent — re-inserting a present id is a
+    /// no-op returning `false`.
+    fn insert(&self, node_id: u64) -> bool {
+        let _g = self.write_lock.lock();
+        let cur = self.members.load();
+        if cur.contains(&node_id) {
+            return false;
+        }
+        let mut next = cur.as_ref().clone();
+        next.push(node_id);
+        self.members.store(std::sync::Arc::new(next));
+        true
+    }
+
+    /// Remove `node_id`. Returns `true` if the id was present.
+    /// Mirrors the pre-fix `DashSet::remove(...).is_some()`.
+    fn remove(&self, node_id: &u64) -> bool {
+        let _g = self.write_lock.lock();
+        let cur = self.members.load();
+        let Some(pos) = cur.iter().position(|m| m == node_id) else {
+            return false;
+        };
+        let mut next = cur.as_ref().clone();
+        next.swap_remove(pos);
+        self.members.store(std::sync::Arc::new(next));
+        true
+    }
+
+    /// `true` when the group has no members.
+    fn is_empty(&self) -> bool {
+        self.members.load().is_empty()
     }
 }
 
@@ -113,10 +166,7 @@ impl ChannelSubscribers {
     /// leaking per-channel entries for ephemeral channels.
     fn is_empty(&self) -> bool {
         self.broadcasters.is_empty()
-            && self
-                .queue_groups
-                .iter()
-                .all(|e| e.value().members.is_empty())
+            && self.queue_groups.iter().all(|e| e.value().is_empty())
     }
 
     /// All subscribers regardless of mode. The set-membership view
@@ -126,8 +176,9 @@ impl ChannelSubscribers {
     fn all_subscribers(&self) -> Vec<u64> {
         let mut out: Vec<u64> = self.broadcasters.iter().map(|e| *e).collect();
         for grp in self.queue_groups.iter() {
-            for m in grp.value().members.iter() {
-                if !out.contains(&m) {
+            let snapshot = grp.value().members.load();
+            for m in snapshot.iter() {
+                if !out.contains(m) {
                     out.push(*m);
                 }
             }
@@ -193,7 +244,7 @@ impl ChannelSubscribers {
             return Some(SubscriptionMode::Broadcast);
         }
         for grp in self.queue_groups.iter() {
-            if grp.value().members.contains(&node_id) {
+            if grp.value().members.load().contains(&node_id) {
                 return Some(SubscriptionMode::QueueGroup(grp.key().clone()));
             }
         }
@@ -225,7 +276,7 @@ impl ChannelSubscribers {
                     .queue_groups
                     .entry(name)
                     .or_insert_with(QueueGroup::new);
-                grp.members.insert(node_id)
+                grp.insert(node_id)
             }
         }
     }
@@ -250,9 +301,9 @@ impl ChannelSubscribers {
         let mut now_empty: Option<QueueGroupName> = None;
         let mut found = false;
         for grp in self.queue_groups.iter() {
-            if grp.value().members.remove(&node_id).is_some() {
+            if grp.value().remove(&node_id) {
                 found = true;
-                if grp.value().members.is_empty() {
+                if grp.value().is_empty() {
                     now_empty = Some(grp.key().clone());
                 }
                 break;
@@ -263,8 +314,7 @@ impl ChannelSubscribers {
             // concurrent `add_with_mode` raced our removal and
             // re-populated the group between our `is_empty()` and
             // the eviction below. Only evict if STILL empty.
-            self.queue_groups
-                .remove_if(&name, |_, g| g.members.is_empty());
+            self.queue_groups.remove_if(&name, |_, g| g.is_empty());
         }
         found
     }
