@@ -1,0 +1,23 @@
+net/crates/net/sdk/benches/nrpc_common/mod.rs
+  s_8870c7403329c0::t_30d4f208651a29 528,541-543
+  s_8870c7403329c0::t_908c335a985e92 76-99
+  s_8870c7403329c0::t_219f9be8449dff 490,503-505
+  s_8870c7403329c0::t_8b3d0713f055dc 438,447
+  s_8870c7403329c0::t_61d5a57e434320 408,422
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "387c63f9a5940a3885cc7bbf871552d3c64d74b4",
+  "prompts": {},
+  "sessions": {
+    "s_8870c7403329c0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0cc782bd-f8c5-40e5-80e4-a9c79b6b7195",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
