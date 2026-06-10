@@ -1,0 +1,19 @@
+# cargo-nextest configuration.
+#
+# Retries for timing-sensitive integration suites.
+#
+# Several suites here exercise the reliable-stream transport over loopback UDP
+# and/or spawn `net` CLI subprocesses that stand up full mesh nodes. They are
+# correct but inherently timing-sensitive: under a full-workspace run the CPU
+# is oversubscribed, so grant/ACKs can slip past the transport retransmit
+# budget and a data stream resets ("holder reset stream (retransmit
+# exhausted)"), or a second-resolution token expires before a subscribe
+# handshake lands. Each passes in isolation and at moderate load.
+#
+# nextest re-runs a failed test in a FRESH, isolated process. A load flake
+# passes on the re-run; a genuine logic bug fails all attempts — so retries
+# absorb saturation noise without masking real regressions. CI already runs
+# with `--no-fail-fast`, so this only changes the per-test outcome, not the
+# matrix.
+[profile.default]
+retries = 2
