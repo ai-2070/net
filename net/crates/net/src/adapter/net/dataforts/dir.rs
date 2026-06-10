@@ -209,7 +209,6 @@ pub struct DirStats {
 /// are recorded. Entries are sorted by path for a deterministic
 /// manifest. Non-regular, non-dir, non-symlink nodes are skipped.
 pub async fn store_dir(adapter: &MeshBlobAdapter, root: &Path) -> Result<BlobRef, DirError> {
-    let mut entries: Vec<DirEntry> = Vec::new();
     // Directory traversal (`read_dir` + `symlink_metadata`, recursive) is
     // blocking FS — run it on the blocking pool so it doesn't stall an
     // async executor thread at node_modules scale (T-3). Deterministic
@@ -226,49 +225,110 @@ pub async fn store_dir(adapter: &MeshBlobAdapter, root: &Path) -> Result<BlobRef
     .map_err(|e| DirError::Io(std::io::Error::other(e)))??;
     raw.sort_by(|a, b| a.0.cmp(&b.0));
 
-    for (rel, meta, abs) in raw {
-        let file_type = meta.file_type();
-        if file_type.is_symlink() {
-            // read_link is a single tiny syscall — inline.
-            let target = std::fs::read_link(&abs)?;
-            entries.push(DirEntry {
-                path: rel,
-                kind: EntryKind::Symlink {
-                    target: target.to_string_lossy().into_owned(),
-                },
-            });
-        } else if file_type.is_dir() {
-            entries.push(DirEntry {
-                path: rel,
-                kind: EntryKind::Dir {
-                    mode: mode_of(&meta),
-                },
-            });
-        } else if file_type.is_file() {
-            // Offload only large reads (T-3); small files read inline
-            // (sub-ms, cheaper than spawn_blocking dispatch).
-            let bytes = if meta.len() > BLOCKING_FS_THRESHOLD {
-                tokio::task::spawn_blocking(move || std::fs::read(&abs))
-                    .await
-                    .map_err(|e| DirError::Io(std::io::Error::other(e)))??
-            } else {
-                std::fs::read(&abs)?
-            };
-            let chunked = chunk_payload(&bytes)?;
-            let hash: [u8; 32] = blake3::hash(&bytes).into();
-            let uri = format!("mesh://{}", hex(&hash));
-            let blob_ref = chunked.into_blob_ref(uri, Encoding::Replicated)?;
-            adapter.store(&blob_ref, &bytes).await?;
-            entries.push(DirEntry {
-                path: rel,
-                kind: EntryKind::File {
-                    mode: mode_of(&meta),
-                    blob: blob_ref.encode(),
-                },
-            });
+    // PERF_AUDIT §6.9 — parallelize file processing with the same
+    // shape `fetch_dir` uses (bounded `Semaphore` over file count +
+    // a `byte_sem` budget). Pre-fix the loop fully serialized:
+    // one file at a time read → hash → chunk → store. With
+    // `buffer_unordered`-style spawned work, disk reads and
+    // adapter stores overlap and the manifest finalizes when the
+    // last file lands, not after the sum of per-file latencies.
+    //
+    // Dirs and symlinks are still inline — they're sub-µs syscalls
+    // and not worth a tokio spawn dispatch.
+    use futures::stream::StreamExt;
+    let store_concurrency = DEFAULT_FETCH_CONCURRENCY;
+    let store_budget = u32::try_from(DEFAULT_INFLIGHT_BUDGET_BYTES).unwrap_or(u32::MAX);
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(store_concurrency));
+    let byte_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(store_budget as usize));
+
+    // Build a per-entry task stream. We preserve manifest order
+    // by emitting entries in the same `raw` order: dirs/symlinks
+    // resolve to `Ready` futures so they slot into the stream
+    // alongside file futures and don't need a separate pass.
+    let file_futures = raw.into_iter().map(|(rel, meta, abs)| {
+        let adapter = adapter; // borrow re-aliased for clarity
+        let sem = sem.clone();
+        let byte_sem = byte_sem.clone();
+        let mode = mode_of(&meta);
+        async move {
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                let target = std::fs::read_link(&abs)?;
+                return Ok::<Option<DirEntry>, DirError>(Some(DirEntry {
+                    path: rel,
+                    kind: EntryKind::Symlink {
+                        target: target.to_string_lossy().into_owned(),
+                    },
+                }));
+            }
+            if file_type.is_dir() {
+                return Ok(Some(DirEntry {
+                    path: rel,
+                    kind: EntryKind::Dir { mode },
+                }));
+            }
+            if file_type.is_file() {
+                // Bound concurrency before the disk read so a
+                // wide directory doesn't trigger N parallel
+                // `spawn_blocking`s saturating the blocking pool.
+                let _permit = sem.acquire().await.map_err(|_| {
+                    DirError::Blob(BlobError::Backend("dir store: semaphore closed".into()))
+                })?;
+                // Per-file in-flight byte reservation. Mirrors
+                // fetch_dir's pattern: each file reserves ≤
+                // its size (capped at the chunk size + budget)
+                // so big files self-limit while small files
+                // stay bounded only by the count cap.
+                let in_flight = (meta.len() as u32)
+                    .min(BLOB_CHUNK_SIZE_BYTES as u32)
+                    .min(store_budget)
+                    .max(1);
+                let _bytes_permit = byte_sem.acquire_many(in_flight).await.map_err(|_| {
+                    DirError::Blob(BlobError::Backend(
+                        "dir store: byte semaphore closed".into(),
+                    ))
+                })?;
+                let bytes = if meta.len() > BLOCKING_FS_THRESHOLD {
+                    tokio::task::spawn_blocking(move || std::fs::read(&abs))
+                        .await
+                        .map_err(|e| DirError::Io(std::io::Error::other(e)))??
+                } else {
+                    std::fs::read(&abs)?
+                };
+                let chunked = chunk_payload(&bytes)?;
+                let hash: [u8; 32] = blake3::hash(&bytes).into();
+                let uri = format!("mesh://{}", hex(&hash));
+                let blob_ref = chunked.into_blob_ref(uri, Encoding::Replicated)?;
+                adapter.store(&blob_ref, &bytes).await?;
+                return Ok(Some(DirEntry {
+                    path: rel,
+                    kind: EntryKind::File {
+                        mode,
+                        blob: blob_ref.encode(),
+                    },
+                }));
+            }
+            // Device / socket / fifo — skip.
+            Ok(None)
         }
-        // else: device / socket / fifo — skipped.
+    });
+
+    // `buffer_unordered` lets futures resolve as soon as they're
+    // ready (vs `buffered` which waits for in-order completion);
+    // we re-sort at the end to keep the manifest deterministic.
+    let mut results: Vec<DirEntry> = Vec::new();
+    let mut stream = futures::stream::iter(file_futures).buffer_unordered(store_concurrency);
+    while let Some(res) = stream.next().await {
+        match res? {
+            Some(entry) => results.push(entry),
+            None => {}
+        }
     }
+    // Restore the deterministic-by-path order that the pre-fix
+    // sequential loop produced (raw was already sorted before
+    // dispatch; `buffer_unordered` returns in completion order).
+    results.sort_by(|a, b| a.path.cmp(&b.path));
+    let entries = results;
 
     let manifest = DirManifest {
         version: DIR_MANIFEST_VERSION,
