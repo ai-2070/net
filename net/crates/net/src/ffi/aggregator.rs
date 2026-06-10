@@ -294,21 +294,29 @@ where
         return std::ptr::null_mut();
     }
     let h: &RegistryClientHandle = unsafe { &*handle };
-    // Bail with INVALID_ARGS (same shape as a NULL handle) if
-    // `_free` has begun — a freed handle is effectively invalid.
-    let _op = match h.guard.try_enter() {
-        Some(op) => op,
+    // Hold the guard ONLY long enough to clone the inner client (an
+    // Arc-backed handle that keeps the mesh node alive on its own).
+    // Bail with INVALID_ARGS (same shape as a NULL handle) if `_free`
+    // has begun. Dropping the guard before the blocking RPC means a
+    // concurrent `_free` never waits on the (caller-settable, possibly
+    // multi-second) op deadline — so it can't time out and leak the
+    // inner; the op simply completes against its own clone.
+    let client = match h.guard.try_enter() {
+        Some(_op) => h.client.read().clone(),
         None => {
             unsafe { write_kind(out_error_kind, NET_REGISTRY_ERR_INVALID_ARGS) };
             return std::ptr::null_mut();
         }
     };
-    let client = h.client.read().clone();
     match op(client) {
         Ok(json) => unsafe { json_to_raw(json, out_error_kind) },
         Err(e) => {
             let (kind, detail) = classify(&e);
-            store_error_detail(h, detail);
+            // Re-enter only to record the detail; if the handle is now
+            // being freed, drop it (a freed handle won't be queried).
+            if let Some(_op) = h.guard.try_enter() {
+                store_error_detail(h, detail);
+            }
             unsafe { write_kind(out_error_kind, kind) };
             std::ptr::null_mut()
         }
@@ -381,14 +389,15 @@ pub unsafe extern "C" fn net_registry_client_unregister(
         return -1;
     };
     let h: &RegistryClientHandle = unsafe { &*handle };
-    let _op = match h.guard.try_enter() {
-        Some(op) => op,
+    // Guard held only for the clone — see `registry_op_json` for why
+    // the blocking RPC runs unguarded.
+    let client = match h.guard.try_enter() {
+        Some(_op) => h.client.read().clone(),
         None => {
             unsafe { write_kind(out_error_kind, NET_REGISTRY_ERR_INVALID_ARGS) };
             return -1;
         }
     };
-    let client = h.client.read().clone();
     match block_on(client.unregister(target_node_id, group)) {
         Ok(existed) => {
             unsafe { write_kind(out_error_kind, NET_REGISTRY_OK) };
@@ -400,7 +409,9 @@ pub unsafe extern "C" fn net_registry_client_unregister(
         }
         Err(e) => {
             let (kind, detail) = classify(&e);
-            store_error_detail(h, detail);
+            if let Some(_op) = h.guard.try_enter() {
+                store_error_detail(h, detail);
+            }
             unsafe { write_kind(out_error_kind, kind) };
             -1
         }
@@ -715,21 +726,23 @@ where
         return std::ptr::null_mut();
     }
     let h: &FoldQueryClientHandle = unsafe { &*handle };
-    // Bail with INVALID_ARGS (same shape as a NULL handle) if
-    // `_free` has begun — a freed handle is effectively invalid.
-    let _op = match h.guard.try_enter() {
-        Some(op) => op,
+    // Guard held only for the clone — see `registry_op_json` for why
+    // the blocking RPC runs unguarded (so a long op deadline can't
+    // make a concurrent `_free` time out and leak the inner).
+    let client = match h.guard.try_enter() {
+        Some(_op) => h.client.read().clone(),
         None => {
             unsafe { write_kind(out_error_kind, NET_REGISTRY_ERR_INVALID_ARGS) };
             return std::ptr::null_mut();
         }
     };
-    let client = h.client.read().clone();
     match op(client) {
         Ok(json) => unsafe { json_to_raw(json, out_error_kind) },
         Err(e) => {
             let (kind, detail) = classify_fold_query(&e);
-            store_fold_query_error_detail(h, detail);
+            if let Some(_op) = h.guard.try_enter() {
+                store_fold_query_error_detail(h, detail);
+            }
             unsafe { write_kind(out_error_kind, kind) };
             std::ptr::null_mut()
         }
