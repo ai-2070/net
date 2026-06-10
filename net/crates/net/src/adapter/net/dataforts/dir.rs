@@ -788,20 +788,28 @@ fn safe_join(dest: &Path, rel: &str) -> Result<PathBuf, DirError> {
     Ok(out)
 }
 
-/// Case-fold one path component for declared-symlink matching.
+/// Fold one path component to a canonical key for declared-symlink
+/// matching, tracking how the destination filesystem compares names.
 ///
-/// Windows and the default macOS (APFS/HFS+) volumes are
-/// case-*insensitive*, so `A` and `a` name the same entry there. The
-/// composition check matches a target's components against the set of
-/// declared symlink paths; if that match were case-sensitive, a hostile
-/// manifest could declare symlink `a` and route a target through `A` to
-/// slip past the check while the OS still resolves them as the same
-/// link. Fold to lowercase so the comparison tracks the filesystem.
-/// This over-rejects a genuinely case-distinct sibling on a
-/// case-sensitive FS (Linux ext4), an acceptable safety bias for an
-/// attacker-controlled manifest.
+/// Default macOS (APFS/HFS+) and Windows volumes compare filenames
+/// **case-insensitively**, and APFS/HFS+ additionally compare
+/// **normalization-insensitively** — the precomposed `é` (U+00E9) and
+/// the decomposed `e`+◌́ (U+0065 U+0301) name the same entry. The
+/// composition check matches a target's components against the declared
+/// symlink set; if that match used raw bytes, a hostile manifest could
+/// declare symlink `é` (one form) and route a target through the other
+/// form (or a case variant) to slip past the check while the OS still
+/// resolves them as the same link.
+///
+/// Fold to a single key — lowercase, then NFC-normalize — so equivalent
+/// names collapse together. This over-rejects names that are genuinely
+/// distinct on a case-/normalization-sensitive FS (Linux ext4), an
+/// acceptable safety bias for an attacker-controlled manifest. It's a
+/// close approximation of the OS folding (true caseless matching also
+/// folds e.g. `ß`→`ss`), erring toward rejection.
 fn fold_component(c: &str) -> String {
-    c.to_lowercase()
+    use unicode_normalization::UnicodeNormalization;
+    c.to_lowercase().nfc().collect()
 }
 
 /// Normalize a manifest relative path to its sequence of plain-name
@@ -850,9 +858,10 @@ fn normal_components(rel: &str) -> Option<Vec<String>> {
 /// lands on it but doesn't traverse it); that destination is validated
 /// in its own right when its entry is processed.
 ///
-/// Matching against `symlinks` is case-insensitive (see
-/// [`fold_component`]) so a casing variant can't bypass the check on a
-/// case-insensitive filesystem.
+/// Matching against `symlinks` is case- and normalization-insensitive
+/// (see [`fold_component`]) so a casing or Unicode-normalization variant
+/// can't bypass the check on a case-/normalization-insensitive
+/// filesystem (notably default APFS).
 fn check_link_target(
     link_rel: &str,
     target: &str,
@@ -1050,6 +1059,30 @@ mod tests {
         // A link sitting under a case-variant of a symlinked parent is
         // likewise rejected.
         assert!(check_link_target("A/inner", "x", &s).is_err());
+    }
+
+    #[test]
+    fn check_link_target_rejects_composed_escape_with_different_unicode_form() {
+        // On a normalization-insensitive FS (default APFS) the
+        // precomposed and decomposed forms of an accented name are the
+        // same entry, so a normalization variant must not dodge the
+        // traversal check. Declare the symlink in NFC form, route the
+        // target through the NFD form.
+        const NFC: &str = "caf\u{00E9}"; // "café" precomposed
+        const NFD: &str = "cafe\u{0301}"; // "café" decomposed
+                                          // Sanity: the two forms are byte-distinct (raw-bytes matching
+                                          // would miss the bypass) but fold to the same key.
+        assert_ne!(NFC, NFD);
+        assert_eq!(fold_component(NFC), fold_component(NFD));
+
+        let mut s = BTreeSet::new();
+        s.insert(normal_components(NFC).unwrap()); // symlink declared NFC
+
+        // Target routes through the NFD form (== NFC on APFS) → reject.
+        assert!(check_link_target("b", &format!("{NFD}/sub/../../etc"), &s).is_err());
+        // Mixed case + normalization variant also folds and is rejected.
+        let upper_nfd = format!("CAFE{}", "\u{0301}");
+        assert!(check_link_target("b", &format!("{upper_nfd}/x/../../../etc"), &s).is_err());
     }
 
     #[test]

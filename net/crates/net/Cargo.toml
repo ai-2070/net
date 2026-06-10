@@ -175,6 +175,11 @@ dataforts = [
     "dep:blake3",
     "dep:fastcdc",
     "dep:reed-solomon-erasure",
+    # Unicode normalization for the dir-transfer symlink-composition
+    # check: default macOS APFS compares filenames normalization- AND
+    # case-insensitively, so the lexical traversal check must fold both
+    # to avoid an NFC/NFD bypass (see `dir::fold_component`).
+    "dep:unicode-normalization",
 ]
 # NAT traversal — reflex probe + classification + rendezvous punch.
 # Stages 1–3 of `docs/NAT_TRAVERSAL_PLAN.md`. No new deps; rides
@@ -292,6 +297,10 @@ x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"], option
 # compiled in transitively via the dalek/curve25519 stack, so a direct
 # (optional) dep adds nothing to the build.
 subtle = { version = "2", optional = true }
+# Unicode normalization (NFC) for the dir-transfer symlink-composition
+# check — see the `dataforts` feature. Small, dependency-free crate from
+# the unicode-rs team.
+unicode-normalization = { version = "0.1", optional = true }
 # Regex for `TagMatcher::Regex` (Phase 6c-C) + the safety predicate
 # match path in `behavior::safety`. Optional — gated behind the
 # `regex` Cargo feature. Off by default keeps ~500 KiB out of the
