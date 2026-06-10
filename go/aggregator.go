@@ -56,7 +56,7 @@ extern int net_registry_client_unregister(
     uint64_t target_node_id,
     const char* group_name,
     int* out_error_kind);
-extern const char* net_registry_last_error_detail(net_registry_client_handle_t* handle);
+extern char* net_registry_last_error_detail(net_registry_client_handle_t* handle);
 
 // FoldQueryClient.
 extern net_fold_query_client_handle_t* net_fold_query_client_new(void* mesh_handle);
@@ -78,7 +78,7 @@ extern char* net_fold_query_client_query_summarize_now(
 extern void net_fold_query_client_invalidate_cache(net_fold_query_client_handle_t* handle);
 extern void net_fold_query_client_invalidate_target(
     net_fold_query_client_handle_t* handle, uint64_t target_node_id);
-extern const char* net_fold_query_last_error_detail(net_fold_query_client_handle_t* handle);
+extern char* net_fold_query_last_error_detail(net_fold_query_client_handle_t* handle);
 
 // Free strings returned by the *_list / *_spawn / *_query_* ops.
 // Same symbol the netdb / memories surfaces use.
@@ -410,6 +410,9 @@ func (c *RegistryClient) lastErrorDetail() string {
 	if ptr == nil {
 		return ""
 	}
+	// The accessor now returns an owned copy (was a borrow into the
+	// handle); free it after copying into a Go string or it leaks.
+	defer C.net_free_string(ptr)
 	return C.GoString(ptr)
 }
 
@@ -567,5 +570,7 @@ func (c *FoldQueryClient) lastErrorDetail() string {
 	if ptr == nil {
 		return ""
 	}
+	// Owned copy (was a borrow into the handle) — free after copying.
+	defer C.net_free_string(ptr)
 	return C.GoString(ptr)
 }
