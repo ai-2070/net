@@ -1578,6 +1578,15 @@ type RpcOriginNodeCache = Arc<OriginKeyedLru<u64>>;
 /// per service.
 const RPC_CALLER_CACHE_CAP: usize = 4096;
 
+/// Non-zero form of [`RPC_CALLER_CACHE_CAP`], validated at compile time so
+/// `OriginKeyedLru::new` carries no runtime `unwrap`/`expect`. A zero cap
+/// would fail the build here rather than panic at startup.
+const RPC_CALLER_CACHE_CAP_NZ: std::num::NonZeroUsize =
+    match std::num::NonZeroUsize::new(RPC_CALLER_CACHE_CAP) {
+        Some(n) => n,
+        None => panic!("RPC_CALLER_CACHE_CAP must be non-zero"),
+    };
+
 /// Thread-safe, bounded LRU keyed by the wire-claimed caller `origin_hash`.
 ///
 /// Backs both [`RpcOriginNodeCache`] and the §8b reply-channel cache. Wraps
@@ -1591,10 +1600,7 @@ struct OriginKeyedLru<V>(Mutex<lru::LruCache<u64, V>>);
 
 impl<V: Clone> OriginKeyedLru<V> {
     fn new() -> Self {
-        // `RPC_CALLER_CACHE_CAP` is a non-zero literal.
-        let cap = std::num::NonZeroUsize::new(RPC_CALLER_CACHE_CAP)
-            .expect("RPC_CALLER_CACHE_CAP must be non-zero");
-        Self(Mutex::new(lru::LruCache::new(cap)))
+        Self(Mutex::new(lru::LruCache::new(RPC_CALLER_CACHE_CAP_NZ)))
     }
 
     /// Look up `origin`, promoting it to most-recently-used on a hit.
