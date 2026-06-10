@@ -346,6 +346,21 @@ impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
         self.by_region.clear();
         self.by_state.clear();
     }
+
+    /// PERF_AUDIT §4.5 — `on_insert` keys this index on
+    /// `(tags, derived synthetic tags, region, state)`. If the two
+    /// payloads agree on every one of those, an on_remove +
+    /// on_insert against them nets to a no-op on every bucket
+    /// (`derive_synthetic_index_tags` is pure over the payload, so
+    /// identical inputs produce identical synthetic outputs). The
+    /// hardware / allow-lists / metadata fields are NOT consulted
+    /// by this index, so they can differ without affecting the
+    /// answer here — but the steady-state refresh case the audit
+    /// targets keeps all of them identical too, so a simple
+    /// `(tags, region, state)` equality check captures the win.
+    fn index_payload_equivalent(old: &CapabilityMembership, new: &CapabilityMembership) -> bool {
+        old.state == new.state && old.region == new.region && old.tags == new.tags
+    }
 }
 
 /// Derive the index-only synthetic tags for a membership: the
@@ -975,6 +990,116 @@ mod tests {
             fold.query(CapabilityQuery::InRegion("us-west".into()))
                 .len(),
             1
+        );
+    }
+
+    /// PERF_AUDIT §4.5 — when a refresh announcement carries the
+    /// same (tags, region, state) as the existing entry, the
+    /// secondary index must NOT be churned. The skip optimization
+    /// must still let the entry's generation/TTL update, and
+    /// queries must continue to return the entry — verifying that
+    /// the index dance was unnecessary, not just absent.
+    ///
+    /// `index_payload_equivalent` itself is unit-tested below.
+    #[test]
+    fn replace_same_payload_keeps_index_consistent_and_query_returns_entry() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+
+        // v1: gpu+h100 tags, Idle, us-east.
+        fold.apply(sign_cap(
+            &kp,
+            0xCAFE,
+            1,
+            0x100,
+            vec!["gpu", "h100"],
+            NodeState::Idle,
+            Some("us-east"),
+        ))
+        .expect("v1");
+
+        // v2: identical payload, higher generation (steady-state
+        // refresh).
+        let outcome = fold
+            .apply(sign_cap(
+                &kp,
+                0xCAFE,
+                2,
+                0x100,
+                vec!["gpu", "h100"],
+                NodeState::Idle,
+                Some("us-east"),
+            ))
+            .expect("v2");
+        assert_eq!(outcome, ApplyOutcome::Replaced);
+
+        // The post-refresh query results must reflect the entry
+        // through every indexed dimension.
+        let by_tag = fold.query(CapabilityQuery::HasAllTags(vec!["gpu".into()]));
+        assert_eq!(by_tag.len(), 1, "tag bucket must still resolve the entry");
+        let by_state = fold.query(CapabilityQuery::InState(NodeState::Idle));
+        assert_eq!(by_state.len(), 1, "state bucket must still resolve");
+        let by_region = fold.query(CapabilityQuery::InRegion("us-east".into()));
+        assert_eq!(by_region.len(), 1, "region bucket must still resolve");
+    }
+
+    /// PERF_AUDIT §4.5 — `index_payload_equivalent` is the gate
+    /// between "skip the index dance" and "rebuild the buckets".
+    /// Pin both sides: identical (tags, region, state) returns
+    /// true; any differing dimension returns false.
+    #[test]
+    fn index_payload_equivalent_matches_indexed_dimensions() {
+        use std::collections::BTreeMap;
+        let base = CapabilityMembership {
+            class_hash: 0x100,
+            tags: vec!["gpu".into(), "h100".into()],
+            hardware: None,
+            state: NodeState::Idle,
+            region: Some("us-east".into()),
+            price_quote: None,
+            reflex_addr: None,
+            allowed_nodes: Vec::new(),
+            allowed_subnets: Vec::new(),
+            allowed_groups: Vec::new(),
+            metadata: BTreeMap::new(),
+        };
+        assert!(
+            <CapabilityIndexInner as super::super::FoldIndex<CapabilityFold>>::index_payload_equivalent(&base, &base.clone()),
+            "byte-identical payload is equivalent"
+        );
+
+        // Tags differ.
+        let mut t = base.clone();
+        t.tags.push("a100".into());
+        assert!(
+            !<CapabilityIndexInner as super::super::FoldIndex<CapabilityFold>>::index_payload_equivalent(&base, &t),
+            "tag delta must invalidate"
+        );
+
+        // State differs.
+        let mut s = base.clone();
+        s.state = NodeState::Busy;
+        assert!(
+            !<CapabilityIndexInner as super::super::FoldIndex<CapabilityFold>>::index_payload_equivalent(&base, &s),
+            "state delta must invalidate"
+        );
+
+        // Region differs.
+        let mut r = base.clone();
+        r.region = Some("us-west".into());
+        assert!(
+            !<CapabilityIndexInner as super::super::FoldIndex<CapabilityFold>>::index_payload_equivalent(&base, &r),
+            "region delta must invalidate"
+        );
+
+        // Non-indexed dimension (metadata) — these CAN differ
+        // without forcing an index rebuild. The skip is correct
+        // because the index doesn't key on metadata at all.
+        let mut m = base.clone();
+        m.metadata.insert("intent".into(), "ml-training".into());
+        assert!(
+            <CapabilityIndexInner as super::super::FoldIndex<CapabilityFold>>::index_payload_equivalent(&base, &m),
+            "metadata delta is OK to skip — index doesn't key on metadata"
         );
     }
 

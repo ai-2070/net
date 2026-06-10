@@ -404,10 +404,21 @@ impl<K: FoldKind> Fold<K> {
                         state.by_node.remove(&old_entry.node_id);
                     }
                 }
-                index.on_remove(&key, &old_entry.payload);
-
                 let new_entry = build_entry::<K>(&ann);
-                index.on_insert(&key, &new_entry.payload);
+                // PERF_AUDIT §4.5 — steady-state refresh (same
+                // tags/region/state, new generation/TTL) skips
+                // the index churn. The default
+                // `index_payload_equivalent` returns `false`, so
+                // folds that don't implement a content-aware
+                // equality check fall through to the safe
+                // remove-then-insert pre-fix path.
+                if !<K::Index as crate::adapter::net::behavior::fold::state::FoldIndex<K>>::index_payload_equivalent(
+                    &old_entry.payload,
+                    &new_entry.payload,
+                ) {
+                    index.on_remove(&key, &old_entry.payload);
+                    index.on_insert(&key, &new_entry.payload);
+                }
                 state
                     .by_node
                     .entry(ann.node_id)
