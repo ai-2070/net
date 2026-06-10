@@ -60,9 +60,19 @@ pub struct ServiceMetricsAtomic {
     pub latency_sum_ns: AtomicU64,
     /// Number of latency observations recorded.
     pub latency_count: AtomicU64,
-    /// Cumulative bucket counts: `latency_buckets[i]` = number of
-    /// observations with latency `<= DEFAULT_LATENCY_BUCKETS_SECS[i]`.
-    /// Last entry (`[N_BUCKETS-1]`) is the `+Inf` bucket — equal to
+    /// Non-cumulative bucket counts: `latency_buckets[i]` = number
+    /// of observations whose latency falls **into** bucket `i`
+    /// (i.e. `le_seconds <= DEFAULT_LATENCY_BUCKETS_SECS[i]` AND
+    /// `le_seconds >  DEFAULT_LATENCY_BUCKETS_SECS[i-1]`).
+    /// `[N_BUCKETS-1]` is the `+Inf` bucket — observations
+    /// exceeding the last finite bound. Per PERF_AUDIT §3.2 the
+    /// hot path now bumps a single bucket per observation; the
+    /// public snapshot path (`RpcMetricsRegistry::snapshot`)
+    /// computes the cumulative prefix-sum for backward
+    /// compatibility with the documented `ServiceMetrics`
+    /// contract (one prefix-sum at scrape time vs ~14 atomic RMWs
+    /// per RPC). Last entry (`[N_BUCKETS-1]`) is the `+Inf`
+    /// bucket — equal to
     /// `latency_count` by Prometheus convention.
     pub latency_buckets: [AtomicU64; N_BUCKETS],
 
@@ -155,8 +165,16 @@ impl ServiceMetricsAtomic {
     }
 }
 
-/// Internal: bump `sum_ns`, `count`, and every cumulative bucket
-/// the observation satisfies, plus the `+Inf` terminal bucket.
+/// Internal: bump `sum_ns`, `count`, and exactly ONE bucket — the
+/// partition point for the observation. Pre-fix (PERF_AUDIT §3.2)
+/// this fetch_add'd every cumulative bucket the observation
+/// satisfied, so a fast 5 ms RPC paid 12 bucket RMWs + sum + count
+/// = 14 RMWs on the same 2 cache lines from every concurrent
+/// caller — and again on the handler side. Non-cumulative storage
+/// drops the hot path to 3 RMWs (sum + count + one bucket); the
+/// reader (`snapshot()`) materializes the cumulative shape via a
+/// prefix-sum at scrape time, preserving the documented public
+/// `ServiceMetrics::latency_buckets` semantics.
 fn record_into_histogram(
     elapsed: Duration,
     sum_ns: &AtomicU64,
@@ -167,9 +185,13 @@ fn record_into_histogram(
     sum_ns.fetch_add(ns, Ordering::Relaxed);
     count.fetch_add(1, Ordering::Relaxed);
     let secs = ns as f64 / 1.0e9_f64;
+    // First finite bucket whose `le` >= secs claims the
+    // observation. Observations that exceed the last finite bound
+    // land in the terminal `+Inf` slot at index `N_BUCKETS - 1`.
     for (i, le) in DEFAULT_LATENCY_BUCKETS_SECS.iter().enumerate() {
         if secs <= *le {
             buckets[i].fetch_add(1, Ordering::Relaxed);
+            return;
         }
     }
     buckets[N_BUCKETS - 1].fetch_add(1, Ordering::Relaxed);
@@ -272,13 +294,23 @@ impl RpcMetricsRegistry {
         let mut services = Vec::with_capacity(self.services.len());
         for entry in self.services.iter() {
             let m = entry.value();
+            // PERF_AUDIT §3.2 — storage is non-cumulative (one
+            // bucket per observation on the hot path). Materialize
+            // the cumulative shape the public `latency_buckets`
+            // contract documents via a prefix-sum here at scrape
+            // time. Single-pass, O(N_BUCKETS), no allocation cost
+            // beyond the one Vec already paid for.
             let mut buckets = Vec::with_capacity(N_BUCKETS);
+            let mut running: u64 = 0;
             for b in &m.latency_buckets {
-                buckets.push(b.load(Ordering::Relaxed));
+                running = running.saturating_add(b.load(Ordering::Relaxed));
+                buckets.push(running);
             }
             let mut handler_buckets = Vec::with_capacity(N_BUCKETS);
+            let mut h_running: u64 = 0;
             for b in &m.handler_duration_buckets {
-                handler_buckets.push(b.load(Ordering::Relaxed));
+                h_running = h_running.saturating_add(b.load(Ordering::Relaxed));
+                handler_buckets.push(h_running);
             }
             services.push(ServiceMetrics {
                 service: entry.key().clone(),
@@ -749,6 +781,65 @@ mod tests {
         assert_eq!(s.latency_buckets[1], 1, "7ms ≤ 10ms");
         assert_eq!(s.latency_buckets[5], 2, "7ms + 150ms ≤ 0.25s");
         assert_eq!(s.latency_buckets[N_BUCKETS - 1], 3, "+Inf == count");
+    }
+
+    /// PERF_AUDIT §3.2 — the storage is non-cumulative (one
+    /// `fetch_add` per observation on the hot path) and the
+    /// snapshot path prefix-sums into the documented cumulative
+    /// shape. This test pins both halves at once: it inspects the
+    /// raw atomic storage to assert exactly one slot was bumped
+    /// per observation, AND asserts the snapshot reproduces the
+    /// cumulative shape downstream consumers (Prometheus, FFI)
+    /// rely on. A regression that reintroduces the all-buckets-
+    /// it-satisfies hot-path would fail the raw-storage assertion
+    /// even when the snapshot still happened to be correct.
+    #[test]
+    fn record_into_histogram_bumps_exactly_one_slot_per_observation() {
+        let r = RpcMetricsRegistry::new();
+        let m = r.for_service("hot-path-pin");
+        // Three observations into three distinct buckets.
+        m.record_latency(Duration::from_millis(7)); // -> bucket[1] (≤10ms)
+        m.record_latency(Duration::from_millis(150)); // -> bucket[5] (≤0.25s)
+        m.record_latency(Duration::from_secs(3)); // -> bucket[9] (≤5s)
+
+        // Raw storage assertion — non-cumulative.
+        let raw: Vec<u64> = m
+            .latency_buckets
+            .iter()
+            .map(|b| b.load(Ordering::Relaxed))
+            .collect();
+        assert_eq!(
+            raw.iter().sum::<u64>(),
+            3,
+            "non-cumulative storage sums to observation count: {:?}",
+            raw
+        );
+        // Exactly three slots populated; bucket[1], bucket[5], bucket[9].
+        let populated: Vec<usize> = raw
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c > 0)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            populated,
+            vec![1, 5, 9],
+            "each observation must bump exactly one bucket: {:?}",
+            raw
+        );
+
+        // Snapshot path materializes the cumulative shape.
+        let snap = r.snapshot();
+        let s = &snap.services[0];
+        assert_eq!(s.latency_buckets[0], 0, "no obs in ≤5ms bucket");
+        assert_eq!(s.latency_buckets[1], 1, "cumulative ≤10ms = 1");
+        assert_eq!(s.latency_buckets[5], 2, "cumulative ≤0.25s = 2");
+        assert_eq!(s.latency_buckets[9], 3, "cumulative ≤5s = 3");
+        assert_eq!(
+            s.latency_buckets[N_BUCKETS - 1],
+            3,
+            "+Inf cumulative = total count"
+        );
     }
 
     #[test]
