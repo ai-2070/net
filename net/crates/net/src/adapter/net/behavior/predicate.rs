@@ -1306,10 +1306,53 @@ impl Predicate {
     }
 
     /// `And` short-circuit evaluation in cost-ascending child order.
+    ///
+    /// PERF_AUDIT §4.7 — pre-fix this allocated a fresh
+    /// `Vec<usize>` per evaluation and called
+    /// `sort_by_key(|&i| children[i].static_cost())`, which
+    /// re-runs `static_cost()` on each comparison;
+    /// `static_cost()` itself recurses through the subtree, so
+    /// for an N-child And node every row paid
+    /// O(N · subtree_size · log N) just to plan the walk. With
+    /// the fixed predicates `find_nodes_matching` evaluates per
+    /// row, that work is invariant — we want to do it once.
+    ///
+    /// The change: precompute each child's `(index, cost)` into a
+    /// small stack array (common case ≤ 8 children — well within
+    /// the structural cap callers honor), sort the precomputed
+    /// tuples, then walk. Cost computation runs exactly once per
+    /// child per evaluation (vs O(log N) times under the prior
+    /// `sort_by_key` shape). For deeper And nodes we still
+    /// allocate, but the typical case avoids both the Vec alloc
+    /// and the redundant cost recompute.
     fn eval_all_in_cost_order(children: &[Predicate], ctx: &EvalContext<'_>) -> bool {
-        let mut order: Vec<usize> = (0..children.len()).collect();
-        order.sort_by_key(|&i| children[i].static_cost());
-        order.into_iter().all(|i| children[i].evaluate(ctx))
+        const STACK_CAP: usize = 8;
+        if children.len() <= STACK_CAP {
+            let mut tuples: [(usize, u32); STACK_CAP] = [(0, 0); STACK_CAP];
+            for (i, child) in children.iter().enumerate() {
+                tuples[i] = (i, child.static_cost());
+            }
+            tuples[..children.len()].sort_unstable_by_key(|&(_, c)| c);
+            for &(i, _) in &tuples[..children.len()] {
+                if !children[i].evaluate(ctx) {
+                    return false;
+                }
+            }
+            true
+        } else {
+            let mut tuples: Vec<(usize, u32)> = children
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (i, c.static_cost()))
+                .collect();
+            tuples.sort_unstable_by_key(|&(_, c)| c);
+            for &(i, _) in &tuples {
+                if !children[i].evaluate(ctx) {
+                    return false;
+                }
+            }
+            true
+        }
     }
 
     /// `Or` short-circuit evaluation in cost-ascending child order.
@@ -1324,10 +1367,37 @@ impl Predicate {
     /// planner has no per-clause trueness signal, so it falls
     /// back to ordering by raw evaluation work — neutral between
     /// And and Or, which is the best we can do here.
+    ///
+    /// PERF_AUDIT §4.7 — same precomputed-tuple shape as
+    /// `eval_all_in_cost_order` above.
     fn eval_any_in_cost_order(children: &[Predicate], ctx: &EvalContext<'_>) -> bool {
-        let mut order: Vec<usize> = (0..children.len()).collect();
-        order.sort_by_key(|&i| children[i].static_cost());
-        order.into_iter().any(|i| children[i].evaluate(ctx))
+        const STACK_CAP: usize = 8;
+        if children.len() <= STACK_CAP {
+            let mut tuples: [(usize, u32); STACK_CAP] = [(0, 0); STACK_CAP];
+            for (i, child) in children.iter().enumerate() {
+                tuples[i] = (i, child.static_cost());
+            }
+            tuples[..children.len()].sort_unstable_by_key(|&(_, c)| c);
+            for &(i, _) in &tuples[..children.len()] {
+                if children[i].evaluate(ctx) {
+                    return true;
+                }
+            }
+            false
+        } else {
+            let mut tuples: Vec<(usize, u32)> = children
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (i, c.static_cost()))
+                .collect();
+            tuples.sort_unstable_by_key(|&(_, c)| c);
+            for &(i, _) in &tuples {
+                if children[i].evaluate(ctx) {
+                    return true;
+                }
+            }
+            false
+        }
     }
 
     /// Static cost estimate for the planner. Lower = cheaper to
