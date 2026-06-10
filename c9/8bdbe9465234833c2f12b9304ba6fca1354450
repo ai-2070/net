@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/PERF_AUDIT_2026_06_09_HOT_PATH.md
+  s_8870c7403329c0::t_c7ec090251d32d 210-222
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "c98bdbe9465234833c2f12b9304ba6fca1354450",
+  "prompts": {},
+  "sessions": {
+    "s_8870c7403329c0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0cc782bd-f8c5-40e5-80e4-a9c79b6b7195",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
