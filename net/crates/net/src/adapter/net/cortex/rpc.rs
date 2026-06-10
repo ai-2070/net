@@ -474,6 +474,16 @@ impl RpcRequestPayload {
     /// one is always a caller bug).
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.encoded_len());
+        self.encode_into(&mut buf);
+        buf
+    }
+
+    /// Encode directly into `buf`, appending the wire bytes (audit T2.2).
+    /// Callers that already hold an `EventMeta`-prefixed buffer use this to
+    /// skip `encode()`'s intermediate `Vec` allocation + copy. Produces the
+    /// identical bytes `encode()` returns. Pre-`reserve(encoded_len())` for an
+    /// exact-fit single allocation when starting from an empty buffer.
+    pub fn encode_into(&self, buf: &mut Vec<u8>) {
         // service
         let svc = self.service.as_bytes();
         debug_assert!(
@@ -489,7 +499,7 @@ impl RpcRequestPayload {
         // flags
         buf.put_u16_le(self.flags);
         // headers
-        encode_headers(&self.headers, &mut buf);
+        encode_headers(&self.headers, buf);
         // body
         debug_assert!(
             self.body.len() <= MAX_RPC_BODY_LEN,
@@ -499,7 +509,6 @@ impl RpcRequestPayload {
         );
         buf.put_u32_le(self.body.len() as u32);
         buf.extend_from_slice(&self.body);
-        buf
     }
 
     /// Decode from the wire bytes following the `EventMeta` prefix.
@@ -604,12 +613,19 @@ impl RpcRequestChunkPayload {
     /// release.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.encoded_len());
+        self.encode_into(&mut buf);
+        buf
+    }
+
+    /// Encode directly into `buf`, appending the wire bytes (audit T2.2).
+    /// See [`RpcRequestPayload::encode_into`].
+    pub fn encode_into(&self, buf: &mut Vec<u8>) {
         // call_id
         buf.put_u64_le(self.call_id);
         // flags
         buf.put_u16_le(self.flags);
         // headers
-        encode_headers(&self.headers, &mut buf);
+        encode_headers(&self.headers, buf);
         // body
         debug_assert!(
             self.body.len() <= MAX_RPC_BODY_LEN,
@@ -619,7 +635,6 @@ impl RpcRequestChunkPayload {
         );
         buf.put_u32_le(self.body.len() as u32);
         buf.extend_from_slice(&self.body);
-        buf
     }
 
     /// Decode from the wire bytes following the `EventMeta` prefix.
@@ -690,8 +705,15 @@ impl RpcResponsePayload {
     /// [`RpcRequestPayload::encode`] — see that method's doc.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.encoded_len());
+        self.encode_into(&mut buf);
+        buf
+    }
+
+    /// Encode directly into `buf`, appending the wire bytes (audit T2.2).
+    /// See [`RpcRequestPayload::encode_into`].
+    pub fn encode_into(&self, buf: &mut Vec<u8>) {
         buf.put_u16_le(self.status.to_wire());
-        encode_headers(&self.headers, &mut buf);
+        encode_headers(&self.headers, buf);
         debug_assert!(
             self.body.len() <= MAX_RPC_BODY_LEN,
             "body length {} exceeds MAX_RPC_BODY_LEN ({})",
@@ -700,7 +722,6 @@ impl RpcResponsePayload {
         );
         buf.put_u32_le(self.body.len() as u32);
         buf.extend_from_slice(&self.body);
-        buf
     }
 
     /// Decode from the wire bytes following the `EventMeta` prefix.

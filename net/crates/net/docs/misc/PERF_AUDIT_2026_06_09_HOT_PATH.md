@@ -207,12 +207,19 @@ unary RPC on both sides. First, current state of the known `NRPC_FLAMEGRAPH.md` 
 
 **New findings (not in the flamegraph catalog):**
 
-- **8a. One `tokio::spawn` per response** (`mesh_rpc.rs:1798-1833`): the emit closure
-  spawns a task for every response publish. *Est.* 1–2 µs scheduling per RT, and it is
-  one of the 4–6 spawns the flamegraph counted. The T1.2 cache hit makes the publish
-  itself cheap (`publish_to_peer`), so the spawn is now the dominant cost of the
-  response leg — inline the publish into the handler task (it's already spawned) or
-  feed a drainer like T1.1 did.
+- **8a. One `tokio::spawn` per response** (`mesh_rpc.rs:1798-1833`) — ✅ DONE. The emit
+  closure spawned a task for every response publish. *Est.* 1–2 µs scheduling per RT,
+  one of the 4–6 spawns the flamegraph counted; with the T1.2 cache making the publish
+  itself cheap, the spawn was the dominant cost of the response leg. Fixed via the T1.1
+  drainer pattern: the (sync) emit closure now builds the wire payload and `try_send`s
+  an `RpcResponseJob` to a single per-service drain task that does the `.await` publish
+  — no per-response spawn, bounded channel (drop-on-overflow), FIFO. Streaming/duplex
+  variants keep their per-emit spawn (unary is the QPS hot path). Correctness pinned by
+  the full lib suite + two-mesh round-trip + serve-handle-drop in-flight tests.
+  *Measurement note:* the win is ~1–2 µs/RT, below this dev box's Windows-loopback
+  variance floor — a before/after on `nrpc_qps` showed `c1/32B` −3.6% (p<0.05) but the
+  other c1/c16 bars within noise; authoritative measurement remains the Linux flamegraph
+  environment (consistent with the rest of this wire-path audit).
 - **8b. Reply-channel string per response** (`mesh_rpc.rs:1799-1800`):
   `format!("{service}.replies.{caller_origin:016x}")` + `ChannelName::new()` — two
   heap allocs per response that are deterministic from `(service, caller_origin)` and
@@ -269,9 +276,15 @@ items:
   that is 500K channel wakes/s, and it is where the "RedEX wake: 5–10 µs" line in
   `PERF_AUDIT_2026_05_19_NRPC.md` lives. The v1 watcher model is live-tail by design;
   batched delivery is a v2 architecture item. Listed as the known ceiling, not a bug.
-- **`bench_append_batch_disk` has still never been run** — phases 1–4 claim
-  multi-× wins with no captured before/after. Cheap to close; do it with the next
-  bench sweep.
+- **`bench_append_batch_disk`** — ✅ run (2026-06-10, Windows dev box; first capture).
+  64-event batches: **64 B → 20.2 µs/batch (~3.17 M ev/s)**, **1 KiB → 62.5 µs/batch
+  (~1.02 M ev/s)** ≈ ~315 ns/event. The companion
+  `redex_append_batch_disk_policies` confirms the Phase 3/4 background-fsync design:
+  `never`/default ~23 µs/batch vs `every_n_1` (synchronous fsync per batch) ~853 µs/batch
+  — i.e. the appender pays only the page-cache write and coalescing is **~40×** faster
+  than per-batch fsync. (No true before/after — the pre-phase code isn't checked out —
+  but the policy split is direct evidence the phases 1–4 wins are real. Windows numbers;
+  not added to `BENCHMARKS.md`, which is M1/i9-format.)
 
 CortEX fold dispatch: decode path is zero-copy (`Bytes::slice`, postcard), context
 construction allocation-free (`cortex/rpc.rs:1495,1598-1604`); the only hot-path issue
@@ -292,8 +305,8 @@ findings; do not re-audit.
 
 ## 12. WIDENED (round 3): behavior/ modules — prior fixes verified, no new findings
 
-All fixes from `PERF_AUDIT_2026_05_28_CAPABILITY.md` and
-`PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md` verified present in the code (sorted-tag `sort_unstable` +
+All fixes from `PERF_AUDIT_2026_05_28_CAPABILITY.md` and `PERF_AUDIT_2026_06_08
+_BENCHMARK_WINS.md` verified present in the code (sorted-tag `sort_unstable` +
 `sort_by_cached_key` `capability.rs:1856,1865`, tag-direct filter fast paths `:2369`,
 axis_key alloc removal `:1349,1372`, AtomicUsize counters across swarm/metadata/
 proximity/route). The two deliberately-pending items stand: compact codec (fix #3,
@@ -374,6 +387,43 @@ answers **no** across the board:
 
 **Control-plane is closed. With §8–§14, every surface in the net crate has now been
 audited or has a recorded clean verdict; the survey is complete.**
+
+---
+
+## 15. CORRECTNESS (found while baselining the QPS bench): a node expires its own capability entry and denies its own services — ✅ FIXED
+
+Not a perf item, but surfaced by this work and worth recording. While capturing a
+`nrpc_qps` baseline to measure §8a, the **c128** bar deterministically panicked with
+`CapabilityDenied`. Root cause (instrumented, conclusive):
+
+1. At c128 the transport saturates; `call_json_direct_retrying` retried `Transport`
+   backpressure with no deadline, so the bar **livelocked** — it ran for **>300 s**
+   instead of ~8 s, making ~no progress. (Same livelock that hung the 16 KiB bar.)
+2. Capability fold entries carry a TTL (default 300 s) and the sweeper reaps them on
+   expiry. **Nothing periodically re-announced the node's own entry** — no background
+   loop did, and `serve_rpc`'s announce is one-time. So ~300 s in, the self-entry
+   expired (`lived_ms=300433`, instrumented) and was swept (`total_nodes → 0`).
+3. The callee-side cap-auth gate (`may_execute(self, …)`, `mesh_rpc.rs`) then found no
+   self-entry → `CapabilityDenied` on every inbound call. Peers also expire the node's
+   announcement after one TTL, so it stops being discoverable too.
+
+So **any node serving RPC continuously past one TTL (≈5 min) without re-announcing
+would start rejecting all inbound calls AND drop off discovery** — a self-inflicted
+outage, masked until now because every test/bench runs far under 300 s (only the c128
+livelock ran long enough to trip it).
+
+**Fixes (committed):**
+- **Periodic re-announce** — `spawn_capability_reannounce_loop` re-broadcasts the
+  node's capabilities every `MeshNodeConfig::capability_reannounce_interval`
+  (default 150 s) with a 2×-interval TTL, refreshing both the local self-index (callee
+  gate) and peers' folds (discovery). Re-broadcasting needs an owned `Arc` (the per-peer
+  sends are `&self`), so `MeshNode::start_arc(self: &Arc<Self>)` stores a `Weak` the
+  loop upgrades each tick; the SDK (`Mesh::start`) and FFI (`net_mesh_start`) call it. A
+  bare `start(&self)` keeps its signature — no test-caller churn — and omits the loop
+  (fine for the short-lived non-`Arc` nodes that take it). A/B tests pin both directions.
+- **Bench-harness livelock** — `call_*_retrying` now bounds backpressure retries with a
+  20 s `RETRY_DEADLINE`, so a saturated bar fails fast (`c128/32B` in ~24 s vs ~5 min)
+  with `transport saturated … not measurable here`, instead of livelocking past a TTL.
 
 ---
 

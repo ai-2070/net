@@ -322,6 +322,18 @@ Benchmarks accurate as of 2026-04-27.
 | check_all | 342.96 ms | 2.9158 elem/s | 331.65 ms | 3.0152 elem/s |
 | stats | 80.568 ms | 12.412 elem/s | 100.06 ms | 9.9939 elem/s |
 
+> **⚠️ `check_all` (342 ms) and `stats` (80–100 ms) are benchmark-fixture
+> artifacts, NOT hot-path costs — don't chase them.** Both are an O(nodes) scan
+> whose cost Criterion reports *per element* against a fixture the
+> `heartbeat_new` bench balloons to millions of entries (it inserts a fresh id
+> every iteration into the shared detector). On the real hot path:
+> `check_all` runs once per `heartbeat_interval` (default 5 s) and costs
+> ~204 µs at 5,000 nodes — see *Failure Scaling* below, which grows linearly
+> and contradicts the 342 ms figure — i.e. ~40 µs/s amortized; `stats` is
+> observability-only by documented design. The genuine per-heartbeat costs are
+> `heartbeat_existing` / `heartbeat_new` / `status_check` (14–242 ns). See
+> `docs/misc/PERF_AUDIT_2026_06_09_HOT_PATH.md` §14.
+
 ### Circuit Breaker
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
