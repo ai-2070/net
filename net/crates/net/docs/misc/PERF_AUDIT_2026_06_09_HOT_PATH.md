@@ -292,8 +292,8 @@ findings; do not re-audit.
 
 ## 12. WIDENED (round 3): behavior/ modules — prior fixes verified, no new findings
 
-All fixes from `PERF_AUDIT_2026_05_28_CAPABILITY.md` and `PERF_AUDIT_2026_06_08
-_BENCHMARK_WINS.md` verified present in the code (sorted-tag `sort_unstable` +
+All fixes from `PERF_AUDIT_2026_05_28_CAPABILITY.md` and
+`PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md` verified present in the code (sorted-tag `sort_unstable` +
 `sort_by_cached_key` `capability.rs:1856,1865`, tag-direct filter fast paths `:2369`,
 axis_key alloc removal `:1349,1372`, AtomicUsize counters across swarm/metadata/
 proximity/route). The two deliberately-pending items stand: compact codec (fix #3,

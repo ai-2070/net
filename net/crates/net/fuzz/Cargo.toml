@@ -32,7 +32,7 @@ libfuzzer-sys = "0.4"
 # `postcard` decodes the blob TransferHeader directly. Versions
 # pinned to the parent crate's.
 bytes = "1"
-postcard = { version = "1", features = ["use-std"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 # Depend on the parent crate with every feature the fuzz
 # targets need. `port-mapping` pulls in NAT-PMP + UPnP decoders;
 # `nat-traversal` surfaces classify + reflex types; `cortex`
