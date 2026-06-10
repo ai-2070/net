@@ -335,6 +335,12 @@ pub struct ServeHandle {
     /// exits on its own once the dispatcher's `mpsc::Sender` is
     /// dropped via `unregister_rpc_inbound`.
     _bridge: JoinHandle<()>,
+    /// The per-service response drainer task (unary `serve_rpc` only;
+    /// `None` for the streaming/duplex variants, which still spawn per
+    /// emit). Like `_bridge`, held only to detach — it exits on its own
+    /// once the emit closure (the sole `Sender` owner, dropped when the
+    /// bridge task ends and the fold drops) is gone. See §8a.
+    _response_drain: Option<JoinHandle<()>>,
     /// Hold an Arc back to the mesh so we can unregister on Drop
     /// without the mesh having to track us.
     mesh: Arc<MeshNode>,
@@ -351,6 +357,21 @@ impl Drop for ServeHandle {
         self.mesh.unregister_rpc_inbound(self.channel_hash);
         self.mesh.rpc_local_services_arc().remove(&self.service);
     }
+}
+
+/// A response ready to publish, handed from a (synchronous) `serve_rpc`
+/// emit closure to the per-service response drainer task. Replaces the
+/// pre-§8a `tokio::spawn`-per-response: the emit closure builds the wire
+/// payload (cheap, sync) and `try_send`s this job; one drain task does the
+/// `.await` publish. The reply `ChannelName` is `Arc<str>` and `payload` is
+/// `Bytes`, so the hand-off is a couple of moves — no copy, no per-response
+/// task allocation/scheduling.
+struct RpcResponseJob {
+    caller_origin: u64,
+    call_id: u64,
+    target_hint: Option<u64>,
+    reply_channel: ChannelName,
+    payload: Bytes,
 }
 
 // ============================================================================
@@ -1782,12 +1803,13 @@ impl MeshNode {
         let origin_node_cache: RpcOriginNodeCache = Arc::new(dashmap::DashMap::new());
 
         // Build the emit closure. When the handler completes, the
-        // fold calls this with `(caller_origin, call_id, response)`.
-        // The closure publishes a RESPONSE event on
-        // `<service>.replies.<caller_origin>` via the existing
-        // pub/sub path. `tokio::spawn` keeps the closure
-        // synchronous (the fold doesn't await).
-        let mesh_for_emit = Arc::clone(self);
+        // fold calls this (synchronously) with `(caller_origin, call_id,
+        // response)`. §8a: instead of `tokio::spawn`ing a task per response,
+        // the closure builds the wire payload (cheap, no await) and hands a
+        // job to a single per-service response drainer task (below), which
+        // does the `.await` publish. A `tokio::spawn` per response cost
+        // ~1–2 µs of scheduling on a wake-bound path; a channel send is a
+        // fraction of that, and the drainer amortizes the wakeup.
         let service_for_emit = service.to_string();
         let server_origin = self.identity_origin_hash();
         let origin_node_cache_for_emit = Arc::clone(&origin_node_cache);
@@ -1802,8 +1824,11 @@ impl MeshNode {
         // same growth profile as `origin_node_cache` above.
         let reply_channel_cache: Arc<dashmap::DashMap<u64, ChannelName>> =
             Arc::new(dashmap::DashMap::new());
+        // §8a response drainer channel. Bounded like the inbound channel; a
+        // full channel means the drainer can't keep up, so we drop (the
+        // caller times out) rather than block the fold.
+        let (resp_tx, mut resp_rx) = mpsc::channel::<RpcResponseJob>(1024);
         let emit: RpcResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
-            let mesh = Arc::clone(&mesh_for_emit);
             let target_hint = origin_node_cache_for_emit.get(&caller_origin).map(|v| *v);
             // Resolve the reply channel from cache (Arc bump on hit; one
             // `format!` + `ChannelName::new` the first time we see a caller).
@@ -1824,33 +1849,35 @@ impl MeshNode {
                     }
                 }
             };
-            tokio::spawn(async move {
-                // Build the RESPONSE event envelope: 24-byte meta
-                // + encoded RpcResponsePayload.
-                let meta = EventMeta::new(
-                    super::cortex::DISPATCH_RPC_RESPONSE,
-                    0,
-                    server_origin,
-                    call_id,
-                    0,
-                );
-                let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
-                buf.extend_from_slice(&meta.to_bytes());
-                resp.encode_into(&mut buf);
-
-                if let Err(e) = publish_response_to_caller(
-                    &mesh,
+            // Build the RESPONSE event envelope (24-byte meta + encoded
+            // payload) synchronously — pure CPU, no await — then hand it to
+            // the drainer.
+            let meta = EventMeta::new(
+                super::cortex::DISPATCH_RPC_RESPONSE,
+                0,
+                server_origin,
+                call_id,
+                0,
+            );
+            let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
+            buf.extend_from_slice(&meta.to_bytes());
+            resp.encode_into(&mut buf);
+            if resp_tx
+                .try_send(RpcResponseJob {
                     caller_origin,
+                    call_id,
                     target_hint,
-                    &reply_channel,
-                    Bytes::from(buf),
-                )
-                .await
-                {
-                    tracing::warn!(error = %e, caller_origin = format!("{:#x}", caller_origin),
-                        call_id, "rpc serve_rpc: response publish failed");
-                }
-            });
+                    reply_channel,
+                    payload: Bytes::from(buf),
+                })
+                .is_err()
+            {
+                tracing::debug!(
+                    caller_origin = format!("{:#x}", caller_origin),
+                    call_id,
+                    "rpc serve_rpc: response drainer at capacity; dropping response"
+                );
+            }
         });
 
         // Build the server fold and wrap it in an Arc<Mutex<...>>
@@ -1993,6 +2020,33 @@ impl MeshNode {
             }
         });
 
+        // §8a response drainer. Drains `resp_rx` and does the `.await`
+        // publish that the emit closure used to `tokio::spawn` per response.
+        // Exits on its own when `resp_tx` (held only by the emit closure,
+        // which the fold owns) is dropped — i.e. when the bridge task ends
+        // and the fold drops, the same teardown that stops `_bridge`.
+        let response_drain_mesh = Arc::clone(self);
+        let response_drain = tokio::spawn(async move {
+            while let Some(job) = resp_rx.recv().await {
+                if let Err(e) = publish_response_to_caller(
+                    &response_drain_mesh,
+                    job.caller_origin,
+                    job.target_hint,
+                    &job.reply_channel,
+                    job.payload,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        caller_origin = format!("{:#x}", job.caller_origin),
+                        call_id = job.call_id,
+                        "rpc serve_rpc: response publish failed"
+                    );
+                }
+            }
+        });
+
         // Spawn an async re-announce so peers also learn about
         // the new service without the operator having to call
         // `announce_capabilities` manually. The local self-index
@@ -2016,6 +2070,7 @@ impl MeshNode {
             channel_hash,
             service: service.to_string(),
             _bridge: bridge,
+            _response_drain: Some(response_drain),
             mesh: Arc::clone(self),
         })
     }
@@ -2128,6 +2183,9 @@ impl MeshNode {
             channel_hash,
             service: service.to_string(),
             _bridge: bridge,
+            // Streaming/duplex variants still spawn per emit (§8a covers the
+            // unary hot path); no drainer.
+            _response_drain: None,
             mesh: Arc::clone(self),
         })
     }
@@ -2255,6 +2313,9 @@ impl MeshNode {
             channel_hash,
             service: service.to_string(),
             _bridge: bridge,
+            // Streaming/duplex variants still spawn per emit (§8a covers the
+            // unary hot path); no drainer.
+            _response_drain: None,
             mesh: Arc::clone(self),
         })
     }
@@ -2490,6 +2551,9 @@ impl MeshNode {
             channel_hash,
             service: service.to_string(),
             _bridge: bridge,
+            // Streaming/duplex variants still spawn per emit (§8a covers the
+            // unary hot path); no drainer.
+            _response_drain: None,
             mesh: Arc::clone(self),
         })
     }
