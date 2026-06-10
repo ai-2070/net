@@ -561,27 +561,38 @@ impl NetSession {
         fairness_weight: u8,
         tx_window: u32,
     ) -> u64 {
+        // PERF_AUDIT §2.12 — read-only fast path. `publish_to_peer`
+        // calls `open_stream_with` on every publish, but the stream
+        // is almost always already open after the first call —
+        // pre-fix this took a DashMap write `entry()` lock per
+        // publish just to land in the Occupied arm and return the
+        // existing epoch. The `get` probe holds a read lock so
+        // concurrent opens on other streams don't contend.
+        if let Some(existing_ref) = self.streams.get(&stream_id) {
+            let existing = existing_ref.value();
+            if existing.reliable_mode() != reliable
+                || existing.fairness_weight() != fairness_weight.max(1)
+                || existing.tx_window() != tx_window
+            {
+                tracing::warn!(
+                    stream_id = format!("{:#x}", stream_id),
+                    existing_reliable = existing.reliable_mode(),
+                    new_reliable = reliable,
+                    existing_weight = existing.fairness_weight(),
+                    new_weight = fairness_weight,
+                    existing_tx_window = existing.tx_window(),
+                    new_tx_window = tx_window,
+                    "open_stream: ignoring conflicting config; first open wins"
+                );
+            }
+            return existing.epoch();
+        }
+        // Slow path: stream missing. Take the write lock and
+        // either create the entry or pick up a concurrent
+        // creator's epoch on the race.
         use dashmap::mapref::entry::Entry;
         match self.streams.entry(stream_id) {
-            Entry::Occupied(existing) => {
-                let existing = existing.get();
-                if existing.reliable_mode() != reliable
-                    || existing.fairness_weight() != fairness_weight.max(1)
-                    || existing.tx_window() != tx_window
-                {
-                    tracing::warn!(
-                        stream_id = format!("{:#x}", stream_id),
-                        existing_reliable = existing.reliable_mode(),
-                        new_reliable = reliable,
-                        existing_weight = existing.fairness_weight(),
-                        new_weight = fairness_weight,
-                        existing_tx_window = existing.tx_window(),
-                        new_tx_window = tx_window,
-                        "open_stream: ignoring conflicting config; first open wins"
-                    );
-                }
-                existing.epoch()
-            }
+            Entry::Occupied(existing) => existing.get().epoch(),
             Entry::Vacant(v) => {
                 let epoch = self.next_stream_epoch();
                 v.insert(StreamState::new_full_with_epoch(
