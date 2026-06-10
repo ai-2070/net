@@ -1,0 +1,34 @@
+net/crates/net/src/adapter/net/dataforts/blob/mesh.rs
+  s_d4a014e53aa1f5::t_035db9b8394908 1583-1585
+  s_d4a014e53aa1f5::t_71982f7c71a6df 4273-4302,4305-4315
+  s_d4a014e53aa1f5::t_05a315fa8d8352 1566-1568
+  s_d4a014e53aa1f5::t_d1aa3b8de17f33 4303-4304
+  s_d4a014e53aa1f5::t_1ae042ab61919b 1514-1515,1518-1520
+  s_d4a014e53aa1f5::t_e844fadc39372b 1314-1315,1317,1326,1397-1398,1400,1409,1626-1627,1629,1638
+  s_d4a014e53aa1f5::t_414a141a417330 2448-2478
+  s_d4a014e53aa1f5::t_d62937f8a07b60 1476-1479
+  s_d4a014e53aa1f5::t_a67f954c0df25a 2959-2962
+  s_d4a014e53aa1f5::t_ff192beab215d5 3069-3070,3080-3081
+  s_d4a014e53aa1f5::t_3b760dbf8a1ead 3234-3238,3241
+  s_d4a014e53aa1f5::t_3b73d109befebc 1600-1602
+  s_d4a014e53aa1f5::t_bd023b7c12be55 2041-2043,2048
+  s_d4a014e53aa1f5::t_dc34219cb22863 2301-2306
+  s_d4a014e53aa1f5::t_031571912c335b 1551-1554
+  s_d4a014e53aa1f5::t_c78b0192e8beb8 1499-1503
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "78d7678e2a5e34f15763d2b2080fd914ac6f91ed",
+  "prompts": {},
+  "sessions": {
+    "s_d4a014e53aa1f5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a6af4feb-518f-4835-a66d-5b2f7797adef",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
