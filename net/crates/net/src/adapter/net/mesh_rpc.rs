@@ -1561,7 +1561,53 @@ fn build_request_grant_emitter(
 /// only used by the matching service's response emit, so a malicious
 /// peer can at most misdirect responses for THEIR own request — they
 /// already could.
-type RpcOriginNodeCache = Arc<dashmap::DashMap<u64, u64>>;
+///
+/// **Bounded** ([`OriginKeyedLru`]): the key is the wire-claimed
+/// `origin_hash` and the bridge inserts it *before* the capability gate,
+/// so an unbounded map would let one authed peer spray distinct origins and
+/// amplify server memory. The LRU caps the footprint; eviction costs only a
+/// response-path cache miss (roster fallback), never correctness.
+type RpcOriginNodeCache = Arc<OriginKeyedLru<u64>>;
+
+/// Capacity bound for the per-`serve_rpc` caller-keyed caches
+/// ([`RpcOriginNodeCache`] and the §8b reply-channel cache). Sized for the
+/// legitimate active-caller working set of a single service; well past it the
+/// LRU evicts cold origins rather than growing without limit under a
+/// crafted-origin flood. Each entry is tiny (a `u64` and, for the reply
+/// cache, an `Arc<str>` channel name), so the whole bound is a few hundred KB
+/// per service.
+const RPC_CALLER_CACHE_CAP: usize = 4096;
+
+/// Thread-safe, bounded LRU keyed by the wire-claimed caller `origin_hash`.
+///
+/// Backs both [`RpcOriginNodeCache`] and the §8b reply-channel cache. Wraps
+/// `lru::LruCache` (which needs `&mut` even to read, to bump the entry to
+/// most-recently-used) in a `parking_lot::Mutex`. The per-response lock is
+/// uncontended in the common case — one fold drives a given service — and is
+/// far cheaper than the `format!` + `ChannelName` allocation / roster fan-out
+/// the caches exist to avoid. Eviction is always safe: a miss just recomputes
+/// the value (channel name) or falls back to the roster lookup.
+struct OriginKeyedLru<V>(Mutex<lru::LruCache<u64, V>>);
+
+impl<V: Clone> OriginKeyedLru<V> {
+    fn new() -> Self {
+        // `RPC_CALLER_CACHE_CAP` is a non-zero literal.
+        let cap = std::num::NonZeroUsize::new(RPC_CALLER_CACHE_CAP)
+            .expect("RPC_CALLER_CACHE_CAP must be non-zero");
+        Self(Mutex::new(lru::LruCache::new(cap)))
+    }
+
+    /// Look up `origin`, promoting it to most-recently-used on a hit.
+    fn get(&self, origin: u64) -> Option<V> {
+        self.0.lock().get(&origin).cloned()
+    }
+
+    /// Insert / refresh `origin`, evicting the least-recently-used entry
+    /// when at capacity.
+    fn insert(&self, origin: u64, value: V) {
+        self.0.lock().put(origin, value);
+    }
+}
 
 /// Direct-send a built RESPONSE (or streaming chunk) packet to the
 /// caller's reply channel, bypassing the roster fan-out path
@@ -1800,7 +1846,7 @@ impl MeshNode {
         // its REQUEST. Populated by the bridge below; consumed by
         // the emit closure so [`publish_response_to_caller`] can
         // skip the roster fan-out on the response leg.
-        let origin_node_cache: RpcOriginNodeCache = Arc::new(dashmap::DashMap::new());
+        let origin_node_cache: RpcOriginNodeCache = Arc::new(OriginKeyedLru::new());
 
         // Build the emit closure. When the handler completes, the
         // fold calls this (synchronously) with `(caller_origin, call_id,
@@ -1820,20 +1866,22 @@ impl MeshNode {
         // `Arc<str>`, so a cache hit is an Arc bump; this removes the per-
         // response `format!` String + `ChannelName::new` (`Arc<str>`) allocation
         // (and the per-call `service.clone()`) the emit closure used to pay on
-        // every response. Keyed by `caller_origin`, bounded by peer count — the
-        // same growth profile as `origin_node_cache` above.
-        let reply_channel_cache: Arc<dashmap::DashMap<u64, ChannelName>> =
-            Arc::new(dashmap::DashMap::new());
+        // every response. Keyed by the wire-claimed `caller_origin` and so
+        // bounded the same way as `origin_node_cache` above — an
+        // `OriginKeyedLru`, not an unbounded map, so a crafted-origin flood
+        // can't amplify server memory (a miss just rebuilds the name).
+        let reply_channel_cache: Arc<OriginKeyedLru<ChannelName>> =
+            Arc::new(OriginKeyedLru::new());
         // §8a response drainer channel. Bounded like the inbound channel; a
         // full channel means the drainer can't keep up, so we drop (the
         // caller times out) rather than block the fold.
         let (resp_tx, mut resp_rx) = mpsc::channel::<RpcResponseJob>(1024);
         let emit: RpcResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
-            let target_hint = origin_node_cache_for_emit.get(&caller_origin).map(|v| *v);
+            let target_hint = origin_node_cache_for_emit.get(caller_origin);
             // Resolve the reply channel from cache (Arc bump on hit; one
             // `format!` + `ChannelName::new` the first time we see a caller).
-            let reply_channel = match reply_channel_cache.get(&caller_origin) {
-                Some(c) => c.clone(),
+            let reply_channel = match reply_channel_cache.get(caller_origin) {
+                Some(c) => c,
                 None => {
                     let name = format!("{service_for_emit}.replies.{caller_origin:016x}");
                     match ChannelName::new(&name) {
@@ -2098,7 +2146,7 @@ impl MeshNode {
         // T1.2 cache: bridge populates from inbound.from_node, emit
         // closure consults to skip roster fan-out. See the unary
         // serve_rpc above for the full rationale.
-        let origin_node_cache: RpcOriginNodeCache = Arc::new(dashmap::DashMap::new());
+        let origin_node_cache: RpcOriginNodeCache = Arc::new(OriginKeyedLru::new());
 
         let mesh_for_emit = Arc::clone(self);
         let service_for_emit = service.to_string();
@@ -2109,7 +2157,7 @@ impl MeshNode {
         let emit: RpcAsyncResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
             let mesh = Arc::clone(&mesh_for_emit);
             let service = service_for_emit.clone();
-            let target_hint = origin_node_cache_for_emit.get(&caller_origin).map(|v| *v);
+            let target_hint = origin_node_cache_for_emit.get(caller_origin);
             Box::pin(async move {
                 let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
                 let reply_channel = match ChannelName::new(&reply_channel_name) {
@@ -2215,7 +2263,7 @@ impl MeshNode {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<RpcInboundEvent>(1024);
 
         // T1.2 cache — see serve_rpc above for full rationale.
-        let origin_node_cache: RpcOriginNodeCache = Arc::new(dashmap::DashMap::new());
+        let origin_node_cache: RpcOriginNodeCache = Arc::new(OriginKeyedLru::new());
 
         let mesh_for_emit = Arc::clone(self);
         let service_for_emit = service.to_string();
@@ -2230,7 +2278,7 @@ impl MeshNode {
         let emit_resp: RpcResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
             let mesh = Arc::clone(&emit_resp_mesh);
             let service = emit_resp_service.clone();
-            let target_hint = origin_node_cache_for_emit.get(&caller_origin).map(|v| *v);
+            let target_hint = origin_node_cache_for_emit.get(caller_origin);
             tokio::spawn(async move {
                 let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
                 let reply_channel = match ChannelName::new(&reply_channel_name) {
@@ -2454,7 +2502,7 @@ impl MeshNode {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<RpcInboundEvent>(1024);
 
         // T1.2 cache — see serve_rpc above for full rationale.
-        let origin_node_cache: RpcOriginNodeCache = Arc::new(dashmap::DashMap::new());
+        let origin_node_cache: RpcOriginNodeCache = Arc::new(OriginKeyedLru::new());
 
         let mesh_for_emit = Arc::clone(self);
         let service_for_emit = service.to_string();
@@ -2469,7 +2517,7 @@ impl MeshNode {
         let emit_resp: RpcAsyncResponseEmitter = Arc::new(move |caller_origin, call_id, resp| {
             let mesh = Arc::clone(&emit_resp_mesh);
             let service = emit_resp_service.clone();
-            let target_hint = origin_node_cache_for_emit.get(&caller_origin).map(|v| *v);
+            let target_hint = origin_node_cache_for_emit.get(caller_origin);
             Box::pin(async move {
                 let reply_channel_name = format!("{service}.replies.{caller_origin:016x}");
                 let reply_channel = match ChannelName::new(&reply_channel_name) {
@@ -3727,4 +3775,48 @@ fn _ensure_send_sync() {
     assert_send_sync::<RpcStatus>();
     assert_send_sync::<RpcReply>();
     assert_send_sync::<CallOptions>();
+}
+
+#[cfg(test)]
+mod origin_cache_tests {
+    use super::*;
+
+    /// The crafted-origin memory-amplification guard (cubic P2): the reply-
+    /// channel / origin-node caches are keyed by the *wire-claimed*
+    /// `caller_origin`, which a single authed peer can vary freely. Spraying
+    /// far more distinct origins than the capacity must NOT grow the cache —
+    /// it stays pinned at `RPC_CALLER_CACHE_CAP`, evicting the coldest.
+    #[test]
+    fn origin_keyed_lru_bounds_under_crafted_origin_flood() {
+        let cache: OriginKeyedLru<u64> = OriginKeyedLru::new();
+        let flood = (RPC_CALLER_CACHE_CAP as u64) * 4;
+        for origin in 0..flood {
+            cache.insert(origin, origin);
+        }
+        assert_eq!(
+            cache.0.lock().len(),
+            RPC_CALLER_CACHE_CAP,
+            "cache must stay at its capacity bound under a crafted-origin flood"
+        );
+        // The most-recently-seen window survives; the cold prefix is evicted.
+        assert_eq!(cache.get(flood - 1), Some(flood - 1));
+        assert_eq!(cache.get(0), None);
+    }
+
+    /// `get` promotes to most-recently-used, so a touched entry outlives an
+    /// untouched one when the cache overflows by one — confirming the wrapper
+    /// gives true LRU semantics (a hot caller isn't evicted out from under an
+    /// in-flight exchange).
+    #[test]
+    fn origin_keyed_lru_get_promotes_to_mru() {
+        let cache: OriginKeyedLru<u64> = OriginKeyedLru::new();
+        for origin in 0..(RPC_CALLER_CACHE_CAP as u64) {
+            cache.insert(origin, origin);
+        }
+        // Touch origin 0 (otherwise the LRU), then overflow by one entry.
+        assert_eq!(cache.get(0), Some(0));
+        cache.insert(u64::MAX, 1);
+        assert_eq!(cache.get(0), Some(0), "touched entry must survive eviction");
+        assert_eq!(cache.get(1), None, "the now-LRU entry (1) must be evicted");
+    }
 }
