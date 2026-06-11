@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/mod.rs
+  s_58168e769adc91::t_97804dce493f10 274-281,287-315
+  s_58168e769adc91::t_db3d85c68a1501 1363-1368,1370-1394,1398-1405
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "6368336092e6f542a219d7317bf8021ce6819bd8",
+  "prompts": {},
+  "sessions": {
+    "s_58168e769adc91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "43399f81-fab3-4b2a-a002-4ece8a909069",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
