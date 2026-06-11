@@ -1,0 +1,38 @@
+net/crates/net/docs/misc/PERF_AUDIT_2026_06_10_FULL_CRATE.md
+  s_58168e769adc91::t_d7f4ff4ece4210 123
+  s_58168e769adc91::t_fb419278604eb2 111
+  s_58168e769adc91::t_ae88101a08bf1b 112
+  s_58168e769adc91::t_c7f63cf966340b 96
+  s_58168e769adc91::t_8307698fdfb277 129
+  s_58168e769adc91::t_1f21b973b171a9 144
+  s_58168e769adc91::t_7b698a1539a0d6 188-275
+  s_58168e769adc91::t_9c53a7c61a9b10 114
+  s_58168e769adc91::t_77d710c6600011 106
+  s_58168e769adc91::t_18757c4a8c3fa0 128
+  s_58168e769adc91::t_6101ebc43a05cb 89
+  s_58168e769adc91::t_dca520cb8d563d 73
+  s_58168e769adc91::t_ab9d7b8ca1965b 155
+  s_58168e769adc91::t_d658fa42564aff 110
+  s_58168e769adc91::t_35a6d5b6c211a5 77
+  s_58168e769adc91::t_5fc60eb64960b5 14,21-28
+  s_58168e769adc91::t_fb642f414e1cab 125
+  s_58168e769adc91::t_838a94edeb3523 93
+  s_58168e769adc91::t_97b05cf1b45286 146
+  s_58168e769adc91::t_1b9118deead8e0 140
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "efa9f9c69657f442b59b170fa2dd0bfb6fb9f8ab",
+  "prompts": {},
+  "sessions": {
+    "s_58168e769adc91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "43399f81-fab3-4b2a-a002-4ece8a909069",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
