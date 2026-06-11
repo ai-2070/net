@@ -1,0 +1,27 @@
+net/crates/net/src/shard/mod.rs
+  s_58168e769adc91::t_2cf8a8925390d8 1451-1480
+  s_58168e769adc91::t_684e0259c77be7 187,235
+net/crates/net/src/bus.rs
+  s_58168e769adc91::t_3016298e64de9d 2714-2742
+net/crates/net/src/ffi/mod.rs
+  s_58168e769adc91::t_5da499dbb4f2ac 1193
+  s_58168e769adc91::t_fd8fd62fe2af30 2032-2120
+  s_58168e769adc91::t_6ae8c0ad6648e8 1064-1119
+  s_58168e769adc91::t_4a6cb2b4259b81 155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "731d3974a89b0c389add705aee7a86005f257bfa",
+  "prompts": {},
+  "sessions": {
+    "s_58168e769adc91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "43399f81-fab3-4b2a-a002-4ece8a909069",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
