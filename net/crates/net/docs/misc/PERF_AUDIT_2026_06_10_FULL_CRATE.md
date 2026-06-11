@@ -11,7 +11,23 @@ capability folds (`src/adapter/net/behavior/`), RedEX/CortEX/state
 currently measured. Per-item costs marked *est.* are reasoned from the code, not
 re-measured.
 
-> **Status: findings only (2026-06-10).** No fixes applied. Prior-audit fixes were
+> **Status (updated 2026-06-11, post-review):** 51 of 56 items landed on
+> `performance-8` across 45 focused commits, plus the first
+> bench-coverage gap closed. Remaining items are structural
+> (require multi-file refactors that exceed a single commit's
+> scope) or explicitly deferred for wire/API surface reasons.
+> See the resolution table below for the per-item index.
+>
+> A commit-by-commit review pass over the landed fixes (2026-06-11,
+> 17 follow-up commits) found and repaired **10 real bugs in the
+> fixes themselves**, added 40+ regression tests, dispositioned 11
+> external review-bot (cubic) findings, and fixed 2 CI gates. Where
+> a landed fix was amended, the resolution table's Commit cell
+> lists `original + amending` commits; the full account is in
+> **Review pass + hardening (2026-06-11)** below the resolution
+> table.
+>
+> Original findings-only note (2026-06-10): Prior-audit fixes were
 > verified as landed before flagging anything (perf #17/#18/#32/#51/#52/#70/#72/#84/
 > #96/#100/#128/#132/#138/#171/#172/#184, the May-28 capability fixes, the CDC no-cut
 > cache, T1.1 grant coalescing, T2.2 `encode_into`). Everything below is residue those
@@ -19,6 +35,245 @@ re-measured.
 > behavior/ and dataforts clean at the *control-plane* level; this sweep traced the
 > per-candidate / per-packet **query-side** and **store-side** paths and found the
 > items in §4 and §6.
+
+## Resolution table
+
+Status codes:
+
+| Code | Meaning |
+| ---- | ------- |
+| ✅ Done | Fix landed; regression test pins the contract; commit linked. |
+| 🟡 Partial | Some sub-fixes landed; remainder deferred with documented rationale. |
+| ⏸ Deferred | Skipped pending explicit consent (public-type touch, wire-format change, or design call). |
+| 📐 Structural | Multi-file refactor; not landed yet — fix shape known. |
+| ➖ By design | Audit flagged the cost but accepted the design (cost vs. invariant tradeoff). |
+| ⊆ Subsumed | Fix is a side effect of another item's resolution. |
+
+### §1 — Core bus (`bus.rs`, `shard/`, `consumer/`, `event.rs`, `ffi/`)
+
+| Item | Title | Status | Commit |
+| ---- | ----- | ------ | ------ |
+| §1.1 | Global SeqCst in-flight counter ping-pong | ✅ Done | `91b2983bd` |
+| §1.2 | Per-event global stats duplicate per-shard counters | ✅ Done | `91b2983bd` |
+| §1.3 | Dynamic-scaling metrics 2× `Instant::now()` + 3 RMWs / event | ✅ Done | `aeb7d3a0f` |
+| §1.4 | Batch worker locks shard mutex just to bump atomic | ✅ Done | `58c4ec11c` |
+| §1.5 | Dynamic-mode shard-id → index uses std SipHash HashMap | ✅ Done | `8a46e5487` |
+| §1.6 | FFI poll parses + re-serializes every event | ✅ Done | `78569eb12` |
+| §1.7 | `ingest_raw_batch` growth-by-doubling Vec per shard per call | ✅ Done | `8a46e5487` |
+| §1.8 | `StoredEvent::Serialize` String copy + JSON re-validate per event | ✅ Done | `8a46e5487` |
+| §1.9 | Drain workers poll at 100 µs | ➖ By design | — |
+
+### §2 — Mesh transport datapath (`mesh.rs`, `session.rs`, `crypto.rs`, `transport.rs`, `protocol.rs`, `batch.rs`, `linux.rs`)
+
+| Item | Title | Status | Commit |
+| ---- | ----- | ------ | ------ |
+| §2.1 | Default send path is one syscall / packet (sendmmsg only on `scheduled`) | 📐 Structural | — |
+| §2.2 | ~8 KB heap alloc per inbound packet on both ingress paths | 📐 Structural | — |
+| §2.3 | Per-event `String` event-id formatting on hottest delivery path | ⏸ Deferred | — |
+| §2.4 | Routed packets do O(peers) linear scan per packet | ✅ Done | `b45bc44b8` + `676b4d5e1` (reverse-index eviction on session replacement) |
+| §2.5 | Relay forwarding: full-packet copy + `tokio::spawn` per forward | ✅ Done | `f7d82d053` |
+| §2.6 | `PacketBuilder` pays avoidable full-payload memcpy per built packet | ✅ Done | `133e6361c` |
+| §2.7 | Two `SystemTime::now()` calls per packet, each direction | ✅ Done | `3e3a5ea80` |
+| §2.8 | Grant path re-resolves peer per packet, ignoring node-id cache | ✅ Done | `799d014a5` + `676b4d5e1` (fallback now primes the cache — landed fast path was dead for non-cortex traffic) + `a8617ca43` (`resolve_grant_peer` extraction + self-priming test) |
+| §2.9 | Subprotocol handlers re-scan peers for `from_node` already a param | ✅ Done | `f0b70c09d` |
+| §2.10 | NACK retransmit rebuild makes redundant full-packet copy | ✅ Done | `f0b70c09d` |
+| §2.11 | All ingress decrypt + dispatch on single tokio task | 📐 Structural | — |
+| §2.12 | Minor per-packet overheads on publish/send path | 🟡 Partial | `efcec7052` (open_stream_full); 3 sub-fixes pending |
+
+§2.12 sub-fixes: open_stream_full read fast path ✅; PacketSender::send_batch BatchedTransport pool 📐; register_retransmit Vec<Bytes> pool 📐; read_events Vec<Bytes> pool 📐.
+
+### §3 — Routing / nRPC / reliability (`mesh_rpc.rs`, `router.rs`, `reliability.rs`, `channel/`)
+
+| Item | Title | Status | Commit |
+| ---- | ----- | ------ | ------ |
+| §3.1 | `FairScheduler::dequeue` allocates Vec + iterates DashMap per packet | ✅ Done | `ced8a5edb` + `f845557fe` (version-counted rebuild closes lost-wakeup race) |
+| §3.2 | Histogram records do ~14 contended atomic RMWs per RPC | ✅ Done | `367d23744` |
+| §3.3 | Flow-controlled `RpcStream` spawns task + sends packet per chunk | ✅ Done | `b62db8937` |
+| §3.4 | `ReliableStream::on_ack` scans entire retransmit window per ACK | ✅ Done | `d2fd0e1c0` |
+| §3.5 | Per-call reply-subscription check is global Mutex + O(N) String scan | ✅ Done | `01062218b` + `676b4d5e1` (collision-verified registry — hash-only key could drop replies) |
+| §3.6 | `QueueGroup::select` snapshots whole member set per publish | ✅ Done | `87fc34ace` |
+| §3.7 | `NetProxy::forward` copies full packet per forward | ✅ Done | `f0b70c09d` |
+| §3.8 | `getrandom` syscall per RPC for call-id minting | ✅ Done | `a11f27396` + `676b4d5e1` (pooled OS entropy replaces SplitMix64 — invertible finalizer leaked future ids) |
+| §3.9 | Three heap allocs per streaming chunk for constant header | ⏸ Deferred | — (RpcHeader is `pub type`; wire-format-adjacent) |
+| §3.10 | Reply/request channel hash recomputed per response and per chunk | ✅ Done | `de66235c4` |
+| §3.11 | Per-call `service.to_string()` + deep header clone in `call` | ✅ Done | `de66235c4` |
+| §3.12 | Double DashMap probe per stream-stats record on forward path | ✅ Done | `58c4ec11c` |
+
+### §4 — Behavior / capability folds (`behavior/`)
+
+| Item | Title | Status | Commit |
+| ---- | ----- | ------ | ------ |
+| §4.1 | `synthesize_capability_set` re-parses on every call | ✅ Done | `91d6b3837` + `cf6b91162` (pre-synthesize generation stamp closes stale-forever race) + `af7738979` (cfg-gate on `dataforts`) |
+| §4.2 | `may_execute` runs per RPC with no caching; caller axes re-derived | 🟡 Partial | `d269677fd` (hoist + batch); verdict cache (sub-fix a) pending |
+| §4.3 | Intent axis clones candidate's entire tag set per evaluation | ✅ Done | `cad56e57d` |
+| §4.4 | `signed_payload` clones full announcement before encoding | ✅ Done | `28d8c809d` |
+| §4.5 | Per-announcement fold refresh churns secondary index under lock | ✅ Done | `ae6239a44` + `cf6b91162` (`hardware` added to equivalence — GPU-shape refresh left synthetic index stale) |
+| §4.6 | Fold primary store + inverted indexes use default SipHash | ✅ Done | `1058d2e07` + `cf6b91162` (`tags_any_union` switched too) + `6331db9dc` (rustdoc private-link gate) |
+| §4.7 | Predicate planner re-plans on every `evaluate()` | ✅ Done | `471c98546` + `cf6b91162` (`(cost, index)` key restores stable tie order) + `1fd476002` (And/Or walks deduped) |
+| §4.8 | Constant semver RHS re-parsed on every predicate evaluation | ⏸ Deferred | — (Predicate enum field change; codec-adjacent) |
+| §4.9 | `placement_score` takes fold lock twice + 4 tag-set scans per candidate | ✅ Done | `ff8e923f8` (lock dedup) + `091b60810` (single-pass extract) + `cf6b91162` (first-valid-wins guard — malformed duplicate clobbered valid value) |
+| §4.10 | `composite_query` clones full `CapabilityMembership` per match | ✅ Done | `cad56e57d` |
+| §4.11 | Permissive-filter candidate resolution double-materializes | ✅ Done | `cad56e57d` |
+| §4.12 | `tags_union_for` clones every tag string per enumeration | ⊆ Subsumed | by §4.1's cached `Arc<CapabilitySet>` |
+
+### §5 — RedEX / CortEX / state (`redex/`, `cortex/`, `state/`, `netdb/`)
+
+| Item | Title | Status | Commit |
+| ---- | ----- | ------ | ------ |
+| §5.1 | Leader catch-up reads entire backlog per request (O(N²)) | ✅ Done | `fa684fa35` + `cd13d9067` (per-event wire overhead in the pre-walk — zero-payload backlog defeated the byte bound) |
+| §5.2 | Replica apply deep-copies every replicated payload | ✅ Done | `69a865224` |
+| §5.3 | 3 `metadata()` syscalls per disk append for rollback lengths | ✅ Done | `41942d039` + `cd13d9067` (dat write-failure path routed through poisoning `rollback_truncate` — silent `set_len` failure desynced the cached length) |
+| §5.4 | Leader copies each shipped payload twice | ✅ Done | `69a865224` |
+| §5.5 | Blocking fsync + disk writes on async runtime task, per chunk | ✅ Done | `238dd30d6` |
+| §5.6 | CortEX watchers re-run full O(N) query on every fold change | ✅ Done | `c32f3b104` + `cd13d9067` (end-of-stream during drain still delivers the final state) |
+| §5.7 | Typed ingest builds two buffers + hashes payload twice per write | ✅ Done | `df4311dd5` + `dd72de22b` (checksum slot centralized: `EVENT_META_CHECKSUM_RANGE` + `EventMeta::patch_checksum`) |
+| §5.8 | `materialize` re-checksums every payload on every read | ✅ Done | `fa684fa35` (combined with §5.1 budget gate) |
+| §5.9 | Disk writes (6 syscalls) execute under file-wide Mutex | 📐 Structural | — |
+| §5.10 | `find_many` / `count_where` are full-table scans; `RedexIndex` unused | 📐 Structural | — (workload-dependent priority) |
+
+### §6 — Dataforts blob layer (`dataforts/`)
+
+| Item | Title | Status | Commit |
+| ---- | ----- | ------ | ------ |
+| §6.1 | BLAKE3 + Reed-Solomon run inline on tokio runtime | ✅ Done | `fbc668bb7` |
+| §6.2 | Every chunk hashed twice on store; directory-store path 4×, chunks 2× | ✅ Done | `78d7678e2` |
+| §6.3 | Dedup-hit stores read + re-hash entire existing chunk | ✅ Done | `35a0f9f41` + `a3a37cbed` (compare FIRST retained event — duplicate-event layouts spuriously rejected) + `301d8220f` (fetch-time backstop pinned by test) |
+| §6.4 | Tree fetch copies assembled range once per tree level | ✅ Done | `8b74f56ea` |
+| §6.5 | RS store path copies every CDC chunk extra time into striper | ✅ Done | `9d85aca8a` |
+| §6.6 | Chunk serving copies every 8 KiB wire frame out of refcounted buffer | ✅ Done | `a11f27396` |
+| §6.7 | Per-op RedexFile reopen overhead on every chunk fetch/store/exists | ✅ Done | `471d88f89` + `a3a37cbed` (`sweep_gc` pops the handle cache — stale handle after GC silently skipped re-stores: data loss) |
+| §6.8 | Heat-registry eviction is O(cap) scan under global heat mutex | ✅ Done | `124e9412b` |
+| §6.9 | `store_dir` fully sequential, buffers whole files in memory | ✅ Done | `15cf9d24f` + `a3a37cbed` (error path drains in-flight futures) + `c5649169b` (u64-domain byte-permit clamp — >4 GiB files wrapped to 1 permit) |
+| §6.10 | FS adapter: hash on runtime, full payload copy, double `canonicalize` | ✅ Done | `6b5c897dd` |
+| §6.11 | Tree walk re-hashes every node `fetch_chunk` already verified | ✅ Done | `a11f27396` |
+| §6.12 | Reconstruction copies every surviving shard to owned Vec | ✅ Done | `799d014a5` |
+
+### Bench coverage gaps
+
+| Gap | Description | Status | Commit |
+| --- | ----------- | ------ | ------ |
+| #1 | Multi-producer (1/2/4/8 threads) `EventBus::ingest_raw` | ✅ Done | `c1cff1271` + `14c40234b` (de-skew: single cached routing hash sent every producer to one shard — **numbers in `c1cff1271`'s message are invalid; re-baseline**) |
+| #2 | Loopback pps end-to-end (`dispatch_packet` → egress) | 📐 Structural | — |
+| #3 | Replication catch-up (lagged-replica scenario) | 📐 Structural | — |
+
+### Summary counts
+
+| Status | §1 | §2 | §3 | §4 | §5 | §6 | Bench | Total |
+| ------ | --: | --: | --: | --: | --: | --: | ----: | ----: |
+| ✅ Done | 8 | 7 | 11 | 9 | 8 | 12 | 1 | **56** |
+| 🟡 Partial | 0 | 1 | 0 | 1 | 0 | 0 | 0 | **2** |
+| ⏸ Deferred | 0 | 1 | 1 | 1 | 0 | 0 | 0 | **3** |
+| 📐 Structural | 0 | 3 | 0 | 0 | 2 | 0 | 2 | **7** |
+| ➖ By design | 1 | 0 | 0 | 0 | 0 | 0 | 0 | **1** |
+| ⊆ Subsumed | 0 | 0 | 0 | 1 | 0 | 0 | 0 | **1** |
+| **§ items** | **9** | **12** | **12** | **12** | **10** | **12** | **3** | **70** |
+
+Note: the count tallies *resolution outcomes* per audit finding (a single commit can resolve multiple items; a single item can take multiple commits). The summary row's totals match the number of audit findings, not commit count.
+
+### Deferred items — why not now
+
+- **§2.3 — per-event String event-id**: `StoredEvent.id: String` is a public field on the consumer-trait surface. Changing it to integers / `Cow` / a typed `EventId` breaks every adapter (`jetstream.rs`, `redis.rs`) and downstream consumer. Wants a deliberate API-design pass, not a perf commit.
+- **§3.9 — streaming continue header**: `RpcHeader = (String, Vec<u8>)` is `pub type`; changing to `(Cow<'static, str>, Bytes)` is a typedef-level wire-adjacent change. The alternative (flag bit in envelope) is a real wire-format diff.
+- **§4.8 — constant semver RHS**: needs to change `Predicate` enum so the semver value carries a pre-parsed cache. The enum participates in the on-disk fold serialization codec; bumping it requires a codec version bump and migration path.
+- **§4.2 verdict cache (sub-fix a)**: design call. The hoist (sub-fixes b+c) landed; the verdict cache itself wants an LRU keyed on `(target, tag_hash, caller)` with change-generation invalidation, which is the same shape as §4.1 but covers a wider key space. Worth scoping against a verdict-hit-rate measurement first.
+
+### Structural items — fix shape known, multi-file refactor required
+
+- **§2.1 + §3.1 (now done) — sendmmsg integration**: §3.1's ArcSwap snapshot landed, removing the per-dequeue alloc. §2.1's "default sends through the scheduler" needs a per-socket egress aggregator and a wider refactor of every direct-send call site.
+- **§2.2 — recv slab/pool**: recvmmsg into one large refcounted buffer, hand out Bytes slices per slot. Needs Linux fast-path rework plus a fallback story for the non-batched recv path.
+- **§2.11 — single-task ingress ceiling**: structural — sharded receive tasks behind a port/peer hash.
+- **§5.9 — file-wide Mutex restructure**: memory-staged commit with the disk write after, or seqlock/ArcSwap snapshot index so readers never touch the writer lock. §5.3's cached-length fix already shrank the lock-hold time; this is the next-level win.
+- **§5.10 — RedexIndex wiring**: wire `RedexIndex` for `where_tag`/`status` lookups → O(matches). Only worth it if NetDB queries are hot in production; needs production-trace data before prioritizing.
+
+## Review pass + hardening (2026-06-11)
+
+After the 45 fix commits landed, every commit was re-reviewed
+one-by-one (six parallel subsystem reviewers + a docs pass): each
+fix verified against its audit item with full surrounding context,
+missing regression tests added, and external review-bot findings
+dispositioned. 17 follow-up commits. Validation state at the end of
+the pass: clippy clean under the default feature set AND
+`--no-default-features --features {net, cortex}`;
+`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --lib` clean;
+4,300+ lib tests green; `dir_transfer`, `integration_cortex_*`,
+and `integration_redex` suites green.
+
+### Bugs found in the landed fixes (all repaired)
+
+| # | Item | Bug in the landed fix | Class | Fix |
+| - | ---- | --------------------- | ----- | --- |
+| 1 | §4.1 | Cache entry stamped with the generation read AFTER synthesize — a fold update racing the synthesize caches pre-change state under the post-change generation, served stale until the next unrelated mutation | stale data | `cf6b91162` |
+| 2 | §3.1 | Racing snapshot rebuilds store out of order — a non-empty stream can go permanently absent from the active snapshot (lost wakeup; stranded packets, nothing repairs it) | liveness | `f845557fe` |
+| 3 | §3.5 | Registry keyed on xxh3(service) only, no fallback compare — a service-name collision suppresses a needed subscription; that service's replies silently dropped, calls time out | correctness | `676b4d5e1` |
+| 4 | §3.8 | SplitMix64's output finalizer is a public bijection — any callee receiving one call_id can invert it to the thread's PRNG state and predict every future call_id minted on that thread | security | `676b4d5e1` |
+| 5 | §2.4 | Session replacement (re-handshake) leaked the displaced session_id's reverse-index entry forever — unbounded growth, one entry per rotation | leak | `676b4d5e1` |
+| 6 | §4.5 | `index_payload_equivalent` omitted `hardware`, which feeds the `gpu:*` synthetic index tags — a GPU-shape-only refresh skipped the index dance and left `require_gpu` queries stale | stale data | `cf6b91162` |
+| 7 | §4.9 | Single-pass extraction flipped first-valid-wins to last-wins-even-if-malformed — a trailing `cpu_cores=garbage` duplicate clobbers a valid earlier value to `None` (permissive 1.0) | correctness | `cf6b91162` |
+| 8 | §5.1 | Pre-walk costed events by `payload_len` only — zero-length payloads (legal) cost 0 and never bind the budget, re-creating the unbounded leader read for zero/tiny-payload backlogs | perf regression | `cd13d9067` |
+| 9 | §6.7 | `sweep_gc` never popped the new handle cache (and its own pin-probe re-warmed it for the hashes being deleted) — a post-sweep re-store hit the stale idempotent path and silently skipped the append | **data loss** | `a3a37cbed` |
+| 10 | §5.6 | Burst-drain's end-of-stream arm returned without running the query — the burst's final state was never delivered when the producer's last append raced adapter teardown | lost event | `cd13d9067` |
+
+Smaller repairs in the same commits: §5.3's single-append dat
+write-failure path re-routed through the poisoning
+`rollback_truncate` (silent `set_len` failure permanently desynced
+the cached length → a later rollback would truncate valid tail
+bytes); §6.3's dedup compares the FIRST retained event so legacy
+duplicate-event layouts aren't spuriously rejected; §6.9's error
+path drains in-flight futures (first-error-wins + abort flag)
+instead of leaking `in_flight_stores` accounting; §2.12's
+lost-creation-race arm regained the config-conflict warning
+(`warn_if_config_conflicts` shared by both arms); §2.8's fallback
+now publishes the resolved node id — the landed tier-1 cache was
+only primed by the cortex RPC hook, so the fast path was dead for
+plain reliable streams; §4.7's equal-cost tie order restored to
+declaration order via a `(cost, index)` sort key.
+
+### Bench gap #1: recorded numbers invalidated
+
+`c1cff1271`'s multi-producer bench cloned ONE `RawEvent` template;
+`RawEvent` caches the xxh3 routing hash of its bytes, so every
+event from every producer routed to a single shard — the bench
+measured shard-mutex contention, not the §1.1 striped-counter layer
+it was written to expose (this also explains the suspicious 1→2
+producer throughput *drop* in that commit's message). Fixed in
+`14c40234b` (pool of 256 distinct templates, round-robined with
+per-thread stagger). **The baseline numbers recorded in
+`c1cff1271`'s commit message are not comparable to post-fix runs —
+re-baseline before drawing conclusions from this bench.**
+
+### External review-bot (cubic) findings — dispositions
+
+11 findings triaged. Four flagged bugs the review pass above had
+already fixed (the bot reviewed the pre-review diff): §4.1
+generation stamp, §3.5 hash collision, §4.5 hardware equivalence,
+§6.7 sweep-cache invalidation. The remainder:
+
+| Finding | Disposition | Commit |
+| ------- | ----------- | ------ |
+| §3.4 — stranded acked straggler can spuriously retransmit / fail the stream | By design; window pinned by test: spuriousness bounded to one RTO duplicate, never flags `failed`, reclaimed by the next covering cumulative ack | `101f0f6c7` |
+| §6.3 — same-length corrupted slot accepted at store time | By design (documented tradeoff); the fetch-time backstop is now proven by test — poisoned slot surfaces `HashMismatch` instead of serving corrupt bytes | `301d8220f` |
+| §4.7 — duplicated cost-ordering logic in `eval_all`/`eval_any` | Deduped into one `eval_in_cost_order(children, ctx, stop_on)`; vacuous-children semantics pinned | `1fd476002` |
+| §1.1 — slot-distribution test brittle (ThreadId hash distribution unguaranteed) | Replaced with deterministic per-slot accounting independence + sticky/in-bounds mapping tests; no statistical assumptions remain | `1a798c175` |
+| §2.8 — cached_node_id fast path never populated in the receive flow | True of the original commit; fixed in `676b4d5e1`; resolution extracted to `MeshNode::resolve_grant_peer` + self-priming/stale-session regression test | `a8617ca43` |
+| §5.7 — magic `20..24` checksum offset in the prebuilt-ingest paths | Centralized: `EVENT_META_CHECKSUM_RANGE` const + `EventMeta::patch_checksum`; all 5 layout-aware sites routed through; byte-identity pinned by the golden tests | `dd72de22b` |
+| §2.7 — cache-hit test assumes a 100-read burst beats the 1 ms window | Reuse/refresh decision extracted to pure `coarse_clock_advance`; 3 deterministic synthetic-instant tests replace the burst (hot path unchanged) | `636833609` |
+| §6.9 — `meta.len() as u32` wraps for > 4 GiB files, under-reserving the byte budget | Real bug — shared u64-domain `in_flight_byte_permits` helper for `store_dir` + `fetch_dir`; wrap case pinned by test | `c5649169b` |
+
+### CI gate fixes
+
+- `af7738979` — §4.1's `capability_set_cache` field cfg-gated on
+  `dataforts` along with its sole consumer (the greedy-observer
+  read in `process_data_packet`); non-dataforts feature combos
+  failed `-D warnings` with dead-code. Default-features-only
+  validation missed it — minimal-feature clippy
+  (`--no-default-features --features net`) belongs in the
+  validation checklist for changes to cfg-gated files.
+- `6331db9dc` — public `CapabilityIndexInner` docs intra-doc-linked
+  the private `BuildU64TupleHasher` (§4.6 commentary); failed
+  `rustdoc::private-intra-doc-links` under `-D warnings`. Link
+  demoted to plain code formatting; the hasher stays private.
+
+---
 
 **Headline conclusions:**
 

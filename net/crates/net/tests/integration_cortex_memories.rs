@@ -9,7 +9,9 @@
 
 use futures::StreamExt;
 use net::adapter::net::channel::ChannelName;
-use net::adapter::net::cortex::memories::{MemoriesAdapter, OrderBy, MEMORIES_CHANNEL};
+use net::adapter::net::cortex::memories::{
+    MemoriesAdapter, OrderBy, DISPATCH_MEMORY_STORED, MEMORIES_CHANNEL,
+};
 use net::adapter::net::cortex::{compute_checksum_with_meta, EventMeta, EVENT_META_SIZE};
 use net::adapter::net::redex::Redex;
 
@@ -1010,4 +1012,112 @@ async fn re_store_preserves_pinned_flag_and_created_ns() {
     assert_eq!(m.tags, vec!["updated".to_string()]);
     assert_eq!(m.source, "bob");
     assert_eq!(m.updated_ns, 200);
+}
+
+#[tokio::test]
+async fn test_watch_rapid_burst_delivers_final_state() {
+    // PERF_AUDIT §5.6 — the watcher coalesces bursty change ticks
+    // (opportunistic drain before re-query). Intermediate results
+    // may be skipped arbitrarily, but the FINAL state of the burst
+    // must always be delivered (eventual consistency of the last
+    // value). A regression that loses a tick during coalescing
+    // would leave the consumer stuck one state behind, which the
+    // timeout below converts into a test failure.
+    let redex = Redex::new();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
+
+    let mut stream = Box::pin(memories.watch().where_tag("burst").stream());
+    assert!(stream.next().await.unwrap().is_empty());
+
+    const N: u64 = 50;
+    let mut last = 0;
+    for id in 1..=N {
+        last = memories
+            .store(id, format!("m-{id}"), vec!["burst".into()], "alice", id)
+            .unwrap();
+    }
+    memories.wait_for_seq(last).await.unwrap();
+
+    let final_set = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let v = stream
+                .next()
+                .await
+                .expect("watch stream must not end while the adapter lives");
+            if v.len() == N as usize {
+                return v;
+            }
+        }
+    })
+    .await
+    .expect("watcher must deliver the burst's final state");
+
+    let mut ids: Vec<u64> = final_set.iter().map(|m| m.id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, (1..=N).collect::<Vec<u64>>());
+}
+
+#[tokio::test]
+async fn test_regression_single_buffer_ingest_matches_legacy_two_buffer_layout() {
+    // PERF_AUDIT §5.7 — `ingest_typed` now serializes postcard
+    // output directly into one buffer with the 24-byte EventMeta
+    // slot reserved at the head, patching the checksum in place.
+    // The on-disk bytes must be IDENTICAL to the legacy two-buffer
+    // construction (postcard::to_allocvec → EventMeta with stamped
+    // checksum → meta.to_bytes() ++ tail), or files written by the
+    // two code generations would diverge. This test rebuilds the
+    // legacy bytes by hand and compares.
+    let redex = Redex::new();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
+
+    let seq = memories
+        .store(
+            42,
+            "single-buffer layout pin",
+            vec!["t1".into(), "t2".into()],
+            "alice",
+            777,
+        )
+        .unwrap();
+    memories.wait_for_seq(seq).await.unwrap();
+
+    let file = redex
+        .open_file(
+            &ChannelName::new(MEMORIES_CHANNEL).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+    let events = file.read_range(0, 1);
+    assert_eq!(events.len(), 1);
+    let on_disk = &events[0].payload;
+
+    // Legacy reconstruction. `MemoryStoredPayload` is private, but
+    // postcard encodes a struct as the bare concatenation of its
+    // fields (no names, no framing), so a tuple with the same field
+    // sequence produces byte-identical output: (id: u64, content:
+    // String, tags: Vec<String>, source: String, now_ns: u64).
+    let tail = postcard::to_allocvec(&(
+        42u64,
+        "single-buffer layout pin",
+        vec!["t1".to_string(), "t2".to_string()],
+        "alice",
+        777u64,
+    ))
+    .unwrap();
+    // First ingest on a fresh channel stamps app_seq = 0; checksum
+    // is computed over (header-with-zero-checksum ++ tail), exactly
+    // as the legacy path did.
+    let mut meta = EventMeta::new(DISPATCH_MEMORY_STORED, 0, ORIGIN, 0, 0);
+    meta.checksum = compute_checksum_with_meta(&meta, &tail);
+    let mut expected = Vec::with_capacity(EVENT_META_SIZE + tail.len());
+    expected.extend_from_slice(&meta.to_bytes());
+    expected.extend_from_slice(&tail);
+
+    assert_eq!(
+        on_disk.as_ref(),
+        expected.as_slice(),
+        "single-buffer ingest must produce byte-identical records to \
+         the legacy two-buffer path (meta header at offset 0, checksum \
+         patched at 20..24, postcard tail at 24..)"
+    );
 }

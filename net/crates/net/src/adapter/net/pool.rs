@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use super::crypto::{session_prefix_from_id, PacketCipher};
 use super::protocol::{
-    EventFrame, NetHeader, PacketFlags, MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE, NONCE_SIZE,
+    EventFrame, NetHeader, PacketFlags, HEADER_SIZE, MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE, NONCE_SIZE,
     PAYLOAD_LEN_OFFSET,
 };
 
@@ -153,20 +153,35 @@ impl PacketBuilder {
             NetHeader::MAX_EVENTS_PER_PACKET,
         );
 
-        // Reset buffers (no allocation)
-        self.payload.clear();
+        // PERF_AUDIT §2.6 — frame events directly into the packet
+        // buffer at `HEADER_SIZE` offset (rather than into a
+        // separate `payload` scratch, then memcpy the full
+        // encrypted payload across after the header). Reserves
+        // HEADER_SIZE placeholder bytes up front so events land at
+        // their final wire offset; the header is patched into the
+        // placeholder after encryption supplies the nonce counter
+        // and final payload length. Eliminates one ~payload-sized
+        // memcpy per TX.
         self.packet.clear();
+        self.packet.resize(HEADER_SIZE, 0);
 
-        // Write event frames to payload buffer
-        EventFrame::write_events(events, &mut self.payload);
+        // Append event frames after the header placeholder. The
+        // payload-region length tracked below excludes HEADER_SIZE.
+        EventFrame::write_events(events, &mut self.packet);
+        let plaintext_len = self.packet.len() - HEADER_SIZE;
 
-        // Build and serialize header once (nonce is placeholder, will be patched)
+        // Build and serialize header once (nonce is placeholder,
+        // will be patched). The wire payload_len field stores the
+        // ciphertext-only length, which equals `plaintext_len` —
+        // the 16-byte tag isn't counted (see comment below). For
+        // the AAD-providing call, the plaintext length is the
+        // value used by both ends of the channel.
         let header = NetHeader::new(
             self.session_id,
             stream_id,
             sequence,
             [0u8; NONCE_SIZE],
-            self.payload.len() as u16,
+            plaintext_len as u16,
             events.len() as u16,
             flags,
         )
@@ -175,48 +190,52 @@ impl PacketBuilder {
         let aad = header.aad();
         let mut header_bytes = header.to_bytes();
 
-        // Encrypt payload in-place and get the counter used.
-        // ChaCha20-Poly1305 encryption cannot fail with valid inputs —
-        // an error here indicates memory corruption or a cipher library bug.
-        let counter = match self.cipher.encrypt_in_place(&aad, &mut self.payload) {
-            Ok(c) => c,
+        // Encrypt the in-place payload region. ChaCha20-Poly1305
+        // encryption cannot fail with valid inputs — an error
+        // here indicates memory corruption or a cipher library bug.
+        let (counter, tag) = match self
+            .cipher
+            .encrypt_in_place_detached(&aad, &mut self.packet[HEADER_SIZE..])
+        {
+            Ok(out) => out,
             Err(e) => panic!(
                 "BUG: ChaCha20-Poly1305 encryption failed (session={:016x}, payload_len={}): {}",
-                self.session_id,
-                self.payload.len(),
-                e
+                self.session_id, plaintext_len, e
             ),
         };
+        // Append the detached 16-byte auth tag in place — same
+        // wire shape as the prior path, just without the
+        // intermediate scratch buffer.
+        self.packet.extend_from_slice(&tag);
 
-        // Patch nonce into serialized header (bytes 12..24). The
-        // 4-byte prefix must be derived the same way the cipher does
-        // (`session_prefix_from_id`), otherwise the receiver will
-        // reconstruct a different nonce and AEAD verification fails.
+        // Patch nonce into the in-buffer header (bytes 12..24).
+        // The 4-byte prefix must be derived the same way the
+        // cipher does (`session_prefix_from_id`); a divergence
+        // would make the receiver reconstruct a different nonce
+        // and AEAD verification would fail.
         header_bytes[12..16].copy_from_slice(&session_prefix_from_id(self.session_id));
         header_bytes[16..24].copy_from_slice(&counter.to_le_bytes());
 
-        // Patch payload_len to exclude the 16-byte auth tag.
-        // The `as u16` cast is safe under current MAX_PAYLOAD_SIZE
-        // (8112 << u16::MAX), but a future config that raised the cap
-        // past `u16::MAX + 16` would silently truncate the wire
-        // length and the receiver would mis-frame. The
-        // debug_assert is a tripwire so the truncation surfaces in
-        // CI before it reaches production.
+        // Wire payload_len reflects ciphertext-without-tag (the
+        // tag is appended separately and the receiver computes
+        // `total - HEADER_SIZE - TAG_SIZE`). The `as u16` cast is
+        // safe under current MAX_PAYLOAD_SIZE (8112 << u16::MAX);
+        // a future config raising the cap past u16::MAX would
+        // silently truncate this field.
         debug_assert!(
-            self.payload.len() - 16 <= u16::MAX as usize,
+            plaintext_len <= u16::MAX as usize,
             "payload length {} would truncate the u16 wire field; \
-             revisit MAX_PAYLOAD_SIZE before raising the cap past u16::MAX + 16",
-            self.payload.len() - 16,
+             revisit MAX_PAYLOAD_SIZE before raising the cap past u16::MAX",
+            plaintext_len,
         );
-        let payload_len = (self.payload.len() - 16) as u16;
+        let payload_len = plaintext_len as u16;
         header_bytes[PAYLOAD_LEN_OFFSET..PAYLOAD_LEN_OFFSET + 2]
             .copy_from_slice(&payload_len.to_le_bytes());
 
-        // Assemble packet: header + encrypted_payload + tag
-        self.packet.extend_from_slice(&header_bytes);
-        self.packet.extend_from_slice(&self.payload);
+        // Splice the final header bytes into the placeholder.
+        self.packet[..HEADER_SIZE].copy_from_slice(&header_bytes);
 
-        // split() transfers ownership without atomic ref-count bump
+        // split() transfers ownership without atomic ref-count bump.
         self.packet.split().freeze()
     }
 
@@ -246,17 +265,20 @@ impl PacketBuilder {
             NetHeader::MAX_EVENTS_PER_PACKET,
         );
 
-        self.payload.clear();
+        // PERF_AUDIT §2.6 — same in-place framing pattern as
+        // `build()`. See that method for the full rationale.
         self.packet.clear();
+        self.packet.resize(HEADER_SIZE, 0);
 
-        EventFrame::write_events(events, &mut self.payload);
+        EventFrame::write_events(events, &mut self.packet);
+        let plaintext_len = self.packet.len() - HEADER_SIZE;
 
         let header = NetHeader::new(
             self.session_id,
             stream_id,
             sequence,
             [0u8; NONCE_SIZE],
-            self.payload.len() as u16,
+            plaintext_len as u16,
             events.len() as u16,
             flags,
         )
@@ -266,31 +288,31 @@ impl PacketBuilder {
         let aad = header.aad();
         let mut header_bytes = header.to_bytes();
 
-        let counter = match self.cipher.encrypt_in_place(&aad, &mut self.payload) {
-            Ok(c) => c,
+        let (counter, tag) = match self
+            .cipher
+            .encrypt_in_place_detached(&aad, &mut self.packet[HEADER_SIZE..])
+        {
+            Ok(out) => out,
             Err(e) => panic!(
                 "BUG: ChaCha20-Poly1305 encryption failed (session={:016x}): {}",
                 self.session_id, e
             ),
         };
+        self.packet.extend_from_slice(&tag);
 
         header_bytes[12..16].copy_from_slice(&session_prefix_from_id(self.session_id));
         header_bytes[16..24].copy_from_slice(&counter.to_le_bytes());
-        // See `build()` for why this debug_assert exists. Same
-        // safety argument: `as u16` truncates if MAX_PAYLOAD_SIZE
-        // is ever raised past u16::MAX + 16.
         debug_assert!(
-            self.payload.len() - 16 <= u16::MAX as usize,
+            plaintext_len <= u16::MAX as usize,
             "payload length {} would truncate the u16 wire field; \
-             revisit MAX_PAYLOAD_SIZE before raising the cap past u16::MAX + 16",
-            self.payload.len() - 16,
+             revisit MAX_PAYLOAD_SIZE before raising the cap past u16::MAX",
+            plaintext_len,
         );
-        let payload_len = (self.payload.len() - 16) as u16;
+        let payload_len = plaintext_len as u16;
         header_bytes[PAYLOAD_LEN_OFFSET..PAYLOAD_LEN_OFFSET + 2]
             .copy_from_slice(&payload_len.to_le_bytes());
 
-        self.packet.extend_from_slice(&header_bytes);
-        self.packet.extend_from_slice(&self.payload);
+        self.packet[..HEADER_SIZE].copy_from_slice(&header_bytes);
         self.packet.split().freeze()
     }
 
@@ -1645,5 +1667,175 @@ mod tests {
             .collect();
         // No panic — boundary inclusive.
         let _ = builder.build(0, 1, &cap_events, PacketFlags::NONE);
+    }
+
+    /// PERF_AUDIT §2.6 regression: the in-place framing rewrite
+    /// must preserve the wire shape and AEAD seal exactly. We
+    /// build a packet via the new path, parse the header out, then
+    /// decrypt the in-place payload region with the matching
+    /// receiver-side cipher. Any drift between encryption AAD,
+    /// nonce derivation, or wire-format byte layout would surface
+    /// as a failed decrypt or a length mismatch.
+    #[test]
+    fn build_roundtrips_through_decrypt_with_in_place_framing() {
+        let key = [0x42u8; 32];
+        let session_id = 0xDEAD_BEEF_F00D_CAFE_u64;
+        let pool = ThreadLocalPool::new(2, &key, session_id);
+        let mut builder = pool.get();
+
+        let events: Vec<Bytes> = vec![
+            Bytes::from_static(b"first-event-AAAAA"),
+            Bytes::from_static(b"second-event-BBBBBBBBB"),
+            Bytes::from_static(b"third-CCC"),
+        ];
+        let stream_id = 0x1234u64;
+        let sequence = 0x5678u64;
+        let pkt = builder.build(stream_id, sequence, &events, PacketFlags::NONE);
+
+        let header = NetHeader::from_bytes(&pkt[..HEADER_SIZE])
+            .expect("header must parse from the in-place-framed packet");
+        assert_eq!(header.stream_id, stream_id, "stream_id survives framing");
+        assert_eq!(header.sequence, sequence, "sequence survives framing");
+        assert_eq!(header.session_id, session_id, "session_id survives framing");
+        assert_eq!(
+            header.event_count as usize,
+            events.len(),
+            "event_count must match"
+        );
+
+        let payload_len = header.payload_len as usize;
+        let total_expected = HEADER_SIZE + payload_len + 16;
+        assert_eq!(
+            pkt.len(),
+            total_expected,
+            "wire layout must be [HEADER {HEADER_SIZE}][CIPHERTEXT {payload_len}][TAG 16] — \
+             a stray copy or off-by-one would change the total length"
+        );
+
+        // The receiver verifies the tag against the same AAD the
+        // sender used. `decrypt_in_place` consumes (ciphertext +
+        // tag) as one buffer and returns the plaintext length.
+        let rx_cipher = PacketCipher::new(&key, session_id);
+        let nonce_counter = u64::from_le_bytes(pkt[16..24].try_into().unwrap());
+        let aad = header.aad();
+        let mut buf = bytes::BytesMut::from(&pkt[HEADER_SIZE..]);
+        let plaintext_len = rx_cipher
+            .decrypt_in_place(nonce_counter, &aad, &mut buf[..])
+            .expect(
+                "AEAD decrypt must succeed — any AAD drift between sender and \
+                     receiver would surface here",
+            );
+        assert_eq!(
+            plaintext_len, payload_len,
+            "decrypted plaintext length must match the wire payload_len"
+        );
+
+        // Frames round-trip — same events in same order.
+        let recovered =
+            EventFrame::read_events(buf.split_to(plaintext_len).freeze(), header.event_count);
+        assert_eq!(recovered.len(), events.len());
+        for (i, (got, expected)) in recovered.iter().zip(events.iter()).enumerate() {
+            assert_eq!(got, expected, "event {i} must round-trip exactly");
+        }
+    }
+
+    /// PERF_AUDIT §2.6 regression: same property for
+    /// `build_subprotocol`. The subprotocol_id rides in the
+    /// header's AAD, so any drift there fails AEAD verification
+    /// rather than silently passing through.
+    #[test]
+    fn build_subprotocol_roundtrips_through_decrypt_with_in_place_framing() {
+        let key = [0x99u8; 32];
+        let session_id = 0xC0FFEE_BABE_u64;
+        let pool = ThreadLocalPool::new(2, &key, session_id);
+        let mut builder = pool.get();
+
+        let events: Vec<Bytes> = vec![
+            Bytes::from_static(b"sub-event-1"),
+            Bytes::from_static(b"sub-event-2-longer"),
+        ];
+        let pkt = builder.build_subprotocol(0xAAAA, 0xBBBB, &events, PacketFlags::NONE, 0x33);
+        let header = NetHeader::from_bytes(&pkt[..HEADER_SIZE]).expect("subprotocol header parses");
+        assert_eq!(header.subprotocol_id, 0x33, "subprotocol_id must survive");
+
+        let rx_cipher = PacketCipher::new(&key, session_id);
+        let nonce_counter = u64::from_le_bytes(pkt[16..24].try_into().unwrap());
+        let aad = header.aad();
+        let mut buf = bytes::BytesMut::from(&pkt[HEADER_SIZE..]);
+        let plaintext_len = rx_cipher
+            .decrypt_in_place(nonce_counter, &aad, &mut buf[..])
+            .expect("subprotocol decrypt must succeed");
+        let recovered =
+            EventFrame::read_events(buf.split_to(plaintext_len).freeze(), header.event_count);
+        assert_eq!(recovered, events, "subprotocol events round-trip");
+    }
+
+    /// PERF_AUDIT §2.6 regression: `build()` hands the packet
+    /// allocation away via `split().freeze()`, so the next build
+    /// reuses (or re-grows) `self.packet` while the previous
+    /// packet's `Bytes` is still alive — the path where BytesMut
+    /// cannot reclaim and must reallocate. An offset bug in the
+    /// in-place framing (header placeholder, payload sub-slice,
+    /// tag append) would corrupt the second or third packet, not
+    /// the first. Build three back-to-back, keep all alive,
+    /// decrypt all three.
+    #[test]
+    fn build_reuses_buffer_across_packets_while_previous_alive() {
+        let key = [0x07u8; 32];
+        let session_id = 0x0123_4567_89AB_CDEF_u64;
+        let pool = ThreadLocalPool::new(2, &key, session_id);
+        let mut builder = pool.get();
+        let rx_cipher = PacketCipher::new(&key, session_id);
+
+        let payloads: [&[u8]; 3] = [
+            b"packet-one-payload",
+            b"packet-two-payload-which-is-a-bit-longer",
+            b"p3",
+        ];
+        // Keep every packet alive across subsequent builds.
+        let packets: Vec<Bytes> = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let events = vec![Bytes::copy_from_slice(p)];
+                builder.build(7, i as u64, &events, PacketFlags::NONE)
+            })
+            .collect();
+
+        let mut prev_counter: Option<u64> = None;
+        for (i, pkt) in packets.iter().enumerate() {
+            let header = NetHeader::from_bytes(&pkt[..HEADER_SIZE])
+                .unwrap_or_else(|| panic!("packet {i} header must parse"));
+            assert_eq!(header.sequence, i as u64, "packet {i} sequence");
+            assert_eq!(
+                pkt.len(),
+                HEADER_SIZE + header.payload_len as usize + 16,
+                "packet {i} wire layout"
+            );
+
+            let nonce_counter = u64::from_le_bytes(pkt[16..24].try_into().unwrap());
+            if let Some(prev) = prev_counter {
+                assert!(
+                    nonce_counter > prev,
+                    "nonce counter must be strictly increasing across reused builds \
+                     (packet {i}: {nonce_counter} <= {prev})"
+                );
+            }
+            prev_counter = Some(nonce_counter);
+
+            let aad = header.aad();
+            let mut buf = bytes::BytesMut::from(&pkt[HEADER_SIZE..]);
+            let plaintext_len = rx_cipher
+                .decrypt_in_place(nonce_counter, &aad, &mut buf[..])
+                .unwrap_or_else(|e| panic!("packet {i} must decrypt after buffer reuse: {e}"));
+            let recovered =
+                EventFrame::read_events(buf.split_to(plaintext_len).freeze(), header.event_count);
+            assert_eq!(recovered.len(), 1, "packet {i} event count");
+            assert_eq!(
+                recovered[0].as_ref(),
+                payloads[i],
+                "packet {i} payload must round-trip despite the handed-off allocation"
+            );
+        }
     }
 }

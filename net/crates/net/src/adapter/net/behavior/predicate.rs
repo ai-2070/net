@@ -1306,10 +1306,72 @@ impl Predicate {
     }
 
     /// `And` short-circuit evaluation in cost-ascending child order.
+    ///
+    /// PERF_AUDIT §4.7 — pre-fix this allocated a fresh
+    /// `Vec<usize>` per evaluation and called
+    /// `sort_by_key(|&i| children[i].static_cost())`, which
+    /// re-runs `static_cost()` on each comparison;
+    /// `static_cost()` itself recurses through the subtree, so
+    /// for an N-child And node every row paid
+    /// O(N · subtree_size · log N) just to plan the walk. With
+    /// the fixed predicates `find_nodes_matching` evaluates per
+    /// row, that work is invariant — we want to do it once.
+    ///
+    /// The change: precompute each child's `(index, cost)` into a
+    /// small stack array (common case ≤ 8 children — well within
+    /// the structural cap callers honor), sort the precomputed
+    /// tuples, then walk. Cost computation runs exactly once per
+    /// child per evaluation (vs O(log N) times under the prior
+    /// `sort_by_key` shape). For deeper And nodes we still
+    /// allocate, but the typical case avoids both the Vec alloc
+    /// and the redundant cost recompute.
     fn eval_all_in_cost_order(children: &[Predicate], ctx: &EvalContext<'_>) -> bool {
-        let mut order: Vec<usize> = (0..children.len()).collect();
-        order.sort_by_key(|&i| children[i].static_cost());
-        order.into_iter().all(|i| children[i].evaluate(ctx))
+        // First false wins; vacuously true — `.all()` semantics.
+        Self::eval_in_cost_order(children, ctx, false)
+    }
+
+    /// Shared planner core for the And/Or cost-ordered walks.
+    /// Walks `children` cheapest-first; the first child that
+    /// evaluates to `stop_on` short-circuits and returns
+    /// `stop_on`; if none does, returns `!stop_on`. And-semantics
+    /// = `stop_on == false` (first false wins, vacuously true);
+    /// Or-semantics = `stop_on == true` (first true wins,
+    /// vacuously false).
+    ///
+    /// Sort key is `(cost, index)` — the index tiebreak keeps
+    /// equal-cost children in declaration order, matching the
+    /// pre-§4.7 STABLE `sort_by_key` exactly (an unstable sort
+    /// on cost alone would reorder ties). Evaluation is pure so
+    /// results can't differ, but the deterministic walk order
+    /// keeps timing/short-circuit behavior reproducible.
+    fn eval_in_cost_order(children: &[Predicate], ctx: &EvalContext<'_>, stop_on: bool) -> bool {
+        const STACK_CAP: usize = 8;
+        if children.len() <= STACK_CAP {
+            let mut tuples: [(usize, u32); STACK_CAP] = [(0, 0); STACK_CAP];
+            for (i, child) in children.iter().enumerate() {
+                tuples[i] = (i, child.static_cost());
+            }
+            tuples[..children.len()].sort_unstable_by_key(|&(i, c)| (c, i));
+            for &(i, _) in &tuples[..children.len()] {
+                if children[i].evaluate(ctx) == stop_on {
+                    return stop_on;
+                }
+            }
+            !stop_on
+        } else {
+            let mut tuples: Vec<(usize, u32)> = children
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (i, c.static_cost()))
+                .collect();
+            tuples.sort_unstable_by_key(|&(i, c)| (c, i));
+            for &(i, _) in &tuples {
+                if children[i].evaluate(ctx) == stop_on {
+                    return stop_on;
+                }
+            }
+            !stop_on
+        }
     }
 
     /// `Or` short-circuit evaluation in cost-ascending child order.
@@ -1324,10 +1386,13 @@ impl Predicate {
     /// planner has no per-clause trueness signal, so it falls
     /// back to ordering by raw evaluation work — neutral between
     /// And and Or, which is the best we can do here.
+    ///
+    /// PERF_AUDIT §4.7 — same precomputed-tuple walk as
+    /// `eval_all_in_cost_order`; both delegate to
+    /// [`Self::eval_in_cost_order`].
     fn eval_any_in_cost_order(children: &[Predicate], ctx: &EvalContext<'_>) -> bool {
-        let mut order: Vec<usize> = (0..children.len()).collect();
-        order.sort_by_key(|&i| children[i].static_cost());
-        order.into_iter().any(|i| children[i].evaluate(ctx))
+        // First true wins; vacuously false — `.any()` semantics.
+        Self::eval_in_cost_order(children, ctx, true)
     }
 
     /// Static cost estimate for the planner. Lower = cheaper to
@@ -2581,6 +2646,80 @@ mod tests {
         assert!(Predicate::And(vec![]).evaluate_unplanned(&cx));
         assert!(!Predicate::Or(vec![]).evaluate_unplanned(&cx));
     }
+    /// PERF_AUDIT §4.7 — the planner's stack-array fast path
+    /// covers ≤ 8 children; And/Or nodes past that capacity must
+    /// spill to the heap path with identical semantics. The
+    /// verdict-deciding clause sits PAST index 8 in every case, so
+    /// a planner that silently truncated at the stack capacity
+    /// (instead of spilling) would flip each assertion.
+    #[test]
+    fn planner_over_stack_capacity_spills_to_heap_and_matches_unplanned() {
+        let n = 12usize;
+        // And: clause i requires metadata key "k{i}".
+        let and_ast = Predicate::And(
+            (0..n)
+                .map(|i| Predicate::MetadataExists {
+                    key: format!("k{i}"),
+                })
+                .collect(),
+        );
+        // Or: clause i matches metadata value "v{i}" under "sel".
+        let or_ast = Predicate::Or(
+            (0..n)
+                .map(|i| Predicate::MetadataEquals {
+                    key: "sel".into(),
+                    value: format!("v{i}"),
+                })
+                .collect(),
+        );
+
+        // All 12 keys present → And true.
+        let mut all = BTreeMap::new();
+        for i in 0..n {
+            all.insert(format!("k{i}"), "1".to_string());
+        }
+        let cx_all = ctx(&[], &all);
+        assert!(and_ast.evaluate(&cx_all));
+        assert!(and_ast.evaluate_unplanned(&cx_all));
+
+        // k11 — a clause past the stack capacity — missing → And
+        // false. Truncation at 8 children would return true.
+        let mut missing_tail = all.clone();
+        missing_tail.remove("k11");
+        let cx_missing = ctx(&[], &missing_tail);
+        assert!(!and_ast.evaluate(&cx_missing));
+        assert!(!and_ast.evaluate_unplanned(&cx_missing));
+
+        // Or: only the 12th alternative matches → true.
+        // Truncation at 8 children would return false.
+        let only_last = meta_with(&[("sel", "v11")]);
+        let cx_last = ctx(&[], &only_last);
+        assert!(or_ast.evaluate(&cx_last));
+        assert!(or_ast.evaluate_unplanned(&cx_last));
+
+        // No alternative matches → Or false.
+        let none = meta_with(&[("sel", "nope")]);
+        let cx_none = ctx(&[], &none);
+        assert!(!or_ast.evaluate(&cx_none));
+        assert!(!or_ast.evaluate_unplanned(&cx_none));
+    }
+
+    /// Vacuous-children semantics through the shared cost-order
+    /// walk: `And([])` is true and `Or([])` is false (`.all()` /
+    /// `.any()` semantics). Pins the `!stop_on` fall-through in
+    /// `eval_in_cost_order` now that both composite arms route
+    /// through one helper — a sign flip there would invert every
+    /// empty composite while leaving non-empty cases green.
+    #[test]
+    fn and_or_empty_children_are_vacuously_true_and_false() {
+        let empty_meta = BTreeMap::new();
+        let cx = ctx(&[], &empty_meta);
+        assert!(Predicate::And(vec![]).evaluate(&cx));
+        assert!(Predicate::And(vec![]).evaluate_unplanned(&cx));
+        assert!(!Predicate::Or(vec![]).evaluate(&cx));
+        assert!(!Predicate::Or(vec![]).evaluate_unplanned(&cx));
+    }
+
     /// Exhaustive small-input parity: enumerate a handful of small
     /// `(ast, ctx)` combinations and assert planned = unplanned.
     /// Phase 4 doesn't ship full property-based fuzzing

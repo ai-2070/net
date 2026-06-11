@@ -241,6 +241,28 @@ pub trait FoldIndex<K: FoldKind>: Send + Sync {
     /// [`super::Fold::restore`] before re-populating from a
     /// snapshot.
     fn clear(&mut self);
+
+    /// Returns `true` when the two payloads index identically —
+    /// i.e. [`Self::on_remove`] + [`Self::on_insert`] against
+    /// these two payloads would net to a no-op on every
+    /// dimension this index maintains.
+    ///
+    /// The runtime's `MergeAction::Replace` arm consults this
+    /// before paying the index churn: when an announcement
+    /// refreshes generation/TTL without changing the tags /
+    /// region / state the index keys on (the steady-state
+    /// republish case), the index dance is pure waste. Per
+    /// PERF_AUDIT §4.5 — pre-fix the refresh always re-walked
+    /// every tag bucket, re-derived synthetic indexes, and
+    /// re-allocated the `entry().or_default()` HashSets even
+    /// when nothing changed, all under the writer lock.
+    ///
+    /// Default `false` keeps the safe pre-fix behavior for
+    /// indexes that don't implement a content-aware equality
+    /// check.
+    fn index_payload_equivalent(_old: &K::Payload, _new: &K::Payload) -> bool {
+        false
+    }
 }
 
 /// Default no-op secondary index. Folds that don't need a

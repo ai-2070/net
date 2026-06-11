@@ -371,7 +371,31 @@ struct RpcResponseJob {
     call_id: u64,
     target_hint: Option<u64>,
     reply_channel: ChannelName,
+    /// PERF_AUDIT §3.10 — cached
+    /// `ChannelId::new(reply_channel).hash()`, populated by the
+    /// emit closure's `reply_channel_cache` lookup. Pre-fix the
+    /// drainer re-ran xxh3 over the channel name per response;
+    /// the same `OriginKeyedLru` now caches the triple so a
+    /// cache hit is one Arc bump + two `u64` copies.
+    reply_channel_hash: ChannelHash,
+    /// PERF_AUDIT §3.10 — cached
+    /// `MeshNode::publish_stream_id(&reply_channel_id)`.
+    reply_stream_id: u64,
     payload: Bytes,
+}
+
+/// Cached triple `(ChannelName, ChannelHash, stream_id)` for the
+/// per-caller reply channel. Stored in the per-`serve_rpc`
+/// `OriginKeyedLru` so each subsequent response to the same
+/// caller is one Arc bump on the name + two `u64` copies — no
+/// xxh3, no `publish_stream_id`.
+///
+/// Per PERF_AUDIT §3.10.
+#[derive(Clone)]
+struct CachedReplyChannel {
+    name: ChannelName,
+    hash: ChannelHash,
+    stream_id: u64,
 }
 
 // ============================================================================
@@ -391,6 +415,15 @@ pub struct RpcStream {
     mesh: Arc<MeshNode>,
     target_node_id: u64,
     request_channel: ChannelName,
+    /// Cached `ChannelId::new(request_channel).hash()`. Pre-fix
+    /// `spawn_grant_publish` re-ran xxh3 over the channel name on
+    /// every auto/explicit grant — per PERF_AUDIT §3.10 the value
+    /// is invariant for the stream's lifetime, so we cache it once
+    /// at construction.
+    request_channel_hash: ChannelHash,
+    /// Cached `MeshNode::publish_stream_id(&request_channel_id)`.
+    /// Same reasoning as `request_channel_hash`.
+    request_stream_id: u64,
     self_origin: u64,
     call_id: u64,
     inner: tokio::sync::mpsc::UnboundedReceiver<StreamItem>,
@@ -398,11 +431,19 @@ pub struct RpcStream {
     /// error). Subsequent polls return `None`.
     done: bool,
     /// `Some(_)` if this stream uses flow control (caller set
-    /// `CallOptions::stream_window_initial`). Auto-grant emits 1
-    /// credit per delivered chunk, which keeps the server's
-    /// credit at roughly the initial window. `None` → no flow
-    /// control; `poll_next` does not emit grants.
+    /// `CallOptions::stream_window_initial`). Auto-grant
+    /// accumulates 1 credit per delivered chunk and fires one
+    /// batched `spawn_grant_publish` once the accumulator reaches
+    /// `window / 2` (or 1 for tiny windows). Keeps the server's
+    /// pump fed at roughly the configured rate without the per-
+    /// chunk spawn-storm + AEAD-storm the pre-fix path produced.
+    /// `None` → no flow control; `poll_next` does not emit grants.
+    /// Per PERF_AUDIT_2026_06_10_FULL_CRATE.md §3.3.
     stream_window: Option<u32>,
+    /// Auto-grant accumulator: chunks delivered since the last
+    /// emitted grant. Flushed at the `window / 2` threshold (see
+    /// the doc on [`Self::stream_window`]).
+    grant_pending: u32,
     /// Observer-fire bookkeeping. Latched on terminal observation
     /// in `poll_next`; fired once from `Drop` so the Deck NRPC
     /// tab + every other `RpcObserver` consumer sees one event
@@ -450,11 +491,42 @@ impl RpcStream {
         spawn_grant_publish(
             Arc::clone(&self.mesh),
             self.target_node_id,
-            self.request_channel.clone(),
+            self.request_channel_hash,
+            self.request_stream_id,
             self.self_origin,
             self.call_id,
             amount,
         );
+    }
+}
+
+/// PERF_AUDIT §3.3 — auto-grant coalescing decision for
+/// [`RpcStream::poll_next`]. Accumulates one credit (the chunk
+/// that was just delivered to the consumer) into `pending` and
+/// returns `Some(amount)` when the accumulator reaches the flush
+/// threshold of `window / 2` (clamped to ≥ 1 so a window of 1
+/// degenerates to the pre-fix per-chunk cadence).
+///
+/// Liveness invariant (why no flush-on-drop / timer backstop is
+/// needed): the credits left pending never exceed
+/// `threshold - 1 < window`. The server starts with `window`
+/// credits and `credits = window - (sent - delivered) - pending`,
+/// so whenever the consumer has polled everything that was sent
+/// (the only state in which it could block waiting on the server),
+/// `credits = window - pending >= window - threshold + 1 >= 1` —
+/// the server can always make progress. A consumer that stops
+/// polling stalls the pump by design (that's flow control), and
+/// the chunks already buffered in the stream's mpsc are enough to
+/// carry `pending` across the threshold as soon as it resumes.
+fn accumulate_auto_grant(pending: &mut u32, window: u32) -> Option<u32> {
+    *pending = pending.saturating_add(1);
+    let threshold = (window / 2).max(1);
+    if *pending >= threshold {
+        let amount = *pending;
+        *pending = 0;
+        Some(amount)
+    } else {
+        None
     }
 }
 
@@ -463,19 +535,22 @@ impl RpcStream {
 /// [`RpcStream::poll_next`]. Same direct-unicast publish path as
 /// [`spawn_cancel_publish`], just with a different dispatch byte
 /// + a 4-byte u32 payload.
+///
+/// PERF_AUDIT §3.10 — takes `request_channel_hash` and
+/// `request_stream_id` as pre-computed inputs (cached on
+/// `RpcStream`) so the per-chunk grant path doesn't re-run
+/// `ChannelId::new` + xxh3 on every call.
 fn spawn_grant_publish(
     mesh: Arc<MeshNode>,
     target: u64,
-    request_channel: ChannelName,
+    request_channel_hash: ChannelHash,
+    request_stream_id: u64,
     self_origin: u64,
     call_id: u64,
     amount: u32,
 ) {
     tokio::spawn(async move {
         let meta = EventMeta::new(DISPATCH_RPC_STREAM_GRANT, 0, self_origin, call_id, 0);
-        let request_channel_id = ChannelId::new(request_channel);
-        let request_channel_hash = request_channel_id.hash();
-        let stream_id = MeshNode::publish_stream_id(&request_channel_id);
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + 4);
         buf.extend_from_slice(&meta.to_bytes());
         buf.extend_from_slice(&encode_stream_grant(amount));
@@ -484,7 +559,7 @@ fn spawn_grant_publish(
             .publish_to_peer(
                 target,
                 request_channel_hash,
-                stream_id,
+                request_stream_id,
                 /* reliable */ true,
                 std::slice::from_ref(&payload),
             )
@@ -504,22 +579,31 @@ impl futures::Stream for RpcStream {
         }
         match self.inner.poll_recv(cx) {
             std::task::Poll::Ready(Some(StreamItem::Chunk(body))) => {
-                // Auto-grant 1 credit per delivered chunk so the
-                // server's pump stays at roughly the initial
-                // window. No-op when the stream isn't flow-
-                // controlled. For batched cadence, callers can
-                // skip auto-grant by NOT setting
-                // `stream_window_initial` and using `RpcStream::grant`
-                // directly with their preferred batching.
-                if self.stream_window.is_some() {
-                    spawn_grant_publish(
-                        Arc::clone(&self.mesh),
-                        self.target_node_id,
-                        self.request_channel.clone(),
-                        self.self_origin,
-                        self.call_id,
-                        1,
-                    );
+                // Auto-grant: accumulate 1 credit per delivered
+                // chunk and fire a batched `spawn_grant_publish`
+                // only when the accumulator reaches `window / 2`
+                // (or 1 for tiny windows). Per PERF_AUDIT §3.3 —
+                // pre-fix this spawned one task + one reliable
+                // AEAD packet per chunk, a spawn-storm + AEAD-
+                // storm under bursting; the server side already
+                // fixed the identical shape via
+                // `build_request_grant_emitter` (§3.3 audit text).
+                // Callers needing finer cadence still have
+                // `RpcStream::grant` for explicit batches.
+                if let Some(window) = self.stream_window {
+                    let mut pending = self.grant_pending;
+                    if let Some(amount) = accumulate_auto_grant(&mut pending, window) {
+                        spawn_grant_publish(
+                            Arc::clone(&self.mesh),
+                            self.target_node_id,
+                            self.request_channel_hash,
+                            self.request_stream_id,
+                            self.self_origin,
+                            self.call_id,
+                            amount,
+                        );
+                    }
+                    self.grant_pending = pending;
                 }
                 self.observer.add_response_bytes(body.len() as u32);
                 std::task::Poll::Ready(Some(Ok(body)))
@@ -575,10 +659,15 @@ impl Drop for RpcStream {
 /// Shared REQUEST_CHUNK-publish helper. Builds the wire frame and
 /// fires through `publish_to_peer` direct-unicast (same routing
 /// pattern as the initial REQUEST — caller knows the target).
+/// PERF_AUDIT §3.10 — accepts pre-computed
+/// `request_channel_hash` and `request_stream_id` (cached on
+/// `ClientStreamCallRaw`) so the per-chunk client-stream send path
+/// doesn't re-run `ChannelId::new` + xxh3 on every chunk.
 async fn publish_request_chunk(
     mesh: &Arc<MeshNode>,
     target: u64,
-    request_channel: &ChannelName,
+    request_channel_hash: ChannelHash,
+    request_stream_id: u64,
     self_origin: u64,
     chunk: &RpcRequestChunkPayload,
 ) -> Result<(), RpcError> {
@@ -586,14 +675,11 @@ async fn publish_request_chunk(
     let mut buf = Vec::with_capacity(EVENT_META_SIZE + chunk.encoded_len());
     buf.extend_from_slice(&meta.to_bytes());
     chunk.encode_into(&mut buf);
-    let request_channel_id = ChannelId::new(request_channel.clone());
-    let request_channel_hash = request_channel_id.hash();
-    let stream_id = MeshNode::publish_stream_id(&request_channel_id);
     let payload = Bytes::from(buf);
     mesh.publish_to_peer(
         target,
         request_channel_hash,
-        stream_id,
+        request_stream_id,
         /* reliable */ true,
         std::slice::from_ref(&payload),
     )
@@ -653,6 +739,12 @@ pub struct ClientStreamCallRaw {
     mesh: Arc<MeshNode>,
     target_node_id: u64,
     request_channel: ChannelName,
+    /// PERF_AUDIT §3.10 — cached `ChannelId::new(request_channel).hash()`
+    /// so per-chunk REQUEST_CHUNK publishes don't re-run xxh3.
+    request_channel_hash: ChannelHash,
+    /// PERF_AUDIT §3.10 — cached
+    /// `MeshNode::publish_stream_id(&request_channel_id)`.
+    request_stream_id: u64,
     self_origin: u64,
     call_id: u64,
     service: String,
@@ -754,7 +846,8 @@ impl ClientStreamCallRaw {
                 publish_request_chunk(
                     &self.mesh,
                     self.target_node_id,
-                    &self.request_channel,
+                    self.request_channel_hash,
+                    self.request_stream_id,
                     self.self_origin,
                     &chunk,
                 )
@@ -796,7 +889,8 @@ impl ClientStreamCallRaw {
                 publish_request_chunk(
                     &self.mesh,
                     self.target_node_id,
-                    &self.request_channel,
+                    self.request_channel_hash,
+                    self.request_stream_id,
                     self.self_origin,
                     &chunk,
                 )
@@ -880,15 +974,14 @@ impl ClientStreamCallRaw {
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + req.encoded_len());
         buf.extend_from_slice(&meta.to_bytes());
         req.encode_into(&mut buf);
-        let request_channel_id = ChannelId::new(self.request_channel.clone());
-        let request_channel_hash = request_channel_id.hash();
-        let stream_id = MeshNode::publish_stream_id(&request_channel_id);
         let payload = Bytes::from(buf);
+        // PERF_AUDIT §3.10 — use the cached hash + stream_id from
+        // construction; no per-publish `ChannelId::new` + xxh3.
         self.mesh
             .publish_to_peer(
                 self.target_node_id,
-                request_channel_hash,
-                stream_id,
+                self.request_channel_hash,
+                self.request_stream_id,
                 /* reliable */ true,
                 std::slice::from_ref(&payload),
             )
@@ -941,6 +1034,11 @@ struct DuplexInner {
     mesh: Arc<MeshNode>,
     target_node_id: u64,
     request_channel: ChannelName,
+    /// PERF_AUDIT §3.10 — cached channel-id hash + stream id so
+    /// per-chunk publishes from the upload side don't re-run
+    /// `ChannelId::new` + xxh3.
+    request_channel_hash: ChannelHash,
+    request_stream_id: u64,
     self_origin: u64,
     call_id: u64,
     /// Whether the initial REQUEST was successfully published.
@@ -1050,7 +1148,8 @@ impl DuplexSink {
                 publish_request_chunk(
                     &self.inner.mesh,
                     self.inner.target_node_id,
-                    &self.inner.request_channel,
+                    self.inner.request_channel_hash,
+                    self.inner.request_stream_id,
                     self.inner.self_origin,
                     &chunk,
                 )
@@ -1087,7 +1186,8 @@ impl DuplexSink {
                 publish_request_chunk(
                     &self.inner.mesh,
                     self.inner.target_node_id,
-                    &self.inner.request_channel,
+                    self.inner.request_channel_hash,
+                    self.inner.request_stream_id,
                     self.inner.self_origin,
                     &chunk,
                 )
@@ -1126,16 +1226,15 @@ impl DuplexSink {
         let mut buf = Vec::with_capacity(EVENT_META_SIZE + req.encoded_len());
         buf.extend_from_slice(&meta.to_bytes());
         req.encode_into(&mut buf);
-        let request_channel_id = ChannelId::new(self.inner.request_channel.clone());
-        let request_channel_hash = request_channel_id.hash();
-        let stream_id = MeshNode::publish_stream_id(&request_channel_id);
         let payload = Bytes::from(buf);
+        // PERF_AUDIT §3.10 — cached hash + stream_id from the
+        // inner `ClientStreamCallRaw`.
         self.inner
             .mesh
             .publish_to_peer(
                 self.inner.target_node_id,
-                request_channel_hash,
-                stream_id,
+                self.inner.request_channel_hash,
+                self.inner.request_stream_id,
                 /* reliable */ true,
                 std::slice::from_ref(&payload),
             )
@@ -1631,23 +1730,27 @@ impl<V: Clone> OriginKeyedLru<V> {
 /// like a test harness where the caller never announces and the
 /// bridge cache is empty — fall back to [`MeshNode::publish`] via
 /// the roster, matching the pre-T1.2 behavior verbatim.
+/// PERF_AUDIT §3.10 — accepts pre-computed
+/// `reply_channel_hash` and `reply_stream_id` so the per-response
+/// path doesn't re-run `ChannelId::new` + xxh3 + `publish_stream_id`
+/// on every send. The emit closure's `OriginKeyedLru<CachedReplyChannel>`
+/// caches the triple per caller_origin.
 async fn publish_response_to_caller(
     mesh: &MeshNode,
     caller_origin: u64,
     target_hint: Option<u64>,
     reply_channel: &ChannelName,
+    reply_channel_hash: ChannelHash,
+    reply_stream_id: u64,
     payload: Bytes,
 ) -> Result<(), AdapterError> {
     let resolved = target_hint.or_else(|| mesh.get_node_by_origin_hash(caller_origin));
     if let Some(target_node_id) = resolved {
-        let channel_id = ChannelId::new(reply_channel.clone());
-        let channel_hash = channel_id.hash();
-        let stream_id = MeshNode::publish_stream_id(&channel_id);
         return mesh
             .publish_to_peer(
                 target_node_id,
-                channel_hash,
-                stream_id,
+                reply_channel_hash,
+                reply_stream_id,
                 /* reliable */ true,
                 std::slice::from_ref(&payload),
             )
@@ -1876,7 +1979,11 @@ impl MeshNode {
         // bounded the same way as `origin_node_cache` above — an
         // `OriginKeyedLru`, not an unbounded map, so a crafted-origin flood
         // can't amplify server memory (a miss just rebuilds the name).
-        let reply_channel_cache: Arc<OriginKeyedLru<ChannelName>> = Arc::new(OriginKeyedLru::new());
+        // PERF_AUDIT §3.10 — cache the triple (name, hash, stream_id)
+        // per caller_origin so the per-response drainer doesn't
+        // recompute xxh3 + publish_stream_id on every send.
+        let reply_channel_cache: Arc<OriginKeyedLru<CachedReplyChannel>> =
+            Arc::new(OriginKeyedLru::new());
         // §8a response drainer channel. Bounded like the inbound channel; a
         // full channel means the drainer can't keep up, so we drop (the
         // caller times out) rather than block the fold.
@@ -1885,14 +1992,22 @@ impl MeshNode {
             let target_hint = origin_node_cache_for_emit.get(caller_origin);
             // Resolve the reply channel from cache (Arc bump on hit; one
             // `format!` + `ChannelName::new` the first time we see a caller).
-            let reply_channel = match reply_channel_cache.get(caller_origin) {
+            let cached = match reply_channel_cache.get(caller_origin) {
                 Some(c) => c,
                 None => {
                     let name = format!("{service_for_emit}.replies.{caller_origin:016x}");
                     match ChannelName::new(&name) {
-                        Ok(c) => {
-                            reply_channel_cache.insert(caller_origin, c.clone());
-                            c
+                        Ok(channel_name) => {
+                            // Compute hash + stream_id ONCE per caller_origin
+                            // and stash them alongside the name.
+                            let channel_id = ChannelId::new(channel_name.clone());
+                            let triple = CachedReplyChannel {
+                                hash: channel_id.hash(),
+                                stream_id: MeshNode::publish_stream_id(&channel_id),
+                                name: channel_name,
+                            };
+                            reply_channel_cache.insert(caller_origin, triple.clone());
+                            triple
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, channel = %name,
@@ -1920,7 +2035,9 @@ impl MeshNode {
                     caller_origin,
                     call_id,
                     target_hint,
-                    reply_channel,
+                    reply_channel: cached.name,
+                    reply_channel_hash: cached.hash,
+                    reply_stream_id: cached.stream_id,
                     payload: Bytes::from(buf),
                 })
                 .is_err()
@@ -2086,6 +2203,8 @@ impl MeshNode {
                     job.caller_origin,
                     job.target_hint,
                     &job.reply_channel,
+                    job.reply_channel_hash,
+                    job.reply_stream_id,
                     job.payload,
                 )
                 .await
@@ -2183,11 +2302,22 @@ impl MeshNode {
                 let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
                 buf.extend_from_slice(&meta.to_bytes());
                 resp.encode_into(&mut buf);
+                // PERF_AUDIT §3.10: compute hash + stream_id at the
+                // call site. These legacy streaming paths don't yet
+                // cache the triple via `OriginKeyedLru<CachedReplyChannel>`;
+                // wiring them up is a follow-up — for now the
+                // compute happens here per response, same as the
+                // pre-fix in-function shape.
+                let reply_channel_id = ChannelId::new(reply_channel.clone());
+                let reply_channel_hash = reply_channel_id.hash();
+                let reply_stream_id = MeshNode::publish_stream_id(&reply_channel_id);
                 if let Err(e) = publish_response_to_caller(
                     &mesh,
                     caller_origin,
                     target_hint,
                     &reply_channel,
+                    reply_channel_hash,
+                    reply_stream_id,
                     Bytes::from(buf),
                 )
                 .await
@@ -2304,11 +2434,22 @@ impl MeshNode {
                 let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
                 buf.extend_from_slice(&meta.to_bytes());
                 resp.encode_into(&mut buf);
+                // PERF_AUDIT §3.10: compute hash + stream_id at the
+                // call site. These legacy streaming paths don't yet
+                // cache the triple via `OriginKeyedLru<CachedReplyChannel>`;
+                // wiring them up is a follow-up — for now the
+                // compute happens here per response, same as the
+                // pre-fix in-function shape.
+                let reply_channel_id = ChannelId::new(reply_channel.clone());
+                let reply_channel_hash = reply_channel_id.hash();
+                let reply_stream_id = MeshNode::publish_stream_id(&reply_channel_id);
                 if let Err(e) = publish_response_to_caller(
                     &mesh,
                     caller_origin,
                     target_hint,
                     &reply_channel,
+                    reply_channel_hash,
+                    reply_stream_id,
                     Bytes::from(buf),
                 )
                 .await
@@ -2466,6 +2607,8 @@ impl MeshNode {
             mesh: Arc::clone(self),
             target_node_id,
             request_channel: route.request_channel.clone(),
+            request_channel_hash: route.request_channel_hash,
+            request_stream_id: route.request_stream_id,
             self_origin,
             call_id,
             service: service.to_string(),
@@ -2543,11 +2686,22 @@ impl MeshNode {
                 let mut buf = Vec::with_capacity(EVENT_META_SIZE + 64);
                 buf.extend_from_slice(&meta.to_bytes());
                 resp.encode_into(&mut buf);
+                // PERF_AUDIT §3.10: compute hash + stream_id at the
+                // call site. These legacy streaming paths don't yet
+                // cache the triple via `OriginKeyedLru<CachedReplyChannel>`;
+                // wiring them up is a follow-up — for now the
+                // compute happens here per response, same as the
+                // pre-fix in-function shape.
+                let reply_channel_id = ChannelId::new(reply_channel.clone());
+                let reply_channel_hash = reply_channel_id.hash();
+                let reply_stream_id = MeshNode::publish_stream_id(&reply_channel_id);
                 if let Err(e) = publish_response_to_caller(
                     &mesh,
                     caller_origin,
                     target_hint,
                     &reply_channel,
+                    reply_channel_hash,
+                    reply_stream_id,
                     Bytes::from(buf),
                 )
                 .await
@@ -2700,6 +2854,8 @@ impl MeshNode {
             mesh: Arc::clone(self),
             target_node_id,
             request_channel: route.request_channel.clone(),
+            request_channel_hash: route.request_channel_hash,
+            request_stream_id: route.request_stream_id,
             self_origin,
             call_id,
             initial_sent: std::sync::atomic::AtomicBool::new(false),
@@ -2834,11 +2990,17 @@ impl MeshNode {
             mesh: Arc::clone(self),
             target_node_id,
             request_channel: route.request_channel.clone(),
+            // PERF_AUDIT §3.10 — cache the channel hash + stream
+            // id from `route` so per-chunk grants in `poll_next`
+            // don't re-run `ChannelId::new` + xxh3.
+            request_channel_hash: route.request_channel_hash,
+            request_stream_id: route.request_stream_id,
             self_origin,
             call_id,
             inner: rx,
             done: false,
             stream_window: opts.stream_window_initial,
+            grant_pending: 0,
             _cancel_keep_alive: cancel_keep_alive,
             observer: StreamingObserverState::new(
                 Arc::clone(self),
@@ -2953,7 +3115,12 @@ impl MeshNode {
         let self_id = self.node_id();
         let any_candidate = candidates[0];
         let fold = self.capability_fold();
-        candidates.retain(|c| capability_bridge::may_execute(fold, *c, &tag, self_id));
+        // PERF_AUDIT §4.2 — batch the per-candidate gate so the
+        // fold read lock is taken once and the caller's subnet +
+        // groups are parsed once, not N times.
+        let verdicts = capability_bridge::may_execute_batch(fold, &candidates, &tag, self_id);
+        let mut iter = verdicts.into_iter();
+        candidates.retain(|_| iter.next().unwrap_or(false));
         if candidates.is_empty() {
             return Err(RpcError::CapabilityDenied {
                 // No authorized target; surface one of the
@@ -3045,7 +3212,11 @@ impl MeshNode {
         let self_id = self.node_id();
         let any_candidate = candidates[0];
         let fold = self.capability_fold();
-        candidates.retain(|c| capability_bridge::may_execute(fold, *c, &tag, self_id));
+        // PERF_AUDIT §4.2 — batch the per-candidate gate. See the
+        // mirror site at `:3093`.
+        let verdicts = capability_bridge::may_execute_batch(fold, &candidates, &tag, self_id);
+        let mut iter = verdicts.into_iter();
+        candidates.retain(|_| iter.next().unwrap_or(false));
         if candidates.is_empty() {
             return Err(RpcError::CapabilityDenied {
                 target: any_candidate,
@@ -3143,7 +3314,7 @@ impl MeshNode {
         target_node_id: u64,
         service: &str,
         payload: Bytes,
-        opts: CallOptions,
+        mut opts: CallOptions,
     ) -> Result<RpcReply, RpcError> {
         // `started_total` brackets the entire call for the
         // `RpcObserver` latency field; the substrate-internal
@@ -3227,7 +3398,13 @@ impl MeshNode {
         // so name collisions resolve to caller-overrides via the
         // server-side `predicate_from_rpc_headers` first-match
         // semantics.
-        headers.extend(opts.request_headers.iter().cloned());
+        // PERF_AUDIT §3.11 — `opts` is owned by this function and
+        // its `request_headers` are unused after this point;
+        // `Vec::append(&mut other)` drains `other` into `headers`
+        // with zero allocation, vs the pre-fix
+        // `.iter().cloned()` which deep-cloned each
+        // `(String, Vec<u8>)` pair into a fresh entry.
+        headers.append(&mut opts.request_headers);
         let req = RpcRequestPayload {
             service: service.to_string(),
             deadline_ns: opts.deadline.map(instant_to_unix_nanos).unwrap_or(0),
@@ -3505,28 +3682,34 @@ impl MeshNode {
         reply_hash: ChannelHash,
     ) -> Result<(), RpcError> {
         let registry = self.rpc_reply_subscriptions_arc();
-        {
-            let entries = registry.lock();
-            if entries
-                .iter()
-                .any(|(t, s)| *t == target_node_id && s == service)
-            {
-                return Ok(());
-            }
-            // Cap the registry. New entries past the cap are
-            // refused — caller should reuse an existing
-            // (target, service) pair or operate on fewer.
-            if entries.len() >= MAX_REPLY_SUBSCRIPTIONS {
-                return Err(RpcError::NoRoute {
-                    target: target_node_id,
-                    reason: format!(
-                        "reply-subscription registry at cap ({} entries); refusing new \
-                         (target={target_node_id:#x}, service={service:?}). Caller should \
-                         reuse an existing target+service pair or shrink the active set.",
-                        MAX_REPLY_SUBSCRIPTIONS,
-                    ),
-                });
-            }
+        // PERF_AUDIT §3.5 — DashMap keyed by
+        // `(target, xxh3_64(service))`. Pre-fix this was a global
+        // `Mutex<Vec<(u64, String)>>` that every concurrent RPC
+        // caller took on every call to scan the Vec with a String
+        // compare per entry — all callers serialized on it. Now the
+        // hot path is one shard-local read with a single String
+        // compare against the slot's stored service name (xxh3 is
+        // not collision-free; see `reply_subscription_covers`).
+        let service_hash = xxhash_rust::xxh3::xxh3_64(service.as_bytes());
+        if reply_subscription_covers(&registry, target_node_id, service_hash, service) {
+            return Ok(());
+        }
+        // Cap the registry. `len()` on DashMap is approximate under
+        // concurrent churn (it sums shard counts under shard reads,
+        // not a global lock), which is exactly the semantics we
+        // want here — the cap is a soft guard against a runaway
+        // caller, not a precise invariant. Past the cap, new
+        // entries are refused.
+        if registry.len() >= MAX_REPLY_SUBSCRIPTIONS {
+            return Err(RpcError::NoRoute {
+                target: target_node_id,
+                reason: format!(
+                    "reply-subscription registry at cap ({} entries); refusing new \
+                     (target={target_node_id:#x}, service={service:?}). Caller should \
+                     reuse an existing target+service pair or shrink the active set.",
+                    MAX_REPLY_SUBSCRIPTIONS,
+                ),
+            });
         }
 
         // Subscribe to our own reply channel from the target so the
@@ -3571,9 +3754,40 @@ impl MeshNode {
         }
 
         let _ = reply_hash; // captured into the dispatcher above; surfaced for debug
-        registry.lock().push((target_node_id, service.to_string()));
+                            // `insert` is idempotent — a concurrent caller that beat us
+                            // to it just overwrote the slot with the identical value.
+                            // On a genuine xxh3 collision between two service names on
+                            // the same target, the slot flips to whichever service
+                            // subscribed last and the other re-subscribes on its next
+                            // call (idempotent, correct, merely un-cached). Cap drift
+                            // past MAX_REPLY_SUBSCRIPTIONS during a concurrent insert
+                            // race is bounded by the number of concurrent callers,
+                            // which operators tune separately.
+        registry.insert((target_node_id, service_hash), Arc::from(service));
         Ok(())
     }
+}
+
+/// PERF_AUDIT §3.5 — hot-path membership check for the
+/// reply-subscription registry. Returns `true` only when the slot
+/// for `(target, xxh3(service))` exists AND the stored service
+/// name matches exactly. xxh3_64 is neither collision-free nor
+/// cryptographic; a hash-only hit that skipped the subscribe for
+/// a *different* service would silently drop that service's
+/// replies — the reply channel name embeds the service, so being
+/// in the target's roster for the colliding service's channel
+/// does nothing for this one. Verifying the stored name turns a
+/// collision into a per-call re-subscribe (idempotent, harmless)
+/// instead of a correctness bug.
+fn reply_subscription_covers(
+    registry: &dashmap::DashMap<(u64, u64), Arc<str>>,
+    target_node_id: u64,
+    service_hash: u64,
+    service: &str,
+) -> bool {
+    registry
+        .get(&(target_node_id, service_hash))
+        .is_some_and(|entry| entry.value().as_ref() == service)
 }
 
 /// Hard cap on the number of distinct (target_node_id, service)
@@ -3584,28 +3798,71 @@ impl MeshNode {
 /// more should reuse existing reply paths.
 pub const MAX_REPLY_SUBSCRIPTIONS: usize = 1024;
 
-/// Mint a random 64-bit call_id from `getrandom` entropy. Used as
-/// the correlation token for REQUEST/RESPONSE pairing. The fold
-/// keys pending oneshots on this value; any session peer with
-/// publish access to the reply channel could ship a forged
-/// RESPONSE if it could guess the value. Sequential u64s are
-/// predictable from any peer that observes a single allocation;
-/// random u64s collide with 2^-64 probability per call and are
-/// independent across peers.
+/// Mint a random 64-bit call_id. Used as the correlation token
+/// for REQUEST/RESPONSE pairing. The fold keys pending oneshots on
+/// this value; any session peer with publish access to the reply
+/// channel could ship a forged RESPONSE if it could guess the
+/// value. Sequential u64s are predictable from any peer that
+/// observes a single allocation; random u64s collide with 2^-64
+/// probability per call and are unpredictable to observing peers.
 ///
-/// Falls back to a zero call_id on entropy failure — that
+/// **PERF_AUDIT §3.8** — pre-fix this called `getrandom::fill` for
+/// 8 bytes per RPC — one OS entropy syscall per call
+/// (BCryptGenRandom on Windows, ~200-400 ns; somewhat cheaper on
+/// Linux). Now each thread refills a small pool of raw OS entropy
+/// ([`CALL_ID_ENTROPY_POOL_BYTES`]) with a single `getrandom`
+/// syscall and hands out 8 bytes per call, amortizing the syscall
+/// across [`CALL_ID_ENTROPY_POOL_BYTES`]/8 mints.
+///
+/// Every minted id is still raw OS entropy — NOT the output of a
+/// userspace PRNG — so the unpredictability-to-peers property is
+/// byte-for-byte identical to the pre-§3.8 per-call fill. (An
+/// earlier draft of this fix streamed ids from a thread-local
+/// SplitMix64; that was unsound for this threat model: call_ids
+/// are sent to callees by design, and SplitMix64's output
+/// finalizer is a public bijection, so a single observed id
+/// reveals the generator state and with it every FUTURE call_id
+/// minted on that thread — letting one callee forge responses to
+/// races on calls addressed to other peers. Raw pooled entropy
+/// has no such state to recover.)
+///
+/// Falls back to a zero call_id if the pool refill fails — that
 /// effectively disables correlation for this call (the oneshot
 /// will time out) rather than panic, but in practice
-/// `getrandom::fill` failure is a fatal-environment signal
-/// (no `/dev/urandom`, broken syscall) and the broader stack
-/// won't be functional anyway.
+/// `getrandom::fill` failure is a fatal-environment signal (no
+/// `/dev/urandom`, broken syscall) and the broader stack won't be
+/// functional anyway. The pool cursor is left exhausted so the
+/// next mint retries the refill.
 fn mint_random_call_id() -> u64 {
-    let mut buf = [0u8; 8];
-    if getrandom::fill(&mut buf).is_err() {
-        return 0;
+    thread_local! {
+        // (pool, cursor). Cursor starts exhausted so the first
+        // mint on each thread performs the initial refill.
+        static CALL_ID_ENTROPY_POOL: std::cell::RefCell<([u8; CALL_ID_ENTROPY_POOL_BYTES], usize)> = const {
+            std::cell::RefCell::new(([0u8; CALL_ID_ENTROPY_POOL_BYTES], CALL_ID_ENTROPY_POOL_BYTES))
+        };
     }
-    u64::from_le_bytes(buf)
+    CALL_ID_ENTROPY_POOL.with(|cell| {
+        let mut pool = cell.borrow_mut();
+        let (buf, cursor) = &mut *pool;
+        if *cursor >= CALL_ID_ENTROPY_POOL_BYTES {
+            if getrandom::fill(buf).is_err() {
+                return 0;
+            }
+            *cursor = 0;
+        }
+        let mut id = [0u8; 8];
+        id.copy_from_slice(&buf[*cursor..*cursor + 8]);
+        *cursor += 8;
+        u64::from_le_bytes(id)
+    })
 }
+
+/// Per-thread OS-entropy pool size for [`mint_random_call_id`].
+/// 64 ids (512 bytes) per `getrandom` syscall — the syscall cost
+/// is dominated by the fixed kernel round-trip, so batching 64
+/// mints recovers ~98% of the per-call overhead while keeping the
+/// amount of buffered future-id entropy per thread small.
+const CALL_ID_ENTROPY_POOL_BYTES: usize = 64 * 8;
 
 // ============================================================================
 // Internal: tiny shims so the `serve_rpc` / `call` impls stay
@@ -3806,6 +4063,179 @@ mod origin_cache_tests {
         // The most-recently-seen window survives; the cold prefix is evicted.
         assert_eq!(cache.get(flood - 1), Some(flood - 1));
         assert_eq!(cache.get(0), None);
+    }
+
+    /// PERF_AUDIT §3.8 — `mint_random_call_id` mints thousands of
+    /// values from the pooled-entropy path, all of which must be
+    /// distinct in practice (a duplicate would let two in-flight
+    /// calls collide on the per-Mesh pending map). 100k samples is
+    /// far below the 2^32 birthday-paradox boundary, so a
+    /// regression that recycled pool bytes (cursor mis-advance,
+    /// missed refill) would fail loudly. The loop also crosses the
+    /// pool-refill boundary thousands of times (pool holds 64 ids),
+    /// pinning the refill/cursor arithmetic.
+    #[test]
+    fn mint_random_call_id_produces_distinct_values_across_thousands_of_calls() {
+        let mut seen = std::collections::HashSet::with_capacity(100_000);
+        for _ in 0..100_000 {
+            let id = super::mint_random_call_id();
+            // 0 is the fallback sentinel — should not appear under
+            // a working `getrandom` refill.
+            assert_ne!(id, 0, "fallback-zero path triggered unexpectedly");
+            assert!(seen.insert(id), "duplicate call_id minted: {:#x}", id);
+        }
+    }
+
+    /// PERF_AUDIT §3.8 — minted ids are raw OS entropy: count
+    /// set-bits across 10k mints and assert the fraction is near
+    /// 0.5. A pool-management bug that handed out the zeroed
+    /// initial buffer (or re-served a stale window) would skew
+    /// this hard; properly random 64-bit ids have expected ~0.5
+    /// set bits per sample with O(1/sqrt(N)) tolerance.
+    #[test]
+    fn mint_random_call_id_set_bit_density_is_balanced() {
+        let n = 10_000u64;
+        let mut total_set: u64 = 0;
+        for _ in 0..n {
+            total_set += super::mint_random_call_id().count_ones() as u64;
+        }
+        let bits_total = n * 64;
+        let fraction = total_set as f64 / bits_total as f64;
+        // Expected 0.5; tolerance generous (~3σ) to keep the test
+        // reliable while still catching collapsed-pool regressions.
+        assert!(
+            (fraction - 0.5).abs() < 0.02,
+            "set-bit density {} is too far from 0.5 — pool may be mismanaged",
+            fraction
+        );
+    }
+
+    /// PERF_AUDIT §3.5 — the reply-subscription registry's hot
+    /// path must be a `(target, xxh3(service))` lookup, not a
+    /// `Mutex<Vec<(u64, String)>>` linear scan. Pin the contract
+    /// via `reply_subscription_covers` (the exact hot-path check):
+    /// 1. distinct (target, service) pairs are distinct keys —
+    ///    same service against two targets, and two services
+    ///    against one target, never alias;
+    /// 2. repeat insert of the same pair is idempotent and the
+    ///    fast path keeps answering `true`;
+    /// 3. an xxh3 COLLISION (same hash, different service name)
+    ///    must NOT count as covered — a false positive here would
+    ///    skip a needed subscribe and silently drop the colliding
+    ///    service's replies. The stored-name verification turns it
+    ///    into a re-subscribe instead;
+    /// 4. the cap is enforced via `len()`, not a separate counter
+    ///    that could drift.
+    #[test]
+    fn reply_subscriptions_keyed_by_target_and_service_hash() {
+        use dashmap::DashMap;
+        let registry: DashMap<(u64, u64), Arc<str>> = DashMap::new();
+        let h_a = xxhash_rust::xxh3::xxh3_64(b"svc-a");
+        let h_b = xxhash_rust::xxh3::xxh3_64(b"svc-b");
+        // Same target, different services → distinct entries.
+        registry.insert((0xAA, h_a), Arc::from("svc-a"));
+        registry.insert((0xAA, h_b), Arc::from("svc-b"));
+        assert!(super::reply_subscription_covers(
+            &registry, 0xAA, h_a, "svc-a"
+        ));
+        assert!(super::reply_subscription_covers(
+            &registry, 0xAA, h_b, "svc-b"
+        ));
+        // Same service, different targets → distinct entries.
+        assert!(!super::reply_subscription_covers(
+            &registry, 0xBB, h_a, "svc-a"
+        ));
+        registry.insert((0xBB, h_a), Arc::from("svc-a"));
+        assert!(super::reply_subscription_covers(
+            &registry, 0xBB, h_a, "svc-a"
+        ));
+        // Idempotent — repeat insert overwrites with the identical
+        // value; the fast path keeps answering true.
+        registry.insert((0xAA, h_a), Arc::from("svc-a"));
+        assert!(super::reply_subscription_covers(
+            &registry, 0xAA, h_a, "svc-a"
+        ));
+        assert_eq!(registry.len(), 3);
+        // xxh3 collision: "svc-evil" hashing to h_a (forced here —
+        // xxh3_64 collisions are computable offline since the hash
+        // isn't cryptographic) must NOT cover "svc-a"'s slot, and
+        // vice versa. The hash-only DashSet shape this replaced
+        // answered `true` and silently skipped the subscribe.
+        assert!(
+            !super::reply_subscription_covers(&registry, 0xAA, h_a, "svc-evil"),
+            "hash collision must not satisfy the membership check for a \
+             different service name"
+        );
+        // After the colliding service legitimately subscribes (slot
+        // overwritten), the original service degrades to
+        // re-subscribe — covered must flip to false for it, never
+        // silently true for both.
+        registry.insert((0xAA, h_a), Arc::from("svc-evil"));
+        assert!(super::reply_subscription_covers(
+            &registry, 0xAA, h_a, "svc-evil"
+        ));
+        assert!(!super::reply_subscription_covers(
+            &registry, 0xAA, h_a, "svc-a"
+        ));
+    }
+
+    /// PERF_AUDIT §3.3 — grant-stall backstop check for the
+    /// window/2 auto-grant coalescing. Simulates the full
+    /// credit loop for every window 1..=64: the server starts
+    /// with `window` credits and consumes one per chunk; the
+    /// client accumulates via `accumulate_auto_grant` and only
+    /// flushes at the threshold. Asserts:
+    /// 1. liveness — an actively-polling consumer never observes
+    ///    the server starved (credits exhausted with nothing left
+    ///    to poll), i.e. withholding sub-threshold credits cannot
+    ///    deadlock the stream and no timer/drop backstop is needed;
+    /// 2. coalescing — grant-packet count stays at
+    ///    ~chunks / (window/2), and is strictly fewer than one
+    ///    grant per chunk once window ≥ 4 (the integration suite
+    ///    only exercises window=2, whose threshold degenerates
+    ///    to per-chunk).
+    #[test]
+    fn auto_grant_coalescing_never_starves_the_server_pump() {
+        for window in 1u32..=64 {
+            let chunks = 1_000u32;
+            let mut server_credits = window as u64;
+            let mut pending = 0u32;
+            let mut sent = 0u32;
+            let mut delivered = 0u32;
+            let mut grants = 0u32;
+            while delivered < chunks {
+                // Server pump: send while credits remain.
+                while server_credits > 0 && sent < chunks {
+                    server_credits -= 1;
+                    sent += 1;
+                }
+                assert!(
+                    sent > delivered,
+                    "window {window}: server starved while the consumer is actively \
+                     polling (credits {server_credits}, pending {pending}, \
+                     sent {sent}, delivered {delivered})"
+                );
+                // Consumer polls exactly one chunk.
+                delivered += 1;
+                if let Some(amount) = super::accumulate_auto_grant(&mut pending, window) {
+                    grants += 1;
+                    server_credits += amount as u64;
+                }
+            }
+            let threshold = (window / 2).max(1);
+            assert!(
+                grants <= chunks / threshold + 1,
+                "window {window}: {grants} grant packets exceeds the \
+                 coalesced cadence bound of {}",
+                chunks / threshold + 1
+            );
+            if window >= 4 {
+                assert!(
+                    grants < chunks,
+                    "window {window}: coalescing must emit fewer grants than chunks"
+                );
+            }
+        }
     }
 
     /// `get` promotes to most-recently-used, so a touched entry outlives an

@@ -3,7 +3,8 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::json;
 
-use net::config::BackpressureMode;
+use net::bus::EventBus;
+use net::config::{BackpressureMode, EventBusConfig};
 use net::event::{InternalEvent, RawEvent};
 use net::shard::ShardManager;
 use net::timestamp::TimestampGenerator;
@@ -159,12 +160,115 @@ fn bench_batch_pop(c: &mut Criterion) {
     group.finish();
 }
 
+/// PERF_AUDIT bench-coverage-gap #1 — drives
+/// [`EventBus::ingest_raw`] with 1/2/4/8 producer threads. The
+/// bus-level hot path the existing single-threaded `bench_shard`
+/// can't see lives here: the bus-side `events_ingested` counter
+/// (striped per PERF_AUDIT §1.1+§1.2) plus the dynamic-scaling
+/// metrics collector subsampling (§1.3) all run on each
+/// `ingest_raw`. Multi-producer contention is the regime where
+/// the striped-counter fix shows up — under a single producer
+/// the cache line never bounces, so the pre-fix vs post-fix
+/// numbers look identical.
+///
+/// Bench shape:
+///   - Pool of 256 pre-built [`RawEvent`] templates with distinct
+///     payloads, cloned per push (a refcount bump; no JSON
+///     re-serialization). The pool matters: `RawEvent` caches the
+///     xxh3 hash of its bytes for shard routing, so a single
+///     template would pin EVERY event to one shard and the bench
+///     would measure that shard's mutex instead of the bus layer.
+///   - `BackpressureMode::DropOldest` so a saturated ring never
+///     stalls a producer.
+///   - 16-shard bus so producers route to distinct shards
+///     statistically — the bench measures contention on the
+///     bus-level counter, NOT per-shard mutex contention (the
+///     dynamic-scaling regime is a separate axis the audit
+///     covers under §1.3 / §1.4).
+fn bench_event_bus_ingest_raw_concurrent(c: &mut Criterion) {
+    let mut group = c.benchmark_group("event_bus_ingest_raw_concurrent");
+
+    const EVENTS_PER_BATCH: u64 = 8_192;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime for bench setup");
+
+    for &producers in &[1usize, 2, 4, 8] {
+        group.throughput(Throughput::Elements(EVENTS_PER_BATCH));
+        group.bench_with_input(
+            BenchmarkId::new("producers", producers),
+            &producers,
+            |b, &producers| {
+                // One bus per producer-count benchmark (not per
+                // `b.iter` sample — bus setup is far too heavy for
+                // that). 16 shards × 64 K capacity gives the drain
+                // workers plenty of headroom against the 8 K events
+                // per sample, and DropOldest means a transiently
+                // saturated ring evicts instead of stalling a
+                // producer mid-sample.
+                let config = EventBusConfig::builder()
+                    .num_shards(16)
+                    .ring_buffer_capacity(65_536)
+                    .backpressure_mode(BackpressureMode::DropOldest)
+                    .build()
+                    .unwrap();
+                let bus = std::sync::Arc::new(
+                    runtime
+                        .block_on(EventBus::new(config))
+                        .expect("EventBus::new for bench"),
+                );
+                // Distinct payloads → distinct cached hashes →
+                // statistical spread across the 16 shards. A single
+                // template would route every event to ONE shard
+                // (RawEvent pre-computes its routing hash) and
+                // serialize all producers on that shard's mutex.
+                let templates: Vec<RawEvent> = (0..256)
+                    .map(|i| RawEvent::from_str(&format!(r#"{{"i":{i}}}"#)))
+                    .collect();
+
+                b.iter(|| {
+                    let per_thread = EVENTS_PER_BATCH as usize / producers;
+                    std::thread::scope(|scope| {
+                        for t in 0..producers {
+                            let bus = std::sync::Arc::clone(&bus);
+                            let templates = &templates;
+                            scope.spawn(move || {
+                                // Stagger each producer's start
+                                // offset so threads don't push the
+                                // same template (= same shard) in
+                                // lockstep.
+                                let mut idx = t * 31;
+                                for _ in 0..per_thread {
+                                    let _ = bus.ingest_raw(templates[idx & 255].clone());
+                                    idx = idx.wrapping_add(1);
+                                }
+                            });
+                        }
+                    });
+                });
+
+                // EventBus::shutdown consumes `self`, so we can't
+                // call it through the Arc handle. Drop the Arc and
+                // rely on the bus's `Drop` to tear down background
+                // workers. The runtime stays alive across
+                // iterations to amortize its setup cost.
+                drop(bus);
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_shard,
     bench_timestamp,
     bench_event_creation,
     bench_batch_pop,
+    bench_event_bus_ingest_raw_concurrent,
 );
 
 criterion_main!(benches);

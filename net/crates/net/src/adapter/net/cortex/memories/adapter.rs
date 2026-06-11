@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
@@ -13,7 +12,6 @@ use super::super::super::channel::ChannelName;
 use super::super::super::redex::{Redex, RedexError, RedexFileConfig, WriteToken};
 use super::super::adapter::{CortexAdapter, WaitForTokenError};
 use super::super::config::CortexAdapterConfig;
-use super::super::envelope::EventEnvelope;
 use super::super::error::CortexAdapterError;
 use super::super::meta::{compute_checksum_with_meta, EventMeta};
 use super::super::watermark::WatermarkingFold;
@@ -446,26 +444,23 @@ impl MemoriesAdapter {
         dispatch: u8,
         payload: &T,
     ) -> Result<u64, CortexAdapterError> {
-        let tail = postcard::to_allocvec(payload).map_err(|e| {
+        // PERF_AUDIT §5.7 — see `tasks/adapter.rs::ingest_typed`
+        // for the full rationale. Same single-buffer
+        // serialize-then-patch-checksum shape applied here.
+        use super::super::super::cortex::meta::EVENT_META_SIZE;
+        let app_seq = self.app_seq.fetch_add(1, Ordering::AcqRel);
+        let mut meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, 0);
+        let mut buf = Vec::with_capacity(EVENT_META_SIZE + 128);
+        buf.extend_from_slice(&meta.to_bytes());
+        buf = postcard::to_extend(payload, buf).map_err(|e| {
             CortexAdapterError::Redex(super::super::super::redex::RedexError::Encode(
                 e.to_string(),
             ))
         })?;
-        // See `tasks/adapter.rs::ingest_typed` for the full
-        // fetch_add rationale.
-        let app_seq = self.app_seq.fetch_add(1, Ordering::AcqRel);
-        // Build the meta with checksum=0 first; `compute_checksum_with_meta`
-        // hashes the header (with the checksum slot zeroed) AND the
-        // tail, so we have to materialize the rest of the header
-        // before computing the checksum. The legacy tail-only
-        // `compute_checksum` left the dispatch / flags /
-        // origin_hash / seq_or_ts bytes outside the integrity
-        // check.
-        let mut meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, 0);
-        meta.checksum = compute_checksum_with_meta(&meta, &tail);
-        let payload_bytes = Bytes::from(tail);
-        let env = EventEnvelope::new(meta, payload_bytes);
-        self.inner.ingest(env)
+        let tail = &buf[EVENT_META_SIZE..];
+        meta.checksum = compute_checksum_with_meta(&meta, tail);
+        EventMeta::patch_checksum(&mut buf, meta.checksum);
+        self.inner.ingest_prebuilt(&buf)
     }
 }
 

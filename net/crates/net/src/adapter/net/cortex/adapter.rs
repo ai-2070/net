@@ -453,6 +453,31 @@ impl<State> CortexAdapter<State> {
         Ok(self.inner.file.append(&buf)?)
     }
 
+    /// Append a pre-built combined `meta ++ tail` buffer directly,
+    /// bypassing the `IntoRedexPayload` projection + per-call Vec
+    /// allocation that [`Self::ingest`] does.
+    ///
+    /// Per PERF_AUDIT §5.7 — the typed-ingest hot path
+    /// ([`super::tasks::TasksAdapter::ingest_typed`]) used to call
+    /// `postcard::to_allocvec` (alloc #1) then `ingest(env)` (alloc
+    /// #2 + a full-payload memcpy from postcard's Vec into the
+    /// combine buffer). With this entry point the typed path can
+    /// serialize directly into a single buffer with the
+    /// [`EVENT_META_SIZE`] header slot reserved, patch the
+    /// checksum in place, and append — one allocation, one
+    /// memcpy, no intermediate `Bytes` wrap.
+    ///
+    /// The caller is responsible for the wire-format invariants
+    /// `ingest` would have enforced (24-byte header at offset 0
+    /// with a valid checksum). Mis-formed buffers surface at the
+    /// fold's decode step.
+    pub(crate) fn ingest_prebuilt(&self, buf: &[u8]) -> Result<u64, CortexAdapterError> {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(CortexAdapterError::Closed);
+        }
+        Ok(self.inner.file.append(buf)?)
+    }
+
     /// Append an envelope and return a [`WriteToken`] addressing
     /// the resulting write. The token is the typed handle the
     /// read-your-writes API consumes via

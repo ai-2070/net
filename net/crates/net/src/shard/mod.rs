@@ -37,7 +37,6 @@ use crate::timestamp::TimestampGenerator;
 use serde_json::Value as JsonValue;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
-use std::time::Instant;
 
 /// Atomic counters for a single shard. Kept outside `Shard` as `Arc`s
 /// so `ShardManager::stats()` can aggregate them without locking each
@@ -86,6 +85,17 @@ impl ShardCounters {
     }
 }
 
+/// PERF_AUDIT §1.3 — sampling stride for dynamic-scaling
+/// instrumentation. Push-latency and buffer-length measurements
+/// run once every `METRICS_SAMPLE_STRIDE` successful pushes. The
+/// per-event counters still update at full resolution; only the
+/// expensive paths (clock read pair + push_latency CAS loop)
+/// subsample. With stride 64, sample/event count divergence
+/// stays under 2% at typical sustained event rates and the
+/// average estimator's standard error is below 1 ns within a
+/// metrics tick window.
+const METRICS_SAMPLE_STRIDE: u8 = 64;
+
 /// A single shard with its own ring buffer and timestamp generator.
 pub struct Shard {
     /// Shard identifier.
@@ -101,6 +111,13 @@ pub struct Shard {
     metrics_collector: Option<Arc<ShardMetricsCollector>>,
     /// Ring buffer capacity (for metrics).
     capacity: usize,
+    /// PERF_AUDIT §1.3 — rolling counter modulo
+    /// `METRICS_SAMPLE_STRIDE` driving the push-path sampling
+    /// decision. Cheap byte-sized increment + masked compare per
+    /// push. SPSC-safe because the producing thread holds the
+    /// shard mutex throughout `try_push_raw` / `try_push`, which
+    /// is where this field is read and written.
+    metrics_sample_phase: u8,
 }
 
 impl Shard {
@@ -113,6 +130,7 @@ impl Shard {
             counters: Arc::new(ShardCounters::default()),
             metrics_collector: None,
             capacity,
+            metrics_sample_phase: 0,
         }
     }
 
@@ -125,6 +143,7 @@ impl Shard {
             counters: Arc::new(ShardCounters::default()),
             metrics_collector: Some(metrics),
             capacity,
+            metrics_sample_phase: 0,
         }
     }
 
@@ -143,9 +162,39 @@ impl Shard {
     /// Returns the assigned insertion timestamp on success.
     ///
     /// This is the fastest ingestion path - no serialization or hashing needed.
+    ///
+    /// PERF_AUDIT §1.3 — dynamic-scaling instrumentation
+    /// subsamples on a 1-in-`METRICS_SAMPLE_STRIDE` cadence.
+    /// Pre-fix the path took `Instant::now()` twice (Windows QPC,
+    /// ~15–30 ns each) plus a CAS-loop on push_latency under the
+    /// shard mutex per event when a metrics_collector was set —
+    /// ~60–120 ns of pure instrumentation overhead per event for
+    /// dynamic-scaling deployments. Now: per-event counters
+    /// (events_in_window / pushes_since_drain_start) still bump
+    /// at full resolution, but the latency clock-read pair +
+    /// CAS update + buffer-length store only fire every Nth
+    /// successful push. The quanta TSC clock (~1–5 ns per read)
+    /// replaces Instant::now() at the sampling boundary so even
+    /// the sampled cost is ~10× smaller than the pre-fix path.
     #[inline]
     pub fn try_push_raw(&mut self, raw: Bytes) -> Result<u64, IngestionError> {
-        let push_start = self.metrics_collector.as_ref().map(|_| Instant::now());
+        // Snapshot the sampling decision and start-tick BEFORE
+        // the ring push so a slow push doesn't bias the
+        // measurement. The phase increment under the shard
+        // mutex is race-free with the SPSC contract.
+        let push_start_raw = if self.metrics_collector.is_some() {
+            self.metrics_sample_phase = self.metrics_sample_phase.wrapping_add(1);
+            if self
+                .metrics_sample_phase
+                .is_multiple_of(METRICS_SAMPLE_STRIDE)
+            {
+                Some(self.timestamp_gen.now_raw())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let ts = self.timestamp_gen.next();
         let event = InternalEvent::new(raw, ts, self.id);
 
@@ -154,9 +203,15 @@ impl Shard {
                 self.counters
                     .events_ingested
                     .fetch_add(1, AtomicOrdering::Relaxed);
-                if let (Some(collector), Some(start)) = (&self.metrics_collector, push_start) {
-                    collector.record_push(start.elapsed().as_nanos() as u64);
-                    collector.record_buffer_len(self.ring_buffer.len());
+                if let Some(collector) = &self.metrics_collector {
+                    collector.record_event_only();
+                    if let Some(start_raw) = push_start_raw {
+                        let latency_ns = self
+                            .timestamp_gen
+                            .delta_ns(start_raw, self.timestamp_gen.now_raw());
+                        collector.record_latency_sample(latency_ns);
+                        collector.record_buffer_len(self.ring_buffer.len());
+                    }
                 }
                 Ok(ts)
             }
@@ -173,9 +228,25 @@ impl Shard {
     /// Returns the assigned insertion timestamp on success.
     ///
     /// This serializes the value once before storing.
+    ///
+    /// Same dynamic-scaling subsampling discipline as
+    /// [`Self::try_push_raw`] — see that method's PERF_AUDIT
+    /// §1.3 commentary for the rationale.
     #[inline]
     pub fn try_push(&mut self, raw: JsonValue) -> Result<u64, IngestionError> {
-        let push_start = self.metrics_collector.as_ref().map(|_| Instant::now());
+        let push_start_raw = if self.metrics_collector.is_some() {
+            self.metrics_sample_phase = self.metrics_sample_phase.wrapping_add(1);
+            if self
+                .metrics_sample_phase
+                .is_multiple_of(METRICS_SAMPLE_STRIDE)
+            {
+                Some(self.timestamp_gen.now_raw())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let ts = self.timestamp_gen.next();
         let event = InternalEvent::from_value(raw, ts, self.id);
 
@@ -184,9 +255,15 @@ impl Shard {
                 self.counters
                     .events_ingested
                     .fetch_add(1, AtomicOrdering::Relaxed);
-                if let (Some(collector), Some(start)) = (&self.metrics_collector, push_start) {
-                    collector.record_push(start.elapsed().as_nanos() as u64);
-                    collector.record_buffer_len(self.ring_buffer.len());
+                if let Some(collector) = &self.metrics_collector {
+                    collector.record_event_only();
+                    if let Some(start_raw) = push_start_raw {
+                        let latency_ns = self
+                            .timestamp_gen
+                            .delta_ns(start_raw, self.timestamp_gen.now_raw());
+                        collector.record_latency_sample(latency_ns);
+                        collector.record_buffer_len(self.ring_buffer.len());
+                    }
                 }
                 Ok(ts)
             }
@@ -316,12 +393,58 @@ pub struct ShardTable {
     /// locking the shard mutex.
     counters: Vec<Arc<ShardCounters>>,
     /// Map from shard ID to index in `shards`/`counters`.
-    shard_index: std::collections::HashMap<u16, usize>,
+    ///
+    /// PERF_AUDIT §1.5 — uses `BuildU16IdentityHasher`, a hand-rolled
+    /// `BuildHasher` that returns the key bytes verbatim (no SipHash
+    /// mixing). Shard IDs are internally allocated by the bus / mapper,
+    /// not influenced by external input, so the DoS-resistance SipHash
+    /// is there to provide is irrelevant here — identity hashing on a
+    /// `u16` is collision-free and ~10× faster than the std default.
+    shard_index: std::collections::HashMap<u16, usize, BuildU16IdentityHasher>,
 }
+
+/// Identity hasher for `u16` map keys. Shard IDs live in `0..=65535`
+/// and are allocated by the bus / mapper — never by external input —
+/// so the SipHash mixing the std default provides for DoS-resistance
+/// adds ~15-25 ns per lookup with zero benefit. The identity hash
+/// drops that to ~1 ns and stays collision-free across the entire
+/// `u16` range.
+///
+/// Per PERF_AUDIT_2026_06_10_FULL_CRATE.md §1.5.
+#[derive(Default, Clone)]
+struct U16IdentityHasher(u64);
+
+impl std::hash::Hasher for U16IdentityHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write_u16(&mut self, v: u16) {
+        self.0 = v as u64;
+    }
+    /// Defensive fallback. The std `Hash for u16` impl calls
+    /// `write_u16` directly, so this byte path is only reached if
+    /// someone hashes a non-u16 key against this hasher (which would
+    /// be a bug). Pack the first 8 bytes into a u64 so the result is
+    /// at least defined, and let it surface as a runtime hash collision
+    /// rather than a panic.
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes.iter().take(8) {
+            self.0 = self.0.rotate_left(8) ^ (b as u64);
+        }
+    }
+}
+
+type BuildU16IdentityHasher = std::hash::BuildHasherDefault<U16IdentityHasher>;
 
 impl ShardTable {
     fn new(shards: Vec<Shard>) -> Self {
-        let mut shard_index = std::collections::HashMap::with_capacity(shards.len());
+        let mut shard_index = std::collections::HashMap::with_capacity_and_hasher(
+            shards.len(),
+            BuildU16IdentityHasher::default(),
+        );
         let mut counters = Vec::with_capacity(shards.len());
         let shards: Vec<_> = shards
             .into_iter()
@@ -653,7 +776,20 @@ impl ShardManager {
         // Bucket by table index. Using a Vec<Vec<_>> keyed by index is
         // cheaper than a HashMap for the common case of a small
         // shard count.
-        let mut groups: Vec<Vec<Bytes>> = (0..table.shards.len()).map(|_| Vec::new()).collect();
+        //
+        // PERF_AUDIT §1.7 — pre-size each per-shard `Vec<Bytes>` to
+        // the expected per-shard event count (events.len() / nshards),
+        // doubled for headroom. Pre-fix every group started at
+        // capacity 0 and grew by doubling, paying `nshards + 1`
+        // allocations and ~2× redundant memmove of the 32-byte
+        // `Bytes` handles per batch. `events.len() / shards.len() * 2`
+        // covers the typical uniformly-distributed batch with a small
+        // overshoot, and the rare worst-case (all events in one shard)
+        // still grows by doubling from a non-zero base.
+        let per_group_hint = (events.len() / table.shards.len().max(1)) * 2;
+        let mut groups: Vec<Vec<Bytes>> = (0..table.shards.len())
+            .map(|_| Vec::with_capacity(per_group_hint))
+            .collect();
         let mut group_ids: Vec<u16> = vec![0; groups.len()];
 
         let mut unrouted = 0usize;
@@ -709,6 +845,26 @@ impl ShardManager {
         let idx = self.resolve_idx(&table, id)?;
         let shard = table.shards.get(idx)?.clone();
         Some(ShardRef { shard })
+    }
+
+    /// Lock-free per-batch counter bump for the supplied shard. The
+    /// `batches_dispatched` field lives on the parallel
+    /// `Vec<Arc<ShardCounters>>` precisely so stats can be recorded
+    /// without taking the producer-hot shard mutex. Returns `false`
+    /// when `id` is unknown (e.g. the shard was just removed); the
+    /// caller treats that as a no-op. Per PERF_AUDIT §1.4.
+    pub fn record_batch_dispatch(&self, id: u16) -> bool {
+        let table = self.table.load();
+        let Some(idx) = self.resolve_idx(&table, id) else {
+            return false;
+        };
+        let Some(counters) = table.counters.get(idx) else {
+            return false;
+        };
+        counters
+            .batches_dispatched
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        true
     }
 
     /// Execute a function with exclusive access to a shard.
@@ -796,7 +952,7 @@ impl ShardManager {
         F: FnOnce(
             &Vec<Arc<parking_lot::Mutex<Shard>>>,
             &Vec<Arc<ShardCounters>>,
-            &std::collections::HashMap<u16, usize>,
+            &std::collections::HashMap<u16, usize, BuildU16IdentityHasher>,
         ) -> ShardTable,
     {
         let _guard = self.rebuild_lock.lock();
@@ -1083,30 +1239,37 @@ mod tests {
     }
 
     /// A `Shard` configured with a `ShardMetricsCollector` must feed every
-    /// successful push into the collector so the dynamic-scaling and
-    /// drain-finalize paths see non-zero counters. Without this wiring
-    /// `evaluate_scaling` reads `fill_ratio == 0` for every shard and
-    /// `finalize_draining`'s "is the ring actually empty" predicate is a
-    /// no-op (it sees `pushes_since_drain_start == 0` regardless of
-    /// contents).
+    /// successful push into the per-event counters so the dynamic-scaling
+    /// `event_rate` and drain-finalize predicate see correct totals.
+    ///
+    /// Per PERF_AUDIT §1.3 the latency / buffer-length probes are
+    /// subsampled on a 1-in-`METRICS_SAMPLE_STRIDE` cadence, so this
+    /// test pushes well past one stride period (256 = 4 × stride)
+    /// to deterministically guarantee at least four sampling
+    /// boundaries fire — the resulting averages are statistically
+    /// well-defined and the test contract stays observable.
     #[test]
     fn try_push_feeds_metrics_collector() {
         let collector = Arc::new(ShardMetricsCollector::new(0, 1024));
         let mut shard = Shard::with_metrics(0, 1024, Arc::clone(&collector));
 
-        for i in 0..16 {
+        let pushes: u64 = (METRICS_SAMPLE_STRIDE as u64) * 4;
+        for i in 0..pushes {
             shard.try_push(json!({"i": i})).unwrap();
         }
 
         let metrics = collector.collect_and_reset();
         assert_eq!(
-            metrics.event_rate, 16,
-            "every push must increment event_rate"
+            metrics.event_rate, pushes,
+            "every push must increment event_rate at full resolution"
         );
-        assert!(metrics.fill_ratio > 0.0, "buffer length must be observable");
+        assert!(
+            metrics.fill_ratio > 0.0,
+            "buffer length must be observable after ≥1 sampling stride"
+        );
         assert!(
             metrics.avg_push_latency_ns > 0,
-            "push latency must be recorded"
+            "push latency must be recorded after ≥1 sampling stride"
         );
     }
 
@@ -1143,21 +1306,185 @@ mod tests {
     }
 
     /// Same wiring for `try_push_raw` — the byte-oriented hot path.
+    /// Pushes past 4× `METRICS_SAMPLE_STRIDE` for the same
+    /// statistical reason as `try_push_feeds_metrics_collector`.
     #[test]
     fn try_push_raw_feeds_metrics_collector() {
         let collector = Arc::new(ShardMetricsCollector::new(0, 1024));
         let mut shard = Shard::with_metrics(0, 1024, Arc::clone(&collector));
 
-        for i in 0..16 {
+        let pushes: u64 = (METRICS_SAMPLE_STRIDE as u64) * 4;
+        for i in 0..pushes {
             shard
                 .try_push_raw(bytes::Bytes::from(format!("event-{i}")))
                 .unwrap();
         }
 
         let metrics = collector.collect_and_reset();
-        assert_eq!(metrics.event_rate, 16);
+        assert_eq!(metrics.event_rate, pushes);
         assert!(metrics.fill_ratio > 0.0);
         assert!(metrics.avg_push_latency_ns > 0);
+    }
+
+    /// PERF_AUDIT §1.3 regression: instrumentation MUST subsample
+    /// the latency/buffer-length probes — the pre-fix code paid
+    /// 2× `Instant::now()` plus a CAS loop on push_latency under
+    /// the shard mutex for every event, ~60–120 ns of overhead
+    /// per ingest. Pin the contract by pushing exactly
+    /// `STRIDE - 1` events and asserting no latency sample fires.
+    #[test]
+    fn latency_and_buffer_len_are_subsampled() {
+        let collector = Arc::new(ShardMetricsCollector::new(0, 1024));
+        let mut shard = Shard::with_metrics(0, 1024, Arc::clone(&collector));
+
+        // STRIDE - 1 pushes: the rolling counter never lands at
+        // phase 0, so no latency / buffer_len sample fires. The
+        // per-event counters still bump.
+        let below_stride: u64 = (METRICS_SAMPLE_STRIDE as u64) - 1;
+        for i in 0..below_stride {
+            shard
+                .try_push_raw(bytes::Bytes::from(format!("evt-{i}")))
+                .unwrap();
+        }
+        let metrics = collector.collect_and_reset();
+        assert_eq!(
+            metrics.event_rate, below_stride,
+            "per-event counters retain full resolution"
+        );
+        assert_eq!(
+            metrics.avg_push_latency_ns, 0,
+            "no latency sample must fire below the first stride boundary — \
+             pre-fix this fired every event"
+        );
+        assert_eq!(
+            metrics.fill_ratio, 0.0,
+            "no buffer_len sample must fire below the first stride boundary"
+        );
+
+        // Exactly one more push crosses the stride: latency and
+        // fill_ratio become observable.
+        shard.try_push_raw(bytes::Bytes::from("evt-final")).unwrap();
+        let metrics = collector.collect_and_reset();
+        assert_eq!(
+            metrics.event_rate, 1,
+            "the final push counts toward event_rate"
+        );
+        assert!(
+            metrics.avg_push_latency_ns > 0,
+            "crossing the stride boundary must record a latency sample"
+        );
+        assert!(
+            metrics.fill_ratio > 0.0,
+            "crossing the stride boundary must record buffer_len"
+        );
+    }
+
+    /// PERF_AUDIT §1.4 — `ShardManager::record_batch_dispatch` must
+    /// hit the lock-free per-shard counter (no shard-mutex lock).
+    /// Pin: a sequence of calls bumps the counter to the expected
+    /// total; unknown shard ids return false and do not bump
+    /// anything; the read path (`ShardManager::stats()`) reflects
+    /// the increments.
+    #[test]
+    fn record_batch_dispatch_is_lock_free_and_aggregates() {
+        let manager = ShardManager::new(2, 1024, BackpressureMode::DropNewest);
+        let shard_ids = manager.shard_ids();
+        assert_eq!(shard_ids.len(), 2);
+        for _ in 0..7 {
+            assert!(manager.record_batch_dispatch(shard_ids[0]));
+        }
+        for _ in 0..3 {
+            assert!(manager.record_batch_dispatch(shard_ids[1]));
+        }
+        // Unknown id → no-op.
+        assert!(!manager.record_batch_dispatch(0xFFFF));
+
+        // Stats aggregator sums across shards.
+        let stats = manager.stats();
+        assert_eq!(
+            stats.batches_dispatched, 10,
+            "aggregated batches_dispatched must equal the sum of per-shard \
+             record_batch_dispatch calls"
+        );
+    }
+
+    /// PERF_AUDIT §1.4 — the lock-free counter bump must hit the
+    /// RIGHT shard slot after a dynamic rescale. `remove_shard`
+    /// rebuilds the table with `swap_remove`, which relocates the
+    /// last shard into the removed index; a stale id→idx mapping
+    /// (or a static-mode `shard_id == index` assumption leaking
+    /// into dynamic mode) would credit the wrong shard's counter.
+    #[test]
+    fn record_batch_dispatch_hits_correct_slot_after_rescale() {
+        use crate::config::ScalingPolicy;
+        let policy = ScalingPolicy {
+            min_shards: 1,
+            max_shards: 8,
+            cooldown: std::time::Duration::from_nanos(1),
+            ..Default::default()
+        };
+        let manager =
+            ShardManager::with_mapper(2, 1024, BackpressureMode::DropNewest, policy).unwrap();
+
+        // Remove shard 0: swap_remove moves shard 1 (last) into
+        // index 0, so id 1 now resolves to a different index than
+        // its id.
+        manager
+            .remove_shard(0)
+            .expect("remove_shard must succeed in dynamic mode");
+
+        // Removed id → no-op, no counter bump anywhere.
+        assert!(!manager.record_batch_dispatch(0));
+
+        // Surviving id must bump ITS counter through the rebuilt
+        // index, not slot `shard_id as usize`.
+        for _ in 0..5 {
+            assert!(manager.record_batch_dispatch(1));
+        }
+        let shard1_batches = manager
+            .with_shard(1, |s| {
+                s.counters.batches_dispatched.load(AtomicOrdering::Relaxed)
+            })
+            .expect("shard 1 still routable");
+        assert_eq!(
+            shard1_batches, 5,
+            "post-rescale bumps must land on the surviving shard's counter"
+        );
+        assert_eq!(
+            manager.stats().batches_dispatched,
+            5,
+            "aggregate must see exactly the 5 post-rescale bumps"
+        );
+    }
+
+    /// PERF_AUDIT §1.5 — the identity hasher must stay collision-free
+    /// across the entire u16 keyspace (that's the property that makes
+    /// dropping SipHash safe here). Pin both the raw hasher contract
+    /// (`finish() == key`) and the end-to-end map behavior with every
+    /// possible shard id inserted at once.
+    #[test]
+    fn u16_identity_hasher_is_collision_free_across_keyspace() {
+        use std::hash::Hasher as _;
+        let mut h = U16IdentityHasher::default();
+        h.write_u16(0xBEEF);
+        assert_eq!(h.finish(), 0xBEEF, "hash must be the key verbatim");
+
+        let mut map: std::collections::HashMap<u16, usize, BuildU16IdentityHasher> =
+            std::collections::HashMap::with_capacity_and_hasher(
+                1 << 16,
+                BuildU16IdentityHasher::default(),
+            );
+        for id in 0..=u16::MAX {
+            map.insert(id, id as usize);
+        }
+        assert_eq!(map.len(), 1 << 16, "all 65536 keys must coexist");
+        for id in 0..=u16::MAX {
+            assert_eq!(
+                map.get(&id).copied(),
+                Some(id as usize),
+                "key {id} must round-trip through the identity-hashed map"
+            );
+        }
     }
 
     #[test]

@@ -561,25 +561,57 @@ impl NetSession {
         fairness_weight: u8,
         tx_window: u32,
     ) -> u64 {
+        // First-open-wins: warn when a caller's config disagrees
+        // with the live stream's. Shared by the read-probe hit and
+        // the lost-creation-race Occupied arm below so both
+        // occupied shapes keep the pre-§2.12 warning behavior.
+        fn warn_if_config_conflicts(
+            existing: &StreamState,
+            stream_id: u64,
+            reliable: bool,
+            fairness_weight: u8,
+            tx_window: u32,
+        ) {
+            if existing.reliable_mode() != reliable
+                || existing.fairness_weight() != fairness_weight.max(1)
+                || existing.tx_window() != tx_window
+            {
+                tracing::warn!(
+                    stream_id = format!("{:#x}", stream_id),
+                    existing_reliable = existing.reliable_mode(),
+                    new_reliable = reliable,
+                    existing_weight = existing.fairness_weight(),
+                    new_weight = fairness_weight,
+                    existing_tx_window = existing.tx_window(),
+                    new_tx_window = tx_window,
+                    "open_stream: ignoring conflicting config; first open wins"
+                );
+            }
+        }
+
+        // PERF_AUDIT §2.12 — read-only fast path. `publish_to_peer`
+        // calls `open_stream_with` on every publish, but the stream
+        // is almost always already open after the first call —
+        // pre-fix this took a DashMap write `entry()` lock per
+        // publish just to land in the Occupied arm and return the
+        // existing epoch. The `get` probe holds a read lock so
+        // concurrent opens on other streams don't contend.
+        if let Some(existing_ref) = self.streams.get(&stream_id) {
+            let existing = existing_ref.value();
+            warn_if_config_conflicts(existing, stream_id, reliable, fairness_weight, tx_window);
+            return existing.epoch();
+        }
+        // Slow path: stream missing. Take the write lock and
+        // either create the entry or pick up a concurrent
+        // creator's epoch on the race.
         use dashmap::mapref::entry::Entry;
         match self.streams.entry(stream_id) {
             Entry::Occupied(existing) => {
+                // Lost the creation race to a concurrent opener —
+                // same first-open-wins semantics (and the same
+                // conflict warning) as the read-probe hit above.
                 let existing = existing.get();
-                if existing.reliable_mode() != reliable
-                    || existing.fairness_weight() != fairness_weight.max(1)
-                    || existing.tx_window() != tx_window
-                {
-                    tracing::warn!(
-                        stream_id = format!("{:#x}", stream_id),
-                        existing_reliable = existing.reliable_mode(),
-                        new_reliable = reliable,
-                        existing_weight = existing.fairness_weight(),
-                        new_weight = fairness_weight,
-                        existing_tx_window = existing.tx_window(),
-                        new_tx_window = tx_window,
-                        "open_stream: ignoring conflicting config; first open wins"
-                    );
-                }
+                warn_if_config_conflicts(existing, stream_id, reliable, fairness_weight, tx_window);
                 existing.epoch()
             }
             Entry::Vacant(v) => {
@@ -1851,6 +1883,59 @@ mod tests {
             state.fairness_weight(),
             3,
             "first open wins — weight still 3"
+        );
+    }
+
+    /// PERF_AUDIT §2.12 regression: `open_stream_full` now probes
+    /// with a read-only `get` before falling back to the write
+    /// `entry()`. Two racers that both miss the probe must NOT
+    /// duplicate the stream or observe different epochs — the
+    /// `entry()` fallback serializes creation, and the loser picks
+    /// up the winner's epoch. Hammer the race across many fresh
+    /// stream ids; any TOCTOU between the probe and the entry
+    /// surfaces as an epoch mismatch or a stream-count anomaly.
+    #[test]
+    fn open_stream_full_racing_creators_agree_on_one_epoch() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let keys = test_keys();
+        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let session = Arc::new(NetSession::new(keys, peer_addr, 4, false));
+
+        const RACERS: usize = 4;
+        const ROUNDS: u64 = 200;
+        for round in 0..ROUNDS {
+            let stream_id = 0x1000 + round; // fresh id per round
+            let barrier = Arc::new(Barrier::new(RACERS));
+            let handles: Vec<_> = (0..RACERS)
+                .map(|_| {
+                    let session = Arc::clone(&session);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        session.open_stream_full(stream_id, true, 2, 0)
+                    })
+                })
+                .collect();
+            let epochs: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert!(
+                epochs.windows(2).all(|w| w[0] == w[1]),
+                "round {round}: all racers must observe the creation winner's epoch, got {epochs:?}"
+            );
+            let live = session
+                .get_stream(stream_id)
+                .expect("stream must exist after the race");
+            assert_eq!(
+                live.epoch(),
+                epochs[0],
+                "round {round}: live stream's epoch must match what the racers returned"
+            );
+        }
+        assert_eq!(
+            session.stream_count() as u64,
+            ROUNDS,
+            "exactly one stream per id — racing creators must never duplicate"
         );
     }
 

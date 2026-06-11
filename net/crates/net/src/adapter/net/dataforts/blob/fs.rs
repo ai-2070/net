@@ -94,6 +94,24 @@ pub const DEFAULT_FS_ADAPTER_CONCURRENCY: usize = 64;
 pub struct FileSystemAdapter {
     id: String,
     root: PathBuf,
+    /// Lazily-computed `canonicalize(root)`. Per PERF_AUDIT §6.10
+    /// the pre-fix `path_within_root` / store path canonicalized
+    /// `root` on every store + every fetch. The root is set at
+    /// construction and never changes, so we cache the resolved
+    /// form via `OnceLock` on first use. Stored as
+    /// `Option<PathBuf>` so the cache can record "root doesn't
+    /// exist yet" (legitimate at fresh-adapter construction) and
+    /// re-try on the next store — `OnceLock` only initializes
+    /// once, so we hold the cell as `Mutex<Option<PathBuf>>`
+    /// instead.
+    ///
+    /// **Unsupported:** re-pointing `root` (e.g. it is a symlink
+    /// whose target changes, or it is deleted and re-created at a
+    /// different resolved location) while the adapter is live. The
+    /// cache pins the canonical form resolved on first use; the
+    /// containment checks would keep enforcing the original
+    /// target. Construct a fresh adapter if the root must move.
+    root_canonical: Arc<parking_lot::Mutex<Option<PathBuf>>>,
     /// Cap on concurrent `spawn_blocking` tasks issued by this
     /// adapter. Bounds the share of the tokio blocking pool that a
     /// burst of stores can claim so other blocking work in the
@@ -111,7 +129,28 @@ impl FileSystemAdapter {
         Self {
             id: id.into(),
             root: root.into(),
+            root_canonical: Arc::new(parking_lot::Mutex::new(None)),
             concurrency: Arc::new(Semaphore::new(DEFAULT_FS_ADAPTER_CONCURRENCY)),
+        }
+    }
+
+    /// Get the cached `canonicalize(root)` (computing + storing on
+    /// first call). Returns `Err` if `canonicalize` fails for any
+    /// reason other than NotFound; returns `Ok(None)` if the root
+    /// doesn't exist yet (fresh adapter — the next store will
+    /// `create_dir_all` it). Per PERF_AUDIT §6.10 — must be called
+    /// from a blocking context (it may issue one `canonicalize`).
+    fn cached_root_canonical(&self) -> Result<Option<PathBuf>, BlobError> {
+        if let Some(cached) = self.root_canonical.lock().clone() {
+            return Ok(Some(cached));
+        }
+        match std::fs::canonicalize(&self.root) {
+            Ok(canon) => {
+                *self.root_canonical.lock() = Some(canon.clone());
+                Ok(Some(canon))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(backend(e)),
         }
     }
 
@@ -152,13 +191,19 @@ impl FileSystemAdapter {
     /// `root`, `Ok(false)` when it does not exist, and `Err` on an IO
     /// error or when the resolved path escapes `root`. Must be called
     /// from a blocking context (it issues `canonicalize` syscalls).
-    fn path_within_root(path: &Path, root: &Path) -> Result<bool, BlobError> {
+    fn path_within_root(&self, path: &Path) -> Result<bool, BlobError> {
         let canon = match std::fs::canonicalize(path) {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(backend(e)),
         };
-        let root_canon = std::fs::canonicalize(root).map_err(backend)?;
+        // PERF_AUDIT §6.10 — cached root canonicalization. Pre-fix
+        // every read paid an extra `canonicalize(root)` syscall.
+        let Some(root_canon) = self.cached_root_canonical()? else {
+            // Root doesn't exist yet — a resolved blob path can't
+            // escape something that's not there.
+            return Ok(false);
+        };
         if !canon.starts_with(&root_canon) {
             return Err(BlobError::Backend(
                 "fs adapter: resolved blob path escapes adapter root".to_string(),
@@ -219,21 +264,7 @@ impl BlobAdapter for FileSystemAdapter {
 
     async fn store(&self, blob_ref: &BlobRef, bytes: &[u8]) -> Result<(), BlobError> {
         let (expected_hash, _uri) = expect_small(blob_ref)?;
-        // Verify the bytes hash to the BlobRef's hash BEFORE writing.
-        // Without this an adapter author (or compromised binding) can
-        // pre-seed an arbitrary hash slot with attacker content; a
-        // later honest BlobRef would then resolve to that content
-        // because the on-disk path is keyed only on the hash. Hash
-        // here and reject mismatches at the trust boundary.
-        let computed: [u8; 32] = blake3::hash(bytes).into();
-        if computed != expected_hash {
-            return Err(BlobError::HashMismatch {
-                expected: expected_hash,
-                actual: computed,
-            });
-        }
         let path = self.path_for(&expected_hash);
-        let root = self.root.clone();
         let bytes = bytes.to_vec();
         let _permit = self
             .concurrency
@@ -241,21 +272,56 @@ impl BlobAdapter for FileSystemAdapter {
             .acquire_owned()
             .await
             .map_err(|_| backend("adapter concurrency semaphore closed"))?;
+        // PERF_AUDIT §6.10 — clone the adapter handle into the
+        // blocking closure so the hash verify AND the parent-canon
+        // check share the cached `root_canonical`. Pre-fix the
+        // hash ran on the tokio runtime worker (multi-ms for a
+        // multi-MiB Small blob) and the root canon was redone per
+        // store; both move into the blocking pool here.
+        let me = self.clone();
         tokio::task::spawn_blocking(move || -> Result<(), BlobError> {
             let _permit = _permit; // hold across the blocking work
+                                   // PERF_AUDIT §6.10 — hash verify inside the blocking
+                                   // pool so a multi-MiB Small payload doesn't stall the
+                                   // runtime worker. Verify the bytes hash to the BlobRef's
+                                   // hash BEFORE writing. Without this an adapter author
+                                   // (or compromised binding) can pre-seed an arbitrary
+                                   // hash slot with attacker content; a later honest
+                                   // BlobRef would then resolve to that content because
+                                   // the on-disk path is keyed only on the hash. Hash here
+                                   // and reject mismatches at the trust boundary.
+            let computed: [u8; 32] = blake3::hash(&bytes).into();
+            if computed != expected_hash {
+                return Err(BlobError::HashMismatch {
+                    expected: expected_hash,
+                    actual: computed,
+                });
+            }
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(backend)?;
                 // Defend against shard-dir symlinks pointing outside
-                // `root`. Canonicalize both sides (resolves every
-                // symlink in the path) and reject if the parent
-                // isn't contained in the root. Without this check,
+                // `root`. Canonicalize the parent (resolves every
+                // symlink in the path) and reject if it isn't
+                // contained in the cached root. Without this check,
                 // an attacker who can pre-create `<root>/<shard>`
                 // as a symlink to `/tmp` (or anywhere) escapes the
                 // adapter's sandbox on every store — D-12's hash-
                 // verify defends *reads* from attacker bytes; this
                 // defends *writes* from escaping the root.
                 let parent_canon = std::fs::canonicalize(parent).map_err(backend)?;
-                let root_canon = std::fs::canonicalize(&root).map_err(backend)?;
+                let root_canon = match me.cached_root_canonical()? {
+                    Some(r) => r,
+                    None => {
+                        // Root went missing between `create_dir_all`
+                        // and `canonicalize` — the create above
+                        // would have raced its disappearance. Treat
+                        // as an escape because we can't establish
+                        // containment.
+                        return Err(BlobError::Backend(
+                            "fs adapter: root vanished between create + canonicalize".into(),
+                        ));
+                    }
+                };
                 if !parent_canon.starts_with(&root_canon) {
                     return Err(BlobError::Backend(format!(
                         "fs adapter: shard dir escapes root (parent={:?} root={:?})",
@@ -358,7 +424,6 @@ impl BlobAdapter for FileSystemAdapter {
     async fn fetch(&self, blob_ref: &BlobRef) -> Result<Bytes, BlobError> {
         let (hash, uri) = expect_small(blob_ref)?;
         let path = self.path_for(&hash);
-        let root = self.root.clone();
         let uri = sanitize_uri_for_error(uri);
         let _permit = self
             .concurrency
@@ -366,10 +431,15 @@ impl BlobAdapter for FileSystemAdapter {
             .acquire_owned()
             .await
             .map_err(|_| backend("adapter concurrency semaphore closed"))?;
+        // PERF_AUDIT §6.10 — clone the adapter handle into the
+        // blocking closure so `path_within_root` can hit the cached
+        // root canonicalization on `self.root_canonical`. Each
+        // clone is one String + one PathBuf + two Arc bumps.
+        let me = self.clone();
         tokio::task::spawn_blocking(move || -> Result<Bytes, BlobError> {
             let _permit = _permit;
             // Reject a symlink-escape before following the path (L3).
-            if !Self::path_within_root(&path, &root)? {
+            if !me.path_within_root(&path)? {
                 return Err(BlobError::NotFound(uri));
             }
             match std::fs::read(&path) {
@@ -406,7 +476,6 @@ impl BlobAdapter for FileSystemAdapter {
         }
         let (hash, uri) = expect_small(blob_ref)?;
         let path = self.path_for(&hash);
-        let root = self.root.clone();
         let uri = sanitize_uri_for_error(uri);
         let start = range.start;
         let _permit = self
@@ -415,10 +484,12 @@ impl BlobAdapter for FileSystemAdapter {
             .acquire_owned()
             .await
             .map_err(|_| backend("adapter concurrency semaphore closed"))?;
+        // PERF_AUDIT §6.10 — share the cached root canonicalization.
+        let me = self.clone();
         tokio::task::spawn_blocking(move || -> Result<Bytes, BlobError> {
             let _permit = _permit;
             // Reject a symlink-escape before following the path (L3).
-            if !Self::path_within_root(&path, &root)? {
+            if !me.path_within_root(&path)? {
                 return Err(BlobError::NotFound(uri));
             }
             let mut f = match std::fs::File::open(&path) {
@@ -440,18 +511,19 @@ impl BlobAdapter for FileSystemAdapter {
     async fn exists(&self, blob_ref: &BlobRef) -> Result<bool, BlobError> {
         let (hash, _uri) = expect_small(blob_ref)?;
         let path = self.path_for(&hash);
-        let root = self.root.clone();
         let permit = self
             .concurrency
             .clone()
             .acquire_owned()
             .await
             .map_err(|_| backend("adapter concurrency semaphore closed"))?;
+        // PERF_AUDIT §6.10 — share the cached root canonicalization.
+        let me = self.clone();
         let res = tokio::task::spawn_blocking(move || -> Result<bool, BlobError> {
             let _permit = permit;
             // Reject an out-of-root symlink before probing (L3). A path
             // that resolves outside root is not a legitimate blob.
-            if !Self::path_within_root(&path, &root)? {
+            if !me.path_within_root(&path)? {
                 return Ok(false);
             }
             // Then preserve the pre-L3 `is_file()` contract: only a
@@ -473,7 +545,6 @@ impl BlobAdapter for FileSystemAdapter {
         // on the producer side.
         let (hash, uri) = expect_small(blob_ref)?;
         let path = self.path_for(&hash);
-        let root = self.root.clone();
         let uri = sanitize_uri_for_error(uri);
         // Acquire-on-spawn: the streaming task holds the permit for
         // the duration of the read, mirroring the all-in-memory
@@ -487,10 +558,12 @@ impl BlobAdapter for FileSystemAdapter {
         // 4-chunk channel — enough to keep the reader busy without
         // letting it run far ahead of the consumer.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BlobError>>(4);
+        // PERF_AUDIT §6.10 — share the cached root canonicalization.
+        let me = self.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             // Reject a symlink-escape before following the path (L3).
-            match Self::path_within_root(&path, &root) {
+            match me.path_within_root(&path) {
                 Ok(true) => {}
                 Ok(false) => {
                     let _ = tx.blocking_send(Err(BlobError::NotFound(uri)));

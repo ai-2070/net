@@ -56,6 +56,15 @@ pub const CHUNK_MAX_HARD_CEILING_BYTES: u32 = 64 * 1024 * 1024;
 /// typically replicates one CDC chunk per round trip.
 pub const CHUNK_MAX_BACKGROUND_SOFT_CAP_BYTES: u32 = 4 * 1024 * 1024;
 
+/// Per-event wire overhead inside a [`SyncResponse`] chunk: 8 bytes
+/// `event_seq` + 4 bytes `payload_len`. Used both by the budget cull
+/// loop in [`handle_sync_request`] and as the `per_event_overhead`
+/// passed to `RedexFile::read_range_limited` — keeping the pre-walk's
+/// per-event cost identical to the cull loop's means the bounded read
+/// fetches exactly the events that ship, and a backlog of zero-length
+/// payloads can't defeat the byte bound (each still costs 12).
+const SYNC_EVENT_WIRE_OVERHEAD_BYTES: u64 = 8 + 4;
+
 /// Outcome of running [`handle_sync_request`] against a leader's
 /// `RedexFile`. Either a serializable [`SyncResponse`] or a typed
 /// [`SyncNackError`] the coordinator wraps in a `SyncNack` wire
@@ -231,11 +240,24 @@ pub fn handle_sync_request(
         effective_budget = effective_budget.min(CHUNK_MAX_BACKGROUND_SOFT_CAP_BYTES);
     }
 
-    // Read a generous window — file's local retention may have
-    // trimmed seqs; `read_range` silently skips evicted entries.
-    // We pull `local_next` as the upper bound so we don't miss
-    // recent events, then cull to the byte budget afterward.
-    let events = file.read_range(request.since_seq, local_next);
+    // Read a budget-bounded window. Pre-fix this called
+    // `file.read_range(since_seq, local_next)` with no cap and culled
+    // afterward — a replica 1 GB behind made the leader scan + xxh3
+    // every payload in the backlog just to ship 64 MiB. The pre-walk
+    // inside `read_range_limited` now sums index `payload_len`s plus
+    // the same 12-byte per-event wire overhead the cull loop below
+    // charges (cheap, no materialize, no checksum) and only fetches
+    // the events that fit — the pre-walk and the cull loop agree
+    // byte-for-byte, so the bounded read fetches exactly the events
+    // that ship. The loop below remains the authority on the budget
+    // and the hard-ceiling-first-event NACK rule. Per
+    // PERF_AUDIT_2026_06_10_FULL_CRATE.md §5.1.
+    let events = file.read_range_limited(
+        request.since_seq,
+        local_next,
+        effective_budget as u64,
+        SYNC_EVENT_WIRE_OVERHEAD_BYTES,
+    );
     if events.is_empty() {
         // Range was non-empty per `local_next > since_seq` but
         // `read_range` returned nothing — every requested seq has
@@ -262,7 +284,7 @@ pub fn handle_sync_request(
     let mut acc: u64 = 0;
     let mut out: Vec<SyncEvent> = Vec::new();
     for ev in events {
-        let cost = 8u64 + 4 + ev.payload.len() as u64;
+        let cost = SYNC_EVENT_WIRE_OVERHEAD_BYTES + ev.payload.len() as u64;
         // R-19: bound oversize-first-event admission by the
         // hard ceiling. An event whose payload alone exceeds
         // the 64 MiB hard cap must NACK BadRange — shipping it
@@ -293,9 +315,15 @@ pub fn handle_sync_request(
         // diverged from the surrounding pattern; future reviewers
         // copying the loop body would carry the unguarded version.
         acc = acc.saturating_add(cost);
+        // `ev.payload` is a refcount-shareable Bytes from the heap
+        // segment. Pre-fix this did `to_vec()` (full memcpy +
+        // alloc) which `SyncResponse::to_bytes` then copied again
+        // into the wire frame — two unnecessary copies on the
+        // leader send path. With `SyncEvent.payload: Bytes` this
+        // becomes a refcount bump. Per §5.4.
         out.push(SyncEvent {
             event_seq: ev.entry.seq,
-            payload: ev.payload.to_vec(),
+            payload: ev.payload.clone(),
         });
     }
 
@@ -306,6 +334,43 @@ pub fn handle_sync_request(
         request_id: request.request_id,
         events: out,
     })
+}
+
+/// Async wrapper around [`apply_sync_response`] that offloads the
+/// blocking body (`append_batch` writes + `file.sync()` fsync, both
+/// of which block the calling task for ms-class durations on disk-
+/// backed channels) to the tokio blocking pool.
+///
+/// **PERF_AUDIT §5.5** — the replication runtime's per-channel
+/// `select!` loop calls this on every accepted `SyncResponse`. Pre-
+/// fix the sync `apply_sync_response` ran inline on that task,
+/// pinning a tokio worker thread for the duration of every fsync —
+/// starving every OTHER task scheduled on that worker (other
+/// channels' loops, timers) and degrading runtime scheduler health.
+/// The per-channel loop itself still awaits this wrapper inline —
+/// deliberately, so the advertised tail only advances after the
+/// fsync completes and a subsequent chunk can never be processed
+/// while a prior apply is in flight. The win is confined to the
+/// runtime: blocking work moves to the blocking pool, worker
+/// threads stay available.
+///
+/// `RedexFile` is internally `Arc<RedexFileInner>` so `clone()` is
+/// a refcount bump; `SyncResponse` clones the `Vec<SyncEvent>` once
+/// (each event's `payload: Bytes` is itself a refcount bump after
+/// PERF_AUDIT §5.2 / §5.4). The cloning cost is dominated by the
+/// fsync the wrapper exists to offload.
+pub async fn apply_sync_response_async(
+    file: RedexFile,
+    response: SyncResponse,
+    expected_channel: ChannelId,
+) -> Result<u64, ApplyError> {
+    tokio::task::spawn_blocking(move || apply_sync_response(&file, &response, expected_channel))
+        .await
+        .unwrap_or_else(|join_err| {
+            Err(ApplyError::AppendFailed(format!(
+                "apply_sync_response_async: spawn_blocking panicked: {join_err}"
+            )))
+        })
 }
 
 /// Replica-side: validate + apply a chunk to `file`. Returns the
@@ -402,13 +467,12 @@ pub fn apply_sync_response(
             divergence_suspected,
         });
     }
-    // Apply via append_batch. We hand each payload as a `Bytes`
-    // (cheap clone-of-`Vec<u8>`) so we don't double-copy.
-    let payloads: Vec<Bytes> = response
-        .events
-        .iter()
-        .map(|e| Bytes::from(e.payload.clone()))
-        .collect();
+    // Apply via append_batch. Each payload is already a Bytes
+    // (Vec<u8> → Bytes was the §5.2 fix); cloning is now a true
+    // refcount bump rather than the alloc + memcpy that
+    // `Bytes::from(e.payload.clone())` produced when payload was
+    // a Vec<u8>. Per PERF_AUDIT §5.2.
+    let payloads: Vec<Bytes> = response.events.iter().map(|e| e.payload.clone()).collect();
     let appended = payloads.len() as u64;
     file.append_batch(&payloads)
         .map_err(|e| ApplyError::AppendFailed(format!("{e:?}")))?;
@@ -548,7 +612,7 @@ mod tests {
         assert_eq!(resp.first_seq, 0);
         assert_eq!(resp.events[0].event_seq, 0);
         assert_eq!(resp.events[4].event_seq, 4);
-        assert_eq!(resp.events[0].payload, b"evt-0");
+        assert_eq!(resp.events[0].payload.as_ref(), b"evt-0");
     }
 
     #[test]
@@ -792,7 +856,7 @@ mod tests {
             let events: Vec<SyncEvent> = (0..chunk_size)
                 .map(|i| SyncEvent {
                     event_seq: 4 + i as u64,
-                    payload: format!("e-{i}").into_bytes(),
+                    payload: bytes::Bytes::from(format!("e-{i}").into_bytes()),
                 })
                 .collect();
             let response = SyncResponse {
@@ -827,15 +891,15 @@ mod tests {
             events: vec![
                 SyncEvent {
                     event_seq: 0,
-                    payload: b"first".to_vec(),
+                    payload: bytes::Bytes::from_static(b"first"),
                 },
                 SyncEvent {
                     event_seq: 1,
-                    payload: b"second".to_vec(),
+                    payload: bytes::Bytes::from_static(b"second"),
                 },
                 SyncEvent {
                     event_seq: 2,
-                    payload: b"third".to_vec(),
+                    payload: bytes::Bytes::from_static(b"third"),
                 },
             ],
             request_id: 0,
@@ -872,7 +936,7 @@ mod tests {
             leader_first_retained_seq: 0,
             events: vec![SyncEvent {
                 event_seq: 0,
-                payload: b"x".to_vec(),
+                payload: bytes::Bytes::from_static(b"x"),
             }],
             request_id: 0,
         };
@@ -890,7 +954,7 @@ mod tests {
             leader_first_retained_seq: 0,
             events: vec![SyncEvent {
                 event_seq: 5, // declared 0 but actually 5
-                payload: b"x".to_vec(),
+                payload: bytes::Bytes::from_static(b"x"),
             }],
             request_id: 0,
         };
@@ -909,15 +973,15 @@ mod tests {
             events: vec![
                 SyncEvent {
                     event_seq: 0,
-                    payload: b"a".to_vec(),
+                    payload: bytes::Bytes::from_static(b"a"),
                 },
                 SyncEvent {
                     event_seq: 1,
-                    payload: b"b".to_vec(),
+                    payload: bytes::Bytes::from_static(b"b"),
                 },
                 SyncEvent {
                     event_seq: 3, // gap! should be 2
-                    payload: b"c".to_vec(),
+                    payload: bytes::Bytes::from_static(b"c"),
                 },
             ],
             request_id: 0,
@@ -945,14 +1009,14 @@ mod tests {
             events: vec![
                 SyncEvent {
                     event_seq: u64::MAX,
-                    payload: b"last".to_vec(),
+                    payload: bytes::Bytes::from_static(b"last"),
                 },
                 // Whatever this seq is, `prev + 1` overflows so
                 // the loop must report NonMonotonic at index 1
                 // rather than panic.
                 SyncEvent {
                     event_seq: 0,
-                    payload: b"wraparound".to_vec(),
+                    payload: bytes::Bytes::from_static(b"wraparound"),
                 },
             ],
             request_id: 0,
@@ -975,11 +1039,11 @@ mod tests {
             events: vec![
                 SyncEvent {
                     event_seq: 0,
-                    payload: b"a".to_vec(),
+                    payload: bytes::Bytes::from_static(b"a"),
                 },
                 SyncEvent {
                     event_seq: 0, // duplicate
-                    payload: b"a-dup".to_vec(),
+                    payload: bytes::Bytes::from_static(b"a-dup"),
                 },
             ],
             request_id: 0,
@@ -1000,7 +1064,7 @@ mod tests {
             leader_first_retained_seq: 0,
             events: vec![SyncEvent {
                 event_seq: 2,
-                payload: b"stale".to_vec(),
+                payload: bytes::Bytes::from_static(b"stale"),
             }],
             request_id: 0,
         };
@@ -1029,7 +1093,7 @@ mod tests {
             leader_first_retained_seq: 0,
             events: vec![SyncEvent {
                 event_seq: 5,
-                payload: b"future".to_vec(),
+                payload: bytes::Bytes::from_static(b"future"),
             }],
             request_id: 0,
         };
@@ -1070,7 +1134,7 @@ mod tests {
             leader_first_retained_seq: 5,
             events: vec![SyncEvent {
                 event_seq: 5,
-                payload: b"future".to_vec(),
+                payload: bytes::Bytes::from_static(b"future"),
             }],
             request_id: 0,
         };
@@ -1126,7 +1190,7 @@ mod tests {
             leader_first_retained_seq: 3,
             events: vec![SyncEvent {
                 event_seq: 5,
-                payload: b"future".to_vec(),
+                payload: bytes::Bytes::from_static(b"future"),
             }],
             request_id: 0,
         };
@@ -1258,11 +1322,11 @@ mod tests {
             events: vec![
                 SyncEvent {
                     event_seq: 10,
-                    payload: vec![b'A'],
+                    payload: bytes::Bytes::from_static(b"A"),
                 },
                 SyncEvent {
                     event_seq: 11,
-                    payload: vec![b'B'],
+                    payload: bytes::Bytes::from_static(b"B"),
                 },
             ],
             request_id: 0,
@@ -1293,5 +1357,155 @@ mod tests {
         assert_eq!(events[0].payload.as_ref(), b"A");
         assert_eq!(events[1].entry.seq, 11);
         assert_eq!(events[1].payload.as_ref(), b"B");
+    }
+
+    /// PERF_AUDIT §5.1 — catch-up progress guarantee. A single event
+    /// larger than the request's chunk budget (but under the hard
+    /// ceiling) must still ship, alone, instead of producing an
+    /// empty chunk the replica would retry forever (livelock). The
+    /// follow-up request from `first_seq + events.len()` must then
+    /// resume cleanly at the next event.
+    #[test]
+    fn oversized_first_event_under_hard_ceiling_still_ships_alone() {
+        let f = build_file("redex/oversize_progress");
+        // Event 0: 256-byte payload, far above the 16-byte budget
+        // below. Events 1..=3: small.
+        f.append(&vec![b'L'; 256]).unwrap();
+        append_n(&f, 3, "small");
+        let cid = channel_id_for("redex/oversize_progress");
+
+        let req = SyncRequest {
+            channel_id: cid,
+            since_seq: 0,
+            chunk_max: 16,
+            request_id: 7,
+            class: Default::default(),
+        };
+        let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
+            panic!("oversize-but-under-ceiling first event must ship, not NACK");
+        };
+        assert_eq!(resp.first_seq, 0);
+        assert_eq!(
+            resp.events.len(),
+            1,
+            "exactly the oversize event ships; nothing rides along"
+        );
+        assert_eq!(resp.events[0].event_seq, 0);
+        assert_eq!(resp.events[0].payload.len(), 256);
+
+        // Continuation: the replica's follow-up request from
+        // `first_seq + events.len()` resumes at seq 1.
+        let next_req = SyncRequest {
+            channel_id: cid,
+            since_seq: resp.first_seq + resp.events.len() as u64,
+            chunk_max: 4096,
+            request_id: 8,
+            class: Default::default(),
+        };
+        let SyncRequestOutcome::Response(next) = handle_sync_request(&f, &next_req, cid) else {
+            panic!("expected Response");
+        };
+        assert_eq!(next.first_seq, 1);
+        assert_eq!(next.events.len(), 3);
+        assert_eq!(next.events[0].event_seq, 1);
+        assert_eq!(next.events[0].payload.as_ref(), b"small-0");
+    }
+
+    /// PERF_AUDIT §5.1 — zero-length payloads must not defeat the
+    /// bounded read: each event still costs the 12-byte SyncEvent
+    /// wire overhead, so a tiny budget admits a bounded number of
+    /// them (not the entire backlog).
+    #[test]
+    fn zero_length_payload_backlog_is_still_budget_bounded() {
+        let f = build_file("redex/zero_len_budget");
+        for _ in 0..100 {
+            f.append(b"").unwrap();
+        }
+        let cid = channel_id_for("redex/zero_len_budget");
+        // Budget 50 → 4 events at 12 bytes wire cost each (48; a
+        // 5th would reach 60 > 50).
+        let req = SyncRequest {
+            channel_id: cid,
+            since_seq: 0,
+            chunk_max: 50,
+            request_id: 0,
+            class: Default::default(),
+        };
+        let SyncRequestOutcome::Response(resp) = handle_sync_request(&f, &req, cid) else {
+            panic!("expected Response");
+        };
+        assert_eq!(resp.events.len(), 4);
+        assert_eq!(resp.first_seq, 0);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // apply_sync_response_async — PERF_AUDIT §5.5
+    // ────────────────────────────────────────────────────────────────
+
+    /// PERF_AUDIT §5.5 — ordering contract of the spawn_blocking
+    /// offload: when `apply_sync_response_async` resolves `Ok`, the
+    /// apply (append_batch + sync) has COMPLETED — the returned tail
+    /// is immediately readable from the file. The runtime advances
+    /// the advertised tail (`record_tail_seq`) only after this await
+    /// resolves, so "durable before advertise" is preserved.
+    #[tokio::test]
+    async fn apply_sync_response_async_resolves_only_after_apply_is_visible() {
+        let replica = build_file("redex/async_apply");
+        let cid = channel_id_for("redex/async_apply");
+        let response = SyncResponse {
+            channel_id: cid,
+            first_seq: 0,
+            leader_first_retained_seq: 0,
+            events: vec![
+                SyncEvent {
+                    event_seq: 0,
+                    payload: bytes::Bytes::from_static(b"a"),
+                },
+                SyncEvent {
+                    event_seq: 1,
+                    payload: bytes::Bytes::from_static(b"b"),
+                },
+            ],
+            request_id: 0,
+        };
+
+        let new_tail = apply_sync_response_async(replica.clone(), response, cid)
+            .await
+            .unwrap();
+        assert_eq!(new_tail, 2);
+        // At resolution time the events are already applied — no
+        // separate completion signal to wait for.
+        assert_eq!(replica.next_seq(), 2);
+        let events = replica.read_range(0, 2);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].payload.as_ref(), b"a");
+        assert_eq!(events[1].payload.as_ref(), b"b");
+    }
+
+    /// PERF_AUDIT §5.5 — apply errors must propagate through the
+    /// spawn_blocking wrapper (the JoinHandle is awaited, not
+    /// dropped). A channel mismatch surfaces as the same
+    /// `ApplyError` the sync form returns, and nothing is applied.
+    #[tokio::test]
+    async fn apply_sync_response_async_propagates_apply_errors() {
+        let replica = build_file("redex/async_apply_err");
+        let expected = channel_id_for("redex/async_apply_err");
+        let wrong = channel_id_for("redex/async_apply_err_other");
+        let response = SyncResponse {
+            channel_id: wrong,
+            first_seq: 0,
+            leader_first_retained_seq: 0,
+            events: vec![SyncEvent {
+                event_seq: 0,
+                payload: bytes::Bytes::from_static(b"x"),
+            }],
+            request_id: 0,
+        };
+
+        let err = apply_sync_response_async(replica.clone(), response, expected)
+            .await
+            .expect_err("channel mismatch must propagate");
+        assert!(matches!(err, ApplyError::ChannelMismatch { .. }));
+        assert_eq!(replica.next_seq(), 0, "nothing applied on error");
     }
 }

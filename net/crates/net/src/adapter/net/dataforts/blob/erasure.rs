@@ -320,6 +320,23 @@ impl RsEncoder {
     /// - Inner-vec lengths differ → `BlobError::Backend`.
     /// - Inner-vec length is zero → `BlobError::Backend`.
     pub fn encode(&self, data: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, BlobError> {
+        // Backwards-compat shim — the slice-taking [`Self::encode_slices`]
+        // does the real work. Per PERF_AUDIT §6.5 the striper now
+        // routes through `encode_slices` directly so the data
+        // shards don't have to be materialized into owned `Vec`s
+        // first; this `&[Vec<u8>]` entry stays for tests and
+        // legacy callers.
+        let data_views: Vec<&[u8]> = data.iter().map(|d| d.as_slice()).collect();
+        self.encode_slices(&data_views)
+    }
+
+    /// PERF_AUDIT §6.5 — slice-taking variant of [`Self::encode`]
+    /// used by the RS striper hot path. Lets full-length data
+    /// shards pass through as borrowed slices into the original
+    /// `Bytes` buffers (no per-chunk Vec materialization); only
+    /// shards shorter than `max_len` get padded into owned
+    /// scratch storage on the caller side.
+    pub fn encode_slices(&self, data: &[&[u8]]) -> Result<Vec<Vec<u8>>, BlobError> {
         if data.len() != self.params.k as usize {
             return Err(BlobError::Backend(format!(
                 "RS encode: expected {} data shards, got {}",
@@ -344,12 +361,9 @@ impl RsEncoder {
             ));
         }
         let mut parity: Vec<Vec<u8>> = (0..self.params.m).map(|_| vec![0u8; shard_len]).collect();
-        // The crate's `encode_sep` takes `data: &[T]` and writes
-        // into `parity: &mut [U]`; both must be slice-of-slices.
-        let data_refs: Vec<&[u8]> = data.iter().map(|d| d.as_slice()).collect();
         let mut parity_refs: Vec<&mut [u8]> = parity.iter_mut().map(|p| p.as_mut_slice()).collect();
         self.rs
-            .encode_sep(&data_refs, &mut parity_refs)
+            .encode_sep(data, &mut parity_refs)
             .map_err(|e| BlobError::Backend(format!("RS encode_sep failed: {:?}", e)))?;
         Ok(parity)
     }
@@ -446,7 +460,14 @@ pub struct RsStriper {
     /// `encode` can produce parity over them (since data chunks
     /// must be padded to equal length for the GF(2^8) encoder,
     /// the striper needs the raw bytes, not just the ref).
-    in_flight: Vec<(Vec<u8>, ChunkRefV3)>,
+    ///
+    /// **PERF_AUDIT §6.5** — held as `Bytes` so the CDC store path
+    /// can `push_chunk(chunk_bytes.clone(), ...)` (refcount bump,
+    /// O(1)) instead of the pre-fix `push_chunk(chunk_bytes.to_vec(),
+    /// ...)` (a full ~1-16 MiB memcpy per chunk). The Fixed store
+    /// path converts `Vec<u8>` → `Bytes` via `Bytes::from` which
+    /// is also O(1) (takes ownership of the Vec's buffer).
+    in_flight: Vec<(bytes::Bytes, ChunkRefV3)>,
     /// Running total of *data bytes* (sum of in-flight chunk
     /// sizes) — drives the stripe-close decision.
     in_flight_data_bytes: u64,
@@ -489,7 +510,7 @@ impl RsStriper {
     /// fewer-than-`k`-chunks-at-byte-target CDC edge case.
     pub fn push_chunk(
         &mut self,
-        bytes: Vec<u8>,
+        bytes: bytes::Bytes,
         chunk_ref: ChunkRefV3,
     ) -> Result<Option<ClosedStripe>, BlobError> {
         if !chunk_ref.is_data() {
@@ -550,17 +571,51 @@ impl RsStriper {
             .max()
             .unwrap_or(1)
             .max(1);
-        let mut padded: Vec<Vec<u8>> = Vec::with_capacity(k);
+        // PERF_AUDIT §6.5 — short shards get padded into owned
+        // scratch Vecs (storage for the resize-to-max_len); shards
+        // that are already at max_len pass through as borrowed
+        // slices into the `Bytes` we already hold. The encoder
+        // doesn't need ownership of the input — it only reads.
+        // Pre-fix every shard was unconditionally materialized
+        // into an owned Vec, paying a full-shard memcpy per CDC
+        // chunk for the (~always) full-length data shards.
+        let mut padded_owned: Vec<Vec<u8>> = Vec::new();
         let mut data_refs: Vec<ChunkRefV3> = Vec::with_capacity(k);
-        for (mut bytes, chunk_ref) in in_flight {
-            if bytes.len() < max_len {
-                bytes.resize(max_len, 0);
+        // Track each in-flight entry's source so we can later
+        // build a `Vec<&[u8]>` referencing either the original
+        // `Bytes` or the padded scratch buffer.
+        enum ShardSrc {
+            /// Index into the original `in_flight[i].0: Bytes`.
+            Original(usize),
+            /// Index into `padded_owned`.
+            Padded(usize),
+        }
+        let mut sources: Vec<ShardSrc> = Vec::with_capacity(k);
+        for (i, (bytes, chunk_ref)) in in_flight.iter().enumerate() {
+            if bytes.len() == max_len {
+                sources.push(ShardSrc::Original(i));
+            } else {
+                let mut padded = Vec::with_capacity(max_len);
+                padded.extend_from_slice(bytes);
+                padded.resize(max_len, 0);
+                let idx = padded_owned.len();
+                padded_owned.push(padded);
+                sources.push(ShardSrc::Padded(idx));
             }
-            padded.push(bytes);
-            data_refs.push(chunk_ref);
+            data_refs.push(*chunk_ref);
         }
 
-        let parity_bytes = self.encoder.encode(&padded)?;
+        // Build the borrowed slice view the encoder consumes. The
+        // `in_flight` Bytes and `padded_owned` Vecs both live for
+        // the entire encode call, so the &[u8] borrows are sound.
+        let data_views: Vec<&[u8]> = sources
+            .iter()
+            .map(|src| match src {
+                ShardSrc::Original(i) => in_flight[*i].0.as_ref(),
+                ShardSrc::Padded(i) => padded_owned[*i].as_slice(),
+            })
+            .collect();
+        let parity_bytes = self.encoder.encode_slices(&data_views)?;
         let mut parity_refs: Vec<ChunkRefV3> = Vec::with_capacity(m);
         for (i, pbytes) in parity_bytes.iter().enumerate() {
             let phash: [u8; 32] = blake3::hash(pbytes).into();
@@ -806,12 +861,12 @@ mod tests {
             let bytes = det_bytes(i, 100);
             let hash: [u8; 32] = blake3::hash(&bytes).into();
             let cref = ChunkRefV3::data(hash, 100);
-            assert!(striper.push_chunk(bytes, cref).unwrap().is_none());
+            assert!(striper.push_chunk(bytes.into(), cref).unwrap().is_none());
         }
         let bytes = det_bytes(3, 100);
         let hash: [u8; 32] = blake3::hash(&bytes).into();
         let cref = ChunkRefV3::data(hash, 100);
-        let closed = striper.push_chunk(bytes, cref).unwrap().unwrap();
+        let closed = striper.push_chunk(bytes.into(), cref).unwrap().unwrap();
         assert_eq!(closed.block.chunks.len(), 6); // 4 data + 2 parity
         assert_eq!(closed.parity_bytes.len(), 2);
         assert_eq!(
@@ -838,7 +893,7 @@ mod tests {
             let hash: [u8; 32] = blake3::hash(&bytes).into();
             let cref = ChunkRefV3::data(hash, size as u32);
             sent.push(cref);
-            let result = striper.push_chunk(bytes, cref).unwrap();
+            let result = striper.push_chunk(bytes.into(), cref).unwrap();
             if i + 1 == sizes.len() {
                 let closed = result.unwrap();
                 for (j, &expected_size) in sizes.iter().enumerate() {
@@ -863,7 +918,7 @@ mod tests {
             let bytes = det_bytes(i, 50);
             let hash: [u8; 32] = blake3::hash(&bytes).into();
             let cref = ChunkRefV3::data(hash, 50);
-            assert!(striper.push_chunk(bytes, cref).unwrap().is_none());
+            assert!(striper.push_chunk(bytes.into(), cref).unwrap().is_none());
         }
         let closed = striper.finalize().unwrap().unwrap();
         assert_eq!(closed.block.encoding, Encoding::Replicated);
@@ -891,7 +946,7 @@ mod tests {
             let bytes = det_bytes(i, 64);
             let hash: [u8; 32] = blake3::hash(&bytes).into();
             let cref = ChunkRefV3::data(hash, 64);
-            if striper.push_chunk(bytes, cref).unwrap().is_some() {
+            if striper.push_chunk(bytes.into(), cref).unwrap().is_some() {
                 closed_count += 1;
             }
         }
@@ -905,7 +960,7 @@ mod tests {
         let mut striper = RsStriper::new(RsParams { k: 3, m: 2 }).unwrap();
         let bytes = vec![0u8; 10];
         let parity_ref = ChunkRefV3::parity([0u8; 32], 10, 0);
-        assert!(striper.push_chunk(bytes, parity_ref).is_err());
+        assert!(striper.push_chunk(bytes.into(), parity_ref).is_err());
     }
 
     /// End-to-end RS round trip through the striper: push k
@@ -920,7 +975,7 @@ mod tests {
         for (i, bytes) in originals.iter().enumerate() {
             let hash: [u8; 32] = blake3::hash(bytes).into();
             let cref = ChunkRefV3::data(hash, bytes.len() as u32);
-            let result = striper.push_chunk(bytes.clone(), cref).unwrap();
+            let result = striper.push_chunk(bytes.clone().into(), cref).unwrap();
             if i + 1 == originals.len() {
                 closed = Some(result.unwrap());
             }
@@ -947,6 +1002,79 @@ mod tests {
         let mut expected = originals[1].clone();
         expected.resize(shard_len, 0);
         assert_eq!(shards[1].as_ref().unwrap(), &expected);
+    }
+
+    /// PERF_AUDIT §6.5 — golden parity equivalence. The
+    /// Bytes-holding striper (full-length shards borrowed straight
+    /// from the original `Bytes`, short shards padded into owned
+    /// scratch) must produce byte-identical parity to the legacy
+    /// all-Vec path (manually zero-pad every shard to `max_len`,
+    /// then `encode(&[Vec<u8>])`). Mixed-size stripe so BOTH the
+    /// `Original` (shard 1, max-length) and `Padded` (shards 0, 2,
+    /// 3) branches of `close_stripe_with_rs` execute.
+    #[test]
+    fn striper_bytes_path_parity_matches_legacy_all_vec_encode() {
+        let params = RsParams { k: 4, m: 2 };
+        let sizes = [100usize, 256, 73, 9];
+        let originals: Vec<Vec<u8>> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| det_bytes(i as u8, s))
+            .collect();
+
+        // Legacy all-Vec path: pad every shard to max_len, encode
+        // owned Vecs. This is exactly what the pre-§6.5
+        // close_stripe_with_rs did.
+        let max_len = sizes.iter().copied().max().unwrap();
+        let padded: Vec<Vec<u8>> = originals
+            .iter()
+            .map(|b| {
+                let mut v = b.clone();
+                v.resize(max_len, 0);
+                v
+            })
+            .collect();
+        let encoder = RsEncoder::new(params).unwrap();
+        let golden = encoder.encode(&padded).unwrap();
+
+        // Striper path (Bytes in_flight + borrowed/padded views).
+        let mut striper = RsStriper::new(params).unwrap();
+        let mut closed: Option<ClosedStripe> = None;
+        for (i, bytes) in originals.iter().enumerate() {
+            let hash: [u8; 32] = blake3::hash(bytes).into();
+            let cref = ChunkRefV3::data(hash, bytes.len() as u32);
+            let result = striper.push_chunk(bytes.clone().into(), cref).unwrap();
+            if i + 1 == originals.len() {
+                closed = Some(result.unwrap());
+            } else {
+                assert!(result.is_none());
+            }
+        }
+        let closed = closed.unwrap();
+        assert_eq!(
+            closed.parity_bytes, golden,
+            "striper parity must be byte-identical to the legacy all-Vec encode path"
+        );
+        // Parity refs must hash + size the emitted parity bytes.
+        let parity_refs: Vec<&ChunkRefV3> = closed
+            .block
+            .chunks
+            .iter()
+            .filter(|c| c.is_parity())
+            .collect();
+        assert_eq!(parity_refs.len(), 2);
+        for (r, p) in parity_refs.iter().zip(closed.parity_bytes.iter()) {
+            let expect: [u8; 32] = blake3::hash(p).into();
+            assert_eq!(r.hash, expect, "parity ref hash must cover emitted bytes");
+            assert_eq!(r.size as usize, max_len, "parity sized to max data shard");
+        }
+        // Data refs keep their PRE-padding sizes (the on-wire
+        // contract reads rely on to strip the zero-fill).
+        let data_refs: Vec<&ChunkRefV3> =
+            closed.block.chunks.iter().filter(|c| c.is_data()).collect();
+        for (r, &s) in data_refs.iter().zip(sizes.iter()) {
+            assert_eq!(r.size as usize, s, "data ref keeps pre-padding size");
+        }
     }
 
     /// Production constants match the v0.3 plan §6: `(10, 4)`

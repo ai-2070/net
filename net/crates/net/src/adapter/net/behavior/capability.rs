@@ -2111,6 +2111,66 @@ pub struct CapabilityAnnouncement {
 /// "lists > 64 use a group, not inline node enumeration."
 pub const MAX_ALLOW_LIST_LEN: usize = 64;
 
+/// Borrowed canonical view of a [`CapabilityAnnouncement`] used by
+/// [`CapabilityAnnouncement::signed_payload`]. Per PERF_AUDIT §4.4 —
+/// emits the same byte sequence as the derived `Serialize` on a
+/// `CapabilityAnnouncement` whose `signature` is `None` and
+/// `hop_count` is `0`, without cloning the heavy `CapabilitySet`
+/// payload + allow-lists per sign / verify.
+///
+/// **Wire compatibility.** Field order, names, and
+/// `skip_serializing_if` behaviour must match the derived impl on
+/// `CapabilityAnnouncement` exactly. Reorder a field here without
+/// also reordering its declaration in the struct and pre-M-1 /
+/// pre-v0.4 peers will fail signature verification across the
+/// rolling upgrade. Adding a field to `CapabilityAnnouncement`
+/// requires adding the matching `serialize_field` call here too.
+struct SignedPayloadCanonical<'a>(&'a CapabilityAnnouncement);
+
+impl<'a> serde::Serialize for SignedPayloadCanonical<'a> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let a = self.0;
+        // Up to 11 fields can be emitted (signature and hop_count
+        // are ALWAYS omitted in the canonical view because we're
+        // emulating `signature = None` and `hop_count = 0`). The
+        // count is a hint; the JSON serializer ignores it and the
+        // others tolerate over-counting plus `skip_field`.
+        let mut state = serializer.serialize_struct("CapabilityAnnouncement", 11)?;
+        state.serialize_field("node_id", &a.node_id)?;
+        state.serialize_field("entity_id", &a.entity_id)?;
+        state.serialize_field("version", &a.version)?;
+        state.serialize_field("timestamp_ns", &a.timestamp_ns)?;
+        state.serialize_field("ttl_secs", &a.ttl_secs)?;
+        state.serialize_field("capabilities", &a.capabilities)?;
+        // signature: emulating `None` → omit unconditionally.
+        // hop_count: emulating `0` → omit unconditionally.
+        // The remaining fields use the same `skip_serializing_if`
+        // predicates the derived impl uses.
+        if a.reflex_addr.is_some() {
+            state.serialize_field("reflex_addr", &a.reflex_addr)?;
+        } else {
+            state.skip_field("reflex_addr")?;
+        }
+        if !a.allowed_nodes.is_empty() {
+            state.serialize_field("allowed_nodes", &a.allowed_nodes)?;
+        } else {
+            state.skip_field("allowed_nodes")?;
+        }
+        if !a.allowed_subnets.is_empty() {
+            state.serialize_field("allowed_subnets", &a.allowed_subnets)?;
+        } else {
+            state.skip_field("allowed_subnets")?;
+        }
+        if !a.allowed_groups.is_empty() {
+            state.serialize_field("allowed_groups", &a.allowed_groups)?;
+        } else {
+            state.skip_field("allowed_groups")?;
+        }
+        state.end()
+    }
+}
+
 /// Serde predicate: skip serializing `hop_count` when it's zero.
 /// Preserves on-wire byte-compat with pre-M-1 announcements that
 /// didn't carry this field at all. See
@@ -2257,10 +2317,18 @@ impl CapabilityAnnouncement {
         reason = "no CapabilityAnnouncement field has a fallible Serialize impl today; panic is the documented loud-diagnostic strategy for a future refactor that introduces one"
     )]
     fn signed_payload(&self) -> Vec<u8> {
-        let mut canonical = self.clone();
-        canonical.signature = None;
-        canonical.hop_count = 0;
-        serde_json::to_vec(&canonical).expect(
+        // PERF_AUDIT §4.4 — serialize a borrowed canonical view
+        // instead of cloning the whole announcement. Pre-fix this
+        // did `let mut canonical = self.clone(); canonical.signature
+        // = None; canonical.hop_count = 0; serde_json::to_vec(&canonical)`,
+        // deep-cloning the full `CapabilitySet` (HashSet<Tag>,
+        // metadata, allow-lists, hardware) per sign and per verify.
+        // The wrapper emits the same byte sequence: `signature` and
+        // `hop_count` are always omitted (the derived `Serialize`
+        // skips them via `skip_serializing_if` for `None` /
+        // `is_hop_count_zero`), and the remaining fields pass
+        // through borrowed.
+        serde_json::to_vec(&SignedPayloadCanonical(self)).expect(
             "CapabilityAnnouncement::signed_payload: serde_json::to_vec is infallible \
              over the current field set; if this ever fires, a fallible Serialize impl \
              was added and the signed transcript must be re-designed before merging",
@@ -3339,6 +3407,76 @@ mod tests {
             "pre-v0.4 wire shape must not carry allowed_groups when empty"
         );
     }
+    /// PERF_AUDIT §4.4 — the borrowed `SignedPayloadCanonical`
+    /// wrapper MUST emit byte-identical JSON to the pre-fix
+    /// clone-then-mutate approach (clone the announcement, set
+    /// `signature = None`, set `hop_count = 0`, serialize). Any
+    /// drift breaks signature compatibility across the rolling
+    /// upgrade. Pin byte-identity across the realistic axes:
+    /// empty / full allow-lists, with / without `reflex_addr`,
+    /// signature already set vs not, hop_count zero vs non-zero.
+    #[test]
+    fn signed_payload_canonical_is_byte_identical_to_clone_mutate_form() {
+        use super::super::super::identity::EntityKeypair;
+        fn cloned_canonical(ann: &CapabilityAnnouncement) -> Vec<u8> {
+            // The pre-fix path: clone, mutate, serialize. Used here
+            // ONLY as the reference oracle.
+            let mut canonical = ann.clone();
+            canonical.signature = None;
+            canonical.hop_count = 0;
+            serde_json::to_vec(&canonical).expect("infallible")
+        }
+
+        let kp = EntityKeypair::generate();
+
+        // Bare announcement — no allow-lists, no reflex_addr, no
+        // signature, hop_count = 0.
+        let bare =
+            CapabilityAnnouncement::new(7, kp.entity_id().clone(), 1, sample_capability_set());
+        assert_eq!(
+            bare.signed_payload(),
+            cloned_canonical(&bare),
+            "bare announcement: signed_payload must equal cloned-canonical bytes"
+        );
+
+        // With reflex_addr set.
+        let with_reflex = bare
+            .clone()
+            .with_reflex_addr(Some("198.51.100.5:54321".parse().unwrap()));
+        assert_eq!(
+            with_reflex.signed_payload(),
+            cloned_canonical(&with_reflex),
+            "with reflex_addr: signed_payload must equal cloned-canonical bytes"
+        );
+
+        // With non-empty allow_nodes.
+        let mut with_nodes = bare.clone();
+        with_nodes.allowed_nodes = vec![0x1111, 0x2222, 0x3333];
+        assert_eq!(
+            with_nodes.signed_payload(),
+            cloned_canonical(&with_nodes),
+            "with allowed_nodes: signed_payload must equal cloned-canonical bytes"
+        );
+
+        // With every optional field populated — including
+        // non-empty allowed_subnets / allowed_groups so all three
+        // allow-list `skip_serializing_if = "Vec::is_empty"` axes
+        // are exercised in their EMITTED form, not just skipped.
+        let mut full = with_reflex.clone();
+        full.allowed_nodes = vec![0x1111, 0x2222];
+        full.allowed_subnets = vec![super::super::subnet::SubnetId([0x11; 16])];
+        full.allowed_groups = vec![super::super::group::GroupId([0x22; 32])];
+        // Pretend signature was already set + hop_count was bumped
+        // (the canonical view must blank both before hashing).
+        full.signature = Some(Signature64([0x42; 64]));
+        full.hop_count = 5;
+        assert_eq!(
+            full.signed_payload(),
+            cloned_canonical(&full),
+            "with signature/hop_count set: canonical must blank them before serialize"
+        );
+    }
+
     /// A signed announcement carrying non-empty allow-lists
     /// verifies after wire round-trip. Pins that the signature
     /// covers the new fields end-to-end.

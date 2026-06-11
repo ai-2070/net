@@ -1100,6 +1100,69 @@ impl RedexFile {
         out
     }
 
+    /// Read events in `[start, end)` up to a cumulative byte budget,
+    /// where each event costs `payload_len + per_event_overhead`.
+    /// Pre-walks the index (which is cheap — `RedexEntry: Copy`,
+    /// no payload touch, no checksum) to find the first index slice
+    /// whose cost sum reaches `max_payload_bytes`, then materializes
+    /// only that slice. Always materializes at least one event when the
+    /// range is non-empty so callers that want to surface oversize-
+    /// first-event errors still get a single event back.
+    ///
+    /// `per_event_overhead` exists so a backlog of zero/tiny payloads
+    /// can't defeat the bound: with payload-only accounting, a run of
+    /// zero-length events costs 0 each and the pre-walk would take the
+    /// ENTIRE range — re-creating the unbounded read this method
+    /// replaces. Callers should pass their real per-event framing cost
+    /// (e.g. the 12-byte SyncEvent wire header for replication
+    /// catch-up); pass `0` only when the caller separately bounds the
+    /// event count.
+    ///
+    /// Use this in preference to `read_range` whenever the caller has a
+    /// hard upper bound on bytes shipped — most importantly leader
+    /// replication catch-up, where `read_range(since_seq, local_next)`
+    /// over a GB-scale backlog wasted ~1 GB of disk read + xxh3
+    /// (`materialize` re-checksums every payload, §5.8) per request
+    /// while holding the file mutex (stalling concurrent `append`s).
+    /// Per PERF_AUDIT_2026_06_10_FULL_CRATE.md §5.1.
+    pub fn read_range_limited(
+        &self,
+        start: u64,
+        end: u64,
+        max_payload_bytes: u64,
+        per_event_overhead: u64,
+    ) -> Vec<RedexEvent> {
+        if end <= start {
+            return Vec::new();
+        }
+        let mut state = self.inner.state.lock();
+        let lo = state.index.partition_point(|e| e.seq < start);
+        let hi = state.index.partition_point(|e| e.seq < end);
+        let range = &state.index[lo..hi];
+        // Pre-walk: count how many leading entries fit the budget.
+        // First entry is always taken so the caller can surface an
+        // oversize-first-event NACK rather than silently producing an
+        // empty range.
+        let mut acc: u64 = 0;
+        let mut take_count: usize = 0;
+        for entry in range {
+            let cost = u64::from(entry.payload_len).saturating_add(per_event_overhead);
+            if take_count > 0 && acc.saturating_add(cost) > max_payload_bytes {
+                break;
+            }
+            acc = acc.saturating_add(cost);
+            take_count += 1;
+        }
+        let entries: Vec<RedexEntry> = state.index[lo..lo + take_count].to_vec();
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            if let Some(ev) = materialize(entry, &mut state.segment) {
+                out.push(ev);
+            }
+        }
+        out
+    }
+
     /// Read a single event by sequence. Returns `None` when `seq`
     /// has been evicted or was never appended. Convenience over
     /// [`Self::read_range(seq, seq + 1)`]; saves the `Vec`
@@ -1967,6 +2030,99 @@ mod tests {
         let last = f.read_range(998, 1000);
         assert_eq!(last.len(), 2);
         assert_eq!(last.last().unwrap().entry.seq, 999);
+    }
+
+    /// PERF_AUDIT §5.1 — `read_range_limited` must (a) stop
+    /// materializing once the running payload total reaches the
+    /// budget, (b) always return at least one event so the caller
+    /// can detect oversize-first-event and NACK, (c) preserve the
+    /// half-open range semantics of `read_range`, and (d) match
+    /// `read_range` exactly when the budget is generous.
+    #[test]
+    fn read_range_limited_bounds_payload_bytes_and_keeps_at_least_one() {
+        let f = make_file("perf-5-1");
+        // 50 events of 100 bytes each → 5_000 bytes total payload.
+        let payload = vec![b'x'; 100];
+        for _ in 0..50 {
+            f.append(&payload).unwrap();
+        }
+
+        // (a) Budget caps the cumulative payload bytes returned.
+        // 250 bytes = 2 events (200 bytes), the next would push to
+        // 300 > 250 → stop.
+        let bounded = f.read_range_limited(0, 50, 250, 0);
+        assert_eq!(bounded.len(), 2);
+        assert_eq!(
+            bounded.iter().map(|e| e.entry.seq).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        // (b) Oversize-first-event behavior: budget = 1 byte, but
+        // the first event is 100 bytes — we still return it so the
+        // caller can detect and NACK rather than spin on an empty
+        // chunk forever.
+        let oversize_first = f.read_range_limited(0, 50, 1, 0);
+        assert_eq!(oversize_first.len(), 1);
+        assert_eq!(oversize_first[0].entry.seq, 0);
+
+        // (c) Half-open `end` is exclusive — same as read_range.
+        let tail = f.read_range_limited(48, 50, u64::MAX, 0);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail.last().unwrap().entry.seq, 49);
+
+        // (d) Generous budget reproduces `read_range` exactly.
+        let unbounded = f.read_range_limited(10, 30, u64::MAX, 0);
+        let baseline = f.read_range(10, 30);
+        assert_eq!(unbounded.len(), baseline.len());
+        for (a, b) in unbounded.iter().zip(baseline.iter()) {
+            assert_eq!(a.entry.seq, b.entry.seq);
+            assert_eq!(a.payload.as_ref(), b.payload.as_ref());
+        }
+    }
+
+    /// PERF_AUDIT §5.1 — empty-range and end<=start short-circuit
+    /// returns Vec::new() without taking the file lock or walking
+    /// the index. Ensures the limited variant matches the
+    /// unbounded variant's edge-case contract.
+    #[test]
+    fn read_range_limited_empty_range_short_circuits() {
+        let f = make_file("perf-5-1-empty");
+        for _ in 0..5 {
+            f.append(b"x").unwrap();
+        }
+        assert!(f.read_range_limited(10, 5, 1024, 0).is_empty());
+        assert!(f.read_range_limited(3, 3, 1024, 0).is_empty());
+    }
+
+    /// PERF_AUDIT §5.1 — `per_event_overhead` must keep the pre-walk
+    /// bounded for zero-length payloads. With payload-only accounting
+    /// a run of empty events costs 0 each, the budget never binds,
+    /// and the pre-walk takes (and materializes) the ENTIRE range —
+    /// re-creating the unbounded read this method exists to replace.
+    #[test]
+    fn read_range_limited_overhead_bounds_zero_payload_runs() {
+        let f = make_file("perf-5-1-zero");
+        // 100 zero-length payloads — legal via `append(&[])`.
+        for _ in 0..100 {
+            f.append(b"").unwrap();
+        }
+
+        // Overhead 12 (the SyncEvent wire-header cost replication
+        // passes): budget 50 admits 4 events (12, 24, 36, 48; the
+        // 5th would reach 60 > 50).
+        let bounded = f.read_range_limited(0, 100, 50, 12);
+        assert_eq!(bounded.len(), 4);
+
+        // Overhead 0 documents the failure mode the parameter
+        // guards against: every zero-cost event fits, so the whole
+        // range comes back.
+        let unbounded = f.read_range_limited(0, 100, 50, 0);
+        assert_eq!(unbounded.len(), 100);
+
+        // Progress guarantee still holds with overhead larger than
+        // the budget: at least one event ships.
+        let keep_one = f.read_range_limited(0, 100, 1, 12);
+        assert_eq!(keep_one.len(), 1);
     }
 
     #[test]

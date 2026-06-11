@@ -17,6 +17,14 @@
 /// Size of an `EventMeta` in its wire / on-disk format.
 pub const EVENT_META_SIZE: usize = 24;
 
+/// Byte range of the `checksum` field within the encoded header —
+/// the single source of truth for the slot the §5.7 prebuilt-ingest
+/// paths patch in place after the tail is serialized (see
+/// [`EventMeta::patch_checksum`]). Kept next to [`EVENT_META_SIZE`]
+/// so a layout change updates every encoder/decoder/patcher from
+/// one place instead of chasing magic `20..24` offsets.
+pub(crate) const EVENT_META_CHECKSUM_RANGE: std::ops::Range<usize> = 20..24;
+
 /// Dispatch value reserved for "raw" payloads — no CortEX-level
 /// semantics. Callers that don't need dispatch routing should use
 /// this.
@@ -88,8 +96,19 @@ impl EventMeta {
         // out[2..4] stays [0, 0] (reserved pad).
         out[4..12].copy_from_slice(&self.origin_hash.to_le_bytes());
         out[12..20].copy_from_slice(&self.seq_or_ts.to_le_bytes());
-        out[20..24].copy_from_slice(&self.checksum.to_le_bytes());
+        out[EVENT_META_CHECKSUM_RANGE].copy_from_slice(&self.checksum.to_le_bytes());
         out
+    }
+
+    /// Patch the `checksum` slot of an encoded header in place.
+    /// `buf` must start with an [`EventMeta`] encoded by
+    /// [`Self::to_bytes`] (the §5.7 single-buffer ingest shape:
+    /// header at offset 0, tail behind it). Lives here so the
+    /// field's byte range stays in this module rather than
+    /// leaking as magic offsets into every ingest path.
+    #[inline(always)]
+    pub(crate) fn patch_checksum(buf: &mut [u8], checksum: u32) {
+        buf[EVENT_META_CHECKSUM_RANGE].copy_from_slice(&checksum.to_le_bytes());
     }
 
     /// Decode from a 24-byte slice. Returns `None` if the slice is
@@ -114,7 +133,11 @@ impl EventMeta {
             _pad: [bytes[2], bytes[3]],
             origin_hash: u64::from_le_bytes(bytes[4..12].try_into().expect("8 bytes")),
             seq_or_ts: u64::from_le_bytes(bytes[12..20].try_into().expect("8 bytes")),
-            checksum: u32::from_le_bytes(bytes[20..24].try_into().expect("4 bytes")),
+            checksum: u32::from_le_bytes(
+                bytes[EVENT_META_CHECKSUM_RANGE]
+                    .try_into()
+                    .expect("4 bytes"),
+            ),
         })
     }
 
@@ -132,8 +155,7 @@ impl EventMeta {
     /// (including the uninitialized 0 placeholder during ingest).
     fn for_checksum_bytes(&self) -> [u8; EVENT_META_SIZE] {
         let mut b = self.to_bytes();
-        // bytes [20..24] = checksum field; zero it.
-        b[20..24].copy_from_slice(&0u32.to_le_bytes());
+        Self::patch_checksum(&mut b, 0);
         b
     }
 }

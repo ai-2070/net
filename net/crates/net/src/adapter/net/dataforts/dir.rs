@@ -80,6 +80,21 @@ const BLOCKING_FS_THRESHOLD: u64 = 256 * 1024;
 /// higher can raise this constant for more large-file parallelism.
 pub const DEFAULT_INFLIGHT_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 
+/// Byte-semaphore permits a file reserves while in flight: ≈ its
+/// current chunk's worth (chunks move sequentially), clamped to
+/// `[1, budget]` so a file larger than the whole budget can still
+/// run (alone). Shared by `store_dir` and `fetch_dir` so both
+/// sides reserve identically.
+///
+/// The min-chain runs in the u64 domain BEFORE the `u32` cast —
+/// `store_dir` previously cast `meta.len() as u32` first, which
+/// wraps for files > 4 GiB (4 GiB + 1 B → 1 permit) and
+/// under-reserves the budget while the entire file is buffered in
+/// memory. The result fits `u32` by construction (≤ `budget`).
+fn in_flight_byte_permits(len: u64, budget: u32) -> u32 {
+    len.min(BLOB_CHUNK_SIZE_BYTES).min(budget as u64).max(1) as u32
+}
+
 // ── Errors ──────────────────────────────────────────────────────────
 
 /// Failure surface for directory store / fetch.
@@ -209,7 +224,6 @@ pub struct DirStats {
 /// are recorded. Entries are sorted by path for a deterministic
 /// manifest. Non-regular, non-dir, non-symlink nodes are skipped.
 pub async fn store_dir(adapter: &MeshBlobAdapter, root: &Path) -> Result<BlobRef, DirError> {
-    let mut entries: Vec<DirEntry> = Vec::new();
     // Directory traversal (`read_dir` + `symlink_metadata`, recursive) is
     // blocking FS — run it on the blocking pool so it doesn't stall an
     // async executor thread at node_modules scale (T-3). Deterministic
@@ -226,49 +240,140 @@ pub async fn store_dir(adapter: &MeshBlobAdapter, root: &Path) -> Result<BlobRef
     .map_err(|e| DirError::Io(std::io::Error::other(e)))??;
     raw.sort_by(|a, b| a.0.cmp(&b.0));
 
-    for (rel, meta, abs) in raw {
-        let file_type = meta.file_type();
-        if file_type.is_symlink() {
-            // read_link is a single tiny syscall — inline.
-            let target = std::fs::read_link(&abs)?;
-            entries.push(DirEntry {
-                path: rel,
-                kind: EntryKind::Symlink {
-                    target: target.to_string_lossy().into_owned(),
-                },
-            });
-        } else if file_type.is_dir() {
-            entries.push(DirEntry {
-                path: rel,
-                kind: EntryKind::Dir {
-                    mode: mode_of(&meta),
-                },
-            });
-        } else if file_type.is_file() {
-            // Offload only large reads (T-3); small files read inline
-            // (sub-ms, cheaper than spawn_blocking dispatch).
-            let bytes = if meta.len() > BLOCKING_FS_THRESHOLD {
-                tokio::task::spawn_blocking(move || std::fs::read(&abs))
-                    .await
-                    .map_err(|e| DirError::Io(std::io::Error::other(e)))??
-            } else {
-                std::fs::read(&abs)?
-            };
-            let chunked = chunk_payload(&bytes)?;
-            let hash: [u8; 32] = blake3::hash(&bytes).into();
-            let uri = format!("mesh://{}", hex(&hash));
-            let blob_ref = chunked.into_blob_ref(uri, Encoding::Replicated)?;
-            adapter.store(&blob_ref, &bytes).await?;
-            entries.push(DirEntry {
-                path: rel,
-                kind: EntryKind::File {
-                    mode: mode_of(&meta),
-                    blob: blob_ref.encode(),
-                },
-            });
+    // PERF_AUDIT §6.9 — parallelize file processing with the same
+    // shape `fetch_dir` uses (bounded `Semaphore` over file count +
+    // a `byte_sem` budget). Pre-fix the loop fully serialized:
+    // one file at a time read → hash → chunk → store. With
+    // `buffer_unordered`-style spawned work, disk reads and
+    // adapter stores overlap and the manifest finalizes when the
+    // last file lands, not after the sum of per-file latencies.
+    //
+    // Dirs and symlinks are still inline — they're sub-µs syscalls
+    // and not worth a tokio spawn dispatch.
+    use futures::stream::StreamExt;
+    let store_concurrency = DEFAULT_FETCH_CONCURRENCY;
+    let store_budget = u32::try_from(DEFAULT_INFLIGHT_BUDGET_BYTES).unwrap_or(u32::MAX);
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(store_concurrency));
+    let byte_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(store_budget as usize));
+
+    // Build a per-entry task stream. We preserve manifest order
+    // by emitting entries in the same `raw` order: dirs/symlinks
+    // resolve to `Ready` futures so they slot into the stream
+    // alongside file futures and don't need a separate pass.
+    // First-error abort flag: once any entry fails, later entries
+    // short-circuit before doing I/O. The drain loop below still
+    // awaits every STARTED future (see drain comment), but this
+    // flag keeps a failure in a 100k-file tree from paying the
+    // read + hash + store cost for every remaining entry.
+    let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let file_futures = raw.into_iter().map(|(rel, meta, abs)| {
+        let sem = sem.clone();
+        let byte_sem = byte_sem.clone();
+        let abort = abort.clone();
+        let mode = mode_of(&meta);
+        async move {
+            if abort.load(std::sync::atomic::Ordering::Relaxed) {
+                // A sibling entry already failed; the overall
+                // store_dir returns its error, so this entry's
+                // output is discarded either way.
+                return Ok::<Option<DirEntry>, DirError>(None);
+            }
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                let target = std::fs::read_link(&abs)?;
+                return Ok::<Option<DirEntry>, DirError>(Some(DirEntry {
+                    path: rel,
+                    kind: EntryKind::Symlink {
+                        target: target.to_string_lossy().into_owned(),
+                    },
+                }));
+            }
+            if file_type.is_dir() {
+                return Ok(Some(DirEntry {
+                    path: rel,
+                    kind: EntryKind::Dir { mode },
+                }));
+            }
+            if file_type.is_file() {
+                // Bound concurrency before the disk read so a
+                // wide directory doesn't trigger N parallel
+                // `spawn_blocking`s saturating the blocking pool.
+                let _permit = sem.acquire().await.map_err(|_| {
+                    DirError::Blob(BlobError::Backend("dir store: semaphore closed".into()))
+                })?;
+                // Per-file in-flight byte reservation — same
+                // helper as fetch_dir so both sides reserve
+                // identically: big files self-limit while small
+                // files stay bounded only by the count cap.
+                let in_flight = in_flight_byte_permits(meta.len(), store_budget);
+                let _bytes_permit = byte_sem.acquire_many(in_flight).await.map_err(|_| {
+                    DirError::Blob(BlobError::Backend(
+                        "dir store: byte semaphore closed".into(),
+                    ))
+                })?;
+                let bytes = if meta.len() > BLOCKING_FS_THRESHOLD {
+                    tokio::task::spawn_blocking(move || std::fs::read(&abs))
+                        .await
+                        .map_err(|e| DirError::Io(std::io::Error::other(e)))??
+                } else {
+                    std::fs::read(&abs)?
+                };
+                let chunked = chunk_payload(&bytes)?;
+                let hash: [u8; 32] = blake3::hash(&bytes).into();
+                let uri = format!("mesh://{}", hex(&hash));
+                let blob_ref = chunked.into_blob_ref(uri, Encoding::Replicated)?;
+                adapter.store(&blob_ref, &bytes).await?;
+                return Ok(Some(DirEntry {
+                    path: rel,
+                    kind: EntryKind::File {
+                        mode,
+                        blob: blob_ref.encode(),
+                    },
+                }));
+            }
+            // Device / socket / fifo — skip.
+            Ok(None)
         }
-        // else: device / socket / fifo — skipped.
+    });
+
+    // `buffer_unordered` lets futures resolve as soon as they're
+    // ready (vs `buffered` which waits for in-order completion);
+    // we re-sort at the end to keep the manifest deterministic.
+    //
+    // Drain the stream fully — don't short-circuit on the first
+    // error. Same rationale as the manifest store loop in
+    // mesh.rs: `store_chunk` registers a per-hash entry in
+    // `in_flight_stores` on entry and removes it after the store
+    // completes (success or error); dropping a buffered future
+    // mid-flight skips that cleanup and leaks the entry. Awaiting
+    // every started future lets in-flight stores run their own
+    // cleanup paths; the `abort` flag set on first error keeps
+    // not-yet-started entries from doing any new work. First
+    // error wins so the caller observes the same failure shape
+    // as the pre-§6.9 sequential loop.
+    let mut results: Vec<DirEntry> = Vec::new();
+    let mut first_err: Option<DirError> = None;
+    let mut stream = futures::stream::iter(file_futures).buffer_unordered(store_concurrency);
+    while let Some(res) = stream.next().await {
+        match res {
+            Ok(Some(entry)) => results.push(entry),
+            Ok(None) => {}
+            Err(e) => {
+                abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
     }
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    // Restore the deterministic-by-path order that the pre-fix
+    // sequential loop produced (raw was already sorted before
+    // dispatch; `buffer_unordered` returns in completion order).
+    results.sort_by(|a, b| a.path.cmp(&b.path));
+    let entries = results;
 
     let manifest = DirManifest {
         version: DIR_MANIFEST_VERSION,
@@ -478,11 +583,7 @@ async fn reconstruct_tree(
             .ok_or_else(|| DirError::Manifest(format!("entry {} has no blob ref", entry.path)))?;
         // Bytes this file can have in flight at once ≈ its current chunk
         // (chunks pull sequentially), bounded by the budget.
-        let in_flight = blob_ref
-            .size()
-            .min(BLOB_CHUNK_SIZE_BYTES)
-            .min(budget as u64)
-            .max(1) as u32;
+        let in_flight = in_flight_byte_permits(blob_ref.size(), budget);
         let node = node.clone();
         let sem = sem.clone();
         let byte_sem = byte_sem.clone();
@@ -971,6 +1072,38 @@ fn hex(hash: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review-bot P2 regression — the byte-permit clamp must run
+    /// in the u64 domain BEFORE the u32 cast. `store_dir`
+    /// previously did `(len as u32).min(...)`, so a > 4 GiB file
+    /// wrapped (4 GiB + 1 B → 1 permit) and held the whole file in
+    /// memory against a 1-byte budget reservation.
+    #[test]
+    fn in_flight_byte_permits_clamps_before_casting() {
+        let budget = u32::try_from(DEFAULT_INFLIGHT_BUDGET_BYTES).unwrap();
+        let chunk = u32::try_from(BLOB_CHUNK_SIZE_BYTES).unwrap();
+
+        // Empty file still needs one permit to make progress.
+        assert_eq!(in_flight_byte_permits(0, budget), 1);
+        // Small file reserves exactly its size.
+        assert_eq!(in_flight_byte_permits(1024, budget), 1024);
+        // At and past the chunk size: capped to one chunk's worth.
+        assert_eq!(in_flight_byte_permits(BLOB_CHUNK_SIZE_BYTES, budget), chunk);
+        assert_eq!(
+            in_flight_byte_permits(BLOB_CHUNK_SIZE_BYTES + 1, budget),
+            chunk
+        );
+        // The wrap case: 4 GiB + 1 byte. `as u32` first would give
+        // 1; the u64-domain clamp gives the chunk cap.
+        assert_eq!(
+            in_flight_byte_permits(u64::from(u32::MAX) + 2, budget),
+            chunk
+        );
+        assert_eq!(in_flight_byte_permits(u64::MAX, budget), chunk);
+        // A budget smaller than the chunk size wins the clamp, so
+        // a giant file can still run alone.
+        assert_eq!(in_flight_byte_permits(u64::MAX, 64), 64);
+    }
 
     #[test]
     fn safe_join_accepts_plain_relative_paths() {

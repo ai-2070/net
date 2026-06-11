@@ -166,10 +166,51 @@ impl ShardMetricsCollector {
         self.current_len.store(len as u64, AtomicOrdering::Relaxed);
     }
 
-    /// Record an event ingestion.
+    /// Record an event ingestion: bumps the per-event counters
+    /// (events_in_window, pushes_since_drain_start) AND adds a
+    /// latency sample to the packed `(count, sum)` average.
+    ///
+    /// Pre-PERF_AUDIT §1.3 this was the only API and every
+    /// successful push called it, paying the CAS loop on
+    /// `push_latency` per event under the shard mutex. The
+    /// subsampled fast path now calls [`Self::record_event_only`]
+    /// per event and [`Self::record_latency_sample`] only once
+    /// every N pushes. This composite remains for test fixtures
+    /// and the rare caller that wants both updates together.
     #[inline]
     pub fn record_push(&self, latency_ns: u64) {
+        self.record_event_only();
+        self.record_latency_sample(latency_ns);
+    }
+
+    /// Bump only the per-event counters (no latency sample).
+    /// Always called by the push path so per-event statistics
+    /// (event_rate, drain-window counts) stay accurate at full
+    /// resolution; the more expensive latency CAS-loop runs only
+    /// at the subsampled cadence (PERF_AUDIT §1.3).
+    #[inline]
+    pub fn record_event_only(&self) {
         self.events_in_window.fetch_add(1, AtomicOrdering::Relaxed);
+        // Always increment — the cost is one fetch_add and the
+        // counter only matters when the shard is draining. Cheaper
+        // than branching on `self.draining.load()` in the hot path.
+        self.pushes_since_drain_start
+            .fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// Add a latency sample to the packed `(count, sum)` average.
+    /// Called once per sampling boundary (default 1-in-64 pushes)
+    /// to keep the average estimator at full statistical fidelity
+    /// without paying the CAS loop on every event (PERF_AUDIT §1.3).
+    ///
+    /// Subsampling is an unbiased estimator: `sum / count` over
+    /// random samples converges to the true mean, so the
+    /// scaling heuristic's threshold comparison stays correct;
+    /// only the variance grows. With N=64, the standard error
+    /// shrinks below 1 ns at typical event rates (>1k/sec) within
+    /// a single tick window.
+    #[inline]
+    pub fn record_latency_sample(&self, latency_ns: u64) {
         // Atomically add 1 to count (upper 32 bits) and
         // `latency_ns` to sum (lower 32 bits). `fetch_update`
         // CAS-loops the load-and-store, so a concurrent
@@ -187,11 +228,6 @@ impl ShardMetricsCollector {
                     let new_sum = sum.saturating_add(latency_ns.min(u32::MAX as u64) as u32) as u64;
                     Some((new_count << 32) | new_sum)
                 });
-        // Always increment — the cost is one fetch_add and the
-        // counter only matters when the shard is draining. Cheaper
-        // than branching on `self.draining.load()` in the hot path.
-        self.pushes_since_drain_start
-            .fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Record a batch flush.

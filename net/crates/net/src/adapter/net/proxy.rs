@@ -306,10 +306,27 @@ impl NetProxy {
             return ForwardResult::Dropped(ProxyError::TtlExpired);
         }
 
-        // Build forwarded packet with updated header
-        let mut fwd_data = BytesMut::with_capacity(data.len());
-        new_header.write_to(&mut fwd_data);
-        fwd_data.extend_from_slice(&data[ROUTING_HEADER_SIZE..]);
+        // Build forwarded packet with updated header.
+        // PERF_AUDIT §3.7 — port of perf #18 (already in
+        // router.rs:728): fast-path the typical sole-owned `Bytes`
+        // with `try_into_mut` + `write_at` so the body never gets
+        // copied. Pre-fix this allocated a fresh BytesMut the size
+        // of the whole packet and `extend_from_slice`d the body
+        // per forwarded packet — for a standalone-proxy
+        // deployment moving high pps, the body memcpy was the
+        // dominant per-packet cost.
+        let fwd_data = match data.try_into_mut() {
+            Ok(mut mut_data) => {
+                new_header.write_at(&mut mut_data[..ROUTING_HEADER_SIZE]);
+                mut_data.freeze()
+            }
+            Err(orig_data) => {
+                let mut new_data = BytesMut::with_capacity(orig_data.len());
+                new_header.write_to(&mut new_data);
+                new_data.extend_from_slice(&orig_data[ROUTING_HEADER_SIZE..]);
+                new_data.freeze()
+            }
+        };
 
         let latency_ns = start.elapsed().as_nanos() as u64;
 
@@ -323,7 +340,7 @@ impl NetProxy {
 
         ForwardResult::Forwarded {
             next_hop,
-            packet: fwd_data.freeze(),
+            packet: fwd_data,
             latency_ns,
         }
     }
@@ -723,5 +740,57 @@ mod tests {
             }
             _ => panic!("expected forwarded"),
         }
+    }
+
+    /// PERF_AUDIT §3.7 regression: `forward()` fast-paths a sole-
+    /// owned `Bytes` with `try_into_mut` + in-place `write_at`,
+    /// and falls back to the legacy rebuild when a clone is
+    /// outstanding. Two invariants pinned here:
+    ///
+    ///   1. Both paths produce byte-identical forwarded packets.
+    ///   2. The slow path must NOT mutate the shared inbound
+    ///      buffer — the caller's outstanding clone has to keep
+    ///      the ORIGINAL ttl/hop_count.
+    #[tokio::test]
+    async fn forward_slow_path_matches_fast_path_and_leaves_clone_untouched() {
+        let config = ProxyConfig::new(0x1234, "127.0.0.1:0".parse().unwrap());
+        let proxy = NetProxy::new(config).await.unwrap();
+        let next_hop: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        proxy.add_route(0x5678, next_hop);
+
+        let builder = MultiHopPacketBuilder::new(0xABCD);
+        let packet = builder.build(0x5678, 4, b"payload");
+
+        // Slow path: hold a clone so try_into_mut inside forward()
+        // must fail and take the rebuild arm.
+        let outstanding = packet.clone();
+        let slow_fwd = match proxy.forward(packet) {
+            ForwardResult::Forwarded { packet, .. } => packet,
+            other => panic!("expected forwarded, got {other:?}"),
+        };
+        // The shared original must be untouched — an in-place
+        // write against a shared buffer would corrupt every other
+        // holder's view.
+        let orig_header = RoutingHeader::from_bytes(&outstanding[..ROUTING_HEADER_SIZE]).unwrap();
+        assert_eq!(orig_header.ttl, 4, "clone's ttl must be unmodified");
+        assert_eq!(
+            orig_header.hop_count, 0,
+            "clone's hop_count must be unmodified"
+        );
+
+        // Fast path: sole-owned packet with identical contents.
+        let fast_fwd = match proxy.forward(outstanding) {
+            ForwardResult::Forwarded { packet, .. } => packet,
+            other => panic!("expected forwarded, got {other:?}"),
+        };
+
+        assert_eq!(
+            slow_fwd, fast_fwd,
+            "slow (rebuild) and fast (in-place write_at) forwards must be wire-identical"
+        );
+        let header = RoutingHeader::from_bytes(&fast_fwd[..ROUTING_HEADER_SIZE]).unwrap();
+        assert_eq!(header.ttl, 3);
+        assert_eq!(header.hop_count, 1);
+        assert_eq!(&fast_fwd[ROUTING_HEADER_SIZE..], b"payload");
     }
 }

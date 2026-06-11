@@ -376,6 +376,24 @@ pub struct BlobHeatRegistry {
     /// here prevents the duplicate emission; `commit_emissions`
     /// clears the entry once the sink has confirmed.
     in_flight: std::collections::HashSet<[u8; 32]>,
+    /// LRU index: monotonically-increasing position → blob hash.
+    /// Leftmost = smallest position = least-recently-touched
+    /// entry. Per PERF_AUDIT §6.8 — pre-fix `evict_lru` did
+    /// `counters.iter().min_by_key(...)`, an O(cap=8192) scan
+    /// under the global registry mutex on every new-entry
+    /// admission at cap. The BTreeMap LRU collapses eviction to
+    /// O(log n) via `pop_first`. Pattern mirrors
+    /// [`super::super::greedy::cache::GreedyCacheRegistry`]
+    /// (also in-tree).
+    lru: std::collections::BTreeMap<u64, [u8; 32]>,
+    /// Reverse index: hash → its current LRU position. Lets
+    /// `bump`/`entry_mut` invalidate the prior position before
+    /// inserting a fresh one without a linear scan of `lru`.
+    lru_pos: HashMap<[u8; 32], u64>,
+    /// Next LRU position to assign. Monotonic across every touch.
+    /// Saturating to `u64::MAX` would require `u64::MAX` distinct
+    /// touches — unreachable in any realistic deployment.
+    next_lru_pos: u64,
 }
 
 impl Default for BlobHeatRegistry {
@@ -384,6 +402,9 @@ impl Default for BlobHeatRegistry {
             counters: HashMap::new(),
             cap: DEFAULT_HEAT_REGISTRY_CAP,
             in_flight: std::collections::HashSet::new(),
+            lru: std::collections::BTreeMap::new(),
+            lru_pos: HashMap::new(),
+            next_lru_pos: 0,
         }
     }
 }
@@ -408,6 +429,9 @@ impl BlobHeatRegistry {
             counters: HashMap::new(),
             cap,
             in_flight: std::collections::HashSet::new(),
+            lru: std::collections::BTreeMap::new(),
+            lru_pos: HashMap::new(),
+            next_lru_pos: 0,
         }
     }
 
@@ -450,29 +474,41 @@ impl BlobHeatRegistry {
         if !self.counters.contains_key(&hash) && self.cap > 0 && self.counters.len() >= self.cap {
             self.evict_lru();
         }
+        // PERF_AUDIT §6.8 — assign / refresh the LRU position so
+        // the next eviction's `pop_first` lands on the least-
+        // recently-touched entry. The prior position (if any) is
+        // removed from `lru` before inserting the fresh one so the
+        // BTreeMap stays in sync with `lru_pos`.
+        let pos = self.next_lru_pos;
+        self.next_lru_pos = self.next_lru_pos.saturating_add(1);
+        if let Some(old_pos) = self.lru_pos.insert(hash, pos) {
+            self.lru.remove(&old_pos);
+        }
+        self.lru.insert(pos, hash);
         self.counters
             .entry(hash)
             .or_insert_with(|| HeatCounter::new(half_life, now))
     }
 
+    /// Evict the least-recently-touched entry. Per PERF_AUDIT §6.8
+    /// this is O(log n) via `BTreeMap::pop_first` on the LRU index;
+    /// pre-fix it was `counters.iter().min_by_key(...)`, an O(cap)
+    /// scan under the global registry mutex on every new-entry
+    /// admission at cap.
     fn evict_lru(&mut self) {
-        let victim = self
-            .counters
-            .iter()
-            .min_by_key(|(_, c)| c.last_update())
-            .map(|(k, _)| *k);
-        if let Some(key) = victim {
-            self.counters.remove(&key);
-            // Clear any stale `in_flight` marker for the evicted
-            // hash. Without this, a later reintroduction (re-bump
-            // via `entry_mut`) creates a fresh counter that
-            // `tick` permanently suppresses because
-            // `in_flight.contains(&key)` is still true — the
-            // emission was issued for the prior counter but
-            // never `commit_emissions`'d after eviction wiped
-            // the registry entry.
-            self.in_flight.remove(&key);
-        }
+        let Some((_pos, key)) = self.lru.pop_first() else {
+            return;
+        };
+        self.lru_pos.remove(&key);
+        self.counters.remove(&key);
+        // Clear any stale `in_flight` marker for the evicted
+        // hash. Without this, a later reintroduction (re-bump via
+        // `entry_mut`) creates a fresh counter that `tick`
+        // permanently suppresses because `in_flight.contains(&key)`
+        // is still true — the emission was issued for the prior
+        // counter but never `commit_emissions`'d after eviction
+        // wiped the registry entry.
+        self.in_flight.remove(&key);
     }
 
     /// Read-only access to the counter for `hash`.
@@ -489,6 +525,10 @@ impl BlobHeatRegistry {
         // clean `in_flight` slot, otherwise `tick` suppresses
         // every emission for the new counter forever.
         self.in_flight.remove(hash);
+        // Keep the LRU index in lockstep with `counters`.
+        if let Some(pos) = self.lru_pos.remove(hash) {
+            self.lru.remove(&pos);
+        }
     }
 
     /// Iterate `(hash, counter)` pairs. Read-only.
@@ -571,6 +611,13 @@ impl BlobHeatRegistry {
         });
         for hash in &pruned {
             self.in_flight.remove(hash);
+            // Per PERF_AUDIT §6.8 — keep the LRU index in
+            // lockstep with `counters` so a pruned-then-re-bumped
+            // hash gets a fresh position rather than a stale
+            // entry pointing into a removed key.
+            if let Some(pos) = self.lru_pos.remove(hash) {
+                self.lru.remove(&pos);
+            }
         }
     }
 
@@ -1312,6 +1359,77 @@ mod tests {
             "len() {} exceeded cap {} after concurrent inserts; LRU eviction is broken",
             guard.len(),
             cap,
+        );
+    }
+
+    /// PERF_AUDIT §6.8 — eviction must drop the least-recently-
+    /// touched entry. Pin the LRU ordering contract: insert 3
+    /// entries A,B,C, touch A so its LRU position refreshes,
+    /// then trigger an eviction by inserting D at cap = 3. B
+    /// should be evicted (oldest LRU pos), not A (just touched)
+    /// or C/D (newest).
+    #[test]
+    fn blob_heat_evict_lru_drops_oldest_touched_entry() {
+        let mut reg = BlobHeatRegistry::with_cap(3);
+        let half = Duration::from_secs(60);
+        let now = Instant::now();
+        let a = hash(0xAA);
+        let b = hash(0xBB);
+        let c = hash(0xCC);
+        let d = hash(0xDD);
+        // Initial inserts → LRU order: A, B, C.
+        reg.entry_mut(a, half, now);
+        reg.entry_mut(b, half, now);
+        reg.entry_mut(c, half, now);
+        // Touch A → moves it to most-recent. LRU order now: B, C, A.
+        reg.entry_mut(a, half, now);
+        // Insert D triggers eviction. The victim must be B.
+        reg.entry_mut(d, half, now);
+        assert!(reg.get(&a).is_some(), "touched A must survive");
+        assert!(reg.get(&b).is_none(), "untouched B must be the LRU victim");
+        assert!(
+            reg.get(&c).is_some(),
+            "C is more recent than B; must survive"
+        );
+        assert!(reg.get(&d).is_some(), "newly inserted D must be present");
+        assert_eq!(reg.len(), 3);
+    }
+
+    /// PERF_AUDIT §6.8 — `remove` must keep the LRU index in
+    /// lockstep with `counters`. A removed-then-re-inserted hash
+    /// gets a fresh LRU position rather than a stale one, and
+    /// the BTreeMap's `pop_first` never points at a hash no
+    /// longer in `counters`.
+    #[test]
+    fn blob_heat_remove_keeps_lru_index_consistent() {
+        let mut reg = BlobHeatRegistry::with_cap(3);
+        let half = Duration::from_secs(60);
+        let now = Instant::now();
+        let a = hash(0xAA);
+        let b = hash(0xBB);
+        let c = hash(0xCC);
+        let d = hash(0xDD);
+        reg.entry_mut(a, half, now);
+        reg.entry_mut(b, half, now);
+        reg.entry_mut(c, half, now);
+        // Remove A. Now the registry holds B, C and the LRU has
+        // entries for B, C (A's pos was removed).
+        reg.remove(&a);
+        assert_eq!(reg.len(), 2);
+        // Insert D — should NOT trigger eviction (len is now 2,
+        // cap is 3). All three of B, C, D should be present.
+        reg.entry_mut(d, half, now);
+        assert!(reg.get(&b).is_some());
+        assert!(reg.get(&c).is_some());
+        assert!(reg.get(&d).is_some());
+        assert_eq!(reg.len(), 3);
+        // Re-inserting A triggers eviction. The victim must be B
+        // (oldest surviving LRU pos), NOT A's old stale position.
+        reg.entry_mut(a, half, now);
+        assert!(reg.get(&a).is_some(), "re-inserted A is present");
+        assert!(
+            reg.get(&b).is_none(),
+            "B is the LRU victim — A's old position must have been cleaned up by remove()"
         );
     }
 }

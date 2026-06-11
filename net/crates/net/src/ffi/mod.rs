@@ -152,7 +152,7 @@ use tokio::runtime::Runtime;
 
 use crate::bus::EventBus;
 use crate::config::EventBusConfig;
-use crate::consumer::ConsumeRequest;
+use crate::consumer::{ConsumeRequest, ConsumeResponse};
 use crate::event::{Event, RawEvent};
 
 /// C FFI for CortEX / NetDb / RedexFile. Requires `netdb` (for the
@@ -1061,6 +1061,62 @@ fn parse_poll_request_json(json_str: &str) -> Result<ConsumeRequest, c_int> {
     Ok(req)
 }
 
+/// Build the JSON envelope `net_poll` writes into the caller's buffer.
+///
+/// **PERF_AUDIT §1.6.** Pre-fix every event was deserialized into a
+/// full `serde_json::Value` tree (per-event hashmap + recursive
+/// allocations + UTF-8 re-validation) and then re-serialized when the
+/// envelope was emitted. Per event that's ~1-5 µs/KB plus an
+/// unbounded chain of small allocations for the tree shape — a real
+/// load on the FFI/SDK consume hot path.
+///
+/// The new path uses `from_slice::<&RawValue>`: validates the bytes
+/// as well-formed JSON, hands back a borrowed view into the original
+/// buffer, and lets the outer serialize splice those bytes verbatim
+/// into the envelope. Zero per-event allocation on the parse-OK fast
+/// path; the rare invalid-UTF-8 / invalid-JSON fallback still emits
+/// the bytes as a JSON string so the caller can see what got skipped.
+/// Events whose bytes are not even valid UTF-8 are skipped entirely
+/// (only `parse_errors` records them) — same as the pre-fix path.
+fn build_poll_envelope_json(response: &ConsumeResponse) -> Result<String, serde_json::Error> {
+    use serde_json::value::RawValue;
+    #[derive(serde::Serialize)]
+    #[serde(untagged)]
+    enum EventOut<'a> {
+        Raw(&'a RawValue),
+        Fallback(String),
+    }
+    let mut events_out: Vec<EventOut<'_>> = Vec::with_capacity(response.events.len());
+    let mut parse_errors: usize = 0;
+    for e in &response.events {
+        match serde_json::from_slice::<&RawValue>(&e.raw) {
+            Ok(rv) => events_out.push(EventOut::Raw(rv)),
+            Err(_) => {
+                parse_errors += 1;
+                // Include the raw bytes as a string so the caller doesn't silently lose events
+                if let Ok(raw) = e.raw_str() {
+                    events_out.push(EventOut::Fallback(raw.to_string()));
+                }
+            }
+        }
+    }
+    #[derive(serde::Serialize)]
+    struct EnvelopeBorrowed<'a> {
+        events: &'a [EventOut<'a>],
+        next_id: Option<&'a str>,
+        has_more: bool,
+        count: usize,
+        parse_errors: usize,
+    }
+    serde_json::to_string(&EnvelopeBorrowed {
+        events: &events_out,
+        next_id: response.next_id.as_deref(),
+        has_more: response.has_more,
+        count: events_out.len(),
+        parse_errors,
+    })
+}
+
 /// Poll events from the bus.
 ///
 /// # Parameters
@@ -1134,27 +1190,7 @@ pub unsafe extern "C" fn net_poll(
     // Serialize response. Events that fail to parse are included as raw
     // strings so the caller can see all events and detect parse failures.
     let total_events = response.events.len();
-    let mut parsed_events: Vec<serde_json::Value> = Vec::with_capacity(total_events);
-    let mut parse_errors: usize = 0;
-    for e in &response.events {
-        match e.parse() {
-            Ok(v) => parsed_events.push(v),
-            Err(_) => {
-                parse_errors += 1;
-                // Include the raw bytes as a string so the caller doesn't silently lose events
-                if let Ok(raw) = e.raw_str() {
-                    parsed_events.push(serde_json::Value::String(raw.to_string()));
-                }
-            }
-        }
-    }
-    let response_json = match serde_json::to_string(&serde_json::json!({
-        "events": parsed_events,
-        "next_id": response.next_id,
-        "has_more": response.has_more,
-        "count": parsed_events.len(),
-        "parse_errors": parse_errors,
-    })) {
+    let response_json = match build_poll_envelope_json(&response) {
         Ok(s) => s,
         Err(_) => return NetError::Unknown.into(),
     };
@@ -1992,6 +2028,95 @@ pub unsafe extern "C" fn net_stats_ex(handle: *mut NetHandle, out: *mut NetStats
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a `ConsumeResponse` with the given raw event payloads —
+    /// shared fixture for the PERF_AUDIT §1.6 envelope tests.
+    fn poll_response_with_raw(raws: Vec<bytes::Bytes>) -> ConsumeResponse {
+        let events = raws
+            .into_iter()
+            .enumerate()
+            .map(|(i, raw)| crate::event::StoredEvent::new(format!("ev-{i}"), raw, i as u64, 0))
+            .collect();
+        ConsumeResponse {
+            events,
+            next_id: Some("cursor-42".to_string()),
+            has_more: true,
+            truncated_at_per_shard_cap: false,
+            stalled_shards: Vec::new(),
+            failed_shards: Vec::new(),
+        }
+    }
+
+    /// PERF_AUDIT §1.6 — the poll envelope must splice valid event
+    /// bytes through verbatim (no `Value` round-trip). Key order and
+    /// number formatting are the two observable fingerprints of the
+    /// old parse→re-serialize path: a BTreeMap-backed `Value` would
+    /// re-order `z` before `a` alphabetically and could rewrite
+    /// `1.0`. The envelope's shape fields must match the pre-fix
+    /// `json!` output: same keys, same value types.
+    #[test]
+    fn poll_envelope_splices_raw_event_bytes_verbatim() {
+        let raw = br#"{"z":1.0,"a":2}"#;
+        let response = poll_response_with_raw(vec![bytes::Bytes::from_static(raw)]);
+        let json = build_poll_envelope_json(&response).unwrap();
+
+        assert!(
+            json.contains(std::str::from_utf8(raw).unwrap()),
+            "event bytes must appear verbatim in the envelope; got {json}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["parse_errors"], 0);
+        assert_eq!(v["has_more"], true);
+        assert_eq!(v["next_id"], "cursor-42");
+        assert_eq!(v["events"][0]["z"], 1.0);
+        assert_eq!(v["events"][0]["a"], 2);
+    }
+
+    /// PERF_AUDIT §1.6 — invalid JSON (but valid UTF-8) must fail
+    /// closed into the string fallback: the event shows up as a JSON
+    /// string (caller can see what got skipped), `parse_errors`
+    /// counts it, and the envelope is still valid JSON. No panic, no
+    /// silent loss.
+    #[test]
+    fn poll_envelope_invalid_json_falls_back_to_string() {
+        let response = poll_response_with_raw(vec![
+            bytes::Bytes::from_static(br#"{"ok":true}"#),
+            bytes::Bytes::from_static(b"not valid json"),
+        ]);
+        let json = build_poll_envelope_json(&response).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(v["count"], 2, "fallback event still counts toward count");
+        assert_eq!(v["parse_errors"], 1);
+        assert_eq!(v["events"][0]["ok"], true);
+        assert_eq!(
+            v["events"][1], "not valid json",
+            "invalid-JSON event must be emitted as a JSON string"
+        );
+    }
+
+    /// PERF_AUDIT §1.6 — invalid UTF-8 can't be emitted even as a
+    /// string: the event is skipped from `events` (so `count`
+    /// excludes it) while `parse_errors` still records it. Mirrors
+    /// the pre-fix `e.parse()` + `raw_str()` behavior exactly.
+    #[test]
+    fn poll_envelope_invalid_utf8_is_skipped_but_counted_as_error() {
+        let response = poll_response_with_raw(vec![
+            bytes::Bytes::from_static(&[0xFF, 0xFE, 0xFD]),
+            bytes::Bytes::from_static(br#"{"ok":1}"#),
+        ]);
+        let json = build_poll_envelope_json(&response).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            v["count"], 1,
+            "invalid-UTF-8 event is skipped from the events array"
+        );
+        assert_eq!(v["parse_errors"], 1);
+        assert_eq!(v["events"].as_array().unwrap().len(), 1);
+        assert_eq!(v["events"][0]["ok"], 1);
+    }
 
     #[test]
     fn test_parse_config_valid() {

@@ -116,6 +116,73 @@ pub const MAX_FETCH_RANGE_BYTES: u64 = 1024 * 1024 * 1024;
 /// satisfy clippy's type-complexity threshold.
 type RsEncoderCache = Arc<parking_lot::Mutex<HashMap<(u8, u8), Arc<super::erasure::RsEncoder>>>>;
 
+/// Threshold (bytes) above which blake3 hashing is moved off the
+/// tokio runtime via `spawn_blocking`. Below this, the synchronous
+/// blake3 SIMD path is faster than the spawn_blocking handoff
+/// (~µs).  At 128 KiB the hash takes ~50 µs and starts to push the
+/// runtime worker into the "long task" regime; above it, multi-MiB
+/// CDC chunks run for 1–5 ms each — well into territory that stalls
+/// every other task on the worker.  Per
+/// PERF_AUDIT_2026_06_10_FULL_CRATE.md §6.1.
+pub(crate) const BLAKE3_OFFLOAD_THRESHOLD_BYTES: usize = 128 * 1024;
+
+/// Capacity of the per-adapter chunk-file handle LRU (PERF_AUDIT
+/// §6.7). Const-evaluated so the non-zero proof needs no runtime
+/// `expect`.
+const CHUNK_FILE_HANDLE_CACHE_CAP: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(64) {
+    Some(cap) => cap,
+    // Unreachable: 64 != 0. Evaluated at compile time.
+    None => panic!("chunk-file handle cache cap must be non-zero"),
+};
+
+/// Hash `bytes` with blake3, moving the work to the tokio blocking
+/// pool when `bytes.len() >= BLAKE3_OFFLOAD_THRESHOLD_BYTES`.
+/// Takes ownership of a `Vec<u8>` so the spawn_blocking closure
+/// runs against owned data (no extra copy); returns the bytes back
+/// along with the hash so the caller can continue using them.
+///
+/// Below the threshold the inline blake3 path is faster than the
+/// spawn handoff — we short-circuit and return immediately.
+#[expect(
+    clippy::expect_used,
+    reason = "JoinError here means the blocking task was cancelled at runtime shutdown \
+              or the blake3 closure panicked (it cannot — blake3 over a slice is \
+              panic-free); the awaiting task is itself being torn down in the only \
+              reachable case"
+)]
+pub(crate) async fn blake3_hash_offload_vec(bytes: Vec<u8>) -> ([u8; 32], Vec<u8>) {
+    if bytes.len() < BLAKE3_OFFLOAD_THRESHOLD_BYTES {
+        let hash: [u8; 32] = blake3::hash(&bytes).into();
+        return (hash, bytes);
+    }
+    tokio::task::spawn_blocking(move || {
+        let hash: [u8; 32] = blake3::hash(&bytes).into();
+        (hash, bytes)
+    })
+    .await
+    .expect("blake3 spawn_blocking panicked")
+}
+
+/// `Bytes` variant of [`blake3_hash_offload_vec`] — refcount-clones
+/// for the spawn_blocking closure instead of moving (Bytes clones
+/// are O(1) refcount bumps), so the caller can keep using the input
+/// after the hash returns.
+pub(crate) async fn blake3_hash_offload_bytes(bytes: &Bytes) -> [u8; 32] {
+    if bytes.len() < BLAKE3_OFFLOAD_THRESHOLD_BYTES {
+        return blake3::hash(bytes).into();
+    }
+    let snapshot = bytes.clone();
+    match tokio::task::spawn_blocking(move || blake3::hash(&snapshot).into()).await {
+        Ok(hash) => hash,
+        // JoinError is only observable when the runtime is tearing
+        // down (a queued blocking task was dropped before running;
+        // started blocking tasks are never cancelled, and the
+        // blake3 closure is panic-free). We still hold the input —
+        // hash inline rather than panicking mid-shutdown.
+        Err(_) => blake3::hash(bytes).into(),
+    }
+}
+
 /// Three capability probes a producer consults before publishing
 /// a v0.3 blob: Tree-support (used as the Tree-vs-Manifest gate),
 /// CDC-support (used by [`super::cdc::cdc_downgrade`]), and
@@ -306,6 +373,29 @@ pub struct MeshBlobAdapter {
     /// concurrent stores, not by total distinct hashes ever
     /// seen.
     in_flight_stores: Arc<DashMap<[u8; 32], Arc<tokio::sync::Mutex<()>>>>,
+    /// Small LRU of open chunk-file `RedexFile` handles keyed by
+    /// blob hash.
+    ///
+    /// **PERF_AUDIT §6.7** — pre-fix every `fetch_chunk` /
+    /// `store_chunk` / `chunk_exists` rebuilt the channel name + a
+    /// fresh `RedexFileConfig` (cloning `self.replication`) and
+    /// called `Redex::open_file`, whose reopen fast path still
+    /// runs `ensure_reopen_replication_matches`, an
+    /// `is_authorized` ACL probe, a `replication.validate()`, and
+    /// a `replication.read().is_none()` check. Per-tree-walk that
+    /// adds up to thousands of redundant probes. Caching the
+    /// already-resolved `RedexFile` (Arc clone — refcount bump
+    /// only) collapses the per-op cost to one Mutex lock + LRU
+    /// touch.
+    ///
+    /// The cap is intentionally small: tree walks burst over a
+    /// handful of nodes + chunks at a time, and a stale cached
+    /// handle is functionally identical to a fresh open because
+    /// `Redex::open_file` is idempotent on `(name, config)` — an
+    /// LRU eviction just means the next access pays the open
+    /// cost once, then re-caches.
+    chunk_file_cache:
+        Arc<parking_lot::Mutex<lru::LruCache<[u8; 32], crate::adapter::net::redex::RedexFile>>>,
     /// Active-overflow knobs (v0.3 P1 surface). Held behind
     /// an `Arc<RwLock<_>>` so the boolean toggle + threshold
     /// updates are cheap, lock-free for the steady-state
@@ -410,6 +500,12 @@ impl MeshBlobAdapter {
             blob_heat: None,
             blob_heat_half_life: DEFAULT_BLOB_HEAT_HALF_LIFE,
             in_flight_stores: Arc::new(DashMap::new()),
+            // PERF_AUDIT §6.7 — 64-entry LRU; covers a typical
+            // tree walk's working set (depth × fanout) without
+            // pinning much memory.
+            chunk_file_cache: Arc::new(parking_lot::Mutex::new(lru::LruCache::new(
+                CHUNK_FILE_HANDLE_CACHE_CAP,
+            ))),
             overflow: Arc::new(parking_lot::RwLock::new(OverflowConfig::default())),
             overflow_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tree_node_cache: None,
@@ -1117,6 +1213,15 @@ impl MeshBlobAdapter {
             if let Some(cache) = self.tree_node_cache.as_ref() {
                 cache.lock().remove(&hash);
             }
+            // PERF_AUDIT §6.7 — also drop the cached chunk-file
+            // handle. The sweep's own pin-probe (`chunk_exists`
+            // above) re-warms the cache with a handle for this very
+            // hash; without this pop, a post-sweep fetch would read
+            // the stale in-memory handle (resurrecting the deleted
+            // chunk) and a post-sweep re-store would hit the stale
+            // non-empty idempotent fast-path and silently skip the
+            // append — losing the newly-stored data.
+            self.chunk_file_cache.lock().pop(&hash);
             swept = swept.saturating_add(1);
         }
         self.metrics.record_gc_swept(swept);
@@ -1163,6 +1268,11 @@ impl MeshBlobAdapter {
         if let Some(cache) = self.tree_node_cache.as_ref() {
             cache.lock().remove(hash);
         }
+        // PERF_AUDIT §6.7 — also drop the cached chunk-file
+        // handle. A re-store of the same hash after delete must
+        // open a fresh RedexFile rather than hitting the stale
+        // handle for the just-unlinked file.
+        self.chunk_file_cache.lock().pop(hash);
         Ok(())
     }
 
@@ -1311,8 +1421,10 @@ impl MeshBlobAdapter {
         // Finalize the tree. Persist every trailing node + the
         // root before returning the BlobRef.
         let output = builder.finalize()?;
+        // Builder-emitted node hashes are blake3(bytes) computed
+        // inside TreeBuilder — trusted, skip the verify pass. (§6.2)
         for node in &output.trailing_nodes {
-            self.store_chunk(&node.hash, &node.bytes).await?;
+            self.store_chunk_prehashed(&node.hash, &node.bytes).await?;
         }
         // `root_bytes.is_empty()` signals "already in chunk
         // store" — the streamed-child peel in TreeBuilder::finalize
@@ -1321,7 +1433,7 @@ impl MeshBlobAdapter {
         // that case; the chunk store already carries
         // (root_hash → child bytes).
         if !output.root_bytes.is_empty() {
-            self.store_chunk(&output.root_hash, &output.root_bytes)
+            self.store_chunk_prehashed(&output.root_hash, &output.root_bytes)
                 .await?;
         }
 
@@ -1392,8 +1504,10 @@ impl MeshBlobAdapter {
         }
 
         let output = builder.finalize()?;
+        // Builder-emitted node hashes are blake3(bytes) computed
+        // inside TreeBuilder — trusted, skip the verify pass. (§6.2)
         for node in &output.trailing_nodes {
-            self.store_chunk(&node.hash, &node.bytes).await?;
+            self.store_chunk_prehashed(&node.hash, &node.bytes).await?;
         }
         // `root_bytes.is_empty()` signals "already in chunk
         // store" — the streamed-child peel in TreeBuilder::finalize
@@ -1402,7 +1516,7 @@ impl MeshBlobAdapter {
         // that case; the chunk store already carries
         // (root_hash → child bytes).
         if !output.root_bytes.is_empty() {
-            self.store_chunk(&output.root_hash, &output.root_bytes)
+            self.store_chunk_prehashed(&output.root_hash, &output.root_bytes)
                 .await?;
         }
 
@@ -1469,7 +1583,10 @@ impl MeshBlobAdapter {
             // into the striper).
             let parity_iter = closed.block.chunks.iter().filter(|c| c.is_parity());
             for (p_ref, p_bytes) in parity_iter.zip(closed.parity_bytes.iter()) {
-                adapter.store_chunk(&p_ref.hash, p_bytes).await?;
+                // Parity hashes were computed inside
+                // `RsEncoder::encode` (erasure.rs) over these exact
+                // bytes — trusted, skip the verify pass. (§6.2)
+                adapter.store_chunk_prehashed(&p_ref.hash, p_bytes).await?;
             }
             let data_count = closed.block.chunks.iter().filter(|c| c.is_data()).count() as u64;
             *data_chunk_count = data_chunk_count.saturating_add(data_count);
@@ -1489,8 +1606,11 @@ impl MeshBlobAdapter {
             let leaf_hash: [u8; 32] = blake3::hash(&leaf_bytes).into();
             let leaf_size = leaf.covered_bytes();
             // Persist the leaf as a tree-node chunk (same channel
-            // shape as data chunks).
-            adapter.store_chunk(&leaf_hash, &leaf_bytes).await?;
+            // shape as data chunks). `leaf_hash` was just hashed
+            // over `leaf_bytes` above — trusted. (§6.2)
+            adapter
+                .store_chunk_prehashed(&leaf_hash, &leaf_bytes)
+                .await?;
             // Lift into the internal-cascade builder. The
             // emitted nodes (the leaf itself + any internal
             // closures) are returned but the leaf bytes we
@@ -1501,9 +1621,13 @@ impl MeshBlobAdapter {
             // Persist every internal-level closure (the leaf
             // emission at level 0 is already stored; only the
             // level > 0 internals need separate persistence).
+            // Builder-emitted node hashes are blake3(bytes) computed
+            // inside TreeBuilder — trusted. (§6.2)
             for node in &emitted {
                 if node.level > 0 {
-                    adapter.store_chunk(&node.hash, &node.bytes).await?;
+                    adapter
+                        .store_chunk_prehashed(&node.hash, &node.bytes)
+                        .await?;
                 }
             }
             Ok(())
@@ -1533,10 +1657,22 @@ impl MeshBlobAdapter {
                                 &mut buffer,
                                 Vec::with_capacity(chunk_size_usize),
                             );
-                            let chunk_hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
-                            self.store_chunk(&chunk_hash, &chunk_bytes).await?;
+                            // Offload blake3 for multi-MiB chunks so
+                            // the tokio runtime worker doesn't stall
+                            // for the multi-ms hash. (§6.1)
+                            let (chunk_hash, chunk_bytes) =
+                                blake3_hash_offload_vec(chunk_bytes).await;
+                            // Hash was just computed over chunk_bytes
+                            // — trusted, skip verify. (§6.2)
+                            self.store_chunk_prehashed(&chunk_hash, &chunk_bytes)
+                                .await?;
                             let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
-                            if let Some(closed) = striper.push_chunk(chunk_bytes, cref)? {
+                            // PERF_AUDIT §6.5 — striper now holds
+                            // Bytes; `Bytes::from(Vec<u8>)` is O(1)
+                            // (takes ownership of the Vec's buffer).
+                            if let Some(closed) =
+                                striper.push_chunk(bytes::Bytes::from(chunk_bytes), cref)?
+                            {
                                 flush_stripe(self, closed, &mut builder, &mut data_chunk_count)
                                     .await?;
                             }
@@ -1545,10 +1681,15 @@ impl MeshBlobAdapter {
                 }
                 if !buffer.is_empty() {
                     let chunk_bytes = std::mem::take(&mut buffer);
-                    let chunk_hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
-                    self.store_chunk(&chunk_hash, &chunk_bytes).await?;
+                    // Offload blake3 for multi-MiB chunks. (§6.1)
+                    let (chunk_hash, chunk_bytes) = blake3_hash_offload_vec(chunk_bytes).await;
+                    // Just-computed hash — trusted. (§6.2)
+                    self.store_chunk_prehashed(&chunk_hash, &chunk_bytes)
+                        .await?;
                     let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
-                    if let Some(closed) = striper.push_chunk(chunk_bytes, cref)? {
+                    if let Some(closed) =
+                        striper.push_chunk(bytes::Bytes::from(chunk_bytes), cref)?
+                    {
                         flush_stripe(self, closed, &mut builder, &mut data_chunk_count).await?;
                     }
                 }
@@ -1560,25 +1701,30 @@ impl MeshBlobAdapter {
                     let bytes = maybe?;
                     chunker.extend(bytes.as_ref());
                     while let Some(chunk_bytes) = chunker.try_next_chunk() {
-                        let chunk_hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
-                        self.store_chunk(&chunk_hash, &chunk_bytes).await?;
+                        // Offload blake3 for multi-MiB chunks. (§6.1)
+                        let chunk_hash = blake3_hash_offload_bytes(&chunk_bytes).await;
+                        // Just-computed hash — trusted. (§6.2)
+                        self.store_chunk_prehashed(&chunk_hash, &chunk_bytes)
+                            .await?;
                         let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
-                        // RS striper still owns Vec<u8> internally; one
-                        // copy here is the cost of routing CDC output
-                        // into the RS path. The non-RS CDC path skips
-                        // this — see store_stream_tree_cdc_internal
-                        // where emit_tree_chunk consumes Bytes
-                        // directly.
-                        if let Some(closed) = striper.push_chunk(chunk_bytes.to_vec(), cref)? {
+                        // PERF_AUDIT §6.5 — striper now holds Bytes
+                        // refcount-shared with us; the pre-fix
+                        // `.to_vec()` was a full ~1-16 MiB memcpy per
+                        // CDC chunk. `chunk_bytes.clone()` is O(1).
+                        if let Some(closed) = striper.push_chunk(chunk_bytes.clone(), cref)? {
                             flush_stripe(self, closed, &mut builder, &mut data_chunk_count).await?;
                         }
                     }
                 }
                 for chunk_bytes in chunker.finalize() {
-                    let chunk_hash: [u8; 32] = blake3::hash(&chunk_bytes).into();
-                    self.store_chunk(&chunk_hash, &chunk_bytes).await?;
+                    // Offload blake3 for multi-MiB chunks. (§6.1)
+                    let chunk_hash = blake3_hash_offload_bytes(&chunk_bytes).await;
+                    // Just-computed hash — trusted. (§6.2)
+                    self.store_chunk_prehashed(&chunk_hash, &chunk_bytes)
+                        .await?;
                     let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
-                    if let Some(closed) = striper.push_chunk(chunk_bytes.to_vec(), cref)? {
+                    // PERF_AUDIT §6.5 — refcount bump, no memcpy.
+                    if let Some(closed) = striper.push_chunk(chunk_bytes.clone(), cref)? {
                         flush_stripe(self, closed, &mut builder, &mut data_chunk_count).await?;
                     }
                 }
@@ -1600,8 +1746,10 @@ impl MeshBlobAdapter {
         }
 
         let output = builder.finalize()?;
+        // Builder-emitted node hashes are blake3(bytes) computed
+        // inside TreeBuilder — trusted, skip the verify pass. (§6.2)
         for node in &output.trailing_nodes {
-            self.store_chunk(&node.hash, &node.bytes).await?;
+            self.store_chunk_prehashed(&node.hash, &node.bytes).await?;
         }
         // `root_bytes.is_empty()` signals "already in chunk
         // store" — the streamed-child peel in TreeBuilder::finalize
@@ -1610,7 +1758,7 @@ impl MeshBlobAdapter {
         // that case; the chunk store already carries
         // (root_hash → child bytes).
         if !output.root_bytes.is_empty() {
-            self.store_chunk(&output.root_hash, &output.root_bytes)
+            self.store_chunk_prehashed(&output.root_hash, &output.root_bytes)
                 .await?;
         }
 
@@ -1759,6 +1907,17 @@ impl MeshBlobAdapter {
     /// Returns the requested byte slice in order. `touched` is
     /// extended with every `TreeNode` hash + every leaf chunk
     /// hash walked — used by the data-gravity heat-bump path.
+    /// PERF_AUDIT §6.4 — appends into a caller-supplied `out: &mut
+    /// Vec<u8>` rather than returning a fresh `Vec` per recursion
+    /// level. Pre-fix each level allocated its own Vec and the
+    /// parent did `out.extend_from_slice(&child_bytes)` — a depth-4
+    /// tree fetching a 1 GiB range memcpy'd ~4 GiB across the walk.
+    /// With one shared output buffer, every level appends directly;
+    /// the total per-walk byte count is exactly `range_end -
+    /// range_start`. The caller (`fetch_range` for tree blobs)
+    /// pre-allocates `out` to the range length so even the initial
+    /// growth-by-doubling cost is zero.
+    #[allow(clippy::too_many_arguments)] // recursive walk threads range + output state; a params struct would be rebuilt per level
     fn walk_tree_range<'a>(
         &'a self,
         node_hash: [u8; 32],
@@ -1767,12 +1926,13 @@ impl MeshBlobAdapter {
         range_start: u64,
         range_end: u64,
         touched: &'a mut Vec<[u8; 32]>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, BlobError>> + Send + 'a>>
+        out: &'a mut Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), BlobError>> + Send + 'a>>
     {
         Box::pin(async move {
             // Cheap guard: empty range short-circuits the fetch.
             if range_end <= range_start {
-                return Ok(Vec::new());
+                return Ok(());
             }
             if range_end > subtree_size {
                 return Err(BlobError::Backend(format!(
@@ -1793,20 +1953,14 @@ impl MeshBlobAdapter {
             } else {
                 // Fetch the node's bytes (each tree node is
                 // itself a chunk-shaped Small blob at
-                // `dataforts/blob/<hex32>`).
+                // `dataforts/blob/<hex32>`). PERF_AUDIT §6.11 —
+                // `fetch_chunk` already blake3-verifies the
+                // returned payload against `node_hash`; the prior
+                // defense-in-depth recompute here was pure waste
+                // and only ever fired on a `fetch_chunk` bug, in
+                // which case its own verify would already have
+                // caught the mismatch. Drop the recompute.
                 let bytes = self.fetch_chunk(&node_hash).await?;
-                // BLAKE3 cross-check against the parent's
-                // stored child hash. `fetch_chunk` already
-                // verifies; the re-check here is defense-in-
-                // depth + makes the tree-walk integrity
-                // invariant explicit at this layer.
-                let computed: [u8; 32] = blake3::hash(&bytes).into();
-                if computed != node_hash {
-                    return Err(BlobError::HashMismatch {
-                        expected: node_hash,
-                        actual: computed,
-                    });
-                }
                 // Populate the cache for the next walk that
                 // touches this node. Bytes are cloned only on
                 // the miss path; the hit path returns the
@@ -1843,7 +1997,6 @@ impl MeshBlobAdapter {
                                 .to_owned(),
                         ));
                     }
-                    let mut out: Vec<u8> = Vec::new();
                     let mut offset: u64 = 0;
                     for (child_hash, child_size) in children {
                         let child_start = offset;
@@ -1857,19 +2010,21 @@ impl MeshBlobAdapter {
                         // child's local range.
                         let sub_start = range_start.saturating_sub(child_start);
                         let sub_end = range_end.saturating_sub(child_start).min(child_size);
-                        let child_bytes = self
-                            .walk_tree_range(
-                                child_hash,
-                                child_size,
-                                residual_depth - 1,
-                                sub_start,
-                                sub_end,
-                                touched,
-                            )
-                            .await?;
-                        out.extend_from_slice(&child_bytes);
+                        // PERF_AUDIT §6.4 — pass the shared output
+                        // buffer down; the child appends directly
+                        // into it, no per-level intermediate Vec.
+                        self.walk_tree_range(
+                            child_hash,
+                            child_size,
+                            residual_depth - 1,
+                            sub_start,
+                            sub_end,
+                            touched,
+                            out,
+                        )
+                        .await?;
                     }
-                    Ok(out)
+                    Ok(())
                 }
                 super::blob_tree::TreeNode::Leaf { chunks } => {
                     if residual_depth != 1 {
@@ -1890,7 +2045,6 @@ impl MeshBlobAdapter {
                             residual_depth
                         )));
                     }
-                    let mut out: Vec<u8> = Vec::new();
                     let mut offset: u64 = 0;
                     for chunk in chunks {
                         let chunk_start = offset;
@@ -1919,10 +2073,14 @@ impl MeshBlobAdapter {
                                 requested_end: sub_end,
                                 actual_len: chunk_bytes.len() as u64,
                             })?;
+                        // PERF_AUDIT §6.4 — append into the shared
+                        // output buffer; one memcpy (chunk slice →
+                        // out) instead of two (slice → leaf Vec →
+                        // parent Vec).
                         out.extend_from_slice(slice);
                         touched.push(chunk.hash);
                     }
-                    Ok(out)
+                    Ok(())
                 }
                 super::blob_tree::TreeNode::ErasureLeaf { stripes } => {
                     if residual_depth != 1 {
@@ -1958,7 +2116,6 @@ impl MeshBlobAdapter {
                             }
                         }
                     }
-                    let mut out: Vec<u8> = Vec::new();
                     let mut offset: u64 = 0;
                     for stripe in &stripes {
                         let stripe_size = stripe.covered_bytes();
@@ -1968,6 +2125,14 @@ impl MeshBlobAdapter {
                         if stripe_end <= range_start || stripe_start >= range_end {
                             continue;
                         }
+                        // PERF_AUDIT §6.4 — `walk_stripe_range` still
+                        // returns a Vec because reconstruction's
+                        // mutable-shard buffer contract doesn't
+                        // cleanly thread a shared output buffer; we
+                        // append into `out` once per stripe instead
+                        // of building a per-recursion-level Vec
+                        // first. One memcpy per stripe vs N memcpys
+                        // through the tree levels.
                         let stripe_bytes = self
                             .walk_stripe_range(
                                 stripe,
@@ -1979,7 +2144,7 @@ impl MeshBlobAdapter {
                             .await?;
                         out.extend_from_slice(&stripe_bytes);
                     }
-                    Ok(out)
+                    Ok(())
                 }
             }
         })
@@ -2006,19 +2171,32 @@ impl MeshBlobAdapter {
                 TREE_LEAF_CHUNK_MAX_BYTES
             )));
         }
-        let hash: [u8; 32] = blake3::hash(chunk_bytes).into();
+        // Offload blake3 to the blocking pool when the chunk is
+        // big enough to stall the runtime worker. We hash via a
+        // refcounted `Bytes` snapshot rather than an owned move so
+        // the slice borrow we hold survives across the await — both
+        // `store_chunk_prehashed` and the builder push want
+        // `chunk_bytes` afterwards. (§6.1)
+        let hash: [u8; 32] = if chunk_bytes.len() >= BLAKE3_OFFLOAD_THRESHOLD_BYTES {
+            let snapshot = Bytes::copy_from_slice(chunk_bytes);
+            blake3_hash_offload_bytes(&snapshot).await
+        } else {
+            blake3::hash(chunk_bytes).into()
+        };
         let chunk_size = chunk_bytes.len() as u32;
         // Persist the chunk bytes first so a crash between this
         // and the tree-builder push leaves the chunk content-
         // addressed and reachable for any future re-attempt
         // (the chunk's hash matches its bytes regardless of
         // whether a tree references it yet).
-        self.store_chunk(&hash, chunk_bytes).await?;
+        // Just-computed hash + builder-emitted nodes — trusted,
+        // skip the verify pass. (§6.2)
+        self.store_chunk_prehashed(&hash, chunk_bytes).await?;
         // Push into the builder; persist any cascade-closed nodes
         // before returning.
         let closed = builder.push_chunk(ChunkRefV3::data(hash, chunk_size))?;
         for node in &closed {
-            self.store_chunk(&node.hash, &node.bytes).await?;
+            self.store_chunk_prehashed(&node.hash, &node.bytes).await?;
         }
         Ok(())
     }
@@ -2186,28 +2364,31 @@ impl MeshBlobAdapter {
         for (i, chunk) in stripe.chunks.iter().enumerate() {
             match self.fetch_chunk(&chunk.hash).await {
                 Ok(bytes) => {
-                    // Verify hash before trusting the bytes — the
-                    // fetch_chunk path already does this, but
-                    // belt-and-braces for reconstruction inputs.
-                    let computed: [u8; 32] = blake3::hash(&bytes).into();
-                    if computed != chunk.hash {
-                        // Treat as missing for reconstruction
-                        // purposes — the RS encoder requires
-                        // trusted inputs.
-                        shards.push(None);
-                        if i < k_usize {
-                            missing_data_indices.push(i);
-                        }
-                        continue;
-                    }
+                    // PERF_AUDIT §6.11 — `fetch_chunk` already
+                    // blake3-verifies the returned payload against
+                    // `chunk.hash`. The prior belt-and-braces
+                    // recompute here was pure waste — by the time
+                    // `bytes` is in hand, the hash equality is a
+                    // contract that has already been checked. Drop
+                    // the recompute; any future divergence between
+                    // the contract and the implementation is the
+                    // `fetch_chunk` test's job to catch.
                     // RS reconstruction needs mutable buffers
-                    // (resize + in-place decode). Materialize the
-                    // Bytes into an owned Vec here — the
-                    // surrounding paths still benefit from the
-                    // fetch_chunk-side Bytes hand-off, but the
-                    // reconstruction inner loop requires owned
-                    // backing.
-                    let mut bytes_vec = bytes.to_vec();
+                    // (resize + in-place decode). PERF_AUDIT §6.12
+                    // — when `bytes` is sole-owned (`fetch_chunk`
+                    // typically hands back a refcount=1 `Bytes`),
+                    // `try_into_mut` returns the existing
+                    // allocation as `BytesMut` in O(1) and we
+                    // skip the full-shard memcpy `to_vec()` was
+                    // paying. Only short data shards (length <
+                    // shard_len) need a resize, which is the
+                    // existing pre-fix code. The slow path (an
+                    // outstanding clone forced a copy) still works
+                    // — we just lose the §6.12 win for that shard.
+                    let mut bytes_vec = match bytes.try_into_mut() {
+                        Ok(mut_data) => mut_data.into(),
+                        Err(orig) => orig.to_vec(),
+                    };
                     // Pad data shards to the post-padding length
                     // before passing to the encoder. Parity
                     // shards are already at shard_len.
@@ -2271,7 +2452,12 @@ impl MeshBlobAdapter {
                     );
                     continue;
                 }
-                if let Err(e) = self.store_chunk(&chunk_ref.hash, logical_bytes).await {
+                // Local verify above pinned `computed == chunk_ref.hash`
+                // — trusted, skip the redundant in-store verify. (§6.2)
+                if let Err(e) = self
+                    .store_chunk_prehashed(&chunk_ref.hash, logical_bytes)
+                    .await
+                {
                     tracing::warn!(
                         hash = ?chunk_ref.hash,
                         error = %e,
@@ -2356,6 +2542,32 @@ impl MeshBlobAdapter {
         ChannelName::new(&name).expect("hex-formatted name under reserved prefix is always valid")
     }
 
+    /// Look up an open `RedexFile` for the chunk identified by
+    /// `hash`, opening (and caching) it on miss. Used by
+    /// `fetch_chunk` / `store_chunk_locked` / `chunk_exists` to
+    /// elide the per-call `chunk_channel` build, `chunk_file_config`
+    /// (which clones `self.replication`), `Redex::open_file`'s ACL
+    /// probe + replication validate + reopen-match — none of which
+    /// vary across operations on the same hash.
+    ///
+    /// Per PERF_AUDIT §6.7.
+    fn open_chunk_file_cached(
+        &self,
+        hash: &[u8; 32],
+    ) -> Result<crate::adapter::net::redex::RedexFile, BlobError> {
+        if let Some(file) = self.chunk_file_cache.lock().get(hash).cloned() {
+            return Ok(file);
+        }
+        let channel = Self::chunk_channel(hash);
+        let cfg = self.chunk_file_config();
+        let file = self
+            .redex
+            .open_file(&channel, cfg)
+            .map_err(|e| BlobError::Backend(format!("mesh blob: open chunk file: {}", e)))?;
+        self.chunk_file_cache.lock().put(*hash, file.clone());
+        Ok(file)
+    }
+
     /// `RedexFileConfig` template applied to every chunk open. The
     /// operator opts into disk persistence via [`Self::with_persistent`]
     /// and into cross-node replication via [`Self::with_replication`].
@@ -2396,23 +2608,59 @@ impl MeshBlobAdapter {
     /// would leave the chunk file with duplicate events; reads
     /// still return correct bytes but the underlying storage
     /// wastes space and the layout is non-deterministic). The
-    /// idempotent-skip branch also verifies the existing on-disk
-    /// bytes against the supplied hash before accepting — a
-    /// corrupted prior write (e.g. truncated replication catch-up)
-    /// surfaces as `HashMismatch` rather than silently passing the
-    /// honest caller's `store` call.
+    /// idempotent-skip branch length-checks the existing on-disk
+    /// payload against the supplied bytes (PERF_AUDIT §6.3 — no
+    /// re-hash) — a truncated prior write (e.g. replication
+    /// catch-up) surfaces as `HashMismatch` rather than silently
+    /// passing the honest caller's `store` call; same-length
+    /// corruption is caught by `fetch_chunk`'s read-side verify.
     async fn store_chunk(&self, hash: &[u8; 32], bytes: &[u8]) -> Result<(), BlobError> {
         // Defensive: verify the supplied bytes hash to the supplied
         // hash. The substrate-side `store` already verified at the
         // top of the call; this is a second-pass guard in case
-        // this helper is called from a non-substrate path.
-        let computed: [u8; 32] = blake3::hash(bytes).into();
+        // this helper is called from a non-substrate path. Offload
+        // the verify hash to the blocking pool above threshold so
+        // a multi-MiB Small/Manifest store doesn't stall the runtime
+        // worker. (§6.1)
+        let computed: [u8; 32] = if bytes.len() >= BLAKE3_OFFLOAD_THRESHOLD_BYTES {
+            let snapshot = Bytes::copy_from_slice(bytes);
+            blake3_hash_offload_bytes(&snapshot).await
+        } else {
+            blake3::hash(bytes).into()
+        };
         if computed != *hash {
             return Err(BlobError::HashMismatch {
                 expected: *hash,
                 actual: computed,
             });
         }
+        self.store_chunk_with_lock(hash, bytes).await
+    }
+
+    /// Internal: store a chunk whose `hash` the caller has already
+    /// verified (or just computed) over `bytes`. Skips the per-call
+    /// blake3 second-pass guard that `store_chunk` does — for hot
+    /// in-crate callers (CDC/Fixed chunker, `emit_tree_chunk`,
+    /// `flush_stripe` parity/leaf/internals, `TreeBuilder` finalize,
+    /// manifest store after `chunk_payload` verification) the bytes
+    /// were hashed the line before and re-hashing is pure waste.
+    /// Per PERF_AUDIT_2026_06_10_FULL_CRATE.md §6.2.
+    ///
+    /// This is `pub(crate)` only because the trusted callers live in
+    /// sibling modules; outside the crate, use `store_chunk` (or the
+    /// `BlobAdapter::store` surface) which never trusts the caller.
+    pub(crate) async fn store_chunk_prehashed(
+        &self,
+        hash: &[u8; 32],
+        bytes: &[u8],
+    ) -> Result<(), BlobError> {
+        self.store_chunk_with_lock(hash, bytes).await
+    }
+
+    /// Body shared by `store_chunk` (verifying) and
+    /// `store_chunk_prehashed` (trusts caller): per-hash lock acquire,
+    /// run `store_chunk_locked`, best-effort lock-entry cleanup.
+    async fn store_chunk_with_lock(&self, hash: &[u8; 32], bytes: &[u8]) -> Result<(), BlobError> {
         // Per-hash serialization: one in-flight `store_chunk` per
         // content hash at a time. The lock entry is created lazily
         // and best-effort reclaimed after the store completes.
@@ -2439,31 +2687,54 @@ impl MeshBlobAdapter {
     /// Split out so the lock-acquire / cleanup wrapper can early-
     /// return cleanly via `?` without the per-hash entry leaking.
     async fn store_chunk_locked(&self, hash: &[u8; 32], bytes: &[u8]) -> Result<(), BlobError> {
-        let channel = Self::chunk_channel(hash);
-        let cfg = self.chunk_file_config();
-        let file = self
-            .redex
-            .open_file(&channel, cfg)
-            .map_err(|e| BlobError::Backend(format!("mesh blob: open chunk file: {}", e)))?;
+        // PERF_AUDIT §6.7 — cached open elides the per-call
+        // channel name build + RedexFileConfig clone + Redex ACL
+        // probe + replication validate + reopen-match.
+        let file = self.open_chunk_file_cached(hash)?;
         let now_ms = now_unix_ms();
         if !file.is_empty() {
             // Idempotent fast-path. Content-addressed semantics
-            // promise the on-disk bytes match the hash, but a
-            // corrupted prior write (e.g. replication catch-up
-            // wrote bad bytes before our honest store landed)
-            // would otherwise be silently affirmed. Verify before
-            // returning Ok.
-            let events = file.read_range(0, file.len() as u64);
-            let existing = events.into_iter().next().ok_or_else(|| {
-                BlobError::Backend(
-                    "mesh blob: chunk file non-empty but read returned no events".to_string(),
-                )
-            })?;
-            let computed_existing: [u8; 32] = blake3::hash(&existing.payload).into();
-            if computed_existing != *hash {
+            // promise the on-disk bytes match the hash (verified on
+            // the original store and again on every read via
+            // `fetch_chunk` / `materialize`). Re-reading + re-hashing
+            // the entire on-disk payload on every dedup hit pays
+            // O(chunk_size) for ≈ zero additional protection over
+            // length-compare: the failure mode the deep check was
+            // designed to catch — a truncated replication catch-up —
+            // shows up as a length mismatch (the truncated payload is
+            // shorter than the honest one). Same-length on-disk
+            // corruption is rare under content-addressing and is the
+            // GC/scrub sweep's job, not the per-store hot path. Per
+            // PERF_AUDIT_2026_06_10_FULL_CRATE.md §6.3.
+            //
+            // Length source: the single-event fast path reads
+            // `retained_bytes()` (a lock + one-entry sum, no I/O).
+            // A chunk file can legitimately hold DUPLICATE events
+            // of the same payload (the pre-per-hash-lock TOCTOU
+            // double-append this method's doc describes — "reads
+            // still return correct bytes but the underlying storage
+            // wastes space"). Reads serve the FIRST event, so the
+            // length compare must be against the first event, not
+            // the sum of duplicates — summing would spuriously
+            // reject an honest re-store against such a legacy file.
+            let existing_len = if file.len() <= 1 {
+                file.retained_bytes()
+            } else {
+                file.read_range(0, 1)
+                    .into_iter()
+                    .next()
+                    .map(|e| e.payload.len() as u64)
+                    .unwrap_or(0)
+            };
+            if existing_len != bytes.len() as u64 {
                 return Err(BlobError::HashMismatch {
                     expected: *hash,
-                    actual: computed_existing,
+                    // Length-mismatch under content-addressing: the
+                    // on-disk content can't possibly hash to
+                    // `expected` because it's a different size. We
+                    // surface a sentinel actual rather than paying the
+                    // O(chunk_size) hash we just elided.
+                    actual: [0u8; 32],
                 });
             }
             self.refcount
@@ -2494,12 +2765,10 @@ impl MeshBlobAdapter {
     /// that's N×payload_size bytes of memcpy avoided.
     #[doc(hidden)]
     pub async fn fetch_chunk(&self, hash: &[u8; 32]) -> Result<Bytes, BlobError> {
-        let channel = Self::chunk_channel(hash);
-        let cfg = self.chunk_file_config();
-        let file = self
-            .redex
-            .open_file(&channel, cfg)
-            .map_err(|e| BlobError::Backend(format!("mesh blob: open chunk file: {}", e)))?;
+        // PERF_AUDIT §6.7 — cached open elides the per-call
+        // channel name build + RedexFileConfig clone + Redex ACL
+        // probe + replication validate + reopen-match.
+        let file = self.open_chunk_file_cached(hash)?;
         let len = file.len() as u64;
         if len == 0 {
             return Err(BlobError::NotFound(format!("mesh://{}", hex32(hash))));
@@ -2749,11 +3018,15 @@ impl MeshBlobAdapter {
                 Ok(bytes) => {
                     let computed: [u8; 32] = blake3::hash(&bytes).into();
                     if computed == chunk.hash {
-                        // Materialize the Bytes into an owned Vec
-                        // for the RS encoder's mutable buffer
-                        // contract (same rationale as the
-                        // reconstruction path above).
-                        shards.push(Some(bytes.to_vec()));
+                        // PERF_AUDIT §6.12 — try_into_mut to skip
+                        // the full-shard memcpy when `bytes` is
+                        // sole-owned (the typical case for a fresh
+                        // `fetch_chunk`).
+                        let bytes_vec = match bytes.try_into_mut() {
+                            Ok(mut_data) => mut_data.into(),
+                            Err(orig) => orig.to_vec(),
+                        };
+                        shards.push(Some(bytes_vec));
                         surviving += 1;
                         continue;
                     }
@@ -2887,7 +3160,10 @@ impl MeshBlobAdapter {
             // partial-write across the chunk pool is an operator-
             // visible persistence problem that should NOT be
             // swallowed as "just one bad stripe."
-            self.store_chunk(&chunk_ref.hash, logical_bytes).await?;
+            // Local verify above pinned `computed == chunk_ref.hash`
+            // — trusted, skip the redundant in-store verify. (§6.2)
+            self.store_chunk_prehashed(&chunk_ref.hash, logical_bytes)
+                .await?;
             chunks_restored += 1;
         }
         report.stripes_repaired = report.stripes_repaired.saturating_add(1);
@@ -2994,7 +3270,8 @@ where
             if chunks.is_empty() {
                 let hash: [u8; 32] = blake3::hash(&[]).into();
                 if let Some(a) = adapter {
-                    a.store_chunk(&hash, &[]).await?;
+                    // Just-computed hash — trusted. (§6.2)
+                    a.store_chunk_prehashed(&hash, &[]).await?;
                 }
                 chunks.push(ChunkRef { hash, size: 0 });
             }
@@ -3004,7 +3281,8 @@ where
         let chunk = &buf[..filled];
         let hash: [u8; 32] = blake3::hash(chunk).into();
         if let Some(a) = adapter {
-            a.store_chunk(&hash, chunk).await?;
+            // Just-computed hash — trusted. (§6.2)
+            a.store_chunk_prehashed(&hash, chunk).await?;
         }
         chunks.push(ChunkRef {
             hash,
@@ -3157,9 +3435,14 @@ impl BlobAdapter for MeshBlobAdapter {
                         (rc.hash, bytes_arc.slice(offset..end))
                     })
                     .collect();
+                // Trusted: `chunk_payload` produces (hash, &bytes)
+                // pairs where hash = blake3(bytes), and the verify
+                // loop above already asserted hash equality between
+                // the recomputed chunks and the declared manifest
+                // entries. Skip the per-chunk verify pass. (§6.2)
                 let mut futs = futures::stream::iter(store_items.into_iter().map(
                     |(hash, chunk): ([u8; 32], Bytes)| async move {
-                        self.store_chunk(&hash, &chunk).await
+                        self.store_chunk_prehashed(&hash, &chunk).await
                     },
                 ))
                 .buffer_unordered(MANIFEST_STORE_CONCURRENCY);
@@ -3482,6 +3765,13 @@ impl BlobAdapter for MeshBlobAdapter {
                     )));
                 }
                 let mut touched = Vec::new();
+                // PERF_AUDIT §6.4 — pre-allocate the output buffer
+                // to the requested range length so even the initial
+                // growth-by-doubling cost is zero and every
+                // recursion level appends in-place rather than
+                // alloc'ing its own intermediate Vec.
+                let mut out: Vec<u8> =
+                    Vec::with_capacity(range.end.saturating_sub(range.start) as usize);
                 let walk_result = self
                     .walk_tree_range(
                         *root_hash,
@@ -3490,10 +3780,11 @@ impl BlobAdapter for MeshBlobAdapter {
                         range.start,
                         range.end,
                         &mut touched,
+                        &mut out,
                     )
                     .await;
                 match walk_result {
-                    Ok(bytes) => (Ok(Bytes::from(bytes)), touched),
+                    Ok(()) => (Ok(Bytes::from(out)), touched),
                     Err(e) => (Err(e), Vec::new()),
                 }
             }
@@ -3774,12 +4065,8 @@ impl MeshBlobAdapter {
     /// scans against an arbitrarily-large hash list should be
     /// aware that the side effect compounds.
     fn chunk_exists(&self, hash: &[u8; 32]) -> Result<bool, BlobError> {
-        let channel = Self::chunk_channel(hash);
-        let cfg = self.chunk_file_config();
-        let file = self
-            .redex
-            .open_file(&channel, cfg)
-            .map_err(|e| BlobError::Backend(format!("mesh blob: open chunk file: {}", e)))?;
+        // PERF_AUDIT §6.7 — cached open.
+        let file = self.open_chunk_file_cached(hash)?;
         Ok(!file.is_empty())
     }
 
@@ -3865,6 +4152,97 @@ mod tests {
             hash,
             payload.len() as u64,
         )
+    }
+
+    /// PERF_AUDIT §6.7 — the chunk-file handle cache MUST
+    /// invalidate on `delete_chunk` so a re-store + fetch after
+    /// delete sees the fresh file rather than reading from a
+    /// stale handle that points at the now-unlinked file.
+    #[tokio::test]
+    async fn delete_chunk_invalidates_handle_cache_before_restore() {
+        use crate::adapter::net::dataforts::blob::adapter::BlobAdapter;
+        let adapter = make_adapter();
+        let payload_v1 = b"original payload".to_vec();
+        let hash_v1: [u8; 32] = blake3::hash(&payload_v1).into();
+        let blob_v1 = BlobRef::small(
+            format!("mesh://{}", hex32(&hash_v1)),
+            hash_v1,
+            payload_v1.len() as u64,
+        );
+        adapter.store(&blob_v1, &payload_v1).await.unwrap();
+
+        // Warm the cache via a fetch.
+        let got = adapter.fetch(&blob_v1).await.unwrap();
+        assert_eq!(got.as_ref(), payload_v1.as_slice());
+
+        // Delete the chunk — the cache slot MUST go away.
+        adapter.delete_chunk(&hash_v1).await.unwrap();
+
+        // Fetching again must NOT see the deleted-but-cached
+        // handle as alive. NotFound is the correct outcome here.
+        let after = adapter.fetch(&blob_v1).await;
+        assert!(
+            matches!(after, Err(BlobError::NotFound(_))),
+            "fetch after delete must surface NotFound; got {after:?}",
+        );
+
+        // Re-store under the same hash — must succeed (no stale
+        // handle pointing at a phantom file) and the subsequent
+        // fetch must return the fresh bytes.
+        adapter.store(&blob_v1, &payload_v1).await.unwrap();
+        let after_restore = adapter.fetch(&blob_v1).await.unwrap();
+        assert_eq!(after_restore.as_ref(), payload_v1.as_slice());
+    }
+
+    /// PERF_AUDIT §6.7 — `sweep_gc` deletes chunk files via
+    /// `close_and_unlink_file` directly (not through
+    /// `delete_chunk`), so it needs its own chunk-file-handle
+    /// cache invalidation. The sweep's pin-probe (`chunk_exists`)
+    /// re-warms the cache with a handle for the very hash it then
+    /// unlinks; without the pop, a post-sweep fetch reads the
+    /// stale in-memory handle (resurrecting the deleted chunk)
+    /// and a post-sweep re-store hits the stale non-empty
+    /// idempotent fast-path and silently skips the append —
+    /// losing the data.
+    #[tokio::test]
+    async fn sweep_gc_invalidates_chunk_file_handle_cache() {
+        use crate::adapter::net::dataforts::blob::adapter::BlobAdapter;
+        let adapter = make_adapter();
+        let payload = b"swept then re-stored".to_vec();
+        let hash: [u8; 32] = blake3::hash(&payload).into();
+        let blob = BlobRef::small(
+            format!("mesh://{}", hex32(&hash)),
+            hash,
+            payload.len() as u64,
+        );
+        adapter.store(&blob, &payload).await.unwrap();
+        // Warm the handle cache via a fetch.
+        let got = adapter.fetch(&blob).await.unwrap();
+        assert_eq!(got.as_ref(), payload.as_slice());
+
+        // Far-future timestamp pushes age past the retention floor
+        // so the chunk is deletable.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + (DEFAULT_RETENTION_FLOOR.as_millis() as u64 * 2);
+        let swept = adapter.sweep_gc(now, false).await.unwrap();
+        assert!(swept >= 1, "the stored chunk must be swept; got {swept}");
+
+        // Fetch must observe the deletion, not a stale cached
+        // handle still holding the old in-memory payload.
+        let after = adapter.fetch(&blob).await;
+        assert!(
+            matches!(after, Err(BlobError::NotFound(_))),
+            "fetch after sweep must surface NotFound; got {after:?}",
+        );
+
+        // Re-store must actually append into a fresh file (not
+        // no-op against a stale non-empty handle) and round-trip.
+        adapter.store(&blob, &payload).await.unwrap();
+        let restored = adapter.fetch(&blob).await.unwrap();
+        assert_eq!(restored.as_ref(), payload.as_slice());
     }
 
     #[tokio::test]
@@ -4148,13 +4526,17 @@ mod tests {
         );
     }
 
-    /// Idempotent fast-path must verify the existing on-disk
-    /// bytes against the supplied hash. A pre-existing corrupted
-    /// payload at the same channel (e.g. truncated replication
-    /// catch-up) surfaces as `HashMismatch` rather than silently
-    /// being affirmed by an honest caller's `store`.
+    /// Idempotent fast-path must reject a length-mismatched
+    /// pre-existing payload at the same channel (e.g. truncated
+    /// replication catch-up) — surfaces as `HashMismatch` rather
+    /// than silently being affirmed by an honest caller's `store`.
+    /// Per PERF_AUDIT §6.3 the fast-path now compares length only
+    /// (no re-hash of the existing bytes); same-length on-disk
+    /// corruption is left to GC/scrub. The legacy test still
+    /// passes because the poisoned bytes here are a different
+    /// length from the honest payload.
     #[tokio::test]
-    async fn store_chunk_idempotent_path_verifies_existing_bytes() {
+    async fn store_chunk_idempotent_path_rejects_length_mismatch() {
         use crate::adapter::net::dataforts::blob::adapter::BlobAdapter;
         let adapter = make_adapter();
         // Pre-poison the chunk channel for our intended hash with
@@ -4182,9 +4564,229 @@ mod tests {
         let err = adapter.store(&blob, &intended_payload).await.unwrap_err();
         assert!(
             matches!(err, BlobError::HashMismatch { .. }),
-            "idempotent fast-path must verify existing bytes; got {:?}",
+            "idempotent fast-path must reject length-mismatched existing bytes; got {:?}",
             err
         );
+    }
+
+    /// PERF_AUDIT §6.1 — the offloaded blake3 path must agree with
+    /// the inline path for every input size, especially at the
+    /// threshold boundary. Asserts both helpers match
+    /// `blake3::hash` directly so we can't regress the offload into
+    /// a subtle mis-hash by accident.
+    #[tokio::test]
+    async fn blake3_hash_offload_matches_inline_around_threshold() {
+        use super::{
+            blake3_hash_offload_bytes, blake3_hash_offload_vec, BLAKE3_OFFLOAD_THRESHOLD_BYTES,
+        };
+        // Test sizes that bracket the threshold from below, at, and
+        // above — exercises both the inline short-circuit branch
+        // and the spawn_blocking branch.
+        for size in [
+            0usize,
+            1,
+            64,
+            BLAKE3_OFFLOAD_THRESHOLD_BYTES - 1,
+            BLAKE3_OFFLOAD_THRESHOLD_BYTES,
+            BLAKE3_OFFLOAD_THRESHOLD_BYTES + 1,
+            BLAKE3_OFFLOAD_THRESHOLD_BYTES * 2,
+            BLAKE3_OFFLOAD_THRESHOLD_BYTES * 4 + 17,
+        ] {
+            // Deterministic-but-varied content so identical-zero
+            // collisions can't accidentally pass.
+            let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let expected: [u8; 32] = blake3::hash(&payload).into();
+
+            let (offload_hash_vec, returned) = blake3_hash_offload_vec(payload.clone()).await;
+            assert_eq!(
+                offload_hash_vec, expected,
+                "Vec offload hash mismatch at size {}",
+                size
+            );
+            assert_eq!(
+                returned, payload,
+                "Vec offload must return the original bytes at size {}",
+                size
+            );
+
+            let snapshot = bytes::Bytes::from(payload);
+            let offload_hash_bytes = blake3_hash_offload_bytes(&snapshot).await;
+            assert_eq!(
+                offload_hash_bytes, expected,
+                "Bytes offload hash mismatch at size {}",
+                size
+            );
+        }
+    }
+
+    /// PERF_AUDIT §6.2 — `store_chunk_prehashed` is the in-crate
+    /// trusted entry that skips the second-pass blake3 guard. It
+    /// must still drive content correctly when the (hash, bytes)
+    /// pair is consistent. The contract is "the caller guarantees
+    /// hash == blake3(bytes)" — if they lie, we don't promise
+    /// detection (and `fetch_chunk`'s read-side verify will catch
+    /// it later). This test pins the well-formed contract.
+    #[tokio::test]
+    async fn store_chunk_prehashed_round_trips_against_fetch() {
+        let adapter = make_adapter();
+        let payload: Vec<u8> = b"prehashed round-trip".to_vec();
+        let hash: [u8; 32] = blake3::hash(&payload).into();
+        adapter
+            .store_chunk_prehashed(&hash, &payload)
+            .await
+            .expect("prehashed store accepts well-formed input");
+        let fetched = adapter.fetch_chunk(&hash).await.unwrap();
+        assert_eq!(&fetched[..], &payload[..]);
+    }
+
+    /// PERF_AUDIT §6.2 — the public `BlobAdapter::store` surface
+    /// must keep verifying caller-supplied bytes against the
+    /// declared hash (the verify lives in `store_chunk`, not in
+    /// `store_chunk_prehashed`). This test pins that the
+    /// refactor did not accidentally bypass the verify on the
+    /// untrusted entry point.
+    #[tokio::test]
+    async fn store_chunk_public_path_still_verifies_caller_bytes() {
+        use crate::adapter::net::dataforts::blob::adapter::BlobAdapter;
+        let adapter = make_adapter();
+        let advertised: &[u8] = b"truth-bytes-xx"; // 14 bytes
+        let attempted: Vec<u8> = b"lie-bytes-zzzz".to_vec(); // 14 bytes — same length
+        assert_eq!(advertised.len(), attempted.len());
+        let hash: [u8; 32] = blake3::hash(advertised).into();
+        let blob = BlobRef::small("mesh://verify-after-refactor", hash, attempted.len() as u64);
+        let err = adapter.store(&blob, &attempted).await.unwrap_err();
+        assert!(
+            matches!(err, BlobError::HashMismatch { .. }),
+            "public store must verify caller bytes; got {:?}",
+            err
+        );
+    }
+
+    /// PERF_AUDIT §6.3 — the dedup fast-path must not pay the
+    /// O(chunk_size) read + hash on every duplicate store. With
+    /// length-only verification, a same-length corrupted
+    /// pre-existing payload (the GC/scrub failure mode the audit
+    /// explicitly defers) is no longer caught at store time; this
+    /// test asserts the new behavior to lock the cost-shift in
+    /// place and to act as a regression guard against accidental
+    /// reintroduction of the deep re-hash.
+    #[tokio::test]
+    async fn store_chunk_idempotent_path_accepts_same_length_existing_bytes() {
+        use crate::adapter::net::dataforts::blob::adapter::BlobAdapter;
+        let adapter = make_adapter();
+        let intended_payload = b"honest payload!!".to_vec(); // 16 bytes
+        let intended_hash: [u8; 32] = blake3::hash(&intended_payload).into();
+        let channel = MeshBlobAdapter::chunk_channel_for_hash(&intended_hash);
+        let file = adapter
+            .redex
+            .open_file(&channel, RedexFileConfig::new())
+            .unwrap();
+        // Pre-poison with bytes of the same length but different
+        // content. Under the legacy deep re-hash this would have
+        // returned HashMismatch; under length-only verification it
+        // succeeds (verification deferred to GC/scrub).
+        let corrupt: Vec<u8> = b"CCCCCCCCCCCCCCCC".to_vec();
+        assert_eq!(corrupt.len(), intended_payload.len());
+        file.append(&corrupt).unwrap();
+
+        let blob = BlobRef::small(
+            "mesh://same-len",
+            intended_hash,
+            intended_payload.len() as u64,
+        );
+        // The fast-path now trusts content-addressing and length;
+        // it should accept this store (no read + hash performed).
+        adapter
+            .store(&blob, &intended_payload)
+            .await
+            .expect("length-only verification accepts same-length pre-existing");
+    }
+
+    /// PERF_AUDIT §6.3 — the read-side backstop, pinned. The
+    /// length-only dedup deliberately lets a same-length corrupted
+    /// slot survive store time (asserted by
+    /// `store_chunk_idempotent_path_accepts_same_length_existing_bytes`
+    /// above); the safety argument in `store_chunk_locked`'s
+    /// comment is that `fetch_chunk`'s hash verify catches the
+    /// corruption before any caller sees the bytes. This test
+    /// closes that loop: store succeeds against the poisoned slot,
+    /// then fetch of the same chunk surfaces `HashMismatch` rather
+    /// than serving corrupt bytes. If the read-side verify is ever
+    /// weakened the same way, this fails — and §6.3's documented
+    /// tradeoff stops being sound.
+    #[tokio::test]
+    async fn fetch_backstop_catches_corruption_the_dedup_store_accepted() {
+        use crate::adapter::net::dataforts::blob::adapter::BlobAdapter;
+        let adapter = make_adapter();
+        let intended_payload = b"honest payload!!".to_vec(); // 16 bytes
+        let intended_hash: [u8; 32] = blake3::hash(&intended_payload).into();
+        let channel = MeshBlobAdapter::chunk_channel_for_hash(&intended_hash);
+        let file = adapter
+            .redex
+            .open_file(&channel, RedexFileConfig::new())
+            .unwrap();
+        // Same-length corruption pre-seeded under the honest hash.
+        let corrupt: Vec<u8> = b"CCCCCCCCCCCCCCCC".to_vec();
+        assert_eq!(corrupt.len(), intended_payload.len());
+        file.append(&corrupt).unwrap();
+
+        let blob = BlobRef::small(
+            "mesh://backstop",
+            intended_hash,
+            intended_payload.len() as u64,
+        );
+        // Store-time: accepted (length-only dedup — by design).
+        adapter
+            .store(&blob, &intended_payload)
+            .await
+            .expect("dedup fast-path accepts the same-length slot");
+        // Read-time: the backstop must refuse to serve the corrupt
+        // bytes.
+        let err = adapter
+            .fetch(&blob)
+            .await
+            .expect_err("fetch must not serve corrupted chunk bytes");
+        assert!(
+            matches!(err, BlobError::HashMismatch { .. }),
+            "read-side verify is the §6.3 backstop; got {:?}",
+            err
+        );
+    }
+
+    /// PERF_AUDIT §6.3 — the dedup fast-path's length compare must
+    /// run against the FIRST retained event, not the sum of all
+    /// retained events. A chunk file can legitimately hold the
+    /// same payload appended twice (the pre-per-hash-lock TOCTOU
+    /// double-append the `store_chunk` doc describes: "reads still
+    /// return correct bytes but the underlying storage wastes
+    /// space"); reads serve the first event, so an honest re-store
+    /// against such a legacy file must be accepted rather than
+    /// spuriously rejected because the retained-bytes sum is 2×
+    /// the payload length.
+    #[tokio::test]
+    async fn store_chunk_idempotent_path_accepts_duplicate_event_layout() {
+        use crate::adapter::net::dataforts::blob::adapter::BlobAdapter;
+        let adapter = make_adapter();
+        let payload = b"duplicated payload".to_vec();
+        let hash: [u8; 32] = blake3::hash(&payload).into();
+        let channel = MeshBlobAdapter::chunk_channel_for_hash(&hash);
+        let file = adapter
+            .redex
+            .open_file(&channel, RedexFileConfig::new())
+            .unwrap();
+        // Simulate the pre-lock TOCTOU double-append: two events,
+        // each carrying the full honest payload.
+        file.append(&payload).unwrap();
+        file.append(&payload).unwrap();
+
+        let blob = BlobRef::small("mesh://dup-events", hash, payload.len() as u64);
+        adapter
+            .store(&blob, &payload)
+            .await
+            .expect("dedup fast-path must accept the duplicate-event layout");
+        // Reads keep serving the first event byte-for-byte.
+        let fetched = adapter.fetch(&blob).await.unwrap();
+        assert_eq!(fetched.as_ref(), payload.as_slice());
     }
 
     #[tokio::test]
@@ -5494,6 +6096,128 @@ mod tests {
         assert_eq!(fetched, payload, "reconstructed bytes must match original");
     }
 
+    /// PERF_AUDIT §6.4 — odd-offset PARTIAL ranges through the
+    /// ErasureLeaf walk (the existing RS tests only fetch the
+    /// full range). 4 KiB chunks × 6 with RS(4,2) = one RS stripe
+    /// (chunks 0..4) + a trailing Replicated stripe (chunks 4..6);
+    /// sweep odd ranges including ones crossing the RS-stripe →
+    /// trailer boundary and intra-chunk slices, comparing
+    /// byte-for-byte against the source.
+    #[tokio::test]
+    async fn fetch_range_rs_partial_odd_ranges_cross_stripe_and_trailer() {
+        let adapter = make_adapter();
+        let chunk_size: u32 = 4 * 1024;
+        let payload = deterministic_bytes(0xE7, chunk_size as usize * 6);
+        let rs_params = super::super::erasure::RsParams { k: 4, m: 2 };
+        let blob_ref = adapter
+            .store_stream_tree_rs_internal(
+                stream_one(payload.clone()),
+                ChunkingStrategy::Fixed { size: chunk_size },
+                rs_params,
+            )
+            .await
+            .unwrap();
+        // The RS stripe covers chunks 0..4; the Replicated trailer
+        // covers chunks 4..6.
+        let stripe_boundary = chunk_size as u64 * 4;
+        let total = payload.len() as u64;
+        let ranges: Vec<(u64, u64)> = vec![
+            (1, total - 1),
+            (stripe_boundary - 3, stripe_boundary + 5),
+            (chunk_size as u64 - 1, chunk_size as u64 * 3 + 7),
+            (stripe_boundary + 13, total - 13),
+            (0, 1),
+            (total - 1, total),
+        ];
+        for (start, end) in ranges {
+            let fetched = adapter.fetch_range(&blob_ref, start..end).await.unwrap();
+            assert_eq!(
+                &fetched[..],
+                &payload[start as usize..end as usize],
+                "RS range {start}..{end} must round-trip byte-identical"
+            );
+        }
+    }
+
+    /// PERF_AUDIT §6.4 — odd-offset partial ranges served through
+    /// RS RECONSTRUCTION (`walk_stripe_with_reconstruction`'s
+    /// post-decode slicing), not just the optimistic data-only
+    /// path. Kill `m` data chunks of a single full stripe, then
+    /// sweep odd sub-ranges that overlap both missing and
+    /// surviving chunks.
+    #[tokio::test]
+    async fn fetch_range_rs_reconstruction_round_trips_odd_partial_ranges() {
+        let adapter = make_adapter();
+        let chunk_size: u32 = 4 * 1024;
+        // Single full stripe: exactly k=4 data chunks, no trailing.
+        let payload = deterministic_bytes(0xE8, chunk_size as usize * 4);
+        let rs_params = super::super::erasure::RsParams { k: 4, m: 2 };
+        let blob_ref = adapter
+            .store_stream_tree_rs_internal(
+                stream_one(payload.clone()),
+                ChunkingStrategy::Fixed { size: chunk_size },
+                rs_params,
+            )
+            .await
+            .unwrap();
+
+        // Walk the tree to find the stripe's data chunk hashes
+        // (same shape as fetch_range_rs_reconstructs_when_data_chunks_missing).
+        let root_hash = *blob_ref.tree_root_hash().unwrap();
+        let root_bytes = adapter.fetch_chunk(&root_hash).await.unwrap();
+        let leaf_bytes = match TreeNode::decode(&root_bytes).unwrap() {
+            TreeNode::ErasureLeaf { .. } => root_bytes,
+            TreeNode::Internal { children } => {
+                let (child_hash, _) = children[0];
+                adapter.fetch_chunk(&child_hash).await.unwrap()
+            }
+            TreeNode::Leaf { .. } => panic!("RS path should not emit Leaf nodes"),
+        };
+        let stripes = match TreeNode::decode(&leaf_bytes).unwrap() {
+            TreeNode::ErasureLeaf { stripes } => stripes,
+            other => panic!("expected ErasureLeaf, got: {:?}", other),
+        };
+        assert_eq!(stripes.len(), 1);
+        let data_chunk_hashes: Vec<[u8; 32]> = stripes[0]
+            .chunks
+            .iter()
+            .filter(|c| c.is_data())
+            .map(|c| c.hash)
+            .collect();
+        assert_eq!(data_chunk_hashes.len(), 4);
+
+        // Kill 2 data chunks (= m = tolerance): chunk 0 and chunk 2,
+        // so reconstruction interleaves with surviving chunks.
+        adapter.delete_chunk(&data_chunk_hashes[0]).await.unwrap();
+        adapter.delete_chunk(&data_chunk_hashes[2]).await.unwrap();
+
+        let c = chunk_size as u64;
+        let total = payload.len() as u64;
+        let ranges: Vec<(u64, u64)> = vec![
+            // Off-by-one full range — touches both missing chunks.
+            (1, total - 1),
+            // Odd slice inside missing chunk 0 only.
+            (17, 1000),
+            // Crossing missing chunk 0 → surviving chunk 1.
+            (c - 3, c + 5),
+            // Crossing surviving chunk 1 → missing chunk 2.
+            (c * 2 - 7, c * 2 + 13),
+            // Odd tail inside surviving chunk 3 only.
+            (total - 9, total - 1),
+        ];
+        for (start, end) in ranges {
+            let fetched = adapter
+                .fetch_range(&blob_ref, start..end)
+                .await
+                .expect("degraded RS range fetch must reconstruct");
+            assert_eq!(
+                &fetched[..],
+                &payload[start as usize..end as usize],
+                "degraded RS range {start}..{end} must round-trip byte-identical"
+            );
+        }
+    }
+
     /// Lazy stripe-index population: a fresh adapter doesn't
     /// know about any stripes, but the first `fetch_range` that
     /// walks an ErasureLeaf re-populates the index. Simulates
@@ -6442,6 +7166,61 @@ mod tests {
         let end = leaf_boundary + 100;
         let fetched = adapter.fetch_range(&blob_ref, start..end).await.unwrap();
         assert_eq!(fetched, &payload[start as usize..end as usize]);
+    }
+
+    /// PERF_AUDIT §6.4 — the shared-output-buffer walk must stitch
+    /// non-chunk-aligned ranges exactly at every recursion level.
+    /// Depth-2 tree (1 KiB chunks, `TREE_FANOUT + 3` chunks → a
+    /// full leaf + a partial leaf under one internal root); sweep
+    /// odd-offset / odd-length ranges, including ones that cross
+    /// the leaf-subtree boundary mid-chunk, and compare
+    /// byte-for-byte against the source payload. An off-by-one in
+    /// the offset math at either recursion level corrupts the
+    /// assembled bytes silently — this sweep is the regression
+    /// guard.
+    #[tokio::test]
+    async fn fetch_range_tree_odd_offset_sweep_depth_two() {
+        let adapter = make_adapter();
+        let small_chunk: u32 = 1024;
+        let len = small_chunk as usize * (TREE_FANOUT + 3);
+        let payload = deterministic_bytes(0xB7, len);
+        let blob_ref = adapter
+            .store_stream_tree_internal(
+                stream_one(payload.clone()),
+                Encoding::Replicated,
+                small_chunk,
+            )
+            .await
+            .unwrap();
+        assert_eq!(blob_ref.tree_depth(), Some(2));
+        let leaf_boundary = small_chunk as u64 * TREE_FANOUT as u64;
+        let total = len as u64;
+        let ranges: Vec<(u64, u64)> = vec![
+            // Full blob through the depth-2 walk.
+            (0, total),
+            // Off-by-one at both ends.
+            (1, total - 1),
+            // Two bytes straddling the leaf-subtree boundary.
+            (leaf_boundary - 1, leaf_boundary + 1),
+            // Odd-sized multi-chunk range crossing the boundary
+            // mid-chunk on both sides.
+            (leaf_boundary - 1537, leaf_boundary + 2049),
+            // Intra-first-chunk start, ending inside chunk 2.
+            (513, 1536 + 7),
+            // Odd-length tail of the partial leaf.
+            (total - 7, total),
+            // Single byte each side of the leaf boundary.
+            (leaf_boundary, leaf_boundary + 1),
+            (leaf_boundary - 1, leaf_boundary),
+        ];
+        for (start, end) in ranges {
+            let fetched = adapter.fetch_range(&blob_ref, start..end).await.unwrap();
+            assert_eq!(
+                &fetched[..],
+                &payload[start as usize..end as usize],
+                "range {start}..{end} must round-trip byte-identical"
+            );
+        }
     }
 
     /// Zero-length range short-circuits without any fetches.

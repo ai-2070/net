@@ -184,6 +184,41 @@ impl MemoriesWatcher {
                     _ = tx.closed() => return,
                     maybe_seq = changes.next() => {
                         let Some(_seq) = maybe_seq else { return };
+                        // PERF_AUDIT §5.6 — opportunistic batching.
+                        // Pre-fix every fold-apply tick triggered a
+                        // full `spec.execute` re-scan of the
+                        // memories HashMap. During a catch-up
+                        // replay or any bursty publisher, the same
+                        // filtered result was recomputed once per
+                        // event when downstream callers only ever
+                        // see the final state (the watch channel
+                        // conflates on the consumer side).
+                        //
+                        // Drain any change events that have ALREADY
+                        // arrived in the stream's buffer before
+                        // re-querying. `now_or_never` is a non-
+                        // blocking probe — does not delay queries
+                        // for spread-out changes; only coalesces
+                        // bursts where multiple ticks are already
+                        // queued.
+                        //
+                        // End-of-stream during the drain must NOT
+                        // short-circuit past the query below: we
+                        // already received at least one tick this
+                        // iteration, so the final state still has
+                        // to be computed and delivered (eventual
+                        // consistency of the last value). Returning
+                        // here would drop the burst's final
+                        // emission whenever the producer's last
+                        // append races the adapter teardown.
+                        use futures::future::FutureExt;
+                        let mut stream_ended = false;
+                        while let Some(maybe_more) = changes.next().now_or_never() {
+                            if maybe_more.is_none() {
+                                stream_ended = true;
+                                break;
+                            }
+                        }
                         let current = {
                             let guard = state.read();
                             spec.execute(&guard)
@@ -194,11 +229,71 @@ impl MemoriesWatcher {
                             }
                             last = current;
                         }
+                        if stream_ended {
+                            return;
+                        }
                     }
                 }
             }
         });
 
         WatchStream::new(rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PERF_AUDIT §5.6 regression — the opportunistic burst drain
+    /// must NOT short-circuit past the re-query when it observes
+    /// end-of-stream. A producer that appends a burst and is then
+    /// torn down (changes stream ends) still owes the consumer the
+    /// burst's final state: pre-fix the drain's `None => return`
+    /// dropped the already-received tick(s) on the floor and the
+    /// consumer never saw the last value.
+    ///
+    /// Deterministic under the current-thread test runtime: the
+    /// spawned watcher task cannot run until our first `.await`, so
+    /// the state mutation below lands before the watcher drains the
+    /// (immediately-ready, immediately-ending) 3-tick stream.
+    #[tokio::test]
+    async fn burst_drain_hitting_end_of_stream_still_delivers_final_state() {
+        let state = Arc::new(RwLock::new(MemoriesState::new()));
+        // A 3-tick burst followed immediately by end-of-stream —
+        // models "append burst, then adapter teardown".
+        let changes = StreamExt::boxed(futures::stream::iter(vec![0u64, 1, 2]));
+        let watcher = MemoriesWatcher::new(state.clone(), changes);
+        let mut out = Box::pin(watcher.stream());
+
+        // Mutate state AFTER `stream()` computed the initial
+        // (empty) snapshot but BEFORE the watcher task first polls.
+        state.write().memories.insert(
+            7,
+            Arc::new(Memory {
+                id: 7,
+                content: "final value".into(),
+                tags: vec!["t".into()],
+                source: "test".into(),
+                created_ns: 1,
+                updated_ns: 1,
+                pinned: false,
+            }),
+        );
+
+        let initial = out.next().await.unwrap();
+        assert!(initial.is_empty(), "initial snapshot precedes the insert");
+
+        let last = out
+            .next()
+            .await
+            .expect("final state must be delivered before the stream ends");
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].id, 7);
+
+        assert!(
+            out.next().await.is_none(),
+            "stream ends after the final delivery"
+        );
     }
 }

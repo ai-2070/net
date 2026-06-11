@@ -183,6 +183,24 @@ pub struct CapabilityFilter {
     pub limit: usize,
 }
 
+impl CapabilityFilter {
+    /// `true` when no field constrains the candidate set — every
+    /// node in the fold is admissible. Per PERF_AUDIT §4.11 the
+    /// bulk `find_nodes_matching` path short-circuits on this so
+    /// the permissive case (e.g. `LegacyPlacement::permissive`)
+    /// skips the full `HashSet<(class, NodeId)>` build + retain
+    /// loop + sort + dedup that the general path runs.
+    #[inline]
+    pub fn is_permissive(&self) -> bool {
+        self.class.is_none()
+            && self.tags_all.is_empty()
+            && self.tags_any.is_empty()
+            && self.tag_groups_all.is_empty()
+            && self.state.is_none()
+            && self.region.is_none()
+    }
+}
+
 /// One query result row.
 pub type CapabilityMatch = ((u64, NodeId), CapabilityMembership);
 
@@ -194,10 +212,22 @@ pub type CapabilityMatch = ((u64, NodeId), CapabilityMembership);
 /// find-in-region, find-by-state) without scanning the full
 /// store. `Composite` queries pick the most selective indexed
 /// dimension and filter the others in-memory.
+///
+/// **PERF_AUDIT §4.6** — the inner `HashSet<(u64, NodeId)>` candidate
+/// sets use `BuildU64TupleHasher` (private to this module), a fast
+/// multiplicative mixer for
+/// `(u64, u64)` keys. Pre-fix these used the std SipHash default,
+/// which paid ~15-25 ns of mixing per insert/contains/remove on keys
+/// that are already xxh3-hashed identity bytes (so collision
+/// resistance is already there at construction; SipHash's DoS
+/// resistance adds zero protection). The outer `HashMap<String, _>` /
+/// `HashMap<NodeState, _>` keep the default hasher: tag / region
+/// strings come from publishers and the SipHash protection is
+/// legitimately relevant there.
 #[derive(Debug, Default)]
 pub struct CapabilityIndexInner {
     /// tag → set of (class, node) keys carrying that tag.
-    by_tag: HashMap<String, HashSet<(u64, NodeId)>>,
+    by_tag: HashMap<String, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
     /// Index-only synthetic tag (`model:`/`tool:`/`gpu:`) → set of
     /// (class, node) keys. Kept in a SEPARATE map from `by_tag` so a
     /// raw published tag string can never collide with a synthetic
@@ -207,12 +237,51 @@ pub struct CapabilityIndexInner {
     /// `require_models` query it lacks the real bundle for. The bulk
     /// model/tool/gpu axes (`tag_groups_all`) resolve against this
     /// map only — see [`group_union`].
-    by_synthetic: HashMap<String, HashSet<(u64, NodeId)>>,
+    by_synthetic: HashMap<String, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
     /// region → set of (class, node) keys.
-    by_region: HashMap<String, HashSet<(u64, NodeId)>>,
+    by_region: HashMap<String, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
     /// state → set of (class, node) keys.
-    by_state: HashMap<NodeState, HashSet<(u64, NodeId)>>,
+    by_state: HashMap<NodeState, HashSet<(u64, NodeId), BuildU64TupleHasher>>,
 }
+
+/// Fast multiplicative `(u64, u64)` mixer for the inverted-index
+/// candidate sets. Per PERF_AUDIT §4.6 — see [`CapabilityIndexInner`]
+/// for the threat-model rationale (keys come from already-verified
+/// announcements; SipHash DoS resistance is irrelevant).
+///
+/// `Hash for (u64, u64)` is `write_u64(self.0); write_u64(self.1);`,
+/// so a hasher with a fast `write_u64` step and the byte-fallback for
+/// completeness mixes the pair correctly in 2 multiplications.
+#[derive(Default, Clone)]
+pub(crate) struct U64TupleHasher(u64);
+
+impl std::hash::Hasher for U64TupleHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        // FxHash-style step: rotate, xor, multiply by a large odd
+        // constant. ~1 ns; well-distributed for already-hashed input.
+        const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(FX_SEED);
+    }
+    /// Defensive byte fallback — the std `Hash` impl for `(u64, u64)`
+    /// calls `write_u64` directly, but a future change to the tuple's
+    /// hash impl could route through `write(&[u8])`. Pack up to 8
+    /// bytes per chunk and reuse `write_u64`.
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            self.write_u64(u64::from_le_bytes(buf));
+        }
+    }
+}
+
+pub(crate) type BuildU64TupleHasher = std::hash::BuildHasherDefault<U64TupleHasher>;
 
 impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
     fn on_insert(&mut self, key: &(u64, NodeId), payload: &CapabilityMembership) {
@@ -277,6 +346,35 @@ impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
         self.by_synthetic.clear();
         self.by_region.clear();
         self.by_state.clear();
+    }
+
+    /// PERF_AUDIT §4.5 — `on_insert` keys this index on
+    /// `(tags, derived synthetic tags, region, state)`. If the two
+    /// payloads agree on every one of those, an on_remove +
+    /// on_insert against them nets to a no-op on every bucket
+    /// (`derive_synthetic_index_tags` is pure over the payload, so
+    /// identical inputs produce identical synthetic outputs).
+    ///
+    /// The synthetic tags derive from TWO payload fields: the
+    /// `software.model.*` / `software.tool.*` bundles inside
+    /// `tags` (covered by the `tags` equality) AND the
+    /// `gpu:present` / `gpu:vendor:<v>` projection of `hardware`
+    /// — so `hardware` MUST be part of this comparison or a
+    /// refresh that changes only the GPU shape would leave
+    /// `by_synthetic` stale. Comparing the whole
+    /// `HardwareSummary` is slightly conservative (a
+    /// memory_gb/vram_gb-only delta forces a rebuild the index
+    /// doesn't strictly need), but the steady-state refresh the
+    /// audit targets keeps hardware identical, so the win is
+    /// unaffected and the check stays future-proof against new
+    /// hardware-derived synthetic tags. Allow-lists / metadata /
+    /// price_quote / reflex_addr are NOT consulted by this index
+    /// and may differ freely.
+    fn index_payload_equivalent(old: &CapabilityMembership, new: &CapabilityMembership) -> bool {
+        old.state == new.state
+            && old.region == new.region
+            && old.tags == new.tags
+            && old.hardware == new.hardware
     }
 }
 
@@ -414,7 +512,10 @@ impl FoldKind for CapabilityFold {
 /// as the candidate set, then retain only candidates present
 /// in every subsequent bucket. Empty `tags` returns every key
 /// (matches the `tags_all = []` "no constraint" convention).
-fn resolve_keys_all_tags(index: &CapabilityIndexInner, tags: &[String]) -> HashSet<(u64, NodeId)> {
+fn resolve_keys_all_tags(
+    index: &CapabilityIndexInner,
+    tags: &[String],
+) -> HashSet<(u64, NodeId), BuildU64TupleHasher> {
     if tags.is_empty() {
         // No tag constraint → every indexed key. Use the by_state
         // index as a proxy: every entry is indexed under exactly
@@ -431,16 +532,17 @@ fn resolve_keys_all_tags(index: &CapabilityIndexInner, tags: &[String]) -> HashS
     tags_by_selectivity.sort_by_key(|t| index.by_tag.get(*t).map(|s| s.len()).unwrap_or(0));
 
     let Some(first) = tags_by_selectivity.first() else {
-        return HashSet::new();
+        return HashSet::default();
     };
     let Some(initial) = index.by_tag.get(*first) else {
         // First tag has no entries → intersection is empty.
-        return HashSet::new();
+        return HashSet::default();
     };
-    let mut candidates: HashSet<(u64, NodeId)> = initial.iter().copied().collect();
+    let mut candidates: HashSet<(u64, NodeId), BuildU64TupleHasher> =
+        initial.iter().copied().collect();
     for tag in tags_by_selectivity.iter().skip(1) {
         let Some(bucket) = index.by_tag.get(*tag) else {
-            return HashSet::new();
+            return HashSet::default();
         };
         candidates.retain(|k| bucket.contains(k));
         if candidates.is_empty() {
@@ -466,17 +568,18 @@ pub(crate) fn resolve_candidate_keys(
     state: &FoldState<CapabilityFold>,
     index: &CapabilityIndexInner,
     filter: &CapabilityFilter,
-) -> HashSet<(u64, NodeId)> {
+) -> HashSet<(u64, NodeId), BuildU64TupleHasher> {
     // Each group's union (OR within a group) is needed both to seed
     // (when no `tags_all` is present) and to tighten further down.
     // `group_unions` holds the ones that still need to be applied as
     // retain filters; the seed branch may consume one of them.
-    let mut group_unions: Vec<HashSet<(u64, NodeId)>> = Vec::new();
+    let mut group_unions: Vec<HashSet<(u64, NodeId), BuildU64TupleHasher>> = Vec::new();
 
     // Seed candidate set: prefer tags_all (typically most
     // selective), then the most-selective tag group, then state,
     // then region, then class scan as fallback.
-    let mut candidates: HashSet<(u64, NodeId)> = if !filter.tags_all.is_empty() {
+    let mut candidates: HashSet<(u64, NodeId), BuildU64TupleHasher> = if !filter.tags_all.is_empty()
+    {
         let seed = resolve_keys_all_tags(index, &filter.tags_all);
         // Only materialize the group unions if the seed left
         // something to filter — when `tags_all` selects nothing the
@@ -541,8 +644,9 @@ pub(crate) fn resolve_candidate_keys(
     if !filter.tags_any.is_empty() {
         // Keep only candidates that carry at least one of the
         // tags_any list. Build the union of those tag buckets
-        // once, then `retain`.
-        let mut tags_any_union: HashSet<(u64, NodeId)> = HashSet::new();
+        // once, then `retain`. Same PERF_AUDIT §4.6 fast mixer as
+        // the other `(u64, NodeId)` intermediates in this resolver.
+        let mut tags_any_union: HashSet<(u64, NodeId), BuildU64TupleHasher> = HashSet::default();
         for tag in &filter.tags_any {
             if let Some(bucket) = index.by_tag.get(tag) {
                 tags_any_union.extend(bucket.iter().copied());
@@ -575,7 +679,7 @@ pub(crate) fn resolve_candidate_keys(
 fn build_group_unions(
     index: &CapabilityIndexInner,
     groups: &[Vec<String>],
-) -> Vec<HashSet<(u64, NodeId)>> {
+) -> Vec<HashSet<(u64, NodeId), BuildU64TupleHasher>> {
     groups
         .iter()
         .filter(|g| !g.is_empty())
@@ -592,8 +696,11 @@ fn build_group_unions(
 /// `derive_synthetic_index_tags`. Reading the synthetic map keeps a
 /// raw published tag of the same string from satisfying a model /
 /// tool / gpu axis it has no real bundle / hardware for.
-fn group_union(index: &CapabilityIndexInner, group: &[String]) -> HashSet<(u64, NodeId)> {
-    let mut union: HashSet<(u64, NodeId)> = HashSet::new();
+fn group_union(
+    index: &CapabilityIndexInner,
+    group: &[String],
+) -> HashSet<(u64, NodeId), BuildU64TupleHasher> {
+    let mut union: HashSet<(u64, NodeId), BuildU64TupleHasher> = HashSet::default();
     for tag in group {
         if let Some(bucket) = index.by_synthetic.get(tag) {
             union.extend(bucket.iter().copied());
@@ -612,15 +719,23 @@ fn composite_query(
     filter: &CapabilityFilter,
 ) -> Vec<CapabilityMatch> {
     let candidates = resolve_candidate_keys(state, index, filter);
-    // Materialize matches + apply limit.
-    let mut matches: Vec<CapabilityMatch> = candidates
+    // Materialize matches + apply limit during materialization.
+    //
+    // PERF_AUDIT §4.10 — pre-fix this collected every match (deep-
+    // cloning every `CapabilityMembership` payload — tags Vec,
+    // metadata BTreeMap, allow-lists) and only truncated AFTER. A
+    // query with a small `limit` against a large candidate set
+    // paid the full deep-clone cost on every over-limit match
+    // just to drop it on the next line. With `take` before
+    // `collect`, the clone runs exactly `limit` times.
+    let it = candidates
         .into_iter()
-        .filter_map(|k| state.entries.get(&k).map(|e| (k, e.payload.clone())))
-        .collect();
-    if filter.limit > 0 && matches.len() > filter.limit {
-        matches.truncate(filter.limit);
+        .filter_map(|k| state.entries.get(&k).map(|e| (k, e.payload.clone())));
+    if filter.limit > 0 {
+        it.take(filter.limit).collect()
+    } else {
+        it.collect()
     }
-    matches
 }
 
 /// Return the union of every tag this publisher has advertised
@@ -892,6 +1007,206 @@ mod tests {
             fold.query(CapabilityQuery::InRegion("us-west".into()))
                 .len(),
             1
+        );
+    }
+
+    /// PERF_AUDIT §4.5 — when a refresh announcement carries the
+    /// same (tags, region, state) as the existing entry, the
+    /// secondary index must NOT be churned. The skip optimization
+    /// must still let the entry's generation/TTL update, and
+    /// queries must continue to return the entry — verifying that
+    /// the index dance was unnecessary, not just absent.
+    ///
+    /// `index_payload_equivalent` itself is unit-tested below.
+    #[test]
+    fn replace_same_payload_keeps_index_consistent_and_query_returns_entry() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+
+        // v1: gpu+h100 tags, Idle, us-east.
+        fold.apply(sign_cap(
+            &kp,
+            0xCAFE,
+            1,
+            0x100,
+            vec!["gpu", "h100"],
+            NodeState::Idle,
+            Some("us-east"),
+        ))
+        .expect("v1");
+
+        // v2: identical payload, higher generation (steady-state
+        // refresh).
+        let outcome = fold
+            .apply(sign_cap(
+                &kp,
+                0xCAFE,
+                2,
+                0x100,
+                vec!["gpu", "h100"],
+                NodeState::Idle,
+                Some("us-east"),
+            ))
+            .expect("v2");
+        assert_eq!(outcome, ApplyOutcome::Replaced);
+
+        // The post-refresh query results must reflect the entry
+        // through every indexed dimension.
+        let by_tag = fold.query(CapabilityQuery::HasAllTags(vec!["gpu".into()]));
+        assert_eq!(by_tag.len(), 1, "tag bucket must still resolve the entry");
+        let by_state = fold.query(CapabilityQuery::InState(NodeState::Idle));
+        assert_eq!(by_state.len(), 1, "state bucket must still resolve");
+        let by_region = fold.query(CapabilityQuery::InRegion("us-east".into()));
+        assert_eq!(by_region.len(), 1, "region bucket must still resolve");
+    }
+
+    /// PERF_AUDIT §4.5 — `index_payload_equivalent` is the gate
+    /// between "skip the index dance" and "rebuild the buckets".
+    /// Pin both sides: identical (tags, region, state) returns
+    /// true; any differing dimension returns false.
+    #[test]
+    fn index_payload_equivalent_matches_indexed_dimensions() {
+        use std::collections::BTreeMap;
+        let base = CapabilityMembership {
+            class_hash: 0x100,
+            tags: vec!["gpu".into(), "h100".into()],
+            hardware: None,
+            state: NodeState::Idle,
+            region: Some("us-east".into()),
+            price_quote: None,
+            reflex_addr: None,
+            allowed_nodes: Vec::new(),
+            allowed_subnets: Vec::new(),
+            allowed_groups: Vec::new(),
+            metadata: BTreeMap::new(),
+        };
+        assert!(
+            <CapabilityIndexInner as super::super::FoldIndex<CapabilityFold>>::index_payload_equivalent(&base, &base.clone()),
+            "byte-identical payload is equivalent"
+        );
+
+        // Tags differ.
+        let mut t = base.clone();
+        t.tags.push("a100".into());
+        assert!(
+            !<CapabilityIndexInner as super::super::FoldIndex<CapabilityFold>>::index_payload_equivalent(&base, &t),
+            "tag delta must invalidate"
+        );
+
+        // State differs.
+        let mut s = base.clone();
+        s.state = NodeState::Busy;
+        assert!(
+            !<CapabilityIndexInner as super::super::FoldIndex<CapabilityFold>>::index_payload_equivalent(&base, &s),
+            "state delta must invalidate"
+        );
+
+        // Region differs.
+        let mut r = base.clone();
+        r.region = Some("us-west".into());
+        assert!(
+            !<CapabilityIndexInner as super::super::FoldIndex<CapabilityFold>>::index_payload_equivalent(&base, &r),
+            "region delta must invalidate"
+        );
+
+        // Hardware differs — the `gpu:present` / `gpu:vendor:<v>`
+        // synthetic index tags derive from `hardware`, so a GPU
+        // shape change MUST invalidate or `by_synthetic` goes
+        // stale on a tags-identical refresh.
+        let mut h = base.clone();
+        h.hardware = Some(HardwareSummary {
+            gpu_vendor: Some("nvidia".into()),
+            gpu_count: 1,
+            memory_gb: None,
+            vram_gb: None,
+        });
+        assert!(
+            !<CapabilityIndexInner as super::super::FoldIndex<CapabilityFold>>::index_payload_equivalent(&base, &h),
+            "hardware delta must invalidate — synthetic gpu tags derive from it"
+        );
+
+        // Non-indexed dimension (metadata) — these CAN differ
+        // without forcing an index rebuild. The skip is correct
+        // because the index doesn't key on metadata at all.
+        let mut m = base.clone();
+        m.metadata.insert("intent".into(), "ml-training".into());
+        assert!(
+            <CapabilityIndexInner as super::super::FoldIndex<CapabilityFold>>::index_payload_equivalent(&base, &m),
+            "metadata delta is OK to skip — index doesn't key on metadata"
+        );
+    }
+
+    /// PERF_AUDIT §4.5 regression — a refresh that keeps (tags,
+    /// region, state) identical but CHANGES the hardware GPU
+    /// shape must still rebuild the synthetic index. Pre-fix the
+    /// equivalence check ignored `hardware`, so the gained GPU
+    /// never landed in `by_synthetic` (a `gpu:present` group
+    /// query kept missing the node) and a lost GPU lingered
+    /// stale. Drives the full apply path end-to-end.
+    #[test]
+    fn replace_with_changed_hardware_updates_synthetic_index() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let sign_with_hw = |generation: u64, hardware: Option<HardwareSummary>| {
+            SignedAnnouncement::sign(
+                &kp,
+                CapabilityFold::KIND_ID,
+                0x100,
+                0xFACE,
+                generation,
+                EnvelopeMeta::default(),
+                CapabilityMembership {
+                    class_hash: 0x100,
+                    tags: vec!["worker".into()],
+                    hardware,
+                    state: NodeState::Idle,
+                    region: Some("us-east".into()),
+                    price_quote: None,
+                    reflex_addr: None,
+                    allowed_nodes: Vec::new(),
+                    allowed_subnets: Vec::new(),
+                    allowed_groups: Vec::new(),
+                    metadata: BTreeMap::new(),
+                },
+            )
+            .expect("sign succeeds")
+        };
+        let gpu_present_filter = || CapabilityFilter {
+            tag_groups_all: vec![vec!["gpu:present".into()]],
+            ..CapabilityFilter::default()
+        };
+
+        // v1: no hardware → no gpu:present synthetic tag.
+        fold.apply(sign_with_hw(1, None)).expect("v1");
+        let hits = fold.query(CapabilityQuery::Composite(gpu_present_filter()));
+        assert!(hits.is_empty(), "no GPU yet — synthetic axis must miss");
+
+        // v2: same tags/region/state, GPU appears. The refresh
+        // must rebuild by_synthetic.
+        fold.apply(sign_with_hw(
+            2,
+            Some(HardwareSummary {
+                gpu_vendor: Some("nvidia".into()),
+                gpu_count: 1,
+                memory_gb: Some(64),
+                vram_gb: Some(24),
+            }),
+        ))
+        .expect("v2");
+        let hits = fold.query(CapabilityQuery::Composite(gpu_present_filter()));
+        assert_eq!(
+            hits.len(),
+            1,
+            "GPU gained on refresh must be visible via the synthetic index"
+        );
+
+        // v3: GPU disappears again — the stale gpu:present bucket
+        // must be dropped.
+        fold.apply(sign_with_hw(3, None)).expect("v3");
+        let hits = fold.query(CapabilityQuery::Composite(gpu_present_filter()));
+        assert!(
+            hits.is_empty(),
+            "GPU lost on refresh must drop the stale synthetic bucket"
         );
     }
 

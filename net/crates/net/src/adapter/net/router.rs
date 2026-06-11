@@ -6,6 +6,7 @@
 //! - Low-latency packet forwarding
 //! - Per-stream statistics
 
+use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
 use crossbeam_queue::ArrayQueue;
 use dashmap::DashMap;
@@ -269,6 +270,39 @@ impl StreamQueue {
 pub struct FairScheduler {
     /// Per-stream queues
     streams: DashMap<u64, Arc<StreamQueue>>,
+    /// PERF_AUDIT §3.1 — incrementally-maintained snapshot of the
+    /// set of stream-ids in `streams`. Pre-fix `dequeue` allocated
+    /// a fresh `Vec<u64>` per call (often twice on quantum-reset
+    /// paths) by walking the DashMap — O(streams) work + a heap
+    /// alloc on the per-packet send path that §2.1's batching
+    /// wants to route MORE traffic through. The snapshot is
+    /// rebuilt only when the stream-set actually changes (the
+    /// vacant arm of `enqueue` / `set_stream_weight`, or after
+    /// `cleanup_empty` evicts at least one entry), so steady-
+    /// state dequeue pays a single `ArcSwap::load_full` (a
+    /// relaxed-load + Arc clone). Long-lived streams mean
+    /// rebuild rate is orders of magnitude below dequeue rate.
+    ///
+    /// The snapshot may briefly lag the DashMap (a concurrent
+    /// enqueue can add a stream between snapshot-build and
+    /// dequeue's iteration). That's the same race as the pre-fix
+    /// code — a dequeue that started before the new stream landed
+    /// won't service it this call; the next call's load picks up
+    /// the updated snapshot.
+    active_streams: ArcSwap<Vec<u64>>,
+    /// Version counter for the active-stream snapshot protocol.
+    /// Bumped at every stream-set mutation site *after* the DashMap
+    /// change and *before* [`Self::rebuild_active_streams`] runs.
+    /// The rebuild loop re-checks this after its `store`: if the
+    /// version moved while it was collecting, another mutation
+    /// landed concurrently and this rebuild's snapshot may be stale
+    /// — retry. Without this, two racing rebuilds can store out of
+    /// order (cleanup's pre-insert collection overwriting enqueue's
+    /// post-insert one), leaving a stream with queued packets
+    /// permanently absent from the snapshot: occupied-arm enqueues
+    /// never rebuild and cleanup never evicts a non-empty queue, so
+    /// nothing would ever repair it (lost wakeup).
+    active_streams_version: AtomicU64,
     /// Priority queue (bypasses fair scheduling)
     priority_queue: ArrayQueue<QueuedPacket>,
     /// Fair quantum
@@ -304,6 +338,8 @@ impl FairScheduler {
     pub fn new(quantum: usize, max_depth: usize) -> Self {
         Self {
             streams: DashMap::new(),
+            active_streams: ArcSwap::from_pointee(Vec::new()),
+            active_streams_version: AtomicU64::new(0),
             priority_queue: ArrayQueue::new(max_depth),
             quantum,
             max_depth,
@@ -316,6 +352,48 @@ impl FairScheduler {
         }
     }
 
+    /// PERF_AUDIT §3.1 — mark the stream set as changed and rebuild
+    /// the snapshot. Must be called *after* the DashMap mutation so
+    /// any concurrent rebuild that observes the new version also
+    /// observes the mutation. Called from every stream-set mutation
+    /// site: the vacant arm of [`Self::enqueue`] and
+    /// [`Self::set_stream_weight`], and [`Self::cleanup_empty`]
+    /// when at least one entry was removed.
+    fn note_stream_set_changed(&self) {
+        self.active_streams_version.fetch_add(1, Ordering::SeqCst);
+        self.rebuild_active_streams();
+    }
+
+    /// PERF_AUDIT §3.1 — rebuild the active-stream snapshot from
+    /// the current `streams` DashMap and atomically swap it in.
+    ///
+    /// Lost-wakeup protection: the version counter is re-checked
+    /// after the `store`. If it moved while this rebuild was
+    /// collecting, a concurrent mutation landed and our snapshot
+    /// may predate it — and ArcSwap stores from racing rebuilds
+    /// can land in either order, so a stale collection could
+    /// otherwise overwrite a fresher one and strand a non-empty
+    /// stream outside the snapshot forever. Retrying until the
+    /// version is stable across collect+store guarantees the last
+    /// snapshot standing reflects every mutation (each mutation
+    /// bumps the version *before* its own rebuild, so whichever
+    /// rebuild finishes last either saw the final version or
+    /// retries). SeqCst keeps the version loads and the ArcSwap
+    /// store in one total order; rebuilds only run on stream-set
+    /// changes, so the cost is off the per-packet path.
+    fn rebuild_active_streams(&self) {
+        loop {
+            let v = self.active_streams_version.load(Ordering::SeqCst);
+            let keys: Vec<u64> = self.streams.iter().map(|e| *e.key()).collect();
+            self.active_streams.store(Arc::new(keys));
+            if self.active_streams_version.load(Ordering::SeqCst) == v {
+                break;
+            }
+            // Version moved mid-rebuild: another mutation raced us.
+            // Our snapshot may be stale — collect again.
+        }
+    }
+
     /// Set the fair-scheduling weight for a stream. `weight` is a quantum
     /// multiplier: 1 = equal share (default), higher values give the
     /// stream proportionally more packets per round. Creates the stream
@@ -323,10 +401,25 @@ impl FairScheduler {
     /// before any traffic flows.
     pub fn set_stream_weight(&self, stream_id: u64, weight: u8) {
         let weight = weight.max(1);
-        self.streams
-            .entry(stream_id)
-            .and_modify(|q| q.set_weight(weight))
-            .or_insert_with(|| Arc::new(StreamQueue::new_with_weight(self.max_depth, weight)));
+        // PERF_AUDIT §3.1 — detect new vs existing so the
+        // active-stream snapshot only rebuilds when the set
+        // actually changes.
+        let was_new = match self.streams.entry(stream_id) {
+            dashmap::mapref::entry::Entry::Occupied(occ) => {
+                occ.get().set_weight(weight);
+                false
+            }
+            dashmap::mapref::entry::Entry::Vacant(vac) => {
+                vac.insert(Arc::new(StreamQueue::new_with_weight(
+                    self.max_depth,
+                    weight,
+                )));
+                true
+            }
+        };
+        if was_new {
+            self.note_stream_set_changed();
+        }
     }
 
     /// Enqueue a packet
@@ -340,12 +433,20 @@ impl FairScheduler {
                 return true;
             }
         } else {
-            // Get or create stream queue
-            let queue = self
-                .streams
-                .entry(packet.stream_id)
-                .or_insert_with(|| Arc::new(StreamQueue::new(self.max_depth)))
-                .clone();
+            // PERF_AUDIT §3.1 — get-or-create with new/existing
+            // discrimination so the active-stream snapshot is
+            // rebuilt only when the set actually changes.
+            let (queue, is_new) = match self.streams.entry(packet.stream_id) {
+                dashmap::mapref::entry::Entry::Occupied(occ) => (occ.get().clone(), false),
+                dashmap::mapref::entry::Entry::Vacant(vac) => {
+                    let arc = Arc::new(StreamQueue::new(self.max_depth));
+                    vac.insert(arc.clone());
+                    (arc, true)
+                }
+            };
+            if is_new {
+                self.note_stream_set_changed();
+            }
 
             if queue.push(packet).is_ok() {
                 self.total_queued.fetch_add(1, Ordering::Relaxed);
@@ -380,8 +481,11 @@ impl FairScheduler {
             return Some(packet);
         }
 
-        // Collect stream keys for stable, rotated iteration order
-        let keys: Vec<u64> = self.streams.iter().map(|e| *e.key()).collect();
+        // PERF_AUDIT §3.1 — read the incrementally-maintained
+        // active-stream snapshot instead of walking the DashMap
+        // per call. `load_full` is one relaxed atomic load + Arc
+        // clone (no Vec alloc, no DashMap iteration).
+        let keys = self.active_streams.load_full();
         if keys.is_empty() {
             return None;
         }
@@ -424,14 +528,16 @@ impl FairScheduler {
         }
 
         // If all streams exhausted their quantum, reset and try again.
-        // Re-collect keys so that streams added since the first snapshot
-        // are also considered — using the stale `keys` vec would miss them.
-        let keys: Vec<u64> = self.streams.iter().map(|e| *e.key()).collect();
+        // Re-load the active-stream snapshot so streams added since
+        // the first load are also considered — `load_full` is
+        // cheap (no Vec alloc), and may pick up an updated snapshot
+        // if a concurrent enqueue rebuilt it mid-pass.
+        let keys = self.active_streams.load_full();
         if keys.is_empty() {
             return None;
         }
         let mut has_packets = false;
-        for key in &keys {
+        for key in keys.iter() {
             if let Some(queue) = self.streams.get(key) {
                 queue.reset_round();
                 if !queue.is_empty() {
@@ -501,6 +607,16 @@ impl FairScheduler {
                 true
             }
         });
+        // PERF_AUDIT §3.1 — rebuild the active-stream snapshot
+        // when at least one entry was evicted so the dequeue
+        // path stops iterating over keys that no longer exist.
+        // No-op rebuild on a clean pass is cheap (single Vec
+        // alloc the same size as the prior snapshot, swapped in
+        // via ArcSwap), but the branch keeps the steady-state
+        // cleanup-call cost at zero rebuilds.
+        if removed > 0 {
+            self.note_stream_set_changed();
+        }
         removed
     }
 }
@@ -1674,6 +1790,179 @@ mod tests {
         assert_eq!(
             pkt.stream_id, 1,
             "newly added stream should be visible after quantum reset"
+        );
+    }
+
+    /// PERF_AUDIT §3.1 regression: the active-stream snapshot
+    /// must mutate exactly when the stream set does:
+    ///   - enqueue → new stream: rebuild (ArcSwap pointer changes).
+    ///   - enqueue → existing stream: NO rebuild (pointer stable).
+    ///   - set_stream_weight → new stream: rebuild.
+    ///   - set_stream_weight → existing stream weight change: NO rebuild.
+    ///   - cleanup_empty actually removes something: rebuild.
+    ///   - cleanup_empty with nothing to remove: NO rebuild.
+    ///
+    /// Pre-fix dequeue collected a fresh Vec<u64> from the DashMap
+    /// on EVERY call (twice on the quantum-reset path). A regression
+    /// that drops the snapshot-store from any of the three mutation
+    /// sites would silently leave dequeue iterating a stale set.
+    #[test]
+    fn active_stream_snapshot_tracks_stream_set_changes() {
+        let scheduler = FairScheduler::new(2, 16);
+        let initial_ptr = Arc::as_ptr(&scheduler.active_streams.load_full());
+        assert!(scheduler.active_streams.load_full().is_empty());
+
+        // enqueue → new stream → rebuild.
+        scheduler.enqueue(QueuedPacket {
+            data: Bytes::from_static(b"a"),
+            dest: "127.0.0.1:9000".parse().unwrap(),
+            stream_id: 7,
+            priority: false,
+            queued_at: Instant::now(),
+        });
+        let after_new = scheduler.active_streams.load_full();
+        assert_ne!(
+            Arc::as_ptr(&after_new),
+            initial_ptr,
+            "vacant-arm enqueue must swap a fresh snapshot in"
+        );
+        assert_eq!(&*after_new, &[7u64]);
+
+        // enqueue → existing stream → snapshot stable.
+        let before_existing = Arc::as_ptr(&scheduler.active_streams.load_full());
+        scheduler.enqueue(QueuedPacket {
+            data: Bytes::from_static(b"b"),
+            dest: "127.0.0.1:9000".parse().unwrap(),
+            stream_id: 7,
+            priority: false,
+            queued_at: Instant::now(),
+        });
+        assert_eq!(
+            Arc::as_ptr(&scheduler.active_streams.load_full()),
+            before_existing,
+            "occupied-arm enqueue must NOT rebuild the snapshot — a \
+             regression here defeats the §3.1 fix's steady-state win"
+        );
+
+        // set_stream_weight → new stream → rebuild.
+        let before_weight_new = Arc::as_ptr(&scheduler.active_streams.load_full());
+        scheduler.set_stream_weight(11, 3);
+        let after_weight_new = scheduler.active_streams.load_full();
+        assert_ne!(
+            Arc::as_ptr(&after_weight_new),
+            before_weight_new,
+            "set_stream_weight on a new stream must rebuild the snapshot"
+        );
+        let mut sorted: Vec<u64> = after_weight_new.iter().copied().collect();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![7u64, 11]);
+
+        // set_stream_weight → existing stream → stable.
+        let before_weight_existing = Arc::as_ptr(&scheduler.active_streams.load_full());
+        scheduler.set_stream_weight(11, 5);
+        assert_eq!(
+            Arc::as_ptr(&scheduler.active_streams.load_full()),
+            before_weight_existing,
+            "set_stream_weight on existing stream must NOT rebuild"
+        );
+
+        // cleanup_empty with nothing to remove (stream 7 has pending
+        // packets) → stable.
+        let before_clean_noop = Arc::as_ptr(&scheduler.active_streams.load_full());
+        let removed = scheduler.cleanup_empty();
+        assert_eq!(
+            removed, 1,
+            "stream 11 has no packets and only DashMap refs it"
+        );
+        let after_clean = scheduler.active_streams.load_full();
+        assert_ne!(
+            Arc::as_ptr(&after_clean),
+            before_clean_noop,
+            "cleanup_empty that actually removed an entry MUST rebuild"
+        );
+        assert_eq!(&*after_clean, &[7u64]);
+
+        // cleanup_empty with nothing removable (stream 7 still has
+        // packets queued) → stable pointer.
+        let before_clean_stable = Arc::as_ptr(&scheduler.active_streams.load_full());
+        let removed = scheduler.cleanup_empty();
+        assert_eq!(removed, 0);
+        assert_eq!(
+            Arc::as_ptr(&scheduler.active_streams.load_full()),
+            before_clean_stable,
+            "cleanup_empty that removed nothing must NOT rebuild"
+        );
+    }
+
+    /// PERF_AUDIT §3.1 lost-wakeup regression: concurrent snapshot
+    /// rebuilds (enqueue vacant-arm racing cleanup_empty's rebuild)
+    /// must never leave the snapshot out of sync with the stream
+    /// map once activity quiesces. Without the version-counter
+    /// retry, a rebuild that collected keys BEFORE a concurrent
+    /// insert could store AFTER the inserting thread's own rebuild,
+    /// wiping the new stream from the snapshot; with no further
+    /// stream-set change the stream's packets would be stranded
+    /// forever (occupied-arm enqueues don't rebuild, and cleanup
+    /// never evicts a non-empty queue). This hammers the race and
+    /// asserts the quiescent invariant snapshot == live stream set.
+    #[test]
+    fn active_stream_snapshot_survives_concurrent_rebuild_races() {
+        use std::thread;
+
+        let scheduler = Arc::new(FairScheduler::new(2, 16));
+        let mut handles = Vec::new();
+
+        // Writers: continuously create fresh streams (vacant-arm
+        // rebuilds) and drain packets so queues trend toward empty
+        // and stay eligible for cleanup eviction (cleanup rebuilds).
+        for t in 0..4u64 {
+            let sched = Arc::clone(&scheduler);
+            handles.push(thread::spawn(move || {
+                for i in 0..500u64 {
+                    let stream_id = t * 100_000 + i;
+                    sched.enqueue(QueuedPacket {
+                        data: Bytes::from_static(b"x"),
+                        dest: "127.0.0.1:9000".parse().unwrap(),
+                        stream_id,
+                        priority: false,
+                        queued_at: Instant::now(),
+                    });
+                    let _ = sched.dequeue();
+                }
+            }));
+        }
+
+        // Dedicated cleanup hammer: maximizes rebuild/insert overlap.
+        {
+            let sched = Arc::clone(&scheduler);
+            handles.push(thread::spawn(move || {
+                for _ in 0..2_000 {
+                    sched.cleanup_empty();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Quiescent invariant: snapshot == live stream set. A lost
+        // rebuild leaves a stream in the map (with packets queued)
+        // that the snapshot — and therefore dequeue — never sees.
+        let mut snapshot: Vec<u64> = scheduler
+            .active_streams
+            .load_full()
+            .iter()
+            .copied()
+            .collect();
+        snapshot.sort_unstable();
+        let mut live: Vec<u64> = scheduler.streams.iter().map(|e| *e.key()).collect();
+        live.sort_unstable();
+        assert_eq!(
+            snapshot, live,
+            "active-stream snapshot diverged from the stream map after \
+             concurrent enqueue/cleanup churn — version-counter retry \
+             protocol failed to repair a racing rebuild"
         );
     }
 

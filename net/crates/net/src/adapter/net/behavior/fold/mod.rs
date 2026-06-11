@@ -318,6 +318,16 @@ impl<K: FoldKind> Fold<K> {
         self.change_tx.subscribe()
     }
 
+    /// Read the current change-generation without subscribing.
+    /// Hot caches (e.g. `CapabilitySetCache`) check this against
+    /// their stored generation to detect staleness; cheaper than
+    /// `subscribe_changes().borrow()` because it skips minting a
+    /// receiver. Per PERF_AUDIT §4.1.
+    #[inline]
+    pub fn change_generation(&self) -> u64 {
+        *self.change_tx.borrow()
+    }
+
     /// Apply a verified signed announcement to the fold.
     ///
     /// Rejects the wire-format `generation == 0` sentinel, then
@@ -394,10 +404,21 @@ impl<K: FoldKind> Fold<K> {
                         state.by_node.remove(&old_entry.node_id);
                     }
                 }
-                index.on_remove(&key, &old_entry.payload);
-
                 let new_entry = build_entry::<K>(&ann);
-                index.on_insert(&key, &new_entry.payload);
+                // PERF_AUDIT §4.5 — steady-state refresh (same
+                // tags/region/state, new generation/TTL) skips
+                // the index churn. The default
+                // `index_payload_equivalent` returns `false`, so
+                // folds that don't implement a content-aware
+                // equality check fall through to the safe
+                // remove-then-insert pre-fix path.
+                if !<K::Index as crate::adapter::net::behavior::fold::state::FoldIndex<K>>::index_payload_equivalent(
+                    &old_entry.payload,
+                    &new_entry.payload,
+                ) {
+                    index.on_remove(&key, &old_entry.payload);
+                    index.on_insert(&key, &new_entry.payload);
+                }
                 state
                     .by_node
                     .entry(ann.node_id)

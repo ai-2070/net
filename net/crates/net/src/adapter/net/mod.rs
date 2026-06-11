@@ -213,6 +213,14 @@ use transport::NetSocket as Socket;
 // Re-export xxh3 utilities for stream routing
 pub use routing::{route_to_shard, stream_id_from_bytes, stream_id_from_key};
 
+/// Threshold below which the cached coarse-clock reading is reused
+/// instead of re-reading the OS wall clock. 1 ms is well below the
+/// session-timeout / heartbeat / NACK cadence the consumers care
+/// about (those tick on the seconds scale), and well above the
+/// `Instant::now` cost (~10 ns) we still pay per call to gate the
+/// cache. Per PERF_AUDIT §2.7.
+const COARSE_CLOCK_REFRESH_NS: u64 = 1_000_000; // 1 ms
+
 /// Current timestamp in nanoseconds since the Unix epoch.
 ///
 /// Shared utility — avoids duplicating this across `causal.rs`, `snapshot.rs`,
@@ -228,12 +236,83 @@ pub use routing::{route_to_shard, stream_id_from_bytes, stream_id_from_key};
 /// everywhere. `unwrap_or_default()` returning `Duration::ZERO`
 /// for a pre-epoch clock would also produce identical timestamps
 /// that break ordering.
+///
+/// Coarse-clock cached per thread at [`COARSE_CLOCK_REFRESH_NS`]
+/// granularity (PERF_AUDIT §2.7) — readings may be up to 1 ms
+/// stale, and two threads may disagree by up to that much.
+/// Consumers doing timeout arithmetic MUST use `saturating_sub`
+/// (they all do today) so a reader with a staler cache than the
+/// toucher can't wrap and false-expire.
 #[inline]
 pub(crate) fn current_timestamp() -> u64 {
-    let elapsed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+    // **PERF_AUDIT §2.7.** Per-packet RX/TX paths each call
+    // `current_timestamp()` twice (one stream `touch` + one session
+    // `touch`). On Windows `SystemTime::now()` is
+    // `GetSystemTimePreciseAsFileTime` (~600 ns); on Linux it's
+    // `clock_gettime(CLOCK_REALTIME)` (~120 ns). At sustained packet
+    // rates the four wall-clock reads per ping eat measurable CPU.
+    //
+    // Coarse-clock cache: a `thread_local!` Cell holds the last
+    // `(Instant, u64-ns)` pair. Each call asks `Instant::now()`
+    // (~10 ns — TSC-backed on both Linux and Windows) whether 1 ms
+    // has elapsed; if not, the cached `u64` is reused. Repeated
+    // calls within the same millisecond from the same thread pay
+    // one Instant comparison instead of one OS wall-clock syscall.
+    //
+    // Consumers (`session.is_timed_out` against multi-second
+    // timeouts, `last_activity_ns` for diagnostics) are insensitive
+    // to ≤ 1 ms drift; the wire envelopes that need absolute epoch
+    // ns (capability announcements, snapshots) call
+    // `current_timestamp_micros` or stamp `SystemTime::now()`
+    // directly — neither hits this path.
+    thread_local! {
+        static COARSE_CLOCK: std::cell::Cell<Option<(std::time::Instant, u64)>>
+            = const { std::cell::Cell::new(None) };
+    }
+    COARSE_CLOCK.with(|cell| {
+        let now_inst = std::time::Instant::now();
+        let (store, ns) = coarse_clock_advance(cell.get(), now_inst, || {
+            let elapsed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        });
+        if let Some(pair) = store {
+            cell.set(Some(pair));
+        }
+        ns
+    })
+}
+
+/// Pure core of the §2.7 coarse clock: given the cached
+/// `(instant, ns)` pair and the current `Instant`, decide whether
+/// to reuse the cached reading (younger than
+/// [`COARSE_CLOCK_REFRESH_NS`]) or call `read_wall` for a fresh
+/// wall-clock value. Returns `(cache update, value)` — `None`
+/// means a cache hit (nothing to store, keeping the hit path
+/// store-free); `Some(pair)` rebases the refresh window on the
+/// read instant.
+///
+/// Extracted from [`current_timestamp`] so the reuse/refresh
+/// decision is testable with synthetic instants. The previous
+/// test drove the real thread-local with a 100-read burst and
+/// asserted every value matched — correct on an idle machine, but
+/// a > 1 ms OS preemption mid-burst legitimately rolls the window,
+/// so the assertion was probabilistic under CI load even with
+/// retries.
+#[inline]
+fn coarse_clock_advance(
+    cached: Option<(std::time::Instant, u64)>,
+    now_inst: std::time::Instant,
+    read_wall: impl FnOnce() -> u64,
+) -> (Option<(std::time::Instant, u64)>, u64) {
+    if let Some((last_inst, last_ns)) = cached {
+        if now_inst.duration_since(last_inst).as_nanos() < COARSE_CLOCK_REFRESH_NS as u128 {
+            return (None, last_ns);
+        }
+    }
+    let ns = read_wall();
+    (Some((now_inst, ns)), ns)
 }
 
 /// Current timestamp in microseconds since the Unix epoch.
@@ -1279,6 +1358,66 @@ mod tests {
 
         let adapter = NetAdapter::new(config).unwrap();
         assert_eq!(adapter.name(), "net");
+    }
+
+    /// PERF_AUDIT §2.7 — cache hit: a read younger than the
+    /// refresh window must return the cached value WITHOUT
+    /// touching the wall clock and without rewriting the cache.
+    /// Deterministic — drives `coarse_clock_advance` with
+    /// synthetic instants instead of racing a real 1 ms window
+    /// against OS scheduling.
+    #[test]
+    fn coarse_clock_reuses_cache_within_refresh_window() {
+        let t0 = std::time::Instant::now();
+        let within = t0 + std::time::Duration::from_nanos(COARSE_CLOCK_REFRESH_NS - 1);
+        let (store, ns) = coarse_clock_advance(Some((t0, 42)), within, || {
+            panic!("cache hit must not read the wall clock")
+        });
+        assert_eq!(ns, 42, "hit must return the cached reading");
+        assert!(store.is_none(), "hit must keep the hit path store-free");
+    }
+
+    /// PERF_AUDIT §2.7 — refresh: a read at (boundary is
+    /// exclusive) or past the window must take a fresh wall-clock
+    /// reading and rebase the window on the read instant.
+    #[test]
+    fn coarse_clock_refreshes_at_and_past_the_window() {
+        let t0 = std::time::Instant::now();
+        let at_boundary = t0 + std::time::Duration::from_nanos(COARSE_CLOCK_REFRESH_NS);
+        let (store, ns) = coarse_clock_advance(Some((t0, 42)), at_boundary, || 100);
+        assert_eq!(ns, 100, "boundary read must refresh");
+        assert_eq!(
+            store,
+            Some((at_boundary, 100)),
+            "refresh must rebase the window on the read instant"
+        );
+    }
+
+    /// PERF_AUDIT §2.7 — cold start: no cached pair → wall-clock
+    /// read, cached against the read instant.
+    #[test]
+    fn coarse_clock_cold_start_reads_wall_clock() {
+        let t0 = std::time::Instant::now();
+        let (store, ns) = coarse_clock_advance(None, t0, || 7);
+        assert_eq!(ns, 7);
+        assert_eq!(store, Some((t0, 7)));
+    }
+
+    #[test]
+    fn current_timestamp_advances_after_refresh_interval() {
+        // After sleeping past the refresh interval, the next read
+        // must return a larger value — pins that the cache
+        // actually refreshes rather than getting stuck on the
+        // initial reading.
+        let first = current_timestamp();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let later = current_timestamp();
+        assert!(
+            later > first,
+            "post-refresh reading must advance: first={}, later={}",
+            first,
+            later
+        );
     }
 
     #[test]
