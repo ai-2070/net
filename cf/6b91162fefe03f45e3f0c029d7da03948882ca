@@ -1,0 +1,39 @@
+net/crates/net/src/adapter/net/behavior/fold/capability_bridge.rs
+  s_58168e769adc91::t_049f1a2a4ab0a2 321-325
+  s_58168e769adc91::t_7b5a7d806bd468 1733-1764
+  s_58168e769adc91::t_3eb677a34c63c2 1892-1896
+  s_58168e769adc91::t_2677b2222f417b 1701-1732
+  s_58168e769adc91::t_ab744dc2a7805d 360
+  s_58168e769adc91::t_dc5cd586777676 1857-1891,1897-1950
+net/crates/net/src/adapter/net/behavior/placement.rs
+  s_58168e769adc91::t_37f149376c87b3 1151-1152,1154-1155,1157-1158,1160-1161
+  s_58168e769adc91::t_9674ccfe6d9553 1101-1102
+  s_58168e769adc91::t_c7a4772fb9600c 2965-2991
+  s_58168e769adc91::t_6133f1c678c0f2 1125-1135,1153,1156,1159,1162
+net/crates/net/src/adapter/net/behavior/predicate.rs
+  s_58168e769adc91::t_78d4640bd31623 2662-2718
+  s_58168e769adc91::t_a8f3751832d32a 1381-1382,1388,1401
+  s_58168e769adc91::t_31659bb87d1fdc 1330-1335,1341,1354
+net/crates/net/src/adapter/net/behavior/fold/capability.rs
+  s_58168e769adc91::t_bc1b2fbb6fb03a 645-647
+  s_58168e769adc91::t_54a8afcdaf2891 1110-1125,1137-1207
+  s_58168e769adc91::t_c01ae9f17d4aff 355-371,373-376
+net/crates/net/src/adapter/net/behavior/capability.rs
+  s_58168e769adc91::t_76a68eaf5e590a 3465-3468,3471-3472
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "cf6b91162fefe03f45e3f0c029d7da03948882ca",
+  "prompts": {},
+  "sessions": {
+    "s_58168e769adc91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "43399f81-fab3-4b2a-a002-4ece8a909069",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
