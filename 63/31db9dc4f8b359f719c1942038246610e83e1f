@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/behavior/fold/capability.rs
+  s_58168e769adc91::t_8649ee4bbea53c 217-218
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "6331db9dc4f8b359f719c1942038246610e83e1f",
+  "prompts": {},
+  "sessions": {
+    "s_58168e769adc91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "43399f81-fab3-4b2a-a002-4ece8a909069",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
