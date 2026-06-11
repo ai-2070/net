@@ -214,7 +214,8 @@ pub type CapabilityMatch = ((u64, NodeId), CapabilityMembership);
 /// dimension and filter the others in-memory.
 ///
 /// **PERF_AUDIT §4.6** — the inner `HashSet<(u64, NodeId)>` candidate
-/// sets use [`BuildU64TupleHasher`], a fast multiplicative mixer for
+/// sets use `BuildU64TupleHasher` (private to this module), a fast
+/// multiplicative mixer for
 /// `(u64, u64)` keys. Pre-fix these used the std SipHash default,
 /// which paid ~15-25 ns of mixing per insert/contains/remove on keys
 /// that are already xxh3-hashed identity bytes (so collision
