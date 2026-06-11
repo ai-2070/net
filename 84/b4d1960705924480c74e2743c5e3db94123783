@@ -1,0 +1,21 @@
+net/crates/net/examples/interop_smoke.rs
+  s_58168e769adc91::t_c7898d0b38dd4f 1-150
+net/crates/net/README.md
+  s_58168e769adc91::t_f0574b4d801435 1397-1408
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "84b4d1960705924480c74e2743c5e3db94123783",
+  "prompts": {},
+  "sessions": {
+    "s_58168e769adc91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "43399f81-fab3-4b2a-a002-4ece8a909069",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
