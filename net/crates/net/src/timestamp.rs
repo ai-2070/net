@@ -160,6 +160,19 @@ impl TimestampGenerator {
         self.clock.raw()
     }
 
+    /// Compute the nanosecond delta between two raw timestamps
+    /// (`end - start`) using this generator's calibrated clock.
+    /// Cheaper than `raw_to_nanos(end) - raw_to_nanos(start)`
+    /// because the underlying quanta `delta_as_nanos` does the
+    /// scaling once instead of twice; intended for in-process
+    /// elapsed-time measurement on hot paths that already hold a
+    /// `now_raw()` sample (e.g. the shard's dynamic-scaling
+    /// metrics sampling — PERF_AUDIT §1.3).
+    #[inline]
+    pub fn delta_ns(&self, start_raw: u64, end_raw: u64) -> u64 {
+        self.clock.delta_as_nanos(start_raw, end_raw)
+    }
+
     /// Convert a raw timestamp to nanoseconds since this
     /// generator was constructed (i.e. since `baseline_raw`).
     /// Output units match `next()`: the value returned by
