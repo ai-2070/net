@@ -92,9 +92,7 @@ async fn main() {
     let peer_addr: SocketAddr = peer.parse().expect("peer addr");
 
     let mut config = match role {
-        "responder" => {
-            NetAdapterConfig::responder(bind_addr, peer_addr, PSK, responder_keypair())
-        }
+        "responder" => NetAdapterConfig::responder(bind_addr, peer_addr, PSK, responder_keypair()),
         "initiator" => {
             NetAdapterConfig::initiator(bind_addr, peer_addr, PSK, responder_keypair().public)
         }

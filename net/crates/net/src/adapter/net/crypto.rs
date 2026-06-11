@@ -6,8 +6,8 @@
 //! - Key derivation for session keys
 
 use bytes::{Bytes, BytesMut};
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use parking_lot::Mutex;
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use snow::{params::NoiseParams, Builder, HandshakeState};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -714,11 +714,7 @@ impl PacketCipher {
 
         let tag = self
             .cipher
-            .seal_in_place_separate_tag(
-                Nonce::assume_unique_for_key(nonce),
-                Aad::from(aad),
-                buffer,
-            )
+            .seal_in_place_separate_tag(Nonce::assume_unique_for_key(nonce), Aad::from(aad), buffer)
             .map_err(|_| CryptoError::Encryption("encryption failed".to_string()))?;
         let mut tag_bytes = [0u8; TAG_SIZE];
         tag_bytes.copy_from_slice(tag.as_ref());
@@ -792,11 +788,7 @@ impl PacketCipher {
         // (buffer.len() - TAG_SIZE).
         let plaintext_len = self
             .cipher
-            .open_in_place(
-                Nonce::assume_unique_for_key(nonce),
-                Aad::from(aad),
-                buffer,
-            )
+            .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::from(aad), buffer)
             .map_err(|_| CryptoError::Decryption("decryption failed".to_string()))?
             .len();
 
