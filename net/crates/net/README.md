@@ -1394,3 +1394,15 @@ Note: handshake relay no longer consumes a subprotocol ID — it rides as a rout
 ## License
 
 Apache-2.0
+
+### Third-party license notice
+
+The default `net` feature links [`ring`](https://crates.io/crates/ring)
+for the packet-path ChaCha20-Poly1305 AEAD. *ring* is distributed
+under an ISC-style license together with notices for portions
+derived from BoringSSL and OpenSSL/SSLeay; see the
+[ring LICENSE](https://github.com/briansmith/ring/blob/main/LICENSE)
+for the full text. Binary distributions that bundle the compiled
+library (the published Python wheels, npm prebuilds, Go FFI static
+libraries, and release binaries) include *ring*'s object code and
+should retain that notice alongside their own license files.
