@@ -104,6 +104,13 @@ pub struct FileSystemAdapter {
     /// re-try on the next store — `OnceLock` only initializes
     /// once, so we hold the cell as `Mutex<Option<PathBuf>>`
     /// instead.
+    ///
+    /// **Unsupported:** re-pointing `root` (e.g. it is a symlink
+    /// whose target changes, or it is deleted and re-created at a
+    /// different resolved location) while the adapter is live. The
+    /// cache pins the canonical form resolved on first use; the
+    /// containment checks would keep enforcing the original
+    /// target. Construct a fresh adapter if the root must move.
     root_canonical: Arc<parking_lot::Mutex<Option<PathBuf>>>,
     /// Cap on concurrent `spawn_blocking` tasks issued by this
     /// adapter. Bounds the share of the tokio blocking pool that a

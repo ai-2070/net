@@ -245,12 +245,24 @@ pub async fn store_dir(adapter: &MeshBlobAdapter, root: &Path) -> Result<BlobRef
     // by emitting entries in the same `raw` order: dirs/symlinks
     // resolve to `Ready` futures so they slot into the stream
     // alongside file futures and don't need a separate pass.
+    // First-error abort flag: once any entry fails, later entries
+    // short-circuit before doing I/O. The drain loop below still
+    // awaits every STARTED future (see drain comment), but this
+    // flag keeps a failure in a 100k-file tree from paying the
+    // read + hash + store cost for every remaining entry.
+    let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let file_futures = raw.into_iter().map(|(rel, meta, abs)| {
-        let adapter = adapter; // borrow re-aliased for clarity
         let sem = sem.clone();
         let byte_sem = byte_sem.clone();
+        let abort = abort.clone();
         let mode = mode_of(&meta);
         async move {
+            if abort.load(std::sync::atomic::Ordering::Relaxed) {
+                // A sibling entry already failed; the overall
+                // store_dir returns its error, so this entry's
+                // output is discarded either way.
+                return Ok::<Option<DirEntry>, DirError>(None);
+            }
             let file_type = meta.file_type();
             if file_type.is_symlink() {
                 let target = std::fs::read_link(&abs)?;
@@ -316,13 +328,35 @@ pub async fn store_dir(adapter: &MeshBlobAdapter, root: &Path) -> Result<BlobRef
     // `buffer_unordered` lets futures resolve as soon as they're
     // ready (vs `buffered` which waits for in-order completion);
     // we re-sort at the end to keep the manifest deterministic.
+    //
+    // Drain the stream fully — don't short-circuit on the first
+    // error. Same rationale as the manifest store loop in
+    // mesh.rs: `store_chunk` registers a per-hash entry in
+    // `in_flight_stores` on entry and removes it after the store
+    // completes (success or error); dropping a buffered future
+    // mid-flight skips that cleanup and leaks the entry. Awaiting
+    // every started future lets in-flight stores run their own
+    // cleanup paths; the `abort` flag set on first error keeps
+    // not-yet-started entries from doing any new work. First
+    // error wins so the caller observes the same failure shape
+    // as the pre-§6.9 sequential loop.
     let mut results: Vec<DirEntry> = Vec::new();
+    let mut first_err: Option<DirError> = None;
     let mut stream = futures::stream::iter(file_futures).buffer_unordered(store_concurrency);
     while let Some(res) = stream.next().await {
-        match res? {
-            Some(entry) => results.push(entry),
-            None => {}
+        match res {
+            Ok(Some(entry)) => results.push(entry),
+            Ok(None) => {}
+            Err(e) => {
+                abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
         }
+    }
+    if let Some(e) = first_err {
+        return Err(e);
     }
     // Restore the deterministic-by-path order that the pre-fix
     // sequential loop produced (raw was already sorted before

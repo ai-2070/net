@@ -1004,6 +1004,79 @@ mod tests {
         assert_eq!(shards[1].as_ref().unwrap(), &expected);
     }
 
+    /// PERF_AUDIT §6.5 — golden parity equivalence. The
+    /// Bytes-holding striper (full-length shards borrowed straight
+    /// from the original `Bytes`, short shards padded into owned
+    /// scratch) must produce byte-identical parity to the legacy
+    /// all-Vec path (manually zero-pad every shard to `max_len`,
+    /// then `encode(&[Vec<u8>])`). Mixed-size stripe so BOTH the
+    /// `Original` (shard 1, max-length) and `Padded` (shards 0, 2,
+    /// 3) branches of `close_stripe_with_rs` execute.
+    #[test]
+    fn striper_bytes_path_parity_matches_legacy_all_vec_encode() {
+        let params = RsParams { k: 4, m: 2 };
+        let sizes = [100usize, 256, 73, 9];
+        let originals: Vec<Vec<u8>> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| det_bytes(i as u8, s))
+            .collect();
+
+        // Legacy all-Vec path: pad every shard to max_len, encode
+        // owned Vecs. This is exactly what the pre-§6.5
+        // close_stripe_with_rs did.
+        let max_len = sizes.iter().copied().max().unwrap();
+        let padded: Vec<Vec<u8>> = originals
+            .iter()
+            .map(|b| {
+                let mut v = b.clone();
+                v.resize(max_len, 0);
+                v
+            })
+            .collect();
+        let encoder = RsEncoder::new(params).unwrap();
+        let golden = encoder.encode(&padded).unwrap();
+
+        // Striper path (Bytes in_flight + borrowed/padded views).
+        let mut striper = RsStriper::new(params).unwrap();
+        let mut closed: Option<ClosedStripe> = None;
+        for (i, bytes) in originals.iter().enumerate() {
+            let hash: [u8; 32] = blake3::hash(bytes).into();
+            let cref = ChunkRefV3::data(hash, bytes.len() as u32);
+            let result = striper.push_chunk(bytes.clone().into(), cref).unwrap();
+            if i + 1 == originals.len() {
+                closed = Some(result.unwrap());
+            } else {
+                assert!(result.is_none());
+            }
+        }
+        let closed = closed.unwrap();
+        assert_eq!(
+            closed.parity_bytes, golden,
+            "striper parity must be byte-identical to the legacy all-Vec encode path"
+        );
+        // Parity refs must hash + size the emitted parity bytes.
+        let parity_refs: Vec<&ChunkRefV3> = closed
+            .block
+            .chunks
+            .iter()
+            .filter(|c| c.is_parity())
+            .collect();
+        assert_eq!(parity_refs.len(), 2);
+        for (r, p) in parity_refs.iter().zip(closed.parity_bytes.iter()) {
+            let expect: [u8; 32] = blake3::hash(p).into();
+            assert_eq!(r.hash, expect, "parity ref hash must cover emitted bytes");
+            assert_eq!(r.size as usize, max_len, "parity sized to max data shard");
+        }
+        // Data refs keep their PRE-padding sizes (the on-wire
+        // contract reads rely on to strip the zero-fill).
+        let data_refs: Vec<&ChunkRefV3> =
+            closed.block.chunks.iter().filter(|c| c.is_data()).collect();
+        for (r, &s) in data_refs.iter().zip(sizes.iter()) {
+            assert_eq!(r.size as usize, s, "data ref keeps pre-padding size");
+        }
+    }
+
     /// Production constants match the v0.3 plan §6: `(10, 4)`
     /// default, 40 MiB stripe target, 8 MiB stripe minimum.
     #[test]

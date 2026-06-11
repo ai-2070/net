@@ -731,3 +731,103 @@ async fn concurrent_fetch_into_adjacent_dests() {
     assert!(temp_orphans(parent.path(), "a").is_empty());
     assert!(temp_orphans(parent.path(), "b").is_empty());
 }
+
+// ── store_dir parallelization (PERF_AUDIT §6.9) ─────────────────────
+
+/// PERF_AUDIT §6.9 — `store_dir` processes files with bounded
+/// parallelism (`buffer_unordered`), so entries complete out of
+/// path order; the manifest must still come out deterministically
+/// path-ordered. The first-by-path file is large (slow read +
+/// store through the spawn_blocking branch) while the rest are
+/// tiny and finish first — under completion-ordering the big file
+/// would land last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn store_dir_manifest_is_path_ordered_despite_parallel_completion() {
+    let adapter = Arc::new(MeshBlobAdapter::new("order", Arc::new(Redex::new())));
+    let src = TempDir::new("ordersrc");
+    // 600 KiB — above the 256 KiB blocking-FS threshold.
+    let big = vec![0xAB; 600 * 1024];
+    write(src.path(), "aaa_big.bin", &big);
+    for i in 0..40 {
+        write(
+            src.path(),
+            &format!("zz/f{i:02}.txt"),
+            format!("tiny {i}").as_bytes(),
+        );
+    }
+
+    let manifest_ref = store_dir(&adapter, src.path()).await.expect("store_dir");
+    let manifest_bytes = adapter.fetch(&manifest_ref).await.expect("manifest fetch");
+    let manifest: DirManifest = postcard::from_bytes(&manifest_bytes).expect("manifest decode");
+    assert_eq!(manifest.version, DIR_MANIFEST_VERSION);
+
+    let paths: Vec<&str> = manifest.entries.iter().map(|e| e.path.as_str()).collect();
+    let mut sorted = paths.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        paths, sorted,
+        "manifest entries must be path-ordered, not completion-ordered"
+    );
+    assert_eq!(
+        paths.first().copied(),
+        Some("aaa_big.bin"),
+        "slow big file must still sort first by path"
+    );
+    // 1 big file + the `zz` dir entry + 40 tiny files.
+    assert_eq!(manifest.entries.len(), 42);
+}
+
+/// PERF_AUDIT §6.9 — a single file failing its store must fail the
+/// whole `store_dir` (no partial-manifest publish), and the
+/// failure must leave the adapter fully usable: clearing the
+/// fault and re-running succeeds. The fault is injected by
+/// pre-poisoning the chunk slot for one file's content hash with
+/// different-LENGTH bytes — the content-addressed store of the
+/// honest file then surfaces `HashMismatch` from inside the
+/// parallel store loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn store_dir_surfaces_file_store_error_and_recovers_after_fix() {
+    let redex = Arc::new(Redex::new());
+    let adapter = Arc::new(MeshBlobAdapter::new("err", redex.clone()));
+    let src = TempDir::new("errsrc");
+    let poisoned_body = b"poison-target file body".to_vec();
+    write(src.path(), "m/poisoned.bin", &poisoned_body);
+    for i in 0..10 {
+        write(
+            src.path(),
+            &format!("ok/f{i}.txt"),
+            format!("fine {i}").as_bytes(),
+        );
+    }
+
+    // Pre-poison the chunk slot for poisoned.bin's content hash
+    // with shorter bytes. store_dir's store of the honest file
+    // fails the content-addressed length check and must propagate.
+    let hash: [u8; 32] = blake3::hash(&poisoned_body).into();
+    let channel = MeshBlobAdapter::chunk_channel_for_hash(&hash);
+    let file = redex
+        .open_file(&channel, net::adapter::net::redex::RedexFileConfig::new())
+        .expect("open poison channel");
+    file.append(b"short poison").expect("append poison");
+
+    let err = store_dir(&adapter, src.path()).await;
+    assert!(
+        err.is_err(),
+        "poisoned chunk slot must fail store_dir; got {err:?}"
+    );
+
+    // Clear the fault and re-run: store_dir must succeed and emit
+    // a complete manifest (1 poisoned + 10 ok files + 2 dirs).
+    adapter.delete_chunk(&hash).await.expect("clear poison");
+    let manifest_ref = store_dir(&adapter, src.path())
+        .await
+        .expect("store_dir after clearing the poisoned slot");
+    let manifest_bytes = adapter.fetch(&manifest_ref).await.expect("manifest fetch");
+    let manifest: DirManifest = postcard::from_bytes(&manifest_bytes).expect("manifest decode");
+    let file_count = manifest
+        .entries
+        .iter()
+        .filter(|e| matches!(e.kind, EntryKind::File { .. }))
+        .count();
+    assert_eq!(file_count, 11, "all files present after recovery");
+}
