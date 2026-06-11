@@ -2414,8 +2414,7 @@ fn bench_capability_fold_scaling(c: &mut Criterion) {
         // grows; growth here would mean the index itself (not
         // result materialization) is degrading.
         let rare_filter = CapabilityFilter::new().require_tag("rare-fixed");
-        let rare_matches =
-            capability_bridge::find_nodes_matching(&fold, &rare_filter).len() as u64;
+        let rare_matches = capability_bridge::find_nodes_matching(&fold, &rare_filter).len() as u64;
         assert_eq!(
             rare_matches, 100,
             "rare-tag fixture must stay fixed-cardinality across fleet sizes"
