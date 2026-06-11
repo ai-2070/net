@@ -842,20 +842,24 @@ impl DiskSegment {
             let mut dat = self.dat_file.lock();
             let pre_len = self.dat_len.load(Ordering::Acquire);
             if let Err(e) = dat.write_all(payload) {
-                // Best-effort rollback: truncate dat back to its
+                // Roll back through the canonical helper (same as
+                // the batch path): truncate dat back to its
                 // pre-write length so partial bytes don't strand
-                // on disk. `.append(true)` open mode prevents
-                // `set_len` on the same handle on some platforms,
-                // so use a fresh write handle. If even that fails
-                // (filesystem error), surface the original error.
+                // on disk, and poison the segment if the truncation
+                // itself fails. The poison matters more post-§5.3
+                // than it did with the stat-based pre_len: a failed
+                // ad-hoc `set_len` used to self-correct on the next
+                // append's `metadata()` read, but the cached
+                // `dat_len` atomic stays at `pre_len`, so stranded
+                // partial bytes would make every later rollback
+                // target undershoot the real file end — truncating
+                // valid tail bytes. The original write error is
+                // still the one surfaced to the caller.
                 drop(dat);
-                let dat_path = self.live_gen_path("dat");
-                if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                    let _ = f.set_len(pre_len);
-                }
+                self.rollback_truncate("dat", pre_len);
                 // Atomic stays at pre_len — no store happened on
-                // the write_all-failure path, so no decrement is
-                // needed.
+                // the write_all-failure path (and
+                // `rollback_truncate` re-stores the same value).
                 return Err(RedexError::io(e));
             }
             self.dat_len

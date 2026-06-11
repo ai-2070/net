@@ -973,6 +973,53 @@ mod tests {
         assert!(matches!(err, WireError::Truncated { .. }));
     }
 
+    /// PERF_AUDIT §5.2 decode robustness: a forged `payload_len`
+    /// (hostile peer claims u32::MAX bytes for an event the frame
+    /// doesn't carry) must error as Truncated — never panic on the
+    /// `&cursor[..payload_len]` slice that builds the payload
+    /// `Bytes`.
+    #[test]
+    fn sync_response_rejects_forged_payload_len() {
+        let mut bytes = SyncResponse {
+            channel_id: sample_channel_id(),
+            first_seq: 1,
+            leader_first_retained_seq: 0,
+            events: vec![SyncEvent {
+                event_seq: 1,
+                payload: bytes::Bytes::from_static(b"victim"),
+            }],
+            request_id: 0,
+        }
+        .to_bytes();
+        // Layout: header(3) + channel_id(32) + first_seq(8) +
+        // leader_first_retained_seq(8) + request_id(8) +
+        // event_count(4) = 63; event_seq at 63..71; payload_len at
+        // 71..75. Forge it to u32::MAX.
+        bytes[71..75].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = SyncResponse::from_bytes(&bytes).expect_err("forged payload_len must reject");
+        assert!(matches!(err, WireError::Truncated { .. }));
+    }
+
+    /// PERF_AUDIT §5.2 decode robustness: a hostile `event_count`
+    /// with no matching event bytes must error as Truncated without
+    /// attempting a u32::MAX-element pre-allocation (R-36 caps the
+    /// `Vec::with_capacity` at 4096).
+    #[test]
+    fn sync_response_rejects_hostile_event_count() {
+        let mut bytes = SyncResponse {
+            channel_id: sample_channel_id(),
+            first_seq: 0,
+            leader_first_retained_seq: 0,
+            events: vec![],
+            request_id: 0,
+        }
+        .to_bytes();
+        // event_count lives at offset 59..63 (see layout above).
+        bytes[59..63].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = SyncResponse::from_bytes(&bytes).expect_err("hostile event_count must reject");
+        assert!(matches!(err, WireError::Truncated { .. }));
+    }
+
     // ----------------------------------------------------------------
     // SyncHeartbeat round-trip
     // ----------------------------------------------------------------

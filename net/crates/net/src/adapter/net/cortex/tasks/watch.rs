@@ -164,12 +164,16 @@ impl TasksWatcher {
                         // PERF_AUDIT §5.6 — opportunistic batching;
                         // see the matching comment in
                         // `memories/watch.rs` for the full
-                        // rationale.
+                        // rationale. End-of-stream observed during
+                        // the drain must still deliver the final
+                        // state below (we already received a tick
+                        // this iteration) — only THEN exit.
                         use futures::future::FutureExt;
-                        while let Some(maybe_more) = (&mut changes).next().now_or_never() {
-                            match maybe_more {
-                                Some(_) => continue,
-                                None => return,
+                        let mut stream_ended = false;
+                        while let Some(maybe_more) = changes.next().now_or_never() {
+                            if maybe_more.is_none() {
+                                stream_ended = true;
+                                break;
                             }
                         }
                         let current = {
@@ -182,11 +186,60 @@ impl TasksWatcher {
                             }
                             last = current;
                         }
+                        if stream_ended {
+                            return;
+                        }
                     }
                 }
             }
         });
 
         WatchStream::new(rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PERF_AUDIT §5.6 regression — mirror of
+    /// `memories::watch::tests::burst_drain_hitting_end_of_stream_still_delivers_final_state`;
+    /// see that test for the full rationale. The tasks watcher's
+    /// burst drain must deliver the final state before exiting on
+    /// end-of-stream.
+    #[tokio::test]
+    async fn burst_drain_hitting_end_of_stream_still_delivers_final_state() {
+        let state = Arc::new(RwLock::new(TasksState::new()));
+        let changes = StreamExt::boxed(futures::stream::iter(vec![0u64, 1, 2]));
+        let watcher = TasksWatcher::new(state.clone(), changes);
+        let mut out = Box::pin(watcher.stream());
+
+        // Mutate state AFTER `stream()` computed the initial
+        // (empty) snapshot but BEFORE the watcher task first polls.
+        state.write().tasks.insert(
+            7,
+            Task {
+                id: 7,
+                title: "final value".into(),
+                status: TaskStatus::Pending,
+                created_ns: 1,
+                updated_ns: 1,
+            },
+        );
+
+        let initial = out.next().await.unwrap();
+        assert!(initial.is_empty(), "initial snapshot precedes the insert");
+
+        let last = out
+            .next()
+            .await
+            .expect("final state must be delivered before the stream ends");
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].id, 7);
+
+        assert!(
+            out.next().await.is_none(),
+            "stream ends after the final delivery"
+        );
     }
 }

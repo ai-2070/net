@@ -9,7 +9,9 @@
 
 use futures::StreamExt;
 use net::adapter::net::channel::ChannelName;
-use net::adapter::net::cortex::tasks::{OrderBy, TaskStatus, TasksAdapter, TASKS_CHANNEL};
+use net::adapter::net::cortex::tasks::{
+    OrderBy, TaskStatus, TasksAdapter, DISPATCH_TASK_CREATED, TASKS_CHANNEL,
+};
 use net::adapter::net::cortex::{
     compute_checksum, compute_checksum_with_meta, EventMeta, WaitForTokenError, EVENT_META_SIZE,
 };
@@ -1216,4 +1218,47 @@ async fn poll_for_token_synchronous_non_blocking_check() {
     let alien_token = WriteToken::new(0xDEAD_BEEF, seq);
     let err = tasks.poll_for_token(alien_token).unwrap_err();
     assert!(matches!(err, WaitForTokenError::WrongOrigin { .. }));
+}
+
+#[tokio::test]
+async fn test_regression_single_buffer_ingest_matches_legacy_two_buffer_layout() {
+    // PERF_AUDIT §5.7 — mirror of the memories-side layout pin (see
+    // integration_cortex_memories.rs): `ingest_typed` serializes
+    // postcard output directly into one buffer with the 24-byte
+    // EventMeta slot reserved, patching the checksum at 20..24. The
+    // on-disk bytes must be byte-identical to the legacy two-buffer
+    // construction.
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
+
+    let seq = tasks.create(9, "single-buffer layout pin", 4242).unwrap();
+    tasks.wait_for_seq(seq).await.unwrap();
+
+    let file = redex
+        .open_file(
+            &ChannelName::new(TASKS_CHANNEL).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+    let events = file.read_range(0, 1);
+    assert_eq!(events.len(), 1);
+    let on_disk = &events[0].payload;
+
+    // Legacy reconstruction. `TaskCreatedPayload` is private, but
+    // postcard encodes a struct as the bare concatenation of its
+    // fields, so the same-shaped tuple produces identical bytes:
+    // (id: u64, title: String, now_ns: u64).
+    let tail = postcard::to_allocvec(&(9u64, "single-buffer layout pin", 4242u64)).unwrap();
+    let mut meta = EventMeta::new(DISPATCH_TASK_CREATED, 0, ORIGIN, 0, 0);
+    meta.checksum = compute_checksum_with_meta(&meta, &tail);
+    let mut expected = Vec::with_capacity(EVENT_META_SIZE + tail.len());
+    expected.extend_from_slice(&meta.to_bytes());
+    expected.extend_from_slice(&tail);
+
+    assert_eq!(
+        on_disk.as_ref(),
+        expected.as_slice(),
+        "single-buffer ingest must produce byte-identical records to \
+         the legacy two-buffer path"
+    );
 }
