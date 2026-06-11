@@ -1,0 +1,20 @@
+net/crates/net/benches/ingestion.rs
+  s_58168e769adc91::t_268cf37c1b59e2 204-210,222-229,234,236,238-242,244-245
+  s_58168e769adc91::t_1f37bae6e20293 175-180
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "14c40234b27886e4d5f75b049f2b41cec9a5ffd4",
+  "prompts": {},
+  "sessions": {
+    "s_58168e769adc91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "43399f81-fab3-4b2a-a002-4ece8a909069",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
