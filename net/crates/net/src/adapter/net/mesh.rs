@@ -599,7 +599,12 @@ struct DispatchCtx {
     /// admission scope (mesh.rs `process_data_packet`) and other
     /// callers that previously paid 3-5 µs + ~100 allocs every
     /// time they needed a node's parsed capability set. Per
-    /// PERF_AUDIT_2026_06_10_FULL_CRATE.md §4.1.
+    /// PERF_AUDIT_2026_06_10_FULL_CRATE.md §4.1. Gated on
+    /// `dataforts` because the greedy-observer read in
+    /// `process_data_packet` is its only consumer — an ungated
+    /// field is dead code under `-D warnings` for non-dataforts
+    /// feature combinations.
+    #[cfg(feature = "dataforts")]
     capability_set_cache: Arc<super::behavior::fold::capability_bridge::CapabilitySetCache>,
     /// Dedup cache for multi-hop capability announcements, keyed by
     /// `(origin_node_id, version)`. Written by the dispatch handler
@@ -1779,7 +1784,9 @@ pub struct MeshNode {
     /// `Arc<CapabilitySet>` per node, shared with `DispatchCtx` so
     /// the per-packet greedy admission path (and other hot callers)
     /// don't re-parse + re-allocate the full capability set every
-    /// call.
+    /// call. Gated on `dataforts` with its sole consumer (the
+    /// greedy-observer read in `process_data_packet`).
+    #[cfg(feature = "dataforts")]
     capability_set_cache: Arc<super::behavior::fold::capability_bridge::CapabilitySetCache>,
     /// Reservation fold, mirroring [`Self::capability_fold`]
     /// at the per-resource granularity. Always allocated so the
@@ -2196,6 +2203,7 @@ impl MeshNode {
         // Per PERF_AUDIT §4.1: generation-keyed LRU snapshot of the
         // parsed capability set per node. Sized for typical mesh
         // sizes; tunable later if operator load demands it.
+        #[cfg(feature = "dataforts")]
         let capability_set_cache =
             Arc::new(super::behavior::fold::capability_bridge::CapabilitySetCache::new());
         let reservation_fold: Arc<
@@ -2384,6 +2392,7 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             traversal_stats: Arc::new(super::traversal::TraversalStats::new()),
             capability_fold,
+            #[cfg(feature = "dataforts")]
             capability_set_cache,
             reservation_fold,
             seen_announcements: Arc::new(DashMap::new()),
@@ -3477,6 +3486,7 @@ impl MeshNode {
             traversal_config: self.traversal_config.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
             capability_fold: self.capability_fold.clone(),
+            #[cfg(feature = "dataforts")]
             capability_set_cache: self.capability_set_cache.clone(),
             seen_announcements: self.seen_announcements.clone(),
             require_signed_capabilities: self.config.require_signed_capabilities,
