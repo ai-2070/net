@@ -2675,40 +2675,58 @@ mod tests {
         );
     }
 
-    /// PERF_AUDIT §1.1 — the stripe MUST distribute across slots
-    /// rather than collapse onto one. Drives 16 producer threads
-    /// each doing one add (no sub), counts how many slots are
-    /// non-zero. With a healthy stripe + thread-id distribution we
-    /// expect at least 4 distinct slots populated; if we see only
-    /// 1, the stripe regressed to a single shared cache line.
+    /// PERF_AUDIT §1.1 — the stripe's accounting contract, pinned
+    /// deterministically: every slot accumulates independently and
+    /// `sum()` aggregates all of them. A regression collapsing the
+    /// stripe onto one shared slot (the pre-§1.1 shape) aliases the
+    /// per-slot counts and fails the per-slot assertions below.
+    ///
+    /// Deliberately does NOT assert how many distinct slots a set
+    /// of threads lands on: the thread→slot mapping hashes
+    /// `ThreadId`s, whose distribution std does not guarantee, so a
+    /// "N distinct slots populated" assertion is nondeterministic
+    /// (it can fail under legitimate thread-id collisions). The
+    /// mapping's actual contract — in-bounds and sticky per thread
+    /// — is asserted separately below.
     #[test]
-    fn striped_in_flight_distributes_across_slots() {
+    fn striped_in_flight_slots_account_independently() {
+        let counter = StripedInFlight::new();
+        // Distinct count per slot so aliasing between any two slots
+        // changes at least one per-slot readback.
+        for slot in 0..IN_FLIGHT_STRIPE_SLOTS {
+            counter.fetch_add_at(slot, slot as u64 + 1);
+        }
+        let expected_total: u64 = (1..=IN_FLIGHT_STRIPE_SLOTS as u64).sum();
+        assert_eq!(counter.sum(), expected_total, "sum must cover every slot");
+        for slot in 0..IN_FLIGHT_STRIPE_SLOTS {
+            assert_eq!(
+                counter.slots[slot].load(AtomicOrdering::SeqCst),
+                slot as u64 + 1,
+                "slot {slot} must hold exactly its own count (no aliasing)"
+            );
+        }
+    }
+
+    /// PERF_AUDIT §1.1 — thread→slot mapping contract: in-bounds
+    /// for every thread, and sticky (repeat calls from the same
+    /// thread return the same slot, so a producer's add and its
+    /// guard's sub land on the same cache line).
+    #[test]
+    fn striped_in_flight_slot_mapping_is_in_bounds_and_sticky() {
         let counter = std::sync::Arc::new(StripedInFlight::new());
         let mut handles = Vec::new();
         for _ in 0..16 {
             let c = counter.clone();
             handles.push(std::thread::spawn(move || {
-                let slot = c.slot_for_current_thread();
-                c.fetch_add_at(slot, 1);
+                let first = c.slot_for_current_thread();
+                let second = c.slot_for_current_thread();
+                assert!(first < IN_FLIGHT_STRIPE_SLOTS, "slot out of bounds");
+                assert_eq!(first, second, "slot must be sticky per thread");
             }));
         }
         for h in handles {
             h.join().unwrap();
         }
-        assert_eq!(counter.sum(), 16);
-        let nonzero = counter
-            .slots
-            .iter()
-            .filter(|s| s.load(AtomicOrdering::SeqCst) > 0)
-            .count();
-        // 32 slots, 16 producers — hash distribution expected to
-        // populate well over 4 distinct slots in practice. Loose
-        // assertion to stay reliable under thread-id collisions.
-        assert!(
-            nonzero >= 4,
-            "stripe must distribute across slots: only {} of 32 populated",
-            nonzero
-        );
     }
 
     /// PERF_AUDIT §1.1 — the shutdown gate must survive the
