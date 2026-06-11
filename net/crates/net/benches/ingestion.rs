@@ -172,8 +172,12 @@ fn bench_batch_pop(c: &mut Criterion) {
 /// numbers look identical.
 ///
 /// Bench shape:
-///   - Pre-built [`RawEvent`] template cloned per push (a
-///     refcount bump; no JSON re-serialization).
+///   - Pool of 256 pre-built [`RawEvent`] templates with distinct
+///     payloads, cloned per push (a refcount bump; no JSON
+///     re-serialization). The pool matters: `RawEvent` caches the
+///     xxh3 hash of its bytes for shard routing, so a single
+///     template would pin EVERY event to one shard and the bench
+///     would measure that shard's mutex instead of the bus layer.
 ///   - `BackpressureMode::DropOldest` so a saturated ring never
 ///     stalls a producer.
 ///   - 16-shard bus so producers route to distinct shards
@@ -197,14 +201,13 @@ fn bench_event_bus_ingest_raw_concurrent(c: &mut Criterion) {
             BenchmarkId::new("producers", producers),
             &producers,
             |b, &producers| {
-                // Spin a fresh bus per iteration so a saturated
-                // ring buffer from a prior iteration doesn't bias
-                // the next sample. 16 shards × 64 K capacity =
-                // plenty of headroom for `EVENTS_PER_BATCH`
-                // events even under DropNewest, and the bench
-                // routes through `ingest_raw`'s atomic-only path
-                // (no JSON parse, no per-shard mutex serialization
-                // unless producers happen to collide on a shard).
+                // One bus per producer-count benchmark (not per
+                // `b.iter` sample — bus setup is far too heavy for
+                // that). 16 shards × 64 K capacity gives the drain
+                // workers plenty of headroom against the 8 K events
+                // per sample, and DropOldest means a transiently
+                // saturated ring evicts instead of stalling a
+                // producer mid-sample.
                 let config = EventBusConfig::builder()
                     .num_shards(16)
                     .ring_buffer_capacity(65_536)
@@ -216,17 +219,30 @@ fn bench_event_bus_ingest_raw_concurrent(c: &mut Criterion) {
                         .block_on(EventBus::new(config))
                         .expect("EventBus::new for bench"),
                 );
-                let raw_template = RawEvent::from_str(r#"{"i":0}"#);
+                // Distinct payloads → distinct cached hashes →
+                // statistical spread across the 16 shards. A single
+                // template would route every event to ONE shard
+                // (RawEvent pre-computes its routing hash) and
+                // serialize all producers on that shard's mutex.
+                let templates: Vec<RawEvent> = (0..256)
+                    .map(|i| RawEvent::from_str(&format!(r#"{{"i":{i}}}"#)))
+                    .collect();
 
                 b.iter(|| {
                     let per_thread = EVENTS_PER_BATCH as usize / producers;
                     std::thread::scope(|scope| {
-                        for _ in 0..producers {
+                        for t in 0..producers {
                             let bus = std::sync::Arc::clone(&bus);
-                            let template = raw_template.clone();
+                            let templates = &templates;
                             scope.spawn(move || {
+                                // Stagger each producer's start
+                                // offset so threads don't push the
+                                // same template (= same shard) in
+                                // lockstep.
+                                let mut idx = t * 31;
                                 for _ in 0..per_thread {
-                                    let _ = bus.ingest_raw(template.clone());
+                                    let _ = bus.ingest_raw(templates[idx & 255].clone());
+                                    idx = idx.wrapping_add(1);
                                 }
                             });
                         }
