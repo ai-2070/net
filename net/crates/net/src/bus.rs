@@ -2711,6 +2711,35 @@ mod tests {
         );
     }
 
+    /// PERF_AUDIT §1.1 — the shutdown gate must survive the
+    /// striping. After `shutdown_via_ref` completes, `ingest` must
+    /// be rejected with `ShuttingDown`, AND the rejected attempt
+    /// must leave the striped sum at exactly zero — the gate's
+    /// add-check-sub sequence nets out on the producer's slot. A
+    /// leaked increment here would skew the stranded-count
+    /// accounting any later wait-for-zero reader relies on.
+    #[tokio::test]
+    async fn striped_in_flight_shutdown_gate_rejects_and_nets_zero() {
+        let config = EventBusConfig::builder()
+            .num_shards(2)
+            .ring_buffer_capacity(1024)
+            .build()
+            .unwrap();
+        let bus = EventBus::new(config).await.unwrap();
+        bus.shutdown_via_ref().await.unwrap();
+
+        let err = bus.ingest(Event::new(json!({"late": true}))).unwrap_err();
+        assert!(
+            matches!(err, IngestionError::ShuttingDown),
+            "post-shutdown ingest must fail closed, got {err:?}"
+        );
+        assert_eq!(
+            bus.in_flight_ingests.sum(),
+            0,
+            "rejected gate entry must net-zero its stripe slot"
+        );
+    }
+
     #[tokio::test]
     async fn test_event_bus_basic() {
         let config = EventBusConfig::builder()

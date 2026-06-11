@@ -184,7 +184,7 @@ impl Shard {
         // mutex is race-free with the SPSC contract.
         let push_start_raw = if self.metrics_collector.is_some() {
             self.metrics_sample_phase = self.metrics_sample_phase.wrapping_add(1);
-            if self.metrics_sample_phase % METRICS_SAMPLE_STRIDE == 0 {
+            if self.metrics_sample_phase.is_multiple_of(METRICS_SAMPLE_STRIDE) {
                 Some(self.timestamp_gen.now_raw())
             } else {
                 None
@@ -232,7 +232,7 @@ impl Shard {
     pub fn try_push(&mut self, raw: JsonValue) -> Result<u64, IngestionError> {
         let push_start_raw = if self.metrics_collector.is_some() {
             self.metrics_sample_phase = self.metrics_sample_phase.wrapping_add(1);
-            if self.metrics_sample_phase % METRICS_SAMPLE_STRIDE == 0 {
+            if self.metrics_sample_phase.is_multiple_of(METRICS_SAMPLE_STRIDE) {
                 Some(self.timestamp_gen.now_raw())
             } else {
                 None
@@ -1397,6 +1397,85 @@ mod tests {
             "aggregated batches_dispatched must equal the sum of per-shard \
              record_batch_dispatch calls"
         );
+    }
+
+    /// PERF_AUDIT §1.4 — the lock-free counter bump must hit the
+    /// RIGHT shard slot after a dynamic rescale. `remove_shard`
+    /// rebuilds the table with `swap_remove`, which relocates the
+    /// last shard into the removed index; a stale id→idx mapping
+    /// (or a static-mode `shard_id == index` assumption leaking
+    /// into dynamic mode) would credit the wrong shard's counter.
+    #[test]
+    fn record_batch_dispatch_hits_correct_slot_after_rescale() {
+        use crate::config::ScalingPolicy;
+        let policy = ScalingPolicy {
+            min_shards: 1,
+            max_shards: 8,
+            cooldown: std::time::Duration::from_nanos(1),
+            ..Default::default()
+        };
+        let manager =
+            ShardManager::with_mapper(2, 1024, BackpressureMode::DropNewest, policy).unwrap();
+
+        // Remove shard 0: swap_remove moves shard 1 (last) into
+        // index 0, so id 1 now resolves to a different index than
+        // its id.
+        manager
+            .remove_shard(0)
+            .expect("remove_shard must succeed in dynamic mode");
+
+        // Removed id → no-op, no counter bump anywhere.
+        assert!(!manager.record_batch_dispatch(0));
+
+        // Surviving id must bump ITS counter through the rebuilt
+        // index, not slot `shard_id as usize`.
+        for _ in 0..5 {
+            assert!(manager.record_batch_dispatch(1));
+        }
+        let shard1_batches = manager
+            .with_shard(1, |s| {
+                s.counters.batches_dispatched.load(AtomicOrdering::Relaxed)
+            })
+            .expect("shard 1 still routable");
+        assert_eq!(
+            shard1_batches, 5,
+            "post-rescale bumps must land on the surviving shard's counter"
+        );
+        assert_eq!(
+            manager.stats().batches_dispatched,
+            5,
+            "aggregate must see exactly the 5 post-rescale bumps"
+        );
+    }
+
+    /// PERF_AUDIT §1.5 — the identity hasher must stay collision-free
+    /// across the entire u16 keyspace (that's the property that makes
+    /// dropping SipHash safe here). Pin both the raw hasher contract
+    /// (`finish() == key`) and the end-to-end map behavior with every
+    /// possible shard id inserted at once.
+    #[test]
+    fn u16_identity_hasher_is_collision_free_across_keyspace() {
+        use std::hash::Hasher as _;
+        let mut h = U16IdentityHasher::default();
+        h.write_u16(0xBEEF);
+        assert_eq!(h.finish(), 0xBEEF, "hash must be the key verbatim");
+
+        let mut map: std::collections::HashMap<u16, usize, BuildU16IdentityHasher> =
+            std::collections::HashMap::with_capacity_and_hasher(
+                1 << 16,
+                BuildU16IdentityHasher::default(),
+            );
+        for id in 0..=u16::MAX {
+            map.insert(id, id as usize);
+        }
+        assert_eq!(map.len(), 1 << 16, "all 65536 keys must coexist");
+        for id in 0..=u16::MAX {
+            assert_eq!(
+                map.get(&id).copied(),
+                Some(id as usize),
+                "key {id} must round-trip through the identity-hashed map"
+            );
+        }
     }
 
     #[test]
