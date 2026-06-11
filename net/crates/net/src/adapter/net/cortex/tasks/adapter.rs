@@ -509,9 +509,7 @@ impl TasksAdapter {
         })?;
         let tail = &buf[EVENT_META_SIZE..];
         meta.checksum = compute_checksum_with_meta(&meta, tail);
-        // Patch the checksum slot (offset 20..24 — see
-        // `EventMeta::to_bytes`).
-        buf[20..24].copy_from_slice(&meta.checksum.to_le_bytes());
+        EventMeta::patch_checksum(&mut buf, meta.checksum);
         self.inner.ingest_prebuilt(&buf)
     }
 }
