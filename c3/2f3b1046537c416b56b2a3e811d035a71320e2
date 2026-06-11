@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/cortex/memories/watch.rs
+  s_d4a014e53aa1f5::t_2f1bd6109edc12 187-210
+net/crates/net/src/adapter/net/cortex/tasks/watch.rs
+  s_d4a014e53aa1f5::t_4006a52d94e2ee 164-174
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "c32f3b1046537c416b56b2a3e811d035a71320e2",
+  "prompts": {},
+  "sessions": {
+    "s_d4a014e53aa1f5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a6af4feb-518f-4835-a66d-5b2f7797adef",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
