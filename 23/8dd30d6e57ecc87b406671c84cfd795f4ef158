@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/redex/replication_catchup.rs
+  s_d4a014e53aa1f5::t_f1dca289bbb8c6 329-360
+net/crates/net/src/adapter/net/redex/replication_runtime.rs
+  s_d4a014e53aa1f5::t_de00212f819b63 54
+  s_d4a014e53aa1f5::t_0809ecb65a3ef8 53,55
+  s_d4a014e53aa1f5::t_5f6f6e71e3daf1 1526-1535
+  s_d4a014e53aa1f5::t_2de871c5f672bf 1396-1406
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "238dd30d6e57ecc87b406671c84cfd795f4ef158",
+  "prompts": {},
+  "sessions": {
+    "s_d4a014e53aa1f5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a6af4feb-518f-4835-a66d-5b2f7797adef",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
