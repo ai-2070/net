@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/crypto.rs
+  s_9c003fea2208f6::t_630733dd103ef9 365-379,384-385,387
+  s_9c003fea2208f6::t_42a5f061d80d93 420-422
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "8c7a3e9b7f58c2f5f796b81fd4ba7974c37c2b79",
+  "prompts": {},
+  "sessions": {
+    "s_9c003fea2208f6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0831367f-5f5b-4154-9d38-2b2fabfd03b7",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
