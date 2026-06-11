@@ -1,0 +1,20 @@
+net/crates/net/benches/net.rs
+  s_58168e769adc91::t_4ae954c2dfaec7 316-318,331
+  s_58168e769adc91::t_d619db184809e0 275-281,294,297
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "f68525b8cc9a39aafaa7bedfd331278a358c0cf1",
+  "prompts": {},
+  "sessions": {
+    "s_58168e769adc91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "43399f81-fab3-4b2a-a002-4ece8a909069",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
