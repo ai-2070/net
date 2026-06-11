@@ -685,7 +685,7 @@ impl RoutingTable {
                 // Admit only while below cap. Soft check — concurrent
                 // inserts may race the load + fetch_add window, but the
                 // overshoot is bounded by the number of concurrent
-                // admissions and trims back on `prune_stale_streams`.
+                // admissions and trims back on `cleanup_idle_streams`.
                 if self.num_streams.load(Ordering::Relaxed) >= MAX_STREAM_STATS {
                     return None;
                 }

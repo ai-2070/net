@@ -1768,4 +1768,73 @@ mod tests {
             EventFrame::read_events(buf.split_to(plaintext_len).freeze(), header.event_count);
         assert_eq!(recovered, events, "subprotocol events round-trip");
     }
+
+    /// PERF_AUDIT §2.6 regression: `build()` hands the packet
+    /// allocation away via `split().freeze()`, so the next build
+    /// reuses (or re-grows) `self.packet` while the previous
+    /// packet's `Bytes` is still alive — the path where BytesMut
+    /// cannot reclaim and must reallocate. An offset bug in the
+    /// in-place framing (header placeholder, payload sub-slice,
+    /// tag append) would corrupt the second or third packet, not
+    /// the first. Build three back-to-back, keep all alive,
+    /// decrypt all three.
+    #[test]
+    fn build_reuses_buffer_across_packets_while_previous_alive() {
+        let key = [0x07u8; 32];
+        let session_id = 0x0123_4567_89AB_CDEF_u64;
+        let pool = ThreadLocalPool::new(2, &key, session_id);
+        let mut builder = pool.get();
+        let rx_cipher = PacketCipher::new(&key, session_id);
+
+        let payloads: [&[u8]; 3] = [
+            b"packet-one-payload",
+            b"packet-two-payload-which-is-a-bit-longer",
+            b"p3",
+        ];
+        // Keep every packet alive across subsequent builds.
+        let packets: Vec<Bytes> = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let events = vec![Bytes::copy_from_slice(p)];
+                builder.build(7, i as u64, &events, PacketFlags::NONE)
+            })
+            .collect();
+
+        let mut prev_counter: Option<u64> = None;
+        for (i, pkt) in packets.iter().enumerate() {
+            let header = NetHeader::from_bytes(&pkt[..HEADER_SIZE])
+                .unwrap_or_else(|| panic!("packet {i} header must parse"));
+            assert_eq!(header.sequence, i as u64, "packet {i} sequence");
+            assert_eq!(
+                pkt.len(),
+                HEADER_SIZE + header.payload_len as usize + 16,
+                "packet {i} wire layout"
+            );
+
+            let nonce_counter = u64::from_le_bytes(pkt[16..24].try_into().unwrap());
+            if let Some(prev) = prev_counter {
+                assert!(
+                    nonce_counter > prev,
+                    "nonce counter must be strictly increasing across reused builds \
+                     (packet {i}: {nonce_counter} <= {prev})"
+                );
+            }
+            prev_counter = Some(nonce_counter);
+
+            let aad = header.aad();
+            let mut buf = bytes::BytesMut::from(&pkt[HEADER_SIZE..]);
+            let plaintext_len = rx_cipher
+                .decrypt_in_place(nonce_counter, &aad, &mut buf[..])
+                .unwrap_or_else(|e| panic!("packet {i} must decrypt after buffer reuse: {e}"));
+            let recovered =
+                EventFrame::read_events(buf.split_to(plaintext_len).freeze(), header.event_count);
+            assert_eq!(recovered.len(), 1, "packet {i} event count");
+            assert_eq!(
+                recovered[0].as_ref(),
+                payloads[i],
+                "packet {i} payload must round-trip despite the handed-off allocation"
+            );
+        }
+    }
 }

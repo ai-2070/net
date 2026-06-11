@@ -1554,13 +1554,21 @@ pub struct MeshNode {
     /// `parking_lot::Mutex<Vec<(u64, String)>>` that every
     /// concurrent RPC caller took on every `call` to do an
     /// `iter().any(|(t, s)| ... && s == service)` String compare.
-    /// All callers serialized on it. Now it's a `DashSet` of
-    /// `(target, xxh3_64(service))` pairs — the contains-check is a
+    /// All callers serialized on it. Now it's a `DashMap` keyed by
+    /// `(target, xxh3_64(service))` — the membership check is a
     /// shard-local read (no global lock), and the key is two `u64`s
-    /// (no String alloc / compare). The xxh3 cost is `~10 ns` on
+    /// (no String alloc on the probe). The xxh3 cost is `~10 ns` on
     /// the service bytes once per call.
+    ///
+    /// The value is the full service name: xxh3 is NOT
+    /// collision-free, and a hash-only hit that skipped the
+    /// subscribe for a *different* service would silently drop
+    /// that service's replies (the reply channel embeds the
+    /// service name). The hot path verifies the stored name on a
+    /// hash hit; a collision therefore degrades to an idempotent
+    /// re-subscribe instead of a correctness bug.
     #[cfg(feature = "cortex")]
-    rpc_reply_subscriptions: Arc<dashmap::DashSet<(u64, u64)>>,
+    rpc_reply_subscriptions: Arc<dashmap::DashMap<(u64, u64), Arc<str>>>,
     /// nRPC services the local node currently handles (registered
     /// via `Mesh::serve_rpc`, deregistered when the `ServeHandle`
     /// drops). `announce_capabilities` merges these as
@@ -2320,7 +2328,7 @@ impl MeshNode {
             #[cfg(feature = "cortex")]
             rpc_round_robin_cursor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
-            rpc_reply_subscriptions: Arc::new(dashmap::DashSet::new()),
+            rpc_reply_subscriptions: Arc::new(dashmap::DashMap::new()),
             #[cfg(feature = "cortex")]
             rpc_local_services: Arc::new(dashmap::DashSet::new()),
             #[cfg(feature = "tool")]
@@ -2763,7 +2771,7 @@ impl MeshNode {
         // (PERF_AUDIT §2.4).
         let session_id = session.session_id();
         self.router.add_route(peer_node_id, peer_addr);
-        self.peers.insert(
+        let displaced = self.peers.insert(
             peer_node_id,
             PeerInfo {
                 node_id: peer_node_id,
@@ -2778,7 +2786,17 @@ impl MeshNode {
         self.peer_addrs.insert(peer_node_id, peer_addr);
         // PERF_AUDIT §2.4: reverse-index update. Routed-local
         // dispatch reads this in O(1) instead of scanning peers
-        // for a matching session_id.
+        // for a matching session_id. If this insert replaced an
+        // existing session (same peer re-handshaking), evict the
+        // displaced session_id's entry first — otherwise every
+        // re-handshake leaks one stale reverse-index entry
+        // forever. Eviction before insert keeps the fresh mapping
+        // even in the (cryptographically improbable) case where
+        // the new handshake derived the same session_id.
+        if let Some(old) = displaced {
+            self.session_id_to_node
+                .remove_if(&old.session.session_id(), |_, n| *n == peer_node_id);
+        }
         self.session_id_to_node.insert(session_id, peer_node_id);
         match addr_mode {
             AddrInstallMode::DirectOverwrite => {
@@ -2875,7 +2893,7 @@ impl MeshNode {
 
         self.router.add_route(peer_node_id, peer_addr);
 
-        self.peers.insert(
+        let displaced = self.peers.insert(
             peer_node_id,
             PeerInfo {
                 node_id: peer_node_id,
@@ -2890,6 +2908,13 @@ impl MeshNode {
         self.addr_to_node.insert(peer_addr, peer_node_id);
 
         self.peer_addrs.insert(peer_node_id, peer_addr);
+        // PERF_AUDIT §2.4: evict the displaced session's reverse-
+        // index entry before installing the fresh one — see the
+        // matching comment in `install_peer`.
+        if let Some(old) = displaced {
+            self.session_id_to_node
+                .remove_if(&old.session.session_id(), |_, n| *n == peer_node_id);
+        }
         self.session_id_to_node.insert(session_id, peer_node_id);
 
         let peer_graph_id = node_id_to_graph_id(peer_node_id);
@@ -4144,6 +4169,13 @@ impl MeshNode {
                         return;
                     }
                     RoutedRotationOutcome::AcceptRotation => {
+                        // PERF_AUDIT §2.4: the rotation displaces
+                        // the existing session — evict its reverse-
+                        // index entry, otherwise every accepted
+                        // rotation leaks one stale entry forever.
+                        let displaced_session_id = occ.get().session.session_id();
+                        ctx.session_id_to_node
+                            .remove_if(&displaced_session_id, |_, n| *n == peer_node_id);
                         let session = Arc::new(NetSession::new(
                             keys,
                             source,
@@ -5056,10 +5088,11 @@ impl MeshNode {
             // (one Relaxed atomic load), then `ctx.peers.get(nid)`.
             // Pre-fix this went through `addr_to_node.get` →
             // `peers.get` → session-id validation → O(peers)
-            // iter().find fallback — even though the session itself
-            // already cached its NodeId at handshake time. The
-            // addr_to_node lookup is still used as a second-tier
-            // fallback for the brief window before `cache_node_id`
+            // iter().find fallback on every accepted packet. The
+            // per-session cache is populated lazily by the first
+            // successful resolution (here, or in the cortex RPC
+            // dispatch hook below). The addr_to_node lookup is the
+            // second-tier fallback for the window before the cache
             // publishes; the linear scan is the last-resort fallback
             // for the legitimate session-id-mismatch case (relay-
             // shared source address).
@@ -5072,19 +5105,45 @@ impl MeshNode {
                     })
                 })
                 .or_else(|| {
+                    // Cache miss (or stale entry that failed the
+                    // session-id cross-check). Resolve via the
+                    // legacy chain and PUBLISH the result so
+                    // subsequent packets hit the tier-1 atomic
+                    // load — without this, sessions whose traffic
+                    // never traverses the cortex RPC hook (the
+                    // only other `cache_node_id` caller) would pay
+                    // the addr_to_node round-trip per packet
+                    // forever, and §2.8's fast path would be dead
+                    // for plain reliable streams.
                     let peer_addr = session.peer_addr();
-                    ctx.addr_to_node.get(&peer_addr).and_then(|node_id| {
-                        ctx.peers.get(&*node_id).and_then(|p| {
-                            (p.value().session.session_id() == session.session_id())
-                                .then(|| (p.value().addr, p.value().session.clone()))
+                    let resolved = ctx
+                        .addr_to_node
+                        .get(&peer_addr)
+                        .and_then(|node_id| {
+                            ctx.peers.get(&*node_id).and_then(|p| {
+                                (p.value().session.session_id() == session.session_id()).then(
+                                    || {
+                                        (
+                                            p.value().node_id,
+                                            p.value().addr,
+                                            p.value().session.clone(),
+                                        )
+                                    },
+                                )
+                            })
                         })
+                        .or_else(|| {
+                            ctx.peers
+                                .iter()
+                                .find(|e| e.value().session.session_id() == session.session_id())
+                                .map(|e| {
+                                    (e.value().node_id, e.value().addr, e.value().session.clone())
+                                })
+                        });
+                    resolved.map(|(nid, addr, sess)| {
+                        session.cache_node_id(nid);
+                        (addr, sess)
                     })
-                })
-                .or_else(|| {
-                    ctx.peers
-                        .iter()
-                        .find(|e| e.value().session.session_id() == session.session_id())
-                        .map(|e| (e.value().addr, e.value().session.clone()))
                 });
             if let Some((peer_addr, peer_session)) = peer {
                 if !ctx.partition_filter.contains(&peer_addr) {
@@ -6076,9 +6135,13 @@ impl MeshNode {
 
     /// Tracks already-established (target, service) reply
     /// subscriptions. Accessor for `mesh_rpc::Mesh::call`'s
-    /// lazy-subscribe path.
+    /// lazy-subscribe path. Keyed by `(target, xxh3_64(service))`
+    /// with the full service name as the collision-verified value
+    /// (see the field doc).
     #[cfg(feature = "cortex")]
-    pub(super) fn rpc_reply_subscriptions_arc(&self) -> Arc<dashmap::DashSet<(u64, u64)>> {
+    pub(super) fn rpc_reply_subscriptions_arc(
+        &self,
+    ) -> Arc<dashmap::DashMap<(u64, u64), Arc<str>>> {
         self.rpc_reply_subscriptions.clone()
     }
 
@@ -13606,6 +13669,71 @@ mod heartbeat_aead_tests {
         );
     }
 
+    /// PERF_AUDIT §2.4 regression: a peer re-handshake replaces
+    /// the `PeerInfo` under the same node_id with a fresh session
+    /// (new session_id). The reverse index must evict the
+    /// displaced session_id's entry alongside installing the new
+    /// one — otherwise every re-handshake leaks one stale entry
+    /// forever (the `.filter` guard in dispatch makes stale
+    /// entries harmless for routing, but the map grows without
+    /// bound across rotations).
+    #[tokio::test]
+    async fn install_peer_replacement_evicts_displaced_reverse_index_entry() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x2Au8; 32]);
+        let node = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+
+        let peer_id = 0xFEED_F00Du64;
+        let peer_addr: SocketAddr = "10.2.2.2:9100".parse().unwrap();
+
+        let (first_keys, _) = make_session_keys();
+        let first_session_id = first_keys.session_id;
+        node.install_peer(
+            peer_id,
+            peer_addr,
+            first_keys,
+            AddrInstallMode::DirectOverwrite,
+        );
+        assert_eq!(
+            node.session_id_to_node.get(&first_session_id).map(|e| *e),
+            Some(peer_id),
+            "first install must populate the reverse index"
+        );
+
+        // Re-handshake: fresh keys → fresh session_id under the
+        // SAME node_id.
+        let (second_keys, _) = make_session_keys();
+        let second_session_id = second_keys.session_id;
+        assert_ne!(
+            first_session_id, second_session_id,
+            "fresh handshake must derive a distinct session_id"
+        );
+        node.install_peer(
+            peer_id,
+            peer_addr,
+            second_keys,
+            AddrInstallMode::DirectOverwrite,
+        );
+
+        assert_eq!(
+            node.session_id_to_node.get(&second_session_id).map(|e| *e),
+            Some(peer_id),
+            "replacement install must index the fresh session_id"
+        );
+        assert!(
+            !node.session_id_to_node.contains_key(&first_session_id),
+            "displaced session_id must be evicted from the reverse index — \
+             leaving it would leak one entry per re-handshake"
+        );
+        assert_eq!(
+            node.session_id_to_node.len(),
+            1,
+            "exactly one reverse-index entry per live peer session"
+        );
+    }
+
     /// Regression for BUG_AUDIT_2026_04_30_CORE.md #97: the
     /// production heartbeat path must (a) build with the
     /// session's actual TX key — not `&[0u8; 32]` — and (b) use a
@@ -14766,5 +14894,104 @@ mod route_cache_tests {
         let first = node.rpc_route_for_service("svc.cap.0000").unwrap();
         let second = node.rpc_route_for_service("svc.cap.0000").unwrap();
         assert!(Arc::ptr_eq(&first, &second));
+    }
+}
+
+#[cfg(test)]
+mod routed_forward_tests {
+    //! PERF_AUDIT §2.5 — the routed-forward branch of
+    //! `dispatch_packet` patches the routing header in place via
+    //! `try_into_mut` + `write_at` when the inbound `Bytes` is
+    //! sole-owned, and falls back to the legacy rebuild when a
+    //! clone is outstanding. Both branches MUST produce identical
+    //! wire bytes: the header re-serialized with the bumped
+    //! hop_count / decremented ttl, the body untouched.
+    use super::*;
+    use bytes::Bytes;
+
+    /// Replicates `dispatch_packet`'s forward-branch logic on a
+    /// synthetic routed packet, exercising BOTH match arms, and
+    /// asserts byte equality. A drift in `write_at` offsets (fast
+    /// path) versus `to_bytes` layout (slow path) — or a branch
+    /// forgetting `forward()` — fails here without standing up a
+    /// three-node mesh.
+    #[test]
+    fn forward_fast_and_slow_paths_produce_identical_wire_bytes() {
+        let header = RoutingHeader::new(0xDDDD_EEEE_FFFF_0001, 0xABCD_1234, 7);
+        let body: &[u8] = b"opaque-encrypted-inner-packet-bytes-not-touched-by-forwarding";
+        let mut packet = bytes::BytesMut::with_capacity(ROUTING_HEADER_SIZE + body.len());
+        packet.extend_from_slice(&header.to_bytes());
+        packet.extend_from_slice(body);
+        let original = packet.freeze();
+
+        // Parse the way dispatch_packet does, then forward().
+        let routing_header =
+            RoutingHeader::from_bytes(&original[..ROUTING_HEADER_SIZE]).expect("header parses");
+        let mut fwd_header = routing_header;
+        assert!(fwd_header.forward(), "ttl=7 must be forwardable");
+
+        // Slow path (refcount > 1): hold a clone so try_into_mut
+        // must fail, then rebuild like the Err arm.
+        let data_shared = original.clone();
+        let outstanding_clone = original.clone();
+        let slow = match data_shared.try_into_mut() {
+            Ok(_) => panic!("refcount > 1 must take the slow path"),
+            Err(orig_data) => {
+                let mut new_data = bytes::BytesMut::with_capacity(orig_data.len());
+                new_data.extend_from_slice(&fwd_header.to_bytes());
+                new_data.extend_from_slice(&orig_data[ROUTING_HEADER_SIZE..]);
+                new_data.freeze()
+            }
+        };
+        drop(outstanding_clone);
+
+        // Fast path (sole owner): in-place write_at.
+        let fast = match original.try_into_mut() {
+            Ok(mut mut_data) => {
+                fwd_header.write_at(&mut mut_data[..ROUTING_HEADER_SIZE]);
+                mut_data.freeze()
+            }
+            Err(_) => panic!("sole-owned Bytes must take the fast path"),
+        };
+
+        assert_eq!(
+            fast, slow,
+            "fast (in-place write_at) and slow (rebuild) forward paths must be wire-identical"
+        );
+        // Pin the semantic deltas: ttl decremented (byte 2),
+        // hop_count incremented (byte 3), body untouched.
+        let reparsed = RoutingHeader::from_bytes(&fast[..ROUTING_HEADER_SIZE]).unwrap();
+        assert_eq!(reparsed.ttl, 6, "forward() must decrement ttl");
+        assert_eq!(reparsed.hop_count, 1, "forward() must increment hop_count");
+        assert_eq!(reparsed.dest_id, routing_header.dest_id);
+        assert_eq!(reparsed.src_id, routing_header.src_id);
+        assert_eq!(
+            &fast[ROUTING_HEADER_SIZE..],
+            body,
+            "forwarding must never touch the encrypted body"
+        );
+    }
+
+    /// The fast path requires the inbound `Bytes` to be truly
+    /// sole-owned. A `Bytes` produced by `BytesMut::split()` whose
+    /// parent handle is still alive (the default `PacketReceiver`
+    /// shape — `recv_buf.split().freeze()` with `recv_buf`
+    /// retaining the allocation tail) is NOT unique, and must fall
+    /// back to the copying path rather than corrupt shared memory.
+    #[test]
+    fn split_with_live_parent_takes_slow_path() {
+        let mut parent = bytes::BytesMut::with_capacity(256);
+        parent.extend_from_slice(&RoutingHeader::new(1, 2, 3).to_bytes());
+        parent.extend_from_slice(b"body");
+        let child: Bytes = parent.split().freeze();
+        // `parent` still holds the allocation tail — the frozen
+        // child must not be considered unique.
+        assert!(
+            child.try_into_mut().is_err(),
+            "split().freeze() with the parent BytesMut alive must take the slow path — \
+             if this ever starts succeeding, re-evaluate PERF_AUDIT §2.2/§2.5: the \
+             in-place forward fast path would then fire on the default ingress too"
+        );
+        drop(parent);
     }
 }

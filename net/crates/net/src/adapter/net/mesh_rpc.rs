@@ -500,6 +500,36 @@ impl RpcStream {
     }
 }
 
+/// PERF_AUDIT §3.3 — auto-grant coalescing decision for
+/// [`RpcStream::poll_next`]. Accumulates one credit (the chunk
+/// that was just delivered to the consumer) into `pending` and
+/// returns `Some(amount)` when the accumulator reaches the flush
+/// threshold of `window / 2` (clamped to ≥ 1 so a window of 1
+/// degenerates to the pre-fix per-chunk cadence).
+///
+/// Liveness invariant (why no flush-on-drop / timer backstop is
+/// needed): the credits left pending never exceed
+/// `threshold - 1 < window`. The server starts with `window`
+/// credits and `credits = window - (sent - delivered) - pending`,
+/// so whenever the consumer has polled everything that was sent
+/// (the only state in which it could block waiting on the server),
+/// `credits = window - pending >= window - threshold + 1 >= 1` —
+/// the server can always make progress. A consumer that stops
+/// polling stalls the pump by design (that's flow control), and
+/// the chunks already buffered in the stream's mpsc are enough to
+/// carry `pending` across the threshold as soon as it resumes.
+fn accumulate_auto_grant(pending: &mut u32, window: u32) -> Option<u32> {
+    *pending = pending.saturating_add(1);
+    let threshold = (window / 2).max(1);
+    if *pending >= threshold {
+        let amount = *pending;
+        *pending = 0;
+        Some(amount)
+    } else {
+        None
+    }
+}
+
 /// Shared fire-and-forget GRANT-publish helper. Used by
 /// [`RpcStream::grant`] (explicit) and the auto-grant in
 /// [`RpcStream::poll_next`]. Same direct-unicast publish path as
@@ -561,14 +591,8 @@ impl futures::Stream for RpcStream {
                 // Callers needing finer cadence still have
                 // `RpcStream::grant` for explicit batches.
                 if let Some(window) = self.stream_window {
-                    self.grant_pending = self.grant_pending.saturating_add(1);
-                    // `window / 2` clamped to 1 so a window of 1
-                    // still grants per chunk (pre-fix behavior for
-                    // the degenerate case).
-                    let threshold = window.saturating_div(2).max(1);
-                    if self.grant_pending >= threshold {
-                        let amount = self.grant_pending;
-                        self.grant_pending = 0;
+                    let mut pending = self.grant_pending;
+                    if let Some(amount) = accumulate_auto_grant(&mut pending, window) {
                         spawn_grant_publish(
                             Arc::clone(&self.mesh),
                             self.target_node_id,
@@ -579,6 +603,7 @@ impl futures::Stream for RpcStream {
                             amount,
                         );
                     }
+                    self.grant_pending = pending;
                 }
                 self.observer.add_response_bytes(body.len() as u32);
                 std::task::Poll::Ready(Some(Ok(body)))
@@ -3659,18 +3684,19 @@ impl MeshNode {
         reply_hash: ChannelHash,
     ) -> Result<(), RpcError> {
         let registry = self.rpc_reply_subscriptions_arc();
-        // PERF_AUDIT §3.5 — DashSet<(u64, u64)> keyed by
+        // PERF_AUDIT §3.5 — DashMap keyed by
         // `(target, xxh3_64(service))`. Pre-fix this was a global
         // `Mutex<Vec<(u64, String)>>` that every concurrent RPC
         // caller took on every call to scan the Vec with a String
         // compare per entry — all callers serialized on it. Now the
-        // hot path is `contains`, a shard-local read, and the key
-        // pair is `Copy` so no allocation happens in the check.
+        // hot path is one shard-local read with a single String
+        // compare against the slot's stored service name (xxh3 is
+        // not collision-free; see `reply_subscription_covers`).
         let service_hash = xxhash_rust::xxh3::xxh3_64(service.as_bytes());
-        if registry.contains(&(target_node_id, service_hash)) {
+        if reply_subscription_covers(&registry, target_node_id, service_hash, service) {
             return Ok(());
         }
-        // Cap the registry. `len()` on DashSet is approximate under
+        // Cap the registry. `len()` on DashMap is approximate under
         // concurrent churn (it sums shard counts under shard reads,
         // not a global lock), which is exactly the semantics we
         // want here — the cap is a soft guard against a runaway
@@ -3730,15 +3756,40 @@ impl MeshNode {
         }
 
         let _ = reply_hash; // captured into the dispatcher above; surfaced for debug
-        // `insert` is idempotent under DashSet semantics — a
-        // concurrent caller that beat us to it returns `false` and
-        // we're still in the right state. Cap drift past
-        // MAX_REPLY_SUBSCRIPTIONS during a concurrent insert race
-        // is bounded by the number of concurrent callers, which
-        // operators tune separately.
-        registry.insert((target_node_id, service_hash));
+        // `insert` is idempotent — a concurrent caller that beat us
+        // to it just overwrote the slot with the identical value.
+        // On a genuine xxh3 collision between two service names on
+        // the same target, the slot flips to whichever service
+        // subscribed last and the other re-subscribes on its next
+        // call (idempotent, correct, merely un-cached). Cap drift
+        // past MAX_REPLY_SUBSCRIPTIONS during a concurrent insert
+        // race is bounded by the number of concurrent callers,
+        // which operators tune separately.
+        registry.insert((target_node_id, service_hash), Arc::from(service));
         Ok(())
     }
+}
+
+/// PERF_AUDIT §3.5 — hot-path membership check for the
+/// reply-subscription registry. Returns `true` only when the slot
+/// for `(target, xxh3(service))` exists AND the stored service
+/// name matches exactly. xxh3_64 is neither collision-free nor
+/// cryptographic; a hash-only hit that skipped the subscribe for
+/// a *different* service would silently drop that service's
+/// replies — the reply channel name embeds the service, so being
+/// in the target's roster for the colliding service's channel
+/// does nothing for this one. Verifying the stored name turns a
+/// collision into a per-call re-subscribe (idempotent, harmless)
+/// instead of a correctness bug.
+fn reply_subscription_covers(
+    registry: &dashmap::DashMap<(u64, u64), Arc<str>>,
+    target_node_id: u64,
+    service_hash: u64,
+    service: &str,
+) -> bool {
+    registry
+        .get(&(target_node_id, service_hash))
+        .is_some_and(|entry| entry.value().as_ref() == service)
 }
 
 /// Hard cap on the number of distinct (target_node_id, service)
@@ -3754,80 +3805,66 @@ pub const MAX_REPLY_SUBSCRIPTIONS: usize = 1024;
 /// this value; any session peer with publish access to the reply
 /// channel could ship a forged RESPONSE if it could guess the
 /// value. Sequential u64s are predictable from any peer that
-/// observes a single allocation; random u64s with even modest
-/// entropy collide with 2^-64 probability per call and are
-/// unpredictable to observing peers.
+/// observes a single allocation; random u64s collide with 2^-64
+/// probability per call and are unpredictable to observing peers.
 ///
-/// **PERF_AUDIT §3.8** — pre-fix this called `getrandom::fill` per
-/// RPC — one OS entropy syscall per call (BCryptGenRandom on
-/// Windows, ~200-400 ns; somewhat cheaper on Linux). With a hot
-/// caller doing thousands of RPCs/sec this was meaningful
-/// per-call latency for what is fundamentally a one-time-seed-
-/// then-stream problem. Now a thread-local SplitMix64 PRNG is
-/// seeded once from `getrandom` and streams 64 bits per call. The
-/// threat model (audit phrasing: "unpredictability to peers") is
-/// satisfied because SplitMix64 is not invertible without knowing
-/// the seed, and the seed is process-private (never leaves this
-/// thread, never crosses the wire). It is NOT cryptographically
-/// strong against state-recovery attacks; for that we'd need
-/// e.g. ChaCha, which would be a heavier swap with no additional
-/// payoff under the stated threat model.
+/// **PERF_AUDIT §3.8** — pre-fix this called `getrandom::fill` for
+/// 8 bytes per RPC — one OS entropy syscall per call
+/// (BCryptGenRandom on Windows, ~200-400 ns; somewhat cheaper on
+/// Linux). Now each thread refills a small pool of raw OS entropy
+/// ([`CALL_ID_ENTROPY_POOL_BYTES`]) with a single `getrandom`
+/// syscall and hands out 8 bytes per call, amortizing the syscall
+/// across [`CALL_ID_ENTROPY_POOL_BYTES`]/8 mints.
 ///
-/// Falls back to a zero call_id if the initial seed fails — that
+/// Every minted id is still raw OS entropy — NOT the output of a
+/// userspace PRNG — so the unpredictability-to-peers property is
+/// byte-for-byte identical to the pre-§3.8 per-call fill. (An
+/// earlier draft of this fix streamed ids from a thread-local
+/// SplitMix64; that was unsound for this threat model: call_ids
+/// are sent to callees by design, and SplitMix64's output
+/// finalizer is a public bijection, so a single observed id
+/// reveals the generator state and with it every FUTURE call_id
+/// minted on that thread — letting one callee forge responses to
+/// races on calls addressed to other peers. Raw pooled entropy
+/// has no such state to recover.)
+///
+/// Falls back to a zero call_id if the pool refill fails — that
 /// effectively disables correlation for this call (the oneshot
 /// will time out) rather than panic, but in practice
 /// `getrandom::fill` failure is a fatal-environment signal (no
 /// `/dev/urandom`, broken syscall) and the broader stack won't be
-/// functional anyway.
+/// functional anyway. The pool cursor is left exhausted so the
+/// next mint retries the refill.
 fn mint_random_call_id() -> u64 {
     thread_local! {
-        // `Option` so we can lazily seed on the first call without
-        // paying `getrandom` cost at thread startup. `RefCell`
-        // because the next_u64 step is `&mut self`; `Cell` would
-        // need `Copy` and `SplitMix64` is.
-        static CALL_ID_RNG: std::cell::Cell<Option<SplitMix64>> = const {
-            std::cell::Cell::new(None)
+        // (pool, cursor). Cursor starts exhausted so the first
+        // mint on each thread performs the initial refill.
+        static CALL_ID_ENTROPY_POOL: std::cell::RefCell<([u8; CALL_ID_ENTROPY_POOL_BYTES], usize)> = const {
+            std::cell::RefCell::new(([0u8; CALL_ID_ENTROPY_POOL_BYTES], CALL_ID_ENTROPY_POOL_BYTES))
         };
     }
-    CALL_ID_RNG.with(|cell| {
-        let mut rng = match cell.get() {
-            Some(rng) => rng,
-            None => {
-                let mut seed = [0u8; 8];
-                if getrandom::fill(&mut seed).is_err() {
-                    return 0;
-                }
-                SplitMix64 {
-                    state: u64::from_le_bytes(seed),
-                }
+    CALL_ID_ENTROPY_POOL.with(|cell| {
+        let mut pool = cell.borrow_mut();
+        let (buf, cursor) = &mut *pool;
+        if *cursor >= CALL_ID_ENTROPY_POOL_BYTES {
+            if getrandom::fill(buf).is_err() {
+                return 0;
             }
-        };
-        let v = rng.next_u64();
-        cell.set(Some(rng));
-        v
+            *cursor = 0;
+        }
+        let mut id = [0u8; 8];
+        id.copy_from_slice(&buf[*cursor..*cursor + 8]);
+        *cursor += 8;
+        u64::from_le_bytes(id)
     })
 }
 
-/// SplitMix64 PRNG — single-`u64` state, well-distributed output,
-/// invertibility against an observer who knows the state but not
-/// the constants is irrelevant for our threat model (the state
-/// never leaves the local thread). Used as the backing PRNG for
-/// [`mint_random_call_id`].
-#[derive(Copy, Clone)]
-struct SplitMix64 {
-    state: u64,
-}
-
-impl SplitMix64 {
-    #[inline]
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-}
+/// Per-thread OS-entropy pool size for [`mint_random_call_id`].
+/// 64 ids (512 bytes) per `getrandom` syscall — the syscall cost
+/// is dominated by the fixed kernel round-trip, so batching 64
+/// mints recovers ~98% of the per-call overhead while keeping the
+/// amount of buffered future-id entropy per thread small.
+const CALL_ID_ENTROPY_POOL_BYTES: usize = 64 * 8;
 
 // ============================================================================
 // Internal: tiny shims so the `serve_rpc` / `call` impls stay
@@ -4030,83 +4067,163 @@ mod origin_cache_tests {
         assert_eq!(cache.get(0), None);
     }
 
-    /// PERF_AUDIT §3.8 — `mint_random_call_id` minutes thousands of
-    /// values from one seed, all of which must be distinct in
-    /// practice (a duplicate would let two in-flight calls collide
-    /// on the per-Mesh pending map). Run a tight loop, assert no
-    /// collisions across 100k samples — far below the 2^32
-    /// birthday-paradox boundary, so a regression that collapsed
-    /// the stream onto a small period would fail loudly.
+    /// PERF_AUDIT §3.8 — `mint_random_call_id` mints thousands of
+    /// values from the pooled-entropy path, all of which must be
+    /// distinct in practice (a duplicate would let two in-flight
+    /// calls collide on the per-Mesh pending map). 100k samples is
+    /// far below the 2^32 birthday-paradox boundary, so a
+    /// regression that recycled pool bytes (cursor mis-advance,
+    /// missed refill) would fail loudly. The loop also crosses the
+    /// pool-refill boundary thousands of times (pool holds 64 ids),
+    /// pinning the refill/cursor arithmetic.
     #[test]
     fn mint_random_call_id_produces_distinct_values_across_thousands_of_calls() {
         let mut seen = std::collections::HashSet::with_capacity(100_000);
         for _ in 0..100_000 {
             let id = super::mint_random_call_id();
             // 0 is the fallback sentinel — should not appear under
-            // a working `getrandom` seed.
+            // a working `getrandom` refill.
             assert_ne!(id, 0, "fallback-zero path triggered unexpectedly");
             assert!(seen.insert(id), "duplicate call_id minted: {:#x}", id);
         }
     }
 
-    /// PERF_AUDIT §3.8 — SplitMix64 must produce well-distributed
-    /// output: count set-bits across 10k samples and assert the
-    /// fraction is near 0.5. A pathological PRNG that always
-    /// returned 0 or u64::MAX would fail this; a properly mixed
-    /// 64-bit output has expected ~0.5 set bits per sample with
-    /// O(1/sqrt(N)) tolerance.
+    /// PERF_AUDIT §3.8 — minted ids are raw OS entropy: count
+    /// set-bits across 10k mints and assert the fraction is near
+    /// 0.5. A pool-management bug that handed out the zeroed
+    /// initial buffer (or re-served a stale window) would skew
+    /// this hard; properly random 64-bit ids have expected ~0.5
+    /// set bits per sample with O(1/sqrt(N)) tolerance.
     #[test]
-    fn split_mix64_set_bit_density_is_balanced() {
-        let mut rng = super::SplitMix64 {
-            state: 0xDEAD_BEEF_FEED_FACE,
-        };
+    fn mint_random_call_id_set_bit_density_is_balanced() {
         let n = 10_000u64;
         let mut total_set: u64 = 0;
         for _ in 0..n {
-            total_set += rng.next_u64().count_ones() as u64;
+            total_set += super::mint_random_call_id().count_ones() as u64;
         }
         let bits_total = n * 64;
         let fraction = total_set as f64 / bits_total as f64;
         // Expected 0.5; tolerance generous (~3σ) to keep the test
-        // reliable while still catching collapsed-stream regressions.
+        // reliable while still catching collapsed-pool regressions.
         assert!(
             (fraction - 0.5).abs() < 0.02,
-            "set-bit density {} is too far from 0.5 — stream may be biased",
+            "set-bit density {} is too far from 0.5 — pool may be mismanaged",
             fraction
         );
     }
 
     /// PERF_AUDIT §3.5 — the reply-subscription registry's hot
-    /// path must be a `(target, xxh3(service))` lookup against a
-    /// `DashSet`, not a `Mutex<Vec<(u64, String)>>` linear scan.
-    /// Pin the contract:
-    /// 1. distinct (target, service) pairs are distinct keys, even
-    ///    if they happen to xxh3-collide on `service` between two
-    ///    different targets — keying by the pair guards against
-    ///    a same-service multi-target false-positive;
-    /// 2. same (target, service) pair is idempotent — `insert`
-    ///    returns false on the second call, and the contains
-    ///    fast-path returns true;
-    /// 3. the cap is enforced via `len()`, not a separate
-    ///    counter that could drift.
+    /// path must be a `(target, xxh3(service))` lookup, not a
+    /// `Mutex<Vec<(u64, String)>>` linear scan. Pin the contract
+    /// via `reply_subscription_covers` (the exact hot-path check):
+    /// 1. distinct (target, service) pairs are distinct keys —
+    ///    same service against two targets, and two services
+    ///    against one target, never alias;
+    /// 2. repeat insert of the same pair is idempotent and the
+    ///    fast path keeps answering `true`;
+    /// 3. an xxh3 COLLISION (same hash, different service name)
+    ///    must NOT count as covered — a false positive here would
+    ///    skip a needed subscribe and silently drop the colliding
+    ///    service's replies. The stored-name verification turns it
+    ///    into a re-subscribe instead;
+    /// 4. the cap is enforced via `len()`, not a separate counter
+    ///    that could drift.
     #[test]
     fn reply_subscriptions_keyed_by_target_and_service_hash() {
-        use dashmap::DashSet;
-        let registry: DashSet<(u64, u64)> = DashSet::new();
+        use dashmap::DashMap;
+        let registry: DashMap<(u64, u64), Arc<str>> = DashMap::new();
         let h_a = xxhash_rust::xxh3::xxh3_64(b"svc-a");
         let h_b = xxhash_rust::xxh3::xxh3_64(b"svc-b");
         // Same target, different services → distinct entries.
-        assert!(registry.insert((0xAA, h_a)));
-        assert!(registry.insert((0xAA, h_b)));
-        assert!(registry.contains(&(0xAA, h_a)));
-        assert!(registry.contains(&(0xAA, h_b)));
+        registry.insert((0xAA, h_a), Arc::from("svc-a"));
+        registry.insert((0xAA, h_b), Arc::from("svc-b"));
+        assert!(super::reply_subscription_covers(&registry, 0xAA, h_a, "svc-a"));
+        assert!(super::reply_subscription_covers(&registry, 0xAA, h_b, "svc-b"));
         // Same service, different targets → distinct entries.
-        assert!(registry.insert((0xBB, h_a)));
-        assert!(registry.contains(&(0xBB, h_a)));
-        // Idempotent — repeat insert is a no-op, contains stays true.
-        assert!(!registry.insert((0xAA, h_a)));
-        assert!(registry.contains(&(0xAA, h_a)));
+        assert!(!super::reply_subscription_covers(&registry, 0xBB, h_a, "svc-a"));
+        registry.insert((0xBB, h_a), Arc::from("svc-a"));
+        assert!(super::reply_subscription_covers(&registry, 0xBB, h_a, "svc-a"));
+        // Idempotent — repeat insert overwrites with the identical
+        // value; the fast path keeps answering true.
+        registry.insert((0xAA, h_a), Arc::from("svc-a"));
+        assert!(super::reply_subscription_covers(&registry, 0xAA, h_a, "svc-a"));
         assert_eq!(registry.len(), 3);
+        // xxh3 collision: "svc-evil" hashing to h_a (forced here —
+        // xxh3_64 collisions are computable offline since the hash
+        // isn't cryptographic) must NOT cover "svc-a"'s slot, and
+        // vice versa. The hash-only DashSet shape this replaced
+        // answered `true` and silently skipped the subscribe.
+        assert!(
+            !super::reply_subscription_covers(&registry, 0xAA, h_a, "svc-evil"),
+            "hash collision must not satisfy the membership check for a \
+             different service name"
+        );
+        // After the colliding service legitimately subscribes (slot
+        // overwritten), the original service degrades to
+        // re-subscribe — covered must flip to false for it, never
+        // silently true for both.
+        registry.insert((0xAA, h_a), Arc::from("svc-evil"));
+        assert!(super::reply_subscription_covers(&registry, 0xAA, h_a, "svc-evil"));
+        assert!(!super::reply_subscription_covers(&registry, 0xAA, h_a, "svc-a"));
+    }
+
+    /// PERF_AUDIT §3.3 — grant-stall backstop check for the
+    /// window/2 auto-grant coalescing. Simulates the full
+    /// credit loop for every window 1..=64: the server starts
+    /// with `window` credits and consumes one per chunk; the
+    /// client accumulates via `accumulate_auto_grant` and only
+    /// flushes at the threshold. Asserts:
+    /// 1. liveness — an actively-polling consumer never observes
+    ///    the server starved (credits exhausted with nothing left
+    ///    to poll), i.e. withholding sub-threshold credits cannot
+    ///    deadlock the stream and no timer/drop backstop is needed;
+    /// 2. coalescing — grant-packet count stays at
+    ///    ~chunks / (window/2), and is strictly fewer than one
+    ///    grant per chunk once window ≥ 4 (the integration suite
+    ///    only exercises window=2, whose threshold degenerates
+    ///    to per-chunk).
+    #[test]
+    fn auto_grant_coalescing_never_starves_the_server_pump() {
+        for window in 1u32..=64 {
+            let chunks = 1_000u32;
+            let mut server_credits = window as u64;
+            let mut pending = 0u32;
+            let mut sent = 0u32;
+            let mut delivered = 0u32;
+            let mut grants = 0u32;
+            while delivered < chunks {
+                // Server pump: send while credits remain.
+                while server_credits > 0 && sent < chunks {
+                    server_credits -= 1;
+                    sent += 1;
+                }
+                assert!(
+                    sent > delivered,
+                    "window {window}: server starved while the consumer is actively \
+                     polling (credits {server_credits}, pending {pending}, \
+                     sent {sent}, delivered {delivered})"
+                );
+                // Consumer polls exactly one chunk.
+                delivered += 1;
+                if let Some(amount) = super::accumulate_auto_grant(&mut pending, window) {
+                    grants += 1;
+                    server_credits += amount as u64;
+                }
+            }
+            let threshold = (window / 2).max(1);
+            assert!(
+                grants <= chunks / threshold + 1,
+                "window {window}: {grants} grant packets exceeds the \
+                 coalesced cadence bound of {}",
+                chunks / threshold + 1
+            );
+            if window >= 4 {
+                assert!(
+                    grants < chunks,
+                    "window {window}: coalescing must emit fewer grants than chunks"
+                );
+            }
+        }
     }
 
     /// `get` promotes to most-recently-used, so a touched entry outlives an

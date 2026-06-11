@@ -770,10 +770,12 @@ impl ReliabilityMode for ReliableStream {
                 // `remove(idx)` is O(min(idx, len - idx)) — at most
                 // STRAGGLER_LOOKAHEAD = 32 element shifts, bounded
                 // and independent of total window size.
-                let u = self
-                    .pending
-                    .remove(idx)
-                    .expect("idx < len verified by the while guard");
+                let Some(u) = self.pending.remove(idx) else {
+                    // Unreachable: `idx < self.pending.len()` is
+                    // verified by the while guard. Bail rather
+                    // than panic if it ever ceases to hold.
+                    break;
+                };
                 if u.retries == 0 {
                     sample = Some(now.duration_since(u.sent_at));
                 }
@@ -1211,6 +1213,50 @@ mod tests {
         mode.on_ack(6);
         let remaining_seqs: Vec<u64> = mode.pending.iter().map(|u| u.seq()).collect();
         assert_eq!(remaining_seqs, vec![7, 6]);
+    }
+
+    /// PERF_AUDIT §3.4 — a straggler displaced beyond the
+    /// 32-element look-ahead is MISSED by the ACK that covers it
+    /// (the bounded sweep is the whole point), but must self-heal:
+    /// once the newer packets ahead of it are acked and drained by
+    /// the pop-front fast path, the straggler migrates into the
+    /// look-ahead window and the next ACK sweeps it. The transient
+    /// cost is at most one spurious RTO retransmit; what this test
+    /// guards against is the *permanent* leak (straggler pinned in
+    /// `pending` forever → repeated spurious retransmits and an
+    /// eventual false `failed` via max_retries exhaustion).
+    #[test]
+    fn on_ack_straggler_beyond_lookahead_self_heals_on_later_ack() {
+        // Window sized above the 41 tracked packets so the on_send
+        // eviction path (max_pending) stays out of the picture.
+        let mut mode = ReliableStream::with_settings(Duration::from_millis(50), 100, 3);
+        // 40 newer packets first (seqs 1..=40), then the straggler
+        // (seq 0) at index 40 — past the 32-element look-ahead.
+        for i in 1..=40u64 {
+            mode.on_send(descriptor(i, Bytes::from(format!("p{i}"))));
+        }
+        mode.on_send(descriptor(0, Bytes::from_static(b"straggler")));
+        assert_eq!(mode.pending.len(), 41);
+
+        // ACK covering only the straggler (ack_seq = 1 → seq 0 is
+        // acked). Front is seq 1 (>= 1, no pop); the sweep stops at
+        // index 31; seq 0 sits at index 40 — missed, still pending.
+        mode.on_ack(1);
+        assert_eq!(
+            mode.pending.len(),
+            41,
+            "straggler beyond the look-ahead is expected to survive this ACK"
+        );
+
+        // ACK covering everything: pop-front drains seqs 1..=40,
+        // which moves the straggler to index 0 — well inside the
+        // look-ahead — and the sweep collects it.
+        mode.on_ack(41);
+        assert!(
+            mode.pending.is_empty(),
+            "straggler must be swept once the packets ahead of it drain: {:?}",
+            mode.pending.iter().map(|u| u.seq()).collect::<Vec<_>>()
+        );
     }
 
     #[test]

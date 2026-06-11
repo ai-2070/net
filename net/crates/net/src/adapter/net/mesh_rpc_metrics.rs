@@ -842,6 +842,54 @@ mod tests {
         );
     }
 
+    /// PERF_AUDIT §3.2 — partition-point edge cases must match the
+    /// legacy cumulative `<=` semantics exactly:
+    ///   - an observation EQUAL to a finite bound belongs in that
+    ///     bound's bucket (legacy `secs <= le` counted it there);
+    ///   - an observation ABOVE the largest finite bound belongs
+    ///     only in the `+Inf` terminal slot.
+    /// 5 ms divides exactly: `5e6 / 1e9` rounds to the same f64 as
+    /// the literal `0.005`, so this genuinely exercises the `==`
+    /// boundary of the `<=` comparison.
+    #[test]
+    fn histogram_edge_cases_match_legacy_cumulative_semantics() {
+        let r = RpcMetricsRegistry::new();
+        let m = r.for_service("edge-pin");
+        // Exactly on the first finite bound (0.005s).
+        m.record_latency(Duration::from_millis(5));
+        // Beyond the largest finite bound (10s).
+        m.record_latency(Duration::from_secs(30));
+
+        let raw: Vec<u64> = m
+            .latency_buckets
+            .iter()
+            .map(|b| b.load(Ordering::Relaxed))
+            .collect();
+        assert_eq!(
+            raw[0], 1,
+            "exact-bound observation must land in its own bucket, not the next: {:?}",
+            raw
+        );
+        assert_eq!(
+            raw[N_BUCKETS - 1],
+            1,
+            "over-largest-bound observation must land in +Inf only: {:?}",
+            raw
+        );
+        assert_eq!(raw.iter().sum::<u64>(), 2, "one slot per observation: {:?}", raw);
+
+        let snap = r.snapshot();
+        let s = &snap.services[0];
+        assert_eq!(s.latency_count, 2);
+        assert_eq!(s.latency_buckets[0], 1, "cumulative ≤5ms includes the ==5ms obs");
+        let last_finite = DEFAULT_LATENCY_BUCKETS_SECS.len() - 1;
+        assert_eq!(
+            s.latency_buckets[last_finite], 1,
+            "cumulative ≤10s excludes the 30s obs"
+        );
+        assert_eq!(s.latency_buckets[N_BUCKETS - 1], 2, "+Inf == count");
+    }
+
     #[test]
     fn prometheus_text_emits_canonical_metric_names() {
         let r = RpcMetricsRegistry::new();

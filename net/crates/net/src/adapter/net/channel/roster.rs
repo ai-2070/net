@@ -588,6 +588,51 @@ mod tests {
         assert_eq!(r.channel_count(), 0);
     }
 
+    /// PERF_AUDIT §3.6 — the round-robin index is computed against
+    /// the SAME loaded snapshot it indexes (`cursor % snapshot.len()`
+    /// then `snapshot[idx]`), so a membership shrink between two
+    /// selects can never go out of bounds, and a member removed via
+    /// `remove` is never selected once the call returns (the
+    /// ArcSwap store happens synchronously under the write lock).
+    /// Also pins the insert/remove idempotency contracts inherited
+    /// from the pre-fix DashSet shape.
+    #[test]
+    fn queue_group_select_survives_membership_shrink() {
+        let grp = QueueGroup::new();
+        for id in 1..=5u64 {
+            assert!(grp.insert(id));
+        }
+        // Drive the cursor well past the member count.
+        for _ in 0..23 {
+            assert!(grp.select().is_some());
+        }
+        // Shrink to one member; the cursor is far beyond the new
+        // length — select must keep returning the lone member.
+        for id in 1..=4u64 {
+            assert!(grp.remove(&id));
+        }
+        for _ in 0..7 {
+            assert_eq!(grp.select(), Some(5));
+        }
+        // Idempotency: re-insert of a present id and remove of an
+        // absent id are no-ops.
+        assert!(!grp.insert(5));
+        assert!(!grp.remove(&1));
+        // Empty group: select yields None, is_empty flips.
+        assert!(grp.remove(&5));
+        assert!(grp.is_empty());
+        assert_eq!(grp.select(), None);
+        // Re-grow: one full rotation selects every member exactly
+        // once (three consecutive cursor values cover all three
+        // indices modulo 3).
+        for id in [10u64, 20, 30] {
+            assert!(grp.insert(id));
+        }
+        let mut seen: Vec<u64> = (0..3).map(|_| grp.select().unwrap()).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![10, 20, 30]);
+    }
+
     #[test]
     fn test_remove_peer_evicts_everywhere() {
         let r = SubscriberRoster::new();

@@ -213,6 +213,14 @@ use transport::NetSocket as Socket;
 // Re-export xxh3 utilities for stream routing
 pub use routing::{route_to_shard, stream_id_from_bytes, stream_id_from_key};
 
+/// Threshold below which the cached coarse-clock reading is reused
+/// instead of re-reading the OS wall clock. 1 ms is well below the
+/// session-timeout / heartbeat / NACK cadence the consumers care
+/// about (those tick on the seconds scale), and well above the
+/// `Instant::now` cost (~10 ns) we still pay per call to gate the
+/// cache. Per PERF_AUDIT §2.7.
+const COARSE_CLOCK_REFRESH_NS: u64 = 1_000_000; // 1 ms
+
 /// Current timestamp in nanoseconds since the Unix epoch.
 ///
 /// Shared utility — avoids duplicating this across `causal.rs`, `snapshot.rs`,
@@ -228,14 +236,13 @@ pub use routing::{route_to_shard, stream_id_from_bytes, stream_id_from_key};
 /// everywhere. `unwrap_or_default()` returning `Duration::ZERO`
 /// for a pre-epoch clock would also produce identical timestamps
 /// that break ordering.
-/// Threshold below which the cached coarse-clock reading is reused
-/// instead of re-reading the OS wall clock. 1 ms is well below the
-/// session-timeout / heartbeat / NACK cadence the consumers care
-/// about (those tick on the seconds scale), and well above the
-/// `Instant::now` cost (~10 ns) we still pay per call to gate the
-/// cache. Per PERF_AUDIT §2.7.
-const COARSE_CLOCK_REFRESH_NS: u64 = 1_000_000; // 1 ms
-
+///
+/// Coarse-clock cached per thread at [`COARSE_CLOCK_REFRESH_NS`]
+/// granularity (PERF_AUDIT §2.7) — readings may be up to 1 ms
+/// stale, and two threads may disagree by up to that much.
+/// Consumers doing timeout arithmetic MUST use `saturating_sub`
+/// (they all do today) so a reader with a staler cache than the
+/// toucher can't wrap and false-expire.
 #[inline]
 pub(crate) fn current_timestamp() -> u64 {
     // **PERF_AUDIT §2.7.** Per-packet RX/TX paths each call
@@ -1333,11 +1340,18 @@ mod tests {
         // Burst of N reads in well under 1 ms: every return value
         // must equal the first. Pre-fix every call paid a
         // wall-clock syscall and could differ by ns.
-        let first = current_timestamp();
-        let mut all_same = true;
-        for _ in 0..100 {
-            if current_timestamp() != first {
-                all_same = false;
+        //
+        // Retried a few times: a >1 ms OS preemption in the middle
+        // of the burst legitimately rolls the refresh window and
+        // changes the value, so a single noisy attempt must not
+        // flake CI. With a working cache, one clean attempt is
+        // near-certain; with the cache broken, 100 identical
+        // wall-clock ns readings are unobtainable in any attempt.
+        let mut all_same = false;
+        for _attempt in 0..5 {
+            let first = current_timestamp();
+            all_same = (0..100).all(|_| current_timestamp() == first);
+            if all_same {
                 break;
             }
         }
