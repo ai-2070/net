@@ -1746,7 +1746,7 @@ mod tests {
     #[test]
     fn build_subprotocol_roundtrips_through_decrypt_with_in_place_framing() {
         let key = [0x99u8; 32];
-        let session_id = 0xC0FFEE_BABE_u64;
+        let session_id = 0x00C0_FFEE_BABE_u64;
         let pool = ThreadLocalPool::new(2, &key, session_id);
         let mut builder = pool.get();
 

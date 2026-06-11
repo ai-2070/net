@@ -848,6 +848,7 @@ mod tests {
     ///     bound's bucket (legacy `secs <= le` counted it there);
     ///   - an observation ABOVE the largest finite bound belongs
     ///     only in the `+Inf` terminal slot.
+    ///
     /// 5 ms divides exactly: `5e6 / 1e9` rounds to the same f64 as
     /// the literal `0.005`, so this genuinely exercises the `==`
     /// boundary of the `<=` comparison.
