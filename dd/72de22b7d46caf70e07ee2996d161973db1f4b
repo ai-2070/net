@@ -1,0 +1,26 @@
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  s_58168e769adc91::t_9675518d554cd6 512
+net/crates/net/src/adapter/net/cortex/meta.rs
+  s_58168e769adc91::t_681e854aadf34b 20-27
+  s_58168e769adc91::t_791412b6bf3c28 136-138
+  s_58168e769adc91::t_2b51f1fa811d94 99,103-111
+  s_58168e769adc91::t_682598d4d5b872 156
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  s_58168e769adc91::t_30e2bfdd8a1b58 462
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "dd72de22b7d46caf70e07ee2996d161973db1f4b",
+  "prompts": {},
+  "sessions": {
+    "s_58168e769adc91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "43399f81-fab3-4b2a-a002-4ece8a909069",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
