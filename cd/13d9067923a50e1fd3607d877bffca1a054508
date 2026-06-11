@@ -1,0 +1,45 @@
+net/crates/net/src/adapter/net/cortex/memories/watch.rs
+  s_58168e769adc91::t_dc7cfeb86f79ce 216
+  s_58168e769adc91::t_731eedc71fe2a6 204-213,215,217-219,232-233
+  s_58168e769adc91::t_42080365ba905d 243-299
+net/crates/net/src/adapter/net/redex/disk.rs
+  s_58168e769adc91::t_f04d117424997d 845-846,848-857,859,861-862
+net/crates/net/src/adapter/net/redex/replication.rs
+  s_58168e769adc91::t_a47f784a73b72d 976-1022
+net/crates/net/src/adapter/net/redex/replication_catchup.rs
+  s_58168e769adc91::t_7b47de55a92b12 347-355
+  s_58168e769adc91::t_3fbb432d0eb2d3 1361-1510
+  s_58168e769adc91::t_7cd6daa75fcb4a 59-67
+  s_58168e769adc91::t_69d00905e44930 287
+  s_58168e769adc91::t_a1dd58b13d6324 247-253,259
+net/crates/net/src/adapter/net/redex/file.rs
+  s_58168e769adc91::t_122ba1a5760acb 2090-2122
+  s_58168e769adc91::t_f094c1d2904be8 2053,2061,2066,2071
+  s_58168e769adc91::t_d00163eb2954a8 1103-1105,1107,1112-1120,1133,1149
+net/crates/net/tests/integration_cortex_memories.rs
+  s_58168e769adc91::t_7b196672670458 1016-1123
+  s_58168e769adc91::t_f44ab56d082e6e 12-14
+net/crates/net/src/adapter/net/cortex/tasks/watch.rs
+  s_58168e769adc91::t_04127e9a1600a6 167-170,172,174-176,189-190
+  s_58168e769adc91::t_684e0259c77be7 173
+  s_58168e769adc91::t_2604fc58fc64b8 200-245
+net/crates/net/tests/integration_cortex_tasks.rs
+  s_58168e769adc91::t_1f9c630e8fdce2 12-14
+  s_58168e769adc91::t_14093d3d6bdb47 1222-1264
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "cd13d9067923a50e1fd3607d877bffca1a054508",
+  "prompts": {},
+  "sessions": {
+    "s_58168e769adc91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "43399f81-fab3-4b2a-a002-4ece8a909069",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
