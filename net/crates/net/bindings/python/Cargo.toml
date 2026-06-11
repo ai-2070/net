@@ -147,7 +147,7 @@ async-trait = { version = "0.1", optional = true }
 postcard = { version = "1", default-features = false, features = ["alloc"], optional = true }
 
 [build-dependencies]
-pyo3-build-config = "0.28.0"
+pyo3-build-config = "0.29.0"
 
 # `[profile.release]` intentionally omitted — cargo ignores non-root
 # profiles ("profiles for the non root package will be ignored"). The
