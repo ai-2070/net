@@ -1326,13 +1326,30 @@ impl Predicate {
     /// allocate, but the typical case avoids both the Vec alloc
     /// and the redundant cost recompute.
     fn eval_all_in_cost_order(children: &[Predicate], ctx: &EvalContext<'_>) -> bool {
+        // First false wins; vacuously true — `.all()` semantics.
+        Self::eval_in_cost_order(children, ctx, false)
+    }
+
+    /// Shared planner core for the And/Or cost-ordered walks.
+    /// Walks `children` cheapest-first; the first child that
+    /// evaluates to `stop_on` short-circuits and returns
+    /// `stop_on`; if none does, returns `!stop_on`. And-semantics
+    /// = `stop_on == false` (first false wins, vacuously true);
+    /// Or-semantics = `stop_on == true` (first true wins,
+    /// vacuously false).
+    ///
+    /// Sort key is `(cost, index)` — the index tiebreak keeps
+    /// equal-cost children in declaration order, matching the
+    /// pre-§4.7 STABLE `sort_by_key` exactly (an unstable sort
+    /// on cost alone would reorder ties). Evaluation is pure so
+    /// results can't differ, but the deterministic walk order
+    /// keeps timing/short-circuit behavior reproducible.
+    fn eval_in_cost_order(
+        children: &[Predicate],
+        ctx: &EvalContext<'_>,
+        stop_on: bool,
+    ) -> bool {
         const STACK_CAP: usize = 8;
-        // Sort key is `(cost, index)` — the index tiebreak keeps
-        // equal-cost children in declaration order, matching the
-        // pre-fix STABLE `sort_by_key` exactly (an unstable sort
-        // on cost alone would reorder ties). Evaluation is pure so
-        // results can't differ, but the deterministic walk order
-        // keeps timing/short-circuit behavior reproducible.
         if children.len() <= STACK_CAP {
             let mut tuples: [(usize, u32); STACK_CAP] = [(0, 0); STACK_CAP];
             for (i, child) in children.iter().enumerate() {
@@ -1340,11 +1357,11 @@ impl Predicate {
             }
             tuples[..children.len()].sort_unstable_by_key(|&(i, c)| (c, i));
             for &(i, _) in &tuples[..children.len()] {
-                if !children[i].evaluate(ctx) {
-                    return false;
+                if children[i].evaluate(ctx) == stop_on {
+                    return stop_on;
                 }
             }
-            true
+            !stop_on
         } else {
             let mut tuples: Vec<(usize, u32)> = children
                 .iter()
@@ -1353,11 +1370,11 @@ impl Predicate {
                 .collect();
             tuples.sort_unstable_by_key(|&(i, c)| (c, i));
             for &(i, _) in &tuples {
-                if !children[i].evaluate(ctx) {
-                    return false;
+                if children[i].evaluate(ctx) == stop_on {
+                    return stop_on;
                 }
             }
-            true
+            !stop_on
         }
     }
 
@@ -1374,38 +1391,12 @@ impl Predicate {
     /// back to ordering by raw evaluation work — neutral between
     /// And and Or, which is the best we can do here.
     ///
-    /// PERF_AUDIT §4.7 — same precomputed-tuple shape as
-    /// `eval_all_in_cost_order` above.
+    /// PERF_AUDIT §4.7 — same precomputed-tuple walk as
+    /// `eval_all_in_cost_order`; both delegate to
+    /// [`Self::eval_in_cost_order`].
     fn eval_any_in_cost_order(children: &[Predicate], ctx: &EvalContext<'_>) -> bool {
-        const STACK_CAP: usize = 8;
-        // `(cost, index)` key — see `eval_all_in_cost_order` for
-        // the tie-order rationale.
-        if children.len() <= STACK_CAP {
-            let mut tuples: [(usize, u32); STACK_CAP] = [(0, 0); STACK_CAP];
-            for (i, child) in children.iter().enumerate() {
-                tuples[i] = (i, child.static_cost());
-            }
-            tuples[..children.len()].sort_unstable_by_key(|&(i, c)| (c, i));
-            for &(i, _) in &tuples[..children.len()] {
-                if children[i].evaluate(ctx) {
-                    return true;
-                }
-            }
-            false
-        } else {
-            let mut tuples: Vec<(usize, u32)> = children
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (i, c.static_cost()))
-                .collect();
-            tuples.sort_unstable_by_key(|&(i, c)| (c, i));
-            for &(i, _) in &tuples {
-                if children[i].evaluate(ctx) {
-                    return true;
-                }
-            }
-            false
-        }
+        // First true wins; vacuously false — `.any()` semantics.
+        Self::eval_in_cost_order(children, ctx, true)
     }
 
     /// Static cost estimate for the planner. Lower = cheaper to
@@ -2716,6 +2707,23 @@ mod tests {
         assert!(!or_ast.evaluate(&cx_none));
         assert!(!or_ast.evaluate_unplanned(&cx_none));
     }
+
+    /// Vacuous-children semantics through the shared cost-order
+    /// walk: `And([])` is true and `Or([])` is false (`.all()` /
+    /// `.any()` semantics). Pins the `!stop_on` fall-through in
+    /// `eval_in_cost_order` now that both composite arms route
+    /// through one helper — a sign flip there would invert every
+    /// empty composite while leaving non-empty cases green.
+    #[test]
+    fn and_or_empty_children_are_vacuously_true_and_false() {
+        let empty_meta = BTreeMap::new();
+        let cx = ctx(&[], &empty_meta);
+        assert!(Predicate::And(vec![]).evaluate(&cx));
+        assert!(Predicate::And(vec![]).evaluate_unplanned(&cx));
+        assert!(!Predicate::Or(vec![]).evaluate(&cx));
+        assert!(!Predicate::Or(vec![]).evaluate_unplanned(&cx));
+    }
+
     /// Exhaustive small-input parity: enumerate a handful of small
     /// `(ast, ctx)` combinations and assert planned = unplanned.
     /// Phase 4 doesn't ship full property-based fuzzing
