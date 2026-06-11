@@ -672,6 +672,32 @@ impl PacketCipher {
         Ok(counter)
     }
 
+    /// Encrypt a `&mut [u8]` sub-slice in place with AAD, returning
+    /// the nonce counter and the detached 16-byte tag for the caller
+    /// to splice in (e.g., append at a chosen offset within the same
+    /// outer packet buffer).
+    ///
+    /// Lets `PacketBuilder` (PERF_AUDIT §2.6) frame events directly
+    /// into the packet buffer at `HEADER_SIZE` offset, encrypt that
+    /// region in place, and append the tag — eliminating the
+    /// previous full-payload memcpy from the scratch `payload`
+    /// buffer into `packet`.
+    #[inline]
+    pub fn encrypt_in_place_detached(
+        &self,
+        aad: &[u8],
+        buffer: &mut [u8],
+    ) -> Result<(u64, [u8; 16]), CryptoError> {
+        let counter = self.tx_counter.fetch_add(1, Ordering::Relaxed);
+        let nonce = self.nonce_from_counter(counter);
+
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached((&nonce).into(), aad, buffer)
+            .map_err(|_| CryptoError::Encryption("encryption failed".to_string()))?;
+        Ok((counter, tag.into()))
+    }
+
     /// Encrypt payload with AAD.
     ///
     /// Returns (ciphertext, nonce_counter).
