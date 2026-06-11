@@ -80,6 +80,21 @@ const BLOCKING_FS_THRESHOLD: u64 = 256 * 1024;
 /// higher can raise this constant for more large-file parallelism.
 pub const DEFAULT_INFLIGHT_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 
+/// Byte-semaphore permits a file reserves while in flight: ≈ its
+/// current chunk's worth (chunks move sequentially), clamped to
+/// `[1, budget]` so a file larger than the whole budget can still
+/// run (alone). Shared by `store_dir` and `fetch_dir` so both
+/// sides reserve identically.
+///
+/// The min-chain runs in the u64 domain BEFORE the `u32` cast —
+/// `store_dir` previously cast `meta.len() as u32` first, which
+/// wraps for files > 4 GiB (4 GiB + 1 B → 1 permit) and
+/// under-reserves the budget while the entire file is buffered in
+/// memory. The result fits `u32` by construction (≤ `budget`).
+fn in_flight_byte_permits(len: u64, budget: u32) -> u32 {
+    len.min(BLOB_CHUNK_SIZE_BYTES).min(budget as u64).max(1) as u32
+}
+
 // ── Errors ──────────────────────────────────────────────────────────
 
 /// Failure surface for directory store / fetch.
@@ -286,15 +301,11 @@ pub async fn store_dir(adapter: &MeshBlobAdapter, root: &Path) -> Result<BlobRef
                 let _permit = sem.acquire().await.map_err(|_| {
                     DirError::Blob(BlobError::Backend("dir store: semaphore closed".into()))
                 })?;
-                // Per-file in-flight byte reservation. Mirrors
-                // fetch_dir's pattern: each file reserves ≤
-                // its size (capped at the chunk size + budget)
-                // so big files self-limit while small files
-                // stay bounded only by the count cap.
-                let in_flight = (meta.len() as u32)
-                    .min(BLOB_CHUNK_SIZE_BYTES as u32)
-                    .min(store_budget)
-                    .max(1);
+                // Per-file in-flight byte reservation — same
+                // helper as fetch_dir so both sides reserve
+                // identically: big files self-limit while small
+                // files stay bounded only by the count cap.
+                let in_flight = in_flight_byte_permits(meta.len(), store_budget);
                 let _bytes_permit = byte_sem.acquire_many(in_flight).await.map_err(|_| {
                     DirError::Blob(BlobError::Backend(
                         "dir store: byte semaphore closed".into(),
@@ -572,11 +583,7 @@ async fn reconstruct_tree(
             .ok_or_else(|| DirError::Manifest(format!("entry {} has no blob ref", entry.path)))?;
         // Bytes this file can have in flight at once ≈ its current chunk
         // (chunks pull sequentially), bounded by the budget.
-        let in_flight = blob_ref
-            .size()
-            .min(BLOB_CHUNK_SIZE_BYTES)
-            .min(budget as u64)
-            .max(1) as u32;
+        let in_flight = in_flight_byte_permits(blob_ref.size(), budget);
         let node = node.clone();
         let sem = sem.clone();
         let byte_sem = byte_sem.clone();
@@ -1065,6 +1072,38 @@ fn hex(hash: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review-bot P2 regression — the byte-permit clamp must run
+    /// in the u64 domain BEFORE the u32 cast. `store_dir`
+    /// previously did `(len as u32).min(...)`, so a > 4 GiB file
+    /// wrapped (4 GiB + 1 B → 1 permit) and held the whole file in
+    /// memory against a 1-byte budget reservation.
+    #[test]
+    fn in_flight_byte_permits_clamps_before_casting() {
+        let budget = u32::try_from(DEFAULT_INFLIGHT_BUDGET_BYTES).unwrap();
+        let chunk = u32::try_from(BLOB_CHUNK_SIZE_BYTES).unwrap();
+
+        // Empty file still needs one permit to make progress.
+        assert_eq!(in_flight_byte_permits(0, budget), 1);
+        // Small file reserves exactly its size.
+        assert_eq!(in_flight_byte_permits(1024, budget), 1024);
+        // At and past the chunk size: capped to one chunk's worth.
+        assert_eq!(in_flight_byte_permits(BLOB_CHUNK_SIZE_BYTES, budget), chunk);
+        assert_eq!(
+            in_flight_byte_permits(BLOB_CHUNK_SIZE_BYTES + 1, budget),
+            chunk
+        );
+        // The wrap case: 4 GiB + 1 byte. `as u32` first would give
+        // 1; the u64-domain clamp gives the chunk cap.
+        assert_eq!(
+            in_flight_byte_permits(u64::from(u32::MAX) + 2, budget),
+            chunk
+        );
+        assert_eq!(in_flight_byte_permits(u64::MAX, budget), chunk);
+        // A budget smaller than the chunk size wins the clamp, so
+        // a giant file can still run alone.
+        assert_eq!(in_flight_byte_permits(u64::MAX, 64), 64);
+    }
 
     #[test]
     fn safe_join_accepts_plain_relative_paths() {
