@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/router.rs
+  s_58168e769adc91::t_2b470e08f4d2a7 1891-1958
+  s_58168e769adc91::t_15f1bc6c5ad469 355-366,369-383,385-394
+  s_58168e769adc91::t_9e17bceddf80cf 342
+  s_58168e769adc91::t_e3a7a89bbfef93 418
+  s_58168e769adc91::t_7213c84120f33d 293-305
+  s_58168e769adc91::t_f4f9fc25c2c011 445
+  s_58168e769adc91::t_ebe97c7d8ade69 615
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "f845557feed44189788373def6ea27153c139a52",
+  "prompts": {},
+  "sessions": {
+    "s_58168e769adc91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "43399f81-fab3-4b2a-a002-4ece8a909069",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
