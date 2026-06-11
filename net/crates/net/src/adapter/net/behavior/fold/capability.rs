@@ -352,14 +352,28 @@ impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
     /// payloads agree on every one of those, an on_remove +
     /// on_insert against them nets to a no-op on every bucket
     /// (`derive_synthetic_index_tags` is pure over the payload, so
-    /// identical inputs produce identical synthetic outputs). The
-    /// hardware / allow-lists / metadata fields are NOT consulted
-    /// by this index, so they can differ without affecting the
-    /// answer here — but the steady-state refresh case the audit
-    /// targets keeps all of them identical too, so a simple
-    /// `(tags, region, state)` equality check captures the win.
+    /// identical inputs produce identical synthetic outputs).
+    ///
+    /// The synthetic tags derive from TWO payload fields: the
+    /// `software.model.*` / `software.tool.*` bundles inside
+    /// `tags` (covered by the `tags` equality) AND the
+    /// `gpu:present` / `gpu:vendor:<v>` projection of `hardware`
+    /// — so `hardware` MUST be part of this comparison or a
+    /// refresh that changes only the GPU shape would leave
+    /// `by_synthetic` stale. Comparing the whole
+    /// `HardwareSummary` is slightly conservative (a
+    /// memory_gb/vram_gb-only delta forces a rebuild the index
+    /// doesn't strictly need), but the steady-state refresh the
+    /// audit targets keeps hardware identical, so the win is
+    /// unaffected and the check stays future-proof against new
+    /// hardware-derived synthetic tags. Allow-lists / metadata /
+    /// price_quote / reflex_addr are NOT consulted by this index
+    /// and may differ freely.
     fn index_payload_equivalent(old: &CapabilityMembership, new: &CapabilityMembership) -> bool {
-        old.state == new.state && old.region == new.region && old.tags == new.tags
+        old.state == new.state
+            && old.region == new.region
+            && old.tags == new.tags
+            && old.hardware == new.hardware
     }
 }
 
@@ -628,8 +642,9 @@ pub(crate) fn resolve_candidate_keys(
     if !filter.tags_any.is_empty() {
         // Keep only candidates that carry at least one of the
         // tags_any list. Build the union of those tag buckets
-        // once, then `retain`.
-        let mut tags_any_union: HashSet<(u64, NodeId)> = HashSet::new();
+        // once, then `retain`. Same PERF_AUDIT §4.6 fast mixer as
+        // the other `(u64, NodeId)` intermediates in this resolver.
+        let mut tags_any_union: HashSet<(u64, NodeId), BuildU64TupleHasher> = HashSet::default();
         for tag in &filter.tags_any {
             if let Some(bucket) = index.by_tag.get(tag) {
                 tags_any_union.extend(bucket.iter().copied());
@@ -1092,6 +1107,22 @@ mod tests {
             "region delta must invalidate"
         );
 
+        // Hardware differs — the `gpu:present` / `gpu:vendor:<v>`
+        // synthetic index tags derive from `hardware`, so a GPU
+        // shape change MUST invalidate or `by_synthetic` goes
+        // stale on a tags-identical refresh.
+        let mut h = base.clone();
+        h.hardware = Some(HardwareSummary {
+            gpu_vendor: Some("nvidia".into()),
+            gpu_count: 1,
+            memory_gb: None,
+            vram_gb: None,
+        });
+        assert!(
+            !<CapabilityIndexInner as super::super::FoldIndex<CapabilityFold>>::index_payload_equivalent(&base, &h),
+            "hardware delta must invalidate — synthetic gpu tags derive from it"
+        );
+
         // Non-indexed dimension (metadata) — these CAN differ
         // without forcing an index rebuild. The skip is correct
         // because the index doesn't key on metadata at all.
@@ -1100,6 +1131,80 @@ mod tests {
         assert!(
             <CapabilityIndexInner as super::super::FoldIndex<CapabilityFold>>::index_payload_equivalent(&base, &m),
             "metadata delta is OK to skip — index doesn't key on metadata"
+        );
+    }
+
+    /// PERF_AUDIT §4.5 regression — a refresh that keeps (tags,
+    /// region, state) identical but CHANGES the hardware GPU
+    /// shape must still rebuild the synthetic index. Pre-fix the
+    /// equivalence check ignored `hardware`, so the gained GPU
+    /// never landed in `by_synthetic` (a `gpu:present` group
+    /// query kept missing the node) and a lost GPU lingered
+    /// stale. Drives the full apply path end-to-end.
+    #[test]
+    fn replace_with_changed_hardware_updates_synthetic_index() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let sign_with_hw = |generation: u64, hardware: Option<HardwareSummary>| {
+            SignedAnnouncement::sign(
+                &kp,
+                CapabilityFold::KIND_ID,
+                0x100,
+                0xFACE,
+                generation,
+                EnvelopeMeta::default(),
+                CapabilityMembership {
+                    class_hash: 0x100,
+                    tags: vec!["worker".into()],
+                    hardware,
+                    state: NodeState::Idle,
+                    region: Some("us-east".into()),
+                    price_quote: None,
+                    reflex_addr: None,
+                    allowed_nodes: Vec::new(),
+                    allowed_subnets: Vec::new(),
+                    allowed_groups: Vec::new(),
+                    metadata: BTreeMap::new(),
+                },
+            )
+            .expect("sign succeeds")
+        };
+        let gpu_present_filter = || CapabilityFilter {
+            tag_groups_all: vec![vec!["gpu:present".into()]],
+            ..CapabilityFilter::default()
+        };
+
+        // v1: no hardware → no gpu:present synthetic tag.
+        fold.apply(sign_with_hw(1, None)).expect("v1");
+        let hits = fold.query(CapabilityQuery::Composite(gpu_present_filter()));
+        assert!(hits.is_empty(), "no GPU yet — synthetic axis must miss");
+
+        // v2: same tags/region/state, GPU appears. The refresh
+        // must rebuild by_synthetic.
+        fold.apply(sign_with_hw(
+            2,
+            Some(HardwareSummary {
+                gpu_vendor: Some("nvidia".into()),
+                gpu_count: 1,
+                memory_gb: Some(64),
+                vram_gb: Some(24),
+            }),
+        ))
+        .expect("v2");
+        let hits = fold.query(CapabilityQuery::Composite(gpu_present_filter()));
+        assert_eq!(
+            hits.len(),
+            1,
+            "GPU gained on refresh must be visible via the synthetic index"
+        );
+
+        // v3: GPU disappears again — the stale gpu:present bucket
+        // must be dropped.
+        fold.apply(sign_with_hw(3, None)).expect("v3");
+        let hits = fold.query(CapabilityQuery::Composite(gpu_present_filter()));
+        assert!(
+            hits.is_empty(),
+            "GPU lost on refresh must drop the stale synthetic bucket"
         );
     }
 

@@ -3462,11 +3462,14 @@ mod tests {
             "with allowed_nodes: signed_payload must equal cloned-canonical bytes"
         );
 
-        // With every optional field populated.
+        // With every optional field populated — including
+        // non-empty allowed_subnets / allowed_groups so all three
+        // allow-list `skip_serializing_if = "Vec::is_empty"` axes
+        // are exercised in their EMITTED form, not just skipped.
         let mut full = with_reflex.clone();
         full.allowed_nodes = vec![0x1111, 0x2222];
-        full.allowed_subnets = Vec::new();
-        full.allowed_groups = Vec::new();
+        full.allowed_subnets = vec![super::super::subnet::SubnetId([0x11; 16])];
+        full.allowed_groups = vec![super::super::group::GroupId([0x22; 32])];
         // Pretend signature was already set + hop_count was bumped
         // (the canonical view must blank both before hashing).
         full.signature = Some(Signature64([0x42; 64]));

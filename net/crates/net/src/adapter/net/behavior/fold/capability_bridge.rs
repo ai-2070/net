@@ -318,11 +318,11 @@ const CAPABILITY_SET_CACHE_DEFAULT_CAPACITY: usize = 256;
 
 /// Bounded LRU cache of synthesized `Arc<CapabilitySet>` per node,
 /// invalidated by the fold's change-generation
-/// ([`Fold::change_generation`]). Eliminates the multi-µs re-parse
-/// + re-allocate that `synthesize_capability_set` does per call on
-/// the hot paths (per-packet greedy admission at mesh.rs:5181,
-/// per-candidate `placement_score`, per-candidate `best_by_score`,
-/// per-call `may_execute` retain loops). Per
+/// ([`Fold::change_generation`]). Eliminates the multi-µs
+/// re-parse + re-allocate that `synthesize_capability_set` does
+/// per call on the hot paths (per-packet greedy admission at
+/// mesh.rs:5181, per-candidate `placement_score`, per-candidate
+/// `best_by_score`, per-call `may_execute` retain loops). Per
 /// PERF_AUDIT_2026_06_10_FULL_CRATE.md §4.1.
 ///
 /// The generation is global to the fold — any fold change
@@ -357,7 +357,7 @@ impl CapabilitySetCache {
     /// than panicking.
     pub fn with_capacity(capacity: usize) -> Self {
         let cap = std::num::NonZeroUsize::new(capacity.max(1))
-            .expect("max(1) yields >= 1, NonZeroUsize::new always succeeds");
+            .unwrap_or(std::num::NonZeroUsize::MIN);
         Self {
             inner: parking_lot::Mutex::new(lru::LruCache::new(cap)),
         }
@@ -388,18 +388,23 @@ impl CapabilitySetCache {
         // own read lock still serializes the with_state body, but
         // that's much cheaper).
         let caps = std::sync::Arc::new(synthesize_capability_set(fold, node_id));
-        // Re-read the generation AFTER synthesize and store
-        // against it — captures any fold change that ran while we
-        // were synthesizing, so the cache entry is at least as
-        // fresh as our synthesized snapshot. A worse-case race
-        // just refreshes the entry on the next access.
-        let post_gen = fold.change_generation();
+        // Store against the generation captured BEFORE synthesize
+        // (`current_gen`). The fold bumps its generation under the
+        // state write lock AFTER mutating, so a set synthesized
+        // after we read gen G reflects state at gen >= G; if a
+        // concurrent apply/evict ran during synthesize the live
+        // generation is already > G and the entry misses on the
+        // next access (one wasted re-synthesize, never a stale
+        // hit). Stamping the generation read AFTER synthesize
+        // would invert that: a set built from pre-change state
+        // could be stored under the post-change generation and
+        // served stale until the next unrelated fold mutation.
         {
             let mut lru = self.inner.lock();
             lru.put(
                 node_id,
                 CachedCapabilitySetEntry {
-                    generation: post_gen,
+                    generation: current_gen,
                     caps: caps.clone(),
                 },
             );
@@ -1201,6 +1206,44 @@ mod tests {
         assert_eq!(nodes, vec![0xAA]);
     }
 
+    /// PERF_AUDIT §4.11 — a filter whose only constraint is a
+    /// range predicate translates to a permissive fold filter
+    /// (`is_permissive() == true`), so it MUST NOT take the
+    /// permissive fast path: the range post-filter still tightens
+    /// the result. Pins the `range_predicates_present` guard in
+    /// `find_nodes_matching` — dropping it would make a
+    /// `min_memory_gb` query return every node in the fold.
+    #[test]
+    fn find_nodes_matching_range_only_filter_skips_permissive_fast_path() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let big = HardwareSummary {
+            gpu_vendor: None,
+            gpu_count: 0,
+            memory_gb: Some(128),
+            vram_gb: None,
+        };
+        fold.apply(sign_member(&kp, 0xA1, 0x100, vec!["gpu"], Some(big)))
+            .expect("apply big");
+        fold.apply(sign_member(&kp, 0xA2, 0x100, vec!["gpu"], None))
+            .expect("apply no-hw");
+
+        let range_only = LegacyFilter {
+            min_memory_gb: Some(64),
+            ..LegacyFilter::default()
+        };
+        // The translated fold filter carries no constraint...
+        assert!(translate_filter(&range_only).is_permissive());
+        // ...but the range predicate must still apply: only the
+        // 128 GB node passes; the hardware-less node fails closed.
+        let nodes = find_nodes_matching(&fold, &range_only);
+        assert_eq!(nodes, vec![0xA1]);
+
+        // Sanity: the truly permissive filter returns both, sorted.
+        let all = find_nodes_matching(&fold, &LegacyFilter::default());
+        assert_eq!(all, vec![0xA1, 0xA2]);
+    }
+
     #[test]
     fn target_matches_filter_agrees_with_find_nodes_matching() {
         // Two publishers, mixed tag sets — both filter inputs must
@@ -1655,6 +1698,70 @@ mod tests {
         );
     }
 
+    /// PERF_AUDIT §4.9 — `synthesize_capability_set_if_known`
+    /// folds the placement-side known-check and the synthesize
+    /// into one lock acquisition. Pin its three-branch contract:
+    /// unknown publisher → `None` (placement hard-veto), known
+    /// publisher with no tags → `Some(empty)` (indexed, proceeds
+    /// to scoring), known publisher with tags → `Some(populated)`.
+    /// The legacy `synthesize_capability_set` wrapper must map
+    /// `None` to an empty set (its pre-fix shape).
+    #[test]
+    fn synthesize_if_known_distinguishes_unknown_from_empty() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(sign_member(&kp, 0xB1, 0x100, vec!["gpu"], None))
+            .expect("apply tagged");
+        fold.apply(sign_member(&kp, 0xB2, 0x100, vec![], None))
+            .expect("apply untagged");
+
+        // Unknown → None (hard veto).
+        assert!(synthesize_capability_set_if_known(&fold, 0xDEAD).is_none());
+        // Known + tags → Some(populated).
+        let tagged = synthesize_capability_set_if_known(&fold, 0xB1)
+            .expect("tagged publisher is known");
+        assert!(tagged.tags.iter().any(|t| t.to_string() == "gpu"));
+        // Known + no tags → Some(empty) — indexed candidates with
+        // empty tag sets still proceed to scoring.
+        let untagged = synthesize_capability_set_if_known(&fold, 0xB2)
+            .expect("untagged publisher is still known");
+        assert!(untagged.tags.is_empty());
+        // Wrapper parity: unknown maps to the empty default.
+        assert!(synthesize_capability_set(&fold, 0xDEAD).tags.is_empty());
+    }
+
+    /// PERF_AUDIT §4.1 — node REMOVAL (`evict_node`, which the
+    /// SWIM death path drives) must invalidate the cached entry:
+    /// the eviction bumps the fold's change generation, so the
+    /// next lookup misses and re-synthesizes an empty set instead
+    /// of serving the dead node's capabilities forever.
+    #[test]
+    fn capability_set_cache_invalidates_on_node_eviction() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(sign_member(&kp, 0xEE, 0x100, vec!["gpu"], None))
+            .expect("apply EE");
+        let cache = CapabilitySetCache::new();
+        let live = cache.get_or_synthesize(&fold, 0xEE);
+        assert!(
+            live.tags.iter().any(|t| t.to_string() == "gpu"),
+            "pre-eviction lookup should see the published tag"
+        );
+
+        fold.evict_node(0xEE, "swim-dead");
+
+        let after = cache.get_or_synthesize(&fold, 0xEE);
+        assert!(
+            !std::sync::Arc::ptr_eq(&live, &after),
+            "eviction must invalidate the cached entry"
+        );
+        assert!(
+            after.tags.is_empty(),
+            "post-eviction set must be empty, not the dead node's cached tags: {:?}",
+            after.tags
+        );
+    }
+
     /// PERF_AUDIT §4.2 — `may_execute_batch` must produce
     /// byte-identical verdicts to the per-target `may_execute`
     /// across every realistic shape (target known / unknown,
@@ -1746,5 +1853,99 @@ mod tests {
         let fold = new_fold();
         let got = may_execute_batch(&fold, &[], "nrpc:noop", 0xCA);
         assert!(got.is_empty());
+    }
+
+    /// PERF_AUDIT §4.2 — exercise the hoisted `derive_caller_axes`
+    /// path with REAL `subnet:` / `group:` membership tags. The
+    /// node-axis test above never reaches the subnet/group
+    /// derivation, so a regression in the once-per-batch hoist
+    /// (e.g. deriving from the wrong node, or dropping the parse)
+    /// would slip past it. Three restricted targets: subnet-allowed
+    /// (admit), group-allowed (admit), foreign-subnet (deny) — and
+    /// the batched verdicts must equal the per-target ones.
+    #[test]
+    fn may_execute_batch_derives_caller_subnet_and_groups_once() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let caller: NodeId = 0xCA;
+        let by_subnet: NodeId = 0xA1;
+        let by_group: NodeId = 0xA2;
+        let foreign: NodeId = 0xA3;
+
+        let caller_subnet =
+            super::super::super::subnet::SubnetId::from_tag(&format!("subnet:{}", "11".repeat(16)))
+                .expect("parse caller subnet tag");
+        let other_subnet =
+            super::super::super::subnet::SubnetId::from_tag(&format!("subnet:{}", "22".repeat(16)))
+                .expect("parse other subnet tag");
+        let caller_group =
+            super::super::super::group::GroupId::from_tag(&format!("group:{}", "33".repeat(32)))
+                .expect("parse caller group tag");
+
+        // Caller publishes its subnet + group membership tags.
+        let caller_subnet_tag = caller_subnet.to_tag();
+        let caller_group_tag = caller_group.to_tag();
+        fold.apply(sign_member(
+            &kp,
+            caller,
+            0x100,
+            vec![
+                "scope:user",
+                caller_subnet_tag.as_str(),
+                caller_group_tag.as_str(),
+            ],
+            None,
+        ))
+        .expect("caller apply");
+
+        let restricted = |node: NodeId,
+                          subnets: Vec<super::super::super::subnet::SubnetId>,
+                          groups: Vec<super::super::super::group::GroupId>| {
+            SignedAnnouncement::sign(
+                &kp,
+                super::super::capability::CapabilityFold::KIND_ID,
+                0x100,
+                node,
+                1,
+                EnvelopeMeta::default(),
+                CapabilityMembership {
+                    class_hash: 0x100,
+                    tags: vec!["nrpc:echo".into()],
+                    hardware: None,
+                    state: NodeState::Idle,
+                    region: None,
+                    price_quote: None,
+                    reflex_addr: None,
+                    allowed_nodes: Vec::new(),
+                    allowed_subnets: subnets,
+                    allowed_groups: groups,
+                    metadata: std::collections::BTreeMap::new(),
+                },
+            )
+            .expect("sign restricted")
+        };
+        fold.apply(restricted(by_subnet, vec![caller_subnet], Vec::new()))
+            .expect("by_subnet apply");
+        fold.apply(restricted(by_group, Vec::new(), vec![caller_group]))
+            .expect("by_group apply");
+        fold.apply(restricted(foreign, vec![other_subnet], Vec::new()))
+            .expect("foreign apply");
+
+        let targets = vec![by_subnet, by_group, foreign];
+        let tag = "nrpc:echo";
+        let batch = may_execute_batch(&fold, &targets, tag, caller);
+        let per_target: Vec<bool> = targets
+            .iter()
+            .map(|t| may_execute(&fold, *t, tag, caller))
+            .collect();
+        assert_eq!(
+            batch, per_target,
+            "batched subnet/group verdicts must equal per-target verdicts"
+        );
+        assert_eq!(
+            batch,
+            vec![true, true, false],
+            "subnet-allowed admits, group-allowed admits, foreign subnet denies"
+        );
     }
 }

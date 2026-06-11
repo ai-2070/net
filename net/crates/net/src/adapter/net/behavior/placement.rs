@@ -1098,8 +1098,8 @@ fn saturating_score(value: f32, reference: f32) -> f32 {
 ///
 /// `None` ↔ the tag was absent OR present but malformed
 /// (un-parseable, non-finite, negative, or above
-/// `MAX_RESOURCE_VALUE` — see [`target_axis_value_numeric`] for
-/// the N-12 sentinel and `saturating_score`'s CR-9 NaN guard).
+/// `MAX_RESOURCE_VALUE` — the N-12 sentinel; see also
+/// `saturating_score`'s CR-9 NaN guard).
 /// The `_from_values` helpers below interpret `None` exactly as
 /// "no data" so the permissive-when-no-data contract is
 /// unchanged.
@@ -1122,14 +1122,17 @@ struct ResourceAxisValues {
 ///     `MAX_RESOURCE_VALUE` → slot stays `None`.
 ///   - otherwise slot becomes `Some(value)`.
 ///
-/// Iteration order over `caps.tags` is preserved, so a duplicate
-/// tag-key still resolves to the LAST matching entry — matching
-/// the pre-fix `find_map`'s "first matching" semantic flipped
-/// only in the trivial sense (the new code overwrites on each
-/// match; the pre-fix early-returned on first). Duplicate-tag
-/// behavior is undefined at the capability layer (TOFU pin),
-/// so the swap from first-wins to last-wins is observationally
-/// indistinguishable at the placement layer.
+/// Duplicate tag-keys (same key, different value — distinct
+/// `HashSet<Tag>` entries) resolve exactly as the pre-fix
+/// `find_map` did: the FIRST tag in iteration order whose value
+/// parses AND passes the range guard wins. The `is_none()` guard
+/// per slot keeps a later malformed duplicate from clobbering a
+/// valid value already captured, and lets a later valid
+/// duplicate fill a slot an earlier malformed one left empty —
+/// both of which the pre-fix scan-past-malformed `find_map`
+/// guaranteed. (An unconditional overwrite would flip both on
+/// adversarial input: a trailing `cpu_cores=garbage` duplicate
+/// would reset a valid slot to `None` → permissive 1.0.)
 fn extract_resource_axis_values(caps: &CapabilitySet) -> ResourceAxisValues {
     let mut vals = ResourceAxisValues::default();
     for tag in &caps.tags {
@@ -1145,10 +1148,18 @@ fn extract_resource_axis_values(caps: &CapabilitySet) -> ResourceAxisValues {
                 Some(v)
             };
             match (axis, key.as_str()) {
-                (TaxonomyAxis::Hardware, "cpu_cores") => vals.cpu_cores = parsed(),
-                (TaxonomyAxis::Hardware, "memory_gb") => vals.memory_gb = parsed(),
-                (TaxonomyAxis::Hardware, "gpu.vram_gb") => vals.gpu_vram_gb = parsed(),
-                (TaxonomyAxis::Dataforts, "capacity_gb") => vals.capacity_gb = parsed(),
+                (TaxonomyAxis::Hardware, "cpu_cores") if vals.cpu_cores.is_none() => {
+                    vals.cpu_cores = parsed();
+                }
+                (TaxonomyAxis::Hardware, "memory_gb") if vals.memory_gb.is_none() => {
+                    vals.memory_gb = parsed();
+                }
+                (TaxonomyAxis::Hardware, "gpu.vram_gb") if vals.gpu_vram_gb.is_none() => {
+                    vals.gpu_vram_gb = parsed();
+                }
+                (TaxonomyAxis::Dataforts, "capacity_gb") if vals.capacity_gb.is_none() => {
+                    vals.capacity_gb = parsed();
+                }
                 _ => {}
             }
         }
@@ -2949,6 +2960,33 @@ mod tests {
         assert_eq!(vals.memory_gb, None, "NaN must be rejected");
         assert_eq!(vals.gpu_vram_gb, None, "negative must be rejected");
         assert_eq!(vals.capacity_gb, None, "unparseable must be rejected");
+    }
+
+    /// PERF_AUDIT §4.9 regression: duplicate axis-key tags (same
+    /// key, different values — distinct `HashSet<Tag>` entries)
+    /// must resolve like the pre-fix `find_map`: the valid value
+    /// wins no matter where the malformed duplicate lands in the
+    /// set's iteration order. An unconditional-overwrite
+    /// extraction would intermittently (order-dependently) let
+    /// the malformed entry clobber the valid one to `None`.
+    #[test]
+    fn extract_resource_axis_values_valid_duplicate_wins_over_malformed() {
+        let caps = empty_caps()
+            .add_tag("hardware.cpu_cores=12")
+            .add_tag("hardware.cpu_cores=garbage")
+            .add_tag("dataforts.capacity_gb=zzz")
+            .add_tag("dataforts.capacity_gb=2048");
+        let vals = extract_resource_axis_values(&caps);
+        assert_eq!(
+            vals.cpu_cores,
+            Some(12.0),
+            "valid cpu_cores must survive a malformed duplicate"
+        );
+        assert_eq!(
+            vals.capacity_gb,
+            Some(2048.0),
+            "valid capacity_gb must survive a malformed duplicate"
+        );
     }
 
     /// N-12 regression: a `hardware.cpu_cores=1e308` announcement

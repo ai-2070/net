@@ -1327,12 +1327,18 @@ impl Predicate {
     /// and the redundant cost recompute.
     fn eval_all_in_cost_order(children: &[Predicate], ctx: &EvalContext<'_>) -> bool {
         const STACK_CAP: usize = 8;
+        // Sort key is `(cost, index)` — the index tiebreak keeps
+        // equal-cost children in declaration order, matching the
+        // pre-fix STABLE `sort_by_key` exactly (an unstable sort
+        // on cost alone would reorder ties). Evaluation is pure so
+        // results can't differ, but the deterministic walk order
+        // keeps timing/short-circuit behavior reproducible.
         if children.len() <= STACK_CAP {
             let mut tuples: [(usize, u32); STACK_CAP] = [(0, 0); STACK_CAP];
             for (i, child) in children.iter().enumerate() {
                 tuples[i] = (i, child.static_cost());
             }
-            tuples[..children.len()].sort_unstable_by_key(|&(_, c)| c);
+            tuples[..children.len()].sort_unstable_by_key(|&(i, c)| (c, i));
             for &(i, _) in &tuples[..children.len()] {
                 if !children[i].evaluate(ctx) {
                     return false;
@@ -1345,7 +1351,7 @@ impl Predicate {
                 .enumerate()
                 .map(|(i, c)| (i, c.static_cost()))
                 .collect();
-            tuples.sort_unstable_by_key(|&(_, c)| c);
+            tuples.sort_unstable_by_key(|&(i, c)| (c, i));
             for &(i, _) in &tuples {
                 if !children[i].evaluate(ctx) {
                     return false;
@@ -1372,12 +1378,14 @@ impl Predicate {
     /// `eval_all_in_cost_order` above.
     fn eval_any_in_cost_order(children: &[Predicate], ctx: &EvalContext<'_>) -> bool {
         const STACK_CAP: usize = 8;
+        // `(cost, index)` key — see `eval_all_in_cost_order` for
+        // the tie-order rationale.
         if children.len() <= STACK_CAP {
             let mut tuples: [(usize, u32); STACK_CAP] = [(0, 0); STACK_CAP];
             for (i, child) in children.iter().enumerate() {
                 tuples[i] = (i, child.static_cost());
             }
-            tuples[..children.len()].sort_unstable_by_key(|&(_, c)| c);
+            tuples[..children.len()].sort_unstable_by_key(|&(i, c)| (c, i));
             for &(i, _) in &tuples[..children.len()] {
                 if children[i].evaluate(ctx) {
                     return true;
@@ -1390,7 +1398,7 @@ impl Predicate {
                 .enumerate()
                 .map(|(i, c)| (i, c.static_cost()))
                 .collect();
-            tuples.sort_unstable_by_key(|&(_, c)| c);
+            tuples.sort_unstable_by_key(|&(i, c)| (c, i));
             for &(i, _) in &tuples {
                 if children[i].evaluate(ctx) {
                     return true;
@@ -2650,6 +2658,63 @@ mod tests {
         assert!(!Predicate::Or(vec![]).evaluate(&cx));
         assert!(Predicate::And(vec![]).evaluate_unplanned(&cx));
         assert!(!Predicate::Or(vec![]).evaluate_unplanned(&cx));
+    }
+    /// PERF_AUDIT §4.7 — the planner's stack-array fast path
+    /// covers ≤ 8 children; And/Or nodes past that capacity must
+    /// spill to the heap path with identical semantics. The
+    /// verdict-deciding clause sits PAST index 8 in every case, so
+    /// a planner that silently truncated at the stack capacity
+    /// (instead of spilling) would flip each assertion.
+    #[test]
+    fn planner_over_stack_capacity_spills_to_heap_and_matches_unplanned() {
+        let n = 12usize;
+        // And: clause i requires metadata key "k{i}".
+        let and_ast = Predicate::And(
+            (0..n)
+                .map(|i| Predicate::MetadataExists {
+                    key: format!("k{i}"),
+                })
+                .collect(),
+        );
+        // Or: clause i matches metadata value "v{i}" under "sel".
+        let or_ast = Predicate::Or(
+            (0..n)
+                .map(|i| Predicate::MetadataEquals {
+                    key: "sel".into(),
+                    value: format!("v{i}"),
+                })
+                .collect(),
+        );
+
+        // All 12 keys present → And true.
+        let mut all = BTreeMap::new();
+        for i in 0..n {
+            all.insert(format!("k{i}"), "1".to_string());
+        }
+        let cx_all = ctx(&[], &all);
+        assert!(and_ast.evaluate(&cx_all));
+        assert!(and_ast.evaluate_unplanned(&cx_all));
+
+        // k11 — a clause past the stack capacity — missing → And
+        // false. Truncation at 8 children would return true.
+        let mut missing_tail = all.clone();
+        missing_tail.remove("k11");
+        let cx_missing = ctx(&[], &missing_tail);
+        assert!(!and_ast.evaluate(&cx_missing));
+        assert!(!and_ast.evaluate_unplanned(&cx_missing));
+
+        // Or: only the 12th alternative matches → true.
+        // Truncation at 8 children would return false.
+        let only_last = meta_with(&[("sel", "v11")]);
+        let cx_last = ctx(&[], &only_last);
+        assert!(or_ast.evaluate(&cx_last));
+        assert!(or_ast.evaluate_unplanned(&cx_last));
+
+        // No alternative matches → Or false.
+        let none = meta_with(&[("sel", "nope")]);
+        let cx_none = ctx(&[], &none);
+        assert!(!or_ast.evaluate(&cx_none));
+        assert!(!or_ast.evaluate_unplanned(&cx_none));
     }
     /// Exhaustive small-input parity: enumerate a handful of small
     /// `(ast, ctx)` combinations and assert planned = unplanned.
