@@ -519,6 +519,138 @@ pub fn may_execute(
     })
 }
 
+/// Batched `may_execute` for the caller-side `candidates.retain(...)`
+/// path: takes ONE fold read lock for the whole batch and derives
+/// the caller's subnet + group membership ONCE outside the per-
+/// target loop. Returns a `Vec<bool>` parallel to `targets` — index
+/// `i` is `true` iff `caller_node` may execute `capability_tag` on
+/// `targets[i]`.
+///
+/// Per PERF_AUDIT §4.2 — pre-fix the retain-style callers at
+/// `mesh_rpc.rs:3093` and `:3185` called the single-target
+/// [`may_execute`] per candidate. Each call took a fresh
+/// `with_state` read lock, walked the caller's entries to re-parse
+/// `subnet:` / `group:` tags from the string form, and allocated
+/// three allow-list Vecs. With 100 candidates that's 100 lock
+/// acquisitions + 100 parses of the caller's tag bag + 300 Vec
+/// allocations for the same answer.
+pub fn may_execute_batch(
+    fold: &Fold<CapabilityFold>,
+    targets: &[NodeId],
+    capability_tag: &str,
+    caller_node: NodeId,
+) -> Vec<bool> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    fold.with_state(|state| {
+        // Hoist the caller's subnet + groups out of the per-target
+        // loop. Identical across every iteration; pre-fix this re-
+        // walked + re-parsed every retain step.
+        let (caller_subnet, caller_groups) = derive_caller_axes(state, caller_node);
+        targets
+            .iter()
+            .map(|target_node| {
+                may_execute_with_caller(
+                    state,
+                    *target_node,
+                    capability_tag,
+                    caller_node,
+                    caller_subnet.as_ref(),
+                    &caller_groups,
+                )
+            })
+            .collect()
+    })
+}
+
+/// Internal: derive `(subnet, groups)` for `caller_node` from the
+/// fold's `by_node` reverse index. `subnet:<hex>` / `group:<hex>`
+/// tags are mapped through `SubnetId::from_tag` / `GroupId::from_tag`.
+/// Returns `(None, Vec::new())` for an unknown caller.
+fn derive_caller_axes(
+    state: &super::state::FoldState<CapabilityFold>,
+    caller_node: NodeId,
+) -> (
+    Option<super::super::subnet::SubnetId>,
+    Vec<super::super::group::GroupId>,
+) {
+    let Some(caller_keys) = state.by_node.get(&caller_node) else {
+        return (None, Vec::new());
+    };
+    let mut caller_subnet = None;
+    let mut caller_groups: Vec<super::super::group::GroupId> = Vec::new();
+    for k in caller_keys {
+        let Some(entry) = state.entries.get(k) else {
+            continue;
+        };
+        for raw in &entry.payload.tags {
+            if let Some(subnet) = super::super::subnet::SubnetId::from_tag(raw) {
+                caller_subnet = Some(subnet);
+            }
+            if let Some(group) = super::super::group::GroupId::from_tag(raw) {
+                caller_groups.push(group);
+            }
+        }
+    }
+    (caller_subnet, caller_groups)
+}
+
+/// Internal: per-target verdict that takes the pre-derived caller
+/// axes instead of re-walking the caller's entries per call. Same
+/// semantics as the inner body of [`may_execute`].
+fn may_execute_with_caller(
+    state: &super::state::FoldState<CapabilityFold>,
+    target_node: NodeId,
+    capability_tag: &str,
+    caller_node: NodeId,
+    caller_subnet: Option<&super::super::subnet::SubnetId>,
+    caller_groups: &[super::super::group::GroupId],
+) -> bool {
+    let Some(keys) = state.by_node.get(&target_node) else {
+        return false;
+    };
+    let mut target_carries_tag = false;
+    let mut allowed_nodes: Vec<u64> = Vec::new();
+    let mut allowed_subnets: Vec<super::super::subnet::SubnetId> = Vec::new();
+    let mut allowed_groups: Vec<super::super::group::GroupId> = Vec::new();
+    for k in keys {
+        let Some(entry) = state.entries.get(k) else {
+            continue;
+        };
+        if entry.payload.tags.iter().any(|t| t == capability_tag) {
+            target_carries_tag = true;
+        }
+        allowed_nodes.extend(entry.payload.allowed_nodes.iter().copied());
+        allowed_subnets.extend(entry.payload.allowed_subnets.iter().copied());
+        allowed_groups.extend(entry.payload.allowed_groups.iter().cloned());
+    }
+    if !target_carries_tag {
+        return false;
+    }
+    if allowed_nodes.is_empty() && allowed_subnets.is_empty() && allowed_groups.is_empty() {
+        return true;
+    }
+    if allowed_nodes.contains(&caller_node) {
+        return true;
+    }
+    if !allowed_subnets.is_empty() {
+        if let Some(subnet) = caller_subnet {
+            if allowed_subnets.contains(subnet) {
+                return true;
+            }
+        }
+    }
+    if !allowed_groups.is_empty() {
+        for g in caller_groups {
+            if allowed_groups.contains(g) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Translate a legacy [`CapabilityAnnouncement`] into a
 /// fold-shaped [`SignedAnnouncement<CapabilityMembership>`]
 /// suitable for [`Fold::apply`] dual-population during the
@@ -1521,5 +1653,98 @@ mod tests {
             std::sync::Arc::ptr_eq(&first, &second),
             "unknown-node entries still hit the cache on repeat access"
         );
+    }
+
+    /// PERF_AUDIT §4.2 — `may_execute_batch` must produce
+    /// byte-identical verdicts to the per-target `may_execute`
+    /// across every realistic shape (target known / unknown,
+    /// target carries / doesn't carry tag, allow-lists empty /
+    /// populated). The retain-loop callers replaced their per-
+    /// candidate `may_execute` calls with `may_execute_batch`,
+    /// so any divergence between the two produces silent auth
+    /// behavior drift.
+    #[test]
+    fn may_execute_batch_matches_per_target_may_execute() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        // Three publishers: a target carrying the gated tag with
+        // empty allow-lists (permissive), a target carrying it
+        // with a populated allow-list, and a target not carrying
+        // the tag at all. Plus the caller itself.
+        let caller: NodeId = 0xCA;
+        let permissive: NodeId = 0xAA;
+        let restricted: NodeId = 0xBB;
+        let no_tag: NodeId = 0xCC;
+        fold.apply(sign_member(
+            &kp,
+            permissive,
+            0x100,
+            vec!["nrpc:echo"],
+            None,
+        ))
+        .expect("permissive");
+        // Restricted: allow only the caller.
+        let restricted_ann = SignedAnnouncement::sign(
+            &kp,
+            super::super::capability::CapabilityFold::KIND_ID,
+            0x100,
+            restricted,
+            1,
+            EnvelopeMeta::default(),
+            CapabilityMembership {
+                class_hash: 0x100,
+                tags: vec!["nrpc:echo".into()],
+                hardware: None,
+                state: NodeState::Idle,
+                region: None,
+                price_quote: None,
+                reflex_addr: None,
+                allowed_nodes: vec![caller],
+                allowed_subnets: Vec::new(),
+                allowed_groups: Vec::new(),
+                metadata: std::collections::BTreeMap::new(),
+            },
+        )
+        .expect("sign restricted");
+        fold.apply(restricted_ann).expect("restricted apply");
+        fold.apply(sign_member(&kp, no_tag, 0x100, vec!["gpu"], None))
+            .expect("no-tag apply");
+        // Caller's own self-ann so subnet/group derivation has
+        // something to walk (it doesn't carry subnet/group tags
+        // here — that's OK, derivation returns (None, []) and
+        // the allow-list match falls back to the node axis).
+        fold.apply(sign_member(&kp, caller, 0x100, vec!["scope:user"], None))
+            .expect("caller apply");
+
+        let targets = vec![permissive, restricted, no_tag, 0xDEAD /* unknown */];
+        let tag = "nrpc:echo";
+        let batch = may_execute_batch(&fold, &targets, tag, caller);
+        let per_target: Vec<bool> = targets
+            .iter()
+            .map(|t| may_execute(&fold, *t, tag, caller))
+            .collect();
+        assert_eq!(
+            batch, per_target,
+            "batched verdicts must equal per-target verdicts"
+        );
+        // Pin the explicit per-target outcomes so a refactor that
+        // breaks the verdict semantics fails loudly here, not
+        // only via a downstream auth integration test.
+        assert_eq!(
+            batch,
+            vec![true, true, false, false],
+            "permissive admits, restricted admits caller via node axis, \
+             no-tag denies, unknown denies"
+        );
+    }
+
+    /// PERF_AUDIT §4.2 — empty `targets` slice short-circuits
+    /// without taking the fold lock. Pin the zero-allocation
+    /// contract: an empty input must return an empty Vec.
+    #[test]
+    fn may_execute_batch_empty_targets_returns_empty() {
+        let fold = new_fold();
+        let got = may_execute_batch(&fold, &[], "nrpc:noop", 0xCA);
+        assert!(got.is_empty());
     }
 }

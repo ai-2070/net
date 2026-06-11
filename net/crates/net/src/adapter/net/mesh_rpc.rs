@@ -3090,7 +3090,13 @@ impl MeshNode {
         let self_id = self.node_id();
         let any_candidate = candidates[0];
         let fold = self.capability_fold();
-        candidates.retain(|c| capability_bridge::may_execute(fold, *c, &tag, self_id));
+        // PERF_AUDIT §4.2 — batch the per-candidate gate so the
+        // fold read lock is taken once and the caller's subnet +
+        // groups are parsed once, not N times.
+        let verdicts =
+            capability_bridge::may_execute_batch(fold, &candidates, &tag, self_id);
+        let mut iter = verdicts.into_iter();
+        candidates.retain(|_| iter.next().unwrap_or(false));
         if candidates.is_empty() {
             return Err(RpcError::CapabilityDenied {
                 // No authorized target; surface one of the
@@ -3182,7 +3188,12 @@ impl MeshNode {
         let self_id = self.node_id();
         let any_candidate = candidates[0];
         let fold = self.capability_fold();
-        candidates.retain(|c| capability_bridge::may_execute(fold, *c, &tag, self_id));
+        // PERF_AUDIT §4.2 — batch the per-candidate gate. See the
+        // mirror site at `:3093`.
+        let verdicts =
+            capability_bridge::may_execute_batch(fold, &candidates, &tag, self_id);
+        let mut iter = verdicts.into_iter();
+        candidates.retain(|_| iter.next().unwrap_or(false));
         if candidates.is_empty() {
             return Err(RpcError::CapabilityDenied {
                 target: any_candidate,
