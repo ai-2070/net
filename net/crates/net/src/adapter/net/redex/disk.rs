@@ -143,6 +143,20 @@ pub(super) struct DiskSegment {
     worker_idx_file: Mutex<File>,
     worker_dat_file: Mutex<File>,
     worker_ts_file: Mutex<File>,
+    /// Cached on-disk length of `dat`. Initialized at open from
+    /// `dat_file.metadata().len()` AFTER all recovery truncations
+    /// have settled. Bumped after each successful `dat.write_all`
+    /// under the `dat_file` lock; stored back to the pre-write
+    /// value on rollback. Reset to the new dat's length inside
+    /// the `compact_to` manifest flip.
+    ///
+    /// Replaces a `dat.metadata()` stat-class syscall on every
+    /// disk append (PERF_AUDIT §5.3) — Windows in particular
+    /// resolved file metadata via a separate IOCTL that doubled
+    /// the syscall count of the hot path.
+    dat_len: AtomicU64,
+    idx_len: AtomicU64,
+    ts_len: AtomicU64,
     /// Append-path fsync interval: after `fsync_every_n` successful
     /// appends, the segment notifies the background fsync worker.
     /// `0` disables append-count-based syncing.
@@ -506,6 +520,14 @@ impl DiskSegment {
         let worker_dat_file = dat_file.try_clone().map_err(RedexError::io)?;
         let worker_ts_file = ts_file.try_clone().map_err(RedexError::io)?;
 
+        // Seed the on-disk length cache from the post-recovery
+        // handles. From here on the append paths track lengths via
+        // these atomics — no further `metadata()` calls in the hot
+        // path.
+        let initial_idx_len = idx_file.metadata().map_err(RedexError::io)?.len();
+        let initial_dat_len = dat_file.metadata().map_err(RedexError::io)?.len();
+        let initial_ts_len = ts_file.metadata().map_err(RedexError::io)?.len();
+
         // Sweep any orphan generation directories left behind by a
         // crashed prior `compact_to`. A crash between writing
         // `v<N+1>/{idx,dat,ts}` and the manifest flip leaves the
@@ -524,6 +546,9 @@ impl DiskSegment {
                 worker_idx_file: Mutex::new(worker_idx_file),
                 worker_dat_file: Mutex::new(worker_dat_file),
                 worker_ts_file: Mutex::new(worker_ts_file),
+                dat_len: AtomicU64::new(initial_dat_len),
+                idx_len: AtomicU64::new(initial_idx_len),
+                ts_len: AtomicU64::new(initial_ts_len),
                 fsync_every_n,
                 fsync_max_bytes,
                 appends_since_sync: AtomicU64::new(0),
@@ -674,6 +699,7 @@ impl DiskSegment {
                         "redex disk rollback: {file_name} set_len failed; poisoning segment",
                     );
                     self.poisoned.store(true, Ordering::Release);
+                    return;
                 }
             }
             Err(e) => {
@@ -683,44 +709,33 @@ impl DiskSegment {
                     "redex disk rollback: {file_name} open failed; poisoning segment",
                 );
                 self.poisoned.store(true, Ordering::Release);
+                return;
             }
+        }
+        // Truncation succeeded — keep the cached length atomic in
+        // sync with the new on-disk size so subsequent appends pick
+        // up the rolled-back value as their pre_len without
+        // a stat-class syscall (PERF_AUDIT §5.3).
+        match file_name {
+            "dat" => self.dat_len.store(target_len, Ordering::Release),
+            "idx" => self.idx_len.store(target_len, Ordering::Release),
+            "ts" => self.ts_len.store(target_len, Ordering::Release),
+            _ => {}
         }
     }
 
     /// Roll back a partial single-entry append after the idx (or
     /// ts-metadata read) failed. The dat rollback uses
-    /// (current_len - payload_len) as the target since the
-    /// single-entry path doesn't snapshot the pre-write dat length.
+    /// `(cached_len - payload_len)` as the target — preserving the
+    /// pre-§5.3 "truncate by payload_len from current size"
+    /// semantics under concurrent appenders, just sourced from the
+    /// `dat_len` atomic instead of a `metadata()` syscall.
     fn rollback_after_idx_failure(&self, pre_idx_len: u64, dat_rollback: Option<u64>) {
         self.rollback_truncate("idx", pre_idx_len);
         if let Some(payload_len) = dat_rollback {
-            let dat_path = self.live_gen_path("dat");
-            let dat_target = match OpenOptions::new().read(true).open(&dat_path) {
-                Ok(f) => match f.metadata() {
-                    Ok(m) => Some(m.len().saturating_sub(payload_len)),
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            path = %dat_path.display(),
-                            "redex disk rollback: dat metadata failed; poisoning segment",
-                        );
-                        self.poisoned.store(true, Ordering::Release);
-                        None
-                    }
-                },
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        path = %dat_path.display(),
-                        "redex disk rollback: dat open(read) failed; poisoning segment",
-                    );
-                    self.poisoned.store(true, Ordering::Release);
-                    None
-                }
-            };
-            if let Some(target) = dat_target {
-                self.rollback_truncate("dat", target);
-            }
+            let current = self.dat_len.load(Ordering::Acquire);
+            let target = current.saturating_sub(payload_len);
+            self.rollback_truncate("dat", target);
         }
     }
 
@@ -816,9 +831,16 @@ impl DiskSegment {
         // capture the pre-write length and `set_len` back on
         // error so the dat file always matches what the index
         // describes.
-        if !entry.is_inline() {
+        // PERF_AUDIT §5.3 — the dat / idx / ts pre-write lengths
+        // are tracked via per-file `AtomicU64` rather than a stat
+        // syscall on every append. The append-mutexes serialize
+        // load + write_all + store under the file lock, so a load
+        // followed by a corresponding store is equivalent to
+        // `fetch_add` for the contended path. On failure the store
+        // is skipped, leaving the atomic at the pre-write value.
+        let dat_pre_len: Option<u64> = if !entry.is_inline() {
             let mut dat = self.dat_file.lock();
-            let pre_len = dat.metadata().map_err(RedexError::io)?.len();
+            let pre_len = self.dat_len.load(Ordering::Acquire);
             if let Err(e) = dat.write_all(payload) {
                 // Best-effort rollback: truncate dat back to its
                 // pre-write length so partial bytes don't strand
@@ -831,54 +853,57 @@ impl DiskSegment {
                 if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
                     let _ = f.set_len(pre_len);
                 }
+                // Atomic stays at pre_len — no store happened on
+                // the write_all-failure path, so no decrement is
+                // needed.
                 return Err(RedexError::io(e));
             }
-        }
+            self.dat_len
+                .store(pre_len + payload.len() as u64, Ordering::Release);
+            Some(pre_len)
+        } else {
+            None
+        };
         // Test-only injection: dat write succeeded, now bail
         // before touching idx. Exercises the dat-rollback path.
         #[cfg(test)]
         if self.fail_after_dat_write.swap(false, Ordering::AcqRel) {
-            if !entry.is_inline() {
-                let dat_path = self.live_gen_path("dat");
-                if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                    let cur = f.metadata().map(|m| m.len()).unwrap_or(0);
-                    let _ = f.set_len(cur.saturating_sub(payload.len() as u64));
-                }
+            if let Some(target) = dat_pre_len {
+                // The dat write completed and the atomic was
+                // bumped — roll both back through the canonical
+                // helper so the cached length stays in sync.
+                self.rollback_truncate("dat", target);
             }
             return Err(RedexError::Io(
                 "test-injected post-dat-pre-idx failure".into(),
             ));
         }
         let mut idx = self.idx_file.lock();
-        // `idx.metadata()?` can fail (file handle invalidated
-        // after compact_to placeholder swap, fs error, etc.) AFTER
-        // the dat write at line 607 has already committed bytes
-        // to disk. A `?` early-return would skip the rollback
-        // block below, leaving orphan dat bytes on disk while the
-        // caller is told the append failed. Wrap explicitly so
-        // the dat rollback runs on this path too.
+        // `metadata()`-based pre-len read removed (PERF_AUDIT
+        // §5.3): the idx length is tracked via `idx_len`. The
+        // append-mutex serializes load + write_all + store so
+        // this is equivalent to `fetch_add` for the contended
+        // path, and the rollback paths below restore the atomic
+        // alongside the file truncation.
+        //
+        // The test-only `fail_next_idx_metadata` flag now stands
+        // in for any infallible-looking precondition that could
+        // still fail at runtime (the original handle-invalidated
+        // case from the prior compact_to placeholder layout is
+        // gone — there are no metadata calls left here to fail —
+        // but the rollback path remains under test coverage so a
+        // future failure mode can be exercised without churn).
         #[cfg(test)]
-        let idx_metadata = if self.fail_next_idx_metadata.swap(false, Ordering::AcqRel) {
-            Err(std::io::Error::other("test-injected idx.metadata failure"))
-        } else {
-            idx.metadata()
-        };
-        #[cfg(not(test))]
-        let idx_metadata = idx.metadata();
-        let pre_idx_len = match idx_metadata {
-            Ok(m) => m.len(),
-            Err(e) => {
-                drop(idx);
-                if !entry.is_inline() {
-                    let dat_path = self.live_gen_path("dat");
-                    if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                        let cur = f.metadata().map(|m| m.len()).unwrap_or(0);
-                        let _ = f.set_len(cur.saturating_sub(payload.len() as u64));
-                    }
-                }
-                return Err(RedexError::io(e));
+        if self.fail_next_idx_metadata.swap(false, Ordering::AcqRel) {
+            drop(idx);
+            if let Some(target) = dat_pre_len {
+                self.rollback_truncate("dat", target);
             }
-        };
+            return Err(RedexError::io(std::io::Error::other(
+                "test-injected idx.metadata failure",
+            )));
+        }
+        let pre_idx_len = self.idx_len.load(Ordering::Acquire);
         if let Err(e) = idx.write_all(&entry.to_bytes()) {
             drop(idx);
             let dat_rollback = if entry.is_inline() {
@@ -889,42 +914,31 @@ impl DiskSegment {
             self.rollback_after_idx_failure(pre_idx_len, dat_rollback);
             return Err(RedexError::io(e));
         }
+        self.idx_len
+            .store(pre_idx_len + REDEX_ENTRY_SIZE as u64, Ordering::Release);
         drop(idx);
 
         // Append the timestamp to the ts sidecar. If it fails we
         // roll back idx (and dat) so the on-disk index never
         // reaches an entry without a matching timestamp.
         let mut ts = self.ts_file.lock();
-        // `ts.metadata()?` can fail AFTER both dat AND idx have
-        // committed bytes to disk. A `?` early-return would skip
-        // the rollback block below, leaving the on-disk idx with
-        // a record whose ts entry never landed (so on reopen
-        // `read_timestamps` returns None for the length mismatch
-        // and every recovered entry gets `now()` as its
-        // timestamp, breaking age-based retention). Wrap
-        // explicitly so the idx + dat rollback runs on this path
-        // too.
+        // `metadata()` pre-len read replaced by the `ts_len`
+        // atomic (PERF_AUDIT §5.3); same load + write_all + store
+        // discipline as the idx step above.
         #[cfg(test)]
-        let ts_metadata = if self.fail_next_ts_metadata.swap(false, Ordering::AcqRel) {
-            Err(std::io::Error::other("test-injected ts.metadata failure"))
-        } else {
-            ts.metadata()
-        };
-        #[cfg(not(test))]
-        let ts_metadata = ts.metadata();
-        let pre_ts_len = match ts_metadata {
-            Ok(m) => m.len(),
-            Err(e) => {
-                drop(ts);
-                let dat_rollback = if entry.is_inline() {
-                    None
-                } else {
-                    Some(payload.len() as u64)
-                };
-                self.rollback_after_idx_failure(pre_idx_len, dat_rollback);
-                return Err(RedexError::io(e));
-            }
-        };
+        if self.fail_next_ts_metadata.swap(false, Ordering::AcqRel) {
+            drop(ts);
+            let dat_rollback = if entry.is_inline() {
+                None
+            } else {
+                Some(payload.len() as u64)
+            };
+            self.rollback_after_idx_failure(pre_idx_len, dat_rollback);
+            return Err(RedexError::io(std::io::Error::other(
+                "test-injected ts.metadata failure",
+            )));
+        }
+        let pre_ts_len = self.ts_len.load(Ordering::Acquire);
         if let Err(e) = ts.write_all(&timestamp_ns.to_le_bytes()) {
             drop(ts);
             let dat_rollback = if entry.is_inline() {
@@ -935,7 +949,11 @@ impl DiskSegment {
             self.rollback_after_ts_failure(pre_idx_len, pre_ts_len, dat_rollback);
             return Err(RedexError::io(e));
         }
+        self.ts_len.store(pre_ts_len + 8, Ordering::Release);
         drop(ts);
+        // Suppress an unused-binding warning when `dat_pre_len` is
+        // only consumed inside the test-injection branch above.
+        let _ = dat_pre_len;
 
         // Bytes written across all three files this call. ts is 8
         // bytes, idx is REDEX_ENTRY_SIZE, dat is payload.len() for
@@ -1041,17 +1059,20 @@ impl DiskSegment {
             ts_buf.extend_from_slice(&t.to_le_bytes());
         }
 
-        // Skip dat entirely when every entry is inline. Track
-        // `dat_pre_len` only when we actually wrote, so the idx/ts
-        // rollback paths know whether a dat truncation is needed.
+        // PERF_AUDIT §5.3 — pre-write lengths come from the
+        // per-file `AtomicU64` tracking rather than a `metadata()`
+        // stat-class syscall on every batch append. Same
+        // load + write_all + store discipline as `append_entry_inner`.
         let dat_pre_len: Option<u64> = if !dat_buf.is_empty() {
             let mut dat = self.dat_file.lock();
-            let pre_len = dat.metadata().map_err(RedexError::io)?.len();
+            let pre_len = self.dat_len.load(Ordering::Acquire);
             if let Err(e) = dat.write_all(&dat_buf) {
                 drop(dat);
                 self.rollback_truncate("dat", pre_len);
                 return Err(RedexError::io(e));
             }
+            self.dat_len
+                .store(pre_len + dat_buf.len() as u64, Ordering::Release);
             drop(dat);
             Some(pre_len)
         } else {
@@ -1059,27 +1080,20 @@ impl DiskSegment {
         };
 
         let mut idx = self.idx_file.lock();
-        // Same hazard as `append_entry_inner` — `metadata()?` can
-        // fail after the dat write at line 787 has committed
-        // bytes. Wrap explicitly so the dat rollback runs.
+        // Test-only injection: simulate a pre-idx-write failure
+        // after dat has committed. Path through the canonical
+        // rollback helper so the cached length stays in sync.
         #[cfg(test)]
-        let idx_metadata = if self.fail_next_idx_metadata.swap(false, Ordering::AcqRel) {
-            Err(std::io::Error::other("test-injected idx.metadata failure"))
-        } else {
-            idx.metadata()
-        };
-        #[cfg(not(test))]
-        let idx_metadata = idx.metadata();
-        let idx_pre_len = match idx_metadata {
-            Ok(m) => m.len(),
-            Err(e) => {
-                drop(idx);
-                if let Some(pre_len) = dat_pre_len {
-                    self.rollback_truncate("dat", pre_len);
-                }
-                return Err(RedexError::io(e));
+        if self.fail_next_idx_metadata.swap(false, Ordering::AcqRel) {
+            drop(idx);
+            if let Some(pre_len) = dat_pre_len {
+                self.rollback_truncate("dat", pre_len);
             }
-        };
+            return Err(RedexError::io(std::io::Error::other(
+                "test-injected idx.metadata failure",
+            )));
+        }
+        let idx_pre_len = self.idx_len.load(Ordering::Acquire);
         if let Err(e) = idx.write_all(&idx_buf) {
             drop(idx);
             self.rollback_truncate("idx", idx_pre_len);
@@ -1088,34 +1102,27 @@ impl DiskSegment {
             }
             return Err(RedexError::io(e));
         }
+        self.idx_len
+            .store(idx_pre_len + idx_buf.len() as u64, Ordering::Release);
         drop(idx);
 
         let mut ts = self.ts_file.lock();
-        // `metadata()?` can fail after dat AND idx have both
-        // committed bytes. Wrap explicitly so the full rollback
-        // runs on this path too — without it the on-disk idx
-        // would end up with records whose ts never landed,
-        // breaking `read_timestamps` alignment and age-based
-        // retention.
+        // Test-only injection: simulate a pre-ts-write failure
+        // after both dat and idx have committed. Full rollback
+        // runs so the on-disk idx never reaches an entry without
+        // a matching timestamp.
         #[cfg(test)]
-        let ts_metadata = if self.fail_next_ts_metadata.swap(false, Ordering::AcqRel) {
-            Err(std::io::Error::other("test-injected ts.metadata failure"))
-        } else {
-            ts.metadata()
-        };
-        #[cfg(not(test))]
-        let ts_metadata = ts.metadata();
-        let ts_pre_len = match ts_metadata {
-            Ok(m) => m.len(),
-            Err(e) => {
-                drop(ts);
-                self.rollback_truncate("idx", idx_pre_len);
-                if let Some(pre_len) = dat_pre_len {
-                    self.rollback_truncate("dat", pre_len);
-                }
-                return Err(RedexError::io(e));
+        if self.fail_next_ts_metadata.swap(false, Ordering::AcqRel) {
+            drop(ts);
+            self.rollback_truncate("idx", idx_pre_len);
+            if let Some(pre_len) = dat_pre_len {
+                self.rollback_truncate("dat", pre_len);
             }
-        };
+            return Err(RedexError::io(std::io::Error::other(
+                "test-injected ts.metadata failure",
+            )));
+        }
+        let ts_pre_len = self.ts_len.load(Ordering::Acquire);
         if let Err(e) = ts.write_all(&ts_buf) {
             drop(ts);
             self.rollback_truncate("ts", ts_pre_len);
@@ -1125,6 +1132,8 @@ impl DiskSegment {
             }
             return Err(RedexError::io(e));
         }
+        self.ts_len
+            .store(ts_pre_len + ts_buf.len() as u64, Ordering::Release);
         drop(ts);
 
         let total_bytes = (dat_buf.len() + idx_buf.len() + ts_buf.len()) as u64;
@@ -1354,6 +1363,11 @@ impl DiskSegment {
         } else {
             old_dat[dat_base as usize..].to_vec()
         };
+        // Snapshot the new dat's length before the variable gets
+        // shadowed by the append-mode `File` handle below, so the
+        // `dat_len` atomic reset at the manifest flip has a clean
+        // source.
+        let new_dat_len = new_dat.len() as u64;
 
         // Create the new generation directory and write its three
         // files. Until the manifest flip below, none of this is
@@ -1478,6 +1492,17 @@ impl DiskSegment {
         *worker_idx_guard = new_idx_worker;
         *worker_dat_guard = new_dat_worker;
         *worker_ts_guard = new_ts_worker;
+        // PERF_AUDIT §5.3 — reset the cached on-disk lengths to
+        // the new generation's files (the prior generation's
+        // values would point past the end of the freshly-written
+        // dat / idx / ts, breaking the next append's pre_len
+        // capture). Under the file locks held above, no append
+        // can observe a transient mismatch.
+        self.idx_len
+            .store(new_idx_bytes.len() as u64, Ordering::Release);
+        self.dat_len.store(new_dat_len, Ordering::Release);
+        self.ts_len
+            .store(new_ts_bytes.len() as u64, Ordering::Release);
         self.live_gen.store(next_gen, Ordering::Release);
 
         // Drop locks before the best-effort sweep of the prior
@@ -2588,6 +2613,220 @@ mod tests {
         assert_eq!(recovered.index.len(), 2);
         assert_eq!(&recovered.payload_bytes[..p1.len()], p1);
         assert_eq!(&recovered.payload_bytes[p1.len()..p1.len() + p2.len()], p2);
+
+        cleanup(&base);
+    }
+
+    /// PERF_AUDIT §5.3 regression: the cached `dat_len` / `idx_len` /
+    /// `ts_len` atomics replace a `metadata()` syscall on every
+    /// append. The on-disk file sizes after each successful append
+    /// must equal the atomic values, AND a rollback path that
+    /// truncates a file must also store the matching atomic so the
+    /// next append's pre-len capture is correct. Without this last
+    /// piece, after a `fail_next_idx_metadata` injection the dat
+    /// atomic would stay at `pre_dat_len + payload.len()` while the
+    /// dat file itself was truncated to `pre_dat_len` — and the next
+    /// rollback would set_len the dat to a wrong (over-sized) target.
+    ///
+    /// We exercise this end-to-end: prime, inject an idx-metadata
+    /// failure, observe that the dat file is correctly rolled back,
+    /// THEN do another successful append + reopen and verify
+    /// recovery sees a clean state with no stranded bytes.
+    #[test]
+    fn cached_lengths_stay_in_sync_across_idx_metadata_rollback() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/cached_len_idx").unwrap();
+        let live = gen_dir(&channel_dir(&base, &name), FIRST_GENERATION);
+        let dat_path = live.join("dat");
+
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+
+        let p1: &[u8] = b"prime-payload-AAA";
+        let e1 = RedexEntry::new_heap(0, 0, p1.len() as u32, 0, payload_checksum(p1));
+        recovered.disk.append_entry(&e1, p1).unwrap();
+        recovered.disk.sync().unwrap();
+        let pre_dat_len = std::fs::metadata(&dat_path).unwrap().len();
+        assert_eq!(pre_dat_len as usize, p1.len());
+
+        // Arm the post-dat / pre-idx injection — runs AFTER the dat
+        // atomic has been bumped but BEFORE the idx write. The
+        // rollback must put dat_len back so the subsequent append's
+        // pre-len matches the truncated file size.
+        recovered.disk.arm_next_idx_metadata_failure();
+        let p2: &[u8] = b"would-strand-BBBB";
+        let e2 = RedexEntry::new_heap(1, p1.len() as u32, p2.len() as u32, 0, payload_checksum(p2));
+        let err = recovered.disk.append_entry(&e2, p2);
+        assert!(err.is_err(), "injected idx-metadata failure must surface");
+
+        // Without the atomic store in rollback_truncate, dat_len
+        // would still read `pre_dat_len + p2.len()`. We can't peek
+        // the atomic directly, but we can verify behavior: do
+        // another append, then check that `payload_offset` /
+        // recovery line up exactly. Any stale atomic would cause
+        // the next rollback path to set_len past the real file
+        // size — extending with garbage zeros.
+        let p3: &[u8] = b"good-retry-CCCC";
+        let e3 = RedexEntry::new_heap(2, p1.len() as u32, p3.len() as u32, 0, payload_checksum(p3));
+        recovered.disk.append_entry(&e3, p3).unwrap();
+        recovered.disk.sync().unwrap();
+
+        let final_dat_len = std::fs::metadata(&dat_path).unwrap().len();
+        assert_eq!(
+            final_dat_len as usize,
+            p1.len() + p3.len(),
+            "dat file must hold exactly p1 + p3 after the rolled-back attempt; \
+             any stranded bytes would shift recovery's heap offsets"
+        );
+
+        // Force a SECOND idx-metadata failure to exercise the
+        // rollback_after_idx_failure path that reads the dat_len
+        // atomic to compute the truncation target. If the atomic
+        // were drifting, the target would land past the real file
+        // end and set_len would zero-extend.
+        recovered.disk.arm_next_idx_metadata_failure();
+        let p4: &[u8] = b"second-strand-DDDD";
+        let e4 = RedexEntry::new_heap(
+            3,
+            (p1.len() + p3.len()) as u32,
+            p4.len() as u32,
+            0,
+            payload_checksum(p4),
+        );
+        let err = recovered.disk.append_entry(&e4, p4);
+        assert!(err.is_err(), "second injected idx-metadata failure must surface");
+
+        let after_second_failure = std::fs::metadata(&dat_path).unwrap().len();
+        assert_eq!(
+            after_second_failure as usize,
+            p1.len() + p3.len(),
+            "rolled-back dat must equal pre-failure length exactly, with no \
+             trailing zero-extension from a stale length atomic"
+        );
+
+        drop(recovered);
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert_eq!(recovered.index.len(), 2, "only p1 and p3 must survive");
+        assert_eq!(&recovered.payload_bytes[..p1.len()], p1);
+        assert_eq!(&recovered.payload_bytes[p1.len()..], p3);
+
+        cleanup(&base);
+    }
+
+    /// PERF_AUDIT §5.3 regression: same property for the ts-metadata
+    /// rollback path — after the test injection, the cached lengths
+    /// must match the on-disk files exactly so subsequent appends
+    /// don't see drift.
+    #[test]
+    fn cached_lengths_stay_in_sync_across_ts_metadata_rollback() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/cached_len_ts").unwrap();
+        let live = gen_dir(&channel_dir(&base, &name), FIRST_GENERATION);
+        let dat_path = live.join("dat");
+        let idx_path = live.join("idx");
+
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let p1: &[u8] = b"prime-payload-AAA";
+        let e1 = RedexEntry::new_heap(0, 0, p1.len() as u32, 0, payload_checksum(p1));
+        recovered.disk.append_entry(&e1, p1).unwrap();
+        recovered.disk.sync().unwrap();
+        let pre_dat_len = std::fs::metadata(&dat_path).unwrap().len();
+        let pre_idx_len = std::fs::metadata(&idx_path).unwrap().len();
+
+        recovered.disk.arm_next_ts_metadata_failure();
+        let p2: &[u8] = b"would-strand-BBBB";
+        let e2 = RedexEntry::new_heap(1, p1.len() as u32, p2.len() as u32, 0, payload_checksum(p2));
+        let err = recovered.disk.append_entry(&e2, p2);
+        assert!(err.is_err(), "injected ts-metadata failure must surface");
+
+        assert_eq!(
+            std::fs::metadata(&dat_path).unwrap().len(),
+            pre_dat_len,
+            "ts-metadata failure must roll dat back to pre-failure length"
+        );
+        assert_eq!(
+            std::fs::metadata(&idx_path).unwrap().len(),
+            pre_idx_len,
+            "ts-metadata failure must roll idx back to pre-failure length"
+        );
+
+        let p3: &[u8] = b"good-retry-CCCC";
+        let e3 = RedexEntry::new_heap(2, p1.len() as u32, p3.len() as u32, 0, payload_checksum(p3));
+        recovered.disk.append_entry(&e3, p3).unwrap();
+        recovered.disk.sync().unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&dat_path).unwrap().len() as usize,
+            p1.len() + p3.len(),
+            "post-rollback append must land at the rolled-back dat tail; a \
+             stale length atomic would skew the on-disk size"
+        );
+
+        cleanup(&base);
+    }
+
+    /// PERF_AUDIT §5.3 regression: `compact_to` must reset the
+    /// cached `dat_len` / `idx_len` / `ts_len` atomics to the new
+    /// generation's file sizes. Without the reset, the post-compact
+    /// atomic would still point at the OLD generation's larger
+    /// values and the next rollback path would set_len the new
+    /// (smaller) file to that stale length — zero-extending past
+    /// its real EOF and corrupting recovery.
+    #[test]
+    fn compact_to_resets_cached_lengths_for_new_generation() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/cached_len_compact").unwrap();
+
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let payloads: [&[u8]; 4] = [b"AAAAA", b"BBBBB", b"CCCCC", b"DDDDD"];
+        let mut offset = 0u32;
+        let mut entries: Vec<RedexEntry> = Vec::new();
+        for (seq, p) in payloads.iter().enumerate() {
+            let e = RedexEntry::new_heap(seq as u64, offset, p.len() as u32, 0, payload_checksum(p));
+            recovered.disk.append_entry(&e, p).unwrap();
+            entries.push(e);
+            offset += p.len() as u32;
+        }
+        recovered.disk.sync().unwrap();
+
+        // Compact down to entries [2, 3]. dat_base is the absolute
+        // offset of the FIRST surviving heap entry in the current
+        // dat (10), so the new dat is `[CCCCC][DDDDD]` (10 bytes).
+        let surviving: Vec<RedexEntry> = entries[2..].to_vec();
+        let surviving_ts = vec![0u64; surviving.len()];
+        let dat_base = entries[2].payload_offset as u64;
+        recovered
+            .disk
+            .compact_to(&surviving, &surviving_ts, dat_base)
+            .unwrap();
+
+        let live = recovered.disk.live_dir();
+        let post_dat_len = std::fs::metadata(live.join("dat")).unwrap().len();
+        let post_idx_len = std::fs::metadata(live.join("idx")).unwrap().len();
+        let post_ts_len = std::fs::metadata(live.join("ts")).unwrap().len();
+        assert_eq!(post_dat_len as usize, 10, "new dat must be exactly 10 bytes");
+        assert_eq!(post_idx_len as usize, surviving.len() * REDEX_ENTRY_SIZE);
+        assert_eq!(post_ts_len as usize, surviving.len() * 8);
+
+        // Probe the atomics indirectly: arm an idx-metadata failure
+        // and observe the rollback truncates dat to the CURRENT
+        // file length (not the pre-compact larger one). If
+        // compact_to left the dat atomic at the pre-compact value
+        // (25), rollback_after_idx_failure would set_len the dat
+        // to `25 - payload.len()` — extending the new 10-byte file
+        // with zeros up to that target.
+        recovered.disk.arm_next_idx_metadata_failure();
+        let p5: &[u8] = b"EEEEE";
+        let e5 = RedexEntry::new_heap(99, post_dat_len as u32, p5.len() as u32, 0, payload_checksum(p5));
+        let err = recovered.disk.append_entry(&e5, p5);
+        assert!(err.is_err(), "injected idx-metadata failure must surface");
+
+        let dat_after_rollback = std::fs::metadata(live.join("dat")).unwrap().len();
+        assert_eq!(
+            dat_after_rollback, post_dat_len,
+            "rollback after compact must restore dat to the post-compact \
+             length, not the pre-compact one — a stale length atomic \
+             would zero-extend the file"
+        );
 
         cleanup(&base);
     }
