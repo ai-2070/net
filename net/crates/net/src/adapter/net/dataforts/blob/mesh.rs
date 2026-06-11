@@ -1871,6 +1871,16 @@ impl MeshBlobAdapter {
     /// Returns the requested byte slice in order. `touched` is
     /// extended with every `TreeNode` hash + every leaf chunk
     /// hash walked — used by the data-gravity heat-bump path.
+    /// PERF_AUDIT §6.4 — appends into a caller-supplied `out: &mut
+    /// Vec<u8>` rather than returning a fresh `Vec` per recursion
+    /// level. Pre-fix each level allocated its own Vec and the
+    /// parent did `out.extend_from_slice(&child_bytes)` — a depth-4
+    /// tree fetching a 1 GiB range memcpy'd ~4 GiB across the walk.
+    /// With one shared output buffer, every level appends directly;
+    /// the total per-walk byte count is exactly `range_end -
+    /// range_start`. The caller (`fetch_range` for tree blobs)
+    /// pre-allocates `out` to the range length so even the initial
+    /// growth-by-doubling cost is zero.
     fn walk_tree_range<'a>(
         &'a self,
         node_hash: [u8; 32],
@@ -1879,12 +1889,13 @@ impl MeshBlobAdapter {
         range_start: u64,
         range_end: u64,
         touched: &'a mut Vec<[u8; 32]>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, BlobError>> + Send + 'a>>
+        out: &'a mut Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), BlobError>> + Send + 'a>>
     {
         Box::pin(async move {
             // Cheap guard: empty range short-circuits the fetch.
             if range_end <= range_start {
-                return Ok(Vec::new());
+                return Ok(());
             }
             if range_end > subtree_size {
                 return Err(BlobError::Backend(format!(
@@ -1949,7 +1960,6 @@ impl MeshBlobAdapter {
                                 .to_owned(),
                         ));
                     }
-                    let mut out: Vec<u8> = Vec::new();
                     let mut offset: u64 = 0;
                     for (child_hash, child_size) in children {
                         let child_start = offset;
@@ -1963,19 +1973,21 @@ impl MeshBlobAdapter {
                         // child's local range.
                         let sub_start = range_start.saturating_sub(child_start);
                         let sub_end = range_end.saturating_sub(child_start).min(child_size);
-                        let child_bytes = self
-                            .walk_tree_range(
-                                child_hash,
-                                child_size,
-                                residual_depth - 1,
-                                sub_start,
-                                sub_end,
-                                touched,
-                            )
-                            .await?;
-                        out.extend_from_slice(&child_bytes);
+                        // PERF_AUDIT §6.4 — pass the shared output
+                        // buffer down; the child appends directly
+                        // into it, no per-level intermediate Vec.
+                        self.walk_tree_range(
+                            child_hash,
+                            child_size,
+                            residual_depth - 1,
+                            sub_start,
+                            sub_end,
+                            touched,
+                            out,
+                        )
+                        .await?;
                     }
-                    Ok(out)
+                    Ok(())
                 }
                 super::blob_tree::TreeNode::Leaf { chunks } => {
                     if residual_depth != 1 {
@@ -1996,7 +2008,6 @@ impl MeshBlobAdapter {
                             residual_depth
                         )));
                     }
-                    let mut out: Vec<u8> = Vec::new();
                     let mut offset: u64 = 0;
                     for chunk in chunks {
                         let chunk_start = offset;
@@ -2025,10 +2036,14 @@ impl MeshBlobAdapter {
                                 requested_end: sub_end,
                                 actual_len: chunk_bytes.len() as u64,
                             })?;
+                        // PERF_AUDIT §6.4 — append into the shared
+                        // output buffer; one memcpy (chunk slice →
+                        // out) instead of two (slice → leaf Vec →
+                        // parent Vec).
                         out.extend_from_slice(slice);
                         touched.push(chunk.hash);
                     }
-                    Ok(out)
+                    Ok(())
                 }
                 super::blob_tree::TreeNode::ErasureLeaf { stripes } => {
                     if residual_depth != 1 {
@@ -2064,7 +2079,6 @@ impl MeshBlobAdapter {
                             }
                         }
                     }
-                    let mut out: Vec<u8> = Vec::new();
                     let mut offset: u64 = 0;
                     for stripe in &stripes {
                         let stripe_size = stripe.covered_bytes();
@@ -2074,6 +2088,14 @@ impl MeshBlobAdapter {
                         if stripe_end <= range_start || stripe_start >= range_end {
                             continue;
                         }
+                        // PERF_AUDIT §6.4 — `walk_stripe_range` still
+                        // returns a Vec because reconstruction's
+                        // mutable-shard buffer contract doesn't
+                        // cleanly thread a shared output buffer; we
+                        // append into `out` once per stripe instead
+                        // of building a per-recursion-level Vec
+                        // first. One memcpy per stripe vs N memcpys
+                        // through the tree levels.
                         let stripe_bytes = self
                             .walk_stripe_range(
                                 stripe,
@@ -2085,7 +2107,7 @@ impl MeshBlobAdapter {
                             .await?;
                         out.extend_from_slice(&stripe_bytes);
                     }
-                    Ok(out)
+                    Ok(())
                 }
             }
         })
@@ -3694,6 +3716,14 @@ impl BlobAdapter for MeshBlobAdapter {
                     )));
                 }
                 let mut touched = Vec::new();
+                // PERF_AUDIT §6.4 — pre-allocate the output buffer
+                // to the requested range length so even the initial
+                // growth-by-doubling cost is zero and every
+                // recursion level appends in-place rather than
+                // alloc'ing its own intermediate Vec.
+                let mut out: Vec<u8> = Vec::with_capacity(
+                    range.end.saturating_sub(range.start) as usize,
+                );
                 let walk_result = self
                     .walk_tree_range(
                         *root_hash,
@@ -3702,10 +3732,11 @@ impl BlobAdapter for MeshBlobAdapter {
                         range.start,
                         range.end,
                         &mut touched,
+                        &mut out,
                     )
                     .await;
                 match walk_result {
-                    Ok(bytes) => (Ok(Bytes::from(bytes)), touched),
+                    Ok(()) => (Ok(Bytes::from(out)), touched),
                     Err(e) => (Err(e), Vec::new()),
                 }
             }
