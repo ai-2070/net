@@ -6,11 +6,8 @@
 //! - Key derivation for session keys
 
 use bytes::{Bytes, BytesMut};
-use chacha20poly1305::{
-    aead::{Aead, AeadInPlace, KeyInit},
-    ChaCha20Poly1305,
-};
 use parking_lot::Mutex;
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use snow::{params::NoiseParams, Builder, HandshakeState};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -364,6 +361,17 @@ impl NoiseHandshake {
     }
 }
 
+/// Build the `ring` AEAD key for the packet path.
+#[expect(
+    clippy::expect_used,
+    reason = "UnboundKey::new fails only on key-length mismatch; the [u8; 32] parameter makes that unrepresentable for CHACHA20_POLY1305"
+)]
+fn packet_key(key: &[u8; 32]) -> LessSafeKey {
+    LessSafeKey::new(
+        UnboundKey::new(&CHACHA20_POLY1305, key).expect("32-byte ChaCha20-Poly1305 key"),
+    )
+}
+
 /// Packet cipher using ChaCha20-Poly1305 with counter-based nonces.
 ///
 /// Nonce format: `[session_prefix: 4 bytes][counter: 8 bytes]`
@@ -384,8 +392,17 @@ impl NoiseHandshake {
 /// When used inside a `PacketPool`, the TX counter should be shared across
 /// all ciphers in the pool via `with_shared_tx_counter()` to prevent nonce
 /// reuse across concurrent builders.
+///
+/// Backend: `ring`'s RFC 8439 ChaCha20-Poly1305 (CRYPTO SPIKE
+/// 2026-06-11). Swapped from the RustCrypto `chacha20poly1305`
+/// stack, whose poly1305 0.8 AVX2 backend re-derives the Poly1305
+/// key powers per MESSAGE — ~700 ns of fixed cost on every packet,
+/// paid on both seal and open (975 ns total at 64 B vs ~0.47 ns/B
+/// marginal; see `net_encryption/raw_aead`). Identical wire bytes
+/// — both implement RFC 8439 — pinned by the cross-impl round-trip
+/// tests below.
 pub struct PacketCipher {
-    cipher: ChaCha20Poly1305,
+    cipher: LessSafeKey,
     /// Pre-built nonce with the session prefix already filled into
     /// the first 4 bytes (and the counter bytes left as zeros for
     /// each per-packet overwrite). Per crypto-session perf #138,
@@ -597,7 +614,7 @@ impl PacketCipher {
         let mut nonce_template = [0u8; NONCE_SIZE];
         nonce_template[0..4].copy_from_slice(&session_prefix_from_id(session_id));
         Self {
-            cipher: ChaCha20Poly1305::new(key.into()),
+            cipher: packet_key(key),
             nonce_template,
             tx_counter: Arc::new(AtomicU64::new(0)),
             rx_window: Mutex::new(ReplayWindow::new()),
@@ -617,7 +634,7 @@ impl PacketCipher {
         let mut nonce_template = [0u8; NONCE_SIZE];
         nonce_template[0..4].copy_from_slice(&session_prefix_from_id(session_id));
         Self {
-            cipher: ChaCha20Poly1305::new(key.into()),
+            cipher: packet_key(key),
             nonce_template,
             tx_counter,
             rx_window: Mutex::new(ReplayWindow::new()),
@@ -665,10 +682,14 @@ impl PacketCipher {
 
         let tag = self
             .cipher
-            .encrypt_in_place_detached((&nonce).into(), aad, buffer)
+            .seal_in_place_separate_tag(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::from(aad),
+                buffer.as_mut(),
+            )
             .map_err(|_| CryptoError::Encryption("encryption failed".to_string()))?;
 
-        buffer.extend_from_slice(&tag);
+        buffer.extend_from_slice(tag.as_ref());
         Ok(counter)
     }
 
@@ -693,9 +714,11 @@ impl PacketCipher {
 
         let tag = self
             .cipher
-            .encrypt_in_place_detached((&nonce).into(), aad, buffer)
+            .seal_in_place_separate_tag(Nonce::assume_unique_for_key(nonce), Aad::from(aad), buffer)
             .map_err(|_| CryptoError::Encryption("encryption failed".to_string()))?;
-        Ok((counter, tag.into()))
+        let mut tag_bytes = [0u8; TAG_SIZE];
+        tag_bytes.copy_from_slice(tag.as_ref());
+        Ok((counter, tag_bytes))
     }
 
     /// Encrypt payload with AAD.
@@ -703,19 +726,17 @@ impl PacketCipher {
     /// Returns (ciphertext, nonce_counter).
     #[inline]
     pub fn encrypt(&self, aad: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, u64), CryptoError> {
-        use chacha20poly1305::aead::Payload;
-
         let counter = self.tx_counter.fetch_add(1, Ordering::Relaxed);
         let nonce = self.nonce_from_counter(counter);
 
-        let payload = Payload {
-            msg: plaintext,
-            aad,
-        };
-
-        let ciphertext = self
-            .cipher
-            .encrypt((&nonce).into(), payload)
+        let mut ciphertext = Vec::with_capacity(plaintext.len() + TAG_SIZE);
+        ciphertext.extend_from_slice(plaintext);
+        self.cipher
+            .seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::from(aad),
+                &mut ciphertext,
+            )
             .map_err(|_| CryptoError::Encryption("encryption failed".to_string()))?;
 
         Ok((ciphertext, counter))
@@ -729,17 +750,20 @@ impl PacketCipher {
         aad: &[u8],
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        use chacha20poly1305::aead::Payload;
-
         let nonce = self.nonce_from_counter(nonce_counter);
-        let payload = Payload {
-            msg: ciphertext,
-            aad,
-        };
 
-        self.cipher
-            .decrypt((&nonce).into(), payload)
-            .map_err(|_| CryptoError::Decryption("decryption failed".to_string()))
+        let mut buf = ciphertext.to_vec();
+        let plaintext_len = self
+            .cipher
+            .open_in_place(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::from(aad),
+                &mut buf,
+            )
+            .map_err(|_| CryptoError::Decryption("decryption failed".to_string()))?
+            .len();
+        buf.truncate(plaintext_len);
+        Ok(buf)
     }
 
     /// Decrypt payload in-place with AAD using the provided nonce counter.
@@ -757,13 +781,16 @@ impl PacketCipher {
         }
 
         let nonce = self.nonce_from_counter(nonce_counter);
-        let plaintext_len = buffer.len() - TAG_SIZE;
-        let (data, tag_bytes) = buffer.split_at_mut(plaintext_len);
-        let tag = chacha20poly1305::Tag::from_slice(tag_bytes);
 
-        self.cipher
-            .decrypt_in_place_detached((&nonce).into(), aad, data, tag)
-            .map_err(|_| CryptoError::Decryption("decryption failed".to_string()))?;
+        // ring's `open_in_place` consumes the wire layout directly:
+        // ciphertext followed by the 16-byte tag in one contiguous
+        // buffer, decrypted in place. Returns the plaintext slice
+        // (buffer.len() - TAG_SIZE).
+        let plaintext_len = self
+            .cipher
+            .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::from(aad), buffer)
+            .map_err(|_| CryptoError::Decryption("decryption failed".to_string()))?
+            .len();
 
         Ok(plaintext_len)
     }
@@ -954,6 +981,86 @@ fn hex_string(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CRYPTO SPIKE (2026-06-11) — wire-format compatibility across
+    /// AEAD implementations. The packet path sealed with ring must
+    /// open with the RustCrypto `chacha20poly1305` stack the
+    /// pre-spike code used (and vice versa, below): both implement
+    /// RFC 8439, so for identical (key, nonce, aad) the ciphertext
+    /// and tag are byte-identical, and a mixed-version mesh
+    /// interoperates. If either test fails, the swap broke the wire
+    /// format and CANNOT ship.
+    #[test]
+    fn ring_seal_opens_with_rustcrypto() {
+        use chacha20poly1305::{
+            aead::{Aead, Payload},
+            ChaCha20Poly1305, KeyInit,
+        };
+        let key = [0x42u8; 32];
+        let session_id = 0xABCD_EF01_2345_6789u64;
+        let cipher = PacketCipher::new(&key, session_id);
+        let aad = [0x24u8; 56];
+        let plaintext: &[u8] = b"wire-format compat across AEAD implementations";
+
+        // `encrypt` returns ciphertext || tag — the same layout
+        // RustCrypto's non-detached `decrypt` consumes.
+        let (ct, counter) = cipher.encrypt(&aad, plaintext).unwrap();
+
+        // Reconstruct the nonce exactly as a receiver does from the
+        // wire header (prefix from session id + counter).
+        let mut nonce = [0u8; NONCE_SIZE];
+        nonce[0..4].copy_from_slice(&session_prefix_from_id(session_id));
+        nonce[4..12].copy_from_slice(&counter.to_le_bytes());
+
+        let rustcrypto = ChaCha20Poly1305::new((&key).into());
+        let opened = rustcrypto
+            .decrypt(
+                (&nonce).into(),
+                Payload {
+                    msg: &ct,
+                    aad: &aad,
+                },
+            )
+            .expect("RustCrypto must open ring's seal byte-for-byte");
+        assert_eq!(opened, plaintext);
+    }
+
+    /// Inverse direction: a packet sealed by a pre-spike peer
+    /// (RustCrypto) must open through the ring-backed
+    /// `PacketCipher::decrypt`.
+    #[test]
+    fn rustcrypto_seal_opens_with_ring() {
+        use chacha20poly1305::{
+            aead::{Aead, Payload},
+            ChaCha20Poly1305, KeyInit,
+        };
+        let key = [0x42u8; 32];
+        let session_id = 0xABCD_EF01_2345_6789u64;
+        let cipher = PacketCipher::new(&key, session_id);
+        let aad = [0x24u8; 56];
+        let plaintext: &[u8] = b"wire-format compat across AEAD implementations";
+        let counter = 7u64;
+
+        let mut nonce = [0u8; NONCE_SIZE];
+        nonce[0..4].copy_from_slice(&session_prefix_from_id(session_id));
+        nonce[4..12].copy_from_slice(&counter.to_le_bytes());
+
+        let rustcrypto = ChaCha20Poly1305::new((&key).into());
+        let ct = rustcrypto
+            .encrypt(
+                (&nonce).into(),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+
+        let opened = cipher
+            .decrypt(counter, &aad, &ct)
+            .expect("ring must open RustCrypto's seal byte-for-byte");
+        assert_eq!(opened, plaintext);
+    }
 
     /// Regression: previously `session_prefix` was just
     /// `(session_id as u32).to_le_bytes()` — truncating the high 32

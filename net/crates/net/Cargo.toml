@@ -85,6 +85,7 @@ redis = ["dep:redis"]
 jetstream = ["dep:async-nats"]
 net = [
     "dep:chacha20poly1305",
+    "dep:ring",
     "dep:snow",
     "dep:getrandom",
     "dep:dashmap",
@@ -239,6 +240,19 @@ arc-swap = "1.7.1"
 
 # Net adapter (optional)
 chacha20poly1305 = { version = "0.10", optional = true }
+# Packet-path AEAD (RFC 8439 ChaCha20-Poly1305) — CRYPTO SPIKE
+# (2026-06-11). The RustCrypto chacha20poly1305 stack pays ~700 ns
+# of per-MESSAGE fixed cost in poly1305 0.8's AVX2 backend
+# (Poly1305::new re-derives the r^1..r^4 key powers per call),
+# dominating small-packet encrypt/decrypt (975 ns at 64 B vs
+# ~0.47 ns/B marginal). ring's asm implementation has both low
+# fixed cost and higher bulk rate. Wire format is unchanged —
+# both implement RFC 8439, so ciphertexts are byte-identical and
+# mixed-version meshes interoperate (pinned by the cross-impl
+# round-trip tests in crypto.rs). chacha20poly1305 stays for the
+# IdentityEnvelope XChaCha sealed-box and as the cross-impl test
+# oracle.
+ring = { version = "0.17", optional = true }
 snow = { version = "0.10.0", optional = true }
 getrandom = { version = "0.4.2", optional = true }
 dashmap = { version = "6", optional = true }
