@@ -228,7 +228,8 @@ fn bench_packet_build(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark encryption/decryption (via PacketBuilder which uses XChaCha20-Poly1305).
+/// Benchmark encryption/decryption (via PacketBuilder — ChaCha20-Poly1305
+/// IETF, 12-byte template+counter nonces; see crypto::PacketCipher).
 fn bench_encryption(c: &mut Criterion) {
     let mut group = c.benchmark_group("net_encryption");
 
@@ -251,6 +252,53 @@ fn bench_encryption(c: &mut Criterion) {
                 });
             },
         );
+    }
+
+    // Decomposition: the raw AEAD call alone — crate-level
+    // `ChaCha20Poly1305::encrypt_in_place_detached` with a
+    // template nonce and a 56-byte AAD (the size
+    // `NetHeader::aad()` produces), isolating cipher cost from
+    // the builder's framing / header / buffer work in `encrypt/N`
+    // above. The gap between `encrypt/N` and `raw_aead/N` is the
+    // builder's overhead; the raw fixed cost at small sizes is
+    // the crate's per-message setup (one ChaCha block to derive
+    // the one-time Poly1305 key, plus poly1305 0.8's per-message
+    // AVX2 key-power precomputation — amortized only on multi-KB
+    // payloads).
+    {
+        use chacha20poly1305::{
+            aead::{AeadInPlace, KeyInit},
+            ChaCha20Poly1305,
+        };
+        let cipher = ChaCha20Poly1305::new((&key).into());
+        let aad = [0x42u8; 56];
+        for payload_size in [64usize, 256, 1024, 4096].iter() {
+            let mut buf = vec![0x42u8; *payload_size];
+            let mut counter = 0u64;
+            // Cheap clone (key schedule state) so each size's move
+            // closure owns its instance.
+            let cipher = cipher.clone();
+            group.throughput(Throughput::Bytes(*payload_size as u64));
+            group.bench_with_input(
+                BenchmarkId::new("raw_aead", payload_size),
+                payload_size,
+                move |b, _| {
+                    b.iter(|| {
+                        // Template-nonce shape mirrors
+                        // `PacketCipher::nonce_from_counter`; the
+                        // counter bump keeps (key, nonce) pairs
+                        // unique across iterations.
+                        counter = counter.wrapping_add(1);
+                        let mut nonce = [0u8; 12];
+                        nonce[4..12].copy_from_slice(&counter.to_le_bytes());
+                        let tag = cipher
+                            .encrypt_in_place_detached((&nonce).into(), &aad, &mut buf)
+                            .expect("AEAD encrypt cannot fail on valid inputs");
+                        std::hint::black_box(tag)
+                    });
+                },
+            );
+        }
     }
 
     group.finish();
