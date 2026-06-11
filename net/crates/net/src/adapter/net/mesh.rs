@@ -4277,6 +4277,63 @@ impl MeshNode {
     ///
     /// This is the same logic as `NetAdapter::process_packet` but extracted
     /// to work with the multi-session dispatch.
+    /// PERF_AUDIT §2.8 — two-tier resolution of the peer behind an
+    /// accepted data packet's session, for the grant path.
+    ///
+    /// Tier 1: `session.cached_node_id()` (one Relaxed load),
+    /// cross-checked against the live peer entry's session_id so a
+    /// stale cache can never misroute a grant. Tier 2:
+    /// `addr_to_node` → `peers`; the O(peers) scan is the last
+    /// resort for the legitimate session-id-mismatch case
+    /// (relay-shared source address). Any successful FALLBACK
+    /// resolution publishes the node id back onto the session so
+    /// the next packet takes tier 1 — without that publish,
+    /// sessions whose traffic never traverses the cortex RPC
+    /// dispatch hook (the only other `cache_node_id` caller) pay
+    /// the fallback chain per packet forever and the fast path is
+    /// dead for plain reliable streams (the exact shape b45bc44b8
+    /// originally shipped with; pinned by
+    /// `grant_peer_resolution_self_primes_node_id_cache`).
+    #[inline]
+    fn resolve_grant_peer(
+        peers: &DashMap<u64, PeerInfo>,
+        addr_to_node: &DashMap<SocketAddr, u64>,
+        session: &NetSession,
+    ) -> Option<(SocketAddr, Arc<NetSession>)> {
+        session
+            .cached_node_id()
+            .and_then(|nid| {
+                peers.get(&nid).and_then(|p| {
+                    (p.value().session.session_id() == session.session_id())
+                        .then(|| (p.value().addr, p.value().session.clone()))
+                })
+            })
+            .or_else(|| {
+                let peer_addr = session.peer_addr();
+                let resolved = addr_to_node
+                    .get(&peer_addr)
+                    .and_then(|node_id| {
+                        peers.get(&*node_id).and_then(|p| {
+                            (p.value().session.session_id() == session.session_id()).then(|| {
+                                (p.value().node_id, p.value().addr, p.value().session.clone())
+                            })
+                        })
+                    })
+                    .or_else(|| {
+                        peers
+                            .iter()
+                            .find(|e| e.value().session.session_id() == session.session_id())
+                            .map(|e| {
+                                (e.value().node_id, e.value().addr, e.value().session.clone())
+                            })
+                    });
+                resolved.map(|(nid, addr, sess)| {
+                    session.cache_node_id(nid);
+                    (addr, sess)
+                })
+            })
+    }
+
     fn process_local_packet(
         mut parsed: ParsedPacket,
         from_node: u64,
@@ -5084,67 +5141,12 @@ impl MeshNode {
         if let Some(total_consumed) = grant_bytes {
             // Resolve the sending peer.
             //
-            // PERF_AUDIT §2.8 — try `session.cached_node_id()` first
-            // (one Relaxed atomic load), then `ctx.peers.get(nid)`.
-            // Pre-fix this went through `addr_to_node.get` →
-            // `peers.get` → session-id validation → O(peers)
-            // iter().find fallback on every accepted packet. The
-            // per-session cache is populated lazily by the first
-            // successful resolution (here, or in the cortex RPC
-            // dispatch hook below). The addr_to_node lookup is the
-            // second-tier fallback for the window before the cache
-            // publishes; the linear scan is the last-resort fallback
-            // for the legitimate session-id-mismatch case (relay-
-            // shared source address).
-            let peer = session
-                .cached_node_id()
-                .and_then(|nid| {
-                    ctx.peers.get(&nid).and_then(|p| {
-                        (p.value().session.session_id() == session.session_id())
-                            .then(|| (p.value().addr, p.value().session.clone()))
-                    })
-                })
-                .or_else(|| {
-                    // Cache miss (or stale entry that failed the
-                    // session-id cross-check). Resolve via the
-                    // legacy chain and PUBLISH the result so
-                    // subsequent packets hit the tier-1 atomic
-                    // load — without this, sessions whose traffic
-                    // never traverses the cortex RPC hook (the
-                    // only other `cache_node_id` caller) would pay
-                    // the addr_to_node round-trip per packet
-                    // forever, and §2.8's fast path would be dead
-                    // for plain reliable streams.
-                    let peer_addr = session.peer_addr();
-                    let resolved = ctx
-                        .addr_to_node
-                        .get(&peer_addr)
-                        .and_then(|node_id| {
-                            ctx.peers.get(&*node_id).and_then(|p| {
-                                (p.value().session.session_id() == session.session_id()).then(
-                                    || {
-                                        (
-                                            p.value().node_id,
-                                            p.value().addr,
-                                            p.value().session.clone(),
-                                        )
-                                    },
-                                )
-                            })
-                        })
-                        .or_else(|| {
-                            ctx.peers
-                                .iter()
-                                .find(|e| e.value().session.session_id() == session.session_id())
-                                .map(|e| {
-                                    (e.value().node_id, e.value().addr, e.value().session.clone())
-                                })
-                        });
-                    resolved.map(|(nid, addr, sess)| {
-                        session.cache_node_id(nid);
-                        (addr, sess)
-                    })
-                });
+            // PERF_AUDIT §2.8 — see `Self::resolve_grant_peer`:
+            // tier-1 cached-node-id load (session-id cross-checked),
+            // `addr_to_node` second tier, O(peers) scan last resort,
+            // and the fallback publishes the cache so subsequent
+            // packets take tier 1.
+            let peer = Self::resolve_grant_peer(&ctx.peers, &ctx.addr_to_node, session);
             if let Some((peer_addr, peer_session)) = peer {
                 if !ctx.partition_filter.contains(&peer_addr) {
                     // Enqueue for the per-mesh drainer
@@ -13731,6 +13733,75 @@ mod heartbeat_aead_tests {
             node.session_id_to_node.len(),
             1,
             "exactly one reverse-index entry per live peer session"
+        );
+    }
+
+    /// PERF_AUDIT §2.8 regression — the grant-path fast path must
+    /// be SELF-PRIMING: a fallback resolution publishes the node id
+    /// onto the session so the next packet takes the tier-1 atomic
+    /// load. b45bc44b8 originally shipped without the publish, so
+    /// the cache stayed empty for any session whose traffic never
+    /// traversed the cortex RPC dispatch hook (plain reliable
+    /// streams) and the fast path was dead. Also pins the stale-
+    /// cache safety: a replaced session's resolution must fail the
+    /// session-id cross-check rather than misroute to the
+    /// replacement peer entry.
+    #[tokio::test]
+    async fn grant_peer_resolution_self_primes_node_id_cache() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x2Bu8; 32]);
+        let node = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+
+        let peer_id = 0xCAFE_D00Du64;
+        let peer_addr: SocketAddr = "10.3.3.3:9100".parse().unwrap();
+        let (keys, _) = make_session_keys();
+        node.install_peer(peer_id, peer_addr, keys, AddrInstallMode::DirectOverwrite);
+        let session = node
+            .peers
+            .get(&peer_id)
+            .map(|p| p.value().session.clone())
+            .expect("peer installed");
+        assert_eq!(
+            session.cached_node_id(),
+            None,
+            "install_peer must not pre-prime the cache (lazy by design)"
+        );
+
+        // First resolution: tier 1 misses, the fallback resolves via
+        // addr_to_node AND publishes the node id.
+        let (resolved_addr, resolved_session) =
+            MeshNode::resolve_grant_peer(&node.peers, &node.addr_to_node, &session)
+                .expect("fallback chain resolves the installed peer");
+        assert_eq!(resolved_addr, peer_addr);
+        assert_eq!(resolved_session.session_id(), session.session_id());
+        assert_eq!(
+            session.cached_node_id(),
+            Some(peer_id),
+            "fallback resolution must publish the cache (self-priming)"
+        );
+
+        // Second resolution: tier 1 must carry it alone — drop the
+        // addr_to_node entry to prove the fallback chain is no
+        // longer needed for this session.
+        node.addr_to_node.remove(&peer_addr);
+        let (addr2, _) =
+            MeshNode::resolve_grant_peer(&node.peers, &node.addr_to_node, &session)
+                .expect("tier-1 cached resolution");
+        assert_eq!(addr2, peer_addr);
+
+        // Stale-cache safety: a re-handshake replaces the session
+        // under the same node id. The OLD session's cached id now
+        // points at a peer entry whose session_id no longer matches
+        // — tier 1 must reject it, and with no addr or scan match
+        // for the dead session the resolution returns None instead
+        // of misrouting a grant to the replacement session.
+        let (new_keys, _) = make_session_keys();
+        node.install_peer(peer_id, peer_addr, new_keys, AddrInstallMode::DirectOverwrite);
+        assert!(
+            MeshNode::resolve_grant_peer(&node.peers, &node.addr_to_node, &session).is_none(),
+            "stale session must not resolve to the replacement peer entry"
         );
     }
 
