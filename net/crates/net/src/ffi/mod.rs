@@ -1133,28 +1133,58 @@ pub unsafe extern "C" fn net_poll(
 
     // Serialize response. Events that fail to parse are included as raw
     // strings so the caller can see all events and detect parse failures.
+    //
+    // **PERF_AUDIT §1.6.** Pre-fix every event was deserialized into a
+    // full `serde_json::Value` tree (per-event hashmap + recursive
+    // allocations + UTF-8 re-validation) and then re-serialized when the
+    // envelope was emitted. Per event that's ~1-5 µs/KB plus an
+    // unbounded chain of small allocations for the tree shape — a real
+    // load on the FFI/SDK consume hot path.
+    //
+    // The new path uses `from_slice::<&RawValue>`: validates the bytes
+    // as well-formed JSON, hands back a borrowed view into the original
+    // buffer, and lets the outer serialize splice those bytes verbatim
+    // into the envelope. Zero per-event allocation on the parse-OK fast
+    // path; the rare invalid-UTF-8 / invalid-JSON fallback still emits
+    // the bytes as a JSON string so the caller can see what got skipped.
+    use serde_json::value::RawValue;
+    #[derive(serde::Serialize)]
+    #[serde(untagged)]
+    enum EventOut<'a> {
+        Raw(&'a RawValue),
+        Fallback(String),
+    }
     let total_events = response.events.len();
-    let mut parsed_events: Vec<serde_json::Value> = Vec::with_capacity(total_events);
+    let mut events_out: Vec<EventOut<'_>> = Vec::with_capacity(total_events);
     let mut parse_errors: usize = 0;
     for e in &response.events {
-        match e.parse() {
-            Ok(v) => parsed_events.push(v),
+        match serde_json::from_slice::<&RawValue>(&e.raw) {
+            Ok(rv) => events_out.push(EventOut::Raw(rv)),
             Err(_) => {
                 parse_errors += 1;
                 // Include the raw bytes as a string so the caller doesn't silently lose events
                 if let Ok(raw) = e.raw_str() {
-                    parsed_events.push(serde_json::Value::String(raw.to_string()));
+                    events_out.push(EventOut::Fallback(raw.to_string()));
                 }
             }
         }
     }
-    let response_json = match serde_json::to_string(&serde_json::json!({
-        "events": parsed_events,
-        "next_id": response.next_id,
-        "has_more": response.has_more,
-        "count": parsed_events.len(),
-        "parse_errors": parse_errors,
-    })) {
+    #[derive(serde::Serialize)]
+    struct EnvelopeBorrowed<'a> {
+        events: &'a [EventOut<'a>],
+        next_id: Option<&'a str>,
+        has_more: bool,
+        count: usize,
+        parse_errors: usize,
+    }
+    let envelope = EnvelopeBorrowed {
+        events: &events_out,
+        next_id: response.next_id.as_deref(),
+        has_more: response.has_more,
+        count: events_out.len(),
+        parse_errors,
+    };
+    let response_json = match serde_json::to_string(&envelope) {
         Ok(s) => s,
         Err(_) => return NetError::Unknown.into(),
     };
