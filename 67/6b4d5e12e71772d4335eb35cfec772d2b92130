@@ -1,0 +1,58 @@
+net/crates/net/src/adapter/net/mod.rs
+  s_58168e769adc91::t_f07f6e4f06b817 216-223,239-245
+  s_58168e769adc91::t_67b39c32c372cb 1343-1354
+net/crates/net/src/adapter/net/channel/roster.rs
+  s_58168e769adc91::t_1bd3af03c31c1f 591-635
+net/crates/net/src/adapter/net/mesh_rpc.rs
+  s_58168e769adc91::t_49d4fb35d1b26f 4170-4226
+  s_58168e769adc91::t_1ddcc3463f39f6 4116-4130,4133-4134,4138-4141,4143-4149,4151-4167
+  s_58168e769adc91::t_02cd656d0adbfe 594-595,606
+  s_58168e769adc91::t_0e01c2c0bd07b8 3808-3817,3819-3829,3831,3836-3837,3840-3843,3846-3851,3853-3858,3862-3867
+  s_58168e769adc91::t_256cb65d6e612f 3687,3692-3694,3696,3699
+  s_58168e769adc91::t_58ad629f1c844e 3759-3768,3773-3792
+  s_58168e769adc91::t_73deefc6978031 503-532
+  s_58168e769adc91::t_ec34cf41971a9b 4070-4078,4085,4091-4096,4098,4102,4107,4110
+net/crates/net/src/adapter/net/session.rs
+  s_58168e769adc91::t_82c860a6cfd7a2 1889-1899,1901-1941
+  s_58168e769adc91::t_2540f373ea2d53 1900
+  s_58168e769adc91::t_0649426f6e5a04 564-574,590-601,609-616
+net/crates/net/src/adapter/net/proxy.rs
+  s_58168e769adc91::t_39f44f9d429ca4 744-792
+net/crates/net/src/adapter/net/reliability.rs
+  s_58168e769adc91::t_4356887d0af028 1218-1229,1233-1261
+  s_58168e769adc91::t_8a48924fb82823 773-778
+  s_58168e769adc91::t_17e8d8f5b7f64c 1230-1232
+net/crates/net/src/adapter/net/route.rs
+  s_58168e769adc91::t_11491a3c3d61d3 688
+net/crates/net/src/adapter/net/mesh.rs
+  s_58168e769adc91::t_c021841b3e64f5 2896,2911-2917
+  s_58168e769adc91::t_53469456c2e58b 2331
+  s_58168e769adc91::t_cee98aa123b92e 5108-5117,5119-5133,5135-5145
+  s_58168e769adc91::t_fb531f244f5f7c 4172-4178
+  s_58168e769adc91::t_3aa8c79d7ac949 14899-14997
+  s_58168e769adc91::t_1c33374df25e34 13672-13736
+  s_58168e769adc91::t_e7ce36cd499a8a 2774,2789-2799
+  s_58168e769adc91::t_1b0352bc96a521 6138-6140,6142-6144
+  s_58168e769adc91::t_a4df9dcef334d9 5091-5095
+  s_58168e769adc91::t_7340380129035f 1557-1558,1560,1562-1569,1571
+net/crates/net/src/adapter/net/pool.rs
+  s_58168e769adc91::t_64e0399f284d55 1771-1839
+net/crates/net/src/adapter/net/mesh_rpc_metrics.rs
+  s_58168e769adc91::t_b53330f56acf6e 845-892
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "676b4d5e12e71772d4335eb35cfec772d2b92130",
+  "prompts": {},
+  "sessions": {
+    "s_58168e769adc91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "43399f81-fab3-4b2a-a002-4ece8a909069",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
