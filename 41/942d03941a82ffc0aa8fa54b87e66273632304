@@ -1,0 +1,31 @@
+net/crates/net/src/adapter/net/redex/disk.rs
+  s_d4a014e53aa1f5::t_7d2120c9566088 925-927,929-941,952,954-956
+  s_d4a014e53aa1f5::t_dd4ada9eba1b42 1495-1502,1504-1505
+  s_d4a014e53aa1f5::t_bd85e0bd2e09f3 1062-1065,1068,1074-1075,1083-1085,1087-1090,1092-1096,1105-1106,1110-1113,1115-1119,1121-1125,1135-1136
+  s_d4a014e53aa1f5::t_29c7f3879f7e0d 523-530
+  s_d4a014e53aa1f5::t_ebaa29dc96b3a2 1366-1370
+  s_d4a014e53aa1f5::t_3fa53d53df8857 2620-2833
+  s_d4a014e53aa1f5::t_ee391c826e3e2f 549-551
+  s_d4a014e53aa1f5::t_8b89a6dc1b39d6 871-875,882-895,897-900,902-906,917-918
+  s_d4a014e53aa1f5::t_b1224c88d2c2c3 729-732,736-738
+  s_d4a014e53aa1f5::t_23c627a1e03354 146-159
+  s_d4a014e53aa1f5::t_4c0a123cb4ce26 702,712,715-723
+  s_d4a014e53aa1f5::t_47973d153b3cea 834-841,843,856-858,861-866
+  s_d4a014e53aa1f5::t_271754958993c5 1503
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "41942d03941a82ffc0aa8fa54b87e66273632304",
+  "prompts": {},
+  "sessions": {
+    "s_d4a014e53aa1f5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a6af4feb-518f-4835-a66d-5b2f7797adef",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
