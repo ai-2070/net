@@ -4710,6 +4710,57 @@ mod tests {
             .expect("length-only verification accepts same-length pre-existing");
     }
 
+    /// PERF_AUDIT §6.3 — the read-side backstop, pinned. The
+    /// length-only dedup deliberately lets a same-length corrupted
+    /// slot survive store time (asserted by
+    /// `store_chunk_idempotent_path_accepts_same_length_existing_bytes`
+    /// above); the safety argument in `store_chunk_locked`'s
+    /// comment is that `fetch_chunk`'s hash verify catches the
+    /// corruption before any caller sees the bytes. This test
+    /// closes that loop: store succeeds against the poisoned slot,
+    /// then fetch of the same chunk surfaces `HashMismatch` rather
+    /// than serving corrupt bytes. If the read-side verify is ever
+    /// weakened the same way, this fails — and §6.3's documented
+    /// tradeoff stops being sound.
+    #[tokio::test]
+    async fn fetch_backstop_catches_corruption_the_dedup_store_accepted() {
+        use crate::adapter::net::dataforts::blob::adapter::BlobAdapter;
+        let adapter = make_adapter();
+        let intended_payload = b"honest payload!!".to_vec(); // 16 bytes
+        let intended_hash: [u8; 32] = blake3::hash(&intended_payload).into();
+        let channel = MeshBlobAdapter::chunk_channel_for_hash(&intended_hash);
+        let file = adapter
+            .redex
+            .open_file(&channel, RedexFileConfig::new())
+            .unwrap();
+        // Same-length corruption pre-seeded under the honest hash.
+        let corrupt: Vec<u8> = b"CCCCCCCCCCCCCCCC".to_vec();
+        assert_eq!(corrupt.len(), intended_payload.len());
+        file.append(&corrupt).unwrap();
+
+        let blob = BlobRef::small(
+            "mesh://backstop",
+            intended_hash,
+            intended_payload.len() as u64,
+        );
+        // Store-time: accepted (length-only dedup — by design).
+        adapter
+            .store(&blob, &intended_payload)
+            .await
+            .expect("dedup fast-path accepts the same-length slot");
+        // Read-time: the backstop must refuse to serve the corrupt
+        // bytes.
+        let err = adapter
+            .fetch(&blob)
+            .await
+            .expect_err("fetch must not serve corrupted chunk bytes");
+        assert!(
+            matches!(err, BlobError::HashMismatch { .. }),
+            "read-side verify is the §6.3 backstop; got {:?}",
+            err
+        );
+    }
+
     /// PERF_AUDIT §6.3 — the dedup fast-path's length compare must
     /// run against the FIRST retained event, not the sum of all
     /// retained events. A chunk file can legitimately hold the
