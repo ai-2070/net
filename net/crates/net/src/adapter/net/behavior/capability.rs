@@ -3431,12 +3431,8 @@ mod tests {
 
         // Bare announcement — no allow-lists, no reflex_addr, no
         // signature, hop_count = 0.
-        let bare = CapabilityAnnouncement::new(
-            7,
-            kp.entity_id().clone(),
-            1,
-            sample_capability_set(),
-        );
+        let bare =
+            CapabilityAnnouncement::new(7, kp.entity_id().clone(), 1, sample_capability_set());
         assert_eq!(
             bare.signed_payload(),
             cloned_canonical(&bare),

@@ -876,12 +876,20 @@ mod tests {
             "over-largest-bound observation must land in +Inf only: {:?}",
             raw
         );
-        assert_eq!(raw.iter().sum::<u64>(), 2, "one slot per observation: {:?}", raw);
+        assert_eq!(
+            raw.iter().sum::<u64>(),
+            2,
+            "one slot per observation: {:?}",
+            raw
+        );
 
         let snap = r.snapshot();
         let s = &snap.services[0];
         assert_eq!(s.latency_count, 2);
-        assert_eq!(s.latency_buckets[0], 1, "cumulative ≤5ms includes the ==5ms obs");
+        assert_eq!(
+            s.latency_buckets[0], 1,
+            "cumulative ≤5ms includes the ==5ms obs"
+        );
         let last_finite = DEFAULT_LATENCY_BUCKETS_SECS.len() - 1;
         assert_eq!(
             s.latency_buckets[last_finite], 1,

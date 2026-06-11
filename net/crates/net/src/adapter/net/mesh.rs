@@ -2196,9 +2196,8 @@ impl MeshNode {
         // Per PERF_AUDIT §4.1: generation-keyed LRU snapshot of the
         // parsed capability set per node. Sized for typical mesh
         // sizes; tunable later if operator load demands it.
-        let capability_set_cache = Arc::new(
-            super::behavior::fold::capability_bridge::CapabilitySetCache::new(),
-        );
+        let capability_set_cache =
+            Arc::new(super::behavior::fold::capability_bridge::CapabilitySetCache::new());
         let reservation_fold: Arc<
             super::behavior::fold::Fold<super::behavior::fold::ReservationFold>,
         > = Arc::new(super::behavior::fold::Fold::new());
@@ -3808,7 +3807,11 @@ impl MeshNode {
                         .session_id_to_node
                         .get(&session_id)
                         .map(|e| *e.value())
-                        .and_then(|node_id| peers.get(&node_id).map(|e| (node_id, e.value().session.clone())))
+                        .and_then(|node_id| {
+                            peers
+                                .get(&node_id)
+                                .map(|e| (node_id, e.value().session.clone()))
+                        })
                         .filter(|(_, session)| session.session_id() == session_id);
                     if let Some((peer_node_id, session)) = matched {
                         Self::process_local_packet(parsed, peer_node_id, &session, ctx);
@@ -4323,9 +4326,7 @@ impl MeshNode {
                         peers
                             .iter()
                             .find(|e| e.value().session.session_id() == session.session_id())
-                            .map(|e| {
-                                (e.value().node_id, e.value().addr, e.value().session.clone())
-                            })
+                            .map(|e| (e.value().node_id, e.value().addr, e.value().session.clone()))
                     });
                 resolved.map(|(nid, addr, sess)| {
                     session.cache_node_id(nid);
@@ -5381,7 +5382,9 @@ impl MeshNode {
             // change_tx, so an inbound `SUBPROTOCOL_CAPABILITY_ANN`
             // bumps it correctly.
             Some(match publisher_node {
-                Some(nid) => ctx.capability_set_cache.get_or_synthesize(&ctx.capability_fold, nid),
+                Some(nid) => ctx
+                    .capability_set_cache
+                    .get_or_synthesize(&ctx.capability_fold, nid),
                 None => std::sync::Arc::new(
                     crate::adapter::net::behavior::capability::CapabilitySet::new(),
                 ),
@@ -13786,9 +13789,8 @@ mod heartbeat_aead_tests {
         // addr_to_node entry to prove the fallback chain is no
         // longer needed for this session.
         node.addr_to_node.remove(&peer_addr);
-        let (addr2, _) =
-            MeshNode::resolve_grant_peer(&node.peers, &node.addr_to_node, &session)
-                .expect("tier-1 cached resolution");
+        let (addr2, _) = MeshNode::resolve_grant_peer(&node.peers, &node.addr_to_node, &session)
+            .expect("tier-1 cached resolution");
         assert_eq!(addr2, peer_addr);
 
         // Stale-cache safety: a re-handshake replaces the session
@@ -13798,7 +13800,12 @@ mod heartbeat_aead_tests {
         // for the dead session the resolution returns None instead
         // of misrouting a grant to the replacement session.
         let (new_keys, _) = make_session_keys();
-        node.install_peer(peer_id, peer_addr, new_keys, AddrInstallMode::DirectOverwrite);
+        node.install_peer(
+            peer_id,
+            peer_addr,
+            new_keys,
+            AddrInstallMode::DirectOverwrite,
+        );
         assert!(
             MeshNode::resolve_grant_peer(&node.peers, &node.addr_to_node, &session).is_none(),
             "stale session must not resolve to the replacement peer entry"

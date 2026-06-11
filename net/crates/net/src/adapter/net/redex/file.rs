@@ -2052,7 +2052,10 @@ mod tests {
         // 300 > 250 → stop.
         let bounded = f.read_range_limited(0, 50, 250, 0);
         assert_eq!(bounded.len(), 2);
-        assert_eq!(bounded.iter().map(|e| e.entry.seq).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(
+            bounded.iter().map(|e| e.entry.seq).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
 
         // (b) Oversize-first-event behavior: budget = 1 byte, but
         // the first event is 100 bytes — we still return it so the

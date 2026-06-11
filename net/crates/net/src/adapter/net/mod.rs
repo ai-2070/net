@@ -1369,8 +1369,7 @@ mod tests {
     #[test]
     fn coarse_clock_reuses_cache_within_refresh_window() {
         let t0 = std::time::Instant::now();
-        let within =
-            t0 + std::time::Duration::from_nanos(COARSE_CLOCK_REFRESH_NS - 1);
+        let within = t0 + std::time::Duration::from_nanos(COARSE_CLOCK_REFRESH_NS - 1);
         let (store, ns) = coarse_clock_advance(Some((t0, 42)), within, || {
             panic!("cache hit must not read the wall clock")
         });
@@ -1384,8 +1383,7 @@ mod tests {
     #[test]
     fn coarse_clock_refreshes_at_and_past_the_window() {
         let t0 = std::time::Instant::now();
-        let at_boundary =
-            t0 + std::time::Duration::from_nanos(COARSE_CLOCK_REFRESH_NS);
+        let at_boundary = t0 + std::time::Duration::from_nanos(COARSE_CLOCK_REFRESH_NS);
         let (store, ns) = coarse_clock_advance(Some((t0, 42)), at_boundary, || 100);
         assert_eq!(ns, 100, "boundary read must refresh");
         assert_eq!(

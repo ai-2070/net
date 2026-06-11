@@ -410,7 +410,10 @@ impl FairScheduler {
                 false
             }
             dashmap::mapref::entry::Entry::Vacant(vac) => {
-                vac.insert(Arc::new(StreamQueue::new_with_weight(self.max_depth, weight)));
+                vac.insert(Arc::new(StreamQueue::new_with_weight(
+                    self.max_depth,
+                    weight,
+                )));
                 true
             }
         };
@@ -1867,7 +1870,10 @@ mod tests {
         // packets) → stable.
         let before_clean_noop = Arc::as_ptr(&scheduler.active_streams.load_full());
         let removed = scheduler.cleanup_empty();
-        assert_eq!(removed, 1, "stream 11 has no packets and only DashMap refs it");
+        assert_eq!(
+            removed, 1,
+            "stream 11 has no packets and only DashMap refs it"
+        );
         let after_clean = scheduler.active_streams.load_full();
         assert_ne!(
             Arc::as_ptr(&after_clean),
@@ -1943,8 +1949,12 @@ mod tests {
         // Quiescent invariant: snapshot == live stream set. A lost
         // rebuild leaves a stream in the map (with packets queued)
         // that the snapshot — and therefore dequeue — never sees.
-        let mut snapshot: Vec<u64> =
-            scheduler.active_streams.load_full().iter().copied().collect();
+        let mut snapshot: Vec<u64> = scheduler
+            .active_streams
+            .load_full()
+            .iter()
+            .copied()
+            .collect();
         snapshot.sort_unstable();
         let mut live: Vec<u64> = scheduler.streams.iter().map(|e| *e.key()).collect();
         live.sort_unstable();

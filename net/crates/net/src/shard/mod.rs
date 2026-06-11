@@ -184,7 +184,10 @@ impl Shard {
         // mutex is race-free with the SPSC contract.
         let push_start_raw = if self.metrics_collector.is_some() {
             self.metrics_sample_phase = self.metrics_sample_phase.wrapping_add(1);
-            if self.metrics_sample_phase.is_multiple_of(METRICS_SAMPLE_STRIDE) {
+            if self
+                .metrics_sample_phase
+                .is_multiple_of(METRICS_SAMPLE_STRIDE)
+            {
                 Some(self.timestamp_gen.now_raw())
             } else {
                 None
@@ -203,8 +206,9 @@ impl Shard {
                 if let Some(collector) = &self.metrics_collector {
                     collector.record_event_only();
                     if let Some(start_raw) = push_start_raw {
-                        let latency_ns =
-                            self.timestamp_gen.delta_ns(start_raw, self.timestamp_gen.now_raw());
+                        let latency_ns = self
+                            .timestamp_gen
+                            .delta_ns(start_raw, self.timestamp_gen.now_raw());
                         collector.record_latency_sample(latency_ns);
                         collector.record_buffer_len(self.ring_buffer.len());
                     }
@@ -232,7 +236,10 @@ impl Shard {
     pub fn try_push(&mut self, raw: JsonValue) -> Result<u64, IngestionError> {
         let push_start_raw = if self.metrics_collector.is_some() {
             self.metrics_sample_phase = self.metrics_sample_phase.wrapping_add(1);
-            if self.metrics_sample_phase.is_multiple_of(METRICS_SAMPLE_STRIDE) {
+            if self
+                .metrics_sample_phase
+                .is_multiple_of(METRICS_SAMPLE_STRIDE)
+            {
                 Some(self.timestamp_gen.now_raw())
             } else {
                 None
@@ -251,8 +258,9 @@ impl Shard {
                 if let Some(collector) = &self.metrics_collector {
                     collector.record_event_only();
                     if let Some(start_raw) = push_start_raw {
-                        let latency_ns =
-                            self.timestamp_gen.delta_ns(start_raw, self.timestamp_gen.now_raw());
+                        let latency_ns = self
+                            .timestamp_gen
+                            .delta_ns(start_raw, self.timestamp_gen.now_raw());
                         collector.record_latency_sample(latency_ns);
                         collector.record_buffer_len(self.ring_buffer.len());
                     }
@@ -1355,11 +1363,12 @@ mod tests {
 
         // Exactly one more push crosses the stride: latency and
         // fill_ratio become observable.
-        shard
-            .try_push_raw(bytes::Bytes::from("evt-final"))
-            .unwrap();
+        shard.try_push_raw(bytes::Bytes::from("evt-final")).unwrap();
         let metrics = collector.collect_and_reset();
-        assert_eq!(metrics.event_rate, 1, "the final push counts toward event_rate");
+        assert_eq!(
+            metrics.event_rate, 1,
+            "the final push counts toward event_rate"
+        );
         assert!(
             metrics.avg_push_latency_ns > 0,
             "crossing the stride boundary must record a latency sample"

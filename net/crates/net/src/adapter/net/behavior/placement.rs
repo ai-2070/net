@@ -541,10 +541,8 @@ impl<'a> PlacementFilter for StandardPlacement<'a> {
         // `synthesize_capability_set_if_known` folds both into a
         // single `with_state` that returns `None` on the
         // known-check miss path.
-        let target_caps = capability_bridge::synthesize_capability_set_if_known(
-            self.fold,
-            *target,
-        )?;
+        let target_caps =
+            capability_bridge::synthesize_capability_set_if_known(self.fold, *target)?;
         (|target_caps: &CapabilitySet| -> Option<f32> {
             // Hard-constraint check: artifact's `required` caps
             // must be a subset of the target's tag set. `Chain`
@@ -2918,8 +2916,16 @@ mod tests {
         let vals = extract_resource_axis_values(&caps);
         assert_eq!(vals.cpu_cores, Some(12.0), "cpu_cores must be picked up");
         assert_eq!(vals.memory_gb, Some(64.0), "memory_gb must be picked up");
-        assert_eq!(vals.gpu_vram_gb, Some(24.0), "gpu.vram_gb must be picked up");
-        assert_eq!(vals.capacity_gb, Some(2048.0), "capacity_gb must be picked up");
+        assert_eq!(
+            vals.gpu_vram_gb,
+            Some(24.0),
+            "gpu.vram_gb must be picked up"
+        );
+        assert_eq!(
+            vals.capacity_gb,
+            Some(2048.0),
+            "capacity_gb must be picked up"
+        );
 
         // Score the result through the public entry point and
         // confirm it composes the same as before — the audit's
@@ -2952,8 +2958,8 @@ mod tests {
     fn extract_resource_axis_values_rejects_malformed_per_slot() {
         let caps = empty_caps()
             .add_tag("hardware.cpu_cores=1e308") // overflow → None
-            .add_tag("hardware.memory_gb=NaN")    // NaN → None
-            .add_tag("hardware.gpu.vram_gb=-4")    // negative → None
+            .add_tag("hardware.memory_gb=NaN") // NaN → None
+            .add_tag("hardware.gpu.vram_gb=-4") // negative → None
             .add_tag("dataforts.capacity_gb=abc"); // unparseable → None
         let vals = extract_resource_axis_values(&caps);
         assert_eq!(vals.cpu_cores, None, "1e308 exceeds MAX_RESOURCE_VALUE");

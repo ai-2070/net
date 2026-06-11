@@ -2697,7 +2697,10 @@ mod tests {
             payload_checksum(p4),
         );
         let err = recovered.disk.append_entry(&e4, p4);
-        assert!(err.is_err(), "second injected idx-metadata failure must surface");
+        assert!(
+            err.is_err(),
+            "second injected idx-metadata failure must surface"
+        );
 
         let after_second_failure = std::fs::metadata(&dat_path).unwrap().len();
         assert_eq!(
@@ -2785,7 +2788,8 @@ mod tests {
         let mut offset = 0u32;
         let mut entries: Vec<RedexEntry> = Vec::new();
         for (seq, p) in payloads.iter().enumerate() {
-            let e = RedexEntry::new_heap(seq as u64, offset, p.len() as u32, 0, payload_checksum(p));
+            let e =
+                RedexEntry::new_heap(seq as u64, offset, p.len() as u32, 0, payload_checksum(p));
             recovered.disk.append_entry(&e, p).unwrap();
             entries.push(e);
             offset += p.len() as u32;
@@ -2807,7 +2811,10 @@ mod tests {
         let post_dat_len = std::fs::metadata(live.join("dat")).unwrap().len();
         let post_idx_len = std::fs::metadata(live.join("idx")).unwrap().len();
         let post_ts_len = std::fs::metadata(live.join("ts")).unwrap().len();
-        assert_eq!(post_dat_len as usize, 10, "new dat must be exactly 10 bytes");
+        assert_eq!(
+            post_dat_len as usize, 10,
+            "new dat must be exactly 10 bytes"
+        );
         assert_eq!(post_idx_len as usize, surviving.len() * REDEX_ENTRY_SIZE);
         assert_eq!(post_ts_len as usize, surviving.len() * 8);
 
@@ -2820,7 +2827,13 @@ mod tests {
         // with zeros up to that target.
         recovered.disk.arm_next_idx_metadata_failure();
         let p5: &[u8] = b"EEEEE";
-        let e5 = RedexEntry::new_heap(99, post_dat_len as u32, p5.len() as u32, 0, payload_checksum(p5));
+        let e5 = RedexEntry::new_heap(
+            99,
+            post_dat_len as u32,
+            p5.len() as u32,
+            0,
+            payload_checksum(p5),
+        );
         let err = recovered.disk.append_entry(&e5, p5);
         assert!(err.is_err(), "injected idx-metadata failure must surface");
 

@@ -577,7 +577,8 @@ pub(crate) fn resolve_candidate_keys(
     // Seed candidate set: prefer tags_all (typically most
     // selective), then the most-selective tag group, then state,
     // then region, then class scan as fallback.
-    let mut candidates: HashSet<(u64, NodeId), BuildU64TupleHasher> = if !filter.tags_all.is_empty() {
+    let mut candidates: HashSet<(u64, NodeId), BuildU64TupleHasher> = if !filter.tags_all.is_empty()
+    {
         let seed = resolve_keys_all_tags(index, &filter.tags_all);
         // Only materialize the group unions if the seed left
         // something to filter — when `tags_all` selects nothing the

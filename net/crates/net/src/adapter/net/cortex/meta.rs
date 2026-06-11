@@ -134,7 +134,9 @@ impl EventMeta {
             origin_hash: u64::from_le_bytes(bytes[4..12].try_into().expect("8 bytes")),
             seq_or_ts: u64::from_le_bytes(bytes[12..20].try_into().expect("8 bytes")),
             checksum: u32::from_le_bytes(
-                bytes[EVENT_META_CHECKSUM_RANGE].try_into().expect("4 bytes"),
+                bytes[EVENT_META_CHECKSUM_RANGE]
+                    .try_into()
+                    .expect("4 bytes"),
             ),
         })
     }

@@ -773,7 +773,10 @@ mod tests {
         // holder's view.
         let orig_header = RoutingHeader::from_bytes(&outstanding[..ROUTING_HEADER_SIZE]).unwrap();
         assert_eq!(orig_header.ttl, 4, "clone's ttl must be unmodified");
-        assert_eq!(orig_header.hop_count, 0, "clone's hop_count must be unmodified");
+        assert_eq!(
+            orig_header.hop_count, 0,
+            "clone's hop_count must be unmodified"
+        );
 
         // Fast path: sole-owned packet with identical contents.
         let fast_fwd = match proxy.forward(outstanding) {

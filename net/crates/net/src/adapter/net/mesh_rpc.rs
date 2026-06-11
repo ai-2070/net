@@ -3118,8 +3118,7 @@ impl MeshNode {
         // PERF_AUDIT §4.2 — batch the per-candidate gate so the
         // fold read lock is taken once and the caller's subnet +
         // groups are parsed once, not N times.
-        let verdicts =
-            capability_bridge::may_execute_batch(fold, &candidates, &tag, self_id);
+        let verdicts = capability_bridge::may_execute_batch(fold, &candidates, &tag, self_id);
         let mut iter = verdicts.into_iter();
         candidates.retain(|_| iter.next().unwrap_or(false));
         if candidates.is_empty() {
@@ -3215,8 +3214,7 @@ impl MeshNode {
         let fold = self.capability_fold();
         // PERF_AUDIT §4.2 — batch the per-candidate gate. See the
         // mirror site at `:3093`.
-        let verdicts =
-            capability_bridge::may_execute_batch(fold, &candidates, &tag, self_id);
+        let verdicts = capability_bridge::may_execute_batch(fold, &candidates, &tag, self_id);
         let mut iter = verdicts.into_iter();
         candidates.retain(|_| iter.next().unwrap_or(false));
         if candidates.is_empty() {
@@ -3756,15 +3754,15 @@ impl MeshNode {
         }
 
         let _ = reply_hash; // captured into the dispatcher above; surfaced for debug
-        // `insert` is idempotent — a concurrent caller that beat us
-        // to it just overwrote the slot with the identical value.
-        // On a genuine xxh3 collision between two service names on
-        // the same target, the slot flips to whichever service
-        // subscribed last and the other re-subscribes on its next
-        // call (idempotent, correct, merely un-cached). Cap drift
-        // past MAX_REPLY_SUBSCRIPTIONS during a concurrent insert
-        // race is bounded by the number of concurrent callers,
-        // which operators tune separately.
+                            // `insert` is idempotent — a concurrent caller that beat us
+                            // to it just overwrote the slot with the identical value.
+                            // On a genuine xxh3 collision between two service names on
+                            // the same target, the slot flips to whichever service
+                            // subscribed last and the other re-subscribes on its next
+                            // call (idempotent, correct, merely un-cached). Cap drift
+                            // past MAX_REPLY_SUBSCRIPTIONS during a concurrent insert
+                            // race is bounded by the number of concurrent callers,
+                            // which operators tune separately.
         registry.insert((target_node_id, service_hash), Arc::from(service));
         Ok(())
     }
@@ -4137,16 +4135,26 @@ mod origin_cache_tests {
         // Same target, different services → distinct entries.
         registry.insert((0xAA, h_a), Arc::from("svc-a"));
         registry.insert((0xAA, h_b), Arc::from("svc-b"));
-        assert!(super::reply_subscription_covers(&registry, 0xAA, h_a, "svc-a"));
-        assert!(super::reply_subscription_covers(&registry, 0xAA, h_b, "svc-b"));
+        assert!(super::reply_subscription_covers(
+            &registry, 0xAA, h_a, "svc-a"
+        ));
+        assert!(super::reply_subscription_covers(
+            &registry, 0xAA, h_b, "svc-b"
+        ));
         // Same service, different targets → distinct entries.
-        assert!(!super::reply_subscription_covers(&registry, 0xBB, h_a, "svc-a"));
+        assert!(!super::reply_subscription_covers(
+            &registry, 0xBB, h_a, "svc-a"
+        ));
         registry.insert((0xBB, h_a), Arc::from("svc-a"));
-        assert!(super::reply_subscription_covers(&registry, 0xBB, h_a, "svc-a"));
+        assert!(super::reply_subscription_covers(
+            &registry, 0xBB, h_a, "svc-a"
+        ));
         // Idempotent — repeat insert overwrites with the identical
         // value; the fast path keeps answering true.
         registry.insert((0xAA, h_a), Arc::from("svc-a"));
-        assert!(super::reply_subscription_covers(&registry, 0xAA, h_a, "svc-a"));
+        assert!(super::reply_subscription_covers(
+            &registry, 0xAA, h_a, "svc-a"
+        ));
         assert_eq!(registry.len(), 3);
         // xxh3 collision: "svc-evil" hashing to h_a (forced here —
         // xxh3_64 collisions are computable offline since the hash
@@ -4163,8 +4171,12 @@ mod origin_cache_tests {
         // re-subscribe — covered must flip to false for it, never
         // silently true for both.
         registry.insert((0xAA, h_a), Arc::from("svc-evil"));
-        assert!(super::reply_subscription_covers(&registry, 0xAA, h_a, "svc-evil"));
-        assert!(!super::reply_subscription_covers(&registry, 0xAA, h_a, "svc-a"));
+        assert!(super::reply_subscription_covers(
+            &registry, 0xAA, h_a, "svc-evil"
+        ));
+        assert!(!super::reply_subscription_covers(
+            &registry, 0xAA, h_a, "svc-a"
+        ));
     }
 
     /// PERF_AUDIT §3.3 — grant-stall backstop check for the

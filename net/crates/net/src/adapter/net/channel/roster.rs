@@ -165,8 +165,7 @@ impl ChannelSubscribers {
     /// The outer `subs` map evicts on this predicate to avoid
     /// leaking per-channel entries for ephemeral channels.
     fn is_empty(&self) -> bool {
-        self.broadcasters.is_empty()
-            && self.queue_groups.iter().all(|e| e.value().is_empty())
+        self.broadcasters.is_empty() && self.queue_groups.iter().all(|e| e.value().is_empty())
     }
 
     /// All subscribers regardless of mode. The set-membership view

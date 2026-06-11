@@ -1397,12 +1397,9 @@ async fn on_inbound(
             // fsync to the blocking pool so the per-channel select
             // loop stays responsive to heartbeats / other inbound
             // messages while the apply lands.
-            let apply_outcome = apply_sync_response_async(
-                inputs.file.clone(),
-                msg.clone(),
-                inputs.channel_id,
-            )
-            .await;
+            let apply_outcome =
+                apply_sync_response_async(inputs.file.clone(), msg.clone(), inputs.channel_id)
+                    .await;
             match apply_outcome {
                 Ok(new_tail) => {
                     // Record the post-apply tail on the coordinator

@@ -1721,15 +1721,18 @@ mod tests {
         let mut buf = bytes::BytesMut::from(&pkt[HEADER_SIZE..]);
         let plaintext_len = rx_cipher
             .decrypt_in_place(nonce_counter, &aad, &mut buf[..])
-            .expect("AEAD decrypt must succeed — any AAD drift between sender and \
-                     receiver would surface here");
+            .expect(
+                "AEAD decrypt must succeed — any AAD drift between sender and \
+                     receiver would surface here",
+            );
         assert_eq!(
             plaintext_len, payload_len,
             "decrypted plaintext length must match the wire payload_len"
         );
 
         // Frames round-trip — same events in same order.
-        let recovered = EventFrame::read_events(buf.split_to(plaintext_len).freeze(), header.event_count);
+        let recovered =
+            EventFrame::read_events(buf.split_to(plaintext_len).freeze(), header.event_count);
         assert_eq!(recovered.len(), events.len());
         for (i, (got, expected)) in recovered.iter().zip(events.iter()).enumerate() {
             assert_eq!(got, expected, "event {i} must round-trip exactly");
@@ -1751,10 +1754,8 @@ mod tests {
             Bytes::from_static(b"sub-event-1"),
             Bytes::from_static(b"sub-event-2-longer"),
         ];
-        let pkt =
-            builder.build_subprotocol(0xAAAA, 0xBBBB, &events, PacketFlags::NONE, 0x33);
-        let header =
-            NetHeader::from_bytes(&pkt[..HEADER_SIZE]).expect("subprotocol header parses");
+        let pkt = builder.build_subprotocol(0xAAAA, 0xBBBB, &events, PacketFlags::NONE, 0x33);
+        let header = NetHeader::from_bytes(&pkt[..HEADER_SIZE]).expect("subprotocol header parses");
         assert_eq!(header.subprotocol_id, 0x33, "subprotocol_id must survive");
 
         let rx_cipher = PacketCipher::new(&key, session_id);

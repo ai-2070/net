@@ -1387,7 +1387,10 @@ mod tests {
         reg.entry_mut(d, half, now);
         assert!(reg.get(&a).is_some(), "touched A must survive");
         assert!(reg.get(&b).is_none(), "untouched B must be the LRU victim");
-        assert!(reg.get(&c).is_some(), "C is more recent than B; must survive");
+        assert!(
+            reg.get(&c).is_some(),
+            "C is more recent than B; must survive"
+        );
         assert!(reg.get(&d).is_some(), "newly inserted D must be present");
         assert_eq!(reg.len(), 3);
     }

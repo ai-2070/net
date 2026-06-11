@@ -281,15 +281,15 @@ impl BlobAdapter for FileSystemAdapter {
         let me = self.clone();
         tokio::task::spawn_blocking(move || -> Result<(), BlobError> {
             let _permit = _permit; // hold across the blocking work
-            // PERF_AUDIT §6.10 — hash verify inside the blocking
-            // pool so a multi-MiB Small payload doesn't stall the
-            // runtime worker. Verify the bytes hash to the BlobRef's
-            // hash BEFORE writing. Without this an adapter author
-            // (or compromised binding) can pre-seed an arbitrary
-            // hash slot with attacker content; a later honest
-            // BlobRef would then resolve to that content because
-            // the on-disk path is keyed only on the hash. Hash here
-            // and reject mismatches at the trust boundary.
+                                   // PERF_AUDIT §6.10 — hash verify inside the blocking
+                                   // pool so a multi-MiB Small payload doesn't stall the
+                                   // runtime worker. Verify the bytes hash to the BlobRef's
+                                   // hash BEFORE writing. Without this an adapter author
+                                   // (or compromised binding) can pre-seed an arbitrary
+                                   // hash slot with attacker content; a later honest
+                                   // BlobRef would then resolve to that content because
+                                   // the on-disk path is keyed only on the hash. Hash here
+                                   // and reject mismatches at the trust boundary.
             let computed: [u8; 32] = blake3::hash(&bytes).into();
             if computed != expected_hash {
                 return Err(BlobError::HashMismatch {

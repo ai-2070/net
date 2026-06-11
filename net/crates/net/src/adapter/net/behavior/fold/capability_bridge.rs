@@ -356,8 +356,8 @@ impl CapabilitySetCache {
     /// the cache to set 0, so silently rounding up is friendlier
     /// than panicking.
     pub fn with_capacity(capacity: usize) -> Self {
-        let cap = std::num::NonZeroUsize::new(capacity.max(1))
-            .unwrap_or(std::num::NonZeroUsize::MIN);
+        let cap =
+            std::num::NonZeroUsize::new(capacity.max(1)).unwrap_or(std::num::NonZeroUsize::MIN);
         Self {
             inner: parking_lot::Mutex::new(lru::LruCache::new(cap)),
         }
@@ -1718,8 +1718,8 @@ mod tests {
         // Unknown → None (hard veto).
         assert!(synthesize_capability_set_if_known(&fold, 0xDEAD).is_none());
         // Known + tags → Some(populated).
-        let tagged = synthesize_capability_set_if_known(&fold, 0xB1)
-            .expect("tagged publisher is known");
+        let tagged =
+            synthesize_capability_set_if_known(&fold, 0xB1).expect("tagged publisher is known");
         assert!(tagged.tags.iter().any(|t| t.to_string() == "gpu"));
         // Known + no tags → Some(empty) — indexed candidates with
         // empty tag sets still proceed to scoring.
@@ -1782,14 +1782,8 @@ mod tests {
         let permissive: NodeId = 0xAA;
         let restricted: NodeId = 0xBB;
         let no_tag: NodeId = 0xCC;
-        fold.apply(sign_member(
-            &kp,
-            permissive,
-            0x100,
-            vec!["nrpc:echo"],
-            None,
-        ))
-        .expect("permissive");
+        fold.apply(sign_member(&kp, permissive, 0x100, vec!["nrpc:echo"], None))
+            .expect("permissive");
         // Restricted: allow only the caller.
         let restricted_ann = SignedAnnouncement::sign(
             &kp,
@@ -1898,32 +1892,33 @@ mod tests {
         ))
         .expect("caller apply");
 
-        let restricted = |node: NodeId,
-                          subnets: Vec<super::super::super::subnet::SubnetId>,
-                          groups: Vec<super::super::super::group::GroupId>| {
-            SignedAnnouncement::sign(
-                &kp,
-                super::super::capability::CapabilityFold::KIND_ID,
-                0x100,
-                node,
-                1,
-                EnvelopeMeta::default(),
-                CapabilityMembership {
-                    class_hash: 0x100,
-                    tags: vec!["nrpc:echo".into()],
-                    hardware: None,
-                    state: NodeState::Idle,
-                    region: None,
-                    price_quote: None,
-                    reflex_addr: None,
-                    allowed_nodes: Vec::new(),
-                    allowed_subnets: subnets,
-                    allowed_groups: groups,
-                    metadata: std::collections::BTreeMap::new(),
-                },
-            )
-            .expect("sign restricted")
-        };
+        let restricted =
+            |node: NodeId,
+             subnets: Vec<super::super::super::subnet::SubnetId>,
+             groups: Vec<super::super::super::group::GroupId>| {
+                SignedAnnouncement::sign(
+                    &kp,
+                    super::super::capability::CapabilityFold::KIND_ID,
+                    0x100,
+                    node,
+                    1,
+                    EnvelopeMeta::default(),
+                    CapabilityMembership {
+                        class_hash: 0x100,
+                        tags: vec!["nrpc:echo".into()],
+                        hardware: None,
+                        state: NodeState::Idle,
+                        region: None,
+                        price_quote: None,
+                        reflex_addr: None,
+                        allowed_nodes: Vec::new(),
+                        allowed_subnets: subnets,
+                        allowed_groups: groups,
+                        metadata: std::collections::BTreeMap::new(),
+                    },
+                )
+                .expect("sign restricted")
+            };
         fold.apply(restricted(by_subnet, vec![caller_subnet], Vec::new()))
             .expect("by_subnet apply");
         fold.apply(restricted(by_group, Vec::new(), vec![caller_group]))

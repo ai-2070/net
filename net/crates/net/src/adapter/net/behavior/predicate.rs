@@ -1344,11 +1344,7 @@ impl Predicate {
     /// on cost alone would reorder ties). Evaluation is pure so
     /// results can't differ, but the deterministic walk order
     /// keeps timing/short-circuit behavior reproducible.
-    fn eval_in_cost_order(
-        children: &[Predicate],
-        ctx: &EvalContext<'_>,
-        stop_on: bool,
-    ) -> bool {
+    fn eval_in_cost_order(children: &[Predicate], ctx: &EvalContext<'_>, stop_on: bool) -> bool {
         const STACK_CAP: usize = 8;
         if children.len() <= STACK_CAP {
             let mut tuples: [(usize, u32); STACK_CAP] = [(0, 0); STACK_CAP];

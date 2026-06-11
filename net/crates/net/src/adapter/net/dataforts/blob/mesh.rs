@@ -394,7 +394,8 @@ pub struct MeshBlobAdapter {
     /// `Redex::open_file` is idempotent on `(name, config)` — an
     /// LRU eviction just means the next access pays the open
     /// cost once, then re-caches.
-    chunk_file_cache: Arc<parking_lot::Mutex<lru::LruCache<[u8; 32], crate::adapter::net::redex::RedexFile>>>,
+    chunk_file_cache:
+        Arc<parking_lot::Mutex<lru::LruCache<[u8; 32], crate::adapter::net::redex::RedexFile>>>,
     /// Active-overflow knobs (v0.3 P1 surface). Held behind
     /// an `Arc<RwLock<_>>` so the boolean toggle + threshold
     /// updates are cheap, lock-free for the steady-state
@@ -1681,8 +1682,7 @@ impl MeshBlobAdapter {
                 if !buffer.is_empty() {
                     let chunk_bytes = std::mem::take(&mut buffer);
                     // Offload blake3 for multi-MiB chunks. (§6.1)
-                    let (chunk_hash, chunk_bytes) =
-                        blake3_hash_offload_vec(chunk_bytes).await;
+                    let (chunk_hash, chunk_bytes) = blake3_hash_offload_vec(chunk_bytes).await;
                     // Just-computed hash — trusted. (§6.2)
                     self.store_chunk_prehashed(&chunk_hash, &chunk_bytes)
                         .await?;
@@ -1702,8 +1702,7 @@ impl MeshBlobAdapter {
                     chunker.extend(bytes.as_ref());
                     while let Some(chunk_bytes) = chunker.try_next_chunk() {
                         // Offload blake3 for multi-MiB chunks. (§6.1)
-                        let chunk_hash =
-                            blake3_hash_offload_bytes(&chunk_bytes).await;
+                        let chunk_hash = blake3_hash_offload_bytes(&chunk_bytes).await;
                         // Just-computed hash — trusted. (§6.2)
                         self.store_chunk_prehashed(&chunk_hash, &chunk_bytes)
                             .await?;
@@ -1712,9 +1711,7 @@ impl MeshBlobAdapter {
                         // refcount-shared with us; the pre-fix
                         // `.to_vec()` was a full ~1-16 MiB memcpy per
                         // CDC chunk. `chunk_bytes.clone()` is O(1).
-                        if let Some(closed) =
-                            striper.push_chunk(chunk_bytes.clone(), cref)?
-                        {
+                        if let Some(closed) = striper.push_chunk(chunk_bytes.clone(), cref)? {
                             flush_stripe(self, closed, &mut builder, &mut data_chunk_count).await?;
                         }
                     }
@@ -2663,11 +2660,7 @@ impl MeshBlobAdapter {
     /// Body shared by `store_chunk` (verifying) and
     /// `store_chunk_prehashed` (trusts caller): per-hash lock acquire,
     /// run `store_chunk_locked`, best-effort lock-entry cleanup.
-    async fn store_chunk_with_lock(
-        &self,
-        hash: &[u8; 32],
-        bytes: &[u8],
-    ) -> Result<(), BlobError> {
+    async fn store_chunk_with_lock(&self, hash: &[u8; 32], bytes: &[u8]) -> Result<(), BlobError> {
         // Per-hash serialization: one in-flight `store_chunk` per
         // content hash at a time. The lock entry is created lazily
         // and best-effort reclaimed after the store completes.
@@ -3777,9 +3770,8 @@ impl BlobAdapter for MeshBlobAdapter {
                 // growth-by-doubling cost is zero and every
                 // recursion level appends in-place rather than
                 // alloc'ing its own intermediate Vec.
-                let mut out: Vec<u8> = Vec::with_capacity(
-                    range.end.saturating_sub(range.start) as usize,
-                );
+                let mut out: Vec<u8> =
+                    Vec::with_capacity(range.end.saturating_sub(range.start) as usize);
                 let walk_result = self
                     .walk_tree_range(
                         *root_hash,
