@@ -2445,6 +2445,7 @@ dependencies = [
  "redis",
  "reed-solomon-erasure",
  "regex",
+ "ring",
  "semver",
  "serde",
  "serde_json",

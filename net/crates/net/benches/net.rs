@@ -301,6 +301,41 @@ fn bench_encryption(c: &mut Criterion) {
         }
     }
 
+    // ring's RFC 8439 implementation — the backend `PacketCipher`
+    // uses post-spike. `raw_aead` above stays as the RustCrypto
+    // reference so the cipher-vs-cipher fixed/marginal profile is
+    // visible side by side in every run.
+    {
+        use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+        let aad = [0x42u8; 56];
+        for payload_size in [64usize, 256, 1024, 4096].iter() {
+            let unbound = UnboundKey::new(&CHACHA20_POLY1305, &key).expect("32-byte key");
+            let cipher = LessSafeKey::new(unbound);
+            let mut buf = vec![0x42u8; *payload_size];
+            let mut counter = 0u64;
+            group.throughput(Throughput::Bytes(*payload_size as u64));
+            group.bench_with_input(
+                BenchmarkId::new("raw_ring", payload_size),
+                payload_size,
+                move |b, _| {
+                    b.iter(|| {
+                        counter = counter.wrapping_add(1);
+                        let mut nonce = [0u8; 12];
+                        nonce[4..12].copy_from_slice(&counter.to_le_bytes());
+                        let tag = cipher
+                            .seal_in_place_separate_tag(
+                                Nonce::assume_unique_for_key(nonce),
+                                Aad::from(&aad),
+                                &mut buf,
+                            )
+                            .expect("seal cannot fail on valid inputs");
+                        std::hint::black_box(tag)
+                    });
+                },
+            );
+        }
+    }
+
     group.finish();
 }
 
