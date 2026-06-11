@@ -362,14 +362,29 @@ impl NoiseHandshake {
 }
 
 /// Build the `ring` AEAD key for the packet path.
+///
+/// Boxed because `ring::aead::LessSafeKey` is 544 bytes — its inner
+/// `UnboundKey` is sized to ring's largest AEAD variant (AES-256-GCM's
+/// expanded key schedule + GHASH table), even though this path only ever
+/// holds a 32-byte ChaCha20-Poly1305 key. `PacketCipher` is embedded by
+/// value in every `PacketBuilder`, and `PacketBuilder`s are moved through
+/// the packet pool's `ArrayQueue` on every `get()`/`release()`. Inlining
+/// the 544-byte key tripled `PacketBuilder`'s size (~304 → ~816 B) and
+/// regressed the pure pool get/return path ~70% (`net_packet_pool`,
+/// `pool_comparison`, `pool_contention` — the latter worst, from the
+/// fatter slots' cache traffic). Boxing moves an 8-byte pointer instead;
+/// the heap allocation is paid only on cipher construction (pool
+/// pre-fill / refill / rekey — all cold), never on the steady-state
+/// reuse path, and the extra indirection inside seal/open is negligible
+/// against the AEAD itself.
 #[expect(
     clippy::expect_used,
     reason = "UnboundKey::new fails only on key-length mismatch; the [u8; 32] parameter makes that unrepresentable for CHACHA20_POLY1305"
 )]
-fn packet_key(key: &[u8; 32]) -> LessSafeKey {
-    LessSafeKey::new(
+fn packet_key(key: &[u8; 32]) -> Box<LessSafeKey> {
+    Box::new(LessSafeKey::new(
         UnboundKey::new(&CHACHA20_POLY1305, key).expect("32-byte ChaCha20-Poly1305 key"),
-    )
+    ))
 }
 
 /// Packet cipher using ChaCha20-Poly1305 with counter-based nonces.
@@ -402,7 +417,9 @@ fn packet_key(key: &[u8; 32]) -> LessSafeKey {
 /// — both implement RFC 8439 — pinned by the cross-impl round-trip
 /// tests below.
 pub struct PacketCipher {
-    cipher: LessSafeKey,
+    /// Boxed to keep this 544-byte key off the by-value pool-moved
+    /// `PacketBuilder` — see [`packet_key`] for the size rationale.
+    cipher: Box<LessSafeKey>,
     /// Pre-built nonce with the session prefix already filled into
     /// the first 4 bytes (and the counter bytes left as zeros for
     /// each per-packet overwrite). Per crypto-session perf #138,
