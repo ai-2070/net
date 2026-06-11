@@ -1259,6 +1259,62 @@ mod tests {
         );
     }
 
+    /// The worst-case cost of the bounded look-ahead, pinned: a
+    /// cumulatively-acked straggler stranded beyond the 32-element
+    /// sweep CAN be spuriously retransmitted by the RTO while it
+    /// waits for the packets ahead of it to drain — but the
+    /// spuriousness is bounded (the retransmit is a duplicate the
+    /// receiver's replay window absorbs), the stream must never
+    /// reach the failed state because of it, and any later
+    /// cumulative ack covering it reclaims it through the pop-front
+    /// prefix walk (an acked packet cannot outlive a covering
+    /// cumulative ack). Regression guard for the "stranded acked
+    /// packet → spurious retransmit / failed-state" hazard of the
+    /// §3.4 bounded sweep.
+    #[test]
+    fn straggler_spurious_retransmit_is_bounded_and_never_fails_stream() {
+        let rto = Duration::from_millis(5);
+        let mut s = ReliableStream::with_settings(rto, 100, 3);
+        // 40 newer packets, then the straggler (seq 0) at index 40
+        // — past the 32-element look-ahead.
+        for i in 1..=40u64 {
+            s.on_send(descriptor(i, Bytes::from(format!("p{i}"))));
+        }
+        s.on_send(descriptor(0, Bytes::from_static(b"straggler")));
+
+        // Cumulative ack covering ONLY the straggler: front is seq 1
+        // (>= 1, no pop), the sweep stops at index 31 — seq 0 stays
+        // pending even though the peer has it.
+        s.on_ack(1);
+        assert_eq!(s.pending.len(), 41, "straggler stranded past the sweep");
+
+        // RTO elapses: the stranded-but-acked straggler is among the
+        // retransmits (the bounded cost the look-ahead trades for
+        // O(window) ack scans). Retries remain (< max), so the
+        // stream must NOT flag failed.
+        std::thread::sleep(rto * 2);
+        let resent = s.get_timed_out();
+        assert!(
+            resent.iter().any(|d| d.seq == 0),
+            "stranded acked straggler is spuriously retransmitted once"
+        );
+        assert!(
+            !s.take_failed(),
+            "a spurious straggler retransmit must not fail the stream"
+        );
+
+        // Later cumulative ack covering everything: the pop-front
+        // prefix walk drains seqs 1..=40 AND then seq 0 (0 < 41) —
+        // the acked straggler cannot survive a covering ack.
+        s.on_ack(41);
+        assert!(
+            s.pending.is_empty(),
+            "covering cumulative ack reclaims the straggler: {:?}",
+            s.pending.iter().map(|u| u.seq()).collect::<Vec<_>>()
+        );
+        assert!(!s.take_failed(), "stream healthy after recovery");
+    }
+
     #[test]
     fn test_reliable_stream_pending() {
         let mut mode = ReliableStream::new();
