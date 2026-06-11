@@ -50,7 +50,9 @@ use super::replication::{
     ChannelId, ReplicaRole, SyncHeartbeat, SyncNack, SyncRequest, SyncResponse,
 };
 use super::replication_budget::BandwidthBudget;
-use super::replication_catchup::{apply_sync_response, handle_sync_request, SyncRequestOutcome};
+use super::replication_catchup::{
+    apply_sync_response_async, handle_sync_request, SyncRequestOutcome,
+};
 use super::replication_coordinator::{ChannelIdentity, CoordinatorError, ReplicationCoordinator};
 use super::replication_heartbeat::HeartbeatTracker;
 use super::replication_step::{
@@ -1391,7 +1393,17 @@ async fn on_inbound(
             // (tail advanced). Drives the R-28 catchup-backoff
             // accounting below.
             let pre_apply_tail = inputs.file.next_seq();
-            match apply_sync_response(&inputs.file, &msg, inputs.channel_id) {
+            // PERF_AUDIT §5.5 — offload the blocking append_batch +
+            // fsync to the blocking pool so the per-channel select
+            // loop stays responsive to heartbeats / other inbound
+            // messages while the apply lands.
+            let apply_outcome = apply_sync_response_async(
+                inputs.file.clone(),
+                msg.clone(),
+                inputs.channel_id,
+            )
+            .await;
+            match apply_outcome {
                 Ok(new_tail) => {
                     // Record the post-apply tail on the coordinator
                     // so capability-tag advertisements ride
@@ -1511,8 +1523,16 @@ async fn on_inbound(
                                 );
                             }
                             // Retry the apply now that the local
-                            // tail matches first_seq.
-                            match apply_sync_response(&inputs.file, &msg, inputs.channel_id) {
+                            // tail matches first_seq. PERF_AUDIT §5.5
+                            // — same off-loop offload as the primary
+                            // apply path above.
+                            let retry_outcome = apply_sync_response_async(
+                                inputs.file.clone(),
+                                msg.clone(),
+                                inputs.channel_id,
+                            )
+                            .await;
+                            match retry_outcome {
                                 Ok(new_tail) => {
                                     coordinator.record_tail_seq(new_tail);
                                     tracing::trace!(

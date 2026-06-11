@@ -326,6 +326,38 @@ pub fn handle_sync_request(
     })
 }
 
+/// Async wrapper around [`apply_sync_response`] that offloads the
+/// blocking body (`append_batch` writes + `file.sync()` fsync, both
+/// of which block the calling task for ms-class durations on disk-
+/// backed channels) to the tokio blocking pool.
+///
+/// **PERF_AUDIT §5.5** — the replication runtime's per-channel
+/// `select!` loop calls this on every accepted `SyncResponse`. Pre-
+/// fix the sync `apply_sync_response` ran inline on that task,
+/// stalling heartbeat dispatch and inbound-msg handling for the
+/// duration of every fsync. Wrapping just `apply_sync_response` in
+/// `spawn_blocking` is enough — the surrounding loop continues to
+/// handle other channel events while the apply lands.
+///
+/// `RedexFile` is internally `Arc<RedexFileInner>` so `clone()` is
+/// a refcount bump; `SyncResponse` clones the `Vec<SyncEvent>` once
+/// (each event's `payload: Bytes` is itself a refcount bump after
+/// PERF_AUDIT §5.2 / §5.4). The cloning cost is dominated by the
+/// fsync the wrapper exists to offload.
+pub async fn apply_sync_response_async(
+    file: RedexFile,
+    response: SyncResponse,
+    expected_channel: ChannelId,
+) -> Result<u64, ApplyError> {
+    tokio::task::spawn_blocking(move || apply_sync_response(&file, &response, expected_channel))
+        .await
+        .unwrap_or_else(|join_err| {
+            Err(ApplyError::AppendFailed(format!(
+                "apply_sync_response_async: spawn_blocking panicked: {join_err}"
+            )))
+        })
+}
+
 /// Replica-side: validate + apply a chunk to `file`. Returns the
 /// new tail (`file.next_seq()` after the apply).
 ///
