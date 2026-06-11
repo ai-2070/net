@@ -272,6 +272,13 @@ fn bench_encryption(c: &mut Criterion) {
         };
         let cipher = ChaCha20Poly1305::new((&key).into());
         let aad = [0x42u8; 56];
+        // Prefix-filled template, exactly `PacketCipher`'s shape:
+        // the 4-byte session prefix is derived ONCE at construction
+        // (any non-zero stand-in works — AEAD timing is independent
+        // of nonce VALUES); per call the template is copied and only
+        // the counter bytes 4..12 are overwritten, mirroring
+        // `nonce_from_counter` instruction-for-instruction.
+        let nonce_template: [u8; 12] = [0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0, 0, 0, 0, 0];
         for payload_size in [64usize, 256, 1024, 4096].iter() {
             let mut buf = vec![0x42u8; *payload_size];
             let mut counter = 0u64;
@@ -284,12 +291,10 @@ fn bench_encryption(c: &mut Criterion) {
                 payload_size,
                 move |b, _| {
                     b.iter(|| {
-                        // Template-nonce shape mirrors
-                        // `PacketCipher::nonce_from_counter`; the
-                        // counter bump keeps (key, nonce) pairs
+                        // Counter bump keeps (key, nonce) pairs
                         // unique across iterations.
                         counter = counter.wrapping_add(1);
-                        let mut nonce = [0u8; 12];
+                        let mut nonce = nonce_template;
                         nonce[4..12].copy_from_slice(&counter.to_le_bytes());
                         let tag = cipher
                             .encrypt_in_place_detached((&nonce).into(), &aad, &mut buf)
@@ -308,6 +313,9 @@ fn bench_encryption(c: &mut Criterion) {
     {
         use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
         let aad = [0x42u8; 56];
+        // Same prefix-filled template shape as `raw_aead` above —
+        // see the comment there.
+        let nonce_template: [u8; 12] = [0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0, 0, 0, 0, 0];
         for payload_size in [64usize, 256, 1024, 4096].iter() {
             let unbound = UnboundKey::new(&CHACHA20_POLY1305, &key).expect("32-byte key");
             let cipher = LessSafeKey::new(unbound);
@@ -320,7 +328,7 @@ fn bench_encryption(c: &mut Criterion) {
                 move |b, _| {
                     b.iter(|| {
                         counter = counter.wrapping_add(1);
-                        let mut nonce = [0u8; 12];
+                        let mut nonce = nonce_template;
                         nonce[4..12].copy_from_slice(&counter.to_le_bytes());
                         let tag = cipher
                             .seal_in_place_separate_tag(
