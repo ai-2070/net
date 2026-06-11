@@ -3,7 +3,8 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::json;
 
-use net::config::BackpressureMode;
+use net::bus::EventBus;
+use net::config::{BackpressureMode, EventBusConfig};
 use net::event::{InternalEvent, RawEvent};
 use net::shard::ShardManager;
 use net::timestamp::TimestampGenerator;
@@ -159,12 +160,99 @@ fn bench_batch_pop(c: &mut Criterion) {
     group.finish();
 }
 
+/// PERF_AUDIT bench-coverage-gap #1 — drives
+/// [`EventBus::ingest_raw`] with 1/2/4/8 producer threads. The
+/// bus-level hot path the existing single-threaded `bench_shard`
+/// can't see lives here: the bus-side `events_ingested` counter
+/// (striped per PERF_AUDIT §1.1+§1.2) plus the dynamic-scaling
+/// metrics collector subsampling (§1.3) all run on each
+/// `ingest_raw`. Multi-producer contention is the regime where
+/// the striped-counter fix shows up — under a single producer
+/// the cache line never bounces, so the pre-fix vs post-fix
+/// numbers look identical.
+///
+/// Bench shape:
+///   - Pre-built [`RawEvent`] template cloned per push (a
+///     refcount bump; no JSON re-serialization).
+///   - `BackpressureMode::DropOldest` so a saturated ring never
+///     stalls a producer.
+///   - 16-shard bus so producers route to distinct shards
+///     statistically — the bench measures contention on the
+///     bus-level counter, NOT per-shard mutex contention (the
+///     dynamic-scaling regime is a separate axis the audit
+///     covers under §1.3 / §1.4).
+fn bench_event_bus_ingest_raw_concurrent(c: &mut Criterion) {
+    let mut group = c.benchmark_group("event_bus_ingest_raw_concurrent");
+
+    const EVENTS_PER_BATCH: u64 = 8_192;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime for bench setup");
+
+    for &producers in &[1usize, 2, 4, 8] {
+        group.throughput(Throughput::Elements(EVENTS_PER_BATCH));
+        group.bench_with_input(
+            BenchmarkId::new("producers", producers),
+            &producers,
+            |b, &producers| {
+                // Spin a fresh bus per iteration so a saturated
+                // ring buffer from a prior iteration doesn't bias
+                // the next sample. 16 shards × 64 K capacity =
+                // plenty of headroom for `EVENTS_PER_BATCH`
+                // events even under DropNewest, and the bench
+                // routes through `ingest_raw`'s atomic-only path
+                // (no JSON parse, no per-shard mutex serialization
+                // unless producers happen to collide on a shard).
+                let config = EventBusConfig::builder()
+                    .num_shards(16)
+                    .ring_buffer_capacity(65_536)
+                    .backpressure_mode(BackpressureMode::DropOldest)
+                    .build()
+                    .unwrap();
+                let bus = std::sync::Arc::new(
+                    runtime
+                        .block_on(EventBus::new(config))
+                        .expect("EventBus::new for bench"),
+                );
+                let raw_template = RawEvent::from_str(r#"{"i":0}"#);
+
+                b.iter(|| {
+                    let per_thread = EVENTS_PER_BATCH as usize / producers;
+                    std::thread::scope(|scope| {
+                        for _ in 0..producers {
+                            let bus = std::sync::Arc::clone(&bus);
+                            let template = raw_template.clone();
+                            scope.spawn(move || {
+                                for _ in 0..per_thread {
+                                    let _ = bus.ingest_raw(template.clone());
+                                }
+                            });
+                        }
+                    });
+                });
+
+                // EventBus::shutdown consumes `self`, so we can't
+                // call it through the Arc handle. Drop the Arc and
+                // rely on the bus's `Drop` to tear down background
+                // workers. The runtime stays alive across
+                // iterations to amortize its setup cost.
+                drop(bus);
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_shard,
     bench_timestamp,
     bench_event_creation,
     bench_batch_pop,
+    bench_event_bus_ingest_raw_concurrent,
 );
 
 criterion_main!(benches);
