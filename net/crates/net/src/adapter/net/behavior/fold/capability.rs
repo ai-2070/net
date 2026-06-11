@@ -552,10 +552,37 @@ fn resolve_keys_all_tags(
     candidates
 }
 
+/// Borrow-or-own candidate set returned by
+/// [`resolve_candidate_keys`]. A single-constraint filter resolves
+/// to exactly one index bucket, and that bucket IS the answer —
+/// returning it borrowed skips cloning every candidate key into a
+/// fresh owned set (alloc + rehash of M keys; the dominant cost of
+/// a high-cardinality single-tag discovery query). Composite
+/// filters still materialize an owned, tightened set.
+pub(crate) enum CandidateKeys<'a> {
+    /// The filter constrained exactly one indexed dimension —
+    /// the bucket is borrowed from the index untouched.
+    Borrowed(&'a HashSet<(u64, NodeId), BuildU64TupleHasher>),
+    /// Composite (or empty-result) filter — materialized set.
+    Owned(HashSet<(u64, NodeId), BuildU64TupleHasher>),
+}
+
+impl CandidateKeys<'_> {
+    /// The resolved key set, regardless of arm.
+    pub(crate) fn as_set(&self) -> &HashSet<(u64, NodeId), BuildU64TupleHasher> {
+        match self {
+            Self::Borrowed(s) => s,
+            Self::Owned(s) => s,
+        }
+    }
+}
+
 /// Resolve the set of `(class, node)` keys a
 /// [`CapabilityFilter`] selects on its *indexed* axes — tags,
 /// state, region, class. Chooses the most-selective indexed
 /// dimension as the seed, then tightens with the rest in memory.
+/// Single-constraint filters return the index bucket borrowed
+/// (see [`CandidateKeys`]); composite filters materialize.
 ///
 /// Does NOT clone any payload, and does NOT apply `filter.limit`
 /// or non-indexed predicates (hardware / model / tool). Callers
@@ -564,11 +591,45 @@ fn resolve_keys_all_tags(
 /// [`Fold::with_state_and_index`]; [`composite_query`] layers the
 /// payload materialization + limit on top for the
 /// `Vec<CapabilityMatch>` query path.
-pub(crate) fn resolve_candidate_keys(
+pub(crate) fn resolve_candidate_keys<'a>(
     state: &FoldState<CapabilityFold>,
-    index: &CapabilityIndexInner,
+    index: &'a CapabilityIndexInner,
     filter: &CapabilityFilter,
-) -> HashSet<(u64, NodeId), BuildU64TupleHasher> {
+) -> CandidateKeys<'a> {
+    // Single-constraint fast path (2026-06-11 service-discovery
+    // follow-up): when the filter constrains exactly one indexed
+    // dimension and nothing else would tighten the seed, the index
+    // bucket already IS the final candidate set. Borrow it instead
+    // of cloning every key into an owned set — and, for the state /
+    // region shapes, instead of also running the general path's
+    // redundant self-retain against the very bucket it seeded from.
+    // `tags_all` resolves against `by_tag` only (synthetic model /
+    // tool / gpu axes ride `tag_groups_all` → `by_synthetic`), so
+    // borrowing the raw-tag bucket cannot leak a synthetic match.
+    if filter.tag_groups_all.is_empty() && filter.tags_any.is_empty() && filter.class.is_none() {
+        match (&filter.tags_all[..], filter.state, &filter.region) {
+            ([tag], None, None) => {
+                return match index.by_tag.get(tag) {
+                    Some(bucket) => CandidateKeys::Borrowed(bucket),
+                    None => CandidateKeys::Owned(HashSet::default()),
+                };
+            }
+            ([], Some(state_filter), None) => {
+                return match index.by_state.get(&state_filter) {
+                    Some(bucket) => CandidateKeys::Borrowed(bucket),
+                    None => CandidateKeys::Owned(HashSet::default()),
+                };
+            }
+            ([], None, Some(region)) => {
+                return match index.by_region.get(region) {
+                    Some(bucket) => CandidateKeys::Borrowed(bucket),
+                    None => CandidateKeys::Owned(HashSet::default()),
+                };
+            }
+            _ => {}
+        }
+    }
+
     // Each group's union (OR within a group) is needed both to seed
     // (when no `tags_all` is present) and to tighten further down.
     // `group_unions` holds the ones that still need to be applied as
@@ -669,7 +730,7 @@ pub(crate) fn resolve_candidate_keys(
     // is always the seed (the first branch above), so `candidates`
     // already equals its intersection and every retain since has
     // only narrowed it.
-    candidates
+    CandidateKeys::Owned(candidates)
 }
 
 /// Materialize the union for each non-empty group in
@@ -729,8 +790,9 @@ fn composite_query(
     // just to drop it on the next line. With `take` before
     // `collect`, the clone runs exactly `limit` times.
     let it = candidates
-        .into_iter()
-        .filter_map(|k| state.entries.get(&k).map(|e| (k, e.payload.clone())));
+        .as_set()
+        .iter()
+        .filter_map(|&k| state.entries.get(&k).map(|e| (k, e.payload.clone())));
     if filter.limit > 0 {
         it.take(filter.limit).collect()
     } else {
@@ -1394,6 +1456,109 @@ mod tests {
         };
         let hits = fold.query(CapabilityQuery::Composite(filter));
         assert_eq!(hits.len(), 3);
+    }
+
+    /// 2026-06-11 service-discovery follow-up — single-constraint
+    /// filters must take the borrowed fast path (the index bucket
+    /// IS the answer; no clone/rehash of M candidate keys),
+    /// composite filters must materialize, and the borrowed arm
+    /// must select exactly what the general path would.
+    #[test]
+    fn single_constraint_filters_borrow_the_index_bucket() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(sign_cap(
+            &kp,
+            0xA,
+            1,
+            0x100,
+            vec!["gpu", "fast"],
+            NodeState::Idle,
+            Some("us-east"),
+        ))
+        .unwrap();
+        fold.apply(sign_cap(
+            &kp,
+            0xB,
+            1,
+            0x100,
+            vec!["gpu"],
+            NodeState::Busy,
+            Some("us-west"),
+        ))
+        .unwrap();
+        fold.apply(sign_cap(
+            &kp,
+            0xC,
+            1,
+            0x200,
+            vec!["cpu"],
+            NodeState::Idle,
+            Some("us-east"),
+        ))
+        .unwrap();
+
+        fold.with_state_and_index(|state, index| {
+            let nodes = |keys: &CandidateKeys<'_>| -> Vec<NodeId> {
+                let mut v: Vec<NodeId> = keys.as_set().iter().map(|&(_, n)| n).collect();
+                v.sort_unstable();
+                v
+            };
+
+            // Single tag → Borrowed: exactly the by_tag bucket.
+            let tag_only = CapabilityFilter {
+                tags_all: vec!["gpu".into()],
+                ..CapabilityFilter::default()
+            };
+            let got = resolve_candidate_keys(state, index, &tag_only);
+            assert!(
+                matches!(got, CandidateKeys::Borrowed(_)),
+                "single-tag filter must borrow the index bucket"
+            );
+            assert_eq!(nodes(&got), vec![0xA, 0xB]);
+
+            // Single state → Borrowed.
+            let state_only = CapabilityFilter {
+                state: Some(NodeState::Idle),
+                ..CapabilityFilter::default()
+            };
+            let got = resolve_candidate_keys(state, index, &state_only);
+            assert!(matches!(got, CandidateKeys::Borrowed(_)));
+            assert_eq!(nodes(&got), vec![0xA, 0xC]);
+
+            // Single region → Borrowed.
+            let region_only = CapabilityFilter {
+                region: Some("us-east".into()),
+                ..CapabilityFilter::default()
+            };
+            let got = resolve_candidate_keys(state, index, &region_only);
+            assert!(matches!(got, CandidateKeys::Borrowed(_)));
+            assert_eq!(nodes(&got), vec![0xA, 0xC]);
+
+            // Unknown single tag → provably empty (Owned default,
+            // no bucket to borrow).
+            let missing = CapabilityFilter {
+                tags_all: vec!["nope".into()],
+                ..CapabilityFilter::default()
+            };
+            let got = resolve_candidate_keys(state, index, &missing);
+            assert!(matches!(got, CandidateKeys::Owned(_)));
+            assert!(got.as_set().is_empty());
+
+            // Composite (tag + state) → Owned: the general path
+            // must still materialize and intersect.
+            let composite = CapabilityFilter {
+                tags_all: vec!["gpu".into()],
+                state: Some(NodeState::Idle),
+                ..CapabilityFilter::default()
+            };
+            let got = resolve_candidate_keys(state, index, &composite);
+            assert!(
+                matches!(got, CandidateKeys::Owned(_)),
+                "composite filter must materialize a tightened set"
+            );
+            assert_eq!(nodes(&got), vec![0xA]);
+        });
     }
 
     #[test]

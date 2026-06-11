@@ -2356,16 +2356,34 @@ fn bench_capability_fold_scaling(c: &mut Criterion) {
     for node_count in [1000, 5000, 10000, 50000].iter() {
         let fold = Fold::<CapabilityFold>::with_sweep_interval(Duration::ZERO);
         for i in 0..*node_count {
-            let caps = sample_capability_set(i as u64);
+            let mut caps = sample_capability_set(i as u64);
+            // Fixed-cardinality discovery target: exactly 100 nodes
+            // carry this tag at EVERY fleet size. `query_tag_rare`
+            // below isolates indexed-lookup cost from result
+            // materialization — `query_tag`'s "inference" rides on
+            // half the fleet (`sample_capability_set` tags every
+            // even index), so its per-query growth with node_count
+            // is the result set, not the index.
+            if i < 100 {
+                caps = caps.add_tag("rare-fixed");
+            }
             let ann =
                 CapabilityAnnouncement::new(i as u64, EntityId::from_bytes([0u8; 32]), 1, caps);
             capability_bridge::apply_legacy_announcement(&fold, ann)
                 .expect("apply legacy announcement in fixture");
         }
 
+        // Throughput is per MATCH, not per query: a query that
+        // returns half the fleet is information-theoretically
+        // O(matches), so per-query wall time grows linearly with
+        // node_count by fixture construction. Per-match throughput
+        // is the metric that's comparable across sizes —
+        // 2026-06-11 service-discovery feedback read the per-query
+        // growth as "linear scan" when the linear factor was the
+        // result set, not the lookup.
         let tag_filter = CapabilityFilter::new().require_tag("inference");
-
-        group.throughput(Throughput::Elements(1));
+        let tag_matches = capability_bridge::find_nodes_matching(&fold, &tag_filter).len() as u64;
+        group.throughput(Throughput::Elements(tag_matches.max(1)));
         group.bench_with_input(
             BenchmarkId::new("query_tag", node_count),
             node_count,
@@ -2378,12 +2396,35 @@ fn bench_capability_fold_scaling(c: &mut Criterion) {
             .require_tag("inference")
             .require_gpu()
             .with_min_memory(70);
-
+        let complex_matches =
+            capability_bridge::find_nodes_matching(&fold, &complex_filter).len() as u64;
+        group.throughput(Throughput::Elements(complex_matches.max(1)));
         group.bench_with_input(
             BenchmarkId::new("query_complex", node_count),
             node_count,
             |b, _| {
                 b.iter(|| capability_bridge::find_nodes_matching(&fold, &complex_filter));
+            },
+        );
+
+        // The fleet-scale discovery shape: constant match
+        // cardinality (100) while node_count scales. With the
+        // inverted `by_tag` index + the single-constraint borrowed
+        // fast path this should hold roughly flat as node_count
+        // grows; growth here would mean the index itself (not
+        // result materialization) is degrading.
+        let rare_filter = CapabilityFilter::new().require_tag("rare-fixed");
+        let rare_matches = capability_bridge::find_nodes_matching(&fold, &rare_filter).len() as u64;
+        assert_eq!(
+            rare_matches, 100,
+            "rare-tag fixture must stay fixed-cardinality across fleet sizes"
+        );
+        group.throughput(Throughput::Elements(rare_matches));
+        group.bench_with_input(
+            BenchmarkId::new("query_tag_rare", node_count),
+            node_count,
+            |b, _| {
+                b.iter(|| capability_bridge::find_nodes_matching(&fold, &rare_filter));
             },
         );
     }

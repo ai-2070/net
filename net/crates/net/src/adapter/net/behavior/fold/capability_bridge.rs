@@ -776,8 +776,9 @@ pub fn find_nodes_matching(fold: &Fold<CapabilityFold>, legacy: &LegacyFilter) -
     // every match before the caller can discard it.
     let mut out: Vec<NodeId> = fold.with_state_and_index(|state, index| {
         let candidates = resolve_candidate_keys(state, index, &fold_filter);
+        let candidates = candidates.as_set();
         let mut ids: Vec<NodeId> = Vec::with_capacity(candidates.len());
-        for key in candidates {
+        for &key in candidates {
             let Some(entry) = state.entries.get(&key) else {
                 continue;
             };
@@ -945,8 +946,9 @@ pub fn find_nodes_matching_scoped(
     // gate after the locks drop.
     let scoped: Vec<(NodeId, CapabilityScope)> = fold.with_state_and_index(|state, index| {
         let candidates = resolve_candidate_keys(state, index, &fold_filter);
+        let candidates = candidates.as_set();
         let mut acc: Vec<(NodeId, CapabilityScope)> = Vec::with_capacity(candidates.len());
-        for key in candidates {
+        for &key in candidates {
             let Some(entry) = state.entries.get(&key) else {
                 continue;
             };
