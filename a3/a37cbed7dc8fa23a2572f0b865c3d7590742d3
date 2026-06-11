@@ -1,0 +1,41 @@
+net/crates/net/src/adapter/net/dataforts/dir.rs
+  s_58168e769adc91::t_0854c73d34cc58 248-253,257,260-265
+  s_58168e769adc91::t_03e8ad4372f741 331-342,344,347-355,358-359
+net/crates/net/src/adapter/net/dataforts/blob/erasure.rs
+  s_58168e769adc91::t_52db2c6d201818 1007-1079
+net/crates/net/src/adapter/net/dataforts/blob/fs.rs
+  s_58168e769adc91::t_c2fa08878a88c3 107-113
+net/crates/net/src/adapter/net/dataforts/blob/mesh.rs
+  s_58168e769adc91::t_4e0e042d445be4 2185
+  s_58168e769adc91::t_43e2ecf9d1c15a 146-152,175-183
+  s_58168e769adc91::t_93011ed68858fa 2716-2735
+  s_58168e769adc91::t_81253f7eab4a18 6056-6177
+  s_58168e769adc91::t_5c7af15ad878ee 129-131,137
+  s_58168e769adc91::t_03f0543d556e4e 1215-1223
+  s_58168e769adc91::t_4ae78820f8a942 132-136
+  s_58168e769adc91::t_4f80e759ae592a 2614-2619
+  s_58168e769adc91::t_3a3e098d178020 506
+  s_58168e769adc91::t_e2446303a4f68f 1923
+  s_58168e769adc91::t_d9f508f191d596 2630
+  s_58168e769adc91::t_ac47c1ffd91639 4713-4748
+  s_58168e769adc91::t_8b5fbf76a0fe80 4205-4255
+  s_58168e769adc91::t_4ea41f095c4117 7128-7182
+net/crates/net/tests/dir_transfer.rs
+  s_58168e769adc91::t_849c08050f3fe1 734-833
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "a3a37cbed7dc8fa23a2572f0b865c3d7590742d3",
+  "prompts": {},
+  "sessions": {
+    "s_58168e769adc91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "43399f81-fab3-4b2a-a002-4ece8a909069",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
