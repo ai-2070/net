@@ -184,6 +184,30 @@ impl MemoriesWatcher {
                     _ = tx.closed() => return,
                     maybe_seq = changes.next() => {
                         let Some(_seq) = maybe_seq else { return };
+                        // PERF_AUDIT §5.6 — opportunistic batching.
+                        // Pre-fix every fold-apply tick triggered a
+                        // full `spec.execute` re-scan of the
+                        // memories HashMap. During a catch-up
+                        // replay or any bursty publisher, the same
+                        // filtered result was recomputed once per
+                        // event when downstream callers only ever
+                        // see the final state (the watch channel
+                        // conflates on the consumer side).
+                        //
+                        // Drain any change events that have ALREADY
+                        // arrived in the stream's buffer before
+                        // re-querying. `now_or_never` is a non-
+                        // blocking probe — does not delay queries
+                        // for spread-out changes; only coalesces
+                        // bursts where multiple ticks are already
+                        // queued.
+                        use futures::future::FutureExt;
+                        while let Some(maybe_more) = (&mut changes).next().now_or_never() {
+                            match maybe_more {
+                                Some(_) => continue,
+                                None => return,
+                            }
+                        }
                         let current = {
                             let guard = state.read();
                             spec.execute(&guard)

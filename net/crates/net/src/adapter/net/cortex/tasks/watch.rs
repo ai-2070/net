@@ -161,6 +161,17 @@ impl TasksWatcher {
                     _ = tx.closed() => return,
                     maybe_seq = changes.next() => {
                         let Some(_seq) = maybe_seq else { return };
+                        // PERF_AUDIT §5.6 — opportunistic batching;
+                        // see the matching comment in
+                        // `memories/watch.rs` for the full
+                        // rationale.
+                        use futures::future::FutureExt;
+                        while let Some(maybe_more) = (&mut changes).next().now_or_never() {
+                            match maybe_more {
+                                Some(_) => continue,
+                                None => return,
+                            }
+                        }
                         let current = {
                             let guard = state.read();
                             spec.execute(&guard)
