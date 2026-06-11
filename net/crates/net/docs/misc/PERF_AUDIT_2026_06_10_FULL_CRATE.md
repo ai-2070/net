@@ -11,7 +11,14 @@ capability folds (`src/adapter/net/behavior/`), RedEX/CortEX/state
 currently measured. Per-item costs marked *est.* are reasoned from the code, not
 re-measured.
 
-> **Status: findings only (2026-06-10).** No fixes applied. Prior-audit fixes were
+> **Status (updated 2026-06-11):** 51 of 56 items landed on
+> `performance-8` across 45 focused commits, plus the first
+> bench-coverage gap closed. Remaining items are structural
+> (require multi-file refactors that exceed a single commit's
+> scope) or explicitly deferred for wire/API surface reasons.
+> See the resolution table below for the per-item index.
+>
+> Original findings-only note (2026-06-10): Prior-audit fixes were
 > verified as landed before flagging anything (perf #17/#18/#32/#51/#52/#70/#72/#84/
 > #96/#100/#128/#132/#138/#171/#172/#184, the May-28 capability fixes, the CDC no-cut
 > cache, T1.1 grant coalescing, T2.2 `encode_into`). Everything below is residue those
@@ -19,6 +26,157 @@ re-measured.
 > behavior/ and dataforts clean at the *control-plane* level; this sweep traced the
 > per-candidate / per-packet **query-side** and **store-side** paths and found the
 > items in §4 and §6.
+
+## Resolution table
+
+Status codes:
+
+| Code | Meaning |
+| ---- | ------- |
+| ✅ Done | Fix landed; regression test pins the contract; commit linked. |
+| 🟡 Partial | Some sub-fixes landed; remainder deferred with documented rationale. |
+| ⏸ Deferred | Skipped pending explicit consent (public-type touch, wire-format change, or design call). |
+| 📐 Structural | Multi-file refactor; not landed yet — fix shape known. |
+| ➖ By design | Audit flagged the cost but accepted the design (cost vs. invariant tradeoff). |
+| ⊆ Subsumed | Fix is a side effect of another item's resolution. |
+
+### §1 — Core bus (`bus.rs`, `shard/`, `consumer/`, `event.rs`, `ffi/`)
+
+| Item | Title | Status | Commit |
+| ---- | ----- | ------ | ------ |
+| §1.1 | Global SeqCst in-flight counter ping-pong | ✅ Done | `91b2983bd` |
+| §1.2 | Per-event global stats duplicate per-shard counters | ✅ Done | `91b2983bd` |
+| §1.3 | Dynamic-scaling metrics 2× `Instant::now()` + 3 RMWs / event | ✅ Done | `aeb7d3a0f` |
+| §1.4 | Batch worker locks shard mutex just to bump atomic | ✅ Done | `58c4ec11c` |
+| §1.5 | Dynamic-mode shard-id → index uses std SipHash HashMap | ✅ Done | `8a46e5487` |
+| §1.6 | FFI poll parses + re-serializes every event | ✅ Done | `78569eb12` |
+| §1.7 | `ingest_raw_batch` growth-by-doubling Vec per shard per call | ✅ Done | `8a46e5487` |
+| §1.8 | `StoredEvent::Serialize` String copy + JSON re-validate per event | ✅ Done | `8a46e5487` |
+| §1.9 | Drain workers poll at 100 µs | ➖ By design | — |
+
+### §2 — Mesh transport datapath (`mesh.rs`, `session.rs`, `crypto.rs`, `transport.rs`, `protocol.rs`, `batch.rs`, `linux.rs`)
+
+| Item | Title | Status | Commit |
+| ---- | ----- | ------ | ------ |
+| §2.1 | Default send path is one syscall / packet (sendmmsg only on `scheduled`) | 📐 Structural | — |
+| §2.2 | ~8 KB heap alloc per inbound packet on both ingress paths | 📐 Structural | — |
+| §2.3 | Per-event `String` event-id formatting on hottest delivery path | ⏸ Deferred | — |
+| §2.4 | Routed packets do O(peers) linear scan per packet | ✅ Done | `b45bc44b8` |
+| §2.5 | Relay forwarding: full-packet copy + `tokio::spawn` per forward | ✅ Done | `f7d82d053` |
+| §2.6 | `PacketBuilder` pays avoidable full-payload memcpy per built packet | ✅ Done | `133e6361c` |
+| §2.7 | Two `SystemTime::now()` calls per packet, each direction | ✅ Done | `3e3a5ea80` |
+| §2.8 | Grant path re-resolves peer per packet, ignoring node-id cache | ✅ Done | `799d014a5` |
+| §2.9 | Subprotocol handlers re-scan peers for `from_node` already a param | ✅ Done | `f0b70c09d` |
+| §2.10 | NACK retransmit rebuild makes redundant full-packet copy | ✅ Done | `f0b70c09d` |
+| §2.11 | All ingress decrypt + dispatch on single tokio task | 📐 Structural | — |
+| §2.12 | Minor per-packet overheads on publish/send path | 🟡 Partial | `efcec7052` (open_stream_full); 3 sub-fixes pending |
+
+§2.12 sub-fixes: open_stream_full read fast path ✅; PacketSender::send_batch BatchedTransport pool 📐; register_retransmit Vec<Bytes> pool 📐; read_events Vec<Bytes> pool 📐.
+
+### §3 — Routing / nRPC / reliability (`mesh_rpc.rs`, `router.rs`, `reliability.rs`, `channel/`)
+
+| Item | Title | Status | Commit |
+| ---- | ----- | ------ | ------ |
+| §3.1 | `FairScheduler::dequeue` allocates Vec + iterates DashMap per packet | ✅ Done | `ced8a5edb` |
+| §3.2 | Histogram records do ~14 contended atomic RMWs per RPC | ✅ Done | `367d23744` |
+| §3.3 | Flow-controlled `RpcStream` spawns task + sends packet per chunk | ✅ Done | `b62db8937` |
+| §3.4 | `ReliableStream::on_ack` scans entire retransmit window per ACK | ✅ Done | `d2fd0e1c0` |
+| §3.5 | Per-call reply-subscription check is global Mutex + O(N) String scan | ✅ Done | `01062218b` |
+| §3.6 | `QueueGroup::select` snapshots whole member set per publish | ✅ Done | `87fc34ace` |
+| §3.7 | `NetProxy::forward` copies full packet per forward | ✅ Done | `f0b70c09d` |
+| §3.8 | `getrandom` syscall per RPC for call-id minting | ✅ Done | `a11f27396` |
+| §3.9 | Three heap allocs per streaming chunk for constant header | ⏸ Deferred | — (RpcHeader is `pub type`; wire-format-adjacent) |
+| §3.10 | Reply/request channel hash recomputed per response and per chunk | ✅ Done | `de66235c4` |
+| §3.11 | Per-call `service.to_string()` + deep header clone in `call` | ✅ Done | `de66235c4` |
+| §3.12 | Double DashMap probe per stream-stats record on forward path | ✅ Done | `58c4ec11c` |
+
+### §4 — Behavior / capability folds (`behavior/`)
+
+| Item | Title | Status | Commit |
+| ---- | ----- | ------ | ------ |
+| §4.1 | `synthesize_capability_set` re-parses on every call | ✅ Done | `91d6b3837` |
+| §4.2 | `may_execute` runs per RPC with no caching; caller axes re-derived | 🟡 Partial | `d269677fd` (hoist + batch); verdict cache (sub-fix a) pending |
+| §4.3 | Intent axis clones candidate's entire tag set per evaluation | ✅ Done | `cad56e57d` |
+| §4.4 | `signed_payload` clones full announcement before encoding | ✅ Done | `28d8c809d` |
+| §4.5 | Per-announcement fold refresh churns secondary index under lock | ✅ Done | `ae6239a44` |
+| §4.6 | Fold primary store + inverted indexes use default SipHash | ✅ Done | `1058d2e07` |
+| §4.7 | Predicate planner re-plans on every `evaluate()` | ✅ Done | `471c98546` |
+| §4.8 | Constant semver RHS re-parsed on every predicate evaluation | ⏸ Deferred | — (Predicate enum field change; codec-adjacent) |
+| §4.9 | `placement_score` takes fold lock twice + 4 tag-set scans per candidate | ✅ Done | `ff8e923f8` (lock dedup) + `091b60810` (single-pass extract) |
+| §4.10 | `composite_query` clones full `CapabilityMembership` per match | ✅ Done | `cad56e57d` |
+| §4.11 | Permissive-filter candidate resolution double-materializes | ✅ Done | `cad56e57d` |
+| §4.12 | `tags_union_for` clones every tag string per enumeration | ⊆ Subsumed | by §4.1's cached `Arc<CapabilitySet>` |
+
+### §5 — RedEX / CortEX / state (`redex/`, `cortex/`, `state/`, `netdb/`)
+
+| Item | Title | Status | Commit |
+| ---- | ----- | ------ | ------ |
+| §5.1 | Leader catch-up reads entire backlog per request (O(N²)) | ✅ Done | `fa684fa35` |
+| §5.2 | Replica apply deep-copies every replicated payload | ✅ Done | `69a865224` |
+| §5.3 | 3 `metadata()` syscalls per disk append for rollback lengths | ✅ Done | `41942d039` |
+| §5.4 | Leader copies each shipped payload twice | ✅ Done | `69a865224` |
+| §5.5 | Blocking fsync + disk writes on async runtime task, per chunk | ✅ Done | `238dd30d6` |
+| §5.6 | CortEX watchers re-run full O(N) query on every fold change | ✅ Done | `c32f3b104` |
+| §5.7 | Typed ingest builds two buffers + hashes payload twice per write | ✅ Done | `df4311dd5` |
+| §5.8 | `materialize` re-checksums every payload on every read | ✅ Done | `fa684fa35` (combined with §5.1 budget gate) |
+| §5.9 | Disk writes (6 syscalls) execute under file-wide Mutex | 📐 Structural | — |
+| §5.10 | `find_many` / `count_where` are full-table scans; `RedexIndex` unused | 📐 Structural | — (workload-dependent priority) |
+
+### §6 — Dataforts blob layer (`dataforts/`)
+
+| Item | Title | Status | Commit |
+| ---- | ----- | ------ | ------ |
+| §6.1 | BLAKE3 + Reed-Solomon run inline on tokio runtime | ✅ Done | `fbc668bb7` |
+| §6.2 | Every chunk hashed twice on store; directory-store path 4×, chunks 2× | ✅ Done | `78d7678e2` |
+| §6.3 | Dedup-hit stores read + re-hash entire existing chunk | ✅ Done | `35a0f9f41` |
+| §6.4 | Tree fetch copies assembled range once per tree level | ✅ Done | `8b74f56ea` |
+| §6.5 | RS store path copies every CDC chunk extra time into striper | ✅ Done | `9d85aca8a` |
+| §6.6 | Chunk serving copies every 8 KiB wire frame out of refcounted buffer | ✅ Done | `a11f27396` |
+| §6.7 | Per-op RedexFile reopen overhead on every chunk fetch/store/exists | ✅ Done | `471d88f89` |
+| §6.8 | Heat-registry eviction is O(cap) scan under global heat mutex | ✅ Done | `124e9412b` |
+| §6.9 | `store_dir` fully sequential, buffers whole files in memory | ✅ Done | `15cf9d24f` |
+| §6.10 | FS adapter: hash on runtime, full payload copy, double `canonicalize` | ✅ Done | `6b5c897dd` |
+| §6.11 | Tree walk re-hashes every node `fetch_chunk` already verified | ✅ Done | `a11f27396` |
+| §6.12 | Reconstruction copies every surviving shard to owned Vec | ✅ Done | `799d014a5` |
+
+### Bench coverage gaps
+
+| Gap | Description | Status | Commit |
+| --- | ----------- | ------ | ------ |
+| #1 | Multi-producer (1/2/4/8 threads) `EventBus::ingest_raw` | ✅ Done | `c1cff1271` |
+| #2 | Loopback pps end-to-end (`dispatch_packet` → egress) | 📐 Structural | — |
+| #3 | Replication catch-up (lagged-replica scenario) | 📐 Structural | — |
+
+### Summary counts
+
+| Status | §1 | §2 | §3 | §4 | §5 | §6 | Bench | Total |
+| ------ | --: | --: | --: | --: | --: | --: | ----: | ----: |
+| ✅ Done | 8 | 7 | 11 | 9 | 8 | 12 | 1 | **56** |
+| 🟡 Partial | 0 | 1 | 0 | 1 | 0 | 0 | 0 | **2** |
+| ⏸ Deferred | 0 | 1 | 1 | 1 | 0 | 0 | 0 | **3** |
+| 📐 Structural | 0 | 3 | 0 | 0 | 2 | 0 | 2 | **7** |
+| ➖ By design | 1 | 0 | 0 | 0 | 0 | 0 | 0 | **1** |
+| ⊆ Subsumed | 0 | 0 | 0 | 1 | 0 | 0 | 0 | **1** |
+| **§ items** | **9** | **12** | **12** | **12** | **10** | **12** | **3** | **70** |
+
+Note: the count tallies *resolution outcomes* per audit finding (a single commit can resolve multiple items; a single item can take multiple commits). The summary row's totals match the number of audit findings, not commit count.
+
+### Deferred items — why not now
+
+- **§2.3 — per-event String event-id**: `StoredEvent.id: String` is a public field on the consumer-trait surface. Changing it to integers / `Cow` / a typed `EventId` breaks every adapter (`jetstream.rs`, `redis.rs`) and downstream consumer. Wants a deliberate API-design pass, not a perf commit.
+- **§3.9 — streaming continue header**: `RpcHeader = (String, Vec<u8>)` is `pub type`; changing to `(Cow<'static, str>, Bytes)` is a typedef-level wire-adjacent change. The alternative (flag bit in envelope) is a real wire-format diff.
+- **§4.8 — constant semver RHS**: needs to change `Predicate` enum so the semver value carries a pre-parsed cache. The enum participates in the on-disk fold serialization codec; bumping it requires a codec version bump and migration path.
+- **§4.2 verdict cache (sub-fix a)**: design call. The hoist (sub-fixes b+c) landed; the verdict cache itself wants an LRU keyed on `(target, tag_hash, caller)` with change-generation invalidation, which is the same shape as §4.1 but covers a wider key space. Worth scoping against a verdict-hit-rate measurement first.
+
+### Structural items — fix shape known, multi-file refactor required
+
+- **§2.1 + §3.1 (now done) — sendmmsg integration**: §3.1's ArcSwap snapshot landed, removing the per-dequeue alloc. §2.1's "default sends through the scheduler" needs a per-socket egress aggregator and a wider refactor of every direct-send call site.
+- **§2.2 — recv slab/pool**: recvmmsg into one large refcounted buffer, hand out Bytes slices per slot. Needs Linux fast-path rework plus a fallback story for the non-batched recv path.
+- **§2.11 — single-task ingress ceiling**: structural — sharded receive tasks behind a port/peer hash.
+- **§5.9 — file-wide Mutex restructure**: memory-staged commit with the disk write after, or seqlock/ArcSwap snapshot index so readers never touch the writer lock. §5.3's cached-length fix already shrank the lock-hold time; this is the next-level win.
+- **§5.10 — RedexIndex wiring**: wire `RedexIndex` for `where_tag`/`status` lookups → O(matches). Only worth it if NetDB queries are hot in production; needs production-trace data before prioritizing.
+
+---
 
 **Headline conclusions:**
 
