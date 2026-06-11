@@ -1,0 +1,31 @@
+net/crates/net/src/adapter/net/dataforts/blob/erasure.rs
+  s_d4a014e53aa1f5::t_f65b961507b3d5 921
+  s_d4a014e53aa1f5::t_b24152e66800e3 949
+  s_d4a014e53aa1f5::t_9d1c0ea8a25785 323-339,366
+  s_d4a014e53aa1f5::t_ddf75e7d31123f 513
+  s_d4a014e53aa1f5::t_e5f88c28c01bb0 463-470
+  s_d4a014e53aa1f5::t_9ed5234c09c9cf 864,869
+  s_d4a014e53aa1f5::t_6a75adf106fcc6 896
+  s_d4a014e53aa1f5::t_75915835a3e941 574-582,584-603,605,608-618
+  s_d4a014e53aa1f5::t_586f99e91a4734 963
+  s_d4a014e53aa1f5::t_452ebb3127690d 978
+net/crates/net/src/adapter/net/dataforts/blob/mesh.rs
+  s_d4a014e53aa1f5::t_8d4ab8062f24aa 1680-1686,1698-1699
+  s_d4a014e53aa1f5::t_fe394ac00a3f52 1638-1643,1659-1661
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "9d85aca8abbdc4b298bdb1c7728ef2ca5b2a486d",
+  "prompts": {},
+  "sessions": {
+    "s_d4a014e53aa1f5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a6af4feb-518f-4835-a66d-5b2f7797adef",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
