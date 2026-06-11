@@ -1635,7 +1635,12 @@ impl MeshBlobAdapter {
                             self.store_chunk_prehashed(&chunk_hash, &chunk_bytes)
                                 .await?;
                             let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
-                            if let Some(closed) = striper.push_chunk(chunk_bytes, cref)? {
+                            // PERF_AUDIT §6.5 — striper now holds
+                            // Bytes; `Bytes::from(Vec<u8>)` is O(1)
+                            // (takes ownership of the Vec's buffer).
+                            if let Some(closed) =
+                                striper.push_chunk(bytes::Bytes::from(chunk_bytes), cref)?
+                            {
                                 flush_stripe(self, closed, &mut builder, &mut data_chunk_count)
                                     .await?;
                             }
@@ -1651,7 +1656,9 @@ impl MeshBlobAdapter {
                     self.store_chunk_prehashed(&chunk_hash, &chunk_bytes)
                         .await?;
                     let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
-                    if let Some(closed) = striper.push_chunk(chunk_bytes, cref)? {
+                    if let Some(closed) =
+                        striper.push_chunk(bytes::Bytes::from(chunk_bytes), cref)?
+                    {
                         flush_stripe(self, closed, &mut builder, &mut data_chunk_count).await?;
                     }
                 }
@@ -1670,13 +1677,13 @@ impl MeshBlobAdapter {
                         self.store_chunk_prehashed(&chunk_hash, &chunk_bytes)
                             .await?;
                         let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
-                        // RS striper still owns Vec<u8> internally; one
-                        // copy here is the cost of routing CDC output
-                        // into the RS path. The non-RS CDC path skips
-                        // this — see store_stream_tree_cdc_internal
-                        // where emit_tree_chunk consumes Bytes
-                        // directly.
-                        if let Some(closed) = striper.push_chunk(chunk_bytes.to_vec(), cref)? {
+                        // PERF_AUDIT §6.5 — striper now holds Bytes
+                        // refcount-shared with us; the pre-fix
+                        // `.to_vec()` was a full ~1-16 MiB memcpy per
+                        // CDC chunk. `chunk_bytes.clone()` is O(1).
+                        if let Some(closed) =
+                            striper.push_chunk(chunk_bytes.clone(), cref)?
+                        {
                             flush_stripe(self, closed, &mut builder, &mut data_chunk_count).await?;
                         }
                     }
@@ -1688,7 +1695,8 @@ impl MeshBlobAdapter {
                     self.store_chunk_prehashed(&chunk_hash, &chunk_bytes)
                         .await?;
                     let cref = ChunkRefV3::data(chunk_hash, chunk_bytes.len() as u32);
-                    if let Some(closed) = striper.push_chunk(chunk_bytes.to_vec(), cref)? {
+                    // PERF_AUDIT §6.5 — refcount bump, no memcpy.
+                    if let Some(closed) = striper.push_chunk(chunk_bytes.clone(), cref)? {
                         flush_stripe(self, closed, &mut builder, &mut data_chunk_count).await?;
                     }
                 }
