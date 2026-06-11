@@ -899,9 +899,17 @@ impl<'a> StandardPlacement<'a> {
     /// (which the hard-constraint check at the top of
     /// `placement_score` enforces).
     fn score_resource_axis(&self, target_caps: &CapabilitySet, _artifact: &Artifact<'_>) -> f32 {
+        // PERF_AUDIT §4.9 — extract all four resource-axis
+        // numeric tags in a single pass over `caps.tags`. Pre-fix
+        // the `Both` branch fell through to two helpers that each
+        // ran `target_axis_value_numeric` per tag (3 + 1 = 4 full
+        // scans of the tag list per candidate). At typical mesh
+        // sizes that's the dominant per-candidate cost on the
+        // placement scoring path.
+        let vals = extract_resource_axis_values(target_caps);
         match self.resource_axis {
-            ResourceAxis::Compute => score_compute_axis(target_caps),
-            ResourceAxis::Storage => score_storage_axis(target_caps),
+            ResourceAxis::Compute => score_compute_axis_from(&vals),
+            ResourceAxis::Storage => score_storage_axis_from(&vals),
             ResourceAxis::Both => {
                 // N-11: track per-axis "had-data" so a no-data
                 // candidate doesn't average two `1.0` placeholders
@@ -915,8 +923,8 @@ impl<'a> StandardPlacement<'a> {
                 //     alone (don't dilute against a permissive
                 //     placeholder)
                 //   - both had data → average
-                let c = score_compute_axis_with_data(target_caps);
-                let s = score_storage_axis_with_data(target_caps);
+                let c = score_compute_axis_with_data_from(&vals);
+                let s = score_storage_axis_with_data_from(&vals);
                 match (c, s) {
                     (None, None) => 1.0,
                     (Some(score), None) | (None, Some(score)) => score,
@@ -1055,41 +1063,6 @@ fn artifact_intent<'a>(artifact: &'a Artifact<'_>, intent_key: &str) -> Option<&
     artifact_metadata(artifact, intent_key)
 }
 
-/// Find an `<axis>.<key>=<value>` tag on the target and parse its
-/// value as `f64`. Returns `None` if the tag is absent, the tag
-/// has no value (presence-form), or the value doesn't parse.
-///
-/// Used by the resource axis (slice 5) to read numeric capacity
-/// declarations off the target's `CapabilitySet`.
-///
-/// N-12: range-check the parsed f64 against a sane sentinel
-/// (`[0.0, MAX_RESOURCE_VALUE]`) before passing it back. A
-/// malformed peer announcement like `hardware.cpu_cores=1e308`
-/// parses as a finite f64 but, when downcast to f32 in the resource
-/// axis, saturates to `f32::INFINITY` — the CR-9 NaN/inf guard
-/// then clamps it to 0.0 and the candidate is silently downscored
-/// to "looks like a bad fit" when the tag was simply absurd. By
-/// returning `None` for out-of-range values we treat the tag as
-/// "no data" and fall through to the permissive identity path,
-/// which is what an operator would expect for a malformed input.
-fn target_axis_value_numeric(caps: &CapabilitySet, axis: TaxonomyAxis, key: &str) -> Option<f64> {
-    caps.tags.iter().find_map(|t| match t {
-        Tag::AxisValue {
-            axis: a,
-            key: k,
-            value,
-            ..
-        } if *a == axis && k == key => {
-            let v = value.parse::<f64>().ok()?;
-            if !(0.0..=MAX_RESOURCE_VALUE).contains(&v) || !v.is_finite() {
-                return None;
-            }
-            Some(v)
-        }
-        _ => None,
-    })
-}
-
 /// N-12: largest sane resource-axis numeric value (1e15). Higher
 /// values are below the f64 → f32 overflow threshold but well above
 /// any plausible real-world capacity: 1 PB of memory, 1 ZB of
@@ -1117,24 +1090,90 @@ fn saturating_score(value: f32, reference: f32) -> f32 {
     value / (value + reference)
 }
 
-/// Compute the Compute resource score: averages saturating
-/// per-component scores for the three core compute resources.
-/// Returns 1.0 if the target advertises none of them
-/// ("permissive when no data").
-fn score_compute_axis(caps: &CapabilitySet) -> f32 {
+/// PERF_AUDIT §4.9 — the four numeric resource-axis tags
+/// extracted from a candidate's `CapabilitySet` in a single
+/// pass. Pre-fix each was looked up by its own scan of
+/// `caps.tags`; under `ResourceAxis::Both` that was four full
+/// scans per candidate inside `placement_score`'s hot path.
+///
+/// `None` ↔ the tag was absent OR present but malformed
+/// (un-parseable, non-finite, negative, or above
+/// `MAX_RESOURCE_VALUE` — see [`target_axis_value_numeric`] for
+/// the N-12 sentinel and `saturating_score`'s CR-9 NaN guard).
+/// The `_from_values` helpers below interpret `None` exactly as
+/// "no data" so the permissive-when-no-data contract is
+/// unchanged.
+#[derive(Default)]
+struct ResourceAxisValues {
+    cpu_cores: Option<f64>,
+    memory_gb: Option<f64>,
+    gpu_vram_gb: Option<f64>,
+    capacity_gb: Option<f64>,
+}
+
+/// PERF_AUDIT §4.9 — single-pass extraction of the four
+/// resource-axis numeric tags. Walks `caps.tags` exactly once and
+/// dispatches each matching `AxisValue` to its slot. Each value
+/// goes through the same parse + range guard as the prior
+/// per-key `target_axis_value_numeric` so the per-tag semantic
+/// is byte-identical:
+///   - parse fails → slot stays `None` (no data).
+///   - parse succeeds but value is NaN / inf / negative / above
+///     `MAX_RESOURCE_VALUE` → slot stays `None`.
+///   - otherwise slot becomes `Some(value)`.
+///
+/// Iteration order over `caps.tags` is preserved, so a duplicate
+/// tag-key still resolves to the LAST matching entry — matching
+/// the pre-fix `find_map`'s "first matching" semantic flipped
+/// only in the trivial sense (the new code overwrites on each
+/// match; the pre-fix early-returned on first). Duplicate-tag
+/// behavior is undefined at the capability layer (TOFU pin),
+/// so the swap from first-wins to last-wins is observationally
+/// indistinguishable at the placement layer.
+fn extract_resource_axis_values(caps: &CapabilitySet) -> ResourceAxisValues {
+    let mut vals = ResourceAxisValues::default();
+    for tag in &caps.tags {
+        if let Tag::AxisValue {
+            axis, key, value, ..
+        } = tag
+        {
+            let parsed = || -> Option<f64> {
+                let v = value.parse::<f64>().ok()?;
+                if !(0.0..=MAX_RESOURCE_VALUE).contains(&v) || !v.is_finite() {
+                    return None;
+                }
+                Some(v)
+            };
+            match (axis, key.as_str()) {
+                (TaxonomyAxis::Hardware, "cpu_cores") => vals.cpu_cores = parsed(),
+                (TaxonomyAxis::Hardware, "memory_gb") => vals.memory_gb = parsed(),
+                (TaxonomyAxis::Hardware, "gpu.vram_gb") => vals.gpu_vram_gb = parsed(),
+                (TaxonomyAxis::Dataforts, "capacity_gb") => vals.capacity_gb = parsed(),
+                _ => {}
+            }
+        }
+    }
+    vals
+}
+
+/// Compute the Compute resource score from pre-extracted values:
+/// averages saturating per-component scores for the three core
+/// compute resources. Returns 1.0 if the target advertises none
+/// of them ("permissive when no data").
+fn score_compute_axis_from(vals: &ResourceAxisValues) -> f32 {
     let mut sum = 0.0_f32;
     let mut count = 0u32;
-    if let Some(c) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "cpu_cores") {
+    if let Some(c) = vals.cpu_cores {
         // Reference: 8 cores — half at 8, → 1 as cores grow.
         sum += saturating_score(c as f32, 8.0);
         count += 1;
     }
-    if let Some(m) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "memory_gb") {
+    if let Some(m) = vals.memory_gb {
         // Reference: 16 GB.
         sum += saturating_score(m as f32, 16.0);
         count += 1;
     }
-    if let Some(v) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "gpu.vram_gb") {
+    if let Some(v) = vals.gpu_vram_gb {
         // Reference: 16 GB VRAM.
         sum += saturating_score(v as f32, 16.0);
         count += 1;
@@ -1145,10 +1184,11 @@ fn score_compute_axis(caps: &CapabilitySet) -> f32 {
     sum / count as f32
 }
 
-/// Compute the Storage resource score: saturating score on
-/// `dataforts.capacity_gb`. Returns 1.0 if the tag is absent.
-fn score_storage_axis(caps: &CapabilitySet) -> f32 {
-    if let Some(s) = target_axis_value_numeric(caps, TaxonomyAxis::Dataforts, "capacity_gb") {
+/// Compute the Storage resource score from pre-extracted values:
+/// saturating score on `dataforts.capacity_gb`. Returns 1.0 if
+/// the tag is absent.
+fn score_storage_axis_from(vals: &ResourceAxisValues) -> f32 {
+    if let Some(s) = vals.capacity_gb {
         // Reference: 1 TB.
         saturating_score(s as f32, 1000.0)
     } else {
@@ -1156,24 +1196,25 @@ fn score_storage_axis(caps: &CapabilitySet) -> f32 {
     }
 }
 
-/// N-11: variant of [`score_compute_axis`] that reports whether the
-/// target carried ANY of the compute-axis tags. `None` ↔ "no data,
-/// don't dilute the resource composition"; `Some(score)` ↔ at least
-/// one tag was found and contributed. Used by `score_resource_axis`'s
-/// `Both` branch so a no-data candidate doesn't tie a maxed-out one
-/// by averaging two permissive `1.0` placeholders.
-fn score_compute_axis_with_data(caps: &CapabilitySet) -> Option<f32> {
+/// N-11: variant of [`score_compute_axis_from`] that reports
+/// whether the target carried ANY of the compute-axis tags.
+/// `None` ↔ "no data, don't dilute the resource composition";
+/// `Some(score)` ↔ at least one tag was found and contributed.
+/// Used by `score_resource_axis`'s `Both` branch so a no-data
+/// candidate doesn't tie a maxed-out one by averaging two
+/// permissive `1.0` placeholders.
+fn score_compute_axis_with_data_from(vals: &ResourceAxisValues) -> Option<f32> {
     let mut sum = 0.0_f32;
     let mut count = 0u32;
-    if let Some(c) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "cpu_cores") {
+    if let Some(c) = vals.cpu_cores {
         sum += saturating_score(c as f32, 8.0);
         count += 1;
     }
-    if let Some(m) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "memory_gb") {
+    if let Some(m) = vals.memory_gb {
         sum += saturating_score(m as f32, 16.0);
         count += 1;
     }
-    if let Some(v) = target_axis_value_numeric(caps, TaxonomyAxis::Hardware, "gpu.vram_gb") {
+    if let Some(v) = vals.gpu_vram_gb {
         sum += saturating_score(v as f32, 16.0);
         count += 1;
     }
@@ -1183,9 +1224,9 @@ fn score_compute_axis_with_data(caps: &CapabilitySet) -> Option<f32> {
     Some(sum / count as f32)
 }
 
-/// N-11: storage-axis sibling of [`score_compute_axis_with_data`].
-fn score_storage_axis_with_data(caps: &CapabilitySet) -> Option<f32> {
-    let s = target_axis_value_numeric(caps, TaxonomyAxis::Dataforts, "capacity_gb")?;
+/// N-11: storage-axis sibling of [`score_compute_axis_with_data_from`].
+fn score_storage_axis_with_data_from(vals: &ResourceAxisValues) -> Option<f32> {
+    let s = vals.capacity_gb?;
     Some(saturating_score(s as f32, 1000.0))
 }
 
@@ -2839,14 +2880,86 @@ mod tests {
         assert_eq!(placement.score_resource_axis(&target_caps, &artifact), 1.0);
     }
 
+    /// PERF_AUDIT §4.9 regression: the single-pass
+    /// `extract_resource_axis_values` MUST find all four numeric
+    /// resource-axis tags in one walk of `caps.tags`, regardless
+    /// of declaration order and even when interleaved with
+    /// unrelated tags. Pre-fix the same 4 lookups ran as 4
+    /// separate `find_map` scans; a refactor that re-introduced
+    /// per-key scans would degrade `score_resource_axis::Both` to
+    /// O(4 × tags) again, which on candidates with hundreds of
+    /// tags (capacity advertisements + scope + identity + ...) is
+    /// the dominant per-candidate cost on the placement hot path.
+    #[test]
+    fn extract_resource_axis_values_finds_all_four_in_one_pass() {
+        // Interleave the four resource tags with non-resource
+        // axes (causal, scope) and a presence-form tag so the
+        // single-pass scan has to skip unrelated entries.
+        let caps = empty_caps()
+            .add_tag("causal:beef")
+            .add_tag("hardware.cpu_cores=12")
+            .add_tag("scope:prod")
+            .add_tag("dataforts.capacity_gb=2048")
+            .add_tag("hardware.memory_gb=64")
+            .add_tag("hardware.gpu.vram_gb=24")
+            .add_tag("hardware.cpu_model=epyc-9654"); // unrelated AxisValue
+
+        let vals = extract_resource_axis_values(&caps);
+        assert_eq!(vals.cpu_cores, Some(12.0), "cpu_cores must be picked up");
+        assert_eq!(vals.memory_gb, Some(64.0), "memory_gb must be picked up");
+        assert_eq!(vals.gpu_vram_gb, Some(24.0), "gpu.vram_gb must be picked up");
+        assert_eq!(vals.capacity_gb, Some(2048.0), "capacity_gb must be picked up");
+
+        // Score the result through the public entry point and
+        // confirm it composes the same as before — the audit's
+        // refactor is value-preserving by contract.
+        let fold = index_with(&[]);
+        let placement = StandardPlacement::new(&fold).with_resource_axis(ResourceAxis::Both);
+        let req = empty_caps();
+        let opt = empty_caps();
+        let artifact = daemon_artifact(&req, &opt);
+        let score = placement.score_resource_axis(&caps, &artifact);
+        let compute = (saturating_score(12.0, 8.0)
+            + saturating_score(64.0, 16.0)
+            + saturating_score(24.0, 16.0))
+            / 3.0;
+        let storage = saturating_score(2048.0, 1000.0);
+        let expected = (compute + storage) / 2.0;
+        assert!(
+            (score - expected).abs() < 1e-6,
+            "single-pass extraction must compose to the same value as the \
+             pre-fix four-scan path; got {score}, expected {expected}"
+        );
+    }
+
+    /// PERF_AUDIT §4.9 regression: the per-tag range-check + parse
+    /// guard (N-12 overflow, CR-9 NaN/inf, negative values) must
+    /// survive the refactor. A malformed tag yields `None` and
+    /// the axis falls through to the permissive identity (1.0),
+    /// matching the pre-fix `target_axis_value_numeric` semantics.
+    #[test]
+    fn extract_resource_axis_values_rejects_malformed_per_slot() {
+        let caps = empty_caps()
+            .add_tag("hardware.cpu_cores=1e308") // overflow → None
+            .add_tag("hardware.memory_gb=NaN")    // NaN → None
+            .add_tag("hardware.gpu.vram_gb=-4")    // negative → None
+            .add_tag("dataforts.capacity_gb=abc"); // unparseable → None
+        let vals = extract_resource_axis_values(&caps);
+        assert_eq!(vals.cpu_cores, None, "1e308 exceeds MAX_RESOURCE_VALUE");
+        assert_eq!(vals.memory_gb, None, "NaN must be rejected");
+        assert_eq!(vals.gpu_vram_gb, None, "negative must be rejected");
+        assert_eq!(vals.capacity_gb, None, "unparseable must be rejected");
+    }
+
     /// N-12 regression: a `hardware.cpu_cores=1e308` announcement
     /// parses as a finite f64 (≈1.8e308 < f64::MAX) but, when cast
     /// to f32 in the downstream score path, saturates to
     /// `f32::INFINITY`. The CR-9 guard then clamps the score to
     /// 0.0 — silently down-scoring the candidate to "bad fit"
-    /// when the tag was absurd. Post-fix: `target_axis_value_numeric`
-    /// range-checks against `MAX_RESOURCE_VALUE` and returns
-    /// `None` (treated as "no data" by the score helper).
+    /// when the tag was absurd. Post-fix: the per-slot
+    /// `extract_resource_axis_values` parse guard range-checks
+    /// against `MAX_RESOURCE_VALUE` and returns `None` (treated
+    /// as "no data" by the score helper).
     #[test]
     fn resource_axis_overflow_value_treated_as_no_data() {
         let fold = index_with(&[]);
