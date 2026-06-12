@@ -3446,3 +3446,47 @@ Found 8 outliers among 100 measurements (8.00%)
   4 (4.00%) low mild
   1 (1.00%) high mild
   3 (3.00%) high severe
+     Running benches\nrpc_churn.rs (target\release\deps\nrpc_churn-800c15d450427042.exe)
+  ... 100 / 1000 pairs
+  ... 200 / 1000 pairs
+  ... 300 / 1000 pairs
+  ... 400 / 1000 pairs
+  ... 500 / 1000 pairs
+  ... 600 / 1000 pairs
+  ... 700 / 1000 pairs
+  ... 800 / 1000 pairs
+  ... 900 / 1000 pairs
+  ... 1000 / 1000 pairs
+nrpc_churn — pairs=1000, codec=json, routing=direct
+       phase      p50_us      p95_us      p99_us    p99.9_us      max_us
+  build_pair      251.01      399.10      650.75      817.15     1709.06  (mean 272.87 us)
+   handshake    11829.25    13017.09    13541.38    13967.36    14221.31  (mean 11812.45 us)
+   first_rpc      234.24      352.25      423.17      482.81     2486.27  (mean 244.09 us)
+     Running benches\nrpc_client_streaming.rs (target\release\deps\nrpc_client_streaming-6d97f4ebf003b164.exe)
+Gnuplot not found, using plotters backend
+nrpc_client_stream/n16/64B
+                        time:   [122.10 µs 123.15 µs 124.21 µs]
+                        thrpt:  [128.82 Kelem/s 129.92 Kelem/s 131.04 Kelem/s]
+nrpc_client_stream/n256/64B
+                        time:   [1.1798 ms 1.1827 ms 1.1863 ms]
+                        thrpt:  [215.79 Kelem/s 216.45 Kelem/s 216.99 Kelem/s]
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) high mild
+  1 (5.00%) high severe
+nrpc_client_stream/n16/1KiB
+                        time:   [123.36 µs 125.32 µs 127.90 µs]
+                        thrpt:  [125.10 Kelem/s 127.67 Kelem/s 129.70 Kelem/s]
+nrpc_client_stream/n256/1KiB
+                        time:   [1.4001 ms 1.4041 ms 1.4081 ms]
+                        thrpt:  [181.81 Kelem/s 182.33 Kelem/s 182.84 Kelem/s]
+
+     Running benches\nrpc_duplex.rs (target\release\deps\nrpc_duplex-da94b076604330c0.exe)
+Gnuplot not found, using plotters backend
+nrpc_duplex/n16/64B     time:   [155.26 µs 157.68 µs 159.77 µs]
+                        thrpt:  [100.15 Kelem/s 101.47 Kelem/s 103.05 Kelem/s]
+nrpc_duplex/n256/64B    time:   [1.8654 ms 1.8786 ms 1.8928 ms]
+                        thrpt:  [135.25 Kelem/s 136.27 Kelem/s 137.23 Kelem/s]
+nrpc_duplex/n16/1KiB    time:   [177.48 µs 180.26 µs 182.98 µs]
+                        thrpt:  [87.441 Kelem/s 88.759 Kelem/s 90.152 Kelem/s]
+nrpc_duplex/n256/1KiB   time:   [1.9832 ms 2.0004 ms 2.0189 ms]
+                        thrpt:  [126.80 Kelem/s 127.97 Kelem/s 129.08 Kelem/s]
