@@ -50,7 +50,7 @@ use super::mesh_rpc_metrics::{CallMetricsGuard, CallOutcome};
 use crate::error::AdapterError;
 
 use super::mesh::MeshNode;
-use super::redex::{RedexEntry, RedexEvent, RedexFold};
+use super::redex::{RedexEntry, RedexEvent};
 
 // ============================================================================
 // Public types.
@@ -2050,10 +2050,11 @@ impl MeshNode {
             }
         });
 
-        // Build the server fold and wrap it in an Arc<Mutex<...>>
-        // so the bridge task can drive it (the trait takes
-        // `&mut self`). Attach the per-service metrics handle so
-        // the spawned handler tasks bump server-side counters.
+        // Build the server fold. The bridge task below owns it and
+        // drives it via `apply_shared(&self)` — fold state is
+        // internally synchronized, so no outer mutex (audit T2.1).
+        // Attach the per-service metrics handle so the handler
+        // tasks bump server-side counters.
         let metrics_handle = self.rpc_metrics_arc().for_service(service);
         // Keep a clone of the emit closure for the callee-side
         // capability-auth defense-in-depth path in the bridge
@@ -2067,9 +2068,8 @@ impl MeshNode {
         // handler-side counters; this one covers the path BEFORE
         // the handler runs, which the fold-side metrics never see.
         let metrics_for_bridge = Arc::clone(&metrics_handle);
-        let fold = Arc::new(Mutex::new(
-            RpcServerFold::new(handler as Arc<dyn RpcHandler>, emit).with_metrics(metrics_handle),
-        ));
+        let fold =
+            RpcServerFold::new(handler as Arc<dyn RpcHandler>, emit).with_metrics(metrics_handle);
 
         // Register the inbound dispatcher. Push into the mpsc;
         // the bridge task does the actual fold work.
@@ -2184,7 +2184,7 @@ impl MeshNode {
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
-                if let Err(e) = fold.lock().apply(&ev, &mut ()) {
+                if let Err(e) = fold.apply_shared(&ev) {
                     tracing::warn!(error = %e, "rpc serve_rpc: fold apply error");
                 }
             }
@@ -2334,10 +2334,8 @@ impl MeshNode {
         // + pump task bump server-side counters (including the
         // streaming-only `streaming_chunks_emitted_total`).
         let metrics_handle = self.rpc_metrics_arc().for_service(service);
-        let fold = Arc::new(Mutex::new(
-            RpcServerStreamingFold::new(handler as Arc<dyn RpcStreamingHandler>, emit)
-                .with_metrics(metrics_handle),
-        ));
+        let fold = RpcServerStreamingFold::new(handler as Arc<dyn RpcStreamingHandler>, emit)
+            .with_metrics(metrics_handle);
         let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
             let _ = tx.try_send(ev);
         });
@@ -2356,7 +2354,7 @@ impl MeshNode {
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
-                if let Err(e) = fold.lock().apply(&ev, &mut ()) {
+                if let Err(e) = fold.apply_shared(&ev) {
                     tracing::warn!(error = %e, "rpc serve_rpc_streaming: fold apply error");
                 }
             }
@@ -2473,11 +2471,10 @@ impl MeshNode {
         );
 
         let metrics_handle = self.rpc_metrics_arc().for_service(service);
-        let fold = Arc::new(Mutex::new(
+        let fold =
             RpcStreamingRequestFold::new(handler as Arc<dyn RpcClientStreamingHandler>, emit_resp)
                 .with_grant_emitter(emit_grant)
-                .with_metrics(metrics_handle),
-        ));
+                .with_metrics(metrics_handle);
         let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
             let _ = tx.try_send(ev);
         });
@@ -2496,7 +2493,7 @@ impl MeshNode {
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
-                if let Err(e) = fold.lock().apply(&ev, &mut ()) {
+                if let Err(e) = fold.apply_shared(&ev) {
                     tracing::warn!(error = %e,
                         "rpc serve_rpc_client_stream: fold apply error");
                 }
@@ -2724,11 +2721,9 @@ impl MeshNode {
         );
 
         let metrics_handle = self.rpc_metrics_arc().for_service(service);
-        let fold = Arc::new(Mutex::new(
-            RpcDuplexFold::new(handler as Arc<dyn RpcDuplexHandler>, emit_resp)
-                .with_grant_emitter(emit_grant)
-                .with_metrics(metrics_handle),
-        ));
+        let fold = RpcDuplexFold::new(handler as Arc<dyn RpcDuplexHandler>, emit_resp)
+            .with_grant_emitter(emit_grant)
+            .with_metrics(metrics_handle);
         let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
             let _ = tx.try_send(ev);
         });
@@ -2747,7 +2742,7 @@ impl MeshNode {
                 let payload = inbound.payload;
                 let entry = RedexEntry::new_heap(0, 0, payload.len() as u32, 0, 0);
                 let ev = RedexEvent { entry, payload };
-                if let Err(e) = fold.lock().apply(&ev, &mut ()) {
+                if let Err(e) = fold.apply_shared(&ev) {
                     tracing::warn!(error = %e,
                         "rpc serve_rpc_duplex: fold apply error");
                 }
@@ -3730,14 +3725,18 @@ impl MeshNode {
         // `RpcClientPending` keyed by call_id, so reuse is safe.
         if !self.rpc_inbound_dispatcher_registered(reply_hash) {
             let pending = self.rpc_client_pending();
-            let fold = Arc::new(Mutex::new(RpcClientFold::new(pending)));
+            // Owned by the dispatcher closure; `apply_inbound` takes
+            // `&self` (its only state is the internally-synced
+            // `RpcClientPending`), so no `Mutex` wrapper — pre-T2.1
+            // every inbound RESPONSE paid a fold-wide lock here.
+            let fold = RpcClientFold::new(pending);
             // S-4 part 2: use `apply_inbound` so the wire-session
             // peer's NodeId (resolved in mesh.rs's dispatch site)
             // flows into the fold's deliver gate. The legacy
             // `RedexFold::apply` shim delivers with from_node=0,
             // which would defeat the binding.
             let dispatcher: RpcInboundDispatcher = Arc::new(move |ev| {
-                fold.lock().apply_inbound(&ev);
+                fold.apply_inbound(&ev);
             });
             // Race-safe: a concurrent caller might have just
             // registered between our check and our insert. In that

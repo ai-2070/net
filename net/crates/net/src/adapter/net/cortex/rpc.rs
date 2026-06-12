@@ -16,8 +16,9 @@
 //! on top.
 
 use bytes::{Buf, BufMut, Bytes};
+use dashmap::DashMap;
+#[cfg(test)]
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -1374,6 +1375,47 @@ pub type RpcAsyncResponseEmitter = Arc<
         + 'static,
 >;
 
+/// In-flight call map shared between a fold and its spawned handler
+/// tasks. Keyed `(caller_origin, call_id)`. A `DashMap` rather than a
+/// `Mutex<HashMap>` so the REQUEST insert, the CANCEL remove, and the
+/// handler task's self-clean are shard-local lock-free ops, and so the
+/// folds' `apply_shared` can take `&self` — drive sites no longer wrap
+/// the fold in an outer `Arc<Mutex<...>>`
+/// (`PERF_AUDIT_2026_06_13_NRPC_FOLLOWUP.md` #2 / audit T2.1).
+type InFlightMap = Arc<DashMap<(u64, u64), RpcCancellationToken>>;
+
+/// Poll `task` once inline; `tokio::spawn` it only when the first poll
+/// returns `Pending` (`PERF_AUDIT_2026_06_13_NRPC_FOLLOWUP.md` #1 /
+/// audit T2.3).
+///
+/// A synchronous handler — the common echo / lookup shape — resolves
+/// on its first poll, so its RESPONSE is emitted inline and the call
+/// never pays the spawn + wake (~1–3 µs on the wake-bound path the
+/// 2026-05-26 flame graph showed). A handler that awaits anything
+/// parks at its first await and is spawned, exactly as before.
+///
+/// Trade-off, for handler authors: the first poll runs on the fold's
+/// bridge task, so heavy *synchronous* work before the handler's
+/// first await now runs head-of-line on the service's inbound queue.
+/// Such handlers should `tokio::task::yield_now().await` (or spawn
+/// internally) before the heavy section.
+///
+/// The noop-waker poll composes safely with the later spawn: tokio
+/// polls a freshly spawned task at least once, which re-registers a
+/// real waker, so a wake delivered to the noop waker between the two
+/// polls cannot be lost.
+fn spawn_or_inline<F>(task: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut task = Box::pin(task);
+    let waker = futures::task::noop_waker_ref();
+    let mut cx = std::task::Context::from_waker(waker);
+    if task.as_mut().poll(&mut cx).is_pending() {
+        tokio::spawn(task);
+    }
+}
+
 /// Server-side fold. Sees REQUEST events on the configured channel,
 /// dispatches to the user-supplied handler, emits RESPONSE events
 /// via the supplied emitter. CANCEL events flip the matching
@@ -1381,19 +1423,17 @@ pub type RpcAsyncResponseEmitter = Arc<
 ///
 /// State `()` — the user's state lives on whatever the `RpcHandler`
 /// captures (typically `Arc<Mutex<S>>`). The fold's own state (the
-/// in-flight map) lives on `&mut self` and is shared with spawned
-/// handler tasks via `Arc<Mutex<...>>` so the task can self-clean
-/// on completion.
+/// in-flight map) is internally synchronized, so drive sites call
+/// [`Self::apply_shared`] through a plain `&self` — no outer mutex.
 pub struct RpcServerFold {
     handler: Arc<dyn RpcHandler>,
     emit: RpcResponseEmitter,
     /// (caller_origin, call_id) → cancellation token for the
     /// in-flight handler. Inserted on REQUEST, removed by either
-    /// the spawned handler task on completion or by the fold on
-    /// CANCEL. Wrapped in `Arc<Mutex<...>>` so spawned tasks can
-    /// remove their own entries without going back through the
-    /// fold.
-    in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
+    /// the handler task on completion or by the fold on CANCEL.
+    /// Shared `DashMap` so handler tasks can remove their own
+    /// entries without going back through the fold.
+    in_flight: InFlightMap,
     /// Optional per-service metrics handle. When `Some`, the
     /// spawned handler task bumps `handler_invocations_total` /
     /// `handler_in_flight` / `handler_panics_total` and records
@@ -1420,7 +1460,7 @@ impl RpcServerFold {
         Self {
             handler,
             emit,
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            in_flight: Arc::new(DashMap::new()),
             metrics: None,
             #[cfg(test)]
             test_now_ns: None,
@@ -1452,7 +1492,7 @@ impl RpcServerFold {
     /// Test-only: snapshot of the in-flight call set.
     #[cfg(test)]
     pub fn in_flight_keys(&self) -> Vec<(u64, u64)> {
-        self.in_flight.lock().keys().copied().collect()
+        self.in_flight.iter().map(|e| *e.key()).collect()
     }
 
     fn now_ns(&self) -> u64 {
@@ -1491,8 +1531,15 @@ impl RpcServerFold {
 /// within the threshold an NTP-disciplined cluster ever drifts to.
 pub const DEADLINE_SKEW_TOLERANCE_NS: u64 = 10_000_000_000; // 10 seconds
 
-impl RedexFold<()> for RpcServerFold {
-    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
+impl RpcServerFold {
+    /// Drive one event through the fold. Takes `&self`: every piece
+    /// of fold state is internally synchronized (`InFlightMap`, `Arc`
+    /// handler/emitter), so drive sites — the per-service bridge task
+    /// in `Mesh::serve_rpc` — call this directly instead of wrapping
+    /// the fold in an `Arc<Mutex<...>>` and locking per event (audit
+    /// T2.1: the pre-fix pattern cost an outer lock plus 2–3
+    /// `in_flight` mutex crossings per REQUEST).
+    pub fn apply_shared(&self, ev: &RedexEvent) -> Result<(), RedexError> {
         // Decode the meta header. A garbled meta means the event
         // doesn't even claim to be an RPC packet — log and skip
         // rather than killing the fold. Returning `Err(Decode)`
@@ -1560,28 +1607,38 @@ impl RedexFold<()> for RpcServerFold {
                 // in-flight entry — leaving the second handler's
                 // CANCEL handling broken (CANCEL events look up
                 // the now-missing key and no-op). Cleaner to refuse.
-                {
-                    let in_flight = self.in_flight.lock();
-                    if in_flight.contains_key(&key) {
-                        drop(in_flight);
-                        tracing::warn!(
-                            caller_origin = format!("{:#x}", meta.origin_hash),
-                            call_id = meta.seq_or_ts,
-                            "rpc server fold: duplicate REQUEST for in-flight call_id; refusing",
-                        );
-                        let resp = RpcResponsePayload {
-                            status: RpcStatus::Internal,
-                            headers: vec![],
-                            body: Bytes::from_static(
-                                b"duplicate REQUEST for already-in-flight call_id",
-                            ),
-                        };
-                        (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
-                        return Ok(());
-                    }
-                }
+                //
+                // Atomic check + insert via the entry API. The shard
+                // guard drops at the end of the match — before the
+                // refusal emit and before the handler's inline poll
+                // below — so neither runs under a DashMap shard lock
+                // (the handler task removes this same key on
+                // completion; holding the guard across the inline
+                // poll would self-deadlock).
                 let cancellation = RpcCancellationToken::new();
-                self.in_flight.lock().insert(key, cancellation.clone());
+                let duplicate = match self.in_flight.entry(key) {
+                    dashmap::mapref::entry::Entry::Occupied(_) => true,
+                    dashmap::mapref::entry::Entry::Vacant(slot) => {
+                        slot.insert(cancellation.clone());
+                        false
+                    }
+                };
+                if duplicate {
+                    tracing::warn!(
+                        caller_origin = format!("{:#x}", meta.origin_hash),
+                        call_id = meta.seq_or_ts,
+                        "rpc server fold: duplicate REQUEST for in-flight call_id; refusing",
+                    );
+                    let resp = RpcResponsePayload {
+                        status: RpcStatus::Internal,
+                        headers: vec![],
+                        body: Bytes::from_static(
+                            b"duplicate REQUEST for already-in-flight call_id",
+                        ),
+                    };
+                    (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                    return Ok(());
+                }
                 let handler = self.handler.clone();
                 let emit = self.emit.clone();
                 let in_flight = self.in_flight.clone();
@@ -1599,11 +1656,16 @@ impl RedexFold<()> for RpcServerFold {
                     None
                 };
                 let metrics = self.metrics.clone();
-                // Keep a probe handle so the spawned task can detect
+                // Keep a probe handle so the handler task can detect
                 // a CANCEL that fired during handler execution and
                 // override its response with `RpcStatus::Cancelled`.
                 let cancel_probe = cancellation.clone();
-                tokio::spawn(async move {
+                // T2.3: poll the handler future once inline — a
+                // synchronous handler completes here and its
+                // RESPONSE is emitted without a spawn + wake; only
+                // a handler that actually parks is spawned. See
+                // `spawn_or_inline` for the trade-off notes.
+                spawn_or_inline(async move {
                     // Server-side metrics: count this invocation;
                     // bump in_flight; time the handler; tally
                     // panics. Only fires when a metrics handle was
@@ -1699,12 +1761,12 @@ impl RedexFold<()> for RpcServerFold {
                             }
                         }
                     };
-                    in_flight.lock().remove(&key);
+                    in_flight.remove(&key);
                     emit(caller_origin, call_id, resp);
                 });
             }
             DISPATCH_RPC_CANCEL => {
-                if let Some(token) = self.in_flight.lock().remove(&key) {
+                if let Some((_, token)) = self.in_flight.remove(&key) {
                     token.cancel();
                 }
                 // Idempotent — CANCEL for an unknown call_id (e.g.
@@ -1722,6 +1784,16 @@ impl RedexFold<()> for RpcServerFold {
             _ => {}
         }
         Ok(())
+    }
+}
+
+impl RedexFold<()> for RpcServerFold {
+    /// Thin delegation to [`Self::apply_shared`]. Kept so the fold
+    /// still slots into `CortexAdapter` / test drivers that speak
+    /// the trait; the production bridge in `Mesh::serve_rpc` calls
+    /// `apply_shared` directly without an outer mutex.
+    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
+        self.apply_shared(ev)
     }
 }
 
@@ -2028,7 +2100,7 @@ pub trait RpcStreamingHandler: Send + Sync + 'static {
 /// `Semaphore` shared between the pump task (which awaits
 /// permits) and the fold's `apply()` method handling
 /// STREAM_GRANT events (which add permits).
-type FlowControlMap = Arc<Mutex<HashMap<(u64, u64), Arc<tokio::sync::Semaphore>>>>;
+type FlowControlMap = Arc<DashMap<(u64, u64), Arc<tokio::sync::Semaphore>>>;
 
 /// Server-side fold for streaming RPC. Parallel to `RpcServerFold`
 /// but multi-fire emit: each handler invocation may produce many
@@ -2037,11 +2109,12 @@ type FlowControlMap = Arc<Mutex<HashMap<(u64, u64), Arc<tokio::sync::Semaphore>>
 ///
 /// State `()` — like the unary fold, the handler owns user state
 /// via captured `Arc<Mutex<S>>`. The fold's own state (in-flight
-/// cancellation tokens) lives on `&mut self`.
+/// cancellation tokens) is internally synchronized; drive sites use
+/// [`Self::apply_shared`] through `&self`.
 pub struct RpcServerStreamingFold {
     handler: Arc<dyn RpcStreamingHandler>,
     emit: RpcAsyncResponseEmitter,
-    in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
+    in_flight: InFlightMap,
     /// Per-call flow-control semaphore (when the caller opted in).
     /// `Some(sem)` means "pump must `acquire().await` one permit
     /// per chunk before emitting; STREAM_GRANT events
@@ -2070,8 +2143,8 @@ impl RpcServerStreamingFold {
         Self {
             handler,
             emit,
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
-            flow_control: Arc::new(Mutex::new(HashMap::new())),
+            in_flight: Arc::new(DashMap::new()),
+            flow_control: Arc::new(DashMap::new()),
             metrics: None,
         }
     }
@@ -2092,12 +2165,14 @@ impl RpcServerStreamingFold {
     /// Test-only: snapshot of the in-flight call set.
     #[cfg(test)]
     pub fn in_flight_keys(&self) -> Vec<(u64, u64)> {
-        self.in_flight.lock().keys().copied().collect()
+        self.in_flight.iter().map(|e| *e.key()).collect()
     }
 }
 
-impl RedexFold<()> for RpcServerStreamingFold {
-    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
+impl RpcServerStreamingFold {
+    /// Drive one event through the fold. `&self` — same rationale as
+    /// [`RpcServerFold::apply_shared`] (audit T2.1).
+    pub fn apply_shared(&self, ev: &RedexEvent) -> Result<(), RedexError> {
         let Some(meta) = (if ev.payload.len() >= EVENT_META_SIZE {
             EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
         } else {
@@ -2156,38 +2231,42 @@ impl RedexFold<()> for RpcServerStreamingFold {
                 // `Internal` chunk so the duplicate sender sees a
                 // clean refusal rather than waiting on a stream
                 // that will never produce output.
-                {
-                    let in_flight = self.in_flight.lock();
-                    if in_flight.contains_key(&key) {
-                        drop(in_flight);
-                        tracing::warn!(
-                            caller_origin = format!("{:#x}", meta.origin_hash),
-                            call_id = meta.seq_or_ts,
-                            "rpc streaming server fold: duplicate REQUEST for in-flight call_id; refusing",
-                        );
-                        let resp = RpcResponsePayload {
-                            status: RpcStatus::Internal,
-                            headers: vec![(
-                                HEADER_NRPC_STREAMING.to_string(),
-                                HEADER_NRPC_STREAMING_END.to_vec(),
-                            )],
-                            body: Bytes::from_static(
-                                b"duplicate REQUEST for already-in-flight call_id",
-                            ),
-                        };
-                        let emit = self.emit.clone();
-                        let caller_origin = meta.origin_hash;
-                        let call_id = meta.seq_or_ts;
-                        tokio::spawn(async move {
-                            emit(caller_origin, call_id, resp).await;
-                        });
-                        return Ok(());
-                    }
-                }
-                // Cancellation token + in-flight bookkeeping —
-                // identical to the unary fold's pattern.
+                //
+                // Atomic check + insert via the entry API; the shard
+                // guard drops at the end of the match (see the unary
+                // fold for the rationale).
                 let cancellation = RpcCancellationToken::new();
-                self.in_flight.lock().insert(key, cancellation.clone());
+                let duplicate = match self.in_flight.entry(key) {
+                    dashmap::mapref::entry::Entry::Occupied(_) => true,
+                    dashmap::mapref::entry::Entry::Vacant(slot) => {
+                        slot.insert(cancellation.clone());
+                        false
+                    }
+                };
+                if duplicate {
+                    tracing::warn!(
+                        caller_origin = format!("{:#x}", meta.origin_hash),
+                        call_id = meta.seq_or_ts,
+                        "rpc streaming server fold: duplicate REQUEST for in-flight call_id; refusing",
+                    );
+                    let resp = RpcResponsePayload {
+                        status: RpcStatus::Internal,
+                        headers: vec![(
+                            HEADER_NRPC_STREAMING.to_string(),
+                            HEADER_NRPC_STREAMING_END.to_vec(),
+                        )],
+                        body: Bytes::from_static(
+                            b"duplicate REQUEST for already-in-flight call_id",
+                        ),
+                    };
+                    let emit = self.emit.clone();
+                    let caller_origin = meta.origin_hash;
+                    let call_id = meta.seq_or_ts;
+                    tokio::spawn(async move {
+                        emit(caller_origin, call_id, resp).await;
+                    });
+                    return Ok(());
+                }
                 // Flow-control opt-in: parse the
                 // `nrpc-stream-window-initial` header. When
                 // present, install a per-call semaphore the pump
@@ -2196,7 +2275,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
                 // entry → pump skips the await (back-compat).
                 let flow_sem = parse_stream_window_initial(&payload.headers).map(|n| {
                     let sem = Arc::new(tokio::sync::Semaphore::new(n as usize));
-                    self.flow_control.lock().insert(key, sem.clone());
+                    self.flow_control.insert(key, sem.clone());
                     sem
                 });
                 let handler = self.handler.clone();
@@ -2371,12 +2450,12 @@ impl RedexFold<()> for RpcServerStreamingFold {
                             }
                         }
                     };
-                    in_flight.lock().remove(&key);
+                    in_flight.remove(&key);
                     // Drop the per-call flow-control semaphore
                     // (if any) so a stale GRANT arriving after
                     // termination is silently dropped — the entry
                     // is gone, lookup misses.
-                    flow_control.lock().remove(&key);
+                    flow_control.remove(&key);
                     // Await the terminal frame's publish too so it
                     // arrives strictly AFTER the last chunk on the
                     // wire (the pump has already drained, but the
@@ -2386,7 +2465,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
                 });
             }
             DISPATCH_RPC_CANCEL => {
-                if let Some(token) = self.in_flight.lock().remove(&key) {
+                if let Some((_, token)) = self.in_flight.remove(&key) {
                     token.cancel();
                 }
                 // Also drop the flow-control entry — the spawned
@@ -2395,7 +2474,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
                 // refilling the pump (the pending `acquire().await`
                 // will resolve once the semaphore is dropped or
                 // when the task exits).
-                self.flow_control.lock().remove(&key);
+                self.flow_control.remove(&key);
             }
             DISPATCH_RPC_STREAM_GRANT => {
                 // Add credit to the per-call semaphore. Silently
@@ -2418,7 +2497,10 @@ impl RedexFold<()> for RpcServerStreamingFold {
                 if amount == 0 {
                     return Ok(());
                 }
-                if let Some(sem) = self.flow_control.lock().get(&key).cloned() {
+                // Clone out of the map ref before `add_permits` so
+                // the shard guard is released first.
+                let sem = self.flow_control.get(&key).map(|e| e.value().clone());
+                if let Some(sem) = sem {
                     // Tokio's `Semaphore::add_permits` is bounded
                     // by `MAX_PERMITS = usize::MAX >> 3`. A
                     // misbehaving caller flooding huge grants
@@ -2430,6 +2512,14 @@ impl RedexFold<()> for RpcServerStreamingFold {
             _ => {}
         }
         Ok(())
+    }
+}
+
+impl RedexFold<()> for RpcServerStreamingFold {
+    /// Thin delegation to [`Self::apply_shared`] — see
+    /// [`RpcServerFold`]'s trait impl for the rationale.
+    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
+        self.apply_shared(ev)
     }
 }
 
@@ -2467,7 +2557,7 @@ impl RedexFold<()> for RpcServerStreamingFold {
 /// The matching receiver lives inside the handler's
 /// [`RequestStream`]; dropping the sender (on REQUEST_END or
 /// CANCEL) closes the stream.
-type RequestChunkSenders = Arc<Mutex<HashMap<(u64, u64), tokio::sync::mpsc::Sender<bytes::Bytes>>>>;
+type RequestChunkSenders = Arc<DashMap<(u64, u64), tokio::sync::mpsc::Sender<bytes::Bytes>>>;
 
 /// Shared REQUEST_CHUNK handling used by both
 /// [`RpcStreamingRequestFold`] and [`RpcDuplexFold`]. Decodes the
@@ -2512,7 +2602,7 @@ fn apply_request_chunk_to_senders(
     }
     let key = (meta.origin_hash, meta.seq_or_ts);
     let is_end = payload.flags & FLAG_RPC_REQUEST_END != 0;
-    let sender = senders.lock().get(&key).cloned();
+    let sender = senders.get(&key).map(|e| e.value().clone());
     let Some(sender) = sender else {
         // Unknown call — either the initial REQUEST hasn't
         // arrived yet (out-of-order delivery is possible on the
@@ -2539,7 +2629,7 @@ fn apply_request_chunk_to_senders(
         // Drop the sender from the map → its clone here goes out
         // of scope at end of function → the receiver in the
         // handler's RequestStream sees EOF on the next poll.
-        senders.lock().remove(&key);
+        senders.remove(&key);
     }
 }
 
@@ -2551,8 +2641,9 @@ fn apply_request_chunk_to_senders(
 /// State `()` — like the other folds, application state lives in
 /// the handler's captured `Arc<Mutex<S>>`. The fold's own state
 /// (in-flight cancellation tokens + per-call request-chunk
-/// senders) lives on `&mut self` via `Arc<Mutex<...>>` so spawned
-/// handler tasks can self-clean on completion.
+/// senders) is internally synchronized so spawned handler tasks
+/// can self-clean on completion and drive sites use
+/// [`Self::apply_shared`] through `&self`.
 ///
 /// Bidi streaming plan (Phase B).
 pub struct RpcStreamingRequestFold {
@@ -2567,7 +2658,7 @@ pub struct RpcStreamingRequestFold {
     /// refill and stall once their initial window is exhausted —
     /// honest behavior for a fold not wired up for grants).
     grant_emit: Option<RpcRequestGrantEmitter>,
-    in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
+    in_flight: InFlightMap,
     senders: RequestChunkSenders,
     /// Optional per-service metrics handle. Same shape as the
     /// other folds. Reuses the response-side counters where they
@@ -2590,8 +2681,8 @@ impl RpcStreamingRequestFold {
             handler,
             emit,
             grant_emit: None,
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
-            senders: Arc::new(Mutex::new(HashMap::new())),
+            in_flight: Arc::new(DashMap::new()),
+            senders: Arc::new(DashMap::new()),
             metrics: None,
         }
     }
@@ -2622,7 +2713,7 @@ impl RpcStreamingRequestFold {
     /// Test-only: snapshot of the in-flight call set.
     #[cfg(test)]
     pub fn in_flight_keys(&self) -> Vec<(u64, u64)> {
-        self.in_flight.lock().keys().copied().collect()
+        self.in_flight.iter().map(|e| *e.key()).collect()
     }
 
     /// Test-only: snapshot of the in-flight per-call senders.
@@ -2630,12 +2721,14 @@ impl RpcStreamingRequestFold {
     /// been dropped after REQUEST_END / CANCEL.
     #[cfg(test)]
     pub fn sender_keys(&self) -> Vec<(u64, u64)> {
-        self.senders.lock().keys().copied().collect()
+        self.senders.iter().map(|e| *e.key()).collect()
     }
 }
 
-impl RedexFold<()> for RpcStreamingRequestFold {
-    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
+impl RpcStreamingRequestFold {
+    /// Drive one event through the fold. `&self` — same rationale as
+    /// [`RpcServerFold::apply_shared`] (audit T2.1).
+    pub fn apply_shared(&self, ev: &RedexEvent) -> Result<(), RedexError> {
         let Some(meta) = (if ev.payload.len() >= EVENT_META_SIZE {
             EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
         } else {
@@ -2694,28 +2787,34 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                 // while the first attempt is still in-flight
                 // would overwrite the prior sender and orphan the
                 // existing handler.
-                {
-                    let in_flight = self.in_flight.lock();
-                    if in_flight.contains_key(&key) {
-                        drop(in_flight);
-                        tracing::warn!(
-                            caller_origin = format!("{:#x}", meta.origin_hash),
-                            call_id = meta.seq_or_ts,
-                            "rpc client-streaming server fold: duplicate REQUEST for in-flight call_id; refusing",
-                        );
-                        let resp = RpcResponsePayload {
-                            status: RpcStatus::Internal,
-                            headers: vec![],
-                            body: Bytes::from_static(
-                                b"duplicate REQUEST for already-in-flight call_id",
-                            ),
-                        };
-                        (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
-                        return Ok(());
-                    }
-                }
+                //
+                // Atomic check + insert via the entry API; the shard
+                // guard drops at the end of the match (see the unary
+                // fold for the rationale).
                 let cancellation = RpcCancellationToken::new();
-                self.in_flight.lock().insert(key, cancellation.clone());
+                let duplicate = match self.in_flight.entry(key) {
+                    dashmap::mapref::entry::Entry::Occupied(_) => true,
+                    dashmap::mapref::entry::Entry::Vacant(slot) => {
+                        slot.insert(cancellation.clone());
+                        false
+                    }
+                };
+                if duplicate {
+                    tracing::warn!(
+                        caller_origin = format!("{:#x}", meta.origin_hash),
+                        call_id = meta.seq_or_ts,
+                        "rpc client-streaming server fold: duplicate REQUEST for in-flight call_id; refusing",
+                    );
+                    let resp = RpcResponsePayload {
+                        status: RpcStatus::Internal,
+                        headers: vec![],
+                        body: Bytes::from_static(
+                            b"duplicate REQUEST for already-in-flight call_id",
+                        ),
+                    };
+                    (self.emit)(meta.origin_hash, meta.seq_or_ts, resp);
+                    return Ok(());
+                }
                 // Build the per-call request-chunk mpsc. Bounded
                 // capacity — overflow on the sender side drops the
                 // chunk (caller can re-send or, if flow-control is
@@ -2758,7 +2857,7 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                 // with a trailing REQUEST_CHUNK. Don't even insert
                 // the sender into the map; just drop it here.
                 if !end_on_initial {
-                    self.senders.lock().insert(key, tx);
+                    self.senders.insert(key, tx);
                 }
                 // Build the handler's context + stream. Auto-grant
                 // is opted into when the caller set the request
@@ -2898,13 +2997,13 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                             }
                         }
                     };
-                    in_flight.lock().remove(&key);
+                    in_flight.remove(&key);
                     // Drop the per-call request-chunk sender too
                     // (idempotent — already gone if REQUEST_END
                     // arrived; defensive otherwise so a handler
                     // that returned without consuming all chunks
                     // doesn't leak the entry).
-                    senders.lock().remove(&key);
+                    senders.remove(&key);
                     (emit)(caller_origin, call_id, terminal);
                 });
             }
@@ -2917,7 +3016,7 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                 );
             }
             DISPATCH_RPC_CANCEL => {
-                if let Some(token) = self.in_flight.lock().remove(&key) {
+                if let Some((_, token)) = self.in_flight.remove(&key) {
                     token.cancel();
                 }
                 // Drop the per-call sender so the handler's
@@ -2927,11 +3026,19 @@ impl RedexFold<()> for RpcStreamingRequestFold {
                 // spawned task ensures the terminal RESPONSE is
                 // Cancelled regardless of which the handler
                 // checks first).
-                self.senders.lock().remove(&key);
+                self.senders.remove(&key);
             }
             _ => {}
         }
         Ok(())
+    }
+}
+
+impl RedexFold<()> for RpcStreamingRequestFold {
+    /// Thin delegation to [`Self::apply_shared`] — see
+    /// [`RpcServerFold`]'s trait impl for the rationale.
+    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
+        self.apply_shared(ev)
     }
 }
 
@@ -2972,7 +3079,7 @@ pub struct RpcDuplexFold {
     emit: RpcAsyncResponseEmitter,
     /// Optional request-direction grant emitter.
     grant_emit: Option<RpcRequestGrantEmitter>,
-    in_flight: Arc<Mutex<HashMap<(u64, u64), RpcCancellationToken>>>,
+    in_flight: InFlightMap,
     senders: RequestChunkSenders,
     metrics: Option<Arc<crate::adapter::net::mesh_rpc_metrics::ServiceMetricsAtomic>>,
 }
@@ -2987,8 +3094,8 @@ impl RpcDuplexFold {
             handler,
             emit,
             grant_emit: None,
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
-            senders: Arc::new(Mutex::new(HashMap::new())),
+            in_flight: Arc::new(DashMap::new()),
+            senders: Arc::new(DashMap::new()),
             metrics: None,
         }
     }
@@ -3017,18 +3124,20 @@ impl RpcDuplexFold {
     /// Test-only: snapshot of the in-flight call set.
     #[cfg(test)]
     pub fn in_flight_keys(&self) -> Vec<(u64, u64)> {
-        self.in_flight.lock().keys().copied().collect()
+        self.in_flight.iter().map(|e| *e.key()).collect()
     }
 
     /// Test-only: snapshot of the in-flight per-call senders.
     #[cfg(test)]
     pub fn sender_keys(&self) -> Vec<(u64, u64)> {
-        self.senders.lock().keys().copied().collect()
+        self.senders.iter().map(|e| *e.key()).collect()
     }
 }
 
-impl RedexFold<()> for RpcDuplexFold {
-    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
+impl RpcDuplexFold {
+    /// Drive one event through the fold. `&self` — same rationale as
+    /// [`RpcServerFold::apply_shared`] (audit T2.1).
+    pub fn apply_shared(&self, ev: &RedexEvent) -> Result<(), RedexError> {
         let Some(meta) = (if ev.payload.len() >= EVENT_META_SIZE {
             EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
         } else {
@@ -3100,37 +3209,42 @@ impl RedexFold<()> for RpcDuplexFold {
                     });
                     return Ok(());
                 }
-                // Duplicate-REQUEST refusal.
-                {
-                    let in_flight = self.in_flight.lock();
-                    if in_flight.contains_key(&key) {
-                        drop(in_flight);
-                        tracing::warn!(
-                            caller_origin = format!("{:#x}", meta.origin_hash),
-                            call_id = meta.seq_or_ts,
-                            "rpc duplex server fold: duplicate REQUEST for in-flight call_id; refusing",
-                        );
-                        let resp = RpcResponsePayload {
-                            status: RpcStatus::Internal,
-                            headers: vec![(
-                                HEADER_NRPC_STREAMING.to_string(),
-                                HEADER_NRPC_STREAMING_END.to_vec(),
-                            )],
-                            body: Bytes::from_static(
-                                b"duplicate REQUEST for already-in-flight call_id",
-                            ),
-                        };
-                        let emit = self.emit.clone();
-                        let caller_origin = meta.origin_hash;
-                        let call_id = meta.seq_or_ts;
-                        tokio::spawn(async move {
-                            emit(caller_origin, call_id, resp).await;
-                        });
-                        return Ok(());
-                    }
-                }
+                // Duplicate-REQUEST refusal. Atomic check + insert
+                // via the entry API; the shard guard drops at the
+                // end of the match (see the unary fold for the
+                // rationale).
                 let cancellation = RpcCancellationToken::new();
-                self.in_flight.lock().insert(key, cancellation.clone());
+                let duplicate = match self.in_flight.entry(key) {
+                    dashmap::mapref::entry::Entry::Occupied(_) => true,
+                    dashmap::mapref::entry::Entry::Vacant(slot) => {
+                        slot.insert(cancellation.clone());
+                        false
+                    }
+                };
+                if duplicate {
+                    tracing::warn!(
+                        caller_origin = format!("{:#x}", meta.origin_hash),
+                        call_id = meta.seq_or_ts,
+                        "rpc duplex server fold: duplicate REQUEST for in-flight call_id; refusing",
+                    );
+                    let resp = RpcResponsePayload {
+                        status: RpcStatus::Internal,
+                        headers: vec![(
+                            HEADER_NRPC_STREAMING.to_string(),
+                            HEADER_NRPC_STREAMING_END.to_vec(),
+                        )],
+                        body: Bytes::from_static(
+                            b"duplicate REQUEST for already-in-flight call_id",
+                        ),
+                    };
+                    let emit = self.emit.clone();
+                    let caller_origin = meta.origin_hash;
+                    let call_id = meta.seq_or_ts;
+                    tokio::spawn(async move {
+                        emit(caller_origin, call_id, resp).await;
+                    });
+                    return Ok(());
+                }
 
                 // Build per-call request-side mpsc (Phase B
                 // pattern).
@@ -3152,7 +3266,7 @@ impl RedexFold<()> for RpcDuplexFold {
                     }
                 }
                 if !end_on_initial {
-                    self.senders.lock().insert(key, req_tx);
+                    self.senders.insert(key, req_tx);
                 }
                 // Hand the handler an auto-granting RequestStream
                 // when the caller opted into request-direction
@@ -3331,8 +3445,8 @@ impl RedexFold<()> for RpcDuplexFold {
                             }
                         }
                     };
-                    in_flight.lock().remove(&key);
-                    senders.lock().remove(&key);
+                    in_flight.remove(&key);
+                    senders.remove(&key);
                     emit(caller_origin, call_id, terminal).await;
                 });
             }
@@ -3345,14 +3459,22 @@ impl RedexFold<()> for RpcDuplexFold {
                 );
             }
             DISPATCH_RPC_CANCEL => {
-                if let Some(token) = self.in_flight.lock().remove(&key) {
+                if let Some((_, token)) = self.in_flight.remove(&key) {
                     token.cancel();
                 }
-                self.senders.lock().remove(&key);
+                self.senders.remove(&key);
             }
             _ => {}
         }
         Ok(())
+    }
+}
+
+impl RedexFold<()> for RpcDuplexFold {
+    /// Thin delegation to [`Self::apply_shared`] — see
+    /// [`RpcServerFold`]'s trait impl for the rationale.
+    fn apply(&mut self, ev: &RedexEvent, _state: &mut ()) -> Result<(), RedexError> {
+        self.apply_shared(ev)
     }
 }
 
@@ -3813,7 +3935,12 @@ impl RpcClientFold {
     /// the AEAD-verified session peer's `NodeId` in
     /// `ev.from_node`; the pending registry's S-4 binding gate
     /// uses it to reject responses from the wrong target.
-    pub fn apply_inbound(&mut self, ev: &RpcInboundEvent) {
+    ///
+    /// `&self` — the fold's only state is the internally-synced
+    /// `RpcClientPending`, so the per-reply-channel dispatcher
+    /// calls this directly without a `Mutex` wrapper (audit T2.1:
+    /// pre-fix every inbound RESPONSE paid a fold-wide lock).
+    pub fn apply_inbound(&self, ev: &RpcInboundEvent) {
         let Some(meta) = (if ev.payload.len() >= EVENT_META_SIZE {
             EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
         } else {
@@ -4614,6 +4741,141 @@ mod tests {
         assert_eq!(resp.status, RpcStatus::Ok);
         assert_eq!(resp.body.as_ref(), b"hello");
         // In-flight set is cleaned up after the handler completes.
+        assert!(fold.in_flight_keys().is_empty());
+    }
+
+    // --------------------------------------------------------------------
+    // T2.3 inline-ready dispatch + T2.1 `&self` fold drive
+    // (`PERF_AUDIT_2026_06_13_NRPC_FOLLOWUP.md` #1/#2). These pin the
+    // dispatch *mechanics*; the status-mapping tests above cover the
+    // response shapes themselves.
+    // --------------------------------------------------------------------
+
+    /// T2.3: a synchronous handler resolves on its first poll, so the
+    /// RESPONSE is emitted inline — observable the moment
+    /// `apply_shared` returns, with no yield to the runtime in
+    /// between. `#[tokio::test]` is a current-thread runtime, so a
+    /// spawned task cannot run before the first `.await`; if inline
+    /// dispatch regresses to spawn-always, `captured` is still empty
+    /// here and the assertion fails deterministically.
+    #[tokio::test]
+    async fn server_fold_sync_handler_emits_response_inline_without_yield() {
+        let (emit, captured) = capturing_emitter();
+        let fold = RpcServerFold::new(Arc::new(EchoHandler), emit);
+        let req = RpcRequestPayload {
+            service: "echo".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: Bytes::from_static(b"inline"),
+        };
+        fold.apply_shared(&rpc_request_event(0xCAFE, 41, req)).unwrap();
+
+        // NO await between apply and assert.
+        {
+            let captured = captured.lock();
+            assert_eq!(captured.len(), 1, "sync handler must emit inline");
+            let (origin, call_id, resp) = &captured[0];
+            assert_eq!((*origin, *call_id), (0xCAFE, 41));
+            assert_eq!(resp.status, RpcStatus::Ok);
+            assert_eq!(resp.body.as_ref(), b"inline");
+        }
+        // The in-flight entry self-cleaned inline too.
+        assert!(fold.in_flight_keys().is_empty());
+    }
+
+    /// T2.3, pending side: a handler that parks at its first await is
+    /// spawned (NOT resolved inline) — `apply_shared` returns with
+    /// nothing emitted and the call registered in-flight; the
+    /// response arrives once the handler is released. Also exercises
+    /// the noop-waker → spawn hand-off: the release signal fires
+    /// against the inline poll's noop waker, and the spawned task's
+    /// guaranteed initial poll must still observe it.
+    #[tokio::test]
+    async fn server_fold_pending_handler_is_spawned_and_completes_after_release() {
+        struct ParkedHandler {
+            release: Arc<Notify>,
+        }
+        #[async_trait::async_trait]
+        impl RpcHandler for ParkedHandler {
+            async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                self.release.notified().await;
+                Ok(RpcResponsePayload {
+                    status: RpcStatus::Ok,
+                    headers: vec![],
+                    body: ctx.payload.body,
+                })
+            }
+        }
+
+        let (emit, captured) = capturing_emitter();
+        let release = Arc::new(Notify::new());
+        let fold = RpcServerFold::new(
+            Arc::new(ParkedHandler {
+                release: release.clone(),
+            }),
+            emit,
+        );
+        let req = RpcRequestPayload {
+            service: "parked".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: Bytes::from_static(b"later"),
+        };
+        fold.apply_shared(&rpc_request_event(0xCAFE, 42, req)).unwrap();
+
+        // Parked at the handler's first await: nothing emitted, call
+        // registered in-flight.
+        assert!(captured.lock().is_empty(), "pending handler must not emit inline");
+        assert_eq!(fold.in_flight_keys(), vec![(0xCAFE, 42)]);
+
+        release.notify_one();
+        assert!(
+            wait_until(|| !captured.lock().is_empty(), Duration::from_secs(2)).await,
+            "released handler must complete via the spawned task"
+        );
+        let captured = captured.lock();
+        assert_eq!(captured[0].2.status, RpcStatus::Ok);
+        assert_eq!(captured[0].2.body.as_ref(), b"later");
+        drop(captured);
+        assert!(fold.in_flight_keys().is_empty());
+    }
+
+    /// T2.3, panic side: a handler that panics before its first await
+    /// now panics during the INLINE poll — `catch_unwind` must
+    /// contain it so it cannot unwind into the bridge task driving
+    /// `apply_shared`, and the Internal response is emitted inline.
+    /// (`server_fold_handler_panic_surfaces_as_internal_status` covers
+    /// the status mapping; this pins the unwind containment on the
+    /// new inline path specifically.)
+    #[tokio::test]
+    async fn server_fold_sync_panic_is_caught_on_inline_path() {
+        struct SyncPanicHandler;
+        #[async_trait::async_trait]
+        impl RpcHandler for SyncPanicHandler {
+            async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+                panic!("inline-path panic");
+            }
+        }
+
+        let (emit, captured) = capturing_emitter();
+        let fold = RpcServerFold::new(Arc::new(SyncPanicHandler), emit);
+        let req = RpcRequestPayload {
+            service: "boom".to_string(),
+            deadline_ns: 0,
+            flags: 0,
+            headers: vec![],
+            body: Bytes::new(),
+        };
+        // Must not unwind out of apply_shared.
+        fold.apply_shared(&rpc_request_event(0xCAFE, 43, req)).unwrap();
+
+        let captured = captured.lock();
+        assert_eq!(captured.len(), 1, "panic response must be emitted inline");
+        assert_eq!(captured[0].2.status, RpcStatus::Internal);
+        assert!(String::from_utf8_lossy(&captured[0].2.body).contains("handler panicked"));
+        drop(captured);
         assert!(fold.in_flight_keys().is_empty());
     }
 

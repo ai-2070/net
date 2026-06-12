@@ -6,6 +6,22 @@ stands now, which of the original items have since landed, and ranks
 the remaining opportunities. No new benchmark run was taken for this
 doc — numbers cited are from the May 26 re-bench.
 
+> **Course-correction (same day, before implementing):**
+> [`../plans/NRPC_QPS_CONCURRENCY_SCALING_PLAN.md`](../plans/NRPC_QPS_CONCURRENCY_SCALING_PLAN.md)
+> (Phase 0 findings, 2026-06-01) post-dates the May audit and
+> experimentally disproves this doc's original c16/c128 framing for
+> items #2 and #3: the worker-thread sweep is flat AND the channel-shard
+> bench (own bridge + own fold mutex per channel) makes throughput
+> *worse*, so the fold mutex is **not** the throughput ceiling. The
+> ceiling is the **single recv loop's syscalls + wakeups** (one
+> `recv_buf_from` per packet; a reliable unary RPC is 4 packets because
+> the StreamWindow grant is the sole ACK). The real throughput levers
+> are the ack-piggyback wire change
+> ([`../plans/NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md`](../plans/NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md))
+> and batched receive (item #4). Items #1/#2 below remain valid as
+> **c1-latency / wake-reduction** work and were landed as such — their
+> original "lifts the c128 ceiling" claims are struck.
+
 ## Where nRPC stands
 
 | Configuration | Baseline (May 19) | After Tier 1 (May 26) | Δ |
@@ -62,6 +78,19 @@ relevant), **T3.4**, **T3.5**, **T4.2** (deferred).
   (unary `RpcServerFold`, server-streaming, client-stream, duplex —
   `cortex/rpc.rs:1606, ~2220, ~2800, ~3000+`). Fix as a shared helper,
   land per-fold commits.
+- **Status: landed (2026-06-13), unary fold only.**
+  `cortex/rpc.rs::spawn_or_inline` Box-pins the handler task, polls it
+  once with a noop waker, and spawns only on `Pending` — safe because
+  tokio guarantees a fresh task an initial poll, which re-registers a
+  real waker. Deliberately NOT applied to the streaming/client-stream/
+  duplex folds: their handler tasks await a pump `JoinHandle` (and an
+  async terminal emit), so they are always `Pending` at first poll and
+  inline polling would buy nothing. Trade-off documented on the helper:
+  a handler doing heavy synchronous work before its first await now
+  runs that work head-of-line on the service's bridge task. Tests:
+  `server_fold_sync_handler_emits_response_inline_without_yield`,
+  `server_fold_pending_handler_is_spawned_and_completes_after_release`,
+  `server_fold_sync_panic_is_caught_on_inline_path`.
 
 ### 2. T2.1 — drop the fold mutexes
 
@@ -76,27 +105,61 @@ relevant), **T3.4**, **T3.5**, **T4.2** (deferred).
     four fold variants (`cortex/rpc.rs:1396, 2044, 2570, 2975`).
 - **Fix:** Make `apply` take `&self` (or interior-mutability shim);
   replace `in_flight` with `DashMap<(u64, u64), RpcCancellationToken>`.
-- **Payoff:** modest at c1; matters at c128 where every response for a
-  service serializes through one fold lock.
+- **Payoff (corrected):** ~~matters at c128 where every response for a
+  service serializes through one fold lock~~ — disproven by the
+  scaling plan's shard test (the bridge is a single task per service,
+  so the locks were uncontended; the ceiling is upstream). Real payoff:
+  removes 3–5 uncontended lock crossings from the c1 path, and it is a
+  **prerequisite for #1** — inline-polling the handler under the old
+  `fold.lock()` would have held the fold mutex across user code.
+- **Status: landed (2026-06-13), all four server folds + client fold.**
+  Done WITHOUT touching the `RedexFold` trait (the wide-blast-radius
+  churn the scaling plan warned against): each fold gains an inherent
+  `apply_shared(&self)` carrying the real logic; the trait impl
+  delegates, so `CortexAdapter`/test drivers still work. `in_flight`,
+  the streaming fold's `flow_control`, and the chunk `senders` maps are
+  all `DashMap` now; duplicate-REQUEST check + insert is a single
+  atomic `entry()` op (shard guard provably dropped before the inline
+  poll — holding it across the handler's self-clean `remove` would
+  self-deadlock). `RpcClientFold::apply_inbound` takes `&self`, so the
+  per-reply-channel dispatcher (`mesh_rpc.rs`) and all four bridge
+  tasks drive their folds with no `Arc<Mutex<...>>` wrapper.
 
-### 3. De-serialize the per-service response drain (c128 ceiling)
+### 3. De-serialize the per-service response drain (c128 ceiling) — ⚠ demoted
 
 - **What:** §8a funnels all responses for a service through a single
   bounded-mpsc drain task that does AEAD encrypt + `send_to`
   sequentially. 114 K QPS ≈ 8.7 µs/response — approximately that
-  loop's per-item cost, i.e. the drain task is now the throughput
-  ceiling.
-- **Fix options:** (a) drain with a small worker pool; (b) drain the
-  whole queue per wake and emit batched — pairs naturally with item 4.
-- **Payoff:** lifts the c128 plateau toward the original ~150 K QPS
-  target. Negligible effect on c1.
+  loop's per-item cost.
+- **Demoted (2026-06-13):** the scaling plan's Phase 0 verdict places
+  the ceiling in the **shared recv loop**, upstream of the drain — the
+  same evidence that disproved the fold mutex (sharding channels, which
+  also shards drain tasks, made throughput worse). Parallelizing the
+  drain alone is unlikely to move the ceiling until the recv-loop
+  packet count drops (ack-piggyback) or the recv syscall batches.
+  Revisit only after item 4 / the ack-piggyback plan lands and a
+  re-bench shows the drain as the new wall.
+- **Fix options (if revisited):** (a) drain with a small worker pool;
+  (b) drain the whole queue per wake and emit batched — pairs
+  naturally with item 4.
 
-### 4. Syscall batching below nRPC
+### 4. Syscall batching below nRPC — now the primary throughput lever
 
-- **What:** 2 UDP syscalls per leg, ~5–10 µs of the 42.5 µs c1 budget.
-- **Fix:** `sendmmsg`/`recvmmsg` + GSO/GRO on Linux; RIO (or at
-  minimum multi-frame coalescing per `send_to`) on Windows.
-- **Payoff:** the only path meaningfully below ~20 µs single-flight.
+- **What:** 2 UDP syscalls per leg, ~5–10 µs of the 42.5 µs c1 budget —
+  and per the scaling plan, a reliable unary RPC is actually
+  **4 packets** (REQUEST + RESPONSE + a StreamWindow grant in each
+  direction, because the grant is the sole ACK), all funneling through
+  one single-syscall recv loop per node.
+- **Fix:** two complementary efforts, both already designed/scoped:
+  - **Ack-piggyback wire change** — carry `ack_seq` on data packets so
+    unary needs no standalone grant (4 packets → 2). Design-complete
+    in `../plans/NRPC_ACK_PIGGYBACK_PROTOCOL_PLAN.md`.
+  - **Batched receive** — wire the existing `BatchedPacketReceiver`
+    (recvmmsg) into `spawn_receive_loop` on Linux; RIO (or at minimum
+    multi-frame coalescing per `send_to`) on Windows.
+- **Payoff:** the only path meaningfully below ~20 µs single-flight,
+  AND — post-correction — the only credible path past the ~90–115 K
+  QPS ceiling.
 - **Scope note:** transport-layer project, benefits everything on the
   mesh, not nRPC-local. Track separately from nRPC work.
 
@@ -132,22 +195,53 @@ relevant), **T3.4**, **T3.5**, **T4.2** (deferred).
   same reasoning that dropped T4.1; revisit only if a protocol
   revision touches the frame layout anyway.
 
-## Suggested order
+## Measured outcome (2026-06-13, quick read)
 
-1. **T2.3** (inline-ready dispatch) and **T2.1** (fold mutexes) — the
-   two remaining audit items aimed at the wakeup signal.
-2. **Re-bench `nrpc_qps`** (`cargo bench --bench nrpc_qps --features
-   "net cortex"`). Original prediction for Tier 1 + Tier 2:
-   c1/32B ≈ 35–45 µs is already met, so the refined target here is
-   **c1/32B ≈ 30–35 µs, c128 ≥ 150 K QPS**.
+A/B on this branch, same host (Win11, 24 logical cores) and settings
+(criterion `--warm-up-time 1 --measurement-time 3 --sample-size 20`;
+diagnostic quality, not the published-numbers protocol). Baseline =
+the exact pre-change tree (changes stashed), comparison = #1 + #2
+landed:
+
+| bench | pre-change | with #1 + #2 | Δ |
+|---|---:|---:|---|
+| c1/32B | 34.31 µs | **33.73 µs** | **−1.6 %** (p = 0.00) |
+| c16/32B | 134.1 µs (119.3 K/s) | 134.1 µs (119.4 K/s) | none (p = 0.82) |
+| c128/32B | not measurable | not measurable | — |
+
+Exactly as the course-corrected prediction said: a real but small
+**c1-latency** trim (~0.6 µs ≈ one spawn+wake + a few uncontended lock
+crossings) and **no movement at c16** — the ceiling is the recv loop,
+which these items never targeted. c128 panics the bench harness's
+saturation guard (`nrpc_common/mod.rs:91`, "this bar is not measurable
+here — don't chase it") on this host **both with and without the
+change** — pre-existing, verified by running the pre-change tree.
+
+Note the absolute c1 number (≈34 µs) is already below the May 26
+re-bench's 42.5 µs; that gap pre-dates this change (other work landed
+on this branch / different quick-read settings) and is NOT attributable
+to #1/#2.
+
+## Suggested order (updated 2026-06-13 after landing #1/#2)
+
+1. ~~**T2.3** (inline-ready dispatch) and **T2.1** (fold mutexes)~~ —
+   **done** (see Status notes in items #1/#2). Tests: 78 cortex-rpc
+   unit tests (3 new), 36 nRPC integration tests, SDK mesh_rpc suites
+   + backpressure, full lib suite (4310) all green.
+2. **Re-bench `nrpc_qps`** (`cargo bench --bench nrpc_qps`, sdk crate).
+   Post-correction the honest expectation is a **c1-latency** trim
+   (one spawn+wake + a handful of lock crossings, ~1–3 µs of 42.5),
+   with the c16/c128 ceiling roughly unchanged — the ceiling is the
+   recv loop, not dispatch. Treat the streaming benches
+   (`nrpc_streaming.rs`) and `c128/16KiB` as the regression tripwires.
 3. If the measured delta diverges from prediction, take a `samply`
    flamegraph before the next change — this discipline served the
    Tier 1 work well (it's how the threshold-coalesce deadlock and the
    drainer redesign were caught early).
-4. **Item 3** (response-drain parallelism) if c128 throughput is the
-   priority after step 2.
-5. **Item 4** (syscall batching) as a separate transport-layer track
-   if sub-20 µs single-flight becomes a goal.
+4. **The ack-piggyback protocol plan + item 4** (batched receive) are
+   the throughput track — that's where the c16/c128 ceiling actually
+   moves. Item 3 (drain parallelism) only re-enters if a post-item-4
+   re-bench names the drain as the new wall.
 
 ## Source-of-truth file paths
 
