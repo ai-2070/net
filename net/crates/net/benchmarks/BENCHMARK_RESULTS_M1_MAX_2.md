@@ -5428,3 +5428,65 @@ redex_tail/append_to_next
 Found 10 outliers among 100 measurements (10.00%)
   8 (8.00%) high mild
   2 (2.00%) high severe
+
+     Running benches/nrpc_churn.rs (target/release/deps/nrpc_churn-52c2aa4020d6dfbe)
+  ... 100 / 1000 pairs
+  ... 200 / 1000 pairs
+  ... 300 / 1000 pairs
+  ... 400 / 1000 pairs
+  ... 500 / 1000 pairs
+  ... 600 / 1000 pairs
+  ... 700 / 1000 pairs
+  ... 800 / 1000 pairs
+  ... 900 / 1000 pairs
+  ... 1000 / 1000 pairs
+nrpc_churn — pairs=1000, codec=json, routing=direct
+       phase      p50_us      p95_us      p99_us    p99.9_us      max_us
+  build_pair      715.26     1084.41     1257.47     1525.76     2377.73  (mean 719.27 us)
+   handshake     4132.86     4898.81     5300.22     7176.19    16654.33  (mean 3982.25 us)
+   first_rpc      745.47     1095.68     1471.49     2988.03     4657.15  (mean 753.23 us)
+     Running benches/nrpc_client_streaming.rs (target/release/deps/nrpc_client_streaming-48c0c22842c3666d)
+Gnuplot not found, using plotters backend
+nrpc_client_stream/n16/64B
+                        time:   [120.96 µs 121.20 µs 121.45 µs]
+                        thrpt:  [131.74 Kelem/s 132.01 Kelem/s 132.28 Kelem/s]
+Found 6 outliers among 20 measurements (30.00%)
+  1 (5.00%) low severe
+  1 (5.00%) low mild
+  2 (10.00%) high mild
+  2 (10.00%) high severe
+nrpc_client_stream/n256/64B
+                        time:   [1.4252 ms 1.4615 ms 1.5271 ms]
+                        thrpt:  [167.64 Kelem/s 175.17 Kelem/s 179.63 Kelem/s]
+nrpc_client_stream/n16/1KiB
+                        time:   [143.82 µs 144.12 µs 144.43 µs]
+                        thrpt:  [110.78 Kelem/s 111.01 Kelem/s 111.25 Kelem/s]
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) low mild
+  1 (5.00%) high severe
+nrpc_client_stream/n256/1KiB
+                        time:   [1.7591 ms 1.7733 ms 1.7853 ms]
+                        thrpt:  [143.39 Kelem/s 144.37 Kelem/s 145.53 Kelem/s]
+
+     Running benches/nrpc_duplex.rs (target/release/deps/nrpc_duplex-9ca66750578e6aed)
+Gnuplot not found, using plotters backend
+nrpc_duplex/n16/64B     time:   [188.47 µs 193.01 µs 196.16 µs]
+                        thrpt:  [81.568 Kelem/s 82.896 Kelem/s 84.896 Kelem/s]
+Found 4 outliers among 20 measurements (20.00%)
+  2 (10.00%) low severe
+  1 (5.00%) high mild
+  1 (5.00%) high severe
+nrpc_duplex/n256/64B    time:   [2.0844 ms 2.1025 ms 2.1225 ms]
+                        thrpt:  [120.62 Kelem/s 121.76 Kelem/s 122.82 Kelem/s]
+Found 2 outliers among 20 measurements (10.00%)
+  2 (10.00%) high mild
+nrpc_duplex/n16/1KiB    time:   [223.32 µs 223.76 µs 224.27 µs]
+                        thrpt:  [71.341 Kelem/s 71.506 Kelem/s 71.645 Kelem/s]
+Found 4 outliers among 20 measurements (20.00%)
+  1 (5.00%) low mild
+  2 (10.00%) high mild
+  1 (5.00%) high severe
+nrpc_duplex/n256/1KiB   time:   [2.3576 ms 2.5653 ms 2.7479 ms]
+                        thrpt:  [93.163 Kelem/s 99.795 Kelem/s 108.59 Kelem/s]
+Found 3 outliers among 20 measurements (15.00%)
+  3 (15.00%) high severe
