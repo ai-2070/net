@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/PERF_AUDIT_2026_06_13_NRPC_FOLLOWUP.md
+  s_3022368eebaf05::t_6dd5e85af3b5e7 1-165
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "43d4f5315af570491c3502488dfc5bf3e593538f",
+  "prompts": {},
+  "sessions": {
+    "s_3022368eebaf05": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "495c5463-fae2-45d3-b7bd-32d256a35d75",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
