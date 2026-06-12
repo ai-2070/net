@@ -5307,206 +5307,124 @@ standard_placement_score/with_custom_filter_predicate/100
      Running benches/redex.rs (target/release/deps/redex-7747e7cc38414c23)
 Gnuplot not found, using plotters backend
 redex_append_inline/heap_file
-                        time:   [34.567 ns 34.635 ns 34.703 ns]
-                        thrpt:  [28.816 Melem/s 28.873 Melem/s 28.929 Melem/s]
-                 change:
-                        time:   [−1.4093% −0.8854% −0.3026%] (p = 0.00 < 0.05)
-                        thrpt:  [+0.3035% +0.8933% +1.4294%]
-                        Change within noise threshold.
-Found 5 outliers among 100 measurements (5.00%)
-  2 (2.00%) high mild
-  3 (3.00%) high severe
-
-redex_append_heap/heap_file/32
-                        time:   [39.275 ns 39.721 ns 40.146 ns]
-                        thrpt:  [760.17 MiB/s 768.30 MiB/s 777.02 MiB/s]
-                 change:
-                        time:   [−12.843% −10.628% −8.2342%] (p = 0.00 < 0.05)
-                        thrpt:  [+8.9730% +11.891% +14.735%]
-                        Performance has improved.
-Found 17 outliers among 100 measurements (17.00%)
-  15 (15.00%) high mild
-  2 (2.00%) high severe
-redex_append_heap/heap_file/256
-                        time:   [71.542 ns 72.738 ns 73.949 ns]
-                        thrpt:  [3.2241 GiB/s 3.2778 GiB/s 3.3326 GiB/s]
-                 change:
-                        time:   [−15.807% −12.532% −8.8751%] (p = 0.00 < 0.05)
-                        thrpt:  [+9.7395% +14.327% +18.775%]
-                        Performance has improved.
-Found 1 outliers among 100 measurements (1.00%)
-  1 (1.00%) high mild
-redex_append_heap/heap_file/1024
-                        time:   [168.82 ns 170.45 ns 172.14 ns]
-                        thrpt:  [5.5400 GiB/s 5.5950 GiB/s 5.6491 GiB/s]
-                 change:
-                        time:   [−19.273% −15.770% −11.742%] (p = 0.00 < 0.05)
-                        thrpt:  [+13.304% +18.722% +23.875%]
-                        Performance has improved.
-Found 16 outliers among 100 measurements (16.00%)
-  2 (2.00%) low severe
-  8 (8.00%) low mild
-  4 (4.00%) high mild
-  2 (2.00%) high severe
-
-redex_append_watcher_paths/no_watchers
-                        time:   [68.653 ns 69.665 ns 70.929 ns]
-                        thrpt:  [3.3614 GiB/s 3.4224 GiB/s 3.4728 GiB/s]
-                 change:
-                        time:   [−7.8364% −4.1591% −0.2089%] (p = 0.04 < 0.05)
-                        thrpt:  [+0.2093% +4.3396% +8.5027%]
-                        Change within noise threshold.
-Found 5 outliers among 100 measurements (5.00%)
-  5 (5.00%) high mild
-redex_append_watcher_paths/with_tail
-                        time:   [198.62 ns 200.24 ns 201.67 ns]
-                        thrpt:  [1.1822 GiB/s 1.1907 GiB/s 1.2004 GiB/s]
-                 change:
-                        time:   [−3.9199% −2.0216% −0.1510%] (p = 0.04 < 0.05)
-                        thrpt:  [+0.1513% +2.0633% +4.0798%]
-                        Change within noise threshold.
-
-redex_append_batch/batch_64_x_64B
-                        time:   [1.5700 µs 1.5802 µs 1.5926 µs]
-                        thrpt:  [40.185 Melem/s 40.501 Melem/s 40.764 Melem/s]
-                 change:
-                        time:   [−4.1130% −1.7738% +0.6082%] (p = 0.14 > 0.05)
-                        thrpt:  [−0.6045% +1.8059% +4.2895%]
-                        No change in performance detected.
+                        time:   [35.171 ns 35.356 ns 35.538 ns]
+                        thrpt:  [28.139 Melem/s 28.283 Melem/s 28.432 Melem/s]
 Found 2 outliers among 100 measurements (2.00%)
   1 (1.00%) high mild
+  1 (1.00%) high severe
+
+redex_append_heap/heap_file/32
+                        time:   [39.721 ns 40.360 ns 40.973 ns]
+                        thrpt:  [744.83 MiB/s 756.13 MiB/s 768.30 MiB/s]
+Found 15 outliers among 100 measurements (15.00%)
+  14 (14.00%) high mild
+  1 (1.00%) high severe
+redex_append_heap/heap_file/256
+                        time:   [71.383 ns 72.420 ns 73.659 ns]
+                        thrpt:  [3.2368 GiB/s 3.2922 GiB/s 3.3400 GiB/s]
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) low mild
+  2 (2.00%) high mild
+redex_append_heap/heap_file/1024
+                        time:   [176.87 ns 179.09 ns 181.38 ns]
+                        thrpt:  [5.2578 GiB/s 5.3251 GiB/s 5.3920 GiB/s]
+Found 9 outliers among 100 measurements (9.00%)
+  8 (8.00%) low mild
+  1 (1.00%) high mild
+
+redex_append_watcher_paths/no_watchers
+                        time:   [70.809 ns 71.826 ns 73.046 ns]
+                        thrpt:  [3.2639 GiB/s 3.3194 GiB/s 3.3671 GiB/s]
+Found 3 outliers among 100 measurements (3.00%)
+  2 (2.00%) low mild
+  1 (1.00%) high mild
+redex_append_watcher_paths/with_tail
+                        time:   [201.43 ns 203.22 ns 204.78 ns]
+                        thrpt:  [1.1643 GiB/s 1.1732 GiB/s 1.1836 GiB/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+
+redex_append_batch/batch_64_x_64B
+                        time:   [1.7024 µs 1.7180 µs 1.7330 µs]
+                        thrpt:  [36.929 Melem/s 37.252 Melem/s 37.595 Melem/s]
+Found 1 outliers among 100 measurements (1.00%)
   1 (1.00%) high severe
 
 redex_append_disk/disk_file/32
-                        time:   [8.2937 µs 8.3178 µs 8.3453 µs]
-                        thrpt:  [3.6568 MiB/s 3.6690 MiB/s 3.6796 MiB/s]
-                 change:
-                        time:   [+72.110% +86.189% +97.055%] (p = 0.00 < 0.05)
-                        thrpt:  [−49.253% −46.291% −41.898%]
-                        Performance has regressed.
-Found 17 outliers among 100 measurements (17.00%)
-  1 (1.00%) low mild
-  4 (4.00%) high mild
-  12 (12.00%) high severe
+                        time:   [4.3119 µs 4.3346 µs 4.3668 µs]
+                        thrpt:  [6.9885 MiB/s 7.0404 MiB/s 7.0774 MiB/s]
+Found 16 outliers among 100 measurements (16.00%)
+  7 (7.00%) high mild
+  9 (9.00%) high severe
 redex_append_disk/disk_file/256
-                        time:   [13.934 µs 14.085 µs 14.259 µs]
-                        thrpt:  [17.121 MiB/s 17.334 MiB/s 17.521 MiB/s]
-                 change:
-                        time:   [+107.39% +176.61% +244.01%] (p = 0.00 < 0.05)
-                        thrpt:  [−70.931% −63.849% −51.782%]
-                        Performance has regressed.
-Found 2 outliers among 100 measurements (2.00%)
-  1 (1.00%) high mild
-  1 (1.00%) high severe
-redex_append_disk/disk_file/1024
-                        time:   [20.606 µs 20.825 µs 21.082 µs]
-                        thrpt:  [46.322 MiB/s 46.893 MiB/s 47.392 MiB/s]
-                 change:
-                        time:   [+251.01% +321.97% +479.49%] (p = 0.00 < 0.05)
-                        thrpt:  [−82.743% −76.301% −71.511%]
-                        Performance has regressed.
-Found 5 outliers among 100 measurements (5.00%)
-  2 (2.00%) high mild
+                        time:   [4.5152 µs 4.5329 µs 4.5561 µs]
+                        thrpt:  [53.585 MiB/s 53.860 MiB/s 54.071 MiB/s]
+Found 7 outliers among 100 measurements (7.00%)
+  4 (4.00%) high mild
   3 (3.00%) high severe
+redex_append_disk/disk_file/1024
+                        time:   [5.3155 µs 5.3326 µs 5.3536 µs]
+                        thrpt:  [182.41 MiB/s 183.13 MiB/s 183.72 MiB/s]
+Found 15 outliers among 100 measurements (15.00%)
+  4 (4.00%) high mild
+  11 (11.00%) high severe
 
 redex_append_batch_disk/batch_64_x/64
-                        time:   [53.864 µs 54.497 µs 55.239 µs]
-                        thrpt:  [1.1586 Melem/s 1.1744 Melem/s 1.1882 Melem/s]
-                 change:
-                        time:   [+189.64% +407.31% +814.14%] (p = 0.00 < 0.05)
-                        thrpt:  [−89.061% −80.288% −65.475%]
-                        Performance has regressed.
+                        time:   [11.610 µs 11.661 µs 11.727 µs]
+                        thrpt:  [5.4575 Melem/s 5.4884 Melem/s 5.5127 Melem/s]
 Found 8 outliers among 100 measurements (8.00%)
-  5 (5.00%) high mild
-  3 (3.00%) high severe
+  7 (7.00%) high mild
+  1 (1.00%) high severe
 redex_append_batch_disk/batch_64_x/1024
-                        time:   [81.865 µs 83.556 µs 85.602 µs]
-                        thrpt:  [747.65 Kelem/s 765.95 Kelem/s 781.78 Kelem/s]
-                 change:
-                        time:   [+50.428% +82.462% +138.79%] (p = 0.00 < 0.05)
-                        thrpt:  [−58.122% −45.194% −33.523%]
-                        Performance has regressed.
-Found 1 outliers among 100 measurements (1.00%)
+                        time:   [29.667 µs 30.166 µs 30.676 µs]
+                        thrpt:  [2.0864 Melem/s 2.1216 Melem/s 2.1573 Melem/s]
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
   1 (1.00%) high severe
 
 redex_append_disk_policies/disk_file_256B/never
-                        time:   [11.651 µs 11.731 µs 11.827 µs]
-                        thrpt:  [20.643 MiB/s 20.812 MiB/s 20.954 MiB/s]
-                 change:
-                        time:   [+101.17% +153.40% +209.04%] (p = 0.00 < 0.05)
-                        thrpt:  [−67.642% −60.537% −50.292%]
-                        Performance has regressed.
-Found 6 outliers among 100 measurements (6.00%)
-  1 (1.00%) high mild
-  5 (5.00%) high severe
+                        time:   [4.5019 µs 4.5343 µs 4.5906 µs]
+                        thrpt:  [53.183 MiB/s 53.843 MiB/s 54.231 MiB/s]
+Found 16 outliers among 100 measurements (16.00%)
+  3 (3.00%) high mild
+  13 (13.00%) high severe
 redex_append_disk_policies/disk_file_256B/every_n_1
-                        time:   [427.96 µs 550.96 µs 696.73 µs]
-                        thrpt:  [358.82 KiB/s 453.75 KiB/s 584.16 KiB/s]
-                 change:
-                        time:   [−39.100% −24.944% −9.7943%] (p = 0.00 < 0.05)
-                        thrpt:  [+10.858% +33.234% +64.203%]
-                        Performance has improved.
+                        time:   [669.44 µs 838.95 µs 1.0090 ms]
+                        thrpt:  [247.76 KiB/s 297.99 KiB/s 373.45 KiB/s]
 redex_append_disk_policies/disk_file_256B/every_n_64
-                        time:   [194.64 µs 211.41 µs 226.28 µs]
-                        thrpt:  [1.0789 MiB/s 1.1548 MiB/s 1.2543 MiB/s]
-                 change:
-                        time:   [−17.497% −7.2611% +5.6352%] (p = 0.23 > 0.05)
-                        thrpt:  [−5.3346% +7.8296% +21.207%]
-                        No change in performance detected.
+                        time:   [198.25 µs 208.49 µs 217.14 µs]
+                        thrpt:  [1.1244 MiB/s 1.1710 MiB/s 1.2315 MiB/s]
 redex_append_disk_policies/disk_file_256B/interval_50ms
-                        time:   [15.816 µs 16.178 µs 16.504 µs]
-                        thrpt:  [14.792 MiB/s 15.091 MiB/s 15.436 MiB/s]
-                 change:
-                        time:   [+135.03% +225.09% +376.93%] (p = 0.00 < 0.05)
-                        thrpt:  [−79.033% −69.239% −57.452%]
-                        Performance has regressed.
-Found 2 outliers among 100 measurements (2.00%)
-  1 (1.00%) high mild
+                        time:   [5.0701 µs 5.2522 µs 5.4133 µs]
+                        thrpt:  [45.100 MiB/s 46.484 MiB/s 48.153 MiB/s]
+Found 1 outliers among 100 measurements (1.00%)
   1 (1.00%) high severe
 redex_append_disk_policies/disk_file_256B/interval_or_bytes
-                        time:   [12.207 µs 12.573 µs 12.888 µs]
-                        thrpt:  [18.943 MiB/s 19.418 MiB/s 20.001 MiB/s]
-                 change:
-                        time:   [+39.699% +63.033% +97.042%] (p = 0.00 < 0.05)
-                        thrpt:  [−49.249% −38.663% −28.417%]
-                        Performance has regressed.
+                        time:   [7.8292 µs 8.0491 µs 8.2581 µs]
+                        thrpt:  [29.564 MiB/s 30.331 MiB/s 31.183 MiB/s]
 Found 1 outliers among 100 measurements (1.00%)
   1 (1.00%) high severe
 
 redex_append_batch_disk_policies/batch_64_x_64B/never
-                        time:   [102.79 µs 104.59 µs 106.77 µs]
-                        thrpt:  [599.41 Kelem/s 611.90 Kelem/s 622.66 Kelem/s]
-                 change:
-                        time:   [+409.02% +726.78% +1272.5%] (p = 0.00 < 0.05)
-                        thrpt:  [−92.714% −87.905% −80.354%]
-                        Performance has regressed.
-Found 4 outliers among 100 measurements (4.00%)
-  3 (3.00%) high mild
-  1 (1.00%) high severe
+                        time:   [11.894 µs 12.090 µs 12.360 µs]
+                        thrpt:  [5.1782 Melem/s 5.2937 Melem/s 5.3807 Melem/s]
+Found 18 outliers among 100 measurements (18.00%)
+  7 (7.00%) high mild
+  11 (11.00%) high severe
 redex_append_batch_disk_policies/batch_64_x_64B/every_n_1
-                        time:   [2.5101 ms 2.7612 ms 3.0051 ms]
-                        thrpt:  [21.297 Kelem/s 23.178 Kelem/s 25.497 Kelem/s]
-                 change:
-                        time:   [+39.571% +62.701% +89.148%] (p = 0.00 < 0.05)
-                        thrpt:  [−47.131% −38.538% −28.352%]
-                        Performance has regressed.
+                        time:   [1.2342 ms 1.5113 ms 1.7730 ms]
+                        thrpt:  [36.098 Kelem/s 42.347 Kelem/s 51.855 Kelem/s]
+Benchmarking redex_append_batch_disk_policies/batch_64_x_64B/interval_or_bytes_small: Warming up for 3.0000 s
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 5.4s, enable flat sampling, or reduce sample count to 60.
 redex_append_batch_disk_policies/batch_64_x_64B/interval_or_bytes_small
-                        time:   [1.4286 ms 1.6401 ms 1.8642 ms]
-                        thrpt:  [34.331 Kelem/s 39.021 Kelem/s 44.799 Kelem/s]
-                 change:
-                        time:   [−29.404% −15.086% +1.0698%] (p = 0.07 > 0.05)
-                        thrpt:  [−1.0585% +17.767% +41.652%]
-                        No change in performance detected.
-Found 5 outliers among 100 measurements (5.00%)
-  5 (5.00%) high mild
+                        time:   [1.9017 ms 2.0903 ms 2.2565 ms]
+                        thrpt:  [28.362 Kelem/s 30.618 Kelem/s 33.654 Kelem/s]
+Found 3 outliers among 100 measurements (3.00%)
+  3 (3.00%) low mild
 
 redex_tail/append_to_next
-                        time:   [165.99 ns 166.60 ns 167.19 ns]
-                        thrpt:  [5.9812 Melem/s 6.0022 Melem/s 6.0244 Melem/s]
-                 change:
-                        time:   [+4.2605% +4.8079% +5.3622%] (p = 0.00 < 0.05)
-                        thrpt:  [−5.0893% −4.5873% −4.0864%]
-                        Performance has regressed.
-Found 3 outliers among 100 measurements (3.00%)
-  1 (1.00%) high mild
+                        time:   [162.05 ns 163.11 ns 164.34 ns]
+                        thrpt:  [6.0849 Melem/s 6.1307 Melem/s 6.1711 Melem/s]
+Found 10 outliers among 100 measurements (10.00%)
+  8 (8.00%) high mild
   2 (2.00%) high severe
