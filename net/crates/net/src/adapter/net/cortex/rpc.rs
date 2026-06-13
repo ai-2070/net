@@ -4769,7 +4769,8 @@ mod tests {
             headers: vec![],
             body: Bytes::from_static(b"inline"),
         };
-        fold.apply_shared(&rpc_request_event(0xCAFE, 41, req)).unwrap();
+        fold.apply_shared(&rpc_request_event(0xCAFE, 41, req))
+            .unwrap();
 
         // NO await between apply and assert.
         {
@@ -4823,11 +4824,15 @@ mod tests {
             headers: vec![],
             body: Bytes::from_static(b"later"),
         };
-        fold.apply_shared(&rpc_request_event(0xCAFE, 42, req)).unwrap();
+        fold.apply_shared(&rpc_request_event(0xCAFE, 42, req))
+            .unwrap();
 
         // Parked at the handler's first await: nothing emitted, call
         // registered in-flight.
-        assert!(captured.lock().is_empty(), "pending handler must not emit inline");
+        assert!(
+            captured.lock().is_empty(),
+            "pending handler must not emit inline"
+        );
         assert_eq!(fold.in_flight_keys(), vec![(0xCAFE, 42)]);
 
         release.notify_one();
@@ -4869,7 +4874,8 @@ mod tests {
             body: Bytes::new(),
         };
         // Must not unwind out of apply_shared.
-        fold.apply_shared(&rpc_request_event(0xCAFE, 43, req)).unwrap();
+        fold.apply_shared(&rpc_request_event(0xCAFE, 43, req))
+            .unwrap();
 
         let captured = captured.lock();
         assert_eq!(captured.len(), 1, "panic response must be emitted inline");
