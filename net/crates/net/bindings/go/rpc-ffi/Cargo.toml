@@ -1,6 +1,6 @@
 [package]
 name = "net-rpc-ffi"
-version = "0.27.4"
+version = "0.27.5"
 edition = "2021"
 license = "Apache-2.0"
 description = "C ABI nRPC surface for the Go binding of Net"
@@ -32,7 +32,7 @@ tool = ["net/tool"]
 # both cdylibs export the same `#[no_mangle]` FFI symbols and the
 # Go test binary's link order resolves them — diverging features
 # corrupt shared types' layouts.
-net = { package = "net-mesh", version = "0.27.4", path = "../../..", features = ["net", "netdb", "redex-disk"] }
+net = { package = "net-mesh", version = "0.27.5", path = "../../..", features = ["net", "netdb", "redex-disk"] }
 tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
 bytes = "1"
 parking_lot = "0.12"
