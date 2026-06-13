@@ -126,7 +126,7 @@ pyo3 = { version = "0.28.0", features = ["extension-module"] }
 # the user can `await`; `into_future` does the reverse for
 # async-`def` handlers. Version-locked to pyo3 0.28 — track that
 # bump whenever pyo3 itself moves.
-pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 # Zeroizing wrapper for transient operator-seed copies in the
 # DeckClient / OperatorIdentity standalone constructors.
 zeroize = "1"
