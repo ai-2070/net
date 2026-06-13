@@ -120,13 +120,13 @@ net = { package = "net-mesh", version = "0.27.3", path = "../..", default-featur
 net-sdk = { package = "net-mesh-sdk", version = "0.27.3", path = "../../sdk", default-features = false, optional = true }
 dashmap = { version = "6", optional = true }
 parking_lot = "0.12"
-pyo3 = { version = "0.28.0", features = ["extension-module"] }
+pyo3 = { version = "0.29.0", features = ["extension-module"] }
 # Bridge between Rust async (tokio) and Python asyncio coroutines.
 # `future_into_py` converts a Rust future into a Python awaitable
 # the user can `await`; `into_future` does the reverse for
 # async-`def` handlers. Version-locked to pyo3 0.28 — track that
 # bump whenever pyo3 itself moves.
-pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 # Zeroizing wrapper for transient operator-seed copies in the
 # DeckClient / OperatorIdentity standalone constructors.
 zeroize = "1"
