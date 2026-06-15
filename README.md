@@ -670,12 +670,12 @@ Feature set affects `.rlib` and `.a` (which keep all compiled code for downstrea
 
 | Features | `libnet.dylib` (cdylib) | `libnet.rlib` | `libnet.a` |
 |----------|------------------------:|--------------:|-----------:|
-| `net` | **2.53 MB** | 34.4 MB | 41.4 MB |
-| `+ nat-traversal` | **2.62 MB** | 35.6 MB | 42.3 MB |
-| `+ redex + redex-disk` | **2.64 MB** | 38.7 MB | 43.8 MB |
-| `+ cortex + netdb + dataforts + meshos` | **3.82 MB** | 64.5 MB | 55.1 MB |
-| `+ redis` | **4.39 MB** | 65.1 MB | 62.7 MB |
-| `+ jetstream` (instead of `redis`) | **5.87 MB** | 67.9 MB | 80.8 MB |
+| `net` | **2.60 MB** | 34.8 MB | 41.7 MB |
+| `+ nat-traversal` | **2.69 MB** | 36.2 MB | 42.6 MB |
+| `+ redex + redex-disk` | **2.69 MB** | 39.3 MB | 44.1 MB |
+| `+ cortex + netdb + dataforts + meshos` | **4.06 MB** | 66.1 MB | 56.3 MB |
+| `+ redis` | **4.63 MB** | 66.7 MB | 63.8 MB |
+| `+ jetstream` (instead of `redis`) | **6.05 MB** | 69.5 MB | 81.7 MB |
 
 The fourth row — `net + nat-traversal + redex + redex-disk + cortex + netdb + dataforts + meshos` — is the full folded-state stack: durable append-only logs, the cross-model query façade, Dataforts blob storage, and the MeshOS supervisor. It's the realistic "everything on" core build short of the optional external-service adapters.
 
@@ -683,9 +683,9 @@ The fourth row — `net + nat-traversal + redex + redex-disk + cortex + netdb + 
 - `libnet.rlib` — Rust static lib with metadata (consumed by other Rust crates).
 - `libnet.a` — C/C++ static lib, pre-LTO, expected for `staticlib`.
 
-Measured on `aarch64-apple-darwin`, 2026-06-03.
+Measured on `aarch64-apple-darwin`, 2026-06-15.
 
-Pure-Rust features are nearly free on the cdylib: `nat-traversal` adds **~94 KB**, and RedEX + disk durability another **~20 KB** — dead-code elimination strips whatever the caller doesn't use, even as the `.rlib` grows by ~3 MB. The real cdylib growth comes from referenced code (`cortex + netdb + dataforts + meshos`, **+1.18 MB**) and from external dependency trees: `redis` **+0.57 MB**, and `jetstream` the outlier at **+2.05 MB** (it pulls in `async-nats`).
+Pure-Rust features are nearly free on the cdylib: `nat-traversal` adds **~96 KB**, and RedEX + disk durability another **~2 KB** — dead-code elimination strips whatever the caller doesn't use, even as the `.rlib` grows by ~4 MB. The real cdylib growth comes from referenced code (`cortex + netdb + dataforts + meshos`, **+1.37 MB**) and from external dependency trees: `redis` **+0.57 MB**, and `jetstream` the outlier at **+1.99 MB** (it pulls in `async-nats`).
 
 `compute` and `groups` aren't core-crate features — they live in the SDK and only ship in the binding cdylibs (`libnet_node.dylib`, the Python module, the npm `.node`), so they don't change the `libnet.dylib` figures above. The `.rlib` and `.a` grow with every feature because they keep all symbols for downstream linkers; only the shipped cdylibs get the full benefit of LTO.
 
