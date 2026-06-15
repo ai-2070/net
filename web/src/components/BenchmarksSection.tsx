@@ -19,7 +19,7 @@ const BENCH_GROUPS: readonly BenchGroup[] = [
       {
         op: "routing header forward",
         m1: { ns: "0.57 ns", rate: "1.75G/s" },
-        i9: { ns: "0.20 ns", rate: "4.99G/s" },
+        i9: { ns: "0.20 ns", rate: "4.96G/s" },
       },
       {
         op: "header serialize",
@@ -28,8 +28,8 @@ const BENCH_GROUPS: readonly BenchGroup[] = [
       },
       {
         op: "routing lookup (hit)",
-        m1: { ns: "40 ns", rate: "25.2M/s" },
-        i9: { ns: "38 ns", rate: "26.3M/s" },
+        m1: { ns: "38 ns", rate: "26.5M/s" },
+        i9: { ns: "38 ns", rate: "26.2M/s" },
       },
     ],
   },
@@ -38,18 +38,18 @@ const BENCH_GROUPS: readonly BenchGroup[] = [
     rows: [
       {
         op: "1 hop",
-        m1: { ns: "57 ns", rate: "17.4M/s" },
+        m1: { ns: "62 ns", rate: "16.2M/s" },
         i9: { ns: "53 ns", rate: "18.7M/s" },
       },
       {
         op: "3 hops",
-        m1: { ns: "160 ns", rate: "6.23M/s" },
-        i9: { ns: "122 ns", rate: "8.18M/s" },
+        m1: { ns: "160 ns", rate: "6.25M/s" },
+        i9: { ns: "121 ns", rate: "8.26M/s" },
       },
       {
         op: "5 hops",
-        m1: { ns: "257 ns", rate: "3.90M/s" },
-        i9: { ns: "196 ns", rate: "5.09M/s" },
+        m1: { ns: "271 ns", rate: "3.69M/s" },
+        i9: { ns: "190 ns", rate: "5.28M/s" },
       },
     ],
   },
@@ -58,18 +58,18 @@ const BENCH_GROUPS: readonly BenchGroup[] = [
     rows: [
       {
         op: "heartbeat",
-        m1: { ns: "29 ns", rate: "34.7M/s" },
-        i9: { ns: "36 ns", rate: "28.0M/s" },
+        m1: { ns: "40 ns", rate: "25.2M/s" },
+        i9: { ns: "69 ns", rate: "14.4M/s" },
       },
       {
         op: "circuit breaker check",
         m1: { ns: "9.55 ns", rate: "105M/s" },
-        i9: { ns: "11 ns", rate: "90.3M/s" },
+        i9: { ns: "11 ns", rate: "90.0M/s" },
       },
       {
         op: "full fail + recover",
-        m1: { ns: "274 ns", rate: "3.65M/s" },
-        i9: { ns: "249 ns", rate: "4.02M/s" },
+        m1: { ns: "291 ns", rate: "3.44M/s" },
+        i9: { ns: "280 ns", rate: "3.58M/s" },
       },
     ],
   },
@@ -79,12 +79,12 @@ const BENCH_GROUPS: readonly BenchGroup[] = [
       {
         op: "pingwave roundtrip",
         m1: { ns: "0.93 ns", rate: "1.07G/s" },
-        i9: { ns: "0.69 ns", rate: "1.46G/s" },
+        i9: { ns: "0.64 ns", rate: "1.57G/s" },
       },
       {
         op: "new peer discovery",
-        m1: { ns: "93 ns", rate: "10.8M/s" },
-        i9: { ns: "47 ns", rate: "21.2M/s" },
+        m1: { ns: "39 ns", rate: "25.3M/s" },
+        i9: { ns: "38 ns", rate: "26.4M/s" },
       },
     ],
   },
@@ -94,12 +94,12 @@ const BENCH_GROUPS: readonly BenchGroup[] = [
       {
         op: "filter (require GPU)",
         m1: { ns: "47 ns", rate: "21.4M/s" },
-        i9: { ns: "44 ns", rate: "22.8M/s" },
+        i9: { ns: "43 ns", rate: "23.4M/s" },
       },
       {
         op: "GPU check",
-        m1: { ns: "40 ns", rate: "25.3M/s" },
-        i9: { ns: "41 ns", rate: "24.7M/s" },
+        m1: { ns: "40 ns", rate: "24.7M/s" },
+        i9: { ns: "41 ns", rate: "24.6M/s" },
       },
     ],
   },
@@ -155,16 +155,16 @@ export function BenchmarksSection() {
           <hr className="border-0 border-t border-line my-5" />
           <BenchKpi
             label="// hot path"
-            value="4.99"
+            value="4.96"
             unit="G/s"
             note="Operations per second on a single core for the forward path. Five billion. Per second. Per core."
           />
           <hr className="border-0 border-t border-line my-5" />
           <BenchKpi
             label="// SDK ingest"
-            value="6.97"
+            value="9.53"
             unit="M/s"
-            note='Python via PyO3 batch ingest. The "slow" binding language hits seven million events per second.'
+            note='Python via PyO3 batch ingest. The "slow" binding language hits nine and a half million events per second.'
           />
           <hr className="border-0 border-t border-line my-5" />
           <h4 className="text-[10px] tracking-[0.15em] text-ink-dim uppercase mb-4 font-medium">
@@ -175,7 +175,7 @@ export function BenchmarksSection() {
             <br />
             <b className="text-ink font-medium">► i9-14900K</b> @5GHz, Win11
             <br />
-            <b className="text-ink font-medium">► date</b> 2026-06-01
+            <b className="text-ink font-medium">► date</b> 2026-06-12
             <br />
             <b className="text-ink font-medium">► profile</b> release + LTO +
             CG=1
