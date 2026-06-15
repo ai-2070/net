@@ -513,61 +513,61 @@ All numbers below measure **packet scheduling** — the time to process, route, 
 
 | Operation | M1 Max | i9-14900K |
 |-----------|--------|-----------|
-| Header serialize | 1.98 ns / **505M ops/sec** | 1.31 ns / **762M ops/sec** |
-| Header deserialize | 2.11 ns / **475M ops/sec** | 1.21 ns / **829M ops/sec** |
-| Routing header serialize | 0.63 ns / **1.59G ops/sec** | 0.46 ns / **2.18G ops/sec** |
-| Routing header forward | 0.57 ns / **1.75G ops/sec** | 0.20 ns / **5.06G ops/sec** |
-| Routing lookup (hit) | 38.09 ns / **26.3M ops/sec** | 37.52 ns / **26.7M ops/sec** |
-| Decision pipeline | 38.89 ns / **25.7M ops/sec** | 38.62 ns / **25.9M ops/sec** |
+| Header serialize | 2.19 ns / **456M ops/sec** | 1.21 ns / **829M ops/sec** |
+| Header deserialize | 2.35 ns / **426M ops/sec** | 1.61 ns / **622M ops/sec** |
+| Routing header serialize | 0.62 ns / **1.60G ops/sec** | 0.51 ns / **1.97G ops/sec** |
+| Routing header forward | 0.57 ns / **1.75G ops/sec** | 0.20 ns / **4.96G ops/sec** |
+| Routing lookup (hit) | 37.73 ns / **26.5M ops/sec** | 38.14 ns / **26.2M ops/sec** |
+| Decision pipeline | 37.48 ns / **26.7M ops/sec** | 38.47 ns / **26.0M ops/sec** |
 
 ### Multi-hop Forwarding
 
 | Hops | M1 Max | i9-14900K |
 |-----:|--------|-----------|
-| 1 | 59.07 ns / **16.9M ops/sec** | 53.37 ns / **18.7M ops/sec** |
-| 2 | 117.32 ns / **8.52M ops/sec** | 86.87 ns / **11.5M ops/sec** |
-| 3 | 163.16 ns / **6.13M ops/sec** | 120.66 ns / **8.29M ops/sec** |
-| 5 | 273.51 ns / **3.66M ops/sec** | 189.73 ns / **5.27M ops/sec** |
+| 1 | 61.66 ns / **16.2M ops/sec** | 53.42 ns / **18.7M ops/sec** |
+| 2 | 116.46 ns / **8.59M ops/sec** | 88.64 ns / **11.3M ops/sec** |
+| 3 | 160.03 ns / **6.25M ops/sec** | 121.08 ns / **8.26M ops/sec** |
+| 5 | 271.11 ns / **3.69M ops/sec** | 189.54 ns / **5.28M ops/sec** |
 
 | Threads | M1 Max | i9-14900K |
 |--------:|--------|-----------|
-| 4 | 4.68 M/s | 7.09 M/s |
-| 8 | 8.14 M/s | 9.96 M/s |
-| 16 | 7.93 M/s | 12.8 M/s |
+| 4 | 5.64 M/s | 6.89 M/s |
+| 8 | 6.94 M/s | 9.91 M/s |
+| 16 | 9.20 M/s | 10.5 M/s |
 
 ### Failure Detection & Recovery
 
 | Operation | M1 Max | i9-14900K |
 |-----------|--------|-----------|
-| Heartbeat (existing node) | 29.03 ns / **34.5M ops/sec** | 35.27 ns / **28.4M ops/sec** |
-| Status check | 14.74 ns / **67.8M ops/sec** | 13.42 ns / **74.5M ops/sec** |
-| Circuit breaker check | 13.44 ns / **74.4M ops/sec** | 10.17 ns / **98.4M ops/sec** |
-| Recovery (evaluate alternates) | 251.67 ns / **3.97M ops/sec** | 254.20 ns / **3.93M ops/sec** |
-| Full fail + recover cycle | 287.97 ns / **3.47M ops/sec** | 255.40 ns / **3.92M ops/sec** |
+| Heartbeat (existing node) | 39.76 ns / **25.2M ops/sec** | 69.27 ns / **14.4M ops/sec** |
+| Status check | 15.10 ns / **66.2M ops/sec** | 15.17 ns / **65.9M ops/sec** |
+| Circuit breaker check | 9.55 ns / **104.7M ops/sec** | 11.11 ns / **90.0M ops/sec** |
+| Recovery (evaluate alternates) | 257.51 ns / **3.88M ops/sec** | 354.87 ns / **2.82M ops/sec** |
+| Full fail + recover cycle | 290.75 ns / **3.44M ops/sec** | 279.63 ns / **3.58M ops/sec** |
 
 ### Swarm / Discovery
 
 | Operation | M1 Max | i9-14900K |
 |-----------|--------|-----------|
-| Pingwave serialize | 0.78 ns / **1.28G ops/sec** | 0.54 ns / **1.86G ops/sec** |
-| Pingwave roundtrip | 0.93 ns / **1.07G ops/sec** | 0.65 ns / **1.55G ops/sec** |
-| New peer discovery | 113.27 ns / **8.83M ops/sec** | 151.82 ns / **6.59M ops/sec** |
+| Pingwave serialize | 0.78 ns / **1.28G ops/sec** | 0.52 ns / **1.93G ops/sec** |
+| Pingwave roundtrip | 0.93 ns / **1.07G ops/sec** | 0.64 ns / **1.57G ops/sec** |
+| New peer discovery | 39.49 ns / **25.3M ops/sec** | 37.92 ns / **26.4M ops/sec** |
 
 | Nodes | M1 Max (all_nodes) | i9-14900K (all_nodes) |
 |------:|-------------------:|----------------------:|
-| 100 | 2.52 us | 7.47 us |
-| 500 | 8.09 us | 16.09 us |
-| 1,000 | 132.7 us | 26.86 us |
-| 5,000 | 113.29 us | 237.66 us |
+| 100 | 2.85 us | 13.27 us |
+| 500 | 8.33 us | 26.06 us |
+| 1,000 | 37.38 us | 43.11 us |
+| 5,000 | 113.37 us | 316.56 us |
 
 ### Encryption (ChaCha20-Poly1305)
 
 | Payload | M1 Max | i9-14900K |
 |--------:|--------|-----------|
-| 64B | 483.14 ns / 126.3 MiB/s | 1.14 us / 53.7 MiB/s |
-| 256B | 922.69 ns / 264.6 MiB/s | 1.20 us / 203.0 MiB/s |
-| 1KB | 2.69 us / 362.8 MiB/s | 1.58 us / 618.4 MiB/s |
-| 4KB | 9.74 us / 400.9 MiB/s | 3.10 us / 1.23 GiB/s |
+| 64B | 301.09 ns / 202.7 MiB/s | 212.81 ns / 286.8 MiB/s |
+| 256B | 476.74 ns / 512.1 MiB/s | 277.96 ns / 878.3 MiB/s |
+| 1KB | 908.20 ns / 1.05 GiB/s | 540.50 ns / 1.76 GiB/s |
+| 4KB | 2.89 us / 1.32 GiB/s | 1.53 us / 2.50 GiB/s |
 
 ### Capability System
 
@@ -589,17 +589,17 @@ All numbers below measure **packet scheduling** — the time to process, route, 
 
 | Threads | M1 Max | i9-14900K |
 |--------:|--------|-----------|
-| 8 | **9.18 M/s** | **5.45 M/s** |
-| 16 | **9.42 M/s** | **8.43 M/s** |
-| 32 | **9.80 M/s** | **9.89 M/s** |
+| 8 | **11.66 M/s** | **14.19 M/s** |
+| 16 | **11.46 M/s** | **17.21 M/s** |
+| 32 | **11.47 M/s** | **21.09 M/s** |
 
 Pool contention (thread-local acquire/release):
 
 | Threads | M1 Max | i9-14900K |
 |--------:|--------|-----------|
-| 8 | **72.5 M/s** | **63.2 M/s** |
-| 16 | **70.4 M/s** | **88.0 M/s** |
-| 32 | **76.9 M/s** | **110.4 M/s** |
+| 8 | **67.8 M/s** | **69.7 M/s** |
+| 16 | **72.7 M/s** | **91.1 M/s** |
+| 32 | **70.4 M/s** | **120.9 M/s** |
 
 ### SDK Ingestion
 
