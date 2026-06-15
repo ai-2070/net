@@ -2,7 +2,7 @@
 
 Performance benchmarks for the Net Rust core and Net transport layer.
 
-Benchmarks accurate as of 2026-04-27.
+Benchmarks accurate as of 2026-06-12.
 
 **Test Systems:**
 - Apple M1 Max, macOS
@@ -12,10 +12,10 @@ Benchmarks accurate as of 2026-04-27.
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| Serialize | 1.9795 ns | 505.17 Melem/s | 1.3121 ns | 762.11 Melem/s |
-| Deserialize | 2.1051 ns | 475.04 Melem/s | 1.2066 ns | 828.74 Melem/s |
-| Roundtrip | 2.1236 ns | 470.89 Melem/s | 1.2073 ns | 828.27 Melem/s |
-| AAD generation | 2.0290 ns | 492.84 Melem/s | 1.0993 ns | 909.65 Melem/s |
+| Serialize | 2.1909 ns | 456.44 Melem/s | 1.2061 ns | 829.14 Melem/s |
+| Deserialize | 2.3487 ns | 425.77 Melem/s | 1.6079 ns | 621.91 Melem/s |
+| Roundtrip | 2.3496 ns | 425.61 Melem/s | 1.6096 ns | 621.28 Melem/s |
+| AAD generation | 1.8632 ns | 536.70 Melem/s | 1.0641 ns | 939.77 Melem/s |
 
 ## Event Frame Serialization
 
@@ -23,128 +23,128 @@ Benchmarks accurate as of 2026-04-27.
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| 64B | 18.313 ns | 3.2547 GiB/s | 35.636 ns | 1.6726 GiB/s |
-| 256B | 45.154 ns | 5.2802 GiB/s | 35.975 ns | 6.6273 GiB/s |
-| 1KB | 35.994 ns | 26.495 GiB/s | 36.711 ns | 25.978 GiB/s |
-| 4KB | 77.377 ns | 49.300 GiB/s | 51.033 ns | 74.749 GiB/s |
+| 64B | 21.494 ns | 2.7731 GiB/s | 35.345 ns | 1.6863 GiB/s |
+| 256B | 46.699 ns | 5.1054 GiB/s | 35.330 ns | 6.7483 GiB/s |
+| 1KB | 34.028 ns | 28.026 GiB/s | 35.310 ns | 27.008 GiB/s |
+| 4KB | 76.349 ns | 49.964 GiB/s | 48.129 ns | 79.260 GiB/s |
 
 ### Batch Write (64B events)
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| 1 events | 18.358 ns | 3.2468 GiB/s | 26.697 ns | 2.2326 GiB/s |
-| 10 events | 70.986 ns | 8.3967 GiB/s | 58.763 ns | 10.143 GiB/s |
-| 50 events | 147.66 ns | 20.184 GiB/s | 146.16 ns | 20.390 GiB/s |
-| 100 events | 273.70 ns | 21.777 GiB/s | 259.22 ns | 22.994 GiB/s |
+| 1 events | 21.556 ns | 2.7651 GiB/s | 27.175 ns | 2.1933 GiB/s |
+| 10 events | 68.435 ns | 8.7097 GiB/s | 55.323 ns | 10.774 GiB/s |
+| 50 events | 146.33 ns | 20.366 GiB/s | 147.62 ns | 20.189 GiB/s |
+| 100 events | 272.47 ns | 21.876 GiB/s | 273.13 ns | 21.822 GiB/s |
 
 ### Batch Read
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| Read batch (10 events) | 140.85 ns | 70.998 Melem/s | 164.31 ns | 60.861 Melem/s |
+| Read batch (10 events) | 137.77 ns | 72.587 Melem/s | 163.35 ns | 61.220 Melem/s |
 
 ## Packet Pool (Zero-Allocation)
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| Shared pool get+return | 38.626 ns | 25.889 Melem/s | 52.956 ns | 18.884 Melem/s |
-| Thread-local get+return | 82.768 ns | 12.082 Melem/s | 65.543 ns | 15.257 Melem/s |
+| Shared pool get+return | 47.648 ns | 20.987 Melem/s | 40.935 ns | 24.429 Melem/s |
+| Thread-local get+return | 104.99 ns | 9.5243 Melem/s | 60.006 ns | 16.665 Melem/s |
 
 ### Pool Comparison (10x cycles)
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| Shared pool 10x | 340.51 ns | 2.9368 Melem/s | 526.09 ns | 1.9008 Melem/s |
-| Thread-local 10x | 959.35 ns | 1.0424 Melem/s | 819.73 ns | 1.2199 Melem/s |
+| Shared pool 10x | 349.64 ns | 2.8601 Melem/s | 381.92 ns | 2.6183 Melem/s |
+| Thread-local 10x | 1.1130 us | 898.47 Kelem/s | 802.06 ns | 1.2468 Melem/s |
 
 ## Packet Build
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| 1 event | 485.51 ns | 125.71 MiB/s | 1.1361 us | 53.724 MiB/s |
-| 10 events | 1.8459 us | 330.66 MiB/s | 1.5017 us | 406.44 MiB/s |
-| 50 events | 8.2080 us | 371.80 MiB/s | 2.9299 us | 1.0172 GiB/s |
+| 1 event | 299.12 ns | 204.05 MiB/s | 212.20 ns | 287.63 MiB/s |
+| 10 events | 708.38 ns | 861.61 MiB/s | 436.52 ns | 1.3655 GiB/s |
+| 50 events | 2.4421 us | 1.2203 GiB/s | 1.4282 us | 2.0866 GiB/s |
 
 ## Encryption (ChaCha20-Poly1305)
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| 64B | 483.14 ns | 126.33 MiB/s | 1.1356 us | 53.749 MiB/s |
-| 256B | 922.69 ns | 264.60 MiB/s | 1.2027 us | 203.00 MiB/s |
-| 1KB | 2.6917 us | 362.80 MiB/s | 1.5793 us | 618.35 MiB/s |
-| 4KB | 9.7427 us | 400.94 MiB/s | 3.0992 us | 1.2309 GiB/s |
+| 64B | 301.09 ns | 202.71 MiB/s | 212.81 ns | 286.80 MiB/s |
+| 256B | 476.74 ns | 512.10 MiB/s | 277.96 ns | 878.33 MiB/s |
+| 1KB | 908.20 ns | 1.0501 GiB/s | 540.50 ns | 1.7644 GiB/s |
+| 4KB | 2.8872 us | 1.3212 GiB/s | 1.5262 us | 2.4995 GiB/s |
 
 ### End-to-End Packet Build (50 events)
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| Shared pool | 8.1780 us | 373.17 MiB/s | 2.8706 us | 1.0382 GiB/s |
-| Thread-local pool | 8.1857 us | 372.82 MiB/s | 2.8355 us | 1.0510 GiB/s |
+| Shared pool | 2.4268 us | 1.2281 GiB/s | 1.4289 us | 2.0857 GiB/s |
+| Thread-local pool | 2.4609 us | 1.2110 GiB/s | 1.4415 us | 2.0675 GiB/s |
 
 ## Adaptive Batcher Overhead
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| optimal_size() | 972.95 ps | 1.0278 Gelem/s | 788.45 ps | 1.2683 Gelem/s |
-| record() | 3.8946 ns | 256.77 Melem/s | 14.312 ns | 69.870 Melem/s |
-| full_cycle | 4.3907 ns | 227.75 Melem/s | 7.9251 ns | 126.18 Melem/s |
+| optimal_size() | 986.72 ps | 1.0135 Gelem/s | 804.51 ps | 1.2430 Gelem/s |
+| record() | 3.8605 ns | 259.03 Melem/s | 9.4878 ns | 105.40 Melem/s |
+| full_cycle | 4.3735 ns | 228.65 Melem/s | 8.0509 ns | 124.21 Melem/s |
 
 ## Key Generation
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| Keypair generate | 12.426 us | 80.477 Kelem/s | 10.661 us | 93.798 Kelem/s |
+| Keypair generate | 12.456 us | 80.285 Kelem/s | 10.851 us | 92.157 Kelem/s |
 
 ## Multi-threaded Packet Build (1000 packets/thread)
 
 | Threads | Pool | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 8 | Shared | 1.8232 ms | 4.3879 Melem/s | 1.6552 ms | 4.8333 Melem/s |
-| 8 | Thread-local | 871.34 us | 9.1812 Melem/s | 1.4680 ms | 5.4497 Melem/s |
-| 16 | Shared | 4.3219 ms | 3.7021 Melem/s | 2.6261 ms | 6.0926 Melem/s |
-| 16 | Thread-local | 1.6980 ms | 9.4230 Melem/s | 1.8989 ms | 8.4260 Melem/s |
-| 24 | Shared | 6.5734 ms | 3.6511 Melem/s | 3.7907 ms | 6.3314 Melem/s |
-| 24 | Thread-local | 2.4907 ms | 9.6358 Melem/s | 2.7032 ms | 8.8783 Melem/s |
-| 32 | Shared | 8.6432 ms | 3.7023 Melem/s | 5.5519 ms | 5.7638 Melem/s |
-| 32 | Thread-local | 3.2641 ms | 9.8037 Melem/s | 3.2369 ms | 9.8861 Melem/s |
+| 8 | Shared | 1.8532 ms | 4.3170 Melem/s | 1.2241 ms | 6.5356 Melem/s |
+| 8 | Thread-local | 686.14 us | 11.659 Melem/s | 563.94 us | 14.186 Melem/s |
+| 16 | Shared | 4.3103 ms | 3.7120 Melem/s | 2.5168 ms | 6.3574 Melem/s |
+| 16 | Thread-local | 1.3962 ms | 11.460 Melem/s | 929.65 us | 17.211 Melem/s |
+| 24 | Shared | 6.7933 ms | 3.5329 Melem/s | 4.0055 ms | 5.9918 Melem/s |
+| 24 | Thread-local | 2.1242 ms | 11.298 Melem/s | 1.2289 ms | 19.529 Melem/s |
+| 32 | Shared | 9.6371 ms | 3.3205 Melem/s | 5.3050 ms | 6.0321 Melem/s |
+| 32 | Thread-local | 2.7898 ms | 11.470 Melem/s | 1.5174 ms | 21.088 Melem/s |
 
 ### Pool Contention (10,000 acquire/release per thread)
 
 | Threads | Pool | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 8 | Shared | 17.757 ms | 4.5052 Melem/s | 9.5961 ms | 8.3367 Melem/s |
-| 8 | Thread-local | 1.1039 ms | 72.473 Melem/s | 1.2653 ms | 63.228 Melem/s |
-| 16 | Shared | 42.666 ms | 3.7501 Melem/s | 21.895 ms | 7.3077 Melem/s |
-| 16 | Thread-local | 2.2715 ms | 70.439 Melem/s | 1.8178 ms | 88.018 Melem/s |
-| 24 | Shared | 62.141 ms | 3.8622 Melem/s | 35.778 ms | 6.7079 Melem/s |
-| 24 | Thread-local | 3.2728 ms | 73.332 Melem/s | 2.2103 ms | 108.58 Melem/s |
-| 32 | Shared | 88.574 ms | 3.6128 Melem/s | 46.426 ms | 6.8927 Melem/s |
-| 32 | Thread-local | 4.1638 ms | 76.853 Melem/s | 2.8982 ms | 110.41 Melem/s |
+| 8 | Shared | 17.374 ms | 4.6045 Melem/s | 10.343 ms | 7.7344 Melem/s |
+| 8 | Thread-local | 1.1804 ms | 67.775 Melem/s | 1.1486 ms | 69.653 Melem/s |
+| 16 | Shared | 37.810 ms | 4.2316 Melem/s | 21.660 ms | 7.3870 Melem/s |
+| 16 | Thread-local | 2.2019 ms | 72.666 Melem/s | 1.7565 ms | 91.092 Melem/s |
+| 24 | Shared | 61.180 ms | 3.9228 Melem/s | 38.590 ms | 6.2193 Melem/s |
+| 24 | Thread-local | 3.3226 ms | 72.233 Melem/s | 2.1261 ms | 112.88 Melem/s |
+| 32 | Shared | 82.277 ms | 3.8893 Melem/s | 49.627 ms | 6.4481 Melem/s |
+| 32 | Thread-local | 4.5433 ms | 70.434 Melem/s | 2.6460 ms | 120.94 Melem/s |
 
 ### Mixed Frame Sizes (64B/256B/1KB rotation)
 
 | Threads | Pool | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 8 | Shared | 1.3890 ms | 8.6394 Melem/s | 1.1449 ms | 10.481 Melem/s |
-| 8 | Thread-local | 1.0463 ms | 11.469 Melem/s | 1.0572 ms | 11.351 Melem/s |
-| 16 | Shared | 3.1078 ms | 7.7225 Melem/s | 1.6026 ms | 14.976 Melem/s |
-| 16 | Thread-local | 2.0450 ms | 11.736 Melem/s | 1.3995 ms | 17.149 Melem/s |
-| 24 | Shared | 4.7286 ms | 7.6132 Melem/s | 2.1766 ms | 16.539 Melem/s |
-| 24 | Thread-local | 2.9936 ms | 12.026 Melem/s | 1.7878 ms | 20.136 Melem/s |
-| 32 | Shared | 6.2144 ms | 7.7240 Melem/s | 3.2686 ms | 14.685 Melem/s |
-| 32 | Thread-local | 3.9297 ms | 12.215 Melem/s | 2.2510 ms | 21.324 Melem/s |
+| 8 | Shared | 1.0381 ms | 11.560 Melem/s | 739.21 us | 16.234 Melem/s |
+| 8 | Thread-local | 635.02 us | 18.897 Melem/s | 543.79 us | 22.067 Melem/s |
+| 16 | Shared | 2.4291 ms | 9.8802 Melem/s | 1.3792 ms | 17.401 Melem/s |
+| 16 | Thread-local | 1.2185 ms | 19.697 Melem/s | 868.66 us | 27.629 Melem/s |
+| 24 | Shared | 4.0760 ms | 8.8321 Melem/s | 2.0743 ms | 17.355 Melem/s |
+| 24 | Thread-local | 1.8125 ms | 19.862 Melem/s | 1.1795 ms | 30.520 Melem/s |
+| 32 | Shared | 5.6080 ms | 8.5592 Melem/s | 2.7998 ms | 17.144 Melem/s |
+| 32 | Thread-local | 2.3118 ms | 20.763 Melem/s | 1.4859 ms | 32.303 Melem/s |
 
 ### Throughput Scaling (Thread-local Pool)
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| 1 threads | 6.7210 ms | 297.58 Kelem/s | 3.6389 ms | 549.62 Kelem/s |
-| 2 threads | 6.9737 ms | 573.58 Kelem/s | 3.7152 ms | 1.0767 Melem/s |
-| 4 threads | 7.4390 ms | 1.0754 Melem/s | 3.7323 ms | 2.1434 Melem/s |
-| 8 threads | 7.8256 ms | 2.0446 Melem/s | 4.6415 ms | 3.4472 Melem/s |
-| 16 threads | 15.423 ms | 2.0748 Melem/s | 5.4369 ms | 5.8857 Melem/s |
-| 24 threads | 22.826 ms | 2.1028 Melem/s | 7.9115 ms | 6.0671 Melem/s |
-| 32 threads | 29.946 ms | 2.1372 Melem/s | 10.167 ms | 6.2949 Melem/s |
+| 1 threads | 2.4787 ms | 806.86 Kelem/s | 1.4312 ms | 1.3974 Melem/s |
+| 2 threads | 2.5825 ms | 1.5489 Melem/s | 1.5071 ms | 2.6541 Melem/s |
+| 4 threads | 2.7908 ms | 2.8666 Melem/s | 1.5458 ms | 5.1752 Melem/s |
+| 8 threads | 3.0433 ms | 5.2574 Melem/s | 2.0913 ms | 7.6507 Melem/s |
+| 16 threads | 5.9857 ms | 5.3461 Melem/s | 3.3343 ms | 9.5973 Melem/s |
+| 24 threads | 8.7039 ms | 5.5148 Melem/s | 3.9903 ms | 12.029 Melem/s |
+| 32 threads | 12.350 ms | 5.1820 Melem/s | 5.1411 ms | 12.449 Melem/s |
 
 ## Routing
 
@@ -152,40 +152,40 @@ Benchmarks accurate as of 2026-04-27.
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| Serialize | 627.06 ps | 1.5947 Gelem/s | 458.66 ps | 2.1803 Gelem/s |
-| Deserialize | 936.61 ps | 1.0677 Gelem/s | 720.57 ps | 1.3878 Gelem/s |
-| Roundtrip | 936.94 ps | 1.0673 Gelem/s | 711.16 ps | 1.4061 Gelem/s |
-| Forward | 572.90 ps | 1.7455 Gelem/s | 197.75 ps | 5.0569 Gelem/s |
+| Serialize | 624.31 ps | 1.6018 Gelem/s | 508.32 ps | 1.9673 Gelem/s |
+| Deserialize | 931.90 ps | 1.0731 Gelem/s | 720.41 ps | 1.3881 Gelem/s |
+| Roundtrip | 931.81 ps | 1.0732 Gelem/s | 735.15 ps | 1.3603 Gelem/s |
+| Forward | 571.42 ps | 1.7500 Gelem/s | 201.75 ps | 4.9566 Gelem/s |
 
 ### Routing Table
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| lookup_hit | 38.087 ns | 26.256 Melem/s | 37.520 ns | 26.653 Melem/s |
-| lookup_miss | 15.194 ns | 65.817 Melem/s | 17.417 ns | 57.416 Melem/s |
-| is_local | 314.60 ps | 3.1786 Gelem/s | 200.43 ps | 4.9892 Gelem/s |
-| add_route | 227.91 ns | 4.3877 Melem/s | 185.53 ns | 5.3899 Melem/s |
-| record_in | 49.706 ns | 20.118 Melem/s | 40.591 ns | 24.636 Melem/s |
-| record_out | 20.988 ns | 47.647 Melem/s | 21.100 ns | 47.392 Melem/s |
-| aggregate_stats | 2.1182 us | 472.10 Kelem/s | 8.0137 us | 124.79 Kelem/s |
+| lookup_hit | 37.730 ns | 26.504 Melem/s | 38.135 ns | 26.223 Melem/s |
+| lookup_miss | 15.219 ns | 65.708 Melem/s | 17.706 ns | 56.477 Melem/s |
+| is_local | 313.39 ps | 3.1909 Gelem/s | 201.29 ps | 4.9681 Gelem/s |
+| add_route | 46.487 ns | 21.511 Melem/s | 37.349 ns | 26.774 Melem/s |
+| record_in | 49.694 ns | 20.123 Melem/s | 40.648 ns | 24.602 Melem/s |
+| record_out | 22.084 ns | 45.282 Melem/s | 21.174 ns | 47.228 Melem/s |
+| aggregate_stats | 2.1356 us | 468.25 Kelem/s | 6.1092 us | 163.69 Kelem/s |
 
 ### Concurrent Routing Lookup
 
 | Threads | Pool | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 4 | Lookup | 150.82 us | 26.522 Melem/s | 179.22 us | 22.319 Melem/s |
-| 4 | Stats | 285.91 us | 13.990 Melem/s | 227.20 us | 17.605 Melem/s |
-| 8 | Lookup | 247.27 us | 32.354 Melem/s | 286.48 us | 27.926 Melem/s |
-| 8 | Stats | 402.88 us | 19.857 Melem/s | 330.19 us | 24.229 Melem/s |
-| 16 | Lookup | 427.39 us | 37.437 Melem/s | 520.51 us | 30.739 Melem/s |
-| 16 | Stats | 797.54 us | 20.062 Melem/s | 578.11 us | 27.676 Melem/s |
+| 4 | Lookup | 158.46 us | 25.243 Melem/s | 181.94 us | 21.985 Melem/s |
+| 4 | Stats | 291.31 us | 13.731 Melem/s | 226.05 us | 17.695 Melem/s |
+| 8 | Lookup | 249.46 us | 32.069 Melem/s | 287.24 us | 27.851 Melem/s |
+| 8 | Stats | 406.38 us | 19.686 Melem/s | 328.02 us | 24.389 Melem/s |
+| 16 | Lookup | 428.00 us | 37.383 Melem/s | 522.62 us | 30.615 Melem/s |
+| 16 | Stats | 799.27 us | 20.018 Melem/s | 582.35 us | 27.475 Melem/s |
 
 ### Decision Pipeline
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| parse + lookup + forward | 38.888 ns | 25.715 Melem/s | 38.618 ns | 25.894 Melem/s |
-| full with stats | 109.96 ns | 9.0945 Melem/s | 100.88 ns | 9.9128 Melem/s |
+| parse + lookup + forward | 37.481 ns | 26.680 Melem/s | 38.471 ns | 25.993 Melem/s |
+| full with stats | 106.24 ns | 9.4129 Melem/s | 99.818 ns | 10.018 Melem/s |
 
 ## Multi-hop Forwarding
 
@@ -193,69 +193,69 @@ Benchmarks accurate as of 2026-04-27.
 
 | Payload | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 64B | Build | 23.215 ns | 2.5675 GiB/s | 40.723 ns | 1.4637 GiB/s |
-| 64B | Build (priority) | 20.647 ns | 2.8868 GiB/s | 29.625 ns | 2.0120 GiB/s |
-| 256B | Build | 51.113 ns | 4.6646 GiB/s | 43.461 ns | 5.4858 GiB/s |
-| 256B | Build (priority) | 50.016 ns | 4.7669 GiB/s | 31.959 ns | 7.4601 GiB/s |
-| 1KB | Build | 41.145 ns | 23.178 GiB/s | 43.981 ns | 21.684 GiB/s |
-| 1KB | Build (priority) | 38.402 ns | 24.834 GiB/s | 35.206 ns | 27.088 GiB/s |
-| 4KB | Build | 82.055 ns | 46.489 GiB/s | 62.592 ns | 60.946 GiB/s |
-| 4KB | Build (priority) | 80.475 ns | 47.402 GiB/s | 52.824 ns | 72.215 GiB/s |
+| 64B | Build | 25.934 ns | 2.2983 GiB/s | 41.097 ns | 1.4503 GiB/s |
+| 64B | Build (priority) | 24.004 ns | 2.4831 GiB/s | 29.613 ns | 2.0128 GiB/s |
+| 256B | Build | 51.517 ns | 4.6280 GiB/s | 44.460 ns | 5.3626 GiB/s |
+| 256B | Build (priority) | 47.969 ns | 4.9703 GiB/s | 32.347 ns | 7.3705 GiB/s |
+| 1KB | Build | 39.581 ns | 24.094 GiB/s | 44.189 ns | 21.582 GiB/s |
+| 1KB | Build (priority) | 36.372 ns | 26.220 GiB/s | 35.378 ns | 26.957 GiB/s |
+| 4KB | Build | 77.966 ns | 48.928 GiB/s | 64.470 ns | 59.170 GiB/s |
+| 4KB | Build (priority) | 75.934 ns | 50.237 GiB/s | 53.732 ns | 70.995 GiB/s |
 
 ### Chain Scaling (forward_chain)
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| 1 hops | 59.066 ns | 16.930 Melem/s | 53.369 ns | 18.737 Melem/s |
-| 2 hops | 117.32 ns | 8.5239 Melem/s | 86.868 ns | 11.512 Melem/s |
-| 3 hops | 163.16 ns | 6.1291 Melem/s | 120.66 ns | 8.2878 Melem/s |
-| 4 hops | 216.95 ns | 4.6094 Melem/s | 154.83 ns | 6.4585 Melem/s |
-| 5 hops | 273.51 ns | 3.6561 Melem/s | 189.73 ns | 5.2706 Melem/s |
+| 1 hops | 61.656 ns | 16.219 Melem/s | 53.417 ns | 18.721 Melem/s |
+| 2 hops | 116.46 ns | 8.5868 Melem/s | 88.642 ns | 11.281 Melem/s |
+| 3 hops | 160.03 ns | 6.2489 Melem/s | 121.08 ns | 8.2588 Melem/s |
+| 4 hops | 217.27 ns | 4.6026 Melem/s | 156.17 ns | 6.4033 Melem/s |
+| 5 hops | 271.11 ns | 3.6886 Melem/s | 189.54 ns | 5.2758 Melem/s |
 
 ### Hop Latency
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| Single hop process | 1.4534 ns | 688.06 Melem/s | 956.42 ps | 1.0456 Gelem/s |
-| Single hop full | 57.810 ns | 17.298 Melem/s | 33.033 ns | 30.273 Melem/s |
+| Single hop process | 1.4653 ns | 682.45 Melem/s | 966.73 ps | 1.0344 Gelem/s |
+| Single hop full | 58.018 ns | 17.236 Melem/s | 34.141 ns | 29.291 Melem/s |
 
 ### Hop Scaling by Payload Size
 
 | Payload | Hops | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 64B | 1 hops | 29.697 ns | 2.0071 GiB/s | 51.991 ns | 1.1464 GiB/s |
-| 64B | 2 hops | 52.765 ns | 1.1296 GiB/s | 85.921 ns | 710.37 MiB/s |
-| 64B | 3 hops | 76.365 ns | 799.26 MiB/s | 117.58 ns | 519.09 MiB/s |
-| 64B | 4 hops | 100.17 ns | 609.34 MiB/s | 148.90 ns | 409.92 MiB/s |
-| 64B | 5 hops | 130.59 ns | 467.37 MiB/s | 182.79 ns | 333.92 MiB/s |
-| 256B | 1 hops | 58.795 ns | 4.0551 GiB/s | 53.936 ns | 4.4204 GiB/s |
-| 256B | 2 hops | 115.71 ns | 2.0604 GiB/s | 89.793 ns | 2.6552 GiB/s |
-| 256B | 3 hops | 162.42 ns | 1.4679 GiB/s | 120.47 ns | 1.9791 GiB/s |
-| 256B | 4 hops | 221.76 ns | 1.0751 GiB/s | 154.96 ns | 1.5385 GiB/s |
-| 256B | 5 hops | 283.72 ns | 860.50 MiB/s | 191.03 ns | 1.2481 GiB/s |
-| 1024B | 1 hops | 48.124 ns | 19.817 GiB/s | 54.602 ns | 17.466 GiB/s |
-| 1024B | 2 hops | 117.18 ns | 8.1383 GiB/s | 89.531 ns | 10.652 GiB/s |
-| 1024B | 3 hops | 159.92 ns | 5.9634 GiB/s | 124.67 ns | 7.6498 GiB/s |
-| 1024B | 4 hops | 215.82 ns | 4.4189 GiB/s | 159.07 ns | 5.9952 GiB/s |
-| 1024B | 5 hops | 258.70 ns | 3.6864 GiB/s | 197.50 ns | 4.8288 GiB/s |
+| 64B | 1 hops | 31.758 ns | 1.8768 GiB/s | 53.762 ns | 1.1087 GiB/s |
+| 64B | 2 hops | 84.664 ns | 720.91 MiB/s | 84.985 ns | 718.19 MiB/s |
+| 64B | 3 hops | 111.24 ns | 548.67 MiB/s | 116.24 ns | 525.07 MiB/s |
+| 64B | 4 hops | 140.62 ns | 434.03 MiB/s | 148.63 ns | 410.66 MiB/s |
+| 64B | 5 hops | 167.47 ns | 364.46 MiB/s | 184.47 ns | 330.86 MiB/s |
+| 256B | 1 hops | 58.446 ns | 4.0793 GiB/s | 53.698 ns | 4.4400 GiB/s |
+| 256B | 2 hops | 113.84 ns | 2.0943 GiB/s | 87.617 ns | 2.7212 GiB/s |
+| 256B | 3 hops | 159.04 ns | 1.4991 GiB/s | 123.25 ns | 1.9344 GiB/s |
+| 256B | 4 hops | 214.88 ns | 1.1095 GiB/s | 154.66 ns | 1.5415 GiB/s |
+| 256B | 5 hops | 270.25 ns | 903.39 MiB/s | 190.90 ns | 1.2489 GiB/s |
+| 1024B | 1 hops | 44.878 ns | 21.251 GiB/s | 54.721 ns | 17.428 GiB/s |
+| 1024B | 2 hops | 107.25 ns | 8.8923 GiB/s | 90.824 ns | 10.500 GiB/s |
+| 1024B | 3 hops | 150.63 ns | 6.3314 GiB/s | 125.82 ns | 7.5796 GiB/s |
+| 1024B | 4 hops | 200.62 ns | 4.7536 GiB/s | 160.85 ns | 5.9288 GiB/s |
+| 1024B | 5 hops | 233.58 ns | 4.0828 GiB/s | 203.21 ns | 4.6930 GiB/s |
 
 ### Route and Forward (with routing table lookup)
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| 1 hops | 178.04 ns | 5.6166 Melem/s | 152.03 ns | 6.5777 Melem/s |
-| 2 hops | 353.15 ns | 2.8317 Melem/s | 284.39 ns | 3.5163 Melem/s |
-| 3 hops | 527.53 ns | 1.8956 Melem/s | 415.06 ns | 2.4093 Melem/s |
-| 4 hops | 713.90 ns | 1.4007 Melem/s | 559.76 ns | 1.7865 Melem/s |
-| 5 hops | 880.92 ns | 1.1352 Melem/s | 695.45 ns | 1.4379 Melem/s |
+| 1 hops | 157.11 ns | 6.3648 Melem/s | 154.47 ns | 6.4738 Melem/s |
+| 2 hops | 310.08 ns | 3.2250 Melem/s | 290.76 ns | 3.4393 Melem/s |
+| 3 hops | 462.31 ns | 2.1631 Melem/s | 424.95 ns | 2.3532 Melem/s |
+| 4 hops | 620.72 ns | 1.6110 Melem/s | 558.01 ns | 1.7921 Melem/s |
+| 5 hops | 775.19 ns | 1.2900 Melem/s | 694.54 ns | 1.4398 Melem/s |
 
 ### Concurrent Forwarding
 
 | Threads | Pool | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 4 | Forward | 853.81 us | 4.6849 Melem/s | 564.56 us | 7.0851 Melem/s |
-| 8 | Forward | 982.85 us | 8.1396 Melem/s | 803.11 us | 9.9613 Melem/s |
-| 16 | Forward | 2.0173 ms | 7.9312 Melem/s | 1.2483 ms | 12.818 Melem/s |
+| 4 | Forward | 709.80 us | 5.6354 Melem/s | 580.86 us | 6.8864 Melem/s |
+| 8 | Forward | 1.1528 ms | 6.9396 Melem/s | 806.99 us | 9.9134 Melem/s |
+| 16 | Forward | 1.7385 ms | 9.2036 Melem/s | 1.5263 ms | 10.483 Melem/s |
 
 ## Swarm / Discovery
 
@@ -263,52 +263,52 @@ Benchmarks accurate as of 2026-04-27.
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| Serialize | 778.96 ps | 1.2838 Gelem/s | 536.54 ps | 1.8638 Gelem/s |
-| Deserialize | 934.41 ps | 1.0702 Gelem/s | 655.20 ps | 1.5262 Gelem/s |
-| Roundtrip | 931.54 ps | 1.0735 Gelem/s | 645.41 ps | 1.5494 Gelem/s |
-| Forward | 667.72 ps | 1.4976 Gelem/s | 542.53 ps | 1.8432 Gelem/s |
+| Serialize | 781.32 ps | 1.2799 Gelem/s | 518.93 ps | 1.9270 Gelem/s |
+| Deserialize | 931.39 ps | 1.0737 Gelem/s | 636.21 ps | 1.5718 Gelem/s |
+| Roundtrip | 931.83 ps | 1.0732 Gelem/s | 637.45 ps | 1.5687 Gelem/s |
+| Forward | 625.27 ps | 1.5993 Gelem/s | 518.69 ps | 1.9279 Gelem/s |
 
 ### Local Graph
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| create_pingwave | 2.0999 ns | 476.20 Melem/s | 4.9381 ns | 202.51 Melem/s |
-| on_pingwave_new | 113.27 ns | 8.8287 Melem/s | 151.82 ns | 6.5867 Melem/s |
-| on_pingwave_duplicate | 33.091 ns | 30.219 Melem/s | 16.788 ns | 59.566 Melem/s |
-| get_node | 26.430 ns | 37.835 Melem/s | 14.852 ns | 67.330 Melem/s |
-| node_count | 199.38 ns | 5.0155 Melem/s | 959.04 ns | 1.0427 Melem/s |
-| stats | 597.46 ns | 1.6737 Melem/s | 2.8759 us | 347.72 Kelem/s |
+| create_pingwave | 2.1014 ns | 475.88 Melem/s | 5.0430 ns | 198.29 Melem/s |
+| on_pingwave_new | 39.492 ns | 25.321 Melem/s | 37.916 ns | 26.374 Melem/s |
+| on_pingwave_duplicate | 22.815 ns | 43.831 Melem/s | 17.086 ns | 58.527 Melem/s |
+| get_node | 15.127 ns | 66.107 Melem/s | 21.305 ns | 46.936 Melem/s |
+| node_count | 319.63 ps | 3.1286 Gelem/s | 278.17 ps | 3.5950 Gelem/s |
+| stats | 388.18 ps | 2.5762 Gelem/s | 548.43 ps | 1.8234 Gelem/s |
 
 ### Graph Scaling
 
 | Nodes | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 100 | all_nodes | 2.5183 us | 39.709 Melem/s | 7.4721 us | 13.383 Melem/s |
-| 100 | nodes_within_hops | 2.8790 us | 34.734 Melem/s | 7.5288 us | 13.282 Melem/s |
-| 500 | all_nodes | 8.0948 us | 61.768 Melem/s | 16.091 us | 31.074 Melem/s |
-| 500 | nodes_within_hops | 9.4634 us | 52.835 Melem/s | 16.272 us | 30.727 Melem/s |
-| 1,000 | all_nodes | 132.72 us | 7.5345 Melem/s | 26.862 us | 37.228 Melem/s |
-| 1,000 | nodes_within_hops | 60.290 us | 16.587 Melem/s | 26.595 us | 37.600 Melem/s |
-| 5,000 | all_nodes | 113.29 us | 44.133 Melem/s | 237.66 us | 21.039 Melem/s |
-| 5,000 | nodes_within_hops | 176.48 us | 28.333 Melem/s | 238.64 us | 20.952 Melem/s |
+| 100 | all_nodes | 2.8506 us | 35.081 Melem/s | 13.270 us | 7.5356 Melem/s |
+| 100 | nodes_within_hops | 3.1941 us | 31.308 Melem/s | 13.311 us | 7.5126 Melem/s |
+| 500 | all_nodes | 8.3259 us | 60.054 Melem/s | 26.063 us | 19.184 Melem/s |
+| 500 | nodes_within_hops | 9.7512 us | 51.276 Melem/s | 25.939 us | 19.276 Melem/s |
+| 1,000 | all_nodes | 37.378 us | 26.754 Melem/s | 43.105 us | 23.199 Melem/s |
+| 1,000 | nodes_within_hops | 64.030 us | 15.618 Melem/s | 41.811 us | 23.917 Melem/s |
+| 5,000 | all_nodes | 113.37 us | 44.102 Melem/s | 316.56 us | 15.795 Melem/s |
+| 5,000 | nodes_within_hops | 131.58 us | 37.999 Melem/s | 311.17 us | 16.068 Melem/s |
 
 ### Path Finding
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| path_1_hop | 1.5412 us | 648.85 Kelem/s | 5.3652 us | 186.39 Kelem/s |
-| path_2_hops | 1.5826 us | 631.87 Kelem/s | 5.5363 us | 180.63 Kelem/s |
-| path_4_hops | 1.8451 us | 541.99 Kelem/s | 5.8806 us | 170.05 Kelem/s |
-| path_not_found | 1.7515 us | 570.93 Kelem/s | 5.7318 us | 174.47 Kelem/s |
-| path_complex_graph | 220.18 us | 4.5417 Kelem/s | 177.70 us | 5.6274 Kelem/s |
+| path_1_hop | 2.3039 us | 434.05 Kelem/s | 10.410 us | 96.058 Kelem/s |
+| path_2_hops | 2.3335 us | 428.54 Kelem/s | 10.738 us | 93.125 Kelem/s |
+| path_4_hops | 2.6945 us | 371.12 Kelem/s | 11.133 us | 89.826 Kelem/s |
+| path_not_found | 2.4460 us | 408.83 Kelem/s | 10.879 us | 91.918 Kelem/s |
+| path_complex_graph | 260.29 us | 3.8418 Kelem/s | 335.84 us | 2.9776 Kelem/s |
 
 ### Concurrent Pingwave Processing
 
 | Threads | Pool | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 4 | Pingwave | 107.57 us | 18.592 Melem/s | 167.26 us | 11.957 Melem/s |
-| 8 | Pingwave | 173.56 us | 23.047 Melem/s | 282.09 us | 14.180 Melem/s |
-| 16 | Pingwave | 308.13 us | 25.963 Melem/s | 524.87 us | 15.242 Melem/s |
+| 4 | Pingwave | 112.78 us | 17.733 Melem/s | 311.25 us | 6.4257 Melem/s |
+| 8 | Pingwave | 185.60 us | 21.552 Melem/s | 474.19 us | 8.4355 Melem/s |
+| 16 | Pingwave | 332.44 us | 24.064 Melem/s | 685.28 us | 11.674 Melem/s |
 
 ## Failure Detection
 
@@ -316,206 +316,211 @@ Benchmarks accurate as of 2026-04-27.
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| heartbeat_existing | 29.027 ns | 34.451 Melem/s | 35.267 ns | 28.355 Melem/s |
-| heartbeat_new | 242.62 ns | 4.1216 Melem/s | 174.10 ns | 5.7438 Melem/s |
-| status_check | 14.742 ns | 67.832 Melem/s | 13.418 ns | 74.527 Melem/s |
-| check_all | 342.96 ms | 2.9158 elem/s | 331.65 ms | 3.0152 elem/s |
-| stats | 80.568 ms | 12.412 elem/s | 100.06 ms | 9.9939 elem/s |
+| heartbeat_existing | 39.762 ns | 25.150 Melem/s | 69.269 ns | 14.436 Melem/s |
+| heartbeat_new | 237.77 ns | 4.2058 Melem/s | 243.74 ns | 4.1027 Melem/s |
+| status_check | 15.102 ns | 66.218 Melem/s | 15.174 ns | 65.903 Melem/s |
+| check_all | 12.198 us | 81.978 Kelem/s | 28.012 us | 35.699 Kelem/s |
+| stats | 10.749 us | 93.029 Kelem/s | 21.162 us | 47.254 Kelem/s |
 
-> **⚠️ `check_all` (342 ms) and `stats` (80–100 ms) are benchmark-fixture
-> artifacts, NOT hot-path costs — don't chase them.** Both are an O(nodes) scan
-> whose cost Criterion reports *per element* against a fixture the
-> `heartbeat_new` bench balloons to millions of entries (it inserts a fresh id
-> every iteration into the shared detector). On the real hot path:
-> `check_all` runs once per `heartbeat_interval` (default 5 s) and costs
-> ~204 µs at 5,000 nodes — see *Failure Scaling* below, which grows linearly
-> and contradicts the 342 ms figure — i.e. ~40 µs/s amortized; `stats` is
-> observability-only by documented design. The genuine per-heartbeat costs are
-> `heartbeat_existing` / `heartbeat_new` / `status_check` (14–242 ns). See
-> `docs/misc/PERF_AUDIT_2026_06_09_HOT_PATH.md` §14.
+> **Note:** `check_all` and `stats` are O(nodes) maintenance scans, not
+> per-packet hot-path costs. `check_all` runs once per `heartbeat_interval`
+> (default 5 s) and `stats` is observability-only by design. *Failure Scaling*
+> below shows `check_all` growing linearly to ~55 us at 5,000 nodes
+> (~11 us/s amortized). The genuine per-event costs are `heartbeat_existing` /
+> `heartbeat_new` / `status_check` (15–242 ns).
 
 ### Circuit Breaker
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| allow_closed | 13.439 ns | 74.412 Melem/s | 10.166 ns | 98.371 Melem/s |
-| record_success | 9.6538 ns | 103.59 Melem/s | 8.6455 ns | 115.67 Melem/s |
-| record_failure | 9.6089 ns | 104.07 Melem/s | 9.9009 ns | 101.00 Melem/s |
-| state | 13.437 ns | 74.423 Melem/s | 10.263 ns | 97.435 Melem/s |
+| allow_closed | 9.5519 ns | 104.69 Melem/s | 11.113 ns | 89.984 Melem/s |
+| record_success | 8.3906 ns | 119.18 Melem/s | 11.360 ns | 88.028 Melem/s |
+| record_failure | 7.4171 ns | 134.82 Melem/s | 11.037 ns | 90.601 Melem/s |
+| state | 9.5163 ns | 105.08 Melem/s | 12.002 ns | 83.321 Melem/s |
 
 ### Recovery Manager
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| on_failure_with_alternates | 251.67 ns | 3.9734 Melem/s | 254.20 ns | 3.9339 Melem/s |
-| on_failure_no_alternates | 322.50 ns | 3.1008 Melem/s | 222.76 ns | 4.4891 Melem/s |
-| get_action | 37.080 ns | 26.968 Melem/s | 37.864 ns | 26.410 Melem/s |
-| is_failed | 13.599 ns | 73.536 Melem/s | 12.822 ns | 77.993 Melem/s |
-| on_recovery | 106.20 ns | 9.4162 Melem/s | 124.46 ns | 8.0346 Melem/s |
-| stats | 701.68 ps | 1.4251 Gelem/s | 1.2060 ns | 829.22 Melem/s |
+| on_failure_with_alternates | 257.51 ns | 3.8833 Melem/s | 354.87 ns | 2.8180 Melem/s |
+| on_failure_no_alternates | 178.22 ns | 5.6111 Melem/s | 245.16 ns | 4.0790 Melem/s |
+| get_action | 37.147 ns | 26.920 Melem/s | 80.773 ns | 12.380 Melem/s |
+| is_failed | 13.954 ns | 71.664 Melem/s | 24.647 ns | 40.572 Melem/s |
+| on_recovery | 99.187 ns | 10.082 Melem/s | 236.60 ns | 4.2265 Melem/s |
+| stats | 699.22 ps | 1.4302 Gelem/s | 1.7008 ns | 587.95 Melem/s |
 
 ### Full Recovery Cycle
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| Fail + recover cycle | 287.97 ns | 3.4726 Melem/s | 255.40 ns | 3.9154 Melem/s |
+| Fail + recover cycle | 290.75 ns | 3.4394 Melem/s | 279.63 ns | 3.5761 Melem/s |
 
 ### Loss Simulator
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| 1% | 2.7977 ns | 357.44 Melem/s | 11.051 ns | 90.492 Melem/s |
-| 5% | 3.1565 ns | 316.80 Melem/s | 11.468 ns | 87.198 Melem/s |
-| 10% | 3.6260 ns | 275.79 Melem/s | 11.974 ns | 83.518 Melem/s |
-| 20% | 4.5804 ns | 218.32 Melem/s | 13.007 ns | 76.884 Melem/s |
-| burst | 2.9330 ns | 340.95 Melem/s | 11.540 ns | 86.659 Melem/s |
+| 1% | 2.7864 ns | 358.89 Melem/s | 16.562 ns | 60.377 Melem/s |
+| 5% | 3.1451 ns | 317.96 Melem/s | 16.981 ns | 58.891 Melem/s |
+| 10% | 3.6118 ns | 276.87 Melem/s | 17.517 ns | 57.088 Melem/s |
+| 20% | 4.5659 ns | 219.01 Melem/s | 18.658 ns | 53.596 Melem/s |
+| burst | 2.9188 ns | 342.60 Melem/s | 17.139 ns | 58.346 Melem/s |
 
 ### Failure Scaling (check_all)
 
 | Nodes | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 100 | check_all | 4.8056 us | 20.809 Melem/s | 8.8337 us | 11.320 Melem/s |
-| 100 | healthy_nodes | 1.7158 us | 58.281 Melem/s | 7.0171 us | 14.251 Melem/s |
-| 500 | check_all | 20.892 us | 23.933 Melem/s | 23.103 us | 21.642 Melem/s |
-| 500 | healthy_nodes | 5.4386 us | 91.936 Melem/s | 9.8395 us | 50.816 Melem/s |
-| 1,000 | check_all | 40.976 us | 24.405 Melem/s | 41.088 us | 24.338 Melem/s |
-| 1,000 | healthy_nodes | 10.222 us | 97.831 Melem/s | 14.881 us | 67.199 Melem/s |
-| 5,000 | check_all | 203.50 us | 24.570 Melem/s | 182.98 us | 27.325 Melem/s |
-| 5,000 | healthy_nodes | 48.838 us | 102.38 Melem/s | 53.553 us | 93.365 Melem/s |
+| 100 | check_all | 2.4792 us | 40.336 Melem/s | 12.272 us | 8.1487 Melem/s |
+| 100 | healthy_nodes | 2.1508 us | 46.494 Melem/s | 11.434 us | 8.7455 Melem/s |
+| 500 | check_all | 6.5892 us | 75.882 Melem/s | 20.516 us | 24.371 Melem/s |
+| 500 | healthy_nodes | 6.1351 us | 81.498 Melem/s | 15.234 us | 32.822 Melem/s |
+| 1,000 | check_all | 12.105 us | 82.610 Melem/s | 30.501 us | 32.786 Melem/s |
+| 1,000 | healthy_nodes | 10.616 us | 94.197 Melem/s | 22.350 us | 44.743 Melem/s |
+| 5,000 | check_all | 54.931 us | 91.023 Melem/s | 87.514 us | 57.133 Melem/s |
+| 5,000 | healthy_nodes | 50.910 us | 98.212 Melem/s | 51.754 us | 96.611 Melem/s |
 
 ### Concurrent Heartbeats
 
 | Threads | Pool | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 4 | Heartbeat | 186.32 us | 10.734 Melem/s | 207.56 us | 9.6357 Melem/s |
-| 8 | Heartbeat | 254.05 us | 15.745 Melem/s | 323.27 us | 12.374 Melem/s |
-| 16 | Heartbeat | 466.77 us | 17.139 Melem/s | 568.92 us | 14.062 Melem/s |
+| 4 | Heartbeat | 197.85 us | 10.109 Melem/s | 215.76 us | 9.2694 Melem/s |
+| 8 | Heartbeat | 259.48 us | 15.416 Melem/s | 340.99 us | 11.730 Melem/s |
+| 16 | Heartbeat | 486.95 us | 16.429 Melem/s | 604.87 us | 13.226 Melem/s |
 
 ## Stream Multiplexing
 
 | Streams | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 10 | Lookup | 291.86 ns | 34.263 Melem/s | 348.28 ns | 28.713 Melem/s |
-| 10 | Stats | 484.33 ns | 20.647 Melem/s | 410.47 ns | 24.362 Melem/s |
-| 100 | Lookup | 2.9157 us | 34.297 Melem/s | 3.4340 us | 29.120 Melem/s |
-| 100 | Stats | 4.9629 us | 20.149 Melem/s | 4.1103 us | 24.329 Melem/s |
-| 1,000 | Lookup | 29.223 us | 34.220 Melem/s | 35.485 us | 28.181 Melem/s |
-| 1,000 | Stats | 52.473 us | 19.058 Melem/s | 43.948 us | 22.754 Melem/s |
-| 10,000 | Lookup | 292.93 us | 34.138 Melem/s | 386.36 us | 25.882 Melem/s |
-| 10,000 | Stats | 569.47 us | 17.560 Melem/s | 462.94 us | 21.601 Melem/s |
+| 10 | Lookup | 292.48 ns | 34.191 Melem/s | 337.21 ns | 29.655 Melem/s |
+| 10 | Stats | 465.58 ns | 21.479 Melem/s | 396.54 ns | 25.218 Melem/s |
+| 100 | Lookup | 2.9158 us | 34.296 Melem/s | 3.3989 us | 29.421 Melem/s |
+| 100 | Stats | 4.5977 us | 21.750 Melem/s | 3.9472 us | 25.334 Melem/s |
+| 1,000 | Lookup | 29.094 us | 34.371 Melem/s | 35.773 us | 27.954 Melem/s |
+| 1,000 | Stats | 46.384 us | 21.559 Melem/s | 42.918 us | 23.300 Melem/s |
+| 10,000 | Lookup | 291.12 us | 34.350 Melem/s | 386.08 us | 25.901 Melem/s |
+| 10,000 | Stats | 508.24 us | 19.676 Melem/s | 455.29 us | 21.964 Melem/s |
 
 ## Fair Scheduler
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| Creation | 288.21 ns | 3.4697 Melem/s | 1.5589 us | 641.48 Kelem/s |
-| Stream count (empty) | 200.77 ns | 4.9809 Melem/s | 947.66 ns | 1.0552 Melem/s |
-| Total queued | 312.04 ps | 3.2047 Gelem/s | 200.77 ps | 4.9809 Gelem/s |
-| Cleanup (empty) | 201.26 ns | 4.9686 Melem/s | 1.2865 us | 777.29 Kelem/s |
+| Creation | 391.85 ns | 2.5520 Melem/s | 1.7416 us | 574.19 Kelem/s |
+| Stream count (empty) | 199.39 ns | 5.0152 Melem/s | 960.03 ns | 1.0416 Melem/s |
+| Total queued | 311.25 ps | 3.2128 Gelem/s | 234.84 ps | 4.2582 Gelem/s |
+| Cleanup (empty) | 200.45 ns | 4.9888 Melem/s | 1.2938 us | 772.95 Kelem/s |
 
 ## Capability System
+
+
+Capability state is folded: announcements collapse into one queryable index that scales from a 10K-node mesh to ~2M nodes. The single-element checks below are matches against a fully populated set.
 
 ### CapabilitySet
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| create | 533.54 ns | 1.8743 Melem/s | 777.18 ns | 1.2867 Melem/s |
-| serialize | 930.29 ns | 1.0749 Melem/s | 712.47 ns | 1.4036 Melem/s |
-| deserialize | 1.7227 us | 580.48 Kelem/s | 3.0854 us | 324.11 Kelem/s |
-| roundtrip | 2.6938 us | 371.22 Kelem/s | 3.9750 us | 251.57 Kelem/s |
-| has_tag | 747.24 ps | 1.3383 Gelem/s | 605.35 ps | 1.6519 Gelem/s |
-| has_model | 934.44 ps | 1.0702 Gelem/s | 445.66 ps | 2.2438 Gelem/s |
-| has_tool | 747.85 ps | 1.3372 Gelem/s | 690.86 ps | 1.4475 Gelem/s |
-| has_gpu | 311.50 ps | 3.2103 Gelem/s | 199.80 ps | 5.0051 Gelem/s |
+| create | 19.025 us | 52.563 Kelem/s | 13.980 us | 71.529 Kelem/s |
+| serialize | 10.787 us | 92.703 Kelem/s | 33.480 us | 29.868 Kelem/s |
+| deserialize | 10.078 us | 99.225 Kelem/s | 8.0414 us | 124.36 Kelem/s |
+| roundtrip | 21.072 us | 47.456 Kelem/s | 19.062 us | 52.460 Kelem/s |
+| has_tag | 46.747 ns | 21.392 Melem/s | 67.864 ns | 14.735 Melem/s |
+| has_model | 37.260 ns | 26.839 Melem/s | 24.073 ns | 41.541 Melem/s |
+| has_tool | 63.146 ns | 15.836 Melem/s | 35.405 ns | 28.244 Melem/s |
+| has_gpu | 40.519 ns | 24.680 Melem/s | 40.587 ns | 24.639 Melem/s |
 
 ### Capability Announcement
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| create | 374.61 ns | 2.6695 Melem/s | 2.3375 us | 427.81 Kelem/s |
-| serialize | 1.2338 us | 810.48 Kelem/s | 1.7309 us | 577.72 Kelem/s |
-| deserialize | 2.0844 us | 479.75 Kelem/s | 2.7562 us | 362.82 Kelem/s |
-| is_expired | 25.249 ns | 39.605 Melem/s | 21.715 ns | 46.051 Melem/s |
+| create | 3.4149 us | 292.83 Kelem/s | 2.7479 us | 363.92 Kelem/s |
+| serialize | 11.132 us | 89.831 Kelem/s | 11.495 us | 86.993 Kelem/s |
+| deserialize | 10.354 us | 96.583 Kelem/s | 9.6005 us | 104.16 Kelem/s |
+| is_expired | 25.175 ns | 39.722 Melem/s | 21.176 ns | 47.224 Melem/s |
 
 ### Capability Serialization (Simple vs Complex)
 
 | Type | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| Simple | Serialize | 19.123 ns | 52.294 Melem/s | 37.537 ns | 26.640 Melem/s |
-| Simple | Deserialize | 4.7538 ns | 210.36 Melem/s | 8.8392 ns | 113.13 Melem/s |
-| Complex | Serialize | 40.989 ns | 24.397 Melem/s | 38.401 ns | 26.041 Melem/s |
-| Complex | Deserialize | 153.56 ns | 6.5121 Melem/s | 1.0230 us | 977.50 Kelem/s |
+| Simple | Serialize | 20.728 ns | 48.245 Melem/s | 37.083 ns | 26.967 Melem/s |
+| Simple | Deserialize | 5.5787 ns | 179.25 Melem/s | 14.790 ns | 67.615 Melem/s |
+| Complex | Serialize | 43.985 ns | 22.735 Melem/s | 39.098 ns | 25.577 Melem/s |
+| Complex | Deserialize | 378.30 ns | 2.6434 Melem/s | 238.23 ns | 4.1977 Melem/s |
 
 ### Capability Filter
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| single_tag | 9.9682 ns | 100.32 Melem/s | 3.4333 ns | 291.26 Melem/s |
-| require_gpu | 4.0489 ns | 246.98 Melem/s | 1.7827 ns | 560.96 Melem/s |
-| gpu_vendor | 3.7378 ns | 267.54 Melem/s | 1.9699 ns | 507.64 Melem/s |
-| min_memory | 3.7389 ns | 267.46 Melem/s | 1.7762 ns | 562.99 Melem/s |
-| complex | 10.279 ns | 97.282 Melem/s | 5.7069 ns | 175.23 Melem/s |
-| no_match | 3.1157 ns | 320.95 Melem/s | 1.7608 ns | 567.91 Melem/s |
+| single_tag | 57.136 ns | 17.502 Melem/s | 59.724 ns | 16.744 Melem/s |
+| require_gpu | 46.726 ns | 21.402 Melem/s | 42.801 ns | 23.364 Melem/s |
+| gpu_vendor | 152.37 ns | 6.5628 Melem/s | 127.19 ns | 7.8622 Melem/s |
+| min_memory | 31.373 ns | 31.874 Melem/s | 23.804 ns | 42.010 Melem/s |
+| complex | 4.7046 us | 212.56 Kelem/s | 3.9229 us | 254.91 Kelem/s |
+| no_match | 83.412 ns | 11.989 Melem/s | 76.976 ns | 12.991 Melem/s |
 
-### Capability Index (Insert)
-
-| Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
-|---|---|---|---|---|
-| 100 nodes | 111.54 us | 896.51 Kelem/s | 168.55 us | 593.28 Kelem/s |
-| 1,000 nodes | 1.1739 ms | 851.86 Kelem/s | 1.3966 ms | 716.05 Kelem/s |
-| 10,000 nodes | 17.241 ms | 580.00 Kelem/s | 15.626 ms | 639.96 Kelem/s |
-
-### Capability Index (Query, 10,000 nodes)
+### Capability Fold Index (Insert)
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| single_tag | 253.51 us | 3.9446 Kelem/s | 175.95 us | 5.6833 Kelem/s |
-| require_gpu | 325.43 us | 3.0728 Kelem/s | 180.63 us | 5.5362 Kelem/s |
-| gpu_vendor | 827.10 us | 1.2090 Kelem/s | 508.12 us | 1.9681 Kelem/s |
-| min_memory | 841.27 us | 1.1887 Kelem/s | 533.36 us | 1.8749 Kelem/s |
-| complex | 611.13 us | 1.6363 Kelem/s | 335.95 us | 2.9766 Kelem/s |
-| model | 99.107 us | 10.090 Kelem/s | 96.330 us | 10.381 Kelem/s |
-| tool | 771.71 us | 1.2958 Kelem/s | 494.54 us | 2.0221 Kelem/s |
-| no_results | 22.229 ns | 44.987 Melem/s | 28.914 ns | 34.585 Melem/s |
+| 100 nodes | 4.0300 ms | 24.814 Kelem/s | 3.1872 ms | 31.376 Kelem/s |
+| 1,000 nodes | 40.637 ms | 24.608 Kelem/s | 30.298 ms | 33.006 Kelem/s |
+| 10,000 nodes | 423.46 ms | 23.615 Kelem/s | 307.09 ms | 32.564 Kelem/s |
 
-### Capability Index (Find Best)
+### Capability Fold Index (Query, 10,000 nodes)
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| Simple | 313.38 us | 3.1910 Kelem/s | 209.77 us | 4.7670 Kelem/s |
-| With preferences | 653.69 us | 1.5298 Kelem/s | 431.18 us | 2.3192 Kelem/s |
+| single_tag | 109.69 us | 9.1163 Kelem/s | 91.039 us | 10.984 Kelem/s |
+| require_gpu | 299.35 us | 3.3406 Kelem/s | 232.41 us | 4.3028 Kelem/s |
+| gpu_vendor | 438.66 us | 2.2797 Kelem/s | 305.96 us | 3.2684 Kelem/s |
+| min_memory | 345.90 us | 2.8910 Kelem/s | 278.98 us | 3.5845 Kelem/s |
+| complex | 325.36 us | 3.0735 Kelem/s | 182.19 us | 5.4888 Kelem/s |
+| model | 71.391 us | 14.007 Kelem/s | 58.464 us | 17.105 Kelem/s |
+| tool | 270.06 us | 3.7028 Kelem/s | 231.50 us | 4.3196 Kelem/s |
+| no_results | 81.762 ns | 12.231 Melem/s | 86.584 ns | 11.549 Melem/s |
+
+### Capability Fold Index (Find Best)
+
+| Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
+|---|---|---|---|---|
+| Simple | 272.81 us | 3.6656 Kelem/s | 232.59 us | 4.2995 Kelem/s |
+| With preferences | 456.30 us | 2.1916 Kelem/s | 168.32 us | 5.9412 Kelem/s |
 
 ### Capability Search (1,000 nodes)
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| find_with_gpu | 17.250 us | 57.972 Kelem/s | 30.519 us | 32.766 Kelem/s |
-| find_by_tool (Python) | 31.243 us | 32.007 Kelem/s | 61.204 us | 16.339 Kelem/s |
-| find_by_tool (Rust) | 39.598 us | 25.254 Kelem/s | 76.874 us | 13.008 Kelem/s |
+| find_with_gpu | 27.648 us | 36.169 Kelem/s | 49.928 us | 20.029 Kelem/s |
+| find_by_tool (Python) | 59.701 us | 16.750 Kelem/s | 100.86 us | 9.9150 Kelem/s |
+| find_by_tool (Rust) | 78.087 us | 12.806 Kelem/s | 127.51 us | 7.8428 Kelem/s |
 
-### Capability Index Scaling
+### Capability Fold Scaling
 
 | Nodes | Query Type | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 1,000 | Tag | 12.534 us | 79.785 Kelem/s | 10.348 us | 96.634 Kelem/s |
-| 1,000 | Complex | 40.487 us | 24.699 Kelem/s | 27.562 us | 36.281 Kelem/s |
-| 5,000 | Tag | 70.269 us | 14.231 Kelem/s | 54.408 us | 18.380 Kelem/s |
-| 5,000 | Complex | 302.95 us | 3.3009 Kelem/s | 136.51 us | 7.3252 Kelem/s |
-| 10,000 | Tag | 154.98 us | 6.4525 Kelem/s | 171.99 us | 5.8142 Kelem/s |
-| 10,000 | Complex | 601.95 us | 1.6613 Kelem/s | 338.57 us | 2.9536 Kelem/s |
-| 50,000 | Tag | 2.5575 ms | 391.00 elem/s | 1.2324 ms | 811.41 elem/s |
-| 50,000 | Complex | 3.8061 ms | 262.73 elem/s | 2.1659 ms | 461.69 elem/s |
+| 1,000 | Tag (broad) | 9.4969 us | 52.649 Melem/s | 7.9688 us | 62.744 Melem/s |
+| 1,000 | Tag (selective) | 1.8962 us | 52.738 Melem/s | 1.5241 us | 65.614 Melem/s |
+| 1,000 | Complex | 18.414 us | 24.546 Melem/s | 16.940 us | 26.683 Melem/s |
+| 5,000 | Tag (broad) | 52.894 us | 47.265 Melem/s | 80.688 us | 30.984 Melem/s |
+| 5,000 | Tag (selective) | 1.8909 us | 52.884 Melem/s | 2.8429 us | 35.175 Melem/s |
+| 5,000 | Complex | 202.02 us | 11.202 Melem/s | 167.49 us | 13.511 Melem/s |
+| 10,000 | Tag (broad) | 108.44 us | 46.108 Melem/s | 171.89 us | 29.089 Melem/s |
+| 10,000 | Tag (selective) | 1.9007 us | 52.612 Melem/s | 2.8508 us | 35.078 Melem/s |
+| 10,000 | Complex | 367.38 us | 12.328 Melem/s | 342.91 us | 13.208 Melem/s |
+| 50,000 | Tag (broad) | 643.95 us | 38.823 Melem/s | 1.2093 ms | 20.672 Melem/s |
+| 50,000 | Tag (selective) | 1.9104 us | 52.345 Melem/s | 2.9360 us | 34.060 Melem/s |
+| 50,000 | Complex | 1.6939 ms | 13.374 Melem/s | 2.7328 ms | 8.2897 Melem/s |
+
+> A *selective* tag query stays flat (~2 us) regardless of mesh size, while a *broad* tag scans its match set — the property that lets one fold span millions of nodes.
+
 
 ### Concurrent Capability Index
 
 | Threads | Pool | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 4 | Insert | 393.20 us | 5.0865 Melem/s | 568.09 us | 3.5206 Melem/s |
-| 4 | Query | 387.20 ms | 5.1653 Kelem/s | 249.54 ms | 8.0147 Kelem/s |
-| 8 | Insert | 446.81 us | 8.9523 Melem/s | 1.1444 ms | 3.4954 Melem/s |
-| 8 | Query | 604.06 ms | 6.6218 Kelem/s | 301.72 ms | 13.257 Kelem/s |
-| 16 | Insert | 982.61 us | 8.1416 Melem/s | 1.3039 ms | 6.1353 Melem/s |
-| 16 | Query | 1.0196 s | 7.8460 Kelem/s | 436.90 ms | 18.311 Kelem/s |
+| 4 | Insert | 15.573 ms | 128.43 Kelem/s | 25.569 ms | 78.218 Kelem/s |
+| 4 | Query | 161.43 ms | 12.389 Kelem/s | 209.95 ms | 9.5263 Kelem/s |
+| 8 | Insert | 16.313 ms | 245.20 Kelem/s | 23.200 ms | 172.41 Kelem/s |
+| 8 | Query | 171.05 ms | 23.386 Kelem/s | 226.73 ms | 17.642 Kelem/s |
+| 16 | Insert | 34.600 ms | 231.21 Kelem/s | 49.383 ms | 162.00 Kelem/s |
+| 16 | Query | 272.98 ms | 29.306 Kelem/s | 515.41 ms | 15.522 Kelem/s |
 
 ## Running Benchmarks
 
@@ -532,16 +537,16 @@ RUSTFLAGS="-C target-cpu=native" cargo bench --features net --bench net
 To re-parse raw criterion output into structured markdown, use the helper script in `benchmarks/`:
 
 ```bash
-./benchmarks/parse_criterion.py BENCHMARK_RESULTS_M1_MAX.md /tmp/m1_max_parsed.md
+./benchmarks/parse_criterion.py BENCHMARK_RESULTS_M1_MAX_2.md /tmp/m1_max_parsed.md
 ```
 
 ## Key Insights
 
-1. **Header serialize/deserialize runs at ~760–910M ops/sec** (i9) / ~470–505M ops/sec (M1) — sub-2ns per operation; AAD generation cleared 900M ops/sec on i9.
-2. **Routing header forward at 5G ops/sec on i9** (~200 ps) — routing header serialize/roundtrip 1.07–2.18G ops/sec across both platforms.
-3. **Thread-local pool eliminates contention** — up to ~21x faster than shared pool at 32 threads (M1: 76.9M vs 3.61M ops/sec; i9: 110.4M vs 6.89M ops/sec).
-4. **Capability filters run at ~97–568M ops/sec** — fast enough for inline packet decisions.
-5. **Circuit breaker checks are ~10ns** — negligible overhead per packet.
-6. **Event frame write scales with payload** — ~1.7–3.3 GiB/s at 64B, ~49 GiB/s on M1 / ~75 GiB/s on i9 at 4KB.
-7. **Multi-hop forwarding adds ~30–60ns per hop** — linear scaling, no amplification.
-8. **CortEX ingestion got materially faster on M1**: `tasks.create` is now 113 ns (8.87M ops/sec, was 266 ns / 3.77M); `tasks_count_where` @ 10K is 6.7 µs (1.5G elem/sec, was 38.2 µs / 262M elem/sec). Snapshot encode @ 10K is ~4× faster on both platforms.
+1. **Header serialize/deserialize runs at ~620–830M ops/sec** (i9) / ~425–456M ops/sec (M1) — sub-2.5 ns per operation; AAD generation cleared ~940M ops/sec on i9.
+2. **Routing header forward at ~5G ops/sec on i9** (~200 ps) — routing header serialize/roundtrip 1.07–1.97G ops/sec across both platforms.
+3. **Thread-local pool eliminates contention** — ~18x faster than shared pool at 32 threads (M1: 70.4M vs 3.89M ops/sec; i9: 120.9M vs 6.45M ops/sec).
+4. **Encryption got faster** — the upgraded ChaCha20-Poly1305 path does 64B in ~301 ns on M1 / ~213 ns on i9, and 4KB at 1.32 GiB/s (M1) / 2.50 GiB/s (i9).
+5. **Circuit breaker checks are ~10 ns** — negligible overhead per packet.
+6. **Event frame write scales with payload** — ~1.7–2.8 GiB/s at 64B (single write), ~50 GiB/s on M1 / ~79 GiB/s on i9 at 4KB.
+7. **Multi-hop forwarding adds ~50 ns per hop** — linear scaling, no amplification.
+8. **Capability state is folded** — announcements collapse into a queryable index sized for large meshes; a selective tag query stays flat at ~2 us regardless of mesh size. Per-node fold insert is ~40 us (M1).
