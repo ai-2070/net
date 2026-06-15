@@ -1,0 +1,20 @@
+web/src/components/HeroSection.tsx
+  s_c51cba3057e0b6::t_a78fbee2486e8d 360
+  s_c51cba3057e0b6::t_e532b08126b289 362
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "0ab34b5609e93cb943bef93727b428c028aef1fe",
+  "prompts": {},
+  "sessions": {
+    "s_c51cba3057e0b6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1421e78f-3d60-42af-af36-4c4c8af8b180",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
