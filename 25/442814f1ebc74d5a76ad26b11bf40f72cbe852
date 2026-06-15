@@ -1,0 +1,24 @@
+README.md
+  s_c51cba3057e0b6::t_74d90c0790f0b0 643
+  s_c51cba3057e0b6::t_de191c53746614 576-580,582-589
+  s_c51cba3057e0b6::t_806854ae4cd900 630-637
+  s_c51cba3057e0b6::t_c63dd8a2d1ff99 510
+  s_c51cba3057e0b6::t_20b803af27bb88 639
+  s_c51cba3057e0b6::t_4d0dc1a3439c2d 647-659
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "25442814f1ebc74d5a76ad26b11bf40f72cbe852",
+  "prompts": {},
+  "sessions": {
+    "s_c51cba3057e0b6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1421e78f-3d60-42af-af36-4c4c8af8b180",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
