@@ -507,7 +507,7 @@ Specialists win their single operation. Net wins the full workflow.
 
 All numbers below measure **packet scheduling** — the time to process, route, encrypt, and queue a packet for transmission. They do not include NIC transfer, wire latency, or speed-of-light propagation. The software layer is what these benchmarks prove is no longer the bottleneck.
 
-**Test systems:** Apple M1 Max (macOS) and Intel i9-14900K @5GHz (Windows 11). Full results in [BENCHMARKS.md](net/crates/net/BENCHMARKS.md).
+**Test systems:** Apple M1 Max (macOS) and Intel i9-14900K @5GHz (Windows 11). Core-crate numbers captured 2026-06-12 (`cargo bench`); SDK ingestion 2026-06-15. Full raw results in [BENCHMARKS.md](net/crates/net/BENCHMARKS.md).
 
 ### Routing
 
@@ -573,17 +573,20 @@ All numbers below measure **packet scheduling** — the time to process, route, 
 
 | Operation | M1 Max | i9-14900K |
 |-----------|--------|-----------|
-| Filter (single tag) | 9.97 ns / **100M ops/sec** | 3.43 ns / **291M ops/sec** |
-| Filter (require GPU) | 4.05 ns / **247M ops/sec** | 1.78 ns / **561M ops/sec** |
-| GPU check | 0.31 ns / **3.21G ops/sec** | 0.20 ns / **5.01G ops/sec** |
-| Capability announcement | 374.61 ns / **2.67M ops/sec** | 2.34 us / **428K ops/sec** |
+| Announcement → fold (create) | 3.41 us / **293K ops/sec** | 2.75 us / **364K ops/sec** |
+| Fold insert (per node) | 40.3 us / **24.8K nodes/sec** | 31.9 us / **31.4K nodes/sec** |
+| `has_gpu` check (populated set) | 40.5 ns / **24.7M ops/sec** | 40.6 ns / **24.6M ops/sec** |
+| Filter match (single tag) | 57.1 ns / **17.5M ops/sec** | 59.7 ns / **16.7M ops/sec** |
+| Filter match (require GPU) | 46.7 ns / **21.4M ops/sec** | 42.8 ns / **23.4M ops/sec** |
 
-| Nodes | M1 Max (tag query) | i9-14900K (tag query) |
-|------:|-------------------:|----------------------:|
-| 1,000 | 12.53 us | 10.35 us |
-| 5,000 | 70.27 us | 54.41 us |
-| 10,000 | 154.98 us | 171.99 us |
-| 50,000 | 2.56 ms | 1.23 ms |
+Tag query against the folded index, by mesh size — a *broad* tag (many matches) scans the match set and grows with it; a *selective* tag stays flat regardless of mesh size, which is the property that lets one fold span millions of nodes:
+
+| Nodes | Broad tag (M1 / i9) | Selective tag (M1 / i9) |
+|------:|--------------------:|------------------------:|
+| 1,000 | 9.50 us / 7.97 us | 1.90 us / 1.52 us |
+| 5,000 | 52.9 us / 80.7 us | 1.89 us / 2.84 us |
+| 10,000 | 108 us / 172 us | 1.90 us / 2.85 us |
+| 50,000 | 644 us / 1.21 ms | 1.91 us / 2.94 us |
 
 ### Multi-threaded Scaling (thread-local pool)
 
@@ -624,37 +627,36 @@ Microbenchmarks of the local append-only log on its own, separate from CortEX. A
 
 | Operation | Latency | Throughput |
 |-----------|--------:|-----------:|
-| Append inline (≤8 B) | 47 ns | **21.3M ops/sec** |
-| Append heap (32 B) | 54 ns | **18.6M ops/sec** |
-| Append heap (256 B) | 97 ns | **10.3M ops/sec** |
-| Append heap (1 KB) | 240 ns | **4.17M ops/sec** |
-| Batch append (64 × 64 B) | 1.72 us | **37.2M elements/sec** |
-| Append disk (32 B, `redex-disk`) | 3.11 us | **321k ops/sec** |
-| Append disk (1 KB, `redex-disk`) | 6.42 us | **156k ops/sec** |
-| Tail latency (append → subscriber) | 138 ns | -- |
+| Append inline (≤8 B) | 35 ns | **28.3M ops/sec** |
+| Append heap (32 B) | 40 ns | **24.8M ops/sec** |
+| Append heap (256 B) | 72 ns | **13.8M ops/sec** |
+| Append heap (1 KB) | 179 ns | **5.58M ops/sec** |
+| Batch append (64 × 64 B) | 1.72 us | **37.3M elements/sec** |
+| Append disk (32 B, `redex-disk`) | 4.33 us | **231k ops/sec** |
+| Append disk (1 KB, `redex-disk`) | 5.33 us | **188k ops/sec** |
+| Tail latency (append → subscriber) | 163 ns | -- |
 
-Disk durability costs ~50x the memory-only append path and caps throughput around **hundreds of thousands of events/sec per file** — ample headroom for every workload where the event rate is bounded by the hardware generating it (sensors, instruments, telemetry) rather than by software replaying synthetic load.
+Disk durability costs ~100x the memory-only append path and caps throughput around **hundreds of thousands of events/sec per file** — ample headroom for every workload where the event rate is bounded by the hardware generating it (sensors, instruments, telemetry) rather than by software replaying synthetic load.
 
 ### CortEX + NetDB (end-to-end)
 
-The numbers that matter for real workloads — ingest, fold, query, snapshot — measured through the full `TasksAdapter` / `MemoriesAdapter` / `NetDb` stack with RedEX underneath. This is the slice a factory cell, substation, or Deck runs; the microbenchmarks above are how we know no single layer is load-bearing.
+The numbers that matter for real workloads — ingest, fold, query, snapshot — measured through the full `TasksAdapter` / `MemoriesAdapter` / `NetDb` stack with RedEX underneath. This is the slice a factory cell, substation, or Deck runs; the microbenchmarks above are how we know no single layer is load-bearing. The trustworthy figures here are the latencies; the `find_many` / `count_where` *element* throughputs are per-element nanosecond-scale and swing run-to-run, so read them as orders of magnitude, not precise numbers.
 
 | Operation | Latency | Throughput |
 |-----------|--------:|-----------:|
-| `tasks.create` ingest (no barrier) | 113 ns | **8.87M ops/sec** |
-| `memories.store` ingest | 218 ns | **4.58M ops/sec** |
-| Fold round-trip (`create` + `waitForSeq`) | 5.59 us | **179k ops/sec** |
-| `find_unique` (state lookup) | 8.98 ns | **111M ops/sec** |
-| `find_many` @ 1 K tasks (status filter) | 7.61 us | **131M elements/sec** |
-| `find_many` @ 10 K tasks | 125 us | **80.2M elements/sec** |
-| `count_where` @ 10 K tasks | 6.67 us | **1.50G elements/sec** |
-| `find_many` @ 1 K memories (tag filter) | 49.4 us | **20.3M elements/sec** |
-| Tasks snapshot encode @ 10 K | 83.2 us | -- |
-| Memories snapshot encode @ 10 K | 697 us | -- |
-| `NetDb::open` (both models) | 6.30 us | **159k ops/sec** |
-| Bundle encode @ 1 K (48 KB output) | 31.8 us | -- |
-| Bundle decode @ 1 K | 26.5 us | -- |
-| Bundle decode @ 10 K | 203 us | -- |
+| `tasks.create` ingest (no barrier) | 120 ns | **8.35M ops/sec** |
+| `memories.store` ingest | 309 ns | **3.24M ops/sec** |
+| Fold round-trip (`create` + `waitForSeq`) | 5.69 us | **176k ops/sec** |
+| `find_unique` (state lookup) | 9.08 ns | **110M ops/sec** |
+| `find_many` @ 1 K tasks (status filter) | 19.2 us | **52.1M elements/sec** |
+| `find_many` @ 10 K tasks | 226 us | **44.3M elements/sec** |
+| `count_where` @ 10 K tasks | 28.3 us | **353M elements/sec** |
+| `find_many` @ 1 K memories (tag filter) | 13.3 us | **75.5M elements/sec** |
+| Tasks snapshot encode @ 10 K | 315 us | -- |
+| Memories snapshot encode @ 10 K | 687 us | -- |
+| Bundle encode @ 1 K (48 KB output) | 22.7 us | -- |
+| Bundle decode @ 1 K | 26.8 us | -- |
+| Bundle decode @ 10 K | 279 us | -- |
 
 
 
