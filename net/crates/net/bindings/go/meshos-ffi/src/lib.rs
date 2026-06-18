@@ -413,6 +413,13 @@ pub unsafe extern "C" fn net_meshos_process_emit(
     if payload_ptr.is_null() && payload_len > 0 {
         return;
     }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`; an oversized
+    // (e.g. sign-extended `-1`) length from cgo would be immediate UB.
+    // This is a `void` emit callback, so drop the emit (fail-closed),
+    // matching the null-pointer guard above.
+    if payload_len > isize::MAX as usize {
+        return;
+    }
     let slice = if payload_len == 0 {
         &[][..]
     } else {
@@ -444,6 +451,12 @@ pub unsafe extern "C" fn net_meshos_snapshot_emit(
         return;
     }
     if payload_ptr.is_null() && payload_len > 0 {
+        return;
+    }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`; an oversized
+    // length from cgo would be immediate UB. Drop the emit (fail-closed),
+    // matching the null-pointer guard above.
+    if payload_len > isize::MAX as usize {
         return;
     }
     let slice = if payload_len == 0 {
