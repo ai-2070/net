@@ -111,16 +111,29 @@ impl FoldKind for RoutingFold {
             return MergeAction::Insert;
         };
 
-        // Same-publisher anti-reorder: reject stale generations
-        // before checking metric so a replay of an old (lower-
-        // metric) announcement from the same publisher doesn't
-        // resurrect a stale route.
-        if entry.node_id == incoming.node_id && incoming.generation <= entry.generation {
-            return MergeAction::Reject;
+        // Same-publisher path: this is the route OWNER re-announcing
+        // its own route. Generation is the anti-reorder mechanism.
+        if entry.node_id == incoming.node_id {
+            // Stale/replayed generation: reject before touching the
+            // metric so an old (possibly lower-metric) replay from
+            // the same publisher can't resurrect a stale route.
+            if incoming.generation <= entry.generation {
+                return MergeAction::Reject;
+            }
+            // Strictly-newer generation from the SAME publisher
+            // always wins, regardless of metric direction. The owner
+            // observed genuine link degradation (a worse metric) and
+            // its fresher observation must replace its own older one;
+            // otherwise the table keeps advertising the stale lower
+            // metric / old next-hop until TTL (~300s), delaying
+            // convergence on degradation (#27). Cross-publisher
+            // competition (below) still uses lowest-metric-wins.
+            return MergeAction::Replace;
         }
 
-        // Metric comparison: lower wins, equal accepts (refreshes
-        // `expires_at`). Strictly higher loses.
+        // Cross-publisher competition: lower metric wins, equal
+        // accepts (refreshes `expires_at` and lets a same-quality
+        // alternate keep the slot warm). Strictly higher loses.
         if incoming.payload.metric <= entry.payload.metric {
             MergeAction::Replace
         } else {
@@ -312,6 +325,60 @@ mod tests {
             .apply(sign_route(&kp, 0xAA, 2, 0x42, addr(7000), 1, 0xAA))
             .expect("better");
         assert_eq!(outcome, ApplyOutcome::Replaced);
+        assert_eq!(fold.query(RoutingQuery::Lookup(0x42))[0].1.metric, 1);
+    }
+
+    #[test]
+    fn same_publisher_higher_generation_worse_metric_replaces() {
+        // Regression for #27: the route OWNER re-announcing its
+        // OWN route at a strictly-higher generation must win even
+        // when the new metric is WORSE — it observed genuine link
+        // degradation and the table must converge on it, not keep
+        // advertising the stale lower metric until TTL (~300s).
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+
+        // Owner 0xAA installs a direct route at metric=1, gen=1.
+        fold.apply(sign_route(&kp, 0xAA, 1, 0x42, addr(7000), 1, 0xAA))
+            .expect("first");
+        // Same owner re-announces at gen=2 with a worse metric=4
+        // (link degraded) and a new next-hop.
+        let outcome = fold
+            .apply(sign_route(&kp, 0xAA, 2, 0x42, addr(8000), 4, 0xAA))
+            .expect("degraded re-announce");
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Replaced,
+            "owner's strictly-newer announcement must replace its own older one"
+        );
+
+        let q = fold.query(RoutingQuery::Lookup(0x42));
+        assert_eq!(q[0].1.metric, 4, "table converges on the degraded metric");
+        assert_eq!(q[0].1.next_hop, addr(8000), "and the owner's new next-hop");
+    }
+
+    #[test]
+    fn cross_publisher_worse_metric_still_loses() {
+        // Guard the OTHER half of #27's fix: the same-publisher
+        // exemption must NOT leak into cross-publisher
+        // competition. A DIFFERENT publisher announcing a worse
+        // metric at a higher generation still loses — cross-
+        // publisher routes compete strictly on lowest-metric-wins.
+        let fold = new_fold();
+        let kp_a = EntityKeypair::generate();
+        let kp_b = EntityKeypair::generate();
+
+        fold.apply(sign_route(&kp_a, 0xAA, 1, 0x42, addr(7000), 1, 0xAA))
+            .expect("owner A, metric=1");
+        // Publisher B, higher generation but worse metric=9.
+        let outcome = fold
+            .apply(sign_route(&kp_b, 0xBB, 99, 0x42, addr(8000), 9, 0xBB))
+            .expect("B worse metric");
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Rejected,
+            "cross-publisher worse metric must lose regardless of generation"
+        );
         assert_eq!(fold.query(RoutingQuery::Lookup(0x42))[0].1.metric, 1);
     }
 
