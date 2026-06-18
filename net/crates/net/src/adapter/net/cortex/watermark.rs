@@ -370,8 +370,11 @@ mod tests {
         // The watermark must stay put and the error must surface
         // verbatim — only the recoverable-Decode path changed in #6.
         let app_seq = Arc::new(AtomicU64::new(0));
-        let mut wf =
-            WatermarkingFold::new(MockFold::fail_on_nonrecoverable(0), app_seq.clone(), ORIGIN_US);
+        let mut wf = WatermarkingFold::new(
+            MockFold::fail_on_nonrecoverable(0),
+            app_seq.clone(),
+            ORIGIN_US,
+        );
         let mut state = Vec::new();
 
         let r = wf.apply(&ev_with_meta(0, ORIGIN_US, 42, b""), &mut state);

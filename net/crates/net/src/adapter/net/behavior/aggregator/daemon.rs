@@ -353,8 +353,7 @@ impl AggregatorDaemon {
             .into_iter()
             .filter(|summary| {
                 let prev = latest.iter().rev().find(|s| {
-                    s.fold_kind == summary.fold_kind
-                        && s.source_subnet == summary.source_subnet
+                    s.fold_kind == summary.fold_kind && s.source_subnet == summary.source_subnet
                 });
                 match prev {
                     None => true,

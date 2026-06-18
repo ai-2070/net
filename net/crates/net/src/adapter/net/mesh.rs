@@ -11188,25 +11188,23 @@ impl MeshNode {
             // `TxAdmit::Acquired` returns credit + sequence under the
             // same DashMap lookup — a close+reopen race can't slip a
             // stale sequence from the old lifetime onto the new state.
-            let (guard, seq) = match session.try_acquire_tx_credit_matching_epoch(
-                stream_id,
-                stream.epoch,
-                needed,
-            ) {
-                TxAdmit::Acquired { guard, seq } => (guard, seq),
-                TxAdmit::WindowFull => {
-                    if *committed_any {
-                        // Already committed earlier packets this call —
-                        // a return would trigger a whole-slice replay.
-                        // Wait for a receiver grant to free credit.
-                        tokio::time::sleep(delay).await;
-                        delay = (delay * 2).min(cap);
-                        continue;
+            let (guard, seq) =
+                match session.try_acquire_tx_credit_matching_epoch(stream_id, stream.epoch, needed)
+                {
+                    TxAdmit::Acquired { guard, seq } => (guard, seq),
+                    TxAdmit::WindowFull => {
+                        if *committed_any {
+                            // Already committed earlier packets this call —
+                            // a return would trigger a whole-slice replay.
+                            // Wait for a receiver grant to free credit.
+                            tokio::time::sleep(delay).await;
+                            delay = (delay * 2).min(cap);
+                            continue;
+                        }
+                        return Err(StreamError::Backpressure);
                     }
-                    return Err(StreamError::Backpressure);
-                }
-                TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
-            };
+                    TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
+                };
             let packet = builder.build(stream_id, seq, batch, flags);
             match self
                 .deliver_stream_packet(scheduled, &packet, peer_addr, stream_id)

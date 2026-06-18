@@ -2974,7 +2974,9 @@ mod tests {
 
         // Claim the probe via select() but DO NOT record completion —
         // this models a caller that drops the selection (route_event).
-        let probe = lb.select(&ctx).expect("first request after recovery is the probe");
+        let probe = lb
+            .select(&ctx)
+            .expect("first request after recovery is the probe");
         let ep = lb.endpoints.get(&probe.node_id).unwrap();
         assert!(
             ep.half_open_probe.load(Ordering::Acquire),

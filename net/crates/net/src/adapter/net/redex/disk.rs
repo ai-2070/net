@@ -3036,7 +3036,11 @@ mod tests {
         // left intact, so the checksum filter still accepts the record.
         {
             let mut idx_bytes = std::fs::read(&idx_path).unwrap();
-            assert_eq!(idx_bytes.len(), 4 * REDEX_ENTRY_SIZE, "four records on disk");
+            assert_eq!(
+                idx_bytes.len(),
+                4 * REDEX_ENTRY_SIZE,
+                "four records on disk"
+            );
             let rec2 = 2 * REDEX_ENTRY_SIZE;
             idx_bytes[rec2..rec2 + 8].copy_from_slice(&1u64.to_le_bytes());
             std::fs::write(&idx_path, &idx_bytes).unwrap();
@@ -4823,12 +4827,18 @@ mod tests {
 
         // Exact length → Some(all).
         write_ts(&[10, 20, 30]);
-        assert_eq!(read_timestamps(&ts_path, 3).unwrap(), Some(vec![10, 20, 30]));
+        assert_eq!(
+            read_timestamps(&ts_path, 3).unwrap(),
+            Some(vec![10, 20, 30])
+        );
 
         // Longer than the index (torn-tail recovery shrank idx) →
         // Some(first N).
         write_ts(&[10, 20, 30, 40, 50]);
-        assert_eq!(read_timestamps(&ts_path, 3).unwrap(), Some(vec![10, 20, 30]));
+        assert_eq!(
+            read_timestamps(&ts_path, 3).unwrap(),
+            Some(vec![10, 20, 30])
+        );
 
         // Zero expected entries → trivially Some(empty), never OOB.
         assert_eq!(read_timestamps(&ts_path, 0).unwrap(), Some(vec![]));

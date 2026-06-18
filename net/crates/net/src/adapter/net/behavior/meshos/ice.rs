@@ -2660,8 +2660,7 @@ mod tests {
         let refreeze_ms = issued_at_ms + 10_000; // still inside the 60s window
         let refreeze_blast = simulate(&MeshOsSnapshot::default(), &refreeze);
         let refreeze_hash = blast_radius_hash(&refreeze_blast);
-        let refreeze_sig =
-            OperatorSignature::sign(&kp, &refreeze, refreeze_ms, &refreeze_hash);
+        let refreeze_sig = OperatorSignature::sign(&kp, &refreeze, refreeze_ms, &refreeze_hash);
         let err = verifier
             .verify_commit(
                 &refreeze,

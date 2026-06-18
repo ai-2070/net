@@ -1569,10 +1569,7 @@ mod tests {
         assert_eq!(out.len(), 1, "expected a single error frame: {out:?}");
         match &out[0] {
             Err(MeshError::ExecutorError { detail, .. }) => {
-                assert!(
-                    detail.contains("before terminal frame"),
-                    "got: {detail}"
-                );
+                assert!(detail.contains("before terminal frame"), "got: {detail}");
             }
             other => panic!("expected premature-drop ExecutorError, got {other:?}"),
         }

@@ -783,8 +783,7 @@ pub extern "C" fn net_deck_snapshot_stream_next(
             }
         };
         clear_last_error_inner();
-        let (snap, timed_out) =
-            runtime().block_on(next_with_timeout(timeout_ms, inner.next()));
+        let (snap, timed_out) = runtime().block_on(next_with_timeout(timeout_ms, inner.next()));
         match snap {
             Some(Ok(snap)) => {
                 let json = match serde_json::to_string(&snap) {
@@ -892,8 +891,7 @@ pub extern "C" fn net_deck_status_summary_stream_next(
             }
         };
         clear_last_error_inner();
-        let (item, timed_out) =
-            runtime().block_on(next_with_timeout(timeout_ms, inner.next()));
+        let (item, timed_out) = runtime().block_on(next_with_timeout(timeout_ms, inner.next()));
         match item {
             Some(Ok(summary)) => {
                 unsafe {
@@ -1211,8 +1209,7 @@ pub extern "C" fn net_deck_log_stream_next(
             }
         };
         clear_last_error_inner();
-        let (item, timed_out) =
-            runtime().block_on(next_with_timeout(timeout_ms, inner.next()));
+        let (item, timed_out) = runtime().block_on(next_with_timeout(timeout_ms, inner.next()));
         match item {
             Some(Ok(record)) => {
                 unsafe {
@@ -1303,8 +1300,7 @@ pub extern "C" fn net_deck_failure_stream_next(
             }
         };
         clear_last_error_inner();
-        let (item, timed_out) =
-            runtime().block_on(next_with_timeout(timeout_ms, inner.next()));
+        let (item, timed_out) = runtime().block_on(next_with_timeout(timeout_ms, inner.next()));
         match item {
             Some(Ok(record)) => {
                 unsafe {
@@ -1652,8 +1648,7 @@ pub extern "C" fn net_deck_audit_stream_next(
             }
         };
         clear_last_error_inner();
-        let (item, timed_out) =
-            runtime().block_on(next_with_timeout(timeout_ms, inner.next()));
+        let (item, timed_out) = runtime().block_on(next_with_timeout(timeout_ms, inner.next()));
         match item {
             Some(Ok(r)) => {
                 let json = match serde_json::to_string(&r) {
@@ -3299,7 +3294,10 @@ mod tests {
         let (item, timed_out) =
             runtime().block_on(next_with_timeout(10, futures::StreamExt::next(&mut never)));
         assert!(item.is_none());
-        assert!(timed_out, "pending stream past the deadline must be a timeout");
+        assert!(
+            timed_out,
+            "pending stream past the deadline must be a timeout"
+        );
 
         // An available item is returned with `timed_out == false`.
         let mut ready = futures::stream::iter(vec![7u32]);
