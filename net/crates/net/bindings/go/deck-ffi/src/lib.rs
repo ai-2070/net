@@ -89,6 +89,31 @@ pub const NET_DECK_ERR_INVALID_ARG: c_int = -3;
 pub const NET_DECK_ERR_ALREADY_SHUTDOWN: c_int = -4;
 pub const NET_DECK_ERR_END_OF_STREAM: c_int = -5;
 
+/// Poll one item from a stream's `.next()` future under an optional
+/// timeout, returning `(item, timed_out)`.
+///
+/// This is the single decision point that keeps a genuine stream-end
+/// (`Ok(None)` → `(None, false)`) distinguishable from an elapsed
+/// timeout (`Err(Elapsed)` → `(None, true)`). The previous
+/// `unwrap_or_default()` collapsed both into `None`, so every `_next`
+/// fn reported a closed stream as a timeout (`NET_DECK_OK`, NULL out)
+/// for any non-zero `timeout_ms`, making `NET_DECK_ERR_END_OF_STREAM`
+/// reachable only with `timeout_ms == 0`. Callers must map
+/// `(None, true) → OK/timeout` and `(None, false) → END_OF_STREAM`.
+async fn next_with_timeout<F, T>(timeout_ms: u64, fut: F) -> (Option<T>, bool)
+where
+    F: std::future::Future<Output = Option<T>>,
+{
+    if timeout_ms == 0 {
+        (fut.await, false)
+    } else {
+        match tokio::time::timeout(Duration::from_millis(timeout_ms), fut).await {
+            Ok(item) => (item, false),
+            Err(_elapsed) => (None, true),
+        }
+    }
+}
+
 // =========================================================================
 // Status summary wire form
 // =========================================================================
@@ -758,15 +783,8 @@ pub extern "C" fn net_deck_snapshot_stream_next(
             }
         };
         clear_last_error_inner();
-        let snap = runtime().block_on(async {
-            if timeout_ms == 0 {
-                inner.next().await
-            } else {
-                tokio::time::timeout(Duration::from_millis(timeout_ms), inner.next())
-                    .await
-                    .unwrap_or_default()
-            }
-        });
+        let (snap, timed_out) =
+            runtime().block_on(next_with_timeout(timeout_ms, inner.next()));
         match snap {
             Some(Ok(snap)) => {
                 let json = match serde_json::to_string(&snap) {
@@ -790,15 +808,15 @@ pub extern "C" fn net_deck_snapshot_stream_next(
                 set_last_error_from_sdk(&e);
                 NET_DECK_ERR_CALL_FAILED
             }
-            None if timeout_ms == 0 => {
-                // Stream ended naturally (substrate runtime shut down).
-                unsafe { *out = ptr::null_mut() };
-                NET_DECK_ERR_END_OF_STREAM
-            }
-            None => {
+            None if timed_out => {
                 // Timeout elapsed without an item.
                 unsafe { *out = ptr::null_mut() };
                 NET_DECK_OK
+            }
+            None => {
+                // Stream ended naturally (substrate runtime shut down).
+                unsafe { *out = ptr::null_mut() };
+                NET_DECK_ERR_END_OF_STREAM
             }
         }
     })
@@ -874,15 +892,8 @@ pub extern "C" fn net_deck_status_summary_stream_next(
             }
         };
         clear_last_error_inner();
-        let item = runtime().block_on(async {
-            if timeout_ms == 0 {
-                inner.next().await
-            } else {
-                tokio::time::timeout(Duration::from_millis(timeout_ms), inner.next())
-                    .await
-                    .unwrap_or_default()
-            }
-        });
+        let (item, timed_out) =
+            runtime().block_on(next_with_timeout(timeout_ms, inner.next()));
         match item {
             Some(Ok(summary)) => {
                 unsafe {
@@ -895,13 +906,13 @@ pub extern "C" fn net_deck_status_summary_stream_next(
                 set_last_error_from_sdk(&e);
                 NET_DECK_ERR_CALL_FAILED
             }
-            None if timeout_ms == 0 => {
+            None if timed_out => {
                 unsafe { *has_item_out = 0 };
-                NET_DECK_ERR_END_OF_STREAM
+                NET_DECK_OK
             }
             None => {
                 unsafe { *has_item_out = 0 };
-                NET_DECK_OK
+                NET_DECK_ERR_END_OF_STREAM
             }
         }
     })
@@ -1200,15 +1211,8 @@ pub extern "C" fn net_deck_log_stream_next(
             }
         };
         clear_last_error_inner();
-        let item = runtime().block_on(async {
-            if timeout_ms == 0 {
-                inner.next().await
-            } else {
-                tokio::time::timeout(Duration::from_millis(timeout_ms), inner.next())
-                    .await
-                    .unwrap_or_default()
-            }
-        });
+        let (item, timed_out) =
+            runtime().block_on(next_with_timeout(timeout_ms, inner.next()));
         match item {
             Some(Ok(record)) => {
                 unsafe {
@@ -1221,13 +1225,13 @@ pub extern "C" fn net_deck_log_stream_next(
                 set_last_error_from_sdk(&e);
                 NET_DECK_ERR_CALL_FAILED
             }
-            None if timeout_ms == 0 => {
+            None if timed_out => {
                 unsafe { *has_item_out = 0 };
-                NET_DECK_ERR_END_OF_STREAM
+                NET_DECK_OK
             }
             None => {
                 unsafe { *has_item_out = 0 };
-                NET_DECK_OK
+                NET_DECK_ERR_END_OF_STREAM
             }
         }
     })
@@ -1299,15 +1303,8 @@ pub extern "C" fn net_deck_failure_stream_next(
             }
         };
         clear_last_error_inner();
-        let item = runtime().block_on(async {
-            if timeout_ms == 0 {
-                inner.next().await
-            } else {
-                tokio::time::timeout(Duration::from_millis(timeout_ms), inner.next())
-                    .await
-                    .unwrap_or_default()
-            }
-        });
+        let (item, timed_out) =
+            runtime().block_on(next_with_timeout(timeout_ms, inner.next()));
         match item {
             Some(Ok(record)) => {
                 unsafe {
@@ -1320,13 +1317,13 @@ pub extern "C" fn net_deck_failure_stream_next(
                 set_last_error_from_sdk(&e);
                 NET_DECK_ERR_CALL_FAILED
             }
-            None if timeout_ms == 0 => {
+            None if timed_out => {
                 unsafe { *has_item_out = 0 };
-                NET_DECK_ERR_END_OF_STREAM
+                NET_DECK_OK
             }
             None => {
                 unsafe { *has_item_out = 0 };
-                NET_DECK_OK
+                NET_DECK_ERR_END_OF_STREAM
             }
         }
     })
@@ -1655,15 +1652,8 @@ pub extern "C" fn net_deck_audit_stream_next(
             }
         };
         clear_last_error_inner();
-        let item = runtime().block_on(async {
-            if timeout_ms == 0 {
-                inner.next().await
-            } else {
-                tokio::time::timeout(Duration::from_millis(timeout_ms), inner.next())
-                    .await
-                    .unwrap_or_default()
-            }
-        });
+        let (item, timed_out) =
+            runtime().block_on(next_with_timeout(timeout_ms, inner.next()));
         match item {
             Some(Ok(r)) => {
                 let json = match serde_json::to_string(&r) {
@@ -1687,13 +1677,13 @@ pub extern "C" fn net_deck_audit_stream_next(
                 set_last_error_from_sdk(&e);
                 NET_DECK_ERR_CALL_FAILED
             }
-            None if timeout_ms == 0 => {
+            None if timed_out => {
                 unsafe { *out = ptr::null_mut() };
-                NET_DECK_ERR_END_OF_STREAM
+                NET_DECK_OK
             }
             None => {
                 unsafe { *out = ptr::null_mut() };
-                NET_DECK_OK
+                NET_DECK_ERR_END_OF_STREAM
             }
         }
     })
@@ -2548,6 +2538,12 @@ pub extern "C" fn net_deck_operator_identity_sign_payload(
                 "payload_ptr is NULL but payload_len > 0",
             );
             return NET_DECK_ERR_INVALID_ARG;
+        } else if payload_len > isize::MAX as usize {
+            // `slice::from_raw_parts` requires `len <= isize::MAX`; a
+            // sign-extended `-1` (or any oversized length) from cgo would
+            // be immediate UB. Reject explicitly, matching core `ffi/mod.rs`.
+            set_last_error("invalid_argument", "payload_len exceeds isize::MAX");
+            return NET_DECK_ERR_INVALID_ARG;
         } else {
             unsafe { std::slice::from_raw_parts(payload_ptr, payload_len) }
         };
@@ -3281,6 +3277,71 @@ mod tests {
         net_deck_audit_stream_free(stream);
         net_deck_audit_query_free(q);
         net_deck_client_free(client);
+    }
+
+    // Finding #3: the EOF-vs-timeout decision. `next_with_timeout` is the
+    // single source of truth all `_next` fns share; the `_next` match arms
+    // map `(None, true) → OK/timeout` and `(None, false) → END_OF_STREAM`.
+    #[test]
+    fn next_with_timeout_distinguishes_eof_from_timeout() {
+        // A genuinely-ended stream yields `Ok(None)` → (None, timed_out=false)
+        // → the END_OF_STREAM arm. With the old `unwrap_or_default()` this was
+        // indistinguishable from a timeout for any non-zero `timeout_ms`.
+        let mut ended = futures::stream::empty::<u32>();
+        let (item, timed_out) =
+            runtime().block_on(next_with_timeout(100, futures::StreamExt::next(&mut ended)));
+        assert!(item.is_none());
+        assert!(!timed_out, "ended stream must NOT be flagged as a timeout");
+
+        // A stream that never yields, with a short timeout, elapses →
+        // (None, timed_out=true) → the OK/timeout arm.
+        let mut never = futures::stream::pending::<u32>();
+        let (item, timed_out) =
+            runtime().block_on(next_with_timeout(10, futures::StreamExt::next(&mut never)));
+        assert!(item.is_none());
+        assert!(timed_out, "pending stream past the deadline must be a timeout");
+
+        // An available item is returned with `timed_out == false`.
+        let mut ready = futures::stream::iter(vec![7u32]);
+        let (item, timed_out) =
+            runtime().block_on(next_with_timeout(100, futures::StreamExt::next(&mut ready)));
+        assert_eq!(item, Some(7));
+        assert!(!timed_out);
+
+        // `timeout_ms == 0` (unbounded) never flags a timeout; an ended
+        // stream still reports EOF.
+        let mut ended0 = futures::stream::empty::<u32>();
+        let (item, timed_out) =
+            runtime().block_on(next_with_timeout(0, futures::StreamExt::next(&mut ended0)));
+        assert!(item.is_none());
+        assert!(!timed_out);
+    }
+
+    // Finding #31: `slice::from_raw_parts` requires `len <= isize::MAX`; an
+    // oversized `payload_len` from cgo must be rejected before the deref
+    // rather than triggering UB.
+    #[test]
+    fn sign_payload_rejects_oversized_len() {
+        let identity = net_deck_operator_identity_generate();
+        assert!(!identity.is_null());
+
+        // A non-null pointer with `len > isize::MAX` must be rejected with
+        // INVALID_ARG and must NOT dereference the pointer.
+        let dangling: u8 = 0;
+        let mut op_id: u64 = 0;
+        let mut sig = [0u8; 64];
+        let status = net_deck_operator_identity_sign_payload(
+            identity,
+            &dangling as *const u8,
+            (isize::MAX as usize) + 1,
+            &mut op_id,
+            sig.as_mut_ptr(),
+        );
+        assert_eq!(status, NET_DECK_ERR_INVALID_ARG);
+        let kind = unsafe { CStr::from_ptr(net_deck_last_error_kind()).to_string_lossy() };
+        assert_eq!(kind, "invalid_argument");
+        net_deck_clear_last_error();
+        net_deck_operator_identity_free(identity);
     }
 
     // =========================================================================
