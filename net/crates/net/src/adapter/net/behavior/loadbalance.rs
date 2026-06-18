@@ -830,19 +830,12 @@ impl LoadBalancer {
         self.endpoints
             .insert(node_id, Arc::new(EndpointState::new(endpoint)));
 
-        // Drop this node's existing vnodes before re-inserting. On a
-        // re-add (reconnect / weight change) the prior ~150 vnodes are
-        // still in the ring; `add_to_hash_ring` allocates a fresh
-        // ~150, and the collision probe relocates any vnode that hashes
-        // onto an old slot for this same node to a new key — stranding
-        // the old vnode permanently. Each re-add would otherwise leak
-        // ~150 entries, inflating ring size and skewing distribution
-        // toward the re-added node. Clearing first makes re-add
-        // idempotent (and keeps the ring consistent with the
-        // non-destructive collision probe in `add_to_hash_ring`).
-        self.remove_from_hash_ring(&node_id);
-
-        // Add to hash ring for consistent hashing
+        // Add (or idempotently re-add) this node's vnodes. `add_to_hash_ring`
+        // overwrites the node's own prior vnodes in place and sweeps any
+        // stale leftovers, so a re-add (reconnect / weight change) neither
+        // leaks vnodes nor leaves a transient window where the node is
+        // absent from the ring (which would misroute traffic for an
+        // endpoint that was meant to stay available).
         self.add_to_hash_ring(node_id);
         self.rebuild_endpoint_list();
     }
@@ -1169,15 +1162,25 @@ impl LoadBalancer {
         // `total_weight == 1.0` (e.g. two endpoints each at effective
         // weight 0.5, both `Degraded`) to `1`, so `counter % 1 == 0`
         // always and the cumulative loop (`0.5 > 0`) selected the first
-        // endpoint forever — the second starved. We floor the wheel at
-        // `WRR_MIN_WHEEL` so even a fractional total has enough distinct
-        // positions to resolve each endpoint's share. For an integer
-        // total already ≥ the floor (the common case — weights of 100+),
-        // `wheel == total_ceil` and the rotation length / distribution
-        // are byte-for-byte identical to the integer-weight behavior.
-        const WRR_MIN_WHEEL: u64 = 64;
-        let total_ceil = total_weight.ceil() as u64;
-        let wheel = total_ceil.max(WRR_MIN_WHEEL);
+        // endpoint forever — the second starved.
+        //
+        // Derive the wheel from the weights themselves rather than an
+        // arbitrary floor: `ceil(total / smallest positive weight)`
+        // gives every endpoint at least one wheel position and yields
+        // EXACT ratios for commensurate weights. Integer weights keep
+        // their natural cycle (1,1,1 → wheel 3; 100,50 → wheel 3, i.e.
+        // 2:1) — byte-for-byte the old integer behavior, NOT reshaped by
+        // a fixed constant — while fractional/sub-unit shares resolve
+        // (0.5,0.5 → 2; 1.0,0.5 → 3). The modulus is taken in integer
+        // space (`counter % wheel`) BEFORE the f64 cast, preserving the
+        // precision fix (`counter as f64 % total` lost the low bits of
+        // `counter` past the 2^53 mantissa boundary, stalling rotation).
+        let min_weight = endpoints
+            .iter()
+            .map(|e| e.effective_weight())
+            .filter(|w| *w > 0.0)
+            .fold(f64::INFINITY, f64::min);
+        let wheel = ((total_weight / min_weight).ceil() as u64).max(1);
         // Map the integer wheel position into the real weight domain.
         let target = (counter % wheel) as f64 / wheel as f64 * total_weight;
 
@@ -1442,35 +1445,46 @@ impl LoadBalancer {
     }
 
     fn add_to_hash_ring(&self, node_id: NodeId) {
+        // Slots this node ends up occupying in THIS call — used both to
+        // keep the node's own intra-call collisions distinct and to
+        // sweep any stale vnodes left by a prior add (drift cleanup).
+        let mut placed: std::collections::HashSet<u64> =
+            std::collections::HashSet::with_capacity(self.virtual_nodes as usize);
         for i in 0..self.virtual_nodes {
             let key = format!("{:?}-{}", node_id, i);
             let mut hash = self.hash_key(&key);
-            // Linear-probe past collisions. FNV-1a + ~150 vnodes
-            // per node × ~1k nodes is well below the u64
-            // birthday-bound, but a collision is unobservable
-            // pre-fix: `insert(hash, node_id)` last-write-wins
-            // silently lost an earlier vnode and skewed the ring
-            // distribution toward the late writer. Probe by 1
-            // until we find an empty slot so every vnode is
-            // distinct, then we're guaranteed even with
-            // adversarial node-id choice (the probe terminates
-            // because the ring has at most virtual_nodes * nodes
-            // entries, far below u64::MAX).
-            //
-            // The probe must be NON-DESTRUCTIVE: `DashMap::insert`
-            // overwrites the slot and returns the old value, so the
-            // pre-fix `while insert(..).is_some()` clobbered another
-            // node's vnode on a true collision — the occupant lost
-            // its slot AND `node_id` ended up occupying both `H` and
-            // `H+1`, the exact ring skew the probe is meant to
-            // prevent. Test the slot with `contains_key` first and
-            // only `insert` once we've found a free one, so the
-            // existing occupant is preserved.
-            while self.hash_ring.contains_key(&hash) {
-                hash = hash.wrapping_add(1);
+            // Linear-probe past collisions, NON-DESTRUCTIVELY (a plain
+            // `insert` would clobber another node's vnode and skew the
+            // ring). The probe stops when the slot is:
+            //   * free, OR
+            //   * already held by THIS node from a *prior* add (not one
+            //     we placed this call) — overwrite it in place.
+            // The in-place overwrite is what makes a re-add (reconnect /
+            // weight change) idempotent WITHOUT first removing the
+            // node's vnodes: clearing first (the previous fix) left a
+            // transient window where the node had no ring presence and
+            // traffic could misroute. A slot held by a DIFFERENT node,
+            // or by one of this node's vnodes we ALREADY placed this
+            // call (an intra-node hash collision), is a true collision —
+            // probe on so every vnode stays distinct.
+            loop {
+                match self.hash_ring.get(&hash).map(|r| *r) {
+                    None => break,
+                    Some(occupant) if occupant == node_id && !placed.contains(&hash) => break,
+                    Some(_) => hash = hash.wrapping_add(1),
+                }
             }
             self.hash_ring.insert(hash, node_id);
+            placed.insert(hash);
         }
+        // Sweep any vnodes still tagged with this node that we did NOT
+        // (re)place this call — stale entries from an earlier add whose
+        // probe path changed (e.g. a collision partner was since
+        // removed). The node's freshly-placed vnodes are all in `placed`
+        // and inserted above, so it is never absent from the ring; this
+        // only drops leftovers. Common case: nothing to remove.
+        self.hash_ring
+            .retain(|k, v| *v != node_id || placed.contains(k));
     }
 
     fn remove_from_hash_ring(&self, node_id: &NodeId) {
@@ -3121,6 +3135,30 @@ mod tests {
             first > 0 && second > 0 && first.abs_diff(second) < 200 / 2,
             "two equal sub-unit weights should split roughly evenly \
              (got {first} vs {second})",
+        );
+    }
+
+    /// Review follow-up to #33: deriving the wheel from the weights
+    /// (`ceil(total / min_weight)`) keeps EXACT integer ratios for small
+    /// clusters — the wheel is the natural 3-cycle for a 2:1 split,
+    /// yielding A,A,B. The replaced `WRR_MIN_WHEEL = 64` floor turned
+    /// this into a 64-position approximation, reshaping the rotation for
+    /// any cluster whose total weight was below the floor.
+    #[test]
+    fn cr33_weighted_rr_preserves_exact_integer_ratios() {
+        let lb = LoadBalancer::with_strategy(Strategy::WeightedRoundRobin);
+        let endpoints = vec![
+            Arc::new(EndpointState::new(Endpoint::new(make_node_id(1)).with_weight(2))),
+            Arc::new(EndpointState::new(Endpoint::new(make_node_id(2)).with_weight(1))),
+        ];
+        // Two full turns of the natural 3-position wheel.
+        let picks: Vec<u8> = (0..6)
+            .map(|c| lb.select_weighted_round_robin_at(&endpoints, c).node_id[0])
+            .collect();
+        assert_eq!(
+            picks,
+            vec![1, 1, 2, 1, 1, 2],
+            "2:1 integer weights must cycle A,A,B exactly (got {picks:?})"
         );
     }
 }
