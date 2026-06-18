@@ -666,9 +666,17 @@ struct IceCooldownState {
 /// `per_node` map.
 fn cooldown_targets(proposal: &IceActionProposal) -> CooldownTargets {
     match proposal {
-        IceActionProposal::FreezeCluster { .. } | IceActionProposal::ThawCluster => {
-            CooldownTargets::ClusterWide
-        }
+        // `ThawCluster` is the documented break-glass commit:
+        // operators must be able to thaw the cluster mid-freeze
+        // (see `event_loop.rs` — "operators must be able to thaw
+        // the cluster mid-freeze"). The freeze gate already
+        // honors that, but the cluster-wide cooldown armed by a
+        // preceding `FreezeCluster` would otherwise reject a thaw
+        // landing inside the window. Exempt `ThawCluster` from the
+        // cooldown entirely so it neither checks nor arms a
+        // cooldown bucket.
+        IceActionProposal::ThawCluster => CooldownTargets::Exempt,
+        IceActionProposal::FreezeCluster { .. } => CooldownTargets::ClusterWide,
         IceActionProposal::FlushAvoidLists { scope } => match scope {
             AvoidScope::Local { node } => CooldownTargets::PerNode(vec![*node]),
             AvoidScope::OnPeer { peer } => CooldownTargets::PerNode(vec![*peer]),
@@ -691,6 +699,11 @@ fn cooldown_targets(proposal: &IceActionProposal) -> CooldownTargets {
 enum CooldownTargets {
     ClusterWide,
     PerNode(Vec<NodeId>),
+    /// The proposal is exempt from ICE cooldown — it neither
+    /// checks any cooldown bucket nor arms one on success. Used
+    /// for break-glass commits (`ThawCluster`) that must always
+    /// be admissible mid-freeze.
+    Exempt,
 }
 
 /// Default cap on the per-node admin audit ring. Records older
@@ -951,6 +964,8 @@ impl AdminVerifier {
                     }
                 }
             }
+            // Break-glass commits never block on a cooldown.
+            CooldownTargets::Exempt => {}
         }
         Ok(())
     }
@@ -967,6 +982,8 @@ impl AdminVerifier {
                     state.per_node.insert(*node, expires_at_ms);
                 }
             }
+            // Break-glass commits arm no cooldown of their own.
+            CooldownTargets::Exempt => {}
         }
         // Prune entries that have already expired so the map
         // doesn't grow unbounded with stale nodes the operator
@@ -2592,11 +2609,15 @@ mod tests {
     }
 
     #[test]
-    fn ice_cooldown_freeze_cluster_blocks_subsequent_cluster_wide_commits() {
-        // Cluster-wide cooldown: FreezeCluster blocks the next
-        // ThawCluster inside the window. Subsequent per-node
-        // ICE commits are unaffected because they hit a
-        // different cooldown bucket.
+    fn ice_cooldown_freeze_cluster_allows_thaw_mid_cooldown_but_blocks_refreeze() {
+        // Break-glass invariant (#24): a `FreezeCluster` arms the
+        // cluster-wide cooldown, but `ThawCluster` is exempt — an
+        // operator must be able to thaw the cluster mid-freeze
+        // even inside the cooldown window. A subsequent
+        // *FreezeCluster* (a non-break-glass cluster-wide action)
+        // is still blocked by the live cooldown, so the
+        // anti-thrash protection for ordinary cluster-wide
+        // commits is preserved.
         let kp = EntityKeypair::generate();
         let mut registry = OperatorRegistry::new();
         registry.register(&kp);
@@ -2618,13 +2639,37 @@ mod tests {
             .verify_commit(&freeze, &[sig], issued_at_ms, &hash, issued_at_ms)
             .expect("first freeze should succeed");
 
+        // ThawCluster inside the cooldown window must be ALLOWED
+        // (break-glass), not rejected.
         let thaw = IceActionProposal::ThawCluster;
-        let later_ms = issued_at_ms + 5_000; // 5s later
+        let later_ms = issued_at_ms + 5_000; // 5s later, well inside the 60s cooldown
         let thaw_blast = simulate(&MeshOsSnapshot::default(), &thaw);
         let thaw_hash = blast_radius_hash(&thaw_blast);
         let thaw_sig = OperatorSignature::sign(&kp, &thaw, later_ms, &thaw_hash);
-        let err = verifier
+        verifier
             .verify_commit(&thaw, &[thaw_sig], later_ms, &thaw_hash, later_ms)
+            .expect("ThawCluster must be allowed mid-cooldown (break-glass)");
+
+        // A non-break-glass cluster-wide action (another freeze)
+        // inside the window is still blocked: the thaw above does
+        // not arm a cooldown of its own, but the original freeze's
+        // cooldown is still live.
+        let refreeze = IceActionProposal::FreezeCluster {
+            ttl: Duration::from_secs(120),
+        };
+        let refreeze_ms = issued_at_ms + 10_000; // still inside the 60s window
+        let refreeze_blast = simulate(&MeshOsSnapshot::default(), &refreeze);
+        let refreeze_hash = blast_radius_hash(&refreeze_blast);
+        let refreeze_sig =
+            OperatorSignature::sign(&kp, &refreeze, refreeze_ms, &refreeze_hash);
+        let err = verifier
+            .verify_commit(
+                &refreeze,
+                &[refreeze_sig],
+                refreeze_ms,
+                &refreeze_hash,
+                refreeze_ms,
+            )
             .unwrap_err();
         assert_eq!(err.kind(), "ice_cooldown_active");
         if let VerifyError::IceCooldownActive { node, .. } = err {
