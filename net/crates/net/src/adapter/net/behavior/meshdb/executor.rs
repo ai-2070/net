@@ -468,25 +468,25 @@ fn hash_join_one_sided(
     emit_unmatched_build: bool,
     swap: bool,
 ) -> Result<Vec<ResultRow>, MeshError> {
-    // Build-side rows with no extractable key are dropped by
-    // `build_hash_join_table` (they can never *match* a probe —
-    // a NULL/non-scalar join key matches nothing). For OUTER
-    // joins the build side is the *preserved* side, so such rows
-    // must still appear unmatched (right=None / left=None),
-    // mirroring `hash_join_full_outer`'s no-key handling.
-    // Partition them out here before building the probe table so
-    // the matched/keyed path is unchanged.
-    let (keyed_build_rows, no_key_build_rows): (Vec<ResultRow>, Vec<ResultRow>) =
-        if emit_unmatched_build {
-            build_rows
-                .into_iter()
-                .partition(|r| try_encode_join_key(r, key_mode).is_some())
-        } else {
-            // Inner join: no-key build rows match nothing and are
-            // never emitted, so the table-build drop is correct.
-            (build_rows, Vec::new())
-        };
-    let mut build = build_hash_join_table(keyed_build_rows, key_mode, "broadcast-hash")?;
+    // Extract each build row's join key exactly ONCE. Keyed rows go
+    // into the probe table; for OUTER joins (build = the *preserved*
+    // side) a row with no extractable key (NULL/non-scalar — matches
+    // nothing) is routed aside so it can still be emitted unmatched
+    // (right=None / left=None), mirroring `hash_join_full_outer`. For
+    // INNER joins such rows can never match and are dropped here.
+    // (Pre-fix this partitioned by calling `try_encode_join_key` and
+    // then `build_hash_join_table` re-extracted the same key — double
+    // key extraction / JSON parsing on every build row.)
+    let mut keyed_build: Vec<(Vec<u8>, ResultRow)> = Vec::with_capacity(build_rows.len());
+    let mut no_key_build_rows: Vec<ResultRow> = Vec::new();
+    for row in build_rows {
+        match try_encode_join_key(&row, key_mode) {
+            Some(key) => keyed_build.push((key, row)),
+            None if emit_unmatched_build => no_key_build_rows.push(row),
+            None => {}
+        }
+    }
+    let mut build = build_hash_join_table_from_keyed(keyed_build, "broadcast-hash")?;
 
     let mut out = Vec::new();
     for p in probe_rows {
@@ -1015,12 +1015,25 @@ pub(crate) fn build_hash_join_table(
     key_mode: &JoinKeyMode,
     strategy_label: &str,
 ) -> Result<HashJoinTable, MeshError> {
+    let keyed: Vec<(Vec<u8>, ResultRow)> = rows
+        .into_iter()
+        .filter_map(|row| try_encode_join_key(&row, key_mode).map(|k| (k, row)))
+        .collect();
+    build_hash_join_table_from_keyed(keyed, strategy_label)
+}
+
+/// Build the probe table from rows whose join key has ALREADY been
+/// extracted, applying the same `HASH_JOIN_MEMORY_BYTES` bound as
+/// [`build_hash_join_table`]. Callers that must inspect each row's key
+/// first (outer joins routing out no-key preserved rows) use this to
+/// avoid extracting the key twice.
+fn build_hash_join_table_from_keyed(
+    keyed: Vec<(Vec<u8>, ResultRow)>,
+    strategy_label: &str,
+) -> Result<HashJoinTable, MeshError> {
     let mut build_bytes: u64 = 0;
     let mut table: HashJoinTable = HashJoinTable::new();
-    for row in rows {
-        let Some(key) = try_encode_join_key(&row, key_mode) else {
-            continue;
-        };
+    for (key, row) in keyed {
         let approx = (row.payload.len() + key.len() + 64) as u64;
         build_bytes = build_bytes.saturating_add(approx);
         if build_bytes > HASH_JOIN_MEMORY_BYTES {
