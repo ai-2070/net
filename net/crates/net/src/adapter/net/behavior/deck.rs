@@ -1926,11 +1926,15 @@ impl Stream for AuditStream {
                 if let Some(record) = self.queued.pop_front() {
                     Poll::Ready(Some(Ok(record)))
                 } else {
-                    // The interval consumed its Ready tick on
-                    // this poll; the next poll calls poll_tick
-                    // again, which registers its own waker for
-                    // the next period. No explicit wake_by_ref
-                    // needed.
+                    // We consumed the interval's Ready tick on
+                    // this poll but produced nothing. tokio's
+                    // `Interval::poll_tick` only registers a waker
+                    // on *its own* Pending path — after a consumed
+                    // Ready tick it leaves no waker behind, so a
+                    // bare `audit_stream.next().await` would park
+                    // forever. Re-arm explicitly, mirroring the
+                    // sibling `LogStream` / `FailureStream`.
+                    cx.waker().wake_by_ref();
                     Poll::Pending
                 }
             }
@@ -3733,6 +3737,63 @@ mod tests {
             .expect("second closed")
             .expect("second ok");
         assert!(second.seq > first.seq);
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn audit_stream_rearms_waker_after_empty_tick() {
+        // Regression for #25: after `poll_next` consumes the
+        // interval's Ready tick but finds no matching record, it
+        // MUST re-register a waker (tokio's `Interval::poll_tick`
+        // leaves none behind once its Ready tick is taken).
+        // Without the explicit `wake_by_ref`, a bare
+        // `audit_stream.next().await` parks forever. We drive
+        // `poll_next` manually with a counting waker under paused
+        // time so the assertion is deterministic and can never
+        // hang the suite on regression.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct CountingWaker(AtomicUsize);
+        impl Wake for CountingWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let dispatcher = Arc::new(LoggingDispatcher::new());
+        let runtime = MeshOsRuntime::start(fast_config(), dispatcher);
+        let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate()).with_config(
+            DeckClientConfig {
+                snapshot_poll_interval: Duration::from_millis(10),
+                ..DeckClientConfig::default()
+            },
+        );
+
+        let mut stream = deck.audit().stream();
+        let counter = Arc::new(CountingWaker(AtomicUsize::new(0)));
+        let waker = Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        // First poll: the interval's initial tick fires immediately
+        // (tokio intervals are ready on first poll), the ring is
+        // empty, so we hit the empty branch and must re-arm. Pin on
+        // the stack to poll directly.
+        let mut pinned = std::pin::pin!(&mut stream);
+        let first = pinned.as_mut().poll_next(&mut cx);
+        assert!(
+            matches!(first, Poll::Pending),
+            "empty ring should yield Pending, got {first:?}"
+        );
+        assert!(
+            counter.0.load(Ordering::SeqCst) >= 1,
+            "poll_next must re-register a waker after consuming an empty tick \
+             (otherwise the stream parks forever)"
+        );
+
         let _ = runtime.shutdown().await;
     }
 
