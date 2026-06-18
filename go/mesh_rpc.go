@@ -968,6 +968,81 @@ type StreamOptions struct {
 	Window uint32
 }
 
+// streamHandleGuard coordinates in-flight FFI ops on a streaming
+// handle against a single one-shot free WITHOUT holding a lock across
+// the (blocking) cgo call — so Close / a ctx-cancel can request
+// teardown without blocking behind a parked Recv/Send (#1, and the
+// follow-up review that flagged lock-across-blocking-call wedging
+// Close).
+//
+// An op brackets its cgo call with enter()/leave(). The free path
+// calls requestFree(): if no op is in flight it frees immediately,
+// otherwise the last op to leave() runs the free. free() therefore
+// runs EXACTLY ONCE, always AFTER every in-flight cgo call has
+// returned (no use-after-free), and the free path NEVER blocks (no
+// close-path deadlock / liveness hang).
+//
+// Heap-allocated and shared with the ctx-cancel watcher so the watcher
+// holds no reference to the owning struct, preserving the GC finalizer.
+type streamHandleGuard struct {
+	// bit 0 = teardown requested; bits >= 1 = in-flight op count.
+	state atomic.Int64
+	// free performs the actual FFI teardown; invoked exactly once.
+	free func()
+}
+
+func newStreamHandleGuard(free func()) *streamHandleGuard {
+	return &streamHandleGuard{free: free}
+}
+
+// enter registers an in-flight op. Returns false if teardown has
+// already been requested (the op must abort without touching the
+// handle). On true the caller MUST pair it with exactly one leave().
+func (g *streamHandleGuard) enter() bool {
+	for {
+		s := g.state.Load()
+		if s&1 != 0 {
+			return false
+		}
+		if g.state.CompareAndSwap(s, s+2) {
+			return true
+		}
+	}
+}
+
+// leave deregisters an in-flight op. If teardown was requested while
+// this op ran and it is the last one out, it runs free().
+func (g *streamHandleGuard) leave() {
+	for {
+		s := g.state.Load()
+		ns := s - 2
+		if g.state.CompareAndSwap(s, ns) {
+			if ns == 1 { // teardown bit set, in-flight count now 0
+				g.free()
+			}
+			return
+		}
+	}
+}
+
+// requestFree marks the guard closing (idempotent — only the first
+// caller wins). Frees immediately if no op is in flight, otherwise the
+// last op to leave() will. Never blocks.
+func (g *streamHandleGuard) requestFree() {
+	for {
+		s := g.state.Load()
+		if s&1 != 0 {
+			return // already closing — another caller owns the free
+		}
+		if g.state.CompareAndSwap(s, s|1) {
+			if s>>1 == 0 { // no ops in flight
+				g.free()
+			}
+			return
+		}
+	}
+}
+
 // RpcStream is an open streaming RPC call. Recv blocks until the
 // next chunk arrives, the deadline fires, or the stream
 // terminates. Close MUST be called eventually (defer is fine);
@@ -977,20 +1052,12 @@ type RpcStream struct {
 	rpc    *MeshRpc
 	handle *C.RpcStreamHandleC
 	callID uint64
-	// Heap-allocated so the watcher goroutine can hold a reference
-	// without keeping the RpcStream struct alive — required so
-	// the finalizer can run when the user drops the stream
-	// reference without explicitly Close()ing.
-	closed *atomic.Bool
-	// mu guards the FFI handle against a concurrent _free racing an
-	// in-flight Recv/Grant cgo call (#1). Heap-allocated like
-	// `closed` so the watcher goroutine can hold it without keeping
-	// the RpcStream alive (which would defeat the finalizer).
-	// Recv/Grant hold the read lock across the cgo call; whichever
-	// of Close / the watcher wins `closed.Swap` holds the write
-	// lock while it frees, so the free cannot run concurrently with
-	// a live op.
-	mu *sync.RWMutex
+	// guard serializes Recv/Grant against the FFI free without
+	// holding a lock across the (blocking) cgo call. Heap-allocated
+	// so the watcher goroutine can hold it without keeping the
+	// RpcStream alive (which would defeat the finalizer). See
+	// streamHandleGuard.
+	guard *streamHandleGuard
 	// cancel fires the ctx-cancel watcher goroutine's parent
 	// context so it unblocks and exits when Close() runs even
 	// if the user-supplied ctx never cancels.
@@ -1043,12 +1110,16 @@ func (r *MeshRpc) CallStreaming(
 		msg := readCError(outErr)
 		return nil, parseRpcError(msg)
 	}
+	handlePtr := outStream
+	guard := newStreamHandleGuard(func() {
+		C.net_rpc_stream_close(handlePtr)
+		C.net_rpc_stream_free(handlePtr)
+	})
 	stream := &RpcStream{
 		rpc:    r,
 		handle: outStream,
 		callID: uint64(C.net_rpc_stream_call_id(outStream)),
-		closed: new(atomic.Bool),
-		mu:     new(sync.RWMutex),
+		guard:  guard,
 	}
 	runtime.SetFinalizer(stream, (*RpcStream).finalize)
 
@@ -1058,32 +1129,22 @@ func (r *MeshRpc) CallStreaming(
 	// immediately after Close returns without a transient
 	// goroutine still poking at fields.
 	//
-	// CRITICAL: the goroutine captures only heap-allocated cells
-	// (closed, handle, watcherDone) — never `stream`. Capturing
-	// `stream` would prevent GC and defeat the finalizer if the
-	// user neither cancels ctx nor calls Close. The cleanup chain
-	// is: user-drops-ref → GC → finalizer → finalizer-calls-Close
-	// → Close-calls-cancel → goroutine-wakes-and-exits.
+	// CRITICAL: the goroutine captures only the heap-allocated guard
+	// (which owns the free closure + handle pointer) and watcherDone —
+	// never `stream`. Capturing `stream` would prevent GC and defeat
+	// the finalizer if the user neither cancels ctx nor calls Close.
 	if ctx != nil && ctx.Done() != nil {
 		watchCtx, cancel := context.WithCancel(ctx)
 		stream.cancel = cancel
 		stream.watcherDone = make(chan struct{})
-		closedPtr := stream.closed
-		handlePtr := outStream
-		muPtr := stream.mu
+		guardPtr := guard
 		watcherDone := stream.watcherDone
 		go func() {
 			<-watchCtx.Done()
-			// closed.Swap is the single source of truth for "who
-			// owns the free." Whoever wins (Swap returns false)
-			// performs the C.free; the other path no-ops. The free
-			// is taken under the write lock so it can't race an
-			// in-flight Recv/Grant cgo call (#1).
-			if !closedPtr.Swap(true) {
-				muPtr.Lock()
-				C.net_rpc_stream_free(handlePtr)
-				muPtr.Unlock()
-			}
+			// Whichever of Close / this watcher requests teardown
+			// first runs the free — once, and only after in-flight
+			// Recv/Grant ops have drained (no UAF, no blocking).
+			guardPtr.requestFree()
 			close(watcherDone)
 		}()
 	}
@@ -1129,12 +1190,16 @@ func (r *MeshRpc) CallServiceStreaming(
 		msg := readCError(outErr)
 		return nil, parseRpcError(msg)
 	}
+	handlePtr := outStream
+	guard := newStreamHandleGuard(func() {
+		C.net_rpc_stream_close(handlePtr)
+		C.net_rpc_stream_free(handlePtr)
+	})
 	stream := &RpcStream{
 		rpc:    r,
 		handle: outStream,
 		callID: uint64(C.net_rpc_stream_call_id(outStream)),
-		closed: new(atomic.Bool),
-		mu:     new(sync.RWMutex),
+		guard:  guard,
 	}
 	runtime.SetFinalizer(stream, (*RpcStream).finalize)
 
@@ -1142,19 +1207,13 @@ func (r *MeshRpc) CallServiceStreaming(
 		watchCtx, cancel := context.WithCancel(ctx)
 		stream.cancel = cancel
 		stream.watcherDone = make(chan struct{})
-		closedPtr := stream.closed
-		handlePtr := outStream
-		muPtr := stream.mu
+		guardPtr := guard
 		watcherDone := stream.watcherDone
 		go func() {
 			<-watchCtx.Done()
-			// Free under the write lock so it can't race an in-flight
-			// Recv/Grant cgo call (#1).
-			if !closedPtr.Swap(true) {
-				muPtr.Lock()
-				C.net_rpc_stream_free(handlePtr)
-				muPtr.Unlock()
-			}
+			// Whichever of Close / this watcher requests teardown
+			// first runs the free — once, after in-flight ops drain.
+			guardPtr.requestFree()
 			close(watcherDone)
 		}()
 	}
@@ -1171,15 +1230,14 @@ func (s *RpcStream) CallID() uint64 { return s.callID }
 // any non-nil error EXCEPT `ErrStreamDone`, the stream is closed
 // implicitly and further Recv returns `ErrStreamDone`.
 func (s *RpcStream) Recv() ([]byte, error) {
-	// Hold the read lock across the (blocking) cgo call so a
-	// concurrent Close/watcher _free can't free the handle mid-call
-	// (#1). The free path takes the write lock and therefore waits
-	// for this Recv to return (bounded by the stream deadline).
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed.Load() {
+	// enter()/leave() bracket the (blocking) cgo call WITHOUT holding
+	// a lock across it, so Close / the watcher can request teardown
+	// without wedging behind this Recv (#1). The free runs only once
+	// this op has left, so s.handle stays valid for the whole call.
+	if !s.guard.enter() {
 		return nil, ErrStreamDone
 	}
+	defer s.guard.leave()
 	var outChunk *C.uint8_t
 	var outChunkLen C.size_t
 	var outErr *C.char
@@ -1209,11 +1267,10 @@ func (s *RpcStream) Recv() ([]byte, error) {
 // control wasn't enabled for this stream OR the stream is already
 // done.
 func (s *RpcStream) Grant(amount uint32) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed.Load() {
+	if !s.guard.enter() {
 		return
 	}
+	defer s.guard.leave()
 	C.net_rpc_stream_grant(s.handle, C.uint32_t(amount))
 }
 
@@ -1229,21 +1286,12 @@ func (s *RpcStream) Grant(amount uint32) {
 // Close), the watcher closes watcherDone *before* invoking Close,
 // so the wait below sees a closed channel and returns immediately.
 func (s *RpcStream) Close() {
-	if s.closed.Swap(true) {
-		return
-	}
 	runtime.SetFinalizer(s, nil)
-	// Free under the write lock so we don't race an in-flight
-	// Recv/Grant cgo call (#1). We won closed.Swap above, so the
-	// ctx-cancel watcher (if any) loses its Swap and never touches
-	// the handle — only one of {Close, watcher} ever frees.
-	s.mu.Lock()
-	if s.handle != nil {
-		C.net_rpc_stream_close(s.handle)
-		C.net_rpc_stream_free(s.handle)
-		s.handle = nil
-	}
-	s.mu.Unlock()
+	// Request teardown: frees now if idle, else the last in-flight
+	// Recv/Grant frees on its way out. Never blocks behind a parked
+	// Recv. Idempotent and race-safe against the ctx-cancel watcher —
+	// the free closure (net_rpc_stream_close + _free) runs exactly once.
+	s.guard.requestFree()
 
 	// Trigger the watcher's exit (no-op if it never started).
 	if s.cancel != nil {
@@ -1508,12 +1556,11 @@ type ClientStreamCall struct {
 	rpc    *MeshRpc
 	handle *C.ClientStreamCallHandleC
 	callID uint64
-	closed *atomic.Bool
-	// mu guards the handle against a concurrent _free racing an
-	// in-flight Send (#1). Heap-allocated so the watcher can hold it
-	// without keeping the call alive. Send holds the read lock;
-	// Finish/Close/watcher hold the write lock while freeing.
-	mu          *sync.RWMutex
+	// guard serializes Send against the FFI free without holding a
+	// lock across the (blocking) cgo call. Heap-allocated so the
+	// watcher can hold it without keeping the call alive. See
+	// streamHandleGuard.
+	guard       *streamHandleGuard
 	cancel      context.CancelFunc
 	watcherDone chan struct{}
 }
@@ -1556,39 +1603,31 @@ func (r *MeshRpc) CallClientStream(
 		msg := readCError(outErr)
 		return nil, parseRpcError(msg)
 	}
+	handlePtr := outHandle
+	guard := newStreamHandleGuard(func() {
+		C.net_rpc_client_stream_free(handlePtr)
+	})
 	call := &ClientStreamCall{
 		rpc:    r,
 		handle: outHandle,
 		callID: uint64(C.net_rpc_client_stream_call_id(outHandle)),
-		closed: new(atomic.Bool),
-		mu:     new(sync.RWMutex),
+		guard:  guard,
 	}
 	runtime.SetFinalizer(call, (*ClientStreamCall).finalize)
 
-	// ctx-cancel watcher — mirrors CallStreaming's watcher.
+	// ctx-cancel watcher — mirrors CallStreaming's watcher. Captures
+	// only the heap-allocated guard (which owns the free + handle
+	// pointer) and watcherDone, never `call`, so the finalizer is
+	// preserved.
 	if ctx != nil && ctx.Done() != nil {
 		watchCtx, cancel := context.WithCancel(ctx)
 		call.cancel = cancel
 		call.watcherDone = make(chan struct{})
-		// CAPTURE ONLY HEAP-ALLOCATED CELLS, NOT `call`. Capturing
-		// call here would prevent GC, defeat the finalizer, and
-		// leak the goroutine + call forever if ctx never cancels
-		// AND user never calls Close. With the closed pointer +
-		// raw handle pointer the goroutine is fully decoupled from
-		// the Go-side call struct.
-		closedPtr := call.closed
-		handlePtr := outHandle
-		muPtr := call.mu
+		guardPtr := guard
 		watcherDone := call.watcherDone
 		go func() {
 			<-watchCtx.Done()
-			// Free under the write lock so it can't race an in-flight
-			// Send cgo call (#1).
-			if !closedPtr.Swap(true) {
-				muPtr.Lock()
-				C.net_rpc_client_stream_free(handlePtr)
-				muPtr.Unlock()
-			}
+			guardPtr.requestFree()
 			close(watcherDone)
 		}()
 	}
@@ -1602,11 +1641,10 @@ func (c *ClientStreamCall) CallID() uint64 { return c.callID }
 // (first call) or as a REQUEST_CHUNK (subsequent). Returns
 // ErrStreamDone if Finish or Close already terminated the call.
 func (c *ClientStreamCall) Send(body []byte) error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.closed.Load() {
+	if !c.guard.enter() {
 		return ErrStreamDone
 	}
+	defer c.guard.leave()
 	cBody, freeBody := bytesToCBytes(body)
 	defer freeBody()
 	var outErr *C.char
@@ -1628,30 +1666,24 @@ func (c *ClientStreamCall) Send(body []byte) error {
 // body on success. Consumes the call — subsequent Send / Finish
 // return ErrStreamDone, and Close becomes a no-op.
 func (c *ClientStreamCall) Finish() ([]byte, error) {
-	// Atomic claim of `closed`. If we lose the race to a concurrent
-	// Close, return ErrStreamDone without touching the handle — the
-	// winner is responsible for free. Load-then-Store would race
-	// with Close.Swap and double-free.
-	if c.closed.Swap(true) {
+	// Finish is the terminal op: enter() as an op (fails with
+	// ErrStreamDone if Close/the watcher already requested teardown),
+	// run the finish cgo call, then requestFree()+leave() so the free
+	// runs once this op (and any still-draining Send) has left — never
+	// under a live op, and without blocking.
+	if !c.guard.enter() {
 		return nil, ErrStreamDone
 	}
 	runtime.SetFinalizer(c, nil)
-	// Terminal cgo call + free under the write lock so we don't race
-	// an in-flight Send (#1). We won closed.Swap, so the watcher
-	// loses its Swap and never touches the handle.
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	var outBody *C.uint8_t
 	var outBodyLen C.size_t
 	var outErr *C.char
 	code := C.net_rpc_client_stream_finish(c.handle, &outBody, &outBodyLen, &outErr)
-	defer func() {
-		C.net_rpc_client_stream_free(c.handle)
-		c.handle = nil
-		if c.cancel != nil {
-			c.cancel()
-		}
-	}()
+	c.guard.requestFree()
+	defer c.guard.leave()
+	if c.cancel != nil {
+		defer c.cancel()
+	}
 	switch code {
 	case 0:
 		if outBodyLen == 0 || outBody == nil {
@@ -1674,18 +1706,11 @@ func (c *ClientStreamCall) Finish() ([]byte, error) {
 // Close releases the call. Implicit CANCEL via the SDK's Drop
 // impl if Finish hasn't completed. Idempotent.
 func (c *ClientStreamCall) Close() {
-	if c.closed.Swap(true) {
-		return
-	}
 	runtime.SetFinalizer(c, nil)
-	// Free under the write lock so we don't race an in-flight Send
-	// (#1). We won closed.Swap, so the watcher won't free.
-	c.mu.Lock()
-	if c.handle != nil {
-		C.net_rpc_client_stream_free(c.handle)
-		c.handle = nil
-	}
-	c.mu.Unlock()
+	// Request teardown: frees now if idle, else the last in-flight
+	// Send (or Finish) frees on its way out. Never blocks. Idempotent
+	// and race-safe against Finish / the watcher.
+	c.guard.requestFree()
 	if c.cancel != nil {
 		c.cancel()
 	}
@@ -1723,15 +1748,11 @@ type DuplexCall struct {
 	rpc    *MeshRpc
 	handle *C.DuplexCallHandleC
 	callID uint64
-	// Heap-allocated so the watcher goroutine can hold a reference
-	// without keeping the DuplexCall struct alive. See the
-	// equivalent note on ClientStreamCall.
-	closed *atomic.Bool
-	// mu guards the handle against a concurrent _free racing an
-	// in-flight Send/Recv/FinishSending (#1). Heap-allocated so the
-	// watcher can hold it without keeping the call alive. Readers
-	// hold the read lock; Split/Close/watcher hold the write lock.
-	mu          *sync.RWMutex
+	// guard serializes Send/Recv/FinishSending against the FFI free
+	// without holding a lock across the (blocking) cgo call.
+	// Heap-allocated so the watcher can hold it without keeping the
+	// call alive. See streamHandleGuard.
+	guard       *streamHandleGuard
 	cancel      context.CancelFunc
 	watcherDone chan struct{}
 }
@@ -1769,12 +1790,15 @@ func (r *MeshRpc) CallDuplex(
 		msg := readCError(outErr)
 		return nil, parseRpcError(msg)
 	}
+	handlePtr := outHandle
+	guard := newStreamHandleGuard(func() {
+		C.net_rpc_duplex_free(handlePtr)
+	})
 	call := &DuplexCall{
 		rpc:    r,
 		handle: outHandle,
 		callID: uint64(C.net_rpc_duplex_call_id(outHandle)),
-		closed: new(atomic.Bool),
-		mu:     new(sync.RWMutex),
+		guard:  guard,
 	}
 	runtime.SetFinalizer(call, (*DuplexCall).finalize)
 
@@ -1782,21 +1806,13 @@ func (r *MeshRpc) CallDuplex(
 		watchCtx, cancel := context.WithCancel(ctx)
 		call.cancel = cancel
 		call.watcherDone = make(chan struct{})
-		// Capture heap cells only — never `call`. See the
-		// ClientStreamCall watcher note for the lifecycle proof.
-		closedPtr := call.closed
-		handlePtr := outHandle
-		muPtr := call.mu
+		// Capture the heap guard only — never `call`. See the
+		// streamHandleGuard note for the lifecycle proof.
+		guardPtr := guard
 		watcherDone := call.watcherDone
 		go func() {
 			<-watchCtx.Done()
-			// Free under the write lock so it can't race an in-flight
-			// Send/Recv/FinishSending cgo call (#1).
-			if !closedPtr.Swap(true) {
-				muPtr.Lock()
-				C.net_rpc_duplex_free(handlePtr)
-				muPtr.Unlock()
-			}
+			guardPtr.requestFree()
 			close(watcherDone)
 		}()
 	}
@@ -1808,11 +1824,10 @@ func (d *DuplexCall) CallID() uint64 { return d.callID }
 
 // Send pushes one body chunk to the server.
 func (d *DuplexCall) Send(body []byte) error {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	if d.closed.Load() {
+	if !d.guard.enter() {
 		return ErrStreamDone
 	}
+	defer d.guard.leave()
 	cBody, freeBody := bytesToCBytes(body)
 	defer freeBody()
 	var outErr *C.char
@@ -1833,11 +1848,10 @@ func (d *DuplexCall) Send(body []byte) error {
 // stays open for subsequent Recv calls until the server's
 // terminal frame arrives.
 func (d *DuplexCall) FinishSending() error {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	if d.closed.Load() {
+	if !d.guard.enter() {
 		return ErrStreamDone
 	}
+	defer d.guard.leave()
 	var outErr *C.char
 	code := C.net_rpc_duplex_finish_sending(d.handle, &outErr)
 	switch code {
@@ -1855,11 +1869,10 @@ func (d *DuplexCall) FinishSending() error {
 // Recv blocks until the next response chunk arrives or the
 // stream terminates. Returns ErrStreamDone on clean end.
 func (d *DuplexCall) Recv() ([]byte, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	if d.closed.Load() {
+	if !d.guard.enter() {
 		return nil, ErrStreamDone
 	}
+	defer d.guard.leave()
 	var outChunk *C.uint8_t
 	var outChunkLen C.size_t
 	var outErr *C.char
@@ -1889,25 +1902,21 @@ func (d *DuplexCall) Recv() ([]byte, error) {
 // no-ops. CANCEL fires only when BOTH split halves drop without
 // a clean close.
 func (d *DuplexCall) Split() (*DuplexSink, *DuplexStream, error) {
-	// Atomic claim: lose the race to a concurrent Close and the
-	// handle is already freed; bail out without touching it.
-	if d.closed.Swap(true) {
+	// Split is the terminal op. enter() fails (ErrStreamDone) if
+	// Close/the watcher already requested teardown.
+	if !d.guard.enter() {
 		return nil, nil, ErrStreamDone
 	}
 	runtime.SetFinalizer(d, nil)
-	// into_split consumes the handle and we free the empty shell —
-	// both under the write lock so we don't race an in-flight
-	// Send/Recv (#1). We won closed.Swap, so the watcher won't free.
-	d.mu.Lock()
 	var outSink *C.DuplexSinkHandleC
 	var outStream *C.DuplexStreamHandleC
 	var outErr *C.char
 	code := C.net_rpc_duplex_into_split(d.handle, &outSink, &outStream, &outErr)
-	// The original's C handle is an empty shell after into_split (or
-	// the call failed); free it either way.
-	C.net_rpc_duplex_free(d.handle)
-	d.handle = nil
-	d.mu.Unlock()
+	// Terminal: request teardown and leave so the empty shell is freed
+	// once this op (and any draining Send/Recv) has left. The split
+	// halves below use the new outSink/outStream handles, not d.handle.
+	d.guard.requestFree()
+	d.guard.leave()
 	if d.cancel != nil {
 		d.cancel()
 	}
@@ -1929,18 +1938,11 @@ func (d *DuplexCall) Split() (*DuplexSink, *DuplexStream, error) {
 
 // Close releases the call. Idempotent.
 func (d *DuplexCall) Close() {
-	if d.closed.Swap(true) {
-		return
-	}
 	runtime.SetFinalizer(d, nil)
-	// Free under the write lock so we don't race an in-flight
-	// Send/Recv (#1). We won closed.Swap, so the watcher won't free.
-	d.mu.Lock()
-	if d.handle != nil {
-		C.net_rpc_duplex_free(d.handle)
-		d.handle = nil
-	}
-	d.mu.Unlock()
+	// Request teardown: frees now if idle, else the last in-flight
+	// Send/Recv/FinishSending frees on its way out. Never blocks.
+	// Idempotent and race-safe against Split / the watcher.
+	d.guard.requestFree()
 	if d.cancel != nil {
 		d.cancel()
 	}
