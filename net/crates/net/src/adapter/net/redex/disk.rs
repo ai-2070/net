@@ -2159,7 +2159,15 @@ fn read_timestamps(path: &Path, expected_entries: usize) -> Result<Option<Vec<u6
     let mut f = File::open(path).map_err(RedexError::io)?;
     let mut bytes = Vec::new();
     f.read_to_end(&mut bytes).map_err(RedexError::io)?;
-    if bytes.len() < expected_entries * 8 {
+    // #18: compare via division, not `expected_entries * 8`. The
+    // multiplication can overflow `usize` (a ~10 GB `.idx` on a
+    // 32-bit build, or a corrupt/huge index value) and wrap to a
+    // small product that spuriously passes this guard, after which
+    // the `i * 8` slice below indexes out of bounds. `bytes.len()
+    // / 8` cannot overflow and is the algebraic equivalent of
+    // `bytes.len() < expected_entries * 8` for the integer domain
+    // (each timestamp is exactly 8 bytes).
+    if bytes.len() / 8 < expected_entries {
         // Index has more entries than ts has timestamps — the
         // sidecar is partial / lagged. Reject and fall back.
         return Ok(None);
@@ -4533,5 +4541,53 @@ mod tests {
              outside ({outside}); test self-reference accounting \
              is broken.",
         );
+    }
+
+    /// #18: `read_timestamps`' length guard must compare via
+    /// division, not `expected_entries * 8`. The multiplication can
+    /// overflow `usize` and wrap to a small product that spuriously
+    /// passes the guard, after which `i * 8` indexes out of bounds.
+    /// We can't allocate an exabyte ts file to trigger the overflow
+    /// directly, but this exercises the three boundary outcomes of
+    /// the division-based guard (`bytes.len() / 8 < expected_entries`)
+    /// to lock its behavior in: partial sidecar rejected, exact
+    /// length accepted, longer-than-needed accepted+truncated.
+    #[test]
+    fn bug18_read_timestamps_length_guard() {
+        let base = tmpdir();
+        let ts_path = base.join("ts");
+
+        let write_ts = |vals: &[u64]| {
+            use std::io::Write as _;
+            let mut buf = Vec::with_capacity(vals.len() * 8);
+            for &v in vals {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            let mut f = std::fs::File::create(&ts_path).unwrap();
+            f.write_all(&buf).unwrap();
+            f.sync_all().unwrap();
+        };
+
+        // Missing file → None (caller falls back to now()).
+        let _ = std::fs::remove_file(&ts_path);
+        assert_eq!(read_timestamps(&ts_path, 3).unwrap(), None);
+
+        // Partial sidecar (2 timestamps, index claims 3) → None.
+        write_ts(&[10, 20]);
+        assert_eq!(read_timestamps(&ts_path, 3).unwrap(), None);
+
+        // Exact length → Some(all).
+        write_ts(&[10, 20, 30]);
+        assert_eq!(read_timestamps(&ts_path, 3).unwrap(), Some(vec![10, 20, 30]));
+
+        // Longer than the index (torn-tail recovery shrank idx) →
+        // Some(first N).
+        write_ts(&[10, 20, 30, 40, 50]);
+        assert_eq!(read_timestamps(&ts_path, 3).unwrap(), Some(vec![10, 20, 30]));
+
+        // Zero expected entries → trivially Some(empty), never OOB.
+        assert_eq!(read_timestamps(&ts_path, 0).unwrap(), Some(vec![]));
+
+        cleanup(&base);
     }
 }

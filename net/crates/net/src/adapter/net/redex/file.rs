@@ -612,9 +612,82 @@ impl RedexFile {
         if payloads.is_empty() {
             return Ok(None);
         }
-
-        let ts = now_ns();
         let mut state = self.inner.state.lock();
+        // `None` expected_first_seq ⇒ no caller-supplied seq guard;
+        // append at whatever the current tail is.
+        self.append_batch_locked(&mut state, payloads, None)
+    }
+
+    /// Like [`Self::append_batch`], but only appends if the file's
+    /// current `next_seq` (the seq the first appended event will
+    /// receive) equals `expected_first_seq`, with the check and the
+    /// append performed under **one** held state lock.
+    ///
+    /// #5 (replication TOCTOU): `apply_sync_response` previously read
+    /// `file.next_seq()` (one lock acquisition), validated
+    /// `first_seq == local_next`, then called `append_batch` (a
+    /// *separate* lock acquisition). A concurrent writer slipping in
+    /// between advanced `next_seq`, so the replicated events landed
+    /// at seqs higher than their leader-declared `event_seq`,
+    /// silently misaligning the leader↔replica logs. This method
+    /// closes that window: the `next_seq == expected_first_seq`
+    /// recheck and the append are atomic with respect to every other
+    /// writer. On mismatch it appends nothing and returns
+    /// [`RedexError::SeqMismatch`] so the caller can surface the
+    /// concurrent-write race rather than corrupt the alignment.
+    ///
+    /// The happy path is byte-for-byte identical to `append_batch`
+    /// (same validation, same disk-first ordering, same rollback,
+    /// same watcher notification) once the guard passes.
+    pub fn append_batch_if_next_seq(
+        &self,
+        expected_first_seq: u64,
+        payloads: &[Bytes],
+    ) -> Result<Option<u64>, RedexError> {
+        self.check_not_closed()?;
+        if payloads.is_empty() {
+            // No-op batches never touch the seq counter; treat as a
+            // success that appended nothing, matching `append_batch`.
+            return Ok(None);
+        }
+        let mut state = self.inner.state.lock();
+        self.append_batch_locked(&mut state, payloads, Some(expected_first_seq))
+    }
+
+    /// Shared body of [`Self::append_batch`] /
+    /// [`Self::append_batch_if_next_seq`]. The caller must hold the
+    /// state lock and guarantee `payloads` is non-empty. When
+    /// `expected_first_seq` is `Some`, the append proceeds only if
+    /// the current `next_seq` matches it (checked under the held
+    /// lock); a mismatch returns [`RedexError::SeqMismatch`] without
+    /// mutating any state.
+    #[expect(
+        clippy::expect_used,
+        reason = "segment capacity is pre-validated and offsets pre-checked above; offset_to_u32 and segment.append_many cannot fail at this point"
+    )]
+    fn append_batch_locked(
+        &self,
+        state: &mut parking_lot::MutexGuard<'_, FileState>,
+        payloads: &[Bytes],
+        expected_first_seq: Option<u64>,
+    ) -> Result<Option<u64>, RedexError> {
+        let ts = now_ns();
+
+        // #5: seq guard, evaluated under the SAME lock as the append
+        // below. `next_seq` is the seq the first appended event will
+        // receive. Checking it here — before the `fetch_add` — means
+        // no other writer can advance the counter between the check
+        // and the allocation, because they would need this same lock
+        // to call `fetch_add`.
+        if let Some(expected) = expected_first_seq {
+            let current = self.inner.next_seq.load(Ordering::Acquire);
+            if current != expected {
+                return Err(RedexError::SeqMismatch {
+                    expected,
+                    actual: current,
+                });
+            }
+        }
 
         // Pre-validate: every payload must fit in the remaining
         // segment capacity, and the final offset must fit in a u32.
@@ -1686,6 +1759,69 @@ mod tests {
         assert_eq!(f.append(b"b").unwrap(), 1);
         assert_eq!(f.append(b"c").unwrap(), 2);
         assert_eq!(f.next_seq(), 3);
+    }
+
+    /// #5: the seq-guarded append applies when `next_seq` matches
+    /// the caller's `expected_first_seq`, and the assigned seqs are
+    /// the contiguous range starting at that value.
+    #[test]
+    fn append_batch_if_next_seq_applies_on_match() {
+        let f = make_file("t-guarded-match");
+        f.append(b"a").unwrap();
+        f.append(b"b").unwrap();
+        assert_eq!(f.next_seq(), 2);
+
+        let batch = [Bytes::from_static(b"c"), Bytes::from_static(b"d")];
+        let first = f
+            .append_batch_if_next_seq(2, &batch)
+            .expect("guarded append must succeed when next_seq matches")
+            .expect("non-empty batch returns Some(first_seq)");
+        assert_eq!(first, 2);
+        assert_eq!(f.next_seq(), 4);
+        assert_eq!(&f.read_one(2).unwrap().payload[..], b"c");
+        assert_eq!(&f.read_one(3).unwrap().payload[..], b"d");
+    }
+
+    /// #5: the seq-guarded append rejects with `SeqMismatch` and
+    /// mutates NOTHING (no seq burnt, no index growth) when the
+    /// file's `next_seq` has moved off the expected value — exactly
+    /// the concurrent-writer race the guard exists to catch.
+    #[test]
+    fn append_batch_if_next_seq_rejects_on_mismatch() {
+        let f = make_file("t-guarded-mismatch");
+        f.append(b"a").unwrap();
+        assert_eq!(f.next_seq(), 1);
+
+        // Caller believes the tail is still 0 (stale snapshot), but
+        // a concurrent append already advanced it to 1.
+        let batch = [Bytes::from_static(b"x")];
+        let err = f
+            .append_batch_if_next_seq(0, &batch)
+            .expect_err("guarded append must reject a stale expected_first_seq");
+        match err {
+            RedexError::SeqMismatch { expected, actual } => {
+                assert_eq!(expected, 0);
+                assert_eq!(actual, 1);
+            }
+            other => panic!("expected SeqMismatch, got {other:?}"),
+        }
+        // No state mutated: tail unchanged, nothing appended at the
+        // bogus seq, the real seq-0 event is intact.
+        assert_eq!(f.next_seq(), 1, "rejected guard must not burn a seq");
+        assert!(f.read_one(1).is_none(), "nothing appended on mismatch");
+        assert_eq!(&f.read_one(0).unwrap().payload[..], b"a");
+    }
+
+    /// #5: an empty batch is a no-op regardless of the guard value,
+    /// matching `append_batch`'s `Ok(None)` contract.
+    #[test]
+    fn append_batch_if_next_seq_empty_is_noop() {
+        let f = make_file("t-guarded-empty");
+        f.append(b"a").unwrap();
+        // Wrong expected value, but the empty batch short-circuits
+        // before the guard is even consulted.
+        assert_eq!(f.append_batch_if_next_seq(999, &[]).unwrap(), None);
+        assert_eq!(f.next_seq(), 1);
     }
 
     #[test]

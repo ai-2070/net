@@ -479,10 +479,40 @@ impl OutstandingRequests {
     /// Record a freshly-minted `request_id` against `leader`.
     /// Best-effort GC of expired entries runs at insert time so
     /// the set stays bounded without a separate sweeper task.
+    ///
+    /// #35: the expiry GC alone does NOT bound the map. Under
+    /// sustained young in-flight load (many channels / a fast
+    /// tick), a replica can legitimately hold ≥ cap requests all
+    /// younger than [`REQUEST_TTL`]; `retain` then evicts nothing
+    /// and the insert proceeds anyway, so the map grows without
+    /// bound until TTLs start expiring. To make the soft cap an
+    /// actual bound, after the expiry sweep, if we are still at or
+    /// above the cap, evict the single OLDEST entry before
+    /// inserting. Token matching stays correct — the evicted token
+    /// is the one closest to its own TTL, so a response for it was
+    /// already the most likely to be rejected as stale; the caller
+    /// treats a missing token exactly like an expired one (drop the
+    /// response). The map size after this method is therefore
+    /// `<= REQUEST_REGISTRY_SOFT_CAP`.
     pub fn record(&mut self, leader: NodeId, request_id: u64, now: Instant) {
         if self.entries.len() >= REQUEST_REGISTRY_SOFT_CAP {
             self.entries
                 .retain(|_, &mut inserted| now.saturating_duration_since(inserted) < REQUEST_TTL);
+            // Replacing an existing key won't grow the map, so only
+            // force-evict when we'd actually add a NEW entry and are
+            // still at/over the cap with nothing expired.
+            if self.entries.len() >= REQUEST_REGISTRY_SOFT_CAP
+                && !self.entries.contains_key(&(leader, request_id))
+            {
+                if let Some(oldest_key) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, &inserted)| inserted)
+                    .map(|(k, _)| *k)
+                {
+                    self.entries.remove(&oldest_key);
+                }
+            }
         }
         self.entries.insert((leader, request_id), now);
     }
@@ -503,6 +533,13 @@ impl OutstandingRequests {
     /// inherit the prior leader's in-flight token set.
     pub fn clear_leader(&mut self, leader: NodeId) {
         self.entries.retain(|(l, _), _| *l != leader);
+    }
+
+    /// Current entry count. Test-only accessor for the #35
+    /// soft-cap-bound assertions; the field is otherwise private.
+    #[cfg(test)]
+    pub(crate) fn len_for_test(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -1823,6 +1860,76 @@ mod tests {
         async fn withdraw_chain(&self, _origin_hash: u64) -> Result<(), AdapterError> {
             Ok(())
         }
+    }
+
+    /// #35: under sustained young in-flight load the soft cap must
+    /// be an ACTUAL bound. Filling the registry with cap entries
+    /// all younger than the TTL and then recording one more must
+    /// NOT grow the map past the cap — the oldest entry is evicted
+    /// instead.
+    #[test]
+    fn bug35_outstanding_requests_cap_is_bounded_under_young_load() {
+        let mut reg = OutstandingRequests::new();
+        let leader: NodeId = 0x42;
+        let base = Instant::now();
+
+        // Insert exactly cap entries, each strictly younger than
+        // the TTL (timestamps `base + i ms`, all "now-ish"). The
+        // first inserted (request_id 0) is the oldest.
+        for i in 0..REQUEST_REGISTRY_SOFT_CAP as u64 {
+            let t = base + Duration::from_millis(i);
+            reg.record(leader, i, t);
+        }
+        assert_eq!(reg.len_for_test(), REQUEST_REGISTRY_SOFT_CAP);
+
+        // One more young request, still well within the TTL. The
+        // expiry sweep evicts nothing (all young), so the cap path
+        // must force-evict the oldest entry (request_id 0).
+        let newest_t = base + Duration::from_millis(REQUEST_REGISTRY_SOFT_CAP as u64);
+        reg.record(leader, REQUEST_REGISTRY_SOFT_CAP as u64, newest_t);
+
+        // Map stayed bounded.
+        assert_eq!(
+            reg.len_for_test(),
+            REQUEST_REGISTRY_SOFT_CAP,
+            "soft cap must bound the map even when nothing has expired"
+        );
+        // The oldest token (id 0) was evicted: a response for it is
+        // now rejected as if stale.
+        assert!(
+            !reg.take(leader, 0, newest_t),
+            "oldest token should have been force-evicted at the cap"
+        );
+        // The freshly recorded token is present and matchable.
+        assert!(
+            reg.take(leader, REQUEST_REGISTRY_SOFT_CAP as u64, newest_t),
+            "newest token must still be recorded"
+        );
+    }
+
+    /// #35 companion: re-recording an EXISTING key at the cap must
+    /// not evict a different entry (the insert is a replace, not a
+    /// growth).
+    #[test]
+    fn bug35_record_existing_key_at_cap_does_not_evict() {
+        let mut reg = OutstandingRequests::new();
+        let leader: NodeId = 0x42;
+        let base = Instant::now();
+        for i in 0..REQUEST_REGISTRY_SOFT_CAP as u64 {
+            reg.record(leader, i, base + Duration::from_millis(i));
+        }
+        // Re-record an already-present key. Size unchanged; the
+        // oldest (id 0) must survive because no new slot is needed.
+        reg.record(
+            leader,
+            REQUEST_REGISTRY_SOFT_CAP as u64 - 1,
+            base + Duration::from_millis(REQUEST_REGISTRY_SOFT_CAP as u64),
+        );
+        assert_eq!(reg.len_for_test(), REQUEST_REGISTRY_SOFT_CAP);
+        assert!(
+            reg.take(leader, 0, base + Duration::from_millis(1)),
+            "re-recording an existing key must not evict a distinct entry"
+        );
     }
 
     /// Recorder dispatcher — captures every outbound wire
