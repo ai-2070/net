@@ -1,0 +1,29 @@
+net/crates/net/src/adapter/net/behavior/loadbalance.rs
+  s_a77664841befef::t_4686f63a61ff51 1159-1165,1167-1182
+  s_a77664841befef::t_3a904528344f56 1010-1016
+  s_a77664841befef::t_4b59f2b73d87fd 507-512
+  s_a77664841befef::t_da6ccb4742132c 833-844
+  s_a77664841befef::t_1f1e979d036206 457-478
+  s_a77664841befef::t_2a7b5e4e03774d 300
+  s_a77664841befef::t_27324226ed494b 2945-3123
+  s_a77664841befef::t_ed61b681e647a8 1459-1469,1472
+  s_a77664841befef::t_735da3c2e04da9 521,524-531
+  s_a77664841befef::t_841ef805044732 388-391
+  s_a77664841befef::t_7ffe6563c3fbd2 257-272
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "0b219bf4acbd3233c7d74b79d70e720f9caabf91",
+  "prompts": {},
+  "sessions": {
+    "s_a77664841befef": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5703ca68-d2ee-4e77-9d7f-06fbcec46aed",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
