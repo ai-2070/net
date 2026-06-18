@@ -26,7 +26,7 @@ jobs:
       run:
         working-directory: net/crates/net
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -70,7 +70,7 @@ jobs:
       run:
         working-directory: net/crates/net
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -346,7 +346,7 @@ jobs:
       run:
         working-directory: net/crates/net
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -395,7 +395,7 @@ jobs:
       run:
         working-directory: net/crates/net/sdk
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -454,7 +454,7 @@ jobs:
       run:
         working-directory: net/crates/net/bindings/node
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -520,7 +520,7 @@ jobs:
       run:
         working-directory: net/crates/net/sdk-ts
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -598,7 +598,7 @@ jobs:
       run:
         working-directory: net/crates/net/bindings/python
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -690,7 +690,7 @@ jobs:
       run:
         working-directory: net/crates/net/sdk-py
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -722,7 +722,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup Go
         uses: actions/setup-go@v6
@@ -813,7 +813,7 @@ jobs:
       run:
         working-directory: net/crates/net
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -962,7 +962,7 @@ jobs:
             # Cargo.toml pins its SDK feature set.
             features: ""
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -1031,7 +1031,7 @@ jobs:
             path: net/crates/net/bindings/go/deck-ffi
             features: ""
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -1269,7 +1269,7 @@ jobs:
       run:
         working-directory: net/crates/net
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -1322,7 +1322,7 @@ jobs:
       run:
         working-directory: net/crates/net
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -1349,7 +1349,7 @@ jobs:
       run:
         working-directory: net/crates/net
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -1367,7 +1367,7 @@ jobs:
       run:
         working-directory: net/crates/net
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

@@ -28,7 +28,7 @@ jobs:
     name: Publish net-mesh + net-mesh-sdk-macros + net-mesh-sdk
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
