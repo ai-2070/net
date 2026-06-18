@@ -25,23 +25,50 @@ FFI-edge mediums. One reported HIGH (crypto anti-replay `MAX_FORWARD`) was
 investigated and **downgraded to informational** (#37) — the control is dead on
 the hot path but the window math means it is *not* an exploitable replay bypass.
 
-## Resolution (branch `bugfix/audit-2026-06-18`, 22 commits)
+## Resolution (branch `bugfix/audit-2026-06-18`, 31 commits)
 
 **Fixed + committed (34 of 37 findings + several appendix-class):**
 - Rust core/behavior: #5, #6, #9, #10, #13, #14, #15, #18, #19, #20, #21, #22,
   #24, #25, #26, #27, #28, #29, #32, #33, #34, #35, #36. All compile-verified
-  (`cargo check`) and the touched modules' `cargo test` pass; regression tests
-  added per finding (existing tests that pinned buggy behavior — e.g. #24 ICE
-  cooldown, #6 watermark — were updated).
+  (`cargo check` + `cargo clippy`) and the touched modules' `cargo test` pass;
+  regression tests added per finding (existing tests that pinned buggy behavior
+  — e.g. #24 ICE cooldown, #6 watermark — were updated).
 - FFI / go-ffi Rust crates: #3, #8 (rpc-ffi + compute-ffi), #11, #16, #30, #31
   (rpc/compute/deck/meshos/meshdb-ffi), #4. Compile-verified; crate tests pass.
 - Go bindings (canonical `go/` module): #1 (RpcStream/ClientStreamCall/
   DuplexCall), #2 (MeshOsDaemonHandle), #7 (MeshBlobAdapter) — the three
   use-after-free races. **Caveat:** this environment has no cgo C toolchain
-  (`CGO_ENABLED=0`, no gcc), so these three are verified by `gofmt` + manual
-  review only, not a cgo compile/link. The changes are mechanical RWMutex +
-  `runtime.KeepAlive` additions mirroring the existing `MeshRpc.withHandle` /
-  `MeshStream.Send` pattern.
+  (`CGO_ENABLED=0`, no gcc), so these are verified by `gofmt` + manual review
+  (plus a pure-Go unit test for the #1 quiesce guard that runs in CI), not a cgo
+  compile/link.
+
+**Code-review follow-ups (two automated review rounds — all addressed):**
+- **#8 panic guard was dead in compute-ffi** (P1) — the first pass *defined* the
+  `ffi_guard!` `catch_unwind` macro but never invoked it, so every `extern "C"`
+  entry point still unwound across the C ABI. Now wrapped on all 80 entry points
+  (rpc-ffi had it correct already). `cargo check` + crate tests pass.
+- **#1 held a read lock across a blocking cgo call** (P1×3) — the first Go fix
+  used an `RWMutex` held across `Recv`/`Send`, which could wedge `Close`/`Finish`/
+  `Split` on a deadline-less stream. Replaced with a refcount **quiesce guard**
+  (`streamHandleGuard`): ops bracket the cgo call with `enter()/leave()` without
+  holding a lock; the free runs once, only after the last op leaves, and the
+  free path never blocks. Pure-Go regression tests added for the guard.
+- **#22 masked truncation** (P1) — the first fix treated a clean stream-end after
+  a non-final batch as success, hiding a truncated result. Corrected: the sender
+  (`run_server_call`) now *always* emits a `final = true` terminal batch (even
+  for an exact `MESHDB_SERVER_BATCH_ROWS` multiple), and the receiver again
+  treats a missing terminal as a protocol error.
+- **#20 double key extraction** (P2) — the outer-join path extracted the build
+  key twice; now extracted once in a single pass.
+- **#15 transient ring window** (P2) — the first fix removed the node's vnodes
+  before re-adding (a window where it was absent); now overwrites in place +
+  sweeps stale entries, so it is never removed from the ring on a re-add.
+- **#33 arbitrary WRR constant** (P3) — replaced the `WRR_MIN_WHEEL = 64` floor
+  (which reshaped small-cluster ratios) with a wheel derived from the weights
+  (`ceil(total / min_weight)`): ratio-exact for commensurate weights, still
+  resolving sub-unit shares.
+- **redex** — dropped a stale `#[expect(clippy::expect_used)]` left on
+  `append_batch` by the #5 refactor (clippy `unfulfilled_lint_expectations`).
 
 **Investigated and intentionally NOT changed:**
 - #37 — reverted. The "restore MAX_FORWARD in `commit`" hardening breaks 4
@@ -61,10 +88,14 @@ the hot path but the window math means it is *not* an exploitable replay bypass.
   (add `seed_len` to `net_compute_spawn`/`net_meshos_register…` + update Go
   callers + headers); disproportionate for a LOW finding only reachable by a
   caller violating the documented 32-byte contract (in-tree callers always pass
-  32). The compute-ffi commit message overstates this — only #8/#31 landed there.
+  32). (#8 and #31 *did* land in compute-ffi — only the #17 seed check is open.)
 - #12 — `C.GoBytes(ptr, C.int(len))` ≥2 GiB truncation (~20 call sites). Each
   site needs bespoke error handling around `goBytesChecked`'s `(…, bool)`
   return; with no cgo toolchain to compile-verify, 20 blind edits is too risky.
+- **blob.go (#7) / meshos.go (#2) share the lock-across-blocking-call pattern**
+  that #1 was corrected for (Fetch/Store and NextControl(0) hold the lock across
+  a blocking cgo call). Not yet flagged by review; the same `streamHandleGuard`
+  treatment applies (meshos needs care around the pump + cgo.Handle teardown).
 - Appendix B-1..B-7 — in the divergent `bindings/go/net/` copy (+ B-4 pump
   busy-spin in canonical `meshos.go`); not addressed.
 
