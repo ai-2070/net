@@ -603,10 +603,6 @@ impl RedexFile {
     ///   any in-memory commit — on disk failure the seq allocation
     ///   rolls back and neither memory nor subscribers observe the
     ///   batch.
-    #[expect(
-        clippy::expect_used,
-        reason = "segment capacity is pre-validated and offsets pre-checked above; offset_to_u32 and segment.append_many cannot fail at this point"
-    )]
     pub fn append_batch(&self, payloads: &[Bytes]) -> Result<Option<u64>, RedexError> {
         self.check_not_closed()?;
         if payloads.is_empty() {
