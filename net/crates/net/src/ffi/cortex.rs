@@ -1994,6 +1994,9 @@ pub unsafe extern "C" fn net_tasks_snapshot_and_watch(
     {
         return NetError::NullPointer.into();
     }
+    // #11: pre-zero the snapshot out-params so every error return
+    // below leaves (null, 0) per the documented out-param contract.
+    zero_out_json(out_snapshot, out_snapshot_len);
     let tasks = unsafe { &*handle };
     let _op = match tasks.guard.try_enter() {
         Some(op) => op,
@@ -2035,6 +2038,10 @@ pub unsafe extern "C" fn net_tasks_watch_next(
     if cursor.is_null() || out_json.is_null() || out_len.is_null() {
         return NetError::NullPointer.into();
     }
+    // #11: pre-zero so every error return below (ShuttingDown,
+    // stream-ended, NET_ERR_TIMEOUT) leaves (null, 0) rather than
+    // stale stack data — matching the documented out-param contract.
+    zero_out_json(out_json, out_len);
     let cursor = unsafe { &*cursor };
     let _op = match cursor.guard.try_enter() {
         Some(op) => op,
@@ -2637,6 +2644,9 @@ pub unsafe extern "C" fn net_memories_list(
     if handle.is_null() || out_json.is_null() || out_len.is_null() {
         return NetError::NullPointer.into();
     }
+    // #11: pre-zero so every error return (ShuttingDown, filter-parse
+    // error) leaves (null, 0) per the out-param contract.
+    zero_out_json(out_json, out_len);
     let mem = unsafe { &*handle };
     let _op = match mem.guard.try_enter() {
         Some(op) => op,
@@ -2681,6 +2691,9 @@ pub unsafe extern "C" fn net_memories_snapshot_and_watch(
     {
         return NetError::NullPointer.into();
     }
+    // #11: pre-zero the snapshot out-params so every error return
+    // below leaves (null, 0) per the documented out-param contract.
+    zero_out_json(out_snapshot, out_snapshot_len);
     let mem = unsafe { &*handle };
     let _op = match mem.guard.try_enter() {
         Some(op) => op,
@@ -2717,6 +2730,9 @@ pub unsafe extern "C" fn net_memories_watch_next(
     if cursor.is_null() || out_json.is_null() || out_len.is_null() {
         return NetError::NullPointer.into();
     }
+    // #11: pre-zero so every error return (ShuttingDown, stream-ended,
+    // NET_ERR_TIMEOUT) leaves (null, 0) per the out-param contract.
+    zero_out_json(out_json, out_len);
     let cursor = unsafe { &*cursor };
     let _op = match cursor.guard.try_enter() {
         Some(op) => op,
