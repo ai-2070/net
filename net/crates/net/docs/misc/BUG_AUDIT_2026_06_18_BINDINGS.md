@@ -15,6 +15,16 @@ handful of core-behavior logic bugs (reconcile eviction budget, aggregator
 interval, load-balancer probe/ring) — so the Rust core is *mostly* clean but not
 entirely.
 
+A **third** parallel pass (findings 19–37, six per-subsystem agents over transport
+core, RedEX, dataforts, behavior/fold, shard/crypto/identity, and nRPC/SDK) found
+the first **core data-path** defects, narrowing the "core mostly clean" framing
+further: a HIGH reliable-stream **sequence gap** in the canonical `mesh.rs` send
+path (#19, hand-verified end to end) and a silent **OUTER-join row-drop** in the
+meshdb executor (#20, hand-verified), plus a tier of behavior / replication /
+FFI-edge mediums. One reported HIGH (crypto anti-replay `MAX_FORWARD`) was
+investigated and **downgraded to informational** (#37) — the control is dead on
+the hot path but the window math means it is *not* an exploitable replay bypass.
+
 ## Subsystems audited and found CLEAN (no concrete bug)
 
 These came back with no actionable defect — they are saturated with prior-audit
@@ -52,6 +62,25 @@ regression tests and explicit fix annotations:
 | 16 | LOW | `bindings/go/rpc-ffi/src/lib.rs` | `duplex_into_split` drops surviving half on partial-consume (premature CANCEL) | Agent-reported |
 | 17 | LOW | `bindings/go/{compute,meshos}-ffi` | Unchecked 32-byte read from caller seed pointer (OOB read on short buffer) | Agent-reported |
 | 18 | LOW | `adapter/net/redex/disk.rs` | `expected_entries * 8` can overflow before bounds check (32-bit only) | Agent-reported |
+| 19 | HIGH | `adapter/net/mesh.rs` + `session.rs` | Reliable-stream seq consumed but not rolled back on scheduler backpressure → permanent gap + dup re-send | Verified |
+| 20 | MEDIUM | `behavior/meshdb/executor.rs` | LEFT/RIGHT OUTER join drops preserved-side rows with a missing/non-scalar join key | Verified |
+| 21 | MEDIUM | `adapter/net/redex/entry.rs` | Per-entry checksum covers payload only, not header → corrupt `seq` breaks `partition_point` reads | Agent-reported |
+| 22 | MEDIUM | `behavior/meshdb/federated.rs` | Lost trailing `End` frame reports a fully-delivered result as `ExecutorError` | Agent-reported |
+| 23 | MEDIUM | `adapter/net/mesh.rs` | `publish_to_peer` doesn't batch by event count → `assert!` panic on >2028 events | Agent-reported |
+| 24 | MEDIUM | `behavior/meshos/ice.rs` | `ThawCluster` blocked by cluster-wide cooldown, contradicting the break-glass invariant | Agent-reported |
+| 25 | MEDIUM | `behavior/deck.rs` | `AuditStream::poll_next` doesn't re-register a waker after a consumed tick → can park forever | Agent-reported |
+| 26 | MEDIUM | `behavior/meshdb/transport.rs` | Duplicate in-flight `call_id` overwrites prior caller's response sender (debug_assert only) | Agent-reported |
+| 27 | MEDIUM | `behavior/fold/routing.rs` | Route owner can't update its own route to a worse metric → stale route pinned until TTL | Agent-reported |
+| 28 | MEDIUM | `behavior/meshos/reconcile.rs` | `MarkAvoid` re-emitted every tick — dedup guard reads `avoid_list`, never populated in prod | Verified |
+| 29 | MEDIUM | `behavior/loadbalance.rs` | Hash-ring collision probe uses destructive `insert`, clobbers another node's vnode (refines #15) | Verified |
+| 30 | MEDIUM | `bindings/go/rpc-ffi/src/lib.rs` | `write_response`/`find_service_nodes` write out-params with no null check (extends #8) | Verified |
+| 31 | MEDIUM | `bindings/go/*-ffi` | No `len > isize::MAX` guard before `slice::from_raw_parts` (extends #8) | Verified (structural) |
+| 32 | LOW | `behavior/meshdb/executor.rs` | `sort_merge_join` drops no-key rows on both sides; diverges from hash full-outer (latent) | Agent-reported |
+| 33 | LOW | `behavior/loadbalance.rs` | Weighted-RR starves endpoints when all effective weights < 1.0 (ceil collapses to 1) | Agent-reported |
+| 34 | LOW | `adapter/net/mesh_rpc.rs` | `mint_random_call_id` returns `0` on `getrandom` failure → concurrent calls evict each other | Agent-reported |
+| 35 | LOW | `adapter/net/redex/replication_runtime.rs` | `OutstandingRequests` soft-cap only evicts expired → unbounded under sustained in-flight load | Agent-reported |
+| 36 | LOW | `adapter/net/redex/retention.rs` | Age-based eviction assumes monotonic wall-clock; backward NTP step mis-counts drops | Agent-reported |
+| 37 | INFO | `adapter/net/crypto.rs` | `commit()` doesn't enforce `MAX_FORWARD` on hot path — investigated, NOT an exploitable replay bypass | Verified (not a bug) |
 | B-* | MED/LOW | `bindings/go/net/*` (divergent copy) | Hedge/watch/last-error bugs | See appendix |
 
 ---
@@ -634,6 +663,531 @@ path, not network-untrusted.
 
 ---
 
+## Findings — third pass (2026-06-18 follow-up, transport / behavior / join deep audit)
+
+A third parallel audit (six per-subsystem agents over the transport core,
+RedEX persistence, dataforts, the behavior/fold layer, shard/crypto/identity, and
+nRPC/CortEX/SDK) added findings 19–37. Findings **19, 20, 28, 29, 30** were
+hand-verified against the source (file:line traced end to end, lock/ownership and
+window math checked); **31** is structurally confirmed; the rest are agent-reported
+with the confidence noted. Finding **37** is a reported HIGH that was investigated
+and **downgraded** — it is recorded here for honesty, not as a defect.
+
+Dataforts (blob refcount / LRU / gravity / overflow) and the shard/mapper +
+crypto/identity/token + bus/event/timestamp core came back **CLEAN** this pass and
+are not re-listed beyond the first-pass note above.
+
+---
+
+### 🔴 HIGH 19 — Reliable-stream sequence consumed but not rolled back on scheduler backpressure → permanent gap + duplicate re-send
+
+**Files:** `net/crates/net/src/adapter/net/mesh.rs:11097-11119` (mid-batch flush;
+same shape at the final-flush block 11125-11146) and
+`net/crates/net/src/adapter/net/session.rs` (`try_acquire_tx_credit_inner`
+399-403, `TxSlotGuard::drop` 509-523, `next_tx_seq` 1463-1466).
+**Confidence:** Verified end to end.
+
+`send_on_stream` allocates a sequence number **atomically with the byte credit**,
+then builds, delivers, commits, and only afterwards registers the retransmit
+descriptor:
+
+```rust
+let (guard, seq) = match session.try_acquire_tx_credit_matching_epoch(
+    stream_id, stream.epoch, needed,
+) {
+    TxAdmit::Acquired { guard, seq } => (guard, seq),   // 11102 — seq consumed here
+    TxAdmit::WindowFull => return Err(StreamError::Backpressure),
+    TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
+};
+let packet = builder.build(stream_id, seq, &current_batch, flags);
+self.deliver_stream_packet(scheduled, &packet, peer_addr, stream_id)
+    .await?;                                            // 11108 — early return BEFORE register_retransmit
+guard.commit();                                         // 11109
+Self::register_retransmit(&session, stream_id, stream.epoch, seq, &current_batch, flags); // 11110
+```
+
+The seq comes from `next_tx_seq()` — a bare `fetch_add` with **no rollback path**:
+
+```rust
+let seq = if admitted { Some(state.next_tx_seq()) } else { None };  // session.rs:399
+// next_tx_seq(): self.tx_seq.fetch_add(1, Ordering::Relaxed)        // session.rs:1465
+```
+
+`TxSlotGuard::drop` refunds **only the credit bytes** — it never touches `tx_seq`:
+
+```rust
+impl Drop for TxSlotGuard {
+    fn drop(&mut self) {
+        if !self.active { return; }
+        if let Some(state) = self.session.try_stream(self.stream_id) {
+            if state.epoch() == self.epoch {
+                state.refund_tx_credit(self.bytes);   // 520 — credit only, NOT the seq
+            }
+        }
+    }
+}
+```
+
+For a **scheduled** stream, `deliver_stream_packet` has a *second, independent*
+backpressure source — a full FairScheduler queue — surfaced as the same
+`Backpressure` error **after** the seq was consumed:
+
+```rust
+if self.router.scheduler().enqueue(queued) { Ok(()) }
+else { Err(StreamError::Backpressure) }   // mesh.rs:11225 — packet was NOT enqueued
+```
+
+When this fires, the `?` at 11108 returns early: the guard drops and refunds credit
+(correct), but `register_retransmit` never runs and the consumed `seq` is never
+rolled back — and the packet was never put on the wire. `send_with_retry` then
+**re-runs the whole `events` slice** with fresh sequence numbers
+(`mesh.rs:11251-11257`).
+
+**Impact (reliable stream):** a *permanent, unrecoverable gap* at the skipped seq —
+the receiver records the next packet out-of-order, never advances `next_expected`
+past the hole, and NACKs it forever; the sender's `on_nack(seq)` finds no
+descriptor (never registered) and can't retransmit → eventual `failed` flag →
+spurious `StreamReset`. Compounding it: any partial flush that *did* commit earlier
+in the same call is **re-sent under new seqs** on retry → duplicate delivery. This
+is the *documented* backpressure path under bulk load, not a rare edge.
+
+**Fix:** allocate the sequence only after the packet is accepted (or make `seq`
+refundable like the credit and unwind it on the failure path), and don't replay
+already-committed events when `send_with_retry` re-enters after a partial-batch
+backpressure.
+
+---
+
+### 🟠 MEDIUM 20 — LEFT/RIGHT OUTER join silently drops preserved-side rows with a missing join key
+
+**File:** `net/crates/net/src/adapter/net/behavior/meshdb/executor.rs:994`
+(reached via dispatch at 442-449; emit loop 490-503).
+**Confidence:** Verified.
+
+`build_hash_join_table` skips any row whose `JoinKeyMode::Field` key is
+missing/non-scalar:
+
+```rust
+for row in rows {
+    let Some(key) = try_encode_join_key(&row, key_mode) else {
+        continue;                       // 994 — no-key build-side rows never enter the table
+    };
+    ...
+    table.entry(key).or_default().push((row, false));
+}
+```
+
+For `LeftOuter` the build side **is** the preserved (left) side
+(`hash_join_one_sided(left_rows, right_rows, key_mode, true, false)`, line 443;
+`RightOuter` is symmetric on the right, line 448). The `emit_unmatched_build` loop
+only iterates rows that made it into `build`:
+
+```rust
+if emit_unmatched_build {
+    for entries in build.into_values() {       // 491 — only rows that had a key
+        for (b, matched) in entries {
+            if !matched { out.push(encode_joined_row(/* (Some(b), None) */)?); }
+        }
+    }
+}
+```
+
+So a left row with an absent/non-scalar join key is dropped entirely instead of
+emitted with `right = None` — violating OUTER-join semantics (a NULL join key must
+never *match*, but the row must still appear). `hash_join_full_outer` (518+)
+handles the no-key case correctly, so this is also an internal inconsistency.
+Reachable for any join on a JSON field that is absent in some rows. (The planner
+rewrites `Field("origin"/"seq"/…)` to row-intrinsic modes that never fail, so this
+only bites arbitrary JSON-field joins — hence MEDIUM, not HIGH.)
+
+**Fix:** in the outer-join path, emit preserved-side no-key rows unmatched
+(mirror `hash_join_full_outer`), rather than dropping them in
+`build_hash_join_table`.
+
+---
+
+### 🟠 MEDIUM 21 — RedEX per-entry checksum covers the payload only, not the header
+
+**File:** `net/crates/net/src/adapter/net/redex/entry.rs:182` (root cause);
+recovery in `disk.rs:415-459`; consumed by `file.rs:1024,1087-1088,1139-1140,1176`.
+**Confidence:** Agent-reported (high confidence on mechanism).
+
+`payload_checksum(payload: &[u8])` hashes only the payload bytes — the 20-byte idx
+record's header fields (`seq`, `payload_offset`, `payload_len`, `flags`) are **not**
+covered. Recovery (`disk.rs::open`) validates each survivor only by re-checksumming
+its payload and trims the dat tail by `payload_offset` monotonicity; it never
+asserts `seq` is monotonically increasing. A torn/bit-rotted write that corrupts
+the `seq` field while leaving payload+checksum intact is therefore accepted into the
+recovered index. Every read (`tail`, `read_range`, `read_one`, `read_range_limited`)
+uses `partition_point` assuming `state.index` is sorted by `seq`, so a non-monotonic
+recovered index silently returns wrong/missing events; `next_seq = last.seq + 1` can
+also jump or regress (a regressed `next_seq` on a leader re-issues already-replicated
+seqs with different content → silent divergence). Bounded by requiring header-region
+corruption specifically (payload corruption *is* caught) → MEDIUM.
+
+**Fix:** extend the per-entry checksum to cover the header fields, or assert
+`seq` monotonicity during the recovery walk.
+
+---
+
+### 🟠 MEDIUM 22 — Lost trailing `End` frame reports a fully-delivered federated result as failed
+
+**File:** `net/crates/net/src/adapter/net/behavior/meshdb/federated.rs:1090-1114`;
+interacts with `transport.rs:723,767`.
+**Confidence:** Agent-reported.
+
+`translate_responses` treats only `Batch { final: true }` as terminal; a successful
+non-final batch that happens to be the last frame falls through to an
+`ExecutorError { detail: "transport stream ended before terminal frame" }`.
+`run_server_call` always sends intermediate batches with `final = false` and marks
+only the residual flush terminal — so if the separate `End` send fails after a clean
+batch flush, the caller sees all rows **plus** a spurious error and must discard the
+whole result.
+
+**Fix:** treat a clean stream end after a delivered batch as success, or make the
+terminal marker ride the last data frame rather than a separate `End`.
+
+---
+
+### 🟠 MEDIUM 23 — `publish_to_peer` doesn't batch by event count → release-mode `assert!` panic
+
+**File:** `net/crates/net/src/adapter/net/mesh.rs:8812` (path: `publish` 8324 /
+`publish_many` 8335); assert in `pool.rs:260-266`.
+**Confidence:** Agent-reported (high confidence).
+
+```rust
+builder.build_subprotocol(stream_id, seq, events, flags, 0)   // 8812 — entire slice, no chunking
+```
+
+`build_subprotocol` runs `assert!(events.len() <= NetHeader::MAX_EVENTS_PER_PACKET,
+…)` (a real release-mode `assert!`; `MAX_EVENTS_PER_PACKET = 2028`). Unlike
+`send_to_peer`/`send_routed`/`send_on_stream`, which all chunk at
+`MAX_PAYLOAD_SIZE` (implicitly bounding event count), the publish path passes the
+caller's whole slice straight through. `publish_many` with >2028 events panics the
+calling task; a single payload between `MAX_PAYLOAD_SIZE` and 65535 bytes builds an
+over-MTU packet the receiver drops silently.
+
+**Fix:** chunk the publish path by event count and byte size like the unicast/stream
+paths (or return an error instead of asserting).
+
+---
+
+### 🟠 MEDIUM 24 — ICE `ThawCluster` blocked by the cluster-wide cooldown (break-glass violated)
+
+**File:** `net/crates/net/src/adapter/net/behavior/meshos/ice.rs:669`
+(`cooldown_targets`), gate in `verify_commit` (~897).
+**Confidence:** Agent-reported.
+
+`cooldown_targets` maps both `FreezeCluster` and `ThawCluster` to
+`CooldownTargets::ClusterWide`, and `check_ice_cooldown` runs before fold/verify, so
+a `ThawCluster` arriving inside the (default 300s) window after a `FreezeCluster` is
+rejected with `IceCooldownActive`. `event_loop.rs:1136-1137` explicitly states ICE
+commits must "bypass by design — operators must be able to thaw the cluster
+mid-freeze"; the freeze gate honors that, but the *separate* cooldown gate silently
+blocks it. A test currently pins the broken behavior.
+
+**Fix:** exempt `ThawCluster` from the cluster-wide cooldown.
+
+---
+
+### 🟠 MEDIUM 25 — `AuditStream::poll_next` doesn't re-register a waker after a consumed tick
+
+**File:** `net/crates/net/src/adapter/net/behavior/deck.rs:1926-1935`.
+**Confidence:** Agent-reported.
+
+The empty-queue branch returns `Poll::Pending` with a comment claiming "no explicit
+`wake_by_ref` needed," whereas the sibling `LogStream` (~2074) and `FailureStream`
+(~2142) call `cx.waker().wake_by_ref()` in the identical branch. tokio's
+`Interval::poll_tick` only registers the waker on its own `Pending` path; after
+consuming a `Ready` tick and returning `Pending` with no record, no waker is
+registered, so a bare `audit_stream.next().await` can wedge permanently. Masked in
+tests by `tokio::time::timeout` wrappers and incidental wakes.
+
+**Fix:** mirror the siblings' `cx.waker().wake_by_ref()` in the empty branch.
+
+---
+
+### 🟠 MEDIUM 26 — Duplicate in-flight `call_id` overwrites the prior caller's response sender
+
+**File:** `net/crates/net/src/adapter/net/behavior/meshdb/transport.rs:392-412`.
+**Confidence:** Agent-reported.
+
+```rust
+let prev = self.inflight.insert(call_id, InflightCaller { tx, .. });
+debug_assert!(prev.is_none(), ...);   // release: prev silently dropped
+```
+
+In release builds a duplicate `call_id` drops the prior caller's `tx`; the first
+caller's `ResponseStream` closes and surfaces a synthetic error / empty result with
+no signal (the comment admits "the earlier caller would otherwise hang forever").
+Mitigated because `call_id`s come from a process-global counter, so a collision
+requires an id-recycling / hand-rolled-request bug a layer up → MEDIUM.
+
+**Fix:** refuse the duplicate (return an error) rather than overwriting, even in
+release.
+
+---
+
+### 🟠 MEDIUM 27 — Route owner cannot update its own route to a worse metric
+
+**File:** `net/crates/net/src/adapter/net/behavior/fold/routing.rs:124`.
+**Confidence:** Agent-reported (medium).
+
+After the same-publisher anti-reorder gate, the metric gate runs unconditionally:
+
+```rust
+if incoming.payload.metric <= entry.payload.metric { Replace } else { Reject }
+```
+
+A same-publisher update with a strictly higher generation but a *worse* (higher)
+metric — the owner re-announcing genuine link degradation — evaluates `3 <= 1` →
+`Reject`. The owner's fresher observation is discarded and the table keeps
+advertising the stale lower metric / old next-hop until TTL (~300s), delaying
+convergence on link degradation. Marked medium/medium because it mirrors legacy
+`RoutingTable` parity and may be a deliberate lowest-metric-wins choice.
+
+**Fix:** allow a same-publisher, higher-generation update to replace regardless of
+metric direction (an owner's newer announcement should win over its own older one).
+
+---
+
+### 🟠 MEDIUM 28 — `MarkAvoid` re-emitted every reconcile tick (`avoid_list` never populated in prod)
+
+**File:** `net/crates/net/src/adapter/net/behavior/meshos/reconcile.rs:339`
+(`diff_locality`).
+**Confidence:** Verified.
+
+The idempotence guard meant to emit one `MarkAvoid` per degraded peer reads
+`actual.avoid_list`:
+
+```rust
+if actual.avoid_list.contains_key(&peer) { continue; }   // 339
+```
+
+But I grep-confirmed **every** `avoid_list.insert` in the `meshos` module is
+`#[cfg(test)]` (reconcile.rs:644 is inside `#[test]
+reconcile_with_no_daemon_intent_emits_nothing_even_with_state`; the rest are in
+`state.rs`/`snapshot.rs` test fns). No production path populates `avoid_list` —
+admin events only `clear`/`remove` it and the tick GC only prunes it. So the guard
+never trips in the live loop and a persistently-degraded peer gets a fresh
+`MarkAvoid` every tick → repeated dispatch + action-queue pressure. Tests pass only
+because they pre-seed `avoid_list` manually.
+
+**Fix:** have the `MarkAvoid` emission (or its application) actually record the peer
+in `avoid_list` (with a TTL/decay), so the dedup guard becomes live.
+
+---
+
+### 🟠 MEDIUM 29 — Hash-ring collision probe uses destructive `insert`, clobbering another node's vnode
+
+**File:** `net/crates/net/src/adapter/net/behavior/loadbalance.rs:1372`.
+**Confidence:** Verified. **Refines LOW 15** (whose "linear-probes to a new slot,
+stranding the old vnode" mechanism description is itself slightly off — the old
+vnode is *overwritten*, not stranded).
+
+```rust
+while self.hash_ring.insert(hash, node_id).is_some() {   // 1372
+    hash = hash.wrapping_add(1);
+}
+```
+
+The comment (1361-1374) says the probe keeps every vnode distinct, but
+`DashMap::insert` is **destructive** — it overwrites the slot and returns the old
+value. On a true collision, slot `H` held `node_X`; this `insert` replaces it with
+`node_id` (returns `Some(node_X)`), then probes `H+1` and inserts `node_id` *again*.
+Net result: `node_X` loses its vnode and `node_id` occupies **both** `H` and `H+1`
+— the exact ring skew the probe is meant to prevent. Practical impact is low (FNV-1a
+over `u64` with ~150k entries makes collisions astronomically rare) and the loop
+still terminates, but the primitive does the opposite of its stated intent.
+
+**Fix:** probe with `contains_key` / `entry().or_insert` so the existing occupant is
+preserved, e.g. `while self.hash_ring.contains_key(&hash) { hash =
+hash.wrapping_add(1); } self.hash_ring.insert(hash, node_id);`.
+
+---
+
+### 🟠 MEDIUM 30 — Go `rpc-ffi` writes out-params with no null check
+
+**File:** `net/crates/net/bindings/go/rpc-ffi/src/lib.rs:821-828` (`write_response`)
+and `858-873` (`net_rpc_find_service_nodes`).
+**Confidence:** Verified. **Extends HIGH 8** (same crate's missing-safety theme).
+
+```rust
+fn write_response(body: Vec<u8>, out_ptr: *mut *mut u8, out_len: *mut usize) {
+    let boxed: Box<[u8]> = body.into_boxed_slice();
+    let len = boxed.len();
+    let ptr = Box::into_raw(boxed) as *mut u8;
+    unsafe { *out_ptr = ptr; *out_len = len; }   // 825-828 — no out_ptr.is_null() guard
+}
+```
+
+`write_response` is called on every success path (`net_rpc_call` 751,
+`net_rpc_call_service` 801, `net_rpc_stream_next` …); `net_rpc_find_service_nodes`
+similarly writes `*out_ptr`/`*out_count` unconditionally (858-861, 870-873). The same
+file's `write_err` (275) *does* null-check `out_err`, and the core `ffi/mod.rs`
+null-checks every out-param — so this is an inconsistency, not a deliberate contract.
+A C/cgo caller passing NULL gets a null-pointer write / UB. The in-tree Go wrapper
+always passes valid stack addresses (limiting real-world reachability → MEDIUM), but
+the public ABI symbol is exposed to arbitrary `dlsym`/cgo callers.
+
+**Fix:** null-check every out-param before writing, matching `write_err` and the core
+`ffi/*` crates.
+
+---
+
+### 🟠 MEDIUM 31 — Go FFI crates: no `len > isize::MAX` guard before `slice::from_raw_parts`
+
+**Files:** `bindings/go/rpc-ffi/src/lib.rs:268,738`; unguarded sibling sites in
+`compute-ffi` (816, 881, 1034, …), `meshdb-ffi` (337, 961), `meshos-ffi` (419, 452),
+`deck-ffi` (2552).
+**Confidence:** Verified (structural).
+
+```rust
+Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })  // 738
+```
+
+`from_raw_parts`'s safety contract requires `len <= isize::MAX`; the go-ffi crates
+take `req_len`/`len` straight from C with only a null check. `grep isize::MAX` over
+`bindings/go/**/*.rs` is empty, versus the core `ffi/mod.rs` (802, 856, 942, 1745)
+which guards `if len > isize::MAX as usize { return … }` at every such site. Passing
+`(size_t)-1` from cgo is immediate UB. MEDIUM because it requires an out-of-contract
+length, but the core treats the guard as required defensive validation.
+
+**Fix:** add the `len > isize::MAX` guard before every `from_raw_parts`/
+`copy_nonoverlapping` in the go-ffi crates (and pair with HIGH 8's `catch_unwind`).
+
+---
+
+### 🟡 LOW 32 — `sort_merge_join` drops no-key rows on both sides
+
+**File:** `net/crates/net/src/adapter/net/behavior/meshdb/executor.rs:1063`.
+**Confidence:** Agent-reported; latent.
+
+Both inputs are built via `filter_map(|r| try_encode_join_key(&r, key_mode).map(|k|
+(k, r)))`, discarding no-key rows before merging, so *every* outer-join kind
+(including FullOuter) loses preserved-side rows lacking a `Field` key — diverging
+from `hash_join_full_outer` (#20's sibling). Latent because the planner hardcodes
+`JoinStrategy::HashBroadcast` (planner.rs:692); SortMerge is reachable only via a
+hand-built `OperatorPlan`.
+
+**Fix:** same as #20 — carry no-key rows through and emit them unmatched on the
+preserved side.
+
+---
+
+### 🟡 LOW 33 — Weighted-round-robin starves endpoints when all effective weights < 1.0
+
+**File:** `net/crates/net/src/adapter/net/behavior/loadbalance.rs:1094-1095`.
+**Confidence:** Agent-reported.
+
+```rust
+let total_ceil = (total_weight.ceil() as u64).max(1);
+let target = (counter % total_ceil) as f64;
+```
+
+Two endpoints each with effective weight 0.5 (base 1 × `Degraded` 0.5×) give
+`total_weight = 1.0` → `total_ceil = 1` → `target = 0` always; the cumulative loop
+(`0.5 > 0`) always selects the first endpoint and the second is never chosen. Only
+triggers with operator-set small weights (default 100 keeps `Degraded` at 50, clear
+of this) → narrow.
+
+**Fix:** scale weights into integer space before the modulus, or use a float-domain
+selection that doesn't round the total down to 1.
+
+---
+
+### 🟡 LOW 34 — `mint_random_call_id` returns `0` on `getrandom` failure
+
+**File:** `net/crates/net/src/adapter/net/mesh_rpc.rs:3848`.
+**Confidence:** Agent-reported (high confidence on mechanism, very-low severity).
+
+```rust
+if getrandom::fill(buf).is_err() { return 0; }
+```
+
+Two concurrent calls that both mint `0` evict each other's pending entries
+(`register(0, …)` overwrites), so the first caller's receiver gets `RecvError::Closed`
+→ a spurious `RpcError::Transport` (not the clean timeout the doc claims), and a
+stale 0-RESPONSE could resolve the wrong waiter (the S-4 `from_node` gate still
+blocks cross-peer forgery; same-peer cross-call confusion is not). Only triggers when
+OS entropy is unavailable (a near-fatal environment), and the cursor is left
+exhausted so it self-heals when `getrandom` recovers.
+
+**Fix:** latch a hard error on entropy failure, or reserve `0` as a sentinel and
+re-mint.
+
+---
+
+### 🟡 LOW 35 — RedEX `OutstandingRequests` soft cap doesn't actually bound
+
+**File:** `net/crates/net/src/adapter/net/redex/replication_runtime.rs:482-488`.
+**Confidence:** Agent-reported.
+
+`record` only GCs *expired* entries when at the cap:
+
+```rust
+if self.entries.len() >= REQUEST_REGISTRY_SOFT_CAP {
+    self.entries.retain(|_, &mut inserted| now.saturating_duration_since(inserted) < REQUEST_TTL);
+}
+self.entries.insert(...);   // proceeds even if retain evicted nothing
+```
+
+If a replica legitimately has ≥256 in-flight requests all younger than the 30s TTL
+(many channels / fast tick), `retain` evicts nothing and the insert still proceeds —
+so the map grows unbounded until TTLs expire. Not a correctness bug (token matching
+stays correct); purely a memory bound that doesn't bound as documented.
+
+**Fix:** evict oldest-N (or refuse) when the cap is hit with no expired entries.
+
+---
+
+### 🟡 LOW 36 — Age-based retention assumes a monotonic wall-clock
+
+**File:** `net/crates/net/src/adapter/net/redex/retention.rs:84-90`.
+**Confidence:** Agent-reported (low).
+
+```rust
+for &ts in timestamps.iter() { if ts >= cutoff { break; } age_drop += 1; }
+```
+
+The age loop breaks at the first entry at/after the cutoff, treating the prefix as
+"all older." Timestamps are wall-clock (`now_ns()`) captured at append time; a
+backward clock step (NTP correction) can make a later entry carry a smaller
+timestamp, so the early `break` yields a wrong drop count (retain-too-long or
+over-evict). Affects retention accuracy only, not log integrity; the module already
+documents the "~monotonic wall clock" assumption.
+
+**Fix:** use the monotonic per-entry seq for age decisions, or scan fully rather
+than breaking early.
+
+---
+
+### ⚪ INFO 37 — Reported anti-replay `MAX_FORWARD` bypass — investigated and downgraded (NOT a bug)
+
+**File:** `net/crates/net/src/adapter/net/crypto.rs:523` (`commit`), reached via
+`try_admit_rx_counter`/`update_rx_counter` (902-937).
+**Confidence:** Verified — **not an exploitable replay bypass.**
+
+A pass agent reported this as HIGH: `commit`'s forward branch (538-547) accepts any
+forward jump and may zero the bitmap via `shift_bitmap_up` (shift ≥ 1024), while the
+`MAX_FORWARD` cap is enforced only in `is_valid` (498-499) — and the perf-#132 hot
+path (`try_admit_rx_counter` → `commit`) skips `is_valid` (the doc at 910-932 says so
+explicitly). All of that is accurate. **However**, working through the window math:
+when `commit` zeroes the bitmap it also sets `rx_counter = received + 1`, so the new
+window bottom (`received − 1023`) is `≥ rx_counter_old` — *above every
+previously-accepted counter*. No already-seen counter survives in the window, so none
+can be re-accepted; each individual counter still commits at most once. The removal of
+the `is_valid` pre-check therefore weakens a **dead operational / defense-in-depth
+control** (large gaps that should force a re-handshake are now silently accepted with
+a warn-log) but is **not** an exploitable replay bypass.
+
+**Recommendation (hardening, not a fix for a live hole):** restore the `MAX_FORWARD`
+reject inside `commit` itself so the documented "re-handshake past a large gap"
+policy is enforced on the hot path, and correct the comment at 914-921 (which claims
+`commit` "already rejects out-of-window … counters internally").
+
+---
+
 ## Appendix — findings in the divergent `bindings/go/net/` copy
 
 `net/crates/net/bindings/go/net/` is git-tracked but has **no `go.mod`** and is a
@@ -698,8 +1252,21 @@ their impact as gated on that copy being built.
    `MeshStream.Send` pattern).
 2. **HIGH 8** — add `catch_unwind`/abort-guard to `rpc-ffi` + `compute-ffi` so a
    panic or `block_on` re-entry can't unwind across the C ABI.
-3. **MEDIUM 3 + 9 + 10** — deck-ffi EOF/timeout match (consumer livelock); reconcile
+3. **HIGH 19** — reliable-stream sequence gap + duplicate re-send on scheduler
+   backpressure (canonical `mesh.rs` send path). The only third-pass HIGH and the
+   first confirmed *core data-path* corruption; fix seq allocation/rollback before
+   the binding work if reliable scheduled streams are in use.
+4. **MEDIUM 3 + 9 + 10** — deck-ffi EOF/timeout match (consumer livelock); reconcile
    double-eviction; aggregator zero-interval panic. Small, contained fixes.
-4. **MEDIUM 11–14** — cortex out-param pre-zero, `GoBytes` size truncation,
-   `filter_novel` dedup key, half-open probe release.
-5. LOW 4–6, 15–18 and the appendix items as hygiene / when the bindings copy ships.
+5. **MEDIUM 20 + 21 + 22** — OUTER-join row-drop (silent query data loss), RedEX
+   header-checksum gap (silent index corruption on bit-rot), federated lost-`End`
+   spurious failure. Correctness of stored/queried data.
+6. **MEDIUM 11–14, 23–31** — cortex out-param pre-zero, `GoBytes` truncation,
+   `filter_novel` dedup key, half-open probe release; plus publish event-count
+   batching (panic), ICE thaw cooldown (break-glass), audit-stream waker, dup
+   `call_id`, route-owner degrade, `MarkAvoid` re-emit, hash-ring probe clobber, and
+   the go-ffi null-out-param / `isize::MAX` guards (with HIGH 8).
+7. LOW 4–6, 15–18, 32–36 and the appendix items as hygiene / when the bindings copy
+   ships.
+8. **INFO 37** — restore the `MAX_FORWARD` reject inside `commit` and fix the
+   misleading comment (hardening; not a live vulnerability).
