@@ -120,11 +120,12 @@ type MeshBlobAdapterOpts struct {
 }
 
 // MeshBlobAdapter wraps `*net_mesh_blob_adapter_t`. Cheap to
-// share via the Go runtime; methods take an internal lock
-// around `Close()` to serialize FFI `_free` against any
-// concurrent in-flight op.
+// share via the Go runtime; methods hold a read lock across the
+// FFI call and Close takes the write lock, so a concurrent _free
+// (explicit Close or the GC finalizer) can never race an in-flight
+// op into a use-after-free.
 type MeshBlobAdapter struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	handle *C.net_mesh_blob_adapter_t
 }
 
@@ -188,9 +189,9 @@ func (a *MeshBlobAdapter) Close() error {
 // The substrate BLAKE3-verifies + raises a typed error on
 // mismatch.
 func (a *MeshBlobAdapter) Store(blobRefBytes, data []byte) error {
-	a.mu.Lock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	handle := a.handle
-	a.mu.Unlock()
 	if handle == nil {
 		return ErrBlobClosed
 	}
@@ -215,9 +216,9 @@ func (a *MeshBlobAdapter) Store(blobRefBytes, data []byte) error {
 
 // Fetch returns the content-addressed bytes for `blobRefBytes`.
 func (a *MeshBlobAdapter) Fetch(blobRefBytes []byte) ([]byte, error) {
-	a.mu.Lock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	handle := a.handle
-	a.mu.Unlock()
 	if handle == nil {
 		return nil, ErrBlobClosed
 	}
@@ -243,9 +244,9 @@ func (a *MeshBlobAdapter) Fetch(blobRefBytes []byte) ([]byte, error) {
 // Exists probes local presence — returns `true` when every
 // chunk of `blobRefBytes` is locally reachable.
 func (a *MeshBlobAdapter) Exists(blobRefBytes []byte) (bool, error) {
-	a.mu.Lock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	handle := a.handle
-	a.mu.Unlock()
 	if handle == nil {
 		return false, ErrBlobClosed
 	}
@@ -269,9 +270,9 @@ func (a *MeshBlobAdapter) Exists(blobRefBytes []byte) (bool, error) {
 // (includes the v0.2 counter family + the v0.3 overflow
 // counter family if active).
 func (a *MeshBlobAdapter) PrometheusText() (string, error) {
-	a.mu.Lock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	handle := a.handle
-	a.mu.Unlock()
 	if handle == nil {
 		return "", ErrBlobClosed
 	}
@@ -286,9 +287,9 @@ func (a *MeshBlobAdapter) PrometheusText() (string, error) {
 // OverflowEnabled — `true` iff the adapter is currently
 // advertising `dataforts.blob.overflow`.
 func (a *MeshBlobAdapter) OverflowEnabled() (bool, error) {
-	a.mu.Lock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	handle := a.handle
-	a.mu.Unlock()
 	if handle == nil {
 		return false, ErrBlobClosed
 	}
@@ -302,9 +303,9 @@ func (a *MeshBlobAdapter) OverflowEnabled() (bool, error) {
 // OverflowActive — `true` iff the most recent overflow tick
 // observed disk at or above the high-water threshold.
 func (a *MeshBlobAdapter) OverflowActive() (bool, error) {
-	a.mu.Lock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	handle := a.handle
-	a.mu.Unlock()
 	if handle == nil {
 		return false, ErrBlobClosed
 	}
@@ -317,9 +318,9 @@ func (a *MeshBlobAdapter) OverflowActive() (bool, error) {
 
 // OverflowConfig snapshots the current overflow configuration.
 func (a *MeshBlobAdapter) OverflowConfig() (*OverflowConfig, error) {
-	a.mu.Lock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	handle := a.handle
-	a.mu.Unlock()
 	if handle == nil {
 		return nil, ErrBlobClosed
 	}
@@ -338,9 +339,9 @@ func (a *MeshBlobAdapter) OverflowConfig() (*OverflowConfig, error) {
 
 // SetOverflowEnabled flips the master switch at runtime.
 func (a *MeshBlobAdapter) SetOverflowEnabled(enabled bool) error {
-	a.mu.Lock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	handle := a.handle
-	a.mu.Unlock()
 	if handle == nil {
 		return ErrBlobClosed
 	}
@@ -361,9 +362,9 @@ func (a *MeshBlobAdapter) SetOverflowConfig(cfg *OverflowConfig) error {
 	if cfg == nil {
 		return fmt.Errorf("%w: config is nil", ErrBlobInvalidConfig)
 	}
-	a.mu.Lock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	handle := a.handle
-	a.mu.Unlock()
 	if handle == nil {
 		return ErrBlobClosed
 	}
