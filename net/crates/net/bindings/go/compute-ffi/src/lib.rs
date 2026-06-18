@@ -35,6 +35,7 @@
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
@@ -165,6 +166,58 @@ fn runtime() -> &'static Arc<Runtime> {
                 .expect("failed to construct compute-ffi tokio runtime"),
         )
     })
+}
+
+/// `block_on(...)` wrapper that aborts on runtime-in-runtime rather
+/// than panicking across the C ABI boundary.
+///
+/// Mirrors `net::ffi::mesh::block_on` / `net::ffi::cortex::block_on`:
+/// calling `Runtime::block_on` from a thread already inside a tokio
+/// runtime panics with "Cannot start a runtime from within a
+/// runtime". These functions are `extern "C"`, so that unwind would
+/// cross the cgo boundary into Go — undefined behavior. The check
+/// costs one TLS lookup (`Handle::try_current`) per call; a
+/// contract-violating embedded-Rust caller gets a clean abort with a
+/// diagnosable message instead of UB.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        eprintln!(
+            "FATAL: compute FFI called from inside a tokio runtime context; \
+             aborting to avoid runtime-in-runtime panic across the FFI boundary"
+        );
+        std::process::abort();
+    }
+    runtime().block_on(future)
+}
+
+// =========================================================================
+// FFI guard — wraps every entry point in `catch_unwind`
+// =========================================================================
+
+/// Wrap an `extern "C"` body in `catch_unwind` so a panic can never
+/// unwind across the C ABI boundary (which is undefined behavior).
+/// On panic the diagnostic is logged via `eprintln!` (this crate has
+/// no thread-local last-error channel like `meshos-ffi`/`deck-ffi`)
+/// and `$default` is returned. Mirrors the `ffi_guard!` macro in the
+/// sibling `meshos-ffi` / `deck-ffi` crates.
+macro_rules! ffi_guard {
+    ($default:expr, $body:block) => {{
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| $body));
+        match result {
+            Ok(v) => v,
+            Err(payload) => {
+                let detail = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "panic across FFI boundary".to_string()
+                };
+                eprintln!("net-compute-ffi: caught panic across FFI boundary: {detail}");
+                $default
+            }
+        }
+    }};
 }
 
 // =========================================================================
@@ -306,8 +359,7 @@ pub extern "C" fn net_compute_runtime_start(
         return NET_COMPUTE_ERR_NULL;
     };
     let inner = h.inner.clone();
-    let rt = runtime();
-    let res = rt.block_on(async move { inner.start().await });
+    let res = block_on(async move { inner.start().await });
     match res {
         Ok(()) => NET_COMPUTE_OK,
         Err(e) => {
@@ -330,8 +382,7 @@ pub extern "C" fn net_compute_runtime_shutdown(
     };
     let inner = h.inner.clone();
     let factories = h.factories.clone();
-    let rt = runtime();
-    let res = rt.block_on(async move { inner.shutdown().await });
+    let res = block_on(async move { inner.shutdown().await });
     match res {
         Ok(()) => {
             factories.clear();
@@ -809,6 +860,14 @@ fn fetch_daemon_caps(
             unsafe { libc::free(ptr as *mut std::ffi::c_void) };
             return CapabilitySet::default();
         }
+        // `slice::from_raw_parts` requires `len <= isize::MAX`; a
+        // dispatcher returning a bogus oversized length would be UB.
+        // Free the buffer (caller still owes us the free) and fall
+        // back to empty, mirroring the core ffi guard discipline.
+        if len > isize::MAX as usize {
+            unsafe { libc::free(ptr as *mut std::ffi::c_void) };
+            return CapabilitySet::default();
+        }
         // SAFETY: the consumer's contract says `ptr` points at
         // `len` bytes of UTF-8 JSON it allocated via
         // `C.malloc` / `libc::malloc`. We free via `libc::free`
@@ -872,6 +931,12 @@ pub extern "C" fn net_compute_outputs_push(
         return NET_COMPUTE_ERR_NULL;
     }
     if len > 0 && data.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`; a C caller
+    // passing `(size_t)-1` is immediate UB. Reject defensively, as the
+    // core `ffi/mod.rs` does at every such site.
+    if len > isize::MAX as usize {
         return NET_COMPUTE_ERR_NULL;
     }
     let v = unsafe { &mut *vec };
@@ -1026,6 +1091,13 @@ impl MeshDaemon for GoBridge {
             return None;
         }
         if len == 0 {
+            unsafe { libc::free(ptr as *mut std::ffi::c_void) };
+            return None;
+        }
+        // `slice::from_raw_parts` requires `len <= isize::MAX`; a Go
+        // snapshot trampoline returning a bogus oversized length would
+        // be UB. Free and treat as None, mirroring the core ffi guard.
+        if len > isize::MAX as usize {
             unsafe { libc::free(ptr as *mut std::ffi::c_void) };
             return None;
         }
@@ -1187,8 +1259,7 @@ pub extern "C" fn net_compute_spawn(
     };
 
     let inner = h.inner.clone();
-    let rt = runtime();
-    let result = rt.block_on(async move {
+    let result = block_on(async move {
         inner
             .spawn_with_daemon(sdk_identity, cfg, bridge, kind_factory)
             .await
@@ -1230,8 +1301,7 @@ pub extern "C" fn net_compute_runtime_stop(
         return NET_COMPUTE_ERR_NULL;
     };
     let inner = h.inner.clone();
-    let rt = runtime();
-    match rt.block_on(async move { inner.stop(origin_hash).await }) {
+    match block_on(async move { inner.stop(origin_hash).await }) {
         Ok(()) => NET_COMPUTE_OK,
         Err(e) => {
             write_err(err_out, &e.to_string());
@@ -1264,8 +1334,7 @@ pub extern "C" fn net_compute_runtime_snapshot(
         return NET_COMPUTE_ERR_NULL;
     }
     let inner = h.inner.clone();
-    let rt = runtime();
-    let result = rt.block_on(async move { inner.snapshot(origin_hash).await });
+    let result = block_on(async move { inner.snapshot(origin_hash).await });
     match result {
         Ok(opt) => {
             let vec = match opt {
@@ -1368,8 +1437,7 @@ pub extern "C" fn net_compute_spawn_from_snapshot(
     };
 
     let inner = h.inner.clone();
-    let rt = runtime();
-    let result = rt.block_on(async move {
+    let result = block_on(async move {
         inner
             .spawn_from_snapshot_with_daemon(
                 sdk_identity,
@@ -1484,8 +1552,7 @@ pub extern "C" fn net_compute_migration_handle_wait(
         return NET_COMPUTE_ERR_NULL;
     };
     let handle = h.inner.clone();
-    let rt = runtime();
-    match rt.block_on(async move { handle.wait().await }) {
+    match block_on(async move { handle.wait().await }) {
         Ok(()) => NET_COMPUTE_OK,
         Err(e) => {
             write_err(err_out, &format_sdk_error(&e));
@@ -1505,8 +1572,7 @@ pub extern "C" fn net_compute_migration_handle_wait_with_timeout(
         return NET_COMPUTE_ERR_NULL;
     };
     let handle = h.inner.clone();
-    let rt = runtime();
-    match rt.block_on(async move {
+    match block_on(async move {
         handle
             .wait_with_timeout(std::time::Duration::from_millis(timeout_ms))
             .await
@@ -1530,8 +1596,7 @@ pub extern "C" fn net_compute_migration_handle_cancel(
         return NET_COMPUTE_ERR_NULL;
     };
     let handle = &h.inner;
-    let rt = runtime();
-    match rt.block_on(async move { handle.cancel().await }) {
+    match block_on(async move { handle.cancel().await }) {
         Ok(()) => NET_COMPUTE_OK,
         Err(e) => {
             write_err(err_out, &format_sdk_error(&e));
@@ -1572,8 +1637,7 @@ pub extern "C" fn net_compute_start_migration(
     };
 
     let inner = h.inner.clone();
-    let rt = runtime();
-    let result = rt.block_on(async move {
+    let result = block_on(async move {
         inner
             .start_migration_with(origin_hash, source_node, target_node, opts)
             .await
@@ -1733,6 +1797,11 @@ pub extern "C" fn net_compute_runtime_deliver(
     if event_payload_len > 0 && event_payload.is_null() {
         return NET_COMPUTE_ERR_NULL;
     }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`; reject a
+    // `(size_t)-1` from cgo before it reaches the read (core ffi guard).
+    if event_payload_len > isize::MAX as usize {
+        return NET_COMPUTE_ERR_NULL;
+    }
     let payload = if event_payload_len == 0 {
         Bytes::new()
     } else {
@@ -1751,8 +1820,7 @@ pub extern "C" fn net_compute_runtime_deliver(
     };
 
     let inner = h.inner.clone();
-    let rt = runtime();
-    let result = rt.block_on(async move { inner.deliver(origin_hash, &event) });
+    let result = block_on(async move { inner.deliver(origin_hash, &event) });
     match result {
         Ok(outputs) => {
             let vec = OutputsVec {
@@ -1914,6 +1982,13 @@ fn write_err(out: *mut *mut c_char, msg: &str) {
 /// byte sequence of `len` bytes (no trailing NUL required).
 fn cstr_to_string(ptr: *const c_char, len: usize) -> Option<String> {
     if ptr.is_null() {
+        return None;
+    }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`. A C caller
+    // passing a sign-extended `-1` (or any `len > isize::MAX as usize`)
+    // is immediate UB before any other validation runs. Reject — the
+    // core `ffi/mod.rs` guards every such site. Mirrors that contract.
+    if len > isize::MAX as usize {
         return None;
     }
     let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
@@ -2985,6 +3060,10 @@ pub extern "C" fn net_compute_register_placement_filter(
     }
     if PLACEMENT_FILTER_DISPATCHER.get().is_none() {
         return -4;
+    }
+    // `slice::from_raw_parts` requires `len <= isize::MAX` (core ffi guard).
+    if id_len > isize::MAX as usize {
+        return NET_COMPUTE_ERR_NULL;
     }
 
     let id = unsafe {
