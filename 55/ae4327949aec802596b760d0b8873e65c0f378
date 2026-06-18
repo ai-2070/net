@@ -1,0 +1,20 @@
+go/blob.go
+  s_a77664841befef::t_afc642fcbfdd17 123-126,128
+  s_a77664841befef::t_7402d9ab9e371d 192-193,219-220,247-248,273-274,290-291,306-307,321-322,342-343,365-366
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "55ae4327949aec802596b760d0b8873e65c0f378",
+  "prompts": {},
+  "sessions": {
+    "s_a77664841befef": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5703ca68-d2ee-4e77-9d7f-06fbcec46aed",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
