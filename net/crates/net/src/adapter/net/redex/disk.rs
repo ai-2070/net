@@ -461,19 +461,94 @@ impl DiskSegment {
         // Compact timestamps to match the surviving index. If the
         // ts sidecar was missing/corrupt, propagate `None` so the
         // file.rs layer falls back to `now()`.
-        let timestamps = original_timestamps.as_ref().map(|all_ts| {
+        let mut timestamps = original_timestamps.as_ref().map(|all_ts| {
             survivors
                 .iter()
                 .map(|&i| all_ts.get(i).copied().unwrap_or(0))
                 .collect::<Vec<u64>>()
         });
 
+        // Enforce strict `seq` monotonicity over the (checksum-valid)
+        // recovered index. The per-entry checksum covers only the
+        // payload, NOT the 20-byte idx header (`seq`,
+        // `payload_offset`, `payload_len`, `flags`), so a torn write
+        // or bit-rot that mangles `seq` while leaving payload+checksum
+        // intact passes the checksum filter above and lands in the
+        // recovered index. Every read path (`tail`, `read_range`,
+        // `read_one`, `read_range_limited`) uses `partition_point`,
+        // which REQUIRES `index` to be sorted by `seq`; a non-monotonic
+        // index would silently return wrong/missing events, and
+        // `next_seq = last.seq + 1` could jump or regress (a regressed
+        // next_seq on a leader re-issues already-replicated seqs with
+        // different content → silent divergence).
+        //
+        // Walk forward and stop at the FIRST entry whose `seq` does not
+        // strictly exceed its predecessor's. Treat that as a torn tail
+        // — exactly how the torn-idx and torn-dat passes above handle a
+        // partial/garbage suffix — and truncate the index there. By
+        // dropping the suffix (rather than the single bad record) we
+        // never reorder survivors, so the result is always sorted by
+        // `seq` and `next_seq` is sane. This needs no on-disk format
+        // change: valid files are strictly increasing already, so this
+        // is a no-op for them.
+        let mut seq_truncate_at: Option<usize> = None;
+        for i in 1..index.len() {
+            if index[i].seq <= index[i - 1].seq {
+                seq_truncate_at = Some(i);
+                break;
+            }
+        }
+        if let Some(cut) = seq_truncate_at {
+            let dropped = index.len() - cut;
+            index.truncate(cut);
+            if let Some(ts) = timestamps.as_mut() {
+                ts.truncate(cut);
+            }
+            // Durably truncate the idx file to match the trimmed
+            // in-memory index — but ONLY when the on-disk idx file is
+            // still byte-for-byte aligned with `index`, i.e. when the
+            // checksum filter above did NOT compact `index` in memory
+            // (`bad_entries == 0`). A mid-file checksum drop leaves the
+            // idx file un-rewritten (existing behavior; it re-aligns
+            // lazily on the next append/compact), so its record at
+            // position `index.len()` is NOT our trim boundary —
+            // `set_len`-ing it would chop the wrong bytes. In that case
+            // we trim only in memory; the next reopen re-derives the
+            // same survivors and re-applies this trim deterministically.
+            //
+            // When aligned, the `set_len` is paired with `sync_all` for
+            // the same reason as the torn-idx/torn-dat passes: a crash
+            // before the next durable write must not reincarnate the
+            // non-monotonic suffix and re-trigger this trim forever.
+            if bad_entries == 0 {
+                let file = OpenOptions::new()
+                    .write(true)
+                    .open(&idx_path)
+                    .map_err(RedexError::io)?;
+                file.set_len((index.len() * REDEX_ENTRY_SIZE) as u64)
+                    .map_err(RedexError::io)?;
+                file.sync_all().map_err(RedexError::io)?;
+            }
+            tracing::error!(
+                dropped,
+                surviving = index.len(),
+                "DiskSegment::open: truncated {} trailing entries at a \
+                 non-monotonic seq during recovery; on-disk idx header \
+                 may have a torn write or bit-rot",
+                dropped
+            );
+        }
+
         // If we dropped mid-file entries, the on-disk ts file no
         // longer matches the surviving index byte-for-byte. Rewrite
         // it with the compacted timestamps so the next reopen sees a
         // file of length `surviving * 8` whose i-th entry pairs with
-        // `index[i]`. When no entries were dropped, just truncate
-        // the trailing slack from the tail-truncation step.
+        // `index[i]`. When no entries were dropped, just truncate the
+        // trailing slack from the tail-truncation step. The
+        // seq-monotonicity trim above only drops a TAIL (and shortens
+        // `timestamps` in lock-step), so it never needs the mid-file
+        // rewrite — the `else` branch's plain `set_len` re-aligns the
+        // ts file to the shortened index.
         if let Some(ts) = timestamps.as_ref() {
             if bad_entries > 0 {
                 if let Ok(mut file) = OpenOptions::new().write(true).truncate(true).open(&ts_path) {
@@ -2912,6 +2987,176 @@ mod tests {
              positions of the surviving entries; pre-fix this would \
              have been [1000, 2000, 3000]"
         );
+
+        cleanup(&base);
+    }
+
+    /// BUG_AUDIT #21: the per-entry checksum covers only the payload,
+    /// NOT the 20-byte idx header (`seq`/`offset`/`len`/`flags`). A
+    /// torn write or bit-rot that mangles `seq` while leaving the
+    /// payload + its checksum intact slips past recovery's checksum
+    /// filter. Pre-fix it landed in the recovered index, breaking the
+    /// `partition_point`-by-seq invariant every read relies on and
+    /// letting `next_seq = last.seq + 1` regress.
+    ///
+    /// Here we write four monotonic heap entries (seq 0,1,2,3), then
+    /// overwrite the `seq` HEADER of the third record (index 2) with a
+    /// value that breaks strict monotonicity — but leave its payload
+    /// and checksum untouched so the checksum filter accepts it. The
+    /// recovery walk must detect the non-monotonic seq and TRUNCATE the
+    /// index at that point (treating it as a torn tail), so the
+    /// surviving index is strictly increasing, reads stay correct, and
+    /// `next_seq` (derived as `last.seq + 1` at the file layer) is sane.
+    #[test]
+    fn recovery_truncates_at_non_monotonic_seq_header() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/seq_monotonic").unwrap();
+        let idx_path = gen_dir(&channel_dir(&base, &name), FIRST_GENERATION).join("idx");
+
+        // Four valid, strictly-increasing heap entries.
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let payloads: [&[u8]; 4] = [b"AA", b"BB", b"CC", b"DD"];
+        let timestamps: [u64; 4] = [1000, 2000, 3000, 4000];
+        let mut offset = 0u32;
+        for (i, p) in payloads.iter().enumerate() {
+            let e = RedexEntry::new_heap(i as u64, offset, p.len() as u32, 0, payload_checksum(p));
+            recovered
+                .disk
+                .append_entry_at(&e, p, timestamps[i])
+                .unwrap();
+            offset += p.len() as u32;
+        }
+        recovered.disk.sync().unwrap();
+        drop(recovered);
+
+        // Corrupt ONLY the `seq` header (first 8 LE bytes) of the third
+        // idx record (record index 2). We set it to 1, which is <= the
+        // previous survivor's seq (1) — a strict-monotonicity violation
+        // — while the payload `CC` in dat and the record's checksum are
+        // left intact, so the checksum filter still accepts the record.
+        {
+            let mut idx_bytes = std::fs::read(&idx_path).unwrap();
+            assert_eq!(idx_bytes.len(), 4 * REDEX_ENTRY_SIZE, "four records on disk");
+            let rec2 = 2 * REDEX_ENTRY_SIZE;
+            idx_bytes[rec2..rec2 + 8].copy_from_slice(&1u64.to_le_bytes());
+            std::fs::write(&idx_path, &idx_bytes).unwrap();
+        }
+
+        // Reopen: recovery must truncate at record index 2, keeping
+        // only seq [0, 1].
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let seqs: Vec<u64> = recovered.index.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![0, 1],
+            "recovery must truncate at the first non-monotonic seq; \
+             pre-fix the corrupt record (and the entries after it) \
+             would have been accepted, breaking partition_point reads"
+        );
+
+        // The surviving index is strictly increasing → partition_point
+        // reads are correct, and next_seq = last.seq + 1 = 2 is sane
+        // (not a regression to <= an already-issued seq).
+        for w in recovered.index.windows(2) {
+            assert!(w[0].seq < w[1].seq, "recovered index must be sorted by seq");
+        }
+        assert_eq!(
+            recovered.index.last().map(|e| e.seq + 1),
+            Some(2),
+            "next_seq derived from the trimmed tail must not regress"
+        );
+
+        // ts must stay paired with the trimmed index.
+        let ts = recovered.timestamps.expect("ts sidecar present");
+        assert_eq!(ts, vec![1000, 2000], "timestamps trimmed in lock-step");
+
+        // The idx file was durably truncated (bad_entries == 0 path), so
+        // a second reopen sees the already-clean two-record file with no
+        // further trimming.
+        let after_len = std::fs::metadata(&idx_path).unwrap().len();
+        assert_eq!(
+            after_len,
+            (2 * REDEX_ENTRY_SIZE) as u64,
+            "idx file durably truncated to the surviving two records"
+        );
+        let recovered2 = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let seqs2: Vec<u64> = recovered2.index.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs2, vec![0, 1], "second reopen is stable");
+
+        cleanup(&base);
+    }
+
+    /// Companion to `recovery_truncates_at_non_monotonic_seq_header`
+    /// for the `bad_entries > 0` path: when a mid-file checksum drop
+    /// has ALSO occurred, the idx file is intentionally left
+    /// un-rewritten (it re-aligns lazily on the next append/compact),
+    /// so the seq-monotonicity trim must apply IN MEMORY only and must
+    /// NOT `set_len` the (now-misaligned) idx file. We still assert the
+    /// in-memory recovered index is correctly trimmed and that a second
+    /// reopen converges to the same result.
+    #[test]
+    fn recovery_seq_trim_is_in_memory_only_after_checksum_drop() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/seq_monotonic_cksum").unwrap();
+        let dir = gen_dir(&channel_dir(&base, &name), FIRST_GENERATION);
+        let idx_path = dir.join("idx");
+        let dat_path = dir.join("dat");
+
+        // Five strictly-increasing heap entries (seq 0..4).
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let payloads: [&[u8]; 5] = [b"AA", b"BB", b"CC", b"DD", b"EE"];
+        let timestamps: [u64; 5] = [1000, 2000, 3000, 4000, 5000];
+        let mut offset = 0u32;
+        for (i, p) in payloads.iter().enumerate() {
+            let e = RedexEntry::new_heap(i as u64, offset, p.len() as u32, 0, payload_checksum(p));
+            recovered
+                .disk
+                .append_entry_at(&e, p, timestamps[i])
+                .unwrap();
+            offset += p.len() as u32;
+        }
+        recovered.disk.sync().unwrap();
+        drop(recovered);
+
+        // (1) Corrupt the payload of record 1 (`BB`) so its checksum
+        // fails → checksum filter drops it (bad_entries > 0). The dat
+        // layout is AABBCCDDEE; `BB` starts at offset 2.
+        {
+            let mut dat = std::fs::read(&dat_path).unwrap();
+            dat[2] ^= 0xFF;
+            std::fs::write(&dat_path, &dat).unwrap();
+        }
+        // (2) Corrupt the `seq` HEADER of record 3 (`DD`) to 2, which is
+        // <= record 2's seq (2) after the survivor compaction — a
+        // monotonicity violation among survivors. Payload + checksum
+        // left intact so the checksum filter accepts it.
+        {
+            let mut idx_bytes = std::fs::read(&idx_path).unwrap();
+            let rec3 = 3 * REDEX_ENTRY_SIZE;
+            idx_bytes[rec3..rec3 + 8].copy_from_slice(&2u64.to_le_bytes());
+            std::fs::write(&idx_path, &idx_bytes).unwrap();
+        }
+
+        // Reopen. Checksum filter drops seq 1; survivors are
+        // [0, 2, 2(corrupt), 4]. The seq trim then truncates at the
+        // first non-monotonic survivor (the corrupt 2), leaving [0, 2].
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let seqs: Vec<u64> = recovered.index.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![0, 2], "checksum drop then seq trim → [0, 2]");
+        for w in recovered.index.windows(2) {
+            assert!(w[0].seq < w[1].seq, "recovered index must be sorted by seq");
+        }
+        let ts = recovered.timestamps.as_ref().expect("ts sidecar present");
+        assert_eq!(ts, &vec![1000, 3000], "timestamps paired with survivors");
+        drop(recovered);
+
+        // Second reopen converges to the same in-memory result. (The
+        // idx file was not `set_len` on the seq trim because the
+        // checksum drop had already desynced it; recovery re-derives
+        // the survivors deterministically.)
+        let recovered2 = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let seqs2: Vec<u64> = recovered2.index.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs2, vec![0, 2], "second reopen is stable");
 
         cleanup(&base);
     }
