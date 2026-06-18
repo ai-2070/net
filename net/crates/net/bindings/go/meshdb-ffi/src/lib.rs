@@ -329,9 +329,11 @@ pub unsafe extern "C" fn net_meshdb_reader_append(
         if reader.is_null() {
             return NET_MESHDB_INVALID_ARG;
         }
+        // #31: `slice::from_raw_parts` requires `len <= isize::MAX`; a
+        // sign-extended `-1` from cgo would be immediate UB. Reject it.
         let payload_vec = if payload_len == 0 {
             Vec::new()
-        } else if payload.is_null() {
+        } else if payload.is_null() || payload_len > isize::MAX as usize {
             return NET_MESHDB_INVALID_ARG;
         } else {
             slice::from_raw_parts(payload, payload_len).to_vec()
@@ -955,7 +957,9 @@ pub unsafe extern "C" fn net_meshdb_decode_payload_json(
     payload_len: usize,
 ) -> *mut std::ffi::c_char {
     ffi_guard!(ptr::null_mut(), {
-        if payload_len == 0 || payload.is_null() {
+        // #31: `from_raw_parts` requires `len <= isize::MAX`; reject a
+        // sign-extended `-1` from cgo to avoid UB.
+        if payload_len == 0 || payload.is_null() || payload_len > isize::MAX as usize {
             return ptr::null_mut();
         }
         let bytes = slice::from_raw_parts(payload, payload_len);
