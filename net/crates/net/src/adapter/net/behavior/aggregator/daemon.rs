@@ -61,6 +61,10 @@ pub enum AggregatorError {
     },
     /// `fold_kinds` is empty — the daemon would do nothing.
     NoFoldKinds,
+    /// `summary_interval` is zero. `tokio::time::interval` panics
+    /// on a zero period, which would kill the spawned background
+    /// task, so the daemon refuses to construct with one.
+    ZeroInterval,
 }
 
 impl std::fmt::Display for AggregatorError {
@@ -72,6 +76,12 @@ impl std::fmt::Display for AggregatorError {
                  custom override in AggregatorConfig::custom_summarizers"
             ),
             Self::NoFoldKinds => write!(f, "AggregatorConfig::fold_kinds is empty"),
+            Self::ZeroInterval => write!(
+                f,
+                "AggregatorConfig::summary_interval is zero; \
+                 it must be a non-zero Duration (tokio::time::interval \
+                 panics on a zero period)"
+            ),
         }
     }
 }
@@ -165,6 +175,14 @@ impl AggregatorDaemon {
         if config.fold_kinds.is_empty() {
             return Err(AggregatorError::NoFoldKinds);
         }
+        // `spawn` feeds `summary_interval` into
+        // `tokio::time::interval`, which panics on a zero period
+        // and would kill the background task. Reject it here so the
+        // panic is impossible by construction (and so `health`'s
+        // "validation at construction rejects this" note holds).
+        if config.summary_interval.is_zero() {
+            return Err(AggregatorError::ZeroInterval);
+        }
         let mut summarizers: HashMap<u16, Arc<dyn Summarizer>> = HashMap::new();
         for kind in &config.fold_kinds {
             let s = resolve_summarizer(*kind, &config.custom_summarizers)
@@ -230,10 +248,10 @@ impl AggregatorDaemon {
     ///
     /// Bumps `generation`, runs each configured summarizer, then
     /// appends novel summaries to the latest-summaries buffer.
-    /// Summaries whose `(source_subnet, buckets)` match the most
-    /// recent entry for the same fold-kind are dropped — see
-    /// [`Self::tick_and_publish`] for the rationale. Does NOT
-    /// publish onto the wire.
+    /// Summaries whose `buckets` match the most recent entry of
+    /// the same identity `(fold_kind, source_subnet)` are dropped
+    /// — see [`Self::tick_and_publish`] for the rationale. Does
+    /// NOT publish onto the wire.
     ///
     /// Returns the novel summaries just appended (empty when the
     /// tick was a no-op). Callers that need the freshly-produced
@@ -252,9 +270,9 @@ impl AggregatorDaemon {
     /// [`MeshNode::publish`](crate::adapter::net::MeshNode::publish).
     /// Used by the background loop; tests can call it explicitly.
     ///
-    /// A summary is "novel" when its `(source_subnet, buckets)`
-    /// differs from the most recent entry already in the
-    /// latest-summaries buffer for the same `fold_kind`. Folds
+    /// A summary is "novel" when its `buckets` differ from the
+    /// most recent entry already in the latest-summaries buffer
+    /// with the same identity `(fold_kind, source_subnet)`. Folds
     /// that change rarely (capability, reservation) otherwise
     /// republish byte-identical summaries every tick.
     ///
@@ -311,10 +329,21 @@ impl AggregatorDaemon {
         Ok(published)
     }
 
-    /// Drop summaries whose `(source_subnet, buckets)` matches
-    /// the most recent prior entry in the latest buffer for the
-    /// same fold-kind. Generation is intentionally not part of
-    /// the equality — generation always advances tick-to-tick.
+    /// Drop summaries whose `buckets` match the most recent prior
+    /// entry in the latest buffer for the same row *identity*
+    /// — `(fold_kind, source_subnet)`. Generation is intentionally
+    /// not part of the equality — generation always advances
+    /// tick-to-tick.
+    ///
+    /// The baseline lookup keys on `(fold_kind, source_subnet)`
+    /// rather than `fold_kind` alone because a custom summarizer
+    /// may emit several `SummaryAnnouncement` rows under one
+    /// `fold_kind` in a single tick (per-class / per-region
+    /// rollups, distinguished by `source_subnet`). Keying on
+    /// `fold_kind` alone would diff every such row against the
+    /// single most-recent buffered entry of that kind, so all but
+    /// one would compare against the wrong baseline, always look
+    /// "novel", and re-publish every tick.
     fn filter_novel(&self, batch: Vec<SummaryAnnouncement>) -> Vec<SummaryAnnouncement> {
         if batch.is_empty() {
             return batch;
@@ -323,16 +352,13 @@ impl AggregatorDaemon {
         batch
             .into_iter()
             .filter(|summary| {
-                let prev = latest
-                    .iter()
-                    .rev()
-                    .find(|s| s.fold_kind == summary.fold_kind);
+                let prev = latest.iter().rev().find(|s| {
+                    s.fold_kind == summary.fold_kind
+                        && s.source_subnet == summary.source_subnet
+                });
                 match prev {
                     None => true,
-                    Some(prev) => {
-                        prev.source_subnet != summary.source_subnet
-                            || prev.buckets != summary.buckets
-                    }
+                    Some(prev) => prev.buckets != summary.buckets,
                 }
             })
             .collect()
@@ -559,8 +585,11 @@ impl LifecycleDaemon for AggregatorDaemon {
         let interval_ns = self.config.summary_interval.as_nanos();
         if interval_ns == 0 {
             // Degenerate config — can't reason about ticks per
-            // unit time. Surface as healthy; the validation at
-            // construction normally rejects this.
+            // unit time. `new()` rejects a zero `summary_interval`
+            // (`AggregatorError::ZeroInterval`), so this branch is
+            // unreachable for a daemon built through `new`; it
+            // stays as a defensive guard against a divide-by-zero
+            // below. Surface as healthy rather than panicking.
             return ReplicaHealth::healthy();
         }
         let elapsed_ns = self.start_instant.elapsed().as_nanos();
@@ -659,6 +688,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_rejects_zero_summary_interval() {
+        // A zero `summary_interval` would make `spawn`'s
+        // `tokio::time::interval(Duration::ZERO)` panic and kill
+        // the background task. `new()` must reject it up front so
+        // that panic is impossible by construction. The fold-kind
+        // is valid here so the only reason to reject is the zero
+        // interval.
+        let mesh = build_mesh().await;
+        let cfg = AggregatorConfig::new(SubnetId::GLOBAL)
+            .with_fold_kind(CapabilityFold::KIND_ID)
+            .with_interval(Duration::ZERO);
+        match AggregatorDaemon::new(cfg, mesh) {
+            Err(AggregatorError::ZeroInterval) => {}
+            Err(other) => panic!("expected ZeroInterval, got {other:?}"),
+            Ok(_) => panic!("expected ZeroInterval, got Ok"),
+        }
+    }
+
+    #[tokio::test]
     async fn tick_once_summarizes_capability_fold_and_bumps_generation() {
         let mesh = build_mesh().await;
         // Prime the capability fold with two idle + one busy
@@ -709,6 +757,62 @@ mod tests {
         agg.tick_once();
         assert_eq!(agg.generation(), 2);
         assert_eq!(agg.latest_summaries().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn filter_novel_keys_on_source_subnet_not_fold_kind_alone() {
+        // Regression for the dedup bug: a custom summarizer may
+        // emit several rows under one `fold_kind` per tick,
+        // distinguished by `source_subnet` (per-class / per-region
+        // rollups). The baseline lookup must key on
+        // `(fold_kind, source_subnet)` so each row diffs against
+        // its OWN prior baseline — not against the single
+        // most-recent buffered row of that kind.
+        let mesh = build_mesh().await;
+        let cfg = AggregatorConfig::new(SubnetId::GLOBAL)
+            .with_fold_kind(CapabilityFold::KIND_ID)
+            .with_interval(Duration::from_secs(60));
+        let agg = AggregatorDaemon::new(cfg, mesh).expect("new");
+
+        let row = |subnet: SubnetId, count: u64| SummaryAnnouncement {
+            source_subnet: subnet,
+            fold_kind: CapabilityFold::KIND_ID,
+            generation: 1,
+            buckets: vec![("idle".to_string(), count)],
+        };
+        let a = SubnetId::new(&[1]);
+        let b = SubnetId::new(&[2]);
+
+        // Tick 1: two same-kind rows with distinct source_subnets.
+        // Buffer is empty, so both are novel.
+        let novel = agg.filter_novel(vec![row(a, 1), row(b, 2)]);
+        assert_eq!(
+            novel.len(),
+            2,
+            "two same-kind rows with distinct source_subnets are both novel"
+        );
+        agg.append_to_latest(novel);
+        assert_eq!(agg.latest_summaries().len(), 2);
+
+        // Tick 2: re-emit identical rows. Each diffs against its
+        // OWN buffered baseline (matched on source_subnet), so
+        // both are TRUE repeats and dedup to zero. Under the old
+        // fold_kind-only key, the `a` row would have been diffed
+        // against the most-recent buffered row (`b`), looked
+        // novel, and re-published every tick.
+        let novel = agg.filter_novel(vec![row(a, 1), row(b, 2)]);
+        assert!(
+            novel.is_empty(),
+            "identical re-emits of both rows dedup to nothing, got {novel:?}"
+        );
+
+        // Tick 3: only the `a` row's buckets change. `a` is novel
+        // (its own buckets differ from its baseline); `b` is an
+        // unchanged repeat and is dropped.
+        let novel = agg.filter_novel(vec![row(a, 9), row(b, 2)]);
+        assert_eq!(novel.len(), 1, "only the changed-row should be novel");
+        assert_eq!(novel[0].source_subnet, a);
+        assert_eq!(novel[0].buckets, vec![("idle".to_string(), 9)]);
     }
 
     #[tokio::test]
