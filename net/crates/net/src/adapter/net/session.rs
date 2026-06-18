@@ -418,6 +418,26 @@ impl NetSession {
             seq: seq.expect("seq is Some when admitted is true"),
         }
     }
+
+    /// Roll back a TX sequence allocated by
+    /// [`Self::try_acquire_tx_credit_matching_epoch`] when the packet it
+    /// was minted for never reached the wire (scheduler/socket
+    /// backpressure after the seq was consumed). Guarded by `epoch` so a
+    /// close+reopen race can't roll back a sequence on a fresh stream
+    /// state that never issued it — the exact discipline
+    /// [`TxSlotGuard::drop`] uses for the byte-credit refund.
+    ///
+    /// Returns `true` if the sequence was reclaimed (it was the most-
+    /// recently-issued seq and no concurrent send raced ahead), leaving
+    /// no receiver-visible gap; `false` otherwise.
+    pub fn try_rollback_tx_seq(self: &Arc<Self>, stream_id: u64, epoch: u64, seq: u64) -> bool {
+        if let Some(state) = self.try_stream(stream_id) {
+            if state.epoch() == epoch {
+                return state.try_rollback_tx_seq(seq);
+            }
+        }
+        false
+    }
 }
 
 /// Outcome of [`NetSession::try_acquire_tx_credit_matching_epoch`].
@@ -1354,6 +1374,34 @@ impl StreamState {
                 Some(v.saturating_sub(bytes as u64))
             })
             .ok();
+    }
+
+    /// Attempt to roll back a TX sequence number that was allocated via
+    /// [`Self::next_tx_seq`] but whose packet never reached the wire
+    /// (e.g. the FairScheduler queue was full and `deliver_stream_packet`
+    /// returned `Backpressure` *after* the seq was consumed). Unlike the
+    /// byte credit — which `TxSlotGuard::drop` always refunds — the seq
+    /// is a monotonic `fetch_add` counter, so a blind decrement is unsafe:
+    /// a concurrent sender on the same stream may already have consumed
+    /// `seq + 1`, and decrementing would re-issue that sender's sequence.
+    ///
+    /// We therefore roll back **only** via a CAS `seq + 1 -> seq`, which
+    /// succeeds exactly when `seq` was the most-recently-issued sequence
+    /// (the common case for the backpressure-on-the-last-flush scenario)
+    /// and no other send has advanced the counter in between. Returns
+    /// `true` if the rollback won the CAS (no gap left behind), `false`
+    /// if another allocation raced ahead — in which case the gap is
+    /// genuinely unavoidable and the reliable-stream retransmit/NACK
+    /// machinery must recover it instead.
+    pub fn try_rollback_tx_seq(&self, seq: u64) -> bool {
+        self.tx_seq
+            .compare_exchange(
+                seq.wrapping_add(1),
+                seq,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     /// Apply a receiver grant reporting the receiver's **absolute**
@@ -2413,6 +2461,89 @@ mod tests {
         // The pre-fix audit framing claimed this was a bug; closer
         // inspection showed it's the documented v2 design. See
         // `RxCreditState` rustdoc + `mesh.rs:3110-3135`.
+    }
+
+    /// Regression (#19): a TX sequence consumed for a packet that never
+    /// reached the wire (scheduler/socket backpressure after the seq was
+    /// allocated) must be reclaimable so the receiver sees no permanent
+    /// gap. `try_rollback_tx_seq` rolls the counter back exactly when the
+    /// seq was the most-recently-issued one.
+    #[test]
+    fn try_rollback_tx_seq_reclaims_last_issued_seq() {
+        let state = StreamState::new_full(true, 1, 100);
+
+        // Consume two sequences (0 then 1).
+        let s0 = state.next_tx_seq();
+        let s1 = state.next_tx_seq();
+        assert_eq!(s0, 0);
+        assert_eq!(s1, 1);
+
+        // The packet for s1 hit backpressure and never went out. Roll it
+        // back: the CAS `2 -> 1` wins because s1 was the last seq issued.
+        assert!(
+            state.try_rollback_tx_seq(s1),
+            "rolling back the most-recent seq must succeed"
+        );
+
+        // No gap: the next allocation re-uses the reclaimed value.
+        assert_eq!(
+            state.next_tx_seq(),
+            s1,
+            "after rollback the counter must re-issue the reclaimed seq, leaving no hole"
+        );
+    }
+
+    /// Regression (#19): if a *concurrent* sender on the same stream
+    /// already consumed the next sequence, the rollback must NOT corrupt
+    /// the counter — a blind decrement would re-issue the concurrent
+    /// sender's seq as a duplicate. The CAS-guarded rollback fails
+    /// cleanly and leaves the counter untouched.
+    #[test]
+    fn try_rollback_tx_seq_refuses_when_a_newer_seq_was_issued() {
+        let state = StreamState::new_full(true, 1, 100);
+
+        let stale = state.next_tx_seq(); // 0 — this packet hit backpressure
+        let newer = state.next_tx_seq(); // 1 — a concurrent send already took it
+        assert_eq!(stale, 0);
+        assert_eq!(newer, 1);
+
+        // Rolling back the stale seq must fail: the counter is at 2, not
+        // `stale + 1`, so the CAS cannot win.
+        assert!(
+            !state.try_rollback_tx_seq(stale),
+            "rollback must refuse once a newer seq has been issued"
+        );
+
+        // Counter is intact — the next allocation is still 2, so the
+        // concurrent sender's seq 1 is never re-issued as a duplicate.
+        assert_eq!(state.next_tx_seq(), 2);
+    }
+
+    /// The session-level wrapper is epoch-guarded: a rollback aimed at a
+    /// different epoch (post close+reopen) is a no-op and never touches
+    /// the live stream state, mirroring the credit-refund discipline in
+    /// `TxSlotGuard::drop`.
+    #[test]
+    fn session_try_rollback_tx_seq_is_epoch_guarded() {
+        let keys = test_keys();
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let session = Arc::new(NetSession::new(keys, addr, 4, false));
+
+        let stream_id = 0x55;
+        // Consume a seq, then release the DashMap `RefMut` before the
+        // session-level rollback re-locks the same map.
+        let (epoch, seq) = {
+            let state = session.get_or_create_stream(stream_id);
+            (state.epoch(), state.next_tx_seq())
+        };
+
+        // Wrong epoch: no-op, returns false, counter untouched.
+        assert!(!session.try_rollback_tx_seq(stream_id, epoch.wrapping_add(1), seq));
+        assert_eq!(session.try_stream(stream_id).unwrap().current_tx_seq(), 1);
+
+        // Correct epoch: reclaims the seq.
+        assert!(session.try_rollback_tx_seq(stream_id, epoch, seq));
+        assert_eq!(session.try_stream(stream_id).unwrap().current_tx_seq(), 0);
     }
 
     /// Regression: `outstanding()` must never observe a transient

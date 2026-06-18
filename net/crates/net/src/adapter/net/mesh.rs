@@ -11079,42 +11079,35 @@ impl MeshNode {
             PacketFlags::NONE
         };
 
+        // #19 atomicity: once ANY packet of this call has been committed
+        // (put on the wire / handed to the scheduler), the call is past
+        // the point of no return. Surfacing `Backpressure` to the caller
+        // after a partial commit is unsafe: `send_with_retry` replays the
+        // WHOLE `events` slice under fresh sequence numbers, so the
+        // already-committed packets would be delivered twice. So we only
+        // return `Backpressure` while `committed_any == false` (the caller
+        // may safely retry the whole slice — nothing has been sent and any
+        // consumed seq was rolled back). After the first commit, a flush
+        // that meets backpressure retries *internally* with backoff until
+        // it clears, so the batch is sent exactly once, in order.
+        let mut committed_any = false;
+
         for event in events {
             let frame_size = EventFrame::LEN_SIZE + event.len();
             if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE && !current_batch.is_empty() {
-                // Charge the **wire size** (Net header + AEAD tag +
-                // payload) rather than just the event-frame payload
-                // so the byte window matches the bandwidth the sender
-                // actually pumps onto the link. Both ends add the
-                // same fixed per-packet overhead, so sender and
-                // receiver accounting stay symmetric.
-                //
-                // `TxAdmit::Acquired` returns credit + sequence under
-                // the same DashMap lookup — a close+reopen race can't
-                // slip a stale sequence from the old lifetime onto
-                // the new state.
-                let needed = wire_bytes_for_payload(current_size);
-                let (guard, seq) = match session.try_acquire_tx_credit_matching_epoch(
-                    stream_id,
-                    stream.epoch,
-                    needed,
-                ) {
-                    TxAdmit::Acquired { guard, seq } => (guard, seq),
-                    TxAdmit::WindowFull => return Err(StreamError::Backpressure),
-                    TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
-                };
-                let packet = builder.build(stream_id, seq, &current_batch, flags);
-                self.deliver_stream_packet(scheduled, &packet, peer_addr, stream_id)
-                    .await?;
-                guard.commit(); // accepted (socket or scheduler) — bytes are the receiver's now
-                Self::register_retransmit(
+                self.flush_stream_batch(
                     &session,
+                    &mut builder,
+                    stream,
                     stream_id,
-                    stream.epoch,
-                    seq,
-                    &current_batch,
+                    peer_addr,
+                    scheduled,
                     flags,
-                );
+                    &current_batch,
+                    current_size,
+                    &mut committed_any,
+                )
+                .await?;
                 current_batch.clear();
                 current_size = 0;
             }
@@ -11123,31 +11116,134 @@ impl MeshNode {
         }
 
         if !current_batch.is_empty() {
-            let needed = wire_bytes_for_payload(current_size);
-            let (guard, seq) =
-                match session.try_acquire_tx_credit_matching_epoch(stream_id, stream.epoch, needed)
-                {
-                    TxAdmit::Acquired { guard, seq } => (guard, seq),
-                    TxAdmit::WindowFull => return Err(StreamError::Backpressure),
-                    TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
-                };
-            let packet = builder.build(stream_id, seq, &current_batch, flags);
-            self.deliver_stream_packet(scheduled, &packet, peer_addr, stream_id)
-                .await?;
-            guard.commit();
-            Self::register_retransmit(
+            self.flush_stream_batch(
                 &session,
+                &mut builder,
+                stream,
                 stream_id,
-                stream.epoch,
-                seq,
-                &current_batch,
+                peer_addr,
+                scheduled,
                 flags,
-            );
+                &current_batch,
+                current_size,
+                &mut committed_any,
+            )
+            .await?;
         }
 
         drop(builder);
         session.touch();
         Ok(())
+    }
+
+    /// Flush one built batch of a [`Self::send_on_stream`] call: acquire
+    /// byte credit + a sequence, build the packet, deliver it, commit the
+    /// credit, and register the reliable retransmit descriptor.
+    ///
+    /// Backpressure handling is the delicate part (bug-audit #19). The
+    /// sequence is allocated atomically with the byte credit (so a
+    /// close+reopen race can't cross-contaminate accounting across stream
+    /// lifetimes), but `deliver_stream_packet` can *still* fail with
+    /// `Backpressure` AFTER the seq was consumed — a full FairScheduler
+    /// queue on a `scheduled` stream. The fix has two halves:
+    ///
+    /// * **No permanent gap.** On the scheduler-backpressure failure path
+    ///   the guard's `Drop` refunds the byte credit, and we additionally
+    ///   roll back the just-consumed sequence via
+    ///   [`NetSession::try_rollback_tx_seq`] (a CAS that only reclaims the
+    ///   most-recently-issued seq). The packet was never on the wire, so
+    ///   reclaiming the seq leaves no hole for the receiver to NACK
+    ///   forever.
+    /// * **No duplicate replay.** `*committed_any` tracks whether an
+    ///   earlier flush in the same call already put a packet on the wire.
+    ///   Before the first commit, backpressure propagates as
+    ///   `StreamError::Backpressure` (the caller's `send_with_retry` may
+    ///   safely replay the whole slice). After the first commit, this
+    ///   flush instead retries internally with exponential backoff until
+    ///   it clears, so the committed prefix is never re-sent under new
+    ///   seqs.
+    #[allow(clippy::too_many_arguments)]
+    async fn flush_stream_batch(
+        &self,
+        session: &Arc<NetSession>,
+        builder: &mut super::pool::ThreadLocalPooledBuilder<'_>,
+        stream: &Stream,
+        stream_id: u64,
+        peer_addr: SocketAddr,
+        scheduled: bool,
+        flags: PacketFlags,
+        batch: &[Bytes],
+        batch_size: usize,
+        committed_any: &mut bool,
+    ) -> Result<(), StreamError> {
+        // Charge the **wire size** (Net header + AEAD tag + payload)
+        // rather than just the event-frame payload so the byte window
+        // matches the bandwidth the sender actually pumps onto the link.
+        // Both ends add the same fixed per-packet overhead, so sender and
+        // receiver accounting stay symmetric.
+        let needed = wire_bytes_for_payload(batch_size);
+        let mut delay = Duration::from_millis(5);
+        let cap = Duration::from_millis(200);
+        loop {
+            // `TxAdmit::Acquired` returns credit + sequence under the
+            // same DashMap lookup — a close+reopen race can't slip a
+            // stale sequence from the old lifetime onto the new state.
+            let (guard, seq) = match session.try_acquire_tx_credit_matching_epoch(
+                stream_id,
+                stream.epoch,
+                needed,
+            ) {
+                TxAdmit::Acquired { guard, seq } => (guard, seq),
+                TxAdmit::WindowFull => {
+                    if *committed_any {
+                        // Already committed earlier packets this call —
+                        // a return would trigger a whole-slice replay.
+                        // Wait for a receiver grant to free credit.
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(cap);
+                        continue;
+                    }
+                    return Err(StreamError::Backpressure);
+                }
+                TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
+            };
+            let packet = builder.build(stream_id, seq, batch, flags);
+            match self
+                .deliver_stream_packet(scheduled, &packet, peer_addr, stream_id)
+                .await
+            {
+                Ok(()) => {
+                    guard.commit(); // accepted (socket or scheduler) — bytes are the receiver's now
+                    Self::register_retransmit(session, stream_id, stream.epoch, seq, batch, flags);
+                    *committed_any = true;
+                    return Ok(());
+                }
+                Err(StreamError::Backpressure) => {
+                    // Scheduler queue full: the packet did NOT reach the
+                    // wire. Drop the guard (refunds the byte credit) and
+                    // roll back the consumed sequence so no receiver gap
+                    // is left behind, then either retry internally (if a
+                    // prefix is already committed) or surface backpressure
+                    // for a safe whole-slice replay.
+                    drop(guard);
+                    session.try_rollback_tx_seq(stream_id, stream.epoch, seq);
+                    if *committed_any {
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(cap);
+                        continue;
+                    }
+                    return Err(StreamError::Backpressure);
+                }
+                Err(e) => {
+                    // Transport/other error: the guard's Drop refunds the
+                    // credit. Roll back the seq too — the packet never
+                    // reached the wire, so the sequence is unused.
+                    drop(guard);
+                    session.try_rollback_tx_seq(stream_id, stream.epoch, seq);
+                    return Err(e);
+                }
+            }
+        }
     }
 
     /// Register a just-sent reliable packet for retransmit (STREAM_RETRANSMIT
