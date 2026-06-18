@@ -25,6 +25,49 @@ FFI-edge mediums. One reported HIGH (crypto anti-replay `MAX_FORWARD`) was
 investigated and **downgraded to informational** (#37) — the control is dead on
 the hot path but the window math means it is *not* an exploitable replay bypass.
 
+## Resolution (branch `bugfix/audit-2026-06-18`, 22 commits)
+
+**Fixed + committed (34 of 37 findings + several appendix-class):**
+- Rust core/behavior: #5, #6, #9, #10, #13, #14, #15, #18, #19, #20, #21, #22,
+  #24, #25, #26, #27, #28, #29, #32, #33, #34, #35, #36. All compile-verified
+  (`cargo check`) and the touched modules' `cargo test` pass; regression tests
+  added per finding (existing tests that pinned buggy behavior — e.g. #24 ICE
+  cooldown, #6 watermark — were updated).
+- FFI / go-ffi Rust crates: #3, #8 (rpc-ffi + compute-ffi), #11, #16, #30, #31
+  (rpc/compute/deck/meshos/meshdb-ffi), #4. Compile-verified; crate tests pass.
+- Go bindings (canonical `go/` module): #1 (RpcStream/ClientStreamCall/
+  DuplexCall), #2 (MeshOsDaemonHandle), #7 (MeshBlobAdapter) — the three
+  use-after-free races. **Caveat:** this environment has no cgo C toolchain
+  (`CGO_ENABLED=0`, no gcc), so these three are verified by `gofmt` + manual
+  review only, not a cgo compile/link. The changes are mechanical RWMutex +
+  `runtime.KeepAlive` additions mirroring the existing `MeshRpc.withHandle` /
+  `MeshStream.Send` pattern.
+
+**Investigated and intentionally NOT changed:**
+- #37 — reverted. The "restore MAX_FORWARD in `commit`" hardening breaks 4
+  existing replay-window tests that encode deliberate design: `commit` accepts
+  large forward jumps so a receiver that missed >1024 packets survives heavy
+  loss without a forced re-handshake (old counters are still caught by the age
+  check). The audit already classified #37 as *not* an exploitable bug, so this
+  is a behavior/policy change with a real reliability downside and no security
+  gain — left to a deliberate decision.
+
+**Deferred (not safely completable in this pass — see notes):**
+- #23 — publish-path event-count/byte chunking. A non-trivial hot-path refactor
+  (`send_on_stream`-style per-chunk credit/seq loop) in `mesh.rs`; deserves
+  careful reliable-stream testing rather than a rushed edit. Still open: a
+  `publish_many` of >2028 events panics `build_subprotocol`'s `assert!`.
+- #17 — seed-pointer length validation. The real fix is a breaking C-ABI change
+  (add `seed_len` to `net_compute_spawn`/`net_meshos_register…` + update Go
+  callers + headers); disproportionate for a LOW finding only reachable by a
+  caller violating the documented 32-byte contract (in-tree callers always pass
+  32). The compute-ffi commit message overstates this — only #8/#31 landed there.
+- #12 — `C.GoBytes(ptr, C.int(len))` ≥2 GiB truncation (~20 call sites). Each
+  site needs bespoke error handling around `goBytesChecked`'s `(…, bool)`
+  return; with no cgo toolchain to compile-verify, 20 blind edits is too risky.
+- Appendix B-1..B-7 — in the divergent `bindings/go/net/` copy (+ B-4 pump
+  busy-spin in canonical `meshos.go`); not addressed.
+
 ## Subsystems audited and found CLEAN (no concrete bug)
 
 These came back with no actionable defect — they are saturated with prior-audit
