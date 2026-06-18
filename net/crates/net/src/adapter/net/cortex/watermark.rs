@@ -12,8 +12,10 @@
 //! The typed adapters install this wrapper around the user fold so
 //! discovery piggybacks on the fold task's traversal. The fold task
 //! reads each event exactly once; on every successful inner-fold
-//! `apply` we parse the leading [`EventMeta`] and, if the event
-//! matches our `origin_hash`, advance the shared `Arc<AtomicU64>` via
+//! `apply` — and also on a recoverable `Decode` error, because the
+//! wire slot is claimed regardless of whether the body decodes (#6)
+//! — we parse the leading [`EventMeta`] and, if the event matches
+//! our `origin_hash`, advance the shared `Arc<AtomicU64>` via
 //! `fetch_max(meta.seq_or_ts + 1)`. The typed constructors then
 //! `wait_for_seq(replay_end - 1).await` before returning so callers
 //! see a fully-ready adapter — `app_seq` is correct synchronously
@@ -63,14 +65,34 @@ where
     F: RedexFold<S>,
 {
     fn apply(&mut self, ev: &RedexEvent, state: &mut S) -> Result<(), RedexError> {
-        // Inner fold owns the user-visible state-update semantics. If
-        // it errors we surface that verbatim — the watermark only
-        // advances on a successful apply, so a fold-error policy of
-        // `Continue` skips this event for both state AND watermark
-        // accounting (matching the pre-fix behavior where the
-        // synchronous `read_range` loop would have included the
-        // event but the fold would have skipped it).
-        self.inner.apply(ev, state)?;
+        // Inner fold owns the user-visible state-update semantics.
+        let inner_result = self.inner.apply(ev, state);
+
+        // The watermark advances on a successful apply AND on a
+        // recoverable `Decode` error for a same-origin event. The
+        // latter is the #6 fix: the `EventMeta` header is parsed
+        // independently of the body, and the wire slot is *claimed*
+        // (a `seq_or_ts` was already stamped on this event) the
+        // moment it was written — regardless of whether the body
+        // decodes. If we returned early on a recoverable Decode
+        // without advancing, `app_seq` could fall behind a
+        // claimed-but-dead `seq_or_ts`; a later `ingest_typed`
+        // would then re-stamp that same `seq_or_ts`, producing two
+        // wire events with the same per-origin sequence — the exact
+        // corruption this counter exists to prevent.
+        //
+        // A NON-recoverable error (stream-level / configuration) is
+        // surfaced verbatim with the watermark untouched: it halts
+        // the fold task rather than skipping a single claimed slot,
+        // so there is no claimed-but-dead slot to account for.
+        match &inner_result {
+            Ok(()) => {}
+            Err(e) if e.is_recoverable_decode() => {
+                // Fall through to the header parse + watermark
+                // advance below, then return the error.
+            }
+            Err(_) => return inner_result,
+        }
 
         // Defensive payload-length guard — a payload shorter than
         // `EVENT_META_SIZE` cannot have come through `ingest_typed`
@@ -79,13 +101,13 @@ where
         // file, in which case we silently skip rather than corrupt
         // the watermark with a bogus parse.
         if ev.payload.len() < EVENT_META_SIZE {
-            return Ok(());
+            return inner_result;
         }
         let Some(meta) = EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE]) else {
-            return Ok(());
+            return inner_result;
         };
         if meta.origin_hash != self.origin_hash {
-            return Ok(());
+            return inner_result;
         }
 
         // `fetch_max` is the right primitive: events arrive in
@@ -110,11 +132,11 @@ where
         // malformed event; refusing to advance keeps `app_seq <
         // u64::MAX` and preserves the monotonicity invariant.
         if meta.seq_or_ts == u64::MAX {
-            return Ok(());
+            return inner_result;
         }
         let next = meta.seq_or_ts.saturating_add(1);
         self.app_seq.fetch_max(next, Ordering::AcqRel);
-        Ok(())
+        inner_result
     }
 }
 
@@ -137,10 +159,13 @@ mod tests {
 
     /// Inner fold that just records every (seq, dispatch) pair the
     /// wrapper hands it, and optionally fails on a specific seq to
-    /// exercise the error-propagation path.
+    /// exercise the error-propagation path. `fail_recoverable`
+    /// selects whether the forced failure is a recoverable
+    /// `Decode` (skip-and-continue) or a non-recoverable error.
     struct MockFold {
         seen: Vec<(u64, u8)>,
         fail_at_seq: Option<u64>,
+        fail_recoverable: bool,
     }
 
     impl MockFold {
@@ -148,12 +173,26 @@ mod tests {
             Self {
                 seen: Vec::new(),
                 fail_at_seq: None,
+                fail_recoverable: true,
             }
         }
+        /// Fail on `seq` with a recoverable `Decode` error (the
+        /// per-event skip-and-continue path).
         fn fail_on(seq: u64) -> Self {
             Self {
                 seen: Vec::new(),
                 fail_at_seq: Some(seq),
+                fail_recoverable: true,
+            }
+        }
+        /// Fail on `seq` with a NON-recoverable error (a
+        /// stream-level failure that must not advance the
+        /// watermark).
+        fn fail_on_nonrecoverable(seq: u64) -> Self {
+            Self {
+                seen: Vec::new(),
+                fail_at_seq: Some(seq),
+                fail_recoverable: false,
             }
         }
     }
@@ -161,7 +200,10 @@ mod tests {
     impl RedexFold<Vec<(u64, u8)>> for MockFold {
         fn apply(&mut self, ev: &RedexEvent, state: &mut Vec<(u64, u8)>) -> Result<(), RedexError> {
             if Some(ev.entry.seq) == self.fail_at_seq {
-                return Err(RedexError::Decode("forced failure".into()));
+                if self.fail_recoverable {
+                    return Err(RedexError::Decode("forced failure".into()));
+                }
+                return Err(RedexError::Io("forced non-recoverable failure".into()));
             }
             let dispatch = ev.payload.first().copied().unwrap_or(0);
             self.seen.push((ev.entry.seq, dispatch));
@@ -271,23 +313,76 @@ mod tests {
     }
 
     #[test]
-    fn inner_fold_error_propagates_and_does_not_advance_watermark() {
-        // The watermark only advances on a *successful*
-        // inner-fold apply. If the user fold rejects the event, the
-        // wrapper must surface the error AND leave app_seq alone — the
-        // event was effectively skipped (Continue policy) or halted
-        // the task (Stop policy), and either way the per-origin
-        // counter must not include it.
+    fn recoverable_decode_error_still_advances_watermark_for_matching_origin() {
+        // #6 fix (UPDATED — this test previously pinned the buggy
+        // behavior of NOT advancing on a recoverable Decode).
+        //
+        // A recoverable `Decode` error on a SAME-ORIGIN event still
+        // advances `app_seq`: the wire slot was already claimed (a
+        // `seq_or_ts` was stamped when the event was written), and
+        // the `EventMeta` header parses independently of the body.
+        // If we left `app_seq` behind here, a later `ingest_typed`
+        // could re-stamp the same `seq_or_ts`, producing a
+        // duplicate per-origin sequence — the exact corruption this
+        // counter prevents. The wrapper must STILL surface the
+        // error to the inner fold-error-policy interpreter.
         let app_seq = Arc::new(AtomicU64::new(0));
         let mut wf = WatermarkingFold::new(MockFold::fail_on(0), app_seq.clone(), ORIGIN_US);
         let mut state = Vec::new();
 
         let r = wf.apply(&ev_with_meta(0, ORIGIN_US, 42, b""), &mut state);
+        assert!(
+            matches!(r, Err(RedexError::Decode(_))),
+            "the recoverable Decode error must still propagate to the caller",
+        );
+        assert_eq!(
+            app_seq.load(Ordering::Acquire),
+            43,
+            "watermark MUST advance past a claimed-but-dead same-origin slot \
+             (seq_or_ts 42 -> app_seq 43) so it can't be re-stamped later",
+        );
+    }
+
+    #[test]
+    fn recoverable_decode_error_does_not_advance_for_other_origin() {
+        // The recoverable-Decode advance is scoped to MATCHING
+        // origin only — a decode failure on another origin's event
+        // claims no slot in OUR per-origin counter, so it must
+        // leave our watermark untouched (same as the success path).
+        let app_seq = Arc::new(AtomicU64::new(0));
+        let mut wf = WatermarkingFold::new(MockFold::fail_on(0), app_seq.clone(), ORIGIN_US);
+        let mut state = Vec::new();
+
+        let r = wf.apply(&ev_with_meta(0, ORIGIN_OTHER, 999, b""), &mut state);
         assert!(matches!(r, Err(RedexError::Decode(_))));
         assert_eq!(
             app_seq.load(Ordering::Acquire),
             0,
-            "watermark must NOT advance for an event the inner fold rejected",
+            "another origin's claimed slot must not move our watermark",
+        );
+    }
+
+    #[test]
+    fn non_recoverable_inner_error_does_not_advance_watermark() {
+        // A NON-recoverable error (stream-level / configuration)
+        // halts the fold task rather than skipping a single claimed
+        // slot, so there is no claimed-but-dead slot to account for.
+        // The watermark must stay put and the error must surface
+        // verbatim — only the recoverable-Decode path changed in #6.
+        let app_seq = Arc::new(AtomicU64::new(0));
+        let mut wf =
+            WatermarkingFold::new(MockFold::fail_on_nonrecoverable(0), app_seq.clone(), ORIGIN_US);
+        let mut state = Vec::new();
+
+        let r = wf.apply(&ev_with_meta(0, ORIGIN_US, 42, b""), &mut state);
+        assert!(
+            matches!(r, Err(RedexError::Io(_))),
+            "non-recoverable error must propagate verbatim",
+        );
+        assert_eq!(
+            app_seq.load(Ordering::Acquire),
+            0,
+            "watermark must NOT advance on a non-recoverable inner error",
         );
     }
 
