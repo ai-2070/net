@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/BUG_AUDIT_2026_06_18_BINDINGS.md
+  s_a77664841befef::t_d72313e055f361 1-368
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "cfbfa449fdc85e3b00313ed334f7d4ca3a518b7a",
+  "prompts": {},
+  "sessions": {
+    "s_a77664841befef": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5703ca68-d2ee-4e77-9d7f-06fbcec46aed",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
