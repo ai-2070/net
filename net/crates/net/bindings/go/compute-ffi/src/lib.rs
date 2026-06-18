@@ -258,12 +258,14 @@ static NEXT_RUNTIME_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// (e.g., structured error detail). Idempotent on NULL.
 #[no_mangle]
 pub extern "C" fn net_compute_free_cstring(s: *mut c_char) {
+    ffi_guard!((), {
     if s.is_null() {
         return;
     }
     unsafe {
         let _ = CString::from_raw(s);
     }
+    })
 }
 
 // =========================================================================
@@ -292,6 +294,7 @@ pub extern "C" fn net_compute_runtime_new(
     node_arc: *mut Arc<MeshNode>,
     channel_configs_arc: *mut Arc<ChannelConfigRegistry>,
 ) -> *mut DaemonRuntimeHandle {
+    ffi_guard!(std::ptr::null_mut(), {
     if node_arc.is_null() || channel_configs_arc.is_null() {
         return std::ptr::null_mut();
     }
@@ -312,6 +315,7 @@ pub extern "C" fn net_compute_runtime_new(
         factories: Arc::new(DashMap::new()),
         runtime_id,
     }))
+    })
 }
 
 /// Return the monotonic runtime identifier assigned at
@@ -323,10 +327,12 @@ pub extern "C" fn net_compute_runtime_new(
 /// Returns `0` on NULL input.
 #[no_mangle]
 pub extern "C" fn net_compute_runtime_id(handle: *const DaemonRuntimeHandle) -> u64 {
+    ffi_guard!(0, {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return 0;
     };
     h.runtime_id
+    })
 }
 
 /// Free a runtime handle. The underlying `MeshNode` stays alive
@@ -334,12 +340,14 @@ pub extern "C" fn net_compute_runtime_id(handle: *const DaemonRuntimeHandle) -> 
 /// its own `MeshNodeHandle`). Idempotent on NULL.
 #[no_mangle]
 pub extern "C" fn net_compute_runtime_free(handle: *mut DaemonRuntimeHandle) {
+    ffi_guard!((), {
     if handle.is_null() {
         return;
     }
     unsafe {
         let _ = Box::from_raw(handle);
     }
+    })
 }
 
 /// Transition the runtime to `Ready`. Installs the migration
@@ -355,6 +363,7 @@ pub extern "C" fn net_compute_runtime_start(
     handle: *mut DaemonRuntimeHandle,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -367,6 +376,7 @@ pub extern "C" fn net_compute_runtime_start(
             NET_COMPUTE_ERR_CALL_FAILED
         }
     }
+    })
 }
 
 /// Tear down the runtime. Drains daemons + factory registrations +
@@ -377,6 +387,7 @@ pub extern "C" fn net_compute_runtime_shutdown(
     handle: *mut DaemonRuntimeHandle,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -393,6 +404,7 @@ pub extern "C" fn net_compute_runtime_shutdown(
             NET_COMPUTE_ERR_CALL_FAILED
         }
     }
+    })
 }
 
 /// Return `1` if the runtime has transitioned to `Ready` and not
@@ -400,6 +412,7 @@ pub extern "C" fn net_compute_runtime_shutdown(
 /// on a NULL handle.
 #[no_mangle]
 pub extern "C" fn net_compute_runtime_is_ready(handle: *mut DaemonRuntimeHandle) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -408,6 +421,7 @@ pub extern "C" fn net_compute_runtime_is_ready(handle: *mut DaemonRuntimeHandle)
     } else {
         0
     }
+    })
 }
 
 /// Return the number of daemons currently registered on this
@@ -415,10 +429,12 @@ pub extern "C" fn net_compute_runtime_is_ready(handle: *mut DaemonRuntimeHandle)
 /// [`NET_COMPUTE_ERR_NULL`]).
 #[no_mangle]
 pub extern "C" fn net_compute_runtime_daemon_count(handle: *mut DaemonRuntimeHandle) -> i64 {
+    ffi_guard!(0, {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL as i64;
     };
     h.inner.daemon_count() as i64
+    })
 }
 
 /// Register a factory kind on the runtime. Enables `spawn` and
@@ -451,6 +467,7 @@ pub extern "C" fn net_compute_register_factory(
     kind_ptr: *const c_char,
     kind_len: usize,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -500,6 +517,7 @@ pub extern "C" fn net_compute_register_factory(
         };
     }
     NET_COMPUTE_OK
+    })
 }
 
 /// Register a factory kind with a real Go-side factory function
@@ -522,6 +540,7 @@ pub extern "C" fn net_compute_register_factory_with_func(
     kind_ptr: *const c_char,
     kind_len: usize,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -592,6 +611,7 @@ pub extern "C" fn net_compute_register_factory_with_func(
         };
     }
     NET_COMPUTE_OK
+    })
 }
 
 // =========================================================================
@@ -683,6 +703,7 @@ pub extern "C" fn net_compute_set_dispatcher(
     free: Option<FreeFn>,
     factory: Option<FactoryFn>,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(process) = process else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -706,6 +727,7 @@ pub extern "C" fn net_compute_set_dispatcher(
         factory,
     });
     NET_COMPUTE_OK
+    })
 }
 
 // =========================================================================
@@ -782,11 +804,13 @@ static DAEMON_CAPS_DISPATCHER: OnceLock<DaemonCapsFn> = OnceLock::new();
 /// Passing NULL returns `NET_COMPUTE_ERR_NULL`.
 #[no_mangle]
 pub extern "C" fn net_compute_set_daemon_caps_dispatcher(f: Option<DaemonCapsFn>) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(f) = f else {
         return NET_COMPUTE_ERR_NULL;
     };
     let _ = DAEMON_CAPS_DISPATCHER.set(f);
     NET_COMPUTE_OK
+    })
 }
 
 /// Internal helper: fetch the per-daemon cap sets via the
@@ -927,6 +951,7 @@ pub extern "C" fn net_compute_outputs_push(
     data: *const u8,
     len: usize,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     if vec.is_null() {
         return NET_COMPUTE_ERR_NULL;
     }
@@ -947,6 +972,7 @@ pub extern "C" fn net_compute_outputs_push(
     };
     v.inner.push(Bytes::copy_from_slice(slice));
     NET_COMPUTE_OK
+    })
 }
 
 /// Free a `(ptr, len)` snapshot payload heap-allocated by Go
@@ -960,6 +986,7 @@ pub extern "C" fn net_compute_outputs_push(
 /// the pointer; we free via `libc::free`. NULL is a no-op.
 #[no_mangle]
 pub extern "C" fn net_compute_snapshot_bytes_free(ptr: *mut u8, _len: usize) {
+    ffi_guard!((), {
     // N-8: pre-fix the combined `ptr.is_null() || len == 0` early-
     // return leaked any allocation a Go trampoline allocated via
     // `C.malloc(0)` (which on glibc returns a valid free-able
@@ -976,6 +1003,7 @@ pub extern "C" fn net_compute_snapshot_bytes_free(ptr: *mut u8, _len: usize) {
     unsafe {
         libc::free(ptr as *mut std::ffi::c_void);
     }
+    })
 }
 
 // =========================================================================
@@ -1144,10 +1172,12 @@ pub struct DaemonHandleC {
 /// has a non-zero origin_hash).
 #[no_mangle]
 pub extern "C" fn net_compute_daemon_handle_origin_hash(h: *const DaemonHandleC) -> u64 {
+    ffi_guard!(0, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return 0;
     };
     h.origin_hash
+    })
 }
 
 /// Copy the 32-byte `entity_id` into `out[0..32]`. Returns
@@ -1157,6 +1187,7 @@ pub extern "C" fn net_compute_daemon_handle_entity_id(
     h: *const DaemonHandleC,
     out: *mut u8,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -1167,18 +1198,21 @@ pub extern "C" fn net_compute_daemon_handle_entity_id(
         std::ptr::copy_nonoverlapping(h.entity_id.as_ptr(), out, 32);
     }
     NET_COMPUTE_OK
+    })
 }
 
 /// Free the handle. The daemon itself keeps running — call
 /// [`net_compute_runtime_stop`] first to tear it down.
 #[no_mangle]
 pub extern "C" fn net_compute_daemon_handle_free(h: *mut DaemonHandleC) {
+    ffi_guard!((), {
     if h.is_null() {
         return;
     }
     unsafe {
         let _ = Box::from_raw(h);
     }
+    })
 }
 
 // =========================================================================
@@ -1217,6 +1251,7 @@ pub extern "C" fn net_compute_spawn(
     out_handle: *mut *mut DaemonHandleC,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -1286,6 +1321,7 @@ pub extern "C" fn net_compute_spawn(
             NET_COMPUTE_ERR_CALL_FAILED
         }
     }
+    })
 }
 
 /// Stop a daemon by `origin_hash`. Idempotent during shutdown.
@@ -1297,6 +1333,7 @@ pub extern "C" fn net_compute_runtime_stop(
     origin_hash: u64,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -1308,6 +1345,7 @@ pub extern "C" fn net_compute_runtime_stop(
             NET_COMPUTE_ERR_CALL_FAILED
         }
     }
+    })
 }
 
 /// Take a snapshot of the daemon identified by `origin_hash`.
@@ -1327,6 +1365,7 @@ pub extern "C" fn net_compute_runtime_snapshot(
     out_outputs: *mut *mut OutputsVec,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -1356,6 +1395,7 @@ pub extern "C" fn net_compute_runtime_snapshot(
             NET_COMPUTE_ERR_CALL_FAILED
         }
     }
+    })
 }
 
 /// Spawn a daemon from a previously-taken snapshot. Parallels
@@ -1385,6 +1425,7 @@ pub extern "C" fn net_compute_spawn_from_snapshot(
     out_handle: *mut *mut DaemonHandleC,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -1470,6 +1511,7 @@ pub extern "C" fn net_compute_spawn_from_snapshot(
             NET_COMPUTE_ERR_CALL_FAILED
         }
     }
+    })
 }
 
 // =========================================================================
@@ -1491,36 +1533,44 @@ pub struct MigrationHandleC {
 /// the background. Idempotent on NULL.
 #[no_mangle]
 pub extern "C" fn net_compute_migration_handle_free(h: *mut MigrationHandleC) {
+    ffi_guard!((), {
     if h.is_null() {
         return;
     }
     unsafe {
         let _ = Box::from_raw(h);
     }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_migration_handle_origin_hash(h: *const MigrationHandleC) -> u64 {
+    ffi_guard!(0, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return 0;
     };
     h.origin_hash
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_migration_handle_source_node(h: *const MigrationHandleC) -> u64 {
+    ffi_guard!(0, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return 0;
     };
     h.source_node
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_migration_handle_target_node(h: *const MigrationHandleC) -> u64 {
+    ffi_guard!(0, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return 0;
     };
     h.target_node
+    })
 }
 
 /// Return the current migration phase as a CString, or NULL if
@@ -1529,6 +1579,7 @@ pub extern "C" fn net_compute_migration_handle_target_node(h: *const MigrationHa
 /// [`net_compute_free_cstring`].
 #[no_mangle]
 pub extern "C" fn net_compute_migration_handle_phase(h: *const MigrationHandleC) -> *mut c_char {
+    ffi_guard!(std::ptr::null_mut(), {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return std::ptr::null_mut();
     };
@@ -1538,6 +1589,7 @@ pub extern "C" fn net_compute_migration_handle_phase(h: *const MigrationHandleC)
             .unwrap_or(std::ptr::null_mut()),
         None => std::ptr::null_mut(),
     }
+    })
 }
 
 /// Block until the migration reaches a terminal state. Returns
@@ -1548,6 +1600,7 @@ pub extern "C" fn net_compute_migration_handle_wait(
     h: *mut MigrationHandleC,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -1559,6 +1612,7 @@ pub extern "C" fn net_compute_migration_handle_wait(
             NET_COMPUTE_ERR_CALL_FAILED
         }
     }
+    })
 }
 
 /// Like `wait` with a caller-controlled timeout in milliseconds.
@@ -1568,6 +1622,7 @@ pub extern "C" fn net_compute_migration_handle_wait_with_timeout(
     timeout_ms: u64,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -1583,6 +1638,7 @@ pub extern "C" fn net_compute_migration_handle_wait_with_timeout(
             NET_COMPUTE_ERR_CALL_FAILED
         }
     }
+    })
 }
 
 /// Request cancellation. Best-effort; past `cutover` the routing
@@ -1592,6 +1648,7 @@ pub extern "C" fn net_compute_migration_handle_cancel(
     h: *mut MigrationHandleC,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -1603,6 +1660,7 @@ pub extern "C" fn net_compute_migration_handle_cancel(
             NET_COMPUTE_ERR_CALL_FAILED
         }
     }
+    })
 }
 
 /// Start a migration with default options. Returns a boxed
@@ -1621,6 +1679,7 @@ pub extern "C" fn net_compute_start_migration(
     out_handle: *mut *mut MigrationHandleC,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -1663,6 +1722,7 @@ pub extern "C" fn net_compute_start_migration(
             NET_COMPUTE_ERR_CALL_FAILED
         }
     }
+    })
 }
 
 /// Declare on the target side that a migration will land here for
@@ -1679,6 +1739,7 @@ pub extern "C" fn net_compute_expect_migration(
     max_log_entries: u32,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -1699,6 +1760,7 @@ pub extern "C" fn net_compute_expect_migration(
             NET_COMPUTE_ERR_CALL_FAILED
         }
     }
+    })
 }
 
 /// Pre-register a target-side identity for a migration that will
@@ -1715,6 +1777,7 @@ pub extern "C" fn net_compute_register_migration_target_identity(
     max_log_entries: u32,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -1746,6 +1809,7 @@ pub extern "C" fn net_compute_register_migration_target_identity(
             NET_COMPUTE_ERR_CALL_FAILED
         }
     }
+    })
 }
 
 /// Query the orchestrator's migration phase for `origin_hash`.
@@ -1757,6 +1821,7 @@ pub extern "C" fn net_compute_migration_phase(
     handle: *mut DaemonRuntimeHandle,
     origin_hash: u64,
 ) -> *mut c_char {
+    ffi_guard!(std::ptr::null_mut(), {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return std::ptr::null_mut();
     };
@@ -1766,6 +1831,7 @@ pub extern "C" fn net_compute_migration_phase(
             .unwrap_or(std::ptr::null_mut()),
         None => std::ptr::null_mut(),
     }
+    })
 }
 
 /// Deliver one event to the daemon at `origin_hash`. The Go
@@ -1788,6 +1854,7 @@ pub extern "C" fn net_compute_runtime_deliver(
     out_outputs: *mut *mut OutputsVec,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -1839,16 +1906,19 @@ pub extern "C" fn net_compute_runtime_deliver(
             NET_COMPUTE_ERR_CALL_FAILED
         }
     }
+    })
 }
 
 /// Return the number of outputs stored in `vec`. Returns `0` on
 /// NULL.
 #[no_mangle]
 pub extern "C" fn net_compute_outputs_len(vec: *const OutputsVec) -> usize {
+    ffi_guard!(0, {
     let Some(v) = (unsafe { vec.as_ref() }) else {
         return 0;
     };
     v.inner.len()
+    })
 }
 
 /// Copy the `idx`-th output payload's `(ptr, len)` into
@@ -1861,6 +1931,7 @@ pub extern "C" fn net_compute_outputs_at(
     out_ptr: *mut *const u8,
     out_len: *mut usize,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(v) = (unsafe { vec.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -1875,18 +1946,21 @@ pub extern "C" fn net_compute_outputs_at(
         *out_len = b.len();
     }
     NET_COMPUTE_OK
+    })
 }
 
 /// Free the outputs vec produced by
 /// [`net_compute_runtime_deliver`]. Idempotent on NULL.
 #[no_mangle]
 pub extern "C" fn net_compute_outputs_free(vec: *mut OutputsVec) {
+    ffi_guard!((), {
     if vec.is_null() {
         return;
     }
     unsafe {
         let _ = Box::from_raw(vec);
     }
+    })
 }
 
 // =========================================================================
@@ -2028,6 +2102,7 @@ pub extern "C" fn net_compute_test_inject_synthetic_peer(
     mesh_arc: *mut std::sync::Arc<MeshNode>,
     node_id: u64,
 ) {
+    ffi_guard!((), {
     use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
     use net::adapter::net::identity::EntityId;
     if mesh_arc.is_null() {
@@ -2041,6 +2116,7 @@ pub extern "C" fn net_compute_test_inject_synthetic_peer(
         1,
         CapabilitySet::new(),
     ));
+    })
 }
 
 /// Test-only — same shape as
@@ -2064,6 +2140,7 @@ pub extern "C" fn net_compute_test_inject_synthetic_peer_with_tags(
     node_id: u64,
     tags_json: *const c_char,
 ) {
+    ffi_guard!((), {
     use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
     use net::adapter::net::behavior::Tag;
     use net::adapter::net::identity::EntityId;
@@ -2092,6 +2169,7 @@ pub extern "C" fn net_compute_test_inject_synthetic_peer_with_tags(
     }
     let eid = EntityId::from_bytes([0u8; 32]);
     arc.test_inject_capability_announcement(CapabilityAnnouncement::new(node_id, eid, 1, caps));
+    })
 }
 
 // =========================================================================
@@ -2262,6 +2340,7 @@ pub extern "C" fn net_compute_replica_group_spawn(
     out_handle: *mut *mut ReplicaGroupHandle,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(rt) = (unsafe { runtime.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -2313,40 +2392,49 @@ pub extern "C" fn net_compute_replica_group_spawn(
         }
         Err(e) => group_err_out(err_out, &e),
     }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_replica_group_free(h: *mut ReplicaGroupHandle) {
+    ffi_guard!((), {
     if h.is_null() {
         return;
     }
     unsafe {
         let _ = Box::from_raw(h);
     }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_replica_group_replica_count(h: *const ReplicaGroupHandle) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
     h.inner.replica_count() as c_int
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_replica_group_healthy_count(h: *const ReplicaGroupHandle) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
     h.inner.healthy_count() as c_int
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_replica_group_group_id(h: *const ReplicaGroupHandle) -> u32 {
+    ffi_guard!(0, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return 0;
     };
     h.inner.group_id()
+    })
 }
 
 /// Fill `(out_status, out_healthy, out_total)` with the group's
@@ -2359,6 +2447,7 @@ pub extern "C" fn net_compute_replica_group_health(
     out_healthy: *mut u32,
     out_total: *mut u32,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -2372,6 +2461,7 @@ pub extern "C" fn net_compute_replica_group_health(
         *out_total = t;
     }
     NET_COMPUTE_OK
+    })
 }
 
 /// Route a request to the best healthy replica. `routing_key_ptr`
@@ -2384,6 +2474,7 @@ pub extern "C" fn net_compute_replica_group_route_event(
     out_origin: *mut u64,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -2403,6 +2494,7 @@ pub extern "C" fn net_compute_replica_group_route_event(
         }
         Err(e) => group_err_out(err_out, &e),
     }
+    })
 }
 
 /// Resize the group to `n` members. Reuses the kind the group was
@@ -2413,6 +2505,7 @@ pub extern "C" fn net_compute_replica_group_scale_to(
     n: u32,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -2429,6 +2522,7 @@ pub extern "C" fn net_compute_replica_group_scale_to(
         Ok(()) => NET_COMPUTE_OK,
         Err(e) => group_err_out(err_out, &e),
     }
+    })
 }
 
 #[no_mangle]
@@ -2436,10 +2530,12 @@ pub extern "C" fn net_compute_replica_group_on_node_recovery(
     h: *const ReplicaGroupHandle,
     node_id: u64,
 ) {
+    ffi_guard!((), {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return;
     };
     h.inner.on_node_recovery(node_id);
+    })
 }
 
 /// Return the members roster as a heap-allocated JSON string.
@@ -2448,6 +2544,7 @@ pub extern "C" fn net_compute_replica_group_on_node_recovery(
 pub extern "C" fn net_compute_replica_group_members_json(
     h: *const ReplicaGroupHandle,
 ) -> *mut c_char {
+    ffi_guard!(std::ptr::null_mut(), {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return std::ptr::null_mut();
     };
@@ -2455,6 +2552,7 @@ pub extern "C" fn net_compute_replica_group_members_json(
     CString::new(json)
         .map(|c| c.into_raw())
         .unwrap_or(std::ptr::null_mut())
+    })
 }
 
 // ---------------------------------------------------------------
@@ -2481,6 +2579,7 @@ pub extern "C" fn net_compute_fork_group_spawn(
     out_handle: *mut *mut ForkGroupHandle,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(rt) = (unsafe { runtime.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -2522,54 +2621,66 @@ pub extern "C" fn net_compute_fork_group_spawn(
         }
         Err(e) => group_err_out(err_out, &e),
     }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_fork_group_free(h: *mut ForkGroupHandle) {
+    ffi_guard!((), {
     if h.is_null() {
         return;
     }
     unsafe {
         let _ = Box::from_raw(h);
     }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_fork_group_fork_count(h: *const ForkGroupHandle) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
     h.inner.fork_count() as c_int
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_fork_group_healthy_count(h: *const ForkGroupHandle) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
     h.inner.healthy_count() as c_int
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_fork_group_parent_origin(h: *const ForkGroupHandle) -> u64 {
+    ffi_guard!(0, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return 0;
     };
     h.inner.parent_origin()
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_fork_group_fork_seq(h: *const ForkGroupHandle) -> u64 {
+    ffi_guard!(0, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return 0;
     };
     h.inner.fork_seq()
+    })
 }
 
 /// Verify every fork's lineage record. Returns 1 on verified, 0
 /// otherwise. Caller sees NULL handle as 0.
 #[no_mangle]
 pub extern "C" fn net_compute_fork_group_verify_lineage(h: *const ForkGroupHandle) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return 0;
     };
@@ -2578,6 +2689,7 @@ pub extern "C" fn net_compute_fork_group_verify_lineage(h: *const ForkGroupHandl
     } else {
         0
     }
+    })
 }
 
 #[no_mangle]
@@ -2586,6 +2698,7 @@ pub extern "C" fn net_compute_fork_group_scale_to(
     n: u32,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -2602,18 +2715,22 @@ pub extern "C" fn net_compute_fork_group_scale_to(
         Ok(()) => NET_COMPUTE_OK,
         Err(e) => group_err_out(err_out, &e),
     }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_fork_group_on_node_recovery(h: *const ForkGroupHandle, node_id: u64) {
+    ffi_guard!((), {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return;
     };
     h.inner.on_node_recovery(node_id);
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_fork_group_members_json(h: *const ForkGroupHandle) -> *mut c_char {
+    ffi_guard!(std::ptr::null_mut(), {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return std::ptr::null_mut();
     };
@@ -2621,12 +2738,14 @@ pub extern "C" fn net_compute_fork_group_members_json(h: *const ForkGroupHandle)
     CString::new(json)
         .map(|c| c.into_raw())
         .unwrap_or(std::ptr::null_mut())
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_fork_group_fork_records_json(
     h: *const ForkGroupHandle,
 ) -> *mut c_char {
+    ffi_guard!(std::ptr::null_mut(), {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return std::ptr::null_mut();
     };
@@ -2634,6 +2753,7 @@ pub extern "C" fn net_compute_fork_group_fork_records_json(
     CString::new(json)
         .map(|c| c.into_raw())
         .unwrap_or(std::ptr::null_mut())
+    })
 }
 
 // ---------------------------------------------------------------
@@ -2657,6 +2777,7 @@ pub extern "C" fn net_compute_standby_group_spawn(
     out_handle: *mut *mut StandbyGroupHandle,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(rt) = (unsafe { runtime.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -2701,52 +2822,64 @@ pub extern "C" fn net_compute_standby_group_spawn(
         }
         Err(e) => group_err_out(err_out, &e),
     }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_standby_group_free(h: *mut StandbyGroupHandle) {
+    ffi_guard!((), {
     if h.is_null() {
         return;
     }
     unsafe {
         let _ = Box::from_raw(h);
     }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_standby_group_member_count(h: *const StandbyGroupHandle) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
     h.inner.member_count() as c_int
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_standby_group_standby_count(h: *const StandbyGroupHandle) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
     h.inner.standby_count() as c_int
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_standby_group_active_index(h: *const StandbyGroupHandle) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
     h.inner.active_index() as c_int
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_standby_group_active_origin(h: *const StandbyGroupHandle) -> u64 {
+    ffi_guard!(0, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return 0;
     };
     h.inner.active_origin()
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_standby_group_active_healthy(h: *const StandbyGroupHandle) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return 0;
     };
@@ -2755,24 +2888,29 @@ pub extern "C" fn net_compute_standby_group_active_healthy(h: *const StandbyGrou
     } else {
         0
     }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_standby_group_group_id(h: *const StandbyGroupHandle) -> u32 {
+    ffi_guard!(0, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return 0;
     };
     h.inner.group_id()
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_standby_group_buffered_event_count(
     h: *const StandbyGroupHandle,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
     h.inner.buffered_event_count() as c_int
+    })
 }
 
 #[no_mangle]
@@ -2781,6 +2919,7 @@ pub extern "C" fn net_compute_standby_group_sync_standbys(
     out_through: *mut u64,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -2794,6 +2933,7 @@ pub extern "C" fn net_compute_standby_group_sync_standbys(
         }
         Err(e) => group_err_out(err_out, &e),
     }
+    })
 }
 
 #[no_mangle]
@@ -2802,6 +2942,7 @@ pub extern "C" fn net_compute_standby_group_promote(
     out_origin: *mut u64,
     err_out: *mut *mut c_char,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
@@ -2815,6 +2956,7 @@ pub extern "C" fn net_compute_standby_group_promote(
         }
         Err(e) => group_err_out(err_out, &e),
     }
+    })
 }
 
 #[no_mangle]
@@ -2822,16 +2964,19 @@ pub extern "C" fn net_compute_standby_group_on_node_recovery(
     h: *const StandbyGroupHandle,
     node_id: u64,
 ) {
+    ffi_guard!((), {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return;
     };
     h.inner.on_node_recovery(node_id);
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_standby_group_members_json(
     h: *const StandbyGroupHandle,
 ) -> *mut c_char {
+    ffi_guard!(std::ptr::null_mut(), {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return std::ptr::null_mut();
     };
@@ -2839,6 +2984,7 @@ pub extern "C" fn net_compute_standby_group_members_json(
     CString::new(json)
         .map(|c| c.into_raw())
         .unwrap_or(std::ptr::null_mut())
+    })
 }
 
 /// Returns `"active"` / `"standby"` (caller frees via
@@ -2848,6 +2994,7 @@ pub extern "C" fn net_compute_standby_group_member_role(
     h: *const StandbyGroupHandle,
     index: u32,
 ) -> *mut c_char {
+    ffi_guard!(std::ptr::null_mut(), {
     let Some(h) = (unsafe { h.as_ref() }) else {
         return std::ptr::null_mut();
     };
@@ -2860,6 +3007,7 @@ pub extern "C" fn net_compute_standby_group_member_role(
             .unwrap_or(std::ptr::null_mut()),
         None => std::ptr::null_mut(),
     }
+    })
 }
 
 // =========================================================================
@@ -2918,11 +3066,13 @@ static PLACEMENT_FILTER_DISPATCHER: OnceLock<PlacementFilterFn> = OnceLock::new(
 pub extern "C" fn net_compute_set_placement_filter_dispatcher(
     f: Option<PlacementFilterFn>,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     let Some(f) = f else {
         return NET_COMPUTE_ERR_NULL;
     };
     let _ = PLACEMENT_FILTER_DISPATCHER.set(f);
     NET_COMPUTE_OK
+    })
 }
 
 /// Bridge wrapper that implements `PlacementFilter` by calling the
@@ -3052,6 +3202,7 @@ pub extern "C" fn net_compute_register_placement_filter(
     id_ptr: *const c_char,
     id_len: usize,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     use ::net::adapter::net::behavior::placement::PlacementFilter;
     use ::net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
 
@@ -3090,6 +3241,7 @@ pub extern "C" fn net_compute_register_placement_filter(
     } else {
         NET_COMPUTE_ERR_DUPLICATE_KIND
     }
+    })
 }
 
 /// Drop the placement-filter registration under `id`.
@@ -3107,6 +3259,7 @@ pub extern "C" fn net_compute_unregister_placement_filter(
     id_ptr: *const c_char,
     id_len: usize,
 ) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     use ::net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
     if id_ptr.is_null() {
         return NET_COMPUTE_ERR_NULL;
@@ -3123,6 +3276,7 @@ pub extern "C" fn net_compute_unregister_placement_filter(
     } else {
         0
     }
+    })
 }
 
 /// Whether `id` is currently registered. Diagnostic helper.
@@ -3135,6 +3289,7 @@ pub extern "C" fn net_compute_unregister_placement_filter(
 /// [`net_compute_register_placement_filter`].
 #[no_mangle]
 pub extern "C" fn net_compute_has_placement_filter(id_ptr: *const c_char, id_len: usize) -> c_int {
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
     use ::net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
     if id_ptr.is_null() {
         return NET_COMPUTE_ERR_NULL;
@@ -3151,6 +3306,7 @@ pub extern "C" fn net_compute_has_placement_filter(id_ptr: *const c_char, id_len
     } else {
         0
     }
+    })
 }
 
 // =========================================================================
@@ -3186,6 +3342,7 @@ pub extern "C" fn net_capability_aggregate(
     group_by_json: *const c_char,
     aggregation_json: *const c_char,
 ) -> *mut c_char {
+    ffi_guard!(std::ptr::null_mut(), {
     use net::adapter::net::behavior::fold::{Aggregation, GroupBy, TagMatcher};
     use std::ffi::CStr;
 
@@ -3237,6 +3394,7 @@ pub extern "C" fn net_capability_aggregate(
         Ok(c) => c.into_raw(),
         Err(_) => std::ptr::null_mut(),
     }
+    })
 }
 
 /// Run `Fold::capacity_ranking` against the publisher's capability
@@ -3258,6 +3416,7 @@ pub extern "C" fn net_capability_capacity_ranking(
     query_json: *const c_char,
     rtt_map_json: *const c_char,
 ) -> *mut c_char {
+    ffi_guard!(std::ptr::null_mut(), {
     use net::adapter::net::behavior::fold::CapacityQuery;
     use std::collections::HashMap;
     use std::ffi::CStr;
@@ -3320,6 +3479,7 @@ pub extern "C" fn net_capability_capacity_ranking(
         Ok(c) => c.into_raw(),
         Err(_) => std::ptr::null_mut(),
     }
+    })
 }
 
 // =========================================================================
