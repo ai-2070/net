@@ -1081,19 +1081,6 @@ fn try_encode_join_key_federated(
 fn translate_responses(mut response_stream: ResponseStream, handle: QueryHandle) -> ResultStream {
     let (tx, rx) = mpsc::channel::<Result<ResultRow, MeshError>>(64);
     tokio::spawn(async move {
-        // Track whether at least one `Batch` frame was delivered.
-        // `run_server_call` always marks intermediate batches
-        // `final = false` and the terminal flush rides either on
-        // a `last`/`final = true` batch *or* a separate `End`
-        // frame — and when the row count is an exact multiple of
-        // the server batch size, the residual flush is empty so
-        // NO `final = true` batch is sent, only `chunk`s + `End`.
-        // If that trailing `End` is lost in transport, a fully
-        // delivered result would otherwise be reported as failed.
-        // Treat a clean stream end after a delivered batch as
-        // success (the rows are already downstream); only a drop
-        // before any batch is a genuine premature-drop error.
-        let mut delivered_batch = false;
         while let Some(response) = response_stream.next().await {
             if handle.is_cancelled() {
                 let _ = tx.send(Err(MeshError::QueryCancelled)).await;
@@ -1101,7 +1088,6 @@ fn translate_responses(mut response_stream: ResponseStream, handle: QueryHandle)
             }
             match response {
                 MeshDbResponse::Batch { batch, .. } => {
-                    delivered_batch = true;
                     let is_final = batch.r#final;
                     for row in batch.rows {
                         if tx.send(Ok(row)).await.is_err() {
@@ -1119,21 +1105,12 @@ fn translate_responses(mut response_stream: ResponseStream, handle: QueryHandle)
                 }
             }
         }
-        // Stream ended without an explicit terminal frame (no
-        // End / Error / final-batch). All terminal arms above
-        // `return`, so reaching here means the stream closed
-        // after the last frame we saw.
-        if delivered_batch {
-            // A non-final batch was delivered and the stream then
-            // closed cleanly — the trailing `End` was lost in
-            // transport but every row already reached the caller.
-            // Report success: just close the row channel by
-            // returning without synthesizing an error.
-            return;
-        }
-        // Nothing was ever delivered and the stream dropped — a
-        // genuine premature drop. Surface it so consumers don't
-        // mistake premature drop for clean EOS.
+        // The stream closed without a terminal frame (End / Error /
+        // `final = true` batch). `run_server_call` always terminates a
+        // COMPLETE result with a `final = true` batch (it now emits one
+        // even when the residual is empty), so reaching here means the
+        // stream was TRUNCATED in transport. Surface it as a protocol
+        // error rather than masking the lost rows as a clean result.
         let _ = tx
             .send(Err(MeshError::ExecutorError {
                 node: 0,
@@ -1515,46 +1492,76 @@ mod tests {
         assert!(rows.is_empty());
     }
 
-    // Regression for finding #22: a clean stream end after a
-    // delivered (non-final) batch — the trailing `End` frame was
-    // lost in transport — must be reported as success, not as a
-    // spurious `ExecutorError`. Every row already reached the
-    // caller; synthesizing an error would force them to discard a
-    // fully-delivered result.
+    // Regression for finding #22 (corrected after review): the terminal
+    // marker now ALWAYS rides a `final = true` batch — `run_server_call`
+    // emits one even when the residual is empty. A complete stream (an
+    // intermediate chunk followed by a `final = true` batch) yields all
+    // rows and NO error.
     #[tokio::test]
-    async fn lost_end_after_delivered_batch_is_success() {
+    async fn final_batch_terminates_stream_successfully() {
         use super::super::protocol::ResultBatch;
 
-        // One non-final batch carrying two rows, then the stream
-        // simply ends (no End / Error / final batch) — exactly
-        // what a dropped `End` frame looks like to the caller.
-        let frames = vec![MeshDbResponse::Batch {
-            call_id: 7,
-            batch: ResultBatch::chunk(vec![
-                ResultRow {
+        let frames = vec![
+            MeshDbResponse::Batch {
+                call_id: 7,
+                batch: ResultBatch::chunk(vec![ResultRow {
                     origin: 0xAA,
                     seq: SeqNum(1),
                     payload: b"r1".to_vec(),
-                },
-                ResultRow {
+                }]),
+            },
+            MeshDbResponse::Batch {
+                call_id: 7,
+                batch: ResultBatch::last(vec![ResultRow {
                     origin: 0xAA,
                     seq: SeqNum(2),
                     payload: b"r2".to_vec(),
-                },
-            ]),
+                }]),
+            },
+        ];
+        let stream: ResponseStream = Box::pin(futures::stream::iter(frames));
+        let handle = QueryHandle::new(1);
+
+        let out = collect_rows(translate_responses(stream, handle)).await;
+        assert_eq!(out.len(), 2, "expected exactly the two rows, got {out:?}");
+        assert!(
+            out.iter().all(|r| r.is_ok()),
+            "a final batch must not synthesize an error: {out:?}"
+        );
+        let seqs: Vec<u64> = out.into_iter().map(|r| r.unwrap().seq.0).collect();
+        assert_eq!(seqs, vec![1, 2]);
+    }
+
+    // Review follow-up to #22: a non-final batch followed by a clean
+    // stream end (no End / Error / `final = true` frame) is a TRUNCATED
+    // stream, not a complete one. The rows that did arrive are
+    // forwarded, but the missing terminal MUST surface as an error so a
+    // truncated result is never silently mistaken for a full one.
+    #[tokio::test]
+    async fn truncation_after_non_final_batch_surfaces_error() {
+        use super::super::protocol::ResultBatch;
+
+        let frames = vec![MeshDbResponse::Batch {
+            call_id: 7,
+            batch: ResultBatch::chunk(vec![ResultRow {
+                origin: 0xAA,
+                seq: SeqNum(1),
+                payload: b"r1".to_vec(),
+            }]),
         }];
         let stream: ResponseStream = Box::pin(futures::stream::iter(frames));
         let handle = QueryHandle::new(1);
 
         let out = collect_rows(translate_responses(stream, handle)).await;
-        // Both rows delivered, and crucially NO trailing error.
-        assert_eq!(out.len(), 2, "expected exactly the two rows, got {out:?}");
-        assert!(
-            out.iter().all(|r| r.is_ok()),
-            "lost End must not synthesize an error: {out:?}"
-        );
-        let seqs: Vec<u64> = out.into_iter().map(|r| r.unwrap().seq.0).collect();
-        assert_eq!(seqs, vec![1, 2]);
+        // The delivered row is forwarded, then a terminal truncation error.
+        assert_eq!(out.len(), 2, "expected the row plus a truncation error: {out:?}");
+        assert!(out[0].is_ok(), "the delivered row should be forwarded: {out:?}");
+        match &out[1] {
+            Err(MeshError::ExecutorError { detail, .. }) => {
+                assert!(detail.contains("before terminal frame"), "got: {detail}");
+            }
+            other => panic!("expected truncation ExecutorError, got {other:?}"),
+        }
     }
 
     // Complementary guard: a stream that drops before ANY batch is

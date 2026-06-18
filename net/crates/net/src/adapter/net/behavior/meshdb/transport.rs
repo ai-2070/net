@@ -753,25 +753,33 @@ async fn run_server_call(
         }
     }
 
-    // Flush any residual rows then emit the terminal End.
-    // The `last` flag on the batch is enough — no need for a
-    // separate End. Stay strict and emit End anyway for
-    // wire-uniformity; the caller-side stream guard treats
-    // either as terminal.
-    if !batch.is_empty()
-        && sender
-            .send_frame(
-                peer,
-                MeshDbFrame::Response(MeshDbResponse::Batch {
-                    call_id,
-                    batch: ResultBatch::last(batch),
-                }),
-            )
-            .await
-            .is_err()
+    // Emit the residual rows as the terminal `final = true` batch.
+    // We send it UNCONDITIONALLY — even when `batch` is empty (the row
+    // count was an exact multiple of `MESHDB_SERVER_BATCH_ROWS`, or
+    // there were no rows at all) — so the terminal marker ALWAYS rides
+    // a data frame. Previously an empty residual skipped this batch and
+    // relied solely on the separate `End` below; if that `End` was lost
+    // in transport, the receiver could not distinguish a fully-delivered
+    // result from a truncated one. With a `final = true` batch always
+    // present at the end of a complete stream, a missing terminal frame
+    // unambiguously means truncation (`translate_responses` surfaces it
+    // as a protocol error rather than masking the lost rows).
+    if sender
+        .send_frame(
+            peer,
+            MeshDbFrame::Response(MeshDbResponse::Batch {
+                call_id,
+                batch: ResultBatch::last(batch),
+            }),
+        )
+        .await
+        .is_err()
     {
         return;
     }
+    // Redundant terminal kept for wire-uniformity with consumers that
+    // key on `End`; the receiver returns on the `final = true` batch
+    // above, so a lost `End` no longer changes the outcome.
     let _ = sender
         .send_frame(peer, MeshDbFrame::Response(MeshDbResponse::End { call_id }))
         .await;
@@ -1118,6 +1126,85 @@ mod tests {
 
         // Server-side bookkeeping cleared after the call drained.
         assert_eq!(server_b.inflight_calls(), 0);
+    }
+
+    // Review follow-up to #22: `run_server_call` must terminate a
+    // complete result with a `final = true` batch even when the row
+    // count is an EXACT multiple of `MESHDB_SERVER_BATCH_ROWS` (so the
+    // residual flush is empty). Otherwise the only terminal would be the
+    // separate `End` frame, and a lost `End` would be indistinguishable
+    // from a truncated stream to the receiver.
+    #[tokio::test]
+    async fn server_emits_final_batch_for_exact_batch_multiple_row_count() {
+        #[derive(Default)]
+        struct CapturingSender {
+            frames: parking_lot::Mutex<Vec<MeshDbFrame>>,
+        }
+        #[async_trait]
+        impl MeshDbWireSender for CapturingSender {
+            async fn send_frame(
+                &self,
+                _target: u64,
+                frame: MeshDbFrame,
+            ) -> Result<(), TransportError> {
+                self.frames.lock().push(frame);
+                Ok(())
+            }
+        }
+
+        // Seed exactly MESHDB_SERVER_BATCH_ROWS rows so the residual is
+        // empty (row count is an exact multiple of the batch size).
+        let origin = 0xCAFEu64;
+        let reader = Arc::new(InMemoryChainReader::default());
+        for i in 0..MESHDB_SERVER_BATCH_ROWS as u64 {
+            reader.append(origin, SeqNum(i), vec![i as u8]);
+        }
+        let executor: Arc<dyn MeshQueryExecutor> = Arc::new(LocalMeshQueryExecutor::new(reader));
+        let plan = atomic_plan(OperatorPlan::BetweenRead {
+            origin,
+            start: SeqNum(0),
+            end: SeqNum(MESHDB_SERVER_BATCH_ROWS as u64),
+        });
+
+        let sender = Arc::new(CapturingSender::default());
+        let inflight = Arc::new(RwLock::new(HashMap::new()));
+        run_server_call(
+            0xB,
+            42,
+            plan,
+            executor,
+            sender.clone(),
+            Arc::new(Notify::new()),
+            inflight,
+        )
+        .await;
+
+        let frames = sender.frames.lock();
+        let total_rows: usize = frames
+            .iter()
+            .filter_map(|f| match f {
+                MeshDbFrame::Response(MeshDbResponse::Batch { batch, .. }) => Some(batch.rows.len()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(
+            total_rows,
+            MESHDB_SERVER_BATCH_ROWS,
+            "all rows must be shipped"
+        );
+        let has_final_batch = frames.iter().any(|f| {
+            matches!(
+                f,
+                MeshDbFrame::Response(MeshDbResponse::Batch {
+                    batch: ResultBatch { r#final: true, .. },
+                    ..
+                })
+            )
+        });
+        assert!(
+            has_final_batch,
+            "must emit a final=true terminal batch even for an exact batch-multiple row count"
+        );
     }
 
     #[tokio::test]
