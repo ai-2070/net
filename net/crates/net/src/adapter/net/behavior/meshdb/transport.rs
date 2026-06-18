@@ -386,30 +386,38 @@ impl MeshDbTransport for MeshDbWireTransport {
         // could ship msg back before our caller-table entry is
         // visible and the response would be dropped as
         // UnknownCallId.
-        // Per perf #198 — `DashMap::insert` is sharded, so concurrent
+        // Per perf #198 — `DashMap` is sharded, so concurrent
         // `send`s with distinct `call_id`s no longer serialize on the
         // whole-map write lock the legacy `RwLock<HashMap>` did.
-        let prev = self.inflight.insert(
-            call_id,
-            InflightCaller {
-                tx,
-                target_node: node,
-            },
-        );
+        //
         // `call_id`s come from the process-global
         // `FEDERATED_CALL_ID_COUNTER`, so a collision means either
         // (a) someone hand-rolled a request bypassing the counter,
         // or (b) the same call_id reached `send` twice (e.g. a
         // retry that recycled the id). Both are bugs in the layer
-        // above us; debug_assert so the test suite catches them
-        // without paying a release-build cost. Release builds keep
-        // the latest-wins behaviour rather than rejecting — the
-        // earlier caller would otherwise hang forever on a stale
-        // tx that no one drains.
-        debug_assert!(
-            prev.is_none(),
-            "duplicate inflight call_id={call_id:#x}; previous caller silently overwritten",
-        );
+        // above us. Rather than overwrite — which silently drops the
+        // prior caller's `tx`, closing its `ResponseStream` and
+        // surfacing a synthetic empty/failed result with no signal —
+        // refuse the duplicate. The `entry` API makes the
+        // occupied-check and the insert atomic within the shard, so
+        // two concurrent `send`s with the same id can't both believe
+        // they won. The first caller keeps its live registration; the
+        // duplicate is rejected here and never reaches the wire.
+        use dashmap::mapref::entry::Entry;
+        match self.inflight.entry(call_id) {
+            Entry::Occupied(_) => {
+                return Err(TransportError::Other(format!(
+                    "duplicate inflight call_id={call_id:#x}; \
+                     refusing to overwrite the prior caller's response channel",
+                )));
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(InflightCaller {
+                    tx,
+                    target_node: node,
+                });
+            }
+        }
         let send_result = self
             .sender
             .send_frame(node, MeshDbFrame::Request(request))
@@ -974,6 +982,81 @@ mod tests {
             },
             total_cost: CostEstimate::default(),
         }
+    }
+
+    /// Sender that accepts every frame without routing it
+    /// anywhere — lets `MeshDbWireTransport::send` register an
+    /// inflight entry and return a live stream without needing a
+    /// peer dispatcher. Used to exercise the duplicate-call_id
+    /// guard in isolation.
+    struct OkSender;
+
+    #[async_trait]
+    impl MeshDbWireSender for OkSender {
+        async fn send_frame(
+            &self,
+            _target_node: u64,
+            _frame: MeshDbFrame,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    // Regression for finding #26: a duplicate in-flight `call_id`
+    // must be refused (error) rather than silently overwriting the
+    // prior caller's response sender. Pre-fix this was a
+    // `debug_assert!` only, so release builds dropped the first
+    // caller's `tx`, hanging / failing it with no signal.
+    #[tokio::test]
+    async fn duplicate_call_id_is_refused_not_overwritten() {
+        let transport = MeshDbWireTransport {
+            sender: Arc::new(OkSender),
+            inflight: Arc::new(DashMap::new()),
+        };
+
+        let plan = atomic_plan(OperatorPlan::LatestRead { origin: 0xAA });
+        let req1 = MeshDbRequest::Execute {
+            call_id: 0x1234,
+            plan: plan.clone(),
+        };
+        let req2 = MeshDbRequest::Execute {
+            call_id: 0x1234, // same id — the collision under test
+            plan,
+        };
+
+        // First send registers the caller and returns a stream.
+        // Keep it alive (don't drop) so its inflight entry stays
+        // registered while the second send races it.
+        let _stream1 = transport
+            .send(0xB, req1)
+            .await
+            .expect("first send registers cleanly");
+        assert_eq!(transport.inflight.len(), 1);
+
+        // Second send with the same call_id must be refused.
+        // (Match rather than `expect_err`: the Ok variant is a boxed
+        // response stream that does not implement `Debug`.)
+        let err = match transport.send(0xB, req2).await {
+            Ok(_) => panic!("duplicate call_id must be refused"),
+            Err(e) => e,
+        };
+        match err {
+            TransportError::Other(detail) => {
+                assert!(
+                    detail.contains("duplicate inflight call_id"),
+                    "got: {detail}"
+                );
+            }
+            other => panic!("expected TransportError::Other, got {other:?}"),
+        }
+
+        // The first caller's registration is untouched — exactly
+        // one entry, still the original.
+        assert_eq!(
+            transport.inflight.len(),
+            1,
+            "the prior caller must remain registered"
+        );
     }
 
     #[tokio::test]

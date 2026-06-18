@@ -468,7 +468,25 @@ fn hash_join_one_sided(
     emit_unmatched_build: bool,
     swap: bool,
 ) -> Result<Vec<ResultRow>, MeshError> {
-    let mut build = build_hash_join_table(build_rows, key_mode, "broadcast-hash")?;
+    // Build-side rows with no extractable key are dropped by
+    // `build_hash_join_table` (they can never *match* a probe —
+    // a NULL/non-scalar join key matches nothing). For OUTER
+    // joins the build side is the *preserved* side, so such rows
+    // must still appear unmatched (right=None / left=None),
+    // mirroring `hash_join_full_outer`'s no-key handling.
+    // Partition them out here before building the probe table so
+    // the matched/keyed path is unchanged.
+    let (keyed_build_rows, no_key_build_rows): (Vec<ResultRow>, Vec<ResultRow>) =
+        if emit_unmatched_build {
+            build_rows
+                .into_iter()
+                .partition(|r| try_encode_join_key(r, key_mode).is_some())
+        } else {
+            // Inner join: no-key build rows match nothing and are
+            // never emitted, so the table-build drop is correct.
+            (build_rows, Vec::new())
+        };
+    let mut build = build_hash_join_table(keyed_build_rows, key_mode, "broadcast-hash")?;
 
     let mut out = Vec::new();
     for p in probe_rows {
@@ -499,6 +517,15 @@ fn hash_join_one_sided(
                     out.push(encode_joined_row(left, right)?);
                 }
             }
+        }
+        // No-key preserved-side rows: never matched, always emitted.
+        for b in no_key_build_rows {
+            let (left, right) = if swap {
+                (None, Some(b))
+            } else {
+                (Some(b), None)
+            };
+            out.push(encode_joined_row(left, right)?);
         }
     }
     Ok(out)
@@ -1060,19 +1087,32 @@ fn sort_merge_join(
     key_mode: &JoinKeyMode,
     kind: JoinKind,
 ) -> Result<Vec<ResultRow>, MeshError> {
-    let mut left: Vec<(Vec<u8>, ResultRow)> = left_rows
-        .into_iter()
-        .filter_map(|r| try_encode_join_key(&r, key_mode).map(|k| (k, r)))
-        .collect();
-    let mut right: Vec<(Vec<u8>, ResultRow)> = right_rows
-        .into_iter()
-        .filter_map(|r| try_encode_join_key(&r, key_mode).map(|k| (k, r)))
-        .collect();
-    left.sort_by(|a, b| a.0.cmp(&b.0));
-    right.sort_by(|a, b| a.0.cmp(&b.0));
-
     let emit_left_unmatched = matches!(kind, JoinKind::LeftOuter | JoinKind::FullOuter);
     let emit_right_unmatched = matches!(kind, JoinKind::RightOuter | JoinKind::FullOuter);
+
+    // No-key rows can never *match* (a NULL/non-scalar join key
+    // matches nothing), so they're excluded from the two-pointer
+    // merge. But on a preserved (outer) side they must still be
+    // emitted unmatched — mirroring `hash_join_full_outer`. Carry
+    // them aside instead of dropping them in the `filter_map`.
+    let mut left: Vec<(Vec<u8>, ResultRow)> = Vec::with_capacity(left_rows.len());
+    let mut left_no_key: Vec<ResultRow> = Vec::new();
+    for r in left_rows {
+        match try_encode_join_key(&r, key_mode) {
+            Some(k) => left.push((k, r)),
+            None => left_no_key.push(r),
+        }
+    }
+    let mut right: Vec<(Vec<u8>, ResultRow)> = Vec::with_capacity(right_rows.len());
+    let mut right_no_key: Vec<ResultRow> = Vec::new();
+    for r in right_rows {
+        match try_encode_join_key(&r, key_mode) {
+            Some(k) => right.push((k, r)),
+            None => right_no_key.push(r),
+        }
+    }
+    left.sort_by(|a, b| a.0.cmp(&b.0));
+    right.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut out = Vec::new();
     let (mut li, mut ri) = (0usize, 0usize);
@@ -1116,10 +1156,18 @@ fn sort_merge_join(
         for (_, l) in &left[li..] {
             out.push(encode_joined_row(Some(l.clone()), None)?);
         }
+        // Left-side no-key rows: never matched, always emitted.
+        for l in left_no_key {
+            out.push(encode_joined_row(Some(l), None)?);
+        }
     }
     if emit_right_unmatched {
         for (_, r) in &right[ri..] {
             out.push(encode_joined_row(None, Some(r.clone()))?);
+        }
+        // Right-side no-key rows: never matched, always emitted.
+        for r in right_no_key {
+            out.push(encode_joined_row(None, Some(r))?);
         }
     }
     Ok(out)
@@ -2165,6 +2213,173 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    // Helper: a row whose JSON payload may or may not carry the
+    // join field. `JoinKeyMode::Field(path)` extraction returns
+    // `None` when the field is absent — that's the no-key case
+    // the OUTER-join paths must still preserve.
+    fn json_row(origin: u64, seq: u64, json: &str) -> ResultRow {
+        ResultRow {
+            origin,
+            seq: SeqNum(seq),
+            payload: json.as_bytes().to_vec(),
+        }
+    }
+
+    // Regression for finding #20: LEFT/RIGHT OUTER hash-join must
+    // emit preserved-side rows whose `Field` key is missing — they
+    // can't match, but they must still appear with the other side
+    // None. Pre-fix `build_hash_join_table` dropped them entirely.
+    #[test]
+    fn hash_join_left_outer_emits_no_key_lefts() {
+        use crate::adapter::net::behavior::meshdb::planner::JoinKeyMode;
+        use crate::adapter::net::behavior::meshdb::query::JoinedRowPayload;
+
+        let key_mode = JoinKeyMode::Field("k".to_string());
+        // Left: one row with the key ("v"), one row missing it.
+        let left = vec![
+            json_row(0x100, 1, r#"{"k":"v"}"#),
+            json_row(0x100, 2, r#"{"other":"x"}"#), // no "k" → no key
+        ];
+        // Right matches the keyed left row.
+        let right = vec![json_row(0x200, 9, r#"{"k":"v"}"#)];
+
+        let out = hash_join_one_sided(left, right, &key_mode, true, false).unwrap();
+        let decoded: Vec<JoinedRowPayload> = out
+            .iter()
+            .map(|r| postcard::from_bytes(&r.payload).unwrap())
+            .collect();
+        assert_eq!(decoded.len(), 2, "decoded = {decoded:?}");
+        // The matched row.
+        let matched = decoded
+            .iter()
+            .filter(|j| j.left.is_some() && j.right.is_some())
+            .count();
+        assert_eq!(matched, 1, "matched: decoded = {decoded:?}");
+        // The no-key left must be present, unmatched (right=None).
+        let no_key = decoded
+            .iter()
+            .find(|j| j.left.as_ref().map(|l| l.seq) == Some(SeqNum(2)))
+            .expect("no-key left row must be emitted");
+        assert!(
+            no_key.right.is_none(),
+            "no-key left must never match: {no_key:?}"
+        );
+    }
+
+    // Regression for finding #20 (RightOuter is the symmetric
+    // case — the right side is preserved/built).
+    #[test]
+    fn hash_join_right_outer_emits_no_key_rights() {
+        use crate::adapter::net::behavior::meshdb::planner::JoinKeyMode;
+        use crate::adapter::net::behavior::meshdb::query::JoinedRowPayload;
+
+        let key_mode = JoinKeyMode::Field("k".to_string());
+        let left = vec![json_row(0x100, 1, r#"{"k":"v"}"#)];
+        let right = vec![
+            json_row(0x200, 8, r#"{"k":"v"}"#),
+            json_row(0x200, 9, r#"{"nope":1}"#), // no "k" → no key
+        ];
+
+        // RightOuter dispatches as build-on-right with swap=true.
+        let out = hash_join_one_sided(right, left, &key_mode, true, true).unwrap();
+        let decoded: Vec<JoinedRowPayload> = out
+            .iter()
+            .map(|r| postcard::from_bytes(&r.payload).unwrap())
+            .collect();
+        assert_eq!(decoded.len(), 2, "decoded = {decoded:?}");
+        let no_key = decoded
+            .iter()
+            .find(|j| j.right.as_ref().map(|r| r.seq) == Some(SeqNum(9)))
+            .expect("no-key right row must be emitted");
+        assert!(
+            no_key.left.is_none(),
+            "no-key right must never match: {no_key:?}"
+        );
+    }
+
+    // Inner join must NOT emit no-key rows (they match nothing and
+    // inner drops unmatched) — guards against over-emitting.
+    #[test]
+    fn hash_join_inner_drops_no_key_rows() {
+        use crate::adapter::net::behavior::meshdb::planner::JoinKeyMode;
+        use crate::adapter::net::behavior::meshdb::query::JoinedRowPayload;
+
+        let key_mode = JoinKeyMode::Field("k".to_string());
+        let left = vec![
+            json_row(0x100, 1, r#"{"k":"v"}"#),
+            json_row(0x100, 2, r#"{"other":"x"}"#), // no key
+        ];
+        let right = vec![json_row(0x200, 9, r#"{"k":"v"}"#)];
+
+        let out = hash_join_one_sided(left, right, &key_mode, false, false).unwrap();
+        let decoded: Vec<JoinedRowPayload> = out
+            .iter()
+            .map(|r| postcard::from_bytes(&r.payload).unwrap())
+            .collect();
+        // Only the matched pair; no-key left dropped.
+        assert_eq!(decoded.len(), 1, "decoded = {decoded:?}");
+        assert!(decoded[0].left.is_some() && decoded[0].right.is_some());
+    }
+
+    // Regression for finding #32: sort-merge join must carry no-key
+    // rows through and emit them unmatched on the preserved side,
+    // matching the hash-join family.
+    #[test]
+    fn sort_merge_full_outer_emits_no_key_rows_on_both_sides() {
+        use crate::adapter::net::behavior::meshdb::planner::JoinKeyMode;
+        use crate::adapter::net::behavior::meshdb::query::{JoinKind, JoinedRowPayload};
+
+        let key_mode = JoinKeyMode::Field("k".to_string());
+        let left = vec![
+            json_row(0x100, 1, r#"{"k":"v"}"#),
+            json_row(0x100, 2, r#"{"missing":1}"#), // no key
+        ];
+        let right = vec![
+            json_row(0x200, 8, r#"{"k":"v"}"#),
+            json_row(0x200, 9, r#"{"alsomissing":1}"#), // no key
+        ];
+
+        let out = sort_merge_join(left, right, &key_mode, JoinKind::FullOuter).unwrap();
+        let decoded: Vec<JoinedRowPayload> = out
+            .iter()
+            .map(|r| postcard::from_bytes(&r.payload).unwrap())
+            .collect();
+        // matched(v,v) + left-only(seq2) + right-only(seq9) = 3.
+        assert_eq!(decoded.len(), 3, "decoded = {decoded:?}");
+        let left_no_key = decoded
+            .iter()
+            .find(|j| j.left.as_ref().map(|l| l.seq) == Some(SeqNum(2)))
+            .expect("no-key left must be emitted");
+        assert!(left_no_key.right.is_none());
+        let right_no_key = decoded
+            .iter()
+            .find(|j| j.right.as_ref().map(|r| r.seq) == Some(SeqNum(9)))
+            .expect("no-key right must be emitted");
+        assert!(right_no_key.left.is_none());
+    }
+
+    // Sort-merge LeftOuter must preserve the no-key left but NOT
+    // emit the no-key right (right is not the preserved side here).
+    #[test]
+    fn sort_merge_left_outer_preserves_only_left_no_key() {
+        use crate::adapter::net::behavior::meshdb::planner::JoinKeyMode;
+        use crate::adapter::net::behavior::meshdb::query::{JoinKind, JoinedRowPayload};
+
+        let key_mode = JoinKeyMode::Field("k".to_string());
+        let left = vec![json_row(0x100, 2, r#"{"missing":1}"#)]; // no key
+        let right = vec![json_row(0x200, 9, r#"{"alsomissing":1}"#)]; // no key
+
+        let out = sort_merge_join(left, right, &key_mode, JoinKind::LeftOuter).unwrap();
+        let decoded: Vec<JoinedRowPayload> = out
+            .iter()
+            .map(|r| postcard::from_bytes(&r.payload).unwrap())
+            .collect();
+        // Only the no-key left appears; the no-key right is dropped.
+        assert_eq!(decoded.len(), 1, "decoded = {decoded:?}");
+        assert_eq!(decoded[0].left.as_ref().unwrap().seq, SeqNum(2));
+        assert!(decoded[0].right.is_none());
     }
 
     #[tokio::test]
