@@ -25,7 +25,7 @@ FFI-edge mediums. One reported HIGH (crypto anti-replay `MAX_FORWARD`) was
 investigated and **downgraded to informational** (#37) — the control is dead on
 the hot path but the window math means it is *not* an exploitable replay bypass.
 
-## Resolution (branch `bugfix/audit-2026-06-18`, 31 commits)
+## Resolution (branch `bugfix/audit-2026-06-18`, 47 commits)
 
 **Fixed + committed (34 of 37 findings + several appendix-class):**
 - Rust core/behavior: #5, #6, #9, #10, #13, #14, #15, #18, #19, #20, #21, #22,
@@ -42,7 +42,7 @@ the hot path but the window math means it is *not* an exploitable replay bypass.
   (plus a pure-Go unit test for the #1 quiesce guard that runs in CI), not a cgo
   compile/link.
 
-**Code-review follow-ups (two automated review rounds — all addressed):**
+**Code-review follow-ups (three automated review rounds — all addressed):**
 - **#8 panic guard was dead in compute-ffi** (P1) — the first pass *defined* the
   `ffi_guard!` `catch_unwind` macro but never invoked it, so every `extern "C"`
   entry point still unwound across the C ABI. Now wrapped on all 80 entry points
@@ -70,6 +70,97 @@ the hot path but the window math means it is *not* an exploitable replay bypass.
 - **redex** — dropped a stale `#[expect(clippy::expect_used)]` left on
   `append_batch` by the #5 refactor (clippy `unfulfilled_lint_expectations`).
 
+_Third round (2026-06-19 `/code-review` pass over the full branch diff — 14
+commits, one per finding). Rust changes are `cargo check`-clean (both
+`net-mesh` and `net-compute-ffi`) with the touched modules' tests passing; Go
+changes are `gofmt`-clean and mirror already-compiling patterns but, as above,
+were not cgo-compiled here (no toolchain)._
+
+- **#1 follow-up — the `Split()` halves were left on the bare UAF pattern.**
+  The #1 fix converted `DuplexCall` to the quiesce guard, but the post-`Split()`
+  halves `DuplexSink` / `DuplexStream` (own native handles, own finalizers,
+  blocking `Recv`/`Send`) still used the `closed atomic.Bool` check-then-use —
+  the exact race #1 closed. Both now carry their own `streamHandleGuard`.
+  (`fix(go/mesh_rpc): guard DuplexSink/DuplexStream …`)
+- **#2 / the deferred lock-across-blocking wedge — `NextControl(0)` ↔ `Free`.**
+  `MeshOsDaemonHandle` converted to the `streamHandleGuard` so `Free`'s
+  `requestFree()` never blocks behind a parked unbounded `NextControl(0)`.
+  Slicing the wait can't substitute: the FFI returns `CONTROL_NONE` for *both* a
+  slice-timeout and a real shutdown, so a sliced unbounded wait can't tell "keep
+  waiting" from "done". An uncancellable `NextControl(0)` still only returns on
+  an event/shutdown (nothing can wake it early without substrate support), but it
+  no longer wedges `Free`. (`fix(go/meshos): use streamHandleGuard …`)
+- **`PublishLog` GC use-after-free (new, not a numbered finding).** `PublishLog`
+  took `unsafe.Pointer(&msgBytes[0])` inside an inner `if` block that closed
+  before the cgo call and never `KeepAlive`d it; cgo does not pin a `*C.char`
+  that has lost its Go-pointer identity, so the GC could reclaim the backing
+  array mid-call. Hoisted + `runtime.KeepAlive`, matching the sibling
+  `PublishCapabilities`. (`fix(go/meshos): keep msgBytes alive …`)
+- **#31 follow-up — three `isize::MAX` guards the sweep missed.** The #31 sweep
+  guarded `net_compute_register_placement_filter` but not its copy-paste siblings
+  `net_compute_unregister_placement_filter` / `net_compute_has_placement_filter`,
+  nor `net_compute_spawn_from_snapshot`'s snapshot read (guarded only by
+  `len == 0`). All three now guard `len > isize::MAX` before `from_raw_parts`.
+  (`fix(compute-ffi): guard len > isize::MAX …`)
+- **#8 follow-up — `daemon_count` panic default collided with a valid result.**
+  `net_compute_runtime_daemon_count`'s `ffi_guard!` default was `0` — itself a
+  valid count — so a caught panic read as "0 daemons" success rather than the
+  `-1` (`NET_COMPUTE_ERR_NULL`) the function uses for errors. Default changed to
+  the negative sentinel. (`fix(compute-ffi): daemon_count panic default …`)
+- **#19 follow-up — unbounded committed-prefix retry.** After the first packet of
+  a multi-batch send commits, `flush_stream_batch` can't surface `Backpressure`
+  (replay would duplicate), so it retried internally — with NO bound. A *stalled*
+  (not closed) receiver that never grants credit spun the sender forever (the
+  only loop exit was `StreamClosed`). Bounded by `COMMITTED_FLUSH_STALL_BUDGET`
+  (30 s, the default session-dead horizon): past it the peer is treated as dead
+  and a terminal `StreamError::Transport` (which the caller does NOT replay) is
+  surfaced. Paused-time unit tests added. (`fix(mesh): bound flush_stream_batch …`)
+- **#14 follow-up — `circuit_recovery_time_ms == 0` collapses the breaker.** A
+  zero recovery window made `open_time.elapsed() < ZERO` always false and the
+  abandoned-probe check `claimed_at.elapsed() >= ZERO` always true, so a tripped
+  breaker admitted instantly and the single-probe half-open gate vanished.
+  Clamped to ≥ 1 ms at the derivation point (regression `cr14b`). Also corrected
+  `is_circuit_open`'s "**Pure predicate** — no side effects" doc: it performs one
+  bounded, idempotent self-healing write (reclaiming a genuinely-abandoned slot),
+  which must stay in the predicate — a rejected endpoint is never selected, so
+  its abandoned slot can only be healed during the scan.
+  (`fix(loadbalance): clamp circuit_recovery_time_ms …`, `docs(loadbalance): …`)
+- **#35 follow-up — `OutstandingRequests::record` was O(n) per insert.** At the
+  soft cap it scanned every entry twice — a `retain` expiry sweep plus a
+  `min_by_key` for the oldest — on the hot replication path. Re-backed with
+  `lru::LruCache` (already a dependency): `put` evicts the LRU (= oldest recorded,
+  since `take` only pops) entry in O(1), making the cap a HARD bound; TTL is still
+  enforced lazily in `take`. #35 cap tests unchanged and still pass.
+  (`perf(redex/replication): bound OutstandingRequests with LruCache …`)
+- **#15 / #29 follow-up — full-ring sweep on a fresh add.** `add_to_hash_ring`
+  ran the O(ring) stale-vnode `retain` on *every* add, including a node's first
+  (which has no prior vnodes to sweep). Threaded the `endpoints.insert`
+  was-present result (decided under `membership_lock`) so the sweep runs only on
+  a re-add. (`perf(loadbalance): skip hash-ring stale-vnode sweep on a fresh add`)
+- **#25 follow-up — the empty-tick waker re-arm was hand-copied 3×.**
+  `AuditStream` / `LogStream` / `FailureStream` each inlined the
+  `cx.waker().wake_by_ref()` + `Poll::Pending` re-arm; centralized into a
+  `rearm_after_empty_tick` helper so a fourth stream can't silently omit it and
+  reintroduce the park-forever bug. (`refactor(deck): centralize the empty-tick …`)
+- **#21 follow-up — header integrity needs no on-disk format change.** Extending
+  the 28-bit payload checksum to cover the idx header would be a backward-
+  incompatible format break *and* is unnecessary: recovery recomputes the
+  checksum over the bytes **as located and interpreted by** the header, so a
+  corrupt `payload_offset` / `payload_len` / `flags` reads the wrong (or
+  out-of-bounds) region and fails the checksum → the entry is dropped. Only `seq`
+  (which selects nothing on read) escapes, which is exactly why #21 added the
+  seq-monotonicity walk. Documented this transitive coverage at the recovery
+  filter and added a test that corrupts ONLY `payload_offset` and asserts the
+  drop. (`test(redex): pin transitive header-corruption coverage …`)
+- **blob.go / mesh_rpc.go boilerplate dedup (cleanup).** The deferred
+  "blob.go (#7) shares the lock-across-blocking pattern" item was re-examined and
+  is NOT a wedge: `blob` Store/Fetch `block_on` **local-disk** I/O (not network),
+  and holding the RLock across them IS the #7 use-after-free fix — so only the 9×
+  lock-and-validate boilerplate was deduped into a `withReadHandle` helper
+  (mirroring meshos.go). The 4× ctx-cancel watcher block in `mesh_rpc.go` was
+  likewise extracted into `spawnCtxCancelWatcher`. (`refactor(go/blob): …`,
+  `refactor(go/mesh_rpc): extract spawnCtxCancelWatcher …`)
+
 **Investigated and intentionally NOT changed:**
 - #37 — reverted. The "restore MAX_FORWARD in `commit`" hardening breaks 4
   existing replay-window tests that encode deliberate design: `commit` accepts
@@ -92,10 +183,12 @@ the hot path but the window math means it is *not* an exploitable replay bypass.
 - #12 — `C.GoBytes(ptr, C.int(len))` ≥2 GiB truncation (~20 call sites). Each
   site needs bespoke error handling around `goBytesChecked`'s `(…, bool)`
   return; with no cgo toolchain to compile-verify, 20 blind edits is too risky.
-- **blob.go (#7) / meshos.go (#2) share the lock-across-blocking-call pattern**
-  that #1 was corrected for (Fetch/Store and NextControl(0) hold the lock across
-  a blocking cgo call). Not yet flagged by review; the same `streamHandleGuard`
-  treatment applies (meshos needs care around the pump + cgo.Handle teardown).
+- ~~**blob.go (#7) / meshos.go (#2) share the lock-across-blocking-call
+  pattern**~~ — RESOLVED in the third review round. `meshos.go`'s
+  `NextControl(0)` ↔ `Free` wedge was real and is fixed via the
+  `streamHandleGuard` (above). `blob.go` was re-examined and is NOT a wedge:
+  Fetch/Store `block_on` local-disk I/O, and holding the RLock across them is the
+  #7 UAF fix itself — so only the boilerplate was deduped, behavior preserved.
 - Appendix B-1..B-7 — in the divergent `bindings/go/net/` copy (+ B-4 pump
   busy-spin in canonical `meshos.go`); not addressed.
 
