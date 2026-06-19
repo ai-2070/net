@@ -184,17 +184,27 @@ func (a *MeshBlobAdapter) Close() error {
 	return nil
 }
 
+// withReadHandle runs fn under the read lock with a validated, non-nil
+// native handle, keeping the adapter alive across the cgo call. Returns
+// false (without calling fn) when the handle has been closed. Every FFI
+// deref of `handle` goes through here so Close's `_free` (which takes
+// the write lock) cannot race a live op into a use-after-free.
+func (a *MeshBlobAdapter) withReadHandle(fn func(handle *C.net_mesh_blob_adapter_t)) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.handle == nil {
+		return false
+	}
+	fn(a.handle)
+	runtime.KeepAlive(a)
+	return true
+}
+
 // Store `data` under the content address declared by
 // `blobRefBytes` (a previously-encoded `BlobRef` wire blob).
 // The substrate BLAKE3-verifies + raises a typed error on
 // mismatch.
 func (a *MeshBlobAdapter) Store(blobRefBytes, data []byte) error {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	handle := a.handle
-	if handle == nil {
-		return ErrBlobClosed
-	}
 	var refPtr *C.uint8_t
 	if len(blobRefBytes) > 0 {
 		refPtr = (*C.uint8_t)(unsafe.Pointer(&blobRefBytes[0]))
@@ -203,11 +213,16 @@ func (a *MeshBlobAdapter) Store(blobRefBytes, data []byte) error {
 	if len(data) > 0 {
 		dataPtr = (*C.uint8_t)(unsafe.Pointer(&data[0]))
 	}
-	rc := C.net_mesh_blob_adapter_store(
-		handle,
-		refPtr, C.size_t(len(blobRefBytes)),
-		dataPtr, C.size_t(len(data)),
-	)
+	var rc C.int
+	if !a.withReadHandle(func(handle *C.net_mesh_blob_adapter_t) {
+		rc = C.net_mesh_blob_adapter_store(
+			handle,
+			refPtr, C.size_t(len(blobRefBytes)),
+			dataPtr, C.size_t(len(data)),
+		)
+	}) {
+		return ErrBlobClosed
+	}
 	if rc != 0 {
 		return fmt.Errorf("%w: store failed with rc=%d", ErrBlob, int(rc))
 	}
@@ -216,23 +231,22 @@ func (a *MeshBlobAdapter) Store(blobRefBytes, data []byte) error {
 
 // Fetch returns the content-addressed bytes for `blobRefBytes`.
 func (a *MeshBlobAdapter) Fetch(blobRefBytes []byte) ([]byte, error) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	handle := a.handle
-	if handle == nil {
-		return nil, ErrBlobClosed
-	}
 	var refPtr *C.uint8_t
 	if len(blobRefBytes) > 0 {
 		refPtr = (*C.uint8_t)(unsafe.Pointer(&blobRefBytes[0]))
 	}
 	var outPtr *C.uint8_t
 	var outLen C.size_t
-	rc := C.net_mesh_blob_adapter_fetch(
-		handle,
-		refPtr, C.size_t(len(blobRefBytes)),
-		&outPtr, &outLen,
-	)
+	var rc C.int
+	if !a.withReadHandle(func(handle *C.net_mesh_blob_adapter_t) {
+		rc = C.net_mesh_blob_adapter_fetch(
+			handle,
+			refPtr, C.size_t(len(blobRefBytes)),
+			&outPtr, &outLen,
+		)
+	}) {
+		return nil, ErrBlobClosed
+	}
 	if rc != 0 {
 		return nil, fmt.Errorf("%w: fetch failed with rc=%d", ErrBlob, int(rc))
 	}
@@ -244,22 +258,21 @@ func (a *MeshBlobAdapter) Fetch(blobRefBytes []byte) ([]byte, error) {
 // Exists probes local presence — returns `true` when every
 // chunk of `blobRefBytes` is locally reachable.
 func (a *MeshBlobAdapter) Exists(blobRefBytes []byte) (bool, error) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	handle := a.handle
-	if handle == nil {
-		return false, ErrBlobClosed
-	}
 	var refPtr *C.uint8_t
 	if len(blobRefBytes) > 0 {
 		refPtr = (*C.uint8_t)(unsafe.Pointer(&blobRefBytes[0]))
 	}
 	var present C.int
-	rc := C.net_mesh_blob_adapter_exists(
-		handle,
-		refPtr, C.size_t(len(blobRefBytes)),
-		&present,
-	)
+	var rc C.int
+	if !a.withReadHandle(func(handle *C.net_mesh_blob_adapter_t) {
+		rc = C.net_mesh_blob_adapter_exists(
+			handle,
+			refPtr, C.size_t(len(blobRefBytes)),
+			&present,
+		)
+	}) {
+		return false, ErrBlobClosed
+	}
 	if rc != 0 {
 		return false, fmt.Errorf("%w: exists failed with rc=%d", ErrBlob, int(rc))
 	}
@@ -270,13 +283,12 @@ func (a *MeshBlobAdapter) Exists(blobRefBytes []byte) (bool, error) {
 // (includes the v0.2 counter family + the v0.3 overflow
 // counter family if active).
 func (a *MeshBlobAdapter) PrometheusText() (string, error) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	handle := a.handle
-	if handle == nil {
+	var body *C.char
+	if !a.withReadHandle(func(handle *C.net_mesh_blob_adapter_t) {
+		body = C.net_mesh_blob_adapter_prometheus_text(handle)
+	}) {
 		return "", ErrBlobClosed
 	}
-	body := C.net_mesh_blob_adapter_prometheus_text(handle)
 	if body == nil {
 		return "", fmt.Errorf("%w: prometheus_text returned null", ErrBlob)
 	}
@@ -287,13 +299,12 @@ func (a *MeshBlobAdapter) PrometheusText() (string, error) {
 // OverflowEnabled — `true` iff the adapter is currently
 // advertising `dataforts.blob.overflow`.
 func (a *MeshBlobAdapter) OverflowEnabled() (bool, error) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	handle := a.handle
-	if handle == nil {
+	var rc C.int
+	if !a.withReadHandle(func(handle *C.net_mesh_blob_adapter_t) {
+		rc = C.net_mesh_blob_adapter_overflow_enabled(handle)
+	}) {
 		return false, ErrBlobClosed
 	}
-	rc := C.net_mesh_blob_adapter_overflow_enabled(handle)
 	if rc < 0 {
 		return false, fmt.Errorf("%w: overflow_enabled rc=%d", ErrBlob, int(rc))
 	}
@@ -303,13 +314,12 @@ func (a *MeshBlobAdapter) OverflowEnabled() (bool, error) {
 // OverflowActive — `true` iff the most recent overflow tick
 // observed disk at or above the high-water threshold.
 func (a *MeshBlobAdapter) OverflowActive() (bool, error) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	handle := a.handle
-	if handle == nil {
+	var rc C.int
+	if !a.withReadHandle(func(handle *C.net_mesh_blob_adapter_t) {
+		rc = C.net_mesh_blob_adapter_overflow_active(handle)
+	}) {
 		return false, ErrBlobClosed
 	}
-	rc := C.net_mesh_blob_adapter_overflow_active(handle)
 	if rc < 0 {
 		return false, fmt.Errorf("%w: overflow_active rc=%d", ErrBlob, int(rc))
 	}
@@ -318,13 +328,12 @@ func (a *MeshBlobAdapter) OverflowActive() (bool, error) {
 
 // OverflowConfig snapshots the current overflow configuration.
 func (a *MeshBlobAdapter) OverflowConfig() (*OverflowConfig, error) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	handle := a.handle
-	if handle == nil {
+	var body *C.char
+	if !a.withReadHandle(func(handle *C.net_mesh_blob_adapter_t) {
+		body = C.net_mesh_blob_adapter_overflow_config(handle)
+	}) {
 		return nil, ErrBlobClosed
 	}
-	body := C.net_mesh_blob_adapter_overflow_config(handle)
 	if body == nil {
 		return nil, fmt.Errorf("%w: overflow_config returned null", ErrBlob)
 	}
@@ -339,17 +348,16 @@ func (a *MeshBlobAdapter) OverflowConfig() (*OverflowConfig, error) {
 
 // SetOverflowEnabled flips the master switch at runtime.
 func (a *MeshBlobAdapter) SetOverflowEnabled(enabled bool) error {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	handle := a.handle
-	if handle == nil {
-		return ErrBlobClosed
-	}
 	b := C.int(0)
 	if enabled {
 		b = 1
 	}
-	rc := C.net_mesh_blob_adapter_set_overflow_enabled(handle, b)
+	var rc C.int
+	if !a.withReadHandle(func(handle *C.net_mesh_blob_adapter_t) {
+		rc = C.net_mesh_blob_adapter_set_overflow_enabled(handle, b)
+	}) {
+		return ErrBlobClosed
+	}
 	if rc != 0 {
 		return fmt.Errorf("%w: set_overflow_enabled rc=%d", ErrBlob, int(rc))
 	}
@@ -362,19 +370,18 @@ func (a *MeshBlobAdapter) SetOverflowConfig(cfg *OverflowConfig) error {
 	if cfg == nil {
 		return fmt.Errorf("%w: config is nil", ErrBlobInvalidConfig)
 	}
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	handle := a.handle
-	if handle == nil {
-		return ErrBlobClosed
-	}
 	body, err := json.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("%w: marshal: %v", ErrBlobInvalidConfig, err)
 	}
 	cBody := C.CString(string(body))
 	defer C.free(unsafe.Pointer(cBody))
-	rc := C.net_mesh_blob_adapter_set_overflow_config(handle, cBody)
+	var rc C.int
+	if !a.withReadHandle(func(handle *C.net_mesh_blob_adapter_t) {
+		rc = C.net_mesh_blob_adapter_set_overflow_config(handle, cBody)
+	}) {
+		return ErrBlobClosed
+	}
 	if rc != 0 {
 		return fmt.Errorf("%w: set_overflow_config rc=%d", ErrBlob, int(rc))
 	}
