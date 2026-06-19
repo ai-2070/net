@@ -1105,12 +1105,12 @@ fn translate_responses(mut response_stream: ResponseStream, handle: QueryHandle)
                 }
             }
         }
-        // Stream ended without a terminal frame (no End / Error
-        // / final-batch). All terminal arms above `return`, so
-        // reaching here means the transport dropped the stream
-        // prematurely. Per the protocol contract this is a
-        // transport-level error — surface it so consumers don't
-        // mistake premature drop for clean EOS.
+        // The stream closed without a terminal frame (End / Error /
+        // `final = true` batch). `run_server_call` always terminates a
+        // COMPLETE result with a `final = true` batch (it now emits one
+        // even when the residual is empty), so reaching here means the
+        // stream was TRUNCATED in transport. Surface it as a protocol
+        // error rather than masking the lost rows as a clean result.
         let _ = tx
             .send(Err(MeshError::ExecutorError {
                 node: 0,
@@ -1490,6 +1490,103 @@ mod tests {
         let running = fed.execute(plan).await.unwrap();
         let rows = collect_rows(running.rows).await;
         assert!(rows.is_empty());
+    }
+
+    // Regression for finding #22 (corrected after review): the terminal
+    // marker now ALWAYS rides a `final = true` batch — `run_server_call`
+    // emits one even when the residual is empty. A complete stream (an
+    // intermediate chunk followed by a `final = true` batch) yields all
+    // rows and NO error.
+    #[tokio::test]
+    async fn final_batch_terminates_stream_successfully() {
+        use super::super::protocol::ResultBatch;
+
+        let frames = vec![
+            MeshDbResponse::Batch {
+                call_id: 7,
+                batch: ResultBatch::chunk(vec![ResultRow {
+                    origin: 0xAA,
+                    seq: SeqNum(1),
+                    payload: b"r1".to_vec(),
+                }]),
+            },
+            MeshDbResponse::Batch {
+                call_id: 7,
+                batch: ResultBatch::last(vec![ResultRow {
+                    origin: 0xAA,
+                    seq: SeqNum(2),
+                    payload: b"r2".to_vec(),
+                }]),
+            },
+        ];
+        let stream: ResponseStream = Box::pin(futures::stream::iter(frames));
+        let handle = QueryHandle::new(1);
+
+        let out = collect_rows(translate_responses(stream, handle)).await;
+        assert_eq!(out.len(), 2, "expected exactly the two rows, got {out:?}");
+        assert!(
+            out.iter().all(|r| r.is_ok()),
+            "a final batch must not synthesize an error: {out:?}"
+        );
+        let seqs: Vec<u64> = out.into_iter().map(|r| r.unwrap().seq.0).collect();
+        assert_eq!(seqs, vec![1, 2]);
+    }
+
+    // Review follow-up to #22: a non-final batch followed by a clean
+    // stream end (no End / Error / `final = true` frame) is a TRUNCATED
+    // stream, not a complete one. The rows that did arrive are
+    // forwarded, but the missing terminal MUST surface as an error so a
+    // truncated result is never silently mistaken for a full one.
+    #[tokio::test]
+    async fn truncation_after_non_final_batch_surfaces_error() {
+        use super::super::protocol::ResultBatch;
+
+        let frames = vec![MeshDbResponse::Batch {
+            call_id: 7,
+            batch: ResultBatch::chunk(vec![ResultRow {
+                origin: 0xAA,
+                seq: SeqNum(1),
+                payload: b"r1".to_vec(),
+            }]),
+        }];
+        let stream: ResponseStream = Box::pin(futures::stream::iter(frames));
+        let handle = QueryHandle::new(1);
+
+        let out = collect_rows(translate_responses(stream, handle)).await;
+        // The delivered row is forwarded, then a terminal truncation error.
+        assert_eq!(
+            out.len(),
+            2,
+            "expected the row plus a truncation error: {out:?}"
+        );
+        assert!(
+            out[0].is_ok(),
+            "the delivered row should be forwarded: {out:?}"
+        );
+        match &out[1] {
+            Err(MeshError::ExecutorError { detail, .. }) => {
+                assert!(detail.contains("before terminal frame"), "got: {detail}");
+            }
+            other => panic!("expected truncation ExecutorError, got {other:?}"),
+        }
+    }
+
+    // Complementary guard: a stream that drops before ANY batch is
+    // a genuine premature drop and must still surface the error.
+    #[tokio::test]
+    async fn premature_drop_before_any_batch_still_errors() {
+        // Empty stream: closes without delivering anything.
+        let stream: ResponseStream = Box::pin(futures::stream::empty());
+        let handle = QueryHandle::new(1);
+
+        let out = collect_rows(translate_responses(stream, handle)).await;
+        assert_eq!(out.len(), 1, "expected a single error frame: {out:?}");
+        match &out[0] {
+            Err(MeshError::ExecutorError { detail, .. }) => {
+                assert!(detail.contains("before terminal frame"), "got: {detail}");
+            }
+            other => panic!("expected premature-drop ExecutorError, got {other:?}"),
+        }
     }
 
     #[tokio::test]

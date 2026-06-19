@@ -31,6 +31,7 @@
 
 use bytes::Bytes;
 
+use super::error::RedexError;
 use super::file::RedexFile;
 use super::replication::{ChannelId, SyncEvent, SyncNackError, SyncRequest, SyncResponse};
 
@@ -467,15 +468,41 @@ pub fn apply_sync_response(
             divergence_suspected,
         });
     }
-    // Apply via append_batch. Each payload is already a Bytes
-    // (Vec<u8> → Bytes was the §5.2 fix); cloning is now a true
-    // refcount bump rather than the alloc + memcpy that
+    // Apply via the seq-guarded append. Each payload is already a
+    // Bytes (Vec<u8> → Bytes was the §5.2 fix); cloning is now a
+    // true refcount bump rather than the alloc + memcpy that
     // `Bytes::from(e.payload.clone())` produced when payload was
     // a Vec<u8>. Per PERF_AUDIT §5.2.
     let payloads: Vec<Bytes> = response.events.iter().map(|e| e.payload.clone()).collect();
     let appended = payloads.len() as u64;
-    file.append_batch(&payloads)
-        .map_err(|e| ApplyError::AppendFailed(format!("{e:?}")))?;
+    // #5 (TOCTOU): we validated `first_seq == local_next` above
+    // using a `next_seq()` snapshot that released the state lock.
+    // A concurrent direct append to this replica-role file between
+    // that snapshot and the append would advance `next_seq`, so
+    // `append_batch` (which assigns fresh contiguous seqs from the
+    // *current* tail, ignoring the events' leader-declared
+    // `event_seq`) would silently land the chunk at the wrong seqs
+    // and misalign the leader↔replica logs. `append_batch_if_next_seq`
+    // re-checks `next_seq == first_seq` and appends under ONE held
+    // lock, so the window is closed: a racing writer surfaces as
+    // `SeqMismatch` (mapped to a `GapBeforeChunk`-shaped recovery
+    // signal) instead of silent divergence. On the single-writer
+    // happy path (the documented replica invariant) the recheck is
+    // a cheap atomic load that always matches.
+    file.append_batch_if_next_seq(response.first_seq, &payloads)
+        .map_err(|e| match e {
+            RedexError::SeqMismatch { actual, .. } => ApplyError::GapBeforeChunk {
+                first_seq: response.first_seq,
+                local_next: actual,
+                // A concurrent local append advanced the tail past
+                // the chunk's `first_seq`. The replica's log now
+                // carries events the leader's chunk doesn't, so the
+                // histories have diverged in exactly the sense R-5
+                // flags — route through the same skip-ahead recovery.
+                divergence_suspected: true,
+            },
+            other => ApplyError::AppendFailed(format!("{other:?}")),
+        })?;
     // Force a disk sync before returning the new tail so the
     // replica's next heartbeat advertises a durable seq. Without
     // this, the runtime broadcasts `tail_seq = post-append` while
@@ -1507,5 +1534,42 @@ mod tests {
             .expect_err("channel mismatch must propagate");
         assert!(matches!(err, ApplyError::ChannelMismatch { .. }));
         assert_eq!(replica.next_seq(), 0, "nothing applied on error");
+    }
+
+    /// #5 happy path: switching `apply_sync_response` from the
+    /// unguarded `append_batch` to the seq-guarded
+    /// `append_batch_if_next_seq` must not change behavior when the
+    /// chunk starts exactly at the local tail (the only case the
+    /// pre-checks let reach the append). The deterministic
+    /// concurrent-writer race itself is covered by the
+    /// `append_batch_if_next_seq_rejects_on_mismatch` unit test on
+    /// the `RedexFile` primitive in `file.rs`; here we pin that a
+    /// well-formed chunk still applies cleanly through the guard.
+    #[test]
+    fn apply_sync_response_happy_path_through_seq_guard() {
+        let dst = build_file("redex/guarded_apply");
+        append_n(&dst, 3, "pre"); // local tail = 3
+        let cid = channel_id_for("redex/guarded_apply");
+        let response = SyncResponse {
+            channel_id: cid,
+            first_seq: 3,
+            leader_first_retained_seq: 0,
+            events: vec![
+                SyncEvent {
+                    event_seq: 3,
+                    payload: bytes::Bytes::from_static(b"d"),
+                },
+                SyncEvent {
+                    event_seq: 4,
+                    payload: bytes::Bytes::from_static(b"e"),
+                },
+            ],
+            request_id: 0,
+        };
+        let new_tail = apply_sync_response(&dst, &response, cid).expect("guarded apply");
+        assert_eq!(new_tail, 5);
+        assert_eq!(dst.next_seq(), 5);
+        assert_eq!(&dst.read_one(3).unwrap().payload[..], b"d");
+        assert_eq!(&dst.read_one(4).unwrap().payload[..], b"e");
     }
 }

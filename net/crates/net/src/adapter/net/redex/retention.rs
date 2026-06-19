@@ -66,26 +66,42 @@ pub(crate) fn compute_eviction_count(
     }
 
     // Age-based: drop entries whose timestamp is STRICTLY older
-    // than the cutoff. Timestamps are ~monotonic (wall clock)
-    // within a single process, so the first entry with
-    // `ts >= cutoff` marks the retained head.
+    // than the cutoff. Eviction is head-prefix only (the segment
+    // can only trim from the front), so the age drop count is the
+    // length of the prefix that must go for no *stale* entry to
+    // remain.
     //
-    // Pre-fix, the predicate was `ts > cutoff` (drop on
-    // `ts <= cutoff`), so an entry with `ts == cutoff` — i.e.
-    // an entry exactly `max_age_ns` old — was dropped.
-    // Intuitive "max age" semantics retain the boundary entry;
-    // breaking change to align the implementation with that
-    // intuition. Callers that depended on the off-by-one (e.g.
-    // tests asserting "5 of 10 dropped under
-    // `max_age = total - 1`") see one fewer drop now.
+    // Pre-fix #36, this early-broke at the first entry with
+    // `ts >= cutoff`, treating the prefix before it as "all older"
+    // — which assumes timestamps are monotonically non-decreasing.
+    // They are wall-clock (`now_ns()`) captured at append time, so
+    // a backward clock step (NTP correction) can make a *later*
+    // entry carry a *smaller* ts than an earlier one. With the
+    // early break, a young entry followed by an older one yields a
+    // wrong drop count: the older entry is silently retained past
+    // its max age. Fix: scan the whole slice and take the prefix up
+    // to and including the LAST entry older than the cutoff. This
+    // never retains a stale entry; at worst it drops a young entry
+    // that happens to sit ahead of an older one in seq order, which
+    // is the conservative choice (over-retention of stale data is
+    // the failure we must avoid). On a monotonic clock the last-old
+    // index is exactly `first-young-index − 1`, so the count is
+    // identical to the old early-break behavior — no change on the
+    // happy path.
+    //
+    // Note on the `ts >= cutoff` boundary: an entry exactly
+    // `max_age_ns` old (`ts == cutoff`) is RETAINED, matching the
+    // intuitive "max age N retains entries up to N old" semantics.
     if let Some(max_age_ns) = cfg.retention_max_age_ns {
         let cutoff = now_ns.saturating_sub(max_age_ns);
         let mut age_drop = 0;
-        for &ts in timestamps.iter() {
-            if ts >= cutoff {
-                break;
+        for (idx, &ts) in timestamps.iter().enumerate() {
+            if ts < cutoff {
+                // Drop the prefix [0..=idx]. Keep scanning: a
+                // still-later entry may also be stale under a
+                // non-monotonic clock.
+                age_drop = idx + 1;
             }
-            age_drop += 1;
         }
         drop = drop.max(age_drop);
     }
@@ -308,5 +324,53 @@ mod tests {
             "entry at exactly cutoff (ts=15, max_age=5, now=20) \
              must be retained — pre-fix this dropped 2 entries"
         );
+    }
+
+    /// Regression #36: a backward wall-clock step (NTP correction)
+    /// can make a LATER entry carry a SMALLER timestamp than an
+    /// earlier one. The age scan must not early-break at the first
+    /// young entry, or it under-counts and silently retains a stale
+    /// entry past its max age.
+    #[test]
+    fn bug36_non_monotonic_timestamps_count_all_stale() {
+        let entries = heap_entries(5, 16);
+        // index:        0    1    2    3    4
+        // ts (ns):    [100, 500, 200, 110, 120]
+        // The clock stepped backward after index 1, so indices 2..4
+        // carry smaller timestamps than index 1 despite being
+        // appended later.
+        let ts = vec![100u64, 500, 200, 110, 120];
+        // now = 700, max_age = 300 → cutoff = 400. Entries older
+        // than the cutoff (ts < 400): indices 0 (100), 2 (200),
+        // 3 (110), 4 (120). Index 1 (500) is young.
+        //
+        // Early-break (pre-fix) would stop at index 1 → drop 1,
+        // silently RETAINING the three stale entries at 2,3,4.
+        // Full-scan (post-fix) finds the last stale index is 4, so
+        // it drops the whole [0..=4] prefix = 5. Conservative: it
+        // also drops the young index-1 entry rather than leave the
+        // older tail behind it un-evictable, but no stale entry is
+        // ever retained.
+        let cfg = RedexFileConfig::default().with_retention_max_age(Duration::from_nanos(300));
+        assert_eq!(
+            compute_eviction_count(&entries, &ts, 700, &cfg),
+            5,
+            "non-monotonic timestamps must not let a stale entry \
+             survive behind a younger one (pre-fix early-break dropped 1)"
+        );
+    }
+
+    /// Companion to #36: confirm the full-scan fix is a no-op on a
+    /// strictly monotonic clock — the drop count must equal the old
+    /// early-break behavior so the happy path is unchanged.
+    #[test]
+    fn bug36_monotonic_timestamps_unchanged() {
+        let entries = heap_entries(6, 16);
+        let ts = vec![10u64, 20, 30, 40, 50, 60];
+        // now = 60, max_age = 25 → cutoff = 35. ts < 35: 10,20,30
+        // (indices 0,1,2). Last stale index 2 → drop 3, identical
+        // to the early-break result.
+        let cfg = RedexFileConfig::default().with_retention_max_age(Duration::from_nanos(25));
+        assert_eq!(compute_eviction_count(&entries, &ts, 60, &cfg), 3);
     }
 }

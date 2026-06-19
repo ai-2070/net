@@ -3826,13 +3826,19 @@ pub const MAX_REPLY_SUBSCRIPTIONS: usize = 1024;
 /// races on calls addressed to other peers. Raw pooled entropy
 /// has no such state to recover.)
 ///
-/// Falls back to a zero call_id if the pool refill fails — that
-/// effectively disables correlation for this call (the oneshot
-/// will time out) rather than panic, but in practice
-/// `getrandom::fill` failure is a fatal-environment signal (no
-/// `/dev/urandom`, broken syscall) and the broader stack won't be
-/// functional anyway. The pool cursor is left exhausted so the
-/// next mint retries the refill.
+/// If the pool refill fails, falls back to a process-global
+/// monotonic counter rather than returning `0`: two concurrent
+/// callers that both minted `0` would `register(0, …)` over each
+/// other, so the first caller's oneshot closes with
+/// `RecvError::Closed` (a spurious `Transport` error, not the clean
+/// timeout the all-distinct path yields). The counter keeps ids
+/// distinct (predictable on entropy failure, but the S-4
+/// `from_node` gate still blocks cross-peer forgery, and such calls
+/// time out anyway). `getrandom::fill` failure is a fatal-
+/// environment signal (no `/dev/urandom`, broken syscall) and the
+/// broader stack won't be functional anyway; the pool cursor is
+/// left exhausted so the next mint retries the refill. `0` is
+/// reserved as a sentinel and never returned.
 fn mint_random_call_id() -> u64 {
     thread_local! {
         // (pool, cursor). Cursor starts exhausted so the first
@@ -3846,14 +3852,28 @@ fn mint_random_call_id() -> u64 {
         let (buf, cursor) = &mut *pool;
         if *cursor >= CALL_ID_ENTROPY_POOL_BYTES {
             if getrandom::fill(buf).is_err() {
-                return 0;
+                // Entropy unavailable. Do NOT return 0 — concurrent
+                // callers would all mint 0 and clobber each other's
+                // pending entries. A process-global counter keeps ids
+                // distinct (starts at 1, so it is non-zero until it
+                // wraps the full u64 range, at which point the 0 is
+                // mapped to 1 below).
+                static CALL_ID_FALLBACK: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(1);
+                let id = CALL_ID_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return if id == 0 { 1 } else { id };
             }
             *cursor = 0;
         }
         let mut id = [0u8; 8];
         id.copy_from_slice(&buf[*cursor..*cursor + 8]);
         *cursor += 8;
-        u64::from_le_bytes(id)
+        // Reserve 0 as the "no correlation" sentinel: on the ~1-in-2^64
+        // chance the pool yields all-zero bytes, remap to a fixed non-zero.
+        match u64::from_le_bytes(id) {
+            0 => 1,
+            id => id,
+        }
     })
 }
 

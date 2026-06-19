@@ -386,30 +386,38 @@ impl MeshDbTransport for MeshDbWireTransport {
         // could ship msg back before our caller-table entry is
         // visible and the response would be dropped as
         // UnknownCallId.
-        // Per perf #198 — `DashMap::insert` is sharded, so concurrent
+        // Per perf #198 — `DashMap` is sharded, so concurrent
         // `send`s with distinct `call_id`s no longer serialize on the
         // whole-map write lock the legacy `RwLock<HashMap>` did.
-        let prev = self.inflight.insert(
-            call_id,
-            InflightCaller {
-                tx,
-                target_node: node,
-            },
-        );
+        //
         // `call_id`s come from the process-global
         // `FEDERATED_CALL_ID_COUNTER`, so a collision means either
         // (a) someone hand-rolled a request bypassing the counter,
         // or (b) the same call_id reached `send` twice (e.g. a
         // retry that recycled the id). Both are bugs in the layer
-        // above us; debug_assert so the test suite catches them
-        // without paying a release-build cost. Release builds keep
-        // the latest-wins behaviour rather than rejecting — the
-        // earlier caller would otherwise hang forever on a stale
-        // tx that no one drains.
-        debug_assert!(
-            prev.is_none(),
-            "duplicate inflight call_id={call_id:#x}; previous caller silently overwritten",
-        );
+        // above us. Rather than overwrite — which silently drops the
+        // prior caller's `tx`, closing its `ResponseStream` and
+        // surfacing a synthetic empty/failed result with no signal —
+        // refuse the duplicate. The `entry` API makes the
+        // occupied-check and the insert atomic within the shard, so
+        // two concurrent `send`s with the same id can't both believe
+        // they won. The first caller keeps its live registration; the
+        // duplicate is rejected here and never reaches the wire.
+        use dashmap::mapref::entry::Entry;
+        match self.inflight.entry(call_id) {
+            Entry::Occupied(_) => {
+                return Err(TransportError::Other(format!(
+                    "duplicate inflight call_id={call_id:#x}; \
+                     refusing to overwrite the prior caller's response channel",
+                )));
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(InflightCaller {
+                    tx,
+                    target_node: node,
+                });
+            }
+        }
         let send_result = self
             .sender
             .send_frame(node, MeshDbFrame::Request(request))
@@ -745,25 +753,33 @@ async fn run_server_call(
         }
     }
 
-    // Flush any residual rows then emit the terminal End.
-    // The `last` flag on the batch is enough — no need for a
-    // separate End. Stay strict and emit End anyway for
-    // wire-uniformity; the caller-side stream guard treats
-    // either as terminal.
-    if !batch.is_empty()
-        && sender
-            .send_frame(
-                peer,
-                MeshDbFrame::Response(MeshDbResponse::Batch {
-                    call_id,
-                    batch: ResultBatch::last(batch),
-                }),
-            )
-            .await
-            .is_err()
+    // Emit the residual rows as the terminal `final = true` batch.
+    // We send it UNCONDITIONALLY — even when `batch` is empty (the row
+    // count was an exact multiple of `MESHDB_SERVER_BATCH_ROWS`, or
+    // there were no rows at all) — so the terminal marker ALWAYS rides
+    // a data frame. Previously an empty residual skipped this batch and
+    // relied solely on the separate `End` below; if that `End` was lost
+    // in transport, the receiver could not distinguish a fully-delivered
+    // result from a truncated one. With a `final = true` batch always
+    // present at the end of a complete stream, a missing terminal frame
+    // unambiguously means truncation (`translate_responses` surfaces it
+    // as a protocol error rather than masking the lost rows).
+    if sender
+        .send_frame(
+            peer,
+            MeshDbFrame::Response(MeshDbResponse::Batch {
+                call_id,
+                batch: ResultBatch::last(batch),
+            }),
+        )
+        .await
+        .is_err()
     {
         return;
     }
+    // Redundant terminal kept for wire-uniformity with consumers that
+    // key on `End`; the receiver returns on the `final = true` batch
+    // above, so a lost `End` no longer changes the outcome.
     let _ = sender
         .send_frame(peer, MeshDbFrame::Response(MeshDbResponse::End { call_id }))
         .await;
@@ -976,6 +992,81 @@ mod tests {
         }
     }
 
+    /// Sender that accepts every frame without routing it
+    /// anywhere — lets `MeshDbWireTransport::send` register an
+    /// inflight entry and return a live stream without needing a
+    /// peer dispatcher. Used to exercise the duplicate-call_id
+    /// guard in isolation.
+    struct OkSender;
+
+    #[async_trait]
+    impl MeshDbWireSender for OkSender {
+        async fn send_frame(
+            &self,
+            _target_node: u64,
+            _frame: MeshDbFrame,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    // Regression for finding #26: a duplicate in-flight `call_id`
+    // must be refused (error) rather than silently overwriting the
+    // prior caller's response sender. Pre-fix this was a
+    // `debug_assert!` only, so release builds dropped the first
+    // caller's `tx`, hanging / failing it with no signal.
+    #[tokio::test]
+    async fn duplicate_call_id_is_refused_not_overwritten() {
+        let transport = MeshDbWireTransport {
+            sender: Arc::new(OkSender),
+            inflight: Arc::new(DashMap::new()),
+        };
+
+        let plan = atomic_plan(OperatorPlan::LatestRead { origin: 0xAA });
+        let req1 = MeshDbRequest::Execute {
+            call_id: 0x1234,
+            plan: plan.clone(),
+        };
+        let req2 = MeshDbRequest::Execute {
+            call_id: 0x1234, // same id — the collision under test
+            plan,
+        };
+
+        // First send registers the caller and returns a stream.
+        // Keep it alive (don't drop) so its inflight entry stays
+        // registered while the second send races it.
+        let _stream1 = transport
+            .send(0xB, req1)
+            .await
+            .expect("first send registers cleanly");
+        assert_eq!(transport.inflight.len(), 1);
+
+        // Second send with the same call_id must be refused.
+        // (Match rather than `expect_err`: the Ok variant is a boxed
+        // response stream that does not implement `Debug`.)
+        let err = match transport.send(0xB, req2).await {
+            Ok(_) => panic!("duplicate call_id must be refused"),
+            Err(e) => e,
+        };
+        match err {
+            TransportError::Other(detail) => {
+                assert!(
+                    detail.contains("duplicate inflight call_id"),
+                    "got: {detail}"
+                );
+            }
+            other => panic!("expected TransportError::Other, got {other:?}"),
+        }
+
+        // The first caller's registration is untouched — exactly
+        // one entry, still the original.
+        assert_eq!(
+            transport.inflight.len(),
+            1,
+            "the prior caller must remain registered"
+        );
+    }
+
     #[tokio::test]
     async fn wire_dispatcher_round_trips_a_latest_query_across_two_nodes() {
         // Two-node setup: node_a is the caller; node_b runs the
@@ -1035,6 +1126,86 @@ mod tests {
 
         // Server-side bookkeeping cleared after the call drained.
         assert_eq!(server_b.inflight_calls(), 0);
+    }
+
+    // Review follow-up to #22: `run_server_call` must terminate a
+    // complete result with a `final = true` batch even when the row
+    // count is an EXACT multiple of `MESHDB_SERVER_BATCH_ROWS` (so the
+    // residual flush is empty). Otherwise the only terminal would be the
+    // separate `End` frame, and a lost `End` would be indistinguishable
+    // from a truncated stream to the receiver.
+    #[tokio::test]
+    async fn server_emits_final_batch_for_exact_batch_multiple_row_count() {
+        #[derive(Default)]
+        struct CapturingSender {
+            frames: parking_lot::Mutex<Vec<MeshDbFrame>>,
+        }
+        #[async_trait]
+        impl MeshDbWireSender for CapturingSender {
+            async fn send_frame(
+                &self,
+                _target: u64,
+                frame: MeshDbFrame,
+            ) -> Result<(), TransportError> {
+                self.frames.lock().push(frame);
+                Ok(())
+            }
+        }
+
+        // Seed exactly MESHDB_SERVER_BATCH_ROWS rows so the residual is
+        // empty (row count is an exact multiple of the batch size).
+        let origin = 0xCAFEu64;
+        let reader = Arc::new(InMemoryChainReader::default());
+        for i in 0..MESHDB_SERVER_BATCH_ROWS as u64 {
+            reader.append(origin, SeqNum(i), vec![i as u8]);
+        }
+        let executor: Arc<dyn MeshQueryExecutor> = Arc::new(LocalMeshQueryExecutor::new(reader));
+        let plan = atomic_plan(OperatorPlan::BetweenRead {
+            origin,
+            start: SeqNum(0),
+            end: SeqNum(MESHDB_SERVER_BATCH_ROWS as u64),
+        });
+
+        let sender = Arc::new(CapturingSender::default());
+        let inflight = Arc::new(RwLock::new(HashMap::new()));
+        run_server_call(
+            0xB,
+            42,
+            plan,
+            executor,
+            sender.clone(),
+            Arc::new(Notify::new()),
+            inflight,
+        )
+        .await;
+
+        let frames = sender.frames.lock();
+        let total_rows: usize = frames
+            .iter()
+            .filter_map(|f| match f {
+                MeshDbFrame::Response(MeshDbResponse::Batch { batch, .. }) => {
+                    Some(batch.rows.len())
+                }
+                _ => None,
+            })
+            .sum();
+        assert_eq!(
+            total_rows, MESHDB_SERVER_BATCH_ROWS,
+            "all rows must be shipped"
+        );
+        let has_final_batch = frames.iter().any(|f| {
+            matches!(
+                f,
+                MeshDbFrame::Response(MeshDbResponse::Batch {
+                    batch: ResultBatch { r#final: true, .. },
+                    ..
+                })
+            )
+        });
+        assert!(
+            has_final_batch,
+            "must emit a final=true terminal batch even for an exact batch-multiple row count"
+        );
     }
 
     #[tokio::test]

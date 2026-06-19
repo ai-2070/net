@@ -228,6 +228,17 @@ fn diff_replicas(
             // BTreeSet's iter is sorted ascending, so `.next()`
             // is the min. Phase D-1 swaps in a placement-score-
             // based pick.
+            //
+            // Skip any chain `diff_forced_evictions` (ICE arm,
+            // runs first) already evicted this tick — the
+            // one-eviction-per-chain-per-tick budget. Without
+            // this guard a chain that is both force-evicted AND
+            // over its desired replica count emits two
+            // `RequestEviction` actions in one pass (mirrors the
+            // `diff_scheduler` guard at the Phase D-1 arm).
+            if evicted.contains(&chain) {
+                continue;
+            }
             if let Some(victim) = holders.and_then(|hs| hs.iter().next()).copied() {
                 out.push(MeshOsAction::RequestEviction { chain, victim });
                 evicted.insert(chain);
@@ -1288,6 +1299,72 @@ mod tests {
     }
 
     #[test]
+    fn mark_avoid_is_not_re_emitted_after_the_loop_records_it() {
+        // Regression for bug #28. `diff_locality`'s idempotence
+        // guard reads `actual.avoid_list`, but no PRODUCTION path
+        // populated it (every `avoid_list.insert` outside tests was
+        // `#[cfg(test)]`), so a persistently-degraded peer used to
+        // get a fresh `MarkAvoid` every tick. The fix records the
+        // peer in `avoid_list` when the loop consumes the emitted
+        // `MarkAvoid` (see `MeshOsLoop::run_reconcile`'s writeback,
+        // same shape as `last_rebalance` / `applied_backoffs`).
+        // This test simulates that writeback and asserts the
+        // second pass emits nothing while the entry is live.
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base);
+        actual.rtt.insert(42, Duration::from_millis(500));
+        let desired = DesiredState::default();
+        let locality = LocalityConfig::default();
+
+        // First pass: peer 42 is degraded and not yet avoided →
+        // exactly one MarkAvoid.
+        let first = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &locality,
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        match first.as_slice() {
+            [MeshOsAction::MarkAvoid { peer, ttl, .. }] => {
+                assert_eq!(*peer, 42);
+                assert_eq!(*ttl, locality.avoid_ttl);
+            }
+            other => panic!("first pass expected one MarkAvoid, got {other:?}"),
+        }
+
+        // Simulate the loop's writeback after consuming the
+        // emitted MarkAvoid (mirrors run_reconcile): record the
+        // peer with `until = now + ttl`.
+        actual.avoid_list.insert(
+            42,
+            AvoidEntry {
+                reason: "rtt-degradation".into(),
+                until: base + locality.avoid_ttl,
+            },
+        );
+
+        // Second pass within the avoid TTL — RTT is still bad but
+        // the peer is now on the avoid list → no re-emit.
+        let second = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &locality,
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        assert!(
+            second.is_empty(),
+            "persistently-degraded peer must emit MarkAvoid once, not every tick; got {second:?}",
+        );
+    }
+
+    #[test]
     fn mark_avoid_emission_is_sorted_by_peer_id_for_stability() {
         let mut actual = MeshOsState::default();
         actual.rtt.insert(7, Duration::from_millis(500));
@@ -2185,6 +2262,60 @@ mod tests {
                 chain: CHAIN,
                 victim: 99,
             }],
+        );
+    }
+
+    #[test]
+    fn forced_eviction_and_overcount_for_same_chain_emit_exactly_one_eviction() {
+        // Regression for bug #9. The Phase C count-driven arm
+        // (`diff_replicas`) used to push `RequestEviction` and
+        // write the `evicted_this_tick` set but never READ it, so
+        // a chain that is BOTH force-evicted (ICE arm, runs
+        // first) AND over its desired replica count got two
+        // `RequestEviction` actions in one tick — defeating the
+        // one-eviction-per-chain-per-tick budget. The count arm
+        // now skips chains already evicted this tick, mirroring
+        // the Phase D-1 scheduler guard.
+        const CHAIN: ChainId = 0xBEEF;
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(anchor());
+        // Two holders; this_node leads; desired count 1 → the
+        // count arm would evict the lex-smallest holder. The ICE
+        // arm independently force-evicts holder 99.
+        actual
+            .replicas
+            .insert(CHAIN, ::std::collections::BTreeSet::from([THIS_NODE, 99]));
+        actual.replica_leader.insert(CHAIN, THIS_NODE);
+        actual.forced_evictions.push((CHAIN, 99));
+        let mut desired = DesiredState::default();
+        desired.desired_replicas.insert(CHAIN, 1);
+
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        let evictions: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, MeshOsAction::RequestEviction { chain, .. } if *chain == CHAIN))
+            .collect();
+        assert_eq!(
+            evictions.len(),
+            1,
+            "force-evicted + over-replicated chain must emit exactly one RequestEviction, got {evictions:?}",
+        );
+        // The ICE arm runs first, so its victim (99) wins the
+        // single eviction slot — not the count arm's lex-smallest.
+        assert_eq!(
+            evictions[0],
+            &MeshOsAction::RequestEviction {
+                chain: CHAIN,
+                victim: 99,
+            },
         );
     }
 

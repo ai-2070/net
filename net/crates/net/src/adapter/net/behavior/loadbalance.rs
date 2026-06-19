@@ -254,6 +254,22 @@ struct EndpointState {
     /// Whether a half-open probe request is currently in flight. Only one
     /// request is admitted per recovery cycle to test the endpoint.
     half_open_probe: std::sync::atomic::AtomicBool,
+    /// Watchdog timestamp for the half-open probe claim.
+    ///
+    /// Stamped with `Instant::now()` whenever `half_open_probe` flips
+    /// `false -> true` (at selection). `select` returns a `Selection` but
+    /// has no way to bind an RAII guard to it (the dashmap `Ref` is local
+    /// and `Selection` is a `Clone` public type consumed by the FFI/SDK
+    /// bindings), so if a caller — e.g. `GroupCoordinator::route_event`,
+    /// which never calls `record_completion` — drops the selection without
+    /// recording completion, the bare bool would stay `true` forever and
+    /// `is_circuit_open` would keep the recovered endpoint out of rotation
+    /// permanently. `is_circuit_open` treats a probe held longer than the
+    /// recovery window as abandoned and reclaims the slot so a fresh probe
+    /// can be admitted (the watchdog the `ProbeGuard` doc points to for the
+    /// async-cancel hazard). `record_completion` clears it on the normal
+    /// path.
+    half_open_probe_at: Mutex<Option<Instant>>,
     /// Set when the endpoint is removed from the balancer. The flat snapshot
     /// shares this `Arc`, so a selector iterating a snapshot taken *before* a
     /// concurrent removal (and before the rebuild that drops the endpoint)
@@ -281,6 +297,7 @@ impl EndpointState {
             circuit_open: std::sync::atomic::AtomicBool::new(false),
             circuit_open_time: Mutex::new(None),
             half_open_probe: std::sync::atomic::AtomicBool::new(false),
+            half_open_probe_at: Mutex::new(None),
             removed: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -368,6 +385,10 @@ impl EndpointState {
         // circuit's fate. Clearing the flag with swap also guarantees only
         // one completion is treated as the probe outcome.
         if self.half_open_probe.swap(false, Ordering::AcqRel) {
+            // Clear the watchdog stamp now that the probe is resolved
+            // normally — keeps a stale `Instant` from lingering past the
+            // next claim's stamp.
+            *self.half_open_probe_at.lock() = None;
             if success {
                 self.circuit_open.store(false, Ordering::Release);
                 self.consecutive_failures.store(0, Ordering::Relaxed);
@@ -401,21 +422,31 @@ impl EndpointState {
 
     /// Returns true if new requests should be rejected for this endpoint.
     ///
-    /// **Pure predicate** — this method has no side effects. The
-    /// half-open probe slot is claimed lazily at selection time
-    /// via [`try_claim_half_open_probe`], so only the endpoint
-    /// actually chosen by the selector claims the probe.
-    ///
-    /// Conflating "is the circuit open?" with "CAS-claim the
-    /// half-open probe slot when the recovery window has elapsed"
-    /// would let `get_available_endpoints` claim the probe slot
-    /// for every endpoint it filters. A multi-endpoint outage past
-    /// its recovery window would then have every endpoint claim
-    /// the probe slot in the scan while only one (or zero) was
-    /// selected. The N-1 others would hold
+    /// Does NOT claim the half-open probe slot — that is done lazily at
+    /// selection time via [`try_claim_half_open_probe`], so only the
+    /// endpoint actually chosen by the selector claims the probe.
+    /// Conflating "is the circuit open?" with "CAS-claim the half-open
+    /// probe slot when the recovery window has elapsed" would let
+    /// `get_available_endpoints` claim the probe slot for every endpoint
+    /// it filters: a multi-endpoint outage past its recovery window
+    /// would then have every endpoint claim the slot in the scan while
+    /// only one (or zero) was selected; the N-1 others would hold
     /// `half_open_probe == true` with no in-flight request and no
-    /// completion path — every subsequent `is_circuit_open` would
+    /// completion path, and every subsequent `is_circuit_open` would
     /// return true forever.
+    ///
+    /// NOT a pure predicate: it performs ONE bounded self-healing write.
+    /// When the slot is held by a probe that has been claimed for longer
+    /// than a full recovery window with no completion (genuinely
+    /// ABANDONED — see below), it reclaims the slot via
+    /// [`release_half_open_probe`] and admits. This is idempotent under
+    /// concurrent scanners and only ever fires on an abandoned slot — a
+    /// LIVE probe (claimed within the recovery window) is never touched —
+    /// so a read-only caller cannot clear an in-flight probe. The reclaim
+    /// must live here, not on the claim path: the claim only runs for the
+    /// endpoint the selector picks, but a rejected endpoint is never
+    /// picked, so its abandoned slot could only be healed during this
+    /// scan.
     fn is_circuit_open(&self, recovery_time: Duration) -> bool {
         if !self.circuit_open.load(Ordering::Acquire) {
             return false;
@@ -433,7 +464,28 @@ impl EndpointState {
         // Otherwise we admit (the caller will CAS-claim the slot
         // via `try_claim_half_open_probe` only on the endpoint it
         // actually selects).
-        self.half_open_probe.load(Ordering::Acquire)
+        if !self.half_open_probe.load(Ordering::Acquire) {
+            return false;
+        }
+        // The slot is claimed. A claim that has been held longer than
+        // a full recovery window with no completion is an ABANDONED
+        // probe — a selection handed to a caller (e.g.
+        // `GroupCoordinator::route_event`) that never calls
+        // `record_completion`, or an async request future that was
+        // cancelled/panicked between claim and completion without a
+        // `ProbeGuard`. Without this watchdog the bare bool would
+        // pin the recovered endpoint out of rotation forever. Reclaim
+        // the slot so a fresh probe can be admitted on this scan.
+        let abandoned = self
+            .half_open_probe_at
+            .lock()
+            .is_some_and(|claimed_at| claimed_at.elapsed() >= recovery_time);
+        if abandoned {
+            self.release_half_open_probe();
+            // Admit: this scan/selection will re-claim the slot.
+            return false;
+        }
+        true
     }
 
     /// Try to claim the half-open probe slot.
@@ -462,7 +514,12 @@ impl EndpointState {
         self.half_open_probe
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
-            .map(|_| ProbeGuard { state: self })
+            .map(|_| {
+                // Stamp the watchdog so a never-committed, never-dropped
+                // claim still self-heals via `is_circuit_open`.
+                self.stamp_half_open_probe();
+                ProbeGuard { state: self }
+            })
     }
 
     /// Release the half-open probe slot without recording a
@@ -471,7 +528,17 @@ impl EndpointState {
     /// slot must be cleared via direct atomic write (e.g.
     /// `record_completion` once the breaker fully reopens).
     fn release_half_open_probe(&self) {
+        *self.half_open_probe_at.lock() = None;
         self.half_open_probe.store(false, Ordering::Release);
+    }
+
+    /// Stamp the half-open probe watchdog. Called right after a
+    /// successful `false -> true` claim of `half_open_probe` so
+    /// `is_circuit_open` can reclaim an abandoned probe slot (a
+    /// selection that was returned to a caller who never recorded
+    /// completion) once it has been held past the recovery window.
+    fn stamp_half_open_probe(&self) {
+        *self.half_open_probe_at.lock() = Some(Instant::now());
     }
 }
 
@@ -770,11 +837,20 @@ impl LoadBalancer {
         // Hold `membership_lock` across the mutation + rebuild so a concurrent
         // add/remove can't store a stale snapshot over ours (see field doc).
         let _guard = self.membership_lock.lock();
-        self.endpoints
-            .insert(node_id, Arc::new(EndpointState::new(endpoint)));
+        let was_present = self
+            .endpoints
+            .insert(node_id, Arc::new(EndpointState::new(endpoint)))
+            .is_some();
 
-        // Add to hash ring for consistent hashing
-        self.add_to_hash_ring(node_id);
+        // Add (or idempotently re-add) this node's vnodes. `add_to_hash_ring`
+        // overwrites the node's own prior vnodes in place and sweeps any
+        // stale leftovers, so a re-add (reconnect / weight change) neither
+        // leaks vnodes nor leaves a transient window where the node is
+        // absent from the ring (which would misroute traffic for an
+        // endpoint that was meant to stay available). `was_present`
+        // (endpoint absent => no prior vnodes, under `membership_lock`)
+        // lets a fresh add skip the full-ring stale-vnode sweep.
+        self.add_to_hash_ring(node_id, was_present);
         self.rebuild_endpoint_list();
     }
 
@@ -938,6 +1014,13 @@ impl LoadBalancer {
                         drop(state);
                         continue;
                     }
+                    // Stamp the watchdog so this claim self-heals even
+                    // if the returned `Selection` is dropped without a
+                    // matching `record_completion` (e.g.
+                    // `GroupCoordinator::route_event`). `is_circuit_open`
+                    // reclaims the slot once it has been held past the
+                    // recovery window. See `half_open_probe_at`.
+                    state.stamp_half_open_probe();
                     true
                 } else {
                     false
@@ -969,7 +1052,13 @@ impl LoadBalancer {
         &self,
         ctx: &RequestContext,
     ) -> Result<Vec<Arc<EndpointState>>, LoadBalancerError> {
-        let recovery_time = Duration::from_millis(self.config.circuit_recovery_time_ms);
+        // Clamp to >= 1ms. A 0 recovery window makes the abandoned-probe
+        // watchdog in `is_circuit_open` fire on every freshly-claimed
+        // probe (`claimed_at.elapsed() >= ZERO` is always true), which
+        // collapses the single-probe half-open gate and admits unbounded
+        // concurrent probes to a still-failing endpoint. `0` is a
+        // reachable, unvalidated config value, so guard it at the source.
+        let recovery_time = Duration::from_millis(self.config.circuit_recovery_time_ms.max(1));
         let mut available = Vec::new();
         let mut zone_matches = Vec::new();
 
@@ -1080,19 +1169,40 @@ impl LoadBalancer {
             return self.select_round_robin_at(endpoints, counter as usize);
         }
 
-        // Reduce the counter modulo `total_weight` in integer space
-        // BEFORE casting to f64. The previous implementation did
-        // `counter as f64 % total_weight`, which lost the low bits
-        // of `counter` once it crossed the f64 mantissa boundary
-        // (2^53 selections) — rotation stalled on a narrow set of
-        // indices and distribution skewed on long-running services.
+        // Pick a wheel position by reducing the counter modulo an
+        // integer `wheel` size BEFORE casting to f64, then mapping that
+        // position proportionally into `[0, total_weight)`. Doing the
+        // modulus in integer space first preserves the precision fix —
+        // `counter as f64 % total_weight` lost the low bits of `counter`
+        // past the f64 mantissa boundary (2^53 selections), stalling
+        // rotation on a narrow set of indices.
         //
-        // `total_weight.ceil() as u64` loses at most 1 unit of
-        // fractional precision (negligible for any real load-balancer
-        // configuration), while keeping the rotation length
-        // comparable to the integer-weight sum.
-        let total_ceil = (total_weight.ceil() as u64).max(1);
-        let target = (counter % total_ceil) as f64;
+        // The wheel size must NOT collapse to the integer ceiling of a
+        // sub-unit total: `total_weight.ceil() as u64` mapped
+        // `total_weight == 1.0` (e.g. two endpoints each at effective
+        // weight 0.5, both `Degraded`) to `1`, so `counter % 1 == 0`
+        // always and the cumulative loop (`0.5 > 0`) selected the first
+        // endpoint forever — the second starved.
+        //
+        // Derive the wheel from the weights themselves rather than an
+        // arbitrary floor: `ceil(total / smallest positive weight)`
+        // gives every endpoint at least one wheel position and yields
+        // EXACT ratios for commensurate weights. Integer weights keep
+        // their natural cycle (1,1,1 → wheel 3; 100,50 → wheel 3, i.e.
+        // 2:1) — byte-for-byte the old integer behavior, NOT reshaped by
+        // a fixed constant — while fractional/sub-unit shares resolve
+        // (0.5,0.5 → 2; 1.0,0.5 → 3). The modulus is taken in integer
+        // space (`counter % wheel`) BEFORE the f64 cast, preserving the
+        // precision fix (`counter as f64 % total` lost the low bits of
+        // `counter` past the 2^53 mantissa boundary, stalling rotation).
+        let min_weight = endpoints
+            .iter()
+            .map(|e| e.effective_weight())
+            .filter(|w| *w > 0.0)
+            .fold(f64::INFINITY, f64::min);
+        let wheel = ((total_weight / min_weight).ceil() as u64).max(1);
+        // Map the integer wheel position into the real weight domain.
+        let target = (counter % wheel) as f64 / wheel as f64 * total_weight;
 
         let mut cumulative = 0.0;
         for state in endpoints {
@@ -1354,24 +1464,55 @@ impl LoadBalancer {
         self.select_weighted_round_robin(endpoints)
     }
 
-    fn add_to_hash_ring(&self, node_id: NodeId) {
+    /// Place (or idempotently re-place) `node_id`'s vnodes on the ring.
+    /// `was_present` is whether the node already had an endpoint entry
+    /// (and therefore prior vnodes): on a fresh add it is false and the
+    /// stale-vnode sweep is skipped, avoiding a full-ring scan per join.
+    fn add_to_hash_ring(&self, node_id: NodeId, was_present: bool) {
+        // Slots this node ends up occupying in THIS call — used both to
+        // keep the node's own intra-call collisions distinct and to
+        // sweep any stale vnodes left by a prior add (drift cleanup).
+        let mut placed: std::collections::HashSet<u64> =
+            std::collections::HashSet::with_capacity(self.virtual_nodes as usize);
         for i in 0..self.virtual_nodes {
             let key = format!("{:?}-{}", node_id, i);
             let mut hash = self.hash_key(&key);
-            // Linear-probe past collisions. FNV-1a + ~150 vnodes
-            // per node × ~1k nodes is well below the u64
-            // birthday-bound, but a collision is unobservable
-            // pre-fix: `insert(hash, node_id)` last-write-wins
-            // silently lost an earlier vnode and skewed the ring
-            // distribution toward the late writer. Probe by 1
-            // until we find an empty slot so every vnode is
-            // distinct, then we're guaranteed even with
-            // adversarial node-id choice (the probe terminates
-            // because the ring has at most virtual_nodes * nodes
-            // entries, far below u64::MAX).
-            while self.hash_ring.insert(hash, node_id).is_some() {
-                hash = hash.wrapping_add(1);
+            // Linear-probe past collisions, NON-DESTRUCTIVELY (a plain
+            // `insert` would clobber another node's vnode and skew the
+            // ring). The probe stops when the slot is:
+            //   * free, OR
+            //   * already held by THIS node from a *prior* add (not one
+            //     we placed this call) — overwrite it in place.
+            // The in-place overwrite is what makes a re-add (reconnect /
+            // weight change) idempotent WITHOUT first removing the
+            // node's vnodes: clearing first (the previous fix) left a
+            // transient window where the node had no ring presence and
+            // traffic could misroute. A slot held by a DIFFERENT node,
+            // or by one of this node's vnodes we ALREADY placed this
+            // call (an intra-node hash collision), is a true collision —
+            // probe on so every vnode stays distinct.
+            loop {
+                match self.hash_ring.get(&hash).map(|r| *r) {
+                    None => break,
+                    Some(occupant) if occupant == node_id && !placed.contains(&hash) => break,
+                    Some(_) => hash = hash.wrapping_add(1),
+                }
             }
+            self.hash_ring.insert(hash, node_id);
+            placed.insert(hash);
+        }
+        // Sweep any vnodes still tagged with this node that we did NOT
+        // (re)place this call — stale entries from an earlier add whose
+        // probe path changed (e.g. a collision partner was since
+        // removed). The node's freshly-placed vnodes are all in `placed`
+        // and inserted above, so it is never absent from the ring; this
+        // only drops leftovers. Skipped entirely on a fresh add: a node
+        // with no prior endpoint entry has no prior vnodes to leave
+        // behind, so the O(ring) retain scan would never remove anything
+        // — important when many nodes join a large ring.
+        if was_present {
+            self.hash_ring
+                .retain(|k, v| *v != node_id || placed.contains(k));
         }
     }
 
@@ -2843,5 +2984,249 @@ mod tests {
             .starts_with("circuit breaker open for:"));
         assert!(format!("{}", LoadBalancerError::MaxConnectionsReached(id))
             .starts_with("max connections reached for:"));
+    }
+
+    /// Finding #14: a half-open probe claimed at selection time but
+    /// never completed (the production `GroupCoordinator::route_event`
+    /// path calls `select` and never `record_completion`) must NOT pin
+    /// the recovered endpoint out of rotation forever. The watchdog
+    /// reclaims the abandoned slot once it has been held past the
+    /// recovery window, so a later selection is admitted as a fresh
+    /// probe.
+    #[test]
+    fn cr14_abandoned_half_open_probe_is_reclaimed_after_recovery_window() {
+        let config = LoadBalancerConfig {
+            strategy: Strategy::RoundRobin,
+            circuit_recovery_time_ms: 50,
+            ..Default::default()
+        };
+        let lb = LoadBalancer::new(config);
+        lb.add_endpoint(Endpoint::new(make_node_id(1)));
+        let ctx = RequestContext::new();
+
+        // Trip the breaker (5 consecutive failures).
+        for _ in 0..5 {
+            let sel = lb.select(&ctx).expect("admitted before trip");
+            lb.record_completion(&sel.node_id, false);
+        }
+        assert!(lb.select(&ctx).is_err(), "open breaker must reject");
+
+        // Wait past the recovery window so the next selection admits
+        // the probe.
+        std::thread::sleep(Duration::from_millis(75));
+
+        // Claim the probe via select() but DO NOT record completion —
+        // this models a caller that drops the selection (route_event).
+        let probe = lb
+            .select(&ctx)
+            .expect("first request after recovery is the probe");
+        let ep = lb.endpoints.get(&probe.node_id).unwrap();
+        assert!(
+            ep.half_open_probe.load(Ordering::Acquire),
+            "probe slot is claimed right after selection"
+        );
+        drop(ep);
+
+        // Immediately, the slot is fresh — another selector is still
+        // (correctly) rejected.
+        assert!(
+            lb.select(&ctx).is_err(),
+            "a freshly-claimed probe still gates concurrent selectors"
+        );
+
+        // Let the abandoned probe age past a full recovery window.
+        std::thread::sleep(Duration::from_millis(75));
+
+        // The watchdog must reclaim the stranded slot: a later
+        // selection is admitted again rather than rejected forever.
+        let reclaimed = lb.select(&ctx);
+        assert!(
+            reclaimed.is_ok(),
+            "an abandoned half-open probe (no record_completion) must be \
+             reclaimed after the recovery window so the recovered endpoint \
+             returns to rotation — pre-fix the bare bool pinned it out forever"
+        );
+    }
+
+    /// Follow-up to cr14: a `circuit_recovery_time_ms == 0` config must
+    /// not collapse the breaker. Pre-fix, a zero recovery window made
+    /// `open_time.elapsed() < ZERO` always false (the breaker never held
+    /// open) and `claimed_at.elapsed() >= ZERO` always true (every probe
+    /// judged abandoned), so a tripped breaker admitted instantly and the
+    /// single-probe half-open gate vanished. The `>= 1ms` clamp keeps the
+    /// breaker shut inside its (tiny) recovery window.
+    #[test]
+    fn cr14b_zero_recovery_time_does_not_collapse_breaker() {
+        let config = LoadBalancerConfig {
+            strategy: Strategy::RoundRobin,
+            circuit_recovery_time_ms: 0,
+            ..Default::default()
+        };
+        let lb = LoadBalancer::new(config);
+        lb.add_endpoint(Endpoint::new(make_node_id(1)));
+        let ctx = RequestContext::new();
+
+        // Trip the breaker (5 consecutive failures).
+        for _ in 0..5 {
+            let sel = lb.select(&ctx).expect("admitted before trip");
+            lb.record_completion(&sel.node_id, false);
+        }
+        // Immediately after tripping — microseconds later, inside the
+        // clamped 1ms recovery window — the breaker must still reject.
+        // Pre-fix the 0 window admitted instantly, collapsing the gate
+        // and letting unbounded concurrent probes hit a failing endpoint.
+        assert!(
+            lb.select(&ctx).is_err(),
+            "a 0 recovery-time config must not collapse the open breaker \
+             into instant admission"
+        );
+    }
+
+    /// Finding #15: re-adding an already-present endpoint must NOT
+    /// leak its previous hash-ring vnodes. Pre-fix `add_endpoint`
+    /// inserted a fresh ~`virtual_nodes` set without removing the
+    /// node's existing vnodes, leaking ~150 ring entries per re-add.
+    #[test]
+    fn cr15_readd_endpoint_does_not_leak_hash_ring_vnodes() {
+        let lb = LoadBalancer::with_strategy(Strategy::ConsistentHash);
+        let node = make_node_id(1);
+
+        lb.add_endpoint(Endpoint::new(node));
+        let after_first = lb.hash_ring.len();
+        assert_eq!(
+            after_first, lb.virtual_nodes as usize,
+            "a fresh add must create exactly virtual_nodes vnodes"
+        );
+
+        // Re-add the same node several times (reconnect / weight change).
+        for _ in 0..5 {
+            lb.add_endpoint(Endpoint::new(node).with_weight(200));
+        }
+
+        assert_eq!(
+            lb.hash_ring.len(),
+            lb.virtual_nodes as usize,
+            "re-adding the same node must not leak stale vnodes — the ring \
+             size must stay at virtual_nodes, not grow by ~150 per re-add"
+        );
+
+        // Every ring entry must still resolve to this node.
+        assert!(
+            lb.hash_ring.iter().all(|e| *e.value() == node),
+            "all vnodes must belong to the re-added node"
+        );
+    }
+
+    /// Finding #29: the hash-ring collision probe must be
+    /// NON-DESTRUCTIVE. Pre-fix `while insert(..).is_some()`
+    /// overwrote an occupied slot (clobbering another node's vnode)
+    /// before probing onward. We force a guaranteed collision by
+    /// pre-occupying every slot `add_to_hash_ring` would target for a
+    /// node and assert the existing occupants survive.
+    #[test]
+    fn cr29_hash_ring_collision_probe_preserves_existing_occupant() {
+        let lb = LoadBalancer::with_strategy(Strategy::ConsistentHash);
+        let victim = make_node_id(0xAA);
+        let newcomer = make_node_id(0xBB);
+
+        // Pre-occupy, with `victim`, every slot that add_to_hash_ring
+        // will hash to for `newcomer` (so EVERY vnode insert collides).
+        for i in 0..lb.virtual_nodes {
+            let key = format!("{:?}-{}", newcomer, i);
+            let hash = lb.hash_key(&key);
+            lb.hash_ring.insert(hash, victim);
+        }
+        let victim_slots_before = lb.hash_ring.len();
+        assert_eq!(victim_slots_before, lb.virtual_nodes as usize);
+
+        // Now add the newcomer — every primary slot collides with a
+        // victim vnode and must be linear-probed past, NOT clobbered.
+        // Fresh add (newcomer was never present) => was_present = false.
+        lb.add_to_hash_ring(newcomer, false);
+
+        // None of the victim's vnodes may have been overwritten.
+        let victim_count = lb.hash_ring.iter().filter(|e| *e.value() == victim).count();
+        assert_eq!(
+            victim_count, lb.virtual_nodes as usize,
+            "the collision probe must preserve the existing occupant's vnodes \
+             (pre-fix destructive insert clobbered them)"
+        );
+        // The newcomer still gets its full vnode allotment.
+        let newcomer_count = lb
+            .hash_ring
+            .iter()
+            .filter(|e| *e.value() == newcomer)
+            .count();
+        assert_eq!(
+            newcomer_count, lb.virtual_nodes as usize,
+            "the newcomer must still get its full vnode allotment via probing"
+        );
+    }
+
+    /// Finding #33: weighted-round-robin must not starve endpoints
+    /// when every effective weight is sub-unit. Two `Degraded`
+    /// endpoints (weight 1 × 0.5 multiplier = 0.5 effective) sum to
+    /// `total_weight == 1.0`; pre-fix `total_ceil = ceil(1.0) = 1`
+    /// made `target == 0` always and the cumulative loop always
+    /// picked the first endpoint, starving the second.
+    #[test]
+    fn cr33_weighted_rr_does_not_starve_sub_unit_weights() {
+        let lb = LoadBalancer::with_strategy(Strategy::WeightedRoundRobin);
+        lb.add_endpoint(Endpoint::new(make_node_id(1)).with_weight(1));
+        lb.add_endpoint(Endpoint::new(make_node_id(2)).with_weight(1));
+
+        // Degrade both so effective weight is 0.5 each (total 1.0).
+        lb.update_health(&make_node_id(1), HealthStatus::Degraded);
+        lb.update_health(&make_node_id(2), HealthStatus::Degraded);
+
+        let ctx = RequestContext::new();
+        let mut counts = std::collections::HashMap::new();
+        for _ in 0..200 {
+            let sel = lb.select(&ctx).expect("an endpoint must be selectable");
+            lb.record_completion(&sel.node_id, true);
+            *counts.entry(sel.node_id[0]).or_insert(0_u32) += 1;
+        }
+
+        let first = *counts.get(&1).unwrap_or(&0);
+        let second = *counts.get(&2).unwrap_or(&0);
+        assert!(
+            second > 0,
+            "second sub-unit-weight endpoint must NOT be starved (got {first} \
+             vs {second}) — pre-fix ceil collapsed the rotation to bucket 0",
+        );
+        // Equal effective weights → roughly even split.
+        assert!(
+            first > 0 && second > 0 && first.abs_diff(second) < 200 / 2,
+            "two equal sub-unit weights should split roughly evenly \
+             (got {first} vs {second})",
+        );
+    }
+
+    /// Review follow-up to #33: deriving the wheel from the weights
+    /// (`ceil(total / min_weight)`) keeps EXACT integer ratios for small
+    /// clusters — the wheel is the natural 3-cycle for a 2:1 split,
+    /// yielding A,A,B. The replaced `WRR_MIN_WHEEL = 64` floor turned
+    /// this into a 64-position approximation, reshaping the rotation for
+    /// any cluster whose total weight was below the floor.
+    #[test]
+    fn cr33_weighted_rr_preserves_exact_integer_ratios() {
+        let lb = LoadBalancer::with_strategy(Strategy::WeightedRoundRobin);
+        let endpoints = vec![
+            Arc::new(EndpointState::new(
+                Endpoint::new(make_node_id(1)).with_weight(2),
+            )),
+            Arc::new(EndpointState::new(
+                Endpoint::new(make_node_id(2)).with_weight(1),
+            )),
+        ];
+        // Two full turns of the natural 3-position wheel.
+        let picks: Vec<u8> = (0..6)
+            .map(|c| lb.select_weighted_round_robin_at(&endpoints, c).node_id[0])
+            .collect();
+        assert_eq!(
+            picks,
+            vec![1, 1, 2, 1, 1, 2],
+            "2:1 integer weights must cycle A,A,B exactly (got {picks:?})"
+        );
     }
 }

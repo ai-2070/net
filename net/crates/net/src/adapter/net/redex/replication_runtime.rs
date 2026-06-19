@@ -37,10 +37,12 @@
 //! `ReplicationDispatcher`) lands in a separate slice — this
 //! commit covers the runtime task itself + the trait.
 
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use lru::LruCache;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -453,9 +455,15 @@ pub const CATCHUP_BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// forged frame from any peer that happens to be the recorded
 /// leader). Entries auto-expire after [`REQUEST_TTL`] so the set
 /// can't grow without bound under leader silence.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct OutstandingRequests {
-    entries: std::collections::HashMap<(NodeId, u64), Instant>,
+    // LRU-bounded to REQUEST_REGISTRY_SOFT_CAP. `take` pops (never
+    // `get`s) so nothing reorders entries after insertion — LRU order
+    // is exactly insertion order, and the entry evicted on overflow is
+    // the OLDEST recorded request, in O(1). This replaces the prior
+    // `HashMap` whose `record` scanned every entry (retain + min_by_key)
+    // on each insert once at the cap.
+    entries: LruCache<(NodeId, u64), Instant>,
 }
 
 /// TTL on entries in [`OutstandingRequests`]. Bounded by the
@@ -469,22 +477,36 @@ pub const REQUEST_TTL: Duration = Duration::from_secs(30);
 pub const REQUEST_REGISTRY_SOFT_CAP: usize = 256;
 
 impl OutstandingRequests {
-    /// Construct an empty registry.
+    /// Construct an empty registry bounded to
+    /// [`REQUEST_REGISTRY_SOFT_CAP`].
     pub fn new() -> Self {
+        // The cap is a nonzero const; `unwrap_or(MIN)` keeps the
+        // construction lint-clean (no expect/unwrap) for the impossible
+        // zero case.
+        let cap = NonZeroUsize::new(REQUEST_REGISTRY_SOFT_CAP).unwrap_or(NonZeroUsize::MIN);
         Self {
-            entries: std::collections::HashMap::new(),
+            entries: LruCache::new(cap),
         }
     }
 
     /// Record a freshly-minted `request_id` against `leader`.
-    /// Best-effort GC of expired entries runs at insert time so
-    /// the set stays bounded without a separate sweeper task.
+    ///
+    /// #35: the map must stay bounded even under sustained young
+    /// in-flight load (many channels / a fast tick), where a replica
+    /// legitimately holds ≥ cap requests all younger than
+    /// [`REQUEST_TTL`]. The backing [`LruCache`] makes the bound a HARD
+    /// `<= REQUEST_REGISTRY_SOFT_CAP` in O(1): inserting a new key at
+    /// capacity evicts the least-recently-used (= oldest recorded, since
+    /// `take` only pops) entry. Token matching stays correct — the
+    /// evicted token is the one closest to its own TTL, so a response for
+    /// it was already the most likely to be rejected as stale; the caller
+    /// treats a missing token exactly like an expired one (drop the
+    /// response). TTL expiry itself is enforced lazily in [`Self::take`],
+    /// so no per-insert O(n) sweep is needed.
     pub fn record(&mut self, leader: NodeId, request_id: u64, now: Instant) {
-        if self.entries.len() >= REQUEST_REGISTRY_SOFT_CAP {
-            self.entries
-                .retain(|_, &mut inserted| now.saturating_duration_since(inserted) < REQUEST_TTL);
-        }
-        self.entries.insert((leader, request_id), now);
+        // `put` updates an existing key in place (no growth, no eviction)
+        // or inserts a new one, evicting the LRU entry when at capacity.
+        self.entries.put((leader, request_id), now);
     }
 
     /// Take the entry for `(leader, request_id)` if present and
@@ -492,7 +514,7 @@ impl OutstandingRequests {
     /// matched; the caller proceeds with the apply path. `false`
     /// means the response is stale / forged / past TTL — drop.
     pub fn take(&mut self, leader: NodeId, request_id: u64, now: Instant) -> bool {
-        match self.entries.remove(&(leader, request_id)) {
+        match self.entries.pop(&(leader, request_id)) {
             Some(inserted) => now.saturating_duration_since(inserted) < REQUEST_TTL,
             None => false,
         }
@@ -502,7 +524,22 @@ impl OutstandingRequests {
     /// the believed leader changes so a re-elected peer doesn't
     /// inherit the prior leader's in-flight token set.
     pub fn clear_leader(&mut self, leader: NodeId) {
-        self.entries.retain(|(l, _), _| *l != leader);
+        // LruCache has no `retain`; collect this leader's keys, then pop.
+        let to_drop: Vec<(NodeId, u64)> = self
+            .entries
+            .iter()
+            .filter_map(|(&key, _)| (key.0 == leader).then_some(key))
+            .collect();
+        for k in &to_drop {
+            self.entries.pop(k);
+        }
+    }
+
+    /// Current entry count. Test-only accessor for the #35
+    /// soft-cap-bound assertions; the field is otherwise private.
+    #[cfg(test)]
+    pub(crate) fn len_for_test(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -1823,6 +1860,76 @@ mod tests {
         async fn withdraw_chain(&self, _origin_hash: u64) -> Result<(), AdapterError> {
             Ok(())
         }
+    }
+
+    /// #35: under sustained young in-flight load the soft cap must
+    /// be an ACTUAL bound. Filling the registry with cap entries
+    /// all younger than the TTL and then recording one more must
+    /// NOT grow the map past the cap — the oldest entry is evicted
+    /// instead.
+    #[test]
+    fn bug35_outstanding_requests_cap_is_bounded_under_young_load() {
+        let mut reg = OutstandingRequests::new();
+        let leader: NodeId = 0x42;
+        let base = Instant::now();
+
+        // Insert exactly cap entries, each strictly younger than
+        // the TTL (timestamps `base + i ms`, all "now-ish"). The
+        // first inserted (request_id 0) is the oldest.
+        for i in 0..REQUEST_REGISTRY_SOFT_CAP as u64 {
+            let t = base + Duration::from_millis(i);
+            reg.record(leader, i, t);
+        }
+        assert_eq!(reg.len_for_test(), REQUEST_REGISTRY_SOFT_CAP);
+
+        // One more young request, still well within the TTL. The
+        // expiry sweep evicts nothing (all young), so the cap path
+        // must force-evict the oldest entry (request_id 0).
+        let newest_t = base + Duration::from_millis(REQUEST_REGISTRY_SOFT_CAP as u64);
+        reg.record(leader, REQUEST_REGISTRY_SOFT_CAP as u64, newest_t);
+
+        // Map stayed bounded.
+        assert_eq!(
+            reg.len_for_test(),
+            REQUEST_REGISTRY_SOFT_CAP,
+            "soft cap must bound the map even when nothing has expired"
+        );
+        // The oldest token (id 0) was evicted: a response for it is
+        // now rejected as if stale.
+        assert!(
+            !reg.take(leader, 0, newest_t),
+            "oldest token should have been force-evicted at the cap"
+        );
+        // The freshly recorded token is present and matchable.
+        assert!(
+            reg.take(leader, REQUEST_REGISTRY_SOFT_CAP as u64, newest_t),
+            "newest token must still be recorded"
+        );
+    }
+
+    /// #35 companion: re-recording an EXISTING key at the cap must
+    /// not evict a different entry (the insert is a replace, not a
+    /// growth).
+    #[test]
+    fn bug35_record_existing_key_at_cap_does_not_evict() {
+        let mut reg = OutstandingRequests::new();
+        let leader: NodeId = 0x42;
+        let base = Instant::now();
+        for i in 0..REQUEST_REGISTRY_SOFT_CAP as u64 {
+            reg.record(leader, i, base + Duration::from_millis(i));
+        }
+        // Re-record an already-present key. Size unchanged; the
+        // oldest (id 0) must survive because no new slot is needed.
+        reg.record(
+            leader,
+            REQUEST_REGISTRY_SOFT_CAP as u64 - 1,
+            base + Duration::from_millis(REQUEST_REGISTRY_SOFT_CAP as u64),
+        );
+        assert_eq!(reg.len_for_test(), REQUEST_REGISTRY_SOFT_CAP);
+        assert!(
+            reg.take(leader, 0, base + Duration::from_millis(1)),
+            "re-recording an existing key must not evict a distinct entry"
+        );
     }
 
     /// Recorder dispatcher — captures every outbound wire

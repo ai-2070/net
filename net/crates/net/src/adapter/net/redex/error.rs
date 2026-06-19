@@ -37,6 +37,26 @@ pub enum RedexError {
         hi: u64,
     },
 
+    /// A seq-guarded append (`append_batch_if_next_seq`) found the
+    /// file's `next_seq` no longer equal to the caller-supplied
+    /// `expected_first_seq` at the moment the append would run.
+    ///
+    /// #5: replication catch-up validates `first_seq == local_next`
+    /// and then appends; a concurrent writer that advanced
+    /// `next_seq` between the two would misalign the leader↔replica
+    /// seqs. The guarded append rejects with this error instead of
+    /// silently landing the batch at the wrong seqs. Recoverable —
+    /// the caller (replica runtime) re-issues a `SYNC_REQUEST` from
+    /// the new tail.
+    #[error("seq guard failed: expected next_seq {expected}, found {actual}")]
+    SeqMismatch {
+        /// The `next_seq` the caller required (the chunk's
+        /// `first_seq`).
+        expected: u64,
+        /// The `next_seq` actually observed under the append lock.
+        actual: u64,
+    },
+
     /// A channel name was rejected (e.g. invalid format, collision on open).
     #[error("channel error: {0}")]
     Channel(String),
@@ -96,8 +116,8 @@ impl RedexError {
     /// errors and storage-side encode failures, which legitimately
     /// halt under `Stop`. `Io` / `Closed` / `Lagged` are
     /// stream-level. `PayloadTooLarge` / `SegmentOffsetOverflow` /
-    /// `SeqOutOfRange` / `Channel` / `Unauthorized` are
-    /// configuration / authorization issues.
+    /// `SeqOutOfRange` / `SeqMismatch` / `Channel` / `Unauthorized`
+    /// are configuration / concurrency / authorization issues.
     pub fn is_recoverable_decode(&self) -> bool {
         matches!(self, Self::Decode(_))
     }

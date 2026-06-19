@@ -35,6 +35,7 @@
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
@@ -167,6 +168,58 @@ fn runtime() -> &'static Arc<Runtime> {
     })
 }
 
+/// `block_on(...)` wrapper that aborts on runtime-in-runtime rather
+/// than panicking across the C ABI boundary.
+///
+/// Mirrors `net::ffi::mesh::block_on` / `net::ffi::cortex::block_on`:
+/// calling `Runtime::block_on` from a thread already inside a tokio
+/// runtime panics with "Cannot start a runtime from within a
+/// runtime". These functions are `extern "C"`, so that unwind would
+/// cross the cgo boundary into Go — undefined behavior. The check
+/// costs one TLS lookup (`Handle::try_current`) per call; a
+/// contract-violating embedded-Rust caller gets a clean abort with a
+/// diagnosable message instead of UB.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        eprintln!(
+            "FATAL: compute FFI called from inside a tokio runtime context; \
+             aborting to avoid runtime-in-runtime panic across the FFI boundary"
+        );
+        std::process::abort();
+    }
+    runtime().block_on(future)
+}
+
+// =========================================================================
+// FFI guard — wraps every entry point in `catch_unwind`
+// =========================================================================
+
+/// Wrap an `extern "C"` body in `catch_unwind` so a panic can never
+/// unwind across the C ABI boundary (which is undefined behavior).
+/// On panic the diagnostic is logged via `eprintln!` (this crate has
+/// no thread-local last-error channel like `meshos-ffi`/`deck-ffi`)
+/// and `$default` is returned. Mirrors the `ffi_guard!` macro in the
+/// sibling `meshos-ffi` / `deck-ffi` crates.
+macro_rules! ffi_guard {
+    ($default:expr, $body:block) => {{
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| $body));
+        match result {
+            Ok(v) => v,
+            Err(payload) => {
+                let detail = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "panic across FFI boundary".to_string()
+                };
+                eprintln!("net-compute-ffi: caught panic across FFI boundary: {detail}");
+                $default
+            }
+        }
+    }};
+}
+
 // =========================================================================
 // Handle types
 // =========================================================================
@@ -205,12 +258,14 @@ static NEXT_RUNTIME_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// (e.g., structured error detail). Idempotent on NULL.
 #[no_mangle]
 pub extern "C" fn net_compute_free_cstring(s: *mut c_char) {
-    if s.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = CString::from_raw(s);
-    }
+    ffi_guard!((), {
+        if s.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = CString::from_raw(s);
+        }
+    })
 }
 
 // =========================================================================
@@ -239,26 +294,28 @@ pub extern "C" fn net_compute_runtime_new(
     node_arc: *mut Arc<MeshNode>,
     channel_configs_arc: *mut Arc<ChannelConfigRegistry>,
 ) -> *mut DaemonRuntimeHandle {
-    if node_arc.is_null() || channel_configs_arc.is_null() {
-        return std::ptr::null_mut();
-    }
-    // Take ownership of the boxed Arcs — the caller's LDFLAGS
-    // expectation (paired `_free`) is handled by the fact that we
-    // document consumption in the docstring. Go callers release
-    // these pointers from their finalizer list after the call
-    // succeeds.
-    let node = unsafe { *Box::from_raw(node_arc) };
-    let cc = unsafe { *Box::from_raw(channel_configs_arc) };
+    ffi_guard!(std::ptr::null_mut(), {
+        if node_arc.is_null() || channel_configs_arc.is_null() {
+            return std::ptr::null_mut();
+        }
+        // Take ownership of the boxed Arcs — the caller's LDFLAGS
+        // expectation (paired `_free`) is handled by the fact that we
+        // document consumption in the docstring. Go callers release
+        // these pointers from their finalizer list after the call
+        // succeeds.
+        let node = unsafe { *Box::from_raw(node_arc) };
+        let cc = unsafe { *Box::from_raw(channel_configs_arc) };
 
-    let sdk_mesh = SdkMesh::from_node_arc(node, cc, None);
-    let sdk_rt = SdkDaemonRuntime::new(Arc::new(sdk_mesh));
+        let sdk_mesh = SdkMesh::from_node_arc(node, cc, None);
+        let sdk_rt = SdkDaemonRuntime::new(Arc::new(sdk_mesh));
 
-    let runtime_id = NEXT_RUNTIME_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Box::into_raw(Box::new(DaemonRuntimeHandle {
-        inner: Arc::new(sdk_rt),
-        factories: Arc::new(DashMap::new()),
-        runtime_id,
-    }))
+        let runtime_id = NEXT_RUNTIME_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Box::into_raw(Box::new(DaemonRuntimeHandle {
+            inner: Arc::new(sdk_rt),
+            factories: Arc::new(DashMap::new()),
+            runtime_id,
+        }))
+    })
 }
 
 /// Return the monotonic runtime identifier assigned at
@@ -270,10 +327,12 @@ pub extern "C" fn net_compute_runtime_new(
 /// Returns `0` on NULL input.
 #[no_mangle]
 pub extern "C" fn net_compute_runtime_id(handle: *const DaemonRuntimeHandle) -> u64 {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return 0;
-    };
-    h.runtime_id
+    ffi_guard!(0, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return 0;
+        };
+        h.runtime_id
+    })
 }
 
 /// Free a runtime handle. The underlying `MeshNode` stays alive
@@ -281,12 +340,14 @@ pub extern "C" fn net_compute_runtime_id(handle: *const DaemonRuntimeHandle) -> 
 /// its own `MeshNodeHandle`). Idempotent on NULL.
 #[no_mangle]
 pub extern "C" fn net_compute_runtime_free(handle: *mut DaemonRuntimeHandle) {
-    if handle.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = Box::from_raw(handle);
-    }
+    ffi_guard!((), {
+        if handle.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = Box::from_raw(handle);
+        }
+    })
 }
 
 /// Transition the runtime to `Ready`. Installs the migration
@@ -302,19 +363,20 @@ pub extern "C" fn net_compute_runtime_start(
     handle: *mut DaemonRuntimeHandle,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let inner = h.inner.clone();
-    let rt = runtime();
-    let res = rt.block_on(async move { inner.start().await });
-    match res {
-        Ok(()) => NET_COMPUTE_OK,
-        Err(e) => {
-            write_err(err_out, &e.to_string());
-            NET_COMPUTE_ERR_CALL_FAILED
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let inner = h.inner.clone();
+        let res = block_on(async move { inner.start().await });
+        match res {
+            Ok(()) => NET_COMPUTE_OK,
+            Err(e) => {
+                write_err(err_out, &e.to_string());
+                NET_COMPUTE_ERR_CALL_FAILED
+            }
         }
-    }
+    })
 }
 
 /// Tear down the runtime. Drains daemons + factory registrations +
@@ -325,23 +387,24 @@ pub extern "C" fn net_compute_runtime_shutdown(
     handle: *mut DaemonRuntimeHandle,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let inner = h.inner.clone();
-    let factories = h.factories.clone();
-    let rt = runtime();
-    let res = rt.block_on(async move { inner.shutdown().await });
-    match res {
-        Ok(()) => {
-            factories.clear();
-            NET_COMPUTE_OK
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let inner = h.inner.clone();
+        let factories = h.factories.clone();
+        let res = block_on(async move { inner.shutdown().await });
+        match res {
+            Ok(()) => {
+                factories.clear();
+                NET_COMPUTE_OK
+            }
+            Err(e) => {
+                write_err(err_out, &e.to_string());
+                NET_COMPUTE_ERR_CALL_FAILED
+            }
         }
-        Err(e) => {
-            write_err(err_out, &e.to_string());
-            NET_COMPUTE_ERR_CALL_FAILED
-        }
-    }
+    })
 }
 
 /// Return `1` if the runtime has transitioned to `Ready` and not
@@ -349,25 +412,30 @@ pub extern "C" fn net_compute_runtime_shutdown(
 /// on a NULL handle.
 #[no_mangle]
 pub extern "C" fn net_compute_runtime_is_ready(handle: *mut DaemonRuntimeHandle) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    if h.inner.is_ready() {
-        1
-    } else {
-        0
-    }
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        if h.inner.is_ready() {
+            1
+        } else {
+            0
+        }
+    })
 }
 
 /// Return the number of daemons currently registered on this
 /// runtime. Returns `-1` on NULL handle (cast of
-/// [`NET_COMPUTE_ERR_NULL`]).
+/// [`NET_COMPUTE_ERR_NULL`]) or on a caught panic — `0` is a valid
+/// count and must not double as the error sentinel.
 #[no_mangle]
 pub extern "C" fn net_compute_runtime_daemon_count(handle: *mut DaemonRuntimeHandle) -> i64 {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL as i64;
-    };
-    h.inner.daemon_count() as i64
+    ffi_guard!(NET_COMPUTE_ERR_NULL as i64, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL as i64;
+        };
+        h.inner.daemon_count() as i64
+    })
 }
 
 /// Register a factory kind on the runtime. Enables `spawn` and
@@ -400,33 +468,34 @@ pub extern "C" fn net_compute_register_factory(
     kind_ptr: *const c_char,
     kind_len: usize,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    if kind_ptr.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    let kind = match cstr_to_string(kind_ptr, kind_len) {
-        Some(s) => s,
-        None => return NET_COMPUTE_ERR_NULL,
-    };
-    use dashmap::mapref::entry::Entry;
-    match h.factories.entry(kind.clone()) {
-        Entry::Occupied(_) => return NET_COMPUTE_ERR_DUPLICATE_KIND,
-        Entry::Vacant(slot) => {
-            slot.insert(());
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        if kind_ptr.is_null() {
+            return NET_COMPUTE_ERR_NULL;
         }
-    }
+        let kind = match cstr_to_string(kind_ptr, kind_len) {
+            Some(s) => s,
+            None => return NET_COMPUTE_ERR_NULL,
+        };
+        use dashmap::mapref::entry::Entry;
+        match h.factories.entry(kind.clone()) {
+            Entry::Occupied(_) => return NET_COMPUTE_ERR_DUPLICATE_KIND,
+            Entry::Vacant(slot) => {
+                slot.insert(());
+            }
+        }
 
-    // Mirror into the SDK factory registry with a loud-failure
-    // fallback bridge. Without this, `expect_migration` /
-    // `register_migration_target_identity` reject with
-    // `FactoryNotFound`. The bridge fails on first `restore` /
-    // `process` with a typed error so a migration that lands on
-    // a kind registered via `RegisterFactory` (without Func) is
-    // visibly rejected rather than silently accepting events.
-    let kind_for_bridge = kind.clone();
-    if let Err(e) = h.inner.register_factory(&kind, move || {
+        // Mirror into the SDK factory registry with a loud-failure
+        // fallback bridge. Without this, `expect_migration` /
+        // `register_migration_target_identity` reject with
+        // `FactoryNotFound`. The bridge fails on first `restore` /
+        // `process` with a typed error so a migration that lands on
+        // a kind registered via `RegisterFactory` (without Func) is
+        // visibly rejected rather than silently accepting events.
+        let kind_for_bridge = kind.clone();
+        if let Err(e) = h.inner.register_factory(&kind, move || {
         Box::new(ReconstructionErrorBridge::new(
             kind_for_bridge.clone(),
             "kind registered via RegisterFactory (without Func); use RegisterFactoryFunc to enable migration-target reconstruction",
@@ -448,7 +517,8 @@ pub extern "C" fn net_compute_register_factory(
             _ => NET_COMPUTE_ERR_CALL_FAILED,
         };
     }
-    NET_COMPUTE_OK
+        NET_COMPUTE_OK
+    })
 }
 
 /// Register a factory kind with a real Go-side factory function
@@ -471,76 +541,81 @@ pub extern "C" fn net_compute_register_factory_with_func(
     kind_ptr: *const c_char,
     kind_len: usize,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    if kind_ptr.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    let kind = match cstr_to_string(kind_ptr, kind_len) {
-        Some(s) => s,
-        None => return NET_COMPUTE_ERR_NULL,
-    };
-    use dashmap::mapref::entry::Entry;
-    match h.factories.entry(kind.clone()) {
-        Entry::Occupied(_) => return NET_COMPUTE_ERR_DUPLICATE_KIND,
-        Entry::Vacant(slot) => {
-            slot.insert(());
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        if kind_ptr.is_null() {
+            return NET_COMPUTE_ERR_NULL;
         }
-    }
-
-    // SDK closure reaches back into Go via the factory trampoline
-    // to build a fresh daemon per invocation. Captures the runtime
-    // id so Go can scope its factory map to this runtime and avoid
-    // the process-global overwrite bug (two runtimes registering
-    // the same kind would otherwise collide).
-    let kind_for_closure = kind.clone();
-    let runtime_id = h.runtime_id;
-    let closure = move || -> Box<dyn MeshDaemon> {
-        let Some(d) = DISPATCHER.get() else {
-            // Failing loudly beats silent-noop: a reconstructed
-            // daemon that processes zero events is harder to spot
-            // than a typed error. See `ReconstructionErrorBridge`.
-            let reason = "Go dispatcher not registered (net_compute_set_dispatcher never called)";
-            eprintln!("net-compute-ffi: kind '{kind_for_closure}': {reason}");
-            return Box::new(ReconstructionErrorBridge::new(
-                kind_for_closure.clone(),
-                reason,
-            ));
+        let kind = match cstr_to_string(kind_ptr, kind_len) {
+            Some(s) => s,
+            None => return NET_COMPUTE_ERR_NULL,
         };
-        let mut daemon_id: u64 = 0;
-        let code = unsafe {
-            (d.factory)(
-                runtime_id,
-                kind_for_closure.as_ptr() as *const c_char,
-                kind_for_closure.len(),
-                &mut daemon_id,
-            )
-        };
-        if code != NET_COMPUTE_OK {
-            let reason = format!("Go factory returned error code {code}");
-            eprintln!("net-compute-ffi: kind '{kind_for_closure}': {reason}");
-            return Box::new(ReconstructionErrorBridge::new(
-                kind_for_closure.clone(),
-                reason,
-            ));
+        use dashmap::mapref::entry::Entry;
+        match h.factories.entry(kind.clone()) {
+            Entry::Occupied(_) => return NET_COMPUTE_ERR_DUPLICATE_KIND,
+            Entry::Vacant(slot) => {
+                slot.insert(());
+            }
         }
-        Box::new(GoBridge::build(kind_for_closure.clone(), daemon_id))
-    };
 
-    if let Err(e) = h.inner.register_factory(&kind, closure) {
-        h.factories.remove(&kind);
-        // Same discrimination as `net_compute_register_factory`
-        // above — `ShuttingDown` / `NotReady` must not masquerade
-        // as duplicate-kind so the Go layer can surface
-        // `ErrRuntimeShutDown` to the caller.
-        return match e {
-            SdkDaemonError::FactoryAlreadyRegistered(_) => NET_COMPUTE_ERR_DUPLICATE_KIND,
-            SdkDaemonError::ShuttingDown | SdkDaemonError::NotReady => NET_COMPUTE_ERR_CALL_FAILED,
-            _ => NET_COMPUTE_ERR_CALL_FAILED,
+        // SDK closure reaches back into Go via the factory trampoline
+        // to build a fresh daemon per invocation. Captures the runtime
+        // id so Go can scope its factory map to this runtime and avoid
+        // the process-global overwrite bug (two runtimes registering
+        // the same kind would otherwise collide).
+        let kind_for_closure = kind.clone();
+        let runtime_id = h.runtime_id;
+        let closure = move || -> Box<dyn MeshDaemon> {
+            let Some(d) = DISPATCHER.get() else {
+                // Failing loudly beats silent-noop: a reconstructed
+                // daemon that processes zero events is harder to spot
+                // than a typed error. See `ReconstructionErrorBridge`.
+                let reason =
+                    "Go dispatcher not registered (net_compute_set_dispatcher never called)";
+                eprintln!("net-compute-ffi: kind '{kind_for_closure}': {reason}");
+                return Box::new(ReconstructionErrorBridge::new(
+                    kind_for_closure.clone(),
+                    reason,
+                ));
+            };
+            let mut daemon_id: u64 = 0;
+            let code = unsafe {
+                (d.factory)(
+                    runtime_id,
+                    kind_for_closure.as_ptr() as *const c_char,
+                    kind_for_closure.len(),
+                    &mut daemon_id,
+                )
+            };
+            if code != NET_COMPUTE_OK {
+                let reason = format!("Go factory returned error code {code}");
+                eprintln!("net-compute-ffi: kind '{kind_for_closure}': {reason}");
+                return Box::new(ReconstructionErrorBridge::new(
+                    kind_for_closure.clone(),
+                    reason,
+                ));
+            }
+            Box::new(GoBridge::build(kind_for_closure.clone(), daemon_id))
         };
-    }
-    NET_COMPUTE_OK
+
+        if let Err(e) = h.inner.register_factory(&kind, closure) {
+            h.factories.remove(&kind);
+            // Same discrimination as `net_compute_register_factory`
+            // above — `ShuttingDown` / `NotReady` must not masquerade
+            // as duplicate-kind so the Go layer can surface
+            // `ErrRuntimeShutDown` to the caller.
+            return match e {
+                SdkDaemonError::FactoryAlreadyRegistered(_) => NET_COMPUTE_ERR_DUPLICATE_KIND,
+                SdkDaemonError::ShuttingDown | SdkDaemonError::NotReady => {
+                    NET_COMPUTE_ERR_CALL_FAILED
+                }
+                _ => NET_COMPUTE_ERR_CALL_FAILED,
+            };
+        }
+        NET_COMPUTE_OK
+    })
 }
 
 // =========================================================================
@@ -632,29 +707,31 @@ pub extern "C" fn net_compute_set_dispatcher(
     free: Option<FreeFn>,
     factory: Option<FactoryFn>,
 ) -> c_int {
-    let Some(process) = process else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let Some(snapshot) = snapshot else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let Some(restore) = restore else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let Some(free) = free else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let Some(factory) = factory else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let _ = DISPATCHER.set(DispatcherFns {
-        process,
-        snapshot,
-        restore,
-        free,
-        factory,
-    });
-    NET_COMPUTE_OK
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(process) = process else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let Some(snapshot) = snapshot else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let Some(restore) = restore else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let Some(free) = free else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let Some(factory) = factory else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let _ = DISPATCHER.set(DispatcherFns {
+            process,
+            snapshot,
+            restore,
+            free,
+            factory,
+        });
+        NET_COMPUTE_OK
+    })
 }
 
 // =========================================================================
@@ -731,11 +808,13 @@ static DAEMON_CAPS_DISPATCHER: OnceLock<DaemonCapsFn> = OnceLock::new();
 /// Passing NULL returns `NET_COMPUTE_ERR_NULL`.
 #[no_mangle]
 pub extern "C" fn net_compute_set_daemon_caps_dispatcher(f: Option<DaemonCapsFn>) -> c_int {
-    let Some(f) = f else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let _ = DAEMON_CAPS_DISPATCHER.set(f);
-    NET_COMPUTE_OK
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(f) = f else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let _ = DAEMON_CAPS_DISPATCHER.set(f);
+        NET_COMPUTE_OK
+    })
 }
 
 /// Internal helper: fetch the per-daemon cap sets via the
@@ -809,6 +888,14 @@ fn fetch_daemon_caps(
             unsafe { libc::free(ptr as *mut std::ffi::c_void) };
             return CapabilitySet::default();
         }
+        // `slice::from_raw_parts` requires `len <= isize::MAX`; a
+        // dispatcher returning a bogus oversized length would be UB.
+        // Free the buffer (caller still owes us the free) and fall
+        // back to empty, mirroring the core ffi guard discipline.
+        if len > isize::MAX as usize {
+            unsafe { libc::free(ptr as *mut std::ffi::c_void) };
+            return CapabilitySet::default();
+        }
         // SAFETY: the consumer's contract says `ptr` points at
         // `len` bytes of UTF-8 JSON it allocated via
         // `C.malloc` / `libc::malloc`. We free via `libc::free`
@@ -868,20 +955,28 @@ pub extern "C" fn net_compute_outputs_push(
     data: *const u8,
     len: usize,
 ) -> c_int {
-    if vec.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    if len > 0 && data.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    let v = unsafe { &mut *vec };
-    let slice = if len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(data, len) }
-    };
-    v.inner.push(Bytes::copy_from_slice(slice));
-    NET_COMPUTE_OK
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        if vec.is_null() {
+            return NET_COMPUTE_ERR_NULL;
+        }
+        if len > 0 && data.is_null() {
+            return NET_COMPUTE_ERR_NULL;
+        }
+        // `slice::from_raw_parts` requires `len <= isize::MAX`; a C caller
+        // passing `(size_t)-1` is immediate UB. Reject defensively, as the
+        // core `ffi/mod.rs` does at every such site.
+        if len > isize::MAX as usize {
+            return NET_COMPUTE_ERR_NULL;
+        }
+        let v = unsafe { &mut *vec };
+        let slice = if len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(data, len) }
+        };
+        v.inner.push(Bytes::copy_from_slice(slice));
+        NET_COMPUTE_OK
+    })
 }
 
 /// Free a `(ptr, len)` snapshot payload heap-allocated by Go
@@ -895,22 +990,24 @@ pub extern "C" fn net_compute_outputs_push(
 /// the pointer; we free via `libc::free`. NULL is a no-op.
 #[no_mangle]
 pub extern "C" fn net_compute_snapshot_bytes_free(ptr: *mut u8, _len: usize) {
-    // N-8: pre-fix the combined `ptr.is_null() || len == 0` early-
-    // return leaked any allocation a Go trampoline allocated via
-    // `C.malloc(0)` (which on glibc returns a valid free-able
-    // pointer with a zero requested size). CR-11 split the same
-    // guard on the inbound paths (`GoBridge::snapshot` and
-    // `parse_side`); this outbound free helper — declared in
-    // `net.go.h` and callable directly by Go — kept the old
-    // shape. `libc::free` reads its metadata from the malloc
-    // header so the `len` parameter is informational only.
-    if ptr.is_null() {
-        return;
-    }
-    // The Go side allocated via `C.malloc`; `libc::free` matches.
-    unsafe {
-        libc::free(ptr as *mut std::ffi::c_void);
-    }
+    ffi_guard!((), {
+        // N-8: pre-fix the combined `ptr.is_null() || len == 0` early-
+        // return leaked any allocation a Go trampoline allocated via
+        // `C.malloc(0)` (which on glibc returns a valid free-able
+        // pointer with a zero requested size). CR-11 split the same
+        // guard on the inbound paths (`GoBridge::snapshot` and
+        // `parse_side`); this outbound free helper — declared in
+        // `net.go.h` and callable directly by Go — kept the old
+        // shape. `libc::free` reads its metadata from the malloc
+        // header so the `len` parameter is informational only.
+        if ptr.is_null() {
+            return;
+        }
+        // The Go side allocated via `C.malloc`; `libc::free` matches.
+        unsafe {
+            libc::free(ptr as *mut std::ffi::c_void);
+        }
+    })
 }
 
 // =========================================================================
@@ -1029,6 +1126,13 @@ impl MeshDaemon for GoBridge {
             unsafe { libc::free(ptr as *mut std::ffi::c_void) };
             return None;
         }
+        // `slice::from_raw_parts` requires `len <= isize::MAX`; a Go
+        // snapshot trampoline returning a bogus oversized length would
+        // be UB. Free and treat as None, mirroring the core ffi guard.
+        if len > isize::MAX as usize {
+            unsafe { libc::free(ptr as *mut std::ffi::c_void) };
+            return None;
+        }
         // Copy the Go-allocated buffer into a Rust `Bytes` and
         // free the original so Go's malloc pool stays tidy.
         let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
@@ -1072,10 +1176,12 @@ pub struct DaemonHandleC {
 /// has a non-zero origin_hash).
 #[no_mangle]
 pub extern "C" fn net_compute_daemon_handle_origin_hash(h: *const DaemonHandleC) -> u64 {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return 0;
-    };
-    h.origin_hash
+    ffi_guard!(0, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return 0;
+        };
+        h.origin_hash
+    })
 }
 
 /// Copy the 32-byte `entity_id` into `out[0..32]`. Returns
@@ -1085,28 +1191,32 @@ pub extern "C" fn net_compute_daemon_handle_entity_id(
     h: *const DaemonHandleC,
     out: *mut u8,
 ) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    if out.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(h.entity_id.as_ptr(), out, 32);
-    }
-    NET_COMPUTE_OK
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        if out.is_null() {
+            return NET_COMPUTE_ERR_NULL;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(h.entity_id.as_ptr(), out, 32);
+        }
+        NET_COMPUTE_OK
+    })
 }
 
 /// Free the handle. The daemon itself keeps running — call
 /// [`net_compute_runtime_stop`] first to tear it down.
 #[no_mangle]
 pub extern "C" fn net_compute_daemon_handle_free(h: *mut DaemonHandleC) {
-    if h.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = Box::from_raw(h);
-    }
+    ffi_guard!((), {
+        if h.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = Box::from_raw(h);
+        }
+    })
 }
 
 // =========================================================================
@@ -1145,76 +1255,77 @@ pub extern "C" fn net_compute_spawn(
     out_handle: *mut *mut DaemonHandleC,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    if kind_ptr.is_null() || identity_seed.is_null() || out_handle.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    // Copy the 32-byte seed — the SDK `Identity::from_seed` takes
-    // `[u8; 32]` by value and we don't want to hold onto Go's
-    // backing memory past the call.
-    let mut seed = [0u8; 32];
-    unsafe {
-        std::ptr::copy_nonoverlapping(identity_seed, seed.as_mut_ptr(), 32);
-    }
-    let sdk_identity = SdkIdentity::from_seed(seed);
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        if kind_ptr.is_null() || identity_seed.is_null() || out_handle.is_null() {
+            return NET_COMPUTE_ERR_NULL;
+        }
+        let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        // Copy the 32-byte seed — the SDK `Identity::from_seed` takes
+        // `[u8; 32]` by value and we don't want to hold onto Go's
+        // backing memory past the call.
+        let mut seed = [0u8; 32];
+        unsafe {
+            std::ptr::copy_nonoverlapping(identity_seed, seed.as_mut_ptr(), 32);
+        }
+        let sdk_identity = SdkIdentity::from_seed(seed);
 
-    let mut cfg = DaemonHostConfig {
-        auto_snapshot_interval,
-        ..DaemonHostConfig::default()
-    };
-    if max_log_entries > 0 {
-        cfg.max_log_entries = max_log_entries;
-    }
+        let mut cfg = DaemonHostConfig {
+            auto_snapshot_interval,
+            ..DaemonHostConfig::default()
+        };
+        if max_log_entries > 0 {
+            cfg.max_log_entries = max_log_entries;
+        }
 
-    let bridge = Box::new(GoBridge::build(kind.clone(), daemon_id));
-    // kind_factory for migration-target reconstruction. Uses a
-    // loud-failure bridge: if a migration lands here before the
-    // caller has also installed `RegisterFactoryFunc` for this
-    // kind, the migration fails visibly on first `restore` /
-    // `process` rather than silently accepting events into a
-    // noop.
-    let kind_for_fallback = kind.clone();
-    let kind_factory = move || -> Box<dyn MeshDaemon> {
-        Box::new(ReconstructionErrorBridge::new(
+        let bridge = Box::new(GoBridge::build(kind.clone(), daemon_id));
+        // kind_factory for migration-target reconstruction. Uses a
+        // loud-failure bridge: if a migration lands here before the
+        // caller has also installed `RegisterFactoryFunc` for this
+        // kind, the migration fails visibly on first `restore` /
+        // `process` rather than silently accepting events into a
+        // noop.
+        let kind_for_fallback = kind.clone();
+        let kind_factory = move || -> Box<dyn MeshDaemon> {
+            Box::new(ReconstructionErrorBridge::new(
             kind_for_fallback.clone(),
             "spawn-side kind registration does not route to a Go factory; call DaemonRuntime.RegisterFactoryFunc before the migration lands",
         ))
-    };
+        };
 
-    let inner = h.inner.clone();
-    let rt = runtime();
-    let result = rt.block_on(async move {
-        inner
-            .spawn_with_daemon(sdk_identity, cfg, bridge, kind_factory)
-            .await
-    });
-    match result {
-        Ok(sdk_handle) => {
-            let origin_hash = sdk_handle.origin_hash;
-            let entity_id = *sdk_handle.entity_id.as_bytes();
-            let boxed = Box::new(DaemonHandleC {
-                origin_hash,
-                entity_id,
-                inner: sdk_handle,
-            });
-            unsafe {
-                *out_handle = Box::into_raw(boxed);
+        let inner = h.inner.clone();
+        let result = block_on(async move {
+            inner
+                .spawn_with_daemon(sdk_identity, cfg, bridge, kind_factory)
+                .await
+        });
+        match result {
+            Ok(sdk_handle) => {
+                let origin_hash = sdk_handle.origin_hash;
+                let entity_id = *sdk_handle.entity_id.as_bytes();
+                let boxed = Box::new(DaemonHandleC {
+                    origin_hash,
+                    entity_id,
+                    inner: sdk_handle,
+                });
+                unsafe {
+                    *out_handle = Box::into_raw(boxed);
+                }
+                NET_COMPUTE_OK
             }
-            NET_COMPUTE_OK
-        }
-        Err(e) => {
-            unsafe {
-                *out_handle = std::ptr::null_mut();
+            Err(e) => {
+                unsafe {
+                    *out_handle = std::ptr::null_mut();
+                }
+                write_err(err_out, &e.to_string());
+                NET_COMPUTE_ERR_CALL_FAILED
             }
-            write_err(err_out, &e.to_string());
-            NET_COMPUTE_ERR_CALL_FAILED
         }
-    }
+    })
 }
 
 /// Stop a daemon by `origin_hash`. Idempotent during shutdown.
@@ -1226,18 +1337,19 @@ pub extern "C" fn net_compute_runtime_stop(
     origin_hash: u64,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let inner = h.inner.clone();
-    let rt = runtime();
-    match rt.block_on(async move { inner.stop(origin_hash).await }) {
-        Ok(()) => NET_COMPUTE_OK,
-        Err(e) => {
-            write_err(err_out, &e.to_string());
-            NET_COMPUTE_ERR_CALL_FAILED
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let inner = h.inner.clone();
+        match block_on(async move { inner.stop(origin_hash).await }) {
+            Ok(()) => NET_COMPUTE_OK,
+            Err(e) => {
+                write_err(err_out, &e.to_string());
+                NET_COMPUTE_ERR_CALL_FAILED
+            }
         }
-    }
+    })
 }
 
 /// Take a snapshot of the daemon identified by `origin_hash`.
@@ -1257,36 +1369,37 @@ pub extern "C" fn net_compute_runtime_snapshot(
     out_outputs: *mut *mut OutputsVec,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    if out_outputs.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    let inner = h.inner.clone();
-    let rt = runtime();
-    let result = rt.block_on(async move { inner.snapshot(origin_hash).await });
-    match result {
-        Ok(opt) => {
-            let vec = match opt {
-                Some(snap) => OutputsVec {
-                    inner: vec![Bytes::from(snap.to_bytes())],
-                },
-                None => OutputsVec { inner: Vec::new() },
-            };
-            unsafe {
-                *out_outputs = Box::into_raw(Box::new(vec));
-            }
-            NET_COMPUTE_OK
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        if out_outputs.is_null() {
+            return NET_COMPUTE_ERR_NULL;
         }
-        Err(e) => {
-            unsafe {
-                *out_outputs = std::ptr::null_mut();
+        let inner = h.inner.clone();
+        let result = block_on(async move { inner.snapshot(origin_hash).await });
+        match result {
+            Ok(opt) => {
+                let vec = match opt {
+                    Some(snap) => OutputsVec {
+                        inner: vec![Bytes::from(snap.to_bytes())],
+                    },
+                    None => OutputsVec { inner: Vec::new() },
+                };
+                unsafe {
+                    *out_outputs = Box::into_raw(Box::new(vec));
+                }
+                NET_COMPUTE_OK
             }
-            write_err(err_out, &e.to_string());
-            NET_COMPUTE_ERR_CALL_FAILED
+            Err(e) => {
+                unsafe {
+                    *out_outputs = std::ptr::null_mut();
+                }
+                write_err(err_out, &e.to_string());
+                NET_COMPUTE_ERR_CALL_FAILED
+            }
         }
-    }
+    })
 }
 
 /// Spawn a daemon from a previously-taken snapshot. Parallels
@@ -1316,92 +1429,97 @@ pub extern "C" fn net_compute_spawn_from_snapshot(
     out_handle: *mut *mut DaemonHandleC,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    if kind_ptr.is_null() || identity_seed.is_null() || out_handle.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    if snapshot_len > 0 && snapshot_ptr.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        if kind_ptr.is_null() || identity_seed.is_null() || out_handle.is_null() {
+            return NET_COMPUTE_ERR_NULL;
+        }
+        if snapshot_len > 0 && snapshot_ptr.is_null() {
+            return NET_COMPUTE_ERR_NULL;
+        }
+        // `slice::from_raw_parts` requires `len <= isize::MAX` (core ffi guard).
+        if snapshot_len > isize::MAX as usize {
+            return NET_COMPUTE_ERR_NULL;
+        }
+        let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
 
-    // Decode the snapshot up front so a corrupted buffer surfaces
-    // with a clean message before we build a bridge / register a
-    // daemon_id.
-    let snap_bytes = if snapshot_len == 0 {
-        &[] as &[u8]
-    } else {
-        unsafe { std::slice::from_raw_parts(snapshot_ptr, snapshot_len) }
-    };
-    let Some(snapshot_decoded) = StateSnapshot::from_bytes(snap_bytes) else {
-        write_err(err_out, "snapshot decode failed");
-        return NET_COMPUTE_ERR_CALL_FAILED;
-    };
+        // Decode the snapshot up front so a corrupted buffer surfaces
+        // with a clean message before we build a bridge / register a
+        // daemon_id.
+        let snap_bytes = if snapshot_len == 0 {
+            &[] as &[u8]
+        } else {
+            unsafe { std::slice::from_raw_parts(snapshot_ptr, snapshot_len) }
+        };
+        let Some(snapshot_decoded) = StateSnapshot::from_bytes(snap_bytes) else {
+            write_err(err_out, "snapshot decode failed");
+            return NET_COMPUTE_ERR_CALL_FAILED;
+        };
 
-    let mut seed = [0u8; 32];
-    unsafe {
-        std::ptr::copy_nonoverlapping(identity_seed, seed.as_mut_ptr(), 32);
-    }
-    let sdk_identity = SdkIdentity::from_seed(seed);
+        let mut seed = [0u8; 32];
+        unsafe {
+            std::ptr::copy_nonoverlapping(identity_seed, seed.as_mut_ptr(), 32);
+        }
+        let sdk_identity = SdkIdentity::from_seed(seed);
 
-    let mut cfg = DaemonHostConfig {
-        auto_snapshot_interval,
-        ..DaemonHostConfig::default()
-    };
-    if max_log_entries > 0 {
-        cfg.max_log_entries = max_log_entries;
-    }
+        let mut cfg = DaemonHostConfig {
+            auto_snapshot_interval,
+            ..DaemonHostConfig::default()
+        };
+        if max_log_entries > 0 {
+            cfg.max_log_entries = max_log_entries;
+        }
 
-    let bridge = Box::new(GoBridge::build(kind.clone(), daemon_id));
-    // Same loud-failure fallback rationale as the plain-spawn
-    // path above — see the comment there.
-    let kind_for_fallback = kind.clone();
-    let kind_factory = move || -> Box<dyn MeshDaemon> {
-        Box::new(ReconstructionErrorBridge::new(
+        let bridge = Box::new(GoBridge::build(kind.clone(), daemon_id));
+        // Same loud-failure fallback rationale as the plain-spawn
+        // path above — see the comment there.
+        let kind_for_fallback = kind.clone();
+        let kind_factory = move || -> Box<dyn MeshDaemon> {
+            Box::new(ReconstructionErrorBridge::new(
             kind_for_fallback.clone(),
             "spawn-from-snapshot kind registration does not route to a Go factory; call DaemonRuntime.RegisterFactoryFunc before the migration lands",
         ))
-    };
+        };
 
-    let inner = h.inner.clone();
-    let rt = runtime();
-    let result = rt.block_on(async move {
-        inner
-            .spawn_from_snapshot_with_daemon(
-                sdk_identity,
-                snapshot_decoded,
-                cfg,
-                bridge,
-                kind_factory,
-            )
-            .await
-    });
-    match result {
-        Ok(sdk_handle) => {
-            let origin_hash = sdk_handle.origin_hash;
-            let entity_id = *sdk_handle.entity_id.as_bytes();
-            let boxed = Box::new(DaemonHandleC {
-                origin_hash,
-                entity_id,
-                inner: sdk_handle,
-            });
-            unsafe {
-                *out_handle = Box::into_raw(boxed);
+        let inner = h.inner.clone();
+        let result = block_on(async move {
+            inner
+                .spawn_from_snapshot_with_daemon(
+                    sdk_identity,
+                    snapshot_decoded,
+                    cfg,
+                    bridge,
+                    kind_factory,
+                )
+                .await
+        });
+        match result {
+            Ok(sdk_handle) => {
+                let origin_hash = sdk_handle.origin_hash;
+                let entity_id = *sdk_handle.entity_id.as_bytes();
+                let boxed = Box::new(DaemonHandleC {
+                    origin_hash,
+                    entity_id,
+                    inner: sdk_handle,
+                });
+                unsafe {
+                    *out_handle = Box::into_raw(boxed);
+                }
+                NET_COMPUTE_OK
             }
-            NET_COMPUTE_OK
-        }
-        Err(e) => {
-            unsafe {
-                *out_handle = std::ptr::null_mut();
+            Err(e) => {
+                unsafe {
+                    *out_handle = std::ptr::null_mut();
+                }
+                write_err(err_out, &e.to_string());
+                NET_COMPUTE_ERR_CALL_FAILED
             }
-            write_err(err_out, &e.to_string());
-            NET_COMPUTE_ERR_CALL_FAILED
         }
-    }
+    })
 }
 
 // =========================================================================
@@ -1423,36 +1541,44 @@ pub struct MigrationHandleC {
 /// the background. Idempotent on NULL.
 #[no_mangle]
 pub extern "C" fn net_compute_migration_handle_free(h: *mut MigrationHandleC) {
-    if h.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = Box::from_raw(h);
-    }
+    ffi_guard!((), {
+        if h.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = Box::from_raw(h);
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_migration_handle_origin_hash(h: *const MigrationHandleC) -> u64 {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return 0;
-    };
-    h.origin_hash
+    ffi_guard!(0, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return 0;
+        };
+        h.origin_hash
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_migration_handle_source_node(h: *const MigrationHandleC) -> u64 {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return 0;
-    };
-    h.source_node
+    ffi_guard!(0, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return 0;
+        };
+        h.source_node
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_migration_handle_target_node(h: *const MigrationHandleC) -> u64 {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return 0;
-    };
-    h.target_node
+    ffi_guard!(0, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return 0;
+        };
+        h.target_node
+    })
 }
 
 /// Return the current migration phase as a CString, or NULL if
@@ -1461,15 +1587,17 @@ pub extern "C" fn net_compute_migration_handle_target_node(h: *const MigrationHa
 /// [`net_compute_free_cstring`].
 #[no_mangle]
 pub extern "C" fn net_compute_migration_handle_phase(h: *const MigrationHandleC) -> *mut c_char {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return std::ptr::null_mut();
-    };
-    match h.inner.phase() {
-        Some(p) => CString::new(migration_phase_str(p))
-            .map(|c| c.into_raw())
-            .unwrap_or(std::ptr::null_mut()),
-        None => std::ptr::null_mut(),
-    }
+    ffi_guard!(std::ptr::null_mut(), {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return std::ptr::null_mut();
+        };
+        match h.inner.phase() {
+            Some(p) => CString::new(migration_phase_str(p))
+                .map(|c| c.into_raw())
+                .unwrap_or(std::ptr::null_mut()),
+            None => std::ptr::null_mut(),
+        }
+    })
 }
 
 /// Block until the migration reaches a terminal state. Returns
@@ -1480,18 +1608,19 @@ pub extern "C" fn net_compute_migration_handle_wait(
     h: *mut MigrationHandleC,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let handle = h.inner.clone();
-    let rt = runtime();
-    match rt.block_on(async move { handle.wait().await }) {
-        Ok(()) => NET_COMPUTE_OK,
-        Err(e) => {
-            write_err(err_out, &format_sdk_error(&e));
-            NET_COMPUTE_ERR_CALL_FAILED
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let handle = h.inner.clone();
+        match block_on(async move { handle.wait().await }) {
+            Ok(()) => NET_COMPUTE_OK,
+            Err(e) => {
+                write_err(err_out, &format_sdk_error(&e));
+                NET_COMPUTE_ERR_CALL_FAILED
+            }
         }
-    }
+    })
 }
 
 /// Like `wait` with a caller-controlled timeout in milliseconds.
@@ -1501,22 +1630,23 @@ pub extern "C" fn net_compute_migration_handle_wait_with_timeout(
     timeout_ms: u64,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let handle = h.inner.clone();
-    let rt = runtime();
-    match rt.block_on(async move {
-        handle
-            .wait_with_timeout(std::time::Duration::from_millis(timeout_ms))
-            .await
-    }) {
-        Ok(()) => NET_COMPUTE_OK,
-        Err(e) => {
-            write_err(err_out, &format_sdk_error(&e));
-            NET_COMPUTE_ERR_CALL_FAILED
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let handle = h.inner.clone();
+        match block_on(async move {
+            handle
+                .wait_with_timeout(std::time::Duration::from_millis(timeout_ms))
+                .await
+        }) {
+            Ok(()) => NET_COMPUTE_OK,
+            Err(e) => {
+                write_err(err_out, &format_sdk_error(&e));
+                NET_COMPUTE_ERR_CALL_FAILED
+            }
         }
-    }
+    })
 }
 
 /// Request cancellation. Best-effort; past `cutover` the routing
@@ -1526,18 +1656,19 @@ pub extern "C" fn net_compute_migration_handle_cancel(
     h: *mut MigrationHandleC,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let handle = &h.inner;
-    let rt = runtime();
-    match rt.block_on(async move { handle.cancel().await }) {
-        Ok(()) => NET_COMPUTE_OK,
-        Err(e) => {
-            write_err(err_out, &format_sdk_error(&e));
-            NET_COMPUTE_ERR_CALL_FAILED
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let handle = &h.inner;
+        match block_on(async move { handle.cancel().await }) {
+            Ok(()) => NET_COMPUTE_OK,
+            Err(e) => {
+                write_err(err_out, &format_sdk_error(&e));
+                NET_COMPUTE_ERR_CALL_FAILED
+            }
         }
-    }
+    })
 }
 
 /// Start a migration with default options. Returns a boxed
@@ -1556,49 +1687,50 @@ pub extern "C" fn net_compute_start_migration(
     out_handle: *mut *mut MigrationHandleC,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    if out_handle.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    let opts = MigrationOpts {
-        transport_identity: transport_identity != 0,
-        retry_not_ready: if retry_not_ready_ms == 0 {
-            None
-        } else {
-            Some(std::time::Duration::from_millis(retry_not_ready_ms))
-        },
-    };
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        if out_handle.is_null() {
+            return NET_COMPUTE_ERR_NULL;
+        }
+        let opts = MigrationOpts {
+            transport_identity: transport_identity != 0,
+            retry_not_ready: if retry_not_ready_ms == 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_millis(retry_not_ready_ms))
+            },
+        };
 
-    let inner = h.inner.clone();
-    let rt = runtime();
-    let result = rt.block_on(async move {
-        inner
-            .start_migration_with(origin_hash, source_node, target_node, opts)
-            .await
-    });
-    match result {
-        Ok(mig) => {
-            let boxed = Box::new(MigrationHandleC {
-                origin_hash: mig.origin_hash,
-                source_node: mig.source_node,
-                target_node: mig.target_node,
-                inner: mig,
-            });
-            unsafe {
-                *out_handle = Box::into_raw(boxed);
+        let inner = h.inner.clone();
+        let result = block_on(async move {
+            inner
+                .start_migration_with(origin_hash, source_node, target_node, opts)
+                .await
+        });
+        match result {
+            Ok(mig) => {
+                let boxed = Box::new(MigrationHandleC {
+                    origin_hash: mig.origin_hash,
+                    source_node: mig.source_node,
+                    target_node: mig.target_node,
+                    inner: mig,
+                });
+                unsafe {
+                    *out_handle = Box::into_raw(boxed);
+                }
+                NET_COMPUTE_OK
             }
-            NET_COMPUTE_OK
-        }
-        Err(e) => {
-            unsafe {
-                *out_handle = std::ptr::null_mut();
+            Err(e) => {
+                unsafe {
+                    *out_handle = std::ptr::null_mut();
+                }
+                write_err(err_out, &format_sdk_error(&e));
+                NET_COMPUTE_ERR_CALL_FAILED
             }
-            write_err(err_out, &format_sdk_error(&e));
-            NET_COMPUTE_ERR_CALL_FAILED
         }
-    }
+    })
 }
 
 /// Declare on the target side that a migration will land here for
@@ -1615,26 +1747,28 @@ pub extern "C" fn net_compute_expect_migration(
     max_log_entries: u32,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let mut cfg = DaemonHostConfig {
-        auto_snapshot_interval,
-        ..DaemonHostConfig::default()
-    };
-    if max_log_entries > 0 {
-        cfg.max_log_entries = max_log_entries;
-    }
-    match h.inner.expect_migration(&kind, origin_hash, cfg) {
-        Ok(()) => NET_COMPUTE_OK,
-        Err(e) => {
-            write_err(err_out, &format_sdk_error(&e));
-            NET_COMPUTE_ERR_CALL_FAILED
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let mut cfg = DaemonHostConfig {
+            auto_snapshot_interval,
+            ..DaemonHostConfig::default()
+        };
+        if max_log_entries > 0 {
+            cfg.max_log_entries = max_log_entries;
         }
-    }
+        match h.inner.expect_migration(&kind, origin_hash, cfg) {
+            Ok(()) => NET_COMPUTE_OK,
+            Err(e) => {
+                write_err(err_out, &format_sdk_error(&e));
+                NET_COMPUTE_ERR_CALL_FAILED
+            }
+        }
+    })
 }
 
 /// Pre-register a target-side identity for a migration that will
@@ -1651,37 +1785,39 @@ pub extern "C" fn net_compute_register_migration_target_identity(
     max_log_entries: u32,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    if identity_seed.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let mut seed = [0u8; 32];
-    unsafe {
-        std::ptr::copy_nonoverlapping(identity_seed, seed.as_mut_ptr(), 32);
-    }
-    let sdk_identity = SdkIdentity::from_seed(seed);
-    let mut cfg = DaemonHostConfig {
-        auto_snapshot_interval,
-        ..DaemonHostConfig::default()
-    };
-    if max_log_entries > 0 {
-        cfg.max_log_entries = max_log_entries;
-    }
-    match h
-        .inner
-        .register_migration_target_identity(&kind, sdk_identity, cfg)
-    {
-        Ok(()) => NET_COMPUTE_OK,
-        Err(e) => {
-            write_err(err_out, &format_sdk_error(&e));
-            NET_COMPUTE_ERR_CALL_FAILED
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        if identity_seed.is_null() {
+            return NET_COMPUTE_ERR_NULL;
         }
-    }
+        let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let mut seed = [0u8; 32];
+        unsafe {
+            std::ptr::copy_nonoverlapping(identity_seed, seed.as_mut_ptr(), 32);
+        }
+        let sdk_identity = SdkIdentity::from_seed(seed);
+        let mut cfg = DaemonHostConfig {
+            auto_snapshot_interval,
+            ..DaemonHostConfig::default()
+        };
+        if max_log_entries > 0 {
+            cfg.max_log_entries = max_log_entries;
+        }
+        match h
+            .inner
+            .register_migration_target_identity(&kind, sdk_identity, cfg)
+        {
+            Ok(()) => NET_COMPUTE_OK,
+            Err(e) => {
+                write_err(err_out, &format_sdk_error(&e));
+                NET_COMPUTE_ERR_CALL_FAILED
+            }
+        }
+    })
 }
 
 /// Query the orchestrator's migration phase for `origin_hash`.
@@ -1693,15 +1829,17 @@ pub extern "C" fn net_compute_migration_phase(
     handle: *mut DaemonRuntimeHandle,
     origin_hash: u64,
 ) -> *mut c_char {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return std::ptr::null_mut();
-    };
-    match h.inner.migration_phase(origin_hash) {
-        Some(p) => CString::new(migration_phase_str(p))
-            .map(|c| c.into_raw())
-            .unwrap_or(std::ptr::null_mut()),
-        None => std::ptr::null_mut(),
-    }
+    ffi_guard!(std::ptr::null_mut(), {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return std::ptr::null_mut();
+        };
+        match h.inner.migration_phase(origin_hash) {
+            Some(p) => CString::new(migration_phase_str(p))
+                .map(|c| c.into_raw())
+                .unwrap_or(std::ptr::null_mut()),
+            None => std::ptr::null_mut(),
+        }
+    })
 }
 
 /// Deliver one event to the daemon at `origin_hash`. The Go
@@ -1724,63 +1862,71 @@ pub extern "C" fn net_compute_runtime_deliver(
     out_outputs: *mut *mut OutputsVec,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    if out_outputs.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    if event_payload_len > 0 && event_payload.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    let payload = if event_payload_len == 0 {
-        Bytes::new()
-    } else {
-        let slice = unsafe { std::slice::from_raw_parts(event_payload, event_payload_len) };
-        Bytes::copy_from_slice(slice)
-    };
-    let event = CausalEvent {
-        link: net::adapter::net::state::causal::CausalLink {
-            origin_hash: event_origin_hash,
-            horizon_encoded: 0,
-            sequence: event_sequence,
-            parent_hash: 0,
-        },
-        payload,
-        received_at: 0,
-    };
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        if out_outputs.is_null() {
+            return NET_COMPUTE_ERR_NULL;
+        }
+        if event_payload_len > 0 && event_payload.is_null() {
+            return NET_COMPUTE_ERR_NULL;
+        }
+        // `slice::from_raw_parts` requires `len <= isize::MAX`; reject a
+        // `(size_t)-1` from cgo before it reaches the read (core ffi guard).
+        if event_payload_len > isize::MAX as usize {
+            return NET_COMPUTE_ERR_NULL;
+        }
+        let payload = if event_payload_len == 0 {
+            Bytes::new()
+        } else {
+            let slice = unsafe { std::slice::from_raw_parts(event_payload, event_payload_len) };
+            Bytes::copy_from_slice(slice)
+        };
+        let event = CausalEvent {
+            link: net::adapter::net::state::causal::CausalLink {
+                origin_hash: event_origin_hash,
+                horizon_encoded: 0,
+                sequence: event_sequence,
+                parent_hash: 0,
+            },
+            payload,
+            received_at: 0,
+        };
 
-    let inner = h.inner.clone();
-    let rt = runtime();
-    let result = rt.block_on(async move { inner.deliver(origin_hash, &event) });
-    match result {
-        Ok(outputs) => {
-            let vec = OutputsVec {
-                inner: outputs.into_iter().map(|ev| ev.payload.clone()).collect(),
-            };
-            unsafe {
-                *out_outputs = Box::into_raw(Box::new(vec));
+        let inner = h.inner.clone();
+        let result = block_on(async move { inner.deliver(origin_hash, &event) });
+        match result {
+            Ok(outputs) => {
+                let vec = OutputsVec {
+                    inner: outputs.into_iter().map(|ev| ev.payload.clone()).collect(),
+                };
+                unsafe {
+                    *out_outputs = Box::into_raw(Box::new(vec));
+                }
+                NET_COMPUTE_OK
             }
-            NET_COMPUTE_OK
-        }
-        Err(e) => {
-            unsafe {
-                *out_outputs = std::ptr::null_mut();
+            Err(e) => {
+                unsafe {
+                    *out_outputs = std::ptr::null_mut();
+                }
+                write_err(err_out, &e.to_string());
+                NET_COMPUTE_ERR_CALL_FAILED
             }
-            write_err(err_out, &e.to_string());
-            NET_COMPUTE_ERR_CALL_FAILED
         }
-    }
+    })
 }
 
 /// Return the number of outputs stored in `vec`. Returns `0` on
 /// NULL.
 #[no_mangle]
 pub extern "C" fn net_compute_outputs_len(vec: *const OutputsVec) -> usize {
-    let Some(v) = (unsafe { vec.as_ref() }) else {
-        return 0;
-    };
-    v.inner.len()
+    ffi_guard!(0, {
+        let Some(v) = (unsafe { vec.as_ref() }) else {
+            return 0;
+        };
+        v.inner.len()
+    })
 }
 
 /// Copy the `idx`-th output payload's `(ptr, len)` into
@@ -1793,32 +1939,36 @@ pub extern "C" fn net_compute_outputs_at(
     out_ptr: *mut *const u8,
     out_len: *mut usize,
 ) -> c_int {
-    let Some(v) = (unsafe { vec.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    if out_ptr.is_null() || out_len.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    let Some(b) = v.inner.get(idx) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    unsafe {
-        *out_ptr = b.as_ptr();
-        *out_len = b.len();
-    }
-    NET_COMPUTE_OK
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(v) = (unsafe { vec.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        if out_ptr.is_null() || out_len.is_null() {
+            return NET_COMPUTE_ERR_NULL;
+        }
+        let Some(b) = v.inner.get(idx) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        unsafe {
+            *out_ptr = b.as_ptr();
+            *out_len = b.len();
+        }
+        NET_COMPUTE_OK
+    })
 }
 
 /// Free the outputs vec produced by
 /// [`net_compute_runtime_deliver`]. Idempotent on NULL.
 #[no_mangle]
 pub extern "C" fn net_compute_outputs_free(vec: *mut OutputsVec) {
-    if vec.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = Box::from_raw(vec);
-    }
+    ffi_guard!((), {
+        if vec.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = Box::from_raw(vec);
+        }
+    })
 }
 
 // =========================================================================
@@ -1916,6 +2066,13 @@ fn cstr_to_string(ptr: *const c_char, len: usize) -> Option<String> {
     if ptr.is_null() {
         return None;
     }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`. A C caller
+    // passing a sign-extended `-1` (or any `len > isize::MAX as usize`)
+    // is immediate UB before any other validation runs. Reject — the
+    // core `ffi/mod.rs` guards every such site. Mirrors that contract.
+    if len > isize::MAX as usize {
+        return None;
+    }
     let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
     std::str::from_utf8(bytes).ok().map(|s| s.to_string())
 }
@@ -1953,19 +2110,21 @@ pub extern "C" fn net_compute_test_inject_synthetic_peer(
     mesh_arc: *mut std::sync::Arc<MeshNode>,
     node_id: u64,
 ) {
-    use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
-    use net::adapter::net::identity::EntityId;
-    if mesh_arc.is_null() {
-        return;
-    }
-    let arc = unsafe { &*mesh_arc };
-    let eid = EntityId::from_bytes([0u8; 32]);
-    arc.test_inject_capability_announcement(CapabilityAnnouncement::new(
-        node_id,
-        eid,
-        1,
-        CapabilitySet::new(),
-    ));
+    ffi_guard!((), {
+        use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
+        use net::adapter::net::identity::EntityId;
+        if mesh_arc.is_null() {
+            return;
+        }
+        let arc = unsafe { &*mesh_arc };
+        let eid = EntityId::from_bytes([0u8; 32]);
+        arc.test_inject_capability_announcement(CapabilityAnnouncement::new(
+            node_id,
+            eid,
+            1,
+            CapabilitySet::new(),
+        ));
+    })
 }
 
 /// Test-only — same shape as
@@ -1989,34 +2148,36 @@ pub extern "C" fn net_compute_test_inject_synthetic_peer_with_tags(
     node_id: u64,
     tags_json: *const c_char,
 ) {
-    use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
-    use net::adapter::net::behavior::Tag;
-    use net::adapter::net::identity::EntityId;
-    use std::ffi::CStr;
-    if mesh_arc.is_null() {
-        return;
-    }
-    let arc = unsafe { &*mesh_arc };
-    let tags: Vec<String> = if tags_json.is_null() {
-        Vec::new()
-    } else {
-        let s = match unsafe { CStr::from_ptr(tags_json) }.to_str() {
-            Ok(s) => s,
-            Err(_) => return,
+    ffi_guard!((), {
+        use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
+        use net::adapter::net::behavior::Tag;
+        use net::adapter::net::identity::EntityId;
+        use std::ffi::CStr;
+        if mesh_arc.is_null() {
+            return;
+        }
+        let arc = unsafe { &*mesh_arc };
+        let tags: Vec<String> = if tags_json.is_null() {
+            Vec::new()
+        } else {
+            let s = match unsafe { CStr::from_ptr(tags_json) }.to_str() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            match serde_json::from_str(s) {
+                Ok(v) => v,
+                Err(_) => return,
+            }
         };
-        match serde_json::from_str(s) {
-            Ok(v) => v,
-            Err(_) => return,
+        let mut caps = CapabilitySet::new();
+        for s in tags {
+            if let Ok(t) = Tag::parse(&s) {
+                caps.tags.insert(t);
+            }
         }
-    };
-    let mut caps = CapabilitySet::new();
-    for s in tags {
-        if let Ok(t) = Tag::parse(&s) {
-            caps.tags.insert(t);
-        }
-    }
-    let eid = EntityId::from_bytes([0u8; 32]);
-    arc.test_inject_capability_announcement(CapabilityAnnouncement::new(node_id, eid, 1, caps));
+        let eid = EntityId::from_bytes([0u8; 32]);
+        arc.test_inject_capability_announcement(CapabilityAnnouncement::new(node_id, eid, 1, caps));
+    })
 }
 
 // =========================================================================
@@ -2187,91 +2348,101 @@ pub extern "C" fn net_compute_replica_group_spawn(
     out_handle: *mut *mut ReplicaGroupHandle,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(rt) = (unsafe { runtime.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    if out_handle.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let Some(seed) = parse_seed(group_seed) else {
-        write_err(
-            err_out,
-            "group: invalid-config: group_seed must be 32 bytes",
-        );
-        return NET_COMPUTE_ERR_CALL_FAILED;
-    };
-    let Some(lb) = parse_strategy(lb_strategy_ptr, lb_strategy_len) else {
-        write_err(err_out, "group: invalid-config: unknown lb strategy");
-        return NET_COMPUTE_ERR_CALL_FAILED;
-    };
-
-    let mut host = DaemonHostConfig {
-        auto_snapshot_interval,
-        ..DaemonHostConfig::default()
-    };
-    if max_log_entries > 0 {
-        host.max_log_entries = max_log_entries;
-    }
-    let Ok(replica_count_u8) = u8::try_from(replica_count) else {
-        return group_err_out_reason(
-            err_out,
-            format!("invalid-config: replica count {replica_count} exceeds 255"),
-        );
-    };
-    let cfg = SdkReplicaGroupConfig {
-        replica_count: replica_count_u8,
-        group_seed: seed,
-        lb_strategy: lb,
-        host_config: host,
-    };
-
-    match SdkReplicaGroup::spawn(&rt.inner, &kind, cfg) {
-        Ok(g) => {
-            let h = ReplicaGroupHandle {
-                inner: std::sync::Arc::new(g),
-            };
-            unsafe { *out_handle = Box::into_raw(Box::new(h)) };
-            NET_COMPUTE_OK
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(rt) = (unsafe { runtime.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        if out_handle.is_null() {
+            return NET_COMPUTE_ERR_NULL;
         }
-        Err(e) => group_err_out(err_out, &e),
-    }
+        let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let Some(seed) = parse_seed(group_seed) else {
+            write_err(
+                err_out,
+                "group: invalid-config: group_seed must be 32 bytes",
+            );
+            return NET_COMPUTE_ERR_CALL_FAILED;
+        };
+        let Some(lb) = parse_strategy(lb_strategy_ptr, lb_strategy_len) else {
+            write_err(err_out, "group: invalid-config: unknown lb strategy");
+            return NET_COMPUTE_ERR_CALL_FAILED;
+        };
+
+        let mut host = DaemonHostConfig {
+            auto_snapshot_interval,
+            ..DaemonHostConfig::default()
+        };
+        if max_log_entries > 0 {
+            host.max_log_entries = max_log_entries;
+        }
+        let Ok(replica_count_u8) = u8::try_from(replica_count) else {
+            return group_err_out_reason(
+                err_out,
+                format!("invalid-config: replica count {replica_count} exceeds 255"),
+            );
+        };
+        let cfg = SdkReplicaGroupConfig {
+            replica_count: replica_count_u8,
+            group_seed: seed,
+            lb_strategy: lb,
+            host_config: host,
+        };
+
+        match SdkReplicaGroup::spawn(&rt.inner, &kind, cfg) {
+            Ok(g) => {
+                let h = ReplicaGroupHandle {
+                    inner: std::sync::Arc::new(g),
+                };
+                unsafe { *out_handle = Box::into_raw(Box::new(h)) };
+                NET_COMPUTE_OK
+            }
+            Err(e) => group_err_out(err_out, &e),
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_replica_group_free(h: *mut ReplicaGroupHandle) {
-    if h.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = Box::from_raw(h);
-    }
+    ffi_guard!((), {
+        if h.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = Box::from_raw(h);
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_replica_group_replica_count(h: *const ReplicaGroupHandle) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    h.inner.replica_count() as c_int
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        h.inner.replica_count() as c_int
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_replica_group_healthy_count(h: *const ReplicaGroupHandle) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    h.inner.healthy_count() as c_int
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        h.inner.healthy_count() as c_int
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_replica_group_group_id(h: *const ReplicaGroupHandle) -> u32 {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return 0;
-    };
-    h.inner.group_id()
+    ffi_guard!(0, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return 0;
+        };
+        h.inner.group_id()
+    })
 }
 
 /// Fill `(out_status, out_healthy, out_total)` with the group's
@@ -2284,19 +2455,21 @@ pub extern "C" fn net_compute_replica_group_health(
     out_healthy: *mut u32,
     out_total: *mut u32,
 ) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    if out_status.is_null() || out_healthy.is_null() || out_total.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    let (s, hc, t) = health_status(h.inner.health());
-    unsafe {
-        *out_status = s;
-        *out_healthy = hc;
-        *out_total = t;
-    }
-    NET_COMPUTE_OK
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        if out_status.is_null() || out_healthy.is_null() || out_total.is_null() {
+            return NET_COMPUTE_ERR_NULL;
+        }
+        let (s, hc, t) = health_status(h.inner.health());
+        unsafe {
+            *out_status = s;
+            *out_healthy = hc;
+            *out_total = t;
+        }
+        NET_COMPUTE_OK
+    })
 }
 
 /// Route a request to the best healthy replica. `routing_key_ptr`
@@ -2309,25 +2482,27 @@ pub extern "C" fn net_compute_replica_group_route_event(
     out_origin: *mut u64,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    if out_origin.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    let mut rc = SdkRequestContext::new();
-    if routing_key_len > 0 {
-        if let Some(k) = cstr_to_string(routing_key_ptr, routing_key_len) {
-            rc = rc.with_routing_key(k);
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        if out_origin.is_null() {
+            return NET_COMPUTE_ERR_NULL;
         }
-    }
-    match h.inner.route_event(&rc) {
-        Ok(origin) => {
-            unsafe { *out_origin = origin };
-            NET_COMPUTE_OK
+        let mut rc = SdkRequestContext::new();
+        if routing_key_len > 0 {
+            if let Some(k) = cstr_to_string(routing_key_ptr, routing_key_len) {
+                rc = rc.with_routing_key(k);
+            }
         }
-        Err(e) => group_err_out(err_out, &e),
-    }
+        match h.inner.route_event(&rc) {
+            Ok(origin) => {
+                unsafe { *out_origin = origin };
+                NET_COMPUTE_OK
+            }
+            Err(e) => group_err_out(err_out, &e),
+        }
+    })
 }
 
 /// Resize the group to `n` members. Reuses the kind the group was
@@ -2338,22 +2513,24 @@ pub extern "C" fn net_compute_replica_group_scale_to(
     n: u32,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let n_u8 = match u8::try_from(n) {
-        Ok(v) => v,
-        Err(_) => {
-            return group_err_out_reason(
-                err_out,
-                format!("invalid-config: replica count {n} exceeds {}", u8::MAX),
-            );
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let n_u8 = match u8::try_from(n) {
+            Ok(v) => v,
+            Err(_) => {
+                return group_err_out_reason(
+                    err_out,
+                    format!("invalid-config: replica count {n} exceeds {}", u8::MAX),
+                );
+            }
+        };
+        match h.inner.scale_to(n_u8) {
+            Ok(()) => NET_COMPUTE_OK,
+            Err(e) => group_err_out(err_out, &e),
         }
-    };
-    match h.inner.scale_to(n_u8) {
-        Ok(()) => NET_COMPUTE_OK,
-        Err(e) => group_err_out(err_out, &e),
-    }
+    })
 }
 
 #[no_mangle]
@@ -2361,10 +2538,12 @@ pub extern "C" fn net_compute_replica_group_on_node_recovery(
     h: *const ReplicaGroupHandle,
     node_id: u64,
 ) {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return;
-    };
-    h.inner.on_node_recovery(node_id);
+    ffi_guard!((), {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return;
+        };
+        h.inner.on_node_recovery(node_id);
+    })
 }
 
 /// Return the members roster as a heap-allocated JSON string.
@@ -2373,13 +2552,15 @@ pub extern "C" fn net_compute_replica_group_on_node_recovery(
 pub extern "C" fn net_compute_replica_group_members_json(
     h: *const ReplicaGroupHandle,
 ) -> *mut c_char {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return std::ptr::null_mut();
-    };
-    let json = members_to_json(&h.inner.replicas());
-    CString::new(json)
-        .map(|c| c.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    ffi_guard!(std::ptr::null_mut(), {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return std::ptr::null_mut();
+        };
+        let json = members_to_json(&h.inner.replicas());
+        CString::new(json)
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    })
 }
 
 // ---------------------------------------------------------------
@@ -2406,103 +2587,117 @@ pub extern "C" fn net_compute_fork_group_spawn(
     out_handle: *mut *mut ForkGroupHandle,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(rt) = (unsafe { runtime.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    if out_handle.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let Some(lb) = parse_strategy(lb_strategy_ptr, lb_strategy_len) else {
-        write_err(err_out, "group: invalid-config: unknown lb strategy");
-        return NET_COMPUTE_ERR_CALL_FAILED;
-    };
-    let mut host = DaemonHostConfig {
-        auto_snapshot_interval,
-        ..DaemonHostConfig::default()
-    };
-    if max_log_entries > 0 {
-        host.max_log_entries = max_log_entries;
-    }
-    let Ok(fork_count_u8) = u8::try_from(fork_count) else {
-        return group_err_out_reason(
-            err_out,
-            format!("invalid-config: fork count {fork_count} exceeds 255"),
-        );
-    };
-    let cfg = SdkForkGroupConfig {
-        fork_count: fork_count_u8,
-        lb_strategy: lb,
-        host_config: host,
-    };
-    match SdkForkGroup::fork(&rt.inner, &kind, parent_origin, fork_seq, cfg) {
-        Ok(g) => {
-            let h = ForkGroupHandle {
-                inner: std::sync::Arc::new(g),
-            };
-            unsafe { *out_handle = Box::into_raw(Box::new(h)) };
-            NET_COMPUTE_OK
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(rt) = (unsafe { runtime.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        if out_handle.is_null() {
+            return NET_COMPUTE_ERR_NULL;
         }
-        Err(e) => group_err_out(err_out, &e),
-    }
+        let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let Some(lb) = parse_strategy(lb_strategy_ptr, lb_strategy_len) else {
+            write_err(err_out, "group: invalid-config: unknown lb strategy");
+            return NET_COMPUTE_ERR_CALL_FAILED;
+        };
+        let mut host = DaemonHostConfig {
+            auto_snapshot_interval,
+            ..DaemonHostConfig::default()
+        };
+        if max_log_entries > 0 {
+            host.max_log_entries = max_log_entries;
+        }
+        let Ok(fork_count_u8) = u8::try_from(fork_count) else {
+            return group_err_out_reason(
+                err_out,
+                format!("invalid-config: fork count {fork_count} exceeds 255"),
+            );
+        };
+        let cfg = SdkForkGroupConfig {
+            fork_count: fork_count_u8,
+            lb_strategy: lb,
+            host_config: host,
+        };
+        match SdkForkGroup::fork(&rt.inner, &kind, parent_origin, fork_seq, cfg) {
+            Ok(g) => {
+                let h = ForkGroupHandle {
+                    inner: std::sync::Arc::new(g),
+                };
+                unsafe { *out_handle = Box::into_raw(Box::new(h)) };
+                NET_COMPUTE_OK
+            }
+            Err(e) => group_err_out(err_out, &e),
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_fork_group_free(h: *mut ForkGroupHandle) {
-    if h.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = Box::from_raw(h);
-    }
+    ffi_guard!((), {
+        if h.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = Box::from_raw(h);
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_fork_group_fork_count(h: *const ForkGroupHandle) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    h.inner.fork_count() as c_int
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        h.inner.fork_count() as c_int
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_fork_group_healthy_count(h: *const ForkGroupHandle) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    h.inner.healthy_count() as c_int
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        h.inner.healthy_count() as c_int
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_fork_group_parent_origin(h: *const ForkGroupHandle) -> u64 {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return 0;
-    };
-    h.inner.parent_origin()
+    ffi_guard!(0, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return 0;
+        };
+        h.inner.parent_origin()
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_fork_group_fork_seq(h: *const ForkGroupHandle) -> u64 {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return 0;
-    };
-    h.inner.fork_seq()
+    ffi_guard!(0, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return 0;
+        };
+        h.inner.fork_seq()
+    })
 }
 
 /// Verify every fork's lineage record. Returns 1 on verified, 0
 /// otherwise. Caller sees NULL handle as 0.
 #[no_mangle]
 pub extern "C" fn net_compute_fork_group_verify_lineage(h: *const ForkGroupHandle) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return 0;
-    };
-    if h.inner.verify_lineage() {
-        1
-    } else {
-        0
-    }
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return 0;
+        };
+        if h.inner.verify_lineage() {
+            1
+        } else {
+            0
+        }
+    })
 }
 
 #[no_mangle]
@@ -2511,54 +2706,62 @@ pub extern "C" fn net_compute_fork_group_scale_to(
     n: u32,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let n_u8 = match u8::try_from(n) {
-        Ok(v) => v,
-        Err(_) => {
-            return group_err_out_reason(
-                err_out,
-                format!("invalid-config: fork count {n} exceeds {}", u8::MAX),
-            );
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let n_u8 = match u8::try_from(n) {
+            Ok(v) => v,
+            Err(_) => {
+                return group_err_out_reason(
+                    err_out,
+                    format!("invalid-config: fork count {n} exceeds {}", u8::MAX),
+                );
+            }
+        };
+        match h.inner.scale_to(n_u8) {
+            Ok(()) => NET_COMPUTE_OK,
+            Err(e) => group_err_out(err_out, &e),
         }
-    };
-    match h.inner.scale_to(n_u8) {
-        Ok(()) => NET_COMPUTE_OK,
-        Err(e) => group_err_out(err_out, &e),
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_fork_group_on_node_recovery(h: *const ForkGroupHandle, node_id: u64) {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return;
-    };
-    h.inner.on_node_recovery(node_id);
+    ffi_guard!((), {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return;
+        };
+        h.inner.on_node_recovery(node_id);
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_fork_group_members_json(h: *const ForkGroupHandle) -> *mut c_char {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return std::ptr::null_mut();
-    };
-    let json = members_to_json(&h.inner.members());
-    CString::new(json)
-        .map(|c| c.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    ffi_guard!(std::ptr::null_mut(), {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return std::ptr::null_mut();
+        };
+        let json = members_to_json(&h.inner.members());
+        CString::new(json)
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_fork_group_fork_records_json(
     h: *const ForkGroupHandle,
 ) -> *mut c_char {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return std::ptr::null_mut();
-    };
-    let json = fork_records_to_json(&h.inner.fork_records());
-    CString::new(json)
-        .map(|c| c.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    ffi_guard!(std::ptr::null_mut(), {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return std::ptr::null_mut();
+        };
+        let json = fork_records_to_json(&h.inner.fork_records());
+        CString::new(json)
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    })
 }
 
 // ---------------------------------------------------------------
@@ -2582,122 +2785,140 @@ pub extern "C" fn net_compute_standby_group_spawn(
     out_handle: *mut *mut StandbyGroupHandle,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(rt) = (unsafe { runtime.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    if out_handle.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let Some(seed) = parse_seed(group_seed) else {
-        write_err(
-            err_out,
-            "group: invalid-config: group_seed must be 32 bytes",
-        );
-        return NET_COMPUTE_ERR_CALL_FAILED;
-    };
-    let mut host = DaemonHostConfig {
-        auto_snapshot_interval,
-        ..DaemonHostConfig::default()
-    };
-    if max_log_entries > 0 {
-        host.max_log_entries = max_log_entries;
-    }
-    let Ok(member_count_u8) = u8::try_from(member_count) else {
-        return group_err_out_reason(
-            err_out,
-            format!("invalid-config: member count {member_count} exceeds 255"),
-        );
-    };
-    let cfg = SdkStandbyGroupConfig {
-        member_count: member_count_u8,
-        group_seed: seed,
-        host_config: host,
-    };
-    match SdkStandbyGroup::spawn(&rt.inner, &kind, cfg) {
-        Ok(g) => {
-            let h = StandbyGroupHandle {
-                inner: std::sync::Arc::new(g),
-            };
-            unsafe { *out_handle = Box::into_raw(Box::new(h)) };
-            NET_COMPUTE_OK
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(rt) = (unsafe { runtime.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        if out_handle.is_null() {
+            return NET_COMPUTE_ERR_NULL;
         }
-        Err(e) => group_err_out(err_out, &e),
-    }
+        let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let Some(seed) = parse_seed(group_seed) else {
+            write_err(
+                err_out,
+                "group: invalid-config: group_seed must be 32 bytes",
+            );
+            return NET_COMPUTE_ERR_CALL_FAILED;
+        };
+        let mut host = DaemonHostConfig {
+            auto_snapshot_interval,
+            ..DaemonHostConfig::default()
+        };
+        if max_log_entries > 0 {
+            host.max_log_entries = max_log_entries;
+        }
+        let Ok(member_count_u8) = u8::try_from(member_count) else {
+            return group_err_out_reason(
+                err_out,
+                format!("invalid-config: member count {member_count} exceeds 255"),
+            );
+        };
+        let cfg = SdkStandbyGroupConfig {
+            member_count: member_count_u8,
+            group_seed: seed,
+            host_config: host,
+        };
+        match SdkStandbyGroup::spawn(&rt.inner, &kind, cfg) {
+            Ok(g) => {
+                let h = StandbyGroupHandle {
+                    inner: std::sync::Arc::new(g),
+                };
+                unsafe { *out_handle = Box::into_raw(Box::new(h)) };
+                NET_COMPUTE_OK
+            }
+            Err(e) => group_err_out(err_out, &e),
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_standby_group_free(h: *mut StandbyGroupHandle) {
-    if h.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = Box::from_raw(h);
-    }
+    ffi_guard!((), {
+        if h.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = Box::from_raw(h);
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_standby_group_member_count(h: *const StandbyGroupHandle) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    h.inner.member_count() as c_int
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        h.inner.member_count() as c_int
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_standby_group_standby_count(h: *const StandbyGroupHandle) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    h.inner.standby_count() as c_int
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        h.inner.standby_count() as c_int
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_standby_group_active_index(h: *const StandbyGroupHandle) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    h.inner.active_index() as c_int
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        h.inner.active_index() as c_int
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_standby_group_active_origin(h: *const StandbyGroupHandle) -> u64 {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return 0;
-    };
-    h.inner.active_origin()
+    ffi_guard!(0, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return 0;
+        };
+        h.inner.active_origin()
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_standby_group_active_healthy(h: *const StandbyGroupHandle) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return 0;
-    };
-    if h.inner.active_healthy() {
-        1
-    } else {
-        0
-    }
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return 0;
+        };
+        if h.inner.active_healthy() {
+            1
+        } else {
+            0
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_standby_group_group_id(h: *const StandbyGroupHandle) -> u32 {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return 0;
-    };
-    h.inner.group_id()
+    ffi_guard!(0, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return 0;
+        };
+        h.inner.group_id()
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_standby_group_buffered_event_count(
     h: *const StandbyGroupHandle,
 ) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    h.inner.buffered_event_count() as c_int
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        h.inner.buffered_event_count() as c_int
+    })
 }
 
 #[no_mangle]
@@ -2706,19 +2927,21 @@ pub extern "C" fn net_compute_standby_group_sync_standbys(
     out_through: *mut u64,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    if out_through.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    match h.inner.sync_standbys() {
-        Ok(seq) => {
-            unsafe { *out_through = seq };
-            NET_COMPUTE_OK
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        if out_through.is_null() {
+            return NET_COMPUTE_ERR_NULL;
         }
-        Err(e) => group_err_out(err_out, &e),
-    }
+        match h.inner.sync_standbys() {
+            Ok(seq) => {
+                unsafe { *out_through = seq };
+                NET_COMPUTE_OK
+            }
+            Err(e) => group_err_out(err_out, &e),
+        }
+    })
 }
 
 #[no_mangle]
@@ -2727,19 +2950,21 @@ pub extern "C" fn net_compute_standby_group_promote(
     out_origin: *mut u64,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    if out_origin.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    match h.inner.promote() {
-        Ok(origin) => {
-            unsafe { *out_origin = origin };
-            NET_COMPUTE_OK
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        if out_origin.is_null() {
+            return NET_COMPUTE_ERR_NULL;
         }
-        Err(e) => group_err_out(err_out, &e),
-    }
+        match h.inner.promote() {
+            Ok(origin) => {
+                unsafe { *out_origin = origin };
+                NET_COMPUTE_OK
+            }
+            Err(e) => group_err_out(err_out, &e),
+        }
+    })
 }
 
 #[no_mangle]
@@ -2747,23 +2972,27 @@ pub extern "C" fn net_compute_standby_group_on_node_recovery(
     h: *const StandbyGroupHandle,
     node_id: u64,
 ) {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return;
-    };
-    h.inner.on_node_recovery(node_id);
+    ffi_guard!((), {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return;
+        };
+        h.inner.on_node_recovery(node_id);
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn net_compute_standby_group_members_json(
     h: *const StandbyGroupHandle,
 ) -> *mut c_char {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return std::ptr::null_mut();
-    };
-    let json = members_to_json(&h.inner.members());
-    CString::new(json)
-        .map(|c| c.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    ffi_guard!(std::ptr::null_mut(), {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return std::ptr::null_mut();
+        };
+        let json = members_to_json(&h.inner.members());
+        CString::new(json)
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    })
 }
 
 /// Returns `"active"` / `"standby"` (caller frees via
@@ -2773,18 +3002,20 @@ pub extern "C" fn net_compute_standby_group_member_role(
     h: *const StandbyGroupHandle,
     index: u32,
 ) -> *mut c_char {
-    let Some(h) = (unsafe { h.as_ref() }) else {
-        return std::ptr::null_mut();
-    };
-    match h.inner.member_role(index as u8) {
-        Some(SdkMemberRole::Active) => CString::new("active")
-            .map(|c| c.into_raw())
-            .unwrap_or(std::ptr::null_mut()),
-        Some(SdkMemberRole::Standby) => CString::new("standby")
-            .map(|c| c.into_raw())
-            .unwrap_or(std::ptr::null_mut()),
-        None => std::ptr::null_mut(),
-    }
+    ffi_guard!(std::ptr::null_mut(), {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            return std::ptr::null_mut();
+        };
+        match h.inner.member_role(index as u8) {
+            Some(SdkMemberRole::Active) => CString::new("active")
+                .map(|c| c.into_raw())
+                .unwrap_or(std::ptr::null_mut()),
+            Some(SdkMemberRole::Standby) => CString::new("standby")
+                .map(|c| c.into_raw())
+                .unwrap_or(std::ptr::null_mut()),
+            None => std::ptr::null_mut(),
+        }
+    })
 }
 
 // =========================================================================
@@ -2843,11 +3074,13 @@ static PLACEMENT_FILTER_DISPATCHER: OnceLock<PlacementFilterFn> = OnceLock::new(
 pub extern "C" fn net_compute_set_placement_filter_dispatcher(
     f: Option<PlacementFilterFn>,
 ) -> c_int {
-    let Some(f) = f else {
-        return NET_COMPUTE_ERR_NULL;
-    };
-    let _ = PLACEMENT_FILTER_DISPATCHER.set(f);
-    NET_COMPUTE_OK
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        let Some(f) = f else {
+            return NET_COMPUTE_ERR_NULL;
+        };
+        let _ = PLACEMENT_FILTER_DISPATCHER.set(f);
+        NET_COMPUTE_OK
+    })
 }
 
 /// Bridge wrapper that implements `PlacementFilter` by calling the
@@ -2977,40 +3210,46 @@ pub extern "C" fn net_compute_register_placement_filter(
     id_ptr: *const c_char,
     id_len: usize,
 ) -> c_int {
-    use ::net::adapter::net::behavior::placement::PlacementFilter;
-    use ::net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        use ::net::adapter::net::behavior::placement::PlacementFilter;
+        use ::net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
 
-    if mesh_arc.is_null() || id_ptr.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    if PLACEMENT_FILTER_DISPATCHER.get().is_none() {
-        return -4;
-    }
-
-    let id = unsafe {
-        let bytes = std::slice::from_raw_parts(id_ptr as *const u8, id_len);
-        match std::str::from_utf8(bytes) {
-            Ok(s) => s.to_string(),
-            Err(_) => return -5,
+        if mesh_arc.is_null() || id_ptr.is_null() {
+            return NET_COMPUTE_ERR_NULL;
         }
-    };
+        if PLACEMENT_FILTER_DISPATCHER.get().is_none() {
+            return -4;
+        }
+        // `slice::from_raw_parts` requires `len <= isize::MAX` (core ffi guard).
+        if id_len > isize::MAX as usize {
+            return NET_COMPUTE_ERR_NULL;
+        }
 
-    let arc = unsafe { &*mesh_arc };
-    let capability_fold = arc.capability_fold().clone();
-    let wrapper = CgoPlacementFilter {
-        id: id.clone(),
-        capability_fold,
-    };
-    let arc_filter: Arc<dyn PlacementFilter> = Arc::new(wrapper);
+        let id = unsafe {
+            let bytes = std::slice::from_raw_parts(id_ptr as *const u8, id_len);
+            match std::str::from_utf8(bytes) {
+                Ok(s) => s.to_string(),
+                Err(_) => return -5,
+            }
+        };
 
-    // SDK Phase 7 polish: `"go"` binding label drives the
-    // `dataforts_placement_callback_invocations_total{binding="go"}`
-    // counter on the substrate registry.
-    if global_placement_filter_registry().register(id, arc_filter, "go") {
-        NET_COMPUTE_OK
-    } else {
-        NET_COMPUTE_ERR_DUPLICATE_KIND
-    }
+        let arc = unsafe { &*mesh_arc };
+        let capability_fold = arc.capability_fold().clone();
+        let wrapper = CgoPlacementFilter {
+            id: id.clone(),
+            capability_fold,
+        };
+        let arc_filter: Arc<dyn PlacementFilter> = Arc::new(wrapper);
+
+        // SDK Phase 7 polish: `"go"` binding label drives the
+        // `dataforts_placement_callback_invocations_total{binding="go"}`
+        // counter on the substrate registry.
+        if global_placement_filter_registry().register(id, arc_filter, "go") {
+            NET_COMPUTE_OK
+        } else {
+            NET_COMPUTE_ERR_DUPLICATE_KIND
+        }
+    })
 }
 
 /// Drop the placement-filter registration under `id`.
@@ -3028,22 +3267,28 @@ pub extern "C" fn net_compute_unregister_placement_filter(
     id_ptr: *const c_char,
     id_len: usize,
 ) -> c_int {
-    use ::net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
-    if id_ptr.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    let id = unsafe {
-        let bytes = std::slice::from_raw_parts(id_ptr as *const u8, id_len);
-        match std::str::from_utf8(bytes) {
-            Ok(s) => s,
-            Err(_) => return NET_COMPUTE_ERR_NULL,
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        use ::net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
+        if id_ptr.is_null() {
+            return NET_COMPUTE_ERR_NULL;
         }
-    };
-    if global_placement_filter_registry().unregister(id) {
-        1
-    } else {
-        0
-    }
+        // `slice::from_raw_parts` requires `len <= isize::MAX` (core ffi guard).
+        if id_len > isize::MAX as usize {
+            return NET_COMPUTE_ERR_NULL;
+        }
+        let id = unsafe {
+            let bytes = std::slice::from_raw_parts(id_ptr as *const u8, id_len);
+            match std::str::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(_) => return NET_COMPUTE_ERR_NULL,
+            }
+        };
+        if global_placement_filter_registry().unregister(id) {
+            1
+        } else {
+            0
+        }
+    })
 }
 
 /// Whether `id` is currently registered. Diagnostic helper.
@@ -3056,22 +3301,28 @@ pub extern "C" fn net_compute_unregister_placement_filter(
 /// [`net_compute_register_placement_filter`].
 #[no_mangle]
 pub extern "C" fn net_compute_has_placement_filter(id_ptr: *const c_char, id_len: usize) -> c_int {
-    use ::net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
-    if id_ptr.is_null() {
-        return NET_COMPUTE_ERR_NULL;
-    }
-    let id = unsafe {
-        let bytes = std::slice::from_raw_parts(id_ptr as *const u8, id_len);
-        match std::str::from_utf8(bytes) {
-            Ok(s) => s,
-            Err(_) => return NET_COMPUTE_ERR_NULL,
+    ffi_guard!(NET_COMPUTE_ERR_NULL, {
+        use ::net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
+        if id_ptr.is_null() {
+            return NET_COMPUTE_ERR_NULL;
         }
-    };
-    if global_placement_filter_registry().contains(id) {
-        1
-    } else {
-        0
-    }
+        // `slice::from_raw_parts` requires `len <= isize::MAX` (core ffi guard).
+        if id_len > isize::MAX as usize {
+            return NET_COMPUTE_ERR_NULL;
+        }
+        let id = unsafe {
+            let bytes = std::slice::from_raw_parts(id_ptr as *const u8, id_len);
+            match std::str::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(_) => return NET_COMPUTE_ERR_NULL,
+            }
+        };
+        if global_placement_filter_registry().contains(id) {
+            1
+        } else {
+            0
+        }
+    })
 }
 
 // =========================================================================
@@ -3107,57 +3358,59 @@ pub extern "C" fn net_capability_aggregate(
     group_by_json: *const c_char,
     aggregation_json: *const c_char,
 ) -> *mut c_char {
-    use net::adapter::net::behavior::fold::{Aggregation, GroupBy, TagMatcher};
-    use std::ffi::CStr;
+    ffi_guard!(std::ptr::null_mut(), {
+        use net::adapter::net::behavior::fold::{Aggregation, GroupBy, TagMatcher};
+        use std::ffi::CStr;
 
-    if mesh_arc.is_null() || group_by_json.is_null() || aggregation_json.is_null() {
-        return std::ptr::null_mut();
-    }
-    let arc = unsafe { &*mesh_arc };
+        if mesh_arc.is_null() || group_by_json.is_null() || aggregation_json.is_null() {
+            return std::ptr::null_mut();
+        }
+        let arc = unsafe { &*mesh_arc };
 
-    let matcher: Option<TagMatcher> = if matcher_json.is_null() {
-        None
-    } else {
-        let s = match unsafe { CStr::from_ptr(matcher_json) }.to_str() {
+        let matcher: Option<TagMatcher> = if matcher_json.is_null() {
+            None
+        } else {
+            let s = match unsafe { CStr::from_ptr(matcher_json) }.to_str() {
+                Ok(s) => s,
+                Err(_) => return std::ptr::null_mut(),
+            };
+            match serde_json::from_str(s) {
+                Ok(m) => Some(m),
+                Err(_) => return std::ptr::null_mut(),
+            }
+        };
+        let group_by_str = match unsafe { CStr::from_ptr(group_by_json) }.to_str() {
             Ok(s) => s,
             Err(_) => return std::ptr::null_mut(),
         };
-        match serde_json::from_str(s) {
-            Ok(m) => Some(m),
+        let group_by: GroupBy = match serde_json::from_str(group_by_str) {
+            Ok(g) => g,
             Err(_) => return std::ptr::null_mut(),
-        }
-    };
-    let group_by_str = match unsafe { CStr::from_ptr(group_by_json) }.to_str() {
-        Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
-    };
-    let group_by: GroupBy = match serde_json::from_str(group_by_str) {
-        Ok(g) => g,
-        Err(_) => return std::ptr::null_mut(),
-    };
-    let agg_str = match unsafe { CStr::from_ptr(aggregation_json) }.to_str() {
-        Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
-    };
-    let agg: Aggregation = match serde_json::from_str(agg_str) {
-        Ok(a) => a,
-        Err(_) => return std::ptr::null_mut(),
-    };
+        };
+        let agg_str = match unsafe { CStr::from_ptr(aggregation_json) }.to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let agg: Aggregation = match serde_json::from_str(agg_str) {
+            Ok(a) => a,
+            Err(_) => return std::ptr::null_mut(),
+        };
 
-    let rows = arc.capability_fold().aggregate(matcher, group_by, agg);
-    // Project to the row shape Go expects.
-    let rows_out: Vec<serde_json::Value> = rows
-        .into_iter()
-        .map(|(bucket, value)| serde_json::json!({"bucket": bucket, "value": value}))
-        .collect();
-    let s = match serde_json::to_string(&rows_out) {
-        Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
-    };
-    match CString::new(s) {
-        Ok(c) => c.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
+        let rows = arc.capability_fold().aggregate(matcher, group_by, agg);
+        // Project to the row shape Go expects.
+        let rows_out: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|(bucket, value)| serde_json::json!({"bucket": bucket, "value": value}))
+            .collect();
+        let s = match serde_json::to_string(&rows_out) {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        match CString::new(s) {
+            Ok(c) => c.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
 }
 
 /// Run `Fold::capacity_ranking` against the publisher's capability
@@ -3179,68 +3432,70 @@ pub extern "C" fn net_capability_capacity_ranking(
     query_json: *const c_char,
     rtt_map_json: *const c_char,
 ) -> *mut c_char {
-    use net::adapter::net::behavior::fold::CapacityQuery;
-    use std::collections::HashMap;
-    use std::ffi::CStr;
+    ffi_guard!(std::ptr::null_mut(), {
+        use net::adapter::net::behavior::fold::CapacityQuery;
+        use std::collections::HashMap;
+        use std::ffi::CStr;
 
-    #[derive(serde::Deserialize)]
-    struct RttEntry {
-        node_id: u64,
-        rtt_ms: u32,
-    }
+        #[derive(serde::Deserialize)]
+        struct RttEntry {
+            node_id: u64,
+            rtt_ms: u32,
+        }
 
-    if mesh_arc.is_null() || query_json.is_null() {
-        return std::ptr::null_mut();
-    }
-    let arc = unsafe { &*mesh_arc };
+        if mesh_arc.is_null() || query_json.is_null() {
+            return std::ptr::null_mut();
+        }
+        let arc = unsafe { &*mesh_arc };
 
-    let query_str = match unsafe { CStr::from_ptr(query_json) }.to_str() {
-        Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
-    };
-    let query: CapacityQuery = match serde_json::from_str(query_str) {
-        Ok(q) => q,
-        Err(_) => return std::ptr::null_mut(),
-    };
-
-    let rtt_map: HashMap<u64, u32> = if rtt_map_json.is_null() {
-        HashMap::new()
-    } else {
-        let s = match unsafe { CStr::from_ptr(rtt_map_json) }.to_str() {
+        let query_str = match unsafe { CStr::from_ptr(query_json) }.to_str() {
             Ok(s) => s,
             Err(_) => return std::ptr::null_mut(),
         };
-        let entries: Vec<RttEntry> = match serde_json::from_str(s) {
-            Ok(v) => v,
+        let query: CapacityQuery = match serde_json::from_str(query_str) {
+            Ok(q) => q,
             Err(_) => return std::ptr::null_mut(),
         };
-        entries.into_iter().map(|e| (e.node_id, e.rtt_ms)).collect()
-    };
 
-    let rows = arc
-        .capability_fold()
-        .capacity_ranking(query, |node_id| rtt_map.get(&node_id).copied());
-    let rows_out: Vec<serde_json::Value> = rows
-        .into_iter()
-        .map(|r| {
-            serde_json::json!({
-                "bucket": r.bucket,
-                "idle": r.idle,
-                "busy": r.busy,
-                "reserved": r.reserved,
-                "available": r.available,
-                "summed_capacity": r.summed_capacity,
+        let rtt_map: HashMap<u64, u32> = if rtt_map_json.is_null() {
+            HashMap::new()
+        } else {
+            let s = match unsafe { CStr::from_ptr(rtt_map_json) }.to_str() {
+                Ok(s) => s,
+                Err(_) => return std::ptr::null_mut(),
+            };
+            let entries: Vec<RttEntry> = match serde_json::from_str(s) {
+                Ok(v) => v,
+                Err(_) => return std::ptr::null_mut(),
+            };
+            entries.into_iter().map(|e| (e.node_id, e.rtt_ms)).collect()
+        };
+
+        let rows = arc
+            .capability_fold()
+            .capacity_ranking(query, |node_id| rtt_map.get(&node_id).copied());
+        let rows_out: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "bucket": r.bucket,
+                    "idle": r.idle,
+                    "busy": r.busy,
+                    "reserved": r.reserved,
+                    "available": r.available,
+                    "summed_capacity": r.summed_capacity,
+                })
             })
-        })
-        .collect();
-    let s = match serde_json::to_string(&rows_out) {
-        Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
-    };
-    match CString::new(s) {
-        Ok(c) => c.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
+            .collect();
+        let s = match serde_json::to_string(&rows_out) {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        match CString::new(s) {
+            Ok(c) => c.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
 }
 
 // =========================================================================

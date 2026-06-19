@@ -225,7 +225,7 @@ fn format_ts_ms(ts_ms: u64) -> String {
     // exported log window's timestamps line up with what the
     // operator saw on the LOGS tab.
     let total_sec = ts_ms / 1_000;
-    let hh = total_sec / 3_600;
+    let hh = (total_sec / 3_600) % 24;
     let mm = (total_sec / 60) % 60;
     let ss = total_sec % 60;
     let ms = ts_ms % 1_000;
@@ -274,5 +274,26 @@ fn format_admin_event(event: &AdminEvent) -> (&'static str, String) {
         ),
         KillMigration { migration } => ("kill_migration", format!("migration=0x{migration:x}")),
         _ => ("unknown", "—".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_ts_ms;
+
+    #[test]
+    fn format_ts_ms_wraps_hours_mod_24() {
+        // 13:45:12.345 on some day far past the epoch. Pre-fix the hour
+        // field rendered the raw epoch hour-count (~494179) instead of a
+        // 24h clock, overflowing the 2-digit field (bug #4).
+        let day = 20_000u64 * 86_400 * 1_000; // 20000 whole days, no intraday remainder
+        let ts = day + (13 * 3_600 + 45 * 60 + 12) * 1_000 + 345;
+        assert_eq!(format_ts_ms(ts), "13:45:12.345");
+    }
+
+    #[test]
+    fn format_ts_ms_midnight_is_zero_hour() {
+        let day = 19_000u64 * 86_400 * 1_000;
+        assert_eq!(format_ts_ms(day), "00:00:00.000");
     }
 }

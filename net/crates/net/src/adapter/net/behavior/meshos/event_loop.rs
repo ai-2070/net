@@ -1553,6 +1553,24 @@ impl MeshOsLoop {
                 super::action::MeshOsAction::ApplyBackoff { daemon, until } => {
                     self.actual.applied_backoffs.insert(daemon.clone(), *until);
                 }
+                super::action::MeshOsAction::MarkAvoid { peer, reason, ttl } => {
+                    // Record the avoided peer so `diff_locality`'s
+                    // idempotence guard (`avoid_list.contains_key`)
+                    // is live: without this writeback no production
+                    // path populates `avoid_list`, so a persistently
+                    // degraded peer would re-emit `MarkAvoid` every
+                    // tick. Same writeback shape as `last_rebalance`
+                    // / `applied_backoffs`. The entry decays via the
+                    // existing Tick `gc_avoid_list` once `until`
+                    // elapses, so a recovered peer is re-evaluated.
+                    self.actual.avoid_list.insert(
+                        *peer,
+                        super::state::AvoidEntry {
+                            reason: reason.clone(),
+                            until: now.checked_add(*ttl).unwrap_or(now),
+                        },
+                    );
+                }
                 _ => {}
             }
         }

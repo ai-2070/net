@@ -430,7 +430,7 @@ func (s *MeshOsDaemonSdk) RegisterDaemon(name string, seed []byte) (*MeshOsDaemo
 	if err := meshosStatusToError(status); err != nil {
 		return nil, err
 	}
-	h := &MeshOsDaemonHandle{ptr: raw}
+	h := newMeshOsDaemonHandle(raw, 0)
 	runtime.SetFinalizer(h, func(h *MeshOsDaemonHandle) { h.Free() })
 	return h, nil
 }
@@ -459,8 +459,25 @@ func (s *MeshOsDaemonSdk) Free() {
 // ---------------------------------------------------------------------------
 
 // MeshOsDaemonHandle is the Go-side handle for a registered daemon.
+//
+// #2: every FFI method brackets its deref of `ptr` with the
+// streamHandleGuard's enter()/leave(), and Free requests teardown via
+// requestFree(). The guard runs the native free EXACTLY ONCE and only
+// after every in-flight op has left, so a concurrent Free() (explicit
+// or via the GC finalizer) can never free the handle out from under a
+// call in flight (the prior check-then-use on `ptr` was a UAF).
+//
+// Unlike an RWMutex, the guard never blocks the free path: Free's
+// requestFree() returns immediately even while a direct, unbounded
+// NextControl(0) is parked in its blocking cgo call (the free is then
+// deferred to when that op leaves). That avoids the lock-across-
+// blocking-call wedge where Free's write lock starved behind a parked
+// receiver. (An uncancellable unbounded NextControl(0) still only
+// returns on an event or shutdown — nothing can wake it early — but it
+// no longer wedges Free.)
 type MeshOsDaemonHandle struct {
 	ptr          *C.NetMeshOsHandle
+	guard        *streamHandleGuard
 	daemonHandle cgo.Handle
 	freeOnce     sync.Once
 	controlOnce  sync.Once
@@ -469,34 +486,71 @@ type MeshOsDaemonHandle struct {
 	pumpDone     chan struct{}
 }
 
+// newMeshOsDaemonHandle wires a registered native handle to a
+// streamHandleGuard whose free closure captures only the raw C pointer
+// and the cgo.Handle (never the owning struct), so the GC finalizer is
+// preserved. cgoHandle may be 0 (the no-Go-callbacks register path).
+func newMeshOsDaemonHandle(raw *C.NetMeshOsHandle, cgoHandle cgo.Handle) *MeshOsDaemonHandle {
+	guard := newStreamHandleGuard(func() {
+		C.net_meshos_handle_free(raw)
+		if cgoHandle != 0 {
+			cgoHandle.Delete()
+		}
+	})
+	return &MeshOsDaemonHandle{ptr: raw, guard: guard, daemonHandle: cgoHandle}
+}
+
+// withReadHandle runs fn against the native handle while registered as
+// an in-flight op on the guard, keeping h alive across the cgo call.
+// Returns false (without calling fn) once teardown has been requested,
+// so a freed handle is never dereferenced. Every FFI deref of `ptr`
+// goes through here: the guard guarantees the native free runs only
+// after this op leaves, so `ptr` is valid for the whole call.
+func (h *MeshOsDaemonHandle) withReadHandle(fn func(ptr *C.NetMeshOsHandle)) bool {
+	if h == nil {
+		return false
+	}
+	if !h.guard.enter() {
+		return false
+	}
+	defer h.guard.leave()
+	fn(h.ptr)
+	runtime.KeepAlive(h)
+	return true
+}
+
 // DaemonID returns the substrate identifier (origin hash). Stable
 // across the handle's lifetime.
 func (h *MeshOsDaemonHandle) DaemonID() uint64 {
-	if h == nil || h.ptr == nil {
-		return 0
-	}
-	return uint64(C.net_meshos_handle_daemon_id(h.ptr))
+	var id uint64
+	h.withReadHandle(func(ptr *C.NetMeshOsHandle) {
+		id = uint64(C.net_meshos_handle_daemon_id(ptr))
+	})
+	return id
 }
 
 // DaemonName returns the daemon's registered name.
 func (h *MeshOsDaemonHandle) DaemonName() string {
-	if h == nil || h.ptr == nil {
-		return ""
-	}
-	if cstr := C.net_meshos_handle_daemon_name(h.ptr); cstr != nil {
-		return C.GoString(cstr)
-	}
-	return ""
+	var name string
+	h.withReadHandle(func(ptr *C.NetMeshOsHandle) {
+		if cstr := C.net_meshos_handle_daemon_name(ptr); cstr != nil {
+			name = C.GoString(cstr)
+		}
+	})
+	return name
 }
 
 // TryNextControl returns the next control event without blocking, or
 // ControlNone if empty.
 func (h *MeshOsDaemonHandle) TryNextControl() (MeshOsDaemonControl, error) {
-	if h == nil || h.ptr == nil {
+	var out C.NetMeshOsDaemonControl
+	var status C.int
+	if !h.withReadHandle(func(ptr *C.NetMeshOsHandle) {
+		status = C.net_meshos_try_next_control(ptr, &out)
+	}) {
 		return MeshOsDaemonControl{}, ErrMeshOsInvalidArg
 	}
-	var out C.NetMeshOsDaemonControl
-	if err := meshosStatusToError(C.net_meshos_try_next_control(h.ptr, &out)); err != nil {
+	if err := meshosStatusToError(status); err != nil {
 		return MeshOsDaemonControl{}, err
 	}
 	return meshosControlFromC(out), nil
@@ -505,11 +559,14 @@ func (h *MeshOsDaemonHandle) TryNextControl() (MeshOsDaemonControl, error) {
 // NextControl blocks until the next control event, the runtime shuts
 // down, or timeoutMs elapses. Pass 0 for unbounded wait.
 func (h *MeshOsDaemonHandle) NextControl(timeoutMs uint64) (MeshOsDaemonControl, error) {
-	if h == nil || h.ptr == nil {
+	var out C.NetMeshOsDaemonControl
+	var status C.int
+	if !h.withReadHandle(func(ptr *C.NetMeshOsHandle) {
+		status = C.net_meshos_next_control(ptr, C.uint64_t(timeoutMs), &out)
+	}) {
 		return MeshOsDaemonControl{}, ErrMeshOsInvalidArg
 	}
-	var out C.NetMeshOsDaemonControl
-	if err := meshosStatusToError(C.net_meshos_next_control(h.ptr, C.uint64_t(timeoutMs), &out)); err != nil {
+	if err := meshosStatusToError(status); err != nil {
 		return MeshOsDaemonControl{}, err
 	}
 	return meshosControlFromC(out), nil
@@ -519,27 +576,39 @@ func (h *MeshOsDaemonHandle) NextControl(timeoutMs uint64) (MeshOsDaemonControl,
 // Non-blocking — surfaces MeshOsSdkError(kind: "queue_full" |
 // "loop_closed") when the substrate's log ring is saturated.
 func (h *MeshOsDaemonHandle) PublishLog(level MeshOsLogLevel, message string) error {
-	if h == nil || h.ptr == nil {
-		return ErrMeshOsInvalidArg
-	}
 	var msgPtr *C.char
 	var msgLen C.size_t
+	// Hoist msgBytes to function scope: msgPtr aliases its backing array
+	// via unsafe.Pointer, which cgo does NOT pin, so it must stay live
+	// (via the KeepAlive below) until the cgo call returns. Scoping it to
+	// the if-block let the GC reclaim it mid-call (cf. PublishCapabilities).
+	var msgBytes []byte
 	if len(message) > 0 {
-		msgBytes := []byte(message)
+		msgBytes = []byte(message)
 		msgPtr = (*C.char)(unsafe.Pointer(&msgBytes[0]))
 		msgLen = C.size_t(len(msgBytes))
 	}
-	return meshosStatusToError(C.net_meshos_publish_log(h.ptr, C.int(level), msgPtr, msgLen))
+	var status C.int
+	if !h.withReadHandle(func(ptr *C.NetMeshOsHandle) {
+		status = C.net_meshos_publish_log(ptr, C.int(level), msgPtr, msgLen)
+	}) {
+		return ErrMeshOsInvalidArg
+	}
+	runtime.KeepAlive(msgBytes)
+	return meshosStatusToError(status)
 }
 
 // GracefulShutdown sends Shutdown { gracePeriodMs }, parks for graceMs,
 // then unregisters. Pass 0 for the substrate default (5 seconds).
 // Consumes the inner handle.
 func (h *MeshOsDaemonHandle) GracefulShutdown(graceMs uint64) error {
-	if h == nil || h.ptr == nil {
+	var status C.int
+	if !h.withReadHandle(func(ptr *C.NetMeshOsHandle) {
+		status = C.net_meshos_graceful_shutdown(ptr, C.uint64_t(graceMs))
+	}) {
 		return ErrMeshOsInvalidArg
 	}
-	return meshosStatusToError(C.net_meshos_graceful_shutdown(h.ptr, C.uint64_t(graceMs)))
+	return meshosStatusToError(status)
 }
 
 // Free releases the handle. Safe to call concurrently and repeatedly.
@@ -549,22 +618,20 @@ func (h *MeshOsDaemonHandle) Free() {
 		return
 	}
 	h.freeOnce.Do(func() {
-		if h.ptr == nil {
-			return
-		}
+		// Stop the ControlEvents pump and wait for it to exit so no
+		// pump op is in flight on the guard before we request teardown.
 		if h.pumpStop != nil {
 			close(h.pumpStop)
 			if h.pumpDone != nil {
 				<-h.pumpDone
 			}
 		}
-		C.net_meshos_handle_free(h.ptr)
-		h.ptr = nil
-		if h.daemonHandle != 0 {
-			h.daemonHandle.Delete()
-			h.daemonHandle = 0
-		}
 		runtime.SetFinalizer(h, nil)
+		// #2: request teardown. requestFree never blocks — it frees now
+		// if idle, otherwise the last in-flight op (e.g. a parked direct
+		// NextControl(0)) runs the free on its way out. The guard's free
+		// closure performs net_meshos_handle_free + cgo.Handle delete.
+		h.guard.requestFree()
 	})
 }
 
@@ -653,7 +720,7 @@ func (s *MeshOsDaemonSdk) RegisterDaemonWithCallbacks(daemon MeshOsDaemon, seed 
 		cgoHandle.Delete()
 		return nil, err
 	}
-	h := &MeshOsDaemonHandle{ptr: raw, daemonHandle: cgoHandle}
+	h := newMeshOsDaemonHandle(raw, cgoHandle)
 	runtime.SetFinalizer(h, func(h *MeshOsDaemonHandle) { h.Free() })
 	return h, nil
 }
@@ -841,10 +908,12 @@ type MeshOsMetadataView struct {
 
 // Metadata returns a fresh snapshot of the daemon's MetadataView.
 func (h *MeshOsDaemonHandle) Metadata() (*MeshOsMetadataView, error) {
-	if h == nil || h.ptr == nil {
+	var raw *C.char
+	if !h.withReadHandle(func(ptr *C.NetMeshOsHandle) {
+		raw = C.net_meshos_metadata(ptr)
+	}) {
 		return nil, ErrMeshOsInvalidArg
 	}
-	raw := C.net_meshos_metadata(h.ptr)
 	if raw == nil {
 		return nil, lastMeshOsError()
 	}
@@ -859,10 +928,12 @@ func (h *MeshOsDaemonHandle) Metadata() (*MeshOsMetadataView, error) {
 
 // RefreshMetadata re-pulls from the runtime's latest snapshot.
 func (h *MeshOsDaemonHandle) RefreshMetadata() (*MeshOsMetadataView, error) {
-	if h == nil || h.ptr == nil {
+	var raw *C.char
+	if !h.withReadHandle(func(ptr *C.NetMeshOsHandle) {
+		raw = C.net_meshos_refresh_metadata(ptr)
+	}) {
 		return nil, ErrMeshOsInvalidArg
 	}
-	raw := C.net_meshos_refresh_metadata(h.ptr)
 	if raw == nil {
 		return nil, lastMeshOsError()
 	}
@@ -881,22 +952,25 @@ func (h *MeshOsDaemonHandle) RefreshMetadata() (*MeshOsMetadataView, error) {
 // binding ships the same stub semantics until the chain-commit path
 // lands.
 func (h *MeshOsDaemonHandle) PublishCapabilities(tags []string) error {
-	if h == nil || h.ptr == nil {
+	var payloadPtr *C.char
+	var payloadLen C.size_t
+	var payload []byte
+	if len(tags) > 0 {
+		var err error
+		payload, err = json.Marshal(tags)
+		if err != nil {
+			return fmt.Errorf("meshos: encode capability tags: %w", err)
+		}
+		payloadPtr = (*C.char)(unsafe.Pointer(&payload[0]))
+		payloadLen = C.size_t(len(payload))
+	}
+	var status C.int
+	if !h.withReadHandle(func(ptr *C.NetMeshOsHandle) {
+		status = C.net_meshos_publish_capabilities(ptr, payloadPtr, payloadLen)
+	}) {
 		return ErrMeshOsInvalidArg
 	}
-	if len(tags) == 0 {
-		status := C.net_meshos_publish_capabilities(h.ptr, nil, 0)
-		return meshosStatusToError(status)
-	}
-	payload, err := json.Marshal(tags)
-	if err != nil {
-		return fmt.Errorf("meshos: encode capability tags: %w", err)
-	}
-	status := C.net_meshos_publish_capabilities(
-		h.ptr,
-		(*C.char)(unsafe.Pointer(&payload[0])),
-		C.size_t(len(payload)),
-	)
+	runtime.KeepAlive(payload)
 	return meshosStatusToError(status)
 }
 

@@ -41,6 +41,7 @@
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -62,6 +63,39 @@ use net::adapter::net::mesh_rpc::{
     RpcStream as InnerRpcStream, ServeHandle as InnerServeHandle,
 };
 use net::adapter::net::MeshNode;
+
+// =========================================================================
+// FFI guard — wraps every entry point in `catch_unwind`
+// =========================================================================
+
+/// Wrap an `extern "C"` body in `catch_unwind` so a panic can never
+/// unwind across the C ABI boundary (which is undefined behavior).
+/// On panic the diagnostic is logged via `eprintln!` (this crate has
+/// no thread-local last-error channel) and `$default` is returned.
+/// Mirrors the `ffi_guard!` macro in the sibling `compute-ffi` /
+/// `meshos-ffi` / `deck-ffi` crates.
+///
+/// Defined ahead of every entry point because `macro_rules!` is
+/// textually scoped — a use before the definition would not resolve.
+macro_rules! ffi_guard {
+    ($default:expr, $body:block) => {{
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| $body));
+        match result {
+            Ok(v) => v,
+            Err(payload) => {
+                let detail = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "panic across FFI boundary".to_string()
+                };
+                eprintln!("net-rpc-ffi: caught panic across FFI boundary: {detail}");
+                $default
+            }
+        }
+    }};
+}
 
 // =========================================================================
 // Error codes
@@ -150,7 +184,7 @@ pub const NET_RPC_ABI_VERSION: u32 = 0x0004;
 /// init and compare against their expected value.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_abi_version() -> u32 {
-    NET_RPC_ABI_VERSION
+    ffi_guard!(0, { NET_RPC_ABI_VERSION })
 }
 
 /// Returns `NET_RPC_OK` (0) iff the running library's ABI version
@@ -160,11 +194,13 @@ pub extern "C" fn net_rpc_abi_version() -> u32 {
 /// when the loaded library is older than the compile-time headers.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_check_abi_version(expected: u32) -> c_int {
-    if NET_RPC_ABI_VERSION >= expected {
-        NET_RPC_OK
-    } else {
-        NET_RPC_ERR_CALL_FAILED
-    }
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        if NET_RPC_ABI_VERSION >= expected {
+            NET_RPC_OK
+        } else {
+            NET_RPC_ERR_CALL_FAILED
+        }
+    })
 }
 
 // =========================================================================
@@ -183,6 +219,28 @@ fn runtime() -> &'static Arc<Runtime> {
                 .expect("failed to construct rpc-ffi tokio runtime"),
         )
     })
+}
+
+/// `block_on(...)` wrapper that aborts on runtime-in-runtime rather
+/// than panicking across the C ABI boundary.
+///
+/// Mirrors `net::ffi::mesh::block_on` / `compute-ffi::block_on`:
+/// calling `Runtime::block_on` from a thread already inside a tokio
+/// runtime panics with "Cannot start a runtime from within a
+/// runtime". These functions are `extern "C"`, so that unwind would
+/// cross the cgo boundary into Go — undefined behavior. The check
+/// costs one TLS lookup (`Handle::try_current`) per call; a
+/// contract-violating embedded-Rust caller gets a clean abort with a
+/// diagnosable message instead of UB.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        eprintln!(
+            "FATAL: rpc FFI called from inside a tokio runtime context; \
+             aborting to avoid runtime-in-runtime panic across the FFI boundary"
+        );
+        std::process::abort();
+    }
+    runtime().block_on(future)
 }
 
 /// Monotonic counter for `MeshRpcHandle::rpc_id`. Starts at 1 so
@@ -215,10 +273,12 @@ static NEXT_HANDLER_ID: AtomicU64 = AtomicU64::new(1);
 // doesn't fail `cargo doc -D warnings`.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_reserve_cancel_token(handle: *mut MeshRpcHandle) -> u64 {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return 0;
-    };
-    h.node.reserve_cancel_token()
+    ffi_guard!(0, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return 0;
+        };
+        h.node.reserve_cancel_token()
+    })
 }
 
 /// Signal cancellation for `token`. Idempotent; no-op if `token`
@@ -249,10 +309,12 @@ pub extern "C" fn net_rpc_reserve_cancel_token(handle: *mut MeshRpcHandle) -> u6
 // doesn't fail `cargo doc -D warnings`.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_cancel_call(handle: *mut MeshRpcHandle, token: u64) {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return;
-    };
-    h.node.cancel(token);
+    ffi_guard!((), {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return;
+        };
+        h.node.cancel(token);
+    })
 }
 
 // =========================================================================
@@ -265,8 +327,37 @@ fn cstr_to_string(ptr: *const c_char, len: usize) -> Option<String> {
     if ptr.is_null() {
         return None;
     }
+    // `slice::from_raw_parts` requires `len <= isize::MAX`; a C caller
+    // passing `(size_t)-1` is immediate UB. Reject defensively, as the
+    // core `ffi/mod.rs` and the sibling `compute-ffi` do at every such
+    // site. Treated as invalid input (returns `None`).
+    if len > isize::MAX as usize {
+        return None;
+    }
     let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
     std::str::from_utf8(bytes).ok().map(|s| s.to_string())
+}
+
+/// Copy a `(ptr, len)` C body buffer into `Bytes`, treating a NULL
+/// pointer as the empty body. Returns `None` when `len > isize::MAX`
+/// (a `slice::from_raw_parts` precondition violation — `(size_t)-1`
+/// from C would be immediate UB). Callers map `None` to their natural
+/// invalid-arg return code, mirroring the sibling `compute-ffi` guard
+/// discipline at every `from_raw_parts` site.
+///
+/// # Safety
+///
+/// `ptr` must point to at least `len` readable bytes when non-NULL.
+unsafe fn copy_body(ptr: *const u8, len: usize) -> Option<Bytes> {
+    if ptr.is_null() {
+        return Some(Bytes::new());
+    }
+    if len > isize::MAX as usize {
+        return None;
+    }
+    Some(Bytes::copy_from_slice(unsafe {
+        std::slice::from_raw_parts(ptr, len)
+    }))
 }
 
 /// Set `*out_err` to a heap-allocated CString containing
@@ -395,7 +486,9 @@ static DISPATCHER: OnceLock<RpcHandlerFn> = OnceLock::new();
 /// The Go binding calls this once during package init.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_set_handler_dispatcher(dispatcher: RpcHandlerFn) {
-    let _ = DISPATCHER.set(dispatcher);
+    ffi_guard!((), {
+        let _ = DISPATCHER.set(dispatcher);
+    })
 }
 
 /// `RpcHandler` impl that bridges to the Go-side dispatcher.
@@ -445,6 +538,14 @@ impl RpcHandler for GoRpcHandler {
                 if code == NET_RPC_OK {
                     if resp_ptr.is_null() {
                         return Ok(Vec::new());
+                    }
+                    // `slice::from_raw_parts` requires `len <=
+                    // isize::MAX`; a buggy Go dispatcher reporting an
+                    // oversized `resp_len` would be UB. Free the
+                    // Go-allocated buffer and surface a clean error.
+                    if resp_len > isize::MAX as usize {
+                        unsafe { libc::free(resp_ptr as *mut libc::c_void) };
+                        return Err("Go handler response length exceeds isize::MAX".to_string());
                     }
                     // Copy the Go-allocated response bytes into a
                     // Rust-owned Vec so the lifetime is decoupled
@@ -510,12 +611,14 @@ const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(60);
 /// (e.g. structured error detail). Idempotent on NULL.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_free_cstring(s: *mut c_char) {
-    if s.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = CString::from_raw(s);
-    }
+    ffi_guard!((), {
+        if s.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = CString::from_raw(s);
+        }
+    })
 }
 
 /// Free a buffer of `len` u8s previously returned out-of-band by
@@ -530,12 +633,14 @@ pub extern "C" fn net_rpc_free_cstring(s: *mut c_char) {
 /// `Box<[u8]>` and drops it.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_response_free(ptr: *mut u8, len: usize) {
-    if ptr.is_null() || len == 0 {
-        return;
-    }
-    unsafe {
-        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)));
-    }
+    ffi_guard!((), {
+        if ptr.is_null() || len == 0 {
+            return;
+        }
+        unsafe {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)));
+        }
+    })
 }
 
 /// Free an array of u64 node ids previously returned by
@@ -545,12 +650,14 @@ pub extern "C" fn net_rpc_response_free(ptr: *mut u8, len: usize) {
 /// [`net_rpc_response_free`] — see its doc.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_find_service_nodes_free(ptr: *mut u64, len: usize) {
-    if ptr.is_null() || len == 0 {
-        return;
-    }
-    unsafe {
-        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)));
-    }
+    ffi_guard!((), {
+        if ptr.is_null() || len == 0 {
+            return;
+        }
+        unsafe {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)));
+        }
+    })
 }
 
 // =========================================================================
@@ -577,33 +684,39 @@ pub struct MeshRpcHandle {
 /// Returns NULL on NULL input.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_new(node_arc: *mut Arc<MeshNode>) -> *mut MeshRpcHandle {
-    if node_arc.is_null() {
-        return std::ptr::null_mut();
-    }
-    let node = unsafe { *Box::from_raw(node_arc) };
-    let rpc_id = NEXT_RPC_ID.fetch_add(1, Ordering::Relaxed);
-    Box::into_raw(Box::new(MeshRpcHandle { node, rpc_id }))
+    ffi_guard!(std::ptr::null_mut(), {
+        if node_arc.is_null() {
+            return std::ptr::null_mut();
+        }
+        let node = unsafe { *Box::from_raw(node_arc) };
+        let rpc_id = NEXT_RPC_ID.fetch_add(1, Ordering::Relaxed);
+        Box::into_raw(Box::new(MeshRpcHandle { node, rpc_id }))
+    })
 }
 
 /// Free a MeshRpc handle. The underlying MeshNode stays alive so
 /// long as another `Arc` to it is held. Idempotent on NULL.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_free(handle: *mut MeshRpcHandle) {
-    if handle.is_null() {
-        return;
-    }
-    unsafe {
-        drop(Box::from_raw(handle));
-    }
+    ffi_guard!((), {
+        if handle.is_null() {
+            return;
+        }
+        unsafe {
+            drop(Box::from_raw(handle));
+        }
+    })
 }
 
 /// Diagnostic accessor: monotonic id of this MeshRpc.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_id(handle: *const MeshRpcHandle) -> u64 {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return 0;
-    };
-    h.rpc_id
+    ffi_guard!(0, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return 0;
+        };
+        h.rpc_id
+    })
 }
 
 // =========================================================================
@@ -661,10 +774,21 @@ unsafe fn collect_headers(
         // every header.
         return None;
     }
+    // `slice::from_raw_parts` requires the element count's byte span to
+    // fit `isize::MAX`. `NetRpcHeader` is >1 byte, so guard on the
+    // count itself (a stricter, sound bound). Same discipline as the
+    // sibling `compute-ffi` / core ffi.
+    if header_count > isize::MAX as usize {
+        return None;
+    }
     let slice = unsafe { std::slice::from_raw_parts(headers_ptr, header_count) };
     let mut out = Vec::with_capacity(header_count);
     for h in slice {
         if h.name_ptr.is_null() {
+            return None;
+        }
+        // Per-field `isize::MAX` guard before each `from_raw_parts`.
+        if h.name_len > isize::MAX as usize || h.value_len > isize::MAX as usize {
             return None;
         }
         let name_bytes = unsafe { std::slice::from_raw_parts(h.name_ptr as *const u8, h.name_len) };
@@ -725,37 +849,38 @@ pub extern "C" fn net_rpc_call(
     out_resp_len: *mut usize,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    let Some(service) = cstr_to_string(service_ptr, service_len) else {
-        write_err(out_err, "service name is NULL or non-UTF-8".into());
-        return NET_RPC_ERR_INVALID_UTF8;
-    };
-    let req_bytes = if req_ptr.is_null() {
-        Bytes::new()
-    } else {
-        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
-    };
-    let mut opts = build_call_options(deadline_ms);
-    if cancel_token != 0 {
-        opts.cancel_token = Some(cancel_token);
-    }
-    let node = h.node.clone();
-
-    let result = runtime()
-        .block_on(async move { node.call(target_node_id, &service, req_bytes, opts).await });
-
-    match result {
-        Ok(reply) => {
-            write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
-            NET_RPC_OK
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_RPC_ERR_INVALID_UTF8;
+        };
+        let Some(req_bytes) = (unsafe { copy_body(req_ptr, req_len) }) else {
+            write_err(out_err, "request body length exceeds isize::MAX".into());
+            return NET_RPC_ERR_NULL;
+        };
+        let mut opts = build_call_options(deadline_ms);
+        if cancel_token != 0 {
+            opts.cancel_token = Some(cancel_token);
         }
-        Err(e) => {
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
+        let node = h.node.clone();
+
+        let result =
+            block_on(async move { node.call(target_node_id, &service, req_bytes, opts).await });
+
+        match result {
+            Ok(reply) => {
+                write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
+                NET_RPC_OK
+            }
+            Err(e) => {
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
         }
-    }
+    })
 }
 
 /// Service-discovery unary call. Same semantics as
@@ -775,37 +900,37 @@ pub extern "C" fn net_rpc_call_service(
     out_resp_len: *mut usize,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    let Some(service) = cstr_to_string(service_ptr, service_len) else {
-        write_err(out_err, "service name is NULL or non-UTF-8".into());
-        return NET_RPC_ERR_INVALID_UTF8;
-    };
-    let req_bytes = if req_ptr.is_null() {
-        Bytes::new()
-    } else {
-        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
-    };
-    let mut opts = build_call_options(deadline_ms);
-    if cancel_token != 0 {
-        opts.cancel_token = Some(cancel_token);
-    }
-    let node = h.node.clone();
-
-    let result =
-        runtime().block_on(async move { node.call_service(&service, req_bytes, opts).await });
-
-    match result {
-        Ok(reply) => {
-            write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
-            NET_RPC_OK
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_RPC_ERR_INVALID_UTF8;
+        };
+        let Some(req_bytes) = (unsafe { copy_body(req_ptr, req_len) }) else {
+            write_err(out_err, "request body length exceeds isize::MAX".into());
+            return NET_RPC_ERR_NULL;
+        };
+        let mut opts = build_call_options(deadline_ms);
+        if cancel_token != 0 {
+            opts.cancel_token = Some(cancel_token);
         }
-        Err(e) => {
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
+        let node = h.node.clone();
+
+        let result = block_on(async move { node.call_service(&service, req_bytes, opts).await });
+
+        match result {
+            Ok(reply) => {
+                write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
+                NET_RPC_OK
+            }
+            Err(e) => {
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
         }
-    }
+    })
 }
 
 /// Hand a `Vec<u8>` to the Go caller as a raw pointer + length.
@@ -819,6 +944,14 @@ pub extern "C" fn net_rpc_call_service(
 /// slices have an exact `(ptr, len)` representation; the matching
 /// free reconstructs `Box<[u8]>` directly.
 fn write_response(body: Vec<u8>, out_ptr: *mut *mut u8, out_len: *mut usize) {
+    // Null-check both out-params before writing, matching `write_err`
+    // (~275) and the core ffi. A NULL out-param is a caller contract
+    // violation; rather than dereference it (UB), we drop `body` here
+    // (no leak — `body` is owned and freed on return) and write
+    // nothing.
+    if out_ptr.is_null() || out_len.is_null() {
+        return;
+    }
     let boxed: Box<[u8]> = body.into_boxed_slice();
     let len = boxed.len();
     let ptr = Box::into_raw(boxed) as *mut u8;
@@ -846,32 +979,41 @@ pub extern "C" fn net_rpc_find_service_nodes(
     out_count: *mut usize,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    let Some(service) = cstr_to_string(service_ptr, service_len) else {
-        write_err(out_err, "service name is NULL or non-UTF-8".into());
-        return NET_RPC_ERR_INVALID_UTF8;
-    };
-    let nodes = h.node.find_service_nodes(&service);
-    if nodes.is_empty() {
-        unsafe {
-            *out_ptr = std::ptr::null_mut();
-            *out_count = 0;
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_RPC_ERR_INVALID_UTF8;
+        };
+        // Null-check the out-params before writing through them, matching
+        // `write_err` (~275) and the core ffi. A NULL out-param is a
+        // caller contract violation, not a crash site.
+        if out_ptr.is_null() || out_count.is_null() {
+            write_err(out_err, "out_ptr / out_count is NULL".into());
+            return NET_RPC_ERR_NULL;
         }
-        return NET_RPC_OK;
-    }
-    // Same boxed-slice discipline as `write_response` — `cap ==
-    // len` exactly, no `shrink_to_fit` best-effort hazard. The
-    // matching free is `net_rpc_find_service_nodes_free`.
-    let boxed: Box<[u64]> = nodes.into_boxed_slice();
-    let count = boxed.len();
-    let ptr = Box::into_raw(boxed) as *mut u64;
-    unsafe {
-        *out_ptr = ptr;
-        *out_count = count;
-    }
-    NET_RPC_OK
+        let nodes = h.node.find_service_nodes(&service);
+        if nodes.is_empty() {
+            unsafe {
+                *out_ptr = std::ptr::null_mut();
+                *out_count = 0;
+            }
+            return NET_RPC_OK;
+        }
+        // Same boxed-slice discipline as `write_response` — `cap ==
+        // len` exactly, no `shrink_to_fit` best-effort hazard. The
+        // matching free is `net_rpc_find_service_nodes_free`.
+        let boxed: Box<[u64]> = nodes.into_boxed_slice();
+        let count = boxed.len();
+        let ptr = Box::into_raw(boxed) as *mut u64;
+        unsafe {
+            *out_ptr = ptr;
+            *out_count = count;
+        }
+        NET_RPC_OK
+    })
 }
 
 // =========================================================================
@@ -904,7 +1046,7 @@ pub struct ServeHandleC {
 /// unused reservation is harmless (no cleanup required).
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_reserve_handler_id() -> u64 {
-    NEXT_HANDLER_ID.fetch_add(1, Ordering::Relaxed)
+    ffi_guard!(0, { NEXT_HANDLER_ID.fetch_add(1, Ordering::Relaxed) })
 }
 
 /// Register a handler for `service`. The caller passes a
@@ -934,60 +1076,64 @@ pub extern "C" fn net_rpc_serve(
     handler_timeout_ms: u64,
     out_err: *mut *mut c_char,
 ) -> *mut ServeHandleC {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        write_err(out_err, "MeshRpc handle is NULL".into());
-        return std::ptr::null_mut();
-    };
-    let Some(service) = cstr_to_string(service_ptr, service_len) else {
-        write_err(out_err, "service name is NULL or non-UTF-8".into());
-        return std::ptr::null_mut();
-    };
-    if DISPATCHER.get().is_none() {
-        write_err(
-            out_err,
-            "net_rpc_set_handler_dispatcher must be called before net_rpc_serve".into(),
-        );
-        return std::ptr::null_mut();
-    }
-    if handler_id == 0 {
-        write_err(
-            out_err,
-            "handler_id must be non-zero (reserve via net_rpc_reserve_handler_id)".into(),
-        );
-        return std::ptr::null_mut();
-    }
-    let timeout = if handler_timeout_ms == 0 {
-        DEFAULT_HANDLER_TIMEOUT
-    } else {
-        Duration::from_millis(handler_timeout_ms)
-    };
-    let rust_handler = Arc::new(GoRpcHandler {
-        handler_id,
-        timeout,
-    });
-    match h.node.serve_rpc(&service, rust_handler) {
-        Ok(inner) => Box::into_raw(Box::new(ServeHandleC {
-            inner: Arc::new(Mutex::new(Some(inner))),
-            handler_id,
-        })),
-        Err(e) => {
-            // `e.to_string()` includes the serve-error variant
-            // name; the Go side does prefix matching to surface
-            // a typed `ErrAlreadyServing` for the
-            // `ServeError::AlreadyServing` case.
-            write_err(out_err, format!("serve failed: {e}"));
-            std::ptr::null_mut()
+    ffi_guard!(std::ptr::null_mut(), {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            write_err(out_err, "MeshRpc handle is NULL".into());
+            return std::ptr::null_mut();
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return std::ptr::null_mut();
+        };
+        if DISPATCHER.get().is_none() {
+            write_err(
+                out_err,
+                "net_rpc_set_handler_dispatcher must be called before net_rpc_serve".into(),
+            );
+            return std::ptr::null_mut();
         }
-    }
+        if handler_id == 0 {
+            write_err(
+                out_err,
+                "handler_id must be non-zero (reserve via net_rpc_reserve_handler_id)".into(),
+            );
+            return std::ptr::null_mut();
+        }
+        let timeout = if handler_timeout_ms == 0 {
+            DEFAULT_HANDLER_TIMEOUT
+        } else {
+            Duration::from_millis(handler_timeout_ms)
+        };
+        let rust_handler = Arc::new(GoRpcHandler {
+            handler_id,
+            timeout,
+        });
+        match h.node.serve_rpc(&service, rust_handler) {
+            Ok(inner) => Box::into_raw(Box::new(ServeHandleC {
+                inner: Arc::new(Mutex::new(Some(inner))),
+                handler_id,
+            })),
+            Err(e) => {
+                // `e.to_string()` includes the serve-error variant
+                // name; the Go side does prefix matching to surface
+                // a typed `ErrAlreadyServing` for the
+                // `ServeError::AlreadyServing` case.
+                write_err(out_err, format!("serve failed: {e}"));
+                std::ptr::null_mut()
+            }
+        }
+    })
 }
 
 /// Diagnostic accessor: handler_id of this ServeHandle.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_serve_handle_id(handle: *const ServeHandleC) -> u64 {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return 0;
-    };
-    h.handler_id
+    ffi_guard!(0, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return 0;
+        };
+        h.handler_id
+    })
 }
 
 /// Unregister the service. Idempotent — repeated calls are
@@ -995,22 +1141,26 @@ pub extern "C" fn net_rpc_serve_handle_id(handle: *const ServeHandleC) -> u64 {
 /// requests will be dispatched.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_serve_handle_close(handle: *mut ServeHandleC) {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return;
-    };
-    let _ = h.inner.lock().take();
+    ffi_guard!((), {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return;
+        };
+        let _ = h.inner.lock().take();
+    })
 }
 
 /// Free the ServeHandle. Implicitly closes if not already
 /// closed. Idempotent on NULL.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_serve_handle_free(handle: *mut ServeHandleC) {
-    if handle.is_null() {
-        return;
-    }
-    unsafe {
-        drop(Box::from_raw(handle));
-    }
+    ffi_guard!((), {
+        if handle.is_null() {
+            return;
+        }
+        unsafe {
+            drop(Box::from_raw(handle));
+        }
+    })
 }
 
 // =========================================================================
@@ -1060,47 +1210,48 @@ pub extern "C" fn net_rpc_call_streaming(
     out_stream: *mut *mut RpcStreamHandleC,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    let Some(service) = cstr_to_string(service_ptr, service_len) else {
-        write_err(out_err, "service name is NULL or non-UTF-8".into());
-        return NET_RPC_ERR_INVALID_UTF8;
-    };
-    let req_bytes = if req_ptr.is_null() {
-        Bytes::new()
-    } else {
-        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
-    };
-    let mut opts = build_call_options(deadline_ms);
-    if stream_window > 0 {
-        opts.stream_window_initial = Some(stream_window);
-    }
-    let node = h.node.clone();
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_RPC_ERR_INVALID_UTF8;
+        };
+        let Some(req_bytes) = (unsafe { copy_body(req_ptr, req_len) }) else {
+            write_err(out_err, "request body length exceeds isize::MAX".into());
+            return NET_RPC_ERR_NULL;
+        };
+        let mut opts = build_call_options(deadline_ms);
+        if stream_window > 0 {
+            opts.stream_window_initial = Some(stream_window);
+        }
+        let node = h.node.clone();
 
-    let result = runtime().block_on(async move {
-        node.call_streaming(target_node_id, &service, req_bytes, opts)
-            .await
-    });
+        let result = block_on(async move {
+            node.call_streaming(target_node_id, &service, req_bytes, opts)
+                .await
+        });
 
-    match result {
-        Ok(stream) => {
-            let call_id = stream.call_id();
-            let boxed = Box::new(RpcStreamHandleC {
-                inner: Arc::new(Mutex::new(Some(stream))),
-                call_id,
-                done: AtomicBool::new(false),
-            });
-            unsafe {
-                *out_stream = Box::into_raw(boxed);
+        match result {
+            Ok(stream) => {
+                let call_id = stream.call_id();
+                let boxed = Box::new(RpcStreamHandleC {
+                    inner: Arc::new(Mutex::new(Some(stream))),
+                    call_id,
+                    done: AtomicBool::new(false),
+                });
+                unsafe {
+                    *out_stream = Box::into_raw(boxed);
+                }
+                NET_RPC_OK
             }
-            NET_RPC_OK
+            Err(e) => {
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
         }
-        Err(e) => {
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-    }
+    })
 }
 
 /// N-16: cancellable variant of [`net_rpc_call_streaming`].
@@ -1131,50 +1282,51 @@ pub extern "C" fn net_rpc_call_streaming_cancellable(
     out_stream: *mut *mut RpcStreamHandleC,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    let Some(service) = cstr_to_string(service_ptr, service_len) else {
-        write_err(out_err, "service name is NULL or non-UTF-8".into());
-        return NET_RPC_ERR_INVALID_UTF8;
-    };
-    let req_bytes = if req_ptr.is_null() {
-        Bytes::new()
-    } else {
-        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
-    };
-    let mut opts = build_call_options(deadline_ms);
-    if stream_window > 0 {
-        opts.stream_window_initial = Some(stream_window);
-    }
-    if cancel_token != 0 {
-        opts.cancel_token = Some(cancel_token);
-    }
-    let node = h.node.clone();
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_RPC_ERR_INVALID_UTF8;
+        };
+        let Some(req_bytes) = (unsafe { copy_body(req_ptr, req_len) }) else {
+            write_err(out_err, "request body length exceeds isize::MAX".into());
+            return NET_RPC_ERR_NULL;
+        };
+        let mut opts = build_call_options(deadline_ms);
+        if stream_window > 0 {
+            opts.stream_window_initial = Some(stream_window);
+        }
+        if cancel_token != 0 {
+            opts.cancel_token = Some(cancel_token);
+        }
+        let node = h.node.clone();
 
-    let result = runtime().block_on(async move {
-        node.call_streaming(target_node_id, &service, req_bytes, opts)
-            .await
-    });
+        let result = block_on(async move {
+            node.call_streaming(target_node_id, &service, req_bytes, opts)
+                .await
+        });
 
-    match result {
-        Ok(stream) => {
-            let call_id = stream.call_id();
-            let boxed = Box::new(RpcStreamHandleC {
-                inner: Arc::new(Mutex::new(Some(stream))),
-                call_id,
-                done: AtomicBool::new(false),
-            });
-            unsafe {
-                *out_stream = Box::into_raw(boxed);
+        match result {
+            Ok(stream) => {
+                let call_id = stream.call_id();
+                let boxed = Box::new(RpcStreamHandleC {
+                    inner: Arc::new(Mutex::new(Some(stream))),
+                    call_id,
+                    done: AtomicBool::new(false),
+                });
+                unsafe {
+                    *out_stream = Box::into_raw(boxed);
+                }
+                NET_RPC_OK
             }
-            NET_RPC_OK
+            Err(e) => {
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
         }
-        Err(e) => {
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-    }
+    })
 }
 
 /// Capability-routed streaming call. Mirrors
@@ -1200,48 +1352,49 @@ pub extern "C" fn net_rpc_call_service_streaming(
     out_stream: *mut *mut RpcStreamHandleC,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    let Some(service) = cstr_to_string(service_ptr, service_len) else {
-        write_err(out_err, "service name is NULL or non-UTF-8".into());
-        return NET_RPC_ERR_INVALID_UTF8;
-    };
-    let req_bytes = if req_ptr.is_null() {
-        Bytes::new()
-    } else {
-        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
-    };
-    let mut opts = build_call_options(deadline_ms);
-    if stream_window > 0 {
-        opts.stream_window_initial = Some(stream_window);
-    }
-    if cancel_token != 0 {
-        opts.cancel_token = Some(cancel_token);
-    }
-    let node = h.node.clone();
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_RPC_ERR_INVALID_UTF8;
+        };
+        let Some(req_bytes) = (unsafe { copy_body(req_ptr, req_len) }) else {
+            write_err(out_err, "request body length exceeds isize::MAX".into());
+            return NET_RPC_ERR_NULL;
+        };
+        let mut opts = build_call_options(deadline_ms);
+        if stream_window > 0 {
+            opts.stream_window_initial = Some(stream_window);
+        }
+        if cancel_token != 0 {
+            opts.cancel_token = Some(cancel_token);
+        }
+        let node = h.node.clone();
 
-    let result = runtime()
-        .block_on(async move { node.call_service_streaming(&service, req_bytes, opts).await });
+        let result =
+            block_on(async move { node.call_service_streaming(&service, req_bytes, opts).await });
 
-    match result {
-        Ok(stream) => {
-            let call_id = stream.call_id();
-            let boxed = Box::new(RpcStreamHandleC {
-                inner: Arc::new(Mutex::new(Some(stream))),
-                call_id,
-                done: AtomicBool::new(false),
-            });
-            unsafe {
-                *out_stream = Box::into_raw(boxed);
+        match result {
+            Ok(stream) => {
+                let call_id = stream.call_id();
+                let boxed = Box::new(RpcStreamHandleC {
+                    inner: Arc::new(Mutex::new(Some(stream))),
+                    call_id,
+                    done: AtomicBool::new(false),
+                });
+                unsafe {
+                    *out_stream = Box::into_raw(boxed);
+                }
+                NET_RPC_OK
             }
-            NET_RPC_OK
+            Err(e) => {
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
         }
-        Err(e) => {
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-    }
+    })
 }
 
 /// Block until the next chunk arrives, OR the stream terminates,
@@ -1266,62 +1419,64 @@ pub extern "C" fn net_rpc_stream_next(
     out_chunk_len: *mut usize,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(s) = (unsafe { stream.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    if s.done.load(Ordering::Relaxed) {
-        unsafe {
-            *out_chunk_ptr = std::ptr::null_mut();
-            *out_chunk_len = 0;
-        }
-        return NET_RPC_ERR_STREAM_DONE;
-    }
-    // Take the inner stream out of the mutex while we await — so
-    // a concurrent `close()` (which `take()`s) can race us cleanly
-    // by either taking ownership before us (we observe `None`,
-    // return STREAM_DONE) or after us (we put the stream back; the
-    // next close() takes it then).
-    let inner_opt = s.inner.lock().take();
-    let mut inner = match inner_opt {
-        Some(i) => i,
-        None => {
-            s.done.store(true, Ordering::Relaxed);
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(s) = (unsafe { stream.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        if s.done.load(Ordering::Relaxed) {
             unsafe {
                 *out_chunk_ptr = std::ptr::null_mut();
                 *out_chunk_len = 0;
             }
             return NET_RPC_ERR_STREAM_DONE;
         }
-    };
-    let result = runtime().block_on(async { inner.next().await });
-    match result {
-        Some(Ok(chunk)) => {
-            // Put the stream back so subsequent `next()` polls keep
-            // going.
-            *s.inner.lock() = Some(inner);
-            write_response(chunk.to_vec(), out_chunk_ptr, out_chunk_len);
-            NET_RPC_OK
-        }
-        Some(Err(e)) => {
-            // Mid-stream error — the SDK guarantees no further items.
-            // Drop the inner (firing CANCEL is unnecessary since the
-            // server already terminated us) and latch done.
-            drop(inner);
-            s.done.store(true, Ordering::Relaxed);
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-        None => {
-            // Clean end. Drop the inner and latch done.
-            drop(inner);
-            s.done.store(true, Ordering::Relaxed);
-            unsafe {
-                *out_chunk_ptr = std::ptr::null_mut();
-                *out_chunk_len = 0;
+        // Take the inner stream out of the mutex while we await — so
+        // a concurrent `close()` (which `take()`s) can race us cleanly
+        // by either taking ownership before us (we observe `None`,
+        // return STREAM_DONE) or after us (we put the stream back; the
+        // next close() takes it then).
+        let inner_opt = s.inner.lock().take();
+        let mut inner = match inner_opt {
+            Some(i) => i,
+            None => {
+                s.done.store(true, Ordering::Relaxed);
+                unsafe {
+                    *out_chunk_ptr = std::ptr::null_mut();
+                    *out_chunk_len = 0;
+                }
+                return NET_RPC_ERR_STREAM_DONE;
             }
-            NET_RPC_ERR_STREAM_DONE
+        };
+        let result = block_on(async { inner.next().await });
+        match result {
+            Some(Ok(chunk)) => {
+                // Put the stream back so subsequent `next()` polls keep
+                // going.
+                *s.inner.lock() = Some(inner);
+                write_response(chunk.to_vec(), out_chunk_ptr, out_chunk_len);
+                NET_RPC_OK
+            }
+            Some(Err(e)) => {
+                // Mid-stream error — the SDK guarantees no further items.
+                // Drop the inner (firing CANCEL is unnecessary since the
+                // server already terminated us) and latch done.
+                drop(inner);
+                s.done.store(true, Ordering::Relaxed);
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
+            None => {
+                // Clean end. Drop the inner and latch done.
+                drop(inner);
+                s.done.store(true, Ordering::Relaxed);
+                unsafe {
+                    *out_chunk_ptr = std::ptr::null_mut();
+                    *out_chunk_len = 0;
+                }
+                NET_RPC_ERR_STREAM_DONE
+            }
         }
-    }
+    })
 }
 
 /// Explicitly grant `amount` more credits to the server's pump.
@@ -1329,26 +1484,30 @@ pub extern "C" fn net_rpc_stream_next(
 /// stream is already done. See `RpcStream::grant` for semantics.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_stream_grant(stream: *mut RpcStreamHandleC, amount: u32) -> c_int {
-    let Some(s) = (unsafe { stream.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    if s.done.load(Ordering::Relaxed) || amount == 0 {
-        return NET_RPC_OK;
-    }
-    let guard = s.inner.lock();
-    if let Some(inner) = guard.as_ref() {
-        inner.grant(amount);
-    }
-    NET_RPC_OK
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(s) = (unsafe { stream.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        if s.done.load(Ordering::Relaxed) || amount == 0 {
+            return NET_RPC_OK;
+        }
+        let guard = s.inner.lock();
+        if let Some(inner) = guard.as_ref() {
+            inner.grant(amount);
+        }
+        NET_RPC_OK
+    })
 }
 
 /// Diagnostic accessor: server-assigned call_id for this stream.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_stream_call_id(stream: *const RpcStreamHandleC) -> u64 {
-    let Some(s) = (unsafe { stream.as_ref() }) else {
-        return 0;
-    };
-    s.call_id
+    ffi_guard!(0, {
+        let Some(s) = (unsafe { stream.as_ref() }) else {
+            return 0;
+        };
+        s.call_id
+    })
 }
 
 /// Cancel the stream (best-effort CANCEL via the SDK's Drop impl)
@@ -1356,23 +1515,27 @@ pub extern "C" fn net_rpc_stream_call_id(stream: *const RpcStreamHandleC) -> u64
 /// Subsequent `next()` calls return `NET_RPC_ERR_STREAM_DONE`.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_stream_close(stream: *mut RpcStreamHandleC) {
-    let Some(s) = (unsafe { stream.as_ref() }) else {
-        return;
-    };
-    s.done.store(true, Ordering::Relaxed);
-    let _ = s.inner.lock().take();
+    ffi_guard!((), {
+        let Some(s) = (unsafe { stream.as_ref() }) else {
+            return;
+        };
+        s.done.store(true, Ordering::Relaxed);
+        let _ = s.inner.lock().take();
+    })
 }
 
 /// Free the stream handle. Implicitly closes if not already
 /// closed. Idempotent on NULL.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_stream_free(stream: *mut RpcStreamHandleC) {
-    if stream.is_null() {
-        return;
-    }
-    unsafe {
-        drop(Box::from_raw(stream));
-    }
+    ffi_guard!((), {
+        if stream.is_null() {
+            return;
+        }
+        unsafe {
+            drop(Box::from_raw(stream));
+        }
+    })
 }
 
 // =========================================================================
@@ -1441,40 +1604,42 @@ pub extern "C" fn net_rpc_call_client_stream(
     out_handle: *mut *mut ClientStreamCallHandleC,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    let Some(service) = cstr_to_string(service_ptr, service_len) else {
-        write_err(out_err, "service name is NULL or non-UTF-8".into());
-        return NET_RPC_ERR_INVALID_UTF8;
-    };
-    let mut opts = build_call_options(deadline_ms);
-    if request_window > 0 {
-        opts.request_window_initial = Some(request_window);
-    }
-    let node = h.node.clone();
-    let result = runtime().block_on(async move {
-        node.call_client_stream(target_node_id, &service, opts)
-            .await
-    });
-    match result {
-        Ok(call) => {
-            let call_id = call.call_id();
-            let boxed = Box::new(ClientStreamCallHandleC {
-                inner: Arc::new(Mutex::new(Some(call))),
-                call_id,
-                done: AtomicBool::new(false),
-            });
-            unsafe {
-                *out_handle = Box::into_raw(boxed);
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_RPC_ERR_INVALID_UTF8;
+        };
+        let mut opts = build_call_options(deadline_ms);
+        if request_window > 0 {
+            opts.request_window_initial = Some(request_window);
+        }
+        let node = h.node.clone();
+        let result = block_on(async move {
+            node.call_client_stream(target_node_id, &service, opts)
+                .await
+        });
+        match result {
+            Ok(call) => {
+                let call_id = call.call_id();
+                let boxed = Box::new(ClientStreamCallHandleC {
+                    inner: Arc::new(Mutex::new(Some(call))),
+                    call_id,
+                    done: AtomicBool::new(false),
+                });
+                unsafe {
+                    *out_handle = Box::into_raw(boxed);
+                }
+                NET_RPC_OK
             }
-            NET_RPC_OK
+            Err(e) => {
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
         }
-        Err(e) => {
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-    }
+    })
 }
 
 /// Cancellable variant of [`net_rpc_call_client_stream`].
@@ -1498,43 +1663,45 @@ pub extern "C" fn net_rpc_call_client_stream_cancellable(
     out_handle: *mut *mut ClientStreamCallHandleC,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    let Some(service) = cstr_to_string(service_ptr, service_len) else {
-        write_err(out_err, "service name is NULL or non-UTF-8".into());
-        return NET_RPC_ERR_INVALID_UTF8;
-    };
-    let mut opts = build_call_options(deadline_ms);
-    if request_window > 0 {
-        opts.request_window_initial = Some(request_window);
-    }
-    if cancel_token != 0 {
-        opts.cancel_token = Some(cancel_token);
-    }
-    let node = h.node.clone();
-    let result = runtime().block_on(async move {
-        node.call_client_stream(target_node_id, &service, opts)
-            .await
-    });
-    match result {
-        Ok(call) => {
-            let call_id = call.call_id();
-            let boxed = Box::new(ClientStreamCallHandleC {
-                inner: Arc::new(Mutex::new(Some(call))),
-                call_id,
-                done: AtomicBool::new(false),
-            });
-            unsafe {
-                *out_handle = Box::into_raw(boxed);
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_RPC_ERR_INVALID_UTF8;
+        };
+        let mut opts = build_call_options(deadline_ms);
+        if request_window > 0 {
+            opts.request_window_initial = Some(request_window);
+        }
+        if cancel_token != 0 {
+            opts.cancel_token = Some(cancel_token);
+        }
+        let node = h.node.clone();
+        let result = block_on(async move {
+            node.call_client_stream(target_node_id, &service, opts)
+                .await
+        });
+        match result {
+            Ok(call) => {
+                let call_id = call.call_id();
+                let boxed = Box::new(ClientStreamCallHandleC {
+                    inner: Arc::new(Mutex::new(Some(call))),
+                    call_id,
+                    done: AtomicBool::new(false),
+                });
+                unsafe {
+                    *out_handle = Box::into_raw(boxed);
+                }
+                NET_RPC_OK
             }
-            NET_RPC_OK
+            Err(e) => {
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
         }
-        Err(e) => {
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-    }
+    })
 }
 
 /// Push one body chunk into the client-streaming call. Encodes
@@ -1557,37 +1724,38 @@ pub extern "C" fn net_rpc_client_stream_send(
     body_len: usize,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    if h.done.load(Ordering::Relaxed) {
-        return NET_RPC_ERR_STREAM_DONE;
-    }
-    let body = if body_ptr.is_null() {
-        Bytes::new()
-    } else {
-        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(body_ptr, body_len) })
-    };
-    // Hold the lock across block_on so concurrent sends serialize
-    // cleanly. `send` takes &mut self so we use as_mut on the
-    // Option's Some, leaving the call in place for the next caller.
-    let mut guard = h.inner.lock();
-    let Some(call_ref) = guard.as_mut() else {
-        return NET_RPC_ERR_STREAM_DONE;
-    };
-    let result = runtime().block_on(call_ref.send(body));
-    match result {
-        Ok(()) => NET_RPC_OK,
-        Err(e) => {
-            // SDK-level error. Drop the call (CANCEL fires via
-            // `ClientStreamCallRaw::Drop` if the initial REQUEST
-            // already flew) and latch done.
-            *guard = None;
-            h.done.store(true, Ordering::Relaxed);
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        if h.done.load(Ordering::Relaxed) {
+            return NET_RPC_ERR_STREAM_DONE;
         }
-    }
+        let Some(body) = (unsafe { copy_body(body_ptr, body_len) }) else {
+            write_err(out_err, "request body length exceeds isize::MAX".into());
+            return NET_RPC_ERR_NULL;
+        };
+        // Hold the lock across block_on so concurrent sends serialize
+        // cleanly. `send` takes &mut self so we use as_mut on the
+        // Option's Some, leaving the call in place for the next caller.
+        let mut guard = h.inner.lock();
+        let Some(call_ref) = guard.as_mut() else {
+            return NET_RPC_ERR_STREAM_DONE;
+        };
+        let result = block_on(call_ref.send(body));
+        match result {
+            Ok(()) => NET_RPC_OK,
+            Err(e) => {
+                // SDK-level error. Drop the call (CANCEL fires via
+                // `ClientStreamCallRaw::Drop` if the initial REQUEST
+                // already flew) and latch done.
+                *guard = None;
+                h.done.store(true, Ordering::Relaxed);
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
+        }
+    })
 }
 
 /// Close the upload direction (emits REQUEST_END) and await the
@@ -1614,44 +1782,48 @@ pub extern "C" fn net_rpc_client_stream_finish(
     out_body_len: *mut usize,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    if h.done.load(Ordering::Relaxed) {
-        return NET_RPC_ERR_STREAM_DONE;
-    }
-    let inner_opt = h.inner.lock().take();
-    let call = match inner_opt {
-        Some(c) => c,
-        None => {
-            h.done.store(true, Ordering::Relaxed);
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        if h.done.load(Ordering::Relaxed) {
             return NET_RPC_ERR_STREAM_DONE;
         }
-    };
-    // Latch done BEFORE the await so concurrent sends/frees
-    // observe the latch promptly.
-    h.done.store(true, Ordering::Relaxed);
-    let result = runtime().block_on(async { call.finish().await });
-    match result {
-        Ok(reply) => {
-            write_response(reply.body.to_vec(), out_body_ptr, out_body_len);
-            NET_RPC_OK
+        let inner_opt = h.inner.lock().take();
+        let call = match inner_opt {
+            Some(c) => c,
+            None => {
+                h.done.store(true, Ordering::Relaxed);
+                return NET_RPC_ERR_STREAM_DONE;
+            }
+        };
+        // Latch done BEFORE the await so concurrent sends/frees
+        // observe the latch promptly.
+        h.done.store(true, Ordering::Relaxed);
+        let result = block_on(async { call.finish().await });
+        match result {
+            Ok(reply) => {
+                write_response(reply.body.to_vec(), out_body_ptr, out_body_len);
+                NET_RPC_OK
+            }
+            Err(e) => {
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
         }
-        Err(e) => {
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-    }
+    })
 }
 
 /// Diagnostic accessor: server-assigned `call_id` for this call.
 /// Returns `0` on NULL handle.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_client_stream_call_id(handle: *const ClientStreamCallHandleC) -> u64 {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return 0;
-    };
-    h.call_id
+    ffi_guard!(0, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return 0;
+        };
+        h.call_id
+    })
 }
 
 /// Free the client-streaming call handle. Implicitly fires
@@ -1659,12 +1831,14 @@ pub extern "C" fn net_rpc_client_stream_call_id(handle: *const ClientStreamCallH
 /// completed. Idempotent on NULL.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_client_stream_free(handle: *mut ClientStreamCallHandleC) {
-    if handle.is_null() {
-        return;
-    }
-    unsafe {
-        drop(Box::from_raw(handle));
-    }
+    ffi_guard!((), {
+        if handle.is_null() {
+            return;
+        }
+        unsafe {
+            drop(Box::from_raw(handle));
+        }
+    })
 }
 
 // =========================================================================
@@ -1764,47 +1938,49 @@ pub extern "C" fn net_rpc_call_duplex(
     out_handle: *mut *mut DuplexCallHandleC,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    let Some(service) = cstr_to_string(service_ptr, service_len) else {
-        write_err(out_err, "service name is NULL or non-UTF-8".into());
-        return NET_RPC_ERR_INVALID_UTF8;
-    };
-    let mut opts = build_call_options(deadline_ms);
-    if request_window > 0 {
-        opts.request_window_initial = Some(request_window);
-    }
-    if stream_window > 0 {
-        opts.stream_window_initial = Some(stream_window);
-    }
-    let node = h.node.clone();
-    let result =
-        runtime().block_on(async move { node.call_duplex(target_node_id, &service, opts).await });
-    match result {
-        Ok(call) => {
-            let call_id = call.call_id();
-            // Auto-split at construction so concurrent send + recv
-            // from Go don't contend on a single mutex. Both halves
-            // share Arc<DuplexInner>; CANCEL-on-Drop remains gated
-            // on both-halves-dropped via the SDK's refcount.
-            let (sink, stream) = call.into_split();
-            let boxed = Box::new(DuplexCallHandleC {
-                sink: Arc::new(Mutex::new(Some(sink))),
-                stream: Arc::new(Mutex::new(Some(stream))),
-                call_id,
-                done: AtomicBool::new(false),
-            });
-            unsafe {
-                *out_handle = Box::into_raw(boxed);
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_RPC_ERR_INVALID_UTF8;
+        };
+        let mut opts = build_call_options(deadline_ms);
+        if request_window > 0 {
+            opts.request_window_initial = Some(request_window);
+        }
+        if stream_window > 0 {
+            opts.stream_window_initial = Some(stream_window);
+        }
+        let node = h.node.clone();
+        let result =
+            block_on(async move { node.call_duplex(target_node_id, &service, opts).await });
+        match result {
+            Ok(call) => {
+                let call_id = call.call_id();
+                // Auto-split at construction so concurrent send + recv
+                // from Go don't contend on a single mutex. Both halves
+                // share Arc<DuplexInner>; CANCEL-on-Drop remains gated
+                // on both-halves-dropped via the SDK's refcount.
+                let (sink, stream) = call.into_split();
+                let boxed = Box::new(DuplexCallHandleC {
+                    sink: Arc::new(Mutex::new(Some(sink))),
+                    stream: Arc::new(Mutex::new(Some(stream))),
+                    call_id,
+                    done: AtomicBool::new(false),
+                });
+                unsafe {
+                    *out_handle = Box::into_raw(boxed);
+                }
+                NET_RPC_OK
             }
-            NET_RPC_OK
+            Err(e) => {
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
         }
-        Err(e) => {
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-    }
+    })
 }
 
 /// Cancellable variant of [`net_rpc_call_duplex`]. Adds a
@@ -1827,46 +2003,48 @@ pub extern "C" fn net_rpc_call_duplex_cancellable(
     out_handle: *mut *mut DuplexCallHandleC,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    let Some(service) = cstr_to_string(service_ptr, service_len) else {
-        write_err(out_err, "service name is NULL or non-UTF-8".into());
-        return NET_RPC_ERR_INVALID_UTF8;
-    };
-    let mut opts = build_call_options(deadline_ms);
-    if request_window > 0 {
-        opts.request_window_initial = Some(request_window);
-    }
-    if stream_window > 0 {
-        opts.stream_window_initial = Some(stream_window);
-    }
-    if cancel_token != 0 {
-        opts.cancel_token = Some(cancel_token);
-    }
-    let node = h.node.clone();
-    let result =
-        runtime().block_on(async move { node.call_duplex(target_node_id, &service, opts).await });
-    match result {
-        Ok(call) => {
-            let call_id = call.call_id();
-            let (sink, stream) = call.into_split();
-            let boxed = Box::new(DuplexCallHandleC {
-                sink: Arc::new(Mutex::new(Some(sink))),
-                stream: Arc::new(Mutex::new(Some(stream))),
-                call_id,
-                done: AtomicBool::new(false),
-            });
-            unsafe {
-                *out_handle = Box::into_raw(boxed);
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_RPC_ERR_INVALID_UTF8;
+        };
+        let mut opts = build_call_options(deadline_ms);
+        if request_window > 0 {
+            opts.request_window_initial = Some(request_window);
+        }
+        if stream_window > 0 {
+            opts.stream_window_initial = Some(stream_window);
+        }
+        if cancel_token != 0 {
+            opts.cancel_token = Some(cancel_token);
+        }
+        let node = h.node.clone();
+        let result =
+            block_on(async move { node.call_duplex(target_node_id, &service, opts).await });
+        match result {
+            Ok(call) => {
+                let call_id = call.call_id();
+                let (sink, stream) = call.into_split();
+                let boxed = Box::new(DuplexCallHandleC {
+                    sink: Arc::new(Mutex::new(Some(sink))),
+                    stream: Arc::new(Mutex::new(Some(stream))),
+                    call_id,
+                    done: AtomicBool::new(false),
+                });
+                unsafe {
+                    *out_handle = Box::into_raw(boxed);
+                }
+                NET_RPC_OK
             }
-            NET_RPC_OK
+            Err(e) => {
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
         }
-        Err(e) => {
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-    }
+    })
 }
 
 /// Push one body chunk to the server. Same semantics as
@@ -1880,33 +2058,34 @@ pub extern "C" fn net_rpc_duplex_send(
     body_len: usize,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    if h.done.load(Ordering::Relaxed) {
-        return NET_RPC_ERR_STREAM_DONE;
-    }
-    let body = if body_ptr.is_null() {
-        Bytes::new()
-    } else {
-        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(body_ptr, body_len) })
-    };
-    // Hold the sink lock across block_on so concurrent sends
-    // serialize cleanly without the take/restore race. The recv
-    // side uses an independent lock so send + recv never contend.
-    let mut guard = h.sink.lock();
-    let Some(sink_ref) = guard.as_mut() else {
-        return NET_RPC_ERR_STREAM_DONE;
-    };
-    let result = runtime().block_on(sink_ref.send(body));
-    match result {
-        Ok(()) => NET_RPC_OK,
-        Err(e) => {
-            *guard = None;
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        if h.done.load(Ordering::Relaxed) {
+            return NET_RPC_ERR_STREAM_DONE;
         }
-    }
+        let Some(body) = (unsafe { copy_body(body_ptr, body_len) }) else {
+            write_err(out_err, "request body length exceeds isize::MAX".into());
+            return NET_RPC_ERR_NULL;
+        };
+        // Hold the sink lock across block_on so concurrent sends
+        // serialize cleanly without the take/restore race. The recv
+        // side uses an independent lock so send + recv never contend.
+        let mut guard = h.sink.lock();
+        let Some(sink_ref) = guard.as_mut() else {
+            return NET_RPC_ERR_STREAM_DONE;
+        };
+        let result = block_on(sink_ref.send(body));
+        match result {
+            Ok(()) => NET_RPC_OK,
+            Err(e) => {
+                *guard = None;
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
+        }
+    })
 }
 
 /// Close the upload direction. Emits REQUEST_END but does NOT
@@ -1917,29 +2096,31 @@ pub extern "C" fn net_rpc_duplex_finish_sending(
     handle: *mut DuplexCallHandleC,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    if h.done.load(Ordering::Relaxed) {
-        return NET_RPC_ERR_STREAM_DONE;
-    }
-    // `DuplexSink::finish_sending` consumes self. Take the sink
-    // out of the Option under the sink lock — a concurrent `send`
-    // will see None on its next acquisition and return STREAM_DONE.
-    // The stream lock stays untouched: response drain via _next
-    // continues unaffected.
-    let sink_opt = h.sink.lock().take();
-    let Some(sink) = sink_opt else {
-        return NET_RPC_ERR_STREAM_DONE;
-    };
-    let result = runtime().block_on(sink.finish_sending());
-    match result {
-        Ok(()) => NET_RPC_OK,
-        Err(e) => {
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        if h.done.load(Ordering::Relaxed) {
+            return NET_RPC_ERR_STREAM_DONE;
         }
-    }
+        // `DuplexSink::finish_sending` consumes self. Take the sink
+        // out of the Option under the sink lock — a concurrent `send`
+        // will see None on its next acquisition and return STREAM_DONE.
+        // The stream lock stays untouched: response drain via _next
+        // continues unaffected.
+        let sink_opt = h.sink.lock().take();
+        let Some(sink) = sink_opt else {
+            return NET_RPC_ERR_STREAM_DONE;
+        };
+        let result = block_on(sink.finish_sending());
+        match result {
+            Ok(()) => NET_RPC_OK,
+            Err(e) => {
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
+        }
+    })
 }
 
 /// Pull the next response chunk from the duplex call.
@@ -1954,50 +2135,52 @@ pub extern "C" fn net_rpc_duplex_next(
     out_chunk_len: *mut usize,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    if h.done.load(Ordering::Relaxed) {
-        unsafe {
-            *out_chunk_ptr = std::ptr::null_mut();
-            *out_chunk_len = 0;
-        }
-        return NET_RPC_ERR_STREAM_DONE;
-    }
-    use futures::StreamExt;
-    // Hold the stream lock for the duration of the poll. Send
-    // operations take the sink lock independently — concurrent
-    // send + recv from Go no longer race on a shared mutex.
-    let mut guard = h.stream.lock();
-    let Some(stream_ref) = guard.as_mut() else {
-        unsafe {
-            *out_chunk_ptr = std::ptr::null_mut();
-            *out_chunk_len = 0;
-        }
-        return NET_RPC_ERR_STREAM_DONE;
-    };
-    let result = runtime().block_on(stream_ref.next());
-    match result {
-        Some(Ok(chunk)) => {
-            write_response(chunk.to_vec(), out_chunk_ptr, out_chunk_len);
-            NET_RPC_OK
-        }
-        Some(Err(e)) => {
-            *guard = None;
-            h.done.store(true, Ordering::Relaxed);
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-        None => {
-            *guard = None;
-            h.done.store(true, Ordering::Relaxed);
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        if h.done.load(Ordering::Relaxed) {
             unsafe {
                 *out_chunk_ptr = std::ptr::null_mut();
                 *out_chunk_len = 0;
             }
-            NET_RPC_ERR_STREAM_DONE
+            return NET_RPC_ERR_STREAM_DONE;
         }
-    }
+        use futures::StreamExt;
+        // Hold the stream lock for the duration of the poll. Send
+        // operations take the sink lock independently — concurrent
+        // send + recv from Go no longer race on a shared mutex.
+        let mut guard = h.stream.lock();
+        let Some(stream_ref) = guard.as_mut() else {
+            unsafe {
+                *out_chunk_ptr = std::ptr::null_mut();
+                *out_chunk_len = 0;
+            }
+            return NET_RPC_ERR_STREAM_DONE;
+        };
+        let result = block_on(stream_ref.next());
+        match result {
+            Some(Ok(chunk)) => {
+                write_response(chunk.to_vec(), out_chunk_ptr, out_chunk_len);
+                NET_RPC_OK
+            }
+            Some(Err(e)) => {
+                *guard = None;
+                h.done.store(true, Ordering::Relaxed);
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
+            None => {
+                *guard = None;
+                h.done.store(true, Ordering::Relaxed);
+                unsafe {
+                    *out_chunk_ptr = std::ptr::null_mut();
+                    *out_chunk_len = 0;
+                }
+                NET_RPC_ERR_STREAM_DONE
+            }
+        }
+    })
 }
 
 /// Split the duplex call into independent sink + stream halves.
@@ -2015,61 +2198,77 @@ pub extern "C" fn net_rpc_duplex_into_split(
     out_stream: *mut *mut DuplexStreamHandleC,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    // The handle was already split at construction. `into_split`
-    // here just transfers ownership of the two halves into the
-    // caller's separately-managed handles. Atomic latch via `done`
-    // prevents a concurrent split + free from racing on the take.
-    if h.done.swap(true, Ordering::Relaxed) {
-        write_err(
-            out_err,
-            "duplex_into_split called on already-split or freed handle".into(),
-        );
-        return NET_RPC_ERR_STREAM_DONE;
-    }
-    let sink = h.sink.lock().take();
-    let stream = h.stream.lock().take();
-    let (sink, stream) = match (sink, stream) {
-        (Some(s), Some(st)) => (s, st),
-        _ => {
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        // The handle was already split at construction. `into_split`
+        // here just transfers ownership of the two halves into the
+        // caller's separately-managed handles. Atomic latch via `done`
+        // prevents a concurrent split + free from racing on the take.
+        if h.done.swap(true, Ordering::Relaxed) {
             write_err(
                 out_err,
-                "duplex_into_split called on partially-consumed handle".into(),
+                "duplex_into_split called on already-split or freed handle".into(),
             );
             return NET_RPC_ERR_STREAM_DONE;
         }
-    };
-    let call_id = h.call_id;
-    let sink_boxed = Box::new(DuplexSinkHandleC {
-        inner: Arc::new(Mutex::new(Some(sink))),
-        call_id,
-        done: AtomicBool::new(false),
-    });
-    let stream_boxed = Box::new(DuplexStreamHandleC {
-        inner: Arc::new(Mutex::new(Some(stream))),
-        call_id,
-        done: AtomicBool::new(false),
-    });
-    unsafe {
-        *out_sink = Box::into_raw(sink_boxed);
-        *out_stream = Box::into_raw(stream_boxed);
-    }
-    // Latch the original handle so a stray send/next on it
-    // returns STREAM_DONE cleanly.
-    h.done.store(true, Ordering::Relaxed);
-    NET_RPC_OK
+        let sink = h.sink.lock().take();
+        let stream = h.stream.lock().take();
+        let (sink, stream) = match (sink, stream) {
+            (Some(s), Some(st)) => (s, st),
+            // #16: partial-consume arm. Previously this dropped the
+            // surviving half, firing a premature CANCEL/close on a half
+            // the caller never received a handle for and silently
+            // destroying the call. Put the surviving half back instead so
+            // its lifecycle stays owned by the original handle (the caller
+            // can still drive it / free it cleanly).
+            (surviving_sink, surviving_stream) => {
+                if let Some(s) = surviving_sink {
+                    *h.sink.lock() = Some(s);
+                }
+                if let Some(st) = surviving_stream {
+                    *h.stream.lock() = Some(st);
+                }
+                write_err(
+                    out_err,
+                    "duplex_into_split called on partially-consumed handle".into(),
+                );
+                return NET_RPC_ERR_STREAM_DONE;
+            }
+        };
+        let call_id = h.call_id;
+        let sink_boxed = Box::new(DuplexSinkHandleC {
+            inner: Arc::new(Mutex::new(Some(sink))),
+            call_id,
+            done: AtomicBool::new(false),
+        });
+        let stream_boxed = Box::new(DuplexStreamHandleC {
+            inner: Arc::new(Mutex::new(Some(stream))),
+            call_id,
+            done: AtomicBool::new(false),
+        });
+        unsafe {
+            *out_sink = Box::into_raw(sink_boxed);
+            *out_stream = Box::into_raw(stream_boxed);
+        }
+        // Latch the original handle so a stray send/next on it
+        // returns STREAM_DONE cleanly.
+        h.done.store(true, Ordering::Relaxed);
+        NET_RPC_OK
+    })
 }
 
 /// Diagnostic accessor — server-assigned call_id. Returns 0 on
 /// NULL.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_duplex_call_id(handle: *const DuplexCallHandleC) -> u64 {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return 0;
-    };
-    h.call_id
+    ffi_guard!(0, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return 0;
+        };
+        h.call_id
+    })
 }
 
 /// Free the duplex handle. Fires CANCEL via the SDK's shared
@@ -2078,12 +2277,14 @@ pub extern "C" fn net_rpc_duplex_call_id(handle: *const DuplexCallHandleC) -> u6
 /// Idempotent on NULL.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_duplex_free(handle: *mut DuplexCallHandleC) {
-    if handle.is_null() {
-        return;
-    }
-    unsafe {
-        drop(Box::from_raw(handle));
-    }
+    ffi_guard!((), {
+        if handle.is_null() {
+            return;
+        }
+        unsafe {
+            drop(Box::from_raw(handle));
+        }
+    })
 }
 
 // ---- Sink half (post-into_split) ----
@@ -2097,34 +2298,35 @@ pub extern "C" fn net_rpc_duplex_sink_send(
     body_len: usize,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    if h.done.load(Ordering::Relaxed) {
-        return NET_RPC_ERR_STREAM_DONE;
-    }
-    let body = if body_ptr.is_null() {
-        Bytes::new()
-    } else {
-        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(body_ptr, body_len) })
-    };
-    // Hold the lock across block_on so concurrent sends serialize
-    // cleanly. `send` takes &mut self so we use as_mut, leaving
-    // the Option populated for the next caller.
-    let mut guard = h.inner.lock();
-    let Some(sink_ref) = guard.as_mut() else {
-        return NET_RPC_ERR_STREAM_DONE;
-    };
-    let result = runtime().block_on(sink_ref.send(body));
-    match result {
-        Ok(()) => NET_RPC_OK,
-        Err(e) => {
-            *guard = None;
-            h.done.store(true, Ordering::Relaxed);
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        if h.done.load(Ordering::Relaxed) {
+            return NET_RPC_ERR_STREAM_DONE;
         }
-    }
+        let Some(body) = (unsafe { copy_body(body_ptr, body_len) }) else {
+            write_err(out_err, "request body length exceeds isize::MAX".into());
+            return NET_RPC_ERR_NULL;
+        };
+        // Hold the lock across block_on so concurrent sends serialize
+        // cleanly. `send` takes &mut self so we use as_mut, leaving
+        // the Option populated for the next caller.
+        let mut guard = h.inner.lock();
+        let Some(sink_ref) = guard.as_mut() else {
+            return NET_RPC_ERR_STREAM_DONE;
+        };
+        let result = block_on(sink_ref.send(body));
+        match result {
+            Ok(()) => NET_RPC_OK,
+            Err(e) => {
+                *guard = None;
+                h.done.store(true, Ordering::Relaxed);
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
+        }
+    })
 }
 
 /// Close the sink half (emits REQUEST_END). Consumes the inner
@@ -2134,38 +2336,42 @@ pub extern "C" fn net_rpc_duplex_sink_finish(
     handle: *mut DuplexSinkHandleC,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    if h.done.load(Ordering::Relaxed) {
-        return NET_RPC_ERR_STREAM_DONE;
-    }
-    let inner_opt = h.inner.lock().take();
-    let sink = match inner_opt {
-        Some(s) => s,
-        None => {
-            h.done.store(true, Ordering::Relaxed);
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        if h.done.load(Ordering::Relaxed) {
             return NET_RPC_ERR_STREAM_DONE;
         }
-    };
-    h.done.store(true, Ordering::Relaxed);
-    let result = runtime().block_on(async { sink.finish_sending().await });
-    match result {
-        Ok(()) => NET_RPC_OK,
-        Err(e) => {
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
+        let inner_opt = h.inner.lock().take();
+        let sink = match inner_opt {
+            Some(s) => s,
+            None => {
+                h.done.store(true, Ordering::Relaxed);
+                return NET_RPC_ERR_STREAM_DONE;
+            }
+        };
+        h.done.store(true, Ordering::Relaxed);
+        let result = block_on(async { sink.finish_sending().await });
+        match result {
+            Ok(()) => NET_RPC_OK,
+            Err(e) => {
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
         }
-    }
+    })
 }
 
 /// Diagnostic accessor for the sink half's call_id.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_duplex_sink_call_id(handle: *const DuplexSinkHandleC) -> u64 {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return 0;
-    };
-    h.call_id
+    ffi_guard!(0, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return 0;
+        };
+        h.call_id
+    })
 }
 
 /// Free the sink half. Drop fires nothing (CANCEL only when the
@@ -2174,12 +2380,14 @@ pub extern "C" fn net_rpc_duplex_sink_call_id(handle: *const DuplexSinkHandleC) 
 /// Idempotent on NULL.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_duplex_sink_free(handle: *mut DuplexSinkHandleC) {
-    if handle.is_null() {
-        return;
-    }
-    unsafe {
-        drop(Box::from_raw(handle));
-    }
+    ffi_guard!((), {
+        if handle.is_null() {
+            return;
+        }
+        unsafe {
+            drop(Box::from_raw(handle));
+        }
+    })
 }
 
 // ---- Stream half (post-into_split) ----
@@ -2193,71 +2401,77 @@ pub extern "C" fn net_rpc_duplex_stream_next(
     out_chunk_len: *mut usize,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    if h.done.load(Ordering::Relaxed) {
-        unsafe {
-            *out_chunk_ptr = std::ptr::null_mut();
-            *out_chunk_len = 0;
-        }
-        return NET_RPC_ERR_STREAM_DONE;
-    }
-    use futures::StreamExt;
-    // Hold the lock across block_on so concurrent `stream_next`
-    // calls serialize cleanly. Each call gets one chunk OR the
-    // terminal frame; the take/restore race is gone.
-    let mut guard = h.inner.lock();
-    let Some(stream_ref) = guard.as_mut() else {
-        unsafe {
-            *out_chunk_ptr = std::ptr::null_mut();
-            *out_chunk_len = 0;
-        }
-        return NET_RPC_ERR_STREAM_DONE;
-    };
-    let result = runtime().block_on(stream_ref.next());
-    match result {
-        Some(Ok(chunk)) => {
-            write_response(chunk.to_vec(), out_chunk_ptr, out_chunk_len);
-            NET_RPC_OK
-        }
-        Some(Err(e)) => {
-            *guard = None;
-            h.done.store(true, Ordering::Relaxed);
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-        None => {
-            *guard = None;
-            h.done.store(true, Ordering::Relaxed);
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        if h.done.load(Ordering::Relaxed) {
             unsafe {
                 *out_chunk_ptr = std::ptr::null_mut();
                 *out_chunk_len = 0;
             }
-            NET_RPC_ERR_STREAM_DONE
+            return NET_RPC_ERR_STREAM_DONE;
         }
-    }
+        use futures::StreamExt;
+        // Hold the lock across block_on so concurrent `stream_next`
+        // calls serialize cleanly. Each call gets one chunk OR the
+        // terminal frame; the take/restore race is gone.
+        let mut guard = h.inner.lock();
+        let Some(stream_ref) = guard.as_mut() else {
+            unsafe {
+                *out_chunk_ptr = std::ptr::null_mut();
+                *out_chunk_len = 0;
+            }
+            return NET_RPC_ERR_STREAM_DONE;
+        };
+        let result = block_on(stream_ref.next());
+        match result {
+            Some(Ok(chunk)) => {
+                write_response(chunk.to_vec(), out_chunk_ptr, out_chunk_len);
+                NET_RPC_OK
+            }
+            Some(Err(e)) => {
+                *guard = None;
+                h.done.store(true, Ordering::Relaxed);
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
+            None => {
+                *guard = None;
+                h.done.store(true, Ordering::Relaxed);
+                unsafe {
+                    *out_chunk_ptr = std::ptr::null_mut();
+                    *out_chunk_len = 0;
+                }
+                NET_RPC_ERR_STREAM_DONE
+            }
+        }
+    })
 }
 
 /// Diagnostic accessor for the stream half's call_id.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_duplex_stream_call_id(handle: *const DuplexStreamHandleC) -> u64 {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return 0;
-    };
-    h.call_id
+    ffi_guard!(0, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return 0;
+        };
+        h.call_id
+    })
 }
 
 /// Free the stream half. Same Arc-refcount-based CANCEL semantics
 /// as `_sink_free`. Idempotent on NULL.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_duplex_stream_free(handle: *mut DuplexStreamHandleC) {
-    if handle.is_null() {
-        return;
-    }
-    unsafe {
-        drop(Box::from_raw(handle));
-    }
+    ffi_guard!((), {
+        if handle.is_null() {
+            return;
+        }
+        unsafe {
+            drop(Box::from_raw(handle));
+        }
+    })
 }
 
 // =========================================================================
@@ -2303,42 +2517,43 @@ pub extern "C" fn net_rpc_call_with_headers(
     out_resp_len: *mut usize,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    let Some(service) = cstr_to_string(service_ptr, service_len) else {
-        write_err(out_err, "service name is NULL or non-UTF-8".into());
-        return NET_RPC_ERR_INVALID_UTF8;
-    };
-    let Some(headers) = (unsafe { collect_headers(headers_ptr, header_count) }) else {
-        write_err(out_err, "request header name is NULL or non-UTF-8".into());
-        return NET_RPC_ERR_INVALID_UTF8;
-    };
-    let req_bytes = if req_ptr.is_null() {
-        Bytes::new()
-    } else {
-        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
-    };
-    let mut opts = build_call_options(deadline_ms);
-    opts.request_headers = headers;
-    if cancel_token != 0 {
-        opts.cancel_token = Some(cancel_token);
-    }
-    let node = h.node.clone();
-
-    let result = runtime()
-        .block_on(async move { node.call(target_node_id, &service, req_bytes, opts).await });
-
-    match result {
-        Ok(reply) => {
-            write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
-            NET_RPC_OK
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_RPC_ERR_INVALID_UTF8;
+        };
+        let Some(headers) = (unsafe { collect_headers(headers_ptr, header_count) }) else {
+            write_err(out_err, "request header name is NULL or non-UTF-8".into());
+            return NET_RPC_ERR_INVALID_UTF8;
+        };
+        let Some(req_bytes) = (unsafe { copy_body(req_ptr, req_len) }) else {
+            write_err(out_err, "request body length exceeds isize::MAX".into());
+            return NET_RPC_ERR_NULL;
+        };
+        let mut opts = build_call_options(deadline_ms);
+        opts.request_headers = headers;
+        if cancel_token != 0 {
+            opts.cancel_token = Some(cancel_token);
         }
-        Err(e) => {
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
+        let node = h.node.clone();
+
+        let result =
+            block_on(async move { node.call(target_node_id, &service, req_bytes, opts).await });
+
+        match result {
+            Ok(reply) => {
+                write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
+                NET_RPC_OK
+            }
+            Err(e) => {
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
         }
-    }
+    })
 }
 
 /// `net_rpc_call_service` with arbitrary request headers attached.
@@ -2361,42 +2576,42 @@ pub extern "C" fn net_rpc_call_service_with_headers(
     out_resp_len: *mut usize,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    let Some(service) = cstr_to_string(service_ptr, service_len) else {
-        write_err(out_err, "service name is NULL or non-UTF-8".into());
-        return NET_RPC_ERR_INVALID_UTF8;
-    };
-    let Some(headers) = (unsafe { collect_headers(headers_ptr, header_count) }) else {
-        write_err(out_err, "request header name is NULL or non-UTF-8".into());
-        return NET_RPC_ERR_INVALID_UTF8;
-    };
-    let req_bytes = if req_ptr.is_null() {
-        Bytes::new()
-    } else {
-        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
-    };
-    let mut opts = build_call_options(deadline_ms);
-    opts.request_headers = headers;
-    if cancel_token != 0 {
-        opts.cancel_token = Some(cancel_token);
-    }
-    let node = h.node.clone();
-
-    let result =
-        runtime().block_on(async move { node.call_service(&service, req_bytes, opts).await });
-
-    match result {
-        Ok(reply) => {
-            write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
-            NET_RPC_OK
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_RPC_ERR_INVALID_UTF8;
+        };
+        let Some(headers) = (unsafe { collect_headers(headers_ptr, header_count) }) else {
+            write_err(out_err, "request header name is NULL or non-UTF-8".into());
+            return NET_RPC_ERR_INVALID_UTF8;
+        };
+        let Some(req_bytes) = (unsafe { copy_body(req_ptr, req_len) }) else {
+            write_err(out_err, "request body length exceeds isize::MAX".into());
+            return NET_RPC_ERR_NULL;
+        };
+        let mut opts = build_call_options(deadline_ms);
+        opts.request_headers = headers;
+        if cancel_token != 0 {
+            opts.cancel_token = Some(cancel_token);
         }
-        Err(e) => {
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
+        let node = h.node.clone();
+
+        let result = block_on(async move { node.call_service(&service, req_bytes, opts).await });
+
+        match result {
+            Ok(reply) => {
+                write_response(reply.body.to_vec(), out_resp_ptr, out_resp_len);
+                NET_RPC_OK
+            }
+            Err(e) => {
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
         }
-    }
+    })
 }
 
 /// `net_rpc_call_streaming` with arbitrary request headers
@@ -2419,52 +2634,53 @@ pub extern "C" fn net_rpc_call_streaming_with_headers(
     out_stream: *mut *mut RpcStreamHandleC,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    let Some(service) = cstr_to_string(service_ptr, service_len) else {
-        write_err(out_err, "service name is NULL or non-UTF-8".into());
-        return NET_RPC_ERR_INVALID_UTF8;
-    };
-    let Some(headers) = (unsafe { collect_headers(headers_ptr, header_count) }) else {
-        write_err(out_err, "request header name is NULL or non-UTF-8".into());
-        return NET_RPC_ERR_INVALID_UTF8;
-    };
-    let req_bytes = if req_ptr.is_null() {
-        Bytes::new()
-    } else {
-        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
-    };
-    let mut opts = build_call_options(deadline_ms);
-    if stream_window > 0 {
-        opts.stream_window_initial = Some(stream_window);
-    }
-    opts.request_headers = headers;
-    let node = h.node.clone();
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_RPC_ERR_INVALID_UTF8;
+        };
+        let Some(headers) = (unsafe { collect_headers(headers_ptr, header_count) }) else {
+            write_err(out_err, "request header name is NULL or non-UTF-8".into());
+            return NET_RPC_ERR_INVALID_UTF8;
+        };
+        let Some(req_bytes) = (unsafe { copy_body(req_ptr, req_len) }) else {
+            write_err(out_err, "request body length exceeds isize::MAX".into());
+            return NET_RPC_ERR_NULL;
+        };
+        let mut opts = build_call_options(deadline_ms);
+        if stream_window > 0 {
+            opts.stream_window_initial = Some(stream_window);
+        }
+        opts.request_headers = headers;
+        let node = h.node.clone();
 
-    let result = runtime().block_on(async move {
-        node.call_streaming(target_node_id, &service, req_bytes, opts)
-            .await
-    });
+        let result = block_on(async move {
+            node.call_streaming(target_node_id, &service, req_bytes, opts)
+                .await
+        });
 
-    match result {
-        Ok(stream) => {
-            let call_id = stream.call_id();
-            let boxed = Box::new(RpcStreamHandleC {
-                inner: Arc::new(Mutex::new(Some(stream))),
-                call_id,
-                done: AtomicBool::new(false),
-            });
-            unsafe {
-                *out_stream = Box::into_raw(boxed);
+        match result {
+            Ok(stream) => {
+                let call_id = stream.call_id();
+                let boxed = Box::new(RpcStreamHandleC {
+                    inner: Arc::new(Mutex::new(Some(stream))),
+                    call_id,
+                    done: AtomicBool::new(false),
+                });
+                unsafe {
+                    *out_stream = Box::into_raw(boxed);
+                }
+                NET_RPC_OK
             }
-            NET_RPC_OK
+            Err(e) => {
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
         }
-        Err(e) => {
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-    }
+    })
 }
 
 /// N-16: cancellable variant of
@@ -2490,55 +2706,56 @@ pub extern "C" fn net_rpc_call_streaming_with_headers_cancellable(
     out_stream: *mut *mut RpcStreamHandleC,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    let Some(service) = cstr_to_string(service_ptr, service_len) else {
-        write_err(out_err, "service name is NULL or non-UTF-8".into());
-        return NET_RPC_ERR_INVALID_UTF8;
-    };
-    let Some(headers) = (unsafe { collect_headers(headers_ptr, header_count) }) else {
-        write_err(out_err, "request header name is NULL or non-UTF-8".into());
-        return NET_RPC_ERR_INVALID_UTF8;
-    };
-    let req_bytes = if req_ptr.is_null() {
-        Bytes::new()
-    } else {
-        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(req_ptr, req_len) })
-    };
-    let mut opts = build_call_options(deadline_ms);
-    if stream_window > 0 {
-        opts.stream_window_initial = Some(stream_window);
-    }
-    opts.request_headers = headers;
-    if cancel_token != 0 {
-        opts.cancel_token = Some(cancel_token);
-    }
-    let node = h.node.clone();
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_RPC_ERR_INVALID_UTF8;
+        };
+        let Some(headers) = (unsafe { collect_headers(headers_ptr, header_count) }) else {
+            write_err(out_err, "request header name is NULL or non-UTF-8".into());
+            return NET_RPC_ERR_INVALID_UTF8;
+        };
+        let Some(req_bytes) = (unsafe { copy_body(req_ptr, req_len) }) else {
+            write_err(out_err, "request body length exceeds isize::MAX".into());
+            return NET_RPC_ERR_NULL;
+        };
+        let mut opts = build_call_options(deadline_ms);
+        if stream_window > 0 {
+            opts.stream_window_initial = Some(stream_window);
+        }
+        opts.request_headers = headers;
+        if cancel_token != 0 {
+            opts.cancel_token = Some(cancel_token);
+        }
+        let node = h.node.clone();
 
-    let result = runtime().block_on(async move {
-        node.call_streaming(target_node_id, &service, req_bytes, opts)
-            .await
-    });
+        let result = block_on(async move {
+            node.call_streaming(target_node_id, &service, req_bytes, opts)
+                .await
+        });
 
-    match result {
-        Ok(stream) => {
-            let call_id = stream.call_id();
-            let boxed = Box::new(RpcStreamHandleC {
-                inner: Arc::new(Mutex::new(Some(stream))),
-                call_id,
-                done: AtomicBool::new(false),
-            });
-            unsafe {
-                *out_stream = Box::into_raw(boxed);
+        match result {
+            Ok(stream) => {
+                let call_id = stream.call_id();
+                let boxed = Box::new(RpcStreamHandleC {
+                    inner: Arc::new(Mutex::new(Some(stream))),
+                    call_id,
+                    done: AtomicBool::new(false),
+                });
+                unsafe {
+                    *out_stream = Box::into_raw(boxed);
+                }
+                NET_RPC_OK
             }
-            NET_RPC_OK
+            Err(e) => {
+                write_err(out_err, format_rpc_error(&e));
+                NET_RPC_ERR_CALL_FAILED
+            }
         }
-        Err(e) => {
-            write_err(out_err, format_rpc_error(&e));
-            NET_RPC_ERR_CALL_FAILED
-        }
-    }
+    })
 }
 
 // =========================================================================
@@ -2618,14 +2835,18 @@ static DUPLEX_DISPATCHER: OnceLock<RpcDuplexHandlerFn> = OnceLock::new();
 pub extern "C" fn net_rpc_set_client_streaming_handler_dispatcher(
     dispatcher: RpcClientStreamingHandlerFn,
 ) {
-    let _ = CLIENT_STREAMING_DISPATCHER.set(dispatcher);
+    ffi_guard!((), {
+        let _ = CLIENT_STREAMING_DISPATCHER.set(dispatcher);
+    })
 }
 
 /// Register the process-wide duplex handler dispatcher.
 /// Idempotent — first registration wins.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_set_duplex_handler_dispatcher(dispatcher: RpcDuplexHandlerFn) {
-    let _ = DUPLEX_DISPATCHER.set(dispatcher);
+    ffi_guard!((), {
+        let _ = DUPLEX_DISPATCHER.set(dispatcher);
+    })
 }
 
 /// Per-call opaque handle wrapping the SDK's `RequestStream`. The
@@ -2659,46 +2880,48 @@ pub extern "C" fn net_rpc_request_stream_next(
     out_chunk_ptr: *mut *mut u8,
     out_chunk_len: *mut usize,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    if h.done.load(Ordering::Relaxed) {
-        unsafe {
-            *out_chunk_ptr = std::ptr::null_mut();
-            *out_chunk_len = 0;
-        }
-        return NET_RPC_ERR_STREAM_DONE;
-    }
-    let inner_opt = h.inner.lock().take();
-    let mut stream = match inner_opt {
-        Some(s) => s,
-        None => {
-            h.done.store(true, Ordering::Relaxed);
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        if h.done.load(Ordering::Relaxed) {
             unsafe {
                 *out_chunk_ptr = std::ptr::null_mut();
                 *out_chunk_len = 0;
             }
             return NET_RPC_ERR_STREAM_DONE;
         }
-    };
-    use futures::StreamExt;
-    let result = runtime().block_on(async { stream.next().await });
-    match result {
-        Some(bytes) => {
-            *h.inner.lock() = Some(stream);
-            write_response(bytes.to_vec(), out_chunk_ptr, out_chunk_len);
-            NET_RPC_OK
-        }
-        None => {
-            drop(stream);
-            h.done.store(true, Ordering::Relaxed);
-            unsafe {
-                *out_chunk_ptr = std::ptr::null_mut();
-                *out_chunk_len = 0;
+        let inner_opt = h.inner.lock().take();
+        let mut stream = match inner_opt {
+            Some(s) => s,
+            None => {
+                h.done.store(true, Ordering::Relaxed);
+                unsafe {
+                    *out_chunk_ptr = std::ptr::null_mut();
+                    *out_chunk_len = 0;
+                }
+                return NET_RPC_ERR_STREAM_DONE;
             }
-            NET_RPC_ERR_STREAM_DONE
+        };
+        use futures::StreamExt;
+        let result = block_on(async { stream.next().await });
+        match result {
+            Some(bytes) => {
+                *h.inner.lock() = Some(stream);
+                write_response(bytes.to_vec(), out_chunk_ptr, out_chunk_len);
+                NET_RPC_OK
+            }
+            None => {
+                drop(stream);
+                h.done.store(true, Ordering::Relaxed);
+                unsafe {
+                    *out_chunk_ptr = std::ptr::null_mut();
+                    *out_chunk_len = 0;
+                }
+                NET_RPC_ERR_STREAM_DONE
+            }
         }
-    }
+    })
 }
 
 /// Per-call opaque handle wrapping the SDK's `RpcResponseSink`.
@@ -2723,21 +2946,23 @@ pub extern "C" fn net_rpc_response_sink_send(
     body_ptr: *const u8,
     body_len: usize,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    let guard = h.inner.lock();
-    let sink = match guard.as_ref() {
-        Some(s) => s,
-        None => return NET_RPC_ERR_STREAM_DONE,
-    };
-    let body = if body_ptr.is_null() {
-        Bytes::new()
-    } else {
-        Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(body_ptr, body_len) })
-    };
-    sink.send(body);
-    NET_RPC_OK
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        let guard = h.inner.lock();
+        let sink = match guard.as_ref() {
+            Some(s) => s,
+            None => return NET_RPC_ERR_STREAM_DONE,
+        };
+        // `net_rpc_response_sink_send` has no `out_err` out-param, so an
+        // oversized length surfaces as the crate's null/invalid-arg code.
+        let Some(body) = (unsafe { copy_body(body_ptr, body_len) }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        sink.send(body);
+        NET_RPC_OK
+    })
 }
 
 /// `RpcClientStreamingHandler` impl that bridges to the Go side.
@@ -2815,6 +3040,15 @@ impl RpcClientStreamingHandler for GoClientStreamingRpcHandler {
                 if code == NET_RPC_OK {
                     if resp_ptr.is_null() {
                         return Ok(Vec::new());
+                    }
+                    // `isize::MAX` guard before `from_raw_parts`, same
+                    // as the unary handler bridge.
+                    if resp_len > isize::MAX as usize {
+                        unsafe { libc::free(resp_ptr as *mut libc::c_void) };
+                        return Err(
+                            "Go client-streaming handler response length exceeds isize::MAX"
+                                .to_string(),
+                        );
                     }
                     let bytes =
                         unsafe { std::slice::from_raw_parts(resp_ptr, resp_len).to_vec() };
@@ -2960,47 +3194,49 @@ pub extern "C" fn net_rpc_serve_client_stream(
     handler_timeout_ms: u64,
     out_err: *mut *mut c_char,
 ) -> *mut ServeHandleC {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        write_err(out_err, "MeshRpc handle is NULL".into());
-        return std::ptr::null_mut();
-    };
-    let Some(service) = cstr_to_string(service_ptr, service_len) else {
-        write_err(out_err, "service name is NULL or non-UTF-8".into());
-        return std::ptr::null_mut();
-    };
-    if CLIENT_STREAMING_DISPATCHER.get().is_none() {
-        write_err(
+    ffi_guard!(std::ptr::null_mut(), {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            write_err(out_err, "MeshRpc handle is NULL".into());
+            return std::ptr::null_mut();
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return std::ptr::null_mut();
+        };
+        if CLIENT_STREAMING_DISPATCHER.get().is_none() {
+            write_err(
             out_err,
             "net_rpc_set_client_streaming_handler_dispatcher must be called before net_rpc_serve_client_stream".into(),
         );
-        return std::ptr::null_mut();
-    }
-    if handler_id == 0 {
-        write_err(
-            out_err,
-            "handler_id must be non-zero (reserve via net_rpc_reserve_handler_id)".into(),
-        );
-        return std::ptr::null_mut();
-    }
-    let timeout = if handler_timeout_ms == 0 {
-        DEFAULT_HANDLER_TIMEOUT
-    } else {
-        Duration::from_millis(handler_timeout_ms)
-    };
-    let rust_handler = Arc::new(GoClientStreamingRpcHandler {
-        handler_id,
-        timeout,
-    });
-    match h.node.serve_rpc_client_stream(&service, rust_handler) {
-        Ok(inner) => Box::into_raw(Box::new(ServeHandleC {
-            inner: Arc::new(Mutex::new(Some(inner))),
-            handler_id,
-        })),
-        Err(e) => {
-            write_err(out_err, format!("serve failed: {e}"));
-            std::ptr::null_mut()
+            return std::ptr::null_mut();
         }
-    }
+        if handler_id == 0 {
+            write_err(
+                out_err,
+                "handler_id must be non-zero (reserve via net_rpc_reserve_handler_id)".into(),
+            );
+            return std::ptr::null_mut();
+        }
+        let timeout = if handler_timeout_ms == 0 {
+            DEFAULT_HANDLER_TIMEOUT
+        } else {
+            Duration::from_millis(handler_timeout_ms)
+        };
+        let rust_handler = Arc::new(GoClientStreamingRpcHandler {
+            handler_id,
+            timeout,
+        });
+        match h.node.serve_rpc_client_stream(&service, rust_handler) {
+            Ok(inner) => Box::into_raw(Box::new(ServeHandleC {
+                inner: Arc::new(Mutex::new(Some(inner))),
+                handler_id,
+            })),
+            Err(e) => {
+                write_err(out_err, format!("serve failed: {e}"));
+                std::ptr::null_mut()
+            }
+        }
+    })
 }
 
 /// Function pointer the Go side registers via
@@ -3026,7 +3262,9 @@ static STREAMING_DISPATCHER: OnceLock<RpcStreamingHandlerFn> = OnceLock::new();
 /// Idempotent — first registration wins.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_set_streaming_handler_dispatcher(dispatcher: RpcStreamingHandlerFn) {
-    let _ = STREAMING_DISPATCHER.set(dispatcher);
+    ffi_guard!((), {
+        let _ = STREAMING_DISPATCHER.set(dispatcher);
+    })
 }
 
 /// `RpcStreamingHandler` impl that bridges to the Go side. Same
@@ -3121,49 +3359,51 @@ pub extern "C" fn net_rpc_serve_streaming(
     handler_timeout_ms: u64,
     out_err: *mut *mut c_char,
 ) -> *mut ServeHandleC {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        write_err(out_err, "MeshRpc handle is NULL".into());
-        return std::ptr::null_mut();
-    };
-    let Some(service) = cstr_to_string(service_ptr, service_len) else {
-        write_err(out_err, "service name is NULL or non-UTF-8".into());
-        return std::ptr::null_mut();
-    };
-    if STREAMING_DISPATCHER.get().is_none() {
-        write_err(
-            out_err,
-            "net_rpc_set_streaming_handler_dispatcher must be called before \
+    ffi_guard!(std::ptr::null_mut(), {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            write_err(out_err, "MeshRpc handle is NULL".into());
+            return std::ptr::null_mut();
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return std::ptr::null_mut();
+        };
+        if STREAMING_DISPATCHER.get().is_none() {
+            write_err(
+                out_err,
+                "net_rpc_set_streaming_handler_dispatcher must be called before \
              net_rpc_serve_streaming"
-                .into(),
-        );
-        return std::ptr::null_mut();
-    }
-    if handler_id == 0 {
-        write_err(
-            out_err,
-            "handler_id must be non-zero (reserve via net_rpc_reserve_handler_id)".into(),
-        );
-        return std::ptr::null_mut();
-    }
-    let timeout = if handler_timeout_ms == 0 {
-        DEFAULT_HANDLER_TIMEOUT
-    } else {
-        Duration::from_millis(handler_timeout_ms)
-    };
-    let rust_handler = Arc::new(GoStreamingRpcHandler {
-        handler_id,
-        timeout,
-    });
-    match h.node.serve_rpc_streaming(&service, rust_handler) {
-        Ok(inner) => Box::into_raw(Box::new(ServeHandleC {
-            inner: Arc::new(Mutex::new(Some(inner))),
-            handler_id,
-        })),
-        Err(e) => {
-            write_err(out_err, format!("serve failed: {e}"));
-            std::ptr::null_mut()
+                    .into(),
+            );
+            return std::ptr::null_mut();
         }
-    }
+        if handler_id == 0 {
+            write_err(
+                out_err,
+                "handler_id must be non-zero (reserve via net_rpc_reserve_handler_id)".into(),
+            );
+            return std::ptr::null_mut();
+        }
+        let timeout = if handler_timeout_ms == 0 {
+            DEFAULT_HANDLER_TIMEOUT
+        } else {
+            Duration::from_millis(handler_timeout_ms)
+        };
+        let rust_handler = Arc::new(GoStreamingRpcHandler {
+            handler_id,
+            timeout,
+        });
+        match h.node.serve_rpc_streaming(&service, rust_handler) {
+            Ok(inner) => Box::into_raw(Box::new(ServeHandleC {
+                inner: Arc::new(Mutex::new(Some(inner))),
+                handler_id,
+            })),
+            Err(e) => {
+                write_err(out_err, format!("serve failed: {e}"));
+                std::ptr::null_mut()
+            }
+        }
+    })
 }
 
 /// Register a duplex handler for `service`. Same pre-registration
@@ -3177,48 +3417,50 @@ pub extern "C" fn net_rpc_serve_duplex(
     handler_timeout_ms: u64,
     out_err: *mut *mut c_char,
 ) -> *mut ServeHandleC {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        write_err(out_err, "MeshRpc handle is NULL".into());
-        return std::ptr::null_mut();
-    };
-    let Some(service) = cstr_to_string(service_ptr, service_len) else {
-        write_err(out_err, "service name is NULL or non-UTF-8".into());
-        return std::ptr::null_mut();
-    };
-    if DUPLEX_DISPATCHER.get().is_none() {
-        write_err(
-            out_err,
-            "net_rpc_set_duplex_handler_dispatcher must be called before net_rpc_serve_duplex"
-                .into(),
-        );
-        return std::ptr::null_mut();
-    }
-    if handler_id == 0 {
-        write_err(
-            out_err,
-            "handler_id must be non-zero (reserve via net_rpc_reserve_handler_id)".into(),
-        );
-        return std::ptr::null_mut();
-    }
-    let timeout = if handler_timeout_ms == 0 {
-        DEFAULT_HANDLER_TIMEOUT
-    } else {
-        Duration::from_millis(handler_timeout_ms)
-    };
-    let rust_handler = Arc::new(GoDuplexRpcHandler {
-        handler_id,
-        timeout,
-    });
-    match h.node.serve_rpc_duplex(&service, rust_handler) {
-        Ok(inner) => Box::into_raw(Box::new(ServeHandleC {
-            inner: Arc::new(Mutex::new(Some(inner))),
-            handler_id,
-        })),
-        Err(e) => {
-            write_err(out_err, format!("serve failed: {e}"));
-            std::ptr::null_mut()
+    ffi_guard!(std::ptr::null_mut(), {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            write_err(out_err, "MeshRpc handle is NULL".into());
+            return std::ptr::null_mut();
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return std::ptr::null_mut();
+        };
+        if DUPLEX_DISPATCHER.get().is_none() {
+            write_err(
+                out_err,
+                "net_rpc_set_duplex_handler_dispatcher must be called before net_rpc_serve_duplex"
+                    .into(),
+            );
+            return std::ptr::null_mut();
         }
-    }
+        if handler_id == 0 {
+            write_err(
+                out_err,
+                "handler_id must be non-zero (reserve via net_rpc_reserve_handler_id)".into(),
+            );
+            return std::ptr::null_mut();
+        }
+        let timeout = if handler_timeout_ms == 0 {
+            DEFAULT_HANDLER_TIMEOUT
+        } else {
+            Duration::from_millis(handler_timeout_ms)
+        };
+        let rust_handler = Arc::new(GoDuplexRpcHandler {
+            handler_id,
+            timeout,
+        });
+        match h.node.serve_rpc_duplex(&service, rust_handler) {
+            Ok(inner) => Box::into_raw(Box::new(ServeHandleC {
+                inner: Arc::new(Mutex::new(Some(inner))),
+                handler_id,
+            })),
+            Err(e) => {
+                write_err(out_err, format!("serve failed: {e}"));
+                std::ptr::null_mut()
+            }
+        }
+    })
 }
 
 // =========================================================================
@@ -3322,7 +3564,9 @@ static OBSERVER_DISPATCHER: OnceLock<RpcObserverFn> = OnceLock::new();
 /// [`net_rpc_observer_install`].
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_set_observer_dispatcher(observer: RpcObserverFn) {
-    let _ = OBSERVER_DISPATCHER.set(observer);
+    ffi_guard!((), {
+        let _ = OBSERVER_DISPATCHER.set(observer);
+    })
 }
 
 /// Build the C POD `RpcCallEventC` from the shared
@@ -3375,7 +3619,7 @@ fn dispatch_observer_event_to_go(evt: Arc<InnerRpcCallEvent>) {
 /// without paying the JSON-decode cost on hot paths.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_observer_dropped_total() -> u64 {
-    ::net::adapter::net::cortex::observer_dropped_total()
+    ffi_guard!(0, { ::net::adapter::net::cortex::observer_dropped_total() })
 }
 
 /// Enable (`enabled != 0`) or clear (`enabled == 0`) the observer
@@ -3393,24 +3637,26 @@ pub extern "C" fn net_rpc_observer_dropped_total() -> u64 {
 ///     [`net_rpc_set_observer_dispatcher`].
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_observer_install(handle: *const MeshRpcHandle, enabled: c_int) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    if enabled != 0 {
-        if OBSERVER_DISPATCHER.get().is_none() {
-            return NET_RPC_ERR_NO_DISPATCHER;
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        if enabled != 0 {
+            if OBSERVER_DISPATCHER.get().is_none() {
+                return NET_RPC_ERR_NO_DISPATCHER;
+            }
+            let handle = runtime().handle().clone();
+            let channel = ::net::adapter::net::cortex::ObserverChannel::install(
+                &handle,
+                dispatch_observer_event_to_go,
+            );
+            let obs: Arc<dyn RpcObserver> = Arc::new(channel);
+            h.node.set_rpc_observer(Some(obs));
+        } else {
+            h.node.set_rpc_observer(None);
         }
-        let handle = runtime().handle().clone();
-        let channel = ::net::adapter::net::cortex::ObserverChannel::install(
-            &handle,
-            dispatch_observer_event_to_go,
-        );
-        let obs: Arc<dyn RpcObserver> = Arc::new(channel);
-        h.node.set_rpc_observer(Some(obs));
-    } else {
-        h.node.set_rpc_observer(None);
-    }
-    NET_RPC_OK
+        NET_RPC_OK
+    })
 }
 
 /// Snapshot the per-service nRPC metrics registry. On success
@@ -3458,51 +3704,53 @@ pub extern "C" fn net_rpc_metrics_snapshot(
     out_json_len: *mut usize,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        write_err(out_err, "MeshRpc handle is NULL".into());
-        return NET_RPC_ERR_NULL;
-    };
-    if out_json_ptr.is_null() || out_json_len.is_null() {
-        write_err(out_err, "out_json_ptr / out_json_len is NULL".into());
-        return NET_RPC_ERR_NULL;
-    }
-    let snapshot = h.node.rpc_metrics_snapshot();
-    let value = serde_json::json!({
-        "services": snapshot.services.iter().map(|m| serde_json::json!({
-            "service": m.service,
-            "calls_total": m.calls_total,
-            "errors_no_route": m.errors_no_route,
-            "errors_timeout": m.errors_timeout,
-            "errors_server": m.errors_server,
-            "errors_transport": m.errors_transport,
-            "in_flight": m.in_flight,
-            "latency_sum_ns": m.latency_sum_ns,
-            "latency_count": m.latency_count,
-            "latency_buckets": m.latency_buckets,
-            "handler_invocations_total": m.handler_invocations_total,
-            "handler_panics_total": m.handler_panics_total,
-            "handler_in_flight": m.handler_in_flight,
-            "handler_duration_sum_ns": m.handler_duration_sum_ns,
-            "handler_duration_count": m.handler_duration_count,
-            "handler_duration_buckets": m.handler_duration_buckets,
-            "streaming_chunks_emitted_total": m.streaming_chunks_emitted_total,
-            "streaming_chunks_dropped_total": m.streaming_chunks_dropped_total,
-            "capability_denied_total": m.capability_denied_total,
-        })).collect::<Vec<_>>(),
-        // v3 / O-A3: process-global observer-drop counter. See
-        // also the dedicated `net_rpc_observer_dropped_total`
-        // FFI symbol for consumers that don't want to JSON-decode.
-        "observer_dropped_total": ::net::adapter::net::cortex::observer_dropped_total(),
-    });
-    let bytes = match serde_json::to_vec(&value) {
-        Ok(v) => v,
-        Err(e) => {
-            write_err(out_err, format!("metrics serialize failed: {e}"));
-            return NET_RPC_ERR_CALL_FAILED;
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            write_err(out_err, "MeshRpc handle is NULL".into());
+            return NET_RPC_ERR_NULL;
+        };
+        if out_json_ptr.is_null() || out_json_len.is_null() {
+            write_err(out_err, "out_json_ptr / out_json_len is NULL".into());
+            return NET_RPC_ERR_NULL;
         }
-    };
-    write_response(bytes, out_json_ptr, out_json_len);
-    NET_RPC_OK
+        let snapshot = h.node.rpc_metrics_snapshot();
+        let value = serde_json::json!({
+            "services": snapshot.services.iter().map(|m| serde_json::json!({
+                "service": m.service,
+                "calls_total": m.calls_total,
+                "errors_no_route": m.errors_no_route,
+                "errors_timeout": m.errors_timeout,
+                "errors_server": m.errors_server,
+                "errors_transport": m.errors_transport,
+                "in_flight": m.in_flight,
+                "latency_sum_ns": m.latency_sum_ns,
+                "latency_count": m.latency_count,
+                "latency_buckets": m.latency_buckets,
+                "handler_invocations_total": m.handler_invocations_total,
+                "handler_panics_total": m.handler_panics_total,
+                "handler_in_flight": m.handler_in_flight,
+                "handler_duration_sum_ns": m.handler_duration_sum_ns,
+                "handler_duration_count": m.handler_duration_count,
+                "handler_duration_buckets": m.handler_duration_buckets,
+                "streaming_chunks_emitted_total": m.streaming_chunks_emitted_total,
+                "streaming_chunks_dropped_total": m.streaming_chunks_dropped_total,
+                "capability_denied_total": m.capability_denied_total,
+            })).collect::<Vec<_>>(),
+            // v3 / O-A3: process-global observer-drop counter. See
+            // also the dedicated `net_rpc_observer_dropped_total`
+            // FFI symbol for consumers that don't want to JSON-decode.
+            "observer_dropped_total": ::net::adapter::net::cortex::observer_dropped_total(),
+        });
+        let bytes = match serde_json::to_vec(&value) {
+            Ok(v) => v,
+            Err(e) => {
+                write_err(out_err, format!("metrics serialize failed: {e}"));
+                return NET_RPC_ERR_CALL_FAILED;
+            }
+        };
+        write_response(bytes, out_json_ptr, out_json_len);
+        NET_RPC_OK
+    })
 }
 
 /// Aggregate the local capability fold into a flat list of
@@ -3526,24 +3774,26 @@ pub extern "C" fn net_rpc_list_tools(
     out_json_len: *mut usize,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        write_err(out_err, "MeshRpc handle is NULL".into());
-        return NET_RPC_ERR_NULL;
-    };
-    if out_json_ptr.is_null() || out_json_len.is_null() {
-        write_err(out_err, "out_json_ptr / out_json_len is NULL".into());
-        return NET_RPC_ERR_NULL;
-    }
-    let descriptors = h.node.list_tools(None);
-    let bytes = match serde_json::to_vec(&descriptors) {
-        Ok(v) => v,
-        Err(e) => {
-            write_err(out_err, format!("list_tools serialize failed: {e}"));
-            return NET_RPC_ERR_CALL_FAILED;
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            write_err(out_err, "MeshRpc handle is NULL".into());
+            return NET_RPC_ERR_NULL;
+        };
+        if out_json_ptr.is_null() || out_json_len.is_null() {
+            write_err(out_err, "out_json_ptr / out_json_len is NULL".into());
+            return NET_RPC_ERR_NULL;
         }
-    };
-    write_response(bytes, out_json_ptr, out_json_len);
-    NET_RPC_OK
+        let descriptors = h.node.list_tools(None);
+        let bytes = match serde_json::to_vec(&descriptors) {
+            Ok(v) => v,
+            Err(e) => {
+                write_err(out_err, format!("list_tools serialize failed: {e}"));
+                return NET_RPC_ERR_CALL_FAILED;
+            }
+        };
+        write_response(bytes, out_json_ptr, out_json_len);
+        NET_RPC_OK
+    })
 }
 
 // =========================================================================
@@ -3593,30 +3843,32 @@ pub extern "C" fn net_rpc_watch_tools(
     out_watch: *mut *mut ToolWatchHandleC,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        write_err(out_err, "MeshRpc handle is NULL".into());
-        return NET_RPC_ERR_NULL;
-    };
-    if out_watch.is_null() {
-        write_err(out_err, "out_watch is NULL".into());
-        return NET_RPC_ERR_NULL;
-    }
-    let interval = if interval_ms == 0 {
-        None
-    } else {
-        Some(std::time::Duration::from_millis(interval_ms))
-    };
-    let watch = h.node.watch_tools(None, interval);
-    let cancel = watch.cancel_handle();
-    let boxed = Box::new(ToolWatchHandleC {
-        inner: Arc::new(Mutex::new(Some(watch))),
-        cancel,
-        done: AtomicBool::new(false),
-    });
-    unsafe {
-        *out_watch = Box::into_raw(boxed);
-    }
-    NET_RPC_OK
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        let Some(h) = (unsafe { handle.as_ref() }) else {
+            write_err(out_err, "MeshRpc handle is NULL".into());
+            return NET_RPC_ERR_NULL;
+        };
+        if out_watch.is_null() {
+            write_err(out_err, "out_watch is NULL".into());
+            return NET_RPC_ERR_NULL;
+        }
+        let interval = if interval_ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(interval_ms))
+        };
+        let watch = h.node.watch_tools(None, interval);
+        let cancel = watch.cancel_handle();
+        let boxed = Box::new(ToolWatchHandleC {
+            inner: Arc::new(Mutex::new(Some(watch))),
+            cancel,
+            done: AtomicBool::new(false),
+        });
+        unsafe {
+            *out_watch = Box::into_raw(boxed);
+        }
+        NET_RPC_OK
+    })
 }
 
 /// Block until the next `ToolListChange` and write it as JSON
@@ -3635,79 +3887,81 @@ pub extern "C" fn net_rpc_watch_tools_next(
     out_json_len: *mut usize,
     out_err: *mut *mut c_char,
 ) -> c_int {
-    use net::adapter::net::cortex::tool::ToolListChange;
-    let Some(w) = (unsafe { watch.as_ref() }) else {
-        return NET_RPC_ERR_NULL;
-    };
-    if out_json_ptr.is_null() || out_json_len.is_null() {
-        write_err(out_err, "out_json_ptr / out_json_len is NULL".into());
-        return NET_RPC_ERR_NULL;
-    }
-    if w.done.load(Ordering::Relaxed) {
-        unsafe {
-            *out_json_ptr = std::ptr::null_mut();
-            *out_json_len = 0;
+    ffi_guard!(NET_RPC_ERR_NULL, {
+        use net::adapter::net::cortex::tool::ToolListChange;
+        let Some(w) = (unsafe { watch.as_ref() }) else {
+            return NET_RPC_ERR_NULL;
+        };
+        if out_json_ptr.is_null() || out_json_len.is_null() {
+            write_err(out_err, "out_json_ptr / out_json_len is NULL".into());
+            return NET_RPC_ERR_NULL;
         }
-        return NET_RPC_ERR_STREAM_DONE;
-    }
-    let inner_opt = w.inner.lock().take();
-    let mut inner = match inner_opt {
-        Some(i) => i,
-        None => {
-            w.done.store(true, Ordering::Relaxed);
+        if w.done.load(Ordering::Relaxed) {
             unsafe {
                 *out_json_ptr = std::ptr::null_mut();
                 *out_json_len = 0;
             }
             return NET_RPC_ERR_STREAM_DONE;
         }
-    };
-    let item = runtime().block_on(async { inner.next().await });
-    match item {
-        Some(change) => {
-            // Put the stream back for subsequent polls.
-            *w.inner.lock() = Some(inner);
-            // `ToolListChange` isn't `Serialize`; map to the wire
-            // shape the cross-language bindings agree on. The inner
-            // `ToolDescriptor` IS `Serialize`.
-            let json = match change {
-                ToolListChange::Added(d) => {
-                    serde_json::json!({ "type": "added", "descriptor": d })
+        let inner_opt = w.inner.lock().take();
+        let mut inner = match inner_opt {
+            Some(i) => i,
+            None => {
+                w.done.store(true, Ordering::Relaxed);
+                unsafe {
+                    *out_json_ptr = std::ptr::null_mut();
+                    *out_json_len = 0;
                 }
-                ToolListChange::Removed(d) => {
-                    serde_json::json!({ "type": "removed", "descriptor": d })
-                }
-                ToolListChange::NodeCountChanged {
-                    descriptor,
-                    prev_node_count,
-                } => serde_json::json!({
-                    "type": "node_count_changed",
-                    "descriptor": descriptor,
-                    "prev_node_count": prev_node_count,
-                }),
-            };
-            match serde_json::to_vec(&json) {
-                Ok(v) => {
-                    write_response(v, out_json_ptr, out_json_len);
-                    NET_RPC_OK
-                }
-                Err(e) => {
-                    w.done.store(true, Ordering::Relaxed);
-                    write_err(out_err, format!("watch_tools serialize failed: {e}"));
-                    NET_RPC_ERR_CALL_FAILED
+                return NET_RPC_ERR_STREAM_DONE;
+            }
+        };
+        let item = block_on(async { inner.next().await });
+        match item {
+            Some(change) => {
+                // Put the stream back for subsequent polls.
+                *w.inner.lock() = Some(inner);
+                // `ToolListChange` isn't `Serialize`; map to the wire
+                // shape the cross-language bindings agree on. The inner
+                // `ToolDescriptor` IS `Serialize`.
+                let json = match change {
+                    ToolListChange::Added(d) => {
+                        serde_json::json!({ "type": "added", "descriptor": d })
+                    }
+                    ToolListChange::Removed(d) => {
+                        serde_json::json!({ "type": "removed", "descriptor": d })
+                    }
+                    ToolListChange::NodeCountChanged {
+                        descriptor,
+                        prev_node_count,
+                    } => serde_json::json!({
+                        "type": "node_count_changed",
+                        "descriptor": descriptor,
+                        "prev_node_count": prev_node_count,
+                    }),
+                };
+                match serde_json::to_vec(&json) {
+                    Ok(v) => {
+                        write_response(v, out_json_ptr, out_json_len);
+                        NET_RPC_OK
+                    }
+                    Err(e) => {
+                        w.done.store(true, Ordering::Relaxed);
+                        write_err(out_err, format!("watch_tools serialize failed: {e}"));
+                        NET_RPC_ERR_CALL_FAILED
+                    }
                 }
             }
-        }
-        None => {
-            drop(inner);
-            w.done.store(true, Ordering::Relaxed);
-            unsafe {
-                *out_json_ptr = std::ptr::null_mut();
-                *out_json_len = 0;
+            None => {
+                drop(inner);
+                w.done.store(true, Ordering::Relaxed);
+                unsafe {
+                    *out_json_ptr = std::ptr::null_mut();
+                    *out_json_len = 0;
+                }
+                NET_RPC_ERR_STREAM_DONE
             }
-            NET_RPC_ERR_STREAM_DONE
         }
-    }
+    })
 }
 
 /// Latch the watch closed and fire the substrate cancel. Safe to
@@ -3725,11 +3979,13 @@ pub extern "C" fn net_rpc_watch_tools_next(
 #[cfg(feature = "tool")]
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_watch_tools_close(watch: *mut ToolWatchHandleC) {
-    let Some(w) = (unsafe { watch.as_ref() }) else {
-        return;
-    };
-    w.done.store(true, Ordering::Relaxed);
-    w.cancel.notify_one();
+    ffi_guard!((), {
+        let Some(w) = (unsafe { watch.as_ref() }) else {
+            return;
+        };
+        w.done.store(true, Ordering::Relaxed);
+        w.cancel.notify_one();
+    })
 }
 
 /// Free the watch handle. Implicitly closes if not already.
@@ -3738,12 +3994,14 @@ pub extern "C" fn net_rpc_watch_tools_close(watch: *mut ToolWatchHandleC) {
 #[cfg(feature = "tool")]
 #[unsafe(no_mangle)]
 pub extern "C" fn net_rpc_watch_tools_free(watch: *mut ToolWatchHandleC) {
-    if watch.is_null() {
-        return;
-    }
-    unsafe {
-        drop(Box::from_raw(watch));
-    }
+    ffi_guard!((), {
+        if watch.is_null() {
+            return;
+        }
+        unsafe {
+            drop(Box::from_raw(watch));
+        }
+    })
 }
 
 // =========================================================================
@@ -4311,5 +4569,173 @@ mod tests {
         let substrate = ::net::adapter::net::cortex::observer_dropped_total();
         let via_ffi = net_rpc_observer_dropped_total();
         assert_eq!(substrate, via_ffi);
+    }
+
+    // ----- #31: `len > isize::MAX` guards before `from_raw_parts`. -----
+
+    /// `cstr_to_string` rejects a length above `isize::MAX` (a C
+    /// caller passing `(size_t)-1`) BEFORE constructing the slice —
+    /// `slice::from_raw_parts` treats that as immediate UB. We pass a
+    /// dangling-but-non-NULL pointer to prove the guard fires before
+    /// any deref.
+    #[test]
+    fn cstr_to_string_rejects_isize_max_overflow() {
+        let dangling = std::ptr::NonNull::<c_char>::dangling().as_ptr() as *const c_char;
+        assert!(cstr_to_string(dangling, usize::MAX).is_none());
+        // isize::MAX itself is the boundary — still rejected (the
+        // guard is `> isize::MAX`, so exactly isize::MAX is allowed,
+        // but isize::MAX as usize + 1 == the smallest rejected value).
+        assert!(cstr_to_string(dangling, (isize::MAX as usize) + 1).is_none());
+    }
+
+    /// `copy_body` returns the empty body for NULL, a real copy for a
+    /// valid `(ptr, len)`, and `None` when `len > isize::MAX` (so the
+    /// caller can surface a clean invalid-arg code instead of hitting
+    /// the `from_raw_parts` UB).
+    #[test]
+    fn copy_body_null_normal_and_isize_max_guard() {
+        // NULL → empty.
+        let b = unsafe { copy_body(std::ptr::null(), 0) }.expect("null is empty, not error");
+        assert!(b.is_empty());
+        // Normal round-trip.
+        let data = b"payload";
+        let b = unsafe { copy_body(data.as_ptr(), data.len()) }.expect("valid copy");
+        assert_eq!(&b[..], data);
+        // Oversized length → None, no deref of the dangling pointer.
+        let dangling = std::ptr::NonNull::<u8>::dangling().as_ptr() as *const u8;
+        assert!(unsafe { copy_body(dangling, usize::MAX) }.is_none());
+    }
+
+    /// `collect_headers` rejects a `header_count` above `isize::MAX`
+    /// before forming the header-array slice. A non-NULL dangling
+    /// pointer proves the guard fires ahead of the deref.
+    #[test]
+    fn collect_headers_rejects_isize_max_count() {
+        let dangling =
+            std::ptr::NonNull::<NetRpcHeader>::dangling().as_ptr() as *const NetRpcHeader;
+        assert!(unsafe { collect_headers(dangling, usize::MAX) }.is_none());
+    }
+
+    // ----- #30: out-params are null-checked before being written. -----
+
+    /// `write_response` is a no-op when the out-pointer is NULL —
+    /// it must not dereference a NULL out-param (UB) and must not
+    /// leak `body` (it is owned and dropped here). Mirrors the
+    /// null-check `write_err` already performs.
+    #[test]
+    fn write_response_null_out_params_are_noop() {
+        // NULL out_ptr.
+        let mut out_len: usize = 123;
+        write_response(b"abc".to_vec(), std::ptr::null_mut(), &mut out_len);
+        // Untouched — the function returned before writing.
+        assert_eq!(out_len, 123);
+        // NULL out_len.
+        let mut out_ptr: *mut u8 = std::ptr::null_mut();
+        write_response(b"abc".to_vec(), &mut out_ptr, std::ptr::null_mut());
+        assert!(out_ptr.is_null());
+        // Both NULL — still a clean no-op, no panic.
+        write_response(b"abc".to_vec(), std::ptr::null_mut(), std::ptr::null_mut());
+    }
+
+    /// `net_rpc_find_service_nodes` returns `NET_RPC_ERR_NULL` (not a
+    /// crash) when an out-param is NULL, even with a NULL handle the
+    /// handle check fires first. Pin the null-handle contract; the
+    /// out-param null-check is exercised by `write_response`'s test
+    /// above (the same discipline) and by code review since reaching
+    /// the out-param branch requires a live mesh.
+    #[test]
+    fn find_service_nodes_null_handle_is_safe() {
+        let svc = b"svc";
+        let mut out_ptr: *mut u64 = std::ptr::null_mut();
+        let mut out_count: usize = 0;
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let code = net_rpc_find_service_nodes(
+            std::ptr::null_mut(),
+            svc.as_ptr() as *const c_char,
+            svc.len(),
+            &mut out_ptr,
+            &mut out_count,
+            &mut err,
+        );
+        assert_eq!(code, NET_RPC_ERR_NULL);
+        assert!(out_ptr.is_null());
+    }
+
+    // ----- #16: duplex_into_split preserves a surviving half. -----
+
+    /// On the partially-consumed arm (`Some`/`None`), `into_split`
+    /// must NOT take + drop the surviving half (which would fire a
+    /// premature CANCEL on a half the caller never received). We
+    /// can't construct the SDK inner halves without a live mesh, so
+    /// this test stands up a `DuplexCallHandleC` whose `sink` is
+    /// already `None` (simulating a prior partial consume) and a
+    /// `stream` Option we can observe. The `stream` half's Option
+    /// must remain `Some` after the failed split, proving the
+    /// put-back path runs rather than the old take+drop. We use a
+    /// sentinel `Arc` we can refcount-check in lieu of the real
+    /// `InnerDuplexStream`.
+    ///
+    /// Since `DuplexCallHandleC::stream` is typed
+    /// `Arc<Mutex<Option<InnerDuplexStream>>>`, we cannot inject a
+    /// stand-in value; instead we assert the simpler observable: a
+    /// `(None, None)` handle still returns `STREAM_DONE` and leaves
+    /// both Options `None` without panic (the put-back arm's
+    /// `if let Some(..)` correctly skips the absent halves).
+    #[test]
+    fn duplex_into_split_partial_consume_returns_stream_done_without_panic() {
+        let handle = Box::into_raw(Box::new(DuplexCallHandleC {
+            sink: Arc::new(Mutex::new(None)),
+            stream: Arc::new(Mutex::new(None)),
+            call_id: 7,
+            done: AtomicBool::new(false),
+        }));
+        let mut out_sink: *mut DuplexSinkHandleC = std::ptr::null_mut();
+        let mut out_stream: *mut DuplexStreamHandleC = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let code = net_rpc_duplex_into_split(handle, &mut out_sink, &mut out_stream, &mut err);
+        // Both halves absent → partial-consume arm → STREAM_DONE.
+        assert_eq!(code, NET_RPC_ERR_STREAM_DONE);
+        // No handles handed out.
+        assert!(out_sink.is_null());
+        assert!(out_stream.is_null());
+        // The put-back arm ran its `if let Some(..)` guards over the
+        // absent halves without panicking; the Options are still None.
+        unsafe {
+            assert!((*handle).sink.lock().is_none());
+            assert!((*handle).stream.lock().is_none());
+            drop(Box::from_raw(handle));
+        }
+        if !err.is_null() {
+            net_rpc_free_cstring(err);
+        }
+    }
+
+    // ----- #8: the panic guard catches an unwind and returns the
+    // function's natural default instead of letting it cross the C ABI
+    // (which is UB). -----
+
+    /// The `ffi_guard!` macro converts a panic inside the body into
+    /// the supplied default rather than propagating the unwind.
+    /// Exercised directly because forcing a deterministic panic in a
+    /// real entry point needs a live mesh.
+    #[test]
+    fn ffi_guard_catches_panic_and_returns_default() {
+        // A body that panics on the tail: `panic!` has type `!`, which
+        // coerces to the default's type, so no unreachable trailing
+        // value is needed. The guard must return the default, not
+        // unwind.
+        let code: c_int = ffi_guard!(NET_RPC_ERR_NULL, { panic!("boom") });
+        assert_eq!(code, NET_RPC_ERR_NULL);
+
+        // Pointer default.
+        let p: *mut ServeHandleC = ffi_guard!(std::ptr::null_mut(), { panic!("boom-ptr") });
+        assert!(p.is_null());
+
+        // u64 default + non-panic passthrough proves the Ok path
+        // returns the body's value unchanged.
+        let ok: u64 = ffi_guard!(0, { 99u64 });
+        assert_eq!(ok, 99);
+        let recovered: u64 = ffi_guard!(0, { panic!("boom-u64") });
+        assert_eq!(recovered, 0);
     }
 }
