@@ -827,16 +827,20 @@ impl LoadBalancer {
         // Hold `membership_lock` across the mutation + rebuild so a concurrent
         // add/remove can't store a stale snapshot over ours (see field doc).
         let _guard = self.membership_lock.lock();
-        self.endpoints
-            .insert(node_id, Arc::new(EndpointState::new(endpoint)));
+        let was_present = self
+            .endpoints
+            .insert(node_id, Arc::new(EndpointState::new(endpoint)))
+            .is_some();
 
         // Add (or idempotently re-add) this node's vnodes. `add_to_hash_ring`
         // overwrites the node's own prior vnodes in place and sweeps any
         // stale leftovers, so a re-add (reconnect / weight change) neither
         // leaks vnodes nor leaves a transient window where the node is
         // absent from the ring (which would misroute traffic for an
-        // endpoint that was meant to stay available).
-        self.add_to_hash_ring(node_id);
+        // endpoint that was meant to stay available). `was_present`
+        // (endpoint absent => no prior vnodes, under `membership_lock`)
+        // lets a fresh add skip the full-ring stale-vnode sweep.
+        self.add_to_hash_ring(node_id, was_present);
         self.rebuild_endpoint_list();
     }
 
@@ -1444,7 +1448,11 @@ impl LoadBalancer {
         self.select_weighted_round_robin(endpoints)
     }
 
-    fn add_to_hash_ring(&self, node_id: NodeId) {
+    /// Place (or idempotently re-place) `node_id`'s vnodes on the ring.
+    /// `was_present` is whether the node already had an endpoint entry
+    /// (and therefore prior vnodes): on a fresh add it is false and the
+    /// stale-vnode sweep is skipped, avoiding a full-ring scan per join.
+    fn add_to_hash_ring(&self, node_id: NodeId, was_present: bool) {
         // Slots this node ends up occupying in THIS call — used both to
         // keep the node's own intra-call collisions distinct and to
         // sweep any stale vnodes left by a prior add (drift cleanup).
@@ -1482,9 +1490,14 @@ impl LoadBalancer {
         // probe path changed (e.g. a collision partner was since
         // removed). The node's freshly-placed vnodes are all in `placed`
         // and inserted above, so it is never absent from the ring; this
-        // only drops leftovers. Common case: nothing to remove.
-        self.hash_ring
-            .retain(|k, v| *v != node_id || placed.contains(k));
+        // only drops leftovers. Skipped entirely on a fresh add: a node
+        // with no prior endpoint entry has no prior vnodes to leave
+        // behind, so the O(ring) retain scan would never remove anything
+        // — important when many nodes join a large ring.
+        if was_present {
+            self.hash_ring
+                .retain(|k, v| *v != node_id || placed.contains(k));
+        }
     }
 
     fn remove_from_hash_ring(&self, node_id: &NodeId) {
@@ -3078,7 +3091,8 @@ mod tests {
 
         // Now add the newcomer — every primary slot collides with a
         // victim vnode and must be linear-probed past, NOT clobbered.
-        lb.add_to_hash_ring(newcomer);
+        // Fresh add (newcomer was never present) => was_present = false.
+        lb.add_to_hash_ring(newcomer, false);
 
         // None of the victim's vnodes may have been overwritten.
         let victim_count = lb.hash_ring.iter().filter(|e| *e.value() == victim).count();
