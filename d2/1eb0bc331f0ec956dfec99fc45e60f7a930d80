@@ -1,0 +1,23 @@
+go/mesh_rpc.go
+  s_8d9ce9de1270a9::t_10d72a55b4c48b 1046-1072
+  s_8d9ce9de1270a9::t_7c314aa31838e6 1153-1157
+  s_8d9ce9de1270a9::t_0f038a8782d490 1213
+  s_8d9ce9de1270a9::t_4b04a312fa3272 1612
+  s_8d9ce9de1270a9::t_84d933c4cd568d 1784
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "d21eb0bc331f0ec956dfec99fc45e60f7a930d80",
+  "prompts": {},
+  "sessions": {
+    "s_8d9ce9de1270a9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5673ce20-f8cb-4442-a0bc-4dba027009a9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
