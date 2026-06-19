@@ -430,7 +430,7 @@ func (s *MeshOsDaemonSdk) RegisterDaemon(name string, seed []byte) (*MeshOsDaemo
 	if err := meshosStatusToError(status); err != nil {
 		return nil, err
 	}
-	h := &MeshOsDaemonHandle{ptr: raw}
+	h := newMeshOsDaemonHandle(raw, 0)
 	runtime.SetFinalizer(h, func(h *MeshOsDaemonHandle) { h.Free() })
 	return h, nil
 }
@@ -460,14 +460,24 @@ func (s *MeshOsDaemonSdk) Free() {
 
 // MeshOsDaemonHandle is the Go-side handle for a registered daemon.
 //
-// #2: every FFI method derefs `ptr` under `mu.RLock` and Free takes
-// `mu.Lock`, so a concurrent Free() (explicit or via the GC
-// finalizer) can never free the native handle while a call is
-// in-flight on it (which was a use-after-free with the prior
-// unsynchronized check-then-use on `ptr`).
+// #2: every FFI method brackets its deref of `ptr` with the
+// streamHandleGuard's enter()/leave(), and Free requests teardown via
+// requestFree(). The guard runs the native free EXACTLY ONCE and only
+// after every in-flight op has left, so a concurrent Free() (explicit
+// or via the GC finalizer) can never free the handle out from under a
+// call in flight (the prior check-then-use on `ptr` was a UAF).
+//
+// Unlike an RWMutex, the guard never blocks the free path: Free's
+// requestFree() returns immediately even while a direct, unbounded
+// NextControl(0) is parked in its blocking cgo call (the free is then
+// deferred to when that op leaves). That avoids the lock-across-
+// blocking-call wedge where Free's write lock starved behind a parked
+// receiver. (An uncancellable unbounded NextControl(0) still only
+// returns on an event or shutdown — nothing can wake it early — but it
+// no longer wedges Free.)
 type MeshOsDaemonHandle struct {
-	mu           sync.RWMutex
 	ptr          *C.NetMeshOsHandle
+	guard        *streamHandleGuard
 	daemonHandle cgo.Handle
 	freeOnce     sync.Once
 	controlOnce  sync.Once
@@ -476,20 +486,34 @@ type MeshOsDaemonHandle struct {
 	pumpDone     chan struct{}
 }
 
-// withReadHandle runs fn under the read lock with a validated,
-// non-nil native handle, keeping h alive across the cgo call.
-// Returns false (without calling fn) when the handle is nil or has
-// been freed. Every FFI deref of `ptr` goes through here so Free's
-// `_free` (which takes the write lock) cannot race a live op.
+// newMeshOsDaemonHandle wires a registered native handle to a
+// streamHandleGuard whose free closure captures only the raw C pointer
+// and the cgo.Handle (never the owning struct), so the GC finalizer is
+// preserved. cgoHandle may be 0 (the no-Go-callbacks register path).
+func newMeshOsDaemonHandle(raw *C.NetMeshOsHandle, cgoHandle cgo.Handle) *MeshOsDaemonHandle {
+	guard := newStreamHandleGuard(func() {
+		C.net_meshos_handle_free(raw)
+		if cgoHandle != 0 {
+			cgoHandle.Delete()
+		}
+	})
+	return &MeshOsDaemonHandle{ptr: raw, guard: guard, daemonHandle: cgoHandle}
+}
+
+// withReadHandle runs fn against the native handle while registered as
+// an in-flight op on the guard, keeping h alive across the cgo call.
+// Returns false (without calling fn) once teardown has been requested,
+// so a freed handle is never dereferenced. Every FFI deref of `ptr`
+// goes through here: the guard guarantees the native free runs only
+// after this op leaves, so `ptr` is valid for the whole call.
 func (h *MeshOsDaemonHandle) withReadHandle(fn func(ptr *C.NetMeshOsHandle)) bool {
 	if h == nil {
 		return false
 	}
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	if h.ptr == nil {
+	if !h.guard.enter() {
 		return false
 	}
+	defer h.guard.leave()
 	fn(h.ptr)
 	runtime.KeepAlive(h)
 	return true
@@ -588,30 +612,20 @@ func (h *MeshOsDaemonHandle) Free() {
 		return
 	}
 	h.freeOnce.Do(func() {
-		// Stop the ControlEvents pump and wait for it to exit BEFORE
-		// taking the write lock. The pump's in-flight NextControl
-		// holds the read lock (its 50ms poll bounds the wait), so
-		// grabbing the write lock first would deadlock against it.
+		// Stop the ControlEvents pump and wait for it to exit so no
+		// pump op is in flight on the guard before we request teardown.
 		if h.pumpStop != nil {
 			close(h.pumpStop)
 			if h.pumpDone != nil {
 				<-h.pumpDone
 			}
 		}
-		// #2: take the write lock so no other method is mid-cgo-call
-		// on the native handle when we free it.
-		h.mu.Lock()
-		defer h.mu.Unlock()
-		if h.ptr == nil {
-			return
-		}
-		C.net_meshos_handle_free(h.ptr)
-		h.ptr = nil
-		if h.daemonHandle != 0 {
-			h.daemonHandle.Delete()
-			h.daemonHandle = 0
-		}
 		runtime.SetFinalizer(h, nil)
+		// #2: request teardown. requestFree never blocks — it frees now
+		// if idle, otherwise the last in-flight op (e.g. a parked direct
+		// NextControl(0)) runs the free on its way out. The guard's free
+		// closure performs net_meshos_handle_free + cgo.Handle delete.
+		h.guard.requestFree()
 	})
 }
 
@@ -700,7 +714,7 @@ func (s *MeshOsDaemonSdk) RegisterDaemonWithCallbacks(daemon MeshOsDaemon, seed 
 		cgoHandle.Delete()
 		return nil, err
 	}
-	h := &MeshOsDaemonHandle{ptr: raw, daemonHandle: cgoHandle}
+	h := newMeshOsDaemonHandle(raw, cgoHandle)
 	runtime.SetFinalizer(h, func(h *MeshOsDaemonHandle) { h.Free() })
 	return h, nil
 }
