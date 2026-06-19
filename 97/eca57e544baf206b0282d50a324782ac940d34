@@ -1,0 +1,20 @@
+go/mesh_rpc.go
+  s_8d9ce9de1270a9::t_f5a826b71401d5 1932-1949
+  s_8d9ce9de1270a9::t_86ca2f9d73a647 1974-1976,1984,1987,2007-2009,2012,2015-2018,2032,2035,2045-2047,2056,2059,2083-2084,2087
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "97eca57e544baf206b0282d50a324782ac940d34",
+  "prompts": {},
+  "sessions": {
+    "s_8d9ce9de1270a9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5673ce20-f8cb-4442-a0bc-4dba027009a9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
