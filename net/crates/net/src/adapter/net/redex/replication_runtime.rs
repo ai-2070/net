@@ -37,10 +37,12 @@
 //! `ReplicationDispatcher`) lands in a separate slice — this
 //! commit covers the runtime task itself + the trait.
 
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use lru::LruCache;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -453,9 +455,15 @@ pub const CATCHUP_BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// forged frame from any peer that happens to be the recorded
 /// leader). Entries auto-expire after [`REQUEST_TTL`] so the set
 /// can't grow without bound under leader silence.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct OutstandingRequests {
-    entries: std::collections::HashMap<(NodeId, u64), Instant>,
+    // LRU-bounded to REQUEST_REGISTRY_SOFT_CAP. `take` pops (never
+    // `get`s) so nothing reorders entries after insertion — LRU order
+    // is exactly insertion order, and the entry evicted on overflow is
+    // the OLDEST recorded request, in O(1). This replaces the prior
+    // `HashMap` whose `record` scanned every entry (retain + min_by_key)
+    // on each insert once at the cap.
+    entries: LruCache<(NodeId, u64), Instant>,
 }
 
 /// TTL on entries in [`OutstandingRequests`]. Bounded by the
@@ -469,52 +477,36 @@ pub const REQUEST_TTL: Duration = Duration::from_secs(30);
 pub const REQUEST_REGISTRY_SOFT_CAP: usize = 256;
 
 impl OutstandingRequests {
-    /// Construct an empty registry.
+    /// Construct an empty registry bounded to
+    /// [`REQUEST_REGISTRY_SOFT_CAP`].
     pub fn new() -> Self {
+        // The cap is a nonzero const; `unwrap_or(MIN)` keeps the
+        // construction lint-clean (no expect/unwrap) for the impossible
+        // zero case.
+        let cap = NonZeroUsize::new(REQUEST_REGISTRY_SOFT_CAP).unwrap_or(NonZeroUsize::MIN);
         Self {
-            entries: std::collections::HashMap::new(),
+            entries: LruCache::new(cap),
         }
     }
 
     /// Record a freshly-minted `request_id` against `leader`.
-    /// Best-effort GC of expired entries runs at insert time so
-    /// the set stays bounded without a separate sweeper task.
     ///
-    /// #35: the expiry GC alone does NOT bound the map. Under
-    /// sustained young in-flight load (many channels / a fast
-    /// tick), a replica can legitimately hold ≥ cap requests all
-    /// younger than [`REQUEST_TTL`]; `retain` then evicts nothing
-    /// and the insert proceeds anyway, so the map grows without
-    /// bound until TTLs start expiring. To make the soft cap an
-    /// actual bound, after the expiry sweep, if we are still at or
-    /// above the cap, evict the single OLDEST entry before
-    /// inserting. Token matching stays correct — the evicted token
-    /// is the one closest to its own TTL, so a response for it was
-    /// already the most likely to be rejected as stale; the caller
+    /// #35: the map must stay bounded even under sustained young
+    /// in-flight load (many channels / a fast tick), where a replica
+    /// legitimately holds ≥ cap requests all younger than
+    /// [`REQUEST_TTL`]. The backing [`LruCache`] makes the bound a HARD
+    /// `<= REQUEST_REGISTRY_SOFT_CAP` in O(1): inserting a new key at
+    /// capacity evicts the least-recently-used (= oldest recorded, since
+    /// `take` only pops) entry. Token matching stays correct — the
+    /// evicted token is the one closest to its own TTL, so a response for
+    /// it was already the most likely to be rejected as stale; the caller
     /// treats a missing token exactly like an expired one (drop the
-    /// response). The map size after this method is therefore
-    /// `<= REQUEST_REGISTRY_SOFT_CAP`.
+    /// response). TTL expiry itself is enforced lazily in [`Self::take`],
+    /// so no per-insert O(n) sweep is needed.
     pub fn record(&mut self, leader: NodeId, request_id: u64, now: Instant) {
-        if self.entries.len() >= REQUEST_REGISTRY_SOFT_CAP {
-            self.entries
-                .retain(|_, &mut inserted| now.saturating_duration_since(inserted) < REQUEST_TTL);
-            // Replacing an existing key won't grow the map, so only
-            // force-evict when we'd actually add a NEW entry and are
-            // still at/over the cap with nothing expired.
-            if self.entries.len() >= REQUEST_REGISTRY_SOFT_CAP
-                && !self.entries.contains_key(&(leader, request_id))
-            {
-                if let Some(oldest_key) = self
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, &inserted)| inserted)
-                    .map(|(k, _)| *k)
-                {
-                    self.entries.remove(&oldest_key);
-                }
-            }
-        }
-        self.entries.insert((leader, request_id), now);
+        // `put` updates an existing key in place (no growth, no eviction)
+        // or inserts a new one, evicting the LRU entry when at capacity.
+        self.entries.put((leader, request_id), now);
     }
 
     /// Take the entry for `(leader, request_id)` if present and
@@ -522,7 +514,7 @@ impl OutstandingRequests {
     /// matched; the caller proceeds with the apply path. `false`
     /// means the response is stale / forged / past TTL — drop.
     pub fn take(&mut self, leader: NodeId, request_id: u64, now: Instant) -> bool {
-        match self.entries.remove(&(leader, request_id)) {
+        match self.entries.pop(&(leader, request_id)) {
             Some(inserted) => now.saturating_duration_since(inserted) < REQUEST_TTL,
             None => false,
         }
@@ -532,7 +524,15 @@ impl OutstandingRequests {
     /// the believed leader changes so a re-elected peer doesn't
     /// inherit the prior leader's in-flight token set.
     pub fn clear_leader(&mut self, leader: NodeId) {
-        self.entries.retain(|(l, _), _| *l != leader);
+        // LruCache has no `retain`; collect this leader's keys, then pop.
+        let to_drop: Vec<(NodeId, u64)> = self
+            .entries
+            .iter()
+            .filter_map(|(&key, _)| (key.0 == leader).then_some(key))
+            .collect();
+        for k in &to_drop {
+            self.entries.pop(k);
+        }
     }
 
     /// Current entry count. Test-only accessor for the #35
