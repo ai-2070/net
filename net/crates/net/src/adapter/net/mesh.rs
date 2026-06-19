@@ -96,6 +96,88 @@ const STREAM_GRANT_DRAIN_INTERVAL: Duration = Duration::from_millis(1);
 /// receiver NACK.
 const RETRANSMIT_TICK: Duration = Duration::from_millis(25);
 
+/// Upper bound on how long [`MeshNode::flush_stream_batch`] retries a
+/// committed-prefix flush against a receiver that grants no credit.
+/// After ANY packet of a multi-batch send is committed we can't surface
+/// `Backpressure` (the caller would replay the whole slice → duplicates,
+/// see #19), so we wait for a `StreamWindow` grant — but a receiver that
+/// grants zero credit for longer than the session-dead horizon
+/// (`NetConfig::DEFAULT_SESSION_TIMEOUT`, 30 s) is effectively gone.
+/// Past this budget we surface a terminal `Transport` error (which the
+/// caller does NOT replay) rather than spin forever (#4 follow-up).
+const COMMITTED_FLUSH_STALL_BUDGET: Duration = Duration::from_secs(30);
+
+/// Back off, then report whether the committed-prefix flush retry may
+/// continue. Returns `Err(StreamError::Transport)` once `deadline` has
+/// passed — a receiver that has granted no credit by then is treated as
+/// dead, and a terminal (non-replayable) error is preferable to an
+/// unbounded spin. Otherwise sleeps the current backoff, doubles it
+/// (capped at `cap`), and returns `Ok`. Factored out of
+/// `flush_stream_batch` so the bound is unit-testable under paused time.
+async fn await_credit_or_stall(
+    delay: &mut Duration,
+    cap: Duration,
+    deadline: tokio::time::Instant,
+) -> Result<(), StreamError> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(StreamError::Transport(
+            "stream credit stalled: receiver granted no credit within the send budget".to_string(),
+        ));
+    }
+    tokio::time::sleep(*delay).await;
+    *delay = (*delay * 2).min(cap);
+    Ok(())
+}
+
+#[cfg(test)]
+mod committed_flush_stall_tests {
+    use super::*;
+
+    /// #4: the committed-prefix retry must be bounded. Against a receiver
+    /// that never grants credit, `await_credit_or_stall` returns a
+    /// terminal `Transport` error once `COMMITTED_FLUSH_STALL_BUDGET`
+    /// elapses instead of looping forever. Paused time auto-advances as
+    /// the backoff sleeps complete, so this runs instantly.
+    #[tokio::test(start_paused = true)]
+    async fn committed_flush_retry_is_bounded_by_stall_budget() {
+        let cap = Duration::from_millis(200);
+        let deadline = tokio::time::Instant::now() + COMMITTED_FLUSH_STALL_BUDGET;
+        let mut delay = Duration::from_millis(5);
+        let mut iters = 0u32;
+        loop {
+            match await_credit_or_stall(&mut delay, cap, deadline).await {
+                Ok(()) => {
+                    iters += 1;
+                    assert!(iters < 100_000, "retry must be bounded, not spin forever");
+                }
+                Err(StreamError::Transport(msg)) => {
+                    assert!(msg.contains("credit stalled"), "terminal stall error: {msg}");
+                    break;
+                }
+                Err(other) => panic!("unexpected error variant: {other}"),
+            }
+        }
+        // Backoff caps at 200ms, so reaching the 30s budget takes on the
+        // order of ~150 iterations — bounded, never the spin guard.
+        assert!(iters > 0, "should back off at least once before giving up");
+        assert!(iters < 10_000, "should reach the budget via capped backoff, got {iters}");
+    }
+
+    /// A still-fresh deadline lets the retry continue (`Ok`) and doubles
+    /// the backoff toward the cap.
+    #[tokio::test(start_paused = true)]
+    async fn await_credit_backs_off_while_under_deadline() {
+        let cap = Duration::from_millis(200);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut delay = Duration::from_millis(5);
+        match await_credit_or_stall(&mut delay, cap, deadline).await {
+            Ok(()) => {}
+            Err(e) => panic!("under deadline must continue (Ok), got {e}"),
+        }
+        assert_eq!(delay, Duration::from_millis(10), "backoff must double");
+    }
+}
+
 /// One entry in the per-mesh pending-grant queue. Captures the
 /// AEAD session (for cipher + packet pool + next_control_tx_seq)
 /// and the peer's wire address. The receive path already has both
@@ -11161,7 +11243,10 @@ impl MeshNode {
     ///   safely replay the whole slice). After the first commit, this
     ///   flush instead retries internally with exponential backoff until
     ///   it clears, so the committed prefix is never re-sent under new
-    ///   seqs.
+    ///   seqs — bounded by [`COMMITTED_FLUSH_STALL_BUDGET`]: a receiver
+    ///   that grants no credit by then is treated as dead and a terminal
+    ///   `StreamError::Transport` is surfaced (which the caller does NOT
+    ///   replay), so a permanently-stalled peer can't hang the sender.
     #[allow(clippy::too_many_arguments)]
     async fn flush_stream_batch(
         &self,
@@ -11184,6 +11269,11 @@ impl MeshNode {
         let needed = wire_bytes_for_payload(batch_size);
         let mut delay = Duration::from_millis(5);
         let cap = Duration::from_millis(200);
+        // Bound the post-commit internal retry so a stalled (but not
+        // closed) receiver that never grants credit can't hang the
+        // sender forever (#4 follow-up). Only consulted on the committed
+        // path; pre-commit backpressure still returns immediately.
+        let stall_deadline = tokio::time::Instant::now() + COMMITTED_FLUSH_STALL_BUDGET;
         loop {
             // `TxAdmit::Acquired` returns credit + sequence under the
             // same DashMap lookup — a close+reopen race can't slip a
@@ -11196,9 +11286,10 @@ impl MeshNode {
                         if *committed_any {
                             // Already committed earlier packets this call —
                             // a return would trigger a whole-slice replay.
-                            // Wait for a receiver grant to free credit.
-                            tokio::time::sleep(delay).await;
-                            delay = (delay * 2).min(cap);
+                            // Wait for a receiver grant to free credit, but
+                            // give up (terminal error, no replay) once the
+                            // stall budget is exhausted.
+                            await_credit_or_stall(&mut delay, cap, stall_deadline).await?;
                             continue;
                         }
                         return Err(StreamError::Backpressure);
@@ -11226,8 +11317,7 @@ impl MeshNode {
                     drop(guard);
                     session.try_rollback_tx_seq(stream_id, stream.epoch, seq);
                     if *committed_any {
-                        tokio::time::sleep(delay).await;
-                        delay = (delay * 2).min(cap);
+                        await_credit_or_stall(&mut delay, cap, stall_deadline).await?;
                         continue;
                     }
                     return Err(StreamError::Backpressure);
