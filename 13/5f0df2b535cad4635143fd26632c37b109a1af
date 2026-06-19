@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/behavior/deck.rs
+  s_8d9ce9de1270a9::t_5e8ec336a004ea 1898-1912,1944
+  s_8d9ce9de1270a9::t_14279c80a6b271 2087
+  s_8d9ce9de1270a9::t_8babafd8f27698 2154
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "135f0df2b535cad4635143fd26632c37b109a1af",
+  "prompts": {},
+  "sessions": {
+    "s_8d9ce9de1270a9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5673ce20-f8cb-4442-a0bc-4dba027009a9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
