@@ -422,21 +422,31 @@ impl EndpointState {
 
     /// Returns true if new requests should be rejected for this endpoint.
     ///
-    /// **Pure predicate** — this method has no side effects. The
-    /// half-open probe slot is claimed lazily at selection time
-    /// via [`try_claim_half_open_probe`], so only the endpoint
-    /// actually chosen by the selector claims the probe.
-    ///
-    /// Conflating "is the circuit open?" with "CAS-claim the
-    /// half-open probe slot when the recovery window has elapsed"
-    /// would let `get_available_endpoints` claim the probe slot
-    /// for every endpoint it filters. A multi-endpoint outage past
-    /// its recovery window would then have every endpoint claim
-    /// the probe slot in the scan while only one (or zero) was
-    /// selected. The N-1 others would hold
+    /// Does NOT claim the half-open probe slot — that is done lazily at
+    /// selection time via [`try_claim_half_open_probe`], so only the
+    /// endpoint actually chosen by the selector claims the probe.
+    /// Conflating "is the circuit open?" with "CAS-claim the half-open
+    /// probe slot when the recovery window has elapsed" would let
+    /// `get_available_endpoints` claim the probe slot for every endpoint
+    /// it filters: a multi-endpoint outage past its recovery window
+    /// would then have every endpoint claim the slot in the scan while
+    /// only one (or zero) was selected; the N-1 others would hold
     /// `half_open_probe == true` with no in-flight request and no
-    /// completion path — every subsequent `is_circuit_open` would
+    /// completion path, and every subsequent `is_circuit_open` would
     /// return true forever.
+    ///
+    /// NOT a pure predicate: it performs ONE bounded self-healing write.
+    /// When the slot is held by a probe that has been claimed for longer
+    /// than a full recovery window with no completion (genuinely
+    /// ABANDONED — see below), it reclaims the slot via
+    /// [`release_half_open_probe`] and admits. This is idempotent under
+    /// concurrent scanners and only ever fires on an abandoned slot — a
+    /// LIVE probe (claimed within the recovery window) is never touched —
+    /// so a read-only caller cannot clear an in-flight probe. The reclaim
+    /// must live here, not on the claim path: the claim only runs for the
+    /// endpoint the selector picks, but a rejected endpoint is never
+    /// picked, so its abandoned slot could only be healed during this
+    /// scan.
     fn is_circuit_open(&self, recovery_time: Duration) -> bool {
         if !self.circuit_open.load(Ordering::Acquire) {
             return false;
