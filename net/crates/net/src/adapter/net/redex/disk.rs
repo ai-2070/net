@@ -406,6 +406,19 @@ impl DiskSegment {
         // index record; we still verify them in case the index
         // file itself was corrupted.
         //
+        // Note this ALSO catches header corruption of `payload_offset`
+        // / `payload_len` / `flags` transitively, even though the
+        // checksum nominally covers only the payload: the checksum is
+        // recomputed over the bytes AS LOCATED AND INTERPRETED by the
+        // header, so a mangled offset/len reads the wrong (or
+        // out-of-bounds → dropped above) region and a flipped INLINE bit
+        // reinterprets the record — either way the recomputed checksum
+        // no longer matches the stored one and the entry is dropped. The
+        // only header field that selects nothing on read, `seq`, escapes
+        // this filter and is handled by the monotonicity walk below.
+        // (Hence no on-disk format change — e.g. extending the checksum
+        // to cover the header — is needed or warranted.)
+        //
         // Use a manual loop (not `retain`) so we can track which
         // original indices survived. The survivor indices are then
         // used to pick matching timestamps from `original_timestamps`
@@ -3086,6 +3099,69 @@ mod tests {
         let recovered2 = DiskSegment::open(&base, &name, 0, 0).unwrap();
         let seqs2: Vec<u64> = recovered2.index.iter().map(|e| e.seq).collect();
         assert_eq!(seqs2, vec![0, 1], "second reopen is stable");
+
+        cleanup(&base);
+    }
+
+    /// BUG_AUDIT #9 (altitude): the per-entry checksum covers only the
+    /// payload, NOT the idx header — yet a corrupt `payload_offset` /
+    /// `payload_len` is still caught TRANSITIVELY, so no on-disk format
+    /// change (a header checksum) is needed. The checksum is verified
+    /// against the bytes AS LOCATED by the header, so a mangled offset
+    /// makes recovery read the WRONG payload, the recomputed checksum
+    /// mismatches the stored one, and the entry is dropped.
+    ///
+    /// Four valid heap entries; we corrupt ONLY record 1's
+    /// `payload_offset` header (LE bytes 8..12) to point at record 0's
+    /// payload region instead of its own, leaving its `len` + checksum
+    /// intact. Recovery must drop record 1 (it now reads "AA" but still
+    /// claims checksum("BB")).
+    #[test]
+    fn recovery_drops_entry_with_corrupt_payload_offset_header() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/offset_corrupt").unwrap();
+        let idx_path = gen_dir(&channel_dir(&base, &name), FIRST_GENERATION).join("idx");
+
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let payloads: [&[u8]; 4] = [b"AA", b"BB", b"CC", b"DD"];
+        let timestamps: [u64; 4] = [1000, 2000, 3000, 4000];
+        let mut offset = 0u32;
+        for (i, p) in payloads.iter().enumerate() {
+            let e = RedexEntry::new_heap(i as u64, offset, p.len() as u32, 0, payload_checksum(p));
+            recovered
+                .disk
+                .append_entry_at(&e, p, timestamps[i])
+                .unwrap();
+            offset += p.len() as u32;
+        }
+        recovered.disk.sync().unwrap();
+        drop(recovered);
+
+        // Corrupt ONLY the payload_offset header (LE bytes 8..12) of
+        // record index 1 ("BB"): point it at record 0's payload region
+        // (offset 0, "AA") instead of its own (offset 2). len + checksum
+        // stay intact, so the record now reads "AA" yet claims
+        // checksum("BB").
+        {
+            let mut idx_bytes = std::fs::read(&idx_path).unwrap();
+            assert_eq!(idx_bytes.len(), 4 * REDEX_ENTRY_SIZE, "four records on disk");
+            let rec1_offset_field = REDEX_ENTRY_SIZE + 8;
+            idx_bytes[rec1_offset_field..rec1_offset_field + 4]
+                .copy_from_slice(&0u32.to_le_bytes());
+            std::fs::write(&idx_path, &idx_bytes).unwrap();
+        }
+
+        // Reopen: the checksum verified against the header-located bytes
+        // no longer matches, so record 1 is dropped even though only its
+        // header was corrupted (a mid-file drop, leaving 0/2/3).
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let seqs: Vec<u64> = recovered.index.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![0, 2, 3],
+            "an entry whose payload_offset header was corrupted (so it \
+             reads the wrong payload) must fail its checksum and be dropped"
+        );
 
         cleanup(&base);
     }
