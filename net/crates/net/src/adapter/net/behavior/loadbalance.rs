@@ -1052,7 +1052,14 @@ impl LoadBalancer {
         &self,
         ctx: &RequestContext,
     ) -> Result<Vec<Arc<EndpointState>>, LoadBalancerError> {
-        let recovery_time = Duration::from_millis(self.config.circuit_recovery_time_ms);
+        // Clamp to >= 1ms. A 0 recovery window makes the abandoned-probe
+        // watchdog in `is_circuit_open` fire on every freshly-claimed
+        // probe (`claimed_at.elapsed() >= ZERO` is always true), which
+        // collapses the single-probe half-open gate and admits unbounded
+        // concurrent probes to a still-failing endpoint. `0` is a
+        // reachable, unvalidated config value, so guard it at the source.
+        let recovery_time =
+            Duration::from_millis(self.config.circuit_recovery_time_ms.max(1));
         let mut available = Vec::new();
         let mut zone_matches = Vec::new();
 
@@ -3039,6 +3046,40 @@ mod tests {
             "an abandoned half-open probe (no record_completion) must be \
              reclaimed after the recovery window so the recovered endpoint \
              returns to rotation — pre-fix the bare bool pinned it out forever"
+        );
+    }
+
+    /// Follow-up to cr14: a `circuit_recovery_time_ms == 0` config must
+    /// not collapse the breaker. Pre-fix, a zero recovery window made
+    /// `open_time.elapsed() < ZERO` always false (the breaker never held
+    /// open) and `claimed_at.elapsed() >= ZERO` always true (every probe
+    /// judged abandoned), so a tripped breaker admitted instantly and the
+    /// single-probe half-open gate vanished. The `>= 1ms` clamp keeps the
+    /// breaker shut inside its (tiny) recovery window.
+    #[test]
+    fn cr14b_zero_recovery_time_does_not_collapse_breaker() {
+        let config = LoadBalancerConfig {
+            strategy: Strategy::RoundRobin,
+            circuit_recovery_time_ms: 0,
+            ..Default::default()
+        };
+        let lb = LoadBalancer::new(config);
+        lb.add_endpoint(Endpoint::new(make_node_id(1)));
+        let ctx = RequestContext::new();
+
+        // Trip the breaker (5 consecutive failures).
+        for _ in 0..5 {
+            let sel = lb.select(&ctx).expect("admitted before trip");
+            lb.record_completion(&sel.node_id, false);
+        }
+        // Immediately after tripping — microseconds later, inside the
+        // clamped 1ms recovery window — the breaker must still reject.
+        // Pre-fix the 0 window admitted instantly, collapsing the gate
+        // and letting unbounded concurrent probes hit a failing endpoint.
+        assert!(
+            lb.select(&ctx).is_err(),
+            "a 0 recovery-time config must not collapse the open breaker \
+             into instant admission"
         );
     }
 
