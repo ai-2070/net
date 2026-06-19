@@ -1895,6 +1895,21 @@ impl AuditStream {
     }
 }
 
+/// Re-arm the task waker after an `Interval` Ready tick that produced
+/// no record, returning the `Poll::Pending` the poll should yield.
+///
+/// tokio's [`Interval::poll_tick`] only registers a waker on *its own*
+/// `Pending` path — after a consumed Ready tick that yields nothing it
+/// leaves no waker behind, so a bare `stream.next().await` would park
+/// forever. Every snapshot-polling deck stream that drains a Ready tick
+/// without producing must call this; centralizing it keeps a new stream
+/// type from silently reintroducing the park-forever bug.
+#[inline]
+fn rearm_after_empty_tick<T>(cx: &Context<'_>) -> Poll<Option<T>> {
+    cx.waker().wake_by_ref();
+    Poll::Pending
+}
+
 impl Stream for AuditStream {
     type Item = Result<super::meshos::AdminAuditRecord, DeckError>;
 
@@ -1926,16 +1941,7 @@ impl Stream for AuditStream {
                 if let Some(record) = self.queued.pop_front() {
                     Poll::Ready(Some(Ok(record)))
                 } else {
-                    // We consumed the interval's Ready tick on
-                    // this poll but produced nothing. tokio's
-                    // `Interval::poll_tick` only registers a waker
-                    // on *its own* Pending path — after a consumed
-                    // Ready tick it leaves no waker behind, so a
-                    // bare `audit_stream.next().await` would park
-                    // forever. Re-arm explicitly, mirroring the
-                    // sibling `LogStream` / `FailureStream`.
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+                    rearm_after_empty_tick(cx)
                 }
             }
             Poll::Pending => Poll::Pending,
@@ -2078,8 +2084,7 @@ impl Stream for LogStream {
                 if let Some(record) = self.queued.pop_front() {
                     Poll::Ready(Some(Ok(record)))
                 } else {
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+                    rearm_after_empty_tick(cx)
                 }
             }
             Poll::Pending => Poll::Pending,
@@ -2146,8 +2151,7 @@ impl Stream for FailureStream {
                 if let Some(record) = self.queued.pop_front() {
                     Poll::Ready(Some(Ok(record)))
                 } else {
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+                    rearm_after_empty_tick(cx)
                 }
             }
             Poll::Pending => Poll::Pending,
