@@ -1929,8 +1929,24 @@ func (d *DuplexCall) Split() (*DuplexSink, *DuplexStream, error) {
 			return nil, nil, fmt.Errorf("net_rpc_duplex_into_split returned %d: %s", int(code), msg)
 		}
 	}
-	sink := &DuplexSink{rpc: d.rpc, handle: outSink, callID: d.callID}
-	stream := &DuplexStream{rpc: d.rpc, handle: outStream, callID: d.callID}
+	// Each half carries its own streamHandleGuard so Close / the GC
+	// finalizer can request teardown without holding a lock across the
+	// blocking Recv/Send cgo call, and the free never runs while an op
+	// is in flight (same #1 use-after-free fix as DuplexCall).
+	sinkHandle := outSink
+	sink := &DuplexSink{
+		rpc:    d.rpc,
+		handle: outSink,
+		callID: d.callID,
+		guard:  newStreamHandleGuard(func() { C.net_rpc_duplex_sink_free(sinkHandle) }),
+	}
+	streamHandle := outStream
+	stream := &DuplexStream{
+		rpc:    d.rpc,
+		handle: outStream,
+		callID: d.callID,
+		guard:  newStreamHandleGuard(func() { C.net_rpc_duplex_stream_free(streamHandle) }),
+	}
 	runtime.SetFinalizer(sink, (*DuplexSink).finalize)
 	runtime.SetFinalizer(stream, (*DuplexStream).finalize)
 	return sink, stream, nil
@@ -1955,7 +1971,9 @@ type DuplexSink struct {
 	rpc    *MeshRpc
 	handle *C.DuplexSinkHandleC
 	callID uint64
-	closed atomic.Bool
+	// guard serializes Send/Finish against the FFI free without holding
+	// a lock across the blocking cgo call. See streamHandleGuard.
+	guard *streamHandleGuard
 }
 
 // CallID returns the server-assigned id.
@@ -1963,9 +1981,10 @@ func (s *DuplexSink) CallID() uint64 { return s.callID }
 
 // Send pushes one body chunk.
 func (s *DuplexSink) Send(body []byte) error {
-	if s.closed.Load() {
+	if !s.guard.enter() {
 		return ErrStreamDone
 	}
+	defer s.guard.leave()
 	cBody, freeBody := bytesToCBytes(body)
 	defer freeBody()
 	var outErr *C.char
@@ -1985,18 +2004,18 @@ func (s *DuplexSink) Send(body []byte) error {
 // Finish closes the upload direction (emits REQUEST_END).
 // Consumes the sink — subsequent Send returns ErrStreamDone.
 func (s *DuplexSink) Finish() error {
-	// Atomic claim: lose the race to a concurrent Close and the
-	// handle is already freed.
-	if s.closed.Swap(true) {
+	// Terminal op: enter() fails (ErrStreamDone) if Close / the
+	// finalizer already requested teardown and the handle is gone.
+	if !s.guard.enter() {
 		return ErrStreamDone
 	}
+	runtime.SetFinalizer(s, nil)
 	var outErr *C.char
 	code := C.net_rpc_duplex_sink_finish(s.handle, &outErr)
-	runtime.SetFinalizer(s, nil)
-	defer func() {
-		C.net_rpc_duplex_sink_free(s.handle)
-		s.handle = nil
-	}()
+	// Request teardown and leave: the guard runs the sink_free once this
+	// op (and any racing Send) has left — never while one is in flight.
+	s.guard.requestFree()
+	s.guard.leave()
 	switch code {
 	case 0:
 		return nil
@@ -2010,14 +2029,10 @@ func (s *DuplexSink) Finish() error {
 }
 
 // Close releases the sink half without explicitly emitting
-// REQUEST_END. Idempotent.
+// REQUEST_END. Idempotent and race-safe against a parked Send/Finish.
 func (s *DuplexSink) Close() {
-	if s.closed.Swap(true) {
-		return
-	}
 	runtime.SetFinalizer(s, nil)
-	C.net_rpc_duplex_sink_free(s.handle)
-	s.handle = nil
+	s.guard.requestFree()
 }
 
 func (s *DuplexSink) finalize() { s.Close() }
@@ -2027,7 +2042,9 @@ type DuplexStream struct {
 	rpc    *MeshRpc
 	handle *C.DuplexStreamHandleC
 	callID uint64
-	closed atomic.Bool
+	// guard serializes Recv against the FFI free without holding a lock
+	// across the blocking cgo call. See streamHandleGuard.
+	guard *streamHandleGuard
 }
 
 // CallID returns the server-assigned id.
@@ -2036,9 +2053,10 @@ func (s *DuplexStream) CallID() uint64 { return s.callID }
 // Recv blocks until the next response chunk arrives or the
 // stream terminates. Returns ErrStreamDone on clean end.
 func (s *DuplexStream) Recv() ([]byte, error) {
-	if s.closed.Load() {
+	if !s.guard.enter() {
 		return nil, ErrStreamDone
 	}
+	defer s.guard.leave()
 	var outChunk *C.uint8_t
 	var outChunkLen C.size_t
 	var outErr *C.char
@@ -2062,14 +2080,11 @@ func (s *DuplexStream) Recv() ([]byte, error) {
 	}
 }
 
-// Close releases the stream half. Idempotent.
+// Close releases the stream half. Idempotent and race-safe against a
+// parked Recv.
 func (s *DuplexStream) Close() {
-	if s.closed.Swap(true) {
-		return
-	}
 	runtime.SetFinalizer(s, nil)
-	C.net_rpc_duplex_stream_free(s.handle)
-	s.handle = nil
+	s.guard.requestFree()
 }
 
 func (s *DuplexStream) finalize() { s.Close() }
