@@ -1554,8 +1554,15 @@ mod tests {
 
         let out = collect_rows(translate_responses(stream, handle)).await;
         // The delivered row is forwarded, then a terminal truncation error.
-        assert_eq!(out.len(), 2, "expected the row plus a truncation error: {out:?}");
-        assert!(out[0].is_ok(), "the delivered row should be forwarded: {out:?}");
+        assert_eq!(
+            out.len(),
+            2,
+            "expected the row plus a truncation error: {out:?}"
+        );
+        assert!(
+            out[0].is_ok(),
+            "the delivered row should be forwarded: {out:?}"
+        );
         match &out[1] {
             Err(MeshError::ExecutorError { detail, .. }) => {
                 assert!(detail.contains("before terminal frame"), "got: {detail}");

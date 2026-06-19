@@ -3148,8 +3148,12 @@ mod tests {
     fn cr33_weighted_rr_preserves_exact_integer_ratios() {
         let lb = LoadBalancer::with_strategy(Strategy::WeightedRoundRobin);
         let endpoints = vec![
-            Arc::new(EndpointState::new(Endpoint::new(make_node_id(1)).with_weight(2))),
-            Arc::new(EndpointState::new(Endpoint::new(make_node_id(2)).with_weight(1))),
+            Arc::new(EndpointState::new(
+                Endpoint::new(make_node_id(1)).with_weight(2),
+            )),
+            Arc::new(EndpointState::new(
+                Endpoint::new(make_node_id(2)).with_weight(1),
+            )),
         ];
         // Two full turns of the natural 3-position wheel.
         let picks: Vec<u8> = (0..6)

@@ -1183,13 +1183,14 @@ mod tests {
         let total_rows: usize = frames
             .iter()
             .filter_map(|f| match f {
-                MeshDbFrame::Response(MeshDbResponse::Batch { batch, .. }) => Some(batch.rows.len()),
+                MeshDbFrame::Response(MeshDbResponse::Batch { batch, .. }) => {
+                    Some(batch.rows.len())
+                }
                 _ => None,
             })
             .sum();
         assert_eq!(
-            total_rows,
-            MESHDB_SERVER_BATCH_ROWS,
+            total_rows, MESHDB_SERVER_BATCH_ROWS,
             "all rows must be shipped"
         );
         let has_final_batch = frames.iter().any(|f| {
