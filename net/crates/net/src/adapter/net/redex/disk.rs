@@ -3144,7 +3144,11 @@ mod tests {
         // checksum("BB").
         {
             let mut idx_bytes = std::fs::read(&idx_path).unwrap();
-            assert_eq!(idx_bytes.len(), 4 * REDEX_ENTRY_SIZE, "four records on disk");
+            assert_eq!(
+                idx_bytes.len(),
+                4 * REDEX_ENTRY_SIZE,
+                "four records on disk"
+            );
             let rec1_offset_field = REDEX_ENTRY_SIZE + 8;
             idx_bytes[rec1_offset_field..rec1_offset_field + 4]
                 .copy_from_slice(&0u32.to_le_bytes());

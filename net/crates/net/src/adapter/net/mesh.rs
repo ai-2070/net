@@ -151,7 +151,10 @@ mod committed_flush_stall_tests {
                     assert!(iters < 100_000, "retry must be bounded, not spin forever");
                 }
                 Err(StreamError::Transport(msg)) => {
-                    assert!(msg.contains("credit stalled"), "terminal stall error: {msg}");
+                    assert!(
+                        msg.contains("credit stalled"),
+                        "terminal stall error: {msg}"
+                    );
                     break;
                 }
                 Err(other) => panic!("unexpected error variant: {other}"),
@@ -160,7 +163,10 @@ mod committed_flush_stall_tests {
         // Backoff caps at 200ms, so reaching the 30s budget takes on the
         // order of ~150 iterations — bounded, never the spin guard.
         assert!(iters > 0, "should back off at least once before giving up");
-        assert!(iters < 10_000, "should reach the budget via capped backoff, got {iters}");
+        assert!(
+            iters < 10_000,
+            "should reach the budget via capped backoff, got {iters}"
+        );
     }
 
     /// A still-fresh deadline lets the retry continue (`Ok`) and doubles

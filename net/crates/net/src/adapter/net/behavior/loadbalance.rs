@@ -1058,8 +1058,7 @@ impl LoadBalancer {
         // collapses the single-probe half-open gate and admits unbounded
         // concurrent probes to a still-failing endpoint. `0` is a
         // reachable, unvalidated config value, so guard it at the source.
-        let recovery_time =
-            Duration::from_millis(self.config.circuit_recovery_time_ms.max(1));
+        let recovery_time = Duration::from_millis(self.config.circuit_recovery_time_ms.max(1));
         let mut available = Vec::new();
         let mut zone_matches = Vec::new();
 
