@@ -578,8 +578,13 @@ func (h *MeshOsDaemonHandle) NextControl(timeoutMs uint64) (MeshOsDaemonControl,
 func (h *MeshOsDaemonHandle) PublishLog(level MeshOsLogLevel, message string) error {
 	var msgPtr *C.char
 	var msgLen C.size_t
+	// Hoist msgBytes to function scope: msgPtr aliases its backing array
+	// via unsafe.Pointer, which cgo does NOT pin, so it must stay live
+	// (via the KeepAlive below) until the cgo call returns. Scoping it to
+	// the if-block let the GC reclaim it mid-call (cf. PublishCapabilities).
+	var msgBytes []byte
 	if len(message) > 0 {
-		msgBytes := []byte(message)
+		msgBytes = []byte(message)
 		msgPtr = (*C.char)(unsafe.Pointer(&msgBytes[0]))
 		msgLen = C.size_t(len(msgBytes))
 	}
@@ -589,6 +594,7 @@ func (h *MeshOsDaemonHandle) PublishLog(level MeshOsLogLevel, message string) er
 	}) {
 		return ErrMeshOsInvalidArg
 	}
+	runtime.KeepAlive(msgBytes)
 	return meshosStatusToError(status)
 }
 
