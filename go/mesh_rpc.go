@@ -1043,6 +1043,33 @@ func (g *streamHandleGuard) requestFree() {
 	}
 }
 
+// spawnCtxCancelWatcher wires ctx cancellation to a streamHandleGuard
+// teardown. Returns the cancel func and a done channel that closes once
+// the watcher has requested the free, or (nil, nil) when ctx has no Done
+// channel (nothing to watch).
+//
+// The spawned goroutine captures ONLY the heap guard — never the owning
+// call/stream struct — so the GC finalizer is preserved when the user
+// neither cancels ctx nor calls Close. Whichever of Close / this watcher
+// requests teardown first runs the free: once, and only after in-flight
+// Recv/Send/Grant ops have drained (no use-after-free, no blocking).
+func spawnCtxCancelWatcher(
+	ctx context.Context,
+	guard *streamHandleGuard,
+) (context.CancelFunc, chan struct{}) {
+	if ctx == nil || ctx.Done() == nil {
+		return nil, nil
+	}
+	watchCtx, cancel := context.WithCancel(ctx)
+	watcherDone := make(chan struct{})
+	go func() {
+		<-watchCtx.Done()
+		guard.requestFree()
+		close(watcherDone)
+	}()
+	return cancel, watcherDone
+}
+
 // RpcStream is an open streaming RPC call. Recv blocks until the
 // next chunk arrives, the deadline fires, or the stream
 // terminates. Close MUST be called eventually (defer is fine);
@@ -1123,31 +1150,11 @@ func (r *MeshRpc) CallStreaming(
 	}
 	runtime.SetFinalizer(stream, (*RpcStream).finalize)
 
-	// Spawn a watcher goroutine that closes the stream when ctx is
-	// canceled. The goroutine signals `watcherDone` on exit; Close
-	// waits on it so the user can drop the *RpcStream reference
-	// immediately after Close returns without a transient
-	// goroutine still poking at fields.
-	//
-	// CRITICAL: the goroutine captures only the heap-allocated guard
-	// (which owns the free closure + handle pointer) and watcherDone —
-	// never `stream`. Capturing `stream` would prevent GC and defeat
-	// the finalizer if the user neither cancels ctx nor calls Close.
-	if ctx != nil && ctx.Done() != nil {
-		watchCtx, cancel := context.WithCancel(ctx)
-		stream.cancel = cancel
-		stream.watcherDone = make(chan struct{})
-		guardPtr := guard
-		watcherDone := stream.watcherDone
-		go func() {
-			<-watchCtx.Done()
-			// Whichever of Close / this watcher requests teardown
-			// first runs the free — once, and only after in-flight
-			// Recv/Grant ops have drained (no UAF, no blocking).
-			guardPtr.requestFree()
-			close(watcherDone)
-		}()
-	}
+	// On ctx cancel, tear the stream down. Close waits on watcherDone so
+	// the user can drop the *RpcStream immediately after Close returns
+	// without a watcher still poking at fields. (Lifecycle/GC proof in
+	// spawnCtxCancelWatcher.)
+	stream.cancel, stream.watcherDone = spawnCtxCancelWatcher(ctx, guard)
 	return stream, nil
 }
 
@@ -1203,20 +1210,7 @@ func (r *MeshRpc) CallServiceStreaming(
 	}
 	runtime.SetFinalizer(stream, (*RpcStream).finalize)
 
-	if ctx != nil && ctx.Done() != nil {
-		watchCtx, cancel := context.WithCancel(ctx)
-		stream.cancel = cancel
-		stream.watcherDone = make(chan struct{})
-		guardPtr := guard
-		watcherDone := stream.watcherDone
-		go func() {
-			<-watchCtx.Done()
-			// Whichever of Close / this watcher requests teardown
-			// first runs the free — once, after in-flight ops drain.
-			guardPtr.requestFree()
-			close(watcherDone)
-		}()
-	}
+	stream.cancel, stream.watcherDone = spawnCtxCancelWatcher(ctx, guard)
 	return stream, nil
 }
 
@@ -1615,22 +1609,7 @@ func (r *MeshRpc) CallClientStream(
 	}
 	runtime.SetFinalizer(call, (*ClientStreamCall).finalize)
 
-	// ctx-cancel watcher — mirrors CallStreaming's watcher. Captures
-	// only the heap-allocated guard (which owns the free + handle
-	// pointer) and watcherDone, never `call`, so the finalizer is
-	// preserved.
-	if ctx != nil && ctx.Done() != nil {
-		watchCtx, cancel := context.WithCancel(ctx)
-		call.cancel = cancel
-		call.watcherDone = make(chan struct{})
-		guardPtr := guard
-		watcherDone := call.watcherDone
-		go func() {
-			<-watchCtx.Done()
-			guardPtr.requestFree()
-			close(watcherDone)
-		}()
-	}
+	call.cancel, call.watcherDone = spawnCtxCancelWatcher(ctx, guard)
 	return call, nil
 }
 
@@ -1802,20 +1781,7 @@ func (r *MeshRpc) CallDuplex(
 	}
 	runtime.SetFinalizer(call, (*DuplexCall).finalize)
 
-	if ctx != nil && ctx.Done() != nil {
-		watchCtx, cancel := context.WithCancel(ctx)
-		call.cancel = cancel
-		call.watcherDone = make(chan struct{})
-		// Capture the heap guard only — never `call`. See the
-		// streamHandleGuard note for the lifecycle proof.
-		guardPtr := guard
-		watcherDone := call.watcherDone
-		go func() {
-			<-watchCtx.Done()
-			guardPtr.requestFree()
-			close(watcherDone)
-		}()
-	}
+	call.cancel, call.watcherDone = spawnCtxCancelWatcher(ctx, guard)
 	return call, nil
 }
 
