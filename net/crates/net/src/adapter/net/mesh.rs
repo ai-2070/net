@@ -129,61 +129,6 @@ async fn await_credit_or_stall(
     Ok(())
 }
 
-#[cfg(test)]
-mod committed_flush_stall_tests {
-    use super::*;
-
-    /// #4: the committed-prefix retry must be bounded. Against a receiver
-    /// that never grants credit, `await_credit_or_stall` returns a
-    /// terminal `Transport` error once `COMMITTED_FLUSH_STALL_BUDGET`
-    /// elapses instead of looping forever. Paused time auto-advances as
-    /// the backoff sleeps complete, so this runs instantly.
-    #[tokio::test(start_paused = true)]
-    async fn committed_flush_retry_is_bounded_by_stall_budget() {
-        let cap = Duration::from_millis(200);
-        let deadline = tokio::time::Instant::now() + COMMITTED_FLUSH_STALL_BUDGET;
-        let mut delay = Duration::from_millis(5);
-        let mut iters = 0u32;
-        loop {
-            match await_credit_or_stall(&mut delay, cap, deadline).await {
-                Ok(()) => {
-                    iters += 1;
-                    assert!(iters < 100_000, "retry must be bounded, not spin forever");
-                }
-                Err(StreamError::Transport(msg)) => {
-                    assert!(
-                        msg.contains("credit stalled"),
-                        "terminal stall error: {msg}"
-                    );
-                    break;
-                }
-                Err(other) => panic!("unexpected error variant: {other}"),
-            }
-        }
-        // Backoff caps at 200ms, so reaching the 30s budget takes on the
-        // order of ~150 iterations — bounded, never the spin guard.
-        assert!(iters > 0, "should back off at least once before giving up");
-        assert!(
-            iters < 10_000,
-            "should reach the budget via capped backoff, got {iters}"
-        );
-    }
-
-    /// A still-fresh deadline lets the retry continue (`Ok`) and doubles
-    /// the backoff toward the cap.
-    #[tokio::test(start_paused = true)]
-    async fn await_credit_backs_off_while_under_deadline() {
-        let cap = Duration::from_millis(200);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        let mut delay = Duration::from_millis(5);
-        match await_credit_or_stall(&mut delay, cap, deadline).await {
-            Ok(()) => {}
-            Err(e) => panic!("under deadline must continue (Ok), got {e}"),
-        }
-        assert_eq!(delay, Duration::from_millis(10), "backoff must double");
-    }
-}
-
 /// One entry in the per-mesh pending-grant queue. Captures the
 /// AEAD session (for cipher + packet pool + next_control_tx_seq)
 /// and the peer's wire address. The receive path already has both
@@ -15271,5 +15216,65 @@ mod routed_forward_tests {
              in-place forward fast path would then fire on the default ingress too"
         );
         drop(parent);
+    }
+}
+
+// NOTE: this test module lives at the END of the file ON PURPOSE. The
+// heartbeat drift check in session.rs treats the FIRST column-0
+// `#[cfg(test)] mod` as the production/test boundary, so a test module
+// placed earlier would hide the real `session.build_heartbeat()` caller
+// from `mesh_rs_production_callers_match_allowlist`.
+#[cfg(test)]
+mod committed_flush_stall_tests {
+    use super::*;
+
+    /// #4: the committed-prefix retry must be bounded. Against a receiver
+    /// that never grants credit, `await_credit_or_stall` returns a
+    /// terminal `Transport` error once `COMMITTED_FLUSH_STALL_BUDGET`
+    /// elapses instead of looping forever. Paused time auto-advances as
+    /// the backoff sleeps complete, so this runs instantly.
+    #[tokio::test(start_paused = true)]
+    async fn committed_flush_retry_is_bounded_by_stall_budget() {
+        let cap = Duration::from_millis(200);
+        let deadline = tokio::time::Instant::now() + COMMITTED_FLUSH_STALL_BUDGET;
+        let mut delay = Duration::from_millis(5);
+        let mut iters = 0u32;
+        loop {
+            match await_credit_or_stall(&mut delay, cap, deadline).await {
+                Ok(()) => {
+                    iters += 1;
+                    assert!(iters < 100_000, "retry must be bounded, not spin forever");
+                }
+                Err(StreamError::Transport(msg)) => {
+                    assert!(
+                        msg.contains("credit stalled"),
+                        "terminal stall error: {msg}"
+                    );
+                    break;
+                }
+                Err(other) => panic!("unexpected error variant: {other}"),
+            }
+        }
+        // Backoff caps at 200ms, so reaching the 30s budget takes on the
+        // order of ~150 iterations — bounded, never the spin guard.
+        assert!(iters > 0, "should back off at least once before giving up");
+        assert!(
+            iters < 10_000,
+            "should reach the budget via capped backoff, got {iters}"
+        );
+    }
+
+    /// A still-fresh deadline lets the retry continue (`Ok`) and doubles
+    /// the backoff toward the cap.
+    #[tokio::test(start_paused = true)]
+    async fn await_credit_backs_off_while_under_deadline() {
+        let cap = Duration::from_millis(200);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut delay = Duration::from_millis(5);
+        match await_credit_or_stall(&mut delay, cap, deadline).await {
+            Ok(()) => {}
+            Err(e) => panic!("under deadline must continue (Ok), got {e}"),
+        }
+        assert_eq!(delay, Duration::from_millis(10), "backoff must double");
     }
 }
