@@ -1,0 +1,24 @@
+go/meshos.go
+  s_8d9ce9de1270a9::t_c555bc858d4ab5 463-477,489-500
+  s_8d9ce9de1270a9::t_979abd67b39ff7 503-508,513,516
+  s_8d9ce9de1270a9::t_5260986c12c5f5 433
+  s_8d9ce9de1270a9::t_79adecaab657ba 717
+  s_8d9ce9de1270a9::t_d9abbabc45e97c 480
+  s_8d9ce9de1270a9::t_985cfbdebc8290 615-616,624-628
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "f944dfb7d6c13292522bd49713ee6e3ac377f7a5",
+  "prompts": {},
+  "sessions": {
+    "s_8d9ce9de1270a9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5673ce20-f8cb-4442-a0bc-4dba027009a9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
