@@ -1438,6 +1438,10 @@ pub extern "C" fn net_compute_spawn_from_snapshot(
         if snapshot_len > 0 && snapshot_ptr.is_null() {
             return NET_COMPUTE_ERR_NULL;
         }
+        // `slice::from_raw_parts` requires `len <= isize::MAX` (core ffi guard).
+        if snapshot_len > isize::MAX as usize {
+            return NET_COMPUTE_ERR_NULL;
+        }
         let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
             return NET_COMPUTE_ERR_NULL;
         };
@@ -3267,6 +3271,10 @@ pub extern "C" fn net_compute_unregister_placement_filter(
         if id_ptr.is_null() {
             return NET_COMPUTE_ERR_NULL;
         }
+        // `slice::from_raw_parts` requires `len <= isize::MAX` (core ffi guard).
+        if id_len > isize::MAX as usize {
+            return NET_COMPUTE_ERR_NULL;
+        }
         let id = unsafe {
             let bytes = std::slice::from_raw_parts(id_ptr as *const u8, id_len);
             match std::str::from_utf8(bytes) {
@@ -3295,6 +3303,10 @@ pub extern "C" fn net_compute_has_placement_filter(id_ptr: *const c_char, id_len
     ffi_guard!(NET_COMPUTE_ERR_NULL, {
         use ::net::adapter::net::behavior::placement_registry::global_placement_filter_registry;
         if id_ptr.is_null() {
+            return NET_COMPUTE_ERR_NULL;
+        }
+        // `slice::from_raw_parts` requires `len <= isize::MAX` (core ffi guard).
+        if id_len > isize::MAX as usize {
             return NET_COMPUTE_ERR_NULL;
         }
         let id = unsafe {
