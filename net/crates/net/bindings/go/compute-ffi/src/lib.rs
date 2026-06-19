@@ -426,10 +426,11 @@ pub extern "C" fn net_compute_runtime_is_ready(handle: *mut DaemonRuntimeHandle)
 
 /// Return the number of daemons currently registered on this
 /// runtime. Returns `-1` on NULL handle (cast of
-/// [`NET_COMPUTE_ERR_NULL`]).
+/// [`NET_COMPUTE_ERR_NULL`]) or on a caught panic — `0` is a valid
+/// count and must not double as the error sentinel.
 #[no_mangle]
 pub extern "C" fn net_compute_runtime_daemon_count(handle: *mut DaemonRuntimeHandle) -> i64 {
-    ffi_guard!(0, {
+    ffi_guard!(NET_COMPUTE_ERR_NULL as i64, {
         let Some(h) = (unsafe { handle.as_ref() }) else {
             return NET_COMPUTE_ERR_NULL as i64;
         };
