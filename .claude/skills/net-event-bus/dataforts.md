@@ -1,6 +1,6 @@
 # Dataforts — greedy cache, gravity, blob refs, read-your-writes
 
-Dataforts is the **compositional data plane** that lands in v0.15 ("Rebel Yell") on top of the v0.14 substrate. Four phases compose against the existing RedEX / CortEX / capability-index / proximity-graph layers — there's no new wire protocol and no separate coordinator service. All four ship behind the single `dataforts` Cargo feature; pre-built release artifacts ship with it enabled.
+Dataforts is the **compositional data plane** on top of the substrate. Four phases compose against the existing RedEX / CortEX / capability-index / proximity-graph layers — there's no new wire protocol and no separate coordinator service. All four ship behind the single `dataforts` Cargo feature; pre-built artifacts ship with it enabled.
 
 Greedy and gravity are **runtime-toggleable policies** — operators flip them on / off live against a running mesh, no rebuild required. The Cargo feature gates whether the surface compiles at all; the per-phase decision is operational.
 
@@ -15,7 +15,7 @@ If you came here from `redex.md` or `cortex.md` looking for "how do I read my ow
 | "Nodes near a chain should cache it speculatively, evict cold ones under pressure" | Phase 1 — Greedy | `Redex::enable_greedy_dataforts(mesh, …)` |
 | "Hot chains should drift toward the readers that drive the heat" | Phase 4 — Gravity | `Redex::enable_gravity_for_greedy(mesh, …)` |
 | "Substrate should carry a content-addressed reference; bytes live in S3 / Ceph / IPFS / local FS" | Phase 3 — Blob | `BlobAdapterRegistry::register` + `blob_publish` / `blob_resolve` |
-| "Move a blob / directory **peer-to-peer over the mesh** — no external store in the path" | Transfer (v0.27) | `serve_blob_transfer` + `fetch_blob` / `store_dir` / `fetch_dir` |
+| "Move a blob / directory **peer-to-peer over the mesh** — no external store in the path" | Transfer | `serve_blob_transfer` + `fetch_blob` / `store_dir` / `fetch_dir` |
 | "Producer needs to read its own write deterministically through the cache" | Phase 5 — RYW | `tasks.wait_for_token(token, deadline)` |
 
 The four phases are independent. A deployment can run greedy without gravity (hoard, don't rebalance), gravity without greedy (drift-only on pre-seeded replicas), both, or neither (substrate-only). Same for blob and RYW.
@@ -86,9 +86,9 @@ redex.enableGreedyDataforts(mesh, {
 ### Operational notes
 
 - **Bandwidth-budget rejection has its own counter** (`dataforts_greedy_admit_throttled_bandwidth_total`). Disambiguate "NIC saturated" from "cache full" on the operator dashboard.
-- **Cluster-cap eviction withdraws chain announcements inline.** Peers see the `causal:<hex>` advertisement drop in the same tick (D-1 fix).
-- **`upsert` on reopen subtracts old bytes from `total_bytes`.** Pre-v0.15 the cluster-cap budget drifted upward over reopens until admission rejected everything (D-3 fix).
-- **`observer_inflight_cap` is the spawn fan-out bound.** A flooding peer can't pile up unbounded outstanding tasks; on saturation the event drops and the counter bumps (D-7 fix).
+- **Cluster-cap eviction withdraws chain announcements inline.** Peers see the `causal:<hex>` advertisement drop in the same tick.
+- **`upsert` on reopen subtracts old bytes from `total_bytes`.** The cluster-cap budget stays accurate across reopens.
+- **`observer_inflight_cap` is the spawn fan-out bound.** A flooding peer can't pile up unbounded outstanding tasks; on saturation the event drops and the counter bumps.
 - **`disable_greedy_dataforts()` removes the observer.** The runtime drops the cache files (in-memory) or leaves them on disk (persistent) — disable is a runtime decision, not a cleanup signal.
 - **Cache files are keyed by wire `u16`**, not canonical `u32` — the cache name is `dataforts/greedy/<hex16>`. Two wire-colliding channels share a cache file (a small mix-up at the data-plane layer); ACL / config / RYW decisions stay collision-safe via the canonical hash.
 
@@ -143,12 +143,12 @@ redex.enableGravityForGreedy(mesh, {
 ### Operational notes
 
 - **Requires greedy first.** `enable_gravity_for_greedy` without a prior `enable_greedy_dataforts` returns `RedexError`.
-- **Heat tags are auth-gated on the publisher's `causal:` claim.** A peer advertising `heat:X` without simultaneously advertising `causal:X` has its heat tag dropped at the receive boundary (D-11). Per-peer rate-limit of heat emissions is acknowledged as deferred (N-8).
-- **`HeatRegistry` is capped at 8 K entries with LRU eviction by `last_update`.** Misbehaving peers can't flood the registry past the cap (D-10, N-2 fix).
-- **`should_emit_heat` is subnormal-safe.** Near-zero `prev` (1e-300, subnormals) no longer trips `inf`-prone ratio arithmetic (D-29 / N-9 fix); NaN rates return `Skip`.
-- **Log-scale wire normalization.** Pre-v0.15 the wire used `(rate / (rate + 1))` which compressed asymptotically — every "warm" chain looked like "blazing." v0.15 uses `ln_1p(rate) / ln_1p(reference)` with the configurable reference rate (D-30 fix).
-- **`gravity_tick` is batched.** All chain emissions in a tick coalesce into one `announce_heat_batch` + one `announce_capabilities` rewrite (D-25 fix). Pre-fix it was O(n²) on a 100 K-chain node.
-- **`origin_hash == 0` skip.** Default-constructed publishers carried `origin_hash = 0`; gravity now skips heat bumps on unattributed origins as defense-in-depth (D-9 fix).
+- **Heat tags are auth-gated on the publisher's `causal:` claim.** A peer advertising `heat:X` without simultaneously advertising `causal:X` has its heat tag dropped at the receive boundary. Per-peer rate-limit of heat emissions is not yet implemented.
+- **`HeatRegistry` is capped at 8 K entries with LRU eviction by `last_update`.** Misbehaving peers can't flood the registry past the cap.
+- **`should_emit_heat` is subnormal-safe.** Near-zero `prev` (1e-300, subnormals) doesn't trip `inf`-prone ratio arithmetic; NaN rates return `Skip`.
+- **Log-scale wire normalization.** The wire uses `ln_1p(rate) / ln_1p(reference)` with the configurable reference rate, so warm chains and blazing chains stay distinguishable rather than compressing asymptotically.
+- **`gravity_tick` is batched.** All chain emissions in a tick coalesce into one `announce_heat_batch` + one `announce_capabilities` rewrite — not O(n²) on a 100 K-chain node.
+- **`origin_hash == 0` skip.** Default-constructed publishers carry `origin_hash = 0`; gravity skips heat bumps on unattributed origins as defense-in-depth.
 
 ---
 
@@ -166,17 +166,17 @@ size:    u64              // bytes; bounded by BLOB_REF_MAX_SIZE = 16 GiB
 uri:     [u8]             // length-prefixed; adapter dispatch key
 ```
 
-Adapter dispatch is **URI-scheme keyed**, not channel-config keyed. `BlobAdapter::accepted_schemes() -> &[&str]` declares which URI schemes an adapter handles (`["s3", "s3+https"]`, `["file"]`, etc.); the registry routes by scheme. Pre-v0.15 the channel config selected the adapter — an attacker who could write to a channel could route their `BlobRef` URI through any registered adapter (D-13 authority-confusion fix).
+Adapter dispatch is **URI-scheme keyed**, not channel-config keyed. `BlobAdapter::accepted_schemes() -> &[&str]` declares which URI schemes an adapter handles (`["s3", "s3+https"]`, `["file"]`, etc.); the registry routes by scheme. Because the channel config does not select the adapter, an attacker who can write to a channel can't route their `BlobRef` URI through an arbitrary registered adapter.
 
 ### Operational notes
 
-- **Hash-verify on store.** `FileSystemAdapter::store(blob_ref, &bytes)` BLAKE3-hashes the supplied bytes and rejects mismatch (D-12).
-- **`fsync` of temp + parent dir** lands in the FS store path. Power loss between rename and OS flush no longer leaves zero-length files in the addressable space (D-33).
-- **Unique tmp suffixes.** `<hash>.<pid>.<atomic>.<nanos>.tmp` — concurrent stores on the same hash no longer race or fail on Windows-rename (D-32, N-6 hash-verify on idempotent re-store).
-- **Streaming hooks.** `fetch_stream` / `store_stream` ship as required methods on `BlobAdapter` with default implementations that route through `fetch` / `store` for back-compat; adapters wanting real streaming override (D-16). FS adapter chunks at 256 KiB.
-- **`BlobRef::MAX_SIZE = 16 GiB` default cap.** Decode rejects larger sizes; `RedexFileConfig::with_blob_max_size` lifts the cap when an operator needs it (D-15).
-- **Per-channel registry override.** `RedexFileConfig::with_blob_adapter_registry(Some(arc))` for multi-tenant isolation; default-tenant path uses the global singleton unchanged (D-34).
-- **`BlobError::NotFound(uri)` sanitizes the URI.** Control chars escape as `\xNN`, length caps at 256 bytes — a binding logging the error can't be log-injected by an attacker who controls the URI (D-31).
+- **Hash-verify on store.** `FileSystemAdapter::store(blob_ref, &bytes)` BLAKE3-hashes the supplied bytes and rejects mismatch.
+- **`fsync` of temp + parent dir** lands in the FS store path. Power loss between rename and OS flush doesn't leave zero-length files in the addressable space.
+- **Unique tmp suffixes.** `<hash>.<pid>.<atomic>.<nanos>.tmp` — concurrent stores on the same hash don't race or fail on Windows-rename, and idempotent re-stores hash-verify.
+- **Streaming hooks.** `fetch_stream` / `store_stream` ship as required methods on `BlobAdapter` with default implementations that route through `fetch` / `store`; adapters wanting real streaming override. FS adapter chunks at 256 KiB.
+- **`BlobRef::MAX_SIZE = 16 GiB` default cap.** Decode rejects larger sizes; `RedexFileConfig::with_blob_max_size` lifts the cap when an operator needs it.
+- **Per-channel registry override.** `RedexFileConfig::with_blob_adapter_registry(Some(arc))` for multi-tenant isolation; default-tenant path uses the global singleton.
+- **`BlobError::NotFound(uri)` sanitizes the URI.** Control chars escape as `\xNN`, length caps at 256 bytes — a binding logging the error can't be log-injected by an attacker who controls the URI.
 
 ### Wire-up
 
@@ -212,15 +212,15 @@ const payload = await blobResolve(blobRef);
 
 Each binding lets you write adapters in the host language:
 
-- **Python** — `register_blob_adapter(id, instance)` where `instance` implements `fetch` / `store` (sync or `async def`). Async adapters run on a binding-owned event loop on a dedicated thread (D-4 fix — no fresh `asyncio.run` per call). An `aiobotocore` / `httpx.AsyncClient` / SQLAlchemy async engine inside the adapter is safe.
+- **Python** — `register_blob_adapter(id, instance)` where `instance` implements `fetch` / `store` (sync or `async def`). Async adapters run on a binding-owned event loop on a dedicated thread (no fresh `asyncio.run` per call). An `aiobotocore` / `httpx.AsyncClient` / SQLAlchemy async engine inside the adapter is safe.
 - **Node** — `registerBlobAdapter(id, instance)` (sync TSFN bridge) or `registerAsyncBlobAdapter(id, instance)` (Promise-returning TSFN bridge).
-- **C / cgo** — `NetBlobAdapterVtable` with per-field null-check at registration (D-22); partial vtables return `NET_ERR_BLOB_VTABLE_INVALID`.
+- **C / cgo** — `NetBlobAdapterVtable` with per-field null-check at registration; partial vtables return `NET_ERR_BLOB_VTABLE_INVALID`.
 
 ---
 
-## Mesh blob + directory transfer (v0.27)
+## Mesh blob + directory transfer
 
-Phase 3's `BlobRef` is a *reference*; the bytes still have to move. Pre-v0.27 the only movers were the storage adapters (S3 / Ceph / FS pull). v0.27 adds **peer-to-peer transfer over the mesh transport itself** — a new `SUBPROTOCOL_BLOB_TRANSFER` rides the v0.27 fair-scheduled streams (`StreamConfig.scheduled = true`, see `streams.md`), so a node fetches a content-addressed blob — or a whole directory — directly from a peer that holds it, with no external store in the path.
+Phase 3's `BlobRef` is a *reference*; the bytes still have to move. Besides the storage adapters (S3 / Ceph / FS pull), there's **peer-to-peer transfer over the mesh transport itself** — `SUBPROTOCOL_BLOB_TRANSFER` rides the fair-scheduled streams (`StreamConfig.scheduled = true`, see `streams.md`), so a node fetches a content-addressed blob — or a whole directory — directly from a peer that holds it, with no external store in the path.
 
 This composes with Phase 3: `store_dir` writes chunks **into** a `BlobAdapter` and returns a manifest `BlobRef`; `fetch_blob` / `fetch_dir` pull those chunks **over the mesh** from whoever holds them. You can use the transfer surface without an S3-style backend at all (the FS adapter is enough).
 
@@ -243,7 +243,7 @@ This composes with Phase 3: `store_dir` writes chunks **into** a `BlobAdapter` a
 
 `DirStats { files: usize, bytes: u64 }`. `concurrency = 0` → `DEFAULT_FETCH_CONCURRENCY = 16` leaf files in flight. `BlobRef::Small` is one chunk; `BlobRef::Manifest` is its ordered chunk list; **`BlobRef::Tree` is not supported by the transport wrappers** (use the substrate tree walk). The SDK stays thin — no retry policy, no rollback machinery beyond `fetch_dir`'s atomic rename, no directory-sync primitives; applications compose policy above.
 
-**Go / C:** the FFI symbols ship in `src/ffi/transport.rs` (`net_serve_blob_transfer`, `net_fetch_blob`, `net_fetch_blob_discovered`, `net_store_dir`, `net_fetch_dir`, `net_dir_manifest_read`) and Go binds them over cgo. Note: as of this writing they are **not declared in `include/net.h`** — a C consumer declares the prototypes against the exported symbols directly. (The release notes describe a five-tier SDK; the ergonomic wrappers are Rust / Node / Python, with the C ABI present but the header not yet regenerated.)
+**Go / C:** the FFI symbols ship in `src/ffi/transport.rs` (`net_serve_blob_transfer`, `net_fetch_blob`, `net_fetch_blob_discovered`, `net_store_dir`, `net_fetch_dir`, `net_dir_manifest_read`) and Go binds them over cgo. Note: they are **not declared in `include/net.h`** — a C consumer declares the prototypes against the exported symbols directly. The ergonomic wrappers are Rust / Node / Python, with the C ABI present but the header not yet regenerated.
 
 ### Rust
 
@@ -312,7 +312,7 @@ pub struct WriteToken {
 }
 ```
 
-Fields are `pub(crate)`; the public constructor is `#[doc(hidden)]`. `FromStr` is gated behind `#[cfg(test)]` / `wire-debug`. **Tokens are unforgeable only against the adapter that issued them** — origin-bound. A token claiming `origin_hash = X` passed to an adapter whose `origin_hash = Y` rejects with `WaitForTokenError::WrongOrigin` (D-19 threat model).
+Fields are `pub(crate)`; the public constructor is `#[doc(hidden)]`. `FromStr` is gated behind `#[cfg(test)]` / `wire-debug`. **Tokens are unforgeable only against the adapter that issued them** — origin-bound. A token claiming `origin_hash = X` passed to an adapter whose `origin_hash = Y` rejects with `WaitForTokenError::WrongOrigin`.
 
 ### Wire-up
 
@@ -339,22 +339,22 @@ await tasks.waitForToken(result.token, 250);
 result, _ := tasks.Create(1, "first", uint64(time.Now().UnixNano()))
 if err := tasks.WaitForToken(result.Token, 250*time.Millisecond); err != nil { /* … */ }
 // PollForToken — non-blocking
-// WaitForTokenContext — Go context, but cancellation isn't propagated into the FFI wait (N-11)
+// WaitForTokenContext — Go context, but cancellation isn't propagated into the FFI wait
 ```
 
 ### Operational notes
 
-- **`applied_through_seq()` vs. `folded_through_seq()`.** The pre-v0.15 wait delegated to `wait_for_seq`, which returned when the *folded* watermark passed `seq` — including events that `FoldErrorPolicy::Skip` silently skipped via `RedexError::is_recoverable_decode`. A producer whose write hit a skip got `Ok(())` and then read state that didn't reflect its write. v0.15 waits on **applied** (events that actually ran through the fold) (D-17 fix).
-- **`FoldStopped` is a real error.** `wait_for_seq` used to return `Ok` when `running == false` (fold task crashed under `FoldErrorPolicy::Stop`); every pending RYW wait resolved with silent `Ok(())`. v0.15 surfaces `WaitForTokenError::FoldStopped { applied_through_seq }` (D-18 fix).
-- **`deadline_ms == 0` is a non-blocking poll** across every binding. Synchronous applied-vs-token check; no wait scheduled. Pre-fix the FFI rewrote `0` to `1 ms` (D-23, N-4 fixes).
-- **Process-wide in-flight cap.** `set_global_ryw_inflight_cap(usize)` sets a process-wide bound on outstanding RYW waiters; every `wait_for_token` does a two-tier acquire (process-wide then per-adapter). The default per-adapter cap is 1024 (renamed `ryw_inflight_cap` with a non-FIFO doc note in D-37) (D-38).
-- **Go context cancellation isn't propagated into the FFI wait.** `WaitForTokenContext(ctx, token)` accepts a Go `context.Context` but cancellation doesn't preempt the blocking FFI call — use it for ergonomics, not sub-deadline cancellation (N-11 doc note).
+- **`applied_through_seq()` vs. `folded_through_seq()`.** The wait keys on **applied** (events that actually ran through the fold), not the *folded* watermark — so a producer whose write hit a `FoldErrorPolicy::Skip` (via `RedexError::is_recoverable_decode`) doesn't get a premature `Ok(())` over state that doesn't reflect its write.
+- **`FoldStopped` is a real error.** When `running == false` (fold task crashed under `FoldErrorPolicy::Stop`), the wait surfaces `WaitForTokenError::FoldStopped { applied_through_seq }` rather than resolving every pending RYW wait with a silent `Ok(())`.
+- **`deadline_ms == 0` is a non-blocking poll** across every binding. Synchronous applied-vs-token check; no wait scheduled.
+- **Process-wide in-flight cap.** `set_global_ryw_inflight_cap(usize)` sets a process-wide bound on outstanding RYW waiters; every `wait_for_token` does a two-tier acquire (process-wide then per-adapter). The default per-adapter cap is 1024 (`ryw_inflight_cap`, non-FIFO).
+- **Go context cancellation isn't propagated into the FFI wait.** `WaitForTokenContext(ctx, token)` accepts a Go `context.Context` but cancellation doesn't preempt the blocking FFI call — use it for ergonomics, not sub-deadline cancellation.
 
 ---
 
 ## Common gotchas
 
-- **`dataforts` feature must be on.** Builds without it surface typed `RedexError` stubs from every `enable_*` entry point: `"requires the 'dataforts' feature; rebuild with --features dataforts"`. Pre-built release artifacts ship with the feature enabled.
+- **`dataforts` feature must be on.** Builds without it surface typed `RedexError` stubs from every `enable_*` entry point: `"requires the 'dataforts' feature; rebuild with --features dataforts"`. Pre-built artifacts ship with the feature enabled.
 - **Greedy admission rejection has six reasons** (`AdmitRejectReason::{Scope, Proximity, Intent, Colocation, Capacity, Bandwidth}`). Each has its own Prometheus counter — disambiguate "why isn't this chain being cached?" by checking which counter bumped.
 - **Gravity without greedy is allowed.** A node with `enable_gravity_for_greedy` but no `enable_greedy_dataforts` is the "drift-only" quadrant — already-placed replicas emit heat, but the node doesn't speculatively cache.
 - **`Redex::greedy_cache_for(channel) -> Option<RedexFile>`** returns the cache file if greedy admitted that chain; the caller falls back to a network fetch / substrate read path on `None`. The substrate doesn't auto-route reads through the cache — it's an explicit lookup.
@@ -367,5 +367,4 @@ if err := tasks.WaitForToken(result.Token, 250*time.Millisecond); err != nil { /
 
 - **Full plan + activation gates per phase**: `net/crates/net/docs/misc/DATAFORTS_PLAN.md`.
 - **Wishlist audit** (what's a Dataforts phase vs. what already ships via core primitives): `net/crates/net/docs/misc/DATAFORTS_FEATURES.md`.
-- **v0.15 release notes** with all the D-1..D-54 + N-1..N-11 fix references: `net/crates/net/docs/releases/RELEASE_v0.15_REBEL_YELL.md`.
-- **Cargo feature interaction**: `net` crate's `dataforts` feature pulls `cortex + blake3 + xxhash-rust`. Builds without it get the substrate path unchanged (RedEX, CortEX, NetDB, replication all work as in v0.14).
+- **Cargo feature interaction**: `net` crate's `dataforts` feature pulls `cortex + blake3 + xxhash-rust`. Builds without it get the substrate path unchanged (RedEX, CortEX, NetDB, replication all work as normal).

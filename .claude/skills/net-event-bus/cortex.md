@@ -176,7 +176,7 @@ state, _ := tasks.State()       // snapshot
 if err := tasks.WaitForToken(result.Token, 250*time.Millisecond); err != nil { /* … */ }
 // PollForToken — non-blocking
 if err := tasks.PollForToken(result.Token); err != nil { /* … */ }
-// Context-aware variant (but see N-11 caveat)
+// Context-aware variant (see the cancellation caveat below)
 ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 defer cancel()
 if err := tasks.WaitForTokenContext(ctx, result.Token); err != nil { /* … */ }
@@ -184,7 +184,7 @@ if err := tasks.WaitForTokenContext(ctx, result.Token); err != nil { /* … */ }
 
 **Key facts:**
 - `WaitForToken(token, timeout)` blocks the calling goroutine; `PollForToken(token)` is a non-blocking applied-vs-token check.
-- `WaitForTokenContext(ctx, token)` accepts a Go `context.Context`, but **context cancellation isn't propagated into the FFI wait** — the FFI's blocking call continues until the underlying deadline expires (N-11 doc note). Use it for ergonomics, not for sub-deadline cancellation.
+- `WaitForTokenContext(ctx, token)` accepts a Go `context.Context`, but **context cancellation isn't propagated into the FFI wait** — the FFI's blocking call continues until the underlying deadline expires. Use it for ergonomics, not for sub-deadline cancellation.
 
 ## C
 
@@ -208,7 +208,7 @@ net_tasks_close(tasks);
 
 **Key facts:**
 - The FFI wraps every `block_on` body in `std::panic::catch_unwind`; panics surface as `NET_ERR_PANIC` rather than unwinding across `extern "C"`.
-- `timeout_ms == 0` is a non-blocking poll (D-23 fix); pre-v0.15 it was rewritten to 1 ms.
+- `timeout_ms == 0` is a non-blocking poll.
 
 ---
 
@@ -252,8 +252,8 @@ let db = NetDb::builder(Redex::new()).origin(origin_hash).with_tasks().with_memo
 ## Common gotchas
 
 - **`tasks.state()` returns an `Arc<RwLock<State>>` (Rust) / a snapshot dict (Python) / a JS object (Node).** Don't write through it; writes diverge from the RedEX log. Use the adapter's mutating methods (`tasks.create / .complete / .delete / .rename`) — they go through `ingest_with_token`.
-- **`applied_through_seq` ≠ `folded_through_seq`.** RYW waits on applied (events that ran through the fold); folded includes events the fold task observed but skipped under `FoldErrorPolicy::Skip`. The pre-v0.15 `wait_for_token` waited on folded and returned `Ok(())` for skipped events — fixed in D-17.
-- **`FoldStopped` is a real error.** The fold task can crash under `FoldErrorPolicy::Stop`; `wait_for_token` now surfaces `WaitForTokenError::FoldStopped` rather than a silent `Ok(())` (D-18).
+- **`applied_through_seq` ≠ `folded_through_seq`.** RYW waits on applied (events that ran through the fold); folded includes events the fold task observed but skipped under `FoldErrorPolicy::Skip`.
+- **`FoldStopped` is a real error.** The fold task can crash under `FoldErrorPolicy::Stop`; `wait_for_token` surfaces `WaitForTokenError::FoldStopped` rather than a silent `Ok(())`.
 - **The fold loop runs on a tokio task you don't see.** If you're embedding in a non-tokio runtime, you need a tokio runtime alive in the process — the substrate uses `tokio::spawn` under the hood.
 - **`open_from_snapshot` restores the applied watermark.** Subsequent events fold from there, not from seq 0. The applied watermark is the canonical "where am I in the log" pointer.
 - **Memory cost is `O(state_size)`, not `O(events)`.** Retention trim on the underlying RedEX file doesn't shrink the in-memory state — that's the fold's job (e.g., delete a Task removes it from state).

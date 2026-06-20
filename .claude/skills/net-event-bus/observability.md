@@ -102,9 +102,9 @@ Source: `net/crates/net/src/adapter/net/stream.rs:164-198`.
 
 TS / Python expose the same shape on `NetStreamStats` (`net/crates/net/bindings/node/index.d.ts:1667-1678`, `net/crates/net/bindings/python/src/lib.rs:1000-1021`); TS uses camelCase (`txSeq`, `lastActivityNs`, `backpressureEvents`, `txCreditRemaining`, …). `last_activity_ns` is a `bigint` in TS — well above `2^53`, will quietly truncate if you cast.
 
-### Retransmit-window evictions — `untracked_evictions()` (v0.27)
+### Retransmit-window evictions — `untracked_evictions()`
 
-The reliable-stream retransmit window has a bounded number of slots. If the tx-credit window ever admits more in-flight packets than the retransmit window can track, the oldest unacked descriptor is evicted — and a packet lost *after* eviction can never be retransmitted. That is **silent loss**, the stream-layer cousin of `events_dropped`. v0.27 sizes the retransmit window from the tx-window so the invariant `tx-window ≤ retransmit-window` holds by default, and surfaces any eviction that still occurs:
+The reliable-stream retransmit window has a bounded number of slots. If the tx-credit window ever admits more in-flight packets than the retransmit window can track, the oldest unacked descriptor is evicted — and a packet lost *after* eviction can never be retransmitted. That is **silent loss**, the stream-layer cousin of `events_dropped`. The retransmit window is sized from the tx-window so the invariant `tx-window ≤ retransmit-window` holds by default, and any eviction that still occurs is surfaced:
 
 - **`ReliableStream::untracked_evictions() -> u64`** — cumulative count of evicted, no-longer-trackable descriptors. Should be `0` in a correctly-sized deployment; a non-zero and climbing value means a window misconfiguration is silently dropping retransmittable data.
 - A **rate-limited `warn!`** fires on the first eviction and every 64th after, so the loss is visible in logs even without scraping.

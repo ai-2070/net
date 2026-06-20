@@ -1,6 +1,6 @@
 # RedEX — local append-only log
 
-RedEX is the **per-channel local persistence layer**. Not a database. Not a cluster. Not a broker. A `Redex` handle owns a directory; an open `RedexFile` is a single channel's append-only log on that node. Each node decides what to keep; there's no shared retention policy and no consensus. Replication (v0.14+) is opt-in per file via `RedexFileConfig::replication` — covered separately at the end.
+RedEX is the **per-channel local persistence layer**. Not a database. Not a cluster. Not a broker. A `Redex` handle owns a directory; an open `RedexFile` is a single channel's append-only log on that node. Each node decides what to keep; there's no shared retention policy and no consensus. Replication is opt-in per file via `RedexFileConfig::replication` — covered separately at the end.
 
 The bus is transient. RedEX is what you reach for when "I need to survive a node restart" or "I need to fold this stream into a CortEX state."
 
@@ -140,7 +140,7 @@ await file.close(); // async — same
 ```
 
 **Key facts:**
-- `RedexFile.sync()` and `RedexFile.close()` are **async** (return `Promise<void>`). Pre-v0.14 sync call sites compile but generate orphan Promise warnings and may exit the process before the fsync lands.
+- `RedexFile.sync()` and `RedexFile.close()` are **async** (return `Promise<void>`). Awaiting them matters: an un-awaited `close()` can let the process exit before the fsync lands.
 - `BigInt` for sequence numbers and retention caps — JS numbers lose precision past 2^53. Don't pass plain `Number`.
 - Per-channel config naming is camelCase; the underlying core accepts both shapes but Node binding rejects snake_case for tagged enums (`'colocationStrict'`, not `'colocation_strict'`).
 
@@ -223,7 +223,6 @@ net_redex_free(redex);
 
 ## Cross-binding gotchas
 
-- **`RedexFileConfig` field renames between versions.** v0.14 added `replication`; v0.15 didn't touch the file-config surface. If you have v0.13-era code, `with_persistent(true)` + retention knobs still work.
 - **Reopen with different config rejects.** `redex.open_file("foo", cfg_a)` then `redex.open_file("foo", cfg_b)` where `cfg_a != cfg_b` returns `RedexError::Channel("different from the original")` (compared structurally; `None ↔ None` and `Some(rep_a) ↔ Some(rep_b)` with matching shape both succeed). Tests that opened a channel with one config and reopened expecting silent reuse will see the typed error.
 - **`sweep_retention()` is manual.** The substrate doesn't run a global retention task; you call it on a cadence from your application. Forgetting this is the most common "why is my disk filling up?" misconfiguration.
 - **`append_batch` is per-batch atomic, not cross-batch.** All events in a single call land contiguously or none do; nothing serializes two distinct `append_batch` calls.
@@ -232,7 +231,7 @@ net_redex_free(redex);
 
 ---
 
-## Replication (v0.14+)
+## Replication
 
 For cross-node durability, pair `RedexFileConfig::with_replication(Some(ReplicationConfig { … }))` with a prior `Redex::enable_replication(mesh)` call. The per-channel replication runtime runs a 4-state machine (`Idle / Replica / Candidate / Leader`) over the `SUBPROTOCOL_REDEX` wire codec; nearest-RTT election with NodeId tiebreak, pull-based catch-up, bandwidth-budget gated.
 
@@ -251,7 +250,7 @@ let file = redex.open_file(
 )?;
 ```
 
-Replication is a deep topic; this skill stays focused on the local log. For the wire codec, election rules, failover semantics, bandwidth budgets, and per-channel Prometheus metrics, point at `net/README.md` § Replication or `net/crates/net/docs/releases/RELEASE_v0.14_THE_WARRIORS.md`.
+Replication is a deep topic; this skill stays focused on the local log. For the wire codec, election rules, failover semantics, bandwidth budgets, and per-channel Prometheus metrics, point at `net/README.md` § Replication.
 
 ---
 
