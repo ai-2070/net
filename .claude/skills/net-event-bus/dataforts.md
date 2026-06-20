@@ -15,6 +15,7 @@ If you came here from `redex.md` or `cortex.md` looking for "how do I read my ow
 | "Nodes near a chain should cache it speculatively, evict cold ones under pressure" | Phase 1 — Greedy | `Redex::enable_greedy_dataforts(mesh, …)` |
 | "Hot chains should drift toward the readers that drive the heat" | Phase 4 — Gravity | `Redex::enable_gravity_for_greedy(mesh, …)` |
 | "Substrate should carry a content-addressed reference; bytes live in S3 / Ceph / IPFS / local FS" | Phase 3 — Blob | `BlobAdapterRegistry::register` + `blob_publish` / `blob_resolve` |
+| "Move a blob / directory **peer-to-peer over the mesh** — no external store in the path" | Transfer (v0.27) | `serve_blob_transfer` + `fetch_blob` / `store_dir` / `fetch_dir` |
 | "Producer needs to read its own write deterministically through the cache" | Phase 5 — RYW | `tasks.wait_for_token(token, deadline)` |
 
 The four phases are independent. A deployment can run greedy without gravity (hoard, don't rebalance), gravity without greedy (drift-only on pre-seeded replicas), both, or neither (substrate-only). Same for blob and RYW.
@@ -214,6 +215,84 @@ Each binding lets you write adapters in the host language:
 - **Python** — `register_blob_adapter(id, instance)` where `instance` implements `fetch` / `store` (sync or `async def`). Async adapters run on a binding-owned event loop on a dedicated thread (D-4 fix — no fresh `asyncio.run` per call). An `aiobotocore` / `httpx.AsyncClient` / SQLAlchemy async engine inside the adapter is safe.
 - **Node** — `registerBlobAdapter(id, instance)` (sync TSFN bridge) or `registerAsyncBlobAdapter(id, instance)` (Promise-returning TSFN bridge).
 - **C / cgo** — `NetBlobAdapterVtable` with per-field null-check at registration (D-22); partial vtables return `NET_ERR_BLOB_VTABLE_INVALID`.
+
+---
+
+## Mesh blob + directory transfer (v0.27)
+
+Phase 3's `BlobRef` is a *reference*; the bytes still have to move. Pre-v0.27 the only movers were the storage adapters (S3 / Ceph / FS pull). v0.27 adds **peer-to-peer transfer over the mesh transport itself** — a new `SUBPROTOCOL_BLOB_TRANSFER` rides the v0.27 fair-scheduled streams (`StreamConfig.scheduled = true`, see `streams.md`), so a node fetches a content-addressed blob — or a whole directory — directly from a peer that holds it, with no external store in the path.
+
+This composes with Phase 3: `store_dir` writes chunks **into** a `BlobAdapter` and returns a manifest `BlobRef`; `fetch_blob` / `fetch_dir` pull those chunks **over the mesh** from whoever holds them. You can use the transfer surface without an S3-style backend at all (the FS adapter is enough).
+
+**How it works.** Discovery rides the capability fold's `causal:<hex>` advertisement. The requester picks a holder, opens a freshly-allocated transfer stream, and the holder validates possession-of-hash as the capability, then chunks the blob into ≤8108-byte reliable events terminated by FIN. The receiver concatenates by arrival order and verifies BLAKE3. **The hash is an unguessable 256-bit bearer token** — anyone who can name the hash can fetch the bytes, so sensitive content must layer channel / capability auth above this transport (or treat the hash itself as a secret).
+
+**Sizes + atomicity.** Default chunk `BLOB_CHUNK_SIZE_BYTES = 4 MiB`; per-chunk ceiling `TRANSFER_MAX_CHUNK_BYTES = 16 MiB`; wire events ≤8108 bytes. Both send and receive stream chunk-at-a-time (peak memory ≈ one chunk), so total transfer size is **disk-bound, not memory-bound**. `fetch_dir` is **atomic** — it writes to a sibling temp path and renames, so the destination either becomes the complete tree or stays exactly as it was; a mid-fetch failure is a complete rollback. Manifest paths are validated to stay within `dest`, so a hostile sender can't escape the destination root.
+
+**Install first.** A node must call `serve_blob_transfer(mesh, adapter)` before it can serve chunks to peers **or** issue its own fetches (`fetch_blob` registers state on the local engine). `serve_blob_transfer_rpc` additionally registers the `blob.transfers` operator RPC so `net-mesh transfer ls / status / cancel` can introspect this node's in-flight requester-side transfers.
+
+### Surface (verified against `sdk/src/transport.rs` + bindings)
+
+| Op | Rust (`net_sdk::transport`) | Node (mesh method) | Python (`_net` fn) |
+|---|---|---|---|
+| install engine | `serve_blob_transfer(&mesh, adapter)` | `mesh.serveBlobTransfer(adapter)` | `serve_blob_transfer(mesh, adapter)` |
+| fetch a blob (known holder) | `fetch_blob(&mesh, source, &ref) -> Bytes` | `mesh.fetchBlob(holderId, ref) -> Buffer` | `fetch_blob(mesh, holder_id, ref) -> bytes` |
+| fetch, discover holder | `fetch_blob_discovered(&mesh, &ref)` | `mesh.fetchBlobDiscovered(ref)` | `fetch_blob_discovered(mesh, ref)` |
+| stream a blob chunk-wise | `fetch_blob_stream(&mesh, source, &ref)` | — | — |
+| store a dir → manifest ref | `store_dir(adapter, &root) -> BlobRef` | `mesh.storeDir(adapter, root) -> BlobRef` | `store_dir(mesh, adapter, root) -> BlobRef` |
+| fetch a dir | `fetch_dir(&mesh, source, &ref, dest, concurrency) -> DirStats` | `mesh.fetchDir(sourceId, ref, dest) -> {files, bytes}` | `fetch_dir(mesh, source_id, ref, dest) -> (files, bytes)` |
+
+`DirStats { files: usize, bytes: u64 }`. `concurrency = 0` → `DEFAULT_FETCH_CONCURRENCY = 16` leaf files in flight. `BlobRef::Small` is one chunk; `BlobRef::Manifest` is its ordered chunk list; **`BlobRef::Tree` is not supported by the transport wrappers** (use the substrate tree walk). The SDK stays thin — no retry policy, no rollback machinery beyond `fetch_dir`'s atomic rename, no directory-sync primitives; applications compose policy above.
+
+**Go / C:** the FFI symbols ship in `src/ffi/transport.rs` (`net_serve_blob_transfer`, `net_fetch_blob`, `net_fetch_blob_discovered`, `net_store_dir`, `net_fetch_dir`, `net_dir_manifest_read`) and Go binds them over cgo. Note: as of this writing they are **not declared in `include/net.h`** — a C consumer declares the prototypes against the exported symbols directly. (The release notes describe a five-tier SDK; the ergonomic wrappers are Rust / Node / Python, with the C ABI present but the header not yet regenerated.)
+
+### Rust
+
+```rust
+use net_sdk::transport::{serve_blob_transfer, fetch_blob, store_dir, fetch_dir};
+use std::{path::Path, sync::Arc};
+
+// One-time: install the engine over a blob adapter (FS / S3 / …).
+serve_blob_transfer(&mesh, Arc::new(adapter));
+
+// Producer: hash a directory into content-addressed blobs, get the root ref.
+let manifest_ref = store_dir(&fs_adapter, Path::new("/data/model")).await?;
+// …publish `manifest_ref` on a channel so a consumer learns the token…
+
+// Consumer: pull one blob from a known holder, BLAKE3-verified.
+let bytes = fetch_blob(&mesh, holder_node_id, &blob_ref).await?;
+
+// Consumer: materialize a whole directory atomically (0 = default concurrency).
+let stats = fetch_dir(&mesh, holder_node_id, &manifest_ref, Path::new("/dest"), 0).await?;
+println!("{} files, {} bytes", stats.files, stats.bytes);
+```
+
+```ts
+mesh.serveBlobTransfer(adapter);
+const manifestRef = await mesh.storeDir(adapter, "/data/model");
+const bytes = await mesh.fetchBlob(holderNodeId, blobRef);          // Buffer
+const { files, bytes: n } = await mesh.fetchDir(sourceId, manifestRef, "/dest");
+```
+
+```python
+_net.serve_blob_transfer(mesh, adapter)
+manifest_ref = _net.store_dir(mesh, adapter, "/data/model")
+data = _net.fetch_blob(mesh, holder_id, blob_ref)                   # bytes
+files, n = _net.fetch_dir(mesh, source_id, manifest_ref, "/dest")
+```
+
+### Operator CLI — `net-mesh transfer`
+
+When a `MeshNode` is reachable through the standard `CliContext`, the operator CLI (`net-mesh` binary) moves blobs without writing code:
+
+| Command | Does |
+|---|---|
+| `net-mesh transfer send-blob <path> [--store]` | chunk a file (or stdin via `-`), optionally persist each chunk, print the `BlobRef` hex |
+| `net-mesh transfer recv-blob <source> <ref> --out <path>` | fetch one blob from a peer, stream to disk (temp-and-rename) |
+| `net-mesh transfer send-dir <path>` | walk + hash a directory, print the root manifest `BlobRef` hex |
+| `net-mesh transfer recv-dir <source> <root-ref> --dest <path>` | materialize a directory tree **atomically** |
+| `net-mesh transfer ls` / `status <id>` / `cancel <id>` | list / inspect / abort in-flight transfers |
+
+The verbs compose with the shell (pipe into `send-blob`, redirect `recv-blob` to stdout) and render a determinate byte-progress bar for sized fetches. They ship behind the `cli` feature flag.
 
 ---
 

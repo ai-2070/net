@@ -48,6 +48,8 @@ Re-announce to update. Subsequent calls go through the `CapabilityDiff` machiner
 
 Default TTL is 5 minutes. Override with `announce_capabilities_with(caps, ttl, sign)` (Rust). Re-announce before TTL elapses or peers will GC the entry.
 
+**Announcements are bound to the signer (v0.27.2).** The capability fold binds an announcement's wire `node_id` to the verified signing key, so a peer can no longer announce capabilities *as* another node. A forged `node_id` (one that doesn't match the signer) is rejected with `WireError::NodeIdMismatch` rather than silently folded in. Honest peers are unaffected.
+
 ---
 
 ## Querying — three shapes
@@ -89,6 +91,8 @@ pub struct CapabilityFilter {
 ```
 
 `require_tags` is AND (every tag must be present). `require_models` and `require_tools` are OR (any one match satisfies).
+
+**Queries are index-driven and cheap (v0.27).** The bulk-query path no longer clones the whole `CapabilityMembership` payload per candidate — it returns `NodeId`s directly and seeds complex `query_model` / `query_tool` filters from the tag index instead of full-scanning. On a 10k-node fold (M1 Max) this took single-tag lookups from ~14 ms to ~184 µs and `query_model` from ~108 ms to ~88 µs (~1230×). The locking surface is unchanged. You still shouldn't rebuild a topic system on `find_nodes` (latest-wins, no ordering — see *What this is NOT*), but per-query cost is no longer the reason not to.
 
 ---
 

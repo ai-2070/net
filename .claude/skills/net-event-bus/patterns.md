@@ -144,9 +144,9 @@ JSON is the wire format. There is no schema registry. Producer and consumer must
 
 ## "I want auth — only some subscribers should see this channel"
 
-Use **permission tokens** (see `net/README.md` § Security surface). The publisher's identity issues signed tokens; subscribers present them when subscribing. Publisher checks via a 20ns bloom filter on every emit. Revocation is immediate.
+Register the channel with `token_roots` and present a **root-anchored `TokenChain`** when subscribing (v0.27 — see `concepts.md` § Identity and `net/README.md` § Security surface). The chain is honored only if it roots at one of the channel's `token_roots`, binds at its leaf to the subscriber's `EntityId`, and authorizes the action at every link; the publisher re-checks expiry + revocation while the subscription lives, and revocation is immediate. **Delegated** publishers must install their chain locally with `MeshNode::set_publish_chain(channel, chain)`; **direct-issued** publishers need no change. This replaced the older bare-token model and is a **breaking wire change** — v0.26 and v0.27 peers don't interoperate on auth-gated channels.
 
-This is out of scope for the basic event-bus skill — point at the source if the user needs it. The native `net` binding exposes the token API; the SDK wrappers may not surface it cleanly yet.
+This is out of scope for the basic event-bus skill — point at the source if the user needs it. The native `net` binding exposes the chain API; the SDK surfaces a presented token via `SubscribeOptions.token`, and `set_publish_chain` lives on the core `MeshNode`.
 
 ## "I want a channel only visible inside one subnet (e.g. dev vs prod)"
 

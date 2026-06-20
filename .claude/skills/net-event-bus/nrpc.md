@@ -282,6 +282,35 @@ Stack them: `breaker.call(() => callWithRetry(...))` is the typical "give up fas
 
 ---
 
+## Throughput tuning — ingress/egress batching (v0.27)
+
+nRPC throughput is bounded by the shared mesh receive loop, not the handler. v0.27 lands the diagnosis plus two opt-in batching paths; **both default off**.
+
+- **`recvmmsg` ingress batching** — build feature `batched-ingress` + runtime `MeshNodeConfig::batched_ingress = true` routes the mesh receive loop through the Linux `recvmmsg` path, handing a whole syscall batch over the channel at once instead of one packet per `blocking_send`. The field exists **only** when the crate is built `--features batched-ingress` (Linux-only effect); default `false`. Turn it on for high-QPS ingress where the per-packet channel-hop tax dominates.
+- **`sendmmsg` egress batching** — a per-mesh group-by-destination drain coalesces relayed packets to the same peer into one `sendmmsg` syscall. It's **disabled on the originating fast path** on purpose: request/response is latency-bound with send-queue depth ≈ 1, so send-batching there adds latency without throughput. The win is real only for concurrent *relayed* traffic between two peers.
+
+**The scaling wall is the recv pipeline.** `nrpc_qps` scales `c1 → c16` at ~4×, not 16× — the bottleneck is the single-consumer `recv → AEAD decrypt → bridge task → fold mutex` chain, not the send path or the handler. Batching shaves syscall overhead but does not move this wall (the ack-piggyback protocol that does is a future release). Don't promise linear QPS scaling from raising concurrency alone.
+
+---
+
+## Typed bindings from discovered tools — `net-mesh typegen` (v0.27)
+
+nRPC has no IDL and needs none — the wire is schemaless JSON and each side ships its own typed serializer. v0.27 adds an **optional** codegen path for the AI-tool case: `net-mesh typegen` walks the capability fold for `ai-tool:*` tags, fetches each matching descriptor's metadata, and emits typed bindings so a caller gets compile-time types for a tool it discovered at runtime. Codegen is a convenience over the same wire RPC — a generated call lands identically to a hand-written `call_typed`.
+
+Output is one module per tool: the tool's JSON Schema lowers to TypeScript interfaces (`--language ts`) or Pydantic v2 models (`--language python`), plus a typed call helper (`callAcmeWebSearch(mesh, request)` / `call_acme_web_search(mesh, request)`) and a `…Meta` constant carrying the descriptor (tool id, version, streaming flag, tags). Bindings are cross-language by construction — a Python agent calling a TypeScript tool calling a Go server is the same wire shape as Rust→Rust.
+
+| Command | Does |
+|---|---|
+| `net-mesh typegen generate --language ts --tag weather --out ./generated` | generate from live discovery, filtered by tag (`--tag` repeatable; ANY match) |
+| `net-mesh typegen generate --language python --tool acme.web-search --out ./generated` | generate for explicit tool ids (`--tool` repeatable; exact match) |
+| `net-mesh typegen generate --from-snapshot <file> …` | regenerate from a pinned snapshot — no mesh query, hermetic CI |
+| `net-mesh typegen snapshot --tag weather --out <file>` | capture currently-discoverable descriptors into a versioned snapshot |
+| `net-mesh typegen diff --from <a> --to <b> [--exit-code]` | added/removed tools + schema deltas; `--exit-code` exits 14 on a BREAKING change (CI gate) |
+
+The actual flags are singular-and-repeatable (`--tag`, `--tool`) and `diff` takes `--from` / `--to`, **not** positional args. Ships behind the `cli` feature flag. Source: `cli/src/commands/typegen/`.
+
+---
+
 ## Cross-binding contract
 
 The canonical interop contract — used by every binding's wire-format compat test — is the `cross_lang_echo_sum` service. Same JSON shape, same status codes, same error prefixes across Rust / Node / Python / Go.
