@@ -1,0 +1,66 @@
+.claude/skills/net-event-bus/SKILL.md
+  s_a984d0bd503748::t_4f8dce00638c03 25
+  s_a984d0bd503748::t_b614b550e79877 28
+.claude/skills/net-event-bus/capabilities.md
+  s_a984d0bd503748::t_d03dc891feffa5 51
+  s_a984d0bd503748::t_c85f530e9317cb 95
+.claude/skills/net-event-bus/cortex.md
+  s_a984d0bd503748::t_2e2c4573670fec 179
+  s_a984d0bd503748::t_5cc6fcf70e7509 187
+  s_a984d0bd503748::t_c826c9a673c5d8 211
+  s_a984d0bd503748::t_37ed0811b5208d 255
+  s_a984d0bd503748::t_b4a645e379e8a6 256
+.claude/skills/net-event-bus/patterns.md
+  s_a984d0bd503748::t_40017e8a09620c 147
+.claude/skills/net-event-bus/observability.md
+  s_a984d0bd503748::t_e113cc58100809 105,107
+.claude/skills/net-event-bus/dataforts.md
+  s_a984d0bd503748::t_7882da15962533 3
+  s_a984d0bd503748::t_5cfcf780cc2be8 221,223
+  s_a984d0bd503748::t_666fa561fad3c1 246
+  s_a984d0bd503748::t_86ee64942a614b 347-351
+  s_a984d0bd503748::t_2895ba86a324ab 215,217
+  s_a984d0bd503748::t_af78cbea846ca0 173-179
+  s_a984d0bd503748::t_0f69fcdac79f6f 146-151
+  s_a984d0bd503748::t_97f87e0137e47a 18
+  s_a984d0bd503748::t_d2fb2ac3cda26f 342
+  s_a984d0bd503748::t_1b4ee3b6e74837 357
+  s_a984d0bd503748::t_60defd938adeef 169
+  s_a984d0bd503748::t_e035170e4f4edd 370
+  s_a984d0bd503748::t_693c2826028c30 315
+  s_a984d0bd503748::t_b494be60b15310 89-91
+.claude/skills/net-event-bus/concepts.md
+  s_a984d0bd503748::t_c410c9622dbe08 115
+  s_a984d0bd503748::t_059414ac547955 165
+.claude/skills/net-event-bus/streams.md
+  s_a984d0bd503748::t_e798c4b02a052a 36
+  s_a984d0bd503748::t_d3ddc5dc782028 271
+  s_a984d0bd503748::t_b8645dbfc73120 34
+  s_a984d0bd503748::t_9a395ce6be2f14 307
+  s_a984d0bd503748::t_6b737f099784e8 238
+  s_a984d0bd503748::t_0e3006c48def2c 263
+.claude/skills/net-event-bus/redex.md
+  s_a984d0bd503748::t_4d1f5d4aba52fb 253
+  s_a984d0bd503748::t_c59b265924e0ed 234
+  s_a984d0bd503748::t_25b2ea072e83cb 143
+  s_a984d0bd503748::t_f3f4882f236031 3
+.claude/skills/net-event-bus/nrpc.md
+  s_a984d0bd503748::t_3d0e42e94664b8 285,287
+  s_a984d0bd503748::t_afea88ffe1ddbb 296,298
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "1ddc2ba71d6d7dc2dd1294abd68da5a06fe2731c",
+  "prompts": {},
+  "sessions": {
+    "s_a984d0bd503748": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2070a8cf-690b-49da-bcd7-1943a5b138fa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
