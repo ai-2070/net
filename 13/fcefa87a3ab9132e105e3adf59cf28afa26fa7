@@ -1,0 +1,43 @@
+.claude/skills/net-event-bus/streams.md
+  s_a984d0bd503748::t_511d56f751b2d3 65
+  s_a984d0bd503748::t_b3b6d6835f45cc 66
+  s_a984d0bd503748::t_6b6862846bfd86 259,263
+  s_a984d0bd503748::t_63c491ec16557c 271
+  s_a984d0bd503748::t_a16b513868ecac 307
+  s_a984d0bd503748::t_8eec92e403a9c2 238
+  s_a984d0bd503748::t_b5e08cf31799cf 34,36
+.claude/skills/net-event-bus/dataforts.md
+  s_a984d0bd503748::t_82639bd11454d0 18
+  s_a984d0bd503748::t_eebbd38fcfcd58 221-298
+.claude/skills/net-event-bus/concepts.md
+  s_a984d0bd503748::t_d28bee27795637 115
+  s_a984d0bd503748::t_110852fee23efd 165
+.claude/skills/net-event-bus/SKILL.md
+  s_a984d0bd503748::t_8537c44d54d500 25
+  s_a984d0bd503748::t_c86457c9b48ecd 28
+.claude/skills/net-event-bus/nrpc.md
+  s_a984d0bd503748::t_6e2a43bdbeea84 285-313
+.claude/skills/net-event-bus/patterns.md
+  s_a984d0bd503748::t_529d63dd3038d9 147,149
+.claude/skills/net-event-bus/observability.md
+  s_a984d0bd503748::t_3561a5fb366ece 105-113
+.claude/skills/net-event-bus/capabilities.md
+  s_a984d0bd503748::t_b21dba7b9622ed 51-52
+  s_a984d0bd503748::t_630a2e6cd1726a 95-96
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "13fcefa87a3ab9132e105e3adf59cf28afa26fa7",
+  "prompts": {},
+  "sessions": {
+    "s_a984d0bd503748": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2070a8cf-690b-49da-bcd7-1943a5b138fa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
