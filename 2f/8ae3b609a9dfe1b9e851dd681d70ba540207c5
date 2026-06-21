@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_06_21_PORT_SCANNING.md
+  s_d6aaacaeb7ae80::t_f874eb5145a5e1 1-202
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "2f8ae3b609a9dfe1b9e851dd681d70ba540207c5",
+  "prompts": {},
+  "sessions": {
+    "s_d6aaacaeb7ae80": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3cecd013-206c-467a-974f-8c275ba1e8d5",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
