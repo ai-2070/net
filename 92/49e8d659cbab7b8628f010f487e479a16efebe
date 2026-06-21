@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_06_21_NAT_TRAVERSAL.md
+  s_d6aaacaeb7ae80::t_3280170df047c8 1-194
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "9249e8d659cbab7b8628f010f487e479a16efebe",
+  "prompts": {},
+  "sessions": {
+    "s_d6aaacaeb7ae80": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3cecd013-206c-467a-974f-8c275ba1e8d5",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
