@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_d6aaacaeb7ae80::t_cf986d3f5f7f25 7787-7790
+  s_d6aaacaeb7ae80::t_baea953b699bec 7709-7746,7751-7753
+net/crates/net/tests/rendezvous_coordinator.rs
+  s_d6aaacaeb7ae80::t_7db88ae9f3f8b1 384-516
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "b54329d88d49e0c44069b0b02847816e26ccef43",
+  "prompts": {},
+  "sessions": {
+    "s_d6aaacaeb7ae80": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3cecd013-206c-467a-974f-8c275ba1e8d5",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
