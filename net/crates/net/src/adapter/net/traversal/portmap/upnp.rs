@@ -94,6 +94,19 @@ impl UpnpMapper {
     /// `local_ip` should be the interface address the mesh
     /// socket bound to — not `0.0.0.0` and not a loopback.
     pub fn new(local_ip: IpAddr) -> Self {
+        // The router needs a concrete LAN address to forward matched
+        // traffic to; `0.0.0.0` / `::` or a loopback would produce an
+        // `AddPortMapping` most IGDs reject, and the mesh would then
+        // advertise a mapping that routes nowhere (code review
+        // 2026-06-21, Finding A1). The production path
+        // (`sequential_mapper_from_os` → `local_ipv4_for_gateway`)
+        // already supplies a validated non-unspecified IPv4; this
+        // `debug_assert` pins the contract for direct callers without
+        // a release-build cost.
+        debug_assert!(
+            !local_ip.is_unspecified() && !local_ip.is_loopback(),
+            "UpnpMapper::new requires a concrete LAN IP, got {local_ip}",
+        );
         Self {
             local_ip,
             gateway: Mutex::new(None),
@@ -172,6 +185,13 @@ impl PortMapperClient for UpnpMapper {
         let result = tokio::time::timeout(UPNP_DEADLINE, async {
             let gw = self.gateway().await?;
             let local = SocketAddr::new(self.local_ip, internal_port);
+            // Re-read the WAN IP on every install / renew rather than
+            // caching it from `probe`: a CGNAT or dynamic-IP gateway
+            // can change its external address between calls, and the
+            // mapping we publish must carry the *current* one. Cost is
+            // one extra SOAP round-trip, bounded by `UPNP_DEADLINE`
+            // (code review 2026-06-21, Finding A3 — intentional, not
+            // an oversight).
             let external_ip = gw
                 .get_external_ip()
                 .await
@@ -248,34 +268,7 @@ fn search_err_to_port_mapping(err: igd_next::SearchError) -> PortMappingError {
     }
 }
 
-/// Map `igd-next::AddPortError` into our stable vocabulary.
-/// `PortInUse` / `SamePortValuesRequired` / `OnlyPermanentLeasesSupported`
-/// are router-policy refusals; other variants are transport.
-#[allow(dead_code)]
-fn add_port_err_to_port_mapping(err: igd_next::AddPortError) -> PortMappingError {
-    use igd_next::AddPortError;
-    match err {
-        AddPortError::PortInUse => PortMappingError::Refused("port-in-use".into()),
-        AddPortError::SamePortValuesRequired => {
-            PortMappingError::Refused("same-port-required".into())
-        }
-        AddPortError::OnlyPermanentLeasesSupported => {
-            PortMappingError::Refused("only-permanent-leases-supported".into())
-        }
-        AddPortError::DescriptionTooLong => {
-            PortMappingError::Transport("description too long".into())
-        }
-        AddPortError::ExternalPortZeroInvalid | AddPortError::InternalPortZeroInvalid => {
-            PortMappingError::Transport("zero port invalid".into())
-        }
-        AddPortError::RequestError(e) => PortMappingError::Transport(format!("IGD request: {e}")),
-        AddPortError::ActionNotAuthorized => {
-            PortMappingError::Refused("action-not-authorized".into())
-        }
-    }
-}
-
-/// Companion mapper for `AddAnyPortError`. `ExternalPortInUse` /
+/// Mapper for `AddAnyPortError`. `ExternalPortInUse` /
 /// `NoPortsAvailable` / `OnlyPermanentLeasesSupported` are
 /// router-policy refusals; other variants are transport.
 fn add_any_port_err_to_port_mapping(err: igd_next::AddAnyPortError) -> PortMappingError {
@@ -307,6 +300,35 @@ fn add_any_port_err_to_port_mapping(err: igd_next::AddAnyPortError) -> PortMappi
 mod tests {
     use super::*;
     use igd_next::AddPortError;
+
+    /// Test-only mapper for `igd-next::AddPortError`. Production uses
+    /// `add_any_port` (→ `add_any_port_err_to_port_mapping`), so the
+    /// fixed-port `AddPortError` mapping exists only to pin the
+    /// stable error vocabulary here (code review 2026-06-21,
+    /// Finding A2 — was a `#[allow(dead_code)]` fn in the module body).
+    fn add_port_err_to_port_mapping(err: AddPortError) -> PortMappingError {
+        match err {
+            AddPortError::PortInUse => PortMappingError::Refused("port-in-use".into()),
+            AddPortError::SamePortValuesRequired => {
+                PortMappingError::Refused("same-port-required".into())
+            }
+            AddPortError::OnlyPermanentLeasesSupported => {
+                PortMappingError::Refused("only-permanent-leases-supported".into())
+            }
+            AddPortError::DescriptionTooLong => {
+                PortMappingError::Transport("description too long".into())
+            }
+            AddPortError::ExternalPortZeroInvalid | AddPortError::InternalPortZeroInvalid => {
+                PortMappingError::Transport("zero port invalid".into())
+            }
+            AddPortError::RequestError(e) => {
+                PortMappingError::Transport(format!("IGD request: {e}"))
+            }
+            AddPortError::ActionNotAuthorized => {
+                PortMappingError::Refused("action-not-authorized".into())
+            }
+        }
+    }
 
     #[test]
     fn error_mapping_no_response_is_unavailable() {
@@ -344,6 +366,17 @@ mod tests {
         assert!(mapper.cached_gateway().is_none());
     }
 
+    /// Finding A1: `UpnpMapper::new` debug-asserts a concrete LAN IP.
+    /// An unspecified (`0.0.0.0`) address would map to nowhere. Gated
+    /// on `debug_assertions` since the check (and thus the panic) is
+    /// compiled out of release builds.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "concrete LAN IP")]
+    fn new_rejects_unspecified_local_ip_in_debug() {
+        let _ = UpnpMapper::new("0.0.0.0".parse().unwrap());
+    }
+
     /// Integration-style: SSDP search against a network with no
     /// IGD responder (the typical CI environment) should fail
     /// with `Unavailable` within the search-timeout budget.
@@ -360,7 +393,12 @@ mod tests {
         // NoResponseWithinTimeout. Both map to errors we accept
         // here — the property we care about is "doesn't hang
         // beyond the deadline + doesn't panic."
-        let mapper = UpnpMapper::new("127.0.0.1".parse().unwrap());
+        //
+        // A concrete (non-loopback) LAN IP — `local_ip` is irrelevant
+        // to the SSDP-search path this exercises, but `UpnpMapper::new`
+        // now debug-asserts a routable address (Finding A1), so a
+        // loopback would (correctly) panic.
+        let mapper = UpnpMapper::new("10.0.0.1".parse().unwrap());
         let start = tokio::time::Instant::now();
         let res = mapper.probe().await;
         let elapsed = start.elapsed();
