@@ -1397,6 +1397,40 @@ async fn await_punch_observer_outcome(
     }
 }
 
+/// RAII single-flight gate over an `AtomicBool`.
+///
+/// [`SweepGuard::try_enter`] returns `Some(guard)` iff the flag was
+/// previously clear (and atomically sets it); dropping the guard
+/// clears it. [`MeshNode::reclassify_nat`] uses it to honor its
+/// documented "at most one sweep at a time" contract: a second,
+/// concurrent entry observes the flag already set and bails out as a
+/// no-op rather than racing the in-flight sweep on the shared
+/// `pending_reflex_probes` map.
+#[cfg(feature = "nat-traversal")]
+struct SweepGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+#[cfg(feature = "nat-traversal")]
+impl<'a> SweepGuard<'a> {
+    /// Try to enter the single-flight section. `Some` on success
+    /// (flag was clear, now set); `None` if a sweep is already
+    /// running. `Acquire` on the swap so the entering sweep's reads
+    /// happen-after the prior sweep's `Release` on drop.
+    fn try_enter(flag: &'a std::sync::atomic::AtomicBool) -> Option<Self> {
+        if flag.swap(true, std::sync::atomic::Ordering::Acquire) {
+            None
+        } else {
+            Some(Self(flag))
+        }
+    }
+}
+
+#[cfg(feature = "nat-traversal")]
+impl Drop for SweepGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Compute the three keep-alive send offsets (relative to the
 /// scheduler task's spawn instant) for a punch whose synchronized
 /// fire time is `fire_at_ms` (Unix epoch ms), given the current
@@ -1806,6 +1840,17 @@ pub struct MeshNode {
             ),
         >,
     >,
+    /// Single-flight gate for the classification sweep.
+    /// [`Self::reclassify_nat`] sets this on entry and clears it on
+    /// exit (via an RAII [`SweepGuard`]); a concurrent entry while a
+    /// sweep is already in flight is a no-op, as that method's doc
+    /// promises. Without it, an operator / FFI `reclassify_nat` call
+    /// racing the background classify loop would collide on
+    /// `pending_reflex_probes` (keyed by peer id) and starve one of
+    /// the sweeps. Plain `AtomicBool` (not `Arc`) — only ever touched
+    /// through `&self` inside `reclassify_nat`.
+    #[cfg(feature = "nat-traversal")]
+    nat_classifying: std::sync::atomic::AtomicBool,
     /// Current NAT classification, encoded via
     /// [`super::traversal::classify::NatClass::as_u8`]. Starts as
     /// `Unknown` (`0`) and is updated by the classification sweep
@@ -2465,6 +2510,8 @@ impl MeshNode {
             pending_punch_acks: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
             next_waiter_gen: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            #[cfg(feature = "nat-traversal")]
+            nat_classifying: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "nat-traversal")]
             punch_observers: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
@@ -12448,6 +12495,18 @@ impl MeshNode {
     pub async fn reclassify_nat(&self) {
         use super::traversal::classify::ClassifyFsm;
 
+        // Single-flight gate (doc contract: "at most one sweep at a
+        // time"). `reclassify_nat` is `pub` + FFI-exported, so an
+        // operator call can race the background classify loop's tick
+        // (or another operator call). Concurrent sweeps collide on
+        // `pending_reflex_probes` — keyed by peer id, the later
+        // probe insert drops the earlier sweep's oneshot and starves
+        // it. A second concurrent entry is a no-op; the RAII guard
+        // clears the flag on every exit path below.
+        let Some(_sweep) = SweepGuard::try_enter(&self.nat_classifying) else {
+            return;
+        };
+
         // Reflex-override short-circuit: an operator-set (or
         // port-mapping installed) external address already tells
         // us everything the classifier would: NAT type is Open,
@@ -12855,6 +12914,33 @@ mod keepalive_offset_tests {
         let offsets = keepalive_send_offsets(u64::MAX, 0, DEADLINE);
         assert_eq!(offsets[0], DEADLINE);
         assert!(offsets[2] <= DEADLINE + Duration::from_millis(250));
+    }
+}
+
+#[cfg(all(test, feature = "nat-traversal"))]
+mod sweep_guard_tests {
+    //! Unit coverage for [`SweepGuard`] (code review 2026-06-21,
+    //! port-scanning Finding B1): the single-flight gate that backs
+    //! `reclassify_nat`'s "at most one sweep at a time" contract.
+    use super::SweepGuard;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn try_enter_is_single_flight_and_releases_on_drop() {
+        let flag = AtomicBool::new(false);
+
+        let g1 = SweepGuard::try_enter(&flag);
+        assert!(g1.is_some(), "first entry must acquire the gate");
+        assert!(
+            SweepGuard::try_enter(&flag).is_none(),
+            "a second concurrent entry must be refused while the first is held",
+        );
+
+        drop(g1);
+        assert!(
+            SweepGuard::try_enter(&flag).is_some(),
+            "after the guard drops, the gate must be re-enterable",
+        );
     }
 }
 
