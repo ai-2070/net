@@ -1,0 +1,19 @@
+web/src/content/docs/releases/RELEASE_v0.27.7_PURPLE_RAIN.md
+  s_10be910f0d3ce3::t_7bc7f661196cc6 1-50
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "db0bf13566db30926bb596c56e8b6dd1bef0c74c",
+  "prompts": {},
+  "sessions": {
+    "s_10be910f0d3ce3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "020749a0-9c9b-4591-a7a8-7ff8b38b378c",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
