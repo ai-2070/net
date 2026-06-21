@@ -292,8 +292,6 @@ async fn observer_acks_only_on_matching_sender_node_id() {
 
     let a_id = a.node_id();
     let b_id = b.node_id();
-    let r_id = r.node_id();
-    let a_addr = a.local_addr();
     let r_for_poll = r.clone();
     assert!(
         wait_for(Duration::from_secs(3), || {
@@ -307,18 +305,20 @@ async fn observer_acks_only_on_matching_sender_node_id() {
     // Helper: drive one punch round on A (installs A's observer keyed
     // by `listener_addr`), inject one keep-alive from the listener
     // with the given sender id, and report whether A acked B within
-    // the punch window.
+    // the punch window. Node ids / addrs are derived from the handles
+    // so the signature stays small.
     async fn round(
         a: &Arc<MeshNode>,
         r: &Arc<MeshNode>,
-        listener: &UdpSocket,
-        a_addr: SocketAddr,
         b: &Arc<MeshNode>,
-        a_id: u64,
-        b_id: u64,
-        r_id: u64,
+        listener: &UdpSocket,
         injected_sender: u64,
     ) -> bool {
+        let a_id = a.node_id();
+        let b_id = b.node_id();
+        let r_id = r.node_id();
+        let a_addr = a.local_addr();
+
         // B waits for A's ack (from_peer == a_id, forwarded by R).
         let b_clone = b.clone();
         let b_wait = tokio::spawn(async move { b_clone.await_punch_ack(a_id, r_id).await });
@@ -327,7 +327,7 @@ async fn observer_acks_only_on_matching_sender_node_id() {
         // A initiates: R introduces, A installs its observer keyed by
         // B's reflex (= listener_addr) and starts its own keep-alive
         // train at the listener (harmless here).
-        a.request_punch(r.node_id(), b_id, a_addr)
+        a.request_punch(r_id, b_id, a_addr)
             .await
             .expect("request_punch should mediate");
         // Let A's dispatch install the observer before we inject.
@@ -342,11 +342,11 @@ async fn observer_acks_only_on_matching_sender_node_id() {
         listener.send_to(&ka, a_addr).await.unwrap();
 
         // Did A ack B? B's waiter resolves iff A emitted the ack.
-        matches!(b_wait.await.expect("b_wait task panicked"), Ok(_))
+        b_wait.await.expect("b_wait task panicked").is_ok()
     }
 
     // Control: matching sender id → A must ack.
-    let acked_on_match = round(&a, &r, &listener, a_addr, &b, a_id, b_id, r_id, b_id).await;
+    let acked_on_match = round(&a, &r, &b, &listener, b.node_id()).await;
     assert!(
         acked_on_match,
         "control: a keep-alive whose sender_node_id == B must drive A's ack \
@@ -354,18 +354,7 @@ async fn observer_acks_only_on_matching_sender_node_id() {
     );
 
     // Reject: wrong sender id → A must stay silent → B times out.
-    let acked_on_mismatch = round(
-        &a,
-        &r,
-        &listener,
-        a_addr,
-        &b,
-        a_id,
-        b_id,
-        r_id,
-        0xDEAD_BEEF_u64, // not B's node id
-    )
-    .await;
+    let acked_on_mismatch = round(&a, &r, &b, &listener, 0xDEAD_BEEF_u64).await;
     assert!(
         !acked_on_mismatch,
         "reject: a keep-alive with the wrong sender_node_id must NOT drive \
@@ -467,7 +456,7 @@ async fn stray_keepalive_with_wrong_sender_does_not_burn_the_observer() {
         .await
         .unwrap();
 
-    let acked = matches!(b_wait.await.expect("b_wait task panicked"), Ok(_));
+    let acked = b_wait.await.expect("b_wait task panicked").is_ok();
     assert!(
         acked,
         "a stray wrong-sender keep-alive must not burn the observer; the \
