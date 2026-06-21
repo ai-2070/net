@@ -12494,7 +12494,7 @@ impl MeshNode {
     /// `nat_class` + `reflex_addr` with the result.
     ///
     /// Runs at most one *sweep* at a time — a second `reclassify_nat`
-    /// call while a sweep is in flight is a no-op (the [`SweepGuard`]
+    /// call while a sweep is in flight is a no-op (the `SweepGuard`
     /// at the top of the body). The gate is sweep-level only: a
     /// standalone [`Self::probe_reflex`] — e.g. the
     /// `net_mesh_probe_reflex` FFI — is *not* gated and can still race
