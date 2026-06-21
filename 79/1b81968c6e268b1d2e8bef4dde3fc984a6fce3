@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/traversal/portmap/upnp.rs
+  s_d6aaacaeb7ae80::t_966587b0525368 271
+  s_d6aaacaeb7ae80::t_bb7bb2d0051c34 304-332
+  s_d6aaacaeb7ae80::t_ac47040c1f449e 97-109
+  s_d6aaacaeb7ae80::t_ce51622b1b7067 396-401
+  s_d6aaacaeb7ae80::t_4f7dd5a7dd77ae 369-379
+  s_d6aaacaeb7ae80::t_f04b426e736bee 188-194
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "791b81968c6e268b1d2e8bef4dde3fc984a6fce3",
+  "prompts": {},
+  "sessions": {
+    "s_d6aaacaeb7ae80": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3cecd013-206c-467a-974f-8c275ba1e8d5",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
