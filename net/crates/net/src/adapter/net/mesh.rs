@@ -12654,19 +12654,21 @@ impl MeshNode {
             );
             return;
         }
-        // No-observation guard: when every probe failed we have no
-        // fresh reflex to publish. Pre-fix the commit still wrote
-        // `nat_class` (typically degenerating to `Unknown`) but
-        // left the previous `reflex_addr` in place — a torn
-        // `(fresh class, stale reflex)` snapshot that violates the
-        // `traversal_publish_mu` invariant a downstream
-        // `announce_capabilities_with` reader expects to see
-        // coherent. Match the deadline-expired branch in
-        // `reclassify_nat` (the `tokio::time::timeout` Err arm
-        // above): treat "no observations this sweep" as a transient
-        // signal and leave the previously-published pair untouched.
-        // A subsequent sweep can install a fresh class+reflex
-        // together.
+        // No-reflex guard (defense-in-depth). For coherent inputs from
+        // `reclassify_nat` the <2-observation guard above already
+        // subsumes this case: an all-probes-failed sweep has
+        // `observation_count == 0`, and any sweep with
+        // `observation_count >= 2` necessarily threaded a
+        // `latest_reflex` (it is set on every `fsm.observe`). This
+        // guard remains for a *torn* input — a caller passing
+        // `observation_count >= 2` with `latest_reflex == None` — so
+        // the commit never publishes a `nat_class` without a paired
+        // reflex (the `traversal_publish_mu` coherence invariant a
+        // downstream `announce_capabilities_with` reader relies on).
+        // Same policy as the deadline-expired branch in
+        // `reclassify_nat`: leave the previously-published pair
+        // untouched. Pinned by
+        // `commit_keeps_prior_on_torn_class_without_reflex`.
         let Some(addr) = latest_reflex else {
             tracing::debug!(
                 "nat-traversal: no probe observations this sweep, keeping prior (class, reflex) pair"
@@ -13294,6 +13296,42 @@ mod reclassify_override_race_tests {
             node.reflex_addr(),
             Some(probed),
             "a single-observation sweep must not overwrite the published reflex",
+        );
+    }
+
+    /// Finding B2 follow-up (code review 2026-06-21, port-scanning):
+    /// the no-reflex guard in `commit_reclassify_observations` is
+    /// subsumed by the <2-observation guard for every coherent
+    /// `reclassify_nat` input (0 observations ⟹ caught by the count
+    /// guard; ≥2 observations ⟹ a reflex was threaded). It is retained
+    /// purely as defense-in-depth against a *torn* input — a commit
+    /// claiming ≥2 observations yet carrying no reflex. Such an input
+    /// must still keep the prior (class, reflex) pair rather than
+    /// publish a class with no paired reflex.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_keeps_prior_on_torn_class_without_reflex() {
+        let node = build_node_for_test().await;
+        let probed: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+
+        // Seed a coherent two-observation result.
+        node.commit_reclassify_observations(NatClass::Cone, Some(probed), 2);
+        assert_eq!(node.nat_class(), NatClass::Cone);
+        assert_eq!(node.reflex_addr(), Some(probed));
+
+        // Torn input: claims 2 observations (so the <2 guard does NOT
+        // fire) but carries no reflex. The no-reflex guard must catch
+        // it and keep the prior pair.
+        node.commit_reclassify_observations(NatClass::Open, None, 2);
+
+        assert_eq!(
+            node.nat_class(),
+            NatClass::Cone,
+            "a torn (class, None) commit must not publish a class without a reflex",
+        );
+        assert_eq!(
+            node.reflex_addr(),
+            Some(probed),
+            "a torn (class, None) commit must leave the published reflex intact",
         );
     }
 
