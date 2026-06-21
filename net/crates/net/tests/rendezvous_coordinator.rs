@@ -381,3 +381,136 @@ async fn request_punch_times_out_when_targets_reflex_was_evicted_by_ttl_gc() {
         "should not wait much past punch_deadline; elapsed {elapsed:?}",
     );
 }
+
+/// Anti-reflection guard (code review 2026-06-21, Finding 1): a
+/// `PunchRequest` whose `self_reflex` IP does not match the
+/// requester's session source address must be dropped by the
+/// coordinator, even when the target's reflex IS cached.
+///
+/// Without the guard, a malicious A could name an arbitrary victim
+/// address in `self_reflex`; R would forward it to B, and B — which
+/// accepts an unsolicited `PunchIntroduce` as the punch responder —
+/// would fire its keep-alive train at the victim, turning R + B into
+/// a UDP reflector with A's identity hidden. The guard binds
+/// `self_reflex` to A's observed wire-source IP (only the port may
+/// legitimately differ, under symmetric NAT), so the spoofed request
+/// is dropped and A's `request_punch` times out with `PunchFailed`
+/// inside `punch_deadline`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_punch_with_spoofed_self_reflex_ip_is_dropped() {
+    let (a, r, b, _x) = rendezvous_topology().await;
+
+    // Both classify + announce so R has BOTH reflexes cached — this
+    // isolates the drop cause to the self_reflex IP guard rather than
+    // a missing target reflex.
+    a.reclassify_nat().await;
+    b.reclassify_nat().await;
+    a.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("A announce");
+    b.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("B announce");
+
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+    let a_bind = a.local_addr();
+    let b_bind = b.local_addr();
+    let r_for_poll = r.clone();
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            r_for_poll.peer_reflex_addr(b_id) == Some(b_bind)
+                && r_for_poll.peer_reflex_addr(a_id) == Some(a_bind)
+        })
+        .await,
+        "R should have both reflexes cached before we fire",
+    );
+
+    // A spoofed self_reflex on a different IP than A's loopback
+    // session source. R must drop the request silently.
+    let spoofed: SocketAddr = "203.0.113.50:9001".parse().unwrap();
+    assert_ne!(
+        spoofed.ip(),
+        a_bind.ip(),
+        "test precondition: spoofed IP must differ from A's session source",
+    );
+
+    let start = tokio::time::Instant::now();
+    let result = a.request_punch(r.node_id(), b_id, spoofed).await;
+    let elapsed = start.elapsed();
+
+    match result {
+        Err(TraversalError::PunchFailed) => {}
+        other => {
+            panic!("expected PunchFailed (coordinator drops spoofed self_reflex), got {other:?}")
+        }
+    }
+    // Dropped silently → A waits the full punch_deadline (~5s).
+    assert!(
+        elapsed >= Duration::from_secs(4),
+        "should wait ~punch_deadline before failing; elapsed {elapsed:?}",
+    );
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "should not wait much past punch_deadline; elapsed {elapsed:?}",
+    );
+}
+
+/// Complement of the guard test: a `self_reflex` that shares A's
+/// session-source IP but carries a DIFFERENT port (the symmetric-NAT
+/// self-report case) is accepted — the guard keys on IP only. B
+/// receives the introduce carrying that port-shifted reflex verbatim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_punch_with_port_shifted_self_reflex_is_accepted() {
+    let (a, r, b, _x) = rendezvous_topology().await;
+
+    a.reclassify_nat().await;
+    b.reclassify_nat().await;
+    a.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("A announce");
+    b.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("B announce");
+
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+    let a_bind = a.local_addr();
+    let b_bind = b.local_addr();
+    let r_for_poll = r.clone();
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            r_for_poll.peer_reflex_addr(b_id) == Some(b_bind)
+                && r_for_poll.peer_reflex_addr(a_id) == Some(a_bind)
+        })
+        .await,
+        "R should have both reflexes cached before we fire",
+    );
+
+    // Same IP as A's session source, different port — a plausible
+    // symmetric-NAT self-report. `wrapping_add(1)` is always distinct
+    // from the original u16 port.
+    let port_shifted = SocketAddr::new(a_bind.ip(), a_bind.port().wrapping_add(1));
+    assert_ne!(port_shifted.port(), a_bind.port());
+
+    // B installs its waiter so the introduce completes its oneshot.
+    let r_id = r.node_id();
+    let b_clone = b.clone();
+    let b_wait = tokio::spawn(async move { b_clone.await_punch_introduce(a_id, r_id).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let a_intro = a
+        .request_punch(r.node_id(), b_id, port_shifted)
+        .await
+        .expect("port-shifted self_reflex (same IP) should be accepted");
+    let b_intro = b_wait
+        .await
+        .expect("B wait task panicked")
+        .expect("B should receive PunchIntroduce");
+
+    assert_eq!(a_intro.peer, b_id, "A's introduce.peer should be B");
+    assert_eq!(
+        b_intro.peer_reflex, port_shifted,
+        "B's introduce must carry A's port-shifted self_reflex verbatim",
+    );
+}

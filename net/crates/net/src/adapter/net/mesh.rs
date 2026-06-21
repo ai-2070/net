@@ -607,13 +607,23 @@ struct DispatchCtx {
     #[cfg(feature = "nat-traversal")]
     pending_punch_acks: PendingPunchAcks,
     /// Keep-alive observers, keyed by the `SocketAddr` of the
-    /// counterpart's `peer_reflex`. Fired by the receive loop
-    /// when a matching `Keepalive`-formatted packet arrives;
-    /// consumed by the endpoint's punch-scheduling task to
-    /// decide when to emit a `PunchAck`.
+    /// counterpart's `peer_reflex`. The value pairs the expected
+    /// counterpart `node_id` with the oneshot. The receive loop
+    /// fires (and removes) the observer only for a `Keepalive`
+    /// whose `sender_node_id` matches that expected id; a stray or
+    /// spoofed keep-alive from the right source addr but the wrong
+    /// sender is left in place so it can't burn an in-flight punch.
+    /// The endpoint's punch-scheduling task consumes the fired
+    /// oneshot to decide when to emit a `PunchAck`.
     #[cfg(feature = "nat-traversal")]
     punch_observers: Arc<
-        DashMap<SocketAddr, tokio::sync::oneshot::Sender<super::traversal::rendezvous::Keepalive>>,
+        DashMap<
+            SocketAddr,
+            (
+                u64,
+                tokio::sync::oneshot::Sender<super::traversal::rendezvous::Keepalive>,
+            ),
+        >,
     >,
     /// NAT-traversal tunables (probe timeouts, punch cadence,
     /// classification deadlines). Shared with `MeshNode` by value
@@ -1320,17 +1330,27 @@ fn capability_reannounce_ttl(
 
 /// Race a punch-observer `oneshot::Receiver` against a deadline
 /// and handle cleanup of the shared `punch_observers` map with
-/// the correct semantics for each outcome. Returns `true` when
-/// the observer fired (caller should emit a `PunchAck`), `false`
-/// otherwise.
+/// the correct semantics for each outcome. Returns `true` when a
+/// keep-alive fired the observer (caller should emit a `PunchAck`),
+/// `false` otherwise.
+///
+/// The keep-alive's `sender_node_id` is validated by the receive
+/// loop *before* it fires this oneshot — only a packet whose sender
+/// matches the awaited counterpart consumes the observer (see the
+/// `remove_if` in `dispatch_packet`). So a `true` here already means
+/// "a keep-alive from the right peer arrived"; the caller no longer
+/// re-checks the sender. Crucially, a stray/spoofed keep-alive from
+/// the right source addr but the wrong sender id is left in the map
+/// by the receive loop rather than consuming the observer, so it
+/// can't burn an in-flight punch — a later valid keep-alive still
+/// fires this oneshot.
 ///
 /// Three outcomes, each with a distinct cleanup rule:
 ///
-/// - **`Ok(Ok(ka))`** — a matching keep-alive arrived and the
-///   receive loop fired our sender. Returns `true`; caller emits
-///   the ack. The receive loop already consumed the map entry
-///   via `remove` when it fired the oneshot, so no cleanup
-///   needed here.
+/// - **`Ok(Ok(_ka))`** — a validated keep-alive arrived and the
+///   receive loop fired our sender. Returns `true`. The receive
+///   loop already consumed the map entry via `remove_if` when it
+///   fired the oneshot, so no cleanup needed here.
 /// - **`Ok(Err(_))`** — our sender was dropped without firing.
 ///   This happens when a newer observer replaced ours in the
 ///   map (`DashMap::insert` drops the old value, which wakes
@@ -1353,12 +1373,15 @@ async fn await_punch_observer_outcome(
     deadline: Duration,
     punch_observers: &DashMap<
         SocketAddr,
-        tokio::sync::oneshot::Sender<super::traversal::rendezvous::Keepalive>,
+        (
+            u64,
+            tokio::sync::oneshot::Sender<super::traversal::rendezvous::Keepalive>,
+        ),
     >,
     peer_reflex: SocketAddr,
 ) -> bool {
     match tokio::time::timeout(deadline, obs_rx).await {
-        // Observer fired with a real keep-alive.
+        // Observer fired with a sender-validated keep-alive.
         Ok(Ok(_ka)) => true,
         // Sender was dropped — almost certainly replaced by a
         // newer observer for the same peer_reflex. Leaving the
@@ -1372,6 +1395,39 @@ async fn await_punch_observer_outcome(
             false
         }
     }
+}
+
+/// Compute the three keep-alive send offsets (relative to the
+/// scheduler task's spawn instant) for a punch whose synchronized
+/// fire time is `fire_at_ms` (Unix epoch ms), given the current
+/// wall-clock `now_ms` and the punch `deadline`.
+///
+/// The lead (`fire_at_ms - now_ms`) is:
+///
+/// - **clamped to `deadline`** — `fire_at_ms` is a
+///   coordinator-supplied value, and a malicious or buggy
+///   coordinator can name a fire time arbitrarily far in the
+///   future. A lead beyond `deadline` is useless (the observer task
+///   gives up then), and leaving it unbounded would park the
+///   keep-alive sender task — which holds a socket handle + payload
+///   — for that whole duration, with `start + offset` risking an
+///   `Instant` overflow. Clamping bounds the sender task's lifetime
+///   to the observer's.
+/// - **floored at zero** by the saturating subtraction — a lead in
+///   the past (clock skew, slow path) collapses to "fire
+///   immediately."
+///
+/// The +100 ms / +250 ms spacing (plan §3) is applied after the
+/// clamp; saturating adds keep the arithmetic panic-free even at
+/// the `Duration::MAX` extreme.
+#[cfg(feature = "nat-traversal")]
+fn keepalive_send_offsets(fire_at_ms: u64, now_ms: u64, deadline: Duration) -> [Duration; 3] {
+    let base_lead = Duration::from_millis(fire_at_ms.saturating_sub(now_ms)).min(deadline);
+    [
+        base_lead,
+        base_lead.saturating_add(Duration::from_millis(100)),
+        base_lead.saturating_add(Duration::from_millis(250)),
+    ]
 }
 
 /// Rolling-window auth-failure tracker, one entry per peer.
@@ -1734,12 +1790,22 @@ pub struct MeshNode {
     next_waiter_gen: Arc<std::sync::atomic::AtomicU64>,
     /// Keep-alive observers for in-progress punches, keyed by
     /// the `SocketAddr` we're watching for inbound traffic (the
-    /// counterpart's `peer_reflex`). The receive loop fires the
-    /// oneshot on the first matching keep-alive and the punch-
-    /// scheduler task reacts by emitting a `PunchAck`.
+    /// counterpart's `peer_reflex`). The value pairs the expected
+    /// counterpart `node_id` with the oneshot; the receive loop
+    /// fires the oneshot only on a keep-alive whose `sender_node_id`
+    /// matches that id (a wrong-sender packet is left in place, not
+    /// consumed), and the punch-scheduler task reacts by emitting a
+    /// `PunchAck`.
     #[cfg(feature = "nat-traversal")]
-    punch_observers:
-        Arc<DashMap<SocketAddr, oneshot::Sender<super::traversal::rendezvous::Keepalive>>>,
+    punch_observers: Arc<
+        DashMap<
+            SocketAddr,
+            (
+                u64,
+                oneshot::Sender<super::traversal::rendezvous::Keepalive>,
+            ),
+        >,
+    >,
     /// Current NAT classification, encoded via
     /// [`super::traversal::classify::NatClass::as_u8`]. Starts as
     /// `Unknown` (`0`) and is updated by the classification sweep
@@ -3667,7 +3733,21 @@ impl MeshNode {
         #[cfg(feature = "nat-traversal")]
         if data.len() == super::traversal::rendezvous::KEEPALIVE_LEN {
             if let Some(ka) = super::traversal::rendezvous::decode_keepalive(&data) {
-                if let Some((_, tx)) = ctx.punch_observers.remove(&source) {
+                // Fire (and consume) the observer only when the
+                // keep-alive's claimed sender matches the counterpart
+                // this observer is waiting for — the expected node id
+                // is stored alongside the oneshot. A stray or spoofed
+                // keep-alive from the right source addr but the wrong
+                // (or zeroed) sender id leaves the observer in place,
+                // armed for a later valid keep-alive, instead of
+                // burning the punch attempt; the source-addr key alone
+                // is not an authenticator. Validating here, *before*
+                // removal, is what keeps a single bad first packet
+                // from permanently failing an otherwise-good punch.
+                if let Some((_, (_expected, tx))) = ctx
+                    .punch_observers
+                    .remove_if(&source, |_, (expected, _)| ka.sender_node_id == *expected)
+                {
                     let _ = tx.send(ka);
                 }
                 return;
@@ -7706,11 +7786,51 @@ impl MeshNode {
             return;
         };
 
+        // Resolve A's session up-front. We need A's observed wire
+        // source address both to validate the self-reported reflex
+        // (immediately below) and, later, to send A its
+        // `PunchIntroduce`. If A isn't in our peer table we can't
+        // coordinate at all.
+        let Some((a_addr, a_session)) = ctx
+            .peers
+            .get(&from_node)
+            .map(|e| (e.value().addr, e.value().session.clone()))
+        else {
+            return;
+        };
+
+        // Anti-reflection guard. `self_reflex` is an unsigned,
+        // attacker-controllable field on the request. Forwarding it
+        // verbatim into B's `PunchIntroduce` would let a malicious A
+        // name an arbitrary victim address — B (which accepts an
+        // unsolicited introduce as the punch responder) would then
+        // fire its keep-alive train at that victim, turning the
+        // coordinator + B into a UDP reflector with A's identity
+        // hidden. Bind the self-report to A's actual session source
+        // IP: a genuine A is reachable at `a_addr`, so its real
+        // reflex shares that IP — only the port can differ, under
+        // symmetric NAT. A mismatched IP is a spoofed target; drop
+        // silently, exactly like any other coordinator-side drop, and
+        // A's `connect_direct` falls back to the relay on its
+        // timeout.
+        if req.self_reflex.ip() != a_addr.ip() {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                claimed = %req.self_reflex,
+                session_src = %a_addr,
+                "rendezvous: PunchRequest self_reflex IP != session source; \
+                 dropping (anti-reflection)",
+            );
+            return;
+        }
+
         // A's reflex comes from the request body. R trusts A's
         // self-report over the cached value for A-side, per the
         // note above; a mid-session rebind on A's gateway is
         // visible to A before it propagates into R's capability
-        // cache via a re-announce.
+        // cache via a re-announce. The IP is now pinned to A's
+        // session source by the guard above, so only the port is
+        // free to vary.
         let a_reflex = req.self_reflex;
 
         // 2. Compute the shared fire time.
@@ -7744,17 +7864,10 @@ impl MeshNode {
         })
         .encode();
 
-        // Look up sessions for both endpoints. If B isn't in our
-        // peer table we can't introduce — stage 5 SDK surface
-        // will map this to `RendezvousNoRelay` on A's side via
-        // the `connect_direct` timeout.
-        let Some((a_addr, a_session)) = ctx
-            .peers
-            .get(&from_node)
-            .map(|e| (e.value().addr, e.value().session.clone()))
-        else {
-            return;
-        };
+        // Look up B's session. If B isn't in our peer table we
+        // can't introduce — stage 5 SDK surface will map this to
+        // `RendezvousNoRelay` on A's side via the `connect_direct`
+        // timeout. (A's session was resolved up-front, above.)
         let Some((b_addr, b_session)) = ctx
             .peers
             .get(&req.target)
@@ -7856,29 +7969,31 @@ impl MeshNode {
             return;
         }
 
-        // Install the observer. A prior pending entry at the same
-        // addr (unusual — would mean two simultaneous punches to
-        // the same peer_reflex) is replaced; the earlier scheduler
-        // task sees a `SendError` on its oneshot.
+        // Install the observer, tagged with the counterpart's
+        // `node_id` so the receive loop can validate a keep-alive's
+        // `sender_node_id` before firing this oneshot. A prior
+        // pending entry at the same addr (unusual — would mean two
+        // simultaneous punches to the same peer_reflex) is replaced;
+        // the earlier scheduler task sees a `SendError` on its
+        // oneshot.
         let (obs_tx, obs_rx) = oneshot::channel();
-        ctx.punch_observers.insert(intro.peer_reflex, obs_tx);
+        ctx.punch_observers
+            .insert(intro.peer_reflex, (intro.peer, obs_tx));
 
         // Compute keep-alive send delays. `fire_at_ms` is a Unix
-        // epoch millisecond value synthesized by R; we subtract
-        // "now" to get the lead. If the computed lead is
-        // negative (clock skew, slow path), treat as "fire
-        // immediately" rather than as an error.
+        // epoch millisecond value synthesized by R; the lead is
+        // `fire_at - now`, clamped to `punch_deadline`. See
+        // [`keepalive_send_offsets`] for the negative-lead and
+        // unbounded-future handling.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let base_lead_ms = intro.fire_at_ms.saturating_sub(now_ms);
-        let base_lead = std::time::Duration::from_millis(base_lead_ms);
-        let offsets = [
-            base_lead,
-            base_lead.saturating_add(std::time::Duration::from_millis(100)),
-            base_lead.saturating_add(std::time::Duration::from_millis(250)),
-        ];
+        let offsets = keepalive_send_offsets(
+            intro.fire_at_ms,
+            now_ms,
+            ctx.traversal_config.punch_deadline,
+        );
 
         let local_node_id = ctx.local_node_id;
         let peer_reflex = intro.peer_reflex;
@@ -7920,9 +8035,15 @@ impl MeshNode {
         // for cleanup so the map-eviction race against a
         // replacement observer is handled in one place.
         tokio::spawn(async move {
-            let outcome =
-                await_punch_observer_outcome(obs_rx, deadline, &punch_observers, peer_reflex).await;
-            if !outcome {
+            // The receive loop only fires this observer for a
+            // keep-alive whose `sender_node_id` matches `peer` (the
+            // expected id was stored alongside the oneshot at insert
+            // time), so a `true` here already means the counterpart's
+            // keep-alive reached us. A wrong-sender packet is dropped
+            // upstream *without* consuming the observer, so it can't
+            // burn the attempt — a later valid keep-alive still fires.
+            if !await_punch_observer_outcome(obs_rx, deadline, &punch_observers, peer_reflex).await
+            {
                 return;
             }
             // Observer fired — build + send the ack via the
@@ -12571,20 +12692,26 @@ mod punch_observer_tests {
         "198.51.100.5:9001".parse().unwrap()
     }
 
+    /// Expected counterpart node id stored alongside each observer.
+    /// `await_punch_observer_outcome` itself doesn't validate it —
+    /// the receive loop's `remove_if` does that before firing — so
+    /// these cleanup-semantics tests just need a stable value.
+    const EXPECTED_PEER: u64 = 0x1234;
+
     /// Keep-alive fires before the deadline — outcome is `true`
-    /// (caller emits ack). The map entry was consumed by the
-    /// receive loop when it fired the oneshot, so the helper
-    /// doesn't need to remove anything.
+    /// (caller emits the ack). The map entry was consumed by the
+    /// receive loop's sender-validated `remove_if` when it fired the
+    /// oneshot, so the helper doesn't need to remove anything.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fires_true_when_keepalive_arrives() {
-        let observers: DashMap<SocketAddr, oneshot::Sender<Keepalive>> = DashMap::new();
+        let observers: DashMap<SocketAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
         let peer = sample_peer();
         let (tx, rx) = oneshot::channel();
-        observers.insert(peer, tx);
+        observers.insert(peer, (EXPECTED_PEER, tx));
 
-        // Simulate the receive loop firing the oneshot: remove
-        // from the map + send the keepalive.
-        let (_, fired_tx) = observers.remove(&peer).unwrap();
+        // Simulate the receive loop firing the oneshot after its
+        // sender-id check passes: remove from the map + send the ka.
+        let (_, (_id, fired_tx)) = observers.remove(&peer).unwrap();
         fired_tx.send(sample_ka()).expect("send");
 
         let result =
@@ -12597,10 +12724,10 @@ mod punch_observer_tests {
     /// keep-alive doesn't find it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn timeout_evicts_own_stale_entry() {
-        let observers: DashMap<SocketAddr, oneshot::Sender<Keepalive>> = DashMap::new();
+        let observers: DashMap<SocketAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
         let peer = sample_peer();
         let (tx, rx) = oneshot::channel();
-        observers.insert(peer, tx);
+        observers.insert(peer, (EXPECTED_PEER, tx));
 
         // Very short deadline; nobody fires.
         let result =
@@ -12619,18 +12746,18 @@ mod punch_observer_tests {
     /// in the map.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sender_dropped_leaves_replacement_observer_intact() {
-        let observers: DashMap<SocketAddr, oneshot::Sender<Keepalive>> = DashMap::new();
+        let observers: DashMap<SocketAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
         let peer = sample_peer();
 
         // Install observer A.
         let (tx_a, rx_a) = oneshot::channel::<Keepalive>();
-        observers.insert(peer, tx_a);
+        observers.insert(peer, (EXPECTED_PEER, tx_a));
 
         // Install observer B via insert — this drops A's sender
         // (the old value returned from the insert is dropped
         // immediately). Now the map contains B's sender.
         let (tx_b, _rx_b) = oneshot::channel::<Keepalive>();
-        observers.insert(peer, tx_b);
+        observers.insert(peer, (EXPECTED_PEER, tx_b));
         assert!(observers.contains_key(&peer), "B's sender in map");
 
         // A's task runs the cleanup helper. A's rx_a sees
@@ -12650,12 +12777,12 @@ mod punch_observer_tests {
     /// `remove` on every cleanup path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn timeout_then_sender_drop_does_not_double_evict() {
-        let observers: DashMap<SocketAddr, oneshot::Sender<Keepalive>> = DashMap::new();
+        let observers: DashMap<SocketAddr, (u64, oneshot::Sender<Keepalive>)> = DashMap::new();
         let peer = sample_peer();
 
         // First task: install A, let it time out, evict.
         let (tx_a, rx_a) = oneshot::channel::<Keepalive>();
-        observers.insert(peer, tx_a);
+        observers.insert(peer, (EXPECTED_PEER, tx_a));
         let r1 =
             await_punch_observer_outcome(rx_a, Duration::from_millis(20), &observers, peer).await;
         assert!(!r1);
@@ -12665,9 +12792,9 @@ mod punch_observer_tests {
         // insert from C — simulates the "replacement" scenario
         // but now for a different observer lineage.
         let (tx_b, rx_b) = oneshot::channel::<Keepalive>();
-        observers.insert(peer, tx_b);
+        observers.insert(peer, (EXPECTED_PEER, tx_b));
         let (tx_c, _rx_c) = oneshot::channel::<Keepalive>();
-        observers.insert(peer, tx_c);
+        observers.insert(peer, (EXPECTED_PEER, tx_c));
 
         // B's task cleanup. Must NOT remove peer (C is live).
         let r2 = await_punch_observer_outcome(rx_b, Duration::from_secs(5), &observers, peer).await;
@@ -12676,6 +12803,58 @@ mod punch_observer_tests {
             observers.contains_key(&peer),
             "C's sender must remain after B's sender-dropped cleanup",
         );
+    }
+}
+
+#[cfg(all(test, feature = "nat-traversal"))]
+mod keepalive_offset_tests {
+    //! Unit coverage for [`keepalive_send_offsets`] (code review
+    //! 2026-06-21, Finding 3): the per-packet send schedule must
+    //! clamp a coordinator-supplied `fire_at_ms` so a far-future
+    //! value can't park the keep-alive sender task indefinitely or
+    //! overflow `Instant`.
+    use super::keepalive_send_offsets;
+    use std::time::Duration;
+
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn normal_lead_is_preserved_with_documented_spacing() {
+        // fire_at 500 ms in the future → 500 / 600 / 750 ms.
+        let offsets = keepalive_send_offsets(1_000_500, 1_000_000, DEADLINE);
+        assert_eq!(offsets[0], Duration::from_millis(500));
+        assert_eq!(offsets[1], Duration::from_millis(600));
+        assert_eq!(offsets[2], Duration::from_millis(750));
+    }
+
+    #[test]
+    fn past_fire_at_collapses_to_immediate() {
+        // fire_at already elapsed → base lead 0; spacing still applies.
+        let offsets = keepalive_send_offsets(900_000, 1_000_000, DEADLINE);
+        assert_eq!(offsets[0], Duration::ZERO);
+        assert_eq!(offsets[1], Duration::from_millis(100));
+        assert_eq!(offsets[2], Duration::from_millis(250));
+    }
+
+    #[test]
+    fn far_future_fire_at_is_clamped_to_deadline() {
+        // A malicious/buggy coordinator names a fire time ~1e9 s out.
+        // The base lead must clamp to `deadline`, bounding the sender
+        // task's lifetime rather than parking it for ~31 years.
+        let offsets = keepalive_send_offsets(1_000_000 + 1_000_000_000_000, 1_000_000, DEADLINE);
+        assert_eq!(offsets[0], DEADLINE, "base lead must clamp to deadline");
+        // Spacing applies after the clamp; bounded just past it.
+        assert_eq!(offsets[1], DEADLINE + Duration::from_millis(100));
+        assert_eq!(offsets[2], DEADLINE + Duration::from_millis(250));
+    }
+
+    #[test]
+    fn u64_max_fire_at_does_not_panic_and_clamps() {
+        // Extreme input: must neither panic on the millis→Duration
+        // conversion nor exceed the clamp.
+        let offsets = keepalive_send_offsets(u64::MAX, 0, DEADLINE);
+        assert_eq!(offsets[0], DEADLINE);
+        assert!(offsets[2] <= DEADLINE + Duration::from_millis(250));
     }
 }
 
