@@ -40,6 +40,55 @@ exist here.)
 
 ---
 
+## Resolution status — 2026-06-21 (branch `port-scanning-fixes`)
+
+All eight findings have been addressed on this branch — the two Medium bugs
+(B1, B2) with code fixes + tests, B3/B4/B5/A3 as docstring/comment corrections,
+A1 as a `debug_assert` (+ a release `warn` follow-up), and A2 as a test-only
+refactor. A verification pass (compile of the default and `port-mapping` configs
++ run of every affected test) confirms they land and pass. Three review
+follow-ups were then applied — see **Follow-up refinements** below.
+
+| # | Status | Commit | Test |
+|---|--------|--------|------|
+| A1 | ✅ Resolved — `debug_assert` + release `warn` | `791b81968`, `aa1c65266` | `upnp::tests::new_rejects_unspecified_local_ip_in_debug` |
+| A2 | ✅ Resolved — moved to test-only | `791b81968` | `upnp::tests::error_mapping_*` |
+| A3 | ✅ Resolved — doc: re-read is intentional | `791b81968` | — |
+| B1 | ✅ Resolved — `SweepGuard` single-flight; gate scope clarified | `920f6e0b7`, `e39e13c65` | `mesh::sweep_guard_tests` |
+| B2 | ✅ Resolved — <2-observation guard; torn-input guard retained | `27037738a`, `3f183f235` | `commit_keeps_prior_class_on_single_observation_sweep`, `…_on_torn_class_without_reflex` |
+| B3 | ✅ Resolved — doc: wildcard-bind limitation | `700a860a5` | — |
+| B4 | ✅ Resolved — doc: destination-diversity caveat | `27037738a` | — |
+| B5 | ✅ Resolved — doc: cached-addr tradeoff | `32d9a333a` | — |
+
+### Follow-up refinements (2026-06-21)
+
+These address review notes raised after the initial fixes; the original finding
+text below is retained as the historical record.
+
+- **B1 — gate scope.** `SweepGuard` serializes `reclassify_nat` against itself,
+  but does *not* lock the underlying `pending_reflex_probes` map. A standalone
+  `probe_reflex` (the `net_mesh_probe_reflex` FFI) can still race a sweep's probe
+  to the same peer and cancel one of them. The collision is benign — waiters are
+  generation-stamped (cleanup can't evict a replacement), the loser resolves as
+  `ReflexTimeout`, and the B2 guard keeps such a sweep on its prior class instead
+  of flapping to `Unknown`. The `reclassify_nat` docstring + gate comment now
+  state this (`e39e13c65`).
+- **B2 — torn-input guard.** With the <2-observation guard in place, the older
+  `latest_reflex == None` guard is unreachable for coherent `reclassify_nat`
+  inputs (0 observations ⟹ caught by the count guard; ≥2 ⟹ a reflex was
+  threaded). It is retained as defense-in-depth against a *torn* `(class, None)`
+  input claiming ≥2 observations, now pinned by
+  `commit_keeps_prior_on_torn_class_without_reflex` (`3f183f235`).
+- **A1 — release visibility.** `debug_assert` is compiled out of release, so a
+  non-routable `local_ip` would have produced a route-nowhere mapping *silently*
+  there. A `tracing::warn!` now surfaces the misuse in release too (the assert
+  still fails fast in dev). A `Result`-returning constructor was judged
+  disproportionate — the only production caller already supplies a validated IP.
+  The release-only warn path is not unit-tested (log-capture is impractical)
+  (`aa1c65266`).
+
+---
+
 # Part A — UPnP-IGD discovery (`portmap/upnp.rs`)
 
 A thin, well-bounded wrapper over the `igd-next` crate. No correctness bugs
@@ -196,7 +245,8 @@ eyes open about the spoofing tradeoff.
 | B4 | peer selection lacks destination diversity | Low | caveat comment |
 | B5 | reflex echo uses cached addr, not live source | Low | doc or switch to `source` |
 
-**None break the correctness contract** — every miss falls back to the routed
-handshake. B1 and B2 are the actionable bugs with clean, testable fixes
-(single-flight `AtomicBool`; sub-2-observation guard); B3/B5 are primarily
-docstring-accuracy fixes; A1/A2/B4 are minor cleanups.
+**None broke the correctness contract** — every miss falls back to the routed
+handshake. B1 and B2 were the actionable bugs (single-flight `SweepGuard`;
+sub-2-observation guard), both fixed with regression tests; B3/B5 were
+docstring-accuracy fixes; A1/A2/B4 were minor cleanups. All are resolved on
+`port-scanning-fixes` — see **Resolution status** above for commits + tests.
