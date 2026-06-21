@@ -68,6 +68,15 @@ async fn build_node() -> Arc<MeshNode> {
     )
 }
 
+async fn build_node_with_reflex(override_addr: SocketAddr) -> Arc<MeshNode> {
+    let cfg = test_config().with_reflex_override(override_addr);
+    Arc::new(
+        MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new"),
+    )
+}
+
 async fn connect_pair(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
     let a_id = a.node_id();
     let b_pub = *b.public_key();
@@ -229,4 +238,140 @@ async fn malformed_keepalive_is_ignored_not_fatal() {
     // traversal_stats read works, which proves the runtime
     // didn't crash.
     let _stats = a.traversal_stats();
+}
+
+/// Finding 2 (code review 2026-06-21): the punch observer must
+/// validate a keep-alive's `sender_node_id` against the expected
+/// counterpart before emitting a `PunchAck`. The observer is keyed
+/// only by source `SocketAddr`, so a stray/spoofed keep-alive
+/// arriving from the right address but carrying the wrong sender id
+/// must NOT be treated as a successful punch.
+///
+/// Harness: B advertises a reflex override pointing at a
+/// test-controlled UDP listener, so A installs its punch observer
+/// keyed by that listener address. We then inject keep-alives *from*
+/// the listener socket and watch whether A emits a `PunchAck` to B
+/// (B's `await_punch_ack` resolving is the signal that A acked).
+///
+/// Two phases against the same harness make the test self-validating
+/// rather than vacuous:
+///
+/// - **Control** — inject `sender_node_id == B`: A's observer fires,
+///   the sender matches, A acks, B's wait resolves. Proves the
+///   injection path actually drives an ack.
+/// - **Reject** — inject `sender_node_id != B`: A's observer fires
+///   but the sender check fails, A stays silent, B's wait times out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn observer_acks_only_on_matching_sender_node_id() {
+    // Test-controlled UDP socket standing in for B's reflex. A's
+    // observer ends up keyed by this address.
+    let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let listener_addr: SocketAddr = listener.local_addr().unwrap();
+
+    let a = build_node().await;
+    let r = build_node().await;
+    let b = build_node_with_reflex(listener_addr).await;
+    let x = build_node().await;
+    connect_pair(&a, &r).await;
+    connect_pair(&b, &r).await;
+    connect_pair(&a, &x).await;
+    connect_pair(&b, &x).await;
+    connect_pair(&r, &x).await;
+    a.start();
+    r.start();
+    b.start();
+    x.start();
+
+    a.reclassify_nat().await;
+    a.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("A announce");
+    b.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("B announce");
+
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+    let r_id = r.node_id();
+    let a_addr = a.local_addr();
+    let r_for_poll = r.clone();
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            r_for_poll.peer_reflex_addr(b_id) == Some(listener_addr)
+                && r_for_poll.peer_reflex_addr(a_id).is_some()
+        })
+        .await,
+        "R should see B's override reflex + A's reflex before we fire",
+    );
+
+    // Helper: drive one punch round on A (installs A's observer keyed
+    // by `listener_addr`), inject one keep-alive from the listener
+    // with the given sender id, and report whether A acked B within
+    // the punch window.
+    async fn round(
+        a: &Arc<MeshNode>,
+        r: &Arc<MeshNode>,
+        listener: &UdpSocket,
+        a_addr: SocketAddr,
+        b: &Arc<MeshNode>,
+        a_id: u64,
+        b_id: u64,
+        r_id: u64,
+        injected_sender: u64,
+    ) -> bool {
+        // B waits for A's ack (from_peer == a_id, forwarded by R).
+        let b_clone = b.clone();
+        let b_wait = tokio::spawn(async move { b_clone.await_punch_ack(a_id, r_id).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // A initiates: R introduces, A installs its observer keyed by
+        // B's reflex (= listener_addr) and starts its own keep-alive
+        // train at the listener (harmless here).
+        a.request_punch(r.node_id(), b_id, a_addr)
+            .await
+            .expect("request_punch should mediate");
+        // Let A's dispatch install the observer before we inject.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Inject a keep-alive from the listener socket → arrives at A
+        // with source == listener_addr, firing A's observer.
+        let ka = encode_keepalive(&Keepalive {
+            sender_node_id: injected_sender,
+            punch_id: 0,
+        });
+        listener.send_to(&ka, a_addr).await.unwrap();
+
+        // Did A ack B? B's waiter resolves iff A emitted the ack.
+        matches!(b_wait.await.expect("b_wait task panicked"), Ok(_))
+    }
+
+    // Control: matching sender id → A must ack.
+    let acked_on_match = round(
+        &a, &r, &listener, a_addr, &b, a_id, b_id, r_id, b_id,
+    )
+    .await;
+    assert!(
+        acked_on_match,
+        "control: a keep-alive whose sender_node_id == B must drive A's ack \
+         (otherwise the test is vacuous)",
+    );
+
+    // Reject: wrong sender id → A must stay silent → B times out.
+    let acked_on_mismatch = round(
+        &a,
+        &r,
+        &listener,
+        a_addr,
+        &b,
+        a_id,
+        b_id,
+        r_id,
+        0xDEAD_BEEF_u64, // not B's node id
+    )
+    .await;
+    assert!(
+        !acked_on_mismatch,
+        "reject: a keep-alive with the wrong sender_node_id must NOT drive \
+         an ack — the observer's source-addr keying is not sufficient on its own",
+    );
 }

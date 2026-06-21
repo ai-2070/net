@@ -1320,17 +1320,18 @@ fn capability_reannounce_ttl(
 
 /// Race a punch-observer `oneshot::Receiver` against a deadline
 /// and handle cleanup of the shared `punch_observers` map with
-/// the correct semantics for each outcome. Returns `true` when
-/// the observer fired (caller should emit a `PunchAck`), `false`
-/// otherwise.
+/// the correct semantics for each outcome. Returns `Some(keepalive)`
+/// when the observer fired (the caller then validates its
+/// `sender_node_id` before emitting a `PunchAck`), `None` otherwise.
 ///
 /// Three outcomes, each with a distinct cleanup rule:
 ///
 /// - **`Ok(Ok(ka))`** — a matching keep-alive arrived and the
-///   receive loop fired our sender. Returns `true`; caller emits
-///   the ack. The receive loop already consumed the map entry
-///   via `remove` when it fired the oneshot, so no cleanup
-///   needed here.
+///   receive loop fired our sender. Returns `Some(ka)`; the caller
+///   checks `ka.sender_node_id` against the expected counterpart
+///   and emits the ack only on a match. The receive loop already
+///   consumed the map entry via `remove` when it fired the
+///   oneshot, so no cleanup needed here.
 /// - **`Ok(Err(_))`** — our sender was dropped without firing.
 ///   This happens when a newer observer replaced ours in the
 ///   map (`DashMap::insert` drops the old value, which wakes
@@ -1356,20 +1357,22 @@ async fn await_punch_observer_outcome(
         tokio::sync::oneshot::Sender<super::traversal::rendezvous::Keepalive>,
     >,
     peer_reflex: SocketAddr,
-) -> bool {
+) -> Option<super::traversal::rendezvous::Keepalive> {
     match tokio::time::timeout(deadline, obs_rx).await {
-        // Observer fired with a real keep-alive.
-        Ok(Ok(_ka)) => true,
+        // Observer fired with a real keep-alive. Hand it back so
+        // the caller can validate `sender_node_id` against the
+        // expected counterpart before acting on it.
+        Ok(Ok(ka)) => Some(ka),
         // Sender was dropped — almost certainly replaced by a
         // newer observer for the same peer_reflex. Leaving the
         // map alone is correct: the replacement's sender is the
         // current value and a remove would evict it.
-        Ok(Err(_)) => false,
+        Ok(Err(_)) => None,
         // Deadline fired with our sender still in the map. Evict
         // so a late keep-alive doesn't find a stale entry.
         Err(_) => {
             punch_observers.remove(&peer_reflex);
-            false
+            None
         }
     }
 }
@@ -7984,14 +7987,31 @@ impl MeshNode {
         // for cleanup so the map-eviction race against a
         // replacement observer is handled in one place.
         tokio::spawn(async move {
-            let outcome =
-                await_punch_observer_outcome(obs_rx, deadline, &punch_observers, peer_reflex).await;
-            if !outcome {
+            let Some(ka) =
+                await_punch_observer_outcome(obs_rx, deadline, &punch_observers, peer_reflex).await
+            else {
+                return;
+            };
+            // Validate the keep-alive's claimed sender against the
+            // counterpart we're actually punching to. The observer
+            // is keyed only by source `SocketAddr`; a stray or
+            // spoofed 14-byte `KEEPALIVE_MAGIC` packet arriving from
+            // `peer_reflex` with someone else's (or a zeroed)
+            // `sender_node_id` would otherwise falsely signal "punch
+            // succeeded" and emit an ack for a path that isn't really
+            // open. `peer` is the counterpart's node id, which is
+            // exactly what its keep-alive stamps as `sender_node_id`.
+            if ka.sender_node_id != peer {
+                tracing::trace!(
+                    expected = format!("{peer:#x}"),
+                    got = format!("{:#x}", ka.sender_node_id),
+                    "rendezvous: keep-alive sender_node_id mismatch; not acking",
+                );
                 return;
             }
-            // Observer fired — build + send the ack via the
-            // coordinator session, same shape as the former
-            // `send_punch_ack_via` helper.
+            // Observer fired and the sender checks out — build +
+            // send the ack via the coordinator session, same shape
+            // as the former `send_punch_ack_via` helper.
             let ack_body = RendezvousMsg::PunchAck(PunchAck {
                 from_peer: local_node_id,
                 to_peer: peer,
@@ -12635,12 +12655,15 @@ mod punch_observer_tests {
         "198.51.100.5:9001".parse().unwrap()
     }
 
-    /// Keep-alive fires before the deadline — outcome is `true`
-    /// (caller emits ack). The map entry was consumed by the
-    /// receive loop when it fired the oneshot, so the helper
-    /// doesn't need to remove anything.
+    /// Keep-alive fires before the deadline — outcome is the decoded
+    /// `Keepalive`, returned intact (caller then validates its
+    /// `sender_node_id`). The map entry was consumed by the receive
+    /// loop when it fired the oneshot, so the helper doesn't need to
+    /// remove anything. Returning the payload (rather than a bare
+    /// bool) is what lets the caller enforce the sender check — code
+    /// review 2026-06-21, Finding 2.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fires_true_when_keepalive_arrives() {
+    async fn returns_keepalive_when_it_arrives() {
         let observers: DashMap<SocketAddr, oneshot::Sender<Keepalive>> = DashMap::new();
         let peer = sample_peer();
         let (tx, rx) = oneshot::channel();
@@ -12653,7 +12676,11 @@ mod punch_observer_tests {
 
         let result =
             await_punch_observer_outcome(rx, Duration::from_secs(1), &observers, peer).await;
-        assert!(result, "keepalive arrival should return true");
+        assert_eq!(
+            result,
+            Some(sample_ka()),
+            "keepalive arrival must return the decoded payload, sender_node_id included",
+        );
     }
 
     /// Deadline expires while our sender is still the live value
@@ -12669,7 +12696,7 @@ mod punch_observer_tests {
         // Very short deadline; nobody fires.
         let result =
             await_punch_observer_outcome(rx, Duration::from_millis(50), &observers, peer).await;
-        assert!(!result, "timeout should return false");
+        assert!(result.is_none(), "timeout should return None");
         assert!(
             !observers.contains_key(&peer),
             "timeout should evict our own stale entry",
@@ -12701,7 +12728,7 @@ mod punch_observer_tests {
         // RecvError (tx_a dropped), outcome is `Ok(Err(_))`.
         let result =
             await_punch_observer_outcome(rx_a, Duration::from_secs(5), &observers, peer).await;
-        assert!(!result, "sender-dropped path returns false");
+        assert!(result.is_none(), "sender-dropped path returns None");
         assert!(
             observers.contains_key(&peer),
             "B's sender must still be in the map — A's cleanup must not evict",
@@ -12722,7 +12749,7 @@ mod punch_observer_tests {
         observers.insert(peer, tx_a);
         let r1 =
             await_punch_observer_outcome(rx_a, Duration::from_millis(20), &observers, peer).await;
-        assert!(!r1);
+        assert!(r1.is_none());
         assert!(!observers.contains_key(&peer));
 
         // Second task: install B, drop B's sender via a fresh
@@ -12735,7 +12762,7 @@ mod punch_observer_tests {
 
         // B's task cleanup. Must NOT remove peer (C is live).
         let r2 = await_punch_observer_outcome(rx_b, Duration::from_secs(5), &observers, peer).await;
-        assert!(!r2);
+        assert!(r2.is_none());
         assert!(
             observers.contains_key(&peer),
             "C's sender must remain after B's sender-dropped cleanup",
