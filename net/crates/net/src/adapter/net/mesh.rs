@@ -5085,12 +5085,26 @@ impl MeshNode {
                 };
                 match msg {
                     reflex::ReflexMsg::Request => {
-                        // Echo the observed source address back. Source
-                        // is read from `PeerInfo.addr` — the last
-                        // address our kernel saw packets from this peer
-                        // arrive on, equivalent to a STUN server's
-                        // "observed source" because NAT-rewriting is
-                        // applied by the time packets reach our socket.
+                        // Echo back the requester's public address. We
+                        // use `PeerInfo.addr` — the source recorded at
+                        // handshake / key-rotation time (`addr: source`
+                        // in the routed-handshake path), NOT the live
+                        // UDP source of this reflex packet. NAT-rewrite
+                        // is applied by the time packets reach our
+                        // socket, so for a peer whose NAT mapping is
+                        // stable this equals a STUN server's "observed
+                        // source."
+                        //
+                        // Tradeoff (code review 2026-06-21, Finding
+                        // B5): the handshake addr is authenticated, so
+                        // an on-path attacker can't make us report a
+                        // spoofed reflex by forging a UDP source. The
+                        // cost is that a *mid-session NAT rebind*
+                        // without a re-handshake yields a stale reflex
+                        // until the session re-establishes. Echoing the
+                        // live `source` would track rebinds but be
+                        // spoofable; the spoof-resistant cached addr is
+                        // the deliberate choice.
                         let Some((dest_addr, dest_sess)) = ctx
                             .peers
                             .get(&from_node)
