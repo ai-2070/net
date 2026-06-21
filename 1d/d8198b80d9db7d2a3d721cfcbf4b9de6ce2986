@@ -1,0 +1,24 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_06_21_NAT_TRAVERSAL.md
+  s_b93d1d2fee6b2e::t_3aba9297c8979b 82-85
+  s_b93d1d2fee6b2e::t_38d70a62f7f320 153-155
+  s_b93d1d2fee6b2e::t_84aa23a06c7f4e 184-186
+  s_b93d1d2fee6b2e::t_8039e45e155c82 31,36-76
+  s_b93d1d2fee6b2e::t_c50bdf2a20b279 78,211-289
+  s_b93d1d2fee6b2e::t_8a9688a8693d0c 317-318,320-326
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "1dd8198b80d9db7d2a3d721cfcbf4b9de6ce2986",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
