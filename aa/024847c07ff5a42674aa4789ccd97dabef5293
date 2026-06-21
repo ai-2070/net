@@ -1,0 +1,20 @@
+net/crates/net/tests/punch_keepalive.rs
+  s_d6aaacaeb7ae80::t_56e540b7e0df2b 459
+  s_d6aaacaeb7ae80::t_3e428ae03623d4 308-309,314,317-321,330,345,349,357
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "aa024847c07ff5a42674aa4789ccd97dabef5293",
+  "prompts": {},
+  "sessions": {
+    "s_d6aaacaeb7ae80": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3cecd013-206c-467a-974f-8c275ba1e8d5",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
