@@ -346,10 +346,7 @@ async fn observer_acks_only_on_matching_sender_node_id() {
     }
 
     // Control: matching sender id → A must ack.
-    let acked_on_match = round(
-        &a, &r, &listener, a_addr, &b, a_id, b_id, r_id, b_id,
-    )
-    .await;
+    let acked_on_match = round(&a, &r, &listener, a_addr, &b, a_id, b_id, r_id, b_id).await;
     assert!(
         acked_on_match,
         "control: a keep-alive whose sender_node_id == B must drive A's ack \

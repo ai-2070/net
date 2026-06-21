@@ -1798,7 +1798,13 @@ pub struct MeshNode {
     /// `PunchAck`.
     #[cfg(feature = "nat-traversal")]
     punch_observers: Arc<
-        DashMap<SocketAddr, (u64, oneshot::Sender<super::traversal::rendezvous::Keepalive>)>,
+        DashMap<
+            SocketAddr,
+            (
+                u64,
+                oneshot::Sender<super::traversal::rendezvous::Keepalive>,
+            ),
+        >,
     >,
     /// Current NAT classification, encoded via
     /// [`super::traversal::classify::NatClass::as_u8`]. Starts as
@@ -8036,7 +8042,8 @@ impl MeshNode {
             // keep-alive reached us. A wrong-sender packet is dropped
             // upstream *without* consuming the observer, so it can't
             // burn the attempt — a later valid keep-alive still fires.
-            if !await_punch_observer_outcome(obs_rx, deadline, &punch_observers, peer_reflex).await {
+            if !await_punch_observer_outcome(obs_rx, deadline, &punch_observers, peer_reflex).await
+            {
                 return;
             }
             // Observer fired — build + send the ack via the

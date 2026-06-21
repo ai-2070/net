@@ -441,9 +441,9 @@ async fn request_punch_with_spoofed_self_reflex_ip_is_dropped() {
 
     match result {
         Err(TraversalError::PunchFailed) => {}
-        other => panic!(
-            "expected PunchFailed (coordinator drops spoofed self_reflex), got {other:?}"
-        ),
+        other => {
+            panic!("expected PunchFailed (coordinator drops spoofed self_reflex), got {other:?}")
+        }
     }
     // Dropped silently → A waits the full punch_deadline (~5s).
     assert!(
