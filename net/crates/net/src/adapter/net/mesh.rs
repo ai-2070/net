@@ -7706,11 +7706,51 @@ impl MeshNode {
             return;
         };
 
+        // Resolve A's session up-front. We need A's observed wire
+        // source address both to validate the self-reported reflex
+        // (immediately below) and, later, to send A its
+        // `PunchIntroduce`. If A isn't in our peer table we can't
+        // coordinate at all.
+        let Some((a_addr, a_session)) = ctx
+            .peers
+            .get(&from_node)
+            .map(|e| (e.value().addr, e.value().session.clone()))
+        else {
+            return;
+        };
+
+        // Anti-reflection guard. `self_reflex` is an unsigned,
+        // attacker-controllable field on the request. Forwarding it
+        // verbatim into B's `PunchIntroduce` would let a malicious A
+        // name an arbitrary victim address — B (which accepts an
+        // unsolicited introduce as the punch responder) would then
+        // fire its keep-alive train at that victim, turning the
+        // coordinator + B into a UDP reflector with A's identity
+        // hidden. Bind the self-report to A's actual session source
+        // IP: a genuine A is reachable at `a_addr`, so its real
+        // reflex shares that IP — only the port can differ, under
+        // symmetric NAT. A mismatched IP is a spoofed target; drop
+        // silently, exactly like any other coordinator-side drop, and
+        // A's `connect_direct` falls back to the relay on its
+        // timeout.
+        if req.self_reflex.ip() != a_addr.ip() {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                claimed = %req.self_reflex,
+                session_src = %a_addr,
+                "rendezvous: PunchRequest self_reflex IP != session source; \
+                 dropping (anti-reflection)",
+            );
+            return;
+        }
+
         // A's reflex comes from the request body. R trusts A's
         // self-report over the cached value for A-side, per the
         // note above; a mid-session rebind on A's gateway is
         // visible to A before it propagates into R's capability
-        // cache via a re-announce.
+        // cache via a re-announce. The IP is now pinned to A's
+        // session source by the guard above, so only the port is
+        // free to vary.
         let a_reflex = req.self_reflex;
 
         // 2. Compute the shared fire time.
@@ -7744,17 +7784,10 @@ impl MeshNode {
         })
         .encode();
 
-        // Look up sessions for both endpoints. If B isn't in our
-        // peer table we can't introduce — stage 5 SDK surface
-        // will map this to `RendezvousNoRelay` on A's side via
-        // the `connect_direct` timeout.
-        let Some((a_addr, a_session)) = ctx
-            .peers
-            .get(&from_node)
-            .map(|e| (e.value().addr, e.value().session.clone()))
-        else {
-            return;
-        };
+        // Look up B's session. If B isn't in our peer table we
+        // can't introduce — stage 5 SDK surface will map this to
+        // `RendezvousNoRelay` on A's side via the `connect_direct`
+        // timeout. (A's session was resolved up-front, above.)
         let Some((b_addr, b_session)) = ctx
             .peers
             .get(&req.target)
