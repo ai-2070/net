@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/traversal/classify.rs
+  s_d6aaacaeb7ae80::t_81aacc4de6c9a7 292-310
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "700a860a5773326fa50ebf5709b5feaad8352440",
+  "prompts": {},
+  "sessions": {
+    "s_d6aaacaeb7ae80": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3cecd013-206c-467a-974f-8c275ba1e8d5",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
