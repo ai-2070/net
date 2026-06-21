@@ -1,0 +1,39 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_d6aaacaeb7ae80::t_965e17285ef5c3 12720,12742,12773
+  s_d6aaacaeb7ae80::t_5fd77d637f6213 12728
+  s_d6aaacaeb7ae80::t_775d84885b8823 12747,12778
+  s_d6aaacaeb7ae80::t_e7e61044448315 12688-12697,12699-12700,12703,12705-12707,12712
+  s_d6aaacaeb7ae80::t_5e9087700a4e76 3730-3744
+  s_d6aaacaeb7ae80::t_39b9bea53f227f 7966-7972,7974-7975
+  s_d6aaacaeb7ae80::t_6cb16c0c04d3b4 12790
+  s_d6aaacaeb7ae80::t_f36a0f90a30e8b 12794
+  s_d6aaacaeb7ae80::t_3f883f44f2e9a7 12753,12788
+  s_d6aaacaeb7ae80::t_e8c9b2e7fb54f2 1333-1346,1350-1353,1376-1379,1382,1384-1385,1390,1395
+  s_d6aaacaeb7ae80::t_4d99e094831759 12781
+  s_d6aaacaeb7ae80::t_9964c8ca79ce90 12760
+  s_d6aaacaeb7ae80::t_de3abe25795bd9 12723
+  s_d6aaacaeb7ae80::t_cfc442c00b0404 8032-8039,8042-8044
+  s_d6aaacaeb7ae80::t_8907f14ce9183c 610-617,620-626
+  s_d6aaacaeb7ae80::t_f241445407cb86 1793-1798,1800-1802
+net/crates/net/tests/punch_keepalive.rs
+  s_d6aaacaeb7ae80::t_356a155c7b5554 378-479
+net/crates/net/docs/misc/CODE_REVIEW_2026_06_21_NAT_TRAVERSAL.md
+  s_d6aaacaeb7ae80::t_c543f34ec21c96 61-80
+  s_d6aaacaeb7ae80::t_b97ec93d2fa66c 46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "a9aefca0a11e90725591d9ce114ab32e131d1c7c",
+  "prompts": {},
+  "sessions": {
+    "s_d6aaacaeb7ae80": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3cecd013-206c-467a-974f-8c275ba1e8d5",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
