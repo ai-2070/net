@@ -1374,6 +1374,39 @@ async fn await_punch_observer_outcome(
     }
 }
 
+/// Compute the three keep-alive send offsets (relative to the
+/// scheduler task's spawn instant) for a punch whose synchronized
+/// fire time is `fire_at_ms` (Unix epoch ms), given the current
+/// wall-clock `now_ms` and the punch `deadline`.
+///
+/// The lead (`fire_at_ms - now_ms`) is:
+///
+/// - **clamped to `deadline`** — `fire_at_ms` is a
+///   coordinator-supplied value, and a malicious or buggy
+///   coordinator can name a fire time arbitrarily far in the
+///   future. A lead beyond `deadline` is useless (the observer task
+///   gives up then), and leaving it unbounded would park the
+///   keep-alive sender task — which holds a socket handle + payload
+///   — for that whole duration, with `start + offset` risking an
+///   `Instant` overflow. Clamping bounds the sender task's lifetime
+///   to the observer's.
+/// - **floored at zero** by the saturating subtraction — a lead in
+///   the past (clock skew, slow path) collapses to "fire
+///   immediately."
+///
+/// The +100 ms / +250 ms spacing (plan §3) is applied after the
+/// clamp; saturating adds keep the arithmetic panic-free even at
+/// the `Duration::MAX` extreme.
+#[cfg(feature = "nat-traversal")]
+fn keepalive_send_offsets(fire_at_ms: u64, now_ms: u64, deadline: Duration) -> [Duration; 3] {
+    let base_lead = Duration::from_millis(fire_at_ms.saturating_sub(now_ms)).min(deadline);
+    [
+        base_lead,
+        base_lead.saturating_add(Duration::from_millis(100)),
+        base_lead.saturating_add(Duration::from_millis(250)),
+    ]
+}
+
 /// Rolling-window auth-failure tracker, one entry per peer.
 /// Lives behind a per-key `Mutex` so updates from concurrent
 /// subscribes don't race each other on the same peer's counter.
@@ -7897,21 +7930,19 @@ impl MeshNode {
         ctx.punch_observers.insert(intro.peer_reflex, obs_tx);
 
         // Compute keep-alive send delays. `fire_at_ms` is a Unix
-        // epoch millisecond value synthesized by R; we subtract
-        // "now" to get the lead. If the computed lead is
-        // negative (clock skew, slow path), treat as "fire
-        // immediately" rather than as an error.
+        // epoch millisecond value synthesized by R; the lead is
+        // `fire_at - now`, clamped to `punch_deadline`. See
+        // [`keepalive_send_offsets`] for the negative-lead and
+        // unbounded-future handling.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let base_lead_ms = intro.fire_at_ms.saturating_sub(now_ms);
-        let base_lead = std::time::Duration::from_millis(base_lead_ms);
-        let offsets = [
-            base_lead,
-            base_lead.saturating_add(std::time::Duration::from_millis(100)),
-            base_lead.saturating_add(std::time::Duration::from_millis(250)),
-        ];
+        let offsets = keepalive_send_offsets(
+            intro.fire_at_ms,
+            now_ms,
+            ctx.traversal_config.punch_deadline,
+        );
 
         let local_node_id = ctx.local_node_id;
         let peer_reflex = intro.peer_reflex;
@@ -12709,6 +12740,58 @@ mod punch_observer_tests {
             observers.contains_key(&peer),
             "C's sender must remain after B's sender-dropped cleanup",
         );
+    }
+}
+
+#[cfg(all(test, feature = "nat-traversal"))]
+mod keepalive_offset_tests {
+    //! Unit coverage for [`keepalive_send_offsets`] (code review
+    //! 2026-06-21, Finding 3): the per-packet send schedule must
+    //! clamp a coordinator-supplied `fire_at_ms` so a far-future
+    //! value can't park the keep-alive sender task indefinitely or
+    //! overflow `Instant`.
+    use super::keepalive_send_offsets;
+    use std::time::Duration;
+
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn normal_lead_is_preserved_with_documented_spacing() {
+        // fire_at 500 ms in the future → 500 / 600 / 750 ms.
+        let offsets = keepalive_send_offsets(1_000_500, 1_000_000, DEADLINE);
+        assert_eq!(offsets[0], Duration::from_millis(500));
+        assert_eq!(offsets[1], Duration::from_millis(600));
+        assert_eq!(offsets[2], Duration::from_millis(750));
+    }
+
+    #[test]
+    fn past_fire_at_collapses_to_immediate() {
+        // fire_at already elapsed → base lead 0; spacing still applies.
+        let offsets = keepalive_send_offsets(900_000, 1_000_000, DEADLINE);
+        assert_eq!(offsets[0], Duration::ZERO);
+        assert_eq!(offsets[1], Duration::from_millis(100));
+        assert_eq!(offsets[2], Duration::from_millis(250));
+    }
+
+    #[test]
+    fn far_future_fire_at_is_clamped_to_deadline() {
+        // A malicious/buggy coordinator names a fire time ~1e9 s out.
+        // The base lead must clamp to `deadline`, bounding the sender
+        // task's lifetime rather than parking it for ~31 years.
+        let offsets = keepalive_send_offsets(1_000_000 + 1_000_000_000_000, 1_000_000, DEADLINE);
+        assert_eq!(offsets[0], DEADLINE, "base lead must clamp to deadline");
+        // Spacing applies after the clamp; bounded just past it.
+        assert_eq!(offsets[1], DEADLINE + Duration::from_millis(100));
+        assert_eq!(offsets[2], DEADLINE + Duration::from_millis(250));
+    }
+
+    #[test]
+    fn u64_max_fire_at_does_not_panic_and_clamps() {
+        // Extreme input: must neither panic on the millis→Duration
+        // conversion nor exceed the clamp.
+        let offsets = keepalive_send_offsets(u64::MAX, 0, DEADLINE);
+        assert_eq!(offsets[0], DEADLINE);
+        assert!(offsets[2] <= DEADLINE + Duration::from_millis(250));
     }
 }
 
