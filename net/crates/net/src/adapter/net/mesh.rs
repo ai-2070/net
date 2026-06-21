@@ -12523,6 +12523,16 @@ impl MeshNode {
         // Snapshot up to two peers. Two is enough to distinguish
         // Cone vs. Symmetric (plan §2); sampling more adds probe
         // traffic for no classification gain.
+        //
+        // Caveat (code review 2026-06-21, Finding B4): symmetric-NAT
+        // detection assumes the two peers are distinct *destinations*
+        // (different public IPs). Two node ids resolving to the same
+        // host/IP look like one destination to the NAT, so a
+        // symmetric NAT keyed on dest IP could hand out the same port
+        // for both and be misread as Cone. Low-probability on a real
+        // mesh, and it only affects the Cone-vs-Symmetric distinction
+        // — a misread still falls back to the routed path on punch
+        // failure.
         let peers: Vec<u64> = self.peers.iter().map(|e| *e.key()).take(2).collect();
         if peers.len() < 2 {
             return;
@@ -12560,7 +12570,7 @@ impl MeshNode {
         }
 
         let class = fsm.classify(bind);
-        self.commit_reclassify_observations(class, latest_reflex);
+        self.commit_reclassify_observations(class, latest_reflex, fsm.observation_count());
     }
 
     /// Commit the result of a classification sweep.
@@ -12583,6 +12593,7 @@ impl MeshNode {
         &self,
         class: super::traversal::classify::NatClass,
         latest_reflex: Option<std::net::SocketAddr>,
+        observation_count: usize,
     ) {
         use std::sync::atomic::Ordering;
         // Hold the publication mutex across the re-check + the
@@ -12595,6 +12606,22 @@ impl MeshNode {
         let _g = self.traversal_publish_mu.lock();
         if self.reflex_override_active.load(Ordering::Acquire) {
             tracing::debug!("nat-traversal: reflex override installed mid-sweep, skipping commit");
+            return;
+        }
+        // Insufficient-observations guard (code review 2026-06-21,
+        // Finding B2). `classify` returns `Unknown` below two
+        // observations; publishing that would flap a previously-good
+        // Cone/Open down to Unknown on nothing more than transient
+        // packet loss (one of the two probes dropped). That's the same
+        // flap the deadline-expired branch in `reclassify_nat`
+        // deliberately avoids — so apply the same policy here: keep
+        // the prior (class, reflex) pair and let a later two-response
+        // sweep install a fresh one.
+        if observation_count < 2 {
+            tracing::debug!(
+                observation_count,
+                "nat-traversal: fewer than 2 probe observations this sweep, keeping prior pair"
+            );
             return;
         }
         // No-observation guard: when every probe failed we have no
@@ -13088,7 +13115,7 @@ mod reclassify_override_race_tests {
         let probed: SocketAddr = "198.51.100.9:4242".parse().unwrap();
 
         // Override flag is false by default.
-        node.commit_reclassify_observations(NatClass::Cone, Some(probed));
+        node.commit_reclassify_observations(NatClass::Cone, Some(probed), 2);
 
         assert_eq!(node.nat_class(), NatClass::Cone);
         assert_eq!(node.reflex_addr(), Some(probed));
@@ -13116,7 +13143,7 @@ mod reclassify_override_race_tests {
 
         // Now the classifier's (stale) commit tries to land.
         // With the guard in place, it must be skipped.
-        node.commit_reclassify_observations(NatClass::Symmetric, Some(probed));
+        node.commit_reclassify_observations(NatClass::Symmetric, Some(probed), 2);
 
         assert_eq!(
             node.nat_class(),
@@ -13146,7 +13173,7 @@ mod reclassify_override_race_tests {
 
         // Classifier gave up (all probes failed); it would
         // still store `Unknown` without the guard.
-        node.commit_reclassify_observations(NatClass::Unknown, None);
+        node.commit_reclassify_observations(NatClass::Unknown, None, 0);
 
         assert_eq!(
             node.nat_class(),
@@ -13176,7 +13203,7 @@ mod reclassify_override_race_tests {
 
         // Seed a coherent (Cone, Some(probed)) pair via the same
         // commit path; no override is installed so this must apply.
-        node.commit_reclassify_observations(NatClass::Cone, Some(probed));
+        node.commit_reclassify_observations(NatClass::Cone, Some(probed), 2);
         assert_eq!(node.nat_class(), NatClass::Cone);
         assert_eq!(node.reflex_addr(), Some(probed));
 
@@ -13185,7 +13212,7 @@ mod reclassify_override_race_tests {
         // while keeping `Some(probed)` as the reflex — torn pair.
         // Post-fix the function returns early and both fields
         // remain untouched.
-        node.commit_reclassify_observations(NatClass::Unknown, None);
+        node.commit_reclassify_observations(NatClass::Unknown, None, 0);
 
         assert_eq!(
             node.nat_class(),
@@ -13205,6 +13232,41 @@ mod reclassify_override_race_tests {
         );
     }
 
+    /// Finding B2 (code review 2026-06-21, port-scanning): a sweep
+    /// that collected fewer than two observations must NOT publish.
+    /// `classify` returns `Unknown` below 2 observations, and
+    /// committing that would flap a previously-good class down to
+    /// Unknown on nothing more than transient packet loss (one of the
+    /// two probes dropped). The commit must keep the prior
+    /// (class, reflex) pair.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_keeps_prior_class_on_single_observation_sweep() {
+        let node = build_node_for_test().await;
+        let probed: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+
+        // Seed a coherent two-observation result.
+        node.commit_reclassify_observations(NatClass::Cone, Some(probed), 2);
+        assert_eq!(node.nat_class(), NatClass::Cone);
+        assert_eq!(node.reflex_addr(), Some(probed));
+
+        // Next sweep gets only ONE probe response → classify() yields
+        // Unknown for <2 observations. Pre-fix this stored
+        // (Unknown, single); post-fix the prior pair is kept.
+        let single: SocketAddr = "198.51.100.10:4243".parse().unwrap();
+        node.commit_reclassify_observations(NatClass::Unknown, Some(single), 1);
+
+        assert_eq!(
+            node.nat_class(),
+            NatClass::Cone,
+            "a single-observation sweep must not downgrade a good class to Unknown",
+        );
+        assert_eq!(
+            node.reflex_addr(),
+            Some(probed),
+            "a single-observation sweep must not overwrite the published reflex",
+        );
+    }
+
     /// After `clear_reflex_override` is called, the classifier
     /// regains write access. Without this, the fix would
     /// permanently freeze classification once any override had
@@ -13218,7 +13280,7 @@ mod reclassify_override_race_tests {
         node.set_reflex_override(override_addr);
         node.clear_reflex_override();
 
-        node.commit_reclassify_observations(NatClass::Cone, Some(probed));
+        node.commit_reclassify_observations(NatClass::Cone, Some(probed), 2);
 
         assert_eq!(node.nat_class(), NatClass::Cone);
         assert_eq!(node.reflex_addr(), Some(probed));
