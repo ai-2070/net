@@ -43,7 +43,7 @@ and 5, plus a set of non-blocking minor notes.
 | Finding | Status | Commit | Test |
 |---|---|---|---|
 | 1 — UDP reflector | ⚠️ **Partially resolved** — coordinator path closed; direct path still open (Finding 4) | `b54329d88` | `rendezvous_coordinator.rs::request_punch_with_spoofed_self_reflex_ip_is_dropped`, `…_port_shifted_self_reflex_is_accepted` |
-| 2 — `sender_node_id` unvalidated | ✅ **Resolved** | `fb151b4af` | `punch_keepalive.rs::observer_acks_only_on_matching_sender_node_id` |
+| 2 — `sender_node_id` unvalidated | ✅ **Resolved** (validation moved to receive loop after a cubic-flagged DoS in the first cut) | `fb151b4af` + follow-up | `punch_keepalive.rs::observer_acks_only_on_matching_sender_node_id`, `…::stray_keepalive_with_wrong_sender_does_not_burn_the_observer` |
 | 3 — unbounded `fire_at_ms` | ✅ **Resolved** | `9b56e6d41` | `mesh.rs::keepalive_offset_tests` (4 cases) |
 
 ### Finding 1 fix — bind `self_reflex` to A's session source IP
@@ -58,14 +58,26 @@ acceptance test. The drop is silent (→ A's `request_punch` times out as
 
 ### Finding 2 fix — validate keep-alive `sender_node_id`
 
-`await_punch_observer_outcome` now returns `Option<Keepalive>` instead of
-`bool`, threading the decoded payload to the observer task, which compares
-`ka.sender_node_id == intro.peer` before emitting the `PunchAck`
-(`mesh.rs:8004`). The wire path is consistent end-to-end: the keep-alive sender
-stamps its own `local_node_id` (`mesh.rs:7971`) and the counterpart's observer
-expects exactly that id. The integration test is self-validating — a **control
-phase** with a matching id proves the injection path actually drives an ack, so
-the reject phase cannot pass vacuously.
+The sender check runs in the **receive loop, before the observer is removed**.
+`punch_observers` values now carry the expected counterpart `node_id` alongside
+the oneshot, and `dispatch_packet` consumes the observer via a `remove_if` that
+fires only when `ka.sender_node_id` matches that id. The wire path is consistent
+end-to-end: the keep-alive sender stamps its own `local_node_id` and the
+counterpart's observer expects exactly that id.
+
+The first cut put the check *after* the observer fired (inside the scheduler
+task). cubic flagged that as a P2 DoS: the receive loop removed the observer on
+the first keep-alive from `peer_reflex` regardless of sender, so a single
+stray/spoofed packet consumed the observer and the late check then failed the
+punch permanently — even if a valid keep-alive arrived moments later. Moving the
+check ahead of removal means a wrong-sender packet is dropped without consuming
+the observer, so a subsequent valid keep-alive still completes the punch.
+
+Tests: `observer_acks_only_on_matching_sender_node_id` (self-validating —
+a **control phase** with a matching id proves the injection path drives an ack,
+so the reject phase can't pass vacuously) and
+`stray_keepalive_with_wrong_sender_does_not_burn_the_observer` (the DoS
+regression — stray-then-valid still acks).
 
 ### Finding 3 fix — clamp `fire_at_ms` lead
 

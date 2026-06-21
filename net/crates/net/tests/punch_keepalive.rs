@@ -375,3 +375,105 @@ async fn observer_acks_only_on_matching_sender_node_id() {
          an ack — the observer's source-addr keying is not sufficient on its own",
     );
 }
+
+/// Regression for the cubic-flagged DoS in the Finding 2 fix: a
+/// stray/spoofed keep-alive carrying the wrong `sender_node_id` must
+/// NOT consume the observer. The receive loop validates the sender
+/// *before* removing the observer, so a bad first packet is dropped
+/// while the observer stays armed — a later valid keep-alive still
+/// drives the `PunchAck`. (Before the fix, the first keep-alive — any
+/// sender — was removed and fired the oneshot; the sender check then
+/// ran too late and the punch was failed permanently.)
+///
+/// Same injection harness as
+/// `observer_acks_only_on_matching_sender_node_id`: B's reflex
+/// override points at a test-controlled listener, so A's observer is
+/// keyed by that address and we inject keep-alives from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stray_keepalive_with_wrong_sender_does_not_burn_the_observer() {
+    let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let listener_addr: SocketAddr = listener.local_addr().unwrap();
+
+    let a = build_node().await;
+    let r = build_node().await;
+    let b = build_node_with_reflex(listener_addr).await;
+    let x = build_node().await;
+    connect_pair(&a, &r).await;
+    connect_pair(&b, &r).await;
+    connect_pair(&a, &x).await;
+    connect_pair(&b, &x).await;
+    connect_pair(&r, &x).await;
+    a.start();
+    r.start();
+    b.start();
+    x.start();
+
+    a.reclassify_nat().await;
+    a.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("A announce");
+    b.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("B announce");
+
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+    let r_id = r.node_id();
+    let a_addr = a.local_addr();
+    let r_for_poll = r.clone();
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            r_for_poll.peer_reflex_addr(b_id) == Some(listener_addr)
+                && r_for_poll.peer_reflex_addr(a_id).is_some()
+        })
+        .await,
+        "R should see B's override reflex + A's reflex before we fire",
+    );
+
+    // B waits for A's ack (from_peer == a_id, forwarded by R).
+    let b_clone = b.clone();
+    let b_wait = tokio::spawn(async move { b_clone.await_punch_ack(a_id, r_id).await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    // A initiates → R introduces → A installs its observer keyed by
+    // B's reflex (= listener_addr), tagged with expected sender B.
+    a.request_punch(r.node_id(), b_id, a_addr)
+        .await
+        .expect("request_punch should mediate");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // STRAY first: wrong sender id from the right source address. The
+    // receive loop must drop it WITHOUT consuming the observer.
+    listener
+        .send_to(
+            &encode_keepalive(&Keepalive {
+                sender_node_id: 0xDEAD_BEEF,
+                punch_id: 0,
+            }),
+            a_addr,
+        )
+        .await
+        .unwrap();
+    // Give the receive loop time to (correctly) ignore the stray.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // VALID second: correct sender id. The observer must still be
+    // armed, so this fires it and A acks.
+    listener
+        .send_to(
+            &encode_keepalive(&Keepalive {
+                sender_node_id: b_id,
+                punch_id: 0,
+            }),
+            a_addr,
+        )
+        .await
+        .unwrap();
+
+    let acked = matches!(b_wait.await.expect("b_wait task panicked"), Ok(_));
+    assert!(
+        acked,
+        "a stray wrong-sender keep-alive must not burn the observer; the \
+         subsequent valid keep-alive must still drive A's PunchAck",
+    );
+}
