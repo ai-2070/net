@@ -28,12 +28,60 @@ The "NAT traversal is an optimization, not correctness" framing is consistently
 maintained — every failure path falls back to the routed handshake, so **none
 of the findings below break the correctness contract.**
 
-All three findings live in the **rendezvous runtime path**, where the
+All findings below live in the **rendezvous runtime path**, where the
 implementation is weaker than both the surrounding code's posture and the plan.
 
 ---
 
+## Resolution status — 2026-06-21 hardening pass (branch `nat-traversal-hardening`)
+
+The original three findings were addressed in this branch. A verification pass
+(compile + run of every new/changed test) confirms the fixes land and pass. Two
+residual items that surfaced during that pass are tracked below as Findings 4
+and 5, plus a set of non-blocking minor notes.
+
+| Finding | Status | Commit | Test |
+|---|---|---|---|
+| 1 — UDP reflector | ⚠️ **Partially resolved** — coordinator path closed; direct path still open (Finding 4) | `b54329d88` | `rendezvous_coordinator.rs::request_punch_with_spoofed_self_reflex_ip_is_dropped`, `…_port_shifted_self_reflex_is_accepted` |
+| 2 — `sender_node_id` unvalidated | ✅ **Resolved** | `fb151b4af` | `punch_keepalive.rs::observer_acks_only_on_matching_sender_node_id` |
+| 3 — unbounded `fire_at_ms` | ✅ **Resolved** | `9b56e6d41` | `mesh.rs::keepalive_offset_tests` (4 cases) |
+
+### Finding 1 fix — bind `self_reflex` to A's session source IP
+
+`handle_punch_request` now resolves A's session up-front and drops the request
+when `req.self_reflex.ip() != a_addr.ip()` (`mesh.rs:7772`), *before* `a_reflex`
+is ever read. This closes the **coordinator-mediated** reflection path — an
+attacker can no longer name a third-party victim IP. Symmetric-NAT port shifts
+stay honoured (the guard keys on IP only), verified by the port-shifted
+acceptance test. The drop is silent (→ A's `request_punch` times out as
+`PunchFailed`); `RendezvousRejected` is still not constructed (Finding 5).
+
+### Finding 2 fix — validate keep-alive `sender_node_id`
+
+`await_punch_observer_outcome` now returns `Option<Keepalive>` instead of
+`bool`, threading the decoded payload to the observer task, which compares
+`ka.sender_node_id == intro.peer` before emitting the `PunchAck`
+(`mesh.rs:8004`). The wire path is consistent end-to-end: the keep-alive sender
+stamps its own `local_node_id` (`mesh.rs:7971`) and the counterpart's observer
+expects exactly that id. The integration test is self-validating — a **control
+phase** with a matching id proves the injection path actually drives an ack, so
+the reject phase cannot pass vacuously.
+
+### Finding 3 fix — clamp `fire_at_ms` lead
+
+The inline offset math was extracted into a pure, unit-tested
+`keepalive_send_offsets(fire_at_ms, now_ms, deadline)` (`mesh.rs:1404`) that
+clamps `base_lead` to `punch_deadline` and uses saturating adds for the
+`+100/+250 ms` spacing. Far-future and `u64::MAX` inputs are covered for both
+clamping and panic-freedom.
+
+---
+
 ## Finding 1 — Rendezvous is an unauthenticated UDP reflector to attacker-chosen addresses (Medium)
+
+> **Status: partially resolved** (`b54329d88`) — coordinator path closed; the
+> direct unsolicited-introduce path is still open and is now tracked as
+> Finding 4. The original analysis below is retained as the historical record.
 
 The punch responder fires UDP keep-alives at a **wire-supplied** address with no
 validation and no rate limit.
@@ -102,6 +150,9 @@ the reflex handler correctly replies only to the peer's *known* address
 
 ## Finding 2 — Keep-alive `sender_node_id` is decoded but never validated (Low)
 
+> **Status: resolved** (`fb151b4af`). The original analysis below is retained as
+> the historical record.
+
 `Keepalive.sender_node_id` is documented as **load-bearing**, specifically to
 stop "a stray packet on the right source addr [from] falsely signal[ing] 'punch
 succeeded'" (`rendezvous.rs:180-185`).
@@ -130,6 +181,9 @@ from the doc to match reality.
 
 ## Finding 3 — `fire_at_ms` from `PunchIntroduce` is trusted unbounded (Low)
 
+> **Status: resolved** (`9b56e6d41`). The original analysis below is retained as
+> the historical record.
+
 In `schedule_punch` (`mesh.rs:7871-7915`):
 
 ```rust
@@ -151,6 +205,85 @@ introduces accumulates parked tasks (memory / task-handle pressure).
 
 Clamp `base_lead` to a small multiple of `TraversalConfig::punch_fire_lead`
 (e.g. a few seconds) and drop introduces whose `fire_at` is implausibly distant.
+
+---
+
+## Finding 4 — Residual: the *direct* unsolicited `PunchIntroduce` reflector is still open (Low–Medium, Open)
+
+Surfaced during the 2026-06-21 verification pass. Finding 1's fix guards the
+**coordinator-mediated** path only; the **direct** path from Finding 1's
+reachability analysis is untouched:
+
+- An authenticated session peer X sends responder B an unsolicited
+  `PunchIntroduce{ peer: <any>, peer_reflex: <victim>, fire_at: now }`. B has no
+  waiter for `<any>`, so the dispatch arm falls through to `schedule_punch`
+  (`mesh.rs:5114→5126`).
+- `schedule_punch`'s keep-alive sender task fires three packets to
+  `intro.peer_reflex` **unconditionally** (`mesh.rs:7974-7982`); `peer_reflex`
+  is wire-supplied and bound to nothing X-related.
+
+The Finding 2 `sender_node_id` check does **not** close this — it gates only
+whether B emits the *return* `PunchAck`, not whether B sends the keep-alive
+*train*. So B still emits `3 × 14` bytes at an attacker-named address, source
+obfuscated behind B.
+
+### Why it's lower-severity than the headline
+
+Reachable only by an authenticated mesh member; payload is tiny and there is no
+amplification (the value is reflection / source-hiding). Finding 3's clamp now
+bounds each parked sender task to ≤ `punch_deadline + 250 ms`, so flooding
+far-future introduces no longer accumulates unbounded parked tasks — only
+bounded-lifetime churn (still uncapped in *rate*; see Finding 5).
+
+### Recommended fix
+
+Finding 1's mitigation #3, now promoted from optional: in the unsolicited
+branch, drop when `intro.peer_reflex` disagrees with `reflex_addr_for(intro.peer)`
+if a reflex is cached for `intro.peer` in the fold. When no reflex is cached,
+fall back to the Finding 5 rate-limit budget rather than firing blind.
+
+---
+
+## Finding 5 — Rate-limit budgets and `RendezvousRejected` remain unimplemented (Low, Open)
+
+Carried forward from Finding 1's mitigation #2 and its "why this is a gap" note;
+still true after this branch:
+
+- There is still **no per-requester budget on `PunchRequest`** and **no per-peer
+  budget on responder keep-alive trains**. Volume-based abuse over the
+  still-open direct path (Finding 4) is unbounded in *count*.
+- `TraversalError::RendezvousRejected` / `RendezvousNoRelay` are still **never
+  constructed**. Finding 1's guard surfaces as a silent drop → `PunchFailed`
+  timeout, so the FFI-mapped error codes (`ffi/mesh.rs:144-145`) stay dead.
+
+### Recommended fix
+
+Add the planned budgets (the `is_auth_throttled` subscribe-auth infrastructure
+is the model) and surface both the rate-limit rejection and the Finding 1 IP
+mismatch as `RendezvousRejected` — so the error path stops being dead and A gets
+a fast, typed failure instead of waiting out `punch_deadline`.
+
+---
+
+## Minor notes (non-blocking)
+
+1. **The Finding 1 guard assumes A is a *direct* session peer of R.**
+   `PeerInfo::addr` is the *relay's* address for relay-reached peers
+   (`mesh.rs:1130-1132`). If R ever reaches requester A via a relay, the guard
+   compares `self_reflex.ip()` against the relay IP and drops a legitimate
+   request → relay fallback. Correctness-preserving, and A↔R is direct in the
+   normal rendezvous topology, but the guard comment should state the
+   assumption.
+2. **IP-only binding has two acknowledged edges.** (a) IPv4-mapped-IPv6 or
+   multi-public-IP CGNAT pools can drop a valid A (→ relay fallback); (b) under
+   CGNAT a malicious A can still name `self_reflex = <shared IP>:<co-tenant port>`
+   and reflect at a co-tenant behind the same public IP. Both are inherent to
+   "bind IP, allow any port for symmetric NAT" and are accepted tradeoffs.
+3. **Doc nit in `keepalive_send_offsets`.** Its comment says the clamp "bounds
+   the sender task's lifetime to the observer's." Because the `+100/+250 ms`
+   spacing is applied *after* the clamp, at the clamp extreme the sender outlives
+   the observer by up to 250 ms. Harmless (still bounded, panic-free), but
+   "to within ~250 ms of the observer's" would be exact.
 
 ---
 
@@ -181,14 +314,13 @@ Clamp `base_lead` to a small multiple of `TraversalConfig::punch_fire_lead`
 
 ## Suggested follow-up
 
-Findings 1 (mitigation 1) and 3 are small, localized changes. A natural single
-patch:
+The 2026-06-21 hardening pass landed Finding 1 (mitigation 1), Finding 2, and
+Finding 3. Remaining work, in priority order:
 
-- `handle_punch_request`: reject `PunchRequest` whose `self_reflex.ip()` does
-  not match the requester's session source IP.
-- `schedule_punch`: clamp `base_lead`.
-- Wire `RendezvousRejected` into the coordinator so the FFI-mapped error code
-  stops being dead.
-
-Finding 2 is a doc-vs-implementation reconciliation that can ride along or be
-deferred.
+- **Finding 4** — close the direct unsolicited-introduce reflector by validating
+  `intro.peer_reflex` against the cached announced reflex of `intro.peer`.
+- **Finding 5** — add the per-requester / per-peer rate-limit budgets and wire
+  `RendezvousRejected` so the FFI-mapped error code stops being dead and the
+  Finding 1 drop becomes a typed, fast failure.
+- **Minor notes 1 & 3** — tighten the guard comment (direct-session assumption)
+  and the `keepalive_send_offsets` lifetime-bound wording.
