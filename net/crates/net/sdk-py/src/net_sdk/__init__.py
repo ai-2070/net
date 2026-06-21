@@ -285,4 +285,4 @@ __all__ += [
     "watch_tools",
 ]
 
-__version__ = "0.27.6"
+__version__ = "0.27.7"
