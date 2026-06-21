@@ -12493,8 +12493,13 @@ impl MeshNode {
     /// [`super::traversal::classify::ClassifyFsm`], and updates
     /// `nat_class` + `reflex_addr` with the result.
     ///
-    /// Runs at most one sweep at a time — a second call while a
-    /// sweep is in flight is a no-op. Exits early if fewer than 2
+    /// Runs at most one *sweep* at a time — a second `reclassify_nat`
+    /// call while a sweep is in flight is a no-op (the [`SweepGuard`]
+    /// at the top of the body). The gate is sweep-level only: a
+    /// standalone [`Self::probe_reflex`] — e.g. the
+    /// `net_mesh_probe_reflex` FFI — is *not* gated and can still race
+    /// a sweep's probe to the same peer (a benign collision; see the
+    /// gate comment in the body). Exits early if fewer than 2
     /// peers are currently connected; callers should check
     /// [`Self::nat_class`] after the returned future completes to
     /// see whether classification produced a definite verdict or
@@ -12517,6 +12522,17 @@ impl MeshNode {
         // probe insert drops the earlier sweep's oneshot and starves
         // it. A second concurrent entry is a no-op; the RAII guard
         // clears the flag on every exit path below.
+        //
+        // Scope: this gate serializes *sweeps* against each other, not
+        // the `pending_reflex_probes` map itself. A standalone
+        // `probe_reflex` (the `net_mesh_probe_reflex` FFI) doesn't take
+        // the gate, so it can still race a sweep's probe to the same
+        // peer and cancel one of them. That residual is benign: probe
+        // waiters are generation-stamped (cleanup can't evict a
+        // replacement), the loser just gets `ReflexTimeout`, and the
+        // <2-observation guard (Finding B2) keeps a sweep that drops a
+        // probe this way on its prior class instead of flapping to
+        // Unknown.
         let Some(_sweep) = SweepGuard::try_enter(&self.nat_classifying) else {
             return;
         };
