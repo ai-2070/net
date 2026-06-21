@@ -1397,6 +1397,40 @@ async fn await_punch_observer_outcome(
     }
 }
 
+/// RAII single-flight gate over an `AtomicBool`.
+///
+/// [`SweepGuard::try_enter`] returns `Some(guard)` iff the flag was
+/// previously clear (and atomically sets it); dropping the guard
+/// clears it. [`MeshNode::reclassify_nat`] uses it to honor its
+/// documented "at most one sweep at a time" contract: a second,
+/// concurrent entry observes the flag already set and bails out as a
+/// no-op rather than racing the in-flight sweep on the shared
+/// `pending_reflex_probes` map.
+#[cfg(feature = "nat-traversal")]
+struct SweepGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+#[cfg(feature = "nat-traversal")]
+impl<'a> SweepGuard<'a> {
+    /// Try to enter the single-flight section. `Some` on success
+    /// (flag was clear, now set); `None` if a sweep is already
+    /// running. `Acquire` on the swap so the entering sweep's reads
+    /// happen-after the prior sweep's `Release` on drop.
+    fn try_enter(flag: &'a std::sync::atomic::AtomicBool) -> Option<Self> {
+        if flag.swap(true, std::sync::atomic::Ordering::Acquire) {
+            None
+        } else {
+            Some(Self(flag))
+        }
+    }
+}
+
+#[cfg(feature = "nat-traversal")]
+impl Drop for SweepGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Compute the three keep-alive send offsets (relative to the
 /// scheduler task's spawn instant) for a punch whose synchronized
 /// fire time is `fire_at_ms` (Unix epoch ms), given the current
@@ -1806,6 +1840,17 @@ pub struct MeshNode {
             ),
         >,
     >,
+    /// Single-flight gate for the classification sweep.
+    /// [`Self::reclassify_nat`] sets this on entry and clears it on
+    /// exit (via an RAII [`SweepGuard`]); a concurrent entry while a
+    /// sweep is already in flight is a no-op, as that method's doc
+    /// promises. Without it, an operator / FFI `reclassify_nat` call
+    /// racing the background classify loop would collide on
+    /// `pending_reflex_probes` (keyed by peer id) and starve one of
+    /// the sweeps. Plain `AtomicBool` (not `Arc`) — only ever touched
+    /// through `&self` inside `reclassify_nat`.
+    #[cfg(feature = "nat-traversal")]
+    nat_classifying: std::sync::atomic::AtomicBool,
     /// Current NAT classification, encoded via
     /// [`super::traversal::classify::NatClass::as_u8`]. Starts as
     /// `Unknown` (`0`) and is updated by the classification sweep
@@ -2465,6 +2510,8 @@ impl MeshNode {
             pending_punch_acks: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
             next_waiter_gen: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            #[cfg(feature = "nat-traversal")]
+            nat_classifying: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "nat-traversal")]
             punch_observers: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
@@ -5038,12 +5085,26 @@ impl MeshNode {
                 };
                 match msg {
                     reflex::ReflexMsg::Request => {
-                        // Echo the observed source address back. Source
-                        // is read from `PeerInfo.addr` — the last
-                        // address our kernel saw packets from this peer
-                        // arrive on, equivalent to a STUN server's
-                        // "observed source" because NAT-rewriting is
-                        // applied by the time packets reach our socket.
+                        // Echo back the requester's public address. We
+                        // use `PeerInfo.addr` — the source recorded at
+                        // handshake / key-rotation time (`addr: source`
+                        // in the routed-handshake path), NOT the live
+                        // UDP source of this reflex packet. NAT-rewrite
+                        // is applied by the time packets reach our
+                        // socket, so for a peer whose NAT mapping is
+                        // stable this equals a STUN server's "observed
+                        // source."
+                        //
+                        // Tradeoff (code review 2026-06-21, Finding
+                        // B5): the handshake addr is authenticated, so
+                        // an on-path attacker can't make us report a
+                        // spoofed reflex by forging a UDP source. The
+                        // cost is that a *mid-session NAT rebind*
+                        // without a re-handshake yields a stale reflex
+                        // until the session re-establishes. Echoing the
+                        // live `source` would track rebinds but be
+                        // spoofable; the spoof-resistant cached addr is
+                        // the deliberate choice.
                         let Some((dest_addr, dest_sess)) = ctx
                             .peers
                             .get(&from_node)
@@ -12432,8 +12493,13 @@ impl MeshNode {
     /// [`super::traversal::classify::ClassifyFsm`], and updates
     /// `nat_class` + `reflex_addr` with the result.
     ///
-    /// Runs at most one sweep at a time — a second call while a
-    /// sweep is in flight is a no-op. Exits early if fewer than 2
+    /// Runs at most one *sweep* at a time — a second `reclassify_nat`
+    /// call while a sweep is in flight is a no-op (the `SweepGuard`
+    /// at the top of the body). The gate is sweep-level only: a
+    /// standalone [`Self::probe_reflex`] — e.g. the
+    /// `net_mesh_probe_reflex` FFI — is *not* gated and can still race
+    /// a sweep's probe to the same peer (a benign collision; see the
+    /// gate comment in the body). Exits early if fewer than 2
     /// peers are currently connected; callers should check
     /// [`Self::nat_class`] after the returned future completes to
     /// see whether classification produced a definite verdict or
@@ -12447,6 +12513,29 @@ impl MeshNode {
     #[cfg(feature = "nat-traversal")]
     pub async fn reclassify_nat(&self) {
         use super::traversal::classify::ClassifyFsm;
+
+        // Single-flight gate (doc contract: "at most one sweep at a
+        // time"). `reclassify_nat` is `pub` + FFI-exported, so an
+        // operator call can race the background classify loop's tick
+        // (or another operator call). Concurrent sweeps collide on
+        // `pending_reflex_probes` — keyed by peer id, the later
+        // probe insert drops the earlier sweep's oneshot and starves
+        // it. A second concurrent entry is a no-op; the RAII guard
+        // clears the flag on every exit path below.
+        //
+        // Scope: this gate serializes *sweeps* against each other, not
+        // the `pending_reflex_probes` map itself. A standalone
+        // `probe_reflex` (the `net_mesh_probe_reflex` FFI) doesn't take
+        // the gate, so it can still race a sweep's probe to the same
+        // peer and cancel one of them. That residual is benign: probe
+        // waiters are generation-stamped (cleanup can't evict a
+        // replacement), the loser just gets `ReflexTimeout`, and the
+        // <2-observation guard (Finding B2) keeps a sweep that drops a
+        // probe this way on its prior class instead of flapping to
+        // Unknown.
+        let Some(_sweep) = SweepGuard::try_enter(&self.nat_classifying) else {
+            return;
+        };
 
         // Reflex-override short-circuit: an operator-set (or
         // port-mapping installed) external address already tells
@@ -12464,6 +12553,16 @@ impl MeshNode {
         // Snapshot up to two peers. Two is enough to distinguish
         // Cone vs. Symmetric (plan §2); sampling more adds probe
         // traffic for no classification gain.
+        //
+        // Caveat (code review 2026-06-21, Finding B4): symmetric-NAT
+        // detection assumes the two peers are distinct *destinations*
+        // (different public IPs). Two node ids resolving to the same
+        // host/IP look like one destination to the NAT, so a
+        // symmetric NAT keyed on dest IP could hand out the same port
+        // for both and be misread as Cone. Low-probability on a real
+        // mesh, and it only affects the Cone-vs-Symmetric distinction
+        // — a misread still falls back to the routed path on punch
+        // failure.
         let peers: Vec<u64> = self.peers.iter().map(|e| *e.key()).take(2).collect();
         if peers.len() < 2 {
             return;
@@ -12501,7 +12600,7 @@ impl MeshNode {
         }
 
         let class = fsm.classify(bind);
-        self.commit_reclassify_observations(class, latest_reflex);
+        self.commit_reclassify_observations(class, latest_reflex, fsm.observation_count());
     }
 
     /// Commit the result of a classification sweep.
@@ -12524,6 +12623,7 @@ impl MeshNode {
         &self,
         class: super::traversal::classify::NatClass,
         latest_reflex: Option<std::net::SocketAddr>,
+        observation_count: usize,
     ) {
         use std::sync::atomic::Ordering;
         // Hold the publication mutex across the re-check + the
@@ -12538,19 +12638,37 @@ impl MeshNode {
             tracing::debug!("nat-traversal: reflex override installed mid-sweep, skipping commit");
             return;
         }
-        // No-observation guard: when every probe failed we have no
-        // fresh reflex to publish. Pre-fix the commit still wrote
-        // `nat_class` (typically degenerating to `Unknown`) but
-        // left the previous `reflex_addr` in place — a torn
-        // `(fresh class, stale reflex)` snapshot that violates the
-        // `traversal_publish_mu` invariant a downstream
-        // `announce_capabilities_with` reader expects to see
-        // coherent. Match the deadline-expired branch in
-        // `reclassify_nat` (the `tokio::time::timeout` Err arm
-        // above): treat "no observations this sweep" as a transient
-        // signal and leave the previously-published pair untouched.
-        // A subsequent sweep can install a fresh class+reflex
-        // together.
+        // Insufficient-observations guard (code review 2026-06-21,
+        // Finding B2). `classify` returns `Unknown` below two
+        // observations; publishing that would flap a previously-good
+        // Cone/Open down to Unknown on nothing more than transient
+        // packet loss (one of the two probes dropped). That's the same
+        // flap the deadline-expired branch in `reclassify_nat`
+        // deliberately avoids — so apply the same policy here: keep
+        // the prior (class, reflex) pair and let a later two-response
+        // sweep install a fresh one.
+        if observation_count < 2 {
+            tracing::debug!(
+                observation_count,
+                "nat-traversal: fewer than 2 probe observations this sweep, keeping prior pair"
+            );
+            return;
+        }
+        // No-reflex guard (defense-in-depth). For coherent inputs from
+        // `reclassify_nat` the <2-observation guard above already
+        // subsumes this case: an all-probes-failed sweep has
+        // `observation_count == 0`, and any sweep with
+        // `observation_count >= 2` necessarily threaded a
+        // `latest_reflex` (it is set on every `fsm.observe`). This
+        // guard remains for a *torn* input — a caller passing
+        // `observation_count >= 2` with `latest_reflex == None` — so
+        // the commit never publishes a `nat_class` without a paired
+        // reflex (the `traversal_publish_mu` coherence invariant a
+        // downstream `announce_capabilities_with` reader relies on).
+        // Same policy as the deadline-expired branch in
+        // `reclassify_nat`: leave the previously-published pair
+        // untouched. Pinned by
+        // `commit_keeps_prior_on_torn_class_without_reflex`.
         let Some(addr) = latest_reflex else {
             tracing::debug!(
                 "nat-traversal: no probe observations this sweep, keeping prior (class, reflex) pair"
@@ -12859,6 +12977,33 @@ mod keepalive_offset_tests {
 }
 
 #[cfg(all(test, feature = "nat-traversal"))]
+mod sweep_guard_tests {
+    //! Unit coverage for [`SweepGuard`] (code review 2026-06-21,
+    //! port-scanning Finding B1): the single-flight gate that backs
+    //! `reclassify_nat`'s "at most one sweep at a time" contract.
+    use super::SweepGuard;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn try_enter_is_single_flight_and_releases_on_drop() {
+        let flag = AtomicBool::new(false);
+
+        let g1 = SweepGuard::try_enter(&flag);
+        assert!(g1.is_some(), "first entry must acquire the gate");
+        assert!(
+            SweepGuard::try_enter(&flag).is_none(),
+            "a second concurrent entry must be refused while the first is held",
+        );
+
+        drop(g1);
+        assert!(
+            SweepGuard::try_enter(&flag).is_some(),
+            "after the guard drops, the gate must be re-enterable",
+        );
+    }
+}
+
+#[cfg(all(test, feature = "nat-traversal"))]
 mod reclassify_override_race_tests {
     //! Regression coverage for a cubic-flagged P1 bug:
     //! [`MeshNode::reclassify_nat`] checked
@@ -13002,7 +13147,7 @@ mod reclassify_override_race_tests {
         let probed: SocketAddr = "198.51.100.9:4242".parse().unwrap();
 
         // Override flag is false by default.
-        node.commit_reclassify_observations(NatClass::Cone, Some(probed));
+        node.commit_reclassify_observations(NatClass::Cone, Some(probed), 2);
 
         assert_eq!(node.nat_class(), NatClass::Cone);
         assert_eq!(node.reflex_addr(), Some(probed));
@@ -13030,7 +13175,7 @@ mod reclassify_override_race_tests {
 
         // Now the classifier's (stale) commit tries to land.
         // With the guard in place, it must be skipped.
-        node.commit_reclassify_observations(NatClass::Symmetric, Some(probed));
+        node.commit_reclassify_observations(NatClass::Symmetric, Some(probed), 2);
 
         assert_eq!(
             node.nat_class(),
@@ -13060,7 +13205,7 @@ mod reclassify_override_race_tests {
 
         // Classifier gave up (all probes failed); it would
         // still store `Unknown` without the guard.
-        node.commit_reclassify_observations(NatClass::Unknown, None);
+        node.commit_reclassify_observations(NatClass::Unknown, None, 0);
 
         assert_eq!(
             node.nat_class(),
@@ -13090,7 +13235,7 @@ mod reclassify_override_race_tests {
 
         // Seed a coherent (Cone, Some(probed)) pair via the same
         // commit path; no override is installed so this must apply.
-        node.commit_reclassify_observations(NatClass::Cone, Some(probed));
+        node.commit_reclassify_observations(NatClass::Cone, Some(probed), 2);
         assert_eq!(node.nat_class(), NatClass::Cone);
         assert_eq!(node.reflex_addr(), Some(probed));
 
@@ -13099,7 +13244,7 @@ mod reclassify_override_race_tests {
         // while keeping `Some(probed)` as the reflex — torn pair.
         // Post-fix the function returns early and both fields
         // remain untouched.
-        node.commit_reclassify_observations(NatClass::Unknown, None);
+        node.commit_reclassify_observations(NatClass::Unknown, None, 0);
 
         assert_eq!(
             node.nat_class(),
@@ -13119,6 +13264,77 @@ mod reclassify_override_race_tests {
         );
     }
 
+    /// Finding B2 (code review 2026-06-21, port-scanning): a sweep
+    /// that collected fewer than two observations must NOT publish.
+    /// `classify` returns `Unknown` below 2 observations, and
+    /// committing that would flap a previously-good class down to
+    /// Unknown on nothing more than transient packet loss (one of the
+    /// two probes dropped). The commit must keep the prior
+    /// (class, reflex) pair.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_keeps_prior_class_on_single_observation_sweep() {
+        let node = build_node_for_test().await;
+        let probed: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+
+        // Seed a coherent two-observation result.
+        node.commit_reclassify_observations(NatClass::Cone, Some(probed), 2);
+        assert_eq!(node.nat_class(), NatClass::Cone);
+        assert_eq!(node.reflex_addr(), Some(probed));
+
+        // Next sweep gets only ONE probe response → classify() yields
+        // Unknown for <2 observations. Pre-fix this stored
+        // (Unknown, single); post-fix the prior pair is kept.
+        let single: SocketAddr = "198.51.100.10:4243".parse().unwrap();
+        node.commit_reclassify_observations(NatClass::Unknown, Some(single), 1);
+
+        assert_eq!(
+            node.nat_class(),
+            NatClass::Cone,
+            "a single-observation sweep must not downgrade a good class to Unknown",
+        );
+        assert_eq!(
+            node.reflex_addr(),
+            Some(probed),
+            "a single-observation sweep must not overwrite the published reflex",
+        );
+    }
+
+    /// Finding B2 follow-up (code review 2026-06-21, port-scanning):
+    /// the no-reflex guard in `commit_reclassify_observations` is
+    /// subsumed by the <2-observation guard for every coherent
+    /// `reclassify_nat` input (0 observations ⟹ caught by the count
+    /// guard; ≥2 observations ⟹ a reflex was threaded). It is retained
+    /// purely as defense-in-depth against a *torn* input — a commit
+    /// claiming ≥2 observations yet carrying no reflex. Such an input
+    /// must still keep the prior (class, reflex) pair rather than
+    /// publish a class with no paired reflex.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_keeps_prior_on_torn_class_without_reflex() {
+        let node = build_node_for_test().await;
+        let probed: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+
+        // Seed a coherent two-observation result.
+        node.commit_reclassify_observations(NatClass::Cone, Some(probed), 2);
+        assert_eq!(node.nat_class(), NatClass::Cone);
+        assert_eq!(node.reflex_addr(), Some(probed));
+
+        // Torn input: claims 2 observations (so the <2 guard does NOT
+        // fire) but carries no reflex. The no-reflex guard must catch
+        // it and keep the prior pair.
+        node.commit_reclassify_observations(NatClass::Open, None, 2);
+
+        assert_eq!(
+            node.nat_class(),
+            NatClass::Cone,
+            "a torn (class, None) commit must not publish a class without a reflex",
+        );
+        assert_eq!(
+            node.reflex_addr(),
+            Some(probed),
+            "a torn (class, None) commit must leave the published reflex intact",
+        );
+    }
+
     /// After `clear_reflex_override` is called, the classifier
     /// regains write access. Without this, the fix would
     /// permanently freeze classification once any override had
@@ -13132,7 +13348,7 @@ mod reclassify_override_race_tests {
         node.set_reflex_override(override_addr);
         node.clear_reflex_override();
 
-        node.commit_reclassify_observations(NatClass::Cone, Some(probed));
+        node.commit_reclassify_observations(NatClass::Cone, Some(probed), 2);
 
         assert_eq!(node.nat_class(), NatClass::Cone);
         assert_eq!(node.reflex_addr(), Some(probed));

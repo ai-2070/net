@@ -289,14 +289,25 @@ impl ClassifyFsm {
         // When `bind_addr.ip()` is wildcard (0.0.0.0 or ::), a
         // reflex observation like `192.0.2.1:9001` would never
         // compare equal under a strict `reflex.ip() ==
-        // bind_addr.ip()` check — even though the ports match and
-        // the node is in fact directly reachable. The FSM would
-        // then classify as `Cone` (or `Symmetric`) and
-        // `pair_action` would trigger an unnecessary `SinglePunch`,
-        // and capability tags would advertise `nat:cone` instead
-        // of `nat:open`, biasing peer-side decisions. An
-        // unspecified bind IP is therefore treated as a wildcard
-        // match — port-only equality suffices.
+        // bind_addr.ip()` check — even though the ports match. The
+        // FSM would then classify as `Cone`/`Symmetric` and advertise
+        // `nat:cone` instead of `nat:open`. An unspecified bind IP is
+        // therefore treated as a wildcard match — port-only equality
+        // suffices.
+        //
+        // Limitation (code review 2026-06-21, Finding B3): from a
+        // wildcard bind, port-only equality cannot distinguish a
+        // genuinely un-NATed node (reflex == its own public addr)
+        // from a node behind a *port-preserving* NAT (reflex port ==
+        // bind port by coincidence of preservation). The latter is
+        // classified `Open` here and may not actually be reachable by
+        // an unsolicited `Direct` connect (a port-restricted cone
+        // drops inbound from a host it hasn't contacted). The cost is
+        // bounded: `pair_action(Open, …)` mostly picks `Direct`, the
+        // direct handshake fails, and `connect_direct` falls back to
+        // the routed path — an optimization miss, not a connectivity
+        // failure. Binding to a concrete interface IP (not 0.0.0.0)
+        // avoids the ambiguity entirely.
         let bind_ip_is_wildcard = bind_addr.ip().is_unspecified();
         if self.probes.iter().any(|(_, reflex)| {
             reflex.port() == bind_addr.port()
