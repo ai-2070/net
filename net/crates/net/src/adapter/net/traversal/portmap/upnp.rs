@@ -100,13 +100,22 @@ impl UpnpMapper {
         // advertise a mapping that routes nowhere (code review
         // 2026-06-21, Finding A1). The production path
         // (`sequential_mapper_from_os` → `local_ipv4_for_gateway`)
-        // already supplies a validated non-unspecified IPv4; this
-        // `debug_assert` pins the contract for direct callers without
-        // a release-build cost.
+        // already supplies a validated non-unspecified IPv4. The
+        // `debug_assert` fails fast on misuse in dev; the
+        // `tracing::warn!` below surfaces the same misuse in release
+        // (where the assert is compiled out) so a mapping that routes
+        // nowhere is never installed *silently* (Finding A1 follow-up).
         debug_assert!(
             !local_ip.is_unspecified() && !local_ip.is_loopback(),
             "UpnpMapper::new requires a concrete LAN IP, got {local_ip}",
         );
+        if local_ip.is_unspecified() || local_ip.is_loopback() {
+            tracing::warn!(
+                %local_ip,
+                "UpnpMapper::new given a non-routable LAN IP; the IGD will likely \
+                 reject AddPortMapping and any mapping would route nowhere",
+            );
+        }
         Self {
             local_ip,
             gateway: Mutex::new(None),
