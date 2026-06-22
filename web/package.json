@@ -62,7 +62,7 @@
     "@trpc/react-query": "11.18.0",
     "@trpc/server": "11.18.0",
     "@types/mdx": "2.0.14",
-    "axios": "1.18.0",
+    "axios": "1.18.1",
     "axios-retry": "4.5.0",
     "better-auth": "1.6.20",
     "cache-manager": "7.2.8",
