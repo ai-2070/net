@@ -71,7 +71,7 @@ jobs:
       # one target shouldn't invalidate the others' build
       # artifacts.
       - name: Cache cargo
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin/
