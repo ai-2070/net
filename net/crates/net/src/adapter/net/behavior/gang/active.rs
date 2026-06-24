@@ -20,12 +20,9 @@
 
 use std::collections::HashMap;
 
-use crate::adapter::net::behavior::fold::{
-    ApplyOutcome, Fold, IslandId, JobId, NodeId, ReservationFold,
-};
-use crate::adapter::net::identity::EntityKeypair;
+use crate::adapter::net::behavior::fold::{ApplyOutcome, IslandId, JobId, NodeId};
 
-use super::claim::{activate_announcement, ClaimError};
+use super::claim::{activate_announcement, Claimant, ClaimError};
 use super::quorum::{Epoch, FenceLedger, QuorumWitness, ReplicaSet};
 
 /// Outcome of a partition-safe `→ Active` commit attempt.
@@ -101,14 +98,15 @@ impl ReplicaCohort {
 /// so a leadership term and the fold's anti-reorder counter are one
 /// and the same number. The proposer must therefore have reserved the
 /// island at a generation strictly below `epoch`.
-#[allow(clippy::too_many_arguments)]
+/// `claimant` carries the proposing leader's identity + reservation
+/// fold; the `Active` is signed at `generation = epoch` (not the
+/// claimant's counter), so the leader must have reserved the island
+/// at a generation strictly below `epoch`.
 pub fn commit_active(
+    claimant: &Claimant,
     cohort: &mut ReplicaCohort,
     set: &ReplicaSet,
     reachable: &[NodeId],
-    reservations: &Fold<ReservationFold>,
-    keypair: &EntityKeypair,
-    node_id: NodeId,
     island: IslandId,
     job_id: JobId,
     epoch: Epoch,
@@ -128,8 +126,8 @@ pub fn commit_active(
     }
 
     // Quorum reached → apply the Active (epoch rides the generation).
-    let ann = activate_announcement(keypair, node_id, epoch, island, job_id)?;
-    match reservations.apply(ann)? {
+    let ann = activate_announcement(claimant.keypair, claimant.node_id, epoch, island, job_id)?;
+    match claimant.reservations.apply(ann)? {
         ApplyOutcome::Inserted | ApplyOutcome::Replaced => Ok(ActiveCommitOutcome::Committed),
         // We gathered a quorum but no longer hold the Reserved — a
         // takeover landed first. No compute starts.
@@ -142,9 +140,12 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::adapter::net::behavior::fold::{ReservationQuery, ReservationState};
+    use crate::adapter::net::behavior::fold::{
+        Fold, ReservationFold, ReservationQuery, ReservationState,
+    };
     use crate::adapter::net::behavior::gang::single_island_claim;
     use crate::adapter::net::current_timestamp_micros;
+    use crate::adapter::net::identity::EntityKeypair;
 
     fn new_reservations() -> Fold<ReservationFold> {
         Fold::with_sweep_interval(Duration::ZERO)
@@ -170,13 +171,12 @@ mod tests {
 
         // Leader reserves at gen 1, then commits Active at epoch 2.
         single_island_claim(&fold, &leader, ln, 1, 0xA0, fresh()).unwrap();
+        let claimant = Claimant::new(&fold, &leader, ln);
         let out = commit_active(
+            &claimant,
             &mut cohort,
             &set,
             &[1, 2, 3], // majority reachable
-            &fold,
-            &leader,
-            ln,
             0xA0,
             7, // job
             2, // epoch (> reserve gen 1)
@@ -202,22 +202,20 @@ mod tests {
         let a = EntityKeypair::generate();
         let an = a.entity_id().node_id();
         single_island_claim(&fold, &a, an, 1, 0xA0, fresh()).unwrap();
+        let claimant_a = Claimant::new(&fold, &a, an);
 
         // Split 3 | 2. A is on the majority side {1,2,3}.
-        let majority = commit_active(
-            &mut cohort, &set, &[1, 2, 3], &fold, &a, an, 0xA0, 7, 2,
-        )
-        .unwrap();
+        let majority =
+            commit_active(&claimant_a, &mut cohort, &set, &[1, 2, 3], 0xA0, 7, 2).unwrap();
         assert_eq!(majority, ActiveCommitOutcome::Committed);
 
         // A would-be competing leader B on the minority side {4,5}
         // cannot gather a quorum → never starts compute.
         let b = EntityKeypair::generate();
         let bn = b.entity_id().node_id();
-        let minority = commit_active(
-            &mut cohort, &set, &[4, 5], &fold, &b, bn, 0xA0, 9, 3,
-        )
-        .unwrap();
+        let claimant_b = Claimant::new(&fold, &b, bn);
+        let minority =
+            commit_active(&claimant_b, &mut cohort, &set, &[4, 5], 0xA0, 9, 3).unwrap();
         assert_eq!(
             minority,
             ActiveCommitOutcome::NoQuorum { acks: 2, needed: 3 },
@@ -246,8 +244,9 @@ mod tests {
         let n = EntityKeypair::generate();
         let nn = n.entity_id().node_id();
         single_island_claim(&fold, &n, nn, 1, 0xA0, fresh()).unwrap();
+        let claimant_n = Claimant::new(&fold, &n, nn);
         assert_eq!(
-            commit_active(&mut cohort, &set, &[1, 2, 3], &fold, &n, nn, 0xA0, 1, 5).unwrap(),
+            commit_active(&claimant_n, &mut cohort, &set, &[1, 2, 3], 0xA0, 1, 5).unwrap(),
             ActiveCommitOutcome::Committed,
         );
         // Every replica now fenced at epoch 5.
@@ -260,10 +259,9 @@ mod tests {
         // quorum. O never commits.
         let o = EntityKeypair::generate();
         let on = o.entity_id().node_id();
-        let stale = commit_active(
-            &mut cohort, &set, &[1, 2, 3], &fold, &o, on, 0xA0, 2, 4,
-        )
-        .unwrap();
+        let claimant_o = Claimant::new(&fold, &o, on);
+        let stale =
+            commit_active(&claimant_o, &mut cohort, &set, &[1, 2, 3], 0xA0, 2, 4).unwrap();
         assert_eq!(
             stale,
             ActiveCommitOutcome::NoQuorum { acks: 0, needed: 2 },
@@ -293,8 +291,8 @@ mod tests {
         let bn = b.entity_id().node_id();
         single_island_claim(&fold, &b, bn, 1, 0xA0, fresh()).unwrap();
 
-        let out =
-            commit_active(&mut cohort, &set, &[1, 2, 3], &fold, &a, an, 0xA0, 7, 2).unwrap();
+        let claimant_a = Claimant::new(&fold, &a, an);
+        let out = commit_active(&claimant_a, &mut cohort, &set, &[1, 2, 3], 0xA0, 7, 2).unwrap();
         assert_eq!(out, ActiveCommitOutcome::LostReservation);
         // B still holds it, Reserved (no Active leaked).
         assert!(matches!(

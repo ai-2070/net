@@ -30,7 +30,7 @@
 use crate::adapter::net::behavior::fold::{Fold, IslandId, JobId, NodeId, ReservationFold};
 use crate::adapter::net::identity::EntityKeypair;
 
-use super::claim::{release_island, single_island_claim, ClaimError, ClaimOutcome};
+use super::claim::{release_island, single_island_claim, Claimant, ClaimError, ClaimOutcome};
 
 /// A gang job's claim over multiple islands — all-or-none. The plan
 /// types `islands` as a `SmallVec`; the crate has no `smallvec` dep,
@@ -118,14 +118,11 @@ pub fn try_acquire_gang(
 /// attempt. `now_us` and `backoff` are injected so the loop is
 /// deterministically testable: production passes the crate's
 /// `current_timestamp_micros` and a jittered sleep; tests pass a fake
-/// clock and a no-op.
-/// `backoff` receives the zero-based attempt number.
-#[allow(clippy::too_many_arguments)]
+/// clock and a no-op. `backoff` receives the zero-based attempt
+/// number. `claimant` carries the identity + generation; the loop
+/// advances its generation through [`try_acquire_gang`].
 pub fn acquire_gang(
-    reservations: &Fold<ReservationFold>,
-    keypair: &EntityKeypair,
-    node_id: NodeId,
-    generation: &mut u64,
+    claimant: &mut Claimant,
     claim: &GangClaim,
     reserve_ttl_us: u64,
     now_us: impl Fn() -> u64,
@@ -139,7 +136,14 @@ pub fn acquire_gang(
     let mut attempt = 0u32;
     loop {
         let until = now_us().saturating_add(reserve_ttl_us);
-        match try_acquire_gang(reservations, keypair, node_id, generation, &islands, until)? {
+        match try_acquire_gang(
+            claimant.reservations,
+            claimant.keypair,
+            claimant.node_id,
+            &mut claimant.generation,
+            &islands,
+            until,
+        )? {
             AcquireAttempt::Held => return Ok(GangOutcome::Held(islands)),
             AcquireAttempt::Blocked(_) => {
                 // Check the deadline AFTER releasing (try_acquire_gang
@@ -223,13 +227,10 @@ mod tests {
         let b = EntityKeypair::generate();
         let (na, nb) = (a.entity_id().node_id(), b.entity_id().node_id());
 
-        let mut ga = 1;
         // A acquires first (single-threaded determinism).
+        let mut ca = Claimant::new(&fold, &a, na);
         let ra = acquire_gang(
-            &fold,
-            &a,
-            na,
-            &mut ga,
+            &mut ca,
             &GangClaim {
                 job: 1,
                 islands: vec![2, 1], // unsorted on purpose
@@ -244,12 +245,9 @@ mod tests {
 
         // B, deadline in the past → exactly one blocked attempt then
         // a clean give-up holding nothing (no deadlock, no spin).
-        let mut gb = 1;
+        let mut cb = Claimant::new(&fold, &b, nb);
         let rb = acquire_gang(
-            &fold,
-            &b,
-            nb,
-            &mut gb,
+            &mut cb,
             &GangClaim {
                 job: 2,
                 islands: vec![1, 2],
@@ -290,12 +288,9 @@ mod tests {
             ga_rel += 1;
         };
 
-        let mut gb = 1;
+        let mut cb = Claimant::new(&fold, &b, nb);
         let rb = acquire_gang(
-            &fold,
-            &b,
-            nb,
-            &mut gb,
+            &mut cb,
             &GangClaim {
                 job: 2,
                 islands: vec![1, 2],
@@ -331,12 +326,9 @@ mod tests {
 
         // B acquires {2,3,4}; the expired reserves on 2 and 3 are
         // taken over.
-        let mut gb = 1;
+        let mut cb = Claimant::new(&fold, &b, nb);
         let rb = acquire_gang(
-            &fold,
-            &b,
-            nb,
-            &mut gb,
+            &mut cb,
             &GangClaim {
                 job: 9,
                 islands: vec![2, 3, 4],
@@ -375,7 +367,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let kp = EntityKeypair::generate();
                     let node = kp.entity_id().node_id();
-                    let mut gen = 1u64;
+                    let mut claimant = Claimant::new(&fold, &kp, node);
                     let claim = GangClaim {
                         job: 1,
                         islands: islands.clone(),
@@ -385,10 +377,7 @@ mod tests {
                     };
                     barrier.wait();
                     let outcome = acquire_gang(
-                        &fold,
-                        &kp,
-                        node,
-                        &mut gen,
+                        &mut claimant,
                         &claim,
                         2_000_000,
                         current_timestamp_micros,
@@ -402,8 +391,7 @@ mod tests {
                         sorted.sort_unstable();
                         assert_eq!(held, &sorted, "Held set is the full gang, in order");
                         for &island in held {
-                            release_island(&fold, &kp, node, gen, island).unwrap();
-                            gen += 1;
+                            release_island(&fold, &kp, node, claimant.next_gen(), island).unwrap();
                         }
                     }
                     matches!(outcome, GangOutcome::Held(_))

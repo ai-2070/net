@@ -201,6 +201,54 @@ pub fn release_island(
     Ok(ClaimOutcome::from_apply(reservations.apply(ann)?))
 }
 
+/// A claiming actor and its target reservation fold — the identity
+/// (`keypair` / `node_id`) plus the monotonic per-publisher
+/// `generation` counter, bundled so the gang/commit calls don't
+/// thread them as four separate positional args (which, being three
+/// `&_`/`u64`s in a row, are easy to transpose at the call site).
+///
+/// Construct one per claiming task; the orchestrators
+/// ([`acquire_gang`](super::acquire_gang),
+/// [`commit_active`](super::commit_active)) advance the generation
+/// internally so every announcement this actor emits stays
+/// strictly-monotonic (the reservation fold's anti-reorder rule).
+pub struct Claimant<'a> {
+    pub(super) reservations: &'a Fold<ReservationFold>,
+    pub(super) keypair: &'a EntityKeypair,
+    pub(super) node_id: NodeId,
+    pub(super) generation: u64,
+}
+
+impl<'a> Claimant<'a> {
+    /// Build a claimant. The generation counter starts at 1 (the
+    /// reservation fold treats a first announcement as the baseline
+    /// regardless, then requires strict-monotonic growth).
+    pub fn new(
+        reservations: &'a Fold<ReservationFold>,
+        keypair: &'a EntityKeypair,
+        node_id: NodeId,
+    ) -> Self {
+        Self {
+            reservations,
+            keypair,
+            node_id,
+            generation: 1,
+        }
+    }
+
+    /// Take the next generation, advancing the counter. The
+    /// orchestrators thread `&mut self.generation` directly into their
+    /// inner loops; this accessor exists for tests that need a fresh
+    /// monotonic generation after a gang acquire (e.g. to release or
+    /// activate the held islands), hence `#[cfg(test)]`.
+    #[cfg(test)]
+    pub(super) fn next_gen(&mut self) -> u64 {
+        let g = self.generation;
+        self.generation += 1;
+        g
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;

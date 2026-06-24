@@ -22,7 +22,7 @@ use crate::adapter::net::behavior::fold::{
     Fold, GpuId, IslandId, NodeId, ReservationFold, ReservationQuery, ReservationState,
 };
 use crate::adapter::net::behavior::gang::{
-    acquire_gang, activate_island, GangClaim, GangOutcome,
+    acquire_gang, activate_island, Claimant, GangClaim, GangOutcome,
 };
 use crate::adapter::net::current_timestamp_micros;
 use crate::adapter::net::identity::EntityKeypair;
@@ -78,17 +78,14 @@ fn run_one_interleaving(seed: u64, gangs: usize, islands: u64) {
             std::thread::spawn(move || {
                 let kp = EntityKeypair::generate();
                 let node = kp.entity_id().node_id();
-                let mut gen = 1u64;
+                let mut claimant = Claimant::new(&fold, &kp, node);
                 let claim = GangClaim {
                     job: 1,
                     islands: want.clone(),
                     deadline_us: deadline,
                 };
                 let outcome = acquire_gang(
-                    &fold,
-                    &kp,
-                    node,
-                    &mut gen,
+                    &mut claimant,
                     &claim,
                     1_000_000,
                     current_timestamp_micros,
@@ -99,8 +96,7 @@ fn run_one_interleaving(seed: u64, gangs: usize, islands: u64) {
                     // Drive each held island Reserved → Active (the
                     // gang "starts compute"). Held all → all activate.
                     for &island in &held {
-                        activate_island(&fold, &kp, node, gen, island, 1).unwrap();
-                        gen += 1;
+                        activate_island(&fold, &kp, node, claimant.next_gen(), island, 1).unwrap();
                     }
                     // Hold (no release) so the final snapshot is stable.
                     Some((node, held))

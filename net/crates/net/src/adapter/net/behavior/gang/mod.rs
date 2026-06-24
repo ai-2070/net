@@ -49,7 +49,7 @@ mod proptest;
 pub use active::{commit_active, ActiveCommitOutcome, ReplicaCohort};
 pub use claim::{
     activate_announcement, activate_island, release_announcement, release_island,
-    reserve_announcement, single_island_claim, ClaimError, ClaimOutcome,
+    reserve_announcement, single_island_claim, Claimant, ClaimError, ClaimOutcome,
 };
 pub use contention::claim_first_available;
 pub use filter::{
@@ -59,7 +59,9 @@ pub use filter::{
 pub use multi::{acquire_gang, try_acquire_gang, AcquireAttempt, GangClaim, GangOutcome};
 pub use placement::{colocated_island_config, pinned_island_replicas, COLOCATE_WITH_STRICT_KEY};
 pub use quorum::{Epoch, FenceLedger, QuorumWitness, ReplicaSet};
-pub use schedule::{schedule_gang, schedule_single, Scheduled, ScheduleError};
+pub use schedule::{
+    schedule_gang, schedule_single, GangRequest, GangScheduler, Scheduled, ScheduleError,
+};
 
 use crate::adapter::net::behavior::fold::{
     CapabilityFold, CapabilityQuery, Fold, IslandId, IslandQuery, IslandRecord, IslandTopologyFold,
@@ -139,7 +141,7 @@ mod tests {
         tags: Vec<String>,
     ) {
         let membership = CapabilityMembership {
-            class_hash: 0x6770_75, // "gpu" — any stable class id
+            class_hash: 0x67_70_75, // "gpu" — any stable class id
             tags,
             hardware: None,
             state: NodeState::Idle,

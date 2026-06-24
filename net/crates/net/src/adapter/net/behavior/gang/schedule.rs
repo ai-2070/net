@@ -15,12 +15,11 @@
 //! passes the crate's `current_timestamp_micros` and a jittered sleep.
 
 use crate::adapter::net::behavior::fold::{
-    CapabilityFold, Fold, IslandId, IslandTopologyFold, JobId, NodeId, ReservationFold,
+    CapabilityFold, Fold, IslandId, IslandTopologyFold, JobId,
 };
-use crate::adapter::net::identity::EntityKeypair;
 use crate::adapter::net::stream::StreamError;
 
-use super::claim::ClaimError;
+use super::claim::{Claimant, ClaimError};
 use super::contention::claim_first_available;
 use super::multi::{acquire_gang, GangClaim, GangOutcome};
 use super::{match_islands, MatchCriteria};
@@ -70,19 +69,55 @@ impl From<ClaimError> for ScheduleError {
     }
 }
 
+/// A gang-scheduling context: the read folds (capability + topology)
+/// the match pipeline consults, plus the [`Claimant`] that commits
+/// the result. Bundling them turns the otherwise 11–12-arg
+/// schedulers into a `&mut GangScheduler` + a couple of per-call
+/// params.
+pub struct GangScheduler<'a> {
+    pub(super) capability: &'a Fold<CapabilityFold>,
+    pub(super) topology: &'a Fold<IslandTopologyFold>,
+    pub(super) claimant: Claimant<'a>,
+}
+
+impl<'a> GangScheduler<'a> {
+    /// Build a scheduler over the read folds + a claiming actor.
+    pub fn new(
+        capability: &'a Fold<CapabilityFold>,
+        topology: &'a Fold<IslandTopologyFold>,
+        claimant: Claimant<'a>,
+    ) -> Self {
+        Self {
+            capability,
+            topology,
+            claimant,
+        }
+    }
+}
+
+/// A multi-island gang request: what to match + claim, and the
+/// timing. `gang_size` is how many islands the job needs (all-or-
+/// none); `job` stamps the eventual claim.
+pub struct GangRequest<'a> {
+    /// The capability + numeric + selection match (plan §2 steps 1–3).
+    pub criteria: &'a MatchCriteria,
+    /// Job id carried on the gang claim.
+    pub job: JobId,
+    /// Number of islands the gang needs.
+    pub gang_size: usize,
+    /// How long each `Reserved` lasts before foreign takeover.
+    pub reserve_ttl_us: u64,
+    /// Wall-clock-micros deadline for assembling the gang.
+    pub deadline_us: u64,
+}
+
 /// Schedule a **single-island** job: re-match each round, reserve the
 /// first available island, and on no-capacity / contention-loss back
 /// off and retry until `deadline_us`. Returns the claimed island, or
 /// [`ScheduleError::Backpressure`] when nothing could be secured in
 /// time.
-#[allow(clippy::too_many_arguments)]
 pub fn schedule_single(
-    capability_fold: &Fold<CapabilityFold>,
-    topology_fold: &Fold<IslandTopologyFold>,
-    reservations: &Fold<ReservationFold>,
-    keypair: &EntityKeypair,
-    node_id: NodeId,
-    generation: &mut u64,
+    scheduler: &mut GangScheduler,
     criteria: &MatchCriteria,
     reserve_ttl_us: u64,
     deadline_us: u64,
@@ -92,12 +127,23 @@ pub fn schedule_single(
     let mut attempt = 0u32;
     loop {
         // Re-match each round — the world moves between attempts.
-        let islands = match_islands(capability_fold, topology_fold, criteria);
+        let islands = match_islands(scheduler.capability, scheduler.topology, criteria);
         if !islands.is_empty() {
             let until = now_us().saturating_add(reserve_ttl_us);
-            if let Some(won) =
-                claim_first_available(reservations, keypair, node_id, generation, &islands, until)?
-            {
+            // Copy the (Copy) identity fields out before the &mut
+            // borrow of `generation` so the disjoint-field access is
+            // unambiguous.
+            let res = scheduler.claimant.reservations;
+            let kp = scheduler.claimant.keypair;
+            let node = scheduler.claimant.node_id;
+            if let Some(won) = claim_first_available(
+                res,
+                kp,
+                node,
+                &mut scheduler.claimant.generation,
+                &islands,
+                until,
+            )? {
                 return Ok(Scheduled::Single(won));
             }
         }
@@ -110,48 +156,34 @@ pub fn schedule_single(
     }
 }
 
-/// Schedule a **multi-island gang** of `gang_size` islands: match for
-/// candidates, take the top `gang_size` by the selection policy, and
-/// acquire them all-or-none via [`acquire_gang`]. Returns the held
-/// set, or [`ScheduleError::Backpressure`] when fewer than
-/// `gang_size` islands match or the gang couldn't be assembled before
-/// the deadline.
-#[allow(clippy::too_many_arguments)]
+/// Schedule a **multi-island gang**: match for candidates, take the
+/// top `req.gang_size` by the selection policy, and acquire them
+/// all-or-none via [`acquire_gang`]. Returns the held set, or
+/// [`ScheduleError::Backpressure`] when fewer than `gang_size` islands
+/// match or the gang couldn't be assembled before the deadline.
 pub fn schedule_gang(
-    capability_fold: &Fold<CapabilityFold>,
-    topology_fold: &Fold<IslandTopologyFold>,
-    reservations: &Fold<ReservationFold>,
-    keypair: &EntityKeypair,
-    node_id: NodeId,
-    generation: &mut u64,
-    criteria: &MatchCriteria,
-    job: JobId,
-    gang_size: usize,
-    reserve_ttl_us: u64,
-    deadline_us: u64,
+    scheduler: &mut GangScheduler,
+    req: &GangRequest,
     now_us: impl Fn() -> u64 + Copy,
     backoff: impl FnMut(u32),
 ) -> Result<Scheduled, ScheduleError> {
     // Match for candidates and take the top `gang_size` by selection.
-    let mut candidates = match_islands(capability_fold, topology_fold, criteria);
-    if candidates.len() < gang_size {
+    let mut candidates = match_islands(scheduler.capability, scheduler.topology, req.criteria);
+    if candidates.len() < req.gang_size {
         // Not enough islands match right now → saturation.
         return Err(ScheduleError::backpressure());
     }
-    candidates.truncate(gang_size);
+    candidates.truncate(req.gang_size);
 
     let claim = GangClaim {
-        job,
+        job: req.job,
         islands: candidates,
-        deadline_us,
+        deadline_us: req.deadline_us,
     };
     match acquire_gang(
-        reservations,
-        keypair,
-        node_id,
-        generation,
+        &mut scheduler.claimant,
         &claim,
-        reserve_ttl_us,
+        req.reserve_ttl_us,
         now_us,
         backoff,
     )? {
@@ -169,12 +201,13 @@ mod tests {
     use super::*;
     use crate::adapter::net::behavior::fold::{
         CapabilityFilter, CapabilityMembership, CapabilityQuery, EnvelopeMeta, FoldKind, GpuSet,
-        IslandRecord, NodeState, ReservationQuery, SignedAnnouncement,
+        IslandRecord, NodeState, ReservationFold, ReservationQuery, SignedAnnouncement,
     };
     use crate::adapter::net::behavior::gang::{
         single_island_claim, NumericFilter, SelectionPolicy,
     };
     use crate::adapter::net::current_timestamp_micros;
+    use crate::adapter::net::identity::EntityKeypair;
 
     fn new_fold<K: FoldKind>() -> Fold<K> {
         Fold::with_sweep_interval(Duration::ZERO)
@@ -267,10 +300,14 @@ mod tests {
         announce_capability(&caps, &kp, node);
         announce_island(&topo, &kp, node, 0xA0);
 
-        let mut gen = 1;
+        let mut scheduler = GangScheduler::new(&caps, &topo, Claimant::new(&res, &kp, node));
         let got = schedule_single(
-            &caps, &topo, &res, &kp, node, &mut gen, &criteria(), 60_000_000, fresh(),
-            current_timestamp_micros, |_| {},
+            &mut scheduler,
+            &criteria(),
+            60_000_000,
+            fresh(),
+            current_timestamp_micros,
+            |_| {},
         )
         .unwrap();
         assert_eq!(got, Scheduled::Single(0xA0));
@@ -290,10 +327,14 @@ mod tests {
         // Injected clock: starts at 1, deadline 3 → a couple rounds
         // then give up.
         let clock = AtomicU64::new(1);
-        let mut gen = 1;
+        let mut scheduler = GangScheduler::new(&caps, &topo, Claimant::new(&res, &kp, node));
         let err = schedule_single(
-            &caps, &topo, &res, &kp, node, &mut gen, &criteria(), 60_000_000, 3,
-            || clock.fetch_add(1, Ordering::Relaxed), |_| {},
+            &mut scheduler,
+            &criteria(),
+            60_000_000,
+            3,
+            || clock.fetch_add(1, Ordering::Relaxed),
+            |_| {},
         )
         .unwrap_err();
         assert!(
@@ -327,10 +368,14 @@ mod tests {
             }
         };
 
-        let mut gen = 1;
+        let mut scheduler = GangScheduler::new(&caps, &topo, Claimant::new(&res, &kp, node));
         let got = schedule_single(
-            &caps, &topo, &res, &kp, node, &mut gen, &criteria(), 60_000_000, u64::MAX,
-            current_timestamp_micros, backoff,
+            &mut scheduler,
+            &criteria(),
+            60_000_000,
+            u64::MAX,
+            current_timestamp_micros,
+            backoff,
         )
         .unwrap();
         assert_eq!(got, Scheduled::Single(0xA0));
@@ -352,10 +397,19 @@ mod tests {
             announce_island(&topo, &kp, node, id);
         }
 
-        let mut gen = 1;
+        let crit = criteria();
+        let mut scheduler = GangScheduler::new(&caps, &topo, Claimant::new(&res, &kp, node));
         let got = schedule_gang(
-            &caps, &topo, &res, &kp, node, &mut gen, &criteria(), 42, 2, 60_000_000, fresh(),
-            current_timestamp_micros, |_| {},
+            &mut scheduler,
+            &GangRequest {
+                criteria: &crit,
+                job: 42,
+                gang_size: 2,
+                reserve_ttl_us: 60_000_000,
+                deadline_us: fresh(),
+            },
+            current_timestamp_micros,
+            |_| {},
         )
         .unwrap();
         match got {
@@ -374,10 +428,19 @@ mod tests {
         announce_capability(&caps, &kp, node);
         announce_island(&topo, &kp, node, 0xA0); // only ONE island
 
-        let mut gen = 1;
+        let crit = criteria();
+        let mut scheduler = GangScheduler::new(&caps, &topo, Claimant::new(&res, &kp, node));
         let err = schedule_gang(
-            &caps, &topo, &res, &kp, node, &mut gen, &criteria(), 42, 3, 60_000_000, fresh(),
-            current_timestamp_micros, |_| {},
+            &mut scheduler,
+            &GangRequest {
+                criteria: &crit,
+                job: 42,
+                gang_size: 3,
+                reserve_ttl_us: 60_000_000,
+                deadline_us: fresh(),
+            },
+            current_timestamp_micros,
+            |_| {},
         )
         .unwrap_err();
         assert!(matches!(
