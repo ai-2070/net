@@ -49,7 +49,8 @@ pub use claim::{
 };
 pub use contention::claim_first_available;
 pub use filter::{
-    candidate_hosts, numeric_filter, select_islands, NumericFilter, SelectionPolicy,
+    candidate_hosts, numeric_filter, select_islands, select_with_affinity, NumericFilter,
+    SelectionPolicy,
 };
 pub use multi::{acquire_gang, try_acquire_gang, AcquireAttempt, GangClaim, GangOutcome};
 pub use placement::{colocated_island_config, pinned_island_replicas, COLOCATE_WITH_STRICT_KEY};
@@ -57,6 +58,7 @@ pub use quorum::{Epoch, FenceLedger, QuorumWitness, ReplicaSet};
 
 use crate::adapter::net::behavior::fold::{
     CapabilityFold, CapabilityQuery, Fold, IslandId, IslandQuery, IslandRecord, IslandTopologyFold,
+    ModelId,
 };
 
 /// Inputs to the read-only match→select pipeline ([`match_islands`],
@@ -70,6 +72,11 @@ pub struct MatchCriteria {
     pub numeric: NumericFilter,
     /// Claim-order policy — step 3.
     pub selection: SelectionPolicy,
+    /// Soft warm-model affinity (step 3): islands with this model
+    /// already resident rank ahead of cold ones, within the selection
+    /// policy. `None` = no affinity. Distinct from
+    /// [`NumericFilter::require_warm_model`], which is a hard filter.
+    pub prefer_warm_model: Option<ModelId>,
 }
 
 /// Run the read-only match→select pipeline: coarse capability match
@@ -99,8 +106,9 @@ pub fn match_islands(
         .map(|(_, record)| record)
         .filter(|record| hosts.contains(&record.host) && criteria.numeric.accepts(record))
         .collect();
-    // [3] selection ordering → claim order.
-    select_islands(candidates, criteria.selection)
+    // [3] selection ordering (with soft warm-model affinity) → claim
+    // order.
+    select_with_affinity(candidates, criteria.selection, criteria.prefer_warm_model)
 }
 
 #[cfg(test)]
@@ -221,6 +229,7 @@ mod tests {
                 ..Default::default()
             },
             selection: SelectionPolicy::LeastLoaded,
+            prefer_warm_model: None,
         };
 
         let order = match_islands(&caps, &topo, &criteria);
@@ -246,6 +255,7 @@ mod tests {
             }),
             numeric: NumericFilter::default(),
             selection: SelectionPolicy::LeastLoaded,
+            prefer_warm_model: None,
         };
         assert!(match_islands(&caps, &topo, &criteria).is_empty());
     }
@@ -273,6 +283,7 @@ mod tests {
                 ..Default::default()
             },
             selection: SelectionPolicy::LeastLoaded,
+            prefer_warm_model: None,
         };
 
         let order = match_islands(&caps, &topo, &criteria);

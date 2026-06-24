@@ -74,16 +74,23 @@ pub fn numeric_filter(
     records.into_iter().filter(|r| filter.accepts(r)).collect()
 }
 
-/// Island selection ordering (plan §2 step 3). Phase A ships two
-/// deterministic policies; the richer pack/spread/warm-affinity/
-/// load-band policy is Phase E.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Island selection ordering (plan §2 step 3 / Phase E): a pure
+/// ranking over the live [`IslandTopology`] axes.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum SelectionPolicy {
-    /// Least-loaded island first (lowest `load`), `IslandId`
-    /// ascending as a deterministic tie-break. The default — packs
-    /// onto the most-available island first.
+    /// **Spread** — least-loaded island first (lowest `load`),
+    /// `IslandId` ascending as a deterministic tie-break. The default:
+    /// distributes work across islands.
     #[default]
     LeastLoaded,
+    /// **Pack** — most-loaded (but still filter-passing) island first.
+    /// Consolidates jobs onto busy-but-available islands so whole
+    /// islands stay idle and claimable by a future large gang.
+    Pack,
+    /// **Load-band** — island whose load is closest to `target`
+    /// first. Avoids both stone-cold islands (cold-start cost) and
+    /// near-saturated ones (tail-latency cliff).
+    LoadBand(f32),
     /// `IslandId` ascending, ignoring the live axes. This is the
     /// global lock-ordering the multi-island ordered-acquire path
     /// (Phase C) needs: acquiring islands in one total order is what
@@ -91,19 +98,54 @@ pub enum SelectionPolicy {
     LowestId,
 }
 
+/// Total order over two islands under `policy`, ties broken on
+/// ascending `IslandId` so selection is deterministic.
+fn policy_cmp(a: &IslandRecord, b: &IslandRecord, policy: SelectionPolicy) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let primary = match policy {
+        SelectionPolicy::LeastLoaded => {
+            a.load.partial_cmp(&b.load).unwrap_or(Ordering::Equal)
+        }
+        SelectionPolicy::Pack => b.load.partial_cmp(&a.load).unwrap_or(Ordering::Equal),
+        SelectionPolicy::LoadBand(target) => {
+            let da = (a.load - target).abs();
+            let db = (b.load - target).abs();
+            da.partial_cmp(&db).unwrap_or(Ordering::Equal)
+        }
+        SelectionPolicy::LowestId => Ordering::Equal,
+    };
+    primary.then(a.id.cmp(&b.id))
+}
+
 /// Step 3: order `records` per `policy` and project to claim-order
 /// island ids. Pure.
 pub fn select_islands(mut records: Vec<IslandRecord>, policy: SelectionPolicy) -> Vec<IslandId> {
-    match policy {
-        SelectionPolicy::LeastLoaded => records.sort_by(|a, b| {
-            a.load
-                .partial_cmp(&b.load)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.id.cmp(&b.id))
-        }),
-        SelectionPolicy::LowestId => records.sort_by_key(|r| r.id),
-    }
+    records.sort_by(|a, b| policy_cmp(a, b, policy));
     records.into_iter().map(|r| r.id).collect()
+}
+
+/// Step 3 with soft **warm-model affinity**: islands that already
+/// have `prefer_warm_model` resident rank ahead of those that don't
+/// (skipping cold-load), and within each group `policy` orders them.
+/// `None` reduces to plain [`select_islands`]. Pure.
+///
+/// Affinity is a *preference*, not the hard `require_warm_model`
+/// filter — a job that benefits from a warm model but can tolerate a
+/// cold start still considers cold islands, just after the warm ones.
+pub fn select_with_affinity(
+    records: Vec<IslandRecord>,
+    policy: SelectionPolicy,
+    prefer_warm_model: Option<ModelId>,
+) -> Vec<IslandId> {
+    let Some(model) = prefer_warm_model else {
+        return select_islands(records, policy);
+    };
+    let (warm, cold): (Vec<IslandRecord>, Vec<IslandRecord>) = records
+        .into_iter()
+        .partition(|r| r.warm_models.contains(&model));
+    let mut ordered = select_islands(warm, policy);
+    ordered.extend(select_islands(cold, policy));
+    ordered
 }
 
 #[cfg(test)]
@@ -220,5 +262,63 @@ mod tests {
             SelectionPolicy::LowestId,
         );
         assert_eq!(order, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn pack_orders_most_loaded_first() {
+        // Consolidate: busiest filter-passing island first, leaving
+        // whole islands idle for future large gangs.
+        let order = select_islands(
+            vec![
+                rec(1, 0xAA, 4, 0.2, 0),
+                rec(2, 0xAA, 4, 0.8, 0),
+                rec(3, 0xAA, 4, 0.5, 0),
+            ],
+            SelectionPolicy::Pack,
+        );
+        assert_eq!(order, vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn load_band_orders_by_distance_to_target() {
+        // Target 0.5: closest-to-half-loaded first.
+        let order = select_islands(
+            vec![
+                rec(1, 0xAA, 4, 0.05, 0), // dist 0.45
+                rec(2, 0xAA, 4, 0.55, 0), // dist 0.05
+                rec(3, 0xAA, 4, 0.95, 0), // dist 0.45 (ties id 1 → id breaks)
+                rec(4, 0xAA, 4, 0.40, 0), // dist 0.10
+            ],
+            SelectionPolicy::LoadBand(0.5),
+        );
+        assert_eq!(order, vec![2, 4, 1, 3]);
+    }
+
+    #[test]
+    fn affinity_ranks_warm_islands_ahead_within_policy() {
+        let mut warm_a = rec(1, 0xAA, 4, 0.9, 0); // warm, high load
+        warm_a.warm_models = vec![0xBEEF];
+        let cold_b = rec(2, 0xAA, 4, 0.1, 0); // cold, low load
+        let mut warm_c = rec(3, 0xAA, 4, 0.3, 0); // warm, mid load
+        warm_c.warm_models = vec![0xBEEF, 0xA1];
+
+        // Spread policy: within the warm group least-loaded first
+        // (3 then 1), then the cold group (2). Warm beats cold even
+        // though cold island 2 is the least loaded overall.
+        let order = select_with_affinity(
+            vec![warm_a, cold_b, warm_c],
+            SelectionPolicy::LeastLoaded,
+            Some(0xBEEF),
+        );
+        assert_eq!(order, vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn affinity_none_is_plain_selection() {
+        let recs = vec![rec(2, 0xAA, 4, 0.5, 0), rec(1, 0xAA, 4, 0.1, 0)];
+        assert_eq!(
+            select_with_affinity(recs.clone(), SelectionPolicy::LeastLoaded, None),
+            select_islands(recs, SelectionPolicy::LeastLoaded),
+        );
     }
 }
