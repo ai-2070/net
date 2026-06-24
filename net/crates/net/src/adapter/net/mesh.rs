@@ -1940,6 +1940,15 @@ pub struct MeshNode {
     /// announcements flow through the same `SUBPROTOCOL_FOLD`
     /// dispatch as capability announcements.
     reservation_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::ReservationFold>>,
+    /// Island-topology fold (Thunderdome gang-claim scheduler).
+    /// Folds each host's self-announced GPU-island record — gpu set,
+    /// host, warm models, and the live load / p50-latency axes —
+    /// keyed by `IslandId`. Inbound island announcements flow through
+    /// the same `SUBPROTOCOL_FOLD` dispatch as capability +
+    /// reservation announcements; the gang scheduler reads it
+    /// alongside the capability fold for the numeric-filter step. See
+    /// `docs/plans/MESH_SCHEDULER_GANG_CLAIM_PLAN.md`.
+    island_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::IslandTopologyFold>>,
     /// Dedup cache for multi-hop capability announcements. Keyed by
     /// `(origin_node_id, version)` — the same discriminator
     /// `CapabilityIndex` uses to skip stale announcements. Entries
@@ -2353,9 +2362,13 @@ impl MeshNode {
         let reservation_fold: Arc<
             super::behavior::fold::Fold<super::behavior::fold::ReservationFold>,
         > = Arc::new(super::behavior::fold::Fold::new());
+        let island_fold: Arc<
+            super::behavior::fold::Fold<super::behavior::fold::IslandTopologyFold>,
+        > = Arc::new(super::behavior::fold::Fold::new());
         let fold_registry = Arc::new(super::behavior::fold::FoldRegistry::new());
         fold_registry.register(capability_fold.clone());
         fold_registry.register(reservation_fold.clone());
+        fold_registry.register(island_fold.clone());
         let fold_router: Arc<
             parking_lot::RwLock<Option<Arc<dyn super::behavior::fold::FoldChannelRouter>>>,
         > = Arc::new(parking_lot::RwLock::new(Some(
@@ -2541,6 +2554,7 @@ impl MeshNode {
             #[cfg(feature = "dataforts")]
             capability_set_cache,
             reservation_fold,
+            island_fold,
             seen_announcements: Arc::new(DashMap::new()),
             last_announce_at: Arc::new(parking_lot::Mutex::new(None)),
             local_announcement: Arc::new(ArcSwapOption::empty()),
@@ -9224,6 +9238,27 @@ impl MeshNode {
         .await
     }
 
+    /// Publish this node's [`super::behavior::fold::IslandTopologyFold`]
+    /// record for one of its GPU islands — the host self-announcing
+    /// its gpu set, warm models, and the live load / p50-latency
+    /// axes. Re-publish each heartbeat to refresh the live axes;
+    /// generation is per-island (sharded by island id). Peers fold
+    /// these into the Thunderdome gang scheduler's numeric-filter
+    /// view.
+    ///
+    /// `record.host` is forced to this node's id so the announcement
+    /// passes the fold's ownership gate (a node may only announce
+    /// islands it hosts).
+    pub async fn publish_island_topology(
+        &self,
+        mut record: super::behavior::fold::IslandRecord,
+    ) -> Result<usize, AdapterError> {
+        record.host = self.node_id;
+        let island_id = record.id;
+        self.publish_fold::<super::behavior::fold::IslandTopologyFold>(island_id, 0, record)
+            .await
+    }
+
     /// Send a raw subprotocol message to a peer.
     ///
     /// The payload is sent as a single event frame with the specified
@@ -11028,6 +11063,16 @@ impl MeshNode {
         &self,
     ) -> &Arc<super::behavior::fold::Fold<super::behavior::fold::ReservationFold>> {
         &self.reservation_fold
+    }
+
+    /// Shared reference to the island-topology fold (Thunderdome
+    /// gang-claim scheduler). Always present; the scheduler's
+    /// match→claim pipeline reads it alongside
+    /// [`Self::capability_fold`] for the live numeric-filter step.
+    pub fn island_fold(
+        &self,
+    ) -> &Arc<super::behavior::fold::Fold<super::behavior::fold::IslandTopologyFold>> {
+        &self.island_fold
     }
 
     /// Test-only helper — translate a legacy
