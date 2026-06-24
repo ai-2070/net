@@ -77,6 +77,34 @@ CP on `Active` only (AP everywhere else); the epoch rides the existing
 - **Escrow (§7)** and **sub-island fractional claims** remain deferred exactly as
   the plan states.
 
+### Post-audit corrections (see `MESH_SCHEDULER_PLAN_CORRECTIONS.md`)
+
+The branch audit confirmed the two gang-layer findings were benign; the resolutions
+were doc + DST:
+
+- **Selection policy (§7) is implemented** — `filter.rs` ships `SelectionPolicy`:
+  `LeastLoaded` (spread, the default), `Pack`, `LoadBand(target)`, `LowestId`, with a
+  pure `policy_cmp`; warm-model affinity layers on top of any of them via
+  `select_with_affinity` (soft) — distinct from `NumericFilter::require_warm_model`
+  (hard). The policy is no longer "undetermined."
+- **Option 4b stays deferred behind a *measured* condition, not a flag.** Premature
+  flag infrastructure is the wrong direction for a substrate. Implement two-phase
+  reserve→commit (4b) only when ordered-acquire (4a) shows pathological backoff at
+  measured island counts — concretely, **if gang reject rates exceed ~30 % at 8+
+  islands under sustained contention**. Until that signal, 4a is the whole story and
+  no 4b seam exists in the code (the plan and code now agree).
+- **DST harness now includes partition-during-claim.** `tests/loom_models.rs` gained
+  a loom model for the quorum-`Active` fence: two concurrent leaders at distinct
+  epochs race the commit, and under every interleaving at most one holds `Active`,
+  the higher epoch always wins (a stale ex-leader never strands the island), and the
+  epoch is monotonic. This complements `active.rs`'s deterministic brutal test #3.
+- **§8 structural claims verified by reading** (the non-hardware part of the gating
+  checklist): the epoch rides the `generation` with no parallel Raft term
+  (`active.rs`), `ColocationStrict` pins the reservation-chain replicas to the §6
+  quorum set (`placement.rs`), and no `step.rs` path treats a match as a hold. The
+  remaining gating — **partition / TTL-takeover / fence behavior on real multi-node
+  hardware** — is verification that needs a fleet, not code (Phase 0).
+
 ## Frame
 
 `PlacementFilter` and the mesh scheduler answer *"where should this daemon live, and is

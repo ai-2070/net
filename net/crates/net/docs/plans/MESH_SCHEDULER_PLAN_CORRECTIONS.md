@@ -6,12 +6,33 @@
 
 ## Status
 
+**Resolved on `mesh-scheduler`** — see [Resolution](#resolution--landed-on-mesh-scheduler).
+Every implementation-level gap (#2, #4, #5, cross-cutting) is fixed with tests; the
+design-level items (#1, #3, #6, #7) are decided and documented; the §8 *structural* claims
+are verified by reading and the partition-during-claim DST scenario is now a loom model.
+What remains genuinely open is the §8 **multi-node hardware** gating (Phase 0), which is
+not a code task.
+
 Six gaps confirmed by reading the branch. Two are design-level (need explicit decisions
 documented in the plans), four are implementation-level (need code changes). One concern
 from the review (selection policy) is actually well-implemented and only needs the plan to
 acknowledge it.
 
 Ordered by load-bearing impact, not by file location.
+
+## Resolution — landed on `mesh-scheduler`
+
+| # | Concern | Disposition | Commit(s) |
+|---|---|---|---|
+| 1 | `Blocked` is dead state | **Activated** (Option B, per the reviewer's "decide as an output of #2"): `block_on_failure` parks the parent `Blocked` on a shard failure — *parked on external state, recoverable*, distinct from `Waiting` (self-retrying claim reject). | `039f3de` |
+| 2 | Shard failure hangs the gang | **Fixed**: `Trigger::AfterTerminal` (fires on Done *or* Failed), `ShardGroup::failed`/`done_count`, `JoinPolicy {AllOrNothing(default), BestEffort, Threshold}` + `JoinStatus`, `try_join`→`Join::Failed`, `propagate_failure` (cancel pending + fail parent). | `b8c00ea`, `039f3de` |
+| 3 | Replay ≠ user-facing rewind | **Documented + `StepKind`**: advisory `Pure/Idempotent/SideEffecting` marker (`may_reexecute`); rewind reconstructs metadata only — side effects aren't undone; the one substrate-compensable case (a held claim) *is* released. | `dea3ec3` |
+| 4 | Delete is shallow | **Fixed**: `DISPATCH_TASK_LINKED` lineage + cascading delete over the folded subtree (deterministic) + `TriggerEngine::on_delete` pruning; `fan_out`/`try_join` link shards+reduce to the parent. | `9a6c02e` |
+| 5 | Tick-trigger O(N); trigger scope | **Fixed**: `BTreeMap` tick index (drains `tick<=now` prefix, O(due+log T)) + complexity rustdoc on every method; `AfterTerminal` added; the speculative trigger types are dropped from the plan (below). | `3889a47`, `b8c00ea` |
+| 6 | Option 4b flag absent | **Plan-only (Option A)**: 4b stays deferred behind a *measured* trigger condition (below), not a premature flag. | docs |
+| 7 | Selection policy undersold | **Plan-only**: plan §7 now names the four implemented policies + affinity. | docs |
+| Cross | Abnormal terminal states must release claims | **Fixed**: the seam is now bidirectional — `ClaimPipeline::release` + `release_step`; an end-to-end test acquires `Active` then returns the island to `Free`. | `dea3ec3` |
+| 8 | Hard layer unverified | **Structural claims verified by reading** (epoch *is* the generation — no Raft term; `ColocationStrict` pins replicas to the quorum set; `requires_capability` is never a hold) **+ partition-during-claim loom model added**. The full **multi-node hardware** gating remains the one open item — not a code task. | `5dd8872` |
 
 > **Reviewer addendum (independently verified against `mesh-scheduler`).** Items 1, 2, 4,
 > 5, 6, 7 were re-checked against the branch and all confirm — file paths, symbol names,

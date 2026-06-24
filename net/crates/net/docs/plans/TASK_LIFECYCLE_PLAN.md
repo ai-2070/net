@@ -65,6 +65,41 @@ Thunderdome's, not forbidden here; and `requires_capability` is a *filter*,
 claimed only via the seam. Semantics emerge from primitives — leases, cursors,
 triggers, shard groups — with no DAG DSL or controller loop.
 
+### Post-audit corrections (see `MESH_SCHEDULER_PLAN_CORRECTIONS.md`)
+
+A branch audit found gaps between this plan and the shipped code; the resolutions
+hardened the contracts below. The corrections doc carries the per-item table.
+
+- **Failure propagation (was: a failed shard hung the reduce forever).** A shard's
+  fan-in is now failure-aware: `JoinPolicy` is `AllOrNothing` by **default** (any
+  `Failed` shard fails the join), with `BestEffort` and `Threshold(n)` as escape
+  hatches. `Trigger::AfterTerminal` fires on `Done` *or* `Failed` so a failed
+  predecessor can't strand its dependents. `propagate_failure` cancels the pending
+  siblings and fails the parent; `block_on_failure` is the recoverable variant.
+- **`Blocked` has real semantics now.** It means *parked on external state that the
+  task can't change itself* (a failed prerequisite awaiting operator/retry) — as
+  opposed to `Waiting` (a self-retrying Thunderdome claim reject). Its one call site
+  is `block_on_failure`.
+- **Delete cascades.** Deleting a task reclaims its whole linked subtree (shards,
+  spawned children) in one folded event and prunes triggers waiting on it — an
+  orphaned shard can no longer keep running (and keep holding a claim). Content-
+  addressed `results/*.ref` blobs survive (they're not owned by the task).
+- **The seam is bidirectional.** `ClaimPipeline` gained `release`; every abnormal
+  exit of a step holding an `Active` claim (failed / cancelled / deleted / rewound-
+  past) MUST `release_step` it. An un-released claim is a stranded GPU — the one
+  case the substrate *can* compensate (a held claim is its own to revoke), unlike
+  external side effects.
+- **Rewind is a metadata contract.** Reopening/replaying reconstructs lifecycle
+  metadata deterministically; it does **not** undo side effects from previously-
+  executed steps. The advisory `StepKind { Pure, Idempotent, SideEffecting }` lets a
+  worker refuse to silently re-run a completed side-effecting step on rewind. The
+  one substrate-compensable rewind case — a held Thunderdome claim — is released.
+- **Trigger scope.** The implemented set is `AfterTask`, `AfterTerminal`, `IfResult`,
+  `AtTick` (tick triggers indexed in a `BTreeMap`, O(due+log T) per tick). The
+  speculative `BlobReplicated` / `CapabilityAvailable` / node-join-leave triggers the
+  earlier draft listed are **not** implemented and are dropped from scope until a
+  concrete user needs them — they were doc-implementation skew.
+
 ## Frame
 
 A task is a RedEX directory with a single-writer chain. Workers advance an explicit cursor;
