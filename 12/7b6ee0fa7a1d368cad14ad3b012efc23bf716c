@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/behavior/fold/mod.rs
+  s_b93d1d2fee6b2e::t_69a22193f385f1 51-53
+  s_b93d1d2fee6b2e::t_164738ad8d0ead 28
+net/crates/net/src/adapter/net/behavior/fold/island.rs
+  s_b93d1d2fee6b2e::t_ea868270916559 1-277,279-448
+  s_b93d1d2fee6b2e::t_e06e841097ad2d 278
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.11",
+  "base_commit_sha": "127b6ee0fa7a1d368cad14ad3b012efc23bf716c",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
