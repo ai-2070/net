@@ -1,0 +1,40 @@
+net/crates/net/src/adapter/net/cortex/workflow/adapter.rs
+  s_b93d1d2fee6b2e::t_348bb71fd94154 27-28,33-34
+  s_b93d1d2fee6b2e::t_9b9ea65b4252f8 154-160,165-168
+  s_b93d1d2fee6b2e::t_496ee0a39845ed 196-202
+  s_b93d1d2fee6b2e::t_5f009413baf7ba 169,365-416
+net/crates/net/src/adapter/net/cortex/workflow/trigger.rs
+  s_b93d1d2fee6b2e::t_bdcfc3bc81a594 197-205
+  s_b93d1d2fee6b2e::t_3e2ba92d0eaf5e 389-410
+net/crates/net/src/adapter/net/cortex/workflow/dispatch.rs
+  s_b93d1d2fee6b2e::t_28957f4f403b80 25-28
+  s_b93d1d2fee6b2e::t_9d8f3c2f1a5d8b 42
+net/crates/net/src/adapter/net/cortex/workflow/fold.rs
+  s_b93d1d2fee6b2e::t_e209a648f87156 14,18-19
+  s_b93d1d2fee6b2e::t_556b16bbcdd1f9 93-110,119-128
+net/crates/net/src/adapter/net/cortex/workflow/types.rs
+  s_b93d1d2fee6b2e::t_676b29d0431f18 116-123
+net/crates/net/src/adapter/net/cortex/workflow/shard.rs
+  s_b93d1d2fee6b2e::t_4af107348b25b6 586-611
+  s_b93d1d2fee6b2e::t_81a5ce2f434b5a 289-297
+  s_b93d1d2fee6b2e::t_1a05447f10f236 231-235,240-242
+net/crates/net/src/adapter/net/cortex/workflow/state.rs
+  s_b93d1d2fee6b2e::t_689d52f2726e39 50-56
+  s_b93d1d2fee6b2e::t_b13d928ae2e582 110-143
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.11",
+  "base_commit_sha": "9a6c02e0ff5b2e78ed051d308083e9bee5e473d8",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
