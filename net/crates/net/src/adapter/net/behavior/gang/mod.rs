@@ -41,6 +41,7 @@ pub mod filter;
 pub mod multi;
 pub mod placement;
 pub mod quorum;
+pub mod schedule;
 
 pub use active::{commit_active, ActiveCommitOutcome, ReplicaCohort};
 pub use claim::{
@@ -55,6 +56,7 @@ pub use filter::{
 pub use multi::{acquire_gang, try_acquire_gang, AcquireAttempt, GangClaim, GangOutcome};
 pub use placement::{colocated_island_config, pinned_island_replicas, COLOCATE_WITH_STRICT_KEY};
 pub use quorum::{Epoch, FenceLedger, QuorumWitness, ReplicaSet};
+pub use schedule::{schedule_gang, schedule_single, Scheduled, ScheduleError};
 
 use crate::adapter::net::behavior::fold::{
     CapabilityFold, CapabilityQuery, Fold, IslandId, IslandQuery, IslandRecord, IslandTopologyFold,
