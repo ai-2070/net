@@ -30,6 +30,7 @@ pub mod dataforts_capabilities;
 pub mod deck;
 pub mod diff;
 pub mod fold;
+pub mod gang;
 pub mod group;
 pub mod lifecycle;
 pub mod loadbalance;
