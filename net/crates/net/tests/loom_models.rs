@@ -701,3 +701,103 @@ fn replication_metrics_same_counter_three_way_contention() {
         assert_eq!(leader_changes, 3, "no lost updates under contention");
     });
 }
+
+// ─────────────────────────────────────────────────────────────
+// Model N: Gang ordered-acquire (Thunderdome §4 / Phase C)
+//
+// Mirrors `src/adapter/net/behavior/gang/multi.rs::try_acquire_gang`
+// — a gang acquires its islands in ASCENDING IslandId order
+// (the global lock-ordering), and on the first reject releases
+// everything it already grabbed. The production path keys on a
+// `ReservationFold` CAS (DashMap-backed, so loom can't drive it
+// directly); this models the *pattern* with loom atomics: each
+// island is an `AtomicU64` holder (0 = free), the claim is a
+// `compare_exchange(0, me)`, the release a `store(0)`.
+//
+// Invariants under EVERY interleaving:
+//   - **No deadlock.** Both gangs always terminate (a gang never
+//     blocks while holding — it releases on reject). Because both
+//     acquire in ascending order, a hold-and-wait cycle can't form.
+//   - **All-or-none.** A gang that returns `true` holds its FULL
+//     set; one that returns `false` released its partial hold and
+//     holds NONE.
+//   - **Single-winner on the contended island.** The two gangs
+//     overlap on the highest island; exactly one ends up holding
+//     it (and therefore exactly one wins overall).
+//
+// The two gangs overlap on island 2 — the LAST one each acquires —
+// so the loser must release a lower island it already grabbed,
+// exercising the release-the-partial-hold path that all-or-none
+// hinges on.
+// ─────────────────────────────────────────────────────────────
+
+/// `compare_exchange(0 → me)` claim of one island. `Acquire` on
+/// success so the holder's subsequent reads happen-after the prior
+/// holder's `Release` on drop — mirrors the fold's per-key CAS.
+fn island_claim(island: &AtomicU64, me: u64) -> bool {
+    island
+        .compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
+}
+
+/// Release a held island back to free.
+fn island_release(island: &AtomicU64) {
+    island.store(0, Ordering::Release);
+}
+
+/// Ordered-acquire one gang's `want` indices (MUST be ascending).
+/// Returns `true` iff the full set was claimed; on the first reject
+/// it releases everything grabbed so far and returns `false`.
+fn ordered_acquire(islands: &[AtomicU64; 3], want: &[usize], me: u64) -> bool {
+    let mut held: Vec<usize> = Vec::new();
+    for &idx in want {
+        if island_claim(&islands[idx], me) {
+            held.push(idx);
+        } else {
+            for &h in held.iter().rev() {
+                island_release(&islands[h]);
+            }
+            return false;
+        }
+    }
+    true
+}
+
+#[test]
+fn gang_ordered_acquire_is_deadlock_free_and_all_or_none() {
+    loom::model(|| {
+        let islands = Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]);
+
+        // Gang 1 (id 1) wants {0, 2}; gang 2 (id 2) wants {1, 2}.
+        // Overlap is island 2, acquired LAST by both — so the loser
+        // must release its lower island.
+        let g1 = {
+            let isl = islands.clone();
+            thread::spawn(move || ordered_acquire(&isl, &[0, 2], 1))
+        };
+        let g2 = {
+            let isl = islands.clone();
+            thread::spawn(move || ordered_acquire(&isl, &[1, 2], 2))
+        };
+
+        // No deadlock: both joins return under every interleaving.
+        let r1 = g1.join().unwrap();
+        let r2 = g2.join().unwrap();
+
+        let held = |idx: usize| islands[idx].load(Ordering::Relaxed);
+
+        // Exactly one gang wins (they contend on island 2).
+        assert!(r1 != r2, "exactly one gang wins the contended island");
+
+        // All-or-none: winner holds its FULL set; loser holds NONE.
+        if r1 {
+            assert_eq!(held(0), 1, "gang1 won → holds island 0");
+            assert_eq!(held(2), 1, "gang1 won → holds island 2");
+            assert_eq!(held(1), 0, "gang2 lost → released island 1");
+        } else {
+            assert_eq!(held(1), 2, "gang2 won → holds island 1");
+            assert_eq!(held(2), 2, "gang2 won → holds island 2");
+            assert_eq!(held(0), 0, "gang1 lost → released island 0");
+        }
+    });
+}
