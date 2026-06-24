@@ -1,0 +1,28 @@
+net/crates/net/src/adapter/net/cortex/workflow/step.rs
+  s_b93d1d2fee6b2e::t_6a313dd77b892e 125-141,151,160-163,165,172
+  s_b93d1d2fee6b2e::t_c711b7be03f21d 409-416
+  s_b93d1d2fee6b2e::t_33ea0adacea8ea 1-124,150,152-159,164,166-171,173-194,196-204,213-225,227-408,417-451,459-494,502-520
+  s_b93d1d2fee6b2e::t_6a284919e18021 452-458
+  s_b93d1d2fee6b2e::t_0c16a04794f133 142-149
+  s_b93d1d2fee6b2e::t_fcaea1a22580ce 195,205-212,226
+  s_b93d1d2fee6b2e::t_1c277fe6d31eee 495-501
+net/crates/net/src/adapter/net/cortex/workflow/mod.rs
+  s_b93d1d2fee6b2e::t_7e4aa12a8afee5 41
+  s_b93d1d2fee6b2e::t_344e4469479ed8 27,39-40,42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.11",
+  "base_commit_sha": "2686f0299dc6e6e5f0aabc16409c395f0f774b69",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
