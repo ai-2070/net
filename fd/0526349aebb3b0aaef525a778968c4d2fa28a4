@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/behavior/gang/schedule.rs
+  s_b93d1d2fee6b2e::t_0942bc1658849d 15
+net/crates/net/src/adapter/net/behavior/gang/multi.rs
+  s_b93d1d2fee6b2e::t_c821ad34004021 123
+  s_b93d1d2fee6b2e::t_d1fedd5a99017d 119-121
+net/crates/net/src/adapter/net/behavior/gang/filter.rs
+  s_b93d1d2fee6b2e::t_4e60fd3816dea4 78
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.11",
+  "base_commit_sha": "fd0526349aebb3b0aaef525a778968c4d2fa28a4",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
