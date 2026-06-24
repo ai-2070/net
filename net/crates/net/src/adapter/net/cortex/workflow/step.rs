@@ -21,8 +21,8 @@ use crate::adapter::net::behavior::fold::{
     CapabilityFold, Fold, IslandId, IslandTopologyFold, JobId, NodeId, ReservationFold,
 };
 use crate::adapter::net::behavior::gang::{
-    commit_active, match_islands, single_island_claim, ActiveCommitOutcome, ClaimError,
-    ClaimOutcome, Claimant, Epoch, MatchCriteria, ReplicaCohort, ReplicaSet,
+    commit_active, match_islands, release_island, single_island_claim, ActiveCommitOutcome,
+    ClaimError, ClaimOutcome, Claimant, Epoch, MatchCriteria, ReplicaCohort, ReplicaSet,
 };
 use crate::adapter::net::current_timestamp_micros;
 use crate::adapter::net::identity::EntityKeypair;
@@ -65,6 +65,13 @@ pub enum ClaimResult {
 /// [`CapabilityRequirement`] to this and reacts to the
 /// [`ClaimResult`]. Implementors encapsulate the *entire* contact with
 /// resource arbitration; the lifecycle depends only on this trait.
+///
+/// The seam is **bidirectional**: `claim` acquires, `release` returns
+/// the island to the pool. Every abnormal exit of a step that holds an
+/// `Active` claim (failed, cancelled, deleted, rewound-past) must
+/// `release` it — an un-released claim is a stranded GPU (the audit's
+/// cross-cutting rule). Acquire without release is the one-directional
+/// bug the matching `release` closes.
 pub trait ClaimPipeline {
     /// Error type for a claim attempt (sign/apply-level failures,
     /// distinct from a clean [`ClaimResult::Rejected`]).
@@ -73,6 +80,13 @@ pub trait ClaimPipeline {
     /// Hand `req` to Thunderdome's match→claim pipeline and report
     /// whether an `Active` handle is now held.
     fn claim(&mut self, req: &CapabilityRequirement) -> Result<ClaimResult, Self::Error>;
+
+    /// Release a previously-held [`ActiveClaim`], returning its island
+    /// to the pool. The substrate *can* compensate here — unlike an
+    /// external side effect, a held claim is its own to revoke. Should
+    /// be idempotent at the resource layer (releasing an island the
+    /// caller no longer holds is a no-op).
+    fn release(&mut self, claim: &ActiveClaim) -> Result<(), Self::Error>;
 }
 
 /// What [`drive_capability_step`] did with the task.
@@ -242,6 +256,70 @@ impl ClaimPipeline for GangClaimPipeline<'_> {
             }
         }
     }
+
+    fn release(&mut self, claim: &ActiveClaim) -> Result<(), ClaimError> {
+        // CAS the island back to Free — the matching release for the
+        // Active commit. Signed at the next generation so it can't be
+        // reordered behind the claim. A no-op at the fold if we no
+        // longer hold it (idempotent).
+        let gen = self.next_gen();
+        release_island(
+            self.ctx.reservations,
+            self.ctx.keypair,
+            self.ctx.node_id,
+            gen,
+            claim.island,
+        )?;
+        Ok(())
+    }
+}
+
+/// Release a step's held `Active` claim — the matching *release* for
+/// [`drive_capability_step`]'s acquire. The worker MUST call this on
+/// every abnormal exit of a step that holds an island (`Failed`,
+/// cancelled, deleted, rewound past the acquiring step): the island is
+/// the substrate's to revoke, and an un-released claim is a stranded
+/// GPU (the audit's cross-cutting rule). Idempotent at the Thunderdome
+/// layer. Like [`drive_capability_step`] it touches no fold directly —
+/// the only path back to the resource is through `pipeline`.
+pub fn release_step<P: ClaimPipeline>(
+    pipeline: &mut P,
+    claim: &ActiveClaim,
+) -> Result<(), P::Error> {
+    pipeline.release(claim)
+}
+
+/// Advisory classification of a step's side-effect profile (corrections
+/// #3). The substrate can't *verify* side-effect freedom, so this is
+/// convention the worker respects, not enforcement: a `SideEffecting`
+/// step that already completed should not be silently re-run on rewind
+/// without a registered compensating step, whereas `Pure` / `Idempotent`
+/// steps are safe to re-execute. Rewind reconstructs lifecycle metadata
+/// deterministically; it does **not** undo external side effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StepKind {
+    /// No external side effects — safe to re-execute freely.
+    #[default]
+    Pure,
+    /// Has side effects but re-execution leaves the world unchanged
+    /// (e.g. an idempotent PUT) — safe to re-execute.
+    Idempotent,
+    /// Produces non-idempotent external effects (an email, a payment, a
+    /// non-idempotent API call). Re-execution is unsafe.
+    SideEffecting,
+}
+
+impl StepKind {
+    /// May this step be safely re-executed (e.g. on a rewind/retry)
+    /// given whether it `already_completed`? `Pure` / `Idempotent` are
+    /// always safe; a completed `SideEffecting` step is not (the worker
+    /// should require a compensating step instead). Advisory.
+    pub fn may_reexecute(self, already_completed: bool) -> bool {
+        match self {
+            StepKind::Pure | StepKind::Idempotent => true,
+            StepKind::SideEffecting => !already_completed,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -264,12 +342,17 @@ mod tests {
     struct ForcedPipeline {
         result: ClaimResult,
         calls: u32,
+        releases: u32,
     }
     impl ClaimPipeline for ForcedPipeline {
         type Error = std::convert::Infallible;
         fn claim(&mut self, _req: &CapabilityRequirement) -> Result<ClaimResult, Self::Error> {
             self.calls += 1;
             Ok(self.result)
+        }
+        fn release(&mut self, _claim: &ActiveClaim) -> Result<(), Self::Error> {
+            self.releases += 1;
+            Ok(())
         }
     }
 
@@ -305,6 +388,7 @@ mod tests {
         let mut pipeline = ForcedPipeline {
             result: ClaimResult::Rejected,
             calls: 0,
+            releases: 0,
         };
         let gate = drive_capability_step(&wf, &mut pipeline, 1, &requirement()).unwrap();
         let seq = wf.wait(1).unwrap(); // flush + read
@@ -325,6 +409,7 @@ mod tests {
         let mut pipeline = ForcedPipeline {
             result: ClaimResult::Active(ActiveClaim { island: 0xA0 }),
             calls: 0,
+            releases: 0,
         };
         let gate = drive_capability_step(&wf, &mut pipeline, 1, &requirement()).unwrap();
         let seq = wf.start(1).unwrap();
@@ -332,6 +417,26 @@ mod tests {
 
         assert_eq!(gate, StepGate::Running(ActiveClaim { island: 0xA0 }));
         assert_eq!(wf.get(1).unwrap().status, TaskStatus::Running);
+
+        // Abnormal exit: the worker fails the step and MUST release the
+        // claim through the same seam (corrections cross-cutting rule).
+        if let StepGate::Running(claim) = gate {
+            release_step(&mut pipeline, &claim).unwrap();
+            wf.fail(1).unwrap();
+        }
+        assert_eq!(pipeline.releases, 1, "the held claim is released on abnormal exit");
+    }
+
+    #[test]
+    fn step_kind_reexecute_is_advisory_and_blocks_completed_side_effects() {
+        // Pure / Idempotent: always safe to re-run.
+        assert!(StepKind::Pure.may_reexecute(true));
+        assert!(StepKind::Idempotent.may_reexecute(true));
+        // SideEffecting: safe before completion, unsafe after (needs a
+        // compensating step instead of a silent re-run).
+        assert!(StepKind::SideEffecting.may_reexecute(false));
+        assert!(!StepKind::SideEffecting.may_reexecute(true));
+        assert_eq!(StepKind::default(), StepKind::Pure);
     }
 
     // --- production pipeline over real Thunderdome folds ---
@@ -434,6 +539,59 @@ mod tests {
             res.query(ReservationQuery::State(0xA0))[0].1,
             ReservationState::Active { holder, .. } if holder == ln
         ));
+    }
+
+    /// Cross-cutting rule, end-to-end over real Thunderdome folds: a
+    /// step acquires an island in `Active`, then on an abnormal exit
+    /// `release_step` returns it to `Free` — the held GPU goes back to
+    /// the pool (no stranded hardware).
+    #[tokio::test]
+    async fn gang_pipeline_release_returns_the_island_to_free() {
+        let caps = new_fold::<CapabilityFold>();
+        let topo = new_fold::<IslandTopologyFold>();
+        let res = new_fold::<ReservationFold>();
+        let gpu = EntityKeypair::generate();
+        let gn = gpu.entity_id().node_id();
+        announce_capability(&caps, &gpu, gn);
+        announce_island(&topo, &gpu, gn, 0xA0);
+
+        let leader = EntityKeypair::generate();
+        let ln = leader.entity_id().node_id();
+        let mut pipeline = GangClaimPipeline::new(
+            GangClaimContext {
+                capability: &caps,
+                topology: &topo,
+                reservations: &res,
+                keypair: &leader,
+                node_id: ln,
+            },
+            ReplicaSet::new([1, 2, 3]),
+            vec![1, 2, 3],
+            42,
+        );
+
+        let redex = Redex::new();
+        let wf = WorkflowAdapter::open(&redex, 0x0F10_00D6).await.unwrap();
+        submitted_task(&wf, 1).await;
+
+        let gate = drive_capability_step(&wf, &mut pipeline, 1, &requirement()).unwrap();
+        let claim = match gate {
+            StepGate::Running(c) => c,
+            StepGate::Waiting => panic!("expected the claim to commit Active"),
+        };
+        // Held in Active.
+        assert!(matches!(
+            res.query(ReservationQuery::State(0xA0))[0].1,
+            ReservationState::Active { .. }
+        ));
+
+        // Abnormal exit → release through the seam → island Free.
+        release_step(&mut pipeline, &claim).unwrap();
+        assert_eq!(
+            res.query(ReservationQuery::State(0xA0))[0].1,
+            ReservationState::Free,
+            "released island returns to the pool",
+        );
     }
 
     #[tokio::test]

@@ -42,8 +42,8 @@ pub use shard::{
 };
 pub use state::{StatusCounts, WorkflowState};
 pub use step::{
-    drive_capability_step, ActiveClaim, CapabilityRequirement, ClaimPipeline, ClaimResult,
-    GangClaimContext, GangClaimPipeline, StepError, StepGate,
+    drive_capability_step, release_step, ActiveClaim, CapabilityRequirement, ClaimPipeline,
+    ClaimResult, GangClaimContext, GangClaimPipeline, StepError, StepGate, StepKind,
 };
 pub use trigger::{Action, Trigger, TriggerEngine, TriggerWorld};
 pub use types::{TaskId, TaskState, TaskStatus};
