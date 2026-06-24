@@ -1,0 +1,22 @@
+net/crates/net/docs/plans/TASK_LIFECYCLE_PLAN.md
+  s_b93d1d2fee6b2e::t_b29f541573e67f 16-19,23-30,39-66
+net/crates/net/docs/plans/MESH_SCHEDULER_GANG_CLAIM_PLAN.md
+  s_b93d1d2fee6b2e::t_79b53a58a4bda6 39-79
+  s_b93d1d2fee6b2e::t_e6df0ee4e556c0 15-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.11",
+  "base_commit_sha": "2a98e5c31574c57c8cc77a8e17180a954cf7f367",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
