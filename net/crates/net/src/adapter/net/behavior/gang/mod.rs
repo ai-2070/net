@@ -43,6 +43,9 @@ pub mod placement;
 pub mod quorum;
 pub mod schedule;
 
+#[cfg(test)]
+mod proptest;
+
 pub use active::{commit_active, ActiveCommitOutcome, ReplicaCohort};
 pub use claim::{
     activate_announcement, activate_island, release_announcement, release_island,
