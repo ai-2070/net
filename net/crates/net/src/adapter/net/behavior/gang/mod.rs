@@ -39,6 +39,7 @@ pub mod claim;
 pub mod contention;
 pub mod filter;
 pub mod multi;
+pub mod placement;
 pub mod quorum;
 
 pub use active::{commit_active, ActiveCommitOutcome, ReplicaCohort};
@@ -51,6 +52,7 @@ pub use filter::{
     candidate_hosts, numeric_filter, select_islands, NumericFilter, SelectionPolicy,
 };
 pub use multi::{acquire_gang, try_acquire_gang, AcquireAttempt, GangClaim, GangOutcome};
+pub use placement::{colocated_island_config, pinned_island_replicas, COLOCATE_WITH_STRICT_KEY};
 pub use quorum::{Epoch, FenceLedger, QuorumWitness, ReplicaSet};
 
 use crate::adapter::net::behavior::fold::{
