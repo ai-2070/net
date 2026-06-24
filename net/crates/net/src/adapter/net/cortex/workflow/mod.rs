@@ -24,6 +24,7 @@ mod dispatch;
 mod fold;
 pub mod lease;
 mod state;
+pub mod step;
 pub mod trigger;
 mod types;
 
@@ -35,5 +36,9 @@ pub use dispatch::{
 pub use fold::WorkflowFold;
 pub use lease::{TaskLease, TaskLeaseOutcome};
 pub use state::WorkflowState;
+pub use step::{
+    drive_capability_step, ActiveClaim, CapabilityRequirement, ClaimPipeline, ClaimResult,
+    GangClaimContext, GangClaimPipeline, StepError, StepGate,
+};
 pub use trigger::{Action, Trigger, TriggerEngine, TriggerWorld};
 pub use types::{TaskId, TaskState, TaskStatus};
