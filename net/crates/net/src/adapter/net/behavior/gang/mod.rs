@@ -37,6 +37,7 @@
 pub mod claim;
 pub mod contention;
 pub mod filter;
+pub mod multi;
 
 pub use claim::{
     activate_announcement, activate_island, release_announcement, release_island,
@@ -46,6 +47,7 @@ pub use contention::claim_first_available;
 pub use filter::{
     candidate_hosts, numeric_filter, select_islands, NumericFilter, SelectionPolicy,
 };
+pub use multi::{acquire_gang, try_acquire_gang, AcquireAttempt, GangClaim, GangOutcome};
 
 use crate::adapter::net::behavior::fold::{
     CapabilityFold, CapabilityQuery, Fold, IslandId, IslandQuery, IslandRecord, IslandTopologyFold,
