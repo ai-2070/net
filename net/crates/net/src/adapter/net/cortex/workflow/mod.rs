@@ -31,13 +31,13 @@ mod types;
 
 pub use adapter::WorkflowAdapter;
 pub use dispatch::{
-    DISPATCH_TASK_ADVANCED, DISPATCH_TASK_DELETED, DISPATCH_TASK_RETRIED, DISPATCH_TASK_SUBMITTED,
-    DISPATCH_TASK_TRANSITIONED, WORKFLOW_CHANNEL,
+    DISPATCH_TASK_ADVANCED, DISPATCH_TASK_CANCEL_REQUESTED, DISPATCH_TASK_DELETED,
+    DISPATCH_TASK_RETRIED, DISPATCH_TASK_SUBMITTED, DISPATCH_TASK_TRANSITIONED, WORKFLOW_CHANNEL,
 };
 pub use fold::WorkflowFold;
 pub use lease::{TaskLease, TaskLeaseOutcome};
 pub use shard::{derive_shard_ids, fan_out, try_join, Join, ShardGroup};
-pub use state::WorkflowState;
+pub use state::{StatusCounts, WorkflowState};
 pub use step::{
     drive_capability_step, ActiveClaim, CapabilityRequirement, ClaimPipeline, ClaimResult,
     GangClaimContext, GangClaimPipeline, StepError, StepGate,

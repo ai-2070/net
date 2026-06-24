@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 
 use super::super::super::channel::ChannelName;
 use super::super::super::redex::{Redex, RedexError, RedexFileConfig};
@@ -22,15 +23,25 @@ use super::super::error::CortexAdapterError;
 use super::super::meta::{compute_checksum_with_meta, EventMeta, EVENT_META_SIZE};
 use super::super::watermark::WatermarkingFold;
 use super::dispatch::{
-    DISPATCH_TASK_ADVANCED, DISPATCH_TASK_DELETED, DISPATCH_TASK_RETRIED, DISPATCH_TASK_SUBMITTED,
-    DISPATCH_TASK_TRANSITIONED, WORKFLOW_CHANNEL,
+    DISPATCH_TASK_ADVANCED, DISPATCH_TASK_CANCEL_REQUESTED, DISPATCH_TASK_DELETED,
+    DISPATCH_TASK_RETRIED, DISPATCH_TASK_SUBMITTED, DISPATCH_TASK_TRANSITIONED, WORKFLOW_CHANNEL,
 };
 use super::fold::WorkflowFold;
-use super::state::WorkflowState;
+use super::state::{StatusCounts, WorkflowState};
 use super::types::{
-    AdvancedPayload, DeletedPayload, RetriedPayload, SubmittedPayload, TaskId, TaskState,
-    TaskStatus, TransitionedPayload,
+    AdvancedPayload, CancelRequestedPayload, DeletedPayload, RetriedPayload, SubmittedPayload,
+    TaskId, TaskState, TaskStatus, TransitionedPayload,
 };
+
+/// Wire format for [`WorkflowAdapter::snapshot`]: wraps the
+/// `WorkflowState` blob alongside the adapter's `app_seq` so a restore
+/// keeps per-origin `EventMeta::seq_or_ts` monotonic (mirrors
+/// `TasksAdapter`).
+#[derive(Serialize, Deserialize)]
+struct WorkflowSnapshotPayload {
+    app_seq: u64,
+    inner: Vec<u8>,
+}
 
 /// Typed wrapper around `CortexAdapter<WorkflowState>` exposing the
 /// task-lifecycle transitions.
@@ -144,6 +155,15 @@ impl WorkflowAdapter {
         self.ingest_typed(DISPATCH_TASK_DELETED, &DeletedPayload { id })
     }
 
+    /// Request cancellation of `id` — a worker-observed signal (the
+    /// plan's `cancel.json`). This only records the request; the
+    /// single-writer worker polls [`Self::is_cancel_requested`] and
+    /// drives the task to a terminal status. Cleared on delete or a
+    /// fresh submit.
+    pub fn request_cancel(&self, id: TaskId) -> Result<u64, CortexAdapterError> {
+        self.ingest_typed(DISPATCH_TASK_CANCEL_REQUESTED, &CancelRequestedPayload { id })
+    }
+
     /// Read-only access to the materialized state.
     pub fn state(&self) -> Arc<RwLock<WorkflowState>> {
         self.inner.state()
@@ -155,9 +175,95 @@ impl WorkflowAdapter {
         self.inner.state().read().get(id)
     }
 
+    /// Has cancellation been requested for `id`? The worker polls this.
+    pub fn is_cancel_requested(&self, id: TaskId) -> bool {
+        self.inner.state().read().is_cancel_requested(id)
+    }
+
+    /// Roll-up of task counts per status — the observability summary.
+    pub fn status_counts(&self) -> StatusCounts {
+        self.inner.state().read().status_counts()
+    }
+
     /// Block until every event up through `seq` has been folded.
     pub async fn wait_for_seq(&self, seq: u64) -> Result<(), Option<u64>> {
         self.inner.wait_for_seq(seq).await
+    }
+
+    /// Capture a snapshot for restore: `(state_bytes, last_seq)` —
+    /// persist both together. Reopening from it via
+    /// [`Self::open_from_snapshot`] skips replay up through `last_seq`,
+    /// bounding failover catch-up on a long task history (perf note).
+    pub fn snapshot(&self) -> Result<(Vec<u8>, Option<u64>), CortexAdapterError> {
+        let (inner, last_seq) = self.inner.snapshot()?;
+        let payload = WorkflowSnapshotPayload {
+            app_seq: self.app_seq.load(Ordering::Acquire),
+            inner,
+        };
+        let bytes = postcard::to_allocvec(&payload).map_err(|e| {
+            CortexAdapterError::Redex(RedexError::Encode(format!("workflow snapshot wrap: {e}")))
+        })?;
+        Ok((bytes, last_seq))
+    }
+
+    /// Open the workflow adapter from a snapshot, skipping replay of
+    /// events up through `last_seq`.
+    pub async fn open_from_snapshot(
+        redex: &Redex,
+        origin_hash: u64,
+        state_bytes: &[u8],
+        last_seq: Option<u64>,
+    ) -> Result<Self, CortexAdapterError> {
+        Self::open_from_snapshot_with_config(
+            redex,
+            origin_hash,
+            RedexFileConfig::default(),
+            state_bytes,
+            last_seq,
+        )
+        .await
+    }
+
+    /// Like [`Self::open_from_snapshot`] but with a caller-supplied
+    /// `RedexFileConfig`.
+    pub async fn open_from_snapshot_with_config(
+        redex: &Redex,
+        origin_hash: u64,
+        redex_config: RedexFileConfig,
+        state_bytes: &[u8],
+        last_seq: Option<u64>,
+    ) -> Result<Self, CortexAdapterError> {
+        let payload: WorkflowSnapshotPayload = postcard::from_bytes(state_bytes).map_err(|e| {
+            CortexAdapterError::Redex(RedexError::Encode(format!("workflow snapshot unwrap: {e}")))
+        })?;
+        let name = ChannelName::new(WORKFLOW_CHANNEL)
+            .map_err(|e| CortexAdapterError::Redex(RedexError::Channel(e.to_string())))?;
+        let app_seq = Arc::new(AtomicU64::new(payload.app_seq));
+        let fold = WatermarkingFold::new(WorkflowFold, app_seq.clone(), origin_hash);
+        let inner = CortexAdapter::open_from_snapshot(
+            redex,
+            &name,
+            redex_config.clone(),
+            CortexAdapterConfig::default(),
+            fold,
+            &payload.inner,
+            last_seq,
+        )?;
+        let file = redex.open_file(&name, redex_config)?;
+        let next_seq = file.next_seq();
+        if next_seq > 0 {
+            inner.wait_for_seq(next_seq - 1).await.map_err(|folded| {
+                CortexAdapterError::FoldStoppedBeforeSeq {
+                    wanted: next_seq - 1,
+                    folded_through: folded,
+                }
+            })?;
+        }
+        Ok(Self {
+            inner,
+            origin_hash,
+            app_seq,
+        })
     }
 
     /// Build the `EventMeta` header + postcard payload, stamp the
@@ -263,5 +369,85 @@ mod tests {
             }
         );
         assert_eq!(resumed.get(2).unwrap().status, TaskStatus::Failed);
+    }
+
+    // --- Phase E: cancel / checkpoint / observability ---
+
+    #[tokio::test]
+    async fn cancel_signal_observed_then_cleared_on_delete() {
+        let (_redex, wf) = open().await;
+        wf.submit(1).unwrap();
+        wf.start(1).unwrap();
+        let seq = wf.request_cancel(1).unwrap();
+        wf.wait_for_seq(seq).await.unwrap();
+
+        // The worker observes the signal and drives the task terminal
+        // (its policy — here, Failed). request_cancel itself never
+        // changed the status.
+        assert!(wf.is_cancel_requested(1));
+        assert_eq!(wf.get(1).unwrap().status, TaskStatus::Running);
+        let seq = wf.fail(1).unwrap();
+        wf.wait_for_seq(seq).await.unwrap();
+        assert_eq!(wf.get(1).unwrap().status, TaskStatus::Failed);
+
+        // Delete reclaims the subtree AND clears the cancel signal.
+        let seq = wf.delete(1).unwrap();
+        wf.wait_for_seq(seq).await.unwrap();
+        assert!(!wf.is_cancel_requested(1));
+        assert!(wf.get(1).is_none());
+    }
+
+    #[tokio::test]
+    async fn fresh_submit_clears_a_stale_cancel() {
+        let (_redex, wf) = open().await;
+        wf.submit(1).unwrap();
+        wf.request_cancel(1).unwrap();
+        let seq = wf.submit(1).unwrap(); // re-submit resets the task
+        wf.wait_for_seq(seq).await.unwrap();
+        assert!(!wf.is_cancel_requested(1), "re-submit clears the stale cancel");
+    }
+
+    #[tokio::test]
+    async fn status_counts_roll_up() {
+        let (_redex, wf) = open().await;
+        wf.submit(1).unwrap(); // Submitted
+        wf.submit(2).unwrap();
+        wf.start(2).unwrap(); // Running
+        wf.submit(3).unwrap();
+        let seq = wf.complete(3).unwrap(); // Done
+        wf.wait_for_seq(seq).await.unwrap();
+
+        let c = wf.status_counts();
+        assert_eq!(c.submitted, 1);
+        assert_eq!(c.running, 1);
+        assert_eq!(c.done, 1);
+        assert_eq!(c.total(), 3);
+    }
+
+    /// Checkpoint: snapshot a populated workflow and restore it into a
+    /// fresh adapter — the state is reproduced without re-folding the
+    /// chain (the perf note's bounded failover replay).
+    #[tokio::test]
+    async fn snapshot_then_restore_reproduces_state() {
+        let redex = Redex::new();
+        let wf = WorkflowAdapter::open(&redex, ORIGIN).await.unwrap();
+        wf.submit(1).unwrap();
+        wf.start(1).unwrap();
+        wf.advance(1).unwrap();
+        wf.submit(2).unwrap();
+        let seq = wf.complete(2).unwrap();
+        wf.wait_for_seq(seq).await.unwrap();
+
+        let (bytes, last_seq) = wf.snapshot().unwrap();
+
+        // Restore into a fresh Redex: no chain to replay, state comes
+        // straight from the checkpoint.
+        let redex2 = Redex::new();
+        let restored = WorkflowAdapter::open_from_snapshot(&redex2, ORIGIN, &bytes, last_seq)
+            .await
+            .unwrap();
+        assert_eq!(restored.get(1), wf.get(1));
+        assert_eq!(restored.get(2), wf.get(2));
+        assert_eq!(restored.status_counts(), wf.status_counts());
     }
 }

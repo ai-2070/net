@@ -106,3 +106,10 @@ pub(super) struct RetriedPayload {
 pub(super) struct DeletedPayload {
     pub id: TaskId,
 }
+
+/// Payload for `DISPATCH_TASK_CANCEL_REQUESTED` — record a cancel
+/// signal for the worker to observe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct CancelRequestedPayload {
+    pub id: TaskId,
+}

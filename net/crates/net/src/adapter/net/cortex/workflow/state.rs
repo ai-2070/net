@@ -2,11 +2,37 @@
 //! `CortexAdapter<WorkflowState>`'s `RwLock`: one [`TaskState`] per
 //! live task id.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
 use super::types::{TaskId, TaskState, TaskStatus};
+
+/// Counts of tasks per status — the observability / metrics summary
+/// (plan piece 7). The event log is the chain itself; this is the
+/// materialized roll-up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatusCounts {
+    /// Tasks in `Submitted`.
+    pub submitted: usize,
+    /// Tasks in `Running`.
+    pub running: usize,
+    /// Tasks in `Waiting`.
+    pub waiting: usize,
+    /// Tasks in `Blocked`.
+    pub blocked: usize,
+    /// Tasks in `Done`.
+    pub done: usize,
+    /// Tasks in `Failed`.
+    pub failed: usize,
+}
+
+impl StatusCounts {
+    /// Total live tasks across every status.
+    pub fn total(&self) -> usize {
+        self.submitted + self.running + self.waiting + self.blocked + self.done + self.failed
+    }
+}
 
 /// Materialized view over the task-lifecycle log.
 ///
@@ -17,6 +43,10 @@ use super::types::{TaskId, TaskState, TaskStatus};
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct WorkflowState {
     pub(super) tasks: HashMap<TaskId, TaskState>,
+    /// Task ids with a pending cancel request — the worker-observed
+    /// signal (plan piece 6). Set by `request_cancel`, cleared on
+    /// delete or a fresh submit.
+    pub(super) cancelled: HashSet<TaskId>,
 }
 
 impl WorkflowState {
@@ -57,6 +87,33 @@ impl WorkflowState {
             .iter()
             .filter(move |(_, st)| st.status == status)
             .map(|(id, _)| *id)
+    }
+
+    /// Has cancellation been requested for `id`? The single-writer
+    /// worker polls this and drives the task to a terminal status.
+    pub fn is_cancel_requested(&self, id: TaskId) -> bool {
+        self.cancelled.contains(&id)
+    }
+
+    /// Number of tasks with a pending cancel request.
+    pub fn cancel_requested_count(&self) -> usize {
+        self.cancelled.len()
+    }
+
+    /// Roll-up of task counts per status (observability summary).
+    pub fn status_counts(&self) -> StatusCounts {
+        let mut c = StatusCounts::default();
+        for st in self.tasks.values() {
+            match st.status {
+                TaskStatus::Submitted => c.submitted += 1,
+                TaskStatus::Running => c.running += 1,
+                TaskStatus::Waiting => c.waiting += 1,
+                TaskStatus::Blocked => c.blocked += 1,
+                TaskStatus::Done => c.done += 1,
+                TaskStatus::Failed => c.failed += 1,
+            }
+        }
+        c
     }
 }
 

@@ -10,13 +10,13 @@ use super::super::meta::{
     compute_checksum, compute_checksum_with_meta, EventMeta, EVENT_META_SIZE,
 };
 use super::dispatch::{
-    DISPATCH_TASK_ADVANCED, DISPATCH_TASK_DELETED, DISPATCH_TASK_RETRIED, DISPATCH_TASK_SUBMITTED,
-    DISPATCH_TASK_TRANSITIONED,
+    DISPATCH_TASK_ADVANCED, DISPATCH_TASK_CANCEL_REQUESTED, DISPATCH_TASK_DELETED,
+    DISPATCH_TASK_RETRIED, DISPATCH_TASK_SUBMITTED, DISPATCH_TASK_TRANSITIONED,
 };
 use super::state::WorkflowState;
 use super::types::{
-    AdvancedPayload, DeletedPayload, RetriedPayload, SubmittedPayload, TaskState, TaskStatus,
-    TransitionedPayload,
+    AdvancedPayload, CancelRequestedPayload, DeletedPayload, RetriedPayload, SubmittedPayload,
+    TaskState, TaskStatus, TransitionedPayload,
 };
 
 /// Fold implementation for the task-lifecycle model.
@@ -57,8 +57,9 @@ impl RedexFold<WorkflowState> for WorkflowFold {
                     postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
                 // Submit is the baseline; a re-submit of a live id
                 // resets it to the fresh state (the log is the source
-                // of truth).
+                // of truth) and clears any stale cancel signal.
                 state.tasks.insert(p.id, TaskState::submitted());
+                state.cancelled.remove(&p.id);
             }
             DISPATCH_TASK_TRANSITIONED => {
                 let p: TransitionedPayload =
@@ -90,6 +91,15 @@ impl RedexFold<WorkflowState> for WorkflowFold {
                 let p: DeletedPayload =
                     postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
                 state.tasks.remove(&p.id);
+                // Reclaim the subtree — drop any pending cancel signal.
+                state.cancelled.remove(&p.id);
+            }
+            DISPATCH_TASK_CANCEL_REQUESTED => {
+                let p: CancelRequestedPayload =
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
+                // Record the signal for the worker to observe; the
+                // status transition itself is the worker's to make.
+                state.cancelled.insert(p.id);
             }
             other => {
                 // Unknown dispatches in the CortEX-internal range are
