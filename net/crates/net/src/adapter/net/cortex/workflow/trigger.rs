@@ -15,7 +15,7 @@
 //! explicit map, so the same event sequence fires the same triggers on
 //! replay.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::state::WorkflowState;
 use super::types::{TaskId, TaskStatus};
@@ -128,15 +128,16 @@ impl Trigger {
             Trigger::AfterTask(task)
             | Trigger::IfResult { task, .. }
             | Trigger::AfterTerminal(task) => TriggerKey::Task(*task),
-            Trigger::AtTick(_) => TriggerKey::Tick,
+            Trigger::AtTick(tick) => TriggerKey::Tick(*tick),
         }
     }
 }
 
-/// Index bucket — what a trigger waits on.
+/// Index bucket — what a trigger waits on. `Tick` carries the deadline
+/// so the engine can key the tick index by value (corrections #5).
 enum TriggerKey {
     Task(TaskId),
-    Tick,
+    Tick(u64),
 }
 
 /// An indexed set of armed triggers. Driven by events: when a task
@@ -149,10 +150,26 @@ enum TriggerKey {
 /// the caller applies the returned actions (e.g. via
 /// [`WorkflowAdapter`](super::WorkflowAdapter)). That is what keeps this
 /// a *substrate* rather than a controller loop.
+///
+/// **Complexity** (T = armed triggers; the index is the plan's
+/// O(relevant)-not-O(all) promise on *both* axes — corrections #5):
+/// - [`arm`](Self::arm): O(1) amortized for task-keyed triggers, O(log T)
+///   for `AtTick` (BTreeMap insert).
+/// - [`on_task_change`](Self::on_task_change): O(triggers waiting on that
+///   task) — task-keyed, not a scan of all T.
+/// - [`on_tick`](Self::on_tick): O(triggers due at `now` + log T) —
+///   the BTreeMap drains the `tick <= now` prefix, never the whole set
+///   (the naive `Vec` scan this replaced was O(all tick triggers)).
+/// - [`on_delete`](Self::on_delete): O(triggers waiting on that task).
+/// - [`armed_count`](Self::armed_count): O(distinct task ids + distinct
+///   tick values).
 #[derive(Default)]
 pub struct TriggerEngine {
     by_task: HashMap<TaskId, Vec<(Trigger, Action)>>,
-    by_tick: Vec<(Trigger, Action)>,
+    /// `AtTick` triggers keyed by their tick value, so `on_tick(now)`
+    /// drains only the due `tick <= now` prefix instead of scanning
+    /// every armed tick trigger (corrections #5).
+    by_tick: BTreeMap<u64, Vec<(Trigger, Action)>>,
 }
 
 impl TriggerEngine {
@@ -161,11 +178,12 @@ impl TriggerEngine {
         Self::default()
     }
 
-    /// Arm `trigger` to fire `action` once satisfied.
+    /// Arm `trigger` to fire `action` once satisfied. O(1) amortized for
+    /// task-keyed triggers; O(log T) for `AtTick` (BTreeMap insert).
     pub fn arm(&mut self, trigger: Trigger, action: Action) {
         match trigger.key() {
             TriggerKey::Task(task) => self.by_task.entry(task).or_default().push((trigger, action)),
-            TriggerKey::Tick => self.by_tick.push((trigger, action)),
+            TriggerKey::Tick(tick) => self.by_tick.entry(tick).or_default().push((trigger, action)),
         }
     }
 
@@ -184,14 +202,19 @@ impl TriggerEngine {
         fired.into_iter().map(|(_, action)| action).collect()
     }
 
-    /// The logical clock advanced: evaluate tick-waiting triggers,
-    /// returning + disarming the satisfied ones.
+    /// The logical clock advanced to `world.tick`: fire + disarm every
+    /// `AtTick` trigger whose deadline has passed. O(due + log T): the
+    /// BTreeMap splits off the `tick <= now` prefix (all of which are
+    /// satisfied — `AtTick` fires at `now >= tick`), leaving the future
+    /// ones armed, rather than scanning every armed tick trigger.
     pub fn on_tick(&mut self, world: &TriggerWorld<'_>) -> Vec<Action> {
-        let armed = std::mem::take(&mut self.by_tick);
-        let (fired, still_armed): (Vec<_>, Vec<_>) =
-            armed.into_iter().partition(|(t, _)| t.is_satisfied(world));
-        self.by_tick = still_armed;
-        fired.into_iter().map(|(_, action)| action).collect()
+        // Keep the strictly-future ones (tick > now); drain the rest.
+        let future = self.by_tick.split_off(&world.tick.saturating_add(1));
+        let due = std::mem::replace(&mut self.by_tick, future);
+        due.into_values()
+            .flatten()
+            .map(|(_, action)| action)
+            .collect()
     }
 
     /// `task` was deleted: drop every trigger waiting on it — they can
@@ -205,7 +228,8 @@ impl TriggerEngine {
 
     /// Total triggers still armed (not yet fired).
     pub fn armed_count(&self) -> usize {
-        self.by_task.values().map(Vec::len).sum::<usize>() + self.by_tick.len()
+        self.by_task.values().map(Vec::len).sum::<usize>()
+            + self.by_tick.values().map(Vec::len).sum::<usize>()
     }
 }
 
@@ -418,6 +442,36 @@ mod tests {
         assert_eq!(
             eng.on_tick(&TriggerWorld::new(&s, 3)),
             vec![Action::Submit(1)]
+        );
+        assert_eq!(eng.armed_count(), 0);
+    }
+
+    #[test]
+    fn on_tick_drains_only_the_due_prefix_and_keeps_future_triggers() {
+        // The BTreeMap index (corrections #5): on_tick(now) fires the
+        // tick<=now prefix in deterministic (tick, insertion) order and
+        // leaves strictly-future deadlines armed — not an O(all) scan.
+        let mut eng = TriggerEngine::new();
+        eng.arm(Trigger::AtTick(3), Action::Submit(1));
+        eng.arm(Trigger::AtTick(5), Action::Submit(2));
+        eng.arm(Trigger::AtTick(5), Action::Submit(3)); // same deadline
+        eng.arm(Trigger::AtTick(9), Action::Submit(4));
+        assert_eq!(eng.armed_count(), 4);
+        let s = WorkflowState::new();
+
+        // now=5 fires deadlines 3, 5, 5 (ordered), leaving 9 armed.
+        assert_eq!(
+            eng.on_tick(&TriggerWorld::new(&s, 5)),
+            vec![Action::Submit(1), Action::Submit(2), Action::Submit(3)],
+        );
+        assert_eq!(eng.armed_count(), 1);
+        // A tick below the next deadline fires nothing.
+        assert!(eng.on_tick(&TriggerWorld::new(&s, 8)).is_empty());
+        assert_eq!(eng.armed_count(), 1);
+        // now=9 fires the last.
+        assert_eq!(
+            eng.on_tick(&TriggerWorld::new(&s, 9)),
+            vec![Action::Submit(4)]
         );
         assert_eq!(eng.armed_count(), 0);
     }
