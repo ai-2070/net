@@ -23,6 +23,7 @@ mod adapter;
 mod dispatch;
 mod fold;
 pub mod lease;
+pub mod shard;
 mod state;
 pub mod step;
 pub mod trigger;
@@ -35,6 +36,7 @@ pub use dispatch::{
 };
 pub use fold::WorkflowFold;
 pub use lease::{TaskLease, TaskLeaseOutcome};
+pub use shard::{derive_shard_ids, fan_out, try_join, Join, ShardGroup};
 pub use state::WorkflowState;
 pub use step::{
     drive_capability_step, ActiveClaim, CapabilityRequirement, ClaimPipeline, ClaimResult,
