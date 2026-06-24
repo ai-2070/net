@@ -1,0 +1,34 @@
+net/crates/net/src/adapter/net/cortex/workflow/adapter.rs
+  s_b93d1d2fee6b2e::t_940c90b7d58d20 1-267
+net/crates/net/src/adapter/net/cortex/workflow/state.rs
+  s_b93d1d2fee6b2e::t_d0efce60658a27 1-104
+net/crates/net/src/adapter/net/cortex/workflow/dispatch.rs
+  s_b93d1d2fee6b2e::t_4d21e2413094cf 1-32
+net/crates/net/src/adapter/net/cortex/workflow/types.rs
+  s_b93d1d2fee6b2e::t_526111b1fb8498 1-108
+net/crates/net/src/adapter/net/cortex/workflow/fold.rs
+  s_b93d1d2fee6b2e::t_5e0763ed3c10c8 1-106
+net/crates/net/src/adapter/net/cortex/workflow/mod.rs
+  s_b93d1d2fee6b2e::t_6c8a2403ff5894 1-37
+net/crates/net/src/adapter/net/cortex/workflow/lease.rs
+  s_b93d1d2fee6b2e::t_7aa9d6ee9e9608 193-194,196,198-199
+  s_b93d1d2fee6b2e::t_1484afef6bbbaf 1-192,195,197,200-238
+net/crates/net/src/adapter/net/cortex/mod.rs
+  s_b93d1d2fee6b2e::t_90cccf38dbeae4 37-38
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.11",
+  "base_commit_sha": "b4b88a1b1006616bd745cbd296591ce9102725c1",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
