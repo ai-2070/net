@@ -12,8 +12,7 @@
 //!
 //! `now_us` + `backoff` are injected for deterministic tests (a fake
 //! clock + a no-op), exactly as in [`super::acquire_gang`]; production
-//! passes [`current_timestamp_micros`](crate::adapter::net::current_timestamp_micros)
-//! and a jittered sleep.
+//! passes the crate's `current_timestamp_micros` and a jittered sleep.
 
 use crate::adapter::net::behavior::fold::{
     CapabilityFold, Fold, IslandId, IslandTopologyFold, JobId, NodeId, ReservationFold,

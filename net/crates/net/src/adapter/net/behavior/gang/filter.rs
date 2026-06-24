@@ -75,7 +75,7 @@ pub fn numeric_filter(
 }
 
 /// Island selection ordering (plan §2 step 3 / Phase E): a pure
-/// ranking over the live [`IslandTopology`] axes.
+/// ranking over the live `IslandTopology` axes.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum SelectionPolicy {
     /// **Spread** — least-loaded island first (lowest `load`),

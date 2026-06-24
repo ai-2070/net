@@ -116,10 +116,11 @@ pub fn try_acquire_gang(
 /// foreign gang may take it over (sized from the claim-round latency,
 /// plan open question 3); a fresh deadline is stamped on every
 /// attempt. `now_us` and `backoff` are injected so the loop is
-/// deterministically testable: production passes
-/// [`current_timestamp_micros`](crate::adapter::net::current_timestamp_micros)
-/// and a jittered sleep; tests pass a fake clock and a no-op.
+/// deterministically testable: production passes the crate's
+/// `current_timestamp_micros` and a jittered sleep; tests pass a fake
+/// clock and a no-op.
 /// `backoff` receives the zero-based attempt number.
+#[allow(clippy::too_many_arguments)]
 pub fn acquire_gang(
     reservations: &Fold<ReservationFold>,
     keypair: &EntityKeypair,
