@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/cortex/workflow/mod.rs
+  s_b93d1d2fee6b2e::t_958e7de14317ca 39-42
+net/crates/net/src/adapter/net/cortex/workflow/shard.rs
+  s_b93d1d2fee6b2e::t_463aeb6b1f3ac5 37-38,43-46,51-52,54-58,62-63,68,82-87,104-105,118-228
+  s_b93d1d2fee6b2e::t_c7045a60f0929a 242,244,250,252-256,259-261,263-274,277,280-328
+  s_b93d1d2fee6b2e::t_afa35bbf8fe27c 452-571
+  s_b93d1d2fee6b2e::t_bd1fd790380775 355-369
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.11",
+  "base_commit_sha": "039f3de33b73e03ae2e2334b6b7d040349d9ed40",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
