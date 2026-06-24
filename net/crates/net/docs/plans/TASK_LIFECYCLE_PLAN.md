@@ -13,16 +13,21 @@
 
 ## Status
 
-Design only. **Strictly downstream of Thunderdome** — this layer assumes the resource is
+**Implemented** on branch `mesh-scheduler` in `cortex/workflow/` — all five phases
+(A–E) and all seven "What ships" pieces; see
+[Implementation status](#implementation-status--landed-on-mesh-scheduler).
+**Strictly downstream of Thunderdome** — this layer assumes the resource is
 already atomically held; it never arbitrates contention itself.
 
 Prerequisites:
-- **Thunderdome Phases C + D** (multi-resource atomic claim + partition-safe `Active`) —
-  **hard** prerequisite for the *capability-bearing* paths only. A step that requires an
-  exclusive capability must obtain it through the Thunderdome claim pipeline; building those
-  paths before the claim is proven yields a workflow engine that double-books exclusive
-  resources the first time two jobs contend. Hardware-free tasks (Phases A–C, E) have no such
-  dependency and can proceed independently.
+- ~~**Thunderdome Phases C + D** (multi-resource atomic claim + partition-safe
+  `Active`)~~ ✅ Landed — the **hard** prerequisite for the *capability-bearing*
+  paths is satisfied; the gang claim this layer sits on is implemented in
+  `behavior/gang/` (see [`MESH_SCHEDULER_GANG_CLAIM_PLAN.md`](MESH_SCHEDULER_GANG_CLAIM_PLAN.md)).
+  A step that requires an exclusive capability obtains it through that pipeline
+  via the Phase D seam ([`cortex/workflow/step.rs`]); it can't bypass it to
+  touch a `ReservationFold`. Hardware-free tasks (Phases A–C, E) had no such
+  dependency and proceeded independently.
 - ~~**RedEX directories + single-writer chains** (`redex/`).~~ ✅ Landed.
 - ~~**CortEX fold/replay/tail** (`behavior/meshos/`, `CORTEX_ADAPTER_PLAN.md`).~~ ✅ Landed.
 - ~~**nRPC streaming + capability-gated tools** (`nrpc`).~~ ✅ Landed — step execution.
@@ -30,6 +35,35 @@ Prerequisites:
 Activation gate: a workload with multi-step jobs — dependencies, map-reduce fan-out,
 conditional branches, resumable long-running pipelines — i.e. the first user who wants
 more than "run one tool once."
+
+## Implementation status — landed on `mesh-scheduler`
+
+Implemented as the `cortex::workflow` CortEX model (mirroring the `cortex::tasks`
+template), plus the task lease over `ReservationFold` and the Thunderdome seam.
+All five phases and all seven shipped pieces are landed; **32 tests** pass under
+strict lib clippy, test-target clippy, and rustdoc `-D warnings`.
+
+| Phase | Commit | Where | Tests |
+|---|---|---|---|
+| A state machine + lease + replay | `b4b88a1` | `cortex/workflow/{types,dispatch,state,fold,adapter,lease}.rs` | 10 |
+| B triggers + dependencies (`after_task` / `if_result`) | `276dbe8` | `cortex/workflow/trigger.rs` | 8 |
+| C shards — fan-out / fan-in | `f39518f` | `cortex/workflow/shard.rs` | 5 |
+| D capability-bearing steps — the Thunderdome seam | `2686f02` | `cortex/workflow/step.rs` | 5 |
+| E retry / cancel / checkpoint / observability | `182e684` | `cortex/workflow/{adapter,state,fold,dispatch,types}.rs` | 4 |
+
+The seam (D) routes a step's capability requirement through Thunderdome's
+match→reserve→quorum-`Active` flow and is *structurally* unable to bypass it
+(`drive_capability_step` holds no fold); a minority-partition leader is
+quorum-starved → the step stays `Waiting`, never starting compute — the
+Thunderdome partition guarantee, surfaced intact at the lifecycle boundary.
+
+All four locked decisions hold in the code: the task lease is the easy AP lease
+(`ReservationFold` at task-id granularity), never Thunderdome's CP `Active`;
+deadlock-freedom for multi-resource claims is Thunderdome's ordered-acquire, not
+this layer's stateless workers; two-phase commit / ordered-acquire are
+Thunderdome's, not forbidden here; and `requires_capability` is a *filter*,
+claimed only via the seam. Semantics emerge from primitives — leases, cursors,
+triggers, shard groups — with no DAG DSL or controller loop.
 
 ## Frame
 

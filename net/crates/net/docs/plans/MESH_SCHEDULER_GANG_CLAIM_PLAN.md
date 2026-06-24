@@ -12,8 +12,11 @@
 
 ## Status
 
-Design only. **Most of the hard primitive already exists** — the work is a claim
-*protocol* over it, not new distributed-systems infrastructure.
+**Implemented** on branch `mesh-scheduler` (the in-codebase scope — everything
+bar the real-hardware proof and the on-wire quorum-ack RPC; see
+[Implementation status](#implementation-status--landed-on-mesh-scheduler)).
+Originally design-only; **most of the hard primitive already existed** — the work
+was a claim *protocol* over it, not new distributed-systems infrastructure.
 
 Prerequisites:
 - ~~**`ReservationFold`** (`behavior/fold/reservation.rs`) — per-`ResourceId` CAS state
@@ -32,6 +35,47 @@ Activation gate: a GPU fleet running **contended multi-GPU gang jobs** where par
 allocation deadlocks and a cross-DC partition can double-run a job. Realistic trigger:
 a neocloud whose margin is utilization and whose jobs are tensor/pipeline-parallel
 (multi-GPU, all-or-nothing).
+
+## Implementation status — landed on `mesh-scheduler`
+
+Implemented in `behavior/gang/` (+ the `IslandTopology` fold in
+`behavior/fold/island.rs`) and wired onto `MeshNode`. Every phase (A–E), all
+three brutal tests, the property test, and a loom DST model are landed and pass
+under strict lib clippy, test-target clippy, and rustdoc `-D warnings`.
+
+| Phase / piece | Commit | Where | Tests |
+|---|---|---|---|
+| A.1 `IslandTopology` fold | `127b6ee` | `behavior/fold/island.rs` | 9 |
+| A.2 match→claim pipeline | `c54e828` | `behavior/gang/{filter,claim,mod}.rs` | 15 |
+| B single-island contention (brutal #1) | `819c662` | `behavior/gang/contention.rs` | 3 |
+| C multi-island gang protocol (brutal #2) | `208caab` | `behavior/gang/multi.rs` | 6 |
+| D.1 quorum-witness + epoch fence | `e37bd9f` | `behavior/gang/quorum.rs` | 7 |
+| D.2a partition-safe `Active` commit (brutal #3) | `31fec84` | `behavior/gang/active.rs` | 4 |
+| D.2b `ColocationStrict` placement (§5) | `3b4faf6` | `behavior/gang/placement.rs` | 4 |
+| E.1 selection policy (pack/spread/load-band/affinity) | `849ed15` | `behavior/gang/filter.rs` | (in pipeline) |
+| E.2 queue / retry / backpressure | `401b54e` | `behavior/gang/schedule.rs` | 5 |
+| Property test (K gangs × J islands) | `8a94438` | `behavior/gang/proptest.rs` | 1 |
+| DST (loom) ordered-acquire deadlock-freedom | `f359548` | `tests/loom_models.rs` | 1 |
+| Live wiring — island fold + publish API | `d0b57f2` | `mesh.rs` | — |
+| Node-level scheduler API + 2-node broadcast | `a327f72` | `mesh.rs`, `tests/gang_claim_node.rs` | 3 |
+| Refactor — `Claimant`/`GangScheduler` context bundles | `f279a96` | `behavior/gang/` | — |
+
+All five locked decisions hold in the code: island *is* the `ResourceId`
+(single-island gang = one existing CAS); match narrows / CAS commits (steps 1–3
+are pure reads); ordered-acquire on ascending `IslandId` for deadlock-freedom;
+CP on `Active` only (AP everywhere else); the epoch rides the existing
+`generation` rather than a new term.
+
+**Not yet built** (out of scope this pass):
+- The raise-able **hardware proof** — real GPUs, node-killed-mid-stream, a
+  partition injected, an MFU / tail-latency delta vs. Volcano / Kueue. Needs a
+  fleet, not code.
+- **Live quorum-ack RPC** — the `QuorumWitness` / `FenceLedger` logic and the
+  `commit_active` driver are built and tested with an in-process `ReplicaCohort`
+  (which models the split via a `reachable` subset); wiring the replica acks to
+  an on-wire RPC round-trip is the one remaining integration.
+- **Escrow (§7)** and **sub-island fractional claims** remain deferred exactly as
+  the plan states.
 
 ## Frame
 
