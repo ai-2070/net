@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/behavior/gang/mod.rs
+  s_b93d1d2fee6b2e::t_95685764f0b075 40,50
+net/crates/net/src/adapter/net/behavior/gang/multi.rs
+  s_b93d1d2fee6b2e::t_9c8247ec0da48b 1-163,165-426
+  s_b93d1d2fee6b2e::t_7c86638ddc33bf 164
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.11",
+  "base_commit_sha": "208caaba03921065180a9626c141081bb044ee57",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
