@@ -1,0 +1,55 @@
+net/crates/net/src/adapter/net/behavior/gang/claim.rs
+  s_b93d1d2fee6b2e::t_67bc2d44e13a54 204-238,245-251
+  s_b93d1d2fee6b2e::t_b67080460305e4 239-244
+net/crates/net/src/adapter/net/behavior/gang/mod.rs
+  s_b93d1d2fee6b2e::t_2dcbf5e3f15bbb 52
+  s_b93d1d2fee6b2e::t_13d12ed6ac9cc8 62-64
+  s_b93d1d2fee6b2e::t_eadb3faa29c475 144
+net/crates/net/src/adapter/net/behavior/gang/multi.rs
+  s_b93d1d2fee6b2e::t_3efe4b03bfeb9c 370,380,394
+  s_b93d1d2fee6b2e::t_d3fb3aa2f3114c 121-123,125,139-146
+  s_b93d1d2fee6b2e::t_83b8421e44635f 329,331
+  s_b93d1d2fee6b2e::t_60a41462622166 231,233,248,250
+  s_b93d1d2fee6b2e::t_ac7941c0d8ee14 33
+  s_b93d1d2fee6b2e::t_65a87c7513c3ad 291,293
+net/crates/net/src/adapter/net/behavior/gang/active.rs
+  s_b93d1d2fee6b2e::t_3017930fba7be3 25
+  s_b93d1d2fee6b2e::t_91e0acbd5169f4 101-104,106,129-130
+  s_b93d1d2fee6b2e::t_816ed88f0128ea 174,176
+  s_b93d1d2fee6b2e::t_325abe4f9606a3 143-145,148
+  s_b93d1d2fee6b2e::t_17c1cd5f3b8855 205,208-209,216-218
+  s_b93d1d2fee6b2e::t_3b9421470a7943 247,249
+  s_b93d1d2fee6b2e::t_835c01dc7e4bf5 23
+  s_b93d1d2fee6b2e::t_90380b998466b0 294-295
+  s_b93d1d2fee6b2e::t_e2bc07806cacad 262-264
+net/crates/net/src/adapter/net/behavior/gang/schedule.rs
+  s_b93d1d2fee6b2e::t_f909f0a5c18a3c 400-401,403-412
+  s_b93d1d2fee6b2e::t_fb5993dc7b161c 72-113,120,130,133-146,159-163,165-166,171-172,176,179,181,184,186
+  s_b93d1d2fee6b2e::t_0be08712500be6 330,332-337
+  s_b93d1d2fee6b2e::t_b2c946a84d1736 371,373-378
+  s_b93d1d2fee6b2e::t_c2c22804343198 303,305-310
+  s_b93d1d2fee6b2e::t_308b6a9c32da20 22
+  s_b93d1d2fee6b2e::t_a7aa8053c1450b 204
+  s_b93d1d2fee6b2e::t_94306b05e796e7 210
+  s_b93d1d2fee6b2e::t_4041108236e411 18
+  s_b93d1d2fee6b2e::t_ec2ba374635a33 431-432,434-443
+net/crates/net/src/adapter/net/behavior/gang/proptest.rs
+  s_b93d1d2fee6b2e::t_b2489d856925c6 25
+  s_b93d1d2fee6b2e::t_d06eaf32856be5 81,88,99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.11",
+  "base_commit_sha": "f279a96020fb6fd8a2ccdd3d05d6b58aaf6cac40",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
