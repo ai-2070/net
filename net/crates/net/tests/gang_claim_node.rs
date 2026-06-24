@@ -12,10 +12,13 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
+use net::adapter::net::behavior::capability::CapabilitySet;
 use net::adapter::net::behavior::fold::{
     CapabilityFilter, CapabilityFold, CapabilityMembership, CapabilityQuery, EnvelopeMeta, FoldKind,
-    GpuSet, IslandRecord, IslandTopologyFold, NodeState, SignedAnnouncement,
+    GpuSet, IslandQuery, IslandRecord, IslandTopologyFold, NodeState, ReservationQuery,
+    SignedAnnouncement,
 };
 use net::adapter::net::behavior::gang::{
     match_islands, single_island_claim, ClaimOutcome, MatchCriteria, NumericFilter, SelectionPolicy,
@@ -26,11 +29,34 @@ const PSK: [u8; 32] = [0x5a; 32];
 
 async fn build_node() -> Arc<MeshNode> {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let cfg = MeshNodeConfig::new(addr, PSK)
+        .with_heartbeat_interval(Duration::from_millis(200))
+        .with_session_timeout(Duration::from_secs(5))
+        .with_handshake(3, Duration::from_secs(2));
     Arc::new(
-        MeshNode::new(EntityKeypair::generate(), MeshNodeConfig::new(addr, PSK))
+        MeshNode::new(EntityKeypair::generate(), cfg)
             .await
             .expect("MeshNode::new"),
     )
+}
+
+/// House pattern: handshake `a` → `b` (and accept on `b`).
+async fn connect_pair(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
+    let a_id = a.node_id();
+    let b_pub = *b.public_key();
+    let b_addr = b.local_addr();
+    let b_id = b.node_id();
+    let b_clone = b.clone();
+    let accept = tokio::spawn(async move { b_clone.accept(a_id).await });
+    a.connect(b_addr, &b_pub, b_id).await.expect("connect");
+    accept.await.expect("accept task").expect("accept");
+}
+
+fn now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64
 }
 
 /// Sign a capability announcement (peer carries `tags`, Idle) and
@@ -122,11 +148,7 @@ async fn island_fold_is_wired_and_scheduler_matches_and_claims_over_node_folds()
     // Claim the top island through the node's reservation fold.
     let claimant = EntityKeypair::generate();
     let cn = claimant.entity_id().node_id();
-    let now_us = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as u64;
-    let deadline = now_us + 60_000_000;
+    let deadline = now_us() + 60_000_000;
     let got = single_island_claim(
         node.reservation_fold(),
         &claimant,
@@ -144,4 +166,136 @@ async fn island_fold_is_wired_and_scheduler_matches_and_claims_over_node_folds()
             .holder(),
         Some(cn),
     );
+}
+
+/// 2-node broadcast: a host publishes its island topology and it
+/// converges into a connected peer's island fold over the wire —
+/// proving the island fold is registered in the live dispatch path
+/// (`publish_island_topology` → `SUBPROTOCOL_FOLD` → peer's fold).
+///
+/// The host first announces capabilities: the `SUBPROTOCOL_FOLD`
+/// dispatch keys on `peer_entity_ids`, which the receiver populates
+/// from the publisher's capability announcement (the entity
+/// bootstrap). We then re-publish the island each poll so the
+/// one-shot broadcast can't race ahead of that bootstrap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn island_topology_broadcasts_to_a_connected_peer() {
+    let host = build_node().await;
+    let peer = build_node().await;
+    connect_pair(&host, &peer).await;
+    host.start();
+    peer.start();
+
+    let host_id = host.node_id();
+    // Bootstrap: the peer learns host's EntityId from this.
+    host.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce");
+
+    let record = IslandRecord {
+        id: 0xC0,
+        gpus: GpuSet::new(vec![0, 1, 2, 3]),
+        host: 0, // overwritten with host.node_id() by publish
+        warm_models: vec![0xA1],
+        load: 0.42,
+        p50_latency_us: 900,
+    };
+    let peer_view = peer.clone();
+    let mut converged = false;
+    for _ in 0..50 {
+        host.publish_island_topology(record.clone())
+            .await
+            .expect("publish island");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if !peer_view.island_fold().query(IslandQuery::Get(0xC0)).is_empty() {
+            converged = true;
+            break;
+        }
+    }
+    assert!(converged, "peer should fold the host's island announcement");
+
+    let row = peer.island_fold().query(IslandQuery::Get(0xC0));
+    assert_eq!(row[0].1.host, host_id, "host stamped as the announcer");
+    assert_eq!(row[0].1.load, 0.42);
+}
+
+/// Node-level claim round-trip: a scheduler node folds a GPU peer's
+/// capability + island (primed here as already-converged), runs
+/// `claim_gpu_island` against its OWN folds, and the resulting
+/// reservation broadcasts to a connected peer's reservation fold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn claim_gpu_island_reserves_and_broadcasts_to_peer() {
+    let scheduler = build_node().await;
+    let peer = build_node().await;
+    connect_pair(&scheduler, &peer).await;
+    scheduler.start();
+    peer.start();
+
+    // Bootstrap: the peer learns the scheduler's EntityId so the
+    // scheduler's reservation broadcasts will dispatch into the
+    // peer's fold.
+    scheduler
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce");
+
+    // A GPU peer's capability + island already folded into the
+    // scheduler's view (fold→fold convergence is exercised by the
+    // broadcast test above).
+    let gpu = EntityKeypair::generate();
+    let gn = gpu.entity_id().node_id();
+    prime_capability(&scheduler, &gpu, gn, vec!["gpu:h100".into()]);
+    prime_island(&scheduler, &gpu, gn, 0xD0, 0.1);
+
+    let criteria = MatchCriteria {
+        capability: CapabilityQuery::Composite(CapabilityFilter {
+            tags_all: vec!["gpu:h100".into()],
+            ..Default::default()
+        }),
+        numeric: NumericFilter {
+            min_gpus: 8,
+            ..Default::default()
+        },
+        selection: SelectionPolicy::LeastLoaded,
+        prefer_warm_model: None,
+    };
+
+    // First claim establishes the local hold (optimistic AP view).
+    let claimed = scheduler
+        .claim_gpu_island(&criteria, now_us() + 60_000_000)
+        .await
+        .expect("claim_gpu_island");
+    assert_eq!(claimed, Some(0xD0));
+    let sched_id = scheduler.node_id();
+    assert_eq!(
+        scheduler
+            .reservation_fold()
+            .query(ReservationQuery::State(0xD0))[0]
+            .1
+            .holder(),
+        Some(sched_id),
+    );
+
+    // Re-broadcast the reservation (a legal self-extend) each poll so
+    // it converges on the peer once the entity bootstrap has landed.
+    let peer_view = peer.clone();
+    let mut converged = false;
+    for _ in 0..50 {
+        scheduler
+            .reserve_island(0xD0, now_us() + 60_000_000)
+            .await
+            .expect("reserve");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if peer_view
+            .reservation_fold()
+            .query(ReservationQuery::State(0xD0))
+            .first()
+            .and_then(|(_, s)| s.holder())
+            == Some(sched_id)
+        {
+            converged = true;
+            break;
+        }
+    }
+    assert!(converged, "peer should see the scheduler's reservation converge");
 }

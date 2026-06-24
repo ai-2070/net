@@ -11075,6 +11075,112 @@ impl MeshNode {
         &self.island_fold
     }
 
+    /// Match GPU islands for a gang job by reading this node's
+    /// capability + island folds (Thunderdome §2 steps 1–3). Pure
+    /// read; returns the candidate islands in claim order. The
+    /// node-level entry to the match→claim pipeline.
+    pub fn match_gpu_islands(
+        &self,
+        criteria: &super::behavior::gang::MatchCriteria,
+    ) -> Vec<super::behavior::fold::IslandId> {
+        super::behavior::gang::match_islands(&self.capability_fold, &self.island_fold, criteria)
+    }
+
+    /// Reserve `island` under this node's identity: apply the
+    /// `Reserved` transition to the local reservation fold — this
+    /// node's optimistic AP view (locked decision 2) — and broadcast
+    /// it to peers. Returns the local CAS outcome (`Won` if the
+    /// island was free/unheld in this node's view, `Lost` if already
+    /// held). `until_unix_us` is the takeover deadline.
+    pub async fn reserve_island(
+        &self,
+        island: super::behavior::fold::IslandId,
+        until_unix_us: u64,
+    ) -> Result<super::behavior::gang::ClaimOutcome, AdapterError> {
+        self.apply_and_broadcast_reservation(
+            island,
+            super::behavior::fold::ReservationState::Reserved {
+                holder: self.node_id,
+                until_unix_us,
+            },
+        )
+        .await
+    }
+
+    /// Release `island` this node holds: apply `Free` locally and
+    /// broadcast. Returns the local CAS outcome (`Lost` if this node
+    /// wasn't the holder — a foreign release is refused by the fold).
+    pub async fn release_island(
+        &self,
+        island: super::behavior::fold::IslandId,
+    ) -> Result<super::behavior::gang::ClaimOutcome, AdapterError> {
+        self.apply_and_broadcast_reservation(island, super::behavior::fold::ReservationState::Free)
+            .await
+    }
+
+    /// Match GPU islands by `criteria` and reserve the first
+    /// available, all under this node's identity — the node-level
+    /// "schedule a single-island gang against my own folds" loop
+    /// (the `Reserved` reject walks to the next candidate). Returns
+    /// the claimed island, or `None` when nothing matched or every
+    /// match was contended in this node's view.
+    pub async fn claim_gpu_island(
+        &self,
+        criteria: &super::behavior::gang::MatchCriteria,
+        until_unix_us: u64,
+    ) -> Result<Option<super::behavior::fold::IslandId>, AdapterError> {
+        for island in self.match_gpu_islands(criteria) {
+            if matches!(
+                self.reserve_island(island, until_unix_us).await?,
+                super::behavior::gang::ClaimOutcome::Won
+            ) {
+                return Ok(Some(island));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Build a signed reservation transition, apply it to the local
+    /// reservation fold for the optimistic CAS outcome, and broadcast
+    /// it. Shared by [`Self::reserve_island`] / [`Self::release_island`].
+    async fn apply_and_broadcast_reservation(
+        &self,
+        island: super::behavior::fold::IslandId,
+        state: super::behavior::fold::ReservationState,
+    ) -> Result<super::behavior::gang::ClaimOutcome, AdapterError> {
+        use super::behavior::fold::{ApplyOutcome, FoldKind, ReservationFold};
+        let gen = self.next_fold_generation(ReservationFold::KIND_ID, island);
+        let meta = super::behavior::fold::EnvelopeMeta {
+            announced_at: super::current_timestamp_micros(),
+            ..Default::default()
+        };
+        let ann = super::behavior::fold::SignedAnnouncement::sign(
+            &self.identity,
+            ReservationFold::KIND_ID,
+            0,
+            self.node_id,
+            gen,
+            meta,
+            super::behavior::fold::ReservationAnnouncement {
+                resource_id: island,
+                state,
+            },
+        )
+        .map_err(|e| AdapterError::Connection(format!("reservation: sign failed: {e}")))?;
+        // Local optimistic CAS (this node's AP view), then propagate.
+        let outcome = self
+            .reservation_fold
+            .apply(ann.clone())
+            .map_err(|e| AdapterError::Connection(format!("reservation: apply failed: {e}")))?;
+        let _ = self.publish_fold_broadcast(&ann).await;
+        Ok(match outcome {
+            ApplyOutcome::Inserted | ApplyOutcome::Replaced => {
+                super::behavior::gang::ClaimOutcome::Won
+            }
+            ApplyOutcome::Rejected => super::behavior::gang::ClaimOutcome::Lost,
+        })
+    }
+
     /// Test-only helper — translate a legacy
     /// [`CapabilityAnnouncement`] into the fold-shaped envelope
     /// and apply it. Mirrors the inbound dispatch path's
