@@ -35,12 +35,14 @@
 //! [`ReservationFold`]: crate::adapter::net::behavior::fold::ReservationFold
 
 pub mod claim;
+pub mod contention;
 pub mod filter;
 
 pub use claim::{
     activate_announcement, activate_island, release_announcement, release_island,
     reserve_announcement, single_island_claim, ClaimError, ClaimOutcome,
 };
+pub use contention::claim_first_available;
 pub use filter::{
     candidate_hosts, numeric_filter, select_islands, NumericFilter, SelectionPolicy,
 };
