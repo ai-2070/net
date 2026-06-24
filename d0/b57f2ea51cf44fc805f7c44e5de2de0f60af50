@@ -1,0 +1,26 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_b93d1d2fee6b2e::t_87e572ae9c5722 1943-1951
+  s_b93d1d2fee6b2e::t_bf45fc8e6d5ff7 2365-2367,2371
+  s_b93d1d2fee6b2e::t_fa133d481e9988 2557
+  s_b93d1d2fee6b2e::t_1ac1260426da25 9241-9261
+  s_b93d1d2fee6b2e::t_d1eb7060c86637 11068-11077
+net/crates/net/tests/gang_claim_node.rs
+  s_b93d1d2fee6b2e::t_a23fd4c94826f1 1-124,130-147
+  s_b93d1d2fee6b2e::t_926022bc2990d7 125-129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.11",
+  "base_commit_sha": "d0b57f2ea51cf44fc805f7c44e5de2de0f60af50",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
