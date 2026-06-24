@@ -36,6 +36,13 @@ pub enum Trigger {
         /// The value that fires this branch.
         value: String,
     },
+    /// Failure-aware dependency: fires once `task` reaches **either**
+    /// terminal state (`Done` *or* `Failed`). This is the primitive
+    /// failure propagation needs — `AfterTask` only observes `Done`, so
+    /// a failed predecessor would leave its dependents armed forever.
+    /// A handler inspects the predecessor's status to branch on the
+    /// outcome (e.g. submit a compensating task on `Failed`).
+    AfterTerminal(TaskId),
     /// Timestamp: fires once the logical clock reaches `tick`. Time is
     /// an explicit input (never `now()`), preserving determinism.
     AtTick(u64),
@@ -82,6 +89,13 @@ impl<'a> TriggerWorld<'a> {
             .map(|s| s.status == TaskStatus::Done)
             .unwrap_or(false)
     }
+
+    fn task_terminal(&self, task: TaskId) -> bool {
+        self.tasks
+            .get(task)
+            .map(|s| s.status.is_terminal())
+            .unwrap_or(false)
+    }
 }
 
 static EMPTY_RESULTS: std::sync::OnceLock<HashMap<TaskId, HashMap<String, String>>> =
@@ -102,6 +116,7 @@ impl Trigger {
                         .map(|v| v == value)
                         .unwrap_or(false)
             }
+            Trigger::AfterTerminal(task) => world.task_terminal(*task),
             Trigger::AtTick(tick) => world.tick >= *tick,
         }
     }
@@ -110,7 +125,9 @@ impl Trigger {
     /// only the triggers keyed to it (perf note).
     fn key(&self) -> TriggerKey {
         match self {
-            Trigger::AfterTask(task) | Trigger::IfResult { task, .. } => TriggerKey::Task(*task),
+            Trigger::AfterTask(task)
+            | Trigger::IfResult { task, .. }
+            | Trigger::AfterTerminal(task) => TriggerKey::Task(*task),
             Trigger::AtTick(_) => TriggerKey::Tick,
         }
     }
@@ -253,6 +270,27 @@ mod tests {
             results: &empty,
         };
         assert!(!left.is_satisfied(&world2));
+    }
+
+    #[test]
+    fn after_terminal_fires_on_done_or_failed_but_not_running() {
+        let t = Trigger::AfterTerminal(1);
+        let running = state_with(&[(1, TaskStatus::Running)]);
+        let waiting = state_with(&[(1, TaskStatus::Waiting)]);
+        let done = state_with(&[(1, TaskStatus::Done)]);
+        let failed = state_with(&[(1, TaskStatus::Failed)]);
+        // Non-terminal → not satisfied (where AfterTask would also wait).
+        assert!(!t.is_satisfied(&TriggerWorld::new(&running, 0)));
+        assert!(!t.is_satisfied(&TriggerWorld::new(&waiting, 0)));
+        // BOTH terminal states fire — this is the failure-propagation
+        // primitive `AfterTask` (Done-only) lacks.
+        assert!(t.is_satisfied(&TriggerWorld::new(&done, 0)));
+        assert!(t.is_satisfied(&TriggerWorld::new(&failed, 0)));
+        // A `Failed` predecessor leaves an `AfterTask` armed forever but
+        // fires `AfterTerminal`.
+        assert!(!Trigger::AfterTask(1).is_satisfied(&TriggerWorld::new(&failed, 0)));
+        // Unknown task → not satisfied.
+        assert!(!t.is_satisfied(&TriggerWorld::new(&WorkflowState::new(), 0)));
     }
 
     #[test]
