@@ -801,3 +801,98 @@ fn gang_ordered_acquire_is_deadlock_free_and_all_or_none() {
         }
     });
 }
+
+// ─────────────────────────────────────────────────────────────
+// Model N+1: Partition-during-claim → quorum-`Active` fence
+// (Thunderdome §6 / Phase D — corrections §8 item 1)
+//
+// Mirrors the CP invariant of
+// `src/adapter/net/behavior/gang/active.rs::commit_active`: an
+// island's reservation chain is single-writer, and the fence —
+// `FenceLedger::accept_active` (accept iff `epoch >
+// highest_witnessed`) composed with the reservation fold's
+// generation-CAS replace — gates the `→ Active` transition. The
+// brutal-test #3 in `active.rs` proves this DETERMINISTICALLY
+// (a scripted 3|2 split); this models the same guarantee under
+// loom's exhaustive interleaving of two CONCURRENT would-be
+// leaders, which is the partition-during-claim race the audit
+// (§8 item 1) flagged as present in `active.rs` but absent from
+// the DST harness.
+//
+// The reservation cell packs `(epoch << 32) | leader_id` into one
+// `AtomicU64` (0 = Free) so the (epoch, holder) pair is read +
+// swapped atomically — the single-writer chain. A leader commits
+// only if it carries a STRICTLY-higher epoch than the incumbent
+// (the fence); the CAS makes the install atomic.
+//
+// Invariants under EVERY interleaving of leaders at epochs 2 and 3:
+//   - **At most one Active holder.** One cell, atomically swapped —
+//     never a torn (half-epoch-A, half-id-B) read.
+//   - **The fence holds: the higher epoch always wins.** The
+//     epoch-3 leader ends as the holder regardless of timing; the
+//     epoch-2 leader never holds at the end (it is refused if it
+//     races late, or replaced if it installed first). A stale
+//     ex-leader can never strand the island.
+//   - **Monotonic epoch.** The committed epoch never regresses.
+// ─────────────────────────────────────────────────────────────
+
+const FREE: u64 = 0;
+
+fn pack(epoch: u64, leader: u64) -> u64 {
+    (epoch << 32) | leader
+}
+fn epoch_of(state: u64) -> u64 {
+    state >> 32
+}
+
+/// One leader's `→ Active` commit attempt against the single-writer
+/// reservation cell. Commits iff it carries a strictly-higher epoch
+/// than the incumbent (the fence); `SeqCst` so the model explores the
+/// total order the production chain imposes. Returns whether it
+/// installed (it may later be replaced by a higher epoch).
+fn commit_active_fenced(cell: &AtomicU64, leader: u64, epoch: u64) -> bool {
+    loop {
+        let cur = cell.load(Ordering::SeqCst);
+        // Fence: an equal-or-lower epoch never displaces a live Active.
+        if cur != FREE && epoch <= epoch_of(cur) {
+            return false;
+        }
+        if cell
+            .compare_exchange(cur, pack(epoch, leader), Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return true;
+        }
+        // Lost the race — re-read and re-evaluate the fence.
+    }
+}
+
+#[test]
+fn partition_during_claim_fence_lets_only_the_higher_epoch_hold_active() {
+    loom::model(|| {
+        let cell = Arc::new(AtomicU64::new(FREE));
+
+        // Two would-be leaders race the commit: the ex-leader at the
+        // stale epoch 2, the new leader at epoch 3 (post leadership
+        // change). They model the two sides of a partition both
+        // attempting `→ Active` on the same island.
+        let stale = {
+            let c = cell.clone();
+            thread::spawn(move || commit_active_fenced(&c, 0xA, 2))
+        };
+        let fresh = {
+            let c = cell.clone();
+            thread::spawn(move || commit_active_fenced(&c, 0xB, 3))
+        };
+        let _stale_installed = stale.join().unwrap();
+        let fresh_installed = fresh.join().unwrap();
+
+        // The fence guarantee: the epoch-3 leader always ends up
+        // holding Active, and the stale epoch-2 leader never does —
+        // under every interleaving.
+        let end = cell.load(Ordering::SeqCst);
+        assert_eq!(epoch_of(end), 3, "the higher epoch wins the fence");
+        assert_eq!(end, pack(3, 0xB), "epoch-3 leader holds Active, single-writer");
+        assert!(fresh_installed, "the fresh leader always commits (over Free or the stale Active)");
+    });
+}
