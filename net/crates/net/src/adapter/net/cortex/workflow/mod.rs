@@ -24,6 +24,7 @@ mod dispatch;
 mod fold;
 pub mod lease;
 mod state;
+pub mod trigger;
 mod types;
 
 pub use adapter::WorkflowAdapter;
@@ -34,4 +35,5 @@ pub use dispatch::{
 pub use fold::WorkflowFold;
 pub use lease::{TaskLease, TaskLeaseOutcome};
 pub use state::WorkflowState;
+pub use trigger::{Action, Trigger, TriggerEngine, TriggerWorld};
 pub use types::{TaskId, TaskState, TaskStatus};
