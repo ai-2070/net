@@ -47,6 +47,13 @@ pub struct WorkflowState {
     /// signal (plan piece 6). Set by `request_cancel`, cleared on
     /// delete or a fresh submit.
     pub(super) cancelled: HashSet<TaskId>,
+    /// Parent → children lineage (shards, spawned children). Built from
+    /// `link` events; lets delete cascade over the subtree instead of
+    /// orphaning descendants (corrections #4).
+    pub(super) children: HashMap<TaskId, Vec<TaskId>>,
+    /// Child → parent reverse edges, so a deleted root can detach from
+    /// its parent's child list.
+    pub(super) parents: HashMap<TaskId, TaskId>,
 }
 
 impl WorkflowState {
@@ -98,6 +105,40 @@ impl WorkflowState {
     /// Number of tasks with a pending cancel request.
     pub fn cancel_requested_count(&self) -> usize {
         self.cancelled.len()
+    }
+
+    /// Direct children (shards / spawned children) of `id`.
+    pub fn children_of(&self, id: TaskId) -> &[TaskId] {
+        self.children.get(&id).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// The parent of `id`, if it was linked under one.
+    pub fn parent_of(&self, id: TaskId) -> Option<TaskId> {
+        self.parents.get(&id).copied()
+    }
+
+    /// Every transitive descendant of `id` (children, grandchildren,
+    /// …), excluding `id` itself. The set a delete cascades over; the
+    /// caller also uses it to prune triggers waiting on the subtree.
+    /// Deterministic order (BFS).
+    pub fn descendants(&self, id: TaskId) -> Vec<TaskId> {
+        let mut out = Vec::new();
+        let mut queue = std::collections::VecDeque::from(self.children_of(id).to_vec());
+        while let Some(t) = queue.pop_front() {
+            if out.contains(&t) {
+                continue; // cycle guard (lineage should be a forest)
+            }
+            out.push(t);
+            queue.extend(self.children_of(t).iter().copied());
+        }
+        out
+    }
+
+    /// `id` plus all its descendants — the full subtree a delete removes.
+    pub fn subtree(&self, id: TaskId) -> Vec<TaskId> {
+        let mut all = vec![id];
+        all.extend(self.descendants(id));
+        all
     }
 
     /// Roll-up of task counts per status (observability summary).

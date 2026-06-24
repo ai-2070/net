@@ -194,6 +194,15 @@ impl TriggerEngine {
         fired.into_iter().map(|(_, action)| action).collect()
     }
 
+    /// `task` was deleted: drop every trigger waiting on it — they can
+    /// never fire (the task is gone), so leaving them armed would leak
+    /// (corrections #4). Returns the number dropped. When deleting a
+    /// subtree, call this for each id in
+    /// [`WorkflowAdapter::subtree`](super::WorkflowAdapter::subtree).
+    pub fn on_delete(&mut self, task: TaskId) -> usize {
+        self.by_task.remove(&task).map(|v| v.len()).unwrap_or(0)
+    }
+
     /// Total triggers still armed (not yet fired).
     pub fn armed_count(&self) -> usize {
         self.by_task.values().map(Vec::len).sum::<usize>() + self.by_tick.len()
@@ -374,6 +383,29 @@ mod tests {
         // hold under a different recorded result — though for a Done
         // task it won't; disarming is the caller's policy).
         assert_eq!(eng.armed_count(), 1);
+    }
+
+    #[test]
+    fn on_delete_prunes_triggers_waiting_on_the_task() {
+        // Two tasks (A, B) each gate a dependent; deleting A drops only
+        // A's armed trigger (corrections #4 — they can never fire).
+        let mut eng = TriggerEngine::new();
+        eng.arm(Trigger::AfterTask(1), Action::Submit(10));
+        eng.arm(Trigger::AfterTerminal(1), Action::Submit(11));
+        eng.arm(Trigger::AfterTask(2), Action::Submit(20));
+        assert_eq!(eng.armed_count(), 3);
+
+        // Delete task 1 → both triggers waiting on it are dropped.
+        assert_eq!(eng.on_delete(1), 2);
+        assert_eq!(eng.armed_count(), 1);
+        // Deleting an id with no armed triggers is a no-op.
+        assert_eq!(eng.on_delete(99), 0);
+        // Task 2's trigger survives and still fires.
+        let done2 = state_with(&[(2, TaskStatus::Done)]);
+        assert_eq!(
+            eng.on_task_change(2, &TriggerWorld::new(&done2, 0)),
+            vec![Action::Submit(20)]
+        );
     }
 
     #[test]

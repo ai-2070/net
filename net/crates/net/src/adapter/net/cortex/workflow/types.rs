@@ -113,3 +113,11 @@ pub(super) struct DeletedPayload {
 pub(super) struct CancelRequestedPayload {
     pub id: TaskId,
 }
+
+/// Payload for `DISPATCH_TASK_LINKED` — record a parent→child lineage
+/// edge so delete cascades to the subtree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct LinkedPayload {
+    pub parent: TaskId,
+    pub child: TaskId,
+}

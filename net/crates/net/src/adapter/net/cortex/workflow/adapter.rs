@@ -24,13 +24,14 @@ use super::super::meta::{compute_checksum_with_meta, EventMeta, EVENT_META_SIZE}
 use super::super::watermark::WatermarkingFold;
 use super::dispatch::{
     DISPATCH_TASK_ADVANCED, DISPATCH_TASK_CANCEL_REQUESTED, DISPATCH_TASK_DELETED,
-    DISPATCH_TASK_RETRIED, DISPATCH_TASK_SUBMITTED, DISPATCH_TASK_TRANSITIONED, WORKFLOW_CHANNEL,
+    DISPATCH_TASK_LINKED, DISPATCH_TASK_RETRIED, DISPATCH_TASK_SUBMITTED, DISPATCH_TASK_TRANSITIONED,
+    WORKFLOW_CHANNEL,
 };
 use super::fold::WorkflowFold;
 use super::state::{StatusCounts, WorkflowState};
 use super::types::{
-    AdvancedPayload, CancelRequestedPayload, DeletedPayload, RetriedPayload, SubmittedPayload,
-    TaskId, TaskState, TaskStatus, TransitionedPayload,
+    AdvancedPayload, CancelRequestedPayload, DeletedPayload, LinkedPayload, RetriedPayload,
+    SubmittedPayload, TaskId, TaskState, TaskStatus, TransitionedPayload,
 };
 
 /// Wire format for [`WorkflowAdapter::snapshot`]: wraps the
@@ -150,9 +151,21 @@ impl WorkflowAdapter {
         self.ingest_typed(DISPATCH_TASK_RETRIED, &RetriedPayload { id })
     }
 
-    /// Delete a task, reclaiming its subtree.
+    /// Delete a task, reclaiming its **whole subtree** — every linked
+    /// descendant (shards, spawned children) is removed too, so an
+    /// orphaned shard can't keep running (and keep holding a claim).
+    /// To also drop triggers waiting on the subtree, read
+    /// [`Self::subtree`] before deleting and call
+    /// [`TriggerEngine::on_delete`](super::TriggerEngine::on_delete) for
+    /// each id.
     pub fn delete(&self, id: TaskId) -> Result<u64, CortexAdapterError> {
         self.ingest_typed(DISPATCH_TASK_DELETED, &DeletedPayload { id })
+    }
+
+    /// Record a parent→child lineage edge (a shard / spawned child), so
+    /// [`Self::delete`] of the parent cascades to `child`. Idempotent.
+    pub fn link(&self, parent: TaskId, child: TaskId) -> Result<u64, CortexAdapterError> {
+        self.ingest_typed(DISPATCH_TASK_LINKED, &LinkedPayload { parent, child })
     }
 
     /// Request cancellation of `id` — a worker-observed signal (the
@@ -178,6 +191,13 @@ impl WorkflowAdapter {
     /// Has cancellation been requested for `id`? The worker polls this.
     pub fn is_cancel_requested(&self, id: TaskId) -> bool {
         self.inner.state().read().is_cancel_requested(id)
+    }
+
+    /// `id` plus all its transitive descendants — the subtree a
+    /// [`Self::delete`] removes. Read this before deleting to prune the
+    /// trigger engine over the same set.
+    pub fn subtree(&self, id: TaskId) -> Vec<TaskId> {
+        self.inner.state().read().subtree(id)
     }
 
     /// Roll-up of task counts per status — the observability summary.
@@ -340,6 +360,58 @@ mod tests {
         let seq = wf.delete(3).unwrap();
         wf.wait_for_seq(seq).await.unwrap();
         assert!(wf.get(3).is_none());
+    }
+
+    /// Delete cascades over the linked subtree — children and
+    /// grandchildren go too (corrections #4), while an unrelated subtree
+    /// is untouched.
+    #[tokio::test]
+    async fn delete_cascades_over_the_linked_subtree() {
+        let (_redex, wf) = open().await;
+        // Tree: 1 → {2, 3}, 3 → {4}. Plus an unrelated 10 → {11}.
+        for id in [1, 2, 3, 4, 10, 11] {
+            wf.submit(id).unwrap();
+        }
+        wf.link(1, 2).unwrap();
+        wf.link(1, 3).unwrap();
+        wf.link(3, 4).unwrap();
+        wf.link(10, 11).unwrap();
+        let seq = wf.link(10, 11).unwrap(); // idempotent re-link
+        wf.wait_for_seq(seq).await.unwrap();
+
+        assert_eq!(wf.subtree(1), vec![1, 2, 3, 4]);
+        assert_eq!(wf.state().read().children_of(10), &[11]); // not double-linked
+
+        // Delete the root: the whole subtree is reclaimed in one event.
+        let seq = wf.delete(1).unwrap();
+        wf.wait_for_seq(seq).await.unwrap();
+        for id in [1, 2, 3, 4] {
+            assert!(wf.get(id).is_none(), "subtree member {id} reclaimed");
+        }
+        // The unrelated subtree survives.
+        assert!(wf.get(10).is_some());
+        assert!(wf.get(11).is_some());
+    }
+
+    /// Deleting a non-root detaches it from its parent's child list, so
+    /// a later delete of the parent doesn't dangle.
+    #[tokio::test]
+    async fn delete_detaches_child_from_parent_lineage() {
+        let (_redex, wf) = open().await;
+        for id in [1, 2, 3] {
+            wf.submit(id).unwrap();
+        }
+        wf.link(1, 2).unwrap();
+        let seq = wf.link(1, 3).unwrap();
+        wf.wait_for_seq(seq).await.unwrap();
+
+        // Delete child 2 directly.
+        let seq = wf.delete(2).unwrap();
+        wf.wait_for_seq(seq).await.unwrap();
+        assert!(wf.get(2).is_none());
+        // Parent 1 now lists only 3.
+        assert_eq!(wf.state().read().children_of(1), &[3]);
+        assert_eq!(wf.subtree(1), vec![1, 3]);
     }
 
     /// Replay / failover-resume: a second adapter opened against the

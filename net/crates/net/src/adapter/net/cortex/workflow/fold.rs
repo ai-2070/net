@@ -11,12 +11,12 @@ use super::super::meta::{
 };
 use super::dispatch::{
     DISPATCH_TASK_ADVANCED, DISPATCH_TASK_CANCEL_REQUESTED, DISPATCH_TASK_DELETED,
-    DISPATCH_TASK_RETRIED, DISPATCH_TASK_SUBMITTED, DISPATCH_TASK_TRANSITIONED,
+    DISPATCH_TASK_LINKED, DISPATCH_TASK_RETRIED, DISPATCH_TASK_SUBMITTED, DISPATCH_TASK_TRANSITIONED,
 };
 use super::state::WorkflowState;
 use super::types::{
-    AdvancedPayload, CancelRequestedPayload, DeletedPayload, RetriedPayload, SubmittedPayload,
-    TaskState, TaskStatus, TransitionedPayload,
+    AdvancedPayload, CancelRequestedPayload, DeletedPayload, LinkedPayload, RetriedPayload,
+    SubmittedPayload, TaskState, TaskStatus, TransitionedPayload,
 };
 
 /// Fold implementation for the task-lifecycle model.
@@ -90,9 +90,24 @@ impl RedexFold<WorkflowState> for WorkflowFold {
             DISPATCH_TASK_DELETED => {
                 let p: DeletedPayload =
                     postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
-                state.tasks.remove(&p.id);
-                // Reclaim the subtree — drop any pending cancel signal.
-                state.cancelled.remove(&p.id);
+                // Cascade: delete reclaims the WHOLE subtree (shards /
+                // spawned children), not just the named task — an
+                // orphaned shard would keep running and keep holding its
+                // claim (corrections #4). The subtree is computed from
+                // the folded lineage, so it's deterministic / replayable.
+                let subtree = state.subtree(p.id);
+                // Detach the root from its parent's child list.
+                if let Some(parent) = state.parents.get(&p.id).copied() {
+                    if let Some(sibs) = state.children.get_mut(&parent) {
+                        sibs.retain(|c| *c != p.id);
+                    }
+                }
+                for t in subtree {
+                    state.tasks.remove(&t);
+                    state.cancelled.remove(&t);
+                    state.children.remove(&t);
+                    state.parents.remove(&t);
+                }
             }
             DISPATCH_TASK_CANCEL_REQUESTED => {
                 let p: CancelRequestedPayload =
@@ -100,6 +115,17 @@ impl RedexFold<WorkflowState> for WorkflowFold {
                 // Record the signal for the worker to observe; the
                 // status transition itself is the worker's to make.
                 state.cancelled.insert(p.id);
+            }
+            DISPATCH_TASK_LINKED => {
+                let p: LinkedPayload =
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
+                // Record the lineage edge (idempotent — a duplicate link
+                // doesn't double-insert the child).
+                let kids = state.children.entry(p.parent).or_default();
+                if !kids.contains(&p.child) {
+                    kids.push(p.child);
+                }
+                state.parents.insert(p.child, p.parent);
             }
             other => {
                 // Unknown dispatches in the CortEX-internal range are

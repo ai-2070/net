@@ -228,12 +228,18 @@ pub enum JoinStatus {
     Pending,
 }
 
-/// Fan out: submit every shard task. Returns the last append seq (0 if
-/// the group has no shards).
+/// Fan out: submit every shard task. When the group was
+/// [`derived`](ShardGroup::derived) from a parent, also record the
+/// parent→shard lineage so a later [`delete`](super::WorkflowAdapter::delete)
+/// of the parent cascades to the shards (corrections #4). Returns the
+/// last append seq (0 if the group has no shards).
 pub fn fan_out(wf: &WorkflowAdapter, group: &ShardGroup) -> Result<u64, CortexAdapterError> {
     let mut last = 0;
     for &shard in group.shards() {
         last = wf.submit(shard)?;
+        if let Some(parent) = group.parent() {
+            last = wf.link(parent, shard)?;
+        }
     }
     Ok(last)
 }
@@ -280,7 +286,15 @@ pub fn try_join_with(
         return Ok(Join::AlreadySubmitted);
     }
     match status {
-        JoinStatus::Ready => Ok(Join::Submitted(wf.submit(group.reduce())?)),
+        JoinStatus::Ready => {
+            let mut seq = wf.submit(group.reduce())?;
+            // Link the reduce under the parent too, so deleting the job
+            // reclaims its fan-in along with the shards.
+            if let Some(parent) = group.parent() {
+                seq = wf.link(parent, group.reduce())?;
+            }
+            Ok(Join::Submitted(seq))
+        }
         JoinStatus::Failed(f) => Ok(Join::Failed(f)),
         JoinStatus::Pending => Ok(Join::Pending),
     }
@@ -567,6 +581,32 @@ mod tests {
         );
         // Siblings untouched — the failed shard can be retried to clear.
         assert!(!wf.is_cancel_requested(shards[2]));
+    }
+
+    /// `fan_out` of a derived group records lineage, so deleting the
+    /// parent job reclaims all its shards (corrections #4 — no orphaned
+    /// shards left running).
+    #[tokio::test]
+    async fn delete_parent_reclaims_all_shards() {
+        let redex = Redex::new();
+        let wf = WorkflowAdapter::open(&redex, 0x0F10_00C4).await.unwrap();
+        let group = ShardGroup::derived(7, 3, 99);
+        let shards = group.shards().to_vec();
+        let seq = wf.submit(7).unwrap();
+        wf.wait_for_seq(seq).await.unwrap();
+        let seq = fan_out(&wf, &group).unwrap();
+        wf.wait_for_seq(seq).await.unwrap();
+        for s in &shards {
+            assert!(wf.get(*s).is_some());
+        }
+
+        // Delete the job → its shards cascade away.
+        let seq = wf.delete(7).unwrap();
+        wf.wait_for_seq(seq).await.unwrap();
+        assert!(wf.get(7).is_none());
+        for s in &shards {
+            assert!(wf.get(*s).is_none(), "shard {s} reclaimed with the parent");
+        }
     }
 
     /// Shards have **independent** leases: distinct shard ids are

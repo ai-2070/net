@@ -22,6 +22,10 @@ pub const DISPATCH_TASK_DELETED: u8 = 0x05;
 /// and drives the task to a terminal status; this event only records
 /// the request.
 pub const DISPATCH_TASK_CANCEL_REQUESTED: u8 = 0x06;
+/// A parent→child lineage edge (a shard / spawned child of a parent
+/// job). Records the subtree linkage so [`DISPATCH_TASK_DELETED`]
+/// cascades to descendants instead of orphaning them.
+pub const DISPATCH_TASK_LINKED: u8 = 0x07;
 
 /// Canonical channel name for the task-lifecycle model.
 pub const WORKFLOW_CHANNEL: &str = "cortex/workflow";
@@ -35,4 +39,5 @@ const _: () = {
     assert!(DISPATCH_TASK_RETRIED < 0x80);
     assert!(DISPATCH_TASK_DELETED < 0x80);
     assert!(DISPATCH_TASK_CANCEL_REQUESTED < 0x80);
+    assert!(DISPATCH_TASK_LINKED < 0x80);
 };
