@@ -34,27 +34,38 @@ pub fn derive_shard_ids(parent: TaskId, count: usize) -> Vec<TaskId> {
         .collect()
 }
 
-/// A fan-out: K independent shard tasks plus a reduce task gated on all
-/// of them reaching `Done`.
+/// A fan-out: K independent shard tasks plus a reduce task gated on the
+/// **join** of all of them (per the group's [`JoinPolicy`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardGroup {
     shards: Vec<TaskId>,
     reduce: TaskId,
+    /// The job task that fanned out, if known — the propagation target
+    /// for [`propagate_failure`] / [`block_on_failure`]. `None` for a
+    /// group built from explicit ids with no owning job.
+    parent: Option<TaskId>,
 }
 
 impl ShardGroup {
     /// Build a group from explicit shard ids and a reduce id (the
-    /// caller owns the task-id space).
+    /// caller owns the task-id space). No parent — failure propagation
+    /// targets only the shards themselves.
     pub fn new(shards: Vec<TaskId>, reduce: TaskId) -> Self {
-        Self { shards, reduce }
+        Self {
+            shards,
+            reduce,
+            parent: None,
+        }
     }
 
     /// Build a group whose shard ids are [`derive_shard_ids`] of
-    /// `parent`, with an explicit reduce id.
+    /// `parent`, with an explicit reduce id. `parent` is retained as
+    /// the failure-propagation target.
     pub fn derived(parent: TaskId, shard_count: usize, reduce: TaskId) -> Self {
         Self {
             shards: derive_shard_ids(parent, shard_count),
             reduce,
+            parent: Some(parent),
         }
     }
 
@@ -66,6 +77,12 @@ impl ShardGroup {
     /// The reduce task id (the fan-in).
     pub fn reduce(&self) -> TaskId {
         self.reduce
+    }
+
+    /// The owning job task (the propagation target), if this group was
+    /// [`derived`](Self::derived) from one.
+    pub fn parent(&self) -> Option<TaskId> {
+        self.parent
     }
 
     /// Number of shards.
@@ -84,7 +101,8 @@ impl ShardGroup {
         })
     }
 
-    /// Shards not yet `Done` (progress / which to retry).
+    /// Shards not yet `Done` (progress / which to retry). Includes
+    /// `Failed` shards — they are "not done" until retried.
     pub fn pending(&self, state: &WorkflowState) -> Vec<TaskId> {
         self.shards
             .iter()
@@ -97,6 +115,117 @@ impl ShardGroup {
             })
             .collect()
     }
+
+    /// Shards currently in `Failed` — symmetric with [`pending`](Self::pending).
+    /// A non-empty result is what `AllOrNothing` propagates on.
+    pub fn failed(&self, state: &WorkflowState) -> Vec<TaskId> {
+        self.shards
+            .iter()
+            .copied()
+            .filter(|s| {
+                state
+                    .get(*s)
+                    .map(|t| t.status == TaskStatus::Failed)
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// Count of shards currently `Done`.
+    pub fn done_count(&self, state: &WorkflowState) -> usize {
+        self.shards
+            .iter()
+            .filter(|s| {
+                state
+                    .get(**s)
+                    .map(|t| t.status == TaskStatus::Done)
+                    .unwrap_or(false)
+            })
+            .count()
+    }
+
+    /// Evaluate the join under `policy` — the failure-aware fan-in
+    /// status. Pure + deterministic. A failed shard never silently
+    /// hangs the reduce (the corrections #2 fix): it surfaces as
+    /// [`JoinStatus::Failed`] under `AllOrNothing`, or is tolerated
+    /// under `BestEffort` / `Threshold`.
+    pub fn join_status(&self, state: &WorkflowState, policy: JoinPolicy) -> JoinStatus {
+        let failed = self.failed(state);
+        let done = self.done_count(state);
+        let total = self.shards.len();
+        match policy {
+            JoinPolicy::AllOrNothing => {
+                if !failed.is_empty() {
+                    JoinStatus::Failed(failed)
+                } else if done == total {
+                    JoinStatus::Ready
+                } else {
+                    JoinStatus::Pending
+                }
+            }
+            JoinPolicy::BestEffort => {
+                // Ready once every shard is terminal (Done or Failed);
+                // the reducer decides what to do with partial results.
+                let terminal = self
+                    .shards
+                    .iter()
+                    .filter(|s| {
+                        state
+                            .get(**s)
+                            .map(|t| t.status.is_terminal())
+                            .unwrap_or(false)
+                    })
+                    .count();
+                if terminal == total {
+                    JoinStatus::Ready
+                } else {
+                    JoinStatus::Pending
+                }
+            }
+            JoinPolicy::Threshold(n) => {
+                if done >= n {
+                    JoinStatus::Ready
+                } else if total.saturating_sub(failed.len()) < n {
+                    // Even if every still-running shard finishes, `n`
+                    // is unreachable — the join can never satisfy.
+                    JoinStatus::Failed(failed)
+                } else {
+                    JoinStatus::Pending
+                }
+            }
+        }
+    }
+}
+
+/// How a fan-in treats shards reaching terminal states. The default
+/// (`AllOrNothing`) is strict map-reduce; the others are escape hatches
+/// the structure supports without API breakage (corrections #2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JoinPolicy {
+    /// Reduce fires only when **all** shards are `Done`; any `Failed`
+    /// shard fails the join. The default.
+    #[default]
+    AllOrNothing,
+    /// Reduce fires once **every** shard is terminal (`Done` or
+    /// `Failed`); the reducer inspects which succeeded. For
+    /// embarrassingly-parallel work where partial results are usable.
+    BestEffort,
+    /// Reduce fires once at least `n` shards are `Done` (quorum
+    /// map-reduce); becomes unsatisfiable — and so `Failed` — once too
+    /// many shards have failed for `n` to be reachable.
+    Threshold(usize),
+}
+
+/// The join's verdict under a [`JoinPolicy`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinStatus {
+    /// The join is satisfied — submit the reduce.
+    Ready,
+    /// The join can never be satisfied: these shards `Failed`. The
+    /// caller propagates ([`propagate_failure`] / [`block_on_failure`]).
+    Failed(Vec<TaskId>),
+    /// Not yet — shards still running, none disqualifying.
+    Pending,
 }
 
 /// Fan out: submit every shard task. Returns the last append seq (0 if
@@ -110,33 +239,93 @@ pub fn fan_out(wf: &WorkflowAdapter, group: &ShardGroup) -> Result<u64, CortexAd
 }
 
 /// Result of a [`try_join`] attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Join {
-    /// Every shard is `Done` and the reduce was just submitted at this
+    /// The join was satisfied and the reduce was just submitted at this
     /// seq — `wait_for_seq(seq)` to observe it fold in.
     Submitted(u64),
     /// The reduce was already submitted by a prior `try_join`
     /// (idempotent — not re-submitted).
     AlreadySubmitted,
-    /// Shards aren't all `Done` yet; the reduce stays gated.
+    /// The join isn't satisfied yet; the reduce stays gated.
     Pending,
+    /// The join can **never** be satisfied under the policy: these
+    /// shards `Failed`. The reduce is not submitted — the caller
+    /// propagates the failure ([`propagate_failure`] /
+    /// [`block_on_failure`]) instead of waiting forever (corrections #2).
+    Failed(Vec<TaskId>),
 }
 
-/// Join: if every shard is `Done`, submit the reduce (once) and return
-/// [`Join::Submitted`]; if it was already submitted return
-/// [`Join::AlreadySubmitted`]; otherwise [`Join::Pending`]. Idempotent.
+/// Join under the default [`JoinPolicy::AllOrNothing`]: submit the
+/// reduce once every shard is `Done`; surface [`Join::Failed`] if any
+/// shard failed; otherwise [`Join::Pending`]. Idempotent.
 pub fn try_join(wf: &WorkflowAdapter, group: &ShardGroup) -> Result<Join, CortexAdapterError> {
-    let (already, ready) = {
+    try_join_with(wf, group, JoinPolicy::AllOrNothing)
+}
+
+/// Like [`try_join`] but with an explicit [`JoinPolicy`]. Idempotent:
+/// once the reduce is present, returns [`Join::AlreadySubmitted`]
+/// regardless of policy.
+pub fn try_join_with(
+    wf: &WorkflowAdapter,
+    group: &ShardGroup,
+    policy: JoinPolicy,
+) -> Result<Join, CortexAdapterError> {
+    let (already, status) = {
         let state = wf.state();
         let guard = state.read();
-        (guard.contains(group.reduce()), group.join_ready(&guard))
+        (guard.contains(group.reduce()), group.join_status(&guard, policy))
     };
     if already {
-        Ok(Join::AlreadySubmitted)
-    } else if ready {
-        Ok(Join::Submitted(wf.submit(group.reduce())?))
-    } else {
-        Ok(Join::Pending)
+        return Ok(Join::AlreadySubmitted);
+    }
+    match status {
+        JoinStatus::Ready => Ok(Join::Submitted(wf.submit(group.reduce())?)),
+        JoinStatus::Failed(f) => Ok(Join::Failed(f)),
+        JoinStatus::Pending => Ok(Join::Pending),
+    }
+}
+
+/// Propagate a shard failure as **terminal** (the `AllOrNothing`
+/// default disposition): request-cancel every still-pending shard so
+/// they stop holding work / claims, then mark the group's `parent`
+/// `Failed`. Returns the last append seq, or `Ok(0)` if there's nothing
+/// to do (no parent, no pending shards). Idempotent-ish: re-running
+/// re-issues cancels, which are themselves idempotent signals.
+pub fn propagate_failure(
+    wf: &WorkflowAdapter,
+    group: &ShardGroup,
+) -> Result<u64, CortexAdapterError> {
+    let mut last = 0;
+    // Stop the siblings — an orphaned shard that keeps running keeps
+    // holding whatever resource/claim it acquired (the stranded-GPU
+    // failure mode of the audit's cross-cutting rule).
+    let pending = group.pending(&wf.state().read());
+    for shard in pending {
+        last = wf.request_cancel(shard)?;
+    }
+    if let Some(parent) = group.parent() {
+        last = wf.fail(parent)?;
+    }
+    Ok(last)
+}
+
+/// Propagate a shard failure as **recoverable**: mark the group's
+/// `parent` `Blocked` — it cannot proceed on its own, but an operator
+/// (or a retry policy) can re-run the failed shards, and when they
+/// reach `Done` the join is re-evaluated. Unlike [`propagate_failure`]
+/// this does **not** cancel the other shards. This is the real call
+/// site that gives `Blocked` distinct semantics from `Waiting`
+/// (corrections #1: `Blocked` = parked on external state, not a
+/// self-retrying claim reject). Returns the append seq, or `Ok(0)` if
+/// the group has no parent.
+pub fn block_on_failure(
+    wf: &WorkflowAdapter,
+    group: &ShardGroup,
+) -> Result<u64, CortexAdapterError> {
+    match group.parent() {
+        Some(parent) => wf.block(parent),
+        None => Ok(0),
     }
 }
 
@@ -156,6 +345,21 @@ mod tests {
                 TaskState {
                     step: 0,
                     status: TaskStatus::Done,
+                    attempts: 0,
+                },
+            );
+        }
+        s
+    }
+
+    fn state_with(pairs: &[(TaskId, TaskStatus)]) -> WorkflowState {
+        let mut s = WorkflowState::new();
+        for (id, status) in pairs {
+            s.tasks.insert(
+                *id,
+                TaskState {
+                    step: 0,
+                    status: *status,
                     attempts: 0,
                 },
             );
@@ -243,6 +447,126 @@ mod tests {
         assert_eq!(try_join(&wf, &group).unwrap(), Join::AlreadySubmitted);
         // The retried shard recorded its attempt.
         assert_eq!(wf.get(11).unwrap().attempts, 1);
+    }
+
+    // --- corrections #2 / #1: failure propagation + Blocked ---
+
+    #[test]
+    fn failed_shard_surfaces_as_join_failed_not_pending() {
+        let group = ShardGroup::new(vec![1, 2, 3], 9);
+        // Shard 2 failed, 1 done, 3 still running.
+        let st = state_with(&[
+            (1, TaskStatus::Done),
+            (2, TaskStatus::Failed),
+            (3, TaskStatus::Running),
+        ]);
+        // The old join_ready hangs (never all-Done); join_status names
+        // the failure instead — the hang fix.
+        assert!(!group.join_ready(&st));
+        assert_eq!(group.failed(&st), vec![2]);
+        assert_eq!(
+            group.join_status(&st, JoinPolicy::AllOrNothing),
+            JoinStatus::Failed(vec![2]),
+        );
+    }
+
+    #[test]
+    fn best_effort_joins_when_every_shard_is_terminal() {
+        let group = ShardGroup::new(vec![1, 2, 3], 9);
+        let mixed = state_with(&[
+            (1, TaskStatus::Done),
+            (2, TaskStatus::Failed),
+            (3, TaskStatus::Running),
+        ]);
+        // One still running → not ready.
+        assert_eq!(group.join_status(&mixed, JoinPolicy::BestEffort), JoinStatus::Pending);
+        // All terminal (Done + Failed) → ready; reducer sees partials.
+        let terminal = state_with(&[
+            (1, TaskStatus::Done),
+            (2, TaskStatus::Failed),
+            (3, TaskStatus::Done),
+        ]);
+        assert_eq!(group.join_status(&terminal, JoinPolicy::BestEffort), JoinStatus::Ready);
+    }
+
+    #[test]
+    fn threshold_joins_at_n_done_and_fails_once_unreachable() {
+        let group = ShardGroup::new(vec![1, 2, 3], 9);
+        // Need 2 of 3 Done. One Done, two running → pending.
+        let one = state_with(&[(1, TaskStatus::Done), (2, TaskStatus::Running), (3, TaskStatus::Running)]);
+        assert_eq!(group.join_status(&one, JoinPolicy::Threshold(2)), JoinStatus::Pending);
+        // Two Done → ready.
+        let two = state_with(&[(1, TaskStatus::Done), (2, TaskStatus::Done), (3, TaskStatus::Running)]);
+        assert_eq!(group.join_status(&two, JoinPolicy::Threshold(2)), JoinStatus::Ready);
+        // One Done, two Failed → only 1 can ever be Done < 2 → Failed.
+        let lost = state_with(&[(1, TaskStatus::Done), (2, TaskStatus::Failed), (3, TaskStatus::Failed)]);
+        assert_eq!(
+            group.join_status(&lost, JoinPolicy::Threshold(2)),
+            JoinStatus::Failed(vec![2, 3]),
+        );
+    }
+
+    /// A failed shard makes `try_join` return `Failed` (not hang on
+    /// `Pending`), and `propagate_failure` cancels the still-pending
+    /// siblings and fails the parent job.
+    #[tokio::test]
+    async fn propagate_failure_cancels_pending_and_fails_parent() {
+        let redex = Redex::new();
+        let wf = WorkflowAdapter::open(&redex, 0x0F10_00C2).await.unwrap();
+        // Group derived from parent 7 (so it has a propagation target).
+        let group = ShardGroup::derived(7, 3, 99);
+        let shards = group.shards().to_vec();
+        let seq = wf.submit(7).unwrap(); // the job task
+        wf.wait_for_seq(seq).await.unwrap();
+        let seq = fan_out(&wf, &group).unwrap();
+        wf.wait_for_seq(seq).await.unwrap();
+
+        // Shard 0 done, shard 1 FAILED, shard 2 still running.
+        wf.complete(shards[0]).unwrap();
+        let seq = wf.fail(shards[1]).unwrap();
+        wf.wait_for_seq(seq).await.unwrap();
+
+        // try_join surfaces the failure rather than hanging.
+        assert_eq!(
+            try_join(&wf, &group).unwrap(),
+            Join::Failed(vec![shards[1]]),
+        );
+        assert!(!wf.state().read().contains(99), "reduce never submitted on failure");
+
+        // Propagate: pending sibling (shard 2) cancelled, parent Failed.
+        let seq = propagate_failure(&wf, &group).unwrap();
+        wf.wait_for_seq(seq).await.unwrap();
+        assert!(wf.is_cancel_requested(shards[2]), "running sibling cancelled");
+        assert!(!wf.is_cancel_requested(shards[0]), "the Done shard isn't cancelled");
+        assert_eq!(wf.get(7).unwrap().status, TaskStatus::Failed, "parent failed");
+    }
+
+    /// Recoverable disposition: `block_on_failure` parks the parent
+    /// `Blocked` (corrections #1's real call site for `block()`) and
+    /// leaves the siblings alone, so a retry of the failed shard can
+    /// later clear the join.
+    #[tokio::test]
+    async fn block_on_failure_marks_parent_blocked_and_spares_siblings() {
+        let redex = Redex::new();
+        let wf = WorkflowAdapter::open(&redex, 0x0F10_00C3).await.unwrap();
+        let group = ShardGroup::derived(7, 3, 99);
+        let shards = group.shards().to_vec();
+        let seq = wf.submit(7).unwrap();
+        wf.wait_for_seq(seq).await.unwrap();
+        fan_out(&wf, &group).unwrap();
+        wf.start(shards[2]).unwrap();
+        let seq = wf.fail(shards[1]).unwrap();
+        wf.wait_for_seq(seq).await.unwrap();
+
+        let seq = block_on_failure(&wf, &group).unwrap();
+        wf.wait_for_seq(seq).await.unwrap();
+        assert_eq!(
+            wf.get(7).unwrap().status,
+            TaskStatus::Blocked,
+            "parent parked Blocked (external state), distinct from Waiting",
+        );
+        // Siblings untouched — the failed shard can be retried to clear.
+        assert!(!wf.is_cancel_requested(shards[2]));
     }
 
     /// Shards have **independent** leases: distinct shard ids are
