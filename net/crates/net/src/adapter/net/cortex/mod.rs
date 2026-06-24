@@ -34,6 +34,8 @@ mod watermark;
 pub mod memories;
 #[cfg(feature = "cortex")]
 pub mod tasks;
+#[cfg(feature = "cortex")]
+pub mod workflow;
 
 #[cfg(feature = "tool")]
 pub mod tool;
