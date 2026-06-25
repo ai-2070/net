@@ -1,0 +1,24 @@
+net/crates/net/src/ffi/mesh.rs
+  s_ddc59b666d4704::t_2f940cebdbb469 3820-3827,3852
+go/cortex.go
+  s_ddc59b666d4704::t_ca48ff3d33a52c 1481
+  s_ddc59b666d4704::t_965d9e0109fec0 1503-1504,1512-1514
+  s_ddc59b666d4704::t_50cd47828c504b 1358
+  s_ddc59b666d4704::t_8034a4fdfcd00c 1379-1380,1388-1390
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "733bad75809ce14d34b89239231138da95d1c91e",
+  "prompts": {},
+  "sessions": {
+    "s_ddc59b666d4704": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4de2bf58-426a-4af3-a1a4-40e427a2caff",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
