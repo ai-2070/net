@@ -45,11 +45,11 @@ import (
 // ---------------------------------------------------------------------------
 
 var (
-	ErrCortexClosed = errors.New("cortex adapter closed")
-	ErrCortexFold   = errors.New("cortex fold / ingestion failed")
-	ErrNetDb        = errors.New("netdb error")
-	ErrRedex        = errors.New("redex error")
-	ErrStreamEnded  = errors.New("stream ended")
+	ErrCortexClosed  = errors.New("cortex adapter closed")
+	ErrCortexFold    = errors.New("cortex fold / ingestion failed")
+	ErrNetDb         = errors.New("netdb error")
+	ErrRedex         = errors.New("redex error")
+	ErrStreamEnded   = errors.New("stream ended")
 	ErrStreamTimeout = errors.New("stream timed out")
 )
 
@@ -991,4 +991,259 @@ func marshalFilter(filter any) (*C.char, error) {
 		return nil, nil
 	}
 	return C.CString(string(data)), nil
+}
+
+// ---------------------------------------------------------------------------
+// Task lifecycle (WorkflowAdapter)
+// ---------------------------------------------------------------------------
+
+// WorkflowTaskState is the materialized lifecycle state of one task.
+type WorkflowTaskState struct {
+	Step     uint32
+	Status   string // submitted|running|waiting|blocked|done|failed
+	Attempts uint32
+}
+
+// WorkflowStatusCounts rolls up task counts per status.
+type WorkflowStatusCounts struct {
+	Submitted uint64
+	Running   uint64
+	Waiting   uint64
+	Blocked   uint64
+	Done      uint64
+	Failed    uint64
+}
+
+func wfStatusString(code int) string {
+	switch code {
+	case 0:
+		return "submitted"
+	case 1:
+		return "running"
+	case 2:
+		return "waiting"
+	case 3:
+		return "blocked"
+	case 4:
+		return "done"
+	case 5:
+		return "failed"
+	default:
+		return "unknown"
+	}
+}
+
+// WorkflowAdapter is the typed task-lifecycle handle — a single-writer
+// RedEX chain folded into per-task { step, status, attempts }.
+type WorkflowAdapter struct {
+	mu     sync.RWMutex
+	handle *C.net_workflow_adapter_t
+}
+
+// OpenWorkflow opens the workflow adapter against a Redex. `persistent`
+// routes writes through the Redex's persistent directory.
+func OpenWorkflow(redex *Redex, originHash uint64, persistent bool) (*WorkflowAdapter, error) {
+	var p C.int
+	if persistent {
+		p = 1
+	}
+	redex.mu.RLock()
+	defer redex.mu.RUnlock()
+	if redex.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	var out *C.net_workflow_adapter_t
+	code := C.net_workflow_adapter_open(redex.handle, C.uint64_t(originHash), p, &out)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	w := &WorkflowAdapter{handle: out}
+	runtime.SetFinalizer(w, (*WorkflowAdapter).free)
+	return w, nil
+}
+
+func (w *WorkflowAdapter) free() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.handle != nil {
+		C.net_workflow_adapter_free(w.handle)
+		w.handle = nil
+		runtime.SetFinalizer(w, nil)
+	}
+}
+
+// Free releases the adapter. Idempotent.
+func (w *WorkflowAdapter) Free() { w.free() }
+
+func (w *WorkflowAdapter) seqOp(
+	call func(*C.net_workflow_adapter_t, *C.uint64_t) C.int,
+) (uint64, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return 0, ErrShuttingDown
+	}
+	var seq C.uint64_t
+	code := call(w.handle, &seq)
+	if err := cortexErrorFromCode(code); err != nil {
+		return 0, err
+	}
+	return uint64(seq), nil
+}
+
+// Submit a new task (enters at step 0, submitted).
+func (w *WorkflowAdapter) Submit(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_submit(h, C.uint64_t(id), s)
+	})
+}
+
+// Start marks the task running.
+func (w *WorkflowAdapter) Start(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_start(h, C.uint64_t(id), s)
+	})
+}
+
+// Wait parks the task waiting.
+func (w *WorkflowAdapter) Wait(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_wait(h, C.uint64_t(id), s)
+	})
+}
+
+// Block parks the task blocked.
+func (w *WorkflowAdapter) Block(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_block(h, C.uint64_t(id), s)
+	})
+}
+
+// Complete marks the task done (terminal success).
+func (w *WorkflowAdapter) Complete(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_complete(h, C.uint64_t(id), s)
+	})
+}
+
+// Fail marks the task failed (terminal failure).
+func (w *WorkflowAdapter) Fail(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_fail(h, C.uint64_t(id), s)
+	})
+}
+
+// Advance bumps the step cursor (resets attempts).
+func (w *WorkflowAdapter) Advance(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_advance(h, C.uint64_t(id), s)
+	})
+}
+
+// Retry re-runs the current step (never resurrects a done task).
+func (w *WorkflowAdapter) Retry(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_retry(h, C.uint64_t(id), s)
+	})
+}
+
+// Delete removes a task and its whole linked subtree.
+func (w *WorkflowAdapter) Delete(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_delete(h, C.uint64_t(id), s)
+	})
+}
+
+// RequestCancel records a cancellation signal for the worker to observe.
+func (w *WorkflowAdapter) RequestCancel(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_request_cancel(h, C.uint64_t(id), s)
+	})
+}
+
+// Link records a parent->child lineage edge (idempotent).
+func (w *WorkflowAdapter) Link(parent, child uint64) (uint64, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return 0, ErrShuttingDown
+	}
+	var seq C.uint64_t
+	code := C.net_workflow_link(w.handle, C.uint64_t(parent), C.uint64_t(child), &seq)
+	if err := cortexErrorFromCode(code); err != nil {
+		return 0, err
+	}
+	return uint64(seq), nil
+}
+
+// Get returns the current state of id, or nil if unknown.
+func (w *WorkflowAdapter) Get(id uint64) (*WorkflowTaskState, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	var found, status C.int
+	var step, attempts C.uint32_t
+	code := C.net_workflow_get(w.handle, C.uint64_t(id), &found, &step, &status, &attempts)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	if found == 0 {
+		return nil, nil
+	}
+	return &WorkflowTaskState{
+		Step:     uint32(step),
+		Status:   wfStatusString(int(status)),
+		Attempts: uint32(attempts),
+	}, nil
+}
+
+// IsCancelRequested reports whether cancellation was requested for id.
+func (w *WorkflowAdapter) IsCancelRequested(id uint64) (bool, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return false, ErrShuttingDown
+	}
+	var b C.int
+	code := C.net_workflow_is_cancel_requested(w.handle, C.uint64_t(id), &b)
+	if err := cortexErrorFromCode(code); err != nil {
+		return false, err
+	}
+	return b != 0, nil
+}
+
+// StatusCounts rolls up task counts per status.
+func (w *WorkflowAdapter) StatusCounts() (WorkflowStatusCounts, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return WorkflowStatusCounts{}, ErrShuttingDown
+	}
+	var c C.net_workflow_status_counts_t
+	code := C.net_workflow_status_counts(w.handle, &c)
+	if err := cortexErrorFromCode(code); err != nil {
+		return WorkflowStatusCounts{}, err
+	}
+	return WorkflowStatusCounts{
+		Submitted: uint64(c.submitted),
+		Running:   uint64(c.running),
+		Waiting:   uint64(c.waiting),
+		Blocked:   uint64(c.blocked),
+		Done:      uint64(c.done),
+		Failed:    uint64(c.failed),
+	}, nil
+}
+
+// WaitForSeq blocks until every event up through seq has folded.
+// `timeoutMs` of 0 waits indefinitely.
+func (w *WorkflowAdapter) WaitForSeq(seq uint64, timeoutMs uint32) error {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return ErrShuttingDown
+	}
+	code := C.net_workflow_wait_for_seq(w.handle, C.uint64_t(seq), C.uint32_t(timeoutMs))
+	return cortexErrorFromCode(code)
 }

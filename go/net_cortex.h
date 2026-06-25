@@ -35,6 +35,7 @@ typedef struct net_redex_file_s      net_redex_file_t;
 typedef struct net_redex_tail_s      net_redex_tail_t;
 typedef struct net_tasks_adapter_s   net_tasks_adapter_t;
 typedef struct net_tasks_watch_s     net_tasks_watch_t;
+typedef struct net_workflow_adapter_s net_workflow_adapter_t;
 typedef struct net_memories_adapter_s net_memories_adapter_t;
 typedef struct net_memories_watch_s  net_memories_watch_t;
 
@@ -87,6 +88,45 @@ int  net_tasks_snapshot_and_watch(net_tasks_adapter_t* handle,
 int  net_tasks_watch_next(net_tasks_watch_t* cursor, uint32_t timeout_ms,
                           char** out_json, size_t* out_len);
 void net_tasks_watch_free(net_tasks_watch_t* cursor);
+
+/* ---- Task lifecycle (WorkflowAdapter) ----
+ * Status code on the wire: 0 submitted|1 running|2 waiting|3 blocked|
+ * 4 done|5 failed. Transitions return the append seq in *out_seq. */
+typedef struct {
+    uint64_t submitted;
+    uint64_t running;
+    uint64_t waiting;
+    uint64_t blocked;
+    uint64_t done;
+    uint64_t failed;
+} net_workflow_status_counts_t;
+
+int  net_workflow_adapter_open(net_redex_t* redex, uint64_t origin_hash,
+                               int persistent,
+                               net_workflow_adapter_t** out_handle);
+void net_workflow_adapter_free(net_workflow_adapter_t* handle);
+int  net_workflow_submit(net_workflow_adapter_t* handle, uint64_t id, uint64_t* out_seq);
+int  net_workflow_start(net_workflow_adapter_t* handle, uint64_t id, uint64_t* out_seq);
+int  net_workflow_wait(net_workflow_adapter_t* handle, uint64_t id, uint64_t* out_seq);
+int  net_workflow_block(net_workflow_adapter_t* handle, uint64_t id, uint64_t* out_seq);
+int  net_workflow_complete(net_workflow_adapter_t* handle, uint64_t id, uint64_t* out_seq);
+int  net_workflow_fail(net_workflow_adapter_t* handle, uint64_t id, uint64_t* out_seq);
+int  net_workflow_advance(net_workflow_adapter_t* handle, uint64_t id, uint64_t* out_seq);
+int  net_workflow_retry(net_workflow_adapter_t* handle, uint64_t id, uint64_t* out_seq);
+int  net_workflow_delete(net_workflow_adapter_t* handle, uint64_t id, uint64_t* out_seq);
+int  net_workflow_link(net_workflow_adapter_t* handle, uint64_t parent,
+                       uint64_t child, uint64_t* out_seq);
+int  net_workflow_request_cancel(net_workflow_adapter_t* handle, uint64_t id,
+                                 uint64_t* out_seq);
+int  net_workflow_get(net_workflow_adapter_t* handle, uint64_t id,
+                      int* out_found, uint32_t* out_step,
+                      int* out_status, uint32_t* out_attempts);
+int  net_workflow_is_cancel_requested(net_workflow_adapter_t* handle, uint64_t id,
+                                      int* out_bool);
+int  net_workflow_status_counts(net_workflow_adapter_t* handle,
+                                net_workflow_status_counts_t* out);
+int  net_workflow_wait_for_seq(net_workflow_adapter_t* handle, uint64_t seq,
+                               uint32_t timeout_ms);
 
 /* ---- Memories adapter ---- */
 int  net_memories_adapter_open(net_redex_t* redex, uint64_t origin_hash,
