@@ -807,33 +807,36 @@ fn gang_ordered_acquire_is_deadlock_free_and_all_or_none() {
 // (Thunderdome §6 / Phase D — corrections §8 item 1)
 //
 // Mirrors the CP invariant of
-// `src/adapter/net/behavior/gang/active.rs::commit_active`: an
-// island's reservation chain is single-writer, and the fence —
-// `FenceLedger::accept_active` (accept iff `epoch >
-// highest_witnessed`) composed with the reservation fold's
-// generation-CAS replace — gates the `→ Active` transition. The
-// brutal-test #3 in `active.rs` proves this DETERMINISTICALLY
-// (a scripted 3|2 split); this models the same guarantee under
-// loom's exhaustive interleaving of two CONCURRENT would-be
-// leaders, which is the partition-during-claim race the audit
-// (§8 item 1) flagged as present in `active.rs` but absent from
-// the DST harness.
+// `src/adapter/net/behavior/gang/active.rs::commit_active`, which
+// composes TWO distinct mechanisms (review #3 corrected this model,
+// which previously conflated them into a single "higher epoch wins"
+// CAS — a displacement production does NOT perform):
+//   1. the FENCE (`FenceLedger::accept_active`) gates *ack-gathering*:
+//      a replica acks iff `epoch >= highest_witnessed` (EQUAL allowed),
+//      then witnesses it — so a strictly-lower stale epoch can't reach
+//      quorum; and
+//   2. the HOLDER-GATED install (the reservation fold): a live `Active`
+//      is never replaced by a *different* publisher, whatever its epoch
+//      (`(Active, _) => Reject`) — a later higher-epoch leader gets
+//      `LostReservation`, it does NOT steal the running Active.
+// The brutal-test #3 in `active.rs` proves the deterministic 3|2 split;
+// this models the same guarantee under loom's exhaustive interleaving of
+// two CONCURRENT would-be leaders — the partition-during-claim race the
+// audit (§8 item 1) flagged as present in `active.rs` but absent here.
 //
-// The reservation cell packs `(epoch << 32) | leader_id` into one
-// `AtomicU64` (0 = Free) so the (epoch, holder) pair is read +
-// swapped atomically — the single-writer chain. A leader commits
-// only if it carries a STRICTLY-higher epoch than the incumbent
-// (the fence); the CAS makes the install atomic.
+// Two `AtomicU64`s: `fence` (highest witnessed epoch, monotonic) and the
+// reservation `cell` packing `(epoch << 32) | leader_id` (0 = Free) so
+// the (epoch, holder) pair is read + swapped atomically.
 //
 // Invariants under EVERY interleaving of leaders at epochs 2 and 3:
-//   - **At most one Active holder.** One cell, atomically swapped —
-//     never a torn (half-epoch-A, half-id-B) read.
-//   - **The fence holds: the higher epoch always wins.** The
-//     epoch-3 leader ends as the holder regardless of timing; the
-//     epoch-2 leader never holds at the end (it is refused if it
-//     races late, or replaced if it installed first). A stale
-//     ex-leader can never strand the island.
-//   - **Monotonic epoch.** The committed epoch never regresses.
+//   - **At most one Active holder (no double-run).** One cell, one
+//     FREE→holder transition — never a torn read, never two holders.
+//     Exactly one installs (at least one always passes the fence).
+//   - **A live Active is not displaced by a higher epoch.** The holder
+//     is whoever won the install race, NOT necessarily epoch 3 — the
+//     faithful production behaviour.
+//   - **Monotonic fence.** The witnessed epoch never regresses; it ends
+//     at the max (3), fencing any strictly-lower late quorum attempt.
 // ─────────────────────────────────────────────────────────────
 
 const FREE: u64 = 0;
@@ -841,58 +844,105 @@ const FREE: u64 = 0;
 fn pack(epoch: u64, leader: u64) -> u64 {
     (epoch << 32) | leader
 }
-fn epoch_of(state: u64) -> u64 {
-    state >> 32
-}
 
-/// One leader's `→ Active` commit attempt against the single-writer
-/// reservation cell. Commits iff it carries a strictly-higher epoch
-/// than the incumbent (the fence); `SeqCst` so the model explores the
-/// total order the production chain imposes. Returns whether it
-/// installed (it may later be replaced by a higher epoch).
-fn commit_active_fenced(cell: &AtomicU64, leader: u64, epoch: u64) -> bool {
+/// One leader's `→ Active` commit attempt, modelling the *two* production
+/// mechanisms faithfully (review #3):
+///
+/// 1. **Fence (the ack-gathering gate).** A replica acks iff `epoch >=
+///    highest_witnessed`, then witnesses it — `FenceLedger::accept_active`
+///    (equal epoch allowed; only a *strictly-lower* stale epoch is
+///    refused). The single `fence` cell stands for the quorum's
+///    collective fence; failing it means no quorum, so no commit.
+/// 2. **Holder-gated install.** The `Active` install is a CAS `FREE ->
+///    (epoch, leader)` on the reservation cell. A live `Active` is
+///    **never** displaced by a *different* leader, whatever its epoch —
+///    production's `(Active, _) => Reject` for a cross-publisher write
+///    (reservation.rs). A higher-epoch leader that arrives after another
+///    installed gets the equivalent of `LostReservation`.
+///
+/// Returns whether *this* leader installed the `Active`. `SeqCst` so the
+/// model explores the total order the production chain imposes.
+fn commit_active_fenced(fence: &AtomicU64, cell: &AtomicU64, leader: u64, epoch: u64) -> bool {
+    // [1] Fence-check + witness (monotonic max). A strictly-lower epoch
+    //     than what's already witnessed is refused — it can't gather a
+    //     quorum (accept iff epoch >= highest_witnessed).
     loop {
-        let cur = cell.load(Ordering::SeqCst);
-        // Fence: an equal-or-lower epoch never displaces a live Active.
-        if cur != FREE && epoch <= epoch_of(cur) {
+        let f = fence.load(Ordering::SeqCst);
+        if epoch < f {
             return false;
         }
-        if cell
-            .compare_exchange(cur, pack(epoch, leader), Ordering::SeqCst, Ordering::SeqCst)
+        if fence
+            .compare_exchange(f, epoch.max(f), Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            return true;
+            break;
         }
-        // Lost the race — re-read and re-evaluate the fence.
     }
+    // [2] Install over a FREE cell only. A different leader's live Active
+    //     is final (holder-gated) — we do NOT displace it.
+    cell.compare_exchange(
+        FREE,
+        pack(epoch, leader),
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    )
+    .is_ok()
 }
 
 #[test]
-fn partition_during_claim_fence_lets_only_the_higher_epoch_hold_active() {
+fn partition_during_claim_lets_at_most_one_leader_hold_active() {
     loom::model(|| {
+        let fence = Arc::new(AtomicU64::new(0));
         let cell = Arc::new(AtomicU64::new(FREE));
 
-        // Two would-be leaders race the commit: the ex-leader at the
-        // stale epoch 2, the new leader at epoch 3 (post leadership
-        // change). They model the two sides of a partition both
-        // attempting `→ Active` on the same island.
+        // Two would-be leaders race the commit on the same island: the
+        // ex-leader at the stale epoch 2, the new leader at epoch 3 (post
+        // leadership change). They model the two sides of a partition
+        // both attempting `→ Active`.
         let stale = {
-            let c = cell.clone();
-            thread::spawn(move || commit_active_fenced(&c, 0xA, 2))
+            let (f, c) = (fence.clone(), cell.clone());
+            thread::spawn(move || commit_active_fenced(&f, &c, 0xA, 2))
         };
         let fresh = {
-            let c = cell.clone();
-            thread::spawn(move || commit_active_fenced(&c, 0xB, 3))
+            let (f, c) = (fence.clone(), cell.clone());
+            thread::spawn(move || commit_active_fenced(&f, &c, 0xB, 3))
         };
-        let _stale_installed = stale.join().unwrap();
+        let stale_installed = stale.join().unwrap();
         let fresh_installed = fresh.join().unwrap();
 
-        // The fence guarantee: the epoch-3 leader always ends up
-        // holding Active, and the stale epoch-2 leader never does —
-        // under every interleaving.
+        // SAFETY (the no-double-run guarantee): at most one leader ever
+        // installs Active, under every interleaving. At least one always
+        // passes the fence, so exactly one holds.
+        assert!(
+            stale_installed ^ fresh_installed,
+            "exactly one leader installs Active — never a double-run",
+        );
         let end = cell.load(Ordering::SeqCst);
-        assert_eq!(epoch_of(end), 3, "the higher epoch wins the fence");
-        assert_eq!(end, pack(3, 0xB), "epoch-3 leader holds Active, single-writer");
-        assert!(fresh_installed, "the fresh leader always commits (over Free or the stale Active)");
+        assert_ne!(end, FREE, "an Active is installed");
+
+        // The holder is whoever won the install CAS — NOT necessarily the
+        // higher epoch. Production refuses a cross-publisher Active→Active
+        // (reservation.rs), so a higher-epoch leader arriving second
+        // cannot displace a live Active (it gets LostReservation). The
+        // packed cell is never torn. (The OLD model asserted "higher
+        // epoch always wins" — a displacement production does not do, and
+        // which would itself be a double-run; review #3.)
+        if stale_installed {
+            assert_eq!(
+                end,
+                pack(2, 0xA),
+                "leader A holds; B can't displace a live Active"
+            );
+        } else {
+            assert_eq!(end, pack(3, 0xB), "leader B holds");
+        }
+
+        // The fence is monotonic and ends at the highest witnessed epoch,
+        // so a strictly-lower stale epoch can never gather a later quorum.
+        assert_eq!(
+            fence.load(Ordering::SeqCst),
+            3,
+            "fence advanced to the max epoch"
+        );
     });
 }
