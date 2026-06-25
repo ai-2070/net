@@ -3943,6 +3943,79 @@ pub unsafe extern "C" fn net_trigger_armed_count(
     0
 }
 
+/// Arm AtTick(tick) -> action (0 submit, 1 start).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_arm_at_tick(
+    handle: *mut TriggerEngineHandle,
+    tick: u64,
+    action_kind: c_int,
+    action_id: u64,
+) -> c_int {
+    unsafe { trigger_arm(handle, InnerWfTrigger::AtTick(tick), action_kind, action_id) }
+}
+
+/// The clock advanced to `now`: fire + disarm every AtTick trigger whose
+/// deadline has passed. Fills parallel `out_kinds[i]`/`out_ids[i]` up to
+/// `cap`, total in `*out_count`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_on_tick(
+    handle: *mut TriggerEngineHandle,
+    now: u64,
+    out_kinds: *mut c_int,
+    out_ids: *mut u64,
+    cap: usize,
+    out_count: *mut usize,
+) -> c_int {
+    if handle.is_null() || out_count.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let state = h.adapter.state();
+    let guard = state.read();
+    let world = InnerTriggerWorld::new(&guard, now);
+    let actions = h.engine.lock().unwrap().on_tick(&world);
+    unsafe {
+        *out_count = actions.len();
+        if !out_kinds.is_null() && !out_ids.is_null() {
+            for (i, a) in actions.iter().take(cap).enumerate() {
+                let (k, id) = wf_action_code(a);
+                *out_kinds.add(i) = k;
+                *out_ids.add(i) = id;
+            }
+        }
+    }
+    0
+}
+
+/// `id` plus all transitive descendants — the delete subtree. Fills up
+/// to `cap` ids into `out_ids`, total in `*out_count`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_subtree(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_ids: *mut u64,
+    cap: usize,
+    out_count: *mut usize,
+) -> c_int {
+    if handle.is_null() || out_count.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*handle };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let ids = wf.inner.subtree(id);
+    unsafe {
+        *out_count = ids.len();
+        if !out_ids.is_null() {
+            let n = ids.len().min(cap);
+            std::ptr::copy_nonoverlapping(ids.as_ptr(), out_ids, n);
+        }
+    }
+    0
+}
+
 // ABI-visible no-op to force the linker to keep `c_void` happy on
 // some older linkers; harmless otherwise.
 #[doc(hidden)]

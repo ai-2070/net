@@ -1248,6 +1248,34 @@ func (w *WorkflowAdapter) WaitForSeq(seq uint64, timeoutMs uint32) error {
 	return cortexErrorFromCode(code)
 }
 
+// Subtree returns `id` plus all its transitive descendants (the delete
+// subtree).
+func (w *WorkflowAdapter) Subtree(id uint64) ([]uint64, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	var count C.size_t
+	code := C.net_workflow_subtree(w.handle, C.uint64_t(id), nil, 0, &count)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	if count == 0 {
+		return nil, nil
+	}
+	ids := make([]uint64, int(count))
+	code = C.net_workflow_subtree(
+		w.handle, C.uint64_t(id), (*C.uint64_t)(unsafe.Pointer(&ids[0])), count, &count)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	if int(count) < len(ids) {
+		ids = ids[:int(count)]
+	}
+	return ids, nil
+}
+
 // ---------------------------------------------------------------------------
 // Tier 2: shards (fan-out / fan-in)
 // ---------------------------------------------------------------------------
@@ -1428,6 +1456,46 @@ func (e *TriggerEngine) OnTaskChange(task, tick uint64) ([]TriggerAction, error)
 	ids := make([]uint64, int(count))
 	code = C.net_trigger_on_task_change(
 		e.handle, C.uint64_t(task), C.uint64_t(tick),
+		&kinds[0], (*C.uint64_t)(unsafe.Pointer(&ids[0])), count, &count)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	n := int(count)
+	if n > len(ids) {
+		n = len(ids)
+	}
+	out := make([]TriggerAction, n)
+	for i := 0; i < n; i++ {
+		kind := "submit"
+		if kinds[i] == 1 {
+			kind = "start"
+		}
+		out[i] = TriggerAction{Kind: kind, ID: ids[i]}
+	}
+	return out, nil
+}
+
+// ArmAtTick arms AtTick(tick) -> action (fires once the clock reaches tick).
+func (e *TriggerEngine) ArmAtTick(tick uint64, action TriggerAction) error {
+	code := C.net_trigger_arm_at_tick(
+		e.handle, C.uint64_t(tick), actionKindCode(action.Kind), C.uint64_t(action.ID))
+	return cortexErrorFromCode(code)
+}
+
+// OnTick fires + disarms every AtTick trigger due at `now`; returns them.
+func (e *TriggerEngine) OnTick(now uint64) ([]TriggerAction, error) {
+	var count C.size_t
+	code := C.net_trigger_on_tick(e.handle, C.uint64_t(now), nil, nil, 0, &count)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	if count == 0 {
+		return nil, nil
+	}
+	kinds := make([]C.int, int(count))
+	ids := make([]uint64, int(count))
+	code = C.net_trigger_on_tick(
+		e.handle, C.uint64_t(now),
 		&kinds[0], (*C.uint64_t)(unsafe.Pointer(&ids[0])), count, &count)
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
