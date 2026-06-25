@@ -1,0 +1,26 @@
+net/crates/net/bindings/python/python/net/__init__.py
+  s_58a23d9389d6ed::t_49143efc648684 91-93,121-123
+net/crates/net/bindings/python/tests/test_scheduler.py
+  s_58a23d9389d6ed::t_be3a9d87ab0ca8 1-80
+net/crates/net/sdk-py/src/net_sdk/mesh.py
+  s_58a23d9389d6ed::t_f5261e8010549b 139-218
+net/crates/net/bindings/python/src/lib.rs
+  s_58a23d9389d6ed::t_c8416f45f7702b 1087-1136
+  s_58a23d9389d6ed::t_d096e497fc76fc 1876-1989
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "65e4e60ac578ec2c9275746bff5edb192b687b7a",
+  "prompts": {},
+  "sessions": {
+    "s_58a23d9389d6ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92186006-b4bc-4409-9b64-7b1fa8e6ebfa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
