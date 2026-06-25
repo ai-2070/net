@@ -11207,7 +11207,18 @@ impl MeshNode {
             .reservation_fold
             .apply(ann.clone())
             .map_err(|e| AdapterError::Connection(format!("reservation: apply failed: {e}")))?;
-        let _ = self.publish_fold_broadcast(&ann).await;
+        // The broadcast is best-effort gossip (the local CAS already
+        // decided the AP outcome), but don't silently drop a failed
+        // propagation: the returned ClaimOutcome reflects only the local
+        // view, so a dropped error hides "won locally, peers not told"
+        // (review #10).
+        if let Err(e) = self.publish_fold_broadcast(&ann).await {
+            tracing::warn!(
+                island,
+                error = %e,
+                "reservation broadcast failed; local CAS applied but peers not notified",
+            );
+        }
         Ok(match outcome {
             ApplyOutcome::Inserted | ApplyOutcome::Replaced => {
                 super::behavior::gang::ClaimOutcome::Won
