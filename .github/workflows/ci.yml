@@ -899,11 +899,12 @@ jobs:
         crate:
           - name: rust-sdk
             path: net/crates/net/sdk
-            # `full` enables every SDK feature flag (net, cortex,
-            # compute, groups, redis, jetstream). Mirrors the
-            # `rust-sdk-tests` job's surface plus the optional
-            # adapter features.
-            features: --features full
+            # `full` is misleadingly named — it is `local + nat-traversal
+            # + redis + jetstream + meshos + deck + tool + macros` and
+            # OMITS `port-mapping`, `dataforts`, `meshdb`. Add those three
+            # code surfaces explicitly so clippy lints them too (clippy
+            # only compiles, so the service-adapter features are fine).
+            features: --features "full port-mapping dataforts meshdb"
           - name: node
             path: net/crates/net/bindings/node
             # Mirrors the `node-tests` napi build (no redis default,

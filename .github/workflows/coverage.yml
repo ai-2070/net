@@ -76,10 +76,14 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      # `--features` mirrors the clippy job's feature set —
-      # broad enough to compile every test in `tests/*.rs` that
-      # isn't gated on a service-container feature (redis,
-      # jetstream). Dropping `--lib` lets cargo-llvm-cov pick up
+      # `--features` is the widest SERVICE-FREE set — broad enough
+      # to RUN every test in `tests/*.rs` + every in-source unit
+      # that isn't gated on a service-container feature (redis,
+      # jetstream). (The `clippy` job uses `--all-features` instead:
+      # it only compiles, so it can include redis/jetstream without
+      # a running service — that distinction is why tests can't.)
+      # It mirrors the gating `unit-tests` job's `$UNIT_FEATURES`
+      # plus `tool`. Dropping `--lib` lets cargo-llvm-cov pick up
       # both the in-source `#[cfg(test)]` units and the
       # integration tests in `tests/`, which is where the bulk of
       # the substrate's behavioral coverage actually lives
