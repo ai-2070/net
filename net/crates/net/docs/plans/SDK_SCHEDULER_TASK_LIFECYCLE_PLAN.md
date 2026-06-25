@@ -276,16 +276,18 @@ I/O, so a pure "evaluate → return actions" call is the cleanest boundary.
 
 | Capability | Rust SDK | TS | Python | Go | C |
 |---|---|---|---|---|---|
-| publish/match/reserve/release/claim island | ✅ | ✅ | ☐ | ☐ | ☐ |
-| gang/island types | ✅ | ✅ | ☐ | ☐ | ☐ |
-| WorkflowAdapter open + transitions | ✅ | ✅ | ☐ | ☐ | ☐ |
-| Workflow reads (get/status_counts/subtree) | ✅ | ✅ | ☐ | ☐ | ☐ |
-| Workflow snapshot/restore | ✅ | ✅ | ☐ | ☐ | ☐ |
+| publish/match/reserve/release/claim island | ✅ | ✅ | ✅ | ☐ | ☐ |
+| gang/island types | ✅ | ✅ | ✅ | ☐ | ☐ |
+| WorkflowAdapter open + transitions | ✅ | ✅ | ✅ | ☐ | ☐ |
+| Workflow reads (get/status_counts/subtree) | ✅ | ✅ | ✅ | ☐ | ☐ |
+| Workflow snapshot/restore | ✅ | ✅ | ✅ | ☐ | ☐ |
 | Shards (fan_out/try_join/propagate) — T2 | ☐ | ☐ | ☐ | ☐ | ☐ |
 | Triggers — T2 | ☐ | ☐ | ☐ | ☐ | ☐ |
 
-**Progress:** P0 (Rust SDK) and P1 (TypeScript) landed Tier 1 — verified end-to-end
-(Rust surface tests; napi build + tsc + vitest). P2 (Python), P3 (Go/C) next.
+**Progress:** P0 (Rust SDK), P1 (TypeScript), P2 (Python) landed Tier 1 — all
+verified end-to-end (Rust surface tests; napi build + tsc + vitest; maturin build +
+pytest). P3 (Go/C) next. Python gang takes flat kwargs (no nested-criteria object),
+same as the napi side.
 
 ---
 
