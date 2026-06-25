@@ -1,0 +1,28 @@
+net/crates/net/docs/plans/MESH_SCHEDULER_GANG_CLAIM_PLAN.md
+  s_b93d1d2fee6b2e::t_934809f4bdc36b 201,206,208
+  s_b93d1d2fee6b2e::t_a4befa42df43c7 87-89
+net/crates/net/docs/plans/SDK_SCHEDULER_TASK_LIFECYCLE_PLAN.md
+  s_b93d1d2fee6b2e::t_af9ba24e57b1ee 134,139,141
+  s_b93d1d2fee6b2e::t_747da0a6ae3771 67,70-71,73-75
+  s_b93d1d2fee6b2e::t_10ef796f3165c2 338
+net/crates/net/docs/misc/CODE_REVIEW_2026_06_25_SDK_SCHEDULER.md
+  s_b93d1d2fee6b2e::t_10ef796f3165c2 27,150
+net/crates/net/docs/plans/MESH_SCHEDULER_CODE_REVIEW.md
+  s_b93d1d2fee6b2e::t_10ef796f3165c2 56,58,201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "40f2deb0ad230043e8508445aa29abb027839167",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
