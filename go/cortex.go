@@ -1529,39 +1529,55 @@ func (e *TriggerEngine) RecordResult(task uint64, key, value string) error {
 	return cortexErrorFromCode(code)
 }
 
-// OnTaskChange returns the actions fired by `task`'s change, evaluated
-// against the bound adapter's current state.
-func (e *TriggerEngine) OnTaskChange(task, tick uint64) ([]TriggerAction, error) {
-	var count C.size_t
-	code := C.net_trigger_on_task_change(
-		e.handle, C.uint64_t(task), C.uint64_t(tick), nil, nil, 0, &count)
-	if err := cortexErrorFromCode(code); err != nil {
-		return nil, err
+// collectTriggerActions materializes the parallel (kinds, ids) the FFI
+// filled, reading exactly `count` entries (capped to the buffer length as
+// a defensive bound — see the single-call note on OnTaskChange/OnTick).
+func collectTriggerActions(kinds []C.int, ids []uint64, count int) []TriggerAction {
+	if count > len(ids) {
+		count = len(ids)
 	}
-	if count == 0 {
-		return nil, nil
+	if count <= 0 {
+		return nil
 	}
-	kinds := make([]C.int, int(count))
-	ids := make([]uint64, int(count))
-	code = C.net_trigger_on_task_change(
-		e.handle, C.uint64_t(task), C.uint64_t(tick),
-		&kinds[0], (*C.uint64_t)(unsafe.Pointer(&ids[0])), count, &count)
-	if err := cortexErrorFromCode(code); err != nil {
-		return nil, err
-	}
-	n := int(count)
-	if n > len(ids) {
-		n = len(ids)
-	}
-	out := make([]TriggerAction, n)
-	for i := 0; i < n; i++ {
+	out := make([]TriggerAction, count)
+	for i := 0; i < count; i++ {
 		kind := "submit"
 		if kinds[i] == 1 {
 			kind = "start"
 		}
 		out[i] = TriggerAction{Kind: kind, ID: ids[i]}
 	}
-	return out, nil
+	return out
+}
+
+// OnTaskChange returns the actions fired by `task`'s change, evaluated
+// against the bound adapter's current state.
+//
+// net_trigger_on_task_change is *consuming*: it disarms the triggers it
+// fires, so — unlike the read-only list getters (Subtree, MatchGpuIslands)
+// — it cannot be sized with a NULL-buffer probe pass. A probe pass would
+// fire and discard the actions, and the real pass would then find nothing
+// armed. Instead size the buffer once from ArmedCount (an upper bound:
+// fired ⊆ armed) and make a single call. The engine is driven by a single
+// goroutine, so no concurrent arm grows the set between the two FFI calls.
+func (e *TriggerEngine) OnTaskChange(task, tick uint64) ([]TriggerAction, error) {
+	n, err := e.ArmedCount()
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	kinds := make([]C.int, n)
+	ids := make([]uint64, n)
+	var count C.size_t
+	code := C.net_trigger_on_task_change(
+		e.handle, C.uint64_t(task), C.uint64_t(tick),
+		&kinds[0], (*C.uint64_t)(unsafe.Pointer(&ids[0])), C.size_t(n), &count)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	return collectTriggerActions(kinds, ids, int(count)), nil
 }
 
 // ArmAtTick arms AtTick(tick) -> action (fires once the clock reaches tick).
@@ -1572,36 +1588,29 @@ func (e *TriggerEngine) ArmAtTick(tick uint64, action TriggerAction) error {
 }
 
 // OnTick fires + disarms every AtTick trigger due at `now`; returns them.
+//
+// Like OnTaskChange, net_trigger_on_tick is *consuming* (it disarms what
+// it fires), so it is a single call sized from ArmedCount rather than a
+// NULL-buffer probe + fill — a probe pass would drain the due triggers and
+// throw the actions away. See OnTaskChange for the full rationale.
 func (e *TriggerEngine) OnTick(now uint64) ([]TriggerAction, error) {
-	var count C.size_t
-	code := C.net_trigger_on_tick(e.handle, C.uint64_t(now), nil, nil, 0, &count)
-	if err := cortexErrorFromCode(code); err != nil {
+	n, err := e.ArmedCount()
+	if err != nil {
 		return nil, err
 	}
-	if count == 0 {
+	if n == 0 {
 		return nil, nil
 	}
-	kinds := make([]C.int, int(count))
-	ids := make([]uint64, int(count))
-	code = C.net_trigger_on_tick(
+	kinds := make([]C.int, n)
+	ids := make([]uint64, n)
+	var count C.size_t
+	code := C.net_trigger_on_tick(
 		e.handle, C.uint64_t(now),
-		&kinds[0], (*C.uint64_t)(unsafe.Pointer(&ids[0])), count, &count)
+		&kinds[0], (*C.uint64_t)(unsafe.Pointer(&ids[0])), C.size_t(n), &count)
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
 	}
-	n := int(count)
-	if n > len(ids) {
-		n = len(ids)
-	}
-	out := make([]TriggerAction, n)
-	for i := 0; i < n; i++ {
-		kind := "submit"
-		if kinds[i] == 1 {
-			kind = "start"
-		}
-		out[i] = TriggerAction{Kind: kind, ID: ids[i]}
-	}
-	return out, nil
+	return collectTriggerActions(kinds, ids, int(count)), nil
 }
 
 // ArmedCount returns the number of armed (not-yet-fired) triggers.

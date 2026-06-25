@@ -5029,4 +5029,74 @@ mod tests {
             net_redex_free(r);
         }
     }
+
+    /// The trigger fire calls (`net_trigger_on_tick` /
+    /// `net_trigger_on_task_change`) are *consuming* — they disarm what
+    /// they fire on every call, regardless of whether the out-buffers are
+    /// NULL. A caller must therefore size the buffer up front and call
+    /// ONCE; a "probe with NULL to learn the count, then fill" two-pass
+    /// fires + disarms on the probe and discards the actions, so the fill
+    /// pass returns nothing. This pins both halves: a correctly-sized
+    /// single call returns the action and disarms, and a NULL-buffer probe
+    /// silently drops it (the bug the Go wrapper hit — review 2026-06-25).
+    #[test]
+    fn trigger_on_tick_is_consuming_single_call() {
+        unsafe {
+            let r = net_redex_new(ptr::null());
+            let mut wf: *mut WorkflowAdapterHandle = ptr::null_mut();
+            assert_eq!(net_workflow_adapter_open(r, 0xF00D, 0, &mut wf), 0);
+            let mut eng: *mut TriggerEngineHandle = ptr::null_mut();
+            assert_eq!(net_trigger_engine_new(wf, &mut eng), 0);
+
+            // Arm AtTick(5) -> Submit(2).
+            assert_eq!(net_trigger_arm_at_tick(eng, 5, 0 /* submit */, 2), 0);
+            let mut armed: usize = 0;
+            assert_eq!(net_trigger_armed_count(eng, &mut armed), 0);
+            assert_eq!(armed, 1);
+
+            let mut kinds = [0_i32; 4];
+            let mut ids = [0_u64; 4];
+            let mut count: usize = 0;
+
+            // Below the deadline: nothing fires, the trigger stays armed.
+            assert_eq!(
+                net_trigger_on_tick(eng, 4, kinds.as_mut_ptr(), ids.as_mut_ptr(), 4, &mut count),
+                0
+            );
+            assert_eq!(count, 0);
+            net_trigger_armed_count(eng, &mut armed);
+            assert_eq!(armed, 1);
+
+            // Reaches the deadline: fires once (single, correctly-sized
+            // call) and disarms.
+            assert_eq!(
+                net_trigger_on_tick(eng, 5, kinds.as_mut_ptr(), ids.as_mut_ptr(), 4, &mut count),
+                0
+            );
+            assert_eq!(count, 1);
+            assert_eq!((kinds[0], ids[0]), (0, 2));
+            net_trigger_armed_count(eng, &mut armed);
+            assert_eq!(armed, 0);
+
+            // The footgun: a NULL-buffer "probe" pass still fires + disarms,
+            // so a follow-up fill pass sees nothing — actions lost.
+            assert_eq!(net_trigger_arm_at_tick(eng, 7, 0, 9), 0);
+            assert_eq!(
+                net_trigger_on_tick(eng, 7, ptr::null_mut(), ptr::null_mut(), 0, &mut count),
+                0
+            );
+            assert_eq!(count, 1, "probe reports the count but consumes the trigger");
+            net_trigger_armed_count(eng, &mut armed);
+            assert_eq!(armed, 0, "probe pass already disarmed it");
+            assert_eq!(
+                net_trigger_on_tick(eng, 7, kinds.as_mut_ptr(), ids.as_mut_ptr(), 4, &mut count),
+                0
+            );
+            assert_eq!(count, 0, "the fired action was lost to the probe pass");
+
+            net_trigger_engine_free(eng);
+            net_workflow_adapter_free(wf);
+            net_redex_free(r);
+        }
+    }
 }
