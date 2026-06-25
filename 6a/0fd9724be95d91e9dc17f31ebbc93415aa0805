@@ -1,0 +1,19 @@
+net/crates/net/examples/scheduler.c
+  s_58a23d9389d6ed::t_714e1f02864dd5 1-112
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "6a0fd9724be95d91e9dc17f31ebbc93415aa0805",
+  "prompts": {},
+  "sessions": {
+    "s_58a23d9389d6ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92186006-b4bc-4409-9b64-7b1fa8e6ebfa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
