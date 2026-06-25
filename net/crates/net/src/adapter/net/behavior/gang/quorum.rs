@@ -84,10 +84,12 @@ impl ReplicaSet {
     }
 
     /// Does `ack_count` distinct acks constitute a strict majority of
-    /// this set? `acks * 2 > n`, false for an empty set. The minority
+    /// this set? `ack_count >= quorum_threshold()`, false for an empty
+    /// set. Defers to [`Self::quorum_threshold`] so "majority" has a
+    /// single definition the CP gate can't drift from. The minority
     /// side of a split can never satisfy this — the whole point.
     pub fn has_quorum(&self, ack_count: usize) -> bool {
-        !self.members.is_empty() && ack_count * 2 > self.members.len()
+        !self.members.is_empty() && ack_count >= self.quorum_threshold()
     }
 }
 
