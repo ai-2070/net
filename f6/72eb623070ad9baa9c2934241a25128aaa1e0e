@@ -1,0 +1,24 @@
+go/scheduler_test.go
+  s_ddc59b666d4704::t_687225a1e8e4fd 1-119
+go/cortex.go
+  s_ddc59b666d4704::t_4b51ca282be98e 1591-1595,1597-1598,1601,1604-1607,1609,1613
+  s_ddc59b666d4704::t_9ac1b2d2d139b1 1532-1552,1555-1562,1564-1565,1568,1571-1574,1576,1580
+net/crates/net/src/ffi/cortex.rs
+  s_ddc59b666d4704::t_71a2f69983bcfd 5032-5101
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "f672eb623070ad9baa9c2934241a25128aaa1e0e",
+  "prompts": {},
+  "sessions": {
+    "s_ddc59b666d4704": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4de2bf58-426a-4af3-a1a4-40e427a2caff",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
