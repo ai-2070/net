@@ -267,12 +267,15 @@ mod tests {
 
     // NB: SequentialMapper composes concrete `NatPmpMapper` +
     // `UpnpMapper` clients — the trait field isn't generic. To
-    // drive behavior in unit tests we construct it with a
-    // dummy gateway + local IP that we know will fail (loopback,
-    // no router) and assert the state-transition logic.
+    // drive behavior in unit tests we construct it with a loopback
+    // gateway (no UPnP/NAT-PMP responder there, so probes fail) and a
+    // non-routable TEST-NET-1 local IP (RFC 5737): `UpnpMapper::new`
+    // debug-asserts a non-loopback LAN IP, and TEST-NET space still has
+    // no router, so the probe fails as intended.
+    const TEST_LOCAL_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
 
     fn sample_sequencer() -> SequentialMapper {
-        SequentialMapper::new(Some(Ipv4Addr::LOCALHOST), IpAddr::V4(Ipv4Addr::LOCALHOST))
+        SequentialMapper::new(Some(Ipv4Addr::LOCALHOST), TEST_LOCAL_IP)
     }
 
     #[test]
@@ -283,7 +286,7 @@ mod tests {
 
     #[test]
     fn new_without_gateway_skips_nat_pmp() {
-        let seq = SequentialMapper::new(None, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let seq = SequentialMapper::new(None, TEST_LOCAL_IP);
         assert!(seq.nat_pmp.is_none());
     }
 

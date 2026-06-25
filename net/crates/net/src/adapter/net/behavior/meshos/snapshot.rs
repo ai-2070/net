@@ -1188,7 +1188,11 @@ mod tests {
         // The Running path should keep its original
         // semantics: time since the most recent `Started`.
         let mut actual = MeshOsState::default();
-        let now = Instant::now();
+        // Anchor the reference forward so the `- 900s` below can't
+        // underflow the monotonic clock on a low-uptime host (a fresh CI
+        // runner). Ages are relative to `last_tick`, so the shared offset
+        // cancels and the assertions are unchanged.
+        let now = Instant::now() + Duration::from_secs(3600);
         actual.last_tick = Some(now);
         let d = dref("worker", 2);
         let mut status = DaemonStatus::default();
@@ -1380,7 +1384,10 @@ mod tests {
     fn daemon_age_uses_most_recent_of_exit_or_crash() {
         // Crash newer than exit → anchor on crash.
         let mut actual = MeshOsState::default();
-        let now = Instant::now();
+        // Anchor forward so the `- 120s` below can't underflow the
+        // monotonic clock on a low-uptime host; ages are relative to
+        // `last_tick`, so the shared offset cancels.
+        let now = Instant::now() + Duration::from_secs(3600);
         actual.last_tick = Some(now);
         let d = dref("worker", 3);
         let mut status = DaemonStatus::default();
