@@ -85,8 +85,14 @@ were doc + DST:
 - **Selection policy (§7) is implemented** — `filter.rs` ships `SelectionPolicy`:
   `LeastLoaded` (spread, the default), `Pack`, `LoadBand(target)`, `LowestId`, with a
   pure `policy_cmp`; capability affinity layers on top of any of them via
-  `select_with_affinity` (soft, `prefer_capability`) — distinct from
-  `NumericFilter::require_capabilities` (hard). The policy is no longer "undetermined."
+  `select_with_affinity` (soft, `prefer_capability`) — distinct from the hard
+  island-resident filters `NumericFilter::require_all` / `require_any`. The policy is
+  no longer "undetermined."
+- **Matching is symmetric across both folds.** The host match (step 1) takes the full
+  `CapabilityQuery` — `tags_all` / `tags_any` / `tag_groups_all` (AND / OR / AND-of-ORs)
+  via `CapabilityFilter`. The live island filter (step 2) mirrors it on the resident-
+  capability axis with `require_all` (AND) + `require_any` (OR). Both query shapes are
+  reachable from the flat SDK criteria, not only from a hand-built `MatchCriteria`.
 - **Option 4b stays deferred behind a *measured* condition, not a flag.** Premature
   flag infrastructure is the wrong direction for a substrate. Implement two-phase
   reserve→commit (4b) only when ordered-acquire (4a) shows pathological backoff at

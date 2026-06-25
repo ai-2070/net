@@ -73,6 +73,10 @@ subset and the complex orchestration primitives land behind it.
   prefer_capability }`, `NumericFilter`, `SelectionPolicy`, `ClaimOutcome {Won, Lost}`,
   `UnitSet`, `IslandId`. (Resource-agnostic: GPU specifics are plain tags, e.g.
   `gpu:h100` / `model:<hex>`.)
+- Flat criteria fields (every binding): host match — `tags_all` (AND), `tags_any` (OR),
+  `tag_groups_all` (AND-of-ORs); island numeric — `min_units`, `max_load`,
+  `max_p50_latency_us`; island resident — `require_all` (AND), `require_any` (OR);
+  ordering — `selection`, `load_band_target`, `prefer_capability`.
 
 **Task lifecycle (cortex surface):**
 - `WorkflowAdapter::open(redex, origin_hash)` / `open_with_config` *(async)*
