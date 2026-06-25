@@ -369,8 +369,8 @@ mod tests {
 
     use super::*;
     use crate::adapter::net::behavior::fold::{
-        CapabilityFilter, CapabilityMembership, CapabilityQuery, EnvelopeMeta, FoldKind, GpuSet,
-        IslandRecord, NodeState, ReservationQuery, ReservationState, SignedAnnouncement,
+        CapabilityFilter, CapabilityMembership, CapabilityQuery, EnvelopeMeta, FoldKind,
+        IslandRecord, NodeState, ReservationQuery, ReservationState, SignedAnnouncement, UnitSet,
     };
     use crate::adapter::net::behavior::gang::{NumericFilter, SelectionPolicy};
     use crate::adapter::net::cortex::workflow::TaskStatus;
@@ -404,11 +404,11 @@ mod tests {
                     ..Default::default()
                 }),
                 numeric: NumericFilter {
-                    min_gpus: 8,
+                    min_units: 8,
                     ..Default::default()
                 },
                 selection: SelectionPolicy::LeastLoaded,
-                prefer_warm_model: None,
+                prefer_capability: None,
             },
             reserve_ttl_us: 60_000_000,
         }
@@ -523,9 +523,9 @@ mod tests {
     fn announce_island(fold: &Fold<IslandTopologyFold>, kp: &EntityKeypair, node: u64, id: u64) {
         let record = IslandRecord {
             id,
-            gpus: GpuSet::new((0..8).collect()),
+            units: UnitSet::new((0..8).collect()),
             host: node,
-            warm_models: vec![0xA1],
+            capabilities: vec!["model:a1".into()],
             load: 0.2,
             p50_latency_us: 1_000,
         };

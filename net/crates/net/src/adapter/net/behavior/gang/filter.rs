@@ -11,9 +11,7 @@
 
 use std::collections::HashSet;
 
-use crate::adapter::net::behavior::fold::{
-    CapabilityMatch, IslandId, IslandRecord, ModelId, NodeId,
-};
+use crate::adapter::net::behavior::fold::{CapabilityMatch, IslandId, IslandRecord, NodeId};
 
 /// Step 1 bridge: the candidate *hosts* surfaced by a capability
 /// match. The capability fold is keyed by `(class, node)`; the node
@@ -32,21 +30,22 @@ pub fn candidate_hosts(matches: &[CapabilityMatch]) -> HashSet<NodeId> {
 /// accepts everything.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NumericFilter {
-    /// Minimum GPUs in the island's NVLink domain. `0` = any.
-    pub min_gpus: usize,
+    /// Minimum exclusive units in the island. `0` = any.
+    pub min_units: usize,
     /// Maximum live load (`0.0..=1.0`). `None` = any.
     pub max_load: Option<f32>,
     /// Maximum live p50 latency (µs). `None` = any.
     pub max_p50_latency_us: Option<u32>,
-    /// Require this model already warm in GPU memory (skips
-    /// cold-load). `None` = any.
-    pub require_warm_model: Option<ModelId>,
+    /// Capabilities the island must have resident (AND) — e.g.
+    /// `"model:<hex>"` for a warm model that skips cold-load. Empty =
+    /// no constraint.
+    pub require_capabilities: Vec<String>,
 }
 
 impl NumericFilter {
     /// Does `record` satisfy every populated constraint?
     pub fn accepts(&self, record: &IslandRecord) -> bool {
-        if record.gpus.len() < self.min_gpus {
+        if record.units.len() < self.min_units {
             return false;
         }
         if let Some(max) = self.max_load {
@@ -59,10 +58,13 @@ impl NumericFilter {
                 return false;
             }
         }
-        if let Some(model) = self.require_warm_model {
-            if !record.warm_models.contains(&model) {
-                return false;
-            }
+        // Every required capability must be resident on the island.
+        if !self
+            .require_capabilities
+            .iter()
+            .all(|cap| record.capabilities.contains(cap))
+        {
+            return false;
         }
         true
     }
@@ -124,25 +126,26 @@ pub fn select_islands(mut records: Vec<IslandRecord>, policy: SelectionPolicy) -
     records.into_iter().map(|r| r.id).collect()
 }
 
-/// Step 3 with soft **warm-model affinity**: islands that already
-/// have `prefer_warm_model` resident rank ahead of those that don't
-/// (skipping cold-load), and within each group `policy` orders them.
-/// `None` reduces to plain [`select_islands`]. Pure.
+/// Step 3 with soft **capability affinity**: islands that already have
+/// `prefer_capability` resident rank ahead of those that don't (e.g. a
+/// warm model that skips cold-load), and within each group `policy`
+/// orders them. `None` reduces to plain [`select_islands`]. Pure.
 ///
-/// Affinity is a *preference*, not the hard `require_warm_model`
-/// filter — a job that benefits from a warm model but can tolerate a
-/// cold start still considers cold islands, just after the warm ones.
+/// Affinity is a *preference*, not the hard `require_capabilities`
+/// filter — a job that benefits from a resident capability but can
+/// tolerate its absence still considers islands without it, just after
+/// the ones that have it.
 pub fn select_with_affinity(
     records: Vec<IslandRecord>,
     policy: SelectionPolicy,
-    prefer_warm_model: Option<ModelId>,
+    prefer_capability: Option<String>,
 ) -> Vec<IslandId> {
-    let Some(model) = prefer_warm_model else {
+    let Some(cap) = prefer_capability else {
         return select_islands(records, policy);
     };
     let (warm, cold): (Vec<IslandRecord>, Vec<IslandRecord>) = records
         .into_iter()
-        .partition(|r| r.warm_models.contains(&model));
+        .partition(|r| r.capabilities.contains(&cap));
     let mut ordered = select_islands(warm, policy);
     ordered.extend(select_islands(cold, policy));
     ordered
@@ -151,14 +154,14 @@ pub fn select_with_affinity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::net::behavior::fold::{GpuSet, IslandRecord};
+    use crate::adapter::net::behavior::fold::{IslandRecord, UnitSet};
 
-    fn rec(id: IslandId, host: NodeId, gpus: usize, load: f32, lat: u32) -> IslandRecord {
+    fn rec(id: IslandId, host: NodeId, units: usize, load: f32, lat: u32) -> IslandRecord {
         IslandRecord {
             id,
-            gpus: GpuSet::new((0..gpus as u32).collect()),
+            units: UnitSet::new((0..units as u32).collect()),
             host,
-            warm_models: vec![0xA1],
+            capabilities: vec!["model:a1".into()],
             load,
             p50_latency_us: lat,
         }
@@ -179,9 +182,9 @@ mod tests {
     }
 
     #[test]
-    fn min_gpus_filters_small_islands() {
+    fn min_units_filters_small_islands() {
         let f = NumericFilter {
-            min_gpus: 4,
+            min_units: 4,
             ..Default::default()
         };
         assert!(f.accepts(&rec(1, 0xAA, 4, 0.0, 0)));
@@ -202,28 +205,28 @@ mod tests {
     }
 
     #[test]
-    fn warm_model_requirement_filters() {
+    fn required_capability_filters() {
         let f = NumericFilter {
-            require_warm_model: Some(0xBEEF),
+            require_capabilities: vec!["model:beef".into()],
             ..Default::default()
         };
         let mut hot = rec(1, 0xAA, 4, 0.0, 0);
-        hot.warm_models = vec![0xBEEF, 0xA1];
+        hot.capabilities = vec!["model:beef".into(), "model:a1".into()];
         assert!(f.accepts(&hot));
-        assert!(!f.accepts(&rec(2, 0xAA, 4, 0.0, 0))); // only has 0xA1
+        assert!(!f.accepts(&rec(2, 0xAA, 4, 0.0, 0))); // only has model:a1
     }
 
     #[test]
     fn numeric_filter_retains_passing_records() {
         let f = NumericFilter {
-            min_gpus: 4,
+            min_units: 4,
             max_load: Some(0.5),
             ..Default::default()
         };
         let kept: Vec<IslandId> = numeric_filter(
             vec![
                 rec(1, 0xAA, 4, 0.2, 0), // pass
-                rec(2, 0xAA, 2, 0.2, 0), // too few gpus
+                rec(2, 0xAA, 2, 0.2, 0), // too few units
                 rec(3, 0xAA, 8, 0.9, 0), // too loaded
                 rec(4, 0xAA, 8, 0.4, 0), // pass
             ],
@@ -297,10 +300,10 @@ mod tests {
     #[test]
     fn affinity_ranks_warm_islands_ahead_within_policy() {
         let mut warm_a = rec(1, 0xAA, 4, 0.9, 0); // warm, high load
-        warm_a.warm_models = vec![0xBEEF];
+        warm_a.capabilities = vec!["model:beef".into()];
         let cold_b = rec(2, 0xAA, 4, 0.1, 0); // cold, low load
         let mut warm_c = rec(3, 0xAA, 4, 0.3, 0); // warm, mid load
-        warm_c.warm_models = vec![0xBEEF, 0xA1];
+        warm_c.capabilities = vec!["model:beef".into(), "model:a1".into()];
 
         // Spread policy: within the warm group least-loaded first
         // (3 then 1), then the cold group (2). Warm beats cold even
@@ -308,7 +311,7 @@ mod tests {
         let order = select_with_affinity(
             vec![warm_a, cold_b, warm_c],
             SelectionPolicy::LeastLoaded,
-            Some(0xBEEF),
+            Some("model:beef".into()),
         );
         assert_eq!(order, vec![3, 1, 2]);
     }

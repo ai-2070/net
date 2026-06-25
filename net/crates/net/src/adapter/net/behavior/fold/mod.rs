@@ -49,7 +49,7 @@ pub use dispatch::{
 };
 pub use expiry::DEFAULT_SWEEP_INTERVAL;
 pub use island::{
-    GpuId, GpuSet, IslandId, IslandQuery, IslandRecord, IslandRow, IslandTopologyFold, ModelId,
+    IslandId, IslandQuery, IslandRecord, IslandRow, IslandTopologyFold, UnitId, UnitSet,
 };
 pub use metrics::{FoldMetrics, FoldStats};
 pub use reservation::{

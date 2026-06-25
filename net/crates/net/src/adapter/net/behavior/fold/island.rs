@@ -1,19 +1,22 @@
-//! `IslandTopologyFold` — folded GPU-island topology surface.
+//! `IslandTopologyFold` — folded resource-island topology surface.
 //!
-//! An *island* is one NVLink domain — the unit a gang job actually
-//! claims (plan locked decision 1). Each island carries one entry
-//! whose payload is the host's self-announced [`IslandRecord`]:
-//! its GPU set, host node, warm models, and the **live numeric
-//! axes** (`load`, `p50_latency_us`).
+//! An *island* is one co-located pool of exclusive units — the thing
+//! a gang job actually claims (plan locked decision 1). Each island
+//! carries one entry whose payload is the host's self-announced
+//! [`IslandRecord`]: its unit set, host node, resident capabilities,
+//! and the **live numeric axes** (`load`, `p50_latency_us`). The unit
+//! is resource-agnostic: a GPU in an NVLink domain is one instance,
+//! but so is any fungible exclusive resource (an accelerator slot, a
+//! licensed seat, a rack PDU port).
 //!
 //! Those live axes are deliberately kept *here* and **not** in the
 //! capability index: they churn every heartbeat, and baking them
 //! into signed/replicated capability tags would cause tag-churn and
 //! stale reads (plan locked decision 4 — "match narrows, CAS
 //! commits"). The capability fold answers the coarse *which nodes
-//! have H100s with NVLink* question; this fold answers the live
-//! *and which island is least-loaded / has the model warm* question
-//! the scheduler's numeric filter needs.
+//! carry the required capability* question; this fold answers the live
+//! *and which island is least-loaded / already has the capability
+//! resident* question the scheduler's numeric filter needs.
 //!
 //! ## Ownership
 //!
@@ -42,57 +45,52 @@ use serde::{Deserialize, Serialize};
 use super::state::{FoldEntry, FoldState, MergeAction, NoIndex, NodeId};
 use super::{FoldKind, SignedAnnouncement};
 
-/// Island identifier — `hash(host, nvlink_domain)`. The same `u64`
-/// space as [`super::ResourceId`], so a single-island gang claim is
-/// one existing [`super::ReservationFold`] CAS with zero new code
-/// (plan locked decision 1).
+/// Island identifier — `hash(host, domain)`. The same `u64` space as
+/// [`super::ResourceId`], so a single-island gang claim is one existing
+/// [`super::ReservationFold`] CAS with zero new code (plan locked
+/// decision 1).
 pub type IslandId = u64;
 
-/// Model identifier — opaque `u64` (e.g. a content hash of the
-/// model name / weights). A *warm* model is one already resident in
-/// an island's GPU memory, so a job targeting it skips cold-load —
-/// the warm-model-affinity axis the selection policy reads.
-pub type ModelId = u64;
+/// A unit index within a host's island (e.g. a GPU index within an
+/// NVLink domain, or any fungible exclusive sub-resource).
+pub type UnitId = u32;
 
-/// A GPU index within a host's NVLink domain.
-pub type GpuId = u32;
-
-/// The set of GPUs composing one NVLink island. Stored sorted +
-/// deduped so [`GpuSet::intersects`] is a linear merge — the check
-/// the "no two `Active` claims share a GPU" property leans on once
-/// gangs span islands (Phase C/D).
+/// The set of units composing one island. Stored sorted + deduped so
+/// [`UnitSet::intersects`] is a linear merge — the check the "no two
+/// `Active` claims share a unit" property leans on once gangs span
+/// islands (Phase C/D).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GpuSet(Vec<GpuId>);
+pub struct UnitSet(Vec<UnitId>);
 
-impl GpuSet {
-    /// Build a `GpuSet` from arbitrary GPU ids, normalizing to
+impl UnitSet {
+    /// Build a `UnitSet` from arbitrary unit ids, normalizing to
     /// sorted + deduped order.
-    pub fn new(mut gpus: Vec<GpuId>) -> Self {
-        gpus.sort_unstable();
-        gpus.dedup();
-        Self(gpus)
+    pub fn new(mut units: Vec<UnitId>) -> Self {
+        units.sort_unstable();
+        units.dedup();
+        Self(units)
     }
 
-    /// Number of distinct GPUs in the island — the axis a
-    /// `min_gpus` numeric filter compares against.
+    /// Number of distinct units in the island — the axis a `min_units`
+    /// numeric filter compares against.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
-    /// Is the island empty (no GPUs)? Such a record is malformed;
-    /// the numeric filter rejects it under any positive `min_gpus`.
+    /// Is the island empty (no units)? Such a record is malformed; the
+    /// numeric filter rejects it under any positive `min_units`.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    /// Borrow the sorted GPU ids.
-    pub fn gpus(&self) -> &[GpuId] {
+    /// Borrow the sorted unit ids.
+    pub fn units(&self) -> &[UnitId] {
         &self.0
     }
 
-    /// Do these two islands share any GPU? Both vecs are sorted, so
+    /// Do these two islands share any unit? Both vecs are sorted, so
     /// this is an O(n+m) merge, not a nested scan.
-    pub fn intersects(&self, other: &GpuSet) -> bool {
+    pub fn intersects(&self, other: &UnitSet) -> bool {
         let (mut i, mut j) = (0, 0);
         while i < self.0.len() && j < other.0.len() {
             match self.0[i].cmp(&other.0[j]) {
@@ -112,16 +110,19 @@ impl GpuSet {
 /// change only on a hardware/host event).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IslandRecord {
-    /// `hash(host, nvlink_domain)` — also this entry's fold key and
-    /// the [`super::ResourceId`] a claim targets.
+    /// `hash(host, domain)` — also this entry's fold key and the
+    /// [`super::ResourceId`] a claim targets.
     pub id: IslandId,
-    /// GPUs in the NVLink domain.
-    pub gpus: GpuSet,
+    /// The exclusive units composing this island.
+    pub units: UnitSet,
     /// Host node that owns + announces this island. Must equal the
     /// announcement's publisher (`node_id`); enforced in `merge`.
     pub host: NodeId,
-    /// Models currently resident in the island's GPU memory.
-    pub warm_models: Vec<ModelId>,
+    /// Capabilities currently resident on this island — the same tag
+    /// vocabulary as the capability fold (e.g. `"model:<hex>"` for a
+    /// warm model). The soft-affinity axis the selection policy reads;
+    /// kept here (not in the capability index) because it churns.
+    pub capabilities: Vec<String>,
     /// Live utilization in `0.0..=1.0`. Fold updates on heartbeat.
     pub load: f32,
     /// Live p50 request latency in microseconds.
@@ -293,9 +294,9 @@ mod tests {
     fn record(id: IslandId, host: NodeId, load: f32) -> IslandRecord {
         IslandRecord {
             id,
-            gpus: GpuSet::new(vec![0, 1, 2, 3]),
+            units: UnitSet::new(vec![0, 1, 2, 3]),
             host,
-            warm_models: vec![0xA1],
+            capabilities: vec!["model:a1".into()],
             load,
             p50_latency_us: 1_500,
         }
@@ -475,13 +476,13 @@ mod tests {
     }
 
     #[test]
-    fn gpu_set_normalizes_and_intersects() {
-        let a = GpuSet::new(vec![3, 1, 1, 2]);
-        assert_eq!(a.gpus(), &[1, 2, 3]);
+    fn unit_set_normalizes_and_intersects() {
+        let a = UnitSet::new(vec![3, 1, 1, 2]);
+        assert_eq!(a.units(), &[1, 2, 3]);
         assert_eq!(a.len(), 3);
-        assert!(a.intersects(&GpuSet::new(vec![5, 3])));
-        assert!(!a.intersects(&GpuSet::new(vec![4, 5, 6])));
-        assert!(!a.intersects(&GpuSet::default()));
+        assert!(a.intersects(&UnitSet::new(vec![5, 3])));
+        assert!(!a.intersects(&UnitSet::new(vec![4, 5, 6])));
+        assert!(!a.intersects(&UnitSet::default()));
     }
 
     #[test]

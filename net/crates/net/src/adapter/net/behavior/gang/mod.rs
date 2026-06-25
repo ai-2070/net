@@ -1,10 +1,12 @@
-//! Gang-claim scheduler ("Thunderdome") — contended GPU-island
+//! Gang-claim scheduler ("Thunderdome") — contended resource-island
 //! arbitration over the substrate's [`ReservationFold`].
 //!
 //! Where the placement scheduler keeps daemon *placements* optimal
 //! over time, this module answers the orthogonal question: *which of
-//! N contending gang jobs atomically wins a contended GPU island,
-//! right now, without double-booking it across a partition.* There
+//! N contending gang jobs atomically wins a contended island of
+//! exclusive units, right now, without double-booking it across a
+//! partition.* (A GPU NVLink domain is the motivating instance; the
+//! mechanism is resource-agnostic.) There
 //! is no central coordinator — matching is a local read, the claim
 //! is a CAS against a single-writer chain, and arbitration falls out
 //! of the chain's total order.
@@ -65,7 +67,6 @@ pub use schedule::{
 
 use crate::adapter::net::behavior::fold::{
     CapabilityFold, CapabilityQuery, Fold, IslandId, IslandQuery, IslandRecord, IslandTopologyFold,
-    ModelId,
 };
 
 /// Inputs to the read-only match→select pipeline ([`match_islands`],
@@ -79,11 +80,11 @@ pub struct MatchCriteria {
     pub numeric: NumericFilter,
     /// Claim-order policy — step 3.
     pub selection: SelectionPolicy,
-    /// Soft warm-model affinity (step 3): islands with this model
-    /// already resident rank ahead of cold ones, within the selection
+    /// Soft capability affinity (step 3): islands with this capability
+    /// already resident rank ahead of the rest, within the selection
     /// policy. `None` = no affinity. Distinct from
-    /// [`NumericFilter::require_warm_model`], which is a hard filter.
-    pub prefer_warm_model: Option<ModelId>,
+    /// [`NumericFilter::require_capabilities`], which is a hard filter.
+    pub prefer_capability: Option<String>,
 }
 
 /// Run the read-only match→select pipeline: coarse capability match
@@ -116,9 +117,13 @@ pub fn match_islands(
         .map(|(_, record)| record)
         .filter(|record| criteria.numeric.accepts(record))
         .collect();
-    // [3] selection ordering (with soft warm-model affinity) → claim
+    // [3] selection ordering (with soft capability affinity) → claim
     // order.
-    select_with_affinity(candidates, criteria.selection, criteria.prefer_warm_model)
+    select_with_affinity(
+        candidates,
+        criteria.selection,
+        criteria.prefer_capability.clone(),
+    )
 }
 
 #[cfg(test)]
@@ -128,9 +133,9 @@ mod tests {
 
     use super::*;
     use crate::adapter::net::behavior::fold::{
-        CapabilityFilter, CapabilityMembership, EnvelopeMeta, Fold, FoldKind, GpuSet, IslandRecord,
+        CapabilityFilter, CapabilityMembership, EnvelopeMeta, Fold, FoldKind, IslandRecord,
         IslandTopologyFold, NodeState, ReservationFold, ReservationQuery, ReservationState,
-        SignedAnnouncement,
+        SignedAnnouncement, UnitSet,
     };
     use crate::adapter::net::current_timestamp_micros;
     use crate::adapter::net::identity::EntityKeypair;
@@ -175,14 +180,14 @@ mod tests {
         kp: &EntityKeypair,
         node: u64,
         id: IslandId,
-        gpus: usize,
+        units: usize,
         load: f32,
     ) {
         let record = IslandRecord {
             id,
-            gpus: GpuSet::new((0..gpus as u32).collect()),
+            units: UnitSet::new((0..units as u32).collect()),
             host: node,
-            warm_models: vec![0xA1],
+            capabilities: vec!["model:a1".into()],
             load,
             p50_latency_us: 1_500,
         };
@@ -234,12 +239,12 @@ mod tests {
                 ..Default::default()
             }),
             numeric: NumericFilter {
-                min_gpus: 8,
+                min_units: 8,
                 max_load: Some(0.5),
                 ..Default::default()
             },
             selection: SelectionPolicy::LeastLoaded,
-            prefer_warm_model: None,
+            prefer_capability: None,
         };
 
         let order = match_islands(&caps, &topo, &criteria);
@@ -265,7 +270,7 @@ mod tests {
             }),
             numeric: NumericFilter::default(),
             selection: SelectionPolicy::LeastLoaded,
-            prefer_warm_model: None,
+            prefer_capability: None,
         };
         assert!(match_islands(&caps, &topo, &criteria).is_empty());
     }
@@ -289,11 +294,11 @@ mod tests {
                 ..Default::default()
             }),
             numeric: NumericFilter {
-                min_gpus: 8,
+                min_units: 8,
                 ..Default::default()
             },
             selection: SelectionPolicy::LeastLoaded,
-            prefer_warm_model: None,
+            prefer_capability: None,
         };
 
         let order = match_islands(&caps, &topo, &criteria);

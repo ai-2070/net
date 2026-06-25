@@ -3600,19 +3600,19 @@ struct GangCriteriaJson {
     #[serde(default)]
     tags_all: Vec<String>,
     #[serde(default)]
-    min_gpus: usize,
+    min_units: usize,
     #[serde(default)]
     max_load: Option<f32>,
     #[serde(default)]
     max_p50_latency_us: Option<u32>,
     #[serde(default)]
-    require_warm_model: Option<u64>,
+    require_capabilities: Vec<String>,
     #[serde(default)]
     selection: Option<String>,
     #[serde(default)]
     load_band_target: Option<f32>,
     #[serde(default)]
-    prefer_warm_model: Option<u64>,
+    prefer_capability: Option<String>,
 }
 
 /// One island a node self-publishes (parsed from `record_json`). Its
@@ -3621,9 +3621,9 @@ struct GangCriteriaJson {
 struct IslandRecordJson {
     id: u64,
     #[serde(default)]
-    gpus: Vec<u32>,
+    units: Vec<u32>,
     #[serde(default)]
-    warm_models: Vec<u64>,
+    capabilities: Vec<String>,
     #[serde(default)]
     load: f32,
     #[serde(default)]
@@ -3648,18 +3648,18 @@ fn build_gang_criteria(
             ..Default::default()
         }),
         numeric: NumericFilter {
-            min_gpus: c.min_gpus,
+            min_units: c.min_units,
             max_load: c.max_load,
             max_p50_latency_us: c.max_p50_latency_us,
-            require_warm_model: c.require_warm_model,
+            require_capabilities: c.require_capabilities,
         },
         selection,
-        prefer_warm_model: c.prefer_warm_model,
+        prefer_capability: c.prefer_capability,
     })
 }
 
 /// Publish this node's island-topology record (host forced to self).
-/// `record_json` is `{"id":..,"gpus":[..],"warm_models":[..],"load":..,
+/// `record_json` is `{"id":..,"units":[..],"capabilities":[..],"load":..,
 /// "p50_latency_us":..}`. The peer fan-out count is written to
 /// `*out_count` (may be NULL).
 #[unsafe(no_mangle)]
@@ -3683,12 +3683,12 @@ pub unsafe extern "C" fn net_mesh_publish_island_topology(
         Ok(r) => r,
         Err(_) => return NET_ERR_GANG_INVALID,
     };
-    use crate::adapter::net::behavior::fold::{GpuSet, IslandRecord};
+    use crate::adapter::net::behavior::fold::{IslandRecord, UnitSet};
     let record = IslandRecord {
         id: rec.id,
-        gpus: GpuSet::new(rec.gpus),
+        units: UnitSet::new(rec.units),
         host: 0, // forced to this node by publish
-        warm_models: rec.warm_models,
+        capabilities: rec.capabilities,
         load: rec.load,
         p50_latency_us: rec.p50_latency_us,
     };
@@ -3706,11 +3706,11 @@ pub unsafe extern "C" fn net_mesh_publish_island_topology(
     }
 }
 
-/// Match GPU islands against `criteria_json` (read-only). Up to `cap`
+/// Match islands against `criteria_json` (read-only). Up to `cap`
 /// island ids are written to `out_ids`; the total match count (which may
 /// exceed `cap`) is written to `*out_count`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn net_mesh_match_gpu_islands(
+pub unsafe extern "C" fn net_mesh_match_islands(
     handle: *mut MeshNodeHandle,
     criteria_json: *const c_char,
     out_ids: *mut u64,
@@ -3735,7 +3735,7 @@ pub unsafe extern "C" fn net_mesh_match_gpu_islands(
     let Some(criteria) = build_gang_criteria(parsed) else {
         return NET_ERR_GANG_INVALID;
     };
-    let ids = h.inner.match_gpu_islands(&criteria);
+    let ids = h.inner.match_islands(&criteria);
     unsafe {
         *out_count = ids.len();
         if !out_ids.is_null() {
@@ -3807,7 +3807,7 @@ pub unsafe extern "C" fn net_mesh_release_island(
 /// is 1 and `*out_island` holds the id, or `*out_found` is 0 when
 /// nothing matched / all contended.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn net_mesh_claim_gpu_island(
+pub unsafe extern "C" fn net_mesh_claim_island(
     handle: *mut MeshNodeHandle,
     criteria_json: *const c_char,
     until_unix_us: u64,
@@ -3841,7 +3841,7 @@ pub unsafe extern "C" fn net_mesh_claim_gpu_island(
         return NET_ERR_GANG_INVALID;
     };
     let node = h.inner.clone();
-    match block_on(async move { node.claim_gpu_island(&criteria, until_unix_us).await }) {
+    match block_on(async move { node.claim_island(&criteria, until_unix_us).await }) {
         Ok(Some(id)) => {
             unsafe {
                 *out_found = 1;
