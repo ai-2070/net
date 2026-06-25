@@ -121,6 +121,27 @@ impl Trigger {
         }
     }
 
+    /// Can this trigger *never* become satisfied in `world`, so it
+    /// should be disarmed rather than re-armed? A task's result and
+    /// done-ness are immutable once it is terminal, so:
+    /// - `AfterTask` waits for `Done`; if the task reached a terminal
+    ///   state that is *not* `Done` (i.e. `Failed`), it can never fire.
+    /// - `IfResult` needs `Done` + a value match; on a terminal task
+    ///   whose value doesn't match (or that `Failed`), it can never fire.
+    ///
+    /// `AfterTerminal` fires *on* terminal so it is never dead, and
+    /// `AtTick` is drained by [`Self::on_tick`], never re-armed here.
+    /// Without this, a branch's non-taken `IfResult` arms accumulate
+    /// permanently in `by_task` once the task completes (review #7).
+    fn is_dead(&self, world: &TriggerWorld<'_>) -> bool {
+        match self {
+            Trigger::AfterTask(task) | Trigger::IfResult { task, .. } => {
+                world.task_terminal(*task) && !self.is_satisfied(world)
+            }
+            Trigger::AfterTerminal(_) | Trigger::AtTick(_) => false,
+        }
+    }
+
     /// The index bucket this trigger waits on, so a fired event touches
     /// only the triggers keyed to it (perf note).
     fn key(&self) -> TriggerKey {
@@ -189,13 +210,18 @@ impl TriggerEngine {
 
     /// `task` changed status: evaluate only the triggers waiting on it,
     /// returning + disarming the satisfied ones. Triggers that aren't
-    /// yet satisfied stay armed.
+    /// yet satisfied stay armed — unless they can *never* be satisfied
+    /// ([`Trigger::is_dead`], e.g. a branch's non-matching `IfResult`
+    /// arm once the task is terminal), which are dropped so they don't
+    /// accumulate forever (review #7).
     pub fn on_task_change(&mut self, task: TaskId, world: &TriggerWorld<'_>) -> Vec<Action> {
         let Some(armed) = self.by_task.remove(&task) else {
             return Vec::new();
         };
-        let (fired, still_armed): (Vec<_>, Vec<_>) =
+        let (fired, rest): (Vec<_>, Vec<_>) =
             armed.into_iter().partition(|(t, _)| t.is_satisfied(world));
+        // Keep only arms that may still fire; drop the dead ones.
+        let still_armed: Vec<_> = rest.into_iter().filter(|(t, _)| !t.is_dead(world)).collect();
         if !still_armed.is_empty() {
             self.by_task.insert(task, still_armed);
         }
@@ -403,10 +429,26 @@ mod tests {
             results: &res,
         };
         assert_eq!(eng.on_task_change(1, &world), vec![Action::Submit(10)]);
-        // The non-matching branch stays armed (its condition may yet
-        // hold under a different recorded result — though for a Done
-        // task it won't; disarming is the caller's policy).
+        // Task 1 is terminal (Done), so the non-matching "right" branch
+        // can never fire — it is disarmed rather than re-armed, so it
+        // doesn't accumulate forever (review #7).
+        assert_eq!(eng.armed_count(), 0);
+    }
+
+    /// An `AfterTask` waiting on a task that reaches a terminal state
+    /// *other than* `Done` (i.e. `Failed`) can never fire, so it is
+    /// disarmed instead of re-armed (review #7).
+    #[test]
+    fn after_task_on_a_failed_task_is_disarmed() {
+        let mut eng = TriggerEngine::new();
+        eng.arm(Trigger::AfterTask(1), Action::Submit(10));
         assert_eq!(eng.armed_count(), 1);
+
+        let failed = state_with(&[(1, TaskStatus::Failed)]);
+        let world = TriggerWorld::new(&failed, 0);
+        // Task failed → AfterTask never fires, and is dropped.
+        assert!(eng.on_task_change(1, &world).is_empty());
+        assert_eq!(eng.armed_count(), 0);
     }
 
     #[test]
