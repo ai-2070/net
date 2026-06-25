@@ -1,0 +1,28 @@
+net/crates/net/sdk-ts/test/workflow.test.ts
+  s_58a23d9389d6ed::t_cfdb62064d7d15 1-51
+net/crates/net/sdk-ts/src/cortex.ts
+  s_58a23d9389d6ed::t_8e0d10b986f723 781-999
+  s_58a23d9389d6ed::t_5d4d9aad2f8dca 45,61-62
+  s_58a23d9389d6ed::t_73acff12f39410 81-82,85-96
+net/crates/net/sdk-ts/src/index.ts
+  s_58a23d9389d6ed::t_cbe800b1a142cf 67,87-89
+net/crates/net/bindings/node/src/cortex.rs
+  s_58a23d9389d6ed::t_81f8edf990812e 34-37
+  s_58a23d9389d6ed::t_17e13c36e698b2 2258-2546
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "9db778cd54205d183577b42117a8eada54a25ca7",
+  "prompts": {},
+  "sessions": {
+    "s_58a23d9389d6ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92186006-b4bc-4409-9b64-7b1fa8e6ebfa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
