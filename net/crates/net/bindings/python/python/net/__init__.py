@@ -75,6 +75,7 @@ try:
         AsyncTasksAdapter,
         AsyncTaskWatchIter,
         CortexError,
+        JoinResult,
         MemoriesAdapter,
         Memory,
         MemoryWatchIter,
@@ -85,7 +86,6 @@ try:
         RedexEvent,
         RedexFile,
         RedexTailIter,
-        JoinResult,
         ShardGroup,
         Task,
         TasksAdapter,
@@ -768,4 +768,4 @@ else:
     )
 
 
-__version__ = "0.27.7"
+__version__ = "0.28.0"
