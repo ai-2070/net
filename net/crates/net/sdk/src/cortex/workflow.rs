@@ -3,7 +3,7 @@
 //! A task is a single-writer RedEX chain; its `TaskState` is the
 //! deterministic fold of transition events (`WorkflowAdapter`). This is
 //! the companion to the gang-claim scheduler ([`crate::gang`]): the gang
-//! decides *who* atomically holds an exclusive GPU island under
+//! decides *who* atomically holds an exclusive resource island under
 //! contention; this layer plans what happens *after* it is held — task
 //! state, the step cursor, retries — with no workflow engine.
 //!

@@ -104,7 +104,7 @@ pub use redis_dedup::RedisStreamDedup;
 // dispatch and operate as a single unit at runtime.
 #[cfg(feature = "net")]
 pub mod capabilities;
-/// Gang-claim GPU-island scheduler value types (live ops on [`mesh::Mesh`]).
+/// Gang-claim resource-island scheduler value types (live ops on [`mesh::Mesh`]).
 #[cfg(feature = "net")]
 pub mod gang;
 #[cfg(feature = "net")]

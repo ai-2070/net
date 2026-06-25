@@ -855,15 +855,15 @@ impl Mesh {
         self.node.find_nodes_by_filter(filter)
     }
 
-    // ---- Gang-claim GPU-island scheduler -----------------------------
+    // ---- Gang-claim resource-island scheduler ------------------------
     //
     // The peer-aware Thunderdome surface; value types live in
     // [`crate::gang`]. `Reserved` is optimistic/AP — the CP `→ Active`
     // commit is a separate (currently Rust-only) primitive.
 
     /// Publish this node's island-topology record — the host
-    /// self-announcing one GPU island's set, warm models, and live
-    /// load / p50-latency axes. `record.host` is forced to this node.
+    /// self-announcing one island's unit set, resident capabilities, and
+    /// live load / p50-latency axes. `record.host` is forced to this node.
     /// Self-indexed locally so this node's own scheduler sees it, then
     /// broadcast to peers; returns the peer fan-out count. Re-publish
     /// each heartbeat to refresh the live axes.

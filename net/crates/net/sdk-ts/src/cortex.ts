@@ -790,8 +790,8 @@ export class NetDb {
  * per-task `{ step, status, attempts }`.
  *
  * The companion to the gang-claim scheduler (the `Mesh` island
- * methods): the gang decides *who* holds an exclusive GPU island; this
- * plans what happens *after* it is held. Its status is the
+ * methods): the gang decides *who* holds an exclusive resource island;
+ * this plans what happens *after* it is held. Its status is the
  * {@link WorkflowTaskStatus} lifecycle — distinct from the cortex
  * tasks-model {@link TaskStatus}.
  */

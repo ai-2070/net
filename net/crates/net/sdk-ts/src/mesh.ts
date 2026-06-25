@@ -586,7 +586,7 @@ export class MeshNode {
     return this.native.findNodes(capabilityFilterToNapi(filter));
   }
 
-  // ---- Gang-claim GPU-island scheduler ----
+  // ---- Gang-claim resource-island scheduler ----
   //
   // The peer-aware Thunderdome surface. `Reserved` is optimistic/AP;
   // the CP `→ Active` commit is a separate (Rust-only) primitive.
