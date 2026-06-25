@@ -1,0 +1,26 @@
+.claude/skills/net-event-bus/SKILL.md
+  s_b93d1d2fee6b2e::t_608863999058e0 3
+  s_b93d1d2fee6b2e::t_87aa321e288b46 24
+  s_b93d1d2fee6b2e::t_44bf7121c450b6 62
+.claude/skills/net-event-bus/capabilities.md
+  s_b93d1d2fee6b2e::t_d9d70e56b1b49b 9-10
+.claude/skills/net-event-bus/scheduler.md
+  s_b93d1d2fee6b2e::t_35f64c5fb55e7f 1-169,171-191
+  s_b93d1d2fee6b2e::t_aa36f599029014 170
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "14a615eaab608d08d32b1b862dbceda477a5aa62",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
