@@ -855,6 +855,72 @@ impl Mesh {
         self.node.find_nodes_by_filter(filter)
     }
 
+    // ---- Gang-claim GPU-island scheduler -----------------------------
+    //
+    // The peer-aware Thunderdome surface; value types live in
+    // [`crate::gang`]. `Reserved` is optimistic/AP — the CP `→ Active`
+    // commit is a separate (currently Rust-only) primitive.
+
+    /// Publish this node's island-topology record — the host
+    /// self-announcing one GPU island's set, warm models, and live
+    /// load / p50-latency axes. `record.host` is forced to this node.
+    /// Self-indexed locally so this node's own scheduler sees it, then
+    /// broadcast to peers; returns the peer fan-out count. Re-publish
+    /// each heartbeat to refresh the live axes.
+    pub async fn publish_island_topology(
+        &self,
+        record: crate::gang::IslandRecord,
+    ) -> Result<usize> {
+        Ok(self.node.publish_island_topology(record).await?)
+    }
+
+    /// Match GPU islands against `criteria` over this node's capability
+    /// + island folds (read-only; no claim). Best island first per the
+    /// selection policy. Empty when nothing matched.
+    pub fn match_gpu_islands(
+        &self,
+        criteria: &crate::gang::MatchCriteria,
+    ) -> Vec<crate::gang::IslandId> {
+        self.node.match_gpu_islands(criteria)
+    }
+
+    /// Reserve `island` (optimistic AP CAS on the reservation fold)
+    /// until `until_unix_us` (wall-clock micros). [`ClaimOutcome::Won`]
+    /// if this node now holds it, [`ClaimOutcome::Lost`] if already
+    /// held by someone with a live reservation.
+    ///
+    /// [`ClaimOutcome::Won`]: crate::gang::ClaimOutcome::Won
+    /// [`ClaimOutcome::Lost`]: crate::gang::ClaimOutcome::Lost
+    pub async fn reserve_island(
+        &self,
+        island: crate::gang::IslandId,
+        until_unix_us: u64,
+    ) -> Result<crate::gang::ClaimOutcome> {
+        Ok(self.node.reserve_island(island, until_unix_us).await?)
+    }
+
+    /// Release `island` this node holds back to `Free`.
+    /// [`ClaimOutcome::Lost`](crate::gang::ClaimOutcome::Lost) if this
+    /// node wasn't the holder.
+    pub async fn release_island(
+        &self,
+        island: crate::gang::IslandId,
+    ) -> Result<crate::gang::ClaimOutcome> {
+        Ok(self.node.release_island(island).await?)
+    }
+
+    /// Match and reserve the first available island in one call — the
+    /// node-level "schedule a single-island gang against my own folds"
+    /// loop. Returns the claimed island, or `None` when nothing matched
+    /// or every match was contended in this node's view.
+    pub async fn claim_gpu_island(
+        &self,
+        criteria: &crate::gang::MatchCriteria,
+        until_unix_us: u64,
+    ) -> Result<Option<crate::gang::IslandId>> {
+        Ok(self.node.claim_gpu_island(criteria, until_unix_us).await?)
+    }
+
     /// Scoped variant of [`Self::find_nodes`]. Filters candidates
     /// through a [`crate::capabilities::ScopeFilter`] derived from
     /// each node's `scope:*` reserved tags. Untagged nodes resolve
