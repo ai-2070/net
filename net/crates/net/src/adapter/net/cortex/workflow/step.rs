@@ -163,7 +163,12 @@ pub struct GangClaimContext<'a> {
 /// can't reach into the scheduler's internals.
 pub struct GangClaimPipeline<'a> {
     ctx: GangClaimContext<'a>,
-    generation: u64,
+    /// Single generation owner: every reserve / epoch / release
+    /// announcement this pipeline signs takes the next value, so they
+    /// stay strictly-monotonic. Replaces a duplicate `generation`
+    /// counter plus a throwaway `Claimant` that was rebuilt (and reset
+    /// to 1) on every commit (review #11).
+    claimant: Claimant<'a>,
     cohort: ReplicaCohort,
     replica_set: ReplicaSet,
     reachable: Vec<NodeId>,
@@ -181,10 +186,35 @@ impl<'a> GangClaimPipeline<'a> {
         reachable: Vec<NodeId>,
         job: JobId,
     ) -> Self {
+        Self::with_generation(ctx, replica_set, reachable, job, 1)
+    }
+
+    /// Like [`new`](Self::new) but seeds the starting generation/epoch.
+    ///
+    /// **Durability limitation (review #4):** the epoch rides the
+    /// reservation generation (locked decision 3), and the fence lives
+    /// in `cohort`, which [`new`](Self::new) builds fresh per pipeline.
+    /// So with the default seed of 1 the `→ Active` fence is only
+    /// self-consistent *within one pipeline's lifetime*: a restarted or
+    /// successor leader that builds a new pipeline restarts epochs at 1,
+    /// below what a prior leader drove the fence to, and (once the
+    /// cohort is durable/shared) would be fenced out — livelock. The
+    /// live Phase-D wiring must seed `start_generation` from a durable
+    /// per-island counter **and** share the cohort across leaders; this
+    /// constructor is the seam for the former.
+    pub fn with_generation(
+        ctx: GangClaimContext<'a>,
+        replica_set: ReplicaSet,
+        reachable: Vec<NodeId>,
+        job: JobId,
+        start_generation: u64,
+    ) -> Self {
         let cohort = ReplicaCohort::new(replica_set.members());
+        let claimant =
+            Claimant::with_generation(ctx.reservations, ctx.keypair, ctx.node_id, start_generation);
         Self {
             ctx,
-            generation: 1,
+            claimant,
             cohort,
             replica_set,
             reachable,
@@ -193,9 +223,7 @@ impl<'a> GangClaimPipeline<'a> {
     }
 
     fn next_gen(&mut self) -> u64 {
-        let g = self.generation;
-        self.generation += 1;
-        g
+        self.claimant.next_gen()
     }
 }
 
@@ -237,9 +265,8 @@ impl ClaimPipeline for GangClaimPipeline<'_> {
         //     the generation: take the next counter value, which is
         //     strictly above the reserve's generation.
         let epoch: Epoch = self.next_gen();
-        let claimant = Claimant::new(self.ctx.reservations, self.ctx.keypair, self.ctx.node_id);
         match commit_active(
-            &claimant,
+            &self.claimant,
             &mut self.cohort,
             &self.replica_set,
             &self.reachable,

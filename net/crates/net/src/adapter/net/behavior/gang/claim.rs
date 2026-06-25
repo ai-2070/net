@@ -245,23 +245,40 @@ impl<'a> Claimant<'a> {
         keypair: &'a EntityKeypair,
         node_id: NodeId,
     ) -> Self {
+        Self::with_generation(reservations, keypair, node_id, 1)
+    }
+
+    /// Build a claimant whose generation counter starts at
+    /// `generation` rather than 1. The epoch rides the reservation
+    /// generation (locked decision 3), so seeding it from a *durable*
+    /// per-island counter is what makes the `→ Active` fence monotonic
+    /// across claimant / pipeline lifetimes (a fresh counter restarts at
+    /// 1, below what a prior leader already drove the fence to — review
+    /// #4). With the default seed of 1 the fence is only self-consistent
+    /// within one claimant's lifetime.
+    pub fn with_generation(
+        reservations: &'a Fold<ReservationFold>,
+        keypair: &'a EntityKeypair,
+        node_id: NodeId,
+        generation: u64,
+    ) -> Self {
         Self {
             reservations,
             keypair,
             node_id,
-            generation: 1,
+            generation,
         }
     }
 
-    /// Take the next generation, advancing the counter. The
+    /// Take the next generation, advancing the counter. The gang
     /// orchestrators thread `&mut self.generation` directly into their
-    /// inner loops; this accessor exists for tests that need a fresh
-    /// monotonic generation after a gang acquire (e.g. to release or
-    /// activate the held islands), hence `#[cfg(test)]`.
-    #[cfg(test)]
-    pub(super) fn next_gen(&mut self) -> u64 {
+    /// inner loops; the cortex `GangClaimPipeline` holds a `Claimant` as
+    /// its single generation owner and calls this for every reserve /
+    /// epoch / release announcement, so they stay strictly-monotonic
+    /// (the reservation fold's anti-reorder rule).
+    pub(crate) fn next_gen(&mut self) -> u64 {
         let g = self.generation;
-        self.generation += 1;
+        self.generation = self.generation.saturating_add(1);
         g
     }
 }
@@ -379,5 +396,18 @@ mod tests {
             fold.query(ReservationQuery::State(0x99)).is_empty(),
             "no spurious Free entry for an island we never held",
         );
+    }
+
+    /// `with_generation` seeds the monotonic counter — the seam a
+    /// durable per-island generation threads through so the epoch stays
+    /// monotonic across claimant lifetimes (review #4).
+    #[test]
+    fn claimant_with_generation_seeds_the_counter() {
+        let fold = new_reservations();
+        let kp = EntityKeypair::generate();
+        let node = kp.entity_id().node_id();
+        let mut c = Claimant::with_generation(&fold, &kp, node, 100);
+        assert_eq!(c.next_gen(), 100);
+        assert_eq!(c.next_gen(), 101);
     }
 }
