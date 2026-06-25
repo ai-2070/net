@@ -281,23 +281,27 @@ Legend: ✅ verified end-to-end here · 🟡 written + compiles, runtime CI-only
 | publish/match/reserve/release/claim island | ✅ | ✅ | ✅ | 🟡 | 🟡 |
 | gang/island types | ✅ | ✅ | ✅ | 🟡 | 🟡 |
 | WorkflowAdapter open + transitions | ✅ | ✅ | ✅ | 🟡 | 🟡 |
-| Workflow reads (get/status_counts/subtree¹) | ✅ | ✅ | ✅ | 🟡 | 🟡 |
-| Workflow snapshot/restore² | ✅ | ✅ | ✅ | ☐ | ☐ |
+| Workflow reads (get/status_counts/subtree) | ✅ | ✅ | ✅ | 🟡 | 🟡 |
+| Workflow snapshot/restore | ✅ | ✅ | ✅ | 🟡 | 🟡 |
 | Shards (fan_out/try_join) — T2 | ✅ | ✅ | ✅ | 🟡 | 🟡 |
-| Triggers (AfterTask/Terminal) — T2 | ✅ | ✅ | ✅ | 🟡 | 🟡 |
+| Triggers (AfterTask/Terminal/AtTick) — T2 | ✅ | ✅ | ✅ | 🟡 | 🟡 |
 
-¹ `subtree` not yet in the C ABI (Vec return); v1 ships the scalar reads.
-² snapshot/restore not yet in the workflow C ABI (Go/C) — follow-up.
+**Progress:** Tier 1 + Tier 2 (incl. `subtree`, snapshot/restore, and the
+AfterTask/AfterTerminal/AtTick trigger set) are exposed on every target. Rust/TS/
+Python are verified end-to-end here (Rust surface tests; napi build + tsc + vitest;
+maturin build + pytest). Go/C (🟡): the full C ABI is in `libnet` and `cargo
+check`s + rustfmt-clean; the root `go/` wrappers + `examples/scheduler.c` are
+written and gofmt-clean — the C/cgo *compile + run* is **CI-only** (no C toolchain
+in the dev sandbox).
 
-**Progress:** P0 (Rust SDK), P1 (TypeScript), P2 (Python) — Tier 1, verified
-end-to-end here (Rust surface tests; napi build + tsc + vitest; maturin build +
-pytest). P3 (Go/C): the C ABI (`net_workflow_*`, `net_mesh_*island*`) is in libnet
-and builds; `examples/scheduler.c` + the root `go/` wrappers are written and pass
-their local gates (cargo check + fmt; C example mirrors `meshos.c`; gofmt clean) —
-but the C/cgo *compile + run* is **CI-only** (no C toolchain in the dev sandbox).
-Remaining: the `bindings/go/net/` reference mirror + a Go test; workflow
-snapshot/restore + `subtree` in the C ABI. Python gang takes flat kwargs (same as
-napi); the C/Go gang takes a JSON criteria string.
+**Remaining (deliberately deferred):**
+- `IfResult` triggers in the bindings — the only trigger variant not bound. It needs
+  a results-map threaded into `TriggerWorld` (results aren't in `WorkflowState`),
+  which breaks the clean `on_task_change(taskId)` signature; needs a small design
+  call (pass a results map vs. have the engine hold one).
+- The `bindings/go/net/` reference copy — **skipped on purpose**: it has no `go.mod`
+  and is compiled by nothing (CI builds the root `go/` module, which has the full
+  surface). It's a hand-maintained contract reference, not a built module.
 
 ---
 
