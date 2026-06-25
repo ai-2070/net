@@ -152,8 +152,19 @@ int  net_workflow_try_join(net_workflow_adapter_t* handle,
 
 /* ---- Tier 2: triggers ----
  * Bound to a WorkflowAdapter (reads its state internally). Actions are
- * (kind, id) pairs: kind 0 = submit, 1 = start. on_task_change fills the
- * parallel out_kinds[]/out_ids[] up to `cap`, total in *out_count. */
+ * (kind, id) pairs: kind 0 = submit, 1 = start. on_task_change / on_tick
+ * fill the parallel out_kinds[]/out_ids[] up to `cap`, total in *out_count.
+ *
+ * IMPORTANT: on_task_change and on_tick are CONSUMING and SINGLE-SHOT —
+ * they fire AND disarm the matching triggers on every call, whether or not
+ * the out-buffers are NULL. Do NOT size them with a "probe with NULL to
+ * learn *out_count, then fill" two-pass (the safe idiom for the read-only
+ * getters net_workflow_subtree / net_mesh_match_gpu_islands): the probe
+ * pass would fire + discard the actions and the fill pass would find
+ * nothing armed. Size the buffer up front (net_trigger_armed_count is an
+ * upper bound — fired is a subset of armed) and call ONCE. If *out_count
+ * exceeds `cap` the surplus actions are lost (they were already
+ * disarmed), so never under-size the buffer. */
 int  net_trigger_engine_new(net_workflow_adapter_t* handle,
                             net_trigger_engine_t** out_handle);
 void net_trigger_engine_free(net_trigger_engine_t* handle);

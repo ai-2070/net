@@ -142,7 +142,12 @@ int  net_workflow_try_join(net_workflow_adapter_t* handle,
                            uint64_t* out_seq, uint64_t* out_failed, size_t cap,
                            size_t* out_failed_count);
 
-/* ---- Tier 2: triggers ---- (action kind 0 submit, 1 start) */
+/* ---- Tier 2: triggers ---- (action kind 0 submit, 1 start)
+ * NOTE: on_task_change / on_tick are CONSUMING and SINGLE-SHOT — they fire
+ * AND disarm matching triggers on every call (NULL out-buffers or not), so
+ * a "probe with NULL, then fill" two-pass would drop the fired actions.
+ * Size the buffer up front (net_trigger_armed_count is an upper bound) and
+ * call ONCE; surplus past `cap` is lost. */
 int  net_trigger_engine_new(net_workflow_adapter_t* handle,
                             net_trigger_engine_t** out_handle);
 void net_trigger_engine_free(net_trigger_engine_t* handle);
