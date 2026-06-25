@@ -136,47 +136,48 @@ class MeshNode:
         """Number of connected peers."""
         return self._native.peer_count()
 
-    # ── Gang-claim GPU-island scheduler ──────────────────────────────
+    # ── Gang-claim resource-island scheduler ─────────────────────────
 
     def publish_island_topology(
         self,
         island_id: int,
-        gpus: List[int],
-        warm_models: List[int],
+        units: List[int],
+        capabilities: List[str],
         load: float,
         p50_latency_us: int,
     ) -> int:
         """Publish this node's island-topology record (its host is forced
         to this node). Self-indexed locally so this node's own scheduler
-        sees it, then broadcast to peers; returns the peer fan-out count."""
+        sees it, then broadcast to peers; returns the peer fan-out count.
+        `capabilities` are resident tags (e.g. ``"model:<hex>"``)."""
         return self._native.publish_island_topology(
-            island_id, gpus, warm_models, load, p50_latency_us
+            island_id, units, capabilities, load, p50_latency_us
         )
 
-    def match_gpu_islands(
+    def match_islands(
         self,
         tags_all: List[str],
         *,
-        min_gpus: Optional[int] = None,
+        min_units: Optional[int] = None,
         max_load: Optional[float] = None,
         max_p50_latency_us: Optional[int] = None,
-        require_warm_model: Optional[int] = None,
+        require_capabilities: Optional[List[str]] = None,
         selection: Optional[str] = None,
         load_band_target: Optional[float] = None,
-        prefer_warm_model: Optional[int] = None,
+        prefer_capability: Optional[str] = None,
     ) -> List[int]:
-        """Match GPU islands against the criteria over this node's folds
+        """Match islands against the criteria over this node's folds
         (read-only; no claim). Best island first. `selection` is one of
         ``least_loaded`` (default) / ``pack`` / ``load_band`` / ``lowest_id``."""
-        return self._native.match_gpu_islands(
+        return self._native.match_islands(
             tags_all,
-            min_gpus=min_gpus,
+            min_units=min_units,
             max_load=max_load,
             max_p50_latency_us=max_p50_latency_us,
-            require_warm_model=require_warm_model,
+            require_capabilities=require_capabilities or [],
             selection=selection,
             load_band_target=load_band_target,
-            prefer_warm_model=prefer_warm_model,
+            prefer_capability=prefer_capability,
         )
 
     def reserve_island(self, island_id: int, until_unix_us: int) -> str:
@@ -189,31 +190,31 @@ class MeshNode:
         node wasn't the holder."""
         return self._native.release_island(island_id)
 
-    def claim_gpu_island(
+    def claim_island(
         self,
         tags_all: List[str],
         until_unix_us: int,
         *,
-        min_gpus: Optional[int] = None,
+        min_units: Optional[int] = None,
         max_load: Optional[float] = None,
         max_p50_latency_us: Optional[int] = None,
-        require_warm_model: Optional[int] = None,
+        require_capabilities: Optional[List[str]] = None,
         selection: Optional[str] = None,
         load_band_target: Optional[float] = None,
-        prefer_warm_model: Optional[int] = None,
+        prefer_capability: Optional[str] = None,
     ) -> Optional[int]:
         """Match + reserve the first available island in one call. Returns
         its id, or ``None`` when nothing matched / all contended."""
-        return self._native.claim_gpu_island(
+        return self._native.claim_island(
             tags_all,
             until_unix_us,
-            min_gpus=min_gpus,
+            min_units=min_units,
             max_load=max_load,
             max_p50_latency_us=max_p50_latency_us,
-            require_warm_model=require_warm_model,
+            require_capabilities=require_capabilities or [],
             selection=selection,
             load_band_target=load_band_target,
-            prefer_warm_model=prefer_warm_model,
+            prefer_capability=prefer_capability,
         )
 
     # ── Stream API ───────────────────────────────────────────────────

@@ -55,7 +55,7 @@ export type {
   PublishConfig,
   PublishReport,
   SubscribeOptions,
-  GpuIslandCriteria,
+  IslandCriteria,
   IslandTopologyInput,
   ClaimOutcome,
   GpuSelectionPolicy,

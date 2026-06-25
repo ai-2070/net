@@ -37,14 +37,14 @@
  */
 
 import { NetMesh as NapiNetMesh } from '@net-mesh/core';
-import type { GpuIslandCriteria, IslandTopologyInput } from '@net-mesh/core';
+import type { IslandCriteria, IslandTopologyInput } from '@net-mesh/core';
 
-export type { GpuIslandCriteria, IslandTopologyInput } from '@net-mesh/core';
+export type { IslandCriteria, IslandTopologyInput } from '@net-mesh/core';
 
 /** Outcome of a reserve/release/claim. */
 export type ClaimOutcome = 'won' | 'lost';
 
-/** Selection policy for {@link MeshNode.matchGpuIslands}. */
+/** Selection policy for {@link MeshNode.matchIslands}. */
 export type GpuSelectionPolicy = 'least_loaded' | 'pack' | 'load_band' | 'lowest_id';
 
 import { setNapiMesh } from './_internal.js';
@@ -601,12 +601,12 @@ export class MeshNode {
   }
 
   /**
-   * Match GPU islands against `criteria` over this node's capability +
+   * Match islands against `criteria` over this node's capability +
    * island folds (read-only; no claim). Best island first. Empty when
    * nothing matched.
    */
-  matchGpuIslands(criteria: GpuIslandCriteria): bigint[] {
-    return this.native.matchGpuIslands(criteria);
+  matchIslands(criteria: IslandCriteria): bigint[] {
+    return this.native.matchIslands(criteria);
   }
 
   /**
@@ -631,8 +631,8 @@ export class MeshNode {
    * its id, or `null` when nothing matched or every match was
    * contended in this node's view.
    */
-  async claimGpuIsland(criteria: GpuIslandCriteria, untilUnixUs: bigint): Promise<bigint | null> {
-    return this.native.claimGpuIsland(criteria, untilUnixUs);
+  async claimIsland(criteria: IslandCriteria, untilUnixUs: bigint): Promise<bigint | null> {
+    return this.native.claimIsland(criteria, untilUnixUs);
   }
 
   /**
