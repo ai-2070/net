@@ -796,6 +796,7 @@ export class NetDb {
  * tasks-model {@link TaskStatus}.
  */
 export class WorkflowAdapter {
+  /** @internal */
   readonly napi: NapiWorkflowAdapter;
 
   constructor(inner: NapiWorkflowAdapter) {
@@ -1027,6 +1028,7 @@ export class WorkflowAdapter {
 
 /** A map-reduce shard group: the shard task ids + the reduce task id. */
 export class ShardGroup {
+  /** @internal */
   readonly napi: NapiShardGroup;
 
   constructor(shards: bigint[], reduce: bigint) {
@@ -1039,6 +1041,7 @@ export class ShardGroup {
  *  {@link onTaskChange} — it returns the satisfied actions for the
  *  caller to apply (it starts no tasks itself). */
 export class TriggerEngine {
+  /** @internal */
   readonly napi: NapiTriggerEngine;
 
   constructor(wf: WorkflowAdapter) {
