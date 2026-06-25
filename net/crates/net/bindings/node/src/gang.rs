@@ -1,13 +1,15 @@
-//! napi bindings for the gang-claim GPU-island scheduler — methods on
-//! the `NetMesh` class plus the flat criteria / island-input objects.
+//! napi bindings for the gang-claim resource-island scheduler — methods
+//! on the `NetMesh` class plus the flat criteria / island-input objects.
 //!
 //! The core `MatchCriteria` embeds a rich `CapabilityQuery` enum; the JS
-//! boundary instead takes a flat [`GpuIslandCriteria`] and builds the
+//! boundary instead takes a flat [`IslandCriteria`] and builds the
 //! composite capability query + numeric filter + selection policy
-//! internally, so callers never touch the internal enum shapes.
+//! internally, so callers never touch the internal enum shapes. The
+//! scheduler is resource-agnostic — GPU specifics ride plain capability
+//! tags (`gpu:h100`, `model:<hex>`).
 
 use ::net::adapter::net::behavior::fold::{
-    CapabilityFilter, CapabilityQuery, GpuSet, IslandRecord,
+    CapabilityFilter, CapabilityQuery, IslandRecord, UnitSet,
 };
 use ::net::adapter::net::behavior::gang::{
     ClaimOutcome, MatchCriteria, NumericFilter, SelectionPolicy,
@@ -18,52 +20,50 @@ use napi_derive::napi;
 use crate::common::bigint_u64;
 use crate::NetMesh;
 
-/// Flat match criteria for the GPU-island scheduler. Built into the core
+/// Flat match criteria for the island scheduler. Built into the core
 /// `MatchCriteria` internally (capability composite + numeric filter +
 /// selection policy).
 #[napi(object)]
-pub struct GpuIslandCriteria {
+pub struct IslandCriteria {
     /// Capability tags every candidate host must carry (AND).
     pub tags_all: Vec<String>,
-    /// Minimum GPUs in the island. Omit / 0 = any.
-    pub min_gpus: Option<u32>,
+    /// Minimum exclusive units in the island. Omit / 0 = any.
+    pub min_units: Option<u32>,
     /// Maximum live load (0.0..=1.0). Omit = any.
     pub max_load: Option<f64>,
     /// Maximum live p50 latency (µs). Omit = any.
     pub max_p50_latency_us: Option<u32>,
-    /// Require this model already warm in GPU memory. Omit = any.
-    pub require_warm_model: Option<BigInt>,
+    /// Capabilities the island must have resident (AND) — e.g.
+    /// `model:<hex>` for a warm model. Omit / empty = any.
+    pub require_capabilities: Option<Vec<String>>,
     /// Selection policy: `least_loaded` (default) / `pack` / `load_band`
     /// / `lowest_id`.
     pub selection: Option<String>,
     /// Target load for the `load_band` policy (0.0..=1.0). Ignored by
     /// the other policies.
     pub load_band_target: Option<f64>,
-    /// Soft warm-model affinity: islands with this model resident rank
-    /// ahead. Omit = none.
-    pub prefer_warm_model: Option<BigInt>,
+    /// Soft capability affinity: islands with this capability resident
+    /// rank ahead. Omit = none.
+    pub prefer_capability: Option<String>,
 }
 
 /// One island a node self-publishes. Its `host` is forced to this node.
 #[napi(object)]
 pub struct IslandTopologyInput {
-    /// `hash(host, nvlink_domain)` — the island id / reservation key.
+    /// `hash(host, domain)` — the island id / reservation key.
     pub id: BigInt,
-    /// GPU indices in the NVLink domain.
-    pub gpus: Vec<u32>,
-    /// Models currently resident in GPU memory.
-    pub warm_models: Vec<BigInt>,
+    /// The exclusive unit indices composing this island.
+    pub units: Vec<u32>,
+    /// Capabilities currently resident on this island (e.g.
+    /// `model:<hex>` tags).
+    pub capabilities: Vec<String>,
     /// Live utilization, 0.0..=1.0.
     pub load: f64,
     /// Live p50 request latency (µs).
     pub p50_latency_us: u32,
 }
 
-fn opt_bigint_u64(b: Option<BigInt>) -> Result<Option<u64>> {
-    b.map(bigint_u64).transpose()
-}
-
-fn build_match_criteria(c: GpuIslandCriteria) -> Result<MatchCriteria> {
+fn build_match_criteria(c: IslandCriteria) -> Result<MatchCriteria> {
     let selection = match c.selection.as_deref() {
         None | Some("least_loaded") => SelectionPolicy::LeastLoaded,
         Some("pack") => SelectionPolicy::Pack,
@@ -81,13 +81,13 @@ fn build_match_criteria(c: GpuIslandCriteria) -> Result<MatchCriteria> {
             ..Default::default()
         }),
         numeric: NumericFilter {
-            min_gpus: c.min_gpus.unwrap_or(0) as usize,
+            min_units: c.min_units.unwrap_or(0) as usize,
             max_load: c.max_load.map(|v| v as f32),
             max_p50_latency_us: c.max_p50_latency_us,
-            require_warm_model: opt_bigint_u64(c.require_warm_model)?,
+            require_capabilities: c.require_capabilities.unwrap_or_default(),
         },
         selection,
-        prefer_warm_model: opt_bigint_u64(c.prefer_warm_model)?,
+        prefer_capability: c.prefer_capability,
     })
 }
 
@@ -107,16 +107,11 @@ impl NetMesh {
     #[napi]
     pub async fn publish_island_topology(&self, island: IslandTopologyInput) -> Result<u32> {
         let node = self.node_arc_clone()?;
-        let warm_models = island
-            .warm_models
-            .into_iter()
-            .map(bigint_u64)
-            .collect::<Result<Vec<_>>>()?;
         let record = IslandRecord {
             id: bigint_u64(island.id)?,
-            gpus: GpuSet::new(island.gpus),
+            units: UnitSet::new(island.units),
             host: 0, // forced to this node by publish
-            warm_models,
+            capabilities: island.capabilities,
             load: island.load as f32,
             p50_latency_us: island.p50_latency_us,
         };
@@ -126,14 +121,14 @@ impl NetMesh {
             .map_err(|e| Error::from_reason(format!("gang: {}", e)))
     }
 
-    /// Match GPU islands against `criteria` over this node's folds
+    /// Match islands against `criteria` over this node's folds
     /// (read-only; no claim). Best island first, by id.
     #[napi]
-    pub fn match_gpu_islands(&self, criteria: GpuIslandCriteria) -> Result<Vec<BigInt>> {
+    pub fn match_islands(&self, criteria: IslandCriteria) -> Result<Vec<BigInt>> {
         let node = self.node_arc_clone()?;
         let mc = build_match_criteria(criteria)?;
         Ok(node
-            .match_gpu_islands(&mc)
+            .match_islands(&mc)
             .into_iter()
             .map(BigInt::from)
             .collect())
@@ -166,15 +161,15 @@ impl NetMesh {
     /// Match + reserve the first available island in one call. Returns
     /// its id, or `null` when nothing matched / all contended.
     #[napi]
-    pub async fn claim_gpu_island(
+    pub async fn claim_island(
         &self,
-        criteria: GpuIslandCriteria,
+        criteria: IslandCriteria,
         until_unix_us: BigInt,
     ) -> Result<Option<BigInt>> {
         let node = self.node_arc_clone()?;
         let mc = build_match_criteria(criteria)?;
         let until = bigint_u64(until_unix_us)?;
-        node.claim_gpu_island(&mc, until)
+        node.claim_island(&mc, until)
             .await
             .map(|o| o.map(BigInt::from))
             .map_err(|e| Error::from_reason(format!("gang: {}", e)))

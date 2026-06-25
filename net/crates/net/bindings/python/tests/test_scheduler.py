@@ -70,12 +70,12 @@ def test_single_node_publish_match_claim() -> None:
     m = NetMesh(_port(2), PSK)
     try:
         m.announce_capabilities({"tags": ["gpu:h100"]})
-        m.publish_island_topology(0xD0, [0, 1, 2, 3, 4, 5, 6, 7], [0xA1], 0.1, 800)
+        m.publish_island_topology(0xD0, [0, 1, 2, 3, 4, 5, 6, 7], ["model:a1"], 0.1, 800)
         assert (
-            m.match_gpu_islands(["gpu:h100"], min_gpus=8, selection="least_loaded")
+            m.match_islands(["gpu:h100"], min_units=8, selection="least_loaded")
             == [0xD0]
         )
-        assert m.claim_gpu_island(["gpu:h100"], UNTIL, min_gpus=8) == 0xD0
+        assert m.claim_island(["gpu:h100"], UNTIL, min_units=8) == 0xD0
     finally:
         m.shutdown()
 

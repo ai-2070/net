@@ -1089,13 +1089,13 @@ mod mesh_bindings {
     #[allow(clippy::too_many_arguments)]
     fn build_gang_criteria(
         tags_all: Vec<String>,
-        min_gpus: Option<usize>,
+        min_units: Option<usize>,
         max_load: Option<f64>,
         max_p50_latency_us: Option<u32>,
-        require_warm_model: Option<u64>,
+        require_capabilities: Vec<String>,
         selection: Option<String>,
         load_band_target: Option<f64>,
-        prefer_warm_model: Option<u64>,
+        prefer_capability: Option<String>,
     ) -> PyResult<::net::adapter::net::behavior::gang::MatchCriteria> {
         use ::net::adapter::net::behavior::fold::{CapabilityFilter, CapabilityQuery};
         use ::net::adapter::net::behavior::gang::{MatchCriteria, NumericFilter, SelectionPolicy};
@@ -1116,13 +1116,13 @@ mod mesh_bindings {
                 ..Default::default()
             }),
             numeric: NumericFilter {
-                min_gpus: min_gpus.unwrap_or(0),
+                min_units: min_units.unwrap_or(0),
                 max_load: max_load.map(|v| v as f32),
                 max_p50_latency_us,
-                require_warm_model,
+                require_capabilities,
             },
             selection: sel,
-            prefer_warm_model,
+            prefer_capability,
         })
     }
 
@@ -1873,27 +1873,28 @@ mod mesh_bindings {
                 .map_err(|e| PyRuntimeError::new_err(format!("capability: {}", e)))
         }
 
-        // ---- Gang-claim GPU-island scheduler ----
+        // ---- Gang-claim resource-island scheduler ----
 
         /// Publish this node's island-topology record (its host is
         /// forced to this node). Self-indexed locally so the node's own
         /// scheduler sees it, then broadcast; returns the peer count.
+        /// `capabilities` are resident tags (e.g. `"model:<hex>"`).
         fn publish_island_topology(
             &self,
             py: Python<'_>,
             id: u64,
-            gpus: Vec<u32>,
-            warm_models: Vec<u64>,
+            units: Vec<u32>,
+            capabilities: Vec<String>,
             load: f64,
             p50_latency_us: u32,
         ) -> PyResult<usize> {
-            use ::net::adapter::net::behavior::fold::{GpuSet, IslandRecord};
+            use ::net::adapter::net::behavior::fold::{IslandRecord, UnitSet};
             let node = self.get_node()?;
             let record = IslandRecord {
                 id,
-                gpus: GpuSet::new(gpus),
+                units: UnitSet::new(units),
                 host: 0, // forced to this node by publish
-                warm_models,
+                capabilities,
                 load: load as f32,
                 p50_latency_us,
             };
@@ -1901,33 +1902,33 @@ mod mesh_bindings {
                 .map_err(|e| PyRuntimeError::new_err(format!("gang: {}", e)))
         }
 
-        /// Match GPU islands against the criteria over this node's
-        /// folds (read-only; no claim). Best island first.
-        #[pyo3(signature = (tags_all, min_gpus=None, max_load=None, max_p50_latency_us=None, require_warm_model=None, selection=None, load_band_target=None, prefer_warm_model=None))]
+        /// Match islands against the criteria over this node's folds
+        /// (read-only; no claim). Best island first.
+        #[pyo3(signature = (tags_all, min_units=None, max_load=None, max_p50_latency_us=None, require_capabilities=Vec::new(), selection=None, load_band_target=None, prefer_capability=None))]
         #[allow(clippy::too_many_arguments)]
-        fn match_gpu_islands(
+        fn match_islands(
             &self,
             tags_all: Vec<String>,
-            min_gpus: Option<usize>,
+            min_units: Option<usize>,
             max_load: Option<f64>,
             max_p50_latency_us: Option<u32>,
-            require_warm_model: Option<u64>,
+            require_capabilities: Vec<String>,
             selection: Option<String>,
             load_band_target: Option<f64>,
-            prefer_warm_model: Option<u64>,
+            prefer_capability: Option<String>,
         ) -> PyResult<Vec<u64>> {
             let node = self.get_node()?;
             let mc = build_gang_criteria(
                 tags_all,
-                min_gpus,
+                min_units,
                 max_load,
                 max_p50_latency_us,
-                require_warm_model,
+                require_capabilities,
                 selection,
                 load_band_target,
-                prefer_warm_model,
+                prefer_capability,
             )?;
-            Ok(node.match_gpu_islands(&mc))
+            Ok(node.match_islands(&mc))
         }
 
         /// Reserve `island` until `until_unix_us` (wall-clock micros).
@@ -1961,35 +1962,35 @@ mod mesh_bindings {
         /// Match + reserve the first available island in one call.
         /// Returns its id, or `None` when nothing matched / all
         /// contended.
-        #[pyo3(signature = (tags_all, until_unix_us, min_gpus=None, max_load=None, max_p50_latency_us=None, require_warm_model=None, selection=None, load_band_target=None, prefer_warm_model=None))]
+        #[pyo3(signature = (tags_all, until_unix_us, min_units=None, max_load=None, max_p50_latency_us=None, require_capabilities=Vec::new(), selection=None, load_band_target=None, prefer_capability=None))]
         #[allow(clippy::too_many_arguments)]
-        fn claim_gpu_island(
+        fn claim_island(
             &self,
             py: Python<'_>,
             tags_all: Vec<String>,
             until_unix_us: u64,
-            min_gpus: Option<usize>,
+            min_units: Option<usize>,
             max_load: Option<f64>,
             max_p50_latency_us: Option<u32>,
-            require_warm_model: Option<u64>,
+            require_capabilities: Vec<String>,
             selection: Option<String>,
             load_band_target: Option<f64>,
-            prefer_warm_model: Option<u64>,
+            prefer_capability: Option<String>,
         ) -> PyResult<Option<u64>> {
             let node = self.get_node()?;
             let mc = build_gang_criteria(
                 tags_all,
-                min_gpus,
+                min_units,
                 max_load,
                 max_p50_latency_us,
-                require_warm_model,
+                require_capabilities,
                 selection,
                 load_band_target,
-                prefer_warm_model,
+                prefer_capability,
             )?;
             py.detach(|| {
                 self.runtime
-                    .block_on(node.claim_gpu_island(&mc, until_unix_us))
+                    .block_on(node.claim_island(&mc, until_unix_us))
             })
             .map_err(|e| PyRuntimeError::new_err(format!("gang: {}", e)))
         }
