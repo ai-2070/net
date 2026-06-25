@@ -283,8 +283,8 @@ Legend: ✅ verified end-to-end here · 🟡 written + compiles, runtime CI-only
 | WorkflowAdapter open + transitions | ✅ | ✅ | ✅ | 🟡 | 🟡 |
 | Workflow reads (get/status_counts/subtree¹) | ✅ | ✅ | ✅ | 🟡 | 🟡 |
 | Workflow snapshot/restore² | ✅ | ✅ | ✅ | ☐ | ☐ |
-| Shards (fan_out/try_join/propagate) — T2 | ☐ | ☐ | ☐ | ☐ | ☐ |
-| Triggers — T2 | ☐ | ☐ | ☐ | ☐ | ☐ |
+| Shards (fan_out/try_join/propagate) — T2 | ✅ | ☐ | ☐ | ☐ | ☐ |
+| Triggers — T2 | ✅ | ☐ | ☐ | ☐ | ☐ |
 
 ¹ `subtree` not yet in the C ABI (Vec return); v1 ships the scalar reads.
 ² snapshot/restore not yet in the workflow C ABI (Go/C) — follow-up.
