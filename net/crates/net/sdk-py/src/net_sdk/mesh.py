@@ -136,6 +136,86 @@ class MeshNode:
         """Number of connected peers."""
         return self._native.peer_count()
 
+    # ── Gang-claim GPU-island scheduler ──────────────────────────────
+
+    def publish_island_topology(
+        self,
+        island_id: int,
+        gpus: List[int],
+        warm_models: List[int],
+        load: float,
+        p50_latency_us: int,
+    ) -> int:
+        """Publish this node's island-topology record (its host is forced
+        to this node). Self-indexed locally so this node's own scheduler
+        sees it, then broadcast to peers; returns the peer fan-out count."""
+        return self._native.publish_island_topology(
+            island_id, gpus, warm_models, load, p50_latency_us
+        )
+
+    def match_gpu_islands(
+        self,
+        tags_all: List[str],
+        *,
+        min_gpus: Optional[int] = None,
+        max_load: Optional[float] = None,
+        max_p50_latency_us: Optional[int] = None,
+        require_warm_model: Optional[int] = None,
+        selection: Optional[str] = None,
+        load_band_target: Optional[float] = None,
+        prefer_warm_model: Optional[int] = None,
+    ) -> List[int]:
+        """Match GPU islands against the criteria over this node's folds
+        (read-only; no claim). Best island first. `selection` is one of
+        ``least_loaded`` (default) / ``pack`` / ``load_band`` / ``lowest_id``."""
+        return self._native.match_gpu_islands(
+            tags_all,
+            min_gpus=min_gpus,
+            max_load=max_load,
+            max_p50_latency_us=max_p50_latency_us,
+            require_warm_model=require_warm_model,
+            selection=selection,
+            load_band_target=load_band_target,
+            prefer_warm_model=prefer_warm_model,
+        )
+
+    def reserve_island(self, island_id: int, until_unix_us: int) -> str:
+        """Reserve `island_id` until `until_unix_us` (wall-clock micros).
+        Returns ``"won"`` if this node now holds it, ``"lost"`` otherwise."""
+        return self._native.reserve_island(island_id, until_unix_us)
+
+    def release_island(self, island_id: int) -> str:
+        """Release `island_id` this node holds. Returns ``"lost"`` if this
+        node wasn't the holder."""
+        return self._native.release_island(island_id)
+
+    def claim_gpu_island(
+        self,
+        tags_all: List[str],
+        until_unix_us: int,
+        *,
+        min_gpus: Optional[int] = None,
+        max_load: Optional[float] = None,
+        max_p50_latency_us: Optional[int] = None,
+        require_warm_model: Optional[int] = None,
+        selection: Optional[str] = None,
+        load_band_target: Optional[float] = None,
+        prefer_warm_model: Optional[int] = None,
+    ) -> Optional[int]:
+        """Match + reserve the first available island in one call. Returns
+        its id, or ``None`` when nothing matched / all contended."""
+        return self._native.claim_gpu_island(
+            tags_all,
+            until_unix_us,
+            min_gpus=min_gpus,
+            max_load=max_load,
+            max_p50_latency_us=max_p50_latency_us,
+            require_warm_model=require_warm_model,
+            selection=selection,
+            load_band_target=load_band_target,
+            prefer_warm_model=prefer_warm_model,
+        )
+
     # ── Stream API ───────────────────────────────────────────────────
 
     def open_stream(

@@ -88,6 +88,9 @@ try:
         Task,
         TasksAdapter,
         TaskWatchIter,
+        WorkflowAdapter,
+        WorkflowStatusCounts,
+        WorkflowTaskState,
     )
 except ImportError:
     # `cortex` feature not compiled in; symbols stay undefined.
@@ -115,6 +118,9 @@ else:
             "Task",
             "TasksAdapter",
             "TaskWatchIter",
+            "WorkflowAdapter",
+            "WorkflowStatusCounts",
+            "WorkflowTaskState",
         ]
     )
 
