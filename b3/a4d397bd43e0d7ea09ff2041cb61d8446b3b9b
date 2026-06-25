@@ -1,0 +1,26 @@
+net/crates/net/src/adapter/net/behavior/gang/claim.rs
+  s_58a23d9389d6ed::t_1e1514802ed1b1 400-411
+  s_58a23d9389d6ed::t_cb2399a79b38f2 273,275-279,281
+  s_58a23d9389d6ed::t_729d3475a9ba66 248-263,269,412
+net/crates/net/src/adapter/net/cortex/workflow/step.rs
+  s_58a23d9389d6ed::t_18129e98174935 189-210,213-214
+  s_58a23d9389d6ed::t_5e4a91c057e6ef 166-171
+  s_58a23d9389d6ed::t_7d9a9df65ad74b 269
+  s_58a23d9389d6ed::t_4e81a007d3d961 217,226
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.11",
+  "base_commit_sha": "b3a4d397bd43e0d7ea09ff2041cb61d8446b3b9b",
+  "prompts": {},
+  "sessions": {
+    "s_58a23d9389d6ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92186006-b4bc-4409-9b64-7b1fa8e6ebfa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
