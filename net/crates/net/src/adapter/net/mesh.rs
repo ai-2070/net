@@ -9253,10 +9253,31 @@ impl MeshNode {
         &self,
         mut record: super::behavior::fold::IslandRecord,
     ) -> Result<usize, AdapterError> {
+        use super::behavior::fold::{FoldKind, IslandTopologyFold};
         record.host = self.node_id;
         let island_id = record.id;
-        self.publish_fold::<super::behavior::fold::IslandTopologyFold>(island_id, 0, record)
-            .await
+        let gen = self.next_fold_generation(IslandTopologyFold::KIND_ID, island_id);
+        let meta = super::behavior::fold::EnvelopeMeta {
+            announced_at: super::current_timestamp_micros(),
+            ..Default::default()
+        };
+        let ann = super::behavior::fold::SignedAnnouncement::sign(
+            &self.identity,
+            IslandTopologyFold::KIND_ID,
+            0,
+            self.node_id,
+            gen,
+            meta,
+            record,
+        )
+        .map_err(|e| AdapterError::Connection(format!("island: sign failed: {e}")))?;
+        // Self-index so the node's OWN scheduler sees islands it hosts:
+        // match_gpu_islands / claim_gpu_island read self.island_fold,
+        // and the broadcast only reaches peers. Mirrors the capability
+        // (announce_capabilities) and reservation
+        // (apply_and_broadcast_reservation) self-apply paths (review #1).
+        let _ = self.island_fold.apply(ann.clone());
+        self.publish_fold_broadcast(&ann).await
     }
 
     /// Send a raw subprotocol message to a peer.

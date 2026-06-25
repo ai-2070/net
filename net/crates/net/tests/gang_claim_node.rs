@@ -219,6 +219,33 @@ async fn island_topology_broadcasts_to_a_connected_peer() {
     assert_eq!(row[0].1.load, 0.42);
 }
 
+/// A node that hosts GPU islands must see them in its OWN island fold
+/// after `publish_island_topology` — the broadcast only reaches peers,
+/// but the node's own scheduler (`match_gpu_islands` / `claim_gpu_island`)
+/// reads the local fold. Without the self-apply a co-located
+/// scheduler+host could never schedule onto its own hardware (review #1).
+#[tokio::test]
+async fn publish_island_topology_self_indexes_for_the_local_scheduler() {
+    let node = build_node().await;
+    let host_id = node.node_id();
+
+    let record = IslandRecord {
+        id: 0xE0,
+        gpus: GpuSet::new(vec![0, 1, 2, 3, 4, 5, 6, 7]),
+        host: 0, // overwritten with node.node_id() by publish
+        warm_models: vec![0xA1],
+        load: 0.1,
+        p50_latency_us: 800,
+    };
+    node.publish_island_topology(record).await.expect("publish");
+
+    // Visible locally with no peer and no wire round-trip.
+    let row = node.island_fold().query(IslandQuery::Get(0xE0));
+    assert_eq!(row.len(), 1, "self-published island is visible in the node's own fold");
+    assert_eq!(row[0].1.host, host_id, "host stamped as this node");
+    assert_eq!(row[0].1.load, 0.1);
+}
+
 /// Node-level claim round-trip: a scheduler node folds a GPU peer's
 /// capability + island (primed here as already-converged), runs
 /// `claim_gpu_island` against its OWN folds, and the resulting
