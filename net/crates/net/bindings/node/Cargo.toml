@@ -139,8 +139,15 @@ net = { package = "net-mesh", version = "0.27.7", path = "../..", default-featur
 net-sdk = { package = "net-mesh-sdk", version = "0.27.7", path = "../../sdk", default-features = false, optional = true }
 dashmap = { version = "6", optional = true }
 parking_lot = "0.12"
-napi = { version = "3.7.0", default-features = false, features = ["napi4", "napi6", "async", "tokio_rt"] }
-napi-derive = "3.4.0"
+# `napi` (runtime) and `napi-derive` MUST move in lockstep: napi-derive
+# pulls napi-derive-backend, and from backend 5.0.5 the `#[napi(object)]`
+# FromNapiValue glue calls `napi::bindgen_prelude::{decorate_field_error,
+# missing_field_error}`, which first ship in the runtime at napi 3.9.4.
+# napi-derive has no cargo dependency on napi, so this floor is the only
+# thing keeping the generated code compilable — do not lower it below the
+# napi-derive partner release.
+napi = { version = "3.9.4", default-features = false, features = ["napi4", "napi6", "async", "tokio_rt"] }
+napi-derive = "3.5.7"
 # Zeroizing wrapper for transient operator-seed copies in the
 # DeckClient / OperatorIdentity standalone constructors.
 zeroize = "1"
