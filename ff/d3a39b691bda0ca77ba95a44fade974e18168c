@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/cortex/workflow/trigger.rs
+  s_58a23d9389d6ed::t_2048b4d871ff93 213-216,221,223-224
+  s_58a23d9389d6ed::t_a6bc86bc2cffe1 432-444,446-451
+  s_58a23d9389d6ed::t_fccc4c8951c65d 124-144
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.11",
+  "base_commit_sha": "ffd3a39b691bda0ca77ba95a44fade974e18168c",
+  "prompts": {},
+  "sessions": {
+    "s_58a23d9389d6ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92186006-b4bc-4409-9b64-7b1fa8e6ebfa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
