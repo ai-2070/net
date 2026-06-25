@@ -284,21 +284,21 @@ Legend: ✅ verified end-to-end here · 🟡 written + compiles, runtime CI-only
 | Workflow reads (get/status_counts/subtree) | ✅ | ✅ | ✅ | 🟡 | 🟡 |
 | Workflow snapshot/restore | ✅ | ✅ | ✅ | 🟡 | 🟡 |
 | Shards (fan_out/try_join) — T2 | ✅ | ✅ | ✅ | 🟡 | 🟡 |
-| Triggers (AfterTask/Terminal/AtTick) — T2 | ✅ | ✅ | ✅ | 🟡 | 🟡 |
+| Triggers (AfterTask/Terminal/AtTick/IfResult) — T2 | ✅ | ✅ | ✅ | 🟡 | 🟡 |
 
-**Progress:** Tier 1 + Tier 2 (incl. `subtree`, snapshot/restore, and the
-AfterTask/AfterTerminal/AtTick trigger set) are exposed on every target. Rust/TS/
-Python are verified end-to-end here (Rust surface tests; napi build + tsc + vitest;
-maturin build + pytest). Go/C (🟡): the full C ABI is in `libnet` and `cargo
-check`s + rustfmt-clean; the root `go/` wrappers + `examples/scheduler.c` are
-written and gofmt-clean — the C/cgo *compile + run* is **CI-only** (no C toolchain
-in the dev sandbox).
+**Progress:** Tier 1 + Tier 2 — including `subtree`, snapshot/restore, and the
+**complete** AfterTask/AfterTerminal/AtTick/**IfResult** trigger set — are exposed
+on every target. Rust/TS/Python are verified end-to-end here (Rust surface tests;
+napi build + tsc + vitest; maturin build + pytest). Go/C (🟡): the full C ABI is in
+`libnet` and `cargo check`s + rustfmt-clean; the root `go/` wrappers +
+`examples/scheduler.c` are written and gofmt-clean — the C/cgo *compile + run* is
+**CI-only** (no C toolchain in the dev sandbox).
+
+`IfResult` uses design **D5(ii)**: the binding-level `TriggerEngine` holds a results
+map populated via `record_result`, threaded into `TriggerWorld` (core helper
+`TriggerWorld::with_results`) so `on_task_change(taskId)` stays a clean one-arg call.
 
 **Remaining (deliberately deferred):**
-- `IfResult` triggers in the bindings — the only trigger variant not bound. It needs
-  a results-map threaded into `TriggerWorld` (results aren't in `WorkflowState`),
-  which breaks the clean `on_task_change(taskId)` signature; needs a small design
-  call (pass a results map vs. have the engine hold one).
 - The `bindings/go/net/` reference copy — **skipped on purpose**: it has no `go.mod`
   and is compiled by nothing (CI builds the root `go/` module, which has the full
   surface). It's a hand-maintained contract reference, not a built module.
