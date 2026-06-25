@@ -247,7 +247,7 @@ mod tests {
         let mut neither = rec(2, 0xAA, 4, 0.0, 0);
         neither.capabilities = vec!["model:cafe".into()];
         assert!(!f.accepts(&neither)); // has neither
-        // Empty require_any = no constraint (composite semantics).
+                                       // Empty require_any = no constraint (composite semantics).
         assert!(NumericFilter::default().accepts(&neither));
     }
 
