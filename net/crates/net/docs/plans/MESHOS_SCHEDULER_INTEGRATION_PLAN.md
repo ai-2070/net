@@ -1,16 +1,17 @@
-# MeshOS ↔ Scheduler Integration — implementation plan
+# MeshOS ↔ Scheduler Integration — implementation plan (v2)
 
 > The wiring between *deciding* and *running*. Thunderdome
 > ([`MESH_SCHEDULER_GANG_CLAIM_PLAN.md`](MESH_SCHEDULER_GANG_CLAIM_PLAN.md)) decides who
 > holds an island; Time ([`TASK_LIFECYCLE_PLAN.md`](TASK_LIFECYCLE_PLAN.md)) decides what
 > state a task is in; **MeshOS runs the daemons.** Today these don't touch — `grep` for
 > `meshos`/`DaemonIntent`/`ActionDispatcher` across `workflow/`, `tasks/`, `gang/` returns
-> nothing. This doc plans the four state-projections (plus one veto rule) that connect them,
-> *without either side calling the other.* Companion to Thunderdome (the claim), Time (the
-> task state), [`MESH_SCHEDULER_PLAN.md`](MESH_SCHEDULER_PLAN.md) (the drift scorer this
-> coexists with), and the MeshOS reconcile loop it projects into. **Come Together release**
-> (Beatles) — two desired-state machines meet at the boundary and never call each other's
-> names.
+> nothing. This doc plans the four state-projections (plus one veto rule) that connect
+> them, *without either side calling the other.* Companion to Thunderdome (the claim),
+> Time (the task state), [`MESH_SCHEDULER_PLAN.md`](MESH_SCHEDULER_PLAN.md) (the drift
+> scorer this coexists with), the MeshOS reconcile loop it projects into, and
+> [`PLAN_CORRECTIONS.md`](PLAN_CORRECTIONS.md) (whose `AfterTerminal` trigger this plan's
+> Phase B consumes). **Come Together release** (Beatles) — two desired-state machines meet
+> at the boundary and never call each other's names.
 
 ## Status
 
@@ -23,34 +24,43 @@ Prerequisites:
   returns `StepGate::Running(ActiveClaim)` / `Waiting`. The bypass-impossibility is
   type-enforced (no reservation fold in step scope).~~ ✅ Landed.
 - ~~**`release_step` + `StepKind` re-exec guard** (`workflow/step.rs`).~~ ✅ Landed.
-- ~~**MeshOS reconcile** (`behavior/meshos/reconcile.rs`) — `reconcile(actual: &MeshOsState,
-  desired: &DesiredState, …, scorer) -> Vec<MeshOsAction>`, with `diff_daemons`,
-  `diff_forced_placements`, `diff_replicas`, `diff_scheduler` arms.~~ ✅ Landed.
+- ~~**MeshOS reconcile** (`behavior/meshos/reconcile.rs`) — `reconcile(actual, desired,
+  …, scorer) -> Vec<MeshOsAction>`, with `diff_daemons`, `diff_forced_placements`,
+  `diff_replicas`, `diff_scheduler` arms.~~ ✅ Landed (verified: lines 76/82/83/92).
 - ~~**Intent + lifecycle vocab** (`behavior/meshos/event.rs`) — `DaemonIntent::{Run,Stop}`,
-  `DaemonRef`, `PlacementIntent`, `DaemonLifecycleSignal`.~~ ✅ Landed.
+  `DaemonRef`, `PlacementIntent`, `DaemonLifecycleSignal`.~~ ✅ Landed (verified: lines
+  238/251/551/563).
 - ~~**`ActionDispatcher`** (`behavior/meshos/executor.rs`) — the execution edge.~~ ✅ Landed.
 - ~~**`IslandTopology` fold** (gang scheduler input).~~ ✅ Landed.
+- **PARTIALLY LANDED — needs the corrections plan's primitive:** failure propagation in
+  shard fan-out depends on `Trigger::AfterTerminal`, which is introduced in
+  [`PLAN_CORRECTIONS.md`](PLAN_CORRECTIONS.md) §2. This plan's Projection 3 consumes it.
+  Either ship that primitive first or sequence the corrections-plan work to land before
+  Phase B of this plan.
 - **NEW, this plan:** four projections (§Design) + the migration-veto rule. Zero of these
-  exist today; the two halves are unconnected.
+  exist today; the two halves are unconnected (verified: `grep meshos` against `workflow/`
+  and `gang/` returns no matches; one false positive on an unrelated `ice.rs` comment).
 
 Activation gate: a task whose step holds an `ActiveClaim` needs to actually *run* on the
-claimed node, and a crashed worker needs to *release* the claim. Both are unreachable until
-this plan lands.
+claimed node, and a crashed worker needs to *release* the claim. Both are unreachable
+until this plan lands.
 
 ## Frame
 
-Both sides are already **desired-state machines.** MeshOS's `reconcile` diffs a `DesiredState`
-against observed `MeshOsState` and emits `MeshOsAction`s. The workflow fold *is* a statement
-of desired state (which tasks should be running). So the connection is not a call graph — it
-is **projection at the desired/observed boundary**, the same "propagate state, not
-connections" posture as the rest of NET. Neither module imports the other. The workflow
-projects task state *into* `DesiredState`; MeshOS projects observed daemon/node state *back
-into* task state and the topology fold. Four projections, one boundary, no RPC.
+Both sides are already **desired-state machines.** MeshOS's `reconcile` diffs a
+`DesiredState` against observed `MeshOsState` and emits `MeshOsAction`s. The workflow fold
+*is* a statement of desired state (which tasks should be running). So the connection is
+not a call graph — it is **projection at the desired/observed boundary**, the same
+"propagate state, not connections" posture as the rest of NET. Neither module imports the
+other. The workflow projects task state *into* `DesiredState`; MeshOS projects observed
+daemon/node state *back into* task state and the topology fold. Four projections, one
+boundary, no RPC.
 
 **Reuses existing primitives:** `reconcile` + its `diff_forced_placements`/`diff_daemons`
 arms, `DaemonIntent`, `DaemonLifecycleSignal`, `ActionDispatcher`, `PlacementScorer`,
 `ClaimPipeline`, `ActiveClaim`, the `IslandTopology` fold. **Adds:** four projection
-functions and the claim-migration veto. No new transport, no new fold, no new consensus.
+functions, the claim-migration veto, and a documented `DaemonRef` encoding convention. No
+new transport, no new fold, no new consensus.
 
 ## Why this exists
 
@@ -60,46 +70,55 @@ functions and the claim-migration veto. No new transport, no new fold, no new co
 2. **Daemon lifecycle is the *only* correct way a crashed job releases its claim.** Without
    the lifecycle→step projection, a worker that dies holding an `ActiveClaim` leaks the
    island forever (corrections #2/#4: stranded GPU). The release path already exists
-   (`release_step`); it just needs `DaemonLifecycleSignal` to *trigger* it.
-3. **Migration vs. exclusive claims is a correctness rule, not an optimization.** Mikoshi can
-   migrate a daemon off the node whose GPU it is using. That either abandons the claim
-   (double-book) or needs an impossible re-claim on the destination. The veto must exist
-   before migration and claims coexist in production.
+   (`release_step`); it just needs `DaemonLifecycleSignal` to *trigger* it, and the
+   trigger machinery needs `AfterTerminal` from the corrections plan to actually
+   propagate the failure to a release.
+3. **Migration vs. exclusive claims is a correctness rule, not an optimization.** Mikoshi
+   can migrate a daemon off the node whose GPU it is using. That either abandons the
+   claim (double-book) or needs an impossible re-claim on the destination. The veto must
+   exist before migration and claims coexist in production, and the veto must be
+   *enforced* — not just documented as convention.
 
 ## What ships
 
 Five pieces, in dependency order:
 
 1. **Projection: workflow task → `DaemonIntent`.** A task at `Running` projects to
-   `DaemonIntent::Run` for a task-keyed `DaemonRef`; terminal/cancel → `Stop`; shard fan-out
-   → N intents. Written into `DesiredState`; reconcile diffs and emits the start/stop action.
-   The workflow **writes intent only** — never `ActionDispatcher::dispatch`
-   ([LD 3](#3-the-workflow-writes-desired-state-never-dispatches)).
-2. **Projection: claim → forced placement.** A claim-bearing task emits a *forced placement*
-   (existing `diff_forced_placements` arm) pinning its daemon to the `ActiveClaim`'s node.
-   The drift `PlacementScorer` is bypassed for claim-pinned daemons — the claim is the
-   placement decision ([LD 1](#1-the-claim-wins-over-the-drift-scorer)).
+   `DaemonIntent::Run` for a task-keyed `DaemonRef`; terminal/cancel → `Stop`; shard
+   fan-out → N intents. Written into `DesiredState`; reconcile diffs and emits the
+   start/stop action. The workflow **writes intent only** — never
+   `ActionDispatcher::dispatch` ([LD 3](#3-the-workflow-writes-desired-state-never-dispatches)).
+2. **Projection: claim → forced placement.** A claim-bearing task emits a *forced
+   placement* (existing `diff_forced_placements` arm) pinning its daemon to the
+   `ActiveClaim`'s node. The drift `PlacementScorer` is bypassed for claim-pinned daemons
+   — the claim is the placement decision ([LD 1](#1-the-claim-wins-over-the-drift-scorer)).
 3. **Projection: `DaemonLifecycleSignal` → step state.** Daemon started → task confirmed
-   `Running`; daemon failed / abnormal exit → step `Failed` → failure-propagation
-   (Time corrections #2) → `release_step` returns the island. This is the release trigger;
-   the release mechanism already exists.
-4. **Projection: observed node/GPU liveness → `IslandTopology` fold.** MeshOS already
-   observes node liveness in `MeshOsState`; project it into the topology fold so the gang
-   scheduler's candidate set reflects reality (a dead node's islands drop out of matching).
-5. **Migration-veto rule.** An exclusive `ActiveClaim` makes its daemon migration-pinned for
-   the claim's lifetime. The Mikoshi/migration path consults claim-state and refuses to move
-   a claim-holder; planned drain becomes release → re-claim elsewhere → restart (stop-the-
-   world for that task), never live migration ([LD 2](#2-migration-veto-for-exclusive-claims)).
+   `Running`; daemon failed / abnormal exit → step `Failed`. The failure then propagates
+   through the corrections-plan `Trigger::AfterTerminal` machinery to release the claim
+   via `release_step` and either retry, fail the parent, or fail the gang per the shard
+   failure-policy. Fully specified in [§Projection 3](#3-daemonlifecyclesignal--step-state-observed-up).
+4. **Projection: observed node/GPU liveness → fold updates.** MeshOS observes node
+   liveness in `MeshOsState`; project it into **both** the `IslandTopology` fold (so the
+   numeric-filter stage drops dead nodes' islands from candidates) **and** the
+   `CapabilityFold` aging (so the coarse-match stage doesn't keep emitting candidates
+   that will just be filtered out). See [§Projection 4](#4-observed-liveness--topology--capability-aging-observed-up).
+5. **Migration-veto rule.** An exclusive `ActiveClaim` makes its daemon migration-pinned
+   for the claim's lifetime. The Mikoshi/migration path consults claim-state and refuses
+   to move a claim-holder; planned drain becomes release → re-claim elsewhere → restart
+   (stop-the-world for that task), never live migration
+   ([LD 2](#2-migration-veto-for-exclusive-claims)). **The veto is enforced by a marker
+   trait on the migration path, not by a `can_migrate()` bool that contributors can
+   forget to consult** — see [LD 4](#4-veto-enforcement-is-by-type-not-convention).
 
 What this doc does NOT ship:
 - **Any direct call between the layers.** If a projection is implemented as a method call
   from `workflow` into `meshos` (or back), it is wrong — see
   [LD 5](#5-no-calls-across-layers-everything-is-state-projected).
-- **Changes to the drift scorer.** `PlacementScorer` keeps scoring *unpinned* daemons; this
-  plan only carves claim-pinned daemons out of its domain.
-- **A migration protocol for claim-holders.** The veto forbids it; designing a live-migrate-
-  with-claim-handoff is explicitly out of scope (and probably physically meaningless for a
-  held GPU).
+- **Changes to the drift scorer.** `PlacementScorer` keeps scoring *unpinned* daemons;
+  this plan only carves claim-pinned daemons out of its domain.
+- **A migration protocol for claim-holders.** The veto forbids it; designing a
+  live-migrate-with-claim-handoff is explicitly out of scope (and probably physically
+  meaningless for a held GPU).
 
 ---
 
@@ -109,168 +128,335 @@ All four projections are pure functions at the state boundary — no I/O, no cal
 other module.
 
 ### 1. Task → `DaemonIntent` (desired down)
+
 ```text
 project_daemon_intents(workflow: &WorkflowState) -> Vec<DaemonIntentUpdate>
     Running(task)        → DaemonIntentUpdate { daemon: daemon_ref(task), intent: Run }
     Failed/Done/Deleted  → ...                                            intent: Stop
     shard fan-out        → one Run per shard daemon_ref
-
-    daemon_ref(task)        = DaemonRef(task_id)
-    daemon_ref(shard)       = DaemonRef(task_id, shard_index)   // NEVER attempt number
 ```
+
+**`DaemonRef` encoding (the load-bearing piece).** The existing struct is
+`DaemonRef { id: u64, name: String }` — verified at `event.rs:238`. The plan does NOT
+change the struct shape. Instead it pins the **encoding convention** for task-derived
+refs:
+
+```rust
+fn daemon_ref(task: TaskId) -> DaemonRef {
+    DaemonRef {
+        // splitmix64 over (DOMAIN_TAG ⊕ task_id). Domain tag distinguishes
+        // task daemons from system daemons in the same registry so a
+        // task_id collision with a system daemon name is impossible.
+        id: encode_task_ref(task),
+        name: format!("task/{task}"),
+    }
+}
+
+fn daemon_ref_shard(parent: TaskId, shard_index: u16) -> DaemonRef {
+    DaemonRef {
+        // splitmix64 over (DOMAIN_TAG ⊕ (parent, shard_index)).
+        // Attempt number is DELIBERATELY EXCLUDED so retries
+        // are reconcile-invisible at the daemon layer (RD 1).
+        id: encode_shard_ref(parent, shard_index),
+        name: format!("task/{parent}/shard/{shard_index}"),
+    }
+}
+```
+
 Folded into the `DesiredState` MeshOS already consumes. The workflow has no handle to the
-dispatcher; it can only emit intent. The `DaemonRef` **must exclude the attempt number** so a
-shard retry is reconcile-invisible (same ref → no spurious stop/start) — see resolved
-decision 1.
+dispatcher; it can only emit intent. **Attempt number is excluded from the encoding** so
+a shard retry projects to the same ref → no diff → no spurious stop/start churn (RD 1).
+
+The encoding convention is defined in **one place** (a new `daemon_ref.rs` in the
+workflow module) and re-exported. Any code path that constructs a task-derived `DaemonRef`
+without going through these functions is a regression — pin this with a clippy lint or a
+visibility constraint (`pub(crate)` on the struct constructor for the encoded id range).
 
 ### 2. Claim → forced placement (desired down, the scheduler seam)
+
 ```text
 project_forced_placements(workflow, claims) -> Vec<ForcedPlacement>
     for each task in Running(ActiveClaim):
         ForcedPlacement { daemon: daemon_ref(task), node: claim.island.node }
 ```
-Consumed by `diff_forced_placements`. A claim-pinned daemon is invisible to the drift
-`PlacementScorer`. The gang scheduler decided the node; MeshOS just honors it. Under
-ICE/freeze, forced placements queue in `FrozenActions.forced_placements` and **replay first
-on thaw** — before the drift scorer or daemon diff — so a freeze can never strand an
-`ActiveClaim` (resolved decision 2).
+
+Consumed by `diff_forced_placements` (verified at `reconcile.rs:82`). A claim-pinned
+daemon is invisible to the drift `PlacementScorer`. The gang scheduler decided the node;
+MeshOS just honors it.
+
+**Freeze interaction (corrected from v1).** The current reconcile freeze behavior at
+`reconcile.rs:67-69` is "drop all output and return early" — there is no `FrozenActions`
+queue (verified: `grep FrozenActions` returns zero hits anywhere in the codebase). v1
+of this plan proposed adding one. **That isn't needed.** Forced placements are
+deterministically re-derived every tick from `(workflow_state, active_claims)`. On thaw,
+the next reconcile tick re-projects current state and emits whatever forced placements
+are still implied by held claims. As long as the claim is still held, the forced
+placement re-emerges naturally — no queue required.
+
+The only failure mode the v1 queue was protecting against is: **reserve TTL expires
+during freeze, claim is lost, freeze thaws, and the forced placement points at an island
+the task no longer holds.** This is prevented by the invariant in [RD 2](#2-freeze-cannot-outlast-claim):
+
+```
+max_freeze_duration < reserve_TTL
+```
+
+Concretely: with the corrections-plan reserve TTL of 5s, freeze TTL must be capped below
+that (cluster-wide config; rejecting freeze proposals with TTL above the cap is a
+one-line check in ICE proposal validation). A freeze that would outlast a claim is
+rejected at proposal time, not silently allowed to strand claims.
 
 ### 3. `DaemonLifecycleSignal` → step state (observed up)
+
 ```text
 apply_lifecycle(signal, workflow) -> WorkflowTransition
     Started(d)          → confirm task(d) Running
-    Failed/Exited(d)    → fail step → (failure propagation) → release_step(claim)
+    Failed/Exited(d)    → fail step → AfterTerminal trigger fires →
+                          (failure policy applied per ShardGroup config) →
+                          release_step(claim)
     Stopped(d)          → expected for terminal/cancel; no-op
 ```
-The release on failure is the corrections-doc cross-cutting rule, now *triggered* by a real
-signal rather than hoped for.
 
-### 4. Observed liveness → `IslandTopology` (observed up)
-```text
-project_topology(meshos: &MeshOsState) -> IslandTopologyDelta
-    node down  → drop its islands from the candidate set
-    node up    → (re)admit
-```
-Closes the loop: matching never offers an island on a dead node. **Invariant:** the reserve
-TTL must be `> 2 × (liveness heartbeat interval + worst-case propagation)` so the
-dead-node→drop sequence always completes before the TTL could expire early — a stale island
-cannot be matched-and-claimed in the gap (resolved decision 3).
+The failure path now has a concrete primitive to ride: `Trigger::AfterTerminal(TaskId)`
+from the corrections plan §2. When a daemon `Failed` signal lands, the projection
+transitions the step to `Failed`, which fires the `AfterTerminal` trigger, which the
+corrections-plan failure-policy code consumes to decide whether to retry the shard,
+cancel sibling shards, or propagate failure to the parent. The release of the held
+`ActiveClaim` happens as part of step `Failed` cleanup — `release_step` is called by the
+worker when its step terminates, the corrections plan does not need to reach into the
+claim system.
 
-### 5. Migration veto
+This is the **one ordering constraint** between the two plans: the corrections plan's
+`AfterTerminal` primitive must land before this plan's Phase B is meaningfully testable,
+because Phase B's "killing a worker daemon fails its step and returns the island to
+`Free` within bounded time" test depends on the failure-propagation path completing.
+
+### 4. Observed liveness → topology + capability aging (observed up)
+
 ```text
-can_migrate(daemon, claims) -> bool
-    !claims.holds_exclusive(daemon)   // a claim-holder is migration-pinned
+project_liveness(meshos: &MeshOsState) -> LivenessDelta
+    node down  → topology: drop its islands from candidate set
+                  capability: invalidate that node's capability entries
+                              (don't wait for natural aging)
+    node up    → topology: (re)admit
+                  capability: allow next heartbeat to re-establish
 ```
-Consulted by the migration path. Drain of a claim-holder = release → re-claim → restart,
-where the **re-claim is an ordinary Thunderdome claim** — it acquires destination islands via
-§4 ordered-acquire, so drain-vs-drain (or drain-vs-gang) contention is resolved deadlock-free
-by the existing protocol with no separate drain coordinator (resolved decision 4).
+
+Both folds get the signal. The gang scheduler's match pipeline reads `CapabilityFold`
+first (coarse prefilter) and `IslandTopology` second (numeric filter). If only the
+topology fold got the liveness signal — as v1 of this plan proposed — the capability
+fold would keep advertising dead-node islands until natural aging, producing candidates
+that get filtered out wastefully. Touching both folds means the match pipeline never
+considers dead-node islands at any stage.
+
+**Capability fold invalidation is *not* deletion.** The capability fold is a CRDT-grade
+AP structure; the projection marks entries as "liveness-suspended" rather than removing
+them. On node-up, suspension lifts and the next capability heartbeat refreshes the
+entry. Suspension is a single boolean flag per capability entry, indexed on the
+publishing node id.
+
+**Invariant** (corrected from v1): the reserve TTL must satisfy:
+```
+reserve_TTL > 2 × (max_liveness_heartbeat_interval + worst_case_fold_propagation_lag)
+```
+With the deployment defaults (1.5s liveness sample, <500ms fold-projection lag): reserve
+TTL ≥ 4s; safe ceiling 5s; this also gives the bound for [RD 2](#2-freeze-cannot-outlast-claim).
+
+This guarantees the ordering — node dies → MeshOS marks it dead → projection 4
+invalidates capability + drops topology → matching stops offering — completes before the
+TTL could expire early. A stale island cannot be matched-and-claimed in the gap.
+
+### 5. Migration veto (enforced by type, not convention)
+
+```rust
+// The migration entry point takes a marker proving the daemon
+// is not a claim-holder. Constructing one consults the claim
+// registry; there is no `unsafe` constructor.
+pub struct MigrationEligible(DaemonRef);
+
+impl MigrationEligible {
+    pub fn check(daemon: DaemonRef, claims: &ClaimRegistry)
+        -> Result<Self, ClaimHeld>
+    {
+        if claims.holds_exclusive(&daemon) {
+            return Err(ClaimHeld(daemon));
+        }
+        Ok(MigrationEligible(daemon))
+    }
+}
+
+// The only migration entry takes this type. A code path that
+// migrates a claim-holder simply cannot type-check.
+pub fn migrate(eligible: MigrationEligible, target: NodeId) -> ... { ... }
+```
+
+This is the LD 4 enforcement: the veto is impossible to bypass by accident because the
+migration entry point only accepts a `MigrationEligible` that can only be constructed
+by passing the claim check. A contributor adding a new migration code path has to go
+through this function or invent a parallel migration system (which is a much larger and
+more visible regression than forgetting a `can_migrate()` call).
+
+Drain of a claim-holder remains `release → re-claim → restart`, where the **re-claim is
+an ordinary Thunderdome claim** — it acquires destination islands via §4 ordered-acquire,
+so drain-vs-drain (or drain-vs-gang) contention is resolved deadlock-free by the existing
+protocol with no separate drain coordinator (RD 3).
 
 ## Phasing
 
 ### Phase A — Desired-down projections (1 week)
-Projections 1 + 2: task→intent, claim→forced-placement. **Done when:** a `Running(ActiveClaim)`
-task starts a daemon on the claim's node, and a terminal task stops it — entirely through
-`DesiredState`, with no workflow→dispatcher call in the path.
+Projections 1 + 2: task→intent, claim→forced-placement. **Done when:** a
+`Running(ActiveClaim)` task starts a daemon on the claim's node, and a terminal task
+stops it — entirely through `DesiredState`, with no workflow→dispatcher call in the
+path. The `daemon_ref` encoding lives in one module and has the visibility constraint
+that prevents bypass.
 
-### Phase B — Observed-up projections (1 week)
-Projections 3 + 4: lifecycle→step, liveness→topology. **Done when:** killing a worker daemon
-fails its step and returns the island to `Free` within bounded time; a downed node's islands
-disappear from matching.
+### Phase B — Observed-up projections (1 week) — *gated on corrections plan §2*
+Projections 3 + 4: lifecycle→step (consuming `AfterTerminal`), liveness→topology +
+capability. **Done when:** killing a worker daemon fails its step and returns the island
+to `Free` within **≤ 2 × (liveness_heartbeat + fold_propagation_lag) + release_latency**
+(at deployment defaults: ≤4s for the liveness-driven path, ≤reserve_TTL for the
+TTL-driven path); a downed node's islands disappear from both capability and topology
+folds.
 
 ### Phase C — Migration veto (3-5 days)
-Projection 5. **Done when:** the migration path refuses to move a claim-holder, and a planned
-drain of one performs release→re-claim→restart without ever double-holding the island.
+Projection 5 with type-enforced eligibility. **Done when:** the migration path will not
+compile if called without `MigrationEligible`, and a planned drain performs
+release → re-claim → restart without ever double-holding the island.
 
 ## Test strategy
 
 - **DST — claim + migration (gating).** Extend `loom_models.rs`: a claim-holding daemon
-  targeted for migration mid-claim must be vetoed; a partition that strands a claim-holder
-  must not let migration *and* reconcile both act. This is the interaction the single-box
-  tests cannot reach.
-- **Integration across the reconciliation boundary.** House pattern (memory transport, two+
-  `NetNode`, subscribe-before-publish): project a `Running(ActiveClaim)` task → assert a
-  `MeshOsAction` start on the claimed node; flip the task terminal → assert the stop. Verify
-  the workflow never holds a dispatcher handle.
-- **Daemon failure → claim release correctness.** A daemon `Failed` signal drives the step to
-  `Failed` and `release_step` returns the island; assert the island is `Free` and re-claimable
-  by another gang within bounded time. The stranded-GPU regression test.
-- **Partition recovery semantics.** Split a claim-holder from the majority; on heal, assert
-  the claim's island ended `Free` exactly once (no double-run survived — Thunderdome §6),
-  the daemon state and the workflow task state agree, and no orphaned daemon kept running on
-  the minority side.
+  targeted for migration mid-claim must be vetoed; a partition that strands a
+  claim-holder must not let migration *and* reconcile both act. This is the interaction
+  the single-box tests cannot reach.
+- **Type-system test for the migration veto.** A `compile_fail` doctest demonstrating
+  that `migrate(some_daemon_ref, target)` does not compile — the type system rejects it
+  without `MigrationEligible::check` first. This is the "veto enforced by type" guarantee
+  pinned mechanically.
+- **Integration across the reconciliation boundary.** House pattern (memory transport,
+  two+ `NetNode`, subscribe-before-publish): project a `Running(ActiveClaim)` task →
+  assert a `MeshOsAction` start on the claimed node; flip the task terminal → assert the
+  stop. Verify the workflow never holds a dispatcher handle.
+- **Daemon failure → claim release correctness.** A daemon `Failed` signal drives the
+  step to `Failed`, the `AfterTerminal` trigger fires, `release_step` returns the island.
+  Assert: island is `Free` within **≤4s at deployment defaults**, re-claimable by another
+  gang. The stranded-GPU regression test, with a concrete bound.
+- **Partition recovery semantics.** Split a claim-holder from the majority; on heal,
+  assert the claim's island ended `Free` exactly once (no double-run survived —
+  Thunderdome §6), the daemon state and the workflow task state agree, and no orphaned
+  daemon kept running on the minority side.
+- **Freeze-vs-claim test.** Issue a freeze with TTL < reserve_TTL: forced placements
+  re-emerge on thaw because the claim is still held. Issue a freeze with TTL ≥
+  reserve_TTL: **proposal is rejected by ICE validation** (test the rejection path
+  exists, not that the silent-strand path works).
+- **Replica-set placement test.** The `IslandTopology` fold's RedEX chain must be placed
+  with `PlacementStrategy::ColocationStrict` to one fault domain — this is the upstream
+  invariant that makes Thunderdome §6's quorum LAN-local and Phase B's partition test
+  meaningful. Pin it: a config that ships without `ColocationStrict` on the topology
+  fold's replica set should fail a startup check, not silently degrade to a slower
+  partition-recovery path.
 
 ## Locked decisions
 
 #### 1. The claim wins over the drift scorer
 A claim-pinned daemon is placed by forced placement on the `ActiveClaim`'s node and is
-removed from the `PlacementScorer`'s domain. The drift scheduler and the gang claim never
-both try to place the same daemon; the claim is authoritative for claim-bearing work.
+removed from the `PlacementScorer`'s domain. The drift scheduler and the gang claim
+never both try to place the same daemon; the claim is authoritative for claim-bearing
+work.
 
 #### 2. Migration-veto for exclusive claims
-An exclusive `ActiveClaim` pins its daemon: migration is refused for the claim's lifetime.
-Moving compute off the GPU it is using is either a double-book or an impossible re-claim;
-drain is release→re-claim→restart, never live migration.
+An exclusive `ActiveClaim` pins its daemon: migration is refused for the claim's
+lifetime. Moving compute off the GPU it is using is either a double-book or an
+impossible re-claim; drain is release → re-claim → restart, never live migration.
 
 #### 3. The workflow writes desired state, never dispatches
 The workflow emits `DaemonIntent` / forced placements into `DesiredState`. It has no
-`ActionDispatcher` handle. This preserves reconcile convergence, supervision, backpressure,
-and the audit chain, and prevents split-brain between "what the fold thinks runs" and "what
-runs."
+`ActionDispatcher` handle. This preserves reconcile convergence, supervision,
+backpressure, and the audit chain, and prevents split-brain between "what the fold
+thinks runs" and "what runs."
 
-#### 4. A step cannot bypass the scheduler — already enforced by the type system
-`drive_capability_step` has no reservation fold in scope; the only path to an exclusive
-resource is `ClaimPipeline`. Bypass is impossible by signature, not by discipline. This plan
-inherits that guarantee and must not introduce a side path that weakens it.
+#### 4. Veto enforcement is by type, not convention
+LD 2 is enforced by `MigrationEligible` (Projection 5): the migration entry point only
+accepts a marker that can only be constructed by passing the claim check. A bypass would
+require either type-defeating `unsafe` or inventing a parallel migration entry point —
+both substantially more visible than forgetting a `can_migrate()` call. Promoted from v1
+"convention" to type enforcement after review found the convention insufficient against
+future contributors.
 
 #### 5. No calls across layers — everything is state-projected
 `workflow`/`gang` and `meshos` never import or call each other. All five connections are
-projections at the desired/observed boundary. A direct call in either direction is a design
-regression, not a shortcut — it recouples what the substrate keeps decoupled.
+projections at the desired/observed boundary. A direct call in either direction is a
+design regression, not a shortcut — it recouples what the substrate keeps decoupled.
 
-## Resolved design decisions
+#### 6. A step cannot bypass the scheduler — already enforced by the type system
+`drive_capability_step` has no reservation fold in scope; the only path to an exclusive
+resource is `ClaimPipeline`. Bypass is impossible by signature, not by discipline. This
+plan inherits that guarantee and must not introduce a side path that weakens it.
 
-All four open questions are decided. Rules below are load-bearing, not advisory.
+## Resolved design decisions (v2)
 
-1. **`DaemonRef` is `(task_id, shard_index)` — never the attempt number. CLOSED.** A shard
-   that fails → retries → replays must not read to reconcile as "old daemon died, new daemon
-   must start" — that produces churn, log spam, and restart storms. Keying the ref on
-   `(task_id, shard_index)` and excluding the attempt count makes a retry reconcile-invisible
-   at the daemon layer: same ref, same desired state, no diff. Guarantees convergence across
-   retries.
+All resolutions below are load-bearing rules, not advisory. Changes from v1 are flagged.
 
-2. **Forced placements queue and replay first after a freeze — guaranteed, not best-effort.
-   CLOSED.** Because the claim *is* the placement, a forced placement can never be dropped.
-   While ICE/freeze is active, forced placements accumulate in `FrozenActions.forced_placements`;
-   on thaw they replay **before** the drift scorer or the daemon diff. This preserves claim
-   stability and monotonic placement correctness — no thaw can strand an `ActiveClaim`.
+1. **`DaemonRef` encoding excludes attempt number — encoding lives in one module.
+   CLOSED.** The existing `DaemonRef { id, name }` struct is unchanged. Task-derived
+   refs are constructed only through `daemon_ref(task)` / `daemon_ref_shard(parent,
+   shard)` in `workflow/daemon_ref.rs`. Attempt number is deliberately excluded so retry
+   is reconcile-invisible (same ref → same desired state → no diff → no churn). Bypass
+   is prevented by module visibility on the encoded id range; a contributor constructing
+   a `DaemonRef` directly with a task-shaped id fails the lint. **(v1 implied the struct
+   carried `(task_id, shard_index)` natively; corrected.)**
 
-3. **Reserve TTL > 2× the MeshOS liveness sampling interval. CLOSED.** The standard
-   liveness-vs-lease invariant: `TTL > 2 × (max liveness heartbeat interval + worst-case
-   propagation)`. This guarantees the ordering — node dies → MeshOS marks it dead →
-   projection 4 drops its islands → matching stops offering them — completes before the TTL
-   could expire early, so a stale island can't be matched-and-claimed in the gap. Set once
-   from the deployment's liveness config; not a per-workload knob. (Worked example: 1.5s
-   liveness sample, <500ms fold-projection lag → 5s reserve TTL is safe and generous.) This
-   constrains the Thunderdome reserve-TTL config — see Thunderdome §6 open question 3.
+2. **Freeze cannot outlast claim — enforced at ICE proposal validation. CLOSED.**
+   Forced placements re-derive deterministically on each reconcile tick from
+   `(workflow_state, active_claims)`. Freeze suppresses output but doesn't drop intent —
+   thaw re-projects current state. The only stranding risk is reserve TTL expiring
+   *during* freeze. Prevented by capping `max_freeze_TTL < reserve_TTL` at the ICE
+   proposal validation layer (a freeze proposal with TTL ≥ reserve_TTL is rejected, not
+   silently accepted). **(v1 proposed a `FrozenActions.forced_placements` queue. That
+   infrastructure does not exist (`grep FrozenActions` → zero hits), and re-derivation
+   on thaw is the simpler and correct mechanism. Corrected.)**
 
-4. **Drain ordering is serial per-island via Thunderdome — no drain-specific arbitration.
-   CLOSED.** There is no special drain mechanism: a drain is `release → re-claim → restart`,
-   and the `re-claim` is an *ordinary* Thunderdome claim. If two drained daemons target the
-   same destination island, Thunderdome arbitrates it like any other contention — no "drain
-   priority," no "drain lock," no bypass of the gang scheduler. Deadlock-freedom is automatic
-   and inherited, not engineered: **reserves are AP, `Active` is CP with the epoch-fence, so
-   no two tasks ever reach `Active` on the same island** — drain contention therefore
-   *resolves* rather than deadlocks. Per-island serialization is the single-writer CAS;
-   cross-island ordering is the §4 lock-ordering. **Rule: drain ordering = the scheduler's
-   natural contention resolution; do not invent drain-specific arbitration.**
+3. **Reserve TTL > 2× the MeshOS liveness sampling interval. CLOSED.** Unchanged from
+   v1. `TTL > 2 × (max liveness heartbeat interval + worst-case propagation)`. With
+   1.5s liveness sample and <500ms fold-projection lag → 5s reserve TTL is safe and
+   generous. Set once from the deployment's liveness config. **This is also the cap that
+   Resolved Decision 2 references for `max_freeze_TTL`.**
+
+4. **Drain ordering is serial per-island via Thunderdome — no drain-specific
+   arbitration. CLOSED.** Unchanged from v1. A drain is `release → re-claim → restart`,
+   and `re-claim` is an ordinary Thunderdome claim. Two drained daemons targeting the
+   same destination island contend via §4 ordered-acquire — no "drain priority," no
+   "drain lock," no bypass. Deadlock-freedom is inherited, not engineered: reserves are
+   AP, `Active` is CP with the epoch-fence, so no two tasks ever reach `Active` on the
+   same island.
+
+5. **Liveness projection touches both topology and capability folds. CLOSED.** v1
+   projected only into `IslandTopology`, which left `CapabilityFold` continuing to
+   advertise dead-node islands until natural aging. Projection 4 now invalidates
+   capability entries by the down-node's id and (re)admits on node-up, eliminating the
+   wasted candidate-then-filter cycles. The capability fold's CRDT-grade AP semantics
+   are preserved — invalidation is a per-entry suspension flag, not a delete. **(v1
+   skipped capability; corrected.)**
+
+6. **`IslandTopology` fold chain placement requires `ColocationStrict`. CLOSED.** The
+   Thunderdome §5 invariant that island replica sets pin to one fault domain extends to
+   the topology fold's own chain: the chain that records which nodes own which islands
+   must itself be placement-constrained, or a cross-DC partition can bisect the
+   topology's quorum and produce inconsistent matching across sides. Pinned with a
+   startup check that refuses to run if the topology fold's chain is not
+   `ColocationStrict` to a single fault domain.
 
 ## See also
-- [`MESH_SCHEDULER_GANG_CLAIM_PLAN.md`](MESH_SCHEDULER_GANG_CLAIM_PLAN.md) — the claim whose
-  `ActiveClaim` node drives forced placement; §6 partition semantics this plan's recovery
-  test asserts against.
+- [`MESH_SCHEDULER_GANG_CLAIM_PLAN.md`](MESH_SCHEDULER_GANG_CLAIM_PLAN.md) — the claim
+  whose `ActiveClaim` node drives forced placement; §5 `ColocationStrict` invariant
+  that Resolved Decision 6 extends to the topology fold; §6 partition semantics this
+  plan's recovery test asserts against.
 - [`TASK_LIFECYCLE_PLAN.md`](TASK_LIFECYCLE_PLAN.md) — the task state projected into
   `DaemonIntent`; the failure-propagation path lifecycle signals trigger.
+- [`PLAN_CORRECTIONS.md`](PLAN_CORRECTIONS.md) — §2 `Trigger::AfterTerminal` primitive
+  that this plan's Projection 3 consumes; §1 `Blocked` decision affects whether the
+  workflow state machine has a state that this plan would need to project (if `Blocked`
+  is kept and means "submitted but resource-blocked," Projection 1 needs a row for it).
 - [`MESH_SCHEDULER_PLAN.md`](MESH_SCHEDULER_PLAN.md) — the drift `PlacementScorer` that
   coexists with, and yields to, claim-pinned placement.
 - `.claude/skills/net-event-bus/testing.md` — the house test harness.
