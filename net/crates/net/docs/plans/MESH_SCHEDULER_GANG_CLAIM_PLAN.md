@@ -84,9 +84,9 @@ were doc + DST:
 
 - **Selection policy (§7) is implemented** — `filter.rs` ships `SelectionPolicy`:
   `LeastLoaded` (spread, the default), `Pack`, `LoadBand(target)`, `LowestId`, with a
-  pure `policy_cmp`; warm-model affinity layers on top of any of them via
-  `select_with_affinity` (soft) — distinct from `NumericFilter::require_warm_model`
-  (hard). The policy is no longer "undetermined."
+  pure `policy_cmp`; capability affinity layers on top of any of them via
+  `select_with_affinity` (soft, `prefer_capability`) — distinct from
+  `NumericFilter::require_capabilities` (hard). The policy is no longer "undetermined."
 - **Option 4b stays deferred behind a *measured* condition, not a flag.** Premature
   flag infrastructure is the wrong direction for a substrate. Implement two-phase
   reserve→commit (4b) only when ordered-acquire (4a) shows pathological backoff at
@@ -198,14 +198,14 @@ What this doc does NOT ship (deferred):
 ### 1. `IslandTopology` fold
 
 ```rust
-/// island id = hash(host, nvlink_domain); the unit gang jobs actually want.
+/// island id = hash(host, domain); the unit gang jobs actually want.
 pub type IslandId = u64; // used directly as the ReservationFold ResourceId
 
 pub struct IslandRecord {
     pub id: IslandId,
-    pub gpus: GpuSet,            // members of the NVLink domain
+    pub units: UnitSet,         // the exclusive units (e.g. GPUs in an NVLink domain)
     pub host: NodeId,
-    pub warm_models: SmallVec<ModelId>,
+    pub capabilities: Vec<String>, // resident tags, e.g. "model:<hex>" for a warm model
     pub load: f32,              // LIVE, fast-changing — fold updates on heartbeat
     pub p50_latency_us: u32,    // LIVE
 }

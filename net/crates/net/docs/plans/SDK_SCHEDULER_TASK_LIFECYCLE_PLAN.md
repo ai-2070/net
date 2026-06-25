@@ -64,14 +64,15 @@ subset and the complex orchestration primitives land behind it.
 
 **Gang (mesh/node surface):**
 - `publish_island_topology(record) -> count` *(async)*
-- `match_gpu_islands(criteria) -> [IslandId]` *(sync, read-only)*
+- `match_islands(criteria) -> [IslandId]` *(sync, read-only)*
 - `reserve_island(island, until_unix_us) -> ClaimOutcome` *(async)*
 - `release_island(island) -> ClaimOutcome` *(async)*
-- `claim_gpu_island(criteria, until_unix_us) -> Option<IslandId>` *(async)*
-- Types: `IslandRecord { id, gpus: GpuSet, host, warm_models, load, p50_latency_us }`,
+- `claim_island(criteria, until_unix_us) -> Option<IslandId>` *(async)*
+- Types: `IslandRecord { id, units: UnitSet, host, capabilities, load, p50_latency_us }`,
   `MatchCriteria { capability, numeric: NumericFilter, selection: SelectionPolicy,
-  prefer_warm_model }`, `NumericFilter`, `SelectionPolicy`, `ClaimOutcome {Won, Lost}`,
-  `GpuSet`, `IslandId`, `ModelId`.
+  prefer_capability }`, `NumericFilter`, `SelectionPolicy`, `ClaimOutcome {Won, Lost}`,
+  `UnitSet`, `IslandId`. (Resource-agnostic: GPU specifics are plain tags, e.g.
+  `gpu:h100` / `model:<hex>`.)
 
 **Task lifecycle (cortex surface):**
 - `WorkflowAdapter::open(redex, origin_hash)` / `open_with_config` *(async)*
@@ -130,14 +131,14 @@ workflow surface alongside:
 
 - New module `sdk/src/gang.rs` re-exporting the gang/island types
   (`MatchCriteria`, `NumericFilter`, `SelectionPolicy`, `ClaimOutcome`, `IslandRecord`,
-  `GpuSet`, `IslandId`, `ModelId`, `ClaimError`).
+  `UnitSet`, `IslandId`, `ClaimError`).
 - Add the five node methods to `impl Mesh` in `sdk/src/mesh.rs`, delegating to the
   inner `Arc<MeshNode>` and mapping errors to `SdkError` — exactly how
   `announce_capabilities` already bridges a peer-aware node call. Pattern:
   ```rust
-  pub async fn claim_gpu_island(&self, c: &gang::MatchCriteria, until_us: u64)
+  pub async fn claim_island(&self, c: &gang::MatchCriteria, until_us: u64)
       -> Result<Option<gang::IslandId>> {
-      self.node_arc().claim_gpu_island(c, until_us).await
+      self.node_arc().claim_island(c, until_us).await
           .map_err(|e| SdkError::Adapter(e.to_string()))
   }
   ```
@@ -334,7 +335,7 @@ map populated via `record_result`, threaded into `TriggerWorld` (core helper
 - **D5** — Triggers cross-FFI shape (return-actions array vs callbacks) — Tier 2.
 - **D6** — `IslandId`/`TaskId` are `u64`; confirm `BigInt` (TS) / `int` (Py) / `uint64_t`
   (Go/C) precision handling is consistent (TS already uses `BigInt` for u64 elsewhere).
-- **D7** — Gang `claim_gpu_island` depends on a live, connected mesh; document the
+- **D7** — Gang `claim_island` depends on a live, connected mesh; document the
   prerequisite (peers + capability/island folds populated) so SDK users don't expect it
   to work on an isolated node (recall review #1: a node now sees its *own* published
   islands, but cross-node matches need convergence).
