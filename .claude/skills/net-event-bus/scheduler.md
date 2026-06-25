@@ -4,7 +4,7 @@ Read this when the user wants to **atomically win a contended exclusive resource
 
 | Layer | Answers | SDK home |
 |---|---|---|
-| **Gang-claim scheduler** ("Thunderdome") | *which of N contending jobs atomically wins a contended island, right now, without double-booking across a partition* | the **mesh / node** surface (peer-aware, live folds) |
+| **Gang-claim scheduler** | *which of N contending jobs atomically wins a contended island, right now, without double-booking across a partition* | the **mesh / node** surface (peer-aware, live folds) |
 | **Task lifecycle** (workflow) | *what happens after it is held* — task state, the step cursor, retries, fan-out, dependencies | the **cortex** surface (a local RedEX chain) |
 
 This is **not** capability routing (`capabilities.md`). `find_nodes` answers "who *can* do X" — an advisory read with no exclusivity. The gang scheduler answers "who *gets* X" — a contended commit where exactly one winner is guaranteed. Use `capabilities.md` to discover candidates; use this to arbitrate the contended grab.
@@ -171,7 +171,7 @@ assert!(wf.get(1).unwrap().status.is_terminal());
 
 ### The capability-bearing step (the one cross-layer seam)
 
-A step that needs an *exclusive* capability must obtain it through the gang match→claim pipeline and **must not run** until an `Active` claim is held. In Rust this is `drive_capability_step(wf, pipeline, task, req)` (Tier-3, `net_sdk::gang` / core `cortex::workflow::step`): the function holds no fold, so a step *cannot* bypass the scheduler by construction. On reject the task parks `Waiting`; a minority-partition leader is quorum-starved and never starts compute. The matching `release_step` returns the island to the pool on any abnormal exit (failed / cancelled / deleted / rewound) — an un-released claim is a stranded resource.
+A step that needs an *exclusive* capability must obtain it through the gang match→claim pipeline and **must not run** until an `Active` claim is held. In Rust this is `drive_capability_step(wf, pipeline, task, req)` (`net_sdk::gang` / core `cortex::workflow::step`): the function holds no fold, so a step *cannot* bypass the scheduler by construction. On reject the task parks `Waiting`; a minority-partition leader is quorum-starved and never starts compute. The matching `release_step` returns the island to the pool on any abnormal exit (failed / cancelled / deleted / rewound) — an un-released claim is a stranded resource.
 
 ---
 
@@ -187,5 +187,5 @@ A step that needs an *exclusive* capability must obtain it through the gang matc
 
 ## Source of truth
 
-- Core: `net/crates/net/src/adapter/net/behavior/gang/` (scheduler) + `behavior/fold/island.rs` (topology fold) + `cortex/workflow/` (lifecycle). Plans: `docs/plans/MESH_SCHEDULER_GANG_CLAIM_PLAN.md`, `docs/plans/TASK_LIFECYCLE_PLAN.md`, `docs/plans/SDK_SCHEDULER_TASK_LIFECYCLE_PLAN.md`.
+- Core: `net/crates/net/src/adapter/net/behavior/gang/` (scheduler) + `behavior/fold/island.rs` (topology fold) + `cortex/workflow/` (lifecycle).
 - SDK: Rust `sdk/src/gang.rs` + `sdk/src/cortex/workflow.rs`; TS `sdk-ts/src/mesh.ts` + `cortex.ts`; Python `sdk-py/src/net_sdk/mesh.py`; Go `go/mesh.go` + `go/cortex.go`; C `include/net.go.h` + `include/net_cortex.h`.
