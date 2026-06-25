@@ -1,0 +1,21 @@
+net/crates/net/sdk/tests/workflow_surface.rs
+  s_58a23d9389d6ed::t_120d98f6b76207 60-113
+net/crates/net/sdk/src/cortex/workflow.rs
+  s_58a23d9389d6ed::t_604d8150ebb74f 42,44-64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "7e263d5869574fd4e56588b59f01b64f8bd56fc9",
+  "prompts": {},
+  "sessions": {
+    "s_58a23d9389d6ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92186006-b4bc-4409-9b64-7b1fa8e6ebfa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
