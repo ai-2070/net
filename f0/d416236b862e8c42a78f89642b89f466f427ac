@@ -1,0 +1,21 @@
+net/crates/net/tests/gang_claim_node.rs
+  s_58a23d9389d6ed::t_69d4ac8330880c 222-248
+net/crates/net/src/adapter/net/mesh.rs
+  s_58a23d9389d6ed::t_f05df6d48c1305 9256,9259-9280
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.11",
+  "base_commit_sha": "f0d416236b862e8c42a78f89642b89f466f427ac",
+  "prompts": {},
+  "sessions": {
+    "s_58a23d9389d6ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92186006-b4bc-4409-9b64-7b1fa8e6ebfa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
