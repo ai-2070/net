@@ -17,8 +17,8 @@ use std::time::Duration;
 use net::adapter::net::behavior::capability::CapabilitySet;
 use net::adapter::net::behavior::fold::{
     CapabilityFilter, CapabilityFold, CapabilityMembership, CapabilityQuery, EnvelopeMeta,
-    FoldKind, UnitSet, IslandQuery, IslandRecord, IslandTopologyFold, NodeState, ReservationQuery,
-    SignedAnnouncement,
+    FoldKind, IslandQuery, IslandRecord, IslandTopologyFold, NodeState, ReservationQuery,
+    SignedAnnouncement, UnitSet,
 };
 use net::adapter::net::behavior::gang::{
     match_islands, single_island_claim, ClaimOutcome, MatchCriteria, NumericFilter, SelectionPolicy,

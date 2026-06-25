@@ -1988,11 +1988,8 @@ mod mesh_bindings {
                 load_band_target,
                 prefer_capability,
             )?;
-            py.detach(|| {
-                self.runtime
-                    .block_on(node.claim_island(&mc, until_unix_us))
-            })
-            .map_err(|e| PyRuntimeError::new_err(format!("gang: {}", e)))
+            py.detach(|| self.runtime.block_on(node.claim_island(&mc, until_unix_us)))
+                .map_err(|e| PyRuntimeError::new_err(format!("gang: {}", e)))
         }
 
         /// **Test-only** helper for the groups test suite.
