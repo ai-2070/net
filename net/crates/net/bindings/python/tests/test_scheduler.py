@@ -9,7 +9,7 @@ pipeline. Multi-node propagation is covered by the Rust integration suite.
 
 from __future__ import annotations
 
-from net import NetMesh, Redex, WorkflowAdapter
+from net import NetMesh, Redex, ShardGroup, TriggerEngine, WorkflowAdapter
 
 PSK = "5b" * 32
 ORIGIN = 0x0F10_5D01
@@ -78,3 +78,42 @@ def test_single_node_publish_match_claim() -> None:
         assert m.claim_gpu_island(["gpu:h100"], UNTIL, min_gpus=8) == 0xD0
     finally:
         m.shutdown()
+
+
+# ---- Tier 2: shards + triggers -------------------------------------------
+
+
+def test_shards_fan_out_then_join() -> None:
+    wf = WorkflowAdapter.open(Redex(), ORIGIN)
+    group = ShardGroup([10, 11, 12], 99)
+    seq = wf.fan_out(group)
+    wf.wait_for_seq(seq)
+    assert wf.try_join(group).kind == "pending"
+
+    last = 0
+    for s in (10, 11, 12):
+        last = wf.complete(s)
+    wf.wait_for_seq(last)
+
+    j = wf.try_join(group)
+    assert j.kind == "submitted"
+    if j.seq is not None:
+        wf.wait_for_seq(j.seq)
+    assert wf.get(99) is not None
+    assert wf.try_join(group).kind == "already_submitted"
+
+
+def test_trigger_fires_dependent_on_done() -> None:
+    wf = WorkflowAdapter.open(Redex(), ORIGIN)
+    eng = TriggerEngine(wf)
+    eng.arm_after_task(1, "submit", 2)  # B depends on A
+
+    wf.submit(1)
+    wf.start(1)
+    wf.wait_for_seq(wf.complete(1))
+
+    actions = eng.on_task_change(1)
+    assert len(actions) == 1
+    assert actions[0].kind == "submit"
+    assert actions[0].id == 2
+    assert eng.armed_count() == 0

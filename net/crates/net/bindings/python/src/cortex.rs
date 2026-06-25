@@ -24,8 +24,11 @@ use ::net::adapter::net::cortex::tasks::{
     TasksAdapter as InnerTasksAdapter,
 };
 use ::net::adapter::net::cortex::workflow::{
+    fan_out, try_join, Action as InnerWfAction, Join as InnerJoin, ShardGroup as InnerShardGroup,
     StatusCounts as InnerStatusCounts, TaskState as InnerWfTaskState,
-    TaskStatus as InnerWfTaskStatus, WorkflowAdapter as InnerWorkflowAdapter,
+    TaskStatus as InnerWfTaskStatus, Trigger as InnerWfTrigger,
+    TriggerEngine as InnerTriggerEngine, TriggerWorld as InnerTriggerWorld,
+    WorkflowAdapter as InnerWorkflowAdapter,
 };
 use ::net::adapter::net::cortex::WaitForTokenError as InnerWaitForTokenError;
 use ::net::adapter::net::redex::{
@@ -3729,6 +3732,41 @@ impl PyWorkflowAdapter {
             .map_err(|e| CortexError::new_err(format!("snapshot failed: {}", e)))
     }
 
+    /// Fan out: submit every shard task. Returns the last append seq.
+    fn fan_out(&self, group: &PyShardGroup) -> PyResult<u64> {
+        fan_out(&self.inner, &group.inner)
+            .map_err(|e| CortexError::new_err(format!("fan_out failed: {}", e)))
+    }
+
+    /// Try to join: submit the reduce once every shard is done, surface
+    /// failed shards, or report pending. Idempotent.
+    fn try_join(&self, group: &PyShardGroup) -> PyResult<PyJoinResult> {
+        match try_join(&self.inner, &group.inner)
+            .map_err(|e| CortexError::new_err(format!("try_join failed: {}", e)))?
+        {
+            InnerJoin::Submitted(s) => Ok(PyJoinResult {
+                kind: "submitted".into(),
+                seq: Some(s),
+                failed: None,
+            }),
+            InnerJoin::AlreadySubmitted => Ok(PyJoinResult {
+                kind: "already_submitted".into(),
+                seq: None,
+                failed: None,
+            }),
+            InnerJoin::Pending => Ok(PyJoinResult {
+                kind: "pending".into(),
+                seq: None,
+                failed: None,
+            }),
+            InnerJoin::Failed(ids) => Ok(PyJoinResult {
+                kind: "failed".into(),
+                seq: None,
+                failed: Some(ids),
+            }),
+        }
+    }
+
     /// Block until every event up through `seq` has folded. Releases
     /// the GIL for the wait.
     fn wait_for_seq(&self, py: Python<'_>, seq: u64) -> PyResult<()> {
@@ -3743,5 +3781,132 @@ impl PyWorkflowAdapter {
                     ))
                 })
         })
+    }
+}
+
+// =========================================================================
+// Tier 2: shards (fan-out / fan-in)
+// =========================================================================
+
+/// A map-reduce shard group: the shard task ids + the reduce task id.
+#[pyclass(name = "ShardGroup")]
+pub struct PyShardGroup {
+    inner: InnerShardGroup,
+}
+
+#[pymethods]
+impl PyShardGroup {
+    #[new]
+    fn new(shards: Vec<u64>, reduce: u64) -> Self {
+        Self {
+            inner: InnerShardGroup::new(shards, reduce),
+        }
+    }
+}
+
+/// Result of a `try_join`: `kind` is `submitted` (reduce appended at
+/// `seq`), `already_submitted`, `pending`, or `failed` (with `failed`
+/// shard ids).
+#[pyclass(name = "JoinResult", from_py_object)]
+#[derive(Clone)]
+pub struct PyJoinResult {
+    #[pyo3(get)]
+    pub kind: String,
+    #[pyo3(get)]
+    pub seq: Option<u64>,
+    #[pyo3(get)]
+    pub failed: Option<Vec<u64>>,
+}
+
+// =========================================================================
+// Tier 2: triggers (D5 (a): the engine binds the WorkflowAdapter and
+// fetches state internally, so the call is just on_task_change(task)).
+// =========================================================================
+
+/// A fired trigger's action: `kind` is `submit` or `start`, `id` the task.
+#[pyclass(name = "TriggerAction", from_py_object)]
+#[derive(Clone)]
+pub struct PyTriggerAction {
+    #[pyo3(get)]
+    pub kind: String,
+    #[pyo3(get)]
+    pub id: u64,
+}
+
+fn wf_action_to_py(a: InnerWfAction) -> PyTriggerAction {
+    match a {
+        InnerWfAction::Submit(id) => PyTriggerAction {
+            kind: "submit".into(),
+            id,
+        },
+        InnerWfAction::Start(id) => PyTriggerAction {
+            kind: "start".into(),
+            id,
+        },
+    }
+}
+
+fn parse_wf_action(kind: &str, id: u64) -> PyResult<InnerWfAction> {
+    match kind {
+        "submit" => Ok(InnerWfAction::Submit(id)),
+        "start" => Ok(InnerWfAction::Start(id)),
+        other => Err(CortexError::new_err(format!("unknown action kind {other:?}"))),
+    }
+}
+
+/// The pure trigger engine, bound to a `WorkflowAdapter` (it reads the
+/// adapter's state internally). `arm_*` a dependency, then drive it with
+/// `on_task_change` — it returns the fired actions for the caller to
+/// apply (it starts no tasks itself).
+#[pyclass(name = "TriggerEngine")]
+pub struct PyTriggerEngine {
+    engine: std::sync::Mutex<InnerTriggerEngine>,
+    adapter: Arc<InnerWorkflowAdapter>,
+}
+
+#[pymethods]
+impl PyTriggerEngine {
+    #[new]
+    fn new(wf: &PyWorkflowAdapter) -> Self {
+        Self {
+            engine: std::sync::Mutex::new(InnerTriggerEngine::new()),
+            adapter: wf.inner.clone(),
+        }
+    }
+
+    /// Arm `AfterTask(task)` -> action (fires when `task` is done).
+    fn arm_after_task(&self, task: u64, action_kind: &str, action_id: u64) -> PyResult<()> {
+        let action = parse_wf_action(action_kind, action_id)?;
+        self.engine
+            .lock()
+            .unwrap()
+            .arm(InnerWfTrigger::AfterTask(task), action);
+        Ok(())
+    }
+
+    /// Arm `AfterTerminal(task)` -> action (fires on done OR failed).
+    fn arm_after_terminal(&self, task: u64, action_kind: &str, action_id: u64) -> PyResult<()> {
+        let action = parse_wf_action(action_kind, action_id)?;
+        self.engine
+            .lock()
+            .unwrap()
+            .arm(InnerWfTrigger::AfterTerminal(task), action);
+        Ok(())
+    }
+
+    /// `task` changed: evaluate the triggers waiting on it against the
+    /// bound adapter's current state; return the fired actions.
+    #[pyo3(signature = (task, tick = 0))]
+    fn on_task_change(&self, task: u64, tick: u64) -> Vec<PyTriggerAction> {
+        let state = self.adapter.state();
+        let guard = state.read();
+        let world = InnerTriggerWorld::new(&guard, tick);
+        let actions = self.engine.lock().unwrap().on_task_change(task, &world);
+        actions.into_iter().map(wf_action_to_py).collect()
+    }
+
+    /// Total armed (not-yet-fired) triggers.
+    fn armed_count(&self) -> usize {
+        self.engine.lock().unwrap().armed_count()
     }
 }

@@ -42,6 +42,10 @@ try:
         WorkflowAdapter,
         WorkflowStatusCounts,
         WorkflowTaskState,
+        ShardGroup,
+        JoinResult,
+        TriggerEngine,
+        TriggerAction,
     )
 except ImportError as e:  # pragma: no cover
     raise ImportError(
@@ -74,6 +78,10 @@ __all__ = [
     "WorkflowStatusCounts",
     "WorkflowTaskState",
     "WorkflowTaskStatus",
+    "ShardGroup",
+    "JoinResult",
+    "TriggerEngine",
+    "TriggerAction",
     "tasks_cm",
     "memories_cm",
 ]
