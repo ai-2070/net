@@ -1940,6 +1940,15 @@ pub struct MeshNode {
     /// announcements flow through the same `SUBPROTOCOL_FOLD`
     /// dispatch as capability announcements.
     reservation_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::ReservationFold>>,
+    /// Island-topology fold (Thunderdome gang-claim scheduler).
+    /// Folds each host's self-announced GPU-island record — gpu set,
+    /// host, warm models, and the live load / p50-latency axes —
+    /// keyed by `IslandId`. Inbound island announcements flow through
+    /// the same `SUBPROTOCOL_FOLD` dispatch as capability +
+    /// reservation announcements; the gang scheduler reads it
+    /// alongside the capability fold for the numeric-filter step. See
+    /// `docs/plans/MESH_SCHEDULER_GANG_CLAIM_PLAN.md`.
+    island_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::IslandTopologyFold>>,
     /// Dedup cache for multi-hop capability announcements. Keyed by
     /// `(origin_node_id, version)` — the same discriminator
     /// `CapabilityIndex` uses to skip stale announcements. Entries
@@ -2353,9 +2362,13 @@ impl MeshNode {
         let reservation_fold: Arc<
             super::behavior::fold::Fold<super::behavior::fold::ReservationFold>,
         > = Arc::new(super::behavior::fold::Fold::new());
+        let island_fold: Arc<
+            super::behavior::fold::Fold<super::behavior::fold::IslandTopologyFold>,
+        > = Arc::new(super::behavior::fold::Fold::new());
         let fold_registry = Arc::new(super::behavior::fold::FoldRegistry::new());
         fold_registry.register(capability_fold.clone());
         fold_registry.register(reservation_fold.clone());
+        fold_registry.register(island_fold.clone());
         let fold_router: Arc<
             parking_lot::RwLock<Option<Arc<dyn super::behavior::fold::FoldChannelRouter>>>,
         > = Arc::new(parking_lot::RwLock::new(Some(
@@ -2541,6 +2554,7 @@ impl MeshNode {
             #[cfg(feature = "dataforts")]
             capability_set_cache,
             reservation_fold,
+            island_fold,
             seen_announcements: Arc::new(DashMap::new()),
             last_announce_at: Arc::new(parking_lot::Mutex::new(None)),
             local_announcement: Arc::new(ArcSwapOption::empty()),
@@ -9224,6 +9238,48 @@ impl MeshNode {
         .await
     }
 
+    /// Publish this node's [`super::behavior::fold::IslandTopologyFold`]
+    /// record for one of its GPU islands — the host self-announcing
+    /// its gpu set, warm models, and the live load / p50-latency
+    /// axes. Re-publish each heartbeat to refresh the live axes;
+    /// generation is per-island (sharded by island id). Peers fold
+    /// these into the Thunderdome gang scheduler's numeric-filter
+    /// view.
+    ///
+    /// `record.host` is forced to this node's id so the announcement
+    /// passes the fold's ownership gate (a node may only announce
+    /// islands it hosts).
+    pub async fn publish_island_topology(
+        &self,
+        mut record: super::behavior::fold::IslandRecord,
+    ) -> Result<usize, AdapterError> {
+        use super::behavior::fold::{FoldKind, IslandTopologyFold};
+        record.host = self.node_id;
+        let island_id = record.id;
+        let gen = self.next_fold_generation(IslandTopologyFold::KIND_ID, island_id);
+        let meta = super::behavior::fold::EnvelopeMeta {
+            announced_at: super::current_timestamp_micros(),
+            ..Default::default()
+        };
+        let ann = super::behavior::fold::SignedAnnouncement::sign(
+            &self.identity,
+            IslandTopologyFold::KIND_ID,
+            0,
+            self.node_id,
+            gen,
+            meta,
+            record,
+        )
+        .map_err(|e| AdapterError::Connection(format!("island: sign failed: {e}")))?;
+        // Self-index so the node's OWN scheduler sees islands it hosts:
+        // match_gpu_islands / claim_gpu_island read self.island_fold,
+        // and the broadcast only reaches peers. Mirrors the capability
+        // (announce_capabilities) and reservation
+        // (apply_and_broadcast_reservation) self-apply paths (review #1).
+        let _ = self.island_fold.apply(ann.clone());
+        self.publish_fold_broadcast(&ann).await
+    }
+
     /// Send a raw subprotocol message to a peer.
     ///
     /// The payload is sent as a single event frame with the specified
@@ -11028,6 +11084,147 @@ impl MeshNode {
         &self,
     ) -> &Arc<super::behavior::fold::Fold<super::behavior::fold::ReservationFold>> {
         &self.reservation_fold
+    }
+
+    /// Shared reference to the island-topology fold (Thunderdome
+    /// gang-claim scheduler). Always present; the scheduler's
+    /// match→claim pipeline reads it alongside
+    /// [`Self::capability_fold`] for the live numeric-filter step.
+    pub fn island_fold(
+        &self,
+    ) -> &Arc<super::behavior::fold::Fold<super::behavior::fold::IslandTopologyFold>> {
+        &self.island_fold
+    }
+
+    /// Match GPU islands for a gang job by reading this node's
+    /// capability + island folds (Thunderdome §2 steps 1–3). Pure
+    /// read; returns the candidate islands in claim order. The
+    /// node-level entry to the match→claim pipeline.
+    pub fn match_gpu_islands(
+        &self,
+        criteria: &super::behavior::gang::MatchCriteria,
+    ) -> Vec<super::behavior::fold::IslandId> {
+        super::behavior::gang::match_islands(&self.capability_fold, &self.island_fold, criteria)
+    }
+
+    /// Reserve `island` under this node's identity: apply the
+    /// `Reserved` transition to the local reservation fold — this
+    /// node's optimistic AP view (locked decision 2) — and broadcast
+    /// it to peers. Returns the local CAS outcome (`Won` if the
+    /// island was free/unheld in this node's view, `Lost` if already
+    /// held). `until_unix_us` is the takeover deadline.
+    pub async fn reserve_island(
+        &self,
+        island: super::behavior::fold::IslandId,
+        until_unix_us: u64,
+    ) -> Result<super::behavior::gang::ClaimOutcome, AdapterError> {
+        self.apply_and_broadcast_reservation(
+            island,
+            super::behavior::fold::ReservationState::Reserved {
+                holder: self.node_id,
+                until_unix_us,
+            },
+        )
+        .await
+    }
+
+    /// Release `island` this node holds: apply `Free` locally and
+    /// broadcast. Returns `Lost` if this node wasn't the holder.
+    ///
+    /// We gate on holder identity first: a `Free` write to an island
+    /// with no local entry would `Insert` and falsely report `Won`
+    /// (leaving a spurious `Free` entry), so a non-holder release is
+    /// reported `Lost` without touching the fold or the wire (review #5).
+    pub async fn release_island(
+        &self,
+        island: super::behavior::fold::IslandId,
+    ) -> Result<super::behavior::gang::ClaimOutcome, AdapterError> {
+        use super::behavior::fold::ReservationQuery;
+        let held_by_us = self
+            .reservation_fold
+            .query(ReservationQuery::State(island))
+            .first()
+            .and_then(|(_, state)| state.holder())
+            == Some(self.node_id);
+        if !held_by_us {
+            return Ok(super::behavior::gang::ClaimOutcome::Lost);
+        }
+        self.apply_and_broadcast_reservation(island, super::behavior::fold::ReservationState::Free)
+            .await
+    }
+
+    /// Match GPU islands by `criteria` and reserve the first
+    /// available, all under this node's identity — the node-level
+    /// "schedule a single-island gang against my own folds" loop
+    /// (the `Reserved` reject walks to the next candidate). Returns
+    /// the claimed island, or `None` when nothing matched or every
+    /// match was contended in this node's view.
+    pub async fn claim_gpu_island(
+        &self,
+        criteria: &super::behavior::gang::MatchCriteria,
+        until_unix_us: u64,
+    ) -> Result<Option<super::behavior::fold::IslandId>, AdapterError> {
+        for island in self.match_gpu_islands(criteria) {
+            if matches!(
+                self.reserve_island(island, until_unix_us).await?,
+                super::behavior::gang::ClaimOutcome::Won
+            ) {
+                return Ok(Some(island));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Build a signed reservation transition, apply it to the local
+    /// reservation fold for the optimistic CAS outcome, and broadcast
+    /// it. Shared by [`Self::reserve_island`] / [`Self::release_island`].
+    async fn apply_and_broadcast_reservation(
+        &self,
+        island: super::behavior::fold::IslandId,
+        state: super::behavior::fold::ReservationState,
+    ) -> Result<super::behavior::gang::ClaimOutcome, AdapterError> {
+        use super::behavior::fold::{ApplyOutcome, FoldKind, ReservationFold};
+        let gen = self.next_fold_generation(ReservationFold::KIND_ID, island);
+        let meta = super::behavior::fold::EnvelopeMeta {
+            announced_at: super::current_timestamp_micros(),
+            ..Default::default()
+        };
+        let ann = super::behavior::fold::SignedAnnouncement::sign(
+            &self.identity,
+            ReservationFold::KIND_ID,
+            0,
+            self.node_id,
+            gen,
+            meta,
+            super::behavior::fold::ReservationAnnouncement {
+                resource_id: island,
+                state,
+            },
+        )
+        .map_err(|e| AdapterError::Connection(format!("reservation: sign failed: {e}")))?;
+        // Local optimistic CAS (this node's AP view), then propagate.
+        let outcome = self
+            .reservation_fold
+            .apply(ann.clone())
+            .map_err(|e| AdapterError::Connection(format!("reservation: apply failed: {e}")))?;
+        // The broadcast is best-effort gossip (the local CAS already
+        // decided the AP outcome), but don't silently drop a failed
+        // propagation: the returned ClaimOutcome reflects only the local
+        // view, so a dropped error hides "won locally, peers not told"
+        // (review #10).
+        if let Err(e) = self.publish_fold_broadcast(&ann).await {
+            tracing::warn!(
+                island,
+                error = %e,
+                "reservation broadcast failed; local CAS applied but peers not notified",
+            );
+        }
+        Ok(match outcome {
+            ApplyOutcome::Inserted | ApplyOutcome::Replaced => {
+                super::behavior::gang::ClaimOutcome::Won
+            }
+            ApplyOutcome::Rejected => super::behavior::gang::ClaimOutcome::Lost,
+        })
     }
 
     /// Test-only helper — translate a legacy

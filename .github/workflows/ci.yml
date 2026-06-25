@@ -133,6 +133,7 @@ jobs:
           --test capability_auth_call_path
           --test capability_auth_conformance
           --test capability_schema_doc_guard
+          --test gang_claim_node
           --test chain_discovery
           --test cross_lang_capability_fixtures
           --test migration_integration

@@ -25,6 +25,7 @@ pub mod capability_aggregation;
 pub mod capability_bridge;
 pub mod dispatch;
 pub mod expiry;
+pub mod island;
 pub mod metrics;
 pub mod reservation;
 pub mod routing;
@@ -47,6 +48,9 @@ pub use dispatch::{
     SUBPROTOCOL_FOLD,
 };
 pub use expiry::DEFAULT_SWEEP_INTERVAL;
+pub use island::{
+    GpuId, GpuSet, IslandId, IslandQuery, IslandRecord, IslandRow, IslandTopologyFold, ModelId,
+};
 pub use metrics::{FoldMetrics, FoldStats};
 pub use reservation::{
     JobId, ReservationAnnouncement, ReservationFold, ReservationQuery, ReservationRow,
