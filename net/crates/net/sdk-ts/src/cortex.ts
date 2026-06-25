@@ -42,6 +42,7 @@ import {
   MemoryWatchIter as NapiMemoryWatchIter,
   RedexFile as NapiRedexFile,
   RedexTailIter as NapiRedexTailIter,
+  WorkflowAdapter as NapiWorkflowAdapter,
   TaskStatus,
   TasksOrderBy,
   MemoriesOrderBy,
@@ -57,6 +58,8 @@ import type {
   CortexSnapshot,
   RedexEventJs,
   RedexFileConfigJs,
+  WorkflowTaskState,
+  WorkflowStatusCounts,
 } from '@net-mesh/core';
 
 // Re-export the NAPI value types so callers get them from one place.
@@ -75,7 +78,22 @@ export type {
   NetDbOpenConfig,
   NetDbBundle,
   CortexSnapshot,
+  WorkflowTaskState,
+  WorkflowStatusCounts,
 };
+
+/**
+ * Workflow task lifecycle status. The state machine the
+ * {@link WorkflowAdapter} drives — distinct from the cortex tasks-model
+ * {@link TaskStatus}.
+ */
+export type WorkflowTaskStatus =
+  | 'submitted'
+  | 'running'
+  | 'waiting'
+  | 'blocked'
+  | 'done'
+  | 'failed';
 
 // Typed error classes shipped by `@net-mesh/core/errors`. Re-exported here
 // so SDK consumers can `import { CortexError } from '@net-mesh/sdk'`
@@ -758,5 +776,224 @@ export class NetDb {
   /** Close every enabled adapter. Idempotent. */
   close(): void {
     this.napi.close();
+  }
+}
+
+/**
+ * Task-lifecycle adapter — a single-writer RedEX chain folded into
+ * per-task `{ step, status, attempts }`.
+ *
+ * The companion to the gang-claim scheduler (the `Mesh` island
+ * methods): the gang decides *who* holds an exclusive GPU island; this
+ * plans what happens *after* it is held. Its status is the
+ * {@link WorkflowTaskStatus} lifecycle — distinct from the cortex
+ * tasks-model {@link TaskStatus}.
+ */
+export class WorkflowAdapter {
+  readonly napi: NapiWorkflowAdapter;
+
+  constructor(inner: NapiWorkflowAdapter) {
+    this.napi = inner;
+  }
+
+  /** Open against a Redex manager. */
+  static async open(
+    redex: Redex,
+    originHash: bigint,
+    opts?: { persistent?: boolean },
+  ): Promise<WorkflowAdapter> {
+    try {
+      const inner = await NapiWorkflowAdapter.open(
+        redex.napi,
+        originHash,
+        opts?.persistent ?? null,
+      );
+      return new WorkflowAdapter(inner);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Open from a snapshot, skipping replay up through `lastSeq`. */
+  static async openFromSnapshot(
+    redex: Redex,
+    originHash: bigint,
+    snapshot: CortexSnapshot,
+    opts?: { persistent?: boolean },
+  ): Promise<WorkflowAdapter> {
+    try {
+      const inner = await NapiWorkflowAdapter.openFromSnapshot(
+        redex.napi,
+        originHash,
+        snapshot.stateBytes,
+        snapshot.lastSeq ?? null,
+        opts?.persistent ?? null,
+      );
+      return new WorkflowAdapter(inner);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Submit a new task — enters at step 0, `submitted`. */
+  submit(id: bigint): bigint {
+    try {
+      return this.napi.submit(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Set a task's status. A terminal task is never moved. */
+  transition(id: bigint, status: WorkflowTaskStatus): bigint {
+    try {
+      return this.napi.transition(id, status);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Mark the task `running`. */
+  start(id: bigint): bigint {
+    try {
+      return this.napi.start(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Park the task `waiting`. */
+  wait(id: bigint): bigint {
+    try {
+      return this.napi.wait(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Park the task `blocked`. */
+  block(id: bigint): bigint {
+    try {
+      return this.napi.block(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Mark the task `done` (terminal success). */
+  complete(id: bigint): bigint {
+    try {
+      return this.napi.complete(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Mark the task `failed` (terminal failure). */
+  fail(id: bigint): bigint {
+    try {
+      return this.napi.fail(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Advance the step cursor (bumps step, resets attempts). */
+  advance(id: bigint): bigint {
+    try {
+      return this.napi.advance(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Retry the current step. Never resurrects a `done` task. */
+  retry(id: bigint): bigint {
+    try {
+      return this.napi.retry(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Delete a task, reclaiming its whole linked subtree. */
+  delete(id: bigint): bigint {
+    try {
+      return this.napi.delete(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Record a parent→child lineage edge (idempotent). */
+  link(parent: bigint, child: bigint): bigint {
+    try {
+      return this.napi.link(parent, child);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Request cancellation — a worker-observed signal. */
+  requestCancel(id: bigint): bigint {
+    try {
+      return this.napi.requestCancel(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Current state for `id`, or `null` if unknown. */
+  get(id: bigint): WorkflowTaskState | null {
+    try {
+      return this.napi.get(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Has cancellation been requested for `id`? */
+  isCancelRequested(id: bigint): boolean {
+    try {
+      return this.napi.isCancelRequested(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** `id` plus all transitive descendants — the delete subtree. */
+  subtree(id: bigint): bigint[] {
+    try {
+      return this.napi.subtree(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Roll-up of task counts per status. */
+  statusCounts(): WorkflowStatusCounts {
+    try {
+      return this.napi.statusCounts();
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Capture a state snapshot for restore via `openFromSnapshot`. */
+  snapshot(): CortexSnapshot {
+    try {
+      return this.napi.snapshot();
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Block until every event up through `seq` has folded. */
+  async waitForSeq(seq: bigint): Promise<void> {
+    try {
+      await this.napi.waitForSeq(seq);
+    } catch (e) {
+      throw classifyError(e);
+    }
   }
 }

@@ -64,6 +64,7 @@ export {
   NetDb,
   TasksAdapter,
   MemoriesAdapter,
+  WorkflowAdapter,
   TaskStatus,
   TasksOrderBy,
   MemoriesOrderBy,
@@ -83,6 +84,9 @@ export type {
   NetDbOpenConfig,
   NetDbBundle,
   CortexSnapshot,
+  WorkflowTaskState,
+  WorkflowTaskStatus,
+  WorkflowStatusCounts,
 } from './cortex';
 
 // Identity + tokens (security surface).
