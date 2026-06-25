@@ -907,18 +907,22 @@ jobs:
             features: --features "full port-mapping dataforts meshdb"
           - name: node
             path: net/crates/net/bindings/node
-            # Mirrors the `node-tests` napi build (no redis default,
-            # plus `test-helpers` so the test-only FFI symbols are
-            # included in the lint set, plus `meshos,deck,meshdb` so
-            # the MeshOS / Deck / MeshDB NAPI surfaces compile).
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,test-helpers
+            # The widest service-free NAPI surface (no redis default).
+            # `test-helpers` keeps the test-only FFI symbols in the lint
+            # set; `dataforts` / `nat-traversal` / `port-mapping` are
+            # included because the TS-SDK ships with `dataforts` (and the
+            # transfer / traversal NAPI surfaces would otherwise go
+            # unlinted — that gap hid a dead-code lint on the transfer
+            # stream-id helpers).
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,test-helpers,dataforts,nat-traversal,port-mapping
           - name: python
             path: net/crates/net/bindings/python
-            # Mirrors the `python-tests` `maturin develop` invocation
-            # (plus `meshos,deck` so the corresponding pyo3 surfaces
-            # are linted, plus `aggregator` so the aggregator pyo3
-            # surface is linted in lockstep with the test job).
-            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool
+            # The widest service-free pyo3 surface. `meshdb` /
+            # `dataforts` / `nat-traversal` / `port-mapping` are included
+            # because the python build / test jobs compile them (the
+            # earlier set even omitted `meshdb`, which `python-tests`
+            # builds) — without them those pyo3 surfaces went unlinted.
+            features: --no-default-features --features net,cortex,compute,groups,meshos,deck,aggregator,tool,meshdb,dataforts,nat-traversal,port-mapping
           - name: go-compute-ffi
             path: net/crates/net/bindings/go/compute-ffi
             # Default features only — the cdylib production build

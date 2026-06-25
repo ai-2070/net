@@ -326,6 +326,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stream_id_helpers_round_trip() {
+        // Exercise the standalone `#[napi]` stream-id helpers: they
+        // delegate to the core transfer-id space, so a constructed id
+        // reads back as a transfer id and a freshly-allocated one does
+        // too. (Also keeps them clippy-live in the `--lib` test build,
+        // where napi's auto-registration — which references them in the
+        // cdylib — is `cfg`-inactive.)
+        let id = transfer_stream_id(BigInt::from(0x1234u64));
+        assert!(is_transfer_stream_id(id));
+        assert!(is_transfer_stream_id(next_transfer_stream_id()));
+    }
+
+    #[test]
     fn discovered_not_found_is_retagged_all_peers_failed() {
         // A discovery NotFound must read as "all peers failed", distinct
         // from the named-holder "not found" a plain fetch surfaces.
