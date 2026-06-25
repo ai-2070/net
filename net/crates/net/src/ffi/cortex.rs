@@ -3663,6 +3663,17 @@ pub unsafe extern "C" fn net_workflow_wait_for_seq(
 // =========================================================================
 
 /// FFI handle wrapping an [`InnerShardGroup`] (a plain value).
+///
+/// Intentionally carries no [`HandleGuard`], unlike the async-backed
+/// handles ([`RedexHandle`], [`RedexFileHandle`], [`WorkflowAdapterHandle`]).
+/// Those guards exist (audit #23) to drain *in-flight async ops* before
+/// `_free` drops the inner — a watch cursor pumping on one thread while
+/// another frees. A shard group holds an immutable plain value; every op
+/// over it (`fan_out` / `try_join`) is synchronous and returns before the
+/// next call, so there is nothing to drain and `_free` is a bare
+/// `Box::from_raw`. Lifecycle safety rests on the module-wide contract
+/// (no use after `_free`); the Go wrapper frees only via finalizer, which
+/// cannot run while a call holds the handle reachable.
 pub struct ShardGroupHandle {
     inner: InnerShardGroup,
 }
@@ -3788,6 +3799,21 @@ pub unsafe extern "C" fn net_workflow_try_join(
 // =========================================================================
 
 /// FFI handle: the pure trigger engine + the bound adapter (state reads).
+///
+/// Carries no [`HandleGuard`] by design (same rationale as
+/// [`ShardGroupHandle`]). The guards on the async-backed handles drain
+/// *in-flight async ops* at `_free` (audit #23); the trigger engine has
+/// none — every entry point (`arm_*`, `record_result`, `on_task_change`,
+/// `on_tick`, `armed_count`) takes the internal `parking_lot` mutexes,
+/// runs to completion synchronously, and returns before the next call, so
+/// `_free` is a bare `Box::from_raw` with nothing to quiesce. The
+/// `parking_lot::Mutex`es make *concurrent method calls* sound; they do not
+/// make a call racing `_free` sound — that, as for every handle here, rests
+/// on the module-wide no-use-after-`_free` contract, which the Go wrapper's
+/// finalizer-only free upholds structurally (the handle stays reachable for
+/// the duration of any call). The bound `adapter` is an owned `Arc` clone,
+/// so it (and the state the engine reads) outlives a freed
+/// [`WorkflowAdapterHandle`].
 pub struct TriggerEngineHandle {
     engine: parking_lot::Mutex<InnerTriggerEngine>,
     /// Recorded task results (via `net_trigger_record_result`) threaded
