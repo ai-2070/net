@@ -46,10 +46,18 @@ const PSK: [u8; 32] = [0x42u8; 32];
 /// tests.
 fn test_config() -> MeshNodeConfig {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    // Handshake budget is deliberately on the generous end of the
+    // repo's idiom (3 attempts × 3 s, vs the 3 × 2 s some suites use).
+    // The coverage workflow runs these under `-C instrument-coverage`,
+    // which slows every basic block several-fold; the spawned `accept`
+    // task can then miss a tighter 2 s window and trip the
+    // `connect().expect(...)` in the three-node helpers. The wider
+    // window costs nothing on the happy path — a successful handshake
+    // returns immediately.
     let mut cfg = MeshNodeConfig::new(addr, PSK)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))
-        .with_handshake(3, Duration::from_secs(2));
+        .with_handshake(3, Duration::from_secs(3));
     cfg.socket_buffers = SocketBufferConfig {
         send_buffer_size: TEST_BUFFER_SIZE,
         recv_buffer_size: TEST_BUFFER_SIZE,
@@ -139,7 +147,7 @@ async fn two_node_pair() -> (Arc<MeshNode>, Arc<MeshNode>) {
 
 /// A manual reclassification with two connected peers on localhost
 /// should yield `Open` — reflex equals bind, no NAT in the path.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reclassify_on_localhost_is_open() {
     let (a, _b, _c) = three_node_star().await;
 
@@ -170,7 +178,7 @@ async fn reclassify_on_localhost_is_open() {
 
 /// A peer receiving an announcement from a classified node can find
 /// it via `find_nodes_by_filter` on the `nat:*` tag.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nat_tag_propagates_through_capability_broadcast() {
     let (a, b, _c) = three_node_star().await;
 
@@ -206,7 +214,7 @@ async fn nat_tag_propagates_through_capability_broadcast() {
 /// `Unknown`. The FSM needs at least two probes to distinguish
 /// Cone from Symmetric; one probe is treated as "unclassified" and
 /// must not flip the atomic into a bogus state.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reclassify_with_single_peer_stays_unknown() {
     let (a, _b) = two_node_pair().await;
 
@@ -225,7 +233,7 @@ async fn reclassify_with_single_peer_stays_unknown() {
 /// The background classify loop (spawned separately from `start`)
 /// should fire the first sweep automatically once ≥2 peers are
 /// connected. No explicit `reclassify_nat` call required.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn background_classify_loop_seeds_state() {
     let (a, _b, _c) = three_node_star().await;
 
