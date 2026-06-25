@@ -1,0 +1,20 @@
+net/crates/net/tests/nat_classify.rs
+  s_b93d1d2fee6b2e::t_bb66cd945aa6de 49-56,60
+  s_b93d1d2fee6b2e::t_f95c28ad8ff2f8 150,181,217,236
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "2b3d98331fc7e373958cdef624f289dffc1ce6ab",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
