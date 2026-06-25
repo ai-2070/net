@@ -6,6 +6,8 @@ This is the primitive Kafka / NATS / Redis Streams / Pulsar do not have. There i
 
 If the user wants topic-style fan-out, use `apis.md` (named channels) or `patterns.md` § "I want a consumer that subscribes to a topic". This file is for placement.
 
+`find_nodes` is **advisory** — it answers "who *can* do X", with no exclusivity; two callers get the same list. If the user needs to **atomically claim a contended exclusive resource** (N jobs want the same GPU island / slot / seat; exactly one must win, no double-booking), that's `scheduler.md` — capability discovery here, then the contended CAS there.
+
 ---
 
 ## The capability model
