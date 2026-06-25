@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/behavior/meshos/snapshot.rs
+  s_b93d1d2fee6b2e::t_3f55d3084999d2 1191-1195
+  s_b93d1d2fee6b2e::t_4a8e13c73b6567 1387-1390
+net/crates/net/src/adapter/net/traversal/portmap/sequential.rs
+  s_b93d1d2fee6b2e::t_418bb7566e0c60 270-275,278
+  s_b93d1d2fee6b2e::t_a1d9a8b7ef5962 289
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "90c75ba647ca988d819d6ef8a5549a7797987ac3",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
