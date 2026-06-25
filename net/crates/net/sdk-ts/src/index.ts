@@ -55,6 +55,10 @@ export type {
   PublishConfig,
   PublishReport,
   SubscribeOptions,
+  GpuIslandCriteria,
+  IslandTopologyInput,
+  ClaimOutcome,
+  GpuSelectionPolicy,
 } from './mesh';
 
 // CortEX + NetDb (event-sourced state with reactive watches).
