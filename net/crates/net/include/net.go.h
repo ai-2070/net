@@ -343,6 +343,39 @@ int      net_mesh_accept(net_meshnode_t* handle,
                          char** out_addr, size_t* out_len);
 int      net_mesh_start(net_meshnode_t* handle);
 
+/* ---- Gang-claim GPU-island scheduler ----
+ *
+ * `criteria_json`:
+ *   { "tags_all": ["gpu:h100"],   // capability tags every host must carry
+ *     "min_gpus": 8,              // optional
+ *     "max_load": 0.8,           // optional (0.0..=1.0)
+ *     "max_p50_latency_us": 5000, // optional
+ *     "require_warm_model": 42,   // optional (u64)
+ *     "selection": "least_loaded",// least_loaded|pack|load_band|lowest_id
+ *     "load_band_target": 0.5,    // for the load_band policy
+ *     "prefer_warm_model": 42 }   // optional (u64)
+ * `record_json`:
+ *   { "id": 1, "gpus": [0,1,2,3], "warm_models": [42],
+ *     "load": 0.1, "p50_latency_us": 800 }   // host forced to this node
+ *
+ * reserve/release write the outcome to *out_outcome: 0 = won, 1 = lost.
+ */
+int      net_mesh_publish_island_topology(net_meshnode_t* handle,
+                                          const char* record_json,
+                                          size_t* out_count);
+int      net_mesh_match_gpu_islands(net_meshnode_t* handle,
+                                    const char* criteria_json,
+                                    uint64_t* out_ids, size_t cap,
+                                    size_t* out_count);
+int      net_mesh_reserve_island(net_meshnode_t* handle, uint64_t island,
+                                 uint64_t until_unix_us, int* out_outcome);
+int      net_mesh_release_island(net_meshnode_t* handle, uint64_t island,
+                                 int* out_outcome);
+int      net_mesh_claim_gpu_island(net_meshnode_t* handle,
+                                   const char* criteria_json,
+                                   uint64_t until_unix_us,
+                                   int* out_found, uint64_t* out_island);
+
 /* ---- Per-peer streams ---- */
 
 /* `config_json`:
