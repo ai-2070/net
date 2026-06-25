@@ -11108,12 +11108,26 @@ impl MeshNode {
     }
 
     /// Release `island` this node holds: apply `Free` locally and
-    /// broadcast. Returns the local CAS outcome (`Lost` if this node
-    /// wasn't the holder — a foreign release is refused by the fold).
+    /// broadcast. Returns `Lost` if this node wasn't the holder.
+    ///
+    /// We gate on holder identity first: a `Free` write to an island
+    /// with no local entry would `Insert` and falsely report `Won`
+    /// (leaving a spurious `Free` entry), so a non-holder release is
+    /// reported `Lost` without touching the fold or the wire (review #5).
     pub async fn release_island(
         &self,
         island: super::behavior::fold::IslandId,
     ) -> Result<super::behavior::gang::ClaimOutcome, AdapterError> {
+        use super::behavior::fold::ReservationQuery;
+        let held_by_us = self
+            .reservation_fold
+            .query(ReservationQuery::State(island))
+            .first()
+            .and_then(|(_, state)| state.holder())
+            == Some(self.node_id);
+        if !held_by_us {
+            return Ok(super::behavior::gang::ClaimOutcome::Lost);
+        }
         self.apply_and_broadcast_reservation(island, super::behavior::fold::ReservationState::Free)
             .await
     }

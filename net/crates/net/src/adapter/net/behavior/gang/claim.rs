@@ -13,7 +13,8 @@
 
 use crate::adapter::net::behavior::fold::{
     ApplyOutcome, EnvelopeMeta, Fold, FoldError, FoldKind, IslandId, JobId, NodeId,
-    ReservationAnnouncement, ReservationFold, ReservationState, SignedAnnouncement, WireError,
+    ReservationAnnouncement, ReservationFold, ReservationQuery, ReservationState,
+    SignedAnnouncement, WireError,
 };
 use crate::adapter::net::identity::EntityKeypair;
 
@@ -188,8 +189,16 @@ pub fn activate_island(
     Ok(ClaimOutcome::from_apply(reservations.apply(ann)?))
 }
 
-/// Release a held island back to `Free`. [`ClaimOutcome::Lost`] if
-/// we weren't the holder (a foreign release is rejected by the fold).
+/// Release a held island back to `Free`. [`ClaimOutcome::Lost`] if we
+/// weren't the holder.
+///
+/// We must check the current holder first: the fold installs a *first*
+/// announcement for an absent key unconditionally, so a `Free` write to
+/// an island we never held would `Insert` and report `Won` (and leave a
+/// spurious `Free` entry behind). Gating on holder identity makes the
+/// "`Lost` if we weren't the holder" contract hold for an absent /
+/// foreign / already-`Free` island, not just a foreign live one
+/// (review #5).
 pub fn release_island(
     reservations: &Fold<ReservationFold>,
     keypair: &EntityKeypair,
@@ -197,6 +206,14 @@ pub fn release_island(
     generation: u64,
     island: IslandId,
 ) -> Result<ClaimOutcome, ClaimError> {
+    let held_by_us = reservations
+        .query(ReservationQuery::State(island))
+        .first()
+        .and_then(|(_, state)| state.holder())
+        == Some(node_id);
+    if !held_by_us {
+        return Ok(ClaimOutcome::Lost);
+    }
     let ann = release_announcement(keypair, node_id, generation, island)?;
     Ok(ClaimOutcome::from_apply(reservations.apply(ann)?))
 }
@@ -344,6 +361,23 @@ mod tests {
         assert_eq!(
             fold.query(ReservationQuery::State(0x10))[0].1.holder(),
             Some(na),
+        );
+    }
+
+    /// Releasing an island we never held is `Lost`, not `Won`, and must
+    /// not leave a spurious `Free` entry behind (review #5).
+    #[test]
+    fn release_of_an_unheld_island_is_lost_not_won() {
+        let fold = new_reservations();
+        let kp = EntityKeypair::generate();
+        let node = kp.entity_id().node_id();
+        assert_eq!(
+            release_island(&fold, &kp, node, 1, 0x99).unwrap(),
+            ClaimOutcome::Lost,
+        );
+        assert!(
+            fold.query(ReservationQuery::State(0x99)).is_empty(),
+            "no spurious Free entry for an island we never held",
         );
     }
 }
