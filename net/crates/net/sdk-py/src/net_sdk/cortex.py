@@ -39,6 +39,13 @@ try:
         Task,
         TasksAdapter,
         TaskWatchIter,
+        WorkflowAdapter,
+        WorkflowStatusCounts,
+        WorkflowTaskState,
+        ShardGroup,
+        JoinResult,
+        TriggerEngine,
+        TriggerAction,
     )
 except ImportError as e:  # pragma: no cover
     raise ImportError(
@@ -51,6 +58,12 @@ except ImportError as e:  # pragma: no cover
 # editors flag invalid string filters at lint time.
 TaskStatus = Literal["pending", "completed"]
 
+# Workflow task-lifecycle status — distinct from the cortex tasks-model
+# `TaskStatus` above (the `WorkflowAdapter` state machine).
+WorkflowTaskStatus = Literal[
+    "submitted", "running", "waiting", "blocked", "done", "failed"
+]
+
 
 __all__ = [
     "CortexError",
@@ -61,6 +74,14 @@ __all__ = [
     "TaskStatus",
     "TasksAdapter",
     "TaskWatchIter",
+    "WorkflowAdapter",
+    "WorkflowStatusCounts",
+    "WorkflowTaskState",
+    "WorkflowTaskStatus",
+    "ShardGroup",
+    "JoinResult",
+    "TriggerEngine",
+    "TriggerAction",
     "tasks_cm",
     "memories_cm",
 ]

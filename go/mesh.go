@@ -31,13 +31,13 @@ import (
 // ---------------------------------------------------------------------------
 
 var (
-	ErrMeshInit         = errors.New("mesh init failed")
-	ErrMeshHandshake    = errors.New("mesh handshake failed")
-	ErrBackpressure     = errors.New("stream backpressure")
-	ErrNotConnected     = errors.New("stream not connected")
-	ErrMeshTransport    = errors.New("mesh transport error")
-	ErrChannel          = errors.New("channel error")
-	ErrChannelAuth      = errors.New("channel: unauthorized")
+	ErrMeshInit      = errors.New("mesh init failed")
+	ErrMeshHandshake = errors.New("mesh handshake failed")
+	ErrBackpressure  = errors.New("stream backpressure")
+	ErrNotConnected  = errors.New("stream not connected")
+	ErrMeshTransport = errors.New("mesh transport error")
+	ErrChannel       = errors.New("channel error")
+	ErrChannelAuth   = errors.New("channel: unauthorized")
 
 	// NAT traversal errors. One sentinel per `TraversalError`
 	// variant so callers can `errors.Is(err, net.ErrTraversalPunchFailed)`.
@@ -105,7 +105,7 @@ func meshErrorFromCode(code C.int) error {
 
 // MeshConfig configures a new mesh node.
 type MeshConfig struct {
-	BindAddr         string `json:"bind_addr"`
+	BindAddr string `json:"bind_addr"`
 	// Hex-encoded 32-byte pre-shared key.
 	PskHex           string `json:"psk_hex"`
 	HeartbeatMs      uint64 `json:"heartbeat_ms,omitempty"`
@@ -225,10 +225,10 @@ type PublishReport struct {
 
 // RecvdEvent is one event drained from a shard inbox.
 type RecvdEvent struct {
-	ID           string
-	Payload      []byte
-	InsertionTs  uint64
-	ShardID      uint16
+	ID          string
+	Payload     []byte
+	InsertionTs uint64
+	ShardID     uint16
 }
 
 // ---------------------------------------------------------------------------
@@ -408,13 +408,13 @@ func (m *MeshNode) Start() error {
 // they never reset, so callers that want deltas should subtract
 // successive snapshots.
 //
-// - PunchesAttempted: the pair-type matrix elected to attempt a
-//   hole-punch. Increments per attempt, regardless of outcome.
-// - PunchesSucceeded: subset of attempts that produced a direct
-//   session. Always <= PunchesAttempted.
-// - RelayFallbacks: MeshNode.ConnectDirect resolutions that
-//   stayed on the routed-handshake path — matrix-skipped pairs
-//   plus punch-failed attempts.
+//   - PunchesAttempted: the pair-type matrix elected to attempt a
+//     hole-punch. Increments per attempt, regardless of outcome.
+//   - PunchesSucceeded: subset of attempts that produced a direct
+//     session. Always <= PunchesAttempted.
+//   - RelayFallbacks: MeshNode.ConnectDirect resolutions that
+//     stayed on the routed-handshake path — matrix-skipped pairs
+//     plus punch-failed attempts.
 type TraversalStats struct {
 	PunchesAttempted uint64
 	PunchesSucceeded uint64
@@ -979,4 +979,157 @@ func (m *MeshNode) Publish(channel string, payload []byte, cfg PublishConfig) (*
 		return nil, fmt.Errorf("decode publish report: %w", err)
 	}
 	return &report, nil
+}
+
+// ---------------------------------------------------------------------------
+// Gang-claim GPU-island scheduler
+// ---------------------------------------------------------------------------
+
+// GangCriteria is the flat match criteria (serialized to JSON for the C
+// ABI, which builds the core MatchCriteria internally). `Selection` is
+// one of "least_loaded" (default) / "pack" / "load_band" / "lowest_id".
+type GangCriteria struct {
+	TagsAll          []string `json:"tags_all,omitempty"`
+	MinGpus          uint     `json:"min_gpus,omitempty"`
+	MaxLoad          *float32 `json:"max_load,omitempty"`
+	MaxP50LatencyUs  *uint32  `json:"max_p50_latency_us,omitempty"`
+	RequireWarmModel *uint64  `json:"require_warm_model,omitempty"`
+	Selection        string   `json:"selection,omitempty"`
+	LoadBandTarget   *float32 `json:"load_band_target,omitempty"`
+	PreferWarmModel  *uint64  `json:"prefer_warm_model,omitempty"`
+}
+
+// IslandRecord is one island a node self-publishes. Its host is forced
+// to this node.
+type IslandRecord struct {
+	ID           uint64   `json:"id"`
+	Gpus         []uint32 `json:"gpus"`
+	WarmModels   []uint64 `json:"warm_models,omitempty"`
+	Load         float32  `json:"load"`
+	P50LatencyUs uint32   `json:"p50_latency_us"`
+}
+
+// PublishIslandTopology publishes this node's island record (host forced
+// to self). Returns the peer fan-out count.
+func (m *MeshNode) PublishIslandTopology(rec IslandRecord) (int, error) {
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return 0, fmt.Errorf("marshal island record: %w", err)
+	}
+	cJSON := C.CString(string(data))
+	defer C.free(unsafe.Pointer(cJSON))
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return 0, ErrShuttingDown
+	}
+	var count C.size_t
+	code := C.net_mesh_publish_island_topology(m.handle, cJSON, &count)
+	if err := meshErrorFromCode(code); err != nil {
+		return 0, err
+	}
+	return int(count), nil
+}
+
+// MatchGpuIslands matches islands against the criteria (read-only). Best
+// island first; empty when nothing matched.
+func (m *MeshNode) MatchGpuIslands(crit GangCriteria) ([]uint64, error) {
+	data, err := json.Marshal(crit)
+	if err != nil {
+		return nil, fmt.Errorf("marshal criteria: %w", err)
+	}
+	cJSON := C.CString(string(data))
+	defer C.free(unsafe.Pointer(cJSON))
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	// First pass: learn the total count, then fill a right-sized buffer.
+	var count C.size_t
+	code := C.net_mesh_match_gpu_islands(m.handle, cJSON, nil, 0, &count)
+	if err := meshErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	if count == 0 {
+		return nil, nil
+	}
+	ids := make([]uint64, int(count))
+	code = C.net_mesh_match_gpu_islands(
+		m.handle, cJSON, (*C.uint64_t)(unsafe.Pointer(&ids[0])), count, &count)
+	if err := meshErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	if int(count) < len(ids) {
+		ids = ids[:int(count)]
+	}
+	return ids, nil
+}
+
+// ReserveIsland reserves island until untilUnixUs (wall-clock micros).
+// Returns "won" if this node now holds it, "lost" otherwise.
+func (m *MeshNode) ReserveIsland(island, untilUnixUs uint64) (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return "", ErrShuttingDown
+	}
+	var outcome C.int
+	code := C.net_mesh_reserve_island(
+		m.handle, C.uint64_t(island), C.uint64_t(untilUnixUs), &outcome)
+	if err := meshErrorFromCode(code); err != nil {
+		return "", err
+	}
+	return claimOutcomeString(int(outcome)), nil
+}
+
+// ReleaseIsland releases island this node holds. Returns "lost" if this
+// node wasn't the holder.
+func (m *MeshNode) ReleaseIsland(island uint64) (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return "", ErrShuttingDown
+	}
+	var outcome C.int
+	code := C.net_mesh_release_island(m.handle, C.uint64_t(island), &outcome)
+	if err := meshErrorFromCode(code); err != nil {
+		return "", err
+	}
+	return claimOutcomeString(int(outcome)), nil
+}
+
+// ClaimGpuIsland matches + reserves the first available island in one
+// call. Returns (id, true, nil) on success, or (0, false, nil) when
+// nothing matched / all contended.
+func (m *MeshNode) ClaimGpuIsland(crit GangCriteria, untilUnixUs uint64) (uint64, bool, error) {
+	data, err := json.Marshal(crit)
+	if err != nil {
+		return 0, false, fmt.Errorf("marshal criteria: %w", err)
+	}
+	cJSON := C.CString(string(data))
+	defer C.free(unsafe.Pointer(cJSON))
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return 0, false, ErrShuttingDown
+	}
+	var found C.int
+	var island C.uint64_t
+	code := C.net_mesh_claim_gpu_island(
+		m.handle, cJSON, C.uint64_t(untilUnixUs), &found, &island)
+	if err := meshErrorFromCode(code); err != nil {
+		return 0, false, err
+	}
+	if found == 0 {
+		return 0, false, nil
+	}
+	return uint64(island), true, nil
+}
+
+func claimOutcomeString(code int) string {
+	if code == 0 {
+		return "won"
+	}
+	return "lost"
 }

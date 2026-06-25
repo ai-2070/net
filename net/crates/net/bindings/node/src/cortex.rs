@@ -31,6 +31,13 @@ use ::net::adapter::net::cortex::tasks::{
     OrderBy as InnerTasksOrderBy, Task as InnerTask, TaskStatus as InnerTaskStatus,
     TasksAdapter as InnerTasksAdapter,
 };
+use ::net::adapter::net::cortex::workflow::{
+    fan_out, try_join, Action as InnerWfAction, Join as InnerJoin, ShardGroup as InnerShardGroup,
+    StatusCounts as InnerStatusCounts, TaskState as InnerWfTaskState,
+    TaskStatus as InnerWfTaskStatus, Trigger as InnerWfTrigger,
+    TriggerEngine as InnerTriggerEngine, TriggerWorld as InnerTriggerWorld,
+    WorkflowAdapter as InnerWorkflowAdapter,
+};
 use ::net::adapter::net::cortex::WaitForTokenError as InnerWaitForTokenError;
 use ::net::adapter::net::redex::{
     FsyncPolicy as InnerFsyncPolicy, PlacementStrategy as InnerPlacementStrategy,
@@ -2249,5 +2256,541 @@ impl NetDb {
                 .map_err(|e| cortex_err("close memories", e))?;
         }
         Ok(())
+    }
+}
+
+// =========================================================================
+// Task lifecycle (WorkflowAdapter)
+// =========================================================================
+
+/// Materialized lifecycle state of one workflow task.
+#[napi(object)]
+pub struct WorkflowTaskState {
+    /// Current step cursor.
+    pub step: u32,
+    /// Lifecycle status: `submitted` / `running` / `waiting` /
+    /// `blocked` / `done` / `failed`.
+    pub status: String,
+    /// Retries of the current step.
+    pub attempts: u32,
+}
+
+/// Roll-up of workflow task counts per status.
+#[napi(object)]
+pub struct WorkflowStatusCounts {
+    pub submitted: u32,
+    pub running: u32,
+    pub waiting: u32,
+    pub blocked: u32,
+    pub done: u32,
+    pub failed: u32,
+}
+
+fn wf_status_str(s: InnerWfTaskStatus) -> &'static str {
+    match s {
+        InnerWfTaskStatus::Submitted => "submitted",
+        InnerWfTaskStatus::Running => "running",
+        InnerWfTaskStatus::Waiting => "waiting",
+        InnerWfTaskStatus::Blocked => "blocked",
+        InnerWfTaskStatus::Done => "done",
+        InnerWfTaskStatus::Failed => "failed",
+    }
+}
+
+fn parse_wf_status(s: &str) -> Result<InnerWfTaskStatus> {
+    Ok(match s {
+        "submitted" => InnerWfTaskStatus::Submitted,
+        "running" => InnerWfTaskStatus::Running,
+        "waiting" => InnerWfTaskStatus::Waiting,
+        "blocked" => InnerWfTaskStatus::Blocked,
+        "done" => InnerWfTaskStatus::Done,
+        "failed" => InnerWfTaskStatus::Failed,
+        other => {
+            return Err(cortex_err(
+                "transition",
+                format!("unknown task status {other:?}"),
+            ))
+        }
+    })
+}
+
+impl From<InnerWfTaskState> for WorkflowTaskState {
+    fn from(t: InnerWfTaskState) -> Self {
+        Self {
+            step: t.step,
+            status: wf_status_str(t.status).to_string(),
+            attempts: t.attempts,
+        }
+    }
+}
+
+impl From<InnerStatusCounts> for WorkflowStatusCounts {
+    fn from(c: InnerStatusCounts) -> Self {
+        Self {
+            submitted: c.submitted as u32,
+            running: c.running as u32,
+            waiting: c.waiting as u32,
+            blocked: c.blocked as u32,
+            done: c.done as u32,
+            failed: c.failed as u32,
+        }
+    }
+}
+
+/// Typed task-lifecycle adapter handle — a single-writer RedEX chain
+/// folded into per-task `{ step, status, attempts }`.
+#[napi]
+pub struct WorkflowAdapter {
+    inner: Arc<InnerWorkflowAdapter>,
+}
+
+#[napi]
+impl WorkflowAdapter {
+    /// Open the workflow adapter against a Redex manager. `persistent`
+    /// routes the chain to disk (requires a Redex with a persistent dir).
+    #[napi(factory)]
+    pub async fn open(
+        redex: &Redex,
+        origin_hash: BigInt,
+        persistent: Option<bool>,
+    ) -> Result<Self> {
+        let cfg = redex_config_from_persistent(persistent);
+        let origin = bigint_u64(origin_hash)?;
+        let inner = InnerWorkflowAdapter::open_with_config(&redex.inner, origin, cfg)
+            .await
+            .map_err(|e| cortex_err("WorkflowAdapter open failed", e))?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// Open from a snapshot, skipping replay up through `lastSeq`.
+    #[napi(factory)]
+    pub async fn open_from_snapshot(
+        redex: &Redex,
+        origin_hash: BigInt,
+        state_bytes: Buffer,
+        last_seq: Option<BigInt>,
+        persistent: Option<bool>,
+    ) -> Result<Self> {
+        let cfg = redex_config_from_persistent(persistent);
+        let origin = bigint_u64(origin_hash)?;
+        let last = last_seq.map(bigint_u64).transpose()?;
+        let inner = InnerWorkflowAdapter::open_from_snapshot_with_config(
+            &redex.inner,
+            origin,
+            cfg,
+            state_bytes.as_ref(),
+            last,
+        )
+        .await
+        .map_err(|e| cortex_err("WorkflowAdapter open_from_snapshot failed", e))?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// Submit a new task — enters at step 0, `submitted`.
+    #[napi]
+    pub fn submit(&self, id: BigInt) -> Result<BigInt> {
+        self.inner
+            .submit(bigint_u64(id)?)
+            .map(BigInt::from)
+            .map_err(|e| cortex_err("submit failed", e))
+    }
+
+    /// Set a task's status (`submitted` / `running` / `waiting` /
+    /// `blocked` / `done` / `failed`). A terminal task is never moved.
+    #[napi]
+    pub fn transition(&self, id: BigInt, status: String) -> Result<BigInt> {
+        self.inner
+            .transition(bigint_u64(id)?, parse_wf_status(&status)?)
+            .map(BigInt::from)
+            .map_err(|e| cortex_err("transition failed", e))
+    }
+
+    /// Mark the task `running`.
+    #[napi]
+    pub fn start(&self, id: BigInt) -> Result<BigInt> {
+        self.inner
+            .start(bigint_u64(id)?)
+            .map(BigInt::from)
+            .map_err(|e| cortex_err("start failed", e))
+    }
+
+    /// Park the task `waiting`.
+    #[napi]
+    pub fn wait(&self, id: BigInt) -> Result<BigInt> {
+        self.inner
+            .wait(bigint_u64(id)?)
+            .map(BigInt::from)
+            .map_err(|e| cortex_err("wait failed", e))
+    }
+
+    /// Park the task `blocked`.
+    #[napi]
+    pub fn block(&self, id: BigInt) -> Result<BigInt> {
+        self.inner
+            .block(bigint_u64(id)?)
+            .map(BigInt::from)
+            .map_err(|e| cortex_err("block failed", e))
+    }
+
+    /// Mark the task `done` (terminal success).
+    #[napi]
+    pub fn complete(&self, id: BigInt) -> Result<BigInt> {
+        self.inner
+            .complete(bigint_u64(id)?)
+            .map(BigInt::from)
+            .map_err(|e| cortex_err("complete failed", e))
+    }
+
+    /// Mark the task `failed` (terminal failure).
+    #[napi]
+    pub fn fail(&self, id: BigInt) -> Result<BigInt> {
+        self.inner
+            .fail(bigint_u64(id)?)
+            .map(BigInt::from)
+            .map_err(|e| cortex_err("fail failed", e))
+    }
+
+    /// Advance the step cursor (bumps step, resets attempts).
+    #[napi]
+    pub fn advance(&self, id: BigInt) -> Result<BigInt> {
+        self.inner
+            .advance(bigint_u64(id)?)
+            .map(BigInt::from)
+            .map_err(|e| cortex_err("advance failed", e))
+    }
+
+    /// Retry the current step (bumps attempts, status → `running`).
+    /// Never resurrects a `done` task.
+    #[napi]
+    pub fn retry(&self, id: BigInt) -> Result<BigInt> {
+        self.inner
+            .retry(bigint_u64(id)?)
+            .map(BigInt::from)
+            .map_err(|e| cortex_err("retry failed", e))
+    }
+
+    /// Delete a task, reclaiming its whole linked subtree.
+    #[napi]
+    pub fn delete(&self, id: BigInt) -> Result<BigInt> {
+        self.inner
+            .delete(bigint_u64(id)?)
+            .map(BigInt::from)
+            .map_err(|e| cortex_err("delete failed", e))
+    }
+
+    /// Record a parent→child lineage edge (idempotent).
+    #[napi]
+    pub fn link(&self, parent: BigInt, child: BigInt) -> Result<BigInt> {
+        self.inner
+            .link(bigint_u64(parent)?, bigint_u64(child)?)
+            .map(BigInt::from)
+            .map_err(|e| cortex_err("link failed", e))
+    }
+
+    /// Request cancellation — a worker-observed signal.
+    #[napi]
+    pub fn request_cancel(&self, id: BigInt) -> Result<BigInt> {
+        self.inner
+            .request_cancel(bigint_u64(id)?)
+            .map(BigInt::from)
+            .map_err(|e| cortex_err("request_cancel failed", e))
+    }
+
+    /// Current state for `id`, or `null` if unknown.
+    #[napi]
+    pub fn get(&self, id: BigInt) -> Result<Option<WorkflowTaskState>> {
+        Ok(self.inner.get(bigint_u64(id)?).map(WorkflowTaskState::from))
+    }
+
+    /// Has cancellation been requested for `id`?
+    #[napi]
+    pub fn is_cancel_requested(&self, id: BigInt) -> Result<bool> {
+        Ok(self.inner.is_cancel_requested(bigint_u64(id)?))
+    }
+
+    /// `id` plus all transitive descendants — the delete subtree.
+    #[napi]
+    pub fn subtree(&self, id: BigInt) -> Result<Vec<BigInt>> {
+        Ok(self
+            .inner
+            .subtree(bigint_u64(id)?)
+            .into_iter()
+            .map(BigInt::from)
+            .collect())
+    }
+
+    /// Roll-up of task counts per status.
+    #[napi]
+    pub fn status_counts(&self) -> WorkflowStatusCounts {
+        self.inner.status_counts().into()
+    }
+
+    /// Capture a state snapshot for restore via `openFromSnapshot`.
+    #[napi]
+    pub fn snapshot(&self) -> Result<CortexSnapshot> {
+        let (bytes, last_seq) = self
+            .inner
+            .snapshot()
+            .map_err(|e| cortex_err("snapshot failed", e))?;
+        Ok(CortexSnapshot {
+            state_bytes: Buffer::from(bytes),
+            last_seq: last_seq.map(BigInt::from),
+        })
+    }
+
+    /// Block until every event up through `seq` has folded.
+    #[napi]
+    pub async fn wait_for_seq(&self, seq: BigInt) -> Result<()> {
+        self.inner
+            .wait_for_seq(bigint_u64(seq)?)
+            .await
+            .map_err(|folded| {
+                cortex_err(
+                    "wait_for_seq",
+                    format!("fold task stopped; folded_through={folded:?}"),
+                )
+            })
+    }
+}
+
+// =========================================================================
+// Tier 2: shards (fan-out / fan-in)
+// =========================================================================
+
+/// A map-reduce shard group: the shard task ids + the reduce task id.
+#[napi]
+pub struct ShardGroup {
+    inner: InnerShardGroup,
+}
+
+#[napi]
+impl ShardGroup {
+    #[napi(constructor)]
+    pub fn new(shards: Vec<BigInt>, reduce: BigInt) -> Result<Self> {
+        let shards = shards
+            .into_iter()
+            .map(bigint_u64)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            inner: InnerShardGroup::new(shards, bigint_u64(reduce)?),
+        })
+    }
+}
+
+/// Result of a `tryJoin`. `kind` is one of `submitted` (reduce just
+/// appended at `seq`), `already_submitted`, `pending`, or `failed`
+/// (with the `failed` shard ids).
+#[napi(object)]
+pub struct JoinResult {
+    pub kind: String,
+    pub seq: Option<BigInt>,
+    pub failed: Option<Vec<BigInt>>,
+}
+
+#[napi]
+impl WorkflowAdapter {
+    /// Fan out: submit every shard task (+ link them under the parent
+    /// when the group was derived). Returns the last append seq.
+    #[napi]
+    pub fn fan_out(&self, group: &ShardGroup) -> Result<BigInt> {
+        fan_out(&self.inner, &group.inner)
+            .map(BigInt::from)
+            .map_err(|e| cortex_err("fan_out", e))
+    }
+
+    /// Try to join: submit the reduce once every shard is `done`,
+    /// surface `failed` shards, or report `pending`. Idempotent.
+    #[napi]
+    pub fn try_join(&self, group: &ShardGroup) -> Result<JoinResult> {
+        match try_join(&self.inner, &group.inner).map_err(|e| cortex_err("try_join", e))? {
+            InnerJoin::Submitted(s) => Ok(JoinResult {
+                kind: "submitted".into(),
+                seq: Some(BigInt::from(s)),
+                failed: None,
+            }),
+            InnerJoin::AlreadySubmitted => Ok(JoinResult {
+                kind: "already_submitted".into(),
+                seq: None,
+                failed: None,
+            }),
+            InnerJoin::Pending => Ok(JoinResult {
+                kind: "pending".into(),
+                seq: None,
+                failed: None,
+            }),
+            InnerJoin::Failed(ids) => Ok(JoinResult {
+                kind: "failed".into(),
+                seq: None,
+                failed: Some(ids.into_iter().map(BigInt::from).collect()),
+            }),
+        }
+    }
+}
+
+// =========================================================================
+// Tier 2: triggers (dependency / branch engine) — D5 (a): the engine
+// binds the WorkflowAdapter and fetches state internally, so the JS call
+// is just `engine.onTaskChange(taskId)`.
+// =========================================================================
+
+/// A fired trigger's action: `kind` is `submit` or `start`, `id` the task.
+#[napi(object)]
+pub struct TriggerAction {
+    pub kind: String,
+    pub id: BigInt,
+}
+
+fn action_to_js(a: InnerWfAction) -> TriggerAction {
+    match a {
+        InnerWfAction::Submit(id) => TriggerAction {
+            kind: "submit".into(),
+            id: BigInt::from(id),
+        },
+        InnerWfAction::Start(id) => TriggerAction {
+            kind: "start".into(),
+            id: BigInt::from(id),
+        },
+    }
+}
+
+fn parse_action(kind: &str, id: u64) -> Result<InnerWfAction> {
+    match kind {
+        "submit" => Ok(InnerWfAction::Submit(id)),
+        "start" => Ok(InnerWfAction::Start(id)),
+        other => Err(cortex_err("arm", format!("unknown action kind {other:?}"))),
+    }
+}
+
+/// The pure trigger engine, bound to a `WorkflowAdapter` (D5: it reads
+/// the adapter's state internally). `arm*` a dependency, then drive it
+/// with `onTaskChange` — it returns the satisfied actions for the caller
+/// to apply (it starts no tasks itself).
+#[napi]
+pub struct TriggerEngine {
+    engine: parking_lot::Mutex<InnerTriggerEngine>,
+    /// Recorded task results (populated via `recordResult`), threaded
+    /// into the `TriggerWorld` so `IfResult` branches can evaluate.
+    results: parking_lot::Mutex<
+        std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
+    >,
+    adapter: Arc<InnerWorkflowAdapter>,
+}
+
+#[napi]
+impl TriggerEngine {
+    #[napi(constructor)]
+    pub fn new(wf: &WorkflowAdapter) -> Self {
+        Self {
+            engine: parking_lot::Mutex::new(InnerTriggerEngine::new()),
+            results: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            adapter: wf.inner.clone(),
+        }
+    }
+
+    /// Arm `AfterTask(task)` -> action (fires when `task` is `done`).
+    #[napi]
+    pub fn arm_after_task(
+        &self,
+        task: BigInt,
+        action_kind: String,
+        action_id: BigInt,
+    ) -> Result<()> {
+        let trigger = InnerWfTrigger::AfterTask(bigint_u64(task)?);
+        let action = parse_action(&action_kind, bigint_u64(action_id)?)?;
+        self.engine.lock().arm(trigger, action);
+        Ok(())
+    }
+
+    /// Arm `IfResult(task, key, value)` -> action: fires when `task` is
+    /// `done` AND its recorded result `key` equals `value`. Record the
+    /// result first via `recordResult`.
+    #[napi]
+    pub fn arm_if_result(
+        &self,
+        task: BigInt,
+        key: String,
+        value: String,
+        action_kind: String,
+        action_id: BigInt,
+    ) -> Result<()> {
+        let trigger = InnerWfTrigger::IfResult {
+            task: bigint_u64(task)?,
+            key,
+            value,
+        };
+        let action = parse_action(&action_kind, bigint_u64(action_id)?)?;
+        self.engine.lock().arm(trigger, action);
+        Ok(())
+    }
+
+    /// Record `task`'s result `key = value` for `IfResult` evaluation.
+    #[napi]
+    pub fn record_result(&self, task: BigInt, key: String, value: String) -> Result<()> {
+        self.results
+            .lock()
+            .entry(bigint_u64(task)?)
+            .or_default()
+            .insert(key, value);
+        Ok(())
+    }
+
+    /// Arm `AfterTerminal(task)` -> action (fires on `done` OR `failed`).
+    #[napi]
+    pub fn arm_after_terminal(
+        &self,
+        task: BigInt,
+        action_kind: String,
+        action_id: BigInt,
+    ) -> Result<()> {
+        let trigger = InnerWfTrigger::AfterTerminal(bigint_u64(task)?);
+        let action = parse_action(&action_kind, bigint_u64(action_id)?)?;
+        self.engine.lock().arm(trigger, action);
+        Ok(())
+    }
+
+    /// `task` changed status: evaluate the triggers waiting on it against
+    /// the bound adapter's current state and return the fired actions.
+    #[napi]
+    pub fn on_task_change(&self, task: BigInt, tick: Option<BigInt>) -> Result<Vec<TriggerAction>> {
+        let task = bigint_u64(task)?;
+        let tick = tick.map(bigint_u64).transpose()?.unwrap_or(0);
+        let state = self.adapter.state();
+        let guard = state.read();
+        let results = self.results.lock();
+        let world = InnerTriggerWorld::with_results(&guard, tick, &results);
+        let actions = self.engine.lock().on_task_change(task, &world);
+        Ok(actions.into_iter().map(action_to_js).collect())
+    }
+
+    /// Arm `AtTick(tick)` -> action (fires once the clock reaches `tick`).
+    #[napi]
+    pub fn arm_at_tick(&self, tick: BigInt, action_kind: String, action_id: BigInt) -> Result<()> {
+        let trigger = InnerWfTrigger::AtTick(bigint_u64(tick)?);
+        let action = parse_action(&action_kind, bigint_u64(action_id)?)?;
+        self.engine.lock().arm(trigger, action);
+        Ok(())
+    }
+
+    /// The clock advanced to `now`: fire + disarm every `AtTick` trigger
+    /// whose deadline has passed. Returns the fired actions.
+    #[napi]
+    pub fn on_tick(&self, now: BigInt) -> Result<Vec<TriggerAction>> {
+        let now = bigint_u64(now)?;
+        let state = self.adapter.state();
+        let guard = state.read();
+        let results = self.results.lock();
+        let world = InnerTriggerWorld::with_results(&guard, now, &results);
+        let actions = self.engine.lock().on_tick(&world);
+        Ok(actions.into_iter().map(action_to_js).collect())
+    }
+
+    /// Total armed (not-yet-fired) triggers.
+    #[napi]
+    pub fn armed_count(&self) -> u32 {
+        self.engine.lock().armed_count() as u32
     }
 }

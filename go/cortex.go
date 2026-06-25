@@ -45,11 +45,11 @@ import (
 // ---------------------------------------------------------------------------
 
 var (
-	ErrCortexClosed = errors.New("cortex adapter closed")
-	ErrCortexFold   = errors.New("cortex fold / ingestion failed")
-	ErrNetDb        = errors.New("netdb error")
-	ErrRedex        = errors.New("redex error")
-	ErrStreamEnded  = errors.New("stream ended")
+	ErrCortexClosed  = errors.New("cortex adapter closed")
+	ErrCortexFold    = errors.New("cortex fold / ingestion failed")
+	ErrNetDb         = errors.New("netdb error")
+	ErrRedex         = errors.New("redex error")
+	ErrStreamEnded   = errors.New("stream ended")
 	ErrStreamTimeout = errors.New("stream timed out")
 )
 
@@ -991,4 +991,656 @@ func marshalFilter(filter any) (*C.char, error) {
 		return nil, nil
 	}
 	return C.CString(string(data)), nil
+}
+
+// ---------------------------------------------------------------------------
+// Task lifecycle (WorkflowAdapter)
+// ---------------------------------------------------------------------------
+
+// WorkflowTaskState is the materialized lifecycle state of one task.
+type WorkflowTaskState struct {
+	Step     uint32
+	Status   string // submitted|running|waiting|blocked|done|failed
+	Attempts uint32
+}
+
+// WorkflowStatusCounts rolls up task counts per status.
+type WorkflowStatusCounts struct {
+	Submitted uint64
+	Running   uint64
+	Waiting   uint64
+	Blocked   uint64
+	Done      uint64
+	Failed    uint64
+}
+
+func wfStatusString(code int) string {
+	switch code {
+	case 0:
+		return "submitted"
+	case 1:
+		return "running"
+	case 2:
+		return "waiting"
+	case 3:
+		return "blocked"
+	case 4:
+		return "done"
+	case 5:
+		return "failed"
+	default:
+		return "unknown"
+	}
+}
+
+// WorkflowAdapter is the typed task-lifecycle handle — a single-writer
+// RedEX chain folded into per-task { step, status, attempts }.
+type WorkflowAdapter struct {
+	mu     sync.RWMutex
+	handle *C.net_workflow_adapter_t
+}
+
+// OpenWorkflow opens the workflow adapter against a Redex. `persistent`
+// routes writes through the Redex's persistent directory.
+func OpenWorkflow(redex *Redex, originHash uint64, persistent bool) (*WorkflowAdapter, error) {
+	var p C.int
+	if persistent {
+		p = 1
+	}
+	redex.mu.RLock()
+	defer redex.mu.RUnlock()
+	if redex.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	var out *C.net_workflow_adapter_t
+	code := C.net_workflow_adapter_open(redex.handle, C.uint64_t(originHash), p, &out)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	w := &WorkflowAdapter{handle: out}
+	runtime.SetFinalizer(w, (*WorkflowAdapter).free)
+	return w, nil
+}
+
+func (w *WorkflowAdapter) free() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.handle != nil {
+		C.net_workflow_adapter_free(w.handle)
+		w.handle = nil
+		runtime.SetFinalizer(w, nil)
+	}
+}
+
+// Free releases the adapter. Idempotent.
+func (w *WorkflowAdapter) Free() { w.free() }
+
+func (w *WorkflowAdapter) seqOp(
+	call func(*C.net_workflow_adapter_t, *C.uint64_t) C.int,
+) (uint64, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return 0, ErrShuttingDown
+	}
+	var seq C.uint64_t
+	code := call(w.handle, &seq)
+	if err := cortexErrorFromCode(code); err != nil {
+		return 0, err
+	}
+	return uint64(seq), nil
+}
+
+// Submit a new task (enters at step 0, submitted).
+func (w *WorkflowAdapter) Submit(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_submit(h, C.uint64_t(id), s)
+	})
+}
+
+// Start marks the task running.
+func (w *WorkflowAdapter) Start(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_start(h, C.uint64_t(id), s)
+	})
+}
+
+// Wait parks the task waiting.
+func (w *WorkflowAdapter) Wait(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_wait(h, C.uint64_t(id), s)
+	})
+}
+
+// Block parks the task blocked.
+func (w *WorkflowAdapter) Block(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_block(h, C.uint64_t(id), s)
+	})
+}
+
+// Complete marks the task done (terminal success).
+func (w *WorkflowAdapter) Complete(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_complete(h, C.uint64_t(id), s)
+	})
+}
+
+// Fail marks the task failed (terminal failure).
+func (w *WorkflowAdapter) Fail(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_fail(h, C.uint64_t(id), s)
+	})
+}
+
+// Advance bumps the step cursor (resets attempts).
+func (w *WorkflowAdapter) Advance(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_advance(h, C.uint64_t(id), s)
+	})
+}
+
+// Retry re-runs the current step (never resurrects a done task).
+func (w *WorkflowAdapter) Retry(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_retry(h, C.uint64_t(id), s)
+	})
+}
+
+// Delete removes a task and its whole linked subtree.
+func (w *WorkflowAdapter) Delete(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_delete(h, C.uint64_t(id), s)
+	})
+}
+
+// RequestCancel records a cancellation signal for the worker to observe.
+func (w *WorkflowAdapter) RequestCancel(id uint64) (uint64, error) {
+	return w.seqOp(func(h *C.net_workflow_adapter_t, s *C.uint64_t) C.int {
+		return C.net_workflow_request_cancel(h, C.uint64_t(id), s)
+	})
+}
+
+// Link records a parent->child lineage edge (idempotent).
+func (w *WorkflowAdapter) Link(parent, child uint64) (uint64, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return 0, ErrShuttingDown
+	}
+	var seq C.uint64_t
+	code := C.net_workflow_link(w.handle, C.uint64_t(parent), C.uint64_t(child), &seq)
+	if err := cortexErrorFromCode(code); err != nil {
+		return 0, err
+	}
+	return uint64(seq), nil
+}
+
+// Get returns the current state of id, or nil if unknown.
+func (w *WorkflowAdapter) Get(id uint64) (*WorkflowTaskState, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	var found, status C.int
+	var step, attempts C.uint32_t
+	code := C.net_workflow_get(w.handle, C.uint64_t(id), &found, &step, &status, &attempts)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	if found == 0 {
+		return nil, nil
+	}
+	return &WorkflowTaskState{
+		Step:     uint32(step),
+		Status:   wfStatusString(int(status)),
+		Attempts: uint32(attempts),
+	}, nil
+}
+
+// IsCancelRequested reports whether cancellation was requested for id.
+func (w *WorkflowAdapter) IsCancelRequested(id uint64) (bool, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return false, ErrShuttingDown
+	}
+	var b C.int
+	code := C.net_workflow_is_cancel_requested(w.handle, C.uint64_t(id), &b)
+	if err := cortexErrorFromCode(code); err != nil {
+		return false, err
+	}
+	return b != 0, nil
+}
+
+// StatusCounts rolls up task counts per status.
+func (w *WorkflowAdapter) StatusCounts() (WorkflowStatusCounts, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return WorkflowStatusCounts{}, ErrShuttingDown
+	}
+	var c C.net_workflow_status_counts_t
+	code := C.net_workflow_status_counts(w.handle, &c)
+	if err := cortexErrorFromCode(code); err != nil {
+		return WorkflowStatusCounts{}, err
+	}
+	return WorkflowStatusCounts{
+		Submitted: uint64(c.submitted),
+		Running:   uint64(c.running),
+		Waiting:   uint64(c.waiting),
+		Blocked:   uint64(c.blocked),
+		Done:      uint64(c.done),
+		Failed:    uint64(c.failed),
+	}, nil
+}
+
+// WaitForSeq blocks until every event up through seq has folded.
+// `timeoutMs` of 0 waits indefinitely.
+func (w *WorkflowAdapter) WaitForSeq(seq uint64, timeoutMs uint32) error {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return ErrShuttingDown
+	}
+	code := C.net_workflow_wait_for_seq(w.handle, C.uint64_t(seq), C.uint32_t(timeoutMs))
+	return cortexErrorFromCode(code)
+}
+
+// Subtree returns `id` plus all its transitive descendants (the delete
+// subtree).
+func (w *WorkflowAdapter) Subtree(id uint64) ([]uint64, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	var count C.size_t
+	code := C.net_workflow_subtree(w.handle, C.uint64_t(id), nil, 0, &count)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	if count == 0 {
+		return nil, nil
+	}
+	ids := make([]uint64, int(count))
+	code = C.net_workflow_subtree(
+		w.handle, C.uint64_t(id), (*C.uint64_t)(unsafe.Pointer(&ids[0])), count, &count)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	if int(count) < len(ids) {
+		ids = ids[:int(count)]
+	}
+	return ids, nil
+}
+
+// Snapshot captures a state snapshot: the bytes plus the snapshot's last
+// seq (hasLastSeq is false when the chain was empty). Restore both
+// together via OpenWorkflowFromSnapshot.
+func (w *WorkflowAdapter) Snapshot() (bytes []byte, lastSeq uint64, hasLastSeq bool, err error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return nil, 0, false, ErrShuttingDown
+	}
+	var length C.size_t
+	var seq C.uint64_t
+	var has C.int
+	// Size, then fill. The snapshot is re-serialized on each FFI call, so a
+	// concurrent transition (transitions also hold only RLock) can grow it
+	// between the two passes. Loop until the buffer was large enough
+	// (length <= cap) rather than silently returning a truncated,
+	// un-restorable buffer when it grew. Converges in one extra pass under
+	// normal write rates; each retry uses the freshly-reported length.
+	code := C.net_workflow_snapshot(w.handle, nil, 0, &length, &seq, &has)
+	if e := cortexErrorFromCode(code); e != nil {
+		return nil, 0, false, e
+	}
+	for length > 0 {
+		bufLen := length
+		buf := make([]byte, int(bufLen))
+		code = C.net_workflow_snapshot(
+			w.handle, (*C.uint8_t)(unsafe.Pointer(&buf[0])), bufLen, &length, &seq, &has)
+		if e := cortexErrorFromCode(code); e != nil {
+			return nil, 0, false, e
+		}
+		if length <= bufLen {
+			return buf[:int(length)], uint64(seq), has != 0, nil
+		}
+		// Grew between the sizing and fill passes — retry at the new size.
+	}
+	return nil, uint64(seq), has != 0, nil
+}
+
+// OpenWorkflowFromSnapshot opens a workflow adapter from a snapshot,
+// skipping replay up through lastSeq when hasLastSeq is true.
+func OpenWorkflowFromSnapshot(
+	redex *Redex, originHash uint64, persistent bool,
+	snapshot []byte, lastSeq uint64, hasLastSeq bool,
+) (*WorkflowAdapter, error) {
+	var p C.int
+	if persistent {
+		p = 1
+	}
+	var has C.int
+	if hasLastSeq {
+		has = 1
+	}
+	redex.mu.RLock()
+	defer redex.mu.RUnlock()
+	if redex.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	var ptr *C.uint8_t
+	if len(snapshot) > 0 {
+		ptr = (*C.uint8_t)(unsafe.Pointer(&snapshot[0]))
+	}
+	var out *C.net_workflow_adapter_t
+	code := C.net_workflow_open_from_snapshot(
+		redex.handle, C.uint64_t(originHash), p, ptr, C.size_t(len(snapshot)),
+		C.uint64_t(lastSeq), has, &out)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	wf := &WorkflowAdapter{handle: out}
+	runtime.SetFinalizer(wf, (*WorkflowAdapter).free)
+	return wf, nil
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2: shards (fan-out / fan-in)
+// ---------------------------------------------------------------------------
+
+// ShardGroup is a map-reduce shard group: the shard task ids + reduce id.
+type ShardGroup struct {
+	mu     sync.Mutex
+	handle *C.net_shard_group_t
+}
+
+// NewShardGroup builds a shard group.
+func NewShardGroup(shards []uint64, reduce uint64) (*ShardGroup, error) {
+	var ptr *C.uint64_t
+	if len(shards) > 0 {
+		ptr = (*C.uint64_t)(unsafe.Pointer(&shards[0]))
+	}
+	var out *C.net_shard_group_t
+	code := C.net_shard_group_new(ptr, C.size_t(len(shards)), C.uint64_t(reduce), &out)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	g := &ShardGroup{handle: out}
+	runtime.SetFinalizer(g, (*ShardGroup).free)
+	return g, nil
+}
+
+func (g *ShardGroup) free() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.handle != nil {
+		C.net_shard_group_free(g.handle)
+		g.handle = nil
+		runtime.SetFinalizer(g, nil)
+	}
+}
+
+// Free releases the shard group. Idempotent and safe against a concurrent
+// finalizer; the group must not be used afterwards.
+func (g *ShardGroup) Free() { g.free() }
+
+// JoinResult is the outcome of TryJoin.
+type JoinResult struct {
+	Kind   string   // submitted | already_submitted | pending | failed
+	Seq    uint64   // valid when Kind == "submitted"
+	Failed []uint64 // valid when Kind == "failed"
+}
+
+func joinKindString(k int) string {
+	switch k {
+	case 0:
+		return "submitted"
+	case 1:
+		return "already_submitted"
+	case 2:
+		return "pending"
+	case 3:
+		return "failed"
+	default:
+		return "unknown"
+	}
+}
+
+// FanOut submits every shard task. Returns the last append seq.
+func (w *WorkflowAdapter) FanOut(group *ShardGroup) (uint64, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return 0, ErrShuttingDown
+	}
+	var seq C.uint64_t
+	code := C.net_workflow_fan_out(w.handle, group.handle, &seq)
+	if err := cortexErrorFromCode(code); err != nil {
+		return 0, err
+	}
+	return uint64(seq), nil
+}
+
+// TryJoin submits the reduce once every shard is done, surfaces failed
+// shards, or reports pending. Idempotent.
+func (w *WorkflowAdapter) TryJoin(group *ShardGroup) (JoinResult, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return JoinResult{}, ErrShuttingDown
+	}
+	var kind C.int
+	var seq C.uint64_t
+	var count C.size_t
+	// First pass: learn the failed-id count.
+	code := C.net_workflow_try_join(w.handle, group.handle, &kind, &seq, nil, 0, &count)
+	if err := cortexErrorFromCode(code); err != nil {
+		return JoinResult{}, err
+	}
+	res := JoinResult{Kind: joinKindString(int(kind)), Seq: uint64(seq)}
+	if int(kind) == 3 && count > 0 {
+		ids := make([]uint64, int(count))
+		code = C.net_workflow_try_join(
+			w.handle, group.handle, &kind, &seq,
+			(*C.uint64_t)(unsafe.Pointer(&ids[0])), count, &count)
+		if err := cortexErrorFromCode(code); err != nil {
+			return JoinResult{}, err
+		}
+		if int(count) < len(ids) {
+			ids = ids[:int(count)]
+		}
+		res.Failed = ids
+	}
+	return res, nil
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2: triggers (bound to a WorkflowAdapter; reads its state internally)
+// ---------------------------------------------------------------------------
+
+// TriggerAction is a fired trigger's action.
+type TriggerAction struct {
+	Kind string // submit | start
+	ID   uint64
+}
+
+func actionKindCode(kind string) C.int {
+	if kind == "start" {
+		return 1
+	}
+	return 0
+}
+
+// TriggerEngine is the pure trigger engine, bound to a WorkflowAdapter.
+type TriggerEngine struct {
+	mu     sync.Mutex
+	handle *C.net_trigger_engine_t
+}
+
+// NewTriggerEngine builds a trigger engine bound to `wf`.
+func NewTriggerEngine(wf *WorkflowAdapter) (*TriggerEngine, error) {
+	wf.mu.RLock()
+	defer wf.mu.RUnlock()
+	if wf.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	var out *C.net_trigger_engine_t
+	code := C.net_trigger_engine_new(wf.handle, &out)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	e := &TriggerEngine{handle: out}
+	runtime.SetFinalizer(e, (*TriggerEngine).free)
+	return e, nil
+}
+
+func (e *TriggerEngine) free() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.handle != nil {
+		C.net_trigger_engine_free(e.handle)
+		e.handle = nil
+		runtime.SetFinalizer(e, nil)
+	}
+}
+
+// Free releases the trigger engine. Idempotent and safe against a
+// concurrent finalizer; the engine must not be used afterwards.
+func (e *TriggerEngine) Free() { e.free() }
+
+// ArmAfterTask arms AfterTask(task) -> action (fires when task is done).
+func (e *TriggerEngine) ArmAfterTask(task uint64, action TriggerAction) error {
+	code := C.net_trigger_arm_after_task(
+		e.handle, C.uint64_t(task), actionKindCode(action.Kind), C.uint64_t(action.ID))
+	return cortexErrorFromCode(code)
+}
+
+// ArmAfterTerminal arms AfterTerminal(task) -> action (done OR failed).
+func (e *TriggerEngine) ArmAfterTerminal(task uint64, action TriggerAction) error {
+	code := C.net_trigger_arm_after_terminal(
+		e.handle, C.uint64_t(task), actionKindCode(action.Kind), C.uint64_t(action.ID))
+	return cortexErrorFromCode(code)
+}
+
+// ArmIfResult arms IfResult(task, key, value) -> action: fires when
+// `task` is done AND its recorded result `key` equals `value`. Record the
+// result first via RecordResult.
+func (e *TriggerEngine) ArmIfResult(task uint64, key, value string, action TriggerAction) error {
+	ckey := C.CString(key)
+	defer C.free(unsafe.Pointer(ckey))
+	cval := C.CString(value)
+	defer C.free(unsafe.Pointer(cval))
+	code := C.net_trigger_arm_if_result(
+		e.handle, C.uint64_t(task), ckey, cval,
+		actionKindCode(action.Kind), C.uint64_t(action.ID))
+	return cortexErrorFromCode(code)
+}
+
+// RecordResult records `task`'s result key = value for IfResult evaluation.
+func (e *TriggerEngine) RecordResult(task uint64, key, value string) error {
+	ckey := C.CString(key)
+	defer C.free(unsafe.Pointer(ckey))
+	cval := C.CString(value)
+	defer C.free(unsafe.Pointer(cval))
+	code := C.net_trigger_record_result(e.handle, C.uint64_t(task), ckey, cval)
+	return cortexErrorFromCode(code)
+}
+
+// collectTriggerActions materializes the parallel (kinds, ids) the FFI
+// filled, reading exactly `count` entries (capped to the buffer length as
+// a defensive bound — see the single-call note on OnTaskChange/OnTick).
+func collectTriggerActions(kinds []C.int, ids []uint64, count int) []TriggerAction {
+	if count > len(ids) {
+		count = len(ids)
+	}
+	if count <= 0 {
+		return nil
+	}
+	out := make([]TriggerAction, count)
+	for i := 0; i < count; i++ {
+		kind := "submit"
+		if kinds[i] == 1 {
+			kind = "start"
+		}
+		out[i] = TriggerAction{Kind: kind, ID: ids[i]}
+	}
+	return out
+}
+
+// OnTaskChange returns the actions fired by `task`'s change, evaluated
+// against the bound adapter's current state.
+//
+// net_trigger_on_task_change is *consuming*: it disarms the triggers it
+// fires, so — unlike the read-only list getters (Subtree, MatchGpuIslands)
+// — it cannot be sized with a NULL-buffer probe pass. A probe pass would
+// fire and discard the actions, and the real pass would then find nothing
+// armed. Instead size the buffer once from ArmedCount (an upper bound:
+// fired ⊆ armed) and make a single call. The engine is driven by a single
+// goroutine, so no concurrent arm grows the set between the two FFI calls.
+func (e *TriggerEngine) OnTaskChange(task, tick uint64) ([]TriggerAction, error) {
+	n, err := e.ArmedCount()
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	kinds := make([]C.int, n)
+	ids := make([]uint64, n)
+	var count C.size_t
+	code := C.net_trigger_on_task_change(
+		e.handle, C.uint64_t(task), C.uint64_t(tick),
+		&kinds[0], (*C.uint64_t)(unsafe.Pointer(&ids[0])), C.size_t(n), &count)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	return collectTriggerActions(kinds, ids, int(count)), nil
+}
+
+// ArmAtTick arms AtTick(tick) -> action (fires once the clock reaches tick).
+func (e *TriggerEngine) ArmAtTick(tick uint64, action TriggerAction) error {
+	code := C.net_trigger_arm_at_tick(
+		e.handle, C.uint64_t(tick), actionKindCode(action.Kind), C.uint64_t(action.ID))
+	return cortexErrorFromCode(code)
+}
+
+// OnTick fires + disarms every AtTick trigger due at `now`; returns them.
+//
+// Like OnTaskChange, net_trigger_on_tick is *consuming* (it disarms what
+// it fires), so it is a single call sized from ArmedCount rather than a
+// NULL-buffer probe + fill — a probe pass would drain the due triggers and
+// throw the actions away. See OnTaskChange for the full rationale.
+func (e *TriggerEngine) OnTick(now uint64) ([]TriggerAction, error) {
+	n, err := e.ArmedCount()
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	kinds := make([]C.int, n)
+	ids := make([]uint64, n)
+	var count C.size_t
+	code := C.net_trigger_on_tick(
+		e.handle, C.uint64_t(now),
+		&kinds[0], (*C.uint64_t)(unsafe.Pointer(&ids[0])), C.size_t(n), &count)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	return collectTriggerActions(kinds, ids, int(count)), nil
+}
+
+// ArmedCount returns the number of armed (not-yet-fired) triggers.
+func (e *TriggerEngine) ArmedCount() (int, error) {
+	var c C.size_t
+	code := C.net_trigger_armed_count(e.handle, &c)
+	if err := cortexErrorFromCode(code); err != nil {
+		return 0, err
+	}
+	return int(c), nil
 }

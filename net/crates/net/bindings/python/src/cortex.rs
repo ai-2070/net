@@ -23,6 +23,13 @@ use ::net::adapter::net::cortex::tasks::{
     OrderBy as InnerTasksOrderBy, Task as InnerTask, TaskStatus as InnerTaskStatus,
     TasksAdapter as InnerTasksAdapter,
 };
+use ::net::adapter::net::cortex::workflow::{
+    fan_out, try_join, Action as InnerWfAction, Join as InnerJoin, ShardGroup as InnerShardGroup,
+    StatusCounts as InnerStatusCounts, TaskState as InnerWfTaskState,
+    TaskStatus as InnerWfTaskStatus, Trigger as InnerWfTrigger,
+    TriggerEngine as InnerTriggerEngine, TriggerWorld as InnerTriggerWorld,
+    WorkflowAdapter as InnerWorkflowAdapter,
+};
 use ::net::adapter::net::cortex::WaitForTokenError as InnerWaitForTokenError;
 use ::net::adapter::net::redex::{
     FsyncPolicy as InnerFsyncPolicy, PlacementStrategy as InnerPlacementStrategy,
@@ -3460,5 +3467,502 @@ impl PyAsyncToolWatchIter {
     fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.close();
         pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
+    }
+}
+
+// =========================================================================
+// Task lifecycle (WorkflowAdapter)
+// =========================================================================
+
+/// Materialized lifecycle state of one workflow task.
+#[pyclass(name = "WorkflowTaskState", from_py_object)]
+#[derive(Clone)]
+pub struct PyWorkflowTaskState {
+    #[pyo3(get)]
+    pub step: u32,
+    /// `submitted` / `running` / `waiting` / `blocked` / `done` / `failed`.
+    #[pyo3(get)]
+    pub status: String,
+    #[pyo3(get)]
+    pub attempts: u32,
+}
+
+impl From<InnerWfTaskState> for PyWorkflowTaskState {
+    fn from(t: InnerWfTaskState) -> Self {
+        Self {
+            step: t.step,
+            status: wf_status_str(t.status).to_string(),
+            attempts: t.attempts,
+        }
+    }
+}
+
+/// Roll-up of workflow task counts per status.
+#[pyclass(name = "WorkflowStatusCounts", from_py_object)]
+#[derive(Clone)]
+pub struct PyWorkflowStatusCounts {
+    #[pyo3(get)]
+    pub submitted: u64,
+    #[pyo3(get)]
+    pub running: u64,
+    #[pyo3(get)]
+    pub waiting: u64,
+    #[pyo3(get)]
+    pub blocked: u64,
+    #[pyo3(get)]
+    pub done: u64,
+    #[pyo3(get)]
+    pub failed: u64,
+}
+
+impl From<InnerStatusCounts> for PyWorkflowStatusCounts {
+    fn from(c: InnerStatusCounts) -> Self {
+        Self {
+            submitted: c.submitted as u64,
+            running: c.running as u64,
+            waiting: c.waiting as u64,
+            blocked: c.blocked as u64,
+            done: c.done as u64,
+            failed: c.failed as u64,
+        }
+    }
+}
+
+fn wf_status_str(s: InnerWfTaskStatus) -> &'static str {
+    match s {
+        InnerWfTaskStatus::Submitted => "submitted",
+        InnerWfTaskStatus::Running => "running",
+        InnerWfTaskStatus::Waiting => "waiting",
+        InnerWfTaskStatus::Blocked => "blocked",
+        InnerWfTaskStatus::Done => "done",
+        InnerWfTaskStatus::Failed => "failed",
+    }
+}
+
+fn parse_wf_status(s: &str) -> PyResult<InnerWfTaskStatus> {
+    Ok(match s {
+        "submitted" => InnerWfTaskStatus::Submitted,
+        "running" => InnerWfTaskStatus::Running,
+        "waiting" => InnerWfTaskStatus::Waiting,
+        "blocked" => InnerWfTaskStatus::Blocked,
+        "done" => InnerWfTaskStatus::Done,
+        "failed" => InnerWfTaskStatus::Failed,
+        other => {
+            return Err(CortexError::new_err(format!(
+                "unknown task status {other:?}"
+            )))
+        }
+    })
+}
+
+/// Typed task-lifecycle adapter — a single-writer RedEX chain folded
+/// into per-task `{ step, status, attempts }`.
+#[pyclass(name = "WorkflowAdapter", from_py_object)]
+#[derive(Clone)]
+pub struct PyWorkflowAdapter {
+    inner: Arc<InnerWorkflowAdapter>,
+    runtime: Arc<Runtime>,
+}
+
+#[pymethods]
+impl PyWorkflowAdapter {
+    /// Open the workflow adapter against a Redex manager.
+    #[staticmethod]
+    #[pyo3(signature = (redex, origin_hash, persistent = false))]
+    fn open(py: Python<'_>, redex: &PyRedex, origin_hash: u64, persistent: bool) -> PyResult<Self> {
+        let runtime = make_runtime()?;
+        let redex_inner = redex.inner.clone();
+        let cfg = cfg_from_persistent(persistent);
+        let runtime_for_block = runtime.clone();
+        let inner = py
+            .detach(move || {
+                runtime_for_block.block_on(async move {
+                    InnerWorkflowAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
+                })
+            })
+            .map_err(|e| CortexError::new_err(format!("WorkflowAdapter open failed: {}", e)))?;
+        Ok(Self {
+            inner: Arc::new(inner),
+            runtime,
+        })
+    }
+
+    /// Open from a snapshot, skipping replay up through `last_seq`.
+    #[staticmethod]
+    #[pyo3(signature = (redex, origin_hash, state_bytes, last_seq = None, persistent = false))]
+    fn open_from_snapshot(
+        py: Python<'_>,
+        redex: &PyRedex,
+        origin_hash: u64,
+        state_bytes: &[u8],
+        last_seq: Option<u64>,
+        persistent: bool,
+    ) -> PyResult<Self> {
+        let runtime = make_runtime()?;
+        let redex_inner = redex.inner.clone();
+        let cfg = cfg_from_persistent(persistent);
+        let bytes = state_bytes.to_vec();
+        let runtime_for_block = runtime.clone();
+        let inner = py
+            .detach(move || {
+                runtime_for_block.block_on(async move {
+                    InnerWorkflowAdapter::open_from_snapshot_with_config(
+                        &redex_inner,
+                        origin_hash,
+                        cfg,
+                        &bytes,
+                        last_seq,
+                    )
+                    .await
+                })
+            })
+            .map_err(|e| {
+                CortexError::new_err(format!("WorkflowAdapter open_from_snapshot failed: {}", e))
+            })?;
+        Ok(Self {
+            inner: Arc::new(inner),
+            runtime,
+        })
+    }
+
+    /// Submit a new task — enters at step 0, `submitted`.
+    fn submit(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .submit(id)
+            .map_err(|e| CortexError::new_err(format!("submit failed: {}", e)))
+    }
+
+    /// Set a task's status. A terminal task is never moved.
+    fn transition(&self, id: u64, status: &str) -> PyResult<u64> {
+        self.inner
+            .transition(id, parse_wf_status(status)?)
+            .map_err(|e| CortexError::new_err(format!("transition failed: {}", e)))
+    }
+
+    /// Mark the task `running`.
+    fn start(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .start(id)
+            .map_err(|e| CortexError::new_err(format!("start failed: {}", e)))
+    }
+
+    /// Park the task `waiting`.
+    fn wait(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .wait(id)
+            .map_err(|e| CortexError::new_err(format!("wait failed: {}", e)))
+    }
+
+    /// Park the task `blocked`.
+    fn block(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .block(id)
+            .map_err(|e| CortexError::new_err(format!("block failed: {}", e)))
+    }
+
+    /// Mark the task `done` (terminal success).
+    fn complete(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .complete(id)
+            .map_err(|e| CortexError::new_err(format!("complete failed: {}", e)))
+    }
+
+    /// Mark the task `failed` (terminal failure).
+    fn fail(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .fail(id)
+            .map_err(|e| CortexError::new_err(format!("fail failed: {}", e)))
+    }
+
+    /// Advance the step cursor (bumps step, resets attempts).
+    fn advance(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .advance(id)
+            .map_err(|e| CortexError::new_err(format!("advance failed: {}", e)))
+    }
+
+    /// Retry the current step. Never resurrects a `done` task.
+    fn retry(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .retry(id)
+            .map_err(|e| CortexError::new_err(format!("retry failed: {}", e)))
+    }
+
+    /// Delete a task, reclaiming its whole linked subtree.
+    fn delete(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .delete(id)
+            .map_err(|e| CortexError::new_err(format!("delete failed: {}", e)))
+    }
+
+    /// Record a parent->child lineage edge (idempotent).
+    fn link(&self, parent: u64, child: u64) -> PyResult<u64> {
+        self.inner
+            .link(parent, child)
+            .map_err(|e| CortexError::new_err(format!("link failed: {}", e)))
+    }
+
+    /// Request cancellation — a worker-observed signal.
+    fn request_cancel(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .request_cancel(id)
+            .map_err(|e| CortexError::new_err(format!("request_cancel failed: {}", e)))
+    }
+
+    /// Current state for `id`, or `None` if unknown.
+    fn get(&self, id: u64) -> Option<PyWorkflowTaskState> {
+        self.inner.get(id).map(PyWorkflowTaskState::from)
+    }
+
+    /// Has cancellation been requested for `id`?
+    fn is_cancel_requested(&self, id: u64) -> bool {
+        self.inner.is_cancel_requested(id)
+    }
+
+    /// `id` plus all transitive descendants — the delete subtree.
+    fn subtree(&self, id: u64) -> Vec<u64> {
+        self.inner.subtree(id)
+    }
+
+    /// Roll-up of task counts per status.
+    fn status_counts(&self) -> PyWorkflowStatusCounts {
+        self.inner.status_counts().into()
+    }
+
+    /// Capture a state snapshot. Returns `(state_bytes, last_seq)`.
+    fn snapshot(&self) -> PyResult<(Vec<u8>, Option<u64>)> {
+        self.inner
+            .snapshot()
+            .map_err(|e| CortexError::new_err(format!("snapshot failed: {}", e)))
+    }
+
+    /// Fan out: submit every shard task. Returns the last append seq.
+    fn fan_out(&self, group: &PyShardGroup) -> PyResult<u64> {
+        fan_out(&self.inner, &group.inner)
+            .map_err(|e| CortexError::new_err(format!("fan_out failed: {}", e)))
+    }
+
+    /// Try to join: submit the reduce once every shard is done, surface
+    /// failed shards, or report pending. Idempotent.
+    fn try_join(&self, group: &PyShardGroup) -> PyResult<PyJoinResult> {
+        match try_join(&self.inner, &group.inner)
+            .map_err(|e| CortexError::new_err(format!("try_join failed: {}", e)))?
+        {
+            InnerJoin::Submitted(s) => Ok(PyJoinResult {
+                kind: "submitted".into(),
+                seq: Some(s),
+                failed: None,
+            }),
+            InnerJoin::AlreadySubmitted => Ok(PyJoinResult {
+                kind: "already_submitted".into(),
+                seq: None,
+                failed: None,
+            }),
+            InnerJoin::Pending => Ok(PyJoinResult {
+                kind: "pending".into(),
+                seq: None,
+                failed: None,
+            }),
+            InnerJoin::Failed(ids) => Ok(PyJoinResult {
+                kind: "failed".into(),
+                seq: None,
+                failed: Some(ids),
+            }),
+        }
+    }
+
+    /// Block until every event up through `seq` has folded. Releases
+    /// the GIL for the wait.
+    fn wait_for_seq(&self, py: Python<'_>, seq: u64) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let runtime = self.runtime.clone();
+        py.detach(|| {
+            runtime
+                .block_on(async move { inner.wait_for_seq(seq).await })
+                .map_err(|folded| {
+                    CortexError::new_err(format!(
+                        "wait_for_seq: fold task stopped; folded_through={folded:?}"
+                    ))
+                })
+        })
+    }
+}
+
+// =========================================================================
+// Tier 2: shards (fan-out / fan-in)
+// =========================================================================
+
+/// A map-reduce shard group: the shard task ids + the reduce task id.
+#[pyclass(name = "ShardGroup")]
+pub struct PyShardGroup {
+    inner: InnerShardGroup,
+}
+
+#[pymethods]
+impl PyShardGroup {
+    #[new]
+    fn new(shards: Vec<u64>, reduce: u64) -> Self {
+        Self {
+            inner: InnerShardGroup::new(shards, reduce),
+        }
+    }
+}
+
+/// Result of a `try_join`: `kind` is `submitted` (reduce appended at
+/// `seq`), `already_submitted`, `pending`, or `failed` (with `failed`
+/// shard ids).
+#[pyclass(name = "JoinResult", from_py_object)]
+#[derive(Clone)]
+pub struct PyJoinResult {
+    #[pyo3(get)]
+    pub kind: String,
+    #[pyo3(get)]
+    pub seq: Option<u64>,
+    #[pyo3(get)]
+    pub failed: Option<Vec<u64>>,
+}
+
+// =========================================================================
+// Tier 2: triggers (D5 (a): the engine binds the WorkflowAdapter and
+// fetches state internally, so the call is just on_task_change(task)).
+// =========================================================================
+
+/// A fired trigger's action: `kind` is `submit` or `start`, `id` the task.
+#[pyclass(name = "TriggerAction", from_py_object)]
+#[derive(Clone)]
+pub struct PyTriggerAction {
+    #[pyo3(get)]
+    pub kind: String,
+    #[pyo3(get)]
+    pub id: u64,
+}
+
+fn wf_action_to_py(a: InnerWfAction) -> PyTriggerAction {
+    match a {
+        InnerWfAction::Submit(id) => PyTriggerAction {
+            kind: "submit".into(),
+            id,
+        },
+        InnerWfAction::Start(id) => PyTriggerAction {
+            kind: "start".into(),
+            id,
+        },
+    }
+}
+
+fn parse_wf_action(kind: &str, id: u64) -> PyResult<InnerWfAction> {
+    match kind {
+        "submit" => Ok(InnerWfAction::Submit(id)),
+        "start" => Ok(InnerWfAction::Start(id)),
+        other => Err(CortexError::new_err(format!(
+            "unknown action kind {other:?}"
+        ))),
+    }
+}
+
+/// The pure trigger engine, bound to a `WorkflowAdapter` (it reads the
+/// adapter's state internally). `arm_*` a dependency, then drive it with
+/// `on_task_change` — it returns the fired actions for the caller to
+/// apply (it starts no tasks itself).
+#[pyclass(name = "TriggerEngine")]
+pub struct PyTriggerEngine {
+    engine: parking_lot::Mutex<InnerTriggerEngine>,
+    /// Recorded task results (via `record_result`) threaded into the
+    /// `TriggerWorld` so `IfResult` branches can evaluate.
+    results: parking_lot::Mutex<
+        std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
+    >,
+    adapter: Arc<InnerWorkflowAdapter>,
+}
+
+#[pymethods]
+impl PyTriggerEngine {
+    #[new]
+    fn new(wf: &PyWorkflowAdapter) -> Self {
+        Self {
+            engine: parking_lot::Mutex::new(InnerTriggerEngine::new()),
+            results: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            adapter: wf.inner.clone(),
+        }
+    }
+
+    /// Arm `AfterTask(task)` -> action (fires when `task` is done).
+    fn arm_after_task(&self, task: u64, action_kind: &str, action_id: u64) -> PyResult<()> {
+        let action = parse_wf_action(action_kind, action_id)?;
+        self.engine
+            .lock()
+            .arm(InnerWfTrigger::AfterTask(task), action);
+        Ok(())
+    }
+
+    /// Arm `IfResult(task, key, value)` -> action: fires when `task` is
+    /// done AND its recorded result `key` equals `value` (record it
+    /// first via `record_result`).
+    fn arm_if_result(
+        &self,
+        task: u64,
+        key: String,
+        value: String,
+        action_kind: &str,
+        action_id: u64,
+    ) -> PyResult<()> {
+        let action = parse_wf_action(action_kind, action_id)?;
+        self.engine
+            .lock()
+            .arm(InnerWfTrigger::IfResult { task, key, value }, action);
+        Ok(())
+    }
+
+    /// Record `task`'s result `key = value` for `IfResult` evaluation.
+    fn record_result(&self, task: u64, key: String, value: String) {
+        self.results
+            .lock()
+            .entry(task)
+            .or_default()
+            .insert(key, value);
+    }
+
+    /// Arm `AfterTerminal(task)` -> action (fires on done OR failed).
+    fn arm_after_terminal(&self, task: u64, action_kind: &str, action_id: u64) -> PyResult<()> {
+        let action = parse_wf_action(action_kind, action_id)?;
+        self.engine
+            .lock()
+            .arm(InnerWfTrigger::AfterTerminal(task), action);
+        Ok(())
+    }
+
+    /// `task` changed: evaluate the triggers waiting on it against the
+    /// bound adapter's current state; return the fired actions.
+    #[pyo3(signature = (task, tick = 0))]
+    fn on_task_change(&self, task: u64, tick: u64) -> Vec<PyTriggerAction> {
+        let state = self.adapter.state();
+        let guard = state.read();
+        let results = self.results.lock();
+        let world = InnerTriggerWorld::with_results(&guard, tick, &results);
+        let actions = self.engine.lock().on_task_change(task, &world);
+        actions.into_iter().map(wf_action_to_py).collect()
+    }
+
+    /// Arm `AtTick(tick)` -> action (fires once the clock reaches `tick`).
+    fn arm_at_tick(&self, tick: u64, action_kind: &str, action_id: u64) -> PyResult<()> {
+        let action = parse_wf_action(action_kind, action_id)?;
+        self.engine.lock().arm(InnerWfTrigger::AtTick(tick), action);
+        Ok(())
+    }
+
+    /// The clock advanced to `now`: fire + disarm every `AtTick` trigger
+    /// whose deadline has passed. Returns the fired actions.
+    fn on_tick(&self, now: u64) -> Vec<PyTriggerAction> {
+        let state = self.adapter.state();
+        let guard = state.read();
+        let results = self.results.lock();
+        let world = InnerTriggerWorld::with_results(&guard, now, &results);
+        let actions = self.engine.lock().on_tick(&world);
+        actions.into_iter().map(wf_action_to_py).collect()
+    }
+
+    /// Total armed (not-yet-fired) triggers.
+    fn armed_count(&self) -> usize {
+        self.engine.lock().armed_count()
     }
 }

@@ -3580,6 +3580,288 @@ pub unsafe extern "C" fn net_normalize_gpu_vendor(
     write_string_out(canonical.to_string(), out_json, out_len)
 }
 
+// =========================================================================
+// Gang-claim GPU-island scheduler — C ABI shipped in `net.h`
+// =========================================================================
+//
+// Node-level surface (D3: reuse the existing `MeshNodeHandle`). Match
+// criteria and the island record cross the boundary as small JSON
+// strings (the codebase's `_json` convention), so the C ABI stays one
+// `const char*` instead of a struct + string-array marshaling.
+
+/// Returned for a bad / unparseable criteria or record JSON.
+pub(crate) const NET_ERR_GANG_INVALID: c_int = -140;
+
+/// Flat match criteria (parsed from the `criteria_json` argument). Built
+/// into the core `MatchCriteria` so callers never touch the internal
+/// `CapabilityQuery` / policy enum shapes.
+#[derive(Deserialize)]
+struct GangCriteriaJson {
+    #[serde(default)]
+    tags_all: Vec<String>,
+    #[serde(default)]
+    min_gpus: usize,
+    #[serde(default)]
+    max_load: Option<f32>,
+    #[serde(default)]
+    max_p50_latency_us: Option<u32>,
+    #[serde(default)]
+    require_warm_model: Option<u64>,
+    #[serde(default)]
+    selection: Option<String>,
+    #[serde(default)]
+    load_band_target: Option<f32>,
+    #[serde(default)]
+    prefer_warm_model: Option<u64>,
+}
+
+/// One island a node self-publishes (parsed from `record_json`). Its
+/// `host` is forced to this node.
+#[derive(Deserialize)]
+struct IslandRecordJson {
+    id: u64,
+    #[serde(default)]
+    gpus: Vec<u32>,
+    #[serde(default)]
+    warm_models: Vec<u64>,
+    #[serde(default)]
+    load: f32,
+    #[serde(default)]
+    p50_latency_us: u32,
+}
+
+fn build_gang_criteria(
+    c: GangCriteriaJson,
+) -> Option<crate::adapter::net::behavior::gang::MatchCriteria> {
+    use crate::adapter::net::behavior::fold::{CapabilityFilter, CapabilityQuery};
+    use crate::adapter::net::behavior::gang::{MatchCriteria, NumericFilter, SelectionPolicy};
+    let selection = match c.selection.as_deref() {
+        None | Some("least_loaded") => SelectionPolicy::LeastLoaded,
+        Some("pack") => SelectionPolicy::Pack,
+        Some("lowest_id") => SelectionPolicy::LowestId,
+        Some("load_band") => SelectionPolicy::LoadBand(c.load_band_target.unwrap_or(0.5)),
+        Some(_) => return None,
+    };
+    Some(MatchCriteria {
+        capability: CapabilityQuery::Composite(CapabilityFilter {
+            tags_all: c.tags_all,
+            ..Default::default()
+        }),
+        numeric: NumericFilter {
+            min_gpus: c.min_gpus,
+            max_load: c.max_load,
+            max_p50_latency_us: c.max_p50_latency_us,
+            require_warm_model: c.require_warm_model,
+        },
+        selection,
+        prefer_warm_model: c.prefer_warm_model,
+    })
+}
+
+/// Publish this node's island-topology record (host forced to self).
+/// `record_json` is `{"id":..,"gpus":[..],"warm_models":[..],"load":..,
+/// "p50_latency_us":..}`. The peer fan-out count is written to
+/// `*out_count` (may be NULL).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_publish_island_topology(
+    handle: *mut MeshNodeHandle,
+    record_json: *const c_char,
+    out_count: *mut usize,
+) -> c_int {
+    if handle.is_null() || record_json.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let Some(js) = (unsafe { c_str_to_string(record_json) }) else {
+        return NetError::InvalidUtf8.into();
+    };
+    let rec: IslandRecordJson = match serde_json::from_str(&js) {
+        Ok(r) => r,
+        Err(_) => return NET_ERR_GANG_INVALID,
+    };
+    use crate::adapter::net::behavior::fold::{GpuSet, IslandRecord};
+    let record = IslandRecord {
+        id: rec.id,
+        gpus: GpuSet::new(rec.gpus),
+        host: 0, // forced to this node by publish
+        warm_models: rec.warm_models,
+        load: rec.load,
+        p50_latency_us: rec.p50_latency_us,
+    };
+    let node = h.inner.clone();
+    match block_on(async move { node.publish_island_topology(record).await }) {
+        Ok(n) => {
+            if !out_count.is_null() {
+                unsafe {
+                    *out_count = n;
+                }
+            }
+            0
+        }
+        Err(e) => adapter_err_to_code(&e),
+    }
+}
+
+/// Match GPU islands against `criteria_json` (read-only). Up to `cap`
+/// island ids are written to `out_ids`; the total match count (which may
+/// exceed `cap`) is written to `*out_count`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_match_gpu_islands(
+    handle: *mut MeshNodeHandle,
+    criteria_json: *const c_char,
+    out_ids: *mut u64,
+    cap: usize,
+    out_count: *mut usize,
+) -> c_int {
+    if handle.is_null() || criteria_json.is_null() || out_count.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let Some(js) = (unsafe { c_str_to_string(criteria_json) }) else {
+        return NetError::InvalidUtf8.into();
+    };
+    let parsed: GangCriteriaJson = match serde_json::from_str(&js) {
+        Ok(c) => c,
+        Err(_) => return NET_ERR_GANG_INVALID,
+    };
+    let Some(criteria) = build_gang_criteria(parsed) else {
+        return NET_ERR_GANG_INVALID;
+    };
+    let ids = h.inner.match_gpu_islands(&criteria);
+    unsafe {
+        *out_count = ids.len();
+        if !out_ids.is_null() {
+            let n = ids.len().min(cap);
+            std::ptr::copy_nonoverlapping(ids.as_ptr(), out_ids, n);
+        }
+    }
+    0
+}
+
+/// Reserve `island` until `until_unix_us`. On success writes `0` (won)
+/// or `1` (lost) to `*out_outcome`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_reserve_island(
+    handle: *mut MeshNodeHandle,
+    island: u64,
+    until_unix_us: u64,
+    out_outcome: *mut c_int,
+) -> c_int {
+    if handle.is_null() || out_outcome.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let node = h.inner.clone();
+    match block_on(async move { node.reserve_island(island, until_unix_us).await }) {
+        Ok(outcome) => {
+            unsafe {
+                *out_outcome = claim_outcome_code(outcome);
+            }
+            0
+        }
+        Err(e) => adapter_err_to_code(&e),
+    }
+}
+
+/// Release `island` this node holds. On success writes `0` (won) or
+/// `1` (lost — wasn't the holder) to `*out_outcome`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_release_island(
+    handle: *mut MeshNodeHandle,
+    island: u64,
+    out_outcome: *mut c_int,
+) -> c_int {
+    if handle.is_null() || out_outcome.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let node = h.inner.clone();
+    match block_on(async move { node.release_island(island).await }) {
+        Ok(outcome) => {
+            unsafe {
+                *out_outcome = claim_outcome_code(outcome);
+            }
+            0
+        }
+        Err(e) => adapter_err_to_code(&e),
+    }
+}
+
+/// Match + reserve the first available island. On success `*out_found`
+/// is 1 and `*out_island` holds the id, or `*out_found` is 0 when
+/// nothing matched / all contended.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_mesh_claim_gpu_island(
+    handle: *mut MeshNodeHandle,
+    criteria_json: *const c_char,
+    until_unix_us: u64,
+    out_found: *mut c_int,
+    out_island: *mut u64,
+) -> c_int {
+    if handle.is_null() || criteria_json.is_null() || out_found.is_null() || out_island.is_null() {
+        return NetError::NullPointer.into();
+    }
+    // Pre-zero both out-params so every non-error return leaves them
+    // deterministic — a caller that reads `out_island` without first
+    // checking `out_found` sees 0, not stale stack data. The success arm
+    // overwrites them.
+    unsafe {
+        *out_found = 0;
+        *out_island = 0;
+    }
+    let h = unsafe { &*handle };
+    let _op = match h.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let Some(js) = (unsafe { c_str_to_string(criteria_json) }) else {
+        return NetError::InvalidUtf8.into();
+    };
+    let parsed: GangCriteriaJson = match serde_json::from_str(&js) {
+        Ok(c) => c,
+        Err(_) => return NET_ERR_GANG_INVALID,
+    };
+    let Some(criteria) = build_gang_criteria(parsed) else {
+        return NET_ERR_GANG_INVALID;
+    };
+    let node = h.inner.clone();
+    match block_on(async move { node.claim_gpu_island(&criteria, until_unix_us).await }) {
+        Ok(Some(id)) => {
+            unsafe {
+                *out_found = 1;
+                *out_island = id;
+            }
+            0
+        }
+        Ok(None) => 0,
+        Err(e) => adapter_err_to_code(&e),
+    }
+}
+
+fn claim_outcome_code(o: crate::adapter::net::behavior::gang::ClaimOutcome) -> c_int {
+    use crate::adapter::net::behavior::gang::ClaimOutcome;
+    match o {
+        ClaimOutcome::Won => 0,
+        ClaimOutcome::Lost => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

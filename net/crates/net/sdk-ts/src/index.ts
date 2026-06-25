@@ -55,6 +55,10 @@ export type {
   PublishConfig,
   PublishReport,
   SubscribeOptions,
+  GpuIslandCriteria,
+  IslandTopologyInput,
+  ClaimOutcome,
+  GpuSelectionPolicy,
 } from './mesh';
 
 // CortEX + NetDb (event-sourced state with reactive watches).
@@ -64,6 +68,9 @@ export {
   NetDb,
   TasksAdapter,
   MemoriesAdapter,
+  WorkflowAdapter,
+  ShardGroup,
+  TriggerEngine,
   TaskStatus,
   TasksOrderBy,
   MemoriesOrderBy,
@@ -83,6 +90,11 @@ export type {
   NetDbOpenConfig,
   NetDbBundle,
   CortexSnapshot,
+  WorkflowTaskState,
+  WorkflowTaskStatus,
+  WorkflowStatusCounts,
+  JoinResult,
+  TriggerAction,
 } from './cortex';
 
 // Identity + tokens (security surface).

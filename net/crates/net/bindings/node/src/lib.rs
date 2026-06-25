@@ -23,6 +23,8 @@ mod common;
 mod compute;
 #[cfg(feature = "cortex")]
 mod cortex;
+#[cfg(feature = "net")]
+mod gang;
 #[cfg(feature = "groups")]
 mod groups;
 #[cfg(feature = "dataforts")]

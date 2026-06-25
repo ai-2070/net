@@ -67,6 +67,12 @@ use crate::adapter::net::cortex::tasks::{
     OrderBy as TasksOrderBy, Task, TaskStatus, TasksAdapter as InnerTasksAdapter, TasksFilter,
     TasksWatcher,
 };
+use crate::adapter::net::cortex::workflow::{
+    fan_out as wf_fan_out, try_join as wf_try_join, Action as InnerWfAction, Join as InnerWfJoin,
+    ShardGroup as InnerShardGroup, StatusCounts as WfStatusCounts, TaskStatus as WfTaskStatus,
+    Trigger as InnerWfTrigger, TriggerEngine as InnerTriggerEngine,
+    TriggerWorld as InnerTriggerWorld, WorkflowAdapter as InnerWorkflowAdapter,
+};
 use crate::adapter::net::cortex::WaitForTokenError as InnerWaitForTokenError;
 use crate::adapter::net::netdb::{NetDbError as InnerNetDbError, NetDbSnapshot};
 use crate::adapter::net::redex::{
@@ -3289,6 +3295,924 @@ fn _netdb_error_keep_alive(e: InnerNetDbError) -> InnerNetDbError {
     e
 }
 
+// =========================================================================
+// Task lifecycle (WorkflowAdapter) — C ABI shipped in `net_cortex.h`
+// =========================================================================
+//
+// Mirrors the `net_tasks_adapter_*` recipe: a `HandleGuard`-wrapped
+// `Arc<WorkflowAdapter>`, opened against an existing `RedexHandle` (D3:
+// reuse the Redex handle). Status is a small integer code on the wire
+// (see `wf_status_to_code`).
+
+/// FFI handle wrapping an [`InnerWorkflowAdapter`].
+pub struct WorkflowAdapterHandle {
+    inner: ManuallyDrop<Arc<InnerWorkflowAdapter>>,
+    guard: HandleGuard,
+}
+
+/// Wire status codes for a workflow task (stable; mirrored in
+/// `net_cortex.h`).
+fn wf_status_to_code(s: WfTaskStatus) -> c_int {
+    match s {
+        WfTaskStatus::Submitted => 0,
+        WfTaskStatus::Running => 1,
+        WfTaskStatus::Waiting => 2,
+        WfTaskStatus::Blocked => 3,
+        WfTaskStatus::Done => 4,
+        WfTaskStatus::Failed => 5,
+    }
+}
+
+/// Wire-form roll-up of task counts per status.
+#[repr(C)]
+pub struct NetWorkflowStatusCounts {
+    pub submitted: u64,
+    pub running: u64,
+    pub waiting: u64,
+    pub blocked: u64,
+    pub done: u64,
+    pub failed: u64,
+}
+
+/// Open a workflow adapter against a Redex. `persistent != 0` routes
+/// writes through the Redex's persistent directory.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_adapter_open(
+    redex: *mut RedexHandle,
+    origin_hash: u64,
+    persistent: c_int,
+    out_handle: *mut *mut WorkflowAdapterHandle,
+) -> c_int {
+    if redex.is_null() || out_handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let redex = unsafe { &*redex };
+    let _op = match redex.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let cfg = if persistent != 0 {
+        RedexFileConfig::default().with_persistent(true)
+    } else {
+        RedexFileConfig::default()
+    };
+    let redex_inner: Arc<InnerRedex> = Arc::clone(&redex.inner);
+    let result = block_on(async move {
+        InnerWorkflowAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
+    });
+    match result {
+        Ok(adapter) => {
+            let handle = Box::new(WorkflowAdapterHandle {
+                inner: ManuallyDrop::new(Arc::new(adapter)),
+                guard: HandleGuard::new(),
+            });
+            unsafe {
+                *out_handle = Box::into_raw(handle);
+            }
+            0
+        }
+        Err(_) => NET_ERR_CORTEX_FOLD,
+    }
+}
+
+/// Free a workflow adapter handle. Quiesces in-flight ops first.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_adapter_free(handle: *mut WorkflowAdapterHandle) {
+    if handle.is_null() {
+        return;
+    }
+    let h: &WorkflowAdapterHandle = unsafe { &*handle };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        unsafe {
+            let inner = ManuallyDrop::take(&mut (*handle).inner);
+            drop(inner);
+        }
+    } else {
+        tracing::warn!(
+            "net_workflow_adapter_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
+    }
+}
+
+/// Shared body for the seq-returning transition entry points.
+unsafe fn wf_seq_op(
+    handle: *mut WorkflowAdapterHandle,
+    out_seq: *mut u64,
+    f: impl FnOnce(
+        &InnerWorkflowAdapter,
+    ) -> Result<u64, crate::adapter::net::cortex::CortexAdapterError>,
+) -> c_int {
+    if handle.is_null() || out_seq.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*handle };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    match f(&wf.inner) {
+        Ok(seq) => {
+            unsafe {
+                *out_seq = seq;
+            }
+            0
+        }
+        Err(_) => NET_ERR_CORTEX_FOLD,
+    }
+}
+
+/// Submit a new task (enters at step 0, `submitted`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_submit(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.submit(id)) }
+}
+
+/// Mark the task `running`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_start(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.start(id)) }
+}
+
+/// Park the task `waiting`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_wait(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.wait(id)) }
+}
+
+/// Park the task `blocked`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_block(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.block(id)) }
+}
+
+/// Mark the task `done` (terminal success).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_complete(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.complete(id)) }
+}
+
+/// Mark the task `failed` (terminal failure).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_fail(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.fail(id)) }
+}
+
+/// Advance the step cursor (bumps step, resets attempts).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_advance(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.advance(id)) }
+}
+
+/// Retry the current step (status → `running`; never resurrects `done`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_retry(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.retry(id)) }
+}
+
+/// Delete a task, reclaiming its whole linked subtree.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_delete(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.delete(id)) }
+}
+
+/// Record a parent->child lineage edge (idempotent).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_link(
+    handle: *mut WorkflowAdapterHandle,
+    parent: u64,
+    child: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.link(parent, child)) }
+}
+
+/// Request cancellation of `id` (a worker-observed signal).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_request_cancel(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.request_cancel(id)) }
+}
+
+/// Read the current state of `id`. `*out_found` is set to 1 and the
+/// other out-params filled if the task exists, else `*out_found` is 0.
+/// `*out_status` is a `wf_status_to_code` value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_get(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_found: *mut c_int,
+    out_step: *mut u32,
+    out_status: *mut c_int,
+    out_attempts: *mut u32,
+) -> c_int {
+    if handle.is_null()
+        || out_found.is_null()
+        || out_step.is_null()
+        || out_status.is_null()
+        || out_attempts.is_null()
+    {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*handle };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    match wf.inner.get(id) {
+        Some(st) => unsafe {
+            *out_found = 1;
+            *out_step = st.step;
+            *out_status = wf_status_to_code(st.status);
+            *out_attempts = st.attempts;
+        },
+        None => unsafe {
+            *out_found = 0;
+        },
+    }
+    0
+}
+
+/// Whether cancellation has been requested for `id` (`*out_bool` 0/1).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_is_cancel_requested(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_bool: *mut c_int,
+) -> c_int {
+    if handle.is_null() || out_bool.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*handle };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    unsafe {
+        *out_bool = c_int::from(wf.inner.is_cancel_requested(id));
+    }
+    0
+}
+
+/// Roll-up of task counts per status into `*out`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_status_counts(
+    handle: *mut WorkflowAdapterHandle,
+    out: *mut NetWorkflowStatusCounts,
+) -> c_int {
+    if handle.is_null() || out.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*handle };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let c: WfStatusCounts = wf.inner.status_counts();
+    unsafe {
+        *out = NetWorkflowStatusCounts {
+            submitted: c.submitted as u64,
+            running: c.running as u64,
+            waiting: c.waiting as u64,
+            blocked: c.blocked as u64,
+            done: c.done as u64,
+            failed: c.failed as u64,
+        };
+    }
+    0
+}
+
+/// Block until every event up through `seq` has folded. `timeout_ms`
+/// of 0 waits indefinitely. Returns `0`, `NET_ERR_TIMEOUT`, or
+/// `NET_ERR_FOLD_STOPPED`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_wait_for_seq(
+    handle: *mut WorkflowAdapterHandle,
+    seq: u64,
+    timeout_ms: u32,
+) -> c_int {
+    if handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*handle };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let adapter: Arc<InnerWorkflowAdapter> = Arc::clone(&wf.inner);
+    block_on(async move {
+        let fut = adapter.wait_for_seq(seq);
+        if timeout_ms == 0 {
+            match fut.await {
+                Ok(()) => 0,
+                Err(_) => NET_ERR_FOLD_STOPPED,
+            }
+        } else {
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms as u64), fut)
+                .await
+            {
+                Ok(Ok(())) => 0,
+                Ok(Err(_)) => NET_ERR_FOLD_STOPPED,
+                Err(_) => NET_ERR_TIMEOUT,
+            }
+        }
+    })
+}
+
+// =========================================================================
+// Tier 2: shards (fan-out / fan-in) — C ABI
+// =========================================================================
+
+/// FFI handle wrapping an [`InnerShardGroup`] (a plain value).
+///
+/// Intentionally carries no [`HandleGuard`], unlike the async-backed
+/// handles ([`RedexHandle`], [`RedexFileHandle`], [`WorkflowAdapterHandle`]).
+/// Those guards exist (audit #23) to drain *in-flight async ops* before
+/// `_free` drops the inner — a watch cursor pumping on one thread while
+/// another frees. A shard group holds an immutable plain value; every op
+/// over it (`fan_out` / `try_join`) is synchronous and returns before the
+/// next call, so there is nothing to drain and `_free` is a bare
+/// `Box::from_raw`. Lifecycle safety rests on the module-wide contract
+/// (no use after `_free`); the Go wrapper frees only via finalizer, which
+/// cannot run while a call holds the handle reachable.
+pub struct ShardGroupHandle {
+    inner: InnerShardGroup,
+}
+
+/// Build a shard group from `shards[0..n]` + the `reduce` task id.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_shard_group_new(
+    shards: *const u64,
+    n: usize,
+    reduce: u64,
+    out_handle: *mut *mut ShardGroupHandle,
+) -> c_int {
+    if out_handle.is_null() || (shards.is_null() && n != 0) {
+        return NetError::NullPointer.into();
+    }
+    let ids: Vec<u64> = if n == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(shards, n) }.to_vec()
+    };
+    let handle = Box::new(ShardGroupHandle {
+        inner: InnerShardGroup::new(ids, reduce),
+    });
+    unsafe {
+        *out_handle = Box::into_raw(handle);
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_shard_group_free(handle: *mut ShardGroupHandle) {
+    if handle.is_null() {
+        return;
+    }
+    unsafe { drop(Box::from_raw(handle)) };
+}
+
+/// Fan out: submit every shard task. Returns the last append seq.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_fan_out(
+    wf: *mut WorkflowAdapterHandle,
+    group: *mut ShardGroupHandle,
+    out_seq: *mut u64,
+) -> c_int {
+    if wf.is_null() || group.is_null() || out_seq.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*wf };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let group = unsafe { &*group };
+    match wf_fan_out(&wf.inner, &group.inner) {
+        Ok(seq) => {
+            unsafe {
+                *out_seq = seq;
+            }
+            0
+        }
+        Err(_) => NET_ERR_CORTEX_FOLD,
+    }
+}
+
+/// Try to join. `*out_kind`: 0 submitted, 1 already_submitted, 2 pending,
+/// 3 failed. On submitted, `*out_seq` holds the reduce seq. On failed, up
+/// to `cap` failed shard ids land in `out_failed`, total in
+/// `*out_failed_count`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_try_join(
+    wf: *mut WorkflowAdapterHandle,
+    group: *mut ShardGroupHandle,
+    out_kind: *mut c_int,
+    out_seq: *mut u64,
+    out_failed: *mut u64,
+    cap: usize,
+    out_failed_count: *mut usize,
+) -> c_int {
+    if wf.is_null()
+        || group.is_null()
+        || out_kind.is_null()
+        || out_seq.is_null()
+        || out_failed_count.is_null()
+    {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*wf };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let group = unsafe { &*group };
+    let join = match wf_try_join(&wf.inner, &group.inner) {
+        Ok(j) => j,
+        Err(_) => return NET_ERR_CORTEX_FOLD,
+    };
+    unsafe {
+        *out_seq = 0;
+        *out_failed_count = 0;
+        match join {
+            InnerWfJoin::Submitted(s) => {
+                *out_kind = 0;
+                *out_seq = s;
+            }
+            InnerWfJoin::AlreadySubmitted => *out_kind = 1,
+            InnerWfJoin::Pending => *out_kind = 2,
+            InnerWfJoin::Failed(ids) => {
+                *out_kind = 3;
+                *out_failed_count = ids.len();
+                if !out_failed.is_null() {
+                    let m = ids.len().min(cap);
+                    std::ptr::copy_nonoverlapping(ids.as_ptr(), out_failed, m);
+                }
+            }
+        }
+    }
+    0
+}
+
+// =========================================================================
+// Tier 2: triggers — C ABI (D5 (a): the engine binds the adapter and
+// reads its state internally)
+// =========================================================================
+
+/// FFI handle: the pure trigger engine + the bound adapter (state reads).
+///
+/// Carries no [`HandleGuard`] by design (same rationale as
+/// [`ShardGroupHandle`]). The guards on the async-backed handles drain
+/// *in-flight async ops* at `_free` (audit #23); the trigger engine has
+/// none — every entry point (`arm_*`, `record_result`, `on_task_change`,
+/// `on_tick`, `armed_count`) takes the internal `parking_lot` mutexes,
+/// runs to completion synchronously, and returns before the next call, so
+/// `_free` is a bare `Box::from_raw` with nothing to quiesce. The
+/// `parking_lot::Mutex`es make *concurrent method calls* sound; they do not
+/// make a call racing `_free` sound — that, as for every handle here, rests
+/// on the module-wide no-use-after-`_free` contract, which the Go wrapper's
+/// finalizer-only free upholds structurally (the handle stays reachable for
+/// the duration of any call). The bound `adapter` is an owned `Arc` clone,
+/// so it (and the state the engine reads) outlives a freed
+/// [`WorkflowAdapterHandle`].
+pub struct TriggerEngineHandle {
+    engine: parking_lot::Mutex<InnerTriggerEngine>,
+    /// Recorded task results (via `net_trigger_record_result`) threaded
+    /// into the `TriggerWorld` so `IfResult` branches can evaluate.
+    results: parking_lot::Mutex<
+        std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
+    >,
+    adapter: Arc<InnerWorkflowAdapter>,
+}
+
+fn wf_action_code(a: &InnerWfAction) -> (c_int, u64) {
+    match a {
+        InnerWfAction::Submit(id) => (0, *id),
+        InnerWfAction::Start(id) => (1, *id),
+    }
+}
+
+fn wf_action_from_code(kind: c_int, id: u64) -> Option<InnerWfAction> {
+    match kind {
+        0 => Some(InnerWfAction::Submit(id)),
+        1 => Some(InnerWfAction::Start(id)),
+        _ => None,
+    }
+}
+
+/// Build a trigger engine bound to `wf` (clones the adapter Arc).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_engine_new(
+    wf: *mut WorkflowAdapterHandle,
+    out_handle: *mut *mut TriggerEngineHandle,
+) -> c_int {
+    if wf.is_null() || out_handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*wf };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let handle = Box::new(TriggerEngineHandle {
+        engine: parking_lot::Mutex::new(InnerTriggerEngine::new()),
+        results: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        adapter: Arc::clone(&wf.inner),
+    });
+    unsafe {
+        *out_handle = Box::into_raw(handle);
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_engine_free(handle: *mut TriggerEngineHandle) {
+    if handle.is_null() {
+        return;
+    }
+    unsafe { drop(Box::from_raw(handle)) };
+}
+
+unsafe fn trigger_arm(
+    handle: *mut TriggerEngineHandle,
+    trigger: InnerWfTrigger,
+    action_kind: c_int,
+    action_id: u64,
+) -> c_int {
+    if handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let Some(action) = wf_action_from_code(action_kind, action_id) else {
+        return NET_ERR_CORTEX_FOLD; // unknown action kind
+    };
+    let h = unsafe { &*handle };
+    h.engine.lock().arm(trigger, action);
+    0
+}
+
+/// Arm IfResult(task, key, value) -> action (0 submit, 1 start): fires
+/// when `task` is Done AND its recorded result `key` equals `value`.
+/// Record the result first via `net_trigger_record_result`. `key`/`value`
+/// are NUL-terminated UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_arm_if_result(
+    handle: *mut TriggerEngineHandle,
+    task: u64,
+    key: *const c_char,
+    value: *const c_char,
+    action_kind: c_int,
+    action_id: u64,
+) -> c_int {
+    if handle.is_null() || key.is_null() || value.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let (key, value) = unsafe {
+        match (CStr::from_ptr(key).to_str(), CStr::from_ptr(value).to_str()) {
+            (Ok(k), Ok(v)) => (k.to_owned(), v.to_owned()),
+            _ => return NetError::InvalidUtf8.into(),
+        }
+    };
+    unsafe {
+        trigger_arm(
+            handle,
+            InnerWfTrigger::IfResult { task, key, value },
+            action_kind,
+            action_id,
+        )
+    }
+}
+
+/// Record `task`'s result `key = value` for `IfResult` evaluation.
+/// `key`/`value` are NUL-terminated UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_record_result(
+    handle: *mut TriggerEngineHandle,
+    task: u64,
+    key: *const c_char,
+    value: *const c_char,
+) -> c_int {
+    if handle.is_null() || key.is_null() || value.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let (key, value) = unsafe {
+        match (CStr::from_ptr(key).to_str(), CStr::from_ptr(value).to_str()) {
+            (Ok(k), Ok(v)) => (k.to_owned(), v.to_owned()),
+            _ => return NetError::InvalidUtf8.into(),
+        }
+    };
+    let h = unsafe { &*handle };
+    h.results.lock().entry(task).or_default().insert(key, value);
+    0
+}
+
+/// Arm AfterTask(task) -> action (0 submit, 1 start).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_arm_after_task(
+    handle: *mut TriggerEngineHandle,
+    task: u64,
+    action_kind: c_int,
+    action_id: u64,
+) -> c_int {
+    unsafe {
+        trigger_arm(
+            handle,
+            InnerWfTrigger::AfterTask(task),
+            action_kind,
+            action_id,
+        )
+    }
+}
+
+/// Arm AfterTerminal(task) -> action.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_arm_after_terminal(
+    handle: *mut TriggerEngineHandle,
+    task: u64,
+    action_kind: c_int,
+    action_id: u64,
+) -> c_int {
+    unsafe {
+        trigger_arm(
+            handle,
+            InnerWfTrigger::AfterTerminal(task),
+            action_kind,
+            action_id,
+        )
+    }
+}
+
+/// `task` changed: evaluate against the bound adapter's state. Fills
+/// parallel `out_kinds[i]` (0 submit, 1 start) / `out_ids[i]` up to `cap`,
+/// with the total fired count in `*out_count`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_on_task_change(
+    handle: *mut TriggerEngineHandle,
+    task: u64,
+    tick: u64,
+    out_kinds: *mut c_int,
+    out_ids: *mut u64,
+    cap: usize,
+    out_count: *mut usize,
+) -> c_int {
+    if handle.is_null() || out_count.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let state = h.adapter.state();
+    let guard = state.read();
+    let results = h.results.lock();
+    let world = InnerTriggerWorld::with_results(&guard, tick, &results);
+    let actions = h.engine.lock().on_task_change(task, &world);
+    unsafe {
+        *out_count = actions.len();
+        if !out_kinds.is_null() && !out_ids.is_null() {
+            for (i, a) in actions.iter().take(cap).enumerate() {
+                let (k, id) = wf_action_code(a);
+                *out_kinds.add(i) = k;
+                *out_ids.add(i) = id;
+            }
+        }
+    }
+    0
+}
+
+/// Total armed (not-yet-fired) triggers into `*out`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_armed_count(
+    handle: *mut TriggerEngineHandle,
+    out: *mut usize,
+) -> c_int {
+    if handle.is_null() || out.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    unsafe {
+        *out = h.engine.lock().armed_count();
+    }
+    0
+}
+
+/// Arm AtTick(tick) -> action (0 submit, 1 start).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_arm_at_tick(
+    handle: *mut TriggerEngineHandle,
+    tick: u64,
+    action_kind: c_int,
+    action_id: u64,
+) -> c_int {
+    unsafe { trigger_arm(handle, InnerWfTrigger::AtTick(tick), action_kind, action_id) }
+}
+
+/// The clock advanced to `now`: fire + disarm every AtTick trigger whose
+/// deadline has passed. Fills parallel `out_kinds[i]`/`out_ids[i]` up to
+/// `cap`, total in `*out_count`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_on_tick(
+    handle: *mut TriggerEngineHandle,
+    now: u64,
+    out_kinds: *mut c_int,
+    out_ids: *mut u64,
+    cap: usize,
+    out_count: *mut usize,
+) -> c_int {
+    if handle.is_null() || out_count.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let state = h.adapter.state();
+    let guard = state.read();
+    let results = h.results.lock();
+    let world = InnerTriggerWorld::with_results(&guard, now, &results);
+    let actions = h.engine.lock().on_tick(&world);
+    unsafe {
+        *out_count = actions.len();
+        if !out_kinds.is_null() && !out_ids.is_null() {
+            for (i, a) in actions.iter().take(cap).enumerate() {
+                let (k, id) = wf_action_code(a);
+                *out_kinds.add(i) = k;
+                *out_ids.add(i) = id;
+            }
+        }
+    }
+    0
+}
+
+/// `id` plus all transitive descendants — the delete subtree. Fills up
+/// to `cap` ids into `out_ids`, total in `*out_count`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_subtree(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_ids: *mut u64,
+    cap: usize,
+    out_count: *mut usize,
+) -> c_int {
+    if handle.is_null() || out_count.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*handle };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let ids = wf.inner.subtree(id);
+    unsafe {
+        *out_count = ids.len();
+        if !out_ids.is_null() {
+            let n = ids.len().min(cap);
+            std::ptr::copy_nonoverlapping(ids.as_ptr(), out_ids, n);
+        }
+    }
+    0
+}
+
+/// Capture a state snapshot. Two-pass like the other buffer returns:
+/// call with `out_bytes` NULL to learn `*out_len`, then again with a
+/// `cap`-sized buffer. `*out_last_seq` / `*out_has_last_seq` carry the
+/// snapshot's last seq (restore both together via `open_from_snapshot`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_snapshot(
+    handle: *mut WorkflowAdapterHandle,
+    out_bytes: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+    out_last_seq: *mut u64,
+    out_has_last_seq: *mut c_int,
+) -> c_int {
+    if handle.is_null() || out_len.is_null() || out_last_seq.is_null() || out_has_last_seq.is_null()
+    {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*handle };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let (bytes, last_seq) = match wf.inner.snapshot() {
+        Ok(v) => v,
+        Err(_) => return NET_ERR_CORTEX_FOLD,
+    };
+    unsafe {
+        *out_len = bytes.len();
+        match last_seq {
+            Some(s) => {
+                *out_last_seq = s;
+                *out_has_last_seq = 1;
+            }
+            None => {
+                *out_last_seq = 0;
+                *out_has_last_seq = 0;
+            }
+        }
+        if !out_bytes.is_null() {
+            let n = bytes.len().min(cap);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_bytes, n);
+        }
+    }
+    0
+}
+
+/// Open a workflow adapter from a snapshot (skips replay up through
+/// `last_seq` when `has_last_seq != 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_open_from_snapshot(
+    redex: *mut RedexHandle,
+    origin_hash: u64,
+    persistent: c_int,
+    state_bytes: *const u8,
+    state_len: usize,
+    last_seq: u64,
+    has_last_seq: c_int,
+    out_handle: *mut *mut WorkflowAdapterHandle,
+) -> c_int {
+    if redex.is_null() || out_handle.is_null() || (state_bytes.is_null() && state_len != 0) {
+        return NetError::NullPointer.into();
+    }
+    let redex = unsafe { &*redex };
+    let _op = match redex.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let cfg = if persistent != 0 {
+        RedexFileConfig::default().with_persistent(true)
+    } else {
+        RedexFileConfig::default()
+    };
+    let bytes: Vec<u8> = if state_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(state_bytes, state_len) }.to_vec()
+    };
+    let last = if has_last_seq != 0 {
+        Some(last_seq)
+    } else {
+        None
+    };
+    let redex_inner: Arc<InnerRedex> = Arc::clone(&redex.inner);
+    let result = block_on(async move {
+        InnerWorkflowAdapter::open_from_snapshot_with_config(
+            &redex_inner,
+            origin_hash,
+            cfg,
+            &bytes,
+            last,
+        )
+        .await
+    });
+    match result {
+        Ok(adapter) => {
+            let handle = Box::new(WorkflowAdapterHandle {
+                inner: ManuallyDrop::new(Arc::new(adapter)),
+                guard: HandleGuard::new(),
+            });
+            unsafe {
+                *out_handle = Box::into_raw(handle);
+            }
+            0
+        }
+        Err(_) => NET_ERR_CORTEX_FOLD,
+    }
+}
+
 // ABI-visible no-op to force the linker to keep `c_void` happy on
 // some older linkers; harmless otherwise.
 #[doc(hidden)]
@@ -4128,6 +5052,76 @@ mod tests {
         assert!(!db.is_null());
         unsafe {
             net_netdb_free(db);
+            net_redex_free(r);
+        }
+    }
+
+    /// The trigger fire calls (`net_trigger_on_tick` /
+    /// `net_trigger_on_task_change`) are *consuming* — they disarm what
+    /// they fire on every call, regardless of whether the out-buffers are
+    /// NULL. A caller must therefore size the buffer up front and call
+    /// ONCE; a "probe with NULL to learn the count, then fill" two-pass
+    /// fires + disarms on the probe and discards the actions, so the fill
+    /// pass returns nothing. This pins both halves: a correctly-sized
+    /// single call returns the action and disarms, and a NULL-buffer probe
+    /// silently drops it (the bug the Go wrapper hit — review 2026-06-25).
+    #[test]
+    fn trigger_on_tick_is_consuming_single_call() {
+        unsafe {
+            let r = net_redex_new(ptr::null());
+            let mut wf: *mut WorkflowAdapterHandle = ptr::null_mut();
+            assert_eq!(net_workflow_adapter_open(r, 0xF00D, 0, &mut wf), 0);
+            let mut eng: *mut TriggerEngineHandle = ptr::null_mut();
+            assert_eq!(net_trigger_engine_new(wf, &mut eng), 0);
+
+            // Arm AtTick(5) -> Submit(2).
+            assert_eq!(net_trigger_arm_at_tick(eng, 5, 0 /* submit */, 2), 0);
+            let mut armed: usize = 0;
+            assert_eq!(net_trigger_armed_count(eng, &mut armed), 0);
+            assert_eq!(armed, 1);
+
+            let mut kinds = [0_i32; 4];
+            let mut ids = [0_u64; 4];
+            let mut count: usize = 0;
+
+            // Below the deadline: nothing fires, the trigger stays armed.
+            assert_eq!(
+                net_trigger_on_tick(eng, 4, kinds.as_mut_ptr(), ids.as_mut_ptr(), 4, &mut count),
+                0
+            );
+            assert_eq!(count, 0);
+            net_trigger_armed_count(eng, &mut armed);
+            assert_eq!(armed, 1);
+
+            // Reaches the deadline: fires once (single, correctly-sized
+            // call) and disarms.
+            assert_eq!(
+                net_trigger_on_tick(eng, 5, kinds.as_mut_ptr(), ids.as_mut_ptr(), 4, &mut count),
+                0
+            );
+            assert_eq!(count, 1);
+            assert_eq!((kinds[0], ids[0]), (0, 2));
+            net_trigger_armed_count(eng, &mut armed);
+            assert_eq!(armed, 0);
+
+            // The footgun: a NULL-buffer "probe" pass still fires + disarms,
+            // so a follow-up fill pass sees nothing — actions lost.
+            assert_eq!(net_trigger_arm_at_tick(eng, 7, 0, 9), 0);
+            assert_eq!(
+                net_trigger_on_tick(eng, 7, ptr::null_mut(), ptr::null_mut(), 0, &mut count),
+                0
+            );
+            assert_eq!(count, 1, "probe reports the count but consumes the trigger");
+            net_trigger_armed_count(eng, &mut armed);
+            assert_eq!(armed, 0, "probe pass already disarmed it");
+            assert_eq!(
+                net_trigger_on_tick(eng, 7, kinds.as_mut_ptr(), ids.as_mut_ptr(), 4, &mut count),
+                0
+            );
+            assert_eq!(count, 0, "the fired action was lost to the probe pass");
+
+            net_trigger_engine_free(eng);
+            net_workflow_adapter_free(wf);
             net_redex_free(r);
         }
     }

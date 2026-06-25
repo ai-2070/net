@@ -42,6 +42,9 @@ import {
   MemoryWatchIter as NapiMemoryWatchIter,
   RedexFile as NapiRedexFile,
   RedexTailIter as NapiRedexTailIter,
+  WorkflowAdapter as NapiWorkflowAdapter,
+  ShardGroup as NapiShardGroup,
+  TriggerEngine as NapiTriggerEngine,
   TaskStatus,
   TasksOrderBy,
   MemoriesOrderBy,
@@ -57,6 +60,10 @@ import type {
   CortexSnapshot,
   RedexEventJs,
   RedexFileConfigJs,
+  WorkflowTaskState,
+  WorkflowStatusCounts,
+  JoinResult,
+  TriggerAction,
 } from '@net-mesh/core';
 
 // Re-export the NAPI value types so callers get them from one place.
@@ -75,7 +82,24 @@ export type {
   NetDbOpenConfig,
   NetDbBundle,
   CortexSnapshot,
+  WorkflowTaskState,
+  WorkflowStatusCounts,
+  JoinResult,
+  TriggerAction,
 };
+
+/**
+ * Workflow task lifecycle status. The state machine the
+ * {@link WorkflowAdapter} drives — distinct from the cortex tasks-model
+ * {@link TaskStatus}.
+ */
+export type WorkflowTaskStatus =
+  | 'submitted'
+  | 'running'
+  | 'waiting'
+  | 'blocked'
+  | 'done'
+  | 'failed';
 
 // Typed error classes shipped by `@net-mesh/core/errors`. Re-exported here
 // so SDK consumers can `import { CortexError } from '@net-mesh/sdk'`
@@ -758,5 +782,317 @@ export class NetDb {
   /** Close every enabled adapter. Idempotent. */
   close(): void {
     this.napi.close();
+  }
+}
+
+/**
+ * Task-lifecycle adapter — a single-writer RedEX chain folded into
+ * per-task `{ step, status, attempts }`.
+ *
+ * The companion to the gang-claim scheduler (the `Mesh` island
+ * methods): the gang decides *who* holds an exclusive GPU island; this
+ * plans what happens *after* it is held. Its status is the
+ * {@link WorkflowTaskStatus} lifecycle — distinct from the cortex
+ * tasks-model {@link TaskStatus}.
+ */
+export class WorkflowAdapter {
+  /** @internal */
+  readonly napi: NapiWorkflowAdapter;
+
+  constructor(inner: NapiWorkflowAdapter) {
+    this.napi = inner;
+  }
+
+  /** Open against a Redex manager. */
+  static async open(
+    redex: Redex,
+    originHash: bigint,
+    opts?: { persistent?: boolean },
+  ): Promise<WorkflowAdapter> {
+    try {
+      const inner = await NapiWorkflowAdapter.open(
+        redex.napi,
+        originHash,
+        opts?.persistent ?? null,
+      );
+      return new WorkflowAdapter(inner);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Open from a snapshot, skipping replay up through `lastSeq`. */
+  static async openFromSnapshot(
+    redex: Redex,
+    originHash: bigint,
+    snapshot: CortexSnapshot,
+    opts?: { persistent?: boolean },
+  ): Promise<WorkflowAdapter> {
+    try {
+      const inner = await NapiWorkflowAdapter.openFromSnapshot(
+        redex.napi,
+        originHash,
+        snapshot.stateBytes,
+        snapshot.lastSeq ?? null,
+        opts?.persistent ?? null,
+      );
+      return new WorkflowAdapter(inner);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Submit a new task — enters at step 0, `submitted`. */
+  submit(id: bigint): bigint {
+    try {
+      return this.napi.submit(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Set a task's status. A terminal task is never moved. */
+  transition(id: bigint, status: WorkflowTaskStatus): bigint {
+    try {
+      return this.napi.transition(id, status);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Mark the task `running`. */
+  start(id: bigint): bigint {
+    try {
+      return this.napi.start(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Park the task `waiting`. */
+  wait(id: bigint): bigint {
+    try {
+      return this.napi.wait(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Park the task `blocked`. */
+  block(id: bigint): bigint {
+    try {
+      return this.napi.block(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Mark the task `done` (terminal success). */
+  complete(id: bigint): bigint {
+    try {
+      return this.napi.complete(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Mark the task `failed` (terminal failure). */
+  fail(id: bigint): bigint {
+    try {
+      return this.napi.fail(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Advance the step cursor (bumps step, resets attempts). */
+  advance(id: bigint): bigint {
+    try {
+      return this.napi.advance(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Retry the current step. Never resurrects a `done` task. */
+  retry(id: bigint): bigint {
+    try {
+      return this.napi.retry(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Delete a task, reclaiming its whole linked subtree. */
+  delete(id: bigint): bigint {
+    try {
+      return this.napi.delete(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Record a parent→child lineage edge (idempotent). */
+  link(parent: bigint, child: bigint): bigint {
+    try {
+      return this.napi.link(parent, child);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Request cancellation — a worker-observed signal. */
+  requestCancel(id: bigint): bigint {
+    try {
+      return this.napi.requestCancel(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Current state for `id`, or `null` if unknown. */
+  get(id: bigint): WorkflowTaskState | null {
+    try {
+      return this.napi.get(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Has cancellation been requested for `id`? */
+  isCancelRequested(id: bigint): boolean {
+    try {
+      return this.napi.isCancelRequested(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** `id` plus all transitive descendants — the delete subtree. */
+  subtree(id: bigint): bigint[] {
+    try {
+      return this.napi.subtree(id);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Roll-up of task counts per status. */
+  statusCounts(): WorkflowStatusCounts {
+    try {
+      return this.napi.statusCounts();
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Capture a state snapshot for restore via `openFromSnapshot`. */
+  snapshot(): CortexSnapshot {
+    try {
+      return this.napi.snapshot();
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Block until every event up through `seq` has folded. */
+  async waitForSeq(seq: bigint): Promise<void> {
+    try {
+      await this.napi.waitForSeq(seq);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Fan out: submit every shard task. Returns the last append seq. */
+  fanOut(group: ShardGroup): bigint {
+    try {
+      return this.napi.fanOut(group.napi);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Try to join: submit the reduce once every shard is done, surface
+   *  failed shards, or report pending. Idempotent. */
+  tryJoin(group: ShardGroup): JoinResult {
+    try {
+      return this.napi.tryJoin(group.napi);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+}
+
+// ---- Tier 2: shards + triggers --------------------------------------------
+
+/** A map-reduce shard group: the shard task ids + the reduce task id. */
+export class ShardGroup {
+  /** @internal */
+  readonly napi: NapiShardGroup;
+
+  constructor(shards: bigint[], reduce: bigint) {
+    this.napi = new NapiShardGroup(shards, reduce);
+  }
+}
+
+/** The pure trigger engine, bound to a {@link WorkflowAdapter} (it reads
+ *  the adapter's state internally). Arm a dependency, then drive it with
+ *  {@link onTaskChange} — it returns the satisfied actions for the
+ *  caller to apply (it starts no tasks itself). */
+export class TriggerEngine {
+  /** @internal */
+  readonly napi: NapiTriggerEngine;
+
+  constructor(wf: WorkflowAdapter) {
+    this.napi = new NapiTriggerEngine(wf.napi);
+  }
+
+  /** Arm AfterTask(task) -> action (fires when `task` is done). */
+  armAfterTask(task: bigint, action: TriggerAction): void {
+    this.napi.armAfterTask(task, action.kind, action.id);
+  }
+
+  /** Arm AfterTerminal(task) -> action (fires on done OR failed). */
+  armAfterTerminal(task: bigint, action: TriggerAction): void {
+    this.napi.armAfterTerminal(task, action.kind, action.id);
+  }
+
+  /** Arm IfResult(task, key, value) -> action: fires when `task` is done
+   *  AND its recorded result `key` equals `value`. Record the result
+   *  first via {@link recordResult}. */
+  armIfResult(
+    task: bigint,
+    key: string,
+    value: string,
+    action: TriggerAction,
+  ): void {
+    this.napi.armIfResult(task, key, value, action.kind, action.id);
+  }
+
+  /** Record `task`'s result `key = value` for IfResult evaluation. */
+  recordResult(task: bigint, key: string, value: string): void {
+    this.napi.recordResult(task, key, value);
+  }
+
+  /** `task` changed: return the fired actions (evaluated against the
+   *  bound adapter's current state). */
+  onTaskChange(task: bigint, tick?: bigint): TriggerAction[] {
+    return this.napi.onTaskChange(task, tick ?? null);
+  }
+
+  /** Arm AtTick(tick) -> action (fires once the clock reaches `tick`). */
+  armAtTick(tick: bigint, action: TriggerAction): void {
+    this.napi.armAtTick(tick, action.kind, action.id);
+  }
+
+  /** The clock advanced to `now`: return the AtTick actions now due. */
+  onTick(now: bigint): TriggerAction[] {
+    return this.napi.onTick(now);
+  }
+
+  /** Total armed (not-yet-fired) triggers. */
+  armedCount(): number {
+    return this.napi.armedCount();
   }
 }

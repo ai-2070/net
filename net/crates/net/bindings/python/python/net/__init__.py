@@ -85,9 +85,16 @@ try:
         RedexEvent,
         RedexFile,
         RedexTailIter,
+        JoinResult,
+        ShardGroup,
         Task,
         TasksAdapter,
         TaskWatchIter,
+        TriggerAction,
+        TriggerEngine,
+        WorkflowAdapter,
+        WorkflowStatusCounts,
+        WorkflowTaskState,
     )
 except ImportError:
     # `cortex` feature not compiled in; symbols stay undefined.
@@ -112,9 +119,16 @@ else:
             "RedexEvent",
             "RedexFile",
             "RedexTailIter",
+            "JoinResult",
+            "ShardGroup",
             "Task",
             "TasksAdapter",
             "TaskWatchIter",
+            "TriggerAction",
+            "TriggerEngine",
+            "WorkflowAdapter",
+            "WorkflowStatusCounts",
+            "WorkflowTaskState",
         ]
     )
 

@@ -1084,6 +1084,56 @@ mod mesh_bindings {
         channel_configs: Arc<ChannelConfigRegistry>,
     }
 
+    /// Build the core `MatchCriteria` from flat Python kwargs (so callers
+    /// never touch the internal `CapabilityQuery` / policy enum shapes).
+    #[allow(clippy::too_many_arguments)]
+    fn build_gang_criteria(
+        tags_all: Vec<String>,
+        min_gpus: Option<usize>,
+        max_load: Option<f64>,
+        max_p50_latency_us: Option<u32>,
+        require_warm_model: Option<u64>,
+        selection: Option<String>,
+        load_band_target: Option<f64>,
+        prefer_warm_model: Option<u64>,
+    ) -> PyResult<::net::adapter::net::behavior::gang::MatchCriteria> {
+        use ::net::adapter::net::behavior::fold::{CapabilityFilter, CapabilityQuery};
+        use ::net::adapter::net::behavior::gang::{MatchCriteria, NumericFilter, SelectionPolicy};
+        let sel = match selection.as_deref() {
+            None | Some("least_loaded") => SelectionPolicy::LeastLoaded,
+            Some("pack") => SelectionPolicy::Pack,
+            Some("lowest_id") => SelectionPolicy::LowestId,
+            Some("load_band") => SelectionPolicy::LoadBand(load_band_target.unwrap_or(0.5) as f32),
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown selection policy {other:?}"
+                )))
+            }
+        };
+        Ok(MatchCriteria {
+            capability: CapabilityQuery::Composite(CapabilityFilter {
+                tags_all,
+                ..Default::default()
+            }),
+            numeric: NumericFilter {
+                min_gpus: min_gpus.unwrap_or(0),
+                max_load: max_load.map(|v| v as f32),
+                max_p50_latency_us,
+                require_warm_model,
+            },
+            selection: sel,
+            prefer_warm_model,
+        })
+    }
+
+    fn claim_outcome_str(o: ::net::adapter::net::behavior::gang::ClaimOutcome) -> &'static str {
+        use ::net::adapter::net::behavior::gang::ClaimOutcome;
+        match o {
+            ClaimOutcome::Won => "won",
+            ClaimOutcome::Lost => "lost",
+        }
+    }
+
     #[pymethods]
     impl NetMesh {
         /// Create a new mesh node.
@@ -1821,6 +1871,127 @@ mod mesh_bindings {
             let core = super::capabilities::capability_set_from_py(caps)?;
             py.detach(|| self.runtime.block_on(node.announce_capabilities(core)))
                 .map_err(|e| PyRuntimeError::new_err(format!("capability: {}", e)))
+        }
+
+        // ---- Gang-claim GPU-island scheduler ----
+
+        /// Publish this node's island-topology record (its host is
+        /// forced to this node). Self-indexed locally so the node's own
+        /// scheduler sees it, then broadcast; returns the peer count.
+        fn publish_island_topology(
+            &self,
+            py: Python<'_>,
+            id: u64,
+            gpus: Vec<u32>,
+            warm_models: Vec<u64>,
+            load: f64,
+            p50_latency_us: u32,
+        ) -> PyResult<usize> {
+            use ::net::adapter::net::behavior::fold::{GpuSet, IslandRecord};
+            let node = self.get_node()?;
+            let record = IslandRecord {
+                id,
+                gpus: GpuSet::new(gpus),
+                host: 0, // forced to this node by publish
+                warm_models,
+                load: load as f32,
+                p50_latency_us,
+            };
+            py.detach(|| self.runtime.block_on(node.publish_island_topology(record)))
+                .map_err(|e| PyRuntimeError::new_err(format!("gang: {}", e)))
+        }
+
+        /// Match GPU islands against the criteria over this node's
+        /// folds (read-only; no claim). Best island first.
+        #[pyo3(signature = (tags_all, min_gpus=None, max_load=None, max_p50_latency_us=None, require_warm_model=None, selection=None, load_band_target=None, prefer_warm_model=None))]
+        #[allow(clippy::too_many_arguments)]
+        fn match_gpu_islands(
+            &self,
+            tags_all: Vec<String>,
+            min_gpus: Option<usize>,
+            max_load: Option<f64>,
+            max_p50_latency_us: Option<u32>,
+            require_warm_model: Option<u64>,
+            selection: Option<String>,
+            load_band_target: Option<f64>,
+            prefer_warm_model: Option<u64>,
+        ) -> PyResult<Vec<u64>> {
+            let node = self.get_node()?;
+            let mc = build_gang_criteria(
+                tags_all,
+                min_gpus,
+                max_load,
+                max_p50_latency_us,
+                require_warm_model,
+                selection,
+                load_band_target,
+                prefer_warm_model,
+            )?;
+            Ok(node.match_gpu_islands(&mc))
+        }
+
+        /// Reserve `island` until `until_unix_us` (wall-clock micros).
+        /// Returns `"won"` / `"lost"`.
+        fn reserve_island(
+            &self,
+            py: Python<'_>,
+            island: u64,
+            until_unix_us: u64,
+        ) -> PyResult<String> {
+            let node = self.get_node()?;
+            let outcome = py
+                .detach(|| {
+                    self.runtime
+                        .block_on(node.reserve_island(island, until_unix_us))
+                })
+                .map_err(|e| PyRuntimeError::new_err(format!("gang: {}", e)))?;
+            Ok(claim_outcome_str(outcome).to_string())
+        }
+
+        /// Release `island` this node holds. Returns `"won"` / `"lost"`
+        /// (`"lost"` if this node wasn't the holder).
+        fn release_island(&self, py: Python<'_>, island: u64) -> PyResult<String> {
+            let node = self.get_node()?;
+            let outcome = py
+                .detach(|| self.runtime.block_on(node.release_island(island)))
+                .map_err(|e| PyRuntimeError::new_err(format!("gang: {}", e)))?;
+            Ok(claim_outcome_str(outcome).to_string())
+        }
+
+        /// Match + reserve the first available island in one call.
+        /// Returns its id, or `None` when nothing matched / all
+        /// contended.
+        #[pyo3(signature = (tags_all, until_unix_us, min_gpus=None, max_load=None, max_p50_latency_us=None, require_warm_model=None, selection=None, load_band_target=None, prefer_warm_model=None))]
+        #[allow(clippy::too_many_arguments)]
+        fn claim_gpu_island(
+            &self,
+            py: Python<'_>,
+            tags_all: Vec<String>,
+            until_unix_us: u64,
+            min_gpus: Option<usize>,
+            max_load: Option<f64>,
+            max_p50_latency_us: Option<u32>,
+            require_warm_model: Option<u64>,
+            selection: Option<String>,
+            load_band_target: Option<f64>,
+            prefer_warm_model: Option<u64>,
+        ) -> PyResult<Option<u64>> {
+            let node = self.get_node()?;
+            let mc = build_gang_criteria(
+                tags_all,
+                min_gpus,
+                max_load,
+                max_p50_latency_us,
+                require_warm_model,
+                selection,
+                load_band_target,
+                prefer_warm_model,
+            )?;
+            py.detach(|| {
+                self.runtime
+                    .block_on(node.claim_gpu_island(&mc, until_unix_us))
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("gang: {}", e)))
         }
 
         /// **Test-only** helper for the groups test suite.
@@ -2935,6 +3106,13 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<cortex::PyTaskWatchIter>()?;
         m.add_class::<cortex::PyAsyncTasksAdapter>()?;
         m.add_class::<cortex::PyAsyncTaskWatchIter>()?;
+        m.add_class::<cortex::PyWorkflowAdapter>()?;
+        m.add_class::<cortex::PyWorkflowTaskState>()?;
+        m.add_class::<cortex::PyWorkflowStatusCounts>()?;
+        m.add_class::<cortex::PyShardGroup>()?;
+        m.add_class::<cortex::PyJoinResult>()?;
+        m.add_class::<cortex::PyTriggerEngine>()?;
+        m.add_class::<cortex::PyTriggerAction>()?;
         m.add_class::<cortex::PyMemory>()?;
         m.add_class::<cortex::PyMemoriesAdapter>()?;
         m.add_class::<cortex::PyMemoryWatchIter>()?;

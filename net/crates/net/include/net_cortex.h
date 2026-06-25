@@ -34,6 +34,9 @@ typedef struct net_redex_file_s      net_redex_file_t;
 typedef struct net_redex_tail_s      net_redex_tail_t;
 typedef struct net_tasks_adapter_s   net_tasks_adapter_t;
 typedef struct net_tasks_watch_s     net_tasks_watch_t;
+typedef struct net_workflow_adapter_s net_workflow_adapter_t;
+typedef struct net_shard_group_s     net_shard_group_t;
+typedef struct net_trigger_engine_s  net_trigger_engine_t;
 typedef struct net_memories_adapter_s net_memories_adapter_t;
 typedef struct net_memories_watch_s  net_memories_watch_t;
 typedef struct net_netdb_s           net_netdb_t;
@@ -87,6 +90,112 @@ int  net_tasks_snapshot_and_watch(net_tasks_adapter_t* handle,
 int  net_tasks_watch_next(net_tasks_watch_t* cursor, uint32_t timeout_ms,
                           char** out_json, size_t* out_len);
 void net_tasks_watch_free(net_tasks_watch_t* cursor);
+
+/* ---- Task lifecycle (WorkflowAdapter) ----
+ *
+ * A single-writer RedEX chain folded into per-task { step, status,
+ * attempts }. Status is a small integer code on the wire:
+ *   0 submitted | 1 running | 2 waiting | 3 blocked | 4 done | 5 failed
+ * Each transition entry returns the RedEX append sequence in *out_seq.
+ */
+typedef struct {
+    uint64_t submitted;
+    uint64_t running;
+    uint64_t waiting;
+    uint64_t blocked;
+    uint64_t done;
+    uint64_t failed;
+} net_workflow_status_counts_t;
+
+int  net_workflow_adapter_open(net_redex_t* redex, uint64_t origin_hash,
+                               int persistent,
+                               net_workflow_adapter_t** out_handle);
+void net_workflow_adapter_free(net_workflow_adapter_t* handle);
+
+int  net_workflow_submit(net_workflow_adapter_t* handle, uint64_t id, uint64_t* out_seq);
+int  net_workflow_start(net_workflow_adapter_t* handle, uint64_t id, uint64_t* out_seq);
+int  net_workflow_wait(net_workflow_adapter_t* handle, uint64_t id, uint64_t* out_seq);
+int  net_workflow_block(net_workflow_adapter_t* handle, uint64_t id, uint64_t* out_seq);
+int  net_workflow_complete(net_workflow_adapter_t* handle, uint64_t id, uint64_t* out_seq);
+int  net_workflow_fail(net_workflow_adapter_t* handle, uint64_t id, uint64_t* out_seq);
+int  net_workflow_advance(net_workflow_adapter_t* handle, uint64_t id, uint64_t* out_seq);
+int  net_workflow_retry(net_workflow_adapter_t* handle, uint64_t id, uint64_t* out_seq);
+int  net_workflow_delete(net_workflow_adapter_t* handle, uint64_t id, uint64_t* out_seq);
+int  net_workflow_link(net_workflow_adapter_t* handle, uint64_t parent,
+                       uint64_t child, uint64_t* out_seq);
+int  net_workflow_request_cancel(net_workflow_adapter_t* handle, uint64_t id,
+                                 uint64_t* out_seq);
+
+int  net_workflow_get(net_workflow_adapter_t* handle, uint64_t id,
+                      int* out_found, uint32_t* out_step,
+                      int* out_status, uint32_t* out_attempts);
+int  net_workflow_is_cancel_requested(net_workflow_adapter_t* handle, uint64_t id,
+                                      int* out_bool);
+int  net_workflow_status_counts(net_workflow_adapter_t* handle,
+                                net_workflow_status_counts_t* out);
+int  net_workflow_wait_for_seq(net_workflow_adapter_t* handle, uint64_t seq,
+                               uint32_t timeout_ms);
+
+/* ---- Tier 2: shards (fan-out / fan-in) ----
+ * try_join's *out_kind: 0 submitted (reduce at *out_seq) | 1 already |
+ * 2 pending | 3 failed (up to `cap` failed ids in out_failed, total in
+ * *out_failed_count). */
+int  net_shard_group_new(const uint64_t* shards, size_t n, uint64_t reduce,
+                         net_shard_group_t** out_handle);
+void net_shard_group_free(net_shard_group_t* handle);
+int  net_workflow_fan_out(net_workflow_adapter_t* handle,
+                          net_shard_group_t* group, uint64_t* out_seq);
+int  net_workflow_try_join(net_workflow_adapter_t* handle,
+                           net_shard_group_t* group, int* out_kind,
+                           uint64_t* out_seq, uint64_t* out_failed, size_t cap,
+                           size_t* out_failed_count);
+
+/* ---- Tier 2: triggers ----
+ * Bound to a WorkflowAdapter (reads its state internally). Actions are
+ * (kind, id) pairs: kind 0 = submit, 1 = start. on_task_change / on_tick
+ * fill the parallel out_kinds[]/out_ids[] up to `cap`, total in *out_count.
+ *
+ * IMPORTANT: on_task_change and on_tick are CONSUMING and SINGLE-SHOT —
+ * they fire AND disarm the matching triggers on every call, whether or not
+ * the out-buffers are NULL. Do NOT size them with a "probe with NULL to
+ * learn *out_count, then fill" two-pass (the safe idiom for the read-only
+ * getters net_workflow_subtree / net_mesh_match_gpu_islands): the probe
+ * pass would fire + discard the actions and the fill pass would find
+ * nothing armed. Size the buffer up front (net_trigger_armed_count is an
+ * upper bound — fired is a subset of armed) and call ONCE. If *out_count
+ * exceeds `cap` the surplus actions are lost (they were already
+ * disarmed), so never under-size the buffer. */
+int  net_trigger_engine_new(net_workflow_adapter_t* handle,
+                            net_trigger_engine_t** out_handle);
+void net_trigger_engine_free(net_trigger_engine_t* handle);
+int  net_trigger_arm_after_task(net_trigger_engine_t* handle, uint64_t task,
+                                int action_kind, uint64_t action_id);
+int  net_trigger_arm_after_terminal(net_trigger_engine_t* handle, uint64_t task,
+                                    int action_kind, uint64_t action_id);
+int  net_trigger_on_task_change(net_trigger_engine_t* handle, uint64_t task,
+                                uint64_t tick, int* out_kinds, uint64_t* out_ids,
+                                size_t cap, size_t* out_count);
+int  net_trigger_armed_count(net_trigger_engine_t* handle, size_t* out);
+int  net_trigger_arm_at_tick(net_trigger_engine_t* handle, uint64_t tick,
+                             int action_kind, uint64_t action_id);
+int  net_trigger_arm_if_result(net_trigger_engine_t* handle, uint64_t task,
+                               const char* key, const char* value,
+                               int action_kind, uint64_t action_id);
+int  net_trigger_record_result(net_trigger_engine_t* handle, uint64_t task,
+                               const char* key, const char* value);
+int  net_trigger_on_tick(net_trigger_engine_t* handle, uint64_t now,
+                         int* out_kinds, uint64_t* out_ids, size_t cap,
+                         size_t* out_count);
+int  net_workflow_subtree(net_workflow_adapter_t* handle, uint64_t id,
+                          uint64_t* out_ids, size_t cap, size_t* out_count);
+int  net_workflow_snapshot(net_workflow_adapter_t* handle, uint8_t* out_bytes,
+                           size_t cap, size_t* out_len, uint64_t* out_last_seq,
+                           int* out_has_last_seq);
+int  net_workflow_open_from_snapshot(net_redex_t* redex, uint64_t origin_hash,
+                                     int persistent, const uint8_t* state_bytes,
+                                     size_t state_len, uint64_t last_seq,
+                                     int has_last_seq,
+                                     net_workflow_adapter_t** out_handle);
 
 /* ---- Memories adapter ---- */
 int  net_memories_adapter_open(net_redex_t* redex, uint64_t origin_hash,

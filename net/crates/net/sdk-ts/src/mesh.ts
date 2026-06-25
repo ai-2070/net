@@ -37,6 +37,15 @@
  */
 
 import { NetMesh as NapiNetMesh } from '@net-mesh/core';
+import type { GpuIslandCriteria, IslandTopologyInput } from '@net-mesh/core';
+
+export type { GpuIslandCriteria, IslandTopologyInput } from '@net-mesh/core';
+
+/** Outcome of a reserve/release/claim. */
+export type ClaimOutcome = 'won' | 'lost';
+
+/** Selection policy for {@link MeshNode.matchGpuIslands}. */
+export type GpuSelectionPolicy = 'least_loaded' | 'pack' | 'load_band' | 'lowest_id';
 
 import { setNapiMesh } from './_internal.js';
 import {
@@ -575,6 +584,55 @@ export class MeshNode {
    */
   findNodes(filter: CapabilityFilter): bigint[] {
     return this.native.findNodes(capabilityFilterToNapi(filter));
+  }
+
+  // ---- Gang-claim GPU-island scheduler ----
+  //
+  // The peer-aware Thunderdome surface. `Reserved` is optimistic/AP;
+  // the CP `→ Active` commit is a separate (Rust-only) primitive.
+
+  /**
+   * Publish this node's island-topology record (its `host` is forced
+   * to this node). Self-indexed locally so this node's own scheduler
+   * sees it, then broadcast to peers; returns the peer fan-out count.
+   */
+  async publishIslandTopology(island: IslandTopologyInput): Promise<number> {
+    return this.native.publishIslandTopology(island);
+  }
+
+  /**
+   * Match GPU islands against `criteria` over this node's capability +
+   * island folds (read-only; no claim). Best island first. Empty when
+   * nothing matched.
+   */
+  matchGpuIslands(criteria: GpuIslandCriteria): bigint[] {
+    return this.native.matchGpuIslands(criteria);
+  }
+
+  /**
+   * Reserve `island` (optimistic AP CAS) until `untilUnixUs`
+   * (wall-clock micros). `'won'` if this node now holds it, `'lost'`
+   * if already held by someone with a live reservation.
+   */
+  async reserveIsland(island: bigint, untilUnixUs: bigint): Promise<ClaimOutcome> {
+    return (await this.native.reserveIsland(island, untilUnixUs)) as ClaimOutcome;
+  }
+
+  /**
+   * Release `island` this node holds. `'lost'` if this node wasn't the
+   * holder.
+   */
+  async releaseIsland(island: bigint): Promise<ClaimOutcome> {
+    return (await this.native.releaseIsland(island)) as ClaimOutcome;
+  }
+
+  /**
+   * Match + reserve the first available island in one call. Returns
+   * its id, or `null` when nothing matched or every match was
+   * contended in this node's view.
+   */
+  async claimGpuIsland(criteria: GpuIslandCriteria, untilUnixUs: bigint): Promise<bigint | null> {
+    return this.native.claimGpuIsland(criteria, untilUnixUs);
   }
 
   /**
