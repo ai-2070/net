@@ -99,3 +99,12 @@ pub use ::net::adapter::net::cortex::memories::OrderBy as MemoriesOrderBy;
 // ---- NetDb facade ----------------------------------------------------------
 
 pub use ::net::adapter::net::netdb::{NetDb, NetDbBuilder, NetDbError, NetDbSnapshot};
+
+// ---- Task lifecycle (workflow) ---------------------------------------------
+
+/// Task-lifecycle orchestration ([`WorkflowAdapter`](workflow::WorkflowAdapter)).
+///
+/// Namespaced under `workflow` rather than flattened here because its
+/// `TaskId` / `TaskStatus` would otherwise collide with the cortex
+/// *tasks* model re-exported above.
+pub mod workflow;
