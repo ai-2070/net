@@ -106,12 +106,15 @@ pub fn match_islands(
     if hosts.is_empty() {
         return Vec::new();
     }
-    // [2] live island records on those hosts, numeric-filtered.
+    // [2] live island records on those hosts, numeric-filtered. The
+    // HostedByAny query filters by host inside the fold's single scan,
+    // so only candidate-host islands are cloned (not the whole
+    // topology, then discarded) — this runs on every claim retry.
     let candidates: Vec<IslandRecord> = topology_fold
-        .query(IslandQuery::All)
+        .query(IslandQuery::HostedByAny(hosts))
         .into_iter()
         .map(|(_, record)| record)
-        .filter(|record| hosts.contains(&record.host) && criteria.numeric.accepts(record))
+        .filter(|record| criteria.numeric.accepts(record))
         .collect();
     // [3] selection ordering (with soft warm-model affinity) → claim
     // order.

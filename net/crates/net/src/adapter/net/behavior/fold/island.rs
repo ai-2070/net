@@ -140,6 +140,12 @@ pub enum IslandQuery {
     /// capability match (which is keyed by host node) onto the
     /// islands that node offers.
     HostedBy(NodeId),
+    /// Every island hosted by any node in the set — the batched form
+    /// of [`HostedBy`](Self::HostedBy) for the scheduler's
+    /// candidate-host match. One scan clones only islands on candidate
+    /// hosts, instead of cloning the whole topology and discarding the
+    /// majority (the `All`-then-filter path it replaces).
+    HostedByAny(std::collections::HashSet<NodeId>),
 }
 
 /// One row in an [`IslandQuery`] result: the island id plus its
@@ -194,6 +200,14 @@ impl FoldKind for IslandTopologyFold {
         if incoming.payload.host != incoming.node_id {
             return MergeAction::Reject;
         }
+        // A non-finite live `load` (NaN/Inf) would make the selection
+        // comparator (filter::policy_cmp, partial_cmp→Equal) non-total
+        // and corrupt claim ordering. The axes are advisory — the
+        // reservation CAS is the real arbiter — but keep them sane so a
+        // buggy/hostile host can't silently scramble placement.
+        if !incoming.payload.load.is_finite() {
+            return MergeAction::Reject;
+        }
         match existing {
             None => MergeAction::Insert,
             Some(entry) => {
@@ -231,6 +245,12 @@ impl FoldKind for IslandTopologyFold {
                 .entries
                 .iter()
                 .filter(|(_, e)| e.payload.host == host)
+                .map(|(k, e)| (*k, e.payload.clone()))
+                .collect(),
+            IslandQuery::HostedByAny(hosts) => state
+                .entries
+                .iter()
+                .filter(|(_, e)| hosts.contains(&e.payload.host))
                 .map(|(k, e)| (*k, e.payload.clone()))
                 .collect(),
         }
@@ -391,6 +411,41 @@ mod tests {
             .collect();
         by_a.sort();
         assert_eq!(by_a, vec![0x10, 0x11]);
+
+        // HostedByAny is the batched form: islands on any host in the
+        // set, in one scan (review #12).
+        let hosts: std::collections::HashSet<NodeId> = [0xAA, 0xBB].into_iter().collect();
+        let mut any: Vec<IslandId> = fold
+            .query(IslandQuery::HostedByAny(hosts))
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        any.sort();
+        assert_eq!(any, vec![0x10, 0x11, 0x20]);
+        // A host not in the set contributes nothing.
+        let only_b: std::collections::HashSet<NodeId> = [0xBB].into_iter().collect();
+        assert_eq!(
+            fold.query(IslandQuery::HostedByAny(only_b))
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec![0x20],
+        );
+    }
+
+    /// A non-finite live `load` is rejected so it can't make the
+    /// selection comparator non-total (review, advisory).
+    #[test]
+    fn non_finite_load_is_rejected() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let outcome = fold
+                .apply(sign_island(&kp, 0xAA, 1, record(0x10, 0xAA, bad)))
+                .expect("apply");
+            assert_eq!(outcome, ApplyOutcome::Rejected, "load {bad} rejected");
+        }
+        assert!(fold.query(IslandQuery::Get(0x10)).is_empty());
     }
 
     #[test]
