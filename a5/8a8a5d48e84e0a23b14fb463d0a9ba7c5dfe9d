@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/MESH_SCHEDULER_CODE_REVIEW.md
+  s_58a23d9389d6ed::t_e19525ca2902f8 1-232
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.11",
+  "base_commit_sha": "a58a8a5d48e84e0a23b14fb463d0a9ba7c5dfe9d",
+  "prompts": {},
+  "sessions": {
+    "s_58a23d9389d6ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92186006-b4bc-4409-9b64-7b1fa8e6ebfa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
