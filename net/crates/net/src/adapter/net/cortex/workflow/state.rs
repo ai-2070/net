@@ -123,9 +123,13 @@ impl WorkflowState {
     /// Deterministic order (BFS).
     pub fn descendants(&self, id: TaskId) -> Vec<TaskId> {
         let mut out = Vec::new();
+        // `seen` makes the cycle guard O(1) per node; `out` keeps the
+        // deterministic BFS order. A `Vec::contains` guard would be
+        // O(n²) over a wide/deep subtree (a delete walks the whole set).
+        let mut seen = std::collections::HashSet::new();
         let mut queue = std::collections::VecDeque::from(self.children_of(id).to_vec());
         while let Some(t) = queue.pop_front() {
-            if out.contains(&t) {
+            if !seen.insert(t) {
                 continue; // cycle guard (lineage should be a forest)
             }
             out.push(t);
