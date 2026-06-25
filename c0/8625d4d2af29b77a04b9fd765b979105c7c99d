@@ -1,0 +1,27 @@
+net/crates/net/sdk-ts/src/cortex.ts
+  s_58a23d9389d6ed::t_5e7e794adfdccc 1064-1073
+net/crates/net/bindings/python/src/cortex.rs
+  s_58a23d9389d6ed::t_06adabb1068d47 3908-3927
+net/crates/net/bindings/node/src/cortex.rs
+  s_58a23d9389d6ed::t_8d1a568225249f 2720-2740
+net/crates/net/sdk-ts/test/workflow.test.ts
+  s_58a23d9389d6ed::t_8040e9c7197062 86-95
+net/crates/net/bindings/python/tests/test_scheduler.py
+  s_58a23d9389d6ed::t_99231f6f0555e0 120-130
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "c08625d4d2af29b77a04b9fd765b979105c7c99d",
+  "prompts": {},
+  "sessions": {
+    "s_58a23d9389d6ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92186006-b4bc-4409-9b64-7b1fa8e6ebfa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
