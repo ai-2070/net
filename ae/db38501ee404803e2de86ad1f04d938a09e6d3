@@ -1,0 +1,28 @@
+net/crates/net/bindings/node/src/lib.rs
+  s_58a23d9389d6ed::t_2eb9fa0c6f0e0d 26-27
+net/crates/net/bindings/node/src/gang.rs
+  s_58a23d9389d6ed::t_c64c34722acc41 1-180
+net/crates/net/sdk-ts/src/index.ts
+  s_58a23d9389d6ed::t_3a81fd9b6b910a 58-61
+net/crates/net/sdk-ts/src/mesh.ts
+  s_58a23d9389d6ed::t_8099b32d75fd6a 589-637
+  s_58a23d9389d6ed::t_6d6558c047c46a 40-48
+net/crates/net/sdk-ts/test/gang.test.ts
+  s_58a23d9389d6ed::t_792620bc69c668 1-49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "aedb38501ee404803e2de86ad1f04d938a09e6d3",
+  "prompts": {},
+  "sessions": {
+    "s_58a23d9389d6ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92186006-b4bc-4409-9b64-7b1fa8e6ebfa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
