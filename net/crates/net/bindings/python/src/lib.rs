@@ -1089,10 +1089,13 @@ mod mesh_bindings {
     #[allow(clippy::too_many_arguments)]
     fn build_gang_criteria(
         tags_all: Vec<String>,
+        tags_any: Vec<String>,
+        tag_groups_all: Vec<Vec<String>>,
         min_units: Option<usize>,
         max_load: Option<f64>,
         max_p50_latency_us: Option<u32>,
-        require_capabilities: Vec<String>,
+        require_all: Vec<String>,
+        require_any: Vec<String>,
         selection: Option<String>,
         load_band_target: Option<f64>,
         prefer_capability: Option<String>,
@@ -1113,13 +1116,16 @@ mod mesh_bindings {
         Ok(MatchCriteria {
             capability: CapabilityQuery::Composite(CapabilityFilter {
                 tags_all,
+                tags_any,
+                tag_groups_all,
                 ..Default::default()
             }),
             numeric: NumericFilter {
                 min_units: min_units.unwrap_or(0),
                 max_load: max_load.map(|v| v as f32),
                 max_p50_latency_us,
-                require_capabilities,
+                require_all,
+                require_any,
             },
             selection: sel,
             prefer_capability,
@@ -1903,16 +1909,21 @@ mod mesh_bindings {
         }
 
         /// Match islands against the criteria over this node's folds
-        /// (read-only; no claim). Best island first.
-        #[pyo3(signature = (tags_all, min_units=None, max_load=None, max_p50_latency_us=None, require_capabilities=Vec::new(), selection=None, load_band_target=None, prefer_capability=None))]
+        /// (read-only; no claim). Best island first. `tags_*` filter the
+        /// host capability match; `require_*` filter the island's
+        /// resident capabilities.
+        #[pyo3(signature = (tags_all, tags_any=Vec::new(), tag_groups_all=Vec::new(), min_units=None, max_load=None, max_p50_latency_us=None, require_all=Vec::new(), require_any=Vec::new(), selection=None, load_band_target=None, prefer_capability=None))]
         #[allow(clippy::too_many_arguments)]
         fn match_islands(
             &self,
             tags_all: Vec<String>,
+            tags_any: Vec<String>,
+            tag_groups_all: Vec<Vec<String>>,
             min_units: Option<usize>,
             max_load: Option<f64>,
             max_p50_latency_us: Option<u32>,
-            require_capabilities: Vec<String>,
+            require_all: Vec<String>,
+            require_any: Vec<String>,
             selection: Option<String>,
             load_band_target: Option<f64>,
             prefer_capability: Option<String>,
@@ -1920,10 +1931,13 @@ mod mesh_bindings {
             let node = self.get_node()?;
             let mc = build_gang_criteria(
                 tags_all,
+                tags_any,
+                tag_groups_all,
                 min_units,
                 max_load,
                 max_p50_latency_us,
-                require_capabilities,
+                require_all,
+                require_any,
                 selection,
                 load_band_target,
                 prefer_capability,
@@ -1962,17 +1976,20 @@ mod mesh_bindings {
         /// Match + reserve the first available island in one call.
         /// Returns its id, or `None` when nothing matched / all
         /// contended.
-        #[pyo3(signature = (tags_all, until_unix_us, min_units=None, max_load=None, max_p50_latency_us=None, require_capabilities=Vec::new(), selection=None, load_band_target=None, prefer_capability=None))]
+        #[pyo3(signature = (tags_all, until_unix_us, tags_any=Vec::new(), tag_groups_all=Vec::new(), min_units=None, max_load=None, max_p50_latency_us=None, require_all=Vec::new(), require_any=Vec::new(), selection=None, load_band_target=None, prefer_capability=None))]
         #[allow(clippy::too_many_arguments)]
         fn claim_island(
             &self,
             py: Python<'_>,
             tags_all: Vec<String>,
             until_unix_us: u64,
+            tags_any: Vec<String>,
+            tag_groups_all: Vec<Vec<String>>,
             min_units: Option<usize>,
             max_load: Option<f64>,
             max_p50_latency_us: Option<u32>,
-            require_capabilities: Vec<String>,
+            require_all: Vec<String>,
+            require_any: Vec<String>,
             selection: Option<String>,
             load_band_target: Option<f64>,
             prefer_capability: Option<String>,
@@ -1980,10 +1997,13 @@ mod mesh_bindings {
             let node = self.get_node()?;
             let mc = build_gang_criteria(
                 tags_all,
+                tags_any,
+                tag_groups_all,
                 min_units,
                 max_load,
                 max_p50_latency_us,
-                require_capabilities,
+                require_all,
+                require_any,
                 selection,
                 load_band_target,
                 prefer_capability,

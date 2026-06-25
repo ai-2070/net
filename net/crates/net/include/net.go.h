@@ -349,12 +349,15 @@ int      net_mesh_start(net_meshnode_t* handle);
  * (a GPU NVLink domain is the motivating instance). GPU specifics ride
  * plain capability tags, e.g. "gpu:h100" / "model:<hex>".
  *
- * `criteria_json`:
- *   { "tags_all": ["gpu:h100"],   // capability tags every host must carry
+ * `criteria_json` (host match: tags_*; island resident match: require_*):
+ *   { "tags_all": ["gpu:h100"],   // host must carry ALL (AND)
+ *     "tags_any": ["zone:a","zone:b"], // host carries >=1 (OR), optional
+ *     "tag_groups_all": [["a","b"],["c"]], // >=1 per group (AND of ORs), opt
  *     "min_units": 8,             // optional
  *     "max_load": 0.8,           // optional (0.0..=1.0)
  *     "max_p50_latency_us": 5000, // optional
- *     "require_capabilities": ["model:2a"], // optional (resident tags, AND)
+ *     "require_all": ["model:2a"],  // island resident tags, ALL (AND), opt
+ *     "require_any": ["model:2a","model:2b"], // resident, >=1 (OR), opt
  *     "selection": "least_loaded",// least_loaded|pack|load_band|lowest_id
  *     "load_band_target": 0.5,    // for the load_band policy
  *     "prefer_capability": "model:2a" } // optional (soft affinity tag)

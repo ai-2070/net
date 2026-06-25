@@ -3597,8 +3597,14 @@ pub(crate) const NET_ERR_GANG_INVALID: c_int = -140;
 /// `CapabilityQuery` / policy enum shapes.
 #[derive(Deserialize)]
 struct GangCriteriaJson {
+    // Host capability match (step 1) — mirrors `CapabilityFilter`.
     #[serde(default)]
     tags_all: Vec<String>,
+    #[serde(default)]
+    tags_any: Vec<String>,
+    #[serde(default)]
+    tag_groups_all: Vec<Vec<String>>,
+    // Live island numeric filter (step 2).
     #[serde(default)]
     min_units: usize,
     #[serde(default)]
@@ -3606,7 +3612,9 @@ struct GangCriteriaJson {
     #[serde(default)]
     max_p50_latency_us: Option<u32>,
     #[serde(default)]
-    require_capabilities: Vec<String>,
+    require_all: Vec<String>,
+    #[serde(default)]
+    require_any: Vec<String>,
     #[serde(default)]
     selection: Option<String>,
     #[serde(default)]
@@ -3645,13 +3653,16 @@ fn build_gang_criteria(
     Some(MatchCriteria {
         capability: CapabilityQuery::Composite(CapabilityFilter {
             tags_all: c.tags_all,
+            tags_any: c.tags_any,
+            tag_groups_all: c.tag_groups_all,
             ..Default::default()
         }),
         numeric: NumericFilter {
             min_units: c.min_units,
             max_load: c.max_load,
             max_p50_latency_us: c.max_p50_latency_us,
-            require_capabilities: c.require_capabilities,
+            require_all: c.require_all,
+            require_any: c.require_any,
         },
         selection,
         prefer_capability: c.prefer_capability,
