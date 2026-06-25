@@ -1,0 +1,32 @@
+net/crates/net/bindings/python/tests/test_scheduler.py
+  s_58a23d9389d6ed::t_d10ee1d731dc79 81-119
+  s_58a23d9389d6ed::t_4208c010c71b57 12
+net/crates/net/bindings/python/src/lib.rs
+  s_58a23d9389d6ed::t_4649c2b6f08641 3106-3109
+net/crates/net/bindings/python/python/net/__init__.py
+  s_58a23d9389d6ed::t_c3c510af6747a3 122-123,127-128
+  s_58a23d9389d6ed::t_9959e23054fdc7 88-89,93-94
+net/crates/net/sdk-py/src/net_sdk/cortex.py
+  s_58a23d9389d6ed::t_a8d05197222f0d 45-48
+  s_58a23d9389d6ed::t_b7cf90f1904301 81-84
+net/crates/net/bindings/python/src/cortex.rs
+  s_58a23d9389d6ed::t_4e14208818f156 3735-3769
+  s_58a23d9389d6ed::t_b3602953a401d9 3786-3912
+  s_58a23d9389d6ed::t_a4dbd74b9b6c8d 27,29-31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "75e0a5cda1727ab5db33febd10a63541b9049120",
+  "prompts": {},
+  "sessions": {
+    "s_58a23d9389d6ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92186006-b4bc-4409-9b64-7b1fa8e6ebfa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
