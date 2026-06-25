@@ -1,9 +1,12 @@
 //! `WorkflowFold` — decodes `EventMeta` + payload, routes on dispatch,
 //! and applies the deterministic task-lifecycle state transition.
 //!
-//! The chain is single-writer (the task-lease holder), so the fold
-//! does not arbitrate concurrent transitions — it simply replays the
-//! writer's cursor advances. Same chain → same state.
+//! The chain is single-writer (the task-lease holder), so the fold does
+//! not arbitrate contention between writers — it replays the writer's
+//! cursor advances. It does enforce one structural invariant, though: a
+//! terminal task (`Done`/`Failed`) is never moved by a later transition
+//! or retry, so a duplicate / replayed / buggy-writer event can't
+//! resurrect a settled task. Same chain → same state.
 
 use super::super::super::redex::{RedexError, RedexEvent, RedexFold};
 use super::super::meta::{

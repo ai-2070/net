@@ -95,9 +95,11 @@ were doc + DST:
   no 4b seam exists in the code (the plan and code now agree).
 - **DST harness now includes partition-during-claim.** `tests/loom_models.rs` gained
   a loom model for the quorum-`Active` fence: two concurrent leaders at distinct
-  epochs race the commit, and under every interleaving at most one holds `Active`,
-  the higher epoch always wins (a stale ex-leader never strands the island), and the
-  epoch is monotonic. This complements `active.rs`'s deterministic brutal test #3.
+  epochs race the commit, and under every interleaving at most one holds `Active`
+  (no double-run) — a stale, strictly-lower epoch is fenced out of gathering a
+  quorum, while a live `Active` is **not** displaced by a higher-epoch leader
+  (it gets `LostReservation` — the holder-gated install), and the fence is
+  monotonic. This complements `active.rs`'s deterministic brutal test #3.
 - **§8 structural claims verified by reading** (the non-hardware part of the gating
   checklist): the epoch rides the `generation` with no parallel Raft term
   (`active.rs`), `ColocationStrict` pins the reservation-chain replicas to the §6
