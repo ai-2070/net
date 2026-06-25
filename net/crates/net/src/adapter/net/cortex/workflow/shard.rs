@@ -25,8 +25,11 @@ use super::types::{TaskId, TaskStatus};
 pub fn derive_shard_ids(parent: TaskId, count: usize) -> Vec<TaskId> {
     (0..count)
         .map(|k| {
-            let mut z = parent
-                .wrapping_add((k as u64).wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let mut z = parent.wrapping_add(
+                (k as u64)
+                    .wrapping_add(1)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            );
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             z ^ (z >> 31)
@@ -290,7 +293,10 @@ pub fn try_join_with(
     let (already, status) = {
         let state = wf.state();
         let guard = state.read();
-        (guard.contains(group.reduce()), group.join_status(&guard, policy))
+        (
+            guard.contains(group.reduce()),
+            group.join_status(&guard, policy),
+        )
     };
     if already {
         return Ok(Join::AlreadySubmitted);
@@ -357,8 +363,8 @@ pub fn block_on_failure(
 mod tests {
     use std::time::Duration;
 
-    use super::*;
     use super::super::types::TaskState;
+    use super::*;
     use crate::adapter::net::redex::Redex;
 
     fn done_state(ids: &[TaskId]) -> WorkflowState {
@@ -483,7 +489,10 @@ mod tests {
             other => panic!("expected Submitted, got {other:?}"),
         };
         wf.wait_for_seq(reduce_seq).await.unwrap();
-        assert!(wf.state().read().contains(99), "reduce submitted on all-done");
+        assert!(
+            wf.state().read().contains(99),
+            "reduce submitted on all-done"
+        );
         // Idempotent: a second try_join doesn't re-submit / reset it.
         assert_eq!(try_join(&wf, &group).unwrap(), Join::AlreadySubmitted);
         // The retried shard recorded its attempt.
@@ -520,27 +529,51 @@ mod tests {
             (3, TaskStatus::Running),
         ]);
         // One still running → not ready.
-        assert_eq!(group.join_status(&mixed, JoinPolicy::BestEffort), JoinStatus::Pending);
+        assert_eq!(
+            group.join_status(&mixed, JoinPolicy::BestEffort),
+            JoinStatus::Pending
+        );
         // All terminal (Done + Failed) → ready; reducer sees partials.
         let terminal = state_with(&[
             (1, TaskStatus::Done),
             (2, TaskStatus::Failed),
             (3, TaskStatus::Done),
         ]);
-        assert_eq!(group.join_status(&terminal, JoinPolicy::BestEffort), JoinStatus::Ready);
+        assert_eq!(
+            group.join_status(&terminal, JoinPolicy::BestEffort),
+            JoinStatus::Ready
+        );
     }
 
     #[test]
     fn threshold_joins_at_n_done_and_fails_once_unreachable() {
         let group = ShardGroup::new(vec![1, 2, 3], 9);
         // Need 2 of 3 Done. One Done, two running → pending.
-        let one = state_with(&[(1, TaskStatus::Done), (2, TaskStatus::Running), (3, TaskStatus::Running)]);
-        assert_eq!(group.join_status(&one, JoinPolicy::Threshold(2)), JoinStatus::Pending);
+        let one = state_with(&[
+            (1, TaskStatus::Done),
+            (2, TaskStatus::Running),
+            (3, TaskStatus::Running),
+        ]);
+        assert_eq!(
+            group.join_status(&one, JoinPolicy::Threshold(2)),
+            JoinStatus::Pending
+        );
         // Two Done → ready.
-        let two = state_with(&[(1, TaskStatus::Done), (2, TaskStatus::Done), (3, TaskStatus::Running)]);
-        assert_eq!(group.join_status(&two, JoinPolicy::Threshold(2)), JoinStatus::Ready);
+        let two = state_with(&[
+            (1, TaskStatus::Done),
+            (2, TaskStatus::Done),
+            (3, TaskStatus::Running),
+        ]);
+        assert_eq!(
+            group.join_status(&two, JoinPolicy::Threshold(2)),
+            JoinStatus::Ready
+        );
         // One Done, two Failed → only 1 can ever be Done < 2 → Failed.
-        let lost = state_with(&[(1, TaskStatus::Done), (2, TaskStatus::Failed), (3, TaskStatus::Failed)]);
+        let lost = state_with(&[
+            (1, TaskStatus::Done),
+            (2, TaskStatus::Failed),
+            (3, TaskStatus::Failed),
+        ]);
         assert_eq!(
             group.join_status(&lost, JoinPolicy::Threshold(2)),
             JoinStatus::Failed(vec![2, 3]),
@@ -572,14 +605,27 @@ mod tests {
             try_join(&wf, &group).unwrap(),
             Join::Failed(vec![shards[1]]),
         );
-        assert!(!wf.state().read().contains(99), "reduce never submitted on failure");
+        assert!(
+            !wf.state().read().contains(99),
+            "reduce never submitted on failure"
+        );
 
         // Propagate: pending sibling (shard 2) cancelled, parent Failed.
         let seq = propagate_failure(&wf, &group).unwrap();
         wf.wait_for_seq(seq).await.unwrap();
-        assert!(wf.is_cancel_requested(shards[2]), "running sibling cancelled");
-        assert!(!wf.is_cancel_requested(shards[0]), "the Done shard isn't cancelled");
-        assert_eq!(wf.get(7).unwrap().status, TaskStatus::Failed, "parent failed");
+        assert!(
+            wf.is_cancel_requested(shards[2]),
+            "running sibling cancelled"
+        );
+        assert!(
+            !wf.is_cancel_requested(shards[0]),
+            "the Done shard isn't cancelled"
+        );
+        assert_eq!(
+            wf.get(7).unwrap().status,
+            TaskStatus::Failed,
+            "parent failed"
+        );
     }
 
     /// Recoverable disposition: `block_on_failure` parks the parent

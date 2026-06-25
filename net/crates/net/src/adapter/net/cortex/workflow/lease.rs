@@ -190,10 +190,16 @@ mod tests {
         let node = kp.entity_id().node_id();
         let mut lease = TaskLease::new(&fold, &kp, node);
 
-        assert_eq!(lease.acquire(0x1A, fresh()).unwrap(), TaskLeaseOutcome::Acquired);
+        assert_eq!(
+            lease.acquire(0x1A, fresh()).unwrap(),
+            TaskLeaseOutcome::Acquired
+        );
         assert_eq!(lease.current_holder(0x1A), Some(node));
         // Renew (re-acquire our own live lease).
-        assert_eq!(lease.acquire(0x1A, fresh()).unwrap(), TaskLeaseOutcome::Acquired);
+        assert_eq!(
+            lease.acquire(0x1A, fresh()).unwrap(),
+            TaskLeaseOutcome::Acquired
+        );
         // Release.
         assert!(lease.release(0x1A).unwrap());
         assert_eq!(lease.current_holder(0x1A), None);

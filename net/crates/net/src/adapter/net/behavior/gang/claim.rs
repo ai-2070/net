@@ -127,13 +127,7 @@ pub fn release_announcement(
     generation: u64,
     island: IslandId,
 ) -> Result<SignedAnnouncement<ReservationAnnouncement>, WireError> {
-    sign_state(
-        keypair,
-        node_id,
-        generation,
-        island,
-        ReservationState::Free,
-    )
+    sign_state(keypair, node_id, generation, island, ReservationState::Free)
 }
 
 fn sign_state(

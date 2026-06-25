@@ -49,7 +49,7 @@ mod proptest;
 pub use active::{commit_active, ActiveCommitOutcome, ReplicaCohort};
 pub use claim::{
     activate_announcement, activate_island, release_announcement, release_island,
-    reserve_announcement, single_island_claim, Claimant, ClaimError, ClaimOutcome,
+    reserve_announcement, single_island_claim, ClaimError, ClaimOutcome, Claimant,
 };
 pub use contention::claim_first_available;
 pub use filter::{
@@ -60,7 +60,7 @@ pub use multi::{acquire_gang, try_acquire_gang, AcquireAttempt, GangClaim, GangO
 pub use placement::{colocated_island_config, pinned_island_replicas, COLOCATE_WITH_STRICT_KEY};
 pub use quorum::{Epoch, FenceLedger, QuorumWitness, ReplicaSet};
 pub use schedule::{
-    schedule_gang, schedule_single, GangRequest, GangScheduler, Scheduled, ScheduleError,
+    schedule_gang, schedule_single, GangRequest, GangScheduler, ScheduleError, Scheduled,
 };
 
 use crate::adapter::net::behavior::fold::{

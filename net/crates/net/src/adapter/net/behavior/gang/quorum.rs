@@ -268,7 +268,10 @@ mod tests {
             ledger.accept_active(island, 5),
             "an equal-epoch retry from the live leader still passes",
         );
-        assert!(ledger.accept_active(island, 6), "a newer term advances the fence");
+        assert!(
+            ledger.accept_active(island, 6),
+            "a newer term advances the fence"
+        );
         assert_eq!(ledger.highest_witnessed(island), 6);
         assert!(!ledger.accept_active(island, 5), "now epoch 5 is stale too");
     }
@@ -279,7 +282,10 @@ mod tests {
         ledger.accept_active(0xA0, 7);
         // A different island starts fresh — epoch 1 is fine there.
         assert!(ledger.accept_active(0xB0, 1));
-        assert!(!ledger.accept_active(0xA0, 6), "island A0 still fenced at 7");
+        assert!(
+            !ledger.accept_active(0xA0, 6),
+            "island A0 still fenced at 7"
+        );
     }
 
     /// The two predicates composed: a leadership change. Old leader

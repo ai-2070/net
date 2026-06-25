@@ -373,8 +373,8 @@ mod tests {
         IslandRecord, NodeState, ReservationQuery, ReservationState, SignedAnnouncement,
     };
     use crate::adapter::net::behavior::gang::{NumericFilter, SelectionPolicy};
-    use crate::adapter::net::redex::Redex;
     use crate::adapter::net::cortex::workflow::TaskStatus;
+    use crate::adapter::net::redex::Redex;
 
     /// A test double: returns a forced result and records that it was
     /// consulted. Lets the seam tests prove the driver routes purely
@@ -435,7 +435,10 @@ mod tests {
         wf.wait_for_seq(seq).await.unwrap();
 
         assert_eq!(gate, StepGate::Waiting);
-        assert_eq!(pipeline.calls, 1, "the requirement is handed to the pipeline");
+        assert_eq!(
+            pipeline.calls, 1,
+            "the requirement is handed to the pipeline"
+        );
         // The step is parked Waiting and never reached Running.
         assert_eq!(wf.get(1).unwrap().status, TaskStatus::Waiting);
     }
@@ -464,7 +467,10 @@ mod tests {
             release_step(&mut pipeline, &claim).unwrap();
             wf.fail(1).unwrap();
         }
-        assert_eq!(pipeline.releases, 1, "the held claim is released on abnormal exit");
+        assert_eq!(
+            pipeline.releases, 1,
+            "the held claim is released on abnormal exit"
+        );
     }
 
     #[test]
@@ -707,7 +713,11 @@ mod tests {
         submitted_task(&wf, 1).await;
 
         let gate = drive_capability_step(&wf, &mut pipeline, 1, &requirement()).unwrap();
-        assert_eq!(gate, StepGate::Waiting, "minority side can't reach Active → step waits");
+        assert_eq!(
+            gate,
+            StepGate::Waiting,
+            "minority side can't reach Active → step waits"
+        );
         // Never Active — no compute starts (the Thunderdome guarantee).
         // And the orphaned reserve is released immediately rather than
         // left Reserved to TTL-expire, so other claimants aren't blocked

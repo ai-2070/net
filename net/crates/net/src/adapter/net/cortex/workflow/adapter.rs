@@ -24,8 +24,8 @@ use super::super::meta::{compute_checksum_with_meta, EventMeta, EVENT_META_SIZE}
 use super::super::watermark::WatermarkingFold;
 use super::dispatch::{
     DISPATCH_TASK_ADVANCED, DISPATCH_TASK_CANCEL_REQUESTED, DISPATCH_TASK_DELETED,
-    DISPATCH_TASK_LINKED, DISPATCH_TASK_RETRIED, DISPATCH_TASK_SUBMITTED, DISPATCH_TASK_TRANSITIONED,
-    WORKFLOW_CHANNEL,
+    DISPATCH_TASK_LINKED, DISPATCH_TASK_RETRIED, DISPATCH_TASK_SUBMITTED,
+    DISPATCH_TASK_TRANSITIONED, WORKFLOW_CHANNEL,
 };
 use super::fold::WorkflowFold;
 use super::state::{StatusCounts, WorkflowState};
@@ -112,7 +112,10 @@ impl WorkflowAdapter {
 
     /// Set a task's status. No-op at fold time if `id` is unknown.
     pub fn transition(&self, id: TaskId, status: TaskStatus) -> Result<u64, CortexAdapterError> {
-        self.ingest_typed(DISPATCH_TASK_TRANSITIONED, &TransitionedPayload { id, status })
+        self.ingest_typed(
+            DISPATCH_TASK_TRANSITIONED,
+            &TransitionedPayload { id, status },
+        )
     }
 
     /// Mark the task `Running` (a step is executing).
@@ -174,7 +177,10 @@ impl WorkflowAdapter {
     /// drives the task to a terminal status. Cleared on delete or a
     /// fresh submit.
     pub fn request_cancel(&self, id: TaskId) -> Result<u64, CortexAdapterError> {
-        self.ingest_typed(DISPATCH_TASK_CANCEL_REQUESTED, &CancelRequestedPayload { id })
+        self.ingest_typed(
+            DISPATCH_TASK_CANCEL_REQUESTED,
+            &CancelRequestedPayload { id },
+        )
     }
 
     /// Read-only access to the materialized state.
@@ -341,7 +347,13 @@ mod tests {
         wf.submit(7).unwrap();
         wf.retry(7).unwrap();
         wf.retry(7).unwrap(); // attempts = 2
-        assert_eq!({ wf.wait_for_seq(wf.advance(7).unwrap()).await.unwrap(); wf.get(7).unwrap().attempts }, 0);
+        assert_eq!(
+            {
+                wf.wait_for_seq(wf.advance(7).unwrap()).await.unwrap();
+                wf.get(7).unwrap().attempts
+            },
+            0
+        );
         assert_eq!(wf.get(7).unwrap().step, 1);
     }
 
@@ -367,7 +379,11 @@ mod tests {
         let seq = wf.retry(1).unwrap();
         wf.wait_for_seq(seq).await.unwrap();
         assert_eq!(wf.get(1).unwrap().status, TaskStatus::Done);
-        assert_eq!(wf.get(1).unwrap().attempts, 0, "retry didn't bump a Done task");
+        assert_eq!(
+            wf.get(1).unwrap().attempts,
+            0,
+            "retry didn't bump a Done task"
+        );
 
         // Failed can't be moved by a plain transition...
         wf.submit(2).unwrap();
@@ -506,7 +522,10 @@ mod tests {
         wf.request_cancel(1).unwrap();
         let seq = wf.submit(1).unwrap(); // re-submit resets the task
         wf.wait_for_seq(seq).await.unwrap();
-        assert!(!wf.is_cancel_requested(1), "re-submit clears the stale cancel");
+        assert!(
+            !wf.is_cancel_requested(1),
+            "re-submit clears the stale cancel"
+        );
     }
 
     #[tokio::test]

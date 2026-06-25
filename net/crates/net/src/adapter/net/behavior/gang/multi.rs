@@ -30,7 +30,7 @@
 use crate::adapter::net::behavior::fold::{Fold, IslandId, JobId, NodeId, ReservationFold};
 use crate::adapter::net::identity::EntityKeypair;
 
-use super::claim::{release_island, single_island_claim, Claimant, ClaimError, ClaimOutcome};
+use super::claim::{release_island, single_island_claim, ClaimError, ClaimOutcome, Claimant};
 
 /// A gang job's claim over multiple islands — all-or-none. The plan
 /// types `islands` as a `SmallVec`; the crate has no `smallvec` dep,
@@ -246,7 +246,11 @@ mod tests {
             |_| {},
         )
         .unwrap();
-        assert_eq!(ra, GangOutcome::Held(vec![1, 2]), "A holds the set in id order");
+        assert_eq!(
+            ra,
+            GangOutcome::Held(vec![1, 2]),
+            "A holds the set in id order"
+        );
 
         // B, deadline in the past → exactly one blocked attempt then
         // a clean give-up holding nothing (no deadlock, no spin).
@@ -414,7 +418,11 @@ mod tests {
         );
         // Everything released at rest.
         for island in [1, 2, 3, 4, 5, 6] {
-            assert_eq!(holder_of(&fold, island), None, "island {island} released at rest");
+            assert_eq!(
+                holder_of(&fold, island),
+                None,
+                "island {island} released at rest"
+            );
         }
     }
 }

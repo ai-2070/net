@@ -19,7 +19,7 @@ use crate::adapter::net::behavior::fold::{
 };
 use crate::adapter::net::stream::StreamError;
 
-use super::claim::{Claimant, ClaimError};
+use super::claim::{ClaimError, Claimant};
 use super::contention::claim_first_available;
 use super::multi::{acquire_gang, GangClaim, GangOutcome};
 use super::{match_islands, MatchCriteria};

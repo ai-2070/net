@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use crate::adapter::net::behavior::fold::{ApplyOutcome, IslandId, JobId, NodeId};
 
-use super::claim::{activate_announcement, Claimant, ClaimError};
+use super::claim::{activate_announcement, ClaimError, Claimant};
 use super::quorum::{Epoch, FenceLedger, QuorumWitness, ReplicaSet};
 
 /// Outcome of a partition-safe `→ Active` commit attempt.
@@ -214,8 +214,7 @@ mod tests {
         let b = EntityKeypair::generate();
         let bn = b.entity_id().node_id();
         let claimant_b = Claimant::new(&fold, &b, bn);
-        let minority =
-            commit_active(&claimant_b, &mut cohort, &set, &[4, 5], 0xA0, 9, 3).unwrap();
+        let minority = commit_active(&claimant_b, &mut cohort, &set, &[4, 5], 0xA0, 9, 3).unwrap();
         assert_eq!(
             minority,
             ActiveCommitOutcome::NoQuorum { acks: 2, needed: 3 },
@@ -260,8 +259,7 @@ mod tests {
         let o = EntityKeypair::generate();
         let on = o.entity_id().node_id();
         let claimant_o = Claimant::new(&fold, &o, on);
-        let stale =
-            commit_active(&claimant_o, &mut cohort, &set, &[1, 2, 3], 0xA0, 2, 4).unwrap();
+        let stale = commit_active(&claimant_o, &mut cohort, &set, &[1, 2, 3], 0xA0, 2, 4).unwrap();
         assert_eq!(
             stale,
             ActiveCommitOutcome::NoQuorum { acks: 0, needed: 2 },

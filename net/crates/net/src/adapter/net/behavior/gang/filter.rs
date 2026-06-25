@@ -11,7 +11,9 @@
 
 use std::collections::HashSet;
 
-use crate::adapter::net::behavior::fold::{CapabilityMatch, IslandId, IslandRecord, ModelId, NodeId};
+use crate::adapter::net::behavior::fold::{
+    CapabilityMatch, IslandId, IslandRecord, ModelId, NodeId,
+};
 
 /// Step 1 bridge: the candidate *hosts* surfaced by a capability
 /// match. The capability fold is keyed by `(class, node)`; the node
@@ -103,9 +105,7 @@ pub enum SelectionPolicy {
 fn policy_cmp(a: &IslandRecord, b: &IslandRecord, policy: SelectionPolicy) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let primary = match policy {
-        SelectionPolicy::LeastLoaded => {
-            a.load.partial_cmp(&b.load).unwrap_or(Ordering::Equal)
-        }
+        SelectionPolicy::LeastLoaded => a.load.partial_cmp(&b.load).unwrap_or(Ordering::Equal),
         SelectionPolicy::Pack => b.load.partial_cmp(&a.load).unwrap_or(Ordering::Equal),
         SelectionPolicy::LoadBand(target) => {
             let da = (a.load - target).abs();

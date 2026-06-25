@@ -71,8 +71,7 @@ mod tests {
         let hn = holder.entity_id().node_id();
         // Island 0x10 and 0x11 are already held by `holder`.
         let mut g = 1;
-        claim_first_available(&fold, &holder, hn, &mut g, &[0x10, 0x11], fresh_deadline())
-            .unwrap();
+        claim_first_available(&fold, &holder, hn, &mut g, &[0x10, 0x11], fresh_deadline()).unwrap();
         // (Only 0x10 was claimed — the helper stops at the first win.)
         // Hold 0x11 too so the next claimant must skip both.
         super::single_island_claim(&fold, &holder, hn, g, 0x11, fresh_deadline()).unwrap();
@@ -90,7 +89,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got, Some(0x12), "must skip the two held islands");
-        assert_eq!(fold.query(ReservationQuery::State(0x12))[0].1.holder(), Some(cn));
+        assert_eq!(
+            fold.query(ReservationQuery::State(0x12))[0].1.holder(),
+            Some(cn)
+        );
     }
 
     #[test]
@@ -105,9 +107,15 @@ mod tests {
         let claimant = EntityKeypair::generate();
         let cn = claimant.entity_id().node_id();
         let mut cg = 1;
-        let got =
-            claim_first_available(&fold, &claimant, cn, &mut cg, &[0x10, 0x11], fresh_deadline())
-                .unwrap();
+        let got = claim_first_available(
+            &fold,
+            &claimant,
+            cn,
+            &mut cg,
+            &[0x10, 0x11],
+            fresh_deadline(),
+        )
+        .unwrap();
         assert_eq!(got, None);
     }
 
@@ -143,16 +151,17 @@ mod tests {
                     let mut gen = 1u64;
                     // All threads line up, then claim at once.
                     barrier.wait();
-                    let won =
-                        claim_first_available(&fold, &kp, node, &mut gen, &islands, deadline)
-                            .expect("claim attempt");
+                    let won = claim_first_available(&fold, &kp, node, &mut gen, &islands, deadline)
+                        .expect("claim attempt");
                     won.map(|island| (node, island))
                 })
             })
             .collect();
 
-        let winners: Vec<(NodeId, IslandId)> =
-            handles.into_iter().filter_map(|h| h.join().unwrap()).collect();
+        let winners: Vec<(NodeId, IslandId)> = handles
+            .into_iter()
+            .filter_map(|h| h.join().unwrap())
+            .collect();
 
         // Exactly M winners — every island claimed once, no more.
         assert_eq!(

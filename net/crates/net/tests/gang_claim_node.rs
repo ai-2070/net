@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use net::adapter::net::behavior::capability::CapabilitySet;
 use net::adapter::net::behavior::fold::{
-    CapabilityFilter, CapabilityFold, CapabilityMembership, CapabilityQuery, EnvelopeMeta, FoldKind,
-    GpuSet, IslandQuery, IslandRecord, IslandTopologyFold, NodeState, ReservationQuery,
+    CapabilityFilter, CapabilityFold, CapabilityMembership, CapabilityQuery, EnvelopeMeta,
+    FoldKind, GpuSet, IslandQuery, IslandRecord, IslandTopologyFold, NodeState, ReservationQuery,
     SignedAnnouncement,
 };
 use net::adapter::net::behavior::gang::{
@@ -143,7 +143,11 @@ async fn island_fold_is_wired_and_scheduler_matches_and_claims_over_node_folds()
     // The scheduler reads the node's wired folds: both islands match,
     // least-loaded first (B at 0.2 before A at 0.7).
     let order = match_islands(node.capability_fold(), node.island_fold(), &criteria);
-    assert_eq!(order, vec![0xB0, 0xA0], "scheduler ranks over the node's island fold");
+    assert_eq!(
+        order,
+        vec![0xB0, 0xA0],
+        "scheduler ranks over the node's island fold"
+    );
 
     // Claim the top island through the node's reservation fold.
     let claimant = EntityKeypair::generate();
@@ -161,7 +165,9 @@ async fn island_fold_is_wired_and_scheduler_matches_and_claims_over_node_folds()
     assert_eq!(got, ClaimOutcome::Won);
     assert_eq!(
         node.reservation_fold()
-            .query(net::adapter::net::behavior::fold::ReservationQuery::State(0xB0))[0]
+            .query(net::adapter::net::behavior::fold::ReservationQuery::State(
+                0xB0
+            ))[0]
             .1
             .holder(),
         Some(cn),
@@ -207,7 +213,11 @@ async fn island_topology_broadcasts_to_a_connected_peer() {
             .await
             .expect("publish island");
         tokio::time::sleep(Duration::from_millis(100)).await;
-        if !peer_view.island_fold().query(IslandQuery::Get(0xC0)).is_empty() {
+        if !peer_view
+            .island_fold()
+            .query(IslandQuery::Get(0xC0))
+            .is_empty()
+        {
             converged = true;
             break;
         }
@@ -241,7 +251,11 @@ async fn publish_island_topology_self_indexes_for_the_local_scheduler() {
 
     // Visible locally with no peer and no wire round-trip.
     let row = node.island_fold().query(IslandQuery::Get(0xE0));
-    assert_eq!(row.len(), 1, "self-published island is visible in the node's own fold");
+    assert_eq!(
+        row.len(),
+        1,
+        "self-published island is visible in the node's own fold"
+    );
     assert_eq!(row[0].1.host, host_id, "host stamped as this node");
     assert_eq!(row[0].1.load, 0.1);
 }
@@ -324,5 +338,8 @@ async fn claim_gpu_island_reserves_and_broadcasts_to_peer() {
             break;
         }
     }
-    assert!(converged, "peer should see the scheduler's reservation converge");
+    assert!(
+        converged,
+        "peer should see the scheduler's reservation converge"
+    );
 }

@@ -203,8 +203,16 @@ impl TriggerEngine {
     /// task-keyed triggers; O(log T) for `AtTick` (BTreeMap insert).
     pub fn arm(&mut self, trigger: Trigger, action: Action) {
         match trigger.key() {
-            TriggerKey::Task(task) => self.by_task.entry(task).or_default().push((trigger, action)),
-            TriggerKey::Tick(tick) => self.by_tick.entry(tick).or_default().push((trigger, action)),
+            TriggerKey::Task(task) => self
+                .by_task
+                .entry(task)
+                .or_default()
+                .push((trigger, action)),
+            TriggerKey::Tick(tick) => self
+                .by_tick
+                .entry(tick)
+                .or_default()
+                .push((trigger, action)),
         }
     }
 
@@ -221,7 +229,10 @@ impl TriggerEngine {
         let (fired, rest): (Vec<_>, Vec<_>) =
             armed.into_iter().partition(|(t, _)| t.is_satisfied(world));
         // Keep only arms that may still fire; drop the dead ones.
-        let still_armed: Vec<_> = rest.into_iter().filter(|(t, _)| !t.is_dead(world)).collect();
+        let still_armed: Vec<_> = rest
+            .into_iter()
+            .filter(|(t, _)| !t.is_dead(world))
+            .collect();
         if !still_armed.is_empty() {
             self.by_task.insert(task, still_armed);
         }
@@ -261,8 +272,8 @@ impl TriggerEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::types::TaskState;
+    use super::*;
 
     fn results(pairs: &[(TaskId, &str, &str)]) -> HashMap<TaskId, HashMap<String, String>> {
         let mut m: HashMap<TaskId, HashMap<String, String>> = HashMap::new();
@@ -321,7 +332,7 @@ mod tests {
         };
         assert!(left.is_satisfied(&world));
         assert!(!right.is_satisfied(&world)); // value mismatch
-        // Done but no result recorded → not satisfied.
+                                              // Done but no result recorded → not satisfied.
         let empty = HashMap::new();
         let world2 = TriggerWorld {
             tasks: &done,
