@@ -342,7 +342,8 @@ int      net_mesh_start(net_meshnode_t* handle);
  * GPU specifics ride plain capability tags, e.g. "gpu:h100"/"model:<hex>".
  * criteria_json (host match: tags_*; island resident match: require_*):
  *   {"tags_all":["gpu:h100"],"tags_any":["zone:a"],
- *    "tag_groups_all":[["a","b"],["c"]],"min_units":8,"max_load":0.8,
+ *    "tag_groups_all":[["a","b"],["c"]],"region":"us-east-1",
+ *    "min_units":8,"max_load":0.8,
  *    "max_p50_latency_us":5000,"require_all":["model:2a"],
  *    "require_any":["model:2a","model:2b"],
  *    "selection":"least_loaded","load_band_target":0.5,

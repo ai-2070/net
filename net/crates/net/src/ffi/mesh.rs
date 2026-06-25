@@ -3604,6 +3604,9 @@ struct GangCriteriaJson {
     tags_any: Vec<String>,
     #[serde(default)]
     tag_groups_all: Vec<Vec<String>>,
+    // Host network-locality (subnet / zone / availability region).
+    #[serde(default)]
+    region: Option<String>,
     // Live island numeric filter (step 2).
     #[serde(default)]
     min_units: usize,
@@ -3655,6 +3658,7 @@ fn build_gang_criteria(
             tags_all: c.tags_all,
             tags_any: c.tags_any,
             tag_groups_all: c.tag_groups_all,
+            region: c.region,
             ..Default::default()
         }),
         numeric: NumericFilter {

@@ -149,12 +149,24 @@ mod tests {
         node: u64,
         tags: Vec<String>,
     ) {
+        announce_capability_in(fold, kp, node, tags, None);
+    }
+
+    /// Like [`announce_capability`] but with a host `region` (the
+    /// network-locality axis subnet / zone filtering rides).
+    fn announce_capability_in(
+        fold: &Fold<CapabilityFold>,
+        kp: &EntityKeypair,
+        node: u64,
+        tags: Vec<String>,
+        region: Option<String>,
+    ) {
         let membership = CapabilityMembership {
             class_hash: 0x67_70_75, // "gpu" — any stable class id
             tags,
             hardware: None,
             state: NodeState::Idle,
-            region: None,
+            region,
             price_quote: None,
             reflex_addr: None,
             allowed_nodes: Vec::new(),
@@ -274,6 +286,76 @@ mod tests {
             prefer_capability: None,
         };
         assert!(match_islands(&caps, &topo, &criteria).is_empty());
+    }
+
+    /// Subnet / region / zone is a **host** property (network locality),
+    /// so it filters at the capability stage (step 1) — never the island
+    /// stage. Two hosts carry the same capability + an equivalent island
+    /// and differ only in region; a region-scoped match returns only the
+    /// in-region host's island, because the out-of-region host is dropped
+    /// before its islands are ever inspected.
+    #[test]
+    fn region_filters_at_the_host_stage_not_the_island() {
+        let caps: Fold<CapabilityFold> = new_fold();
+        let topo: Fold<IslandTopologyFold> = new_fold();
+        let kp_east = EntityKeypair::generate();
+        let kp_west = EntityKeypair::generate();
+        let ne = kp_east.entity_id().node_id();
+        let nw = kp_west.entity_id().node_id();
+
+        announce_capability_in(
+            &caps,
+            &kp_east,
+            ne,
+            vec!["gpu:h100".into()],
+            Some("us-east".into()),
+        );
+        announce_capability_in(
+            &caps,
+            &kp_west,
+            nw,
+            vec!["gpu:h100".into()],
+            Some("us-west".into()),
+        );
+        announce_island(&topo, &kp_east, ne, 0xE0, 8, 0.1);
+        announce_island(&topo, &kp_west, nw, 0xF0, 8, 0.1);
+
+        // Region-scoped: only the us-east host's island survives. The
+        // west host never reaches the numeric/topology stage.
+        let east_only = MatchCriteria {
+            capability: CapabilityQuery::Composite(CapabilityFilter {
+                tags_all: vec!["gpu:h100".into()],
+                region: Some("us-east".into()),
+                ..Default::default()
+            }),
+            numeric: NumericFilter::default(),
+            selection: SelectionPolicy::LeastLoaded,
+            prefer_capability: None,
+        };
+        assert_eq!(match_islands(&caps, &topo, &east_only), vec![0xE0]);
+
+        // No region constraint → both hosts' islands match.
+        let any_region = MatchCriteria {
+            capability: CapabilityQuery::Composite(CapabilityFilter {
+                tags_all: vec!["gpu:h100".into()],
+                ..Default::default()
+            }),
+            ..east_only.clone()
+        };
+        let mut both = match_islands(&caps, &topo, &any_region);
+        both.sort_unstable();
+        assert_eq!(both, vec![0xE0, 0xF0]);
+
+        // A region nobody is in → empty.
+        let nowhere = MatchCriteria {
+            capability: CapabilityQuery::Composite(CapabilityFilter {
+                tags_all: vec!["gpu:h100".into()],
+                region: Some("ap-south".into()),
+                ..Default::default()
+            }),
+            ..east_only.clone()
+        };
+        assert!(match_islands(&caps, &topo, &nowhere).is_empty());
     }
 
     /// End-to-end Phase A "done when": match → claim the top island
