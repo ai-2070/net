@@ -158,23 +158,31 @@ class MeshNode:
         self,
         tags_all: List[str],
         *,
+        tags_any: Optional[List[str]] = None,
+        tag_groups_all: Optional[List[List[str]]] = None,
         min_units: Optional[int] = None,
         max_load: Optional[float] = None,
         max_p50_latency_us: Optional[int] = None,
-        require_capabilities: Optional[List[str]] = None,
+        require_all: Optional[List[str]] = None,
+        require_any: Optional[List[str]] = None,
         selection: Optional[str] = None,
         load_band_target: Optional[float] = None,
         prefer_capability: Optional[str] = None,
     ) -> List[int]:
         """Match islands against the criteria over this node's folds
-        (read-only; no claim). Best island first. `selection` is one of
-        ``least_loaded`` (default) / ``pack`` / ``load_band`` / ``lowest_id``."""
+        (read-only; no claim). Best island first. `tags_*` filter the host
+        capability match; `require_*` filter the island's resident
+        capabilities. `selection` is one of ``least_loaded`` (default) /
+        ``pack`` / ``load_band`` / ``lowest_id``."""
         return self._native.match_islands(
             tags_all,
+            tags_any=tags_any or [],
+            tag_groups_all=tag_groups_all or [],
             min_units=min_units,
             max_load=max_load,
             max_p50_latency_us=max_p50_latency_us,
-            require_capabilities=require_capabilities or [],
+            require_all=require_all or [],
+            require_any=require_any or [],
             selection=selection,
             load_band_target=load_band_target,
             prefer_capability=prefer_capability,
@@ -195,10 +203,13 @@ class MeshNode:
         tags_all: List[str],
         until_unix_us: int,
         *,
+        tags_any: Optional[List[str]] = None,
+        tag_groups_all: Optional[List[List[str]]] = None,
         min_units: Optional[int] = None,
         max_load: Optional[float] = None,
         max_p50_latency_us: Optional[int] = None,
-        require_capabilities: Optional[List[str]] = None,
+        require_all: Optional[List[str]] = None,
+        require_any: Optional[List[str]] = None,
         selection: Optional[str] = None,
         load_band_target: Optional[float] = None,
         prefer_capability: Optional[str] = None,
@@ -208,10 +219,13 @@ class MeshNode:
         return self._native.claim_island(
             tags_all,
             until_unix_us,
+            tags_any=tags_any or [],
+            tag_groups_all=tag_groups_all or [],
             min_units=min_units,
             max_load=max_load,
             max_p50_latency_us=max_p50_latency_us,
-            require_capabilities=require_capabilities or [],
+            require_all=require_all or [],
+            require_any=require_any or [],
             selection=selection,
             load_band_target=load_band_target,
             prefer_capability=prefer_capability,

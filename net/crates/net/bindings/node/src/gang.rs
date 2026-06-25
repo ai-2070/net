@@ -25,17 +25,25 @@ use crate::NetMesh;
 /// selection policy).
 #[napi(object)]
 pub struct IslandCriteria {
-    /// Capability tags every candidate host must carry (AND).
+    /// Host capability tags every candidate must carry (AND).
     pub tags_all: Vec<String>,
+    /// Host must carry at least one of these tags (OR). Omit = any.
+    pub tags_any: Option<Vec<String>>,
+    /// Host must carry at least one tag from *every* group (AND of ORs).
+    /// Omit = any.
+    pub tag_groups_all: Option<Vec<Vec<String>>>,
     /// Minimum exclusive units in the island. Omit / 0 = any.
     pub min_units: Option<u32>,
     /// Maximum live load (0.0..=1.0). Omit = any.
     pub max_load: Option<f64>,
     /// Maximum live p50 latency (µs). Omit = any.
     pub max_p50_latency_us: Option<u32>,
-    /// Capabilities the island must have resident (AND) — e.g.
+    /// Resident capabilities the island must have ALL of (AND) — e.g.
     /// `model:<hex>` for a warm model. Omit / empty = any.
-    pub require_capabilities: Option<Vec<String>>,
+    pub require_all: Option<Vec<String>>,
+    /// Resident capabilities the island must have AT LEAST ONE of (OR).
+    /// Omit / empty = any.
+    pub require_any: Option<Vec<String>>,
     /// Selection policy: `least_loaded` (default) / `pack` / `load_band`
     /// / `lowest_id`.
     pub selection: Option<String>,
@@ -78,13 +86,16 @@ fn build_match_criteria(c: IslandCriteria) -> Result<MatchCriteria> {
     Ok(MatchCriteria {
         capability: CapabilityQuery::Composite(CapabilityFilter {
             tags_all: c.tags_all,
+            tags_any: c.tags_any.unwrap_or_default(),
+            tag_groups_all: c.tag_groups_all.unwrap_or_default(),
             ..Default::default()
         }),
         numeric: NumericFilter {
             min_units: c.min_units.unwrap_or(0) as usize,
             max_load: c.max_load.map(|v| v as f32),
             max_p50_latency_us: c.max_p50_latency_us,
-            require_capabilities: c.require_capabilities.unwrap_or_default(),
+            require_all: c.require_all.unwrap_or_default(),
+            require_any: c.require_any.unwrap_or_default(),
         },
         selection,
         prefer_capability: c.prefer_capability,
