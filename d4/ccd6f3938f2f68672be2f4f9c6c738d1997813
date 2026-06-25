@@ -1,0 +1,26 @@
+net/crates/net/sdk-py/src/net_sdk/mesh.py
+  s_b93d1d2fee6b2e::t_6325999505877d 193,198,201,204,208,211,214,217
+  s_b93d1d2fee6b2e::t_5d0feee7172e94 139,144-145,151-152,154,157,161,164,167,169,172,174,177,180
+net/crates/net/sdk-ts/src/index.ts
+  s_b93d1d2fee6b2e::t_dcbbc526462a9e 58
+net/crates/net/sdk-ts/src/mesh.ts
+  s_b93d1d2fee6b2e::t_dcbbc526462a9e 40,42,47,604,608-609,634-635
+net/crates/net/sdk-ts/test/gang.test.ts
+  s_b93d1d2fee6b2e::t_dcbbc526462a9e 33-34,41,44,46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "d4ccd6f3938f2f68672be2f4f9c6c738d1997813",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
