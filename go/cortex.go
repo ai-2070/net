@@ -1576,7 +1576,7 @@ func collectTriggerActions(kinds []C.int, ids []uint64, count int) []TriggerActi
 // against the bound adapter's current state.
 //
 // net_trigger_on_task_change is *consuming*: it disarms the triggers it
-// fires, so — unlike the read-only list getters (Subtree, MatchGpuIslands)
+// fires, so — unlike the read-only list getters (Subtree, MatchIslands)
 // — it cannot be sized with a NULL-buffer probe pass. A probe pass would
 // fire and discard the actions, and the real pass would then find nothing
 // armed. Instead size the buffer once from ArmedCount (an upper bound:

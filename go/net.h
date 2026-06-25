@@ -337,28 +337,34 @@ int      net_mesh_accept(net_meshnode_t* handle,
                          char** out_addr, size_t* out_len);
 int      net_mesh_start(net_meshnode_t* handle);
 
-/* ---- Gang-claim GPU-island scheduler ----
- * criteria_json: {"tags_all":["gpu:h100"],"min_gpus":8,"max_load":0.8,
- *   "max_p50_latency_us":5000,"require_warm_model":42,
- *   "selection":"least_loaded","load_band_target":0.5,"prefer_warm_model":42}
- * record_json: {"id":1,"gpus":[0,1,2,3],"warm_models":[42],"load":0.1,
- *   "p50_latency_us":800}   (host forced to this node)
+/* ---- Gang-claim resource-island scheduler ----
+ * Resource-agnostic (a GPU NVLink domain is the motivating instance);
+ * GPU specifics ride plain capability tags, e.g. "gpu:h100"/"model:<hex>".
+ * criteria_json (host match: tags_*; island resident match: require_*):
+ *   {"tags_all":["gpu:h100"],"tags_any":["zone:a"],
+ *    "tag_groups_all":[["a","b"],["c"]],"min_units":8,"max_load":0.8,
+ *    "max_p50_latency_us":5000,"require_all":["model:2a"],
+ *    "require_any":["model:2a","model:2b"],
+ *    "selection":"least_loaded","load_band_target":0.5,
+ *    "prefer_capability":"model:2a"}
+ * record_json: {"id":1,"units":[0,1,2,3],"capabilities":["model:2a"],
+ *   "load":0.1,"p50_latency_us":800}   (host forced to this node)
  * reserve/release write *out_outcome: 0 = won, 1 = lost. */
 int      net_mesh_publish_island_topology(net_meshnode_t* handle,
                                           const char* record_json,
                                           size_t* out_count);
-int      net_mesh_match_gpu_islands(net_meshnode_t* handle,
-                                    const char* criteria_json,
-                                    uint64_t* out_ids, size_t cap,
-                                    size_t* out_count);
+int      net_mesh_match_islands(net_meshnode_t* handle,
+                                const char* criteria_json,
+                                uint64_t* out_ids, size_t cap,
+                                size_t* out_count);
 int      net_mesh_reserve_island(net_meshnode_t* handle, uint64_t island,
                                  uint64_t until_unix_us, int* out_outcome);
 int      net_mesh_release_island(net_meshnode_t* handle, uint64_t island,
                                  int* out_outcome);
-int      net_mesh_claim_gpu_island(net_meshnode_t* handle,
-                                   const char* criteria_json,
-                                   uint64_t until_unix_us,
-                                   int* out_found, uint64_t* out_island);
+int      net_mesh_claim_island(net_meshnode_t* handle,
+                               const char* criteria_json,
+                               uint64_t until_unix_us,
+                               int* out_found, uint64_t* out_island);
 
 /* ---- Per-peer streams ---- */
 

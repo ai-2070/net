@@ -982,29 +982,36 @@ func (m *MeshNode) Publish(channel string, payload []byte, cfg PublishConfig) (*
 }
 
 // ---------------------------------------------------------------------------
-// Gang-claim GPU-island scheduler
+// Gang-claim resource-island scheduler
 // ---------------------------------------------------------------------------
 
 // GangCriteria is the flat match criteria (serialized to JSON for the C
-// ABI, which builds the core MatchCriteria internally). `Selection` is
-// one of "least_loaded" (default) / "pack" / "load_band" / "lowest_id".
+// ABI, which builds the core MatchCriteria internally). The scheduler is
+// resource-agnostic: GPU specifics ride plain capability tags (e.g.
+// "gpu:h100", "model:<hex>"). The Tags* fields filter the host capability
+// match (AND / OR / AND-of-ORs); the Require* fields filter the island's
+// resident capabilities. `Selection` is one of "least_loaded" (default) /
+// "pack" / "load_band" / "lowest_id".
 type GangCriteria struct {
-	TagsAll          []string `json:"tags_all,omitempty"`
-	MinGpus          uint     `json:"min_gpus,omitempty"`
-	MaxLoad          *float32 `json:"max_load,omitempty"`
-	MaxP50LatencyUs  *uint32  `json:"max_p50_latency_us,omitempty"`
-	RequireWarmModel *uint64  `json:"require_warm_model,omitempty"`
-	Selection        string   `json:"selection,omitempty"`
-	LoadBandTarget   *float32 `json:"load_band_target,omitempty"`
-	PreferWarmModel  *uint64  `json:"prefer_warm_model,omitempty"`
+	TagsAll          []string   `json:"tags_all,omitempty"`
+	TagsAny          []string   `json:"tags_any,omitempty"`
+	TagGroupsAll     [][]string `json:"tag_groups_all,omitempty"`
+	MinUnits         uint       `json:"min_units,omitempty"`
+	MaxLoad          *float32   `json:"max_load,omitempty"`
+	MaxP50LatencyUs  *uint32    `json:"max_p50_latency_us,omitempty"`
+	RequireAll       []string   `json:"require_all,omitempty"`
+	RequireAny       []string   `json:"require_any,omitempty"`
+	Selection        string     `json:"selection,omitempty"`
+	LoadBandTarget   *float32   `json:"load_band_target,omitempty"`
+	PreferCapability *string    `json:"prefer_capability,omitempty"`
 }
 
 // IslandRecord is one island a node self-publishes. Its host is forced
-// to this node.
+// to this node. Capabilities are resident tags (e.g. "model:<hex>").
 type IslandRecord struct {
 	ID           uint64   `json:"id"`
-	Gpus         []uint32 `json:"gpus"`
-	WarmModels   []uint64 `json:"warm_models,omitempty"`
+	Units        []uint32 `json:"units"`
+	Capabilities []string `json:"capabilities,omitempty"`
 	Load         float32  `json:"load"`
 	P50LatencyUs uint32   `json:"p50_latency_us"`
 }
@@ -1031,9 +1038,9 @@ func (m *MeshNode) PublishIslandTopology(rec IslandRecord) (int, error) {
 	return int(count), nil
 }
 
-// MatchGpuIslands matches islands against the criteria (read-only). Best
+// MatchIslands matches islands against the criteria (read-only). Best
 // island first; empty when nothing matched.
-func (m *MeshNode) MatchGpuIslands(crit GangCriteria) ([]uint64, error) {
+func (m *MeshNode) MatchIslands(crit GangCriteria) ([]uint64, error) {
 	data, err := json.Marshal(crit)
 	if err != nil {
 		return nil, fmt.Errorf("marshal criteria: %w", err)
@@ -1047,7 +1054,7 @@ func (m *MeshNode) MatchGpuIslands(crit GangCriteria) ([]uint64, error) {
 	}
 	// First pass: learn the total count, then fill a right-sized buffer.
 	var count C.size_t
-	code := C.net_mesh_match_gpu_islands(m.handle, cJSON, nil, 0, &count)
+	code := C.net_mesh_match_islands(m.handle, cJSON, nil, 0, &count)
 	if err := meshErrorFromCode(code); err != nil {
 		return nil, err
 	}
@@ -1055,7 +1062,7 @@ func (m *MeshNode) MatchGpuIslands(crit GangCriteria) ([]uint64, error) {
 		return nil, nil
 	}
 	ids := make([]uint64, int(count))
-	code = C.net_mesh_match_gpu_islands(
+	code = C.net_mesh_match_islands(
 		m.handle, cJSON, (*C.uint64_t)(unsafe.Pointer(&ids[0])), count, &count)
 	if err := meshErrorFromCode(code); err != nil {
 		return nil, err
@@ -1099,10 +1106,10 @@ func (m *MeshNode) ReleaseIsland(island uint64) (string, error) {
 	return claimOutcomeString(int(outcome)), nil
 }
 
-// ClaimGpuIsland matches + reserves the first available island in one
+// ClaimIsland matches + reserves the first available island in one
 // call. Returns (id, true, nil) on success, or (0, false, nil) when
 // nothing matched / all contended.
-func (m *MeshNode) ClaimGpuIsland(crit GangCriteria, untilUnixUs uint64) (uint64, bool, error) {
+func (m *MeshNode) ClaimIsland(crit GangCriteria, untilUnixUs uint64) (uint64, bool, error) {
 	data, err := json.Marshal(crit)
 	if err != nil {
 		return 0, false, fmt.Errorf("marshal criteria: %w", err)
@@ -1116,7 +1123,7 @@ func (m *MeshNode) ClaimGpuIsland(crit GangCriteria, untilUnixUs uint64) (uint64
 	}
 	var found C.int
 	var island C.uint64_t
-	code := C.net_mesh_claim_gpu_island(
+	code := C.net_mesh_claim_island(
 		m.handle, cJSON, C.uint64_t(untilUnixUs), &found, &island)
 	if err := meshErrorFromCode(code); err != nil {
 		return 0, false, err
