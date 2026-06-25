@@ -1,0 +1,47 @@
+net/crates/net/src/adapter/net/behavior/gang/quorum.rs
+  s_58a23d9389d6ed::t_33e8929abb1a09 271-274,285-288
+net/crates/net/src/adapter/net/cortex/workflow/lease.rs
+  s_58a23d9389d6ed::t_33e8929abb1a09 193-196,199-202
+net/crates/net/src/adapter/net/behavior/gang/schedule.rs
+  s_58a23d9389d6ed::t_33e8929abb1a09 22
+net/crates/net/src/adapter/net/behavior/gang/active.rs
+  s_58a23d9389d6ed::t_33e8929abb1a09 25,217,262
+net/crates/net/src/adapter/net/cortex/workflow/trigger.rs
+  s_58a23d9389d6ed::t_33e8929abb1a09 206-215,232-235,276,335
+net/crates/net/src/adapter/net/behavior/gang/mod.rs
+  s_58a23d9389d6ed::t_33e8929abb1a09 52,63
+net/crates/net/src/adapter/net/cortex/workflow/shard.rs
+  s_58a23d9389d6ed::t_33e8929abb1a09 28-32,296-299,367,492-495,532-535,542-545,552-560,562-570,572-576,608-611,616-628
+net/crates/net/src/adapter/net/cortex/workflow/adapter.rs
+  s_58a23d9389d6ed::t_33e8929abb1a09 27-28,115-118,180-183,350-356,382-386,525-528
+net/crates/net/src/adapter/net/behavior/gang/filter.rs
+  s_58a23d9389d6ed::t_33e8929abb1a09 14-16,108
+net/crates/net/src/adapter/net/behavior/gang/claim.rs
+  s_58a23d9389d6ed::t_33e8929abb1a09 130
+net/crates/net/src/adapter/net/cortex/workflow/fold.rs
+  s_58a23d9389d6ed::t_33e8929abb1a09 14-15
+net/crates/net/src/adapter/net/cortex/workflow/step.rs
+  s_58a23d9389d6ed::t_33e8929abb1a09 377,438-441,470-473,716-720
+net/crates/net/src/adapter/net/behavior/gang/contention.rs
+  s_58a23d9389d6ed::t_33e8929abb1a09 74,92-95,110-118,154-155,161-164
+net/crates/net/tests/gang_claim_node.rs
+  s_58a23d9389d6ed::t_33e8929abb1a09 19-20,146-150,168-170,216-220,254-258,341-344
+net/crates/net/src/adapter/net/behavior/gang/multi.rs
+  s_58a23d9389d6ed::t_33e8929abb1a09 33,249-253,421-425
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.11",
+  "base_commit_sha": "723d90074db7a7f02f619cc0ca27c6bed8190393",
+  "prompts": {},
+  "sessions": {
+    "s_58a23d9389d6ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92186006-b4bc-4409-9b64-7b1fa8e6ebfa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
