@@ -274,20 +274,30 @@ I/O, so a pure "evaluate → return actions" call is the cleanest boundary.
 
 ## 9. Parity matrix (keep honest as phases land)
 
+Legend: ✅ verified end-to-end here · 🟡 written + compiles, runtime CI-only.
+
 | Capability | Rust SDK | TS | Python | Go | C |
 |---|---|---|---|---|---|
-| publish/match/reserve/release/claim island | ✅ | ✅ | ✅ | ☐ | ☐ |
-| gang/island types | ✅ | ✅ | ✅ | ☐ | ☐ |
-| WorkflowAdapter open + transitions | ✅ | ✅ | ✅ | ☐ | ☐ |
-| Workflow reads (get/status_counts/subtree) | ✅ | ✅ | ✅ | ☐ | ☐ |
-| Workflow snapshot/restore | ✅ | ✅ | ✅ | ☐ | ☐ |
+| publish/match/reserve/release/claim island | ✅ | ✅ | ✅ | 🟡 | 🟡 |
+| gang/island types | ✅ | ✅ | ✅ | 🟡 | 🟡 |
+| WorkflowAdapter open + transitions | ✅ | ✅ | ✅ | 🟡 | 🟡 |
+| Workflow reads (get/status_counts/subtree¹) | ✅ | ✅ | ✅ | 🟡 | 🟡 |
+| Workflow snapshot/restore² | ✅ | ✅ | ✅ | ☐ | ☐ |
 | Shards (fan_out/try_join/propagate) — T2 | ☐ | ☐ | ☐ | ☐ | ☐ |
 | Triggers — T2 | ☐ | ☐ | ☐ | ☐ | ☐ |
 
-**Progress:** P0 (Rust SDK), P1 (TypeScript), P2 (Python) landed Tier 1 — all
-verified end-to-end (Rust surface tests; napi build + tsc + vitest; maturin build +
-pytest). P3 (Go/C) next. Python gang takes flat kwargs (no nested-criteria object),
-same as the napi side.
+¹ `subtree` not yet in the C ABI (Vec return); v1 ships the scalar reads.
+² snapshot/restore not yet in the workflow C ABI (Go/C) — follow-up.
+
+**Progress:** P0 (Rust SDK), P1 (TypeScript), P2 (Python) — Tier 1, verified
+end-to-end here (Rust surface tests; napi build + tsc + vitest; maturin build +
+pytest). P3 (Go/C): the C ABI (`net_workflow_*`, `net_mesh_*island*`) is in libnet
+and builds; `examples/scheduler.c` + the root `go/` wrappers are written and pass
+their local gates (cargo check + fmt; C example mirrors `meshos.c`; gofmt clean) —
+but the C/cgo *compile + run* is **CI-only** (no C toolchain in the dev sandbox).
+Remaining: the `bindings/go/net/` reference mirror + a Go test; workflow
+snapshot/restore + `subtree` in the C ABI. Python gang takes flat kwargs (same as
+napi); the C/Go gang takes a JSON criteria string.
 
 ---
 
