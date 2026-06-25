@@ -18,6 +18,30 @@ Line numbers are anchors at review time and may drift as the branch evolves.
 
 ---
 
+## Status — all findings resolved
+
+Every item below has been fixed on `mesh-scheduler` with a test where
+reasonable; each was committed separately (see `git log`, commit subjects
+tagged `(review #N)`). Highlights:
+
+- **#1–#8** (correctness): fixed. #1 self-index, #2 terminal-transition
+  guard, #3 loom model rewritten to production semantics (verified under
+  `--cfg loom`), #4 seedable epoch + documented Phase-D durability seam,
+  #5 holder-gated release, #6 Threshold `debug_assert`, #7 dead-arm
+  disarm, #8 best-effort rollback.
+- **#9–#14 + advisory** (quality/efficiency/altitude): fixed. #9 HashSet
+  cycle guard, #10 broadcast-error logging, #11 single `Claimant`
+  generation owner, #12 batched `HostedByAny` query, #13 `has_quorum`
+  reuse, #14 release orphaned reserve; plus non-finite `load` rejection
+  and the proptest checked cast.
+
+Note on **#4**: the fence/cohort durability across leader restarts is
+genuinely Phase-D live-wiring work; the commit adds the *seam*
+(`with_generation` to seed the epoch) and documents the requirement
+rather than building the unfinished durable store.
+
+---
+
 ## Correctness
 
 ### 1. `publish_island_topology` never applies to the node's own island fold
