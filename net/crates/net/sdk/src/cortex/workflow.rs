@@ -39,5 +39,26 @@
 //! ```
 
 pub use ::net::adapter::net::cortex::workflow::{
-    StatusCounts, TaskId, TaskState, TaskStatus, WorkflowAdapter,
+    StatusCounts, TaskId, TaskState, TaskStatus, WorkflowAdapter, WorkflowState,
 };
+
+// ---- Tier 2: shards (fan-out / fan-in) -------------------------------------
+
+/// Map-reduce fan-out / fan-in over a [`WorkflowAdapter`]: derive shard
+/// ids, [`fan_out`] them, and [`try_join`] (with a [`JoinPolicy`]) once
+/// they finish. A failed shard surfaces as [`Join::Failed`] rather than
+/// hanging the reduce; [`propagate_failure`] / [`block_on_failure`]
+/// apply the disposition.
+pub use ::net::adapter::net::cortex::workflow::{
+    block_on_failure, derive_shard_ids, fan_out, propagate_failure, try_join, try_join_with, Join,
+    JoinPolicy, JoinStatus, ShardGroup,
+};
+
+// ---- Tier 2: triggers (dependency / branch engine) -------------------------
+
+/// Pure, side-effect-free trigger substrate: [`arm`](TriggerEngine::arm)
+/// a [`Trigger`] to an [`Action`], then drive it with
+/// [`on_task_change`](TriggerEngine::on_task_change) /
+/// [`on_tick`](TriggerEngine::on_tick) — it returns the satisfied
+/// actions for the caller to apply (it starts no tasks itself).
+pub use ::net::adapter::net::cortex::workflow::{Action, Trigger, TriggerEngine, TriggerWorld};
