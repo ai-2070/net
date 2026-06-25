@@ -172,3 +172,23 @@ consistency cleanups. Everything on the Rust / napi / PyO3 side is solid.
 | F3 | Medium | Go binding | `Snapshot()` two-pass truncates to a corrupt buffer if state grows mid-call |
 | F4 | Low | C FFI | `TriggerEngineHandle`/`ShardGroupHandle` omit the sibling `HandleGuard` |
 | F5 | Nit | FFI / Go | `claim` skips pre-zero of `out_island`; `ShardGroup` no public `Free()`; unguarded `free()` |
+
+---
+
+## Closeout (2026-06-25)
+
+All five fixed on this branch. Tests run where the dev sandbox allows
+(`cargo test` for the Rust/FFI side; the Go tests are gofmt-clean and
+parse-checked but cgo-compile + run is CI-only, consistent with the
+branch's 🟡 status).
+
+| # | Resolution | Commit |
+|---|------------|--------|
+| F1 | `OnTick`/`OnTaskChange` size the buffer from `ArmedCount` and call once; `collectTriggerActions` helper. Go regression test (`go/scheduler_test.go`) + runnable FFI test (`ffi/cortex.rs`) pinning the consuming-single-call contract. | `fix(go): trigger OnTick/OnTaskChange dropped every fired action (F1)` |
+| F2 | Documented `net_trigger_on_task_change`/`on_tick` as consuming + single-shot in both `include/net_cortex.h` and `go/net_cortex.h`. | `docs(ffi): mark net_trigger_on_task_change/on_tick as consuming (F2)` |
+| F3 | `Snapshot()` grows the buffer and retries when the chain grew between the sizing and fill passes; round-trip restore test. | `fix(go): WorkflowAdapter.Snapshot() grows the buffer on retry (F3)` |
+| F4 | Documented the deliberate guard-less design on both Tier-2 handles (no in-flight async ops to drain; Go finalizer-only free + module contract). | `docs(ffi): justify the guard-less Tier-2 handles (F4)` |
+| F5 | Pre-zero `out_found`/`out_island` in `claim`; public `Free()` + `sync.Mutex`-guarded `free()` on `ShardGroup`/`TriggerEngine`. | `fix(ffi,go): pre-zero claim out_island; public Free() on Tier-2 handles (F5)` |
+
+Verified here: `cargo test -p net-mesh --features net,netdb,redex-disk --lib ffi::`
+→ 103 passed (incl. the new `trigger_on_tick_is_consuming_single_call`).
