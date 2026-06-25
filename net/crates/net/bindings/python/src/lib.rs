@@ -2935,6 +2935,9 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<cortex::PyTaskWatchIter>()?;
         m.add_class::<cortex::PyAsyncTasksAdapter>()?;
         m.add_class::<cortex::PyAsyncTaskWatchIter>()?;
+        m.add_class::<cortex::PyWorkflowAdapter>()?;
+        m.add_class::<cortex::PyWorkflowTaskState>()?;
+        m.add_class::<cortex::PyWorkflowStatusCounts>()?;
         m.add_class::<cortex::PyMemory>()?;
         m.add_class::<cortex::PyMemoriesAdapter>()?;
         m.add_class::<cortex::PyMemoryWatchIter>()?;

@@ -23,6 +23,10 @@ use ::net::adapter::net::cortex::tasks::{
     OrderBy as InnerTasksOrderBy, Task as InnerTask, TaskStatus as InnerTaskStatus,
     TasksAdapter as InnerTasksAdapter,
 };
+use ::net::adapter::net::cortex::workflow::{
+    StatusCounts as InnerStatusCounts, TaskState as InnerWfTaskState,
+    TaskStatus as InnerWfTaskStatus, WorkflowAdapter as InnerWorkflowAdapter,
+};
 use ::net::adapter::net::cortex::WaitForTokenError as InnerWaitForTokenError;
 use ::net::adapter::net::redex::{
     FsyncPolicy as InnerFsyncPolicy, PlacementStrategy as InnerPlacementStrategy,
@@ -3460,5 +3464,284 @@ impl PyAsyncToolWatchIter {
     fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.close();
         pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok::<(), PyErr>(()) })
+    }
+}
+
+// =========================================================================
+// Task lifecycle (WorkflowAdapter)
+// =========================================================================
+
+/// Materialized lifecycle state of one workflow task.
+#[pyclass(name = "WorkflowTaskState", from_py_object)]
+#[derive(Clone)]
+pub struct PyWorkflowTaskState {
+    #[pyo3(get)]
+    pub step: u32,
+    /// `submitted` / `running` / `waiting` / `blocked` / `done` / `failed`.
+    #[pyo3(get)]
+    pub status: String,
+    #[pyo3(get)]
+    pub attempts: u32,
+}
+
+impl From<InnerWfTaskState> for PyWorkflowTaskState {
+    fn from(t: InnerWfTaskState) -> Self {
+        Self {
+            step: t.step,
+            status: wf_status_str(t.status).to_string(),
+            attempts: t.attempts,
+        }
+    }
+}
+
+/// Roll-up of workflow task counts per status.
+#[pyclass(name = "WorkflowStatusCounts", from_py_object)]
+#[derive(Clone)]
+pub struct PyWorkflowStatusCounts {
+    #[pyo3(get)]
+    pub submitted: u64,
+    #[pyo3(get)]
+    pub running: u64,
+    #[pyo3(get)]
+    pub waiting: u64,
+    #[pyo3(get)]
+    pub blocked: u64,
+    #[pyo3(get)]
+    pub done: u64,
+    #[pyo3(get)]
+    pub failed: u64,
+}
+
+impl From<InnerStatusCounts> for PyWorkflowStatusCounts {
+    fn from(c: InnerStatusCounts) -> Self {
+        Self {
+            submitted: c.submitted as u64,
+            running: c.running as u64,
+            waiting: c.waiting as u64,
+            blocked: c.blocked as u64,
+            done: c.done as u64,
+            failed: c.failed as u64,
+        }
+    }
+}
+
+fn wf_status_str(s: InnerWfTaskStatus) -> &'static str {
+    match s {
+        InnerWfTaskStatus::Submitted => "submitted",
+        InnerWfTaskStatus::Running => "running",
+        InnerWfTaskStatus::Waiting => "waiting",
+        InnerWfTaskStatus::Blocked => "blocked",
+        InnerWfTaskStatus::Done => "done",
+        InnerWfTaskStatus::Failed => "failed",
+    }
+}
+
+fn parse_wf_status(s: &str) -> PyResult<InnerWfTaskStatus> {
+    Ok(match s {
+        "submitted" => InnerWfTaskStatus::Submitted,
+        "running" => InnerWfTaskStatus::Running,
+        "waiting" => InnerWfTaskStatus::Waiting,
+        "blocked" => InnerWfTaskStatus::Blocked,
+        "done" => InnerWfTaskStatus::Done,
+        "failed" => InnerWfTaskStatus::Failed,
+        other => return Err(CortexError::new_err(format!("unknown task status {other:?}"))),
+    })
+}
+
+/// Typed task-lifecycle adapter — a single-writer RedEX chain folded
+/// into per-task `{ step, status, attempts }`.
+#[pyclass(name = "WorkflowAdapter", from_py_object)]
+#[derive(Clone)]
+pub struct PyWorkflowAdapter {
+    inner: Arc<InnerWorkflowAdapter>,
+    runtime: Arc<Runtime>,
+}
+
+#[pymethods]
+impl PyWorkflowAdapter {
+    /// Open the workflow adapter against a Redex manager.
+    #[staticmethod]
+    #[pyo3(signature = (redex, origin_hash, persistent = false))]
+    fn open(py: Python<'_>, redex: &PyRedex, origin_hash: u64, persistent: bool) -> PyResult<Self> {
+        let runtime = make_runtime()?;
+        let redex_inner = redex.inner.clone();
+        let cfg = cfg_from_persistent(persistent);
+        let runtime_for_block = runtime.clone();
+        let inner = py
+            .detach(move || {
+                runtime_for_block.block_on(async move {
+                    InnerWorkflowAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
+                })
+            })
+            .map_err(|e| CortexError::new_err(format!("WorkflowAdapter open failed: {}", e)))?;
+        Ok(Self {
+            inner: Arc::new(inner),
+            runtime,
+        })
+    }
+
+    /// Open from a snapshot, skipping replay up through `last_seq`.
+    #[staticmethod]
+    #[pyo3(signature = (redex, origin_hash, state_bytes, last_seq = None, persistent = false))]
+    fn open_from_snapshot(
+        py: Python<'_>,
+        redex: &PyRedex,
+        origin_hash: u64,
+        state_bytes: &[u8],
+        last_seq: Option<u64>,
+        persistent: bool,
+    ) -> PyResult<Self> {
+        let runtime = make_runtime()?;
+        let redex_inner = redex.inner.clone();
+        let cfg = cfg_from_persistent(persistent);
+        let bytes = state_bytes.to_vec();
+        let runtime_for_block = runtime.clone();
+        let inner = py
+            .detach(move || {
+                runtime_for_block.block_on(async move {
+                    InnerWorkflowAdapter::open_from_snapshot_with_config(
+                        &redex_inner,
+                        origin_hash,
+                        cfg,
+                        &bytes,
+                        last_seq,
+                    )
+                    .await
+                })
+            })
+            .map_err(|e| {
+                CortexError::new_err(format!("WorkflowAdapter open_from_snapshot failed: {}", e))
+            })?;
+        Ok(Self {
+            inner: Arc::new(inner),
+            runtime,
+        })
+    }
+
+    /// Submit a new task — enters at step 0, `submitted`.
+    fn submit(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .submit(id)
+            .map_err(|e| CortexError::new_err(format!("submit failed: {}", e)))
+    }
+
+    /// Set a task's status. A terminal task is never moved.
+    fn transition(&self, id: u64, status: &str) -> PyResult<u64> {
+        self.inner
+            .transition(id, parse_wf_status(status)?)
+            .map_err(|e| CortexError::new_err(format!("transition failed: {}", e)))
+    }
+
+    /// Mark the task `running`.
+    fn start(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .start(id)
+            .map_err(|e| CortexError::new_err(format!("start failed: {}", e)))
+    }
+
+    /// Park the task `waiting`.
+    fn wait(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .wait(id)
+            .map_err(|e| CortexError::new_err(format!("wait failed: {}", e)))
+    }
+
+    /// Park the task `blocked`.
+    fn block(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .block(id)
+            .map_err(|e| CortexError::new_err(format!("block failed: {}", e)))
+    }
+
+    /// Mark the task `done` (terminal success).
+    fn complete(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .complete(id)
+            .map_err(|e| CortexError::new_err(format!("complete failed: {}", e)))
+    }
+
+    /// Mark the task `failed` (terminal failure).
+    fn fail(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .fail(id)
+            .map_err(|e| CortexError::new_err(format!("fail failed: {}", e)))
+    }
+
+    /// Advance the step cursor (bumps step, resets attempts).
+    fn advance(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .advance(id)
+            .map_err(|e| CortexError::new_err(format!("advance failed: {}", e)))
+    }
+
+    /// Retry the current step. Never resurrects a `done` task.
+    fn retry(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .retry(id)
+            .map_err(|e| CortexError::new_err(format!("retry failed: {}", e)))
+    }
+
+    /// Delete a task, reclaiming its whole linked subtree.
+    fn delete(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .delete(id)
+            .map_err(|e| CortexError::new_err(format!("delete failed: {}", e)))
+    }
+
+    /// Record a parent->child lineage edge (idempotent).
+    fn link(&self, parent: u64, child: u64) -> PyResult<u64> {
+        self.inner
+            .link(parent, child)
+            .map_err(|e| CortexError::new_err(format!("link failed: {}", e)))
+    }
+
+    /// Request cancellation — a worker-observed signal.
+    fn request_cancel(&self, id: u64) -> PyResult<u64> {
+        self.inner
+            .request_cancel(id)
+            .map_err(|e| CortexError::new_err(format!("request_cancel failed: {}", e)))
+    }
+
+    /// Current state for `id`, or `None` if unknown.
+    fn get(&self, id: u64) -> Option<PyWorkflowTaskState> {
+        self.inner.get(id).map(PyWorkflowTaskState::from)
+    }
+
+    /// Has cancellation been requested for `id`?
+    fn is_cancel_requested(&self, id: u64) -> bool {
+        self.inner.is_cancel_requested(id)
+    }
+
+    /// `id` plus all transitive descendants — the delete subtree.
+    fn subtree(&self, id: u64) -> Vec<u64> {
+        self.inner.subtree(id)
+    }
+
+    /// Roll-up of task counts per status.
+    fn status_counts(&self) -> PyWorkflowStatusCounts {
+        self.inner.status_counts().into()
+    }
+
+    /// Capture a state snapshot. Returns `(state_bytes, last_seq)`.
+    fn snapshot(&self) -> PyResult<(Vec<u8>, Option<u64>)> {
+        self.inner
+            .snapshot()
+            .map_err(|e| CortexError::new_err(format!("snapshot failed: {}", e)))
+    }
+
+    /// Block until every event up through `seq` has folded. Releases
+    /// the GIL for the wait.
+    fn wait_for_seq(&self, py: Python<'_>, seq: u64) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let runtime = self.runtime.clone();
+        py.detach(|| {
+            runtime
+                .block_on(async move { inner.wait_for_seq(seq).await })
+                .map_err(|folded| {
+                    CortexError::new_err(format!(
+                        "wait_for_seq: fold task stopped; folded_through={folded:?}"
+                    ))
+                })
+        })
     }
 }
