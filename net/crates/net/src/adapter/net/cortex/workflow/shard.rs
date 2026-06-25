@@ -183,6 +183,16 @@ impl ShardGroup {
                 }
             }
             JoinPolicy::Threshold(n) => {
+                // `n > total` is unsatisfiable by construction — a
+                // misconfigured join, not a shard failure. It is the
+                // only way the `Failed` branch below can fire with an
+                // empty `failed` set (failed.is_empty() ⟹ total < n),
+                // which would otherwise fail the parent citing no shard.
+                // Catch it in debug as the config bug it is.
+                debug_assert!(
+                    n <= total,
+                    "Threshold({n}) exceeds shard count {total}: unsatisfiable by construction"
+                );
                 if done >= n {
                     JoinStatus::Ready
                 } else if total.saturating_sub(failed.len()) < n {
@@ -415,6 +425,23 @@ mod tests {
     fn empty_group_joins_immediately() {
         let group = ShardGroup::new(vec![], 9);
         assert!(group.join_ready(&WorkflowState::new()));
+    }
+
+    /// A `Threshold(n)` with `n` above the shard count can never satisfy
+    /// — it is a misconfiguration, not a shard failure. Without the
+    /// guard it returned `Failed(vec![])` (an empty failed-set that
+    /// would fail the parent citing no shard); the debug_assert catches
+    /// it as the config bug it is (review #6).
+    #[test]
+    #[should_panic(expected = "exceeds shard count")]
+    fn threshold_above_shard_count_is_caught() {
+        let group = ShardGroup::new(vec![1, 2, 3], 9);
+        let running = state_with(&[
+            (1, TaskStatus::Running),
+            (2, TaskStatus::Running),
+            (3, TaskStatus::Running),
+        ]);
+        let _ = group.join_status(&running, JoinPolicy::Threshold(5));
     }
 
     /// Phase C "Done when": a map-reduce runs with per-shard retry and a
