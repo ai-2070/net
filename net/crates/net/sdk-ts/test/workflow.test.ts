@@ -83,4 +83,14 @@ describe('WorkflowAdapter shards + triggers (Tier 2)', () => {
     expect(actions).toEqual([{ kind: 'submit', id: 2n }]);
     expect(eng.armedCount()).toBe(0);
   });
+
+  it('an AtTick trigger fires when the clock advances', async () => {
+    const wf = await WorkflowAdapter.open(new Redex(), ORIGIN);
+    const eng = new TriggerEngine(wf);
+    eng.armAtTick(5n, { kind: 'submit', id: 3n });
+
+    expect(eng.onTick(4n)).toEqual([]); // not due yet
+    expect(eng.onTick(5n)).toEqual([{ kind: 'submit', id: 3n }]); // due
+    expect(eng.armedCount()).toBe(0);
+  });
 });

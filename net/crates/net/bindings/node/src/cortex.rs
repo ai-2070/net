@@ -2717,6 +2717,27 @@ impl TriggerEngine {
         Ok(actions.into_iter().map(action_to_js).collect())
     }
 
+    /// Arm `AtTick(tick)` -> action (fires once the clock reaches `tick`).
+    #[napi]
+    pub fn arm_at_tick(&self, tick: BigInt, action_kind: String, action_id: BigInt) -> Result<()> {
+        let trigger = InnerWfTrigger::AtTick(bigint_u64(tick)?);
+        let action = parse_action(&action_kind, bigint_u64(action_id)?)?;
+        self.engine.lock().unwrap().arm(trigger, action);
+        Ok(())
+    }
+
+    /// The clock advanced to `now`: fire + disarm every `AtTick` trigger
+    /// whose deadline has passed. Returns the fired actions.
+    #[napi]
+    pub fn on_tick(&self, now: BigInt) -> Result<Vec<TriggerAction>> {
+        let now = bigint_u64(now)?;
+        let state = self.adapter.state();
+        let guard = state.read();
+        let world = InnerTriggerWorld::new(&guard, now);
+        let actions = self.engine.lock().unwrap().on_tick(&world);
+        Ok(actions.into_iter().map(action_to_js).collect())
+    }
+
     /// Total armed (not-yet-fired) triggers.
     #[napi]
     pub fn armed_count(&self) -> u32 {

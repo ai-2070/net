@@ -117,3 +117,14 @@ def test_trigger_fires_dependent_on_done() -> None:
     assert actions[0].kind == "submit"
     assert actions[0].id == 2
     assert eng.armed_count() == 0
+
+
+def test_at_tick_trigger_fires_on_clock_advance() -> None:
+    wf = WorkflowAdapter.open(Redex(), ORIGIN)
+    eng = TriggerEngine(wf)
+    eng.arm_at_tick(5, "submit", 3)
+
+    assert eng.on_tick(4) == []  # not due yet
+    fired = eng.on_tick(5)  # due
+    assert len(fired) == 1 and fired[0].kind == "submit" and fired[0].id == 3
+    assert eng.armed_count() == 0

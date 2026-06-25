@@ -1061,6 +1061,16 @@ export class TriggerEngine {
     return this.napi.onTaskChange(task, tick ?? null);
   }
 
+  /** Arm AtTick(tick) -> action (fires once the clock reaches `tick`). */
+  armAtTick(tick: bigint, action: TriggerAction): void {
+    this.napi.armAtTick(tick, action.kind, action.id);
+  }
+
+  /** The clock advanced to `now`: return the AtTick actions now due. */
+  onTick(now: bigint): TriggerAction[] {
+    return this.napi.onTick(now);
+  }
+
   /** Total armed (not-yet-fired) triggers. */
   armedCount(): number {
     return this.napi.armedCount();

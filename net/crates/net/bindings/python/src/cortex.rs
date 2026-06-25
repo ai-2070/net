@@ -3905,6 +3905,26 @@ impl PyTriggerEngine {
         actions.into_iter().map(wf_action_to_py).collect()
     }
 
+    /// Arm `AtTick(tick)` -> action (fires once the clock reaches `tick`).
+    fn arm_at_tick(&self, tick: u64, action_kind: &str, action_id: u64) -> PyResult<()> {
+        let action = parse_wf_action(action_kind, action_id)?;
+        self.engine
+            .lock()
+            .unwrap()
+            .arm(InnerWfTrigger::AtTick(tick), action);
+        Ok(())
+    }
+
+    /// The clock advanced to `now`: fire + disarm every `AtTick` trigger
+    /// whose deadline has passed. Returns the fired actions.
+    fn on_tick(&self, now: u64) -> Vec<PyTriggerAction> {
+        let state = self.adapter.state();
+        let guard = state.read();
+        let world = InnerTriggerWorld::new(&guard, now);
+        let actions = self.engine.lock().unwrap().on_tick(&world);
+        actions.into_iter().map(wf_action_to_py).collect()
+    }
+
     /// Total armed (not-yet-fired) triggers.
     fn armed_count(&self) -> usize {
         self.engine.lock().unwrap().armed_count()
