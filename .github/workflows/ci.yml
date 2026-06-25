@@ -825,6 +825,21 @@ jobs:
           RUN_INTEGRATION_TESTS: "1"
         run: go test -v -tags test_helpers ./...
 
+      # `abi_stability_cgo_test.go` (+ its self-contained `_cgo.go`
+      # helper) is gated behind the DISTINCT `abi_stability` build tag —
+      # cgo directives can't live in a `_test.go`, so the helper sits in a
+      # tagged regular `.go` file kept out of shipped SDK builds, and a
+      # separate tag avoids pulling in the `test_helpers` groups FFI
+      # symbols. Neither run above passes `-tags abi_stability`, so the
+      # cgo u64 ABI round-trip (TEST_COVERAGE_PLAN §P3-15) was silently
+      # excluded from CI. `-run` keeps this to just that test — it's a
+      # fast unit test, no need to re-run the integration suite.
+      - name: Run Go ABI-stability cgo test
+        working-directory: go
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
+        run: go test -v -tags abi_stability -run TestABIStabilityU64FFIRoundTrip ./...
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
