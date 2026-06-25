@@ -211,7 +211,7 @@ impl TriggerEngine {
     /// `task` changed status: evaluate only the triggers waiting on it,
     /// returning + disarming the satisfied ones. Triggers that aren't
     /// yet satisfied stay armed — unless they can *never* be satisfied
-    /// ([`Trigger::is_dead`], e.g. a branch's non-matching `IfResult`
+    /// (`Trigger::is_dead`, e.g. a branch's non-matching `IfResult`
     /// arm once the task is terminal), which are dropped so they don't
     /// accumulate forever (review #7).
     pub fn on_task_change(&mut self, task: TaskId, world: &TriggerWorld<'_>) -> Vec<Action> {
