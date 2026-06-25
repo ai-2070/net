@@ -21,7 +21,22 @@ jobs:
   unit-tests:
     name: Unit tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Wider feature set than before → larger compile; the target cache
+    # keeps incremental runs fast, but leave headroom for a cold build.
+    timeout-minutes: 40
+    env:
+      # The widest SERVICE-FREE feature set — every feature except
+      # `redis` / `jetstream`, which need running service containers.
+      #
+      # The gating `--lib` / `--doc` run MUST stay this broad. In-source
+      # `#[cfg(test)]` units behind `meshos` / `port-mapping` /
+      # `nat-traversal` / `meshdb` / `dataforts` / `cli` … are otherwise
+      # gated by NO job: the per-feature `integration-tests` steps pin
+      # `--test <file>` (which runs only those integration binaries, not
+      # the lib units), and the one job that does run them — the Coverage
+      # workflow — is information-only / non-gating. Narrowing this list
+      # silently drops every feature-gated unit test out of CI.
+      UNIT_FEATURES: "net redex redex-disk cortex netdb meshdb meshos dataforts nat-traversal port-mapping tool batched-ingress cli regex"
     defaults:
       run:
         working-directory: net/crates/net
@@ -42,16 +57,20 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-unit-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Run unit tests
-        run: cargo test --lib --features "net redex cortex netdb"
+      # `--lib` runs EVERY in-source `#[cfg(test)]` unit; the broad
+      # `$UNIT_FEATURES` set is what makes feature-gated modules (meshos,
+      # port-mapping, …) actually compile + run here rather than only in
+      # the non-gating Coverage workflow.
+      - name: Run unit tests (all in-source units, full feature set)
+        run: cargo test --lib --features "$UNIT_FEATURES"
 
       # Doctests live in `///` comment blocks across `src/` and `sdk/src/`.
       # `cargo test --lib` does not execute them — they need a separate
-      # `cargo test --doc` invocation. Same feature set as the unit-test
-      # run so doc examples gated on those features compile.
+      # `cargo test --doc` invocation. Same broad feature set so doc
+      # examples gated on any feature compile + run.
       - name: Run doctests
         if: ${{ !cancelled() }}
-        run: cargo test --doc --features "net redex cortex netdb"
+        run: cargo test --doc --features "$UNIT_FEATURES"
 
       # `deck` is a separate workspace member (TUI operator console).
       # It's a binary-only package — `[[bin]]` with no `[lib]` — so
