@@ -161,6 +161,14 @@ int  net_trigger_on_tick(net_trigger_engine_t* handle, uint64_t now,
                          size_t* out_count);
 int  net_workflow_subtree(net_workflow_adapter_t* handle, uint64_t id,
                           uint64_t* out_ids, size_t cap, size_t* out_count);
+int  net_workflow_snapshot(net_workflow_adapter_t* handle, uint8_t* out_bytes,
+                           size_t cap, size_t* out_len, uint64_t* out_last_seq,
+                           int* out_has_last_seq);
+int  net_workflow_open_from_snapshot(net_redex_t* redex, uint64_t origin_hash,
+                                     int persistent, const uint8_t* state_bytes,
+                                     size_t state_len, uint64_t last_seq,
+                                     int has_last_seq,
+                                     net_workflow_adapter_t** out_handle);
 
 /* ---- Memories adapter ---- */
 int  net_memories_adapter_open(net_redex_t* redex, uint64_t origin_hash,

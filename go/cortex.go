@@ -1276,6 +1276,71 @@ func (w *WorkflowAdapter) Subtree(id uint64) ([]uint64, error) {
 	return ids, nil
 }
 
+// Snapshot captures a state snapshot: the bytes plus the snapshot's last
+// seq (hasLastSeq is false when the chain was empty). Restore both
+// together via OpenWorkflowFromSnapshot.
+func (w *WorkflowAdapter) Snapshot() (bytes []byte, lastSeq uint64, hasLastSeq bool, err error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return nil, 0, false, ErrShuttingDown
+	}
+	var length C.size_t
+	var seq C.uint64_t
+	var has C.int
+	code := C.net_workflow_snapshot(w.handle, nil, 0, &length, &seq, &has)
+	if e := cortexErrorFromCode(code); e != nil {
+		return nil, 0, false, e
+	}
+	buf := make([]byte, int(length))
+	if length > 0 {
+		code = C.net_workflow_snapshot(
+			w.handle, (*C.uint8_t)(unsafe.Pointer(&buf[0])), length, &length, &seq, &has)
+		if e := cortexErrorFromCode(code); e != nil {
+			return nil, 0, false, e
+		}
+		if int(length) < len(buf) {
+			buf = buf[:int(length)]
+		}
+	}
+	return buf, uint64(seq), has != 0, nil
+}
+
+// OpenWorkflowFromSnapshot opens a workflow adapter from a snapshot,
+// skipping replay up through lastSeq when hasLastSeq is true.
+func OpenWorkflowFromSnapshot(
+	redex *Redex, originHash uint64, persistent bool,
+	snapshot []byte, lastSeq uint64, hasLastSeq bool,
+) (*WorkflowAdapter, error) {
+	var p C.int
+	if persistent {
+		p = 1
+	}
+	var has C.int
+	if hasLastSeq {
+		has = 1
+	}
+	redex.mu.RLock()
+	defer redex.mu.RUnlock()
+	if redex.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	var ptr *C.uint8_t
+	if len(snapshot) > 0 {
+		ptr = (*C.uint8_t)(unsafe.Pointer(&snapshot[0]))
+	}
+	var out *C.net_workflow_adapter_t
+	code := C.net_workflow_open_from_snapshot(
+		redex.handle, C.uint64_t(originHash), p, ptr, C.size_t(len(snapshot)),
+		C.uint64_t(lastSeq), has, &out)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	wf := &WorkflowAdapter{handle: out}
+	runtime.SetFinalizer(wf, (*WorkflowAdapter).free)
+	return wf, nil
+}
+
 // ---------------------------------------------------------------------------
 // Tier 2: shards (fan-out / fan-in)
 // ---------------------------------------------------------------------------

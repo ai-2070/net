@@ -4016,6 +4016,114 @@ pub unsafe extern "C" fn net_workflow_subtree(
     0
 }
 
+/// Capture a state snapshot. Two-pass like the other buffer returns:
+/// call with `out_bytes` NULL to learn `*out_len`, then again with a
+/// `cap`-sized buffer. `*out_last_seq` / `*out_has_last_seq` carry the
+/// snapshot's last seq (restore both together via `open_from_snapshot`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_snapshot(
+    handle: *mut WorkflowAdapterHandle,
+    out_bytes: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+    out_last_seq: *mut u64,
+    out_has_last_seq: *mut c_int,
+) -> c_int {
+    if handle.is_null() || out_len.is_null() || out_last_seq.is_null() || out_has_last_seq.is_null()
+    {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*handle };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let (bytes, last_seq) = match wf.inner.snapshot() {
+        Ok(v) => v,
+        Err(_) => return NET_ERR_CORTEX_FOLD,
+    };
+    unsafe {
+        *out_len = bytes.len();
+        match last_seq {
+            Some(s) => {
+                *out_last_seq = s;
+                *out_has_last_seq = 1;
+            }
+            None => {
+                *out_last_seq = 0;
+                *out_has_last_seq = 0;
+            }
+        }
+        if !out_bytes.is_null() {
+            let n = bytes.len().min(cap);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_bytes, n);
+        }
+    }
+    0
+}
+
+/// Open a workflow adapter from a snapshot (skips replay up through
+/// `last_seq` when `has_last_seq != 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_open_from_snapshot(
+    redex: *mut RedexHandle,
+    origin_hash: u64,
+    persistent: c_int,
+    state_bytes: *const u8,
+    state_len: usize,
+    last_seq: u64,
+    has_last_seq: c_int,
+    out_handle: *mut *mut WorkflowAdapterHandle,
+) -> c_int {
+    if redex.is_null() || out_handle.is_null() || (state_bytes.is_null() && state_len != 0) {
+        return NetError::NullPointer.into();
+    }
+    let redex = unsafe { &*redex };
+    let _op = match redex.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let cfg = if persistent != 0 {
+        RedexFileConfig::default().with_persistent(true)
+    } else {
+        RedexFileConfig::default()
+    };
+    let bytes: Vec<u8> = if state_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(state_bytes, state_len) }.to_vec()
+    };
+    let last = if has_last_seq != 0 {
+        Some(last_seq)
+    } else {
+        None
+    };
+    let redex_inner: Arc<InnerRedex> = Arc::clone(&redex.inner);
+    let result = block_on(async move {
+        InnerWorkflowAdapter::open_from_snapshot_with_config(
+            &redex_inner,
+            origin_hash,
+            cfg,
+            &bytes,
+            last,
+        )
+        .await
+    });
+    match result {
+        Ok(adapter) => {
+            let handle = Box::new(WorkflowAdapterHandle {
+                inner: ManuallyDrop::new(Arc::new(adapter)),
+                guard: HandleGuard::new(),
+            });
+            unsafe {
+                *out_handle = Box::into_raw(handle);
+            }
+            0
+        }
+        Err(_) => NET_ERR_CORTEX_FOLD,
+    }
+}
+
 // ABI-visible no-op to force the linker to keep `c_void` happy on
 // some older linkers; harmless otherwise.
 #[doc(hidden)]
