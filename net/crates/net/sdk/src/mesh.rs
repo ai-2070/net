@@ -874,8 +874,8 @@ impl Mesh {
         Ok(self.node.publish_island_topology(record).await?)
     }
 
-    /// Match GPU islands against `criteria` over this node's capability
-    /// + island folds (read-only; no claim). Best island first per the
+    /// Match GPU islands against `criteria` over this node's capability +
+    /// island folds (read-only; no claim). Best island first per the
     /// selection policy. Empty when nothing matched.
     pub fn match_gpu_islands(
         &self,

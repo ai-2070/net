@@ -3866,11 +3866,11 @@ fn parse_wf_action(kind: &str, id: u64) -> PyResult<InnerWfAction> {
 /// apply (it starts no tasks itself).
 #[pyclass(name = "TriggerEngine")]
 pub struct PyTriggerEngine {
-    engine: std::sync::Mutex<InnerTriggerEngine>,
+    engine: parking_lot::Mutex<InnerTriggerEngine>,
     /// Recorded task results (via `record_result`) threaded into the
     /// `TriggerWorld` so `IfResult` branches can evaluate.
     results:
-        std::sync::Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, String>>>,
+        parking_lot::Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, String>>>,
     adapter: Arc<InnerWorkflowAdapter>,
 }
 
@@ -3879,8 +3879,8 @@ impl PyTriggerEngine {
     #[new]
     fn new(wf: &PyWorkflowAdapter) -> Self {
         Self {
-            engine: std::sync::Mutex::new(InnerTriggerEngine::new()),
-            results: std::sync::Mutex::new(std::collections::HashMap::new()),
+            engine: parking_lot::Mutex::new(InnerTriggerEngine::new()),
+            results: parking_lot::Mutex::new(std::collections::HashMap::new()),
             adapter: wf.inner.clone(),
         }
     }
@@ -3890,7 +3890,6 @@ impl PyTriggerEngine {
         let action = parse_wf_action(action_kind, action_id)?;
         self.engine
             .lock()
-            .unwrap()
             .arm(InnerWfTrigger::AfterTask(task), action);
         Ok(())
     }
@@ -3909,7 +3908,6 @@ impl PyTriggerEngine {
         let action = parse_wf_action(action_kind, action_id)?;
         self.engine
             .lock()
-            .unwrap()
             .arm(InnerWfTrigger::IfResult { task, key, value }, action);
         Ok(())
     }
@@ -3918,7 +3916,6 @@ impl PyTriggerEngine {
     fn record_result(&self, task: u64, key: String, value: String) {
         self.results
             .lock()
-            .unwrap()
             .entry(task)
             .or_default()
             .insert(key, value);
@@ -3929,7 +3926,6 @@ impl PyTriggerEngine {
         let action = parse_wf_action(action_kind, action_id)?;
         self.engine
             .lock()
-            .unwrap()
             .arm(InnerWfTrigger::AfterTerminal(task), action);
         Ok(())
     }
@@ -3940,9 +3936,9 @@ impl PyTriggerEngine {
     fn on_task_change(&self, task: u64, tick: u64) -> Vec<PyTriggerAction> {
         let state = self.adapter.state();
         let guard = state.read();
-        let results = self.results.lock().unwrap();
+        let results = self.results.lock();
         let world = InnerTriggerWorld::with_results(&guard, tick, &results);
-        let actions = self.engine.lock().unwrap().on_task_change(task, &world);
+        let actions = self.engine.lock().on_task_change(task, &world);
         actions.into_iter().map(wf_action_to_py).collect()
     }
 
@@ -3951,7 +3947,6 @@ impl PyTriggerEngine {
         let action = parse_wf_action(action_kind, action_id)?;
         self.engine
             .lock()
-            .unwrap()
             .arm(InnerWfTrigger::AtTick(tick), action);
         Ok(())
     }
@@ -3961,14 +3956,14 @@ impl PyTriggerEngine {
     fn on_tick(&self, now: u64) -> Vec<PyTriggerAction> {
         let state = self.adapter.state();
         let guard = state.read();
-        let results = self.results.lock().unwrap();
+        let results = self.results.lock();
         let world = InnerTriggerWorld::with_results(&guard, now, &results);
-        let actions = self.engine.lock().unwrap().on_tick(&world);
+        let actions = self.engine.lock().on_tick(&world);
         actions.into_iter().map(wf_action_to_py).collect()
     }
 
     /// Total armed (not-yet-fired) triggers.
     fn armed_count(&self) -> usize {
-        self.engine.lock().unwrap().armed_count()
+        self.engine.lock().armed_count()
     }
 }

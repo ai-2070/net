@@ -2671,11 +2671,11 @@ fn parse_action(kind: &str, id: u64) -> Result<InnerWfAction> {
 /// to apply (it starts no tasks itself).
 #[napi]
 pub struct TriggerEngine {
-    engine: std::sync::Mutex<InnerTriggerEngine>,
+    engine: parking_lot::Mutex<InnerTriggerEngine>,
     /// Recorded task results (populated via `recordResult`), threaded
     /// into the `TriggerWorld` so `IfResult` branches can evaluate.
     results:
-        std::sync::Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, String>>>,
+        parking_lot::Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, String>>>,
     adapter: Arc<InnerWorkflowAdapter>,
 }
 
@@ -2684,8 +2684,8 @@ impl TriggerEngine {
     #[napi(constructor)]
     pub fn new(wf: &WorkflowAdapter) -> Self {
         Self {
-            engine: std::sync::Mutex::new(InnerTriggerEngine::new()),
-            results: std::sync::Mutex::new(std::collections::HashMap::new()),
+            engine: parking_lot::Mutex::new(InnerTriggerEngine::new()),
+            results: parking_lot::Mutex::new(std::collections::HashMap::new()),
             adapter: wf.inner.clone(),
         }
     }
@@ -2700,7 +2700,7 @@ impl TriggerEngine {
     ) -> Result<()> {
         let trigger = InnerWfTrigger::AfterTask(bigint_u64(task)?);
         let action = parse_action(&action_kind, bigint_u64(action_id)?)?;
-        self.engine.lock().unwrap().arm(trigger, action);
+        self.engine.lock().arm(trigger, action);
         Ok(())
     }
 
@@ -2722,7 +2722,7 @@ impl TriggerEngine {
             value,
         };
         let action = parse_action(&action_kind, bigint_u64(action_id)?)?;
-        self.engine.lock().unwrap().arm(trigger, action);
+        self.engine.lock().arm(trigger, action);
         Ok(())
     }
 
@@ -2731,7 +2731,6 @@ impl TriggerEngine {
     pub fn record_result(&self, task: BigInt, key: String, value: String) -> Result<()> {
         self.results
             .lock()
-            .unwrap()
             .entry(bigint_u64(task)?)
             .or_default()
             .insert(key, value);
@@ -2748,7 +2747,7 @@ impl TriggerEngine {
     ) -> Result<()> {
         let trigger = InnerWfTrigger::AfterTerminal(bigint_u64(task)?);
         let action = parse_action(&action_kind, bigint_u64(action_id)?)?;
-        self.engine.lock().unwrap().arm(trigger, action);
+        self.engine.lock().arm(trigger, action);
         Ok(())
     }
 
@@ -2760,9 +2759,9 @@ impl TriggerEngine {
         let tick = tick.map(bigint_u64).transpose()?.unwrap_or(0);
         let state = self.adapter.state();
         let guard = state.read();
-        let results = self.results.lock().unwrap();
+        let results = self.results.lock();
         let world = InnerTriggerWorld::with_results(&guard, tick, &results);
-        let actions = self.engine.lock().unwrap().on_task_change(task, &world);
+        let actions = self.engine.lock().on_task_change(task, &world);
         Ok(actions.into_iter().map(action_to_js).collect())
     }
 
@@ -2771,7 +2770,7 @@ impl TriggerEngine {
     pub fn arm_at_tick(&self, tick: BigInt, action_kind: String, action_id: BigInt) -> Result<()> {
         let trigger = InnerWfTrigger::AtTick(bigint_u64(tick)?);
         let action = parse_action(&action_kind, bigint_u64(action_id)?)?;
-        self.engine.lock().unwrap().arm(trigger, action);
+        self.engine.lock().arm(trigger, action);
         Ok(())
     }
 
@@ -2782,15 +2781,15 @@ impl TriggerEngine {
         let now = bigint_u64(now)?;
         let state = self.adapter.state();
         let guard = state.read();
-        let results = self.results.lock().unwrap();
+        let results = self.results.lock();
         let world = InnerTriggerWorld::with_results(&guard, now, &results);
-        let actions = self.engine.lock().unwrap().on_tick(&world);
+        let actions = self.engine.lock().on_tick(&world);
         Ok(actions.into_iter().map(action_to_js).collect())
     }
 
     /// Total armed (not-yet-fired) triggers.
     #[napi]
     pub fn armed_count(&self) -> u32 {
-        self.engine.lock().unwrap().armed_count() as u32
+        self.engine.lock().armed_count() as u32
     }
 }

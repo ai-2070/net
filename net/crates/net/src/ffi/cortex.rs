@@ -3789,11 +3789,11 @@ pub unsafe extern "C" fn net_workflow_try_join(
 
 /// FFI handle: the pure trigger engine + the bound adapter (state reads).
 pub struct TriggerEngineHandle {
-    engine: std::sync::Mutex<InnerTriggerEngine>,
+    engine: parking_lot::Mutex<InnerTriggerEngine>,
     /// Recorded task results (via `net_trigger_record_result`) threaded
     /// into the `TriggerWorld` so `IfResult` branches can evaluate.
     results:
-        std::sync::Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, String>>>,
+        parking_lot::Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, String>>>,
     adapter: Arc<InnerWorkflowAdapter>,
 }
 
@@ -3827,8 +3827,8 @@ pub unsafe extern "C" fn net_trigger_engine_new(
         None => return NetError::ShuttingDown.into(),
     };
     let handle = Box::new(TriggerEngineHandle {
-        engine: std::sync::Mutex::new(InnerTriggerEngine::new()),
-        results: std::sync::Mutex::new(std::collections::HashMap::new()),
+        engine: parking_lot::Mutex::new(InnerTriggerEngine::new()),
+        results: parking_lot::Mutex::new(std::collections::HashMap::new()),
         adapter: Arc::clone(&wf.inner),
     });
     unsafe {
@@ -3858,7 +3858,7 @@ unsafe fn trigger_arm(
         return NET_ERR_CORTEX_FOLD; // unknown action kind
     };
     let h = unsafe { &*handle };
-    h.engine.lock().unwrap().arm(trigger, action);
+    h.engine.lock().arm(trigger, action);
     0
 }
 
@@ -3915,7 +3915,6 @@ pub unsafe extern "C" fn net_trigger_record_result(
     let h = unsafe { &*handle };
     h.results
         .lock()
-        .unwrap()
         .entry(task)
         .or_default()
         .insert(key, value);
@@ -3977,9 +3976,9 @@ pub unsafe extern "C" fn net_trigger_on_task_change(
     let h = unsafe { &*handle };
     let state = h.adapter.state();
     let guard = state.read();
-    let results = h.results.lock().unwrap();
+    let results = h.results.lock();
     let world = InnerTriggerWorld::with_results(&guard, tick, &results);
-    let actions = h.engine.lock().unwrap().on_task_change(task, &world);
+    let actions = h.engine.lock().on_task_change(task, &world);
     unsafe {
         *out_count = actions.len();
         if !out_kinds.is_null() && !out_ids.is_null() {
@@ -4004,7 +4003,7 @@ pub unsafe extern "C" fn net_trigger_armed_count(
     }
     let h = unsafe { &*handle };
     unsafe {
-        *out = h.engine.lock().unwrap().armed_count();
+        *out = h.engine.lock().armed_count();
     }
     0
 }
@@ -4038,9 +4037,9 @@ pub unsafe extern "C" fn net_trigger_on_tick(
     let h = unsafe { &*handle };
     let state = h.adapter.state();
     let guard = state.read();
-    let results = h.results.lock().unwrap();
+    let results = h.results.lock();
     let world = InnerTriggerWorld::with_results(&guard, now, &results);
-    let actions = h.engine.lock().unwrap().on_tick(&world);
+    let actions = h.engine.lock().on_tick(&world);
     unsafe {
         *out_count = actions.len();
         if !out_kinds.is_null() && !out_ids.is_null() {
