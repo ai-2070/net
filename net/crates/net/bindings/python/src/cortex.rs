@@ -3869,8 +3869,9 @@ pub struct PyTriggerEngine {
     engine: parking_lot::Mutex<InnerTriggerEngine>,
     /// Recorded task results (via `record_result`) threaded into the
     /// `TriggerWorld` so `IfResult` branches can evaluate.
-    results:
-        parking_lot::Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, String>>>,
+    results: parking_lot::Mutex<
+        std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
+    >,
     adapter: Arc<InnerWorkflowAdapter>,
 }
 
@@ -3945,9 +3946,7 @@ impl PyTriggerEngine {
     /// Arm `AtTick(tick)` -> action (fires once the clock reaches `tick`).
     fn arm_at_tick(&self, tick: u64, action_kind: &str, action_id: u64) -> PyResult<()> {
         let action = parse_wf_action(action_kind, action_id)?;
-        self.engine
-            .lock()
-            .arm(InnerWfTrigger::AtTick(tick), action);
+        self.engine.lock().arm(InnerWfTrigger::AtTick(tick), action);
         Ok(())
     }
 

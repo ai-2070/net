@@ -3792,8 +3792,9 @@ pub struct TriggerEngineHandle {
     engine: parking_lot::Mutex<InnerTriggerEngine>,
     /// Recorded task results (via `net_trigger_record_result`) threaded
     /// into the `TriggerWorld` so `IfResult` branches can evaluate.
-    results:
-        parking_lot::Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, String>>>,
+    results: parking_lot::Mutex<
+        std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
+    >,
     adapter: Arc<InnerWorkflowAdapter>,
 }
 
@@ -3913,11 +3914,7 @@ pub unsafe extern "C" fn net_trigger_record_result(
         }
     };
     let h = unsafe { &*handle };
-    h.results
-        .lock()
-        .entry(task)
-        .or_default()
-        .insert(key, value);
+    h.results.lock().entry(task).or_default().insert(key, value);
     0
 }
 

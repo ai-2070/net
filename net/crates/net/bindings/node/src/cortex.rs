@@ -2674,8 +2674,9 @@ pub struct TriggerEngine {
     engine: parking_lot::Mutex<InnerTriggerEngine>,
     /// Recorded task results (populated via `recordResult`), threaded
     /// into the `TriggerWorld` so `IfResult` branches can evaluate.
-    results:
-        parking_lot::Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, String>>>,
+    results: parking_lot::Mutex<
+        std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
+    >,
     adapter: Arc<InnerWorkflowAdapter>,
 }
 
