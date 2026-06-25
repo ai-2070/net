@@ -69,6 +69,8 @@ export {
   TasksAdapter,
   MemoriesAdapter,
   WorkflowAdapter,
+  ShardGroup,
+  TriggerEngine,
   TaskStatus,
   TasksOrderBy,
   MemoriesOrderBy,
@@ -91,6 +93,8 @@ export type {
   WorkflowTaskState,
   WorkflowTaskStatus,
   WorkflowStatusCounts,
+  JoinResult,
+  TriggerAction,
 } from './cortex';
 
 // Identity + tokens (security surface).

@@ -5,7 +5,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { Redex, WorkflowAdapter } from '../src/cortex';
+import { Redex, ShardGroup, TriggerEngine, WorkflowAdapter } from '../src/cortex';
 
 const ORIGIN = 0x0f10_5d01n;
 
@@ -47,5 +47,40 @@ describe('WorkflowAdapter', () => {
     const seq = wf.delete(7n);
     await wf.waitForSeq(seq);
     expect(wf.get(7n)).toBeNull();
+  });
+});
+
+describe('WorkflowAdapter shards + triggers (Tier 2)', () => {
+  it('fans out shards then joins the reduce', async () => {
+    const wf = await WorkflowAdapter.open(new Redex(), ORIGIN);
+    const group = new ShardGroup([10n, 11n, 12n], 99n);
+
+    const seq = wf.fanOut(group);
+    await wf.waitForSeq(seq);
+    expect(wf.tryJoin(group).kind).toBe('pending');
+
+    let last = 0n;
+    for (const s of [10n, 11n, 12n]) last = wf.complete(s);
+    await wf.waitForSeq(last);
+
+    const j = wf.tryJoin(group);
+    expect(j.kind).toBe('submitted');
+    if (j.seq != null) await wf.waitForSeq(j.seq);
+    expect(wf.get(99n)).not.toBeNull();
+    expect(wf.tryJoin(group).kind).toBe('already_submitted');
+  });
+
+  it('a trigger fires the dependent when its predecessor is done', async () => {
+    const wf = await WorkflowAdapter.open(new Redex(), ORIGIN);
+    const eng = new TriggerEngine(wf);
+    eng.armAfterTask(1n, { kind: 'submit', id: 2n }); // B depends on A
+
+    wf.submit(1n);
+    wf.start(1n);
+    await wf.waitForSeq(wf.complete(1n));
+
+    const actions = eng.onTaskChange(1n);
+    expect(actions).toEqual([{ kind: 'submit', id: 2n }]);
+    expect(eng.armedCount()).toBe(0);
   });
 });

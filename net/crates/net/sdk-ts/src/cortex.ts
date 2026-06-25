@@ -43,6 +43,8 @@ import {
   RedexFile as NapiRedexFile,
   RedexTailIter as NapiRedexTailIter,
   WorkflowAdapter as NapiWorkflowAdapter,
+  ShardGroup as NapiShardGroup,
+  TriggerEngine as NapiTriggerEngine,
   TaskStatus,
   TasksOrderBy,
   MemoriesOrderBy,
@@ -60,6 +62,8 @@ import type {
   RedexFileConfigJs,
   WorkflowTaskState,
   WorkflowStatusCounts,
+  JoinResult,
+  TriggerAction,
 } from '@net-mesh/core';
 
 // Re-export the NAPI value types so callers get them from one place.
@@ -80,6 +84,8 @@ export type {
   CortexSnapshot,
   WorkflowTaskState,
   WorkflowStatusCounts,
+  JoinResult,
+  TriggerAction,
 };
 
 /**
@@ -995,5 +1001,68 @@ export class WorkflowAdapter {
     } catch (e) {
       throw classifyError(e);
     }
+  }
+
+  /** Fan out: submit every shard task. Returns the last append seq. */
+  fanOut(group: ShardGroup): bigint {
+    try {
+      return this.napi.fanOut(group.napi);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+
+  /** Try to join: submit the reduce once every shard is done, surface
+   *  failed shards, or report pending. Idempotent. */
+  tryJoin(group: ShardGroup): JoinResult {
+    try {
+      return this.napi.tryJoin(group.napi);
+    } catch (e) {
+      throw classifyError(e);
+    }
+  }
+}
+
+// ---- Tier 2: shards + triggers --------------------------------------------
+
+/** A map-reduce shard group: the shard task ids + the reduce task id. */
+export class ShardGroup {
+  readonly napi: NapiShardGroup;
+
+  constructor(shards: bigint[], reduce: bigint) {
+    this.napi = new NapiShardGroup(shards, reduce);
+  }
+}
+
+/** The pure trigger engine, bound to a {@link WorkflowAdapter} (it reads
+ *  the adapter's state internally). Arm a dependency, then drive it with
+ *  {@link onTaskChange} — it returns the satisfied actions for the
+ *  caller to apply (it starts no tasks itself). */
+export class TriggerEngine {
+  readonly napi: NapiTriggerEngine;
+
+  constructor(wf: WorkflowAdapter) {
+    this.napi = new NapiTriggerEngine(wf.napi);
+  }
+
+  /** Arm AfterTask(task) -> action (fires when `task` is done). */
+  armAfterTask(task: bigint, action: TriggerAction): void {
+    this.napi.armAfterTask(task, action.kind, action.id);
+  }
+
+  /** Arm AfterTerminal(task) -> action (fires on done OR failed). */
+  armAfterTerminal(task: bigint, action: TriggerAction): void {
+    this.napi.armAfterTerminal(task, action.kind, action.id);
+  }
+
+  /** `task` changed: return the fired actions (evaluated against the
+   *  bound adapter's current state). */
+  onTaskChange(task: bigint, tick?: bigint): TriggerAction[] {
+    return this.napi.onTaskChange(task, tick ?? null);
+  }
+
+  /** Total armed (not-yet-fired) triggers. */
+  armedCount(): number {
+    return this.napi.armedCount();
   }
 }

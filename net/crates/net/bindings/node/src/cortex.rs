@@ -32,8 +32,11 @@ use ::net::adapter::net::cortex::tasks::{
     TasksAdapter as InnerTasksAdapter,
 };
 use ::net::adapter::net::cortex::workflow::{
+    fan_out, try_join, Action as InnerWfAction, Join as InnerJoin, ShardGroup as InnerShardGroup,
     StatusCounts as InnerStatusCounts, TaskState as InnerWfTaskState,
-    TaskStatus as InnerWfTaskStatus, WorkflowAdapter as InnerWorkflowAdapter,
+    TaskStatus as InnerWfTaskStatus, Trigger as InnerWfTrigger,
+    TriggerEngine as InnerTriggerEngine, TriggerWorld as InnerTriggerWorld,
+    WorkflowAdapter as InnerWorkflowAdapter,
 };
 use ::net::adapter::net::cortex::WaitForTokenError as InnerWaitForTokenError;
 use ::net::adapter::net::redex::{
@@ -2542,5 +2545,181 @@ impl WorkflowAdapter {
                     format!("fold task stopped; folded_through={folded:?}"),
                 )
             })
+    }
+}
+
+// =========================================================================
+// Tier 2: shards (fan-out / fan-in)
+// =========================================================================
+
+/// A map-reduce shard group: the shard task ids + the reduce task id.
+#[napi]
+pub struct ShardGroup {
+    inner: InnerShardGroup,
+}
+
+#[napi]
+impl ShardGroup {
+    #[napi(constructor)]
+    pub fn new(shards: Vec<BigInt>, reduce: BigInt) -> Result<Self> {
+        let shards = shards
+            .into_iter()
+            .map(bigint_u64)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            inner: InnerShardGroup::new(shards, bigint_u64(reduce)?),
+        })
+    }
+}
+
+/// Result of a `tryJoin`. `kind` is one of `submitted` (reduce just
+/// appended at `seq`), `already_submitted`, `pending`, or `failed`
+/// (with the `failed` shard ids).
+#[napi(object)]
+pub struct JoinResult {
+    pub kind: String,
+    pub seq: Option<BigInt>,
+    pub failed: Option<Vec<BigInt>>,
+}
+
+#[napi]
+impl WorkflowAdapter {
+    /// Fan out: submit every shard task (+ link them under the parent
+    /// when the group was derived). Returns the last append seq.
+    #[napi]
+    pub fn fan_out(&self, group: &ShardGroup) -> Result<BigInt> {
+        fan_out(&self.inner, &group.inner)
+            .map(BigInt::from)
+            .map_err(|e| cortex_err("fan_out", e))
+    }
+
+    /// Try to join: submit the reduce once every shard is `done`,
+    /// surface `failed` shards, or report `pending`. Idempotent.
+    #[napi]
+    pub fn try_join(&self, group: &ShardGroup) -> Result<JoinResult> {
+        match try_join(&self.inner, &group.inner).map_err(|e| cortex_err("try_join", e))? {
+            InnerJoin::Submitted(s) => Ok(JoinResult {
+                kind: "submitted".into(),
+                seq: Some(BigInt::from(s)),
+                failed: None,
+            }),
+            InnerJoin::AlreadySubmitted => Ok(JoinResult {
+                kind: "already_submitted".into(),
+                seq: None,
+                failed: None,
+            }),
+            InnerJoin::Pending => Ok(JoinResult {
+                kind: "pending".into(),
+                seq: None,
+                failed: None,
+            }),
+            InnerJoin::Failed(ids) => Ok(JoinResult {
+                kind: "failed".into(),
+                seq: None,
+                failed: Some(ids.into_iter().map(BigInt::from).collect()),
+            }),
+        }
+    }
+}
+
+// =========================================================================
+// Tier 2: triggers (dependency / branch engine) — D5 (a): the engine
+// binds the WorkflowAdapter and fetches state internally, so the JS call
+// is just `engine.onTaskChange(taskId)`.
+// =========================================================================
+
+/// A fired trigger's action: `kind` is `submit` or `start`, `id` the task.
+#[napi(object)]
+pub struct TriggerAction {
+    pub kind: String,
+    pub id: BigInt,
+}
+
+fn action_to_js(a: InnerWfAction) -> TriggerAction {
+    match a {
+        InnerWfAction::Submit(id) => TriggerAction {
+            kind: "submit".into(),
+            id: BigInt::from(id),
+        },
+        InnerWfAction::Start(id) => TriggerAction {
+            kind: "start".into(),
+            id: BigInt::from(id),
+        },
+    }
+}
+
+fn parse_action(kind: &str, id: u64) -> Result<InnerWfAction> {
+    match kind {
+        "submit" => Ok(InnerWfAction::Submit(id)),
+        "start" => Ok(InnerWfAction::Start(id)),
+        other => Err(cortex_err("arm", format!("unknown action kind {other:?}"))),
+    }
+}
+
+/// The pure trigger engine, bound to a `WorkflowAdapter` (D5: it reads
+/// the adapter's state internally). `arm*` a dependency, then drive it
+/// with `onTaskChange` — it returns the satisfied actions for the caller
+/// to apply (it starts no tasks itself).
+#[napi]
+pub struct TriggerEngine {
+    engine: std::sync::Mutex<InnerTriggerEngine>,
+    adapter: Arc<InnerWorkflowAdapter>,
+}
+
+#[napi]
+impl TriggerEngine {
+    #[napi(constructor)]
+    pub fn new(wf: &WorkflowAdapter) -> Self {
+        Self {
+            engine: std::sync::Mutex::new(InnerTriggerEngine::new()),
+            adapter: wf.inner.clone(),
+        }
+    }
+
+    /// Arm `AfterTask(task)` -> action (fires when `task` is `done`).
+    #[napi]
+    pub fn arm_after_task(
+        &self,
+        task: BigInt,
+        action_kind: String,
+        action_id: BigInt,
+    ) -> Result<()> {
+        let trigger = InnerWfTrigger::AfterTask(bigint_u64(task)?);
+        let action = parse_action(&action_kind, bigint_u64(action_id)?)?;
+        self.engine.lock().unwrap().arm(trigger, action);
+        Ok(())
+    }
+
+    /// Arm `AfterTerminal(task)` -> action (fires on `done` OR `failed`).
+    #[napi]
+    pub fn arm_after_terminal(
+        &self,
+        task: BigInt,
+        action_kind: String,
+        action_id: BigInt,
+    ) -> Result<()> {
+        let trigger = InnerWfTrigger::AfterTerminal(bigint_u64(task)?);
+        let action = parse_action(&action_kind, bigint_u64(action_id)?)?;
+        self.engine.lock().unwrap().arm(trigger, action);
+        Ok(())
+    }
+
+    /// `task` changed status: evaluate the triggers waiting on it against
+    /// the bound adapter's current state and return the fired actions.
+    #[napi]
+    pub fn on_task_change(&self, task: BigInt, tick: Option<BigInt>) -> Result<Vec<TriggerAction>> {
+        let task = bigint_u64(task)?;
+        let tick = tick.map(bigint_u64).transpose()?.unwrap_or(0);
+        let state = self.adapter.state();
+        let guard = state.read();
+        let world = InnerTriggerWorld::new(&guard, tick);
+        let actions = self.engine.lock().unwrap().on_task_change(task, &world);
+        Ok(actions.into_iter().map(action_to_js).collect())
+    }
+
+    /// Total armed (not-yet-fired) triggers.
+    #[napi]
+    pub fn armed_count(&self) -> u32 {
+        self.engine.lock().unwrap().armed_count() as u32
     }
 }
