@@ -1,0 +1,33 @@
+net/crates/net/bindings/python/tests/test_scheduler.py
+  s_b93d1d2fee6b2e::t_9c017eb9f9fd97 73,75,78
+net/crates/net/sdk/src/gang.rs
+  s_b93d1d2fee6b2e::t_2533199cbf4a53 1,3-9,15,18,26-30,42,44,54
+net/crates/net/sdk/tests/gang_surface.rs
+  s_b93d1d2fee6b2e::t_d36e3e3580574c 66,68,81,85,89,92
+  s_b93d1d2fee6b2e::t_78ccd5efc4c315 13-14
+net/crates/net/bindings/python/src/lib.rs
+  s_b93d1d2fee6b2e::t_b57a284bd61997 1092,1095,1098,1119,1122,1125
+  s_b93d1d2fee6b2e::t_bdab9c3a5ecd4f 1876,1881,1886-1887,1891,1895,1897,1905-1907,1909,1912,1915,1918,1923,1926,1929,1931
+  s_b93d1d2fee6b2e::t_575f1995dccbec 1965,1967,1972,1975,1978,1983,1986,1989,1993
+net/crates/net/bindings/node/src/gang.rs
+  s_b93d1d2fee6b2e::t_0271d6f523de81 1-2,5,7-9,12,23,27,30-31,36-38,45-47,53,55-59,66,84,87,90,112,114,124,127,131,164,166,172
+net/crates/net/sdk/src/mesh.rs
+  s_b93d1d2fee6b2e::t_bed3314596757a 916,921
+  s_b93d1d2fee6b2e::t_5845af8937713b 877,880,884
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "9a521c9fc0b01f7f5b59c568e5fb7e23f9f5836b",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
