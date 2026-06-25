@@ -95,11 +95,16 @@ pub fn try_acquire_gang(
             ClaimOutcome::Lost => {
                 // Release everything grabbed this attempt so the gang
                 // never blocks while holding. Reverse order is
-                // cosmetic — releases are independent CAS-es.
+                // cosmetic — releases are independent CAS-es. Best-
+                // effort: a `?` here would short-circuit the rollback on
+                // a (rare) sign/apply error mid-loop and strand the
+                // earlier-grabbed islands, breaking all-or-none. All-or-
+                // none wins; every grabbed island gets a release attempt
+                // (review #8).
                 for &grabbed in held.iter().rev() {
                     let gen = *generation;
                     *generation += 1;
-                    release_island(reservations, keypair, node_id, gen, grabbed)?;
+                    let _ = release_island(reservations, keypair, node_id, gen, grabbed);
                 }
                 return Ok(AcquireAttempt::Blocked(island));
             }
