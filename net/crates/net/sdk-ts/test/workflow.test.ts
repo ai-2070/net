@@ -93,4 +93,32 @@ describe('WorkflowAdapter shards + triggers (Tier 2)', () => {
     expect(eng.onTick(5n)).toEqual([{ kind: 'submit', id: 3n }]); // due
     expect(eng.armedCount()).toBe(0);
   });
+
+  it('an IfResult trigger fires only on a matching recorded result', async () => {
+    const wf = await WorkflowAdapter.open(new Redex(), ORIGIN);
+    const eng = new TriggerEngine(wf);
+    eng.armIfResult(1n, 'status', 'ok', { kind: 'submit', id: 2n });
+
+    eng.recordResult(1n, 'status', 'ok'); // record before completion
+    wf.submit(1n);
+    wf.start(1n);
+    await wf.waitForSeq(wf.complete(1n));
+
+    expect(eng.onTaskChange(1n)).toEqual([{ kind: 'submit', id: 2n }]);
+    expect(eng.armedCount()).toBe(0);
+  });
+
+  it('an IfResult trigger is dropped when the result does not match', async () => {
+    const wf = await WorkflowAdapter.open(new Redex(), ORIGIN);
+    const eng = new TriggerEngine(wf);
+    eng.armIfResult(1n, 'status', 'ok', { kind: 'submit', id: 2n });
+
+    eng.recordResult(1n, 'status', 'fail'); // wrong value
+    wf.submit(1n);
+    wf.start(1n);
+    await wf.waitForSeq(wf.complete(1n));
+
+    expect(eng.onTaskChange(1n)).toEqual([]); // no fire
+    expect(eng.armedCount()).toBe(0); // disarmed: terminal + no match
+  });
 });

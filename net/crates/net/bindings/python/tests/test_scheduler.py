@@ -128,3 +128,32 @@ def test_at_tick_trigger_fires_on_clock_advance() -> None:
     fired = eng.on_tick(5)  # due
     assert len(fired) == 1 and fired[0].kind == "submit" and fired[0].id == 3
     assert eng.armed_count() == 0
+
+
+def test_if_result_trigger_fires_on_matching_result() -> None:
+    wf = WorkflowAdapter.open(Redex(), ORIGIN)
+    eng = TriggerEngine(wf)
+    eng.arm_if_result(1, "status", "ok", "submit", 2)
+
+    eng.record_result(1, "status", "ok")  # record before completion
+    wf.submit(1)
+    wf.start(1)
+    wf.wait_for_seq(wf.complete(1))
+
+    actions = eng.on_task_change(1)
+    assert len(actions) == 1 and actions[0].kind == "submit" and actions[0].id == 2
+    assert eng.armed_count() == 0
+
+
+def test_if_result_trigger_dropped_when_result_mismatches() -> None:
+    wf = WorkflowAdapter.open(Redex(), ORIGIN)
+    eng = TriggerEngine(wf)
+    eng.arm_if_result(1, "status", "ok", "submit", 2)
+
+    eng.record_result(1, "status", "fail")  # wrong value
+    wf.submit(1)
+    wf.start(1)
+    wf.wait_for_seq(wf.complete(1))
+
+    assert eng.on_task_change(1) == []  # no fire
+    assert eng.armed_count() == 0  # disarmed: terminal + no match

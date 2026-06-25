@@ -83,6 +83,22 @@ impl<'a> TriggerWorld<'a> {
         }
     }
 
+    /// Build a world with a caller-supplied results map — what
+    /// `if_result` branch evaluation needs. The SDK bindings hold the
+    /// results map on the trigger engine (populated via `record_result`)
+    /// and pass it here so `on_task_change` stays a one-arg call.
+    pub fn with_results(
+        tasks: &'a WorkflowState,
+        tick: u64,
+        results: &'a HashMap<TaskId, HashMap<String, String>>,
+    ) -> Self {
+        Self {
+            tasks,
+            tick,
+            results,
+        }
+    }
+
     fn task_done(&self, task: TaskId) -> bool {
         self.tasks
             .get(task)

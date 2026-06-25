@@ -3790,6 +3790,10 @@ pub unsafe extern "C" fn net_workflow_try_join(
 /// FFI handle: the pure trigger engine + the bound adapter (state reads).
 pub struct TriggerEngineHandle {
     engine: std::sync::Mutex<InnerTriggerEngine>,
+    /// Recorded task results (via `net_trigger_record_result`) threaded
+    /// into the `TriggerWorld` so `IfResult` branches can evaluate.
+    results:
+        std::sync::Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, String>>>,
     adapter: Arc<InnerWorkflowAdapter>,
 }
 
@@ -3824,6 +3828,7 @@ pub unsafe extern "C" fn net_trigger_engine_new(
     };
     let handle = Box::new(TriggerEngineHandle {
         engine: std::sync::Mutex::new(InnerTriggerEngine::new()),
+        results: std::sync::Mutex::new(std::collections::HashMap::new()),
         adapter: Arc::clone(&wf.inner),
     });
     unsafe {
@@ -3854,6 +3859,66 @@ unsafe fn trigger_arm(
     };
     let h = unsafe { &*handle };
     h.engine.lock().unwrap().arm(trigger, action);
+    0
+}
+
+/// Arm IfResult(task, key, value) -> action (0 submit, 1 start): fires
+/// when `task` is Done AND its recorded result `key` equals `value`.
+/// Record the result first via `net_trigger_record_result`. `key`/`value`
+/// are NUL-terminated UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_arm_if_result(
+    handle: *mut TriggerEngineHandle,
+    task: u64,
+    key: *const c_char,
+    value: *const c_char,
+    action_kind: c_int,
+    action_id: u64,
+) -> c_int {
+    if handle.is_null() || key.is_null() || value.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let (key, value) = unsafe {
+        match (CStr::from_ptr(key).to_str(), CStr::from_ptr(value).to_str()) {
+            (Ok(k), Ok(v)) => (k.to_owned(), v.to_owned()),
+            _ => return NetError::InvalidUtf8.into(),
+        }
+    };
+    unsafe {
+        trigger_arm(
+            handle,
+            InnerWfTrigger::IfResult { task, key, value },
+            action_kind,
+            action_id,
+        )
+    }
+}
+
+/// Record `task`'s result `key = value` for `IfResult` evaluation.
+/// `key`/`value` are NUL-terminated UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_record_result(
+    handle: *mut TriggerEngineHandle,
+    task: u64,
+    key: *const c_char,
+    value: *const c_char,
+) -> c_int {
+    if handle.is_null() || key.is_null() || value.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let (key, value) = unsafe {
+        match (CStr::from_ptr(key).to_str(), CStr::from_ptr(value).to_str()) {
+            (Ok(k), Ok(v)) => (k.to_owned(), v.to_owned()),
+            _ => return NetError::InvalidUtf8.into(),
+        }
+    };
+    let h = unsafe { &*handle };
+    h.results
+        .lock()
+        .unwrap()
+        .entry(task)
+        .or_default()
+        .insert(key, value);
     0
 }
 
@@ -3912,7 +3977,8 @@ pub unsafe extern "C" fn net_trigger_on_task_change(
     let h = unsafe { &*handle };
     let state = h.adapter.state();
     let guard = state.read();
-    let world = InnerTriggerWorld::new(&guard, tick);
+    let results = h.results.lock().unwrap();
+    let world = InnerTriggerWorld::with_results(&guard, tick, &results);
     let actions = h.engine.lock().unwrap().on_task_change(task, &world);
     unsafe {
         *out_count = actions.len();
@@ -3972,7 +4038,8 @@ pub unsafe extern "C" fn net_trigger_on_tick(
     let h = unsafe { &*handle };
     let state = h.adapter.state();
     let guard = state.read();
-    let world = InnerTriggerWorld::new(&guard, now);
+    let results = h.results.lock().unwrap();
+    let world = InnerTriggerWorld::with_results(&guard, now, &results);
     let actions = h.engine.lock().unwrap().on_tick(&world);
     unsafe {
         *out_count = actions.len();

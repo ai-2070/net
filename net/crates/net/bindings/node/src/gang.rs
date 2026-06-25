@@ -6,7 +6,9 @@
 //! composite capability query + numeric filter + selection policy
 //! internally, so callers never touch the internal enum shapes.
 
-use ::net::adapter::net::behavior::fold::{CapabilityFilter, CapabilityQuery, GpuSet, IslandRecord};
+use ::net::adapter::net::behavior::fold::{
+    CapabilityFilter, CapabilityQuery, GpuSet, IslandRecord,
+};
 use ::net::adapter::net::behavior::gang::{
     ClaimOutcome, MatchCriteria, NumericFilter, SelectionPolicy,
 };

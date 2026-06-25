@@ -1055,6 +1055,23 @@ export class TriggerEngine {
     this.napi.armAfterTerminal(task, action.kind, action.id);
   }
 
+  /** Arm IfResult(task, key, value) -> action: fires when `task` is done
+   *  AND its recorded result `key` equals `value`. Record the result
+   *  first via {@link recordResult}. */
+  armIfResult(
+    task: bigint,
+    key: string,
+    value: string,
+    action: TriggerAction,
+  ): void {
+    this.napi.armIfResult(task, key, value, action.kind, action.id);
+  }
+
+  /** Record `task`'s result `key = value` for IfResult evaluation. */
+  recordResult(task: bigint, key: string, value: string): void {
+    this.napi.recordResult(task, key, value);
+  }
+
   /** `task` changed: return the fired actions (evaluated against the
    *  bound adapter's current state). */
   onTaskChange(task: bigint, tick?: bigint): TriggerAction[] {

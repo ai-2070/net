@@ -156,6 +156,11 @@ int  net_trigger_on_task_change(net_trigger_engine_t* handle, uint64_t task,
 int  net_trigger_armed_count(net_trigger_engine_t* handle, size_t* out);
 int  net_trigger_arm_at_tick(net_trigger_engine_t* handle, uint64_t tick,
                              int action_kind, uint64_t action_id);
+int  net_trigger_arm_if_result(net_trigger_engine_t* handle, uint64_t task,
+                               const char* key, const char* value,
+                               int action_kind, uint64_t action_id);
+int  net_trigger_record_result(net_trigger_engine_t* handle, uint64_t task,
+                               const char* key, const char* value);
 int  net_trigger_on_tick(net_trigger_engine_t* handle, uint64_t now,
                          int* out_kinds, uint64_t* out_ids, size_t cap,
                          size_t* out_count);

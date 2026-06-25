@@ -1505,6 +1505,30 @@ func (e *TriggerEngine) ArmAfterTerminal(task uint64, action TriggerAction) erro
 	return cortexErrorFromCode(code)
 }
 
+// ArmIfResult arms IfResult(task, key, value) -> action: fires when
+// `task` is done AND its recorded result `key` equals `value`. Record the
+// result first via RecordResult.
+func (e *TriggerEngine) ArmIfResult(task uint64, key, value string, action TriggerAction) error {
+	ckey := C.CString(key)
+	defer C.free(unsafe.Pointer(ckey))
+	cval := C.CString(value)
+	defer C.free(unsafe.Pointer(cval))
+	code := C.net_trigger_arm_if_result(
+		e.handle, C.uint64_t(task), ckey, cval,
+		actionKindCode(action.Kind), C.uint64_t(action.ID))
+	return cortexErrorFromCode(code)
+}
+
+// RecordResult records `task`'s result key = value for IfResult evaluation.
+func (e *TriggerEngine) RecordResult(task uint64, key, value string) error {
+	ckey := C.CString(key)
+	defer C.free(unsafe.Pointer(ckey))
+	cval := C.CString(value)
+	defer C.free(unsafe.Pointer(cval))
+	code := C.net_trigger_record_result(e.handle, C.uint64_t(task), ckey, cval)
+	return cortexErrorFromCode(code)
+}
+
 // OnTaskChange returns the actions fired by `task`'s change, evaluated
 // against the bound adapter's current state.
 func (e *TriggerEngine) OnTaskChange(task, tick uint64) ([]TriggerAction, error) {

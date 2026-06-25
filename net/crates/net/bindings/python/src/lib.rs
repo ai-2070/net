@@ -1940,7 +1940,10 @@ mod mesh_bindings {
         ) -> PyResult<String> {
             let node = self.get_node()?;
             let outcome = py
-                .detach(|| self.runtime.block_on(node.reserve_island(island, until_unix_us)))
+                .detach(|| {
+                    self.runtime
+                        .block_on(node.reserve_island(island, until_unix_us))
+                })
                 .map_err(|e| PyRuntimeError::new_err(format!("gang: {}", e)))?;
             Ok(claim_outcome_str(outcome).to_string())
         }
@@ -1984,8 +1987,11 @@ mod mesh_bindings {
                 load_band_target,
                 prefer_warm_model,
             )?;
-            py.detach(|| self.runtime.block_on(node.claim_gpu_island(&mc, until_unix_us)))
-                .map_err(|e| PyRuntimeError::new_err(format!("gang: {}", e)))
+            py.detach(|| {
+                self.runtime
+                    .block_on(node.claim_gpu_island(&mc, until_unix_us))
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("gang: {}", e)))
         }
 
         /// **Test-only** helper for the groups test suite.

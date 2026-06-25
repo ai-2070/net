@@ -3547,7 +3547,11 @@ fn parse_wf_status(s: &str) -> PyResult<InnerWfTaskStatus> {
         "blocked" => InnerWfTaskStatus::Blocked,
         "done" => InnerWfTaskStatus::Done,
         "failed" => InnerWfTaskStatus::Failed,
-        other => return Err(CortexError::new_err(format!("unknown task status {other:?}"))),
+        other => {
+            return Err(CortexError::new_err(format!(
+                "unknown task status {other:?}"
+            )))
+        }
     })
 }
 
@@ -3850,7 +3854,9 @@ fn parse_wf_action(kind: &str, id: u64) -> PyResult<InnerWfAction> {
     match kind {
         "submit" => Ok(InnerWfAction::Submit(id)),
         "start" => Ok(InnerWfAction::Start(id)),
-        other => Err(CortexError::new_err(format!("unknown action kind {other:?}"))),
+        other => Err(CortexError::new_err(format!(
+            "unknown action kind {other:?}"
+        ))),
     }
 }
 
@@ -3861,6 +3867,10 @@ fn parse_wf_action(kind: &str, id: u64) -> PyResult<InnerWfAction> {
 #[pyclass(name = "TriggerEngine")]
 pub struct PyTriggerEngine {
     engine: std::sync::Mutex<InnerTriggerEngine>,
+    /// Recorded task results (via `record_result`) threaded into the
+    /// `TriggerWorld` so `IfResult` branches can evaluate.
+    results:
+        std::sync::Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, String>>>,
     adapter: Arc<InnerWorkflowAdapter>,
 }
 
@@ -3870,6 +3880,7 @@ impl PyTriggerEngine {
     fn new(wf: &PyWorkflowAdapter) -> Self {
         Self {
             engine: std::sync::Mutex::new(InnerTriggerEngine::new()),
+            results: std::sync::Mutex::new(std::collections::HashMap::new()),
             adapter: wf.inner.clone(),
         }
     }
@@ -3882,6 +3893,35 @@ impl PyTriggerEngine {
             .unwrap()
             .arm(InnerWfTrigger::AfterTask(task), action);
         Ok(())
+    }
+
+    /// Arm `IfResult(task, key, value)` -> action: fires when `task` is
+    /// done AND its recorded result `key` equals `value` (record it
+    /// first via `record_result`).
+    fn arm_if_result(
+        &self,
+        task: u64,
+        key: String,
+        value: String,
+        action_kind: &str,
+        action_id: u64,
+    ) -> PyResult<()> {
+        let action = parse_wf_action(action_kind, action_id)?;
+        self.engine
+            .lock()
+            .unwrap()
+            .arm(InnerWfTrigger::IfResult { task, key, value }, action);
+        Ok(())
+    }
+
+    /// Record `task`'s result `key = value` for `IfResult` evaluation.
+    fn record_result(&self, task: u64, key: String, value: String) {
+        self.results
+            .lock()
+            .unwrap()
+            .entry(task)
+            .or_default()
+            .insert(key, value);
     }
 
     /// Arm `AfterTerminal(task)` -> action (fires on done OR failed).
@@ -3900,7 +3940,8 @@ impl PyTriggerEngine {
     fn on_task_change(&self, task: u64, tick: u64) -> Vec<PyTriggerAction> {
         let state = self.adapter.state();
         let guard = state.read();
-        let world = InnerTriggerWorld::new(&guard, tick);
+        let results = self.results.lock().unwrap();
+        let world = InnerTriggerWorld::with_results(&guard, tick, &results);
         let actions = self.engine.lock().unwrap().on_task_change(task, &world);
         actions.into_iter().map(wf_action_to_py).collect()
     }
@@ -3920,7 +3961,8 @@ impl PyTriggerEngine {
     fn on_tick(&self, now: u64) -> Vec<PyTriggerAction> {
         let state = self.adapter.state();
         let guard = state.read();
-        let world = InnerTriggerWorld::new(&guard, now);
+        let results = self.results.lock().unwrap();
+        let world = InnerTriggerWorld::with_results(&guard, now, &results);
         let actions = self.engine.lock().unwrap().on_tick(&world);
         actions.into_iter().map(wf_action_to_py).collect()
     }

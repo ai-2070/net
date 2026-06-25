@@ -2305,7 +2305,12 @@ fn parse_wf_status(s: &str) -> Result<InnerWfTaskStatus> {
         "blocked" => InnerWfTaskStatus::Blocked,
         "done" => InnerWfTaskStatus::Done,
         "failed" => InnerWfTaskStatus::Failed,
-        other => return Err(cortex_err("transition", format!("unknown task status {other:?}"))),
+        other => {
+            return Err(cortex_err(
+                "transition",
+                format!("unknown task status {other:?}"),
+            ))
+        }
     })
 }
 
@@ -2344,7 +2349,11 @@ impl WorkflowAdapter {
     /// Open the workflow adapter against a Redex manager. `persistent`
     /// routes the chain to disk (requires a Redex with a persistent dir).
     #[napi(factory)]
-    pub async fn open(redex: &Redex, origin_hash: BigInt, persistent: Option<bool>) -> Result<Self> {
+    pub async fn open(
+        redex: &Redex,
+        origin_hash: BigInt,
+        persistent: Option<bool>,
+    ) -> Result<Self> {
         let cfg = redex_config_from_persistent(persistent);
         let origin = bigint_u64(origin_hash)?;
         let inner = InnerWorkflowAdapter::open_with_config(&redex.inner, origin, cfg)
@@ -2663,6 +2672,10 @@ fn parse_action(kind: &str, id: u64) -> Result<InnerWfAction> {
 #[napi]
 pub struct TriggerEngine {
     engine: std::sync::Mutex<InnerTriggerEngine>,
+    /// Recorded task results (populated via `recordResult`), threaded
+    /// into the `TriggerWorld` so `IfResult` branches can evaluate.
+    results:
+        std::sync::Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, String>>>,
     adapter: Arc<InnerWorkflowAdapter>,
 }
 
@@ -2672,6 +2685,7 @@ impl TriggerEngine {
     pub fn new(wf: &WorkflowAdapter) -> Self {
         Self {
             engine: std::sync::Mutex::new(InnerTriggerEngine::new()),
+            results: std::sync::Mutex::new(std::collections::HashMap::new()),
             adapter: wf.inner.clone(),
         }
     }
@@ -2687,6 +2701,40 @@ impl TriggerEngine {
         let trigger = InnerWfTrigger::AfterTask(bigint_u64(task)?);
         let action = parse_action(&action_kind, bigint_u64(action_id)?)?;
         self.engine.lock().unwrap().arm(trigger, action);
+        Ok(())
+    }
+
+    /// Arm `IfResult(task, key, value)` -> action: fires when `task` is
+    /// `done` AND its recorded result `key` equals `value`. Record the
+    /// result first via `recordResult`.
+    #[napi]
+    pub fn arm_if_result(
+        &self,
+        task: BigInt,
+        key: String,
+        value: String,
+        action_kind: String,
+        action_id: BigInt,
+    ) -> Result<()> {
+        let trigger = InnerWfTrigger::IfResult {
+            task: bigint_u64(task)?,
+            key,
+            value,
+        };
+        let action = parse_action(&action_kind, bigint_u64(action_id)?)?;
+        self.engine.lock().unwrap().arm(trigger, action);
+        Ok(())
+    }
+
+    /// Record `task`'s result `key = value` for `IfResult` evaluation.
+    #[napi]
+    pub fn record_result(&self, task: BigInt, key: String, value: String) -> Result<()> {
+        self.results
+            .lock()
+            .unwrap()
+            .entry(bigint_u64(task)?)
+            .or_default()
+            .insert(key, value);
         Ok(())
     }
 
@@ -2712,7 +2760,8 @@ impl TriggerEngine {
         let tick = tick.map(bigint_u64).transpose()?.unwrap_or(0);
         let state = self.adapter.state();
         let guard = state.read();
-        let world = InnerTriggerWorld::new(&guard, tick);
+        let results = self.results.lock().unwrap();
+        let world = InnerTriggerWorld::with_results(&guard, tick, &results);
         let actions = self.engine.lock().unwrap().on_task_change(task, &world);
         Ok(actions.into_iter().map(action_to_js).collect())
     }
@@ -2733,7 +2782,8 @@ impl TriggerEngine {
         let now = bigint_u64(now)?;
         let state = self.adapter.state();
         let guard = state.read();
-        let world = InnerTriggerWorld::new(&guard, now);
+        let results = self.results.lock().unwrap();
+        let world = InnerTriggerWorld::with_results(&guard, now, &results);
         let actions = self.engine.lock().unwrap().on_tick(&world);
         Ok(actions.into_iter().map(action_to_js).collect())
     }
