@@ -1247,3 +1247,212 @@ func (w *WorkflowAdapter) WaitForSeq(seq uint64, timeoutMs uint32) error {
 	code := C.net_workflow_wait_for_seq(w.handle, C.uint64_t(seq), C.uint32_t(timeoutMs))
 	return cortexErrorFromCode(code)
 }
+
+// ---------------------------------------------------------------------------
+// Tier 2: shards (fan-out / fan-in)
+// ---------------------------------------------------------------------------
+
+// ShardGroup is a map-reduce shard group: the shard task ids + reduce id.
+type ShardGroup struct {
+	handle *C.net_shard_group_t
+}
+
+// NewShardGroup builds a shard group.
+func NewShardGroup(shards []uint64, reduce uint64) (*ShardGroup, error) {
+	var ptr *C.uint64_t
+	if len(shards) > 0 {
+		ptr = (*C.uint64_t)(unsafe.Pointer(&shards[0]))
+	}
+	var out *C.net_shard_group_t
+	code := C.net_shard_group_new(ptr, C.size_t(len(shards)), C.uint64_t(reduce), &out)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	g := &ShardGroup{handle: out}
+	runtime.SetFinalizer(g, (*ShardGroup).free)
+	return g, nil
+}
+
+func (g *ShardGroup) free() {
+	if g.handle != nil {
+		C.net_shard_group_free(g.handle)
+		g.handle = nil
+		runtime.SetFinalizer(g, nil)
+	}
+}
+
+// JoinResult is the outcome of TryJoin.
+type JoinResult struct {
+	Kind   string   // submitted | already_submitted | pending | failed
+	Seq    uint64   // valid when Kind == "submitted"
+	Failed []uint64 // valid when Kind == "failed"
+}
+
+func joinKindString(k int) string {
+	switch k {
+	case 0:
+		return "submitted"
+	case 1:
+		return "already_submitted"
+	case 2:
+		return "pending"
+	case 3:
+		return "failed"
+	default:
+		return "unknown"
+	}
+}
+
+// FanOut submits every shard task. Returns the last append seq.
+func (w *WorkflowAdapter) FanOut(group *ShardGroup) (uint64, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return 0, ErrShuttingDown
+	}
+	var seq C.uint64_t
+	code := C.net_workflow_fan_out(w.handle, group.handle, &seq)
+	if err := cortexErrorFromCode(code); err != nil {
+		return 0, err
+	}
+	return uint64(seq), nil
+}
+
+// TryJoin submits the reduce once every shard is done, surfaces failed
+// shards, or reports pending. Idempotent.
+func (w *WorkflowAdapter) TryJoin(group *ShardGroup) (JoinResult, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.handle == nil {
+		return JoinResult{}, ErrShuttingDown
+	}
+	var kind C.int
+	var seq C.uint64_t
+	var count C.size_t
+	// First pass: learn the failed-id count.
+	code := C.net_workflow_try_join(w.handle, group.handle, &kind, &seq, nil, 0, &count)
+	if err := cortexErrorFromCode(code); err != nil {
+		return JoinResult{}, err
+	}
+	res := JoinResult{Kind: joinKindString(int(kind)), Seq: uint64(seq)}
+	if int(kind) == 3 && count > 0 {
+		ids := make([]uint64, int(count))
+		code = C.net_workflow_try_join(
+			w.handle, group.handle, &kind, &seq,
+			(*C.uint64_t)(unsafe.Pointer(&ids[0])), count, &count)
+		if err := cortexErrorFromCode(code); err != nil {
+			return JoinResult{}, err
+		}
+		if int(count) < len(ids) {
+			ids = ids[:int(count)]
+		}
+		res.Failed = ids
+	}
+	return res, nil
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2: triggers (bound to a WorkflowAdapter; reads its state internally)
+// ---------------------------------------------------------------------------
+
+// TriggerAction is a fired trigger's action.
+type TriggerAction struct {
+	Kind string // submit | start
+	ID   uint64
+}
+
+func actionKindCode(kind string) C.int {
+	if kind == "start" {
+		return 1
+	}
+	return 0
+}
+
+// TriggerEngine is the pure trigger engine, bound to a WorkflowAdapter.
+type TriggerEngine struct {
+	handle *C.net_trigger_engine_t
+}
+
+// NewTriggerEngine builds a trigger engine bound to `wf`.
+func NewTriggerEngine(wf *WorkflowAdapter) (*TriggerEngine, error) {
+	wf.mu.RLock()
+	defer wf.mu.RUnlock()
+	if wf.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	var out *C.net_trigger_engine_t
+	code := C.net_trigger_engine_new(wf.handle, &out)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	e := &TriggerEngine{handle: out}
+	runtime.SetFinalizer(e, (*TriggerEngine).free)
+	return e, nil
+}
+
+func (e *TriggerEngine) free() {
+	if e.handle != nil {
+		C.net_trigger_engine_free(e.handle)
+		e.handle = nil
+		runtime.SetFinalizer(e, nil)
+	}
+}
+
+// ArmAfterTask arms AfterTask(task) -> action (fires when task is done).
+func (e *TriggerEngine) ArmAfterTask(task uint64, action TriggerAction) error {
+	code := C.net_trigger_arm_after_task(
+		e.handle, C.uint64_t(task), actionKindCode(action.Kind), C.uint64_t(action.ID))
+	return cortexErrorFromCode(code)
+}
+
+// ArmAfterTerminal arms AfterTerminal(task) -> action (done OR failed).
+func (e *TriggerEngine) ArmAfterTerminal(task uint64, action TriggerAction) error {
+	code := C.net_trigger_arm_after_terminal(
+		e.handle, C.uint64_t(task), actionKindCode(action.Kind), C.uint64_t(action.ID))
+	return cortexErrorFromCode(code)
+}
+
+// OnTaskChange returns the actions fired by `task`'s change, evaluated
+// against the bound adapter's current state.
+func (e *TriggerEngine) OnTaskChange(task, tick uint64) ([]TriggerAction, error) {
+	var count C.size_t
+	code := C.net_trigger_on_task_change(
+		e.handle, C.uint64_t(task), C.uint64_t(tick), nil, nil, 0, &count)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	if count == 0 {
+		return nil, nil
+	}
+	kinds := make([]C.int, int(count))
+	ids := make([]uint64, int(count))
+	code = C.net_trigger_on_task_change(
+		e.handle, C.uint64_t(task), C.uint64_t(tick),
+		&kinds[0], (*C.uint64_t)(unsafe.Pointer(&ids[0])), count, &count)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	n := int(count)
+	if n > len(ids) {
+		n = len(ids)
+	}
+	out := make([]TriggerAction, n)
+	for i := 0; i < n; i++ {
+		kind := "submit"
+		if kinds[i] == 1 {
+			kind = "start"
+		}
+		out[i] = TriggerAction{Kind: kind, ID: ids[i]}
+	}
+	return out, nil
+}
+
+// ArmedCount returns the number of armed (not-yet-fired) triggers.
+func (e *TriggerEngine) ArmedCount() (int, error) {
+	var c C.size_t
+	code := C.net_trigger_armed_count(e.handle, &c)
+	if err := cortexErrorFromCode(code); err != nil {
+		return 0, err
+	}
+	return int(c), nil
+}

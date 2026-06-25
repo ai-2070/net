@@ -35,6 +35,8 @@ typedef struct net_redex_tail_s      net_redex_tail_t;
 typedef struct net_tasks_adapter_s   net_tasks_adapter_t;
 typedef struct net_tasks_watch_s     net_tasks_watch_t;
 typedef struct net_workflow_adapter_s net_workflow_adapter_t;
+typedef struct net_shard_group_s     net_shard_group_t;
+typedef struct net_trigger_engine_s  net_trigger_engine_t;
 typedef struct net_memories_adapter_s net_memories_adapter_t;
 typedef struct net_memories_watch_s  net_memories_watch_t;
 typedef struct net_netdb_s           net_netdb_t;
@@ -133,6 +135,36 @@ int  net_workflow_status_counts(net_workflow_adapter_t* handle,
                                 net_workflow_status_counts_t* out);
 int  net_workflow_wait_for_seq(net_workflow_adapter_t* handle, uint64_t seq,
                                uint32_t timeout_ms);
+
+/* ---- Tier 2: shards (fan-out / fan-in) ----
+ * try_join's *out_kind: 0 submitted (reduce at *out_seq) | 1 already |
+ * 2 pending | 3 failed (up to `cap` failed ids in out_failed, total in
+ * *out_failed_count). */
+int  net_shard_group_new(const uint64_t* shards, size_t n, uint64_t reduce,
+                         net_shard_group_t** out_handle);
+void net_shard_group_free(net_shard_group_t* handle);
+int  net_workflow_fan_out(net_workflow_adapter_t* handle,
+                          net_shard_group_t* group, uint64_t* out_seq);
+int  net_workflow_try_join(net_workflow_adapter_t* handle,
+                           net_shard_group_t* group, int* out_kind,
+                           uint64_t* out_seq, uint64_t* out_failed, size_t cap,
+                           size_t* out_failed_count);
+
+/* ---- Tier 2: triggers ----
+ * Bound to a WorkflowAdapter (reads its state internally). Actions are
+ * (kind, id) pairs: kind 0 = submit, 1 = start. on_task_change fills the
+ * parallel out_kinds[]/out_ids[] up to `cap`, total in *out_count. */
+int  net_trigger_engine_new(net_workflow_adapter_t* handle,
+                            net_trigger_engine_t** out_handle);
+void net_trigger_engine_free(net_trigger_engine_t* handle);
+int  net_trigger_arm_after_task(net_trigger_engine_t* handle, uint64_t task,
+                                int action_kind, uint64_t action_id);
+int  net_trigger_arm_after_terminal(net_trigger_engine_t* handle, uint64_t task,
+                                    int action_kind, uint64_t action_id);
+int  net_trigger_on_task_change(net_trigger_engine_t* handle, uint64_t task,
+                                uint64_t tick, int* out_kinds, uint64_t* out_ids,
+                                size_t cap, size_t* out_count);
+int  net_trigger_armed_count(net_trigger_engine_t* handle, size_t* out);
 
 /* ---- Memories adapter ---- */
 int  net_memories_adapter_open(net_redex_t* redex, uint64_t origin_hash,

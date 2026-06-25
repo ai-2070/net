@@ -68,8 +68,10 @@ use crate::adapter::net::cortex::tasks::{
     TasksWatcher,
 };
 use crate::adapter::net::cortex::workflow::{
-    StatusCounts as WfStatusCounts, TaskStatus as WfTaskStatus,
-    WorkflowAdapter as InnerWorkflowAdapter,
+    fan_out as wf_fan_out, try_join as wf_try_join, Action as InnerWfAction, Join as InnerWfJoin,
+    ShardGroup as InnerShardGroup, StatusCounts as WfStatusCounts, TaskStatus as WfTaskStatus,
+    Trigger as InnerWfTrigger, TriggerEngine as InnerTriggerEngine,
+    TriggerWorld as InnerTriggerWorld, WorkflowAdapter as InnerWorkflowAdapter,
 };
 use crate::adapter::net::cortex::WaitForTokenError as InnerWaitForTokenError;
 use crate::adapter::net::netdb::{NetDbError as InnerNetDbError, NetDbSnapshot};
@@ -3654,6 +3656,291 @@ pub unsafe extern "C" fn net_workflow_wait_for_seq(
             }
         }
     })
+}
+
+// =========================================================================
+// Tier 2: shards (fan-out / fan-in) — C ABI
+// =========================================================================
+
+/// FFI handle wrapping an [`InnerShardGroup`] (a plain value).
+pub struct ShardGroupHandle {
+    inner: InnerShardGroup,
+}
+
+/// Build a shard group from `shards[0..n]` + the `reduce` task id.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_shard_group_new(
+    shards: *const u64,
+    n: usize,
+    reduce: u64,
+    out_handle: *mut *mut ShardGroupHandle,
+) -> c_int {
+    if out_handle.is_null() || (shards.is_null() && n != 0) {
+        return NetError::NullPointer.into();
+    }
+    let ids: Vec<u64> = if n == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(shards, n) }.to_vec()
+    };
+    let handle = Box::new(ShardGroupHandle {
+        inner: InnerShardGroup::new(ids, reduce),
+    });
+    unsafe {
+        *out_handle = Box::into_raw(handle);
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_shard_group_free(handle: *mut ShardGroupHandle) {
+    if handle.is_null() {
+        return;
+    }
+    unsafe { drop(Box::from_raw(handle)) };
+}
+
+/// Fan out: submit every shard task. Returns the last append seq.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_fan_out(
+    wf: *mut WorkflowAdapterHandle,
+    group: *mut ShardGroupHandle,
+    out_seq: *mut u64,
+) -> c_int {
+    if wf.is_null() || group.is_null() || out_seq.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*wf };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let group = unsafe { &*group };
+    match wf_fan_out(&wf.inner, &group.inner) {
+        Ok(seq) => {
+            unsafe {
+                *out_seq = seq;
+            }
+            0
+        }
+        Err(_) => NET_ERR_CORTEX_FOLD,
+    }
+}
+
+/// Try to join. `*out_kind`: 0 submitted, 1 already_submitted, 2 pending,
+/// 3 failed. On submitted, `*out_seq` holds the reduce seq. On failed, up
+/// to `cap` failed shard ids land in `out_failed`, total in
+/// `*out_failed_count`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_try_join(
+    wf: *mut WorkflowAdapterHandle,
+    group: *mut ShardGroupHandle,
+    out_kind: *mut c_int,
+    out_seq: *mut u64,
+    out_failed: *mut u64,
+    cap: usize,
+    out_failed_count: *mut usize,
+) -> c_int {
+    if wf.is_null()
+        || group.is_null()
+        || out_kind.is_null()
+        || out_seq.is_null()
+        || out_failed_count.is_null()
+    {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*wf };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let group = unsafe { &*group };
+    let join = match wf_try_join(&wf.inner, &group.inner) {
+        Ok(j) => j,
+        Err(_) => return NET_ERR_CORTEX_FOLD,
+    };
+    unsafe {
+        *out_seq = 0;
+        *out_failed_count = 0;
+        match join {
+            InnerWfJoin::Submitted(s) => {
+                *out_kind = 0;
+                *out_seq = s;
+            }
+            InnerWfJoin::AlreadySubmitted => *out_kind = 1,
+            InnerWfJoin::Pending => *out_kind = 2,
+            InnerWfJoin::Failed(ids) => {
+                *out_kind = 3;
+                *out_failed_count = ids.len();
+                if !out_failed.is_null() {
+                    let m = ids.len().min(cap);
+                    std::ptr::copy_nonoverlapping(ids.as_ptr(), out_failed, m);
+                }
+            }
+        }
+    }
+    0
+}
+
+// =========================================================================
+// Tier 2: triggers — C ABI (D5 (a): the engine binds the adapter and
+// reads its state internally)
+// =========================================================================
+
+/// FFI handle: the pure trigger engine + the bound adapter (state reads).
+pub struct TriggerEngineHandle {
+    engine: std::sync::Mutex<InnerTriggerEngine>,
+    adapter: Arc<InnerWorkflowAdapter>,
+}
+
+fn wf_action_code(a: &InnerWfAction) -> (c_int, u64) {
+    match a {
+        InnerWfAction::Submit(id) => (0, *id),
+        InnerWfAction::Start(id) => (1, *id),
+    }
+}
+
+fn wf_action_from_code(kind: c_int, id: u64) -> Option<InnerWfAction> {
+    match kind {
+        0 => Some(InnerWfAction::Submit(id)),
+        1 => Some(InnerWfAction::Start(id)),
+        _ => None,
+    }
+}
+
+/// Build a trigger engine bound to `wf` (clones the adapter Arc).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_engine_new(
+    wf: *mut WorkflowAdapterHandle,
+    out_handle: *mut *mut TriggerEngineHandle,
+) -> c_int {
+    if wf.is_null() || out_handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*wf };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let handle = Box::new(TriggerEngineHandle {
+        engine: std::sync::Mutex::new(InnerTriggerEngine::new()),
+        adapter: Arc::clone(&wf.inner),
+    });
+    unsafe {
+        *out_handle = Box::into_raw(handle);
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_engine_free(handle: *mut TriggerEngineHandle) {
+    if handle.is_null() {
+        return;
+    }
+    unsafe { drop(Box::from_raw(handle)) };
+}
+
+unsafe fn trigger_arm(
+    handle: *mut TriggerEngineHandle,
+    trigger: InnerWfTrigger,
+    action_kind: c_int,
+    action_id: u64,
+) -> c_int {
+    if handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let Some(action) = wf_action_from_code(action_kind, action_id) else {
+        return NET_ERR_CORTEX_FOLD; // unknown action kind
+    };
+    let h = unsafe { &*handle };
+    h.engine.lock().unwrap().arm(trigger, action);
+    0
+}
+
+/// Arm AfterTask(task) -> action (0 submit, 1 start).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_arm_after_task(
+    handle: *mut TriggerEngineHandle,
+    task: u64,
+    action_kind: c_int,
+    action_id: u64,
+) -> c_int {
+    unsafe {
+        trigger_arm(
+            handle,
+            InnerWfTrigger::AfterTask(task),
+            action_kind,
+            action_id,
+        )
+    }
+}
+
+/// Arm AfterTerminal(task) -> action.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_arm_after_terminal(
+    handle: *mut TriggerEngineHandle,
+    task: u64,
+    action_kind: c_int,
+    action_id: u64,
+) -> c_int {
+    unsafe {
+        trigger_arm(
+            handle,
+            InnerWfTrigger::AfterTerminal(task),
+            action_kind,
+            action_id,
+        )
+    }
+}
+
+/// `task` changed: evaluate against the bound adapter's state. Fills
+/// parallel `out_kinds[i]` (0 submit, 1 start) / `out_ids[i]` up to `cap`,
+/// with the total fired count in `*out_count`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_on_task_change(
+    handle: *mut TriggerEngineHandle,
+    task: u64,
+    tick: u64,
+    out_kinds: *mut c_int,
+    out_ids: *mut u64,
+    cap: usize,
+    out_count: *mut usize,
+) -> c_int {
+    if handle.is_null() || out_count.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let state = h.adapter.state();
+    let guard = state.read();
+    let world = InnerTriggerWorld::new(&guard, tick);
+    let actions = h.engine.lock().unwrap().on_task_change(task, &world);
+    unsafe {
+        *out_count = actions.len();
+        if !out_kinds.is_null() && !out_ids.is_null() {
+            for (i, a) in actions.iter().take(cap).enumerate() {
+                let (k, id) = wf_action_code(a);
+                *out_kinds.add(i) = k;
+                *out_ids.add(i) = id;
+            }
+        }
+    }
+    0
+}
+
+/// Total armed (not-yet-fired) triggers into `*out`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_trigger_armed_count(
+    handle: *mut TriggerEngineHandle,
+    out: *mut usize,
+) -> c_int {
+    if handle.is_null() || out.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    unsafe {
+        *out = h.engine.lock().unwrap().armed_count();
+    }
+    0
 }
 
 // ABI-visible no-op to force the linker to keep `c_void` happy on
