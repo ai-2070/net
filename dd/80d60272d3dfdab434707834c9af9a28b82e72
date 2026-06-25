@@ -1,0 +1,25 @@
+net/crates/net/bindings/node/src/cortex.rs
+  s_58a23d9389d6ed::t_2e5e4f587d725b 2674,2678,2687-2688,2703,2725,2750,2762,2764,2773,2784,2786,2793
+net/crates/net/sdk/src/mesh.rs
+  s_58a23d9389d6ed::t_f430ac2543f2af 877-878
+net/crates/net/bindings/python/src/cortex.rs
+  s_58a23d9389d6ed::t_2e5e4f587d725b 3869,3873,3882-3883,3939,3941,3959,3961,3967
+net/crates/net/src/ffi/cortex.rs
+  s_58a23d9389d6ed::t_888f5d956c7e53 3792,3796,3830-3831,3861,3979,3981,4006,4040,4042
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "dd80d60272d3dfdab434707834c9af9a28b82e72",
+  "prompts": {},
+  "sessions": {
+    "s_58a23d9389d6ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92186006-b4bc-4409-9b64-7b1fa8e6ebfa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
