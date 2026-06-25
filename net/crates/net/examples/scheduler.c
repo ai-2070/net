@@ -15,7 +15,7 @@
  *     6. Reserve an island, then release it (both "won").
  *     7. Release an island this node never held ("lost").
  *
- * (publish_island_topology / match_gpu_islands / claim_gpu_island take a
+ * (publish_island_topology / match_islands / claim_island take a
  *  JSON criteria/record string — see net.go.h; omitted here to keep the
  *  example free of a JSON builder.)
  *

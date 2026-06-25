@@ -10,8 +10,8 @@
 
 use net_sdk::capabilities::CapabilitySet;
 use net_sdk::gang::{
-    CapabilityFilter, CapabilityQuery, ClaimOutcome, GpuSet, IslandRecord, MatchCriteria,
-    NumericFilter, SelectionPolicy,
+    CapabilityFilter, CapabilityQuery, ClaimOutcome, IslandRecord, MatchCriteria, NumericFilter,
+    SelectionPolicy, UnitSet,
 };
 use net_sdk::mesh::MeshBuilder;
 
@@ -63,9 +63,9 @@ async fn single_node_publishes_matches_and_claims_its_own_island() {
         .unwrap();
     mesh.publish_island_topology(IslandRecord {
         id: 0xD0,
-        gpus: GpuSet::new(vec![0, 1, 2, 3, 4, 5, 6, 7]),
+        units: UnitSet::new(vec![0, 1, 2, 3, 4, 5, 6, 7]),
         host: 0, // overwritten with this node's id by publish
-        warm_models: vec![0xA1],
+        capabilities: vec!["model:a1".into()],
         load: 0.1,
         p50_latency_us: 800,
     })
@@ -78,18 +78,18 @@ async fn single_node_publishes_matches_and_claims_its_own_island() {
             ..Default::default()
         }),
         numeric: NumericFilter {
-            min_gpus: 8,
+            min_units: 8,
             ..Default::default()
         },
         selection: SelectionPolicy::LeastLoaded,
-        prefer_warm_model: None,
+        prefer_capability: None,
     };
 
     // The node sees its own island...
-    assert_eq!(mesh.match_gpu_islands(&criteria), vec![0xD0]);
+    assert_eq!(mesh.match_islands(&criteria), vec![0xD0]);
     // ...and claims (reserves) it.
     let claimed = mesh
-        .claim_gpu_island(&criteria, now_us() + 60_000_000)
+        .claim_island(&criteria, now_us() + 60_000_000)
         .await
         .unwrap();
     assert_eq!(claimed, Some(0xD0));

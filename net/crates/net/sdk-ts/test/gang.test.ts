@@ -30,20 +30,20 @@ describe('gang scheduler (MeshNode)', () => {
     await node.announceCapabilities({ tags: ['gpu:h100'] });
     await node.publishIslandTopology({
       id: 0xd0n,
-      gpus: [0, 1, 2, 3, 4, 5, 6, 7],
-      warmModels: [0xa1n],
+      units: [0, 1, 2, 3, 4, 5, 6, 7],
+      capabilities: ['model:a1'],
       load: 0.1,
       p50LatencyUs: 800,
     });
 
     const criteria = {
       tagsAll: ['gpu:h100'],
-      minGpus: 8,
+      minUnits: 8,
       selection: 'least_loaded',
     };
-    expect(node.matchGpuIslands(criteria)).toEqual([0xd0n]);
+    expect(node.matchIslands(criteria)).toEqual([0xd0n]);
 
-    const claimed = await node.claimGpuIsland(criteria, nowUs() + 60_000_000n);
+    const claimed = await node.claimIsland(criteria, nowUs() + 60_000_000n);
     expect(claimed).toBe(0xd0n);
   });
 });

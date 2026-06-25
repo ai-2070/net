@@ -9272,7 +9272,7 @@ impl MeshNode {
         )
         .map_err(|e| AdapterError::Connection(format!("island: sign failed: {e}")))?;
         // Self-index so the node's OWN scheduler sees islands it hosts:
-        // match_gpu_islands / claim_gpu_island read self.island_fold,
+        // match_islands / claim_island read self.island_fold,
         // and the broadcast only reaches peers. Mirrors the capability
         // (announce_capabilities) and reservation
         // (apply_and_broadcast_reservation) self-apply paths (review #1).
@@ -11096,11 +11096,11 @@ impl MeshNode {
         &self.island_fold
     }
 
-    /// Match GPU islands for a gang job by reading this node's
-    /// capability + island folds (Thunderdome §2 steps 1–3). Pure
-    /// read; returns the candidate islands in claim order. The
-    /// node-level entry to the match→claim pipeline.
-    pub fn match_gpu_islands(
+    /// Match islands for a gang job by reading this node's capability +
+    /// island folds (Thunderdome §2 steps 1–3). Pure read; returns the
+    /// candidate islands in claim order. The node-level entry to the
+    /// match→claim pipeline.
+    pub fn match_islands(
         &self,
         criteria: &super::behavior::gang::MatchCriteria,
     ) -> Vec<super::behavior::fold::IslandId> {
@@ -11153,18 +11153,18 @@ impl MeshNode {
             .await
     }
 
-    /// Match GPU islands by `criteria` and reserve the first
-    /// available, all under this node's identity — the node-level
-    /// "schedule a single-island gang against my own folds" loop
-    /// (the `Reserved` reject walks to the next candidate). Returns
-    /// the claimed island, or `None` when nothing matched or every
-    /// match was contended in this node's view.
-    pub async fn claim_gpu_island(
+    /// Match islands by `criteria` and reserve the first available, all
+    /// under this node's identity — the node-level "schedule a single-
+    /// island gang against my own folds" loop (the `Reserved` reject
+    /// walks to the next candidate). Returns the claimed island, or
+    /// `None` when nothing matched or every match was contended in this
+    /// node's view.
+    pub async fn claim_island(
         &self,
         criteria: &super::behavior::gang::MatchCriteria,
         until_unix_us: u64,
     ) -> Result<Option<super::behavior::fold::IslandId>, AdapterError> {
-        for island in self.match_gpu_islands(criteria) {
+        for island in self.match_islands(criteria) {
             if matches!(
                 self.reserve_island(island, until_unix_us).await?,
                 super::behavior::gang::ClaimOutcome::Won

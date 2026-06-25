@@ -874,14 +874,14 @@ impl Mesh {
         Ok(self.node.publish_island_topology(record).await?)
     }
 
-    /// Match GPU islands against `criteria` over this node's capability +
+    /// Match islands against `criteria` over this node's capability +
     /// island folds (read-only; no claim). Best island first per the
     /// selection policy. Empty when nothing matched.
-    pub fn match_gpu_islands(
+    pub fn match_islands(
         &self,
         criteria: &crate::gang::MatchCriteria,
     ) -> Vec<crate::gang::IslandId> {
-        self.node.match_gpu_islands(criteria)
+        self.node.match_islands(criteria)
     }
 
     /// Reserve `island` (optimistic AP CAS on the reservation fold)
@@ -913,12 +913,12 @@ impl Mesh {
     /// node-level "schedule a single-island gang against my own folds"
     /// loop. Returns the claimed island, or `None` when nothing matched
     /// or every match was contended in this node's view.
-    pub async fn claim_gpu_island(
+    pub async fn claim_island(
         &self,
         criteria: &crate::gang::MatchCriteria,
         until_unix_us: u64,
     ) -> Result<Option<crate::gang::IslandId>> {
-        Ok(self.node.claim_gpu_island(criteria, until_unix_us).await?)
+        Ok(self.node.claim_island(criteria, until_unix_us).await?)
     }
 
     /// Scoped variant of [`Self::find_nodes`]. Filters candidates

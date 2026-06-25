@@ -53,9 +53,9 @@ rather than building the unfinished durable store.
 `announce_capabilities` (`mesh.rs:9367`, comment "Self-index so local queries see
 our own caps") and `apply_and_broadcast_reservation` (`mesh.rs:11173`).
 
-Since `match_gpu_islands` / `claim_gpu_island` (`mesh.rs:11082` / `11127`) read
+Since `match_islands` / `claim_island` (`mesh.rs:11082` / `11127`) read
 `self.island_fold`, a co-located scheduler+GPU-host that publishes its island and
-then calls `claim_gpu_island` gets `Ok(None)` forever — it can never schedule onto
+then calls `claim_island` gets `Ok(None)` forever — it can never schedule onto
 its own hardware. Only peer-hosted islands are ever visible. The 2-node broadcast
 test only asserts the *peer's* fold converges, so the gap is uncovered.
 
@@ -198,7 +198,7 @@ the commit. Make a single `Claimant` the generation owner (lifting the
 ### 12. `match_islands` clones the whole island table before filtering
 **`behavior/gang/mod.rs` (`match_islands`, `IslandQuery::All`)** · efficiency
 
-Clones every `IslandRecord` (with its `GpuSet`/`warm_models` Vecs) then discards all
+Clones every `IslandRecord` (with its `UnitSet`/`capabilities` Vecs) then discards all
 but a handful, on a path that re-runs on every claim retry. Use a `HostedBy` /
 filtering query that clones only survivors.
 

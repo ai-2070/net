@@ -24,7 +24,7 @@ surfaces are clean and idiomatic:
   (`RedexHandle` / `WorkflowAdapterHandle`), with the inner in `ManuallyDrop`
   and the box intentionally leaked — the established audit-#23 recipe;
 - correct two-pass buffer capping on the **read-only** list calls
-  (`net_workflow_subtree`, `net_mesh_match_gpu_islands`, `net_workflow_try_join`
+  (`net_workflow_subtree`, `net_mesh_match_islands`, `net_workflow_try_join`
   failed-ids), with `copy_nonoverlapping` type-correct because `IslandId` and
   `TaskId` are both `u64` aliases;
 - a `TriggerEngineHandle` that clones `Arc<WorkflowAdapter>` so it correctly
@@ -147,7 +147,7 @@ exempt.
 
 ### F5 (Nit) — assorted consistency gaps
 
-- `net_mesh_claim_gpu_island` (`src/ffi/mesh.rs:3839`): on the `found == 0` path
+- `net_mesh_claim_island` (`src/ffi/mesh.rs:3839`): on the `found == 0` path
   it leaves `*out_island` untouched rather than pre-zeroing it, unlike the
   pre-zero discipline elsewhere in the FFI. Contract says don't read it, so
   harmless — but inconsistent.

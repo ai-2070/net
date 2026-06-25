@@ -17,8 +17,8 @@ use std::time::Duration;
 use net::adapter::net::behavior::capability::CapabilitySet;
 use net::adapter::net::behavior::fold::{
     CapabilityFilter, CapabilityFold, CapabilityMembership, CapabilityQuery, EnvelopeMeta,
-    FoldKind, GpuSet, IslandQuery, IslandRecord, IslandTopologyFold, NodeState, ReservationQuery,
-    SignedAnnouncement,
+    FoldKind, IslandQuery, IslandRecord, IslandTopologyFold, NodeState, ReservationQuery,
+    SignedAnnouncement, UnitSet,
 };
 use net::adapter::net::behavior::gang::{
     match_islands, single_island_claim, ClaimOutcome, MatchCriteria, NumericFilter, SelectionPolicy,
@@ -94,9 +94,9 @@ fn prime_capability(node: &MeshNode, kp: &EntityKeypair, node_id: u64, tags: Vec
 fn prime_island(node: &MeshNode, kp: &EntityKeypair, node_id: u64, id: u64, load: f32) {
     let record = IslandRecord {
         id,
-        gpus: GpuSet::new(vec![0, 1, 2, 3, 4, 5, 6, 7]),
+        units: UnitSet::new(vec![0, 1, 2, 3, 4, 5, 6, 7]),
         host: node_id,
-        warm_models: vec![0xA1],
+        capabilities: vec!["model:a1".into()],
         load,
         p50_latency_us: 1_200,
     };
@@ -133,11 +133,11 @@ async fn island_fold_is_wired_and_scheduler_matches_and_claims_over_node_folds()
             ..Default::default()
         }),
         numeric: NumericFilter {
-            min_gpus: 8,
+            min_units: 8,
             ..Default::default()
         },
         selection: SelectionPolicy::LeastLoaded,
-        prefer_warm_model: None,
+        prefer_capability: None,
     };
 
     // The scheduler reads the node's wired folds: both islands match,
@@ -200,9 +200,9 @@ async fn island_topology_broadcasts_to_a_connected_peer() {
 
     let record = IslandRecord {
         id: 0xC0,
-        gpus: GpuSet::new(vec![0, 1, 2, 3]),
+        units: UnitSet::new(vec![0, 1, 2, 3]),
         host: 0, // overwritten with host.node_id() by publish
-        warm_models: vec![0xA1],
+        capabilities: vec!["model:a1".into()],
         load: 0.42,
         p50_latency_us: 900,
     };
@@ -231,7 +231,7 @@ async fn island_topology_broadcasts_to_a_connected_peer() {
 
 /// A node that hosts GPU islands must see them in its OWN island fold
 /// after `publish_island_topology` — the broadcast only reaches peers,
-/// but the node's own scheduler (`match_gpu_islands` / `claim_gpu_island`)
+/// but the node's own scheduler (`match_islands` / `claim_island`)
 /// reads the local fold. Without the self-apply a co-located
 /// scheduler+host could never schedule onto its own hardware (review #1).
 #[tokio::test]
@@ -241,9 +241,9 @@ async fn publish_island_topology_self_indexes_for_the_local_scheduler() {
 
     let record = IslandRecord {
         id: 0xE0,
-        gpus: GpuSet::new(vec![0, 1, 2, 3, 4, 5, 6, 7]),
+        units: UnitSet::new(vec![0, 1, 2, 3, 4, 5, 6, 7]),
         host: 0, // overwritten with node.node_id() by publish
-        warm_models: vec![0xA1],
+        capabilities: vec!["model:a1".into()],
         load: 0.1,
         p50_latency_us: 800,
     };
@@ -262,10 +262,10 @@ async fn publish_island_topology_self_indexes_for_the_local_scheduler() {
 
 /// Node-level claim round-trip: a scheduler node folds a GPU peer's
 /// capability + island (primed here as already-converged), runs
-/// `claim_gpu_island` against its OWN folds, and the resulting
+/// `claim_island` against its OWN folds, and the resulting
 /// reservation broadcasts to a connected peer's reservation fold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn claim_gpu_island_reserves_and_broadcasts_to_peer() {
+async fn claim_island_reserves_and_broadcasts_to_peer() {
     let scheduler = build_node().await;
     let peer = build_node().await;
     connect_pair(&scheduler, &peer).await;
@@ -294,18 +294,18 @@ async fn claim_gpu_island_reserves_and_broadcasts_to_peer() {
             ..Default::default()
         }),
         numeric: NumericFilter {
-            min_gpus: 8,
+            min_units: 8,
             ..Default::default()
         },
         selection: SelectionPolicy::LeastLoaded,
-        prefer_warm_model: None,
+        prefer_capability: None,
     };
 
     // First claim establishes the local hold (optimistic AP view).
     let claimed = scheduler
-        .claim_gpu_island(&criteria, now_us() + 60_000_000)
+        .claim_island(&criteria, now_us() + 60_000_000)
         .await
-        .expect("claim_gpu_island");
+        .expect("claim_island");
     assert_eq!(claimed, Some(0xD0));
     let sched_id = scheduler.node_id();
     assert_eq!(

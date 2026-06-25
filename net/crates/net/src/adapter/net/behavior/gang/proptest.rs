@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::adapter::net::behavior::fold::{
-    Fold, GpuId, IslandId, NodeId, ReservationFold, ReservationQuery, ReservationState,
+    Fold, IslandId, NodeId, ReservationFold, ReservationQuery, ReservationState, UnitId,
 };
 use crate::adapter::net::behavior::gang::{
     acquire_gang, activate_island, Claimant, GangClaim, GangOutcome,
@@ -37,15 +37,15 @@ fn next(state: &mut u64) -> u64 {
     *state >> 33
 }
 
-/// Island `i` owns the disjoint GPU range `[i*4, i*4+4)`.
+/// Island `i` owns the disjoint unit range `[i*4, i*4+4)`.
 ///
 /// Computed in `u64` with a checked narrowing cast: a bare
-/// `island as GpuId` (u64→u32) before the multiply could let two
-/// distinct island ids alias the same GPU range via truncation, which
-/// would silently weaken the disjoint-GPU invariant this helper
+/// `island as UnitId` (u64→u32) before the multiply could let two
+/// distinct island ids alias the same unit range via truncation, which
+/// would silently weaken the disjoint-unit invariant this helper
 /// encodes. The test's ids stay small, so the cast never trips.
-fn gpus_of(island: IslandId) -> [GpuId; 4] {
-    let base = GpuId::try_from(island * 4).expect("island id too large for test GPU range");
+fn units_of(island: IslandId) -> [UnitId; 4] {
+    let base = UnitId::try_from(island * 4).expect("island id too large for test unit range");
     [base, base + 1, base + 2, base + 3]
 }
 
@@ -141,15 +141,15 @@ fn run_one_interleaving(seed: u64, gangs: usize, islands: u64) {
     }
 
     // --- Invariant 1: no two Active claims share a GPU ---
-    let mut gpu_owner: HashMap<GpuId, NodeId> = HashMap::new();
+    let mut unit_owner: HashMap<UnitId, NodeId> = HashMap::new();
     let mut active_islands = 0usize;
     for island in 0..islands {
         if let Some((holder, true)) = holder_of(&fold, island) {
             active_islands += 1;
-            for gpu in gpus_of(island) {
+            for unit in units_of(island) {
                 assert!(
-                    gpu_owner.insert(gpu, holder).is_none(),
-                    "GPU {gpu} claimed by two Active gangs (seed {seed})",
+                    unit_owner.insert(unit, holder).is_none(),
+                    "unit {unit} claimed by two Active gangs (seed {seed})",
                 );
             }
         }

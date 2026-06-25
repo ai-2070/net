@@ -200,8 +200,8 @@ mod tests {
 
     use super::*;
     use crate::adapter::net::behavior::fold::{
-        CapabilityFilter, CapabilityMembership, CapabilityQuery, EnvelopeMeta, FoldKind, GpuSet,
-        IslandRecord, NodeState, ReservationFold, ReservationQuery, SignedAnnouncement,
+        CapabilityFilter, CapabilityMembership, CapabilityQuery, EnvelopeMeta, FoldKind,
+        IslandRecord, NodeState, ReservationFold, ReservationQuery, SignedAnnouncement, UnitSet,
     };
     use crate::adapter::net::behavior::gang::{
         single_island_claim, NumericFilter, SelectionPolicy,
@@ -250,9 +250,9 @@ mod tests {
     ) {
         let record = IslandRecord {
             id,
-            gpus: GpuSet::new(vec![0, 1, 2, 3, 4, 5, 6, 7]),
+            units: UnitSet::new(vec![0, 1, 2, 3, 4, 5, 6, 7]),
             host: node,
-            warm_models: vec![0xA1],
+            capabilities: vec!["model:a1".into()],
             load: 0.2,
             p50_latency_us: 1_000,
         };
@@ -278,11 +278,11 @@ mod tests {
                 ..Default::default()
             }),
             numeric: NumericFilter {
-                min_gpus: 8,
+                min_units: 8,
                 ..Default::default()
             },
             selection: SelectionPolicy::LeastLoaded,
-            prefer_warm_model: None,
+            prefer_capability: None,
         }
     }
 

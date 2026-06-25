@@ -159,7 +159,7 @@ int  net_workflow_try_join(net_workflow_adapter_t* handle,
  * they fire AND disarm the matching triggers on every call, whether or not
  * the out-buffers are NULL. Do NOT size them with a "probe with NULL to
  * learn *out_count, then fill" two-pass (the safe idiom for the read-only
- * getters net_workflow_subtree / net_mesh_match_gpu_islands): the probe
+ * getters net_workflow_subtree / net_mesh_match_islands): the probe
  * pass would fire + discard the actions and the fill pass would find
  * nothing armed. Size the buffer up front (net_trigger_armed_count is an
  * upper bound — fired is a subset of armed) and call ONCE. If *out_count
