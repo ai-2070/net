@@ -1,0 +1,21 @@
+.github/workflows/ci.yml
+  s_b93d1d2fee6b2e::t_544b6187c5b4cb 910-917,920-925
+net/crates/net/bindings/node/src/transport.rs
+  s_b93d1d2fee6b2e::t_287f883f69f08f 329-340
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "19497c5dcd20cbf5a0912de1360d37a65662a235",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
