@@ -38,8 +38,14 @@ fn next(state: &mut u64) -> u64 {
 }
 
 /// Island `i` owns the disjoint GPU range `[i*4, i*4+4)`.
+///
+/// Computed in `u64` with a checked narrowing cast: a bare
+/// `island as GpuId` (u64→u32) before the multiply could let two
+/// distinct island ids alias the same GPU range via truncation, which
+/// would silently weaken the disjoint-GPU invariant this helper
+/// encodes. The test's ids stay small, so the cast never trips.
 fn gpus_of(island: IslandId) -> [GpuId; 4] {
-    let base = (island as GpuId) * 4;
+    let base = GpuId::try_from(island * 4).expect("island id too large for test GPU range");
     [base, base + 1, base + 2, base + 3]
 }
 
