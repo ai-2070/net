@@ -250,8 +250,21 @@ impl ClaimPipeline for GangClaimPipeline<'_> {
             ActiveCommitOutcome::Committed => Ok(ClaimResult::Active(ActiveClaim { island })),
             // No quorum (minority partition) or a takeover stole the
             // reserve: no Active, so the step is rejected and re-
-            // requests. The orphaned reserve TTL-expires.
+            // requests. Release the reserve we still hold now rather
+            // than letting it TTL-expire — otherwise it blocks every
+            // other claimant on this island for the whole reserve_ttl_us
+            // while this step is merely parked Waiting. Best-effort: a
+            // no-op (Lost) if a takeover already stole it, as on
+            // LostReservation (review #14).
             ActiveCommitOutcome::NoQuorum { .. } | ActiveCommitOutcome::LostReservation => {
+                let gen = self.next_gen();
+                let _ = release_island(
+                    self.ctx.reservations,
+                    self.ctx.keypair,
+                    self.ctx.node_id,
+                    gen,
+                    island,
+                );
                 Ok(ClaimResult::Rejected)
             }
         }
@@ -668,11 +681,14 @@ mod tests {
 
         let gate = drive_capability_step(&wf, &mut pipeline, 1, &requirement()).unwrap();
         assert_eq!(gate, StepGate::Waiting, "minority side can't reach Active → step waits");
-        // Reserved (the AP optimistic hold) but never Active — no
-        // compute starts.
-        assert!(matches!(
-            res.query(ReservationQuery::State(0xA0))[0].1,
-            ReservationState::Reserved { .. }
-        ));
+        // Never Active — no compute starts (the Thunderdome guarantee).
+        // And the orphaned reserve is released immediately rather than
+        // left Reserved to TTL-expire, so other claimants aren't blocked
+        // on this island while the step is parked Waiting (review #14).
+        let state = res.query(ReservationQuery::State(0xA0));
+        assert!(
+            state.is_empty() || matches!(state[0].1, ReservationState::Free),
+            "minority reserve released (Free), never left Reserved or leaked Active: {state:?}",
+        );
     }
 }
