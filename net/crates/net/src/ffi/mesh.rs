@@ -3817,6 +3817,14 @@ pub unsafe extern "C" fn net_mesh_claim_gpu_island(
     if handle.is_null() || criteria_json.is_null() || out_found.is_null() || out_island.is_null() {
         return NetError::NullPointer.into();
     }
+    // Pre-zero both out-params so every non-error return leaves them
+    // deterministic — a caller that reads `out_island` without first
+    // checking `out_found` sees 0, not stale stack data. The success arm
+    // overwrites them.
+    unsafe {
+        *out_found = 0;
+        *out_island = 0;
+    }
     let h = unsafe { &*handle };
     let _op = match h.guard.try_enter() {
         Some(op) => op,
@@ -3841,12 +3849,7 @@ pub unsafe extern "C" fn net_mesh_claim_gpu_island(
             }
             0
         }
-        Ok(None) => {
-            unsafe {
-                *out_found = 0;
-            }
-            0
-        }
+        Ok(None) => 0,
         Err(e) => adapter_err_to_code(&e),
     }
 }

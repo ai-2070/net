@@ -1355,6 +1355,7 @@ func OpenWorkflowFromSnapshot(
 
 // ShardGroup is a map-reduce shard group: the shard task ids + reduce id.
 type ShardGroup struct {
+	mu     sync.Mutex
 	handle *C.net_shard_group_t
 }
 
@@ -1375,12 +1376,18 @@ func NewShardGroup(shards []uint64, reduce uint64) (*ShardGroup, error) {
 }
 
 func (g *ShardGroup) free() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	if g.handle != nil {
 		C.net_shard_group_free(g.handle)
 		g.handle = nil
 		runtime.SetFinalizer(g, nil)
 	}
 }
+
+// Free releases the shard group. Idempotent and safe against a concurrent
+// finalizer; the group must not be used afterwards.
+func (g *ShardGroup) Free() { g.free() }
 
 // JoinResult is the outcome of TryJoin.
 type JoinResult struct {
@@ -1471,6 +1478,7 @@ func actionKindCode(kind string) C.int {
 
 // TriggerEngine is the pure trigger engine, bound to a WorkflowAdapter.
 type TriggerEngine struct {
+	mu     sync.Mutex
 	handle *C.net_trigger_engine_t
 }
 
@@ -1492,12 +1500,18 @@ func NewTriggerEngine(wf *WorkflowAdapter) (*TriggerEngine, error) {
 }
 
 func (e *TriggerEngine) free() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if e.handle != nil {
 		C.net_trigger_engine_free(e.handle)
 		e.handle = nil
 		runtime.SetFinalizer(e, nil)
 	}
 }
+
+// Free releases the trigger engine. Idempotent and safe against a
+// concurrent finalizer; the engine must not be used afterwards.
+func (e *TriggerEngine) Free() { e.free() }
 
 // ArmAfterTask arms AfterTask(task) -> action (fires when task is done).
 func (e *TriggerEngine) ArmAfterTask(task uint64, action TriggerAction) error {
