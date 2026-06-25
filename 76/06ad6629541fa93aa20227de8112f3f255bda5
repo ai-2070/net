@@ -1,0 +1,21 @@
+net/crates/net/include/net.go.h
+  s_58a23d9389d6ed::t_68df34735e121b 346-378
+net/crates/net/src/ffi/mesh.rs
+  s_58a23d9389d6ed::t_858e9d407144a5 3583-3861
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "7606ad6629541fa93aa20227de8112f3f255bda5",
+  "prompts": {},
+  "sessions": {
+    "s_58a23d9389d6ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92186006-b4bc-4409-9b64-7b1fa8e6ebfa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
