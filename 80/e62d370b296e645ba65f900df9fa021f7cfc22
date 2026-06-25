@@ -1,0 +1,27 @@
+net/crates/net/bindings/node/src/gang.rs
+  s_b93d1d2fee6b2e::t_10b0b086f2ad5a 28,30-34,41,43-46
+  s_b93d1d2fee6b2e::t_e2a0246a19c8d8 89-90,97-98
+net/crates/net/sdk-py/src/net_sdk/mesh.py
+  s_b93d1d2fee6b2e::t_05e06ffd90aa19 206-207,211-212,222-223,227-228
+  s_b93d1d2fee6b2e::t_5e0bc65dc2a040 161-162,166-167,173-176,179-180,184-185
+net/crates/net/bindings/python/src/lib.rs
+  s_b93d1d2fee6b2e::t_1205ebb6d2941f 1912-1915,1920-1921,1925-1926,1934-1935,1939-1940
+  s_b93d1d2fee6b2e::t_89cc7c56bfa5ac 1092-1093,1097-1098,1119-1120,1127-1128
+  s_b93d1d2fee6b2e::t_98c0e657c7ef2f 1979,1986-1987,1991-1992,2000-2001,2005-2006
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "80e62d370b296e645ba65f900df9fa021f7cfc22",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
