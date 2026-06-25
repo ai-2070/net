@@ -1288,22 +1288,30 @@ func (w *WorkflowAdapter) Snapshot() (bytes []byte, lastSeq uint64, hasLastSeq b
 	var length C.size_t
 	var seq C.uint64_t
 	var has C.int
+	// Size, then fill. The snapshot is re-serialized on each FFI call, so a
+	// concurrent transition (transitions also hold only RLock) can grow it
+	// between the two passes. Loop until the buffer was large enough
+	// (length <= cap) rather than silently returning a truncated,
+	// un-restorable buffer when it grew. Converges in one extra pass under
+	// normal write rates; each retry uses the freshly-reported length.
 	code := C.net_workflow_snapshot(w.handle, nil, 0, &length, &seq, &has)
 	if e := cortexErrorFromCode(code); e != nil {
 		return nil, 0, false, e
 	}
-	buf := make([]byte, int(length))
-	if length > 0 {
+	for length > 0 {
+		bufLen := length
+		buf := make([]byte, int(bufLen))
 		code = C.net_workflow_snapshot(
-			w.handle, (*C.uint8_t)(unsafe.Pointer(&buf[0])), length, &length, &seq, &has)
+			w.handle, (*C.uint8_t)(unsafe.Pointer(&buf[0])), bufLen, &length, &seq, &has)
 		if e := cortexErrorFromCode(code); e != nil {
 			return nil, 0, false, e
 		}
-		if int(length) < len(buf) {
-			buf = buf[:int(length)]
+		if length <= bufLen {
+			return buf[:int(length)], uint64(seq), has != 0, nil
 		}
+		// Grew between the sizing and fill passes — retry at the new size.
 	}
-	return buf, uint64(seq), has != 0, nil
+	return nil, uint64(seq), has != 0, nil
 }
 
 // OpenWorkflowFromSnapshot opens a workflow adapter from a snapshot,

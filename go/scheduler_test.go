@@ -24,6 +24,62 @@ func openWorkflow(t *testing.T) (*Redex, *WorkflowAdapter) {
 	return r, wf
 }
 
+// Snapshot then restore into a fresh Redex reproduces the folded state.
+// Exercises the grow-retry sizing loop on the happy path (single owner, so
+// it fits on the first fill pass).
+func TestWorkflowSnapshotRoundTrip(t *testing.T) {
+	r, wf := openWorkflow(t)
+	defer r.Free()
+	defer wf.Free()
+
+	for _, id := range []uint64{1, 2, 3} {
+		if _, err := wf.Submit(id); err != nil {
+			t.Fatalf("Submit(%d): %v", id, err)
+		}
+	}
+	if _, err := wf.Start(1); err != nil {
+		t.Fatalf("Start(1): %v", err)
+	}
+	seq, err := wf.Complete(1)
+	if err != nil {
+		t.Fatalf("Complete(1): %v", err)
+	}
+	if err := wf.WaitForSeq(seq, 5000); err != nil {
+		t.Fatalf("WaitForSeq: %v", err)
+	}
+
+	snap, lastSeq, hasSeq, err := wf.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if !hasSeq {
+		t.Fatalf("non-empty chain should report a last seq")
+	}
+
+	r2 := NewRedex("")
+	defer r2.Free()
+	wf2, err := OpenWorkflowFromSnapshot(r2, testOrigin, false, snap, lastSeq, hasSeq)
+	if err != nil {
+		t.Fatalf("OpenWorkflowFromSnapshot: %v", err)
+	}
+	defer wf2.Free()
+
+	st, err := wf2.Get(1)
+	if err != nil || st == nil {
+		t.Fatalf("Get(1) after restore = %v, %v; want done task", st, err)
+	}
+	if st.Status != "done" {
+		t.Fatalf("restored task 1 status = %q; want done", st.Status)
+	}
+	counts, err := wf2.StatusCounts()
+	if err != nil {
+		t.Fatalf("StatusCounts: %v", err)
+	}
+	if counts.Done != 1 || counts.Submitted != 2 {
+		t.Fatalf("restored counts = %+v; want Done=1 Submitted=2", counts)
+	}
+}
+
 // AtTick triggers must fire on the OnTick that reaches their deadline and
 // stay armed before it — the regression guard for the consuming-two-pass
 // bug, which dropped every fired action.
