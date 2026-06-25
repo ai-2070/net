@@ -36,10 +36,20 @@ pub struct NumericFilter {
     pub max_load: Option<f32>,
     /// Maximum live p50 latency (µs). `None` = any.
     pub max_p50_latency_us: Option<u32>,
-    /// Capabilities the island must have resident (AND) — e.g.
-    /// `"model:<hex>"` for a warm model that skips cold-load. Empty =
-    /// no constraint.
-    pub require_capabilities: Vec<String>,
+    /// Resident capabilities the island must have **all** of (AND) —
+    /// e.g. `"model:<hex>"` for a warm model that skips cold-load.
+    /// Empty = no constraint. The island-side analogue of
+    /// [`CapabilityFilter::tags_all`].
+    ///
+    /// [`CapabilityFilter::tags_all`]: crate::adapter::net::behavior::fold::CapabilityFilter::tags_all
+    pub require_all: Vec<String>,
+    /// Resident capabilities the island must have **at least one** of
+    /// (OR). Empty = no constraint (the composite-filter semantics, not
+    /// the bare `HasAnyTag` query). The island-side analogue of
+    /// [`CapabilityFilter::tags_any`].
+    ///
+    /// [`CapabilityFilter::tags_any`]: crate::adapter::net::behavior::fold::CapabilityFilter::tags_any
+    pub require_any: Vec<String>,
 }
 
 impl NumericFilter {
@@ -58,11 +68,21 @@ impl NumericFilter {
                 return false;
             }
         }
-        // Every required capability must be resident on the island.
+        // AND: every `require_all` capability must be resident.
         if !self
-            .require_capabilities
+            .require_all
             .iter()
             .all(|cap| record.capabilities.contains(cap))
+        {
+            return false;
+        }
+        // OR: if `require_any` is non-empty, at least one must be
+        // resident. Empty = no constraint on this axis.
+        if !self.require_any.is_empty()
+            && !self
+                .require_any
+                .iter()
+                .any(|cap| record.capabilities.contains(cap))
         {
             return false;
         }
@@ -131,7 +151,7 @@ pub fn select_islands(mut records: Vec<IslandRecord>, policy: SelectionPolicy) -
 /// warm model that skips cold-load), and within each group `policy`
 /// orders them. `None` reduces to plain [`select_islands`]. Pure.
 ///
-/// Affinity is a *preference*, not the hard `require_capabilities`
+/// Affinity is a *preference*, not the hard `require_all` / `require_any`
 /// filter — a job that benefits from a resident capability but can
 /// tolerate its absence still considers islands without it, just after
 /// the ones that have it.
@@ -205,15 +225,46 @@ mod tests {
     }
 
     #[test]
-    fn required_capability_filters() {
+    fn require_all_filters_resident_capabilities_and() {
         let f = NumericFilter {
-            require_capabilities: vec!["model:beef".into()],
+            require_all: vec!["model:beef".into()],
             ..Default::default()
         };
         let mut hot = rec(1, 0xAA, 4, 0.0, 0);
         hot.capabilities = vec!["model:beef".into(), "model:a1".into()];
         assert!(f.accepts(&hot));
         assert!(!f.accepts(&rec(2, 0xAA, 4, 0.0, 0))); // only has model:a1
+    }
+
+    #[test]
+    fn require_any_filters_resident_capabilities_or() {
+        // OR: at least one of the set must be resident.
+        let f = NumericFilter {
+            require_any: vec!["model:beef".into(), "model:a1".into()],
+            ..Default::default()
+        };
+        assert!(f.accepts(&rec(1, 0xAA, 4, 0.0, 0))); // rec has model:a1 (one of)
+        let mut neither = rec(2, 0xAA, 4, 0.0, 0);
+        neither.capabilities = vec!["model:cafe".into()];
+        assert!(!f.accepts(&neither)); // has neither
+        // Empty require_any = no constraint (composite semantics).
+        assert!(NumericFilter::default().accepts(&neither));
+    }
+
+    #[test]
+    fn require_all_and_require_any_compose() {
+        // Both axes apply: ALL of require_all AND ONE of require_any.
+        let f = NumericFilter {
+            require_all: vec!["model:beef".into()],
+            require_any: vec!["model:a1".into(), "model:cafe".into()],
+            ..Default::default()
+        };
+        let mut both = rec(1, 0xAA, 4, 0.0, 0);
+        both.capabilities = vec!["model:beef".into(), "model:a1".into()];
+        assert!(f.accepts(&both)); // beef (all) + a1 (any)
+        let mut all_no_any = rec(2, 0xAA, 4, 0.0, 0);
+        all_no_any.capabilities = vec!["model:beef".into()];
+        assert!(!f.accepts(&all_no_any)); // beef present, but none of the any-set
     }
 
     #[test]

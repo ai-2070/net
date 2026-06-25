@@ -83,7 +83,8 @@ pub struct MatchCriteria {
     /// Soft capability affinity (step 3): islands with this capability
     /// already resident rank ahead of the rest, within the selection
     /// policy. `None` = no affinity. Distinct from
-    /// [`NumericFilter::require_capabilities`], which is a hard filter.
+    /// [`NumericFilter::require_all`] / [`NumericFilter::require_any`],
+    /// which are hard filters.
     pub prefer_capability: Option<String>,
 }
 
