@@ -65,7 +65,15 @@ impl RedexFold<WorkflowState> for WorkflowFold {
                 let p: TransitionedPayload =
                     postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
                 if let Some(t) = state.tasks.get_mut(&p.id) {
-                    t.status = p.status;
+                    // Terminal is terminal: a `Done`/`Failed` task is
+                    // never moved by a plain transition. The sanctioned
+                    // way out of `Failed` is `retry`; out of `Done`
+                    // there is none (a fresh `submit` resets instead).
+                    // This guards replay / duplicate / buggy-writer
+                    // events from resurrecting a settled task (review #2).
+                    if !t.status.is_terminal() {
+                        t.status = p.status;
+                    }
                 }
                 // A transition for an unknown id is a no-op: the submit
                 // we never observed simply isn't in our view.
@@ -83,8 +91,13 @@ impl RedexFold<WorkflowState> for WorkflowFold {
                 let p: RetriedPayload =
                     postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
                 if let Some(t) = state.tasks.get_mut(&p.id) {
-                    t.attempts = t.attempts.saturating_add(1);
-                    t.status = TaskStatus::Running;
+                    // Retry re-runs the current step — the sanctioned
+                    // `Failed → Running` exit. It must not resurrect a
+                    // `Done` task, which is terminal success (review #2).
+                    if t.status != TaskStatus::Done {
+                        t.attempts = t.attempts.saturating_add(1);
+                        t.status = TaskStatus::Running;
+                    }
                 }
             }
             DISPATCH_TASK_DELETED => {

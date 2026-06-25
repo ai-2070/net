@@ -353,6 +353,36 @@ mod tests {
         assert!(wf.get(42).is_none());
     }
 
+    /// Terminal is terminal: a `Done`/`Failed` task can't be moved by a
+    /// plain transition or resurrected by retry — so a duplicate /
+    /// replayed / buggy-writer event can't un-settle it (review #2).
+    #[tokio::test]
+    async fn terminal_tasks_cannot_be_resurrected() {
+        let (_redex, wf) = open().await;
+
+        // Done is final success: start/retry after complete are no-ops.
+        wf.submit(1).unwrap();
+        wf.complete(1).unwrap();
+        wf.start(1).unwrap();
+        let seq = wf.retry(1).unwrap();
+        wf.wait_for_seq(seq).await.unwrap();
+        assert_eq!(wf.get(1).unwrap().status, TaskStatus::Done);
+        assert_eq!(wf.get(1).unwrap().attempts, 0, "retry didn't bump a Done task");
+
+        // Failed can't be moved by a plain transition...
+        wf.submit(2).unwrap();
+        wf.fail(2).unwrap();
+        let seq = wf.start(2).unwrap();
+        wf.wait_for_seq(seq).await.unwrap();
+        assert_eq!(wf.get(2).unwrap().status, TaskStatus::Failed);
+
+        // ...but retry is the sanctioned Failed → Running exit.
+        let seq = wf.retry(2).unwrap();
+        wf.wait_for_seq(seq).await.unwrap();
+        assert_eq!(wf.get(2).unwrap().status, TaskStatus::Running);
+        assert_eq!(wf.get(2).unwrap().attempts, 1);
+    }
+
     #[tokio::test]
     async fn delete_reclaims_the_task() {
         let (_redex, wf) = open().await;
