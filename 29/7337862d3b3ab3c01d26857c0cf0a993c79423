@@ -1,0 +1,25 @@
+go/cortex.go
+  s_58a23d9389d6ed::t_ad78493e4fbea7 1279-1343
+net/crates/net/src/ffi/cortex.rs
+  s_58a23d9389d6ed::t_e8cadf374300ae 4019-4122
+net/crates/net/include/net_cortex.h
+  s_58a23d9389d6ed::t_48353a27266c15 175-182
+go/net_cortex.h
+  s_58a23d9389d6ed::t_9614309c783f55 164-171
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "297337862d3b3ab3c01d26857c0cf0a993c79423",
+  "prompts": {},
+  "sessions": {
+    "s_58a23d9389d6ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92186006-b4bc-4409-9b64-7b1fa8e6ebfa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
