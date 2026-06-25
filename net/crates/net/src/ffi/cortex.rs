@@ -67,6 +67,10 @@ use crate::adapter::net::cortex::tasks::{
     OrderBy as TasksOrderBy, Task, TaskStatus, TasksAdapter as InnerTasksAdapter, TasksFilter,
     TasksWatcher,
 };
+use crate::adapter::net::cortex::workflow::{
+    StatusCounts as WfStatusCounts, TaskStatus as WfTaskStatus,
+    WorkflowAdapter as InnerWorkflowAdapter,
+};
 use crate::adapter::net::cortex::WaitForTokenError as InnerWaitForTokenError;
 use crate::adapter::net::netdb::{NetDbError as InnerNetDbError, NetDbSnapshot};
 use crate::adapter::net::redex::{
@@ -3287,6 +3291,369 @@ pub unsafe extern "C" fn net_netdb_free(handle: *mut NetDbHandle) {
 #[allow(dead_code)]
 fn _netdb_error_keep_alive(e: InnerNetDbError) -> InnerNetDbError {
     e
+}
+
+// =========================================================================
+// Task lifecycle (WorkflowAdapter) — C ABI shipped in `net_cortex.h`
+// =========================================================================
+//
+// Mirrors the `net_tasks_adapter_*` recipe: a `HandleGuard`-wrapped
+// `Arc<WorkflowAdapter>`, opened against an existing `RedexHandle` (D3:
+// reuse the Redex handle). Status is a small integer code on the wire
+// (see `wf_status_to_code`).
+
+/// FFI handle wrapping an [`InnerWorkflowAdapter`].
+pub struct WorkflowAdapterHandle {
+    inner: ManuallyDrop<Arc<InnerWorkflowAdapter>>,
+    guard: HandleGuard,
+}
+
+/// Wire status codes for a workflow task (stable; mirrored in
+/// `net_cortex.h`).
+fn wf_status_to_code(s: WfTaskStatus) -> c_int {
+    match s {
+        WfTaskStatus::Submitted => 0,
+        WfTaskStatus::Running => 1,
+        WfTaskStatus::Waiting => 2,
+        WfTaskStatus::Blocked => 3,
+        WfTaskStatus::Done => 4,
+        WfTaskStatus::Failed => 5,
+    }
+}
+
+/// Wire-form roll-up of task counts per status.
+#[repr(C)]
+pub struct NetWorkflowStatusCounts {
+    pub submitted: u64,
+    pub running: u64,
+    pub waiting: u64,
+    pub blocked: u64,
+    pub done: u64,
+    pub failed: u64,
+}
+
+/// Open a workflow adapter against a Redex. `persistent != 0` routes
+/// writes through the Redex's persistent directory.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_adapter_open(
+    redex: *mut RedexHandle,
+    origin_hash: u64,
+    persistent: c_int,
+    out_handle: *mut *mut WorkflowAdapterHandle,
+) -> c_int {
+    if redex.is_null() || out_handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let redex = unsafe { &*redex };
+    let _op = match redex.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let cfg = if persistent != 0 {
+        RedexFileConfig::default().with_persistent(true)
+    } else {
+        RedexFileConfig::default()
+    };
+    let redex_inner: Arc<InnerRedex> = Arc::clone(&redex.inner);
+    let result = block_on(async move {
+        InnerWorkflowAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
+    });
+    match result {
+        Ok(adapter) => {
+            let handle = Box::new(WorkflowAdapterHandle {
+                inner: ManuallyDrop::new(Arc::new(adapter)),
+                guard: HandleGuard::new(),
+            });
+            unsafe {
+                *out_handle = Box::into_raw(handle);
+            }
+            0
+        }
+        Err(_) => NET_ERR_CORTEX_FOLD,
+    }
+}
+
+/// Free a workflow adapter handle. Quiesces in-flight ops first.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_adapter_free(handle: *mut WorkflowAdapterHandle) {
+    if handle.is_null() {
+        return;
+    }
+    let h: &WorkflowAdapterHandle = unsafe { &*handle };
+    if h.guard.begin_free(FFI_HANDLE_FREE_DEADLINE) {
+        unsafe {
+            let inner = ManuallyDrop::take(&mut (*handle).inner);
+            drop(inner);
+        }
+    } else {
+        tracing::warn!(
+            "net_workflow_adapter_free: in-flight ops did not drain within deadline; \
+             leaking inner to avoid use-after-free"
+        );
+    }
+}
+
+/// Shared body for the seq-returning transition entry points.
+unsafe fn wf_seq_op(
+    handle: *mut WorkflowAdapterHandle,
+    out_seq: *mut u64,
+    f: impl FnOnce(
+        &InnerWorkflowAdapter,
+    ) -> Result<u64, crate::adapter::net::cortex::CortexAdapterError>,
+) -> c_int {
+    if handle.is_null() || out_seq.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*handle };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    match f(&wf.inner) {
+        Ok(seq) => {
+            unsafe {
+                *out_seq = seq;
+            }
+            0
+        }
+        Err(_) => NET_ERR_CORTEX_FOLD,
+    }
+}
+
+/// Submit a new task (enters at step 0, `submitted`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_submit(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.submit(id)) }
+}
+
+/// Mark the task `running`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_start(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.start(id)) }
+}
+
+/// Park the task `waiting`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_wait(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.wait(id)) }
+}
+
+/// Park the task `blocked`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_block(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.block(id)) }
+}
+
+/// Mark the task `done` (terminal success).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_complete(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.complete(id)) }
+}
+
+/// Mark the task `failed` (terminal failure).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_fail(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.fail(id)) }
+}
+
+/// Advance the step cursor (bumps step, resets attempts).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_advance(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.advance(id)) }
+}
+
+/// Retry the current step (status → `running`; never resurrects `done`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_retry(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.retry(id)) }
+}
+
+/// Delete a task, reclaiming its whole linked subtree.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_delete(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.delete(id)) }
+}
+
+/// Record a parent->child lineage edge (idempotent).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_link(
+    handle: *mut WorkflowAdapterHandle,
+    parent: u64,
+    child: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.link(parent, child)) }
+}
+
+/// Request cancellation of `id` (a worker-observed signal).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_request_cancel(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_seq: *mut u64,
+) -> c_int {
+    unsafe { wf_seq_op(handle, out_seq, |a| a.request_cancel(id)) }
+}
+
+/// Read the current state of `id`. `*out_found` is set to 1 and the
+/// other out-params filled if the task exists, else `*out_found` is 0.
+/// `*out_status` is a `wf_status_to_code` value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_get(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_found: *mut c_int,
+    out_step: *mut u32,
+    out_status: *mut c_int,
+    out_attempts: *mut u32,
+) -> c_int {
+    if handle.is_null()
+        || out_found.is_null()
+        || out_step.is_null()
+        || out_status.is_null()
+        || out_attempts.is_null()
+    {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*handle };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    match wf.inner.get(id) {
+        Some(st) => unsafe {
+            *out_found = 1;
+            *out_step = st.step;
+            *out_status = wf_status_to_code(st.status);
+            *out_attempts = st.attempts;
+        },
+        None => unsafe {
+            *out_found = 0;
+        },
+    }
+    0
+}
+
+/// Whether cancellation has been requested for `id` (`*out_bool` 0/1).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_is_cancel_requested(
+    handle: *mut WorkflowAdapterHandle,
+    id: u64,
+    out_bool: *mut c_int,
+) -> c_int {
+    if handle.is_null() || out_bool.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*handle };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    unsafe {
+        *out_bool = c_int::from(wf.inner.is_cancel_requested(id));
+    }
+    0
+}
+
+/// Roll-up of task counts per status into `*out`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_status_counts(
+    handle: *mut WorkflowAdapterHandle,
+    out: *mut NetWorkflowStatusCounts,
+) -> c_int {
+    if handle.is_null() || out.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*handle };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let c: WfStatusCounts = wf.inner.status_counts();
+    unsafe {
+        *out = NetWorkflowStatusCounts {
+            submitted: c.submitted as u64,
+            running: c.running as u64,
+            waiting: c.waiting as u64,
+            blocked: c.blocked as u64,
+            done: c.done as u64,
+            failed: c.failed as u64,
+        };
+    }
+    0
+}
+
+/// Block until every event up through `seq` has folded. `timeout_ms`
+/// of 0 waits indefinitely. Returns `0`, `NET_ERR_TIMEOUT`, or
+/// `NET_ERR_FOLD_STOPPED`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_workflow_wait_for_seq(
+    handle: *mut WorkflowAdapterHandle,
+    seq: u64,
+    timeout_ms: u32,
+) -> c_int {
+    if handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let wf = unsafe { &*handle };
+    let _op = match wf.guard.try_enter() {
+        Some(op) => op,
+        None => return NetError::ShuttingDown.into(),
+    };
+    let adapter: Arc<InnerWorkflowAdapter> = Arc::clone(&wf.inner);
+    block_on(async move {
+        let fut = adapter.wait_for_seq(seq);
+        if timeout_ms == 0 {
+            match fut.await {
+                Ok(()) => 0,
+                Err(_) => NET_ERR_FOLD_STOPPED,
+            }
+        } else {
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms as u64), fut)
+                .await
+            {
+                Ok(Ok(())) => 0,
+                Ok(Err(_)) => NET_ERR_FOLD_STOPPED,
+                Err(_) => NET_ERR_TIMEOUT,
+            }
+        }
+    })
 }
 
 // ABI-visible no-op to force the linker to keep `c_void` happy on
