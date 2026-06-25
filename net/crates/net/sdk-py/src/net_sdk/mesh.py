@@ -160,6 +160,7 @@ class MeshNode:
         *,
         tags_any: Optional[List[str]] = None,
         tag_groups_all: Optional[List[List[str]]] = None,
+        region: Optional[str] = None,
         min_units: Optional[int] = None,
         max_load: Optional[float] = None,
         max_p50_latency_us: Optional[int] = None,
@@ -170,14 +171,15 @@ class MeshNode:
         prefer_capability: Optional[str] = None,
     ) -> List[int]:
         """Match islands against the criteria over this node's folds
-        (read-only; no claim). Best island first. `tags_*` filter the host
-        capability match; `require_*` filter the island's resident
+        (read-only; no claim). Best island first. `tags_*` / `region` filter
+        the host capability match; `require_*` filter the island's resident
         capabilities. `selection` is one of ``least_loaded`` (default) /
         ``pack`` / ``load_band`` / ``lowest_id``."""
         return self._native.match_islands(
             tags_all,
             tags_any=tags_any or [],
             tag_groups_all=tag_groups_all or [],
+            region=region,
             min_units=min_units,
             max_load=max_load,
             max_p50_latency_us=max_p50_latency_us,
@@ -205,6 +207,7 @@ class MeshNode:
         *,
         tags_any: Optional[List[str]] = None,
         tag_groups_all: Optional[List[List[str]]] = None,
+        region: Optional[str] = None,
         min_units: Optional[int] = None,
         max_load: Optional[float] = None,
         max_p50_latency_us: Optional[int] = None,
@@ -221,6 +224,7 @@ class MeshNode:
             until_unix_us,
             tags_any=tags_any or [],
             tag_groups_all=tag_groups_all or [],
+            region=region,
             min_units=min_units,
             max_load=max_load,
             max_p50_latency_us=max_p50_latency_us,

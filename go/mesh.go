@@ -988,14 +988,15 @@ func (m *MeshNode) Publish(channel string, payload []byte, cfg PublishConfig) (*
 // GangCriteria is the flat match criteria (serialized to JSON for the C
 // ABI, which builds the core MatchCriteria internally). The scheduler is
 // resource-agnostic: GPU specifics ride plain capability tags (e.g.
-// "gpu:h100", "model:<hex>"). The Tags* fields filter the host capability
-// match (AND / OR / AND-of-ORs); the Require* fields filter the island's
-// resident capabilities. `Selection` is one of "least_loaded" (default) /
-// "pack" / "load_band" / "lowest_id".
+// "gpu:h100", "model:<hex>"). The Tags* fields + Region filter the host
+// capability match (Region is host network-locality — subnet / zone); the
+// Require* fields filter the island's resident capabilities. `Selection`
+// is one of "least_loaded" (default) / "pack" / "load_band" / "lowest_id".
 type GangCriteria struct {
 	TagsAll          []string   `json:"tags_all,omitempty"`
 	TagsAny          []string   `json:"tags_any,omitempty"`
 	TagGroupsAll     [][]string `json:"tag_groups_all,omitempty"`
+	Region           string     `json:"region,omitempty"`
 	MinUnits         uint       `json:"min_units,omitempty"`
 	MaxLoad          *float32   `json:"max_load,omitempty"`
 	MaxP50LatencyUs  *uint32    `json:"max_p50_latency_us,omitempty"`

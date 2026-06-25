@@ -48,6 +48,7 @@ The criteria carry a **host capability match** (step 1, over the capability fold
 | `tags_all` | host | host must carry **all** these tags (AND) |
 | `tags_any` | host | host must carry **≥1** (OR); empty = no constraint |
 | `tag_groups_all` | host | **≥1 per group** (AND of ORs); empty = no constraint |
+| `region` | host | host network-locality — subnet / zone / availability region (exact match); empty = any |
 | `min_units` | island | island has at least this many exclusive units |
 | `max_load` | island | live load ≤ this (`0.0..=1.0`) |
 | `max_p50_latency_us` | island | live p50 latency ≤ this |
@@ -57,7 +58,7 @@ The criteria carry a **host capability match** (step 1, over the capability fold
 | `load_band_target` | order | target load for `load_band` |
 | `prefer_capability` | order | **soft** affinity — islands with this capability resident rank ahead (e.g. a warm model that skips cold-load), within the selection policy |
 
-`tags_*` filter *which hosts* are candidates; `require_*` filter *which of their islands* qualify by resident capability. `prefer_capability` is a preference, not a hard filter — cold islands still considered, just after warm ones. An empty `require_any` / `tags_any` is **no constraint** (composite-filter semantics), never "matches nothing".
+`tags_*` and `region` filter *which hosts* are candidates; `require_*` filter *which of their islands* qualify by resident capability. **Subnet / region / zone is a host property** (network locality of the *node* — datacenter, rack, AZ), so it filters at the host stage, **never** in the island resident filter — an island is an NVLink domain *inside* a node, so it has no locality of its own. `prefer_capability` is a preference, not a hard filter — cold islands still considered, just after warm ones. An empty `require_any` / `tags_any` is **no constraint** (composite-filter semantics), never "matches nothing".
 
 The island record a node publishes: `{ id, units: [u32], capabilities: [tag], load, p50_latency_us }` — `capabilities` are resident tags (e.g. `"model:<hex>"` for a warm model). `host` is forced to the publishing node.
 

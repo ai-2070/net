@@ -32,6 +32,9 @@ pub struct IslandCriteria {
     /// Host must carry at least one tag from *every* group (AND of ORs).
     /// Omit = any.
     pub tag_groups_all: Option<Vec<Vec<String>>>,
+    /// Host network-locality — subnet / zone / availability region.
+    /// Omit = any region.
+    pub region: Option<String>,
     /// Minimum exclusive units in the island. Omit / 0 = any.
     pub min_units: Option<u32>,
     /// Maximum live load (0.0..=1.0). Omit = any.
@@ -88,6 +91,7 @@ fn build_match_criteria(c: IslandCriteria) -> Result<MatchCriteria> {
             tags_all: c.tags_all,
             tags_any: c.tags_any.unwrap_or_default(),
             tag_groups_all: c.tag_groups_all.unwrap_or_default(),
+            region: c.region,
             ..Default::default()
         }),
         numeric: NumericFilter {

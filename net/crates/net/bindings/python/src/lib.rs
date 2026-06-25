@@ -1091,6 +1091,7 @@ mod mesh_bindings {
         tags_all: Vec<String>,
         tags_any: Vec<String>,
         tag_groups_all: Vec<Vec<String>>,
+        region: Option<String>,
         min_units: Option<usize>,
         max_load: Option<f64>,
         max_p50_latency_us: Option<u32>,
@@ -1118,6 +1119,7 @@ mod mesh_bindings {
                 tags_all,
                 tags_any,
                 tag_groups_all,
+                region,
                 ..Default::default()
             }),
             numeric: NumericFilter {
@@ -1912,13 +1914,14 @@ mod mesh_bindings {
         /// (read-only; no claim). Best island first. `tags_*` filter the
         /// host capability match; `require_*` filter the island's
         /// resident capabilities.
-        #[pyo3(signature = (tags_all, tags_any=Vec::new(), tag_groups_all=Vec::new(), min_units=None, max_load=None, max_p50_latency_us=None, require_all=Vec::new(), require_any=Vec::new(), selection=None, load_band_target=None, prefer_capability=None))]
+        #[pyo3(signature = (tags_all, tags_any=Vec::new(), tag_groups_all=Vec::new(), region=None, min_units=None, max_load=None, max_p50_latency_us=None, require_all=Vec::new(), require_any=Vec::new(), selection=None, load_band_target=None, prefer_capability=None))]
         #[allow(clippy::too_many_arguments)]
         fn match_islands(
             &self,
             tags_all: Vec<String>,
             tags_any: Vec<String>,
             tag_groups_all: Vec<Vec<String>>,
+            region: Option<String>,
             min_units: Option<usize>,
             max_load: Option<f64>,
             max_p50_latency_us: Option<u32>,
@@ -1933,6 +1936,7 @@ mod mesh_bindings {
                 tags_all,
                 tags_any,
                 tag_groups_all,
+                region,
                 min_units,
                 max_load,
                 max_p50_latency_us,
@@ -1976,7 +1980,7 @@ mod mesh_bindings {
         /// Match + reserve the first available island in one call.
         /// Returns its id, or `None` when nothing matched / all
         /// contended.
-        #[pyo3(signature = (tags_all, until_unix_us, tags_any=Vec::new(), tag_groups_all=Vec::new(), min_units=None, max_load=None, max_p50_latency_us=None, require_all=Vec::new(), require_any=Vec::new(), selection=None, load_band_target=None, prefer_capability=None))]
+        #[pyo3(signature = (tags_all, until_unix_us, tags_any=Vec::new(), tag_groups_all=Vec::new(), region=None, min_units=None, max_load=None, max_p50_latency_us=None, require_all=Vec::new(), require_any=Vec::new(), selection=None, load_band_target=None, prefer_capability=None))]
         #[allow(clippy::too_many_arguments)]
         fn claim_island(
             &self,
@@ -1985,6 +1989,7 @@ mod mesh_bindings {
             until_unix_us: u64,
             tags_any: Vec<String>,
             tag_groups_all: Vec<Vec<String>>,
+            region: Option<String>,
             min_units: Option<usize>,
             max_load: Option<f64>,
             max_p50_latency_us: Option<u32>,
@@ -1999,6 +2004,7 @@ mod mesh_bindings {
                 tags_all,
                 tags_any,
                 tag_groups_all,
+                region,
                 min_units,
                 max_load,
                 max_p50_latency_us,

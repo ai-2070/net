@@ -93,6 +93,12 @@ were doc + DST:
   via `CapabilityFilter`. The live island filter (step 2) mirrors it on the resident-
   capability axis with `require_all` (AND) + `require_any` (OR). Both query shapes are
   reachable from the flat SDK criteria, not only from a hand-built `MatchCriteria`.
+- **Subnet / region / zone is a host filter, not an island filter.** Network locality is
+  a property of the *node* (datacenter / rack / AZ), not of an NVLink domain *inside* it,
+  so it rides the step-1 host match via `CapabilityFilter::region`
+  (`CapabilityQuery::InRegion`) — the field already existed; the flat SDK criteria expose
+  it as `region`. It must **never** land in `IslandRecord` / `NumericFilter` /
+  `require_*`; keeping it host-side keeps the folds aligned with physical reality.
 - **Option 4b stays deferred behind a *measured* condition, not a flag.** Premature
   flag infrastructure is the wrong direction for a substrate. Implement two-phase
   reserve→commit (4b) only when ordered-acquire (4a) shows pathological backoff at

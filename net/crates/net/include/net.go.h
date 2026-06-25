@@ -353,6 +353,7 @@ int      net_mesh_start(net_meshnode_t* handle);
  *   { "tags_all": ["gpu:h100"],   // host must carry ALL (AND)
  *     "tags_any": ["zone:a","zone:b"], // host carries >=1 (OR), optional
  *     "tag_groups_all": [["a","b"],["c"]], // >=1 per group (AND of ORs), opt
+ *     "region": "us-east-1",      // host network-locality (subnet/zone), opt
  *     "min_units": 8,             // optional
  *     "max_load": 0.8,           // optional (0.0..=1.0)
  *     "max_p50_latency_us": 5000, // optional
