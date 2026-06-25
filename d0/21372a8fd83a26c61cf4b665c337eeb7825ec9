@@ -1,0 +1,22 @@
+net/crates/net/tests/loom_models.rs
+  s_58a23d9389d6ed::t_33e8929abb1a09 883-889,931-935,942-946
+  s_58a23d9389d6ed::t_94f5946d8628f0 893,895,898-901,903-904,907-908,910,913-919,921-930,936-941
+  s_58a23d9389d6ed::t_b7a90b72be7a8b 810-825,827-829,832-839
+  s_58a23d9389d6ed::t_2af2c3d1812cfd 848-868,870-871,874-875,878,881-882
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.11",
+  "base_commit_sha": "d021372a8fd83a26c61cf4b665c337eeb7825ec9",
+  "prompts": {},
+  "sessions": {
+    "s_58a23d9389d6ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92186006-b4bc-4409-9b64-7b1fa8e6ebfa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
