@@ -3,11 +3,13 @@
 //! A task's *daemon* is the worker that runs its step. Reconcile keys
 //! daemons by `DaemonRef { id, name }`, and some surfaces key on the
 //! `id` alone (the MeshOS snapshot's `daemons: BTreeMap<u64, _>`, ICE
-//! force-restart-by-id), so task-derived ids must be spread across the
-//! whole `u64` range and namespaced away from the small sequential ids
-//! the registry hands to system daemons. These functions are the *one*
-//! place that mints task-derived refs — constructing a `DaemonRef` with
-//! a task-shaped id anywhere else is a regression (integration plan
+//! force-restart-by-id), so task-derived ids are spread pseudo-randomly
+//! across the whole `u64` range and decorrelated from the small
+//! sequential ids the registry hands to system daemons — a collision with
+//! one is therefore vanishingly unlikely (~2⁻⁶⁴ per system daemon), not
+//! structurally impossible. These functions are the *one* place that
+//! mints task-derived refs — constructing a `DaemonRef` with a
+//! task-shaped id anywhere else is a regression (integration plan
 //! Resolved Decision 1).
 //!
 //! The **attempt number is deliberately excluded** from every encoding:
@@ -19,8 +21,9 @@ use crate::adapter::net::behavior::meshos::DaemonRef;
 use crate::adapter::net::cortex::workflow::TaskId;
 
 /// Namespace tag for top-level task daemons (`"task_id1"` in ASCII).
-/// XOR-mixed into the id so task-derived ids can't collide with the
-/// small sequential ids the registry assigns to system daemons.
+/// XOR-mixed into the id before hashing so the task-id space is
+/// decorrelated from the small sequential ids the registry assigns to
+/// system daemons (collision ~2⁻⁶⁴, not structurally precluded).
 const TASK_DOMAIN: u64 = 0x7461_736B_5F69_6431;
 /// Namespace tag for shard daemons (`"shard_id"` in ASCII).
 const SHARD_DOMAIN: u64 = 0x7368_6172_645F_6964;
@@ -90,8 +93,10 @@ mod tests {
         assert_ne!(a.id, b.id, "distinct tasks → distinct ids");
         assert_eq!(a.name, "task/1");
         assert_eq!(b.name, "task/2");
-        // Namespaced: the encoded id is not the raw task id, so it can't
-        // collide with a small sequential system-daemon id.
+        // Namespaced: the encoded id is not the raw task id, so it is
+        // decorrelated from the small sequential system-daemon ids (a
+        // collision is ~2⁻⁶⁴, not structurally impossible — these checks
+        // pin representative values).
         assert_ne!(daemon_ref(1).id, 1);
         assert_ne!(daemon_ref(2).id, 2);
     }
