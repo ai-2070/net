@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/behavior/scheduler_bridge/daemon_ref.rs
+  s_e2c6f41ae18f64::t_dd4a27b3b8b437 6-12
+  s_e2c6f41ae18f64::t_01eb0c564ae12d 24-26
+  s_e2c6f41ae18f64::t_54211e87506c3c 96-99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "33b2fe43dd934c9db03b3dc59a6288765008974f",
+  "prompts": {},
+  "sessions": {
+    "s_e2c6f41ae18f64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dbc06b06-9d2b-4f28-a220-e736eee44f76",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
