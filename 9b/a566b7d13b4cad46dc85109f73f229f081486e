@@ -1,0 +1,25 @@
+net/crates/net/docs/plans/MESHOS_SCHEDULER_INTEGRATION_PLAN.md
+  s_b93d1d2fee6b2e::t_317b355f87be95 53-68
+  s_b93d1d2fee6b2e::t_15e46096df36b6 32
+  s_b93d1d2fee6b2e::t_b21d6ad96e71dd 435-442
+  s_b93d1d2fee6b2e::t_8908e7fb36db39 303-311
+  s_b93d1d2fee6b2e::t_a25164a19c0097 18-23
+  s_b93d1d2fee6b2e::t_1796d88a26fa39 33
+  s_b93d1d2fee6b2e::t_338316222cc837 338-341,343-349
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "9ba566b7d13b4cad46dc85109f73f229f081486e",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
