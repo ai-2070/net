@@ -65,8 +65,11 @@ pub use schedule::{
     schedule_gang, schedule_single, GangRequest, GangScheduler, ScheduleError, Scheduled,
 };
 
+use std::collections::HashSet;
+
 use crate::adapter::net::behavior::fold::{
     CapabilityFold, CapabilityQuery, Fold, IslandId, IslandQuery, IslandRecord, IslandTopologyFold,
+    NodeId,
 };
 
 /// Inputs to the read-only match→select pipeline ([`match_islands`],
@@ -101,10 +104,21 @@ pub fn match_islands(
     capability_fold: &Fold<CapabilityFold>,
     topology_fold: &Fold<IslandTopologyFold>,
     criteria: &MatchCriteria,
+    down_nodes: &HashSet<NodeId>,
 ) -> Vec<IslandId> {
     // [1] coarse capability match → candidate hosts.
     let matches = capability_fold.query(criteria.capability.clone());
-    let hosts = candidate_hosts(&matches);
+    let mut hosts = candidate_hosts(&matches);
+    // Liveness gate (MeshOS ↔ Scheduler Projection 4): drop hosts MeshOS
+    // currently observes as Unreachable *before* the island query, so
+    // neither a dead host's capability match nor its islands can ever be
+    // offered. Pruning the candidate-host set here — rather than mutating
+    // either fold — leaves both folds' CRDT-grade AP state byte-identical,
+    // and skips the candidate-then-filter work of fetching dead-node
+    // islands only to discard them. `down_nodes` empty ⇒ no-op.
+    if !down_nodes.is_empty() {
+        hosts.retain(|host| !down_nodes.contains(host));
+    }
     if hosts.is_empty() {
         return Vec::new();
     }
@@ -260,7 +274,7 @@ mod tests {
             prefer_capability: None,
         };
 
-        let order = match_islands(&caps, &topo, &criteria);
+        let order = match_islands(&caps, &topo, &criteria, &HashSet::new());
         // C's island (0xC0) excluded by capability; A's 0xA0 excluded
         // by load>0.5. Remaining: A's 0xA5 (0.2) then B's 0xB0 (0.4),
         // least-loaded first.
@@ -285,7 +299,48 @@ mod tests {
             selection: SelectionPolicy::LeastLoaded,
             prefer_capability: None,
         };
-        assert!(match_islands(&caps, &topo, &criteria).is_empty());
+        assert!(match_islands(&caps, &topo, &criteria, &HashSet::new()).is_empty());
+    }
+
+    /// MeshOS ↔ Scheduler Projection 4: a host MeshOS observes as down is
+    /// pruned from the candidate set before the island query, so its
+    /// islands are never offered — without mutating either fold.
+    #[test]
+    fn dead_host_islands_are_pruned_from_matching() {
+        let caps: Fold<CapabilityFold> = new_fold();
+        let topo: Fold<IslandTopologyFold> = new_fold();
+        let kp_a = EntityKeypair::generate();
+        let kp_b = EntityKeypair::generate();
+        let na = kp_a.entity_id().node_id();
+        let nb = kp_b.entity_id().node_id();
+        announce_capability(&caps, &kp_a, na, vec!["gpu:h100".into()]);
+        announce_capability(&caps, &kp_b, nb, vec!["gpu:h100".into()]);
+        announce_island(&topo, &kp_a, na, 0xA0, 8, 0.1);
+        announce_island(&topo, &kp_b, nb, 0xB0, 8, 0.2);
+
+        let criteria = MatchCriteria {
+            capability: CapabilityQuery::Composite(CapabilityFilter {
+                tags_all: vec!["gpu:h100".into()],
+                ..Default::default()
+            }),
+            numeric: NumericFilter::default(),
+            selection: SelectionPolicy::LeastLoaded,
+            prefer_capability: None,
+        };
+
+        // No nodes down → both islands match (least-loaded first).
+        assert_eq!(
+            match_islands(&caps, &topo, &criteria, &HashSet::new()),
+            vec![0xA0, 0xB0],
+        );
+
+        // Host A down → only B's island survives the host prune.
+        let a_down: HashSet<NodeId> = [na].into_iter().collect();
+        assert_eq!(match_islands(&caps, &topo, &criteria, &a_down), vec![0xB0]);
+
+        // Both down → nothing offered.
+        let both_down: HashSet<NodeId> = [na, nb].into_iter().collect();
+        assert!(match_islands(&caps, &topo, &criteria, &both_down).is_empty());
     }
 
     /// Subnet / region / zone is a **host** property (network locality),
@@ -332,7 +387,10 @@ mod tests {
             selection: SelectionPolicy::LeastLoaded,
             prefer_capability: None,
         };
-        assert_eq!(match_islands(&caps, &topo, &east_only), vec![0xE0]);
+        assert_eq!(
+            match_islands(&caps, &topo, &east_only, &HashSet::new()),
+            vec![0xE0]
+        );
 
         // No region constraint → both hosts' islands match.
         let any_region = MatchCriteria {
@@ -342,7 +400,7 @@ mod tests {
             }),
             ..east_only.clone()
         };
-        let mut both = match_islands(&caps, &topo, &any_region);
+        let mut both = match_islands(&caps, &topo, &any_region, &HashSet::new());
         both.sort_unstable();
         assert_eq!(both, vec![0xE0, 0xF0]);
 
@@ -355,7 +413,7 @@ mod tests {
             }),
             ..east_only.clone()
         };
-        assert!(match_islands(&caps, &topo, &nowhere).is_empty());
+        assert!(match_islands(&caps, &topo, &nowhere, &HashSet::new()).is_empty());
     }
 
     /// End-to-end Phase A "done when": match → claim the top island
@@ -384,7 +442,7 @@ mod tests {
             prefer_capability: None,
         };
 
-        let order = match_islands(&caps, &topo, &criteria);
+        let order = match_islands(&caps, &topo, &criteria, &HashSet::new());
         let island = *order.first().expect("a candidate island");
         assert_eq!(island, 0xA0);
 

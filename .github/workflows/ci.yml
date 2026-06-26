@@ -349,14 +349,20 @@ jobs:
       # the contract between MeshOsLoop reconcile → admit →
       # ActionDispatcher across phases; the deck test pins the operator
       # surface (DeckClient → AdminCommands → in-process MeshOsRuntime)
-      # that Deck-the-binary composes against. Both share the same
-      # `meshos` gate and run in one cargo invocation.
+      # that Deck-the-binary composes against. scheduler_bridge_driver
+      # exercises the MeshOS ↔ Scheduler bridge end-to-end (the
+      # SchedulerBridgeDriver over a live MeshOsLoop + MeshNode +
+      # WorkflowAdapter). All three share the same `meshos` gate — which
+      # transitively enables net/cortex/redex (`meshos → cortex → redex →
+      # net`), everything the driver test needs — and run in one cargo
+      # invocation.
       - name: MeshOS + Deck
         if: ${{ !cancelled() }}
         run: >
           cargo nextest run --no-fail-fast --features meshos
           --test meshos_pipeline
           --test deck_pipeline
+          --test scheduler_bridge_driver
 
   loom-tests:
     name: Loom concurrency models

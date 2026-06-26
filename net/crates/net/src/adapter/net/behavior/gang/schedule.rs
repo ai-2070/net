@@ -14,8 +14,10 @@
 //! clock + a no-op), exactly as in [`super::acquire_gang`]; production
 //! passes the crate's `current_timestamp_micros` and a jittered sleep.
 
+use std::collections::HashSet;
+
 use crate::adapter::net::behavior::fold::{
-    CapabilityFold, Fold, IslandId, IslandTopologyFold, JobId,
+    CapabilityFold, Fold, IslandId, IslandTopologyFold, JobId, NodeId,
 };
 use crate::adapter::net::stream::StreamError;
 
@@ -125,9 +127,13 @@ pub fn schedule_single(
     mut backoff: impl FnMut(u32),
 ) -> Result<Scheduled, ScheduleError> {
     let mut attempt = 0u32;
+    // The gang-scheduler path is not yet wired to a liveness source; an
+    // empty down-set means no host pruning. Projection 4's liveness prune
+    // is fed on the node claim path via `MeshNode::set_liveness_down`.
+    let no_down: HashSet<NodeId> = HashSet::new();
     loop {
         // Re-match each round — the world moves between attempts.
-        let islands = match_islands(scheduler.capability, scheduler.topology, criteria);
+        let islands = match_islands(scheduler.capability, scheduler.topology, criteria, &no_down);
         if !islands.is_empty() {
             let until = now_us().saturating_add(reserve_ttl_us);
             // Copy the (Copy) identity fields out before the &mut
@@ -168,7 +174,15 @@ pub fn schedule_gang(
     backoff: impl FnMut(u32),
 ) -> Result<Scheduled, ScheduleError> {
     // Match for candidates and take the top `gang_size` by selection.
-    let mut candidates = match_islands(scheduler.capability, scheduler.topology, req.criteria);
+    // Empty down-set: the scheduler path isn't liveness-wired yet (see
+    // `schedule_single`).
+    let no_down: HashSet<NodeId> = HashSet::new();
+    let mut candidates = match_islands(
+        scheduler.capability,
+        scheduler.topology,
+        req.criteria,
+        &no_down,
+    );
     if candidates.len() < req.gang_size {
         // Not enough islands match right now → saturation.
         return Err(ScheduleError::backpressure());

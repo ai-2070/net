@@ -142,7 +142,12 @@ async fn island_fold_is_wired_and_scheduler_matches_and_claims_over_node_folds()
 
     // The scheduler reads the node's wired folds: both islands match,
     // least-loaded first (B at 0.2 before A at 0.7).
-    let order = match_islands(node.capability_fold(), node.island_fold(), &criteria);
+    let order = match_islands(
+        node.capability_fold(),
+        node.island_fold(),
+        &criteria,
+        &std::collections::HashSet::new(),
+    );
     assert_eq!(
         order,
         vec![0xB0, 0xA0],
@@ -172,6 +177,50 @@ async fn island_fold_is_wired_and_scheduler_matches_and_claims_over_node_folds()
             .holder(),
         Some(cn),
     );
+}
+
+/// MeshOS ↔ Scheduler Projection 4 end-to-end on the public node API:
+/// `set_liveness_down` makes `MeshNode::match_islands` prune a downed
+/// host's islands, and clearing it restores them — no fold mutation.
+#[tokio::test]
+async fn set_liveness_down_prunes_a_dead_hosts_islands_from_match_islands() {
+    let node = build_node().await;
+    let peer_a = EntityKeypair::generate();
+    let peer_b = EntityKeypair::generate();
+    let na = peer_a.entity_id().node_id();
+    let nb = peer_b.entity_id().node_id();
+    prime_capability(&node, &peer_a, na, vec!["gpu:h100".into()]);
+    prime_capability(&node, &peer_b, nb, vec!["gpu:h100".into()]);
+    prime_island(&node, &peer_a, na, 0xA0, 0.7);
+    prime_island(&node, &peer_b, nb, 0xB0, 0.2);
+
+    let criteria = MatchCriteria {
+        capability: CapabilityQuery::Composite(CapabilityFilter {
+            tags_all: vec!["gpu:h100".into()],
+            ..Default::default()
+        }),
+        numeric: NumericFilter {
+            min_units: 8,
+            ..Default::default()
+        },
+        selection: SelectionPolicy::LeastLoaded,
+        prefer_capability: None,
+    };
+
+    // Default (nothing down): both islands, least-loaded first.
+    assert_eq!(node.match_islands(&criteria), vec![0xB0, 0xA0]);
+
+    // Mark host B down → its island 0xB0 is pruned from the public match.
+    node.set_liveness_down([nb].into_iter().collect());
+    assert_eq!(
+        node.match_islands(&criteria),
+        vec![0xA0],
+        "a downed host's island leaves the candidate set",
+    );
+
+    // Clear the down-set → both islands return.
+    node.set_liveness_down(std::collections::HashSet::new());
+    assert_eq!(node.match_islands(&criteria), vec![0xB0, 0xA0]);
 }
 
 /// 2-node broadcast: a host publishes its island topology and it

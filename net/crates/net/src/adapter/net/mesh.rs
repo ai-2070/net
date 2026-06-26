@@ -1949,6 +1949,13 @@ pub struct MeshNode {
     /// alongside the capability fold for the numeric-filter step. See
     /// `docs/plans/MESH_SCHEDULER_GANG_CLAIM_PLAN.md`.
     island_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::IslandTopologyFold>>,
+    /// Hosts MeshOS currently observes as Unreachable. The gang matcher
+    /// ([`Self::match_islands`]) prunes these from the candidate set so a
+    /// dead node's islands / capabilities are never offered (MeshOS ↔
+    /// Scheduler Projection 4). Lock-free `ArcSwap` so the match hot path
+    /// reads it with a single load; replaced per liveness tick via
+    /// [`Self::set_liveness_down`]. Empty by default (no node down).
+    liveness_down: Arc<arc_swap::ArcSwap<std::collections::HashSet<super::behavior::fold::NodeId>>>,
     /// Dedup cache for multi-hop capability announcements. Keyed by
     /// `(origin_node_id, version)` — the same discriminator
     /// `CapabilityIndex` uses to skip stale announcements. Entries
@@ -2555,6 +2562,9 @@ impl MeshNode {
             capability_set_cache,
             reservation_fold,
             island_fold,
+            liveness_down: Arc::new(arc_swap::ArcSwap::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             seen_announcements: Arc::new(DashMap::new()),
             last_announce_at: Arc::new(parking_lot::Mutex::new(None)),
             local_announcement: Arc::new(ArcSwapOption::empty()),
@@ -11104,7 +11114,27 @@ impl MeshNode {
         &self,
         criteria: &super::behavior::gang::MatchCriteria,
     ) -> Vec<super::behavior::fold::IslandId> {
-        super::behavior::gang::match_islands(&self.capability_fold, &self.island_fold, criteria)
+        let down = self.liveness_down.load();
+        super::behavior::gang::match_islands(
+            &self.capability_fold,
+            &self.island_fold,
+            criteria,
+            &down,
+        )
+    }
+
+    /// Replace the set of hosts the gang matcher treats as down. The
+    /// runtime feeds this each liveness tick from
+    /// `scheduler_bridge::project_liveness(meshos).down` (MeshOS ↔
+    /// Scheduler Projection 4); [`Self::match_islands`] then prunes those
+    /// hosts so a dead node's islands / capabilities are never offered.
+    /// Lock-free swap — safe to call from the liveness / reconcile loop
+    /// concurrently with matching.
+    pub fn set_liveness_down(
+        &self,
+        down: std::collections::HashSet<super::behavior::fold::NodeId>,
+    ) {
+        self.liveness_down.store(Arc::new(down));
     }
 
     /// Reserve `island` under this node's identity: apply the

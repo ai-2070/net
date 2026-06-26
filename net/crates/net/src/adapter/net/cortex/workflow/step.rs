@@ -234,7 +234,15 @@ impl ClaimPipeline for GangClaimPipeline<'_> {
         // [1] Match — read-only over capability + topology. The
         //     lifecycle stated the requirement; Thunderdome evaluates
         //     placement.
-        let islands = match_islands(self.ctx.capability, self.ctx.topology, &req.criteria);
+        // Liveness pruning (MeshOS ↔ Scheduler Projection 4) is fed on the
+        // node claim path via `MeshNode::set_liveness_down`; this seam isn't
+        // wired to a liveness source yet, so it passes an empty down-set.
+        let islands = match_islands(
+            self.ctx.capability,
+            self.ctx.topology,
+            &req.criteria,
+            &std::collections::HashSet::new(),
+        );
         if islands.is_empty() {
             return Ok(ClaimResult::Rejected);
         }
