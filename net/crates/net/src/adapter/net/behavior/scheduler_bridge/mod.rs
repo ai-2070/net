@@ -13,22 +13,25 @@
 //! - 1 — task → daemon intent (`project_daemon_intents`). Implemented.
 //! - 2 — claim → forced placement (`project_forced_placements`, backed
 //!   by `ClaimRegistry`). Implemented — closes Phase A.
-//! - 3 — daemon lifecycle → step state (gated on the corrections plan's
-//!   `Trigger::AfterTerminal`).
-//! - 4 — observed liveness → fold-update delta (`project_liveness`).
-//!   The pure node-level projection is implemented; the topology-drop /
-//!   capability-suspend appliers are deferred wiring (plan RD 5).
+//! - 3 — daemon lifecycle → step state (`apply_lifecycle` +
+//!   `build_daemon_task_map`). Implemented — `Trigger::AfterTerminal`
+//!   already exists in `workflow/trigger.rs`, so the gate is lifted.
+//! - 4 — observed liveness → fold-update delta (`project_liveness`) +
+//!   the `gang::match_islands` host-prune applier (via
+//!   `MeshNode::set_liveness_down`). Implemented; per-tick wiring deferred.
 //! - 5 — migration veto (`migrate` / `MigrationEligible`, type-enforced
 //!   via `ClaimRegistry::holds_exclusive`). Implemented.
 
 mod claim_registry;
 mod daemon_ref;
+mod lifecycle;
 mod liveness;
 mod migration;
 mod projection;
 
 pub use claim_registry::ClaimRegistry;
 pub use daemon_ref::{daemon_ref, daemon_ref_shard};
+pub use lifecycle::{apply_lifecycle, build_daemon_task_map, LifecycleTransition};
 pub use liveness::{project_liveness, LivenessDelta};
 pub use migration::{migrate, ClaimHeld, MigrationEligible, MigrationPlan};
 pub use projection::{project_daemon_intents, project_forced_placements};
