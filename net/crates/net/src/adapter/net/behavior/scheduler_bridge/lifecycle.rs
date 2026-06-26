@@ -84,6 +84,22 @@ pub fn apply_lifecycle(
     }
 }
 
+/// Whether a signal can ever imply a transition — a cheap pre-check so
+/// callers skip the O(tasks) daemon→task resolution
+/// ([`build_daemon_task_map`]) for the high-frequency no-op signals
+/// (`HealthChanged` / `SaturationChanged`) and the expected graceful exit.
+/// Exhaustive on purpose so it stays in lockstep with [`apply_lifecycle`]'s
+/// match: a new `#[non_exhaustive]` variant breaks the build here too,
+/// forcing a deliberate classification rather than a silent default.
+pub fn signal_implies_transition(signal: &DaemonLifecycleSignal) -> bool {
+    match signal {
+        DaemonLifecycleSignal::Started { .. } | DaemonLifecycleSignal::Crashed { .. } => true,
+        DaemonLifecycleSignal::ExitedCleanly { .. }
+        | DaemonLifecycleSignal::HealthChanged { .. }
+        | DaemonLifecycleSignal::SaturationChanged { .. } => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
@@ -120,6 +136,35 @@ mod tests {
             None,
             "graceful exit is the expected terminal/cancel shutdown",
         );
+    }
+
+    #[test]
+    fn only_started_and_crashed_imply_a_transition() {
+        use crate::adapter::net::behavior::meshos::DaemonHealth;
+        let at = Instant::now();
+        assert!(signal_implies_transition(&DaemonLifecycleSignal::Started {
+            at
+        }));
+        assert!(signal_implies_transition(&DaemonLifecycleSignal::Crashed {
+            at,
+            reason: "x".into(),
+        }));
+        // The no-op signals short-circuit before any daemon→task resolution.
+        assert!(!signal_implies_transition(
+            &DaemonLifecycleSignal::ExitedCleanly { at }
+        ));
+        assert!(!signal_implies_transition(
+            &DaemonLifecycleSignal::HealthChanged {
+                at,
+                health: DaemonHealth::Healthy,
+            }
+        ));
+        assert!(!signal_implies_transition(
+            &DaemonLifecycleSignal::SaturationChanged {
+                at,
+                saturation: 0.5
+            }
+        ));
     }
 
     #[test]

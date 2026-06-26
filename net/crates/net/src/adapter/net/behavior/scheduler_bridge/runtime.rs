@@ -30,7 +30,9 @@ use crate::adapter::net::cortex::workflow::{ActiveClaim, TaskId, WorkflowState};
 
 use super::claim_registry::ClaimRegistry;
 use super::daemon_ref::daemon_ref;
-use super::lifecycle::{apply_lifecycle, build_daemon_task_map, LifecycleTransition};
+use super::lifecycle::{
+    apply_lifecycle, build_daemon_task_map, signal_implies_transition, LifecycleTransition,
+};
 use super::migration::{ClaimHeld, MigrationEligible};
 use super::projection::{project_daemon_intents, project_forced_placements};
 
@@ -110,16 +112,22 @@ impl SchedulerBridge {
     }
 
     /// Map a daemon lifecycle signal to the workflow transition to apply
-    /// (Projection 3), or `None` for a system daemon / no-op signal.
-    /// Rebuilds the daemon→task map from `workflow` each call; a driver
-    /// processing a burst of signals can call [`build_daemon_task_map`]
-    /// once and use [`apply_lifecycle`] directly.
+    /// (Projection 3), or `None` for a system daemon / no-op signal. A
+    /// signal that can't imply a transition (health / saturation reports,
+    /// graceful exit) returns *before* the daemon→task map is built, so the
+    /// common high-frequency signals cost nothing. For a transition-bearing
+    /// signal the map is rebuilt from `workflow`; a driver processing a
+    /// burst can instead call [`build_daemon_task_map`] once and use
+    /// [`apply_lifecycle`] directly.
     pub fn lifecycle_transition(
         &self,
         signal: &DaemonLifecycleSignal,
         daemon: &DaemonRef,
         workflow: &WorkflowState,
     ) -> Option<LifecycleTransition> {
+        if !signal_implies_transition(signal) {
+            return None;
+        }
         apply_lifecycle(signal, daemon, &build_daemon_task_map(workflow))
     }
 
