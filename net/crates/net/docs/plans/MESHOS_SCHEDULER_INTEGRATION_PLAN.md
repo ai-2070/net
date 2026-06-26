@@ -15,12 +15,18 @@
 
 ## Implementation status (as built)
 
-Phases **A, B, and C are implemented** — all five projections (branch
-`meshos-scheduler`). What remains is the *runtime* that consumes them (applies
-transitions + fires triggers, feeds `set_liveness_down`, populates
-`ClaimRegistry`, publishes intents, runs the `MigrationPlan` executor) — pure
-wiring, no new projection logic. All cross-layer code lives in a neutral bridge
-module
+Phases **A, B, and C are implemented** — all five projections, the
+`SchedulerBridge` facade (owns the `ClaimRegistry`, composes the projections),
+and the `SchedulerBridgeDriver` that runs them against the live handles
+(`tick()` feeds `set_liveness_down` + publishes the merged intents; a self-owned
+`spawn(interval)` / `shutdown()` loop drives `tick()`; a fan-out
+`DaemonLifecycleObserver` applies Projection 3; claim hooks maintain the
+registry). What remains is only **assembly** at a deployment site that already
+owns a `MeshNode` + `MeshOsRuntime` + `WorkflowAdapter`: call
+`driver.spawn(interval)`, install
+`fan_out_lifecycle(vec![meshos_sink, driver.lifecycle_observer()])` on the
+`DaemonRegistry`, and call `on_running` / `on_released` from the step-driver. All
+cross-layer code lives in a neutral bridge module
 `src/adapter/net/behavior/scheduler_bridge/` (Decision 1) — the only module
 importing both `cortex::workflow` and `behavior::meshos`/`gang`, so LD 5 holds
 structurally.
