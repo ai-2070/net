@@ -36,7 +36,7 @@ structurally.
 | 1 task → daemon intent | `project_daemon_intents(&WorkflowState) -> Vec<DaemonIntentUpdate>` | ✅ |
 | 2 claim → forced placement | `project_forced_placements(&ClaimRegistry, resolve_host) -> Vec<DaemonIntentUpdate>` | ✅ |
 | 3 lifecycle → step state | `apply_lifecycle` + `build_daemon_task_map` | ✅ (`AfterTerminal` already existed) |
-| 4 liveness → fold delta | `project_liveness(&MeshOsState) -> LivenessDelta` + `match_islands` host prune | ✅ projection + applier; per-tick wiring deferred |
+| 4 liveness → fold delta | `project_liveness` (+ `_from_snapshot`) + `match_islands` host prune | ✅ projection + applier; driven by `SchedulerBridgeDriver::tick` |
 | 5 migration veto | `migrate(MigrationEligible, NodeId) -> MigrationPlan` | ✅ type-enforced |
 
 **Decision 1 — neutral bridge module.** The projections do NOT live in
@@ -460,36 +460,50 @@ release → re-claim → restart without ever double-holding the island.
 
 ## Test strategy
 
-- **DST — claim + migration (gating).** Extend `loom_models.rs`: a claim-holding daemon
-  targeted for migration mid-claim must be vetoed; a partition that strands a
-  claim-holder must not let migration *and* reconcile both act. This is the interaction
-  the single-box tests cannot reach.
-- **Type-system test for the migration veto.** A `compile_fail` doctest demonstrating
-  that `migrate(some_daemon_ref, target)` does not compile — the type system rejects it
-  without `MigrationEligible::check` first. This is the "veto enforced by type" guarantee
-  pinned mechanically.
-- **Integration across the reconciliation boundary.** House pattern (memory transport,
-  two+ `NetNode`, subscribe-before-publish): project a `Running(ActiveClaim)` task →
-  assert a `MeshOsAction` start on the claimed node; flip the task terminal → assert the
-  stop. Verify the workflow never holds a dispatcher handle.
-- **Daemon failure → claim release correctness.** A daemon `Failed` signal drives the
-  step to `Failed`, the `AfterTerminal` trigger fires, `release_step` returns the island.
-  Assert: island is `Free` within **≤4s at deployment defaults**, re-claimable by another
-  gang. The stranded-GPU regression test, with a concrete bound.
-- **Partition recovery semantics.** Split a claim-holder from the majority; on heal,
-  assert the claim's island ended `Free` exactly once (no double-run survived —
-  Thunderdome §6), the daemon state and the workflow task state agree, and no orphaned
-  daemon kept running on the minority side.
-- **Freeze-vs-claim test.** Issue a freeze with TTL < reserve_TTL: forced placements
-  re-emerge on thaw because the claim is still held. Issue a freeze with TTL ≥
-  reserve_TTL: **proposal is rejected by ICE validation** (test the rejection path
-  exists, not that the silent-strand path works).
-- **Replica-set placement test.** The `IslandTopology` fold's RedEX chain must be placed
-  with `PlacementStrategy::ColocationStrict` to one fault domain — this is the upstream
-  invariant that makes Thunderdome §6's quorum LAN-local and Phase B's partition test
-  meaningful. Pin it: a config that ships without `ColocationStrict` on the topology
-  fold's replica set should fail a startup check, not silently degrade to a slower
-  partition-recovery path.
+**Landed (this branch).** Full unit coverage on the bridge — `daemon_ref`
+encoding, `ClaimRegistry`, all five projections, the `SchedulerBridge` facade,
+and the driver's `event_to_signal` + fan-out — plus the meshos plumbing units
+(the `diff_daemons` node-pin gate and the `desired_daemon_nodes` lifecycle) and
+the gang `match_islands` dead-host prune. Two end-to-end integration tests in
+`tests/scheduler_bridge_driver.rs` (run in CI's `--features meshos` group) drive
+the `SchedulerBridgeDriver` over a live `MeshOsLoop` + `MeshNode` +
+`WorkflowAdapter`. Status of the specific cases below:
+
+- ⬜ **DST — claim + migration (gating).** Not yet built. Extend `loom_models.rs`:
+  a claim-holding daemon targeted for migration mid-claim must be vetoed; a
+  partition that strands a claim-holder must not let migration *and* reconcile
+  both act. This is the interaction the single-box tests cannot reach.
+- ✅ **Type-system test for the migration veto.** Landed — the `compile_fail`
+  doctest on `migrate` (`scheduler_bridge/migration.rs`) proves
+  `migrate(some_daemon_ref, target)` does not compile without
+  `MigrationEligible::check` first.
+- ✅ **Integration across the reconciliation boundary** (in-process form).
+  `running_claim_starts_its_daemon_on_the_claim_node_only` drives a
+  `Running(ActiveClaim)` task → Projections 1+2 → `DesiredState` → `reconcile`
+  and asserts a `StartDaemon` on the claimed node and on NO other node; the
+  driver test asserts the publish + a terminal stop, and the facade never holds a
+  dispatcher handle. The full house two-`NetNode` wire-propagation variant waits
+  on the deployment assembly.
+- ◐ **Daemon failure → claim release correctness.** Partial — the driver test
+  proves a daemon `Crashed` drives the step to `Failed` and releases the claim
+  from the registry (the apply path; `AfterTerminal` fires on `fail`). The
+  "island `Free` within **≤4s at deployment defaults**, re-claimable by another
+  gang" bound needs the worker/runtime `release_step` → reservation-fold wiring,
+  still deferred.
+- ⬜ **Partition recovery semantics.** Not yet built (needs a multi-node +
+  partition harness). Split a claim-holder from the majority; on heal, assert the
+  claim's island ended `Free` exactly once (no double-run survived — Thunderdome
+  §6), the daemon and workflow task states agree, and no orphaned daemon kept
+  running on the minority side.
+- ⬜ **Freeze-vs-claim test.** Not yet built — also needs the RD 2 ICE
+  freeze-TTL-cap **feature**, not yet implemented. Issue a freeze with TTL <
+  reserve_TTL: forced placements re-emerge on thaw because the claim is still
+  held. Issue a freeze with TTL ≥ reserve_TTL: **proposal is rejected by ICE
+  validation** (test the rejection path exists, not the silent-strand path).
+- ⬜ **Replica-set placement test.** Not yet built — also needs the RD 6
+  `ColocationStrict` startup-check **feature**, not yet implemented. A config that
+  ships without `ColocationStrict` on the topology fold's replica set should fail
+  a startup check, not silently degrade to a slower partition-recovery path.
 
 ## Locked decisions
 
