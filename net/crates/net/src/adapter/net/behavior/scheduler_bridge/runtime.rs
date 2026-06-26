@@ -57,10 +57,12 @@ where
         .into_iter()
         .map(|u| (u.daemon.clone(), u))
         .collect();
-    // Projection 2 overlay: pin each claim-bearing daemon to its host.
-    for pin in project_forced_placements(claims, resolve_host) {
-        if let Some(intent) = by_daemon.get_mut(&pin.daemon) {
-            intent.node = pin.node;
+    // Projection 2 overlay: pin each claim-bearing daemon to its host by
+    // setting only the `node` — Projection 1's Run/Stop is preserved, so a
+    // claim held against a non-Running task stays Stop (pinned).
+    for (daemon, host) in project_forced_placements(claims, resolve_host) {
+        if let Some(intent) = by_daemon.get_mut(&daemon) {
+            intent.node = Some(host);
         }
     }
     let mut out: Vec<DaemonIntentUpdate> = by_daemon.into_values().collect();

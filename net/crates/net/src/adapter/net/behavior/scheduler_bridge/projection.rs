@@ -1,7 +1,7 @@
 //! Projection 1 — workflow task state → desired daemon intents.
 
 use crate::adapter::net::behavior::fold::IslandId;
-use crate::adapter::net::behavior::meshos::{DaemonIntent, DaemonIntentUpdate, NodeId};
+use crate::adapter::net::behavior::meshos::{DaemonIntent, DaemonIntentUpdate, DaemonRef, NodeId};
 use crate::adapter::net::cortex::workflow::{TaskStatus, WorkflowState};
 
 use super::claim_registry::ClaimRegistry;
@@ -52,12 +52,11 @@ pub fn project_daemon_intents(workflow: &WorkflowState) -> Vec<DaemonIntentUpdat
     out
 }
 
-/// Project the held exclusive claims into node-pinned daemon intents
-/// (integration plan Projection 2 — the forced-placement seam). For
-/// each daemon holding an `ActiveClaim`, resolve the claim's island to
-/// its host node and emit a `Run` intent pinned there (`node:
-/// Some(host)`), so reconcile starts the daemon on exactly the claimed
-/// node and the drift scorer never places it (plan LD 1).
+/// Project the held exclusive claims into daemon→host node pins
+/// (integration plan Projection 2 — the forced-placement seam). For each
+/// daemon holding an `ActiveClaim`, resolve the claim's island to its host
+/// node and emit a `(daemon, host)` pin, so the daemon runs on exactly the
+/// claimed node and the drift scorer never places it (plan LD 1).
 ///
 /// `resolve_host` maps an island id to its current host — the wiring
 /// supplies a closure over the `IslandTopology` fold's
@@ -70,29 +69,28 @@ pub fn project_daemon_intents(workflow: &WorkflowState) -> Vec<DaemonIntentUpdat
 /// elsewhere; pinning a daemon to a vanished node would only produce an
 /// unschedulable intent.
 ///
-/// This is an **overlay** on [`project_daemon_intents`]: apply that
-/// first (every task `node: None`), then these pinned intents.
-/// `DesiredState::apply_daemon_intent` is last-write-wins per daemon, so
-/// a claim-bearing task's `None` is overridden by `Some(host)`. Output
-/// is sorted by daemon id for a stable order.
+/// Returns only the **pins**, not full `DaemonIntentUpdate`s: a claim
+/// constrains *where* a daemon runs, never *whether* it runs — that is
+/// Projection 1's call. [`super::desired_daemon_intents`] overlays each pin
+/// onto Projection 1's intent by setting *only* its `node`, so a claim held
+/// against a non-`Running` task still merges to `Stop` (pinned), never a
+/// spurious `Run`. (An earlier form returned `Run`-pinned updates and
+/// relied on `apply_daemon_intent`'s last-write-wins to overlay them; that
+/// clobbered Projection 1's `Stop` for a non-`Running` held claim, so the
+/// pin is now intent-free by construction.) Output is sorted by daemon id
+/// for a stable order.
 pub fn project_forced_placements<F>(
     claims: &ClaimRegistry,
     resolve_host: F,
-) -> Vec<DaemonIntentUpdate>
+) -> Vec<(DaemonRef, NodeId)>
 where
     F: Fn(IslandId) -> Option<NodeId>,
 {
-    let mut out: Vec<DaemonIntentUpdate> = claims
+    let mut out: Vec<(DaemonRef, NodeId)> = claims
         .iter()
-        .filter_map(|(daemon, claim)| {
-            resolve_host(claim.island).map(|host| DaemonIntentUpdate {
-                daemon: daemon.clone(),
-                intent: DaemonIntent::Run,
-                node: Some(host),
-            })
-        })
+        .filter_map(|(daemon, claim)| resolve_host(claim.island).map(|host| (daemon.clone(), host)))
         .collect();
-    out.sort_by_key(|update| update.daemon.id);
+    out.sort_by_key(|(daemon, _)| daemon.id);
     out
 }
 
@@ -184,18 +182,13 @@ mod tests {
             _ => None,
         };
 
-        let placements = project_forced_placements(&claims, resolve);
-        let by_name: std::collections::HashMap<String, &DaemonIntentUpdate> = placements
-            .iter()
-            .map(|u| (u.daemon.name.clone(), u))
-            .collect();
-        assert_eq!(by_name["task/1"].intent, DaemonIntent::Run);
-        assert_eq!(
-            by_name["task/1"].node,
-            Some(7),
-            "pinned to its island's host"
-        );
-        assert_eq!(by_name["task/2"].node, Some(9));
+        let by_name: std::collections::HashMap<String, NodeId> =
+            project_forced_placements(&claims, resolve)
+                .into_iter()
+                .map(|(daemon, host)| (daemon.name, host))
+                .collect();
+        assert_eq!(by_name["task/1"], 7, "pinned to its island's host");
+        assert_eq!(by_name["task/2"], 9);
     }
 
     #[test]
@@ -218,6 +211,7 @@ mod tests {
     /// exactly the claim-bearing daemon pinned and the rest run-anywhere.
     #[tokio::test]
     async fn projection1_then_projection2_overlay_pins_only_the_claim_holder() {
+        use super::super::desired_daemon_intents;
         use crate::adapter::net::behavior::meshos::state::DesiredState;
         use crate::adapter::net::cortex::workflow::ActiveClaim;
 
@@ -233,13 +227,10 @@ mod tests {
         claims.insert(daemon_ref(1), ActiveClaim { island: 0xA0 });
         let resolve = |island| if island == 0xA0 { Some(7) } else { None };
 
+        // The canonical composition: the in-process merge applied to a
+        // DesiredState (Projection 1 baseline + Projection 2 pin overlay).
         let mut desired = DesiredState::default();
-        let state = wf.state();
-        let guard = state.read();
-        for intent in project_daemon_intents(&guard) {
-            desired.apply_daemon_intent(&intent);
-        }
-        for intent in project_forced_placements(&claims, resolve) {
+        for intent in desired_daemon_intents(&wf.state().read(), &claims, resolve) {
             desired.apply_daemon_intent(&intent);
         }
 
@@ -258,6 +249,7 @@ mod tests {
     /// `DesiredState`, no workflow→dispatcher call in the path.
     #[tokio::test]
     async fn running_claim_starts_its_daemon_on_the_claim_node_only() {
+        use super::super::desired_daemon_intents;
         use crate::adapter::net::behavior::meshos::state::{DesiredState, MeshOsState};
         use crate::adapter::net::behavior::meshos::{
             reconcile, LocalityConfig, MaintenanceConfig, MeshOsAction, SchedulerConfig,
@@ -276,19 +268,16 @@ mod tests {
         let mut claims = ClaimRegistry::new();
         claims.insert(daemon_ref(1), ActiveClaim { island: 0xA0 });
 
-        // Project both projections into one DesiredState (the overlay).
+        // Merge both projections into one DesiredState (the canonical path).
         let mut desired = DesiredState::default();
         {
             let state = wf.state();
             let guard = state.read();
-            for intent in project_daemon_intents(&guard) {
+            for intent in desired_daemon_intents(&guard, &claims, |island| {
+                (island == 0xA0).then_some(CLAIM_HOST)
+            }) {
                 desired.apply_daemon_intent(&intent);
             }
-        }
-        for intent in
-            project_forced_placements(&claims, |island| (island == 0xA0).then_some(CLAIM_HOST))
-        {
-            desired.apply_daemon_intent(&intent);
         }
 
         // Daemon absent in actual state → a Run intent yields StartDaemon.
@@ -314,5 +303,41 @@ mod tests {
                 .any(|a| matches!(a, MeshOsAction::StartDaemon { .. })),
             "a non-claim node never starts the pinned daemon; got {elsewhere:?}",
         );
+    }
+
+    /// A claim still held against a task that is NOT `Running` (e.g. the
+    /// task failed before `release_step` cleared the registry) must merge
+    /// to a `Stop` pinned to the host — never a spurious `Run`. The pin
+    /// sets only the node; Projection 1 owns the Run/Stop call. (Regression
+    /// for the old `Run`-pinned overlay, which let a stale claim resurrect
+    /// a terminal task's daemon.)
+    #[tokio::test]
+    async fn held_claim_on_a_non_running_task_merges_to_stop_pinned() {
+        use super::super::desired_daemon_intents;
+        use crate::adapter::net::cortex::workflow::ActiveClaim;
+
+        let redex = Redex::new();
+        let wf = WorkflowAdapter::open(&redex, 0x5C4E_DB08).await.unwrap();
+        wf.submit(1).unwrap();
+        wf.start(1).unwrap(); // 1 → Running
+        let seq = wf.complete(1).unwrap(); // 1 → Done (terminal, not Running)
+        wf.wait_for_seq(seq).await.unwrap();
+
+        // The registry still holds task 1's claim (release lagged).
+        let mut claims = ClaimRegistry::new();
+        claims.insert(daemon_ref(1), ActiveClaim { island: 0xA0 });
+        let resolve = |island| (island == 0xA0).then_some(7);
+
+        let intents = desired_daemon_intents(&wf.state().read(), &claims, resolve);
+        let one = intents
+            .iter()
+            .find(|u| u.daemon == daemon_ref(1))
+            .expect("task 1 has an intent");
+        assert_eq!(
+            one.intent,
+            DaemonIntent::Stop,
+            "a non-Running held claim still projects Stop",
+        );
+        assert_eq!(one.node, Some(7), "but is still pinned to the claim host");
     }
 }
