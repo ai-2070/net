@@ -45,8 +45,6 @@ pub mod meshos;
 // import each other (integration-plan Locked Decision 5); every
 // cross-layer projection lives here. Spans both feature surfaces, so
 // it needs both gates.
-#[cfg(all(feature = "cortex", feature = "meshos"))]
-pub mod scheduler_bridge;
 pub mod metadata;
 pub mod placement;
 pub mod placement_registry;
@@ -56,6 +54,8 @@ pub mod query;
 pub mod required_capability;
 pub mod rules;
 pub mod safety;
+#[cfg(all(feature = "cortex", feature = "meshos"))]
+pub mod scheduler_bridge;
 pub mod schema;
 pub mod subnet;
 pub mod tag;

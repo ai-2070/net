@@ -55,7 +55,10 @@ async fn driver_tick_publishes_and_a_crash_fails_the_task() {
 
     // tick(): one live task → one published intent; no peers → none down.
     let report = driver.tick();
-    assert_eq!(report.published, 1, "the one Running task's intent is published");
+    assert_eq!(
+        report.published, 1,
+        "the one Running task's intent is published"
+    );
     assert_eq!(report.down, 0, "an empty snapshot marks no host down");
 
     // A daemon crash for task 1's daemon fails the step and releases the
@@ -80,7 +83,11 @@ async fn driver_tick_publishes_and_a_crash_fails_the_task() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(status, Some(TaskStatus::Failed), "the crash drove the task Failed");
+    assert_eq!(
+        status,
+        Some(TaskStatus::Failed),
+        "the crash drove the task Failed"
+    );
     assert!(
         driver.on_released(1).is_none(),
         "the crash already released the claim",

@@ -177,8 +177,12 @@ pub fn schedule_gang(
     // Empty down-set: the scheduler path isn't liveness-wired yet (see
     // `schedule_single`).
     let no_down: HashSet<NodeId> = HashSet::new();
-    let mut candidates =
-        match_islands(scheduler.capability, scheduler.topology, req.criteria, &no_down);
+    let mut candidates = match_islands(
+        scheduler.capability,
+        scheduler.topology,
+        req.criteria,
+        &no_down,
+    );
     if candidates.len() < req.gang_size {
         // Not enough islands match right now → saturation.
         return Err(ScheduleError::backpressure());

@@ -1955,8 +1955,7 @@ pub struct MeshNode {
     /// Scheduler Projection 4). Lock-free `ArcSwap` so the match hot path
     /// reads it with a single load; replaced per liveness tick via
     /// [`Self::set_liveness_down`]. Empty by default (no node down).
-    liveness_down:
-        Arc<arc_swap::ArcSwap<std::collections::HashSet<super::behavior::fold::NodeId>>>,
+    liveness_down: Arc<arc_swap::ArcSwap<std::collections::HashSet<super::behavior::fold::NodeId>>>,
     /// Dedup cache for multi-hop capability announcements. Keyed by
     /// `(origin_node_id, version)` — the same discriminator
     /// `CapabilityIndex` uses to skip stale announcements. Entries

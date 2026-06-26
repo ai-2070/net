@@ -75,7 +75,10 @@ pub fn project_daemon_intents(workflow: &WorkflowState) -> Vec<DaemonIntentUpdat
 /// `DesiredState::apply_daemon_intent` is last-write-wins per daemon, so
 /// a claim-bearing task's `None` is overridden by `Some(host)`. Output
 /// is sorted by daemon id for a stable order.
-pub fn project_forced_placements<F>(claims: &ClaimRegistry, resolve_host: F) -> Vec<DaemonIntentUpdate>
+pub fn project_forced_placements<F>(
+    claims: &ClaimRegistry,
+    resolve_host: F,
+) -> Vec<DaemonIntentUpdate>
 where
     F: Fn(IslandId) -> Option<NodeId>,
 {
@@ -123,8 +126,16 @@ mod tests {
         let by_name: std::collections::HashMap<String, &DaemonIntentUpdate> =
             intents.iter().map(|u| (u.daemon.name.clone(), u)).collect();
         assert_eq!(by_name["task/1"].intent, DaemonIntent::Run);
-        assert_eq!(by_name["task/2"].intent, DaemonIntent::Stop, "terminal → Stop");
-        assert_eq!(by_name["task/3"].intent, DaemonIntent::Stop, "Waiting → Stop");
+        assert_eq!(
+            by_name["task/2"].intent,
+            DaemonIntent::Stop,
+            "terminal → Stop"
+        );
+        assert_eq!(
+            by_name["task/3"].intent,
+            DaemonIntent::Stop,
+            "Waiting → Stop"
+        );
         assert_eq!(
             by_name["task/4"].intent,
             DaemonIntent::Stop,
@@ -174,10 +185,16 @@ mod tests {
         };
 
         let placements = project_forced_placements(&claims, resolve);
-        let by_name: std::collections::HashMap<String, &DaemonIntentUpdate> =
-            placements.iter().map(|u| (u.daemon.name.clone(), u)).collect();
+        let by_name: std::collections::HashMap<String, &DaemonIntentUpdate> = placements
+            .iter()
+            .map(|u| (u.daemon.name.clone(), u))
+            .collect();
         assert_eq!(by_name["task/1"].intent, DaemonIntent::Run);
-        assert_eq!(by_name["task/1"].node, Some(7), "pinned to its island's host");
+        assert_eq!(
+            by_name["task/1"].node,
+            Some(7),
+            "pinned to its island's host"
+        );
         assert_eq!(by_name["task/2"].node, Some(9));
     }
 
@@ -268,9 +285,9 @@ mod tests {
                 desired.apply_daemon_intent(&intent);
             }
         }
-        for intent in project_forced_placements(&claims, |island| {
-            (island == 0xA0).then_some(CLAIM_HOST)
-        }) {
+        for intent in
+            project_forced_placements(&claims, |island| (island == 0xA0).then_some(CLAIM_HOST))
+        {
             desired.apply_daemon_intent(&intent);
         }
 

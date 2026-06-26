@@ -765,7 +765,9 @@ mod tests {
         status.lifecycle = DaemonLifecycle::Running;
         actual.daemons.insert(d.clone(), status);
         let mut desired = DesiredState::default();
-        desired.desired_daemons.insert(d.clone(), DaemonIntent::Stop);
+        desired
+            .desired_daemons
+            .insert(d.clone(), DaemonIntent::Stop);
         desired.desired_daemon_nodes.insert(d.clone(), OTHER_NODE);
         assert!(reconcile(
             &actual,

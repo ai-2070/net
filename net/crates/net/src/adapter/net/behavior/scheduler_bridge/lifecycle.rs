@@ -149,7 +149,11 @@ mod tests {
         let at = Instant::now();
         for id in [10u64, 20, 30] {
             assert_eq!(
-                apply_lifecycle(&DaemonLifecycleSignal::Started { at }, &daemon_ref(id), &map),
+                apply_lifecycle(
+                    &DaemonLifecycleSignal::Started { at },
+                    &daemon_ref(id),
+                    &map
+                ),
                 Some(LifecycleTransition::ConfirmRunning(id)),
             );
         }

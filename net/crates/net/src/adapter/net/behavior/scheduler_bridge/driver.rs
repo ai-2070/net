@@ -55,9 +55,10 @@ fn resolve_island_host(mesh: &MeshNode, island: IslandId) -> Option<NodeId> {
 /// uses, so the two sinks agree on what each event means.
 fn event_to_signal(event: DaemonLifecycleEvent) -> (DaemonRef, DaemonLifecycleSignal) {
     match event {
-        DaemonLifecycleEvent::Registered { id, name, at } => {
-            (DaemonRef { id, name }, DaemonLifecycleSignal::Started { at })
-        }
+        DaemonLifecycleEvent::Registered { id, name, at } => (
+            DaemonRef { id, name },
+            DaemonLifecycleSignal::Started { at },
+        ),
         DaemonLifecycleEvent::Unregistered { id, name, at } => (
             DaemonRef { id, name },
             DaemonLifecycleSignal::ExitedCleanly { at },
@@ -211,7 +212,8 @@ impl SchedulerBridgeDriver {
         // Projection 4: snapshot → down-set → set_liveness_down.
         let delta = project_liveness_from_snapshot(&self.snapshot.read());
         let down = delta.down.len();
-        self.mesh.set_liveness_down(delta.down.into_iter().collect());
+        self.mesh
+            .set_liveness_down(delta.down.into_iter().collect());
 
         // Projection 1 + 2: publish the merged desired daemon intents.
         let intents: Vec<DaemonIntentUpdate> = {
@@ -291,7 +293,13 @@ mod tests {
             name: "task/1".into(),
             at,
         });
-        assert_eq!(d, DaemonRef { id: 7, name: "task/1".into() });
+        assert_eq!(
+            d,
+            DaemonRef {
+                id: 7,
+                name: "task/1".into()
+            }
+        );
         assert_eq!(s, DaemonLifecycleSignal::Started { at });
 
         let (_, s) = event_to_signal(DaemonLifecycleEvent::Unregistered {
