@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/behavior/scheduler_bridge/mod.rs
+  s_b93d1d2fee6b2e::t_f5b5d1be2f6eab 18-20,26,32
+net/crates/net/src/adapter/net/behavior/scheduler_bridge/liveness.rs
+  s_b93d1d2fee6b2e::t_17c4a8803fa791 1-101
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "2b0121d68fe9fde2bbe09bb43eee4b5b8e9a34a9",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
