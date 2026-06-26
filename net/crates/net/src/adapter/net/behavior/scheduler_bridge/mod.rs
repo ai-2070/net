@@ -24,6 +24,7 @@
 
 mod claim_registry;
 mod daemon_ref;
+mod driver;
 mod lifecycle;
 mod liveness;
 mod migration;
@@ -32,6 +33,7 @@ mod runtime;
 
 pub use claim_registry::ClaimRegistry;
 pub use daemon_ref::{daemon_ref, daemon_ref_shard};
+pub use driver::{fan_out_lifecycle, SchedulerBridgeDriver, TickReport};
 pub use lifecycle::{apply_lifecycle, build_daemon_task_map, LifecycleTransition};
 pub use liveness::{project_liveness, project_liveness_from_snapshot, LivenessDelta};
 pub use migration::{migrate, ClaimHeld, MigrationEligible, MigrationPlan};
