@@ -28,6 +28,7 @@ mod lifecycle;
 mod liveness;
 mod migration;
 mod projection;
+mod runtime;
 
 pub use claim_registry::ClaimRegistry;
 pub use daemon_ref::{daemon_ref, daemon_ref_shard};
@@ -35,3 +36,4 @@ pub use lifecycle::{apply_lifecycle, build_daemon_task_map, LifecycleTransition}
 pub use liveness::{project_liveness, LivenessDelta};
 pub use migration::{migrate, ClaimHeld, MigrationEligible, MigrationPlan};
 pub use projection::{project_daemon_intents, project_forced_placements};
+pub use runtime::{desired_daemon_intents, SchedulerBridge};
