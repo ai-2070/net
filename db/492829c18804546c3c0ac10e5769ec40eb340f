@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_06_26_MESHOS_SCHEDULER.md
+  s_e2c6f41ae18f64::t_d385872f8dcac8 1-225
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "db492829c18804546c3c0ac10e5769ec40eb340f",
+  "prompts": {},
+  "sessions": {
+    "s_e2c6f41ae18f64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dbc06b06-9d2b-4f28-a220-e736eee44f76",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
