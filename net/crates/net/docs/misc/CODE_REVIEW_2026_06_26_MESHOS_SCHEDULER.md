@@ -14,12 +14,29 @@ reconcile. `cargo check -p net --features cortex,meshos --tests` is
 
 ## Status
 
-**Open.** Findings: **2 Important / 3 Minor / 2 Nit**. The production
-paths work as built today; every Important item is a *latent* risk
-(reachable only under flows beyond the Phase-A scope, or an efficiency
+**Resolved (2026-06-26).** All 7 findings (2 Important / 3 Minor / 2 Nit)
+fixed on this branch, each as its own commit with tests where reasonable.
+The production paths worked as built; every Important item was a *latent*
+risk (reachable only under flows beyond the Phase-A scope, or an efficiency
 cost at the stated scale) rather than a live defect. Per the
 "no review-tracking IDs in code or commit messages" feedback rule, the
 labels below are for this doc only.
+
+| Finding | Fix commit (subject) |
+| --- | --- |
+| I1 — pin gate skips orphan stop | `fix(meshos): pinned daemon stops orphan replicas on non-target nodes` |
+| I2 — per-tick snapshot deep clone | `perf(scheduler-bridge): borrow the snapshot in tick() instead of deep-cloning` |
+| M1 — merge vs LWW divergence | `fix(scheduler-bridge): make forced-placement return pins, not Run intents` |
+| M2 — republish-all per tick | `perf(scheduler-bridge): publish only changed daemon intents per tick` |
+| M3 — deleted-task daemon leak | `fix(scheduler-bridge): tear down a deleted task's daemon in tick()` |
+| N1 — `daemon_ref` collision overclaim | `docs(scheduler-bridge): correct the daemon_ref collision claim` |
+| N2 — per-signal map rebuild | `perf(scheduler-bridge): skip the daemon→task map build for no-op signals` |
+
+Verification after the fixes: the scheduler_bridge lib tests (31),
+`reconcile` node-pin tests, and the `scheduler_bridge_driver` (4),
+`gang_claim_node` (5), and `meshos_pipeline` (12) integration tests all
+pass; `cargo clippy --features cortex,meshos --tests` is clean on the
+touched files.
 
 ## What's good (kept deliberately)
 
