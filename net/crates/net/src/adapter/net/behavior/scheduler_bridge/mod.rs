@@ -11,13 +11,16 @@
 //!
 //! Projections (see `docs/plans/MESHOS_SCHEDULER_INTEGRATION_PLAN.md`):
 //! - 1 — task → daemon intent (`project_daemon_intents`). Implemented.
-//! - 2 — claim → forced placement (a node-pinned daemon intent).
+//! - 2 — claim → forced placement (`project_forced_placements`, backed
+//!   by `ClaimRegistry`). Implemented — closes Phase A.
 //! - 3 — daemon lifecycle → step state.
 //! - 4 — observed liveness → topology + capability aging.
-//! - 5 — migration veto.
+//! - 5 — migration veto (`ClaimRegistry::holds_exclusive`).
 
+mod claim_registry;
 mod daemon_ref;
 mod projection;
 
+pub use claim_registry::ClaimRegistry;
 pub use daemon_ref::{daemon_ref, daemon_ref_shard};
-pub use projection::project_daemon_intents;
+pub use projection::{project_daemon_intents, project_forced_placements};
