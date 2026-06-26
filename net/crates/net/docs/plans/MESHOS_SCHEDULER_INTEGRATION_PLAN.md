@@ -15,8 +15,12 @@
 
 ## Implementation status (as built)
 
-Phases **A and C are implemented**; Phase B is partially landed (branch
-`meshos-scheduler`). All cross-layer code lives in a neutral bridge module
+Phases **A, B, and C are implemented** — all five projections (branch
+`meshos-scheduler`). What remains is the *runtime* that consumes them (applies
+transitions + fires triggers, feeds `set_liveness_down`, populates
+`ClaimRegistry`, publishes intents, runs the `MigrationPlan` executor) — pure
+wiring, no new projection logic. All cross-layer code lives in a neutral bridge
+module
 `src/adapter/net/behavior/scheduler_bridge/` (Decision 1) — the only module
 importing both `cortex::workflow` and `behavior::meshos`/`gang`, so LD 5 holds
 structurally.
@@ -25,8 +29,8 @@ structurally.
 |---|---|---|
 | 1 task → daemon intent | `project_daemon_intents(&WorkflowState) -> Vec<DaemonIntentUpdate>` | ✅ |
 | 2 claim → forced placement | `project_forced_placements(&ClaimRegistry, resolve_host) -> Vec<DaemonIntentUpdate>` | ✅ |
-| 3 lifecycle → step state | — | ⛔ blocked on `Trigger::AfterTerminal` + a daemon→task map |
-| 4 liveness → fold delta | `project_liveness(&MeshOsState) -> LivenessDelta` | ✅ projection; appliers deferred |
+| 3 lifecycle → step state | `apply_lifecycle` + `build_daemon_task_map` | ✅ (`AfterTerminal` already existed) |
+| 4 liveness → fold delta | `project_liveness(&MeshOsState) -> LivenessDelta` + `match_islands` host prune | ✅ projection + applier; per-tick wiring deferred |
 | 5 migration veto | `migrate(MigrationEligible, NodeId) -> MigrationPlan` | ✅ type-enforced |
 
 **Decision 1 — neutral bridge module.** The projections do NOT live in
@@ -45,6 +49,22 @@ companion map, and `diff_daemons` a `this_node` pin-gate — a daemon pinned to
 `Some(n)` is managed only by node `n`. `None` = run anywhere (drift scorer's
 domain); `Some(host)` = claim-pinned, invisible to the scorer by construction.
 No new fold.
+
+**Decision 3 — liveness via a match-time host prune, NOT a `CapabilityFold`
+suspension flag (refines RD 5).** Projection 4's applier excludes dead nodes by
+pruning the candidate-host set inside `gang::match_islands`
+(`hosts.retain(|h| !down_nodes.contains(h))`, right after the capability match,
+before the island query) — covering *both* folds' exclusion at the one point
+they meet. This achieves RD 5's stated goal ("the match pipeline never
+considers dead-node islands") while mutating neither fold: apply/merge/query/
+the signed payload stay byte-identical, so AP semantics are preserved *more*
+cleanly than a per-entry flag, with no merge-path interaction. `MeshNode` holds
+the down-set in an `ArcSwap<HashSet<NodeId>>` fed by `set_liveness_down`; its
+public `match_islands` signature is unchanged (bindings/FFI untouched).
+Tradeoff: the fold itself doesn't *carry* liveness for other consumers
+(snapshots/Deck) — acceptable, since RD 5's purpose is purely the match path.
+The `GangScheduler` / `GangClaimPipeline` paths and the per-tick
+`project_liveness → set_liveness_down` call remain deferred wiring.
 
 **`daemon_ref` keying (refines RD 1).** The projection keys EVERY task — shards
 included — by `daemon_ref(task_id)`, not `daemon_ref_shard(parent, index)`: in
@@ -280,11 +300,15 @@ rejected at proposal time, not silently allowed to strand claims.
 
 ### 3. `DaemonLifecycleSignal` → step state (observed up)
 
-**Status: ⛔ not built — blocked.** Two prerequisites are missing: (a)
-`Trigger::AfterTerminal` (corrections plan §2), and (b) a daemon→task reverse
-map — `daemon_ref` is one-way (splitmix64), so a `DaemonLifecycleSignal` for a
-`DaemonRef` cannot currently resolve its `TaskId`. That reverse map is new state
-(sibling to `ClaimRegistry`). Land (a)+(b) before this projection.
+**Status: ✅ built.** Not actually blocked: `Trigger::AfterTerminal` already
+exists in `workflow/trigger.rs` ("fires once `task` reaches `Done` *or*
+`Failed`"), and `PLAN_CORRECTIONS.md` isn't in the repo — that corrections work
+landed, so the gate is lifted. Implemented as `apply_lifecycle(signal, daemon,
+&daemon_task_map) -> Option<LifecycleTransition>` + `build_daemon_task_map`,
+the daemon→task reverse map (`daemon_ref` is one-way, so a `DaemonLifecycleSignal`
+— which carries only a `DaemonRef` — needs it to recover the `TaskId`). The
+projection is pure; applying the resulting `FailStep` via `WorkflowAdapter::fail`
+is what fires the existing `AfterTerminal` trigger (runtime, deferred).
 
 ```text
 apply_lifecycle(signal, workflow) -> WorkflowTransition
@@ -311,15 +335,18 @@ because Phase B's "killing a worker daemon fails its step and returns the island
 
 ### 4. Observed liveness → topology + capability aging (observed up)
 
-**Status: ✅ projection half built; appliers deferred.**
-`project_liveness(&MeshOsState) -> LivenessDelta` is implemented as a *pure,
-node-level* projection: it reads the `node_health` fold and classifies nodes
+**Status: ✅ projection + applier built (applier as a match-time host prune,
+not the RD 5 suspension flag — see Implementation status → Decision 3).**
+`project_liveness(&MeshOsState) -> LivenessDelta` is the *pure, node-level*
+projection: it reads the `node_health` fold and classifies nodes
 (`Unreachable` → down; `Healthy`/`Degraded` → up — a degraded node stays a
-candidate). The node→island and node→capability translation, and the actual
-fold mutations (drop islands; the per-entry `CapabilityFold` suspension flag of
-RD 5 — *hardened core*), are the deferred appliers. `LivenessDelta` is therefore
-node-level (`{ down: Vec<NodeId>, up: Vec<NodeId> }`), not the island/capability
-shape sketched below.
+candidate). `LivenessDelta` is therefore node-level
+(`{ down: Vec<NodeId>, up: Vec<NodeId> }`), not the island/capability shape
+sketched below. The applier is `gang::match_islands`'s `down_nodes` host prune
+(covers both folds' exclusion without mutating either), wired into
+`MeshNode::set_liveness_down`. Deferred: the per-tick
+`project_liveness → set_liveness_down` call and the `GangScheduler` /
+`GangClaimPipeline` paths.
 
 ```text
 project_liveness(meshos: &MeshOsState) -> LivenessDelta
@@ -405,11 +432,14 @@ stops it — entirely through `DesiredState`, with no workflow→dispatcher call
 path. The `daemon_ref` encoding lives in one module and has the visibility constraint
 that prevents bypass.
 
-### Phase B — Observed-up projections (1 week) — ◐ PARTIAL (Proj 4 projection landed; Proj 3 blocked)
-Projection 4's pure node-level projection (`project_liveness`) is landed;
-Projection 3 is blocked on `Trigger::AfterTerminal` + a daemon→task map, and the
-Projection-4 fold appliers (incl. the `CapabilityFold` suspension flag) are
-deferred wiring. The phase is *done* only when those land.
+### Phase B — Observed-up projections — ✅ PROJECTIONS LANDED (runtime apply deferred)
+Both projections are built: Projection 3 (`apply_lifecycle` +
+`build_daemon_task_map` — `AfterTerminal` already existed, so it was never
+blocked) and Projection 4 (`project_liveness` + the `gang::match_islands`
+host-prune applier wired to `MeshNode::set_liveness_down`, instead of RD 5's
+suspension flag — see Decision 3). What's deferred is the runtime that *applies*
+them each tick: feeding `set_liveness_down`, and applying `LifecycleTransition`s
+via `WorkflowAdapter` (which fires the `AfterTerminal` failure policy).
 Projections 3 + 4: lifecycle→step (consuming `AfterTerminal`), liveness→topology +
 capability. **Done when:** killing a worker daemon fails its step and returns the island
 to `Free` within **≤ 2 × (liveness_heartbeat + fold_propagation_lag) + release_latency**
