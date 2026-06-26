@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/behavior/scheduler_bridge/lifecycle.rs
+  s_b93d1d2fee6b2e::t_3a6728a029efed 157-173
+  s_b93d1d2fee6b2e::t_7fa8f578e9a10b 1-156,174
+net/crates/net/src/adapter/net/behavior/scheduler_bridge/mod.rs
+  s_b93d1d2fee6b2e::t_2abfd7a53705fa 16-21,27,34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "5158ba37925b3d04109e6f97814511aa5caed1f1",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
