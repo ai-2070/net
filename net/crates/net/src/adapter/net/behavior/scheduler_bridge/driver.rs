@@ -155,7 +155,8 @@ pub fn fan_out_lifecycle(
 /// and tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TickReport {
-    /// `DaemonIntentUpdate`s published this tick.
+    /// `DaemonIntentUpdate`s published this tick — only those that changed
+    /// since the last publish (an unchanged steady state publishes 0).
     pub published: usize,
     /// Hosts marked down (fed to `set_liveness_down`).
     pub down: usize,
@@ -168,6 +169,12 @@ pub struct SchedulerBridgeDriver {
     mesh: Arc<MeshNode>,
     handle: MeshOsHandle,
     snapshot: MeshOsSnapshotReader,
+    /// The intent most recently published per daemon. [`tick`](Self::tick)
+    /// publishes only intents that differ from this, so a steady state
+    /// re-emits nothing instead of O(tasks) events every pass. An intent
+    /// the channel drops (full / closed) is deliberately *not* recorded
+    /// here, so the next tick retries it.
+    last_published: Mutex<std::collections::HashMap<DaemonRef, DaemonIntentUpdate>>,
     /// Stop signal for the [`spawn`](SchedulerBridgeDriver::spawn)ed loop.
     /// `notify_one` so a shutdown raised while the loop is mid-`tick`
     /// stores a permit and is never lost.
@@ -189,6 +196,7 @@ impl SchedulerBridgeDriver {
             mesh,
             handle,
             snapshot,
+            last_published: Mutex::new(std::collections::HashMap::new()),
             shutdown: Arc::new(Notify::new()),
         }
     }
@@ -205,7 +213,9 @@ impl SchedulerBridgeDriver {
     }
 
     /// One driver pass: apply liveness from the snapshot, then publish the
-    /// merged desired daemon intents (Projection 1 + 2). Publishes are
+    /// merged desired daemon intents (Projection 1 + 2). Only intents that
+    /// changed since the previous pass are published, so a steady state
+    /// emits nothing rather than O(tasks) events per tick. Publishes are
     /// non-blocking and drop on a wedged / closed loop (like the MeshOS
     /// sinks); returns what the pass did.
     pub fn tick(&self) -> TickReport {
@@ -231,15 +241,31 @@ impl SchedulerBridgeDriver {
                 .desired_intents(&guard, |island| resolve_island_host(mesh, island))
         };
         let mut published = 0;
+        let mut last = self.last_published.lock();
+        let mut current: std::collections::HashSet<DaemonRef> = std::collections::HashSet::new();
         for intent in intents {
+            current.insert(intent.daemon.clone());
+            // Skip intents unchanged since the last publish — a steady state
+            // re-emits nothing.
+            if last.get(&intent.daemon) == Some(&intent) {
+                continue;
+            }
             if self
                 .handle
-                .try_publish(MeshOsEvent::DaemonIntentUpdate(intent))
+                .try_publish(MeshOsEvent::DaemonIntentUpdate(intent.clone()))
                 .is_ok()
             {
+                last.insert(intent.daemon.clone(), intent);
                 published += 1;
             }
+            // A dropped publish leaves `last` untouched, so the next tick
+            // retries this intent.
         }
+        // Forget daemons no longer desired (e.g. a deleted task) so a later
+        // re-appearance is republished. Tearing the daemon down is handled
+        // separately.
+        last.retain(|daemon, _| current.contains(daemon));
+        drop(last);
         TickReport { published, down }
     }
 

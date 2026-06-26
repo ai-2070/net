@@ -95,6 +95,49 @@ async fn driver_tick_publishes_and_a_crash_fails_the_task() {
 }
 
 #[tokio::test]
+async fn tick_republishes_only_changed_intents() {
+    // A steady state must not re-emit every task's intent each tick.
+    let MeshOsLoopParts {
+        mesh_loop: _mesh_loop,
+        handle,
+        actions_rx: _actions_rx,
+        reader,
+    } = MeshOsLoop::new(MeshOsConfig::default());
+
+    let mesh = build_mesh().await;
+    let redex = Redex::new();
+    let wf = Arc::new(WorkflowAdapter::open(&redex, 0x00D2_1444).await.unwrap());
+    wf.submit(1).unwrap();
+    let seq = wf.start(1).unwrap();
+    wf.wait_for_seq(seq).await.unwrap();
+
+    let driver = SchedulerBridgeDriver::new(wf.clone(), mesh, handle, reader);
+    driver.on_running(1, ActiveClaim { island: 0xA0 });
+
+    // First tick publishes the one Running task's intent.
+    assert_eq!(
+        driver.tick().published,
+        1,
+        "first tick publishes the intent"
+    );
+    // Nothing changed → the next tick publishes nothing.
+    assert_eq!(
+        driver.tick().published,
+        0,
+        "an unchanged steady state re-emits no intents",
+    );
+
+    // A real change (task 1 completes → Stop) is published again.
+    let seq = wf.complete(1).unwrap();
+    wf.wait_for_seq(seq).await.unwrap();
+    assert_eq!(
+        driver.tick().published,
+        1,
+        "a changed intent (Running → Done) is republished",
+    );
+}
+
+#[tokio::test]
 async fn spawn_loop_runs_until_shutdown_then_stops_cleanly() {
     let MeshOsLoopParts {
         mesh_loop: _mesh_loop,
