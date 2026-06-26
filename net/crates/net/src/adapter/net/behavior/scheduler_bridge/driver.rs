@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 use crate::adapter::net::behavior::fold::{IslandId, IslandQuery, NodeId};
 use crate::adapter::net::behavior::meshos::event_loop::{MeshOsHandle, MeshOsSnapshotReader};
 use crate::adapter::net::behavior::meshos::{
-    DaemonIntentUpdate, DaemonLifecycleSignal, DaemonRef, MeshOsEvent,
+    DaemonIntent, DaemonIntentUpdate, DaemonLifecycleSignal, DaemonRef, MeshOsEvent,
 };
 use crate::adapter::net::compute::{DaemonLifecycleEvent, DaemonLifecycleObserver};
 use crate::adapter::net::cortex::workflow::{ActiveClaim, TaskId, WorkflowAdapter};
@@ -261,10 +261,39 @@ impl SchedulerBridgeDriver {
             // A dropped publish leaves `last` untouched, so the next tick
             // retries this intent.
         }
-        // Forget daemons no longer desired (e.g. a deleted task) so a later
-        // re-appearance is republished. Tearing the daemon down is handled
-        // separately.
-        last.retain(|daemon, _| current.contains(daemon));
+        // Tear down daemons whose task vanished from the workflow (e.g. a
+        // deleted task): the projection emits nothing for a task no longer
+        // in `WorkflowState`, so its last intent would otherwise linger in
+        // MeshOS `desired_daemons` and keep the daemon running forever.
+        // Synthesize an unpinned `Stop` for each. A daemon last published as
+        // `Stop` is already being torn down, so just forget it.
+        let vanished: Vec<DaemonRef> = last
+            .keys()
+            .filter(|daemon| !current.contains(*daemon))
+            .cloned()
+            .collect();
+        for daemon in vanished {
+            let was_run = last.get(&daemon).map(|u| u.intent) == Some(DaemonIntent::Run);
+            if !was_run {
+                last.remove(&daemon);
+                continue;
+            }
+            let stop = DaemonIntentUpdate {
+                daemon: daemon.clone(),
+                intent: DaemonIntent::Stop,
+                node: None,
+            };
+            if self
+                .handle
+                .try_publish(MeshOsEvent::DaemonIntentUpdate(stop))
+                .is_ok()
+            {
+                last.remove(&daemon);
+                published += 1;
+            }
+            // A dropped publish keeps the entry so the next tick retries the
+            // teardown.
+        }
         drop(last);
         TickReport { published, down }
     }

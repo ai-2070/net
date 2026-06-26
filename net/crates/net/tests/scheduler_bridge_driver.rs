@@ -138,6 +138,45 @@ async fn tick_republishes_only_changed_intents() {
 }
 
 #[tokio::test]
+async fn deleting_a_task_tears_down_its_daemon_then_goes_quiet() {
+    // A deleted task vanishes from WorkflowState, so the projection emits
+    // nothing for it; the driver must synthesize a Stop to tear its daemon
+    // down rather than leave it running forever.
+    let MeshOsLoopParts {
+        mesh_loop: _mesh_loop,
+        handle,
+        actions_rx: _actions_rx,
+        reader,
+    } = MeshOsLoop::new(MeshOsConfig::default());
+
+    let mesh = build_mesh().await;
+    let redex = Redex::new();
+    let wf = Arc::new(WorkflowAdapter::open(&redex, 0x00D2_1445).await.unwrap());
+    wf.submit(1).unwrap();
+    let seq = wf.start(1).unwrap();
+    wf.wait_for_seq(seq).await.unwrap();
+
+    let driver = SchedulerBridgeDriver::new(wf.clone(), mesh, handle, reader);
+    driver.on_running(1, ActiveClaim { island: 0xA0 });
+    assert_eq!(driver.tick().published, 1, "Run is published once");
+
+    // Delete task 1 → next tick tears its orphaned daemon down with a Stop.
+    let seq = wf.delete(1).unwrap();
+    wf.wait_for_seq(seq).await.unwrap();
+    assert_eq!(
+        driver.tick().published,
+        1,
+        "a deleted task's daemon is torn down with a Stop",
+    );
+    // Once torn down it is forgotten — no further events.
+    assert_eq!(
+        driver.tick().published,
+        0,
+        "the torn-down daemon emits nothing thereafter",
+    );
+}
+
+#[tokio::test]
 async fn spawn_loop_runs_until_shutdown_then_stops_cleanly() {
     let MeshOsLoopParts {
         mesh_loop: _mesh_loop,
