@@ -13,14 +13,18 @@
 //! - 1 — task → daemon intent (`project_daemon_intents`). Implemented.
 //! - 2 — claim → forced placement (`project_forced_placements`, backed
 //!   by `ClaimRegistry`). Implemented — closes Phase A.
-//! - 3 — daemon lifecycle → step state.
+//! - 3 — daemon lifecycle → step state (gated on the corrections plan's
+//!   `Trigger::AfterTerminal`).
 //! - 4 — observed liveness → topology + capability aging.
-//! - 5 — migration veto (`ClaimRegistry::holds_exclusive`).
+//! - 5 — migration veto (`migrate` / `MigrationEligible`, type-enforced
+//!   via `ClaimRegistry::holds_exclusive`). Implemented.
 
 mod claim_registry;
 mod daemon_ref;
+mod migration;
 mod projection;
 
 pub use claim_registry::ClaimRegistry;
 pub use daemon_ref::{daemon_ref, daemon_ref_shard};
+pub use migration::{migrate, ClaimHeld, MigrationEligible, MigrationPlan};
 pub use projection::{project_daemon_intents, project_forced_placements};
