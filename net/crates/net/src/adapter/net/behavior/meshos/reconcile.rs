@@ -110,18 +110,23 @@ fn diff_daemons(
 ) {
     for (daemon, intent) in &desired.desired_daemons {
         // Node-pin gate (forced placement, MeshOS ↔ Scheduler
-        // Projection 2). A daemon pinned to `Some(n)` is managed ONLY
-        // by node `n`: every other node skips it entirely — it neither
-        // starts nor stops a daemon the claim placed elsewhere.
-        // Unpinned (run-anywhere) daemons fall through to the normal
-        // per-node lifecycle logic below.
-        if let Some(pinned) = desired.desired_daemon_nodes.get(daemon) {
-            if *pinned != this_node {
-                continue;
-            }
-        }
+        // Projection 2). A daemon pinned to node `n` may only RUN on
+        // `n`. On every *other* node the daemon must not be running, so
+        // its effective intent there is `Stop` regardless of the desired
+        // intent: a non-target node never starts the pinned daemon, and
+        // it stops one it is still (incorrectly) running — e.g. an orphan
+        // left behind when the pin moved. Confining only the *start* to
+        // the pin target (rather than skipping the daemon outright) is
+        // what prevents a re-pin from double-running it: stopping
+        // elsewhere can only ever tear down a misplaced replica, never
+        // the live one on `n`. Unpinned (run-anywhere) daemons keep their
+        // desired intent unchanged.
+        let effective_intent = match desired.desired_daemon_nodes.get(daemon) {
+            Some(pinned) if *pinned != this_node => DaemonIntent::Stop,
+            _ => *intent,
+        };
         let status = actual.daemons.get(daemon);
-        match intent {
+        match effective_intent {
             DaemonIntent::Run => match status.map(|s| s.lifecycle).unwrap_or_default() {
                 DaemonLifecycle::Running | DaemonLifecycle::Starting => {
                     // Already in the desired state (or
@@ -728,14 +733,14 @@ mod tests {
     }
 
     #[test]
-    fn node_pinned_daemon_ignored_by_non_target_nodes() {
-        // The same pinned-Run intent reconciled on a DIFFERENT node
-        // emits nothing — the claim placed the daemon elsewhere, so
-        // this node must neither start nor stop it.
+    fn node_pinned_daemon_not_running_locally_is_left_alone_by_non_target_nodes() {
+        // A pinned-Run intent reconciled on a DIFFERENT node that is not
+        // running the daemon emits nothing: a non-target node never starts
+        // the pinned daemon, and there is no local replica to stop.
         const OTHER_NODE: NodeId = 999;
         let mut actual = MeshOsState::default();
         let d = daemon("task/7", 7);
-        actual.daemons.insert(d.clone(), DaemonStatus::default());
+        actual.daemons.insert(d.clone(), DaemonStatus::default()); // Stopped
         let mut desired = DesiredState::default();
         desired.desired_daemons.insert(d.clone(), DaemonIntent::Run);
         desired.desired_daemon_nodes.insert(d.clone(), OTHER_NODE);
@@ -752,11 +757,12 @@ mod tests {
     }
 
     #[test]
-    fn node_pinned_stop_is_ignored_by_non_target_nodes() {
-        // Symmetric to the start case: a Stop intent pinned to another
-        // node must not make THIS_NODE stop a daemon the claim placed
-        // elsewhere — the pin gate skips the whole daemon on non-target
-        // nodes, start AND stop.
+    fn node_pinned_run_orphan_on_a_non_target_node_is_stopped() {
+        // The double-run guard: a daemon pinned to OTHER_NODE but found
+        // RUNNING on THIS_NODE (an orphan left behind when the pin moved)
+        // must be stopped here — otherwise it runs on both this node and
+        // the pin target. The desired intent is `Run`, yet a non-target
+        // node's effective intent is `Stop`, so it tears the orphan down.
         const OTHER_NODE: NodeId = 999;
         let mut actual = MeshOsState::default();
         actual.last_tick = Some(anchor());
@@ -765,11 +771,9 @@ mod tests {
         status.lifecycle = DaemonLifecycle::Running;
         actual.daemons.insert(d.clone(), status);
         let mut desired = DesiredState::default();
-        desired
-            .desired_daemons
-            .insert(d.clone(), DaemonIntent::Stop);
+        desired.desired_daemons.insert(d.clone(), DaemonIntent::Run);
         desired.desired_daemon_nodes.insert(d.clone(), OTHER_NODE);
-        assert!(reconcile(
+        let actions = reconcile(
             &actual,
             &desired,
             THIS_NODE,
@@ -777,8 +781,13 @@ mod tests {
             &MaintenanceConfig::default(),
             &SchedulerConfig::default(),
             None,
-        )
-        .is_empty());
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, MeshOsAction::StopDaemon { daemon: dd, .. } if *dd == d)),
+            "a pinned daemon orphaned on a non-target node is stopped; got {actions:?}",
+        );
     }
 
     #[test]
