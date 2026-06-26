@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/behavior/scheduler_bridge/mod.rs
+  s_b93d1d2fee6b2e::t_b9347b47ebbd11 14-15,18,20,24,26
+net/crates/net/src/adapter/net/behavior/scheduler_bridge/projection.rs
+  s_b93d1d2fee6b2e::t_7756511eff1c99 55-95
+  s_b93d1d2fee6b2e::t_b6a01fe921eb48 161-235
+  s_b93d1d2fee6b2e::t_d5374b8caead7c 3-4,7
+net/crates/net/src/adapter/net/behavior/scheduler_bridge/claim_registry.rs
+  s_b93d1d2fee6b2e::t_4dcfd3e41ff4e9 1-118
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "e52c94c70566ab52896b450b358c6c41f445ee87",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
