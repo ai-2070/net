@@ -209,8 +209,14 @@ impl SchedulerBridgeDriver {
     /// non-blocking and drop on a wedged / closed loop (like the MeshOS
     /// sinks); returns what the pass did.
     pub fn tick(&self) -> TickReport {
-        // Projection 4: snapshot → down-set → set_liveness_down.
-        let delta = project_liveness_from_snapshot(&self.snapshot.read());
+        // Projection 4: snapshot → down-set → set_liveness_down. Borrow
+        // the snapshot through its `Arc` (`load`) rather than deep-cloning
+        // it (`read`): the projection only reads `.peers`, and the guard is
+        // dropped as soon as the delta is computed, so the borrow is short.
+        let delta = {
+            let snapshot = self.snapshot.load();
+            project_liveness_from_snapshot(&snapshot)
+        };
         let down = delta.down.len();
         self.mesh
             .set_liveness_down(delta.down.into_iter().collect());
