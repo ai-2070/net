@@ -1,0 +1,23 @@
+net/crates/net/tests/scheduler_bridge_driver.rs
+  s_e2c6f41ae18f64::t_5689cf3d3e00a9 141-178
+  s_e2c6f41ae18f64::t_bae8d5d877c21d 140
+net/crates/net/src/adapter/net/behavior/scheduler_bridge/driver.rs
+  s_e2c6f41ae18f64::t_7936a68e6d2960 34
+  s_e2c6f41ae18f64::t_916a912cf8984d 264-296
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "5a7bf836473b7b2f4d93cf9a69576ff7748c3cf7",
+  "prompts": {},
+  "sessions": {
+    "s_e2c6f41ae18f64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dbc06b06-9d2b-4f28-a220-e736eee44f76",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
