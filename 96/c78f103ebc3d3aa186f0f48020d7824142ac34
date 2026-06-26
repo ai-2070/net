@@ -1,0 +1,20 @@
+net/crates/net/src/adapter/net/behavior/meshos/reconcile.rs
+  s_e2c6f41ae18f64::t_4d640fafba47ba 736-739,743,760-765,774,776,784-790
+  s_e2c6f41ae18f64::t_3c88f74976e102 113-127,129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "96c78f103ebc3d3aa186f0f48020d7824142ac34",
+  "prompts": {},
+  "sessions": {
+    "s_e2c6f41ae18f64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dbc06b06-9d2b-4f28-a220-e736eee44f76",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
