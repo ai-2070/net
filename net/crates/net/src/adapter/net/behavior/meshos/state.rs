@@ -525,6 +525,15 @@ pub struct DesiredState {
     /// actual `MeshOsState::daemons[*].lifecycle` to emit
     /// `StartDaemon` / `StopDaemon`.
     pub(crate) desired_daemons: HashMap<DaemonRef, DaemonIntent>,
+    /// Sparse node-pin companion to [`Self::desired_daemons`] (the
+    /// forced-placement seam, MeshOS ↔ Scheduler Projection 2).
+    /// Present only for node-targeted daemons: `desired_daemon_nodes[d]
+    /// = n` means daemon `d` is pinned to node `n`, so only `n` acts on
+    /// its intent and every other node ignores it. Absent = run
+    /// anywhere. Kept separate from `desired_daemons` so the common
+    /// run-anywhere case stays a plain intent map and existing call
+    /// sites are untouched.
+    pub(crate) desired_daemon_nodes: HashMap<DaemonRef, NodeId>,
 }
 
 impl DesiredState {
@@ -538,6 +547,18 @@ impl DesiredState {
     pub fn apply_daemon_intent(&mut self, update: &DaemonIntentUpdate) {
         self.desired_daemons
             .insert(update.daemon.clone(), update.intent);
+        // Maintain the sparse node-pin companion. A later run-anywhere
+        // update (`node = None`) for the same daemon clears any prior
+        // pin so a pin can never go stale across folds.
+        match update.node {
+            Some(node) => {
+                self.desired_daemon_nodes
+                    .insert(update.daemon.clone(), node);
+            }
+            None => {
+                self.desired_daemon_nodes.remove(&update.daemon);
+            }
+        }
     }
 
     /// Fold a per-node replica intent input event.
@@ -930,6 +951,38 @@ mod tests {
         let mut state = MeshOsState::default();
         state.apply(&MeshOsEvent::AdminEvent(AdminEvent::ThawCluster), THIS_NODE);
         assert!(state.freeze_until.is_none());
+    }
+
+    #[test]
+    fn daemon_intent_node_pin_set_then_cleared_by_run_anywhere() {
+        // Projection-2 plumbing: a `Some(node)` update records the pin
+        // in the sparse companion map; a later `None` update for the
+        // same daemon clears the pin (so it can't go stale) while the
+        // intent itself folds normally.
+        let d = DaemonRef {
+            id: 7,
+            name: "task/7".into(),
+        };
+        let mut desired = DesiredState::default();
+        desired.apply_daemon_intent(&DaemonIntentUpdate {
+            daemon: d.clone(),
+            intent: DaemonIntent::Run,
+            node: Some(5),
+        });
+        assert_eq!(desired.desired_daemon_nodes.get(&d), Some(&5));
+        assert_eq!(desired.desired_daemons.get(&d), Some(&DaemonIntent::Run));
+
+        // Re-fold the same daemon run-anywhere — pin lifts, intent stays.
+        desired.apply_daemon_intent(&DaemonIntentUpdate {
+            daemon: d.clone(),
+            intent: DaemonIntent::Run,
+            node: None,
+        });
+        assert!(
+            desired.desired_daemon_nodes.get(&d).is_none(),
+            "run-anywhere update must clear the prior node pin",
+        );
+        assert_eq!(desired.desired_daemons.get(&d), Some(&DaemonIntent::Run));
     }
 
     fn seed_avoid_list(state: &mut MeshOsState, peers: &[NodeId]) {

@@ -105,6 +105,7 @@ async fn daemon_intent_run_flows_through_to_start_daemon_dispatch() {
         .publish(MeshOsEvent::DaemonIntentUpdate(DaemonIntentUpdate {
             daemon: d.clone(),
             intent: DaemonIntent::Run,
+            node: None,
         }))
         .await
         .unwrap();
@@ -151,6 +152,7 @@ async fn daemon_intent_stop_flows_through_only_after_a_start_was_seen() {
         .publish(MeshOsEvent::DaemonIntentUpdate(DaemonIntentUpdate {
             daemon: d.clone(),
             intent: DaemonIntent::Stop,
+            node: None,
         }))
         .await
         .unwrap();
@@ -352,6 +354,7 @@ async fn registry_lifecycle_observer_flows_to_meshos_dispatcher() {
                 name: "watcher".into(),
             },
             intent: DaemonIntent::Run,
+            node: None,
         }))
         .await
         .unwrap();
@@ -411,6 +414,7 @@ async fn unregister_flows_through_to_actual_stopped_lifecycle() {
                 name: "watcher".into(),
             },
             intent: DaemonIntent::Run,
+            node: None,
         }))
         .await
         .unwrap();
@@ -474,6 +478,7 @@ async fn admit_gates_held_daemon_so_dispatcher_never_sees_a_start() {
         .publish(MeshOsEvent::DaemonIntentUpdate(DaemonIntentUpdate {
             daemon: d.clone(),
             intent: DaemonIntent::Run,
+            node: None,
         }))
         .await
         .unwrap();
@@ -534,6 +539,7 @@ async fn runtime_pattern_drives_daemon_intent_to_start_daemon_dispatch() {
         .publish(MeshOsEvent::DaemonIntentUpdate(DaemonIntentUpdate {
             daemon: d.clone(),
             intent: DaemonIntent::Run,
+            node: None,
         }))
         .await
         .unwrap();

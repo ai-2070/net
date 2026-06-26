@@ -575,6 +575,14 @@ pub struct DaemonIntentUpdate {
     pub daemon: DaemonRef,
     /// New intent.
     pub intent: DaemonIntent,
+    /// Optional node-pin (the forced-placement seam). `None` means
+    /// "run anywhere" — any admissible node may host the daemon (the
+    /// drift scorer's domain). `Some(n)` pins the daemon to node `n`:
+    /// only `n` acts on the intent and every other node ignores it.
+    /// The gang scheduler sets `Some(claim_host)` so a claim-bearing
+    /// daemon runs exactly on the claimed node, bypassing the drift
+    /// scorer (MeshOS ↔ Scheduler integration, Projection 2).
+    pub node: Option<NodeId>,
 }
 
 /// Per-node replica intent — should this node hold a replica of

@@ -73,7 +73,7 @@ pub fn reconcile(
     // victims) for the same chain in the same pass.
     let mut evicted_this_tick: std::collections::HashSet<ChainId> =
         std::collections::HashSet::new();
-    diff_daemons(actual, desired, now, &mut actions);
+    diff_daemons(actual, desired, this_node, now, &mut actions);
     // ICE force-eviction arm runs first so the count-driven
     // and scheduler arms see the chain marked evicted-this-tick
     // and skip emitting their own (possibly different-victim)
@@ -104,10 +104,22 @@ pub fn reconcile(
 fn diff_daemons(
     actual: &MeshOsState,
     desired: &DesiredState,
+    this_node: NodeId,
     now: Instant,
     out: &mut Vec<MeshOsAction>,
 ) {
     for (daemon, intent) in &desired.desired_daemons {
+        // Node-pin gate (forced placement, MeshOS ↔ Scheduler
+        // Projection 2). A daemon pinned to `Some(n)` is managed ONLY
+        // by node `n`: every other node skips it entirely — it neither
+        // starts nor stops a daemon the claim placed elsewhere.
+        // Unpinned (run-anywhere) daemons fall through to the normal
+        // per-node lifecycle logic below.
+        if let Some(pinned) = desired.desired_daemon_nodes.get(daemon) {
+            if *pinned != this_node {
+                continue;
+            }
+        }
         let status = actual.daemons.get(daemon);
         match intent {
             DaemonIntent::Run => match status.map(|s| s.lifecycle).unwrap_or_default() {
@@ -690,6 +702,81 @@ mod tests {
             None,
         );
         assert_eq!(actions, vec![MeshOsAction::StartDaemon { daemon: d }],);
+    }
+
+    #[test]
+    fn node_pinned_daemon_started_only_on_its_target_node() {
+        // Forced placement (MeshOS ↔ Scheduler Projection 2): a daemon
+        // pinned to THIS_NODE is started here exactly like an unpinned
+        // one — the pin gate admits its target node.
+        let mut actual = MeshOsState::default();
+        let d = daemon("task/7", 7);
+        actual.daemons.insert(d.clone(), DaemonStatus::default()); // Stopped
+        let mut desired = DesiredState::default();
+        desired.desired_daemons.insert(d.clone(), DaemonIntent::Run);
+        desired.desired_daemon_nodes.insert(d.clone(), THIS_NODE);
+        let actions = reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        );
+        assert_eq!(actions, vec![MeshOsAction::StartDaemon { daemon: d }]);
+    }
+
+    #[test]
+    fn node_pinned_daemon_ignored_by_non_target_nodes() {
+        // The same pinned-Run intent reconciled on a DIFFERENT node
+        // emits nothing — the claim placed the daemon elsewhere, so
+        // this node must neither start nor stop it.
+        const OTHER_NODE: NodeId = 999;
+        let mut actual = MeshOsState::default();
+        let d = daemon("task/7", 7);
+        actual.daemons.insert(d.clone(), DaemonStatus::default());
+        let mut desired = DesiredState::default();
+        desired.desired_daemons.insert(d.clone(), DaemonIntent::Run);
+        desired.desired_daemon_nodes.insert(d.clone(), OTHER_NODE);
+        assert!(reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn node_pinned_stop_is_ignored_by_non_target_nodes() {
+        // Symmetric to the start case: a Stop intent pinned to another
+        // node must not make THIS_NODE stop a daemon the claim placed
+        // elsewhere — the pin gate skips the whole daemon on non-target
+        // nodes, start AND stop.
+        const OTHER_NODE: NodeId = 999;
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(anchor());
+        let d = daemon("task/7", 7);
+        let mut status = DaemonStatus::default();
+        status.lifecycle = DaemonLifecycle::Running;
+        actual.daemons.insert(d.clone(), status);
+        let mut desired = DesiredState::default();
+        desired.desired_daemons.insert(d.clone(), DaemonIntent::Stop);
+        desired.desired_daemon_nodes.insert(d.clone(), OTHER_NODE);
+        assert!(reconcile(
+            &actual,
+            &desired,
+            THIS_NODE,
+            &LocalityConfig::default(),
+            &MaintenanceConfig::default(),
+            &SchedulerConfig::default(),
+            None,
+        )
+        .is_empty());
     }
 
     #[test]
