@@ -13,6 +13,58 @@
 > Phase B consumes). **Come Together release** (Beatles) — two desired-state machines meet
 > at the boundary and never call each other's names.
 
+## Implementation status (as built)
+
+Phases **A and C are implemented**; Phase B is partially landed (branch
+`meshos-scheduler`). All cross-layer code lives in a neutral bridge module
+`src/adapter/net/behavior/scheduler_bridge/` (Decision 1) — the only module
+importing both `cortex::workflow` and `behavior::meshos`/`gang`, so LD 5 holds
+structurally.
+
+| Projection | As-built symbol | Status |
+|---|---|---|
+| 1 task → daemon intent | `project_daemon_intents(&WorkflowState) -> Vec<DaemonIntentUpdate>` | ✅ |
+| 2 claim → forced placement | `project_forced_placements(&ClaimRegistry, resolve_host) -> Vec<DaemonIntentUpdate>` | ✅ |
+| 3 lifecycle → step state | — | ⛔ blocked on `Trigger::AfterTerminal` + a daemon→task map |
+| 4 liveness → fold delta | `project_liveness(&MeshOsState) -> LivenessDelta` | ✅ projection; appliers deferred |
+| 5 migration veto | `migrate(MigrationEligible, NodeId) -> MigrationPlan` | ✅ type-enforced |
+
+**Decision 1 — neutral bridge module.** The projections do NOT live in
+`workflow/` as the design drafts implied: housing `daemon_ref` / `project_*`
+there would make `workflow` import `meshos` types (`DaemonRef`,
+`DaemonIntentUpdate`, `NodeId`), breaking LD 5. They live in
+`behavior/scheduler_bridge/`; only the bridge sees both sides.
+
+**Decision 2 — forced placement is a node-pinned daemon intent (corrects §2).**
+The existing `diff_forced_placements` is chain/replica-keyed
+(`forced_placements: Vec<(ChainId, NodeId)>` → `RequestPlacement { chain, .. }`);
+it does not place daemons, and `StartDaemon { daemon }` carries no node. So a
+minimal mechanism was added instead of abusing that arm: `DaemonIntentUpdate`
+gained `node: Option<NodeId>`, `DesiredState` a sparse `desired_daemon_nodes`
+companion map, and `diff_daemons` a `this_node` pin-gate — a daemon pinned to
+`Some(n)` is managed only by node `n`. `None` = run anywhere (drift scorer's
+domain); `Some(host)` = claim-pinned, invisible to the scorer by construction.
+No new fold.
+
+**`daemon_ref` keying (refines RD 1).** The projection keys EVERY task — shards
+included — by `daemon_ref(task_id)`, not `daemon_ref_shard(parent, index)`: in
+this codebase a shard is itself a standalone `TaskId`, so task-id keying is
+strictly more stable than `(parent, position)` under sibling delete/reorder,
+which is exactly RD 1's retry-invisibility goal. `daemon_ref_shard` is retained
+as the by-`(parent, index)` helper.
+
+**Deferred — the appliers / wiring** (no consumer exists yet;
+`drive_capability_step` / `release_step` still have no non-test caller):
+- the runtime/step-driver that calls the projections, publishes the intents,
+  populates `ClaimRegistry` on `Running` / `release_step`, and runs the
+  `MigrationPlan` executor;
+- the Projection-4 appliers — drop a down node's islands from `IslandTopology`
+  and mark its `CapabilityFold` entries liveness-suspended (RD 5: a per-entry
+  flag — a change to *hardened core*, not yet made);
+- the house-pattern wire-propagation integration test (the in-process
+  acceptance test `running_claim_starts_its_daemon_on_the_claim_node_only`
+  covers the projection→reconcile boundary meanwhile).
+
 ## Status
 
 Design only. **No new cross-layer machinery** — every prerequisite exists; the work is
@@ -168,21 +220,41 @@ dispatcher; it can only emit intent. **Attempt number is excluded from the encod
 a shard retry projects to the same ref → no diff → no spurious stop/start churn (RD 1).
 
 The encoding convention is defined in **one place** (a new `daemon_ref.rs` in the
-workflow module) and re-exported. Any code path that constructs a task-derived `DaemonRef`
-without going through these functions is a regression — pin this with a clippy lint or a
-visibility constraint (`pub(crate)` on the struct constructor for the encoded id range).
+`scheduler_bridge` module — Decision 1, **not** the workflow module) and re-exported. Any
+code path that constructs a task-derived `DaemonRef` without going through these functions
+is a regression.
+
+**As built:** the projection keys *every* task by `daemon_ref(task_id)` (shards
+included) rather than `daemon_ref_shard` — see Implementation status →
+`daemon_ref` keying.
 
 ### 2. Claim → forced placement (desired down, the scheduler seam)
 
+**As built (Decision 2) — this corrects the design below.** Forced placement
+is a *node-pinned daemon intent*, not a separate `ForcedPlacement` type, and is
+consumed by `diff_daemons` — NOT the chain-keyed `diff_forced_placements` arm,
+which places replicas (chains), not daemons:
+
 ```text
-project_forced_placements(workflow, claims) -> Vec<ForcedPlacement>
-    for each task in Running(ActiveClaim):
-        ForcedPlacement { daemon: daemon_ref(task), node: claim.island.node }
+project_forced_placements(claims: &ClaimRegistry, resolve_host) -> Vec<DaemonIntentUpdate>
+    for each (daemon, claim) in claims:
+        if let Some(host) = resolve_host(claim.island):   // island → IslandRecord.host
+            DaemonIntentUpdate { daemon, intent: Run, node: Some(host) }
+        // island vanished (dead node, aged out) → emit nothing; the task re-claims at TTL
 ```
 
-Consumed by `diff_forced_placements` (verified at `reconcile.rs:82`). A claim-pinned
-daemon is invisible to the drift `PlacementScorer`. The gang scheduler decided the node;
-MeshOS just honors it.
+`ActiveClaim` carries only `{ island }`, so the host is resolved through the
+`IslandTopology` fold — `resolve_host` is a closure over `IslandQuery::Get`,
+which keeps the projection pure. The node-pinned intent makes the claim-pinned
+daemon invisible to the drift `PlacementScorer` *by construction* (only the
+claim's node acts on it). Composition with Projection 1 is an overlay: apply
+Projection 1 (every task `node: None`) then Projection 2; `apply_daemon_intent`
+is last-write-wins per daemon, so `None` is overridden by `Some(host)`. See
+Implementation status → Decision 2 for the `node` field / `desired_daemon_nodes`
+/ `diff_daemons` pin-gate.
+
+*(Original design, superseded:* `project_forced_placements(workflow, claims) ->
+Vec<ForcedPlacement>` consumed by `diff_forced_placements` — wrong, see above.)
 
 **Freeze interaction (corrected from v1).** The current reconcile freeze behavior at
 `reconcile.rs:67-69` is "drop all output and return early" — there is no `FrozenActions`
@@ -208,6 +280,12 @@ rejected at proposal time, not silently allowed to strand claims.
 
 ### 3. `DaemonLifecycleSignal` → step state (observed up)
 
+**Status: ⛔ not built — blocked.** Two prerequisites are missing: (a)
+`Trigger::AfterTerminal` (corrections plan §2), and (b) a daemon→task reverse
+map — `daemon_ref` is one-way (splitmix64), so a `DaemonLifecycleSignal` for a
+`DaemonRef` cannot currently resolve its `TaskId`. That reverse map is new state
+(sibling to `ClaimRegistry`). Land (a)+(b) before this projection.
+
 ```text
 apply_lifecycle(signal, workflow) -> WorkflowTransition
     Started(d)          → confirm task(d) Running
@@ -232,6 +310,16 @@ because Phase B's "killing a worker daemon fails its step and returns the island
 `Free` within bounded time" test depends on the failure-propagation path completing.
 
 ### 4. Observed liveness → topology + capability aging (observed up)
+
+**Status: ✅ projection half built; appliers deferred.**
+`project_liveness(&MeshOsState) -> LivenessDelta` is implemented as a *pure,
+node-level* projection: it reads the `node_health` fold and classifies nodes
+(`Unreachable` → down; `Healthy`/`Degraded` → up — a degraded node stays a
+candidate). The node→island and node→capability translation, and the actual
+fold mutations (drop islands; the per-entry `CapabilityFold` suspension flag of
+RD 5 — *hardened core*), are the deferred appliers. `LivenessDelta` is therefore
+node-level (`{ down: Vec<NodeId>, up: Vec<NodeId> }`), not the island/capability
+shape sketched below.
 
 ```text
 project_liveness(meshos: &MeshOsState) -> LivenessDelta
@@ -268,6 +356,13 @@ TTL could expire early. A stale island cannot be matched-and-claimed in the gap.
 
 ### 5. Migration veto (enforced by type, not convention)
 
+**Status: ✅ implemented** (the veto primitive; the executor that runs the
+resulting `MigrationPlan` is deferred wiring). Built as sketched below, plus a
+`MigrationPlan { daemon, target }` returned by `migrate` (obtainable only by
+consuming a `MigrationEligible`, so it can never name a claim-holder), and a
+`compile_fail` doctest pinning the type gate. `ClaimRegistry` is keyed by
+`DaemonRef` so `holds_exclusive` answers this directly.
+
 ```rust
 // The migration entry point takes a marker proving the daemon
 // is not a claim-holder. Constructing one consults the claim
@@ -303,14 +398,18 @@ protocol with no separate drain coordinator (RD 3).
 
 ## Phasing
 
-### Phase A — Desired-down projections (1 week)
+### Phase A — Desired-down projections (1 week) — ✅ LANDED
 Projections 1 + 2: task→intent, claim→forced-placement. **Done when:** a
 `Running(ActiveClaim)` task starts a daemon on the claim's node, and a terminal task
 stops it — entirely through `DesiredState`, with no workflow→dispatcher call in the
 path. The `daemon_ref` encoding lives in one module and has the visibility constraint
 that prevents bypass.
 
-### Phase B — Observed-up projections (1 week) — *gated on corrections plan §2*
+### Phase B — Observed-up projections (1 week) — ◐ PARTIAL (Proj 4 projection landed; Proj 3 blocked)
+Projection 4's pure node-level projection (`project_liveness`) is landed;
+Projection 3 is blocked on `Trigger::AfterTerminal` + a daemon→task map, and the
+Projection-4 fold appliers (incl. the `CapabilityFold` suspension flag) are
+deferred wiring. The phase is *done* only when those land.
 Projections 3 + 4: lifecycle→step (consuming `AfterTerminal`), liveness→topology +
 capability. **Done when:** killing a worker daemon fails its step and returns the island
 to `Free` within **≤ 2 × (liveness_heartbeat + fold_propagation_lag) + release_latency**
@@ -318,7 +417,7 @@ to `Free` within **≤ 2 × (liveness_heartbeat + fold_propagation_lag) + releas
 TTL-driven path); a downed node's islands disappear from both capability and topology
 folds.
 
-### Phase C — Migration veto (3-5 days)
+### Phase C — Migration veto (3-5 days) — ✅ LANDED (veto primitive; executor deferred)
 Projection 5 with type-enforced eligibility. **Done when:** the migration path will not
 compile if called without `MigrationEligible`, and a planned drain performs
 release → re-claim → restart without ever double-holding the island.
