@@ -1,0 +1,38 @@
+net/crates/net/src/adapter/net/cortex/workflow/step.rs
+  s_b93d1d2fee6b2e::t_8ee2d126423423 237-245
+net/crates/net/src/adapter/net/mesh.rs
+  s_b93d1d2fee6b2e::t_294f34b410761c 1952-1959
+  s_b93d1d2fee6b2e::t_96c9fb2936d5e0 11118-11138
+  s_b93d1d2fee6b2e::t_e66d051a05c0bd 2566-2568
+net/crates/net/src/adapter/net/behavior/gang/mod.rs
+  s_b93d1d2fee6b2e::t_74e2fbbfd3b19c 107,111-121,303
+  s_b93d1d2fee6b2e::t_99680d1505cd0c 390-393
+  s_b93d1d2fee6b2e::t_72214c9939532c 277,302,445
+  s_b93d1d2fee6b2e::t_0147bb67647ac8 68-69,72
+  s_b93d1d2fee6b2e::t_13dd838f8952b2 305-343
+  s_b93d1d2fee6b2e::t_de725d676bc81b 403
+  s_b93d1d2fee6b2e::t_c9087e8211be63 416
+net/crates/net/src/adapter/net/behavior/gang/schedule.rs
+  s_b93d1d2fee6b2e::t_5b87c7847fb616 177-181
+  s_b93d1d2fee6b2e::t_bf3c46a7c39dcb 130-133,136
+  s_b93d1d2fee6b2e::t_4597f6f17eef25 17-18,20
+net/crates/net/tests/gang_claim_node.rs
+  s_b93d1d2fee6b2e::t_b18f29d38604c9 145-150
+  s_b93d1d2fee6b2e::t_6435a5bc8e736a 182-225
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "94f8ad50860ef735ba460d2434ba62dc4edf1dbf",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
