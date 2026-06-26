@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/behavior/scheduler_bridge/projection.rs
+  s_b93d1d2fee6b2e::t_63e907a3607aed 232
+  s_b93d1d2fee6b2e::t_6b1d6cd3c5702e 236-300
+net/crates/net/src/adapter/net/behavior/meshos/state.rs
+  s_b93d1d2fee6b2e::t_8ce7c1f71a1bc1 982
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "ac97e46ba45ebfdf37193e9f0db71d0ad6584eaf",
+  "prompts": {},
+  "sessions": {
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
