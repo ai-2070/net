@@ -29,6 +29,7 @@
 //! reflects the slowness; dropping it would needlessly shrink the
 //! candidate set.
 
+use crate::adapter::net::behavior::meshos::snapshot::{MeshOsSnapshot, PeerHealthSnapshot};
 use crate::adapter::net::behavior::meshos::state::MeshOsState;
 use crate::adapter::net::behavior::meshos::{NodeHealth, NodeId};
 
@@ -58,6 +59,32 @@ pub fn project_liveness(meshos: &MeshOsState) -> LivenessDelta {
         match health {
             NodeHealth::Healthy | NodeHealth::Degraded => delta.up.push(node),
             NodeHealth::Unreachable => delta.down.push(node),
+        }
+    }
+    delta.down.sort_unstable();
+    delta.up.sort_unstable();
+    delta
+}
+
+/// Like [`project_liveness`] but reading the public `MeshOsSnapshot`
+/// (`MeshOsRuntime::snapshot()`) instead of the loop-internal
+/// `MeshOsState` — the form an *external* driver consumes (the raw
+/// `MeshOsState` is internal to the reconcile loop). Classifies each peer
+/// by its snapshot `health`: `Unreachable` → down; `Healthy` / `Degraded`
+/// → up; no health sample yet → unclassified (left out of both lists, so
+/// an unconfirmed node is never pruned from matching). Same output shape
+/// and sorting as [`project_liveness`].
+pub fn project_liveness_from_snapshot(snapshot: &MeshOsSnapshot) -> LivenessDelta {
+    let mut delta = LivenessDelta::default();
+    for (&node, peer) in &snapshot.peers {
+        match peer.health {
+            Some(PeerHealthSnapshot::Unreachable) => delta.down.push(node),
+            Some(PeerHealthSnapshot::Healthy) | Some(PeerHealthSnapshot::Degraded) => {
+                delta.up.push(node)
+            }
+            // No health sample yet → don't classify; an unconfirmed node
+            // is never dropped from matching.
+            None => {}
         }
     }
     delta.down.sort_unstable();
@@ -97,5 +124,43 @@ mod tests {
     fn empty_health_yields_empty_delta() {
         let delta = project_liveness(&MeshOsState::default());
         assert_eq!(delta, LivenessDelta::default());
+    }
+
+    #[test]
+    fn snapshot_variant_classifies_peers_by_snapshot_health() {
+        use crate::adapter::net::behavior::meshos::snapshot::PeerSnapshot;
+
+        let mut snap = MeshOsSnapshot::default();
+        snap.peers.insert(
+            1,
+            PeerSnapshot {
+                health: Some(PeerHealthSnapshot::Healthy),
+                ..Default::default()
+            },
+        );
+        snap.peers.insert(
+            2,
+            PeerSnapshot {
+                health: Some(PeerHealthSnapshot::Unreachable),
+                ..Default::default()
+            },
+        );
+        snap.peers.insert(
+            3,
+            PeerSnapshot {
+                health: Some(PeerHealthSnapshot::Degraded),
+                ..Default::default()
+            },
+        );
+        // No health sample yet → unclassified.
+        snap.peers.insert(4, PeerSnapshot::default());
+
+        let delta = project_liveness_from_snapshot(&snap);
+        assert_eq!(delta.down, vec![2], "only Unreachable is down");
+        assert_eq!(delta.up, vec![1, 3], "Healthy + Degraded are up");
+        assert!(
+            !delta.down.contains(&4) && !delta.up.contains(&4),
+            "a peer with no health sample is never classified (never pruned)",
+        );
     }
 }
