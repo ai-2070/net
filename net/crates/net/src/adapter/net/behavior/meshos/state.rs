@@ -979,7 +979,7 @@ mod tests {
             node: None,
         });
         assert!(
-            desired.desired_daemon_nodes.get(&d).is_none(),
+            !desired.desired_daemon_nodes.contains_key(&d),
             "run-anywhere update must clear the prior node pin",
         );
         assert_eq!(desired.desired_daemons.get(&d), Some(&DaemonIntent::Run));

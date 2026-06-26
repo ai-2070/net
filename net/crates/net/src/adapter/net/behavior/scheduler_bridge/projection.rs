@@ -229,8 +229,73 @@ mod tests {
         // Task 1's daemon is pinned to node 7; task 2's stays run-anywhere.
         assert_eq!(desired.desired_daemon_nodes.get(&daemon_ref(1)), Some(&7));
         assert!(
-            desired.desired_daemon_nodes.get(&daemon_ref(2)).is_none(),
+            !desired.desired_daemon_nodes.contains_key(&daemon_ref(2)),
             "the non-claim task is never pinned",
+        );
+    }
+
+    /// Phase A acceptance (the plan's "Done when", start half): a
+    /// `Running(ActiveClaim)` task, projected through both projections
+    /// into `DesiredState`, makes reconcile emit `StartDaemon` on the
+    /// claim's node and on NO other node — entirely through
+    /// `DesiredState`, no workflow→dispatcher call in the path.
+    #[tokio::test]
+    async fn running_claim_starts_its_daemon_on_the_claim_node_only() {
+        use crate::adapter::net::behavior::meshos::state::{DesiredState, MeshOsState};
+        use crate::adapter::net::behavior::meshos::{
+            reconcile, LocalityConfig, MaintenanceConfig, MeshOsAction, SchedulerConfig,
+        };
+        use crate::adapter::net::cortex::workflow::{ActiveClaim, WorkflowAdapter};
+
+        const CLAIM_HOST: NodeId = 7;
+        const OTHER_NODE: NodeId = 99;
+
+        let redex = Redex::new();
+        let wf = WorkflowAdapter::open(&redex, 0x5C4E_DB04).await.unwrap();
+        wf.submit(1).unwrap();
+        let seq = wf.start(1).unwrap(); // task 1 → Running
+        wf.wait_for_seq(seq).await.unwrap();
+
+        let mut claims = ClaimRegistry::new();
+        claims.insert(daemon_ref(1), ActiveClaim { island: 0xA0 });
+
+        // Project both projections into one DesiredState (the overlay).
+        let mut desired = DesiredState::default();
+        {
+            let state = wf.state();
+            let guard = state.read();
+            for intent in project_daemon_intents(&guard) {
+                desired.apply_daemon_intent(&intent);
+            }
+        }
+        for intent in project_forced_placements(&claims, |island| {
+            (island == 0xA0).then_some(CLAIM_HOST)
+        }) {
+            desired.apply_daemon_intent(&intent);
+        }
+
+        // Daemon absent in actual state → a Run intent yields StartDaemon.
+        let actual = MeshOsState::default();
+        let (loc, maint, sched) = (
+            LocalityConfig::default(),
+            MaintenanceConfig::default(),
+            SchedulerConfig::default(),
+        );
+
+        let on_claim_host = reconcile(&actual, &desired, CLAIM_HOST, &loc, &maint, &sched, None);
+        assert!(
+            on_claim_host.iter().any(
+                |a| matches!(a, MeshOsAction::StartDaemon { daemon } if *daemon == daemon_ref(1)),
+            ),
+            "the claim's node starts the pinned daemon; got {on_claim_host:?}",
+        );
+
+        let elsewhere = reconcile(&actual, &desired, OTHER_NODE, &loc, &maint, &sched, None);
+        assert!(
+            !elsewhere
+                .iter()
+                .any(|a| matches!(a, MeshOsAction::StartDaemon { .. })),
+            "a non-claim node never starts the pinned daemon; got {elsewhere:?}",
         );
     }
 }
