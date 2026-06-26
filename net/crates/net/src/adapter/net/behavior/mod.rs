@@ -38,6 +38,15 @@ pub mod loadbalance;
 pub mod meshdb;
 #[cfg(feature = "meshos")]
 pub mod meshos;
+// The MeshOS ↔ Scheduler integration bridge — the ONLY module that
+// imports both `meshos` (DesiredState / DaemonIntent) and
+// `cortex::workflow` (WorkflowState) + `gang` (ActiveClaim /
+// IslandTopology). It exists so `workflow`/`gang` and `meshos` never
+// import each other (integration-plan Locked Decision 5); every
+// cross-layer projection lives here. Spans both feature surfaces, so
+// it needs both gates.
+#[cfg(all(feature = "cortex", feature = "meshos"))]
+pub mod scheduler_bridge;
 pub mod metadata;
 pub mod placement;
 pub mod placement_registry;
