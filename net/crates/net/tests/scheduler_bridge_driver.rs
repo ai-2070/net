@@ -86,3 +86,38 @@ async fn driver_tick_publishes_and_a_crash_fails_the_task() {
         "the crash already released the claim",
     );
 }
+
+#[tokio::test]
+async fn spawn_loop_runs_until_shutdown_then_stops_cleanly() {
+    let MeshOsLoopParts {
+        mesh_loop: _mesh_loop,
+        handle,
+        actions_rx: _actions_rx,
+        reader,
+    } = MeshOsLoop::new(MeshOsConfig::default());
+
+    let mesh = build_mesh().await;
+    let redex = Redex::new();
+    let wf = Arc::new(WorkflowAdapter::open(&redex, 0x00D2_1443).await.unwrap());
+    wf.submit(1).unwrap();
+    let seq = wf.start(1).unwrap();
+    wf.wait_for_seq(seq).await.unwrap();
+
+    let driver = Arc::new(SchedulerBridgeDriver::new(wf.clone(), mesh, handle, reader));
+    driver.on_running(1, ActiveClaim { island: 0xA0 });
+
+    // The loop keeps ticking on its own clock until shutdown.
+    let loop_handle = driver.clone().spawn(Duration::from_millis(5));
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(
+        !loop_handle.is_finished(),
+        "the loop runs on its own until shutdown",
+    );
+
+    // Shutdown → the loop stops promptly and without panicking.
+    driver.shutdown();
+    tokio::time::timeout(Duration::from_secs(2), loop_handle)
+        .await
+        .expect("the spawned loop stops within 2s of shutdown")
+        .expect("the loop task did not panic");
+}

@@ -22,8 +22,11 @@
 //! `gang` and `meshos` from importing each other; the bridge sees all).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 use crate::adapter::net::behavior::fold::{IslandId, IslandQuery, NodeId};
 use crate::adapter::net::behavior::meshos::event_loop::{MeshOsHandle, MeshOsSnapshotReader};
@@ -164,6 +167,10 @@ pub struct SchedulerBridgeDriver {
     mesh: Arc<MeshNode>,
     handle: MeshOsHandle,
     snapshot: MeshOsSnapshotReader,
+    /// Stop signal for the [`spawn`](SchedulerBridgeDriver::spawn)ed loop.
+    /// `notify_one` so a shutdown raised while the loop is mid-`tick`
+    /// stores a permit and is never lost.
+    shutdown: Arc<Notify>,
 }
 
 impl SchedulerBridgeDriver {
@@ -181,6 +188,7 @@ impl SchedulerBridgeDriver {
             mesh,
             handle,
             snapshot,
+            shutdown: Arc::new(Notify::new()),
         }
     }
 
@@ -234,6 +242,37 @@ impl SchedulerBridgeDriver {
             bridge: Arc::clone(&self.bridge),
             workflow: Arc::clone(&self.workflow),
         })
+    }
+
+    /// Spawn the periodic driver loop: call [`tick`](Self::tick) every
+    /// `interval` until [`shutdown`](Self::shutdown) is signalled. Returns
+    /// the task handle — await it after `shutdown()` for a clean stop.
+    ///
+    /// The driver bridges three subsystems (`MeshNode` / `MeshOsRuntime` /
+    /// `WorkflowAdapter`) with no single natural owner, so its lifetime is
+    /// the caller's: tie `shutdown()` to your own teardown rather than to
+    /// any one subsystem's. The first tick fires immediately; missed ticks
+    /// are skipped (no burst catch-up).
+    pub fn spawn(self: Arc<Self>, interval: Duration) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        self.tick();
+                    }
+                    _ = self.shutdown.notified() => break,
+                }
+            }
+        })
+    }
+
+    /// Signal the [`spawn`](Self::spawn)ed loop to stop. `notify_one`
+    /// stores a permit if the loop is mid-`tick`, so the signal is never
+    /// lost; await the returned `JoinHandle` for a clean shutdown.
+    pub fn shutdown(&self) {
+        self.shutdown.notify_one();
     }
 }
 
