@@ -1,0 +1,19 @@
+web/src/content/docs/releases/RELEASE_v0.28_ROUND_AND_ROUND.md
+  s_e69efae25a44e0::t_157c1b22bcb0ee 1-388
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "5b1d230a560b1f038a89c09c3112c3d31f593c39",
+  "prompts": {},
+  "sessions": {
+    "s_e69efae25a44e0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "94d44123-1184-41ad-8165-0c6af1be74b2",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
