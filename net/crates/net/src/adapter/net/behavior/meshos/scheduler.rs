@@ -91,6 +91,17 @@ pub trait PlacementScorer: Send + Sync {
         let _ = node;
         None
     }
+
+    /// Estimated cost of migrating `chain` to `target`, if the scorer can
+    /// estimate it (it has the artifact's state size + the path bandwidth /
+    /// RTT). `None` (the default) disables cost-aware gating — the hysteresis
+    /// gap alone decides. When `Some`, the decision arm converts it via
+    /// [`SchedulerConfig::cost_model`] and requires `score_gain - cost > 0`
+    /// before emitting an eviction (Phase 3, `MESH_SCHEDULER_IMPL_PLAN.md`).
+    fn migration_cost(&self, chain: ChainId, target: NodeId) -> Option<MigrationCost> {
+        let _ = (chain, target);
+        None
+    }
 }
 
 /// Tunables for [`super::reconcile::reconcile`]'s scheduler arm.
@@ -125,6 +136,12 @@ pub struct SchedulerConfig {
     /// dirty signal misses a slow sub-fingerprint drift. Default
     /// 30 s, per the design doc's Open Question #1.
     pub decision_interval: Duration,
+
+    /// Converts a [`MigrationCost`] estimate into a score-equivalent the
+    /// decision arm subtracts from the score gain (Phase 3,
+    /// `MESH_SCHEDULER_IMPL_PLAN.md`). Only applies when the scorer
+    /// returns a cost via [`PlacementScorer::migration_cost`].
+    pub cost_model: MigrationCostModel,
 }
 
 impl Default for SchedulerConfig {
@@ -134,7 +151,55 @@ impl Default for SchedulerConfig {
             hysteresis_gap: 0.2,
             cooldown: Duration::from_secs(5 * 60),
             decision_interval: Duration::from_secs(30),
+            cost_model: MigrationCostModel::default(),
         }
+    }
+}
+
+/// Estimated cost of migrating an artifact, in the dimensions the design doc
+/// (`MESH_SCHEDULER_PLAN.md` §2) locks. Produced by
+/// [`PlacementScorer::migration_cost`]; consumed by [`MigrationCostModel`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MigrationCost {
+    /// State-transfer time: `bytes_to_transfer / bandwidth` + serialization.
+    pub state_transfer: Duration,
+    /// Disruption: estimated time the artifact is unavailable mid-migration.
+    pub disruption: Duration,
+    /// Bytes moved during transfer (relevant under network saturation;
+    /// carried for richer models, not used by the default conversion).
+    pub bandwidth_bytes: u64,
+    /// Importance weight — higher means a more valuable artifact, charged a
+    /// proportionally higher cost so it needs a bigger score gain to move.
+    pub reliability_factor: f32,
+}
+
+/// Converts a [`MigrationCost`] into a score-equivalent in `[0, ∞)` so the
+/// decision arm can require `score_gain - cost_score > 0` before migrating.
+///
+/// The default is a deliberately conservative placeholder: the design doc's
+/// activation gate says the cost model is uncalibrated until production
+/// telemetry exists, so this ships the *mechanism* with a safe default and
+/// expects operators to tune `cost_per_sec` against observed migration costs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MigrationCostModel {
+    /// Score units charged per second of `state_transfer + disruption`,
+    /// scaled by `reliability_factor`. Default `0.1`.
+    pub cost_per_sec: f32,
+}
+
+impl Default for MigrationCostModel {
+    fn default() -> Self {
+        Self { cost_per_sec: 0.1 }
+    }
+}
+
+impl MigrationCostModel {
+    /// Score-equivalent cost. Monotonic in `state_transfer`, `disruption`,
+    /// and `reliability_factor` — the property the design doc's test
+    /// strategy pins.
+    pub fn score_equivalent(&self, cost: &MigrationCost) -> f32 {
+        let secs = cost.state_transfer.as_secs_f32() + cost.disruption.as_secs_f32();
+        self.cost_per_sec * secs * cost.reliability_factor.max(0.0)
     }
 }
 
@@ -267,6 +332,14 @@ impl PlacementScorer for SnapshotScorer<'_> {
 
     fn best_alternative(&self, chain: ChainId, exclude: &[NodeId]) -> Option<(NodeId, f32)> {
         self.live.best_alternative(chain, exclude)
+    }
+
+    fn node_fingerprint(&self, node: NodeId) -> Option<u64> {
+        self.live.node_fingerprint(node)
+    }
+
+    fn migration_cost(&self, chain: ChainId, target: NodeId) -> Option<MigrationCost> {
+        self.live.migration_cost(chain, target)
     }
 }
 
@@ -857,5 +930,45 @@ mod tests {
         ls.sample(&replicas, &leader, this, &scorer, t0, interval);
         ls.sample(&replicas, &leader, this, &scorer, t0 + Duration::from_secs(1), interval);
         assert_eq!(scorer.calls(), 2, "no fingerprint → re-scored every tick");
+    }
+
+    // ----- Phase 3: migration cost model -----
+
+    #[test]
+    fn migration_cost_model_is_monotonic() {
+        let model = MigrationCostModel::default();
+        let base = MigrationCost {
+            state_transfer: Duration::from_secs(1),
+            disruption: Duration::from_secs(1),
+            bandwidth_bytes: 0,
+            reliability_factor: 1.0,
+        };
+        let base_score = model.score_equivalent(&base);
+        assert!(base_score > 0.0);
+
+        // Monotonic in state_transfer.
+        let more_transfer = MigrationCost {
+            state_transfer: Duration::from_secs(2),
+            ..base.clone()
+        };
+        assert!(model.score_equivalent(&more_transfer) > base_score);
+
+        // Monotonic in disruption.
+        let more_disruption = MigrationCost {
+            disruption: Duration::from_secs(2),
+            ..base.clone()
+        };
+        assert!(model.score_equivalent(&more_disruption) > base_score);
+
+        // Monotonic in reliability_factor (importance).
+        let more_important = MigrationCost {
+            reliability_factor: 2.0,
+            ..base.clone()
+        };
+        assert!(model.score_equivalent(&more_important) > base_score);
+
+        // A zero-cost migration is free.
+        let zero = MigrationCost::default();
+        assert_eq!(model.score_equivalent(&zero), 0.0);
     }
 }

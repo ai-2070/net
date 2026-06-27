@@ -529,11 +529,23 @@ fn diff_scheduler(
         // exclude slice + the capability-index query inside
         // `best_alternative`.
         let exclude: Vec<NodeId> = holders.iter().copied().collect();
-        let Some((_alt_node, alt_score)) = scorer.best_alternative(chain, &exclude) else {
+        let Some((alt_node, alt_score)) = scorer.best_alternative(chain, &exclude) else {
             continue;
         };
-        if alt_score - victim_score <= config.hysteresis_gap {
+        let score_gain = alt_score - victim_score;
+        if score_gain <= config.hysteresis_gap {
             continue;
+        }
+        // Phase 3 net-benefit gate: if the scorer can estimate the
+        // migration cost, require the score gain to exceed its
+        // score-equivalent. A cheap hysteresis-clearing move still
+        // gets vetoed when the migration would cost more than it buys.
+        // No estimate (`None`) → the hysteresis gap alone decides.
+        if let Some(cost) = scorer.migration_cost(chain, alt_node) {
+            let cost_score = config.cost_model.score_equivalent(&cost);
+            if score_gain - cost_score <= 0.0 {
+                continue;
+            }
         }
         candidates.push((chain, victim));
     }
@@ -2169,6 +2181,87 @@ mod tests {
             }
             other => panic!("expected one RequestEviction(11), got {other:?}"),
         }
+    }
+
+    /// Scorer for the Phase 3 net-benefit tests: a single under-scoring
+    /// holder, a strong alternative, and a configurable migration cost.
+    struct CostScorer {
+        victim_score: f32,
+        alt: (NodeId, f32),
+        cost: Option<super::super::scheduler::MigrationCost>,
+    }
+
+    impl super::super::scheduler::PlacementScorer for CostScorer {
+        fn score(&self, _chain: ChainId, _node: NodeId) -> Option<f32> {
+            Some(self.victim_score)
+        }
+        fn best_alternative(&self, _chain: ChainId, exclude: &[NodeId]) -> Option<(NodeId, f32)> {
+            if exclude.contains(&self.alt.0) {
+                None
+            } else {
+                Some(self.alt)
+            }
+        }
+        fn migration_cost(
+            &self,
+            _chain: ChainId,
+            _target: NodeId,
+        ) -> Option<super::super::scheduler::MigrationCost> {
+            self.cost.clone()
+        }
+    }
+
+    #[test]
+    fn net_benefit_gate_suppresses_costly_migration() {
+        // Gap = 0.9 - 0.3 = 0.6, well past hysteresis (0.2). But the
+        // migration disrupts for 100 s → cost_score = 0.1 * 100 = 10.0,
+        // dwarfing the 0.6 gain → net benefit negative → no eviction.
+        let mut actual = MeshOsState::default();
+        actual
+            .replicas
+            .insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        let scorer = CostScorer {
+            victim_score: 0.3,
+            alt: (5, 0.9),
+            cost: Some(super::super::scheduler::MigrationCost {
+                disruption: ::std::time::Duration::from_secs(100),
+                reliability_factor: 1.0,
+                ..Default::default()
+            }),
+        };
+        assert!(
+            scheduler_call(&actual, Some(&scorer)).is_empty(),
+            "a migration costing more than it buys must be vetoed",
+        );
+    }
+
+    #[test]
+    fn net_benefit_gate_allows_cheap_migration() {
+        // Same scores, but a cheap migration (0.1 s transfer →
+        // cost_score = 0.01) leaves the 0.6 gain intact → eviction emits.
+        let mut actual = MeshOsState::default();
+        actual
+            .replicas
+            .insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        let scorer = CostScorer {
+            victim_score: 0.3,
+            alt: (5, 0.9),
+            cost: Some(super::super::scheduler::MigrationCost {
+                state_transfer: ::std::time::Duration::from_millis(100),
+                reliability_factor: 1.0,
+                ..Default::default()
+            }),
+        };
+        assert_eq!(
+            scheduler_call(&actual, Some(&scorer)),
+            vec![MeshOsAction::RequestEviction {
+                chain: CHAIN_A,
+                victim: THIS_NODE,
+            }],
+            "a cheap migration that clears the gap must proceed",
+        );
     }
 
     #[test]
