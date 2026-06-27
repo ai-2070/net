@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/behavior/meshos/scheduler.rs
+  s_22b9063ec56e89::t_182147f750ea09 162-168,179-180,184-194
+  s_22b9063ec56e89::t_5fcb557c8dbb4c 221-226,229-234
+  s_22b9063ec56e89::t_aa844d3a2efc74 1030-1062
+  s_22b9063ec56e89::t_39e9b2ab1aefb3 195-196
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "e8a5bb27e886b5b0330eea00ba662b19b49d9a6e",
+  "prompts": {},
+  "sessions": {
+    "s_22b9063ec56e89": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "675ec343-2799-4708-9d68-c48f25333f3a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
