@@ -1,0 +1,19 @@
+web/src/content/docs/releases/RELEASE_v0.29_SUMMER_OF_69.md
+  s_22b9063ec56e89::t_eeb68ddc3599e3 1-134
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "74158e1e3c3211711d944d2855c8ec95f2a784fc",
+  "prompts": {},
+  "sessions": {
+    "s_22b9063ec56e89": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "675ec343-2799-4708-9d68-c48f25333f3a",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
