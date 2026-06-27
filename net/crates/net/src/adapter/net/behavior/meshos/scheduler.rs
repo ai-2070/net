@@ -73,6 +73,24 @@ pub trait PlacementScorer: Send + Sync {
     /// score against the worst current holder's score plus
     /// hysteresis before committing.
     fn best_alternative(&self, chain: ChainId, exclude: &[NodeId]) -> Option<(NodeId, f32)>;
+
+    /// A cheap, monotonic per-node fingerprint of the capability /
+    /// inventory state that placement scoring reads — e.g. the
+    /// capability-fold `generation` counter for `node`. Bumped
+    /// whenever anything that could change the node's score changes.
+    ///
+    /// [`LocalScheduler`] folds the fingerprints of a chain's holders
+    /// together to decide whether the chain's scoring inputs moved
+    /// since the last sample (dirty-gating, Phase 2 of
+    /// `MESH_SCHEDULER_IMPL_PLAN.md`). Returning `None` (the default)
+    /// means "I can't cheaply fingerprint this" → the chain is always
+    /// treated as dirty, reproducing un-gated every-tick sampling.
+    /// Slower drift not captured here (RTT, etc.) is caught by the
+    /// scheduler's coarse backstop cadence.
+    fn node_fingerprint(&self, node: NodeId) -> Option<u64> {
+        let _ = node;
+        None
+    }
 }
 
 /// Tunables for [`super::reconcile::reconcile`]'s scheduler arm.
@@ -98,6 +116,15 @@ pub struct SchedulerConfig {
     /// evaluations within this window skip the chain. Default
     /// 5 min — matches the `MESH_SCHEDULER_PLAN.md` value.
     pub cooldown: Duration,
+
+    /// Coarse backstop cadence for the loop-side sampler (Phase 2,
+    /// `MESH_SCHEDULER_IMPL_PLAN.md`). A led chain is re-sampled
+    /// when its dirty fingerprint moves OR at least this long has
+    /// elapsed since its last sample — whichever comes first. The
+    /// backstop guarantees eventual re-evaluation even when the
+    /// dirty signal misses a slow sub-fingerprint drift. Default
+    /// 30 s, per the design doc's Open Question #1.
+    pub decision_interval: Duration,
 }
 
 impl Default for SchedulerConfig {
@@ -106,6 +133,7 @@ impl Default for SchedulerConfig {
             score_floor: 0.5,
             hysteresis_gap: 0.2,
             cooldown: Duration::from_secs(5 * 60),
+            decision_interval: Duration::from_secs(30),
         }
     }
 }
@@ -160,14 +188,18 @@ impl SchedulerRegistry {
 // in behind the existing `PlacementScorer` trait object.
 // =============================================================================
 
-/// Cached per-`(chain, holder)` placement scores sampled loop-side by
-/// [`LocalScheduler`]. Decouples score *sampling* (gated by cadence +
-/// dirty-bits in Phase 2) from the *decision* in `diff_scheduler`, which reads
-/// scores through a [`SnapshotScorer`] instead of evaluating the live
-/// `PlacementFilter` per holder per tick.
+/// Cached placement scores sampled loop-side by [`LocalScheduler`]. Decouples
+/// score *sampling* (gated by cadence + dirty-bits in Phase 2) from the
+/// *decision* in `diff_scheduler`, which reads scores through a
+/// [`SnapshotScorer`] instead of evaluating the live `PlacementFilter` per
+/// holder per tick.
+///
+/// Stored chain → (holder → score) so the gating loop can replace or drop a
+/// whole chain's scores in O(1) without scanning the other chains' entries —
+/// non-dirty chains cost zero map work per tick.
 #[derive(Clone, Default, Debug)]
 pub struct ScoreSnapshot {
-    scores: HashMap<(ChainId, NodeId), f32>,
+    scores: HashMap<ChainId, HashMap<NodeId, f32>>,
 }
 
 impl ScoreSnapshot {
@@ -180,22 +212,34 @@ impl ScoreSnapshot {
     /// the decision arm treat the holder as "no opinion → skip," exactly as a
     /// live scorer returning `None` would.
     pub fn get(&self, chain: ChainId, node: NodeId) -> Option<f32> {
-        self.scores.get(&(chain, node)).copied()
+        self.scores.get(&chain).and_then(|m| m.get(&node)).copied()
     }
 
     /// Record a sampled score.
     pub fn insert(&mut self, chain: ChainId, node: NodeId, score: f32) {
-        self.scores.insert((chain, node), score);
+        self.scores.entry(chain).or_default().insert(node, score);
     }
 
     /// Number of `(chain, holder)` entries sampled.
     pub fn len(&self) -> usize {
-        self.scores.len()
+        self.scores.values().map(HashMap::len).sum()
     }
 
     /// `true` when nothing was sampled.
     pub fn is_empty(&self) -> bool {
-        self.scores.is_empty()
+        self.scores.values().all(HashMap::is_empty)
+    }
+
+    /// Replace all of `chain`'s holder scores in one shot (used by the gating
+    /// loop when a dirty chain is re-sampled). Dropping the old inner map
+    /// clears any holders the chain no longer has.
+    fn set_chain(&mut self, chain: ChainId, holders: HashMap<NodeId, f32>) {
+        self.scores.insert(chain, holders);
+    }
+
+    /// Drop the scores of any chain for which `keep` returns `false`.
+    fn retain_chains(&mut self, keep: impl Fn(ChainId) -> bool) {
+        self.scores.retain(|&chain, _| keep(chain));
     }
 }
 
@@ -322,9 +366,34 @@ impl ScoreHistory {
 /// `PlacementFilter` evaluation (RTT / inventory / caps), not from committed
 /// events, so they must not enter the replay-deterministic `MeshOsState`. All
 /// timestamps are the loop's `last_tick` anchor, never wall-clock.
+///
+/// Phase 2 (`MESH_SCHEDULER_IMPL_PLAN.md`) gates re-sampling by two
+/// complementary levers, each closing a distinct failure mode:
+///
+/// - **Dirty-bit** — a chain is re-scored only when the fingerprint of its
+///   holders' scoring inputs ([`PlacementScorer::node_fingerprint`]) moves.
+///   Kills the O(N) steady-state polling wall: stable chains cost one fold of
+///   cheap counter compares and zero scoring.
+/// - **Coarse backstop** ([`SchedulerConfig::decision_interval`]) — every led
+///   chain is re-scored at least once per interval regardless of its
+///   fingerprint. Catches slow sub-fingerprint drift (and any dirty-tracking
+///   gap) that the dirty-bit alone would leave silently stale forever.
+///
+/// Unsampled chains keep their prior scores in the retained snapshot, so the
+/// decision arm always has full coverage of the `(led-chain, holder)` pairs it
+/// queries.
 #[derive(Default)]
 pub struct LocalScheduler {
+    /// Running snapshot — updated in place; dirty chains replaced, clean
+    /// chains retained, dropped chains GC'd. Returned by `sample`.
+    current: ScoreSnapshot,
+    /// Per-chain score history (worst-holder series + trend).
     history: HashMap<ChainId, ScoreHistory>,
+    /// Last dirty fingerprint observed per chain (absent → never sampled, or
+    /// the scorer couldn't fingerprint it).
+    last_fingerprint: HashMap<ChainId, u64>,
+    /// Last sample timestamp per chain — drives the backstop cadence.
+    last_sampled: HashMap<ChainId, Instant>,
 }
 
 impl LocalScheduler {
@@ -333,16 +402,15 @@ impl LocalScheduler {
         Self::default()
     }
 
-    /// Sample placement scores for every chain this node leads and record
-    /// per-chain history (keyed on the decision-relevant *worst* holder
-    /// score). Returns the snapshot the decision arm reads via
-    /// [`SnapshotScorer`].
+    /// Sample placement scores for the chains this node leads and return the
+    /// snapshot the decision arm reads via [`SnapshotScorer`].
     ///
-    /// Phase 1 samples every led chain on every call, which is
-    /// behavior-identical to the old inline scoring in `diff_scheduler` — the
-    /// snapshot covers exactly the `(led-chain, holder)` pairs the decision
-    /// arm queries. Phase 2 gates this by cadence + dirty-bits and retains the
-    /// prior snapshot for unsampled chains.
+    /// A led chain is re-scored when it is new, when its dirty fingerprint
+    /// moved, or when `decision_interval` has elapsed since its last sample
+    /// (the coarse backstop); otherwise its prior scores are retained
+    /// untouched. With a scorer that doesn't implement `node_fingerprint`
+    /// (fingerprint `None`), every chain is always dirty — behavior-identical
+    /// to Phase 1's sample-everything pass.
     pub fn sample(
         &mut self,
         replicas: &HashMap<ChainId, BTreeSet<NodeId>>,
@@ -350,33 +418,83 @@ impl LocalScheduler {
         this_node: NodeId,
         scorer: &dyn PlacementScorer,
         now: Instant,
-    ) -> ScoreSnapshot {
-        let mut snapshot = ScoreSnapshot::new();
+        decision_interval: Duration,
+    ) -> &ScoreSnapshot {
         let mut led: HashSet<ChainId> = HashSet::new();
         for (&chain, holders) in replicas {
             if replica_leader.get(&chain).copied() != Some(this_node) {
                 continue;
             }
+            if holders.is_empty() {
+                continue;
+            }
             led.insert(chain);
-            // Sample every holder; track the worst (lowest) for history.
+
+            let fingerprint = Self::chain_fingerprint(scorer, holders);
+            let backstop_due = self
+                .last_sampled
+                .get(&chain)
+                .is_none_or(|t| now.saturating_duration_since(*t) >= decision_interval);
+            let dirty = match fingerprint {
+                // Un-fingerprintable → always re-sample (un-gated).
+                None => true,
+                Some(fp) => self.last_fingerprint.get(&chain).copied() != Some(fp),
+            };
+            if !(dirty || backstop_due) {
+                // Clean and not yet due — retain the prior scores untouched.
+                continue;
+            }
+
+            // Re-score every holder; track the worst (lowest) for history.
+            let mut holder_scores: HashMap<NodeId, f32> = HashMap::new();
             let mut worst: Option<f32> = None;
             for &h in holders {
                 if let Some(s) = scorer.score(chain, h) {
-                    snapshot.insert(chain, h, s);
+                    holder_scores.insert(h, s);
                     worst = Some(worst.map_or(s, |w| w.min(s)));
                 }
             }
+            self.current.set_chain(chain, holder_scores);
             if let Some(w) = worst {
                 self.history
                     .entry(chain)
                     .and_modify(|h| h.record(now, w))
                     .or_insert_with(|| ScoreHistory::new(now, w));
             }
+            match fingerprint {
+                Some(fp) => {
+                    self.last_fingerprint.insert(chain, fp);
+                }
+                None => {
+                    self.last_fingerprint.remove(&chain);
+                }
+            }
+            self.last_sampled.insert(chain, now);
         }
-        // Drop history for chains we no longer lead so the sidecar stays
-        // bounded by the led-chain count, not the all-time chain count.
+
+        // Drop all per-chain state for chains we no longer lead so the sidecar
+        // stays bounded by the led-chain count, not the all-time chain count.
+        self.current.retain_chains(|c| led.contains(&c));
         self.history.retain(|c, _| led.contains(c));
-        snapshot
+        self.last_fingerprint.retain(|c, _| led.contains(c));
+        self.last_sampled.retain(|c, _| led.contains(c));
+        &self.current
+    }
+
+    /// Fold a chain's holders into one dirty fingerprint: the holder set
+    /// (their `NodeId`s) plus each holder's [`PlacementScorer::node_fingerprint`].
+    /// A holder added/removed, or any holder's inputs moving, changes the
+    /// result. `None` if any holder is un-fingerprintable (→ always dirty).
+    fn chain_fingerprint(scorer: &dyn PlacementScorer, holders: &BTreeSet<NodeId>) -> Option<u64> {
+        // FNV-1a-style fold; order-independent inputs but holders iterate in
+        // BTreeSet (sorted) order, so the fold is itself deterministic.
+        let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
+        for &h in holders {
+            let fp = scorer.node_fingerprint(h)?;
+            acc = (acc ^ h).wrapping_mul(0x0000_0100_0000_01b3);
+            acc = (acc ^ fp).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        Some(acc)
     }
 
     /// Score history for `chain`, if tracked. Surfaced for observability /
@@ -456,6 +574,7 @@ mod tests {
         assert!((cfg.score_floor - 0.5).abs() < 1e-6);
         assert!((cfg.hysteresis_gap - 0.2).abs() < 1e-6);
         assert_eq!(cfg.cooldown, Duration::from_secs(5 * 60));
+        assert_eq!(cfg.decision_interval, Duration::from_secs(30));
     }
 
     // ----- Phase 1: snapshot / history / sidecar -----
@@ -535,7 +654,14 @@ mod tests {
             alternatives: HashMap::new(),
         };
         let mut ls = LocalScheduler::new();
-        let snap = ls.sample(&replicas, &leader, this, &scorer, Instant::now());
+        let snap = ls.sample(
+            &replicas,
+            &leader,
+            this,
+            &scorer,
+            Instant::now(),
+            Duration::from_secs(30),
+        );
         // Led chain: every holder sampled.
         assert_eq!(snap.get(1, 100), Some(0.4));
         assert_eq!(snap.get(1, 200), Some(0.6));
@@ -560,13 +686,176 @@ mod tests {
         let mut leader: HashMap<ChainId, NodeId> = HashMap::new();
         leader.insert(1, this);
         leader.insert(2, this);
-        ls.sample(&replicas, &leader, this, &scorer, Instant::now());
+        let interval = Duration::from_secs(30);
+        ls.sample(&replicas, &leader, this, &scorer, Instant::now(), interval);
         assert_eq!(ls.tracked_len(), 2);
         // Next tick: we lose leadership of chain 2.
         leader.insert(2, 999);
-        ls.sample(&replicas, &leader, this, &scorer, Instant::now());
+        ls.sample(&replicas, &leader, this, &scorer, Instant::now(), interval);
         assert_eq!(ls.tracked_len(), 1);
         assert!(ls.history(2).is_none(), "dropped chain is GC'd");
         assert!(ls.history(1).is_some());
+    }
+
+    // ----- Phase 2: dirty-gate + coarse backstop -----
+
+    /// Test scorer that counts `score()` calls and exposes a controllable
+    /// per-node fingerprint, so the gating tests can prove exactly when a
+    /// chain is (and isn't) re-scored.
+    struct CountingScorer {
+        score: f32,
+        fp_present: std::sync::atomic::AtomicBool,
+        fp_bits: std::sync::atomic::AtomicU64,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingScorer {
+        fn new(score: f32, fp: Option<u64>) -> Self {
+            use std::sync::atomic::*;
+            Self {
+                score,
+                fp_present: AtomicBool::new(fp.is_some()),
+                fp_bits: AtomicU64::new(fp.unwrap_or(0)),
+                calls: AtomicUsize::new(0),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn set_fp(&self, fp: u64) {
+            self.fp_bits.store(fp, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl PlacementScorer for CountingScorer {
+        fn score(&self, _chain: ChainId, _node: NodeId) -> Option<f32> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(self.score)
+        }
+        fn best_alternative(&self, _chain: ChainId, _exclude: &[NodeId]) -> Option<(NodeId, f32)> {
+            None
+        }
+        fn node_fingerprint(&self, _node: NodeId) -> Option<u64> {
+            use std::sync::atomic::Ordering::Relaxed;
+            if self.fp_present.load(Relaxed) {
+                Some(self.fp_bits.load(Relaxed))
+            } else {
+                None
+            }
+        }
+    }
+
+    fn one_led_chain() -> (HashMap<ChainId, BTreeSet<NodeId>>, HashMap<ChainId, NodeId>, NodeId) {
+        let this: NodeId = 100;
+        let mut replicas: HashMap<ChainId, BTreeSet<NodeId>> = HashMap::new();
+        replicas.insert(1, BTreeSet::from([100]));
+        let mut leader: HashMap<ChainId, NodeId> = HashMap::new();
+        leader.insert(1, this);
+        (replicas, leader, this)
+    }
+
+    #[test]
+    fn dirty_gate_skips_rescore_when_fingerprint_stable() {
+        let (replicas, leader, this) = one_led_chain();
+        let scorer = CountingScorer::new(0.9, Some(7));
+        let mut ls = LocalScheduler::new();
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(30);
+
+        // First sample: new chain → scored.
+        ls.sample(&replicas, &leader, this, &scorer, t0, interval);
+        assert_eq!(scorer.calls(), 1);
+
+        // Second sample, same fingerprint, within the backstop → NOT scored,
+        // but the prior score is retained in the returned snapshot.
+        let snap = ls.sample(
+            &replicas,
+            &leader,
+            this,
+            &scorer,
+            t0 + Duration::from_secs(1),
+            interval,
+        );
+        assert_eq!(snap.get(1, 100), Some(0.9), "clean chain retains its score");
+        assert_eq!(scorer.calls(), 1, "stable fingerprint within backstop → no rescore");
+    }
+
+    #[test]
+    fn dirty_gate_rescore_when_fingerprint_moves() {
+        let (replicas, leader, this) = one_led_chain();
+        let scorer = CountingScorer::new(0.9, Some(7));
+        let mut ls = LocalScheduler::new();
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(30);
+
+        ls.sample(&replicas, &leader, this, &scorer, t0, interval);
+        assert_eq!(scorer.calls(), 1);
+        // Inputs move → fingerprint changes → re-scored even within backstop.
+        scorer.set_fp(8);
+        ls.sample(
+            &replicas,
+            &leader,
+            this,
+            &scorer,
+            t0 + Duration::from_secs(1),
+            interval,
+        );
+        assert_eq!(scorer.calls(), 2, "fingerprint change forces a rescore");
+    }
+
+    #[test]
+    fn coarse_backstop_rescore_even_when_fingerprint_stable() {
+        let (replicas, leader, this) = one_led_chain();
+        let scorer = CountingScorer::new(0.9, Some(7));
+        let mut ls = LocalScheduler::new();
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(30);
+
+        ls.sample(&replicas, &leader, this, &scorer, t0, interval);
+        assert_eq!(scorer.calls(), 1);
+        // Stable fingerprint, but the decision_interval has elapsed → the
+        // backstop forces a rescore. This is the lever the dirty-bit alone
+        // can't provide: it catches drift the fingerprint misses.
+        ls.sample(&replicas, &leader, this, &scorer, t0 + interval, interval);
+        assert_eq!(scorer.calls(), 2, "backstop forces a rescore past the interval");
+    }
+
+    #[test]
+    fn dirty_gate_rescore_when_holder_set_changes() {
+        let (mut replicas, leader, this) = one_led_chain();
+        let scorer = CountingScorer::new(0.9, Some(7)); // constant per-node fp
+        let mut ls = LocalScheduler::new();
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(30);
+
+        ls.sample(&replicas, &leader, this, &scorer, t0, interval);
+        assert_eq!(scorer.calls(), 1, "1 holder scored");
+        // Same fingerprint per node, but a holder is added — the chain
+        // fingerprint folds the holder set, so it moves and forces a rescore.
+        replicas.insert(1, BTreeSet::from([100, 200]));
+        ls.sample(
+            &replicas,
+            &leader,
+            this,
+            &scorer,
+            t0 + Duration::from_secs(1),
+            interval,
+        );
+        assert_eq!(scorer.calls(), 3, "holder-set change rescored both holders");
+    }
+
+    #[test]
+    fn no_fingerprint_means_always_dirty() {
+        // A scorer that can't fingerprint (default trait behavior) is always
+        // re-scored — behavior-identical to Phase 1's sample-everything pass.
+        let (replicas, leader, this) = one_led_chain();
+        let scorer = CountingScorer::new(0.9, None);
+        let mut ls = LocalScheduler::new();
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(30);
+
+        ls.sample(&replicas, &leader, this, &scorer, t0, interval);
+        ls.sample(&replicas, &leader, this, &scorer, t0 + Duration::from_secs(1), interval);
+        assert_eq!(scorer.calls(), 2, "no fingerprint → re-scored every tick");
     }
 }

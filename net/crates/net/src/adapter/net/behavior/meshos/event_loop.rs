@@ -1553,8 +1553,9 @@ impl MeshOsLoop {
                 self.config.this_node,
                 live,
                 now,
+                self.config.scheduler.decision_interval,
             );
-            let snap_scorer = super::scheduler::SnapshotScorer::new(&snapshot, live);
+            let snap_scorer = super::scheduler::SnapshotScorer::new(snapshot, live);
             reconcile(
                 &self.actual,
                 &self.desired,

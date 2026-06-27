@@ -2198,8 +2198,15 @@ mod tests {
         // Decision via the loop path: sample → snapshot → wrap → decide.
         let mut ls = LocalScheduler::new();
         let now = actual.last_tick.unwrap();
-        let snap = ls.sample(&actual.replicas, &actual.replica_leader, THIS_NODE, &raw, now);
-        let snap_scorer = SnapshotScorer::new(&snap, &raw);
+        let snap = ls.sample(
+            &actual.replicas,
+            &actual.replica_leader,
+            THIS_NODE,
+            &raw,
+            now,
+            ::std::time::Duration::from_secs(30),
+        );
+        let snap_scorer = SnapshotScorer::new(snap, &raw);
         let snap_actions = scheduler_call(&actual, Some(&snap_scorer));
 
         assert_eq!(raw_actions, snap_actions, "snapshot path must match raw path");
