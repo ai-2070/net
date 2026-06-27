@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/behavior/meshos/mod.rs
+  s_7f85b6614a7621::t_d6eb889e773a87 140-141
+net/crates/net/src/adapter/net/behavior/meshos/reconcile.rs
+  s_7f85b6614a7621::t_5b806026f69ed3 2278-2280,2304-2307
+net/crates/net/src/adapter/net/behavior/meshos/scheduler.rs
+  s_7f85b6614a7621::t_1b2bdc9a3b3bd4 677-681,809-810,826-830,862-866,906-910,948-955
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "7a92cf33e29431ffb582cd96cf0644b6527c089f",
+  "prompts": {},
+  "sessions": {
+    "s_7f85b6614a7621": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "52f0f3ac-053a-447a-8e56-f9159f9d69e4",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
