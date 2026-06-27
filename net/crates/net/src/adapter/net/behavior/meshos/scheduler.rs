@@ -418,7 +418,7 @@ impl ScoreHistory {
         self.trend
     }
 
-    /// Number of samples retained (≤ [`HISTORY_CAP`]).
+    /// Number of samples retained (≤ `HISTORY_CAP`).
     pub fn len(&self) -> usize {
         self.recent.len()
     }
