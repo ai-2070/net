@@ -312,8 +312,11 @@ pub struct ScoreSnapshot {
 }
 
 impl ScoreSnapshot {
-    /// Empty snapshot.
-    pub fn new() -> Self {
+    /// Empty snapshot. Crate-internal: snapshots are produced by
+    /// [`LocalScheduler::sample`], not constructed by consumers — the public
+    /// surface is the read-only [`get`](Self::get) / [`len`](Self::len) /
+    /// [`is_empty`](Self::is_empty).
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -324,8 +327,11 @@ impl ScoreSnapshot {
         self.scores.get(&chain).and_then(|m| m.get(&node)).copied()
     }
 
-    /// Record a sampled score.
-    pub fn insert(&mut self, chain: ChainId, node: NodeId, score: f32) {
+    /// Record a sampled score. Crate-internal (no range/NaN validation): the
+    /// production sampler writes whole chains via the private `set_chain`, so
+    /// keeping this off the public API prevents an external caller from
+    /// injecting out-of-range / NaN scores straight into the decision math.
+    pub(crate) fn insert(&mut self, chain: ChainId, node: NodeId, score: f32) {
         self.scores.entry(chain).or_default().insert(node, score);
     }
 
