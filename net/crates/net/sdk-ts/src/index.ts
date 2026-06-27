@@ -58,7 +58,7 @@ export type {
   IslandCriteria,
   IslandTopologyInput,
   ClaimOutcome,
-  GpuSelectionPolicy,
+  SelectionPolicy,
 } from './mesh';
 
 // CortEX + NetDb (event-sourced state with reactive watches).

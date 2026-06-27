@@ -55,7 +55,7 @@ The criteria carry a **host capability match** (step 1, over the capability fold
 | `require_all` | island | resident capabilities the island must have **all** of (AND) |
 | `require_any` | island | resident capabilities the island must have **≥1** of (OR); empty = no constraint |
 | `selection` | order | `least_loaded` (default/spread) / `pack` / `load_band` / `lowest_id` |
-| `load_band_target` | order | target load for `load_band` |
+| `load_band_target` | order | target load for `load_band` selection. Python/Go expose it as a separate flat field; **Rust encodes it in the variant** — `SelectionPolicy::LoadBand(f32)`, not a `NumericFilter`/`MatchCriteria` field |
 | `prefer_capability` | order | **soft** affinity — islands with this capability resident rank ahead (e.g. a warm model that skips cold-load), within the selection policy |
 
 `tags_*` and `region` filter *which hosts* are candidates; `require_*` filter *which of their islands* qualify by resident capability. **Subnet / region / zone is a host property** (network locality of the *node* — datacenter, rack, AZ), so it filters at the host stage, **never** in the island resident filter — an island is an NVLink domain *inside* a node, so it has no locality of its own. `prefer_capability` is a preference, not a hard filter — cold islands still considered, just after warm ones. An empty `require_any` / `tags_any` is **no constraint** (composite-filter semantics), never "matches nothing".

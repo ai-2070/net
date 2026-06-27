@@ -45,7 +45,7 @@ export type { IslandCriteria, IslandTopologyInput } from '@net-mesh/core';
 export type ClaimOutcome = 'won' | 'lost';
 
 /** Selection policy for {@link MeshNode.matchIslands}. */
-export type GpuSelectionPolicy = 'least_loaded' | 'pack' | 'load_band' | 'lowest_id';
+export type SelectionPolicy = 'least_loaded' | 'pack' | 'load_band' | 'lowest_id';
 
 import { setNapiMesh } from './_internal.js';
 import {
