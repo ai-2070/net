@@ -159,7 +159,13 @@ impl Default for SchedulerConfig {
 /// Estimated cost of migrating an artifact, in the dimensions the design doc
 /// (`MESH_SCHEDULER_PLAN.md` §2) locks. Produced by
 /// [`PlacementScorer::migration_cost`]; consumed by [`MigrationCostModel`].
-#[derive(Clone, Debug, Default, PartialEq)]
+///
+/// Note `Default` is hand-written (not derived) so `reliability_factor`
+/// defaults to the **neutral `1.0`**, not `0.0`. A derived `0.0` would zero out
+/// the whole cost in [`MigrationCostModel::score_equivalent`] (it is a
+/// multiplier), silently disabling the Phase 3 net-benefit gate for any caller
+/// that builds a cost via `..Default::default()` without setting the weight.
+#[derive(Clone, Debug, PartialEq)]
 pub struct MigrationCost {
     /// State-transfer time: `bytes_to_transfer / bandwidth` + serialization.
     pub state_transfer: Duration,
@@ -170,7 +176,22 @@ pub struct MigrationCost {
     pub bandwidth_bytes: u64,
     /// Importance weight — higher means a more valuable artifact, charged a
     /// proportionally higher cost so it needs a bigger score gain to move.
+    /// Defaults to the neutral `1.0`; a non-positive or non-finite value is
+    /// clamped to `1.0` by `score_equivalent` so it can never zero a real cost.
     pub reliability_factor: f32,
+}
+
+impl Default for MigrationCost {
+    fn default() -> Self {
+        Self {
+            state_transfer: Duration::ZERO,
+            disruption: Duration::ZERO,
+            bandwidth_bytes: 0,
+            // Neutral weight — see the type doc; a `0.0` here would make the
+            // gate a no-op under the common `..Default::default()` idiom.
+            reliability_factor: 1.0,
+        }
+    }
 }
 
 /// Converts a [`MigrationCost`] into a score-equivalent in `[0, ∞)` so the
@@ -197,9 +218,20 @@ impl MigrationCostModel {
     /// Score-equivalent cost. Monotonic in `state_transfer`, `disruption`,
     /// and `reliability_factor` — the property the design doc's test
     /// strategy pins.
+    ///
+    /// `reliability_factor` is a multiplier, so a non-positive or non-finite
+    /// value is clamped to the neutral `1.0` rather than passed through: a `0.0`
+    /// (or NaN) weight would otherwise annihilate the whole cost and silently
+    /// disable the gate. A real migration always carries its transfer +
+    /// disruption time cost regardless of how its importance is (mis)configured.
     pub fn score_equivalent(&self, cost: &MigrationCost) -> f32 {
         let secs = cost.state_transfer.as_secs_f32() + cost.disruption.as_secs_f32();
-        self.cost_per_sec * secs * cost.reliability_factor.max(0.0)
+        let weight = if cost.reliability_factor.is_finite() && cost.reliability_factor > 0.0 {
+            cost.reliability_factor
+        } else {
+            1.0
+        };
+        self.cost_per_sec * secs * weight
     }
 }
 
@@ -994,5 +1026,38 @@ mod tests {
         // A zero-cost migration is free.
         let zero = MigrationCost::default();
         assert_eq!(model.score_equivalent(&zero), 0.0);
+    }
+
+    #[test]
+    fn migration_cost_default_weight_does_not_zero_the_gate() {
+        // Regression for the reliability_factor footgun: a cost built via
+        // `..Default::default()` (no explicit weight) must still charge for its
+        // transfer/disruption time. A derived `0.0` default would make the
+        // multiplier annihilate the cost and disable the Phase 3 gate.
+        let model = MigrationCostModel::default();
+        let defaulted = MigrationCost {
+            state_transfer: Duration::from_secs(10),
+            disruption: Duration::from_secs(10),
+            ..Default::default()
+        };
+        assert!(
+            model.score_equivalent(&defaulted) > 0.0,
+            "default-weight cost must be non-zero or the net-benefit gate is a no-op",
+        );
+
+        // An explicit non-positive / non-finite weight is clamped to the
+        // neutral 1.0, never zeroing a real time cost.
+        let neutral = model.score_equivalent(&defaulted);
+        for bad in [0.0f32, -1.0, f32::NAN] {
+            let weighted = MigrationCost {
+                reliability_factor: bad,
+                ..defaulted.clone()
+            };
+            assert_eq!(
+                model.score_equivalent(&weighted),
+                neutral,
+                "non-positive / NaN weight ({bad}) must clamp to the neutral 1.0",
+            );
+        }
     }
 }
