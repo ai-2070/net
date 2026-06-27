@@ -1,0 +1,19 @@
+net/crates/net/docs/releases/RELEASE_v0.29_SUMMER_OF_69.md
+  s_22b9063ec56e89::t_b2b4b12bf98f80 1-134
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "d855d17b9e3f64e4ba70431b69380d07ca9efbba",
+  "prompts": {},
+  "sessions": {
+    "s_22b9063ec56e89": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "675ec343-2799-4708-9d68-c48f25333f3a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
