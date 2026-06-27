@@ -37,10 +37,30 @@ and lowest-`NodeId` tie-break are preserved.
 
 ## Status
 
-**Open.** Findings this pass: **1 Critical / 5 Important / 7 Nit**.
-Per the "no review-tracking IDs in code or commit messages" feedback
-rule, the C/I/N labels are for this doc only — do not bake them into
-code comments or commit messages.
+**Resolved.** Findings this pass: **1 Critical / 5 Important / 7 Nit**, all
+fixed on `mesh-scheduler-integration` with regression tests, one commit per
+finding. Full crate lib suite (4529 tests) and clippy are green. Per the "no
+review-tracking IDs in code or commit messages" feedback rule, the C/I/N labels
+are for this doc only — they do not appear in the code or commit messages.
+
+Resolution summary:
+
+- **C1** — `MigrationCost` now has a hand-written `Default` (weight `1.0`) and
+  `score_equivalent` clamps non-positive / non-finite weights to `1.0`.
+- **I1** — `PlacementScorer::live_score` (overridden by `SnapshotScorer`)
+  re-confirms the victim live on the sub-floor path before evicting.
+- **I2** — cost-target approximation + cross-tick skew documented in
+  `diff_scheduler` and the impl plan.
+- **I3 / I4** — added a discriminating snapshot-machinery test and a
+  net-benefit boundary sweep.
+- **I5** — NaN scores are skipped in both the decision arm and the sampler.
+- **N1 / N5** — shared `behavior::hash` FNV-1a helper; fingerprint comment
+  corrected to "order-sensitive".
+- **N2** — single `reconcile()` call in `run_reconcile`.
+- **N3** — one shared `FixedScorer` test helper.
+- **N4** — sidecar GC retains gated on led-set membership delta.
+- **N6** — `ScoreSnapshot::new/insert` are `#[cfg(test)] pub(crate)`.
+- **N7** — dropped the unused `MigrationCost.bandwidth_bytes`.
 
 ---
 
