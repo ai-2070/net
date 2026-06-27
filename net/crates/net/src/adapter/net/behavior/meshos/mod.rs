@@ -136,7 +136,10 @@ pub use probes::{
 pub use reconcile::{reconcile, STOP_GRACE_PERIOD};
 pub use redex_appenders::{RedexAdminAuditAppender, RedexFailureAppender, RedexLogAppender};
 pub use runtime::{MeshOsRuntime, MeshOsRuntimeBuilder, RuntimeShutdownError, RuntimeStats};
-pub use scheduler::{PlacementScorer, SchedulerConfig, SchedulerRegistry};
+pub use scheduler::{
+    LocalScheduler, MigrationCost, MigrationCostModel, PlacementScorer, SchedulerConfig,
+    SchedulerRegistry, ScoreHistory, ScoreSnapshot, SnapshotScorer, Trend,
+};
 pub use sdk::{
     DaemonControlRouter, MaintenanceStateView, MeshOsDaemonHandle, MeshOsDaemonSdk, MetadataView,
     SdkError, SdkRoutingDispatcher, DEFAULT_CONTROL_CHANNEL_CAPACITY, DEFAULT_GRACEFUL_SHUTDOWN,

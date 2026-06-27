@@ -471,12 +471,16 @@ fn diff_scheduler(
         return;
     };
 
-    // Sort chain ids for byte-stable action ordering across
-    // reconcile calls regardless of HashMap iteration.
-    let mut chains: Vec<ChainId> = actual.replicas.keys().copied().collect();
-    chains.sort();
+    // Accumulate eviction candidates, then sort by chain id before
+    // emitting so output stays byte-stable across reconcile calls
+    // regardless of HashMap iteration order. Scoring is
+    // side-effect-free, so we iterate `replicas` in native order
+    // and pay the sort only on the (rare) emissions — not an
+    // O(C log C) sort of the whole chain set on every tick, most
+    // of which emit nothing.
+    let mut candidates: Vec<(ChainId, NodeId)> = Vec::new();
 
-    for chain in chains {
+    for (&chain, holders) in &actual.replicas {
         // Skip chains the Phase C count-driven arm already
         // evicted from this tick — one eviction per chain per
         // tick is the safety budget.
@@ -493,39 +497,100 @@ fn diff_scheduler(
                 continue;
             }
         }
-        let holders: Vec<NodeId> = match actual.replicas.get(&chain) {
-            Some(h) if !h.is_empty() => h.iter().copied().collect(),
-            _ => continue,
-        };
-        // Pick the lowest-scoring holder. Use total_cmp on f32
-        // so NaN doesn't surprise us; treat None as "no score
-        // → skip this holder."
+        if holders.is_empty() {
+            continue;
+        }
+        // Pick the lowest-scoring holder. A `None` score means "no
+        // opinion → skip this holder"; a NaN score is treated the
+        // same, because it can't be a meaningful placement score and
+        // every `<` comparison against NaN is false — leaving a NaN
+        // holder to pin `worst` (and slip past the `>= score_floor`
+        // check, which is also false for NaN) would evict an arbitrary
+        // holder on garbage input. Iterate the holder `BTreeSet`
+        // directly (sorted order, so tie-breaking on the lowest NodeId
+        // is unchanged) — the `Vec` for `best_alternative` is
+        // materialized only on the rare sub-floor path below.
         let mut worst: Option<(NodeId, f32)> = None;
-        for &h in &holders {
+        for &h in holders {
             let Some(score) = scorer.score(chain, h) else {
                 continue;
             };
+            if score.is_nan() {
+                continue;
+            }
             worst = match worst {
                 None => Some((h, score)),
                 Some((_, ws)) if score < ws => Some((h, score)),
                 _ => worst,
             };
         }
-        let Some((victim, victim_score)) = worst else {
+        let Some((victim, snapshot_score)) = worst else {
+            continue;
+        };
+        if snapshot_score >= config.score_floor {
+            // No holder is below the floor (per the sampled scores) —
+            // leave the chain alone without paying for a live re-score.
+            continue;
+        }
+        // The snapshot score that selected this victim may be stale: a
+        // clean chain retains its prior sample for up to
+        // `decision_interval` while `best_alternative` below is always
+        // live. Re-confirm the victim's score live before paying for the
+        // alternative search or committing an eviction, so a holder that
+        // has recovered above the floor since its last sample isn't
+        // evicted on a stale low score — and so the hysteresis gap is
+        // measured against a fresh victim score, not a stale one. This is
+        // one live score of a single node on the rare sub-floor path, so
+        // the steady-state zero-scoring property holds. (For a plain,
+        // un-snapshotted scorer `live_score` == `score`, a no-op there.)
+        let Some(victim_score) = scorer.live_score(chain, victim).filter(|s| !s.is_nan()) else {
             continue;
         };
         if victim_score >= config.score_floor {
-            // No holder is below the floor — leave the chain
-            // alone.
             continue;
         }
-        // Check there's a better alternative.
-        let Some((_alt_node, alt_score)) = scorer.best_alternative(chain, &holders) else {
+        // A holder is still below the floor — only now do we pay for the
+        // exclude slice + the capability-index query inside
+        // `best_alternative`.
+        let exclude: Vec<NodeId> = holders.iter().copied().collect();
+        let Some((alt_node, alt_score)) = scorer.best_alternative(chain, &exclude) else {
             continue;
         };
-        if alt_score - victim_score <= config.hysteresis_gap {
+        let score_gain = alt_score - victim_score;
+        if score_gain <= config.hysteresis_gap {
             continue;
         }
+        // Phase 3 net-benefit gate: if the scorer can estimate the
+        // migration cost, require the score gain to exceed its
+        // score-equivalent. A cheap hysteresis-clearing move still
+        // gets vetoed when the migration would cost more than it buys.
+        // No estimate (`None`) → the hysteresis gap alone decides.
+        //
+        // Approximation: the cost is estimated for `alt_node`, the best
+        // alternative, but this arm only emits `RequestEviction` — the
+        // refill is two-stage (Phase C observes the holder-count drop next
+        // tick and emits an *untargeted* `RequestPlacement`, so the
+        // dispatcher re-picks the destination). The actual landing node may
+        // therefore differ from `alt_node`. We use the best alternative as
+        // the proxy target because Phase C refill scores candidates with
+        // the same placement logic, so it lands on a comparably-good node;
+        // `alt_node` is the optimistic (lowest-cost) estimate. Pinning the
+        // refill target through the eviction→placement handshake is
+        // deferred (Phase 4, MESH_SCHEDULER_IMPL_PLAN.md) — until then this
+        // gate is a best-effort damper, not an exact per-target accounting.
+        if let Some(cost) = scorer.migration_cost(chain, alt_node) {
+            let cost_score = config.cost_model.score_equivalent(&cost);
+            if score_gain - cost_score <= 0.0 {
+                continue;
+            }
+        }
+        candidates.push((chain, victim));
+    }
+
+    // One victim per chain, so sorting by chain id is a total
+    // order — reproduces the prior sorted-emission contract.
+    candidates.sort_by_key(|&(chain, _)| chain);
+    for (chain, victim) in candidates {
         out.push(MeshOsAction::RequestEviction { chain, victim });
     }
 }
@@ -1875,27 +1940,10 @@ mod tests {
 
     // ----- Phase D-1: scheduler arm -----
 
-    /// Test-only scorer with a fixed score-table + alternative
-    /// lookup. The reconcile tests build one per case so the
-    /// emission contract is fully observable.
-    struct FixedScorer {
-        scores: std::collections::HashMap<(ChainId, NodeId), f32>,
-        alternatives: std::collections::HashMap<ChainId, (NodeId, f32)>,
-    }
-
-    impl super::super::scheduler::PlacementScorer for FixedScorer {
-        fn score(&self, chain: ChainId, node: NodeId) -> Option<f32> {
-            self.scores.get(&(chain, node)).copied()
-        }
-        fn best_alternative(&self, chain: ChainId, exclude: &[NodeId]) -> Option<(NodeId, f32)> {
-            let (n, s) = self.alternatives.get(&chain).copied()?;
-            if exclude.contains(&n) {
-                None
-            } else {
-                Some((n, s))
-            }
-        }
-    }
+    /// Shared test scorer with a fixed score-table + alternative lookup,
+    /// defined once in the scheduler module (the reconcile tests build one
+    /// per case so the emission contract is fully observable).
+    use super::super::scheduler::FixedScorer;
 
     fn scheduler_call(
         actual: &MeshOsState,
@@ -2153,6 +2201,435 @@ mod tests {
             }
             other => panic!("expected one RequestEviction(11), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn nan_score_holder_is_skipped_not_picked_as_victim() {
+        // A NaN score is "no opinion," not the lowest score. Holder 11
+        // (lower NodeId, so scored first) returns NaN; the real sub-floor
+        // holder is 12. With a naive `<` compare a NaN holder pins `worst`
+        // (`0.3 < NaN` is false) and then slips past the `>= score_floor`
+        // gate (`NaN >= 0.5` is false), evicting the wrong node — this test
+        // pins that NaN is skipped and the victim is 12.
+        let mut actual = MeshOsState::default();
+        actual
+            .replicas
+            .insert(CHAIN_A, ::std::collections::BTreeSet::from([11, 12]));
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        let scorer = FixedScorer {
+            scores: [((CHAIN_A, 11), f32::NAN), ((CHAIN_A, 12), 0.3)]
+                .into_iter()
+                .collect(),
+            alternatives: [(CHAIN_A, (5, 0.9))].into_iter().collect(),
+        };
+        match scheduler_call(&actual, Some(&scorer)).as_slice() {
+            [MeshOsAction::RequestEviction { chain, victim }] => {
+                assert_eq!(*chain, CHAIN_A);
+                assert_eq!(*victim, 12, "NaN holder 11 must be skipped; victim is 12");
+            }
+            other => panic!("expected one RequestEviction(12), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_nan_scores_emit_no_eviction() {
+        // A holder whose only score is NaN is no usable opinion → the chain
+        // has no victim and nothing is emitted (no garbage eviction).
+        let mut actual = MeshOsState::default();
+        actual
+            .replicas
+            .insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        let scorer = FixedScorer {
+            scores: [((CHAIN_A, THIS_NODE), f32::NAN)].into_iter().collect(),
+            alternatives: [(CHAIN_A, (5, 0.9))].into_iter().collect(),
+        };
+        assert!(
+            scheduler_call(&actual, Some(&scorer)).is_empty(),
+            "a holder with only a NaN score must not be evicted",
+        );
+    }
+
+    /// Scorer for the Phase 3 net-benefit tests: a single under-scoring
+    /// holder, a strong alternative, and a configurable migration cost.
+    struct CostScorer {
+        victim_score: f32,
+        alt: (NodeId, f32),
+        cost: Option<super::super::scheduler::MigrationCost>,
+    }
+
+    impl super::super::scheduler::PlacementScorer for CostScorer {
+        fn score(&self, _chain: ChainId, _node: NodeId) -> Option<f32> {
+            Some(self.victim_score)
+        }
+        fn best_alternative(&self, _chain: ChainId, exclude: &[NodeId]) -> Option<(NodeId, f32)> {
+            if exclude.contains(&self.alt.0) {
+                None
+            } else {
+                Some(self.alt)
+            }
+        }
+        fn migration_cost(
+            &self,
+            _chain: ChainId,
+            _target: NodeId,
+        ) -> Option<super::super::scheduler::MigrationCost> {
+            self.cost.clone()
+        }
+    }
+
+    #[test]
+    fn net_benefit_gate_suppresses_costly_migration() {
+        // Gap = 0.9 - 0.3 = 0.6, well past hysteresis (0.2). But the
+        // migration disrupts for 100 s → cost_score = 0.1 * 100 = 10.0,
+        // dwarfing the 0.6 gain → net benefit negative → no eviction.
+        let mut actual = MeshOsState::default();
+        actual
+            .replicas
+            .insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        let scorer = CostScorer {
+            victim_score: 0.3,
+            alt: (5, 0.9),
+            cost: Some(super::super::scheduler::MigrationCost {
+                disruption: ::std::time::Duration::from_secs(100),
+                reliability_factor: 1.0,
+                ..Default::default()
+            }),
+        };
+        assert!(
+            scheduler_call(&actual, Some(&scorer)).is_empty(),
+            "a migration costing more than it buys must be vetoed",
+        );
+    }
+
+    #[test]
+    fn net_benefit_gate_allows_cheap_migration() {
+        // Same scores, but a cheap migration (0.1 s transfer →
+        // cost_score = 0.01) leaves the 0.6 gain intact → eviction emits.
+        let mut actual = MeshOsState::default();
+        actual
+            .replicas
+            .insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        let scorer = CostScorer {
+            victim_score: 0.3,
+            alt: (5, 0.9),
+            cost: Some(super::super::scheduler::MigrationCost {
+                state_transfer: ::std::time::Duration::from_millis(100),
+                reliability_factor: 1.0,
+                ..Default::default()
+            }),
+        };
+        assert_eq!(
+            scheduler_call(&actual, Some(&scorer)),
+            vec![MeshOsAction::RequestEviction {
+                chain: CHAIN_A,
+                victim: THIS_NODE,
+            }],
+            "a cheap migration that clears the gap must proceed",
+        );
+    }
+
+    #[test]
+    fn net_benefit_gate_boundary_tracks_cost_magnitude() {
+        // `allows_cheap_migration` above would still pass with the whole
+        // Phase 3 block deleted (the hysteresis gap alone emits), so it
+        // doesn't actually exercise the gate. This test pins the net-benefit
+        // arithmetic by sweeping the cost across the score gain and asserting
+        // the outcome flips. Gap = 0.9 - 0.3 = 0.6 (past hysteresis 0.2);
+        // with the default model (cost_per_sec 0.1, reliability 1.0) the
+        // cost_score is 0.1 * secs, so the migration emits iff 0.6 - cost > 0.
+        let mut actual = MeshOsState::default();
+        actual
+            .replicas
+            .insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+
+        let outcome = |secs: u64| {
+            let scorer = CostScorer {
+                victim_score: 0.3,
+                alt: (5, 0.9),
+                cost: Some(super::super::scheduler::MigrationCost {
+                    state_transfer: ::std::time::Duration::from_secs(secs),
+                    reliability_factor: 1.0,
+                    ..Default::default()
+                }),
+            };
+            scheduler_call(&actual, Some(&scorer))
+        };
+
+        // cost_score ≈ 0.5 < gain 0.6 → net positive → emits.
+        assert_eq!(
+            outcome(5),
+            vec![MeshOsAction::RequestEviction {
+                chain: CHAIN_A,
+                victim: THIS_NODE,
+            }],
+            "cost below the gain must allow the migration",
+        );
+        // cost_score ≈ 0.6 ≳ gain → net ≤ 0 → suppressed.
+        assert!(
+            outcome(6).is_empty(),
+            "cost at the gain boundary must be suppressed",
+        );
+        // cost_score ≈ 0.7 > gain 0.6 → net negative → suppressed.
+        assert!(
+            outcome(7).is_empty(),
+            "cost above the gain must be suppressed",
+        );
+    }
+
+    #[test]
+    fn snapshot_backed_scorer_matches_raw_scorer_decision() {
+        // Phase 1 (MESH_SCHEDULER_IMPL_PLAN.md): the loop now samples
+        // scores into a snapshot and hands `reconcile` a
+        // `SnapshotScorer` instead of the live scorer. This proves the
+        // snapshot path reaches the identical decision as scoring the
+        // raw scorer inline — the property the loop split rests on.
+        use super::super::scheduler::{LocalScheduler, SnapshotScorer};
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base);
+        actual
+            .replicas
+            .insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE, 11]));
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        let raw = FixedScorer {
+            scores: [((CHAIN_A, THIS_NODE), 0.3), ((CHAIN_A, 11), 0.7)]
+                .into_iter()
+                .collect(),
+            alternatives: [(CHAIN_A, (5, 0.9))].into_iter().collect(),
+        };
+        // Decision via the raw scorer (what the other arm tests use).
+        let raw_actions = scheduler_call(&actual, Some(&raw));
+        // Decision via the loop path: sample → snapshot → wrap → decide.
+        let mut ls = LocalScheduler::new();
+        let now = actual.last_tick.unwrap();
+        let snap = ls.sample(
+            &actual.replicas,
+            &actual.replica_leader,
+            THIS_NODE,
+            &raw,
+            now,
+            ::std::time::Duration::from_secs(30),
+        );
+        let snap_scorer = SnapshotScorer::new(snap, &raw);
+        let snap_actions = scheduler_call(&actual, Some(&snap_scorer));
+
+        assert_eq!(
+            raw_actions, snap_actions,
+            "snapshot path must match raw path"
+        );
+        assert_eq!(
+            raw_actions,
+            vec![MeshOsAction::RequestEviction {
+                chain: CHAIN_A,
+                victim: THIS_NODE,
+            }],
+        );
+        // The sidecar recorded the worst holder's score (0.3, not 0.7).
+        assert!((ls.history(CHAIN_A).unwrap().current() - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sampler_snapshot_is_per_chain_correct_and_isolated() {
+        // Discriminating coverage for the snapshot machinery (the prior
+        // equivalence test samples from the same scorer it compares against,
+        // so it can't catch a mis-keyed set_chain or a wrong get). Two led
+        // chains with distinct holders/scores: prove each score lands in its
+        // own (chain, holder) cell, the worst-holder history is per chain,
+        // and one chain's holders never leak into another's scores. A bug in
+        // set_chain keying, get lookup, or worst tracking flips an assertion.
+        use super::super::scheduler::LocalScheduler;
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base);
+        actual
+            .replicas
+            .insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE, 11]));
+        actual
+            .replicas
+            .insert(CHAIN_B, ::std::collections::BTreeSet::from([THIS_NODE, 12]));
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        actual.replica_leader.insert(CHAIN_B, THIS_NODE);
+        let scorer = FixedScorer {
+            scores: [
+                ((CHAIN_A, THIS_NODE), 0.30),
+                ((CHAIN_A, 11), 0.70),
+                ((CHAIN_B, THIS_NODE), 0.80),
+                ((CHAIN_B, 12), 0.55),
+            ]
+            .into_iter()
+            .collect(),
+            alternatives: ::std::collections::HashMap::new(),
+        };
+        let mut ls = LocalScheduler::new();
+        let snap = ls.sample(
+            &actual.replicas,
+            &actual.replica_leader,
+            THIS_NODE,
+            &scorer,
+            base,
+            ::std::time::Duration::from_secs(30),
+        );
+
+        // Every sampled cell maps to its own value.
+        assert_eq!(snap.get(CHAIN_A, THIS_NODE), Some(0.30));
+        assert_eq!(snap.get(CHAIN_A, 11), Some(0.70));
+        assert_eq!(snap.get(CHAIN_B, THIS_NODE), Some(0.80));
+        assert_eq!(snap.get(CHAIN_B, 12), Some(0.55));
+        // No cross-chain leakage: a chain only carries its own holders.
+        assert_eq!(
+            snap.get(CHAIN_A, 12),
+            None,
+            "chain B's holder must not appear under chain A",
+        );
+        assert_eq!(
+            snap.get(CHAIN_B, 11),
+            None,
+            "chain A's holder must not appear under chain B",
+        );
+        assert_eq!(
+            snap.len(),
+            4,
+            "exactly the four sampled (chain,holder) cells"
+        );
+        // Worst-holder history is tracked per chain.
+        assert!((ls.history(CHAIN_A).unwrap().current() - 0.30).abs() < 1e-6);
+        assert!((ls.history(CHAIN_B).unwrap().current() - 0.55).abs() < 1e-6);
+    }
+
+    /// Scorer with a constant per-node fingerprint (so a chain stays "clean"
+    /// and its snapshot is retained) but a *live* score that can drift after
+    /// sampling — models the RTT-style drift the fingerprint doesn't capture.
+    struct DriftScorer {
+        fp: u64,
+        live_bits: ::std::sync::atomic::AtomicU32,
+        alt: (NodeId, f32),
+    }
+
+    impl DriftScorer {
+        fn new(score: f32, fp: u64, alt: (NodeId, f32)) -> Self {
+            Self {
+                fp,
+                live_bits: ::std::sync::atomic::AtomicU32::new(score.to_bits()),
+                alt,
+            }
+        }
+        fn set_live(&self, score: f32) {
+            self.live_bits
+                .store(score.to_bits(), ::std::sync::atomic::Ordering::Relaxed);
+        }
+        fn live(&self) -> f32 {
+            f32::from_bits(self.live_bits.load(::std::sync::atomic::Ordering::Relaxed))
+        }
+    }
+
+    impl super::super::scheduler::PlacementScorer for DriftScorer {
+        fn score(&self, _chain: ChainId, _node: NodeId) -> Option<f32> {
+            Some(self.live())
+        }
+        fn best_alternative(&self, _chain: ChainId, exclude: &[NodeId]) -> Option<(NodeId, f32)> {
+            if exclude.contains(&self.alt.0) {
+                None
+            } else {
+                Some(self.alt)
+            }
+        }
+        fn node_fingerprint(&self, _node: NodeId) -> Option<u64> {
+            Some(self.fp)
+        }
+    }
+
+    #[test]
+    fn clean_chain_does_not_evict_on_stale_snapshot_after_live_recovery() {
+        // I1: a clean chain (stable fingerprint) retains its prior sampled
+        // score, but the victim's live score has since recovered above the
+        // floor. The decision arm must re-confirm the victim live and NOT
+        // evict on the stale low snapshot score. Without the live re-confirm
+        // this emits a spurious eviction.
+        use super::super::scheduler::{LocalScheduler, SnapshotScorer};
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base);
+        actual
+            .replicas
+            .insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+
+        let scorer = DriftScorer::new(0.3, 7, (5, 0.9));
+        let mut ls = LocalScheduler::new();
+        let interval = ::std::time::Duration::from_secs(30);
+
+        // T0: sample the victim at 0.3 (sub-floor) into the snapshot.
+        ls.sample(
+            &actual.replicas,
+            &actual.replica_leader,
+            THIS_NODE,
+            &scorer,
+            base,
+            interval,
+        );
+        // Live score recovers to 0.8; fingerprint unchanged → chain stays
+        // clean → the snapshot still reports the stale 0.3.
+        scorer.set_live(0.8);
+        let snap = ls.sample(
+            &actual.replicas,
+            &actual.replica_leader,
+            THIS_NODE,
+            &scorer,
+            base + ::std::time::Duration::from_secs(1),
+            interval,
+        );
+        assert_eq!(
+            snap.get(CHAIN_A, THIS_NODE),
+            Some(0.3),
+            "snapshot must retain the stale score for a clean chain",
+        );
+
+        let snap_scorer = SnapshotScorer::new(snap, &scorer);
+        assert!(
+            scheduler_call(&actual, Some(&snap_scorer)).is_empty(),
+            "a victim that recovered above the floor must not be evicted on a stale score",
+        );
+    }
+
+    #[test]
+    fn clean_chain_still_evicts_when_live_confirms_sub_floor() {
+        // Companion to the above: when the live re-confirm agrees the victim
+        // is still sub-floor, the eviction proceeds — the live check only
+        // suppresses recovered victims, it doesn't block real migrations.
+        use super::super::scheduler::{LocalScheduler, SnapshotScorer};
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base);
+        actual
+            .replicas
+            .insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+
+        let scorer = DriftScorer::new(0.3, 7, (5, 0.9));
+        let mut ls = LocalScheduler::new();
+        let interval = ::std::time::Duration::from_secs(30);
+        let snap = ls.sample(
+            &actual.replicas,
+            &actual.replica_leader,
+            THIS_NODE,
+            &scorer,
+            base,
+            interval,
+        );
+        // Live stays sub-floor (0.3) — eviction should proceed.
+        let snap_scorer = SnapshotScorer::new(snap, &scorer);
+        assert_eq!(
+            scheduler_call(&actual, Some(&snap_scorer)),
+            vec![MeshOsAction::RequestEviction {
+                chain: CHAIN_A,
+                victim: THIS_NODE,
+            }],
+            "a victim that is still sub-floor live must be evicted",
+        );
     }
 
     #[test]

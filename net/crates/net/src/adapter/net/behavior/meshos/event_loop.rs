@@ -121,6 +121,13 @@ pub struct MeshOsLoop {
     /// after `run()`.
     scheduler: SchedulerRegistry,
 
+    /// Phase 1 drift-scorer sidecar (MESH_SCHEDULER_IMPL_PLAN.md).
+    /// Owns the loop-side `ScoreHistory` and samples the per-tick
+    /// `ScoreSnapshot` the reconcile decision arm reads through a
+    /// `SnapshotScorer`. Lives here, never in the fold: placement
+    /// scores are live observations, not committed events.
+    local_scheduler: super::scheduler::LocalScheduler,
+
     /// X-13 recovery registry — pluggable per-tick recovery
     /// handlers for groups whose slots were marked unhealthy
     /// after a placement failure. The tick handler calls
@@ -602,6 +609,7 @@ impl MeshOsLoop {
             recent_emissions: Vec::new(),
             probes: ProbeRegistryInner::default(),
             scheduler: SchedulerRegistry::new(),
+            local_scheduler: super::scheduler::LocalScheduler::new(),
             recovery_registry: crate::adapter::net::compute::RecoveryRegistry::new(),
             reconcile_count: 0,
             admin_audit_seq: 0,
@@ -1530,7 +1538,27 @@ impl MeshOsLoop {
             .actual
             .last_tick
             .unwrap_or_else(std::time::Instant::now);
+        // Phase 1 (MESH_SCHEDULER_IMPL_PLAN.md): when a scorer is
+        // installed, sample placement scores loop-side (recording
+        // ScoreHistory) and wrap them in a snapshot-backed scorer. The
+        // per-holder scoring happens here — gateable by cadence +
+        // dirty-bits in Phase 2 — instead of live inside the pure
+        // reconcile pass; the rare candidate search (best_alternative)
+        // still hits the live index via SnapshotScorer's delegation.
+        // With no scorer installed the option is `None` and the
+        // scheduler arm is a no-op.
         let scorer = self.scheduler.current();
+        let snap_scorer = scorer.as_deref().map(|live| {
+            let snapshot = self.local_scheduler.sample(
+                &self.actual.replicas,
+                &self.actual.replica_leader,
+                self.config.this_node,
+                live,
+                now,
+                self.config.scheduler.decision_interval,
+            );
+            super::scheduler::SnapshotScorer::new(snapshot, live)
+        });
         let actions = reconcile(
             &self.actual,
             &self.desired,
@@ -1538,7 +1566,9 @@ impl MeshOsLoop {
             &self.config.locality,
             &self.config.maintenance,
             &self.config.scheduler,
-            scorer.as_deref(),
+            snap_scorer
+                .as_ref()
+                .map(|s| s as &dyn super::scheduler::PlacementScorer),
         );
         // Record cooldowns for any RequestEviction we emit so
         // the same chain doesn't flap on the next tick; track
