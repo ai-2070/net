@@ -565,6 +565,19 @@ fn diff_scheduler(
         // score-equivalent. A cheap hysteresis-clearing move still
         // gets vetoed when the migration would cost more than it buys.
         // No estimate (`None`) → the hysteresis gap alone decides.
+        //
+        // Approximation: the cost is estimated for `alt_node`, the best
+        // alternative, but this arm only emits `RequestEviction` — the
+        // refill is two-stage (Phase C observes the holder-count drop next
+        // tick and emits an *untargeted* `RequestPlacement`, so the
+        // dispatcher re-picks the destination). The actual landing node may
+        // therefore differ from `alt_node`. We use the best alternative as
+        // the proxy target because Phase C refill scores candidates with
+        // the same placement logic, so it lands on a comparably-good node;
+        // `alt_node` is the optimistic (lowest-cost) estimate. Pinning the
+        // refill target through the eviction→placement handshake is
+        // deferred (Phase 4, MESH_SCHEDULER_IMPL_PLAN.md) — until then this
+        // gate is a best-effort damper, not an exact per-target accounting.
         if let Some(cost) = scorer.migration_cost(chain, alt_node) {
             let cost_score = config.cost_model.score_equivalent(&cost);
             if score_gain - cost_score <= 0.0 {

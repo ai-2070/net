@@ -188,6 +188,14 @@ emit RequestEviction only if net_benefit > 0
 For a claim-pinned daemon, consult `MigrationEligible::check` first; a held claim vetoes the
 eviction (it's invisible to the scorer by construction anyway — Integration plan Decision 2).
 
+**Cost-target approximation.** The cost is estimated for `best_alternative`'s winner, but the
+two-stage execution emits an *untargeted* `RequestEviction` → Phase C refill (`RequestPlacement`
+with no pinned target), so the daemon may actually land elsewhere. We use the best alternative as the
+proxy target because Phase C scores candidates with the same placement logic and lands on a
+comparably-good node; `alt_node` is the optimistic (lowest-cost) estimate, making this gate a
+best-effort damper rather than exact per-target accounting. Pinning the refill target through the
+eviction→placement handshake is deferred to Phase 4.
+
 **Tests:** cost monotonic in each dimension; high-`service_value` daemon needs a bigger gap to move;
 net-benefit gate suppresses a marginal migration the hysteresis gap alone would allow; claim-holder
 never emits.
@@ -210,8 +218,13 @@ replica-rebalancing workload; don't build speculatively.
   preserves the I3 contract that two replays of the same event stream converge.
 - **Dirty false-negative → staleness.** Mitigated structurally by the Phase-2 coarse backstop: a
   missed dirty signal costs at most one `decision_interval` of staleness, never permanent.
-- **Snapshot/decision skew.** Scores sampled at tick T drive the decision at tick T; no async gap
-  (same `run_reconcile` body). No mid-tick staleness window.
+- **Snapshot/decision skew.** Within a tick there is no async gap (sampling and decision share the
+  `run_reconcile` body). *Across* ticks, though, the dirty-gate intentionally retains a clean chain's
+  scores for up to `decision_interval`, so a victim's sampled score can lag a live recovery that the
+  fingerprint doesn't capture (e.g. RTT drift) while `best_alternative` is always live. To keep that
+  skew from triggering a spurious eviction, `diff_scheduler` re-confirms the chosen victim **live**
+  (`PlacementScorer::live_score`) on the rare sub-floor candidate path before applying the floor /
+  hysteresis checks — one node, only when a candidate is found, so steady-state zero-scoring holds.
 - **Thrash.** Unchanged guards apply: hysteresis gap + `last_rebalance` cooldown + (design doc)
   oscillation auto-pin. Phase 3's net-benefit gate further damps marginal moves.
 - **Don't over-store history.** See Phase 1 sizing note; bounded ring + EWMA, not the design doc's
