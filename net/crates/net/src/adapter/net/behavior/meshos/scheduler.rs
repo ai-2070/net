@@ -615,13 +615,16 @@ impl LocalScheduler {
     /// A holder added/removed, or any holder's inputs moving, changes the
     /// result. `None` if any holder is un-fingerprintable (→ always dirty).
     fn chain_fingerprint(scorer: &dyn PlacementScorer, holders: &BTreeSet<NodeId>) -> Option<u64> {
-        // FNV-1a-style fold; order-independent inputs but holders iterate in
-        // BTreeSet (sorted) order, so the fold is itself deterministic.
-        let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
+        // FNV-1a fold (shared helper) over each holder's id and its
+        // node_fingerprint. The fold is order-sensitive, so it relies on
+        // `holders` being a `BTreeSet` (sorted iteration) to stay
+        // deterministic across calls.
+        use super::super::hash::{fnv1a_step, FNV1A_OFFSET};
+        let mut acc = FNV1A_OFFSET;
         for &h in holders {
             let fp = scorer.node_fingerprint(h)?;
-            acc = (acc ^ h).wrapping_mul(0x0000_0100_0000_01b3);
-            acc = (acc ^ fp).wrapping_mul(0x0000_0100_0000_01b3);
+            acc = fnv1a_step(acc, h);
+            acc = fnv1a_step(acc, fp);
         }
         Some(acc)
     }

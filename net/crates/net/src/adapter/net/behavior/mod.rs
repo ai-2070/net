@@ -32,6 +32,7 @@ pub mod diff;
 pub mod fold;
 pub mod gang;
 pub mod group;
+pub(crate) mod hash;
 pub mod lifecycle;
 pub mod loadbalance;
 #[cfg(feature = "meshdb")]

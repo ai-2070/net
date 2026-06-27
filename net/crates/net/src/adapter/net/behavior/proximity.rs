@@ -1059,33 +1059,16 @@ fn hash_capabilities(caps: &CapabilitySet) -> u64 {
     let views = caps.views();
     let hw = views.hardware();
 
-    // Simple FNV-1a hash of key capability fields
-    let mut hash: u64 = 0xcbf29ce484222325;
-
-    // Hash hardware memory
-    hash ^= hw.memory_gb as u64;
-    hash = hash.wrapping_mul(0x100000001b3);
-
-    // Hash GPU presence
-    hash ^= if hw.gpu.is_some() { 1 } else { 0 };
-    hash = hash.wrapping_mul(0x100000001b3);
-
-    // Hash accelerator count
-    hash ^= hw.accelerators.len() as u64;
-    hash = hash.wrapping_mul(0x100000001b3);
-
-    // Hash tool count
-    hash ^= views.tools().len() as u64;
-    hash = hash.wrapping_mul(0x100000001b3);
-
-    // Hash model count
-    hash ^= views.models().len() as u64;
-    hash = hash.wrapping_mul(0x100000001b3);
-
-    // Hash tag count
-    hash ^= caps.tags.len() as u64;
-    hash = hash.wrapping_mul(0x100000001b3);
-
+    // FNV-1a hash of key capability fields (shared helper; byte shape
+    // intentionally unchanged — see the module note above).
+    use super::hash::{fnv1a_step, FNV1A_OFFSET};
+    let mut hash = FNV1A_OFFSET;
+    hash = fnv1a_step(hash, hw.memory_gb as u64); // hardware memory
+    hash = fnv1a_step(hash, if hw.gpu.is_some() { 1 } else { 0 }); // GPU presence
+    hash = fnv1a_step(hash, hw.accelerators.len() as u64); // accelerator count
+    hash = fnv1a_step(hash, views.tools().len() as u64); // tool count
+    hash = fnv1a_step(hash, views.models().len() as u64); // model count
+    hash = fnv1a_step(hash, caps.tags.len() as u64); // tag count
     hash
 }
 

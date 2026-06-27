@@ -1521,13 +1521,10 @@ impl LoadBalancer {
     }
 
     fn hash_key(&self, key: &str) -> u64 {
-        // Simple FNV-1a hash
-        let mut hash: u64 = 0xcbf29ce484222325;
-        for byte in key.bytes() {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        hash
+        // FNV-1a over the key bytes (shared helper).
+        key.bytes().fold(super::hash::FNV1A_OFFSET, |acc, byte| {
+            super::hash::fnv1a_step(acc, byte as u64)
+        })
     }
 
     /// Get statistics
