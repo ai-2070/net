@@ -61,5 +61,6 @@ DEBUG_*.md
 
 # Hermes
 hermes/
+hermes-agent/
 .cocoindex_code/
 .codegraph/
