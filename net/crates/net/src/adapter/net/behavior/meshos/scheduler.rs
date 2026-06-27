@@ -603,10 +603,20 @@ impl LocalScheduler {
 
         // Drop all per-chain state for chains we no longer lead so the sidecar
         // stays bounded by the led-chain count, not the all-time chain count.
-        self.current.retain_chains(|c| led.contains(&c));
-        self.history.retain(|c, _| led.contains(c));
-        self.last_fingerprint.retain(|c, _| led.contains(c));
-        self.last_sampled.retain(|c, _| led.contains(c));
+        // This GC is only needed when a previously-tracked chain fell out of
+        // leadership. Every led chain ends with a `last_sampled` entry (it was
+        // either sampled this tick or sampled on an earlier tick — a chain with
+        // no entry is always backstop-due, so it gets sampled), and a chain we
+        // no longer lead is skipped before `led.insert`, leaving its entry
+        // behind. So `last_sampled` ⊇ `led` always, and a size mismatch is
+        // exactly the "membership shrank" signal — in the steady state
+        // (unchanged leadership) this skips four full map scans per tick.
+        if self.last_sampled.len() != led.len() {
+            self.current.retain_chains(|c| led.contains(&c));
+            self.history.retain(|c, _| led.contains(c));
+            self.last_fingerprint.retain(|c, _| led.contains(c));
+            self.last_sampled.retain(|c, _| led.contains(c));
+        }
         &self.current
     }
 
@@ -835,6 +845,43 @@ mod tests {
         assert_eq!(ls.tracked_len(), 1);
         assert!(ls.history(2).is_none(), "dropped chain is GC'd");
         assert!(ls.history(1).is_some());
+    }
+
+    #[test]
+    fn losing_leadership_gcs_snapshot_too_not_just_history() {
+        // The membership-delta gate must GC *every* sidecar map (the snapshot
+        // included), not just history, when a chain drops out of leadership.
+        let this: NodeId = 100;
+        let scorer = FixedScorer {
+            scores: [((1, 100), 0.4), ((2, 100), 0.5)].into_iter().collect(),
+            alternatives: HashMap::new(),
+        };
+        let mut ls = LocalScheduler::new();
+        let mut replicas: HashMap<ChainId, BTreeSet<NodeId>> = HashMap::new();
+        replicas.insert(1, BTreeSet::from([100]));
+        replicas.insert(2, BTreeSet::from([100]));
+        let mut leader: HashMap<ChainId, NodeId> = HashMap::new();
+        leader.insert(1, this);
+        leader.insert(2, this);
+        let interval = Duration::from_secs(30);
+        let t0 = Instant::now();
+        let snap = ls.sample(&replicas, &leader, this, &scorer, t0, interval);
+        assert_eq!(snap.get(2, 100), Some(0.5));
+
+        // Drop leadership of chain 2 → its snapshot entry must be GC'd, while
+        // the still-led chain 1 is retained.
+        leader.insert(2, 999);
+        let snap = ls.sample(
+            &replicas,
+            &leader,
+            this,
+            &scorer,
+            t0 + Duration::from_secs(1),
+            interval,
+        );
+        assert_eq!(snap.get(2, 100), None, "dropped chain's snapshot entry is GC'd");
+        assert_eq!(snap.get(1, 100), Some(0.4), "still-led chain is retained");
+        assert!(ls.history(2).is_none());
     }
 
     // ----- Phase 2: dirty-gate + coarse backstop -----
