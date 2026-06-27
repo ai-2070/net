@@ -1,0 +1,32 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_06_27_MESH_SCHEDULER_DRIFT_SCORER.md
+  s_22b9063ec56e89::t_702404bd4ee688 196-202
+  s_22b9063ec56e89::t_5149fd551ad0e0 286-291
+  s_22b9063ec56e89::t_7fa090433096ae 164-172
+  s_22b9063ec56e89::t_093d65467a9183 381-384
+  s_22b9063ec56e89::t_dd4ff8d039a0bb 334-339
+  s_22b9063ec56e89::t_eb96f8274ec165 410-433
+  s_22b9063ec56e89::t_c7183c03adadac 242-246
+  s_22b9063ec56e89::t_772a9f3ef26ba2 303-305
+  s_22b9063ec56e89::t_628d9f69bd0d32 118-123
+  s_22b9063ec56e89::t_1bbe382e89c0cd 222-226
+  s_22b9063ec56e89::t_519d54681c165b 317-321
+  s_22b9063ec56e89::t_25eb1db907c9d6 265-269
+  s_22b9063ec56e89::t_704de6254e2f26 351-354
+  s_22b9063ec56e89::t_8e239ee2912714 365-368
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "966130f2d192b9c4c96ea6b87167119bc9da57ee",
+  "prompts": {},
+  "sessions": {
+    "s_22b9063ec56e89": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "675ec343-2799-4708-9d68-c48f25333f3a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
