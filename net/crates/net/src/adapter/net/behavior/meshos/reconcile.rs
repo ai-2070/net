@@ -471,12 +471,16 @@ fn diff_scheduler(
         return;
     };
 
-    // Sort chain ids for byte-stable action ordering across
-    // reconcile calls regardless of HashMap iteration.
-    let mut chains: Vec<ChainId> = actual.replicas.keys().copied().collect();
-    chains.sort();
+    // Accumulate eviction candidates, then sort by chain id before
+    // emitting so output stays byte-stable across reconcile calls
+    // regardless of HashMap iteration order. Scoring is
+    // side-effect-free, so we iterate `replicas` in native order
+    // and pay the sort only on the (rare) emissions — not an
+    // O(C log C) sort of the whole chain set on every tick, most
+    // of which emit nothing.
+    let mut candidates: Vec<(ChainId, NodeId)> = Vec::new();
 
-    for chain in chains {
+    for (&chain, holders) in &actual.replicas {
         // Skip chains the Phase C count-driven arm already
         // evicted from this tick — one eviction per chain per
         // tick is the safety budget.
@@ -493,15 +497,17 @@ fn diff_scheduler(
                 continue;
             }
         }
-        let holders: Vec<NodeId> = match actual.replicas.get(&chain) {
-            Some(h) if !h.is_empty() => h.iter().copied().collect(),
-            _ => continue,
-        };
+        if holders.is_empty() {
+            continue;
+        }
         // Pick the lowest-scoring holder. Use total_cmp on f32
         // so NaN doesn't surprise us; treat None as "no score
-        // → skip this holder."
+        // → skip this holder." Iterate the holder `BTreeSet`
+        // directly (sorted order, so tie-breaking on the lowest
+        // NodeId is unchanged) — the `Vec` for `best_alternative`
+        // is materialized only on the rare sub-floor path below.
         let mut worst: Option<(NodeId, f32)> = None;
-        for &h in &holders {
+        for &h in holders {
             let Some(score) = scorer.score(chain, h) else {
                 continue;
             };
@@ -519,13 +525,23 @@ fn diff_scheduler(
             // alone.
             continue;
         }
-        // Check there's a better alternative.
-        let Some((_alt_node, alt_score)) = scorer.best_alternative(chain, &holders) else {
+        // A holder is below the floor — only now do we pay for the
+        // exclude slice + the capability-index query inside
+        // `best_alternative`.
+        let exclude: Vec<NodeId> = holders.iter().copied().collect();
+        let Some((_alt_node, alt_score)) = scorer.best_alternative(chain, &exclude) else {
             continue;
         };
         if alt_score - victim_score <= config.hysteresis_gap {
             continue;
         }
+        candidates.push((chain, victim));
+    }
+
+    // One victim per chain, so sorting by chain id is a total
+    // order — reproduces the prior sorted-emission contract.
+    candidates.sort_by_key(|&(chain, _)| chain);
+    for (chain, victim) in candidates {
         out.push(MeshOsAction::RequestEviction { chain, victim });
     }
 }
