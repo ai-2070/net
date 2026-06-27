@@ -2490,7 +2490,11 @@ mod tests {
             None,
             "chain A's holder must not appear under chain B",
         );
-        assert_eq!(snap.len(), 4, "exactly the four sampled (chain,holder) cells");
+        assert_eq!(
+            snap.len(),
+            4,
+            "exactly the four sampled (chain,holder) cells"
+        );
         // Worst-holder history is tracked per chain.
         assert!((ls.history(CHAIN_A).unwrap().current() - 0.30).abs() < 1e-6);
         assert!((ls.history(CHAIN_B).unwrap().current() - 0.55).abs() < 1e-6);

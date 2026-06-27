@@ -44,7 +44,11 @@ mod tests {
         };
         for seq in [&[1u64, 2, 3][..], &[][..], &[0, 255, 4096], &[u64::MAX, 0]] {
             let folded = seq.iter().fold(FNV1A_OFFSET, |acc, &v| fnv1a_step(acc, v));
-            assert_eq!(folded, reference(seq), "helper must match the open-coded fold");
+            assert_eq!(
+                folded,
+                reference(seq),
+                "helper must match the open-coded fold"
+            );
         }
     }
 

@@ -887,7 +887,11 @@ mod tests {
             t0 + Duration::from_secs(1),
             interval,
         );
-        assert_eq!(snap.get(2, 100), None, "dropped chain's snapshot entry is GC'd");
+        assert_eq!(
+            snap.get(2, 100),
+            None,
+            "dropped chain's snapshot entry is GC'd"
+        );
         assert_eq!(snap.get(1, 100), Some(0.4), "still-led chain is retained");
         assert!(ls.history(2).is_none());
     }
