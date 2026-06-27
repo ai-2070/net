@@ -500,17 +500,24 @@ fn diff_scheduler(
         if holders.is_empty() {
             continue;
         }
-        // Pick the lowest-scoring holder. Use total_cmp on f32
-        // so NaN doesn't surprise us; treat None as "no score
-        // → skip this holder." Iterate the holder `BTreeSet`
-        // directly (sorted order, so tie-breaking on the lowest
-        // NodeId is unchanged) — the `Vec` for `best_alternative`
-        // is materialized only on the rare sub-floor path below.
+        // Pick the lowest-scoring holder. A `None` score means "no
+        // opinion → skip this holder"; a NaN score is treated the
+        // same, because it can't be a meaningful placement score and
+        // every `<` comparison against NaN is false — leaving a NaN
+        // holder to pin `worst` (and slip past the `>= score_floor`
+        // check, which is also false for NaN) would evict an arbitrary
+        // holder on garbage input. Iterate the holder `BTreeSet`
+        // directly (sorted order, so tie-breaking on the lowest NodeId
+        // is unchanged) — the `Vec` for `best_alternative` is
+        // materialized only on the rare sub-floor path below.
         let mut worst: Option<(NodeId, f32)> = None;
         for &h in holders {
             let Some(score) = scorer.score(chain, h) else {
                 continue;
             };
+            if score.is_nan() {
+                continue;
+            }
             worst = match worst {
                 None => Some((h, score)),
                 Some((_, ws)) if score < ws => Some((h, score)),
@@ -2181,6 +2188,53 @@ mod tests {
             }
             other => panic!("expected one RequestEviction(11), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn nan_score_holder_is_skipped_not_picked_as_victim() {
+        // A NaN score is "no opinion," not the lowest score. Holder 11
+        // (lower NodeId, so scored first) returns NaN; the real sub-floor
+        // holder is 12. With a naive `<` compare a NaN holder pins `worst`
+        // (`0.3 < NaN` is false) and then slips past the `>= score_floor`
+        // gate (`NaN >= 0.5` is false), evicting the wrong node — this test
+        // pins that NaN is skipped and the victim is 12.
+        let mut actual = MeshOsState::default();
+        actual
+            .replicas
+            .insert(CHAIN_A, ::std::collections::BTreeSet::from([11, 12]));
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        let scorer = FixedScorer {
+            scores: [((CHAIN_A, 11), f32::NAN), ((CHAIN_A, 12), 0.3)]
+                .into_iter()
+                .collect(),
+            alternatives: [(CHAIN_A, (5, 0.9))].into_iter().collect(),
+        };
+        match scheduler_call(&actual, Some(&scorer)).as_slice() {
+            [MeshOsAction::RequestEviction { chain, victim }] => {
+                assert_eq!(*chain, CHAIN_A);
+                assert_eq!(*victim, 12, "NaN holder 11 must be skipped; victim is 12");
+            }
+            other => panic!("expected one RequestEviction(12), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_nan_scores_emit_no_eviction() {
+        // A holder whose only score is NaN is no usable opinion → the chain
+        // has no victim and nothing is emitted (no garbage eviction).
+        let mut actual = MeshOsState::default();
+        actual
+            .replicas
+            .insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        let scorer = FixedScorer {
+            scores: [((CHAIN_A, THIS_NODE), f32::NAN)].into_iter().collect(),
+            alternatives: [(CHAIN_A, (5, 0.9))].into_iter().collect(),
+        };
+        assert!(
+            scheduler_call(&actual, Some(&scorer)).is_empty(),
+            "a holder with only a NaN score must not be evicted",
+        );
     }
 
     /// Scorer for the Phase 3 net-benefit tests: a single under-scoring

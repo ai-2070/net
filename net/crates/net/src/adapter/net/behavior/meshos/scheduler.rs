@@ -555,6 +555,12 @@ impl LocalScheduler {
             let mut worst: Option<f32> = None;
             for &h in holders {
                 if let Some(s) = scorer.score(chain, h) {
+                    // A NaN score is not a usable opinion — skip it so it can't
+                    // poison the snapshot or the worst-holder history series
+                    // (the decision arm skips NaN too).
+                    if s.is_nan() {
+                        continue;
+                    }
                     holder_scores.insert(h, s);
                     worst = Some(worst.map_or(s, |w| w.min(s)));
                 }
