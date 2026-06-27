@@ -2172,6 +2172,49 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_backed_scorer_matches_raw_scorer_decision() {
+        // Phase 1 (MESH_SCHEDULER_IMPL_PLAN.md): the loop now samples
+        // scores into a snapshot and hands `reconcile` a
+        // `SnapshotScorer` instead of the live scorer. This proves the
+        // snapshot path reaches the identical decision as scoring the
+        // raw scorer inline — the property the loop split rests on.
+        use super::super::scheduler::{LocalScheduler, SnapshotScorer};
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base);
+        actual.replicas.insert(
+            CHAIN_A,
+            ::std::collections::BTreeSet::from([THIS_NODE, 11]),
+        );
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        let raw = FixedScorer {
+            scores: [((CHAIN_A, THIS_NODE), 0.3), ((CHAIN_A, 11), 0.7)]
+                .into_iter()
+                .collect(),
+            alternatives: [(CHAIN_A, (5, 0.9))].into_iter().collect(),
+        };
+        // Decision via the raw scorer (what the other arm tests use).
+        let raw_actions = scheduler_call(&actual, Some(&raw));
+        // Decision via the loop path: sample → snapshot → wrap → decide.
+        let mut ls = LocalScheduler::new();
+        let now = actual.last_tick.unwrap();
+        let snap = ls.sample(&actual.replicas, &actual.replica_leader, THIS_NODE, &raw, now);
+        let snap_scorer = SnapshotScorer::new(&snap, &raw);
+        let snap_actions = scheduler_call(&actual, Some(&snap_scorer));
+
+        assert_eq!(raw_actions, snap_actions, "snapshot path must match raw path");
+        assert_eq!(
+            raw_actions,
+            vec![MeshOsAction::RequestEviction {
+                chain: CHAIN_A,
+                victim: THIS_NODE,
+            }],
+        );
+        // The sidecar recorded the worst holder's score (0.3, not 0.7).
+        assert!((ls.history(CHAIN_A).unwrap().current() - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
     fn scheduler_emits_actions_in_chain_id_sorted_order() {
         let mut actual = MeshOsState::default();
         actual
