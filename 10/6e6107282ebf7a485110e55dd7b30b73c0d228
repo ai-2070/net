@@ -1,0 +1,22 @@
+net/crates/net/src/adapter/net/behavior/meshos/reconcile.rs
+  s_22b9063ec56e89::t_afeaf4a6f6325e 568-580
+net/crates/net/docs/plans/MESH_SCHEDULER_IMPL_PLAN.md
+  s_22b9063ec56e89::t_25715fa52001e7 191-198
+  s_22b9063ec56e89::t_3db78a80d6ee5f 221-227
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "106e6107282ebf7a485110e55dd7b30b73c0d228",
+  "prompts": {},
+  "sessions": {
+    "s_22b9063ec56e89": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "675ec343-2799-4708-9d68-c48f25333f3a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
