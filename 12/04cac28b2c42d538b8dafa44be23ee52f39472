@@ -1,0 +1,23 @@
+.claude/skills/net-event-bus/scheduler.md
+  s_7f85b6614a7621::t_3b460ec880136b 58
+net/crates/net/sdk-ts/src/mesh.ts
+  s_7f85b6614a7621::t_22421559c26ac4 48
+net/crates/net/sdk-ts/src/index.ts
+  s_7f85b6614a7621::t_74fae44e6a239d 61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "1204cac28b2c42d538b8dafa44be23ee52f39472",
+  "prompts": {},
+  "sessions": {
+    "s_7f85b6614a7621": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "52f0f3ac-053a-447a-8e56-f9159f9d69e4",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
