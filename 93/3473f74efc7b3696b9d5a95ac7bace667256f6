@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/behavior/loadbalance.rs
+  s_22b9063ec56e89::t_309746ba3b62bc 1524-1527
+net/crates/net/src/adapter/net/behavior/hash.rs
+  s_22b9063ec56e89::t_223fff78e0cd22 1-57
+net/crates/net/src/adapter/net/behavior/meshos/scheduler.rs
+  s_22b9063ec56e89::t_93116bb93ac6d9 618-623,626-627
+net/crates/net/src/adapter/net/behavior/proximity.rs
+  s_22b9063ec56e89::t_f853039eea51ad 1062-1071
+net/crates/net/src/adapter/net/behavior/mod.rs
+  s_22b9063ec56e89::t_dad59aae1a7dc4 35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "933473f74efc7b3696b9d5a95ac7bace667256f6",
+  "prompts": {},
+  "sessions": {
+    "s_22b9063ec56e89": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "675ec343-2799-4708-9d68-c48f25333f3a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
