@@ -2400,6 +2400,70 @@ mod tests {
         assert!((ls.history(CHAIN_A).unwrap().current() - 0.3).abs() < 1e-6);
     }
 
+    #[test]
+    fn sampler_snapshot_is_per_chain_correct_and_isolated() {
+        // Discriminating coverage for the snapshot machinery (the prior
+        // equivalence test samples from the same scorer it compares against,
+        // so it can't catch a mis-keyed set_chain or a wrong get). Two led
+        // chains with distinct holders/scores: prove each score lands in its
+        // own (chain, holder) cell, the worst-holder history is per chain,
+        // and one chain's holders never leak into another's scores. A bug in
+        // set_chain keying, get lookup, or worst tracking flips an assertion.
+        use super::super::scheduler::LocalScheduler;
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base);
+        actual
+            .replicas
+            .insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE, 11]));
+        actual
+            .replicas
+            .insert(CHAIN_B, ::std::collections::BTreeSet::from([THIS_NODE, 12]));
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+        actual.replica_leader.insert(CHAIN_B, THIS_NODE);
+        let scorer = FixedScorer {
+            scores: [
+                ((CHAIN_A, THIS_NODE), 0.30),
+                ((CHAIN_A, 11), 0.70),
+                ((CHAIN_B, THIS_NODE), 0.80),
+                ((CHAIN_B, 12), 0.55),
+            ]
+            .into_iter()
+            .collect(),
+            alternatives: ::std::collections::HashMap::new(),
+        };
+        let mut ls = LocalScheduler::new();
+        let snap = ls.sample(
+            &actual.replicas,
+            &actual.replica_leader,
+            THIS_NODE,
+            &scorer,
+            base,
+            ::std::time::Duration::from_secs(30),
+        );
+
+        // Every sampled cell maps to its own value.
+        assert_eq!(snap.get(CHAIN_A, THIS_NODE), Some(0.30));
+        assert_eq!(snap.get(CHAIN_A, 11), Some(0.70));
+        assert_eq!(snap.get(CHAIN_B, THIS_NODE), Some(0.80));
+        assert_eq!(snap.get(CHAIN_B, 12), Some(0.55));
+        // No cross-chain leakage: a chain only carries its own holders.
+        assert_eq!(
+            snap.get(CHAIN_A, 12),
+            None,
+            "chain B's holder must not appear under chain A",
+        );
+        assert_eq!(
+            snap.get(CHAIN_B, 11),
+            None,
+            "chain A's holder must not appear under chain B",
+        );
+        assert_eq!(snap.len(), 4, "exactly the four sampled (chain,holder) cells");
+        // Worst-holder history is tracked per chain.
+        assert!((ls.history(CHAIN_A).unwrap().current() - 0.30).abs() < 1e-6);
+        assert!((ls.history(CHAIN_B).unwrap().current() - 0.55).abs() < 1e-6);
+    }
+
     /// Scorer with a constant per-node fingerprint (so a chain stays "clean"
     /// and its snapshot is retained) but a *live* score that can drift after
     /// sampling — models the RTT-style drift the fingerprint doesn't capture.
