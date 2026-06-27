@@ -2349,6 +2349,55 @@ mod tests {
     }
 
     #[test]
+    fn net_benefit_gate_boundary_tracks_cost_magnitude() {
+        // `allows_cheap_migration` above would still pass with the whole
+        // Phase 3 block deleted (the hysteresis gap alone emits), so it
+        // doesn't actually exercise the gate. This test pins the net-benefit
+        // arithmetic by sweeping the cost across the score gain and asserting
+        // the outcome flips. Gap = 0.9 - 0.3 = 0.6 (past hysteresis 0.2);
+        // with the default model (cost_per_sec 0.1, reliability 1.0) the
+        // cost_score is 0.1 * secs, so the migration emits iff 0.6 - cost > 0.
+        let mut actual = MeshOsState::default();
+        actual
+            .replicas
+            .insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+
+        let outcome = |secs: u64| {
+            let scorer = CostScorer {
+                victim_score: 0.3,
+                alt: (5, 0.9),
+                cost: Some(super::super::scheduler::MigrationCost {
+                    state_transfer: ::std::time::Duration::from_secs(secs),
+                    reliability_factor: 1.0,
+                    ..Default::default()
+                }),
+            };
+            scheduler_call(&actual, Some(&scorer))
+        };
+
+        // cost_score ≈ 0.5 < gain 0.6 → net positive → emits.
+        assert_eq!(
+            outcome(5),
+            vec![MeshOsAction::RequestEviction {
+                chain: CHAIN_A,
+                victim: THIS_NODE,
+            }],
+            "cost below the gain must allow the migration",
+        );
+        // cost_score ≈ 0.6 ≳ gain → net ≤ 0 → suppressed.
+        assert!(
+            outcome(6).is_empty(),
+            "cost at the gain boundary must be suppressed",
+        );
+        // cost_score ≈ 0.7 > gain 0.6 → net negative → suppressed.
+        assert!(
+            outcome(7).is_empty(),
+            "cost above the gain must be suppressed",
+        );
+    }
+
+    #[test]
     fn snapshot_backed_scorer_matches_raw_scorer_decision() {
         // Phase 1 (MESH_SCHEDULER_IMPL_PLAN.md): the loop now samples
         // scores into a snapshot and hands `reconcile` a
