@@ -183,14 +183,15 @@ pub struct MigrationCost {
     pub state_transfer: Duration,
     /// Disruption: estimated time the artifact is unavailable mid-migration.
     pub disruption: Duration,
-    /// Bytes moved during transfer (relevant under network saturation;
-    /// carried for richer models, not used by the default conversion).
-    pub bandwidth_bytes: u64,
     /// Importance weight — higher means a more valuable artifact, charged a
     /// proportionally higher cost so it needs a bigger score gain to move.
     /// Defaults to the neutral `1.0`; a non-positive or non-finite value is
     /// clamped to `1.0` by `score_equivalent` so it can never zero a real cost.
     pub reliability_factor: f32,
+    // A `bandwidth_bytes` dimension is in the design doc but isn't carried
+    // here: nothing reads it yet, and the plan defers richer (saturation-
+    // aware) models to Phase 4 ("don't build speculatively"). Re-add it with
+    // the model that consumes it.
 }
 
 impl Default for MigrationCost {
@@ -198,7 +199,6 @@ impl Default for MigrationCost {
         Self {
             state_transfer: Duration::ZERO,
             disruption: Duration::ZERO,
-            bandwidth_bytes: 0,
             // Neutral weight — see the type doc; a `0.0` here would make the
             // gate a no-op under the common `..Default::default()` idiom.
             reliability_factor: 1.0,
@@ -1080,7 +1080,6 @@ mod tests {
         let base = MigrationCost {
             state_transfer: Duration::from_secs(1),
             disruption: Duration::from_secs(1),
-            bandwidth_bytes: 0,
             reliability_factor: 1.0,
         };
         let base_score = model.score_equivalent(&base);
