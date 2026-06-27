@@ -1,6 +1,6 @@
 [package]
 name = "net-mesh-sdk-macros"
-version = "0.28.0"
+version = "0.29.0"
 edition = "2021"
 description = "Procedural macros for net-mesh-sdk (AI tool calling — A-7 of NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md)"
 license = "Apache-2.0"
