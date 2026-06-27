@@ -524,15 +524,32 @@ fn diff_scheduler(
                 _ => worst,
             };
         }
-        let Some((victim, victim_score)) = worst else {
+        let Some((victim, snapshot_score)) = worst else {
+            continue;
+        };
+        if snapshot_score >= config.score_floor {
+            // No holder is below the floor (per the sampled scores) —
+            // leave the chain alone without paying for a live re-score.
+            continue;
+        }
+        // The snapshot score that selected this victim may be stale: a
+        // clean chain retains its prior sample for up to
+        // `decision_interval` while `best_alternative` below is always
+        // live. Re-confirm the victim's score live before paying for the
+        // alternative search or committing an eviction, so a holder that
+        // has recovered above the floor since its last sample isn't
+        // evicted on a stale low score — and so the hysteresis gap is
+        // measured against a fresh victim score, not a stale one. This is
+        // one live score of a single node on the rare sub-floor path, so
+        // the steady-state zero-scoring property holds. (For a plain,
+        // un-snapshotted scorer `live_score` == `score`, a no-op there.)
+        let Some(victim_score) = scorer.live_score(chain, victim).filter(|s| !s.is_nan()) else {
             continue;
         };
         if victim_score >= config.score_floor {
-            // No holder is below the floor — leave the chain
-            // alone.
             continue;
         }
-        // A holder is below the floor — only now do we pay for the
+        // A holder is still below the floor — only now do we pay for the
         // exclude slice + the capability-index query inside
         // `best_alternative`.
         let exclude: Vec<NodeId> = holders.iter().copied().collect();
@@ -2368,6 +2385,138 @@ mod tests {
         );
         // The sidecar recorded the worst holder's score (0.3, not 0.7).
         assert!((ls.history(CHAIN_A).unwrap().current() - 0.3).abs() < 1e-6);
+    }
+
+    /// Scorer with a constant per-node fingerprint (so a chain stays "clean"
+    /// and its snapshot is retained) but a *live* score that can drift after
+    /// sampling — models the RTT-style drift the fingerprint doesn't capture.
+    struct DriftScorer {
+        fp: u64,
+        live_bits: ::std::sync::atomic::AtomicU32,
+        alt: (NodeId, f32),
+    }
+
+    impl DriftScorer {
+        fn new(score: f32, fp: u64, alt: (NodeId, f32)) -> Self {
+            Self {
+                fp,
+                live_bits: ::std::sync::atomic::AtomicU32::new(score.to_bits()),
+                alt,
+            }
+        }
+        fn set_live(&self, score: f32) {
+            self.live_bits
+                .store(score.to_bits(), ::std::sync::atomic::Ordering::Relaxed);
+        }
+        fn live(&self) -> f32 {
+            f32::from_bits(self.live_bits.load(::std::sync::atomic::Ordering::Relaxed))
+        }
+    }
+
+    impl super::super::scheduler::PlacementScorer for DriftScorer {
+        fn score(&self, _chain: ChainId, _node: NodeId) -> Option<f32> {
+            Some(self.live())
+        }
+        fn best_alternative(&self, _chain: ChainId, exclude: &[NodeId]) -> Option<(NodeId, f32)> {
+            if exclude.contains(&self.alt.0) {
+                None
+            } else {
+                Some(self.alt)
+            }
+        }
+        fn node_fingerprint(&self, _node: NodeId) -> Option<u64> {
+            Some(self.fp)
+        }
+    }
+
+    #[test]
+    fn clean_chain_does_not_evict_on_stale_snapshot_after_live_recovery() {
+        // I1: a clean chain (stable fingerprint) retains its prior sampled
+        // score, but the victim's live score has since recovered above the
+        // floor. The decision arm must re-confirm the victim live and NOT
+        // evict on the stale low snapshot score. Without the live re-confirm
+        // this emits a spurious eviction.
+        use super::super::scheduler::{LocalScheduler, SnapshotScorer};
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base);
+        actual
+            .replicas
+            .insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+
+        let scorer = DriftScorer::new(0.3, 7, (5, 0.9));
+        let mut ls = LocalScheduler::new();
+        let interval = ::std::time::Duration::from_secs(30);
+
+        // T0: sample the victim at 0.3 (sub-floor) into the snapshot.
+        ls.sample(
+            &actual.replicas,
+            &actual.replica_leader,
+            THIS_NODE,
+            &scorer,
+            base,
+            interval,
+        );
+        // Live score recovers to 0.8; fingerprint unchanged → chain stays
+        // clean → the snapshot still reports the stale 0.3.
+        scorer.set_live(0.8);
+        let snap = ls.sample(
+            &actual.replicas,
+            &actual.replica_leader,
+            THIS_NODE,
+            &scorer,
+            base + ::std::time::Duration::from_secs(1),
+            interval,
+        );
+        assert_eq!(
+            snap.get(CHAIN_A, THIS_NODE),
+            Some(0.3),
+            "snapshot must retain the stale score for a clean chain",
+        );
+
+        let snap_scorer = SnapshotScorer::new(snap, &scorer);
+        assert!(
+            scheduler_call(&actual, Some(&snap_scorer)).is_empty(),
+            "a victim that recovered above the floor must not be evicted on a stale score",
+        );
+    }
+
+    #[test]
+    fn clean_chain_still_evicts_when_live_confirms_sub_floor() {
+        // Companion to the above: when the live re-confirm agrees the victim
+        // is still sub-floor, the eviction proceeds — the live check only
+        // suppresses recovered victims, it doesn't block real migrations.
+        use super::super::scheduler::{LocalScheduler, SnapshotScorer};
+        let base = anchor();
+        let mut actual = MeshOsState::default();
+        actual.last_tick = Some(base);
+        actual
+            .replicas
+            .insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE]));
+        actual.replica_leader.insert(CHAIN_A, THIS_NODE);
+
+        let scorer = DriftScorer::new(0.3, 7, (5, 0.9));
+        let mut ls = LocalScheduler::new();
+        let interval = ::std::time::Duration::from_secs(30);
+        let snap = ls.sample(
+            &actual.replicas,
+            &actual.replica_leader,
+            THIS_NODE,
+            &scorer,
+            base,
+            interval,
+        );
+        // Live stays sub-floor (0.3) — eviction should proceed.
+        let snap_scorer = SnapshotScorer::new(snap, &scorer);
+        assert_eq!(
+            scheduler_call(&actual, Some(&snap_scorer)),
+            vec![MeshOsAction::RequestEviction {
+                chain: CHAIN_A,
+                victim: THIS_NODE,
+            }],
+            "a victim that is still sub-floor live must be evicted",
+        );
     }
 
     #[test]

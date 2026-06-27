@@ -65,6 +65,18 @@ pub trait PlacementScorer: Send + Sync {
     /// scheduler treats `None` as "skip this holder."
     fn score(&self, chain: ChainId, node: NodeId) -> Option<f32>;
 
+    /// Live (un-cached) score for `(chain, node)` — what `score` would
+    /// return straight from the live placement index, bypassing any
+    /// snapshot a wrapping scorer serves cached values from. Defaults to
+    /// `score`; [`SnapshotScorer`] overrides it to hit the live scorer so
+    /// the decision arm can re-confirm a candidate victim that was
+    /// *selected* from a possibly-stale snapshot before acting on it (see
+    /// `diff_scheduler`'s sub-floor path). Plain scorers need not implement
+    /// it — for them the live and cached scores are identical.
+    fn live_score(&self, chain: ChainId, node: NodeId) -> Option<f32> {
+        self.score(chain, node)
+    }
+
     /// Pick the best alternative node for `chain`, excluding
     /// the nodes already holding it (`exclude`). Returns
     /// `Some((node_id, score))` for the best candidate or `None`
@@ -360,6 +372,12 @@ impl<'a> SnapshotScorer<'a> {
 impl PlacementScorer for SnapshotScorer<'_> {
     fn score(&self, chain: ChainId, node: NodeId) -> Option<f32> {
         self.snapshot.get(chain, node)
+    }
+
+    fn live_score(&self, chain: ChainId, node: NodeId) -> Option<f32> {
+        // Bypass the snapshot — the decision arm uses this to re-confirm a
+        // victim it selected from possibly-stale cached scores.
+        self.live.score(chain, node)
     }
 
     fn best_alternative(&self, chain: ChainId, exclude: &[NodeId]) -> Option<(NodeId, f32)> {
