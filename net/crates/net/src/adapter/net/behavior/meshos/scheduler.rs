@@ -674,7 +674,11 @@ mod tests {
             alternatives: [(1, (200, 0.9))].into_iter().collect(),
         };
         let ss = SnapshotScorer::new(&snap, &live);
-        assert_eq!(ss.score(1, 100), Some(0.42), "score comes from the snapshot");
+        assert_eq!(
+            ss.score(1, 100),
+            Some(0.42),
+            "score comes from the snapshot"
+        );
         assert_eq!(ss.score(1, 999), None, "unsampled holder reads None");
         assert_eq!(
             ss.best_alternative(1, &[]),
@@ -802,7 +806,8 @@ mod tests {
 
     impl PlacementScorer for CountingScorer {
         fn score(&self, _chain: ChainId, _node: NodeId) -> Option<f32> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Some(self.score)
         }
         fn best_alternative(&self, _chain: ChainId, _exclude: &[NodeId]) -> Option<(NodeId, f32)> {
@@ -818,7 +823,11 @@ mod tests {
         }
     }
 
-    fn one_led_chain() -> (HashMap<ChainId, BTreeSet<NodeId>>, HashMap<ChainId, NodeId>, NodeId) {
+    fn one_led_chain() -> (
+        HashMap<ChainId, BTreeSet<NodeId>>,
+        HashMap<ChainId, NodeId>,
+        NodeId,
+    ) {
         let this: NodeId = 100;
         let mut replicas: HashMap<ChainId, BTreeSet<NodeId>> = HashMap::new();
         replicas.insert(1, BTreeSet::from([100]));
@@ -850,7 +859,11 @@ mod tests {
             interval,
         );
         assert_eq!(snap.get(1, 100), Some(0.9), "clean chain retains its score");
-        assert_eq!(scorer.calls(), 1, "stable fingerprint within backstop → no rescore");
+        assert_eq!(
+            scorer.calls(),
+            1,
+            "stable fingerprint within backstop → no rescore"
+        );
     }
 
     #[test]
@@ -890,7 +903,11 @@ mod tests {
         // backstop forces a rescore. This is the lever the dirty-bit alone
         // can't provide: it catches drift the fingerprint misses.
         ls.sample(&replicas, &leader, this, &scorer, t0 + interval, interval);
-        assert_eq!(scorer.calls(), 2, "backstop forces a rescore past the interval");
+        assert_eq!(
+            scorer.calls(),
+            2,
+            "backstop forces a rescore past the interval"
+        );
     }
 
     #[test]
@@ -928,7 +945,14 @@ mod tests {
         let interval = Duration::from_secs(30);
 
         ls.sample(&replicas, &leader, this, &scorer, t0, interval);
-        ls.sample(&replicas, &leader, this, &scorer, t0 + Duration::from_secs(1), interval);
+        ls.sample(
+            &replicas,
+            &leader,
+            this,
+            &scorer,
+            t0 + Duration::from_secs(1),
+            interval,
+        );
         assert_eq!(scorer.calls(), 2, "no fingerprint → re-scored every tick");
     }
 

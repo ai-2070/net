@@ -2275,10 +2275,9 @@ mod tests {
         let base = anchor();
         let mut actual = MeshOsState::default();
         actual.last_tick = Some(base);
-        actual.replicas.insert(
-            CHAIN_A,
-            ::std::collections::BTreeSet::from([THIS_NODE, 11]),
-        );
+        actual
+            .replicas
+            .insert(CHAIN_A, ::std::collections::BTreeSet::from([THIS_NODE, 11]));
         actual.replica_leader.insert(CHAIN_A, THIS_NODE);
         let raw = FixedScorer {
             scores: [((CHAIN_A, THIS_NODE), 0.3), ((CHAIN_A, 11), 0.7)]
@@ -2302,7 +2301,10 @@ mod tests {
         let snap_scorer = SnapshotScorer::new(snap, &raw);
         let snap_actions = scheduler_call(&actual, Some(&snap_scorer));
 
-        assert_eq!(raw_actions, snap_actions, "snapshot path must match raw path");
+        assert_eq!(
+            raw_actions, snap_actions,
+            "snapshot path must match raw path"
+        );
         assert_eq!(
             raw_actions,
             vec![MeshOsAction::RequestEviction {
