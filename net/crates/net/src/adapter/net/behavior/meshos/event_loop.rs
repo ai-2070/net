@@ -1538,15 +1538,17 @@ impl MeshOsLoop {
             .actual
             .last_tick
             .unwrap_or_else(std::time::Instant::now);
+        // Phase 1 (MESH_SCHEDULER_IMPL_PLAN.md): when a scorer is
+        // installed, sample placement scores loop-side (recording
+        // ScoreHistory) and wrap them in a snapshot-backed scorer. The
+        // per-holder scoring happens here — gateable by cadence +
+        // dirty-bits in Phase 2 — instead of live inside the pure
+        // reconcile pass; the rare candidate search (best_alternative)
+        // still hits the live index via SnapshotScorer's delegation.
+        // With no scorer installed the option is `None` and the
+        // scheduler arm is a no-op.
         let scorer = self.scheduler.current();
-        let actions = if let Some(live) = scorer.as_deref() {
-            // Phase 1 (MESH_SCHEDULER_IMPL_PLAN.md): sample placement
-            // scores loop-side (recording ScoreHistory) and hand the
-            // decision pass a snapshot-backed scorer. The per-holder
-            // scoring happens here — gateable by cadence + dirty-bits
-            // in Phase 2 — instead of live inside the pure reconcile
-            // pass; the rare candidate search (best_alternative) still
-            // hits the live index via SnapshotScorer's delegation.
+        let snap_scorer = scorer.as_deref().map(|live| {
             let snapshot = self.local_scheduler.sample(
                 &self.actual.replicas,
                 &self.actual.replica_leader,
@@ -1555,27 +1557,19 @@ impl MeshOsLoop {
                 now,
                 self.config.scheduler.decision_interval,
             );
-            let snap_scorer = super::scheduler::SnapshotScorer::new(snapshot, live);
-            reconcile(
-                &self.actual,
-                &self.desired,
-                self.config.this_node,
-                &self.config.locality,
-                &self.config.maintenance,
-                &self.config.scheduler,
-                Some(&snap_scorer),
-            )
-        } else {
-            reconcile(
-                &self.actual,
-                &self.desired,
-                self.config.this_node,
-                &self.config.locality,
-                &self.config.maintenance,
-                &self.config.scheduler,
-                None,
-            )
-        };
+            super::scheduler::SnapshotScorer::new(snapshot, live)
+        });
+        let actions = reconcile(
+            &self.actual,
+            &self.desired,
+            self.config.this_node,
+            &self.config.locality,
+            &self.config.maintenance,
+            &self.config.scheduler,
+            snap_scorer
+                .as_ref()
+                .map(|s| s as &dyn super::scheduler::PlacementScorer),
+        );
         // Record cooldowns for any RequestEviction we emit so
         // the same chain doesn't flap on the next tick; track
         // `ApplyBackoff` emissions so reconcile suppresses
