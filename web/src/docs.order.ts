@@ -65,6 +65,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     ],
     // Releases — newest first.
     releases: [
+      "RELEASE_v0.29_SUMMER_OF_69",
       "RELEASE_v0.28_ROUND_AND_ROUND",
       "RELEASE_v0.27.7_PURPLE_RAIN",
       "RELEASE_v0.27.6_PURPLE_RAIN",
@@ -147,6 +148,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "tutorials/event-sourced-service": "Event-Sourced Service",
 
     // Releases
+    "releases/RELEASE_v0.29_SUMMER_OF_69": "v0.29.0 — Summer of '69",
     "releases/RELEASE_v0.28_ROUND_AND_ROUND": "v0.28.0 — Round and Round",
     "releases/RELEASE_v0.27.7_PURPLE_RAIN": "v0.27.7 — Purple Rain",
     "releases/RELEASE_v0.27.6_PURPLE_RAIN": "v0.27.6 — Purple Rain",
