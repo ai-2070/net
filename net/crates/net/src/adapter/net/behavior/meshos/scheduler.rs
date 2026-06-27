@@ -641,31 +641,35 @@ impl LocalScheduler {
     }
 }
 
+/// Test-only fixed scorer: a per-`(chain, node)` score table plus a per-chain
+/// best-alternative table; returns `None` for unrecorded entries. Defined at
+/// module level (under `#[cfg(test)]`) so both this module's tests and the
+/// `reconcile` tests share one definition instead of each keeping a copy.
+#[cfg(test)]
+pub(crate) struct FixedScorer {
+    pub scores: HashMap<(ChainId, NodeId), f32>,
+    pub alternatives: HashMap<ChainId, (NodeId, f32)>,
+}
+
+#[cfg(test)]
+impl PlacementScorer for FixedScorer {
+    fn score(&self, chain: ChainId, node: NodeId) -> Option<f32> {
+        self.scores.get(&(chain, node)).copied()
+    }
+    fn best_alternative(&self, chain: ChainId, exclude: &[NodeId]) -> Option<(NodeId, f32)> {
+        let (n, s) = self.alternatives.get(&chain).copied()?;
+        if exclude.contains(&n) {
+            None
+        } else {
+            Some((n, s))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
-
-    /// Test-only fixed scorer: per-chain-per-node table of
-    /// scores. Returns `None` for unrecorded entries.
-    pub(crate) struct FixedScorer {
-        pub scores: HashMap<(ChainId, NodeId), f32>,
-        pub alternatives: HashMap<ChainId, (NodeId, f32)>,
-    }
-
-    impl PlacementScorer for FixedScorer {
-        fn score(&self, chain: ChainId, node: NodeId) -> Option<f32> {
-            self.scores.get(&(chain, node)).copied()
-        }
-        fn best_alternative(&self, chain: ChainId, exclude: &[NodeId]) -> Option<(NodeId, f32)> {
-            let (n, s) = self.alternatives.get(&chain).copied()?;
-            if exclude.contains(&n) {
-                None
-            } else {
-                Some((n, s))
-            }
-        }
-    }
 
     #[test]
     fn fixed_scorer_returns_table_entries() {

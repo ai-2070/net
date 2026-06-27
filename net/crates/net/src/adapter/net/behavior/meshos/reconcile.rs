@@ -1940,27 +1940,10 @@ mod tests {
 
     // ----- Phase D-1: scheduler arm -----
 
-    /// Test-only scorer with a fixed score-table + alternative
-    /// lookup. The reconcile tests build one per case so the
-    /// emission contract is fully observable.
-    struct FixedScorer {
-        scores: std::collections::HashMap<(ChainId, NodeId), f32>,
-        alternatives: std::collections::HashMap<ChainId, (NodeId, f32)>,
-    }
-
-    impl super::super::scheduler::PlacementScorer for FixedScorer {
-        fn score(&self, chain: ChainId, node: NodeId) -> Option<f32> {
-            self.scores.get(&(chain, node)).copied()
-        }
-        fn best_alternative(&self, chain: ChainId, exclude: &[NodeId]) -> Option<(NodeId, f32)> {
-            let (n, s) = self.alternatives.get(&chain).copied()?;
-            if exclude.contains(&n) {
-                None
-            } else {
-                Some((n, s))
-            }
-        }
-    }
+    /// Shared test scorer with a fixed score-table + alternative lookup,
+    /// defined once in the scheduler module (the reconcile tests build one
+    /// per case so the emission contract is fully observable).
+    use super::super::scheduler::FixedScorer;
 
     fn scheduler_call(
         actual: &MeshOsState,
