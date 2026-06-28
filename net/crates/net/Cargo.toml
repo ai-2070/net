@@ -239,7 +239,7 @@ tracing = "0.1"
 arc-swap = "1.7.1"
 
 # Net adapter (optional)
-chacha20poly1305 = { version = "0.10", optional = true }
+chacha20poly1305 = { version = "0.11", optional = true }
 # Packet-path AEAD (RFC 8439 ChaCha20-Poly1305) — CRYPTO SPIKE
 # (2026-06-11). The RustCrypto chacha20poly1305 stack pays ~700 ns
 # of per-MESSAGE fixed cost in poly1305 0.8's AVX2 backend
