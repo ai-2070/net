@@ -9,7 +9,7 @@ build-backend = "maturin"
 # the deck keeps the bare `net-deck` name — see the cross-registry
 # table in the top-level README.
 name = "net-mesh-cli"
-version = "0.29.0"
+version = "0.29.1"
 description = "net-mesh — unified command-line interface for the Net mesh"
 readme = "README.md"
 license = { text = "Apache-2.0" }
