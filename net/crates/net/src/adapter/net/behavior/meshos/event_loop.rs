@@ -1541,8 +1541,8 @@ impl MeshOsLoop {
         // Phase 1 (MESH_SCHEDULER_IMPL_PLAN.md): when a scorer is
         // installed, sample placement scores loop-side (recording
         // ScoreHistory) and wrap them in a snapshot-backed scorer. The
-        // per-holder scoring happens here — gateable by cadence +
-        // dirty-bits in Phase 2 — instead of live inside the pure
+        // per-holder scoring happens here — gated by cadence +
+        // dirty-bits — instead of live inside the pure
         // reconcile pass; the rare candidate search (best_alternative)
         // still hits the live index via SnapshotScorer's delegation.
         // With no scorer installed the option is `None` and the

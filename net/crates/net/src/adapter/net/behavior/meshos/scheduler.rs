@@ -298,7 +298,7 @@ impl SchedulerRegistry {
 // =============================================================================
 
 /// Cached placement scores sampled loop-side by [`LocalScheduler`]. Decouples
-/// score *sampling* (gated by cadence + dirty-bits in Phase 2) from the
+/// score *sampling* (gated by cadence + dirty-bits) from the
 /// *decision* in `diff_scheduler`, which reads scores through a
 /// [`SnapshotScorer`] instead of evaluating the live `PlacementFilter` per
 /// holder per tick.
