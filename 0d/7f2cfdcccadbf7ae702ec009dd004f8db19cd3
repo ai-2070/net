@@ -1,0 +1,20 @@
+net/crates/net/docs/plans/MESH_SCHEDULER_IMPL_PLAN.md
+  s_7f85b6614a7621::t_0de7493095830a 121-123
+  s_7f85b6614a7621::t_a9abc091870f62 91-92,95-98,100-102,105,107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "0d7f2cfdcccadbf7ae702ec009dd004f8db19cd3",
+  "prompts": {},
+  "sessions": {
+    "s_7f85b6614a7621": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "52f0f3ac-053a-447a-8e56-f9159f9d69e4",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
