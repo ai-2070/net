@@ -88,17 +88,23 @@ unchanged — they pin output ordering, which is the property this refactor pres
 **`LocalScheduler` sidecar.** A loop-owned struct (sibling of `SchedulerRegistry` on the event-loop
 struct, `event_loop.rs:122`), holding the non-replicated observational state:
 
+As-built (the design sketch evolved during implementation):
+
 ```rust
 pub struct LocalScheduler {
-    history: HashMap<ChainId, ScoreHistory>,   // per led chain
-    last_sampled_gen: HashMap<ChainId, SampleStamp>, // dirty-tracking inputs (Phase 2)
-    cost_model: MigrationCostModel,            // Phase 3
-    cadence: CadenceConfig,                    // Phase 2
+    current: ScoreSnapshot,                   // running snapshot, returned each tick
+    history: HashMap<ChainId, ScoreHistory>,  // per led chain
+    last_fingerprint: HashMap<ChainId, u64>,  // dirty-bit: last per-chain input fold (Phase 2)
+    last_sampled: HashMap<ChainId, Instant>,  // backstop cadence: last sample time (Phase 2)
 }
+// cost_model (MigrationCostModel) + decision_interval (the cadence) live on
+// SchedulerConfig, NOT here — the *decision* arm consumes them, so they ride
+// with the other scheduler tunables rather than the loop-side sidecar.
 
 pub struct ScoreHistory {
-    recent: VecDeque<(Instant, f32)>,  // bounded ring; see sizing note
+    recent: VecDeque<(Instant, f32)>,  // bounded ring (HISTORY_CAP = 64)
     current: f32,
+    ewma: f32,                         // incremental running mean (trend basis)
     trend: Trend,                      // Stable | Degrading | Improving
 }
 ```
@@ -112,8 +118,9 @@ pub struct ScoreHistory {
 1. Build the led-chain set (leader == this_node).
 2. For chains due to sample (Phase 2 decides which), call the installed scorer, append to
    `ScoreHistory`, update trend.
-3. Produce a `ScoreSnapshot { scores: HashMap<(ChainId, NodeId), f32> }` for the chains the
-   decision pass will consider this tick.
+3. Produce a `ScoreSnapshot { scores: HashMap<ChainId, HashMap<NodeId, f32>> }` (nested chain →
+   holder → score so a dirty chain's scores replace/drop in O(1)) for the chains the decision pass
+   will consider this tick.
 4. Pass `&ScoreSnapshot` into `reconcile`/`diff_scheduler`; `diff_scheduler` reads scores from the
    snapshot instead of calling `scorer.score()` itself. `best_alternative` stays a scorer call
    inside reconcile (still gated by sub-floor victim).
