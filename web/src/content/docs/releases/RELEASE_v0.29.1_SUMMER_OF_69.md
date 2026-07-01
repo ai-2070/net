@@ -16,8 +16,6 @@ v0.29.1 is a **patch release with no functional change to the scheduler or any m
 
 ## Dependency updates
 
-Where v0.29 declared *"None,"* this patch is mostly the opposite — a routine dependency refresh is the bulk of the release.
-
 **Rust**
 
 - `chacha20poly1305` `0.10 → 0.11` — the optional packet-path AEAD (RFC 8439 ChaCha20-Poly1305).
