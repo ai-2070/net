@@ -1867,7 +1867,11 @@ mod tests {
             1000,
             "dropped grant is subsumed by the next authoritative grant"
         );
-        assert_eq!(st.credit_grants_received(), 1, "only the second grant applied");
+        assert_eq!(
+            st.credit_grants_received(),
+            1,
+            "only the second grant applied"
+        );
 
         // A late-arriving straggler of the dropped grant is an
         // idempotent no-op (monotonic `max_consumed_seen`) — it cannot
