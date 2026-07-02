@@ -1,0 +1,85 @@
+net/crates/net/Cargo.toml
+  s_ee23e37ba2d5f0::t_fec823bdb553b8 20
+net/crates/net/bindings/go/compute-ffi/Cargo.toml
+  s_099fa7d871e34d::t_9d642c291edac2 3,48,52
+net/crates/net/bindings/node/Cargo.toml
+  s_b93d1d2fee6b2e::t_ff2d2f295b0dd4 3,138-139
+net/crates/net/bindings/node/package.json
+  s_099fa7d871e34d::t_7a3b5844bf1862 3
+net/crates/net/bindings/python/Cargo.toml
+  s_e8f2c260d69463::t_fed02416528cbe 3,119-120
+net/crates/net/bindings/python/python/net/__init__.py
+  s_58a23d9389d6ed::t_0688c8a88de269 771
+net/crates/net/cli/Cargo.toml
+  s_a529d97b04ee8d::t_28c8151347ed36 3,15
+net/crates/net/sdk-py/src/net_sdk/__init__.py
+  s_099fa7d871e34d::t_93e737316e5147 288
+net/crates/net/sdk-ts/package.json
+  s_099fa7d871e34d::t_8e1ac591b27624 3,42
+net/crates/net/sdk/Cargo.toml
+  s_c24b2495bec0fd::t_f8405553355855 3,25,43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.9",
+  "base_commit_sha": "a0097a05a3b29a7fb0e381c6e9d998fc45472d98",
+  "prompts": {},
+  "sessions": {
+    "s_099fa7d871e34d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee5772a7-2dec-4be1-893b-6977228d4e33",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_58a23d9389d6ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92186006-b4bc-4409-9b64-7b1fa8e6ebfa",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_a529d97b04ee8d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e636aa40-01b9-46e0-a6ac-2e827a24c073",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_b93d1d2fee6b2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2877ca09-2dc3-4f89-b49d-5c57e6a24e56",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_c24b2495bec0fd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e01a2998-9b21-43ec-bf62-bf4d7367328d",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_e8f2c260d69463": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "96767b56-5f2a-4e0b-a316-7d7f32cd7e88",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    },
+    "s_ee23e37ba2d5f0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e81805cc-911e-4bfc-a774-30595b43ba7f",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
