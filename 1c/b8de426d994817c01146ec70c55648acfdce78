@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/STREAM_ACK_BATCHING_AND_RANGES_PLAN.md
+  s_ee23e37ba2d5f0::t_3b439a399dd2e4 121-123,125-136
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.9",
+  "base_commit_sha": "1cb8de426d994817c01146ec70c55648acfdce78",
+  "prompts": {},
+  "sessions": {
+    "s_ee23e37ba2d5f0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e81805cc-911e-4bfc-a774-30595b43ba7f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
