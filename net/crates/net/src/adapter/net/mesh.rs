@@ -277,6 +277,85 @@ fn peer_supports_ack_ranges(
     supports
 }
 
+/// Build the control events for one drained session batch
+/// (B-2/B-3/R-4): the grant events paired with their stream id (the
+/// id rides along so the drainer can find each stream again for the
+/// post-send accounting), the piggybacked NACK events for gapped
+/// streams, and — when the peer advertises support — the SACK-range
+/// events.
+///
+/// Pure build step: it does NOT bump `credit_grants_sent`. That
+/// counter means "grant datagram sent"; the drainer bumps it per
+/// covered stream only after the chunk carrying that stream's grant
+/// clears `send_to`. Pre-fix the bump ran here at build time and
+/// overcounted whenever the send failed.
+#[allow(clippy::type_complexity)]
+fn build_session_control_events(
+    session: &Arc<NetSession>,
+    grants: &[(u64, u64)],
+    emit_ack_ranges: bool,
+) -> (Vec<(u64, Bytes)>, Vec<Bytes>, Vec<Bytes>) {
+    let mut grant_entries: Vec<(u64, Bytes)> = Vec::with_capacity(grants.len());
+    let mut nack_events: Vec<Bytes> = Vec::new();
+    let mut ack_events: Vec<Bytes> = Vec::new();
+    for &(stream_id, total_consumed) in grants {
+        // Piggyback the receiver's cumulative reliable ack
+        // (next_expected) so the sender prunes its retransmit window
+        // of everything below it (H-9). 0 for non-reliable receive
+        // streams.
+        let ack_seq = session
+            .try_stream(stream_id)
+            .map(|s| s.with_reliability(|r| r.rx_ack_seq()))
+            .unwrap_or(0);
+        let payload = StreamWindow {
+            stream_id,
+            total_consumed,
+            ack_seq,
+        }
+        .encode();
+        grant_entries.push((stream_id, Bytes::copy_from_slice(&payload)));
+        // Piggyback a retransmit NACK (STREAM_RETRANSMIT D-2): a
+        // grant is enqueued on every accepted packet, so an
+        // out-of-order arrival (which creates the gap) reliably
+        // triggers a NACK here; tail loss (no later arrival) is
+        // covered by the timeout retransmit loop.
+        let nack = session
+            .try_stream(stream_id)
+            .and_then(|state| state.with_reliability(|r| r.build_nack()));
+        if let Some(nack) = nack {
+            let payload = StreamNack {
+                stream_id,
+                next_expected: nack.next_expected,
+                missing_bitmap: nack.missing_bitmap,
+            }
+            .encode();
+            nack_events.push(Bytes::copy_from_slice(&payload));
+        }
+        // R-4: positive SACK ranges for a gapped stream, to peers
+        // that advertise support. `ack_seq` + ranges are read under
+        // ONE reliability lock so the wire message is internally
+        // consistent (every range strictly above its own ack_seq —
+        // the decode-side validation invariant). A gapless stream
+        // returns no ranges and costs nothing here.
+        if emit_ack_ranges {
+            let snapshot = session.try_stream(stream_id).map(|s| {
+                s.with_reliability(|r| (r.rx_ack_seq(), r.build_ack_ranges(MAX_ACK_RANGES)))
+            });
+            if let Some((range_ack_seq, ranges)) = snapshot {
+                if !ranges.is_empty() {
+                    let msg = StreamAckRanges {
+                        stream_id,
+                        ack_seq: range_ack_seq,
+                        ranges,
+                    };
+                    ack_events.push(Bytes::from(msg.encode()));
+                }
+            }
+        }
+    }
+    (grant_entries, nack_events, ack_events)
+}
+
 /// Total wire bytes for a single Net packet carrying `payload_bytes`
 /// of AEAD-encrypted content. Saturating at `u32::MAX` so a
 /// pathological `payload_bytes` can't silently wrap the credit math.
@@ -5931,86 +6010,40 @@ impl MeshNode {
                     // two) per stream (B-2/B-3). The decode side has
                     // always iterated the full event vector, so old
                     // peers apply every batched grant/NACK.
-                    let mut grant_events: Vec<Bytes> = Vec::with_capacity(grants.len());
-                    let mut nack_events: Vec<Bytes> = Vec::new();
-                    let mut ack_events: Vec<Bytes> = Vec::new();
-                    for (stream_id, total_consumed) in grants {
-                        // Piggyback the receiver's cumulative reliable
-                        // ack (next_expected) so the sender prunes its
-                        // retransmit window of everything below it
-                        // (H-9). 0 for non-reliable receive streams.
-                        let ack_seq = session
-                            .try_stream(stream_id)
-                            .map(|s| s.with_reliability(|r| r.rx_ack_seq()))
-                            .unwrap_or(0);
-                        let payload = StreamWindow {
-                            stream_id,
-                            total_consumed,
-                            ack_seq,
-                        }
-                        .encode();
-                        grant_events.push(Bytes::copy_from_slice(&payload));
-                        // A grant is enqueued on every accepted packet,
-                        // so an out-of-order arrival (which creates the
-                        // gap) reliably triggers a NACK here; tail loss
-                        // (no later arrival) is covered by the timeout
-                        // retransmit loop. `note_grant_sent` fires at
-                        // build time — the counter means "grant emitted
-                        // toward the wire" (post-`sendto` datagram loss
-                        // was never distinguishable anyway).
-                        let nack = session.try_stream(stream_id).and_then(|state| {
-                            state.note_grant_sent();
-                            state.with_reliability(|r| r.build_nack())
-                        });
-                        if let Some(nack) = nack {
-                            let payload = StreamNack {
-                                stream_id,
-                                next_expected: nack.next_expected,
-                                missing_bitmap: nack.missing_bitmap,
-                            }
-                            .encode();
-                            nack_events.push(Bytes::copy_from_slice(&payload));
-                        }
-                        // R-4: positive SACK ranges for a gapped
-                        // stream, to peers that advertise support.
-                        // `ack_seq` + ranges are read under ONE
-                        // reliability lock so the wire message is
-                        // internally consistent (every range strictly
-                        // above its own ack_seq — the decode-side
-                        // validation invariant). A gapless stream
-                        // returns no ranges and costs nothing here.
-                        if emit_ack_ranges {
-                            let snapshot = session.try_stream(stream_id).map(|s| {
-                                s.with_reliability(|r| {
-                                    (r.rx_ack_seq(), r.build_ack_ranges(MAX_ACK_RANGES))
-                                })
-                            });
-                            if let Some((range_ack_seq, ranges)) = snapshot {
-                                if !ranges.is_empty() {
-                                    let msg = StreamAckRanges {
-                                        stream_id,
-                                        ack_seq: range_ack_seq,
-                                        ranges,
-                                    };
-                                    ack_events.push(Bytes::from(msg.encode()));
-                                }
-                            }
-                        }
-                    }
+                    let (grant_entries, nack_events, ack_events) =
+                        build_session_control_events(&session, &grants, emit_ack_ranges);
                     let pool = session.thread_local_pool();
                     let mut builder = pool.get();
-                    for chunk in grant_events.chunks(GRANT_EVENTS_PER_PACKET) {
+                    for chunk in grant_entries.chunks(GRANT_EVENTS_PER_PACKET) {
+                        // `Bytes` clone is a refcount bump — the chunk
+                        // carries (stream_id, event) pairs so the
+                        // post-send accounting below can find each
+                        // covered stream.
+                        let events: Vec<Bytes> = chunk.iter().map(|(_, e)| e.clone()).collect();
                         let seq = session.next_control_tx_seq();
                         let packet = builder.build_subprotocol(
                             CONTROL_STREAM_ID,
                             seq,
-                            chunk,
+                            &events,
                             PacketFlags::NONE,
                             SUBPROTOCOL_STREAM_WINDOW,
                         );
                         if let Err(e) = socket.send_to(&packet, peer_addr).await {
                             tracing::debug!(error = %e, "StreamWindow grant send failed");
                             continue;
+                        }
+                        // The chunk cleared the socket: bump each
+                        // covered stream's grants-sent counter now.
+                        // The counter means "grant datagram sent",
+                        // not "grant built" — a failed `send_to` must
+                        // not count (post-`sendto` datagram loss was
+                        // never distinguishable anyway). Same contract
+                        // as the pre-batching one-packet-per-stream
+                        // shape, where the bump sat after the send.
+                        for (stream_id, _) in chunk {
+                            if let Some(state) = session.try_stream(*stream_id) {
+                                state.note_grant_sent();
+                            }
                         }
                         ControlPlaneStats::record_packet(
                             &control_stats.grant_packets_sent,
@@ -16433,6 +16466,81 @@ mod stream_ack_batching_tests {
             (0..100u64).map(|i| (i, i * 10)).collect::<Vec<_>>(),
             "every stream survives grouping exactly once with its value"
         );
+    }
+
+    /// The build step must NOT bump `credit_grants_sent` — that
+    /// counter means "grant datagram sent", and the drainer bumps it
+    /// per covered stream only after the chunk clears `send_to`.
+    /// Pre-fix the bump ran at build time, overcounting whenever the
+    /// send failed (review P2).
+    #[test]
+    fn build_session_control_events_does_not_bump_grants_sent() {
+        let addr = "127.0.0.1:7005";
+        let s = session_at(addr);
+        let sid = 42u64;
+        s.get_or_create_stream_for_packet(sid, true);
+
+        let grants = vec![(sid, 1000u64)];
+        let (entries, _nacks, _acks) = build_session_control_events(&s, &grants, false);
+        assert_eq!(entries.len(), 1);
+
+        let state = s.try_stream(sid).expect("stream exists");
+        assert_eq!(
+            state.credit_grants_sent(),
+            0,
+            "building the grant event must not count it as sent"
+        );
+        // The post-send bump is the drainer's job — one per grant
+        // that actually cleared the socket.
+        state.note_grant_sent();
+        assert_eq!(state.credit_grants_sent(), 1);
+    }
+
+    /// Grant entries stay paired (stream id ↔ encoded event) so the
+    /// post-send accounting hits the right streams, and NACK / SACK
+    /// events are built only for gapped streams (SACK only when the
+    /// peer supports ranges).
+    #[test]
+    fn build_session_control_events_pairs_ids_and_gates_gap_events() {
+        use crate::adapter::net::subprotocol::stream_window::StreamAckRanges;
+
+        let addr = "127.0.0.1:7006";
+        let s = session_at(addr);
+        // Stream 1: clean in-order receive. Stream 2: gapped (0
+        // received, 5 out of order → head gap at 1).
+        s.get_or_create_stream_for_packet(1, true)
+            .with_reliability(|r| {
+                assert!(r.on_receive(0));
+            });
+        s.get_or_create_stream_for_packet(2, true)
+            .with_reliability(|r| {
+                assert!(r.on_receive(0));
+                assert!(r.on_receive(5));
+            });
+
+        let grants = vec![(1u64, 10u64), (2u64, 20u64)];
+        let (entries, nacks, acks) = build_session_control_events(&s, &grants, true);
+
+        assert_eq!(entries.len(), 2);
+        for (sid, event) in &entries {
+            let g = StreamWindow::decode(event).expect("grant event decodes");
+            assert_eq!(g.stream_id, *sid, "entry id must match its encoded event");
+        }
+
+        assert_eq!(nacks.len(), 1, "only the gapped stream NACKs");
+        let n = StreamNack::decode(&nacks[0]).expect("nack decodes");
+        assert_eq!(n.stream_id, 2);
+        assert_eq!(n.next_expected, 1);
+
+        assert_eq!(acks.len(), 1, "only the gapped stream has SACK ranges");
+        let a = StreamAckRanges::decode(&acks[0]).expect("ack ranges decode");
+        assert_eq!(a.stream_id, 2);
+        assert_eq!(a.ack_seq, 1);
+        assert_eq!(a.ranges, vec![(5, 6)]);
+
+        // Capability gate off ⇒ no SACK events, everything else same.
+        let (_, _, acks_off) = build_session_control_events(&s, &grants, false);
+        assert!(acks_off.is_empty(), "no ranges to a non-advertising peer");
     }
 
     /// Grants for different peers (different sessions) route to their
