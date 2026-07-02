@@ -270,9 +270,15 @@ pub struct ReliableStream {
     /// message's worth) for the NACK-vs-SACK contradiction check —
     /// best-effort observability, last message wins (R-3).
     last_sacked: Vec<(u64, u64)>,
-    /// NACK-vs-SACK contradictions observed: the peer NACKed a seq it
-    /// had positively acknowledged. Positive ack wins — the packet is
-    /// already out of the window — so this only counts (R-3).
+    /// NACK-vs-SACK contradictions observed: a NACK named a seq that
+    /// a prior SACK (in `last_sacked`) positively acknowledged.
+    /// Positive ack wins — the packet is already out of the window —
+    /// so this only counts (R-3). Best-effort signal, NOT proof of a
+    /// hostile peer: the receiver's NACK and SACK for one gap travel
+    /// as separate datagrams and can reorder on the wire (or a stale
+    /// prior-tick NACK can arrive after a fresher SACK), so an honest
+    /// receiver on a lossy/jittery path trips this too. Treat a
+    /// non-zero value as "investigate," not "ban."
     protocol_anomalies: u64,
     /// Pending unacknowledged packets (bounded)
     pending: VecDeque<UnackedPacket>,
@@ -603,6 +609,18 @@ impl ReliableStream {
     /// mirrors the rx window bytes / [`Self::MIN_TRACKED_PACKET_BYTES`]
     /// sizing) and floors at the legacy 64, so default-window streams
     /// keep their pre-R-2 behavior exactly.
+    ///
+    /// Caveat (review HORIZON): `max_pending` is derived from the
+    /// stream's `tx_window`, and this reuses it as the *receive-side*
+    /// acceptance budget. That is correct only because a stream is
+    /// currently constructed with one window value feeding both the
+    /// tx retransmit-window sizing and the rx credit
+    /// (`StreamState::new_full_with_epoch`). If tx and rx windows ever
+    /// become independently configurable, the horizon must be driven
+    /// by the rx budget explicitly (an rx-window arg into the
+    /// reliability state) rather than piggybacking `max_pending` —
+    /// otherwise the receiver would accept out-of-order seqs against
+    /// the *sender's* window, which R-2 explicitly warns against.
     pub fn reorder_horizon(&self) -> u64 {
         (self.max_pending as u64).clamp(64, Self::MAX_REORDER_PACKETS)
     }
@@ -625,10 +643,13 @@ impl ReliableStream {
         self.oo_dropped_capacity
     }
 
-    /// NACK-vs-SACK contradictions observed (R-3). Positive ack wins;
-    /// a non-zero value indicates a buggy or hostile peer (the
-    /// receiver derives NACKs and ACK ranges from one range index, so
-    /// it cannot honestly emit both for the same seq).
+    /// NACK-vs-SACK contradictions observed (R-3). Positive ack wins.
+    /// A best-effort anomaly signal, NOT a hostile-peer verdict: the
+    /// receiver derives NACKs and SACK ranges from one range index and
+    /// cannot emit both for the same seq *in a single snapshot*, but
+    /// the two ride separate datagrams that reorder independently on
+    /// the wire, so an honest peer on a lossy/jittery link raises this
+    /// too. Alert on sustained growth, not a single count.
     #[inline]
     pub fn protocol_anomalies(&self) -> u64 {
         self.protocol_anomalies
@@ -820,11 +841,17 @@ impl ReliabilityMode for ReliableStream {
         // deep `Vec<Bytes>` clone.
         for missing_seq in nack.missing_sequences() {
             // R-3 contradiction rule: positive ACK wins. A NACK for a
-            // seq the peer already SACKed indicates a buggy or
-            // hostile peer — an honest receiver derives NACKs and ACK
-            // ranges from one range index and cannot emit both. The
-            // packet is already gone from `pending`, so nothing could
-            // resend anyway; count the anomaly and move on.
+            // seq a prior SACK already acknowledged is a best-effort
+            // anomaly signal — the packet is already gone from
+            // `pending`, so nothing could resend anyway; count it and
+            // move on. This is NOT proof of a hostile peer: an honest
+            // receiver's NACK and SACK for one gap are separate
+            // datagrams that reorder independently, so a stale NACK
+            // arriving after a fresher SACK trips this on any lossy /
+            // jittery link (see `protocol_anomalies`). The same-cycle
+            // build is now consistent (one reliability-lock snapshot
+            // in `build_session_control_events`), so what remains is
+            // wire reordering, which no receiver can prevent.
             if self
                 .last_sacked
                 .iter()
@@ -980,7 +1007,23 @@ impl ReliabilityMode for ReliableStream {
         }
         // Remember the newest SACK view for the NACK contradiction
         // check (best-effort; last message wins, ≤ MAX_ACK_RANGES).
-        self.last_sacked = ranges.to_vec();
+        // Reuse the existing buffer instead of allocating a fresh Vec
+        // per SACK: on a loss episode these arrive at up to the drain
+        // cadence (~1 kHz) plus the 25 ms tick, and the capacity is
+        // bounded at MAX_ACK_RANGES, so `clear` + `extend_from_slice`
+        // is steady-state allocation-free (review SACKSCAN/H7).
+        //
+        // Note on the full-`retain` cost (review SACKSCAN/H1): a
+        // deliberate short-circuit for a repeated-identical SACK is NOT
+        // applied. After the first SACK prunes the window down to only
+        // the genuinely-missing packets, `pending` is O(lost), so a
+        // repeated SACK's `retain` is already cheap; and skipping it
+        // would leave a concurrently-registered in-range straggler
+        // (see the `on_ack` straggler sweep) in `pending` for a
+        // spurious later retransmit — trading the feature's core
+        // no-RTO-flood guarantee for a scan that is no longer hot.
+        self.last_sacked.clear();
+        self.last_sacked.extend_from_slice(ranges);
         // Remove SACKed packets outright — no mark-and-skip. A
         // positive SACK means the receiver HAS them: they leave
         // in-flight accounting and must never be retransmit-eligible
@@ -2326,6 +2369,37 @@ mod tests {
             before,
             s.cwnd
         );
+    }
+
+    /// R-3 (review SACKSCAN): a repeated-identical SACK is idempotent —
+    /// the second application removes nothing, does not grow cwnd
+    /// again, and refreshes `last_sacked` in place (no per-message
+    /// reallocation of a fresh view). The window already holds only
+    /// the genuinely-missing head after the first SACK.
+    #[test]
+    fn on_ack_ranges_repeated_identical_is_idempotent() {
+        let mut s = ReliableStream::with_settings(Duration::from_millis(50), 16_384, 3);
+        for seq in 0..1000u64 {
+            s.on_send(descriptor(seq, Bytes::from_static(b"x")));
+        }
+        s.on_ack_ranges(0, &[(1, 1000)]);
+        let pending_after_first = s.pending.len();
+        let cwnd_after_first = s.cwnd;
+        assert_eq!(pending_after_first, 1, "only the missing head remains");
+        assert_eq!(s.last_sacked, vec![(1, 1000)]);
+
+        // Same SACK again: no change to the window or cwnd.
+        s.on_ack_ranges(0, &[(1, 1000)]);
+        assert_eq!(
+            s.pending.len(),
+            pending_after_first,
+            "repeated identical SACK removes nothing new"
+        );
+        assert_eq!(
+            s.cwnd, cwnd_after_first,
+            "repeated identical SACK must not re-grow cwnd"
+        );
+        assert_eq!(s.last_sacked, vec![(1, 1000)], "last_sacked stays correct");
     }
 
     /// R-3 / Karn: a SACKed packet that was retransmitted must not
