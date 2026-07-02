@@ -293,3 +293,97 @@ No CLAUDE.md files govern the changed code; no findings.
 | CODECLEN | G4 | triplicated exact-size decode check |
 | FIXTURES | F1 F2 | test fixture duplication (downgraded: matches suite convention) |
 | singletons | G3 G5 G6 H4 H6 H8 F5 | minor / deprioritized / dropped (see notes) |
+
+---
+
+## Resolution (2026-07-02, post-verification)
+
+Each cluster was verified (1-vote adversarial pass; several verifiers were
+re-judged by hand against the code after a rate-limit) and then fixed,
+deferred, or refuted. Fixes landed on branch `stream-ack-batching-and-ranges`.
+
+### Fixed (code + tests)
+
+- **CAPCACHE** (CONFIRMED) — `handle_capability_announcement` now removes the
+  peer's `ack_ranges_peer_cache` entry after folding the announcement, so a
+  verdict cached before the announcement landed (the connect-time race that
+  pinned `false` for the 5 s TTL) and a stale `true` after a peer downgrade are
+  both invalidated immediately. `ack_ranges_peer_cache` added to `DispatchCtx`.
+  Test: `ack_ranges_gate_reresolves_after_announcement_invalidation`.
+- **LOCK3** (CONFIRMED) — `build_session_control_events` now reads `ack_seq` +
+  NACK + SACK ranges under ONE `try_stream` + ONE reliability lock per stream,
+  so a cycle's three control frames are a consistent snapshot (was three
+  separate lock acquisitions that could pair a stale grant/NACK with a fresher
+  SACK). Also removes 2 of every 3 DashMap lookups + lock round-trips on the
+  drainer hot path.
+- **TICK2X** (CONFIRMED) — the 25 ms retransmit tick now walks each session's
+  streams ONCE via new `NetSession::collect_gap_reports` (returns NACK +
+  ack_seq + ranges under one lock), replacing the back-to-back
+  `collect_gap_nacks` + `collect_ack_ranges` double-walk.
+- **EMITLOOP + ACKCHUNK** (CONFIRMED) — extracted one `emit_control_chunks`
+  helper (used by the drainer NACK/SACK and the tick reset/NACK/SACK sites,
+  killing the 6-way copy-paste drift) that packs by ACTUAL size via new
+  `pack_control_events` instead of a worst-case fixed count — variable-size
+  `StreamAckRanges` events no longer ship packets ~85 % empty. Tests:
+  `pack_control_events_fills_by_size_not_worst_case`,
+  `pack_control_events_lone_oversized_event_ships_alone`.
+- **SACKSCAN/H7** (CONFIRMED) — `on_ack_ranges` reuses the `last_sacked` buffer
+  (`clear` + `extend_from_slice`) instead of a fresh `to_vec` per SACK. H1's
+  retain short-circuit was deliberately NOT taken (a concurrently-registered
+  in-range straggler would be skipped → spurious later retransmit; and after
+  the first prune `pending` is O(lost) so the scan is no longer hot). Test:
+  `on_ack_ranges_repeated_identical_is_idempotent`.
+- **ANOMALY** (PLAUSIBLE) — the same-cycle inconsistency is removed by the
+  LOCK3 single-snapshot; the residual cross-datagram-reordering false positive
+  cannot be prevented by any receiver, so the `protocol_anomalies` docs were
+  corrected from "indicates a buggy or hostile peer" to a best-effort signal
+  ("alert on sustained growth, not a single count").
+- **CODECLEN/G4** (CONFIRMED cleanup) — extracted `require_exact_len` shared by
+  the three fixed-size decoders, collapsing the triplicated Truncated/Oversize
+  match (the exact drift that produced the original "need 16" bug).
+- **DORMANT** (CONFIRMED) — fixed by documentation: the tag only propagates
+  once the node broadcasts a capability announcement (explicit
+  `announce_capabilities`, or the `start_arc` reannounce loop within
+  `capability_reannounce_interval`); bare `start()` without an announce keeps
+  the legacy path. Docs on `ACK_RANGES_CAPABILITY_TAG` and
+  `enable_stream_ack_ranges` now state this. Making the node auto-announce at
+  startup is a deliberate global-behavior change left to the maintainer.
+- **HORIZON/I6** (PLAUSIBLE) — added a caveat on `reorder_horizon` that reusing
+  `max_pending` as the rx acceptance budget is a construction-time coincidence,
+  and what to change if tx/rx windows ever diverge.
+- **G5** — subsumed: the `AckWork` tuple alias was removed entirely (the tick
+  now uses `GapReport`), and the now-orphaned `StreamAckRangesEntry` alias was
+  deleted.
+
+### Refuted (no change)
+
+- **ADDR** (A2/B3/C3/E1) — `session_id → peer_addr` is an immutable binding
+  (`resolve_grant_peer` snapshots addr + session together; every rebind builds
+  a fresh session_id). One session_id can never hold two addrs, so grouping on
+  session_id and keeping the first addr is behaviourally identical to the old
+  per-grant addressing.
+- **RESETLOSS** (B2) — per-reset loss was already permanent pre-batching (same
+  destructive `take_failed_stream_ids`, one unacked datagram per reset, no
+  retry). Batching changes only fate-correlation; StreamReset is itself a
+  fast-fail optimisation over the peer-side timeout. Negligible.
+- **INSTANT** (A5/D2/E8) — Rust `Instant` on Linux does not panic below the
+  boot epoch (tv_sec is i64), and CI is `ubuntu-latest`; the pattern is used at
+  ~10 existing sites. Only a fresh-boot (<41 s uptime) Windows dev box is
+  affected — negligible; left as-is for consistency.
+
+### Deferred / noted (no fix)
+
+- **GRANTLOSS** (B1/E2/E7) — real correlation change (one lost grant-chunk
+  datagram now costs many streams' grants vs one pre-batching), but grants are
+  authoritative + re-minted on the next accepted packet and the flush-stall
+  budget backstops; `send_to` errors are rare and on-wire loss was never
+  distinguishable. Batching's syscall/packet reduction is the intended
+  trade-off. Not fixed; flagged for maintainer if credit-blocked-idle stalls
+  are observed.
+- **NACKMAX** (B4/C4) — the lifted reorder horizon is the feature's whole
+  point; the verifier judged the `u64::MAX` legacy-NACK burst "differently bad,
+  arguably better" than the old drop + RTO-collapse, and the spurious-reset
+  escalation does not hold (`on_nack` never sets `failed`). Bounded trade-off,
+  no code change.
+- Minor cleanups **G3/G6/H4/H6/H8** and **FIXTURES F1/F2**, **F5** — left as-is
+  (deliberate landed decisions, or match existing crate conventions).
