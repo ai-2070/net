@@ -1,0 +1,19 @@
+web/src/docs.order.ts
+  s_e69efae25a44e0::t_306b98544e4301 68,153
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.9",
+  "base_commit_sha": "dc06187d6f4576dd02dc99ca9dafaa68c6ce09fe",
+  "prompts": {},
+  "sessions": {
+    "s_e69efae25a44e0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "94d44123-1184-41ad-8165-0c6af1be74b2",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
