@@ -1,14 +1,17 @@
 # Stream ACKs — batched emission + range-bound (SACK-range) ACKs
 
-**Status:** DONE (2026-07-02). Phase 1 (batched control-frame emission)
-landed in `97662a9fe`; Phase 2 (positive SACK-range ACKs) in the
-follow-up commit. Verified: 4552 lib tests (9 new R-2/R-3 unit tests, 8
-Phase-1 batching tests, 7 codec tests), `tests/stream_ack_ranges.rs`
-(capability-gated engage-under-loss + old-peer interop + kill switch),
-all transfer/nrpc/three-node suites incl. the 4 MiB concurrent sweep,
-clippy clean. `benches/reliability.rs`: in-order `on_receive` hot path
-~1.6 ns post-rewrite; SACK prune of a 1000-packet window ~40 µs
-(loss-path only).
+**Status:** DONE + review-hardened (2026-07-02). Phase 1 (batched
+control-frame emission) landed in `97662a9fe`; Phase 2 (positive
+SACK-range ACKs) in the follow-up commit; a branch code-review pass then
+landed the hardening below (see [Post-landing review
+hardening](#post-landing-review-hardening-2026-07-02)). Verified: full
+lib test suite (R-2/R-3 unit tests, Phase-1 batching tests, codec tests,
+plus new gate-invalidation / size-packing / idempotent-SACK regression
+tests), `tests/stream_ack_ranges.rs` (capability-gated engage-under-loss
++ old-peer interop + kill switch), all transfer/nrpc/three-node suites
+incl. the 4 MiB concurrent sweep, clippy clean. `benches/reliability.rs`:
+in-order `on_receive` hot path ~1.6 ns post-rewrite; SACK prune of a
+1000-packet window ~40 µs (loss-path only).
 
 **Outcome:** grant/NACK/reset control frames batch per session
 (O(sessions) packets per drain cycle, was O(2·streams));
@@ -23,6 +26,60 @@ large in-flight RTO-resends O(lost) instead of O(window) — pinned by
 `on_ack_ranges_suppresses_rto_flood_after_head_loss` and the e2e test.
 Observability via `MeshNode::control_plane_stats()` + per-stream
 out-of-order / anomaly counters.
+
+## Post-landing review hardening (2026-07-02)
+
+A branch code-review pass (10 finder angles + adversarial verification;
+outcomes recorded in `docs/misc/CODE_REVIEW_2026_07_02_ACKS_PLAN_CANDIDATES.md`)
+landed the following on top of the feature commits. Nothing changed the
+wire format; all are correctness/consistency/efficiency or documentation.
+
+- **Gate-cache invalidation on announcement.** The per-peer ack-ranges
+  capability-gate cache (R-5) was only expired by its 5 s TTL or
+  dead-peer eviction, so the first gate check after connect (the 25 ms
+  retransmit tick) could cache `false` before the peer's announcement
+  folded and pin the legacy path for the opening loss episode of a fresh
+  transfer; a peer downgrade could keep a stale `true`.
+  `handle_capability_announcement` now removes the peer's
+  `ack_ranges_peer_cache` entry the instant its announcement is folded
+  (cache added to `DispatchCtx`). Pinned by
+  `ack_ranges_gate_reresolves_after_announcement_invalidation`.
+- **Consistent per-cycle snapshot.** `build_session_control_events`
+  reads `ack_seq` + NACK + SACK ranges under ONE `try_stream` + ONE
+  reliability lock per stream (was three), so a cycle's grant / NACK /
+  `StreamAckRanges` for a stream can no longer disagree when a head-fill
+  lands mid-build — and drops ~2/3 of the drainer's per-stream
+  lock/DashMap traffic.
+- **Single-walk proactive tick.** The 25 ms tick now collects each
+  gapped stream's NACK + ack_seq + ranges in one walk via
+  `NetSession::collect_gap_reports` (one lock per stream), replacing the
+  back-to-back `collect_gap_nacks` + `collect_ack_ranges` double-walk.
+- **Size-aware batched emit.** One `emit_control_chunks` helper serves
+  the drainer NACK/SACK and tick reset/NACK/SACK sites (was six drifted
+  copies), packing by actual framed size via `pack_control_events`
+  instead of a worst-case fixed count — so variable-size
+  `StreamAckRanges` events (32..=272 B) fill a datagram instead of
+  shipping one budgeted at the 272 B worst case ~85 % empty.
+  `ACK_EVENTS_PER_PACKET` retired in favor of size packing. Pinned by
+  `pack_control_events_fills_by_size_not_worst_case`.
+- **`on_ack_ranges` allocation.** Reuses the `last_sacked` buffer
+  (`clear` + `extend_from_slice`) instead of a fresh `to_vec` per SACK.
+- **`protocol_anomalies` semantics clarified.** The same-cycle
+  contradiction is removed by the single-snapshot build, but the NACK
+  and SACK for one gap still ride separate datagrams that reorder
+  independently on the wire, so an honest peer on a lossy/jittery path
+  can trip the counter. It is documented as a best-effort signal
+  ("alert on sustained growth"), NOT proof of a hostile peer — softening
+  the R-3 contradiction-rule claim below.
+- **Codec dedup.** `require_exact_len` shared by the three fixed-size
+  decoders (`StreamWindow`/`StreamNack`/`StreamReset`), the exact drift
+  surface that produced the original stale "need 16" message.
+- **Advertisement caveat (see R-5).** The tag only reaches a peer once
+  this node actually broadcasts a capability announcement — an explicit
+  `announce_capabilities`, or the `start_arc` reannounce loop within
+  `capability_reannounce_interval`. A bare `start()` that never announces
+  keeps peers on the legacy path; documented on
+  `ACK_RANGES_CAPABILITY_TAG` / `enable_stream_ack_ranges`.
 
 ## Background — how ACKs work today (verified 2026-07-02)
 
@@ -258,8 +315,13 @@ New trait method `ReliabilityMode::on_ack_ranges(ack_seq: u64, ranges:
   SACK range acknowledged, the positive ACK wins for that seq — the
   packet is gone from `pending`, so `on_nack` naturally finds nothing;
   count a `protocol_anomaly` metric rather than resurrecting state.
-  Receiver-side producer logic can't emit both (NACK derives from the
-  same range set), so an anomaly indicates a buggy/hostile peer.
+  A single receiver *snapshot* can't emit both (they derive from one
+  range set — enforced by the single-lock build, see [review
+  hardening](#post-landing-review-hardening-2026-07-02)), but the NACK
+  and SACK for one gap ride separate datagrams that reorder
+  independently on the wire, so an honest peer on a lossy/jittery path
+  trips this too. Treat `protocol_anomalies` as a best-effort signal
+  (alert on sustained growth), **not** proof of a buggy/hostile peer.
 - Sacked packets do NOT clear `recover` — only a cumulative ack past the
   recover point does (unchanged, T-1).
 
@@ -273,11 +335,17 @@ Emit a `StreamAckRanges` event (batched per session per Phase 1, one
   fires on every accepted packet, carrying the advanced `ack_seq`; verify
   that covers the collapse case and the sender prunes fast — if so, no
   extra emission needed here, and the plan's default is to rely on it.)
-- the 25 ms tick fires with unresolved gaps (same walk as
-  `collect_gap_nacks`).
+- the 25 ms tick fires with unresolved gaps. As landed, this is a
+  *single* per-stream walk (`NetSession::collect_gap_reports`) that
+  yields the NACK and the SACK ranges from one reliability-lock snapshot
+  — not the two separate `collect_gap_nacks` / `collect_ack_ranges`
+  walks the plan first sketched (see [review
+  hardening](#post-landing-review-hardening-2026-07-02)).
 
 No gaps ⇒ nothing emitted; the grant's `ack_seq` covers the contiguous
-case, so loss-free streams see zero new control traffic.
+case, so loss-free streams see zero new control traffic. Emission is
+size-packed (`pack_control_events`): variable-size `StreamAckRanges`
+events fill each datagram by actual size rather than a worst-case count.
 
 ### R-5 — Dispatch + capability gating
 
@@ -290,6 +358,15 @@ case, so loss-free streams see zero new control traffic.
   that don't ⇒ legacy cumulative + NACK only. **Receivers accept
   unconditionally**, including from peers that never announced —
   capability here is optimization negotiation, not authority.
+  The peer-support verdict is cached per node; that cache is
+  invalidated the moment a fresh announcement is folded, so the
+  connect-time "cached `false` before the announcement landed" race and
+  a stale `true` after a downgrade both self-heal at once, not on the
+  5 s TTL (see [review
+  hardening](#post-landing-review-hardening-2026-07-02)). **Note:** the
+  tag only propagates once this node broadcasts an announcement — via
+  `announce_capabilities` or the `start_arc` reannounce loop; a bare
+  `start()` that never announces leaves peers on the legacy path.
 - Unknown subprotocol ids drop safely on old peers
   (`wrong_subprotocol_id_in_payload_dropped`, `mesh.rs` ~15246) — an
   accidental ungated send is survivable but wasteful; gate anyway, and
