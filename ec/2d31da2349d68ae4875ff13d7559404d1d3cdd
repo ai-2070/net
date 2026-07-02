@@ -1,0 +1,24 @@
+net/crates/net/src/adapter/net/reliability.rs
+  s_71546d4a471b13::t_680a8a5384c2ec 844-854
+  s_71546d4a471b13::t_ad09f3a3fc2563 2374-2404
+  s_71546d4a471b13::t_b60cbb504d70b6 612-623
+  s_71546d4a471b13::t_f06b90ab1b2114 646-652
+  s_71546d4a471b13::t_13cea9b0462f0b 1010-1026
+  s_71546d4a471b13::t_01bb869614b922 273-281
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.9",
+  "base_commit_sha": "ec2d31da2349d68ae4875ff13d7559404d1d3cdd",
+  "prompts": {},
+  "sessions": {
+    "s_71546d4a471b13": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dc971519-8aad-49ab-b743-eb40e2447a5e",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
