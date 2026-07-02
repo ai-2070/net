@@ -125,7 +125,9 @@ pub use identity::{
     EntityError, EntityId, EntityKeypair, OriginStamp, PermissionToken, TokenCache, TokenError,
     TokenScope,
 };
-pub use mesh::{MeshNode, MeshNodeConfig, PartitionFilter};
+pub use mesh::{
+    ControlPlaneStats, MeshNode, MeshNodeConfig, PartitionFilter, ACK_RANGES_CAPABILITY_TAG,
+};
 #[cfg(feature = "netdb")]
 pub use netdb::{MemoriesFilter, NetDb, NetDbBuilder, NetDbError, NetDbSnapshot, TasksFilter};
 // `SharedPacketPool` is intentionally not re-exported — see

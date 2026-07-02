@@ -1,11 +1,28 @@
 # Stream ACKs — batched emission + range-bound (SACK-range) ACKs
 
-**Status:** IN PROGRESS (drafted 2026-07-02; revised same day after review).
-Two phases, each landed and committed separately: Phase 1 (batched
-control-frame emission — wire-compatible, no format change) and Phase 2
-(positive SACK/range ACKs — new subprotocol, capability-negotiated).
-Phase 1 ships first: it is prerequisite-free, harvests the easy win, and
-its per-peer grouping is the emission structure Phase 2 rides on.
+**Status:** DONE (2026-07-02). Phase 1 (batched control-frame emission)
+landed in `97662a9fe`; Phase 2 (positive SACK-range ACKs) in the
+follow-up commit. Verified: 4552 lib tests (9 new R-2/R-3 unit tests, 8
+Phase-1 batching tests, 7 codec tests), `tests/stream_ack_ranges.rs`
+(capability-gated engage-under-loss + old-peer interop + kill switch),
+all transfer/nrpc/three-node suites incl. the 4 MiB concurrent sweep,
+clippy clean. `benches/reliability.rs`: in-order `on_receive` hot path
+~1.6 ns post-rewrite; SACK prune of a 1000-packet window ~40 µs
+(loss-path only).
+
+**Outcome:** grant/NACK/reset control frames batch per session
+(O(sessions) packets per drain cycle, was O(2·streams));
+`SUBPROTOCOL_STREAM_ACK = 0x0B03` carries half-open newest-first SACK
+ranges, emission gated on the auto-announced
+`net.reliable.stream_ack_ranges@1` capability tag
+(`MeshNodeConfig::enable_stream_ack_ranges` kill switch); the receiver's
+64-seq reorder bitmap became a budgeted range index
+(horizon = window-derived, floor 64, `MAX_REORDER_RANGES = 32`); SACKed
+packets are removed from the retransmit window, so one head loss under
+large in-flight RTO-resends O(lost) instead of O(window) — pinned by
+`on_ack_ranges_suppresses_rto_flood_after_head_loss` and the e2e test.
+Observability via `MeshNode::control_plane_stats()` + per-stream
+out-of-order / anomaly counters.
 
 ## Background — how ACKs work today (verified 2026-07-02)
 

@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwapOption;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -110,6 +110,27 @@ const NACK_EVENTS_PER_PACKET: usize =
 /// See [`GRANT_EVENTS_PER_PACKET`]; `StreamReset` is 8 B.
 const RESET_EVENTS_PER_PACKET: usize =
     protocol::MAX_PAYLOAD_SIZE / (EventFrame::LEN_SIZE + STREAM_RESET_SIZE);
+/// See [`GRANT_EVENTS_PER_PACKET`]; `StreamAckRanges` is variable-size,
+/// so chunk by its worst case (header + `MAX_ACK_RANGES` ranges =
+/// 272 B) — any mix of range counts then fits the payload budget.
+const ACK_EVENTS_PER_PACKET: usize =
+    protocol::MAX_PAYLOAD_SIZE / (EventFrame::LEN_SIZE + StreamAckRanges::MAX_SIZE);
+
+/// Capability tag advertising support for positive SACK-range ACKs
+/// (`StreamAckRanges`, STREAM_ACK_BATCHING R-5). Auto-merged into
+/// every capability announcement (same pattern as the `nrpc:` /
+/// `ai-tool:` tags) unless
+/// [`MeshNodeConfig::enable_stream_ack_ranges`] is off. Emission is
+/// gated on the peer advertising this tag; receiving is
+/// unconditional — the capability is optimization negotiation, not
+/// authority.
+pub const ACK_RANGES_CAPABILITY_TAG: &str = "net.reliable.stream_ack_ranges@1";
+
+/// TTL for the per-peer ack-ranges capability-gate cache. Capability
+/// entries change on announcement cadence (seconds to minutes); the
+/// drainer asks at up to 1 kHz per session, so gate lookups read
+/// through this cache instead of taking the fold lock every cycle.
+const ACK_RANGES_CAP_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// Control-plane emission counters (STREAM_ACK_BATCHING B-4).
 ///
@@ -137,6 +158,11 @@ pub struct ControlPlaneStats {
     /// Data packets re-sent by the reliability layer: NACK-driven
     /// fast retransmits + RTO-driven timeout retransmits.
     pub retransmit_packets_sent: AtomicU64,
+    /// `StreamAckRanges` control packets emitted (R-4; capability-
+    /// gated per peer).
+    pub ack_range_packets_sent: AtomicU64,
+    /// Individual `StreamAckRanges` events emitted.
+    pub ack_range_events_sent: AtomicU64,
 }
 
 impl ControlPlaneStats {
@@ -221,6 +247,36 @@ fn group_grants_by_session(
     by_session
 }
 
+/// Capability gate for `StreamAckRanges` emission (STREAM_ACK_BATCHING
+/// R-5): does the peer behind `session_id` advertise
+/// [`ACK_RANGES_CAPABILITY_TAG`]? Resolution is session → node via
+/// `session_id_to_node`, then a per-node tag lookup in the capability
+/// fold, read through a [`ACK_RANGES_CAP_CACHE_TTL`] cache (the
+/// drainer asks at up to 1 kHz per session; the fold lookup takes the
+/// fold's read lock). Unknown node or no tag ⇒ `false` — the legacy
+/// cumulative-ACK + NACK path is always safe.
+fn peer_supports_ack_ranges(
+    cache: &DashMap<u64, (bool, Instant)>,
+    session_id_to_node: &DashMap<u64, u64>,
+    capability_fold: &super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>,
+    session_id: u64,
+) -> bool {
+    let Some(node_id) = session_id_to_node.get(&session_id).map(|e| *e.value()) else {
+        return false;
+    };
+    if let Some(hit) = cache.get(&node_id) {
+        if hit.value().1.elapsed() < ACK_RANGES_CAP_CACHE_TTL {
+            return hit.value().0;
+        }
+    }
+    let supports =
+        super::behavior::fold::capability::capability_tags_for(capability_fold, node_id)
+            .iter()
+            .any(|t| t == ACK_RANGES_CAPABILITY_TAG);
+    cache.insert(node_id, (supports, Instant::now()));
+    supports
+}
+
 /// Total wire bytes for a single Net packet carrying `payload_bytes`
 /// of AEAD-encrypted content. Saturating at `u32::MAX` so a
 /// pathological `payload_bytes` can't silently wrap the credit math.
@@ -237,9 +293,9 @@ use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subnet::{DropReason, SubnetGateway, SubnetId, SubnetPolicy};
 use super::subprotocol::stream_window::{
-    StreamNack, StreamReset, StreamWindow, STREAM_NACK_SIZE, STREAM_RESET_SIZE,
-    STREAM_WINDOW_SIZE, SUBPROTOCOL_STREAM_NACK, SUBPROTOCOL_STREAM_RESET,
-    SUBPROTOCOL_STREAM_WINDOW,
+    StreamAckRanges, StreamNack, StreamReset, StreamWindow, MAX_ACK_RANGES, STREAM_NACK_SIZE,
+    STREAM_RESET_SIZE, STREAM_WINDOW_SIZE, SUBPROTOCOL_STREAM_ACK, SUBPROTOCOL_STREAM_NACK,
+    SUBPROTOCOL_STREAM_RESET, SUBPROTOCOL_STREAM_WINDOW,
 };
 use super::subprotocol::MigrationSubprotocolHandler;
 use super::transport::{NetSocket, PacketReceiver, ParsedPacket, SocketBufferConfig};
@@ -920,6 +976,13 @@ pub struct MeshNodeConfig {
     /// (the SDK / FFI path) — re-broadcasting needs an owned `Arc`. A bare
     /// [`MeshNode::start`] omits it.
     pub capability_reannounce_interval: Duration,
+    /// Emit positive SACK-range ACKs (`StreamAckRanges`) to peers that
+    /// advertise [`ACK_RANGES_CAPABILITY_TAG`], and merge that tag
+    /// into this node's own capability announcements
+    /// (STREAM_ACK_BATCHING R-5). Disabling turns the feature off
+    /// wire-wide for this node's sends and advertisements; receiving
+    /// stays unconditional. Default `true`.
+    pub enable_stream_ack_ranges: bool,
     /// This node's subnet. Defaults to [`SubnetId::GLOBAL`] — "no
     /// restriction." Visibility checks compare against this value on
     /// both the publish and subscribe paths.
@@ -1064,6 +1127,7 @@ impl MeshNodeConfig {
             require_signed_capabilities: true,
             capability_gc_interval: Duration::from_secs(60),
             capability_reannounce_interval: Duration::from_secs(150),
+            enable_stream_ack_ranges: true,
             subnet: SubnetId::GLOBAL,
             subnet_policy: None,
             default_visibility: Visibility::Global,
@@ -1156,6 +1220,13 @@ impl MeshNodeConfig {
     /// the loop.
     pub fn with_capability_reannounce_interval(mut self, interval: Duration) -> Self {
         self.capability_reannounce_interval = interval;
+        self
+    }
+
+    /// Enable/disable SACK-range ACK emission + advertisement. See
+    /// [`Self::enable_stream_ack_ranges`].
+    pub fn with_stream_ack_ranges(mut self, enable: bool) -> Self {
+        self.enable_stream_ack_ranges = enable;
         self
     }
 
@@ -2293,6 +2364,10 @@ pub struct MeshNode {
     /// retransmit sends. Shared with the drainer, the retransmit
     /// loop, and the dispatch context.
     control_stats: Arc<ControlPlaneStats>,
+    /// Per-peer cache for the ack-ranges capability gate (R-5):
+    /// `node_id → (supports, checked_at)`. See
+    /// [`peer_supports_ack_ranges`].
+    ack_ranges_peer_cache: Arc<DashMap<u64, (bool, Instant)>>,
     /// Whether the node has been started
     started: AtomicBool,
     /// Weak self-reference, set by [`Self::start_arc`] when the node is
@@ -2702,6 +2777,7 @@ impl MeshNode {
             pending_stream_grants: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             pending_stream_grants_notify: Arc::new(Notify::new()),
             control_stats: Arc::new(ControlPlaneStats::default()),
+            ack_ranges_peer_cache: Arc::new(DashMap::new()),
             started: AtomicBool::new(false),
             self_weak: std::sync::OnceLock::new(),
             accept_in_flight: std::sync::atomic::AtomicUsize::new(0),
@@ -4973,6 +5049,36 @@ impl MeshNode {
             return;
         }
 
+        // Positive SACK-range ACK (STREAM_ACK_BATCHING R-5): the peer
+        // positively acknowledges out-of-order received runs on a
+        // stream we're sending it. Remove those packets from the
+        // retransmit window so the RTO backstop resends only the
+        // genuinely missing ones — pre-R-3 a single lost head packet
+        // RTO-flooded every tracked packet behind it and collapsed
+        // cwnd. Accepted unconditionally: the capability gate applies
+        // to EMISSION only (negotiation, not authority).
+        if parsed.header.subprotocol_id == SUBPROTOCOL_STREAM_ACK {
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+            for payload in events {
+                let ack = match StreamAckRanges::decode(&payload) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "malformed StreamAckRanges");
+                        continue;
+                    }
+                };
+                // Don't resurrect a recently-closed stream's send state.
+                if session.is_grant_quarantined(ack.stream_id) {
+                    continue;
+                }
+                let Some(state) = session.try_stream(ack.stream_id) else {
+                    continue;
+                };
+                state.with_reliability(|r| r.on_ack_ranges(ack.ack_seq, &ack.ranges));
+            }
+            return;
+        }
+
         // Stream reset (STREAM_RETRANSMIT H-3): the sender gave up
         // retransmitting this stream. Fail any pending blob-transfer read
         // on it now (distinct error) instead of waiting for the caller's
@@ -5764,6 +5870,12 @@ impl MeshNode {
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
         let control_stats = self.control_stats.clone();
+        // R-4/R-5 emission gate inputs: config kill-switch + the
+        // per-peer capability cache and its resolution maps.
+        let ack_ranges_enabled = self.config.enable_stream_ack_ranges;
+        let ack_cache = self.ack_ranges_peer_cache.clone();
+        let session_id_to_node = self.session_id_to_node.clone();
+        let capability_fold = self.capability_fold.clone();
 
         tokio::spawn(async move {
             while !shutdown.load(Ordering::Acquire) {
@@ -5797,10 +5909,21 @@ impl MeshNode {
                 // B-1: group by session — the session owns the AEAD
                 // cipher, packet pool, and control-seq counter, so it
                 // is the unit a batched packet can be built against.
-                for (_, (session, peer_addr, grants)) in group_grants_by_session(drained) {
+                for (session_id, (session, peer_addr, grants)) in group_grants_by_session(drained)
+                {
                     if partition_filter.contains(&peer_addr) {
                         continue;
                     }
+                    // R-5: resolve the peer's SACK-range support once
+                    // per session per cycle (cached; see
+                    // `peer_supports_ack_ranges`).
+                    let emit_ack_ranges = ack_ranges_enabled
+                        && peer_supports_ack_ranges(
+                            &ack_cache,
+                            &session_id_to_node,
+                            &capability_fold,
+                            session_id,
+                        );
                     // Build every grant event — plus the piggybacked
                     // NACK events (STREAM_RETRANSMIT D-2) for streams
                     // with gaps — up front, then emit multi-event
@@ -5810,6 +5933,7 @@ impl MeshNode {
                     // peers apply every batched grant/NACK.
                     let mut grant_events: Vec<Bytes> = Vec::with_capacity(grants.len());
                     let mut nack_events: Vec<Bytes> = Vec::new();
+                    let mut ack_events: Vec<Bytes> = Vec::new();
                     for (stream_id, total_consumed) in grants {
                         // Piggyback the receiver's cumulative reliable
                         // ack (next_expected) so the sender prunes its
@@ -5846,6 +5970,31 @@ impl MeshNode {
                             }
                             .encode();
                             nack_events.push(Bytes::copy_from_slice(&payload));
+                        }
+                        // R-4: positive SACK ranges for a gapped
+                        // stream, to peers that advertise support.
+                        // `ack_seq` + ranges are read under ONE
+                        // reliability lock so the wire message is
+                        // internally consistent (every range strictly
+                        // above its own ack_seq — the decode-side
+                        // validation invariant). A gapless stream
+                        // returns no ranges and costs nothing here.
+                        if emit_ack_ranges {
+                            let snapshot = session.try_stream(stream_id).map(|s| {
+                                s.with_reliability(|r| {
+                                    (r.rx_ack_seq(), r.build_ack_ranges(MAX_ACK_RANGES))
+                                })
+                            });
+                            if let Some((range_ack_seq, ranges)) = snapshot {
+                                if !ranges.is_empty() {
+                                    let msg = StreamAckRanges {
+                                        stream_id,
+                                        ack_seq: range_ack_seq,
+                                        ranges,
+                                    };
+                                    ack_events.push(Bytes::from(msg.encode()));
+                                }
+                            }
                         }
                     }
                     let pool = session.thread_local_pool();
@@ -5888,6 +6037,25 @@ impl MeshNode {
                             chunk.len(),
                         );
                     }
+                    for chunk in ack_events.chunks(ACK_EVENTS_PER_PACKET) {
+                        let seq = session.next_control_tx_seq();
+                        let packet = builder.build_subprotocol(
+                            CONTROL_STREAM_ID,
+                            seq,
+                            chunk,
+                            PacketFlags::NONE,
+                            SUBPROTOCOL_STREAM_ACK,
+                        );
+                        if let Err(e) = socket.send_to(&packet, peer_addr).await {
+                            tracing::debug!(error = %e, "StreamAckRanges send failed");
+                            continue;
+                        }
+                        ControlPlaneStats::record_packet(
+                            &control_stats.ack_range_packets_sent,
+                            &control_stats.ack_range_events_sent,
+                            chunk.len(),
+                        );
+                    }
                 }
             }
         })
@@ -5906,6 +6074,11 @@ impl MeshNode {
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
         let control_stats = self.control_stats.clone();
+        // R-4/R-5 proactive SACK-range emission gate inputs.
+        let ack_ranges_enabled = self.config.enable_stream_ack_ranges;
+        let ack_cache = self.ack_ranges_peer_cache.clone();
+        let session_id_to_node = self.session_id_to_node.clone();
+        let capability_fold = self.capability_fold.clone();
 
         tokio::spawn(async move {
             while !shutdown.load(Ordering::Acquire) {
@@ -6041,6 +6214,71 @@ impl MeshNode {
                             ControlPlaneStats::record_packet(
                                 &control_stats.nack_packets_sent,
                                 &control_stats.nack_events_sent,
+                                chunk.len(),
+                            );
+                        }
+                    }
+                }
+
+                // R-4: proactive SACK ranges for quiet gapped streams,
+                // capability-gated per peer (R-5) — same cadence
+                // rationale as the gap NACKs above: the drainer-
+                // piggybacked emission only fires on new arrivals, so
+                // a gap with no further traffic re-advertises its
+                // received runs here instead of leaving the sender's
+                // RTO to guess.
+                type AckWork = Vec<(
+                    SocketAddr,
+                    Arc<NetSession>,
+                    Vec<(u64, u64, Vec<(u64, u64)>)>,
+                )>;
+                let mut ack_work: AckWork = Vec::new();
+                if ack_ranges_enabled {
+                    for peer in peers.iter() {
+                        let session = &peer.value().session;
+                        if !peer_supports_ack_ranges(
+                            &ack_cache,
+                            &session_id_to_node,
+                            &capability_fold,
+                            session.session_id(),
+                        ) {
+                            continue;
+                        }
+                        let items = session.collect_ack_ranges(MAX_ACK_RANGES);
+                        if !items.is_empty() {
+                            ack_work.push((peer.value().addr, session.clone(), items));
+                        }
+                    }
+                }
+                for (addr, session, items) in ack_work {
+                    let pool = session.thread_local_pool();
+                    let mut builder = pool.get();
+                    let ack_events: Vec<Bytes> = items
+                        .into_iter()
+                        .map(|(stream_id, ack_seq, ranges)| {
+                            Bytes::from(
+                                StreamAckRanges {
+                                    stream_id,
+                                    ack_seq,
+                                    ranges,
+                                }
+                                .encode(),
+                            )
+                        })
+                        .collect();
+                    for chunk in ack_events.chunks(ACK_EVENTS_PER_PACKET) {
+                        let seq = session.next_control_tx_seq();
+                        let packet = builder.build_subprotocol(
+                            CONTROL_STREAM_ID,
+                            seq,
+                            chunk,
+                            PacketFlags::NONE,
+                            SUBPROTOCOL_STREAM_ACK,
+                        );
+                        if socket.send_to(&packet, addr).await.is_ok() {
+                            ControlPlaneStats::record_packet(
+                                &control_stats.ack_range_packets_sent,
+                                &control_stats.ack_range_events_sent,
                                 chunk.len(),
                             );
                         }
@@ -9710,6 +9948,17 @@ impl MeshNode {
                 }
             }
             merged
+        };
+
+        // STREAM_ACK_BATCHING R-5: advertise transport support for
+        // positive SACK-range ACKs — same auto-augment pattern as the
+        // `nrpc:` / `ai-tool:` tags above. Config-gated so operators
+        // can turn the feature off wire-wide (compliant peers then
+        // never emit ranges to us, and we never emit to anyone).
+        let caps = if self.config.enable_stream_ack_ranges {
+            caps.add_tag(ACK_RANGES_CAPABILITY_TAG.to_string())
+        } else {
+            caps
         };
 
         let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;

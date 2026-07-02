@@ -38,6 +38,11 @@ use super::transport::ParsedPacket;
 /// for correct credit accounting across lifetimes.
 pub const GRANT_QUARANTINE_WINDOW: Duration = Duration::from_secs(2);
 
+/// One entry of [`NetSession::collect_ack_ranges`]:
+/// `(stream_id, ack_seq, ranges)` — the payload of an outgoing
+/// `StreamAckRanges` message (STREAM_ACK_BATCHING R-4).
+pub type StreamAckRangesEntry = (u64, u64, Vec<(u64, u64)>);
+
 /// Session state after handshake completion.
 pub struct NetSession {
     /// Session ID (derived from handshake)
@@ -281,6 +286,27 @@ impl NetSession {
         for entry in self.streams.iter() {
             if let Some(nack) = entry.value().with_reliability(|r| r.build_nack()) {
                 out.push((*entry.key(), nack));
+            }
+        }
+        out
+    }
+
+    /// Collect `(stream_id, ack_seq, ranges)` for every stream
+    /// currently holding out-of-order received runs
+    /// (STREAM_ACK_BATCHING R-4): the payloads of outgoing
+    /// `StreamAckRanges` messages. `ranges` is newest-first, capped
+    /// at `max_ranges`. Streams without gaps contribute nothing —
+    /// the grant's piggybacked `ack_seq` already covers the
+    /// contiguous case, so loss-free streams cost zero extra control
+    /// traffic.
+    pub fn collect_ack_ranges(&self, max_ranges: usize) -> Vec<StreamAckRangesEntry> {
+        let mut out = Vec::new();
+        for entry in self.streams.iter() {
+            let (ack_seq, ranges) = entry
+                .value()
+                .with_reliability(|r| (r.rx_ack_seq(), r.build_ack_ranges(max_ranges)));
+            if !ranges.is_empty() {
+                out.push((*entry.key(), ack_seq, ranges));
             }
         }
         out

@@ -392,6 +392,11 @@ harness = false
 required-features = ["net"]
 
 [[bench]]
+name = "reliability"
+harness = false
+required-features = ["net"]
+
+[[bench]]
 name = "cortex"
 harness = false
 required-features = ["cortex", "netdb"]
