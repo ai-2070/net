@@ -1,0 +1,45 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_ee23e37ba2d5f0::t_361119040d9e11 3736
+  s_ee23e37ba2d5f0::t_5ba05cf478ae0d 641-644
+  s_ee23e37ba2d5f0::t_ae96c9e0ba6301 5962-5971,5976,5980-5986
+  s_ee23e37ba2d5f0::t_665906baf5bafc 99-150
+  s_ee23e37ba2d5f0::t_05b3a2b3d1bbdf 4962,4965-4969
+  s_ee23e37ba2d5f0::t_249e5b5f4fe5bf 5749-5750
+  s_ee23e37ba2d5f0::t_c8264ec859fcda 5908
+  s_ee23e37ba2d5f0::t_c611aaacc5abab 2291-2295
+  s_ee23e37ba2d5f0::t_1a2de3388a6727 2704
+  s_ee23e37ba2d5f0::t_076a3e05f3e744 16079-16331
+  s_ee23e37ba2d5f0::t_905ce260b22a7c 5733-5748,5751-5758,5766
+  s_ee23e37ba2d5f0::t_d770872f8303ab 5941-5945
+  s_ee23e37ba2d5f0::t_73d2989a1747fb 240-241
+  s_ee23e37ba2d5f0::t_6d4752844d2768 6015-6031,6036,6040-6046
+  s_ee23e37ba2d5f0::t_90b902b50b6187 195-223
+  s_ee23e37ba2d5f0::t_917cddb6cac167 5797-5801,5804-5822,5824-5825,5828-5855,5857-5877,5881,5883,5885-5889
+  s_ee23e37ba2d5f0::t_0475caa8da8506 2277-2284
+net/crates/net/docs/plans/STREAM_ACK_BATCHING_AND_RANGES_PLAN.md
+  s_ee23e37ba2d5f0::t_b288b2435a86e1 318-322
+  s_ee23e37ba2d5f0::t_59673813dc7b5f 228-233
+net/crates/net/src/adapter/net/subprotocol/stream_window.rs
+  s_ee23e37ba2d5f0::t_f007391b186302 85-87,91,100
+  s_ee23e37ba2d5f0::t_ab7943dbb27ed3 258-268,274-280,286-289
+  s_ee23e37ba2d5f0::t_c5c9d1484e30a1 179-186
+  s_ee23e37ba2d5f0::t_4d8b4ff7f8ba54 220-227
+  s_ee23e37ba2d5f0::t_b7b48e0b27a5bc 92-97,101-106
+  s_ee23e37ba2d5f0::t_83b78722558e20 124-131
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.9",
+  "base_commit_sha": "97662a9fe9ae0b142fdb6c506fd9d9f01287ebda",
+  "prompts": {},
+  "sessions": {
+    "s_ee23e37ba2d5f0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e81805cc-911e-4bfc-a774-30595b43ba7f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
