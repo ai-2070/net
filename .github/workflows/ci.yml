@@ -234,13 +234,22 @@ jobs:
           --test integration_netdb
           --test netdb_builder_and_accessors
 
-      # === Dataforts (greedy + gravity) ===================================
-      - name: Dataforts greedy + gravity
+      # === Dataforts (greedy + gravity) + stream SACK ranges ==============
+      # `stream_ack_ranges` (STREAM_ACK_BATCHING_AND_RANGES_PLAN R-6)
+      # rides this feature set: it drives lossy blob transfers to prove
+      # the capability-gated SACK-range path engages
+      # (`StreamAckRanges` emitted, transfer completes byte-for-byte),
+      # that the gate stays shut without the peer capability (old-peer
+      # interop via the legacy cumulative-ACK + NACK path), and that
+      # the `enable_stream_ack_ranges` kill switch suppresses the
+      # capability advertisement.
+      - name: Dataforts greedy + gravity + stream SACK ranges
         if: ${{ !cancelled() }}
         run: >
           cargo nextest run --no-fail-fast --features dataforts
           --test dataforts_greedy_e2e
           --test dataforts_gravity_e2e
+          --test stream_ack_ranges
 
       # === Scheduled-stream batched drain (Linux sendmmsg send path) ======
       # The whole NRPC_SEND_LOOP_BATCHING_PLAN gate, in one compile. The
