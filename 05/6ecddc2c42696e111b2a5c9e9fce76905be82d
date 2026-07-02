@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_07_02_ACKS_PLAN_CANDIDATES.md
+  s_71546d4a471b13::t_b3e09a2ded5f6b 296-389
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.9",
+  "base_commit_sha": "056ecddc2c42696e111b2a5c9e9fce76905be82d",
+  "prompts": {},
+  "sessions": {
+    "s_71546d4a471b13": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dc971519-8aad-49ab-b743-eb40e2447a5e",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
