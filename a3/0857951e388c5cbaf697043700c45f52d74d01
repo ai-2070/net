@@ -1,0 +1,21 @@
+net/crates/net/src/adapter/net/subprotocol/stream_window.rs
+  s_71546d4a471b13::t_a7e71658b9eaf3 137-151
+  s_71546d4a471b13::t_22e29c058e31ae 210-219
+  s_71546d4a471b13::t_eaf055cf081d82 166-175
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.9",
+  "base_commit_sha": "a30857951e388c5cbaf697043700c45f52d74d01",
+  "prompts": {},
+  "sessions": {
+    "s_71546d4a471b13": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dc971519-8aad-49ab-b743-eb40e2447a5e",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
