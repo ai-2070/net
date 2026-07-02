@@ -1,0 +1,21 @@
+net/crates/net/docs/releases/RELEASE_v0.30_FINAL_COUNTDOWN.md
+  s_71546d4a471b13::t_b7097b2b40c523 27,29,31,33,35,37
+  s_71546d4a471b13::t_9bdc234f3b9d83 9,13
+  s_71546d4a471b13::t_8da5759fbb0275 17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.9",
+  "base_commit_sha": "e5d28604113c78763aecd0cfb8104c2191517688",
+  "prompts": {},
+  "sessions": {
+    "s_71546d4a471b13": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dc971519-8aad-49ab-b743-eb40e2447a5e",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
