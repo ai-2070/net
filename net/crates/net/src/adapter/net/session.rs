@@ -38,10 +38,25 @@ use super::transport::ParsedPacket;
 /// for correct credit accounting across lifetimes.
 pub const GRANT_QUARANTINE_WINDOW: Duration = Duration::from_secs(2);
 
-/// One entry of [`NetSession::collect_ack_ranges`]:
-/// `(stream_id, ack_seq, ranges)` — the payload of an outgoing
-/// `StreamAckRanges` message (STREAM_ACK_BATCHING R-4).
-pub type StreamAckRangesEntry = (u64, u64, Vec<(u64, u64)>);
+/// One gapped stream's proactive-tick report (STREAM_ACK_BATCHING
+/// R-4), produced by [`NetSession::collect_gap_reports`] under a
+/// single reliability lock per stream so the NACK and the SACK ranges
+/// describe the same received-range snapshot.
+#[derive(Debug, Clone)]
+pub struct GapReport {
+    /// Stream the gap is on.
+    pub stream_id: u64,
+    /// Legacy negative ack for the gap (always present — every gapped
+    /// stream emits one, capability-independent).
+    pub nack: super::protocol::NackPayload,
+    /// Cumulative ack (`next_expected`) captured in the same snapshot
+    /// as `ranges`, so the outgoing `StreamAckRanges` is internally
+    /// consistent (every range strictly above `ack_seq`).
+    pub ack_seq: u64,
+    /// Positive SACK ranges, newest-first. Empty when the peer does
+    /// not advertise the ack-ranges capability (`want_ranges = false`).
+    pub ranges: Vec<(u64, u64)>,
+}
 
 /// Session state after handshake completion.
 pub struct NetSession {
@@ -276,37 +291,45 @@ impl NetSession {
         out
     }
 
-    /// Collect a NACK for every stream that currently has a gap (H-4):
-    /// `(stream_id, NackPayload)`. Driven on a timer so a persistent gap
-    /// with no further arrivals is re-requested promptly, rather than
-    /// waiting for the *sender's* RTO (the grant-piggybacked NACK only
-    /// fires when a packet is accepted, i.e. when there IS new activity).
-    pub fn collect_gap_nacks(&self) -> Vec<(u64, super::protocol::NackPayload)> {
+    /// Collect the per-stream gap report for every stream that
+    /// currently has a gap (H-4 + STREAM_ACK_BATCHING R-4), in ONE
+    /// walk taking each stream's reliability lock exactly once.
+    ///
+    /// The proactive retransmit tick needs two things for a gapped
+    /// stream — the legacy NACK and (for capable peers) the positive
+    /// SACK ranges — and both derive from the same received-range
+    /// index (`build_nack` and `build_ack_ranges` are non-empty under
+    /// the identical `has_gaps()` condition). Snapshotting them under
+    /// one lock keeps a tick's NACK and SACK for a stream mutually
+    /// consistent and halves the tick's per-stream lock/DashMap cost
+    /// versus the old two-walk shape (`collect_gap_nacks` +
+    /// `collect_ack_ranges`).
+    ///
+    /// `ranges` is only built when `want_ranges` (the peer advertises
+    /// the ack-ranges capability); otherwise it is left empty so a
+    /// non-advertising peer pays nothing for the SACK build. Streams
+    /// without gaps contribute nothing — the grant's piggybacked
+    /// `ack_seq` already covers the contiguous case.
+    pub fn collect_gap_reports(&self, want_ranges: bool, max_ranges: usize) -> Vec<GapReport> {
         let mut out = Vec::new();
         for entry in self.streams.iter() {
-            if let Some(nack) = entry.value().with_reliability(|r| r.build_nack()) {
-                out.push((*entry.key(), nack));
-            }
-        }
-        out
-    }
-
-    /// Collect `(stream_id, ack_seq, ranges)` for every stream
-    /// currently holding out-of-order received runs
-    /// (STREAM_ACK_BATCHING R-4): the payloads of outgoing
-    /// `StreamAckRanges` messages. `ranges` is newest-first, capped
-    /// at `max_ranges`. Streams without gaps contribute nothing —
-    /// the grant's piggybacked `ack_seq` already covers the
-    /// contiguous case, so loss-free streams cost zero extra control
-    /// traffic.
-    pub fn collect_ack_ranges(&self, max_ranges: usize) -> Vec<StreamAckRangesEntry> {
-        let mut out = Vec::new();
-        for entry in self.streams.iter() {
-            let (ack_seq, ranges) = entry
-                .value()
-                .with_reliability(|r| (r.rx_ack_seq(), r.build_ack_ranges(max_ranges)));
-            if !ranges.is_empty() {
-                out.push((*entry.key(), ack_seq, ranges));
+            let report = entry.value().with_reliability(|r| {
+                r.build_nack().map(|nack| {
+                    let ranges = if want_ranges {
+                        r.build_ack_ranges(max_ranges)
+                    } else {
+                        Vec::new()
+                    };
+                    (nack, r.rx_ack_seq(), ranges)
+                })
+            });
+            if let Some((nack, ack_seq, ranges)) = report {
+                out.push(GapReport {
+                    stream_id: *entry.key(),
+                    nack,
+                    ack_seq,
+                    ranges,
+                });
             }
         }
         out
