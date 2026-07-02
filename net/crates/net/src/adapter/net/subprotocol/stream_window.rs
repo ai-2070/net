@@ -134,6 +134,21 @@ pub enum StreamWindowCodecError {
     },
 }
 
+/// Length gate shared by the three fixed-size codecs (`StreamWindow`,
+/// `StreamNack`, `StreamReset`): require exactly `need` bytes, else
+/// the matching `Truncated` / `Oversize` error carrying the REAL
+/// expected size. Centralizing this is what stops a per-decoder size
+/// literal from drifting out of sync with the wire size (the pre-fix
+/// "need 16" message that outlived the 24-byte grant growth).
+#[inline]
+fn require_exact_len(data: &[u8], need: usize) -> Result<(), StreamWindowCodecError> {
+    match data.len() {
+        n if n < need => Err(StreamWindowCodecError::Truncated { got: n, need }),
+        n if n > need => Err(StreamWindowCodecError::Oversize { got: n, need }),
+        _ => Ok(()),
+    }
+}
+
 impl StreamWindow {
     /// Encode to a fixed 16-byte buffer.
     #[inline]
@@ -148,27 +163,16 @@ impl StreamWindow {
     /// Decode a fixed-size message. Returns an error on truncated or
     /// oversize input.
     pub fn decode(data: &[u8]) -> Result<Self, StreamWindowCodecError> {
-        match data.len() {
-            n if n < STREAM_WINDOW_SIZE => Err(StreamWindowCodecError::Truncated {
-                got: n,
-                need: STREAM_WINDOW_SIZE,
-            }),
-            n if n > STREAM_WINDOW_SIZE => Err(StreamWindowCodecError::Oversize {
-                got: n,
-                need: STREAM_WINDOW_SIZE,
-            }),
-            _ => {
-                let mut cur = std::io::Cursor::new(data);
-                let stream_id = cur.get_u64_le();
-                let total_consumed = cur.get_u64_le();
-                let ack_seq = cur.get_u64_le();
-                Ok(Self {
-                    stream_id,
-                    total_consumed,
-                    ack_seq,
-                })
-            }
-        }
+        require_exact_len(data, STREAM_WINDOW_SIZE)?;
+        let mut cur = std::io::Cursor::new(data);
+        let stream_id = cur.get_u64_le();
+        let total_consumed = cur.get_u64_le();
+        let ack_seq = cur.get_u64_le();
+        Ok(Self {
+            stream_id,
+            total_consumed,
+            ack_seq,
+        })
     }
 }
 
@@ -203,27 +207,16 @@ impl StreamNack {
 
     /// Decode a 24-byte message. Errors on truncated / oversize input.
     pub fn decode(data: &[u8]) -> Result<Self, StreamWindowCodecError> {
-        match data.len() {
-            n if n < STREAM_NACK_SIZE => Err(StreamWindowCodecError::Truncated {
-                got: n,
-                need: STREAM_NACK_SIZE,
-            }),
-            n if n > STREAM_NACK_SIZE => Err(StreamWindowCodecError::Oversize {
-                got: n,
-                need: STREAM_NACK_SIZE,
-            }),
-            _ => {
-                let mut cur = std::io::Cursor::new(data);
-                let stream_id = cur.get_u64_le();
-                let next_expected = cur.get_u64_le();
-                let missing_bitmap = cur.get_u64_le();
-                Ok(Self {
-                    stream_id,
-                    next_expected,
-                    missing_bitmap,
-                })
-            }
-        }
+        require_exact_len(data, STREAM_NACK_SIZE)?;
+        let mut cur = std::io::Cursor::new(data);
+        let stream_id = cur.get_u64_le();
+        let next_expected = cur.get_u64_le();
+        let missing_bitmap = cur.get_u64_le();
+        Ok(Self {
+            stream_id,
+            next_expected,
+            missing_bitmap,
+        })
     }
 }
 
