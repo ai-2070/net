@@ -355,22 +355,11 @@ impl StreamReset {
 
     /// Decode an 8-byte message. Errors on truncated / oversize input.
     pub fn decode(data: &[u8]) -> Result<Self, StreamWindowCodecError> {
-        match data.len() {
-            n if n < STREAM_RESET_SIZE => Err(StreamWindowCodecError::Truncated {
-                got: n,
-                need: STREAM_RESET_SIZE,
-            }),
-            n if n > STREAM_RESET_SIZE => Err(StreamWindowCodecError::Oversize {
-                got: n,
-                need: STREAM_RESET_SIZE,
-            }),
-            _ => {
-                let mut cur = std::io::Cursor::new(data);
-                Ok(Self {
-                    stream_id: cur.get_u64_le(),
-                })
-            }
-        }
+        require_exact_len(data, STREAM_RESET_SIZE)?;
+        let mut cur = std::io::Cursor::new(data);
+        Ok(Self {
+            stream_id: cur.get_u64_le(),
+        })
     }
 }
 
