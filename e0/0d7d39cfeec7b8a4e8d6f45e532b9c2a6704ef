@@ -1,0 +1,70 @@
+net/crates/net/src/adapter/net/reliability.rs
+  s_ee23e37ba2d5f0::t_a3a344b85e0194 402-406,414-419
+  s_ee23e37ba2d5f0::t_e38f86e17b72d1 359-372
+  s_ee23e37ba2d5f0::t_096b75caa08c04 105-124
+  s_ee23e37ba2d5f0::t_6543d63752c528 2184-2410
+  s_ee23e37ba2d5f0::t_068b1799a22b53 533-534,536,539-540,547-553,555,558-587,590-595,597-682
+  s_ee23e37ba2d5f0::t_f30c870f52d0ad 740-747,749-753,757,761-769,771-772,775
+  s_ee23e37ba2d5f0::t_5dbd785fb66506 823-836
+  s_ee23e37ba2d5f0::t_cc92617e42e464 251-276
+  s_ee23e37ba2d5f0::t_66110173d09a2f 975-1039
+  s_ee23e37ba2d5f0::t_65e80ef8c104d2 1063
+net/crates/net/benches/reliability.rs
+  s_ee23e37ba2d5f0::t_87a5ccec00656f 1-127
+net/crates/net/docs/plans/STREAM_ACK_BATCHING_AND_RANGES_PLAN.md
+  s_ee23e37ba2d5f0::t_47eb9ebbb05751 3-25
+net/crates/net/src/adapter/net/subprotocol/stream_window.rs
+  s_ee23e37ba2d5f0::t_9cf22b4af4b9c4 128-134
+  s_ee23e37ba2d5f0::t_f7b8947e8174d0 55-69
+  s_ee23e37ba2d5f0::t_5343873d5a26c2 40-45
+  s_ee23e37ba2d5f0::t_c851e70c767465 299
+  s_ee23e37ba2d5f0::t_b24e2f553e876e 473-577
+  s_ee23e37ba2d5f0::t_5adbf4f59e3dc3 230-298,300-348
+net/crates/net/src/adapter/net/session.rs
+  s_ee23e37ba2d5f0::t_efba69f1e2d3c6 41-45
+  s_ee23e37ba2d5f0::t_9aa776de9e06fe 302
+  s_ee23e37ba2d5f0::t_72e768f165fd78 294-301,303-314
+net/crates/net/Cargo.toml
+  s_ee23e37ba2d5f0::t_fc5f19ba54300e 395-399
+net/crates/net/src/adapter/net/mesh.rs
+  s_ee23e37ba2d5f0::t_31f70c4d9493cd 296-298
+  s_ee23e37ba2d5f0::t_0ff49673a44989 113-133
+  s_ee23e37ba2d5f0::t_9209e5886436a8 2367-2370
+  s_ee23e37ba2d5f0::t_bcf9afb057a326 6222-6286
+  s_ee23e37ba2d5f0::t_287ac6e0ad04ac 161-165
+  s_ee23e37ba2d5f0::t_ee439f703657d1 5912-5913,5917-5926
+  s_ee23e37ba2d5f0::t_c67faf8c0905a6 37
+  s_ee23e37ba2d5f0::t_0df6e4ca1dccb1 5974-5975,5981-5982,5986,5997-5998
+  s_ee23e37ba2d5f0::t_b974a1e0925a2b 979-985
+  s_ee23e37ba2d5f0::t_dab7793697cb54 5976-5980,5983-5985,5987-5996
+  s_ee23e37ba2d5f0::t_38bb23dc36f0ac 250-279
+  s_ee23e37ba2d5f0::t_9202f399f7e41a 6077-6081
+  s_ee23e37ba2d5f0::t_bcbb0f1510b904 1226-1232
+  s_ee23e37ba2d5f0::t_ef14ab062f441f 2780
+  s_ee23e37ba2d5f0::t_a46230369cf360 5052-5081
+  s_ee23e37ba2d5f0::t_32dfb0ba9d3982 5936
+  s_ee23e37ba2d5f0::t_819904612c65bf 5873-5878
+  s_ee23e37ba2d5f0::t_930b472f670806 9953-9963
+  s_ee23e37ba2d5f0::t_0caf8bb3f9ebf0 6040-6058
+  s_ee23e37ba2d5f0::t_047eace4c9fc3a 1130
+net/crates/net/tests/stream_ack_ranges.rs
+  s_ee23e37ba2d5f0::t_df49ba9ef9f203 1-206
+net/crates/net/src/adapter/net/mod.rs
+  s_ee23e37ba2d5f0::t_c393d53da64107 128-130
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.9",
+  "base_commit_sha": "e00d7d39cfeec7b8a4e8d6f45e532b9c2a6704ef",
+  "prompts": {},
+  "sessions": {
+    "s_ee23e37ba2d5f0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e81805cc-911e-4bfc-a774-30595b43ba7f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
