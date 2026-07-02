@@ -1,6 +1,6 @@
 [package]
 name = "net-cli"
-version = "0.29.1"
+version = "0.30.0"
 edition = "2021"
 description = "Unified `net-mesh` command-line tool for the Net mesh"
 license = "Apache-2.0"
@@ -12,7 +12,7 @@ name = "net-mesh"
 path = "src/main.rs"
 
 [dependencies]
-net-sdk = { package = "net-mesh-sdk", version = "0.29.1", path = "../sdk", default-features = false, features = [
+net-sdk = { package = "net-mesh-sdk", version = "0.30.0", path = "../sdk", default-features = false, features = [
     "net",
     "nat-traversal",
     "cortex",

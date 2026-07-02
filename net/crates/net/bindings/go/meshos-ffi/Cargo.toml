@@ -1,6 +1,6 @@
 [package]
 name = "net-meshos-ffi"
-version = "0.29.1"
+version = "0.30.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "C ABI MeshOS daemon-author SDK for the Go binding of Net"
@@ -23,7 +23,7 @@ default = []
 # Substrate-side MeshOS SDK + the daemon trait. Pulls in
 # `compute` for `MeshDaemon` and `meshos` for the supervisor runtime;
 # the latter implies `cortex` per the substrate's feature gating.
-net = { package = "net-mesh", version = "0.29.1", path = "../../..", default-features = false, features = ["meshos"] }
+net = { package = "net-mesh", version = "0.30.0", path = "../../..", default-features = false, features = ["meshos"] }
 tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
 bytes = "1.11"
 parking_lot = "0.12"
