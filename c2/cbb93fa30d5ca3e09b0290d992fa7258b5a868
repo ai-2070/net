@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/mesh.rs
+  s_ee23e37ba2d5f0::t_1ec7737ccaf6de 6349
+  s_ee23e37ba2d5f0::t_94930026abbb91 135-143
+  s_ee23e37ba2d5f0::t_6d68761b993bbc 6508-6513
+  s_ee23e37ba2d5f0::t_b95634956ee38c 16586-16606,16678
+  s_ee23e37ba2d5f0::t_9da66fb42e1626 288-298
+  s_ee23e37ba2d5f0::t_31437d9064027d 16675-16677
+  s_ee23e37ba2d5f0::t_999161dc3d4ee7 281-283,6010,6440-6451,16493-16496,16630,16634,16674
+net/crates/net/src/adapter/net/subprotocol/stream_window.rs
+  s_ee23e37ba2d5f0::t_3f0e15f4408396 269
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.9",
+  "base_commit_sha": "c2cbb93fa30d5ca3e09b0290d992fa7258b5a868",
+  "prompts": {},
+  "sessions": {
+    "s_ee23e37ba2d5f0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e81805cc-911e-4bfc-a774-30595b43ba7f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
