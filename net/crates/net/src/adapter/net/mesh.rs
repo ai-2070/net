@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwapOption;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -96,6 +96,99 @@ const STREAM_GRANT_DRAIN_INTERVAL: Duration = Duration::from_millis(1);
 /// receiver NACK.
 const RETRANSMIT_TICK: Duration = Duration::from_millis(25);
 
+/// Max fixed-size control events packed into one batched control
+/// packet, per message type (STREAM_ACK_BATCHING B-2/B-3):
+/// `floor(MAX_PAYLOAD_SIZE / (event-frame length prefix + payload))`.
+/// At 24 B payloads this is ~289 grant/NACK events per packet — far
+/// below `NetHeader::MAX_EVENTS_PER_PACKET` (2027), so the payload
+/// budget is the binding constraint, never the event-count cap.
+///
+/// Only the grant path still chunks by this fixed count (grants are
+/// fixed-size and their loop carries stream ids for post-send
+/// accounting); every other control frame — including the variable-
+/// size `StreamAckRanges` — is packed by actual size via
+/// [`pack_control_events`].
+const GRANT_EVENTS_PER_PACKET: usize =
+    protocol::MAX_PAYLOAD_SIZE / (EventFrame::LEN_SIZE + STREAM_WINDOW_SIZE);
+
+/// Capability tag advertising support for positive SACK-range ACKs
+/// (`StreamAckRanges`, STREAM_ACK_BATCHING R-5). Auto-merged into
+/// every capability announcement (same pattern as the `nrpc:` /
+/// `ai-tool:` tags) unless
+/// [`MeshNodeConfig::enable_stream_ack_ranges`] is off. Emission is
+/// gated on the peer advertising this tag; receiving is
+/// unconditional — the capability is optimization negotiation, not
+/// authority.
+///
+/// **The tag only reaches a peer once this node actually broadcasts a
+/// capability announcement.** A node advertises when the application
+/// calls [`MeshNode::announce_capabilities`], and — for a node started
+/// via [`MeshNode::start_arc`] — on the reannounce loop's cadence
+/// (`capability_reannounce_interval`). A node started via the bare
+/// [`MeshNode::start`] that never announces will not advertise this
+/// tag, so its peers keep the legacy cumulative-ACK + NACK path toward
+/// it (correct, just without the SACK-range optimisation). Deployments
+/// that want SACK ranges to engage promptly should call
+/// `announce_capabilities` after connecting (as the e2e tests do).
+pub const ACK_RANGES_CAPABILITY_TAG: &str = "net.reliable.stream_ack_ranges@1";
+
+/// TTL for the per-peer ack-ranges capability-gate cache. Capability
+/// entries change on announcement cadence (seconds to minutes); the
+/// drainer asks at up to 1 kHz per session, so gate lookups read
+/// through this cache instead of taking the fold lock every cycle.
+const ACK_RANGES_CAP_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// Age bound for `ack_ranges_peer_cache` entries, enforced by the
+/// heartbeat loop's sweep (review P2: the cache is insert-on-lookup,
+/// so without a sweep, peer churn grows it without bound). Entries
+/// belonging to peers with active gapped streams are refreshed every
+/// [`ACK_RANGES_CAP_CACHE_TTL`]; anything older than this belongs to
+/// a departed or long-idle peer, and evicting it costs that peer at
+/// most one extra fold lookup on its next gate check.
+const ACK_RANGES_CAP_CACHE_MAX_AGE: Duration = Duration::from_secs(40);
+
+/// Control-plane emission counters (STREAM_ACK_BATCHING B-4).
+///
+/// The packets/events split makes the batching ratio observable:
+/// `*_events_sent / *_packets_sent` is the achieved coalescing
+/// factor (1.0 = no coalescing, pre-batching behavior). Relaxed
+/// ordering everywhere — these are monotonic telemetry counters
+/// with no cross-thread ordering contract.
+#[derive(Debug, Default)]
+pub struct ControlPlaneStats {
+    /// `StreamWindow` control packets emitted (one per session per
+    /// drain cycle post-batching, plus payload-budget spill).
+    pub grant_packets_sent: AtomicU64,
+    /// Individual `StreamWindow` grant events emitted.
+    pub grant_events_sent: AtomicU64,
+    /// `StreamNack` control packets emitted (drainer piggyback +
+    /// the 25 ms proactive gap tick).
+    pub nack_packets_sent: AtomicU64,
+    /// Individual `StreamNack` events emitted.
+    pub nack_events_sent: AtomicU64,
+    /// `StreamReset` control packets emitted (H-3 give-up signal).
+    pub reset_packets_sent: AtomicU64,
+    /// Individual `StreamReset` events emitted.
+    pub reset_events_sent: AtomicU64,
+    /// Data packets re-sent by the reliability layer: NACK-driven
+    /// fast retransmits + RTO-driven timeout retransmits.
+    pub retransmit_packets_sent: AtomicU64,
+    /// `StreamAckRanges` control packets emitted (R-4; capability-
+    /// gated per peer).
+    pub ack_range_packets_sent: AtomicU64,
+    /// Individual `StreamAckRanges` events emitted.
+    pub ack_range_events_sent: AtomicU64,
+}
+
+impl ControlPlaneStats {
+    /// Count one emitted control packet carrying `events` events.
+    #[inline]
+    fn record_packet(packets: &AtomicU64, events_ctr: &AtomicU64, events: usize) {
+        packets.fetch_add(1, Ordering::Relaxed);
+        events_ctr.fetch_add(events as u64, Ordering::Relaxed);
+    }
+}
+
 /// Upper bound on how long [`MeshNode::flush_stream_batch`] retries a
 /// committed-prefix flush against a receiver that grants no credit.
 /// After ANY packet of a multi-batch send is committed we can't surface
@@ -140,6 +233,235 @@ struct PendingStreamGrant {
     total_consumed: u64,
 }
 
+/// Group drained pending grants by session (STREAM_ACK_BATCHING B-1).
+///
+/// The session — not the peer address — owns the outbound AEAD
+/// cipher, packet pool, and control-seq counter, so it is the unit a
+/// batched control packet can be built against. Two sessions behind
+/// one address (e.g. a rotation mid-drain) must NOT share a packet;
+/// keying on the map key's `session_id` guarantees that. Pure so the
+/// grouping-key contract is unit-testable.
+#[allow(clippy::type_complexity)]
+fn group_grants_by_session(
+    drained: HashMap<(u64, u64), PendingStreamGrant>,
+) -> HashMap<u64, (Arc<NetSession>, SocketAddr, Vec<(u64, u64)>)> {
+    let mut by_session: HashMap<u64, (Arc<NetSession>, SocketAddr, Vec<(u64, u64)>)> =
+        HashMap::new();
+    for ((session_id, stream_id), grant) in drained {
+        let PendingStreamGrant {
+            session,
+            peer_addr,
+            total_consumed,
+        } = grant;
+        by_session
+            .entry(session_id)
+            .or_insert_with(|| (session.clone(), peer_addr, Vec::new()))
+            .2
+            .push((stream_id, total_consumed));
+    }
+    by_session
+}
+
+/// Capability gate for `StreamAckRanges` emission (STREAM_ACK_BATCHING
+/// R-5): does the peer behind `session_id` advertise
+/// [`ACK_RANGES_CAPABILITY_TAG`]? Resolution is session → node via
+/// `session_id_to_node`, then a per-node tag lookup in the capability
+/// fold, read through a [`ACK_RANGES_CAP_CACHE_TTL`] cache (the
+/// drainer asks at up to 1 kHz per session; the fold lookup takes the
+/// fold's read lock). Unknown node or no tag ⇒ `false` — the legacy
+/// cumulative-ACK + NACK path is always safe.
+fn peer_supports_ack_ranges(
+    cache: &DashMap<u64, (bool, Instant)>,
+    session_id_to_node: &DashMap<u64, u64>,
+    capability_fold: &super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>,
+    session_id: u64,
+) -> bool {
+    let Some(node_id) = session_id_to_node.get(&session_id).map(|e| *e.value()) else {
+        return false;
+    };
+    if let Some(hit) = cache.get(&node_id) {
+        if hit.value().1.elapsed() < ACK_RANGES_CAP_CACHE_TTL {
+            return hit.value().0;
+        }
+    }
+    let supports = super::behavior::fold::capability::capability_tags_for(capability_fold, node_id)
+        .iter()
+        .any(|t| t == ACK_RANGES_CAPABILITY_TAG);
+    cache.insert(node_id, (supports, Instant::now()));
+    supports
+}
+
+/// Drop `ack_ranges_peer_cache` entries not refreshed within
+/// `max_age` — the heartbeat-tick backstop that keeps the
+/// insert-on-lookup cache bounded under peer churn (targeted removal
+/// at dead-peer eviction handles the common case; this catches peers
+/// that never reach eviction, e.g. a session that was replaced by a
+/// re-handshake). O(cache) per tick; cache size ≤ peers seen within
+/// the age window.
+fn sweep_ack_ranges_cache(cache: &DashMap<u64, (bool, Instant)>, max_age: Duration) {
+    cache.retain(|_, (_, cached_at)| cached_at.elapsed() < max_age);
+}
+
+/// Build the control events for one drained session batch
+/// (B-2/B-3/R-4): the grant events paired with their stream id (the
+/// id rides along so the drainer can find each stream again for the
+/// post-send accounting), the piggybacked NACK events for gapped
+/// streams, and — when the peer advertises support — the SACK-range
+/// events.
+///
+/// Pure build step: it does NOT bump `credit_grants_sent`. That
+/// counter means "grant datagram sent"; the drainer bumps it per
+/// covered stream only after the chunk carrying that stream's grant
+/// clears `send_to`. Pre-fix the bump ran here at build time and
+/// overcounted whenever the send failed.
+#[allow(clippy::type_complexity)]
+fn build_session_control_events(
+    session: &Arc<NetSession>,
+    grants: &[(u64, u64)],
+    emit_ack_ranges: bool,
+) -> (Vec<(u64, Bytes)>, Vec<Bytes>, Vec<Bytes>) {
+    let mut grant_entries: Vec<(u64, Bytes)> = Vec::with_capacity(grants.len());
+    let mut nack_events: Vec<Bytes> = Vec::new();
+    let mut ack_events: Vec<Bytes> = Vec::new();
+    for &(stream_id, total_consumed) in grants {
+        // One `try_stream` + ONE reliability lock per stream: read the
+        // cumulative ack, the piggyback NACK, and (when the peer
+        // advertises support) the SACK ranges from a SINGLE consistent
+        // snapshot. The three control frames a cycle emits for this
+        // stream therefore always agree — pre-fix each was read under
+        // its own lock, so a head-fill landing mid-build could pair a
+        // stale grant/NACK with a fresher SACK (or a NACK for a gap
+        // that had already healed). The codec invariant "every range
+        // strictly above `ack_seq`" holds because both come from this
+        // one snapshot. A missing / non-reliable stream contributes a
+        // zero cumulative ack (H-9) and no gap frames.
+        let (ack_seq, nack, ranges) = session
+            .try_stream(stream_id)
+            .map(|s| {
+                s.with_reliability(|r| {
+                    let ranges = if emit_ack_ranges {
+                        r.build_ack_ranges(MAX_ACK_RANGES)
+                    } else {
+                        Vec::new()
+                    };
+                    (r.rx_ack_seq(), r.build_nack(), ranges)
+                })
+            })
+            .unwrap_or((0, None, Vec::new()));
+        let payload = StreamWindow {
+            stream_id,
+            total_consumed,
+            ack_seq,
+        }
+        .encode();
+        grant_entries.push((stream_id, Bytes::copy_from_slice(&payload)));
+        // Piggyback a retransmit NACK (STREAM_RETRANSMIT D-2): a
+        // grant is enqueued on every accepted packet, so an
+        // out-of-order arrival (which creates the gap) reliably
+        // triggers a NACK here; tail loss (no later arrival) is
+        // covered by the timeout retransmit loop.
+        if let Some(nack) = nack {
+            let payload = StreamNack {
+                stream_id,
+                next_expected: nack.next_expected,
+                missing_bitmap: nack.missing_bitmap,
+            }
+            .encode();
+            nack_events.push(Bytes::copy_from_slice(&payload));
+        }
+        // R-4: positive SACK ranges for a gapped stream, to peers that
+        // advertise support. A gapless stream returns no ranges and
+        // costs nothing here.
+        if !ranges.is_empty() {
+            let msg = StreamAckRanges {
+                stream_id,
+                ack_seq,
+                ranges,
+            };
+            ack_events.push(Bytes::from(msg.encode()));
+        }
+    }
+    (grant_entries, nack_events, ack_events)
+}
+
+/// Greedily split `events` into consecutive chunks (as index ranges)
+/// that each fit `MAX_PAYLOAD_SIZE` once framed (STREAM_ACK_BATCHING
+/// B-2/B-3/R-4). Framed size is exactly [`EventFrame::calculate_size`]
+/// (`sum(LEN_SIZE + len)`), computed incrementally here.
+///
+/// Unlike a fixed `chunks(N)` split sized for the *worst-case* event,
+/// this fills each datagram by actual event size — so variable-size
+/// `StreamAckRanges` events (1..=`MAX_ACK_RANGES` ranges, 32..=272 B)
+/// no longer ride a packet budgeted at the 272 B worst case and ship
+/// ~85% empty (review ACKCHUNK/H5). Fixed-size grant/NACK/reset events
+/// pack identically to the old `chunks(N)`. An event that alone
+/// exceeds the budget still gets its own chunk — `build_subprotocol`
+/// enforces the hard cap — but the fixed-schema control frames here
+/// are all far below it.
+fn pack_control_events(events: &[Bytes]) -> Vec<std::ops::Range<usize>> {
+    let mut chunks: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut start = 0usize;
+    let mut acc = 0usize;
+    for (i, e) in events.iter().enumerate() {
+        let framed = EventFrame::LEN_SIZE + e.len();
+        // Close the current chunk before `i` if adding this event
+        // would overflow — but only when the chunk already holds at
+        // least one event (`i > start`), so an oversized lone event
+        // still ships alone rather than producing an empty chunk.
+        if i > start && acc + framed > protocol::MAX_PAYLOAD_SIZE {
+            chunks.push(start..i);
+            start = i;
+            acc = 0;
+        }
+        acc += framed;
+    }
+    if start < events.len() {
+        chunks.push(start..events.len());
+    }
+    chunks
+}
+
+/// Emit `events` as one or more batched control packets on `session`
+/// to `addr`, size-packed by [`pack_control_events`], bumping
+/// `(packets_ctr, events_ctr)` once per datagram that clears the
+/// socket (STREAM_ACK_BATCHING B-2/B-3/R-4).
+///
+/// One shared emit path for the drainer's piggyback NACK/SACK packets
+/// and the retransmit tick's reset/NACK/SACK packets — previously six
+/// near-identical copies of the
+/// chunk→`next_control_tx_seq`→`build_subprotocol`→`send_to`→count
+/// sequence that had already drifted in their send-failure handling
+/// (review EMITLOOP/G1). A failed `send_to` is logged and that
+/// datagram skipped; the peer re-requests on its next tick and the
+/// RTO backstops. The grant path stays bespoke — it also runs
+/// per-stream `note_grant_sent` accounting keyed on the covered ids.
+#[allow(clippy::too_many_arguments)]
+async fn emit_control_chunks(
+    socket: &NetSocket,
+    builder: &mut super::pool::ThreadLocalPooledBuilder<'_>,
+    session: &NetSession,
+    addr: SocketAddr,
+    events: &[Bytes],
+    subprotocol_id: u16,
+    packets_ctr: &AtomicU64,
+    events_ctr: &AtomicU64,
+) {
+    for range in pack_control_events(events) {
+        let chunk = &events[range];
+        let seq = session.next_control_tx_seq();
+        let packet = builder.build_subprotocol(
+            CONTROL_STREAM_ID,
+            seq,
+            chunk,
+            PacketFlags::NONE,
+            subprotocol_id,
+        );
+        if socket.send_to(&packet, addr).await.is_ok() {
+            ControlPlaneStats::record_packet(packets_ctr, events_ctr, chunk.len());
+        }
+    }
+}
+
 /// Total wire bytes for a single Net packet carrying `payload_bytes`
 /// of AEAD-encrypted content. Saturating at `u32::MAX` so a
 /// pathological `payload_bytes` can't silently wrap the credit math.
@@ -156,7 +478,8 @@ use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subnet::{DropReason, SubnetGateway, SubnetId, SubnetPolicy};
 use super::subprotocol::stream_window::{
-    StreamNack, StreamReset, StreamWindow, SUBPROTOCOL_STREAM_NACK, SUBPROTOCOL_STREAM_RESET,
+    StreamAckRanges, StreamNack, StreamReset, StreamWindow, MAX_ACK_RANGES, STREAM_WINDOW_SIZE,
+    SUBPROTOCOL_STREAM_ACK, SUBPROTOCOL_STREAM_NACK, SUBPROTOCOL_STREAM_RESET,
     SUBPROTOCOL_STREAM_WINDOW,
 };
 use super::subprotocol::MigrationSubprotocolHandler;
@@ -556,6 +879,10 @@ struct DispatchCtx {
     pending_stream_grants: Arc<parking_lot::Mutex<HashMap<(u64, u64), PendingStreamGrant>>>,
     /// Wakes the grant drainer on enqueue.
     pending_stream_grants_notify: Arc<Notify>,
+    /// Control-plane emission counters, shared with the mesh's
+    /// drainer/retransmit loops. Dispatch counts NACK-driven
+    /// retransmit sends here (STREAM_ACK_BATCHING B-4).
+    control_stats: Arc<ControlPlaneStats>,
     /// Settings for sessions we create during inbound dispatch (relayed
     /// handshake responder completes here).
     packet_pool_size: usize,
@@ -637,6 +964,14 @@ struct DispatchCtx {
     /// `SUBPROTOCOL_CAPABILITY_ANN` packets land here via the
     /// bridge's `translate_announcement`.
     capability_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::CapabilityFold>>,
+    /// Per-peer ack-ranges capability-gate cache, shared with the
+    /// drainer/retransmit loops. The dispatch handler invalidates a
+    /// peer's entry the instant a fresh `SUBPROTOCOL_CAPABILITY_ANN`
+    /// is folded, so the next gate check re-resolves through the fold
+    /// instead of serving a verdict cached before the announcement
+    /// landed (STREAM_ACK_BATCHING R-5; see
+    /// [`peer_supports_ack_ranges`]).
+    ack_ranges_peer_cache: Arc<DashMap<u64, (bool, Instant)>>,
     /// Generation-keyed LRU cache of synthesized
     /// `Arc<CapabilitySet>` per node. Backs the per-packet greedy
     /// admission scope (mesh.rs `process_data_packet`) and other
@@ -834,6 +1169,20 @@ pub struct MeshNodeConfig {
     /// (the SDK / FFI path) — re-broadcasting needs an owned `Arc`. A bare
     /// [`MeshNode::start`] omits it.
     pub capability_reannounce_interval: Duration,
+    /// Emit positive SACK-range ACKs (`StreamAckRanges`) to peers that
+    /// advertise [`ACK_RANGES_CAPABILITY_TAG`], and merge that tag
+    /// into this node's own capability announcements
+    /// (STREAM_ACK_BATCHING R-5). Disabling turns the feature off
+    /// wire-wide for this node's sends and advertisements; receiving
+    /// stays unconditional. Default `true`.
+    ///
+    /// Note: `true` makes the node *willing* to advertise and emit, but
+    /// the tag only propagates when the node actually broadcasts a
+    /// capability announcement — see [`ACK_RANGES_CAPABILITY_TAG`] for
+    /// exactly when that happens. Two default-config nodes that never
+    /// announce fall back to the legacy path; call
+    /// [`MeshNode::announce_capabilities`] to engage SACK ranges.
+    pub enable_stream_ack_ranges: bool,
     /// This node's subnet. Defaults to [`SubnetId::GLOBAL`] — "no
     /// restriction." Visibility checks compare against this value on
     /// both the publish and subscribe paths.
@@ -978,6 +1327,7 @@ impl MeshNodeConfig {
             require_signed_capabilities: true,
             capability_gc_interval: Duration::from_secs(60),
             capability_reannounce_interval: Duration::from_secs(150),
+            enable_stream_ack_ranges: true,
             subnet: SubnetId::GLOBAL,
             subnet_policy: None,
             default_visibility: Visibility::Global,
@@ -1070,6 +1420,13 @@ impl MeshNodeConfig {
     /// the loop.
     pub fn with_capability_reannounce_interval(mut self, interval: Duration) -> Self {
         self.capability_reannounce_interval = interval;
+        self
+    }
+
+    /// Enable/disable SACK-range ACK emission + advertisement. See
+    /// [`Self::enable_stream_ack_ranges`].
+    pub fn with_stream_ack_ranges(mut self, enable: bool) -> Self {
+        self.enable_stream_ack_ranges = enable;
         self
     }
 
@@ -2188,17 +2545,29 @@ pub struct MeshNode {
     /// `(session_id, stream_id)`. The receive path inserts the
     /// latest `total_consumed` here per accepted packet; the
     /// per-mesh drainer task ([`Self::spawn_stream_grant_drainer_loop`])
-    /// pops the map and emits one wire grant per unique key. Latest-
-    /// wins overwrite semantics make this safe — grants are
-    /// authoritative (each carries the full `total_consumed`) so
-    /// a later push subsumes any pending earlier one for the same
-    /// stream. T1.1 from `PERF_AUDIT_2026_05_19_NRPC.md`.
+    /// pops the map and emits the grants batched per session —
+    /// multi-event control frames, one packet per
+    /// [`GRANT_EVENTS_PER_PACKET`] chunk (STREAM_ACK_BATCHING B-1/
+    /// B-2). Latest-wins overwrite semantics make this safe —
+    /// grants are authoritative (each carries the full
+    /// `total_consumed`) so a later push subsumes any pending
+    /// earlier one for the same stream. T1.1 from
+    /// `PERF_AUDIT_2026_05_19_NRPC.md`.
     pending_stream_grants: Arc<parking_lot::Mutex<HashMap<(u64, u64), PendingStreamGrant>>>,
     /// Wakes the drainer task whenever a new pending grant lands.
     /// The drainer also self-wakes on a short interval timer so a
     /// missed notify (e.g. the drainer was already iterating when
     /// the notify fired) still flushes within bounded time.
     pending_stream_grants_notify: Arc<Notify>,
+    /// Control-plane emission counters (STREAM_ACK_BATCHING B-4):
+    /// batched grant/NACK/reset packet+event counts + reliability
+    /// retransmit sends. Shared with the drainer, the retransmit
+    /// loop, and the dispatch context.
+    control_stats: Arc<ControlPlaneStats>,
+    /// Per-peer cache for the ack-ranges capability gate (R-5):
+    /// `node_id → (supports, checked_at)`. See
+    /// [`peer_supports_ack_ranges`].
+    ack_ranges_peer_cache: Arc<DashMap<u64, (bool, Instant)>>,
     /// Whether the node has been started
     started: AtomicBool,
     /// Weak self-reference, set by [`Self::start_arc`] when the node is
@@ -2607,6 +2976,8 @@ impl MeshNode {
             shutdown_notify: Arc::new(Notify::new()),
             pending_stream_grants: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             pending_stream_grants_notify: Arc::new(Notify::new()),
+            control_stats: Arc::new(ControlPlaneStats::default()),
+            ack_ranges_peer_cache: Arc::new(DashMap::new()),
             started: AtomicBool::new(false),
             self_weak: std::sync::OnceLock::new(),
             accept_in_flight: std::sync::atomic::AtomicUsize::new(0),
@@ -3638,6 +4009,7 @@ impl MeshNode {
             partition_filter: self.partition_filter.clone(),
             pending_stream_grants: self.pending_stream_grants.clone(),
             pending_stream_grants_notify: self.pending_stream_grants_notify.clone(),
+            control_stats: self.control_stats.clone(),
             packet_pool_size: self.config.packet_pool_size,
             default_reliable: self.config.default_reliable,
             session_timeout: self.config.session_timeout,
@@ -3656,6 +4028,7 @@ impl MeshNode {
             traversal_config: self.traversal_config.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
             capability_fold: self.capability_fold.clone(),
+            ack_ranges_peer_cache: self.ack_ranges_peer_cache.clone(),
             #[cfg(feature = "dataforts")]
             capability_set_cache: self.capability_set_cache.clone(),
             seen_announcements: self.seen_announcements.clone(),
@@ -4863,11 +5236,46 @@ impl MeshNode {
             if !packets.is_empty() {
                 let socket = ctx.socket.clone();
                 let dest = parsed.source;
+                let control_stats = ctx.control_stats.clone();
                 tokio::spawn(async move {
                     for p in packets {
-                        let _ = socket.send_to(&p, dest).await;
+                        if socket.send_to(&p, dest).await.is_ok() {
+                            control_stats
+                                .retransmit_packets_sent
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 });
+            }
+            return;
+        }
+
+        // Positive SACK-range ACK (STREAM_ACK_BATCHING R-5): the peer
+        // positively acknowledges out-of-order received runs on a
+        // stream we're sending it. Remove those packets from the
+        // retransmit window so the RTO backstop resends only the
+        // genuinely missing ones — pre-R-3 a single lost head packet
+        // RTO-flooded every tracked packet behind it and collapsed
+        // cwnd. Accepted unconditionally: the capability gate applies
+        // to EMISSION only (negotiation, not authority).
+        if parsed.header.subprotocol_id == SUBPROTOCOL_STREAM_ACK {
+            let events = EventFrame::read_events(decrypted, parsed.header.event_count);
+            for payload in events {
+                let ack = match StreamAckRanges::decode(&payload) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "malformed StreamAckRanges");
+                        continue;
+                    }
+                };
+                // Don't resurrect a recently-closed stream's send state.
+                if session.is_grant_quarantined(ack.stream_id) {
+                    continue;
+                }
+                let Some(state) = session.try_stream(ack.stream_id) else {
+                    continue;
+                };
+                state.with_reliability(|r| r.on_ack_ranges(ack.ack_seq, &ack.ranges));
             }
             return;
         }
@@ -5629,19 +6037,32 @@ impl MeshNode {
         }
     }
 
-    /// Drain the per-mesh pending-grant queue and emit one wire
-    /// `StreamWindow` packet per unique `(session_id, stream_id)`
-    /// entry. Replaces the pre-T1.1-v2 per-packet
-    /// `tokio::spawn(spawn_stream_window_grant(...))` — under load
-    /// that burned one spawn + AEAD encrypt + `sendto` per accepted
-    /// inbound packet (`PERF_AUDIT_2026_05_19_NRPC.md` T1.1). The
-    /// drainer wakes on either `pending_stream_grants_notify` or
-    /// the `STREAM_GRANT_DRAIN_INTERVAL` self-wake timer, swaps the
-    /// queue, and emits grants serially. Authoritative-grant
-    /// semantics mean a single emission per stream subsumes any
-    /// pending earlier values for that stream; the receive path's
-    /// latest-wins overwrite delivers the freshest `total_consumed`
-    /// the drainer needs.
+    /// Control-plane emission counters (STREAM_ACK_BATCHING B-4):
+    /// batched grant/NACK/reset packet+event counts and reliability
+    /// retransmit sends. Cheap Arc clone; counters use Relaxed
+    /// ordering (monotonic telemetry, no cross-thread contract).
+    pub fn control_plane_stats(&self) -> Arc<ControlPlaneStats> {
+        self.control_stats.clone()
+    }
+
+    /// Drain the per-mesh pending-grant queue and emit the drained
+    /// grants **batched per session** (STREAM_ACK_BATCHING B-1/B-2):
+    /// one `StreamWindow` packet per session per drain cycle carrying
+    /// up to [`GRANT_EVENTS_PER_PACKET`] grant events (plus payload-
+    /// budget spill), and one `StreamNack` packet per session for any
+    /// piggybacked NACKs. Replaces the post-T1.1 one-packet-per-
+    /// stream shape — with S busy streams to a peer that was up to
+    /// 2·S AEAD encrypts + `sendto`s per millisecond; now it is
+    /// O(sessions). The pre-T1.1-v2 shape was worse still: one
+    /// spawn/encrypt/send per accepted inbound packet
+    /// (`PERF_AUDIT_2026_05_19_NRPC.md` T1.1). The drainer wakes on
+    /// either `pending_stream_grants_notify` or the
+    /// `STREAM_GRANT_DRAIN_INTERVAL` self-wake timer, swaps the
+    /// queue, and emits serially. Authoritative-grant semantics mean
+    /// a single emission per stream subsumes any pending earlier
+    /// values for that stream; the receive path's latest-wins
+    /// overwrite delivers the freshest `total_consumed` the drainer
+    /// needs.
     fn spawn_stream_grant_drainer_loop(&self) -> JoinHandle<()> {
         let socket = self.socket.clone();
         let partition_filter = self.partition_filter.clone();
@@ -5649,6 +6070,13 @@ impl MeshNode {
         let notify = self.pending_stream_grants_notify.clone();
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
+        let control_stats = self.control_stats.clone();
+        // R-4/R-5 emission gate inputs: config kill-switch + the
+        // per-peer capability cache and its resolution maps.
+        let ack_ranges_enabled = self.config.enable_stream_ack_ranges;
+        let ack_cache = self.ack_ranges_peer_cache.clone();
+        let session_id_to_node = self.session_id_to_node.clone();
+        let capability_fold = self.capability_fold.clone();
 
         tokio::spawn(async move {
             while !shutdown.load(Ordering::Acquire) {
@@ -5679,72 +6107,93 @@ impl MeshNode {
                     continue;
                 }
 
-                for ((_, stream_id), grant) in drained {
-                    if partition_filter.contains(&grant.peer_addr) {
+                // B-1: group by session — the session owns the AEAD
+                // cipher, packet pool, and control-seq counter, so it
+                // is the unit a batched packet can be built against.
+                for (session_id, (session, peer_addr, grants)) in group_grants_by_session(drained) {
+                    if partition_filter.contains(&peer_addr) {
                         continue;
                     }
-                    // Piggyback the receiver's cumulative reliable ack
-                    // (next_expected) so the sender prunes its retransmit
-                    // window of everything below it (H-9). 0 for
-                    // non-reliable receive streams.
-                    let ack_seq = grant
-                        .session
-                        .try_stream(stream_id)
-                        .map(|s| s.with_reliability(|r| r.rx_ack_seq()))
-                        .unwrap_or(0);
-                    let payload = StreamWindow {
-                        stream_id,
-                        total_consumed: grant.total_consumed,
-                        ack_seq,
-                    }
-                    .encode();
-                    let pool = grant.session.thread_local_pool();
-                    let mut builder = pool.get();
-                    let seq = grant.session.next_control_tx_seq();
-                    let events = vec![Bytes::copy_from_slice(&payload)];
-                    let packet = builder.build_subprotocol(
-                        CONTROL_STREAM_ID,
-                        seq,
-                        &events,
-                        PacketFlags::NONE,
-                        SUBPROTOCOL_STREAM_WINDOW,
-                    );
-                    if let Err(e) = socket.send_to(&packet, grant.peer_addr).await {
-                        tracing::debug!(error = %e, "StreamWindow grant send failed");
-                        continue;
-                    }
-                    // Piggyback a retransmit NACK (STREAM_RETRANSMIT D-2):
-                    // if this stream has gaps, ask the sender to resend the
-                    // missing sequences. Reuses the grant drainer's per-
-                    // stream-per-cycle throttling and peer resolution. A
-                    // grant is enqueued on every accepted packet, so an
-                    // out-of-order arrival (which creates the gap) reliably
-                    // triggers a NACK here; tail loss (no later arrival) is
-                    // covered by the timeout retransmit loop.
-                    let nack = grant.session.try_stream(stream_id).and_then(|state| {
-                        state.note_grant_sent();
-                        state.with_reliability(|r| r.build_nack())
-                    });
-                    if let Some(nack) = nack {
-                        let payload = StreamNack {
-                            stream_id,
-                            next_expected: nack.next_expected,
-                            missing_bitmap: nack.missing_bitmap,
-                        }
-                        .encode();
-                        let nseq = grant.session.next_control_tx_seq();
-                        let nevents = vec![Bytes::copy_from_slice(&payload)];
-                        let npacket = builder.build_subprotocol(
-                            CONTROL_STREAM_ID,
-                            nseq,
-                            &nevents,
-                            PacketFlags::NONE,
-                            SUBPROTOCOL_STREAM_NACK,
+                    // R-5: resolve the peer's SACK-range support once
+                    // per session per cycle (cached; see
+                    // `peer_supports_ack_ranges`).
+                    let emit_ack_ranges = ack_ranges_enabled
+                        && peer_supports_ack_ranges(
+                            &ack_cache,
+                            &session_id_to_node,
+                            &capability_fold,
+                            session_id,
                         );
-                        if let Err(e) = socket.send_to(&npacket, grant.peer_addr).await {
-                            tracing::debug!(error = %e, "StreamNack send failed");
+                    // Build every grant event — plus the piggybacked
+                    // NACK events (STREAM_RETRANSMIT D-2) for streams
+                    // with gaps — up front, then emit multi-event
+                    // frames: one packet per chunk instead of one (or
+                    // two) per stream (B-2/B-3). The decode side has
+                    // always iterated the full event vector, so old
+                    // peers apply every batched grant/NACK.
+                    let (grant_entries, nack_events, ack_events) =
+                        build_session_control_events(&session, &grants, emit_ack_ranges);
+                    let pool = session.thread_local_pool();
+                    let mut builder = pool.get();
+                    for chunk in grant_entries.chunks(GRANT_EVENTS_PER_PACKET) {
+                        // `Bytes` clone is a refcount bump — the chunk
+                        // carries (stream_id, event) pairs so the
+                        // post-send accounting below can find each
+                        // covered stream.
+                        let events: Vec<Bytes> = chunk.iter().map(|(_, e)| e.clone()).collect();
+                        let seq = session.next_control_tx_seq();
+                        let packet = builder.build_subprotocol(
+                            CONTROL_STREAM_ID,
+                            seq,
+                            &events,
+                            PacketFlags::NONE,
+                            SUBPROTOCOL_STREAM_WINDOW,
+                        );
+                        if let Err(e) = socket.send_to(&packet, peer_addr).await {
+                            tracing::debug!(error = %e, "StreamWindow grant send failed");
+                            continue;
                         }
+                        // The chunk cleared the socket: bump each
+                        // covered stream's grants-sent counter now.
+                        // The counter means "grant datagram sent",
+                        // not "grant built" — a failed `send_to` must
+                        // not count (post-`sendto` datagram loss was
+                        // never distinguishable anyway). Same contract
+                        // as the pre-batching one-packet-per-stream
+                        // shape, where the bump sat after the send.
+                        for (stream_id, _) in chunk {
+                            if let Some(state) = session.try_stream(*stream_id) {
+                                state.note_grant_sent();
+                            }
+                        }
+                        ControlPlaneStats::record_packet(
+                            &control_stats.grant_packets_sent,
+                            &control_stats.grant_events_sent,
+                            chunk.len(),
+                        );
                     }
+                    emit_control_chunks(
+                        &socket,
+                        &mut builder,
+                        &session,
+                        peer_addr,
+                        &nack_events,
+                        SUBPROTOCOL_STREAM_NACK,
+                        &control_stats.nack_packets_sent,
+                        &control_stats.nack_events_sent,
+                    )
+                    .await;
+                    emit_control_chunks(
+                        &socket,
+                        &mut builder,
+                        &session,
+                        peer_addr,
+                        &ack_events,
+                        SUBPROTOCOL_STREAM_ACK,
+                        &control_stats.ack_range_packets_sent,
+                        &control_stats.ack_range_events_sent,
+                    )
+                    .await;
                 }
             }
         })
@@ -5762,6 +6211,12 @@ impl MeshNode {
         let socket = self.socket.clone();
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
+        let control_stats = self.control_stats.clone();
+        // R-4/R-5 proactive SACK-range emission gate inputs.
+        let ack_ranges_enabled = self.config.enable_stream_ack_ranges;
+        let ack_cache = self.ack_ranges_peer_cache.clone();
+        let session_id_to_node = self.session_id_to_node.clone();
+        let capability_fold = self.capability_fold.clone();
 
         tokio::spawn(async move {
             while !shutdown.load(Ordering::Acquire) {
@@ -5794,7 +6249,11 @@ impl MeshNode {
                     let mut builder = pool.get();
                     for d in due {
                         let packet = builder.build(d.stream_id, d.seq, &d.events, d.flags);
-                        let _ = socket.send_to(&packet, addr).await;
+                        if socket.send_to(&packet, addr).await.is_ok() {
+                            control_stats
+                                .retransmit_packets_sent
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
 
@@ -5811,64 +6270,132 @@ impl MeshNode {
                 for (addr, session, failed) in resets {
                     let pool = session.thread_local_pool();
                     let mut builder = pool.get();
-                    for stream_id in failed {
-                        let payload = StreamReset { stream_id }.encode();
-                        let seq = session.next_control_tx_seq();
-                        let events = vec![Bytes::copy_from_slice(&payload)];
-                        let packet = builder.build_subprotocol(
-                            CONTROL_STREAM_ID,
-                            seq,
-                            &events,
-                            PacketFlags::NONE,
-                            SUBPROTOCOL_STREAM_RESET,
-                        );
-                        let _ = socket.send_to(&packet, addr).await;
-                    }
+                    // B-3: all failed streams of a session share one
+                    // reset packet (plus payload-budget spill); the
+                    // receive path iterates every event in the frame.
+                    let reset_events: Vec<Bytes> = failed
+                        .into_iter()
+                        .map(|stream_id| {
+                            Bytes::copy_from_slice(&StreamReset { stream_id }.encode())
+                        })
+                        .collect();
+                    emit_control_chunks(
+                        &socket,
+                        &mut builder,
+                        &session,
+                        addr,
+                        &reset_events,
+                        SUBPROTOCOL_STREAM_RESET,
+                        &control_stats.reset_packets_sent,
+                        &control_stats.reset_events_sent,
+                    )
+                    .await;
                 }
 
-                // H-4: receiver-side proactive NACK. Re-request any
-                // persistent gap on a stream we're receiving, so a hole
-                // with no further arrivals (e.g. tail loss, or a sender
-                // paused on credit) recovers within a tick instead of
-                // waiting for the sender's RTO. The grant-piggybacked
-                // NACK only fires on new activity; this covers the quiet
-                // case. Duplicate NACKs are harmless — `on_nack` resends
-                // are bounded by `max_retries` and deduped by the
-                // receiver.
-                // (peer addr, its session, [(stream_id, NACK)…]) per peer.
-                type GapWork = Vec<(
-                    SocketAddr,
-                    Arc<NetSession>,
-                    Vec<(u64, super::protocol::NackPayload)>,
-                )>;
-                let mut gaps: GapWork = Vec::new();
+                // H-4 + R-4: receiver-side proactive gap recovery. One
+                // walk per peer collects each gapped stream's report
+                // (NACK + SACK ranges from a single reliability-lock
+                // snapshot; review TICK2X/I4 — was two separate walks
+                // that double-locked every stream and could snapshot
+                // the range index at two different instants). The NACK
+                // re-requests a hole with no further arrivals (tail
+                // loss / sender paused on credit) within a tick instead
+                // of waiting the sender's RTO; the SACK (capability-
+                // gated per peer, R-5) re-advertises received runs so
+                // one head loss doesn't leave the sender's RTO to guess.
+                // The grant-piggybacked emission only fires on new
+                // arrivals, so this covers the quiet case. Duplicate
+                // NACKs are harmless (`on_nack` resends are bounded by
+                // `max_retries` and deduped by the receiver).
+                struct TickGaps {
+                    addr: SocketAddr,
+                    session: Arc<NetSession>,
+                    reports: Vec<super::session::GapReport>,
+                }
+                let mut work: Vec<TickGaps> = Vec::new();
                 for peer in peers.iter() {
-                    let g = peer.value().session.collect_gap_nacks();
-                    if !g.is_empty() {
-                        gaps.push((peer.value().addr, peer.value().session.clone(), g));
+                    let session = &peer.value().session;
+                    // SACK ranges only for peers that advertise support
+                    // (R-5); a non-advertising peer's report skips the
+                    // range build entirely (`want_ranges = false`).
+                    let want_ranges = ack_ranges_enabled
+                        && peer_supports_ack_ranges(
+                            &ack_cache,
+                            &session_id_to_node,
+                            &capability_fold,
+                            session.session_id(),
+                        );
+                    let reports = session.collect_gap_reports(want_ranges, MAX_ACK_RANGES);
+                    if !reports.is_empty() {
+                        work.push(TickGaps {
+                            addr: peer.value().addr,
+                            session: session.clone(),
+                            reports,
+                        });
                     }
                 }
-                for (addr, session, g) in gaps {
+                for TickGaps {
+                    addr,
+                    session,
+                    reports,
+                } in work
+                {
                     let pool = session.thread_local_pool();
                     let mut builder = pool.get();
-                    for (stream_id, nack) in g {
-                        let payload = StreamNack {
-                            stream_id,
-                            next_expected: nack.next_expected,
-                            missing_bitmap: nack.missing_bitmap,
-                        }
-                        .encode();
-                        let seq = session.next_control_tx_seq();
-                        let events = vec![Bytes::copy_from_slice(&payload)];
-                        let packet = builder.build_subprotocol(
-                            CONTROL_STREAM_ID,
-                            seq,
-                            &events,
-                            PacketFlags::NONE,
-                            SUBPROTOCOL_STREAM_NACK,
-                        );
-                        let _ = socket.send_to(&packet, addr).await;
-                    }
+                    // B-3: one NACK packet per session per tick (plus
+                    // payload-budget spill) — same multi-event framing
+                    // as the drainer's piggybacked NACKs.
+                    let nack_events: Vec<Bytes> = reports
+                        .iter()
+                        .map(|r| {
+                            Bytes::copy_from_slice(
+                                &StreamNack {
+                                    stream_id: r.stream_id,
+                                    next_expected: r.nack.next_expected,
+                                    missing_bitmap: r.nack.missing_bitmap,
+                                }
+                                .encode(),
+                            )
+                        })
+                        .collect();
+                    emit_control_chunks(
+                        &socket,
+                        &mut builder,
+                        &session,
+                        addr,
+                        &nack_events,
+                        SUBPROTOCOL_STREAM_NACK,
+                        &control_stats.nack_packets_sent,
+                        &control_stats.nack_events_sent,
+                    )
+                    .await;
+                    // R-4: positive SACK ranges for the gapped streams
+                    // whose report carried them (only capable peers).
+                    let ack_events: Vec<Bytes> = reports
+                        .into_iter()
+                        .filter(|r| !r.ranges.is_empty())
+                        .map(|r| {
+                            Bytes::from(
+                                StreamAckRanges {
+                                    stream_id: r.stream_id,
+                                    ack_seq: r.ack_seq,
+                                    ranges: r.ranges,
+                                }
+                                .encode(),
+                            )
+                        })
+                        .collect();
+                    emit_control_chunks(
+                        &socket,
+                        &mut builder,
+                        &session,
+                        addr,
+                        &ack_events,
+                        SUBPROTOCOL_STREAM_ACK,
+                        &control_stats.ack_range_packets_sent,
+                        &control_stats.ack_range_events_sent,
+                    )
+                    .await;
                 }
             }
         })
@@ -5881,6 +6408,7 @@ impl MeshNode {
         let addr_to_node = self.addr_to_node.clone();
         let peer_addrs = self.peer_addrs.clone();
         let session_id_to_node = self.session_id_to_node.clone();
+        let ack_ranges_peer_cache = self.ack_ranges_peer_cache.clone();
         let failure_detector = self.failure_detector.clone();
         let interval = self.config.heartbeat_interval;
         let shutdown = self.shutdown.clone();
@@ -5971,6 +6499,18 @@ impl MeshNode {
                         // disappear on the same tick.
                         proximity_graph.sweep_stale_edges(max_route_age);
 
+                        // Bound the ack-ranges capability-gate cache
+                        // (review P2: insert-on-lookup, so peer churn
+                        // would otherwise grow it without bound).
+                        // Entries for peers with active gapped streams
+                        // refresh every ACK_RANGES_CAP_CACHE_TTL; a
+                        // swept-but-live peer merely pays one fold
+                        // lookup on its next gate check.
+                        sweep_ack_ranges_cache(
+                            &ack_ranges_peer_cache,
+                            ACK_RANGES_CAP_CACHE_MAX_AGE,
+                        );
+
                         // Sweep idle streams per-session and enforce the
                         // per-session `max_streams` cap. Each session is
                         // independent; large deployments with many peers
@@ -6027,6 +6567,12 @@ impl MeshNode {
                                 // session_id; we must not erase that.
                                 session_id_to_node
                                     .remove_if(&old_session_id, |_, n| *n == node_id);
+                                // Targeted ack-ranges gate-cache drop,
+                                // in lockstep with the other per-peer
+                                // maps. A reconnect under the same
+                                // node_id re-resolves through the fold
+                                // on its first gate check.
+                                ack_ranges_peer_cache.remove(&node_id);
                                 tracing::info!(
                                     node_id = format!("{:#x}", node_id),
                                     "evicted permanently-dead peer from peer map",
@@ -7696,6 +8242,16 @@ impl MeshNode {
         }
         let fold_ann = super::behavior::fold::capability_bridge::translate_announcement(&ann);
         let _ = ctx.capability_fold.apply(fold_ann);
+
+        // R-5: the peer's capability set just changed in the fold, so
+        // any cached ack-ranges gate verdict for it is now stale.
+        // Drop it so the next gate check re-resolves through the fold
+        // instead of serving a `false` cached before this announcement
+        // landed (the connect-time race) or a `true` from a capability
+        // the peer just dropped (downgrade/re-handshake). Keyed on the
+        // announcement origin — for a direct ann that is `from_node`,
+        // for a forwarded one the origin whose caps we just folded.
+        ctx.ack_ranges_peer_cache.remove(&ann.node_id);
     }
 
     /// Drop every `heat:<hex>=...` reserved tag from `caps` whose
@@ -9534,6 +10090,17 @@ impl MeshNode {
                 }
             }
             merged
+        };
+
+        // STREAM_ACK_BATCHING R-5: advertise transport support for
+        // positive SACK-range ACKs — same auto-augment pattern as the
+        // `nrpc:` / `ai-tool:` tags above. Config-gated so operators
+        // can turn the feature off wire-wide (compliant peers then
+        // never emit ranges to us, and we never emit to anyone).
+        let caps = if self.config.enable_stream_ack_ranges {
+            caps.add_tag(ACK_RANGES_CAPABILITY_TAG.to_string())
+        } else {
+            caps
         };
 
         let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
@@ -15898,5 +16465,489 @@ mod committed_flush_stall_tests {
             Err(e) => panic!("under deadline must continue (Ok), got {e}"),
         }
         assert_eq!(delay, Duration::from_millis(10), "backoff must double");
+    }
+}
+
+#[cfg(test)]
+mod stream_ack_batching_tests {
+    //! STREAM_ACK_BATCHING Phase 1 (B-1..B-5): grouping-key contract,
+    //! payload-budget chunk math, and multi-event control-frame
+    //! round-trips. The wire-cadence bound ("M streams to one session
+    //! ⇒ one grant packet per drain cycle, plus spill") follows from
+    //! `group_grants_by_session` + `chunks(GRANT_EVENTS_PER_PACKET)`,
+    //! both pinned here without spinning real sockets.
+    use super::*;
+    use crate::adapter::net::crypto::{NoiseHandshake, PacketCipher, StaticKeypair};
+    use crate::adapter::net::protocol::NetHeader;
+    use crate::adapter::net::subprotocol::stream_window::{STREAM_NACK_SIZE, STREAM_RESET_SIZE};
+
+    /// Fixed-count framing budget for the fixed-size `StreamNack` /
+    /// `StreamReset` frames — the reference the codec round-trip tests
+    /// fill "a full packet's worth" against. Production packs these by
+    /// actual size via [`pack_control_events`] (see `GRANT_EVENTS_PER_
+    /// PACKET`), so the constants live here with their tests rather
+    /// than in the module body.
+    const NACK_EVENTS_PER_PACKET: usize =
+        protocol::MAX_PAYLOAD_SIZE / (EventFrame::LEN_SIZE + STREAM_NACK_SIZE);
+    const RESET_EVENTS_PER_PACKET: usize =
+        protocol::MAX_PAYLOAD_SIZE / (EventFrame::LEN_SIZE + STREAM_RESET_SIZE);
+
+    fn make_session_keys() -> (
+        crate::adapter::net::crypto::SessionKeys,
+        crate::adapter::net::crypto::SessionKeys,
+    ) {
+        let psk = [0x42u8; 32];
+        let responder_kp = StaticKeypair::generate();
+        let mut initiator = NoiseHandshake::initiator(&psk, &responder_kp.public).unwrap();
+        let mut responder = NoiseHandshake::responder(&psk, &responder_kp).unwrap();
+        let msg1 = initiator.write_message(&[]).unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(&[]).unwrap();
+        initiator.read_message(&msg2).unwrap();
+        (
+            initiator.into_session_keys().unwrap(),
+            responder.into_session_keys().unwrap(),
+        )
+    }
+
+    fn session_at(addr: &str) -> Arc<NetSession> {
+        let (_init, resp) = make_session_keys();
+        Arc::new(NetSession::new(resp, addr.parse().unwrap(), 4, false))
+    }
+
+    fn pending(session: &Arc<NetSession>, addr: &str, consumed: u64) -> PendingStreamGrant {
+        PendingStreamGrant {
+            session: session.clone(),
+            peer_addr: addr.parse().unwrap(),
+            total_consumed: consumed,
+        }
+    }
+
+    /// The chunk constants must (a) actually batch, (b) fill a packet
+    /// without overflowing the payload budget, and (c) stay under the
+    /// header's event-count cap — the payload budget must be the
+    /// binding constraint.
+    #[test]
+    fn chunk_constants_fit_payload_and_event_caps() {
+        for (per_packet, event_size) in [
+            (GRANT_EVENTS_PER_PACKET, STREAM_WINDOW_SIZE),
+            (NACK_EVENTS_PER_PACKET, STREAM_NACK_SIZE),
+            (RESET_EVENTS_PER_PACKET, STREAM_RESET_SIZE),
+        ] {
+            assert!(per_packet > 1, "batching must batch");
+            let frame = EventFrame::LEN_SIZE + event_size;
+            assert!(
+                per_packet * frame <= protocol::MAX_PAYLOAD_SIZE,
+                "a full chunk must fit the payload budget"
+            );
+            assert!(
+                (per_packet + 1) * frame > protocol::MAX_PAYLOAD_SIZE,
+                "chunk must fill the packet (one more event would overflow)"
+            );
+            assert!(
+                per_packet <= NetHeader::MAX_EVENTS_PER_PACKET as usize,
+                "payload budget, not the event-count cap, must bind"
+            );
+        }
+    }
+
+    /// B-1 grouping-key contract: two DIFFERENT sessions behind the
+    /// SAME peer address (e.g. a rotation mid-drain) must not share a
+    /// batch — each owns its own AEAD cipher + control-seq counter.
+    #[test]
+    fn grouping_is_by_session_not_peer_addr() {
+        let addr = "127.0.0.1:7001";
+        let s1 = session_at(addr);
+        let s2 = session_at(addr);
+        let mut drained = HashMap::new();
+        drained.insert((s1.session_id(), 10u64), pending(&s1, addr, 100));
+        drained.insert((s2.session_id(), 10u64), pending(&s2, addr, 200));
+        let grouped = group_grants_by_session(drained);
+        assert_eq!(grouped.len(), 2, "distinct sessions must stay separate");
+    }
+
+    /// All streams of one session collapse into one batch, each
+    /// exactly once, with its own `total_consumed`.
+    #[test]
+    fn grouping_collects_all_streams_of_one_session() {
+        let addr = "127.0.0.1:7002";
+        let s = session_at(addr);
+        let mut drained = HashMap::new();
+        for stream_id in 0..100u64 {
+            drained.insert(
+                (s.session_id(), stream_id),
+                pending(&s, addr, stream_id * 10),
+            );
+        }
+        let grouped = group_grants_by_session(drained);
+        assert_eq!(grouped.len(), 1, "one session ⇒ one batch");
+        let (_, peer_addr, grants) = &grouped[&s.session_id()];
+        assert_eq!(*peer_addr, addr.parse().unwrap());
+        let mut seen: Vec<(u64, u64)> = grants.clone();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..100u64).map(|i| (i, i * 10)).collect::<Vec<_>>(),
+            "every stream survives grouping exactly once with its value"
+        );
+    }
+
+    /// The build step must NOT bump `credit_grants_sent` — that
+    /// counter means "grant datagram sent", and the drainer bumps it
+    /// per covered stream only after the chunk clears `send_to`.
+    /// Pre-fix the bump ran at build time, overcounting whenever the
+    /// send failed (review P2).
+    #[test]
+    fn build_session_control_events_does_not_bump_grants_sent() {
+        let addr = "127.0.0.1:7005";
+        let s = session_at(addr);
+        let sid = 42u64;
+        s.get_or_create_stream_for_packet(sid, true);
+
+        let grants = vec![(sid, 1000u64)];
+        let (entries, _nacks, _acks) = build_session_control_events(&s, &grants, false);
+        assert_eq!(entries.len(), 1);
+
+        let state = s.try_stream(sid).expect("stream exists");
+        assert_eq!(
+            state.credit_grants_sent(),
+            0,
+            "building the grant event must not count it as sent"
+        );
+        // The post-send bump is the drainer's job — one per grant
+        // that actually cleared the socket.
+        state.note_grant_sent();
+        assert_eq!(state.credit_grants_sent(), 1);
+    }
+
+    /// Grant entries stay paired (stream id ↔ encoded event) so the
+    /// post-send accounting hits the right streams, and NACK / SACK
+    /// events are built only for gapped streams (SACK only when the
+    /// peer supports ranges).
+    #[test]
+    fn build_session_control_events_pairs_ids_and_gates_gap_events() {
+        use crate::adapter::net::subprotocol::stream_window::StreamAckRanges;
+
+        let addr = "127.0.0.1:7006";
+        let s = session_at(addr);
+        // Stream 1: clean in-order receive. Stream 2: gapped (0
+        // received, 5 out of order → head gap at 1).
+        s.get_or_create_stream_for_packet(1, true)
+            .with_reliability(|r| {
+                assert!(r.on_receive(0));
+            });
+        s.get_or_create_stream_for_packet(2, true)
+            .with_reliability(|r| {
+                assert!(r.on_receive(0));
+                assert!(r.on_receive(5));
+            });
+
+        let grants = vec![(1u64, 10u64), (2u64, 20u64)];
+        let (entries, nacks, acks) = build_session_control_events(&s, &grants, true);
+
+        assert_eq!(entries.len(), 2);
+        for (sid, event) in &entries {
+            let g = StreamWindow::decode(event).expect("grant event decodes");
+            assert_eq!(g.stream_id, *sid, "entry id must match its encoded event");
+        }
+
+        assert_eq!(nacks.len(), 1, "only the gapped stream NACKs");
+        let n = StreamNack::decode(&nacks[0]).expect("nack decodes");
+        assert_eq!(n.stream_id, 2);
+        assert_eq!(n.next_expected, 1);
+
+        assert_eq!(acks.len(), 1, "only the gapped stream has SACK ranges");
+        let a = StreamAckRanges::decode(&acks[0]).expect("ack ranges decode");
+        assert_eq!(a.stream_id, 2);
+        assert_eq!(a.ack_seq, 1);
+        assert_eq!(a.ranges, vec![(5, 6)]);
+
+        // Capability gate off ⇒ no SACK events, everything else same.
+        let (_, _, acks_off) = build_session_control_events(&s, &grants, false);
+        assert!(acks_off.is_empty(), "no ranges to a non-advertising peer");
+    }
+
+    /// The capability-gate cache sweep drops entries past the age
+    /// bound and keeps fresh ones — the backstop that keeps the
+    /// insert-on-lookup cache bounded under peer churn (review P2).
+    #[test]
+    fn ack_ranges_cache_sweep_drops_only_stale_entries() {
+        let cache: DashMap<u64, (bool, Instant)> = DashMap::new();
+        let stale_at = Instant::now() - ACK_RANGES_CAP_CACHE_MAX_AGE - Duration::from_secs(1);
+        cache.insert(1, (true, stale_at));
+        cache.insert(2, (false, stale_at));
+        cache.insert(3, (true, Instant::now()));
+
+        sweep_ack_ranges_cache(&cache, ACK_RANGES_CAP_CACHE_MAX_AGE);
+
+        assert!(!cache.contains_key(&1), "stale positive entry swept");
+        assert!(!cache.contains_key(&2), "stale negative entry swept");
+        assert!(
+            cache.contains_key(&3),
+            "fresh entry survives — active peers keep their cached verdict"
+        );
+    }
+
+    /// R-5 gate-cache invalidation (review CAPCACHE): a verdict cached
+    /// before a peer's capability announcement is folded is stale for
+    /// the whole TTL, so the drainer keeps the legacy path during the
+    /// opening loss episode of a fresh transfer. `handle_capability_
+    /// announcement` removes the peer's cache entry the instant the
+    /// announcement folds; this pins that removal is what lets the
+    /// next gate check re-resolve to `true` (rather than waiting for
+    /// the TTL). Drives the real `peer_supports_ack_ranges` + fold.
+    #[test]
+    fn ack_ranges_gate_reresolves_after_announcement_invalidation() {
+        use crate::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
+        use crate::adapter::net::behavior::fold::capability::CapabilityFold;
+        use crate::adapter::net::behavior::fold::capability_bridge::translate_announcement;
+        use crate::adapter::net::behavior::fold::Fold;
+
+        let cache: DashMap<u64, (bool, Instant)> = DashMap::new();
+        let session_id_to_node: DashMap<u64, u64> = DashMap::new();
+        let fold: Fold<CapabilityFold> = Fold::new();
+
+        let kp = crate::adapter::net::EntityKeypair::generate();
+        let node_id = kp.node_id();
+        let session_id = 0x5E5510_u64; // arbitrary session id
+        session_id_to_node.insert(session_id, node_id);
+
+        // Fold empty ⇒ gate resolves false and CACHES (false, now).
+        assert!(!peer_supports_ack_ranges(
+            &cache,
+            &session_id_to_node,
+            &fold,
+            session_id
+        ));
+        assert_eq!(cache.get(&node_id).map(|e| e.value().0), Some(false));
+
+        // Peer now advertises the tag; fold updated (as the dispatch
+        // handler does before invalidating the cache).
+        let caps = CapabilitySet::new().add_tag(ACK_RANGES_CAPABILITY_TAG.to_string());
+        let ann = CapabilityAnnouncement::new(node_id, kp.entity_id().clone(), 1, caps);
+        fold.apply(translate_announcement(&ann))
+            .expect("fold apply");
+
+        // Without invalidation the stale `false` still wins (the bug).
+        assert!(
+            !peer_supports_ack_ranges(&cache, &session_id_to_node, &fold, session_id),
+            "cached false shadows the freshly-folded capability"
+        );
+
+        // The invalidation `handle_capability_announcement` now performs.
+        cache.remove(&node_id);
+
+        // Next check re-resolves through the fold ⇒ true.
+        assert!(
+            peer_supports_ack_ranges(&cache, &session_id_to_node, &fold, session_id),
+            "after invalidation the gate must see the announced capability"
+        );
+    }
+
+    /// Grants for different peers (different sessions) route to their
+    /// own batches with their own addresses.
+    #[test]
+    fn grouping_keeps_peers_separate() {
+        let a1 = "127.0.0.1:7003";
+        let a2 = "127.0.0.1:7004";
+        let s1 = session_at(a1);
+        let s2 = session_at(a2);
+        let mut drained = HashMap::new();
+        drained.insert((s1.session_id(), 1u64), pending(&s1, a1, 11));
+        drained.insert((s2.session_id(), 1u64), pending(&s2, a2, 22));
+        let grouped = group_grants_by_session(drained);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[&s1.session_id()].1, a1.parse().unwrap());
+        assert_eq!(grouped[&s2.session_id()].1, a2.parse().unwrap());
+    }
+
+    /// Decrypt-side pin for `chunk` → `build_subprotocol` framing:
+    /// a maximal batched frame fits one wire packet and every event
+    /// decodes back to its message. The receive path has always
+    /// iterated the full event vector (`mesh.rs` StreamWindow /
+    /// StreamNack / StreamReset arms), so this is the whole wire-
+    /// compatibility story for B-2/B-3.
+    fn roundtrip_full_chunk(payloads: Vec<Vec<u8>>, subprotocol_id: u16) -> Vec<Bytes> {
+        let key = [0x5Au8; 32];
+        let session_id = 0xACE0_FACEu64;
+        let mut builder = PacketBuilder::new(&key, session_id);
+        let events: Vec<Bytes> = payloads.iter().map(|p| Bytes::copy_from_slice(p)).collect();
+        let pkt = builder.build_subprotocol(
+            CONTROL_STREAM_ID,
+            1,
+            &events,
+            PacketFlags::NONE,
+            subprotocol_id,
+        );
+        assert!(
+            pkt.len() <= protocol::MAX_PACKET_SIZE,
+            "full chunk must fit one wire packet ({} > {})",
+            pkt.len(),
+            protocol::MAX_PACKET_SIZE
+        );
+        let header = NetHeader::from_bytes(&pkt[..HEADER_SIZE]).expect("header parses");
+        assert_eq!(header.event_count as usize, events.len());
+        assert_eq!(header.subprotocol_id, subprotocol_id);
+        let rx = PacketCipher::new(&key, session_id);
+        let nonce = u64::from_le_bytes(pkt[16..24].try_into().unwrap());
+        let aad = header.aad();
+        let mut buf = bytes::BytesMut::from(&pkt[HEADER_SIZE..]);
+        let n = rx
+            .decrypt_in_place(nonce, &aad, &mut buf[..])
+            .expect("decrypt succeeds");
+        EventFrame::read_events(buf.split_to(n).freeze(), header.event_count)
+    }
+
+    #[test]
+    fn full_grant_chunk_roundtrips_as_one_packet() {
+        let grants: Vec<StreamWindow> = (0..GRANT_EVENTS_PER_PACKET as u64)
+            .map(|i| StreamWindow {
+                stream_id: i,
+                total_consumed: i * 7,
+                ack_seq: i * 3,
+            })
+            .collect();
+        let recovered = roundtrip_full_chunk(
+            grants.iter().map(|g| g.encode().to_vec()).collect(),
+            SUBPROTOCOL_STREAM_WINDOW,
+        );
+        assert_eq!(
+            recovered.len(),
+            grants.len(),
+            "every grant survives framing"
+        );
+        for (event, g) in recovered.iter().zip(&grants) {
+            assert_eq!(StreamWindow::decode(event).unwrap(), *g);
+        }
+    }
+
+    #[test]
+    fn full_nack_chunk_roundtrips_as_one_packet() {
+        let nacks: Vec<StreamNack> = (0..NACK_EVENTS_PER_PACKET as u64)
+            .map(|i| StreamNack {
+                stream_id: i,
+                next_expected: i + 1,
+                missing_bitmap: i | 1,
+            })
+            .collect();
+        let recovered = roundtrip_full_chunk(
+            nacks.iter().map(|n| n.encode().to_vec()).collect(),
+            SUBPROTOCOL_STREAM_NACK,
+        );
+        assert_eq!(recovered.len(), nacks.len());
+        for (event, n) in recovered.iter().zip(&nacks) {
+            assert_eq!(StreamNack::decode(event).unwrap(), *n);
+        }
+    }
+
+    #[test]
+    fn full_reset_chunk_roundtrips_as_one_packet() {
+        let resets: Vec<StreamReset> = (0..RESET_EVENTS_PER_PACKET as u64)
+            .map(|i| StreamReset { stream_id: i })
+            .collect();
+        let recovered = roundtrip_full_chunk(
+            resets.iter().map(|r| r.encode().to_vec()).collect(),
+            SUBPROTOCOL_STREAM_RESET,
+        );
+        assert_eq!(recovered.len(), resets.len());
+        for (event, r) in recovered.iter().zip(&resets) {
+            assert_eq!(StreamReset::decode(event).unwrap(), *r);
+        }
+    }
+
+    /// Overflow spill (B-5): a batch larger than one packet's budget
+    /// splits into ceil(N / per-packet) chunks, none over budget,
+    /// with no event dropped.
+    #[test]
+    fn oversized_grant_batch_spills_without_loss() {
+        let total = GRANT_EVENTS_PER_PACKET * 2 + 122;
+        let events: Vec<Bytes> = (0..total as u64)
+            .map(|i| {
+                Bytes::copy_from_slice(
+                    &StreamWindow {
+                        stream_id: i,
+                        total_consumed: i,
+                        ack_seq: 0,
+                    }
+                    .encode(),
+                )
+            })
+            .collect();
+        let chunks: Vec<&[Bytes]> = events.chunks(GRANT_EVENTS_PER_PACKET).collect();
+        assert_eq!(chunks.len(), 3, "ceil(2N+122 / N) = 3 packets");
+        assert_eq!(
+            chunks.iter().map(|c| c.len()).sum::<usize>(),
+            total,
+            "no grant dropped by the spill"
+        );
+        for c in &chunks {
+            assert!(EventFrame::calculate_size(c) <= protocol::MAX_PAYLOAD_SIZE);
+        }
+    }
+
+    /// R-4 size-aware packing (review ACKCHUNK/H5): variable-size
+    /// `StreamAckRanges` events pack by ACTUAL size, so a batch of
+    /// small one-range events fills far fewer packets than the old
+    /// worst-case count (payload / 272 B ≈ 29 events/packet) — while
+    /// every chunk still fits the payload budget and no event is lost.
+    #[test]
+    fn pack_control_events_fills_by_size_not_worst_case() {
+        // 200 single-range SACK events (one range each → 32 wire B,
+        // 36 B framed). Worst-case chunking (StreamAckRanges::MAX_SIZE
+        // = 272 B) would have shipped ~29/packet ⇒ ≥7 packets.
+        let events: Vec<Bytes> = (0..200u64)
+            .map(|i| {
+                Bytes::from(
+                    StreamAckRanges {
+                        stream_id: i,
+                        ack_seq: 0,
+                        ranges: vec![(10 * i + 1, 10 * i + 2)],
+                    }
+                    .encode(),
+                )
+            })
+            .collect();
+
+        let ranges = pack_control_events(&events);
+
+        // Every event covered exactly once, in order, no gaps/overlap.
+        let covered: usize = ranges.iter().map(|r| r.len()).sum();
+        assert_eq!(covered, events.len(), "no event dropped by packing");
+        let mut next = 0usize;
+        for r in &ranges {
+            assert_eq!(r.start, next, "chunks are contiguous and in order");
+            next = r.end;
+        }
+        // Each chunk fits the payload budget.
+        for r in &ranges {
+            assert!(
+                EventFrame::calculate_size(&events[r.clone()]) <= protocol::MAX_PAYLOAD_SIZE,
+                "a packed chunk must fit the payload budget"
+            );
+        }
+        // Density: small events pack far below the worst-case bound.
+        // 200 × 36 B ≈ 7.2 KiB ⇒ one packet at an ~8 KiB budget.
+        let worst_case_packets = events.len().div_ceil(
+            protocol::MAX_PAYLOAD_SIZE / (EventFrame::LEN_SIZE + StreamAckRanges::MAX_SIZE),
+        );
+        assert!(
+            ranges.len() < worst_case_packets,
+            "size packing ({} packets) must beat worst-case count ({})",
+            ranges.len(),
+            worst_case_packets
+        );
+    }
+
+    /// A single event larger than the budget still ships alone rather
+    /// than producing an empty chunk (the `i > start` guard).
+    #[test]
+    fn pack_control_events_lone_oversized_event_ships_alone() {
+        let big = Bytes::from(vec![0u8; protocol::MAX_PAYLOAD_SIZE + 10]);
+        let small = Bytes::from_static(b"x");
+        let events = vec![small.clone(), big, small];
+        let ranges = pack_control_events(&events);
+        // small | big-alone | small — three chunks, none empty.
+        assert_eq!(ranges.len(), 3);
+        assert!(ranges.iter().all(|r| !r.is_empty()));
     }
 }

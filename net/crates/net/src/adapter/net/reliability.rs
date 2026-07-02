@@ -102,6 +102,26 @@ pub trait ReliabilityMode: Send + Sync {
     /// post-H-3, spuriously give up). Default no-op.
     fn on_ack(&mut self, _ack_seq: u64) {}
 
+    /// Sender-side: a positive SACK-range ack arrived (R-3).
+    /// `ack_seq` carries the cumulative ack (applied exactly like
+    /// [`Self::on_ack`]); `ranges` are half-open `[start, end)`
+    /// received runs strictly above it. SACKed packets are REMOVED
+    /// from the retransmit window — the receiver has them, so they
+    /// leave in-flight accounting and are never retransmit-eligible
+    /// again. This is what stops one lost head packet from RTO-
+    /// flooding every tracked packet behind it. Default no-op
+    /// (fire-and-forget tracks nothing).
+    fn on_ack_ranges(&mut self, _ack_seq: u64, _ranges: &[(u64, u64)]) {}
+
+    /// Receiver-side: the current out-of-order received runs above
+    /// [`Self::rx_ack_seq`], newest-first (descending by end), at
+    /// most `max_ranges` entries — the payload of an outgoing
+    /// `StreamAckRanges` (R-4). Default empty (fire-and-forget
+    /// tracks nothing; a gapless reliable stream has none).
+    fn build_ack_ranges(&self, _max_ranges: usize) -> Vec<(u64, u64)> {
+        Vec::new()
+    }
+
     /// Whether the sender may put another packet in flight under its
     /// congestion window (H-6). Default `true` (fire-and-forget has no
     /// congestion state). A reliable stream returns `false` once
@@ -228,12 +248,38 @@ pub struct ReliableStream {
     ///
     /// Use `next_expected()` / `ack_seq()` accessors externally.
     next_expected: u64,
-    /// SACK bitmap for out-of-order packets. Bit `i` is set iff sequence
-    /// `next_expected + 1 + i` has been received. This represents up to
-    /// 64 future sequences after the contiguous range. As `next_expected`
-    /// advances, the bitmap is right-shifted so bit 0 always represents
-    /// `next_expected + 1`.
-    sack_bitmap: u64,
+    /// Received-range index for out-of-order arrivals above
+    /// `next_expected` (R-2): half-open `[start, end)` runs, ASCENDING
+    /// by start, fully merged (non-overlapping, non-adjacent; every
+    /// start > `next_expected`). Replaces the v1 64-bit SACK bitmap,
+    /// whose fixed horizon turned one lost head packet into a
+    /// 64-packet in-flight ceiling. This is an INDEX, not a payload
+    /// buffer — per H-8, payloads are pushed to consumers in arrival
+    /// order and reassembled by seq — so memory is
+    /// O([`Self::MAX_REORDER_RANGES`]).
+    received_ranges: VecDeque<(u64, u64)>,
+    /// Out-of-order arrivals accepted into the range index (R-2).
+    oo_accepted: u64,
+    /// Arrivals rejected past the reorder horizon (R-2).
+    oo_dropped_horizon: u64,
+    /// Arrivals rejected because the range index was at
+    /// [`Self::MAX_REORDER_RANGES`] capacity (R-2).
+    oo_dropped_capacity: u64,
+    /// Newest SACK view received via
+    /// [`ReliabilityMode::on_ack_ranges`], kept (≤ 16 entries, one
+    /// message's worth) for the NACK-vs-SACK contradiction check —
+    /// best-effort observability, last message wins (R-3).
+    last_sacked: Vec<(u64, u64)>,
+    /// NACK-vs-SACK contradictions observed: a NACK named a seq that
+    /// a prior SACK (in `last_sacked`) positively acknowledged.
+    /// Positive ack wins — the packet is already out of the window —
+    /// so this only counts (R-3). Best-effort signal, NOT proof of a
+    /// hostile peer: the receiver's NACK and SACK for one gap travel
+    /// as separate datagrams and can reorder on the wire (or a stale
+    /// prior-tick NACK can arrive after a fresher SACK), so an honest
+    /// receiver on a lossy/jittery path trips this too. Treat a
+    /// non-zero value as "investigate," not "ban."
+    protocol_anomalies: u64,
     /// Pending unacknowledged packets (bounded)
     pending: VecDeque<UnackedPacket>,
     /// Retransmit timeout
@@ -316,6 +362,20 @@ impl ReliableStream {
     /// Default max retries
     pub const DEFAULT_MAX_RETRIES: u8 = 3;
 
+    /// Cap on tracked out-of-order received ranges (R-2). An insert
+    /// that would create a fresh range beyond this cap is rejected
+    /// (arrival dropped + counted in
+    /// [`Self::out_of_order_dropped_capacity`]), bounding both index
+    /// memory and the per-packet merge cost. 32 disjoint holes in one
+    /// window is pathological sustained reordering; the sender's RTO
+    /// recovers whatever a reject drops.
+    pub const MAX_REORDER_RANGES: usize = 32;
+
+    /// Cap on the reorder-acceptance horizon in packets (R-2). Equal
+    /// to the retransmit-window cap — accepting further ahead than
+    /// the sender can even track for retransmit is pointless.
+    pub const MAX_REORDER_PACKETS: u64 = Self::MAX_RETRANSMIT_WINDOW as u64;
+
     /// Initial congestion window in packets (H-6). ~TCP initial window;
     /// big enough that low-volume reliable streams (nRPC) never feel it.
     pub const INIT_CWND: f64 = 32.0;
@@ -345,21 +405,11 @@ impl ReliableStream {
     /// generous `max_pending` costs nothing up front — important when
     /// thousands of small-payload streams each carry a reliability state.
     pub fn new() -> Self {
-        Self {
-            next_expected: 0,
-            sack_bitmap: 0,
-            pending: VecDeque::new(),
-            rto: Self::DEFAULT_RTO,
-            max_pending: Self::DEFAULT_MAX_PENDING,
-            max_retries: Self::DEFAULT_MAX_RETRIES,
-            untracked_evictions: 0,
-            failed: false,
-            srtt: None,
-            rttvar: Duration::ZERO,
-            cwnd: Self::INIT_CWND,
-            ssthresh: f64::MAX,
-            recover: None,
-        }
+        Self::with_settings(
+            Self::DEFAULT_RTO,
+            Self::DEFAULT_MAX_PENDING,
+            Self::DEFAULT_MAX_RETRIES,
+        )
     }
 
     /// Create with custom settings. `pending` grows on demand (no
@@ -367,7 +417,12 @@ impl ReliableStream {
     pub fn with_settings(rto: Duration, max_pending: usize, max_retries: u8) -> Self {
         Self {
             next_expected: 0,
-            sack_bitmap: 0,
+            received_ranges: VecDeque::new(),
+            oo_accepted: 0,
+            oo_dropped_horizon: 0,
+            oo_dropped_capacity: 0,
+            last_sacked: Vec::new(),
+            protocol_anomalies: 0,
             pending: VecDeque::new(),
             rto,
             max_pending,
@@ -481,33 +536,170 @@ impl ReliableStream {
     ///
     /// A gap exists whenever at least one future sequence has been
     /// received out of order — meaning `next_expected` itself is still
-    /// pending (the implicit gap) and any interior missing seqs show
-    /// up as zero bits in the SACK bitmap below the highest received.
+    /// pending (the implicit gap) plus any interior holes between the
+    /// received ranges.
     fn has_gaps(&self) -> bool {
-        self.sack_bitmap != 0
+        !self.received_ranges.is_empty()
     }
 
-    /// Get bitmap of missing sequences after `next_expected`.
+    /// Get bitmap of missing sequences after `next_expected` for the
+    /// (unchanged) legacy NACK wire form.
     ///
     /// Bit `i` set means sequence `next_expected + 1 + i` is missing.
     /// Sequence `next_expected` itself is always implicitly missing
     /// whenever `has_gaps()` returns true (that's what makes the NACK
     /// meaningful) — `missing_sequences()` on the resulting NACK emits
     /// `next_expected` first, then the bits of this bitmap.
+    ///
+    /// Post-R-2 this view is DERIVED from the range index and is
+    /// byte-identical to the pre-R-2 bitmap for every state the old
+    /// 64-seq horizon could express. When received runs extend past
+    /// the 64-seq window the mask widens to all ones — every
+    /// unreceived seq inside the window is genuinely missing (there
+    /// is provably later data).
     fn missing_bitmap(&self) -> u64 {
-        // Invert sack_bitmap to get missing sequences; only consider
-        // bits up to the highest received (otherwise we'd claim
-        // sequences we've never heard of are "missing").
-        if self.sack_bitmap == 0 {
+        if self.received_ranges.is_empty() {
             return 0;
         }
-        let highest_bit = 63 - self.sack_bitmap.leading_zeros();
-        let mask = if highest_bit >= 63 {
+        // Rebuild the 64-bit received view: bit i = received
+        // (next_expected + 1 + i). Ranges are ascending + merged.
+        let base = self.next_expected + 1;
+        let mut sack: u64 = 0;
+        let mut beyond = false;
+        for &(start, end) in &self.received_ranges {
+            if start >= base + 64 {
+                beyond = true;
+                break; // ascending — every later range is beyond too
+            }
+            if end > base + 64 {
+                beyond = true;
+            }
+            // Every range starts > next_expected, i.e. >= base, so
+            // the clip below cannot underflow.
+            let lo = start.max(base) - base;
+            let hi = end.min(base + 64) - base;
+            let width = hi - lo;
+            if width >= 64 {
+                sack = u64::MAX;
+            } else {
+                sack |= ((1u64 << width) - 1) << lo;
+            }
+        }
+        if sack == 0 {
+            // Every received run lives beyond the 64-seq window: the
+            // whole window is missing.
+            return u64::MAX;
+        }
+        let mask = if beyond {
             u64::MAX
         } else {
-            (1u64 << (highest_bit + 1)) - 1
+            let highest_bit = 63 - sack.leading_zeros();
+            if highest_bit >= 63 {
+                u64::MAX
+            } else {
+                (1u64 << (highest_bit + 1)) - 1
+            }
         };
-        (!self.sack_bitmap) & mask
+        (!sack) & mask
+    }
+
+    /// Budgeted reorder-acceptance horizon in packets (R-2): how far
+    /// above `next_expected` an out-of-order arrival is accepted.
+    /// Scales with the stream's window-derived budget (`max_pending`
+    /// mirrors the rx window bytes / [`Self::MIN_TRACKED_PACKET_BYTES`]
+    /// sizing) and floors at the legacy 64, so default-window streams
+    /// keep their pre-R-2 behavior exactly.
+    ///
+    /// Caveat (review HORIZON): `max_pending` is derived from the
+    /// stream's `tx_window`, and this reuses it as the *receive-side*
+    /// acceptance budget. That is correct only because a stream is
+    /// currently constructed with one window value feeding both the
+    /// tx retransmit-window sizing and the rx credit
+    /// (`StreamState::new_full_with_epoch`). If tx and rx windows ever
+    /// become independently configurable, the horizon must be driven
+    /// by the rx budget explicitly (an rx-window arg into the
+    /// reliability state) rather than piggybacking `max_pending` —
+    /// otherwise the receiver would accept out-of-order seqs against
+    /// the *sender's* window, which R-2 explicitly warns against.
+    pub fn reorder_horizon(&self) -> u64 {
+        (self.max_pending as u64).clamp(64, Self::MAX_REORDER_PACKETS)
+    }
+
+    /// Out-of-order arrivals accepted into the range index (R-2).
+    #[inline]
+    pub fn out_of_order_accepted(&self) -> u64 {
+        self.oo_accepted
+    }
+
+    /// Arrivals rejected past the reorder horizon (R-2).
+    #[inline]
+    pub fn out_of_order_dropped_horizon(&self) -> u64 {
+        self.oo_dropped_horizon
+    }
+
+    /// Arrivals rejected at [`Self::MAX_REORDER_RANGES`] capacity.
+    #[inline]
+    pub fn out_of_order_dropped_capacity(&self) -> u64 {
+        self.oo_dropped_capacity
+    }
+
+    /// NACK-vs-SACK contradictions observed (R-3). Positive ack wins.
+    /// A best-effort anomaly signal, NOT a hostile-peer verdict: the
+    /// receiver derives NACKs and SACK ranges from one range index and
+    /// cannot emit both for the same seq *in a single snapshot*, but
+    /// the two ride separate datagrams that reorder independently on
+    /// the wire, so an honest peer on a lossy/jittery link raises this
+    /// too. Alert on sustained growth, not a single count.
+    #[inline]
+    pub fn protocol_anomalies(&self) -> u64 {
+        self.protocol_anomalies
+    }
+
+    /// Current out-of-order range count (index occupancy).
+    #[inline]
+    pub fn reorder_ranges(&self) -> usize {
+        self.received_ranges.len()
+    }
+
+    /// Insert an out-of-order received `seq` into the range index,
+    /// merging with adjacent neighbors (R-2). Returns `false` for
+    /// duplicates and for inserts rejected at capacity.
+    fn insert_received(&mut self, seq: u64) -> bool {
+        // Index of the first range with start > seq.
+        let idx = self.received_ranges.partition_point(|&(s, _)| s <= seq);
+        // Left neighbor (start <= seq): duplicate or extend-right.
+        if idx > 0 {
+            let (_, left_end) = self.received_ranges[idx - 1];
+            if seq < left_end {
+                return false; // duplicate inside the left range
+            }
+            if seq == left_end {
+                // Extends the left range by one; may bridge to the
+                // right neighbor.
+                self.received_ranges[idx - 1].1 = left_end + 1;
+                if idx < self.received_ranges.len() && self.received_ranges[idx].0 == left_end + 1 {
+                    let (_, right_end) = self.received_ranges[idx];
+                    self.received_ranges[idx - 1].1 = right_end;
+                    self.received_ranges.remove(idx);
+                }
+                self.oo_accepted += 1;
+                return true;
+            }
+        }
+        // Right neighbor (start > seq): extend-left.
+        if idx < self.received_ranges.len() && self.received_ranges[idx].0 == seq + 1 {
+            self.received_ranges[idx].0 = seq;
+            self.oo_accepted += 1;
+            return true;
+        }
+        // Fresh disjoint range.
+        if self.received_ranges.len() >= Self::MAX_REORDER_RANGES {
+            self.oo_dropped_capacity += 1;
+            return false;
+        }
+        self.received_ranges.insert(idx, (seq, seq + 1));
+        self.oo_accepted += 1;
+        true
     }
 }
 
@@ -565,56 +757,42 @@ impl ReliabilityMode for ReliableStream {
             return false;
         }
         if seq == self.next_expected {
-            // Next expected sequence — advance the contiguous range,
-            // then absorb any already-received future seqs that have
-            // just become contiguous.
-            //
-            // Bitmap invariant (before this call): bit i is set iff
-            // seq (old next_expected + 1 + i) has been received. After
-            // incrementing next_expected by 1 (but BEFORE shifting),
-            // bit 0 of the bitmap now refers to seq new_next_expected
-            // itself — which, if set, means that seq was also received
-            // out-of-order earlier and we can advance past it too.
+            // Head advance + collapse (R-2): absorb the range that
+            // just became contiguous, if any. Ranges are merged and
+            // non-adjacent, so at most ONE range can start at the new
+            // head — absorbing it cannot expose another contiguous
+            // range behind it. This is the correctness-critical path
+            // that ends a loss episode: e.g. `next_expected = 10`,
+            // ranges `[(11, 21)]`, receive 10 ⇒ `next_expected = 21`,
+            // ranges empty.
             self.next_expected += 1;
-            while self.sack_bitmap & 1 != 0 {
-                self.next_expected += 1;
-                self.sack_bitmap >>= 1;
+            if let Some(&(start, end)) = self.received_ranges.front() {
+                if start == self.next_expected {
+                    self.next_expected = end;
+                    self.received_ranges.pop_front();
+                }
             }
-            // Restore the bitmap invariant: after the loop,
-            // bit 0 of the bitmap still refers to seq `next_expected`
-            // (not yet received; otherwise the loop would have
-            // consumed it). The invariant wants bit 0 to refer to
-            // seq `next_expected + 1`, so shift once more.
-            self.sack_bitmap >>= 1;
             return true;
         }
-        // seq > next_expected: future sequence.
-        //
-        // The bitmap can represent up to 64 future seqs past the
-        // contiguous range. `offset` here is (seq - next_expected),
-        // which is ≥ 1. Bit 0 of the bitmap represents
-        // `next_expected + 1`, so the bit index is `offset - 1`.
+        // seq > next_expected: out-of-order future sequence.
         //
         // If the first packet of a stream arrives with seq > 0, this
         // branch records it without advancing next_expected, so
-        // sequences `[0, seq)` remain flagged as missing in the
-        // SACK bitmap — the receiver will request them via a NACK
-        // instead of silently skipping them (which is what the old
-        // code's `seq == ack_seq + 1` branch did, treating seq 0 as
-        // already-acknowledged when the stream actually started with
-        // a lost packet).
+        // sequences `[0, seq)` remain flagged as missing — the
+        // receiver requests them via NACK instead of silently
+        // skipping them.
+        //
+        // Budgeted acceptance horizon (R-2): replaces the fixed
+        // 64-seq bitmap cap that turned one lost head packet into a
+        // 64-packet in-flight ceiling — everything further ahead was
+        // dropped on arrival and had to be resent even though it had
+        // already crossed the wire.
         let offset = seq - self.next_expected;
-        if offset > 64 {
+        if offset > self.reorder_horizon() {
+            self.oo_dropped_horizon += 1;
             return false;
         }
-        let bit = offset - 1;
-        let mask = 1u64 << bit;
-        if self.sack_bitmap & mask != 0 {
-            // Duplicate of a previously-recorded future seq.
-            return false;
-        }
-        self.sack_bitmap |= mask;
-        true
+        self.insert_received(seq)
     }
 
     #[inline]
@@ -662,6 +840,26 @@ impl ReliabilityMode for ReliableStream {
         // each emission is one atomic refcount bump rather than a
         // deep `Vec<Bytes>` clone.
         for missing_seq in nack.missing_sequences() {
+            // R-3 contradiction rule: positive ACK wins. A NACK for a
+            // seq a prior SACK already acknowledged is a best-effort
+            // anomaly signal — the packet is already gone from
+            // `pending`, so nothing could resend anyway; count it and
+            // move on. This is NOT proof of a hostile peer: an honest
+            // receiver's NACK and SACK for one gap are separate
+            // datagrams that reorder independently, so a stale NACK
+            // arriving after a fresher SACK trips this on any lossy /
+            // jittery link (see `protocol_anomalies`). The same-cycle
+            // build is now consistent (one reliability-lock snapshot
+            // in `build_session_control_events`), so what remains is
+            // wire reordering, which no receiver can prevent.
+            if self
+                .last_sacked
+                .iter()
+                .any(|&(s, e)| missing_seq >= s && missing_seq < e)
+            {
+                self.protocol_anomalies = self.protocol_anomalies.saturating_add(1);
+                continue;
+            }
             for unacked in &mut self.pending {
                 if unacked.seq() == missing_seq && unacked.retries < self.max_retries {
                     retransmits.push(Arc::clone(&unacked.descriptor));
@@ -800,6 +998,87 @@ impl ReliabilityMode for ReliableStream {
         }
     }
 
+    fn on_ack_ranges(&mut self, ack_seq: u64, ranges: &[(u64, u64)]) {
+        // Cumulative prune first — pop-front fast path + straggler
+        // sweep + RTT sample + cwnd growth + fast-recovery exit.
+        self.on_ack(ack_seq);
+        if ranges.is_empty() {
+            return;
+        }
+        // Remember the newest SACK view for the NACK contradiction
+        // check (best-effort; last message wins, ≤ MAX_ACK_RANGES).
+        // Reuse the existing buffer instead of allocating a fresh Vec
+        // per SACK: on a loss episode these arrive at up to the drain
+        // cadence (~1 kHz) plus the 25 ms tick, and the capacity is
+        // bounded at MAX_ACK_RANGES, so `clear` + `extend_from_slice`
+        // is steady-state allocation-free (review SACKSCAN/H7).
+        //
+        // Note on the full-`retain` cost (review SACKSCAN/H1): a
+        // deliberate short-circuit for a repeated-identical SACK is NOT
+        // applied. After the first SACK prunes the window down to only
+        // the genuinely-missing packets, `pending` is O(lost), so a
+        // repeated SACK's `retain` is already cheap; and skipping it
+        // would leave a concurrently-registered in-range straggler
+        // (see the `on_ack` straggler sweep) in `pending` for a
+        // spurious later retransmit — trading the feature's core
+        // no-RTO-flood guarantee for a scan that is no longer hot.
+        self.last_sacked.clear();
+        self.last_sacked.extend_from_slice(ranges);
+        // Remove SACKed packets outright — no mark-and-skip. A
+        // positive SACK means the receiver HAS them: they leave
+        // in-flight accounting and must never be retransmit-eligible
+        // again. This is what kills the RTO flood: after one head
+        // loss the window holds ONLY the genuinely missing packets,
+        // so `get_timed_out` resends O(lost), not O(window).
+        let now = Instant::now();
+        let mut sample: Option<Duration> = None;
+        let mut sacked = 0usize;
+        self.pending.retain(|unacked| {
+            let seq = unacked.seq();
+            let inside = ranges.iter().any(|&(s, e)| seq >= s && seq < e);
+            if inside {
+                // Karn: only never-retransmitted packets sample RTT.
+                // Front-to-back walk ⇒ the newest such packet's
+                // sample wins (same convention as `on_ack`).
+                if unacked.retries == 0 {
+                    sample = Some(now.duration_since(unacked.sent_at));
+                }
+                sacked += 1;
+                false
+            } else {
+                true
+            }
+        });
+        if let Some(rtt) = sample {
+            self.update_rto(rtt);
+        }
+        // Conservative cwnd growth (R-3): SACKed packets are
+        // delivered, so they count as acked — but the growth applied
+        // per update is capped at the current cwnd, so one delayed
+        // SACK covering thousands of packets can't step-function
+        // cwnd into a burst (there is no pacer to absorb it).
+        // Slow-start still doubles per update under this cap.
+        let cap = (self.cwnd.ceil() as usize).max(1);
+        for _ in 0..sacked.min(cap) {
+            self.grow_cwnd();
+        }
+        // `recover` is intentionally NOT cleared by ranges — only a
+        // cumulative ack past the recover point ends a loss episode
+        // (T-1); the head gap is by definition still missing.
+    }
+
+    fn build_ack_ranges(&self, max_ranges: usize) -> Vec<(u64, u64)> {
+        // Newest-first (descending by end): truncation under the cap
+        // drops the OLDEST ranges — the ones the next cumulative
+        // advance covers first (R-1 wire order).
+        self.received_ranges
+            .iter()
+            .rev()
+            .take(max_ranges)
+            .copied()
+            .collect()
+    }
+
     fn can_send(&self) -> bool {
         // H-6: cap in-flight (unacked) packets at the congestion window.
         // On a loss-free path cwnd grows past the retransmit window, so
@@ -823,7 +1102,7 @@ impl std::fmt::Debug for ReliableStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReliableStream")
             .field("next_expected", &self.next_expected)
-            .field("sack_bitmap", &format!("{:064b}", self.sack_bitmap))
+            .field("received_ranges", &self.received_ranges)
             .field("pending_count", &self.pending.len())
             .field("rto_ms", &self.rto.as_millis())
             .finish()
@@ -1942,6 +2221,264 @@ mod tests {
             Arc::as_ptr(&from_timeout[0]),
             original_ptr,
             "get_timed_out must clone the Arc, not deep-clone the descriptor"
+        );
+    }
+
+    // ── STREAM_ACK_BATCHING Phase 2 (R-2/R-3): range index, budgeted
+    //    horizon, SACK-driven pruning ────────────────────────────────
+
+    /// R-2 head-collapse — the correctness-critical path that ends a
+    /// loss episode: filling the head gap must advance `next_expected`
+    /// THROUGH the range that just became contiguous, not by one.
+    #[test]
+    fn head_collapse_advances_through_absorbed_range() {
+        let mut s = ReliableStream::new();
+        for i in 0..10u64 {
+            assert!(s.on_receive(i));
+        }
+        for i in 11..21u64 {
+            assert!(s.on_receive(i), "seq {i} within horizon must be accepted");
+        }
+        assert_eq!(s.ack_seq(), 9, "head gap at 10 pins the cumulative ack");
+        assert_eq!(s.reorder_ranges(), 1, "11..21 merged into one range");
+        assert!(s.build_nack().is_some());
+
+        assert!(s.on_receive(10), "head fill");
+        assert_eq!(
+            s.next_expected(),
+            21,
+            "next_expected must collapse through the absorbed range"
+        );
+        assert_eq!(s.reorder_ranges(), 0);
+        assert!(s.build_nack().is_none(), "no gaps left");
+    }
+
+    /// R-2 budgeted horizon: default windows keep the legacy 64
+    /// exactly; large windows scale it up (the pre-R-2 cliff: one
+    /// lost head packet capped usable in-flight at 64 regardless of
+    /// window).
+    #[test]
+    fn reorder_horizon_floors_at_64_and_scales_with_window() {
+        // Default (max_pending = 32) → horizon 64: identical to the
+        // legacy bitmap behavior at both edges.
+        let mut s = ReliableStream::new();
+        assert!(s.on_receive(0)); // next_expected = 1
+        assert!(s.on_receive(1 + 64), "offset 64 accepted (legacy edge)");
+        assert!(!s.on_receive(1 + 65), "offset 65 rejected (legacy edge)");
+        assert_eq!(s.out_of_order_dropped_horizon(), 1);
+
+        // Window-sized stream → horizon = max_pending.
+        let mut big = ReliableStream::with_settings(Duration::from_millis(50), 1000, 3);
+        assert!(big.on_receive(0));
+        assert!(
+            big.on_receive(1 + 1000),
+            "offset 1000 accepted with a 1000-packet window"
+        );
+        assert!(!big.on_receive(1 + 1001), "offset 1001 rejected");
+        assert_eq!(big.reorder_horizon(), 1000);
+    }
+
+    /// R-2 capacity bound: a 33rd disjoint hole is rejected (counted),
+    /// but an arrival that MERGES into existing ranges is always
+    /// accepted — capacity gates fresh ranges, not progress.
+    #[test]
+    fn range_capacity_rejects_fresh_range_but_accepts_merges() {
+        let mut s = ReliableStream::with_settings(Duration::from_millis(50), 16_384, 3);
+        assert!(s.on_receive(0)); // next_expected = 1
+        for i in 0..ReliableStream::MAX_REORDER_RANGES as u64 {
+            assert!(s.on_receive(2 + i * 2), "disjoint seq {}", 2 + i * 2);
+        }
+        assert_eq!(s.reorder_ranges(), ReliableStream::MAX_REORDER_RANGES);
+
+        let next_disjoint = 2 + ReliableStream::MAX_REORDER_RANGES as u64 * 2;
+        assert!(!s.on_receive(next_disjoint), "fresh range at capacity");
+        assert_eq!(s.out_of_order_dropped_capacity(), 1);
+
+        // seq 3 bridges (2,3) and (4,5) into (2,5): accepted, and the
+        // index SHRINKS.
+        assert!(s.on_receive(3));
+        assert_eq!(s.reorder_ranges(), ReliableStream::MAX_REORDER_RANGES - 1);
+    }
+
+    /// R-2: the legacy NACK bitmap derived from the range index is
+    /// identical to the pre-R-2 bitmap for expressible states, and
+    /// widens to all-ones when received runs live beyond the 64-seq
+    /// window (everything in the window is genuinely missing).
+    #[test]
+    fn legacy_nack_bitmap_derives_from_ranges() {
+        // Mirror of `test_reliable_stream_gap` shape: received {0, 1,
+        // 3, 5} → next_expected 2, received view {3, 5} = bits 1 and 3
+        // off base 3 → missing = seq 4 (bit 1).
+        let mut m = ReliableStream::new();
+        for seq in [0u64, 1, 3, 5] {
+            assert!(m.on_receive(seq));
+        }
+        let nack = m.build_nack().unwrap();
+        assert_eq!(nack.next_expected, 2);
+        let missing: Vec<u64> = nack.missing_sequences().collect();
+        assert_eq!(missing, vec![2, 4]);
+
+        // Far-future run only: whole 64-seq window is missing.
+        let mut far = ReliableStream::with_settings(Duration::from_millis(50), 1000, 3);
+        assert!(far.on_receive(0));
+        assert!(far.on_receive(200));
+        let nack = far.build_nack().unwrap();
+        assert_eq!(nack.next_expected, 1);
+        assert_eq!(nack.missing_bitmap, u64::MAX);
+    }
+
+    /// R-3 — the killer demo at unit level: one lost head packet
+    /// under a large in-flight, SACKed via one range, leaves O(lost)
+    /// in the retransmit window; the RTO backstop resends 1 packet,
+    /// not 1000 (pre-R-3 it resent everything and cwnd floored).
+    #[test]
+    fn on_ack_ranges_suppresses_rto_flood_after_head_loss() {
+        let rto = Duration::from_millis(5);
+        let mut s = ReliableStream::with_settings(rto, 16_384, 3);
+        for seq in 0..1000u64 {
+            s.on_send(descriptor(seq, Bytes::from_static(b"x")));
+        }
+        // Receiver has 1..1000, missing only 0.
+        s.on_ack_ranges(0, &[(1, 1000)]);
+        assert_eq!(
+            s.pending.len(),
+            1,
+            "only the genuinely missing head stays tracked"
+        );
+        std::thread::sleep(rto * 2);
+        let resent = s.get_timed_out();
+        assert_eq!(resent.len(), 1, "RTO resends O(lost), not O(window)");
+        assert_eq!(resent[0].seq, 0);
+        assert!(!s.take_failed(), "retries remain — no spurious give-up");
+    }
+
+    /// R-3: cwnd growth per SACK update is capped at the current cwnd
+    /// — one delayed SACK covering thousands of packets must not
+    /// step-function cwnd into a burst.
+    #[test]
+    fn on_ack_ranges_cwnd_growth_is_capped_per_update() {
+        let mut s = ReliableStream::with_settings(Duration::from_millis(50), 16_384, 3);
+        for seq in 0..5000u64 {
+            s.on_send(descriptor(seq, Bytes::from_static(b"x")));
+        }
+        let before = s.cwnd;
+        s.on_ack_ranges(0, &[(1, 5000)]);
+        assert!(
+            s.cwnd <= before * 2.0,
+            "one update at most doubles cwnd (slow-start under cap): {} -> {}",
+            before,
+            s.cwnd
+        );
+    }
+
+    /// R-3 (review SACKSCAN): a repeated-identical SACK is idempotent —
+    /// the second application removes nothing, does not grow cwnd
+    /// again, and refreshes `last_sacked` in place (no per-message
+    /// reallocation of a fresh view). The window already holds only
+    /// the genuinely-missing head after the first SACK.
+    #[test]
+    fn on_ack_ranges_repeated_identical_is_idempotent() {
+        let mut s = ReliableStream::with_settings(Duration::from_millis(50), 16_384, 3);
+        for seq in 0..1000u64 {
+            s.on_send(descriptor(seq, Bytes::from_static(b"x")));
+        }
+        s.on_ack_ranges(0, &[(1, 1000)]);
+        let pending_after_first = s.pending.len();
+        let cwnd_after_first = s.cwnd;
+        assert_eq!(pending_after_first, 1, "only the missing head remains");
+        assert_eq!(s.last_sacked, vec![(1, 1000)]);
+
+        // Same SACK again: no change to the window or cwnd.
+        s.on_ack_ranges(0, &[(1, 1000)]);
+        assert_eq!(
+            s.pending.len(),
+            pending_after_first,
+            "repeated identical SACK removes nothing new"
+        );
+        assert_eq!(
+            s.cwnd, cwnd_after_first,
+            "repeated identical SACK must not re-grow cwnd"
+        );
+        assert_eq!(s.last_sacked, vec![(1, 1000)], "last_sacked stays correct");
+    }
+
+    /// R-3 / Karn: a SACKed packet that was retransmitted must not
+    /// contribute an RTT sample.
+    #[test]
+    fn on_ack_ranges_skips_rtt_sample_for_retransmitted_karn() {
+        let mut s = ReliableStream::with_settings(Duration::from_millis(10), 32, 3);
+        s.on_send(descriptor(0, Bytes::from_static(b"x")));
+        s.on_send(descriptor(1, Bytes::from_static(b"x")));
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(s.get_timed_out().len(), 2, "both retransmitted");
+        s.on_ack_ranges(0, &[(1, 2)]);
+        assert_eq!(
+            s.rto,
+            Duration::from_millis(10),
+            "Karn: no RTT sample from a retransmitted SACKed packet"
+        );
+    }
+
+    /// R-3 contradiction rule: a NACK claiming a seq missing that a
+    /// prior SACK acknowledged resends nothing (positive ack wins)
+    /// and bumps the anomaly counter.
+    #[test]
+    fn nack_after_sack_counts_protocol_anomaly_and_resends_nothing() {
+        let mut s = ReliableStream::new();
+        for seq in 0..5u64 {
+            s.on_send(descriptor(seq, Bytes::from_static(b"x")));
+        }
+        s.on_ack_ranges(0, &[(2, 4)]); // peer HAS 2 and 3
+        assert_eq!(s.protocol_anomalies(), 0);
+        let nack = NackPayload {
+            next_expected: 2, // …and now claims 2 is missing
+            missing_bitmap: 0,
+        };
+        assert!(
+            s.on_nack(&nack).is_empty(),
+            "positive ack wins — nothing resent"
+        );
+        assert_eq!(s.protocol_anomalies(), 1);
+    }
+
+    /// R-1/R-4 producer↔consumer consistency: ranges built by the
+    /// receiver are newest-first, truncate oldest-first, and always
+    /// pass the wire codec's strict validation.
+    #[test]
+    fn build_ack_ranges_newest_first_and_codec_valid() {
+        use crate::adapter::net::subprotocol::stream_window::{StreamAckRanges, MAX_ACK_RANGES};
+
+        let mut s = ReliableStream::with_settings(Duration::from_millis(50), 16_384, 3);
+        assert!(s.on_receive(0)); // next_expected = 1
+        for i in 0..20u64 {
+            assert!(s.on_receive(2 + 2 * i));
+        }
+        let ranges = s.build_ack_ranges(MAX_ACK_RANGES);
+        assert_eq!(ranges.len(), MAX_ACK_RANGES, "truncated to the cap");
+        assert_eq!(
+            ranges[0],
+            (2 + 2 * 19, 2 + 2 * 19 + 1),
+            "newest (highest) range first"
+        );
+        assert!(
+            ranges.windows(2).all(|w| w[0].0 > w[1].1),
+            "strictly descending, non-adjacent"
+        );
+        assert_eq!(
+            ranges.last().copied().unwrap(),
+            (2 + 2 * 4, 2 + 2 * 4 + 1),
+            "truncation dropped the 4 OLDEST ranges"
+        );
+
+        // Whatever the receiver produces must decode cleanly.
+        let msg = StreamAckRanges {
+            stream_id: 7,
+            ack_seq: s.rx_ack_seq(),
+            ranges,
+        };
+        assert_eq!(
+            StreamAckRanges::decode(&msg.encode()).expect("receiver output is always codec-valid"),
+            msg
         );
     }
 }

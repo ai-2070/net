@@ -37,6 +37,12 @@ pub const SUBPROTOCOL_STREAM_NACK: u16 = 0x0B01;
 /// stall to a timeout (H-3).
 pub const SUBPROTOCOL_STREAM_RESET: u16 = 0x0B02;
 
+/// Subprotocol ID for receiver → sender positive SACK-range ACKs
+/// ([`StreamAckRanges`]) — STREAM_ACK_BATCHING_AND_RANGES R-1.
+/// Emission is capability-gated (`net.reliable.stream_ack_ranges@1`);
+/// receivers accept unconditionally.
+pub const SUBPROTOCOL_STREAM_ACK: u16 = 0x0B03;
+
 /// Fixed wire size of a [`StreamReset`] in bytes.
 pub const STREAM_RESET_SIZE: usize = 8;
 
@@ -45,6 +51,21 @@ pub const STREAM_WINDOW_SIZE: usize = 24;
 
 /// Fixed wire size of a [`StreamNack`] in bytes.
 pub const STREAM_NACK_SIZE: usize = 24;
+
+/// Fixed header size of a [`StreamAckRanges`] (`stream_id` + `ack_seq`);
+/// each range adds [`STREAM_ACK_RANGE_SIZE`] bytes.
+pub const STREAM_ACK_HEADER_SIZE: usize = 16;
+
+/// Wire size of one half-open `[start, end)` range in a
+/// [`StreamAckRanges`].
+pub const STREAM_ACK_RANGE_SIZE: usize = 16;
+
+/// Max ranges carried per [`StreamAckRanges`] message. 16 ranges is
+/// 272 wire bytes — comfortably one event inside a batched control
+/// frame. The receiver's range index truncates newest-first to this
+/// cap; the dropped oldest ranges are exactly the ones the next
+/// cumulative-ack advance covers first.
+pub const MAX_ACK_RANGES: usize = 16;
 
 /// Receiver → sender credit grant. Authoritative: `total_consumed`
 /// is the receiver's cumulative bytes-consumed count on the named
@@ -82,16 +103,50 @@ pub struct StreamWindow {
     pub ack_seq: u64,
 }
 
-/// Errors produced by the codec.
+/// Errors produced by the codec. Shared by all three fixed-size
+/// messages in this module, so the expected size is carried per
+/// error rather than hardcoded in the message.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamWindowCodecError {
     /// Buffer shorter than the fixed wire size.
-    #[error("truncated stream-window message: {0} bytes (need 16)")]
-    Truncated(usize),
+    #[error("truncated stream subprotocol message: {got} bytes (need {need})")]
+    Truncated {
+        /// Bytes received.
+        got: usize,
+        /// The message's fixed wire size.
+        need: usize,
+    },
     /// Buffer longer than the fixed wire size. Rejects garbage
     /// trailers rather than silently ignoring them.
-    #[error("oversize stream-window message: {0} bytes (need 16)")]
-    Oversize(usize),
+    #[error("oversize stream subprotocol message: {got} bytes (need {need})")]
+    Oversize {
+        /// Bytes received.
+        got: usize,
+        /// The message's fixed wire size.
+        need: usize,
+    },
+    /// Structurally invalid [`StreamAckRanges`] payload — bad length
+    /// shape, range count, range bounds, ordering, or overlap.
+    #[error("invalid stream-ack ranges: {reason}")]
+    InvalidRanges {
+        /// Which validation failed.
+        reason: &'static str,
+    },
+}
+
+/// Length gate shared by the three fixed-size codecs (`StreamWindow`,
+/// `StreamNack`, `StreamReset`): require exactly `need` bytes, else
+/// the matching `Truncated` / `Oversize` error carrying the REAL
+/// expected size. Centralizing this is what stops a per-decoder size
+/// literal from drifting out of sync with the wire size (the pre-fix
+/// "need 16" message that outlived the 24-byte grant growth).
+#[inline]
+fn require_exact_len(data: &[u8], need: usize) -> Result<(), StreamWindowCodecError> {
+    match data.len() {
+        n if n < need => Err(StreamWindowCodecError::Truncated { got: n, need }),
+        n if n > need => Err(StreamWindowCodecError::Oversize { got: n, need }),
+        _ => Ok(()),
+    }
 }
 
 impl StreamWindow {
@@ -108,21 +163,16 @@ impl StreamWindow {
     /// Decode a fixed-size message. Returns an error on truncated or
     /// oversize input.
     pub fn decode(data: &[u8]) -> Result<Self, StreamWindowCodecError> {
-        match data.len() {
-            n if n < STREAM_WINDOW_SIZE => Err(StreamWindowCodecError::Truncated(n)),
-            n if n > STREAM_WINDOW_SIZE => Err(StreamWindowCodecError::Oversize(n)),
-            _ => {
-                let mut cur = std::io::Cursor::new(data);
-                let stream_id = cur.get_u64_le();
-                let total_consumed = cur.get_u64_le();
-                let ack_seq = cur.get_u64_le();
-                Ok(Self {
-                    stream_id,
-                    total_consumed,
-                    ack_seq,
-                })
-            }
-        }
+        require_exact_len(data, STREAM_WINDOW_SIZE)?;
+        let mut cur = std::io::Cursor::new(data);
+        let stream_id = cur.get_u64_le();
+        let total_consumed = cur.get_u64_le();
+        let ack_seq = cur.get_u64_le();
+        Ok(Self {
+            stream_id,
+            total_consumed,
+            ack_seq,
+        })
     }
 }
 
@@ -157,21 +207,134 @@ impl StreamNack {
 
     /// Decode a 24-byte message. Errors on truncated / oversize input.
     pub fn decode(data: &[u8]) -> Result<Self, StreamWindowCodecError> {
-        match data.len() {
-            n if n < STREAM_NACK_SIZE => Err(StreamWindowCodecError::Truncated(n)),
-            n if n > STREAM_NACK_SIZE => Err(StreamWindowCodecError::Oversize(n)),
-            _ => {
-                let mut cur = std::io::Cursor::new(data);
-                let stream_id = cur.get_u64_le();
-                let next_expected = cur.get_u64_le();
-                let missing_bitmap = cur.get_u64_le();
-                Ok(Self {
-                    stream_id,
-                    next_expected,
-                    missing_bitmap,
-                })
-            }
+        require_exact_len(data, STREAM_NACK_SIZE)?;
+        let mut cur = std::io::Cursor::new(data);
+        let stream_id = cur.get_u64_le();
+        let next_expected = cur.get_u64_le();
+        let missing_bitmap = cur.get_u64_le();
+        Ok(Self {
+            stream_id,
+            next_expected,
+            missing_bitmap,
+        })
+    }
+}
+
+/// Receiver → sender positive SACK-range ACK (STREAM_ACK_BATCHING R-1).
+///
+/// Semantics, precisely: `ack_seq` cumulatively acknowledges every
+/// sequence `< ack_seq` (identical to `StreamWindow::ack_seq` — the
+/// receiver's `next_expected`). `ranges` selectively acknowledge
+/// received runs **strictly above** `ack_seq` as half-open
+/// `[start, end)` intervals. `ack_seq` itself is by definition the
+/// missing head — it is never inside a range, and the cumulative run
+/// is never duplicated as a range. Example: `ack_seq = 101`,
+/// `ranges = [(102, 10001)]` ⇒ everything below 101 received, 101
+/// missing, 102..=10000 received.
+///
+/// Wire order is DESCENDING by `end` (newest first): when the
+/// receiver truncates to [`MAX_ACK_RANGES`] it drops the *oldest*
+/// ranges — the ones the next cumulative advance covers first.
+/// Ranges are fully merged: non-overlapping and non-adjacent.
+///
+/// The sender feeds this to `ReliableStream::on_ack_ranges`, which
+/// removes SACKed packets from the retransmit window so one lost
+/// head packet no longer RTO-floods everything behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamAckRanges {
+    /// Stream the ack applies to.
+    pub stream_id: u64,
+    /// Cumulative ack — every sequence `< ack_seq` is received.
+    pub ack_seq: u64,
+    /// Received runs strictly above `ack_seq`: half-open
+    /// `[start, end)`, descending by `end`, merged,
+    /// `1..=MAX_ACK_RANGES` entries.
+    pub ranges: Vec<(u64, u64)>,
+}
+
+impl StreamAckRanges {
+    /// Minimum wire size: header + one range. A rangeless message is
+    /// meaningless (the grant's `ack_seq` already covers the
+    /// contiguous case) and is rejected by [`Self::decode`].
+    pub const MIN_SIZE: usize = STREAM_ACK_HEADER_SIZE + STREAM_ACK_RANGE_SIZE;
+
+    /// Maximum wire size (header + [`MAX_ACK_RANGES`] ranges).
+    pub const MAX_SIZE: usize = STREAM_ACK_HEADER_SIZE + MAX_ACK_RANGES * STREAM_ACK_RANGE_SIZE;
+
+    /// Encode to `16 + 16·n` bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf =
+            Vec::with_capacity(STREAM_ACK_HEADER_SIZE + self.ranges.len() * STREAM_ACK_RANGE_SIZE);
+        buf.put_u64_le(self.stream_id);
+        buf.put_u64_le(self.ack_seq);
+        for &(start, end) in &self.ranges {
+            buf.put_u64_le(start);
+            buf.put_u64_le(end);
         }
+        buf
+    }
+
+    /// Decode with strict validation. Rejects: truncated / non-`16·n`
+    /// bodies, zero or more than [`MAX_ACK_RANGES`] ranges, empty or
+    /// inverted ranges, ranges not strictly above `ack_seq`, and any
+    /// ordering that is not strictly-descending / merged (overlap or
+    /// adjacency means the producer failed to merge — treat as
+    /// malformed rather than guessing).
+    pub fn decode(data: &[u8]) -> Result<Self, StreamWindowCodecError> {
+        if data.len() < Self::MIN_SIZE {
+            return Err(StreamWindowCodecError::Truncated {
+                got: data.len(),
+                need: Self::MIN_SIZE,
+            });
+        }
+        let body = data.len() - STREAM_ACK_HEADER_SIZE;
+        if !body.is_multiple_of(STREAM_ACK_RANGE_SIZE) {
+            return Err(StreamWindowCodecError::InvalidRanges {
+                reason: "length is not header + 16*n",
+            });
+        }
+        let n = body / STREAM_ACK_RANGE_SIZE;
+        if n > MAX_ACK_RANGES {
+            return Err(StreamWindowCodecError::InvalidRanges {
+                reason: "range count exceeds MAX_ACK_RANGES",
+            });
+        }
+        let mut cur = std::io::Cursor::new(data);
+        let stream_id = cur.get_u64_le();
+        let ack_seq = cur.get_u64_le();
+        let mut ranges = Vec::with_capacity(n);
+        // Descending, merged: each range must end strictly below the
+        // previous (newer) range's start — `end == prev_start` would
+        // be adjacency the producer should have merged.
+        let mut prev_start: Option<u64> = None;
+        for _ in 0..n {
+            let start = cur.get_u64_le();
+            let end = cur.get_u64_le();
+            if start >= end {
+                return Err(StreamWindowCodecError::InvalidRanges {
+                    reason: "empty or inverted range",
+                });
+            }
+            if start <= ack_seq {
+                return Err(StreamWindowCodecError::InvalidRanges {
+                    reason: "range not strictly above ack_seq",
+                });
+            }
+            if let Some(ps) = prev_start {
+                if end >= ps {
+                    return Err(StreamWindowCodecError::InvalidRanges {
+                        reason: "ranges not descending/merged",
+                    });
+                }
+            }
+            prev_start = Some(start);
+            ranges.push((start, end));
+        }
+        Ok(Self {
+            stream_id,
+            ack_seq,
+            ranges,
+        })
     }
 }
 
@@ -192,16 +355,11 @@ impl StreamReset {
 
     /// Decode an 8-byte message. Errors on truncated / oversize input.
     pub fn decode(data: &[u8]) -> Result<Self, StreamWindowCodecError> {
-        match data.len() {
-            n if n < STREAM_RESET_SIZE => Err(StreamWindowCodecError::Truncated(n)),
-            n if n > STREAM_RESET_SIZE => Err(StreamWindowCodecError::Oversize(n)),
-            _ => {
-                let mut cur = std::io::Cursor::new(data);
-                Ok(Self {
-                    stream_id: cur.get_u64_le(),
-                })
-            }
-        }
+        require_exact_len(data, STREAM_RESET_SIZE)?;
+        let mut cur = std::io::Cursor::new(data);
+        Ok(Self {
+            stream_id: cur.get_u64_le(),
+        })
     }
 }
 
@@ -225,19 +383,38 @@ mod tests {
     #[test]
     fn test_decode_truncated_rejected() {
         let err = StreamWindow::decode(&[0u8; STREAM_WINDOW_SIZE - 1]).unwrap_err();
-        assert!(matches!(err, StreamWindowCodecError::Truncated(_)));
+        assert!(matches!(
+            err,
+            StreamWindowCodecError::Truncated {
+                need: STREAM_WINDOW_SIZE,
+                ..
+            }
+        ));
+        // The message must report the real expected size, not a
+        // stale hardcoded one (pre-fix it said "need 16" while the
+        // wire size had grown to 24 with `ack_seq`).
+        assert!(err.to_string().contains("need 24"), "got: {err}");
     }
 
     #[test]
     fn test_decode_oversize_rejected() {
         let err = StreamWindow::decode(&[0u8; STREAM_WINDOW_SIZE + 1]).unwrap_err();
-        assert!(matches!(err, StreamWindowCodecError::Oversize(_)));
+        assert!(matches!(
+            err,
+            StreamWindowCodecError::Oversize {
+                need: STREAM_WINDOW_SIZE,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn test_decode_empty_rejected() {
         let err = StreamWindow::decode(&[]).unwrap_err();
-        assert!(matches!(err, StreamWindowCodecError::Truncated(0)));
+        assert!(matches!(
+            err,
+            StreamWindowCodecError::Truncated { got: 0, .. }
+        ));
     }
 
     #[test]
@@ -273,5 +450,110 @@ mod tests {
             stream_id: 0x2000_0000_0000_0001,
         };
         assert_eq!(StreamReset::decode(&msg.encode()).unwrap(), msg);
+    }
+
+    // ── StreamAckRanges (R-1) ────────────────────────────────────
+
+    fn ack(ack_seq: u64, ranges: &[(u64, u64)]) -> StreamAckRanges {
+        StreamAckRanges {
+            stream_id: 0xF00D,
+            ack_seq,
+            ranges: ranges.to_vec(),
+        }
+    }
+
+    #[test]
+    fn ack_ranges_round_trip_single_and_max() {
+        // The plan's canonical example: <101 received, 101 missing,
+        // 102..=10000 received.
+        let one = ack(101, &[(102, 10_001)]);
+        assert_eq!(StreamAckRanges::decode(&one.encode()).unwrap(), one);
+
+        // MAX_ACK_RANGES descending disjoint ranges.
+        let ranges: Vec<(u64, u64)> = (0..MAX_ACK_RANGES as u64)
+            .map(|i| {
+                let hi = 10_000 - i * 100;
+                (hi - 10, hi)
+            })
+            .collect();
+        let full = ack(5, &ranges);
+        let bytes = full.encode();
+        assert_eq!(bytes.len(), StreamAckRanges::MAX_SIZE);
+        assert_eq!(StreamAckRanges::decode(&bytes).unwrap(), full);
+    }
+
+    #[test]
+    fn ack_ranges_rejects_rangeless_and_truncated() {
+        // Header only (rangeless) is below MIN_SIZE.
+        let err = StreamAckRanges::decode(&[0u8; STREAM_ACK_HEADER_SIZE]).unwrap_err();
+        assert!(matches!(err, StreamWindowCodecError::Truncated { .. }));
+        let err = StreamAckRanges::decode(&[]).unwrap_err();
+        assert!(matches!(err, StreamWindowCodecError::Truncated { .. }));
+    }
+
+    #[test]
+    fn ack_ranges_rejects_non_multiple_length() {
+        let bytes = ack(1, &[(2, 3)]).encode();
+        let mut long = bytes.clone();
+        long.push(0);
+        assert!(matches!(
+            StreamAckRanges::decode(&long).unwrap_err(),
+            StreamWindowCodecError::InvalidRanges { .. }
+        ));
+    }
+
+    #[test]
+    fn ack_ranges_rejects_too_many_ranges() {
+        let ranges: Vec<(u64, u64)> = (0..(MAX_ACK_RANGES as u64 + 1))
+            .map(|i| {
+                let hi = 100_000 - i * 10;
+                (hi - 2, hi)
+            })
+            .collect();
+        let bytes = ack(1, &ranges).encode();
+        assert!(matches!(
+            StreamAckRanges::decode(&bytes).unwrap_err(),
+            StreamWindowCodecError::InvalidRanges {
+                reason: "range count exceeds MAX_ACK_RANGES"
+            }
+        ));
+    }
+
+    #[test]
+    fn ack_ranges_rejects_bad_range_shapes() {
+        // Empty range.
+        assert!(matches!(
+            StreamAckRanges::decode(&ack(1, &[(5, 5)]).encode()).unwrap_err(),
+            StreamWindowCodecError::InvalidRanges {
+                reason: "empty or inverted range"
+            }
+        ));
+        // Inverted range.
+        assert!(StreamAckRanges::decode(&ack(1, &[(9, 5)]).encode()).is_err());
+        // Range at ack_seq (must be strictly above — ack_seq is the
+        // missing head by definition).
+        assert!(matches!(
+            StreamAckRanges::decode(&ack(10, &[(10, 12)]).encode()).unwrap_err(),
+            StreamWindowCodecError::InvalidRanges {
+                reason: "range not strictly above ack_seq"
+            }
+        ));
+        // Range below ack_seq (would duplicate the cumulative run).
+        assert!(StreamAckRanges::decode(&ack(10, &[(3, 6)]).encode()).is_err());
+    }
+
+    #[test]
+    fn ack_ranges_rejects_unmerged_or_ascending_order() {
+        // Ascending (oldest first) — wire order must be newest first.
+        assert!(matches!(
+            StreamAckRanges::decode(&ack(1, &[(2, 4), (6, 8)]).encode()).unwrap_err(),
+            StreamWindowCodecError::InvalidRanges {
+                reason: "ranges not descending/merged"
+            }
+        ));
+        // Adjacent (end == next start) — producer failed to merge.
+        assert!(StreamAckRanges::decode(&ack(1, &[(6, 8), (4, 6)]).encode()).is_err());
+        // Overlapping.
+        assert!(StreamAckRanges::decode(&ack(1, &[(5, 9), (3, 7)]).encode()).is_err());
     }
 }
