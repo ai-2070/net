@@ -656,8 +656,7 @@ impl ReliableStream {
                 // Extends the left range by one; may bridge to the
                 // right neighbor.
                 self.received_ranges[idx - 1].1 = left_end + 1;
-                if idx < self.received_ranges.len() && self.received_ranges[idx].0 == left_end + 1
-                {
+                if idx < self.received_ranges.len() && self.received_ranges[idx].0 == left_end + 1 {
                     let (_, right_end) = self.received_ranges[idx];
                     self.received_ranges[idx - 1].1 = right_end;
                     self.received_ranges.remove(idx);
