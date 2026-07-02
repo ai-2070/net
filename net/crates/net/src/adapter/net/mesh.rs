@@ -132,6 +132,15 @@ pub const ACK_RANGES_CAPABILITY_TAG: &str = "net.reliable.stream_ack_ranges@1";
 /// through this cache instead of taking the fold lock every cycle.
 const ACK_RANGES_CAP_CACHE_TTL: Duration = Duration::from_secs(5);
 
+/// Age bound for `ack_ranges_peer_cache` entries, enforced by the
+/// heartbeat loop's sweep (review P2: the cache is insert-on-lookup,
+/// so without a sweep, peer churn grows it without bound). Entries
+/// belonging to peers with active gapped streams are refreshed every
+/// [`ACK_RANGES_CAP_CACHE_TTL`]; anything older than this belongs to
+/// a departed or long-idle peer, and evicting it costs that peer at
+/// most one extra fold lookup on its next gate check.
+const ACK_RANGES_CAP_CACHE_MAX_AGE: Duration = Duration::from_secs(40);
+
 /// Control-plane emission counters (STREAM_ACK_BATCHING B-4).
 ///
 /// The packets/events split makes the batching ratio observable:
@@ -269,12 +278,22 @@ fn peer_supports_ack_ranges(
             return hit.value().0;
         }
     }
-    let supports =
-        super::behavior::fold::capability::capability_tags_for(capability_fold, node_id)
-            .iter()
-            .any(|t| t == ACK_RANGES_CAPABILITY_TAG);
+    let supports = super::behavior::fold::capability::capability_tags_for(capability_fold, node_id)
+        .iter()
+        .any(|t| t == ACK_RANGES_CAPABILITY_TAG);
     cache.insert(node_id, (supports, Instant::now()));
     supports
+}
+
+/// Drop `ack_ranges_peer_cache` entries not refreshed within
+/// `max_age` — the heartbeat-tick backstop that keeps the
+/// insert-on-lookup cache bounded under peer churn (targeted removal
+/// at dead-peer eviction handles the common case; this catches peers
+/// that never reach eviction, e.g. a session that was replaced by a
+/// re-handshake). O(cache) per tick; cache size ≤ peers seen within
+/// the age window.
+fn sweep_ack_ranges_cache(cache: &DashMap<u64, (bool, Instant)>, max_age: Duration) {
+    cache.retain(|_, (_, cached_at)| cached_at.elapsed() < max_age);
 }
 
 /// Build the control events for one drained session batch
@@ -5988,8 +6007,7 @@ impl MeshNode {
                 // B-1: group by session — the session owns the AEAD
                 // cipher, packet pool, and control-seq counter, so it
                 // is the unit a batched packet can be built against.
-                for (session_id, (session, peer_addr, grants)) in group_grants_by_session(drained)
-                {
+                for (session_id, (session, peer_addr, grants)) in group_grants_by_session(drained) {
                     if partition_filter.contains(&peer_addr) {
                         continue;
                     }
@@ -6328,6 +6346,7 @@ impl MeshNode {
         let addr_to_node = self.addr_to_node.clone();
         let peer_addrs = self.peer_addrs.clone();
         let session_id_to_node = self.session_id_to_node.clone();
+        let ack_ranges_peer_cache = self.ack_ranges_peer_cache.clone();
         let failure_detector = self.failure_detector.clone();
         let interval = self.config.heartbeat_interval;
         let shutdown = self.shutdown.clone();
@@ -6418,6 +6437,18 @@ impl MeshNode {
                         // disappear on the same tick.
                         proximity_graph.sweep_stale_edges(max_route_age);
 
+                        // Bound the ack-ranges capability-gate cache
+                        // (review P2: insert-on-lookup, so peer churn
+                        // would otherwise grow it without bound).
+                        // Entries for peers with active gapped streams
+                        // refresh every ACK_RANGES_CAP_CACHE_TTL; a
+                        // swept-but-live peer merely pays one fold
+                        // lookup on its next gate check.
+                        sweep_ack_ranges_cache(
+                            &ack_ranges_peer_cache,
+                            ACK_RANGES_CAP_CACHE_MAX_AGE,
+                        );
+
                         // Sweep idle streams per-session and enforce the
                         // per-session `max_streams` cap. Each session is
                         // independent; large deployments with many peers
@@ -6474,6 +6505,12 @@ impl MeshNode {
                                 // session_id; we must not erase that.
                                 session_id_to_node
                                     .remove_if(&old_session_id, |_, n| *n == node_id);
+                                // Targeted ack-ranges gate-cache drop,
+                                // in lockstep with the other per-peer
+                                // maps. A reconnect under the same
+                                // node_id re-resolves through the fold
+                                // on its first gate check.
+                                ack_ranges_peer_cache.remove(&node_id);
                                 tracing::info!(
                                     node_id = format!("{:#x}", node_id),
                                     "evicted permanently-dead peer from peer map",
@@ -16453,7 +16490,10 @@ mod stream_ack_batching_tests {
         let s = session_at(addr);
         let mut drained = HashMap::new();
         for stream_id in 0..100u64 {
-            drained.insert((s.session_id(), stream_id), pending(&s, addr, stream_id * 10));
+            drained.insert(
+                (s.session_id(), stream_id),
+                pending(&s, addr, stream_id * 10),
+            );
         }
         let grouped = group_grants_by_session(drained);
         assert_eq!(grouped.len(), 1, "one session ⇒ one batch");
@@ -16543,6 +16583,27 @@ mod stream_ack_batching_tests {
         assert!(acks_off.is_empty(), "no ranges to a non-advertising peer");
     }
 
+    /// The capability-gate cache sweep drops entries past the age
+    /// bound and keeps fresh ones — the backstop that keeps the
+    /// insert-on-lookup cache bounded under peer churn (review P2).
+    #[test]
+    fn ack_ranges_cache_sweep_drops_only_stale_entries() {
+        let cache: DashMap<u64, (bool, Instant)> = DashMap::new();
+        let stale_at = Instant::now() - ACK_RANGES_CAP_CACHE_MAX_AGE - Duration::from_secs(1);
+        cache.insert(1, (true, stale_at));
+        cache.insert(2, (false, stale_at));
+        cache.insert(3, (true, Instant::now()));
+
+        sweep_ack_ranges_cache(&cache, ACK_RANGES_CAP_CACHE_MAX_AGE);
+
+        assert!(!cache.contains_key(&1), "stale positive entry swept");
+        assert!(!cache.contains_key(&2), "stale negative entry swept");
+        assert!(
+            cache.contains_key(&3),
+            "fresh entry survives — active peers keep their cached verdict"
+        );
+    }
+
     /// Grants for different peers (different sessions) route to their
     /// own batches with their own addresses.
     #[test]
@@ -16566,17 +16627,11 @@ mod stream_ack_batching_tests {
     /// iterated the full event vector (`mesh.rs` StreamWindow /
     /// StreamNack / StreamReset arms), so this is the whole wire-
     /// compatibility story for B-2/B-3.
-    fn roundtrip_full_chunk(
-        payloads: Vec<Vec<u8>>,
-        subprotocol_id: u16,
-    ) -> Vec<Bytes> {
+    fn roundtrip_full_chunk(payloads: Vec<Vec<u8>>, subprotocol_id: u16) -> Vec<Bytes> {
         let key = [0x5Au8; 32];
         let session_id = 0xACE0_FACEu64;
         let mut builder = PacketBuilder::new(&key, session_id);
-        let events: Vec<Bytes> = payloads
-            .iter()
-            .map(|p| Bytes::copy_from_slice(p))
-            .collect();
+        let events: Vec<Bytes> = payloads.iter().map(|p| Bytes::copy_from_slice(p)).collect();
         let pkt = builder.build_subprotocol(
             CONTROL_STREAM_ID,
             1,
@@ -16616,7 +16671,11 @@ mod stream_ack_batching_tests {
             grants.iter().map(|g| g.encode().to_vec()).collect(),
             SUBPROTOCOL_STREAM_WINDOW,
         );
-        assert_eq!(recovered.len(), grants.len(), "every grant survives framing");
+        assert_eq!(
+            recovered.len(),
+            grants.len(),
+            "every grant survives framing"
+        );
         for (event, g) in recovered.iter().zip(&grants) {
             assert_eq!(StreamWindow::decode(event).unwrap(), *g);
         }

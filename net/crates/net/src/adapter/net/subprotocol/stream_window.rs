@@ -266,8 +266,7 @@ impl StreamAckRanges {
     pub const MIN_SIZE: usize = STREAM_ACK_HEADER_SIZE + STREAM_ACK_RANGE_SIZE;
 
     /// Maximum wire size (header + [`MAX_ACK_RANGES`] ranges).
-    pub const MAX_SIZE: usize =
-        STREAM_ACK_HEADER_SIZE + MAX_ACK_RANGES * STREAM_ACK_RANGE_SIZE;
+    pub const MAX_SIZE: usize = STREAM_ACK_HEADER_SIZE + MAX_ACK_RANGES * STREAM_ACK_RANGE_SIZE;
 
     /// Encode to `16 + 16·n` bytes.
     pub fn encode(&self) -> Vec<u8> {
