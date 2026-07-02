@@ -96,6 +96,58 @@ const STREAM_GRANT_DRAIN_INTERVAL: Duration = Duration::from_millis(1);
 /// receiver NACK.
 const RETRANSMIT_TICK: Duration = Duration::from_millis(25);
 
+/// Max fixed-size control events packed into one batched control
+/// packet, per message type (STREAM_ACK_BATCHING B-2/B-3):
+/// `floor(MAX_PAYLOAD_SIZE / (event-frame length prefix + payload))`.
+/// At 24 B payloads this is ~289 grant/NACK events per packet — far
+/// below `NetHeader::MAX_EVENTS_PER_PACKET` (2027), so the payload
+/// budget is the binding constraint, never the event-count cap.
+const GRANT_EVENTS_PER_PACKET: usize =
+    protocol::MAX_PAYLOAD_SIZE / (EventFrame::LEN_SIZE + STREAM_WINDOW_SIZE);
+/// See [`GRANT_EVENTS_PER_PACKET`]; `StreamNack` is also 24 B.
+const NACK_EVENTS_PER_PACKET: usize =
+    protocol::MAX_PAYLOAD_SIZE / (EventFrame::LEN_SIZE + STREAM_NACK_SIZE);
+/// See [`GRANT_EVENTS_PER_PACKET`]; `StreamReset` is 8 B.
+const RESET_EVENTS_PER_PACKET: usize =
+    protocol::MAX_PAYLOAD_SIZE / (EventFrame::LEN_SIZE + STREAM_RESET_SIZE);
+
+/// Control-plane emission counters (STREAM_ACK_BATCHING B-4).
+///
+/// The packets/events split makes the batching ratio observable:
+/// `*_events_sent / *_packets_sent` is the achieved coalescing
+/// factor (1.0 = no coalescing, pre-batching behavior). Relaxed
+/// ordering everywhere — these are monotonic telemetry counters
+/// with no cross-thread ordering contract.
+#[derive(Debug, Default)]
+pub struct ControlPlaneStats {
+    /// `StreamWindow` control packets emitted (one per session per
+    /// drain cycle post-batching, plus payload-budget spill).
+    pub grant_packets_sent: AtomicU64,
+    /// Individual `StreamWindow` grant events emitted.
+    pub grant_events_sent: AtomicU64,
+    /// `StreamNack` control packets emitted (drainer piggyback +
+    /// the 25 ms proactive gap tick).
+    pub nack_packets_sent: AtomicU64,
+    /// Individual `StreamNack` events emitted.
+    pub nack_events_sent: AtomicU64,
+    /// `StreamReset` control packets emitted (H-3 give-up signal).
+    pub reset_packets_sent: AtomicU64,
+    /// Individual `StreamReset` events emitted.
+    pub reset_events_sent: AtomicU64,
+    /// Data packets re-sent by the reliability layer: NACK-driven
+    /// fast retransmits + RTO-driven timeout retransmits.
+    pub retransmit_packets_sent: AtomicU64,
+}
+
+impl ControlPlaneStats {
+    /// Count one emitted control packet carrying `events` events.
+    #[inline]
+    fn record_packet(packets: &AtomicU64, events_ctr: &AtomicU64, events: usize) {
+        packets.fetch_add(1, Ordering::Relaxed);
+        events_ctr.fetch_add(events as u64, Ordering::Relaxed);
+    }
+}
+
 /// Upper bound on how long [`MeshNode::flush_stream_batch`] retries a
 /// committed-prefix flush against a receiver that grants no credit.
 /// After ANY packet of a multi-batch send is committed we can't surface
@@ -140,6 +192,35 @@ struct PendingStreamGrant {
     total_consumed: u64,
 }
 
+/// Group drained pending grants by session (STREAM_ACK_BATCHING B-1).
+///
+/// The session — not the peer address — owns the outbound AEAD
+/// cipher, packet pool, and control-seq counter, so it is the unit a
+/// batched control packet can be built against. Two sessions behind
+/// one address (e.g. a rotation mid-drain) must NOT share a packet;
+/// keying on the map key's `session_id` guarantees that. Pure so the
+/// grouping-key contract is unit-testable.
+#[allow(clippy::type_complexity)]
+fn group_grants_by_session(
+    drained: HashMap<(u64, u64), PendingStreamGrant>,
+) -> HashMap<u64, (Arc<NetSession>, SocketAddr, Vec<(u64, u64)>)> {
+    let mut by_session: HashMap<u64, (Arc<NetSession>, SocketAddr, Vec<(u64, u64)>)> =
+        HashMap::new();
+    for ((session_id, stream_id), grant) in drained {
+        let PendingStreamGrant {
+            session,
+            peer_addr,
+            total_consumed,
+        } = grant;
+        by_session
+            .entry(session_id)
+            .or_insert_with(|| (session.clone(), peer_addr, Vec::new()))
+            .2
+            .push((stream_id, total_consumed));
+    }
+    by_session
+}
+
 /// Total wire bytes for a single Net packet carrying `payload_bytes`
 /// of AEAD-encrypted content. Saturating at `u32::MAX` so a
 /// pathological `payload_bytes` can't silently wrap the credit math.
@@ -156,7 +237,8 @@ use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subnet::{DropReason, SubnetGateway, SubnetId, SubnetPolicy};
 use super::subprotocol::stream_window::{
-    StreamNack, StreamReset, StreamWindow, SUBPROTOCOL_STREAM_NACK, SUBPROTOCOL_STREAM_RESET,
+    StreamNack, StreamReset, StreamWindow, STREAM_NACK_SIZE, STREAM_RESET_SIZE,
+    STREAM_WINDOW_SIZE, SUBPROTOCOL_STREAM_NACK, SUBPROTOCOL_STREAM_RESET,
     SUBPROTOCOL_STREAM_WINDOW,
 };
 use super::subprotocol::MigrationSubprotocolHandler;
@@ -556,6 +638,10 @@ struct DispatchCtx {
     pending_stream_grants: Arc<parking_lot::Mutex<HashMap<(u64, u64), PendingStreamGrant>>>,
     /// Wakes the grant drainer on enqueue.
     pending_stream_grants_notify: Arc<Notify>,
+    /// Control-plane emission counters, shared with the mesh's
+    /// drainer/retransmit loops. Dispatch counts NACK-driven
+    /// retransmit sends here (STREAM_ACK_BATCHING B-4).
+    control_stats: Arc<ControlPlaneStats>,
     /// Settings for sessions we create during inbound dispatch (relayed
     /// handshake responder completes here).
     packet_pool_size: usize,
@@ -2188,17 +2274,25 @@ pub struct MeshNode {
     /// `(session_id, stream_id)`. The receive path inserts the
     /// latest `total_consumed` here per accepted packet; the
     /// per-mesh drainer task ([`Self::spawn_stream_grant_drainer_loop`])
-    /// pops the map and emits one wire grant per unique key. Latest-
-    /// wins overwrite semantics make this safe — grants are
-    /// authoritative (each carries the full `total_consumed`) so
-    /// a later push subsumes any pending earlier one for the same
-    /// stream. T1.1 from `PERF_AUDIT_2026_05_19_NRPC.md`.
+    /// pops the map and emits the grants batched per session —
+    /// multi-event control frames, one packet per
+    /// [`GRANT_EVENTS_PER_PACKET`] chunk (STREAM_ACK_BATCHING B-1/
+    /// B-2). Latest-wins overwrite semantics make this safe —
+    /// grants are authoritative (each carries the full
+    /// `total_consumed`) so a later push subsumes any pending
+    /// earlier one for the same stream. T1.1 from
+    /// `PERF_AUDIT_2026_05_19_NRPC.md`.
     pending_stream_grants: Arc<parking_lot::Mutex<HashMap<(u64, u64), PendingStreamGrant>>>,
     /// Wakes the drainer task whenever a new pending grant lands.
     /// The drainer also self-wakes on a short interval timer so a
     /// missed notify (e.g. the drainer was already iterating when
     /// the notify fired) still flushes within bounded time.
     pending_stream_grants_notify: Arc<Notify>,
+    /// Control-plane emission counters (STREAM_ACK_BATCHING B-4):
+    /// batched grant/NACK/reset packet+event counts + reliability
+    /// retransmit sends. Shared with the drainer, the retransmit
+    /// loop, and the dispatch context.
+    control_stats: Arc<ControlPlaneStats>,
     /// Whether the node has been started
     started: AtomicBool,
     /// Weak self-reference, set by [`Self::start_arc`] when the node is
@@ -2607,6 +2701,7 @@ impl MeshNode {
             shutdown_notify: Arc::new(Notify::new()),
             pending_stream_grants: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             pending_stream_grants_notify: Arc::new(Notify::new()),
+            control_stats: Arc::new(ControlPlaneStats::default()),
             started: AtomicBool::new(false),
             self_weak: std::sync::OnceLock::new(),
             accept_in_flight: std::sync::atomic::AtomicUsize::new(0),
@@ -3638,6 +3733,7 @@ impl MeshNode {
             partition_filter: self.partition_filter.clone(),
             pending_stream_grants: self.pending_stream_grants.clone(),
             pending_stream_grants_notify: self.pending_stream_grants_notify.clone(),
+            control_stats: self.control_stats.clone(),
             packet_pool_size: self.config.packet_pool_size,
             default_reliable: self.config.default_reliable,
             session_timeout: self.config.session_timeout,
@@ -4863,9 +4959,14 @@ impl MeshNode {
             if !packets.is_empty() {
                 let socket = ctx.socket.clone();
                 let dest = parsed.source;
+                let control_stats = ctx.control_stats.clone();
                 tokio::spawn(async move {
                     for p in packets {
-                        let _ = socket.send_to(&p, dest).await;
+                        if socket.send_to(&p, dest).await.is_ok() {
+                            control_stats
+                                .retransmit_packets_sent
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 });
             }
@@ -5629,19 +5730,32 @@ impl MeshNode {
         }
     }
 
-    /// Drain the per-mesh pending-grant queue and emit one wire
-    /// `StreamWindow` packet per unique `(session_id, stream_id)`
-    /// entry. Replaces the pre-T1.1-v2 per-packet
-    /// `tokio::spawn(spawn_stream_window_grant(...))` — under load
-    /// that burned one spawn + AEAD encrypt + `sendto` per accepted
-    /// inbound packet (`PERF_AUDIT_2026_05_19_NRPC.md` T1.1). The
-    /// drainer wakes on either `pending_stream_grants_notify` or
-    /// the `STREAM_GRANT_DRAIN_INTERVAL` self-wake timer, swaps the
-    /// queue, and emits grants serially. Authoritative-grant
-    /// semantics mean a single emission per stream subsumes any
-    /// pending earlier values for that stream; the receive path's
-    /// latest-wins overwrite delivers the freshest `total_consumed`
-    /// the drainer needs.
+    /// Control-plane emission counters (STREAM_ACK_BATCHING B-4):
+    /// batched grant/NACK/reset packet+event counts and reliability
+    /// retransmit sends. Cheap Arc clone; counters use Relaxed
+    /// ordering (monotonic telemetry, no cross-thread contract).
+    pub fn control_plane_stats(&self) -> Arc<ControlPlaneStats> {
+        self.control_stats.clone()
+    }
+
+    /// Drain the per-mesh pending-grant queue and emit the drained
+    /// grants **batched per session** (STREAM_ACK_BATCHING B-1/B-2):
+    /// one `StreamWindow` packet per session per drain cycle carrying
+    /// up to [`GRANT_EVENTS_PER_PACKET`] grant events (plus payload-
+    /// budget spill), and one `StreamNack` packet per session for any
+    /// piggybacked NACKs. Replaces the post-T1.1 one-packet-per-
+    /// stream shape — with S busy streams to a peer that was up to
+    /// 2·S AEAD encrypts + `sendto`s per millisecond; now it is
+    /// O(sessions). The pre-T1.1-v2 shape was worse still: one
+    /// spawn/encrypt/send per accepted inbound packet
+    /// (`PERF_AUDIT_2026_05_19_NRPC.md` T1.1). The drainer wakes on
+    /// either `pending_stream_grants_notify` or the
+    /// `STREAM_GRANT_DRAIN_INTERVAL` self-wake timer, swaps the
+    /// queue, and emits serially. Authoritative-grant semantics mean
+    /// a single emission per stream subsumes any pending earlier
+    /// values for that stream; the receive path's latest-wins
+    /// overwrite delivers the freshest `total_consumed` the drainer
+    /// needs.
     fn spawn_stream_grant_drainer_loop(&self) -> JoinHandle<()> {
         let socket = self.socket.clone();
         let partition_filter = self.partition_filter.clone();
@@ -5649,6 +5763,7 @@ impl MeshNode {
         let notify = self.pending_stream_grants_notify.clone();
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
+        let control_stats = self.control_stats.clone();
 
         tokio::spawn(async move {
             while !shutdown.load(Ordering::Acquire) {
@@ -5679,71 +5794,99 @@ impl MeshNode {
                     continue;
                 }
 
-                for ((_, stream_id), grant) in drained {
-                    if partition_filter.contains(&grant.peer_addr) {
+                // B-1: group by session — the session owns the AEAD
+                // cipher, packet pool, and control-seq counter, so it
+                // is the unit a batched packet can be built against.
+                for (_, (session, peer_addr, grants)) in group_grants_by_session(drained) {
+                    if partition_filter.contains(&peer_addr) {
                         continue;
                     }
-                    // Piggyback the receiver's cumulative reliable ack
-                    // (next_expected) so the sender prunes its retransmit
-                    // window of everything below it (H-9). 0 for
-                    // non-reliable receive streams.
-                    let ack_seq = grant
-                        .session
-                        .try_stream(stream_id)
-                        .map(|s| s.with_reliability(|r| r.rx_ack_seq()))
-                        .unwrap_or(0);
-                    let payload = StreamWindow {
-                        stream_id,
-                        total_consumed: grant.total_consumed,
-                        ack_seq,
-                    }
-                    .encode();
-                    let pool = grant.session.thread_local_pool();
-                    let mut builder = pool.get();
-                    let seq = grant.session.next_control_tx_seq();
-                    let events = vec![Bytes::copy_from_slice(&payload)];
-                    let packet = builder.build_subprotocol(
-                        CONTROL_STREAM_ID,
-                        seq,
-                        &events,
-                        PacketFlags::NONE,
-                        SUBPROTOCOL_STREAM_WINDOW,
-                    );
-                    if let Err(e) = socket.send_to(&packet, grant.peer_addr).await {
-                        tracing::debug!(error = %e, "StreamWindow grant send failed");
-                        continue;
-                    }
-                    // Piggyback a retransmit NACK (STREAM_RETRANSMIT D-2):
-                    // if this stream has gaps, ask the sender to resend the
-                    // missing sequences. Reuses the grant drainer's per-
-                    // stream-per-cycle throttling and peer resolution. A
-                    // grant is enqueued on every accepted packet, so an
-                    // out-of-order arrival (which creates the gap) reliably
-                    // triggers a NACK here; tail loss (no later arrival) is
-                    // covered by the timeout retransmit loop.
-                    let nack = grant.session.try_stream(stream_id).and_then(|state| {
-                        state.note_grant_sent();
-                        state.with_reliability(|r| r.build_nack())
-                    });
-                    if let Some(nack) = nack {
-                        let payload = StreamNack {
+                    // Build every grant event — plus the piggybacked
+                    // NACK events (STREAM_RETRANSMIT D-2) for streams
+                    // with gaps — up front, then emit multi-event
+                    // frames: one packet per chunk instead of one (or
+                    // two) per stream (B-2/B-3). The decode side has
+                    // always iterated the full event vector, so old
+                    // peers apply every batched grant/NACK.
+                    let mut grant_events: Vec<Bytes> = Vec::with_capacity(grants.len());
+                    let mut nack_events: Vec<Bytes> = Vec::new();
+                    for (stream_id, total_consumed) in grants {
+                        // Piggyback the receiver's cumulative reliable
+                        // ack (next_expected) so the sender prunes its
+                        // retransmit window of everything below it
+                        // (H-9). 0 for non-reliable receive streams.
+                        let ack_seq = session
+                            .try_stream(stream_id)
+                            .map(|s| s.with_reliability(|r| r.rx_ack_seq()))
+                            .unwrap_or(0);
+                        let payload = StreamWindow {
                             stream_id,
-                            next_expected: nack.next_expected,
-                            missing_bitmap: nack.missing_bitmap,
+                            total_consumed,
+                            ack_seq,
                         }
                         .encode();
-                        let nseq = grant.session.next_control_tx_seq();
-                        let nevents = vec![Bytes::copy_from_slice(&payload)];
-                        let npacket = builder.build_subprotocol(
+                        grant_events.push(Bytes::copy_from_slice(&payload));
+                        // A grant is enqueued on every accepted packet,
+                        // so an out-of-order arrival (which creates the
+                        // gap) reliably triggers a NACK here; tail loss
+                        // (no later arrival) is covered by the timeout
+                        // retransmit loop. `note_grant_sent` fires at
+                        // build time — the counter means "grant emitted
+                        // toward the wire" (post-`sendto` datagram loss
+                        // was never distinguishable anyway).
+                        let nack = session.try_stream(stream_id).and_then(|state| {
+                            state.note_grant_sent();
+                            state.with_reliability(|r| r.build_nack())
+                        });
+                        if let Some(nack) = nack {
+                            let payload = StreamNack {
+                                stream_id,
+                                next_expected: nack.next_expected,
+                                missing_bitmap: nack.missing_bitmap,
+                            }
+                            .encode();
+                            nack_events.push(Bytes::copy_from_slice(&payload));
+                        }
+                    }
+                    let pool = session.thread_local_pool();
+                    let mut builder = pool.get();
+                    for chunk in grant_events.chunks(GRANT_EVENTS_PER_PACKET) {
+                        let seq = session.next_control_tx_seq();
+                        let packet = builder.build_subprotocol(
                             CONTROL_STREAM_ID,
-                            nseq,
-                            &nevents,
+                            seq,
+                            chunk,
+                            PacketFlags::NONE,
+                            SUBPROTOCOL_STREAM_WINDOW,
+                        );
+                        if let Err(e) = socket.send_to(&packet, peer_addr).await {
+                            tracing::debug!(error = %e, "StreamWindow grant send failed");
+                            continue;
+                        }
+                        ControlPlaneStats::record_packet(
+                            &control_stats.grant_packets_sent,
+                            &control_stats.grant_events_sent,
+                            chunk.len(),
+                        );
+                    }
+                    for chunk in nack_events.chunks(NACK_EVENTS_PER_PACKET) {
+                        let seq = session.next_control_tx_seq();
+                        let packet = builder.build_subprotocol(
+                            CONTROL_STREAM_ID,
+                            seq,
+                            chunk,
                             PacketFlags::NONE,
                             SUBPROTOCOL_STREAM_NACK,
                         );
-                        if let Err(e) = socket.send_to(&npacket, grant.peer_addr).await {
+                        if let Err(e) = socket.send_to(&packet, peer_addr).await {
                             tracing::debug!(error = %e, "StreamNack send failed");
+                            continue;
                         }
+                        ControlPlaneStats::record_packet(
+                            &control_stats.nack_packets_sent,
+                            &control_stats.nack_events_sent,
+                            chunk.len(),
+                        );
                     }
                 }
             }
@@ -5762,6 +5905,7 @@ impl MeshNode {
         let socket = self.socket.clone();
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
+        let control_stats = self.control_stats.clone();
 
         tokio::spawn(async move {
             while !shutdown.load(Ordering::Acquire) {
@@ -5794,7 +5938,11 @@ impl MeshNode {
                     let mut builder = pool.get();
                     for d in due {
                         let packet = builder.build(d.stream_id, d.seq, &d.events, d.flags);
-                        let _ = socket.send_to(&packet, addr).await;
+                        if socket.send_to(&packet, addr).await.is_ok() {
+                            control_stats
+                                .retransmit_packets_sent
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
 
@@ -5811,18 +5959,31 @@ impl MeshNode {
                 for (addr, session, failed) in resets {
                     let pool = session.thread_local_pool();
                     let mut builder = pool.get();
-                    for stream_id in failed {
-                        let payload = StreamReset { stream_id }.encode();
+                    // B-3: all failed streams of a session share one
+                    // reset packet (plus payload-budget spill); the
+                    // receive path iterates every event in the frame.
+                    let reset_events: Vec<Bytes> = failed
+                        .into_iter()
+                        .map(|stream_id| {
+                            Bytes::copy_from_slice(&StreamReset { stream_id }.encode())
+                        })
+                        .collect();
+                    for chunk in reset_events.chunks(RESET_EVENTS_PER_PACKET) {
                         let seq = session.next_control_tx_seq();
-                        let events = vec![Bytes::copy_from_slice(&payload)];
                         let packet = builder.build_subprotocol(
                             CONTROL_STREAM_ID,
                             seq,
-                            &events,
+                            chunk,
                             PacketFlags::NONE,
                             SUBPROTOCOL_STREAM_RESET,
                         );
-                        let _ = socket.send_to(&packet, addr).await;
+                        if socket.send_to(&packet, addr).await.is_ok() {
+                            ControlPlaneStats::record_packet(
+                                &control_stats.reset_packets_sent,
+                                &control_stats.reset_events_sent,
+                                chunk.len(),
+                            );
+                        }
                     }
                 }
 
@@ -5851,23 +6012,38 @@ impl MeshNode {
                 for (addr, session, g) in gaps {
                     let pool = session.thread_local_pool();
                     let mut builder = pool.get();
-                    for (stream_id, nack) in g {
-                        let payload = StreamNack {
-                            stream_id,
-                            next_expected: nack.next_expected,
-                            missing_bitmap: nack.missing_bitmap,
-                        }
-                        .encode();
+                    // B-3: one NACK packet per session per tick (plus
+                    // payload-budget spill) — same multi-event framing
+                    // as the drainer's piggybacked NACKs.
+                    let nack_events: Vec<Bytes> = g
+                        .into_iter()
+                        .map(|(stream_id, nack)| {
+                            Bytes::copy_from_slice(
+                                &StreamNack {
+                                    stream_id,
+                                    next_expected: nack.next_expected,
+                                    missing_bitmap: nack.missing_bitmap,
+                                }
+                                .encode(),
+                            )
+                        })
+                        .collect();
+                    for chunk in nack_events.chunks(NACK_EVENTS_PER_PACKET) {
                         let seq = session.next_control_tx_seq();
-                        let events = vec![Bytes::copy_from_slice(&payload)];
                         let packet = builder.build_subprotocol(
                             CONTROL_STREAM_ID,
                             seq,
-                            &events,
+                            chunk,
                             PacketFlags::NONE,
                             SUBPROTOCOL_STREAM_NACK,
                         );
-                        let _ = socket.send_to(&packet, addr).await;
+                        if socket.send_to(&packet, addr).await.is_ok() {
+                            ControlPlaneStats::record_packet(
+                                &control_stats.nack_packets_sent,
+                                &control_stats.nack_events_sent,
+                                chunk.len(),
+                            );
+                        }
                     }
                 }
             }
@@ -15898,5 +16074,258 @@ mod committed_flush_stall_tests {
             Err(e) => panic!("under deadline must continue (Ok), got {e}"),
         }
         assert_eq!(delay, Duration::from_millis(10), "backoff must double");
+    }
+}
+
+#[cfg(test)]
+mod stream_ack_batching_tests {
+    //! STREAM_ACK_BATCHING Phase 1 (B-1..B-5): grouping-key contract,
+    //! payload-budget chunk math, and multi-event control-frame
+    //! round-trips. The wire-cadence bound ("M streams to one session
+    //! ⇒ one grant packet per drain cycle, plus spill") follows from
+    //! `group_grants_by_session` + `chunks(GRANT_EVENTS_PER_PACKET)`,
+    //! both pinned here without spinning real sockets.
+    use super::*;
+    use crate::adapter::net::crypto::{NoiseHandshake, PacketCipher, StaticKeypair};
+    use crate::adapter::net::protocol::NetHeader;
+
+    fn make_session_keys() -> (
+        crate::adapter::net::crypto::SessionKeys,
+        crate::adapter::net::crypto::SessionKeys,
+    ) {
+        let psk = [0x42u8; 32];
+        let responder_kp = StaticKeypair::generate();
+        let mut initiator = NoiseHandshake::initiator(&psk, &responder_kp.public).unwrap();
+        let mut responder = NoiseHandshake::responder(&psk, &responder_kp).unwrap();
+        let msg1 = initiator.write_message(&[]).unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(&[]).unwrap();
+        initiator.read_message(&msg2).unwrap();
+        (
+            initiator.into_session_keys().unwrap(),
+            responder.into_session_keys().unwrap(),
+        )
+    }
+
+    fn session_at(addr: &str) -> Arc<NetSession> {
+        let (_init, resp) = make_session_keys();
+        Arc::new(NetSession::new(resp, addr.parse().unwrap(), 4, false))
+    }
+
+    fn pending(session: &Arc<NetSession>, addr: &str, consumed: u64) -> PendingStreamGrant {
+        PendingStreamGrant {
+            session: session.clone(),
+            peer_addr: addr.parse().unwrap(),
+            total_consumed: consumed,
+        }
+    }
+
+    /// The chunk constants must (a) actually batch, (b) fill a packet
+    /// without overflowing the payload budget, and (c) stay under the
+    /// header's event-count cap — the payload budget must be the
+    /// binding constraint.
+    #[test]
+    fn chunk_constants_fit_payload_and_event_caps() {
+        for (per_packet, event_size) in [
+            (GRANT_EVENTS_PER_PACKET, STREAM_WINDOW_SIZE),
+            (NACK_EVENTS_PER_PACKET, STREAM_NACK_SIZE),
+            (RESET_EVENTS_PER_PACKET, STREAM_RESET_SIZE),
+        ] {
+            assert!(per_packet > 1, "batching must batch");
+            let frame = EventFrame::LEN_SIZE + event_size;
+            assert!(
+                per_packet * frame <= protocol::MAX_PAYLOAD_SIZE,
+                "a full chunk must fit the payload budget"
+            );
+            assert!(
+                (per_packet + 1) * frame > protocol::MAX_PAYLOAD_SIZE,
+                "chunk must fill the packet (one more event would overflow)"
+            );
+            assert!(
+                per_packet <= NetHeader::MAX_EVENTS_PER_PACKET as usize,
+                "payload budget, not the event-count cap, must bind"
+            );
+        }
+    }
+
+    /// B-1 grouping-key contract: two DIFFERENT sessions behind the
+    /// SAME peer address (e.g. a rotation mid-drain) must not share a
+    /// batch — each owns its own AEAD cipher + control-seq counter.
+    #[test]
+    fn grouping_is_by_session_not_peer_addr() {
+        let addr = "127.0.0.1:7001";
+        let s1 = session_at(addr);
+        let s2 = session_at(addr);
+        let mut drained = HashMap::new();
+        drained.insert((s1.session_id(), 10u64), pending(&s1, addr, 100));
+        drained.insert((s2.session_id(), 10u64), pending(&s2, addr, 200));
+        let grouped = group_grants_by_session(drained);
+        assert_eq!(grouped.len(), 2, "distinct sessions must stay separate");
+    }
+
+    /// All streams of one session collapse into one batch, each
+    /// exactly once, with its own `total_consumed`.
+    #[test]
+    fn grouping_collects_all_streams_of_one_session() {
+        let addr = "127.0.0.1:7002";
+        let s = session_at(addr);
+        let mut drained = HashMap::new();
+        for stream_id in 0..100u64 {
+            drained.insert((s.session_id(), stream_id), pending(&s, addr, stream_id * 10));
+        }
+        let grouped = group_grants_by_session(drained);
+        assert_eq!(grouped.len(), 1, "one session ⇒ one batch");
+        let (_, peer_addr, grants) = &grouped[&s.session_id()];
+        assert_eq!(*peer_addr, addr.parse().unwrap());
+        let mut seen: Vec<(u64, u64)> = grants.clone();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..100u64).map(|i| (i, i * 10)).collect::<Vec<_>>(),
+            "every stream survives grouping exactly once with its value"
+        );
+    }
+
+    /// Grants for different peers (different sessions) route to their
+    /// own batches with their own addresses.
+    #[test]
+    fn grouping_keeps_peers_separate() {
+        let a1 = "127.0.0.1:7003";
+        let a2 = "127.0.0.1:7004";
+        let s1 = session_at(a1);
+        let s2 = session_at(a2);
+        let mut drained = HashMap::new();
+        drained.insert((s1.session_id(), 1u64), pending(&s1, a1, 11));
+        drained.insert((s2.session_id(), 1u64), pending(&s2, a2, 22));
+        let grouped = group_grants_by_session(drained);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[&s1.session_id()].1, a1.parse().unwrap());
+        assert_eq!(grouped[&s2.session_id()].1, a2.parse().unwrap());
+    }
+
+    /// Decrypt-side pin for `chunk` → `build_subprotocol` framing:
+    /// a maximal batched frame fits one wire packet and every event
+    /// decodes back to its message. The receive path has always
+    /// iterated the full event vector (`mesh.rs` StreamWindow /
+    /// StreamNack / StreamReset arms), so this is the whole wire-
+    /// compatibility story for B-2/B-3.
+    fn roundtrip_full_chunk(
+        payloads: Vec<Vec<u8>>,
+        subprotocol_id: u16,
+    ) -> Vec<Bytes> {
+        let key = [0x5Au8; 32];
+        let session_id = 0xACE0_FACEu64;
+        let mut builder = PacketBuilder::new(&key, session_id);
+        let events: Vec<Bytes> = payloads
+            .iter()
+            .map(|p| Bytes::copy_from_slice(p))
+            .collect();
+        let pkt = builder.build_subprotocol(
+            CONTROL_STREAM_ID,
+            1,
+            &events,
+            PacketFlags::NONE,
+            subprotocol_id,
+        );
+        assert!(
+            pkt.len() <= protocol::MAX_PACKET_SIZE,
+            "full chunk must fit one wire packet ({} > {})",
+            pkt.len(),
+            protocol::MAX_PACKET_SIZE
+        );
+        let header = NetHeader::from_bytes(&pkt[..HEADER_SIZE]).expect("header parses");
+        assert_eq!(header.event_count as usize, events.len());
+        assert_eq!(header.subprotocol_id, subprotocol_id);
+        let rx = PacketCipher::new(&key, session_id);
+        let nonce = u64::from_le_bytes(pkt[16..24].try_into().unwrap());
+        let aad = header.aad();
+        let mut buf = bytes::BytesMut::from(&pkt[HEADER_SIZE..]);
+        let n = rx
+            .decrypt_in_place(nonce, &aad, &mut buf[..])
+            .expect("decrypt succeeds");
+        EventFrame::read_events(buf.split_to(n).freeze(), header.event_count)
+    }
+
+    #[test]
+    fn full_grant_chunk_roundtrips_as_one_packet() {
+        let grants: Vec<StreamWindow> = (0..GRANT_EVENTS_PER_PACKET as u64)
+            .map(|i| StreamWindow {
+                stream_id: i,
+                total_consumed: i * 7,
+                ack_seq: i * 3,
+            })
+            .collect();
+        let recovered = roundtrip_full_chunk(
+            grants.iter().map(|g| g.encode().to_vec()).collect(),
+            SUBPROTOCOL_STREAM_WINDOW,
+        );
+        assert_eq!(recovered.len(), grants.len(), "every grant survives framing");
+        for (event, g) in recovered.iter().zip(&grants) {
+            assert_eq!(StreamWindow::decode(event).unwrap(), *g);
+        }
+    }
+
+    #[test]
+    fn full_nack_chunk_roundtrips_as_one_packet() {
+        let nacks: Vec<StreamNack> = (0..NACK_EVENTS_PER_PACKET as u64)
+            .map(|i| StreamNack {
+                stream_id: i,
+                next_expected: i + 1,
+                missing_bitmap: i | 1,
+            })
+            .collect();
+        let recovered = roundtrip_full_chunk(
+            nacks.iter().map(|n| n.encode().to_vec()).collect(),
+            SUBPROTOCOL_STREAM_NACK,
+        );
+        assert_eq!(recovered.len(), nacks.len());
+        for (event, n) in recovered.iter().zip(&nacks) {
+            assert_eq!(StreamNack::decode(event).unwrap(), *n);
+        }
+    }
+
+    #[test]
+    fn full_reset_chunk_roundtrips_as_one_packet() {
+        let resets: Vec<StreamReset> = (0..RESET_EVENTS_PER_PACKET as u64)
+            .map(|i| StreamReset { stream_id: i })
+            .collect();
+        let recovered = roundtrip_full_chunk(
+            resets.iter().map(|r| r.encode().to_vec()).collect(),
+            SUBPROTOCOL_STREAM_RESET,
+        );
+        assert_eq!(recovered.len(), resets.len());
+        for (event, r) in recovered.iter().zip(&resets) {
+            assert_eq!(StreamReset::decode(event).unwrap(), *r);
+        }
+    }
+
+    /// Overflow spill (B-5): a batch larger than one packet's budget
+    /// splits into ceil(N / per-packet) chunks, none over budget,
+    /// with no event dropped.
+    #[test]
+    fn oversized_grant_batch_spills_without_loss() {
+        let total = GRANT_EVENTS_PER_PACKET * 2 + 122;
+        let events: Vec<Bytes> = (0..total as u64)
+            .map(|i| {
+                Bytes::copy_from_slice(
+                    &StreamWindow {
+                        stream_id: i,
+                        total_consumed: i,
+                        ack_seq: 0,
+                    }
+                    .encode(),
+                )
+            })
+            .collect();
+        let chunks: Vec<&[Bytes]> = events.chunks(GRANT_EVENTS_PER_PACKET).collect();
+        assert_eq!(chunks.len(), 3, "ceil(2N+122 / N) = 3 packets");
+        assert_eq!(
+            chunks.iter().map(|c| c.len()).sum::<usize>(),
+            total,
+            "no grant dropped by the spill"
+        );
+        for c in &chunks {
+            assert!(EventFrame::calculate_size(c) <= protocol::MAX_PAYLOAD_SIZE);
+        }
     }
 }

@@ -225,7 +225,12 @@ New trait method `ReliabilityMode::on_ack_ranges(ack_seq: u64, ranges:
   packets can't trigger a burst; there is no pacer to absorb it.
 - **RTT (Karn):** sample only packets never retransmitted
   (`retries == 0`); use the newest newly-acknowledged such packet with a
-  known send timestamp. No invented ack-delay compensation.
+  known send timestamp. No invented ack-delay compensation. **Scope:**
+  this is the existing transport-local SRTT/RTO estimator
+  (`ReliableStream::update_rto`, RFC 6298) extended from cumulative ACKs
+  to range ACKs — nothing more. It drives retransmission/loss recovery
+  only and coexists with the proximity graph, which keeps owning
+  routing/path priors.
 - **Contradiction rule:** if a NACK claims a seq missing that a prior
   SACK range acknowledged, the positive ACK wins for that seq — the
   packet is gone from `pending`, so `on_nack` naturally finds nothing;
@@ -310,6 +315,11 @@ receive/parse side lands before any peer emits.
 - No `ack_delay` field / delayed-ACK tuning beyond the existing 1 ms
   drainer coalescing (revisit if RTT tuning demands it).
 - No pacer — the capped-growth rule in R-3 is the burst guard.
+- No new route/proximity RTT concept. ACK/SACK-derived RTT stays
+  transport-local (per-stream SRTT/RTO for loss recovery); the proximity
+  graph keeps owning routing/path priors. Feeding ACK-derived
+  observations back into graph metrics is a possible later enhancement,
+  explicitly out of scope here.
 - No change to delivery-order semantics (H-8: arrival-order push, `seq`
   tagged; consumers reassemble) — the range set is an index, not a
   payload reorder buffer.

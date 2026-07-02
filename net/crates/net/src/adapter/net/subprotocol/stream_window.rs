@@ -82,16 +82,28 @@ pub struct StreamWindow {
     pub ack_seq: u64,
 }
 
-/// Errors produced by the codec.
+/// Errors produced by the codec. Shared by all three fixed-size
+/// messages in this module, so the expected size is carried per
+/// error rather than hardcoded in the message.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamWindowCodecError {
     /// Buffer shorter than the fixed wire size.
-    #[error("truncated stream-window message: {0} bytes (need 16)")]
-    Truncated(usize),
+    #[error("truncated stream subprotocol message: {got} bytes (need {need})")]
+    Truncated {
+        /// Bytes received.
+        got: usize,
+        /// The message's fixed wire size.
+        need: usize,
+    },
     /// Buffer longer than the fixed wire size. Rejects garbage
     /// trailers rather than silently ignoring them.
-    #[error("oversize stream-window message: {0} bytes (need 16)")]
-    Oversize(usize),
+    #[error("oversize stream subprotocol message: {got} bytes (need {need})")]
+    Oversize {
+        /// Bytes received.
+        got: usize,
+        /// The message's fixed wire size.
+        need: usize,
+    },
 }
 
 impl StreamWindow {
@@ -109,8 +121,14 @@ impl StreamWindow {
     /// oversize input.
     pub fn decode(data: &[u8]) -> Result<Self, StreamWindowCodecError> {
         match data.len() {
-            n if n < STREAM_WINDOW_SIZE => Err(StreamWindowCodecError::Truncated(n)),
-            n if n > STREAM_WINDOW_SIZE => Err(StreamWindowCodecError::Oversize(n)),
+            n if n < STREAM_WINDOW_SIZE => Err(StreamWindowCodecError::Truncated {
+                got: n,
+                need: STREAM_WINDOW_SIZE,
+            }),
+            n if n > STREAM_WINDOW_SIZE => Err(StreamWindowCodecError::Oversize {
+                got: n,
+                need: STREAM_WINDOW_SIZE,
+            }),
             _ => {
                 let mut cur = std::io::Cursor::new(data);
                 let stream_id = cur.get_u64_le();
@@ -158,8 +176,14 @@ impl StreamNack {
     /// Decode a 24-byte message. Errors on truncated / oversize input.
     pub fn decode(data: &[u8]) -> Result<Self, StreamWindowCodecError> {
         match data.len() {
-            n if n < STREAM_NACK_SIZE => Err(StreamWindowCodecError::Truncated(n)),
-            n if n > STREAM_NACK_SIZE => Err(StreamWindowCodecError::Oversize(n)),
+            n if n < STREAM_NACK_SIZE => Err(StreamWindowCodecError::Truncated {
+                got: n,
+                need: STREAM_NACK_SIZE,
+            }),
+            n if n > STREAM_NACK_SIZE => Err(StreamWindowCodecError::Oversize {
+                got: n,
+                need: STREAM_NACK_SIZE,
+            }),
             _ => {
                 let mut cur = std::io::Cursor::new(data);
                 let stream_id = cur.get_u64_le();
@@ -193,8 +217,14 @@ impl StreamReset {
     /// Decode an 8-byte message. Errors on truncated / oversize input.
     pub fn decode(data: &[u8]) -> Result<Self, StreamWindowCodecError> {
         match data.len() {
-            n if n < STREAM_RESET_SIZE => Err(StreamWindowCodecError::Truncated(n)),
-            n if n > STREAM_RESET_SIZE => Err(StreamWindowCodecError::Oversize(n)),
+            n if n < STREAM_RESET_SIZE => Err(StreamWindowCodecError::Truncated {
+                got: n,
+                need: STREAM_RESET_SIZE,
+            }),
+            n if n > STREAM_RESET_SIZE => Err(StreamWindowCodecError::Oversize {
+                got: n,
+                need: STREAM_RESET_SIZE,
+            }),
             _ => {
                 let mut cur = std::io::Cursor::new(data);
                 Ok(Self {
@@ -225,19 +255,38 @@ mod tests {
     #[test]
     fn test_decode_truncated_rejected() {
         let err = StreamWindow::decode(&[0u8; STREAM_WINDOW_SIZE - 1]).unwrap_err();
-        assert!(matches!(err, StreamWindowCodecError::Truncated(_)));
+        assert!(matches!(
+            err,
+            StreamWindowCodecError::Truncated {
+                need: STREAM_WINDOW_SIZE,
+                ..
+            }
+        ));
+        // The message must report the real expected size, not a
+        // stale hardcoded one (pre-fix it said "need 16" while the
+        // wire size had grown to 24 with `ack_seq`).
+        assert!(err.to_string().contains("need 24"), "got: {err}");
     }
 
     #[test]
     fn test_decode_oversize_rejected() {
         let err = StreamWindow::decode(&[0u8; STREAM_WINDOW_SIZE + 1]).unwrap_err();
-        assert!(matches!(err, StreamWindowCodecError::Oversize(_)));
+        assert!(matches!(
+            err,
+            StreamWindowCodecError::Oversize {
+                need: STREAM_WINDOW_SIZE,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn test_decode_empty_rejected() {
         let err = StreamWindow::decode(&[]).unwrap_err();
-        assert!(matches!(err, StreamWindowCodecError::Truncated(0)));
+        assert!(matches!(
+            err,
+            StreamWindowCodecError::Truncated { got: 0, .. }
+        ));
     }
 
     #[test]
