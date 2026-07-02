@@ -118,16 +118,22 @@ which have the same one-packet-per-stream shape.
 
 **B-4 — Metrics.** Add counters now so the improvement (and Phase 2's)
 is provable, not vibes:
-- `stream_grant_packets_sent`, `stream_grant_events_sent`
-- `stream_nack_packets_sent`, `stream_nack_events_sent`
+- `grant_packets_sent`, `grant_events_sent`
+- `nack_packets_sent`, `nack_events_sent`
+- `reset_packets_sent`, `reset_events_sent`
 - `retransmit_packets_sent`
-- (Phase 2 adds: `stream_ack_range_packets_sent` / `_events_sent`,
-  `ack_ranges_per_packet`, `spurious_retransmit_suppressed_by_sack`,
-  `out_of_order_packets_accepted`, `out_of_order_packets_dropped_horizon`,
-  `reorder_range_count_max`)
+- (Phase 2 added `ack_range_packets_sent` / `ack_range_events_sent` on
+  `ControlPlaneStats`, plus per-stream `ReliableStream` accessors:
+  `out_of_order_accepted`, `out_of_order_dropped_horizon`,
+  `out_of_order_dropped_capacity`, `reorder_ranges`,
+  `protocol_anomalies`. The planned `ack_ranges_per_packet` is derivable
+  as events/packets; `spurious_retransmit_suppressed_by_sack` landed as
+  a pinned regression test rather than a counter.)
 
-Drive-by (same files, zero risk): `StreamWindowCodecError` messages still
-say "need 16"; the sizes have been 24 since `ack_seq` was added.
+Drive-by (landed with the Phase 1 commit): the stale
+`StreamWindowCodecError` messages — "need 16" while the wire sizes had
+grown to 24 — were fixed; errors now carry `got`/`need` dynamically,
+pinned by `test_decode_truncated_rejected`. Nothing left to do here.
 
 ### Phase 1B — regression / stress tests (B-5)
 
