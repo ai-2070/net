@@ -1,0 +1,19 @@
+web/src/content/docs/releases/RELEASE_v0.30_FINAL_COUNTDOWN.md
+  s_71546d4a471b13::t_f8ea88a7aebd3b 1-112
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.9",
+  "base_commit_sha": "22cb97bdd456a6d324bec066c830ab40e06fa2a8",
+  "prompts": {},
+  "sessions": {
+    "s_71546d4a471b13": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dc971519-8aad-49ab-b743-eb40e2447a5e",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
