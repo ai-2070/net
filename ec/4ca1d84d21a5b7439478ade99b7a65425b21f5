@@ -1,0 +1,19 @@
+net/crates/net/src/adapter/net/reliability.rs
+  s_ee23e37ba2d5f0::t_bc2f77ecd67cfb 659
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.9",
+  "base_commit_sha": "ec4ca1d84d21a5b7439478ade99b7a65425b21f5",
+  "prompts": {},
+  "sessions": {
+    "s_ee23e37ba2d5f0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e81805cc-911e-4bfc-a774-30595b43ba7f",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
