@@ -2402,6 +2402,51 @@ mod tests {
         assert_eq!(s.last_sacked, vec![(1, 1000)], "last_sacked stays correct");
     }
 
+    /// Review NACKMAX: a >64-deep out-of-order arrival is accepted under
+    /// the lifted horizon (pre-R-2 it was dropped at offset > 64), and
+    /// the derived legacy NACK widens its `missing_bitmap` to all-ones.
+    /// That wide NACK may drive a one-shot fast retransmit, but repeated
+    /// re-delivery of the SAME head-gap NACK is deduped by the recover
+    /// point, so retries stay bounded and the stream is never spuriously
+    /// given up — no `take_failed` / StreamReset / fatal path.
+    #[test]
+    fn deep_reorder_does_not_reset_stream() {
+        // Receiver side: accept a far out-of-order seq, then derive the
+        // widened legacy NACK it would emit to the sender.
+        let mut rx = ReliableStream::with_settings(Duration::from_millis(50), 16_384, 3);
+        assert!(rx.on_receive(0)); // next_expected = 1
+        assert!(rx.on_receive(1 + 200), "offset 200 accepted (» legacy 64)");
+        let nack = rx.build_nack().expect("a gap must produce a NACK");
+        assert_eq!(nack.next_expected, 1);
+        assert_eq!(
+            nack.missing_bitmap,
+            u64::MAX,
+            "a run beyond the 64-seq window ⇒ whole window flagged missing"
+        );
+
+        // Sender side: the wide NACK drives ONE fast retransmit; every
+        // repeat for the unchanged head gap is deduped.
+        let mut tx = ReliableStream::with_settings(Duration::from_millis(50), 16_384, 3);
+        for seq in 0..300u64 {
+            tx.on_send(descriptor(seq, Bytes::from_static(b"x")));
+        }
+        assert!(
+            !tx.on_nack(&nack).is_empty(),
+            "first wide NACK drives a fast retransmit"
+        );
+        for _ in 0..5 {
+            assert!(
+                tx.on_nack(&nack).is_empty(),
+                "duplicate head-gap NACK is deduped by the recover point"
+            );
+        }
+        assert!(
+            !tx.take_failed(),
+            "repeated wide NACKs must not exhaust retries / reset the stream"
+        );
+        assert!(tx.has_pending(), "stream is still live, just recovering");
+    }
+
     /// R-3 / Karn: a SACKed packet that was retransmitted must not
     /// contribute an RTT sample.
     #[test]

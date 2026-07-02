@@ -1834,6 +1834,77 @@ mod tests {
         assert_eq!(session.stream_count(), 0);
     }
 
+    /// Review GRANTLOSS: a batched grant datagram carries many streams'
+    /// credit grants at once, and a lost one is NOT re-queued by the
+    /// drainer. That is safe because grants are AUTHORITATIVE and
+    /// cumulative — any later grant for the stream carries the full
+    /// `total_consumed`, so a dropped grant is subsumed by the next one
+    /// and the stream never wedges. This pins the per-stream property
+    /// (a dropped batch is just N of these); the 30 s committed-flush
+    /// budget is the backstop for the pathological "no later grant ever
+    /// arrives" case.
+    #[test]
+    fn dropped_grant_recovers_via_next_authoritative_grant() {
+        let st = StreamState::new_full(true, 1, 1000);
+        assert_eq!(st.tx_credit_remaining(), 1000, "full initial window");
+
+        // Sender commits 600 bytes to the wire → credit falls, the
+        // committed-bytes watermark rises.
+        assert!(st.try_acquire_tx_credit(600));
+        assert_eq!(st.tx_credit_remaining(), 400);
+
+        // The receiver consumed 300, then 600. Its first grant
+        // (total_consumed = 300) rode a batched datagram that was
+        // dropped — never applied. Only the second, cumulative grant
+        // (total_consumed = 600) lands.
+        st.apply_authoritative_grant(600);
+
+        // Credit fully recovers to the window despite the dropped
+        // grant: the later authoritative grant conveyed the whole
+        // cumulative amount. The stream is not wedged.
+        assert_eq!(
+            st.tx_credit_remaining(),
+            1000,
+            "dropped grant is subsumed by the next authoritative grant"
+        );
+        assert_eq!(st.credit_grants_received(), 1, "only the second grant applied");
+
+        // A late-arriving straggler of the dropped grant is an
+        // idempotent no-op (monotonic `max_consumed_seen`) — it cannot
+        // double-credit past the window.
+        st.apply_authoritative_grant(300);
+        assert_eq!(st.tx_credit_remaining(), 1000, "stale grant ignored");
+    }
+
+    /// Review HORIZON: a stream is built from ONE `tx_window` that sizes
+    /// BOTH the sender retransmit window (`max_pending`) AND the
+    /// receiver reorder-acceptance horizon — [`Self::new_full_with_epoch`]
+    /// feeds `tx_window` through [`ReliableStream::max_pending_for_window`],
+    /// and `reorder_horizon` re-clamps that same value. This pins the
+    /// exact acceptance boundary against the tx-window-derived budget,
+    /// so that giving the receiver an INDEPENDENT rx window later fails
+    /// HERE (a deliberate update) instead of silently shifting reorder
+    /// acceptance / memory semantics.
+    #[test]
+    fn reorder_horizon_shares_the_tx_window_budget() {
+        for tx_window in [0u32, 4096, 1 << 16, 1 << 24, u32::MAX] {
+            let expected_horizon = (ReliableStream::max_pending_for_window(tx_window) as u64)
+                .clamp(64, ReliableStream::MAX_REORDER_PACKETS);
+            let st = StreamState::new_full(true, 1, tx_window);
+            st.with_reliability(|r| {
+                assert!(r.on_receive(0)); // next_expected = 1
+                assert!(
+                    r.on_receive(1 + expected_horizon),
+                    "offset == horizon ({expected_horizon}) accepted (window={tx_window})"
+                );
+                assert!(
+                    !r.on_receive(1 + expected_horizon + 1),
+                    "offset horizon+1 rejected (window={tx_window})"
+                );
+            });
+        }
+    }
+
     /// Pin discovery-routing perf #108: the per-session NodeId
     /// cache starts empty, accepts the first non-zero publish,
     /// and ignores the `0` sentinel.

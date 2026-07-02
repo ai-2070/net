@@ -16744,6 +16744,53 @@ mod stream_ack_batching_tests {
         );
     }
 
+    /// R-5 (review DORMANT/CAPCACHE): the peer's advertisement — not
+    /// local support — controls the SACK-range path. With an empty fold
+    /// (the peer never announced `ACK_RANGES_CAPABILITY_TAG`) the gate
+    /// resolves `false`, and the drainer ANDs that into `emit_ack_ranges`;
+    /// so a gapped stream produces the legacy grant + NACK and NO
+    /// `StreamAckRanges`, even though this node's own support is on.
+    #[test]
+    fn no_advertised_capability_keeps_sender_on_legacy_path() {
+        use crate::adapter::net::behavior::fold::capability::CapabilityFold;
+        use crate::adapter::net::behavior::fold::Fold;
+
+        let cache: DashMap<u64, (bool, Instant)> = DashMap::new();
+        let session_id_to_node: DashMap<u64, u64> = DashMap::new();
+        let fold: Fold<CapabilityFold> = Fold::new();
+
+        let session = session_at("127.0.0.1:7011");
+        session_id_to_node.insert(session.session_id(), 0xBEEF_u64);
+
+        // Peer never advertised ⇒ gate false. This is exactly the value
+        // the drainer ANDs with `enable_stream_ack_ranges` to decide
+        // whether to emit ranges.
+        let supported =
+            peer_supports_ack_ranges(&cache, &session_id_to_node, &fold, session.session_id());
+        assert!(
+            !supported,
+            "no advertisement ⇒ legacy path even with local support enabled"
+        );
+
+        // A gapped receive stream: 0 received, 5 out of order ⇒ head gap
+        // at 1 (so there IS a NACK and there WOULD be SACK ranges).
+        session
+            .get_or_create_stream_for_packet(3, true)
+            .with_reliability(|r| {
+                assert!(r.on_receive(0));
+                assert!(r.on_receive(5));
+            });
+
+        let (grants, nacks, acks) =
+            build_session_control_events(&session, &[(3u64, 10u64)], supported);
+        assert_eq!(grants.len(), 1, "grant still emitted");
+        assert_eq!(nacks.len(), 1, "legacy NACK still emitted for the gap");
+        assert!(
+            acks.is_empty(),
+            "no StreamAckRanges to a peer that has not advertised support"
+        );
+    }
+
     /// Grants for different peers (different sessions) route to their
     /// own batches with their own addresses.
     #[test]
