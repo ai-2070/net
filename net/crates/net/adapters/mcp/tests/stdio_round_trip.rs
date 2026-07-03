@@ -146,3 +146,52 @@ async fn a_credential_env_never_appears_in_a_tool_result() {
     // The tool still works — only the credential is withheld.
     assert_eq!(echo.text(), "hello");
 }
+
+#[tokio::test]
+async fn big_tool_returns_a_large_payload() {
+    let client = connect().await;
+    within("initialize", client.initialize())
+        .await
+        .expect("initialize");
+
+    let big = within("big", client.call_tool("big", json!({ "size": 100_000 })))
+        .await
+        .expect("big");
+    assert!(!big.is_error);
+    assert_eq!(
+        big.text().len(),
+        100_000,
+        "the full large payload round-trips"
+    );
+}
+
+#[tokio::test]
+async fn bump_changes_the_tool_set_and_emits_list_changed() {
+    let client = connect().await;
+    within("initialize", client.initialize())
+        .await
+        .expect("initialize");
+
+    // `bonus` is absent before the bump.
+    let before = within("list", client.list_tools()).await.expect("list");
+    assert!(!before.iter().any(|t| t.name == "bonus"));
+
+    // Subscribe BEFORE triggering the change so the notification isn't missed.
+    let mut changed = client.subscribe_list_changed();
+    within("bump", client.call_tool("_bump", json!({})))
+        .await
+        .expect("bump");
+
+    // The server emits tools/list_changed; the client forwards it to subscribers.
+    tokio::time::timeout(CALL_TIMEOUT, changed.recv())
+        .await
+        .expect("list_changed within the ceiling")
+        .expect("list_changed channel stayed open");
+
+    // Re-reading the tool set now shows `bonus`.
+    let after = within("relist", client.list_tools()).await.expect("relist");
+    assert!(
+        after.iter().any(|t| t.name == "bonus"),
+        "bonus appears after a bump",
+    );
+}

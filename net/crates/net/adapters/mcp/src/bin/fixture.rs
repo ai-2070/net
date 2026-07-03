@@ -7,15 +7,18 @@
 //! Speaks newline-delimited JSON-RPC 2.0 over stdin/stdout, synchronously
 //! (a plain blocking read loop — a test double needs no async runtime).
 //!
-//! v0 tool set:
+//! Tool set:
 //!   - `echo`  — returns its `message` argument (deterministic baseline)
 //!   - `add`   — returns `a + b` (typed-args baseline)
 //!   - `boom`  — a tool-level failure (`is_error = true`), NOT a protocol error
 //!   - `slow`  — sleeps `ms` milliseconds before replying (latency injection)
+//!   - `big`   — returns a `size`-byte string (large-payload)
+//!   - `_bump` — flips the tool set + emits `tools/list_changed` (live updates)
+//!   - `bonus` — present only after a `_bump`
 //!
-//! Roadmap (Phase 1 fixture expansion, `MCP_BRIDGE_PLAN.md`): schema-change-
-//! on-command, `tools/list_changed` on demand, a large-payload tool, and a
-//! fake-credentialed tool carrying a sentinel token for the token-leak test.
+//! The credential/token-leak behavior is exercised by spawning the fixture
+//! with a sentinel env var; the fixture never reads its env, so any tool's
+//! result proves a credential doesn't transit (see the stdio tests).
 
 use std::io::{BufRead, Write};
 
@@ -32,6 +35,10 @@ const INVALID_PARAMS: i64 = -32602;
 fn main() -> std::io::Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
+    // Injectable state: calling `_bump` flips this, which changes `tools/list`
+    // (the `bonus` tool appears) and makes the server emit a
+    // `tools/list_changed` notification — the live-descriptor-update behavior.
+    let mut bumped = false;
 
     for line in stdin.lock().lines() {
         let line = line?;
@@ -51,10 +58,23 @@ fn main() -> std::io::Result<()> {
         match (method, id) {
             // A request (method + id) — dispatch and reply.
             (Some(method), Some(id)) => {
-                let response = handle_request(method, id, msg.get("params"));
+                let (response, emit_changed) =
+                    handle_request(method, id, msg.get("params"), &mut bumped);
                 if let Ok(text) = serde_json::to_string(&response) {
                     writeln!(stdout, "{text}")?;
                     stdout.flush()?;
+                }
+                // A `_bump` call changes the tool set — notify the client so it
+                // re-reads `tools/list`.
+                if emit_changed {
+                    let note = json!({
+                        "jsonrpc": spec::JSONRPC_VERSION,
+                        "method": spec::method::TOOLS_LIST_CHANGED,
+                    });
+                    if let Ok(text) = serde_json::to_string(&note) {
+                        writeln!(stdout, "{text}")?;
+                        stdout.flush()?;
+                    }
                 }
             }
             // A notification (method, no id) — e.g. notifications/initialized.
@@ -67,14 +87,23 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Build the JSON-RPC response envelope for one request.
-fn handle_request(method: &str, id: Value, params: Option<&Value>) -> Value {
+/// Build the JSON-RPC response for one request, plus whether a
+/// `tools/list_changed` notification should follow it.
+fn handle_request(
+    method: &str,
+    id: Value,
+    params: Option<&Value>,
+    bumped: &mut bool,
+) -> (Value, bool) {
     match method {
-        spec::method::INITIALIZE => ok(id, initialize_result()),
-        spec::method::TOOLS_LIST => ok(id, tools_list_result()),
-        spec::method::TOOLS_CALL => handle_tools_call(id, params),
+        spec::method::INITIALIZE => (ok(id, initialize_result()), false),
+        spec::method::TOOLS_LIST => (ok(id, tools_list_result(*bumped)), false),
+        spec::method::TOOLS_CALL => handle_tools_call(id, params, bumped),
         // Unknown method.
-        other => err(id, METHOD_NOT_FOUND, format!("method not found: {other}")),
+        other => (
+            err(id, METHOD_NOT_FOUND, format!("method not found: {other}")),
+            false,
+        ),
     }
 }
 
@@ -93,9 +122,10 @@ fn initialize_result() -> Value {
     serde_json::to_value(result).unwrap_or_else(|_| json!({}))
 }
 
-/// The deterministic v0 tool set.
-fn tools_list_result() -> Value {
-    let tools = vec![
+/// The tool set. Deterministic, except that `bonus` appears only after a
+/// `_bump` call — the schema-change-on-command behavior.
+fn tools_list_result(bumped: bool) -> Value {
+    let mut tools = vec![
         Tool {
             name: "echo".to_string(),
             title: Some("Echo".to_string()),
@@ -135,7 +165,33 @@ fn tools_list_result() -> Value {
             }),
             output_schema: None,
         },
+        Tool {
+            name: "big".to_string(),
+            title: Some("Big".to_string()),
+            description: Some("Return a string of `size` bytes (large-payload).".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "size": { "type": "integer", "minimum": 0 } }
+            }),
+            output_schema: None,
+        },
+        Tool {
+            name: "_bump".to_string(),
+            title: Some("Bump".to_string()),
+            description: Some("Change the tool set and emit tools/list_changed.".to_string()),
+            input_schema: json!({ "type": "object", "properties": {} }),
+            output_schema: None,
+        },
     ];
+    if bumped {
+        tools.push(Tool {
+            name: "bonus".to_string(),
+            title: Some("Bonus".to_string()),
+            description: Some("Appears only after a `_bump`.".to_string()),
+            input_schema: json!({ "type": "object", "properties": {} }),
+            output_schema: None,
+        });
+    }
     let result = ListToolsResult {
         tools,
         next_cursor: None,
@@ -143,14 +199,21 @@ fn tools_list_result() -> Value {
     serde_json::to_value(result).unwrap_or_else(|_| json!({ "tools": [] }))
 }
 
-/// Dispatch a `tools/call` to one of the fixture's tools.
-fn handle_tools_call(id: Value, params: Option<&Value>) -> Value {
+/// Dispatch a `tools/call`. Returns the response plus whether a
+/// `tools/list_changed` notification should follow (true only for `_bump`).
+fn handle_tools_call(id: Value, params: Option<&Value>, bumped: &mut bool) -> (Value, bool) {
     let call: CallToolParams = match params.map(|p| serde_json::from_value(p.clone())) {
         Some(Ok(c)) => c,
-        _ => return err(id, INVALID_PARAMS, "invalid tools/call params".to_string()),
+        _ => {
+            return (
+                err(id, INVALID_PARAMS, "invalid tools/call params".to_string()),
+                false,
+            )
+        }
     };
     let args = &call.arguments;
 
+    let mut emit_changed = false;
     let result = match call.name.as_str() {
         "echo" => {
             let message = args
@@ -176,18 +239,34 @@ fn handle_tools_call(id: Value, params: Option<&Value>) -> Value {
             std::thread::sleep(std::time::Duration::from_millis(ms));
             CallToolResult::text_ok(format!("slept {ms}ms"))
         }
+        "big" => {
+            let size = args.get("size").and_then(Value::as_u64).unwrap_or(0) as usize;
+            CallToolResult::text_ok("x".repeat(size))
+        }
+        "_bump" => {
+            *bumped = true;
+            emit_changed = true;
+            CallToolResult::text_ok("bumped")
+        }
+        "bonus" => CallToolResult::text_ok("bonus"),
         // Unknown tool → a protocol-level error, not a tool result.
-        other => return err(id, INVALID_PARAMS, format!("unknown tool: {other}")),
+        other => {
+            return (
+                err(id, INVALID_PARAMS, format!("unknown tool: {other}")),
+                false,
+            )
+        }
     };
 
-    match serde_json::to_value(result) {
+    let response = match serde_json::to_value(result) {
         Ok(value) => ok(id, value),
         Err(_) => err(
             id,
             INVALID_PARAMS,
             "result serialization failed".to_string(),
         ),
-    }
+    };
+    (response, emit_changed)
 }
 
 /// A JSON-RPC success envelope.
