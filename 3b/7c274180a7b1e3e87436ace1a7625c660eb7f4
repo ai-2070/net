@@ -1,0 +1,33 @@
+net/crates/net/adapters/mcp/src/wrap/credentials.rs
+  s_e2c6f41ae18f64::t_d6d7455d23be7d 183-187
+  s_e2c6f41ae18f64::t_ec430eb6244592 283-286,298-302
+  s_e2c6f41ae18f64::t_51f3dae329618e 1-182,188-282,287-297,303-304
+net/crates/net/adapters/mcp/Cargo.toml
+  s_e2c6f41ae18f64::t_07950051ccb5cd 15-20,27,29-30
+  s_e2c6f41ae18f64::t_069a2d566f3b6d 23-26,28
+net/crates/net/adapters/mcp/src/wrap/descriptor.rs
+  s_e2c6f41ae18f64::t_2829ea6e70c18b 1-132,137-203,208-210,215-230,235-236,241-266
+  s_e2c6f41ae18f64::t_13fda79b221216 133-136,204-207,211-214,231-234,237-240
+net/crates/net/adapters/mcp/src/wrap/mod.rs
+  s_e2c6f41ae18f64::t_df4d73f0da9793 3-11,13-14,17-18
+net/crates/net/adapters/mcp/src/lib.rs
+  s_e2c6f41ae18f64::t_adff9479f37b42 10,14-18,20-23
+net/crates/net/Cargo.lock
+  s_e2c6f41ae18f64::t_f06e0e6d6c9bd7 2491-2501
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3b7c274180a7b1e3e87436ace1a7625c660eb7f4",
+  "prompts": {},
+  "sessions": {
+    "s_e2c6f41ae18f64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dbc06b06-9d2b-4f28-a220-e736eee44f76",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
