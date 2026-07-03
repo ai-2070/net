@@ -1,0 +1,23 @@
+net/crates/net/cli/src/commands/wrap.rs
+  s_e2c6f41ae18f64::t_5d76638e2289d8 167-180
+  s_e2c6f41ae18f64::t_6257a741451551 104
+  s_e2c6f41ae18f64::t_cf23eea5243873 29,32-54
+  s_e2c6f41ae18f64::t_9530f8406ff806 198,205-213,215
+  s_e2c6f41ae18f64::t_7696f1b292c097 55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d2fa9467ae0d569ab640a00b52e6a475f4cb5052",
+  "prompts": {},
+  "sessions": {
+    "s_e2c6f41ae18f64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dbc06b06-9d2b-4f28-a220-e736eee44f76",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
