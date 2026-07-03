@@ -134,6 +134,12 @@ pub struct InitializeResult {
 // tools/list
 // ---------------------------------------------------------------------------
 
+/// Default `input_schema` when a non-conforming server omits `inputSchema`:
+/// an empty object, so the field is always an object rather than JSON `null`.
+fn default_input_schema() -> serde_json::Value {
+    serde_json::json!({})
+}
+
 /// One tool as reported by `tools/list`. `input_schema` is a JSON Schema
 /// object kept as an opaque [`serde_json::Value`] — the descriptor-lowering
 /// slice re-serializes it onto a `ToolDescriptor`; here it stays verbatim.
@@ -146,8 +152,9 @@ pub struct Tool {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// JSON Schema for the tool's arguments. MCP requires it; default to an
-    /// empty object if a non-conforming server omits it.
-    #[serde(default)]
+    /// empty object (`{}`, not JSON `null`) if a non-conforming server omits
+    /// it, so downstream code can always treat it as an object.
+    #[serde(default = "default_input_schema")]
     pub input_schema: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<serde_json::Value>,
@@ -298,6 +305,15 @@ mod tests {
         let back = serde_json::to_value(&tool).unwrap();
         assert!(back.get("inputSchema").is_some());
         assert!(back.get("input_schema").is_none());
+    }
+
+    #[test]
+    fn tool_without_input_schema_defaults_to_empty_object() {
+        // A non-conforming server that omits inputSchema must lower to `{}`,
+        // never JSON `null`, so downstream code can treat it as an object.
+        let tool: Tool = serde_json::from_value(serde_json::json!({ "name": "bare" })).unwrap();
+        assert_eq!(tool.input_schema, serde_json::json!({}));
+        assert!(tool.input_schema.is_object());
     }
 
     #[test]
