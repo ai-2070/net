@@ -1,0 +1,52 @@
+[package]
+name = "net-mesh-mcp"
+version = "0.30.0"
+edition = "2021"
+description = "MCP (Model Context Protocol) edge adapter for the Net mesh — net wrap / net mcp serve"
+license = "Apache-2.0"
+repository = "https://github.com/ai-2070/net"
+
+[lib]
+# `use net_mcp::...` — the published artifact is `net-mesh-mcp`.
+name = "net_mcp"
+
+# ---------------------------------------------------------------------------
+# Doctrine (MCP_BRIDGE_PLAN.md #1): this adapter rides on `net-mesh-sdk`
+# ONLY — never on core crates directly. The dependency lands with the
+# mesh-facing lowering (wrap/descriptor + serve). This first slice is the
+# pure MCP JSON-RPC stdio protocol layer + the conformance fixture, which
+# have no mesh dependency at all — hence serde/serde_json/tokio only.
+# ---------------------------------------------------------------------------
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["process", "io-util", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = [
+    "process",
+    "io-util",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "macros",
+] }
+
+# The conformance fixture (MCP_BRIDGE_PLAN.md cross-cutting workstreams):
+# a hermetic stdio MCP server with injectable behaviors that acceptance
+# runs against — never against GitHub. Co-located in this crate so the
+# integration tests can spawn it via `CARGO_BIN_EXE_net-mcp-fixture`;
+# extractable into its own artifact later without touching the wire types.
+[[bin]]
+name = "net-mcp-fixture"
+path = "src/bin/fixture.rs"
+
+# Mirror the workspace panic-hygiene lints (there is no [workspace.lints]
+# table to inherit from — the core crate declares these per-package).
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"

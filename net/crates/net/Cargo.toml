@@ -5,6 +5,7 @@ members = [
     "sdk-macros",
     "deck",
     "cli",
+    "adapters/mcp",
     "aggregator-daemon",
     "bindings/node",
     "bindings/python",
