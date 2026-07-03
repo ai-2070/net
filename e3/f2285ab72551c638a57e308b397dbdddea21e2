@@ -1,0 +1,21 @@
+net/crates/net/docs/plans/HERMES_INTEGRATION_PLAN.md
+  s_e2c6f41ae18f64::t_8f129a1cc332b6 3
+net/crates/net/docs/plans/OPENCLAW_INTEGRATION_PLAN.md
+  s_e2c6f41ae18f64::t_140f377da213db 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e3f2285ab72551c638a57e308b397dbdddea21e2",
+  "prompts": {},
+  "sessions": {
+    "s_e2c6f41ae18f64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dbc06b06-9d2b-4f28-a220-e736eee44f76",
+        "model": "unknown"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
