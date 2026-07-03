@@ -371,6 +371,16 @@ impl Mesh {
         self.node.node_id()
     }
 
+    /// This node's `origin_hash` — the value the bus stamps on outbound
+    /// nRPC calls, which a remote handler reads as
+    /// `RpcContext::caller_origin`. Use it to admit *this* node in a
+    /// caller-scoped authorization check (it is NOT the same as
+    /// [`node_id`](Self::node_id)); e.g. `net wrap`'s owner-only default
+    /// admits the wrapping node's own `origin_hash`.
+    pub fn origin_hash(&self) -> u64 {
+        self.node.origin_hash()
+    }
+
     /// Get the local bind address.
     pub fn local_addr(&self) -> SocketAddr {
         self.node.local_addr()

@@ -124,12 +124,10 @@ async fn wrap_discover_and_invoke_across_two_nodes() {
     handshake(&caller, &host).await;
     let b_id = host.inner().node_id();
 
-    // Admit any caller so this test isolates the invoke/translate path from
-    // the owner-scope gate (which the rejection test below covers). Owner-only
-    // keyed on the caller's origin needs an SDK accessor for a node's own
-    // origin_hash — a provider-side primitive tracked as a follow-up.
-    let mut config = WrapConfig::owner_only(client_info(), 0);
-    config.scope = OwnerScope::any();
+    // Real owner-only: admit the caller by its origin_hash — the value its
+    // outbound calls carry as `caller_origin`. The successful invoke below
+    // then proves `caller_origin == caller.origin_hash()` (the SDK accessor).
+    let config = WrapConfig::owner_only(client_info(), caller.origin_hash());
     let session = wrap_server(&host, FIXTURE, &[], &[], config)
         .await
         .expect("wrap the fixture on the host");
