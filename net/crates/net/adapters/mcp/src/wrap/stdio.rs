@@ -266,8 +266,8 @@ async fn dispatch_line(inner: &Arc<Inner>, line: &str) {
             // Other notifications are not part of the compat tier — ignore.
         }
         // Response to one of our requests (id, no method).
-        (None, Some(id)) => {
-            if let Some(id) = id.as_i64() {
+        (None, Some(id)) => match id.as_i64() {
+            Some(id) => {
                 if let Some(tx) = inner.pending.lock().await.remove(&id) {
                     let payload = match msg.error {
                         Some(err) => Err(err),
@@ -275,8 +275,15 @@ async fn dispatch_line(inner: &Arc<Inner>, line: &str) {
                     };
                     let _ = tx.send(payload);
                 }
+                // An unmatched integer id (a duplicate or already-resolved
+                // response) is benign — ignore it.
             }
-        }
+            // We only ever send integer ids, so a non-integer response id is a
+            // protocol violation. It can never match a pending call, so that
+            // call would hang forever waiting for its real reply — fail every
+            // in-flight call instead (each `rx` resolves to a transport error).
+            None => inner.pending.lock().await.clear(),
+        },
         // Neither method nor id — malformed; ignore.
         (None, None) => {}
     }

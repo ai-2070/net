@@ -19,7 +19,7 @@ pub mod invoke;
 pub mod session;
 pub mod stdio;
 
-pub use credentials::{classify, CredentialOverride, CredentialStatus, WrapEnv};
+pub use credentials::{classify, ClassifyError, CredentialOverride, CredentialStatus, WrapEnv};
 pub use descriptor::{lower_tool, LoweredTool, LoweringContext, Substitutability};
 pub use invoke::{OwnerScope, WrapInvokeHandler};
 pub use session::{build_capability_set, wrap_server, WrapConfig, WrapError, WrapSession};
