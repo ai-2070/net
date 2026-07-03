@@ -2489,6 +2489,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-mesh-mcp"
+version = "0.30.0"
+dependencies = [
+ "net-mesh-sdk",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "net-mesh-sdk"
 version = "0.30.0"
 dependencies = [

@@ -12,12 +12,22 @@ name = "net_mcp"
 
 # ---------------------------------------------------------------------------
 # Doctrine (MCP_BRIDGE_PLAN.md #1): this adapter rides on `net-mesh-sdk`
-# ONLY — never on core crates directly. The dependency lands with the
-# mesh-facing lowering (wrap/descriptor + serve). This first slice is the
-# pure MCP JSON-RPC stdio protocol layer + the conformance fixture, which
-# have no mesh dependency at all — hence serde/serde_json/tokio only.
+# ONLY — never on core crates directly. The single mesh-facing dependency
+# is `net-mesh-sdk`; everything else is protocol / serialization support.
+# A CI dependency check (Open Risks table) enforces that `net-mesh` never
+# appears as a *direct* dependency here — only transitively via the SDK.
+# The `tool` feature is what surfaces `net_sdk::tool::ToolDescriptor`, the
+# lowering target.
 # ---------------------------------------------------------------------------
 [dependencies]
+# `tool` surfaces `ToolDescriptor` (the lowering target) and the
+# `serve_tool` / `call_tool` provider+caller verbs the announce/invoke
+# slices need; it pulls `net` (the SDK tool module is written against the
+# mesh-RPC surface) and `cortex`.
+net-mesh-sdk = { version = "0.30.0", path = "../../sdk", default-features = false, features = [
+    "net",
+    "tool",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

@@ -7,21 +7,20 @@
 //! crates directly (the same rule the Redis / JetStream adapters follow).
 //! If MCP churns, this adapter churns; the mesh does not.
 //!
-//! This crate is being built bottom-up. What lands first is the piece with
-//! no mesh dependency at all:
+//! This crate is being built bottom-up:
 //!
 //! - [`spec`] — the MCP 2026-07-28 (stateless) JSON-RPC wire types. **All**
 //!   spec-version-specific shapes live here and nowhere else, so a spec bump
-//!   is a single-module change (doctrine #6).
-//! - [`wrap`] — the supply side. [`wrap::StdioMcpClient`] spawns a stdio MCP
-//!   server and speaks JSON-RPC to it (`initialize` / `tools/list` /
-//!   `tools/call`); descriptor lowering and the nRPC bridge (which pull in
-//!   the SDK) land on top of it in later slices.
+//!   is a single-module change (doctrine #6). No mesh dependency.
+//! - [`wrap`] — the supply side: [`wrap::StdioMcpClient`] speaks JSON-RPC to
+//!   a spawned MCP server; [`wrap::classify`] scores credential exposure; and
+//!   [`wrap::lower_tool`] lowers a `tools/list` entry to
+//!   `net_sdk::tool::ToolDescriptor` + MCP-bridge metadata.
 //!
-//! The mesh-facing halves (`wrap::descriptor`, `wrap::invoke`, the
-//! `serve` shim) and the `net-mesh-sdk` dependency they need arrive with
-//! Phase 1 / Phase 2; keeping them out of this slice keeps the protocol
-//! layer independently testable against the conformance fixture.
+//! The single mesh-facing dependency is `net-mesh-sdk` (doctrine #1); the
+//! `ToolDescriptor` lowering target comes from its `tool` feature. Still to
+//! land: the nRPC → `tools/call` bridge, the announce/serve wiring, and the
+//! `serve` shim (Phase 2).
 
 pub mod spec;
 pub mod wrap;

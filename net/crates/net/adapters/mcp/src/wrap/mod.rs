@@ -1,13 +1,21 @@
 //! Supply side — wrap a local MCP server as a mesh capability.
 //!
-//! The bottom of the stack is [`StdioMcpClient`] ([`stdio`]): spawn a stdio
-//! MCP server and speak JSON-RPC 2.0 to it. The mesh-facing layers that sit
-//! on top of it — descriptor lowering (`tools/list` → `ToolDescriptor`),
-//! credential classification, and the nRPC → `tools/call` bridge — pull in
-//! `net-mesh-sdk` and land in the Phase 1 slices.
+//! - [`stdio`] — [`StdioMcpClient`]: spawn a stdio MCP server and speak
+//!   JSON-RPC 2.0 to it (no mesh dependency).
+//! - [`credentials`] — classify a wrapped server's credential exposure,
+//!   conservatively (unknown is gated like credentialed).
+//! - [`descriptor`] — lower a `tools/list` entry to `net_sdk::tool::ToolDescriptor`
+//!   plus the MCP-bridge metadata carried as `CapabilitySet` tags.
+//!
+//! Still to land (Phase 1): the nRPC → `tools/call` bridge (`invoke`) and
+//! the announce/serve wiring on the SDK provider surface.
 
+pub mod credentials;
+pub mod descriptor;
 pub mod stdio;
 
+pub use credentials::{classify, CredentialOverride, CredentialStatus, WrapEnv};
+pub use descriptor::{lower_tool, LoweredTool, LoweringContext, Substitutability};
 pub use stdio::StdioMcpClient;
 
 use crate::spec::JsonRpcError;
