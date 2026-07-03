@@ -71,6 +71,31 @@ pub fn invocation_scope_key(tool_id: &str) -> String {
     format!("tool::{tool_id}::invocation_scope")
 }
 
+/// Max length of a tool id, leaving headroom under the substrate's 255-char
+/// channel-name cap for the `.replies.<origin>` suffix the RPC layer appends.
+const MAX_TOOL_ID_LEN: usize = 200;
+
+/// Whether `name` can be used verbatim as an nRPC service id.
+///
+/// A served tool's id becomes the channel names `<id>.requests` /
+/// `<id>.replies.*`, which the substrate validates as **lowercase** names over
+/// `[a-z0-9._/-]` with no `//` and no `.`/`..` path segments. An MCP tool whose
+/// name has uppercase or other characters therefore can't be served as-is —
+/// the wrap layer skips such tools rather than failing the whole server.
+/// (Charset-safe name *allocation* that would let those tools through is a
+/// later concern — the plan's Phase 4 duplicate-grouping/naming work.)
+pub fn is_serviceable_tool_id(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_TOOL_ID_LEN
+        && !name.starts_with('/')
+        && !name.ends_with('/')
+        && !name.contains("//")
+        && name
+            .chars()
+            .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '/'))
+        && name.split('/').all(|seg| seg != "." && seg != "..")
+}
+
 /// The non-per-tool inputs the lowering needs: who the provider is and the
 /// classification the operator/detector produced for this wrap.
 #[derive(Debug, Clone)]
@@ -262,5 +287,29 @@ mod tests {
         );
         assert_eq!(lowered.descriptor.name, "raw");
         assert_eq!(lowered.descriptor.version, "0");
+    }
+
+    #[test]
+    fn serviceable_tool_id_accepts_only_channel_safe_names() {
+        for ok in ["echo", "get_current_time", "a.b", "svc/sub", "x-1"] {
+            assert!(is_serviceable_tool_id(ok), "{ok:?} should be serviceable");
+        }
+        for bad in [
+            "",            // empty
+            "createIssue", // uppercase
+            "a b",         // space
+            "/x",          // leading slash
+            "x/",          // trailing slash
+            "a//b",        // double slash
+            "a/../b",      // traversal segment
+            "a/./b",       // dot segment
+            "emoji\u{1f600}",
+        ] {
+            assert!(!is_serviceable_tool_id(bad), "{bad:?} should be rejected");
+        }
+        assert!(
+            !is_serviceable_tool_id(&"a".repeat(MAX_TOOL_ID_LEN + 1)),
+            "over-long ids are rejected",
+        );
     }
 }

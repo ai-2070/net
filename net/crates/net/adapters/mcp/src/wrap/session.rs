@@ -21,7 +21,9 @@ use net_sdk::mesh_rpc::ServeHandle;
 use net_sdk::tool::description_metadata_key;
 
 use super::credentials::{classify, ClassifyError, CredentialOverride, WrapEnv};
-use super::descriptor::{lower_tool, LoweredTool, LoweringContext, Substitutability};
+use super::descriptor::{
+    is_serviceable_tool_id, lower_tool, LoweredTool, LoweringContext, Substitutability,
+};
 use super::invoke::{OwnerScope, WrapInvokeHandler};
 use super::stdio::StdioMcpClient;
 use super::McpError;
@@ -60,12 +62,22 @@ pub struct WrapSession {
     _handles: Vec<ServeHandle>,
     /// The tool ids served, for diagnostics.
     tools: Vec<String>,
+    /// MCP tool names skipped because they aren't valid nRPC service ids
+    /// (e.g. uppercase / non-charset-safe). Surfaced so the operator sees
+    /// what wasn't bridged instead of it failing silently.
+    skipped: Vec<String>,
 }
 
 impl WrapSession {
     /// The tool ids this session serves.
     pub fn tools(&self) -> &[String] {
         &self.tools
+    }
+
+    /// MCP tool names that were skipped because their name isn't a valid nRPC
+    /// service id (charset-safe name allocation for these is a later concern).
+    pub fn skipped_tools(&self) -> &[String] {
+        &self.skipped
     }
 
     /// The wrapped client (e.g. to subscribe to `tools/list_changed`).
@@ -153,41 +165,65 @@ pub async fn wrap_server(
     let init = client.initialize().await?;
     let tools = client.list_tools().await?;
 
-    // Lower every tool.
+    // Only tools whose name is a valid nRPC service id can be served; skip the
+    // rest so one non-conforming tool name doesn't fail the whole wrap.
+    let (serviceable, unserviceable): (Vec<_>, Vec<_>) = tools
+        .into_iter()
+        .partition(|t| is_serviceable_tool_id(&t.name));
+    let skipped: Vec<String> = unserviceable.into_iter().map(|t| t.name).collect();
+
+    // Lower every serviceable tool.
     let ctx = LoweringContext {
         server_version: init.server_info.version,
         credential_status,
         substitutability: config.substitutability,
     };
-    let lowered: Vec<LoweredTool> = tools.iter().map(|t| lower_tool(t, &ctx)).collect();
+    let lowered: Vec<LoweredTool> = serviceable.iter().map(|t| lower_tool(t, &ctx)).collect();
 
-    // Announce the whole set once.
+    // Announce the tool set, then serve a handler for each. Announce must come
+    // first: the substrate re-broadcasts the merged capability set as each
+    // service registers, so the tool tags only propagate to peers when they are
+    // already in the announced (`user_caps`) baseline — serving first would
+    // broadcast bare `nrpc:` tags and the later announce would not overtake them
+    // at peers. The window between announce and the (local, near-instant) serves
+    // is closed by the rollback below.
     let caps = build_capability_set(&lowered);
     mesh.announce_capabilities(caps)
         .await
         .map_err(|e| WrapError::Announce(e.to_string()))?;
 
-    // Serve one caller-aware handler per tool.
+    // Serve one caller-aware handler per tool. If any serve fails, roll back so
+    // a failed startup never leaves stale, uninvocable capabilities
+    // discoverable: drop the handles served so far (each reverses its
+    // `serve_rpc`) and withdraw the announcement before returning the error.
     let mut handles = Vec::with_capacity(lowered.len());
     let mut served = Vec::with_capacity(lowered.len());
     for lt in &lowered {
         let tool_id = lt.descriptor.tool_id.clone();
         let handler =
             WrapInvokeHandler::new(Arc::clone(&client), tool_id.clone(), config.scope.clone());
-        let handle = mesh
-            .serve_rpc(&tool_id, Arc::new(handler))
-            .map_err(|e| WrapError::Serve {
-                tool: tool_id.clone(),
-                reason: e.to_string(),
-            })?;
-        handles.push(handle);
-        served.push(tool_id);
+        match mesh.serve_rpc(&tool_id, Arc::new(handler)) {
+            Ok(handle) => {
+                handles.push(handle);
+                served.push(tool_id);
+            }
+            Err(e) => {
+                drop(handles);
+                // Best-effort withdraw so discovery matches runtime state.
+                let _ = mesh.announce_capabilities(CapabilitySet::new()).await;
+                return Err(WrapError::Serve {
+                    tool: tool_id,
+                    reason: e.to_string(),
+                });
+            }
+        }
     }
 
     Ok(WrapSession {
         client,
         _handles: handles,
         tools: served,
+        skipped,
     })
 }
 
