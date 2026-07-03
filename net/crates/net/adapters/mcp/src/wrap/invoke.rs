@@ -89,11 +89,19 @@ impl OwnerScope {
 
 /// Decode an nRPC request body into MCP tool arguments. An empty body means
 /// "no arguments" (a tool taking no args), which lowers to an empty object.
+/// MCP `tools/call` arguments must be a JSON **object**; a non-object body
+/// (array / null / primitive) is a caller error, reported crisply here rather
+/// than becoming a confusing upstream/tool failure.
 pub fn parse_arguments(body: &[u8]) -> Result<Value, String> {
     if body.is_empty() {
         return Ok(Value::Object(serde_json::Map::new()));
     }
-    serde_json::from_slice(body).map_err(|e| format!("invalid JSON tool arguments: {e}"))
+    let value: Value =
+        serde_json::from_slice(body).map_err(|e| format!("invalid JSON tool arguments: {e}"))?;
+    if !value.is_object() {
+        return Err("tool arguments must be a JSON object".to_string());
+    }
+    Ok(value)
 }
 
 /// Encode a `CallToolResult` as the nRPC response body (JSON).
@@ -165,9 +173,13 @@ impl RpcHandler for WrapInvokeHandler {
 
         let body = encode_result(&result).map_err(RpcHandlerError::Internal)?;
         if result.is_error {
+            // Return the full encoded CallToolResult (JSON) as the error body,
+            // not just its text, so the caller keeps every content block and
+            // any structured_content the tool reported. `body` is the JSON we
+            // just serialized, so it is valid UTF-8.
             return Err(RpcHandlerError::Application {
                 code: ERR_TOOL,
-                message: result.text(),
+                message: String::from_utf8_lossy(&body).into_owned(),
             });
         }
         Ok(Self::ok(body))
@@ -210,6 +222,15 @@ mod tests {
             serde_json::json!({ "message": "hi" }),
         );
         assert!(parse_arguments(b"not json").is_err());
+        // Valid JSON that is not an object is a caller error — MCP tool
+        // arguments must be an object.
+        for non_object in [&b"[]"[..], b"null", b"5", br#""str""#] {
+            assert!(
+                parse_arguments(non_object).is_err(),
+                "non-object body must be rejected: {:?}",
+                std::str::from_utf8(non_object),
+            );
+        }
     }
 
     #[test]
