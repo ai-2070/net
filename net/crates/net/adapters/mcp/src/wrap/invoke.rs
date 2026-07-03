@@ -49,6 +49,9 @@ pub const ERR_TOOL: u16 = 0x8004;
 #[derive(Debug, Clone, Default)]
 pub struct OwnerScope {
     allowed: HashSet<u64>,
+    /// Admit every caller — the mechanism behind the (deferred) `--public`
+    /// exposure. Never set from the CLI in v0 (owner-only is the default).
+    all: bool,
 }
 
 impl OwnerScope {
@@ -56,7 +59,21 @@ impl OwnerScope {
     pub fn owner_only(owner_origin: u64) -> Self {
         let mut allowed = HashSet::new();
         allowed.insert(owner_origin);
-        Self { allowed }
+        Self {
+            allowed,
+            all: false,
+        }
+    }
+
+    /// Admit **any** caller — the eventual backing for `net wrap --public`,
+    /// which is deferred (not in v0), so this is not reachable from the CLI.
+    /// Provided for explicit public opt-in and to isolate the invoke/translate
+    /// path from the gate in tests.
+    pub fn any() -> Self {
+        Self {
+            allowed: HashSet::new(),
+            all: true,
+        }
     }
 
     /// Widen the scope to also admit `origin` (`net wrap --allow peer:<id>`).
@@ -66,7 +83,7 @@ impl OwnerScope {
 
     /// Is `caller_origin` admitted?
     pub fn allows(&self, caller_origin: u64) -> bool {
-        self.allowed.contains(&caller_origin)
+        self.all || self.allowed.contains(&caller_origin)
     }
 }
 
@@ -175,6 +192,14 @@ mod tests {
         let scope = OwnerScope::default();
         assert!(!scope.allows(0));
         assert!(!scope.allows(7));
+    }
+
+    #[test]
+    fn any_scope_admits_everyone() {
+        let scope = OwnerScope::any();
+        assert!(scope.allows(0));
+        assert!(scope.allows(0xDEAD_BEEF));
+        assert!(scope.allows(u64::MAX));
     }
 
     #[test]
