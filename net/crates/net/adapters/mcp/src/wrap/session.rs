@@ -254,4 +254,35 @@ mod tests {
         let caps = build_capability_set(&[]);
         assert!(!CapabilityFilter::new().require_tag("echo").matches(&caps));
     }
+
+    #[test]
+    fn announced_metadata_carries_classification_not_secrets() {
+        // Structural token-leak guard (doctrine #100). A wrapped server's
+        // credentials go to the child process env (StdioMcpClient::spawn),
+        // never into lowering/announce — so the announcement can only ever
+        // carry the credential *classification* label, never a token.
+        let ctx = LoweringContext {
+            server_version: "1.0.0".to_string(),
+            credential_status: super::super::CredentialStatus::Credentialed,
+            substitutability: Substitutability::ProviderLocal,
+        };
+        let caps = build_capability_set(&[lower_tool(&tool("secretive", "uses a token"), &ctx)]);
+        // The credential_status value is a fixed classification label.
+        assert_eq!(
+            caps.metadata
+                .get(&super::super::descriptor::credential_status_key(
+                    "secretive"
+                ))
+                .map(String::as_str),
+            Some("credentialed"),
+        );
+        // No announced metadata value is anything but the small set of
+        // classification labels + the human description — never a secret.
+        for value in caps.metadata.values() {
+            assert!(
+                !value.contains("token") || value == "uses a token",
+                "announced metadata must not carry secret-shaped values: {value:?}",
+            );
+        }
+    }
 }

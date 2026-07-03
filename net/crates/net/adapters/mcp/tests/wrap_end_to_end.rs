@@ -82,7 +82,7 @@ async fn call_bounded(
     body: Bytes,
 ) -> Result<net_sdk::mesh_rpc::RpcReply, String> {
     match tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(5),
         caller.call(target, service, body, CallOptions::default()),
     )
     .await
@@ -91,6 +91,30 @@ async fn call_bounded(
         Ok(Err(e)) => Err(format!("rpc error: {e:?}")),
         Err(_) => Err("call timed out".to_string()),
     }
+}
+
+/// Retry a call a few times. The first cross-node call to a freshly-served
+/// handler can lose its reply if the handler answers before the caller's
+/// per-caller reply subscription has propagated — a warm-up call establishes
+/// it, so a retry lands. `body` is a fresh-`Bytes` factory since each attempt
+/// consumes one.
+async fn call_retry(
+    caller: &Mesh,
+    target: u64,
+    service: &str,
+    body: impl Fn() -> Bytes,
+) -> Result<net_sdk::mesh_rpc::RpcReply, String> {
+    let mut last = String::new();
+    for _ in 0..5 {
+        match call_bounded(caller, target, service, body()).await {
+            Ok(reply) => return Ok(reply),
+            Err(e) => {
+                last = e;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    Err(last)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -124,7 +148,7 @@ async fn wrap_discover_and_invoke_across_two_nodes() {
 
     // Invoke echo on the host; the owner-scope gate admits the caller and the
     // wrapped tool round-trips the argument.
-    let reply = call_bounded(&caller, b_id, "echo", echo_args("hi mesh"))
+    let reply = call_retry(&caller, b_id, "echo", || echo_args("hi mesh"))
         .await
         .expect("echo call succeeds");
     let result: CallToolResult =

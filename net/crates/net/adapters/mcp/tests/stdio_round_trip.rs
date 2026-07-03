@@ -114,3 +114,35 @@ async fn slow_tool_latency_is_tolerated() {
     assert!(!slow.is_error);
     assert_eq!(slow.text(), "slept 50ms");
 }
+
+#[tokio::test]
+async fn a_credential_env_never_appears_in_a_tool_result() {
+    // Token-leak regression (doctrine #100). A credential configured on a
+    // wrapped server lives in its child-process env and must never appear in a
+    // tool RESULT the bridge returns. This is one of only two things the bridge
+    // puts on the wire; the other — the capability announcement — is covered
+    // structurally by `wrap::session`'s unit tests.
+    const SENTINEL: &str = "SENTINEL-TOKEN-9f83aa-do-not-leak";
+
+    let envs = vec![("SECRET_TOKEN".to_string(), SENTINEL.to_string())];
+    let client = StdioMcpClient::spawn(FIXTURE, &[], &envs, client_info())
+        .await
+        .expect("spawn fixture with a credential");
+    within("initialize", client.initialize())
+        .await
+        .expect("initialize");
+
+    let echo = within(
+        "echo",
+        client.call_tool("echo", json!({ "message": "hello" })),
+    )
+    .await
+    .expect("echo");
+    let serialized = serde_json::to_string(&echo).expect("serialize result");
+    assert!(
+        !serialized.contains(SENTINEL),
+        "a wrapped credential must never appear in a tool result",
+    );
+    // The tool still works — only the credential is withheld.
+    assert_eq!(echo.text(), "hello");
+}
