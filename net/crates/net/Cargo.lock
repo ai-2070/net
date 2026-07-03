@@ -2492,6 +2492,8 @@ dependencies = [
 name = "net-mesh-mcp"
 version = "0.30.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "net-mesh-sdk",
  "serde",
  "serde_json",

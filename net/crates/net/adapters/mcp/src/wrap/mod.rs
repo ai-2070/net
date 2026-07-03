@@ -6,16 +6,21 @@
 //!   conservatively (unknown is gated like credentialed).
 //! - [`descriptor`] — lower a `tools/list` entry to `net_sdk::tool::ToolDescriptor`
 //!   plus the MCP-bridge metadata carried as `CapabilitySet` tags.
+//! - [`invoke`] — [`WrapInvokeHandler`]: bridge an incoming nRPC call to the
+//!   wrapped `tools/call`, gated by the caller's owner scope.
 //!
-//! Still to land (Phase 1): the nRPC → `tools/call` bridge (`invoke`) and
-//! the announce/serve wiring on the SDK provider surface.
+//! Still to land (Phase 1): the announce/serve wiring that discovers the
+//! wrapped tools, lowers them, and serves each [`WrapInvokeHandler`] on the
+//! mesh — plus the `net wrap` CLI command that drives it.
 
 pub mod credentials;
 pub mod descriptor;
+pub mod invoke;
 pub mod stdio;
 
 pub use credentials::{classify, CredentialOverride, CredentialStatus, WrapEnv};
 pub use descriptor::{lower_tool, LoweredTool, LoweringContext, Substitutability};
+pub use invoke::{OwnerScope, WrapInvokeHandler};
 pub use stdio::StdioMcpClient;
 
 use crate::spec::JsonRpcError;

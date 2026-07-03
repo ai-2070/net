@@ -28,6 +28,8 @@ net-mesh-sdk = { version = "0.30.0", path = "../../sdk", default-features = fals
     "net",
     "tool",
 ] }
+async-trait = "0.1"
+bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
