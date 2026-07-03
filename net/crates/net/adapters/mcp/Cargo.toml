@@ -36,6 +36,8 @@ thiserror = "2"
 tokio = { version = "1", features = ["process", "io-util", "rt", "sync", "time"] }
 
 [dev-dependencies]
+# Parses this crate's own manifest in the dependency-boundary test.
+toml = "1"
 tokio = { version = "1", features = [
     "process",
     "io-util",
