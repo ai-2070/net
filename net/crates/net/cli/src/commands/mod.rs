@@ -33,3 +33,4 @@ pub mod subnet;
 pub mod transfer;
 pub mod typegen;
 pub mod version;
+pub mod wrap;

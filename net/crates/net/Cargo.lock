@@ -2380,6 +2380,7 @@ dependencies = [
  "hex",
  "indicatif",
  "net-aggregator-daemon",
+ "net-mesh-mcp",
  "net-mesh-sdk",
  "predicates",
  "serde",
