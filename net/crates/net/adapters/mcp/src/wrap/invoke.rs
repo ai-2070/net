@@ -171,19 +171,31 @@ impl RpcHandler for WrapInvokeHandler {
                 message: e.to_string(),
             })?;
 
-        let body = encode_result(&result).map_err(RpcHandlerError::Internal)?;
+        // [4] Encode the result. Do it per-branch: a tool-level error returns
+        //     the full structured result as the ERR_TOOL body via
+        //     `tool_error_message` (which never fails — it can't mask the tool
+        //     error as an internal one); a success encodes the response body,
+        //     where an encode failure genuinely is internal.
         if result.is_error {
-            // Return the full encoded CallToolResult (JSON) as the error body,
-            // not just its text, so the caller keeps every content block and
-            // any structured_content the tool reported. `body` is the JSON we
-            // just serialized, so it is valid UTF-8.
             return Err(RpcHandlerError::Application {
                 code: ERR_TOOL,
-                message: String::from_utf8_lossy(&body).into_owned(),
+                message: tool_error_message(&result),
             });
         }
+        let body = encode_result(&result).map_err(RpcHandlerError::Internal)?;
         Ok(Self::ok(body))
     }
+}
+
+/// The `ERR_TOOL` error body for a tool-level failure: the full structured
+/// `CallToolResult` as JSON so the caller keeps every content block and any
+/// `structured_content`, falling back to just the text blocks if it
+/// (implausibly) won't serialize — so a tool error is never masked by an
+/// encode failure.
+fn tool_error_message(result: &CallToolResult) -> String {
+    encode_result(result)
+        .map(|body| String::from_utf8_lossy(&body).into_owned())
+        .unwrap_or_else(|_| result.text())
 }
 
 #[cfg(test)]
@@ -240,5 +252,20 @@ mod tests {
         let back: CallToolResult = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.text(), "hello");
         assert!(!back.is_error);
+    }
+
+    #[test]
+    fn tool_error_message_preserves_the_full_structured_result() {
+        let mut result = CallToolResult::text_error("boom");
+        result.structured_content = Some(serde_json::json!({ "code": 42 }));
+        // The ERR_TOOL body is the full JSON result, not just its text — so the
+        // caller keeps every content block and any structured_content.
+        let decoded: CallToolResult = serde_json::from_str(&tool_error_message(&result)).unwrap();
+        assert!(decoded.is_error);
+        assert_eq!(decoded.text(), "boom");
+        assert_eq!(
+            decoded.structured_content,
+            Some(serde_json::json!({ "code": 42 })),
+        );
     }
 }
