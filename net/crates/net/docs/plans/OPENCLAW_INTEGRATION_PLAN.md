@@ -1,6 +1,6 @@
 # Implementation Plan: OpenClaw Integration (grounded in openclaw/openclaw code)
 
-**Companion to:** `net-mcp-bridge-implementation-plan.md` (prerequisite) and `hermes-native-integration-plan.md` (the deeper native showcase). OpenClaw has the largest agent install base, and its single-gateway architecture is a natural complement to Net: this integration adds the multi-machine federation layer OpenClaw doesn't ship. The plan is deliberately lighter than the Hermes plan — MCP compatibility + mesh capabilities + selected native features, not the full migration showcase.
+**Companion to:** `MCP_BRIDGE_PLAN.md` (prerequisite) and `HERMES_INTEGRATION_PLAN.md` (the deeper native showcase). OpenClaw has the largest agent install base, and its single-gateway architecture is a natural complement to Net: this integration adds the multi-machine federation layer OpenClaw doesn't ship. The plan is deliberately lighter than the Hermes plan — MCP compatibility + mesh capabilities + selected native features, not the full migration showcase.
 
 **Repo ground truth** (verified against main, July 2026):
 

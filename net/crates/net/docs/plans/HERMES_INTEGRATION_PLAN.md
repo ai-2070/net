@@ -1,6 +1,6 @@
 # Implementation Plan: Hermes Native Integration (v2 — grounded in hermes-agent code)
 
-**Follow-up to:** `net-mcp-bridge-implementation-plan.md`. Bridge plan ships the wedge; this plan makes Hermes (github.com/NousResearch/hermes-agent) the native-citizen showcase.
+**Follow-up to:** `MCP_BRIDGE_PLAN.md`. Bridge plan ships the wedge; this plan makes Hermes (github.com/NousResearch/hermes-agent) the native-citizen showcase.
 
 **Repo ground truth this plan is built on** (verified against main, July 2026):
 
