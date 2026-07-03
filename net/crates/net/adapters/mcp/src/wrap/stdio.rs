@@ -17,7 +17,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{broadcast, oneshot, Mutex};
+use tokio::sync::{broadcast, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 
 use super::McpError;
@@ -50,6 +50,9 @@ struct Inner {
     next_id: AtomicI64,
     /// Fires once per `notifications/tools/list_changed` from the server.
     list_changed_tx: broadcast::Sender<()>,
+    /// Flips to `true` when the reader task ends (server stdout closed — a
+    /// clean exit or a crash). Backs [`StdioMcpClient::closed`].
+    closed_tx: watch::Sender<bool>,
 }
 
 impl Inner {
@@ -105,6 +108,7 @@ impl StdioMcpClient {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicI64::new(1),
             list_changed_tx: broadcast::channel(LIST_CHANGED_CAP).0,
+            closed_tx: watch::channel(false).0,
         });
         let reader = tokio::spawn(read_loop(Arc::clone(&inner), stdout));
 
@@ -162,6 +166,20 @@ impl StdioMcpClient {
     /// always learns that *a* change occurred.
     pub fn subscribe_list_changed(&self) -> broadcast::Receiver<()> {
         self.inner.list_changed_tx.subscribe()
+    }
+
+    /// Resolve when the wrapped server's stdout closes — a clean exit or a
+    /// crash. A driver can `select!` on this to withdraw the wrapped tools the
+    /// moment the server dies, rather than leaving stale capabilities up.
+    /// Returns immediately if it has already closed.
+    pub async fn closed(&self) {
+        let mut rx = self.inner.closed_tx.subscribe();
+        if *rx.borrow() {
+            return;
+        }
+        // Resolves when the reader sends `true` on exit, or (defensively) if
+        // the sender is dropped.
+        let _ = rx.changed().await;
     }
 
     /// Send a fire-and-forget notification (no response expected).
@@ -227,6 +245,8 @@ async fn read_loop(inner: Arc<Inner>, stdout: ChildStdout) {
     // Fail every outstanding request: dropping the senders resolves each
     // awaiting `rx` to a transport error rather than hanging forever.
     inner.pending.lock().await.clear();
+    // Signal closure so a driver can withdraw the wrapped tools.
+    let _ = inner.closed_tx.send(true);
 }
 
 /// A loosely-typed inbound message, classified by which fields are present.

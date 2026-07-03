@@ -148,6 +148,24 @@ async fn a_credential_env_never_appears_in_a_tool_result() {
 }
 
 #[tokio::test]
+async fn closed_fires_when_the_server_process_exits() {
+    // A process that exits immediately (not a real MCP server): its stdout
+    // closes, so `closed()` resolves — the crash-detection signal a driver uses
+    // to withdraw the wrapped tools.
+    let (program, args): (&str, Vec<String>) = if cfg!(windows) {
+        ("cmd", vec!["/C".to_string(), "exit".to_string()])
+    } else {
+        ("true", Vec::new())
+    };
+    let client = StdioMcpClient::spawn(program, &args, &[], client_info())
+        .await
+        .expect("spawn a short-lived process");
+    tokio::time::timeout(CALL_TIMEOUT, client.closed())
+        .await
+        .expect("closed() resolves when the process exits");
+}
+
+#[tokio::test]
 async fn big_tool_returns_a_large_payload() {
     let client = connect().await;
     within("initialize", client.initialize())

@@ -165,9 +165,20 @@ pub async fn run(
     // teardown the session drops (withdrawing services + stopping the child)
     // and the mesh shuts down.
     let mut changed = session.client().subscribe_list_changed();
+    // A separate Arc so the `closed()` select branch doesn't borrow `session`
+    // (which `refresh` borrows mutably in another branch's body).
+    let client = std::sync::Arc::clone(session.client());
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
+            // The wrapped server exited (clean or crash) — withdraw and stop.
+            _ = client.closed() => {
+                eprintln!("wrapped server exited; withdrawing capabilities.");
+                let _ = mesh
+                    .announce_capabilities(net_sdk::capabilities::CapabilitySet::new())
+                    .await;
+                break;
+            }
             recv = changed.recv() => match recv {
                 // A change (or a lagged signal) — reconcile the mesh.
                 Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -180,7 +191,7 @@ pub async fn run(
                         Err(e) => eprintln!("refresh failed: {e}"),
                     }
                 }
-                // The wrapped server closed its stdout — nothing left to serve.
+                // Broadcast channel closed (client dropped) — stop.
                 Err(broadcast::error::RecvError::Closed) => break,
             },
         }
