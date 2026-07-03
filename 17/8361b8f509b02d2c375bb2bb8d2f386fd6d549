@@ -1,0 +1,21 @@
+net/crates/net/adapters/mcp/src/wrap/invoke.rs
+  s_e2c6f41ae18f64::t_a459b528042aab 256-270
+  s_e2c6f41ae18f64::t_4a0d8c04af104f 174-178,182,185,190-198
+  s_e2c6f41ae18f64::t_78767e93c5634d 199-200
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "178361b8f509b02d2c375bb2bb8d2f386fd6d549",
+  "prompts": {},
+  "sessions": {
+    "s_e2c6f41ae18f64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dbc06b06-9d2b-4f28-a220-e736eee44f76",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
