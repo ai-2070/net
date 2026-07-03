@@ -79,9 +79,132 @@ pub struct JsonRpcError {
     pub data: Option<serde_json::Value>,
 }
 
+/// Standard JSON-RPC error code for invalid JSON (the server could not parse
+/// the line at all). Replied with a `null` id.
+pub const PARSE_ERROR: i64 = -32700;
+/// Standard JSON-RPC error code for a well-formed message that is not a valid
+/// request object (e.g. missing `method`).
+pub const INVALID_REQUEST: i64 = -32600;
 /// Standard JSON-RPC error code for a method the peer does not implement —
-/// what the client replies to any (unsupported) server-initiated request.
+/// what the client replies to any (unsupported) server-initiated request, and
+/// what the shim replies to an unknown MCP method.
 pub const METHOD_NOT_FOUND: i64 = -32601;
+/// Standard JSON-RPC error code for a recognised method called with
+/// malformed / missing params.
+pub const INVALID_PARAMS: i64 = -32602;
+/// Standard JSON-RPC error code for an internal server error.
+pub const INTERNAL_ERROR: i64 = -32603;
+
+// ---------------------------------------------------------------------------
+// Server-side envelopes (the `net mcp serve` shim direction)
+// ---------------------------------------------------------------------------
+//
+// The wrap client always chooses its own `i64` request ids ([`JsonRpcRequest`]),
+// but a *server* must reflect back whatever id the host chose — JSON-RPC allows
+// a string **or** a number — so the serve side carries these permissive forms.
+
+/// A JSON-RPC 2.0 request/response id: a number or a string. The shim echoes
+/// it back verbatim so the host can correlate the response with its request.
+///
+/// Number is tried first (the common case); a JSON string falls through to
+/// [`RequestId::Str`]. A `null` / absent id is modelled as `Option<RequestId>`
+/// at the use site, not as a variant here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum RequestId {
+    /// A numeric id (`{"id": 7}`).
+    Number(i64),
+    /// A string id (`{"id": "abc"}`).
+    Str(String),
+}
+
+/// How an incoming stdio line classifies once parsed. The stdio transport
+/// interleaves requests and notifications on one line stream, so the shim
+/// parses each line into an [`IncomingMessage`] then branches on this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncomingKind {
+    /// Has both `method` and `id` — expects exactly one response.
+    Request,
+    /// Has `method`, no `id` — fire-and-forget, no response.
+    Notification,
+    /// Has `id`, no `method` — a response to a server-initiated request. The
+    /// compat-tier shim sends no such requests, so these are ignored.
+    Response,
+    /// Neither `method` nor `id` — not a valid JSON-RPC message.
+    Malformed,
+}
+
+/// A parsed incoming stdio line, before it is classified into a request /
+/// notification. Every field is optional so a partially-formed message parses
+/// (and is then rejected with a crisp JSON-RPC error) rather than failing the
+/// whole read loop.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IncomingMessage {
+    #[serde(default)]
+    pub jsonrpc: String,
+    #[serde(default)]
+    pub id: Option<RequestId>,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub params: Option<serde_json::Value>,
+}
+
+impl IncomingMessage {
+    /// Classify the message by the presence of `method` / `id`.
+    pub fn kind(&self) -> IncomingKind {
+        match (self.method.is_some(), self.id.is_some()) {
+            (true, true) => IncomingKind::Request,
+            (true, false) => IncomingKind::Notification,
+            (false, true) => IncomingKind::Response,
+            (false, false) => IncomingKind::Malformed,
+        }
+    }
+}
+
+/// A JSON-RPC 2.0 success response the shim writes back to the host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JsonRpcSuccess {
+    pub jsonrpc: String,
+    pub id: RequestId,
+    pub result: serde_json::Value,
+}
+
+impl JsonRpcSuccess {
+    /// Build a success response with the JSON-RPC version tag filled in.
+    pub fn new(id: RequestId, result: serde_json::Value) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id,
+            result,
+        }
+    }
+}
+
+/// A JSON-RPC 2.0 error response. The `id` is serialized as `null` (never
+/// omitted — JSON-RPC requires the member present) when it could not be
+/// determined from a malformed request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JsonRpcErrorResponse {
+    pub jsonrpc: String,
+    pub id: Option<RequestId>,
+    pub error: JsonRpcError,
+}
+
+impl JsonRpcErrorResponse {
+    /// Build an error response for a known request id.
+    pub fn new(id: Option<RequestId>, code: i64, message: impl Into<String>) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id,
+            error: JsonRpcError {
+                code,
+                message: message.into(),
+                data: None,
+            },
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // initialize
@@ -338,5 +461,63 @@ mod tests {
         let back: CallToolResult = serde_json::from_value(v).unwrap();
         assert!(back.is_error);
         assert_eq!(back.text(), "boom");
+    }
+
+    #[test]
+    fn request_id_accepts_number_and_string() {
+        // A host may correlate with a number or a string id; both round-trip
+        // and reflect back verbatim.
+        let n: RequestId = serde_json::from_str("7").unwrap();
+        assert_eq!(n, RequestId::Number(7));
+        assert_eq!(serde_json::to_value(&n).unwrap(), serde_json::json!(7));
+
+        let s: RequestId = serde_json::from_str("\"abc\"").unwrap();
+        assert_eq!(s, RequestId::Str("abc".to_string()));
+        assert_eq!(serde_json::to_value(&s).unwrap(), serde_json::json!("abc"));
+    }
+
+    #[test]
+    fn incoming_message_classifies_request_notification_response_malformed() {
+        let req: IncomingMessage =
+            serde_json::from_value(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "x" }))
+                .unwrap();
+        assert_eq!(req.kind(), IncomingKind::Request);
+
+        let note: IncomingMessage =
+            serde_json::from_value(serde_json::json!({ "jsonrpc": "2.0", "method": "x" })).unwrap();
+        assert_eq!(note.kind(), IncomingKind::Notification);
+
+        let resp: IncomingMessage =
+            serde_json::from_value(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": {} }))
+                .unwrap();
+        assert_eq!(resp.kind(), IncomingKind::Response);
+
+        let bad: IncomingMessage =
+            serde_json::from_value(serde_json::json!({ "jsonrpc": "2.0" })).unwrap();
+        assert_eq!(bad.kind(), IncomingKind::Malformed);
+    }
+
+    #[test]
+    fn success_response_carries_jsonrpc_tag_and_echoes_id() {
+        let res = JsonRpcSuccess::new(
+            RequestId::Str("q".into()),
+            serde_json::json!({ "ok": true }),
+        );
+        let v = serde_json::to_value(&res).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], "q");
+        assert_eq!(v["result"]["ok"], true);
+    }
+
+    #[test]
+    fn error_response_serializes_null_id_when_unknown() {
+        // JSON-RPC requires the `id` member present even when it couldn't be
+        // determined — it must be `null`, not omitted.
+        let res = JsonRpcErrorResponse::new(None, PARSE_ERROR, "bad json");
+        let v = serde_json::to_value(&res).unwrap();
+        assert!(v.get("id").is_some(), "id member must be present");
+        assert_eq!(v["id"], serde_json::Value::Null);
+        assert_eq!(v["error"]["code"], PARSE_ERROR);
+        assert_eq!(v["error"]["message"], "bad json");
     }
 }
