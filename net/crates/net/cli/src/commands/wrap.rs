@@ -26,8 +26,32 @@ use tokio::sync::broadcast;
 use crate::commands::aggregator::RemoteAttachArgs;
 use crate::context::{require_remote_attach, resolve_profile, RemoteAttach};
 use crate::error::{connection_failure, generic, invalid_args, sdk, CliError};
-use crate::output::OutputFormat;
+use crate::output::{emit_stream_row, OutputFormat};
 use crate::parsers::parse_u64_flexible;
+
+/// A `net wrap` output event, emitted through the `--output` pipeline like
+/// every other command (`json` / `ndjson` / `yaml` / `table` / `text`). Wrap
+/// is long-running, so it emits a stream: one `wrapped` event, then a
+/// `tools_changed` / `server_exited` event per lifecycle transition.
+#[derive(serde::Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum WrapEvent<'a> {
+    /// The initial report: served + skipped tools and the scope.
+    Wrapped {
+        name: &'a str,
+        tools: &'a [String],
+        skipped: &'a [String],
+        visibility: &'a str,
+        scope: &'a str,
+    },
+    /// The wrapped server changed its tool set; the mesh was reconciled.
+    ToolsChanged {
+        added: Vec<String>,
+        removed: Vec<String>,
+    },
+    /// The wrapped server exited; capabilities were withdrawn.
+    ServerExited,
+}
 
 #[derive(Args, Debug)]
 pub struct WrapArgs {
@@ -77,7 +101,7 @@ pub struct WrapArgs {
 
 pub async fn run(
     args: WrapArgs,
-    _output: Option<OutputFormat>,
+    output: Option<OutputFormat>,
     config_path: Option<&Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
@@ -140,25 +164,20 @@ pub async fn run(
         .await
         .map_err(|e| sdk(format!("wrap failed: {e}")))?;
 
-    // Report what was wrapped.
-    println!(
-        "wrapped {} tool(s) from `{}`:",
-        session.tools().len(),
-        args.name
-    );
-    for tool in session.tools() {
-        println!("  {tool}");
-    }
-    if !session.skipped_tools().is_empty() {
-        eprintln!(
-            "skipped {} tool(s) whose names aren't valid service ids: {:?}",
-            session.skipped_tools().len(),
-            session.skipped_tools(),
-        );
-    }
-    println!("visibility: owner_only");
-    println!("scope: same_root_identity");
-    println!("serving — press Ctrl-C to stop.");
+    // Report what was wrapped through the `--output` pipeline. Wrap streams
+    // (report + lifecycle events), so it resolves the stream format.
+    let fmt = OutputFormat::resolve_stream(output);
+    emit_stream_row(
+        fmt,
+        &WrapEvent::Wrapped {
+            name: &args.name,
+            tools: session.tools(),
+            skipped: session.skipped_tools(),
+            visibility: "owner_only",
+            scope: "same_root_identity",
+        },
+    )
+    .map_err(|e| generic(format!("write output: {e}")))?;
 
     // Serve until Ctrl-C, refreshing whenever the wrapped server changes its
     // tool set (`tools/list_changed`) so bridged descriptors stay current. On
@@ -173,21 +192,27 @@ pub async fn run(
             _ = tokio::signal::ctrl_c() => break,
             // The wrapped server exited (clean or crash) — withdraw and stop.
             _ = client.closed() => {
-                eprintln!("wrapped server exited; withdrawing capabilities.");
                 let _ = mesh
                     .announce_capabilities(net_sdk::capabilities::CapabilitySet::new())
                     .await;
+                let _ = emit_stream_row(fmt, &WrapEvent::ServerExited);
                 break;
             }
             recv = changed.recv() => match recv {
                 // A change (or a lagged signal) — reconcile the mesh.
                 Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
                     match session.refresh(&mesh).await {
-                        Ok(delta) if !delta.is_empty() => println!(
-                            "tools changed: added {:?}, removed {:?}",
-                            delta.added, delta.removed,
-                        ),
+                        Ok(delta) if !delta.is_empty() => {
+                            let _ = emit_stream_row(
+                                fmt,
+                                &WrapEvent::ToolsChanged {
+                                    added: delta.added,
+                                    removed: delta.removed,
+                                },
+                            );
+                        }
                         Ok(_) => {}
+                        // Diagnostics stay on stderr, off the structured stdout stream.
                         Err(e) => eprintln!("refresh failed: {e}"),
                     }
                 }
