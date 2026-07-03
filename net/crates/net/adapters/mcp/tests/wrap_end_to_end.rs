@@ -213,9 +213,14 @@ async fn refresh_reconciles_the_tool_set_on_list_changed() {
     let mut session = wrap_server(&host, FIXTURE, &[], &[], config)
         .await
         .expect("wrap the fixture");
+    let before: Vec<String> = session.tools().to_vec();
     assert!(
-        !session.tools().iter().any(|t| t == "bonus"),
+        !before.iter().any(|t| t == "bonus"),
         "bonus is absent before the bump",
+    );
+    assert!(
+        before.iter().any(|t| t == "echo"),
+        "echo is served initially"
     );
 
     // Change the wrapped server's tool set (`_bump` makes `bonus` appear and the
@@ -232,6 +237,15 @@ async fn refresh_reconciles_the_tool_set_on_list_changed() {
         delta.added.contains(&"bonus".to_string()),
         "bonus is newly served: {delta:?}",
     );
+    assert!(delta.removed.is_empty(), "nothing was removed: {delta:?}");
+    // Every pre-existing tool must remain served — reconciliation adds without
+    // dropping tools that are still present.
+    for tool in &before {
+        assert!(
+            session.tools().iter().any(|t| t == tool),
+            "pre-existing tool {tool:?} must remain served after refresh",
+        );
+    }
     assert!(session.tools().iter().any(|t| t == "bonus"));
     assert!(
         host.find_nodes(&CapabilityFilter::new().require_tag("bonus"))
