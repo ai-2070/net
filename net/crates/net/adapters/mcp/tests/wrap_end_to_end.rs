@@ -201,3 +201,43 @@ async fn a_caller_outside_the_owner_scope_is_rejected() {
     caller.shutdown().await.ok();
     host.shutdown().await.ok();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refresh_reconciles_the_tool_set_on_list_changed() {
+    // Single node: `wrap_server` self-indexes its announcement and serves
+    // locally, so no peer is needed to observe the reconcile.
+    let host = build_mesh(&[0x45u8; 32]).await;
+
+    let mut config = WrapConfig::owner_only(client_info(), 0);
+    config.scope = OwnerScope::any();
+    let mut session = wrap_server(&host, FIXTURE, &[], &[], config)
+        .await
+        .expect("wrap the fixture");
+    assert!(
+        !session.tools().iter().any(|t| t == "bonus"),
+        "bonus is absent before the bump",
+    );
+
+    // Change the wrapped server's tool set (`_bump` makes `bonus` appear and the
+    // server emit tools/list_changed).
+    session
+        .client()
+        .call_tool("_bump", json!({}))
+        .await
+        .expect("bump");
+
+    // Refresh reconciles the mesh to the new set.
+    let delta = session.refresh(&host).await.expect("refresh");
+    assert!(
+        delta.added.contains(&"bonus".to_string()),
+        "bonus is newly served: {delta:?}",
+    );
+    assert!(session.tools().iter().any(|t| t == "bonus"));
+    assert!(
+        host.find_nodes(&CapabilityFilter::new().require_tag("bonus"))
+            .contains(&host.inner().node_id()),
+        "the host now announces the `bonus` tool",
+    );
+
+    host.shutdown().await.ok();
+}

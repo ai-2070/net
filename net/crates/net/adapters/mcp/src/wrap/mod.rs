@@ -22,7 +22,9 @@ pub mod stdio;
 pub use credentials::{classify, ClassifyError, CredentialOverride, CredentialStatus, WrapEnv};
 pub use descriptor::{lower_tool, LoweredTool, LoweringContext, Substitutability};
 pub use invoke::{OwnerScope, WrapInvokeHandler};
-pub use session::{build_capability_set, wrap_server, WrapConfig, WrapError, WrapSession};
+pub use session::{
+    build_capability_set, wrap_server, RefreshDelta, WrapConfig, WrapError, WrapSession,
+};
 pub use stdio::StdioMcpClient;
 
 use crate::spec::JsonRpcError;

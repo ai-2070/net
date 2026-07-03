@@ -13,6 +13,7 @@
 //! the capability) is a later hardening — for v0 the visibility / scope ride
 //! as announcement *metadata*, honest even before the full permission system.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use net_sdk::capabilities::CapabilitySet;
@@ -52,15 +53,37 @@ pub enum WrapError {
     },
 }
 
+/// What a [`WrapSession::refresh`] changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefreshDelta {
+    /// Tool ids newly served + announced.
+    pub added: Vec<String>,
+    /// Tool ids withdrawn (the wrapped server dropped them).
+    pub removed: Vec<String>,
+}
+
+impl RefreshDelta {
+    /// True when nothing changed.
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
+}
+
 /// A running wrap session: the announced + served tools of one wrapped MCP
 /// server. Drop to withdraw every service and stop the wrapped process.
 pub struct WrapSession {
     /// The connected client. Held so the wrapped process outlives the
     /// session; dropping it kills the child.
     client: Arc<StdioMcpClient>,
-    /// One serve handle per tool. Each reverses its `serve_rpc` on Drop.
-    _handles: Vec<ServeHandle>,
-    /// The tool ids served, for diagnostics.
+    /// `tool_id -> serve handle`. Dropping a handle reverses its `serve_rpc`.
+    /// Keyed so [`refresh`](Self::refresh) can reconcile against the new set.
+    handles: HashMap<String, ServeHandle>,
+    /// Lowering context reused when re-lowering on refresh (the wrapped
+    /// server's version + the per-wrap credential status / substitutability).
+    ctx: LoweringContext,
+    /// Owner scope reused when serving tools that appear on refresh.
+    scope: OwnerScope,
+    /// The tool ids served, sorted, for diagnostics.
     tools: Vec<String>,
     /// MCP tool names skipped because they aren't valid nRPC service ids
     /// (e.g. uppercase / non-charset-safe). Surfaced so the operator sees
@@ -83,6 +106,71 @@ impl WrapSession {
     /// The wrapped client (e.g. to subscribe to `tools/list_changed`).
     pub fn client(&self) -> &Arc<StdioMcpClient> {
         &self.client
+    }
+
+    /// Re-read the wrapped server's tools and reconcile the mesh: announce the
+    /// new set, serve tools that appeared, and withdraw tools that vanished.
+    /// Call this on a `tools/list_changed` notification (subscribe via
+    /// [`client`](Self::client)`().subscribe_list_changed()`) so bridged
+    /// descriptors stay current — "always up-to-date types" holds for bridged
+    /// tools too.
+    pub async fn refresh(&mut self, mesh: &Mesh) -> Result<RefreshDelta, WrapError> {
+        let (lowered, skipped) = discover_and_lower(&self.client, &self.ctx).await?;
+        let desired: HashSet<String> = lowered
+            .iter()
+            .map(|lt| lt.descriptor.tool_id.clone())
+            .collect();
+
+        // Announce the new set first — tags propagate only from the announced
+        // baseline (see `wrap_server`).
+        let caps = build_capability_set(&lowered);
+        mesh.announce_capabilities(caps)
+            .await
+            .map_err(|e| WrapError::Announce(e.to_string()))?;
+
+        // Serve tools that appeared.
+        let mut added = Vec::new();
+        for lt in &lowered {
+            let tool_id = lt.descriptor.tool_id.clone();
+            if !self.handles.contains_key(&tool_id) {
+                let handler = WrapInvokeHandler::new(
+                    Arc::clone(&self.client),
+                    tool_id.clone(),
+                    self.scope.clone(),
+                );
+                let handle =
+                    mesh.serve_rpc(&tool_id, Arc::new(handler))
+                        .map_err(|e| WrapError::Serve {
+                            tool: tool_id.clone(),
+                            reason: e.to_string(),
+                        })?;
+                self.handles.insert(tool_id.clone(), handle);
+                added.push(tool_id);
+            }
+        }
+        // Withdraw tools that vanished (dropping the handle reverses serve_rpc).
+        let removed: Vec<String> = self
+            .handles
+            .keys()
+            .filter(|id| !desired.contains(*id))
+            .cloned()
+            .collect();
+        for tool_id in &removed {
+            self.handles.remove(tool_id);
+        }
+
+        self.tools = self.handles.keys().cloned().collect();
+        self.tools.sort();
+        self.skipped = skipped;
+        added.sort();
+        Ok(RefreshDelta {
+            added,
+            removed: {
+                let mut r = removed;
+                r.sort();
+                r
+            },
+        })
     }
 }
 
@@ -163,22 +251,13 @@ pub async fn wrap_server(
     let client =
         Arc::new(StdioMcpClient::spawn(program, args, envs, config.client_info.clone()).await?);
     let init = client.initialize().await?;
-    let tools = client.list_tools().await?;
 
-    // Only tools whose name is a valid nRPC service id can be served; skip the
-    // rest so one non-conforming tool name doesn't fail the whole wrap.
-    let (serviceable, unserviceable): (Vec<_>, Vec<_>) = tools
-        .into_iter()
-        .partition(|t| is_serviceable_tool_id(&t.name));
-    let skipped: Vec<String> = unserviceable.into_iter().map(|t| t.name).collect();
-
-    // Lower every serviceable tool.
     let ctx = LoweringContext {
         server_version: init.server_info.version,
         credential_status,
         substitutability: config.substitutability,
     };
-    let lowered: Vec<LoweredTool> = serviceable.iter().map(|t| lower_tool(t, &ctx)).collect();
+    let (lowered, skipped) = discover_and_lower(&client, &ctx).await?;
 
     // Announce the tool set, then serve a handler for each. Announce must come
     // first: the substrate re-broadcasts the merged capability set as each
@@ -196,16 +275,14 @@ pub async fn wrap_server(
     // a failed startup never leaves stale, uninvocable capabilities
     // discoverable: drop the handles served so far (each reverses its
     // `serve_rpc`) and withdraw the announcement before returning the error.
-    let mut handles = Vec::with_capacity(lowered.len());
-    let mut served = Vec::with_capacity(lowered.len());
+    let mut handles: HashMap<String, ServeHandle> = HashMap::with_capacity(lowered.len());
     for lt in &lowered {
         let tool_id = lt.descriptor.tool_id.clone();
         let handler =
             WrapInvokeHandler::new(Arc::clone(&client), tool_id.clone(), config.scope.clone());
         match mesh.serve_rpc(&tool_id, Arc::new(handler)) {
             Ok(handle) => {
-                handles.push(handle);
-                served.push(tool_id);
+                handles.insert(tool_id, handle);
             }
             Err(e) => {
                 drop(handles);
@@ -219,12 +296,34 @@ pub async fn wrap_server(
         }
     }
 
+    let mut tools: Vec<String> = handles.keys().cloned().collect();
+    tools.sort();
     Ok(WrapSession {
         client,
-        _handles: handles,
-        tools: served,
+        handles,
+        ctx,
+        scope: config.scope,
+        tools,
         skipped,
     })
+}
+
+/// Discover the wrapped server's tools and lower the serviceable ones,
+/// returning `(lowered, skipped_names)`. Shared by [`wrap_server`] and
+/// [`WrapSession::refresh`].
+async fn discover_and_lower(
+    client: &StdioMcpClient,
+    ctx: &LoweringContext,
+) -> Result<(Vec<LoweredTool>, Vec<String>), WrapError> {
+    let tools = client.list_tools().await?;
+    // Only tools whose name is a valid nRPC service id can be served; skip the
+    // rest so one non-conforming tool name doesn't fail the whole wrap.
+    let (serviceable, unserviceable): (Vec<_>, Vec<_>) = tools
+        .into_iter()
+        .partition(|t| is_serviceable_tool_id(&t.name));
+    let skipped: Vec<String> = unserviceable.into_iter().map(|t| t.name).collect();
+    let lowered: Vec<LoweredTool> = serviceable.iter().map(|t| lower_tool(t, ctx)).collect();
+    Ok((lowered, skipped))
 }
 
 #[cfg(test)]

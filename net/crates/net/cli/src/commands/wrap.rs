@@ -21,6 +21,7 @@ use net_mcp::spec::Implementation;
 use net_mcp::wrap::{wrap_server, CredentialOverride, Substitutability, WrapConfig};
 use net_sdk::identity::Identity;
 use net_sdk::{Mesh, MeshBuilder};
+use tokio::sync::broadcast;
 
 use crate::commands::aggregator::RemoteAttachArgs;
 use crate::context::{require_remote_attach, resolve_profile, RemoteAttach};
@@ -135,7 +136,7 @@ pub async fn run(
         config.scope.allow(origin);
     }
 
-    let session = wrap_server(&mesh, program, prog_args, &envs, config)
+    let mut session = wrap_server(&mesh, program, prog_args, &envs, config)
         .await
         .map_err(|e| sdk(format!("wrap failed: {e}")))?;
 
@@ -159,11 +160,31 @@ pub async fn run(
     println!("scope: same_root_identity");
     println!("serving — press Ctrl-C to stop.");
 
-    // Serve until Ctrl-C, then tear down: dropping the session withdraws the
-    // services and stops the wrapped process; the mesh shuts down after.
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|e| generic(format!("failed to wait for Ctrl-C: {e}")))?;
+    // Serve until Ctrl-C, refreshing whenever the wrapped server changes its
+    // tool set (`tools/list_changed`) so bridged descriptors stay current. On
+    // teardown the session drops (withdrawing services + stopping the child)
+    // and the mesh shuts down.
+    let mut changed = session.client().subscribe_list_changed();
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            recv = changed.recv() => match recv {
+                // A change (or a lagged signal) — reconcile the mesh.
+                Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                    match session.refresh(&mesh).await {
+                        Ok(delta) if !delta.is_empty() => println!(
+                            "tools changed: added {:?}, removed {:?}",
+                            delta.added, delta.removed,
+                        ),
+                        Ok(_) => {}
+                        Err(e) => eprintln!("refresh failed: {e}"),
+                    }
+                }
+                // The wrapped server closed its stdout — nothing left to serve.
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+        }
+    }
     drop(session);
     mesh.shutdown().await.ok();
     Ok(())
