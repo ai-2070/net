@@ -1,0 +1,27 @@
+.claude/skills/net-event-bus/mcp.md
+  s_cdbc9688784d9a::t_f0b19ed0cb5b97 16
+  s_cdbc9688784d9a::t_0faa163dab3470 158-159
+  s_cdbc9688784d9a::t_c450f88e1218a6 8
+  s_cdbc9688784d9a::t_44d0cc5139fc4c 115-142
+.claude/skills/net-event-bus/SKILL.md
+  s_cdbc9688784d9a::t_17804ef34415c3 3
+  s_cdbc9688784d9a::t_c263334ad91b1f 6
+  s_cdbc9688784d9a::t_8351409c22c17d 74
+  s_cdbc9688784d9a::t_9609ab857edb1a 31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "34da75b9ed6931651e6ab6ecb3962bd0da2277e5",
+  "prompts": {},
+  "sessions": {
+    "s_cdbc9688784d9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9dbd24f-9e9a-4ea5-badd-11a26dc79e3a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
