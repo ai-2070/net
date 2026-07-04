@@ -109,6 +109,16 @@ pub use target::{
     InjectionTarget, WrapTransport, RISK_TAG_ACCEPTS_FORWARDED_CREDENTIALS,
 };
 
+/// Best-effort **volatile, full-capacity** scrub of a secret byte buffer — the
+/// same primitive [`ForwardedHeaderValue`] uses on drop (see
+/// [`header::zeroize_vec`]). Exposed for the value-entry CLI (`net forwarding
+/// set-value`), which must wipe the plaintext secret it read from stdin with a
+/// store the optimizer can't elide and that covers spare capacity, not a plain
+/// `= 0` loop that misses both.
+pub fn zeroize_secret(buf: &mut Vec<u8>) {
+    header::zeroize_vec(buf);
+}
+
 /// The forwarded-context object's type name, without version.
 pub const OBJECT_TYPE: &str = "net.invoke.forwarded_context";
 
@@ -127,3 +137,19 @@ pub const DEFAULT_TTL_SECS: u64 = 30;
 /// Hard cap on a forwarded-context TTL. A context asking for more is refused
 /// by [`ForwardedContext::validate`].
 pub const MAX_TTL_SECS: u64 = 300;
+
+#[cfg(test)]
+mod tests {
+    use super::zeroize_secret;
+
+    #[test]
+    fn zeroize_secret_scrubs_full_capacity() {
+        // The public value-entry helper must grow to capacity and volatile-zero
+        // every byte — spare capacity included — not just the live length.
+        let mut v = Vec::with_capacity(32);
+        v.extend_from_slice(b"ghp_SUPERSECRET");
+        zeroize_secret(&mut v);
+        assert_eq!(v.len(), 32, "grown to capacity so spare bytes are scrubbed too");
+        assert!(v.iter().all(|&b| b == 0), "every byte is zero");
+    }
+}

@@ -129,7 +129,9 @@ pub async fn run(
 /// trailing newline is stripped. The value is never echoed back.
 #[cfg(feature = "keychain")]
 async fn set_value(args: SetValueArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
-    use net_mcp::forward::{validate_ref_name, KeychainSecretBackend, DEFAULT_KEYCHAIN_SERVICE};
+    use net_mcp::forward::{
+        validate_ref_name, zeroize_secret, KeychainSecretBackend, DEFAULT_KEYCHAIN_SERVICE,
+    };
     use tokio::io::AsyncReadExt;
 
     // Reject a mistyped ref name before reading the secret: the keychain account
@@ -139,26 +141,32 @@ async fn set_value(args: SetValueArgs, output: Option<OutputFormat>) -> Result<(
     validate_ref_name(&args.ref_name).map_err(|e| invalid_args(e.to_string()))?;
 
     let mut buf = Vec::new();
-    tokio::io::stdin()
-        .read_to_end(&mut buf)
-        .await
-        .map_err(|e| generic(format!("read secret from stdin: {e}")))?;
-    // Strip one trailing newline (`\n` or `\r\n`) from the piped value.
-    if buf.last() == Some(&b'\n') {
-        buf.pop();
-        if buf.last() == Some(&b'\r') {
+    // Read + store inside a fallible block so the plaintext buffer is scrubbed on
+    // *every* exit path (read error, empty, store error, or success), with a
+    // volatile full-capacity wipe rather than an elidable `= 0` loop.
+    let outcome = async {
+        tokio::io::stdin()
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| generic(format!("read secret from stdin: {e}")))?;
+        // Strip one trailing newline (`\n` or `\r\n`) from the piped value.
+        if buf.last() == Some(&b'\n') {
             buf.pop();
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
         }
+        if buf.is_empty() {
+            return Err(invalid_args("no secret value on stdin (pipe the value in)"));
+        }
+        KeychainSecretBackend::default()
+            .set(&args.ref_name, &buf)
+            .await
+            .map_err(|e| generic(format!("store secret in keychain: {e}")))
     }
-    if buf.is_empty() {
-        return Err(invalid_args("no secret value on stdin (pipe the value in)"));
-    }
-
-    let backend = KeychainSecretBackend::default();
-    let result = backend.set(&args.ref_name, &buf).await;
-    // Best-effort scrub of the local plaintext copy regardless of outcome.
-    buf.iter_mut().for_each(|b| *b = 0);
-    result.map_err(|e| generic(format!("store secret in keychain: {e}")))?;
+    .await;
+    zeroize_secret(&mut buf);
+    outcome?;
 
     emit_row(
         output,
