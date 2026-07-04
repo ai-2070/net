@@ -1,0 +1,21 @@
+web/src/content/docs/reference/mcp-bridge.md
+  s_cdbc9688784d9a::t_30816b12dbb1b2 163-172
+.claude/skills/net-event-bus/mcp.md
+  s_cdbc9688784d9a::t_2bafad9a45a2bd 136
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "270b86be6ad9d33358732fa17e0d008ace7204dc",
+  "prompts": {},
+  "sessions": {
+    "s_cdbc9688784d9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9dbd24f-9e9a-4ea5-badd-11a26dc79e3a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
