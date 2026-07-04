@@ -1,0 +1,37 @@
+web/src/content/docs/sdk/typescript/discover.md
+  s_f75d64212a7389::t_e5ba4e8fd77c7f 1-49
+web/src/content/docs/sdk/typescript/invoke.md
+  s_f75d64212a7389::t_0393c4ecf04bd4 1-65
+web/src/content/docs/sdk/typescript/watch.md
+  s_f75d64212a7389::t_ea2c7645f37018 1-45
+web/src/content/docs/sdk/typescript/artifacts.md
+  s_f75d64212a7389::t_83468c9a5237ad 1-49
+web/src/content/docs/sdk/typescript/README.md
+  s_f75d64212a7389::t_e5c7041c2f6b28 1-30
+web/src/content/docs/sdk/typescript/announce.md
+  s_f75d64212a7389::t_b04941c172b030 1-59
+web/src/content/docs/sdk/typescript/quickstart.md
+  s_f75d64212a7389::t_63213b04b30f74 1-58
+web/src/content/docs/sdk/typescript/errors.md
+  s_f75d64212a7389::t_131ee2a3d313b5 1-80
+web/src/docs.order.ts
+  s_f75d64212a7389::t_6eb26a989055d0 201-208
+  s_f75d64212a7389::t_0903fa5509a910 41-49
+  s_f75d64212a7389::t_5552f1bed30792 253-254,256
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ab0705b79c7758033270108feab61c2100eba9e8",
+  "prompts": {},
+  "sessions": {
+    "s_f75d64212a7389": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6139e8e8-9ce9-4dfc-9412-193afe6af8d2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
