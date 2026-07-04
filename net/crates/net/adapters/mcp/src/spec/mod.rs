@@ -109,11 +109,17 @@ pub const INTERNAL_ERROR: i64 = -32603;
 /// Number is tried first (the common case); a JSON string falls through to
 /// [`RequestId::Str`]. A `null` / absent id is modelled as `Option<RequestId>`
 /// at the use site, not as a variant here.
+///
+/// The numeric variant carries a raw [`serde_json::Number`], not an `i64`, so
+/// **any** JSON number the host chose round-trips losslessly — including one
+/// outside `i64` range or (against the spec's advice) fractional. Modelling it
+/// as `i64` made such an id fail the *whole* `IncomingMessage` parse, so the
+/// shim answered `PARSE_ERROR` with a `null` id the host could not correlate.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum RequestId {
-    /// A numeric id (`{"id": 7}`).
-    Number(i64),
+    /// A numeric id (`{"id": 7}`), preserved verbatim as a JSON number.
+    Number(serde_json::Number),
     /// A string id (`{"id": "abc"}`).
     Str(String),
 }
@@ -468,12 +474,28 @@ mod tests {
         // A host may correlate with a number or a string id; both round-trip
         // and reflect back verbatim.
         let n: RequestId = serde_json::from_str("7").unwrap();
-        assert_eq!(n, RequestId::Number(7));
+        assert_eq!(n, RequestId::Number(serde_json::Number::from(7)));
         assert_eq!(serde_json::to_value(&n).unwrap(), serde_json::json!(7));
 
         let s: RequestId = serde_json::from_str("\"abc\"").unwrap();
         assert_eq!(s, RequestId::Str("abc".to_string()));
         assert_eq!(serde_json::to_value(&s).unwrap(), serde_json::json!("abc"));
+    }
+
+    #[test]
+    fn request_id_round_trips_a_number_outside_i64_range() {
+        // Regression (F12): a numeric id larger than i64::MAX must not fail the
+        // whole IncomingMessage parse — it round-trips as a raw JSON number so
+        // the shim can echo it back and the host can correlate the response.
+        let big = "12345678901234567890"; // > i64::MAX
+        let msg: IncomingMessage =
+            serde_json::from_str(&format!(r#"{{"jsonrpc":"2.0","id":{big},"method":"x"}}"#))
+                .expect("an out-of-i64-range id must still parse");
+        assert_eq!(msg.kind(), IncomingKind::Request);
+        let id = msg.id.expect("id present");
+        // Echoing it into a response reproduces the original number verbatim.
+        let echoed = serde_json::to_value(&JsonRpcSuccess::new(id, serde_json::json!({}))).unwrap();
+        assert_eq!(echoed["id"], serde_json::json!(12345678901234567890u64));
     }
 
     #[test]
