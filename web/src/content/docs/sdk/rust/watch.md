@@ -11,6 +11,7 @@ On a `Net` node, subscribe for a type and consume the stream:
 
 ```rust
 use net_sdk::{Net, stream::SubscribeOpts};
+use futures::StreamExt;   // brings `.next()` onto the stream
 
 #[derive(serde::Deserialize, Debug)]
 struct TemperatureReading { sensor_id: String, celsius: f64 }

@@ -15,15 +15,24 @@ import { TypedMeshRpc } from '@net-mesh/core/mesh_rpc';
 interface SummarizeReq  { text: string }
 interface SummarizeResp { summary: string }
 
-// Provider side.
-const serverRpc = TypedMeshRpc.fromMesh((server as any)._native);
+const psk = new Uint8Array(32).fill(0x42);
+const server = await MeshNode.create({ bindAddr: '127.0.0.1:9001', psk });
+const client = await MeshNode.create({ bindAddr: '127.0.0.1:9000', psk });
+// (handshake the two nodes — see the mesh setup guide)
+
+const summarize = (text: string): string => text.slice(0, 40);
+
+// Provider side. NOTE: `_native` is an internal handle — sdk-ts does not yet
+// re-export TypedMeshRpc, so you reach through it. This is the one place the docs
+// touch a private field; expect a public accessor to replace it.
+const serverRpc = TypedMeshRpc.fromMesh((server as unknown as { _native: unknown })._native);
 const handle = serverRpc.serve<SummarizeReq, SummarizeResp>(
   'summarize',
   async (req) => ({ summary: summarize(req.text) }),
 );
 
 // Caller side — typed call with a deadline.
-const clientRpc = TypedMeshRpc.fromMesh((client as any)._native);
+const clientRpc = TypedMeshRpc.fromMesh((client as unknown as { _native: unknown })._native);
 const reply = await clientRpc.call<SummarizeReq, SummarizeResp>(
   server.nodeId(), 'summarize',
   { text: '…' },

@@ -28,9 +28,11 @@ func main() {
         log.Fatal(err)
     }
     // Or ingest a Go value (serialized to JSON).
-    _ = bus.Ingest(map[string]any{"sensor": "radar", "range_m": 45.0})
+    if err := bus.Ingest(map[string]any{"sensor": "radar", "range_m": 45.0}); err != nil {
+        log.Fatal(err)
+    }
 
-    // Poll — cursor-paginated. "" starts from the current tail.
+    // Poll — cursor-paginated. "" starts from the earliest buffered event.
     resp, err := bus.Poll(100, "")
     if err != nil {
         log.Fatal(err)

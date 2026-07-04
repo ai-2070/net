@@ -5,20 +5,26 @@ backpressure is safe to retry blindly.**
 
 ## Classed exceptions on the mesh
 
-Stream and connection failures are exception subclasses you catch by type:
+`BackpressureError` and `NotConnectedError` are raised by the **reliable
+mesh-stream send** path on `MeshNode` — `send_on_stream` (and `send_blocking`) —
+not by the bus `emit` (which drops under load rather than raising). Catch them by
+type:
 
 ```python
 from net_sdk import MeshNode, BackpressureError, NotConnectedError
 
 try:
-    node.send(...)
+    node.send_on_stream(stream, [payload])   # `stream` is an open MeshStream
 except BackpressureError:
-    # window full — the only blindly-retry-safe case (or use the send-with-retry helper)
+    # window full — the only blindly-retry-safe case
     ...
 except NotConnectedError:
     # connection lost — a state change, not a retry
     ...
 ```
+
+`MeshNode.send_with_retry(...)` retries `BackpressureError` for you (5 ms → 200 ms
+backoff), so prefer it over hand-rolling the loop above.
 
 - **`BackpressureError`** — the ring buffer/window was full. Retry with backoff, or
   slow the producer. The *only* error a blind retry can fix.

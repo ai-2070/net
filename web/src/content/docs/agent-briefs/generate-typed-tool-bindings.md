@@ -27,9 +27,10 @@ client code — and gate CI on breaking schema changes — using `net-mesh typeg
    net-mesh typegen generate --language ts --from-snapshot tools.snapshot.json --out ./generated
    ```
 
-3. **Gate CI on breaking changes.** In CI, diff the committed snapshot against the
-   current mesh (or a fresh snapshot):
+3. **Gate CI on breaking changes.** In CI, capture a fresh snapshot from the live
+   mesh, then diff the committed one against it:
    ```
+   net-mesh typegen snapshot --tag weather --out new.snapshot.json
    net-mesh typegen diff --from tools.snapshot.json --to new.snapshot.json --exit-code
    ```
 

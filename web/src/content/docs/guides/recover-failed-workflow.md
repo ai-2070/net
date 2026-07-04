@@ -74,7 +74,7 @@ mid-run and the next invoke lands on the standby.
 Call by service name (not a pinned node id) to get this for free:
 
 ```rust
-let resp: SummarizeResp = caller.call_service_typed("summarize", &req, opts).await?;
+let resp: SummarizeResp = caller.call_service_typed("summarize", &req, CallOptions::default()).await?;
 ```
 
 ## Multi-step work: the task lifecycle
