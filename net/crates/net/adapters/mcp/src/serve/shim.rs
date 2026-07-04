@@ -16,12 +16,15 @@
 //! `AsyncBufRead` / `AsyncWrite`, so tests drive it over an in-memory pipe and
 //! the CLI drives it over real stdio.
 
+use std::path::PathBuf;
+
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::backend::{CapabilityGateway, CapabilityId, GatewayError};
 use super::consent::ConsentPolicy;
+use super::pins::PinStore;
 use super::{
     meta_tools, requires_approval_message, validation, MSG_DENIED_BY_WRAPPER, MSG_NO_CAPABILITIES,
 };
@@ -37,6 +40,11 @@ pub struct Shim<G> {
     gateway: G,
     consent: ConsentPolicy,
     server_info: Implementation,
+    /// Path to the persistent, machine-shared pin store. When set, an approved
+    /// pin there satisfies consent, `net_request_pin` records a pending request
+    /// there, and it is reloaded per call so an out-of-band `net mcp pin
+    /// approve` is seen immediately. `None` in tests keeps consent in-memory.
+    pin_store_path: Option<PathBuf>,
     /// Set once the host sends `notifications/initialized`. Tracked for
     /// completeness; the stateless shim answers regardless.
     initialized: bool,
@@ -52,6 +60,7 @@ impl<G: CapabilityGateway> Shim<G> {
                 name: "net".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
+            pin_store_path: None,
             initialized: false,
         }
     }
@@ -60,6 +69,31 @@ impl<G: CapabilityGateway> Shim<G> {
     pub fn with_consent(mut self, consent: ConsentPolicy) -> Self {
         self.consent = consent;
         self
+    }
+
+    /// Back consent with the persistent pin store at `path` (Phase 3): approved
+    /// pins there admit an otherwise-gated capability, and `net_request_pin`
+    /// records pending requests there.
+    pub fn with_pin_store(mut self, path: PathBuf) -> Self {
+        self.pin_store_path = Some(path);
+        self
+    }
+
+    /// Load the pin store, if one is configured. A read/parse error yields
+    /// `None` — a broken store must never *grant* consent (fail closed).
+    async fn load_pins(&self) -> Option<PinStore> {
+        match &self.pin_store_path {
+            Some(path) => PinStore::load(path).await.ok(),
+            None => None,
+        }
+    }
+
+    /// Does invoking `id` (with `status`) still require approval, given the
+    /// static consent policy and an already-loaded pin store snapshot? An
+    /// approved store pin admits it; otherwise the consent rule stands.
+    fn gated_after_pins(&self, id: &CapabilityId, status: &str, pins: &Option<PinStore>) -> bool {
+        self.consent.requires_approval(id, status)
+            && !pins.as_ref().map(|p| p.is_approved(id)).unwrap_or(false)
     }
 
     /// Run the server loop until the host closes stdin (EOF). Each non-empty
@@ -192,8 +226,8 @@ impl<G: CapabilityGateway> Shim<G> {
             n if n == meta_tools::name::SEARCH => self.tool_search(args).await,
             n if n == meta_tools::name::DESCRIBE => self.tool_describe(args).await,
             n if n == meta_tools::name::INVOKE => self.tool_invoke(args).await,
-            n if n == meta_tools::name::LIST_PINNED => self.tool_list_pinned(),
-            n if n == meta_tools::name::REQUEST_PIN => self.tool_request_pin(args),
+            n if n == meta_tools::name::LIST_PINNED => self.tool_list_pinned().await,
+            n if n == meta_tools::name::REQUEST_PIN => self.tool_request_pin(args).await,
             other => CallToolResult::text_error(format!(
                 "unknown tool `{other}`. This server exposes meta-tools only: \
                  {}, {}, {}, {}, {}. Use net_search_capabilities to find mesh tools.",
@@ -218,6 +252,7 @@ impl<G: CapabilityGateway> Shim<G> {
         if summaries.is_empty() {
             return CallToolResult::text_ok(MSG_NO_CAPABILITIES);
         }
+        let pins = self.load_pins().await;
         let rows: Vec<Value> = summaries
             .iter()
             .map(|s| {
@@ -227,9 +262,7 @@ impl<G: CapabilityGateway> Shim<G> {
                     "description": s.description,
                     "compat_tier": s.compat_tier,
                     "credential_status": s.credential_status,
-                    "requires_approval": self
-                        .consent
-                        .requires_approval(&s.id, &s.credential_status),
+                    "requires_approval": self.gated_after_pins(&s.id, &s.credential_status, &pins),
                 })
             })
             .collect();
@@ -245,6 +278,7 @@ impl<G: CapabilityGateway> Shim<G> {
             Ok(d) => d,
             Err(e) => return CallToolResult::text_error(gateway_error_text(&e)),
         };
+        let pins = self.load_pins().await;
         json_result(json!({
             "cap_id": detail.id.display(),
             "name": detail.name,
@@ -255,9 +289,11 @@ impl<G: CapabilityGateway> Shim<G> {
             "credential_status": detail.credential_status,
             "substitutability": detail.substitutability,
             "version": detail.version,
-            "requires_approval": self
-                .consent
-                .requires_approval(&detail.id, &detail.credential_status),
+            "requires_approval": self.gated_after_pins(
+                &detail.id,
+                &detail.credential_status,
+                &pins,
+            ),
         }))
     }
 
@@ -285,11 +321,11 @@ impl<G: CapabilityGateway> Shim<G> {
         }
 
         // [2] Consent gate — credentialed / external / unknown need local
-        //     approval. Display never implied invocation.
-        if self
-            .consent
-            .requires_approval(&id, &detail.credential_status)
-        {
+        //     approval (an allowlist entry or an approved pin). Display never
+        //     implied invocation. The pin store is reloaded here so an
+        //     out-of-band `net mcp pin approve` takes effect immediately.
+        let pins = self.load_pins().await;
+        if self.gated_after_pins(&id, &detail.credential_status, &pins) {
             return CallToolResult::text_error(requires_approval_message(&id.display()));
         }
 
@@ -305,19 +341,42 @@ impl<G: CapabilityGateway> Shim<G> {
         }
     }
 
-    fn tool_list_pinned(&self) -> CallToolResult {
-        let pinned: Vec<String> = self.consent.pinned().map(|id| id.display()).collect();
-        json_result(json!({ "pinned": pinned }))
+    async fn tool_list_pinned(&self) -> CallToolResult {
+        // Approved pins come from the persistent store (shared across shims)
+        // plus any in-memory pins (tests / static allowlist-as-pin).
+        let mut pinned: std::collections::BTreeSet<String> =
+            self.consent.pinned().map(|id| id.display()).collect();
+        if let Some(store) = self.load_pins().await {
+            for id in store.approved() {
+                pinned.insert(id.display());
+            }
+        }
+        json_result(json!({ "pinned": pinned.into_iter().collect::<Vec<_>>() }))
     }
 
-    fn tool_request_pin(&self, args: &Value) -> CallToolResult {
+    async fn tool_request_pin(&self, args: &Value) -> CallToolResult {
         let id = match parse_cap_id_arg(args) {
             Ok(id) => id,
             Err(e) => return CallToolResult::text_error(e),
         };
-        // v0: creating the pending request + persisting it is Phase 3. Here we
-        // return the out-of-band approval instructions so the model learns the
-        // consent step it cannot perform itself.
+        // Record a *pending* request in the shared store — never an approval.
+        // Moving pending → approved happens only through `net mcp pin approve`,
+        // outside the model loop (the plan's rule: the model must not approve
+        // its own future access).
+        if let Some(path) = &self.pin_store_path {
+            let mut store = match PinStore::load(path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    return CallToolResult::text_error(format!("could not read the pin store: {e}"))
+                }
+            };
+            store.request(&id);
+            if let Err(e) = store.save().await {
+                return CallToolResult::text_error(format!(
+                    "could not record the pin request: {e}"
+                ));
+            }
+        }
         CallToolResult::text_ok(format!(
             "Pin requested for `{}`. A human must approve it out of band before it \
              becomes usable: run `net mcp pin approve {}`. Requesting a pin grants \
@@ -409,8 +468,10 @@ mod tests {
     use super::*;
     use crate::serve::backend::{CapabilityDetail, CapabilitySummary};
     use crate::serve::consent::ConsentPolicy;
+    use crate::serve::pins::PinStore;
     use async_trait::async_trait;
     use std::collections::HashSet;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::io::{AsyncWriteExt, BufReader};
@@ -526,15 +587,38 @@ mod tests {
         run_raw(gateway, consent, &lines).await
     }
 
+    /// Like [`run`] but backing the shim with a persistent pin store at `path`.
+    async fn run_pinned(
+        gateway: InMemoryGateway,
+        consent: ConsentPolicy,
+        path: PathBuf,
+        input: &[Value],
+    ) -> Vec<Value> {
+        let lines: Vec<String> = input.iter().map(|v| v.to_string()).collect();
+        run_inner(gateway, consent, Some(path), &lines).await
+    }
+
     /// Like [`run`] but with raw (possibly non-JSON) input lines.
     async fn run_raw(
         gateway: InMemoryGateway,
         consent: ConsentPolicy,
         lines: &[String],
     ) -> Vec<Value> {
+        run_inner(gateway, consent, None, lines).await
+    }
+
+    async fn run_inner(
+        gateway: InMemoryGateway,
+        consent: ConsentPolicy,
+        pin_path: Option<PathBuf>,
+        lines: &[String],
+    ) -> Vec<Value> {
         let (client, server) = tokio::io::duplex(256 * 1024);
         let (server_rd, server_wr) = tokio::io::split(server);
-        let shim = Shim::new(gateway).with_consent(consent);
+        let mut shim = Shim::new(gateway).with_consent(consent);
+        if let Some(path) = pin_path {
+            shim = shim.with_pin_store(path);
+        }
         let handle =
             tokio::spawn(async move { shim.serve(BufReader::new(server_rd), server_wr).await });
 
@@ -905,5 +989,114 @@ mod tests {
         assert_eq!(out[0]["id"], 1);
         assert_eq!(out[1]["id"], 2);
         assert_eq!(out[2]["id"], 3);
+    }
+
+    // --- Phase 3: persistent pin store ------------------------------------
+
+    fn pin_path() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn request_pin_records_a_pending_request_but_does_not_admit() {
+        let (_dir, path) = pin_path();
+        let gw = gateway_with_echo_and_secret();
+        let calls = gw.invoke_calls.clone();
+        let out = run_pinned(
+            gw,
+            ConsentPolicy::new(),
+            path.clone(),
+            &[
+                // The model requests a pin...
+                call(
+                    1,
+                    meta_tools::name::REQUEST_PIN,
+                    json!({ "cap_id": "nodeb/secret" }),
+                ),
+                // ...then immediately tries to invoke — must still be blocked.
+                call(
+                    2,
+                    meta_tools::name::INVOKE,
+                    json!({ "cap_id": "nodeb/secret", "arguments": { "message": "x" } }),
+                ),
+            ],
+        )
+        .await;
+
+        let requested = tool_result(&out[0]);
+        assert!(!requested.is_error);
+        assert!(requested
+            .text()
+            .contains("net mcp pin approve nodeb/secret"));
+
+        let invoked = tool_result(&out[1]);
+        assert!(invoked.is_error, "a mere request must not grant access");
+        assert!(invoked.text().contains("net mcp pin approve nodeb/secret"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "blocked call never reached provider"
+        );
+
+        // The store holds a pending (not approved) record — the model cannot
+        // approve its own access.
+        let store = PinStore::load(&path).await.unwrap();
+        assert_eq!(
+            store.state(&CapabilityId::parse("nodeb/secret").unwrap()),
+            Some(crate::serve::pins::PinState::Pending),
+        );
+        assert!(!store.is_approved(&CapabilityId::parse("nodeb/secret").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn an_out_of_band_approval_admits_the_capability() {
+        let (_dir, path) = pin_path();
+        // Simulate `net mcp pin approve nodeb/secret` writing the shared store.
+        {
+            let mut store = PinStore::load(&path).await.unwrap();
+            store.approve(&CapabilityId::parse("nodeb/secret").unwrap());
+            store.save().await.unwrap();
+        }
+
+        let out = run_pinned(
+            gateway_with_echo_and_secret(),
+            ConsentPolicy::new(),
+            path,
+            &[
+                // Search reflects the approval: no longer requires_approval.
+                call(1, meta_tools::name::SEARCH, json!({ "query": "secret" })),
+                // And invoke now reaches the provider.
+                call(
+                    2,
+                    meta_tools::name::INVOKE,
+                    json!({ "cap_id": "nodeb/secret", "arguments": { "message": "x" } }),
+                ),
+                // list_pinned reflects the store.
+                call(3, meta_tools::name::LIST_PINNED, json!({})),
+            ],
+        )
+        .await;
+
+        let caps = tool_result(&out[0]).structured_content.unwrap()["capabilities"].clone();
+        let secret = caps
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["cap_id"] == "nodeb/secret")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            secret["requires_approval"], false,
+            "an approved pin clears the approval flag",
+        );
+
+        let invoked = tool_result(&out[1]);
+        assert!(!invoked.is_error, "approved pin ⇒ invocable: {invoked:?}");
+        assert!(invoked.text().contains("invoked nodeb/secret"));
+
+        let pinned = tool_result(&out[2]).structured_content.unwrap()["pinned"].clone();
+        assert_eq!(pinned, json!(["nodeb/secret"]));
     }
 }

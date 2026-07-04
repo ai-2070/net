@@ -29,6 +29,7 @@ pub mod backend;
 pub mod consent;
 pub mod mesh_gateway;
 pub mod meta_tools;
+pub mod pins;
 pub mod shim;
 pub mod validation;
 
@@ -38,6 +39,7 @@ pub use backend::{
 };
 pub use consent::{ConsentDecision, ConsentPolicy};
 pub use mesh_gateway::MeshGateway;
+pub use pins::{PinState, PinStore, PinStoreError};
 pub use shim::Shim;
 pub use validation::{validate_args, ValidationError};
 

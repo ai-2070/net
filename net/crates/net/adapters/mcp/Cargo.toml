@@ -33,11 +33,13 @@ bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["process", "io-util", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["process", "io-util", "rt", "sync", "time", "fs"] }
 
 [dev-dependencies]
 # Parses this crate's own manifest in the dependency-boundary test.
 toml = "1"
+# Isolated temp dirs for the pin-store file tests.
+tempfile = "3"
 tokio = { version = "1", features = [
     "process",
     "io-util",
