@@ -1,0 +1,19 @@
+web/src/content/docs/start/quickstart.md
+  s_f75d64212a7389::t_efa479c090aac6 81
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e404ee504090e14640ccf912d668b4e1d2351b12",
+  "prompts": {},
+  "sessions": {
+    "s_f75d64212a7389": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6139e8e8-9ce9-4dfc-9412-193afe6af8d2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
