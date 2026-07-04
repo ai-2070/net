@@ -292,7 +292,7 @@ When a `MeshNode` is reachable through the standard `CliContext`, the operator C
 | `net-mesh transfer recv-dir <source> <root-ref> --dest <path>` | materialize a directory tree **atomically** |
 | `net-mesh transfer ls` / `status <id>` / `cancel <id>` | list / inspect / abort in-flight transfers |
 
-The verbs compose with the shell (pipe into `send-blob`, redirect `recv-blob` to stdout) and render a determinate byte-progress bar for sized fetches. They ship behind the `cli` feature flag.
+The verbs compose with the shell (pipe into `send-blob`, redirect `recv-blob` to stdout) and render a determinate byte-progress bar for sized fetches. They ship behind the `cli` feature flag. **Full flag surface, atomic-write / exit-code semantics, and scripting notes: `cli.md`.**
 
 ---
 

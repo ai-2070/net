@@ -57,6 +57,8 @@ Use the **memory transport** in tests. Always `shutdown` in a tear-down hook. If
 
 ## Errors
 
+This section is the **SDK-facing** surface + the practical policy. For the fuller core-crate taxonomy under it — the `IngestionError` / `ConsumerError` / `AdapterError` trio, plus subsystem errors (`TokenError`, `TagMatcherError`, `ScalingError`, `ConfigError`, `StreamError`, `RpcError`) with per-variant remediation — see `error-codes.md`.
+
 ### Rust (`net_sdk::error::SdkError`)
 
 Verified against `net/crates/net/sdk/src/error.rs`. The full enum:

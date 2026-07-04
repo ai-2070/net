@@ -344,3 +344,4 @@ Capability routing is for **placement** (pick a node), not **delivery** (the bus
 - `mesh.md` — bind addresses, PSK / identity, peer setup. You need a live mesh node before any of this works.
 - `concepts.md` § Subnets — how subnet policies (a *routing* gate) differ from `scope:*` tags (a *discovery* filter).
 - `patterns.md` § "I want per-tenant capability discovery without standing up subnets" — the recipe-level summary that links here.
+- `filter-dsl.md` — the **bus-side** equality filter for narrowing *event payloads*, as opposed to the `Predicate` AST here for selecting *nodes*. The two compose (capability predicate targets receivers, filter narrows the response).
