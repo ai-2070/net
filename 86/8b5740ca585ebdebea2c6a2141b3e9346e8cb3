@@ -1,0 +1,37 @@
+web/src/content/docs/sdk/python/invoke.md
+  s_f75d64212a7389::t_ae6e8c0315aa9c 1-40
+web/src/content/docs/sdk/python/errors.md
+  s_f75d64212a7389::t_2cf769535d87a2 1-55
+web/src/content/docs/sdk/python/discover.md
+  s_f75d64212a7389::t_88a9b8b17ff5e5 1-39
+web/src/content/docs/sdk/python/quickstart.md
+  s_f75d64212a7389::t_2840751ddf73b9 1-51
+web/src/content/docs/sdk/python/README.md
+  s_f75d64212a7389::t_fb294ab58a3d75 1-36
+web/src/content/docs/sdk/python/artifacts.md
+  s_f75d64212a7389::t_48dbca5d80f1c6 1-45
+web/src/content/docs/sdk/python/watch.md
+  s_f75d64212a7389::t_40ef7f13eea5ed 1-46
+web/src/content/docs/sdk/python/announce.md
+  s_f75d64212a7389::t_df0790a8c14404 1-46
+web/src/docs.order.ts
+  s_f75d64212a7389::t_c66da8e1c7b06a 50-58
+  s_f75d64212a7389::t_b72f6a6d4fe84b 271,274
+  s_f75d64212a7389::t_ac978b917e47fb 218-225
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "868b5740ca585ebdebea2c6a2141b3e9346e8cb3",
+  "prompts": {},
+  "sessions": {
+    "s_f75d64212a7389": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6139e8e8-9ce9-4dfc-9412-193afe6af8d2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
