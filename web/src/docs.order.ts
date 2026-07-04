@@ -56,6 +56,17 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "artifacts",
       "errors",
     ],
+    "sdk/go": [
+      "quickstart",
+      "announce",
+      "discover",
+      "invoke",
+      "watch",
+      "artifacts",
+      "errors",
+    ],
+    // C exposes only the bus in its ABI — an honest two-page spine, not seven.
+    "sdk/c": ["quickstart", "errors"],
     worldview: [
       "agentic-mesh",
       "submitted-is-not-completed",
@@ -223,6 +234,17 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "sdk/python/watch": "Watch",
     "sdk/python/artifacts": "Artifacts",
     "sdk/python/errors": "Errors",
+    "sdk/go": "Go",
+    "sdk/go/quickstart": "Quickstart",
+    "sdk/go/announce": "Announce",
+    "sdk/go/discover": "Discover",
+    "sdk/go/invoke": "Invoke",
+    "sdk/go/watch": "Watch",
+    "sdk/go/artifacts": "Artifacts",
+    "sdk/go/errors": "Errors",
+    "sdk/c": "C",
+    "sdk/c/quickstart": "Quickstart",
+    "sdk/c/errors": "Errors",
 
     // Tutorials
     "tutorials/fleet-telemetry": "Fleet Telemetry",
@@ -268,9 +290,10 @@ export const DOCS_ORDER: DocsOrderConfig = {
   },
   languages: {
     // Each SDK spine is visible under its language pill. Rust is the default.
-    // Phase 3b adds sdk/go → ["go"], sdk/c → ["c"].
     "sdk/rust": ["rust"],
     "sdk/typescript": ["ts"],
     "sdk/python": ["python"],
+    "sdk/go": ["go"],
+    "sdk/c": ["c"],
   },
 };
