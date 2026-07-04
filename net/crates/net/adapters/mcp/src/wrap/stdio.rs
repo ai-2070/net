@@ -231,16 +231,37 @@ fn to_value<T: serde::Serialize>(v: &T) -> Result<Value, McpError> {
     serde_json::to_value(v).map_err(McpError::Decode)
 }
 
+/// Upper bound on a single stdout line (one JSON-RPC message) from the wrapped
+/// server. A well-behaved MCP server's messages are far smaller; the cap exists
+/// only so a malicious or buggy server that streams an unbounded line *without*
+/// a newline can't grow the read buffer until the wrapping node runs out of
+/// memory. An over-length line is drained and discarded, not buffered.
+const MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
+
 /// The background reader: demultiplex the server's stdout until EOF.
 async fn read_loop(inner: Arc<Inner>, stdout: ChildStdout) {
-    let mut lines = BufReader::new(stdout).lines();
-    // Ends on `Ok(None)` (EOF) or `Err(_)` (read error) — either way the
-    // server is gone.
-    while let Ok(Some(line)) = lines.next_line().await {
-        if line.trim().is_empty() {
-            continue;
+    let mut reader = BufReader::new(stdout);
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        // Bounded line read: `next_line()` would accumulate an unbounded String
+        // for a newline-less flood, so frame lines ourselves with a byte cap.
+        match read_capped_line(&mut reader, &mut buf, MAX_LINE_BYTES).await {
+            // A complete line within the cap.
+            Ok(Some(true)) => {
+                let Ok(line) = std::str::from_utf8(&buf) else {
+                    continue; // non-UTF-8 stdout noise — ignore, don't tear down
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                dispatch_line(&inner, line).await;
+            }
+            // A line that exceeded the cap — discard it (its awaiting call, if
+            // any, times out) and keep the connection up rather than OOM.
+            Ok(Some(false)) => continue,
+            // EOF (`None`) or a read error — either way the server is gone.
+            Ok(None) | Err(_) => break,
         }
-        dispatch_line(&inner, &line).await;
     }
     // Fail every outstanding request: dropping the senders resolves each
     // awaiting `rx` to a transport error rather than hanging forever.
@@ -253,6 +274,55 @@ async fn read_loop(inner: Arc<Inner>, stdout: ChildStdout) {
     // resolves). `send_replace` always stores `true`, so a later `subscribe()`
     // observes it immediately.
     inner.closed_tx.send_replace(true);
+}
+
+/// Read one `\n`-terminated line (newline stripped) into `buf`, buffering at
+/// most `max` bytes. Bytes of a line that exceeds `max` are drained and
+/// discarded up to its terminating newline (or EOF), so memory stays bounded
+/// regardless of what the wrapped server emits.
+///
+/// Returns `Ok(Some(true))` for a line within the cap (`buf` holds it),
+/// `Ok(Some(false))` for an over-length line (`buf` holds only its capped
+/// prefix, meant to be ignored), or `Ok(None)` at EOF with nothing pending.
+async fn read_capped_line<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<Option<bool>> {
+    buf.clear();
+    let mut within_cap = true;
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            // EOF: emit a trailing unterminated line if we accumulated one.
+            return if buf.is_empty() && within_cap {
+                Ok(None)
+            } else {
+                Ok(Some(within_cap))
+            };
+        }
+        // How many bytes of this chunk belong to the current line, how many to
+        // consume from the reader, and whether the line terminates here.
+        let (line_bytes, consume, done) = match chunk.iter().position(|&b| b == b'\n') {
+            Some(nl) => (nl, nl + 1, true),
+            None => (chunk.len(), chunk.len(), false),
+        };
+        // Copy up to `max` bytes; once over the cap, keep draining the rest of
+        // the line (advancing the reader) but stop growing `buf`.
+        if within_cap {
+            let room = max.saturating_sub(buf.len());
+            if line_bytes > room {
+                buf.extend_from_slice(&chunk[..room]);
+                within_cap = false;
+            } else {
+                buf.extend_from_slice(&chunk[..line_bytes]);
+            }
+        }
+        reader.consume(consume);
+        if done {
+            return Ok(Some(within_cap));
+        }
+    }
 }
 
 /// A loosely-typed inbound message, classified by which fields are present.
@@ -329,5 +399,63 @@ async fn reply_method_not_found(inner: &Arc<Inner>, id: Value) {
     // Best-effort: if the pipe is gone the connection is ending anyway.
     if let Ok(line) = serde_json::to_string(&reply) {
         let _ = inner.write_line(&line).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn read_line(reader: &mut (impl AsyncBufReadExt + Unpin), max: usize) -> Option<String> {
+        let mut buf = Vec::new();
+        match read_capped_line(reader, &mut buf, max).await.unwrap() {
+            Some(true) => Some(String::from_utf8(buf).unwrap()),
+            Some(false) => None, // over-length line: caller discards it
+            None => Some("<EOF>".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn capped_reader_frames_lines_within_the_cap() {
+        let data = b"hello\nworld\n".to_vec();
+        let mut r = BufReader::new(&data[..]);
+        assert_eq!(read_line(&mut r, 64).await.as_deref(), Some("hello"));
+        assert_eq!(read_line(&mut r, 64).await.as_deref(), Some("world"));
+        assert_eq!(read_line(&mut r, 64).await.as_deref(), Some("<EOF>"));
+    }
+
+    #[tokio::test]
+    async fn capped_reader_discards_an_overlong_line_and_recovers() {
+        // F7: an over-length line (no attacker can grow the buffer past `max`)
+        // is dropped, and the *next* line still frames correctly — proving the
+        // overlong line's terminating newline was consumed, not left to corrupt
+        // the following message.
+        let data = b"ok\nTHIS-LINE-IS-WAY-TOO-LONG\nnext\n".to_vec();
+        let mut r = BufReader::new(&data[..]);
+        assert_eq!(read_line(&mut r, 8).await.as_deref(), Some("ok"));
+        // "THIS-LINE-IS-WAY-TOO-LONG" is 25 bytes > 8 → discarded (None here).
+        assert_eq!(read_line(&mut r, 8).await, None);
+        assert_eq!(read_line(&mut r, 8).await.as_deref(), Some("next"));
+        assert_eq!(read_line(&mut r, 8).await.as_deref(), Some("<EOF>"));
+    }
+
+    #[tokio::test]
+    async fn capped_reader_emits_a_trailing_unterminated_line() {
+        // A final line with no newline is still delivered (within the cap).
+        let data = b"tail-no-newline".to_vec();
+        let mut r = BufReader::new(&data[..]);
+        assert_eq!(read_line(&mut r, 64).await.as_deref(), Some("tail-no-newline"));
+        assert_eq!(read_line(&mut r, 64).await.as_deref(), Some("<EOF>"));
+    }
+
+    #[tokio::test]
+    async fn capped_reader_bounds_a_newlineless_flood() {
+        // The core property: a long run of bytes with NO newline is bounded to
+        // `max`, never buffered whole (an OOM without the cap).
+        let data = vec![b'x'; 10_000];
+        let mut r = BufReader::new(&data[..]);
+        // Over the cap → discarded, reported as an over-length line.
+        assert_eq!(read_line(&mut r, 16).await, None);
+        assert_eq!(read_line(&mut r, 16).await.as_deref(), Some("<EOF>"));
     }
 }
