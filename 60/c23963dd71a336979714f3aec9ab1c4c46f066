@@ -1,0 +1,23 @@
+.github/workflows/ci.yml
+  s_759aaad81078ca::t_a450a1a0a3ac45 1407-1412
+  s_759aaad81078ca::t_f24ff0b87128f5 1447,1451
+net/crates/net/adapters/mcp/Cargo.toml
+  s_759aaad81078ca::t_d98fc3ec2a21b4 13-21
+  s_759aaad81078ca::t_c9fe57f01851ea 74-75,79-95
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "60c23963dd71a336979714f3aec9ab1c4c46f066",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
