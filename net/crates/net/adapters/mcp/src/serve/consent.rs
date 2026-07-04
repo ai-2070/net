@@ -80,10 +80,14 @@ impl ConsentPolicy {
     }
 
     /// Decide whether `id`, with the given wire credential status, may be
-    /// invoked. A status of `none` is always allowed; a gated status
-    /// (credentialed / external / unknown, and any unrecognised value) is
-    /// allowed only when allowlisted or pinned.
+    /// invoked. Every wire status is gated ([`CredentialStatus::from_wire`]
+    /// never trusts a wire value to the ungated `None` — see its trust-boundary
+    /// note), so a discovered capability is invocable only when the operator
+    /// has allowlisted or pinned it.
     pub fn decide(&self, id: &CapabilityId, credential_status: &str) -> ConsentDecision {
+        // Kept for robustness: `from_wire` never yields a non-consent status
+        // today, so this branch does not fire for any wire value — but it keeps
+        // the gate honest if a trusted-status path is ever added.
         if !CredentialStatus::from_wire(credential_status).requires_consent() {
             return ConsentDecision::Allowed;
         }
@@ -109,18 +113,20 @@ mod tests {
     }
 
     #[test]
-    fn uncredentialed_capability_needs_no_approval() {
+    fn a_wire_none_is_gated_not_trusted() {
+        // A discovered capability's self-declared `none` is not trusted across
+        // the demand-side trust boundary — it is gated like any other status.
         let policy = ConsentPolicy::new();
         assert_eq!(
             policy.decide(&cap("b/echo"), "none"),
-            ConsentDecision::Allowed,
+            ConsentDecision::RequiresApproval,
         );
     }
 
     #[test]
     fn spicy_statuses_require_approval_by_default() {
         let policy = ConsentPolicy::new();
-        for status in ["credentialed", "external_api", "unknown"] {
+        for status in ["credentialed", "external_api", "unknown", "none"] {
             assert_eq!(
                 policy.decide(&cap("b/tool"), status),
                 ConsentDecision::RequiresApproval,

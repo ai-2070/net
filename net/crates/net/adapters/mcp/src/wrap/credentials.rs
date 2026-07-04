@@ -39,16 +39,27 @@ impl CredentialStatus {
 
     /// Parse the wire/tag form back to a status — the demand side (`net mcp
     /// serve`) reads it off a discovered capability's metadata to decide
-    /// consent. Any unrecognised or missing string maps to [`Self::Unknown`]
-    /// (the spicy default, never `None`), so a garbled or absent status can
-    /// only ever *over*-gate, never bypass consent — the same conservative
-    /// rule detection follows.
+    /// consent.
+    ///
+    /// **Trust boundary: a wire `"none"` is NOT trusted.** The ungated
+    /// [`Self::None`] is reachable on the supply side only through the local
+    /// operator's forced `--no-credentials` override; it must never be granted
+    /// by a value read off the wire. Discovery metadata is not cryptographically
+    /// authenticated in v0, so a hostile or compromised provider could
+    /// self-declare `credential_status = "none"` to slip past the allowlist /
+    /// pin gate. So `"none"` — like `"unknown"`, anything unrecognised, or an
+    /// absent value — maps to [`Self::Unknown`] (gated). This keeps "spicy until
+    /// proven boring" across the trust boundary: a discovered capability can
+    /// only ever *over*-gate here, never bypass consent. An operator who trusts
+    /// a specific remote capability admits it explicitly (allowlist or pin).
+    /// (Trusting `"none"` from a cryptographically-verified same-root provider
+    /// is a later refinement, tied to the owner root-identity model.)
     pub fn from_wire(s: &str) -> Self {
         match s {
             "credentialed" => CredentialStatus::Credentialed,
             "external_api" => CredentialStatus::ExternalApi,
-            "none" => CredentialStatus::None,
-            // "unknown" and anything unrecognised — spicy until proven boring.
+            // "none", "unknown", and anything unrecognised are all gated — a
+            // wire value can never reach the ungated `None` (see above).
             _ => CredentialStatus::Unknown,
         }
     }
@@ -292,21 +303,35 @@ mod tests {
     }
 
     #[test]
-    fn from_wire_round_trips_and_defaults_unknown_to_spicy() {
-        for status in [
+    fn from_wire_gates_everything_except_credentialed_and_external() {
+        // Only the two explicitly-spicy statuses round-trip verbatim.
+        assert_eq!(
+            CredentialStatus::from_wire("credentialed"),
             CredentialStatus::Credentialed,
+        );
+        assert_eq!(
+            CredentialStatus::from_wire("external_api"),
             CredentialStatus::ExternalApi,
-            CredentialStatus::Unknown,
-            CredentialStatus::None,
-        ] {
-            assert_eq!(CredentialStatus::from_wire(status.as_str()), status);
-        }
-        // A garbled or absent status is gated like credentialed, never None.
-        for garbled in ["", "bogus", "credentialed ", "None", "UNKNOWN"] {
-            let parsed = CredentialStatus::from_wire(garbled);
-            assert_eq!(parsed, CredentialStatus::Unknown, "{garbled:?}");
+        );
+        // "unknown", a garbled value, or an absent one all gate as Unknown.
+        for spicy in ["unknown", "", "bogus", "credentialed ", "None", "UNKNOWN"] {
+            let parsed = CredentialStatus::from_wire(spicy);
+            assert_eq!(parsed, CredentialStatus::Unknown, "{spicy:?}");
             assert!(parsed.requires_consent());
         }
+    }
+
+    /// Trust-boundary invariant: a wire-declared `"none"` never reaches the
+    /// ungated `None` — it gates like anything else, so a discovered
+    /// capability cannot self-declare its way past the consent gate.
+    #[test]
+    fn wire_none_is_gated_not_trusted() {
+        let parsed = CredentialStatus::from_wire(CredentialStatus::None.as_str());
+        assert_eq!(parsed, CredentialStatus::Unknown);
+        assert!(
+            parsed.requires_consent(),
+            "a wire `none` must be gated, not trusted",
+        );
     }
 
     /// The safety invariant: detection can never yield the ungated `None`.

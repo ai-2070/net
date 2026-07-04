@@ -890,9 +890,13 @@ mod tests {
 
     #[tokio::test]
     async fn search_returns_rows_with_requires_approval_flags() {
+        // Every discovered capability is gated by default (a wire-declared
+        // credential status is not trusted); an allowlisted one clears the flag.
+        let mut consent = ConsentPolicy::new();
+        consent.allow(CapabilityId::parse("nodeb/echo").unwrap());
         let out = run(
             gateway_with_echo_and_secret(),
-            ConsentPolicy::new(),
+            consent,
             &[call(1, meta_tools::name::SEARCH, json!({ "query": "" }))],
         )
         .await;
@@ -902,11 +906,14 @@ mod tests {
         let caps = caps.as_array().unwrap();
         assert_eq!(caps.len(), 2);
         let echo = caps.iter().find(|c| c["cap_id"] == "nodeb/echo").unwrap();
-        assert_eq!(echo["requires_approval"], false, "none ⇒ no approval");
+        assert_eq!(
+            echo["requires_approval"], false,
+            "allowlisted ⇒ no approval"
+        );
         let secret = caps.iter().find(|c| c["cap_id"] == "nodeb/secret").unwrap();
         assert_eq!(
             secret["requires_approval"], true,
-            "credentialed ⇒ requires approval",
+            "unapproved ⇒ requires approval",
         );
     }
 
@@ -947,10 +954,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invoke_uncredentialed_runs_the_tool() {
+    async fn invoke_allowlisted_capability_runs_the_tool() {
+        // A discovered capability is gated regardless of its wire-declared
+        // status; allowlisting it lets the invoke through to the provider.
+        let mut consent = ConsentPolicy::new();
+        consent.allow(CapabilityId::parse("nodeb/echo").unwrap());
         let out = run(
             gateway_with_echo_and_secret(),
-            ConsentPolicy::new(),
+            consent,
             &[call(
                 1,
                 meta_tools::name::INVOKE,
@@ -961,6 +972,36 @@ mod tests {
         let result = tool_result(&out[0]);
         assert!(!result.is_error, "{result:?}");
         assert!(result.text().contains("invoked nodeb/echo"));
+    }
+
+    #[tokio::test]
+    async fn invoke_of_a_discovered_capability_is_gated_without_approval() {
+        // The trust-boundary property at the shim level: a discovered
+        // capability whose provider declares `none` is still gated — a wire
+        // status can't grant free invocation.
+        let gw = gateway_with_echo_and_secret();
+        let calls = gw.invoke_calls.clone();
+        let out = run(
+            gw,
+            ConsentPolicy::new(),
+            &[call(
+                1,
+                meta_tools::name::INVOKE,
+                json!({ "cap_id": "nodeb/echo", "arguments": { "message": "hi" } }),
+            )],
+        )
+        .await;
+        let result = tool_result(&out[0]);
+        assert!(
+            result.is_error,
+            "a self-declared `none` must not bypass consent"
+        );
+        assert!(result.text().contains("net mcp pin approve nodeb/echo"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "blocked before the provider"
+        );
     }
 
     #[tokio::test]
@@ -1041,13 +1082,15 @@ mod tests {
 
     #[tokio::test]
     async fn invoke_denied_by_wrapper_surfaces_the_exact_message() {
-        // An uncredentialed cap (passes consent) whose provider denies on
+        // An allowlisted cap (passes local consent) whose provider denies on
         // owner scope — the demand side reports the wrapper's rejection.
         let gw = InMemoryGateway::new(vec![detail("nodeb/echo", "none", echo_schema())])
             .deny("nodeb/echo");
+        let mut consent = ConsentPolicy::new();
+        consent.allow(CapabilityId::parse("nodeb/echo").unwrap());
         let out = run(
             gw,
-            ConsentPolicy::new(),
+            consent,
             &[call(
                 1,
                 meta_tools::name::INVOKE,
