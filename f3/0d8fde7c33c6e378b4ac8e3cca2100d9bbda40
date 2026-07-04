@@ -1,0 +1,43 @@
+web/src/content/docs/sdk/go/README.md
+  s_f75d64212a7389::t_65d448a4c971a3 1-29
+web/src/content/docs/sdk/go/artifacts.md
+  s_f75d64212a7389::t_b830527139e118 1-34
+web/src/content/docs/sdk/go/quickstart.md
+  s_f75d64212a7389::t_c1d207220a1ce7 1-71
+web/src/content/docs/sdk/go/invoke.md
+  s_f75d64212a7389::t_c58984a7f6e4a6 1-48
+web/src/content/docs/sdk/c/README.md
+  s_f75d64212a7389::t_04a5a78bf5daf1 1-27
+web/src/content/docs/sdk/c/quickstart.md
+  s_f75d64212a7389::t_9940f43280e6a9 1-57
+web/src/docs.order.ts
+  s_f75d64212a7389::t_4546b30952b2a2 237-247
+  s_f75d64212a7389::t_1f953221865f69 59-69
+  s_f75d64212a7389::t_cf2461f65967dc 296-297
+web/src/content/docs/sdk/c/errors.md
+  s_f75d64212a7389::t_06255882629ed9 1-45
+web/src/content/docs/sdk/go/announce.md
+  s_f75d64212a7389::t_86905d179be694 1-49
+web/src/content/docs/sdk/go/discover.md
+  s_f75d64212a7389::t_ef86209469aace 1-42
+web/src/content/docs/sdk/go/watch.md
+  s_f75d64212a7389::t_56da2099ea8891 1-41
+web/src/content/docs/sdk/go/errors.md
+  s_f75d64212a7389::t_b6912524d12390 1-44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f30d8fde7c33c6e378b4ac8e3cca2100d9bbda40",
+  "prompts": {},
+  "sessions": {
+    "s_f75d64212a7389": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6139e8e8-9ce9-4dfc-9412-193afe6af8d2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

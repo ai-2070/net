@@ -1,0 +1,24 @@
+net/crates/net/docs/plans/DOCS_STRATEGY_PLAN.md
+  s_f75d64212a7389::t_13a2cc2fe38c39 3-10
+web/src/content/docs/reference/mcp-bridge.md
+  s_f75d64212a7389::t_78b9ee5866b13d 1-104
+web/src/docs.order.ts
+  s_f75d64212a7389::t_606bdbfc1dbaab 216
+  s_f75d64212a7389::t_7181d78c83ea32 117
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "83c04e4f27469dd64db4d0179a078f59af7b9740",
+  "prompts": {},
+  "sessions": {
+    "s_f75d64212a7389": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6139e8e8-9ce9-4dfc-9412-193afe6af8d2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
