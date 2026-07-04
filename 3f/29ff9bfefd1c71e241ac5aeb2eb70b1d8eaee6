@@ -1,0 +1,41 @@
+web/src/content/docs/sdk/rust/discover.md
+  s_f75d64212a7389::t_a6d1a7d4efb4f6 1-62
+web/src/content/docs/sdk/rust/quickstart.md
+  s_f75d64212a7389::t_3b7257c3cc3114 1-69
+web/src/docs.order.ts
+  s_f75d64212a7389::t_4fb0128b7cae7e 235-239
+  s_f75d64212a7389::t_511042e3139bad 25,31-40
+  s_f75d64212a7389::t_51b5955e3c6972 182-192
+web/src/content/docs/sdk/rust/artifacts.md
+  s_f75d64212a7389::t_66d9d6853bb749 1-62
+web/src/content/docs/sdk/rust/announce.md
+  s_f75d64212a7389::t_1d40387176c5a9 1-79
+web/src/content/docs/sdk/rust/watch.md
+  s_f75d64212a7389::t_81532b4b73809a 1-55
+web/src/content/docs/sdk/rust/README.md
+  s_f75d64212a7389::t_ef176eb86ba377 1-36
+net/crates/net/docs/plans/DOCS_SDK_SPINE_PLAN.md
+  s_f75d64212a7389::t_bf878e1aa3df15 1-62
+web/src/content/docs/sdk/rust/invoke.md
+  s_f75d64212a7389::t_47a46ea9f6f570 1-65
+web/src/content/docs/sdk/rust/errors.md
+  s_f75d64212a7389::t_fe497abd4da55d 1-72
+web/src/content/docs/guides/discover-and-invoke.md
+  s_f75d64212a7389::t_2aea4876179974 31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3f29ff9bfefd1c71e241ac5aeb2eb70b1d8eaee6",
+  "prompts": {},
+  "sessions": {
+    "s_f75d64212a7389": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6139e8e8-9ce9-4dfc-9412-193afe6af8d2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
