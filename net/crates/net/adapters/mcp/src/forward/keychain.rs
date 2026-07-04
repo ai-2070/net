@@ -1,12 +1,16 @@
 //! OS-keychain secret value backend
 //! (`MCP_CREDENTIAL_FORWARDING_PLAN.md` Phase 1, value side).
 //!
-//! A persistent [`SecretBackend`](super::SecretBackend) backed by the platform
-//! credential store — macOS Keychain, Windows Credential Manager, or the Linux
-//! Secret Service — via the `keyring` crate. This is the recommended at-rest
-//! home for forwarded secret values: the OS handles encryption, per-user
-//! scoping, and access control, so nothing is ever written to a plaintext file
-//! by Net.
+//! A [`SecretBackend`](super::SecretBackend) backed by the platform credential
+//! store — macOS Keychain, Windows Credential Manager, or the Linux kernel
+//! `keyutils` — via the `keyring` crate. The OS handles storage and per-user
+//! access control, so nothing is ever written to a plaintext file by Net.
+//!
+//! The Linux backend is `keyutils` (pure Rust, no `libdbus`) rather than Secret
+//! Service, so the feature builds with no C system library. The trade-off is
+//! persistence: a keyutils keyring lives for the login session, not across
+//! reboots — see the `[dependencies]` note in `Cargo.toml` for how to swap in
+//! Secret Service where reboot-persistence matters.
 //!
 //! Gated behind the non-default **`keychain`** cargo feature: it pulls the
 //! `keyring` dependency and needs a keychain-capable host to run, so the

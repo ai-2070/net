@@ -21,11 +21,11 @@ fixture = []
 
 # `keychain` gates the OS-keychain secret value backend
 # (`MCP_CREDENTIAL_FORWARDING_PLAN.md` Phase 1) — macOS Keychain, Windows
-# Credential Manager, and the Linux Secret Service (via pure-Rust zbus +
-# `crypto-rust`, so no libdbus / OpenSSL system lib is needed to *build*).
-# NOT a default feature: it pulls the `keyring` dependency and needs a
-# keychain-capable host to *run*, so the default build / CI / `cargo install`
-# never compile it. Enable it to build the persistent backend:
+# Credential Manager, and the Linux kernel `keyutils` (all pure Rust, no C
+# system library; see the `keyring` dependency note for the keyutils vs Secret
+# Service trade-off). NOT a default feature: it pulls the `keyring` dependency
+# and needs a keychain-capable host to *run*, so the default build / CI /
+# `cargo install` never compile it. Enable it to build the backend:
 #   cargo test -p net-mesh-mcp --features keychain
 keychain = ["dep:keyring"]
 
@@ -67,13 +67,19 @@ fs2 = "0.4"
 futures = "0.3"
 # OS-keychain secret value backend, behind the non-default `keychain` feature
 # (see `[features]`). `default-features = false` + explicit native backends
-# keeps the Linux path on pure-Rust zbus/crypto (no libdbus/OpenSSL build dep);
-# it is only compiled when `keychain` is enabled.
+# keeps EVERY platform on a store that needs no C system library: Windows
+# Credential Manager, macOS Keychain, and — deliberately — the Linux kernel
+# `keyutils` backend (`linux-native`) rather than Secret Service. keyring's
+# Secret Service path pulls `dbus-secret-service` -> `libdbus-sys`, a C lib
+# (`libdbus-1-dev`) that headless CI and minimal images lack; keyutils is pure
+# Rust and needs no dbus. Trade-off: a keyutils keyring persists for the login
+# session, not across reboots — a persistent Linux backend (Secret Service) can
+# be swapped in later by enabling `sync-secret-service` and shipping libdbus.
+# Only compiled when `keychain` is enabled.
 keyring = { version = "3", optional = true, default-features = false, features = [
     "apple-native",
     "windows-native",
-    "sync-secret-service",
-    "crypto-rust",
+    "linux-native",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
