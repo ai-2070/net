@@ -1,5 +1,10 @@
 # What is Net?
 
+Net's flagship use is **agentic capability federation** — agents discovering,
+invoking, observing, and recovering work across a trusted mesh. If you want that
+story first, start with [The Agentic Mesh](/docs/worldview/agentic-mesh). This
+page is the mechanism underneath it: what Net actually *is* as a system.
+
 Net is a distributed event bus that runs as a peer-to-peer mesh — no broker to provision, no central service to depend on. Producers and consumers connect directly through the mesh, and every event they exchange is encrypted end-to-end, signed by its origin, and ordered by cause rather than by clock.
 
 If you've used Kafka, NATS, or Redis Streams, the surface will feel familiar: you publish to a channel, subscribe with a filter, replay from a cursor. What changes is everything underneath. There is no broker process to operate, there are no partitions to rebalance, and the identity and routing layers that normally live in a separate service mesh are folded into the bus itself.

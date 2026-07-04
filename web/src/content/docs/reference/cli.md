@@ -2,7 +2,7 @@
 
 The `net-mesh` binary exposes the substrate's operator surface. Two command groups ship in v0.27: `transfer` for moving blobs and directories between nodes, and `typegen` for generating typed bindings from discovered AI tools.
 
-The binary is built behind the `cli` Cargo feature so library consumers don't pay the `clap` build cost. Install it with `cargo install net-mesh --features cli`, or build from source with `cargo build --release --features cli` and run from `target/release/net-mesh`.
+The `net-mesh` binary is produced by the `net-cli` crate (kept separate so library consumers don't pay the `clap` build cost). Install it with `cargo install net-cli`, or build from source with `cargo build --release -p net-cli` and run from `target/release/net-mesh`.
 
 All commands operate against a live `MeshNode` resolved through the standard `CliContext` — the same connection-and-keypair plumbing the SDK uses. Pass `--node-addr <ip:port> --node-pubkey <hex>` to target a remote daemon, or omit them to connect to the local node started by the surrounding environment.
 

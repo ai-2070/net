@@ -11,6 +11,8 @@ Loosely inspired by the Net from Cyberpunk 2077 — a flat, encrypted mesh where
 
 Net is what the internet would look like if it were built today, the network science fiction imagined and systems engineers said was impossible. It is a latency-first encrypted mesh network. Every computer, device, and application is an equal node on a flat topology. There are no clients, no servers, no coordinators. The mesh propagates state, not connections. Existing networks operate in milliseconds (10⁻³). Net operates in nanoseconds (10⁻⁹).
 
+Its flagship use is **agentic capability federation** — agents discovering, invoking, observing, and recovering work across a trusted mesh, with credentials kept local. That's one layer on the substrate, not a separate product: capability discovery, typed RPC, durable logs, folded state, and artifact transfer all ride the same latency-first encrypted mesh. See the [worldview docs](https://github.com/ai-2070/net/blob/master/web/src/content/docs/worldview) for the "why," and the applications below for where else the substrate is strong.
+
 ## Install
 
 ```bash

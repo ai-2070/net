@@ -18,14 +18,67 @@ import type { DocsOrderConfig } from "@/lib/docs";
 // resolve to the same entry. Dashes are the canonical (URL) form.
 export const DOCS_ORDER: DocsOrderConfig = {
   sections: [
+    "worldview",
     "start",
-    "concepts",
     "guides",
+    "concepts",
+    "sdk",
+    "agent-briefs",
     "reference",
     "tutorials",
     "releases",
   ],
   folders: {
+    sdk: ["rust", "typescript", "python", "go", "c"],
+    "sdk/rust": [
+      "quickstart",
+      "announce",
+      "discover",
+      "invoke",
+      "watch",
+      "artifacts",
+      "errors",
+    ],
+    "sdk/typescript": [
+      "quickstart",
+      "announce",
+      "discover",
+      "invoke",
+      "watch",
+      "artifacts",
+      "errors",
+    ],
+    "sdk/python": [
+      "quickstart",
+      "announce",
+      "discover",
+      "invoke",
+      "watch",
+      "artifacts",
+      "errors",
+    ],
+    "sdk/go": [
+      "quickstart",
+      "announce",
+      "discover",
+      "invoke",
+      "watch",
+      "artifacts",
+      "errors",
+    ],
+    // C exposes only the bus in its ABI — an honest two-page spine, not seven.
+    "sdk/c": ["quickstart", "errors"],
+    "agent-briefs": [
+      "wrap-and-use-an-mcp-server",
+      "build-a-recoverable-capability",
+      "generate-typed-tool-bindings",
+    ],
+    worldview: [
+      "agentic-mesh",
+      "right-and-wrong-use-cases",
+      "mcp-vs-net",
+      "rest-vs-net",
+    ],
     start: ["what-is-net", "quickstart", "install"],
     concepts: [
       "architecture",
@@ -37,6 +90,11 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "storage-stack",
     ],
     guides: [
+      "wrap-mcp-server",
+      "expose-net-as-mcp",
+      "discover-and-invoke",
+      "recover-failed-workflow",
+      "submitted-is-not-completed",
       "event-bus",
       "nrpc",
       "durable-logs",
@@ -56,6 +114,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "wire-format",
       "replication-config",
       "error-codes",
+      "mcp-bridge",
       "cli",
     ],
     tutorials: [
@@ -101,12 +160,19 @@ export const DOCS_ORDER: DocsOrderConfig = {
   },
   labels: {
     // Sections
+    worldview: "Worldview",
     start: "Start",
     concepts: "Concepts",
     guides: "Guides",
     reference: "Reference",
     tutorials: "Tutorials",
     releases: "Releases",
+
+    // Worldview
+    "worldview/agentic-mesh": "The Agentic Mesh",
+    "worldview/right-and-wrong-use-cases": "When to Use Net",
+    "worldview/mcp-vs-net": "MCP vs Net",
+    "worldview/rest-vs-net": "REST vs Net",
 
     // Start
     "start/what-is-net": "What is Net?",
@@ -123,6 +189,11 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "concepts/storage-stack": "The Storage Stack",
 
     // Guides
+    "guides/wrap-mcp-server": "Wrap an MCP Server",
+    "guides/expose-net-as-mcp": "Expose Net as MCP",
+    "guides/discover-and-invoke": "Discover and Invoke",
+    "guides/recover-failed-workflow": "Recover a Failed Workflow",
+    "guides/submitted-is-not-completed": "Submitted Is Not Completed",
     "guides/event-bus": "Using the Event Bus",
     "guides/nrpc": "Typed RPC with nRPC",
     "guides/durable-logs": "Durable Logs (RedEX)",
@@ -142,7 +213,52 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "reference/wire-format": "Wire Format",
     "reference/replication-config": "Replication Configuration",
     "reference/error-codes": "Error Codes",
+    "reference/mcp-bridge": "MCP Bridge",
     "reference/cli": "CLI Reference",
+
+    // SDKs
+    sdk: "SDKs",
+    "sdk/rust": "Rust",
+    "sdk/rust/quickstart": "Quickstart",
+    "sdk/rust/announce": "Announce",
+    "sdk/rust/discover": "Discover",
+    "sdk/rust/invoke": "Invoke",
+    "sdk/rust/watch": "Watch",
+    "sdk/rust/artifacts": "Artifacts",
+    "sdk/rust/errors": "Errors",
+    "sdk/typescript": "TypeScript",
+    "sdk/typescript/quickstart": "Quickstart",
+    "sdk/typescript/announce": "Announce",
+    "sdk/typescript/discover": "Discover",
+    "sdk/typescript/invoke": "Invoke",
+    "sdk/typescript/watch": "Watch",
+    "sdk/typescript/artifacts": "Artifacts",
+    "sdk/typescript/errors": "Errors",
+    "sdk/python": "Python",
+    "sdk/python/quickstart": "Quickstart",
+    "sdk/python/announce": "Announce",
+    "sdk/python/discover": "Discover",
+    "sdk/python/invoke": "Invoke",
+    "sdk/python/watch": "Watch",
+    "sdk/python/artifacts": "Artifacts",
+    "sdk/python/errors": "Errors",
+    "sdk/go": "Go",
+    "sdk/go/quickstart": "Quickstart",
+    "sdk/go/announce": "Announce",
+    "sdk/go/discover": "Discover",
+    "sdk/go/invoke": "Invoke",
+    "sdk/go/watch": "Watch",
+    "sdk/go/artifacts": "Artifacts",
+    "sdk/go/errors": "Errors",
+    "sdk/c": "C",
+    "sdk/c/quickstart": "Quickstart",
+    "sdk/c/errors": "Errors",
+
+    // Agent briefs
+    "agent-briefs": "Agent Briefs",
+    "agent-briefs/wrap-and-use-an-mcp-server": "Wrap and Use an MCP Server",
+    "agent-briefs/build-a-recoverable-capability": "Build a Recoverable Capability",
+    "agent-briefs/generate-typed-tool-bindings": "Generate Typed Tool Bindings",
 
     // Tutorials
     "tutorials/fleet-telemetry": "Fleet Telemetry",
@@ -185,5 +301,13 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "releases/release-v0.10-hex": "v0.10 — Hex",
     "releases/release-v0.9-first-blood": "v0.9 — First Blood",
     "releases/release-v0.8-killing-moon": "v0.8 — Killing Moon",
+  },
+  languages: {
+    // Each SDK spine is visible under its language pill. Rust is the default.
+    "sdk/rust": ["rust"],
+    "sdk/typescript": ["ts"],
+    "sdk/python": ["python"],
+    "sdk/go": ["go"],
+    "sdk/c": ["c"],
   },
 };

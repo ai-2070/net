@@ -77,3 +77,16 @@ let bus = EventBus::new(config).await?;
 Once configured, ingestion and consumption work identically — `ingest()` publishes onto the mesh, `poll()` receives from it. The bus on node A and the bus on node B share state through the channels they both subscribe to. Identity, encryption, NAT traversal, and routing are all handled for you.
 
 That's the part that takes longer than five minutes to fully explore — channel naming, visibility scopes, durable persistence, capability-based authorization — but the call shape never changes. Once you have the loop above working locally, the rest is configuration.
+
+## The agentic path
+
+The event bus above is the substrate. Net's flagship use is agents discovering and
+invoking work across the mesh — a different loop on the same foundation:
+
+- [Discover and Invoke](/docs/guides/discover-and-invoke) — query the mesh by
+  capability (`net cap query --tag …`) and make a typed call.
+- [Wrap an MCP Server](/docs/guides/wrap-mcp-server) — turn an existing MCP tool
+  into a discoverable capability with one command.
+- [Expose Net as MCP](/docs/guides/expose-net-as-mcp) — let any MCP host use the
+  mesh.
+- [The Agentic Mesh](/docs/worldview/agentic-mesh) — the worldview behind all of it.
