@@ -1,3 +1,5 @@
+"use client";
+
 import { useState } from "react";
 import { SectionLabel } from "./SectionLabel";
 import { DisplayHeading } from "./DisplayHeading";
@@ -41,7 +43,13 @@ const INSTALL_CARDS: readonly InstallCard[] = [
   },
 ];
 
-export function InstallSection() {
+export function InstallSection({
+  id = "install",
+  label = "§10 / install",
+}: {
+  id?: string;
+  label?: string;
+} = {}) {
   const [copied, setCopied] = useState<string | null>(null);
 
   const handleCopy = async (lang: string, text: string): Promise<void> => {
@@ -57,8 +65,8 @@ export function InstallSection() {
   };
 
   return (
-    <section id="install" className="bg-bg-2 border-b border-line px-6 py-20">
-      <SectionLabel>§10 / install</SectionLabel>
+    <section id={id} className="bg-bg-2 border-b border-line px-6 py-20">
+      <SectionLabel>{label}</SectionLabel>
       <DisplayHeading>
         five languages.
         <br />

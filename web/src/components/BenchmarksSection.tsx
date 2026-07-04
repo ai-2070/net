@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { DisplayHeading } from "./DisplayHeading";
 import { SectionLabel } from "./SectionLabel";
 
@@ -105,16 +106,28 @@ const BENCH_GROUPS: readonly BenchGroup[] = [
   },
 ];
 
-export function BenchmarksSection() {
+export function BenchmarksSection({
+  id = "bench",
+  label = "§04 / measured numbers",
+  intro = (
+    <>
+      All numbers measure packet scheduling — the time to process, route,
+      encrypt, and queue a packet for transmission. They do not include NIC
+      transfer or wire latency.
+    </>
+  ),
+}: {
+  id?: string;
+  label?: ReactNode;
+  intro?: ReactNode;
+} = {}) {
   return (
-    <section id="bench" className="border-b border-line px-6 py-20">
-      <SectionLabel>§04 / measured numbers</SectionLabel>
+    <section id={id} className="border-b border-line px-6 py-20">
+      <SectionLabel>{label}</SectionLabel>
       <DisplayHeading>existence proofs.</DisplayHeading>
 
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">
-        All numbers measure packet scheduling — the time to process, route,
-        encrypt, and queue a packet for transmission. They do not include NIC
-        transfer or wire latency.
+        {intro}
       </p>
 
       <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-8 items-start">

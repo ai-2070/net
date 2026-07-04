@@ -1,15 +1,23 @@
+"use client";
+
 import { useRepoInfo } from "./RepoInfoProvider";
 import { SectionLabel } from "./SectionLabel";
 import { DisplayHeading } from "./DisplayHeading";
 import { formatReleaseDate } from "@/lib/utils";
 
-export function ReleasesSection() {
+export function ReleasesSection({
+  id = "releases",
+  label = "§13 / releases",
+}: {
+  id?: string;
+  label?: string;
+} = {}) {
   const { releases } = useRepoInfo();
   if (releases.length === 0) return null;
 
   return (
-    <section id="releases" className="border-b border-line px-6 py-20">
-      <SectionLabel>§13 / releases</SectionLabel>
+    <section id={id} className="border-b border-line px-6 py-20">
+      <SectionLabel>{label}</SectionLabel>
       <DisplayHeading>net releases.</DisplayHeading>
 
       <p className="text-[16px] text-ink max-w-[740px] leading-[1.6] font-light mb-12">

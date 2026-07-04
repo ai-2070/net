@@ -50,10 +50,16 @@ const APPS: readonly AppCard[] = [
   },
 ];
 
-export function ApplicationsSection() {
+export function ApplicationsSection({
+  id = "apps",
+  label = "§11 / target applications",
+}: {
+  id?: string;
+  label?: string;
+} = {}) {
   return (
-    <section id="apps" className="border-b border-line px-6 py-20">
-      <SectionLabel>§11 / target applications</SectionLabel>
+    <section id={id} className="border-b border-line px-6 py-20">
+      <SectionLabel>{label}</SectionLabel>
       <DisplayHeading>
         everything that
         <br />
