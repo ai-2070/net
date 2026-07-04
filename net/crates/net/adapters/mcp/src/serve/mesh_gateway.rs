@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::{self, StreamExt};
 use net_sdk::capabilities::CapabilityFilter;
 use net_sdk::mesh::Mesh;
 use net_sdk::mesh_rpc::{CallOptions, RpcError};
@@ -45,6 +46,9 @@ const MAX_ATTEMPTS: usize = 4;
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Backoff between attempts.
 const RETRY_BACKOFF: Duration = Duration::from_millis(120);
+/// Max provider catalogs fetched concurrently during `search` — bounds the
+/// fan-out so a large mesh doesn't open one describe call per provider at once.
+const MAX_CONCURRENT_FETCHES: usize = 8;
 
 /// A [`CapabilityGateway`] backed by a joined mesh node.
 pub struct MeshGateway {
@@ -118,16 +122,30 @@ impl CapabilityGateway for MeshGateway {
             .mesh
             .find_nodes(&CapabilityFilter::new().require_tag(BRIDGE_PROVIDER_TAG));
         let q = query.to_lowercase();
+
+        // Fetch provider catalogs concurrently with bounded fan-out, so search
+        // completes in ~the slowest provider's time rather than the sum — a
+        // single slow/unreachable provider (which can burn the full retry
+        // budget) no longer blocks the others.
+        let catalogs: Vec<(u64, Result<DescribeResponse, GatewayError>)> = stream::iter(providers)
+            .map(|node| async move {
+                (
+                    node,
+                    self.fetch_catalog(node, &DescribeRequest::default()).await,
+                )
+            })
+            .buffer_unordered(MAX_CONCURRENT_FETCHES)
+            .collect()
+            .await;
+
         let mut out = Vec::new();
-        for node in providers {
+        for (node, result) in catalogs {
             // Any per-provider failure makes that provider invisible — never
             // fail the whole search. Concretely: `Denied` (out of owner scope),
             // `Transport` (unreachable, or serving no describe service — a
             // `NoRoute` maps here), or `Other` (a catalog we couldn't decode).
             // One bad or hostile provider must not abort global discovery.
-            let Ok(catalog) = self.fetch_catalog(node, &DescribeRequest::default()).await else {
-                continue;
-            };
+            let Ok(catalog) = result else { continue };
             for t in catalog.tools {
                 if q.is_empty() || matches_query(&t, &q) {
                     out.push(summary(node, t));

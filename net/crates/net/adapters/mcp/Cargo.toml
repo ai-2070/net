@@ -30,6 +30,9 @@ net-mesh-sdk = { version = "0.30.0", path = "../../sdk", default-features = fals
 ] }
 async-trait = "0.1"
 bytes = "1"
+# Stream combinators for bounded-concurrency provider fan-out in the demand
+# side's `search` (`buffer_unordered`).
+futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
