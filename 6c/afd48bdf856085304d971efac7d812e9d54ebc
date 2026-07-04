@@ -1,0 +1,35 @@
+net/crates/net/adapters/mcp/src/serve/mesh_gateway.rs
+  s_759aaad81078ca::t_8b2dfea2dde523 400-417,422,429-439,441-444,447-450
+  s_759aaad81078ca::t_7ddef2e65a2e69 465-468,476-484
+  s_759aaad81078ca::t_63438ad22f3624 585-605
+  s_759aaad81078ca::t_b78543dcfdad22 180
+  s_759aaad81078ca::t_362d4ce7c91b2b 281,284
+  s_759aaad81078ca::t_552c493a370599 139-144,151,157
+  s_759aaad81078ca::t_78f145770a0b8f 485-486
+  s_759aaad81078ca::t_c8f3178ba2049d 584
+net/crates/net/adapters/mcp/tests/serve_end_to_end.rs
+  s_759aaad81078ca::t_fd2fe042f6b0ff 131
+  s_759aaad81078ca::t_3b7bb243b8c937 189
+  s_759aaad81078ca::t_73a996a6f276b2 231
+net/crates/net/adapters/mcp/src/serve/backend.rs
+  s_759aaad81078ca::t_a7e484662fae15 199-206,211
+net/crates/net/adapters/mcp/src/serve/shim.rs
+  s_759aaad81078ca::t_dcb073e7a79a04 781
+  s_759aaad81078ca::t_5a2a22888c3e9a 463-471
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6cafd48bdf856085304d971efac7d812e9d54ebc",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
