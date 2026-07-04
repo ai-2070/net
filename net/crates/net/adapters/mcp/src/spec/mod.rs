@@ -23,6 +23,12 @@ pub const PROTOCOL_VERSION: &str = "2026-07-28";
 /// The JSON-RPC 2.0 version tag every message carries.
 pub const JSONRPC_VERSION: &str = "2.0";
 
+/// This bridge's own implementation version, reported as `serverInfo.version`
+/// in the `initialize` handshake (`net mcp serve`). Sourced from the crate
+/// version (`Cargo.toml`) so it never drifts from the release — distinct from
+/// [`PROTOCOL_VERSION`], which is the MCP spec version, not the adapter's.
+pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 envelopes
 // ---------------------------------------------------------------------------
@@ -397,11 +403,12 @@ mod tests {
     fn initialize_params_carry_the_pinned_protocol_version() {
         let p = InitializeParams::new(Implementation {
             name: "net".into(),
-            version: "0.30.0".into(),
+            version: SERVER_VERSION.into(),
         });
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(v["clientInfo"]["name"], "net");
+        assert_eq!(v["clientInfo"]["version"], SERVER_VERSION);
         assert_eq!(v["capabilities"], serde_json::json!({}));
     }
 

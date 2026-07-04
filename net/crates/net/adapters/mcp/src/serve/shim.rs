@@ -33,7 +33,7 @@ use super::{
 use crate::spec::{
     method, CallToolParams, CallToolResult, Implementation, IncomingKind, IncomingMessage,
     JsonRpcErrorResponse, JsonRpcNotification, JsonRpcSuccess, RequestId, INVALID_PARAMS,
-    INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR, PROTOCOL_VERSION,
+    INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR, PROTOCOL_VERSION, SERVER_VERSION,
 };
 
 /// How often the serve loop polls the pin store to detect an out-of-band
@@ -72,7 +72,7 @@ impl<G: CapabilityGateway> Shim<G> {
             consent: ConsentPolicy::new(),
             server_info: Implementation {
                 name: "net".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
+                version: SERVER_VERSION.to_string(),
             },
             pin_store_path: None,
             pin_poll_interval: DEFAULT_PIN_POLL_INTERVAL,
