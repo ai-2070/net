@@ -62,12 +62,18 @@ impl KeychainSecretBackend {
         // could never be read back is rejected here rather than persisted and
         // then failing at forward time. Runs before the keychain is touched.
         ForwardedHeaderValue::validate(value)?;
-        let (service, ref_name, value) =
+        let (service, ref_name, mut value) =
             (self.service.clone(), ref_name.to_string(), value.to_vec());
         run_blocking(move || {
-            entry(&service, &ref_name)?
+            let result = entry(&service, &ref_name)?
                 .set_secret(&value)
-                .map_err(map_err)
+                .map_err(map_err);
+            // Scrub the plaintext copy we materialized for the keychain call,
+            // regardless of outcome — every other path in this module
+            // (`contains`, `get`, `ForwardedHeaderValue`) scrubs its buffer, and
+            // `set` was the one that dropped its copy in the clear.
+            zeroize_vec(&mut value);
+            result
         })
         .await
     }
