@@ -641,22 +641,25 @@ fn assign_pinned_tool_names(approved: &[CapabilityId]) -> Vec<(CapabilityId, Str
 ///
 /// The lossy [`safe_tool_name`] base (character replacement + truncation) is
 /// *always* suffixed with a deterministic hash of the full id, so the name
-/// depends only on `id`. The salt advances solely to dodge a fixed reserved
-/// meta-tool name (never a collision with another pin), keeping the result
-/// independent of the approved set. A residual hash collision between two
-/// distinct ids sharing a base is astronomically unlikely; if it ever happened
-/// they would share a name — no worse than the pre-existing lossy-base
-/// collision, and still not a cross-capability *remap*.
+/// depends only on `id` and is independent of the approved set. The suffix is
+/// `_<6 hex>` ([`with_hash_suffix`]) — a shape no [`RESERVED_TOOL_NAMES`] entry
+/// has (they are plain meta-tool identifiers) — so a promoted pin can never
+/// shadow a meta-tool, and no reserved-name avoidance loop is needed. The
+/// `debug_assert` pins that invariant against a future change to either the
+/// suffix format or the reserved set.
+///
+/// A residual hash collision between two distinct ids sharing a base is
+/// astronomically unlikely; if it ever happened they would share a name — no
+/// worse than the pre-existing lossy-base collision, and still not a
+/// cross-capability *remap*.
 fn stable_pinned_tool_name(id: &CapabilityId) -> String {
     let base = safe_tool_name(id);
-    let mut salt = 0u32;
-    loop {
-        let name = with_hash_suffix(&base, id, salt);
-        if !RESERVED_TOOL_NAMES.contains(&name.as_str()) {
-            return name;
-        }
-        salt += 1;
-    }
+    let name = with_hash_suffix(&base, id, 0);
+    debug_assert!(
+        !RESERVED_TOOL_NAMES.contains(&name.as_str()),
+        "a hash-suffixed pinned name must never equal a reserved meta-tool name",
+    );
+    name
 }
 
 /// `base` (trimmed to fit) plus `_<6 hex>`, a deterministic hash of the id and
