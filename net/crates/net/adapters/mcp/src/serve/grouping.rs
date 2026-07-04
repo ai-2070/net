@@ -87,6 +87,18 @@ pub fn is_collapsible(info: &BridgedToolInfo) -> bool {
 /// observably depends on (id, tier, schemas). The schemas serialize
 /// deterministically (serde_json orders object keys), so the fingerprint is
 /// stable across providers announcing the same tool.
+///
+/// It also folds in the two collapse-gating fields [`is_collapsible`] checks —
+/// `substitutability` and `credential_status`. Grouping is unaffected (every
+/// collapsible tool shares the same values, `provider_equivalent` + `none`, so
+/// they still fingerprint together), but it closes a failover hole: the
+/// demand-side gateway remembers the *primary's* fingerprint unconditionally
+/// and fails over to any collapsible candidate whose fingerprint matches. If
+/// the fingerprint ignored these fields, a credentialed or provider-local
+/// primary that merely shares schemas with a collapsible candidate would match
+/// — routing a call the operator never declared interchangeable. Including them
+/// makes the fingerprint carry the *full* equivalence contract, so a
+/// cross-class match is impossible by construction.
 pub fn descriptor_fingerprint(info: &BridgedToolInfo) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -97,6 +109,8 @@ pub fn descriptor_fingerprint(info: &BridgedToolInfo) -> u64 {
         .as_ref()
         .map(|v| v.to_string())
         .hash(&mut hasher);
+    info.substitutability.hash(&mut hasher);
+    info.credential_status.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -268,6 +282,52 @@ mod tests {
             2,
             "mismatched schemas are distinct capabilities"
         );
+    }
+
+    #[test]
+    fn fingerprint_separates_collapse_classes_even_with_identical_schemas() {
+        // The failover invariant: the demand side remembers the primary's
+        // fingerprint unconditionally and matches collapsible candidates by it.
+        // A credentialed or provider-local primary that merely shares schemas
+        // with a collapsible candidate must NOT fingerprint-match it, or it
+        // would fail over to a provider it was never grouped with.
+        let collapsible = info("echo", true, "none", echo_schema());
+        let provider_local = info("echo", false, "none", echo_schema());
+        let credentialed = info("echo", true, "credentialed", echo_schema());
+
+        assert_ne!(
+            descriptor_fingerprint(&collapsible),
+            descriptor_fingerprint(&provider_local),
+            "a provider-local tool must not match a collapsible one",
+        );
+        assert_ne!(
+            descriptor_fingerprint(&collapsible),
+            descriptor_fingerprint(&credentialed),
+            "a credentialed tool must not match an uncredentialed one",
+        );
+        assert_ne!(
+            descriptor_fingerprint(&provider_local),
+            descriptor_fingerprint(&credentialed),
+            "the two non-collapsible classes are themselves distinct",
+        );
+    }
+
+    #[test]
+    fn fingerprint_still_matches_across_equivalent_providers() {
+        // The other half of the invariant: folding the collapse-gating fields
+        // into the fingerprint must NOT stop genuinely-equivalent providers from
+        // matching — two collapsible tools with the same contract still collapse.
+        let a = info("echo", true, "none", echo_schema());
+        let b = info("echo", true, "none", echo_schema());
+        assert_eq!(
+            descriptor_fingerprint(&a),
+            descriptor_fingerprint(&b),
+            "equivalent collapsible providers keep one fingerprint",
+        );
+        // And end-to-end: they still merge into a single group.
+        let groups = group_capabilities(vec![(10, a), (20, b)]);
+        assert_eq!(groups.len(), 1, "grouping behavior is unchanged");
+        assert_eq!(groups[0].providers, vec![10, 20]);
     }
 
     #[test]

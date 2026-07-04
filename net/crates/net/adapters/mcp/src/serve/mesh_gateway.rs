@@ -179,6 +179,12 @@ impl MeshGateway {
     /// a same-name / different-contract provider. Sorted node order, so
     /// `describe` and `invoke` fail over to the same one.
     ///
+    /// The primary itself needs no separate collapsibility check: the
+    /// fingerprint folds in `substitutability` and `credential_status` (see
+    /// [`descriptor_fingerprint`]), so a credentialed or provider-local primary
+    /// can never share a fingerprint with a collapsible candidate — the match on
+    /// the next line rejects it by construction.
+    ///
     /// **Fail safe:** without the primary's known fingerprint (never searched or
     /// described while it was up) no candidate can be proven equivalent, so we
     /// do not fail over — better a transport error than sending
