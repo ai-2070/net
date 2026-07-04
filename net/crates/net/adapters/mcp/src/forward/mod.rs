@@ -32,6 +32,10 @@
 //!   refused (never a value).
 //! - [`WrapTransport`] / [`resolve_injection`] — the never-for-stdio guard, and
 //!   [`RISK_TAG_ACCEPTS_FORWARDED_CREDENTIALS`] for honest labeling.
+//! - [`ForwardingStore`] (**Phase 1**) — the persistent caller-side *policy*
+//!   store and its redaction-safe [`ForwardingAudit`]. It records destination
+//!   bindings, never secret values; the value backend (keychain / encrypted
+//!   store) and the CLI verbs (`net secret`, `net security audit`) build on it.
 //!
 //! # Threat model (honest section)
 //!
@@ -54,6 +58,7 @@
 mod context;
 mod header;
 mod policy;
+mod store;
 mod target;
 
 pub use context::{ContextError, ForwardedContext};
@@ -65,6 +70,7 @@ pub use policy::{
     AcceptError, AcceptPolicy, AllowList, DenialLevel, ForwardingConfig, PlainHeaderPolicy,
     ProviderScope, SecretPolicy, SendGrant,
 };
+pub use store::{ForwardingAudit, ForwardingStore, Grant, GrantKind, StoreError};
 pub use target::{
     forwarding_supported, resolve_injection, risk_tags_for_accept_policy, ForwardingUnsupported,
     InjectionTarget, WrapTransport, RISK_TAG_ACCEPTS_FORWARDED_CREDENTIALS,
