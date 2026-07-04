@@ -114,6 +114,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "wire-format",
       "replication-config",
       "error-codes",
+      "mcp-bridge",
       "cli",
     ],
     tutorials: [
@@ -212,6 +213,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "reference/wire-format": "Wire Format",
     "reference/replication-config": "Replication Configuration",
     "reference/error-codes": "Error Codes",
+    "reference/mcp-bridge": "MCP Bridge",
     "reference/cli": "CLI Reference",
 
     // SDKs

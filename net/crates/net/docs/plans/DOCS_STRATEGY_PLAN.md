@@ -1,6 +1,13 @@
 # Documentation Strategy — Agentic-Mesh Legibility + Developer Wedge
 
-**Status:** PROPOSED (2026-07-04). Not started. Authored on branch `docs-5`
+**Status:** IN PROGRESS → substantially DONE (2026-07-04). Phase 0 (audit),
+Phase 1 (worldview + positioning), Phase 2 (developer-wedge guides), Phase 3
+(five-language SDK spine — see `DOCS_SDK_SPINE_PLAN.md`), Phase 4 (agent briefs),
+and Phase 5 (reference: `reference/mcp-bridge.md`) have all landed as separate
+commits, each with `cd web && npm run build` green. Remaining polish: Phase 3b
+per-binding deep-verification against `sdk-ts`/`sdk-py`/`go`/`net.h` beyond the
+grounded pass already done, and any further reference reframing. Authored on
+branch `docs-5`
 (off the near-production MCP branch — the MCP bridge crate `net-mesh-mcp`,
 `net wrap` / `net mcp serve` / `net mcp pin`, tests, and CI are present; see
 `MCP_BRIDGE_PLAN.md`). This plan governs the public docs under
