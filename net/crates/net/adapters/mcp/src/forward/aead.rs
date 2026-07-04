@@ -428,7 +428,10 @@ mod tests {
             .seal(&sample("node-dest", 1_000))
             .await
             .unwrap_err();
-        assert!(matches!(err, SealError::Backend(_)), "low-order key must be rejected");
+        assert!(
+            matches!(err, SealError::Backend(_)),
+            "low-order key must be rejected"
+        );
     }
 
     #[tokio::test]

@@ -732,7 +732,10 @@ mod tests {
         assert!(validate_ref_name("github-token").is_ok());
         for bad in ["Github-Token", "", "has space", "-leading", &"x".repeat(65)] {
             assert!(
-                matches!(validate_ref_name(bad), Err(StoreError::InvalidRefName { .. })),
+                matches!(
+                    validate_ref_name(bad),
+                    Err(StoreError::InvalidRefName { .. })
+                ),
                 "{bad:?} must be rejected",
             );
         }
@@ -859,7 +862,10 @@ mod tests {
                 "forwarding": { "enabled": true, "secrets": serde_json::Value::Object(secrets) }
             });
             assert!(
-                matches!(load_json(json).await.unwrap_err(), StoreError::Corrupt { .. }),
+                matches!(
+                    load_json(json).await.unwrap_err(),
+                    StoreError::Corrupt { .. }
+                ),
                 "ref name {bad_ref:?} must be rejected on load",
             );
         }

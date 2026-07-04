@@ -149,7 +149,11 @@ mod tests {
         let mut v = Vec::with_capacity(32);
         v.extend_from_slice(b"ghp_SUPERSECRET");
         zeroize_secret(&mut v);
-        assert_eq!(v.len(), 32, "grown to capacity so spare bytes are scrubbed too");
+        assert_eq!(
+            v.len(),
+            32,
+            "grown to capacity so spare bytes are scrubbed too"
+        );
         assert!(v.iter().all(|&b| b == 0), "every byte is zero");
     }
 }

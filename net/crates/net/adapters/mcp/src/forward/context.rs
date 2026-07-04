@@ -493,7 +493,10 @@ mod tests {
         );
         assert!(matches!(
             ctx.validate().unwrap_err(),
-            ContextError::FieldTooLong { field: "sealed_to", .. },
+            ContextError::FieldTooLong {
+                field: "sealed_to",
+                ..
+            },
         ));
     }
 
