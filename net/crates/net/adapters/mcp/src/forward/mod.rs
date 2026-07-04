@@ -101,7 +101,9 @@ pub use seal::{
 pub use secret::{
     resolve_secret_send, InMemorySecretBackend, ResolveError, SecretBackend, SecretBackendError,
 };
-pub use store::{ForwardingAudit, ForwardingStore, Grant, GrantKind, StoreError};
+pub use store::{
+    validate_ref_name, ForwardingAudit, ForwardingStore, Grant, GrantKind, StoreError,
+};
 pub use target::{
     forwarding_supported, resolve_injection, risk_tags_for_accept_policy, ForwardingUnsupported,
     InjectionTarget, WrapTransport, RISK_TAG_ACCEPTS_FORWARDED_CREDENTIALS,

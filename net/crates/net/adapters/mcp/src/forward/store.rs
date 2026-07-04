@@ -542,7 +542,12 @@ fn render_providers(scope: &ProviderScope) -> String {
 /// name (real tokens usually carry uppercase) — the plan's "never encode a
 /// value in the name" is a convention the charset can only partly enforce, so
 /// the value-in-name prohibition stays a documented convention on top.
-fn validate_ref_name(name: &str) -> Result<(), StoreError> {
+///
+/// Public so the value-entry path (`net forwarding set-value`) can reject a
+/// mistyped ref name at entry — a keychain value stored under a name the policy
+/// side would never accept as a slug can never be resolved, and would otherwise
+/// fail silently as `ValueMissing` at forward time.
+pub fn validate_ref_name(name: &str) -> Result<(), StoreError> {
     let reject = |reason| {
         Err(StoreError::InvalidRefName {
             name: name.to_string(),
@@ -682,6 +687,19 @@ mod tests {
                 false
             )
             .is_ok());
+    }
+
+    #[test]
+    fn public_validate_ref_name_gates_the_value_entry_path() {
+        // `net forwarding set-value` calls this to reject a mistyped ref name at
+        // entry; lock the public contract the CLI depends on.
+        assert!(validate_ref_name("github-token").is_ok());
+        for bad in ["Github-Token", "", "has space", "-leading", &"x".repeat(65)] {
+            assert!(
+                matches!(validate_ref_name(bad), Err(StoreError::InvalidRefName { .. })),
+                "{bad:?} must be rejected",
+            );
+        }
     }
 
     #[tokio::test]

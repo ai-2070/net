@@ -129,8 +129,14 @@ pub async fn run(
 /// trailing newline is stripped. The value is never echoed back.
 #[cfg(feature = "keychain")]
 async fn set_value(args: SetValueArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
-    use net_mcp::forward::{KeychainSecretBackend, DEFAULT_KEYCHAIN_SERVICE};
+    use net_mcp::forward::{validate_ref_name, KeychainSecretBackend, DEFAULT_KEYCHAIN_SERVICE};
     use tokio::io::AsyncReadExt;
+
+    // Reject a mistyped ref name before reading the secret: the keychain account
+    // is this name verbatim, but the policy side stores refs as lowercase slugs
+    // (`net forwarding allow`), so a value under a non-slug name can never be
+    // resolved and would fail silently as `ValueMissing` at forward time.
+    validate_ref_name(&args.ref_name).map_err(|e| invalid_args(e.to_string()))?;
 
     let mut buf = Vec::new();
     tokio::io::stdin()
