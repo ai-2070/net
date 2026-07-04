@@ -1,0 +1,21 @@
+net/crates/net/adapters/mcp/src/serve/shim.rs
+  s_759aaad81078ca::t_d27b49ac9e830f 1406-1435
+  s_759aaad81078ca::t_91469c4499a663 423-436
+  s_759aaad81078ca::t_5bf646cfefb212 1405
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c90b6731e53570ed1c68c1048bf386f9051111f4",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
