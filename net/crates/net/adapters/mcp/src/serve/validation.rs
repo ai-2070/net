@@ -61,8 +61,12 @@ pub fn validate_args(args: &Value, schema: &Value) -> Result<(), ValidationError
         return Ok(());
     };
 
-    let declared_type = schema_obj.get("type").and_then(|t| t.as_str());
-    let has_object_shape = declared_type == Some("object")
+    // Enforce the object contract when the schema declares an object type
+    // (as a string OR a union array containing "object", e.g.
+    // `{"type":["object","null"]}`), or carries `properties` / `required`.
+    // Reading `type` only as a string would skip validation for a union and
+    // let non-object args round-trip to the provider.
+    let has_object_shape = type_includes_object(schema_obj.get("type"))
         || schema_obj.contains_key("properties")
         || schema_obj.contains_key("required");
     if !has_object_shape {
@@ -112,6 +116,19 @@ pub fn validate_args(args: &Value, schema: &Value) -> Result<(), ValidationError
     }
 
     Ok(())
+}
+
+/// Does a JSON Schema `type` declaration include the object type — `"object"`
+/// as a string, or a union array containing `"object"`? Used at the top level
+/// to decide whether to enforce the object contract, so a
+/// `{"type":["object","null"]}` schema (without `properties`/`required`) is
+/// still validated rather than skipped.
+fn type_includes_object(type_decl: Option<&Value>) -> bool {
+    match type_decl {
+        Some(Value::String(s)) => s == "object",
+        Some(Value::Array(alts)) => alts.iter().any(|a| a.as_str() == Some("object")),
+        _ => false,
+    }
 }
 
 /// Does `value` satisfy a JSON Schema `type` declaration? The declaration is
@@ -279,5 +296,16 @@ mod tests {
         });
         assert!(validate_args(&json!({ "x": 123 }), &s).is_ok());
         assert!(validate_args(&json!({ "x": "str" }), &s).is_ok());
+    }
+
+    #[test]
+    fn top_level_object_type_union_is_enforced() {
+        // `{"type":["object","null"]}` (no properties/required) declares an
+        // object type via a union — the object contract must still be enforced
+        // so a non-object argument can't bypass validation to the provider.
+        let s = json!({ "type": ["object", "null"] });
+        assert!(validate_args(&json!({ "any": 1 }), &s).is_ok());
+        let err = validate_args(&json!([1, 2, 3]), &s).unwrap_err();
+        assert!(err.message.contains("must be a JSON object"), "{err}");
     }
 }
