@@ -27,6 +27,7 @@
 
 pub mod backend;
 pub mod consent;
+pub mod grouping;
 pub mod mesh_gateway;
 pub mod meta_tools;
 pub mod pins;
