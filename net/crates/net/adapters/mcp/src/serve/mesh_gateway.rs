@@ -120,21 +120,18 @@ impl CapabilityGateway for MeshGateway {
         let q = query.to_lowercase();
         let mut out = Vec::new();
         for node in providers {
-            match self.fetch_catalog(node, &DescribeRequest::default()).await {
-                Ok(catalog) => {
-                    for t in catalog.tools {
-                        if q.is_empty() || matches_query(&t, &q) {
-                            out.push(summary(node, t));
-                        }
-                    }
+            // Any per-provider failure makes that provider invisible — never
+            // fail the whole search. Concretely: `Denied` (out of owner scope),
+            // `Transport` (unreachable, or serving no describe service — a
+            // `NoRoute` maps here), or `Other` (a catalog we couldn't decode).
+            // One bad or hostile provider must not abort global discovery.
+            let Ok(catalog) = self.fetch_catalog(node, &DescribeRequest::default()).await else {
+                continue;
+            };
+            for t in catalog.tools {
+                if q.is_empty() || matches_query(&t, &q) {
+                    out.push(summary(node, t));
                 }
-                // A provider that denies us (out of owner scope), no longer
-                // serves the describe service, or is unreachable is simply
-                // invisible — skip it, don't fail the whole search.
-                Err(GatewayError::Denied(_))
-                | Err(GatewayError::NotFound(_))
-                | Err(GatewayError::Transport(_)) => continue,
-                Err(e) => return Err(e),
             }
         }
         Ok(out)
