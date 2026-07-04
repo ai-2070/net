@@ -53,7 +53,10 @@ bytes = "1"
 # BLAKE2s-MAC KDF + XChaCha20-Poly1305 AEAD, mirroring the core's proven
 # identity-envelope construction. Pure-Rust "protocol support" (the
 # dependency-boundary test forbids only a direct `net-mesh` dep, not crypto
-# crates), and already resolved in the workspace lock via core.
+# crates). `blake2` and `x25519-dalek` share core's already-locked versions;
+# `chacha20poly1305` 0.11 and `getrandom` 0.4 pull a newer major than core's
+# (0.10 / 0.2–0.3), which Cargo coexists — a deliberate trade of a second
+# locked copy for staying current, not an oversight.
 blake2 = "0.10"
 chacha20poly1305 = "0.11"
 getrandom = "0.4"
