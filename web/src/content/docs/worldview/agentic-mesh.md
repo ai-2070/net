@@ -39,7 +39,7 @@ that announcement into a local index; and any node can **query** the index by
 what it needs rather than by who has it:
 
 ```
-net cap query gpu vram:24                 # who can do this, right now?
+net cap query --tag gpu --tag vram:24     # who can do this, right now?
 net cap nodes                             # everything the local index knows
 ```
 

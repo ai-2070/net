@@ -45,6 +45,10 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "storage-stack",
     ],
     guides: [
+      "wrap-mcp-server",
+      "expose-net-as-mcp",
+      "discover-and-invoke",
+      "recover-failed-workflow",
       "event-bus",
       "nrpc",
       "durable-logs",
@@ -139,6 +143,10 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "concepts/storage-stack": "The Storage Stack",
 
     // Guides
+    "guides/wrap-mcp-server": "Wrap an MCP Server",
+    "guides/expose-net-as-mcp": "Expose Net as MCP",
+    "guides/discover-and-invoke": "Discover and Invoke",
+    "guides/recover-failed-workflow": "Recover a Failed Workflow",
     "guides/event-bus": "Using the Event Bus",
     "guides/nrpc": "Typed RPC with nRPC",
     "guides/durable-logs": "Durable Logs (RedEX)",
