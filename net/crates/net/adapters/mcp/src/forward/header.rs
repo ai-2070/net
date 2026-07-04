@@ -36,8 +36,43 @@ pub const MAX_TOTAL_FORWARDED_BYTES: usize = 32 * 1024;
 /// Header names that are ambient credentials or credential-adjacent. They are
 /// single-value only (never folded), and accepting one auto-tags a capability
 /// [`accepts_forwarded_credentials`](crate::forward::RISK_TAG_ACCEPTS_FORWARDED_CREDENTIALS).
-/// Stored lowercased — compare against [`HeaderName::as_str`].
-const SECURITY_SENSITIVE: &[&str] = &["authorization", "cookie", "set-cookie"];
+/// Stored lowercased — compare against [`HeaderName::as_str`]. Widening this
+/// beyond `authorization`/`cookie` is what stops a bearer credential riding the
+/// **plain** path (or evading the risk tag) just because it uses a vendor
+/// header like `x-api-key` instead of `Authorization`.
+const SECURITY_SENSITIVE_EXACT: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "authentication",
+    "x-auth-key",
+    "x-functions-key",
+];
+
+/// Substrings that mark a header name credential-bearing even when it is not in
+/// [`SECURITY_SENSITIVE_EXACT`] — catches vendor variants (`x-acme-api-key`,
+/// `x-session-token`, `…-secret`) so a novel name can't slip a credential onto
+/// the plain path. Deliberately narrow: bare `-key` / `-token` are **not**
+/// listed, so benign idempotency / partition / trace / csrf headers stay
+/// plain-eligible while real credential shapes (`api-key`, `auth-token`,
+/// `access-token`, `session-token`, `security-token`, `secret`, `password`) do
+/// not.
+const SECURITY_SENSITIVE_SUBSTR: &[&str] = &[
+    "apikey",
+    "api-key",
+    "api_key",
+    "auth-token",
+    "auth_token",
+    "access-token",
+    "access_token",
+    "session-token",
+    "session_token",
+    "security-token",
+    "secret",
+    "password",
+    "passwd",
+];
 
 /// Hop-by-hop headers (RFC 7230 §6.1) plus the `proxy-` family. These describe
 /// a single transport hop, never end-to-end authority, so they are **never**
@@ -111,11 +146,17 @@ impl HeaderName {
         &self.0
     }
 
-    /// A credential or credential-adjacent header (`authorization`, `cookie`,
-    /// `set-cookie`) — single-value only, and its acceptance flags a capability
-    /// as taking forwarded credentials.
+    /// A credential or credential-adjacent header — `authorization`, `cookie`,
+    /// `set-cookie`, and the vendor bearer-credential family (`x-api-key`,
+    /// `x-auth-token`, `x-amz-security-token`, `…-secret`, …). Single-value only,
+    /// and its acceptance flags a capability as taking forwarded credentials.
+    /// Such a header can never ride the plain path — it must use the (stricter)
+    /// secret path.
     pub fn is_security_sensitive(&self) -> bool {
-        SECURITY_SENSITIVE.contains(&self.0.as_str())
+        SECURITY_SENSITIVE_EXACT.contains(&self.0.as_str())
+            || SECURITY_SENSITIVE_SUBSTR
+                .iter()
+                .any(|needle| self.0.contains(needle))
     }
 
     /// A hop-by-hop header (never end-to-end, so never forwardable). `proxy-*`
@@ -336,6 +377,43 @@ mod tests {
         let trace = HeaderName::parse("X-Trace-Id").unwrap();
         assert!(!trace.is_security_sensitive());
         assert!(trace.is_forwardable());
+    }
+
+    #[test]
+    fn widened_credential_classification() {
+        // Vendor bearer-credential headers are sensitive (exact + substring), so
+        // they can't ride the plain path or evade the credential risk tag.
+        for cred in [
+            "x-api-key",
+            "X-Api-Key",
+            "x-acme-api-key",
+            "x-auth-token",
+            "x-amz-security-token",
+            "x-session-token",
+            "x-vault-secret",
+            "proxy-authorization",
+            "x-functions-key",
+        ] {
+            assert!(
+                HeaderName::parse(cred).unwrap().is_security_sensitive(),
+                "{cred:?} must be treated as a credential",
+            );
+        }
+        // Benign `*-key` / `*-token` headers stay plain-eligible — they carry no
+        // long-lived secret, and the narrow heuristic deliberately excludes them.
+        for plain in [
+            "x-trace-id",
+            "x-tenant-id",
+            "x-idempotency-key",
+            "x-partition-key",
+            "x-csrf-token",
+            "x-request-id",
+        ] {
+            assert!(
+                !HeaderName::parse(plain).unwrap().is_security_sensitive(),
+                "{plain:?} must stay plain-eligible",
+            );
+        }
     }
 
     #[test]

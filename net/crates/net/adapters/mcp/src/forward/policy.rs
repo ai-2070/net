@@ -658,6 +658,23 @@ mod tests {
     }
 
     #[test]
+    fn plain_path_refuses_vendor_credential_headers() {
+        // A vendor bearer credential (x-api-key) is classified sensitive, so it
+        // can't ride the plain path even with a fully-matching allowlist — the
+        // same gate that already blocks Authorization.
+        let cfg = cfg_json(serde_json::json!({
+            "enabled": true,
+            "plain_headers": {
+                "X-Api-Key": { "allow": { "providers": "any", "capabilities": ["*"] } }
+            }
+        }));
+        assert_eq!(
+            cfg.decide_plain("X-Api-Key", "n", "any.cap"),
+            Err(DenialLevel::PerHeader),
+        );
+    }
+
+    #[test]
     fn plain_denial_order_matches_secret() {
         // A non-forwardable plain header + capability mismatch reports
         // PerCapability (permits runs first) — the same level decide_secret

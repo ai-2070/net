@@ -140,5 +140,13 @@ mod tests {
 
         let none = AcceptPolicy::default();
         assert!(risk_tags_for_accept_policy(&none).is_empty());
+
+        // A vendor bearer credential in the accept-list also earns the tag — a
+        // wrapper accepting `x-api-key` can't hide its credential surface.
+        let vendor = AcceptPolicy::from_flag("X-Api-Key", false).unwrap();
+        assert_eq!(
+            risk_tags_for_accept_policy(&vendor),
+            vec![RISK_TAG_ACCEPTS_FORWARDED_CREDENTIALS],
+        );
     }
 }
