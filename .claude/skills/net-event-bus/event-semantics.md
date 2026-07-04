@@ -31,6 +31,42 @@ Net's own primitives sit at levels 1–2. A `Receipt` from `emit`/`publish` is l
 
 **The rule:** an event may only assert a level the producer has actually observed. A component that merely *issued a request* has observed level 1 of its own action. It has not observed the effect. So it may emit `valve.open.requested` — never `valve.opened`. Only the actor that observes the valve physically open (level 3) may emit `valve.opened`.
 
+## The ladder in one domain — a payment
+
+Payments make the four levels concrete, and make the cost of collapsing them visceral: the gap between levels is *money that has or hasn't moved*.
+
+| Level | Payment fact | What a `200` here does **not** mean |
+|---|---|---|
+| 1. accepted | the checkout service accepted the charge request | the card was charged |
+| 2. delivered / durable | the charge event is on the log / reached the gateway | the bank approved it |
+| 3. effect applied | the gateway **authorized** (a hold), then later **captured** (a debit) | the funds have settled |
+| 4. invariant holds | the payment **settled** and reconciles against the ledger and the bank feed | — (the only level the business can bill against) |
+
+The classic loss: a checkout service emits `payment.ok` the instant the gateway returns `200 Authorized`, a fulfillment consumer reads that as "paid," and ships the goods. But *authorized ≠ captured ≠ settled*. The hold expires, the capture fails, or the settlement reverses — and goods left the building against money that never arrived. Nothing errored; the `200` was true at level 3-authorize and false at level 4.
+
+Represent each stage as the fact whoever observed it can honestly assert:
+
+```jsonc
+// the checkout service observed only that it asked the gateway
+{ "event": "payment.charge.requested", "order": "A-8123", "amount": 4200, "currency": "USD", "idempotency_key": "chg_A-8123" }
+
+// the gateway adapter observed an authorization hold — NOT a settled payment
+{ "event": "payment.authorized", "order": "A-8123", "auth_id": "auth_9f", "amount": 4200 }
+
+// ...capture is a separate fact, emitted when it actually happens
+{ "event": "payment.captured", "order": "A-8123", "auth_id": "auth_9f", "captured": 4200 }
+
+// ...a decline/failure is its own fact with a reason, never the mere absence of the above
+{ "event": "payment.declined", "order": "A-8123", "reason": "insufficient_funds" }
+
+// ...settlement (level 4) is observed later, by the reconciliation job against the bank feed
+{ "event": "payment.settled", "order": "A-8123", "batch": "2026-07-04-eu", "net": 4183 }
+```
+
+Fulfillment subscribes to `payment.captured` — not `payment.authorized`, and definitely not a generic `payment.ok` — and folds the facts into "safe to ship?" itself. Finance subscribes to `payment.settled` for revenue recognition. Two consumers, two different notions of "success," both computed from the same honest stream — impossible if the producer had collapsed it into one boolean.
+
+The `idempotency_key` is the other half of doing this right: because the bus is at-least-once and a producer may retry, the key lets a consumer dedup a re-emitted `payment.charge.requested` so a retry never becomes a double charge (`gotchas.md` § "I need exactly-once delivery"). A fact carries the identity that makes it safe to see twice; a bare `200` acknowledgement carries nothing.
+
 ## The `200 OK` lie, generically
 
 A request/response API hands the caller a single status code, so it *looks* like one boolean settles everything. But behind any non-trivial effect is a chain of stages:
@@ -102,4 +138,4 @@ A consumer that wants "is the north gate open?" folds `door.unlocked` / `door.un
 - **Transport truth belongs to the transport** (`Receipt`, `Reliable`, RedEX cursor), not to the event payload.
 - **Success is a projection consumers compute over facts**, not a primitive you publish.
 
-When the user's event names or payloads carry `ok` / `done` / `200` / `delivered` semantics, walk them down the ladder and reshape the event as a fact. See `concepts.md` § Publisher (what a receipt does and doesn't mean), `payloads.md` (event form), `cortex.md` (folding facts into a status view), and `nrpc.md` (when a caller genuinely needs a typed reply).
+When the user's event names or payloads carry `ok` / `done` / `200` / `delivered` semantics, walk them down the ladder and reshape the event as a fact. See `concepts.md` § Publisher (what a receipt does and doesn't mean), `payloads.md` (event form), `cortex.md` (folding facts into a status view), `gotchas.md` § "I need exactly-once delivery" (idempotency keys so a fact is safe to see twice), and `nrpc.md` (when a caller genuinely needs a typed reply).
