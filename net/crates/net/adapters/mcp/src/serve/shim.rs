@@ -17,6 +17,7 @@
 //! the CLI drives it over real stdio.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -30,9 +31,14 @@ use super::{
 };
 use crate::spec::{
     method, CallToolParams, CallToolResult, Implementation, IncomingKind, IncomingMessage,
-    JsonRpcErrorResponse, JsonRpcSuccess, RequestId, INVALID_PARAMS, INVALID_REQUEST,
-    METHOD_NOT_FOUND, PARSE_ERROR, PROTOCOL_VERSION,
+    JsonRpcErrorResponse, JsonRpcNotification, JsonRpcSuccess, RequestId, INVALID_PARAMS,
+    INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR, PROTOCOL_VERSION,
 };
+
+/// How often the serve loop polls the pin store to detect an out-of-band
+/// approval and emit `tools/list_changed`. Interactive-paced; overridable in
+/// tests via [`Shim::with_pin_poll_interval`].
+const DEFAULT_PIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The demand-side shim: a stdio MCP server exposing the mesh's capabilities
 /// as meta-tools, backed by a [`CapabilityGateway`].
@@ -45,6 +51,8 @@ pub struct Shim<G> {
     /// there, and it is reloaded per call so an out-of-band `net mcp pin
     /// approve` is seen immediately. `None` in tests keeps consent in-memory.
     pin_store_path: Option<PathBuf>,
+    /// How often to poll the pin store for changes (emitting list_changed).
+    pin_poll_interval: Duration,
     /// Set once the host sends `notifications/initialized`. Tracked for
     /// completeness; the stateless shim answers regardless.
     initialized: bool,
@@ -61,6 +69,7 @@ impl<G: CapabilityGateway> Shim<G> {
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
             pin_store_path: None,
+            pin_poll_interval: DEFAULT_PIN_POLL_INTERVAL,
             initialized: false,
         }
     }
@@ -77,6 +86,28 @@ impl<G: CapabilityGateway> Shim<G> {
     pub fn with_pin_store(mut self, path: PathBuf) -> Self {
         self.pin_store_path = Some(path);
         self
+    }
+
+    /// Override the pin-store poll interval (how quickly an out-of-band
+    /// approval triggers a `tools/list_changed`).
+    pub fn with_pin_poll_interval(mut self, interval: Duration) -> Self {
+        self.pin_poll_interval = interval;
+        self
+    }
+
+    /// A stable signature of the currently-approved pin set (sorted display
+    /// ids). Changing it is what triggers a `tools/list_changed` — so only an
+    /// approval/removal that changes the *promoted* tools notifies the host,
+    /// not a mere pending request.
+    async fn approved_signature(&self) -> Vec<String> {
+        match self.load_pins().await {
+            Some(store) => {
+                let mut ids: Vec<String> = store.approved().iter().map(|id| id.display()).collect();
+                ids.sort();
+                ids
+            }
+            None => Vec::new(),
+        }
     }
 
     /// Load the pin store, if one is configured. A read/parse error yields
@@ -98,21 +129,44 @@ impl<G: CapabilityGateway> Shim<G> {
 
     /// Run the server loop until the host closes stdin (EOF). Each non-empty
     /// input line is handled; requests produce exactly one response line,
-    /// notifications produce none.
+    /// notifications produce none. Concurrently — via one `select!`, so no
+    /// extra task or shared writer — the loop polls the pin store and emits
+    /// `tools/list_changed` when an out-of-band `net mcp pin approve` changes
+    /// the promoted tool set, so the host refreshes without re-listing on a
+    /// timer of its own.
     pub async fn serve<R, W>(mut self, reader: R, mut writer: W) -> std::io::Result<()>
     where
         R: AsyncBufRead + Unpin,
         W: AsyncWrite + Unpin,
     {
         let mut lines = reader.lines();
-        while let Some(line) = lines.next_line().await? {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Some(response) = self.handle_line(&line).await {
-                writer.write_all(response.as_bytes()).await?;
-                writer.write_all(b"\n").await?;
-                writer.flush().await?;
+        // Only watch when a pin store is configured; otherwise the tick branch
+        // is a never-ready future and the loop is a pure read loop.
+        let mut watch = self
+            .pin_store_path
+            .as_ref()
+            .map(|_| tokio::time::interval(self.pin_poll_interval));
+        let mut last_sig = self.approved_signature().await;
+
+        loop {
+            tokio::select! {
+                line = lines.next_line() => {
+                    let Some(line) = line? else { break }; // EOF
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    if let Some(response) = self.handle_line(&line).await {
+                        write_line(&mut writer, &response).await?;
+                    }
+                }
+                _ = tick(&mut watch) => {
+                    let sig = self.approved_signature().await;
+                    if sig != last_sig {
+                        last_sig = sig;
+                        let note = JsonRpcNotification::new(method::TOOLS_LIST_CHANGED, None);
+                        write_line(&mut writer, &line_of(&note)).await?;
+                    }
+                }
             }
         }
         Ok(())
@@ -172,19 +226,25 @@ impl<G: CapabilityGateway> Shim<G> {
                 // and answer regardless of handshake ordering.
                 let result = json!({
                     "protocolVersion": PROTOCOL_VERSION,
-                    // We serve tools/list; listChanged notifications land with
-                    // pin promotion (Phase 3).
-                    "capabilities": { "tools": {} },
+                    // We serve tools/list and emit list_changed when the pin set
+                    // changes (a pinned capability is promoted to a first-class
+                    // tool), so advertise the capability.
+                    "capabilities": { "tools": { "listChanged": true } },
                     "serverInfo": to_value_or_null(&self.server_info),
                     "instructions": "Net mesh capability bridge. Use net_search_capabilities \
                                      to find tools on the mesh, net_describe_capability for a \
-                                     tool's schema, then net_invoke_capability to run it.",
+                                     tool's schema, then net_invoke_capability to run it. \
+                                     Approved-pinned capabilities also appear as first-class \
+                                     tools by their own name.",
                 });
                 success_line(id, result)
             }
             method::TOOLS_LIST => {
-                let tools = to_value_or_null(&meta_tools::meta_tools());
-                success_line(id, json!({ "tools": tools }))
+                // Meta-tools first, then every approved-pinned capability as a
+                // first-class typed tool (its own name + real schema).
+                let mut tools = meta_tools::meta_tools();
+                tools.extend(self.promoted_pinned_tools().await);
+                success_line(id, json!({ "tools": to_value_or_null(&tools) }))
             }
             method::TOOLS_CALL => self.handle_tools_call(id, params).await,
             other => error_line(
@@ -215,29 +275,72 @@ impl<G: CapabilityGateway> Shim<G> {
             }
         };
 
-        let result = self.dispatch_meta_tool(&call.name, &call.arguments).await;
+        let result = self.dispatch_tool(&call.name, &call.arguments).await;
         success_line(id, to_value_or_null(&result))
     }
 
-    /// Route a `tools/call` for a meta-tool to its handler. Unknown names
-    /// return an in-band tool error listing the available meta-tools.
-    async fn dispatch_meta_tool(&self, name: &str, args: &Value) -> CallToolResult {
+    /// Route a `tools/call` to its handler: a meta-tool, an approved-pinned
+    /// capability invoked directly by its first-class name, or an in-band
+    /// unknown-tool error.
+    async fn dispatch_tool(&self, name: &str, args: &Value) -> CallToolResult {
         match name {
             n if n == meta_tools::name::SEARCH => self.tool_search(args).await,
             n if n == meta_tools::name::DESCRIBE => self.tool_describe(args).await,
             n if n == meta_tools::name::INVOKE => self.tool_invoke(args).await,
             n if n == meta_tools::name::LIST_PINNED => self.tool_list_pinned().await,
             n if n == meta_tools::name::REQUEST_PIN => self.tool_request_pin(args).await,
-            other => CallToolResult::text_error(format!(
-                "unknown tool `{other}`. This server exposes meta-tools only: \
-                 {}, {}, {}, {}, {}. Use net_search_capabilities to find mesh tools.",
-                meta_tools::name::SEARCH,
-                meta_tools::name::DESCRIBE,
-                meta_tools::name::INVOKE,
-                meta_tools::name::LIST_PINNED,
-                meta_tools::name::REQUEST_PIN,
-            )),
+            other => match self.resolve_pinned_tool(other).await {
+                // A promoted pinned tool — the arguments are the capability's
+                // own arguments (no meta-tool wrapper). Consent is already
+                // satisfied by the approved pin.
+                Some(id) => self.invoke_capability(&id, args.clone()).await,
+                None => CallToolResult::text_error(format!(
+                    "unknown tool `{other}`. This server exposes the net_* meta-tools \
+                     ({}, {}, {}, {}, {}) plus any approved-pinned capabilities by name. \
+                     Use net_search_capabilities to find mesh tools.",
+                    meta_tools::name::SEARCH,
+                    meta_tools::name::DESCRIBE,
+                    meta_tools::name::INVOKE,
+                    meta_tools::name::LIST_PINNED,
+                    meta_tools::name::REQUEST_PIN,
+                )),
+            },
         }
+    }
+
+    /// The approved-pinned capabilities, each as a first-class typed tool named
+    /// by its host-safe name with its real input schema. A pin whose provider
+    /// is currently unreachable is skipped rather than listed without a schema.
+    async fn promoted_pinned_tools(&self) -> Vec<crate::spec::Tool> {
+        let Some(store) = self.load_pins().await else {
+            return Vec::new();
+        };
+        let mut tools = Vec::new();
+        for id in store.approved() {
+            if let Ok(detail) = self.gateway.describe(&id).await {
+                tools.push(crate::spec::Tool {
+                    name: safe_tool_name(&id),
+                    title: Some(id.display()),
+                    description: detail
+                        .description
+                        .or_else(|| Some(format!("Pinned capability {}", id.display()))),
+                    input_schema: detail.input_schema,
+                    output_schema: detail.output_schema,
+                });
+            }
+        }
+        tools
+    }
+
+    /// Resolve a called first-class tool name to the approved-pinned capability
+    /// it stands for, if any. Deterministic (recomputed from the store each
+    /// call), so no cross-request state is needed.
+    async fn resolve_pinned_tool(&self, name: &str) -> Option<CapabilityId> {
+        let store = self.load_pins().await?;
+        store
+            .approved()
+            .into_iter()
+            .find(|id| safe_tool_name(id) == name)
     }
 
     async fn tool_search(&self, args: &Value) -> CallToolResult {
@@ -304,10 +407,17 @@ impl<G: CapabilityGateway> Shim<G> {
         };
         // The nested tool arguments; absent means "no arguments".
         let tool_args = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        self.invoke_capability(&id, tool_args).await
+    }
 
+    /// Invoke `id` with `tool_args` (the capability's own arguments): describe
+    /// → pre-flight validate → consent gate → route to the provider. Shared by
+    /// the `net_invoke_capability` meta-tool and the first-class pinned-tool
+    /// dispatch.
+    async fn invoke_capability(&self, id: &CapabilityId, tool_args: Value) -> CallToolResult {
         // Describe first — the single source of truth for the schema (for
         // pre-flight validation) and the credential status (for consent).
-        let detail = match self.gateway.describe(&id).await {
+        let detail = match self.gateway.describe(id).await {
             Ok(d) => d,
             Err(e) => return CallToolResult::text_error(gateway_error_text(&e)),
         };
@@ -325,14 +435,14 @@ impl<G: CapabilityGateway> Shim<G> {
         //     implied invocation. The pin store is reloaded here so an
         //     out-of-band `net mcp pin approve` takes effect immediately.
         let pins = self.load_pins().await;
-        if self.gated_after_pins(&id, &detail.credential_status, &pins) {
+        if self.gated_after_pins(id, &detail.credential_status, &pins) {
             return CallToolResult::text_error(requires_approval_message(&id.display()));
         }
 
         // [3] Route to the provider. A remote owner-scope rejection surfaces
         //     as the wrapper-denied message; a tool-level error rides back
         //     in the CallToolResult unchanged.
-        match self.gateway.invoke(&id, tool_args).await {
+        match self.gateway.invoke(id, tool_args).await {
             Ok(result) => result,
             Err(GatewayError::Denied(reason)) => {
                 CallToolResult::text_error(denied_message(&reason))
@@ -389,6 +499,25 @@ impl<G: CapabilityGateway> Shim<G> {
 
 // --- free helpers ----------------------------------------------------------
 
+/// Await the next pin-store poll tick, or never (a pure read loop) when no
+/// store is configured.
+async fn tick(watch: &mut Option<tokio::time::Interval>) {
+    match watch {
+        Some(interval) => {
+            interval.tick().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Write one line (+ newline) and flush.
+async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, line: &str) -> std::io::Result<()> {
+    writer.write_all(line.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
 /// Serialize to a JSON line, falling back to a canned internal-error line if
 /// serialization somehow fails (it does not for these types) — never panics.
 fn line_of<T: Serialize>(value: &T) -> String {
@@ -438,6 +567,27 @@ fn str_arg(args: &Value, field: &str) -> Result<String, String> {
 fn parse_cap_id_arg(args: &Value) -> Result<CapabilityId, String> {
     let raw = str_arg(args, "cap_id")?;
     CapabilityId::parse(&raw).map_err(|e| e.to_string())
+}
+
+/// A host-charset-safe first-class tool name for a pinned capability:
+/// `[a-zA-Z0-9_-]`, ≤ 64 chars (the Phase 4 model-facing naming rule). Derived
+/// deterministically from the id's display form so `tools/list` and
+/// `tools/call` agree without shared state. (Disambiguating rare collisions
+/// with a provider suffix is a later refinement.)
+fn safe_tool_name(id: &CapabilityId) -> String {
+    let mut name: String = id
+        .display()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    name.truncate(64);
+    name
 }
 
 /// Map a gateway error to the model-facing message, using the plan's exact
@@ -953,7 +1103,7 @@ mod tests {
         .await;
         let result = tool_result(&out[0]);
         assert!(result.is_error);
-        assert!(result.text().contains("meta-tools only"));
+        assert!(result.text().contains("unknown tool") && result.text().contains("meta-tools"));
     }
 
     #[tokio::test]
@@ -1098,5 +1248,168 @@ mod tests {
 
         let pinned = tool_result(&out[2]).structured_content.unwrap()["pinned"].clone();
         assert_eq!(pinned, json!(["nodeb/secret"]));
+    }
+
+    #[tokio::test]
+    async fn an_approved_pin_is_promoted_to_a_first_class_tool() {
+        let (_dir, path) = pin_path();
+        {
+            let mut store = PinStore::load(&path).await.unwrap();
+            store.approve(&CapabilityId::parse("nodeb/secret").unwrap());
+            store.save().await.unwrap();
+        }
+        let out = run_pinned(
+            gateway_with_echo_and_secret(),
+            ConsentPolicy::new(),
+            path,
+            &[
+                req(1, method::TOOLS_LIST, json!({})),
+                // Invoke it by its first-class name — arguments are the tool's
+                // own, no meta-tool wrapper, and consent is satisfied by the pin.
+                call(2, "nodeb_secret", json!({ "message": "direct" })),
+            ],
+        )
+        .await;
+
+        let tools = out[0]["result"]["tools"].as_array().unwrap();
+        // 5 meta-tools + the promoted pin.
+        assert_eq!(tools.len(), 6, "{tools:?}");
+        let promoted = tools
+            .iter()
+            .find(|t| t["name"] == "nodeb_secret")
+            .expect("the pinned capability is a first-class tool");
+        assert_eq!(promoted["inputSchema"]["type"], "object");
+        assert_eq!(promoted["title"], "nodeb/secret");
+
+        let invoked = tool_result(&out[1]);
+        assert!(
+            !invoked.is_error,
+            "pinned first-class tool runs: {invoked:?}"
+        );
+        assert!(invoked.text().contains("invoked nodeb/secret"));
+    }
+
+    #[tokio::test]
+    async fn an_unpinned_capability_has_no_first_class_tool() {
+        let (_dir, path) = pin_path();
+        // Empty store — nothing approved.
+        let out = run_pinned(
+            gateway_with_echo_and_secret(),
+            ConsentPolicy::new(),
+            path,
+            &[
+                req(1, method::TOOLS_LIST, json!({})),
+                call(2, "nodeb_secret", json!({ "message": "x" })),
+            ],
+        )
+        .await;
+        let tools = out[0]["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 5, "only meta-tools without an approved pin");
+        let result = tool_result(&out[1]);
+        assert!(result.is_error);
+        assert!(result.text().contains("unknown tool"));
+    }
+
+    #[test]
+    fn safe_tool_name_sanitizes_and_bounds() {
+        let id = CapabilityId::parse("homelab/github.create_issue").unwrap();
+        assert_eq!(safe_tool_name(&id), "homelab_github_create_issue");
+        // Bounded to 64 chars.
+        let long = CapabilityId::new("n", "a".repeat(200));
+        assert!(safe_tool_name(&long).len() <= 64);
+        // Only host-safe characters survive.
+        assert!(safe_tool_name(&long)
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+    }
+
+    #[tokio::test]
+    async fn an_out_of_band_approval_emits_tools_list_changed() {
+        let (_dir, path) = pin_path();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (server_rd, server_wr) = tokio::io::split(server);
+        let shim = Shim::new(gateway_with_echo_and_secret())
+            .with_pin_store(path.clone())
+            .with_pin_poll_interval(Duration::from_millis(25));
+        let handle =
+            tokio::spawn(async move { shim.serve(BufReader::new(server_rd), server_wr).await });
+
+        let (client_rd, mut client_wr) = tokio::io::split(client);
+        let mut reader = BufReader::new(client_rd).lines();
+
+        // Start the loop with an initialize, and consume its response.
+        let init = req(1, method::INITIALIZE, json!({}));
+        client_wr
+            .write_all(format!("{init}\n").as_bytes())
+            .await
+            .unwrap();
+        let resp: Value =
+            serde_json::from_str(&reader.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(resp["id"], 1);
+
+        // Approve a pin out of band (as `net mcp pin approve` would).
+        {
+            let mut store = PinStore::load(&path).await.unwrap();
+            store.approve(&CapabilityId::parse("nodeb/secret").unwrap());
+            store.save().await.unwrap();
+        }
+
+        // The shim should push a tools/list_changed notification. Bound the
+        // wait so a regression fails instead of hanging.
+        let note = tokio::time::timeout(Duration::from_secs(3), reader.next_line())
+            .await
+            .expect("list_changed arrives within the timeout")
+            .unwrap()
+            .unwrap();
+        let nv: Value = serde_json::from_str(&note).unwrap();
+        assert_eq!(nv["method"], method::TOOLS_LIST_CHANGED);
+        assert!(nv.get("id").is_none(), "a notification carries no id");
+
+        client_wr.shutdown().await.unwrap();
+        drop(client_wr);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_list_changed_without_an_approval_change() {
+        // A pending request (which the store records) must NOT emit
+        // list_changed — only a change to the *approved* set does.
+        let (_dir, path) = pin_path();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (server_rd, server_wr) = tokio::io::split(server);
+        let shim = Shim::new(gateway_with_echo_and_secret())
+            .with_pin_store(path.clone())
+            .with_pin_poll_interval(Duration::from_millis(20));
+        let handle =
+            tokio::spawn(async move { shim.serve(BufReader::new(server_rd), server_wr).await });
+
+        let (client_rd, mut client_wr) = tokio::io::split(client);
+        let mut reader = BufReader::new(client_rd).lines();
+
+        // request_pin records a pending record (writes the file) but the
+        // approved set is unchanged.
+        let c = call(
+            1,
+            meta_tools::name::REQUEST_PIN,
+            json!({ "cap_id": "nodeb/secret" }),
+        );
+        client_wr
+            .write_all(format!("{c}\n").as_bytes())
+            .await
+            .unwrap();
+        let resp: Value =
+            serde_json::from_str(&reader.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(resp["id"], 1, "got the request_pin response");
+
+        // Give the watcher several poll cycles; it must stay silent.
+        let quiet = tokio::time::timeout(Duration::from_millis(150), reader.next_line()).await;
+        assert!(
+            quiet.is_err(),
+            "a pending request must not emit list_changed: {quiet:?}",
+        );
+
+        client_wr.shutdown().await.unwrap();
+        drop(client_wr);
+        handle.await.unwrap().unwrap();
     }
 }
