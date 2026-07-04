@@ -43,10 +43,12 @@
 //!   OS-keychain backend (`KeychainSecretBackend`, behind the non-default
 //!   `keychain` feature) plugs in behind the same trait.
 //! - [`SealedContext`] / [`ForwardedContextSealer`] / [`ForwardedContextOpener`]
-//!   (**Phase 2**, seam) — the sealed wire form and the crypto boundary. The
-//!   AEAD itself is deferred (an SDK primitive vs. a crypto crate is a
-//!   decision); the fixed open-order invariants (destination → TTL → decrypt →
-//!   validate) and the shared AAD binding are defined and conformance-tested.
+//!   (**Phase 2**, seam) — the sealed wire form and the crypto boundary, with
+//!   fixed open-order invariants (destination → TTL → decrypt → validate) and
+//!   the shared AAD binding. [`X25519SealedBoxSealer`] / [`X25519SealedBoxOpener`]
+//!   are the real implementation (anonymous X25519 sealed box + XChaCha20-
+//!   Poly1305, mirroring the core's identity envelope); only mesh key
+//!   distribution (recipient pubkey / local secret) remains to wire.
 //!
 //! # Threat model (honest section)
 //!
@@ -66,6 +68,7 @@
 //! later need forwarding (plan Phase 2), these types promote to a shared crate
 //! unchanged — they take no MCP dependency.
 
+mod aead;
 mod context;
 mod header;
 #[cfg(feature = "keychain")]
@@ -85,6 +88,7 @@ pub use policy::{
     AcceptError, AcceptPolicy, AllowList, DenialLevel, ForwardingConfig, PlainHeaderPolicy,
     ProviderScope, SecretPolicy, SendGrant,
 };
+pub use aead::{X25519SealedBoxOpener, X25519SealedBoxSealer};
 pub use seal::{
     ForwardedContextOpener, ForwardedContextSealer, OpenError, SealError, SealedContext,
 };

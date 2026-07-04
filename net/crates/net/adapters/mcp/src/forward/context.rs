@@ -12,16 +12,17 @@
 //!
 //! ## What the AAD binds, and why
 //!
-//! The sealed payload (the header values) is bound — in a later phase, via the
-//! AEAD's associated data — to the non-secret envelope fields: destination
-//! node id, caller origin, capability id, invocation id, the declared header
-//! names, and the expiry. [`ForwardedContext::canonical_aad`] is the exact,
+//! The sealed payload (the header values) is bound — via the AEAD's associated
+//! data — to the non-secret envelope fields: destination node id, caller
+//! origin, capability id, invocation id, expiry, the single-use nonce, and the
+//! declared header names. [`ForwardedContext::canonical_aad`] is the exact,
 //! deterministic byte string that binding uses. Because the header **values**
 //! never enter the AAD, a captured blob reveals nothing, and because every
 //! other field does, a captured blob can't be replayed against another
 //! destination, caller, capability, or invocation — and dies at the TTL
-//! regardless. The nonce is deliberately *not* in the AAD: it becomes the AEAD
-//! nonce in Phase 2, guaranteeing a unique `(key, nonce)` per context.
+//! regardless. (The AEAD's own nonce is derived per-seal from the sealed-box
+//! ephemeral key, so the object's `nonce` field is an authenticated
+//! uniqueness token bound in the AAD, not the AEAD nonce itself.)
 //!
 //! ## Declared vs sealed
 //!
@@ -257,8 +258,9 @@ impl ForwardedContext {
     /// caller_origin  : field
     /// capability_id  : field
     /// invocation_id  : field
-    /// expires_at     : 8 bytes (u64 big-endian, unix seconds)
-    /// header_count   : 4 bytes (u32 big-endian)
+    /// expires_at     : 8 bytes  (u64 big-endian, unix seconds)
+    /// nonce          : 16 bytes (fixed)
+    /// header_count   : 4 bytes  (u32 big-endian)
     /// header_names   : field × header_count, ascending canonical order
     /// ```
     ///
@@ -275,6 +277,7 @@ impl ForwardedContext {
             &self.capability_id,
             &self.invocation_id,
             self.expires_at,
+            &self.nonce,
             &self.declared_names,
         )
     }
@@ -290,6 +293,7 @@ pub(crate) fn canonical_aad_bytes(
     capability_id: &str,
     invocation_id: &str,
     expires_at: u64,
+    nonce: &[u8; 16],
     declared_names: &BTreeSet<HeaderName>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
@@ -300,6 +304,7 @@ pub(crate) fn canonical_aad_bytes(
     write_field(&mut out, capability_id.as_bytes());
     write_field(&mut out, invocation_id.as_bytes());
     out.extend_from_slice(&expires_at.to_be_bytes());
+    out.extend_from_slice(nonce);
     // `declared_names.len()` fits u32 by construction (MAX_FORWARDED_HEADERS).
     out.extend_from_slice(&(declared_names.len() as u32).to_be_bytes());
     for name in declared_names {
@@ -361,7 +366,7 @@ mod tests {
     fn canonical_aad_matches_golden_vector() {
         // Pins the AAD wire encoding. A deliberate layout change re-runs the
         // `emit_golden_aad` emitter below and pastes the new hex here.
-        const GOLDEN_AAD_HEX: &str = "010000001e6e65742e696e766f6b652e666f727761726465645f636f6e7465787440310000000c6e6f64652d646573742d3031000000106f726967696e2d63616c6c65722d3037000000136769746875622e6372656174655f697373756500000014696e762d3030303030303030303030303030303100000000000f425e000000020000000d617574686f72697a6174696f6e0000000b782d74656e616e742d6964";
+        const GOLDEN_AAD_HEX: &str = "010000001e6e65742e696e766f6b652e666f727761726465645f636f6e7465787440310000000c6e6f64652d646573742d3031000000106f726967696e2d63616c6c65722d3037000000136769746875622e6372656174655f697373756500000014696e762d3030303030303030303030303030303100000000000f425e00000000000000000000000000000000000000020000000d617574686f72697a6174696f6e0000000b782d74656e616e742d6964";
         let aad = golden_context().canonical_aad();
         assert_eq!(to_hex(&aad), GOLDEN_AAD_HEX, "forwarded-context AAD drift");
     }

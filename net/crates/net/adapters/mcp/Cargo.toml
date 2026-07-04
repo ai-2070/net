@@ -49,6 +49,15 @@ net-mesh-sdk = { version = "0.31.0", path = "../../sdk", default-features = fals
 ] }
 async-trait = "0.1"
 bytes = "1"
+# Sealed-box crypto for the forwarded-context sealer (Phase 2): X25519 ECDH +
+# BLAKE2s-MAC KDF + XChaCha20-Poly1305 AEAD, mirroring the core's proven
+# identity-envelope construction. Pure-Rust "protocol support" (the
+# dependency-boundary test forbids only a direct `net-mesh` dep, not crypto
+# crates), and already resolved in the workspace lock via core.
+blake2 = "0.10"
+chacha20poly1305 = "0.11"
+getrandom = "0.4"
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 # Cross-process advisory file locking for the shared pin store, so a
 # load→modify→save transaction can't interleave with another shim / the pin
 # CLI and resurrect a removed consent decision.

@@ -2759,9 +2759,12 @@ name = "net-mesh-mcp"
 version = "0.31.0"
 dependencies = [
  "async-trait",
+ "blake2",
  "bytes",
+ "chacha20poly1305 0.11.0",
  "fs2",
  "futures",
+ "getrandom 0.4.3",
  "keyring",
  "net-mesh-sdk",
  "serde",
@@ -2770,6 +2773,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
+ "x25519-dalek",
 ]
 
 [[package]]
