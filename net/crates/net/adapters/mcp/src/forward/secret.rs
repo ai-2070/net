@@ -26,8 +26,21 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::fmt;
 
-use super::header::{ForwardedHeaderValue, HeaderError, HeaderName};
+use super::header::{zeroize_vec, ForwardedHeaderValue, HeaderError, HeaderName};
 use super::policy::{DenialLevel, ForwardingConfig};
+
+/// A zeroize-on-drop container for a stored secret value. Keeping the map's
+/// values in this wrapper — rather than a bare `Vec<u8>` — means a removed,
+/// overwritten, or dropped value has its backing allocation scrubbed instead of
+/// lingering in freed process memory.
+#[derive(Default)]
+struct StoredSecret(Vec<u8>);
+
+impl Drop for StoredSecret {
+    fn drop(&mut self) {
+        zeroize_vec(&mut self.0);
+    }
+}
 
 /// A failure reading from (or writing to) a secret value backend.
 #[derive(Debug, thiserror::Error)]
@@ -70,7 +83,7 @@ pub trait SecretBackend: Send + Sync {
 /// OS keychain / an encrypted file, where the OS handles concurrency.
 #[derive(Default)]
 pub struct InMemorySecretBackend {
-    values: BTreeMap<String, Vec<u8>>,
+    values: BTreeMap<String, StoredSecret>,
 }
 
 impl InMemorySecretBackend {
@@ -89,7 +102,8 @@ impl InMemorySecretBackend {
     /// Enter or replace a value. This is the operator/CLI entry path — never
     /// call it with a model-supplied value.
     pub fn set(&mut self, ref_name: impl Into<String>, value: impl Into<Vec<u8>>) {
-        self.values.insert(ref_name.into(), value.into());
+        // Any prior value at this key is dropped here → scrubbed by StoredSecret.
+        self.values.insert(ref_name.into(), StoredSecret(value.into()));
     }
 
     /// Remove a value. Returns whether one was present.
@@ -122,7 +136,7 @@ impl SecretBackend for InMemorySecretBackend {
         ref_name: &str,
     ) -> Result<Option<ForwardedHeaderValue>, SecretBackendError> {
         match self.values.get(ref_name) {
-            Some(b) => Ok(Some(ForwardedHeaderValue::new(b.clone())?)),
+            Some(s) => Ok(Some(ForwardedHeaderValue::new(s.0.clone())?)),
             None => Ok(None),
         }
     }
