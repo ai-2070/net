@@ -23,7 +23,7 @@ works right up until the moment the world stops being fixed:
   loaded, the service moved.
 - The work has **live state** — it streams, it fails partway, it needs a retry, it
   produces an artifact — and a single `200 OK` can't express any of that (see
-  [Submitted Is Not Completed](/docs/worldview/submitted-is-not-completed)).
+  [Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)).
 - **Credentials** for the tool shouldn't leave the machine that owns them.
 
 A hand-wired call surface has no answer to "what can I use *right now*, and did the
@@ -89,5 +89,6 @@ transport. That's why the agentic story holds up: it's not a thin coordination
 API over someone else's cloud — it's discovery, presence, policy, events, and
 artifacts on infrastructure you own.
 
-Next: [Submitted Is Not Completed](/docs/worldview/submitted-is-not-completed) —
-the one idea that explains why an agent needs events, not just a status code.
+Next: [When to Use Net (and When Not To)](/docs/worldview/right-and-wrong-use-cases).
+And in the guides, [Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)
+is the one idea that explains why an agent needs events, not just a status code.

@@ -3,7 +3,7 @@
 Invoking gets you one result. Watching gets you the ongoing facts — the events the
 work emits as it happens. This is the "observe" half of the agent loop, and it's
 what lets you recover from a partial failure instead of trusting a single return
-value ([Submitted Is Not Completed](/docs/worldview/submitted-is-not-completed)).
+value ([Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)).
 
 ## Subscribe to typed events
 

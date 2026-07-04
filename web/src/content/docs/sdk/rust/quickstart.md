@@ -36,7 +36,7 @@ async fn main() -> net_sdk::error::Result<()> {
 
 `emit` returns a receipt (`shard_id`, `timestamp`) — confirmation the event was
 **accepted into the local ring buffer**, not that a subscriber processed it (see
-[Submitted Is Not Completed](/docs/worldview/submitted-is-not-completed)). Under
+[Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)). Under
 backpressure `emit` can drop; always check `stats().events_dropped`.
 
 Run it the same way as the in-tree example:

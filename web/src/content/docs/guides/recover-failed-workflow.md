@@ -4,7 +4,7 @@ Discovering and invoking a capability is only half the job. The other half is wh
 happens when the call fails — because in a mesh of providers that come and go,
 *something will*. This is where the agentic model earns its keep over a bare
 request/response call: **failure is a typed outcome you can act on**, not a silence
-behind a green button ([Submitted Is Not Completed](/docs/worldview/submitted-is-not-completed)).
+behind a green button ([Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)).
 
 ## Failure is a fact, not a timeout
 
@@ -84,7 +84,7 @@ progress — the task-lifecycle layer models each stage as an observable event, 
 "which step failed, and can I replay it?" is a question you answer from the event
 trail rather than reconstruct from logs. See the scheduler / workflow surface for
 the `WorkflowAdapter` and task-lifecycle events; the principle is the one from
-[Submitted Is Not Completed](/docs/worldview/submitted-is-not-completed): **distinct
+[Submitted Is Not Completed](/docs/guides/submitted-is-not-completed): **distinct
 outcomes are distinct events**, so a partial failure is a first-class, subscribable
 fact your agent can recover from.
 

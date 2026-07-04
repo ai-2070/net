@@ -2,7 +2,7 @@
 
 Invoking gets you one result; watching gets you the ongoing facts — what lets an
 agent recover from a partial failure instead of trusting a single return value
-([Submitted Is Not Completed](/docs/worldview/submitted-is-not-completed)).
+([Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)).
 
 ## Subscribe to typed events
 

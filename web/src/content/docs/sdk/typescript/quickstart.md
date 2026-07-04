@@ -26,7 +26,7 @@ await node.shutdown();   // explicit — Node finalizers are non-deterministic
 
 `emit` returns synchronously once the event is accepted into the local ring
 buffer — confirmation of acceptance, not delivery (see
-[Submitted Is Not Completed](/docs/worldview/submitted-is-not-completed)). Under
+[Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)). Under
 backpressure events can drop; check `stats().eventsDropped`.
 
 ## Consume what you emit

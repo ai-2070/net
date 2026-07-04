@@ -75,7 +75,6 @@ export const DOCS_ORDER: DocsOrderConfig = {
     ],
     worldview: [
       "agentic-mesh",
-      "submitted-is-not-completed",
       "right-and-wrong-use-cases",
       "mcp-vs-net",
       "rest-vs-net",
@@ -95,6 +94,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "expose-net-as-mcp",
       "discover-and-invoke",
       "recover-failed-workflow",
+      "submitted-is-not-completed",
       "event-bus",
       "nrpc",
       "durable-logs",
@@ -170,7 +170,6 @@ export const DOCS_ORDER: DocsOrderConfig = {
 
     // Worldview
     "worldview/agentic-mesh": "The Agentic Mesh",
-    "worldview/submitted-is-not-completed": "Submitted Is Not Completed",
     "worldview/right-and-wrong-use-cases": "When to Use Net",
     "worldview/mcp-vs-net": "MCP vs Net",
     "worldview/rest-vs-net": "REST vs Net",
@@ -194,6 +193,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "guides/expose-net-as-mcp": "Expose Net as MCP",
     "guides/discover-and-invoke": "Discover and Invoke",
     "guides/recover-failed-workflow": "Recover a Failed Workflow",
+    "guides/submitted-is-not-completed": "Submitted Is Not Completed",
     "guides/event-bus": "Using the Event Bus",
     "guides/nrpc": "Typed RPC with nRPC",
     "guides/durable-logs": "Durable Logs (RedEX)",

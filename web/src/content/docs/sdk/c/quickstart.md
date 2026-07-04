@@ -36,7 +36,7 @@ int main(void) {
 
 `net_ingest_raw` accepting the event means it was placed in the local ring buffer —
 acceptance, not delivery (see
-[Submitted Is Not Completed](/docs/worldview/submitted-is-not-completed)).
+[Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)).
 
 Polling is cursor-paginated: `net_poll_ex(handle, limit, cursor, &out)` fills
 `out.events` / `out.count`, sets `out.next_id` (the next cursor) and `out.has_more`.

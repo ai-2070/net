@@ -3,7 +3,7 @@
 **Goal.** Serve a native capability from two providers, invoke it by service name,
 kill the primary mid-run, and prove the call fails over to the standby — the
 "recover" half of the agent loop
-([Submitted Is Not Completed](/docs/worldview/submitted-is-not-completed)).
+([Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)).
 
 ## Prerequisites
 

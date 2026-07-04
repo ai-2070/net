@@ -23,7 +23,7 @@ The short rule:
   responses, discovered at runtime.
 - **Work has live state** — failures, retries, artifacts, or streams that a single
   status code can't express (see
-  [Submitted Is Not Completed](/docs/worldview/submitted-is-not-completed)).
+  [Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)).
 - **Provider availability changes over time** — the GPU is busy, the model loads
   and unloads, the service moves between hosts.
 - **Resources like GPUs should be exposed as capabilities** — discovered and

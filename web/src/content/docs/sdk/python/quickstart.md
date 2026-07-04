@@ -24,7 +24,7 @@ with NetNode(shards=4) as node:
 
 `emit` returns once the event is accepted into the local ring buffer —
 confirmation of acceptance, not delivery (see
-[Submitted Is Not Completed](/docs/worldview/submitted-is-not-completed)). Under
+[Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)). Under
 backpressure events can drop; check `stats().events_dropped`.
 
 Transports are constructor arguments — `NetNode(shards=4)` is memory;

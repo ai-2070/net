@@ -127,4 +127,6 @@ did**, so an agent can recover instead of trusting a green button.
 - **Success is a projection the consumer computes** over facts, not a boolean the
   producer stamps on the wire.
 
-Next: [When to Use Net (and When Not To)](/docs/worldview/right-and-wrong-use-cases).
+Next: [Using the Event Bus](/docs/guides/event-bus) — the place those facts flow.
+For recovering when a step fails, see
+[Recover a Failed Workflow](/docs/guides/recover-failed-workflow).

@@ -28,7 +28,7 @@ the mistake that makes people mistake Net for an API gateway. It isn't one.
 
 - **REST is request/response.** The mesh is evented — work has stages, streams,
   and failures that a resource-and-verb model flattens into a status code (see
-  [Submitted Is Not Completed](/docs/worldview/submitted-is-not-completed)).
+  [Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)).
 - **REST assumes a fixed endpoint.** The mesh discovers capabilities by what they
   do, not by URL. There's no canonical host to point at.
 - **REST terminates trust at every hop** (load balancers, proxies, gateways see

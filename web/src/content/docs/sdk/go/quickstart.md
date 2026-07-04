@@ -46,7 +46,7 @@ func main() {
 
 `Ingest` returns once the event is accepted into the local ring buffer —
 acceptance, not delivery (see
-[Submitted Is Not Completed](/docs/worldview/submitted-is-not-completed)). Under
+[Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)). Under
 backpressure events can drop; check `Stats().EventsDropped`.
 
 `Poll(limit, cursor)` returns a `*PollResponse` with `Events []json.RawMessage` and

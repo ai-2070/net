@@ -22,13 +22,15 @@ is why it holds up. If you want the mechanism first, jump to
 1. **[The Agentic Mesh](/docs/worldview/agentic-mesh)** — the worldview: work is
    distributed across tools, APIs, agents, GPUs, and humans, and agents need to
    discover and coordinate it live.
-2. **[Submitted Is Not Completed](/docs/worldview/submitted-is-not-completed)** —
-   why `200 OK` is not "work done," and what a system that tells the truth about
-   work looks like. Start here if you've never thought about an event bus.
-3. **[When to Use Net (and When Not To)](/docs/worldview/right-and-wrong-use-cases)** —
+2. **[When to Use Net (and When Not To)](/docs/worldview/right-and-wrong-use-cases)** —
    explicit right and wrong use cases. Net is infrastructure with discipline, not
    "use us for everything."
-4. **[MCP vs Net](/docs/worldview/mcp-vs-net)** — MCP made tools callable; Net
+3. **[MCP vs Net](/docs/worldview/mcp-vs-net)** — MCP made tools callable; Net
    makes capabilities discoverable. How the two compose (they do).
-5. **[REST vs Net](/docs/worldview/rest-vs-net)** — where request/response and
+4. **[REST vs Net](/docs/worldview/rest-vs-net)** — where request/response and
    webhooks fit: the legacy edge, not the core.
+
+Then, in the guides:
+**[Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)** — why
+`200 OK` is not "work done," and what a system that tells the truth about work
+looks like. The clearest way in if you've never thought about an event bus.
