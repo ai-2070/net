@@ -1,4 +1,4 @@
-# Code review — `mcp-creds` branch (MCP credential forwarding)
+# Code review — `mcp-creds` branch (MCP credential forwarding) — ✅ RESOLVED
 
 **Date:** 2026-07-04
 **Branch:** `mcp-creds`
@@ -94,9 +94,11 @@ concurrency/IO/CLI), and per-candidate verification.
 ## Findings
 
 Ranked most-severe first. No high-severity defect; F1–F5 are the ones to fix
-before this graduates from seam to a live forwarding path.
+before this graduates from seam to a live forwarding path. **All findings are
+now ✅ FIXED** — each heading carries its fix commit, and the
+[Resolution](#resolution-2026-07-04) table collects them.
 
-### F1 — load-time revalidation skips `validate_ref_name` (documented guarantee unmet)
+### F1 — load-time revalidation skips `validate_ref_name` (documented guarantee unmet) — ✅ FIXED (`42413f5bf`)
 
 **`forward/store.rs:221`** · correctness / invariant · **medium**
 
@@ -128,7 +130,7 @@ string through the surface documented as "value-free by construction"
 
 ---
 
-### F2 — value-backend `set` skips the validation `get` enforces
+### F2 — value-backend `set` skips the validation `get` enforces — ✅ FIXED (`09159baa2`)
 
 **`forward/keychain.rs:59`, `forward/secret.rs:104`** · correctness / robustness · **medium**
 
@@ -151,7 +153,7 @@ control-char checks) in the `set` path so a bad value is rejected at entry.
 
 ---
 
-### F3 — `set-value` stores under the raw, unvalidated ref name
+### F3 — `set-value` stores under the raw, unvalidated ref name — ✅ FIXED (`e1dc9d9fe`)
 
 **`cli/commands/forwarding.rs:152`** · correctness / robustness · **medium-low**
 
@@ -169,7 +171,7 @@ forwards, with no error at entry time.
 
 ---
 
-### F4 — stdin secret scrubbed with a naive, elidable loop
+### F4 — stdin secret scrubbed with a naive, elidable loop — ✅ FIXED (`250f1b682`)
 
 **`cli/commands/forwarding.rs:154`** · secret hygiene · **medium-low**
 
@@ -193,7 +195,7 @@ residue survives in freed heap and in spare capacity.
 
 ---
 
-### F5 — keychain `set`'s `value.to_vec()` copy is never zeroized
+### F5 — keychain `set`'s `value.to_vec()` copy is never zeroized — ✅ FIXED (`37ead679c`)
 
 **`forward/keychain.rs:61`** · secret hygiene · **low-medium**
 
@@ -207,7 +209,7 @@ write path in a module whose whole premise is scrubbing secret buffers.
 
 ---
 
-### F6 — sealer doesn't reject a low-order / identity recipient key
+### F6 — sealer doesn't reject a low-order / identity recipient key — ✅ FIXED (`9c417e2eb`)
 
 **`forward/aead.rs:89`** · crypto hardening / defense-in-depth · **low-medium**
 
@@ -232,7 +234,7 @@ deriving the key.
 
 ---
 
-### F7 — `SECURITY_SENSITIVE` covers only three names
+### F7 — `SECURITY_SENSITIVE` covers only three names — ✅ FIXED (`684e3bcee`)
 
 **`forward/header.rs:40`, `forward/policy.rs:389`** · policy hardening · **low**
 
@@ -256,7 +258,7 @@ denylist-plus-heuristic (`x-*-key` / `x-*-token` / `x-*-secret`) rather than a
 
 ## Lower-severity / robustness
 
-### F8 — `save` is atomic but not durable
+### F8 — `save` is atomic but not durable — ✅ FIXED (`689cda303`)
 
 **`forward/store.rs:280`** · robustness · **low**
 
@@ -267,7 +269,7 @@ guaranteed on all filesystems), `forwarding.json` can be left truncated / zero
 length; the next `load` returns `StoreError::Corrupt`, which fails closed and
 bricks every `net forwarding` verb until the file is manually deleted.
 
-### F9 — header **name** bytes excluded from the size budget
+### F9 — header **name** bytes excluded from the size budget — ✅ FIXED (`7c114e29a`)
 
 **`forward/context.rs:210`, `forward/header.rs:96`** · resource accounting · **low**
 
@@ -278,7 +280,7 @@ whose names are each multi-megabyte passes `validate`, and `serialize_headers` /
 `canonical_aad_bytes` then emit an unbounded-size AAD and plaintext. Names are
 still AAD-bound — this is a size/accounting gap, not a binding defect.
 
-### F10 — `ForwardingFile` lacks `deny_unknown_fields`
+### F10 — `ForwardingFile` lacks `deny_unknown_fields` — ✅ FIXED (`d6aa1af59`)
 
 **`forward/store.rs:177`** · robustness · **low**
 
@@ -286,7 +288,7 @@ The on-disk wrapper `ForwardingFile` is not `#[serde(deny_unknown_fields)]`
 (unlike the inner `ForwardingConfig`), so a typo'd top-level field is silently
 ignored rather than rejected.
 
-### F11 — temp file orphaned on a write/flush error
+### F11 — temp file orphaned on a write/flush error — ✅ FIXED (`344656517`)
 
 **`forward/store.rs:276`** · cleanup · **low**
 
@@ -303,12 +305,16 @@ if the same PID is later reused).
   `write_field` over wire-supplied envelope fields, so a >4 GiB field would panic
   the opener rather than return `OpenError`. Not reachable today (no
   `SealedContext` wire-decode with length limits exists yet); worth a bounded
-  decode when that lands.
+  decode when that lands. — ✅ FIXED (`7c114e29a`): F9's identity-field + name
+  caps bound every AAD field far below `u32::MAX` for any validated context; the
+  future `SealedContext` wire-decode must enforce the same caps.
 - **Dependency hygiene** — the new crypto deps add duplicate major versions to
   the workspace lock (`chacha20poly1305` 0.10 *and* 0.11; a third `getrandom`,
   0.4.3, alongside 0.2/0.3). The `Cargo.toml` comment "already resolved in the
   workspace lock via core" is inaccurate for these; reusing core's locked
-  `chacha20poly1305` 0.10 would trim build time and binary size.
+  `chacha20poly1305` 0.10 would trim build time and binary size. — ✅ FIXED
+  (`18d4edb9c`): comment corrected to state the duplicate copies explicitly; the
+  version choice (staying current) was kept deliberately rather than downgraded.
 
 ---
 
