@@ -1,6 +1,6 @@
 # Net v0.31 — "Hold The Line"
 
-*Named after Toto's 1978 debut single — Steve Lukather's guitar, David Paich's piano hook, Bobby Kimball's belt, the AOR radio staple whose chorus insists "hold the line, love isn't always on time." The riff everyone can hum and nobody can place the band of. Fitting: this release is about holding one line in particular — the one between a tool you trust and a mesh you don't fully.*
+*Named after Toto's 1978 debut single — Steve Lukather's guitar, David Paich's piano hook, Bobby Kimball's belt, the AOR radio staple whose chorus insists "hold the line, love isn't always on time."*
 
 ## The wedge: any MCP host, tools across a trusted mesh
 
