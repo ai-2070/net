@@ -261,10 +261,11 @@ impl CapabilityGateway for MeshGateway {
         }
 
         // Collapse interchangeable providers into one logical capability each
-        // (Phase 4), then filter by the query.
+        // (Phase 4), then filter by the query — matched against every provider's
+        // text in the group, not just the primary's.
         let out = group_capabilities(discovered)
             .into_iter()
-            .filter(|g| q.is_empty() || matches_query(&g.info, &q))
+            .filter(|g| q.is_empty() || g.matches_query(&q))
             .map(group_summary)
             .collect();
         Ok(out)
@@ -347,16 +348,6 @@ fn map_describe_error(e: RpcError, node: u64) -> GatewayError {
         )),
         other => GatewayError::Transport(other.to_string()),
     }
-}
-
-/// Does a bridged tool match a lowercased query substring?
-fn matches_query(t: &BridgedToolInfo, q: &str) -> bool {
-    t.tool_id.to_lowercase().contains(q)
-        || t.name.to_lowercase().contains(q)
-        || t.description
-            .as_deref()
-            .map(|d| d.to_lowercase().contains(q))
-            .unwrap_or(false)
 }
 
 /// Build a `CapabilityDetail` from a provider's descriptor, keeping the
@@ -462,13 +453,18 @@ mod tests {
             visibility: "owner_only".into(),
             invocation_scope: "same_root_identity".into(),
         };
-        let group = CapabilityGroup {
-            capability: "echo".into(),
-            providers: vec![42, 99],
-            info,
-        };
+        // Build the group through the real path so the primary/provider list
+        // come from grouping, not a hand-rolled struct.
+        let group = group_capabilities(vec![(99, info.clone()), (42, info)])
+            .into_iter()
+            .next()
+            .expect("one collapsed group");
         let s = group_summary(group);
-        assert_eq!(s.id.display(), "42/echo", "id uses the primary provider");
+        assert_eq!(
+            s.id.display(),
+            "42/echo",
+            "id uses the primary (lowest) node"
+        );
         assert_eq!(s.providers, vec![42, 99]);
     }
 }

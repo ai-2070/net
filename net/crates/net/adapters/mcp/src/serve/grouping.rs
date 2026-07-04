@@ -38,14 +38,23 @@ pub struct CapabilityGroup {
     /// A representative descriptor. Within a group the providers are
     /// interchangeable, so any one describes the whole group.
     pub info: BridgedToolInfo,
+    /// Lowercased searchable text (name + description) from *every* provider.
+    /// The fingerprint intentionally ignores name/description, so equivalent
+    /// providers can carry divergent text; searching against all of it means a
+    /// query that matches a non-primary provider is not dropped after collapse.
+    search_terms: Vec<String>,
 }
 
 impl CapabilityGroup {
     /// The primary (preferred) provider — the lowest node id, for determinism.
     pub fn primary(&self) -> u64 {
-        // `providers` is non-empty by construction (a group is created from at
-        // least one discovered provider) and sorted.
-        self.providers.first().copied().unwrap_or_default()
+        match self.providers.first() {
+            Some(&node) => node,
+            // Unreachable: `group_capabilities` only ever creates a group from
+            // at least one provider. Fail loud rather than return a bogus `0`
+            // (a valid node id) that would silently misroute.
+            None => panic!("CapabilityGroup has no providers (invariant violated)"),
+        }
     }
 
     /// Providers other than `exclude`, in order — the failover candidates.
@@ -55,6 +64,13 @@ impl CapabilityGroup {
             .copied()
             .filter(|&n| n != exclude)
             .collect()
+    }
+
+    /// Does `query_lower` (already lowercased) match this capability? Matches
+    /// the tool id (shared by every provider) or any provider's name/description.
+    pub fn matches_query(&self, query_lower: &str) -> bool {
+        self.capability.to_lowercase().contains(query_lower)
+            || self.search_terms.iter().any(|t| t.contains(query_lower))
     }
 }
 
@@ -101,6 +117,13 @@ enum GroupKey {
 
 /// Collapse the discovered `(provider, descriptor)` pairs into logical
 /// capabilities. The result is deterministic (sorted keys + sorted providers).
+///
+/// The representative `info` and the `(node, tool_id)` dedup keep the FIRST
+/// descriptor seen for a key. Upstream (`mesh_gateway::search`) flattens each
+/// provider's describe catalog, and a wrap catalog has exactly one entry per
+/// `tool_id`, so a given `(node, tool_id)` appears at most once — the dedup
+/// therefore never discards a genuinely-different descriptor. Every provider's
+/// searchable text is still accumulated so the query filter sees all of it.
 pub fn group_capabilities(discovered: Vec<(u64, BridgedToolInfo)>) -> Vec<CapabilityGroup> {
     let mut groups: BTreeMap<GroupKey, CapabilityGroup> = BTreeMap::new();
     for (node, info) in discovered {
@@ -115,11 +138,23 @@ pub fn group_capabilities(discovered: Vec<(u64, BridgedToolInfo)>) -> Vec<Capabi
                 provider: node,
             }
         };
+        // Capture this provider's searchable text before `info` moves into the
+        // group's representative descriptor on first insert.
+        let terms = [
+            info.name.to_lowercase(),
+            info.description.clone().unwrap_or_default().to_lowercase(),
+        ];
         let entry = groups.entry(key).or_insert_with(|| CapabilityGroup {
             capability: info.tool_id.clone(),
             providers: Vec::new(),
             info,
+            search_terms: Vec::new(),
         });
+        for term in terms {
+            if !term.is_empty() && !entry.search_terms.contains(&term) {
+                entry.search_terms.push(term);
+            }
+        }
         if !entry.providers.contains(&node) {
             entry.providers.push(node);
         }
@@ -245,5 +280,54 @@ mod tests {
         let groups = group_capabilities(discovered);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].providers, vec![10]);
+    }
+
+    fn info_desc(tool: &str, desc: &str) -> BridgedToolInfo {
+        let mut i = info(tool, true, "none", echo_schema());
+        i.description = Some(desc.to_string());
+        i
+    }
+
+    #[test]
+    fn query_matches_a_non_primary_providers_description_after_collapse() {
+        // Two equivalent providers (same schema → they collapse) with DIFFERENT
+        // descriptions. A query matching only the non-primary's description must
+        // still match the collapsed group — the fingerprint ignores description,
+        // so searchable text is accumulated from every provider.
+        let discovered = vec![
+            (10, info_desc("echo", "the primary blurb")),
+            (20, info_desc("echo", "handles zebra requests")),
+        ];
+        let groups = group_capabilities(discovered);
+        assert_eq!(groups.len(), 1, "still collapses despite divergent text");
+        assert_eq!(groups[0].providers, vec![10, 20]);
+        assert!(
+            groups[0].matches_query("zebra"),
+            "matches non-primary description"
+        );
+        assert!(
+            groups[0].matches_query("primary"),
+            "matches primary description"
+        );
+        assert!(
+            groups[0].matches_query("echo"),
+            "matches the shared tool id"
+        );
+        assert!(!groups[0].matches_query("giraffe"), "no false positive");
+    }
+
+    #[test]
+    #[should_panic(expected = "no providers")]
+    fn primary_fails_loud_on_an_empty_group() {
+        // The non-empty invariant is enforced at construction by
+        // `group_capabilities`; if it is ever violated, `primary` must fail
+        // loud rather than return a bogus provider `0`.
+        let group = CapabilityGroup {
+            capability: "x".to_string(),
+            providers: Vec::new(),
+            info: info("x", true, "none", echo_schema()),
+            search_terms: Vec::new(),
+        };
+        let _ = group.primary();
     }
 }
