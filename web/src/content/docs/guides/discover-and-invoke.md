@@ -28,7 +28,7 @@ From the SDK, the same query returns node ids you can call directly:
 use net_sdk::capabilities::CapabilityFilter;
 
 let filter = CapabilityFilter { require_gpu: true, min_vram_gb: Some(24), ..Default::default() };
-let nodes = mesh.find_nodes(&filter).await?;   // node ids that match, right now
+let nodes: Vec<u64> = mesh.find_nodes(&filter);   // sync — node ids that match, right now
 ```
 
 For richer predicates (numeric thresholds, semver, AND/OR/NOT), see the capability

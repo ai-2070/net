@@ -22,11 +22,22 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "start",
     "guides",
     "concepts",
+    "sdk",
     "reference",
     "tutorials",
     "releases",
   ],
   folders: {
+    sdk: ["rust", "typescript", "python", "go", "c"],
+    "sdk/rust": [
+      "quickstart",
+      "announce",
+      "discover",
+      "invoke",
+      "watch",
+      "artifacts",
+      "errors",
+    ],
     worldview: [
       "agentic-mesh",
       "submitted-is-not-completed",
@@ -168,6 +179,17 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "reference/error-codes": "Error Codes",
     "reference/cli": "CLI Reference",
 
+    // SDKs
+    sdk: "SDKs",
+    "sdk/rust": "Rust",
+    "sdk/rust/quickstart": "Quickstart",
+    "sdk/rust/announce": "Announce",
+    "sdk/rust/discover": "Discover",
+    "sdk/rust/invoke": "Invoke",
+    "sdk/rust/watch": "Watch",
+    "sdk/rust/artifacts": "Artifacts",
+    "sdk/rust/errors": "Errors",
+
     // Tutorials
     "tutorials/fleet-telemetry": "Fleet Telemetry",
     "tutorials/distributed-daemon": "Daemon With Failover",
@@ -209,5 +231,10 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "releases/release-v0.10-hex": "v0.10 — Hex",
     "releases/release-v0.9-first-blood": "v0.9 — First Blood",
     "releases/release-v0.8-killing-moon": "v0.8 — Killing Moon",
+  },
+  languages: {
+    // The Rust SDK spine is visible under the `rust` language (the default).
+    // Phase 3b adds sdk/typescript → ["ts"], sdk/python → ["python"], etc.
+    "sdk/rust": ["rust"],
   },
 };
