@@ -97,7 +97,10 @@ async fn gateway_searches_describes_and_invokes_across_two_nodes() {
         "caller discovers the host as an mcp-bridge provider",
     );
 
-    let gateway = MeshGateway::new(Arc::clone(&caller));
+    // Short invoke deadline: these tests drive ultra-fast handlers whose reply
+    // can be lost to the first-reply race (surfacing as a Timeout), so bound
+    // that path rather than waiting out the generous production default.
+    let gateway = MeshGateway::new(Arc::clone(&caller)).with_invoke_timeout(Duration::from_secs(3));
 
     // search — the gateway fetches the host's catalog over the describe RPC and
     // returns summaries (with the credential status the consent gate needs).
@@ -164,7 +167,10 @@ async fn a_gateway_outside_the_owner_scope_sees_nothing_and_cannot_invoke() {
         "the bridge provider is reachable",
     );
 
-    let gateway = MeshGateway::new(Arc::clone(&caller));
+    // Short invoke deadline: these tests drive ultra-fast handlers whose reply
+    // can be lost to the first-reply race (surfacing as a Timeout), so bound
+    // that path rather than waiting out the generous production default.
+    let gateway = MeshGateway::new(Arc::clone(&caller)).with_invoke_timeout(Duration::from_secs(3));
 
     // search — the host denies the describe (owner scope), so the excluded
     // caller sees no capabilities. (An owner-scope denial can also surface as a
@@ -281,7 +287,10 @@ async fn invoke_fails_over_when_the_primary_provider_goes_down() {
         "echo discovered on both providers",
     );
 
-    let gateway = MeshGateway::new(Arc::clone(&caller));
+    // Short invoke deadline: these tests drive ultra-fast handlers whose reply
+    // can be lost to the first-reply race (surfacing as a Timeout), so bound
+    // that path rather than waiting out the generous production default.
+    let gateway = MeshGateway::new(Arc::clone(&caller)).with_invoke_timeout(Duration::from_secs(3));
 
     // Search collapses the two providers into ONE logical capability.
     let mut summaries = Vec::new();

@@ -48,8 +48,15 @@ use crate::wrap::invoke::{ERR_BAD_REQUEST, ERR_OWNER_SCOPE, ERR_TOOL, ERR_UPSTRE
 /// How many times a bounded call is retried before giving up (covers the
 /// reply-channel first-reply race).
 const MAX_ATTEMPTS: usize = 4;
-/// Per-attempt deadline — a lost reply must fail fast so the retry lands.
-const CALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per-attempt deadline for a describe (catalog fetch) — an idempotent read
+/// that should return promptly; a lost reply fails fast so the retry lands.
+const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default per-attempt deadline for an invoke. A bridged MCP tool can
+/// legitimately run far longer than a describe (a web fetch, image generation,
+/// a long shell command), so the invoke deadline is generous and overridable
+/// ([`MeshGateway::with_invoke_timeout`]) — not the 5s that made any slower
+/// tool time out on every attempt and never return success.
+const DEFAULT_INVOKE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Backoff between attempts.
 const RETRY_BACKOFF: Duration = Duration::from_millis(120);
 /// Max provider catalogs fetched concurrently during `search` — bounds the
@@ -65,6 +72,8 @@ pub struct MeshGateway {
     /// — the same equivalence `group_capabilities` proved at search time — even
     /// after the primary is down and can't be re-described.
     fingerprints: Mutex<HashMap<(String, u64), u64>>,
+    /// Per-attempt deadline for an invoke (default [`DEFAULT_INVOKE_TIMEOUT`]).
+    invoke_timeout: Duration,
 }
 
 impl MeshGateway {
@@ -73,7 +82,16 @@ impl MeshGateway {
         Self {
             mesh,
             fingerprints: Mutex::new(HashMap::new()),
+            invoke_timeout: DEFAULT_INVOKE_TIMEOUT,
         }
+    }
+
+    /// Override the per-attempt invoke deadline (default 120s). Describe keeps a
+    /// short fixed deadline — only tool invocation can legitimately run long, so
+    /// a host wrapping slow tools can widen just this.
+    pub fn with_invoke_timeout(mut self, timeout: Duration) -> Self {
+        self.invoke_timeout = timeout;
+        self
     }
 
     /// Record a provider's descriptor fingerprint for later failover matching.
@@ -94,11 +112,18 @@ impl MeshGateway {
             .copied()
     }
 
-    /// One bounded `Mesh::call`. An outer timeout maps to [`RpcError::Timeout`]
-    /// so the retry logic treats a hung/lost call uniformly.
-    async fn call_once(&self, node: u64, service: &str, body: Bytes) -> Result<Bytes, RpcError> {
+    /// One bounded `Mesh::call` with a per-attempt `timeout`. An outer timeout
+    /// maps to [`RpcError::Timeout`] so the retry logic treats a hung/lost call
+    /// uniformly.
+    async fn call_once(
+        &self,
+        node: u64,
+        service: &str,
+        body: Bytes,
+        timeout: Duration,
+    ) -> Result<Bytes, RpcError> {
         match tokio::time::timeout(
-            CALL_TIMEOUT,
+            timeout,
             self.mesh.call(node, service, body, CallOptions::default()),
         )
         .await
@@ -106,17 +131,24 @@ impl MeshGateway {
             Ok(Ok(reply)) => Ok(reply.body),
             Ok(Err(e)) => Err(e),
             Err(_elapsed) => Err(RpcError::Timeout {
-                elapsed_ms: CALL_TIMEOUT.as_millis() as u64,
+                elapsed_ms: timeout.as_millis() as u64,
             }),
         }
     }
 
-    /// Call with retry on transient errors only. Application errors
-    /// ([`RpcError::ServerError`]) return immediately — they are the answer.
-    async fn call_retry(&self, node: u64, service: &str, body: Bytes) -> Result<Bytes, RpcError> {
+    /// Call with a per-attempt `timeout`, retrying on transient errors only.
+    /// Application errors ([`RpcError::ServerError`]) return immediately — they
+    /// are the answer.
+    async fn call_retry(
+        &self,
+        node: u64,
+        service: &str,
+        body: Bytes,
+        timeout: Duration,
+    ) -> Result<Bytes, RpcError> {
         let mut last: Option<RpcError> = None;
         for attempt in 0..MAX_ATTEMPTS {
-            match self.call_once(node, service, body.clone()).await {
+            match self.call_once(node, service, body.clone(), timeout).await {
                 Ok(bytes) => return Ok(bytes),
                 Err(e) if is_retriable(&e) => {
                     last = Some(e);
@@ -140,7 +172,10 @@ impl MeshGateway {
             serde_json::to_vec(req)
                 .map_err(|e| GatewayError::Other(format!("encode describe request: {e}")))?,
         );
-        match self.call_retry(node, DESCRIBE_SERVICE, body).await {
+        match self
+            .call_retry(node, DESCRIBE_SERVICE, body, DESCRIBE_TIMEOUT)
+            .await
+        {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|e| GatewayError::Other(format!("decode describe response: {e}"))),
             Err(e) => Err(map_describe_error(e, node)),
@@ -240,7 +275,10 @@ impl MeshGateway {
         capability: &str,
         body: Bytes,
     ) -> Result<CallToolResult, GatewayError> {
-        match self.call_retry(node, capability, body).await {
+        match self
+            .call_retry(node, capability, body, self.invoke_timeout)
+            .await
+        {
             // Success: the wrap handler encoded the CallToolResult as the body.
             Ok(bytes) => serde_json::from_slice::<CallToolResult>(&bytes)
                 .map_err(|e| GatewayError::Other(format!("decode tool result: {e}"))),
@@ -467,6 +505,22 @@ fn parse_node(provider: &str) -> Result<u64, GatewayError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invoke_deadline_is_more_generous_than_describe() {
+        // F5: a bridged tool can legitimately run far longer than a catalog
+        // fetch, so the invoke deadline must not be pinned to the short describe
+        // one — the old single 5s CALL_TIMEOUT made any slower tool time out on
+        // every attempt and never return success.
+        assert!(
+            DEFAULT_INVOKE_TIMEOUT > DESCRIBE_TIMEOUT,
+            "invoke must allow longer than describe",
+        );
+        assert!(
+            DEFAULT_INVOKE_TIMEOUT >= Duration::from_secs(60),
+            "the invoke deadline should comfortably exceed slow-tool runtimes",
+        );
+    }
 
     #[test]
     fn parse_node_accepts_decimal_and_hex() {
