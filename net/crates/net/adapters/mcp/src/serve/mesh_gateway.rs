@@ -74,6 +74,14 @@ pub struct MeshGateway {
     fingerprints: Mutex<HashMap<(String, u64), u64>>,
     /// Per-attempt deadline for an invoke (default [`DEFAULT_INVOKE_TIMEOUT`]).
     invoke_timeout: Duration,
+    /// Whether to collapse equivalent providers into one logical capability and
+    /// fail invoke/describe over between them (Phase 4). **Off by default**:
+    /// equivalence is proven only from wire-declared attributes a peer controls,
+    /// so on a multi-identity mesh a hostile co-tenant could forge a matching
+    /// fingerprint and become a group's representative or a failover target —
+    /// receiving the operator's arguments. The operator opts in only when the
+    /// mesh's peers are trustworthy-equivalent (their own nodes).
+    trust_equivalent_providers: bool,
 }
 
 impl MeshGateway {
@@ -83,6 +91,7 @@ impl MeshGateway {
             mesh,
             fingerprints: Mutex::new(HashMap::new()),
             invoke_timeout: DEFAULT_INVOKE_TIMEOUT,
+            trust_equivalent_providers: false,
         }
     }
 
@@ -91,6 +100,20 @@ impl MeshGateway {
     /// a host wrapping slow tools can widen just this.
     pub fn with_invoke_timeout(mut self, timeout: Duration) -> Self {
         self.invoke_timeout = timeout;
+        self
+    }
+
+    /// Opt in to cross-provider collapse + failover (Phase 4). Default off.
+    ///
+    /// Enable ONLY when every peer on the mesh is trusted to be a genuine
+    /// equivalent of the operator's own providers — because equivalence is
+    /// decided from forgeable wire attributes (`substitutability`,
+    /// `credential_status`, schema), not a verified shared owner identity (that
+    /// verification is a later refinement). With it off, each provider's
+    /// capability is discovered, pinned, and invoked on its own node id, so a
+    /// peer can never silently stand in for another.
+    pub fn trust_equivalent_providers(mut self, trust: bool) -> Self {
+        self.trust_equivalent_providers = trust;
         self
     }
 
@@ -233,6 +256,12 @@ impl MeshGateway {
         id: &CapabilityId,
         primary: u64,
     ) -> Vec<(u64, BridgedToolInfo)> {
+        // Failover across providers is the same opt-in as collapse: without it,
+        // an invoke stays on its declared provider and never routes the caller's
+        // arguments to a peer that merely advertised a matching wire contract.
+        if !self.trust_equivalent_providers {
+            return Vec::new();
+        }
         let Some(target_fp) = self.known_fingerprint(&id.capability, primary).await else {
             return Vec::new();
         };
@@ -360,9 +389,10 @@ impl CapabilityGateway for MeshGateway {
         }
 
         // Collapse interchangeable providers into one logical capability each
-        // (Phase 4), then filter by the query — matched against every provider's
-        // text in the group, not just the primary's.
-        let out = group_capabilities(discovered)
+        // (Phase 4, opt-in — see `trust_equivalent_providers`), then filter by
+        // the query — matched against every provider's text in the group, not
+        // just the primary's.
+        let out = group_capabilities(discovered, self.trust_equivalent_providers)
             .into_iter()
             .filter(|g| q.is_empty() || g.matches_query(&q))
             .map(group_summary)
@@ -642,8 +672,9 @@ mod tests {
             invocation_scope: "same_root_identity".into(),
         };
         // Build the group through the real path so the primary/provider list
-        // come from grouping, not a hand-rolled struct.
-        let group = group_capabilities(vec![(99, info.clone()), (42, info)])
+        // come from grouping, not a hand-rolled struct. Collapse enabled: this
+        // exercises the two-provider representative selection.
+        let group = group_capabilities(vec![(99, info.clone()), (42, info)], true)
             .into_iter()
             .next()
             .expect("one collapsed group");

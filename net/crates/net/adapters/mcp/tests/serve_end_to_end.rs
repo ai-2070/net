@@ -290,7 +290,11 @@ async fn invoke_fails_over_when_the_primary_provider_goes_down() {
     // Short invoke deadline: these tests drive ultra-fast handlers whose reply
     // can be lost to the first-reply race (surfacing as a Timeout), so bound
     // that path rather than waiting out the generous production default.
-    let gateway = MeshGateway::new(Arc::clone(&caller)).with_invoke_timeout(Duration::from_secs(3));
+    // This is the failover hero path, so opt into cross-provider collapse +
+    // failover (off by default — see MeshGateway::trust_equivalent_providers).
+    let gateway = MeshGateway::new(Arc::clone(&caller))
+        .with_invoke_timeout(Duration::from_secs(3))
+        .trust_equivalent_providers(true);
 
     // Search collapses the two providers into ONE logical capability.
     let mut summaries = Vec::new();

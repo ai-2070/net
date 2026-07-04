@@ -93,6 +93,15 @@ pub struct ServeArgs {
     #[arg(long = "pin-store", value_name = "PATH")]
     pub pin_store: Option<PathBuf>,
 
+    /// Trust equivalent providers: collapse a capability offered by several
+    /// mesh nodes into one and fail invoke/describe over between them (Phase 4).
+    /// OFF by default — equivalence is proven only from wire-declared attributes
+    /// a peer controls, so on a multi-identity mesh this would let a peer that
+    /// forged a matching contract stand in for your provider. Enable only when
+    /// every mesh peer is your own / trusted.
+    #[arg(long = "trust-equivalent-providers")]
+    pub trust_equivalent_providers: bool,
+
     /// The mesh peer to join.
     #[command(flatten)]
     pub remote: RemoteAttachArgs,
@@ -151,7 +160,8 @@ async fn run_serve(
         consent.allow(id);
     }
 
-    let gateway = MeshGateway::new(Arc::clone(&mesh));
+    let gateway = MeshGateway::new(Arc::clone(&mesh))
+        .trust_equivalent_providers(args.trust_equivalent_providers);
     let shim = Shim::new(gateway)
         .with_consent(consent)
         .with_pin_store(resolve_pin_store(args.pin_store.as_deref())?);

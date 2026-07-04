@@ -132,16 +132,30 @@ enum GroupKey {
 /// Collapse the discovered `(provider, descriptor)` pairs into logical
 /// capabilities. The result is deterministic (sorted keys + sorted providers).
 ///
+/// `collapse` gates cross-provider merging. When `false` (the demand side's
+/// default) every `(provider, tool)` stays provider-local, so an equivalent
+/// capability offered by several nodes is shown — and pinned/invoked — per
+/// node, with its real provider id visible. Collapsing is opt-in because
+/// equivalence is proven only from *wire-declared* attributes a peer controls
+/// (`substitutability`, `credential_status`, schema): on a multi-identity mesh
+/// a hostile co-tenant could forge a matching fingerprint and, as the lowest
+/// node id, become a group's representative — the capability the operator sees
+/// and pins. Merging is safe only when the operator asserts the mesh's peers
+/// are trustworthy-equivalent (see `MeshGateway::trust_equivalent_providers`).
+///
 /// The representative `info` and the `(node, tool_id)` dedup keep the FIRST
 /// descriptor seen for a key. Upstream (`mesh_gateway::search`) flattens each
 /// provider's describe catalog, and a wrap catalog has exactly one entry per
 /// `tool_id`, so a given `(node, tool_id)` appears at most once — the dedup
 /// therefore never discards a genuinely-different descriptor. Every provider's
 /// searchable text is still accumulated so the query filter sees all of it.
-pub fn group_capabilities(discovered: Vec<(u64, BridgedToolInfo)>) -> Vec<CapabilityGroup> {
+pub fn group_capabilities(
+    discovered: Vec<(u64, BridgedToolInfo)>,
+    collapse: bool,
+) -> Vec<CapabilityGroup> {
     let mut groups: BTreeMap<GroupKey, CapabilityGroup> = BTreeMap::new();
     for (node, info) in discovered {
-        let key = if is_collapsible(&info) {
+        let key = if collapse && is_collapsible(&info) {
             GroupKey::Equivalent {
                 capability: info.tool_id.clone(),
                 fingerprint: descriptor_fingerprint(&info),
@@ -220,12 +234,29 @@ mod tests {
             (10, info("echo", true, "none", echo_schema())),
             (20, info("echo", true, "none", echo_schema())),
         ];
-        let groups = group_capabilities(discovered);
+        let groups = group_capabilities(discovered, true);
         assert_eq!(groups.len(), 1, "one logical capability: {groups:?}");
         assert_eq!(groups[0].capability, "echo");
         assert_eq!(groups[0].providers, vec![10, 20]);
         assert_eq!(groups[0].primary(), 10);
         assert_eq!(groups[0].others(10), vec![20]);
+    }
+
+    #[test]
+    fn collapse_disabled_keeps_equivalent_providers_separate() {
+        // F2: with collapse OFF (the demand side's default) even provably-
+        // equivalent providers stay provider-local, so a peer that forged a
+        // matching fingerprint cannot become the representative of the
+        // operator's capability — each provider is shown with its own node id.
+        let discovered = vec![
+            (10, info("echo", true, "none", echo_schema())),
+            (20, info("echo", true, "none", echo_schema())),
+        ];
+        let groups = group_capabilities(discovered, false);
+        assert_eq!(groups.len(), 2, "no cross-provider merge when collapse is off");
+        assert!(groups.iter().all(|g| g.providers.len() == 1));
+        assert_eq!(groups[0].providers, vec![10]);
+        assert_eq!(groups[1].providers, vec![20]);
     }
 
     #[test]
@@ -236,7 +267,7 @@ mod tests {
             (10, info("fs.read", false, "none", echo_schema())),
             (20, info("fs.read", false, "none", echo_schema())),
         ];
-        let groups = group_capabilities(discovered);
+        let groups = group_capabilities(discovered, true);
         assert_eq!(groups.len(), 2);
         assert!(groups.iter().all(|g| g.providers.len() == 1));
     }
@@ -256,7 +287,7 @@ mod tests {
                 info("github.create_issue", true, "credentialed", echo_schema()),
             ),
         ];
-        let groups = group_capabilities(discovered);
+        let groups = group_capabilities(discovered, true);
         assert_eq!(groups.len(), 2, "credentialed tools stay provider-local");
         assert!(groups.iter().all(|g| g.providers.len() == 1));
     }
@@ -276,7 +307,7 @@ mod tests {
             json!({ "type": "object", "properties": { "b": {} } }),
         );
         assert_ne!(descriptor_fingerprint(&a), descriptor_fingerprint(&b));
-        let groups = group_capabilities(vec![(10, a), (20, b)]);
+        let groups = group_capabilities(vec![(10, a), (20, b)], true);
         assert_eq!(
             groups.len(),
             2,
@@ -325,7 +356,7 @@ mod tests {
             "equivalent collapsible providers keep one fingerprint",
         );
         // And end-to-end: they still merge into a single group.
-        let groups = group_capabilities(vec![(10, a), (20, b)]);
+        let groups = group_capabilities(vec![(10, a), (20, b)], true);
         assert_eq!(groups.len(), 1, "grouping behavior is unchanged");
         assert_eq!(groups[0].providers, vec![10, 20]);
     }
@@ -337,7 +368,7 @@ mod tests {
             (10, info("echo", true, "none", echo_schema())),
             (10, info("echo", true, "none", echo_schema())),
         ];
-        let groups = group_capabilities(discovered);
+        let groups = group_capabilities(discovered, true);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].providers, vec![10]);
     }
@@ -358,7 +389,7 @@ mod tests {
             (10, info_desc("echo", "the primary blurb")),
             (20, info_desc("echo", "handles zebra requests")),
         ];
-        let groups = group_capabilities(discovered);
+        let groups = group_capabilities(discovered, true);
         assert_eq!(groups.len(), 1, "still collapses despite divergent text");
         assert_eq!(groups[0].providers, vec![10, 20]);
         assert!(
