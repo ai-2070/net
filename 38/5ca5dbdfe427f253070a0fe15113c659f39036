@@ -1,0 +1,26 @@
+.claude/skills/net-event-bus/gotchas.md
+  s_f75d64212a7389::t_f3c652cfb59c22 150,152,154
+  s_f75d64212a7389::t_3987b37d557a96 149,151,153
+.claude/skills/net-event-bus/SKILL.md
+  s_f75d64212a7389::t_a7a46b80b74639 39
+  s_f75d64212a7389::t_abcdf2cc2dd16f 3
+  s_f75d64212a7389::t_a0baa08deaf7ec 76
+.claude/skills/net-event-bus/event-semantics.md
+  s_f75d64212a7389::t_e9a19db2622efa 1-105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "385ca5dbdfe427f253070a0fe15113c659f39036",
+  "prompts": {},
+  "sessions": {
+    "s_f75d64212a7389": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6139e8e8-9ce9-4dfc-9412-193afe6af8d2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
