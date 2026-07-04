@@ -1,0 +1,35 @@
+.claude/skills/net-event-bus/dataforts.md
+  s_f75d64212a7389::t_5d337141ab9790 295
+.claude/skills/net-event-bus/nrpc.md
+  s_f75d64212a7389::t_510fdb69f0743f 310
+.claude/skills/net-event-bus/SKILL.md
+  s_f75d64212a7389::t_2ad24604942005 74-75
+  s_f75d64212a7389::t_4b7de0ae417c80 37-39
+  s_f75d64212a7389::t_791bb321791703 6
+.claude/skills/net-event-bus/error-codes.md
+  s_f75d64212a7389::t_7faf2957c4ac56 1-127
+.claude/skills/net-event-bus/capabilities.md
+  s_f75d64212a7389::t_fa94352539bb9f 347
+.claude/skills/net-event-bus/filter-dsl.md
+  s_f75d64212a7389::t_3daf978246ccd3 1-130
+.claude/skills/net-event-bus/cli.md
+  s_f75d64212a7389::t_b8bf02421234c8 1-110
+.claude/skills/net-event-bus/runtime.md
+  s_f75d64212a7389::t_4a2c529a762630 60-61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1c7d52498db652b2304b479275f44c8db18f03ae",
+  "prompts": {},
+  "sessions": {
+    "s_f75d64212a7389": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6139e8e8-9ce9-4dfc-9412-193afe6af8d2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
