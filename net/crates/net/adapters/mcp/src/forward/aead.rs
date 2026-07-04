@@ -45,7 +45,7 @@ use chacha20poly1305::{
 use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Secret};
 
 use super::context::ForwardedContext;
-use super::header::{ForwardedHeaderValue, HeaderName};
+use super::header::{ForwardedHeaderValue, HeaderName, MAX_HEADER_VALUE_LEN};
 use super::seal::{
     ForwardedContextOpener, ForwardedContextSealer, OpenError, SealError, SealedContext,
 };
@@ -233,6 +233,13 @@ fn deserialize_headers(mut buf: &[u8]) -> Option<BTreeMap<HeaderName, ForwardedH
         let name = take(&mut buf)?;
         let value = take(&mut buf)?;
         let name = HeaderName::parse(std::str::from_utf8(name).ok()?).ok()?;
+        // Reject an oversized value *before* copying it. `ForwardedHeaderValue::new`
+        // enforces the same cap, but only after `to_vec` — a crafted field could
+        // force a large allocation first. `value` is a borrow into the (bounded)
+        // plaintext, so checking its length allocates nothing.
+        if value.len() > MAX_HEADER_VALUE_LEN {
+            return None;
+        }
         let value = ForwardedHeaderValue::new(value.to_vec()).ok()?;
         map.insert(name, value);
     }
@@ -467,5 +474,20 @@ mod tests {
         let mut ok: &[u8] = &[0, 0, 0, 3, b'a', b'b', b'c'];
         assert_eq!(take(&mut ok), Some(&b"abc"[..]));
         assert!(ok.is_empty());
+    }
+
+    #[test]
+    fn deserialize_rejects_an_oversized_value() {
+        // A value field over the per-value cap is rejected before it's copied.
+        let mut blob = Vec::new();
+        put(&mut blob, b"authorization");
+        put(&mut blob, &vec![b'x'; MAX_HEADER_VALUE_LEN + 1]);
+        assert!(deserialize_headers(&blob).is_none());
+
+        // A within-cap field still round-trips.
+        let mut ok = Vec::new();
+        put(&mut ok, b"x-tenant-id");
+        put(&mut ok, b"acme");
+        assert_eq!(deserialize_headers(&ok).unwrap().len(), 1);
     }
 }
