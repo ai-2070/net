@@ -259,12 +259,15 @@ fn take<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
 
 // --- KDF + scrub (mirrors identity/envelope.rs) ----------------------------
 
-/// BLAKE2s-MAC keyed with a domain `label`, over `shared`, truncated to 32.
+/// BLAKE2s-MAC keyed with a domain `label`, over a 32-byte input, truncated to
+/// 32. The domain-separated key-derivation primitive shared by the AEAD key
+/// derivation here and the forwarding-keypair derivation in
+/// [`super::keys`](super::keys).
 #[expect(
     clippy::expect_used,
     reason = "Blake2sMac::new_from_slice rejects only keys longer than 32 bytes; the domain labels are short compile-time constants"
 )]
-fn derive_key(shared: &[u8; 32], label: &[u8]) -> [u8; 32] {
+pub(crate) fn derive_key(shared: &[u8; 32], label: &[u8]) -> [u8; 32] {
     let mut mac = <Blake2sMac<U32> as Mac>::new_from_slice(label)
         .expect("BLAKE2s accepts variable-length keys");
     Mac::update(&mut mac, shared);

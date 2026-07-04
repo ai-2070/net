@@ -74,6 +74,7 @@ mod context;
 mod header;
 #[cfg(feature = "keychain")]
 mod keychain;
+mod keys;
 mod policy;
 mod seal;
 mod secret;
@@ -91,6 +92,7 @@ pub use policy::{
 };
 pub use aead::{X25519SealedBoxOpener, X25519SealedBoxSealer};
 pub use assemble::{AssembleError, ForwardedContextBuilder};
+pub use keys::ForwardingKeypair;
 pub use seal::{
     ForwardedContextOpener, ForwardedContextSealer, OpenError, SealError, SealedContext,
 };
