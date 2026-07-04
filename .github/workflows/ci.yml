@@ -1404,8 +1404,12 @@ jobs:
     # live in each `src/**` module's `#[cfg(test)] mod tests`; the
     # `tests/*.rs` integration tests stand up real one/two/three-node
     # meshes (wrap provider + demand-side gateway, incl. a ~20s
-    # three-node failover) and are picked up automatically by
-    # `cargo test -p net-mesh-mcp` — new `tests/foo.rs` needs no CI edit.
+    # three-node failover). They spawn the conformance server via
+    # `CARGO_BIN_EXE_net-mcp-fixture`, which builds only under the
+    # `fixture` feature (kept out of the published artifact), so both
+    # commands below pass `--features fixture`. A new fixture-spawning
+    # `tests/foo.rs` needs a `[[test]] required-features = ["fixture"]`
+    # entry in `Cargo.toml`; a non-fixture test is still auto-discovered.
     #
     # Clippy is `--lib --bins`, NOT `--all-targets`: production code is
     # held to `-D warnings` with `unwrap_used` / `expect_used` denied
@@ -1440,11 +1444,11 @@ jobs:
           key: ${{ runner.os }}-cargo-mcp-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run clippy (production code, strict)
-        run: cargo clippy -p net-mesh-mcp --lib --bins -- -D warnings
+        run: cargo clippy -p net-mesh-mcp --lib --bins --features fixture -- -D warnings
 
       - name: Run net-mesh-mcp tests
         if: ${{ !cancelled() }}
-        run: cargo test -p net-mesh-mcp
+        run: cargo test -p net-mesh-mcp --features fixture
 
   fmt:
     name: Format

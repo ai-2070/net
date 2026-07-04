@@ -1,11 +1,14 @@
 name: Release Rust crates
 
-# Publishes `net-mesh`, `net-mesh-sdk-macros`, and `net-mesh-sdk`
-# to crates.io.
+# Publishes `net-mesh`, `net-mesh-sdk-macros`, `net-mesh-sdk`, and
+# `net-mesh-mcp` to crates.io.
 #
-# Tag schema: `crates-v<semver>`. The three crates publish in
-# dependency order — `net-mesh` and `net-mesh-sdk-macros` first
-# (independent), then `net-mesh-sdk` once the index has caught up.
+# Tag schema: `crates-v<semver>`. The crates publish in dependency
+# order — `net-mesh` and `net-mesh-sdk-macros` first (independent),
+# then `net-mesh-sdk` once the index has caught up, then
+# `net-mesh-mcp` (the MCP bridge adapter, which depends on the SDK)
+# after a further index wait. `net-cli` depends on `net-mesh-mcp` by
+# version, so this workflow must run before the `cli-v*` release.
 #
 # Required repository secret: `CARGO_REGISTRY_TOKEN`
 #   Generate at https://crates.io/me with the `publish-update`
@@ -25,7 +28,7 @@ env:
 
 jobs:
   publish:
-    name: Publish net-mesh + net-mesh-sdk-macros + net-mesh-sdk
+    name: Publish net-mesh + net-mesh-sdk-macros + net-mesh-sdk + net-mesh-mcp
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -86,6 +89,22 @@ jobs:
 
       - name: Publish net-mesh-sdk
         working-directory: net/crates/net/sdk
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
+
+      # `net-mesh-mcp` (the MCP bridge adapter) depends on `net-mesh-sdk`,
+      # so it publishes last, after the index exposes the SDK version.
+      # Like the SDK step above it isn't dry-run independently — its
+      # `net-mesh-sdk` dep only exists on crates.io once the step above
+      # publishes it — so the publish below carries its own packaging
+      # check. `net-cli` depends on this crate by version, so it must be
+      # on crates.io before the `cli-v*` release runs.
+      - name: Wait for crates.io index (net-mesh-sdk)
+        run: sleep 30
+
+      - name: Publish net-mesh-mcp
+        working-directory: net/crates/net/adapters/mcp
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish
