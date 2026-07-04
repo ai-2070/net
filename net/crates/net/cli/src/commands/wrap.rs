@@ -36,13 +36,23 @@ use crate::parsers::parse_u64_flexible;
 #[derive(serde::Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum WrapEvent<'a> {
-    /// The initial report: served + skipped tools and the scope.
+    /// The initial report: served + skipped tools, the announced
+    /// visibility/scope, and any explicitly-widened caller origins.
     Wrapped {
         name: &'a str,
         tools: &'a [String],
         skipped: &'a [String],
         visibility: &'a str,
+        /// The announced invocation-scope label — the baseline (the owning
+        /// root identity). `--allow` widens the *local* enforcement beyond
+        /// this without changing the announced label, so consumers must read
+        /// `allowed_origins` too to know who may actually invoke.
         scope: &'a str,
+        /// Peer origins explicitly admitted via `--allow`, on top of the owner
+        /// scope. Empty unless the operator widened access — so the structured
+        /// output states exactly who beyond same-root may invoke, rather than
+        /// implying only same-root through the static `scope`.
+        allowed_origins: &'a [u64],
     },
     /// The wrapped server changed its tool set; the mesh was reconciled.
     ToolsChanged {
@@ -156,7 +166,9 @@ pub async fn run(
     } else {
         Substitutability::ProviderLocal
     };
-    for origin in allow {
+    // Widen the local enforcement scope by ref so the origins remain available
+    // to report in the output event below.
+    for &origin in &allow {
         config.scope.allow(origin);
     }
 
@@ -175,6 +187,7 @@ pub async fn run(
             skipped: session.skipped_tools(),
             visibility: "owner_only",
             scope: "same_root_identity",
+            allowed_origins: &allow,
         },
     )
     .map_err(|e| generic(format!("write output: {e}")))?;
@@ -354,5 +367,37 @@ mod tests {
             resolve_credential_override(false, false),
             CredentialOverride::Detect
         );
+    }
+
+    fn wrapped_event(allow: &[u64]) -> serde_json::Value {
+        let tools = vec!["echo".to_string()];
+        let skipped: Vec<String> = Vec::new();
+        serde_json::to_value(WrapEvent::Wrapped {
+            name: "gh",
+            tools: &tools,
+            skipped: &skipped,
+            visibility: "owner_only",
+            scope: "same_root_identity",
+            allowed_origins: allow,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn wrapped_event_reports_widened_allow_origins() {
+        // With `--allow`, the widened origins appear in the structured output,
+        // so a consumer isn't misled by the static `scope` into assuming only
+        // same-root callers are permitted.
+        let v = wrapped_event(&[7, 42]);
+        assert_eq!(v["event"], "wrapped");
+        assert_eq!(v["scope"], "same_root_identity");
+        assert_eq!(v["allowed_origins"], serde_json::json!([7, 42]));
+    }
+
+    #[test]
+    fn wrapped_event_default_scope_is_same_root_only() {
+        // No `--allow`: an empty list is the honest "same-root only" case.
+        let v = wrapped_event(&[]);
+        assert_eq!(v["allowed_origins"], serde_json::json!([]));
     }
 }
