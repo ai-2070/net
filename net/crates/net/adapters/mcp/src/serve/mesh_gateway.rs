@@ -19,6 +19,7 @@
 //! Owner-scope denials and other application errors are **not** retried — they
 //! are deterministic answers, not transient failures.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,11 +30,14 @@ use net_sdk::capabilities::CapabilityFilter;
 use net_sdk::mesh::Mesh;
 use net_sdk::mesh_rpc::{CallOptions, RpcError};
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 use super::backend::{
     CapabilityDetail, CapabilityGateway, CapabilityId, CapabilitySummary, GatewayError,
 };
-use super::grouping::{group_capabilities, is_collapsible, CapabilityGroup};
+use super::grouping::{
+    descriptor_fingerprint, group_capabilities, is_collapsible, CapabilityGroup,
+};
 use crate::bridge::{
     BridgedToolInfo, DescribeRequest, DescribeResponse, BRIDGE_PROVIDER_TAG, DESCRIBE_SERVICE,
 };
@@ -54,12 +58,39 @@ const MAX_CONCURRENT_FETCHES: usize = 8;
 /// A [`CapabilityGateway`] backed by a joined mesh node.
 pub struct MeshGateway {
     mesh: Arc<Mesh>,
+    /// `(capability, provider node) -> descriptor fingerprint`, learned as
+    /// providers are described (search + describe). Failover consults it so it
+    /// only ever routes to a provider whose contract matches the *primary's*
+    /// — the same equivalence `group_capabilities` proved at search time — even
+    /// after the primary is down and can't be re-described.
+    fingerprints: Mutex<HashMap<(String, u64), u64>>,
 }
 
 impl MeshGateway {
     /// Build a gateway over an already-joined `mesh`.
     pub fn new(mesh: Arc<Mesh>) -> Self {
-        Self { mesh }
+        Self {
+            mesh,
+            fingerprints: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record a provider's descriptor fingerprint for later failover matching.
+    async fn remember_fingerprint(&self, capability: &str, node: u64, info: &BridgedToolInfo) {
+        self.fingerprints
+            .lock()
+            .await
+            .insert((capability.to_string(), node), descriptor_fingerprint(info));
+    }
+
+    /// The last-known fingerprint of `capability` on `node`, if we've described
+    /// it before (via search or a successful describe).
+    async fn known_fingerprint(&self, capability: &str, node: u64) -> Option<u64> {
+        self.fingerprints
+            .lock()
+            .await
+            .get(&(capability.to_string(), node))
+            .copied()
     }
 
     /// One bounded `Mesh::call`. An outer timeout maps to [`RpcError::Timeout`]
@@ -134,19 +165,31 @@ impl MeshGateway {
             .into_iter()
             .find(|t| t.tool_id == id.capability)
             .ok_or_else(|| GatewayError::NotFound(id.display()))?;
+        // Learn this provider's contract for later failover matching.
+        self.remember_fingerprint(&id.capability, node, &info).await;
         Ok(detail_from(id, info))
     }
 
-    /// Reachable providers that are interchangeable with `id`'s capability,
-    /// excluding `primary` — the failover candidates. Found by the capability
-    /// tag, described to confirm they are **collapsible** (the operator's
-    /// `provider_equivalent` interchangeability assertion), in sorted node order
-    /// so `describe` and `invoke` fail over to the same provider.
+    /// Reachable providers PROVABLY interchangeable with `id`'s primary,
+    /// excluding `primary` — the failover candidates. A candidate qualifies only
+    /// if it is collapsible (the operator's `provider_equivalent` assertion) AND
+    /// its contract fingerprint matches the primary's — the same equivalence
+    /// `group_capabilities` requires at search time, so failover never routes to
+    /// a same-name / different-contract provider. Sorted node order, so
+    /// `describe` and `invoke` fail over to the same one.
+    ///
+    /// **Fail safe:** without the primary's known fingerprint (never searched or
+    /// described while it was up) no candidate can be proven equivalent, so we
+    /// do not fail over — better a transport error than sending
+    /// primary-validated arguments to an unverified provider.
     async fn equivalent_providers(
         &self,
         id: &CapabilityId,
         primary: u64,
     ) -> Vec<(u64, BridgedToolInfo)> {
+        let Some(target_fp) = self.known_fingerprint(&id.capability, primary).await else {
+            return Vec::new();
+        };
         let mut nodes: Vec<u64> = self
             .mesh
             .find_nodes(&CapabilityFilter::new().require_tag(&id.capability))
@@ -170,7 +213,7 @@ impl MeshGateway {
                     .into_iter()
                     .find(|t| t.tool_id == id.capability)
                 {
-                    if is_collapsible(&info) {
+                    if is_collapsible(&info) && descriptor_fingerprint(&info) == target_fp {
                         out.push((node, info));
                     }
                 }
@@ -260,6 +303,12 @@ impl CapabilityGateway for MeshGateway {
             }
         }
 
+        // Remember each provider's contract fingerprint so a later invoke can
+        // fail over only within the same proven-equivalent group.
+        for (node, info) in &discovered {
+            self.remember_fingerprint(&info.tool_id, *node, info).await;
+        }
+
         // Collapse interchangeable providers into one logical capability each
         // (Phase 4), then filter by the query — matched against every provider's
         // text in the group, not just the primary's.
@@ -295,6 +344,23 @@ impl CapabilityGateway for MeshGateway {
         }
     }
 
+    /// Invoke, with transparent failover to an equivalent provider when the
+    /// primary is unreachable.
+    ///
+    /// **At-least-once semantics.** A transport failure includes a *timeout*,
+    /// which does not prove the primary didn't execute the call — so failover
+    /// (and the same-node retry in `call_retry`) can run a tool more than once.
+    /// This is inherent to transparent failover; exactly-once is not achievable
+    /// across independent providers. It is bounded, not unbounded: failover
+    /// happens ONLY between providers `group_capabilities` collapsed, which
+    /// requires the operator's `provider_equivalent` opt-in AND
+    /// `credential_status == none`. A tool whose duplicate execution mutates
+    /// authenticated or external state needs credentials to do so, so it is
+    /// credentialed, never collapses, and never fails over. Only uncredentialed,
+    /// operator-declared-interchangeable tools fail over — where the operator
+    /// has asserted running on any provider yields the same result, i.e.
+    /// duplicate execution is harmless. A tool where it isn't must not be
+    /// declared `--substitutable`.
     async fn invoke(
         &self,
         id: &CapabilityId,
@@ -306,9 +372,10 @@ impl CapabilityGateway for MeshGateway {
                 .map_err(|e| GatewayError::Other(format!("encode arguments: {e}")))?,
         );
         match self.invoke_on(primary, &id.capability, body.clone()).await {
-            // Primary unreachable — fail over to an equivalent provider. Only a
-            // transport failure fails over: a `Denied` (authorization) or a
-            // tool-level error is a real answer another provider wouldn't change.
+            // Primary unreachable — fail over to an equivalent provider (see the
+            // at-least-once note above). Only a transport failure fails over: a
+            // `Denied` (authorization) or a tool-level error is a real answer
+            // another provider wouldn't change.
             Err(GatewayError::Transport(primary_reason)) => {
                 for (node, _) in self.equivalent_providers(id, primary).await {
                     match self.invoke_on(node, &id.capability, body.clone()).await {
