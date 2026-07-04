@@ -282,12 +282,32 @@ impl ForwardingStore {
         f.write_all(&bytes)
             .await
             .map_err(|e| StoreError::io(&tmp, e))?;
+        // Durability: flush the userspace buffer, then fsync the file's data +
+        // metadata. Atomic rename gives *atomicity* (a reader sees the old or
+        // the new file, never a torn one), but not *durability* — without
+        // sync_all a crash after the rename can surface a truncated / zero-length
+        // store, which load() rejects as Corrupt and bricks every `net
+        // forwarding` verb until the file is deleted by hand.
         f.flush().await.map_err(|e| StoreError::io(&tmp, e))?;
+        f.sync_all().await.map_err(|e| StoreError::io(&tmp, e))?;
         drop(f);
 
         tokio::fs::rename(&tmp, &self.path)
             .await
             .map_err(|e| StoreError::io(&self.path, e))?;
+
+        // fsync the parent directory so the new dirent (the rename itself)
+        // survives a crash too. Best-effort and unix-only: Windows has no
+        // portable directory fsync, and a failure here doesn't invalidate the
+        // already-renamed file.
+        #[cfg(unix)]
+        if let Some(parent) = self.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Ok(dir) = tokio::fs::File::open(parent).await {
+                    let _ = dir.sync_all().await;
+                }
+            }
+        }
         Ok(())
     }
 
