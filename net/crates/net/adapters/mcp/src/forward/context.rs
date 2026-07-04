@@ -44,6 +44,12 @@ use super::{MAX_TTL_SECS, OBJECT_TAG};
 /// (the same discipline as `IDENTITY_ENVELOPE_VERSION`).
 const AAD_SCHEME_VERSION: u8 = 1;
 
+/// Maximum byte length of an identity field (destination, caller, capability,
+/// invocation). These are short ids; capping them keeps every canonical-AAD
+/// length-prefixed field far below the `u32` prefix limit, so the AAD encoder's
+/// length cast can never overflow from a validated context.
+const MAX_ID_FIELD_LEN: usize = 1024;
+
 /// Why a [`ForwardedContext`] failed validation. No variant carries a header
 /// **value** — only names, counts, and lengths, all of which are safe to
 /// surface in a structured error.
@@ -55,6 +61,16 @@ pub enum ContextError {
     MissingField {
         /// Which field was empty.
         field: &'static str,
+    },
+    /// An identity field exceeded [`MAX_ID_FIELD_LEN`] bytes.
+    #[error("forwarded context field {field} is {len} bytes, over the {max}-byte limit")]
+    FieldTooLong {
+        /// Which field was too long.
+        field: &'static str,
+        /// The offending length.
+        len: usize,
+        /// The configured cap.
+        max: usize,
     },
     /// The context carried no headers — an empty forward is meaningless and is
     /// refused rather than sealed.
@@ -195,6 +211,13 @@ impl ForwardedContext {
             if value.trim().is_empty() {
                 return Err(ContextError::MissingField { field });
             }
+            if value.len() > MAX_ID_FIELD_LEN {
+                return Err(ContextError::FieldTooLong {
+                    field,
+                    len: value.len(),
+                    max: MAX_ID_FIELD_LEN,
+                });
+            }
         }
 
         if self.headers.is_empty() {
@@ -207,7 +230,15 @@ impl ForwardedContext {
             });
         }
 
-        let total: usize = self.headers.values().map(ForwardedHeaderValue::len).sum();
+        // Count header **names** as well as values against the budget — a
+        // name-heavy context would otherwise slip an unbounded amount of bytes
+        // past a values-only sum (names are individually capped by
+        // `HeaderName::parse`, but the aggregate belongs in the budget too).
+        let total: usize = self
+            .headers
+            .iter()
+            .map(|(name, value)| name.as_str().len() + value.len())
+            .sum();
         if total > MAX_TOTAL_FORWARDED_BYTES {
             return Err(ContextError::TotalTooLarge {
                 bytes: total,
@@ -444,6 +475,44 @@ mod tests {
             ctx.validate().unwrap_err(),
             ContextError::MissingField { field: "sealed_to" },
         );
+    }
+
+    #[test]
+    fn validate_rejects_an_oversized_identity_field() {
+        let mut headers = BTreeMap::new();
+        headers.insert(HeaderName::parse("X-Trace-Id").unwrap(), hv("abc"));
+        let ctx = ForwardedContext::new(
+            "d".repeat(MAX_ID_FIELD_LEN + 1), // sealed_to over the cap
+            "caller",
+            "cap",
+            "inv",
+            1,
+            2,
+            [0u8; 16],
+            headers,
+        );
+        assert!(matches!(
+            ctx.validate().unwrap_err(),
+            ContextError::FieldTooLong { field: "sealed_to", .. },
+        ));
+    }
+
+    #[test]
+    fn header_names_count_toward_the_total_budget() {
+        // 4 values of 8000 bytes = 32000 (< the 32 KiB budget), but the four
+        // 200-byte names add 800, tipping the total over — proving names are
+        // counted, not just values.
+        let mut headers = BTreeMap::new();
+        for c in ['a', 'b', 'c', 'd'] {
+            let name = HeaderName::parse(&c.to_string().repeat(200)).unwrap();
+            let value = ForwardedHeaderValue::new(vec![b'v'; 8000]).unwrap();
+            headers.insert(name, value);
+        }
+        let ctx = ForwardedContext::new("d", "c", "cap", "inv", 1, 2, [0u8; 16], headers);
+        assert!(matches!(
+            ctx.validate().unwrap_err(),
+            ContextError::TotalTooLarge { .. },
+        ));
     }
 
     #[test]

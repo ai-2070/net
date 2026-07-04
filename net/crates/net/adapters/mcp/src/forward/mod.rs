@@ -85,8 +85,8 @@ pub use aead::{X25519SealedBoxOpener, X25519SealedBoxSealer};
 pub use assemble::{AssembleError, ForwardedContextBuilder};
 pub use context::{ContextError, ForwardedContext};
 pub use header::{
-    ForwardedHeaderValue, HeaderError, HeaderName, MAX_FORWARDED_HEADERS, MAX_HEADER_VALUE_LEN,
-    MAX_TOTAL_FORWARDED_BYTES,
+    ForwardedHeaderValue, HeaderError, HeaderName, MAX_FORWARDED_HEADERS, MAX_HEADER_NAME_LEN,
+    MAX_HEADER_VALUE_LEN, MAX_TOTAL_FORWARDED_BYTES,
 };
 #[cfg(feature = "keychain")]
 pub use keychain::{KeychainSecretBackend, DEFAULT_KEYCHAIN_SERVICE};

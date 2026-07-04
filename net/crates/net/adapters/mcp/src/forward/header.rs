@@ -30,6 +30,12 @@ pub const MAX_FORWARDED_HEADERS: usize = 16;
 /// tenant id is small; anything larger is refused rather than truncated.
 pub const MAX_HEADER_VALUE_LEN: usize = 8 * 1024;
 
+/// Maximum byte length of a header **name**. Real header names are short (the
+/// longest standard ones are well under 40 bytes); this caps the name so it
+/// counts against the forwarded-byte budget with a bound and so the canonical
+/// AAD's length-prefixed name fields can never approach the `u32` prefix limit.
+pub const MAX_HEADER_NAME_LEN: usize = 256;
+
 /// Maximum combined byte length of all forwarded header values in one context.
 pub const MAX_TOTAL_FORWARDED_BYTES: usize = 32 * 1024;
 
@@ -101,6 +107,15 @@ pub enum HeaderError {
         /// The rejected name (safe to surface — names are not secret).
         name: String,
     },
+    /// A header name exceeded [`MAX_HEADER_NAME_LEN`].
+    #[error("header name is {len} bytes, over the {max}-byte limit")]
+    NameTooLong {
+        /// The rejected name's length (names are not secret, but the length is
+        /// all that's needed).
+        len: usize,
+        /// The configured limit.
+        max: usize,
+    },
     /// A header value carried a control byte (CR, LF, NUL, …). Rejecting these
     /// is the header-injection / response-splitting defense. The value itself
     /// is never included — only that it was rejected.
@@ -132,6 +147,12 @@ impl HeaderName {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Err(HeaderError::EmptyName);
+        }
+        if trimmed.len() > MAX_HEADER_NAME_LEN {
+            return Err(HeaderError::NameTooLong {
+                len: trimmed.len(),
+                max: MAX_HEADER_NAME_LEN,
+            });
         }
         if !trimmed.bytes().all(is_token_byte) {
             return Err(HeaderError::InvalidName {
@@ -414,6 +435,18 @@ mod tests {
                 "{plain:?} must stay plain-eligible",
             );
         }
+    }
+
+    #[test]
+    fn name_over_the_length_cap_is_rejected() {
+        assert!(
+            HeaderName::parse(&"x".repeat(MAX_HEADER_NAME_LEN)).is_ok(),
+            "a name at the cap is fine",
+        );
+        assert!(matches!(
+            HeaderName::parse(&"x".repeat(MAX_HEADER_NAME_LEN + 1)).unwrap_err(),
+            HeaderError::NameTooLong { .. },
+        ));
     }
 
     #[test]
