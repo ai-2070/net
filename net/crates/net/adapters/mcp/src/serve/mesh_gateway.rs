@@ -126,7 +126,10 @@ impl CapabilityGateway for MeshGateway {
         // Fetch provider catalogs concurrently with bounded fan-out, so search
         // completes in ~the slowest provider's time rather than the sum — a
         // single slow/unreachable provider (which can burn the full retry
-        // budget) no longer blocks the others.
+        // budget) no longer blocks the others. `buffered` (not
+        // `buffer_unordered`) preserves the deterministic `find_nodes` order, so
+        // results are stable across runs regardless of which provider answers
+        // first.
         let catalogs: Vec<(u64, Result<DescribeResponse, GatewayError>)> = stream::iter(providers)
             .map(|node| async move {
                 (
@@ -134,7 +137,7 @@ impl CapabilityGateway for MeshGateway {
                     self.fetch_catalog(node, &DescribeRequest::default()).await,
                 )
             })
-            .buffer_unordered(MAX_CONCURRENT_FETCHES)
+            .buffered(MAX_CONCURRENT_FETCHES)
             .collect()
             .await;
 
