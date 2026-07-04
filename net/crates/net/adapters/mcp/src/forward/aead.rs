@@ -75,7 +75,6 @@ impl X25519SealedBoxSealer {
 impl ForwardedContextSealer for X25519SealedBoxSealer {
     async fn seal(&self, ctx: &ForwardedContext) -> Result<SealedContext, SealError> {
         ctx.validate()?;
-        let mut plaintext = serialize_headers(ctx);
 
         // Ephemeral X25519 keypair. `X25519Secret` (zeroize feature) wipes
         // itself on drop; scrub the raw seed too.
@@ -88,6 +87,19 @@ impl ForwardedContextSealer for X25519SealedBoxSealer {
 
         let recipient_pk = X25519Pub::from(self.recipient_pub);
         let shared = eph_sk.diffie_hellman(&recipient_pk);
+        // Refuse a low-order / identity recipient key. A non-contributory shared
+        // secret is the all-zero point regardless of our ephemeral key, so the
+        // derived AEAD key would be a public constant and any passive observer
+        // could recompute it and decrypt the bearer token. Reject before
+        // deriving a key or even materializing the plaintext header copy, so the
+        // early-return path holds no secret to scrub.
+        if !shared.was_contributory() {
+            return Err(SealError::Backend(
+                "recipient forwarding key is low-order and was rejected".into(),
+            ));
+        }
+
+        let mut plaintext = serialize_headers(ctx);
         let mut key = derive_key(shared.as_bytes(), KDF_DOMAIN_KEY);
         let nonce = derive_nonce(eph_pk.as_bytes(), &self.recipient_pub);
         let aad = ctx.canonical_aad();
@@ -404,6 +416,19 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, OpenError::BindingFailed));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_low_order_recipient_key() {
+        // An all-zero X25519 public key is a small-order point: the shared
+        // secret is non-contributory (the identity), so the derived key would be
+        // a public constant. The sealer must refuse rather than emit a blob any
+        // observer could decrypt.
+        let err = X25519SealedBoxSealer::to_recipient([0u8; 32])
+            .seal(&sample("node-dest", 1_000))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SealError::Backend(_)), "low-order key must be rejected");
     }
 
     #[tokio::test]
