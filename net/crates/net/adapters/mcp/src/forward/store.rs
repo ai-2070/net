@@ -269,11 +269,10 @@ impl ForwardingStore {
         use tokio::io::AsyncWriteExt;
         let mut opts = tokio::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
+        // `tokio::fs::OpenOptions::mode` is an inherent unix method — no
+        // `OpenOptionsExt` import needed (mirrors the pin store).
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
+        opts.mode(0o600);
         let mut f = opts.open(&tmp).await.map_err(|e| StoreError::io(&tmp, e))?;
         f.write_all(&bytes)
             .await
