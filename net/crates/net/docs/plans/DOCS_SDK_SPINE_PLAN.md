@@ -1,8 +1,10 @@
 # Documentation — SDK Spine (Phase 3 sub-plan of `DOCS_STRATEGY_PLAN.md`)
 
-**Status:** IN PROGRESS. Phase 3a — the **Rust reference spine** —
-(`web/src/content/docs/sdk/rust/`) is the deliverable of this commit. Phase 3b
-(TypeScript / Python / Go / C) is pending review of the Rust spine.
+**Status:** DONE (2026-07-04). Phase 3a (Rust reference spine) + Phase 3b
+(TypeScript, Python, Go, C) all landed. Rust/TS/Python/Go carry the full 7-page
+spine; C is an honest 2-page spine (README + quickstart + errors) because its ABI
+is bus-only. Each language gated to its pill in `docs.order.ts`; every code block
+grounded in that binding's real source/tests. Builds green.
 
 **Goal:** One conceptual spine, five language bindings. Every SDK page teaches the
 same agentic step in the same order, so a reader who learns the concept in one

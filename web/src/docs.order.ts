@@ -23,6 +23,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "guides",
     "concepts",
     "sdk",
+    "agent-briefs",
     "reference",
     "tutorials",
     "releases",
@@ -67,6 +68,11 @@ export const DOCS_ORDER: DocsOrderConfig = {
     ],
     // C exposes only the bus in its ABI — an honest two-page spine, not seven.
     "sdk/c": ["quickstart", "errors"],
+    "agent-briefs": [
+      "wrap-and-use-an-mcp-server",
+      "build-a-recoverable-capability",
+      "generate-typed-tool-bindings",
+    ],
     worldview: [
       "agentic-mesh",
       "submitted-is-not-completed",
@@ -245,6 +251,12 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "sdk/c": "C",
     "sdk/c/quickstart": "Quickstart",
     "sdk/c/errors": "Errors",
+
+    // Agent briefs
+    "agent-briefs": "Agent Briefs",
+    "agent-briefs/wrap-and-use-an-mcp-server": "Wrap and Use an MCP Server",
+    "agent-briefs/build-a-recoverable-capability": "Build a Recoverable Capability",
+    "agent-briefs/generate-typed-tool-bindings": "Generate Typed Tool Bindings",
 
     // Tutorials
     "tutorials/fleet-telemetry": "Fleet Telemetry",
