@@ -64,3 +64,6 @@ hermes/
 hermes-agent/
 .cocoindex_code/
 .codegraph/
+
+# OpenClaw
+openclaw/
