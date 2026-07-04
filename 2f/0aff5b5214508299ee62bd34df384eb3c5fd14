@@ -1,0 +1,21 @@
+net/crates/net/adapters/mcp/src/spec/mod.rs
+  s_759aaad81078ca::t_3df801a24f4037 112-117,121-122
+  s_759aaad81078ca::t_f6b9ee61464214 477,485-498
+  s_759aaad81078ca::t_ff41382c2cfb10 499-500
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2f0aff5b5214508299ee62bd34df384eb3c5fd14",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
