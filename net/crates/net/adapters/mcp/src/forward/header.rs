@@ -186,6 +186,16 @@ impl ForwardedHeaderValue {
     /// some legitimate headers are empty, and emptiness carries no secret.
     pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, HeaderError> {
         let bytes = bytes.into();
+        Self::validate(&bytes)?;
+        Ok(ForwardedHeaderValue(bytes))
+    }
+
+    /// The value-acceptance rules ([`Self::new`]'s checks) applied to a borrowed
+    /// slice, without allocating or wrapping. A value **backend** validates with
+    /// this at its `set` boundary so a value that could never be read back
+    /// (oversize or control-char-bearing — `get` rejects it via [`Self::new`])
+    /// is refused at entry time instead of silently failing at forward time.
+    pub fn validate(bytes: &[u8]) -> Result<(), HeaderError> {
         if bytes.len() > MAX_HEADER_VALUE_LEN {
             return Err(HeaderError::ValueTooLong {
                 len: bytes.len(),
@@ -195,7 +205,7 @@ impl ForwardedHeaderValue {
         if bytes.iter().any(|&b| is_forbidden_value_byte(b)) {
             return Err(HeaderError::ControlCharInValue);
         }
-        Ok(ForwardedHeaderValue(bytes))
+        Ok(())
     }
 
     /// The value's byte length. Safe to log — a length is not a secret.
@@ -342,6 +352,22 @@ mod tests {
         let too_long = vec![b'x'; MAX_HEADER_VALUE_LEN + 1];
         assert!(matches!(
             ForwardedHeaderValue::new(too_long).unwrap_err(),
+            HeaderError::ValueTooLong { .. },
+        ));
+    }
+
+    #[test]
+    fn validate_matches_new_without_allocating() {
+        // The borrow-only entry check a backend uses at `set` must agree with
+        // `new` (what `get` runs), so a value accepted at entry always reads back.
+        assert!(ForwardedHeaderValue::validate(b"Bearer abc123").is_ok());
+        assert!(ForwardedHeaderValue::validate(b"a\tb").is_ok());
+        assert_eq!(
+            ForwardedHeaderValue::validate(b"a\r\nInjected: x").unwrap_err(),
+            HeaderError::ControlCharInValue,
+        );
+        assert!(matches!(
+            ForwardedHeaderValue::validate(&vec![b'x'; MAX_HEADER_VALUE_LEN + 1]).unwrap_err(),
             HeaderError::ValueTooLong { .. },
         ));
     }

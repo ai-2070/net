@@ -57,6 +57,11 @@ impl KeychainSecretBackend {
     /// Enter or replace a secret value for `ref_name`. The operator/CLI entry
     /// path (`net secret set`) — never call it with a model-supplied value.
     pub async fn set(&self, ref_name: &str, value: &[u8]) -> Result<(), SecretBackendError> {
+        // Validate at entry with the same rules `get` enforces (via
+        // `ForwardedHeaderValue::new`), so an oversize / control-char value that
+        // could never be read back is rejected here rather than persisted and
+        // then failing at forward time. Runs before the keychain is touched.
+        ForwardedHeaderValue::validate(value)?;
         let (service, ref_name, value) =
             (self.service.clone(), ref_name.to_string(), value.to_vec());
         run_blocking(move || {
@@ -174,6 +179,23 @@ mod tests {
             !backend.delete(ref_name).await.unwrap(),
             "deleting an absent value is a no-op"
         );
+    }
+
+    #[tokio::test]
+    async fn set_rejects_invalid_value_before_touching_the_keychain() {
+        // Validation runs before any keychain syscall, so this holds even on a
+        // host with no usable keychain: an oversize or control-char value that
+        // `get` could never read back is refused at entry, not persisted.
+        let backend = KeychainSecretBackend::new("svc-unused");
+        let oversize = vec![b'x'; crate::forward::MAX_HEADER_VALUE_LEN + 1];
+        assert!(matches!(
+            backend.set("kc-test", &oversize).await.unwrap_err(),
+            SecretBackendError::Value(_),
+        ));
+        assert!(matches!(
+            backend.set("kc-test", b"tok\nmore").await.unwrap_err(),
+            SecretBackendError::Value(_),
+        ));
     }
 
     #[tokio::test]
