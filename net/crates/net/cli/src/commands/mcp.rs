@@ -232,17 +232,14 @@ async fn pin_mutate(
     let id = CapabilityId::parse(&args.cap_id)
         .map_err(|e| invalid_args(format!("cap id {:?}: {e}", args.cap_id)))?;
     let path = resolve_pin_store(args.pin_store.as_deref())?;
-    let mut store = PinStore::load(&path)
-        .await
-        .map_err(|e| generic(format!("load pin store: {e}")))?;
-    let changed = match action {
+    // Locked load→modify→save so a concurrent shim / pin invocation can't
+    // clobber this operator decision.
+    let changed = PinStore::mutate(path.clone(), |store| match action {
         "approved" => store.approve(&id),
         _ => store.remove(&id),
-    };
-    store
-        .save()
-        .await
-        .map_err(|e| generic(format!("save pin store: {e}")))?;
+    })
+    .await
+    .map_err(|e| generic(format!("update pin store: {e}")))?;
     let row = PinMutation {
         cap_id: id.display(),
         action,

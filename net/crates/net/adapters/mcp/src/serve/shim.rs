@@ -474,16 +474,10 @@ impl<G: CapabilityGateway> Shim<G> {
         // Record a *pending* request in the shared store — never an approval.
         // Moving pending → approved happens only through `net mcp pin approve`,
         // outside the model loop (the plan's rule: the model must not approve
-        // its own future access).
+        // its own future access). Done under the store lock so it can't clobber
+        // a concurrent operator approve/reject.
         if let Some(path) = &self.pin_store_path {
-            let mut store = match PinStore::load(path).await {
-                Ok(s) => s,
-                Err(e) => {
-                    return CallToolResult::text_error(format!("could not read the pin store: {e}"))
-                }
-            };
-            store.request(&id);
-            if let Err(e) = store.save().await {
+            if let Err(e) = PinStore::mutate(path.clone(), |store| store.request(&id)).await {
                 return CallToolResult::text_error(format!(
                     "could not record the pin request: {e}"
                 ));

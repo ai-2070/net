@@ -12,16 +12,19 @@
 //!   daemon-side; our shim is not a daemon client, so the machine-shared
 //!   equivalent is a per-user JSON file every `net mcp serve` and the pin CLI
 //!   read/write. Writes are atomic (temp + rename) so a concurrent reader never
-//!   sees a half-written file; last-writer-wins on the rare approve/request
-//!   race is acceptable for an interactive flow.
+//!   sees a half-written file, and every read-modify-write goes through
+//!   [`PinStore::mutate`] under a cross-process advisory lock, so a stale
+//!   snapshot can never clobber a concurrent change and resurrect a removed
+//!   consent decision. The file is owner-only (0600 on Unix).
 //!
 //! The store keys on a capability's [`CapabilityId`] display form
 //! (`provider/capability`), so a pin is bound to a specific provider — never a
 //! bare capability name that could silently repoint.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use super::backend::CapabilityId;
@@ -56,6 +59,50 @@ pub enum PinStoreError {
         /// Why it failed to parse.
         reason: String,
     },
+}
+
+/// Holds the cross-process advisory lock on the pin store's `.lock` sidecar
+/// for the lifetime of a [`PinStore::mutate`] transaction. Dropping it closes
+/// the file descriptor, which releases the OS lock.
+struct LockGuard {
+    _file: std::fs::File,
+}
+
+impl LockGuard {
+    async fn acquire(store_path: &Path) -> Result<Self, PinStoreError> {
+        let lock_path = PathBuf::from(format!("{}.lock", store_path.display()));
+        let display = lock_path.display().to_string();
+        // `lock_exclusive` blocks until acquired, so take it on a blocking
+        // thread; the returned `File` keeps the lock until it (and thus its fd)
+        // is dropped — safe to hold across the transaction's awaits.
+        let file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+            if let Some(parent) = lock_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            // A lock file: created if absent, never written to or truncated —
+            // only its advisory lock matters. `truncate(false)` is explicit so
+            // we never clobber a sibling process's lock file content.
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)?;
+            file.lock_exclusive()?;
+            Ok(file)
+        })
+        .await
+        .map_err(|e| PinStoreError::Io {
+            path: display.clone(),
+            reason: format!("pin-store lock task panicked: {e}"),
+        })?
+        .map_err(|e| PinStoreError::Io {
+            path: display,
+            reason: e.to_string(),
+        })?;
+        Ok(Self { _file: file })
+    }
 }
 
 /// The persisted, machine-shared set of pins.
@@ -159,6 +206,30 @@ impl PinStore {
 
         tokio::fs::rename(&tmp, &self.path).await.map_err(io_err)?;
         Ok(())
+    }
+
+    /// Atomically apply a mutation under a **cross-process exclusive lock**, so
+    /// a concurrent `net mcp pin` invocation or another `net mcp serve` can't
+    /// interleave its own load→save and clobber this one — in particular, a
+    /// stale snapshot must never resurrect a just-removed approval. The lock is
+    /// held for the whole load → apply → save; read-only [`load`](Self::load)
+    /// needs no lock (the atomic rename prevents torn reads). Returns the
+    /// closure's result.
+    ///
+    /// The lock is taken on a sidecar `.lock` file, not the store itself, since
+    /// the atomic-rename save replaces the store file and would drop a lock
+    /// held on it.
+    pub async fn mutate<R, F>(path: impl Into<PathBuf>, f: F) -> Result<R, PinStoreError>
+    where
+        F: FnOnce(&mut PinStore) -> R,
+    {
+        let path = path.into();
+        // Hold the lock guard across the whole transaction; it releases on drop.
+        let _guard = LockGuard::acquire(&path).await?;
+        let mut store = PinStore::load(&path).await?;
+        let result = f(&mut store);
+        store.save().await?;
+        Ok(result)
     }
 
     /// The store's file path.
@@ -354,5 +425,40 @@ mod tests {
             0o600,
             "the pin store records consent decisions and must be owner-only",
         );
+    }
+
+    #[tokio::test]
+    async fn mutate_applies_and_persists() {
+        let (_dir, path) = store_path();
+        let state = PinStore::mutate(path.clone(), |s| s.request(&cap("b/echo")))
+            .await
+            .unwrap();
+        assert_eq!(
+            state,
+            PinState::Pending,
+            "mutate returns the closure result"
+        );
+        assert_eq!(
+            PinStore::load(&path).await.unwrap().state(&cap("b/echo")),
+            Some(PinState::Pending),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_mutations_do_not_lose_updates() {
+        // Two concurrent locked transactions each approve a different
+        // capability. The lock serializes load→save, so neither clobbers the
+        // other and both survive — without it, the two loads race on the same
+        // snapshot and one approval is lost to last-writer-wins.
+        let (_dir, path) = store_path();
+        let (r1, r2) = tokio::join!(
+            PinStore::mutate(path.clone(), |s| s.approve(&cap("b/a"))),
+            PinStore::mutate(path.clone(), |s| s.approve(&cap("b/b"))),
+        );
+        assert!(r1.unwrap());
+        assert!(r2.unwrap());
+        let store = PinStore::load(&path).await.unwrap();
+        assert!(store.is_approved(&cap("b/a")), "first approval survived");
+        assert!(store.is_approved(&cap("b/b")), "second approval survived");
     }
 }
