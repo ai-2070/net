@@ -1,8 +1,11 @@
 //! Shim-side consent gate (`MCP_BRIDGE_PLAN.md` Phase 2, `serve/consent.rs`).
 //!
-//! A capability with credential status `credentialed`, `external_api`, or
-//! `unknown` is **not invocable** through `net_invoke_capability` until it is
-//! either allowlisted in shim config or pinned with user approval. Search and
+//! A discovered capability is **not invocable** through `net_invoke_capability`
+//! until it is either allowlisted in shim config or pinned with user approval.
+//! A wire-declared credential status — *including* `none` — is not trusted
+//! across the demand-side trust boundary (see
+//! [`CredentialStatus::from_wire`]), so every discovered capability is gated,
+//! not just the `credentialed` / `external_api` / `unknown` ones. Search and
 //! describe still show it — display never implies invocation (doctrine #3) —
 //! marked `requires_approval` so the model knows the next step.
 //!
@@ -48,8 +51,10 @@ pub struct ConsentPolicy {
 }
 
 impl ConsentPolicy {
-    /// An empty policy: nothing allowlisted or pinned. Only capabilities that
-    /// need no approval (`credential_status: none`) are invocable.
+    /// An empty policy: nothing allowlisted or pinned. With no entries **every**
+    /// discovered capability requires approval — a wire credential status
+    /// (including `none`) is not trusted (see [`CredentialStatus::from_wire`]),
+    /// so a capability is invocable only once it is allowlisted or pinned.
     pub fn new() -> Self {
         Self::default()
     }
