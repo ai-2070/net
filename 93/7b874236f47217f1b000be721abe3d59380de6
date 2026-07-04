@@ -1,0 +1,23 @@
+net/crates/net/adapters/mcp/src/forward/mod.rs
+  s_759aaad81078ca::t_89562874ec7c84 93
+  s_759aaad81078ca::t_36008ffa7c5a98 72
+net/crates/net/adapters/mcp/src/forward/assemble.rs
+  s_759aaad81078ca::t_16ed072f3cc242 1-42,46-196
+  s_759aaad81078ca::t_47fe60bd41c6ab 43-45
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "937b874236f47217f1b000be721abe3d59380de6",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
