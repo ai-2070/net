@@ -38,6 +38,15 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "artifacts",
       "errors",
     ],
+    "sdk/typescript": [
+      "quickstart",
+      "announce",
+      "discover",
+      "invoke",
+      "watch",
+      "artifacts",
+      "errors",
+    ],
     worldview: [
       "agentic-mesh",
       "submitted-is-not-completed",
@@ -189,6 +198,14 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "sdk/rust/watch": "Watch",
     "sdk/rust/artifacts": "Artifacts",
     "sdk/rust/errors": "Errors",
+    "sdk/typescript": "TypeScript",
+    "sdk/typescript/quickstart": "Quickstart",
+    "sdk/typescript/announce": "Announce",
+    "sdk/typescript/discover": "Discover",
+    "sdk/typescript/invoke": "Invoke",
+    "sdk/typescript/watch": "Watch",
+    "sdk/typescript/artifacts": "Artifacts",
+    "sdk/typescript/errors": "Errors",
 
     // Tutorials
     "tutorials/fleet-telemetry": "Fleet Telemetry",
@@ -233,8 +250,9 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "releases/release-v0.8-killing-moon": "v0.8 — Killing Moon",
   },
   languages: {
-    // The Rust SDK spine is visible under the `rust` language (the default).
-    // Phase 3b adds sdk/typescript → ["ts"], sdk/python → ["python"], etc.
+    // Each SDK spine is visible under its language pill. Rust is the default.
+    // Phase 3b adds sdk/python → ["python"], sdk/go → ["go"], sdk/c → ["c"].
     "sdk/rust": ["rust"],
+    "sdk/typescript": ["ts"],
   },
 };
