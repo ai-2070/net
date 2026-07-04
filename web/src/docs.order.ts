@@ -124,6 +124,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     ],
     // Releases — newest first.
     releases: [
+      "RELEASE_v0.31_HOLD_THE_LINE",
       "RELEASE_v0.30_FINAL_COUNTDOWN",
       "RELEASE_v0.29.1_SUMMER_OF_69",
       "RELEASE_v0.29_SUMMER_OF_69",
@@ -257,7 +258,8 @@ export const DOCS_ORDER: DocsOrderConfig = {
     // Agent briefs
     "agent-briefs": "Agent Briefs",
     "agent-briefs/wrap-and-use-an-mcp-server": "Wrap and Use an MCP Server",
-    "agent-briefs/build-a-recoverable-capability": "Build a Recoverable Capability",
+    "agent-briefs/build-a-recoverable-capability":
+      "Build a Recoverable Capability",
     "agent-briefs/generate-typed-tool-bindings": "Generate Typed Tool Bindings",
 
     // Tutorials
@@ -266,6 +268,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "tutorials/event-sourced-service": "Event-Sourced Service",
 
     // Releases
+    "releases/RELEASE_v0.31_HOLD_THE_LINE": "v0.31.0 — Hold the Line",
     "releases/RELEASE_v0.30_FINAL_COUNTDOWN": "v0.30.0 — Final Countdown",
     "releases/RELEASE_v0.29.1_SUMMER_OF_69": "v0.29.1 — Summer of '69",
     "releases/RELEASE_v0.29_SUMMER_OF_69": "v0.29.0 — Summer of '69",
