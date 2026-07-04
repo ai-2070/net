@@ -45,7 +45,7 @@ pub enum CapabilityIdError {
 
 impl CapabilityId {
     /// Build from parts. The provider is canonicalized (see
-    /// [`canonical_provider`]) so a node id typed in a different spelling
+    /// `canonical_provider`) so a node id typed in a different spelling
     /// (hex, or with surrounding whitespace) yields the *same* identity — and
     /// therefore the same consent / pin-store key.
     pub fn new(provider: impl Into<String>, capability: impl Into<String>) -> Self {

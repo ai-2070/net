@@ -433,7 +433,7 @@ impl CapabilityGateway for MeshGateway {
     /// `call_retry` *or* failover to another provider — can execute a tool more
     /// than once. Both are gated on [`InvokeSafety`]:
     ///
-    /// - **Same-node retry** uses [`retriable_send_safe`] for
+    /// - **Same-node retry** uses `retriable_send_safe` for
     ///   [`InvokeSafety::AtMostOnce`], so a credentialed / stateful tool is
     ///   never re-sent on a mere timeout; a [`InvokeSafety::DuplicateSafe`] tool
     ///   retries transient timeouts, recovering from the reply-channel
