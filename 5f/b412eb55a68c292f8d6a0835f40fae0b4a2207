@@ -1,0 +1,28 @@
+net/crates/net/adapters/mcp/src/serve/mesh_gateway.rs
+  s_759aaad81078ca::t_fd9e34fa1c1a0d 115-124,126,134,139-148,151
+  s_759aaad81078ca::t_95d390d6746049 175-178
+  s_759aaad81078ca::t_230a513221822b 95,510-524
+  s_759aaad81078ca::t_0781d50c408f51 75-76,85,89-94
+  s_759aaad81078ca::t_7f808a7e3f3bef 278-281
+  s_759aaad81078ca::t_f678612f17af6b 51-59
+  s_759aaad81078ca::t_4dc05b18cb5977 96
+  s_759aaad81078ca::t_73b6eb5bb44ead 509
+net/crates/net/adapters/mcp/tests/serve_end_to_end.rs
+  s_759aaad81078ca::t_e883611cc32cc3 100-103,170-173,290-293
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5fb412eb55a68c292f8d6a0835f40fae0b4a2207",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
