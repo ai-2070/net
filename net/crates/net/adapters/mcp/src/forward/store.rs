@@ -284,22 +284,33 @@ impl ForwardingStore {
         #[cfg(unix)]
         opts.mode(0o600);
         let mut f = opts.open(&tmp).await.map_err(|e| StoreError::io(&tmp, e))?;
-        f.write_all(&bytes)
-            .await
-            .map_err(|e| StoreError::io(&tmp, e))?;
-        // Durability: flush the userspace buffer, then fsync the file's data +
-        // metadata. Atomic rename gives *atomicity* (a reader sees the old or
-        // the new file, never a torn one), but not *durability* — without
-        // sync_all a crash after the rename can surface a truncated / zero-length
-        // store, which load() rejects as Corrupt and bricks every `net
-        // forwarding` verb until the file is deleted by hand.
-        f.flush().await.map_err(|e| StoreError::io(&tmp, e))?;
-        f.sync_all().await.map_err(|e| StoreError::io(&tmp, e))?;
-        drop(f);
+        // From here the temp file exists, so any failure must not leave it
+        // behind (it holds a partial policy and clutters the per-user data dir).
+        // Do the write + fsync + rename in a fallible block and remove the temp
+        // on error.
+        let write_result = async {
+            f.write_all(&bytes)
+                .await
+                .map_err(|e| StoreError::io(&tmp, e))?;
+            // Durability: flush the userspace buffer, then fsync the file's data
+            // + metadata. Atomic rename gives *atomicity* (a reader sees the old
+            // or the new file, never a torn one), but not *durability* — without
+            // sync_all a crash after the rename can surface a truncated /
+            // zero-length store, which load() rejects as Corrupt and bricks every
+            // `net forwarding` verb until the file is deleted by hand.
+            f.flush().await.map_err(|e| StoreError::io(&tmp, e))?;
+            f.sync_all().await.map_err(|e| StoreError::io(&tmp, e))?;
+            drop(f);
 
-        tokio::fs::rename(&tmp, &self.path)
-            .await
-            .map_err(|e| StoreError::io(&self.path, e))?;
+            tokio::fs::rename(&tmp, &self.path)
+                .await
+                .map_err(|e| StoreError::io(&self.path, e))
+        }
+        .await;
+        if let Err(e) = write_result {
+            let _ = tokio::fs::remove_file(&tmp).await; // best-effort cleanup
+            return Err(e);
+        }
 
         // fsync the parent directory so the new dirent (the rename itself)
         // survives a crash too. Best-effort and unix-only: Windows has no
@@ -910,6 +921,27 @@ mod tests {
         assert!(store.is_enabled(), "the failed transaction did not persist");
         assert!(store.config().secrets.contains_key("keep"));
         assert!(!store.config().secrets.contains_key("bad"));
+    }
+
+    #[tokio::test]
+    async fn save_leaves_no_temp_file_behind() {
+        let (_dir, path) = store_path();
+        ForwardingStore::mutate(path.clone(), |s| {
+            s.set_secret("t", "Authorization", AllowList::default(), None, false)
+        })
+        .await
+        .unwrap();
+        assert!(tokio::fs::metadata(&path).await.is_ok(), "store persisted");
+        // No sibling `.tmp.<pid>` file lingers next to the store.
+        let dir = path.parent().unwrap();
+        let mut entries = tokio::fs::read_dir(dir).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name();
+            assert!(
+                !name.to_string_lossy().contains(".tmp."),
+                "a temp file was left behind: {name:?}",
+            );
+        }
     }
 
     #[tokio::test]
