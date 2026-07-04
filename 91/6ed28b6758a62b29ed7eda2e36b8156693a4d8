@@ -1,0 +1,51 @@
+web/src/docs.order.ts
+  s_f75d64212a7389::t_4a50aaa8bdd678 97
+  s_f75d64212a7389::t_4c086148a46439 196
+web/src/content/docs/sdk/typescript/quickstart.md
+  s_f75d64212a7389::t_60250da0286d47 29
+web/src/content/docs/guides/recover-failed-workflow.md
+  s_f75d64212a7389::t_60250da0286d47 7,87
+web/src/content/docs/sdk/python/quickstart.md
+  s_f75d64212a7389::t_60250da0286d47 27
+web/src/content/docs/guides/submitted-is-not-completed.md
+  s_f75d64212a7389::t_1c3813dafd14f1 130-132
+web/src/content/docs/sdk/go/quickstart.md
+  s_f75d64212a7389::t_60250da0286d47 49
+web/src/content/docs/worldview/rest-vs-net.md
+  s_f75d64212a7389::t_60250da0286d47 31
+web/src/content/docs/sdk/python/watch.md
+  s_f75d64212a7389::t_60250da0286d47 5
+web/src/content/docs/worldview/right-and-wrong-use-cases.md
+  s_f75d64212a7389::t_60250da0286d47 26
+web/src/content/docs/worldview/agentic-mesh.md
+  s_f75d64212a7389::t_60250da0286d47 26
+  s_f75d64212a7389::t_8414f63a6f444c 92-94
+web/src/content/docs/worldview/README.md
+  s_f75d64212a7389::t_63e65b46dfe076 25,28,30,32-36
+web/src/content/docs/sdk/rust/quickstart.md
+  s_f75d64212a7389::t_60250da0286d47 39
+web/src/content/docs/sdk/rust/watch.md
+  s_f75d64212a7389::t_60250da0286d47 6
+web/src/content/docs/sdk/typescript/watch.md
+  s_f75d64212a7389::t_60250da0286d47 6
+web/src/content/docs/agent-briefs/build-a-recoverable-capability.md
+  s_f75d64212a7389::t_60250da0286d47 6
+web/src/content/docs/sdk/c/quickstart.md
+  s_f75d64212a7389::t_60250da0286d47 39
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "916ed28b6758a62b29ed7eda2e36b8156693a4d8",
+  "prompts": {},
+  "sessions": {
+    "s_f75d64212a7389": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6139e8e8-9ce9-4dfc-9412-193afe6af8d2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
