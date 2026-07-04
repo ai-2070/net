@@ -122,10 +122,19 @@ pub fn validate_args(args: &Value, schema: &Value) -> Result<(), ValidationError
 fn type_matches(type_decl: &Value, value: &Value) -> bool {
     match type_decl {
         Value::String(t) => json_type_is(t, value),
-        Value::Array(alts) => alts.iter().any(|alt| match alt.as_str() {
-            Some(t) => json_type_is(t, value),
-            None => true,
-        }),
+        Value::Array(alts) => {
+            // An empty type union (`"type": []`) is a malformed / unmodelled
+            // schema, not a contract that rejects everything — treat it like
+            // the other unmodelled cases (satisfiable) rather than failing the
+            // field for every value.
+            if alts.is_empty() {
+                return true;
+            }
+            alts.iter().any(|alt| match alt.as_str() {
+                Some(t) => json_type_is(t, value),
+                None => true,
+            })
+        }
         // A malformed `type` (object/number/…) is not something we model.
         _ => true,
     }
@@ -256,5 +265,19 @@ mod tests {
             "additionalProperties": false
         });
         assert!(validate_args(&json!({ "a": "x", "b": "extra" }), &s).is_ok());
+    }
+
+    #[test]
+    fn empty_type_union_does_not_false_reject() {
+        // `"type": []` is a malformed union; it must not reject every value for
+        // the field (that would make the tool unusable until the schema is
+        // fixed upstream).
+        let s = json!({
+            "type": "object",
+            "properties": { "x": { "type": [] } },
+            "required": ["x"]
+        });
+        assert!(validate_args(&json!({ "x": 123 }), &s).is_ok());
+        assert!(validate_args(&json!({ "x": "str" }), &s).is_ok());
     }
 }
