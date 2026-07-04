@@ -83,7 +83,7 @@ mod target;
 
 pub use aead::{X25519SealedBoxOpener, X25519SealedBoxSealer};
 pub use assemble::{AssembleError, ForwardedContextBuilder};
-pub use context::{ContextError, ForwardedContext};
+pub use context::{ContextError, ForwardedContext, MAX_ID_FIELD_LEN};
 pub use header::{
     ForwardedHeaderValue, HeaderError, HeaderName, MAX_FORWARDED_HEADERS, MAX_HEADER_NAME_LEN,
     MAX_HEADER_VALUE_LEN, MAX_TOTAL_FORWARDED_BYTES,
@@ -110,8 +110,8 @@ pub use target::{
 };
 
 /// Best-effort **volatile, full-capacity** scrub of a secret byte buffer — the
-/// same primitive [`ForwardedHeaderValue`] uses on drop (see
-/// [`header::zeroize_vec`]). Exposed for the value-entry CLI (`net forwarding
+/// same primitive [`ForwardedHeaderValue`] uses on drop (the crate-internal
+/// `header::zeroize_vec`). Exposed for the value-entry CLI (`net forwarding
 /// set-value`), which must wipe the plaintext secret it read from stdin with a
 /// store the optimizer can't elide and that covers spare capacity, not a plain
 /// `= 0` loop that misses both.

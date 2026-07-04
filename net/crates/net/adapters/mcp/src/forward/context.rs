@@ -48,7 +48,7 @@ const AAD_SCHEME_VERSION: u8 = 1;
 /// invocation). These are short ids; capping them keeps every canonical-AAD
 /// length-prefixed field far below the `u32` prefix limit, so the AAD encoder's
 /// length cast can never overflow from a validated context.
-const MAX_ID_FIELD_LEN: usize = 1024;
+pub const MAX_ID_FIELD_LEN: usize = 1024;
 
 /// Why a [`ForwardedContext`] failed validation. No variant carries a header
 /// **value** — only names, counts, and lengths, all of which are safe to

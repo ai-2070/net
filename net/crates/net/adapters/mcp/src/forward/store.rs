@@ -573,7 +573,7 @@ fn render_providers(scope: &ProviderScope) -> String {
 }
 
 /// A secret ref name is an audit-legible **label**, so it must be a lowercase
-/// slug: `[a-z0-9]` first, then `[a-z0-9._-]`, up to [`MAX_REF_NAME_LEN`]. The
+/// slug: `[a-z0-9]` first, then `[a-z0-9._-]`, up to `MAX_REF_NAME_LEN` (64). The
 /// lowercase-only rule is also a light guard against pasting a raw token as the
 /// name (real tokens usually carry uppercase) — the plan's "never encode a
 /// value in the name" is a convention the charset can only partly enforce, so
