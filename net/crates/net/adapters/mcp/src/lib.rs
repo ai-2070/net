@@ -22,8 +22,15 @@
 //! - [`serve`] — the demand side: the [`serve::Shim`] stdio MCP **server**
 //!   that exposes the mesh's capabilities to a local MCP host as meta-tools,
 //!   with pre-flight validation and a shim-side consent gate (Phase 2).
+//! - [`forward`] — spec-only foundation for opt-in, deny-by-default credential
+//!   & header forwarding (`MCP_CREDENTIAL_FORWARDING_PLAN.md` Phase 0): the
+//!   `net.invoke.forwarded_context@1` object, its canonical binding, the
+//!   policy schema, the secret wrapper type, and the never-for-stdio doctrine.
+//!   It forwards nothing — it exists so future phases can't smuggle forwarding
+//!   past these hostile-by-default types.
 
 pub mod bridge;
+pub mod forward;
 pub mod serve;
 pub mod spec;
 pub mod wrap;

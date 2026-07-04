@@ -6,6 +6,8 @@
 
 **Preference order (doctrine):** provider-held credentials > Net delegation/identity > forwarded credentials. Forwarding is the compatibility escape hatch for services that only understand bearer auth.
 
+**Status (2026-07-04):** **Phase 0 has landed** on the `mcp-creds` branch as the `net_mcp::forward` module (`net-mesh-mcp` crate). It is spec-only — it forwards nothing — and pins the shapes and invariants every later phase must route through: the `net.invoke.forwarded_context@1` object with its canonical AAD binding (golden-vectored) and validation, the `ForwardedHeaderValue` secret wrapper (redacted, unserializable, exposed only at an explicit boundary), canonicalized `HeaderName` classification, the deny-by-default caller/destination policy schema with a denial level that names the gate that refused, the `accepts_forwarded_credentials` risk tag, and the **never-for-stdio** guard encoded in the type system. Phases 1–3 remain unbuilt.
+
 ---
 
 ## Doctrine
@@ -110,7 +112,7 @@ Any level saying no = stripped or refused, fail closed, structured error naming 
 
 ## Scope & phasing
 
-- **Phase 0 (now, spec only):** object definition, canonicalization, policy schema, risk tags, test fixture design, the never-for-stdio doctrine. Exists so future bridge work can't smuggle in "just forward Authorization" under pressure.
+- **Phase 0 (spec only) — LANDED:** object definition, canonicalization, policy schema, risk tags, the never-for-stdio doctrine, and the secret wrapper type, in `net_mcp::forward` (`adapters/mcp/src/forward/`). Exists so future bridge work can't smuggle in "just forward Authorization" under pressure. Forwards nothing; sealing, injection, and the secret store are Phases 1–2. The end-to-end sentinel/replay/exfil/cross-caller conformance tests are *designed* here (see Tests) and land alongside the code that actually forwards.
 - **Phase 1:** secret store + audit (`net secret set`, policy parser, `net security audit` surface) — useful independent of forwarding, no forwarding yet.
 - **Phase 2:** sealed context + caller injection + destination accept-lists + conformance tests, for native HTTP-facing capabilities.
 - **Phase 3:** remote/HTTP MCP wrapping rides on it. Stdio wrapping keeps pure credential locality forever — single-user child processes; forwarding doesn't apply and won't be bolted on.
