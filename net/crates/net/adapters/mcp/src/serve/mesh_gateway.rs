@@ -33,7 +33,7 @@ use serde_json::Value;
 use super::backend::{
     CapabilityDetail, CapabilityGateway, CapabilityId, CapabilitySummary, GatewayError,
 };
-use super::grouping::{group_capabilities, CapabilityGroup};
+use super::grouping::{group_capabilities, is_collapsible, CapabilityGroup};
 use crate::bridge::{
     BridgedToolInfo, DescribeRequest, DescribeResponse, BRIDGE_PROVIDER_TAG, DESCRIBE_SERVICE,
 };
@@ -114,6 +114,110 @@ impl MeshGateway {
             Err(e) => Err(map_describe_error(e, node)),
         }
     }
+
+    /// Describe `id`'s capability on one specific provider node.
+    async fn describe_on(
+        &self,
+        node: u64,
+        id: &CapabilityId,
+    ) -> Result<CapabilityDetail, GatewayError> {
+        let catalog = self
+            .fetch_catalog(
+                node,
+                &DescribeRequest {
+                    tool_id: Some(id.capability.clone()),
+                },
+            )
+            .await?;
+        let info = catalog
+            .tools
+            .into_iter()
+            .find(|t| t.tool_id == id.capability)
+            .ok_or_else(|| GatewayError::NotFound(id.display()))?;
+        Ok(detail_from(id, info))
+    }
+
+    /// Reachable providers that are interchangeable with `id`'s capability,
+    /// excluding `primary` — the failover candidates. Found by the capability
+    /// tag, described to confirm they are **collapsible** (the operator's
+    /// `provider_equivalent` interchangeability assertion), in sorted node order
+    /// so `describe` and `invoke` fail over to the same provider.
+    async fn equivalent_providers(
+        &self,
+        id: &CapabilityId,
+        primary: u64,
+    ) -> Vec<(u64, BridgedToolInfo)> {
+        let mut nodes: Vec<u64> = self
+            .mesh
+            .find_nodes(&CapabilityFilter::new().require_tag(&id.capability))
+            .into_iter()
+            .filter(|&n| n != primary)
+            .collect();
+        nodes.sort_unstable();
+        let mut out = Vec::new();
+        for node in nodes {
+            if let Ok(catalog) = self
+                .fetch_catalog(
+                    node,
+                    &DescribeRequest {
+                        tool_id: Some(id.capability.clone()),
+                    },
+                )
+                .await
+            {
+                if let Some(info) = catalog
+                    .tools
+                    .into_iter()
+                    .find(|t| t.tool_id == id.capability)
+                {
+                    if is_collapsible(&info) {
+                        out.push((node, info));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Invoke `capability` on one provider node, mapping the nRPC result:
+    /// success / a tool-level error / a malformed-request or upstream error are
+    /// all `Ok(CallToolResult)` (the provider answered); an owner-scope
+    /// rejection is `Err(Denied)`; an unreachable provider is `Err(Transport)`
+    /// — the only error the caller fails over on.
+    async fn invoke_on(
+        &self,
+        node: u64,
+        capability: &str,
+        body: Bytes,
+    ) -> Result<CallToolResult, GatewayError> {
+        match self.call_retry(node, capability, body).await {
+            // Success: the wrap handler encoded the CallToolResult as the body.
+            Ok(bytes) => serde_json::from_slice::<CallToolResult>(&bytes)
+                .map_err(|e| GatewayError::Other(format!("decode tool result: {e}"))),
+            // Owner-scope rejection at the provider — the confused-deputy defense.
+            Err(RpcError::ServerError { status, message }) if status == ERR_OWNER_SCOPE => {
+                Err(GatewayError::Denied(message))
+            }
+            // The tool ran and reported a tool-level error: the wrap handler put
+            // the full CallToolResult JSON in the message. Recover it so the
+            // model sees the structured error rather than a transport failure.
+            Err(RpcError::ServerError { status, message }) if status == ERR_TOOL => {
+                Ok(serde_json::from_str::<CallToolResult>(&message)
+                    .unwrap_or_else(|_| CallToolResult::text_error(message)))
+            }
+            // The bridge couldn't reach the tool, or the request was malformed
+            // (should not happen — we pre-validate). Surface in-band.
+            Err(RpcError::ServerError { status, message })
+                if status == ERR_UPSTREAM || status == ERR_BAD_REQUEST =>
+            {
+                Ok(CallToolResult::text_error(message))
+            }
+            Err(RpcError::ServerError { status, message }) => Ok(CallToolResult::text_error(
+                format!("provider error {status:#06x}: {message}"),
+            )),
+            Err(e) => Err(GatewayError::Transport(e.to_string())),
+        }
+    }
 }
 
 #[async_trait]
@@ -167,31 +271,27 @@ impl CapabilityGateway for MeshGateway {
     }
 
     async fn describe(&self, id: &CapabilityId) -> Result<CapabilityDetail, GatewayError> {
-        let node = parse_node(&id.provider)?;
-        let catalog = self
-            .fetch_catalog(
-                node,
-                &DescribeRequest {
-                    tool_id: Some(id.capability.clone()),
-                },
-            )
-            .await?;
-        let info = catalog
-            .tools
-            .into_iter()
-            .find(|t| t.tool_id == id.capability)
-            .ok_or_else(|| GatewayError::NotFound(id.display()))?;
-        Ok(CapabilityDetail {
-            id: id.clone(),
-            name: info.name,
-            description: info.description,
-            input_schema: info.input_schema,
-            output_schema: info.output_schema,
-            compat_tier: info.compat_tier,
-            credential_status: info.credential_status,
-            substitutability: info.substitutability,
-            version: info.version,
-        })
+        let primary = parse_node(&id.provider)?;
+        // Try the primary provider; if it's unreachable, describe an equivalent
+        // provider instead (same contract) — so a pinned/known capability keeps
+        // describing after its primary goes down.
+        match self.describe_on(primary, id).await {
+            Err(GatewayError::Transport(reason)) => {
+                match self
+                    .equivalent_providers(id, primary)
+                    .await
+                    .into_iter()
+                    .next()
+                {
+                    Some((_, info)) => Ok(detail_from(id, info)),
+                    None => Err(GatewayError::Transport(format!(
+                        "no reachable provider for `{}` ({reason})",
+                        id.display()
+                    ))),
+                }
+            }
+            other => other,
+        }
     }
 
     async fn invoke(
@@ -199,37 +299,28 @@ impl CapabilityGateway for MeshGateway {
         id: &CapabilityId,
         arguments: Value,
     ) -> Result<CallToolResult, GatewayError> {
-        let node = parse_node(&id.provider)?;
+        let primary = parse_node(&id.provider)?;
         let body = Bytes::from(
             serde_json::to_vec(&arguments)
                 .map_err(|e| GatewayError::Other(format!("encode arguments: {e}")))?,
         );
-        match self.call_retry(node, &id.capability, body).await {
-            // Success: the wrap handler encoded the CallToolResult as the body.
-            Ok(bytes) => serde_json::from_slice::<CallToolResult>(&bytes)
-                .map_err(|e| GatewayError::Other(format!("decode tool result: {e}"))),
-            // Owner-scope rejection at the provider — the confused-deputy defense.
-            Err(RpcError::ServerError { status, message }) if status == ERR_OWNER_SCOPE => {
-                Err(GatewayError::Denied(message))
+        match self.invoke_on(primary, &id.capability, body.clone()).await {
+            // Primary unreachable — fail over to an equivalent provider. Only a
+            // transport failure fails over: a `Denied` (authorization) or a
+            // tool-level error is a real answer another provider wouldn't change.
+            Err(GatewayError::Transport(primary_reason)) => {
+                for (node, _) in self.equivalent_providers(id, primary).await {
+                    match self.invoke_on(node, &id.capability, body.clone()).await {
+                        Err(GatewayError::Transport(_)) => continue, // this one is down too
+                        answer => return answer,
+                    }
+                }
+                Err(GatewayError::Transport(format!(
+                    "all providers for `{}` are unreachable (primary: {primary_reason})",
+                    id.display()
+                )))
             }
-            // The tool ran and reported a tool-level error: the wrap handler put
-            // the full CallToolResult JSON in the message. Recover it so the
-            // model sees the structured error rather than a transport failure.
-            Err(RpcError::ServerError { status, message }) if status == ERR_TOOL => {
-                Ok(serde_json::from_str::<CallToolResult>(&message)
-                    .unwrap_or_else(|_| CallToolResult::text_error(message)))
-            }
-            // The bridge couldn't reach the tool, or the request was malformed
-            // (should not happen — we pre-validate). Surface in-band.
-            Err(RpcError::ServerError { status, message })
-                if status == ERR_UPSTREAM || status == ERR_BAD_REQUEST =>
-            {
-                Ok(CallToolResult::text_error(message))
-            }
-            Err(RpcError::ServerError { status, message }) => Ok(CallToolResult::text_error(
-                format!("provider error {status:#06x}: {message}"),
-            )),
-            Err(e) => Err(GatewayError::Transport(e.to_string())),
+            answer => answer,
         }
     }
 }
@@ -266,6 +357,23 @@ fn matches_query(t: &BridgedToolInfo, q: &str) -> bool {
             .as_deref()
             .map(|d| d.to_lowercase().contains(q))
             .unwrap_or(false)
+}
+
+/// Build a `CapabilityDetail` from a provider's descriptor, keeping the
+/// caller's cap_id (the primary handle) even when a failover provider answered
+/// — the providers are interchangeable, so the schema/status are equivalent.
+fn detail_from(id: &CapabilityId, info: BridgedToolInfo) -> CapabilityDetail {
+    CapabilityDetail {
+        id: id.clone(),
+        name: info.name,
+        description: info.description,
+        input_schema: info.input_schema,
+        output_schema: info.output_schema,
+        compat_tier: info.compat_tier,
+        credential_status: info.credential_status,
+        substitutability: info.substitutability,
+        version: info.version,
+    }
 }
 
 /// Build a search summary for a grouped logical capability. The id is the
