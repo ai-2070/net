@@ -195,11 +195,35 @@ impl ForwardingStore {
         let path = path.into();
         match tokio::fs::read(&path).await {
             Ok(bytes) => {
+                let corrupt = |reason: String| StoreError::Corrupt {
+                    path: path.display().to_string(),
+                    reason,
+                };
                 let file: ForwardingFile =
-                    serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt {
-                        path: path.display().to_string(),
-                        reason: e.to_string(),
-                    })?;
+                    serde_json::from_slice(&bytes).map_err(|e| corrupt(e.to_string()))?;
+                // Fail closed on an unrecognized (e.g. newer) schema rather than
+                // misreading a future format as the current one.
+                if file.schema_version != SCHEMA_VERSION {
+                    return Err(corrupt(format!(
+                        "unsupported schema version {} (expected {SCHEMA_VERSION})",
+                        file.schema_version
+                    )));
+                }
+                // Revalidate every persisted policy with the *same* rules the
+                // write-time mutators enforce, so a config hand-edited into a
+                // forbidden state (a cookie secret without the acknowledgement,
+                // a secret bound to any provider, a hop-by-hop or credential
+                // plain header) is rejected on load instead of silently becoming
+                // active. Store safety checks can't be bypassed by editing the
+                // JSON directly.
+                for (ref_name, policy) in &file.forwarding.secrets {
+                    policy
+                        .validate(ref_name)
+                        .map_err(|e| corrupt(e.to_string()))?;
+                }
+                for (name, policy) in &file.forwarding.plain_headers {
+                    policy.validate(name).map_err(|e| corrupt(e.to_string()))?;
+                }
                 Ok(Self {
                     path,
                     config: file.forwarding,
@@ -687,6 +711,80 @@ mod tests {
         tokio::fs::write(&path, b"{ not valid json").await.unwrap();
         let err = ForwardingStore::load(&path).await.unwrap_err();
         assert!(matches!(err, StoreError::Corrupt { .. }));
+    }
+
+    /// Write `json` to a temp store file and attempt to load it.
+    async fn load_json(json: serde_json::Value) -> Result<(), StoreError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forwarding.json");
+        tokio::fs::write(&path, serde_json::to_vec(&json).unwrap())
+            .await
+            .unwrap();
+        // `dir` is dropped only after the load completes.
+        ForwardingStore::load(&path).await.map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn load_revalidates_persisted_policies() {
+        // A config hand-edited into a forbidden state must be rejected on load,
+        // not silently used — the store's safety checks can't be bypassed by
+        // editing the JSON directly.
+
+        // secret bound to any provider
+        let any = serde_json::json!({
+            "schema_version": 1,
+            "forwarding": { "enabled": true, "secrets": {
+                "t": { "header": "Authorization", "allow": { "providers": "any", "capabilities": ["*"] } }
+            }}
+        });
+        assert!(matches!(
+            load_json(any).await.unwrap_err(),
+            StoreError::Corrupt { .. }
+        ));
+
+        // cookie secret without the recorded acknowledgement
+        let cookie = serde_json::json!({
+            "schema_version": 1,
+            "forwarding": { "enabled": true, "secrets": {
+                "s": { "header": "Cookie", "allow": { "providers": ["n"], "capabilities": ["*"] } }
+            }}
+        });
+        assert!(matches!(
+            load_json(cookie).await.unwrap_err(),
+            StoreError::Corrupt { .. }
+        ));
+
+        // security-sensitive plain header
+        let plain = serde_json::json!({
+            "schema_version": 1,
+            "forwarding": { "enabled": true, "plain_headers": {
+                "Authorization": { "allow": { "providers": "any", "capabilities": ["*"] } }
+            }}
+        });
+        assert!(matches!(
+            load_json(plain).await.unwrap_err(),
+            StoreError::Corrupt { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn load_rejects_an_unknown_schema_version() {
+        let future = serde_json::json!({ "schema_version": 999, "forwarding": { "enabled": false } });
+        assert!(matches!(
+            load_json(future).await.unwrap_err(),
+            StoreError::Corrupt { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn load_accepts_a_valid_persisted_policy() {
+        let ok = serde_json::json!({
+            "schema_version": 1,
+            "forwarding": { "enabled": true, "secrets": {
+                "t": { "header": "Authorization", "allow": { "providers": ["n"], "capabilities": ["*"] } }
+            }}
+        });
+        assert!(load_json(ok).await.is_ok());
     }
 
     #[tokio::test]
