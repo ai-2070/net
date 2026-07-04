@@ -69,6 +69,7 @@
 //! unchanged — they take no MCP dependency.
 
 mod aead;
+mod assemble;
 mod context;
 mod header;
 #[cfg(feature = "keychain")]
@@ -89,6 +90,7 @@ pub use policy::{
     ProviderScope, SecretPolicy, SendGrant,
 };
 pub use aead::{X25519SealedBoxOpener, X25519SealedBoxSealer};
+pub use assemble::{AssembleError, ForwardedContextBuilder};
 pub use seal::{
     ForwardedContextOpener, ForwardedContextSealer, OpenError, SealError, SealedContext,
 };
