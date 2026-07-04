@@ -1,0 +1,21 @@
+net/crates/net/adapters/mcp/src/forward/aead.rs
+  s_cdbc9688784d9a::t_a1fb581ea0528a 90-102
+  s_cdbc9688784d9a::t_c6135d42cb4013 422-433
+  s_cdbc9688784d9a::t_c9066d3749ab8d 421
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9c417e2eb4da29136bb0940726ba6fd62b6bae24",
+  "prompts": {},
+  "sessions": {
+    "s_cdbc9688784d9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9dbd24f-9e9a-4ea5-badd-11a26dc79e3a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
