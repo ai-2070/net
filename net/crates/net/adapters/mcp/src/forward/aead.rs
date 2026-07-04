@@ -306,7 +306,8 @@ fn derive_nonce(eph_pk: &[u8; 32], recipient_pk: &[u8; 32]) -> [u8; 24] {
 }
 
 /// Best-effort scrub with `write_volatile` so the compiler can't elide it.
-fn volatile_zero(buf: &mut [u8]) {
+/// Shared with [`super::keys`], which scrubs its derived forwarding secret.
+pub(crate) fn volatile_zero(buf: &mut [u8]) {
     for byte in buf.iter_mut() {
         // SAFETY: `byte` is a valid, aligned, mutable reference for the
         // duration of this call — all `write_volatile` requires.

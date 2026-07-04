@@ -21,7 +21,7 @@
 
 use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Secret};
 
-use super::aead::{derive_key, X25519SealedBoxOpener};
+use super::aead::{derive_key, volatile_zero, X25519SealedBoxOpener};
 
 /// Domain separator for the forwarding X25519 secret derivation. Versioned so a
 /// future rotation of the derivation is unambiguous.
@@ -43,9 +43,13 @@ impl ForwardingKeypair {
     /// always yields the same forwarding keypair, so a node's published public
     /// key is stable across restarts.
     pub fn from_ed25519_seed(seed: &[u8; 32]) -> Self {
-        let secret_bytes = derive_key(seed, FORWARD_X25519_DOMAIN);
+        let mut secret_bytes = derive_key(seed, FORWARD_X25519_DOMAIN);
         let secret = X25519Secret::from(secret_bytes);
         let public = X25519Pub::from(&secret).to_bytes();
+        // `X25519Secret::from` copied the bytes into a zeroize-on-drop wrapper;
+        // scrub the source array too so the derived secret doesn't linger on the
+        // stack (matching the aead module's ephemeral-key / derived-key hygiene).
+        volatile_zero(&mut secret_bytes);
         Self { secret, public }
     }
 
@@ -94,13 +98,19 @@ mod tests {
     }
 
     #[test]
-    fn forwarding_key_is_not_the_raw_seed() {
-        // Domain separation: the derived secret is a KDF of the seed, not the
-        // seed (nor a naive copy) — the forwarding key is distinct from the
-        // identity key material it comes from.
+    fn forwarding_key_is_domain_separated_from_the_raw_seed() {
+        // Domain separation must actually kick in: the derived forwarding
+        // public key must differ from the one you'd get by using the ed25519
+        // seed *directly* as the X25519 secret (the naive, non-separated
+        // derivation). Comparing public keys — not seed bytes — makes the test
+        // enforce the real invariant instead of passing on any non-identity map.
         let seed = [42u8; 32];
-        let kp = ForwardingKeypair::from_ed25519_seed(&seed);
-        assert_ne!(kp.public_key(), seed, "derived key must not echo the seed");
+        let derived = ForwardingKeypair::from_ed25519_seed(&seed).public_key();
+        let naive = X25519Pub::from(&X25519Secret::from(seed)).to_bytes();
+        assert_ne!(
+            derived, naive,
+            "forwarding key must be domain-separated, not seed-as-X25519-secret",
+        );
     }
 
     #[test]
