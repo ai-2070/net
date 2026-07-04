@@ -24,6 +24,7 @@ pub mod ice;
 pub mod identity;
 pub mod logs;
 pub mod man;
+pub mod mcp;
 pub mod netdb;
 pub mod peer;
 pub mod port;
