@@ -36,6 +36,11 @@
 //!   store and its redaction-safe [`ForwardingAudit`]. It records destination
 //!   bindings, never secret values; the value backend (keychain / encrypted
 //!   store) and the CLI verbs (`net secret`, `net security audit`) build on it.
+//! - [`SecretBackend`] / [`resolve_secret_send`] (**Phase 1**, value side) — the
+//!   value-storage seam and the resolver that applies policy *before* touching
+//!   the backend and materializes a value only as a [`ForwardedHeaderValue`].
+//!   [`InMemorySecretBackend`] is the ephemeral default; persistent backends
+//!   plug in behind the trait.
 //!
 //! # Threat model (honest section)
 //!
@@ -58,6 +63,7 @@
 mod context;
 mod header;
 mod policy;
+mod secret;
 mod store;
 mod target;
 
@@ -69,6 +75,9 @@ pub use header::{
 pub use policy::{
     AcceptError, AcceptPolicy, AllowList, DenialLevel, ForwardingConfig, PlainHeaderPolicy,
     ProviderScope, SecretPolicy, SendGrant,
+};
+pub use secret::{
+    resolve_secret_send, InMemorySecretBackend, ResolveError, SecretBackend, SecretBackendError,
 };
 pub use store::{ForwardingAudit, ForwardingStore, Grant, GrantKind, StoreError};
 pub use target::{
