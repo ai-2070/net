@@ -24,20 +24,54 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Args, Subcommand};
-use net_mcp::serve::{CapabilityId, ConsentPolicy, MeshGateway, Shim, MSG_NO_DAEMON};
+use net_mcp::serve::{
+    CapabilityId, ConsentPolicy, MeshGateway, PinState, PinStore, Shim, MSG_NO_DAEMON,
+};
 use net_sdk::identity::Identity;
 use net_sdk::{Mesh, MeshBuilder};
+use serde::Serialize;
 use tokio::io::BufReader;
 
 use crate::commands::aggregator::RemoteAttachArgs;
 use crate::context::{require_remote_attach, resolve_profile, RemoteAttach};
 use crate::error::{connection_failure, generic, invalid_args, CliError};
-use crate::output::OutputFormat;
+use crate::prelude::{emit_value, OutputFormat};
 
 #[derive(Subcommand, Debug)]
 pub enum McpCommand {
     /// Run a stdio MCP server exposing the mesh's capabilities as meta-tools.
     Serve(ServeArgs),
+    /// Approve / reject / list capability pins (local client consent).
+    #[command(subcommand)]
+    Pin(PinCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PinCommand {
+    /// Approve a pin so the shim may invoke the capability (out-of-band
+    /// consent — this is the step the model cannot perform for itself).
+    Approve(PinIdArgs),
+    /// Reject / remove a pin.
+    Reject(PinIdArgs),
+    /// List pins and their state (pending / approved).
+    List(PinListArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct PinIdArgs {
+    /// The capability id, as `provider/capability` (from a search result).
+    pub cap_id: String,
+
+    /// Pin-store file. Defaults to the per-user store `net mcp serve` reads.
+    #[arg(long = "pin-store", value_name = "PATH")]
+    pub pin_store: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct PinListArgs {
+    /// Pin-store file. Defaults to the per-user store `net mcp serve` reads.
+    #[arg(long = "pin-store", value_name = "PATH")]
+    pub pin_store: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -54,6 +88,11 @@ pub struct ServeArgs {
     #[arg(long = "allow-capability", value_name = "PROVIDER/CAP")]
     pub allow_capability: Vec<String>,
 
+    /// Pin-store file. Defaults to the per-user store the `net mcp pin` verbs
+    /// write; an approved pin there admits its capability.
+    #[arg(long = "pin-store", value_name = "PATH")]
+    pub pin_store: Option<PathBuf>,
+
     /// The mesh peer to join.
     #[command(flatten)]
     pub remote: RemoteAttachArgs,
@@ -61,15 +100,16 @@ pub struct ServeArgs {
 
 pub async fn run(
     cmd: McpCommand,
-    _output: Option<OutputFormat>,
+    output: Option<OutputFormat>,
     config_path: Option<&Path>,
     profile_name: &str,
 ) -> Result<(), CliError> {
     match cmd {
-        // `_output` is intentionally unused — stdout is the MCP JSON-RPC
-        // transport (see the module docs); emitting through the output pipeline
-        // would corrupt it.
+        // `serve` ignores `output` — stdout is the MCP JSON-RPC transport (see
+        // the module docs); emitting through the output pipeline would corrupt
+        // it. The `pin` verbs are ordinary one-shot commands and do use it.
         McpCommand::Serve(args) => run_serve(args, config_path, profile_name).await,
+        McpCommand::Pin(cmd) => run_pin(cmd, output).await,
     }
 }
 
@@ -112,7 +152,9 @@ async fn run_serve(
     }
 
     let gateway = MeshGateway::new(Arc::clone(&mesh));
-    let shim = Shim::new(gateway).with_consent(consent);
+    let shim = Shim::new(gateway)
+        .with_consent(consent)
+        .with_pin_store(resolve_pin_store(args.pin_store.as_deref())?);
 
     // Serve until the host closes stdin (EOF) or the operator hits Ctrl-C.
     let reader = BufReader::new(tokio::io::stdin());
@@ -130,6 +172,104 @@ async fn run_serve(
     if let Ok(mesh) = Arc::try_unwrap(mesh) {
         mesh.shutdown().await.ok();
     }
+    Ok(())
+}
+
+/// Resolve the pin-store path: the explicit `--pin-store`, else the per-user
+/// default (`<local data>/net-mesh/mcp-pins.json`). The shim and the pin verbs
+/// resolve the same default so they read and write one shared file.
+fn resolve_pin_store(override_: Option<&Path>) -> Result<PathBuf, CliError> {
+    if let Some(p) = override_ {
+        return Ok(p.to_path_buf());
+    }
+    dirs::data_local_dir()
+        .or_else(dirs::home_dir)
+        .map(|d| d.join("net-mesh").join("mcp-pins.json"))
+        .ok_or_else(|| {
+            generic(
+                "could not determine a per-user data directory for the pin store; \
+                 pass --pin-store <PATH>",
+            )
+        })
+}
+
+/// One `pin approve` / `pin reject` result row.
+#[derive(Serialize)]
+struct PinMutation {
+    cap_id: String,
+    action: &'static str,
+    /// Whether this changed the stored state (an already-approved approve, or a
+    /// reject of an absent pin, reports `false`).
+    changed: bool,
+    store: String,
+}
+
+/// One `pin list` row.
+#[derive(Serialize)]
+struct PinRow {
+    cap_id: String,
+    state: &'static str,
+}
+
+async fn run_pin(cmd: PinCommand, output: Option<OutputFormat>) -> Result<(), CliError> {
+    match cmd {
+        PinCommand::Approve(args) => pin_mutate(args, output, "approved").await,
+        PinCommand::Reject(args) => pin_mutate(args, output, "rejected").await,
+        PinCommand::List(args) => pin_list(args, output).await,
+    }
+}
+
+/// Approve or reject a pin. Approval is the out-of-band consent step the model
+/// cannot perform — it moves a pending request to approved (or pre-approves a
+/// capability that has no request yet).
+async fn pin_mutate(
+    args: PinIdArgs,
+    output: Option<OutputFormat>,
+    action: &'static str,
+) -> Result<(), CliError> {
+    let id = CapabilityId::parse(&args.cap_id)
+        .map_err(|e| invalid_args(format!("cap id {:?}: {e}", args.cap_id)))?;
+    let path = resolve_pin_store(args.pin_store.as_deref())?;
+    let mut store = PinStore::load(&path)
+        .await
+        .map_err(|e| generic(format!("load pin store: {e}")))?;
+    let changed = match action {
+        "approved" => store.approve(&id),
+        _ => store.remove(&id),
+    };
+    store
+        .save()
+        .await
+        .map_err(|e| generic(format!("save pin store: {e}")))?;
+    let row = PinMutation {
+        cap_id: id.display(),
+        action,
+        changed,
+        store: path.display().to_string(),
+    };
+    emit_value(OutputFormat::resolve_oneshot(output), &row)
+        .map_err(|e| generic(format!("write output: {e}")))?;
+    Ok(())
+}
+
+async fn pin_list(args: PinListArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
+    let path = resolve_pin_store(args.pin_store.as_deref())?;
+    let store = PinStore::load(&path)
+        .await
+        .map_err(|e| generic(format!("load pin store: {e}")))?;
+    let rows: Vec<PinRow> = store
+        .list()
+        .into_iter()
+        .map(|(id, state)| PinRow {
+            cap_id: id.display(),
+            state: match state {
+                PinState::Approved => "approved",
+                PinState::Pending => "pending",
+            },
+        })
+        .collect();
+    emit_value(OutputFormat::resolve_oneshot(output), &rows)
+        .map_err(|e| generic(format!("write output: {e}")))?;
     Ok(())
 }
 
