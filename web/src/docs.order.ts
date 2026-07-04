@@ -47,6 +47,15 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "artifacts",
       "errors",
     ],
+    "sdk/python": [
+      "quickstart",
+      "announce",
+      "discover",
+      "invoke",
+      "watch",
+      "artifacts",
+      "errors",
+    ],
     worldview: [
       "agentic-mesh",
       "submitted-is-not-completed",
@@ -206,6 +215,14 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "sdk/typescript/watch": "Watch",
     "sdk/typescript/artifacts": "Artifacts",
     "sdk/typescript/errors": "Errors",
+    "sdk/python": "Python",
+    "sdk/python/quickstart": "Quickstart",
+    "sdk/python/announce": "Announce",
+    "sdk/python/discover": "Discover",
+    "sdk/python/invoke": "Invoke",
+    "sdk/python/watch": "Watch",
+    "sdk/python/artifacts": "Artifacts",
+    "sdk/python/errors": "Errors",
 
     // Tutorials
     "tutorials/fleet-telemetry": "Fleet Telemetry",
@@ -251,8 +268,9 @@ export const DOCS_ORDER: DocsOrderConfig = {
   },
   languages: {
     // Each SDK spine is visible under its language pill. Rust is the default.
-    // Phase 3b adds sdk/python → ["python"], sdk/go → ["go"], sdk/c → ["c"].
+    // Phase 3b adds sdk/go → ["go"], sdk/c → ["c"].
     "sdk/rust": ["rust"],
     "sdk/typescript": ["ts"],
+    "sdk/python": ["python"],
   },
 };
