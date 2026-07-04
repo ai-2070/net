@@ -1,0 +1,19 @@
+net/crates/net/adapters/mcp/src/forward/keychain.rs
+  s_cdbc9688784d9a::t_15512b201e178a 65,68,70-76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "37ead679c83c35f18ae8b1866b23a6ee386e69fd",
+  "prompts": {},
+  "sessions": {
+    "s_cdbc9688784d9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9dbd24f-9e9a-4ea5-badd-11a26dc79e3a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
