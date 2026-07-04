@@ -299,7 +299,10 @@ mod tests {
 
     fn sample_context(dest: &str, issued_at: u64) -> ForwardedContext {
         let mut headers = BTreeMap::new();
-        headers.insert(HeaderName::parse("Authorization").unwrap(), hv("Bearer t0ken"));
+        headers.insert(
+            HeaderName::parse("Authorization").unwrap(),
+            hv("Bearer t0ken"),
+        );
         headers.insert(HeaderName::parse("X-Tenant-Id").unwrap(), hv("acme"));
         ForwardedContext::new(
             dest,

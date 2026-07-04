@@ -81,26 +81,26 @@ mod secret;
 mod store;
 mod target;
 
+pub use aead::{X25519SealedBoxOpener, X25519SealedBoxSealer};
+pub use assemble::{AssembleError, ForwardedContextBuilder};
 pub use context::{ContextError, ForwardedContext};
 pub use header::{
     ForwardedHeaderValue, HeaderError, HeaderName, MAX_FORWARDED_HEADERS, MAX_HEADER_VALUE_LEN,
     MAX_TOTAL_FORWARDED_BYTES,
 };
+#[cfg(feature = "keychain")]
+pub use keychain::{KeychainSecretBackend, DEFAULT_KEYCHAIN_SERVICE};
+pub use keys::ForwardingKeypair;
 pub use policy::{
     AcceptError, AcceptPolicy, AllowList, DenialLevel, ForwardingConfig, PlainHeaderPolicy,
     PolicyError, ProviderScope, SecretPolicy, SendGrant,
 };
-pub use aead::{X25519SealedBoxOpener, X25519SealedBoxSealer};
-pub use assemble::{AssembleError, ForwardedContextBuilder};
-pub use keys::ForwardingKeypair;
 pub use seal::{
     ForwardedContextOpener, ForwardedContextSealer, OpenError, SealError, SealedContext,
 };
 pub use secret::{
     resolve_secret_send, InMemorySecretBackend, ResolveError, SecretBackend, SecretBackendError,
 };
-#[cfg(feature = "keychain")]
-pub use keychain::{KeychainSecretBackend, DEFAULT_KEYCHAIN_SERVICE};
 pub use store::{ForwardingAudit, ForwardingStore, Grant, GrantKind, StoreError};
 pub use target::{
     forwarding_supported, resolve_injection, risk_tags_for_accept_policy, ForwardingUnsupported,

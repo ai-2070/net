@@ -618,7 +618,9 @@ mod tests {
                 "X-Trace-Id": { "allow": { "providers": "any", "capabilities": ["*"] } }
             }
         }));
-        let grant = cfg.decide_plain("x-trace-id", "any-node", "any.cap").unwrap();
+        let grant = cfg
+            .decide_plain("x-trace-id", "any-node", "any.cap")
+            .unwrap();
         assert_eq!(grant.header.as_str(), "x-trace-id");
         assert_eq!(grant.granted_by, "X-Trace-Id");
     }
@@ -713,7 +715,10 @@ mod tests {
                           "allow": { "providers": ["n"], "capabilities": ["*"] } }
             }
         }));
-        assert_eq!(denied.decide_secret("sess", "n", "x"), Err(DenialLevel::PerHeader));
+        assert_eq!(
+            denied.decide_secret("sess", "n", "x"),
+            Err(DenialLevel::PerHeader)
+        );
 
         // With the acknowledgement recorded, it is allowed.
         let allowed = cfg_json(serde_json::json!({
@@ -756,7 +761,10 @@ mod tests {
             "header": "Connection", "allow": { "providers": ["n"] }
         }))
         .unwrap();
-        assert!(matches!(hop.validate("t"), Err(PolicyError::HopByHop { .. })));
+        assert!(matches!(
+            hop.validate("t"),
+            Err(PolicyError::HopByHop { .. })
+        ));
     }
 
     #[test]
@@ -812,7 +820,10 @@ mod tests {
         assert!(p.implies_credential_tag(), "Authorization ⇒ credential tag");
 
         let plain = AcceptPolicy::from_flag("X-Tenant-Id", false).unwrap();
-        assert!(!plain.implies_credential_tag(), "no sensitive header ⇒ no tag");
+        assert!(
+            !plain.implies_credential_tag(),
+            "no sensitive header ⇒ no tag"
+        );
     }
 
     #[test]

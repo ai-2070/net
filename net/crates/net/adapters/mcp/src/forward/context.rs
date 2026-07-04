@@ -351,7 +351,10 @@ mod tests {
     /// with stable field values so the AAD encoding is pinned byte-for-byte.
     fn golden_context() -> ForwardedContext {
         let mut headers = BTreeMap::new();
-        headers.insert(HeaderName::parse("Authorization").unwrap(), hv("Bearer t0ken"));
+        headers.insert(
+            HeaderName::parse("Authorization").unwrap(),
+            hv("Bearer t0ken"),
+        );
         headers.insert(HeaderName::parse("X-Tenant-Id").unwrap(), hv("acme"));
         ForwardedContext::new(
             "node-dest-01",
@@ -385,7 +388,10 @@ mod tests {
     #[test]
     #[ignore = "emitter for the golden AAD vector"]
     fn emit_golden_aad() {
-        println!("GOLDEN_AAD_HEX = {}", to_hex(&golden_context().canonical_aad()));
+        println!(
+            "GOLDEN_AAD_HEX = {}",
+            to_hex(&golden_context().canonical_aad())
+        );
     }
 
     #[test]
@@ -408,7 +414,10 @@ mod tests {
         // Different destination → different AAD (replay-across-destination
         // defense is rooted here).
         let mut headers = BTreeMap::new();
-        headers.insert(HeaderName::parse("Authorization").unwrap(), hv("Bearer t0ken"));
+        headers.insert(
+            HeaderName::parse("Authorization").unwrap(),
+            hv("Bearer t0ken"),
+        );
         headers.insert(HeaderName::parse("X-Tenant-Id").unwrap(), hv("acme"));
         let other = ForwardedContext::new(
             "node-dest-99",
@@ -429,19 +438,11 @@ mod tests {
         headers.insert(HeaderName::parse("X-Trace-Id").unwrap(), hv("abc"));
         let ctx = ForwardedContext::new(
             "", // empty destination
-            "caller",
-            "cap",
-            "inv",
-            1,
-            2,
-            [0u8; 16],
-            headers,
+            "caller", "cap", "inv", 1, 2, [0u8; 16], headers,
         );
         assert_eq!(
             ctx.validate().unwrap_err(),
-            ContextError::MissingField {
-                field: "sealed_to"
-            },
+            ContextError::MissingField { field: "sealed_to" },
         );
     }
 
@@ -449,9 +450,7 @@ mod tests {
     fn validate_rejects_hop_by_hop_header() {
         let mut headers = BTreeMap::new();
         headers.insert(HeaderName::parse("Connection").unwrap(), hv("keep-alive"));
-        let ctx = ForwardedContext::new(
-            "dest", "caller", "cap", "inv", 1, 2, [0u8; 16], headers,
-        );
+        let ctx = ForwardedContext::new("dest", "caller", "cap", "inv", 1, 2, [0u8; 16], headers);
         assert!(matches!(
             ctx.validate().unwrap_err(),
             ContextError::HopByHopHeader { .. },
@@ -465,10 +464,7 @@ mod tests {
         let mut ctx = ctx;
         ctx.declared_names
             .insert(HeaderName::parse("X-Extra").unwrap());
-        assert_eq!(
-            ctx.validate().unwrap_err(),
-            ContextError::DeclaredMismatch,
-        );
+        assert_eq!(ctx.validate().unwrap_err(), ContextError::DeclaredMismatch,);
     }
 
     #[test]
@@ -476,9 +472,8 @@ mod tests {
         let mut headers = BTreeMap::new();
         headers.insert(HeaderName::parse("X-Trace-Id").unwrap(), hv("abc"));
         // expires_at not after issued_at.
-        let ctx = ForwardedContext::new(
-            "dest", "caller", "cap", "inv", 100, 100, [0u8; 16], headers,
-        );
+        let ctx =
+            ForwardedContext::new("dest", "caller", "cap", "inv", 100, 100, [0u8; 16], headers);
         assert!(matches!(
             ctx.validate().unwrap_err(),
             ContextError::InvalidTtl { .. },

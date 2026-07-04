@@ -141,20 +141,21 @@ impl fmt::Display for HeaderName {
 
 /// True if `b` is an RFC 7230 `token` character.
 fn is_token_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, |b'!'| b'#'
-        | b'$'
-        | b'%'
-        | b'&'
-        | b'\''
-        | b'*'
-        | b'+'
-        | b'-'
-        | b'.'
-        | b'^'
-        | b'_'
-        | b'`'
-        | b'|'
-        | b'~')
+    b.is_ascii_alphanumeric()
+        || matches!(b, |b'!'| b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~')
 }
 
 /// A forwarded header **value**, wrapped so it is hard to leak.
@@ -219,7 +220,11 @@ impl ForwardedHeaderValue {
 /// Redacted — never prints the value, only that it is one and its length.
 impl fmt::Debug for ForwardedHeaderValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ForwardedHeaderValue(<redacted; {} bytes>)", self.0.len())
+        write!(
+            f,
+            "ForwardedHeaderValue(<redacted; {} bytes>)",
+            self.0.len()
+        )
     }
 }
 
@@ -288,7 +293,10 @@ mod tests {
 
     #[test]
     fn empty_and_malformed_names_are_rejected() {
-        assert_eq!(HeaderName::parse("   ").unwrap_err(), HeaderError::EmptyName);
+        assert_eq!(
+            HeaderName::parse("   ").unwrap_err(),
+            HeaderError::EmptyName
+        );
         // A colon, space, or newline are not token characters.
         for bad in ["a b", "x:y", "with\nnewline", "café"] {
             assert!(
@@ -304,7 +312,12 @@ mod tests {
         assert!(auth.is_security_sensitive());
         assert!(auth.is_forwardable(), "sensitive but end-to-end");
 
-        for hop in ["Connection", "Transfer-Encoding", "Proxy-Authorization", "keep-alive"] {
+        for hop in [
+            "Connection",
+            "Transfer-Encoding",
+            "Proxy-Authorization",
+            "keep-alive",
+        ] {
             let h = HeaderName::parse(hop).unwrap();
             assert!(h.is_hop_by_hop(), "{hop:?} is hop-by-hop");
             assert!(!h.is_forwardable(), "{hop:?} must never forward");
@@ -338,7 +351,10 @@ mod tests {
         let v = ForwardedHeaderValue::new(b"ghp_SUPERSECRET".to_vec()).unwrap();
         let dbg = format!("{v:?}");
         let disp = format!("{v}");
-        assert!(!dbg.contains("SUPERSECRET"), "Debug leaked the value: {dbg}");
+        assert!(
+            !dbg.contains("SUPERSECRET"),
+            "Debug leaked the value: {dbg}"
+        );
         assert!(!disp.contains("SUPERSECRET"), "Display leaked the value");
         assert!(dbg.contains("redacted"));
         assert_eq!(disp, "<redacted>");
@@ -352,7 +368,11 @@ mod tests {
         let mut v = Vec::with_capacity(16);
         v.extend_from_slice(b"secret");
         zeroize_vec(&mut v);
-        assert_eq!(v.len(), 16, "grown to capacity so spare bytes are scrubbed too");
+        assert_eq!(
+            v.len(),
+            16,
+            "grown to capacity so spare bytes are scrubbed too"
+        );
         assert!(v.iter().all(|&b| b == 0), "every byte is zero");
     }
 }

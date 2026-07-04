@@ -93,7 +93,9 @@ pub enum StoreError {
         name: String,
     },
     /// A secret was bound to *any* provider — secrets must name specific ones.
-    #[error("secret ref {ref_name:?} allows any provider; secrets must be bound to specific providers")]
+    #[error(
+        "secret ref {ref_name:?} allows any provider; secrets must be bound to specific providers"
+    )]
     SecretProviderAny {
         /// The offending ref name.
         ref_name: String,
@@ -272,10 +274,7 @@ impl ForwardingStore {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut f = opts
-            .open(&tmp)
-            .await
-            .map_err(|e| StoreError::io(&tmp, e))?;
+        let mut f = opts.open(&tmp).await.map_err(|e| StoreError::io(&tmp, e))?;
         f.write_all(&bytes)
             .await
             .map_err(|e| StoreError::io(&tmp, e))?;
@@ -653,7 +652,14 @@ mod tests {
     async fn invalid_ref_names_are_rejected() {
         let (_dir, path) = store_path();
         let mut store = ForwardingStore::load(&path).await.unwrap();
-        for bad in ["", "Github-Token", "has space", "-leading", "ghpUPPER", &"x".repeat(65)] {
+        for bad in [
+            "",
+            "Github-Token",
+            "has space",
+            "-leading",
+            "ghpUPPER",
+            &"x".repeat(65),
+        ] {
             assert!(
                 matches!(
                     store.set_secret(bad, "Authorization", AllowList::default(), None, false),
@@ -664,7 +670,13 @@ mod tests {
         }
         // A clean slug is fine.
         assert!(store
-            .set_secret("prod-github.token_1", "Authorization", AllowList::default(), None, false)
+            .set_secret(
+                "prod-github.token_1",
+                "Authorization",
+                AllowList::default(),
+                None,
+                false
+            )
             .is_ok());
     }
 
@@ -769,7 +781,8 @@ mod tests {
 
     #[tokio::test]
     async fn load_rejects_an_unknown_schema_version() {
-        let future = serde_json::json!({ "schema_version": 999, "forwarding": { "enabled": false } });
+        let future =
+            serde_json::json!({ "schema_version": 999, "forwarding": { "enabled": false } });
         assert!(matches!(
             load_json(future).await.unwrap_err(),
             StoreError::Corrupt { .. }

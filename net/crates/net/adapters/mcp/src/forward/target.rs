@@ -102,7 +102,10 @@ mod tests {
     fn stdio_never_forwards() {
         assert!(!WrapTransport::Stdio.supports_forwarding());
         assert!(!forwarding_supported(WrapTransport::Stdio));
-        for target in [InjectionTarget::HttpHeader, InjectionTarget::ArgumentTemplate] {
+        for target in [
+            InjectionTarget::HttpHeader,
+            InjectionTarget::ArgumentTemplate,
+        ] {
             assert_eq!(
                 resolve_injection(WrapTransport::Stdio, target).unwrap_err(),
                 ForwardingUnsupported::StdioNeverForwards,
@@ -118,7 +121,8 @@ mod tests {
             InjectionTarget::HttpHeader,
         );
         assert_eq!(
-            resolve_injection(WrapTransport::RemoteHttp, InjectionTarget::ArgumentTemplate).unwrap(),
+            resolve_injection(WrapTransport::RemoteHttp, InjectionTarget::ArgumentTemplate)
+                .unwrap(),
             InjectionTarget::ArgumentTemplate,
         );
     }

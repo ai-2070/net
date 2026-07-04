@@ -66,11 +66,13 @@ impl KeychainSecretBackend {
     /// Delete the value for `ref_name`. Returns whether one existed.
     pub async fn delete(&self, ref_name: &str) -> Result<bool, SecretBackendError> {
         let (service, ref_name) = (self.service.clone(), ref_name.to_string());
-        run_blocking(move || match entry(&service, &ref_name)?.delete_credential() {
-            Ok(()) => Ok(true),
-            Err(keyring::Error::NoEntry) => Ok(false),
-            Err(e) => Err(map_err(e)),
-        })
+        run_blocking(
+            move || match entry(&service, &ref_name)?.delete_credential() {
+                Ok(()) => Ok(true),
+                Err(keyring::Error::NoEntry) => Ok(false),
+                Err(e) => Err(map_err(e)),
+            },
+        )
         .await
     }
 }

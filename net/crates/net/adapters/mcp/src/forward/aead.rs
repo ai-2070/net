@@ -142,7 +142,8 @@ impl X25519SealedBoxOpener {
 /// Redacted — never prints the private key.
 impl fmt::Debug for X25519SealedBoxOpener {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("X25519SealedBoxOpener").finish_non_exhaustive()
+        f.debug_struct("X25519SealedBoxOpener")
+            .finish_non_exhaustive()
     }
 }
 
@@ -173,7 +174,9 @@ impl ForwardedContextOpener for X25519SealedBoxOpener {
             return Err(OpenError::BindingFailed);
         }
         let (eph_pk_bytes, ct) = sealed.ciphertext.split_at(EPH_PK_LEN);
-        let eph_arr: [u8; 32] = eph_pk_bytes.try_into().map_err(|_| OpenError::BindingFailed)?;
+        let eph_arr: [u8; 32] = eph_pk_bytes
+            .try_into()
+            .map_err(|_| OpenError::BindingFailed)?;
         let eph_pk = X25519Pub::from(eph_arr);
         let recipient_pub = X25519Pub::from(&self.secret).to_bytes();
 
@@ -334,7 +337,10 @@ mod tests {
 
     fn sample(dest: &str, issued_at: u64) -> ForwardedContext {
         let mut headers = BTreeMap::new();
-        headers.insert(HeaderName::parse("Authorization").unwrap(), hv("Bearer s3cret"));
+        headers.insert(
+            HeaderName::parse("Authorization").unwrap(),
+            hv("Bearer s3cret"),
+        );
         headers.insert(HeaderName::parse("X-Tenant-Id").unwrap(), hv("acme"));
         ForwardedContext::new(
             dest,
@@ -356,7 +362,10 @@ mod tests {
     async fn round_trips_and_hides_values_in_ciphertext() {
         let (pk, sk) = keypair();
         let ctx = sample("node-dest", 1_000);
-        let sealed = X25519SealedBoxSealer::to_recipient(pk).seal(&ctx).await.unwrap();
+        let sealed = X25519SealedBoxSealer::to_recipient(pk)
+            .seal(&ctx)
+            .await
+            .unwrap();
 
         // The real cipher: no cleartext value in the sealed bytes.
         assert!(!contains(&sealed.ciphertext, b"Bearer"));

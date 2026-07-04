@@ -103,7 +103,8 @@ impl InMemorySecretBackend {
     /// call it with a model-supplied value.
     pub fn set(&mut self, ref_name: impl Into<String>, value: impl Into<Vec<u8>>) {
         // Any prior value at this key is dropped here → scrubbed by StoredSecret.
-        self.values.insert(ref_name.into(), StoredSecret(value.into()));
+        self.values
+            .insert(ref_name.into(), StoredSecret(value.into()));
     }
 
     /// Remove a value. Returns whether one was present.
@@ -230,15 +231,22 @@ mod tests {
     fn in_memory_backend_debug_is_redacted() {
         let b = InMemorySecretBackend::new().with("github-token", b"ghp_SECRET".to_vec());
         let dbg = format!("{b:?}");
-        assert!(!dbg.contains("SECRET"), "backend Debug leaked a value: {dbg}");
-        assert!(!dbg.contains("github-token"), "backend Debug leaked a ref name");
+        assert!(
+            !dbg.contains("SECRET"),
+            "backend Debug leaked a value: {dbg}"
+        );
+        assert!(
+            !dbg.contains("github-token"),
+            "backend Debug leaked a ref name"
+        );
         assert!(dbg.contains("1 refs"));
     }
 
     #[tokio::test]
     async fn resolve_success_returns_header_and_value() {
         let config = enabled_config();
-        let backend = InMemorySecretBackend::new().with("github-token", b"Bearer ghp_secret".to_vec());
+        let backend =
+            InMemorySecretBackend::new().with("github-token", b"Bearer ghp_secret".to_vec());
         let (header, value) =
             resolve_secret_send(&config, &backend, "github-token", "node-1", "github.issues")
                 .await
@@ -268,7 +276,10 @@ mod tests {
         let err = resolve_secret_send(&config, &Exploding, "github-token", "node-evil", "github.x")
             .await
             .unwrap_err();
-        assert!(matches!(err, ResolveError::Denied(DenialLevel::PerIdentity)));
+        assert!(matches!(
+            err,
+            ResolveError::Denied(DenialLevel::PerIdentity)
+        ));
     }
 
     #[tokio::test]

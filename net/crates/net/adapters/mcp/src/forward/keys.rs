@@ -78,8 +78,8 @@ impl std::fmt::Debug for ForwardingKeypair {
 mod tests {
     use super::*;
     use crate::forward::{
-        ForwardedContextBuilder, ForwardedContextOpener, ForwardedContextSealer, ForwardedHeaderValue,
-        HeaderName, X25519SealedBoxSealer,
+        ForwardedContextBuilder, ForwardedContextOpener, ForwardedContextSealer,
+        ForwardedHeaderValue, HeaderName, X25519SealedBoxSealer,
     };
 
     #[test]

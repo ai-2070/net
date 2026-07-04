@@ -258,7 +258,13 @@ async fn allow(args: AllowArgs, output: Option<OutputFormat>) -> Result<(), CliE
     let path = resolve_store(args.store.store.as_deref())?;
     let ref_name = args.ref_name.clone();
     ForwardingStore::mutate(path.clone(), move |s| {
-        s.set_secret(&args.ref_name, &args.header, allow, args.purpose, args.force)
+        s.set_secret(
+            &args.ref_name,
+            &args.header,
+            allow,
+            args.purpose,
+            args.force,
+        )
     })
     .await
     .map_err(store_err)?;
@@ -276,9 +282,10 @@ async fn allow(args: AllowArgs, output: Option<OutputFormat>) -> Result<(), CliE
 async fn rm(args: RmArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
     let path = resolve_store(args.store.store.as_deref())?;
     let ref_name = args.ref_name.clone();
-    let changed = ForwardingStore::mutate(path.clone(), move |s| Ok(s.remove_secret(&args.ref_name)))
-        .await
-        .map_err(store_err)?;
+    let changed =
+        ForwardingStore::mutate(path.clone(), move |s| Ok(s.remove_secret(&args.ref_name)))
+            .await
+            .map_err(store_err)?;
     emit_row(
         output,
         MutationRow {
