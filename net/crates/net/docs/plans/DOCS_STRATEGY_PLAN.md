@@ -57,19 +57,23 @@ README says something else.**
 2. **Every concept page answers one question:** *what problem does this solve for
    an agent trying to get work done?* If a page can't answer it, it's reference,
    not concept.
-3. **Honesty is pinned to shipped behavior (see Phase 0).** No worldview claim
-   ships until the code cashes it. Two known caveats that MUST surface in prose,
-   not be papered over:
-   - **Capability discovery is direct-peer today; multi-hop propagation is
-     deferred** (`MULTIHOP_CAPABILITY_PLAN.md`; the skill's `capabilities.md`
-     notes "peers more than one hop away will not see the announcement today").
-     Worldview copy must scope "find a capability *somewhere else on the mesh*"
-     to what actually propagates — do not imply arbitrary cross-org, many-hop
-     discovery that isn't shipped.
+3. **Honesty is pinned to shipped behavior (see Phase 0 — audit complete,
+   `docs/misc/DOCS_CLAIMS_AUDIT.md`).** No worldview claim ships until the code
+   cashes it. The audit resolved the honesty items as follows:
+   - **Multi-hop discovery is SHIPPED** (`MULTIHOP_CAPABILITY_PLAN.md` — hop-count
+     16, TTL dedup, tests). The earlier "deferred" caveat came from a stale skill
+     doc; it is reversed. Worldview copy **may** claim discovery across the mesh,
+     and should state the **hop-count-16 bound** rather than imply infinite reach.
    - **MCP-bridged tools are `compat_tier: "mcp_bridge"` — request/response
-     only, no streams / migration / artifacts.** The rich surface (live state,
-     failures, retries, artifacts, streams) is *native* capabilities. The bridge
-     is the funnel, not the destination; say so on every page that mentions it.
+     only, no streams / migration / artifacts** (confirmed). The rich surface
+     (live state, failures, retries, artifacts, streams) is *native* capabilities.
+     The bridge is the funnel, not the destination; say so on every page.
+   - **Real command names (confirmed):** onboarding has **no `net up`** (use SDK
+     `MeshBuilder` / bootstrap peer); discovery is **`net cap query <tags>`** and
+     **`net cap nodes`** (there is no `net cap search`); capability invocation has
+     **no `cap` verb** — use SDK nRPC `call_typed` or the `net mcp serve`
+     `net_invoke_capability` meta-tool. Wrap/serve: `net wrap … -- <cmd>`,
+     `net mcp serve`, `net mcp pin approve|reject|list`.
 4. **Additive IA, never destructive.** Add `worldview/`, `sdk/`, `agent-briefs/`;
    reframe landings and nav. **Keep `concepts/` and `reference/` intact** — they
    are load-bearing (three reference pages were just ported into the
@@ -171,12 +175,14 @@ labels, hide, and language gating live in `web/src/docs.order.ts`. A folder's
 
 ## Phase plan
 
-### Phase 0 — Pre-flight claims audit (blocking gate; ~0.5 day)
+### Phase 0 — Pre-flight claims audit (blocking gate) — ✅ DONE (2026-07-04)
 
-One pass confirming the live **discover → describe → invoke → observe → recover →
-artifacts → policy** surface cashes every claim the worldview will make. Output:
-a short `docs/misc/DOCS_CLAIMS_AUDIT.md` mapping each claim → the shipped
-primitive (file/command) or → a filed build task.
+Output: `docs/misc/DOCS_CLAIMS_AUDIT.md`. Result: all seven lifecycle claims
+(discover → describe → invoke → observe → recover → artifacts → policy) are
+shipped. Only copy corrections needed — command names (no `net up`; `net cap
+query` not `search`; invoke via SDK/meta-tool) and one caveat that flipped in our
+favor (multi-hop is shipped). No worldview claim dropped. The verification notes
+below record what was checked.
 
 Verify (against code, not memory):
 - **discover:** `net cap search` / `find_nodes` / capability index — and the
