@@ -269,21 +269,43 @@ impl ForwardedContext {
     /// come from [`Self::declared_names`], which is a sorted [`BTreeSet`], so
     /// the order is stable regardless of insertion order.
     pub fn canonical_aad(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.push(AAD_SCHEME_VERSION);
-        write_field(&mut out, OBJECT_TAG.as_bytes());
-        write_field(&mut out, self.sealed_to.as_bytes());
-        write_field(&mut out, self.caller_origin.as_bytes());
-        write_field(&mut out, self.capability_id.as_bytes());
-        write_field(&mut out, self.invocation_id.as_bytes());
-        out.extend_from_slice(&self.expires_at.to_be_bytes());
-        // `declared_names.len()` fits u32 by construction (MAX_FORWARDED_HEADERS).
-        out.extend_from_slice(&(self.declared_names.len() as u32).to_be_bytes());
-        for name in &self.declared_names {
-            write_field(&mut out, name.as_str().as_bytes());
-        }
-        out
+        canonical_aad_bytes(
+            &self.sealed_to,
+            &self.caller_origin,
+            &self.capability_id,
+            &self.invocation_id,
+            self.expires_at,
+            &self.declared_names,
+        )
     }
+}
+
+/// The canonical AAD encoding, factored out so the sealed wire form
+/// ([`super::SealedContext`]) reconstructs the *identical* bytes from its
+/// cleartext envelope — one layout, one golden vector. See
+/// [`ForwardedContext::canonical_aad`] for the documented field order.
+pub(crate) fn canonical_aad_bytes(
+    sealed_to: &str,
+    caller_origin: &str,
+    capability_id: &str,
+    invocation_id: &str,
+    expires_at: u64,
+    declared_names: &BTreeSet<HeaderName>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(AAD_SCHEME_VERSION);
+    write_field(&mut out, OBJECT_TAG.as_bytes());
+    write_field(&mut out, sealed_to.as_bytes());
+    write_field(&mut out, caller_origin.as_bytes());
+    write_field(&mut out, capability_id.as_bytes());
+    write_field(&mut out, invocation_id.as_bytes());
+    out.extend_from_slice(&expires_at.to_be_bytes());
+    // `declared_names.len()` fits u32 by construction (MAX_FORWARDED_HEADERS).
+    out.extend_from_slice(&(declared_names.len() as u32).to_be_bytes());
+    for name in declared_names {
+        write_field(&mut out, name.as_str().as_bytes());
+    }
+    out
 }
 
 /// Append a 4-byte big-endian length prefix followed by `bytes`.

@@ -42,6 +42,11 @@
 //!   [`InMemorySecretBackend`] is the ephemeral default; the persistent
 //!   OS-keychain backend (`KeychainSecretBackend`, behind the non-default
 //!   `keychain` feature) plugs in behind the same trait.
+//! - [`SealedContext`] / [`ForwardedContextSealer`] / [`ForwardedContextOpener`]
+//!   (**Phase 2**, seam) — the sealed wire form and the crypto boundary. The
+//!   AEAD itself is deferred (an SDK primitive vs. a crypto crate is a
+//!   decision); the fixed open-order invariants (destination → TTL → decrypt →
+//!   validate) and the shared AAD binding are defined and conformance-tested.
 //!
 //! # Threat model (honest section)
 //!
@@ -66,6 +71,7 @@ mod header;
 #[cfg(feature = "keychain")]
 mod keychain;
 mod policy;
+mod seal;
 mod secret;
 mod store;
 mod target;
@@ -78,6 +84,9 @@ pub use header::{
 pub use policy::{
     AcceptError, AcceptPolicy, AllowList, DenialLevel, ForwardingConfig, PlainHeaderPolicy,
     ProviderScope, SecretPolicy, SendGrant,
+};
+pub use seal::{
+    ForwardedContextOpener, ForwardedContextSealer, OpenError, SealError, SealedContext,
 };
 pub use secret::{
     resolve_secret_send, InMemorySecretBackend, ResolveError, SecretBackend, SecretBackendError,
