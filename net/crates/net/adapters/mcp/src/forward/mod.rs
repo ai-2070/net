@@ -39,8 +39,9 @@
 //! - [`SecretBackend`] / [`resolve_secret_send`] (**Phase 1**, value side) — the
 //!   value-storage seam and the resolver that applies policy *before* touching
 //!   the backend and materializes a value only as a [`ForwardedHeaderValue`].
-//!   [`InMemorySecretBackend`] is the ephemeral default; persistent backends
-//!   plug in behind the trait.
+//!   [`InMemorySecretBackend`] is the ephemeral default; the persistent
+//!   OS-keychain backend (`KeychainSecretBackend`, behind the non-default
+//!   `keychain` feature) plugs in behind the same trait.
 //!
 //! # Threat model (honest section)
 //!
@@ -62,6 +63,8 @@
 
 mod context;
 mod header;
+#[cfg(feature = "keychain")]
+mod keychain;
 mod policy;
 mod secret;
 mod store;
@@ -79,6 +82,8 @@ pub use policy::{
 pub use secret::{
     resolve_secret_send, InMemorySecretBackend, ResolveError, SecretBackend, SecretBackendError,
 };
+#[cfg(feature = "keychain")]
+pub use keychain::{KeychainSecretBackend, DEFAULT_KEYCHAIN_SERVICE};
 pub use store::{ForwardingAudit, ForwardingStore, Grant, GrantKind, StoreError};
 pub use target::{
     forwarding_supported, resolve_injection, risk_tags_for_accept_policy, ForwardingUnsupported,

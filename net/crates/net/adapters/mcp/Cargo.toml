@@ -19,6 +19,16 @@ name = "net_mcp"
 #   cargo test -p net-mesh-mcp --features fixture
 fixture = []
 
+# `keychain` gates the OS-keychain secret value backend
+# (`MCP_CREDENTIAL_FORWARDING_PLAN.md` Phase 1) — macOS Keychain, Windows
+# Credential Manager, and the Linux Secret Service (via pure-Rust zbus +
+# `crypto-rust`, so no libdbus / OpenSSL system lib is needed to *build*).
+# NOT a default feature: it pulls the `keyring` dependency and needs a
+# keychain-capable host to *run*, so the default build / CI / `cargo install`
+# never compile it. Enable it to build the persistent backend:
+#   cargo test -p net-mesh-mcp --features keychain
+keychain = ["dep:keyring"]
+
 # ---------------------------------------------------------------------------
 # Doctrine (MCP_BRIDGE_PLAN.md #1): this adapter rides on `net-mesh-sdk`
 # ONLY — never on core crates directly. The single mesh-facing dependency
@@ -46,6 +56,16 @@ fs2 = "0.4"
 # Stream combinators for bounded-concurrency provider fan-out in the demand
 # side's `search` (`buffer_unordered`).
 futures = "0.3"
+# OS-keychain secret value backend, behind the non-default `keychain` feature
+# (see `[features]`). `default-features = false` + explicit native backends
+# keeps the Linux path on pure-Rust zbus/crypto (no libdbus/OpenSSL build dep);
+# it is only compiled when `keychain` is enabled.
+keyring = { version = "3", optional = true, default-features = false, features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+    "crypto-rust",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
