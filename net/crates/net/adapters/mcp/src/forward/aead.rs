@@ -249,7 +249,11 @@ fn take<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
         return None;
     }
     let n = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    if buf.len() < 4 + n {
+    // Compare as `n > remaining` rather than `4 + n > len`: `buf.len() >= 4`
+    // here so the subtraction can't underflow, and this avoids a `4 + n` wrap
+    // on 32-bit targets that would let an over-long prefix slip past into a
+    // panicking `split_at`. Fail closed (None) on a malformed prefix.
+    if n > buf.len() - 4 {
         return None;
     }
     let (field, rest) = buf[4..].split_at(n);
@@ -451,5 +455,17 @@ mod tests {
         assert!(opener.open(&sealed, "node-dest", 1_010).await.is_ok());
         // Debug never leaks the secret.
         assert!(!format!("{opener:?}").contains("secret"));
+    }
+
+    #[test]
+    fn take_fails_closed_on_an_overlong_length_prefix() {
+        // A prefix claiming more bytes than remain must return None, never
+        // panic — including the case where `4 + n` would wrap on 32-bit.
+        let mut overlong: &[u8] = &[0xff, 0xff, 0xff, 0xff, 0x01];
+        assert!(take(&mut overlong).is_none());
+        // A well-formed field still parses and advances the cursor.
+        let mut ok: &[u8] = &[0, 0, 0, 3, b'a', b'b', b'c'];
+        assert_eq!(take(&mut ok), Some(&b"abc"[..]));
+        assert!(ok.is_empty());
     }
 }
