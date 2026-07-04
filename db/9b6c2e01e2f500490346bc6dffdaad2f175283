@@ -1,0 +1,36 @@
+net/crates/net/adapters/mcp/src/wrap/catalog.rs
+  s_e2c6f41ae18f64::t_6fd84018f7e051 125-126,133-153
+  s_e2c6f41ae18f64::t_18cb0123e21881 200-208,211-213,216-221,226-234
+  s_e2c6f41ae18f64::t_0179135b7f0195 1-124,127-132,154-199,209-210,214-215,222-225,235-236
+  s_e2c6f41ae18f64::t_5707cc117d7d9e 237-238
+net/crates/net/adapters/mcp/src/bridge.rs
+  s_e2c6f41ae18f64::t_3a2c07da0e540a 30-38
+  s_e2c6f41ae18f64::t_b3936b9e91c210 1-29,39-140
+net/crates/net/adapters/mcp/src/lib.rs
+  s_e2c6f41ae18f64::t_08e0bf99013970 26
+net/crates/net/adapters/mcp/src/wrap/mod.rs
+  s_e2c6f41ae18f64::t_80872fdd78fad7 16
+net/crates/net/adapters/mcp/src/wrap/session.rs
+  s_e2c6f41ae18f64::t_759a21f06df6c3 139-143
+  s_e2c6f41ae18f64::t_9db619d6665734 435-448
+  s_e2c6f41ae18f64::t_20faef4bf2e561 94-99
+  s_e2c6f41ae18f64::t_864cab6c00432c 24,32
+  s_e2c6f41ae18f64::t_095b14e585035f 192-195,202-204
+  s_e2c6f41ae18f64::t_798dfbe48bea93 293-313,317-318,330,350-351
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "db9b6c2e01e2f500490346bc6dffdaad2f175283",
+  "prompts": {},
+  "sessions": {
+    "s_e2c6f41ae18f64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dbc06b06-9d2b-4f28-a220-e736eee44f76",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
