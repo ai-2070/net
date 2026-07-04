@@ -146,3 +146,9 @@ What to do: configure the bind address on the node (`mesh_bind` parameter or equ
 **No.** The mental model is different enough that direct drop-in usually produces working-but-wrong code (e.g. assuming durability that isn't there, expecting consumer groups, depending on broker-side ordering). 
 
 What to do: walk them through `concepts.md`. Then map their use case to the recipes in `patterns.md`. The translation usually simplifies their architecture (fewer moving parts) but it isn't mechanical.
+
+## "Should my event mean success? Can I publish `x.ok` / `status: 200` / `delivered: true`?"
+
+**No — an event is a fact observed at one layer, not an end-to-end acknowledgement.** Transport success is not application success, and application success is not business success. A Net receipt confirms bytes were accepted for fan-out (and, with an opt-in reliability/persistence layer, that they were delivered or logged). It says nothing about whether a downstream effect actually landed — and neither should the event payload. Shaping an event as "the operation is OK" bakes a claim onto the wire that the producer usually can't back up; the quiet failure is the partial one, where the top said OK but a later stage didn't.
+
+What to do: read `event-semantics.md`. Name events after what occurred (`order.placed`, `door.unlocked`), past tense, at the layer that observed it. Make distinct outcomes **distinct events** (`job.submitted` / `job.applied` / `job.failed`), not one boolean — a failure is its own fact, not the absence of a success. Keep transport truth in the transport (`Receipt` / `Reliability::Reliable` / RedEX cursor), not in `{"delivered": true}`. Let consumers fold facts into their own success view (CortEX). If a caller genuinely needs to learn an outcome, that's nRPC (`nrpc.md`) — and even the reply is a fact, not a guarantee.
