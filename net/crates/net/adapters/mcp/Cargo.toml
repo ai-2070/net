@@ -79,7 +79,7 @@ futures = "0.3"
 # session, not across reboots — a persistent Linux backend (Secret Service) can
 # be swapped in later by enabling `sync-secret-service` and shipping libdbus.
 # Only compiled when `keychain` is enabled.
-keyring = { version = "3", optional = true, default-features = false, features = [
+keyring = { version = "4", optional = true, default-features = false, features = [
     "apple-native",
     "windows-native",
     "linux-native",
