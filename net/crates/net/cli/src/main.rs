@@ -153,6 +153,9 @@ enum Command {
     /// MCP bridge — expose mesh capabilities to a local MCP host (`serve`).
     #[command(subcommand)]
     Mcp(commands::mcp::McpCommand),
+    /// Caller-side credential/header forwarding policy + audit (deny-by-default).
+    #[command(subcommand)]
+    Forwarding(commands::forwarding::ForwardingCommand),
     /// Generate typed language bindings from discovered tool descriptors.
     #[command(subcommand)]
     Typegen(commands::typegen::TypegenCommand),
@@ -247,6 +250,9 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         }
         Command::Wrap(args) => commands::wrap::run(args, output, config_path, profile).await,
         Command::Mcp(cmd) => commands::mcp::run(cmd, output, config_path, profile).await,
+        Command::Forwarding(cmd) => {
+            commands::forwarding::run(cmd, output, config_path, profile).await
+        }
         Command::Typegen(cmd) => commands::typegen::run(cmd, output, config_path, profile).await,
         Command::Completion(args) => commands::completion::run::<Cli>(args),
         Command::Man => commands::man::run::<Cli>(),
