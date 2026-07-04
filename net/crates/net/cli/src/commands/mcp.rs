@@ -27,14 +27,14 @@ use clap::{Args, Subcommand};
 use net_mcp::serve::{
     CapabilityId, ConsentPolicy, MeshGateway, PinState, PinStore, Shim, MSG_NO_DAEMON,
 };
-use net_sdk::identity::Identity;
-use net_sdk::{Mesh, MeshBuilder};
 use serde::Serialize;
 use tokio::io::BufReader;
 
 use crate::commands::aggregator::RemoteAttachArgs;
-use crate::context::{require_remote_attach, resolve_profile, RemoteAttach};
-use crate::error::{connection_failure, generic, invalid_args, CliError};
+use crate::context::{
+    build_attached_mesh, load_operator_identity, require_remote_attach, resolve_profile,
+};
+use crate::error::{generic, invalid_args, CliError};
 use crate::prelude::{emit_value, OutputFormat};
 
 #[derive(Subcommand, Debug)]
@@ -138,9 +138,9 @@ async fn run_serve(
                  shim's origin).",
             )
         })?;
-    let identity = load_identity(identity_path).await?;
+    let identity = load_operator_identity(identity_path).await?;
 
-    let mesh = build_shim_mesh(identity, &remote).await?;
+    let mesh = build_attached_mesh("0.0.0.0:0", Some(identity), &remote).await?;
     let mesh = Arc::new(mesh);
 
     // Seed the shim consent allowlist from `--allow-capability`.
@@ -272,58 +272,5 @@ async fn pin_list(args: PinListArgs, output: Option<OutputFormat>) -> Result<(),
     Ok(())
 }
 
-/// Load an operator [`Identity`] from an identity TOML file (`seed_hex = ...`).
-/// Mirrors `net wrap`'s loader so both sides accept the same file.
-async fn load_identity(path: &Path) -> Result<Identity, CliError> {
-    let text = tokio::fs::read_to_string(path).await.map_err(|e| {
-        generic(format!(
-            "failed to read identity file {}: {e}",
-            path.display()
-        ))
-    })?;
-
-    #[derive(serde::Deserialize)]
-    struct IdentityFile {
-        seed_hex: String,
-    }
-    let parsed: IdentityFile = toml::from_str(&text).map_err(|e| {
-        invalid_args(format!(
-            "identity file {} failed to parse: {e}",
-            path.display()
-        ))
-    })?;
-    let seed = hex::decode(&parsed.seed_hex).map_err(|e| {
-        invalid_args(format!(
-            "identity file {} `seed_hex` is not valid hex: {e}",
-            path.display()
-        ))
-    })?;
-    Identity::from_bytes(&seed).map_err(|e| {
-        invalid_args(format!(
-            "identity file {} `seed_hex` is not a valid 32-byte seed: {e:?}",
-            path.display()
-        ))
-    })
-}
-
-/// Build a mesh under `identity` and join it via the remote peer (routed
-/// handshake), the same path `net wrap` uses so the shim carries a stable,
-/// owner-scoped origin.
-async fn build_shim_mesh(identity: Identity, remote: &RemoteAttach) -> Result<Mesh, CliError> {
-    let mesh = MeshBuilder::new("0.0.0.0:0", &remote.psk)
-        .map_err(|e| connection_failure(format!("mesh builder rejected bind address: {e}")))?
-        .identity(identity)
-        .build()
-        .await
-        .map_err(|e| connection_failure(format!("mesh build failed: {e}")))?;
-    mesh.start();
-    mesh.connect_via(&remote.addr.to_string(), &remote.public_key, remote.node_id)
-        .await
-        .map_err(|e| {
-            connection_failure(format!(
-                "routed handshake with {} (node_id={}) failed: {e}",
-                remote.addr, remote.node_id
-            ))
-        })?;
-    Ok(mesh)
-}
+// Identity loading and mesh attachment are shared with `net wrap` — see
+// `context::load_operator_identity` and `context::build_attached_mesh`.

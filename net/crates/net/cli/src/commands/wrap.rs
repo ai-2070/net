@@ -19,13 +19,13 @@ use std::path::PathBuf;
 use clap::Args;
 use net_mcp::spec::Implementation;
 use net_mcp::wrap::{wrap_server, CredentialOverride, Substitutability, WrapConfig};
-use net_sdk::identity::Identity;
-use net_sdk::{Mesh, MeshBuilder};
 use tokio::sync::broadcast;
 
 use crate::commands::aggregator::RemoteAttachArgs;
-use crate::context::{require_remote_attach, resolve_profile, RemoteAttach};
-use crate::error::{connection_failure, generic, invalid_args, sdk, CliError};
+use crate::context::{
+    build_attached_mesh, load_operator_identity, require_remote_attach, resolve_profile,
+};
+use crate::error::{generic, invalid_args, sdk, CliError};
 use crate::output::{emit_stream_row, OutputFormat};
 use crate::parsers::parse_u64_flexible;
 
@@ -138,10 +138,10 @@ pub async fn run(
                  so an ephemeral key would admit nobody.",
             )
         })?;
-    let identity = load_identity(identity_path).await?;
+    let identity = load_operator_identity(identity_path).await?;
 
     // Build a mesh under that identity and join via the peer.
-    let mesh = build_wrap_mesh(identity, &remote).await?;
+    let mesh = build_attached_mesh("0.0.0.0:0", Some(identity), &remote).await?;
 
     // Parse the rest of the operator's intent.
     let (program, prog_args) = args
@@ -247,60 +247,8 @@ pub async fn run(
     Ok(())
 }
 
-/// Load an operator [`Identity`] from an identity TOML file (`seed_hex = ...`).
-async fn load_identity(path: &Path) -> Result<Identity, CliError> {
-    let text = tokio::fs::read_to_string(path).await.map_err(|e| {
-        generic(format!(
-            "failed to read identity file {}: {e}",
-            path.display()
-        ))
-    })?;
-
-    #[derive(serde::Deserialize)]
-    struct IdentityFile {
-        seed_hex: String,
-    }
-    let parsed: IdentityFile = toml::from_str(&text).map_err(|e| {
-        invalid_args(format!(
-            "identity file {} failed to parse: {e}",
-            path.display()
-        ))
-    })?;
-    let seed = hex::decode(&parsed.seed_hex).map_err(|e| {
-        invalid_args(format!(
-            "identity file {} `seed_hex` is not valid hex: {e}",
-            path.display()
-        ))
-    })?;
-    Identity::from_bytes(&seed).map_err(|e| {
-        invalid_args(format!(
-            "identity file {} `seed_hex` is not a valid 32-byte seed: {e:?}",
-            path.display()
-        ))
-    })
-}
-
-/// Build a mesh under `identity` and join it via the remote peer (routed
-/// handshake, mirroring the CLI's remote-attach path but with the operator's
-/// identity so the served capabilities carry a stable, owner-scoped origin).
-async fn build_wrap_mesh(identity: Identity, remote: &RemoteAttach) -> Result<Mesh, CliError> {
-    let mesh = MeshBuilder::new("0.0.0.0:0", &remote.psk)
-        .map_err(|e| connection_failure(format!("mesh builder rejected bind address: {e}")))?
-        .identity(identity)
-        .build()
-        .await
-        .map_err(|e| connection_failure(format!("mesh build failed: {e}")))?;
-    mesh.start();
-    mesh.connect_via(&remote.addr.to_string(), &remote.public_key, remote.node_id)
-        .await
-        .map_err(|e| {
-            connection_failure(format!(
-                "routed handshake with {} (node_id={}) failed: {e}",
-                remote.addr, remote.node_id
-            ))
-        })?;
-    Ok(mesh)
-}
+// Identity loading and mesh attachment are shared with `net mcp serve` — see
+// `context::load_operator_identity` and `context::build_attached_mesh`.
 
 /// Parse `KEY=VALUE` env pairs.
 fn parse_env_pairs(raw: &[String]) -> Result<Vec<(String, String)>, CliError> {

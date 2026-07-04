@@ -247,8 +247,27 @@ impl CliContext {
 /// new initiators against a running dispatch loop. The relay
 /// hop is degenerate (relay == final dest == the daemon).
 async fn build_remote_mesh(remote: RemoteAttach) -> Result<net_sdk::Mesh, CliError> {
-    let mesh = net_sdk::MeshBuilder::new("127.0.0.1:0", &remote.psk)
-        .map_err(|e| connection_failure(format!("mesh builder rejected bind address: {e}")))?
+    // In-process remote attach: loopback bind, ephemeral (anonymous) identity.
+    build_attached_mesh("127.0.0.1:0", None, &remote).await
+}
+
+/// Build a local mesh bound to `bind`, optionally under an operator
+/// `identity`, and join `remote` via the routed handshake. The single
+/// implementation behind the in-process attach ([`build_remote_mesh`],
+/// anonymous + loopback) and the `net wrap` / `net mcp serve` shims (which pass
+/// their operator identity and bind `0.0.0.0:0` so the served / consumed
+/// capabilities carry a stable, owner-scoped origin reachable by the peer).
+pub(crate) async fn build_attached_mesh(
+    bind: &str,
+    identity: Option<net_sdk::identity::Identity>,
+    remote: &RemoteAttach,
+) -> Result<net_sdk::Mesh, CliError> {
+    let mut builder = net_sdk::MeshBuilder::new(bind, &remote.psk)
+        .map_err(|e| connection_failure(format!("mesh builder rejected bind address: {e}")))?;
+    if let Some(id) = identity {
+        builder = builder.identity(id);
+    }
+    let mesh = builder
         .build()
         .await
         .map_err(|e| connection_failure(format!("mesh build failed: {e}")))?;
@@ -348,6 +367,14 @@ pub fn require_remote_attach(
 }
 
 pub(crate) async fn load_identity_keypair(path: &Path) -> Result<EntityKeypair, CliError> {
+    Ok(EntityKeypair::from_bytes(load_identity_seed(path).await?))
+}
+
+/// Load and validate the raw 32-byte seed from a `seed_hex = "..."` identity
+/// TOML file. The one place the read + parse + hex-decode + length checks live,
+/// shared by [`load_identity_keypair`] (→ `EntityKeypair`) and
+/// [`load_operator_identity`] (→ `Identity`) so the two never drift.
+pub(crate) async fn load_identity_seed(path: &Path) -> Result<[u8; 32], CliError> {
     let text = tokio::fs::read_to_string(path).await.map_err(|e| {
         generic(format!(
             "failed to read identity file {}: {e}",
@@ -375,7 +402,23 @@ pub(crate) async fn load_identity_keypair(path: &Path) -> Result<EntityKeypair, 
     }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&seed_bytes);
-    Ok(EntityKeypair::from_bytes(arr))
+    Ok(arr)
+}
+
+/// Load an operator [`Identity`](net_sdk::identity::Identity) from an identity
+/// TOML file. Shared by `net wrap` and `net mcp serve`, which build a mesh
+/// under this identity so served / consumed capabilities carry a stable,
+/// owner-scoped origin.
+pub(crate) async fn load_operator_identity(
+    path: &Path,
+) -> Result<net_sdk::identity::Identity, CliError> {
+    let seed = load_identity_seed(path).await?;
+    net_sdk::identity::Identity::from_bytes(&seed).map_err(|e| {
+        invalid_args(format!(
+            "identity file {} `seed_hex` is not a valid 32-byte seed: {e:?}",
+            path.display()
+        ))
+    })
 }
 
 #[derive(serde::Deserialize)]
