@@ -253,7 +253,11 @@ mod tests {
             (20, info("echo", true, "none", echo_schema())),
         ];
         let groups = group_capabilities(discovered, false);
-        assert_eq!(groups.len(), 2, "no cross-provider merge when collapse is off");
+        assert_eq!(
+            groups.len(),
+            2,
+            "no cross-provider merge when collapse is off"
+        );
         assert!(groups.iter().all(|g| g.providers.len() == 1));
         assert_eq!(groups[0].providers, vec![10]);
         assert_eq!(groups[1].providers, vec![20]);

@@ -407,7 +407,10 @@ mod tests {
             &tool,
             &ctx(CredentialStatus::Unknown, Substitutability::ProviderLocal),
         );
-        assert_eq!(lowered.mcp_name, "createIssue", "original preserved for invoke");
+        assert_eq!(
+            lowered.mcp_name, "createIssue",
+            "original preserved for invoke"
+        );
         let id = &lowered.descriptor.tool_id;
         assert_ne!(id, "createIssue", "the id was sanitized");
         assert!(is_serviceable_tool_id(id));

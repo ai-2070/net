@@ -433,7 +433,10 @@ mod tests {
         );
         // F8: a successful save must leave no umask-perms temp sibling behind.
         let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        assert!(!tmp.exists(), "no leftover temp file after a successful save");
+        assert!(
+            !tmp.exists(),
+            "no leftover temp file after a successful save"
+        );
     }
 
     #[tokio::test]

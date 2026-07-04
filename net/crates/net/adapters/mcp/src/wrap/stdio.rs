@@ -453,7 +453,10 @@ mod tests {
         // A final line with no newline is still delivered (within the cap).
         let data = b"tail-no-newline".to_vec();
         let mut r = BufReader::new(&data[..]);
-        assert_eq!(read_line(&mut r, 64).await.as_deref(), Some("tail-no-newline"));
+        assert_eq!(
+            read_line(&mut r, 64).await.as_deref(),
+            Some("tail-no-newline")
+        );
         assert_eq!(read_line(&mut r, 64).await.as_deref(), Some("<EOF>"));
     }
 

@@ -23,9 +23,7 @@ use net_sdk::tool::description_metadata_key;
 
 use super::catalog::{build_catalog, shared_catalog, DescribeHandler, SharedCatalog};
 use super::credentials::{classify, ClassifyError, CredentialOverride, WrapEnv};
-use super::descriptor::{
-    lower_tool, LoweredTool, LoweringContext, Substitutability,
-};
+use super::descriptor::{lower_tool, LoweredTool, LoweringContext, Substitutability};
 use super::invoke::{OwnerScope, WrapInvokeHandler};
 use super::stdio::StdioMcpClient;
 use super::McpError;
@@ -328,8 +326,11 @@ pub async fn wrap_server(
         let tool_id = lt.descriptor.tool_id.clone();
         // Serve under the channel-safe `tool_id`, invoke by the original
         // `mcp_name` (they differ only for a sanitized name).
-        let handler =
-            WrapInvokeHandler::new(Arc::clone(&client), lt.mcp_name.clone(), config.scope.clone());
+        let handler = WrapInvokeHandler::new(
+            Arc::clone(&client),
+            lt.mcp_name.clone(),
+            config.scope.clone(),
+        );
         match mesh.serve_rpc(&tool_id, Arc::new(handler)) {
             Ok(handle) => {
                 handles.insert(tool_id, handle);
