@@ -76,6 +76,22 @@ fn main() -> std::io::Result<()> {
                         stdout.flush()?;
                     }
                 }
+                // Right after the handshake, emit a SERVER-initiated request.
+                // The bridge doesn't support these; it must answer
+                // method-not-found OFF its read path and keep serving (never
+                // block the reader and deadlock). This exercises that path.
+                if method == spec::method::INITIALIZE {
+                    let server_req = json!({
+                        "jsonrpc": spec::JSONRPC_VERSION,
+                        "id": 9001,
+                        "method": "sampling/createMessage",
+                        "params": {},
+                    });
+                    if let Ok(text) = serde_json::to_string(&server_req) {
+                        writeln!(stdout, "{text}")?;
+                        stdout.flush()?;
+                    }
+                }
             }
             // A notification (method, no id) — e.g. notifications/initialized.
             // Nothing to answer.

@@ -351,8 +351,17 @@ async fn dispatch_line(inner: &Arc<Inner>, line: &str) {
         // Server-initiated request (method + id). The bridge is a pure
         // request/response client; reject sampling / elicitation politely so
         // the server isn't left waiting.
+        //
+        // Reply OFF the read path. The reader is the *sole* drainer of the
+        // child's stdout; if it blocked here writing to a full stdin (while the
+        // child is itself blocked writing a full stdout, not reading stdin),
+        // both pipes would wedge — a two-pipe deadlock hanging every in-flight
+        // request. Spawning keeps the reader draining; `write_line` still
+        // serializes on the stdin mutex, so replies and client requests can't
+        // interleave mid-line.
         (Some(_method), Some(id)) => {
-            reply_method_not_found(inner, id).await;
+            let inner = Arc::clone(inner);
+            tokio::spawn(async move { reply_method_not_found(&inner, id).await });
         }
         // Notification (method, no id).
         (Some(method), None) => {

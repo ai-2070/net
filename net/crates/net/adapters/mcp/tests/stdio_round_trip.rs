@@ -86,6 +86,27 @@ async fn initialize_lists_and_calls_the_fixture_tools() {
 }
 
 #[tokio::test]
+async fn a_server_initiated_request_does_not_wedge_the_reader() {
+    // F3: the fixture emits a SERVER-initiated request right after initialize.
+    // The bridge answers it (method-not-found) OFF its read path, so the reader
+    // keeps draining stdout and later calls still round-trip — the write never
+    // blocks the reader into a two-pipe deadlock.
+    let client = connect().await;
+    within("initialize", client.initialize())
+        .await
+        .expect("initialize");
+
+    let echo = within(
+        "echo",
+        client.call_tool("echo", json!({ "message": "still serving" })),
+    )
+    .await
+    .expect("echo after the server-initiated request");
+    assert!(!echo.is_error);
+    assert_eq!(echo.text(), "still serving");
+}
+
+#[tokio::test]
 async fn unknown_tool_is_a_protocol_error() {
     let client = connect().await;
     within("initialize", client.initialize())
