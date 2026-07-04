@@ -1,0 +1,20 @@
+net/crates/net/adapters/mcp/src/serve/validation.rs
+  s_e2c6f41ae18f64::t_9e488dd1bdd9a2 125-137
+  s_e2c6f41ae18f64::t_a75af35e326db8 269-282
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "29076f474f2808c78218b8d610b0d4a1ea87dfb5",
+  "prompts": {},
+  "sessions": {
+    "s_e2c6f41ae18f64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dbc06b06-9d2b-4f28-a220-e736eee44f76",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
