@@ -148,6 +148,11 @@ enum Command {
     /// Blob + directory transfer (recv/send/ls/status/cancel).
     #[command(subcommand)]
     Transfer(commands::transfer::TransferCommand),
+    /// Wrap a local stdio MCP server as owner-only mesh capabilities.
+    Wrap(commands::wrap::WrapArgs),
+    /// MCP bridge — expose mesh capabilities to a local MCP host (`serve`).
+    #[command(subcommand)]
+    Mcp(commands::mcp::McpCommand),
     /// Generate typed language bindings from discovered tool descriptors.
     #[command(subcommand)]
     Typegen(commands::typegen::TypegenCommand),
@@ -240,6 +245,8 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Transfer(cmd) => {
             commands::transfer::run(cmd, output, config_path, profile, quiet).await
         }
+        Command::Wrap(args) => commands::wrap::run(args, output, config_path, profile).await,
+        Command::Mcp(cmd) => commands::mcp::run(cmd, output, config_path, profile).await,
         Command::Typegen(cmd) => commands::typegen::run(cmd, output, config_path, profile).await,
         Command::Completion(args) => commands::completion::run::<Cli>(args),
         Command::Man => commands::man::run::<Cli>(),

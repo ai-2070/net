@@ -1,0 +1,75 @@
+[package]
+name = "net-mesh-mcp"
+version = "0.30.0"
+edition = "2021"
+description = "MCP (Model Context Protocol) edge adapter for the Net mesh — net wrap / net mcp serve"
+license = "Apache-2.0"
+repository = "https://github.com/ai-2070/net"
+
+[lib]
+# `use net_mcp::...` — the published artifact is `net-mesh-mcp`.
+name = "net_mcp"
+
+# ---------------------------------------------------------------------------
+# Doctrine (MCP_BRIDGE_PLAN.md #1): this adapter rides on `net-mesh-sdk`
+# ONLY — never on core crates directly. The single mesh-facing dependency
+# is `net-mesh-sdk`; everything else is protocol / serialization support.
+# A CI dependency check (Open Risks table) enforces that `net-mesh` never
+# appears as a *direct* dependency here — only transitively via the SDK.
+# The `tool` feature is what surfaces `net_sdk::tool::ToolDescriptor`, the
+# lowering target.
+# ---------------------------------------------------------------------------
+[dependencies]
+# `tool` surfaces `ToolDescriptor` (the lowering target) and the
+# `serve_tool` / `call_tool` provider+caller verbs the announce/invoke
+# slices need; it pulls `net` (the SDK tool module is written against the
+# mesh-RPC surface) and `cortex`.
+net-mesh-sdk = { version = "0.30.0", path = "../../sdk", default-features = false, features = [
+    "net",
+    "tool",
+] }
+async-trait = "0.1"
+bytes = "1"
+# Cross-process advisory file locking for the shared pin store, so a
+# load→modify→save transaction can't interleave with another shim / the pin
+# CLI and resurrect a removed consent decision.
+fs2 = "0.4"
+# Stream combinators for bounded-concurrency provider fan-out in the demand
+# side's `search` (`buffer_unordered`).
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["process", "io-util", "rt", "sync", "time", "fs"] }
+
+[dev-dependencies]
+# Parses this crate's own manifest in the dependency-boundary test.
+toml = "1"
+# Isolated temp dirs for the pin-store file tests.
+tempfile = "3"
+tokio = { version = "1", features = [
+    "process",
+    "io-util",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "macros",
+] }
+
+# The conformance fixture (MCP_BRIDGE_PLAN.md cross-cutting workstreams):
+# a hermetic stdio MCP server with injectable behaviors that acceptance
+# runs against — never against GitHub. Co-located in this crate so the
+# integration tests can spawn it via `CARGO_BIN_EXE_net-mcp-fixture`;
+# extractable into its own artifact later without touching the wire types.
+[[bin]]
+name = "net-mcp-fixture"
+path = "src/bin/fixture.rs"
+
+# Mirror the workspace panic-hygiene lints (there is no [workspace.lints]
+# table to inherit from — the core crate declares these per-package).
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"

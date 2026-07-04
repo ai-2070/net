@@ -26,6 +26,11 @@ net-sdk = { package = "net-mesh-sdk", version = "0.30.0", path = "../sdk", defau
     "tool",
 ] }
 
+# The MCP edge adapter powers `net wrap` (wrap a stdio MCP server as mesh
+# capabilities). The CLI is the packaging point — it links the adapter the
+# same way it links the SDK; the adapter itself still rides on the SDK only.
+net-mesh-mcp = { version = "0.30.0", path = "../adapters/mcp" }
+
 # Clap derives the argv parser from typed structs; `env` enables
 # `NET_MESH_*` env-var fallback for global flags (`--profile` etc.).
 clap = { version = "4", features = ["derive", "env"] }

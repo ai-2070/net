@@ -2989,6 +2989,15 @@ impl MeshNode {
         self.node_id
     }
 
+    /// This node's `origin_hash` — the 8-byte BLAKE2s of its entity public
+    /// key, and the value the bus stamps on this node's outbound RPCs. A
+    /// remote handler sees it as `RpcContext::caller_origin`, so it is the
+    /// stable identifier to admit in a caller-scoped authorization check
+    /// (distinct from [`node_id`](Self::node_id)).
+    pub fn origin_hash(&self) -> u64 {
+        self.identity.entity_id().origin_hash()
+    }
+
     /// The per-packet authorization fast path. Writes land here on
     /// successful subscribe (via `AuthGuard::allow_channel`) and
     /// reads happen on every publish fan-out. Exposed primarily for
