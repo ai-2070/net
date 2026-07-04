@@ -36,7 +36,7 @@ pub mod validation;
 
 pub use backend::{
     CapabilityDetail, CapabilityGateway, CapabilityId, CapabilityIdError, CapabilitySummary,
-    GatewayError,
+    GatewayError, InvokeSafety,
 };
 pub use consent::{ConsentDecision, ConsentPolicy};
 pub use mesh_gateway::MeshGateway;

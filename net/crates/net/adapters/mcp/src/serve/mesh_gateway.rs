@@ -35,6 +35,7 @@ use tokio::sync::Mutex;
 
 use super::backend::{
     CapabilityDetail, CapabilityGateway, CapabilityId, CapabilitySummary, GatewayError,
+    InvokeSafety,
 };
 use super::grouping::{
     descriptor_fingerprint, group_capabilities, is_collapsible, CapabilityGroup,
@@ -430,16 +431,17 @@ impl CapabilityGateway for MeshGateway {
     /// **Duplicate-execution safety.** A timeout does not prove the primary
     /// didn't execute the call, so re-running it — via the same-node retry in
     /// `call_retry` *or* failover to another provider — can execute a tool more
-    /// than once. Both are gated on `duplicate_safe`:
+    /// than once. Both are gated on [`InvokeSafety`]:
     ///
-    /// - **Same-node retry** uses [`retriable_send_safe`] when `!duplicate_safe`,
-    ///   so a credentialed / stateful tool is never re-sent on a mere timeout
-    ///   (at-most-once); an uncredentialed tool retries transient timeouts,
-    ///   recovering from the reply-channel first-reply race.
+    /// - **Same-node retry** uses [`retriable_send_safe`] for
+    ///   [`InvokeSafety::AtMostOnce`], so a credentialed / stateful tool is
+    ///   never re-sent on a mere timeout; a [`InvokeSafety::DuplicateSafe`] tool
+    ///   retries transient timeouts, recovering from the reply-channel
+    ///   first-reply race.
     /// - **Failover** happens ONLY between providers `group_capabilities`
     ///   collapsed, which requires the operator's `provider_equivalent` opt-in
     ///   AND `credential_status == none` — the same uncredentialed class that is
-    ///   `duplicate_safe`. A credentialed tool never collapses, so it has no
+    ///   duplicate-safe. A credentialed tool never collapses, so it has no
     ///   failover candidates and stays on its single provider.
     ///
     /// Net: for a credentialed tool the whole path is at-most-once; for an
@@ -449,16 +451,16 @@ impl CapabilityGateway for MeshGateway {
         &self,
         id: &CapabilityId,
         arguments: Value,
-        duplicate_safe: bool,
+        safety: InvokeSafety,
     ) -> Result<CallToolResult, GatewayError> {
         let primary = parse_node(&id.provider)?;
         let body = Bytes::from(
             serde_json::to_vec(&arguments)
                 .map_err(|e| GatewayError::Other(format!("encode arguments: {e}")))?,
         );
-        // Idempotent (duplicate-safe) calls retry any transient error; a
-        // non-idempotent invoke only retries errors that prove non-execution.
-        let retriable: fn(&RpcError) -> bool = if duplicate_safe {
+        // A duplicate-safe call retries any transient error; an at-most-once
+        // invoke only retries errors that prove non-execution.
+        let retriable: fn(&RpcError) -> bool = if safety.allows_timeout_retry() {
             is_retriable
         } else {
             retriable_send_safe

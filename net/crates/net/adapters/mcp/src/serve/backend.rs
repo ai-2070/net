@@ -95,7 +95,10 @@ impl std::fmt::Display for CapabilityId {
 /// pin recorded under `0x2a/echo` now matches an invoke of `42/echo`.
 fn canonical_provider(raw: &str) -> String {
     let trimmed = raw.trim();
-    let numeric = match trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+    let numeric = match trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
         Some(hex) => u64::from_str_radix(hex, 16),
         None => trimmed.parse::<u64>(),
     };
@@ -175,6 +178,43 @@ pub enum GatewayError {
     Other(String),
 }
 
+/// Whether re-executing an invoke is harmless — the retry policy for
+/// [`CapabilityGateway::invoke`]. A typed flag rather than a bare `bool`, so a
+/// call site or implementation can't silently invert, hard-code, or cargo-cult
+/// the meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvokeSafety {
+    /// Duplicate execution is harmless — an uncredentialed, stateless tool. A
+    /// timed-out call MAY be retried on the same provider, covering the
+    /// reply-channel first-reply race for ultra-fast handlers.
+    DuplicateSafe,
+    /// The invoke is **at-most-once** — a credentialed / stateful tool. A
+    /// timeout (which does not prove the call didn't execute) is surfaced
+    /// rather than retried, so a side effect — a created issue, a charge — is
+    /// never silently duplicated.
+    AtMostOnce,
+}
+
+impl InvokeSafety {
+    /// Derive the retry safety from a capability's wire-declared credential
+    /// status: only an uncredentialed (`none`) tool is duplicate-safe. This is a
+    /// resilience hint from the provider, NOT an authorization decision — the
+    /// consent gate never trusts a wire status, and mislabelling only risks a
+    /// provider duplicating a call to its own tool.
+    pub fn from_credential_status(status: &str) -> Self {
+        if status == "none" {
+            Self::DuplicateSafe
+        } else {
+            Self::AtMostOnce
+        }
+    }
+
+    /// Whether a timed-out call may be retried on the same provider.
+    pub fn allows_timeout_retry(self) -> bool {
+        matches!(self, Self::DuplicateSafe)
+    }
+}
+
 /// The single mesh-facing seam the shim depends on. Search + describe are
 /// reads against the daemon's capability index; invoke routes an nRPC
 /// `tools/call` to the provider and returns the [`CallToolResult`].
@@ -197,18 +237,12 @@ pub trait CapabilityGateway: Send + Sync {
     /// [`GatewayError::Denied`]; a tool-level failure is an `Ok`
     /// [`CallToolResult`] with `is_error = true`.
     ///
-    /// `duplicate_safe` states whether re-executing the tool is harmless (an
-    /// uncredentialed, stateless tool). When `true`, a timed-out call may be
-    /// retried on the same provider — covering the reply-channel first-reply
-    /// race for ultra-fast handlers. When `false`, the invoke is **at-most-once**:
-    /// a timeout (which does not prove the call didn't execute) is surfaced
-    /// rather than retried, so a credentialed side effect — a created issue, a
-    /// charge — is never silently duplicated.
+    /// `safety` selects the retry policy on a timeout — see [`InvokeSafety`].
     async fn invoke(
         &self,
         id: &CapabilityId,
         arguments: serde_json::Value,
-        duplicate_safe: bool,
+        safety: InvokeSafety,
     ) -> Result<CallToolResult, GatewayError>;
 }
 
@@ -271,5 +305,25 @@ mod tests {
             CapabilityId::parse("0x10/svc/sub").unwrap(),
             CapabilityId::new("16", "svc/sub"),
         );
+    }
+
+    #[test]
+    fn invoke_safety_derives_from_credential_status() {
+        // Only an uncredentialed tool is duplicate-safe (may retry a timeout).
+        assert_eq!(
+            InvokeSafety::from_credential_status("none"),
+            InvokeSafety::DuplicateSafe,
+        );
+        assert!(InvokeSafety::from_credential_status("none").allows_timeout_retry());
+        // Everything else — including a garbled / unknown status — is
+        // at-most-once, so a lost reply never duplicates a side effect.
+        for status in ["credentialed", "external_api", "unknown", "", "bogus"] {
+            assert_eq!(
+                InvokeSafety::from_credential_status(status),
+                InvokeSafety::AtMostOnce,
+                "{status:?} must be at-most-once",
+            );
+            assert!(!InvokeSafety::from_credential_status(status).allows_timeout_retry());
+        }
     }
 }

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use net_mcp::bridge::BRIDGE_PROVIDER_TAG;
-use net_mcp::serve::backend::{CapabilityGateway, CapabilityId, GatewayError};
+use net_mcp::serve::backend::{CapabilityGateway, CapabilityId, GatewayError, InvokeSafety};
 use net_mcp::serve::MeshGateway;
 use net_mcp::spec::{CallToolResult, Implementation};
 use net_mcp::wrap::{wrap_server, CredentialOverride, OwnerScope, Substitutability, WrapConfig};
@@ -128,7 +128,11 @@ async fn gateway_searches_describes_and_invokes_across_two_nodes() {
 
     // invoke — the wrapped tool round-trips the argument.
     let result = gateway
-        .invoke(&id, json!({ "message": "hi gateway" }), true)
+        .invoke(
+            &id,
+            json!({ "message": "hi gateway" }),
+            InvokeSafety::DuplicateSafe,
+        )
         .await
         .expect("invoke echo");
     assert!(!result.is_error, "{result:?}");
@@ -186,7 +190,13 @@ async fn a_gateway_outside_the_owner_scope_sees_nothing_and_cannot_invoke() {
     // a `Transport` timeout when the fast rejection outraces reply-subscription
     // setup; both are errors and neither yields a result.
     let id = CapabilityId::new(host_id.to_string(), "echo");
-    let outcome = gateway.invoke(&id, json!({ "message": "nope" }), true).await;
+    let outcome = gateway
+        .invoke(
+            &id,
+            json!({ "message": "nope" }),
+            InvokeSafety::DuplicateSafe,
+        )
+        .await;
     assert!(
         matches!(
             outcome,
@@ -228,7 +238,14 @@ fn substitutable_config(owner_origin: u64) -> WrapConfig {
 /// its reply to the reply-channel race even after the gateway's own retries.
 async fn invoke_retry(gateway: &MeshGateway, id: &CapabilityId, message: &str) -> CallToolResult {
     for _ in 0..6 {
-        if let Ok(result) = gateway.invoke(id, json!({ "message": message }), true).await {
+        if let Ok(result) = gateway
+            .invoke(
+                id,
+                json!({ "message": message }),
+                InvokeSafety::DuplicateSafe,
+            )
+            .await
+        {
             return result;
         }
         tokio::time::sleep(Duration::from_millis(150)).await;

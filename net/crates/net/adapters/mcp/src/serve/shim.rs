@@ -24,7 +24,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::backend::{CapabilityGateway, CapabilityId, GatewayError};
+use super::backend::{CapabilityGateway, CapabilityId, GatewayError, InvokeSafety};
 use super::consent::ConsentPolicy;
 use super::pins::PinStore;
 use super::{
@@ -476,14 +476,15 @@ impl<G: CapabilityGateway> Shim<G> {
         //     as the wrapper-denied message; a tool-level error rides back
         //     in the CallToolResult unchanged.
         //
-        //     `duplicate_safe`: only an uncredentialed tool may be retried on a
-        //     timeout — a credentialed one is at-most-once so a lost reply never
-        //     duplicates a real side effect. This is a resilience hint from the
-        //     provider's declared status, NOT the security gate above (which
-        //     never trusts a wire status): a provider mislabelling its own
-        //     stateful tool only risks duplicating a call to itself.
-        let duplicate_safe = detail.credential_status == "none";
-        match self.gateway.invoke(id, tool_args, duplicate_safe).await {
+        //     The retry policy is derived from the provider's declared status:
+        //     only an uncredentialed tool is duplicate-safe (may retry a
+        //     timeout); a credentialed one is at-most-once so a lost reply never
+        //     duplicates a real side effect. This is a resilience hint, NOT the
+        //     security gate above (which never trusts a wire status): a provider
+        //     mislabelling its own stateful tool only risks duplicating a call
+        //     to itself.
+        let safety = InvokeSafety::from_credential_status(&detail.credential_status);
+        match self.gateway.invoke(id, tool_args, safety).await {
             Ok(result) => result,
             Err(GatewayError::Denied(reason)) => {
                 CallToolResult::text_error(denied_message(&reason))
@@ -796,7 +797,7 @@ mod tests {
             &self,
             id: &CapabilityId,
             arguments: Value,
-            _duplicate_safe: bool,
+            _safety: InvokeSafety,
         ) -> Result<CallToolResult, GatewayError> {
             self.invoke_calls.fetch_add(1, Ordering::SeqCst);
             if self.find(id).is_none() {
@@ -1605,7 +1606,11 @@ mod tests {
         // or not the other is approved — and they never collide.
         let a = CapabilityId::new("nodeb", "a.b");
         let b = CapabilityId::new("nodeb", "a_b");
-        assert_eq!(safe_tool_name(&a), safe_tool_name(&b), "precondition: same base");
+        assert_eq!(
+            safe_tool_name(&a),
+            safe_tool_name(&b),
+            "precondition: same base"
+        );
         assert_eq!(
             assigned_name(&[a.clone()], &a),
             assigned_name(&[a.clone(), b.clone()], &a),
