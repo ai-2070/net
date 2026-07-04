@@ -1,0 +1,909 @@
+//! The stdio MCP **server** loop (`MCP_BRIDGE_PLAN.md` Phase 2, `serve/shim.rs`).
+//!
+//! [`Shim`] reads newline-delimited JSON-RPC from the host on one side and
+//! answers `initialize` / `tools/list` / `tools/call` on the other. Its
+//! `tools/list` is the meta-tool surface ([`super::meta_tools`]); its
+//! `tools/call` dispatches each `net_*` meta-tool through the
+//! [`CapabilityGateway`], applying pre-flight [`validation`](super::validation)
+//! and the [`consent`](super::consent) gate on the invoke path.
+//!
+//! **Serial by design (v0).** The shim processes one request at a time — a
+//! slow invoke blocks the next request. MCP hosts send one request and await,
+//! so this is correct and simple; request pipelining is a later refinement.
+//!
+//! The shim holds no mesh identity or socket — everything mesh-facing is the
+//! gateway's job (doctrine #4). It is transport-generic over any
+//! `AsyncBufRead` / `AsyncWrite`, so tests drive it over an in-memory pipe and
+//! the CLI drives it over real stdio.
+
+use serde::Serialize;
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+
+use super::backend::{CapabilityGateway, CapabilityId, GatewayError};
+use super::consent::ConsentPolicy;
+use super::{
+    meta_tools, requires_approval_message, validation, MSG_DENIED_BY_WRAPPER, MSG_NO_CAPABILITIES,
+};
+use crate::spec::{
+    method, CallToolParams, CallToolResult, Implementation, IncomingKind, IncomingMessage,
+    JsonRpcErrorResponse, JsonRpcSuccess, RequestId, INVALID_PARAMS, INVALID_REQUEST,
+    METHOD_NOT_FOUND, PARSE_ERROR, PROTOCOL_VERSION,
+};
+
+/// The demand-side shim: a stdio MCP server exposing the mesh's capabilities
+/// as meta-tools, backed by a [`CapabilityGateway`].
+pub struct Shim<G> {
+    gateway: G,
+    consent: ConsentPolicy,
+    server_info: Implementation,
+    /// Set once the host sends `notifications/initialized`. Tracked for
+    /// completeness; the stateless shim answers regardless.
+    initialized: bool,
+}
+
+impl<G: CapabilityGateway> Shim<G> {
+    /// Build a shim over `gateway` with an empty consent policy.
+    pub fn new(gateway: G) -> Self {
+        Self {
+            gateway,
+            consent: ConsentPolicy::new(),
+            server_info: Implementation {
+                name: "net".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+            initialized: false,
+        }
+    }
+
+    /// Install a consent policy (config allowlist + any pins).
+    pub fn with_consent(mut self, consent: ConsentPolicy) -> Self {
+        self.consent = consent;
+        self
+    }
+
+    /// Run the server loop until the host closes stdin (EOF). Each non-empty
+    /// input line is handled; requests produce exactly one response line,
+    /// notifications produce none.
+    pub async fn serve<R, W>(mut self, reader: R, mut writer: W) -> std::io::Result<()>
+    where
+        R: AsyncBufRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let mut lines = reader.lines();
+        while let Some(line) = lines.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Some(response) = self.handle_line(&line).await {
+                writer.write_all(response.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle one raw line. Returns the response line to write, or `None` for
+    /// notifications / stray responses that need no reply.
+    async fn handle_line(&mut self, line: &str) -> Option<String> {
+        let msg: IncomingMessage = match serde_json::from_str(line) {
+            Ok(m) => m,
+            Err(e) => {
+                return Some(error_line(
+                    None,
+                    PARSE_ERROR,
+                    format!("parse error: invalid JSON ({e})"),
+                ));
+            }
+        };
+
+        match msg.kind() {
+            IncomingKind::Notification => {
+                self.handle_notification(&msg);
+                None
+            }
+            // The compat-tier shim never sends server→client requests, so any
+            // response the host sends is unexpected — ignore it silently.
+            IncomingKind::Response => None,
+            IncomingKind::Malformed => Some(error_line(
+                msg.id.clone(),
+                INVALID_REQUEST,
+                "invalid request: missing `method`",
+            )),
+            IncomingKind::Request => match (msg.method.clone(), msg.id.clone()) {
+                (Some(m), Some(id)) => Some(self.handle_request(id, &m, msg.params).await),
+                // Unreachable given `kind() == Request`, but no panic.
+                _ => None,
+            },
+        }
+    }
+
+    fn handle_notification(&mut self, msg: &IncomingMessage) {
+        if msg.method.as_deref() == Some(method::INITIALIZED) {
+            self.initialized = true;
+        }
+        // `notifications/cancelled`, `tools/list_changed`, … — nothing to do.
+    }
+
+    async fn handle_request(
+        &mut self,
+        id: RequestId,
+        method: &str,
+        params: Option<Value>,
+    ) -> String {
+        match method {
+            method::INITIALIZE => {
+                // The client sends `notifications/initialized` next; be lenient
+                // and answer regardless of handshake ordering.
+                let result = json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    // We serve tools/list; listChanged notifications land with
+                    // pin promotion (Phase 3).
+                    "capabilities": { "tools": {} },
+                    "serverInfo": to_value_or_null(&self.server_info),
+                    "instructions": "Net mesh capability bridge. Use net_search_capabilities \
+                                     to find tools on the mesh, net_describe_capability for a \
+                                     tool's schema, then net_invoke_capability to run it.",
+                });
+                success_line(id, result)
+            }
+            method::TOOLS_LIST => {
+                let tools = to_value_or_null(&meta_tools::meta_tools());
+                success_line(id, json!({ "tools": tools }))
+            }
+            method::TOOLS_CALL => self.handle_tools_call(id, params).await,
+            other => error_line(
+                Some(id),
+                METHOD_NOT_FOUND,
+                format!("method not found: {other}"),
+            ),
+        }
+    }
+
+    /// `tools/call` always resolves to a JSON-RPC **success** carrying a
+    /// [`CallToolResult`] — a bad tool name or a failed call is reported
+    /// in-band via `is_error`, so the model sees the message. Only malformed
+    /// `params` (not a valid `tools/call` shape) is a protocol-level error.
+    async fn handle_tools_call(&self, id: RequestId, params: Option<Value>) -> String {
+        let params = match params {
+            Some(p) => p,
+            None => return error_line(Some(id), INVALID_PARAMS, "tools/call requires params"),
+        };
+        let call: CallToolParams = match serde_json::from_value(params) {
+            Ok(c) => c,
+            Err(e) => {
+                return error_line(
+                    Some(id),
+                    INVALID_PARAMS,
+                    format!("invalid tools/call params: {e}"),
+                )
+            }
+        };
+
+        let result = self.dispatch_meta_tool(&call.name, &call.arguments).await;
+        success_line(id, to_value_or_null(&result))
+    }
+
+    /// Route a `tools/call` for a meta-tool to its handler. Unknown names
+    /// return an in-band tool error listing the available meta-tools.
+    async fn dispatch_meta_tool(&self, name: &str, args: &Value) -> CallToolResult {
+        match name {
+            n if n == meta_tools::name::SEARCH => self.tool_search(args).await,
+            n if n == meta_tools::name::DESCRIBE => self.tool_describe(args).await,
+            n if n == meta_tools::name::INVOKE => self.tool_invoke(args).await,
+            n if n == meta_tools::name::LIST_PINNED => self.tool_list_pinned(),
+            n if n == meta_tools::name::REQUEST_PIN => self.tool_request_pin(args),
+            other => CallToolResult::text_error(format!(
+                "unknown tool `{other}`. This server exposes meta-tools only: \
+                 {}, {}, {}, {}, {}. Use net_search_capabilities to find mesh tools.",
+                meta_tools::name::SEARCH,
+                meta_tools::name::DESCRIBE,
+                meta_tools::name::INVOKE,
+                meta_tools::name::LIST_PINNED,
+                meta_tools::name::REQUEST_PIN,
+            )),
+        }
+    }
+
+    async fn tool_search(&self, args: &Value) -> CallToolResult {
+        let query = match str_arg(args, "query") {
+            Ok(q) => q,
+            Err(e) => return CallToolResult::text_error(e),
+        };
+        let summaries = match self.gateway.search(&query).await {
+            Ok(s) => s,
+            Err(e) => return CallToolResult::text_error(gateway_error_text(&e)),
+        };
+        if summaries.is_empty() {
+            return CallToolResult::text_ok(MSG_NO_CAPABILITIES);
+        }
+        let rows: Vec<Value> = summaries
+            .iter()
+            .map(|s| {
+                json!({
+                    "cap_id": s.id.display(),
+                    "name": s.name,
+                    "description": s.description,
+                    "compat_tier": s.compat_tier,
+                    "credential_status": s.credential_status,
+                    "requires_approval": self
+                        .consent
+                        .requires_approval(&s.id, &s.credential_status),
+                })
+            })
+            .collect();
+        json_result(json!({ "capabilities": rows }))
+    }
+
+    async fn tool_describe(&self, args: &Value) -> CallToolResult {
+        let id = match parse_cap_id_arg(args) {
+            Ok(id) => id,
+            Err(e) => return CallToolResult::text_error(e),
+        };
+        let detail = match self.gateway.describe(&id).await {
+            Ok(d) => d,
+            Err(e) => return CallToolResult::text_error(gateway_error_text(&e)),
+        };
+        json_result(json!({
+            "cap_id": detail.id.display(),
+            "name": detail.name,
+            "description": detail.description,
+            "input_schema": detail.input_schema,
+            "output_schema": detail.output_schema,
+            "compat_tier": detail.compat_tier,
+            "credential_status": detail.credential_status,
+            "substitutability": detail.substitutability,
+            "version": detail.version,
+            "requires_approval": self
+                .consent
+                .requires_approval(&detail.id, &detail.credential_status),
+        }))
+    }
+
+    async fn tool_invoke(&self, args: &Value) -> CallToolResult {
+        let id = match parse_cap_id_arg(args) {
+            Ok(id) => id,
+            Err(e) => return CallToolResult::text_error(e),
+        };
+        // The nested tool arguments; absent means "no arguments".
+        let tool_args = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+
+        // Describe first — the single source of truth for the schema (for
+        // pre-flight validation) and the credential status (for consent).
+        let detail = match self.gateway.describe(&id).await {
+            Ok(d) => d,
+            Err(e) => return CallToolResult::text_error(gateway_error_text(&e)),
+        };
+
+        // [1] Pre-flight validation — never round-trip a bad arg to the
+        //     provider. Field-naming so the model can self-repair.
+        if let Err(v) = validation::validate_args(&tool_args, &detail.input_schema) {
+            return CallToolResult::text_error(format!(
+                "argument validation failed: {v}. See net_describe_capability for the schema.",
+            ));
+        }
+
+        // [2] Consent gate — credentialed / external / unknown need local
+        //     approval. Display never implied invocation.
+        if self
+            .consent
+            .requires_approval(&id, &detail.credential_status)
+        {
+            return CallToolResult::text_error(requires_approval_message(&id.display()));
+        }
+
+        // [3] Route to the provider. A remote owner-scope rejection surfaces
+        //     as the wrapper-denied message; a tool-level error rides back
+        //     in the CallToolResult unchanged.
+        match self.gateway.invoke(&id, tool_args).await {
+            Ok(result) => result,
+            Err(GatewayError::Denied(reason)) => {
+                CallToolResult::text_error(denied_message(&reason))
+            }
+            Err(e) => CallToolResult::text_error(gateway_error_text(&e)),
+        }
+    }
+
+    fn tool_list_pinned(&self) -> CallToolResult {
+        let pinned: Vec<String> = self.consent.pinned().map(|id| id.display()).collect();
+        json_result(json!({ "pinned": pinned }))
+    }
+
+    fn tool_request_pin(&self, args: &Value) -> CallToolResult {
+        let id = match parse_cap_id_arg(args) {
+            Ok(id) => id,
+            Err(e) => return CallToolResult::text_error(e),
+        };
+        // v0: creating the pending request + persisting it is Phase 3. Here we
+        // return the out-of-band approval instructions so the model learns the
+        // consent step it cannot perform itself.
+        CallToolResult::text_ok(format!(
+            "Pin requested for `{}`. A human must approve it out of band before it \
+             becomes usable: run `net mcp pin approve {}`. Requesting a pin grants \
+             no access by itself.",
+            id.display(),
+            id.display(),
+        ))
+    }
+}
+
+// --- free helpers ----------------------------------------------------------
+
+/// Serialize to a JSON line, falling back to a canned internal-error line if
+/// serialization somehow fails (it does not for these types) — never panics.
+fn line_of<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| {
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal serialization error"}}"#
+            .to_string()
+    })
+}
+
+/// A JSON-RPC success response line.
+fn success_line(id: RequestId, result: Value) -> String {
+    line_of(&JsonRpcSuccess::new(id, result))
+}
+
+/// A JSON-RPC error response line.
+fn error_line(id: Option<RequestId>, code: i64, message: impl Into<String>) -> String {
+    line_of(&JsonRpcErrorResponse::new(id, code, message))
+}
+
+/// Serialize a value to JSON, falling back to `null` (never panics). Used for
+/// the `result` payloads, which are structurally guaranteed to serialize.
+fn to_value_or_null<T: Serialize>(value: &T) -> Value {
+    serde_json::to_value(value).unwrap_or(Value::Null)
+}
+
+/// Wrap a JSON data object as a successful `CallToolResult`: a pretty-printed
+/// text block (so hosts without structured support still see everything) plus
+/// the machine-readable `structured_content`.
+fn json_result(data: Value) -> CallToolResult {
+    let text = serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string());
+    CallToolResult {
+        content: vec![json!({ "type": "text", "text": text })],
+        is_error: false,
+        structured_content: Some(data),
+    }
+}
+
+/// Extract a required string argument from a meta-tool's arguments object.
+fn str_arg(args: &Value, field: &str) -> Result<String, String> {
+    args.get(field)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("missing or non-string argument `{field}`"))
+}
+
+/// Extract and parse the `cap_id` argument into a [`CapabilityId`].
+fn parse_cap_id_arg(args: &Value) -> Result<CapabilityId, String> {
+    let raw = str_arg(args, "cap_id")?;
+    CapabilityId::parse(&raw).map_err(|e| e.to_string())
+}
+
+/// Map a gateway error to the model-facing message, using the plan's exact
+/// strings where they apply.
+fn gateway_error_text(e: &GatewayError) -> String {
+    match e {
+        GatewayError::NoDaemon => super::MSG_NO_DAEMON.to_string(),
+        GatewayError::Denied(reason) => denied_message(reason),
+        GatewayError::NotFound(id) => format!("no capability found for `{id}`"),
+        GatewayError::Transport(m) => format!("transport error reaching the mesh: {m}"),
+        GatewayError::Other(m) => m.clone(),
+    }
+}
+
+/// The wrapper-denied message. When the reason is the canonical owner-scope
+/// rejection this reproduces [`MSG_DENIED_BY_WRAPPER`] verbatim; otherwise it
+/// carries the wrapper's specific reason.
+fn denied_message(reason: &str) -> String {
+    let reason = reason.trim().trim_end_matches('.');
+    if reason == "caller root identity does not match owner scope" {
+        return MSG_DENIED_BY_WRAPPER.to_string();
+    }
+    format!("Denied by remote wrapper: {reason}.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serve::backend::{CapabilityDetail, CapabilitySummary};
+    use crate::serve::consent::ConsentPolicy;
+    use async_trait::async_trait;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    // --- in-memory gateway ------------------------------------------------
+
+    #[derive(Clone)]
+    struct InMemoryGateway {
+        caps: Vec<CapabilityDetail>,
+        deny: HashSet<String>,
+        invoke_calls: Arc<AtomicUsize>,
+    }
+
+    impl InMemoryGateway {
+        fn new(caps: Vec<CapabilityDetail>) -> Self {
+            Self {
+                caps,
+                deny: HashSet::new(),
+                invoke_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+        fn deny(mut self, id: &str) -> Self {
+            self.deny.insert(id.to_string());
+            self
+        }
+        fn find(&self, id: &CapabilityId) -> Option<&CapabilityDetail> {
+            self.caps.iter().find(|c| &c.id == id)
+        }
+    }
+
+    #[async_trait]
+    impl CapabilityGateway for InMemoryGateway {
+        async fn search(&self, query: &str) -> Result<Vec<CapabilitySummary>, GatewayError> {
+            let q = query.to_lowercase();
+            Ok(self
+                .caps
+                .iter()
+                .filter(|c| {
+                    c.id.display().to_lowercase().contains(&q)
+                        || c.name.to_lowercase().contains(&q)
+                        || c.description
+                            .as_deref()
+                            .map(|d| d.to_lowercase().contains(&q))
+                            .unwrap_or(false)
+                })
+                .map(|c| CapabilitySummary {
+                    id: c.id.clone(),
+                    name: c.name.clone(),
+                    description: c.description.clone(),
+                    compat_tier: c.compat_tier.clone(),
+                    credential_status: c.credential_status.clone(),
+                })
+                .collect())
+        }
+
+        async fn describe(&self, id: &CapabilityId) -> Result<CapabilityDetail, GatewayError> {
+            self.find(id)
+                .cloned()
+                .ok_or_else(|| GatewayError::NotFound(id.display()))
+        }
+
+        async fn invoke(
+            &self,
+            id: &CapabilityId,
+            arguments: Value,
+        ) -> Result<CallToolResult, GatewayError> {
+            self.invoke_calls.fetch_add(1, Ordering::SeqCst);
+            if self.find(id).is_none() {
+                return Err(GatewayError::NotFound(id.display()));
+            }
+            if self.deny.contains(&id.display()) {
+                return Err(GatewayError::Denied(
+                    "caller root identity does not match owner scope".to_string(),
+                ));
+            }
+            Ok(CallToolResult::text_ok(format!(
+                "invoked {} with {}",
+                id.display(),
+                arguments
+            )))
+        }
+    }
+
+    fn detail(id: &str, cred: &str, schema: Value) -> CapabilityDetail {
+        let cap = CapabilityId::parse(id).unwrap();
+        CapabilityDetail {
+            id: cap,
+            name: format!("{} tool", id),
+            description: Some(format!("does {id}")),
+            input_schema: schema,
+            output_schema: None,
+            compat_tier: "mcp_bridge".to_string(),
+            credential_status: cred.to_string(),
+            substitutability: "provider_local".to_string(),
+            version: "1.0.0".to_string(),
+        }
+    }
+
+    fn echo_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": { "message": { "type": "string" } },
+            "required": ["message"]
+        })
+    }
+
+    // --- harness ----------------------------------------------------------
+
+    /// Drive the shim over an in-memory duplex: feed `input` lines, collect
+    /// every response line as parsed JSON.
+    async fn run(gateway: InMemoryGateway, consent: ConsentPolicy, input: &[Value]) -> Vec<Value> {
+        let lines: Vec<String> = input.iter().map(|v| v.to_string()).collect();
+        run_raw(gateway, consent, &lines).await
+    }
+
+    /// Like [`run`] but with raw (possibly non-JSON) input lines.
+    async fn run_raw(
+        gateway: InMemoryGateway,
+        consent: ConsentPolicy,
+        lines: &[String],
+    ) -> Vec<Value> {
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let (server_rd, server_wr) = tokio::io::split(server);
+        let shim = Shim::new(gateway).with_consent(consent);
+        let handle =
+            tokio::spawn(async move { shim.serve(BufReader::new(server_rd), server_wr).await });
+
+        let (client_rd, mut client_wr) = tokio::io::split(client);
+        for line in lines {
+            client_wr.write_all(line.as_bytes()).await.unwrap();
+            client_wr.write_all(b"\n").await.unwrap();
+        }
+        // `shutdown` (not a bare drop) closes the write direction so the shim's
+        // read loop sees EOF — a dropped split half leaves the duplex open.
+        client_wr.shutdown().await.unwrap();
+        drop(client_wr);
+
+        let mut out = Vec::new();
+        let mut resp = BufReader::new(client_rd).lines();
+        while let Some(line) = resp.next_line().await.unwrap() {
+            out.push(serde_json::from_str::<Value>(&line).unwrap());
+        }
+        handle.await.unwrap().unwrap();
+        out
+    }
+
+    fn req(id: i64, method: &str, params: Value) -> Value {
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+    }
+
+    fn call(id: i64, tool: &str, arguments: Value) -> Value {
+        req(
+            id,
+            method::TOOLS_CALL,
+            json!({ "name": tool, "arguments": arguments }),
+        )
+    }
+
+    /// The `CallToolResult` inside a `tools/call` success response.
+    fn tool_result(resp: &Value) -> CallToolResult {
+        serde_json::from_value(resp["result"].clone()).unwrap()
+    }
+
+    fn gateway_with_echo_and_secret() -> InMemoryGateway {
+        InMemoryGateway::new(vec![
+            detail("nodeb/echo", "none", echo_schema()),
+            detail("nodeb/secret", "credentialed", echo_schema()),
+        ])
+    }
+
+    // --- tests ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn initialize_advertises_protocol_and_lists_meta_tools() {
+        let out = run(
+            gateway_with_echo_and_secret(),
+            ConsentPolicy::new(),
+            &[
+                req(1, method::INITIALIZE, json!({})),
+                json!({ "jsonrpc": "2.0", "method": method::INITIALIZED }),
+                req(2, method::TOOLS_LIST, json!({})),
+            ],
+        )
+        .await;
+
+        // The notification produces no response, so two responses for ids 1, 2.
+        assert_eq!(out.len(), 2, "got {out:?}");
+        assert_eq!(out[0]["id"], 1);
+        assert_eq!(out[0]["result"]["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(out[0]["result"]["serverInfo"]["name"], "net");
+
+        assert_eq!(out[1]["id"], 2);
+        let tools = out[1]["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 5);
+        assert!(tools.iter().any(|t| t["name"] == meta_tools::name::SEARCH));
+    }
+
+    #[tokio::test]
+    async fn string_request_id_is_echoed_back() {
+        let out = run_raw(
+            gateway_with_echo_and_secret(),
+            ConsentPolicy::new(),
+            &[json!({ "jsonrpc": "2.0", "id": "abc", "method": method::TOOLS_LIST }).to_string()],
+        )
+        .await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["id"], "abc", "string ids reflect back verbatim");
+    }
+
+    #[tokio::test]
+    async fn unknown_method_is_method_not_found() {
+        let out = run(
+            gateway_with_echo_and_secret(),
+            ConsentPolicy::new(),
+            &[req(9, "does/not/exist", json!({}))],
+        )
+        .await;
+        assert_eq!(out[0]["error"]["code"], METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn malformed_json_is_parse_error_with_null_id() {
+        let out = run_raw(
+            gateway_with_echo_and_secret(),
+            ConsentPolicy::new(),
+            &["{ this is not json".to_string()],
+        )
+        .await;
+        assert_eq!(out[0]["error"]["code"], PARSE_ERROR);
+        assert_eq!(out[0]["id"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn notification_produces_no_response() {
+        let out = run(
+            gateway_with_echo_and_secret(),
+            ConsentPolicy::new(),
+            &[json!({ "jsonrpc": "2.0", "method": method::INITIALIZED })],
+        )
+        .await;
+        assert!(out.is_empty(), "notifications get no reply: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn search_returns_rows_with_requires_approval_flags() {
+        let out = run(
+            gateway_with_echo_and_secret(),
+            ConsentPolicy::new(),
+            &[call(1, meta_tools::name::SEARCH, json!({ "query": "" }))],
+        )
+        .await;
+        let result = tool_result(&out[0]);
+        assert!(!result.is_error);
+        let caps = result.structured_content.unwrap()["capabilities"].clone();
+        let caps = caps.as_array().unwrap();
+        assert_eq!(caps.len(), 2);
+        let echo = caps.iter().find(|c| c["cap_id"] == "nodeb/echo").unwrap();
+        assert_eq!(echo["requires_approval"], false, "none ⇒ no approval");
+        let secret = caps.iter().find(|c| c["cap_id"] == "nodeb/secret").unwrap();
+        assert_eq!(
+            secret["requires_approval"], true,
+            "credentialed ⇒ requires approval",
+        );
+    }
+
+    #[tokio::test]
+    async fn search_empty_returns_the_no_capabilities_message() {
+        let out = run(
+            InMemoryGateway::new(vec![]),
+            ConsentPolicy::new(),
+            &[call(
+                1,
+                meta_tools::name::SEARCH,
+                json!({ "query": "anything" }),
+            )],
+        )
+        .await;
+        let result = tool_result(&out[0]);
+        assert!(!result.is_error);
+        assert_eq!(result.text(), MSG_NO_CAPABILITIES);
+    }
+
+    #[tokio::test]
+    async fn describe_returns_schema_and_status() {
+        let out = run(
+            gateway_with_echo_and_secret(),
+            ConsentPolicy::new(),
+            &[call(
+                1,
+                meta_tools::name::DESCRIBE,
+                json!({ "cap_id": "nodeb/echo" }),
+            )],
+        )
+        .await;
+        let result = tool_result(&out[0]);
+        let data = result.structured_content.unwrap();
+        assert_eq!(data["cap_id"], "nodeb/echo");
+        assert_eq!(data["credential_status"], "none");
+        assert_eq!(data["input_schema"]["type"], "object");
+    }
+
+    #[tokio::test]
+    async fn invoke_uncredentialed_runs_the_tool() {
+        let out = run(
+            gateway_with_echo_and_secret(),
+            ConsentPolicy::new(),
+            &[call(
+                1,
+                meta_tools::name::INVOKE,
+                json!({ "cap_id": "nodeb/echo", "arguments": { "message": "hi" } }),
+            )],
+        )
+        .await;
+        let result = tool_result(&out[0]);
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.text().contains("invoked nodeb/echo"));
+    }
+
+    #[tokio::test]
+    async fn invoke_credentialed_is_blocked_pending_approval() {
+        let gw = gateway_with_echo_and_secret();
+        let calls = gw.invoke_calls.clone();
+        let out = run(
+            gw,
+            ConsentPolicy::new(),
+            &[call(
+                1,
+                meta_tools::name::INVOKE,
+                json!({ "cap_id": "nodeb/secret", "arguments": { "message": "x" } }),
+            )],
+        )
+        .await;
+        let result = tool_result(&out[0]);
+        assert!(result.is_error);
+        assert!(
+            result.text().contains("net mcp pin approve nodeb/secret"),
+            "{}",
+            result.text(),
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a blocked call must never reach the provider",
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_after_pin_reaches_the_provider() {
+        let mut consent = ConsentPolicy::new();
+        consent.pin(CapabilityId::parse("nodeb/secret").unwrap());
+        let out = run(
+            gateway_with_echo_and_secret(),
+            consent,
+            &[call(
+                1,
+                meta_tools::name::INVOKE,
+                json!({ "cap_id": "nodeb/secret", "arguments": { "message": "x" } }),
+            )],
+        )
+        .await;
+        let result = tool_result(&out[0]);
+        assert!(!result.is_error, "pinned ⇒ invocable: {result:?}");
+        assert!(result.text().contains("invoked nodeb/secret"));
+    }
+
+    #[tokio::test]
+    async fn invoke_with_bad_args_fails_validation_before_provider() {
+        let gw = gateway_with_echo_and_secret();
+        let calls = gw.invoke_calls.clone();
+        let out = run(
+            gw,
+            ConsentPolicy::new(),
+            // `message` is required + must be a string; send a number.
+            &[call(
+                1,
+                meta_tools::name::INVOKE,
+                json!({ "cap_id": "nodeb/echo", "arguments": { "message": 42 } }),
+            )],
+        )
+        .await;
+        let result = tool_result(&out[0]);
+        assert!(result.is_error);
+        assert!(
+            result.text().contains("validation failed") && result.text().contains("message"),
+            "{}",
+            result.text(),
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "validation failure must not reach the provider",
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_denied_by_wrapper_surfaces_the_exact_message() {
+        // An uncredentialed cap (passes consent) whose provider denies on
+        // owner scope — the demand side reports the wrapper's rejection.
+        let gw = InMemoryGateway::new(vec![detail("nodeb/echo", "none", echo_schema())])
+            .deny("nodeb/echo");
+        let out = run(
+            gw,
+            ConsentPolicy::new(),
+            &[call(
+                1,
+                meta_tools::name::INVOKE,
+                json!({ "cap_id": "nodeb/echo", "arguments": { "message": "x" } }),
+            )],
+        )
+        .await;
+        let result = tool_result(&out[0]);
+        assert!(result.is_error);
+        assert_eq!(result.text(), MSG_DENIED_BY_WRAPPER);
+    }
+
+    #[tokio::test]
+    async fn request_pin_returns_out_of_band_instructions() {
+        let out = run(
+            gateway_with_echo_and_secret(),
+            ConsentPolicy::new(),
+            &[call(
+                1,
+                meta_tools::name::REQUEST_PIN,
+                json!({ "cap_id": "nodeb/secret" }),
+            )],
+        )
+        .await;
+        let result = tool_result(&out[0]);
+        assert!(!result.is_error);
+        assert!(result.text().contains("net mcp pin approve nodeb/secret"));
+        assert!(result.text().contains("grants no access"));
+    }
+
+    #[tokio::test]
+    async fn list_pinned_reflects_the_consent_policy() {
+        let mut consent = ConsentPolicy::new();
+        consent.pin(CapabilityId::parse("nodeb/secret").unwrap());
+        let out = run(
+            gateway_with_echo_and_secret(),
+            consent,
+            &[call(1, meta_tools::name::LIST_PINNED, json!({}))],
+        )
+        .await;
+        let result = tool_result(&out[0]);
+        let pinned = result.structured_content.unwrap()["pinned"].clone();
+        assert_eq!(pinned, json!(["nodeb/secret"]));
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_name_is_an_in_band_error() {
+        let out = run(
+            gateway_with_echo_and_secret(),
+            ConsentPolicy::new(),
+            &[call(1, "net_not_a_tool", json!({}))],
+        )
+        .await;
+        let result = tool_result(&out[0]);
+        assert!(result.is_error);
+        assert!(result.text().contains("meta-tools only"));
+    }
+
+    #[tokio::test]
+    async fn invoke_of_unknown_capability_reports_not_found() {
+        let out = run(
+            gateway_with_echo_and_secret(),
+            ConsentPolicy::new(),
+            &[call(
+                1,
+                meta_tools::name::INVOKE,
+                json!({ "cap_id": "ghost/missing", "arguments": {} }),
+            )],
+        )
+        .await;
+        let result = tool_result(&out[0]);
+        assert!(result.is_error);
+        assert!(result.text().contains("no capability found"));
+    }
+
+    #[tokio::test]
+    async fn several_requests_stream_in_order() {
+        let out = run(
+            gateway_with_echo_and_secret(),
+            ConsentPolicy::new(),
+            &[
+                req(1, method::INITIALIZE, json!({})),
+                req(2, method::TOOLS_LIST, json!({})),
+                call(3, meta_tools::name::SEARCH, json!({ "query": "echo" })),
+            ],
+        )
+        .await;
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["id"], 1);
+        assert_eq!(out[1]["id"], 2);
+        assert_eq!(out[2]["id"], 3);
+    }
+}

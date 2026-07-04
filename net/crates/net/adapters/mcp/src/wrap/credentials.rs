@@ -37,6 +37,22 @@ impl CredentialStatus {
         }
     }
 
+    /// Parse the wire/tag form back to a status — the demand side (`net mcp
+    /// serve`) reads it off a discovered capability's metadata to decide
+    /// consent. Any unrecognised or missing string maps to [`Self::Unknown`]
+    /// (the spicy default, never `None`), so a garbled or absent status can
+    /// only ever *over*-gate, never bypass consent — the same conservative
+    /// rule detection follows.
+    pub fn from_wire(s: &str) -> Self {
+        match s {
+            "credentialed" => CredentialStatus::Credentialed,
+            "external_api" => CredentialStatus::ExternalApi,
+            "none" => CredentialStatus::None,
+            // "unknown" and anything unrecognised — spicy until proven boring.
+            _ => CredentialStatus::Unknown,
+        }
+    }
+
     /// Does invoking this capability require local consent (an allowlist
     /// entry or an approved pin)? Everything except an explicitly-boring
     /// `None` is gated — credentialed, external, and unknown alike.
@@ -273,6 +289,24 @@ mod tests {
         .unwrap();
         assert_eq!(ok, CredentialStatus::None);
         assert!(!ok.requires_consent(), "explicitly boring ⇒ not gated");
+    }
+
+    #[test]
+    fn from_wire_round_trips_and_defaults_unknown_to_spicy() {
+        for status in [
+            CredentialStatus::Credentialed,
+            CredentialStatus::ExternalApi,
+            CredentialStatus::Unknown,
+            CredentialStatus::None,
+        ] {
+            assert_eq!(CredentialStatus::from_wire(status.as_str()), status);
+        }
+        // A garbled or absent status is gated like credentialed, never None.
+        for garbled in ["", "bogus", "credentialed ", "None", "UNKNOWN"] {
+            let parsed = CredentialStatus::from_wire(garbled);
+            assert_eq!(parsed, CredentialStatus::Unknown, "{garbled:?}");
+            assert!(parsed.requires_consent());
+        }
     }
 
     /// The safety invariant: detection can never yield the ungated `None`.

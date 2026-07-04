@@ -18,9 +18,11 @@
 //!   `net_sdk::tool::ToolDescriptor` + MCP-bridge metadata.
 //!
 //! The single mesh-facing dependency is `net-mesh-sdk` (doctrine #1); the
-//! `ToolDescriptor` lowering target comes from its `tool` feature. Still to
-//! land: the nRPC → `tools/call` bridge, the announce/serve wiring, and the
-//! `serve` shim (Phase 2).
+//! `ToolDescriptor` lowering target comes from its `tool` feature.
+//! - [`serve`] — the demand side: the [`serve::Shim`] stdio MCP **server**
+//!   that exposes the mesh's capabilities to a local MCP host as meta-tools,
+//!   with pre-flight validation and a shim-side consent gate (Phase 2).
 
+pub mod serve;
 pub mod spec;
 pub mod wrap;
