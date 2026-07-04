@@ -173,8 +173,13 @@ impl LockGuard {
 }
 
 // On-disk shape: a versioned wrapper around the policy so a future schema bump
-// is not a breaking format change.
+// is not a breaking format change. `deny_unknown_fields` so a typo'd top-level
+// field (e.g. a mis-spelled security key) fails closed rather than being
+// silently ignored — matching the inner `ForwardingConfig`. A genuine future
+// format adds fields under a bumped `schema_version`, which the load-time
+// version check already rejects for this build.
 #[derive(Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct ForwardingFile {
     #[serde(default = "default_schema_version")]
     schema_version: u32,
@@ -855,6 +860,20 @@ mod tests {
             serde_json::json!({ "schema_version": 999, "forwarding": { "enabled": false } });
         assert!(matches!(
             load_json(future).await.unwrap_err(),
+            StoreError::Corrupt { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn load_rejects_an_unknown_top_level_field() {
+        // A typo'd top-level field must fail closed, not be silently ignored.
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "forwarding": { "enabled": false },
+            "enabledd": true
+        });
+        assert!(matches!(
+            load_json(json).await.unwrap_err(),
             StoreError::Corrupt { .. }
         ));
     }
