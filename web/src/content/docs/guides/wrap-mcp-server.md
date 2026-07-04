@@ -43,7 +43,10 @@ net wrap github \
   scoping keys on it, so use a stable identity, not an ephemeral key.
 - `--env KEY=VALUE` (repeatable) sets environment for the child server. **These
   stay in the child process on this machine and never transit the mesh** — this is
-  how credentials stay local.
+  how credentials stay local. The one deliberate exception, for remote/HTTP
+  destinations that only speak bearer auth, is opt-in, deny-by-default
+  [credential forwarding](/docs/reference/mcp-bridge#credential-forwarding-opt-in-deny-by-default);
+  a wrapped stdio server like this one never forwards.
 
 `net wrap` is long-running. It emits a `wrapped` event (the served + skipped
 tools, the announced visibility/scope, and any widened origins), then a

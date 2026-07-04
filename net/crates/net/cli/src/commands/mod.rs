@@ -19,6 +19,7 @@ pub mod channel;
 pub mod completion;
 pub mod daemon;
 pub mod db;
+pub mod forwarding;
 pub mod gateway;
 pub mod ice;
 pub mod identity;

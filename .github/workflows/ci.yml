@@ -1446,6 +1446,16 @@ jobs:
       - name: Run clippy (production code, strict)
         run: cargo clippy -p net-mesh-mcp --lib --bins --features fixture -- -D warnings
 
+      # The `keychain` feature (OS-keychain secret value backend for credential
+      # forwarding) is non-default — the published artifact and the tests
+      # below never compile it. Build-check it here so its Linux path
+      # (pure-Rust kernel keyutils; no libdbus / C system lib) can't silently
+      # rot. It is a compile/lint check only, not a test run: the keychain
+      # tests need a usable keyring, so building is what catches a break.
+      - name: Run clippy (keychain feature, compile check)
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p net-mesh-mcp --lib --features keychain -- -D warnings
+
       - name: Run net-mesh-mcp tests
         if: ${{ !cancelled() }}
         run: cargo test -p net-mesh-mcp --features fixture

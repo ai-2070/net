@@ -5,7 +5,7 @@ Read this when the user wants to **bridge Model Context Protocol (MCP) tools ove
 - **Supply side (`net wrap`)** — take an existing local stdio MCP server (a `npx`/`uvx` package, an internal tool) and expose its tools as **owner-scoped mesh capabilities** that other nodes can discover and invoke.
 - **Demand side (`net mcp serve`)** — expose the mesh's capabilities to a **local MCP host** (Claude Code, Cursor, …) as a stdio MCP server, so the model can search, describe, invoke, and **pin** tools that live on other machines.
 
-Triggers: "MCP", "wrap an MCP server", "bridge MCP over the mesh", "expose mesh tools to Claude Code / Cursor", "net wrap", "net mcp serve", "pin a capability", "net mcp pin", "capability federation".
+Triggers: "MCP", "wrap an MCP server", "bridge MCP over the mesh", "expose mesh tools to Claude Code / Cursor", "net wrap", "net mcp serve", "pin a capability", "net mcp pin", "capability federation", "net forwarding", "credential forwarding", "forward a bearer token / `Authorization` header", "accepts_forwarded_credentials".
 
 This is the `net-mesh-mcp` adapter crate (`net/crates/net/adapters/mcp/`) + the `net wrap` / `net mcp` CLI. It **rides on the same primitives** the rest of this skill covers: capabilities (`capabilities.md`) for discovery, nRPC (`nrpc.md`) for the invoke/describe calls. If MCP is not involved, you don't need this file.
 
@@ -13,7 +13,7 @@ This is the `net-mesh-mcp` adapter crate (`net/crates/net/adapters/mcp/`) + the 
 
 ## Doctrine (the parts that will bite you if you assume otherwise)
 
-1. **Credentials never transit the mesh.** A wrapped server's env vars / tokens stay in that server's child process on the owning machine. Only *tool arguments* and *results* cross the wire — never the secret. There is a permanent CI token-leak test asserting this.
+1. **Credentials stay local by default.** A wrapped server's env vars / tokens stay in that server's child process on the owning machine; only *tool arguments* and *results* cross the wire. A permanent CI token-leak test asserts a wrapped server's `--env` secrets never transit. The **one sanctioned exception** is opt-in, deny-by-default **credential forwarding** (§ *Credential forwarding* below): operator-entered *header* secrets, sealed to the destination, both ends opt in, never for stdio — a tagged concession, off by default, and never the wrapped server's `--env`.
 2. **Owner-only by default.** A wrapped tool is invocable and describable only by the **same root identity** that wrapped it (an AEAD-verified `caller_origin`, not a self-claimed field). Widen explicitly with `--allow`. Display/search never implies invocation.
 3. **The demand side never trusts a wire-declared credential status.** A capability that self-reports `credential_status: "none"` is **still gated** — `credentialed` / `external_api` / `unknown` / `none` all require a local allowlist entry or an approved pin before `net_invoke_capability` will run them. Consent is fail-closed: an empty policy gates *everything*.
 4. **Pin approval is local client consent, not remote authorization.** It clears the *shim's* gate for this user profile on this machine; the remote wrapper's owner scope always wins on top. **The model cannot approve its own access** — `net_request_pin` only records a *pending* request; a human approves out-of-band via `net mcp pin approve`.
@@ -112,6 +112,34 @@ Collapse is additionally gated to `substitutability == provider_equivalent` **an
 
 ---
 
+## Credential forwarding — opt-in, deny-by-default (the exception to doctrine #1)
+
+Default is credential **locality**; forwarding is the one sanctioned way a bearer credential leaves the owning machine, for a **remote/HTTP** destination that understands nothing but an `Authorization`-style header. A tagged concession, not a reach-for feature — preference order stays **provider-held creds > Net delegation/identity > forwarded creds**. Caller/policy side is `net forwarding`; values live in a separate OS-keychain store.
+
+**Both ends opt in; every default hostile.**
+- **Caller:** global kill switch **off**; no secret bound to any provider until `net forwarding allow` names *specific* providers + capability globs. A secret bound to `any` provider is **refused** (a credential to any destination is an exfiltration hole).
+- **Destination:** accepts no forwarded header until its accept-list names it; anything unlisted is stripped.
+- Deny wins; a denial names the gate that refused (global / per-header / per-capability / per-identity), **never a value**.
+
+```
+net forwarding enable | disable                  # global kill switch (default OFF)
+net forwarding allow <ref> --header <H> \
+    [--provider <ID>...] [--any-provider] [--capability <GLOB>...] [--purpose <T>] [--force]
+net forwarding rm <ref>                           # drop a secret ref's policy
+net forwarding audit                              # value-free listing of every grant
+net forwarding set-value <ref>                    # store the VALUE (stdin → OS keychain; needs --features keychain)
+```
+
+- **Policy ≠ value.** `allow` records *that* `<ref>` may go to a provider as header `<H>`; the value is entered separately via `set-value` (read from **stdin**, never argv / shell history) into the OS keychain. A ref can have a policy but no value → forwarding stays off. `audit` is value-free by construction.
+- **Values enter through the operator, never the model** — nothing reads a value from a tool argument, an A2A message, or model output. Don't script `set-value` from an agent.
+- **Never for stdio.** A wrapped stdio server (§ *supply side*) **never** forwards — per-call env mutation of a shared child is cross-caller contamination; the type system has no stdio injection target. Forwarding is remote/HTTP-only.
+- **On the wire:** header values are authority metadata (never a tool arg / result). Sealed to the destination's forwarding key (anonymous X25519 sealed box + XChaCha20-Poly1305); every non-secret envelope field (dest, caller origin, capability, invocation id, expiry, nonce, declared names) is AEAD-bound, so a captured blob can't be **redirected** to another destination or **re-bound** to another caller / capability / invocation (any tampered field fails the tag). **Exact replay** of an *unmodified* blob to its intended destination is only **bounded by the short TTL**, not prevented — there is no receiver-side invocation-id / nonce uniqueness cache yet (TTL is explicitly the backstop for one), so don't describe forwarding as replay-proof. The value wrapper is unserializable + self-redacting in every log / `Debug` / error path.
+- **Honest labeling:** a destination accept-list containing a credential header (`Authorization`, `Cookie`, `x-api-key`, and other bearer-credential names) auto-tags the capability `accepts_forwarded_credentials`, visible in `net_describe_capability` before anything is sent. Security-sensitive headers can never ride the non-secret "plain header" path; `Cookie` / `Set-Cookie` need an explicit `--force`.
+
+**Status — don't over-assume.** The `net forwarding` policy surface + OS-keychain value store **ship** (deny-by-default), and the forwarded-context object + sealing exist as primitives. Wiring the seal-and-inject step into the live wrap→invoke path — and distributing destination forwarding keys — is **not done yet**, and there is no `net wrap --accept-forwarded-headers` flag yet. So today forwarding is *configured and audited* but **not carried end-to-end**: don't tell a user a wrapped call already forwards their token. Source: `net/crates/net/adapters/mcp/src/forward/`.
+
+---
+
 ## Semantics that differ from a plain tool call
 
 - **Invoke is at-most-once for credentialed tools.** A timeout doesn't prove the tool didn't run, so only an *uncredentialed* (duplicate-safe) tool retries a timed-out call; a credentialed / stateful tool surfaces the timeout rather than re-running it, so a side effect (issue, charge) is never silently duplicated. Failover, when enabled, is likewise limited to the uncredentialed class.
@@ -127,4 +155,5 @@ Collapse is additionally gated to `substitutability == provider_equivalent` **an
 - `nrpc.md` — the request/response layer the `describe` and `invoke` calls ride on.
 - `mesh.md` — PSK / identity bootstrap for the two nodes (`net wrap` host + `net mcp serve` client) to reach each other.
 - `net/crates/net/docs/plans/MCP_BRIDGE_PLAN.md` — the design of record (phases, doctrine, open risks).
-- Source of truth: `net/crates/net/adapters/mcp/src/` (`wrap/*` supply side, `serve/*` demand side, `spec/*` MCP wire types).
+- `net/crates/net/docs/plans/MCP_CREDENTIAL_FORWARDING_PLAN.md` — the forwarding design of record (deny-by-default posture, phases, threat model).
+- Source of truth: `net/crates/net/adapters/mcp/src/` (`wrap/*` supply side, `serve/*` demand side, `spec/*` MCP wire types, `forward/*` credential forwarding — policy store, secret value backend, X25519 sealing).

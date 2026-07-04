@@ -19,6 +19,16 @@ name = "net_mcp"
 #   cargo test -p net-mesh-mcp --features fixture
 fixture = []
 
+# `keychain` gates the OS-keychain secret value backend
+# (`MCP_CREDENTIAL_FORWARDING_PLAN.md` Phase 1) — macOS Keychain, Windows
+# Credential Manager, and the Linux kernel `keyutils` (all pure Rust, no C
+# system library; see the `keyring` dependency note for the keyutils vs Secret
+# Service trade-off). NOT a default feature: it pulls the `keyring` dependency
+# and needs a keychain-capable host to *run*, so the default build / CI /
+# `cargo install` never compile it. Enable it to build the backend:
+#   cargo test -p net-mesh-mcp --features keychain
+keychain = ["dep:keyring"]
+
 # ---------------------------------------------------------------------------
 # Doctrine (MCP_BRIDGE_PLAN.md #1): this adapter rides on `net-mesh-sdk`
 # ONLY — never on core crates directly. The single mesh-facing dependency
@@ -39,6 +49,18 @@ net-mesh-sdk = { version = "0.31.0", path = "../../sdk", default-features = fals
 ] }
 async-trait = "0.1"
 bytes = "1"
+# Sealed-box crypto for the forwarded-context sealer (Phase 2): X25519 ECDH +
+# BLAKE2s-MAC KDF + XChaCha20-Poly1305 AEAD, mirroring the core's proven
+# identity-envelope construction. Pure-Rust "protocol support" (the
+# dependency-boundary test forbids only a direct `net-mesh` dep, not crypto
+# crates). `blake2` and `x25519-dalek` share core's already-locked versions;
+# `chacha20poly1305` 0.11 and `getrandom` 0.4 pull a newer major than core's
+# (0.10 / 0.2–0.3), which Cargo coexists — a deliberate trade of a second
+# locked copy for staying current, not an oversight.
+blake2 = "0.10"
+chacha20poly1305 = "0.11"
+getrandom = "0.4"
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 # Cross-process advisory file locking for the shared pin store, so a
 # load→modify→save transaction can't interleave with another shim / the pin
 # CLI and resurrect a removed consent decision.
@@ -46,6 +68,22 @@ fs2 = "0.4"
 # Stream combinators for bounded-concurrency provider fan-out in the demand
 # side's `search` (`buffer_unordered`).
 futures = "0.3"
+# OS-keychain secret value backend, behind the non-default `keychain` feature
+# (see `[features]`). `default-features = false` + explicit native backends
+# keeps EVERY platform on a store that needs no C system library: Windows
+# Credential Manager, macOS Keychain, and — deliberately — the Linux kernel
+# `keyutils` backend (`linux-native`) rather than Secret Service. keyring's
+# Secret Service path pulls `dbus-secret-service` -> `libdbus-sys`, a C lib
+# (`libdbus-1-dev`) that headless CI and minimal images lack; keyutils is pure
+# Rust and needs no dbus. Trade-off: a keyutils keyring persists for the login
+# session, not across reboots — a persistent Linux backend (Secret Service) can
+# be swapped in later by enabling `sync-secret-service` and shipping libdbus.
+# Only compiled when `keychain` is enabled.
+keyring = { version = "3", optional = true, default-features = false, features = [
+    "apple-native",
+    "windows-native",
+    "linux-native",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
