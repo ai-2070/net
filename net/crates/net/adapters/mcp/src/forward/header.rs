@@ -233,9 +233,28 @@ impl fmt::Display for ForwardedHeaderValue {
 /// Best-effort scrub of the backing buffer on drop.
 impl Drop for ForwardedHeaderValue {
     fn drop(&mut self) {
-        for b in &mut self.0 {
-            *b = 0;
-        }
+        zeroize_vec(&mut self.0);
+    }
+}
+
+/// Best-effort scrub of a `Vec<u8>`'s **entire allocation**. Two things a naive
+/// `for b in &mut v { *b = 0 }` gets wrong for secret material:
+///
+/// - it only touches `len()` bytes, leaving `capacity() - len()` spare-capacity
+///   bytes (which may still hold secret data from a prior larger value) in the
+///   freed allocation — so we grow to capacity first (`resize` never
+///   reallocates when the new length is ≤ capacity);
+/// - a plain store can be dead-store-eliminated in optimized builds — so we
+///   `write_volatile` every byte, which the compiler must not elide.
+///
+/// Shared by [`ForwardedHeaderValue`]'s drop and the in-memory secret backend.
+pub(crate) fn zeroize_vec(buf: &mut Vec<u8>) {
+    let cap = buf.capacity();
+    buf.resize(cap, 0);
+    for b in buf.iter_mut() {
+        // SAFETY: `b` is a valid, aligned, mutable reference for the duration
+        // of this call — all `write_volatile` requires.
+        unsafe { std::ptr::write_volatile(b, 0) };
     }
 }
 
@@ -325,5 +344,15 @@ mod tests {
         assert_eq!(disp, "<redacted>");
         // The value is only reachable through the explicit exposure boundary.
         assert_eq!(v.expose(), b"ghp_SUPERSECRET");
+    }
+
+    #[test]
+    fn zeroize_vec_scrubs_the_full_capacity() {
+        // Reserve more than we fill, so there is spare capacity to cover.
+        let mut v = Vec::with_capacity(16);
+        v.extend_from_slice(b"secret");
+        zeroize_vec(&mut v);
+        assert_eq!(v.len(), 16, "grown to capacity so spare bytes are scrubbed too");
+        assert!(v.iter().all(|&b| b == 0), "every byte is zero");
     }
 }
