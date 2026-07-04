@@ -10,6 +10,15 @@ repository = "https://github.com/ai-2070/net"
 # `use net_mcp::...` — the published artifact is `net-mesh-mcp`.
 name = "net_mcp"
 
+[features]
+# `fixture` gates the `net-mcp-fixture` conformance server — a test-only
+# stdio MCP server — and the integration tests that spawn it. It is NOT a
+# default feature, so a plain build / `cargo install net-mesh-mcp` ships the
+# library alone and never installs the fixture as a user-facing binary.
+# Enable it to build + run the end-to-end suite:
+#   cargo test -p net-mesh-mcp --features fixture
+fixture = []
+
 # ---------------------------------------------------------------------------
 # Doctrine (MCP_BRIDGE_PLAN.md #1): this adapter rides on `net-mesh-sdk`
 # ONLY — never on core crates directly. The single mesh-facing dependency
@@ -62,9 +71,28 @@ tokio = { version = "1", features = [
 # runs against — never against GitHub. Co-located in this crate so the
 # integration tests can spawn it via `CARGO_BIN_EXE_net-mcp-fixture`;
 # extractable into its own artifact later without touching the wire types.
+# `required-features` keeps this test helper out of the published/installed
+# artifact — it only builds under `--features fixture`.
 [[bin]]
 name = "net-mcp-fixture"
 path = "src/bin/fixture.rs"
+required-features = ["fixture"]
+
+# The end-to-end tests spawn the fixture via `CARGO_BIN_EXE_net-mcp-fixture`,
+# so they require the same `fixture` feature (a plain `cargo test` skips them;
+# `--features fixture` builds the fixture and runs them). `dependency_boundary`
+# needs no fixture and stays auto-discovered.
+[[test]]
+name = "serve_end_to_end"
+required-features = ["fixture"]
+
+[[test]]
+name = "stdio_round_trip"
+required-features = ["fixture"]
+
+[[test]]
+name = "wrap_end_to_end"
+required-features = ["fixture"]
 
 # Mirror the workspace panic-hygiene lints (there is no [workspace.lints]
 # table to inherit from — the core crate declares these per-package).
