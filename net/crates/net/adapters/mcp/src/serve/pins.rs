@@ -189,20 +189,26 @@ impl PinStore {
         let tmp = self
             .path
             .with_extension(format!("tmp.{}", std::process::id()));
-        tokio::fs::write(&tmp, &bytes).await.map_err(io_err)?;
 
-        // Restrict to owner-only before the rename — the store records
-        // security-sensitive consent decisions, so it must not be world- or
-        // group-readable under a permissive umask. The mode travels with the
-        // inode through the rename. (Unix only; on Windows the per-user data
-        // dir already scopes access via inherited ACLs.)
+        // Create the temp owner-only (0600) *from the start*, then write into
+        // it — the store records security-sensitive consent decisions, so it
+        // must never be even briefly world-/group-readable. Creating first and
+        // chmod'ing after left a window under a permissive umask where the
+        // freshly-written file was readable (and a crash before the chmod left a
+        // umask-perms `.tmp` behind). Truncate so a stale same-pid temp from a
+        // prior crash cannot leave trailing bytes. The 0600 mode travels with
+        // the inode through the atomic rename below. (The `mode` is Unix-only;
+        // on Windows the per-user data dir already scopes access via inherited
+        // ACLs, and the create/write/rename path is otherwise identical.)
+        use tokio::io::AsyncWriteExt;
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-                .await
-                .map_err(io_err)?;
-        }
+        opts.mode(0o600);
+        let mut f = opts.open(&tmp).await.map_err(io_err)?;
+        f.write_all(&bytes).await.map_err(io_err)?;
+        f.flush().await.map_err(io_err)?;
+        drop(f);
 
         tokio::fs::rename(&tmp, &self.path).await.map_err(io_err)?;
         Ok(())
@@ -425,6 +431,9 @@ mod tests {
             0o600,
             "the pin store records consent decisions and must be owner-only",
         );
+        // F8: a successful save must leave no umask-perms temp sibling behind.
+        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        assert!(!tmp.exists(), "no leftover temp file after a successful save");
     }
 
     #[tokio::test]
