@@ -402,6 +402,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tampering_issued_at_fails_the_open() {
+        // issued_at is bound in the AAD, so forging the issue time (which the
+        // opener otherwise trusts when reconstructing the context) breaks the tag.
+        let (pk, sk) = keypair();
+        let mut sealed = X25519SealedBoxSealer::to_recipient(pk)
+            .seal(&sample("node-dest", 1_000))
+            .await
+            .unwrap();
+        sealed.issued_at = 0;
+        let err = X25519SealedBoxOpener::new(sk)
+            .open(&sealed, "node-dest", 1_010)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OpenError::BindingFailed));
+    }
+
+    #[tokio::test]
     async fn refuses_wrong_destination_and_expiry_before_crypto() {
         let (pk, sk) = keypair();
         let sealed = X25519SealedBoxSealer::to_recipient(pk)

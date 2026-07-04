@@ -95,6 +95,7 @@ impl SealedContext {
             &self.caller_origin,
             &self.capability_id,
             &self.invocation_id,
+            self.issued_at,
             self.expires_at,
             &self.nonce,
             &self.declared_names,
