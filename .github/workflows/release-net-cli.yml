@@ -47,10 +47,11 @@ jobs:
             net/crates/net/target/
           key: ${{ runner.os }}-cargo-publish-cli-${{ hashFiles('**/Cargo.lock') }}
 
-      # `net-cli` depends on `net-mesh-sdk` (which depends on
-      # `net-mesh`). Both must already exist on crates.io at the
-      # version this crate's Cargo.toml pins, so run `release-crates`
-      # first when the workspace version bumps.
+      # `net-cli` depends on `net-mesh-sdk` (→ `net-mesh`) and on
+      # `net-mesh-mcp` (the MCP bridge adapter). All must already exist
+      # on crates.io at the version this crate's Cargo.toml pins, so run
+      # `release-crates` first when the workspace version bumps — it now
+      # publishes `net-mesh-mcp` too.
       - name: cargo publish --dry-run (net-cli)
         working-directory: net/crates/net/cli
         run: cargo publish --dry-run
