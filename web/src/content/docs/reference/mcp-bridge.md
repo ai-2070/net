@@ -160,12 +160,16 @@ Forwarded header **values** are authority metadata, never capability input —
 they appear in no tool schema, argument, or result. On the wire they are sealed
 to the destination node's key (anonymous X25519 sealed box + XChaCha20-Poly1305),
 so a relay sees nothing; every non-secret envelope field — destination, caller
-origin, capability, invocation id, expiry, single-use nonce, declared header
-names — is bound as AEAD associated data, so a captured blob can't be redirected
-to another destination, replayed against another invocation, or outlive its
-short TTL. The secret wrapper type is unserializable and redacts itself in every
-log / `Debug` / error path; values enter through the operator (`net forwarding
-set-value`), never a model or a tool argument.
+origin, capability, invocation id, expiry, nonce, declared header names — is
+bound as AEAD associated data, so a captured blob can't be redirected to another
+destination or re-bound to another caller / capability / invocation (any
+tampered field fails the tag). Exact replay of an *unmodified* blob to its
+intended destination is **bounded by the short TTL, not prevented** — a
+receiver-side invocation-id / nonce uniqueness cache (single-use enforcement) is
+the intended defense and is not yet wired, so TTL is the current backstop. The
+secret wrapper type is unserializable and redacts itself in every log / `Debug` /
+error path; values enter through the operator (`net forwarding set-value`), never
+a model or a tool argument.
 
 ### Never for stdio
 
