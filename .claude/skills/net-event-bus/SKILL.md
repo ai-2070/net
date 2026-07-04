@@ -4,7 +4,7 @@ description: "Use this skill when the user is integrating the Net library (`@net
 allowed-tools: ["Read", "Grep", "Glob", "Bash", "Edit", "Write"]
 metadata:
   version: 0.30.0
-  last-updated: 07-04-2026
+  last-updated: 2026-07-04
 ---
 
 # Net as an Event Bus
