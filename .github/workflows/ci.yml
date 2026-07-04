@@ -1396,6 +1396,56 @@ jobs:
       - name: Run net-aggregator-daemon tests
         run: cargo test -p net-aggregator-daemon
 
+  mcp-tests:
+    # `net-mesh-mcp` is the MCP <-> mesh bridge adapter. By doctrine
+    # it rides on the public `net-mesh-sdk` surface ONLY — the
+    # `tests/dependency_boundary.rs` test asserts that boundary, so a
+    # regression that reaches past the SDK fails this job. Unit tests
+    # live in each `src/**` module's `#[cfg(test)] mod tests`; the
+    # `tests/*.rs` integration tests stand up real one/two/three-node
+    # meshes (wrap provider + demand-side gateway, incl. a ~20s
+    # three-node failover) and are picked up automatically by
+    # `cargo test -p net-mesh-mcp` — new `tests/foo.rs` needs no CI edit.
+    #
+    # Clippy is `--lib --bins`, NOT `--all-targets`: production code is
+    # held to `-D warnings` with `unwrap_used` / `expect_used` denied
+    # (see the crate's `[lints.clippy]`), but the integration tests
+    # legitimately use `unwrap` / `expect`, so linting test targets
+    # under `-D warnings` would fail by design. This is why the crate
+    # gets a dedicated job rather than a `ffi-clippy` matrix entry
+    # (that matrix hardcodes `--all-targets`).
+    name: MCP adapter tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: net/crates/net
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-mcp-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run clippy (production code, strict)
+        run: cargo clippy -p net-mesh-mcp --lib --bins -- -D warnings
+
+      - name: Run net-mesh-mcp tests
+        if: ${{ !cancelled() }}
+        run: cargo test -p net-mesh-mcp
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -1490,5 +1540,14 @@ jobs:
       # contract notes stay buildable.
       - name: Build net-rpc-ffi documentation
         run: cargo doc -p net-rpc-ffi --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # `net-mesh-mcp` is the MCP bridge adapter. Its module-level
+      # docstrings document the demand/serve/wrap contracts (meta-tool
+      # surface, owner-scope gate, describe protocol, failover); keep
+      # them warning-free like the other workspace members.
+      - name: Build net-mesh-mcp documentation
+        run: cargo doc -p net-mesh-mcp --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
