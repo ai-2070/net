@@ -1,0 +1,20 @@
+.claude/skills/net-event-bus/event-semantics.md
+  s_f75d64212a7389::t_23a6c0cbb53872 141
+  s_f75d64212a7389::t_4a8abc50e28de1 34-69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3ae3f8b5e2277e1f9b729822142a4eca69ef6b34",
+  "prompts": {},
+  "sessions": {
+    "s_f75d64212a7389": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6139e8e8-9ce9-4dfc-9412-193afe6af8d2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
