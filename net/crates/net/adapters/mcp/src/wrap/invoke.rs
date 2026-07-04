@@ -28,6 +28,14 @@ use crate::spec::CallToolResult;
 /// is outside the tool's owner scope. In the app-defined `0x8000..=0xFFFF`
 /// range required by [`RpcHandlerError::Application`].
 pub const ERR_OWNER_SCOPE: u16 = 0x8001;
+
+/// The canonical owner-scope rejection message the gate returns with
+/// [`ERR_OWNER_SCOPE`]. Shared so every producer (this invoke handler, the
+/// describe handler) and the demand-side shim that canonicalizes it
+/// (`serve::shim` → [`MSG_DENIED_BY_WRAPPER`](crate::serve::MSG_DENIED_BY_WRAPPER))
+/// reference one literal — reword it here and both sides move together, rather
+/// than the shim silently failing to recognise a reworded rejection.
+pub const OWNER_SCOPE_REJECTION: &str = "caller root identity does not match owner scope";
 /// The request body was not decodable JSON tool arguments.
 pub const ERR_BAD_REQUEST: u16 = 0x8002;
 /// The wrapped MCP server failed the call at the protocol level.
@@ -147,7 +155,7 @@ impl RpcHandler for WrapInvokeHandler {
         if !self.scope.allows(ctx.caller_origin) {
             return Err(RpcHandlerError::Application {
                 code: ERR_OWNER_SCOPE,
-                message: "caller root identity does not match owner scope".to_string(),
+                message: OWNER_SCOPE_REJECTION.to_string(),
             });
         }
 

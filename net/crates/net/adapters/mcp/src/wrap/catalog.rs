@@ -25,7 +25,7 @@ use super::descriptor::{
     compat_tier_key, credential_status_key, invocation_scope_key, substitutability_key,
     visibility_key, LoweredTool,
 };
-use super::invoke::{OwnerScope, ERR_BAD_REQUEST, ERR_OWNER_SCOPE};
+use super::invoke::{OwnerScope, ERR_BAD_REQUEST, ERR_OWNER_SCOPE, OWNER_SCOPE_REJECTION};
 use crate::bridge::{BridgedToolInfo, DescribeRequest, DescribeResponse};
 
 /// The shared, swappable catalog a [`DescribeHandler`] reads. `refresh` swaps
@@ -105,7 +105,7 @@ impl RpcHandler for DescribeHandler {
         if !self.scope.allows(ctx.caller_origin) {
             return Err(RpcHandlerError::Application {
                 code: ERR_OWNER_SCOPE,
-                message: "caller root identity does not match owner scope".to_string(),
+                message: OWNER_SCOPE_REJECTION.to_string(),
             });
         }
 

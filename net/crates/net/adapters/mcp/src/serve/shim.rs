@@ -607,7 +607,7 @@ fn gateway_error_text(e: &GatewayError) -> String {
 /// carries the wrapper's specific reason.
 fn denied_message(reason: &str) -> String {
     let reason = reason.trim().trim_end_matches('.');
-    if reason == "caller root identity does not match owner scope" {
+    if reason == crate::wrap::invoke::OWNER_SCOPE_REJECTION {
         return MSG_DENIED_BY_WRAPPER.to_string();
     }
     format!("Denied by remote wrapper: {reason}.")
@@ -694,7 +694,7 @@ mod tests {
             }
             if self.deny.contains(&id.display()) {
                 return Err(GatewayError::Denied(
-                    "caller root identity does not match owner scope".to_string(),
+                    crate::wrap::invoke::OWNER_SCOPE_REJECTION.to_string(),
                 ));
             }
             Ok(CallToolResult::text_ok(format!(
@@ -1454,5 +1454,23 @@ mod tests {
         client_wr.shutdown().await.unwrap();
         drop(client_wr);
         handle.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn denied_message_canonicalizes_the_shared_owner_scope_rejection() {
+        use crate::wrap::invoke::OWNER_SCOPE_REJECTION;
+        // The canonical wrapper rejection maps to the exact product string.
+        assert_eq!(denied_message(OWNER_SCOPE_REJECTION), MSG_DENIED_BY_WRAPPER);
+        // Drift guard: the product string is literally the prefix + the shared
+        // reason, so rewording OWNER_SCOPE_REJECTION without updating
+        // MSG_DENIED_BY_WRAPPER fails here.
+        assert!(MSG_DENIED_BY_WRAPPER.contains(OWNER_SCOPE_REJECTION));
+        // A trailing period on the reason is normalised, not doubled.
+        assert_eq!(
+            denied_message(&format!("{OWNER_SCOPE_REJECTION}.")),
+            MSG_DENIED_BY_WRAPPER,
+        );
+        // Any other reason is wrapped generically.
+        assert_eq!(denied_message("nope"), "Denied by remote wrapper: nope.");
     }
 }
