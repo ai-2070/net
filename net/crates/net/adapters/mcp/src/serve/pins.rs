@@ -143,6 +143,20 @@ impl PinStore {
             .path
             .with_extension(format!("tmp.{}", std::process::id()));
         tokio::fs::write(&tmp, &bytes).await.map_err(io_err)?;
+
+        // Restrict to owner-only before the rename — the store records
+        // security-sensitive consent decisions, so it must not be world- or
+        // group-readable under a permissive umask. The mode travels with the
+        // inode through the rename. (Unix only; on Windows the per-user data
+        // dir already scopes access via inherited ACLs.)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+                .await
+                .map_err(io_err)?;
+        }
+
         tokio::fs::rename(&tmp, &self.path).await.map_err(io_err)?;
         Ok(())
     }
@@ -319,6 +333,26 @@ mod tests {
                 (cap("b/a"), PinState::Approved),
                 (cap("b/z"), PinState::Pending),
             ],
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saved_store_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, path) = store_path();
+        let mut store = PinStore::load(&path).await.unwrap();
+        store.approve(&cap("b/echo"));
+        store.save().await.unwrap();
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the pin store records consent decisions and must be owner-only",
         );
     }
 }
