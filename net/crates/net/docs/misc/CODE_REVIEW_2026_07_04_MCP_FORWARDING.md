@@ -27,13 +27,16 @@ invocation-id replay cache, no mesh key distribution):
 - **CLI** (`cli/commands/forwarding.rs`) — `net forwarding
   enable|disable|allow|rm|audit|set-value`.
 
-> **Status — OPEN (2026-07-04).** Findings below reflect the code as reviewed at
-> branch HEAD (`6f63173a9`). File/line anchors point at the reviewed code. All
-> 78 `forward::*` tests pass; the crypto core and decision logic are sound (see
-> *Verified as correct*). No high-severity defect in the live surface; the
-> recurring theme is the **value-entry path** (F2–F5) doing none of the
+> **Status — RESOLVED (2026-07-04).** All 11 findings plus both marginal notes
+> were fixed on `mcp-creds`, each as its own commit with tests where reasonable
+> (`forward::*` now 88 lib tests, up from 78, all green; keychain + CLI-keychain
+> clippy strict clean; `fmt --check` clean). File/line anchors below point at the
+> code **as reviewed** (pre-fix) and are left intact as the record; the
+> **Resolution** table at the end gives the commit for each. The crypto core and
+> decision logic were sound as reviewed (see *Verified as correct*); the recurring
+> theme fixed was the **value-entry path** (F2–F5) doing none of the
 > validation/scrubbing the rest of the module assumes, plus one **write/load
-> asymmetry** (F1) where the store doesn't uphold a guarantee it documents.
+> asymmetry** (F1) where the store didn't uphold a guarantee it documents.
 
 ---
 
@@ -314,3 +317,30 @@ if the same PID is later reused).
 F1–F5 (the value-entry path + the store write/load asymmetry) are the
 ship-blockers for a live forwarding path. F6 is cheap crypto defense-in-depth
 worth landing alongside. F7–F11 are hardening / robustness that can follow.
+
+---
+
+## Resolution (2026-07-04)
+
+Every finding and both marginal notes shipped on `mcp-creds`, each as its own
+commit with tests where a behavior was observable.
+
+| # | Fix | Commit |
+|---|-----|--------|
+| F1 | Load re-runs `validate_ref_name` on each persisted secret ref | `42413f5bf` |
+| F2 | `ForwardedHeaderValue::validate` runs at `KeychainSecretBackend::set` (value refused at entry) | `09159baa2` |
+| F3 | `set-value` validates the ref name at entry via the now-public `validate_ref_name` | `e1dc9d9fe` |
+| F4 | `set-value` scrubs the stdin buffer via `zeroize_secret` (volatile, full-capacity) on every exit path | `250f1b682` |
+| F5 | Keychain `set` zeroizes its `value.to_vec()` copy after the write | `37ead679c` |
+| F6 | Sealer rejects a low-order recipient key (`shared.was_contributory()`), before materializing plaintext | `9c417e2eb` |
+| F7 | Credential classification widened (curated list + narrow substring heuristic; benign `*-key`/`*-token` excluded) | `684e3bcee` |
+| F8 | `save` adds `sync_all` + best-effort unix parent-dir fsync | `689cda303` |
+| F9 | `MAX_HEADER_NAME_LEN` cap, names counted in the total, identity fields capped (also closes the `write_field` marginal note) | `7c114e29a` |
+| F10 | `deny_unknown_fields` on the on-disk `ForwardingFile` | `d6aa1af59` |
+| F11 | `save` removes the temp file on a write/rename error | `344656517` |
+| dep note | Cargo.toml crypto-deps comment corrected (marginal note) | `18d4edb9c` |
+
+The refuted Windows `FILE_SHARE_DELETE` candidate was left unchanged (no defect).
+Verification: `forward::*` 88 lib tests + integration + keychain tests pass;
+`clippy --features fixture` / `--features keychain` (mcp) and `--features
+keychain` (cli) are strict-clean; `fmt --check` clean (`d8b5a09d4`).
