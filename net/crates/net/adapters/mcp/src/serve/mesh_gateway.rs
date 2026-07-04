@@ -136,21 +136,25 @@ impl MeshGateway {
         }
     }
 
-    /// Call with a per-attempt `timeout`, retrying on transient errors only.
-    /// Application errors ([`RpcError::ServerError`]) return immediately — they
-    /// are the answer.
+    /// Call with a per-attempt `timeout`, retrying while `retriable` says the
+    /// error is worth another attempt. Application errors
+    /// ([`RpcError::ServerError`]) always return immediately — they are the
+    /// answer. `retriable` differs by call idempotency: a describe (idempotent)
+    /// retries any transient error; a non-idempotent invoke only retries errors
+    /// that prove the call never executed (see [`retriable_send_safe`]).
     async fn call_retry(
         &self,
         node: u64,
         service: &str,
         body: Bytes,
         timeout: Duration,
+        retriable: fn(&RpcError) -> bool,
     ) -> Result<Bytes, RpcError> {
         let mut last: Option<RpcError> = None;
         for attempt in 0..MAX_ATTEMPTS {
             match self.call_once(node, service, body.clone(), timeout).await {
                 Ok(bytes) => return Ok(bytes),
-                Err(e) if is_retriable(&e) => {
+                Err(e) if retriable(&e) => {
                     last = Some(e);
                     if attempt + 1 < MAX_ATTEMPTS {
                         tokio::time::sleep(RETRY_BACKOFF).await;
@@ -173,7 +177,7 @@ impl MeshGateway {
                 .map_err(|e| GatewayError::Other(format!("encode describe request: {e}")))?,
         );
         match self
-            .call_retry(node, DESCRIBE_SERVICE, body, DESCRIBE_TIMEOUT)
+            .call_retry(node, DESCRIBE_SERVICE, body, DESCRIBE_TIMEOUT, is_retriable)
             .await
         {
             Ok(bytes) => serde_json::from_slice(&bytes)
@@ -274,9 +278,10 @@ impl MeshGateway {
         node: u64,
         capability: &str,
         body: Bytes,
+        retriable: fn(&RpcError) -> bool,
     ) -> Result<CallToolResult, GatewayError> {
         match self
-            .call_retry(node, capability, body, self.invoke_timeout)
+            .call_retry(node, capability, body, self.invoke_timeout, retriable)
             .await
         {
             // Success: the wrap handler encoded the CallToolResult as the body.
@@ -392,38 +397,57 @@ impl CapabilityGateway for MeshGateway {
     /// Invoke, with transparent failover to an equivalent provider when the
     /// primary is unreachable.
     ///
-    /// **At-least-once semantics.** A transport failure includes a *timeout*,
-    /// which does not prove the primary didn't execute the call — so failover
-    /// (and the same-node retry in `call_retry`) can run a tool more than once.
-    /// This is inherent to transparent failover; exactly-once is not achievable
-    /// across independent providers. It is bounded, not unbounded: failover
-    /// happens ONLY between providers `group_capabilities` collapsed, which
-    /// requires the operator's `provider_equivalent` opt-in AND
-    /// `credential_status == none`. A tool whose duplicate execution mutates
-    /// authenticated or external state needs credentials to do so, so it is
-    /// credentialed, never collapses, and never fails over. Only uncredentialed,
-    /// operator-declared-interchangeable tools fail over — where the operator
-    /// has asserted running on any provider yields the same result, i.e.
-    /// duplicate execution is harmless. A tool where it isn't must not be
-    /// declared `--substitutable`.
+    /// **Duplicate-execution safety.** A timeout does not prove the primary
+    /// didn't execute the call, so re-running it — via the same-node retry in
+    /// `call_retry` *or* failover to another provider — can execute a tool more
+    /// than once. Both are gated on `duplicate_safe`:
+    ///
+    /// - **Same-node retry** uses [`retriable_send_safe`] when `!duplicate_safe`,
+    ///   so a credentialed / stateful tool is never re-sent on a mere timeout
+    ///   (at-most-once); an uncredentialed tool retries transient timeouts,
+    ///   recovering from the reply-channel first-reply race.
+    /// - **Failover** happens ONLY between providers `group_capabilities`
+    ///   collapsed, which requires the operator's `provider_equivalent` opt-in
+    ///   AND `credential_status == none` — the same uncredentialed class that is
+    ///   `duplicate_safe`. A credentialed tool never collapses, so it has no
+    ///   failover candidates and stays on its single provider.
+    ///
+    /// Net: for a credentialed tool the whole path is at-most-once; for an
+    /// uncredentialed one the operator has asserted duplicate execution is
+    /// harmless (running on any provider yields the same result).
     async fn invoke(
         &self,
         id: &CapabilityId,
         arguments: Value,
+        duplicate_safe: bool,
     ) -> Result<CallToolResult, GatewayError> {
         let primary = parse_node(&id.provider)?;
         let body = Bytes::from(
             serde_json::to_vec(&arguments)
                 .map_err(|e| GatewayError::Other(format!("encode arguments: {e}")))?,
         );
-        match self.invoke_on(primary, &id.capability, body.clone()).await {
+        // Idempotent (duplicate-safe) calls retry any transient error; a
+        // non-idempotent invoke only retries errors that prove non-execution.
+        let retriable: fn(&RpcError) -> bool = if duplicate_safe {
+            is_retriable
+        } else {
+            retriable_send_safe
+        };
+        match self
+            .invoke_on(primary, &id.capability, body.clone(), retriable)
+            .await
+        {
             // Primary unreachable — fail over to an equivalent provider (see the
-            // at-least-once note above). Only a transport failure fails over: a
-            // `Denied` (authorization) or a tool-level error is a real answer
-            // another provider wouldn't change.
+            // duplicate-execution note above; only uncredentialed, collapsible
+            // tools ever have candidates here). Only a transport failure fails
+            // over: a `Denied` (authorization) or a tool-level error is a real
+            // answer another provider wouldn't change.
             Err(GatewayError::Transport(primary_reason)) => {
                 for (node, _) in self.equivalent_providers(id, primary).await {
-                    match self.invoke_on(node, &id.capability, body.clone()).await {
+                    match self
+                        .invoke_on(node, &id.capability, body.clone(), retriable)
+                        .await
+                    {
                         Err(GatewayError::Transport(_)) => continue, // this one is down too
                         answer => return answer,
                     }
@@ -438,12 +462,26 @@ impl CapabilityGateway for MeshGateway {
     }
 }
 
-/// True for errors worth retrying (the reply-channel race, transient routing).
+/// True for errors worth retrying an **idempotent** call (a describe, or an
+/// uncredentialed invoke whose duplicate execution is harmless): the
+/// reply-channel first-reply race and transient routing all surface as one of
+/// these, and re-running the call has no ill effect.
 fn is_retriable(e: &RpcError) -> bool {
     matches!(
         e,
         RpcError::NoRoute { .. } | RpcError::Timeout { .. } | RpcError::Transport(_)
     )
+}
+
+/// True only for errors that prove a **non-idempotent** call (an invoke of a
+/// credentialed / stateful tool) never reached a handler, so retrying cannot
+/// execute the tool twice. A `NoRoute` means the router found no handler — the
+/// request was never delivered. A `Timeout` or generic `Transport` failure is
+/// ambiguous (the handler may have run and only the reply was lost to the
+/// first-reply race), so it is NOT retried: better an at-most-once error the
+/// caller can act on than a duplicated side effect (a second issue / charge).
+fn retriable_send_safe(e: &RpcError) -> bool {
+    matches!(e, RpcError::NoRoute { .. })
 }
 
 /// Map a describe-call error to a gateway error.
@@ -541,6 +579,28 @@ mod tests {
             status: ERR_OWNER_SCOPE,
             message: "denied".into(),
         }));
+    }
+
+    #[test]
+    fn send_safe_retriable_only_covers_proven_non_execution() {
+        // F1: a non-idempotent invoke may retry ONLY on an error proving the
+        // call never reached a handler — a NoRoute — so a credentialed side
+        // effect is never duplicated. A Timeout or Transport failure is
+        // ambiguous (the tool may have run, only the reply lost), so it is not
+        // retried; the describe/idempotent predicate still retries a Timeout.
+        assert!(retriable_send_safe(&RpcError::NoRoute {
+            target: 1,
+            reason: "x".into(),
+        }));
+        assert!(!retriable_send_safe(&RpcError::Timeout { elapsed_ms: 10 }));
+        assert!(!retriable_send_safe(&RpcError::ServerError {
+            status: ERR_OWNER_SCOPE,
+            message: "denied".into(),
+        }));
+        assert!(
+            is_retriable(&RpcError::Timeout { elapsed_ms: 10 }),
+            "the idempotent predicate keeps retrying a timeout",
+        );
     }
 
     #[test]

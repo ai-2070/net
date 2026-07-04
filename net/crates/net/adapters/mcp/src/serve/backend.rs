@@ -196,10 +196,19 @@ pub trait CapabilityGateway: Send + Sync {
     /// and return the tool result. A remote owner-scope rejection is
     /// [`GatewayError::Denied`]; a tool-level failure is an `Ok`
     /// [`CallToolResult`] with `is_error = true`.
+    ///
+    /// `duplicate_safe` states whether re-executing the tool is harmless (an
+    /// uncredentialed, stateless tool). When `true`, a timed-out call may be
+    /// retried on the same provider — covering the reply-channel first-reply
+    /// race for ultra-fast handlers. When `false`, the invoke is **at-most-once**:
+    /// a timeout (which does not prove the call didn't execute) is surfaced
+    /// rather than retried, so a credentialed side effect — a created issue, a
+    /// charge — is never silently duplicated.
     async fn invoke(
         &self,
         id: &CapabilityId,
         arguments: serde_json::Value,
+        duplicate_safe: bool,
     ) -> Result<CallToolResult, GatewayError>;
 }
 

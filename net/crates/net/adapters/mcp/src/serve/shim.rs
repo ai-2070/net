@@ -460,7 +460,15 @@ impl<G: CapabilityGateway> Shim<G> {
         // [3] Route to the provider. A remote owner-scope rejection surfaces
         //     as the wrapper-denied message; a tool-level error rides back
         //     in the CallToolResult unchanged.
-        match self.gateway.invoke(id, tool_args).await {
+        //
+        //     `duplicate_safe`: only an uncredentialed tool may be retried on a
+        //     timeout — a credentialed one is at-most-once so a lost reply never
+        //     duplicates a real side effect. This is a resilience hint from the
+        //     provider's declared status, NOT the security gate above (which
+        //     never trusts a wire status): a provider mislabelling its own
+        //     stateful tool only risks duplicating a call to itself.
+        let duplicate_safe = detail.credential_status == "none";
+        match self.gateway.invoke(id, tool_args, duplicate_safe).await {
             Ok(result) => result,
             Err(GatewayError::Denied(reason)) => {
                 CallToolResult::text_error(denied_message(&reason))
@@ -770,6 +778,7 @@ mod tests {
             &self,
             id: &CapabilityId,
             arguments: Value,
+            _duplicate_safe: bool,
         ) -> Result<CallToolResult, GatewayError> {
             self.invoke_calls.fetch_add(1, Ordering::SeqCst);
             if self.find(id).is_none() {

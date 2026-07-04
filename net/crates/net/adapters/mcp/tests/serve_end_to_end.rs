@@ -128,7 +128,7 @@ async fn gateway_searches_describes_and_invokes_across_two_nodes() {
 
     // invoke — the wrapped tool round-trips the argument.
     let result = gateway
-        .invoke(&id, json!({ "message": "hi gateway" }))
+        .invoke(&id, json!({ "message": "hi gateway" }), true)
         .await
         .expect("invoke echo");
     assert!(!result.is_error, "{result:?}");
@@ -186,7 +186,7 @@ async fn a_gateway_outside_the_owner_scope_sees_nothing_and_cannot_invoke() {
     // a `Transport` timeout when the fast rejection outraces reply-subscription
     // setup; both are errors and neither yields a result.
     let id = CapabilityId::new(host_id.to_string(), "echo");
-    let outcome = gateway.invoke(&id, json!({ "message": "nope" })).await;
+    let outcome = gateway.invoke(&id, json!({ "message": "nope" }), true).await;
     assert!(
         matches!(
             outcome,
@@ -228,7 +228,7 @@ fn substitutable_config(owner_origin: u64) -> WrapConfig {
 /// its reply to the reply-channel race even after the gateway's own retries.
 async fn invoke_retry(gateway: &MeshGateway, id: &CapabilityId, message: &str) -> CallToolResult {
     for _ in 0..6 {
-        if let Ok(result) = gateway.invoke(id, json!({ "message": message })).await {
+        if let Ok(result) = gateway.invoke(id, json!({ "message": message }), true).await {
             return result;
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
