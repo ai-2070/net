@@ -40,6 +40,10 @@ pub enum ForwardingCommand {
     Rm(RmArgs),
     /// Show every configured grant — value-free by construction.
     Audit(StoreArgs),
+    /// Store a secret ref's VALUE in the OS keychain, read from stdin (so it
+    /// never lands in argv / shell history). Requires a build with
+    /// `--features keychain`; the policy (`allow`) is configured separately.
+    SetValue(SetValueArgs),
 }
 
 #[derive(Args, Debug)]
@@ -97,6 +101,13 @@ pub struct RmArgs {
     pub store: StoreArgs,
 }
 
+#[derive(Args, Debug)]
+pub struct SetValueArgs {
+    /// The secret ref name to store the value under (should match a ref you
+    /// configured with `net forwarding allow`).
+    pub ref_name: String,
+}
+
 pub async fn run(
     cmd: ForwardingCommand,
     output: Option<OutputFormat>,
@@ -109,7 +120,59 @@ pub async fn run(
         ForwardingCommand::Allow(args) => allow(args, output).await,
         ForwardingCommand::Rm(args) => rm(args, output).await,
         ForwardingCommand::Audit(args) => audit(args, output).await,
+        ForwardingCommand::SetValue(args) => set_value(args, output).await,
     }
+}
+
+/// Store a secret value in the OS keychain (keychain-feature build). The value
+/// is read from stdin so it never enters argv or shell history; a single
+/// trailing newline is stripped. The value is never echoed back.
+#[cfg(feature = "keychain")]
+async fn set_value(args: SetValueArgs, output: Option<OutputFormat>) -> Result<(), CliError> {
+    use net_mcp::forward::{KeychainSecretBackend, DEFAULT_KEYCHAIN_SERVICE};
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = Vec::new();
+    tokio::io::stdin()
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| generic(format!("read secret from stdin: {e}")))?;
+    // Strip one trailing newline (`\n` or `\r\n`) from the piped value.
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+    }
+    if buf.is_empty() {
+        return Err(invalid_args("no secret value on stdin (pipe the value in)"));
+    }
+
+    let backend = KeychainSecretBackend::default();
+    let result = backend.set(&args.ref_name, &buf).await;
+    // Best-effort scrub of the local plaintext copy regardless of outcome.
+    buf.iter_mut().for_each(|b| *b = 0);
+    result.map_err(|e| generic(format!("store secret in keychain: {e}")))?;
+
+    emit_row(
+        output,
+        MutationRow {
+            action: "value-set",
+            ref_name: Some(args.ref_name),
+            changed: true,
+            store: format!("keychain:{DEFAULT_KEYCHAIN_SERVICE}"),
+        },
+    )
+}
+
+/// Fallback when the binary was built without the `keychain` feature: there is
+/// no value store, so say so rather than silently missing the command.
+#[cfg(not(feature = "keychain"))]
+async fn set_value(_args: SetValueArgs, _output: Option<OutputFormat>) -> Result<(), CliError> {
+    Err(generic(
+        "this `net` build has no secret value store; rebuild net-cli with \
+         `--features keychain` to enter secret values",
+    ))
 }
 
 /// Resolve the forwarding-store path: the explicit `--store`, else the per-user
