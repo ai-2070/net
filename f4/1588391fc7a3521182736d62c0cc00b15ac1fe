@@ -1,0 +1,31 @@
+web/src/content/docs/agent-briefs/wrap-and-use-an-mcp-server.md
+  s_f75d64212a7389::t_7c30167032307d 1-71
+net/crates/net/docs/plans/DOCS_SDK_SPINE_PLAN.md
+  s_f75d64212a7389::t_4a22d2fde55ce6 3-7
+web/src/content/docs/agent-briefs/README.md
+  s_f75d64212a7389::t_b7fe0dd75ee335 1-37
+web/src/content/docs/agent-briefs/build-a-recoverable-capability.md
+  s_f75d64212a7389::t_faff4e7ace0469 1-64
+web/src/content/docs/agent-briefs/generate-typed-tool-bindings.md
+  s_f75d64212a7389::t_16fdb33d0b157f 1-68
+web/src/docs.order.ts
+  s_f75d64212a7389::t_65e69a30ca2b60 26
+  s_f75d64212a7389::t_d2825a538f2cf9 71-75
+  s_f75d64212a7389::t_d2089883e3422c 255-260
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f41588391fc7a3521182736d62c0cc00b15ac1fe",
+  "prompts": {},
+  "sessions": {
+    "s_f75d64212a7389": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6139e8e8-9ce9-4dfc-9412-193afe6af8d2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
