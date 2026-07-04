@@ -1,6 +1,7 @@
 //! Provider-side describe service (`MCP_BRIDGE_PLAN.md` Phase 2, option B).
 //!
-//! A wrap node serves one [`DescribeHandler`] on [`bridge::DESCRIBE_SERVICE`]
+//! A wrap node serves one [`DescribeHandler`] on
+//! [`bridge::DESCRIBE_SERVICE`](crate::bridge::DESCRIBE_SERVICE)
 //! so a demand-side gateway can read the full descriptors of its bridged tools
 //! — input schema, description, and credential status — which the announced
 //! capability metadata carries but the public SDK does not surface to a

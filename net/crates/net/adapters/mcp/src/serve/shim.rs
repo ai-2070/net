@@ -4,8 +4,8 @@
 //! answers `initialize` / `tools/list` / `tools/call` on the other. Its
 //! `tools/list` is the meta-tool surface ([`super::meta_tools`]); its
 //! `tools/call` dispatches each `net_*` meta-tool through the
-//! [`CapabilityGateway`], applying pre-flight [`validation`](super::validation)
-//! and the [`consent`](super::consent) gate on the invoke path.
+//! [`CapabilityGateway`], applying pre-flight [`validation`] and the
+//! [`consent`](super::consent) gate on the invoke path.
 //!
 //! **Serial by design (v0).** The shim processes one request at a time — a
 //! slow invoke blocks the next request. MCP hosts send one request and await,

@@ -4,7 +4,8 @@
 //! Discovery and invocation both route over the mesh:
 //! - **search** — find bridge providers by the [`BRIDGE_PROVIDER_TAG`] in the
 //!   capability fold, then fetch each one's catalog via the describe service
-//!   ([`bridge::DESCRIBE_SERVICE`]) and filter by the query.
+//!   ([`bridge::DESCRIBE_SERVICE`](crate::bridge::DESCRIBE_SERVICE)) and filter
+//!   by the query.
 //! - **describe** — fetch one tool's full descriptor from its provider.
 //! - **invoke** — `Mesh::call` the tool's nRPC service on its provider; decode
 //!   the `CallToolResult`.
