@@ -314,10 +314,13 @@ pub(crate) fn canonical_aad_bytes(
 }
 
 /// Append a 4-byte big-endian length prefix followed by `bytes`.
+#[expect(
+    clippy::expect_used,
+    reason = "AAD fields are capped far below u32::MAX (header names, node/caller/capability/invocation ids); a field that large is a logic bug, not runtime input — fail fast rather than emit a truncated, non-canonical length prefix"
+)]
 fn write_field(out: &mut Vec<u8>, bytes: &[u8]) {
-    // A field longer than u32::MAX bytes is impossible here (values are capped
-    // far below), so the cast can't truncate.
-    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    let len = u32::try_from(bytes.len()).expect("AAD field length exceeds u32::MAX");
+    out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(bytes);
 }
 
