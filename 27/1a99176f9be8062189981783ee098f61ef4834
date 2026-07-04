@@ -1,0 +1,33 @@
+net/crates/net/adapters/mcp/src/serve/shim.rs
+  s_e2c6f41ae18f64::t_2a4f87ae9b1181 54-55
+  s_e2c6f41ae18f64::t_c09def1ebe853c 572-592
+  s_e2c6f41ae18f64::t_36134c660d0811 229-232,236-238,243-247
+  s_e2c6f41ae18f64::t_e79f2f74baf0a5 72,91-110
+  s_e2c6f41ae18f64::t_80774aba85430b 1106
+  s_e2c6f41ae18f64::t_5e5e0535e989aa 20,34-35,38-41
+  s_e2c6f41ae18f64::t_245f447f72b758 278,282-285,292-330,332-343
+  s_e2c6f41ae18f64::t_28d9788c9805de 502-520
+  s_e2c6f41ae18f64::t_f679058ca1477b 410-411,413-417,420,438,445
+  s_e2c6f41ae18f64::t_d29f65420b699c 1252-1324
+  s_e2c6f41ae18f64::t_cfd0911711af5d 132-136,143-169
+  s_e2c6f41ae18f64::t_e8fb294e3632f8 111,1325-1393,1395-1414
+  s_e2c6f41ae18f64::t_1f61fdfaac8d6d 42
+  s_e2c6f41ae18f64::t_574a325f4f477a 112
+  s_e2c6f41ae18f64::t_860c3f67f763a3 1394
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "271a99176f9be8062189981783ee098f61ef4834",
+  "prompts": {},
+  "sessions": {
+    "s_e2c6f41ae18f64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dbc06b06-9d2b-4f28-a220-e736eee44f76",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
