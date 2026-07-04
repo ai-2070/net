@@ -1,0 +1,22 @@
+net/crates/net/adapters/mcp/src/serve/grouping.rs
+  s_e2c6f41ae18f64::t_4ca0c21a2899b8 90-101,112-113
+  s_e2c6f41ae18f64::t_2536eaa549f98e 287-332
+net/crates/net/adapters/mcp/src/serve/mesh_gateway.rs
+  s_e2c6f41ae18f64::t_346b9148ca6aca 182-187
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "dab94971c3ead531c5942448e6c80563bdb0c8c2",
+  "prompts": {},
+  "sessions": {
+    "s_e2c6f41ae18f64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dbc06b06-9d2b-4f28-a220-e736eee44f76",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
