@@ -1,0 +1,19 @@
+net/crates/net/docs/plans/DOCS_STRATEGY_PLAN.md
+  s_f75d64212a7389::t_0e15f7d8ed17f9 1-292
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c838567bd28a37d778a5094403874c54b2ab0458",
+  "prompts": {},
+  "sessions": {
+    "s_f75d64212a7389": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6139e8e8-9ce9-4dfc-9412-193afe6af8d2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

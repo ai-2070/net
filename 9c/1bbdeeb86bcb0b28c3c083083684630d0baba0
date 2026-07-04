@@ -1,0 +1,22 @@
+net/crates/net/docs/plans/DOCS_STRATEGY_PLAN.md
+  s_f75d64212a7389::t_89391df6d479d5 178,180-185
+  s_f75d64212a7389::t_adb282cd38eb2d 60-66,68-76
+net/crates/net/docs/misc/DOCS_CLAIMS_AUDIT.md
+  s_f75d64212a7389::t_ef3b0d00392f4e 1-93
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9c1bbdeeb86bcb0b28c3c083083684630d0baba0",
+  "prompts": {},
+  "sessions": {
+    "s_f75d64212a7389": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6139e8e8-9ce9-4dfc-9412-193afe6af8d2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

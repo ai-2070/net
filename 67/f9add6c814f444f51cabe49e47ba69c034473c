@@ -1,0 +1,32 @@
+web/src/content/docs/guides/wrap-mcp-server.md
+  s_f75d64212a7389::t_e7636b96edfe0c 1-104
+web/src/content/docs/guides/recover-failed-workflow.md
+  s_f75d64212a7389::t_5a68b0f1bf2097 1-92
+web/src/content/docs/worldview/agentic-mesh.md
+  s_f75d64212a7389::t_437e6f598b639d 42
+web/src/content/docs/guides/discover-and-invoke.md
+  s_f75d64212a7389::t_fa47381b7cba37 1-96
+web/src/content/docs/guides/expose-net-as-mcp.md
+  s_f75d64212a7389::t_e564708f7e1423 1-75
+web/src/docs.order.ts
+  s_f75d64212a7389::t_83805692edce7a 48-51
+  s_f75d64212a7389::t_1de9dd55546730 146-149
+web/src/content/docs/start/quickstart.md
+  s_f75d64212a7389::t_9429fc57ac6ed9 80-92
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "67f9add6c814f444f51cabe49e47ba69c034473c",
+  "prompts": {},
+  "sessions": {
+    "s_f75d64212a7389": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6139e8e8-9ce9-4dfc-9412-193afe6af8d2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}

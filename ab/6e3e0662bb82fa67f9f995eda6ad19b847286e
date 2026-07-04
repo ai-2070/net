@@ -1,0 +1,39 @@
+web/src/content/docs/worldview/rest-vs-net.md
+  s_f75d64212a7389::t_878bb088cb6032 1-50
+web/src/content/docs/worldview/mcp-vs-net.md
+  s_f75d64212a7389::t_343b756a1bc729 1-80
+web/src/content/docs/start/what-is-net.md
+  s_f75d64212a7389::t_3bc6ab9dd832bb 3-7
+web/src/content/docs/worldview/submitted-is-not-completed.md
+  s_f75d64212a7389::t_3e0634024a97a5 1-130
+README.md
+  s_f75d64212a7389::t_e3be1bf529f214 14-15
+web/src/content/docs/worldview/agentic-mesh.md
+  s_f75d64212a7389::t_22e9ff6d0e089f 1-93
+web/src/docs.order.ts
+  s_f75d64212a7389::t_6e3165de5926c3 120-126
+  s_f75d64212a7389::t_a824eae3a3d241 21,24,30-36
+  s_f75d64212a7389::t_a7f694556fc97c 112
+web/src/content/docs/worldview/right-and-wrong-use-cases.md
+  s_f75d64212a7389::t_8799cba3c29283 1-65
+web/src/content/docs/worldview/README.md
+  s_f75d64212a7389::t_c746a023cfabc5 1-34
+web/src/components/HeroSection.tsx
+  s_f75d64212a7389::t_3e8f1e6fb4ffe3 732-743
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ab6e3e0662bb82fa67f9f995eda6ad19b847286e",
+  "prompts": {},
+  "sessions": {
+    "s_f75d64212a7389": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6139e8e8-9ce9-4dfc-9412-193afe6af8d2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
