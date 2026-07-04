@@ -245,8 +245,14 @@ async fn read_loop(inner: Arc<Inner>, stdout: ChildStdout) {
     // Fail every outstanding request: dropping the senders resolves each
     // awaiting `rx` to a transport error rather than hanging forever.
     inner.pending.lock().await.clear();
-    // Signal closure so a driver can withdraw the wrapped tools.
-    let _ = inner.closed_tx.send(true);
+    // Signal closure so a driver can withdraw the wrapped tools. Use
+    // `send_replace`, not `send`: `send` drops the value when there are no
+    // receivers, so if the server exits before anyone calls `closed()` the
+    // stored value would stay `false` and a later `closed()` would wait on
+    // `changed()` forever (the sender lives as long as the client, so it never
+    // resolves). `send_replace` always stores `true`, so a later `subscribe()`
+    // observes it immediately.
+    inner.closed_tx.send_replace(true);
 }
 
 /// A loosely-typed inbound message, classified by which fields are present.

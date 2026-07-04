@@ -166,6 +166,32 @@ async fn closed_fires_when_the_server_process_exits() {
 }
 
 #[tokio::test]
+async fn closed_is_observable_when_subscribed_after_the_exit() {
+    // Regression: the reader signals closure with `watch::send_replace`, which
+    // stores the value even when there are no receivers. A driver that only
+    // calls `closed()` AFTER the server has already exited must still observe
+    // it. With a plain `watch::send` the signal is dropped when no receiver
+    // exists, and this `closed()` would hang forever (the sender lives as long
+    // as the client, so `changed()` never resolves) — failing via the timeout.
+    let (program, args): (&str, Vec<String>) = if cfg!(windows) {
+        ("cmd", vec!["/C".to_string(), "exit".to_string()])
+    } else {
+        ("true", Vec::new())
+    };
+    let client = StdioMcpClient::spawn(program, &args, &[], client_info())
+        .await
+        .expect("spawn a short-lived process");
+    // Let the process exit and the reader task run to completion — crucially,
+    // no `closed()` subscriber exists during this window, so the reader's
+    // signal fires with zero receivers.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Subscribing only now must still see the stored close signal.
+    tokio::time::timeout(CALL_TIMEOUT, client.closed())
+        .await
+        .expect("a subscriber arriving after the exit still observes closure");
+}
+
+#[tokio::test]
 async fn big_tool_returns_a_large_payload() {
     let client = connect().await;
     within("initialize", client.initialize())
