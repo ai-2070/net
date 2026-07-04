@@ -79,11 +79,9 @@ const MAX_TOOL_ID_LEN: usize = 200;
 ///
 /// A served tool's id becomes the channel names `<id>.requests` /
 /// `<id>.replies.*`, which the substrate validates as **lowercase** names over
-/// `[a-z0-9._/-]` with no `//` and no `.`/`..` path segments. An MCP tool whose
-/// name has uppercase or other characters therefore can't be served as-is —
-/// the wrap layer skips such tools rather than failing the whole server.
-/// (Charset-safe name *allocation* that would let those tools through is a
-/// later concern — the plan's Phase 4 duplicate-grouping/naming work.)
+/// `[a-z0-9._/-]` with no `//` and no `.`/`..` path segments. A name that fails
+/// this can't be a channel id as-is; [`channel_safe_tool_id`] sanitizes it so
+/// the tool is still bridged rather than dropped.
 pub fn is_serviceable_tool_id(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_TOOL_ID_LEN
@@ -94,6 +92,47 @@ pub fn is_serviceable_tool_id(name: &str) -> bool {
             .chars()
             .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '/'))
         && name.split('/').all(|seg| seg != "." && seg != "..")
+}
+
+/// A channel-safe nRPC service id for MCP tool `name`.
+///
+/// A name that is already [`is_serviceable_tool_id`] is used verbatim, so the
+/// common case has no wire change. Otherwise the name is lowercased with every
+/// out-of-charset character mapped to `_`, truncated to fit, and suffixed with
+/// a short hash of the **original** name. The hash keeps distinct names
+/// collision-free and stops a sanitized id from shadowing a serviceable one —
+/// so tools with uppercase / spaced / punctuated names (e.g. `createIssue`) are
+/// BRIDGED under a stable safe id rather than silently dropped. The wrap side
+/// keeps the original name ([`LoweredTool::mcp_name`]) to invoke the tool. The
+/// result always satisfies [`is_serviceable_tool_id`].
+///
+/// `name` must be non-empty — an empty tool name has no usable id and is
+/// skipped by the caller before lowering.
+pub fn channel_safe_tool_id(name: &str) -> String {
+    if is_serviceable_tool_id(name) {
+        return name.to_string();
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hasher);
+    let suffix = format!("{:06x}", hasher.finish() & 0x00ff_ffff);
+    // All-ASCII output (each source char maps to one ASCII byte), so byte
+    // truncation below can never split a char.
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            let lc = c.to_ascii_lowercase();
+            if matches!(lc, 'a'..='z' | '0'..='9' | '_' | '-') {
+                lc
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let max_base = MAX_TOOL_ID_LEN.saturating_sub(suffix.len() + 1);
+    let mut base = sanitized;
+    base.truncate(max_base);
+    format!("{base}_{suffix}")
 }
 
 /// The non-per-tool inputs the lowering needs: who the provider is and the
@@ -118,17 +157,22 @@ pub struct LoweredTool {
     pub descriptor: ToolDescriptor,
     /// Bridge-specific metadata, keyed by `tool::<id>::<field>`.
     pub bridge_metadata: BTreeMap<String, String>,
+    /// The wrapped server's ORIGINAL tool name — the string `tools/call` must
+    /// use to invoke it. Equals `descriptor.tool_id` for a channel-safe name;
+    /// differs when the name was sanitized into a mesh-safe id.
+    pub mcp_name: String,
 }
 
 /// Lower one MCP `tools/list` entry.
 ///
-/// The tool's `name` becomes the nRPC `tool_id` (the string a caller passes
-/// to invoke it); provider namespacing for duplicate grouping is a Phase 4
-/// concern and does not enter the id here. Compat tier is always
-/// `mcp_bridge`, visibility / scope are the owner-only defaults, and the
-/// schemas ride verbatim as JSON strings.
+/// The nRPC `tool_id` is the tool's name made channel-safe by
+/// [`channel_safe_tool_id`] (verbatim when already safe); the original name is
+/// kept in [`LoweredTool::mcp_name`] for invocation. Provider namespacing for
+/// duplicate grouping is a Phase 4 concern and does not enter the id here.
+/// Compat tier is always `mcp_bridge`, visibility / scope are the owner-only
+/// defaults, and the schemas ride verbatim as JSON strings.
 pub fn lower_tool(tool: &Tool, ctx: &LoweringContext) -> LoweredTool {
-    let tool_id = tool.name.clone();
+    let tool_id = channel_safe_tool_id(&tool.name);
     let version = if ctx.server_version.is_empty() {
         "0".to_string()
     } else {
@@ -175,6 +219,7 @@ pub fn lower_tool(tool: &Tool, ctx: &LoweringContext) -> LoweredTool {
     LoweredTool {
         descriptor,
         bridge_metadata,
+        mcp_name: tool.name.clone(),
     }
 }
 
@@ -311,5 +356,62 @@ mod tests {
             !is_serviceable_tool_id(&"a".repeat(MAX_TOOL_ID_LEN + 1)),
             "over-long ids are rejected",
         );
+    }
+
+    #[test]
+    fn channel_safe_id_passes_serviceable_names_verbatim() {
+        for ok in ["echo", "get_current_time", "a.b", "svc/sub", "x-1"] {
+            assert_eq!(channel_safe_tool_id(ok), ok, "{ok:?} is already safe");
+        }
+    }
+
+    #[test]
+    fn channel_safe_id_sanitizes_and_bridges_non_safe_names() {
+        // F10: a non-channel-safe name (uppercase, spaces, punctuation,
+        // non-ASCII) maps to a VALID, stable service id rather than being
+        // dropped.
+        for bad in ["createIssue", "get Status", "n@me!", "Ünïcode", "a b/c"] {
+            let id = channel_safe_tool_id(bad);
+            assert!(
+                is_serviceable_tool_id(&id),
+                "{bad:?} -> {id:?} must be serviceable",
+            );
+        }
+        // Deterministic, and distinct inputs get distinct ids.
+        assert_eq!(
+            channel_safe_tool_id("createIssue"),
+            channel_safe_tool_id("createIssue"),
+        );
+        // A sanitized id never shadows the serviceable name it lowercases to.
+        assert_ne!(
+            channel_safe_tool_id("createIssue"),
+            channel_safe_tool_id("createissue"),
+        );
+        assert_eq!(channel_safe_tool_id("createissue"), "createissue");
+        assert!(channel_safe_tool_id("createIssue").starts_with("createissue_"));
+    }
+
+    #[test]
+    fn lower_tool_keeps_the_original_name_for_a_sanitized_id() {
+        // F10: the descriptor advertises the safe id, but mcp_name is the
+        // original so the invoke handler calls the right wrapped tool, and the
+        // bridge metadata is keyed by the safe id the demand side describes.
+        let tool = Tool {
+            name: "createIssue".to_string(),
+            title: None,
+            description: None,
+            input_schema: json!({ "type": "object" }),
+            output_schema: None,
+        };
+        let lowered = lower_tool(
+            &tool,
+            &ctx(CredentialStatus::Unknown, Substitutability::ProviderLocal),
+        );
+        assert_eq!(lowered.mcp_name, "createIssue", "original preserved for invoke");
+        let id = &lowered.descriptor.tool_id;
+        assert_ne!(id, "createIssue", "the id was sanitized");
+        assert!(is_serviceable_tool_id(id));
+        assert!(id.starts_with("createissue_"));
+        assert!(lowered.bridge_metadata.contains_key(&compat_tier_key(id)));
     }
 }

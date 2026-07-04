@@ -159,6 +159,57 @@ async fn wrap_discover_and_invoke_across_two_nodes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_non_channel_safe_tool_name_is_sanitized_and_still_invokable() {
+    // F10: the fixture's `getCaps` (camelCase) isn't a valid channel id. It must
+    // be BRIDGED under a sanitized service id — not dropped — and invoking that
+    // id must reach the original `getCaps` on the wrapped server.
+    let caller = build_mesh(&[0x46u8; 32]).await;
+    let host = build_mesh(&[0x46u8; 32]).await;
+    handshake(&caller, &host).await;
+    let b_id = host.inner().node_id();
+
+    let config = WrapConfig::owner_only(client_info(), caller.origin_hash());
+    let session = wrap_server(&host, FIXTURE, &[], &[], config)
+        .await
+        .expect("wrap the fixture on the host");
+    // Nothing was dropped for being non-channel-safe.
+    assert!(
+        session.skipped_tools().is_empty(),
+        "no tool dropped: {:?}",
+        session.skipped_tools(),
+    );
+    // `getCaps` is served under a sanitized id (never verbatim).
+    let safe_id = session
+        .tools()
+        .iter()
+        .find(|t| t.starts_with("getcaps_"))
+        .expect("getCaps bridged under a sanitized id")
+        .clone();
+    assert_ne!(safe_id, "getCaps");
+
+    // Discover + invoke by the sanitized id; the wrapped original runs.
+    let filter = CapabilityFilter::new().require_tag(&safe_id);
+    assert!(
+        wait_until(
+            || caller.find_nodes(&filter).contains(&b_id),
+            Duration::from_secs(5),
+        )
+        .await,
+        "caller discovers the sanitized capability",
+    );
+    let reply = call_retry(&caller, b_id, &safe_id, || Bytes::from_static(b"{}"))
+        .await
+        .expect("invoke the sanitized tool");
+    let result: CallToolResult =
+        serde_json::from_slice(reply.body.as_ref()).expect("decode CallToolResult");
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(result.text(), "caps-ok");
+
+    caller.shutdown().await.ok();
+    host.shutdown().await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_caller_outside_the_owner_scope_is_rejected() {
     let caller = build_mesh(&[0x43u8; 32]).await;
     let host = build_mesh(&[0x43u8; 32]).await;

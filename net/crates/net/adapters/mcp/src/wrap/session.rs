@@ -24,7 +24,7 @@ use net_sdk::tool::description_metadata_key;
 use super::catalog::{build_catalog, shared_catalog, DescribeHandler, SharedCatalog};
 use super::credentials::{classify, ClassifyError, CredentialOverride, WrapEnv};
 use super::descriptor::{
-    is_serviceable_tool_id, lower_tool, LoweredTool, LoweringContext, Substitutability,
+    lower_tool, LoweredTool, LoweringContext, Substitutability,
 };
 use super::invoke::{OwnerScope, WrapInvokeHandler};
 use super::stdio::StdioMcpClient;
@@ -91,9 +91,9 @@ pub struct WrapSession {
     scope: OwnerScope,
     /// The tool ids served, sorted, for diagnostics.
     tools: Vec<String>,
-    /// MCP tool names skipped because they aren't valid nRPC service ids
-    /// (e.g. uppercase / non-charset-safe). Surfaced so the operator sees
-    /// what wasn't bridged instead of it failing silently.
+    /// MCP tool names skipped because they have no usable id (an empty name).
+    /// Non-charset-safe names are sanitized and bridged, not skipped. Surfaced
+    /// so the operator sees what wasn't bridged instead of it failing silently.
     skipped: Vec<String>,
     /// Serve handle for the describe service (`bridge::DESCRIBE_SERVICE`).
     /// Held so dropping the session withdraws it with the tool handlers.
@@ -109,8 +109,8 @@ impl WrapSession {
         &self.tools
     }
 
-    /// MCP tool names that were skipped because their name isn't a valid nRPC
-    /// service id (charset-safe name allocation for these is a later concern).
+    /// MCP tool names that were skipped because they have no usable id (an
+    /// empty name). A non-charset-safe name is sanitized and bridged instead.
     pub fn skipped_tools(&self) -> &[String] {
         &self.skipped
     }
@@ -150,9 +150,12 @@ impl WrapSession {
         for lt in &lowered {
             let tool_id = lt.descriptor.tool_id.clone();
             if !self.handles.contains_key(&tool_id) {
+                // Serve under the channel-safe `tool_id`, but invoke the wrapped
+                // tool by its original `mcp_name` (they differ for a sanitized
+                // name).
                 let handler = WrapInvokeHandler::new(
                     Arc::clone(&self.client),
-                    tool_id.clone(),
+                    lt.mcp_name.clone(),
                     self.scope.clone(),
                 );
                 let handle =
@@ -323,8 +326,10 @@ pub async fn wrap_server(
     let mut handles: HashMap<String, ServeHandle> = HashMap::with_capacity(lowered.len());
     for lt in &lowered {
         let tool_id = lt.descriptor.tool_id.clone();
+        // Serve under the channel-safe `tool_id`, invoke by the original
+        // `mcp_name` (they differ only for a sanitized name).
         let handler =
-            WrapInvokeHandler::new(Arc::clone(&client), tool_id.clone(), config.scope.clone());
+            WrapInvokeHandler::new(Arc::clone(&client), lt.mcp_name.clone(), config.scope.clone());
         match mesh.serve_rpc(&tool_id, Arc::new(handler)) {
             Ok(handle) => {
                 handles.insert(tool_id, handle);
@@ -356,21 +361,23 @@ pub async fn wrap_server(
     })
 }
 
-/// Discover the wrapped server's tools and lower the serviceable ones,
-/// returning `(lowered, skipped_names)`. Shared by [`wrap_server`] and
+/// Discover the wrapped server's tools and lower them, returning
+/// `(lowered, skipped_names)`. Shared by [`wrap_server`] and
 /// [`WrapSession::refresh`].
+///
+/// A name that isn't already a valid nRPC service id is *sanitized* into one by
+/// [`lower_tool`] (via `channel_safe_tool_id`) rather than dropped, so a tool
+/// with an uppercase / spaced / punctuated name is still bridged. Only a tool
+/// with an empty name — which has no usable id — is skipped.
 async fn discover_and_lower(
     client: &StdioMcpClient,
     ctx: &LoweringContext,
 ) -> Result<(Vec<LoweredTool>, Vec<String>), WrapError> {
     let tools = client.list_tools().await?;
-    // Only tools whose name is a valid nRPC service id can be served; skip the
-    // rest so one non-conforming tool name doesn't fail the whole wrap.
-    let (serviceable, unserviceable): (Vec<_>, Vec<_>) = tools
-        .into_iter()
-        .partition(|t| is_serviceable_tool_id(&t.name));
-    let skipped: Vec<String> = unserviceable.into_iter().map(|t| t.name).collect();
-    let lowered: Vec<LoweredTool> = serviceable.iter().map(|t| lower_tool(t, ctx)).collect();
+    let (usable, empty_named): (Vec<_>, Vec<_>) =
+        tools.into_iter().partition(|t| !t.name.trim().is_empty());
+    let skipped: Vec<String> = empty_named.into_iter().map(|t| t.name).collect();
+    let lowered: Vec<LoweredTool> = usable.iter().map(|t| lower_tool(t, ctx)).collect();
     Ok((lowered, skipped))
 }
 

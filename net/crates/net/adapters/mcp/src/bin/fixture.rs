@@ -198,6 +198,15 @@ fn tools_list_result(bumped: bool) -> Value {
             input_schema: json!({ "type": "object", "properties": {} }),
             output_schema: None,
         },
+        // A camelCase name — NOT a valid channel id. The wrap layer must
+        // sanitize it into a safe service id and still invoke `getCaps`.
+        Tool {
+            name: "getCaps".to_string(),
+            title: Some("Get Caps".to_string()),
+            description: Some("A non-channel-safe (camelCase) tool name.".to_string()),
+            input_schema: json!({ "type": "object", "properties": {} }),
+            output_schema: None,
+        },
     ];
     if bumped {
         tools.push(Tool {
@@ -265,6 +274,7 @@ fn handle_tools_call(id: Value, params: Option<&Value>, bumped: &mut bool) -> (V
             CallToolResult::text_ok("bumped")
         }
         "bonus" => CallToolResult::text_ok("bonus"),
+        "getCaps" => CallToolResult::text_ok("caps-ok"),
         // Unknown tool → a protocol-level error, not a tool result.
         other => {
             return (
