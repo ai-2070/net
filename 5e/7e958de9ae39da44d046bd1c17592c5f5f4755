@@ -1,0 +1,19 @@
+net/crates/net/docs/misc/CODE_REVIEW_2026_07_04_MCP_BRIDGE.md
+  s_759aaad81078ca::t_73c72e208eea2d 1-315
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5e7e958de9ae39da44d046bd1c17592c5f5f4755",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
