@@ -1,0 +1,38 @@
+web/src/content/docs/reference/mcp-bridge.md
+  s_f75d64212a7389::t_99924194738865 15-16,19-21
+  s_f75d64212a7389::t_811969a1f1f51d 22
+web/src/content/docs/agent-briefs/generate-typed-tool-bindings.md
+  s_f75d64212a7389::t_c882b003b1ade7 30-31,33
+web/src/content/docs/sdk/typescript/invoke.md
+  s_f75d64212a7389::t_051c35ecd2c348 18-28,35
+web/src/content/docs/sdk/rust/watch.md
+  s_f75d64212a7389::t_88939d5043bccc 14
+web/src/content/docs/sdk/go/quickstart.md
+  s_f75d64212a7389::t_15012c30d6bedb 31-33,35
+web/src/content/docs/sdk/c/quickstart.md
+  s_f75d64212a7389::t_1c0a94e818ae6f 18,20-22,25,27,31-37
+  s_f75d64212a7389::t_4250a6a26d903e 51-54
+web/src/content/docs/reference/cli.md
+  s_f75d64212a7389::t_df2ce499790b51 5
+web/src/content/docs/guides/recover-failed-workflow.md
+  s_f75d64212a7389::t_947867a96a0600 77
+web/src/content/docs/sdk/python/errors.md
+  s_f75d64212a7389::t_5aedc82454219c 8-11,17,19,26-27
+  s_f75d64212a7389::t_f7dae1f1e3bb90 28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1f427b414dbdac32c44025e3633c54510faaca24",
+  "prompts": {},
+  "sessions": {
+    "s_f75d64212a7389": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6139e8e8-9ce9-4dfc-9412-193afe6af8d2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
