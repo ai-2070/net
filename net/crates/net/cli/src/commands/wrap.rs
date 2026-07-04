@@ -192,9 +192,17 @@ pub async fn run(
             _ = tokio::signal::ctrl_c() => break,
             // The wrapped server exited (clean or crash) — withdraw and stop.
             _ = client.closed() => {
-                let _ = mesh
+                // Withdraw the announcement so peers stop advertising tools
+                // whose handlers are about to drop. Log a failure (stderr, off
+                // the structured stdout stream) rather than swallowing it —
+                // otherwise a stale announcement could linger with no live
+                // backing handler and no diagnostic. Mirrors the refresh path.
+                if let Err(e) = mesh
                     .announce_capabilities(net_sdk::capabilities::CapabilitySet::new())
-                    .await;
+                    .await
+                {
+                    eprintln!("withdrawing capabilities on server exit failed: {e}");
+                }
                 let _ = emit_stream_row(fmt, &WrapEvent::ServerExited);
                 break;
             }

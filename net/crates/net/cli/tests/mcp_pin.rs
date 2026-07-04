@@ -18,7 +18,15 @@ fn pin_approve_then_list_then_reject_round_trips() {
 
     // Approve — reports the capability as approved.
     net_mesh()
-        .args(["mcp", "pin", "approve", CAP, "--output", "json", "--pin-store"])
+        .args([
+            "mcp",
+            "pin",
+            "approve",
+            CAP,
+            "--output",
+            "json",
+            "--pin-store",
+        ])
         .arg(&store)
         .assert()
         .success()
@@ -36,7 +44,15 @@ fn pin_approve_then_list_then_reject_round_trips() {
 
     // Reject — removes it.
     net_mesh()
-        .args(["mcp", "pin", "reject", CAP, "--output", "json", "--pin-store"])
+        .args([
+            "mcp",
+            "pin",
+            "reject",
+            CAP,
+            "--output",
+            "json",
+            "--pin-store",
+        ])
         .arg(&store)
         .assert()
         .success()
