@@ -21,6 +21,7 @@ use net_sdk::mesh::Mesh;
 use net_sdk::mesh_rpc::ServeHandle;
 use net_sdk::tool::description_metadata_key;
 
+use super::catalog::{build_catalog, shared_catalog, DescribeHandler, SharedCatalog};
 use super::credentials::{classify, ClassifyError, CredentialOverride, WrapEnv};
 use super::descriptor::{
     is_serviceable_tool_id, lower_tool, LoweredTool, LoweringContext, Substitutability,
@@ -28,6 +29,7 @@ use super::descriptor::{
 use super::invoke::{OwnerScope, WrapInvokeHandler};
 use super::stdio::StdioMcpClient;
 use super::McpError;
+use crate::bridge::{BRIDGE_PROVIDER_TAG, DESCRIBE_SERVICE};
 use crate::spec::Implementation;
 
 /// A failure setting up a wrap session.
@@ -89,6 +91,12 @@ pub struct WrapSession {
     /// (e.g. uppercase / non-charset-safe). Surfaced so the operator sees
     /// what wasn't bridged instead of it failing silently.
     skipped: Vec<String>,
+    /// Serve handle for the describe service (`bridge::DESCRIBE_SERVICE`).
+    /// Held so dropping the session withdraws it with the tool handlers.
+    _describe_handle: ServeHandle,
+    /// The describe catalog the describe handler reads; swapped on refresh so
+    /// demand-side describes stay current ("always up-to-date types").
+    describe_catalog: SharedCatalog,
 }
 
 impl WrapSession {
@@ -127,6 +135,11 @@ impl WrapSession {
         mesh.announce_capabilities(caps)
             .await
             .map_err(|e| WrapError::Announce(e.to_string()))?;
+
+        // Refresh the describe catalog so demand-side describes see the new
+        // schemas/status. The describe service keeps serving; only its data
+        // swaps ("always up-to-date types" for the describe path too).
+        *self.describe_catalog.write().await = std::sync::Arc::new(build_catalog(&lowered));
 
         // Serve tools that appeared.
         let mut added = Vec::new();
@@ -176,13 +189,19 @@ impl WrapSession {
 
 /// Assemble the capability set announced for a wrapped server: one tag per
 /// tool (so `cap search <tool>` finds it) plus the bridge metadata and
-/// description under the `tool::<id>::<field>` convention.
+/// description under the `tool::<id>::<field>` convention, and — when there is
+/// at least one tool — the [`BRIDGE_PROVIDER_TAG`] so a demand-side gateway can
+/// find this node as a bridge provider and fetch its catalog via the describe
+/// service.
 ///
 /// One set for the whole server — capability announcements are
 /// whole-node-set replacements, so every tool's tags and metadata must ride
 /// together in a single announcement.
 pub fn build_capability_set(lowered: &[LoweredTool]) -> CapabilitySet {
     let mut caps = CapabilitySet::new();
+    if !lowered.is_empty() {
+        caps = caps.add_tag(BRIDGE_PROVIDER_TAG.to_string());
+    }
     for lt in lowered {
         let d = &lt.descriptor;
         caps = caps.add_tag(d.tool_id.clone());
@@ -271,10 +290,32 @@ pub async fn wrap_server(
         .await
         .map_err(|e| WrapError::Announce(e.to_string()))?;
 
+    // Serve the describe service so demand-side gateways can read the bridged
+    // tools' full descriptors (schema + credential status). Owner-scoped like
+    // invoke — describe is visibility. If it fails, roll back the announcement.
+    let describe_catalog = shared_catalog(build_catalog(&lowered));
+    let describe_handle = match mesh.serve_rpc(
+        DESCRIBE_SERVICE,
+        Arc::new(DescribeHandler::new(
+            describe_catalog.clone(),
+            config.scope.clone(),
+        )),
+    ) {
+        Ok(handle) => handle,
+        Err(e) => {
+            let _ = mesh.announce_capabilities(CapabilitySet::new()).await;
+            return Err(WrapError::Serve {
+                tool: DESCRIBE_SERVICE.to_string(),
+                reason: e.to_string(),
+            });
+        }
+    };
+
     // Serve one caller-aware handler per tool. If any serve fails, roll back so
     // a failed startup never leaves stale, uninvocable capabilities
     // discoverable: drop the handles served so far (each reverses its
-    // `serve_rpc`) and withdraw the announcement before returning the error.
+    // `serve_rpc`), drop the describe handle, and withdraw the announcement
+    // before returning the error.
     let mut handles: HashMap<String, ServeHandle> = HashMap::with_capacity(lowered.len());
     for lt in &lowered {
         let tool_id = lt.descriptor.tool_id.clone();
@@ -286,6 +327,7 @@ pub async fn wrap_server(
             }
             Err(e) => {
                 drop(handles);
+                drop(describe_handle);
                 // Best-effort withdraw so discovery matches runtime state.
                 let _ = mesh.announce_capabilities(CapabilitySet::new()).await;
                 return Err(WrapError::Serve {
@@ -305,6 +347,8 @@ pub async fn wrap_server(
         scope: config.scope,
         tools,
         skipped,
+        _describe_handle: describe_handle,
+        describe_catalog,
     })
 }
 
@@ -388,6 +432,20 @@ mod tests {
     fn empty_tool_list_yields_an_empty_capability_set() {
         let caps = build_capability_set(&[]);
         assert!(!CapabilityFilter::new().require_tag("echo").matches(&caps));
+        // No tools ⇒ not advertised as a bridge provider either.
+        assert!(!CapabilityFilter::new()
+            .require_tag(BRIDGE_PROVIDER_TAG)
+            .matches(&caps));
+    }
+
+    #[test]
+    fn a_non_empty_set_advertises_the_bridge_provider_tag() {
+        // Demand-side gateways find providers via this tag, then fetch each
+        // one's catalog through the describe service.
+        let caps = build_capability_set(&lowered(&[("echo", "echo it")]));
+        assert!(CapabilityFilter::new()
+            .require_tag(BRIDGE_PROVIDER_TAG)
+            .matches(&caps));
     }
 
     #[test]

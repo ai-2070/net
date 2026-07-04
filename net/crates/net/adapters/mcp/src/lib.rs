@@ -23,6 +23,7 @@
 //!   that exposes the mesh's capabilities to a local MCP host as meta-tools,
 //!   with pre-flight validation and a shim-side consent gate (Phase 2).
 
+pub mod bridge;
 pub mod serve;
 pub mod spec;
 pub mod wrap;

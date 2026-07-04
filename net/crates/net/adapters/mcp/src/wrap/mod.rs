@@ -13,6 +13,7 @@
 //! wrapped tools, lowers them, and serves each [`WrapInvokeHandler`] on the
 //! mesh — plus the `net wrap` CLI command that drives it.
 
+pub mod catalog;
 pub mod credentials;
 pub mod descriptor;
 pub mod invoke;
