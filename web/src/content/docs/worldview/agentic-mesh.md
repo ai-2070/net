@@ -88,7 +88,3 @@ addressed artifacts (Dataforts) are all layers on one encrypted, brokerless
 transport. That's why the agentic story holds up: it's not a thin coordination
 API over someone else's cloud — it's discovery, presence, policy, events, and
 artifacts on infrastructure you own.
-
-Next: [When to Use Net (and When Not To)](/docs/worldview/right-and-wrong-use-cases).
-And in the guides, [Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)
-is the one idea that explains why an agent needs events, not just a status code.

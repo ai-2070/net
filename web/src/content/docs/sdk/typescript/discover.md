@@ -42,8 +42,3 @@ for (const t of listTools(node)) {
 Tool descriptors lower to provider tool-call formats (e.g. an OpenAI `tools` array
 entry) via the `openai` helpers, so a discovered tool feeds straight into a
 chat-completion call.
-
-## Next
-
-[Invoke](/docs/sdk/typescript/invoke) — call one of the capabilities you found. The
-same step in Rust is [here](/docs/sdk/rust/discover).

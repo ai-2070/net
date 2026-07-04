@@ -71,10 +71,3 @@ end-to-end patterns are in
 > Retry `BackpressureError`. Treat serialization/config errors as bugs, auth errors
 > as "get a new credential," and `NotConnectedError` / closed streams as state
 > changes retrying won't fix.
-
-## Back to the spine
-
-The whole loop: [announce](/docs/sdk/typescript/announce) →
-[discover](/docs/sdk/typescript/discover) → [invoke](/docs/sdk/typescript/invoke) →
-[watch](/docs/sdk/typescript/watch) → [artifacts](/docs/sdk/typescript/artifacts) →
-recover. Same spine in [Rust](/docs/sdk/rust) and the other bindings.

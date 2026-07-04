@@ -70,6 +70,3 @@ capability returns a "not permitted — request a pin" result, and the model can
 call `net_request_pin` to queue the human approval. Wrapper policy always wins:
 a pin is *local client consent*, not remote authorization — if the remote
 wrapper's owner scope excludes you, the pin doesn't override it.
-
-Next: [Discover and Invoke](/docs/guides/discover-and-invoke) — the native path,
-without an MCP host in the middle.

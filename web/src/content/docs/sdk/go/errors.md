@@ -35,10 +35,3 @@ end-to-end patterns are in
 > Retry on backpressure. Treat serialization/config errors as bugs, auth errors as
 > "get a new credential," and shutdown / not-connected as state changes retrying
 > won't fix.
-
-## Back to the spine
-
-The whole loop: [announce](/docs/sdk/go/announce) → [discover](/docs/sdk/go/discover)
-→ [invoke](/docs/sdk/go/invoke) → [watch](/docs/sdk/go/watch) →
-[artifacts](/docs/sdk/go/artifacts) → recover. Same spine in the
-[other bindings](/docs/sdk/rust).

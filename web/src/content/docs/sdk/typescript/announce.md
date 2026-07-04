@@ -53,7 +53,3 @@ Announcing makes a capability **discoverable**, not open. Visibility and invocat
 are separate — a credentialed capability can be visible while invocable only by its
 owner. The boundary is enforced on invoke, not announce — see
 [Invoke](/docs/sdk/typescript/invoke).
-
-## Next
-
-[Discover](/docs/sdk/typescript/discover).

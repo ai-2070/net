@@ -40,7 +40,3 @@ forever.
 The same subscribe code works whether the publisher is in-process or several hops
 away on the mesh. The concepts are in [Channels](/docs/concepts/channels) and
 [Events and Causality](/docs/concepts/events-and-causality).
-
-## Next
-
-[Artifacts](/docs/sdk/python/artifacts).

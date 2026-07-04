@@ -51,8 +51,3 @@ const node = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk });
 A `MeshNode` speaks encrypted UDP to peers and carries capabilities and nRPC. From
 here the loop is [Announce](/docs/sdk/typescript/announce) →
 [Discover](/docs/sdk/typescript/discover) → [Invoke](/docs/sdk/typescript/invoke).
-
-## Next
-
-[Announce](/docs/sdk/typescript/announce) — put a capability on the mesh. The same
-step in Rust is [here](/docs/sdk/rust/announce).

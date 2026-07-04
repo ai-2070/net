@@ -44,8 +44,3 @@ node = MeshNode(bind_addr="127.0.0.1:0", psk="42" * 32)   # psk is a 32-byte hex
 Note the PSK here is a **hex string** (not raw bytes as in Rust). From here the
 loop is [Announce](/docs/sdk/python/announce) →
 [Discover](/docs/sdk/python/discover) → [Invoke](/docs/sdk/python/invoke).
-
-## Next
-
-[Announce](/docs/sdk/python/announce). Same step in
-[Rust](/docs/sdk/rust/announce) / [TypeScript](/docs/sdk/typescript/announce).

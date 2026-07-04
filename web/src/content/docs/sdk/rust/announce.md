@@ -73,7 +73,3 @@ invocation are separate: a credentialed capability can be visible while invocabl
 only by its owner. That boundary is enforced on invoke, not on announce — see
 [Invoke](/docs/sdk/rust/invoke) and, for wrapped MCP tools,
 [Wrap an MCP Server](/docs/guides/wrap-mcp-server).
-
-## Next
-
-[Discover](/docs/sdk/rust/discover) — find capabilities from another node.

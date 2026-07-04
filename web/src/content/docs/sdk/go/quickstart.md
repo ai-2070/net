@@ -65,7 +65,3 @@ node, err := net.NewMeshNode(net.MeshConfig{
 
 From here: [Announce](/docs/sdk/go/announce) → [Discover](/docs/sdk/go/discover) →
 [Invoke](/docs/sdk/go/invoke).
-
-## Next
-
-[Announce](/docs/sdk/go/announce).

@@ -61,5 +61,3 @@ stateful* — and when it isn't, the honest answer is to use the simpler thing.
 If you're not sure which side of the line you're on, ask: *does anything need to
 be discovered at runtime, and does the work have state I have to observe or
 recover?* Two nos means you don't need Net yet. One yes is worth reading on.
-
-Next: [MCP vs Net](/docs/worldview/mcp-vs-net).

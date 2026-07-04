@@ -56,7 +56,3 @@ Richer predicates (numeric, semver, AND/OR/NOT) and the CLI equivalent
 Discovery is **advisory** — it tells you who *can*, with no exclusivity. To
 atomically claim a contended exclusive resource, that's the scheduler, not
 `find_nodes`.
-
-## Next
-
-[Invoke](/docs/sdk/rust/invoke) — call one of the capabilities you found.

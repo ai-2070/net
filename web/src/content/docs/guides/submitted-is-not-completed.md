@@ -126,7 +126,3 @@ did**, so an agent can recover instead of trusting a green button.
   a reason, not the absence of a success event.
 - **Success is a projection the consumer computes** over facts, not a boolean the
   producer stamps on the wire.
-
-Next: [Using the Event Bus](/docs/guides/event-bus) — the place those facts flow.
-For recovering when a step fails, see
-[Recover a Failed Workflow](/docs/guides/recover-failed-workflow).

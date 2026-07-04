@@ -76,5 +76,3 @@ runtime, use MCP directly — you don't need a mesh
 ([When to Use Net](/docs/worldview/right-and-wrong-use-cases)). Reach for Net when
 the tools live somewhere else, the set changes, credentials must stay put, or the
 work has state you have to observe and recover.
-
-Next: [REST vs Net](/docs/worldview/rest-vs-net).

@@ -49,7 +49,3 @@ let events = mesh.recv(64).await?;         // poll a batch of StoredEvent
 The bus is location-transparent — the same subscribe/consume code works whether the
 publisher is in-process or several hops away. The concepts are in
 [Channels](/docs/concepts/channels) and [Events and Causality](/docs/concepts/events-and-causality).
-
-## Next
-
-[Artifacts](/docs/sdk/rust/artifacts) — when the "event" is too big to put on the bus.

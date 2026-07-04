@@ -43,7 +43,3 @@ mirrors the other SDKs (name, description, tags, typed handler).
 
 Announcing makes a capability discoverable, not open. The visible/invocable
 boundary is enforced on invoke, not announce — see [Invoke](/docs/sdk/go/invoke).
-
-## Next
-
-[Discover](/docs/sdk/go/discover).

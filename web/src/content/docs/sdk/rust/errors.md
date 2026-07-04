@@ -63,10 +63,3 @@ to a standby when the primary dies. The end-to-end patterns are in
 > Retry `Backpressure` (and a transient `Unrouted`, briefly). Treat
 > `Serialization` / `Config` as bugs, auth errors as "get a new credential," and
 > `Shutdown` / `NotConnected` / `Closed` as state changes retrying won't fix.
-
-## Back to the spine
-
-You've walked the whole loop: [announce](/docs/sdk/rust/announce) →
-[discover](/docs/sdk/rust/discover) → [invoke](/docs/sdk/rust/invoke) →
-[watch](/docs/sdk/rust/watch) → [artifacts](/docs/sdk/rust/artifacts) → recover.
-The same spine runs in every binding — [SDK index](/docs/sdk/rust).

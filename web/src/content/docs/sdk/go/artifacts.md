@@ -28,7 +28,3 @@ move a blob from Go, shelling out to `net-mesh transfer`.
 Artifacts are a **native** capability. Tools brought in through the
 [MCP bridge](/docs/guides/wrap-mcp-server) are `mcp_bridge` tier —
 request/response only.
-
-## Next
-
-[Errors](/docs/sdk/go/errors).

@@ -51,7 +51,3 @@ The header states them, and they're the whole discipline of the C ABI:
 - Poll results from `net_poll_ex()` are freed with **`net_free_poll_result()`**.
 - Strings from `net_generate_keypair()` (and similar) are freed with
   **`net_free_string()`**.
-
-## Next
-
-[Errors](/docs/sdk/c/errors).

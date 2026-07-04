@@ -90,7 +90,3 @@ If your agent lives in an MCP host, you don't call `call_typed` directly — the
 host calls the `net_invoke_capability` meta-tool exposed by
 [`net mcp serve`](/docs/guides/expose-net-as-mcp), which performs the same nRPC
 invocation under the hood, gated by the pin/consent flow.
-
-Next: [Recover a Failed Workflow](/docs/guides/recover-failed-workflow) — because
-discovering and invoking is only half the job; the other half is what happens when
-the call fails.

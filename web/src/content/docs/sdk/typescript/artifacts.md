@@ -43,7 +43,3 @@ point; that guide is the full surface.
 Artifacts are a **native** capability. Tools brought in through the
 [MCP bridge](/docs/guides/wrap-mcp-server) are `mcp_bridge` tier —
 request/response only. If your work needs to move bytes, it's a native capability.
-
-## Next
-
-[Errors](/docs/sdk/typescript/errors).

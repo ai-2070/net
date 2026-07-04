@@ -99,6 +99,3 @@ The CLI wraps the SDK primitive `net_mcp::wrap::wrap_server`. To wrap a server
 from inside your own process (so the wrapping node is one you also program
 against), call it directly against a `Mesh` you built — the end-to-end path is
 demonstrated in `adapters/mcp/tests/wrap_end_to_end.rs`.
-
-Next: [Expose Net as MCP](/docs/guides/expose-net-as-mcp) — the other direction,
-so an MCP host can use the mesh.

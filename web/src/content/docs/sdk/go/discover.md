@@ -36,7 +36,3 @@ for _, t := range tools {
 
 Folding is asynchronous — poll `ListTools` until the tool you expect appears rather
 than assuming it's there on the first call.
-
-## Next
-
-[Invoke](/docs/sdk/go/invoke).

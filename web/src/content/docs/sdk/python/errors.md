@@ -45,11 +45,3 @@ exact helper surface are in
 > Retry `BackpressureError`. Treat serialization/config errors as bugs, auth errors
 > as "get a new credential," and `NotConnectedError` / closed streams as state
 > changes retrying won't fix.
-
-## Back to the spine
-
-The whole loop: [announce](/docs/sdk/python/announce) →
-[discover](/docs/sdk/python/discover) → [invoke](/docs/sdk/python/invoke) →
-[watch](/docs/sdk/python/watch) → [artifacts](/docs/sdk/python/artifacts) →
-recover. Same spine in [Rust](/docs/sdk/rust) and
-[TypeScript](/docs/sdk/typescript).

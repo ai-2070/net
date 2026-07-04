@@ -40,7 +40,3 @@ tool API above unless you specifically need raw tags.
 Announcing makes a capability discoverable, not open. Visibility and invocation are
 separate; the boundary is enforced on invoke, not announce — see
 [Invoke](/docs/sdk/python/invoke).
-
-## Next
-
-[Discover](/docs/sdk/python/discover).

@@ -35,7 +35,3 @@ an adapter), covered in [Durable Logs](/docs/guides/durable-logs).
 
 For a live loop, keep calling `Poll` on an interval; an empty `NextID` means you've
 caught up to the tail.
-
-## Next
-
-[Artifacts](/docs/sdk/go/artifacts).

@@ -59,7 +59,3 @@ verified against the authenticated caller origin, regardless of who can *see* it
 For wrapped MCP tools this is the owner-scope / consent model in
 [Wrap an MCP Server](/docs/guides/wrap-mcp-server) and
 [Expose Net as MCP](/docs/guides/expose-net-as-mcp).
-
-## Next
-
-[Watch](/docs/sdk/rust/watch) — observe the events the work emits.

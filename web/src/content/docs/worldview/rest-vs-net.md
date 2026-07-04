@@ -45,6 +45,3 @@ events) on the other. The HTTP system stays in its world; the mesh stays in
 > first-class REST adapter shipped today (unlike the MCP, Redis, and JetStream
 > adapters). If you're building an edge adapter, model it as a capability
 > announcer, and keep the HTTP surface at the boundary.
-
-Back to [the worldview index](/docs/worldview), or continue to
-[What is Net?](/docs/start/what-is-net) for the mechanism.

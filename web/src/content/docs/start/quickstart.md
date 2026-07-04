@@ -78,7 +78,7 @@ Once configured, ingestion and consumption work identically — `ingest()` publi
 
 That's the part that takes longer than five minutes to fully explore — channel naming, visibility scopes, durable persistence, capability-based authorization — but the call shape never changes. Once you have the loop above working locally, the rest is configuration.
 
-## Next: the agentic path
+## The agentic path
 
 The event bus above is the substrate. Net's flagship use is agents discovering and
 invoking work across the mesh — a different loop on the same foundation:

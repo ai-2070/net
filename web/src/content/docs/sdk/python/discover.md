@@ -33,7 +33,3 @@ equivalent (`net cap query --tag …`). For most Python agent code, the tool API
 above is the path you want.
 
 Discovery is **advisory** — it tells you who *can*, with no exclusivity.
-
-## Next
-
-[Invoke](/docs/sdk/python/invoke).

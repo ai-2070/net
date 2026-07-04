@@ -60,10 +60,3 @@ let mesh = MeshBuilder::new("127.0.0.1:0", &PSK)?.build().await?;
 A `Mesh` node speaks encrypted UDP to peers and carries capabilities, tools, and
 nRPC. Two `Mesh` nodes handshake and then discover each other's capabilities — the
 runnable two-node version is `sdk/examples/tool_calling.rs`.
-
-## Next
-
-- [Announce](/docs/sdk/rust/announce) — put a capability on the mesh.
-- Same spine in the other bindings: the [SDK index](/docs/sdk/rust) lists them; the
-  `Net::builder()` / `emit` shape is identical in TypeScript and Python, poll-based
-  in Go and C.

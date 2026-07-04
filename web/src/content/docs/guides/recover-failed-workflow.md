@@ -87,6 +87,3 @@ the `WorkflowAdapter` and task-lifecycle events; the principle is the one from
 [Submitted Is Not Completed](/docs/guides/submitted-is-not-completed): **distinct
 outcomes are distinct events**, so a partial failure is a first-class, subscribable
 fact your agent can recover from.
-
-Back to [the guides](/docs/guides), or up to
-[When to Use Net](/docs/worldview/right-and-wrong-use-cases).

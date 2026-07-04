@@ -42,7 +42,3 @@ Seeing a capability does not grant the right to invoke it. A provider enforces
 scope at call time — an owner-only capability rejects a caller outside its scope,
 regardless of who can see it. For wrapped MCP tools this is the owner-scope /
 consent model in [Wrap an MCP Server](/docs/guides/wrap-mcp-server).
-
-## Next
-
-[Watch](/docs/sdk/go/watch).

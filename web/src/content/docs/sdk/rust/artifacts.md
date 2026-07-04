@@ -56,7 +56,3 @@ Artifacts are a **native** capability. Tools brought in through the
 [MCP bridge](/docs/guides/wrap-mcp-server) are `mcp_bridge` tier —
 request/response only, no artifacts. If your work needs to move bytes, it's a
 native capability, not a wrapped one.
-
-## Next
-
-[Errors](/docs/sdk/rust/errors) — what to do when a call, a stream, or a fetch fails.
