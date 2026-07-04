@@ -213,12 +213,17 @@ impl ForwardingStore {
                 }
                 // Revalidate every persisted policy with the *same* rules the
                 // write-time mutators enforce, so a config hand-edited into a
-                // forbidden state (a cookie secret without the acknowledgement,
-                // a secret bound to any provider, a hop-by-hop or credential
-                // plain header) is rejected on load instead of silently becoming
-                // active. Store safety checks can't be bypassed by editing the
-                // JSON directly.
+                // forbidden state (a value-shaped or otherwise malformed ref
+                // name, a cookie secret without the acknowledgement, a secret
+                // bound to any provider, a hop-by-hop or credential plain header)
+                // is rejected on load instead of silently becoming active. Store
+                // safety checks can't be bypassed by editing the JSON directly.
                 for (ref_name, policy) in &file.forwarding.secrets {
+                    // The ref-name charset/length rule is a write-time guard
+                    // (`set_secret`), so it must be re-enforced here too — a
+                    // hand-edited config keyed by a raw token would otherwise
+                    // load active and leak that token through `audit()`.
+                    validate_ref_name(ref_name).map_err(|e| corrupt(e.to_string()))?;
                     policy
                         .validate(ref_name)
                         .map_err(|e| corrupt(e.to_string()))?;
@@ -776,6 +781,34 @@ mod tests {
             load_json(plain).await.unwrap_err(),
             StoreError::Corrupt { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn load_rejects_a_malformed_ref_name() {
+        // The ref-name charset/length rule is enforced at write time; load must
+        // re-enforce it, or a hand-edited config keyed by a raw token loads
+        // active and leaks the token through the audit surface.
+        for bad_ref in ["ghp_LIVETOKENvalueABC123", "Github-Token", "has space", ""] {
+            // Build the secrets map explicitly so the ref name is a *dynamic*
+            // key (a bare variable in `json!{{ key: .. }}` would be taken as a
+            // literal).
+            let mut secrets = serde_json::Map::new();
+            secrets.insert(
+                bad_ref.to_string(),
+                serde_json::json!({
+                    "header": "Authorization",
+                    "allow": { "providers": ["node-1"], "capabilities": ["*"] }
+                }),
+            );
+            let json = serde_json::json!({
+                "schema_version": 1,
+                "forwarding": { "enabled": true, "secrets": serde_json::Value::Object(secrets) }
+            });
+            assert!(
+                matches!(load_json(json).await.unwrap_err(), StoreError::Corrupt { .. }),
+                "ref name {bad_ref:?} must be rejected on load",
+            );
+        }
     }
 
     #[tokio::test]
