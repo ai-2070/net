@@ -593,34 +593,48 @@ const RESERVED_TOOL_NAMES: [&str; 5] = [
     meta_tools::name::REQUEST_PIN,
 ];
 
-/// Deterministically assign a unique, host-safe first-class tool name to each
-/// approved-pinned capability.
+/// Assign a unique, host-safe first-class tool name to each approved-pinned
+/// capability — as a **pure function of the capability id**, independent of
+/// which *other* pins happen to be approved.
 ///
-/// The base name from [`safe_tool_name`] is lossy (character replacement +
-/// 64-char truncation), so two distinct capability ids can map to the same base
-/// — and a base can even equal a meta-tool name. Both are disambiguated with a
-/// short, deterministic hash of the full id, so `tools/list` never exposes
-/// duplicate names and `tools/call` resolves the right capability. `approved`
-/// must be deterministically ordered (it comes from
-/// [`PinStore::approved`](super::pins::PinStore::approved), sorted by id) so
-/// promotion and dispatch — which both call this — agree on the assignment.
+/// Making the name id-local (rather than giving the first claimant the bare
+/// base name and suffixing later collisions) is what keeps `tools/list` and a
+/// later `tools/call` in agreement across an out-of-band
+/// `net mcp pin approve/reject`: a name the host cached from an earlier list can
+/// never be *reassigned* to a different capability when the approved set changes
+/// (F9). A stale cached name resolves either to the same capability or to
+/// nothing (a safe "unknown tool"), never to another one with the caller's
+/// arguments. `approved` is still deterministically ordered
+/// ([`PinStore::approved`](super::pins::PinStore::approved), sorted by id), but
+/// the assignment no longer depends on that order.
 fn assign_pinned_tool_names(approved: &[CapabilityId]) -> Vec<(CapabilityId, String)> {
-    let mut used: HashSet<String> = RESERVED_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
-    let mut assigned = Vec::with_capacity(approved.len());
-    for id in approved {
-        let base = safe_tool_name(id);
-        let mut name = base.clone();
-        // On any collision (with a reserved name or an earlier pin), suffix a
-        // hash; the salt increments so a residual hash collision still resolves.
-        let mut salt = 0u32;
-        while used.contains(&name) {
-            name = with_hash_suffix(&base, id, salt);
-            salt += 1;
+    approved
+        .iter()
+        .map(|id| (id.clone(), stable_pinned_tool_name(id)))
+        .collect()
+}
+
+/// The host-safe first-class tool name for one pinned capability — a pure
+/// function of its id (see [`assign_pinned_tool_names`]).
+///
+/// The lossy [`safe_tool_name`] base (character replacement + truncation) is
+/// *always* suffixed with a deterministic hash of the full id, so the name
+/// depends only on `id`. The salt advances solely to dodge a fixed reserved
+/// meta-tool name (never a collision with another pin), keeping the result
+/// independent of the approved set. A residual hash collision between two
+/// distinct ids sharing a base is astronomically unlikely; if it ever happened
+/// they would share a name — no worse than the pre-existing lossy-base
+/// collision, and still not a cross-capability *remap*.
+fn stable_pinned_tool_name(id: &CapabilityId) -> String {
+    let base = safe_tool_name(id);
+    let mut salt = 0u32;
+    loop {
+        let name = with_hash_suffix(&base, id, salt);
+        if !RESERVED_TOOL_NAMES.contains(&name.as_str()) {
+            return name;
         }
-        used.insert(name.clone());
-        assigned.push((id.clone(), name));
+        salt += 1;
     }
-    assigned
 }
 
 /// `base` (trimmed to fit) plus `_<6 hex>`, a deterministic hash of the id and
@@ -1371,6 +1385,9 @@ mod tests {
             store.approve(&CapabilityId::parse("nodeb/secret").unwrap());
             store.save().await.unwrap();
         }
+        // The first-class name is a pure function of the id (F9), so compute it
+        // the same way the shim does rather than hard-coding a spelling.
+        let secret_name = stable_pinned_tool_name(&CapabilityId::parse("nodeb/secret").unwrap());
         let out = run_pinned(
             gateway_with_echo_and_secret(),
             ConsentPolicy::new(),
@@ -1379,7 +1396,7 @@ mod tests {
                 req(1, method::TOOLS_LIST, json!({})),
                 // Invoke it by its first-class name — arguments are the tool's
                 // own, no meta-tool wrapper, and consent is satisfied by the pin.
-                call(2, "nodeb_secret", json!({ "message": "direct" })),
+                call(2, &secret_name, json!({ "message": "direct" })),
             ],
         )
         .await;
@@ -1389,7 +1406,7 @@ mod tests {
         assert_eq!(tools.len(), 6, "{tools:?}");
         let promoted = tools
             .iter()
-            .find(|t| t["name"] == "nodeb_secret")
+            .find(|t| t["name"].as_str() == Some(secret_name.as_str()))
             .expect("the pinned capability is a first-class tool");
         assert_eq!(promoted["inputSchema"]["type"], "object");
         assert_eq!(promoted["title"], "nodeb/secret");
@@ -1420,12 +1437,13 @@ mod tests {
             "none",
             json!({ "type": "object" }),
         )]);
+        let ping_name = stable_pinned_tool_name(&CapabilityId::parse("nodeb/ping").unwrap());
         let out = run_pinned(
             gw,
             ConsentPolicy::new(),
             path,
             // A promoted pinned tool called with NO `arguments` field.
-            &[req(1, method::TOOLS_CALL, json!({ "name": "nodeb_ping" }))],
+            &[req(1, method::TOOLS_CALL, json!({ "name": ping_name }))],
         )
         .await;
         let invoked = tool_result(&out[0]);
@@ -1505,6 +1523,44 @@ mod tests {
         // Each name resolves back to a distinct original id.
         let ids: HashSet<String> = assigned.iter().map(|(id, _)| id.display()).collect();
         assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn pinned_name_is_independent_of_the_approved_set() {
+        // F9: a capability's first-class name is a pure function of its id, so
+        // approving/rejecting OTHER pins out of band never remaps a name the
+        // host cached from an earlier tools/list onto a different capability.
+        let assigned_name = |set: &[CapabilityId], want: &CapabilityId| -> String {
+            assign_pinned_tool_names(set)
+                .into_iter()
+                .find(|(id, _)| id == want)
+                .map(|(_, n)| n)
+                .expect("assigned")
+        };
+
+        let x = CapabilityId::parse("nodeb/deploy").unwrap();
+        let y = CapabilityId::parse("nodeb/delete").unwrap();
+        assert_eq!(
+            assigned_name(&[x.clone()], &x),
+            assigned_name(&[x.clone(), y.clone()], &x),
+            "x's name must not depend on whether y is approved",
+        );
+
+        // Even two ids that share a lossy base each keep a stable name whether
+        // or not the other is approved — and they never collide.
+        let a = CapabilityId::new("nodeb", "a.b");
+        let b = CapabilityId::new("nodeb", "a_b");
+        assert_eq!(safe_tool_name(&a), safe_tool_name(&b), "precondition: same base");
+        assert_eq!(
+            assigned_name(&[a.clone()], &a),
+            assigned_name(&[a.clone(), b.clone()], &a),
+            "a's name is stable regardless of b",
+        );
+        assert_ne!(
+            assigned_name(&[a.clone(), b.clone()], &a),
+            assigned_name(&[a.clone(), b.clone()], &b),
+            "distinct ids still get distinct names",
+        );
     }
 
     #[tokio::test]
