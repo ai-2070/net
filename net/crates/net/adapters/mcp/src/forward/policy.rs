@@ -269,10 +269,16 @@ impl ForwardingConfig {
             .iter()
             .find(|(name, _)| HeaderName::parse(name).ok().as_ref() == Some(&target));
         let (ref_name, policy) = entry.ok_or(DenialLevel::PerHeader)?;
-        if !target.is_forwardable() {
+        policy.allow.permits(provider, capability)?;
+        // A plain header must be end-to-end AND non-credential: a security-
+        // sensitive header (Authorization / Cookie / Set-Cookie) never rides
+        // the plain path — that's what the secret path (with its stricter
+        // gates) is for. Checked *after* `permits` so a capability / provider
+        // mismatch reports at the same level `decide_secret` would (its
+        // forwardability check is likewise post-`permits`).
+        if !target.is_forwardable() || target.is_security_sensitive() {
             return Err(DenialLevel::PerHeader);
         }
-        policy.allow.permits(provider, capability)?;
         Ok(SendGrant {
             granted_by: ref_name.clone(),
             header: target,
@@ -519,6 +525,40 @@ mod tests {
         assert!(cfg.decide_plain("X-TRACE-ID", "n", "svc.a").is_ok());
         assert_eq!(
             cfg.decide_plain("x-trace-id", "n", "other.a"),
+            Err(DenialLevel::PerCapability),
+        );
+    }
+
+    #[test]
+    fn plain_path_refuses_security_sensitive_headers() {
+        // Even with a fully-matching allowlist, a credential header can't ride
+        // the plain path — that's what the (stricter) secret path is for.
+        let cfg = cfg_json(serde_json::json!({
+            "enabled": true,
+            "plain_headers": {
+                "Authorization": { "allow": { "providers": "any", "capabilities": ["*"] } }
+            }
+        }));
+        assert_eq!(
+            cfg.decide_plain("Authorization", "n", "any.cap"),
+            Err(DenialLevel::PerHeader),
+        );
+    }
+
+    #[test]
+    fn plain_denial_order_matches_secret() {
+        // A non-forwardable plain header + capability mismatch reports
+        // PerCapability (permits runs first) — the same level decide_secret
+        // reports for the analogous case, now that the forwardability check is
+        // post-permits in both.
+        let cfg = cfg_json(serde_json::json!({
+            "enabled": true,
+            "plain_headers": {
+                "Connection": { "allow": { "providers": "any", "capabilities": ["svc.*"] } }
+            }
+        }));
+        assert_eq!(
+            cfg.decide_plain("Connection", "n", "other.x"),
             Err(DenialLevel::PerCapability),
         );
     }
