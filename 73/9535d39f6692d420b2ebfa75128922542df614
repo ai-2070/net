@@ -1,0 +1,24 @@
+net/crates/net/adapters/mcp/src/bin/fixture.rs
+  s_759aaad81078ca::t_8bd8724fac729d 79-94
+net/crates/net/adapters/mcp/src/wrap/stdio.rs
+  s_759aaad81078ca::t_c9405d9cb0b12b 354-361,363-364
+net/crates/net/adapters/mcp/tests/stdio_round_trip.rs
+  s_759aaad81078ca::t_2fe7ce212a9d88 89-108
+  s_759aaad81078ca::t_e7c75763a29c83 88
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "739535d39f6692d420b2ebfa75128922542df614",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
