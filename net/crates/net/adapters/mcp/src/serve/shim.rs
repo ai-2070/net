@@ -420,6 +420,20 @@ impl<G: CapabilityGateway> Shim<G> {
     /// the `net_invoke_capability` meta-tool and the first-class pinned-tool
     /// dispatch.
     async fn invoke_capability(&self, id: &CapabilityId, tool_args: Value) -> CallToolResult {
+        // A no-argument invocation can arrive as JSON `null`: the host omitted
+        // `arguments` on a promoted pinned tool (which deserializes to
+        // `Value::Null`), or passed `"arguments": null` explicitly. MCP tool
+        // arguments are an object, so normalize `null` to `{}` here — the one
+        // place both the `net_invoke_capability` meta-tool and the first-class
+        // pinned-tool dispatch route through — rather than only in the meta-tool
+        // path. Otherwise a no-arg pinned tool fails pre-flight validation while
+        // the same capability invoked via `net_invoke_capability` succeeds.
+        let tool_args = if tool_args.is_null() {
+            json!({})
+        } else {
+            tool_args
+        };
+
         // Describe first — the single source of truth for the schema (for
         // pre-flight validation) and the credential status (for consent).
         let detail = match self.gateway.describe(id).await {
@@ -1386,6 +1400,37 @@ mod tests {
             "pinned first-class tool runs: {invoked:?}"
         );
         assert!(invoked.text().contains("invoked nodeb/secret"));
+    }
+
+    #[tokio::test]
+    async fn a_no_arg_pinned_tool_invoked_without_arguments_succeeds() {
+        // Regression (F6): the host may omit `arguments` on a promoted pinned
+        // tool, which deserializes to JSON null. That must behave like the same
+        // capability invoked via net_invoke_capability (which defaults a missing
+        // `arguments` to `{}`) — not fail pre-flight validation against the
+        // tool's object schema.
+        let (_dir, path) = pin_path();
+        {
+            let mut store = PinStore::load(&path).await.unwrap();
+            store.approve(&CapabilityId::parse("nodeb/ping").unwrap());
+            store.save().await.unwrap();
+        }
+        let gw = InMemoryGateway::new(vec![detail(
+            "nodeb/ping",
+            "none",
+            json!({ "type": "object" }),
+        )]);
+        let out = run_pinned(
+            gw,
+            ConsentPolicy::new(),
+            path,
+            // A promoted pinned tool called with NO `arguments` field.
+            &[req(1, method::TOOLS_CALL, json!({ "name": "nodeb_ping" }))],
+        )
+        .await;
+        let invoked = tool_result(&out[0]);
+        assert!(!invoked.is_error, "no-arg pinned tool runs: {invoked:?}");
+        assert!(invoked.text().contains("invoked nodeb/ping with {}"));
     }
 
     #[tokio::test]
