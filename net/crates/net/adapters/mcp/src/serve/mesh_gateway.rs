@@ -33,6 +33,7 @@ use serde_json::Value;
 use super::backend::{
     CapabilityDetail, CapabilityGateway, CapabilityId, CapabilitySummary, GatewayError,
 };
+use super::grouping::{group_capabilities, CapabilityGroup};
 use crate::bridge::{
     BridgedToolInfo, DescribeRequest, DescribeResponse, BRIDGE_PROVIDER_TAG, DESCRIBE_SERVICE,
 };
@@ -141,20 +142,27 @@ impl CapabilityGateway for MeshGateway {
             .collect()
             .await;
 
-        let mut out = Vec::new();
+        // Flatten every reachable provider's catalog into (provider, tool)
+        // pairs. Any per-provider failure makes that provider invisible — never
+        // fail the whole search. Concretely: `Denied` (out of owner scope),
+        // `Transport` (unreachable, or serving no describe service — a `NoRoute`
+        // maps here), or `Other` (a catalog we couldn't decode). One bad or
+        // hostile provider must not abort global discovery.
+        let mut discovered: Vec<(u64, BridgedToolInfo)> = Vec::new();
         for (node, result) in catalogs {
-            // Any per-provider failure makes that provider invisible — never
-            // fail the whole search. Concretely: `Denied` (out of owner scope),
-            // `Transport` (unreachable, or serving no describe service — a
-            // `NoRoute` maps here), or `Other` (a catalog we couldn't decode).
-            // One bad or hostile provider must not abort global discovery.
             let Ok(catalog) = result else { continue };
             for t in catalog.tools {
-                if q.is_empty() || matches_query(&t, &q) {
-                    out.push(summary(node, t));
-                }
+                discovered.push((node, t));
             }
         }
+
+        // Collapse interchangeable providers into one logical capability each
+        // (Phase 4), then filter by the query.
+        let out = group_capabilities(discovered)
+            .into_iter()
+            .filter(|g| q.is_empty() || matches_query(&g.info, &q))
+            .map(group_summary)
+            .collect();
         Ok(out)
     }
 
@@ -260,14 +268,16 @@ fn matches_query(t: &BridgedToolInfo, q: &str) -> bool {
             .unwrap_or(false)
 }
 
-/// Build a search summary for a discovered tool on `node`.
-fn summary(node: u64, t: BridgedToolInfo) -> CapabilitySummary {
+/// Build a search summary for a grouped logical capability. The id is the
+/// primary provider's; `providers` lists all of them so invoke can fail over.
+fn group_summary(group: CapabilityGroup) -> CapabilitySummary {
     CapabilitySummary {
-        id: CapabilityId::new(node.to_string(), t.tool_id),
-        name: t.name,
-        description: t.description,
-        compat_tier: t.compat_tier,
-        credential_status: t.credential_status,
+        id: CapabilityId::new(group.primary().to_string(), group.capability.clone()),
+        name: group.info.name,
+        description: group.info.description,
+        compat_tier: group.info.compat_tier,
+        credential_status: group.info.credential_status,
+        providers: group.providers,
     }
 }
 
@@ -330,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_uses_node_id_as_provider() {
+    fn group_summary_uses_primary_node_and_lists_providers() {
         let info = BridgedToolInfo {
             tool_id: "echo".into(),
             name: "Echo".into(),
@@ -340,11 +350,17 @@ mod tests {
             version: "1".into(),
             compat_tier: "mcp_bridge".into(),
             credential_status: "none".into(),
-            substitutability: "provider_local".into(),
+            substitutability: "provider_equivalent".into(),
             visibility: "owner_only".into(),
             invocation_scope: "same_root_identity".into(),
         };
-        let s = summary(42, info);
-        assert_eq!(s.id.display(), "42/echo");
+        let group = CapabilityGroup {
+            capability: "echo".into(),
+            providers: vec![42, 99],
+            info,
+        };
+        let s = group_summary(group);
+        assert_eq!(s.id.display(), "42/echo", "id uses the primary provider");
+        assert_eq!(s.providers, vec![42, 99]);
     }
 }

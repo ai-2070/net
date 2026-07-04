@@ -83,7 +83,9 @@ impl std::fmt::Display for CapabilityId {
 /// by the shim from its consent policy, not carried here.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CapabilitySummary {
-    /// Canonical id.
+    /// Canonical id — the *primary* provider's id when this row is a collapsed
+    /// group of interchangeable providers (Phase 4). Invoke fails over across
+    /// the other `providers`.
     pub id: CapabilityId,
     /// Human-facing name (the descriptor's `name`).
     pub name: String,
@@ -94,6 +96,10 @@ pub struct CapabilitySummary {
     /// Credential status wire form (`credentialed` / `external_api` /
     /// `unknown` / `none`); drives the consent gate.
     pub credential_status: String,
+    /// Every provider node id backing this logical capability, sorted. Length 1
+    /// for a provider-local capability; more when equivalent providers were
+    /// collapsed into one group.
+    pub providers: Vec<u64>,
 }
 
 /// The full describe result: schema + risk/credential status + provider info

@@ -367,6 +367,9 @@ impl<G: CapabilityGateway> Shim<G> {
                     "description": s.description,
                     "compat_tier": s.compat_tier,
                     "credential_status": s.credential_status,
+                    // Provider node ids backing this capability; >1 when
+                    // equivalent providers were collapsed (invoke fails over).
+                    "providers": s.providers,
                     "requires_approval": self.gated_after_pins(&s.id, &s.credential_status, &pins),
                 })
             })
@@ -723,6 +726,9 @@ mod tests {
                     description: c.description.clone(),
                     compat_tier: c.compat_tier.clone(),
                     credential_status: c.credential_status.clone(),
+                    // The in-memory mock doesn't model provider grouping; the
+                    // real MeshGateway populates this and the live test checks it.
+                    providers: Vec::new(),
                 })
                 .collect())
         }
