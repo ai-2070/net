@@ -1,0 +1,36 @@
+net/crates/net/adapters/mcp/src/forward/policy.rs
+  s_759aaad81078ca::t_67133a61025646 1-102,104-105,107-620
+  s_759aaad81078ca::t_180cd217f3147d 103,106
+net/crates/net/adapters/mcp/src/forward/context.rs
+  s_759aaad81078ca::t_f4640b66edcecd 1-341,343-470
+  s_759aaad81078ca::t_fed6f1d3428eef 342
+net/crates/net/adapters/mcp/src/forward/header.rs
+  s_759aaad81078ca::t_83a6ed14b9e623 1-128,131-329
+  s_759aaad81078ca::t_06fb73bd53c8bf 129-130
+net/crates/net/adapters/mcp/src/forward/target.rs
+  s_759aaad81078ca::t_fd0f9904368e76 1-140
+net/crates/net/adapters/mcp/src/forward/mod.rs
+  s_759aaad81078ca::t_558d6b04fad84d 1-90
+net/crates/net/adapters/mcp/src/lib.rs
+  s_759aaad81078ca::t_556d7cb3c9fcd6 25-30,33
+net/crates/net/docs/plans/MCP_CREDENTIAL_FORWARDING_PLAN.md
+  s_759aaad81078ca::t_d3952959d5b16b 9
+  s_759aaad81078ca::t_12b03a8aea00b0 10
+  s_759aaad81078ca::t_8d67b38dca18db 115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9b7a313539749088b016ad00e101f96482e4e729",
+  "prompts": {},
+  "sessions": {
+    "s_759aaad81078ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eab7860-3466-40c5-b449-713e662c5e20",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
