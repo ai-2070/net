@@ -18,14 +18,22 @@ import type { DocsOrderConfig } from "@/lib/docs";
 // resolve to the same entry. Dashes are the canonical (URL) form.
 export const DOCS_ORDER: DocsOrderConfig = {
   sections: [
+    "worldview",
     "start",
-    "concepts",
     "guides",
+    "concepts",
     "reference",
     "tutorials",
     "releases",
   ],
   folders: {
+    worldview: [
+      "agentic-mesh",
+      "submitted-is-not-completed",
+      "right-and-wrong-use-cases",
+      "mcp-vs-net",
+      "rest-vs-net",
+    ],
     start: ["what-is-net", "quickstart", "install"],
     concepts: [
       "architecture",
@@ -101,12 +109,20 @@ export const DOCS_ORDER: DocsOrderConfig = {
   },
   labels: {
     // Sections
+    worldview: "Worldview",
     start: "Start",
     concepts: "Concepts",
     guides: "Guides",
     reference: "Reference",
     tutorials: "Tutorials",
     releases: "Releases",
+
+    // Worldview
+    "worldview/agentic-mesh": "The Agentic Mesh",
+    "worldview/submitted-is-not-completed": "Submitted Is Not Completed",
+    "worldview/right-and-wrong-use-cases": "When to Use Net",
+    "worldview/mcp-vs-net": "MCP vs Net",
+    "worldview/rest-vs-net": "REST vs Net",
 
     // Start
     "start/what-is-net": "What is Net?",

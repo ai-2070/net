@@ -729,6 +729,18 @@ export function HeroSection() {
             not connections.
           </p>
 
+          <p className="text-[13px] text-ink-dim mt-3 max-w-[580px] leading-[1.65]">
+            Flagship use:{" "}
+            <Link
+              href="/docs/worldview/agentic-mesh"
+              className="text-accent no-underline hover:underline"
+            >
+              agentic capability federation
+            </Link>{" "}
+            — agents discovering, invoking, and recovering work across a trusted
+            mesh.
+          </p>
+
           <div className="mt-11 flex gap-3 flex-wrap items-center">
             <Link
               href={globals.links.install}
