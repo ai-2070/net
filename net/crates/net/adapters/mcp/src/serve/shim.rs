@@ -16,6 +16,7 @@
 //! `AsyncBufRead` / `AsyncWrite`, so tests drive it over an in-memory pipe and
 //! the CLI drives it over real stdio.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -316,10 +317,10 @@ impl<G: CapabilityGateway> Shim<G> {
             return Vec::new();
         };
         let mut tools = Vec::new();
-        for id in store.approved() {
+        for (id, name) in assign_pinned_tool_names(&store.approved()) {
             if let Ok(detail) = self.gateway.describe(&id).await {
                 tools.push(crate::spec::Tool {
-                    name: safe_tool_name(&id),
+                    name,
                     title: Some(id.display()),
                     description: detail
                         .description
@@ -333,14 +334,15 @@ impl<G: CapabilityGateway> Shim<G> {
     }
 
     /// Resolve a called first-class tool name to the approved-pinned capability
-    /// it stands for, if any. Deterministic (recomputed from the store each
-    /// call), so no cross-request state is needed.
+    /// it stands for, if any. Uses the same deterministic assignment as
+    /// `promoted_pinned_tools` (recomputed from the store each call), so a
+    /// disambiguated name resolves to exactly the capability it was listed for.
     async fn resolve_pinned_tool(&self, name: &str) -> Option<CapabilityId> {
         let store = self.load_pins().await?;
-        store
-            .approved()
+        assign_pinned_tool_names(&store.approved())
             .into_iter()
-            .find(|id| safe_tool_name(id) == name)
+            .find(|(_, n)| n == name)
+            .map(|(id, _)| id)
     }
 
     async fn tool_search(&self, args: &Value) -> CallToolResult {
@@ -569,11 +571,65 @@ fn parse_cap_id_arg(args: &Value) -> Result<CapabilityId, String> {
     CapabilityId::parse(&raw).map_err(|e| e.to_string())
 }
 
-/// A host-charset-safe first-class tool name for a pinned capability:
-/// `[a-zA-Z0-9_-]`, ≤ 64 chars (the Phase 4 model-facing naming rule). Derived
-/// deterministically from the id's display form so `tools/list` and
-/// `tools/call` agree without shared state. (Disambiguating rare collisions
-/// with a provider suffix is a later refinement.)
+/// The meta-tool names a promoted pinned tool must never take — otherwise it
+/// would be unreachable, since `dispatch_tool` routes a meta-tool name to the
+/// meta-tool branch before it ever consults the pinned tools.
+const RESERVED_TOOL_NAMES: [&str; 5] = [
+    meta_tools::name::SEARCH,
+    meta_tools::name::DESCRIBE,
+    meta_tools::name::INVOKE,
+    meta_tools::name::LIST_PINNED,
+    meta_tools::name::REQUEST_PIN,
+];
+
+/// Deterministically assign a unique, host-safe first-class tool name to each
+/// approved-pinned capability.
+///
+/// The base name from [`safe_tool_name`] is lossy (character replacement +
+/// 64-char truncation), so two distinct capability ids can map to the same base
+/// — and a base can even equal a meta-tool name. Both are disambiguated with a
+/// short, deterministic hash of the full id, so `tools/list` never exposes
+/// duplicate names and `tools/call` resolves the right capability. `approved`
+/// must be deterministically ordered (it comes from
+/// [`PinStore::approved`](super::pins::PinStore::approved), sorted by id) so
+/// promotion and dispatch — which both call this — agree on the assignment.
+fn assign_pinned_tool_names(approved: &[CapabilityId]) -> Vec<(CapabilityId, String)> {
+    let mut used: HashSet<String> = RESERVED_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+    let mut assigned = Vec::with_capacity(approved.len());
+    for id in approved {
+        let base = safe_tool_name(id);
+        let mut name = base.clone();
+        // On any collision (with a reserved name or an earlier pin), suffix a
+        // hash; the salt increments so a residual hash collision still resolves.
+        let mut salt = 0u32;
+        while used.contains(&name) {
+            name = with_hash_suffix(&base, id, salt);
+            salt += 1;
+        }
+        used.insert(name.clone());
+        assigned.push((id.clone(), name));
+    }
+    assigned
+}
+
+/// `base` (trimmed to fit) plus `_<6 hex>`, a deterministic hash of the id and
+/// `salt`, within the 64-char host-name limit.
+fn with_hash_suffix(base: &str, id: &CapabilityId, salt: u32) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.display().hash(&mut hasher);
+    salt.hash(&mut hasher);
+    let suffix = format!("{:06x}", hasher.finish() & 0x00ff_ffff);
+    let max_base = 64usize.saturating_sub(suffix.len() + 1);
+    let mut trimmed = base.to_string();
+    trimmed.truncate(max_base);
+    format!("{trimmed}_{suffix}")
+}
+
+/// A host-charset-safe base name for a pinned capability: `[a-zA-Z0-9_-]`,
+/// ≤ 64 chars (the Phase 4 model-facing naming rule), derived deterministically
+/// from the id's display form. Lossy — see [`assign_pinned_tool_names`], which
+/// resolves the resulting collisions.
 fn safe_tool_name(id: &CapabilityId) -> String {
     let mut name: String = id
         .display()
@@ -1364,6 +1420,46 @@ mod tests {
         assert!(safe_tool_name(&long)
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+    }
+
+    #[test]
+    fn assigned_pinned_names_are_unique_and_avoid_meta_tools() {
+        // `a.b` and `a_b` both sanitize to the same base (a collision), and
+        // `net/search_capabilities` sanitizes to a meta-tool name.
+        let a = CapabilityId::new("nodeb", "a.b");
+        let b = CapabilityId::new("nodeb", "a_b");
+        assert_eq!(
+            safe_tool_name(&a),
+            safe_tool_name(&b),
+            "precondition: same base"
+        );
+        let shadow = CapabilityId::new("net", "search_capabilities");
+        assert!(
+            meta_tools::is_meta_tool(&safe_tool_name(&shadow)),
+            "precondition: sanitizes to a meta-tool name",
+        );
+
+        let approved = vec![a.clone(), b.clone(), shadow.clone()];
+        let assigned = assign_pinned_tool_names(&approved);
+        let names: Vec<String> = assigned.iter().map(|(_, n)| n.clone()).collect();
+
+        // Every assigned name is unique...
+        let unique: HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "names must be unique: {names:?}");
+        // ...none shadows a meta-tool...
+        for n in &names {
+            assert!(!meta_tools::is_meta_tool(n), "{n} shadows a meta-tool");
+            assert!(n.len() <= 64);
+        }
+        // ...and the assignment is deterministic (list ⇄ dispatch agree).
+        let again: Vec<String> = assign_pinned_tool_names(&approved)
+            .into_iter()
+            .map(|(_, n)| n)
+            .collect();
+        assert_eq!(names, again);
+        // Each name resolves back to a distinct original id.
+        let ids: HashSet<String> = assigned.iter().map(|(id, _)| id.display()).collect();
+        assert_eq!(ids.len(), 3);
     }
 
     #[tokio::test]
