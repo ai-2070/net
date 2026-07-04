@@ -20,7 +20,7 @@
 
 use async_trait::async_trait;
 
-use super::header::ForwardedHeaderValue;
+use super::header::{zeroize_vec, ForwardedHeaderValue};
 use super::secret::{SecretBackend, SecretBackendError};
 
 /// The default keychain **service** namespace forwarded secrets live under.
@@ -97,7 +97,14 @@ impl SecretBackend for KeychainSecretBackend {
     async fn contains(&self, ref_name: &str) -> Result<bool, SecretBackendError> {
         let (service, ref_name) = (self.service.clone(), ref_name.to_string());
         run_blocking(move || match entry(&service, &ref_name)?.get_secret() {
-            Ok(_) => Ok(true),
+            // keyring has no existence probe that skips the value, so we read
+            // it — but we only want existence, so scrub the plaintext we had to
+            // materialize before it drops (matching the module's secret-handling
+            // guarantees).
+            Ok(mut bytes) => {
+                zeroize_vec(&mut bytes);
+                Ok(true)
+            }
             Err(keyring::Error::NoEntry) => Ok(false),
             Err(e) => Err(map_err(e)),
         })
