@@ -22,6 +22,15 @@ Protocol (MCP) stdio servers over the Net mesh in both directions:
 Plus two `net` CLI commands (`net wrap`, `net mcp serve|pin`) and a 2-line SDK
 addition exposing a node's own `origin_hash()`.
 
+> **Status — RESOLVED (2026-07-04).** All 13 findings below were fixed on
+> `mcp-3`, each as its own commit with tests; two follow-up review comments
+> (R1, R2) and a rustdoc-link fix landed on top. The file/line anchors in each
+> finding point at the code **as reviewed** (pre-fix) and are left intact as the
+> record; the **Resolution** table at the end gives the commit and what actually
+> shipped for each (some fixes differ from the suggested direction — e.g. F2
+> shipped as a fail-safe opt-in, not the deferred root-identity verification).
+> Branch HEAD passes tests, clippy, `fmt --check`, and `cargo doc -D warnings`.
+
 ---
 
 ## Overall assessment
@@ -304,12 +313,33 @@ three copies become one.
 
 ---
 
-## Suggested triage order
+## Resolution
 
-1. **F1, F4, F5** — fire in normal single-owner operation (duplicate side
-   effects; server hangs; slow tools unusable). Fix before shipping.
-2. **F2** — required if multi-identity meshes are a supported deployment.
-3. **F3, F7** — harden against hostile / buggy wrapped servers.
-4. **F6, F8, F9** — correctness / hardening cleanups.
-5. **F10** — coverage gap; schedule with the Phase 4 naming work.
-6. **F11, F12, F13** — low-severity robustness + reuse.
+All findings fixed on `mcp-3`, each as its own commit with tests. Where the
+shipped fix departs from the review's suggested direction, the note says why.
+
+| # | Commit | What shipped |
+|---|--------|--------------|
+| F1 | `553c0d0` | `CapabilityGateway::invoke` takes an `InvokeSafety` flag; an at-most-once (credentialed) invoke retries only on `NoRoute` (proven non-execution), never on a timeout — a duplicate-safe (uncredentialed) invoke still retries transient timeouts for reply-race resilience. Retry-safety is derived from the provider's declared status (a resilience hint, never the security gate). |
+| F2 | `ca0d38a` | Cross-provider collapse **and** failover are now **opt-in, off by default** (`MeshGateway::trust_equivalent_providers` / `net mcp serve --trust-equivalent-providers`): each provider is discovered, pinned, and invoked on its own node id, so a peer that forged a matching contract can't stand in for another. The suggested deeper fix (verify shared owner/root identity) stays deferred; the opt-in default closes the exposure until it lands. |
+| F3 | `739535d` | The `method not found` reply to a server-initiated request is spawned off the reader, so draining stdout never blocks on a stdin write (no two-pipe deadlock). |
+| F4 | `f12cc80` | `promoted_pinned_tools` describes pins with bounded concurrency (`buffered`), so `tools/list` latency is the slowest single describe, not the sum. |
+| F5 | `5fb412e` | Split deadlines: describe keeps 5s, invoke defaults to 120s and is overridable via `MeshGateway::with_invoke_timeout`. |
+| F6 | `c90b673` | `invoke_capability` normalizes a `null` argument to `{}` (covers both the pinned-tool path and an explicit `"arguments": null`). |
+| F7 | `e2a5dc5` | A bounded line reader caps a stdout line at 32 MiB; an over-length line is drained and dropped rather than buffered. |
+| F8 | `3d0dc41` | The pin-store temp is created `0600` up front via `OpenOptions`, closing the umask window; no leftover temp after a successful save. |
+| F9 | `d1cf2d4` | Pinned tool names are id-local (always hash-suffixed), independent of the approved set, so a cached name never remaps to a different capability. (Simplified further in `4eeb784`.) |
+| F10 | `33bcbab` | Non-channel-safe tool names (camelCase, spaced, punctuated) are sanitized into a stable channel-safe id and bridged; the original is kept in `LoweredTool::mcp_name` for invocation. Only an empty name is skipped. |
+| F11 | `a0ec579` | `CapabilityId::new`/`parse` canonicalize the provider node id (decimal, trimmed) so identity and routing agree; still carried as a string, not a typed `u64` (the deeper form remains a later refinement). |
+| F12 | `2f0aff5` | `RequestId::Number` carries a raw `serde_json::Number`, so any JSON-RPC numeric id round-trips. |
+| F13 | `35b5d6f` | `load_operator_identity` + `build_attached_mesh` hoisted into `cli/src/context.rs`; the three duplicated CLI helpers collapse to one. |
+
+**Follow-up review comments (`cubic-dev-ai`):** R1 (`4eeb784`) — remove the dead
+reserved-name loop in `stable_pinned_tool_name`; R2 (`fce36b1`) — replace the
+`duplicate_safe` bool with the `InvokeSafety::{DuplicateSafe, AtMostOnce}` enum
+(closing the boolean trap). A rustdoc-link fix (`4610dee`) and a rustfmt-only
+commit (`67c6679`) keep the branch green on all CI gates.
+
+**Still deferred (tracked, not regressions):** F2's full fix (verify a failover
+target shares the primary's owner/root identity) and F11's typed-`u64`
+provider both wait on the permission-system work the plan already defers.

@@ -4,6 +4,8 @@
 
 **Wedge statement (frozen):** Net's wedge is agent capability federation. An agent can find a capability somewhere else on the mesh and use it. Payments, billing, identity services, and the enterprise control plane grow from that substrate later. Not in scope for this plan.
 
+**Status (2026-07-04):** the Phase 1–4 core landed on the `mcp-3` branch (`net-mesh-mcp` crate). A code review and 13 fixes are recorded in [`CODE_REVIEW_2026_07_04_MCP_BRIDGE.md`](../misc/CODE_REVIEW_2026_07_04_MCP_BRIDGE.md); the security/design refinements from that pass — most notably that **cross-provider collapse/failover is opt-in and off by default** (Phase 4) and that **invoke is at-most-once for credentialed tools** — are folded into the phases below.
+
 ---
 
 ## Doctrine (non-negotiable constraints)
@@ -89,6 +91,7 @@ Isolate the failure boundary: prove Net onboarding + cross-machine invocation be
   - `compat_tier: "mcp_bridge"`
   - `visibility: "owner_only"`, `invocation_scope: "same_root_identity"` (announcement metadata — honest even before full permission system)
   - `substitutability` field: default `provider_local` (NOT substitutable); `provider_equivalent` only when explicitly flagged
+  - a **channel-safe `tool_id`**: the MCP name verbatim when it is already a valid channel id, else sanitized (lowercased, out-of-charset chars → `_`) and hash-suffixed with the original name; the original name is kept for invocation. So an uppercase / camelCase / spaced tool (`createIssue`) is bridged under a stable safe id rather than dropped — only an empty name is skipped (review F10)
 - [ ] **Credential-status classification (conservative):**
   - env additions passed or inherited secrets configured → `credentialed`
   - common secret patterns detected → `credentialed`
@@ -173,6 +176,7 @@ Tasks:
 ## Phase 4 — Duplicate grouping + failover routing
 
 - [ ] **Canonical identity is structured, never a string:** `{capability: "github.create_issue", provider: <node_id/pubkey>}`. Node *aliases* are mutable display labels — they never enter identifiers, pins, or scripts. Display form uses `/` for the node qualifier (`homelab/github.create_issue`) since `.` is ambiguous inside capability names and `@` is taken by versioning. Model-facing pinned names are daemon-allocated, host-charset-safe (`[a-zA-Z0-9_-]`, ≤64): `github_create_issue`, provider-suffixed only when disambiguation demands it.
+  - v0 refinement: the pinned name is a **pure function of the capability id** (always hash-suffixed), so it is independent of which other pins are approved — an out-of-band approve/reject can never remap a name a host cached onto a different capability (review F9). The provider node id is **canonicalized at parse** (decimal, whitespace-trimmed, `0x`-hex accepted) so identity and routing agree on one spelling; it is still carried as a string rather than a typed `u64` (the deeper form, deferred — review F11).
 - [ ] v0 (ships with Phase 2): search results grouped by capability, providers listed:
 
 ```
@@ -182,11 +186,13 @@ github.create_issue
 
 - [ ] v1: `descriptor_hash = hash(tool_name + input_schema + output_schema + semantics_version + compat_tier + credential_context)`
 - [ ] **`credential_context` is privacy-safe and never raw-token-derived.** It is an opaque local equivalence class: `hash(provider_id + account_id_if_known + local_salt)`. If the account id is unknown, do not collapse. Public announcements never carry anything that could correlate private accounts across meshes — collapse happens only within owner-local context.
-- [ ] Collapse into one logical capability only when `substitutability: "provider_equivalent"`; filesystem-class tools stay provider-local forever
-- [ ] Routing for collapsed capabilities: owner/policy filter → health → proximity → load → pinned preference
-- [ ] **The failover demo (hero artifact):** same tool wrapped on three machines, kill one mid-session, next invoke succeeds via another provider, agent never notices. Script it, record it, put it on the site. This is the demo no MCP gateway can do.
+- [ ] Collapse into one logical capability only when `substitutability: "provider_equivalent"`; filesystem-class tools stay provider-local forever. The equivalence key (`descriptor_fingerprint`) folds `substitutability` + `credential_status` alongside the schema, so a credentialed / provider-local primary can never fingerprint-match a collapsible candidate (review F1/F2 hardening, commit `dab94971c`).
+- [ ] **Collapse + failover are OPT-IN, off by default** (`MeshGateway::trust_equivalent_providers` / `net mcp serve --trust-equivalent-providers`). Equivalence today is proven only from *wire-declared* attributes a peer controls (substitutability, credential_status, public schema), with **no proof the peer shares the primary's owner/root identity** — that verification is deferred to the permission system. Until it lands, the safe default keeps every provider provider-local: each is discovered, pinned, and invoked on its own node id, so a hostile co-tenant that forged a matching contract can neither become a group's representative nor intercept a failover (review F2). Operators whose mesh peers are all their own opt in explicitly.
+- [ ] **Invoke is at-most-once for credentialed tools.** A timeout does not prove non-execution, so only a duplicate-safe (uncredentialed) tool retries a timed-out call on the same provider — the same class that is eligible to collapse/fail over. A credentialed / stateful tool surfaces the timeout rather than re-running it, so a side effect (issue, charge) is never silently duplicated (review F1; `InvokeSafety` enum).
+- [ ] Routing for collapsed capabilities (when opted in): owner/policy filter → health → proximity → load → pinned preference
+- [ ] **The failover demo (hero artifact):** same tool wrapped on three machines, kill one mid-session, next invoke succeeds via another provider, agent never notices. Script it, record it, put it on the site. This is the demo no MCP gateway can do. (Runs with `--trust-equivalent-providers`, and only for uncredentialed substitutable tools where duplicate execution is harmless.)
 
-**Acceptance:** failover demo passes 10/10 scripted runs; cross-account collapse is impossible by construction (test with two distinct tokens for the same provider).
+**Acceptance:** failover demo passes 10/10 scripted runs; cross-account collapse is impossible by construction (test with two distinct tokens for the same provider); collapse/failover is inert unless explicitly enabled.
 
 ---
 
@@ -294,6 +300,9 @@ Rules:
 | Upstream plugin API churn (fast-moving codebase) | Optional track, thin plugin, fork ports same cycle |
 | Host truncates even the small meta-tool set | Host matrix from day one; tested against 3 hosts in Phase 2 |
 | Adapter quietly grows core-internal dependencies | CI dependency check: `net-mesh-mcp` may depend on `net-mesh-sdk` only; violations fail the build |
+| Collapse/failover trusts wire-declared equivalence (a peer can forge a matching contract; no proof it shares the owner/root identity) | Off by default; opt-in `--trust-equivalent-providers`. Full fix = verify a shared owner/root identity, deferred with the permission system (review F2) |
+| Retrying a credentialed invoke on a timeout duplicates a real side effect | At-most-once for credentialed / stateful tools — only uncredentialed (duplicate-safe) tools retry a timeout; retry-safety is an `InvokeSafety` flag (review F1) |
+| A wrapped stdio server floods stdout, or is dropped mid-reply, hanging the wrapper | Bounded line reader (32 MiB cap, over-length lines dropped); server-initiated replies written off the read path so both pipes can't wedge (review F3/F7) |
 
 ---
 
